@@ -66,6 +66,28 @@ impl_writer_for_enum! {
     }
 }
 
+impl UnifiedWriter {
+    /// The backend kind as a low-cardinality `&'static str`, used as the FUSE
+    /// `path_type` metrics label (curvine-fuse Phase 2b). Hand-written rather than
+    /// macro-generated because Opendal and OssHdfs both map to `"ufs"` (not 1:1
+    /// with variants). NOTE: `UnifiedWriter` has NO `Fallback` variant (that is
+    /// reader-only), so there is deliberately no `fallback` arm here. The Opendal
+    /// / OssHdfs arms are feature-gated to match the variants' own `#[cfg(...)]`.
+    pub fn path_type(&self) -> &'static str {
+        match self {
+            UnifiedWriter::Cv(_) => "curvine",
+
+            #[cfg(feature = "opendal")]
+            UnifiedWriter::Opendal(_) => "ufs",
+
+            #[cfg(feature = "oss-hdfs")]
+            UnifiedWriter::OssHdfs(_) => "ufs",
+
+            UnifiedWriter::Local(_) => "local",
+        }
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
 pub enum UnifiedReader {
     Cv(FsReader),
@@ -94,6 +116,29 @@ impl_reader_for_enum! {
         OssHdfs(OssHdfsReader),
 
         Local(LocalReader),
+    }
+}
+
+impl UnifiedReader {
+    /// The backend kind as a low-cardinality `&'static str`, used as the FUSE
+    /// `path_type` metrics label (curvine-fuse Phase 2b). Hand-written (Opendal
+    /// and OssHdfs both map to `"ufs"`). Unlike `UnifiedWriter`, the reader has a
+    /// `Fallback` variant (UFS read-through after a cache miss) → `"fallback"`.
+    /// The Opendal / OssHdfs arms are feature-gated to match the variants.
+    pub fn path_type(&self) -> &'static str {
+        match self {
+            UnifiedReader::Cv(_) => "curvine",
+
+            UnifiedReader::Fallback(_) => "fallback",
+
+            #[cfg(feature = "opendal")]
+            UnifiedReader::Opendal(_) => "ufs",
+
+            #[cfg(feature = "oss-hdfs")]
+            UnifiedReader::OssHdfs(_) => "ufs",
+
+            UnifiedReader::Local(_) => "local",
+        }
     }
 }
 
@@ -283,5 +328,51 @@ impl UfsFileSystem {
 
             UfsFileSystem::Local(fs) => Ok(UfsReader::Local(fs.open(path).await?)),
         }
+    }
+}
+
+#[cfg(test)]
+mod path_type_tests {
+    use super::{UnifiedReader, UnifiedWriter};
+    use curvine_common::fs::local::{LocalReader, LocalWriter};
+    use curvine_common::fs::Path;
+    use std::io::Write;
+
+    // The `Local` variant is the only one cheaply constructible without a live
+    // backend (a temp file is enough), so it is the one asserted here.
+    //
+    // KNOWN GAP (codex review P2-2): the exhaustive `match` in `path_type()` only
+    // guarantees every variant HAS an arm, not that each arm returns the RIGHT
+    // string — `Fallback(_) => "curvine"` would still compile. The other variants
+    // are not unit-tested because they cannot be built without a live backend:
+    //   - Cv(FsReader)/(FsWriter): need a connected Curvine cluster.
+    //   - Fallback(FallbackFsReader): `new` takes a Curvine `FsReader` + a
+    //     `UfsFileSystem`, so it needs a cluster too.
+    //   - Opendal/OssHdfs: need a configured object-store backend.
+    // They are instead covered by (a) the curvine-fuse `path_type_label_consts_*`
+    // contract-seam test, which pins the exact label vocabulary the fuse side
+    // expects ("curvine"/"ufs"/"fallback"/"local"/"unknown"), and (b) e2e under a
+    // real mount (the live run asserts read/write report path_type="curvine"). The
+    // cfg-gating of the Opendal/OssHdfs arms is additionally covered by this crate
+    // compiling under CI's default features (opendal on, oss-hdfs off) — an
+    // un-gated arm would fail to compile when oss-hdfs is off.
+    #[test]
+    fn local_reader_writer_path_type_is_local() {
+        let dir = std::env::temp_dir();
+        let file = dir.join(format!("curvine_path_type_test_{}", std::process::id()));
+        // Writer first (creates/overwrites the file), then a reader over it.
+        {
+            let mut f = std::fs::File::create(&file).expect("create temp file");
+            f.write_all(b"x").expect("write temp file");
+        }
+        let path = Path::from_str(file.to_str().unwrap()).expect("build path");
+
+        let writer = UnifiedWriter::Local(LocalWriter::new(&path, 4096).expect("local writer"));
+        assert_eq!(writer.path_type(), "local");
+
+        let reader = UnifiedReader::Local(LocalReader::new(&path, 4096).expect("local reader"));
+        assert_eq!(reader.path_type(), "local");
+
+        let _ = std::fs::remove_file(&file);
     }
 }

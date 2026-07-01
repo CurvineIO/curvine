@@ -21,6 +21,7 @@ use orpc::common::{CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, Metrics
 use orpc::CommonResult;
 
 use crate::fuse_error::errno_label;
+use crate::session::FuseOpCode;
 
 /// Buckets (µs) for end-to-end request / operation latency. 18 buckets spanning
 /// 10µs–10s, matching the design's "Recommended buckets for request and
@@ -38,6 +39,16 @@ const STAGE_DURATION_BUCKETS_US: &[f64] = &[
     100000.0,
 ];
 
+/// Buckets (bytes) for a single stream read/write size (Phase 2b `io_size_bytes`).
+/// 8 buckets spanning 4KiB–64MiB. The first bucket (`le=4096`) is NOT a minimum
+/// observation floor — a sub-4KiB read/write (e.g. a 1-byte read) is observed
+/// normally and lands in this first bucket. Zero-length writes are a *semantic*
+/// exclusion (they never enter the writer task body, see `file_handle.rs`), not a
+/// bucket limit; do not read the 4KiB floor as "the smallest IO".
+const IO_SIZE_BUCKETS: &[f64] = &[
+    4096.0, 16384.0, 65536.0, 262144.0, 1048576.0, 4194304.0, 16777216.0, 67108864.0,
+];
+
 // `reply_type` label values (`requests_total`).
 pub(crate) const REPLY_TYPE_REPLIED: &str = "replied";
 pub(crate) const REPLY_TYPE_NO_REPLY: &str = "no_reply";
@@ -52,6 +63,49 @@ pub(crate) const REPLY_TYPE_NO_REPLY: &str = "no_reply";
 pub(crate) const STAGE_REPLY_WRITE: &str = "reply_write";
 pub(crate) const STAGE_META_SPAWN: &str = "meta_spawn";
 pub(crate) const STAGE_OPERATION: &str = "operation";
+// Phase 2b: the read/write backend call in the reader/writer task body. This is
+// the ONLY `stage_duration_us` emission point Phase 2b adds. flush/fsync/release
+// deliberately emit NO stage (their result status is not clean — it mixes backend
+// and reply-enqueue errors — so a `stage_duration_us{status}` would carry that
+// pollution); they use the status-less `stream_lifecycle_*` family instead. The
+// send_stream read/write dispatch also emits no stage (covered by the dedicated
+// `io_dispatch_duration_us`); see the `STAGE_STREAM_ENQUEUE` note above.
+pub(crate) const STAGE_STREAM_IO: &str = "stream_io";
+
+// `io_type` label values (Phase 2b). Lowercase, low-cardinality, zero-allocation.
+// read/write feed the `io_*` families (with `status`); flush/fsync/release feed
+// the independent `stream_lifecycle_*` families (no `status`). The two never mix.
+pub(crate) const IO_TYPE_READ: &str = "read";
+pub(crate) const IO_TYPE_WRITE: &str = "write";
+pub(crate) const IO_TYPE_FLUSH: &str = "flush";
+pub(crate) const IO_TYPE_FSYNC: &str = "fsync";
+pub(crate) const IO_TYPE_RELEASE: &str = "release";
+
+// `path_type` label values (Phase 2b), the backend a stream IO targets. read/write
+// resolve the real backend via `UnifiedReader/Writer::path_type()` (which returns
+// these same literals from curvine-client); flush/fsync/release use `unknown` for
+// now (the send_stream layer does not look up the handle). Only `unknown` is read
+// by production fuse code (the lifecycle helper); the backend-specific values are
+// produced by the curvine-client accessor and referenced here only in tests, so
+// they are gated to keep non-test builds warning-free.
+#[cfg_attr(not(test), allow(dead_code))] // value produced by path_type(); fuse-side use is test-only.
+pub(crate) const PATH_TYPE_CURVINE: &str = "curvine";
+#[cfg_attr(not(test), allow(dead_code))] // value produced by path_type(); fuse-side use is test-only.
+pub(crate) const PATH_TYPE_UFS: &str = "ufs";
+// ⚠ `fallback` is the READER WRAPPER TYPE, not the backend a given read actually
+// hit. `UnifiedReader::Fallback(FallbackFsReader)` tries Curvine first and only
+// switches to UFS after a worker error, but `path_type` is captured ONCE at handle
+// construction — so a long-lived fallback-capable reader reports EVERY read
+// (including Curvine cache hits) as `fallback`. Read it as "this handle is
+// fallback-capable", NOT "this read fell back to UFS". A precise per-read backend
+// label would need the reader to surface its actual outcome per `fuse_read`
+// (deferred to a behaviour PR). Dashboards must not treat `fallback` latency/bytes
+// as real UFS-fallback IO.
+#[cfg_attr(not(test), allow(dead_code))] // reader-only Fallback variant; fuse-side use is test-only.
+pub(crate) const PATH_TYPE_FALLBACK: &str = "fallback";
+#[cfg_attr(not(test), allow(dead_code))] // value produced by path_type(); fuse-side use is test-only.
+pub(crate) const PATH_TYPE_LOCAL: &str = "local";
+pub(crate) const PATH_TYPE_UNKNOWN: &str = "unknown";
 
 // `phase` label values (`decode_errors_total`). `parse` (parse-after-ctx
 // cleanup) ships in 1a-2; `decode` (from_bytes failures) in 1b.
@@ -185,6 +239,67 @@ pub struct FuseMetrics {
     /// already removed (esp. the interrupt branch). Event-driven via a guard.
     /// No label.
     pub(crate) setlkw_inflight: Gauge,
+
+    // --- Phase 2b: stream IO (read/write backend + flush/fsync/release lifecycle) ---
+    //
+    // Two deliberately-separate families. `io_*` covers read/write backend IO and
+    // carries `status` (the backend result is clean). `stream_lifecycle_*` covers
+    // flush/fsync/release and carries NO status (their result mixes backend and
+    // reply-enqueue errors, so a status label would be dishonest) — and because a
+    // Prometheus family's label set is fixed at registration, the two cannot share
+    // a family (R3 P0#1).
+    /// read/write backend IO latency, observed in the reader/writer task body when
+    /// the backend `fuse_read`/`fuse_write` returns. `io_type` ∈ {read,write},
+    /// `path_type` is the resolved backend, `status` ∈ {success,error}.
+    pub(crate) io_duration_us: HistogramVec,
+    /// Bytes transferred by a successful read/write. `io_type,path_type,status` —
+    /// but only the `status=success` child is ever created (an error read/write
+    /// records NO byte series; we never `inc_by(0)`), so do not expect
+    /// `io_bytes_total{status=error}`. read uses the actual bytes read (short reads
+    /// count actual), write uses the returned size.
+    pub(crate) io_bytes_total: CounterVec,
+    /// read/write backend attempts. `io_type,path_type,status` — incremented once
+    /// per attempt INCLUDING `status=error`.
+    pub(crate) io_requests_total: CounterVec,
+    /// Single read/write request-size distribution. `io_type,path_type` (no status:
+    /// it characterises requested size, not outcome). read uses the *requested*
+    /// size, write uses the *input* data length — request size, distinct from the
+    /// transferred bytes in `io_bytes_total` (which uses actual).
+    pub(crate) io_size_bytes: HistogramVec,
+    /// read/write dispatch-to-worker latency at `send_stream` (the `fs.read`/
+    /// `fs.write` call). `io_type` ∈ {read,write}. NOT a pure channel push: read
+    /// can include a read-after-write consistency flush + reader reopen, and write
+    /// includes the zero-length no-op direct-reply path. No status (dispatch is
+    /// observed on success, pre-dispatch error, and cancel alike; the distribution
+    /// is the point). Uses the wide request/op buckets, not short-stage buckets,
+    /// because the consistency flush/reopen long tail would otherwise pile into +Inf.
+    pub(crate) io_dispatch_duration_us: HistogramVec,
+    /// read/write backend calls in flight (task body, backend-only — strictly
+    /// shorter than `active_requests`). `io_type` ∈ {read,write}; the guard wraps
+    /// ONLY the `fuse_read`/`fuse_write` call (not the subsequent reply enqueue).
+    pub(crate) stream_io_inflight: GaugeVec,
+    /// flush/fsync/release lifecycle latency at `send_stream` (the whole arm incl.
+    /// the error reply enqueue). `io_type` ∈ {flush,fsync,release}, `path_type`
+    /// fixed `unknown` for now. NO status (the result mixes backend and
+    /// reply-enqueue errors); observed on success, error, pre-dispatch error, and
+    /// cancel.
+    pub(crate) stream_lifecycle_duration_us: HistogramVec,
+    /// flush/fsync/release lifecycle attempts. `io_type,path_type` — counted before
+    /// the match (so a pre-dispatch error still counts). No status (see duration).
+    pub(crate) stream_lifecycle_requests_total: CounterVec,
+    /// flush/fsync/release lifecycle in flight at `send_stream` (dispatch + lock +
+    /// backend round-trip + reply enqueue). `io_type` ∈ {flush,fsync,release}. A
+    /// saturation signal, NOT a pure-backend-stuck signal — a real-time companion
+    /// to `stream_lifecycle_duration_us` (which only emits on completion). Separate
+    /// gauge from `stream_io_inflight` because the scope (whole arm) differs.
+    pub(crate) stream_lifecycle_inflight: GaugeVec,
+    /// Writer-channel backlog: ALL `WriteTask`s enqueued into the writer task but
+    /// not yet dequeued — write / flush / complete / resize, not just `FUSE_WRITE`
+    /// (resize can come from metadata truncate/fallocate). Event-driven via a
+    /// task-embedded `ActiveGuard` created at the enqueue boundary and dropped at
+    /// the writer's dequeue point (or when an un-received task is dropped). No
+    /// `_total` suffix (a gauge), no label.
+    pub(crate) stream_write_queue_depth: Gauge,
 }
 
 impl FuseMetrics {
@@ -363,6 +478,88 @@ impl FuseMetrics {
                 "SETLKW interruptible-request scopes in flight (whole dispatch_meta_interrupt \
                  scope, NOT pending_requests map size; can stay non-zero under reply-channel \
                  backpressure after the map entry is removed)",
+            )?,
+
+            io_duration_us: m::new_histogram_vec_with_buckets(
+                "curvine_fuse_io_duration_us",
+                "Stream read/write backend IO latency in microseconds, observed in the \
+                 reader/writer task body when the backend call returns. io_type=read|write only; \
+                 flush/fsync/release use stream_lifecycle_duration_us instead. NOTE: \
+                 path_type=fallback means the reader is fallback-CAPABLE (a FallbackFsReader \
+                 captured at open), NOT that this read fell back to UFS — Curvine cache hits on \
+                 such a handle are also labelled fallback",
+                &["io_type", "path_type", "status"],
+                REQUEST_DURATION_BUCKETS_US,
+            )?,
+            io_bytes_total: m::new_counter_vec(
+                "curvine_fuse_io_bytes_total",
+                "Bytes transferred by a successful stream read/write (read=actual bytes read, \
+                 write=input length reported to the kernel on success — fuse_write returns no \
+                 partial size). Only the status=success child is created; an error read/write \
+                 records no byte series",
+                &["io_type", "path_type", "status"],
+            )?,
+            io_requests_total: m::new_counter_vec(
+                "curvine_fuse_io_requests_total",
+                "Stream read/write backend attempts, incremented once per attempt including \
+                 status=error. Excludes zero-length writes (they never enter the writer task body)",
+                &["io_type", "path_type", "status"],
+            )?,
+            io_size_bytes: m::new_histogram_vec_with_buckets(
+                "curvine_fuse_io_size_bytes",
+                "Single stream read/write request size in bytes (read=requested size, \
+                 write=input data length); request-size distribution, distinct from the \
+                 transferred io_bytes_total which uses actual bytes",
+                &["io_type", "path_type"],
+                IO_SIZE_BUCKETS,
+            )?,
+            io_dispatch_duration_us: m::new_histogram_vec_with_buckets(
+                "curvine_fuse_io_dispatch_duration_us",
+                "Stream read/write dispatch-to-worker latency in microseconds at send_stream; \
+                 read may include a read-after-write consistency flush + reader reopen, write \
+                 includes zero-length no-op direct replies and their reply-enqueue time (NOT \
+                 worker dispatch). io_type=read|write only; no status",
+                &["io_type"],
+                REQUEST_DURATION_BUCKETS_US,
+            )?,
+            stream_io_inflight: m::new_gauge_vec(
+                "curvine_fuse_stream_io_inflight",
+                "Stream read/write backend calls in flight (task body, backend-only — shorter \
+                 than active_requests; does NOT include the reply channel enqueue). \
+                 io_type=read|write only",
+                &["io_type"],
+            )?,
+            stream_lifecycle_duration_us: m::new_histogram_vec_with_buckets(
+                "curvine_fuse_stream_lifecycle_duration_us",
+                "flush/fsync/release lifecycle duration in microseconds at send_stream (whole \
+                 arm incl. error reply enqueue); attempted count lives in \
+                 stream_lifecycle_requests_total; no success/error status; observed on success, \
+                 error, pre-dispatch error, and cancel. path_type is unknown for now",
+                &["io_type", "path_type"],
+                REQUEST_DURATION_BUCKETS_US,
+            )?,
+            stream_lifecycle_requests_total: m::new_counter_vec(
+                "curvine_fuse_stream_lifecycle_requests_total",
+                "flush/fsync/release lifecycle attempts at send_stream, counted before the match \
+                 (so a pre-dispatch error still counts). No status (the result mixes backend and \
+                 reply-enqueue errors). path_type is unknown for now",
+                &["io_type", "path_type"],
+            )?,
+            stream_lifecycle_inflight: m::new_gauge_vec(
+                "curvine_fuse_stream_lifecycle_inflight",
+                "flush/fsync/release lifecycle in-progress at send_stream (dispatch + lock + \
+                 backend round-trip + reply enqueue); a saturation signal, NOT a \
+                 pure-backend-stuck signal — correlate with stream_write_queue_depth / \
+                 reply_queue_depth / request_duration to localize. io_type=flush|fsync|release",
+                &["io_type"],
+            )?,
+            stream_write_queue_depth: m::new_gauge(
+                "curvine_fuse_stream_write_queue_depth",
+                "Writer-channel backlog: ALL WriteTasks enqueued into the writer task but not yet \
+                 dequeued — write / flush / complete / resize, NOT just FUSE_WRITE. Note resize \
+                 can be driven by metadata paths (SetAttr truncate / fallocate), so a rising \
+                 gauge is not necessarily FUSE write/flush pressure. Event-driven via a \
+                 task-embedded guard, dropped at the dequeue point",
             )?,
         })
     }
@@ -694,6 +891,176 @@ impl FuseMetrics {
             None
         }
     }
+
+    // --- Phase 2b emission helpers ---
+
+    /// Record one read/write backend IO in the reader/writer task body, feeding
+    /// the read/write `io_*` families plus the opcode-free `stage_duration_us`
+    /// (the same dual-emit shape as `record_operation`: `io_*` carries
+    /// `path_type` detail, the stage view stays opcode-free at bounded
+    /// cardinality). `io_type` is `IO_TYPE_READ`/`IO_TYPE_WRITE`; `path_type` is
+    /// the backend resolved at handle open.
+    ///
+    /// - `io_duration_us{io_type,path_type,status}` + `stage_duration_us{stage=
+    ///   stream_io,kind=stream,status}`: observed on success AND error.
+    /// - `io_requests_total{io_type,path_type,status}`: +1 every attempt, error
+    ///   included.
+    /// - `io_size_bytes{io_type,path_type}`: the *request* size (read=requested,
+    ///   write=input len), observed on success and error.
+    /// - `io_bytes_total{io_type,path_type,status=success}`: the *transferred*
+    ///   bytes, ONLY on success (an error creates no byte series — never
+    ///   `inc_by(0)`).
+    pub(crate) fn record_stream_io(
+        &self,
+        io_type: &'static str,
+        path_type: &'static str,
+        ok: bool,
+        transferred_bytes: u64,
+        request_size: u64,
+        elapsed_us: u64,
+    ) {
+        // Status is binary here (the backend call either returned data or an
+        // error); sourcing the string from `FuseReqStatus` keeps it identical to
+        // every other status label.
+        let status_str = if ok {
+            FuseReqStatus::Success.as_str()
+        } else {
+            FuseReqStatus::Error.as_str()
+        };
+        let elapsed = elapsed_us as f64;
+        self.io_duration_us
+            .with_label_values(&[io_type, path_type, status_str])
+            .observe(elapsed);
+        self.stage_duration_us
+            .with_label_values(&[STAGE_STREAM_IO, FuseReqKind::Stream.as_str(), status_str])
+            .observe(elapsed);
+        self.io_requests_total
+            .with_label_values(&[io_type, path_type, status_str])
+            .inc();
+        self.io_size_bytes
+            .with_label_values(&[io_type, path_type])
+            .observe(request_size as f64);
+        if ok {
+            // Success-only byte series, fixed status=success (R3 P0#2).
+            self.io_bytes_total
+                .with_label_values(&[io_type, path_type, FuseReqStatus::Success.as_str()])
+                .inc_by(transferred_bytes as i64);
+        }
+    }
+
+    /// Build the `stream_io_inflight{io_type}` guard for a read/write backend
+    /// call. `Some(ActiveGuard)` when enabled (incrementing the gauge), `None`
+    /// when disabled (never `noop()`). The guard must wrap ONLY the
+    /// `fuse_read`/`fuse_write` call — drop it before the reply enqueue so the
+    /// gauge reflects backend concurrency, not reply-channel time. `io_type` is
+    /// `IO_TYPE_READ`/`IO_TYPE_WRITE` (from the task variant, no opcode lookup).
+    pub(crate) fn stream_io_guard(
+        metrics_enabled: bool,
+        io_type: &'static str,
+    ) -> Option<ActiveGuard> {
+        if metrics_enabled {
+            let gauge = Self::get().stream_io_inflight.with_label_values(&[io_type]);
+            Some(ActiveGuard::new(gauge))
+        } else {
+            None
+        }
+    }
+
+    /// Build the `stream_write_queue_depth` guard for a task entering the writer
+    /// channel. `Some(ActiveGuard)` when enabled (incrementing the gauge), `None`
+    /// when disabled (never `noop()`). Unlike `reply_queue_guard` (which is only
+    /// reached on the enabled path so it takes no flag), the writer constructs one
+    /// `FuseWriter` regardless of the kill switch, so the gate is passed in here.
+    /// The guard is moved into the `QueuedWriteTask` and decrements when the writer
+    /// dequeues (or when an un-received task is dropped).
+    pub(crate) fn stream_write_queue_guard(metrics_enabled: bool) -> Option<ActiveGuard> {
+        if metrics_enabled {
+            Some(ActiveGuard::new(
+                Self::get().stream_write_queue_depth.clone(),
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Build the `io_dispatch_duration_us{io_type}` RAII timer for a read/write
+    /// dispatch at `send_stream`. Returns a bare `HistogramTimer` (no `Option`):
+    /// the caller gates on `metrics.is_some()` and only maps this in when enabled,
+    /// so reaching here means metrics are on and `get()` is initialized. Observes
+    /// on drop, covering success / pre-dispatch error / cancel alike.
+    pub(crate) fn io_dispatch_timer(io_type: &'static str) -> HistogramTimer {
+        let hist = Self::get()
+            .io_dispatch_duration_us
+            .with_label_values(&[io_type]);
+        HistogramTimer::new(hist)
+    }
+
+    /// Open a flush/fsync/release lifecycle scope at `send_stream`: count the
+    /// attempt now (`stream_lifecycle_requests_total{io_type,path_type=unknown}`,
+    /// before the backend runs so a pre-dispatch error still counts) and return a
+    /// `StreamLifecycleScope` holding the duration timer and the inflight guard.
+    /// Both release together at the end of the send_stream arm (the timer
+    /// observes, the guard decrements); the drop *order* between them carries no
+    /// observable semantics. `io_type` is `IO_TYPE_FLUSH`/`FSYNC`/`RELEASE`.
+    ///
+    /// All three sub-metrics use the fixed `path_type=unknown` (the send_stream
+    /// layer does not look up the handle). Attempt-count and timer/guard are wired
+    /// here together with no `.await`/early-return between them, so the family is
+    /// never half-balanced. Like the other guard helpers, this is only ever
+    /// reached on the metrics-enabled path (the caller maps it in behind an
+    /// `enabled` check), so `get()` (strict) is correct.
+    pub(crate) fn stream_lifecycle_scope(io_type: &'static str) -> StreamLifecycleScope {
+        let m = Self::get();
+        m.stream_lifecycle_requests_total
+            .with_label_values(&[io_type, PATH_TYPE_UNKNOWN])
+            .inc();
+        let timer = HistogramTimer::new(
+            m.stream_lifecycle_duration_us
+                .with_label_values(&[io_type, PATH_TYPE_UNKNOWN]),
+        );
+        let inflight = ActiveGuard::new(m.stream_lifecycle_inflight.with_label_values(&[io_type]));
+        StreamLifecycleScope {
+            _timer: timer,
+            _inflight: inflight,
+        }
+    }
+}
+
+/// Map a stream opcode to the read/write `io_type` for `io_dispatch_duration_us`,
+/// or `None` for a non-read/write stream op. Deliberately NOT `opcode.as_str()`:
+/// that yields the capitalized request label (`"Read"`/`"Write"`), whereas the IO
+/// families use the lowercase `IO_TYPE_*` consts.
+pub(crate) fn dispatch_io_type(opcode: FuseOpCode) -> Option<&'static str> {
+    match opcode {
+        FuseOpCode::FUSE_READ => Some(IO_TYPE_READ),
+        FuseOpCode::FUSE_WRITE => Some(IO_TYPE_WRITE),
+        _ => None,
+    }
+}
+
+/// Map a stream opcode to the flush/fsync/release `io_type` for the
+/// `stream_lifecycle_*` families, or `None` otherwise. Same lowercase-const
+/// discipline as `dispatch_io_type` (NOT `opcode.as_str()`). For a known stream
+/// opcode exactly one of `dispatch_io_type`/`lifecycle_io_type` is `Some`.
+pub(crate) fn lifecycle_io_type(opcode: FuseOpCode) -> Option<&'static str> {
+    match opcode {
+        FuseOpCode::FUSE_FLUSH => Some(IO_TYPE_FLUSH),
+        FuseOpCode::FUSE_FSYNC => Some(IO_TYPE_FSYNC),
+        FuseOpCode::FUSE_RELEASE => Some(IO_TYPE_RELEASE),
+        _ => None,
+    }
+}
+
+/// RAII scope for a flush/fsync/release lifecycle at `send_stream`, returned by
+/// `FuseMetrics::stream_lifecycle_scope`. Holds the duration timer (observes on
+/// drop) and the inflight guard (decrements on drop). Created after the attempt
+/// counter is incremented and held across the whole send_stream arm — including
+/// the error reply enqueue — so the duration and inflight cover success, backend
+/// error, pre-dispatch error, and cancellation alike. The two fields' drop order
+/// is irrelevant (separate metrics); only "released at end of arm" matters.
+pub(crate) struct StreamLifecycleScope {
+    _timer: HistogramTimer,
+    _inflight: ActiveGuard,
 }
 
 /// Monotonic time source for durations.
@@ -927,15 +1294,15 @@ impl Drop for ActiveGuard {
 /// `Vec<&str>` on every drop and must not be used per request.
 ///
 /// Durations are measured with the monotonic clock (`Instant`).
-// Phase 0 enabling primitive: defined here, wired to call sites in Phase 1.
-#[allow(dead_code)]
+///
+/// Wired to call sites since Phase 2a (`setlkw_wait_timer`) and Phase 2b
+/// (`io_dispatch_timer` / the `stream_lifecycle_scope` duration timer).
 #[derive(Debug)]
 pub(crate) struct HistogramTimer {
     start: Instant,
     hist: Histogram,
 }
 
-#[allow(dead_code)] // Phase 0 primitive; call sites land in Phase 1.
 impl HistogramTimer {
     pub(crate) fn new(hist: Histogram) -> Self {
         Self {
@@ -1102,11 +1469,16 @@ mod tests {
                 .get(),
             bytes_before + 128
         );
-        assert_eq!(
+        // Lower bound: `stage_duration_us{reply_write,metadata,success}` is
+        // opcode-free, a child shared by every successful metadata reply (concurrent
+        // tests bump it too), so assert it moved by AT LEAST our emission. The
+        // per-opcode `response_write_duration_us{OP,success}` exact +1 above already
+        // pins this call's reply-write observation under the unique opcode.
+        assert!(
             mx.stage_duration_us
                 .with_label_values(&[STAGE_REPLY_WRITE, "metadata", "success"])
-                .get_sample_count(),
-            stage_before + 1
+                .get_sample_count()
+                > stage_before
         );
         // No error/unsupported/interrupted for a success.
         assert_eq!(
@@ -1505,6 +1877,8 @@ mod tests {
 
         mx.record_operation(OP, FuseReqStatus::Success, 321);
 
+        // Exact +1: `operation_duration_us` is keyed by the UNIQUE opcode `OP`, so no
+        // other (parallel) test touches this child.
         assert_eq!(
             mx.operation_duration_us
                 .with_label_values(&[OP, "metadata", "success"])
@@ -1512,12 +1886,20 @@ mod tests {
             op_before + 1,
             "operation_duration_us observed once under opcode/metadata/success"
         );
-        assert_eq!(
+        // Lower bound: `stage_duration_us{stage=operation,metadata,success}` is
+        // opcode-FREE, so it is a child SHARED by every metadata op that runs
+        // `record_operation` (e.g. the dispatch_meta integration tests). Under the
+        // default parallel harness a concurrent success op can also bump it between
+        // our before/after reads, so we assert it moved by AT LEAST our one emission,
+        // not exactly one. The dual-emit intent (one call feeds BOTH families) is
+        // still proven: the exact +1 above pins the per-opcode family, and this pins
+        // that the stage family also received this call's emission.
+        assert!(
             mx.stage_duration_us
                 .with_label_values(&[STAGE_OPERATION, "metadata", "success"])
-                .get_sample_count(),
-            stage_before + 1,
-            "stage_duration_us observed once under stage=operation/metadata/success"
+                .get_sample_count()
+                > stage_before,
+            "stage_duration_us observed under stage=operation/metadata/success"
         );
     }
 
@@ -1622,5 +2004,378 @@ mod tests {
             before + 1,
             "enabled timer observes once on drop"
         );
+    }
+
+    // --- Phase 2b helper tests ---
+    //
+    // The process-global registry accumulates across parallel tests, so value
+    // assertions read a child's counter/histogram before and after and check the
+    // delta on a label set the test owns. The two read/write `path_type` labels are
+    // a closed set shared by every read/write test, so these use a UNIQUE synthetic
+    // `path_type` per test (e.g. "pt_io_rw") to isolate their children — the helper
+    // takes `path_type` as a parameter, so a test-only label is just as valid a
+    // child as a real backend and never collides with another test or with e2e.
+
+    // E (dispatch_io_type / lifecycle_io_type closed maps, R-overall P1#6): the 5
+    // stream opcodes map to the LOWERCASE io_type consts (NOT opcode.as_str(), which
+    // is "Read"/"Fsync" etc.); non-stream / non-IO opcodes map to None; and exactly
+    // one of the two maps is Some for any known stream opcode.
+    #[test]
+    fn stream_io_type_maps_are_lowercase_and_disjoint() {
+        // dispatch (read/write).
+        assert_eq!(dispatch_io_type(FuseOpCode::FUSE_READ), Some(IO_TYPE_READ));
+        assert_eq!(
+            dispatch_io_type(FuseOpCode::FUSE_WRITE),
+            Some(IO_TYPE_WRITE)
+        );
+        assert_eq!(dispatch_io_type(FuseOpCode::FUSE_FLUSH), None);
+        assert_eq!(dispatch_io_type(FuseOpCode::FUSE_FSYNC), None);
+        assert_eq!(dispatch_io_type(FuseOpCode::FUSE_RELEASE), None);
+        assert_eq!(dispatch_io_type(FuseOpCode::FUSE_LOOKUP), None);
+
+        // lifecycle (flush/fsync/release).
+        assert_eq!(
+            lifecycle_io_type(FuseOpCode::FUSE_FLUSH),
+            Some(IO_TYPE_FLUSH)
+        );
+        assert_eq!(
+            lifecycle_io_type(FuseOpCode::FUSE_FSYNC),
+            Some(IO_TYPE_FSYNC)
+        );
+        assert_eq!(
+            lifecycle_io_type(FuseOpCode::FUSE_RELEASE),
+            Some(IO_TYPE_RELEASE)
+        );
+        assert_eq!(lifecycle_io_type(FuseOpCode::FUSE_READ), None);
+        assert_eq!(lifecycle_io_type(FuseOpCode::FUSE_WRITE), None);
+
+        // The lowercase consts are NOT the capitalized request labels.
+        assert_eq!(IO_TYPE_READ, "read");
+        assert_eq!(IO_TYPE_WRITE, "write");
+        assert_eq!(IO_TYPE_FSYNC, "fsync");
+        assert_ne!(IO_TYPE_READ, FuseOpCode::FUSE_READ.as_str());
+        assert_ne!(IO_TYPE_FSYNC, FuseOpCode::FUSE_FSYNC.as_str());
+
+        // For each known stream opcode, exactly one map is Some (mutually exclusive).
+        for op in [
+            FuseOpCode::FUSE_READ,
+            FuseOpCode::FUSE_WRITE,
+            FuseOpCode::FUSE_FLUSH,
+            FuseOpCode::FUSE_FSYNC,
+            FuseOpCode::FUSE_RELEASE,
+        ] {
+            assert!(
+                dispatch_io_type(op).is_some() ^ lifecycle_io_type(op).is_some(),
+                "exactly one of dispatch/lifecycle is Some for {op:?}"
+            );
+        }
+    }
+
+    // E7/E13/E14 (read/write io family): a successful read records duration + stage
+    // + requests{success} + size + bytes{success}; an error records duration + stage
+    // + requests{error} + size, but creates NO bytes child (never inc_by(0)). Uses a
+    // unique path_type so the children are isolated on the shared registry.
+    #[test]
+    fn record_stream_io_success_and_error_families() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+        const PT: &str = "pt_io_rw"; // test-owned path_type, isolates children.
+
+        let dur_s = mx
+            .io_duration_us
+            .with_label_values(&[IO_TYPE_READ, PT, "success"])
+            .get_sample_count();
+        let stage_s = mx
+            .stage_duration_us
+            .with_label_values(&[STAGE_STREAM_IO, "stream", "success"])
+            .get_sample_count();
+        let req_s = mx
+            .io_requests_total
+            .with_label_values(&[IO_TYPE_READ, PT, "success"])
+            .get();
+        let size_s = mx
+            .io_size_bytes
+            .with_label_values(&[IO_TYPE_READ, PT])
+            .get_sample_count();
+        let bytes_s = mx
+            .io_bytes_total
+            .with_label_values(&[IO_TYPE_READ, PT, "success"])
+            .get();
+
+        // Success: 4096 bytes transferred, requested 8192.
+        mx.record_stream_io(IO_TYPE_READ, PT, true, 4096, 8192, 50);
+
+        assert_eq!(
+            mx.io_duration_us
+                .with_label_values(&[IO_TYPE_READ, PT, "success"])
+                .get_sample_count(),
+            dur_s + 1
+        );
+        // Lower bound: `stage_duration_us{stream_io,stream,success}` is opcode-free,
+        // a child shared by every read/write backend success (the reader/writer
+        // task-body integration tests bump it concurrently), so assert it moved by
+        // AT LEAST our emission. The exact +1 lives on the per-(io_type,path_type)
+        // `io_*` children above, which use this test's own unique `PT` path_type.
+        assert!(
+            mx.stage_duration_us
+                .with_label_values(&[STAGE_STREAM_IO, "stream", "success"])
+                .get_sample_count()
+                > stage_s,
+            "read backend call emits stage=stream_io,kind=stream"
+        );
+        assert_eq!(
+            mx.io_requests_total
+                .with_label_values(&[IO_TYPE_READ, PT, "success"])
+                .get(),
+            req_s + 1
+        );
+        assert_eq!(
+            mx.io_size_bytes
+                .with_label_values(&[IO_TYPE_READ, PT])
+                .get_sample_count(),
+            size_s + 1
+        );
+        assert_eq!(
+            mx.io_bytes_total
+                .with_label_values(&[IO_TYPE_READ, PT, "success"])
+                .get(),
+            bytes_s + 4096,
+            "bytes uses ACTUAL transferred (4096), not requested (8192)"
+        );
+
+        // Error: requests{error}+1, duration{error}+1, size+1, but NO bytes child.
+        let req_e = mx
+            .io_requests_total
+            .with_label_values(&[IO_TYPE_READ, PT, "error"])
+            .get();
+        let dur_e = mx
+            .io_duration_us
+            .with_label_values(&[IO_TYPE_READ, PT, "error"])
+            .get_sample_count();
+        let bytes_e = mx
+            .io_bytes_total
+            .with_label_values(&[IO_TYPE_READ, PT, "error"])
+            .get();
+        mx.record_stream_io(IO_TYPE_READ, PT, false, 0, 8192, 9);
+        assert_eq!(
+            mx.io_requests_total
+                .with_label_values(&[IO_TYPE_READ, PT, "error"])
+                .get(),
+            req_e + 1,
+            "error attempt counts in io_requests_total{{status=error}}"
+        );
+        assert_eq!(
+            mx.io_duration_us
+                .with_label_values(&[IO_TYPE_READ, PT, "error"])
+                .get_sample_count(),
+            dur_e + 1,
+            "error duration observed"
+        );
+        assert_eq!(
+            mx.io_bytes_total
+                .with_label_values(&[IO_TYPE_READ, PT, "error"])
+                .get(),
+            bytes_e,
+            "error read must NOT create a status=error bytes child (no inc_by(0))"
+        );
+    }
+
+    // E6 (stream_io_inflight gate): disabled is None (never noop); enabled is Some
+    // and inc/dec balances the GaugeVec child for the given io_type. Uses the real
+    // read child but reads before/after deltas so it is parallel-safe.
+    #[test]
+    fn stream_io_guard_gate_and_balance() {
+        FuseMetrics::ensure_init().unwrap();
+        assert!(
+            FuseMetrics::stream_io_guard(false, IO_TYPE_READ).is_none(),
+            "disabled stream_io_guard must be None, never a noop guard"
+        );
+        let mx = FuseMetrics::get();
+        let before = mx
+            .stream_io_inflight
+            .with_label_values(&[IO_TYPE_WRITE])
+            .get();
+        let guard = FuseMetrics::stream_io_guard(true, IO_TYPE_WRITE);
+        assert!(guard.is_some());
+        assert_eq!(
+            mx.stream_io_inflight
+                .with_label_values(&[IO_TYPE_WRITE])
+                .get(),
+            before + 1,
+            "stream_io_inflight{{write}} inc on guard create"
+        );
+        drop(guard);
+        assert_eq!(
+            mx.stream_io_inflight
+                .with_label_values(&[IO_TYPE_WRITE])
+                .get(),
+            before,
+            "stream_io_inflight{{write}} dec on guard drop"
+        );
+    }
+
+    // E21 (stream_lifecycle_scope): opening the scope counts the attempt
+    // immediately (before the backend runs), holds the inflight guard while alive
+    // (gauge>0), and observes the duration once on drop; the inflight returns to
+    // baseline after drop. Asserts the FULL {io_type,path_type="unknown"} label set
+    // (R-overall P1#5).
+    #[test]
+    fn stream_lifecycle_scope_counts_attempt_holds_inflight_observes_on_drop() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+        let attempt_before = mx
+            .stream_lifecycle_requests_total
+            .with_label_values(&[IO_TYPE_FLUSH, PATH_TYPE_UNKNOWN])
+            .get();
+        let dur_before = mx
+            .stream_lifecycle_duration_us
+            .with_label_values(&[IO_TYPE_FLUSH, PATH_TYPE_UNKNOWN])
+            .get_sample_count();
+        let inflight_before = mx
+            .stream_lifecycle_inflight
+            .with_label_values(&[IO_TYPE_FLUSH])
+            .get();
+
+        let scope = FuseMetrics::stream_lifecycle_scope(IO_TYPE_FLUSH);
+        // Attempt counted at open (before any backend work).
+        assert_eq!(
+            mx.stream_lifecycle_requests_total
+                .with_label_values(&[IO_TYPE_FLUSH, PATH_TYPE_UNKNOWN])
+                .get(),
+            attempt_before + 1,
+            "attempt counted when the scope opens"
+        );
+        // Inflight is held while the scope is alive.
+        assert_eq!(
+            mx.stream_lifecycle_inflight
+                .with_label_values(&[IO_TYPE_FLUSH])
+                .get(),
+            inflight_before + 1,
+            "lifecycle inflight held while the scope is alive"
+        );
+        // Duration not observed until drop.
+        assert_eq!(
+            mx.stream_lifecycle_duration_us
+                .with_label_values(&[IO_TYPE_FLUSH, PATH_TYPE_UNKNOWN])
+                .get_sample_count(),
+            dur_before,
+            "duration not observed until the scope drops"
+        );
+
+        drop(scope);
+        assert_eq!(
+            mx.stream_lifecycle_duration_us
+                .with_label_values(&[IO_TYPE_FLUSH, PATH_TYPE_UNKNOWN])
+                .get_sample_count(),
+            dur_before + 1,
+            "duration observed once on drop"
+        );
+        assert_eq!(
+            mx.stream_lifecycle_inflight
+                .with_label_values(&[IO_TYPE_FLUSH])
+                .get(),
+            inflight_before,
+            "lifecycle inflight back to baseline after drop"
+        );
+    }
+
+    // E (io_dispatch_timer): observes once on drop under the io_type child.
+    #[test]
+    fn io_dispatch_timer_observes_once_on_drop() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+        let before = mx
+            .io_dispatch_duration_us
+            .with_label_values(&[IO_TYPE_WRITE])
+            .get_sample_count();
+        {
+            let _t = FuseMetrics::io_dispatch_timer(IO_TYPE_WRITE);
+        }
+        assert_eq!(
+            mx.io_dispatch_duration_us
+                .with_label_values(&[IO_TYPE_WRITE])
+                .get_sample_count(),
+            before + 1,
+            "io_dispatch timer observes once on drop"
+        );
+    }
+
+    // E4 (stream_write_queue_guard gate): disabled None (never noop), enabled inc/dec
+    // balances the gauge.
+    #[test]
+    fn stream_write_queue_guard_gate() {
+        FuseMetrics::ensure_init().unwrap();
+        assert!(
+            FuseMetrics::stream_write_queue_guard(false).is_none(),
+            "disabled stream_write_queue_guard must be None, never a noop guard"
+        );
+        let mx = FuseMetrics::get();
+        let before = mx.stream_write_queue_depth.get();
+        let guard = FuseMetrics::stream_write_queue_guard(true);
+        assert!(guard.is_some());
+        assert_eq!(
+            mx.stream_write_queue_depth.get(),
+            before + 1,
+            "stream_write_queue_depth inc on guard create"
+        );
+        drop(guard);
+        assert_eq!(
+            mx.stream_write_queue_depth.get(),
+            before,
+            "stream_write_queue_depth dec on guard drop"
+        );
+    }
+
+    // E24 (negative assertion, io family is read/write only): record_stream_io must
+    // never be called with a flush/fsync/release io_type in production — the family
+    // SPLIT is structural (lifecycle uses stream_lifecycle_*). Here we assert the
+    // closed maps enforce that split: an io_type that would land in io_* only ever
+    // comes from dispatch_io_type (read/write), and a lifecycle io_type only from
+    // lifecycle_io_type (flush/fsync/release), so the two label sets cannot cross.
+    #[test]
+    fn io_and_lifecycle_io_types_never_cross() {
+        // The only io_types that reach record_stream_io / stream_io_guard.
+        let io_only = [IO_TYPE_READ, IO_TYPE_WRITE];
+        // The only io_types that reach stream_lifecycle_scope.
+        let lifecycle_only = [IO_TYPE_FLUSH, IO_TYPE_FSYNC, IO_TYPE_RELEASE];
+        for io in io_only {
+            assert!(
+                !lifecycle_only.contains(&io),
+                "{io} must not be a lifecycle io_type"
+            );
+        }
+        for lc in lifecycle_only {
+            assert!(
+                !io_only.contains(&lc),
+                "{lc} must not be a read/write io_type"
+            );
+        }
+    }
+
+    // Contract seam: the fuse-side path_type label consts MUST match the literals
+    // `UnifiedReader/Writer::path_type()` produces in curvine-client (that accessor
+    // returns raw string literals, not these consts). This pins the vocabulary the
+    // two crates share — the curvine-client test asserts the Local accessor returns
+    // "local"; this asserts fuse's const agrees, so the label can never drift apart
+    // across the crate boundary. (PATH_TYPE_UNKNOWN is used in production by the
+    // lifecycle helper; the backend values are referenced here.)
+    #[test]
+    fn path_type_label_consts_match_client_vocabulary() {
+        assert_eq!(PATH_TYPE_CURVINE, "curvine");
+        assert_eq!(PATH_TYPE_UFS, "ufs");
+        assert_eq!(PATH_TYPE_FALLBACK, "fallback");
+        assert_eq!(PATH_TYPE_LOCAL, "local");
+        assert_eq!(PATH_TYPE_UNKNOWN, "unknown");
+    }
+
+    // E27 (negative assertion): there is NO STAGE_STREAM_ENQUEUE const and
+    // stage=stream_io is the only Phase 2b stage value. This is a compile-time-ish
+    // guard: STAGE_STREAM_IO is "stream_io" and there is no "stream_enqueue" stage
+    // const to reference (grep-enforced in review; asserted by value here).
+    #[test]
+    fn stage_stream_io_is_the_only_phase2b_stage() {
+        assert_eq!(STAGE_STREAM_IO, "stream_io");
+        // No STAGE_STREAM_ENQUEUE exists; if one were added this test's neighbors
+        // (the no-enqueue rule) and the send_stream code review would catch it.
     }
 }

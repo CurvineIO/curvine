@@ -1079,26 +1079,35 @@ mod test {
     // through the `*_handle_locked` wrappers, the same before/after pattern as
     // `meta_task_guard_gate`.
     //
-    // Concurrency note: these are now the ONLY tests in this binary that write
-    // `file_handle_num`/`dir_handle_num` — the invariant tests above were moved
-    // off the gauge-writing wrappers onto the gauge-free map_* cores precisely so
-    // they no longer pollute these deltas (PR #941 review). Production
+    // Concurrency note: this is the ONLY test in this binary that writes
+    // `file_handle_num`/`dir_handle_num` — the invariant tests above were moved off
+    // the gauge-writing wrappers onto the gauge-free map_* cores precisely so they
+    // no longer pollute these deltas (PR #941 review). Production
     // `new_handle`/`new_dir_handle` need a live backend, so no other test drives
-    // them either. The file test touches only `file_handle_num` and the dir test
-    // only `dir_handle_num`, so they don't race each other. We assert deltas (not
-    // absolutes) since other tests' `ensure_init` leaves an unknown start. If a
-    // future test writes these gauges, switch to an injected gauge or serialize.
-
+    // them either.
+    //
+    // The file and dir cases are a SINGLE test (not two) on purpose: each case's
+    // cross-non-interference assertion READS the OTHER gauge (the dir case asserts
+    // `file_handle_num` is untouched, and vice versa), while the sibling case WRITES
+    // it. As two `#[test]`s they raced under the default parallel harness — the dir
+    // test could observe the file test's in-flight `+1` and see `file_handle_num !=
+    // file_before` (a spurious `left:0 right:1`). Run sequentially in one test, there
+    // is no concurrent writer of either gauge, so the cross-gauge reads are stable.
+    // We assert deltas (not absolutes) since other tests' `ensure_init` leaves an
+    // unknown start. If a future test writes these gauges, switch to an injected
+    // gauge or serialize.
     #[test]
-    fn insert_file_handle_inc_then_remove_dec_the_file_gauge() {
+    fn handle_chokepoints_inc_dec_their_own_gauge_only() {
         crate::FuseMetrics::ensure_init().unwrap();
         let mx = crate::FuseMetrics::get();
-        let mut map: FastHashMap<u64, FastHashMap<u64, Arc<FileHandle>>> = FastHashMap::default();
 
+        // --- file handle: inc/dec file_handle_num, must not touch dir_handle_num ---
+        let mut file_map: FastHashMap<u64, FastHashMap<u64, Arc<FileHandle>>> =
+            FastHashMap::default();
         let file_before = mx.file_handle_num.get();
         let dir_before = mx.dir_handle_num.get();
 
-        NodeState::insert_file_handle_locked(&mut map, 7, 70, file_handle(7, 70));
+        NodeState::insert_file_handle_locked(&mut file_map, 7, 70, file_handle(7, 70));
         assert_eq!(
             mx.file_handle_num.get(),
             file_before + 1,
@@ -1110,24 +1119,21 @@ mod test {
             "file handle must NOT touch dir_handle_num"
         );
 
-        NodeState::remove_file_handle_locked(&mut map, 7, 70);
+        NodeState::remove_file_handle_locked(&mut file_map, 7, 70);
         assert_eq!(
             mx.file_handle_num.get(),
             file_before,
             "removing the fh must dec file_handle_num back"
         );
-    }
 
-    #[test]
-    fn insert_dir_handle_inc_then_remove_dec_the_dir_gauge() {
-        crate::FuseMetrics::ensure_init().unwrap();
-        let mx = crate::FuseMetrics::get();
-        let mut map: FastHashMap<u64, FastHashMap<u64, Arc<DirHandle>>> = FastHashMap::default();
-
+        // --- dir handle: inc/dec dir_handle_num, must not touch file_handle_num ---
+        // Re-read baselines: both gauges are back to their pre-file-case values now.
+        let mut dir_map: FastHashMap<u64, FastHashMap<u64, Arc<DirHandle>>> =
+            FastHashMap::default();
         let dir_before = mx.dir_handle_num.get();
         let file_before = mx.file_handle_num.get();
 
-        NodeState::insert_dir_handle_locked(&mut map, 8, 80, dir_handle(8, 80));
+        NodeState::insert_dir_handle_locked(&mut dir_map, 8, 80, dir_handle(8, 80));
         assert_eq!(
             mx.dir_handle_num.get(),
             dir_before + 1,
@@ -1139,7 +1145,7 @@ mod test {
             "dir handle must NOT touch file_handle_num"
         );
 
-        NodeState::remove_dir_handle_locked(&mut map, 8, 80);
+        NodeState::remove_dir_handle_locked(&mut dir_map, 8, 80);
         assert_eq!(
             mx.dir_handle_num.get(),
             dir_before,
