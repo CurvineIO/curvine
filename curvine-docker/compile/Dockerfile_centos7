@@ -75,6 +75,19 @@ RUN yum install -y centos-release-scl && \
     automake \
     libtool \
     pciutils-devel \
+    CUnit-devel \
+    libaio-devel \
+    ncurses-devel \
+    json-c-devel \
+    libcmocka-devel \
+    keyutils \
+    keyutils-libs-devel \
+    patchelf \
+    systemtap-sdt-devel \
+    python \
+    python-devel \
+    python3-devel \
+    help2man \
     && yum clean all
 
 # Enable devtoolset-11 and llvm-toolset-7 for all subsequent build steps
@@ -175,12 +188,12 @@ ENV LD_LIBRARY_PATH="${JINDOSDK_HOME}/lib:${LD_LIBRARY_PATH}"
 
 # 4.2. Build SPDK once in the compile image. Runtime and test images consume
 # /opt/spdk from this image instead of rebuilding SPDK in deploy Dockerfiles.
-RUN cd /tmp && \
+RUN ln -sf /usr/bin/cmake3 /usr/local/bin/cmake && \
+    pip3 install ninja meson pyelftools ijson Jinja2 pyyaml && \
+    cd /tmp && \
     git clone --depth 1 --branch "$SPDK_VERSION" --single-branch https://github.com/spdk/spdk.git spdk-src && \
     cd spdk-src && \
     git submodule update --init && \
-    scripts/pkgdep.sh --rdma && \
-    yum clean all && \
     curl -sL https://www.nasm.us/pub/nasm/releasebuilds/$NASM_VERSION/nasm-$NASM_VERSION.tar.gz | \
         tar -xz -C /tmp && \
     cd /tmp/nasm-$NASM_VERSION && \
