@@ -49,7 +49,7 @@ pub struct FallbackFsReader {
     ufs_reader: Option<UfsReader>,
     ufs_path: Path,
     ufs_fs: UfsFileSystem,
-    /// True when the mount is FsMode. Controls whether the snapshot consistency check 
+    /// True when the mount is FsMode. Controls whether the snapshot consistency check
     /// gates the fallback to UFS. CacheMode (false) reads S3 directly without validation.
     is_fs_mode: bool,
 }
