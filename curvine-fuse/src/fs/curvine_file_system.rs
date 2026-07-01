@@ -572,6 +572,8 @@ impl CurvineFileSystem {
             } else {
                 return err_fuse!(libc::EACCES);
             }
+        } else if let Some(writer) = self.state.find_writer(&ino) {
+            writer.lock().await.resize(opts).await?;
         } else {
             self.fs.resize(path, opts).await?;
         };
