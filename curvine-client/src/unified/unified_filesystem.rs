@@ -318,6 +318,7 @@ impl UnifiedFileSystem {
                     cv_reader,
                     ufs_path.clone(),
                     mount.ufs.clone(),
+                    mount.info.is_fs_mode(),
                 )))
             } else if blocks.ufs_exists() {
                 Ok(None)
@@ -336,6 +337,7 @@ impl UnifiedFileSystem {
                         cv_reader,
                         ufs_path.clone(),
                         mount.ufs.clone(),
+                        mount.info.is_fs_mode(),
                     )))
                 }
                 CacheValidity::Invalid(_) => Ok(None),
