@@ -48,8 +48,7 @@ jobs:
             {"build_type":"ubuntu24.04","dockerfile":"Dockerfile_ubuntu24","context":"./curvine-docker/compile","tag":"ubuntu24.04","arch":"arm64","runner":"ubuntu-24.04-arm"},
             {"build_type":"amzn2","dockerfile":"Dockerfile_amzn2","context":"./curvine-docker/compile","tag":"amzn2","arch":"amd64","runner":"ubuntu-latest"},
             {"build_type":"amzn2","dockerfile":"Dockerfile_amzn2","context":"./curvine-docker/compile","tag":"amzn2","arch":"arm64","runner":"ubuntu-24.04-arm"},
-            {"build_type":"centos7","dockerfile":"Dockerfile_centos7","context":"./curvine-docker/compile","tag":"centos7","arch":"amd64","runner":"ubuntu-latest"},
-            {"build_type":"centos7","dockerfile":"Dockerfile_centos7","context":"./curvine-docker/compile","tag":"centos7","arch":"arm64","runner":"ubuntu-24.04-arm"}
+            {"build_type":"centos7","dockerfile":"Dockerfile_centos7","context":"./curvine-docker/compile","tag":"centos7","arch":"amd64","runner":"ubuntu-latest"}
           ]'
 
           BUILD_TYPES="${BUILD_TYPES:-all}"

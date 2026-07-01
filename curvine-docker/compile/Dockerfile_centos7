@@ -178,7 +178,7 @@ ENV LD_LIBRARY_PATH="${JINDOSDK_HOME}/lib:${LD_LIBRARY_PATH}"
 RUN cd /tmp && \
     git clone --depth 1 --branch "$SPDK_VERSION" --single-branch https://github.com/spdk/spdk.git spdk-src && \
     cd spdk-src && \
-    git submodule update --init --depth 1 && \
+    git submodule update --init && \
     scripts/pkgdep.sh --rdma && \
     yum clean all && \
     curl -sL https://www.nasm.us/pub/nasm/releasebuilds/$NASM_VERSION/nasm-$NASM_VERSION.tar.gz | \
