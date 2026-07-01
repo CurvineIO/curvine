@@ -514,7 +514,9 @@ impl NodeState {
         handle: Arc<FileHandle>,
     ) {
         if Self::map_insert_handle(lock, ino, fh, handle) {
-            FuseMetrics::with(|m| m.file_handle_num.inc());
+            FuseMetrics::with(|m| {
+                Self::inc_gauges_lockstep(&m.file_handle_num, &m.file_handle_count)
+            });
         }
     }
 
@@ -529,7 +531,9 @@ impl NodeState {
     ) -> Option<Arc<FileHandle>> {
         let (handle, removed) = Self::map_remove_handle(lock, ino, fh);
         if removed {
-            FuseMetrics::with(|m| m.file_handle_num.dec());
+            FuseMetrics::with(|m| {
+                Self::dec_gauges_lockstep(&m.file_handle_num, &m.file_handle_count)
+            });
         }
         handle
     }
@@ -694,7 +698,9 @@ impl NodeState {
         handle: Arc<DirHandle>,
     ) {
         if Self::map_insert_handle(lock, ino, fh, handle) {
-            FuseMetrics::with(|m| m.dir_handle_num.inc());
+            FuseMetrics::with(|m| {
+                Self::inc_gauges_lockstep(&m.dir_handle_num, &m.dir_handle_count)
+            });
         }
     }
 
@@ -707,7 +713,9 @@ impl NodeState {
     ) -> Option<Arc<DirHandle>> {
         let (handle, removed) = Self::map_remove_handle(lock, ino, fh);
         if removed {
-            FuseMetrics::with(|m| m.dir_handle_num.dec());
+            FuseMetrics::with(|m| {
+                Self::dec_gauges_lockstep(&m.dir_handle_num, &m.dir_handle_count)
+            });
         }
         handle
     }
@@ -917,12 +925,11 @@ impl NodeState {
         // covering the Ok path and every early-? above. inode_num is not touched
         // here (NodeMap::restore already owns it).
         FuseMetrics::with(|m| {
-            Self::sync_handle_gauges(
-                &m.file_handle_num,
-                self.file_handles_len(),
-                &m.dir_handle_num,
-                self.dir_handles_len(),
-            )
+            let file_len = self.file_handles_len();
+            let dir_len = self.dir_handles_len();
+            Self::sync_handle_gauges(&m.file_handle_num, file_len, &m.dir_handle_num, dir_len);
+            // Phase 3b-1: namespaced aliases set from the same live counts.
+            Self::sync_handle_gauges(&m.file_handle_count, file_len, &m.dir_handle_count, dir_len);
         });
 
         if result.is_ok() {
@@ -945,6 +952,23 @@ impl NodeState {
     ) {
         file_gauge.set(file_len as i64);
         dir_gauge.set(dir_len as i64);
+    }
+
+    /// Increment a legacy gauge and its Phase 3b-1 namespaced alias in lockstep.
+    /// Extracted as a `&Gauge` taker (like [`Self::sync_handle_gauges`]) so the
+    /// "legacy and alias move together" invariant is unit-testable against
+    /// injected, isolated gauges — the process-global handle gauges are written
+    /// by parallel tests, so a direct assertion on them would be flaky. Both are
+    /// single atomic adds, safe to call inside the in-lock `FuseMetrics::with`.
+    fn inc_gauges_lockstep(legacy: &orpc::common::Gauge, alias: &orpc::common::Gauge) {
+        legacy.inc();
+        alias.inc();
+    }
+
+    /// Decrement counterpart of [`Self::inc_gauges_lockstep`].
+    fn dec_gauges_lockstep(legacy: &orpc::common::Gauge, alias: &orpc::common::Gauge) {
+        legacy.dec();
+        alias.dec();
     }
 }
 
@@ -1102,6 +1126,9 @@ mod test {
         let mx = crate::FuseMetrics::get();
 
         // --- file handle: inc/dec file_handle_num, must not touch dir_handle_num ---
+        // (Namespaced-alias lockstep is proven separately against injected,
+        // isolated gauges in `inc_dec_gauges_lockstep_move_both_together`, to keep
+        // this process-global-gauge test free of extra flaky absolute assertions.)
         let mut file_map: FastHashMap<u64, FastHashMap<u64, Arc<FileHandle>>> =
             FastHashMap::default();
         let file_before = mx.file_handle_num.get();
@@ -1151,6 +1178,33 @@ mod test {
             dir_before,
             "removing the fh must dec dir_handle_num back"
         );
+    }
+
+    // Phase 3b-1: prove the legacy gauge and its namespaced alias move together
+    // on inc/dec, against INJECTED isolated gauges (not the process-global ones),
+    // so the assertion is exact yet parallel-test safe (the production chokepoints
+    // call these same helpers inside their `FuseMetrics::with` closure).
+    #[test]
+    fn inc_dec_gauges_lockstep_move_both_together() {
+        let legacy = orpc::common::Metrics::new_gauge(
+            "test_lockstep_legacy_gauge_unique",
+            "isolated legacy gauge",
+        )
+        .unwrap();
+        let alias = orpc::common::Metrics::new_gauge(
+            "test_lockstep_alias_gauge_unique",
+            "isolated alias gauge",
+        )
+        .unwrap();
+
+        NodeState::inc_gauges_lockstep(&legacy, &alias);
+        NodeState::inc_gauges_lockstep(&legacy, &alias);
+        assert_eq!(legacy.get(), 2, "legacy inc'd twice");
+        assert_eq!(alias.get(), 2, "alias must track legacy on inc");
+
+        NodeState::dec_gauges_lockstep(&legacy, &alias);
+        assert_eq!(legacy.get(), 1, "legacy dec'd once");
+        assert_eq!(alias.get(), 1, "alias must track legacy on dec");
     }
 
     // The restore handle finalizer feeds file_handles_len()/dir_handles_len() to

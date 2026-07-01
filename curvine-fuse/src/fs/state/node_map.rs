@@ -55,7 +55,10 @@ impl NodeMap {
         // production mount. Assumes one FUSE mount / one NodeState per process
         // (the CLI builds a single CurvineFileSystem); multi-mount would need a
         // per-state aggregator instead.
-        FuseMetrics::with(|m| m.inode_num.set(1));
+        FuseMetrics::with(|m| {
+            m.inode_num.set(1);
+            m.inode_count.set(1);
+        });
         Self {
             nodes,
             names: FastHashMap::default(),
@@ -83,7 +86,10 @@ impl NodeMap {
     fn insert_node(&mut self, id: u64, node: NodeAttr) -> Option<NodeAttr> {
         let prev = self.nodes.insert(id, node);
         if prev.is_none() {
-            FuseMetrics::with(|m| m.inode_num.inc());
+            FuseMetrics::with(|m| {
+                m.inode_num.inc();
+                m.inode_count.inc();
+            });
         }
         prev
     }
@@ -95,7 +101,10 @@ impl NodeMap {
     fn remove_node(&mut self, id: u64) -> Option<NodeAttr> {
         let removed = self.nodes.remove(&id);
         if removed.is_some() {
-            FuseMetrics::with(|m| m.inode_num.dec());
+            FuseMetrics::with(|m| {
+                m.inode_num.dec();
+                m.inode_count.dec();
+            });
         }
         removed
     }
@@ -370,7 +379,13 @@ impl NodeMap {
         if let Some(exists_node) = self.lookup_node(new_id, Some(new_name)).cloned() {
             self.delete_name(&exists_node)?;
             if exists_node.should_unref() {
-                self.nodes.remove(&exists_node.id);
+                // Go through the remove_node chokepoint (not a bare
+                // `self.nodes.remove`) so both the legacy `inode_num` and the
+                // namespaced `inode_count` gauges decrement with the live map.
+                // The name mapping was already cleared by `delete_name` above,
+                // so we must NOT call `delete_node` here (that would re-run
+                // delete_name / parent-ref changes) — only the inode removal.
+                self.remove_node(exists_node.id);
             }
         }
 
@@ -595,7 +610,11 @@ impl NodeMap {
         // Single inode_num set from the live map count — runs on success and on
         // every early-return above (the closure captured `&mut self`, so reading
         // `self.nodes.len()` here is fine and reflects whatever was loaded).
-        FuseMetrics::with(|m| Self::sync_inode_gauge(&m.inode_num, self.nodes.len()));
+        FuseMetrics::with(|m| {
+            let live = self.nodes.len();
+            Self::sync_inode_gauge(&m.inode_num, live);
+            Self::sync_inode_gauge(&m.inode_count, live);
+        });
         result
     }
 
@@ -707,6 +726,44 @@ mod tests {
         );
         // The inode survives under its new parent, same id.
         assert!(map.get(src).is_some(), "renamed inode keeps its id");
+    }
+
+    #[test]
+    fn rename_overwrite_unreffed_target_drops_one_inode() {
+        // rename onto an EXISTING target whose `should_unref()` is true must
+        // remove the target inode through the `remove_node` chokepoint, so the
+        // live count drops by exactly one (and, in production, both the legacy
+        // `inode_num` and the namespaced `inode_count` gauges decrement). This is
+        // the path that previously did a bare `self.nodes.remove`, drifting the
+        // gauges. We assert on `nodes_len()` (the value the gauges track) rather
+        // than the process-global gauge, to stay parallel-test safe.
+        let mut map = test_map();
+        let src = map.find_node(FUSE_ROOT_ID, Some("src")).unwrap().id;
+        let target = map.find_node(FUSE_ROOT_ID, Some("target")).unwrap().id;
+
+        // Make the target collectible: drop its lookup to 0 (find_node set it to
+        // 1) so `should_unref()` (n_lookup==0 && ref_ctr==0 && !root) holds.
+        map.get_mut(target).unwrap().sub_lookup(1);
+        assert!(
+            map.get(target).unwrap().should_unref(),
+            "target must be unref-able to exercise the remove branch"
+        );
+
+        let before = map.nodes_len();
+        map.rename_node(FUSE_ROOT_ID, "src", FUSE_ROOT_ID, "target")
+            .unwrap();
+
+        assert_eq!(
+            map.nodes_len(),
+            before - 1,
+            "overwriting an unreffed target removes exactly one inode"
+        );
+        // The overwritten target id is gone; the source inode took its name.
+        assert!(
+            map.get(target).is_none(),
+            "overwritten target inode removed"
+        );
+        assert!(map.get(src).is_some(), "source inode survives the rename");
     }
 
     #[test]
