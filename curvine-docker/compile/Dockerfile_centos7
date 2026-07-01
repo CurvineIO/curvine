@@ -194,6 +194,8 @@ RUN ln -sf /usr/bin/cmake3 /usr/local/bin/cmake && \
     git clone --depth 1 --branch "$SPDK_VERSION" --single-branch https://github.com/spdk/spdk.git spdk-src && \
     cd spdk-src && \
     git submodule update --init && \
+    python3 -c "from pathlib import Path; p=Path('dpdk/lib/eal/unix/eal_unix_memory.c'); t=p.read_text(); needle='#ifdef RTE_EXEC_ENV_LINUX'; ins='#ifndef MAP_FIXED_NOREPLACE\n#define MAP_FIXED_NOREPLACE MAP_FIXED\n#endif\n\n'; \
+p.write_text(t if 'ifndef MAP_FIXED_NOREPLACE' in t else t.replace(needle, ins + needle, 1))" && \
     curl -sL https://www.nasm.us/pub/nasm/releasebuilds/$NASM_VERSION/nasm-$NASM_VERSION.tar.gz | \
         tar -xz -C /tmp && \
     cd /tmp/nasm-$NASM_VERSION && \
