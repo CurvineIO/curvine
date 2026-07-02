@@ -678,7 +678,7 @@ impl NodeState {
         }
     }
 
-    fn find_open_handle_by_path(&self, path: &Path) -> Option<Arc<FileHandle>> {
+    pub fn find_open_handle_by_path(&self, path: &Path) -> Option<Arc<FileHandle>> {
         let path = path.full_path();
         let lock = self.handles.read();
         lock.values()
