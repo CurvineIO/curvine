@@ -14,7 +14,7 @@
 
 #![cfg(feature = "rust-sdk")]
 
-use curvine_libsdk::sdk::{ConnectOptions, Sdk, SdkBuilder};
+use curvine_libsdk::lib_curvine::{ConnectOptions, LibCurvine, LibCurvineBuilder};
 
 #[test]
 fn connect_options_master_addrs_roundtrip() {
@@ -27,7 +27,7 @@ fn connect_options_master_addrs_roundtrip() {
 
 #[test]
 fn builder_requires_conf_or_masters() {
-    let result = SdkBuilder::new().connect();
+    let result = LibCurvineBuilder::new().connect();
     assert!(result.is_err());
     let err = result.err().expect("error");
     assert!(err.to_string().contains("conf_file or masters"));
@@ -35,7 +35,7 @@ fn builder_requires_conf_or_masters() {
 
 #[test]
 fn builder_accepts_master_addrs() {
-    let built = SdkBuilder::new()
+    let built = LibCurvineBuilder::new()
         .masters(["127.0.0.1:8995"])
         .rpc_timeout_ms(42);
     let _ = built;

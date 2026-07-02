@@ -21,7 +21,7 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::FsResult;
 use std::sync::Arc;
 
-/// How to establish a Curvine SDK session.
+/// How to establish a Curvine libsdk session.
 #[derive(Debug, Clone)]
 pub enum ConnectOptions {
     /// Full `curvine-cluster.toml` path.
@@ -31,13 +31,13 @@ pub enum ConnectOptions {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct SdkBuilder {
+pub struct LibCurvineBuilder {
     masters: Vec<String>,
     conf_path: Option<String>,
     rpc_timeout_ms: Option<u64>,
 }
 
-impl SdkBuilder {
+impl LibCurvineBuilder {
     pub fn new() -> Self {
         Self::default()
     }
@@ -57,26 +57,26 @@ impl SdkBuilder {
         self
     }
 
-    pub fn connect(self) -> FsResult<Sdk> {
+    pub fn connect(self) -> FsResult<LibCurvine> {
         let opts = if let Some(path) = self.conf_path {
             ConnectOptions::ConfigFile(path)
         } else if !self.masters.is_empty() {
             ConnectOptions::MasterAddrs(self.masters)
         } else {
-            return orpc::err_box!("SdkBuilder requires conf_file or masters");
+            return orpc::err_box!("LibCurvineBuilder requires conf_file or masters");
         };
-        Sdk::connect_with_timeout(opts, self.rpc_timeout_ms)
+        LibCurvine::connect_with_timeout(opts, self.rpc_timeout_ms)
     }
 }
 
-pub struct Sdk {
+pub struct LibCurvine {
     session: Arc<Session>,
     master: MasterClient,
     job: JobClient,
     filesystem: FileSystemClient,
 }
 
-impl Sdk {
+impl LibCurvine {
     pub fn connect(opts: ConnectOptions) -> FsResult<Self> {
         Self::connect_with_timeout(opts, None)
     }
@@ -89,8 +89,8 @@ impl Sdk {
         Self::connect(ConnectOptions::MasterAddrs(addrs.into()))
     }
 
-    pub fn builder() -> SdkBuilder {
-        SdkBuilder::new()
+    pub fn builder() -> LibCurvineBuilder {
+        LibCurvineBuilder::new()
     }
 
     fn connect_with_timeout(opts: ConnectOptions, rpc_timeout_ms: Option<u64>) -> FsResult<Self> {

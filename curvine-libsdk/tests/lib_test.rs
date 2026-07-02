@@ -20,7 +20,7 @@ fn compiles_with_default_java_sdk_feature() {
 #[cfg(feature = "rust-sdk")]
 #[test]
 fn compiles_with_rust_sdk_feature() {
-    use curvine_libsdk::sdk::{ConnectOptions, Sdk};
+    use curvine_libsdk::lib_curvine::{ConnectOptions, LibCurvine};
     let _ = ConnectOptions::MasterAddrs(vec!["127.0.0.1:8995".to_string()]);
-    let _ = Sdk::builder();
+    let _ = LibCurvine::builder();
 }

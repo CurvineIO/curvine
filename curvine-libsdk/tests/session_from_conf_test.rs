@@ -33,7 +33,7 @@ fn empty_master_addrs_is_rejected() {
 #[cfg(feature = "rust-sdk")]
 #[test]
 fn sdk_connect_masters_rejects_empty() {
-    let result = curvine_libsdk::sdk::Sdk::connect_masters(Vec::<String>::new());
+    let result = curvine_libsdk::lib_curvine::LibCurvine::connect_masters(Vec::<String>::new());
     assert!(result.is_err());
     let err = result.err().expect("error");
     assert!(err.to_string().contains("master_addrs"));

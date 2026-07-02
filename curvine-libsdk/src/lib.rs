@@ -27,7 +27,7 @@ mod lib_fs_reader;
 pub use self::lib_fs_reader::LibFsReader;
 
 #[cfg(feature = "rust-sdk")]
-pub mod sdk;
+pub mod lib_curvine;
 #[cfg(feature = "rust-sdk")]
 pub mod master;
 #[cfg(feature = "rust-sdk")]
