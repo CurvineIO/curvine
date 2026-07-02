@@ -60,6 +60,13 @@ fn provider_to_str(provider: Option<i32>) -> &'static str {
     }
 }
 
+fn access_mode_to_str(access_mode: Option<i32>) -> &'static str {
+    match access_mode {
+        Some(1) => "read_write",
+        _ => "read_only",
+    }
+}
+
 /// Configuration options for progress display
 pub struct ProgressDisplayOptions {
     /// Progress bar width
@@ -253,6 +260,8 @@ impl Display for GetMountTableResponse {
         let mut ufs_width = 8; // "UFS Path"
         let mut write_type_width = 10; // "Write Type"
         let mut read_verify_ufs_width = 14; // "Read Verify UFS"
+        let mut auto_cache_width = 10; // "Auto Cache"
+        let mut access_mode_width = 11; // "Access Mode"
         let mut storage_width = 7; // "Storage"
         let mut ttl_action_width = 10; // "TTL Action"
         let mut provider_width = 8; // "Provider"
@@ -264,6 +273,15 @@ impl Display for GetMountTableResponse {
             write_type_width = write_type_width.max(write_type_to_str(mnt.write_type()).len());
             read_verify_ufs_width =
                 read_verify_ufs_width.max(if mnt.read_verify_ufs { "yes" } else { "no" }.len());
+            auto_cache_width = auto_cache_width.max(
+                if mnt.auto_cache.unwrap_or(true) {
+                    "yes"
+                } else {
+                    "no"
+                }
+                .len(),
+            );
+            access_mode_width = access_mode_width.max(access_mode_to_str(mnt.access_mode).len());
             storage_width = storage_width.max(storage_type_to_str(mnt.storage_type).len());
             ttl_action_width = ttl_action_width.max(ttl_action_to_str(mnt.ttl_action()).len());
             provider_width = provider_width.max(provider_to_str(mnt.provider).len());
@@ -275,6 +293,8 @@ impl Display for GetMountTableResponse {
         ufs_width += 2;
         write_type_width += 2;
         read_verify_ufs_width += 2;
+        auto_cache_width += 2;
+        access_mode_width += 2;
         storage_width += 2;
         ttl_action_width += 2;
         provider_width += 2;
@@ -289,6 +309,8 @@ impl Display for GetMountTableResponse {
         write!(f, "{:-^width$}+", "", width = ufs_width)?;
         write!(f, "{:-^width$}+", "", width = write_type_width)?;
         write!(f, "{:-^width$}+", "", width = read_verify_ufs_width)?;
+        write!(f, "{:-^width$}+", "", width = auto_cache_width)?;
+        write!(f, "{:-^width$}+", "", width = access_mode_width)?;
         write!(f, "{:-^width$}+", "", width = storage_width)?;
         write!(f, "{:-^width$}+", "", width = ttl_action_width)?;
         writeln!(f, "{:-^width$}+", "", width = provider_width)?;
@@ -310,6 +332,18 @@ impl Display for GetMountTableResponse {
             "Read Verify UFS",
             width = read_verify_ufs_width - 1
         )?;
+        write!(
+            f,
+            " {:<width$}|",
+            "Auto Cache",
+            width = auto_cache_width - 1
+        )?;
+        write!(
+            f,
+            " {:<width$}|",
+            "Access Mode",
+            width = access_mode_width - 1
+        )?;
         write!(f, " {:<width$}|", "Storage", width = storage_width - 1)?;
         write!(
             f,
@@ -326,6 +360,8 @@ impl Display for GetMountTableResponse {
         write!(f, "{:-^width$}+", "", width = ufs_width)?;
         write!(f, "{:-^width$}+", "", width = write_type_width)?;
         write!(f, "{:-^width$}+", "", width = read_verify_ufs_width)?;
+        write!(f, "{:-^width$}+", "", width = auto_cache_width)?;
+        write!(f, "{:-^width$}+", "", width = access_mode_width)?;
         write!(f, "{:-^width$}+", "", width = storage_width)?;
         write!(f, "{:-^width$}+", "", width = ttl_action_width)?;
         writeln!(f, "{:-^width$}+", "", width = provider_width)?;
@@ -347,6 +383,22 @@ impl Display for GetMountTableResponse {
                 " {:<width$}|",
                 if mnt.read_verify_ufs { "yes" } else { "no" },
                 width = read_verify_ufs_width - 1
+            )?;
+            write!(
+                f,
+                " {:<width$}|",
+                if mnt.auto_cache.unwrap_or(true) {
+                    "yes"
+                } else {
+                    "no"
+                },
+                width = auto_cache_width - 1
+            )?;
+            write!(
+                f,
+                " {:<width$}|",
+                access_mode_to_str(mnt.access_mode),
+                width = access_mode_width - 1
             )?;
             write!(
                 f,
@@ -375,6 +427,8 @@ impl Display for GetMountTableResponse {
         write!(f, "{:-^width$}+", "", width = ufs_width)?;
         write!(f, "{:-^width$}+", "", width = write_type_width)?;
         write!(f, "{:-^width$}+", "", width = read_verify_ufs_width)?;
+        write!(f, "{:-^width$}+", "", width = auto_cache_width)?;
+        write!(f, "{:-^width$}+", "", width = access_mode_width)?;
         write!(f, "{:-^width$}+", "", width = storage_width)?;
         write!(f, "{:-^width$}+", "", width = ttl_action_width)?;
         writeln!(f, "{:-^width$}+", "", width = provider_width)?;
