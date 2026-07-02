@@ -12,31 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod core;
+use crate::core::Session;
+use curvine_common::state::MasterInfo;
+use curvine_common::FsResult;
+use orpc::runtime::RpcRuntime;
 
-mod lib_filesystem;
-pub use self::lib_filesystem::LibFilesystem;
-
-mod filesystem_conf;
-pub use self::filesystem_conf::FilesystemConf;
-
-mod lib_fs_writer;
-pub use self::lib_fs_writer::LibFsWriter;
-
-mod lib_fs_reader;
-pub use self::lib_fs_reader::LibFsReader;
-
-#[cfg(feature = "rust-sdk")]
-pub mod sdk;
-#[cfg(feature = "rust-sdk")]
-pub mod master;
-#[cfg(feature = "rust-sdk")]
-pub mod job;
-#[cfg(feature = "rust-sdk")]
-pub mod filesystem;
-
-#[cfg(feature = "python-sdk")]
-pub mod python;
-
-#[cfg(feature = "java-sdk")]
-pub mod java;
+pub fn get_master_info(session: &Session) -> FsResult<MasterInfo> {
+    session
+        .runtime()
+        .block_on(async { session.unified().get_master_info().await })
+}

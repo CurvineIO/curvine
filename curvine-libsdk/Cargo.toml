@@ -5,17 +5,18 @@ edition.workspace = true
 license.workspace = true
 
 [lib]
-crate-type = ['cdylib']
+crate-type = ["rlib", "cdylib"]
 name = "curvine_libsdk"
 
 [features]
 default = ["java-sdk"]
+rust-sdk = []
 java-sdk = ["dep:jni"]
 python-sdk = ["dep:pyo3"]
 
 [dependencies]
 orpc = { workspace = true }
-curvine-client = { workspace = true }
+curvine-client = { workspace = true, default-features = false }
 curvine-common = { workspace = true }
 once_cell = { workspace = true }
 tracing = { workspace = true }
