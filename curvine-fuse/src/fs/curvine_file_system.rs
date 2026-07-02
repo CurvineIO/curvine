@@ -1399,7 +1399,17 @@ impl fs::FileSystem for CurvineFileSystem {
         let parent_ino = op.header.nodeid;
 
         let path = self.state.get_path_common(parent_ino, Some(name))?;
-        if self.state.should_delete_now(parent_ino, Some(name))? {
+        let completed_open_handle = if let Some(handle) = self.state.find_open_handle_by_path(&path)
+        {
+            handle.complete(None).await?;
+            true
+        } else {
+            false
+        };
+
+        let delete_now =
+            completed_open_handle || self.state.should_delete_now(parent_ino, Some(name))?;
+        if delete_now {
             self.fs.delete(&path, false).await?;
         }
         self.state.unlink_node(parent_ino, Some(name))?;
