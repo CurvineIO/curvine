@@ -17,7 +17,9 @@ use clap::Parser;
 use curvine_client::unified::{UfsFileSystem, UnifiedFileSystem};
 use curvine_common::error::{ErrorKind, FsError};
 use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::{MountOptions, Provider, StorageType, TtlAction, WriteType};
+use curvine_common::state::{
+    AccessMode, MountOptions, Provider, StorageType, TtlAction, WriteType,
+};
 use curvine_common::utils::ProtoUtils;
 use orpc::common::{ByteUnit, DurationUnit};
 use orpc::{err_box, CommonResult};
@@ -74,6 +76,18 @@ pub struct MountCommand {
         help = "UFS provider: auto, oss-hdfs, opendal. Controls which implementation to use for the given scheme."
     )]
     provider: Option<String>,
+
+    #[arg(
+        long,
+        help = "Whether to automatically submit a cache job on cache miss or invalid cache. Values: true, false. Default for new mounts: true."
+    )]
+    auto_cache: Option<bool>,
+
+    #[arg(
+        long,
+        help = "Access mode for cache_mode mounts: read_only, read_write. Default for new mounts: read_only."
+    )]
+    access_mode: Option<String>,
 
     #[arg(long, default_value_t = false)]
     check: bool,
@@ -532,6 +546,15 @@ impl MountCommand {
         if let Some(provider_str) = self.provider.as_ref() {
             let provider = Provider::try_from(provider_str.as_str())?;
             opts = opts.provider(provider);
+        }
+
+        if let Some(auto_cache) = self.auto_cache {
+            opts = opts.auto_cache(auto_cache);
+        }
+
+        if let Some(access_mode_str) = self.access_mode.as_ref() {
+            let access_mode = AccessMode::try_from(access_mode_str.as_str())?;
+            opts = opts.access_mode(access_mode);
         }
 
         Ok(opts.build())

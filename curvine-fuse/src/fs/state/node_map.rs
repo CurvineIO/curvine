@@ -55,7 +55,10 @@ impl NodeMap {
         // production mount. Assumes one FUSE mount / one NodeState per process
         // (the CLI builds a single CurvineFileSystem); multi-mount would need a
         // per-state aggregator instead.
-        FuseMetrics::with(|m| m.inode_num.set(1));
+        FuseMetrics::with(|m| {
+            m.inode_num.set(1);
+            m.inode_count.set(1);
+        });
         Self {
             nodes,
             names: FastHashMap::default(),
@@ -83,7 +86,10 @@ impl NodeMap {
     fn insert_node(&mut self, id: u64, node: NodeAttr) -> Option<NodeAttr> {
         let prev = self.nodes.insert(id, node);
         if prev.is_none() {
-            FuseMetrics::with(|m| m.inode_num.inc());
+            FuseMetrics::with(|m| {
+                m.inode_num.inc();
+                m.inode_count.inc();
+            });
         }
         prev
     }
@@ -95,7 +101,10 @@ impl NodeMap {
     fn remove_node(&mut self, id: u64) -> Option<NodeAttr> {
         let removed = self.nodes.remove(&id);
         if removed.is_some() {
-            FuseMetrics::with(|m| m.inode_num.dec());
+            FuseMetrics::with(|m| {
+                m.inode_num.dec();
+                m.inode_count.dec();
+            });
         }
         removed
     }
@@ -169,6 +178,41 @@ impl NodeMap {
     }
 
     pub fn do_lookup<T: AsRef<str>>(
+        &mut self,
+        parent: u64,
+        name: Option<T>,
+        status: &FileStatus,
+    ) -> FuseResult<fuse_attr> {
+        self.do_lookup_probed(parent, name, status, false).0
+    }
+
+    /// `do_lookup` plus an optional NodeMap-dcache hit/miss probe for
+    /// `node_cache_total` (Phase 3a). When `record && name.is_some()`, the second
+    /// tuple element is `Some(hit)` where `hit` reflects whether `(parent,name)`
+    /// already mapped to an inode **before** `find_node` auto-creates one — decided
+    /// here, inside the write lock, so it is atomic with the lookup (not a racy
+    /// pre-probe). The probe is returned (not emitted) so the caller can record the
+    /// metric AFTER releasing the lock, and it is returned on every path (incl. the
+    /// pending-delete/error early returns) so a hit/miss is never dropped. `record`
+    /// is `true` only on the real FUSE `Lookup` path; readdir / mkdir / create /
+    /// link / symlink pass `false`, and `name=None` (`.`/`..`) yields `None`.
+    pub fn do_lookup_probed<T: AsRef<str>>(
+        &mut self,
+        parent: u64,
+        name: Option<T>,
+        status: &FileStatus,
+        record: bool,
+    ) -> (FuseResult<fuse_attr>, Option<bool>) {
+        let node_cache_hit = if record {
+            name.as_ref()
+                .map(|n| self.lookup_node(parent, Some(n.as_ref())).is_some())
+        } else {
+            None
+        };
+        (self.do_lookup_inner(parent, name, status), node_cache_hit)
+    }
+
+    fn do_lookup_inner<T: AsRef<str>>(
         &mut self,
         parent: u64,
         name: Option<T>,
@@ -370,7 +414,13 @@ impl NodeMap {
         if let Some(exists_node) = self.lookup_node(new_id, Some(new_name)).cloned() {
             self.delete_name(&exists_node)?;
             if exists_node.should_unref() {
-                self.nodes.remove(&exists_node.id);
+                // Go through the remove_node chokepoint (not a bare
+                // `self.nodes.remove`) so both the legacy `inode_num` and the
+                // namespaced `inode_count` gauges decrement with the live map.
+                // The name mapping was already cleared by `delete_name` above,
+                // so we must NOT call `delete_node` here (that would re-run
+                // delete_name / parent-ref changes) — only the inode removal.
+                self.remove_node(exists_node.id);
             }
         }
 
@@ -595,7 +645,11 @@ impl NodeMap {
         // Single inode_num set from the live map count — runs on success and on
         // every early-return above (the closure captured `&mut self`, so reading
         // `self.nodes.len()` here is fine and reflects whatever was loaded).
-        FuseMetrics::with(|m| Self::sync_inode_gauge(&m.inode_num, self.nodes.len()));
+        FuseMetrics::with(|m| {
+            let live = self.nodes.len();
+            Self::sync_inode_gauge(&m.inode_num, live);
+            Self::sync_inode_gauge(&m.inode_count, live);
+        });
         result
     }
 
@@ -707,6 +761,85 @@ mod tests {
         );
         // The inode survives under its new parent, same id.
         assert!(map.get(src).is_some(), "renamed inode keeps its id");
+    }
+
+    #[test]
+    fn rename_overwrite_unreffed_target_drops_one_inode() {
+        // rename onto an EXISTING target whose `should_unref()` is true must
+        // remove the target inode through the `remove_node` chokepoint, so the
+        // live count drops by exactly one (and, in production, both the legacy
+        // `inode_num` and the namespaced `inode_count` gauges decrement). This is
+        // the path that previously did a bare `self.nodes.remove`, drifting the
+        // gauges. We assert on `nodes_len()` (the value the gauges track) rather
+        // than the process-global gauge, to stay parallel-test safe.
+        let mut map = test_map();
+        let src = map.find_node(FUSE_ROOT_ID, Some("src")).unwrap().id;
+        let target = map.find_node(FUSE_ROOT_ID, Some("target")).unwrap().id;
+
+        // Make the target collectible: drop its lookup to 0 (find_node set it to
+        // 1) so `should_unref()` (n_lookup==0 && ref_ctr==0 && !root) holds.
+        map.get_mut(target).unwrap().sub_lookup(1);
+        assert!(
+            map.get(target).unwrap().should_unref(),
+            "target must be unref-able to exercise the remove branch"
+        );
+
+        let before = map.nodes_len();
+        map.rename_node(FUSE_ROOT_ID, "src", FUSE_ROOT_ID, "target")
+            .unwrap();
+
+        assert_eq!(
+            map.nodes_len(),
+            before - 1,
+            "overwriting an unreffed target removes exactly one inode"
+        );
+        // The overwritten target id is gone; the source inode took its name.
+        assert!(
+            map.get(target).is_none(),
+            "overwritten target inode removed"
+        );
+        assert!(map.get(src).is_some(), "source inode survives the rename");
+    }
+
+    // Phase 3a node_cache_total probe: `do_lookup_probed` must report the
+    // hit/miss decided BEFORE find_node auto-creates, only when record=true and
+    // name is Some, and on every return path. This is parallel-safe: it asserts
+    // the returned probe bool, not the process-global node_cache_total counter.
+    #[test]
+    fn do_lookup_probed_reports_hit_miss_only_when_recording() {
+        use curvine_common::state::FileStatus;
+        let mut map = test_map();
+        // Distinct names per case: EVEN a record=false lookup materializes the
+        // node via find_node (it is a real lookup, just not counted), so each
+        // presence assertion must use a name not yet touched.
+        let s_y = FileStatus::with_name(2, "y".to_string(), true);
+        let s_z = FileStatus::with_name(3, "z".to_string(), true);
+
+        // record=true, first lookup of "z": miss (not yet in the map).
+        let (_r, probe) = map.do_lookup_probed(FUSE_ROOT_ID, Some("z"), &s_z, true);
+        assert_eq!(probe, Some(false), "first lookup is a miss");
+
+        // record=true, second lookup of "z": hit (find_node materialized it).
+        let (_r, probe) = map.do_lookup_probed(FUSE_ROOT_ID, Some("z"), &s_z, true);
+        assert_eq!(probe, Some(true), "second lookup is a hit");
+
+        // record=false (readdir / mkdir path): never probes, even though it still
+        // materializes "y".
+        let (_r, probe) = map.do_lookup_probed(FUSE_ROOT_ID, Some("y"), &s_y, false);
+        assert_eq!(probe, None, "record=false must not probe");
+        // Confirm that record=false call DID materialize "y": a recording lookup
+        // now sees a hit.
+        let (_r, probe) = map.do_lookup_probed(FUSE_ROOT_ID, Some("y"), &s_y, true);
+        assert_eq!(
+            probe,
+            Some(true),
+            "record=false still materializes the node"
+        );
+
+        // record=true but name=None (`.`/`..`): not counted.
+        let root_status = FileStatus::with_name(1, "/".to_string(), true);
+        let (_r, probe) = map.do_lookup_probed(FUSE_ROOT_ID, None::<&str>, &root_status, true);
+        assert_eq!(probe, None, "name=None must not be counted");
     }
 
     #[test]

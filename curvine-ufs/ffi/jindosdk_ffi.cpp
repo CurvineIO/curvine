@@ -43,7 +43,8 @@ thread_local std::string g_last_error;
 static inline JindoStatus map_error_code_to_status(int32_t code) {
     // Best-effort mapping for a few common error codes.
     // See /usr/local/include/jindosdk/jdo_error.h for the full list.
-    if (code == 3001 /* JDO_FILE_NOT_FOUND_ERROR */) {
+    if (code == 3001 /* JDO_FILE_NOT_FOUND_ERROR */
+        || code == 30001 /* JDO_PARENT_NOT_FOUND_ERROR */) {
         return JINDO_STATUS_FILE_NOT_FOUND;
     }
     return JINDO_STATUS_ERROR;
@@ -302,10 +303,6 @@ void jindo_internal_bool_to_status_cb(JdoHandleCtx_t ctx, bool ok, void* ud) {
     if (code != 0 || !ok) {
         err = jdo_getHandleCtxErrorMsg(ctx);
         st = map_error_code_to_status(code);
-        if (st == JINDO_STATUS_FILE_NOT_FOUND) {
-            // For status-only operations we don't distinguish NotFound.
-            st = JINDO_STATUS_ERROR;
-        }
     }
 
     if (c && c->cb) {
@@ -656,10 +653,6 @@ void jindo_internal_list_dir_cb(JdoHandleCtx_t ctx, JdoListDirResult_t list_resu
     if (code != 0 || !list_result) {
         err = jdo_getHandleCtxErrorMsg(ctx);
         st = map_error_code_to_status(code);
-        if (st == JINDO_STATUS_FILE_NOT_FOUND) {
-            // listDir: treat not-found as error (matches common fs semantics for listing a missing directory)
-            st = JINDO_STATUS_ERROR;
-        }
         if (!list_result && code == 0) {
             st = JINDO_STATUS_ERROR;
         }
@@ -789,7 +782,6 @@ void jindo_internal_content_summary_cb(JdoHandleCtx_t ctx, JdoContentSummary_t s
     if (code != 0 || !summary) {
         err = jdo_getHandleCtxErrorMsg(ctx);
         st = map_error_code_to_status(code);
-        if (st == JINDO_STATUS_FILE_NOT_FOUND) st = JINDO_STATUS_ERROR;
         if (!summary && code == 0) st = JINDO_STATUS_ERROR;
     }
 
@@ -1001,7 +993,6 @@ static void jindo_internal_open_io_cb(JdoHandleCtx_t ctx, JdoIOContext_t io_ctx,
     if (code != 0 || !io_ctx) {
         err = jdo_getHandleCtxErrorMsg(ctx);
         JindoStatus st = map_error_code_to_status(code);
-        if (st == JINDO_STATUS_FILE_NOT_FOUND) st = JINDO_STATUS_ERROR;
 
         if (is_writer) {
             auto* c = reinterpret_cast<AsyncOpenWriterCtx*>(ud);
@@ -1274,8 +1265,6 @@ static void jindo_internal_i64_cb(JdoHandleCtx_t ctx, int64_t value, void* ud) {
     if (code != 0) {
         err = jdo_getHandleCtxErrorMsg(ctx);
         st = map_error_code_to_status(code);
-        if (st == JINDO_STATUS_FILE_NOT_FOUND) st = JINDO_STATUS_ERROR;
-        if (st == JINDO_STATUS_ERROR) st = JINDO_STATUS_ERROR;
     }
 
     if (c && c->cb) c->cb(st, value, err, c->userdata);
@@ -1515,8 +1504,6 @@ JindoStatus jindo_reader_seek_async(JindoReaderHandle reader, int64_t offset, Ji
             if (code != 0 || value < 0) {
                 err = jdo_getHandleCtxErrorMsg(ctx);
                 st = map_error_code_to_status(code);
-                if (st == JINDO_STATUS_FILE_NOT_FOUND) st = JINDO_STATUS_ERROR;
-                st = JINDO_STATUS_ERROR;
             }
 
             if (c && c->cb) c->cb(st, err, c->userdata);

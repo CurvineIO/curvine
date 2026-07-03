@@ -22,6 +22,7 @@ use std::os::raw::c_void;
 
 use crate::oss_hdfs::callback_ctx::{I64CallbackCtx, StatusCallbackCtx};
 use crate::oss_hdfs::ffi::*;
+use crate::oss_hdfs::{check_jindo_status, jindo_error};
 
 // Extension methods for OSS-HDFS Reader
 impl OssHdfsReader {
@@ -87,19 +88,14 @@ impl OssHdfsReader {
             };
             if start_status != JindoStatus::Ok {
                 buffer.clear();
-                let err_msg = jindo_last_error();
-                return Err(FsError::common(format!(
-                    "Failed to start pread: {}",
-                    err_msg
-                )));
+                check_jindo_status(start_status, "Failed to start pread", None)?;
             }
         }
 
         let (status, actual_read, err) = ctx.wait().await?;
         if status != JindoStatus::Ok {
             buffer.clear();
-            let err_msg = err.unwrap_or_else(jindo_last_error);
-            return Err(FsError::common(format!("Failed to pread: {}", err_msg)));
+            check_jindo_status(status, "Failed to pread", err)?;
         }
 
         let actual_read = usize::try_from(actual_read.max(0)).unwrap_or(0);
@@ -128,18 +124,13 @@ impl OssHdfsReader {
             let start_status =
                 unsafe { jindo_reader_tell_async(handle.as_raw(), Some(cb), userdata) };
             if start_status != JindoStatus::Ok {
-                let err_msg = jindo_last_error();
-                return Err(FsError::common(format!(
-                    "Failed to start tell: {}",
-                    err_msg
-                )));
+                check_jindo_status(start_status, "Failed to start tell", None)?;
             }
         }
 
         let (status, offset, err) = ctx.wait().await?;
         if status != JindoStatus::Ok {
-            let err_msg = err.unwrap_or_else(jindo_last_error);
-            return Err(FsError::common(format!("Failed to tell: {}", err_msg)));
+            check_jindo_status(status, "Failed to tell", err)?;
         }
         Ok(offset)
     }
@@ -280,11 +271,7 @@ impl Reader for OssHdfsReader {
                 };
                 if start_status != JindoStatus::Ok {
                     buffer.clear();
-                    let err_msg = jindo_last_error();
-                    return Err(FsError::common(format!(
-                        "Failed to start read: {}",
-                        err_msg
-                    )));
+                    check_jindo_status(start_status, "Failed to start read", None)?;
                 }
             }
 
@@ -294,8 +281,7 @@ impl Reader for OssHdfsReader {
                     buffer.clear();
                     return Ok(DataSlice::Buffer(buffer));
                 }
-                let err_msg = err.unwrap_or_else(jindo_last_error);
-                return Err(FsError::common(format!("Failed to read: {}", err_msg)));
+                return Err(jindo_error(status, "Failed to read", err));
             }
 
             let actual_read = usize::try_from(actual_read.max(0)).unwrap_or(0);
@@ -353,18 +339,13 @@ impl Reader for OssHdfsReader {
                 let start_status =
                     unsafe { jindo_reader_seek_async(handle.as_raw(), pos, Some(cb), userdata) };
                 if start_status != JindoStatus::Ok {
-                    let err_msg = jindo_last_error();
-                    return Err(FsError::common(format!(
-                        "Failed to start seek: {}",
-                        err_msg
-                    )));
+                    check_jindo_status(start_status, "Failed to start seek", None)?;
                 }
             }
 
             let (status, err) = self.status_ctx.wait().await?;
             if status != JindoStatus::Ok {
-                let err_msg = err.unwrap_or_else(jindo_last_error);
-                return Err(FsError::common(format!("Failed to seek: {}", err_msg)));
+                check_jindo_status(status, "Failed to seek", err)?;
             }
         } // handle is dropped here, releasing the borrow
 
@@ -396,22 +377,14 @@ impl Reader for OssHdfsReader {
                 unsafe {
                     jindo_reader_free(handle.as_raw());
                 }
-                let err_msg = jindo_last_error();
-                return Err(FsError::common(format!(
-                    "Failed to start close reader: {}",
-                    err_msg
-                )));
+                check_jindo_status(start_status, "Failed to start close reader", None)?;
             }
 
             let (status, err) = self.status_ctx.wait().await?;
             unsafe { jindo_reader_free(handle.as_raw()) };
 
             if status != JindoStatus::Ok {
-                let err_msg = err.unwrap_or_else(jindo_last_error);
-                return Err(FsError::common(format!(
-                    "Failed to close reader: {}",
-                    err_msg
-                )));
+                check_jindo_status(status, "Failed to close reader", err)?;
             }
         }
         Ok(())

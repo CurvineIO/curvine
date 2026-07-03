@@ -57,6 +57,46 @@ impl TryFrom<&str> for Provider {
     }
 }
 
+#[repr(i32)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    FromPrimitive,
+    IntoPrimitive,
+    Default,
+    Deserialize,
+    Serialize,
+)]
+pub enum AccessMode {
+    #[default]
+    ReadOnly = 0,
+    ReadWrite = 1,
+}
+
+impl AccessMode {
+    pub fn is_read_only(&self) -> bool {
+        matches!(self, AccessMode::ReadOnly)
+    }
+}
+
+impl TryFrom<&str> for AccessMode {
+    type Error = CommonError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let mode = match value.to_lowercase().as_str() {
+            "read_only" => AccessMode::ReadOnly,
+            "read_write" => AccessMode::ReadWrite,
+            _ => return err_box!("invalid access mode: {}", value),
+        };
+
+        Ok(mode)
+    }
+}
+
 /// Mount information structure
 #[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq, Default)]
 pub struct MountInfo {
@@ -72,11 +112,13 @@ pub struct MountInfo {
     pub replicas: Option<i32>,
     pub write_type: WriteType,
     pub provider: Option<Provider>,
+    pub auto_cache: bool,
+    pub access_mode: AccessMode,
 }
 
 impl MountInfo {
     pub fn auto_cache(&self) -> bool {
-        self.ttl_ms > 0
+        self.auto_cache && self.ttl_ms > 0
     }
 
     pub fn get_ttl(&self) -> Option<String> {
@@ -158,6 +200,10 @@ impl MountInfo {
         self.write_type == WriteType::FsMode
     }
 
+    pub fn is_read_only_cache_mode(&self) -> bool {
+        self.is_cache_mode() && self.access_mode.is_read_only()
+    }
+
     pub fn merge_with(self, mnt_opt: MountOptions) -> MountInfo {
         let mut properties = self.properties;
 
@@ -182,6 +228,8 @@ impl MountInfo {
             replicas: mnt_opt.replicas.or(self.replicas),
             write_type: self.write_type,
             provider: mnt_opt.provider.or(self.provider),
+            auto_cache: mnt_opt.auto_cache.unwrap_or(self.auto_cache),
+            access_mode: mnt_opt.access_mode.unwrap_or(self.access_mode),
         }
     }
 }
@@ -199,6 +247,8 @@ pub struct MountOptions {
     pub remove_properties: Vec<String>,
     pub write_type: WriteType,
     pub provider: Option<Provider>,
+    pub auto_cache: Option<bool>,
+    pub access_mode: Option<AccessMode>,
 }
 
 impl MountOptions {
@@ -226,6 +276,8 @@ impl MountOptions {
             replicas: self.replicas,
             write_type: self.write_type,
             provider: self.provider,
+            auto_cache: self.auto_cache.unwrap_or(true),
+            access_mode: self.access_mode.unwrap_or_default(),
         }
     }
 }
@@ -243,6 +295,8 @@ pub struct MountOptionsBuilder {
     remove_properties: Vec<String>,
     write_type: WriteType,
     provider: Option<Provider>,
+    auto_cache: Option<bool>,
+    access_mode: Option<AccessMode>,
 }
 
 impl MountOptionsBuilder {
@@ -251,6 +305,8 @@ impl MountOptionsBuilder {
             write_type: WriteType::CacheMode,
             ttl_ms: Some(7 * DurationUnit::DAY as i64),
             ttl_action: Some(TtlAction::Delete),
+            auto_cache: Some(true),
+            access_mode: Some(AccessMode::ReadOnly),
             ..Default::default()
         }
     }
@@ -324,6 +380,16 @@ impl MountOptionsBuilder {
         self
     }
 
+    pub fn auto_cache(mut self, auto_cache: bool) -> Self {
+        self.auto_cache = Some(auto_cache);
+        self
+    }
+
+    pub fn access_mode(mut self, access_mode: AccessMode) -> Self {
+        self.access_mode = Some(access_mode);
+        self
+    }
+
     pub fn build(self) -> MountOptions {
         MountOptions {
             update: self.update,
@@ -337,6 +403,8 @@ impl MountOptionsBuilder {
             remove_properties: self.remove_properties,
             write_type: self.write_type,
             provider: self.provider,
+            auto_cache: self.auto_cache,
+            access_mode: self.access_mode,
         }
     }
 }
@@ -381,7 +449,51 @@ impl TryFrom<&str> for WriteType {
 #[cfg(test)]
 mod tests {
     use crate::fs::Path;
-    use crate::state::{MountInfo, WriteType};
+    use crate::state::{AccessMode, MountInfo, MountOptions, WriteType};
+
+    #[test]
+    fn test_access_mode_parse() {
+        assert_eq!(
+            AccessMode::try_from("read_only").unwrap(),
+            AccessMode::ReadOnly
+        );
+        assert_eq!(
+            AccessMode::try_from("read_write").unwrap(),
+            AccessMode::ReadWrite
+        );
+        assert!(AccessMode::try_from("invalid").is_err());
+    }
+
+    #[test]
+    fn test_mount_options_default_auto_cache_and_access_mode() {
+        let info = MountOptions::builder().build().to_info(1, "/mnt", "s3://b");
+        assert!(info.auto_cache);
+        assert_eq!(info.access_mode, AccessMode::ReadOnly);
+    }
+
+    #[test]
+    fn test_mount_info_merge_auto_cache_and_access_mode() {
+        let info = MountInfo {
+            cv_path: "/mnt".to_string(),
+            ufs_path: "s3://b".to_string(),
+            auto_cache: true,
+            access_mode: AccessMode::ReadOnly,
+            ..Default::default()
+        };
+
+        let unchanged = info.clone().merge_with(MountOptions::builder().build());
+        assert!(unchanged.auto_cache);
+        assert_eq!(unchanged.access_mode, AccessMode::ReadOnly);
+
+        let updated = info.merge_with(
+            MountOptions::builder()
+                .auto_cache(false)
+                .access_mode(AccessMode::ReadWrite)
+                .build(),
+        );
+        assert!(!updated.auto_cache);
+        assert_eq!(updated.access_mode, AccessMode::ReadWrite);
+    }
 
     #[test]
     fn test_is_fs_mode_resync_guard() {
@@ -390,6 +502,7 @@ mod tests {
             cv_path: "/mnt/fs".to_string(),
             ufs_path: "s3://b/k".to_string(),
             write_type: WriteType::FsMode,
+            auto_cache: true,
             ..Default::default()
         };
         assert!(fs_mode_mount.is_fs_mode());
@@ -399,6 +512,7 @@ mod tests {
             cv_path: "/mnt/cache".to_string(),
             ufs_path: "s3://b/k".to_string(),
             write_type: WriteType::CacheMode,
+            auto_cache: true,
             ..Default::default()
         };
         assert!(!cache_mode_mount.is_fs_mode());

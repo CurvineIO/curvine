@@ -554,6 +554,8 @@ impl ProtoUtils {
             replicas: info.replicas,
             write_type: info.write_type.into(),
             provider: info.provider.map(|v| v.into()),
+            auto_cache: Some(info.auto_cache),
+            access_mode: Some(info.access_mode.into()),
         }
     }
 
@@ -571,6 +573,8 @@ impl ProtoUtils {
             replicas: info.replicas,
             write_type: WriteType::from(info.write_type),
             provider: info.provider.map(|x| x.into()),
+            auto_cache: info.auto_cache.unwrap_or(true),
+            access_mode: info.access_mode.map(AccessMode::from).unwrap_or_default(),
         }
     }
 
@@ -587,6 +591,8 @@ impl ProtoUtils {
             remove_properties: opts.remove_properties,
             write_type: opts.write_type.into(),
             provider: opts.provider.map(|v| v.into()),
+            auto_cache: opts.auto_cache,
+            access_mode: opts.access_mode.map(|v| v.into()),
         }
     }
 
@@ -603,6 +609,8 @@ impl ProtoUtils {
             remove_properties: opts.remove_properties,
             write_type: opts.write_type.into(),
             provider: opts.provider.map(Provider::from),
+            auto_cache: opts.auto_cache,
+            access_mode: opts.access_mode.map(AccessMode::from),
         }
     }
 
@@ -707,5 +715,43 @@ impl ProtoUtils {
             inodes: res.inodes,
             bytes: res.bytes,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::state::{AccessMode, MountInfo, MountOptions};
+    use crate::utils::ProtoUtils;
+
+    #[test]
+    fn test_mount_info_proto_round_trip_auto_cache_and_access_mode() {
+        let info = MountInfo {
+            cv_path: "/mnt".to_string(),
+            ufs_path: "s3://bucket".to_string(),
+            mount_id: 7,
+            auto_cache: false,
+            access_mode: AccessMode::ReadWrite,
+            ..Default::default()
+        };
+
+        let pb = ProtoUtils::mount_info_to_pb(info);
+        let round_trip = ProtoUtils::mount_info_from_pb(pb);
+
+        assert!(!round_trip.auto_cache);
+        assert_eq!(round_trip.access_mode, AccessMode::ReadWrite);
+    }
+
+    #[test]
+    fn test_mount_options_proto_round_trip_auto_cache_and_access_mode() {
+        let opts = MountOptions::builder()
+            .auto_cache(false)
+            .access_mode(AccessMode::ReadWrite)
+            .build();
+
+        let pb = ProtoUtils::mount_options_to_pb(opts);
+        let round_trip = ProtoUtils::mount_options_from_pb(pb);
+
+        assert_eq!(round_trip.auto_cache, Some(false));
+        assert_eq!(round_trip.access_mode, Some(AccessMode::ReadWrite));
     }
 }

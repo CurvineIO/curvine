@@ -51,6 +51,7 @@ pub struct JournalLoader {
     retain_checkpoint_num: usize,
     ignore_reply_error: bool,
     max_retry_num: u64,
+    skip_failed_ufs_replay_after_retry: bool,
     batch_size: u64,
     retry_interval: Duration,
     metrics: &'static MasterMetrics,
@@ -127,6 +128,7 @@ impl JournalLoader {
             retain_checkpoint_num: 3.max(conf.retain_checkpoint_num),
             ignore_reply_error: conf.ignore_reply_error,
             max_retry_num: conf.max_retry_num,
+            skip_failed_ufs_replay_after_retry: conf.skip_failed_ufs_replay_after_retry,
             batch_size: conf.scan_batch_size,
             retry_interval: Duration::from_secs(conf.retry_interval_secs),
             metrics: Master::get_metrics(),
@@ -187,7 +189,12 @@ impl JournalLoader {
         }
     }
 
-    async fn apply0(&self, is_leader: bool, entry: &Entry) -> CommonResult<()> {
+    async fn apply0(
+        &self,
+        is_leader: bool,
+        entry: &Entry,
+        skip_ufs_error: bool,
+    ) -> CommonResult<()> {
         if entry.data.is_empty() {
             return Ok(());
         }
@@ -241,6 +248,14 @@ impl JournalLoader {
             };
 
             if let Err(e) = res {
+                if is_leader && skip_ufs_error {
+                    error!(
+                        "skip failed UFS replay after retries, entry index={}, term={}, journal={:?}, error={}",
+                        entry.index, entry.term, op_entry, e
+                    );
+                    continue;
+                }
+
                 return err_box!("failed to apply journal: {:?}: {}", op_entry, e);
             }
         }
@@ -262,15 +277,24 @@ impl JournalLoader {
         Ok(())
     }
 
-    async fn apply_msg(&self, is_leader: bool, msg: &ApplyMsg) -> CommonResult<()> {
+    async fn apply_msg(
+        &self,
+        is_leader: bool,
+        msg: &ApplyMsg,
+        skip_ufs_error: bool,
+    ) -> CommonResult<()> {
         match msg {
             ApplyMsg::Entry(entry) => {
-                self.apply0(is_leader, entry).await?;
+                self.apply0(is_leader, entry, skip_ufs_error).await?;
                 Ok(())
             }
 
             ApplyMsg::Scan(applied_index) => {
                 let mut last_applied = applied_index.index;
+                if is_leader && skip_ufs_error {
+                    last_applied = last_applied.max(self.get_fsm_state().ufs_applied.index);
+                }
+
                 let commit_index = self.log_store.hard_state().commit;
                 loop {
                     if last_applied >= commit_index {
@@ -292,8 +316,11 @@ impl JournalLoader {
                     );
 
                     for entry in list {
-                        self.apply0(is_leader, &entry).await?;
+                        self.apply0(is_leader, &entry, skip_ufs_error).await?;
                         last_applied = entry.index;
+                        if skip_ufs_error {
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -356,7 +383,7 @@ impl JournalLoader {
                     break;
                 }
 
-                msg => match self.apply_msg(is_leader, &msg).await {
+                msg => match self.apply_msg(is_leader, &msg, false).await {
                     Ok(_) => retry_num = 0,
 
                     Err(error) => {
@@ -366,12 +393,34 @@ impl JournalLoader {
                             retry_num += 1;
 
                             if retry_num >= self.max_retry_num {
-                                panic!("apply entry failed(retry_num={}): {}", retry_num, error);
+                                if self.skip_failed_ufs_replay_after_retry {
+                                    error!(
+                                        "apply entry failed(retry_num={}), skipping failed UFS replay to keep master alive: {}",
+                                        retry_num, error
+                                    );
+                                    let continue_scan = matches!(msg, ApplyMsg::Scan(_));
+                                    if let Err(skip_error) =
+                                        self.apply_msg(is_leader, &msg, true).await
+                                    {
+                                        panic!(
+                                            "apply entry failed while skipping failed UFS replay: {}",
+                                            skip_error
+                                        );
+                                    }
+                                    retry_num = 0;
+                                    if continue_scan {
+                                        retry_msg.replace(msg);
+                                    }
+                                } else {
+                                    panic!(
+                                        "apply entry failed(retry_num={}): {}",
+                                        retry_num, error
+                                    );
+                                }
                             } else {
                                 error!("apply entry failed(retry_num={}): {}", retry_num, error);
+                                retry_msg.replace(msg);
                             }
-
-                            retry_msg.replace(msg);
                         } else {
                             panic!("apply entry failed: {}", error);
                         }
@@ -747,7 +796,7 @@ impl JournalLoader {
 impl AppStorage for JournalLoader {
     async fn apply(&self, wait: bool, msg: ApplyMsg) -> RaftResult<()> {
         if wait || !self.has_apply_worker {
-            if let Err(e) = self.apply_msg(false, &msg).await {
+            if let Err(e) = self.apply_msg(false, &msg, false).await {
                 if self.ignore_reply_error {
                     error!("apply entry failed: {}", e);
                     Ok(())

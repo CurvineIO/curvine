@@ -30,8 +30,16 @@ use orpc::sys::DataSlice;
 /// - `cv_reader` is always present and maintains all internal state (pos, chunk, etc.).
 /// - `ufs_reader` is created lazily on the first worker failure; once set, all
 ///   subsequent reads go through UFS (no retry back to Curvine).
-/// - Before falling back, `validate_ufs_consistency` is called to ensure the UFS
-///   data matches the snapshot recorded in Curvine metadata (`ufs_mtime`, `len`).
+/// - Before falling back, consistency handling depends on the mount's write type:
+///   - **FsMode** (Curvine is the authority, UFS is a flushed copy): `validate_ufs_consistency`
+///     ensures the UFS data matches the snapshot recorded in Curvine metadata
+///     (`ufs_mtime`, `len`). A mismatch means the UFS copy is untrustworthy (incomplete
+///     flush or externally modified) and fallback is refused.
+///   - **CacheMode** (UFS/S3 is the authority, Curvine is a read-through cache): nothing is
+///     validated. We read S3 directly at the current `pos`. If S3 is still readable there,
+///     that is the authoritative data and we serve it. If S3 was deleted or shrunk so that
+///     `pos` no longer exists, the underlying `open_ufs`/`seek` fails and the error
+///     propagates — we do not clamp the seek or paper over an out-of-range position.
 pub struct FallbackFsReader {
     /// Wraps the Curvine reader. Always present as the metadata authority (status, len).
     cv_reader: FsReader,
@@ -41,15 +49,24 @@ pub struct FallbackFsReader {
     ufs_reader: Option<UfsReader>,
     ufs_path: Path,
     ufs_fs: UfsFileSystem,
+    /// True when the mount is FsMode. Controls whether the snapshot consistency check
+    /// gates the fallback to UFS. CacheMode (false) reads S3 directly without validation.
+    is_fs_mode: bool,
 }
 
 impl FallbackFsReader {
-    pub fn new(cv_reader: FsReader, ufs_path: Path, ufs_fs: UfsFileSystem) -> Self {
+    pub fn new(
+        cv_reader: FsReader,
+        ufs_path: Path,
+        ufs_fs: UfsFileSystem,
+        is_fs_mode: bool,
+    ) -> Self {
         Self {
             cv_reader,
             ufs_reader: None,
             ufs_path,
             ufs_fs,
+            is_fs_mode,
         }
     }
 
@@ -111,7 +128,14 @@ impl Reader for FallbackFsReader {
     }
 
     fn len(&self) -> i64 {
-        self.cv_reader.len()
+        match &self.ufs_reader {
+            // CacheMode has fallen back to S3, which is authoritative: report its
+            // live length so len()-based callers (e.g. read_as_string) see the
+            // current object size, not the stale cached Curvine length.
+            Some(u) if !self.is_fs_mode => u.len(),
+            // FsMode (or no fallback yet): Curvine remains the metadata authority.
+            _ => self.cv_reader.len(),
+        }
     }
 
     // pos/chunk/chunk_size delegate to whichever reader is currently active.
@@ -156,14 +180,27 @@ impl Reader for FallbackFsReader {
             Err(e) if is_worker_err(&e) => {
                 let pos = self.cv_reader.pos();
                 warn!(
-                    "Curvine worker error at pos {} for {}, validating UFS consistency before fallback: {}",
+                    "Curvine worker error at pos {} for {} (fs_mode={}), falling back to UFS: {}",
                     pos,
                     self.cv_reader.path(),
+                    self.is_fs_mode,
                     e
                 );
 
-                // Refuse to fall back if UFS data cannot be trusted.
-                self.validate_ufs_consistency().await?;
+                // FsMode: Curvine is authoritative and UFS is only a flushed copy, so
+                // refuse to fall back if the UFS data cannot be trusted (mtime/len drift
+                // means an incomplete flush or external modification).
+                //
+                // CacheMode: S3/UFS is authoritative — there is nothing to validate.
+                // We just read S3 directly. If S3 is still readable at `pos`, that is
+                // the authoritative data and we serve it. If S3 was deleted or shrunk
+                // so that `pos` no longer exists, the read fails naturally below
+                // (open_ufs stat -> NotFound, or seek -> "Invalid seek position") and
+                // that error propagates to the caller. We deliberately do NOT clamp the
+                // seek or pre-check consistency.
+                if self.is_fs_mode {
+                    self.validate_ufs_consistency().await?;
+                }
 
                 let mut ufs: UfsReader = self.ufs_fs.open_ufs(&self.ufs_path).await?;
                 ufs.seek(pos).await?;

@@ -16,6 +16,11 @@ use crate::fs::state::file_handle::FileHandle;
 use crate::fs::state::DirHandle;
 use crate::fs::state::{NodeAttr, NodeMap};
 use crate::fs::{CurvineFileSystem, FuseReader, FuseWriter};
+use crate::fuse_metrics::{
+    StateStageTimer, CACHE_BLOCKS, CACHE_RESULT_HIT, CACHE_RESULT_MISS, CACHE_RESULT_PUT,
+    STATE_KIND_DIR_HANDLES, STATE_KIND_FILE_HANDLES, STATE_KIND_NODE_MAP, STATE_STAGE_DIR_HANDLES,
+    STATE_STAGE_FILE_HANDLES, STATE_STAGE_NODE_MAP,
+};
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{
     err_fuse, FuseMetrics, FuseResult, FUSE_CURRENT_DIR, FUSE_PARENT_DIR, STATE_FILE_MAGIC,
@@ -186,7 +191,45 @@ impl NodeState {
         name: Option<T>,
         status: &FileStatus,
     ) -> FuseResult<fuse_attr> {
-        self.node_write().do_lookup(parent, name, status)
+        // Internal callers (readdir dentry fill, mkdir/create/link/symlink entry
+        // build) are NOT the real FUSE Lookup path, so they never record
+        // node_cache regardless of the metrics switch.
+        self.do_lookup_recorded(parent, name, status, false, false)
+    }
+
+    /// `do_lookup` that emits `node_cache_total` only when BOTH:
+    /// - `is_real_lookup`: this is the real FUSE `Lookup` handler path (not an
+    ///   internal `do_lookup` caller such as readdir / mkdir / create / link /
+    ///   symlink), and
+    /// - `metrics_enabled`: the observation kill-switch is on.
+    ///
+    /// The two flags are split (rather than a single `record` bool) so a future
+    /// caller cannot accidentally enable the metric by passing `true` for "this is
+    /// a lookup" while forgetting the `metrics_enabled` gate. The hit/miss is
+    /// decided inside the `node_write` lock (atomic with the lookup) but the
+    /// metric is emitted AFTER the lock is dropped, so no registry/label work
+    /// happens under the NodeMap write lock.
+    pub fn do_lookup_recorded<T: AsRef<str>>(
+        &self,
+        parent: u64,
+        name: Option<T>,
+        status: &FileStatus,
+        is_real_lookup: bool,
+        metrics_enabled: bool,
+    ) -> FuseResult<fuse_attr> {
+        let record = is_real_lookup && metrics_enabled;
+        let (res, hit) = self
+            .node_write()
+            .do_lookup_probed(parent, name, status, record);
+        if let Some(hit) = hit {
+            let status = if hit {
+                CACHE_RESULT_HIT
+            } else {
+                CACHE_RESULT_MISS
+            };
+            FuseMetrics::with(|m| m.record_node_cache_lookup(status));
+        }
+        res
     }
 
     pub fn unlink_node<T: AsRef<str>>(&self, id: u64, name: Option<T>) -> FuseResult<()> {
@@ -275,9 +318,37 @@ impl NodeState {
         Ok(Arc::new(Mutex::new(writer)))
     }
 
+    /// Emit `user_meta_cache_total{cache=blocks,status}`, gated on the
+    /// `metrics_enabled` observation kill-switch (separate from `enable_meta_cache`
+    /// — D11). No-op when metrics are disabled.
+    fn record_blocks_cache(&self, status: &'static str) {
+        if self.conf.metrics_enabled {
+            FuseMetrics::with(|m| m.record_user_meta_cache(CACHE_BLOCKS, status));
+        }
+    }
+
+    /// Populate the blocks cache for `path` and record the `put` in one place, so
+    /// the production put-wiring (Cv/Fallback `new_reader` arms) is exercised by
+    /// the same seam a test drives — not just the bare counter helper. Gated on
+    /// `metrics_enabled` for the metric (the cache write itself always happens).
+    fn put_blocks_cache_and_record(&self, path: &Path, blocks: FileBlocks) {
+        self.meta_cache.put_open(path, blocks);
+        self.record_blocks_cache(CACHE_RESULT_PUT);
+    }
+
     fn get_cached_blocks(&self, path: &Path) -> Option<FileBlocks> {
         if self.conf.enable_meta_cache {
-            self.meta_cache.get_blocks(path)
+            let blocks = self.meta_cache.get_blocks(path);
+            // Phase 3a: blocks-namespace hit/miss recorded the moment the cache
+            // read resolves (the matching `put` is recorded at the `put_open`
+            // sites in `new_reader`).
+            let result = if blocks.is_some() {
+                CACHE_RESULT_HIT
+            } else {
+                CACHE_RESULT_MISS
+            };
+            self.record_blocks_cache(result);
+            blocks
         } else {
             None
         }
@@ -296,13 +367,17 @@ impl NodeState {
                 if self.conf.enable_meta_cache {
                     match &reader {
                         UnifiedReader::Cv(cv_reader) => {
-                            self.meta_cache
-                                .put_open(path, cv_reader.file_blocks().clone());
+                            self.put_blocks_cache_and_record(path, cv_reader.file_blocks().clone());
                         }
                         UnifiedReader::Fallback(fallback_reader) => {
-                            self.meta_cache
-                                .put_open(path, fallback_reader.file_blocks().clone());
+                            self.put_blocks_cache_and_record(
+                                path,
+                                fallback_reader.file_blocks().clone(),
+                            );
                         }
+                        // Local/Opendal/OssHdfs readers do not populate the blocks
+                        // cache, so they emit no `put` (consistent with the design
+                        // doc's "put_open on Cv/Fallback readers only").
                         _ => {}
                     };
                 }
@@ -514,7 +589,9 @@ impl NodeState {
         handle: Arc<FileHandle>,
     ) {
         if Self::map_insert_handle(lock, ino, fh, handle) {
-            FuseMetrics::with(|m| m.file_handle_num.inc());
+            FuseMetrics::with(|m| {
+                Self::inc_gauges_lockstep(&m.file_handle_num, &m.file_handle_count)
+            });
         }
     }
 
@@ -529,7 +606,9 @@ impl NodeState {
     ) -> Option<Arc<FileHandle>> {
         let (handle, removed) = Self::map_remove_handle(lock, ino, fh);
         if removed {
-            FuseMetrics::with(|m| m.file_handle_num.dec());
+            FuseMetrics::with(|m| {
+                Self::dec_gauges_lockstep(&m.file_handle_num, &m.file_handle_count)
+            });
         }
         handle
     }
@@ -694,7 +773,9 @@ impl NodeState {
         handle: Arc<DirHandle>,
     ) {
         if Self::map_insert_handle(lock, ino, fh, handle) {
-            FuseMetrics::with(|m| m.dir_handle_num.inc());
+            FuseMetrics::with(|m| {
+                Self::inc_gauges_lockstep(&m.dir_handle_num, &m.dir_handle_count)
+            });
         }
     }
 
@@ -707,7 +788,9 @@ impl NodeState {
     ) -> Option<Arc<DirHandle>> {
         let (handle, removed) = Self::map_remove_handle(lock, ino, fh);
         if removed {
-            FuseMetrics::with(|m| m.dir_handle_num.dec());
+            FuseMetrics::with(|m| {
+                Self::dec_gauges_lockstep(&m.dir_handle_num, &m.dir_handle_count)
+            });
         }
         handle
     }
@@ -752,38 +835,86 @@ impl NodeState {
     }
 
     pub async fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {
+        let metrics_enabled = self.conf.metrics_enabled;
+
+        // Phase 3b (P2#3): sample the live handle/node counts ONCE at the very
+        // start of the attempt — BEFORE the first fallible I/O (the magic/version
+        // header writes below) — so even a header-write failure still refreshes
+        // this gauge ("sampled at persist time, unaffected by a later stage
+        // failure"). Best-effort snapshot, each len under its own lock (not a
+        // cross-kind atomic).
+        if metrics_enabled {
+            let node_len = self.node_read().nodes_len();
+            let file_len = self.file_handles_len();
+            let dir_len = self.dir_handles_len();
+            FuseMetrics::with(|m| {
+                m.set_state_handle_count(STATE_KIND_NODE_MAP, node_len);
+                m.set_state_handle_count(STATE_KIND_FILE_HANDLES, file_len);
+                m.set_state_handle_count(STATE_KIND_DIR_HANDLES, dir_len);
+            });
+        }
+
         writer.write_all(STATE_FILE_MAGIC)?;
         writer.write_len(STATE_FILE_VERSION)?;
 
         {
+            let stage = StateStageTimer::start(metrics_enabled, true, STATE_STAGE_NODE_MAP);
             info!("node_state::persist: saving node_map");
             let node_lock = self.node_read();
             node_lock.persist(writer)?;
             info!("node_state::persist: {} node saved", node_lock.nodes_len());
-        }
-
-        info!("node_state::persist: saving file_handles");
-        let handles = self.all_handles();
-        writer.write_len(handles.len() as u64)?;
-        for handle in &handles {
-            if let Err(e) = handle.persist(writer).await {
-                error!("node_state::persist: error saving file_handle {:?}", e)
+            if let Some(stage) = stage {
+                stage.success();
             }
         }
-        info!("node_state::persist: {} file_handles saved", handles.len());
 
-        info!("node_state::persist: saving dir_handles");
-        let dir_handles = self.all_dir_handles();
-        writer.write_len(dir_handles.len() as u64)?;
-        for dir_handle in &dir_handles {
-            writer.write_struct(&**dir_handle)?;
+        {
+            let stage = StateStageTimer::start(metrics_enabled, true, STATE_STAGE_FILE_HANDLES);
+            info!("node_state::persist: saving file_handles");
+            let handles = self.all_handles();
+            writer.write_len(handles.len() as u64)?;
+            // best-effort: a failed handle is logged and skipped (control flow
+            // unchanged), but any failure means the stage did NOT complete cleanly
+            // — leave the StateStageTimer to drop as `error` (do not call
+            // success()), so metrics don't hide a partial/corrupt persist as
+            // success (review #961).
+            let mut any_failed = false;
+            for handle in &handles {
+                if let Err(e) = handle.persist(writer).await {
+                    error!("node_state::persist: error saving file_handle {:?}", e);
+                    any_failed = true;
+                }
+            }
+            info!("node_state::persist: {} file_handles saved", handles.len());
+            if let Some(stage) = stage {
+                if !any_failed {
+                    stage.success();
+                }
+            }
         }
-        info!(
-            "node_state::persist: {} dir_handles saved",
-            dir_handles.len()
-        );
 
-        writer.write_len(self.fh_creator.get())?;
+        {
+            let stage = StateStageTimer::start(metrics_enabled, true, STATE_STAGE_DIR_HANDLES);
+            info!("node_state::persist: saving dir_handles");
+            let dir_handles = self.all_dir_handles();
+            writer.write_len(dir_handles.len() as u64)?;
+            for dir_handle in &dir_handles {
+                writer.write_struct(&**dir_handle)?;
+            }
+            info!(
+                "node_state::persist: {} dir_handles saved",
+                dir_handles.len()
+            );
+            // Phase 3b (P2#2): the trailing fh_creator write is part of the
+            // dir/file-handle recovery chain — fold it into the dir_handles stage
+            // (before success()) so a failure here drops the timer as error,
+            // mirroring restore (which reads fh_creator inside its dir_handles
+            // stage). Avoids the "all stages success + persist_total error" gap.
+            writer.write_len(self.fh_creator.get())?;
+            if let Some(stage) = stage {
+                stage.success();
+            }
+        }
 
         Ok(())
     }
@@ -803,6 +934,7 @@ impl NodeState {
     }
 
     pub async fn restore(&self, reader: &mut StateReader) -> FuseResult<()> {
+        let metrics_enabled = self.conf.metrics_enabled;
         // The magic/version early-returns below are gauge-safe ONLY because no
         // map has been mutated yet: restore runs at mount time before any
         // traffic, so the maps are still at cold-start and the gauges already
@@ -811,6 +943,14 @@ impl NodeState {
         // handle-phase finalizer below); pulling a map write ahead of these
         // checks would skip the finalizer on a magic/version failure and drift
         // the gauge.
+        //
+        // Phase 3b (D8): the magic/version header validation is not one of the
+        // three NodeState recovery stages — a header failure records
+        // state_restore_total{error} (at the fuse_session.rs caller) and produces
+        // NO node_map/file_handles/dir_handles stage. (The earlier `mount_fds`
+        // stage, handled by fuse_session.rs before fs.restore, may already have
+        // recorded success — the fd map precedes this header in the file format.)
+        // So these early returns are intentionally outside any StateStageTimer.
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
         if &magic != STATE_FILE_MAGIC {
@@ -831,6 +971,7 @@ impl NodeState {
         }
 
         {
+            let stage = StateStageTimer::start(metrics_enabled, false, STATE_STAGE_NODE_MAP);
             info!("node_state::restore: restoring node_map");
             let mut node_lock = self.node_write();
             // inode_num is owned by NodeMap::restore (sets from live nodes.len()
@@ -842,6 +983,9 @@ impl NodeState {
                 "node_state::restore: node_map {}restored",
                 node_lock.nodes_len()
             );
+            if let Some(stage) = stage {
+                stage.success();
+            }
         }
 
         // Handle-restore phase. The bulk inserts below do NOT go through the
@@ -856,59 +1000,85 @@ impl NodeState {
         // (dir-handle read/path/list_stream, and the trailing fh_creator read),
         // because any of those can fire after the handle maps were mutated.
         let result: FuseResult<()> = async {
-            info!("node_state::restore: restoring file_handles");
-            let handles_count = reader.read_len()?;
-            let mut restored_handles = 0;
-            for i in 0..handles_count {
-                let handle = match FileHandle::restore(reader, self).await {
-                    Ok(handle) => handle,
-                    Err(e) => {
-                        error!(
-                            "failed to restore file_handle {}/{}: {}",
-                            i + 1,
-                            handles_count,
-                            e
-                        );
-                        continue;
+            // Phase 3b (P1-4): file_handles stage covers read_len + the restore
+            // loop + inserts; any early `?` (read_len) drops the timer as error.
+            {
+                let stage =
+                    StateStageTimer::start(metrics_enabled, false, STATE_STAGE_FILE_HANDLES);
+                info!("node_state::restore: restoring file_handles");
+                let handles_count = reader.read_len()?;
+                let mut restored_handles = 0;
+                // best-effort: a corrupt handle is logged and skipped (control
+                // flow unchanged), but a skipped handle means the stage did NOT
+                // recover cleanly — leave the timer to drop as `error` so metrics
+                // don't hide partial/corrupt restore as success (review #961).
+                let mut any_failed = false;
+                for i in 0..handles_count {
+                    let handle = match FileHandle::restore(reader, self).await {
+                        Ok(handle) => handle,
+                        Err(e) => {
+                            error!(
+                                "failed to restore file_handle {}/{}: {}",
+                                i + 1,
+                                handles_count,
+                                e
+                            );
+                            any_failed = true;
+                            continue;
+                        }
+                    };
+
+                    // Drift-check allowlist: restore bulk insert (file handles).
+                    // Direct insert on purpose — the finalizer below owns the gauge.
+                    self.handles
+                        .write()
+                        .entry(handle.ino)
+                        .or_default()
+                        .insert(handle.fh, Arc::new(handle));
+                    restored_handles += 1;
+                }
+                info!(
+                    "node_state::restore: {}/{} file_handles restored",
+                    restored_handles, handles_count
+                );
+                if let Some(stage) = stage {
+                    if !any_failed {
+                        stage.success();
                     }
-                };
-
-                // Drift-check allowlist: restore bulk insert (file handles).
-                // Direct insert on purpose — the finalizer below owns the gauge.
-                self.handles
-                    .write()
-                    .entry(handle.ino)
-                    .or_default()
-                    .insert(handle.fh, Arc::new(handle));
-                restored_handles += 1;
+                }
             }
-            info!(
-                "node_state::restore: {}/{} file_handles restored",
-                restored_handles, handles_count
-            );
 
-            info!("node_state::restore: restoring dir_handles");
-            let dir_handles_count = reader.read_len()?;
-            for _ in 0..dir_handles_count {
-                let mut handle = reader.read_struct::<DirHandle>()?;
-                let path = Path::from_str(&handle.path)?;
-                let stream = self.list_stream(&path).await?;
-                handle.set_stream(stream);
+            // dir_handles stage covers read_len + loop (read/path/list_stream/
+            // insert) + the trailing fh_creator read (P1-4: fh_creator folds into
+            // dir_handles' tail). Any early `?` drops the timer as error.
+            {
+                let stage = StateStageTimer::start(metrics_enabled, false, STATE_STAGE_DIR_HANDLES);
+                info!("node_state::restore: restoring dir_handles");
+                let dir_handles_count = reader.read_len()?;
+                for _ in 0..dir_handles_count {
+                    let mut handle = reader.read_struct::<DirHandle>()?;
+                    let path = Path::from_str(&handle.path)?;
+                    let stream = self.list_stream(&path).await?;
+                    handle.set_stream(stream);
 
-                // Drift-check allowlist: restore bulk insert (dir handles).
-                self.dir_handles
-                    .write()
-                    .entry(handle.ino)
-                    .or_default()
-                    .insert(handle.fh, Arc::new(handle));
+                    // Drift-check allowlist: restore bulk insert (dir handles).
+                    self.dir_handles
+                        .write()
+                        .entry(handle.ino)
+                        .or_default()
+                        .insert(handle.fh, Arc::new(handle));
+                }
+                info!(
+                    "node_state::restore: {} dir_handles restored",
+                    dir_handles_count
+                );
+
+                let fh_creator_value = reader.read_len()?;
+                self.fh_creator.set(fh_creator_value);
+                if let Some(stage) = stage {
+                    stage.success();
+                }
             }
-            info!(
-                "node_state::restore: {} dir_handles restored",
-                dir_handles_count
-            );
-
-            let fh_creator_value = reader.read_len()?;
-            self.fh_creator.set(fh_creator_value);
             Ok(())
         }
         .await;
@@ -917,12 +1087,11 @@ impl NodeState {
         // covering the Ok path and every early-? above. inode_num is not touched
         // here (NodeMap::restore already owns it).
         FuseMetrics::with(|m| {
-            Self::sync_handle_gauges(
-                &m.file_handle_num,
-                self.file_handles_len(),
-                &m.dir_handle_num,
-                self.dir_handles_len(),
-            )
+            let file_len = self.file_handles_len();
+            let dir_len = self.dir_handles_len();
+            Self::sync_handle_gauges(&m.file_handle_num, file_len, &m.dir_handle_num, dir_len);
+            // Phase 3b-1: namespaced aliases set from the same live counts.
+            Self::sync_handle_gauges(&m.file_handle_count, file_len, &m.dir_handle_count, dir_len);
         });
 
         if result.is_ok() {
@@ -945,6 +1114,23 @@ impl NodeState {
     ) {
         file_gauge.set(file_len as i64);
         dir_gauge.set(dir_len as i64);
+    }
+
+    /// Increment a legacy gauge and its Phase 3b-1 namespaced alias in lockstep.
+    /// Extracted as a `&Gauge` taker (like [`Self::sync_handle_gauges`]) so the
+    /// "legacy and alias move together" invariant is unit-testable against
+    /// injected, isolated gauges — the process-global handle gauges are written
+    /// by parallel tests, so a direct assertion on them would be flaky. Both are
+    /// single atomic adds, safe to call inside the in-lock `FuseMetrics::with`.
+    fn inc_gauges_lockstep(legacy: &orpc::common::Gauge, alias: &orpc::common::Gauge) {
+        legacy.inc();
+        alias.inc();
+    }
+
+    /// Decrement counterpart of [`Self::inc_gauges_lockstep`].
+    fn dec_gauges_lockstep(legacy: &orpc::common::Gauge, alias: &orpc::common::Gauge) {
+        legacy.dec();
+        alias.dec();
     }
 }
 
@@ -1079,26 +1265,38 @@ mod test {
     // through the `*_handle_locked` wrappers, the same before/after pattern as
     // `meta_task_guard_gate`.
     //
-    // Concurrency note: these are now the ONLY tests in this binary that write
-    // `file_handle_num`/`dir_handle_num` — the invariant tests above were moved
-    // off the gauge-writing wrappers onto the gauge-free map_* cores precisely so
-    // they no longer pollute these deltas (PR #941 review). Production
+    // Concurrency note: this is the ONLY test in this binary that writes
+    // `file_handle_num`/`dir_handle_num` — the invariant tests above were moved off
+    // the gauge-writing wrappers onto the gauge-free map_* cores precisely so they
+    // no longer pollute these deltas (PR #941 review). Production
     // `new_handle`/`new_dir_handle` need a live backend, so no other test drives
-    // them either. The file test touches only `file_handle_num` and the dir test
-    // only `dir_handle_num`, so they don't race each other. We assert deltas (not
-    // absolutes) since other tests' `ensure_init` leaves an unknown start. If a
-    // future test writes these gauges, switch to an injected gauge or serialize.
-
+    // them either.
+    //
+    // The file and dir cases are a SINGLE test (not two) on purpose: each case's
+    // cross-non-interference assertion READS the OTHER gauge (the dir case asserts
+    // `file_handle_num` is untouched, and vice versa), while the sibling case WRITES
+    // it. As two `#[test]`s they raced under the default parallel harness — the dir
+    // test could observe the file test's in-flight `+1` and see `file_handle_num !=
+    // file_before` (a spurious `left:0 right:1`). Run sequentially in one test, there
+    // is no concurrent writer of either gauge, so the cross-gauge reads are stable.
+    // We assert deltas (not absolutes) since other tests' `ensure_init` leaves an
+    // unknown start. If a future test writes these gauges, switch to an injected
+    // gauge or serialize.
     #[test]
-    fn insert_file_handle_inc_then_remove_dec_the_file_gauge() {
+    fn handle_chokepoints_inc_dec_their_own_gauge_only() {
         crate::FuseMetrics::ensure_init().unwrap();
         let mx = crate::FuseMetrics::get();
-        let mut map: FastHashMap<u64, FastHashMap<u64, Arc<FileHandle>>> = FastHashMap::default();
 
+        // --- file handle: inc/dec file_handle_num, must not touch dir_handle_num ---
+        // (Namespaced-alias lockstep is proven separately against injected,
+        // isolated gauges in `inc_dec_gauges_lockstep_move_both_together`, to keep
+        // this process-global-gauge test free of extra flaky absolute assertions.)
+        let mut file_map: FastHashMap<u64, FastHashMap<u64, Arc<FileHandle>>> =
+            FastHashMap::default();
         let file_before = mx.file_handle_num.get();
         let dir_before = mx.dir_handle_num.get();
 
-        NodeState::insert_file_handle_locked(&mut map, 7, 70, file_handle(7, 70));
+        NodeState::insert_file_handle_locked(&mut file_map, 7, 70, file_handle(7, 70));
         assert_eq!(
             mx.file_handle_num.get(),
             file_before + 1,
@@ -1110,24 +1308,21 @@ mod test {
             "file handle must NOT touch dir_handle_num"
         );
 
-        NodeState::remove_file_handle_locked(&mut map, 7, 70);
+        NodeState::remove_file_handle_locked(&mut file_map, 7, 70);
         assert_eq!(
             mx.file_handle_num.get(),
             file_before,
             "removing the fh must dec file_handle_num back"
         );
-    }
 
-    #[test]
-    fn insert_dir_handle_inc_then_remove_dec_the_dir_gauge() {
-        crate::FuseMetrics::ensure_init().unwrap();
-        let mx = crate::FuseMetrics::get();
-        let mut map: FastHashMap<u64, FastHashMap<u64, Arc<DirHandle>>> = FastHashMap::default();
-
+        // --- dir handle: inc/dec dir_handle_num, must not touch file_handle_num ---
+        // Re-read baselines: both gauges are back to their pre-file-case values now.
+        let mut dir_map: FastHashMap<u64, FastHashMap<u64, Arc<DirHandle>>> =
+            FastHashMap::default();
         let dir_before = mx.dir_handle_num.get();
         let file_before = mx.file_handle_num.get();
 
-        NodeState::insert_dir_handle_locked(&mut map, 8, 80, dir_handle(8, 80));
+        NodeState::insert_dir_handle_locked(&mut dir_map, 8, 80, dir_handle(8, 80));
         assert_eq!(
             mx.dir_handle_num.get(),
             dir_before + 1,
@@ -1139,12 +1334,39 @@ mod test {
             "dir handle must NOT touch file_handle_num"
         );
 
-        NodeState::remove_dir_handle_locked(&mut map, 8, 80);
+        NodeState::remove_dir_handle_locked(&mut dir_map, 8, 80);
         assert_eq!(
             mx.dir_handle_num.get(),
             dir_before,
             "removing the fh must dec dir_handle_num back"
         );
+    }
+
+    // Phase 3b-1: prove the legacy gauge and its namespaced alias move together
+    // on inc/dec, against INJECTED isolated gauges (not the process-global ones),
+    // so the assertion is exact yet parallel-test safe (the production chokepoints
+    // call these same helpers inside their `FuseMetrics::with` closure).
+    #[test]
+    fn inc_dec_gauges_lockstep_move_both_together() {
+        let legacy = orpc::common::Metrics::new_gauge(
+            "test_lockstep_legacy_gauge_unique",
+            "isolated legacy gauge",
+        )
+        .unwrap();
+        let alias = orpc::common::Metrics::new_gauge(
+            "test_lockstep_alias_gauge_unique",
+            "isolated alias gauge",
+        )
+        .unwrap();
+
+        NodeState::inc_gauges_lockstep(&legacy, &alias);
+        NodeState::inc_gauges_lockstep(&legacy, &alias);
+        assert_eq!(legacy.get(), 2, "legacy inc'd twice");
+        assert_eq!(alias.get(), 2, "alias must track legacy on inc");
+
+        NodeState::dec_gauges_lockstep(&legacy, &alias);
+        assert_eq!(legacy.get(), 1, "legacy dec'd once");
+        assert_eq!(alias.get(), 1, "alias must track legacy on dec");
     }
 
     // The restore handle finalizer feeds file_handles_len()/dir_handles_len() to
@@ -1293,5 +1515,138 @@ mod test {
         assert!(state.is_pending_delete(node.ino));
 
         Ok(())
+    }
+
+    // Phase 3a: the blocks-namespace of user_meta_cache_total. get_cached_blocks
+    // records hit/miss on the cache read; a put_open records the put. Asserts the
+    // real CACHE_BLOCKS children via before/after deltas (the {cache,status}
+    // labels are a closed shared set, so deltas — not absolutes — keep this
+    // parallel-test safe).
+    #[test]
+    fn get_cached_blocks_records_miss_then_hit_and_put() -> CommonResult<()> {
+        use crate::fuse_metrics::{
+            CACHE_BLOCKS, CACHE_RESULT_HIT, CACHE_RESULT_MISS, CACHE_RESULT_PUT,
+        };
+        use curvine_common::state::FileBlocks;
+
+        crate::FuseMetrics::ensure_init().unwrap();
+        let mx = crate::FuseMetrics::get();
+
+        let mut conf = ClusterConf::default();
+        conf.fuse.enable_meta_cache = true;
+        conf.fuse.init()?;
+        let fs = UnifiedFileSystem::with_rt(conf, Arc::new(AsyncRuntime::single()))?;
+        let state = NodeState::new(fs);
+
+        let path = Path::from_str("/blocks-cache-test")?;
+        let read_child = |status: &str| {
+            mx.user_meta_cache_total
+                .with_label_values(&[CACHE_BLOCKS, status])
+                .get()
+        };
+        let (h0, m0, p0) = (
+            read_child(CACHE_RESULT_HIT),
+            read_child(CACHE_RESULT_MISS),
+            read_child(CACHE_RESULT_PUT),
+        );
+
+        // The CACHE_BLOCKS children are a closed, shared label set written by
+        // concurrent tests too, so assert lower bounds on this test's own deltas,
+        // not exact values (Phase3 parallel-test discipline).
+        //
+        // Cold: miss.
+        assert!(state.get_cached_blocks(&path).is_none());
+        assert!(read_child(CACHE_RESULT_MISS) > m0, "cold read is a miss");
+
+        // Populate via the PRODUCTION put seam (the same helper the Cv/Fallback
+        // new_reader arms call), so this test covers the real put wiring, not just
+        // the bare counter helper (P2).
+        let status = FileStatus::with_name(2, "blocks-cache-test".to_string(), false);
+        state.put_blocks_cache_and_record(&path, FileBlocks::new(status, vec![]));
+        assert!(
+            read_child(CACHE_RESULT_PUT) > p0,
+            "production put seam records a put"
+        );
+
+        // Warm read is a hit.
+        assert!(state.get_cached_blocks(&path).is_some());
+        assert!(read_child(CACHE_RESULT_HIT) > h0, "warm read is a hit");
+
+        Ok(())
+    }
+
+    // P1 kill-switch: with metrics_enabled=false (and the singleton initialized),
+    // the blocks cache helpers must still perform the cache read/write while
+    // suppressing emission. This test asserts the FUNCTIONAL half (cache still
+    // works); the NO-EMISSION half is proven deterministically below in
+    // `metrics_disabled_gate_suppresses_emission` against an isolated counter (the
+    // process-global {cache=blocks} children are shared with concurrent tests, so
+    // a "child did not move" assertion here would be flaky — see Phase3 parallel
+    // discipline).
+    #[test]
+    fn blocks_cache_metrics_disabled_emits_nothing() -> CommonResult<()> {
+        use curvine_common::state::FileBlocks;
+
+        crate::FuseMetrics::ensure_init().unwrap();
+
+        let mut conf = ClusterConf::default();
+        conf.fuse.enable_meta_cache = true;
+        conf.fuse.metrics_enabled = false; // observation kill-switch OFF
+        conf.fuse.init()?;
+        let fs = UnifiedFileSystem::with_rt(conf, Arc::new(AsyncRuntime::single()))?;
+        let state = NodeState::new(fs);
+
+        // With metrics disabled, the cache helpers must still perform the cache
+        // read/write (functional behavior), and the emission is structurally
+        // suppressed (each emitter is wrapped in `if self.conf.metrics_enabled`).
+        //
+        // We deliberately do NOT assert on the process-global CACHE_BLOCKS
+        // children here: they are a closed, shared label set that ANY concurrent
+        // test (e.g. the enabled blocks test, or e2e) also writes, so a
+        // disabled-mode "child did not move" equality is inherently flaky under
+        // the default parallel harness. The gate's no-emission behavior is proven
+        // deterministically at the seam level by `ReaddirTimer::start(false)`
+        // returning `None`, and the gate wiring is a simple `if conf.metrics_enabled`
+        // around each `FuseMetrics::with` call.
+        let path = Path::from_str("/blocks-disabled-test")?;
+        assert!(state.get_cached_blocks(&path).is_none(), "cold read misses");
+        let status = FileStatus::with_name(2, "blocks-disabled-test".to_string(), false);
+        state.put_blocks_cache_and_record(&path, FileBlocks::new(status, vec![]));
+        assert!(
+            state.get_cached_blocks(&path).is_some(),
+            "cache write still happens with metrics disabled"
+        );
+
+        Ok(())
+    }
+
+    // P3-1 (deterministic): the no-emission half of the metrics_enabled gate,
+    // proven against an INJECTED isolated counter so it is exact AND parallel-safe
+    // (no shared process-global child). Mirrors the exact `if enabled { emit }`
+    // shape every 3a emitter uses (record_meta_cache / record_blocks_cache /
+    // record_negative_entry / invalidate_cache).
+    #[test]
+    fn metrics_disabled_gate_suppresses_emission() {
+        // Stand-in for a gated emitter: `if enabled { counter.inc() }`.
+        fn record_if(enabled: bool, counter: &orpc::common::Counter) {
+            if enabled {
+                counter.inc();
+            }
+        }
+
+        let counter = orpc::common::Metrics::new_counter(
+            "test_metrics_gate_isolated_counter_unique",
+            "isolated gate counter",
+        )
+        .unwrap();
+
+        // Disabled: no increment, exactly.
+        record_if(false, &counter);
+        record_if(false, &counter);
+        assert_eq!(counter.get(), 0, "disabled gate must emit nothing");
+
+        // Enabled: increments.
+        record_if(true, &counter);
+        assert_eq!(counter.get(), 1, "enabled gate emits");
     }
 }

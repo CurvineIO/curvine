@@ -14,7 +14,7 @@
 
 use bytes::BytesMut;
 use curvine_client::unified::{UfsFileSystem, UnifiedFileSystem, UnifiedReader};
-use curvine_common::fs::{FileSystem, Path, Reader, Writer};
+use curvine_common::fs::{FileSystem, Path, Reader, RpcCode, Writer};
 use curvine_common::state::{MountOptionsBuilder, WriteType};
 use curvine_tests::Testing;
 use orpc::common::Utils;
@@ -48,7 +48,11 @@ fn test_cache_mode() {
         write(&fs, &path, false).await;
 
         // Test 2: resubmit async task (skipped if data already synced); then check UFS mtime unchanged
-        let (ufs_path, mnt) = fs.get_mount(&path).await.unwrap().unwrap();
+        let (ufs_path, mnt) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
         let ufs_reader_before = mnt.ufs.open(&ufs_path).await.unwrap();
         let mtime_before = ufs_reader_before.status().mtime;
         drop(ufs_reader_before);
@@ -110,7 +114,11 @@ fn test_fs_mode() {
         let path = format!("/write_cache_{:?}/test.log", WriteType::FsMode).into();
         write(&fs, &path, false).await;
 
-        let (_, mnt) = fs.get_mount(&path).await.unwrap().unwrap();
+        let (_, mnt) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
 
         // Test rename
         let path = format!("/write_cache_{:?}/meta.log", WriteType::FsMode).into();
@@ -376,7 +384,7 @@ async fn verify_read_data(fs: &UnifiedFileSystem, path: &Path, expected_data: &[
 
 /// Returns true when UFS object exists and matches CV (mtime + full content).
 async fn try_verify_cv_ufs_consistency(fs: &UnifiedFileSystem, path: &Path) -> bool {
-    let (ufs_path, mnt) = match fs.get_mount(path).await {
+    let (ufs_path, mnt) = match fs.get_mount(path, RpcCode::GetMountInfo).await {
         Ok(Some(v)) => v,
         _ => return false,
     };
@@ -429,7 +437,12 @@ async fn mount(fs: &UnifiedFileSystem, write_type: WriteType) {
     let ufs_path = Path::from_str(format!("{}/{}", ufs_base, dir)).unwrap();
     let cv_path = Path::from_str(format!("/{}", dir)).unwrap();
 
-    if fs.get_mount(&cv_path).await.unwrap().is_some() {
+    if fs
+        .get_mount(&cv_path, RpcCode::GetMountInfo)
+        .await
+        .unwrap()
+        .is_some()
+    {
         return;
     }
 
