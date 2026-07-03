@@ -32,7 +32,9 @@ yarn.lock
 .metals
 .scala-build
 .cursorrules
-.cursor
+.cursor/*
+!.cursor/skills
+!.github/skills
 # Scala/Metals related files (not needed for Rust project)
 .metals/
 .scala-build/
@@ -42,7 +44,8 @@ yarn.lock
 curvine-libsdk/java/target/
 .staging/
 .summary/
-.claude/
+.claude/*
+!.claude/skills
 # Repo-root design notes (keep local); allow per-crate docs/ (e.g. curvine-lancedb-rs/docs).
 /docs
 
@@ -50,3 +53,7 @@ __pycache__
 
 # Regression test results (build-server / curvine-tests)
 curvine-tests/regression_result
+
+# Agent skills: only cv-* are tracked in repo; other local skills stay untracked
+.agents/skills/*
+!.agents/skills/cv-*/
