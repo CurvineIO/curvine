@@ -369,6 +369,21 @@ impl DBConf {
         opt
     }
 
+    /// ReadOptions tuned for one-shot bulk scans during snapshot restore.
+    ///
+    /// - `total_order_seek(true)`: required for correctness with hash memtables;
+    ///   without it, a full-CF scan can silently miss keys (see db_engine.rs
+    ///   `scan()` comment).
+    /// - `fill_cache(false)`: the scan data is one-shot and won't be reused;
+    ///   avoid polluting the block cache during restore.
+    /// - `readahead_size(64 MiB)`: maximise sequential I/O throughput.
+    pub fn create_bulk_scan_opt(&self) -> ReadOptions {
+        let mut opt = self.create_iterator_opt();
+        opt.set_total_order_seek(true);
+        opt.fill_cache(false);
+        opt
+    }
+
     // Write configuration
     pub fn create_write_opt(&self) -> WriteOptions {
         let mut opt = WriteOptions::default();
