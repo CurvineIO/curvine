@@ -14,16 +14,80 @@
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::inode::ttl::TtlBucketList;
-use crate::master::meta::inode::{Inode, InodeFile, InodePath, InodeView, ROOT_INODE_ID};
+use crate::master::meta::inode::{Inode, InodeFile, InodePath, InodePtr, InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
 use curvine_common::rocksdb::{DBConf, RocksUtils};
 use curvine_common::state::{BlockLocation, CommitBlock, FileLock, FileStatus, MountInfo};
 use curvine_common::utils::SerdeUtils;
+use log::info;
 use orpc::common::{FileUtils, Utils};
 use orpc::{err_box, try_err, try_option, CommonResult};
-use std::collections::{HashMap, LinkedList};
+use std::collections::{HashMap, HashSet, LinkedList, VecDeque};
 use std::sync::Arc;
+
+// ---------------------------------------------------------------------------
+// Private helper structs for bulk-load snapshot restore (Issue #964)
+// ---------------------------------------------------------------------------
+
+/// Bulk-loaded metadata from RocksDB, used as input for in-memory tree assembly.
+struct SnapshotData {
+    /// parent_id -> list of (child_name, child_id) edges
+    edges: HashMap<i64, Vec<(String, i64)>>,
+    /// inode_id -> deserialized InodeView
+    inodes: HashMap<i64, InodeView>,
+}
+
+/// Lightweight phase-timing / counter collector for create_tree restore.
+struct RestoreTimer {
+    phases: Vec<(&'static str, u64)>,
+    edge_count: usize,
+    inode_count: usize,
+    orphaned_count: usize,
+    repair_count: usize,
+    file_count: i64,
+    dir_count: i64,
+    last_mark: std::time::Instant,
+}
+
+impl RestoreTimer {
+    fn new() -> Self {
+        Self {
+            phases: Vec::new(),
+            edge_count: 0,
+            inode_count: 0,
+            orphaned_count: 0,
+            repair_count: 0,
+            file_count: 0,
+            dir_count: 0,
+            last_mark: std::time::Instant::now(),
+        }
+    }
+
+    fn mark(&mut self, name: &'static str) {
+        let elapsed = self.last_mark.elapsed().as_millis() as u64;
+        self.phases.push((name, elapsed));
+        self.last_mark = std::time::Instant::now();
+    }
+
+    fn log_summary(&self) {
+        let phase_str: Vec<String> = self
+            .phases
+            .iter()
+            .map(|(name, ms)| format!("{}={}ms", name, ms))
+            .collect();
+        info!(
+            "create_tree: edges={}, inodes={}, orphaned={}, repairs={}, files={}, dirs={}, phases=[{}]",
+            self.edge_count,
+            self.inode_count,
+            self.orphaned_count,
+            self.repair_count,
+            self.file_count,
+            self.dir_count,
+            phase_str.join(", "),
+        );
+    }
+}
 
 // Currently, only RockSDB is supported.
 // Note: InodeStore is intentionally NOT Clone.
@@ -400,119 +464,247 @@ impl InodeStore {
         Ok((ROOT_INODE_ID, root))
     }
 
-    // Restore to a directory tree from rocksdb
+    // Restore to a directory tree from rocksdb.
+    //
+    // Two-phase bulk-load approach (Issue #964):
+    //   Phase 1: Sequentially scan entire `edges` and `inodes` column families
+    //            into in-memory HashMaps, eliminating O(N) point lookups.
+    //            Inode deserialization is parallelised across available cores.
+    //   Phase 2: Assemble the in-memory directory tree via BFS, moving InodeView
+    //            values out of the HashMap (zero cloning) and applying the same
+    //            repair logic as the previous per-inode-lookup implementation.
     pub fn create_tree(&self) -> CommonResult<(i64, InodeView)> {
-        // Load root metadata from DB to preserve mtime, nlink, and other attributes
-        // that have been updated since the root was first created.
-        let mut root = self
-            .store
-            .get_inode(ROOT_INODE_ID)?
+        let mut timer = RestoreTimer::new();
+
+        let data = self.load_snapshot_data(&mut timer)?;
+        let (last_inode_id, root) = self.build_tree_from_data(data, &mut timer)?;
+
+        self.fs_stats.set_counts(timer.file_count, timer.dir_count);
+        timer.log_summary();
+
+        Ok((last_inode_id, root))
+    }
+
+    /// Phase 1: Bulk-load all edges and inodes from RocksDB into memory.
+    fn load_snapshot_data(&self, timer: &mut RestoreTimer) -> CommonResult<SnapshotData> {
+        // --- 1a. Scan edges CF → group by parent_id ---
+        let mut edges: HashMap<i64, Vec<(String, i64)>> = HashMap::new();
+        let edges_iter = self.store.bulk_scan_edges()?;
+        for item in edges_iter {
+            let (key, value) = try_err!(item);
+            let (parent_id, child_name) = RocksUtils::i64_str_from_bytes(&key).unwrap();
+            let child_id = RocksUtils::i64_from_bytes(&value)?;
+            edges
+                .entry(parent_id)
+                .or_insert_with(Vec::new)
+                .push((child_name.to_string(), child_id));
+            timer.edge_count += 1;
+        }
+        timer.mark("scan_edges");
+
+        // --- 1b. Scan inodes CF → collect raw bytes ---
+        let mut raw_inodes: Vec<(i64, Vec<u8>)> = Vec::new();
+        let inodes_iter = self.store.bulk_scan_inodes()?;
+        for item in inodes_iter {
+            let (key, value) = try_err!(item);
+            let inode_id = RocksUtils::i64_from_bytes(&key)?;
+            raw_inodes.push((inode_id, value.to_vec()));
+        }
+        timer.inode_count = raw_inodes.len();
+        timer.mark("scan_inodes");
+
+        // --- 1c. Parallel-deserialize inodes ---
+        let inodes = Self::parallel_deserialize_inodes(raw_inodes)?;
+        timer.mark("deserialize_inodes");
+
+        Ok(SnapshotData { edges, inodes })
+    }
+
+    /// Parallel-deserialize raw inode bytes into a HashMap using std::thread::scope.
+    /// Falls back to single-threaded for small datasets.
+    fn parallel_deserialize_inodes(
+        raw: Vec<(i64, Vec<u8>)>,
+    ) -> CommonResult<HashMap<i64, InodeView>> {
+        let total = raw.len();
+        let mut inodes = HashMap::with_capacity(total);
+
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(total.max(1));
+
+        if num_threads <= 1 || total < 1000 {
+            for (id, bytes) in raw {
+                let inode: InodeView = SerdeUtils::deserialize(&bytes)?;
+                inodes.insert(id, inode);
+            }
+            return Ok(inodes);
+        }
+
+        let chunk_size = total.div_ceil(num_threads);
+        let chunks: Vec<Vec<(i64, Vec<u8>)>> = raw.chunks(chunk_size).map(|c| c.to_vec()).collect();
+
+        let thread_results =
+            std::thread::scope(|s| -> CommonResult<Vec<Vec<(i64, InodeView)>>> {
+                let handles: Vec<_> = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        s.spawn(move || -> CommonResult<Vec<(i64, InodeView)>> {
+                            let mut result = Vec::with_capacity(chunk.len());
+                            for (id, bytes) in chunk {
+                                let inode: InodeView = SerdeUtils::deserialize(&bytes)?;
+                                result.push((id, inode));
+                            }
+                            Ok(result)
+                        })
+                    })
+                    .collect();
+
+                let mut all = Vec::with_capacity(handles.len());
+                for h in handles {
+                    let inner = match h.join() {
+                        Ok(result) => result,
+                        Err(_) => {
+                            return err_box!(
+                                "thread panicked during inode deserialization"
+                            )
+                        }
+                    };
+                    all.push(inner?);
+                }
+                Ok(all)
+            })?;
+
+        for chunk_result in thread_results {
+            for (id, inode) in chunk_result {
+                inodes.insert(id, inode);
+            }
+        }
+
+        Ok(inodes)
+    }
+
+    /// Phase 2 + 3: Assemble the in-memory directory tree from bulk-loaded data.
+    ///
+    /// Uses BFS with `HashMap::remove()` to move `InodeView` values into the tree
+    /// (zero cloning). Repair logic (orphaned edges, duplicate directory edges,
+    /// name/parent mismatches) is preserved exactly from the previous implementation.
+    fn build_tree_from_data(
+        &self,
+        mut data: SnapshotData,
+        timer: &mut RestoreTimer,
+    ) -> CommonResult<(i64, InodeView)> {
+        // Load root metadata from the bulk-loaded inodes (or create default).
+        let mut root = data
+            .inodes
+            .remove(&ROOT_INODE_ID)
             .unwrap_or_else(FsDir::create_root);
 
-        let mut stack = LinkedList::new();
-        stack.push_back((
-            root.as_ptr(),
-            ROOT_INODE_ID,
-            InodeView::new_entry(String::new(), ROOT_INODE_ID),
-        ));
+        // BFS stack: (parent_ptr, parent_id)
+        let mut stack: VecDeque<(InodePtr, i64)> = VecDeque::new();
+        stack.push_back((root.as_ptr(), ROOT_INODE_ID));
+
         let mut last_inode_id = ROOT_INODE_ID;
-        let mut file_count = 0i64;
-        let mut dir_count = 0i64;
         let mut dir_edges: HashMap<i64, (i64, String)> = HashMap::new();
+        let mut seen_ids: HashSet<i64> = HashSet::new();
         let mut repair_batch = self.store.new_batch();
         let mut has_repairs = false;
-        while let Some((mut parent, child_id, file_entry)) = stack.pop_front() {
-            last_inode_id = last_inode_id.max(child_id);
 
-            let next_parent = if child_id != ROOT_INODE_ID {
-                let mut store_inode = match self.store.get_inode(child_id)? {
+        while let Some((mut parent, parent_id)) = stack.pop_front() {
+            // Look up children for this directory (O(1) HashMap — no RocksDB access).
+            let children = match data.edges.get(&parent_id) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            for (edge_name, child_id) in children {
+                last_inode_id = last_inode_id.max(*child_id);
+
+                // Check for duplicate directory edge BEFORE removing from inodes.
+                // A directory can only have one parent; if we've already seen this
+                // directory id, the current edge is a duplicate and must be deleted.
+                if dir_edges.contains_key(child_id) {
+                    let (old_parent_id, old_name) = dir_edges.get(child_id).unwrap();
+                    log::warn!(
+                        "create_tree: directory inode {} has multiple parent edges: keeping parent {} name '{}', dropping parent {} name '{}'",
+                        child_id, old_parent_id, old_name, parent_id, edge_name
+                    );
+                    repair_batch.delete_child(parent_id, edge_name)?;
+                    has_repairs = true;
+                    timer.repair_count += 1;
+                    continue;
+                }
+
+                // Check if this is a hard-linked file (already consumed for another edge).
+                // Files can have multiple parent edges; each edge gets its own FileEntry.
+                if seen_ids.contains(child_id) {
+                    timer.file_count += 1;
+                    let entry = InodeView::new_entry(edge_name.clone(), *child_id);
+                    parent.add_child(entry)?;
+                    continue;
+                }
+
+                seen_ids.insert(*child_id);
+
+                // Move the inode out of the HashMap — zero cloning.
+                let store_inode = match data.inodes.remove(child_id) {
                     Some(v) => v,
                     None => {
                         // Orphaned edge: inode was deleted but edge was not cleaned up
                         // (can happen after a crash between two non-atomic batch commits).
-                        // Skip this entry to keep the tree consistent.
                         log::warn!(
                             "create_tree: orphaned edge detected, child_id={} has no inode, skipping",
                             child_id
                         );
+                        timer.orphaned_count += 1;
                         continue;
                     }
                 };
-                let parent_id = parent.id();
-                let edge_name = file_entry.name().to_string();
 
                 let inode = match store_inode {
                     InodeView::Dir(_) => {
-                        if let Some((old_parent_id, old_name)) = dir_edges.get(&child_id) {
-                            log::warn!(
-                                "create_tree: directory inode {} has multiple parent edges: keeping parent {} name '{}', dropping parent {} name '{}'",
-                                child_id,
-                                old_parent_id,
-                                old_name,
-                                parent_id,
-                                edge_name
-                            );
-                            repair_batch.delete_child(parent_id, &edge_name)?;
-                            has_repairs = true;
-                            continue;
-                        }
-                        dir_edges.insert(child_id, (parent_id, edge_name.clone()));
+                        let mut store_inode = store_inode;
+                        dir_edges.insert(*child_id, (parent_id, edge_name.clone()));
 
-                        if store_inode.name() != edge_name
+                        // Name / parent_id mismatch repair
+                        if store_inode.name() != edge_name.as_str()
                             || store_inode.as_dir_ref()?.parent_id() != parent_id
                         {
-                            store_inode.change_name(edge_name);
+                            store_inode.change_name(edge_name.clone());
                             store_inode.set_parent_id(parent_id);
                             repair_batch.write_inode(&store_inode)?;
                             has_repairs = true;
+                            timer.repair_count += 1;
                         }
                         self.ttl_bucket_list.add(&store_inode);
+                        // Don't count root directory
+                        if *child_id != ROOT_INODE_ID {
+                            timer.dir_count += 1;
+                        }
                         store_inode
                     }
                     _ => {
                         self.ttl_bucket_list.add(&store_inode);
-                        file_entry
+                        timer.file_count += 1;
+                        // Use lightweight FileEntry instead of the full inode
+                        InodeView::new_entry(edge_name.clone(), *child_id)
                     }
                 };
 
-                // Count files and directories during tree reconstruction
-                match &inode {
-                    InodeView::File(_) => file_count += 1,
-                    InodeView::Dir(dir) => {
-                        // Don't count root directory
-                        if dir.id != ROOT_INODE_ID {
-                            dir_count += 1;
-                        }
-                    }
-                    InodeView::FileEntry(..) => file_count += 1,
-                }
+                let child_ptr = parent.add_child(inode)?;
 
-                parent.add_child(inode)?
-            } else {
-                parent
-            };
-
-            // Find all child nodes in the directory.
-            if next_parent.is_dir() {
-                let childs_iter = self.store.edges_iter(next_parent.id())?;
-                for item in childs_iter {
-                    let (key, value) = try_err!(item);
-                    let (_, child_name) = RocksUtils::i64_str_from_bytes(&key).unwrap();
-                    let child_id = RocksUtils::i64_from_bytes(&value)?;
-                    let file_entry = InodeView::new_entry(child_name.to_string(), child_id);
-
-                    stack.push_back((next_parent.clone(), child_id, file_entry))
+                // If directory, push onto stack for its children
+                if child_ptr.is_dir() {
+                    stack.push_back((child_ptr, *child_id));
                 }
             }
         }
 
+        // Commit repairs atomically
         if has_repairs {
             repair_batch.commit()?;
         }
-
-        // Update statistics with the counts from tree reconstruction after any
-        // durable repairs have succeeded.
-        self.fs_stats.set_counts(file_count, dir_count);
+        timer.mark("build_tree");
 
         Ok((last_inode_id, root))
     }
@@ -705,7 +897,7 @@ impl InodeStore {
 mod tests {
     use super::*;
     use crate::master::meta::inode::ttl::TtlBucketList;
-    use crate::master::meta::inode::{Inode, InodeDir, ROOT_INODE_ID};
+    use crate::master::meta::inode::{Inode, InodeDir, InodeFile, ROOT_INODE_ID};
     use crate::master::Master;
 
     fn new_store(name: &str) -> CommonResult<InodeStore> {
@@ -807,6 +999,193 @@ mod tests {
             .expect("directory inode should still exist");
         assert_eq!(persisted.name(), "edge-name");
         assert_eq!(persisted.as_dir_ref()?.parent_id(), ROOT_INODE_ID);
+
+        Ok(())
+    }
+
+    #[test]
+    fn create_tree_handles_orphaned_edge() -> CommonResult<()> {
+        let store = new_store("orphaned-edge")?;
+        let root = FsDir::create_root();
+        let dir = InodeView::new_dir("real-dir".to_string(), InodeDir::new(2010, 0));
+
+        {
+            let mut batch = store.new_batch();
+            batch.write_inode(&root)?;
+            batch.write_inode(&dir)?;
+            batch.add_child(ROOT_INODE_ID, "real-dir", dir.id())?;
+            // Add an orphaned edge: edge points to an inode that does not exist.
+            batch.add_child(ROOT_INODE_ID, "orphan", 9999)?;
+            batch.commit()?;
+        }
+
+        let (_, restored) = store.create_tree()?;
+        let names: Vec<&str> = restored
+            .children()
+            .into_iter()
+            .map(|c| c.name())
+            .collect();
+        // Only the real directory should be in the tree; orphaned edge is skipped.
+        assert_eq!(names, vec!["real-dir"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn create_tree_large_tree_counts() -> CommonResult<()> {
+        let store = new_store("large-tree-counts")?;
+        let root = FsDir::create_root();
+
+        let num_dirs = 100;
+        let files_per_dir = 10;
+        let mut next_id: i64 = 3000;
+
+        {
+            let mut batch = store.new_batch();
+            batch.write_inode(&root)?;
+
+            for i in 0..num_dirs {
+                let dir_id = next_id;
+                next_id += 1;
+                let dir_name = format!("d{}", i);
+                let dir = InodeView::new_dir(
+                    dir_name.clone(),
+                    InodeDir::new(dir_id, 0),
+                );
+                batch.write_inode(&dir)?;
+                batch.add_child(ROOT_INODE_ID, &dir_name, dir_id)?;
+
+                for j in 0..files_per_dir {
+                    let file_id = next_id;
+                    next_id += 1;
+                    let file_name = format!("f{}", j);
+                    let file = InodeView::new_file(
+                        file_name.clone(),
+                        InodeFile::new(file_id, 0),
+                    );
+                    batch.write_inode(&file)?;
+                    batch.add_child(dir_id, &file_name, file_id)?;
+                }
+            }
+            batch.commit()?;
+        }
+
+        let (_, _restored) = store.create_tree()?;
+        // get_file_counts() returns (dir_count, file_count)
+        let (dir_count, file_count) = store.get_file_counts();
+
+        assert_eq!(file_count, (num_dirs * files_per_dir) as i64);
+        assert_eq!(dir_count, num_dirs as i64);
+
+        Ok(())
+    }
+
+    #[test]
+    fn load_snapshot_data_correctness() -> CommonResult<()> {
+        let store = new_store("snapshot-data-correctness")?;
+        let root = FsDir::create_root();
+        let dir = InodeView::new_dir("subdir".to_string(), InodeDir::new(5001, 0));
+        let file = InodeView::new_file("note.txt".to_string(), InodeFile::new(5002, 0));
+
+        {
+            let mut batch = store.new_batch();
+            batch.write_inode(&root)?;
+            batch.write_inode(&dir)?;
+            batch.write_inode(&file)?;
+            batch.add_child(ROOT_INODE_ID, "subdir", dir.id())?;
+            batch.add_child(dir.id(), "note.txt", file.id())?;
+            batch.commit()?;
+        }
+
+        let mut timer = RestoreTimer::new();
+        let data = store.load_snapshot_data(&mut timer)?;
+
+        // Verify edges
+        assert_eq!(data.edges.len(), 2);
+        let root_children = data.edges.get(&ROOT_INODE_ID).expect("root edges");
+        assert_eq!(root_children.len(), 1);
+        assert_eq!(root_children[0].0, "subdir");
+        assert_eq!(root_children[0].1, dir.id());
+
+        let dir_children = data.edges.get(&dir.id()).expect("dir edges");
+        assert_eq!(dir_children.len(), 1);
+        assert_eq!(dir_children[0].0, "note.txt");
+        assert_eq!(dir_children[0].1, file.id());
+
+        // Verify inodes
+        assert_eq!(data.inodes.len(), 3);
+        assert!(data.inodes.contains_key(&ROOT_INODE_ID));
+        assert!(data.inodes.contains_key(&dir.id()));
+        assert!(data.inodes.contains_key(&file.id()));
+
+        Ok(())
+    }
+
+    /// Regression benchmark: 100 dirs × 1000 files = ~100K inodes.
+    /// Run with: cargo test -p curvine-server --lib --release -- \
+    ///   master::meta::store::inode_store::tests::bench_create_tree_large --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_create_tree_large() -> CommonResult<()> {
+        let store = new_store("bench-large")?;
+        let root = FsDir::create_root();
+
+        let num_dirs = 100;
+        let files_per_dir = 1000;
+        let mut next_id: i64 = 100000;
+
+        // Write all inodes and edges in a single batch for speed.
+        {
+            let mut batch = store.new_batch();
+            batch.write_inode(&root)?;
+
+            for i in 0..num_dirs {
+                let dir_id = next_id;
+                next_id += 1;
+                let dir_name = format!("d{}", i);
+                let dir = InodeView::new_dir(dir_name.clone(), InodeDir::new(dir_id, 0));
+                batch.write_inode(&dir)?;
+                batch.add_child(ROOT_INODE_ID, &dir_name, dir_id)?;
+
+                for j in 0..files_per_dir {
+                    let file_id = next_id;
+                    next_id += 1;
+                    let file_name = format!("f{}", j);
+                    let file =
+                        InodeView::new_file(file_name.clone(), InodeFile::new(file_id, 0));
+                    batch.write_inode(&file)?;
+                    batch.add_child(dir_id, &file_name, file_id)?;
+                }
+            }
+            batch.commit()?;
+        }
+
+        let total_inodes = 1 + num_dirs + num_dirs * files_per_dir;
+        println!(
+            "bench: {} inodes ({} dirs × {} files + root)",
+            total_inodes, num_dirs, files_per_dir
+        );
+
+        let start = std::time::Instant::now();
+        let (last_inode_id, _root) = store.create_tree()?;
+        let elapsed_ms = start.elapsed().as_millis();
+
+        let (dir_count, file_count) = store.get_file_counts();
+        println!(
+            "bench: create_tree total={} ms, last_inode_id={}, dir_count={}, file_count={}",
+            elapsed_ms, last_inode_id, dir_count, file_count
+        );
+
+        assert_eq!(file_count, (num_dirs * files_per_dir) as i64);
+        assert_eq!(dir_count, num_dirs as i64);
+
+        // Assert total < 10 seconds for ~100K inodes.
+        assert!(
+            elapsed_ms < 10_000,
+            "create_tree took {} ms (> 10s) for {} inodes",
+            elapsed_ms,
+            total_inodes
+        );
 
         Ok(())
     }
