@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::oss_hdfs::callback_ctx::{I64CallbackCtx, StatusCallbackCtx};
+use crate::oss_hdfs::check_jindo_status;
 use crate::oss_hdfs::ffi::*;
 use bytes::BytesMut;
 use curvine_common::error::FsError;
@@ -58,17 +59,13 @@ impl OssHdfsWriter {
             let start_status =
                 unsafe { jindo_writer_tell_async(handle.as_raw(), Some(cb), userdata) };
             if start_status != JindoStatus::Ok {
-                return Err(FsError::common(format!(
-                    "Failed to start tell: {}",
-                    jindo_last_error()
-                )));
+                check_jindo_status(start_status, "Failed to start tell", None)?;
             }
         }
 
         let (status, offset, err) = self.tell_ctx.wait().await?;
         if status != JindoStatus::Ok {
-            let msg = err.unwrap_or_else(jindo_last_error);
-            return Err(FsError::common(format!("Failed to tell: {}", msg)));
+            check_jindo_status(status, "Failed to tell", err)?;
         }
         Ok(offset)
     }
@@ -161,18 +158,13 @@ impl Writer for OssHdfsWriter {
                 jindo_writer_write_async(handle.as_raw(), data_ptr, data_len, Some(cb), userdata)
             };
             if start_status != JindoStatus::Ok {
-                let err_msg = jindo_last_error();
-                return Err(FsError::common(format!(
-                    "Failed to start write: {}",
-                    err_msg
-                )));
+                check_jindo_status(start_status, "Failed to start write", None)?;
             }
         }
 
         let (status, written, err) = self.write_ctx.wait().await?;
         if status != JindoStatus::Ok {
-            let err_msg = err.unwrap_or_else(jindo_last_error);
-            return Err(FsError::common(format!("Failed to write: {}", err_msg)));
+            check_jindo_status(status, "Failed to write", err)?;
         }
         if written != len {
             return Err(FsError::common(format!(
@@ -203,18 +195,13 @@ impl Writer for OssHdfsWriter {
             let start_status =
                 unsafe { jindo_writer_flush_async(handle.as_raw(), Some(cb), userdata) };
             if start_status != JindoStatus::Ok {
-                let err_msg = jindo_last_error();
-                return Err(FsError::common(format!(
-                    "Failed to start flush: {}",
-                    err_msg
-                )));
+                check_jindo_status(start_status, "Failed to start flush", None)?;
             }
         }
 
         let (status, err) = self.status_ctx.wait().await?;
         if status != JindoStatus::Ok {
-            let err_msg = err.unwrap_or_else(jindo_last_error);
-            return Err(FsError::common(format!("Failed to flush: {}", err_msg)));
+            check_jindo_status(status, "Failed to flush", err)?;
         }
         Ok(())
     }
@@ -241,11 +228,7 @@ impl Writer for OssHdfsWriter {
                 unsafe {
                     jindo_writer_free(handle.as_raw());
                 }
-                let err_msg = jindo_last_error();
-                return Err(FsError::common(format!(
-                    "Failed to start close writer: {}",
-                    err_msg
-                )));
+                check_jindo_status(start_status, "Failed to start close writer", None)?;
             }
 
             let (status, err) = self.status_ctx.wait().await?;
@@ -253,11 +236,7 @@ impl Writer for OssHdfsWriter {
             unsafe { jindo_writer_free(handle.as_raw()) };
 
             if status != JindoStatus::Ok {
-                let err_msg = err.unwrap_or_else(jindo_last_error);
-                return Err(FsError::common(format!(
-                    "Failed to close writer: {}",
-                    err_msg
-                )));
+                check_jindo_status(status, "Failed to close writer", err)?;
             }
         }
         Ok(())

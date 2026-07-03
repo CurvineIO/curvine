@@ -30,7 +30,7 @@ use crate::conf::OssHdfsConf;
 use crate::err_ufs;
 use crate::oss_hdfs::callback_ctx::{err_from_c, CallbackCtx};
 use crate::oss_hdfs::ffi::*;
-use crate::oss_hdfs::{OssHdfsReader, OssHdfsWriter, SCHEME};
+use crate::oss_hdfs::{check_jindo_status, OssHdfsReader, OssHdfsWriter, SCHEME};
 use std::ffi::NulError;
 
 // Helper to convert CString errors
@@ -252,10 +252,7 @@ impl OssHdfsFileSystem {
     }
 
     fn check_status(status: JindoStatus, operation: &str) -> FsResult<()> {
-        if status != JindoStatus::Ok {
-            return err_ufs!("{}: {}", operation, jindo_last_error());
-        }
-        Ok(())
+        check_jindo_status(status, operation, None)
     }
 
     fn check_status_with_err(
@@ -263,13 +260,7 @@ impl OssHdfsFileSystem {
         operation: &str,
         err: Option<String>,
     ) -> FsResult<()> {
-        if status != JindoStatus::Ok {
-            if let Some(e) = err {
-                return err_ufs!("{}: {}", operation, e);
-            }
-            return err_ufs!("{}: {}", operation, jindo_last_error());
-        }
-        Ok(())
+        check_jindo_status(status, operation, err)
     }
 
     fn new_file_status(
@@ -563,12 +554,17 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             let start_status = self.with_fs_handle(|fs_handle| unsafe {
                 jindo_filesystem_exists_async(fs_handle, path_cstr.as_ptr(), Some(cb), userdata)
             })?;
-            if start_status != JindoStatus::Ok {
-                Self::check_status(start_status, "Failed to start async exists")?;
+            match start_status {
+                JindoStatus::Ok => {}
+                JindoStatus::FileNotFound => return Ok(false),
+                _ => Self::check_status(start_status, "Failed to start async exists")?,
             }
         }
 
         let (status, exists, err) = ctx.wait().await?;
+        if status == JindoStatus::FileNotFound {
+            return Ok(false);
+        }
         Self::check_status_with_err(status, "Failed to check existence", err)?;
 
         Ok(exists)
@@ -763,12 +759,8 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
                     jindo_free(info_ptr as *mut c_void);
                 }
             }
-            return if status == JindoStatus::FileNotFound {
-                Err(FsError::common("File not found"))
-            } else {
-                Self::check_status_with_err(status, "Failed to get file info", err)?;
-                unreachable!("check_status_with_err returns Err on non-OK status");
-            };
+            Self::check_status_with_err(status, "Failed to get file info", err)?;
+            unreachable!("check_status_with_err returns Err on non-OK status");
         }
 
         if info_ptr.is_null() {
