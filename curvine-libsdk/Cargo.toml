@@ -16,7 +16,7 @@ python-sdk = ["dep:pyo3"]
 
 [dependencies]
 orpc = { workspace = true }
-curvine-client = { workspace = true, default-features = false }
+curvine-client = { workspace = true }
 curvine-common = { workspace = true }
 once_cell = { workspace = true }
 tracing = { workspace = true }

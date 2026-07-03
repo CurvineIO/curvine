@@ -52,9 +52,7 @@ pub fn wait_job_complete(
     fail_if_not_found: bool,
 ) -> FsResult<()> {
     let client = JobMasterClient::new(session.fs_client());
-    session.runtime().block_on(async {
-        client
-            .wait_job_complete(job_id, fail_if_not_found)
-            .await
-    })
+    session
+        .runtime()
+        .block_on(async { client.wait_job_complete(job_id, fail_if_not_found).await })
 }

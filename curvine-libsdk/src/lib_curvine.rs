@@ -58,9 +58,14 @@ impl LibCurvineBuilder {
     }
 
     pub fn connect(self) -> FsResult<LibCurvine> {
+        let has_conf = self.conf_path.is_some();
+        let has_masters = !self.masters.is_empty();
+        if has_conf && has_masters {
+            return orpc::err_box!("LibCurvineBuilder: set conf_file or masters, not both");
+        }
         let opts = if let Some(path) = self.conf_path {
             ConnectOptions::ConfigFile(path)
-        } else if !self.masters.is_empty() {
+        } else if has_masters {
             ConnectOptions::MasterAddrs(self.masters)
         } else {
             return orpc::err_box!("LibCurvineBuilder requires conf_file or masters");

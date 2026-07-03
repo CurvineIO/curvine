@@ -78,7 +78,9 @@ impl LibFilesystem {
 
     pub fn open(&self, path: impl AsRef<str>) -> FsResult<LibFsReader> {
         let path = Path::from_str(path)?;
-        let reader = self.rt().block_on(async { self.inner().open(&path).await })?;
+        let reader = self
+            .rt()
+            .block_on(async { self.inner().open(&path).await })?;
         Ok(LibFsReader::new(self.rt().clone(), reader))
     }
 
@@ -96,7 +98,9 @@ impl LibFilesystem {
 
     pub fn append(&self, path: impl AsRef<str>) -> FsResult<LibFsWriter> {
         let path = Path::from_str(path)?;
-        let writer = self.rt().block_on(async { self.inner().append(&path).await })?;
+        let writer = self
+            .rt()
+            .block_on(async { self.inner().append(&path).await })?;
         Ok(LibFsWriter::new(
             self.rt().clone(),
             writer,

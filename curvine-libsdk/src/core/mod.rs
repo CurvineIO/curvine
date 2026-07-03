@@ -13,7 +13,9 @@
 // limitations under the License.
 
 mod filesystem;
+#[allow(dead_code)]
 mod job;
+#[allow(dead_code)]
 mod master;
 mod session;
 

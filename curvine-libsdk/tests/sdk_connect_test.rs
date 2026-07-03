@@ -34,6 +34,17 @@ fn builder_requires_conf_or_masters() {
 }
 
 #[test]
+fn builder_rejects_conf_and_masters() {
+    let result = LibCurvineBuilder::new()
+        .conf_file("/tmp/cluster.toml")
+        .masters(["127.0.0.1:8995"])
+        .connect();
+    assert!(result.is_err());
+    let err = result.err().expect("error");
+    assert!(err.to_string().contains("not both"));
+}
+
+#[test]
 fn builder_accepts_master_addrs() {
     let built = LibCurvineBuilder::new()
         .masters(["127.0.0.1:8995"])

@@ -128,6 +128,7 @@ impl FilesystemConf {
         if master_addrs.is_empty() {
             return err_box!("master_addrs can not be empty");
         }
+        let log = LogConf::default();
         Ok(Self {
             master_addrs: master_addrs.join(","),
             io_threads: 16,
@@ -153,9 +154,9 @@ impl FilesystemConf {
             block_conn_idle_time: "30s".to_string(),
             small_file_size: "1MB".to_string(),
             large_file_size: "64MB".to_string(),
-            log_level: "warn".to_string(),
-            log_dir: "./logs".to_string(),
-            log_file_name: "client.log".to_string(),
+            log_level: log.level,
+            log_dir: log.log_dir,
+            log_file_name: log.file_name,
             ..Default::default()
         })
     }
