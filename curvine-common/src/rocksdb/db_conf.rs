@@ -14,8 +14,7 @@
 
 use orpc::common::{ByteUnit, FileUtils, Utils};
 use rocksdb::*;
-use serde::Deserialize;
-use serde_with::serde_derive::Serialize;
+use serde::{Deserialize, Serialize};
 use std::ffi::c_int;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

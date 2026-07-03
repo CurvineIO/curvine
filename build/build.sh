@@ -112,6 +112,7 @@ print_help() {
   echo "                          - fuse: FUSE filesystem"
   echo "                          - java: Java SDK"
   echo "                          - python: Python SDK"
+  echo "                          - rust-sdk: Rust SDK (rlib + cdylib)"
   echo "                          - tests: test suite and benchmarks"
   echo "                          - all: all packages"
   echo
@@ -330,6 +331,11 @@ fi
 BUILD_PYTHON_SDK=0
 if should_build_package "python" && [ $SKIP_PYTHON_SDK -eq 0 ]; then
   BUILD_PYTHON_SDK=1
+fi
+
+BUILD_RUST_SDK=0
+if should_build_package "rust-sdk"; then
+  BUILD_RUST_SDK=1
 fi
 
 # Collect all rust packages to build
@@ -577,6 +583,17 @@ if [ $BUILD_JAVA_SDK -eq 1 ]; then
     cp -f "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk.dll" "$FS_HOME/curvine-libsdk/java/native/curvine_libsdk.dll"
   elif [ -e "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" ]; then
     cp -f "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" "$FS_HOME/curvine-libsdk/java/native/libcurvine_libsdk_${OS_VERSION}_$ARCH_NAME.so"
+  fi
+fi
+
+if [ $BUILD_RUST_SDK -eq 1 ]; then
+  build_curvine_libsdk "rust-sdk"
+  mkdir -p "$DIST_DIR"/lib
+  if [ -e "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk.dll" ]; then
+    cp -f "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk.dll" "$DIST_DIR/lib/curvine_libsdk.dll"
+  elif [ -e "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" ]; then
+    cp -f "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" \
+      "$DIST_DIR/lib/libcurvine_libsdk_${OS_VERSION}_$ARCH_NAME.so"
   fi
 fi
 

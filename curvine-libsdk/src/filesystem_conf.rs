@@ -119,6 +119,48 @@ impl FilesystemConf {
         Ok(conf)
     }
 
+    /// Minimal client settings for connecting with master addresses only.
+    pub fn with_master_addrs(addrs: impl IntoIterator<Item = impl AsRef<str>>) -> FsResult<Self> {
+        let master_addrs = addrs
+            .into_iter()
+            .map(|addr| addr.as_ref().to_string())
+            .collect::<Vec<_>>();
+        if master_addrs.is_empty() {
+            return err_box!("master_addrs can not be empty");
+        }
+        let log = LogConf::default();
+        Ok(Self {
+            master_addrs: master_addrs.join(","),
+            io_threads: 16,
+            worker_threads: 16,
+            master_conn_pool_size: 3,
+            conn_timeout_ms: 30_000,
+            rpc_timeout_ms: 120_000,
+            data_timeout_ms: 120_000,
+            block_size: "128MB".to_string(),
+            write_chunk_size: "128KB".to_string(),
+            read_chunk_size: "128KB".to_string(),
+            read_slice_size: "0".to_string(),
+            read_ahead_len: "1MB".to_string(),
+            drop_cache_len: "64MB".to_string(),
+            ttl_ms: "0".to_string(),
+            ttl_action: "none".to_string(),
+            storage_type: "disk".to_string(),
+            failed_worker_ttl: "30s".to_string(),
+            mount_update_ttl: "5m".to_string(),
+            sync_check_interval_min: "1s".to_string(),
+            sync_check_interval_max: "5s".to_string(),
+            max_sync_wait_timeout: "30s".to_string(),
+            block_conn_idle_time: "30s".to_string(),
+            small_file_size: "1MB".to_string(),
+            large_file_size: "64MB".to_string(),
+            log_level: log.level,
+            log_dir: log.log_dir,
+            log_file_name: log.file_name,
+            ..Default::default()
+        })
+    }
+
     pub fn into_cluster_conf(self) -> FsResult<ClusterConf> {
         let mut master_addrs = vec![];
         if self.master_addrs.is_empty() {

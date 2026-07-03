@@ -12,31 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod core;
+mod filesystem;
+#[allow(dead_code)]
+mod job;
+#[allow(dead_code)]
+mod master;
+mod session;
 
-mod lib_filesystem;
-pub use self::lib_filesystem::LibFilesystem;
-
-mod filesystem_conf;
-pub use self::filesystem_conf::FilesystemConf;
-
-mod lib_fs_writer;
-pub use self::lib_fs_writer::LibFsWriter;
-
-mod lib_fs_reader;
-pub use self::lib_fs_reader::LibFsReader;
-
-#[cfg(feature = "rust-sdk")]
-pub mod filesystem;
-#[cfg(feature = "rust-sdk")]
-pub mod job;
-#[cfg(feature = "rust-sdk")]
-pub mod lib_curvine;
-#[cfg(feature = "rust-sdk")]
-pub mod master;
-
-#[cfg(feature = "python-sdk")]
-pub mod python;
-
-#[cfg(feature = "java-sdk")]
-pub mod java;
+pub use self::filesystem::LibFilesystem;
+pub use self::session::Session;
