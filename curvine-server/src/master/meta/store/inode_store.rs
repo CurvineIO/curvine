@@ -542,17 +542,19 @@ impl InodeStore {
         }
 
         let chunk_size = total.div_ceil(num_threads);
-        let chunks: Vec<Vec<(i64, Vec<u8>)>> = raw.chunks(chunk_size).map(|c| c.to_vec()).collect();
 
+        // Borrow raw as slices — no cloning of Vec<u8> payloads.
+        // std::thread::scope guarantees all threads are joined before the
+        // scope returns, so borrowing raw for the scope lifetime is safe.
         let thread_results = std::thread::scope(|s| -> CommonResult<Vec<Vec<(i64, InodeView)>>> {
-            let handles: Vec<_> = chunks
-                .into_iter()
+            let handles: Vec<_> = raw
+                .chunks(chunk_size)
                 .map(|chunk| {
                     s.spawn(move || -> CommonResult<Vec<(i64, InodeView)>> {
                         let mut result = Vec::with_capacity(chunk.len());
                         for (id, bytes) in chunk {
-                            let inode: InodeView = SerdeUtils::deserialize(&bytes)?;
-                            result.push((id, inode));
+                            let inode: InodeView = SerdeUtils::deserialize(bytes)?;
+                            result.push((*id, inode));
                         }
                         Ok(result)
                     })
@@ -639,11 +641,16 @@ impl InodeStore {
                     continue;
                 }
 
-                seen_ids.insert(*child_id);
-
                 // Move the inode out of the HashMap — zero cloning.
+                // seen_ids is updated only after a successful lookup so that orphaned
+                // edges (missing inode) are not recorded as "seen". Otherwise a second
+                // edge to the same missing inode would be misclassified as a hard-link
+                // and added to the tree as a FileEntry pointing at a non-existent inode.
                 let store_inode = match data.inodes.remove(child_id) {
-                    Some(v) => v,
+                    Some(v) => {
+                        seen_ids.insert(*child_id);
+                        v
+                    }
                     None => {
                         // Orphaned edge: inode was deleted but edge was not cleaned up
                         // (can happen after a crash between two non-atomic batch commits).
@@ -994,6 +1001,34 @@ mod tests {
             .expect("directory inode should still exist");
         assert_eq!(persisted.name(), "edge-name");
         assert_eq!(persisted.as_dir_ref()?.parent_id(), ROOT_INODE_ID);
+
+        Ok(())
+    }
+
+    /// Regression test for the seen_ids-before-lookup bug (PR #978 review):
+    /// Two edges point to the same missing inode. The first edge takes the
+    /// orphan path; the second must NOT be misclassified as a hard-link.
+    #[test]
+    fn create_tree_handles_duplicate_orphaned_edges() -> CommonResult<()> {
+        let store = new_store("dup-orphan-edges")?;
+        let root = FsDir::create_root();
+        let dir = InodeView::new_dir("real-dir".to_string(), InodeDir::new(2020, 0));
+
+        {
+            let mut batch = store.new_batch();
+            batch.write_inode(&root)?;
+            batch.write_inode(&dir)?;
+            batch.add_child(ROOT_INODE_ID, "real-dir", dir.id())?;
+            // Two orphan edges pointing to the same missing inode (9999).
+            batch.add_child(ROOT_INODE_ID, "orphan1", 9999)?;
+            batch.add_child(ROOT_INODE_ID, "orphan2", 9999)?;
+            batch.commit()?;
+        }
+
+        let (_, restored) = store.create_tree()?;
+        let names: Vec<&str> = restored.children().into_iter().map(|c| c.name()).collect();
+        // Only the real directory should be in the tree; both orphaned edges are skipped.
+        assert_eq!(names, vec!["real-dir"]);
 
         Ok(())
     }
