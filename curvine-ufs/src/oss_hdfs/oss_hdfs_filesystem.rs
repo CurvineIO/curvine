@@ -234,21 +234,25 @@ impl OssHdfsFileSystem {
         }
     }
 
-    /// Execute an FFI operation with the filesystem handle.
-    ///
-    /// The underlying JindoSDK filesystem handle is thread-safe, so we don't lock here.
-    fn with_fs_handle<F, R>(&self, f: F) -> FsResult<R>
+    /// Execute a blocking JindoSDK filesystem operation outside Tokio worker threads.
+    async fn with_fs_handle_blocking<F, R>(&self, f: F) -> FsResult<R>
     where
-        F: FnOnce(*mut c_void) -> R,
+        F: FnOnce(*mut c_void) -> R + Send + 'static,
+        R: Send + 'static,
     {
-        let handle = &self.inner.fs_handle;
-
-        // Validate handle before use
-        if handle.is_null() {
+        if self.inner.fs_handle.is_null() {
             return Err(FsError::common("Filesystem handle is null"));
         }
 
-        Ok(f(handle.as_raw()))
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            if inner.fs_handle.is_null() {
+                return Err(FsError::common("Filesystem handle is null"));
+            }
+            Ok(f(inner.fs_handle.as_raw()))
+        })
+        .await
+        .map_err(|e| FsError::common(format!("OSS-HDFS blocking operation failed: {}", e)))?
     }
 
     fn check_status(status: JindoStatus, operation: &str) -> FsResult<()> {
@@ -338,7 +342,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
 
     async fn mkdir(&self, path: &Path, create_parent: bool) -> FsResult<bool> {
         let path_cstr = self.path_to_cstring(path)?;
-        let ctx = Box::new(CallbackCtx::<(JindoStatus, Option<String>)>::default());
+        let ctx = Arc::new(CallbackCtx::<(JindoStatus, Option<String>)>::default());
         ctx.reset();
 
         extern "C" fn cb(
@@ -346,25 +350,37 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             err: *const std::os::raw::c_char,
             userdata: *mut c_void,
         ) {
-            let ctx = unsafe { &*(userdata as *const CallbackCtx<(JindoStatus, Option<String>)>) };
-            ctx.complete((status, err_from_c(err)));
+            unsafe {
+                CallbackCtx::<(JindoStatus, Option<String>)>::complete_userdata(
+                    userdata,
+                    (status, err_from_c(err)),
+                );
+            }
         }
 
         {
-            let userdata =
-                (&*ctx as *const CallbackCtx<(JindoStatus, Option<String>)>) as *mut c_void;
-            let start_status = self.with_fs_handle(|fs_handle| unsafe {
-                jindo_filesystem_mkdir_async(
-                    fs_handle,
-                    path_cstr.as_ptr(),
-                    create_parent,
-                    Some(cb),
-                    userdata,
-                )
-            })?;
-            if start_status != JindoStatus::Ok {
-                Self::check_status(start_status, "Failed to start async mkdir")?;
-            }
+            let ctx_for_call = Arc::clone(&ctx);
+            let start_status = self
+                .with_fs_handle_blocking(move |fs_handle| {
+                    let userdata = CallbackCtx::into_userdata(&ctx_for_call);
+                    let status = unsafe {
+                        jindo_filesystem_mkdir_async(
+                            fs_handle,
+                            path_cstr.as_ptr(),
+                            create_parent,
+                            Some(cb),
+                            userdata,
+                        )
+                    };
+                    if status != JindoStatus::Ok {
+                        unsafe {
+                            CallbackCtx::<(JindoStatus, Option<String>)>::drop_userdata(userdata);
+                        }
+                    }
+                    status
+                })
+                .await?;
+            Self::check_status(start_status, "Failed to start async mkdir")?;
         }
 
         let (status, err) = ctx.wait().await?;
@@ -375,7 +391,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
 
     async fn create(&self, path: &Path, _overwrite: bool) -> FsResult<OssHdfsWriter> {
         let path_cstr = self.path_to_cstring(path)?;
-        let ctx = Box::new(CallbackCtx::<(
+        let ctx = Arc::new(CallbackCtx::<(
             JindoStatus,
             JindoWriterHandle,
             Option<String>,
@@ -388,27 +404,40 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             err: *const std::os::raw::c_char,
             userdata: *mut c_void,
         ) {
-            let ctx = unsafe {
-                &*(userdata as *const CallbackCtx<(JindoStatus, JindoWriterHandle, Option<String>)>)
-            };
-            ctx.complete((status, JindoWriterHandle::from_raw(writer), err_from_c(err)));
+            unsafe {
+                CallbackCtx::<(JindoStatus, JindoWriterHandle, Option<String>)>::complete_userdata(
+                    userdata,
+                    (status, JindoWriterHandle::from_raw(writer), err_from_c(err)),
+                );
+            }
         }
 
         {
-            let userdata = (&*ctx
-                as *const CallbackCtx<(JindoStatus, JindoWriterHandle, Option<String>)>)
-                as *mut c_void;
-            let start_status = self.with_fs_handle(|fs_handle| unsafe {
-                jindo_filesystem_open_writer_async(
-                    fs_handle,
-                    path_cstr.as_ptr(),
-                    Some(cb),
-                    userdata,
-                )
-            })?;
-            if start_status != JindoStatus::Ok {
-                Self::check_status(start_status, "Failed to start async open_writer")?;
-            }
+            let ctx_for_call = Arc::clone(&ctx);
+            let start_status = self
+                .with_fs_handle_blocking(move |fs_handle| {
+                    let userdata = CallbackCtx::into_userdata(&ctx_for_call);
+                    let status = unsafe {
+                        jindo_filesystem_open_writer_async(
+                            fs_handle,
+                            path_cstr.as_ptr(),
+                            Some(cb),
+                            userdata,
+                        )
+                    };
+                    if status != JindoStatus::Ok {
+                        unsafe {
+                            CallbackCtx::<(
+                                JindoStatus,
+                                JindoWriterHandle,
+                                Option<String>,
+                            )>::drop_userdata(userdata);
+                        }
+                    }
+                    status
+                })
+                .await?;
+            Self::check_status(start_status, "Failed to start async open_writer")?;
         }
 
         let (status, writer_handle, err) = ctx.wait().await?;
@@ -437,7 +466,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
         let path_cstr = self.path_to_cstring(path)?;
 
         // Open writer in append mode (creates file if not exists, appends if exists)
-        let ctx = Box::new(CallbackCtx::<(
+        let ctx = Arc::new(CallbackCtx::<(
             JindoStatus,
             JindoWriterHandle,
             Option<String>,
@@ -450,27 +479,40 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             err: *const std::os::raw::c_char,
             userdata: *mut c_void,
         ) {
-            let ctx = unsafe {
-                &*(userdata as *const CallbackCtx<(JindoStatus, JindoWriterHandle, Option<String>)>)
-            };
-            ctx.complete((status, JindoWriterHandle::from_raw(writer), err_from_c(err)));
+            unsafe {
+                CallbackCtx::<(JindoStatus, JindoWriterHandle, Option<String>)>::complete_userdata(
+                    userdata,
+                    (status, JindoWriterHandle::from_raw(writer), err_from_c(err)),
+                );
+            }
         }
 
         {
-            let userdata = (&*ctx
-                as *const CallbackCtx<(JindoStatus, JindoWriterHandle, Option<String>)>)
-                as *mut c_void;
-            let start_status = self.with_fs_handle(|fs_handle| unsafe {
-                jindo_filesystem_open_writer_append_async(
-                    fs_handle,
-                    path_cstr.as_ptr(),
-                    Some(cb),
-                    userdata,
-                )
-            })?;
-            if start_status != JindoStatus::Ok {
-                Self::check_status(start_status, "Failed to start async open_writer_append")?;
-            }
+            let ctx_for_call = Arc::clone(&ctx);
+            let start_status = self
+                .with_fs_handle_blocking(move |fs_handle| {
+                    let userdata = CallbackCtx::into_userdata(&ctx_for_call);
+                    let status = unsafe {
+                        jindo_filesystem_open_writer_append_async(
+                            fs_handle,
+                            path_cstr.as_ptr(),
+                            Some(cb),
+                            userdata,
+                        )
+                    };
+                    if status != JindoStatus::Ok {
+                        unsafe {
+                            CallbackCtx::<(
+                                JindoStatus,
+                                JindoWriterHandle,
+                                Option<String>,
+                            )>::drop_userdata(userdata);
+                        }
+                    }
+                    status
+                })
+                .await?;
+            Self::check_status(start_status, "Failed to start async open_writer_append")?;
         }
 
         let (status, writer_handle, err) = ctx.wait().await?;
@@ -482,7 +524,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
         }
 
         // Get current position (file length if file exists, 0 if new file)
-        let tell_ctx = Box::new(CallbackCtx::<(JindoStatus, i64, Option<String>)>::default());
+        let tell_ctx = Arc::new(CallbackCtx::<(JindoStatus, i64, Option<String>)>::default());
         tell_ctx.reset();
         extern "C" fn tell_cb(
             status: JindoStatus,
@@ -490,17 +532,22 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             err: *const std::os::raw::c_char,
             userdata: *mut c_void,
         ) {
-            let ctx =
-                unsafe { &*(userdata as *const CallbackCtx<(JindoStatus, i64, Option<String>)>) };
-            ctx.complete((status, value, err_from_c(err)));
+            unsafe {
+                CallbackCtx::<(JindoStatus, i64, Option<String>)>::complete_userdata(
+                    userdata,
+                    (status, value, err_from_c(err)),
+                );
+            }
         }
 
         {
-            let userdata = (&*tell_ctx as *const CallbackCtx<(JindoStatus, i64, Option<String>)>)
-                as *mut c_void;
+            let userdata = CallbackCtx::into_userdata(&tell_ctx);
             let start_status =
                 unsafe { jindo_writer_tell_async(writer_handle.as_raw(), Some(tell_cb), userdata) };
             if start_status != JindoStatus::Ok {
+                unsafe {
+                    CallbackCtx::<(JindoStatus, i64, Option<String>)>::drop_userdata(userdata);
+                }
                 unsafe {
                     jindo_writer_free(writer_handle.as_raw());
                 }
@@ -534,7 +581,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
 
     async fn exists(&self, path: &Path) -> FsResult<bool> {
         let path_cstr = self.path_to_cstring(path)?;
-        let ctx = Box::new(CallbackCtx::<(JindoStatus, bool, Option<String>)>::default());
+        let ctx = Arc::new(CallbackCtx::<(JindoStatus, bool, Option<String>)>::default());
         ctx.reset();
 
         extern "C" fn cb(
@@ -543,20 +590,39 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             err: *const std::os::raw::c_char,
             userdata: *mut c_void,
         ) {
-            let ctx =
-                unsafe { &*(userdata as *const CallbackCtx<(JindoStatus, bool, Option<String>)>) };
-            ctx.complete((status, value, err_from_c(err)));
+            unsafe {
+                CallbackCtx::<(JindoStatus, bool, Option<String>)>::complete_userdata(
+                    userdata,
+                    (status, value, err_from_c(err)),
+                );
+            }
         }
 
         {
-            let userdata =
-                (&*ctx as *const CallbackCtx<(JindoStatus, bool, Option<String>)>) as *mut c_void;
-            let start_status = self.with_fs_handle(|fs_handle| unsafe {
-                jindo_filesystem_exists_async(fs_handle, path_cstr.as_ptr(), Some(cb), userdata)
-            })?;
+            let ctx_for_call = Arc::clone(&ctx);
+            let start_status = self
+                .with_fs_handle_blocking(move |fs_handle| {
+                    let userdata = CallbackCtx::into_userdata(&ctx_for_call);
+                    let status = unsafe {
+                        jindo_filesystem_exists_async(
+                            fs_handle,
+                            path_cstr.as_ptr(),
+                            Some(cb),
+                            userdata,
+                        )
+                    };
+                    if status != JindoStatus::Ok {
+                        unsafe {
+                            CallbackCtx::<(JindoStatus, bool, Option<String>)>::drop_userdata(
+                                userdata,
+                            );
+                        }
+                    }
+                    status
+                })
+                .await?;
             match start_status {
                 JindoStatus::Ok => {}
-                JindoStatus::FileNotFound => return Ok(false),
                 _ => Self::check_status(start_status, "Failed to start async exists")?,
             }
         }
@@ -573,7 +639,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
     async fn open(&self, path: &Path) -> FsResult<OssHdfsReader> {
         let path_cstr = self.path_to_cstring(path)?;
 
-        let ctx = Box::new(CallbackCtx::<(
+        let ctx = Arc::new(CallbackCtx::<(
             JindoStatus,
             JindoReaderHandle,
             Option<String>,
@@ -586,27 +652,40 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             err: *const std::os::raw::c_char,
             userdata: *mut c_void,
         ) {
-            let ctx = unsafe {
-                &*(userdata as *const CallbackCtx<(JindoStatus, JindoReaderHandle, Option<String>)>)
-            };
-            ctx.complete((status, JindoReaderHandle::from_raw(reader), err_from_c(err)));
+            unsafe {
+                CallbackCtx::<(JindoStatus, JindoReaderHandle, Option<String>)>::complete_userdata(
+                    userdata,
+                    (status, JindoReaderHandle::from_raw(reader), err_from_c(err)),
+                );
+            }
         }
 
         {
-            let userdata = (&*ctx
-                as *const CallbackCtx<(JindoStatus, JindoReaderHandle, Option<String>)>)
-                as *mut c_void;
-            let start_status = self.with_fs_handle(|fs_handle| unsafe {
-                jindo_filesystem_open_reader_async(
-                    fs_handle,
-                    path_cstr.as_ptr(),
-                    Some(cb),
-                    userdata,
-                )
-            })?;
-            if start_status != JindoStatus::Ok {
-                Self::check_status(start_status, "Failed to start async open_reader")?;
-            }
+            let ctx_for_call = Arc::clone(&ctx);
+            let start_status = self
+                .with_fs_handle_blocking(move |fs_handle| {
+                    let userdata = CallbackCtx::into_userdata(&ctx_for_call);
+                    let status = unsafe {
+                        jindo_filesystem_open_reader_async(
+                            fs_handle,
+                            path_cstr.as_ptr(),
+                            Some(cb),
+                            userdata,
+                        )
+                    };
+                    if status != JindoStatus::Ok {
+                        unsafe {
+                            CallbackCtx::<(
+                                JindoStatus,
+                                JindoReaderHandle,
+                                Option<String>,
+                            )>::drop_userdata(userdata);
+                        }
+                    }
+                    status
+                })
+                .await?;
+            Self::check_status(start_status, "Failed to start async open_reader")?;
         }
 
         let (open_status, reader_handle, err) = ctx.wait().await?;
@@ -642,7 +721,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
     async fn rename(&self, src: &Path, dst: &Path) -> FsResult<bool> {
         let src_cstr = self.path_to_cstring(src)?;
         let dst_cstr = self.path_to_cstring(dst)?;
-        let ctx = Box::new(CallbackCtx::<(JindoStatus, Option<String>)>::default());
+        let ctx = Arc::new(CallbackCtx::<(JindoStatus, Option<String>)>::default());
         ctx.reset();
 
         extern "C" fn cb(
@@ -650,25 +729,37 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             err: *const std::os::raw::c_char,
             userdata: *mut c_void,
         ) {
-            let ctx = unsafe { &*(userdata as *const CallbackCtx<(JindoStatus, Option<String>)>) };
-            ctx.complete((status, err_from_c(err)));
+            unsafe {
+                CallbackCtx::<(JindoStatus, Option<String>)>::complete_userdata(
+                    userdata,
+                    (status, err_from_c(err)),
+                );
+            }
         }
 
         {
-            let userdata =
-                (&*ctx as *const CallbackCtx<(JindoStatus, Option<String>)>) as *mut c_void;
-            let start_status = self.with_fs_handle(|fs_handle| unsafe {
-                jindo_filesystem_rename_async(
-                    fs_handle,
-                    src_cstr.as_ptr(),
-                    dst_cstr.as_ptr(),
-                    Some(cb),
-                    userdata,
-                )
-            })?;
-            if start_status != JindoStatus::Ok {
-                Self::check_status(start_status, "Failed to start async rename")?;
-            }
+            let ctx_for_call = Arc::clone(&ctx);
+            let start_status = self
+                .with_fs_handle_blocking(move |fs_handle| {
+                    let userdata = CallbackCtx::into_userdata(&ctx_for_call);
+                    let status = unsafe {
+                        jindo_filesystem_rename_async(
+                            fs_handle,
+                            src_cstr.as_ptr(),
+                            dst_cstr.as_ptr(),
+                            Some(cb),
+                            userdata,
+                        )
+                    };
+                    if status != JindoStatus::Ok {
+                        unsafe {
+                            CallbackCtx::<(JindoStatus, Option<String>)>::drop_userdata(userdata);
+                        }
+                    }
+                    status
+                })
+                .await?;
+            Self::check_status(start_status, "Failed to start async rename")?;
         }
 
         let (status, err) = ctx.wait().await?;
@@ -679,7 +770,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
 
     async fn delete(&self, path: &Path, recursive: bool) -> FsResult<()> {
         let path_cstr = self.path_to_cstring(path)?;
-        let ctx = Box::new(CallbackCtx::<(JindoStatus, Option<String>)>::default());
+        let ctx = Arc::new(CallbackCtx::<(JindoStatus, Option<String>)>::default());
         ctx.reset();
 
         extern "C" fn cb(
@@ -687,25 +778,37 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             err: *const std::os::raw::c_char,
             userdata: *mut c_void,
         ) {
-            let ctx = unsafe { &*(userdata as *const CallbackCtx<(JindoStatus, Option<String>)>) };
-            ctx.complete((status, err_from_c(err)));
+            unsafe {
+                CallbackCtx::<(JindoStatus, Option<String>)>::complete_userdata(
+                    userdata,
+                    (status, err_from_c(err)),
+                );
+            }
         }
 
         {
-            let userdata =
-                (&*ctx as *const CallbackCtx<(JindoStatus, Option<String>)>) as *mut c_void;
-            let start_status = self.with_fs_handle(|fs_handle| unsafe {
-                jindo_filesystem_remove_async(
-                    fs_handle,
-                    path_cstr.as_ptr(),
-                    recursive,
-                    Some(cb),
-                    userdata,
-                )
-            })?;
-            if start_status != JindoStatus::Ok {
-                Self::check_status(start_status, "Failed to start async delete")?;
-            }
+            let ctx_for_call = Arc::clone(&ctx);
+            let start_status = self
+                .with_fs_handle_blocking(move |fs_handle| {
+                    let userdata = CallbackCtx::into_userdata(&ctx_for_call);
+                    let status = unsafe {
+                        jindo_filesystem_remove_async(
+                            fs_handle,
+                            path_cstr.as_ptr(),
+                            recursive,
+                            Some(cb),
+                            userdata,
+                        )
+                    };
+                    if status != JindoStatus::Ok {
+                        unsafe {
+                            CallbackCtx::<(JindoStatus, Option<String>)>::drop_userdata(userdata);
+                        }
+                    }
+                    status
+                })
+                .await?;
+            Self::check_status(start_status, "Failed to start async delete")?;
         }
 
         let (status, err) = ctx.wait().await?;
@@ -718,7 +821,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
         let path_cstr = self.path_to_cstring(path)?;
         // NOTE: store the returned pointer address as `usize` so this future remains `Send`.
         // Raw pointers are not `Send` by default, and this async fn is used in `Send` contexts.
-        let ctx = Box::new(CallbackCtx::<(JindoStatus, usize, Option<String>)>::default());
+        let ctx = Arc::new(CallbackCtx::<(JindoStatus, usize, Option<String>)>::default());
         ctx.reset();
 
         extern "C" fn cb(
@@ -727,25 +830,38 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             err: *const std::os::raw::c_char,
             userdata: *mut c_void,
         ) {
-            let ctx =
-                unsafe { &*(userdata as *const CallbackCtx<(JindoStatus, usize, Option<String>)>) };
-            ctx.complete((status, info as usize, err_from_c(err)));
+            unsafe {
+                CallbackCtx::<(JindoStatus, usize, Option<String>)>::complete_userdata(
+                    userdata,
+                    (status, info as usize, err_from_c(err)),
+                );
+            }
         }
 
         {
-            let userdata =
-                (&*ctx as *const CallbackCtx<(JindoStatus, usize, Option<String>)>) as *mut c_void;
-            let start_status = self.with_fs_handle(|fs_handle| unsafe {
-                jindo_filesystem_get_file_info_async(
-                    fs_handle,
-                    path_cstr.as_ptr(),
-                    Some(cb),
-                    userdata,
-                )
-            })?;
-            if start_status != JindoStatus::Ok {
-                Self::check_status(start_status, "Failed to start async get_file_info")?;
-            }
+            let ctx_for_call = Arc::clone(&ctx);
+            let start_status = self
+                .with_fs_handle_blocking(move |fs_handle| {
+                    let userdata = CallbackCtx::into_userdata(&ctx_for_call);
+                    let status = unsafe {
+                        jindo_filesystem_get_file_info_async(
+                            fs_handle,
+                            path_cstr.as_ptr(),
+                            Some(cb),
+                            userdata,
+                        )
+                    };
+                    if status != JindoStatus::Ok {
+                        unsafe {
+                            CallbackCtx::<(JindoStatus, usize, Option<String>)>::drop_userdata(
+                                userdata,
+                            );
+                        }
+                    }
+                    status
+                })
+                .await?;
+            Self::check_status(start_status, "Failed to start async get_file_info")?;
         }
 
         let (status, info_addr, err) = ctx.wait().await?;
@@ -786,7 +902,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
     async fn list_status(&self, path: &Path) -> FsResult<Vec<FileStatus>> {
         let path_cstr = self.path_to_cstring(path)?;
         // NOTE: store the returned pointer address as `usize` so this future remains `Send`.
-        let ctx = Box::new(CallbackCtx::<(JindoStatus, usize, Option<String>)>::default());
+        let ctx = Arc::new(CallbackCtx::<(JindoStatus, usize, Option<String>)>::default());
         ctx.reset();
 
         extern "C" fn cb(
@@ -795,26 +911,39 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             err: *const std::os::raw::c_char,
             userdata: *mut c_void,
         ) {
-            let ctx =
-                unsafe { &*(userdata as *const CallbackCtx<(JindoStatus, usize, Option<String>)>) };
-            ctx.complete((status, result as usize, err_from_c(err)));
+            unsafe {
+                CallbackCtx::<(JindoStatus, usize, Option<String>)>::complete_userdata(
+                    userdata,
+                    (status, result as usize, err_from_c(err)),
+                );
+            }
         }
 
         {
-            let userdata =
-                (&*ctx as *const CallbackCtx<(JindoStatus, usize, Option<String>)>) as *mut c_void;
-            let start_status = self.with_fs_handle(|fs_handle| unsafe {
-                jindo_filesystem_list_dir_async(
-                    fs_handle,
-                    path_cstr.as_ptr(),
-                    false,
-                    Some(cb),
-                    userdata,
-                )
-            })?;
-            if start_status != JindoStatus::Ok {
-                Self::check_status(start_status, "Failed to start async list_dir")?;
-            }
+            let ctx_for_call = Arc::clone(&ctx);
+            let start_status = self
+                .with_fs_handle_blocking(move |fs_handle| {
+                    let userdata = CallbackCtx::into_userdata(&ctx_for_call);
+                    let status = unsafe {
+                        jindo_filesystem_list_dir_async(
+                            fs_handle,
+                            path_cstr.as_ptr(),
+                            false,
+                            Some(cb),
+                            userdata,
+                        )
+                    };
+                    if status != JindoStatus::Ok {
+                        unsafe {
+                            CallbackCtx::<(JindoStatus, usize, Option<String>)>::drop_userdata(
+                                userdata,
+                            );
+                        }
+                    }
+                    status
+                })
+                .await?;
+            Self::check_status(start_status, "Failed to start async list_dir")?;
         }
 
         let (status, list_addr, err) = ctx.wait().await?;
@@ -866,13 +995,12 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
     }
 
     async fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> FsResult<()> {
-        let path_cstr = self.path_to_cstring(path)?;
-
         // Handle permission (mode in SetAttrOpts)
         if let Some(mode) = opts.mode {
+            let path_cstr = self.path_to_cstring(path)?;
             // Mask to permission bits (avoid truncating/including non-permission bits).
             let perm = (mode & 0o7777) as i16;
-            let ctx = Box::new(CallbackCtx::<(JindoStatus, Option<String>)>::default());
+            let ctx = Arc::new(CallbackCtx::<(JindoStatus, Option<String>)>::default());
             ctx.reset();
 
             extern "C" fn cb(
@@ -880,25 +1008,36 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
                 err: *const std::os::raw::c_char,
                 userdata: *mut c_void,
             ) {
-                let ctx =
-                    unsafe { &*(userdata as *const CallbackCtx<(JindoStatus, Option<String>)>) };
-                ctx.complete((status, err_from_c(err)));
+                unsafe {
+                    CallbackCtx::<(JindoStatus, Option<String>)>::complete_userdata(
+                        userdata,
+                        (status, err_from_c(err)),
+                    );
+                }
             }
 
-            let userdata =
-                (&*ctx as *const CallbackCtx<(JindoStatus, Option<String>)>) as *mut c_void;
-            let start_status = self.with_fs_handle(|fs_handle| unsafe {
-                jindo_filesystem_set_permission_async(
-                    fs_handle,
-                    path_cstr.as_ptr(),
-                    perm,
-                    Some(cb),
-                    userdata,
-                )
-            })?;
-            if start_status != JindoStatus::Ok {
-                Self::check_status(start_status, "Failed to start async set_permission")?;
-            }
+            let ctx_for_call = Arc::clone(&ctx);
+            let start_status = self
+                .with_fs_handle_blocking(move |fs_handle| {
+                    let userdata = CallbackCtx::into_userdata(&ctx_for_call);
+                    let status = unsafe {
+                        jindo_filesystem_set_permission_async(
+                            fs_handle,
+                            path_cstr.as_ptr(),
+                            perm,
+                            Some(cb),
+                            userdata,
+                        )
+                    };
+                    if status != JindoStatus::Ok {
+                        unsafe {
+                            CallbackCtx::<(JindoStatus, Option<String>)>::drop_userdata(userdata);
+                        }
+                    }
+                    status
+                })
+                .await?;
+            Self::check_status(start_status, "Failed to start async set_permission")?;
 
             let (status, err) = ctx.wait().await?;
             Self::check_status_with_err(status, "Failed to set permission", err)?;
@@ -906,11 +1045,12 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
 
         // Handle owner
         if opts.owner.is_some() || opts.group.is_some() {
+            let path_cstr = self.path_to_cstring(path)?;
             let user_cstr =
                 CString::new(opts.owner.as_deref().unwrap_or("")).map_err(cstring_err)?;
             let group_cstr =
                 CString::new(opts.group.as_deref().unwrap_or("")).map_err(cstring_err)?;
-            let ctx = Box::new(CallbackCtx::<(JindoStatus, Option<String>)>::default());
+            let ctx = Arc::new(CallbackCtx::<(JindoStatus, Option<String>)>::default());
             ctx.reset();
 
             extern "C" fn cb(
@@ -918,26 +1058,37 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
                 err: *const std::os::raw::c_char,
                 userdata: *mut c_void,
             ) {
-                let ctx =
-                    unsafe { &*(userdata as *const CallbackCtx<(JindoStatus, Option<String>)>) };
-                ctx.complete((status, err_from_c(err)));
+                unsafe {
+                    CallbackCtx::<(JindoStatus, Option<String>)>::complete_userdata(
+                        userdata,
+                        (status, err_from_c(err)),
+                    );
+                }
             }
 
-            let userdata =
-                (&*ctx as *const CallbackCtx<(JindoStatus, Option<String>)>) as *mut c_void;
-            let start_status = self.with_fs_handle(|fs_handle| unsafe {
-                jindo_filesystem_set_owner_async(
-                    fs_handle,
-                    path_cstr.as_ptr(),
-                    user_cstr.as_ptr(),
-                    group_cstr.as_ptr(),
-                    Some(cb),
-                    userdata,
-                )
-            })?;
-            if start_status != JindoStatus::Ok {
-                Self::check_status(start_status, "Failed to start async set_owner")?;
-            }
+            let ctx_for_call = Arc::clone(&ctx);
+            let start_status = self
+                .with_fs_handle_blocking(move |fs_handle| {
+                    let userdata = CallbackCtx::into_userdata(&ctx_for_call);
+                    let status = unsafe {
+                        jindo_filesystem_set_owner_async(
+                            fs_handle,
+                            path_cstr.as_ptr(),
+                            user_cstr.as_ptr(),
+                            group_cstr.as_ptr(),
+                            Some(cb),
+                            userdata,
+                        )
+                    };
+                    if status != JindoStatus::Ok {
+                        unsafe {
+                            CallbackCtx::<(JindoStatus, Option<String>)>::drop_userdata(userdata);
+                        }
+                    }
+                    status
+                })
+                .await?;
+            Self::check_status(start_status, "Failed to start async set_owner")?;
 
             let (status, err) = ctx.wait().await?;
             Self::check_status_with_err(status, "Failed to set owner", err)?;
