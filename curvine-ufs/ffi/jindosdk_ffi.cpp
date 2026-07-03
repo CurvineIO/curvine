@@ -43,7 +43,8 @@ thread_local std::string g_last_error;
 static inline JindoStatus map_error_code_to_status(int32_t code) {
     // Best-effort mapping for a few common error codes.
     // See /usr/local/include/jindosdk/jdo_error.h for the full list.
-    if (code == 3001 /* JDO_FILE_NOT_FOUND_ERROR */) {
+    if (code == 3001 /* JDO_FILE_NOT_FOUND_ERROR */
+        || code == 30001 /* JDO_PARENT_NOT_FOUND_ERROR */) {
         return JINDO_STATUS_FILE_NOT_FOUND;
     }
     return JINDO_STATUS_ERROR;
