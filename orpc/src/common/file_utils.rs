@@ -14,6 +14,7 @@
 
 use crate::io::IOResult;
 use crate::{err_box, CommonResult};
+use log::warn;
 use std::collections::{HashMap, LinkedList};
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
@@ -143,6 +144,11 @@ impl FileUtils {
     }
 
     /// Recursively compute the total size (in bytes) of all files under `path`.
+    ///
+    /// This is a best-effort computation: I/O errors on individual entries are
+    /// logged as warnings and skipped, so the returned size may undercount if
+    /// some files are unreadable.  Callers that need strict error reporting
+    /// should use `fs::read_dir` / `fs::metadata` directly.
     pub fn dir_size<P: AsRef<Path>>(path: P) -> CommonResult<u64> {
         let path = path.as_ref();
         if !path.exists() {
@@ -152,13 +158,31 @@ impl FileUtils {
         let mut stack = LinkedList::new();
         stack.push_back(path.to_path_buf());
         while let Some(p) = stack.pop_back() {
-            if p.is_file() {
-                total += p.metadata().map(|m| m.len()).unwrap_or(0);
-            } else if p.is_dir() {
-                if let Ok(entries) = fs::read_dir(&p) {
-                    for entry in entries.flatten() {
-                        stack.push_back(entry.path());
+            // Use a single metadata() call instead of is_file() + is_dir() +
+            // metadata(), which would issue up to three stat syscalls.
+            match fs::metadata(&p) {
+                Ok(meta) => {
+                    if meta.is_file() {
+                        total += meta.len();
+                    } else if meta.is_dir() {
+                        match fs::read_dir(&p) {
+                            Ok(entries) => {
+                                for entry in entries.flatten() {
+                                    stack.push_back(entry.path());
+                                }
+                            }
+                            Err(e) => {
+                                warn!("dir_size: failed to read dir {}: {}", p.display(), e);
+                            }
+                        }
                     }
+                }
+                Err(e) => {
+                    warn!(
+                        "dir_size: failed to get metadata for {}: {}",
+                        p.display(),
+                        e
+                    );
                 }
             }
         }
