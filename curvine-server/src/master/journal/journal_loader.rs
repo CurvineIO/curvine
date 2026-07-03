@@ -26,7 +26,7 @@ use curvine_common::raft::{RaftClient, RaftResult, RaftUtils};
 use curvine_common::state::RenameFlags;
 use curvine_common::utils::SerdeUtils;
 use log::{debug, error, info, warn};
-use orpc::common::{FileUtils, LocalTime};
+use orpc::common::{FileUtils, LocalTime, TimeSpent};
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel};
 use orpc::{err_box, ternary, CommonResult};
@@ -399,6 +399,7 @@ impl JournalLoader {
     }
 
     fn apply_snapshot0(&self, snapshot: SnapshotData) -> RaftResult<()> {
+        let mut spend = TimeSpent::new();
         let mut fs_dir = self.fs_dir.write();
         match snapshot.files_data {
             None => {
@@ -414,10 +415,20 @@ impl JournalLoader {
             }
         }
         drop(fs_dir);
+        let restore_ms = spend.used_ms();
+        spend.reset();
 
         self.mnt_mgr.restore();
+        let mount_ms = spend.used_ms();
 
         *self.fsm_state.lock().unwrap() = snapshot.fsm_state;
+
+        info!(
+            "apply_snapshot: fs_dir_restore={} ms, mount_restore={} ms, total={} ms",
+            restore_ms,
+            mount_ms,
+            restore_ms + mount_ms
+        );
 
         Ok(())
     }

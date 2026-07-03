@@ -142,6 +142,29 @@ impl FileUtils {
         Ok(res)
     }
 
+    /// Recursively compute the total size (in bytes) of all files under `path`.
+    pub fn dir_size<P: AsRef<Path>>(path: P) -> CommonResult<u64> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(0);
+        }
+        let mut total: u64 = 0;
+        let mut stack = LinkedList::new();
+        stack.push_back(path.to_path_buf());
+        while let Some(p) = stack.pop_back() {
+            if p.is_file() {
+                total += p.metadata().map(|m| m.len()).unwrap_or(0);
+            } else if p.is_dir() {
+                if let Ok(entries) = fs::read_dir(&p) {
+                    for entry in entries.flatten() {
+                        stack.push_back(entry.path());
+                    }
+                }
+            }
+        }
+        Ok(total)
+    }
+
     pub fn mtime(meta: &Metadata) -> CommonResult<u64> {
         let time = meta.modified()?;
         let since = time.duration_since(UNIX_EPOCH)?;

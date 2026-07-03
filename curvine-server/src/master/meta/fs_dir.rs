@@ -28,7 +28,7 @@ use curvine_common::state::{
 };
 use curvine_common::FsResult;
 use log::{debug, info, warn};
-use orpc::common::{LocalTime, TimeSpent};
+use orpc::common::{FileUtils, LocalTime, TimeSpent};
 use orpc::sync::AtomicCounter;
 use orpc::{err_box, err_ext, try_option, CommonResult};
 use std::collections::{HashMap, LinkedList};
@@ -750,11 +750,12 @@ impl FsDir {
         self.update_last_inode_id(last_inode_id)?;
         let time2 = spend.used_ms();
 
+        let checkpoint_size = FileUtils::dir_size(path).unwrap_or(0);
         info!(
-            "restore from {}, restore rocksdb used {} ms, \
-        build in-memory directory tree used {} ms, \
-        statistics updated during tree reconstruction, last_inode_id {}",
-            path, time1, time2, last_inode_id
+            "restore from {}, checkpoint_size={} bytes, restore_rocksdb={} ms, \
+        build_tree={} ms (see create_tree log for sub-phase breakdown), \
+        last_inode_id={}",
+            path, checkpoint_size, time1, time2, last_inode_id
         );
         Ok(())
     }
