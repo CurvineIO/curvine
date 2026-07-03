@@ -17,6 +17,7 @@ use crate::worker::task::TaskContext;
 use curvine_client::file::CurvineFileSystem;
 use curvine_client::rpc::JobMasterClient;
 use curvine_client::unified::{UfsFileSystem, UnifiedReader, UnifiedWriter};
+use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
 use curvine_common::state::{CreateFileOptsBuilder, JobTaskState, SetAttrOptsBuilder};
 use curvine_common::FsResult;
@@ -196,7 +197,16 @@ impl LoadTaskRunner {
                 return err_box!("File exists and overwrite=false");
             }
 
-            ufs.create(path, overwrite).await
+            match ufs.create(path, overwrite).await {
+                Ok(writer) => Ok(writer),
+                Err(FsError::FileNotFound(_)) => {
+                    if let Some(parent) = path.parent()? {
+                        ufs.mkdir(&parent, true).await?;
+                    }
+                    ufs.create(path, overwrite).await
+                }
+                Err(e) => Err(e),
+            }
         }
     }
 

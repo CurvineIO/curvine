@@ -18,11 +18,13 @@ use curvine_common::raft::storage::{AppStorage, ApplyMsg};
 use curvine_common::raft::{NodeId, RaftPeer};
 use curvine_common::state::{
     BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, MountOptions, OpenFlags,
-    RenameFlags, WorkerInfo,
+    RenameFlags, WorkerInfo, WriteType,
 };
 use curvine_common::utils::SerdeUtils;
 use curvine_server::master::fs::MasterFilesystem;
-use curvine_server::master::journal::{JournalBatch, JournalLoader, JournalSystem};
+use curvine_server::master::journal::{
+    JournalBatch, JournalEntry, JournalLoader, JournalSystem, UfsLoader,
+};
 use curvine_server::master::{Master, MountManager};
 use log::info;
 use orpc::common::{Logger, TimeSpent};
@@ -331,6 +333,71 @@ fn run_mnt(mnt_mgr: Arc<MountManager>) -> CommonResult<()> {
     // umount
     let mount_uri = CurvineURI::new("/x/z/y")?;
     mgr.umount(mount_uri.path())?;
+
+    Ok(())
+}
+
+#[test]
+fn test_ufs_loader_mkdir_recreates_missing_ufs_parent() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!(
+        "ufs-loader-mkdir-parent-{}",
+        orpc::common::LocalTime::mills()
+    ));
+
+    let journal_system = JournalSystem::from_conf(&conf)?;
+    let fs = MasterFilesystem::with_js(&conf, &journal_system);
+    let mount_manager = journal_system.mount_manager();
+
+    let ufs_dir = std::env::temp_dir().join(format!(
+        "curvine-ufs-loader-mkdir-{}-{}",
+        std::process::id(),
+        orpc::common::LocalTime::mills()
+    ));
+    let _ = std::fs::remove_dir_all(&ufs_dir);
+    std::fs::create_dir_all(&ufs_dir)?;
+
+    let mount_opts = MountOptions::builder()
+        .write_type(WriteType::FsMode)
+        .build();
+    mount_manager.mount(
+        None,
+        "/mnt",
+        format!("file://{}/", ufs_dir.display()).as_ref(),
+        &mount_opts,
+    )?;
+
+    fs.mkdir("/mnt/db/table", true)?;
+    journal_system.fs().fs_dir.read().take_entries();
+
+    fs.mkdir("/mnt/db/table/log", false)?;
+    let mkdir_entry = match journal_system
+        .fs()
+        .fs_dir
+        .read()
+        .take_entries()
+        .into_iter()
+        .find_map(|entry| match entry {
+            JournalEntry::Mkdir(e) => Some(e),
+            _ => None,
+        }) {
+        Some(entry) => entry,
+        None => return err_box!("missing mkdir journal entry"),
+    };
+
+    assert!(!ufs_dir.join("db/table").exists());
+
+    let loader = UfsLoader::new(journal_system.job_manager(), &conf.journal);
+    let rt = AsyncRuntime::single();
+    rt.block_on(async { loader.mkdir(&mkdir_entry).await })?;
+
+    assert!(ufs_dir.join("db/table/log").is_dir());
+    let _ = std::fs::remove_dir_all(&ufs_dir);
 
     Ok(())
 }
