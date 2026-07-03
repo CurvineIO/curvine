@@ -15,6 +15,7 @@
 use curvine_common::error::FsError;
 use curvine_common::FsResult;
 use std::ffi::CStr;
+use std::sync::Arc;
 use tokio::sync::Notify;
 
 use super::ffi::JindoStatus;
@@ -52,6 +53,21 @@ impl<T> Default for CallbackCtx<T> {
 }
 
 impl<T> CallbackCtx<T> {
+    pub(crate) fn into_userdata(ctx: &Arc<Self>) -> *mut std::os::raw::c_void {
+        Arc::into_raw(Arc::clone(ctx)) as *mut std::os::raw::c_void
+    }
+
+    pub(crate) unsafe fn drop_userdata(userdata: *mut std::os::raw::c_void) {
+        if !userdata.is_null() {
+            drop(Arc::from_raw(userdata as *const Self));
+        }
+    }
+
+    pub(crate) unsafe fn complete_userdata(userdata: *mut std::os::raw::c_void, v: T) {
+        let ctx = Arc::from_raw(userdata as *const Self);
+        ctx.complete(v);
+    }
+
     pub(crate) fn reset(&self) {
         if let Ok(mut g) = self.result.lock() {
             *g = None;
@@ -92,6 +108,26 @@ pub(crate) struct I64CallbackCtx {
 }
 
 impl I64CallbackCtx {
+    pub(crate) fn into_userdata(ctx: &Arc<Self>) -> *mut std::os::raw::c_void {
+        Arc::into_raw(Arc::clone(ctx)) as *mut std::os::raw::c_void
+    }
+
+    pub(crate) unsafe fn drop_userdata(userdata: *mut std::os::raw::c_void) {
+        if !userdata.is_null() {
+            drop(Arc::from_raw(userdata as *const Self));
+        }
+    }
+
+    pub(crate) unsafe fn complete_userdata(
+        userdata: *mut std::os::raw::c_void,
+        status: JindoStatus,
+        value: i64,
+        err: *const std::os::raw::c_char,
+    ) {
+        let ctx = Arc::from_raw(userdata as *const Self);
+        ctx.complete(status, value, err);
+    }
+
     #[inline]
     pub(crate) fn reset(&self) {
         self.inner.reset();
@@ -120,6 +156,25 @@ pub(crate) struct StatusCallbackCtx {
 }
 
 impl StatusCallbackCtx {
+    pub(crate) fn into_userdata(ctx: &Arc<Self>) -> *mut std::os::raw::c_void {
+        Arc::into_raw(Arc::clone(ctx)) as *mut std::os::raw::c_void
+    }
+
+    pub(crate) unsafe fn drop_userdata(userdata: *mut std::os::raw::c_void) {
+        if !userdata.is_null() {
+            drop(Arc::from_raw(userdata as *const Self));
+        }
+    }
+
+    pub(crate) unsafe fn complete_userdata(
+        userdata: *mut std::os::raw::c_void,
+        status: JindoStatus,
+        err: *const std::os::raw::c_char,
+    ) {
+        let ctx = Arc::from_raw(userdata as *const Self);
+        ctx.complete(status, err);
+    }
+
     #[inline]
     pub(crate) fn reset(&self) {
         self.inner.reset();

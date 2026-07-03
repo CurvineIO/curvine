@@ -12,5 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod ffi_pool_tests;
 mod integration_tests;
 mod test_utils;
