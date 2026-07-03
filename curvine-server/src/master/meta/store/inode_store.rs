@@ -496,7 +496,7 @@ impl InodeStore {
             let child_id = RocksUtils::i64_from_bytes(&value)?;
             edges
                 .entry(parent_id)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push((child_name.to_string(), child_id));
             timer.edge_count += 1;
         }
