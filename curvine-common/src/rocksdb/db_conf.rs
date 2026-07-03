@@ -378,10 +378,9 @@ impl DBConf {
     ///   avoid polluting the block cache during restore.
     /// - `readahead_size(64 MiB)`: maximise sequential I/O throughput.
     pub fn create_bulk_scan_opt(&self) -> ReadOptions {
-        let mut opt = ReadOptions::default();
+        let mut opt = self.create_iterator_opt();
         opt.set_total_order_seek(true);
         opt.fill_cache(false);
-        opt.set_readahead_size(64 * 1024 * 1024);
         opt
     }
 
