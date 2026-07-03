@@ -138,9 +138,7 @@ impl RocksInodeStore {
     }
 
     /// Bulk-scan the entire `edges` CF with tuned ReadOptions.
-    pub fn bulk_scan_edges<'a: 'b, 'b>(
-        &'a self,
-    ) -> CommonResult<DBIteratorWithThreadMode<'b, DB>> {
+    pub fn bulk_scan_edges<'a: 'b, 'b>(&'a self) -> CommonResult<DBIteratorWithThreadMode<'b, DB>> {
         self.db.bulk_scan(Self::CF_EDGES)
     }
 
