@@ -423,23 +423,27 @@ impl InodeStore {
         let mut has_repairs = false;
         while let Some((mut parent, child_id, file_entry)) = stack.pop_front() {
             last_inode_id = last_inode_id.max(child_id);
+            let parent_id = parent.id();
+            let edge_name = file_entry.name().to_string();
 
             let next_parent = if child_id != ROOT_INODE_ID {
                 let mut store_inode = match self.store.get_inode(child_id)? {
                     Some(v) => v,
                     None => {
                         // Orphaned edge: inode was deleted but edge was not cleaned up
-                        // (can happen after a crash between two non-atomic batch commits).
-                        // Skip this entry to keep the tree consistent.
+                        // by older buggy metadata updates. Drop the edge durably so
+                        // recovery does not keep replaying the same broken namespace entry.
                         log::warn!(
-                            "create_tree: orphaned edge detected, child_id={} has no inode, skipping",
+                            "create_tree: orphaned edge detected, parent_id={}, edge_name='{}', child_id={} has no inode, dropping edge",
+                            parent_id,
+                            edge_name,
                             child_id
                         );
+                        repair_batch.delete_child(parent_id, &edge_name)?;
+                        has_repairs = true;
                         continue;
                     }
                 };
-                let parent_id = parent.id();
-                let edge_name = file_entry.name().to_string();
 
                 let inode = match store_inode {
                     InodeView::Dir(_) => {
