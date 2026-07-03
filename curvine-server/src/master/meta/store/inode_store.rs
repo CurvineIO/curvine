@@ -544,36 +544,31 @@ impl InodeStore {
         let chunk_size = total.div_ceil(num_threads);
         let chunks: Vec<Vec<(i64, Vec<u8>)>> = raw.chunks(chunk_size).map(|c| c.to_vec()).collect();
 
-        let thread_results =
-            std::thread::scope(|s| -> CommonResult<Vec<Vec<(i64, InodeView)>>> {
-                let handles: Vec<_> = chunks
-                    .into_iter()
-                    .map(|chunk| {
-                        s.spawn(move || -> CommonResult<Vec<(i64, InodeView)>> {
-                            let mut result = Vec::with_capacity(chunk.len());
-                            for (id, bytes) in chunk {
-                                let inode: InodeView = SerdeUtils::deserialize(&bytes)?;
-                                result.push((id, inode));
-                            }
-                            Ok(result)
-                        })
-                    })
-                    .collect();
-
-                let mut all = Vec::with_capacity(handles.len());
-                for h in handles {
-                    let inner = match h.join() {
-                        Ok(result) => result,
-                        Err(_) => {
-                            return err_box!(
-                                "thread panicked during inode deserialization"
-                            )
+        let thread_results = std::thread::scope(|s| -> CommonResult<Vec<Vec<(i64, InodeView)>>> {
+            let handles: Vec<_> = chunks
+                .into_iter()
+                .map(|chunk| {
+                    s.spawn(move || -> CommonResult<Vec<(i64, InodeView)>> {
+                        let mut result = Vec::with_capacity(chunk.len());
+                        for (id, bytes) in chunk {
+                            let inode: InodeView = SerdeUtils::deserialize(&bytes)?;
+                            result.push((id, inode));
                         }
-                    };
-                    all.push(inner?);
-                }
-                Ok(all)
-            })?;
+                        Ok(result)
+                    })
+                })
+                .collect();
+
+            let mut all = Vec::with_capacity(handles.len());
+            for h in handles {
+                let inner = match h.join() {
+                    Ok(result) => result,
+                    Err(_) => return err_box!("thread panicked during inode deserialization"),
+                };
+                all.push(inner?);
+            }
+            Ok(all)
+        })?;
 
         for chunk_result in thread_results {
             for (id, inode) in chunk_result {
@@ -1020,11 +1015,7 @@ mod tests {
         }
 
         let (_, restored) = store.create_tree()?;
-        let names: Vec<&str> = restored
-            .children()
-            .into_iter()
-            .map(|c| c.name())
-            .collect();
+        let names: Vec<&str> = restored.children().into_iter().map(|c| c.name()).collect();
         // Only the real directory should be in the tree; orphaned edge is skipped.
         assert_eq!(names, vec!["real-dir"]);
 
@@ -1048,10 +1039,7 @@ mod tests {
                 let dir_id = next_id;
                 next_id += 1;
                 let dir_name = format!("d{}", i);
-                let dir = InodeView::new_dir(
-                    dir_name.clone(),
-                    InodeDir::new(dir_id, 0),
-                );
+                let dir = InodeView::new_dir(dir_name.clone(), InodeDir::new(dir_id, 0));
                 batch.write_inode(&dir)?;
                 batch.add_child(ROOT_INODE_ID, &dir_name, dir_id)?;
 
@@ -1059,10 +1047,7 @@ mod tests {
                     let file_id = next_id;
                     next_id += 1;
                     let file_name = format!("f{}", j);
-                    let file = InodeView::new_file(
-                        file_name.clone(),
-                        InodeFile::new(file_id, 0),
-                    );
+                    let file = InodeView::new_file(file_name.clone(), InodeFile::new(file_id, 0));
                     batch.write_inode(&file)?;
                     batch.add_child(dir_id, &file_name, file_id)?;
                 }
@@ -1151,8 +1136,7 @@ mod tests {
                     let file_id = next_id;
                     next_id += 1;
                     let file_name = format!("f{}", j);
-                    let file =
-                        InodeView::new_file(file_name.clone(), InodeFile::new(file_id, 0));
+                    let file = InodeView::new_file(file_name.clone(), InodeFile::new(file_id, 0));
                     batch.write_inode(&file)?;
                     batch.add_child(dir_id, &file_name, file_id)?;
                 }
