@@ -14,9 +14,11 @@
 
 #![allow(clippy::needless_range_loop)]
 
+use crate::master::fs::MasterFilesystem;
 use crate::master::journal::*;
 use crate::master::meta::inode::InodeView::File;
 use crate::master::meta::inode::{InodePath, InodeView};
+use crate::master::meta::InodeId;
 use crate::master::{JobManager, Master, MasterMetrics, MountManager, SyncFsDir};
 use curvine_common::conf::JournalConf;
 use curvine_common::error::FsError;
@@ -603,12 +605,13 @@ impl JournalLoader {
 
     fn add_block(&self, entry: AddBlockEntry) -> CommonResult<()> {
         let fs_dir = self.fs_dir.write();
-        let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
 
-        let mut inode = match inp.get_last_inode() {
-            Some(v) => v,
-            None => {
-                warn!("add_block: file not found: {:?}", entry);
+        let inode_id = entry.blocks.first().map(|v| InodeId::get_id(v.id));
+
+        let mut inode = match MasterFilesystem::resolve_file_inode(&fs_dir, &entry.path, inode_id) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("add_block: file not found: {:?} {}", entry, e);
                 return Ok(());
             }
         };
@@ -623,15 +626,15 @@ impl JournalLoader {
 
     fn complete_file(&self, entry: CompleteFileEntry) -> CommonResult<()> {
         let fs_dir = self.fs_dir.write();
-        let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
 
-        let mut inode = match inp.get_last_inode() {
-            Some(v) => v,
-            None => {
-                warn!("complete_file: file not found: {:?}", entry);
-                return Ok(());
-            }
-        };
+        let mut inode =
+            match MasterFilesystem::resolve_file_inode(&fs_dir, &entry.path, Some(entry.file.id)) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("complete_file: file not found: {:?} {}", entry, e);
+                    return Ok(());
+                }
+            };
         let file = inode.as_file_mut()?;
 
         let _ = mem::replace(file, entry.file);

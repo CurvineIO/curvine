@@ -180,7 +180,13 @@ impl FsWriterBase {
 
         let commits_blocks = self.file_blocks.take_commit_blocks();
         self.fs_client
-            .complete_file(&self.path, self.len, commits_blocks, only_flush)
+            .complete_file_by_id(
+                &self.path,
+                self.file_blocks.status.id,
+                self.len,
+                commits_blocks,
+                only_flush,
+            )
             .await
     }
 
@@ -227,7 +233,13 @@ impl FsWriterBase {
                         let last_block = self.file_blocks.last_block();
                         let lb = self
                             .fs_client
-                            .add_block(&self.path, commit_blocks, self.len, last_block)
+                            .add_block_by_id(
+                                &self.path,
+                                self.file_blocks.status.id,
+                                commit_blocks,
+                                self.len,
+                                last_block,
+                            )
                             .await?;
                         self.file_blocks.add_block(lb.clone())?;
                         let writer =

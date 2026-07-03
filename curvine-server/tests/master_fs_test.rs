@@ -764,10 +764,10 @@ fn add_block_retry(fs: &MasterFilesystem) -> CommonResult<()> {
     let status = fs.create(path, false).unwrap();
 
     let b1 = fs
-        .add_block(path, addr.clone(), vec![], vec![], 0, None)
+        .add_block(path, None, addr.clone(), vec![], vec![], 0, None)
         .unwrap();
     let b2 = fs
-        .add_block(path, addr.clone(), vec![], vec![], 0, None)
+        .add_block(path, None, addr.clone(), vec![], vec![], 0, None)
         .unwrap();
 
     assert_eq!(b1.block.id, b2.block.id);
@@ -792,6 +792,7 @@ fn add_block_retry(fs: &MasterFilesystem) -> CommonResult<()> {
     let b1 = fs
         .add_block(
             path,
+            None,
             addr.clone(),
             vec![commit.clone()],
             vec![],
@@ -802,6 +803,7 @@ fn add_block_retry(fs: &MasterFilesystem) -> CommonResult<()> {
     let b2 = fs
         .add_block(
             path,
+            None,
             addr.clone(),
             vec![commit],
             vec![],
@@ -823,7 +825,7 @@ fn complete_file_retry(fs: &MasterFilesystem) -> CommonResult<()> {
     let addr = ClientAddress::default();
     fs.create(path, false)?;
 
-    let b1 = fs.add_block(path, addr.clone(), vec![], vec![], 0, None)?;
+    let b1 = fs.add_block(path, None, addr.clone(), vec![], vec![], 0, None)?;
 
     let commit = CommitBlock {
         block_id: b1.block.id,
@@ -836,6 +838,7 @@ fn complete_file_retry(fs: &MasterFilesystem) -> CommonResult<()> {
 
     let f1 = fs.complete_file(
         path,
+        None,
         b1.block.len,
         vec![commit.clone()],
         &addr.client_name,
@@ -845,6 +848,7 @@ fn complete_file_retry(fs: &MasterFilesystem) -> CommonResult<()> {
 
     let f2 = fs.complete_file(
         path,
+        None,
         b1.block.len,
         vec![commit.clone()],
         &addr.client_name,

@@ -100,6 +100,9 @@ fn run_filesystem_end_to_end_operations_on_cluster(
         rename2(&fs).await?;
         println!("rename2 done");
 
+        open_file_rename_read_write(&fs).await?;
+        println!("open_file_rename_read_write done");
+
         set_attr_non_recursive(&fs).await?;
         println!("set_attr_non_recursive done");
 
@@ -410,14 +413,54 @@ async fn rename2(fs: &CurvineFileSystem) -> CommonResult<()> {
     let _ = fs.rename(&src, &dst).await?;
 
     assert!(!(fs.exists(&src).await?));
+    assert!(fs.exists(&dst).await?);
     assert!(
-        fs.exists(&Path::from_str("/fs_test/rename2/rename2.log")?)
+        !fs.exists(&Path::from_str("/fs_test/rename2/rename2.log")?)
             .await?
     );
 
     let res = fs.list_status(&dst).await?;
     println!("{:?}", res);
-    assert_eq!(res.len(), 1);
+    assert_eq!(res.len(), 0);
+
+    Ok(())
+}
+
+async fn open_file_rename_read_write(fs: &CurvineFileSystem) -> CommonResult<()> {
+    let src = Path::from_str("/fs_test/open_rename/write.log")?;
+    let dst = Path::from_str("/fs_test/open_rename/write_renamed.log")?;
+
+    let mut writer = fs.create(&src, true).await?;
+    writer.write("before-".as_bytes()).await?;
+    fs.rename(&src, &dst).await?;
+
+    assert!(!fs.exists(&src).await?);
+    assert!(fs.exists(&dst).await?);
+
+    writer.write("after".as_bytes()).await?;
+    writer.complete().await?;
+
+    let status = fs.get_status(&dst).await?;
+    assert_eq!(status.len, "before-after".len() as i64);
+    assert_eq!(fs.read_string(&dst).await?, "before-after");
+    assert!(fs.open(&src).await.is_err());
+
+    let read_src = Path::from_str("/fs_test/open_rename/read.log")?;
+    let read_dst = Path::from_str("/fs_test/open_rename/read_renamed.log")?;
+    fs.write_string(&read_src, "read-before-rename").await?;
+
+    let mut reader = fs.open(&read_src).await?;
+    fs.rename(&read_src, &read_dst).await?;
+
+    assert!(!fs.exists(&read_src).await?);
+    assert!(fs.exists(&read_dst).await?);
+
+    let mut buffer = BytesMut::zeroed("read-before-rename".len());
+    let bytes_read = reader.read_full(&mut buffer).await?;
+    reader.complete().await?;
+    buffer.truncate(bytes_read);
+    assert_eq!(String::from_utf8(buffer.to_vec())?, "read-before-rename");
+    assert_eq!(fs.read_string(&read_dst).await?, "read-before-rename");
 
     Ok(())
 }

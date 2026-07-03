@@ -522,12 +522,12 @@ impl FsDir {
 
     pub fn acquire_new_block(
         &mut self,
-        inp: &InodePath,
+        path: impl AsRef<str>,
+        mut inode: InodePtr,
         commit_blocks: Vec<CommitBlock>,
         choose_workers: &[WorkerAddress],
         file_len: i64,
     ) -> FsResult<ExtendedBlock> {
-        let mut inode = try_option!(inp.get_last_inode());
         let file = inode.as_file_mut()?;
 
         let new_block_id = file.next_block_id()?;
@@ -549,19 +549,19 @@ impl FsDir {
         // state add block.
         self.store.apply_new_block(inode.as_ref(), &commit_blocks)?;
         self.journal_writer
-            .log_add_block(self, inp.path(), inode.as_file_ref()?, commit_blocks)?;
+            .log_add_block(self, path, inode.as_file_ref()?, commit_blocks)?;
         Ok(block)
     }
 
     pub fn complete_file(
         &mut self,
-        inp: &InodePath,
+        path: impl AsRef<str>,
+        inode: &mut InodePtr,
         len: i64,
         commit_block: Vec<CommitBlock>,
         client_name: impl AsRef<str>,
         only_flush: bool,
     ) -> FsResult<bool> {
-        let mut inode = try_option!(inp.get_last_inode());
         let file = inode.as_file_mut()?;
         file.complete(len, &commit_block, client_name, only_flush)?;
 
@@ -569,12 +569,8 @@ impl FsDir {
 
         self.store
             .apply_complete_file(inode.as_ref(), &commit_block)?;
-        self.journal_writer.log_complete_file(
-            self,
-            inp.path(),
-            inode.as_file_ref()?,
-            commit_block,
-        )?;
+        self.journal_writer
+            .log_complete_file(self, path, inode.as_file_ref()?, commit_block)?;
 
         Ok(true)
     }

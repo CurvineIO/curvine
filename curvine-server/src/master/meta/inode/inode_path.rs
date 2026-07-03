@@ -371,9 +371,13 @@ impl InodePath {
         }
     }
 
-    // Delete the last 1 inodes.
-    pub fn delete_last(&mut self) {
-        self.inodes.pop();
+    // Return the last inode only if the path was fully resolved.
+    pub fn task_last(mut self) -> Option<InodePtr> {
+        if self.inodes.len() == self.components.len() {
+            self.inodes.pop()
+        } else {
+            None
+        }
     }
 }
 

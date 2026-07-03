@@ -276,6 +276,30 @@ impl FsClient {
         file_len: i64,
         last_block: Option<ExtendedBlock>,
     ) -> FsResult<LocatedBlock> {
+        self.add_block0(path, None, commit_blocks, file_len, last_block)
+            .await
+    }
+
+    pub async fn add_block_by_id(
+        &self,
+        path: &Path,
+        id: i64,
+        commit_blocks: Vec<CommitBlock>,
+        file_len: i64,
+        last_block: Option<ExtendedBlock>,
+    ) -> FsResult<LocatedBlock> {
+        self.add_block0(path, Some(id), commit_blocks, file_len, last_block)
+            .await
+    }
+
+    async fn add_block0(
+        &self,
+        path: &Path,
+        inode_id: Option<i64>,
+        commit_blocks: Vec<CommitBlock>,
+        file_len: i64,
+        last_block: Option<ExtendedBlock>,
+    ) -> FsResult<LocatedBlock> {
         let commit_blocks = commit_blocks
             .into_iter()
             .map(|v| ProtoUtils::commit_block_to_pb(v.clone()))
@@ -289,6 +313,7 @@ impl FsClient {
             client_address: self.context.client_addr_pb(),
             file_len,
             last_block: last_block.map(ProtoUtils::extend_block_to_pb),
+            inode_id,
         };
 
         let rep_header = self.rpc(RpcCode::AddBlock, header).await?;
@@ -309,6 +334,7 @@ impl FsClient {
                     client_address: self.context.client_addr_pb(),
                     file_len: 0,
                     last_block: None,
+                    inode_id: None,
                 }
             })
             .collect();
@@ -323,10 +349,35 @@ impl FsClient {
             .map(ProtoUtils::located_block_from_pb)
             .collect())
     }
-    // File writing is completed.
+
     pub async fn complete_file(
         &self,
         path: &Path,
+        len: i64,
+        commit_blocks: impl IntoIterator<Item = CommitBlock>,
+        only_flush: bool,
+    ) -> FsResult<Option<FileBlocks>> {
+        self.complete_file0(path, None, len, commit_blocks, only_flush)
+            .await
+    }
+
+    pub async fn complete_file_by_id(
+        &self,
+        path: &Path,
+        inode_id: i64,
+        len: i64,
+        commit_blocks: impl IntoIterator<Item = CommitBlock>,
+        only_flush: bool,
+    ) -> FsResult<Option<FileBlocks>> {
+        self.complete_file0(path, Some(inode_id), len, commit_blocks, only_flush)
+            .await
+    }
+
+    // File writing is completed.
+    async fn complete_file0(
+        &self,
+        path: &Path,
+        inode_id: Option<i64>,
         len: i64,
         commit_blocks: impl IntoIterator<Item = CommitBlock>,
         only_flush: bool,
@@ -342,6 +393,7 @@ impl FsClient {
             client_name: self.context().clone_client_name(),
             commit_blocks,
             only_flush,
+            inode_id,
         };
 
         let rep: CompleteFileResponse = self.rpc(RpcCode::CompleteFile, header).await?;
@@ -366,6 +418,7 @@ impl FsClient {
                     client_name,
                     commit_blocks,
                     only_flush,
+                    inode_id: None,
                 }
             })
             .collect();

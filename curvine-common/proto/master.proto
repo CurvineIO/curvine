@@ -146,6 +146,7 @@ message AddBlockRequest {
     required ClientAddressProto client_address = 5;
     required int64 file_len = 6;
     optional ExtendedBlockProto last_block = 7;
+    optional int64 inode_id = 8;
 }
 
 message AddBlockResponse {
@@ -186,6 +187,7 @@ message CompleteFileRequest {
     required string client_name = 3;
     repeated CommitBlockProto commit_blocks = 4;
     required bool only_flush = 5 [default = false];
+    optional int64 inode_id = 6;
 }
 
 message CompleteFileResponse {
