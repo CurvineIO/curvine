@@ -31,10 +31,20 @@ impl MasterClient {
         self.session.unified().get_master_info().await
     }
 
+    /// Returns total and available capacity in a single RPC.
+    pub async fn capacity_stats(&self) -> FsResult<(i64, i64)> {
+        let info = self.get_master_info().await?;
+        Ok((info.capacity, info.available))
+    }
+
+    /// Returns total cluster capacity. Issues its own RPC; prefer [`Self::capacity_stats`]
+    /// or [`Self::get_master_info`] when multiple fields are needed.
     pub async fn capacity(&self) -> FsResult<i64> {
         Ok(self.get_master_info().await?.capacity)
     }
 
+    /// Returns available cluster capacity. Issues its own RPC; prefer [`Self::capacity_stats`]
+    /// or [`Self::get_master_info`] when multiple fields are needed.
     pub async fn available(&self) -> FsResult<i64> {
         Ok(self.get_master_info().await?.available)
     }

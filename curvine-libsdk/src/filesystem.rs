@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::core::Session;
-use crate::{LibFsReader, LibFsWriter};
 use bytes::BytesMut;
+use curvine_client::unified::{UnifiedReader, UnifiedWriter};
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::FreeResult;
 use curvine_common::FsResult;
@@ -60,30 +60,19 @@ impl FileSystemClient {
         self.unified().list_status_bytes(&path).await
     }
 
-    pub async fn open(&self, path: impl AsRef<str>) -> FsResult<LibFsReader> {
+    pub async fn open(&self, path: impl AsRef<str>) -> FsResult<UnifiedReader> {
         let path = Path::from_str(path)?;
-        let reader = self.unified().open(&path).await?;
-        Ok(LibFsReader::new(self.session.runtime().clone(), reader))
+        self.unified().open(&path).await
     }
 
-    pub async fn create(&self, path: impl AsRef<str>, overwrite: bool) -> FsResult<LibFsWriter> {
+    pub async fn create(&self, path: impl AsRef<str>, overwrite: bool) -> FsResult<UnifiedWriter> {
         let path = Path::from_str(path)?;
-        let writer = self.unified().create(&path, overwrite).await?;
-        Ok(LibFsWriter::new(
-            self.session.runtime().clone(),
-            writer,
-            self.unified().conf(),
-        ))
+        self.unified().create(&path, overwrite).await
     }
 
-    pub async fn append(&self, path: impl AsRef<str>) -> FsResult<LibFsWriter> {
+    pub async fn append(&self, path: impl AsRef<str>) -> FsResult<UnifiedWriter> {
         let path = Path::from_str(path)?;
-        let writer = self.unified().append(&path).await?;
-        Ok(LibFsWriter::new(
-            self.session.runtime().clone(),
-            writer,
-            self.unified().conf(),
-        ))
+        self.unified().append(&path).await
     }
 
     pub async fn free(&self, path: impl AsRef<str>, recursive: bool) -> FsResult<FreeResult> {
