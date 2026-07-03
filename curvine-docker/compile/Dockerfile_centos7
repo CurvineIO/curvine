@@ -149,14 +149,14 @@ RUN cd /opt && \
     curl -fL -o ${JINDOSDK_FILE} \
         https://jindodata-binary.oss-cn-shanghai.aliyuncs.com/release/${JINDOSDK_VERSION}/${JINDOSDK_FILE} && \
     tar -xzf ${JINDOSDK_FILE} && \
+    rm -f ${JINDOSDK_FILE} && \
     echo "Checking extracted directory..." && \
     ls -la /opt/ && \
-    EXTRACTED_DIR=$(ls -d jindosdk* | head -n1) && \
-    echo "Found directory: ${EXTRACTED_DIR}" && \
-    if [ "$EXTRACTED_DIR" != "jindosdk" ]; then \
+    if [ ! -d jindosdk ]; then \
+        EXTRACTED_DIR=$(ls -d jindosdk*/ | head -n1 | sed 's|/$||') && \
+        echo "Found directory: ${EXTRACTED_DIR}" && \
         mv "$EXTRACTED_DIR" jindosdk; \
     fi && \
-    rm -f ${JINDOSDK_FILE} && \
     echo "✓ JindoSDK ${JINDOSDK_VERSION} installed successfully for ${ARCH}"
 ENV JINDOSDK_HOME=/opt/jindosdk
 ENV LD_LIBRARY_PATH="${JINDOSDK_HOME}/lib:${LD_LIBRARY_PATH}"

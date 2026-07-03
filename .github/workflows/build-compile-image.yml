@@ -202,28 +202,37 @@ jobs:
           done
 
           if [ "${#GHCR_REFS[@]}" -eq 1 ]; then
-            echo "Single-arch build for ${TAG}; skipping manifest creation."
-            exit 0
+            docker buildx imagetools create -t "ghcr.io/curvineio/curvine-compile:${TAG}" "${GHCR_REFS[0]}"
+            docker buildx imagetools create -t "curvine/curvine-compile:${TAG}" "${DOCKERHUB_REFS[0]}"
+          else
+            docker manifest rm "ghcr.io/curvineio/curvine-compile:${TAG}" || true
+            docker manifest create "ghcr.io/curvineio/curvine-compile:${TAG}" "${GHCR_REFS[@]}"
+            docker manifest push "ghcr.io/curvineio/curvine-compile:${TAG}"
+
+            docker manifest rm "curvine/curvine-compile:${TAG}" || true
+            docker manifest create "curvine/curvine-compile:${TAG}" "${DOCKERHUB_REFS[@]}"
+            docker manifest push "curvine/curvine-compile:${TAG}"
           fi
-
-          docker manifest rm "ghcr.io/curvineio/curvine-compile:${TAG}" || true
-          docker manifest create "ghcr.io/curvineio/curvine-compile:${TAG}" "${GHCR_REFS[@]}"
-          docker manifest push "ghcr.io/curvineio/curvine-compile:${TAG}"
-
-          docker manifest rm "curvine/curvine-compile:${TAG}" || true
-          docker manifest create "curvine/curvine-compile:${TAG}" "${DOCKERHUB_REFS[@]}"
-          docker manifest push "curvine/curvine-compile:${TAG}"
       
       - name: Manifest creation summary for ${{ matrix.tag }}
+        env:
+          TAG: ${{ matrix.tag }}
+          ARCHS_JSON: ${{ toJSON(matrix.archs) }}
         run: |
-          echo "### Multi-arch Manifest Created for ${{ matrix.tag }} 🎉" >> $GITHUB_STEP_SUMMARY
+          ARCH_COUNT=$(echo "$ARCHS_JSON" | jq 'length')
+          ARCHS=$(echo "$ARCHS_JSON" | jq -r 'join(", ")')
+          if [ "$ARCH_COUNT" -eq 1 ]; then
+            echo "### Single-arch Image Published for ${TAG}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### Multi-arch Manifest Created for ${TAG}" >> $GITHUB_STEP_SUMMARY
+          fi
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Tag:** \`${{ matrix.tag }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Combined architectures:** ${{ join(matrix.archs, ', ') }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** \`${TAG}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Architectures:** ${ARCHS}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Manifests created:**" >> $GITHUB_STEP_SUMMARY
-          echo "- \`ghcr.io/curvineio/curvine-compile:${{ matrix.tag }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- \`curvine/curvine-compile:${{ matrix.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Images published:**" >> $GITHUB_STEP_SUMMARY
+          echo "- \`ghcr.io/curvineio/curvine-compile:${TAG}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`curvine/curvine-compile:${TAG}\`" >> $GITHUB_STEP_SUMMARY
 
   # Final summary
   summary:
@@ -234,6 +243,7 @@ jobs:
       - name: Final build summary
         env:
           BUILD_TYPES_SUMMARY: ${{ needs.prepare.outputs.build_types_summary }}
+          MANIFEST_MATRIX: ${{ needs.prepare.outputs.manifest_matrix }}
         run: |
           echo "### Compile Image Build Summary 🚀" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -244,7 +254,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           
           if [ "${{ inputs.push_image }}" == "true" ]; then
-            echo "**Multi-arch images pushed to:**" >> $GITHUB_STEP_SUMMARY
+            echo "**Images pushed to:**" >> $GITHUB_STEP_SUMMARY
             IFS=',' read -ra TAGS <<< "${BUILD_TYPES_SUMMARY}"
             for tag in "${TAGS[@]}"; do
               tag="$(echo "$tag" | xargs)"
@@ -259,8 +269,11 @@ jobs:
             done
             echo "" >> $GITHUB_STEP_SUMMARY
             FIRST_TAG="$(echo "${TAGS[0]}" | xargs)"
-            echo "# Verify multi-arch" >> $GITHUB_STEP_SUMMARY
-            echo "docker manifest inspect ghcr.io/curvineio/curvine-compile:${FIRST_TAG}" >> $GITHUB_STEP_SUMMARY
+            FIRST_ARCH_COUNT=$(echo "$MANIFEST_MATRIX" | jq -r --arg tag "$FIRST_TAG" '.[] | select(.tag == $tag) | .archs | length')
+            if [ "${FIRST_ARCH_COUNT:-0}" -gt 1 ]; then
+              echo "# Verify multi-arch" >> $GITHUB_STEP_SUMMARY
+              echo "docker manifest inspect ghcr.io/curvineio/curvine-compile:${FIRST_TAG}" >> $GITHUB_STEP_SUMMARY
+            fi
             echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           else
             echo "**Note:** Images were built but not pushed (push_image=false)" >> $GITHUB_STEP_SUMMARY
