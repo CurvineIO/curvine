@@ -42,7 +42,7 @@
 use bytes::BytesMut;
 use curvine_client::file::FsReader;
 use curvine_client::unified::{FallbackFsReader, UfsFileSystem, UnifiedFileSystem, UnifiedReader};
-use curvine_common::fs::{FileSystem, Path, Reader, Writer};
+use curvine_common::fs::{FileSystem, Path, Reader, RpcCode, Writer};
 use curvine_common::state::{MountOptionsBuilder, WriteType};
 use curvine_tests::Testing;
 use orpc::common::Utils;
@@ -78,7 +78,12 @@ async fn mount_fs_mode(fs: &UnifiedFileSystem, mount_dir: &str) {
     let ufs_path = Path::from_str(format!("{}/{}", ufs_base, mount_dir)).unwrap();
     let cv_path = Path::from_str(format!("/{}", mount_dir)).unwrap();
 
-    if fs.get_mount(&cv_path).await.unwrap().is_some() {
+    if fs
+        .get_mount(&cv_path, RpcCode::GetMountInfo)
+        .await
+        .unwrap()
+        .is_some()
+    {
         return;
     }
 
@@ -106,7 +111,12 @@ async fn mount_cache_mode(fs: &UnifiedFileSystem, mount_dir: &str) {
     let ufs_path = Path::from_str(format!("{}/{}", ufs_base, mount_dir)).unwrap();
     let cv_path = Path::from_str(format!("/{}", mount_dir)).unwrap();
 
-    if fs.get_mount(&cv_path).await.unwrap().is_some() {
+    if fs
+        .get_mount(&cv_path, RpcCode::GetMountInfo)
+        .await
+        .unwrap()
+        .is_some()
+    {
         return;
     }
 
@@ -139,7 +149,11 @@ async fn write_ufs_and_warm_cache(
     data: &str,
 ) -> Path {
     let cv_path = Path::from_str(format!("/{}/{}", mount_dir, name)).unwrap();
-    let (ufs_path, mount) = fs.get_mount(&cv_path).await.unwrap().unwrap();
+    let (ufs_path, mount) = fs
+        .get_mount(&cv_path, RpcCode::GetMountInfo)
+        .await
+        .unwrap()
+        .unwrap();
 
     let mut w = mount.ufs.create(&ufs_path, true).await.unwrap();
     w.write(data.as_bytes()).await.unwrap();
@@ -201,7 +215,11 @@ async fn build_reader_with_unreachable_worker(
     }
 
     let cv_reader = FsReader::new(cv_path.clone(), fs.cv().fs_context(), blocks).unwrap();
-    let (ufs_path, mount) = fs.get_mount(cv_path).await.unwrap().unwrap();
+    let (ufs_path, mount) = fs
+        .get_mount(cv_path, RpcCode::GetMountInfo)
+        .await
+        .unwrap()
+        .unwrap();
     FallbackFsReader::new(
         cv_reader,
         ufs_path,
@@ -375,7 +393,11 @@ fn test_tc12_worker_failure_ufs_mtime_mismatch_returns_error() {
         let cv_path = write_and_flush(&fs, mount_dir, "tc12.log", "original-data").await;
 
         // Overwrite UFS file to change mtime/len and create metadata mismatch.
-        let (ufs_path, mount) = fs.get_mount(&cv_path).await.unwrap().unwrap();
+        let (ufs_path, mount) = fs
+            .get_mount(&cv_path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
         let mut ufs_writer = mount.ufs.create(&ufs_path, true).await.unwrap();
         ufs_writer.write(b"changed-in-ufs").await.unwrap();
         ufs_writer.complete().await.unwrap();
@@ -483,7 +505,11 @@ fn test_tc17_cachemode_worker_failure_pos0_reads_current_s3() {
 
         // Modify S3 out-of-band to SHORTER content (changes mtime AND len).
         let changed = "abcdefghij";
-        let (ufs_path, mount) = fs.get_mount(&cv_path).await.unwrap().unwrap();
+        let (ufs_path, mount) = fs
+            .get_mount(&cv_path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
         let mut w = mount.ufs.create(&ufs_path, true).await.unwrap();
         w.write(changed.as_bytes()).await.unwrap();
         w.complete().await.unwrap();
@@ -525,7 +551,11 @@ fn test_tc18_cachemode_worker_failure_shrunk_past_pos_errors() {
 
         // Shrink S3 out-of-band to a few bytes.
         let changed = "abcd";
-        let (ufs_path, mount) = fs.get_mount(&cv_path).await.unwrap().unwrap();
+        let (ufs_path, mount) = fs
+            .get_mount(&cv_path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
         let mut w = mount.ufs.create(&ufs_path, true).await.unwrap();
         w.write(changed.as_bytes()).await.unwrap();
         w.complete().await.unwrap();
@@ -601,7 +631,11 @@ fn test_tc20_cachemode_worker_failure_grown_reads_current_s3() {
 
         // Modify S3 out-of-band to LONGER content (changes mtime AND len).
         let changed = "abcdefghijklmnopqrstuvwxyz";
-        let (ufs_path, mount) = fs.get_mount(&cv_path).await.unwrap().unwrap();
+        let (ufs_path, mount) = fs
+            .get_mount(&cv_path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
         let mut w = mount.ufs.create(&ufs_path, true).await.unwrap();
         w.write(changed.as_bytes()).await.unwrap();
         w.complete().await.unwrap();
@@ -644,7 +678,11 @@ fn test_tc21_cachemode_fallback_len_reflects_current_s3() {
 
         // Grow S3 out-of-band to a longer object.
         let changed = "abcdefghijklmnopqrstuvwxyz";
-        let (ufs_path, mount) = fs.get_mount(&cv_path).await.unwrap().unwrap();
+        let (ufs_path, mount) = fs
+            .get_mount(&cv_path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
         let mut w = mount.ufs.create(&ufs_path, true).await.unwrap();
         w.write(changed.as_bytes()).await.unwrap();
         w.complete().await.unwrap();

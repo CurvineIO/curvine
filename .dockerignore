@@ -1,6 +1,10 @@
 curvine-libsdk/java/target/
+curvine-lancedb/target/
+target/
 **/target/
 # Keep .git directory for version info during build
 # **/.git/
 **/.staging/
 **/.summary/
+.debug/
+testing/

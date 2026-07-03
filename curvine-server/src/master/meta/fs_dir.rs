@@ -790,6 +790,10 @@ impl FsDir {
         Ok(block_ids)
     }
 
+    pub fn get_worker_block_ids(&self, worker_id: u32) -> FsResult<Vec<i64>> {
+        Ok(self.store.store.get_block_ids(worker_id)?)
+    }
+
     // for testing
     pub fn take_entries(&self) -> Vec<JournalEntry> {
         self.journal_writer.take_entries()

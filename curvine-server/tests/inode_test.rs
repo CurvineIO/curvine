@@ -14,9 +14,14 @@
 
 use curvine_common::rocksdb::DBConf;
 use curvine_common::state::BlockLocation;
+use curvine_server::master::meta::inode::ttl::TtlBucketList;
 use curvine_server::master::meta::inode::{InodeDir, InodeFile, InodeView, ROOT_INODE_ID};
-use curvine_server::master::meta::store::RocksInodeStore;
+use curvine_server::master::meta::store::{InodeStore, RocksInodeStore};
+use curvine_server::master::meta::FsDir;
+use curvine_server::master::Master;
+use orpc::common::Utils;
 use orpc::CommonResult;
+use std::sync::Arc;
 
 #[test]
 fn test_inode_dir_add_children_and_sort_alphabetically() {
@@ -87,6 +92,38 @@ fn test_rocks_inode_store_add_delete_child_and_iterator() -> CommonResult<()> {
     }
     println!("vec = {:?}", vec);
     assert_eq!(vec, vec![2, 3]);
+
+    Ok(())
+}
+
+#[test]
+fn test_inode_store_create_tree_removes_orphan_edges() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let conf = DBConf::new(Utils::test_sub_dir(format!(
+        "inode-test/orphan-edge-{}",
+        Utils::rand_str(6)
+    )));
+    {
+        let rocks = RocksInodeStore::new(conf.clone(), true)?;
+        let store = InodeStore::new(rocks, Arc::new(TtlBucketList::new(60_000)));
+        let root = FsDir::create_root();
+        let missing_inode_id = 2001;
+
+        {
+            let mut batch = store.new_batch();
+            batch.write_inode(&root)?;
+            batch.add_child(ROOT_INODE_ID, "missing", missing_inode_id)?;
+            batch.commit()?;
+        }
+
+        let (_, restored) = store.create_tree()?;
+        assert!(restored.get_child("missing").is_none());
+    }
+
+    let rocks = RocksInodeStore::new(conf, false)?;
+    let edge_count = rocks.edges_iter(ROOT_INODE_ID)?.count();
+    assert_eq!(edge_count, 0);
 
     Ok(())
 }

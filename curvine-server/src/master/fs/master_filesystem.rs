@@ -26,8 +26,11 @@ use curvine_common::error::FsError;
 use curvine_common::state::*;
 use curvine_common::FsResult;
 use log::warn;
+use orpc::common::LocalTime;
 use orpc::sync::ArcRwLock;
 use orpc::{err_box, err_ext, try_option, CommonResult};
+use parking_lot::Mutex;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -36,7 +39,16 @@ pub struct MasterFilesystem {
     pub worker_manager: SyncWorkerManager,
     pub master_monitor: MasterMonitor,
     pub conf: Arc<MasterConf>,
+    full_block_reports: Arc<Mutex<HashMap<u32, FullBlockReportState>>>,
 }
+
+struct FullBlockReportState {
+    total_len: u64,
+    update_time_ms: u64,
+    reported_blocks: HashSet<i64>,
+}
+
+const FULL_BLOCK_REPORT_TTL_MS: u64 = 60 * 60 * 1000;
 
 impl MasterFilesystem {
     pub fn new(
@@ -50,6 +62,7 @@ impl MasterFilesystem {
             worker_manager,
             master_monitor,
             conf: Arc::new(conf.master.clone()),
+            full_block_reports: Default::default(),
         }
     }
 
@@ -59,6 +72,7 @@ impl MasterFilesystem {
             worker_manager: js.worker_manager(),
             master_monitor: js.master_monitor(),
             conf: Arc::new(conf.master.clone()),
+            full_block_reports: Default::default(),
         }
     }
 
@@ -673,11 +687,61 @@ impl MasterFilesystem {
         fs_dir.block_exists(id)
     }
 
+    fn collect_full_block_report(&self, list: &BlockReportList) -> Option<HashSet<i64>> {
+        if !list.full_report {
+            return None;
+        }
+
+        let now = LocalTime::mills();
+        let mut reports = self.full_block_reports.lock();
+        reports.retain(|_, report| {
+            now.saturating_sub(report.update_time_ms) <= FULL_BLOCK_REPORT_TTL_MS
+        });
+        let report = reports
+            .entry(list.worker_id)
+            .or_insert_with(|| FullBlockReportState {
+                total_len: list.total_len,
+                update_time_ms: now,
+                reported_blocks: HashSet::with_capacity(list.total_len as usize),
+            });
+
+        if report.total_len != list.total_len {
+            warn!(
+                "full block report for worker {} restarted because total_len changed from {} to {}; discarding {} accumulated block ids",
+                list.worker_id,
+                report.total_len,
+                list.total_len,
+                report.reported_blocks.len()
+            );
+            report.total_len = list.total_len;
+            report.reported_blocks.clear();
+            report.reported_blocks.reserve(list.total_len as usize);
+        }
+        report.update_time_ms = now;
+
+        for block in &list.blocks {
+            report.reported_blocks.insert(block.id);
+        }
+
+        if report.reported_blocks.len() as u64 >= report.total_len {
+            reports
+                .remove(&list.worker_id)
+                .map(|report| report.reported_blocks)
+        } else {
+            None
+        }
+    }
+
+    pub fn reset_full_block_report(&self, worker_id: u32) {
+        self.full_block_reports.lock().remove(&worker_id);
+    }
+
     /// Process block reports
-    pub fn block_report(&self, list: BlockReportList) -> FsResult<()> {
+    pub fn block_report(&self, list: BlockReportList) -> FsResult<Vec<i64>> {
         // @todo check cluster.
-        if list.blocks.is_empty() {
-            return Ok(());
+        let full_reported_blocks = self.collect_full_block_report(&list);
+        if list.blocks.is_empty() && full_reported_blocks.is_none() {
+            return Ok(Vec::new());
         }
 
         //(Whether to increase, block id, block location)
@@ -729,8 +793,29 @@ impl MasterFilesystem {
         }
         drop(wm);
 
+        let mut stale_block_ids = Vec::new();
         let mut fs_dir = self.fs_dir.write();
-        fs_dir.block_report(batch)
+        if let Some(reported_blocks) = full_reported_blocks {
+            let existing_blocks = fs_dir.get_worker_block_ids(list.worker_id)?;
+            for block_id in existing_blocks {
+                if !reported_blocks.contains(&block_id) {
+                    batch.push((false, block_id, BlockLocation::with_id(list.worker_id)));
+                    stale_block_ids.push(block_id);
+                }
+            }
+        }
+
+        fs_dir.block_report(batch)?;
+
+        if !stale_block_ids.is_empty() {
+            warn!(
+                "full block report reconciled {} stale block locations for worker {}",
+                stale_block_ids.len(),
+                list.worker_id
+            );
+        }
+
+        Ok(stale_block_ids)
     }
 
     pub fn delete_locations(&self, worker_id: u32) -> FsResult<Vec<i64>> {
