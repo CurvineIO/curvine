@@ -732,7 +732,7 @@ impl FsDir {
         self.store.create_checkpoint(id)
     }
 
-    pub fn restore<T: AsRef<str>>(&mut self, path: T) -> CommonResult<()> {
+    pub fn restore<T: AsRef<str>>(&mut self, path: T, checkpoint_size: u64) -> CommonResult<()> {
         let mut spend = TimeSpent::new();
         let path = path.as_ref();
 
@@ -751,10 +751,10 @@ impl FsDir {
         let time2 = spend.used_ms();
 
         info!(
-            "restore from {}, restore rocksdb used {} ms, \
-        build in-memory directory tree used {} ms, \
-        statistics updated during tree reconstruction, last_inode_id {}",
-            path, time1, time2, last_inode_id
+            "restore from {}, checkpoint_size={} bytes, restore_rocksdb={} ms, \
+        build_tree={} ms (see create_tree log for sub-phase breakdown), \
+        last_inode_id={}",
+            path, checkpoint_size, time1, time2, last_inode_id
         );
         Ok(())
     }

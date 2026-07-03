@@ -26,7 +26,7 @@ use curvine_common::raft::{RaftClient, RaftResult, RaftUtils};
 use curvine_common::state::RenameFlags;
 use curvine_common::utils::SerdeUtils;
 use log::{debug, error, info, warn};
-use orpc::common::{FileUtils, LocalTime};
+use orpc::common::{FileUtils, LocalTime, TimeSpent};
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel};
 use orpc::{err_box, ternary, CommonResult};
@@ -448,25 +448,56 @@ impl JournalLoader {
     }
 
     fn apply_snapshot0(&self, snapshot: SnapshotData) -> RaftResult<()> {
-        let mut fs_dir = self.fs_dir.write();
-        match snapshot.files_data {
-            None => {
-                let dir = fs_dir.get_checkpoint_path(LocalTime::mills());
-                FileUtils::create_dir(&dir, true)?;
-                fs_dir.restore(dir)?;
-                fs_dir.update_op_id(snapshot.fsm_state.op_id());
-            }
+        let mut spend = TimeSpent::new();
 
+        // Compute checkpoint_size outside the write lock to avoid adding
+        // filesystem traversal I/O to the restore critical section.
+        // The traversal is skipped entirely when info logging is disabled.
+        let (restore_path, checkpoint_size) = match &snapshot.files_data {
             Some(data) => {
-                fs_dir.restore(&data.dir)?;
-                fs_dir.update_op_id(snapshot.fsm_state.op_id());
+                let size = if log::log_enabled!(log::Level::Info) {
+                    FileUtils::dir_size(&data.dir).unwrap_or_else(|e| {
+                        warn!("failed to compute checkpoint size for {}: {}", data.dir, e);
+                        0
+                    })
+                } else {
+                    0
+                };
+                (data.dir.clone(), size)
             }
-        }
+            None => {
+                let dir = self.fs_dir.read().get_checkpoint_path(LocalTime::mills());
+                FileUtils::create_dir(&dir, true)?;
+                let size = if log::log_enabled!(log::Level::Info) {
+                    FileUtils::dir_size(&dir).unwrap_or_else(|e| {
+                        warn!("failed to compute checkpoint size for {}: {}", dir, e);
+                        0
+                    })
+                } else {
+                    0
+                };
+                (dir, size)
+            }
+        };
+
+        let mut fs_dir = self.fs_dir.write();
+        fs_dir.restore(&restore_path, checkpoint_size)?;
+        fs_dir.update_op_id(snapshot.fsm_state.op_id());
         drop(fs_dir);
+        let restore_ms = spend.used_ms();
+        spend.reset();
 
         self.mnt_mgr.restore();
+        let mount_ms = spend.used_ms();
 
         *self.fsm_state.lock().unwrap() = snapshot.fsm_state;
+
+        info!(
+            "apply_snapshot: fs_dir_restore={} ms, mount_restore={} ms, total={} ms",
+            restore_ms,
+            mount_ms,
+            restore_ms + mount_ms
+        );
 
         Ok(())
     }
