@@ -19,8 +19,8 @@ use curvine_common::raft::RaftClient;
 use curvine_common::utils::SerdeUtils;
 use curvine_common::FsResult;
 use orpc::common::{LocalTime, TimeSpent};
-use orpc::err_box;
 use orpc::sync::channel::BlockingReceiver;
+use orpc::CommonResult;
 use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
 use std::time::Duration;
@@ -35,17 +35,17 @@ pub struct SenderTask {
 }
 
 impl SenderTask {
-    pub fn new(client: RaftClient, conf: &JournalConf, batch_seq_id: u64) -> Self {
+    pub fn new(client: RaftClient, conf: &JournalConf, batch_seq_id: u64) -> CommonResult<Self> {
         let sender = Self {
             client,
             batch: JournalBatch::new(batch_seq_id),
             flush_batch_ms: conf.writer_flush_batch_ms,
             flush_batch_size: conf.writer_flush_batch_size,
             last_flush_ms: LocalTime::mills(),
-            metrics: Master::get_metrics(),
+            metrics: Master::get_metrics()?,
         };
 
-        sender
+        Ok(sender)
     }
 
     // Start a thread to execute sender task
@@ -55,7 +55,8 @@ impl SenderTask {
         let task = self;
         thread::Builder::new().name(name.clone()).spawn(move || {
             if let Err(e) = Self::loop0(receiver, poll, task) {
-                panic!("thread {} stop: {:?}", name, e);
+                log::error!("thread {} stop: {:?}; aborting master", name, e);
+                std::process::abort();
             }
         })?;
         Ok(())
@@ -71,7 +72,10 @@ impl SenderTask {
             let event = match receiver.recv_timeout(poll) {
                 Ok(v) => Some(v),
                 Err(RecvTimeoutError::Timeout) => None,
-                Err(e) => return err_box!("event loop: {}", e),
+                Err(RecvTimeoutError::Disconnected) => {
+                    task.flush_pending()?;
+                    return Ok(());
+                }
             };
             task.handle(event)?;
         }
@@ -92,24 +96,35 @@ impl SenderTask {
             return Ok(());
         }
 
-        if force
-            || len >= self.flush_batch_size
-            || LocalTime::mills() - self.last_flush_ms >= self.flush_batch_ms
-        {
-            let spend = TimeSpent::new();
-
-            let bytes = SerdeUtils::serialize(&self.batch)?;
-            self.client.block_on_send_propose(bytes)?;
-
-            self.metrics.journal_flush_count.inc();
-            self.metrics
-                .journal_flush_time
-                .inc_by(spend.used_us() as i64);
-
-            // Scroll to the next batch.
-            self.batch.next();
-            self.last_flush_ms = LocalTime::mills();
+        if force || len >= self.flush_batch_size || self.flush_interval_elapsed() {
+            self.flush_pending()?;
         }
+
+        Ok(())
+    }
+
+    fn flush_interval_elapsed(&self) -> bool {
+        LocalTime::mills() - self.last_flush_ms >= self.flush_batch_ms
+    }
+
+    fn flush_pending(&mut self) -> FsResult<()> {
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+
+        let spend = TimeSpent::new();
+
+        let bytes = SerdeUtils::serialize(&self.batch)?;
+        self.client.block_on_send_propose(bytes)?;
+
+        self.metrics.journal_flush_count.inc();
+        self.metrics
+            .journal_flush_time
+            .inc_by(spend.used_us() as i64);
+
+        // Scroll to the next batch.
+        self.batch.next();
+        self.last_flush_ms = LocalTime::mills();
 
         Ok(())
     }

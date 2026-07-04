@@ -33,7 +33,7 @@ use orpc::{err_box, ternary, CommonResult};
 use raft::eraftpb::Entry;
 use raft::StateRole;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use std::{fs, mem};
 
@@ -64,10 +64,10 @@ impl JournalLoader {
         mnt_mgr: Arc<MountManager>,
         conf: &JournalConf,
         job_manager: Arc<JobManager>,
-    ) -> Self {
+    ) -> CommonResult<Self> {
         let rt = conf.create_runtime();
         let client = RaftClient::from_conf(rt.clone(), conf);
-        let journal_writer = Arc::new(JournalWriter::new(true, client, conf));
+        let journal_writer = Arc::new(JournalWriter::new(true, client, conf)?);
         let log_store = RocksLogStorage::from_conf(conf, false);
         Self::build(
             rt,
@@ -90,7 +90,7 @@ impl JournalLoader {
         job_manager: Arc<JobManager>,
         log_store: RocksLogStorage,
         journal_writer: Arc<JournalWriter>,
-    ) -> Self {
+    ) -> CommonResult<Self> {
         Self::build(
             rt,
             fs_dir,
@@ -113,11 +113,11 @@ impl JournalLoader {
         log_store: RocksLogStorage,
         journal_writer: Arc<JournalWriter>,
         testing: bool,
-    ) -> Self {
+    ) -> CommonResult<Self> {
         let ufs_loader = UfsLoader::new(job_manager, conf);
         let (sender, receiver) = AsyncChannel::new(conf.writer_channel_size).split();
         let loader = Self {
-            node_id: conf.node_id().unwrap(),
+            node_id: conf.node_id()?,
             fs_dir,
             mnt_mgr,
             journal_writer,
@@ -131,7 +131,7 @@ impl JournalLoader {
             skip_failed_ufs_replay_after_retry: conf.skip_failed_ufs_replay_after_retry,
             batch_size: conf.scan_batch_size,
             retry_interval: Duration::from_secs(conf.retry_interval_secs),
-            metrics: Master::get_metrics(),
+            metrics: Master::get_metrics()?,
             has_apply_worker: !testing,
         };
 
@@ -142,11 +142,30 @@ impl JournalLoader {
             });
         }
 
-        loader
+        Ok(loader)
     }
 
-    fn get_ufs_applied(&self) -> AppliedIndex {
-        self.fsm_state.lock().unwrap().ufs_applied.clone()
+    fn fsm_state(&self) -> CommonResult<MutexGuard<'_, FsmState>> {
+        match self.fsm_state.lock() {
+            Ok(state) => Ok(state),
+            Err(e) => err_box!("fsm_state lock poisoned: {}", e),
+        }
+    }
+
+    fn fsm_state_snapshot(&self) -> CommonResult<FsmState> {
+        Ok(self.fsm_state()?.clone())
+    }
+
+    fn get_ufs_applied(&self) -> CommonResult<AppliedIndex> {
+        Ok(self.fsm_state()?.ufs_applied.clone())
+    }
+
+    fn abort_on_fatal_apply_error(message: impl AsRef<str>) -> ! {
+        error!(
+            "fatal journal apply error: {}; aborting master to avoid serving inconsistent metadata",
+            message.as_ref()
+        );
+        std::process::abort();
     }
 
     fn set_applied(
@@ -160,7 +179,7 @@ impl JournalLoader {
                 .log_ufs_applied(applied.op_id, applied.term, applied.index)?;
         }
 
-        let mut state = self.fsm_state.lock().unwrap();
+        let mut state = self.fsm_state()?;
         if is_leader {
             state.ufs_applied = applied.clone();
             state.applied = applied;
@@ -199,7 +218,7 @@ impl JournalLoader {
             return Ok(());
         }
 
-        let cur = self.get_fsm_state();
+        let cur = self.fsm_state_snapshot()?;
         let role_applied = ternary!(is_leader, cur.ufs_applied.index, cur.applied.index);
         if entry.index <= role_applied {
             info!(
@@ -292,7 +311,7 @@ impl JournalLoader {
             ApplyMsg::Scan(applied_index) => {
                 let mut last_applied = applied_index.index;
                 if is_leader && skip_ufs_error {
-                    last_applied = last_applied.max(self.get_fsm_state().ufs_applied.index);
+                    last_applied = last_applied.max(self.fsm_state_snapshot()?.ufs_applied.index);
                 }
 
                 let commit_index = self.log_store.hard_state().commit;
@@ -325,7 +344,7 @@ impl JournalLoader {
                 }
             }
 
-            _ => unreachable!(),
+            _ => err_box!("unsupported apply message in journal loader apply_msg"),
         }
     }
 
@@ -372,7 +391,15 @@ impl JournalLoader {
                 ApplyMsg::RoleChange(role) => {
                     is_leader = role == StateRole::Leader;
                     if is_leader {
-                        let ufs_applied = self.get_ufs_applied();
+                        let ufs_applied = match self.get_ufs_applied() {
+                            Ok(ufs_applied) => ufs_applied,
+                            Err(e) => {
+                                Self::abort_on_fatal_apply_error(format!(
+                                    "failed to read fsm_state after leader role change: {}",
+                                    e
+                                ));
+                            }
+                        };
                         info!("role changed to leader, scheduling UFS replay scan from ufs_applied: {:?}", ufs_applied);
                         retry_msg.replace(ApplyMsg::new_scan(ufs_applied));
                     }
@@ -402,27 +429,30 @@ impl JournalLoader {
                                     if let Err(skip_error) =
                                         self.apply_msg(is_leader, &msg, true).await
                                     {
-                                        panic!(
+                                        Self::abort_on_fatal_apply_error(format!(
                                             "apply entry failed while skipping failed UFS replay: {}",
                                             skip_error
-                                        );
+                                        ));
                                     }
                                     retry_num = 0;
                                     if continue_scan {
                                         retry_msg.replace(msg);
                                     }
                                 } else {
-                                    panic!(
+                                    Self::abort_on_fatal_apply_error(format!(
                                         "apply entry failed(retry_num={}): {}",
                                         retry_num, error
-                                    );
+                                    ));
                                 }
                             } else {
                                 error!("apply entry failed(retry_num={}): {}", retry_num, error);
                                 retry_msg.replace(msg);
                             }
                         } else {
-                            panic!("apply entry failed: {}", error);
+                            Self::abort_on_fatal_apply_error(format!(
+                                "apply entry failed on follower: {}",
+                                error
+                            ));
                         }
                     }
                 },
@@ -431,7 +461,7 @@ impl JournalLoader {
     }
 
     fn create_snapshot0(&self, dir_option: Option<String>) -> RaftResult<SnapshotData> {
-        let fsm_state = self.get_fsm_state();
+        let fsm_state = self.fsm_state_snapshot()?;
         let fs_dir = self.fs_dir.read();
         let dir = match dir_option {
             Some(dir) => dir,
@@ -487,10 +517,10 @@ impl JournalLoader {
         let restore_ms = spend.used_ms();
         spend.reset();
 
-        self.mnt_mgr.restore();
+        self.mnt_mgr.restore_best_effort();
         let mount_ms = spend.used_ms();
 
-        *self.fsm_state.lock().unwrap() = snapshot.fsm_state;
+        *self.fsm_state()? = snapshot.fsm_state;
 
         info!(
             "apply_snapshot: fs_dir_restore={} ms, mount_restore={} ms, total={} ms",
@@ -693,7 +723,7 @@ impl JournalLoader {
     }
 
     pub fn unmount(&self, entry: UnMountEntry) -> CommonResult<()> {
-        if !self.mnt_mgr.has_mounted(entry.id) {
+        if !self.mnt_mgr.has_mounted(entry.id)? {
             warn!("Unmount: id already unmounted: {:?}", entry);
             return Ok(());
         }
@@ -768,7 +798,7 @@ impl JournalLoader {
     }
 
     pub fn ufs_applied(&self, entry: UfsAppliedEntry) -> CommonResult<()> {
-        let mut lock = self.fsm_state.lock().unwrap();
+        let mut lock = self.fsm_state()?;
         lock.ufs_applied = AppliedIndex {
             op_id: entry.op_id,
             rpc_id: entry.rpc_id,
@@ -807,8 +837,8 @@ impl JournalLoader {
         let keep = self.retain_checkpoint_num.saturating_sub(1);
         let del_num = vec.len().saturating_sub(keep);
 
-        for i in 0..del_num {
-            let path = vec[i].1.as_path();
+        for (_, path) in vec.iter().take(del_num) {
+            let path = path.as_path();
             FileUtils::delete_path(path, true)?;
             info!("delete expired checkpoint: {}", path.to_string_lossy());
         }
@@ -844,7 +874,13 @@ impl AppStorage for JournalLoader {
     }
 
     fn get_fsm_state(&self) -> FsmState {
-        self.fsm_state.lock().unwrap().clone()
+        match self.fsm_state.lock() {
+            Ok(state) => state.clone(),
+            Err(e) => {
+                error!("fatal fsm_state lock poisoned: {}", e);
+                std::process::abort();
+            }
+        }
     }
 
     async fn role_change(&self, role: StateRole) -> RaftResult<()> {

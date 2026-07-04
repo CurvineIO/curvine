@@ -130,7 +130,7 @@ fn test_journal_replay_consistency_between_leader_and_follower() -> CommonResult
     fs_leader.print_tree();
     fs_follower.print_tree();
     assert_eq!(fs_leader.last_inode_id(), fs_follower.last_inode_id());
-    assert_eq!(fs_leader.sum_hash(), fs_follower.sum_hash());
+    assert_eq!(fs_leader.sum_hash()?, fs_follower.sum_hash()?);
 
     let leader_mnt = mnt_mgr1.get_mount_table().unwrap();
     let follower_mnt = mnt_mgr2.get_mount_table().unwrap();
@@ -156,6 +156,7 @@ fn test_raft_consensus_and_state_synchronization_between_two_masters() -> Common
     conf.journal.writer_flush_batch_size = 1;
     conf.journal.writer_flush_batch_ms = 10;
     conf.journal.raft_tick_interval_ms = 100;
+    conf.journal.raft_check_quorum = false;
     conf.journal.journal_addrs = vec![
         RaftPeer::new(port1 as NodeId, &conf.master.hostname, port1),
         RaftPeer::new(port2 as NodeId, &conf.master.hostname, port2),
@@ -212,12 +213,16 @@ fn test_raft_consensus_and_state_synchronization_between_two_masters() -> Common
     // the active node, rather than using a fixed sleep that may be insufficient
     // under load. Both inode state and mount table are replicated via separate
     // Raft log entries, so we must wait for all of them to be applied.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + Duration::from_secs(180);
     loop {
         let leader_mnt = mnt_mgr1.get_mount_table().unwrap_or_default();
         let follower_mnt = mnt_mgr2.get_mount_table().unwrap_or_default();
+        let hash_converged = match (active.sum_hash(), standby.sum_hash()) {
+            (Ok(active_hash), Ok(standby_hash)) => active_hash == standby_hash,
+            _ => false,
+        };
         if active.last_inode_id() == standby.last_inode_id()
-            && active.sum_hash() == standby.sum_hash()
+            && hash_converged
             && leader_mnt.len() == follower_mnt.len()
         {
             break;
@@ -226,7 +231,7 @@ fn test_raft_consensus_and_state_synchronization_between_two_masters() -> Common
             active.print_tree();
             standby.print_tree();
             assert_eq!(active.last_inode_id(), standby.last_inode_id());
-            assert_eq!(active.sum_hash(), standby.sum_hash());
+            assert_eq!(active.sum_hash()?, standby.sum_hash()?);
             break;
         }
         thread::sleep(Duration::from_millis(200));

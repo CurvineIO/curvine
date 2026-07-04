@@ -106,7 +106,10 @@ fn test_inode_store_create_tree_removes_orphan_edges() -> CommonResult<()> {
     )));
     {
         let rocks = RocksInodeStore::new(conf.clone(), true)?;
-        let store = InodeStore::new(rocks, Arc::new(TtlBucketList::new(60_000)));
+        let store = InodeStore::new(
+            rocks,
+            Arc::new(TtlBucketList::new(60_000).expect("valid ttl bucket interval")),
+        )?;
         let root = FsDir::create_root();
         let missing_inode_id = 2001;
 

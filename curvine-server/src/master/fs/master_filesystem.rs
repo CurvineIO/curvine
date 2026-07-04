@@ -114,7 +114,7 @@ impl MasterFilesystem {
             if opts.create_parent {
                 if let Some(last_inode) = inp.get_last_inode() {
                     if last_inode.is_dir() {
-                        let status = last_inode.to_file_status(inp.path());
+                        let status = last_inode.to_file_status(inp.path())?;
                         return Ok(status);
                     }
                 }
@@ -128,8 +128,12 @@ impl MasterFilesystem {
         }
 
         let inp = fs_dir.mkdir(inp, opts)?;
-        let last = try_option!(inp.get_last_inode());
-        let status = last.to_file_status(inp.path());
+        let last = try_option!(
+            inp.get_last_inode(),
+            "Path {} has no inode after mkdir",
+            inp.path()
+        );
+        let status = last.to_file_status(inp.path())?;
         Ok(status)
     }
 
@@ -442,7 +446,7 @@ impl MasterFilesystem {
     ) -> FsResult<Vec<WorkerAddress>> {
         let wm = self.worker_manager.read();
 
-        let mut inode = try_option!(inp.get_last_inode());
+        let mut inode = try_option!(inp.get_last_inode(), "File {} not exists", inp.path());
         let file = inode.as_file_mut()?;
         let validate_block = Self::validate_add_block(file, &client_addr, None)?;
 
@@ -526,7 +530,7 @@ impl MasterFilesystem {
         fs_dir.complete_file(&inp, len, commit_blocks, client_name, only_flush)?;
         if only_flush {
             let locs = self.get_block_locs(path, &fs_dir, file)?;
-            let status = inode.to_file_status(path);
+            let status = inode.to_file_status(path)?;
             Ok(Some(FileBlocks::new(status, locs)))
         } else {
             Ok(None)
@@ -542,7 +546,7 @@ impl MasterFilesystem {
         let inode = try_option!(inp.get_last_inode(), "File {} not exists", path);
         let file = inode.as_file_ref()?;
         let blocks = self.get_block_locs(path, fs_dir, file)?;
-        Ok(FileBlocks::new(inode.to_file_status(path), blocks))
+        Ok(FileBlocks::new(inode.to_file_status(path)?, blocks))
     }
 
     fn get_block_locs(
@@ -598,7 +602,7 @@ impl MasterFilesystem {
         let file = inode.as_file_ref()?;
         let block_locs = self.get_block_locs(path, &fs_dir, file)?;
         let locate_blocks = FileBlocks {
-            status: inode.to_file_status(path),
+            status: inode.to_file_status(path)?,
             block_locs,
         };
 
@@ -606,7 +610,7 @@ impl MasterFilesystem {
     }
 
     pub fn master_info(&self) -> FsResult<MasterInfo> {
-        let metrics = Master::get_metrics();
+        let metrics = Master::get_metrics()?;
         let mut info = MasterInfo {
             inode_dir_num: metrics.inode_dir_num.get(),
             inode_file_num: metrics.inode_file_num.get(),
@@ -654,7 +658,7 @@ impl MasterFilesystem {
         wm.add_test_worker(worker);
     }
 
-    pub fn sum_hash(&self) -> u128 {
+    pub fn sum_hash(&self) -> CommonResult<u128> {
         let fs_dir = self.fs_dir.read();
         fs_dir.sum_hash()
     }
@@ -915,14 +919,5 @@ impl MasterFilesystem {
         let inp = Self::resolve_path(&fs_dir, path)?;
 
         fs_dir.set_lock(inp, lock, self.conf.lock_expire_time_ms())
-    }
-}
-
-impl Default for MasterFilesystem {
-    fn default() -> Self {
-        let conf = ClusterConf::format();
-        let journal_system = JournalSystem::from_conf(&conf)
-            .expect("Failed to initialize JournalSystem from default ClusterConf");
-        journal_system.fs()
     }
 }

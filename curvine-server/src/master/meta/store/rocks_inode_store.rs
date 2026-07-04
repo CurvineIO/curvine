@@ -174,7 +174,7 @@ impl RocksInodeStore {
 
     pub fn add_mountpoint(&self, id: u32, entry: &MountInfo) -> CommonResult<()> {
         let key = RocksUtils::u8_u32_to_bytes(Self::PREFIX_MOUNT, id);
-        let value = Serde::serialize(entry).unwrap();
+        let value = Serde::serialize(entry)?;
         self.db.put_cf(Self::CF_COMMON, key, value)
     }
 
@@ -192,7 +192,7 @@ impl RocksInodeStore {
             None => Ok(None),
 
             Some(v) => {
-                let info: MountInfo = Serde::deserialize(&v)?;
+                let info = MountInfo::decode_persisted(&v)?;
                 Ok(Some(info))
             }
         }
@@ -203,7 +203,7 @@ impl RocksInodeStore {
         let mut vec = Vec::with_capacity(8);
         for item in iter {
             let bytes = item?;
-            let mnt = Serde::deserialize::<MountInfo>(&bytes.1)?;
+            let mnt = MountInfo::decode_persisted(&bytes.1)?;
             vec.push(mnt);
         }
 
@@ -250,7 +250,10 @@ impl Iterator for InodeChildrenIter<'_> {
                 Err(e) => Some(Err(e.into())),
 
                 Ok(bytes) => {
-                    let id = RocksUtils::i64_from_bytes(&bytes.1).unwrap();
+                    let id = match RocksUtils::i64_from_bytes(&bytes.1) {
+                        Ok(id) => id,
+                        Err(e) => return Some(Err(e)),
+                    };
                     Some(Ok(id))
                 }
             }

@@ -36,7 +36,11 @@ impl InodePath {
         store: &InodeStore,
     ) -> CommonResult<Self> {
         let components = InodeView::path_components(path.as_ref())?;
-        let name = try_option!(components.last());
+        let name = try_option!(
+            components.last(),
+            "Path {} has no components",
+            path.as_ref()
+        );
 
         if name.is_empty() {
             return err_box!("Path {} is invalid", path.as_ref());
@@ -213,9 +217,10 @@ impl InodePath {
                     // Check the child node name is a glob pattern or not
                     let (is_glob_pattern, glob_pattern) = parse_glob_pattern(child_name_str);
                     if is_glob_pattern {
-                        if let Some(children) =
-                            d.get_child_ptr_by_glob_pattern(&glob_pattern.unwrap())
-                        {
+                        let Some(glob_pattern) = glob_pattern else {
+                            return err_box!("invalid glob pattern: {}", child_name_str);
+                        };
+                        if let Some(children) = d.get_child_ptr_by_glob_pattern(&glob_pattern) {
                             for child_ptr in children.iter() {
                                 parent_map.insert(
                                     child_ptr.as_ref().id(),

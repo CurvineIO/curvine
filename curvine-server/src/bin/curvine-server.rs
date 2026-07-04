@@ -38,7 +38,7 @@ fn main() -> CommonResult<()> {
         ServiceType::Master => {
             conf.check_master_hostname()?;
             let master = Master::with_conf(conf)?;
-            master.block_on_start();
+            master.block_on_start()?;
         }
 
         ServiceType::Worker => {
