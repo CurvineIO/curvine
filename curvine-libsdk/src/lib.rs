@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod core;
+
 mod lib_filesystem;
 pub use self::lib_filesystem::LibFilesystem;
 
@@ -23,6 +25,15 @@ pub use self::lib_fs_writer::LibFsWriter;
 
 mod lib_fs_reader;
 pub use self::lib_fs_reader::LibFsReader;
+
+#[cfg(feature = "rust-sdk")]
+pub mod filesystem;
+#[cfg(feature = "rust-sdk")]
+pub mod job;
+#[cfg(feature = "rust-sdk")]
+pub mod lib_curvine;
+#[cfg(feature = "rust-sdk")]
+pub mod master;
 
 #[cfg(feature = "python-sdk")]
 pub mod python;

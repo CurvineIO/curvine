@@ -14,6 +14,13 @@
 
 use crate::fs::operator::*;
 use crate::fs::state::{CleanerTask, FileHandle, NodeState};
+use crate::fuse_metrics::{
+    ReaddirTimer, CACHE_LIST, CACHE_RESULT_HIT, CACHE_RESULT_MISS, CACHE_RESULT_PUT, CACHE_STATUS,
+    INVAL_REASON_CREATE, INVAL_REASON_FLUSH, INVAL_REASON_FSYNC, INVAL_REASON_LINK,
+    INVAL_REASON_MKDIR, INVAL_REASON_OPEN_WRITE, INVAL_REASON_RELEASE, INVAL_REASON_REMOVEXATTR,
+    INVAL_REASON_RENAME, INVAL_REASON_RESIZE, INVAL_REASON_RMDIR, INVAL_REASON_SETATTR,
+    INVAL_REASON_SETXATTR, INVAL_REASON_SYMLINK, INVAL_REASON_UNLINK,
+};
 use crate::raw::fuse_abi::*;
 use crate::raw::FuseDirentList;
 use crate::session::{FuseBuf, FuseResponse};
@@ -260,6 +267,29 @@ impl CurvineFileSystem {
         arg: &fuse_read_in,
         plus: bool,
     ) -> FuseResult<FuseDirentList> {
+        // Phase 3a readdir metrics: time the whole batch. A `ReaddirTimer` guard
+        // records `readdir_duration_us{status=error}` on drop unless `success(n)`
+        // is called on the Ok path (which records duration + `readdir_entries`).
+        // This way an early `?` return or an async cancellation between awaits is
+        // counted as an error with no `entries` observation (D6 / P2-4). Gated on
+        // the `metrics_enabled` kill-switch: disabled → `None`, no timing at all.
+        let timer = ReaddirTimer::start(self.conf.metrics_enabled);
+        let (res, entries) = self.read_dir_common_inner(header, arg, plus).await?;
+        if let Some(timer) = timer {
+            timer.success(entries);
+        }
+        Ok(res)
+    }
+
+    /// Returns the encoded dirent list plus the number of entries successfully
+    /// added this batch (`index - arg.offset`), which is what `readdir_entries`
+    /// observes — NOT `FuseDirentList`'s byte length and NOT the directory total.
+    async fn read_dir_common_inner(
+        &self,
+        header: &fuse_in_header,
+        arg: &fuse_read_in,
+        plus: bool,
+    ) -> FuseResult<(FuseDirentList, u64)> {
         let handle = self.state.find_dir_handle(header.nodeid, arg.fh)?;
 
         let mut res = FuseDirentList::new(arg);
@@ -272,7 +302,14 @@ impl CurvineFileSystem {
                     if self.conf.enable_meta_cache {
                         let path = Path::from_str(&status.path)?;
                         self.state.meta_cache().put_status(&path, status.clone());
+                        // readdir populates the status cache too; count it as a
+                        // status-cache put (same as get_cached_status), else
+                        // directory-heavy workloads under-report puts. Gated by
+                        // metrics_enabled via record_meta_cache.
+                        self.record_meta_cache(CACHE_STATUS, CACHE_RESULT_PUT);
                     }
+                    // record=false: readdir dentry materialization is NOT a user
+                    // Lookup and must not enter node_cache_total.
                     map.do_lookup(header.nodeid, Some(&status.name), &status)?
                 } else {
                     Self::status_to_attr(&self.conf, &status)?
@@ -288,7 +325,12 @@ impl CurvineFileSystem {
         }
         handle.set_buf(batch).await?;
 
-        Ok(res)
+        // `index` starts at `arg.offset` and only increases (inc'd once per
+        // successful add_dirent), so this never underflows today; use
+        // saturating_sub to keep it panic-safe if that invariant ever changes
+        // (review #961).
+        let entries = index.saturating_sub(arg.offset);
+        Ok((res, entries))
     }
 
     async fn check_permissions(
@@ -534,24 +576,35 @@ impl CurvineFileSystem {
             } else {
                 return err_fuse!(libc::EACCES);
             }
+        } else if let Some(writer) = self.state.find_writer(&ino) {
+            writer.lock().await.resize(opts).await?;
         } else {
             self.fs.resize(path, opts).await?;
         };
 
-        self.invalidate_cache(path)?;
+        // `fs_resize` is reached from both `set_attr` (truncate) and `allocate`
+        // (fallocate), so `reason=resize` covers both; a truncate-via-setattr also
+        // emits a separate `setattr` invalidation for the same logical op.
+        self.invalidate_cache(path, INVAL_REASON_RESIZE)?;
         Ok(())
     }
 
     async fn get_cached_status(&self, path: &Path) -> FuseResult<FileStatus> {
         if self.conf.enable_meta_cache {
             if let Some(status) = self.state.meta_cache().get_status(path) {
+                self.record_meta_cache(CACHE_STATUS, CACHE_RESULT_HIT);
                 return Ok(status);
             }
+            // Miss recorded the moment the cache read returns None (before the
+            // backend fetch), so a backend error/ENOENT after a miss is still in
+            // the hit-rate denominator.
+            self.record_meta_cache(CACHE_STATUS, CACHE_RESULT_MISS);
         }
 
         let status = self.fs_get_status(path).await?;
         if self.conf.enable_meta_cache {
             self.state.meta_cache().put_status(path, status.clone());
+            self.record_meta_cache(CACHE_STATUS, CACHE_RESULT_PUT);
         }
 
         Ok(status)
@@ -560,8 +613,10 @@ impl CurvineFileSystem {
     pub async fn get_cached_list(&self, path: &Path) -> FuseResult<Vec<FileStatus>> {
         if self.conf.enable_meta_cache {
             if let Some(list) = self.state.meta_cache().get_list(path) {
+                self.record_meta_cache(CACHE_LIST, CACHE_RESULT_HIT);
                 return Ok(list);
             }
+            self.record_meta_cache(CACHE_LIST, CACHE_RESULT_MISS);
         }
 
         let list = self.fs.list_status(path).await?;
@@ -574,19 +629,52 @@ impl CurvineFileSystem {
 
         if self.conf.enable_meta_cache {
             self.state.meta_cache().put_list(path, res.clone());
+            self.record_meta_cache(CACHE_LIST, CACHE_RESULT_PUT);
         }
 
         Ok(res)
     }
-    fn invalidate_cache(&self, path: &Path) -> FuseResult<()> {
+
+    /// Emit `user_meta_cache_total{cache,status}`, gated on the `metrics_enabled`
+    /// observation kill-switch (distinct from the `enable_meta_cache` feature
+    /// gate — D10/D11). A no-op when metrics are disabled, so a disabled mount
+    /// pays no label-lookup / counter cost and exposes no series.
+    fn record_meta_cache(&self, cache: &'static str, status: &'static str) {
+        if self.conf.metrics_enabled {
+            FuseMetrics::with(|m| m.record_user_meta_cache(cache, status));
+        }
+    }
+
+    /// Emit `negative_entry_returned_total`, gated on the `metrics_enabled`
+    /// observation kill-switch. No-op when metrics are disabled.
+    fn record_negative_entry(&self) {
+        if self.conf.metrics_enabled {
+            FuseMetrics::with(|m| m.record_negative_entry());
+        }
+    }
+
+    /// Invalidate the MetaCache entries for `path` (and its parent listing) on a
+    /// mutation. `reason` is a static call-site reason for the
+    /// `user_meta_cache_invalidations_total{cache,reason}` counter; it does not
+    /// change which entries are invalidated. The counter records the *requested*
+    /// invalidation per affected cache namespace (see `record_invalidation`), not
+    /// confirmed removals.
+    fn invalidate_cache(&self, path: &Path, reason: &'static str) -> FuseResult<()> {
         if !self.conf.enable_meta_cache {
             return Ok(());
         }
 
         self.state.meta_cache().invalidate(path);
 
-        if let Ok(Some(parent)) = path.parent() {
+        let has_parent = if let Ok(Some(parent)) = path.parent() {
             self.state.meta_cache().invalidate_list(&parent);
+            true
+        } else {
+            false
+        };
+        // `metrics_enabled` observation gate (separate from the feature gate above).
+        if self.conf.metrics_enabled {
+            FuseMetrics::with(|m| m.record_invalidation(reason, has_parent));
         }
 
         Ok(())
@@ -630,10 +718,18 @@ impl fs::FileSystem for CurvineFileSystem {
             out_flags &= !FUSE_WRITEBACK_CACHE;
         }
 
+        // If `fuse.max_readahead_kb` is configured, raise the negotiated
+        // `max_readahead` so the kernel cap (min(bdi.max_readahead_kb,
+        // fuse_conn.max_readahead)) does not silently shrink reads.
+        let max_readahead = match self.conf.max_readahead_kb {
+            Some(kb) => op.arg.max_readahead.max(kb.saturating_mul(1024)),
+            None => op.arg.max_readahead,
+        };
+
         let out = fuse_init_out {
             major: op.arg.major,
             minor: op.arg.minor,
-            max_readahead: op.arg.max_readahead,
+            max_readahead,
             flags: out_flags,
             max_background: self.conf.max_background,
             congestion_threshold: self.conf.congestion_threshold,
@@ -683,12 +779,23 @@ impl fs::FileSystem for CurvineFileSystem {
         let status = match self.get_cached_status(&path).await {
             Ok(s) => s,
             Err(e) if e.errno == libc::ENOENT && !self.conf.negative_ttl.is_zero() => {
+                self.record_negative_entry();
                 return Ok(negative_entry());
             }
             Err(e) => return Err(e),
         };
 
-        let res = self.lookup_status(parent, name.as_deref(), &status);
+        // Real FUSE Lookup path: record the NodeMap-dcache hit/miss when metrics
+        // are enabled. `is_real_lookup=true` distinguishes this from the internal
+        // `do_lookup` callers (readdir, mkdir, create, link, symlink); the
+        // `metrics_enabled` flag is the observation gate — both must hold to emit.
+        let res = self.state.do_lookup_recorded(
+            parent,
+            name.as_deref(),
+            &status,
+            true,
+            self.conf.metrics_enabled,
+        );
 
         let entry = match res {
             Ok(mut attr) => {
@@ -697,6 +804,7 @@ impl fs::FileSystem for CurvineFileSystem {
             }
 
             Err(e) if e.errno == libc::ENOENT && !self.conf.negative_ttl.is_zero() => {
+                self.record_negative_entry();
                 negative_entry()
             }
 
@@ -804,7 +912,7 @@ impl fs::FileSystem for CurvineFileSystem {
         };
 
         let _ = self.fs_set_attr(&path, opts).await?;
-        self.invalidate_cache(&path)?;
+        self.invalidate_cache(&path, INVAL_REASON_SETXATTR)?;
         Ok(())
     }
 
@@ -838,7 +946,7 @@ impl fs::FileSystem for CurvineFileSystem {
         };
 
         let _ = self.fs_set_attr(&path, opts).await?;
-        self.invalidate_cache(&path)?;
+        self.invalidate_cache(&path, INVAL_REASON_REMOVEXATTR)?;
         Ok(())
     }
 
@@ -961,7 +1069,7 @@ impl fs::FileSystem for CurvineFileSystem {
             }
         }
 
-        self.invalidate_cache(&path)?;
+        self.invalidate_cache(&path, INVAL_REASON_SETATTR)?;
         let mut attr = Self::status_to_attr(&self.conf, &status)?;
         attr.ino = op.header.nodeid;
 
@@ -1073,7 +1181,7 @@ impl fs::FileSystem for CurvineFileSystem {
             }
         };
 
-        self.invalidate_cache(&path)?;
+        self.invalidate_cache(&path, INVAL_REASON_MKDIR)?;
         let entry = self.lookup_status(op.header.nodeid, Some(name), &status)?;
         Ok(Self::create_entry_out(&self.conf, entry))
     }
@@ -1171,7 +1279,7 @@ impl fs::FileSystem for CurvineFileSystem {
         // 2. Overwrite operations may change file metadata (size, mtime) immediately
         // 3. Ensures subsequent read operations get fresh metadata
         if action.write() {
-            self.invalidate_cache(&path)?;
+            self.invalidate_cache(&path, INVAL_REASON_OPEN_WRITE)?;
         }
 
         Ok(entry)
@@ -1212,7 +1320,7 @@ impl fs::FileSystem for CurvineFileSystem {
             .await?;
 
         let attr = self.lookup_status(id, Some(name), handle.status())?;
-        self.invalidate_cache(&path)?;
+        self.invalidate_cache(&path, INVAL_REASON_CREATE)?;
         let r = fuse_create_out(
             fuse_entry_out {
                 nodeid: handle.ino,
@@ -1245,7 +1353,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let path = Path::from_str(&handle.status.path)?;
         if handle.writer.is_some() {
-            self.invalidate_cache(&path)?;
+            self.invalidate_cache(&path, INVAL_REASON_FLUSH)?;
         }
         Ok(())
     }
@@ -1276,7 +1384,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let path = Path::from_str(&handle.status.path)?;
         if handle.writer.is_some() {
-            self.invalidate_cache(&path)?;
+            self.invalidate_cache(&path, INVAL_REASON_RELEASE)?;
         }
 
         Ok(())
@@ -1295,7 +1403,7 @@ impl fs::FileSystem for CurvineFileSystem {
             self.fs.delete(&path, false).await?;
         }
         self.state.unlink_node(parent_ino, Some(name))?;
-        self.invalidate_cache(&path)?;
+        self.invalidate_cache(&path, INVAL_REASON_UNLINK)?;
 
         Ok(())
     }
@@ -1316,8 +1424,8 @@ impl fs::FileSystem for CurvineFileSystem {
         let src_status = self.get_cached_status(&src_path).await?;
         self.state.find_link_inode(src_status.id, oldnodeid);
 
-        self.invalidate_cache(&des_path)?;
-        self.invalidate_cache(&src_path)?;
+        self.invalidate_cache(&des_path, INVAL_REASON_LINK)?;
+        self.invalidate_cache(&src_path, INVAL_REASON_LINK)?;
 
         let attr = self
             .lookup_path(op.header.nodeid, Some(name), &des_path)
@@ -1334,7 +1442,7 @@ impl fs::FileSystem for CurvineFileSystem {
         self.fs.delete(&path, false).await?;
         self.state.unlink_node(op.header.nodeid, Some(name))?;
 
-        self.invalidate_cache(&path)?;
+        self.invalidate_cache(&path, INVAL_REASON_RMDIR)?;
         Ok(())
     }
 
@@ -1354,8 +1462,8 @@ impl fs::FileSystem for CurvineFileSystem {
         self.state
             .rename_node(op.header.nodeid, old_name, op.arg.newdir, new_name)?;
 
-        self.invalidate_cache(&old_path)?;
-        self.invalidate_cache(&new_path)?;
+        self.invalidate_cache(&old_path, INVAL_REASON_RENAME)?;
+        self.invalidate_cache(&new_path, INVAL_REASON_RENAME)?;
 
         Ok(())
     }
@@ -1387,7 +1495,7 @@ impl fs::FileSystem for CurvineFileSystem {
         let link_path = self.state.get_path_common(parent, linkname)?;
         self.fs.symlink(target, &link_path, false).await?;
 
-        self.invalidate_cache(&link_path)?;
+        self.invalidate_cache(&link_path, INVAL_REASON_SYMLINK)?;
 
         let entry = self.lookup_path(parent, linkname, &link_path).await?;
         Ok(Self::create_entry_out(&self.conf, entry))
@@ -1427,7 +1535,7 @@ impl fs::FileSystem for CurvineFileSystem {
         handle.flush(Some(reply)).await?;
 
         let path = Path::from_str(&handle.status.path)?;
-        self.invalidate_cache(&path)?;
+        self.invalidate_cache(&path, INVAL_REASON_FSYNC)?;
         Ok(())
     }
 
@@ -1542,6 +1650,12 @@ impl fs::FileSystem for CurvineFileSystem {
         let mut ticks = 0;
         let time = TimeSpent::new();
 
+        // NOTE: `setlkw_wait_duration_us` is NOT observed here. Its RAII timer is
+        // created one layer up, in `FuseReceiver::dispatch_meta_interrupt` before
+        // the `select!`, so that an interrupt arriving before this poll loop ever
+        // runs still records a wait sample. Observing it here would miss exactly
+        // that immediate-cancellation case. See the comment there.
+
         let lock = self.to_file_lock(op.arg);
         loop {
             let conflict = self.fs.set_lock(&path, lock.clone()).await?;
@@ -1566,5 +1680,59 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn restore(&self, reader: &mut StateReader) -> FuseResult<()> {
         self.state.restore(reader).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Pin the production init-order invariant that Phase 1b-2 depends on:
+    /// `FuseMetrics::ensure_init()` MUST run before `NodeState::new()` in
+    /// `CurvineFileSystem::new`. After 1b-2 removed the scrape-time
+    /// `set_metrics()` refresh, the legacy gauges are only correct if their
+    /// event-driven updates (routed through `FuseMetrics::with`) land on an
+    /// initialized singleton; the `NodeMap::new` root baseline `set(1)` is the
+    /// first such update and fires inside `NodeState::new`. If a refactor moved
+    /// `ensure_init()` after `NodeState::new` (or dropped it), that baseline —
+    /// and every subsequent inc/dec — would be silently no-op'd by `with`, and
+    /// the gauges would drift permanently low with no panic.
+    ///
+    /// A behavioral assertion (construct, then check the singleton is init) is
+    /// useless here: the process-global `OnceCell` is already initialized by
+    /// other tests in this binary, so it would pass even if `ensure_init` were
+    /// deleted. We assert on the source text instead, which catches both a
+    /// reordering and an outright removal.
+    ///
+    /// The search is scoped to the body of `fn new` so the literals in this
+    /// test's own doc comment / assert message do not satisfy `find()` — that
+    /// self-reference would make the `.expect` guards dead (the strings always
+    /// exist in this file) and let a removal of the real call slip through by
+    /// matching the prose instead. Slicing to `fn new` keeps `.expect` a real
+    /// "the call was deleted" guard.
+    #[test]
+    fn ensure_init_precedes_node_state() {
+        let src = include_str!("curvine_file_system.rs");
+        let body_start = src
+            .find("pub fn new(conf: ClusterConf")
+            .expect("CurvineFileSystem::new signature not found");
+        // First method after `new`; bounds the body so later occurrences (incl.
+        // this test's own text) are excluded.
+        let body_end = body_start
+            + src[body_start..]
+                .find("pub fn state(")
+                .expect("CurvineFileSystem::state not found after new()");
+        let body = &src[body_start..body_end];
+
+        let init_at = body
+            .find("FuseMetrics::ensure_init()")
+            .expect("CurvineFileSystem::new must call FuseMetrics::ensure_init()");
+        let node_state_at = body
+            .find("NodeState::new(")
+            .expect("CurvineFileSystem::new must construct NodeState::new(..)");
+        assert!(
+            init_at < node_state_at,
+            "FuseMetrics::ensure_init() must precede NodeState::new() in \
+             CurvineFileSystem::new so the legacy gauges' event-driven updates \
+             (FuseMetrics::with) land on an initialized singleton"
+        );
     }
 }

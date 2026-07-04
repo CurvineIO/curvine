@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::oss_hdfs::callback_ctx::{I64CallbackCtx, StatusCallbackCtx};
+use crate::oss_hdfs::check_jindo_status;
 use crate::oss_hdfs::ffi::*;
 use bytes::BytesMut;
 use curvine_common::error::FsError;
@@ -21,6 +22,7 @@ use curvine_common::state::FileStatus;
 use curvine_common::FsResult;
 use orpc::sys::DataSlice;
 use std::os::raw::c_void;
+use std::sync::Arc;
 
 // Extension methods for OSS-HDFS Writer
 impl OssHdfsWriter {
@@ -49,26 +51,22 @@ impl OssHdfsWriter {
             err: *const std::os::raw::c_char,
             userdata: *mut c_void,
         ) {
-            let ctx = unsafe { &*(userdata as *const I64CallbackCtx) };
-            ctx.complete(status, value, err);
+            unsafe { I64CallbackCtx::complete_userdata(userdata, status, value, err) };
         }
 
         {
-            let userdata = (&self.tell_ctx as *const I64CallbackCtx) as *mut c_void;
+            let userdata = I64CallbackCtx::into_userdata(&self.tell_ctx);
             let start_status =
                 unsafe { jindo_writer_tell_async(handle.as_raw(), Some(cb), userdata) };
             if start_status != JindoStatus::Ok {
-                return Err(FsError::common(format!(
-                    "Failed to start tell: {}",
-                    jindo_last_error()
-                )));
+                unsafe { I64CallbackCtx::drop_userdata(userdata) };
+                check_jindo_status(start_status, "Failed to start tell", None)?;
             }
         }
 
         let (status, offset, err) = self.tell_ctx.wait().await?;
         if status != JindoStatus::Ok {
-            let msg = err.unwrap_or_else(jindo_last_error);
-            return Err(FsError::common(format!("Failed to tell: {}", msg)));
+            check_jindo_status(status, "Failed to tell", err)?;
         }
         Ok(offset)
     }
@@ -83,11 +81,11 @@ pub struct OssHdfsWriter {
     pub(crate) chunk_size: usize,
     pub(crate) chunk: BytesMut,
     // Reusable callback context for async write.
-    pub(crate) write_ctx: I64CallbackCtx,
+    pub(crate) write_ctx: Arc<I64CallbackCtx>,
     // Reusable callback context for async tell.
-    pub(crate) tell_ctx: I64CallbackCtx,
+    pub(crate) tell_ctx: Arc<I64CallbackCtx>,
     // Reusable callback context for async operations returning just status (flush/close).
-    pub(crate) status_ctx: StatusCallbackCtx,
+    pub(crate) status_ctx: Arc<StatusCallbackCtx>,
 }
 
 impl Writer for OssHdfsWriter {
@@ -148,31 +146,24 @@ impl Writer for OssHdfsWriter {
             err: *const std::os::raw::c_char,
             userdata: *mut c_void,
         ) {
-            // `userdata` points to a long-lived `I64CallbackCtx` owned by `OssHdfsWriter`.
-            let ctx = unsafe { &*(userdata as *const I64CallbackCtx) };
-            ctx.complete(status, value, err);
+            unsafe { I64CallbackCtx::complete_userdata(userdata, status, value, err) };
         }
 
         let handle = self.writer_handle()?;
         {
-            // IMPORTANT: keep raw pointer userdata scoped to this block so this Future remains Send.
-            let userdata = (&self.write_ctx as *const I64CallbackCtx) as *mut c_void;
+            let userdata = I64CallbackCtx::into_userdata(&self.write_ctx);
             let start_status = unsafe {
                 jindo_writer_write_async(handle.as_raw(), data_ptr, data_len, Some(cb), userdata)
             };
             if start_status != JindoStatus::Ok {
-                let err_msg = jindo_last_error();
-                return Err(FsError::common(format!(
-                    "Failed to start write: {}",
-                    err_msg
-                )));
+                unsafe { I64CallbackCtx::drop_userdata(userdata) };
+                check_jindo_status(start_status, "Failed to start write", None)?;
             }
         }
 
         let (status, written, err) = self.write_ctx.wait().await?;
         if status != JindoStatus::Ok {
-            let err_msg = err.unwrap_or_else(jindo_last_error);
-            return Err(FsError::common(format!("Failed to write: {}", err_msg)));
+            check_jindo_status(status, "Failed to write", err)?;
         }
         if written != len {
             return Err(FsError::common(format!(
@@ -194,27 +185,22 @@ impl Writer for OssHdfsWriter {
             err: *const std::os::raw::c_char,
             userdata: *mut c_void,
         ) {
-            let ctx = unsafe { &*(userdata as *const StatusCallbackCtx) };
-            ctx.complete(status, err);
+            unsafe { StatusCallbackCtx::complete_userdata(userdata, status, err) };
         }
 
         {
-            let userdata = (&self.status_ctx as *const StatusCallbackCtx) as *mut c_void;
+            let userdata = StatusCallbackCtx::into_userdata(&self.status_ctx);
             let start_status =
                 unsafe { jindo_writer_flush_async(handle.as_raw(), Some(cb), userdata) };
             if start_status != JindoStatus::Ok {
-                let err_msg = jindo_last_error();
-                return Err(FsError::common(format!(
-                    "Failed to start flush: {}",
-                    err_msg
-                )));
+                unsafe { StatusCallbackCtx::drop_userdata(userdata) };
+                check_jindo_status(start_status, "Failed to start flush", None)?;
             }
         }
 
         let (status, err) = self.status_ctx.wait().await?;
         if status != JindoStatus::Ok {
-            let err_msg = err.unwrap_or_else(jindo_last_error);
-            return Err(FsError::common(format!("Failed to flush: {}", err_msg)));
+            check_jindo_status(status, "Failed to flush", err)?;
         }
         Ok(())
     }
@@ -225,27 +211,23 @@ impl Writer for OssHdfsWriter {
 
         if let Some(handle) = handle {
             self.status_ctx.reset();
-            let userdata = (&self.status_ctx as *const StatusCallbackCtx) as *mut c_void;
+            let userdata = StatusCallbackCtx::into_userdata(&self.status_ctx);
             extern "C" fn cb(
                 status: JindoStatus,
                 err: *const std::os::raw::c_char,
                 userdata: *mut c_void,
             ) {
-                let ctx = unsafe { &*(userdata as *const StatusCallbackCtx) };
-                ctx.complete(status, err);
+                unsafe { StatusCallbackCtx::complete_userdata(userdata, status, err) };
             }
 
             let start_status =
                 unsafe { jindo_writer_close_async(handle.as_raw(), Some(cb), userdata) };
             if start_status != JindoStatus::Ok {
+                unsafe { StatusCallbackCtx::drop_userdata(userdata) };
                 unsafe {
                     jindo_writer_free(handle.as_raw());
                 }
-                let err_msg = jindo_last_error();
-                return Err(FsError::common(format!(
-                    "Failed to start close writer: {}",
-                    err_msg
-                )));
+                check_jindo_status(start_status, "Failed to start close writer", None)?;
             }
 
             let (status, err) = self.status_ctx.wait().await?;
@@ -253,11 +235,7 @@ impl Writer for OssHdfsWriter {
             unsafe { jindo_writer_free(handle.as_raw()) };
 
             if status != JindoStatus::Ok {
-                let err_msg = err.unwrap_or_else(jindo_last_error);
-                return Err(FsError::common(format!(
-                    "Failed to close writer: {}",
-                    err_msg
-                )));
+                check_jindo_status(status, "Failed to close writer", err)?;
             }
         }
         Ok(())

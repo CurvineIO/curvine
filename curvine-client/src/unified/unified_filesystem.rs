@@ -19,7 +19,7 @@ use crate::ClientMetrics;
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, FsKind, ListStream, Path, Reader, Writer};
+use curvine_common::fs::{FileSystem, FsKind, ListStream, Path, Reader, RpcCode, Writer};
 use curvine_common::state::{
     CreateFileOpts, FileAllocOpts, FileLock, FileStatus, FreeResult, JobStatus, ListOptions,
     LoadJobCommand, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags,
@@ -135,8 +135,12 @@ impl UnifiedFileSystem {
         self.cv.fs_client()
     }
 
-    // Check if the path is a mount point, if so, return the mount point information
-    pub async fn get_mount(&self, path: &Path) -> FsResult<Option<(Path, Arc<MountValue>)>> {
+    // Check if the path is a mount point, if so, return the mount point information.
+    pub async fn get_mount(
+        &self,
+        path: &Path,
+        rpc_code: RpcCode,
+    ) -> FsResult<Option<(Path, Arc<MountValue>)>> {
         if !path.is_cv() {
             return err_box!("path is not curvine path");
         }
@@ -147,6 +151,13 @@ impl UnifiedFileSystem {
 
         let state = self.mount_cache.get_mount(self, path).await?;
         if let Some(mnt) = state {
+            if mnt.info.is_read_only_cache_mode() && Self::is_mount_write_rpc(rpc_code) {
+                return err_ext!(FsError::unsupported(format!(
+                    "{} on read_only cache_mode mount {}",
+                    rpc_code, path
+                )));
+            }
+
             let ufs_path = mnt.get_ufs_path(path)?;
             Ok(Some((ufs_path, mnt)))
         } else {
@@ -154,11 +165,28 @@ impl UnifiedFileSystem {
         }
     }
 
+    fn is_mount_write_rpc(rpc_code: RpcCode) -> bool {
+        matches!(
+            rpc_code,
+            RpcCode::Mkdir
+                | RpcCode::Delete
+                | RpcCode::CreateFile
+                | RpcCode::AppendFile
+                | RpcCode::Rename
+                | RpcCode::SetAttr
+                | RpcCode::Symlink
+                | RpcCode::Link
+                | RpcCode::ResizeFile
+                | RpcCode::SetLock
+        )
+    }
+
     pub async fn get_mount_checked(
         &self,
         path: &Path,
+        rpc_code: RpcCode,
     ) -> FsResult<Option<(Path, Arc<MountValue>)>> {
-        match self.get_mount(path).await? {
+        match self.get_mount(path, rpc_code).await? {
             Some(v) if v.1.info.is_cache_mode() => Ok(Some(v)),
             _ => Ok(None),
         }
@@ -234,7 +262,7 @@ impl UnifiedFileSystem {
 
     pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
         let fut = async {
-            match self.get_mount(path).await? {
+            match self.get_mount(path, RpcCode::Free).await? {
                 None => err_box!(
                     "the current path is not mounted to ufs, so the `free` command cannot be executed."
                 ),
@@ -246,7 +274,7 @@ impl UnifiedFileSystem {
 
     pub async fn symlink(&self, target: &str, link: &Path, force: bool) -> FsResult<()> {
         let fut = async {
-            match self.get_mount_checked(link).await? {
+            match self.get_mount_checked(link, RpcCode::Symlink).await? {
                 None => self.cv.symlink(target, link, force).await,
                 Some(_) => err_ext!(FsError::unsupported("symlink")),
             }
@@ -256,7 +284,7 @@ impl UnifiedFileSystem {
 
     pub async fn link(&self, src_path: &Path, dst_path: &Path) -> FsResult<()> {
         let fut = async {
-            match self.get_mount_checked(src_path).await? {
+            match self.get_mount_checked(src_path, RpcCode::Link).await? {
                 None => self.cv.link(src_path, dst_path).await,
                 Some(_) => err_ext!(FsError::unsupported("link")),
             }
@@ -267,7 +295,7 @@ impl UnifiedFileSystem {
 
     pub async fn resize(&self, path: &Path, opts: FileAllocOpts) -> FsResult<()> {
         let fut = async {
-            match self.get_mount_checked(path).await? {
+            match self.get_mount_checked(path, RpcCode::ResizeFile).await? {
                 None => self.cv.resize(path, opts).await,
                 Some(_) => err_ext!(FsError::unsupported("resize")),
             }
@@ -318,6 +346,7 @@ impl UnifiedFileSystem {
                     cv_reader,
                     ufs_path.clone(),
                     mount.ufs.clone(),
+                    mount.info.is_fs_mode(),
                 )))
             } else if blocks.ufs_exists() {
                 Ok(None)
@@ -336,6 +365,7 @@ impl UnifiedFileSystem {
                         cv_reader,
                         ufs_path.clone(),
                         mount.ufs.clone(),
+                        mount.info.is_fs_mode(),
                     )))
                 }
                 CacheValidity::Invalid(_) => Ok(None),
@@ -385,7 +415,7 @@ impl UnifiedFileSystem {
         if !path.is_cv() {
             return err_box!("the current file {} is not a cache file", path);
         }
-        let (ufs_path, mnt) = match self.get_mount(path).await? {
+        let (ufs_path, mnt) = match self.get_mount(path, RpcCode::GetJobStatus).await? {
             Some((ufs_path, mnt)) => (ufs_path, mnt),
             None => return err_box!("the current file {} is not mounted to ufs", path),
         };
@@ -465,7 +495,12 @@ impl UnifiedFileSystem {
         let mut write_path = path.path().to_owned();
 
         let fut = async {
-            match self.get_mount(path).await? {
+            let rpc_code = if flags.read_only() {
+                RpcCode::OpenFile
+            } else {
+                RpcCode::CreateFile
+            };
+            match self.get_mount(path, rpc_code).await? {
                 None => {
                     let writer = self.cv.open_with_opts(path, opts, flags).await?;
                     Ok(UnifiedWriter::Cv(writer))
@@ -524,7 +559,7 @@ impl UnifiedFileSystem {
         opts: MkdirOpts,
     ) -> FsResult<Option<FileStatus>> {
         let fut = async {
-            match self.get_mount_checked(path).await? {
+            match self.get_mount_checked(path, RpcCode::Mkdir).await? {
                 None => Ok(Some(self.cv.mkdir_with_opts(path, opts).await?)),
 
                 Some((ufs_path, mount)) => {
@@ -546,7 +581,7 @@ impl UnifiedFileSystem {
         opts: SetAttrOpts,
     ) -> FsResult<Option<FileStatus>> {
         let fut = async {
-            match self.get_mount_checked(path).await? {
+            match self.get_mount_checked(path, RpcCode::SetAttr).await? {
                 None => {
                     let status = self.cv.set_attr(path, opts).await?;
                     Ok(Some(status))
@@ -560,7 +595,7 @@ impl UnifiedFileSystem {
 
     pub async fn get_lock(&self, path: &Path, lock: FileLock) -> FsResult<Option<FileLock>> {
         let fut = async {
-            match self.get_mount_checked(path).await? {
+            match self.get_mount_checked(path, RpcCode::GetLock).await? {
                 None => self.cv.get_lock(path, lock).await,
                 Some(_) => err_ext!(FsError::unsupported("get_lock")),
             }
@@ -570,7 +605,7 @@ impl UnifiedFileSystem {
 
     pub async fn set_lock(&self, path: &Path, lock: FileLock) -> FsResult<Option<FileLock>> {
         let fut = async {
-            match self.get_mount_checked(path).await? {
+            match self.get_mount_checked(path, RpcCode::SetLock).await? {
                 None => self.cv.set_lock(path, lock).await,
                 Some(_) => err_ext!(FsError::unsupported("set_lock")),
             }
@@ -611,7 +646,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
 
     async fn exists(&self, path: &Path) -> FsResult<bool> {
         let fut = async {
-            match self.get_mount_checked(path).await? {
+            match self.get_mount_checked(path, RpcCode::Exists).await? {
                 None => self.cv.exists(path).await,
                 Some((ufs_path, mount)) => mount.ufs.exists(&ufs_path).await,
             }
@@ -624,7 +659,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         let mut read_path = path.path().to_owned();
 
         let fut = async {
-            let (ufs_path, mount) = match self.get_mount(path).await? {
+            let (ufs_path, mount) = match self.get_mount(path, RpcCode::OpenFile).await? {
                 None => {
                     let reader = UnifiedReader::Cv(self.cv.open(path).await?);
                     return if reader.status().is_expired() {
@@ -679,7 +714,8 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
 
     async fn rename(&self, src: &Path, dst: &Path) -> FsResult<bool> {
         let fut = async {
-            match self.get_mount_checked(src).await? {
+            let _ = self.get_mount_checked(dst, RpcCode::Rename).await?;
+            match self.get_mount_checked(src, RpcCode::Rename).await? {
                 None => self.cv.rename(src, dst).await,
                 Some((src_ufs, mount)) => {
                     let dst_ufs = mount.get_ufs_path(dst)?;
@@ -701,7 +737,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
 
     async fn delete(&self, path: &Path, recursive: bool) -> FsResult<()> {
         let fut = async {
-            match self.get_mount_checked(path).await? {
+            match self.get_mount_checked(path, RpcCode::Delete).await? {
                 None => self.cv.delete(path, recursive).await,
                 Some((ufs_path, mount)) => {
                     if path.path() == mount.info.cv_path {
@@ -730,7 +766,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
 
     async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {
         let fut = async {
-            match self.get_mount(path).await? {
+            match self.get_mount(path, RpcCode::FileStatus).await? {
                 None => self.cv.get_status(path).await,
 
                 Some((_, mnt)) if mnt.info.is_fs_mode() => self.cv.get_status(path).await,
@@ -759,7 +795,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
 
     async fn list_status(&self, path: &Path) -> FsResult<Vec<FileStatus>> {
         let fut = async {
-            match self.get_mount_checked(path).await? {
+            match self.get_mount_checked(path, RpcCode::ListStatus).await? {
                 None => self.cv.list_status(path).await,
                 Some((ufs_path, mount)) => mount.ufs.list_status(&ufs_path).await,
             }
@@ -769,7 +805,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
 
     async fn list_status_bytes(&self, path: &Path) -> FsResult<BytesMut> {
         let fut = async {
-            match self.get_mount_checked(path).await? {
+            match self.get_mount_checked(path, RpcCode::ListStatus).await? {
                 None => self.cv.list_status_bytes(path).await,
                 Some((ufs_path, mount)) => mount.ufs.list_status_bytes(&ufs_path).await,
             }
@@ -779,7 +815,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
 
     async fn list_options(&self, path: &Path, options: ListOptions) -> FsResult<Vec<FileStatus>> {
         let fut = async {
-            match self.get_mount_checked(path).await? {
+            match self.get_mount_checked(path, RpcCode::ListOptions).await? {
                 None => self.cv.list_options(path, options).await,
                 Some((ufs_path, mount)) => mount.ufs.list_options(&ufs_path, options).await,
             }
@@ -789,7 +825,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
 
     async fn list_options_bytes(&self, path: &Path, options: ListOptions) -> FsResult<BytesMut> {
         let fut = async {
-            match self.get_mount_checked(path).await? {
+            match self.get_mount_checked(path, RpcCode::ListOptions).await? {
                 None => self.cv.list_options_bytes(path, options).await,
                 Some((ufs_path, mount)) => mount.ufs.list_options_bytes(&ufs_path, options).await,
             }
@@ -799,7 +835,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
 
     async fn list_stream(&self, path: &Path, options: ListOptions) -> FsResult<ListStream> {
         let fut = async {
-            match self.get_mount_checked(path).await? {
+            match self.get_mount_checked(path, RpcCode::ListOptions).await? {
                 None => self.cv.list_stream(path, options).await,
                 Some((ufs_path, mount)) => mount.ufs.list_stream(&ufs_path, options).await,
             }
@@ -809,7 +845,11 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
 
     async fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> FsResult<()> {
         let fut = async {
-            if self.get_mount_checked(path).await?.is_none() {
+            if self
+                .get_mount_checked(path, RpcCode::SetAttr)
+                .await?
+                .is_none()
+            {
                 self.cv.set_attr(path, opts).await?;
             }
             // ignore setting attr on ufs mount paths

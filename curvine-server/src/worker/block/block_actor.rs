@@ -113,6 +113,10 @@ impl BlockActor {
 
     pub fn full_block_report(&self) -> CommonResult<usize> {
         let blocks = self.store.all_blocks();
+        if blocks.is_empty() {
+            let _ = self.client.full_block_report(0, &[])?;
+            return Ok(0);
+        }
 
         let mut off = 0;
         while off < blocks.len() {

@@ -129,6 +129,19 @@ impl RocksInodeStore {
         self.db.iter_cf_opt(cf)
     }
 
+    /// Bulk-scan the entire `inodes` CF with tuned ReadOptions (total_order_seek +
+    /// fill_cache(false) + 64 MiB readahead).  Use for snapshot restore.
+    pub fn bulk_scan_inodes<'a: 'b, 'b>(
+        &'a self,
+    ) -> CommonResult<DBIteratorWithThreadMode<'b, DB>> {
+        self.db.bulk_scan(Self::CF_INODES)
+    }
+
+    /// Bulk-scan the entire `edges` CF with tuned ReadOptions.
+    pub fn bulk_scan_edges<'a: 'b, 'b>(&'a self) -> CommonResult<DBIteratorWithThreadMode<'b, DB>> {
+        self.db.bulk_scan(Self::CF_EDGES)
+    }
+
     pub fn delete_locations(&self, worker_id: u32) -> CommonResult<Vec<i64>> {
         let block_ids = self.get_block_ids(worker_id)?;
 

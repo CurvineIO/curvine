@@ -63,6 +63,7 @@ pub enum ErrorKind {
     IsADirectory = 26,
     NotADirectory = 27,
     InvalidArgument = 28,
+    BlockNotFound = 29,
 
     #[num_enum(default)]
     Common = 10000,
@@ -134,6 +135,10 @@ pub enum FsError {
     // Block exception
     #[error("{0}")]
     BlockInfo(ErrorImpl<StringError>),
+
+    // Block data does not exist.
+    #[error("{0}")]
+    BlockNotFound(ErrorImpl<StringError>),
 
     // The lease written to the client service is incorrect.
     #[error("{0}")]
@@ -216,6 +221,11 @@ impl FsError {
         Self::FileNotFound(ErrorImpl::with_source(msg.into()))
     }
 
+    pub fn block_not_found(block_id: i64) -> Self {
+        let msg = format!("Block {} not found", block_id);
+        Self::BlockNotFound(ErrorImpl::with_source(msg.into()))
+    }
+
     pub fn file_expired(path: impl AsRef<str>) -> Self {
         let msg = format!("File {} expired", path.as_ref());
         Self::Expired(ErrorImpl::with_source(msg.into()))
@@ -234,6 +244,15 @@ impl FsError {
     pub fn file_exists(path: impl AsRef<str>) -> Self {
         let msg = format!("{}  already exists", path.as_ref());
         Self::FileAlreadyExists(ErrorImpl::with_source(msg.into()))
+    }
+
+    pub fn file_too_large(len: i64) -> Self {
+        let msg = format!(
+            "file size {} exceeds maximum supported size {}",
+            len,
+            crate::MAX_FILE_SIZE
+        );
+        Self::InvalidFileSize(ErrorImpl::with_source(msg.into()))
     }
 
     pub fn parent_not_dir(path: impl AsRef<str>) -> Self {
@@ -338,6 +357,7 @@ impl FsError {
             FsError::AbnormalData(_) => ErrorKind::AbnormalData,
             FsError::BlockIsWriting(_) => ErrorKind::BlockIsWriting,
             FsError::BlockInfo(_) => ErrorKind::BlockInfo,
+            FsError::BlockNotFound(_) => ErrorKind::BlockNotFound,
             FsError::Lease(_) => ErrorKind::Lease,
             FsError::InvalidPath(_) => ErrorKind::InvalidPath,
             FsError::InvalidArgument(_) => ErrorKind::InvalidArgument,
@@ -483,6 +503,7 @@ impl ErrorExt for FsError {
             FsError::AbnormalData(e) => FsError::AbnormalData(e.ctx(ctx)),
             FsError::BlockIsWriting(e) => FsError::BlockIsWriting(e.ctx(ctx)),
             FsError::BlockInfo(e) => FsError::BlockInfo(e.ctx(ctx)),
+            FsError::BlockNotFound(e) => FsError::BlockNotFound(e.ctx(ctx)),
             FsError::Lease(e) => FsError::Lease(e.ctx(ctx)),
             FsError::InvalidPath(e) => FsError::InvalidPath(e.ctx(ctx)),
             FsError::InvalidArgument(e) => FsError::InvalidArgument(e.ctx(ctx)),
@@ -517,6 +538,7 @@ impl ErrorExt for FsError {
             FsError::AbnormalData(e) => e.encode(ErrorKind::AbnormalData),
             FsError::BlockIsWriting(e) => e.encode(ErrorKind::BlockIsWriting),
             FsError::BlockInfo(e) => e.encode(ErrorKind::BlockInfo),
+            FsError::BlockNotFound(e) => e.encode(ErrorKind::BlockNotFound),
             FsError::Lease(e) => e.encode(ErrorKind::Lease),
             FsError::InvalidPath(e) => e.encode(ErrorKind::InvalidPath),
             FsError::InvalidArgument(e) => e.encode(ErrorKind::InvalidArgument),
@@ -554,6 +576,7 @@ impl ErrorExt for FsError {
             ErrorKind::AbnormalData => FsError::AbnormalData(de.into_string()),
             ErrorKind::BlockIsWriting => FsError::BlockIsWriting(de.into_string()),
             ErrorKind::BlockInfo => FsError::BlockInfo(de.into_string()),
+            ErrorKind::BlockNotFound => FsError::BlockNotFound(de.into_string()),
             ErrorKind::Lease => FsError::Lease(de.into_string()),
             ErrorKind::InvalidPath => FsError::InvalidPath(de.into_string()),
             ErrorKind::InvalidArgument => FsError::InvalidArgument(de.into_string()),

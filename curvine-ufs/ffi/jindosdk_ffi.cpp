@@ -21,6 +21,13 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
+#include <chrono>
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <memory>
+#include <mutex>
+#include <vector>
 
 // Include JindoSDK C API headers
 #include "jdo_api.h"
@@ -36,6 +43,13 @@
 // Thread-local error message storage
 thread_local std::string g_last_error;
 
+static constexpr size_t kDefaultFilesystemStoreShards = 16;
+static constexpr size_t kMaxFilesystemStoreShards = 64;
+static constexpr int64_t kFilesystemStoreShardWaitTimeoutMs = 3 * 1000;
+static constexpr int64_t kFilesystemCloseWaitTimeoutMs = 30 * 1000;
+
+struct JindoFileSystemWrapper;
+
 // =========================
 // Async helper definitions
 // =========================
@@ -43,15 +57,23 @@ thread_local std::string g_last_error;
 static inline JindoStatus map_error_code_to_status(int32_t code) {
     // Best-effort mapping for a few common error codes.
     // See /usr/local/include/jindosdk/jdo_error.h for the full list.
-    if (code == 3001 /* JDO_FILE_NOT_FOUND_ERROR */) {
+    if (code == 3001 /* JDO_FILE_NOT_FOUND_ERROR */
+        || code == 30001 /* JDO_PARENT_NOT_FOUND_ERROR */) {
         return JINDO_STATUS_FILE_NOT_FOUND;
     }
     return JINDO_STATUS_ERROR;
 }
 
+static inline bool is_reusable_operation_ctx(JindoStatus status) {
+    return status == JINDO_STATUS_OK || status == JINDO_STATUS_FILE_NOT_FOUND;
+}
+
 struct AsyncBase {
     JdoOperationCall_t call {nullptr};
     JdoOptions_t options {nullptr};
+    JdoHandleCtx_t handle_ctx {nullptr};
+    struct JindoStoreShard* store_shard {nullptr};
+    JindoFileSystemWrapper* fs_wrapper {nullptr};
     void* userdata {nullptr};
 };
 
@@ -62,38 +84,8 @@ struct AsyncStatusCtx : public AsyncBase {
     char* s3 {nullptr};
 };
 
-struct AsyncBoolCtx : public AsyncBase {
-    JindoBoolResultCallback cb {nullptr};
-    char* s1 {nullptr};
-};
-
-struct AsyncFileInfoCtx : public AsyncBase {
-    JindoFileInfoResultCallback cb {nullptr};
-    char* s1 {nullptr};
-};
-
-struct AsyncListDirCtx : public AsyncBase {
-    JindoListResultCallback cb {nullptr};
-    char* s1 {nullptr};
-};
-
-struct AsyncContentSummaryCtx : public AsyncBase {
-    JindoContentSummaryResultCallback cb {nullptr};
-    char* s1 {nullptr};
-};
-
 struct AsyncI64Ctx : public AsyncBase {
     JindoI64ResultCallback cb {nullptr};
-};
-
-struct AsyncOpenWriterCtx : public AsyncBase {
-    JindoOpenWriterCallback cb {nullptr};
-    char* path {nullptr};
-};
-
-struct AsyncOpenReaderCtx : public AsyncBase {
-    JindoOpenReaderCallback cb {nullptr};
-    char* path {nullptr};
 };
 
 static inline void free_async_strings(AsyncStatusCtx* c) {
@@ -102,30 +94,6 @@ static inline void free_async_strings(AsyncStatusCtx* c) {
     if (c->s2) free(c->s2);
     if (c->s3) free(c->s3);
 }
-static inline void free_async_strings(AsyncBoolCtx* c) {
-    if (!c) return;
-    if (c->s1) free(c->s1);
-}
-static inline void free_async_strings(AsyncFileInfoCtx* c) {
-    if (!c) return;
-    if (c->s1) free(c->s1);
-}
-static inline void free_async_strings(AsyncListDirCtx* c) {
-    if (!c) return;
-    if (c->s1) free(c->s1);
-}
-static inline void free_async_strings(AsyncContentSummaryCtx* c) {
-    if (!c) return;
-    if (c->s1) free(c->s1);
-}
-static inline void free_async_strings(AsyncOpenWriterCtx* c) {
-    if (!c) return;
-    if (c->path) free(c->path);
-}
-static inline void free_async_strings(AsyncOpenReaderCtx* c) {
-    if (!c) return;
-    if (c->path) free(c->path);
-}
 
 // Config wrapper - stores configuration as key-value pairs
 struct JindoConfigWrapper {
@@ -133,13 +101,346 @@ struct JindoConfigWrapper {
     std::map<std::string, bool> bool_configs;
 };
 
+struct JindoStoreShard {
+    std::timed_mutex mutex;
+    JdoStore_t store {nullptr};
+    JdoHandleCtx_t idle_ctx {nullptr};
+};
+
 // FileSystem wrapper - stores JindoSDK handles
 struct JindoFileSystemWrapper {
-    JdoStore_t store;
-    JdoHandleCtx_t ctx;
     std::string uri;
-    bool initialized;
+    std::string user;
+    std::map<std::string, std::string> string_configs;
+    std::map<std::string, bool> bool_configs;
+    std::vector<std::unique_ptr<JindoStoreShard>> store_shards;
+    std::atomic<size_t> next_shard {0};
+    std::atomic<bool> initialized {false};
+    std::atomic<bool> closing {false};
 };
+
+static size_t filesystem_store_shard_count() {
+    const char* raw = std::getenv("CURVINE_OSS_HDFS_STORE_POOL_SIZE");
+    if (!raw || raw[0] == '\0') {
+        return kDefaultFilesystemStoreShards;
+    }
+
+    char* end = nullptr;
+    unsigned long long parsed = std::strtoull(raw, &end, 10);
+    if (end == raw || parsed == 0) {
+        return kDefaultFilesystemStoreShards;
+    }
+
+    return std::min(static_cast<size_t>(parsed), kMaxFilesystemStoreShards);
+}
+
+static JdoStore_t create_store(JindoFileSystemWrapper* wrapper) {
+    if (!wrapper) {
+        g_last_error = "Filesystem not initialized";
+        return nullptr;
+    }
+
+    JdoOptions_t options = jdo_createOptions();
+    if (!options) {
+        g_last_error = "Failed to create options";
+        return nullptr;
+    }
+
+    for (const auto& kv : wrapper->string_configs) {
+        jdo_setOption(options, kv.first.c_str(), kv.second.c_str());
+    }
+
+    for (const auto& kv : wrapper->bool_configs) {
+        jdo_setOption(options, kv.first.c_str(), kv.second ? "true" : "false");
+    }
+
+    JdoStore_t store = jdo_createStore(options, wrapper->uri.c_str());
+    jdo_freeOptions(options);
+
+    if (!store) {
+        g_last_error = "Failed to create store";
+        return nullptr;
+    }
+
+    return store;
+}
+
+static bool ensure_store_shard_locked(JindoFileSystemWrapper* wrapper, JindoStoreShard* shard) {
+    if (!wrapper || !shard) {
+        g_last_error = "Filesystem not initialized";
+        return false;
+    }
+
+    if (shard->store) {
+        return true;
+    }
+
+    shard->store = create_store(wrapper);
+    return shard->store != nullptr;
+}
+
+static JdoHandleCtx_t create_handle_ctx(JindoFileSystemWrapper* wrapper, JindoStoreShard* shard) {
+    if (!wrapper || !shard || !shard->store) {
+        g_last_error = "Filesystem not initialized";
+        return nullptr;
+    }
+
+    JdoHandleCtx_t ctx = jdo_createHandleCtx1(shard->store);
+    if (!ctx) {
+        g_last_error = "Failed to create handle context";
+        return nullptr;
+    }
+
+    jdo_init(ctx, wrapper->user.c_str());
+    int32_t error_code = jdo_getHandleCtxErrorCode(ctx);
+    if (error_code != 0) {
+        const char* error_msg = jdo_getHandleCtxErrorMsg(ctx);
+        g_last_error = error_msg ? error_msg : "Unknown error";
+        jdo_freeHandleCtx(ctx);
+        return nullptr;
+    }
+
+    return ctx;
+}
+
+static bool prepare_store_shard_locked(
+        JindoFileSystemWrapper* wrapper,
+        JindoStoreShard* shard,
+        AsyncBase* c) {
+    if (wrapper->closing.load(std::memory_order_acquire)
+            || !wrapper->initialized.load(std::memory_order_acquire)) {
+        g_last_error = "Filesystem is closing";
+        return false;
+    }
+
+    if (!ensure_store_shard_locked(wrapper, shard)) {
+        return false;
+    }
+
+    JdoHandleCtx_t ctx = shard->idle_ctx;
+    shard->idle_ctx = nullptr;
+    if (!ctx) {
+        ctx = create_handle_ctx(wrapper, shard);
+    }
+    if (!ctx) {
+        return false;
+    }
+
+    c->fs_wrapper = wrapper;
+    c->store_shard = shard;
+    c->handle_ctx = ctx;
+    return true;
+}
+
+static bool acquire_operation_ctx(JindoFileSystemWrapper* wrapper, AsyncBase* c) {
+    if (!wrapper || !c || wrapper->store_shards.empty()) {
+        g_last_error = "Filesystem not initialized";
+        return false;
+    }
+
+    size_t shard_count = wrapper->store_shards.size();
+    size_t start = wrapper->next_shard.fetch_add(1, std::memory_order_relaxed) % shard_count;
+    for (size_t i = 0; i < shard_count; ++i) {
+        auto* shard = wrapper->store_shards[(start + i) % shard_count].get();
+        if (!shard->mutex.try_lock()) {
+            continue;
+        }
+        bool ok = prepare_store_shard_locked(wrapper, shard, c);
+        if (!ok) {
+            shard->mutex.unlock();
+        }
+        return ok;
+    }
+
+    auto* shard = wrapper->store_shards[start].get();
+    if (!shard->mutex.try_lock_for(
+            std::chrono::milliseconds(kFilesystemStoreShardWaitTimeoutMs))) {
+        g_last_error = "Timed out waiting for OSS-HDFS store shard";
+        return false;
+    }
+
+    bool ok = prepare_store_shard_locked(wrapper, shard, c);
+    if (!ok) {
+        shard->mutex.unlock();
+    }
+    return ok;
+}
+
+static void release_operation_ctx(AsyncBase* c, bool reusable) {
+    if (!c || !c->handle_ctx) {
+        return;
+    }
+
+    auto* wrapper = c->fs_wrapper;
+    auto* shard = c->store_shard;
+    JdoHandleCtx_t ctx = c->handle_ctx;
+    c->handle_ctx = nullptr;
+    c->store_shard = nullptr;
+
+    if (shard) {
+        bool keep = reusable
+                && wrapper
+                && !wrapper->closing.load(std::memory_order_acquire)
+                && shard->idle_ctx == nullptr;
+        if (keep) {
+            shard->idle_ctx = ctx;
+        } else {
+            jdo_freeHandleCtx(ctx);
+        }
+        shard->mutex.unlock();
+    } else {
+        jdo_freeHandleCtx(ctx);
+    }
+}
+
+static inline void finish_async_base(AsyncBase* c, bool reusable) {
+    if (!c) return;
+    if (c->call) {
+        jdo_freeOperationCall(c->call);
+        c->call = nullptr;
+    }
+    if (c->options) {
+        jdo_freeOptions(c->options);
+        c->options = nullptr;
+    }
+    if (c->handle_ctx) {
+        release_operation_ctx(c, reusable);
+    }
+}
+
+static inline void free_io_async_base(AsyncBase* c) {
+    if (!c) return;
+    if (c->call) jdo_freeOperationCall(c->call);
+    if (c->options) jdo_freeOptions(c->options);
+}
+
+static bool prepare_async_context(JindoFileSystemWrapper* wrapper, AsyncBase* c) {
+    if (!c) {
+        g_last_error = "Invalid async context";
+        return false;
+    }
+
+    if (!acquire_operation_ctx(wrapper, c)) {
+        return false;
+    }
+
+    c->options = jdo_createOptions();
+    if (!c->options) {
+        g_last_error = "Failed to create options";
+        finish_async_base(c, true);
+        return false;
+    }
+
+    return true;
+}
+
+static JindoStatus status_from_bool_result(
+        JdoHandleCtx_t ctx,
+        bool ok,
+        const char** err,
+        int32_t* code) {
+    *err = nullptr;
+    *code = jdo_getHandleCtxErrorCode(ctx);
+    if (*code != 0 || !ok) {
+        *err = jdo_getHandleCtxErrorMsg(ctx);
+        return map_error_code_to_status(*code);
+    }
+
+    return JINDO_STATUS_OK;
+}
+
+static JindoFileInfo* copy_file_status(
+        JdoFileStatus_t file_status,
+        JindoStatus* status,
+        const char** err) {
+    if (*status != JINDO_STATUS_OK || !file_status) {
+        return nullptr;
+    }
+
+    auto* out = (JindoFileInfo*)malloc(sizeof(JindoFileInfo));
+    if (!out) {
+        *status = JINDO_STATUS_ERROR;
+        *err = "malloc failed";
+        return nullptr;
+    }
+
+    memset(out, 0, sizeof(JindoFileInfo));
+    const char* file_path = jdo_getFileStatusPath(file_status);
+    const char* owner = jdo_getFileStatusUser(file_status);
+    const char* group = jdo_getFileStatusGroup(file_status);
+    out->path = file_path ? strdup(file_path) : nullptr;
+    out->user = owner ? strdup(owner) : nullptr;
+    out->group = group ? strdup(group) : nullptr;
+    out->type = jdo_getFileStatusType(file_status);
+    out->perm = jdo_getFileStatusPerm(file_status);
+    out->length = jdo_getFileStatusSize(file_status);
+    out->mtime = jdo_getFileStatusMtime(file_status);
+    out->atime = jdo_getFileStatusAtime(file_status);
+    return out;
+}
+
+static JindoListResult* copy_list_result(
+        JdoListDirResult_t list_result,
+        JindoStatus* status,
+        const char** err) {
+    if (*status != JINDO_STATUS_OK || !list_result) {
+        return nullptr;
+    }
+
+    auto* out = (JindoListResult*)malloc(sizeof(JindoListResult));
+    if (!out) {
+        *status = JINDO_STATUS_ERROR;
+        *err = "malloc failed";
+        return nullptr;
+    }
+
+    memset(out, 0, sizeof(JindoListResult));
+    int64_t count = jdo_getListDirResultSize(list_result);
+    if (count <= 0) {
+        out->count = 0;
+        return out;
+    }
+
+    out->count = (size_t)count;
+    out->file_infos = (JindoFileInfo*)malloc(sizeof(JindoFileInfo) * count);
+    if (!out->file_infos) {
+        free(out);
+        *status = JINDO_STATUS_ERROR;
+        *err = "malloc failed";
+        return nullptr;
+    }
+
+    memset(out->file_infos, 0, sizeof(JindoFileInfo) * count);
+    for (int64_t i = 0; i < count; i++) {
+        JdoFileStatus_t file_status = jdo_getListDirFileStatus(list_result, i);
+        if (!file_status) {
+            for (int64_t j = 0; j < i; j++) {
+                if (out->file_infos[j].path) free(out->file_infos[j].path);
+                if (out->file_infos[j].user) free(out->file_infos[j].user);
+                if (out->file_infos[j].group) free(out->file_infos[j].group);
+            }
+            free(out->file_infos);
+            free(out);
+            *status = JINDO_STATUS_ERROR;
+            *err = "listDir returned a null file status";
+            return nullptr;
+        }
+
+        const char* file_path = jdo_getFileStatusPath(file_status);
+        const char* owner = jdo_getFileStatusUser(file_status);
+        const char* group = jdo_getFileStatusGroup(file_status);
+        out->file_infos[i].path = file_path ? strdup(file_path) : nullptr;
+        out->file_infos[i].user = owner ? strdup(owner) : nullptr;
+        out->file_infos[i].group = group ? strdup(group) : nullptr;
+        out->file_infos[i].type = jdo_getFileStatusType(file_status);
+        out->file_infos[i].perm = jdo_getFileStatusPerm(file_status);
+        out->file_infos[i].length = jdo_getFileStatusSize(file_status);
+        out->file_infos[i].mtime = jdo_getFileStatusMtime(file_status);
+        out->file_infos[i].atime = jdo_getFileStatusAtime(file_status);
+    }
+
+    return out;
+}
 
 // Writer/Reader wrapper - stores IO context and handle context
 struct JindoIOWrapper {
@@ -190,9 +491,9 @@ void jindo_config_free(JindoConfigHandle config) {
 JindoFileSystemHandle jindo_filesystem_new() {
     try {
         auto* wrapper = new JindoFileSystemWrapper();
-        wrapper->store = nullptr;
-        wrapper->ctx = nullptr;
-        wrapper->initialized = false;
+        wrapper->initialized.store(false, std::memory_order_release);
+        wrapper->closing.store(false, std::memory_order_release);
+        wrapper->next_shard.store(0, std::memory_order_release);
         return wrapper;
     } catch (...) {
         g_last_error = "Failed to create filesystem";
@@ -217,58 +518,58 @@ JindoStatus jindo_filesystem_init(
         
         // Build URI
         wrapper->uri = std::string(bucket);
+        wrapper->user = std::string(user);
+        wrapper->string_configs = cfg->string_configs;
+        wrapper->bool_configs = cfg->bool_configs;
+        wrapper->closing.store(false, std::memory_order_release);
+        wrapper->initialized.store(false, std::memory_order_release);
+        wrapper->next_shard.store(0, std::memory_order_release);
+
+        wrapper->store_shards.clear();
+        size_t shard_count = filesystem_store_shard_count();
+        wrapper->store_shards.reserve(shard_count);
+        for (size_t i = 0; i < shard_count; ++i) {
+            wrapper->store_shards.emplace_back(new JindoStoreShard());
+        }
         
-        // Create JdoOptions and set configuration
-        JdoOptions_t options = jdo_createOptions();
-        if (!options) {
-            g_last_error = "Failed to create options";
+        // Validate one shard eagerly. The remaining shards are created lazily on first use.
+        auto* first_shard = wrapper->store_shards[0].get();
+        first_shard->mutex.lock();
+        if (!ensure_store_shard_locked(wrapper, first_shard)) {
+            first_shard->mutex.unlock();
+            wrapper->store_shards.clear();
             return JINDO_STATUS_ERROR;
         }
-        
-        // Set string configurations
-        for (const auto& kv : cfg->string_configs) {
-            jdo_setOption(options, kv.first.c_str(), kv.second.c_str());
-        }
-        
-        // Set bool configurations
-        for (const auto& kv : cfg->bool_configs) {
-            jdo_setOption(options, kv.first.c_str(), kv.second ? "true" : "false");
-        }
-        
-        // Create store
-        wrapper->store = jdo_createStore(options, wrapper->uri.c_str());
-        jdo_freeOptions(options);
-        
-        if (!wrapper->store) {
-            g_last_error = "Failed to create store";
+
+        JdoHandleCtx_t init_ctx = create_handle_ctx(wrapper, first_shard);
+        if (!init_ctx) {
+            if (first_shard->store) {
+                jdo_destroyStore(first_shard->store);
+                first_shard->store = nullptr;
+            }
+            first_shard->mutex.unlock();
+            wrapper->store_shards.clear();
             return JINDO_STATUS_ERROR;
         }
-        
-        // Create handle context
-        wrapper->ctx = jdo_createHandleCtx1(wrapper->store);
-        if (!wrapper->ctx) {
-            g_last_error = "Failed to create handle context";
-            jdo_destroyStore(wrapper->store);
-            wrapper->store = nullptr;
-            return JINDO_STATUS_ERROR;
-        }
-        
-        // Initialize
-        jdo_init(wrapper->ctx, user);
         
         // Check for errors
-        int32_t error_code = jdo_getHandleCtxErrorCode(wrapper->ctx);
+        int32_t error_code = jdo_getHandleCtxErrorCode(init_ctx);
         if (error_code != 0) {
-            const char* error_msg = jdo_getHandleCtxErrorMsg(wrapper->ctx);
+            const char* error_msg = jdo_getHandleCtxErrorMsg(init_ctx);
             g_last_error = error_msg ? error_msg : "Unknown error";
-            jdo_freeHandleCtx(wrapper->ctx);
-            jdo_destroyStore(wrapper->store);
-            wrapper->ctx = nullptr;
-            wrapper->store = nullptr;
+            jdo_freeHandleCtx(init_ctx);
+            if (first_shard->store) {
+                jdo_destroyStore(first_shard->store);
+                first_shard->store = nullptr;
+            }
+            first_shard->mutex.unlock();
+            wrapper->store_shards.clear();
             return JINDO_STATUS_ERROR;
         }
+        jdo_freeHandleCtx(init_ctx);
+        first_shard->mutex.unlock();
         
-        wrapper->initialized = true;
+        wrapper->initialized.store(true, std::memory_order_release);
         return JINDO_STATUS_OK;
     } catch (const std::exception& e) {
         g_last_error = e.what();
@@ -279,46 +580,46 @@ JindoStatus jindo_filesystem_init(
 void jindo_filesystem_free(JindoFileSystemHandle fs) {
     if (!fs) return;
     auto* wrapper = reinterpret_cast<JindoFileSystemWrapper*>(fs);
-    if (wrapper->ctx) {
-        jdo_freeHandleCtx(wrapper->ctx);
+
+    wrapper->closing.store(true, std::memory_order_release);
+    wrapper->initialized.store(false, std::memory_order_release);
+
+    std::vector<JindoStoreShard*> locked_shards;
+    locked_shards.reserve(wrapper->store_shards.size());
+    auto timeout = std::chrono::milliseconds(kFilesystemCloseWaitTimeoutMs);
+    for (auto& shard_owner : wrapper->store_shards) {
+        auto* shard = shard_owner.get();
+        if (!shard->mutex.try_lock_for(timeout)) {
+            // Keep wrapper/stores alive for in-flight native operations. This avoids use-after-free
+            // at shutdown without blocking Rust Drop indefinitely.
+            g_last_error =
+                "Timed out waiting for OSS-HDFS store shard while closing filesystem; leaving wrapper allocated";
+            std::fprintf(stderr, "curvine oss-hdfs: %s\n", g_last_error.c_str());
+            for (auto* locked : locked_shards) {
+                locked->mutex.unlock();
+            }
+            return;
+        }
+        locked_shards.push_back(shard);
     }
-    if (wrapper->store) {
-        jdo_destroyStore(wrapper->store);
+
+    for (auto* shard : locked_shards) {
+        if (shard->idle_ctx) {
+            jdo_freeHandleCtx(shard->idle_ctx);
+            shard->idle_ctx = nullptr;
+        }
+        if (shard->store) {
+            jdo_destroyStore(shard->store);
+            shard->store = nullptr;
+        }
+        shard->mutex.unlock();
     }
     delete wrapper;
 }
 
-// Directory operations (async-only)
-
-// ======
-// Async: mkdir/rename/remove (status-only)
-// ======
-
-void jindo_internal_bool_to_status_cb(JdoHandleCtx_t ctx, bool ok, void* ud) {
-    auto* c = reinterpret_cast<AsyncStatusCtx*>(ud);
-    const char* err = nullptr;
-    JindoStatus st = JINDO_STATUS_OK;
-    int32_t code = jdo_getHandleCtxErrorCode(ctx);
-    if (code != 0 || !ok) {
-        err = jdo_getHandleCtxErrorMsg(ctx);
-        st = map_error_code_to_status(code);
-        if (st == JINDO_STATUS_FILE_NOT_FOUND) {
-            // For status-only operations we don't distinguish NotFound.
-            st = JINDO_STATUS_ERROR;
-        }
-    }
-
-    if (c && c->cb) {
-        c->cb(st, err, c->userdata);
-    }
-
-    if (c) {
-        if (c->call) jdo_freeOperationCall(c->call);
-        if (c->options) jdo_freeOptions(c->options);
-        free_async_strings(c);
-        delete c;
-    }
-}
+// Filesystem metadata/open operations keep the async ABI used by Rust, but intentionally
+// call JindoSDK's synchronous APIs internally. Production cores showed native crashes in
+// Jindo async metadata entry points, especially jdo_getFileStatusAsync.
 
 JindoStatus jindo_filesystem_mkdir_async(JindoFileSystemHandle fs, const char* path, bool recursive, JindoStatusCallback cb, void* userdata) {
     if (!fs || !path || !cb) {
@@ -327,37 +628,17 @@ JindoStatus jindo_filesystem_mkdir_async(JindoFileSystemHandle fs, const char* p
     }
     try {
         auto* wrapper = reinterpret_cast<JindoFileSystemWrapper*>(fs);
-        if (!wrapper->initialized || !wrapper->ctx) {
-            g_last_error = "Filesystem not initialized";
+        AsyncBase c;
+        if (!prepare_async_context(wrapper, &c)) {
             return JINDO_STATUS_ERROR;
         }
 
-        auto* c = new AsyncStatusCtx();
-        c->cb = cb;
-        c->userdata = userdata;
-        c->s1 = strdup(path);
-        c->options = jdo_createOptions();
-        if (!c->options) {
-            free_async_strings(c);
-            delete c;
-            g_last_error = "Failed to create options";
-            return JINDO_STATUS_ERROR;
-        }
-        jdo_setBoolCallback(c->options, jindo_internal_bool_to_status_cb);
-        jdo_setCallbackContext(c->options, c);
-
-        c->call = jdo_mkdirAsync(wrapper->ctx, c->s1, recursive, 0755, c->options);
-        if (!c->call) {
-            const char* em = jdo_getHandleCtxErrorMsg(wrapper->ctx);
-            g_last_error = em ? em : "mkdirAsync failed";
-            jdo_freeOptions(c->options);
-            c->options = nullptr;
-            free_async_strings(c);
-            delete c;
-            return JINDO_STATUS_ERROR;
-        }
-
-        jdo_perform(wrapper->ctx, c->call);
+        bool ok = jdo_mkdir(c.handle_ctx, path, recursive, 0755, c.options);
+        const char* err = nullptr;
+        int32_t code = 0;
+        JindoStatus status = status_from_bool_result(c.handle_ctx, ok, &err, &code);
+        cb(status, err, userdata);
+        finish_async_base(&c, is_reusable_operation_ctx(status));
         return JINDO_STATUS_OK;
     } catch (const std::exception& e) {
         g_last_error = e.what();
@@ -372,38 +653,17 @@ JindoStatus jindo_filesystem_rename_async(JindoFileSystemHandle fs, const char* 
     }
     try {
         auto* wrapper = reinterpret_cast<JindoFileSystemWrapper*>(fs);
-        if (!wrapper->initialized || !wrapper->ctx) {
-            g_last_error = "Filesystem not initialized";
+        AsyncBase c;
+        if (!prepare_async_context(wrapper, &c)) {
             return JINDO_STATUS_ERROR;
         }
 
-        auto* c = new AsyncStatusCtx();
-        c->cb = cb;
-        c->userdata = userdata;
-        c->s1 = strdup(oldpath);
-        c->s2 = strdup(newpath);
-        c->options = jdo_createOptions();
-        if (!c->options) {
-            free_async_strings(c);
-            delete c;
-            g_last_error = "Failed to create options";
-            return JINDO_STATUS_ERROR;
-        }
-        jdo_setBoolCallback(c->options, jindo_internal_bool_to_status_cb);
-        jdo_setCallbackContext(c->options, c);
-
-        c->call = jdo_renameAsync(wrapper->ctx, c->s1, c->s2, c->options);
-        if (!c->call) {
-            const char* em = jdo_getHandleCtxErrorMsg(wrapper->ctx);
-            g_last_error = em ? em : "renameAsync failed";
-            jdo_freeOptions(c->options);
-            c->options = nullptr;
-            free_async_strings(c);
-            delete c;
-            return JINDO_STATUS_ERROR;
-        }
-
-        jdo_perform(wrapper->ctx, c->call);
+        bool ok = jdo_rename(c.handle_ctx, oldpath, newpath, c.options);
+        const char* err = nullptr;
+        int32_t code = 0;
+        JindoStatus status = status_from_bool_result(c.handle_ctx, ok, &err, &code);
+        cb(status, err, userdata);
+        finish_async_base(&c, is_reusable_operation_ctx(status));
         return JINDO_STATUS_OK;
     } catch (const std::exception& e) {
         g_last_error = e.what();
@@ -418,74 +678,21 @@ JindoStatus jindo_filesystem_remove_async(JindoFileSystemHandle fs, const char* 
     }
     try {
         auto* wrapper = reinterpret_cast<JindoFileSystemWrapper*>(fs);
-        if (!wrapper->initialized || !wrapper->ctx) {
-            g_last_error = "Filesystem not initialized";
+        AsyncBase c;
+        if (!prepare_async_context(wrapper, &c)) {
             return JINDO_STATUS_ERROR;
         }
 
-        auto* c = new AsyncStatusCtx();
-        c->cb = cb;
-        c->userdata = userdata;
-        c->s1 = strdup(path);
-        c->options = jdo_createOptions();
-        if (!c->options) {
-            free_async_strings(c);
-            delete c;
-            g_last_error = "Failed to create options";
-            return JINDO_STATUS_ERROR;
-        }
-        jdo_setBoolCallback(c->options, jindo_internal_bool_to_status_cb);
-        jdo_setCallbackContext(c->options, c);
-
-        c->call = jdo_removeAsync(wrapper->ctx, c->s1, recursive, c->options);
-        if (!c->call) {
-            const char* em = jdo_getHandleCtxErrorMsg(wrapper->ctx);
-            g_last_error = em ? em : "removeAsync failed";
-            jdo_freeOptions(c->options);
-            c->options = nullptr;
-            free_async_strings(c);
-            delete c;
-            return JINDO_STATUS_ERROR;
-        }
-
-        jdo_perform(wrapper->ctx, c->call);
+        bool ok = jdo_remove(c.handle_ctx, path, recursive, c.options);
+        const char* err = nullptr;
+        int32_t code = 0;
+        JindoStatus status = status_from_bool_result(c.handle_ctx, ok, &err, &code);
+        cb(status, err, userdata);
+        finish_async_base(&c, is_reusable_operation_ctx(status));
         return JINDO_STATUS_OK;
     } catch (const std::exception& e) {
         g_last_error = e.what();
         return JINDO_STATUS_ERROR;
-    }
-}
-
-// ======
-// Async: exists (bool result)
-// ======
-
-void jindo_internal_exists_cb(JdoHandleCtx_t ctx, bool exists, void* ud) {
-    auto* c = reinterpret_cast<AsyncBoolCtx*>(ud);
-    const char* err = nullptr;
-    JindoStatus st = JINDO_STATUS_OK;
-    int32_t code = jdo_getHandleCtxErrorCode(ctx);
-    if (code != 0) {
-        err = jdo_getHandleCtxErrorMsg(ctx);
-        st = map_error_code_to_status(code);
-        if (st == JINDO_STATUS_FILE_NOT_FOUND) {
-            // exists semantics: not-found should be (OK, false) if SDK reports it as an error.
-            st = JINDO_STATUS_OK;
-            exists = false;
-        } else {
-            st = JINDO_STATUS_ERROR;
-        }
-    }
-
-    if (c && c->cb) {
-        c->cb(st, exists, err, c->userdata);
-    }
-
-    if (c) {
-        if (c->call) jdo_freeOperationCall(c->call);
-        if (c->options) jdo_freeOptions(c->options);
-        free_async_strings(c);
-        delete c;
     }
 }
 
@@ -496,99 +703,32 @@ JindoStatus jindo_filesystem_exists_async(JindoFileSystemHandle fs, const char* 
     }
     try {
         auto* wrapper = reinterpret_cast<JindoFileSystemWrapper*>(fs);
-        if (!wrapper->initialized || !wrapper->ctx) {
-            g_last_error = "Filesystem not initialized";
+        AsyncBase c;
+        if (!prepare_async_context(wrapper, &c)) {
             return JINDO_STATUS_ERROR;
         }
 
-        auto* c = new AsyncBoolCtx();
-        c->cb = cb;
-        c->userdata = userdata;
-        c->s1 = strdup(path);
-        c->options = jdo_createOptions();
-        if (!c->options) {
-            free_async_strings(c);
-            delete c;
-            g_last_error = "Failed to create options";
-            return JINDO_STATUS_ERROR;
-        }
-        jdo_setBoolCallback(c->options, jindo_internal_exists_cb);
-        jdo_setCallbackContext(c->options, c);
-
-        c->call = jdo_existsAsync(wrapper->ctx, c->s1, c->options);
-        if (!c->call) {
-            const char* em = jdo_getHandleCtxErrorMsg(wrapper->ctx);
-            g_last_error = em ? em : "existsAsync failed";
-            jdo_freeOptions(c->options);
-            c->options = nullptr;
-            free_async_strings(c);
-            delete c;
-            return JINDO_STATUS_ERROR;
+        bool exists = jdo_exists(c.handle_ctx, path, c.options);
+        const char* err = nullptr;
+        int32_t code = jdo_getHandleCtxErrorCode(c.handle_ctx);
+        JindoStatus status = JINDO_STATUS_OK;
+        if (code != 0) {
+            err = jdo_getHandleCtxErrorMsg(c.handle_ctx);
+            status = map_error_code_to_status(code);
+            if (status == JINDO_STATUS_FILE_NOT_FOUND) {
+                status = JINDO_STATUS_OK;
+                exists = false;
+            } else {
+                status = JINDO_STATUS_ERROR;
+            }
         }
 
-        jdo_perform(wrapper->ctx, c->call);
+        cb(status, exists, err, userdata);
+        finish_async_base(&c, is_reusable_operation_ctx(status));
         return JINDO_STATUS_OK;
     } catch (const std::exception& e) {
         g_last_error = e.what();
         return JINDO_STATUS_ERROR;
-    }
-}
-
-// File info operations (async-only)
-// ======
-// Async: getFileStatus (file info result)
-// ======
-
-void jindo_internal_file_status_cb(JdoHandleCtx_t ctx, JdoFileStatus_t file_status, void* ud) {
-    auto* c = reinterpret_cast<AsyncFileInfoCtx*>(ud);
-    const char* err = nullptr;
-    JindoStatus st = JINDO_STATUS_OK;
-    int32_t code = jdo_getHandleCtxErrorCode(ctx);
-    if (code != 0 || !file_status) {
-        err = jdo_getHandleCtxErrorMsg(ctx);
-        st = map_error_code_to_status(code);
-        if (st == JINDO_STATUS_ERROR) {
-            // If SDK didn't give an error code but returned null, treat as not-found.
-            if (!file_status) st = JINDO_STATUS_FILE_NOT_FOUND;
-        }
-    }
-
-    JindoFileInfo* out = nullptr;
-    if (st == JINDO_STATUS_OK && file_status) {
-        out = (JindoFileInfo*)malloc(sizeof(JindoFileInfo));
-        if (out) {
-            memset(out, 0, sizeof(JindoFileInfo));
-            const char* file_path = jdo_getFileStatusPath(file_status);
-            const char* owner = jdo_getFileStatusUser(file_status);
-            const char* group = jdo_getFileStatusGroup(file_status);
-            out->path = file_path ? strdup(file_path) : nullptr;
-            out->user = owner ? strdup(owner) : nullptr;
-            out->group = group ? strdup(group) : nullptr;
-            out->type = jdo_getFileStatusType(file_status);
-            out->perm = jdo_getFileStatusPerm(file_status);
-            out->length = jdo_getFileStatusSize(file_status);
-            out->mtime = jdo_getFileStatusMtime(file_status);
-            out->atime = jdo_getFileStatusAtime(file_status);
-        } else {
-            st = JINDO_STATUS_ERROR;
-            err = "malloc failed";
-        }
-    }
-
-    // Free SDK object now that we've copied everything we need.
-    if (file_status) {
-        jdo_freeFileStatus(file_status);
-    }
-
-    if (c && c->cb) {
-        c->cb(st, out, err, c->userdata);
-    }
-
-    if (c) {
-        if (c->call) jdo_freeOperationCall(c->call);
-        if (c->options) jdo_freeOptions(c->options);
-        free_async_strings(c);
-        delete c;
     }
 }
 
@@ -599,37 +739,30 @@ JindoStatus jindo_filesystem_get_file_info_async(JindoFileSystemHandle fs, const
     }
     try {
         auto* wrapper = reinterpret_cast<JindoFileSystemWrapper*>(fs);
-        if (!wrapper->initialized || !wrapper->ctx) {
-            g_last_error = "Filesystem not initialized";
+        AsyncBase c;
+        if (!prepare_async_context(wrapper, &c)) {
             return JINDO_STATUS_ERROR;
         }
 
-        auto* c = new AsyncFileInfoCtx();
-        c->cb = cb;
-        c->userdata = userdata;
-        c->s1 = strdup(path);
-        c->options = jdo_createOptions();
-        if (!c->options) {
-            free_async_strings(c);
-            delete c;
-            g_last_error = "Failed to create options";
-            return JINDO_STATUS_ERROR;
-        }
-        jdo_setFileStatusCallback(c->options, jindo_internal_file_status_cb);
-        jdo_setCallbackContext(c->options, c);
-
-        c->call = jdo_getFileStatusAsync(wrapper->ctx, c->s1, c->options);
-        if (!c->call) {
-            const char* em = jdo_getHandleCtxErrorMsg(wrapper->ctx);
-            g_last_error = em ? em : "getFileStatusAsync failed";
-            jdo_freeOptions(c->options);
-            c->options = nullptr;
-            free_async_strings(c);
-            delete c;
-            return JINDO_STATUS_ERROR;
+        JdoFileStatus_t file_status = jdo_getFileStatus(c.handle_ctx, path, c.options);
+        const char* err = nullptr;
+        int32_t code = jdo_getHandleCtxErrorCode(c.handle_ctx);
+        JindoStatus status = JINDO_STATUS_OK;
+        if (code != 0 || !file_status) {
+            err = jdo_getHandleCtxErrorMsg(c.handle_ctx);
+            status = map_error_code_to_status(code);
+            if (status == JINDO_STATUS_ERROR && !file_status) {
+                status = JINDO_STATUS_FILE_NOT_FOUND;
+            }
         }
 
-        jdo_perform(wrapper->ctx, c->call);
+        JindoFileInfo* out = copy_file_status(file_status, &status, &err);
+        if (file_status) {
+            jdo_freeFileStatus(file_status);
+        }
+
+        cb(status, out, err, userdata);
+        finish_async_base(&c, is_reusable_operation_ctx(status));
         return JINDO_STATUS_OK;
     } catch (const std::exception& e) {
         g_last_error = e.what();
@@ -644,81 +777,6 @@ void jindo_file_info_free(JindoFileInfo* info) {
     if (info->group) free(info->group);
 }
 
-// ======
-// Async: listDir (list result)
-// ======
-
-void jindo_internal_list_dir_cb(JdoHandleCtx_t ctx, JdoListDirResult_t list_result, void* ud) {
-    auto* c = reinterpret_cast<AsyncListDirCtx*>(ud);
-    const char* err = nullptr;
-    JindoStatus st = JINDO_STATUS_OK;
-    int32_t code = jdo_getHandleCtxErrorCode(ctx);
-    if (code != 0 || !list_result) {
-        err = jdo_getHandleCtxErrorMsg(ctx);
-        st = map_error_code_to_status(code);
-        if (st == JINDO_STATUS_FILE_NOT_FOUND) {
-            // listDir: treat not-found as error (matches common fs semantics for listing a missing directory)
-            st = JINDO_STATUS_ERROR;
-        }
-        if (!list_result && code == 0) {
-            st = JINDO_STATUS_ERROR;
-        }
-    }
-
-    JindoListResult* out = nullptr;
-    if (st == JINDO_STATUS_OK && list_result) {
-        out = (JindoListResult*)malloc(sizeof(JindoListResult));
-        if (out) {
-            memset(out, 0, sizeof(JindoListResult));
-            int64_t count = jdo_getListDirResultSize(list_result);
-            out->count = (size_t)count;
-            if (count > 0) {
-                out->file_infos = (JindoFileInfo*)malloc(sizeof(JindoFileInfo) * count);
-                if (!out->file_infos) {
-                    free(out);
-                    out = nullptr;
-                    st = JINDO_STATUS_ERROR;
-                    err = "malloc failed";
-                } else {
-                    memset(out->file_infos, 0, sizeof(JindoFileInfo) * count);
-                    for (int64_t i = 0; i < count; i++) {
-                        JdoFileStatus_t file_status = jdo_getListDirFileStatus(list_result, i);
-                        const char* file_path = jdo_getFileStatusPath(file_status);
-                        const char* owner = jdo_getFileStatusUser(file_status);
-                        const char* group = jdo_getFileStatusGroup(file_status);
-                        out->file_infos[i].path = file_path ? strdup(file_path) : nullptr;
-                        out->file_infos[i].user = owner ? strdup(owner) : nullptr;
-                        out->file_infos[i].group = group ? strdup(group) : nullptr;
-                        out->file_infos[i].type = jdo_getFileStatusType(file_status);
-                        out->file_infos[i].perm = jdo_getFileStatusPerm(file_status);
-                        out->file_infos[i].length = jdo_getFileStatusSize(file_status);
-                        out->file_infos[i].mtime = jdo_getFileStatusMtime(file_status);
-                        out->file_infos[i].atime = jdo_getFileStatusAtime(file_status);
-                    }
-                }
-            }
-        } else {
-            st = JINDO_STATUS_ERROR;
-            err = "malloc failed";
-        }
-    }
-
-    if (list_result) {
-        jdo_freeListDirResult(list_result);
-    }
-
-    if (c && c->cb) {
-        c->cb(st, out, err, c->userdata);
-    }
-
-    if (c) {
-        if (c->call) jdo_freeOperationCall(c->call);
-        if (c->options) jdo_freeOptions(c->options);
-        free_async_strings(c);
-        delete c;
-    }
-}
-
 JindoStatus jindo_filesystem_list_dir_async(JindoFileSystemHandle fs, const char* path, bool recursive, JindoListResultCallback cb, void* userdata) {
     if (!fs || !path || !cb) {
         g_last_error = "Invalid parameters";
@@ -726,37 +784,30 @@ JindoStatus jindo_filesystem_list_dir_async(JindoFileSystemHandle fs, const char
     }
     try {
         auto* wrapper = reinterpret_cast<JindoFileSystemWrapper*>(fs);
-        if (!wrapper->initialized || !wrapper->ctx) {
-            g_last_error = "Filesystem not initialized";
+        AsyncBase c;
+        if (!prepare_async_context(wrapper, &c)) {
             return JINDO_STATUS_ERROR;
         }
 
-        auto* c = new AsyncListDirCtx();
-        c->cb = cb;
-        c->userdata = userdata;
-        c->s1 = strdup(path);
-        c->options = jdo_createOptions();
-        if (!c->options) {
-            free_async_strings(c);
-            delete c;
-            g_last_error = "Failed to create options";
-            return JINDO_STATUS_ERROR;
-        }
-        jdo_setListDirResultCallback(c->options, jindo_internal_list_dir_cb);
-        jdo_setCallbackContext(c->options, c);
-
-        c->call = jdo_listDirAsync(wrapper->ctx, c->s1, recursive, c->options);
-        if (!c->call) {
-            const char* em = jdo_getHandleCtxErrorMsg(wrapper->ctx);
-            g_last_error = em ? em : "listDirAsync failed";
-            jdo_freeOptions(c->options);
-            c->options = nullptr;
-            free_async_strings(c);
-            delete c;
-            return JINDO_STATUS_ERROR;
+        JdoListDirResult_t list_result = jdo_listDir(c.handle_ctx, path, recursive, c.options);
+        const char* err = nullptr;
+        int32_t code = jdo_getHandleCtxErrorCode(c.handle_ctx);
+        JindoStatus status = JINDO_STATUS_OK;
+        if (code != 0 || !list_result) {
+            err = jdo_getHandleCtxErrorMsg(c.handle_ctx);
+            status = map_error_code_to_status(code);
+            if (!list_result && code == 0) {
+                status = JINDO_STATUS_ERROR;
+            }
         }
 
-        jdo_perform(wrapper->ctx, c->call);
+        JindoListResult* out = copy_list_result(list_result, &status, &err);
+        if (list_result) {
+            jdo_freeListDirResult(list_result);
+        }
+
+        cb(status, out, err, userdata);
+        finish_async_base(&c, is_reusable_operation_ctx(status));
         return JINDO_STATUS_OK;
     } catch (const std::exception& e) {
         g_last_error = e.what();
@@ -777,51 +828,6 @@ void jindo_list_result_free(JindoListResult* result) {
     result->count = 0;
 }
 
-// ======
-// Async: getContentSummary (summary result)
-// ======
-
-void jindo_internal_content_summary_cb(JdoHandleCtx_t ctx, JdoContentSummary_t summary, void* ud) {
-    auto* c = reinterpret_cast<AsyncContentSummaryCtx*>(ud);
-    const char* err = nullptr;
-    JindoStatus st = JINDO_STATUS_OK;
-    int32_t code = jdo_getHandleCtxErrorCode(ctx);
-    if (code != 0 || !summary) {
-        err = jdo_getHandleCtxErrorMsg(ctx);
-        st = map_error_code_to_status(code);
-        if (st == JINDO_STATUS_FILE_NOT_FOUND) st = JINDO_STATUS_ERROR;
-        if (!summary && code == 0) st = JINDO_STATUS_ERROR;
-    }
-
-    JindoContentSummary* out = nullptr;
-    if (st == JINDO_STATUS_OK && summary) {
-        out = (JindoContentSummary*)malloc(sizeof(JindoContentSummary));
-        if (out) {
-            out->file_count = jdo_getContentSummaryFileCount(summary);
-            out->dir_count = jdo_getContentSummaryDirectoryCount(summary);
-            out->file_size = jdo_getContentSummaryFileSize(summary);
-        } else {
-            st = JINDO_STATUS_ERROR;
-            err = "malloc failed";
-        }
-    }
-
-    if (summary) {
-        jdo_freeContentSummary(summary);
-    }
-
-    if (c && c->cb) {
-        c->cb(st, out, err, c->userdata);
-    }
-
-    if (c) {
-        if (c->call) jdo_freeOperationCall(c->call);
-        if (c->options) jdo_freeOptions(c->options);
-        free_async_strings(c);
-        delete c;
-    }
-}
-
 JindoStatus jindo_filesystem_get_content_summary_async(JindoFileSystemHandle fs, const char* path, bool recursive, JindoContentSummaryResultCallback cb, void* userdata) {
     if (!fs || !path || !cb) {
         g_last_error = "Invalid parameters";
@@ -829,37 +835,38 @@ JindoStatus jindo_filesystem_get_content_summary_async(JindoFileSystemHandle fs,
     }
     try {
         auto* wrapper = reinterpret_cast<JindoFileSystemWrapper*>(fs);
-        if (!wrapper->initialized || !wrapper->ctx) {
-            g_last_error = "Filesystem not initialized";
+        AsyncBase c;
+        if (!prepare_async_context(wrapper, &c)) {
             return JINDO_STATUS_ERROR;
         }
 
-        auto* c = new AsyncContentSummaryCtx();
-        c->cb = cb;
-        c->userdata = userdata;
-        c->s1 = strdup(path);
-        c->options = jdo_createOptions();
-        if (!c->options) {
-            free_async_strings(c);
-            delete c;
-            g_last_error = "Failed to create options";
-            return JINDO_STATUS_ERROR;
-        }
-        jdo_setContentSummaryCallback(c->options, jindo_internal_content_summary_cb);
-        jdo_setCallbackContext(c->options, c);
-
-        c->call = jdo_getContentSummaryAsync(wrapper->ctx, c->s1, recursive, c->options);
-        if (!c->call) {
-            const char* em = jdo_getHandleCtxErrorMsg(wrapper->ctx);
-            g_last_error = em ? em : "getContentSummaryAsync failed";
-            jdo_freeOptions(c->options);
-            c->options = nullptr;
-            free_async_strings(c);
-            delete c;
-            return JINDO_STATUS_ERROR;
+        JdoContentSummary_t summary = jdo_getContentSummary(c.handle_ctx, path, recursive, c.options);
+        const char* err = nullptr;
+        int32_t code = jdo_getHandleCtxErrorCode(c.handle_ctx);
+        JindoStatus status = JINDO_STATUS_OK;
+        if (code != 0 || !summary) {
+            err = jdo_getHandleCtxErrorMsg(c.handle_ctx);
+            status = map_error_code_to_status(code);
+            if (!summary && code == 0) {
+                status = JINDO_STATUS_ERROR;
+            }
         }
 
-        jdo_perform(wrapper->ctx, c->call);
+        JindoContentSummary out;
+        JindoContentSummary* out_ptr = nullptr;
+        if (status == JINDO_STATUS_OK && summary) {
+            out.file_count = jdo_getContentSummaryFileCount(summary);
+            out.dir_count = jdo_getContentSummaryDirectoryCount(summary);
+            out.file_size = jdo_getContentSummaryFileSize(summary);
+            out_ptr = &out;
+        }
+
+        if (summary) {
+            jdo_freeContentSummary(summary);
+        }
+
+        cb(status, out_ptr, err, userdata);
+        finish_async_base(&c, is_reusable_operation_ctx(status));
         return JINDO_STATUS_OK;
     } catch (const std::exception& e) {
         g_last_error = e.what();
@@ -867,12 +874,7 @@ JindoStatus jindo_filesystem_get_content_summary_async(JindoFileSystemHandle fs,
     }
 }
 
-// OSS-HDFS specific operations (async-only)
-
-// ======
-// Async: setPermission / setOwner (status-only)
-// Reuse the same bool->status callback as mkdir/rename/remove.
-// ======
+// OSS-HDFS specific metadata operations.
 
 JindoStatus jindo_filesystem_set_permission_async(JindoFileSystemHandle fs, const char* path, int16_t perm, JindoStatusCallback cb, void* userdata) {
     if (!fs || !path || !cb) {
@@ -881,37 +883,17 @@ JindoStatus jindo_filesystem_set_permission_async(JindoFileSystemHandle fs, cons
     }
     try {
         auto* wrapper = reinterpret_cast<JindoFileSystemWrapper*>(fs);
-        if (!wrapper->initialized || !wrapper->ctx) {
-            g_last_error = "Filesystem not initialized";
+        AsyncBase c;
+        if (!prepare_async_context(wrapper, &c)) {
             return JINDO_STATUS_ERROR;
         }
 
-        auto* c = new AsyncStatusCtx();
-        c->cb = cb;
-        c->userdata = userdata;
-        c->s1 = strdup(path);
-        c->options = jdo_createOptions();
-        if (!c->options) {
-            free_async_strings(c);
-            delete c;
-            g_last_error = "Failed to create options";
-            return JINDO_STATUS_ERROR;
-        }
-        jdo_setBoolCallback(c->options, jindo_internal_bool_to_status_cb);
-        jdo_setCallbackContext(c->options, c);
-
-        c->call = jdo_setPermissionAsync(wrapper->ctx, c->s1, perm, c->options);
-        if (!c->call) {
-            const char* em = jdo_getHandleCtxErrorMsg(wrapper->ctx);
-            g_last_error = em ? em : "setPermissionAsync failed";
-            jdo_freeOptions(c->options);
-            c->options = nullptr;
-            free_async_strings(c);
-            delete c;
-            return JINDO_STATUS_ERROR;
-        }
-
-        jdo_perform(wrapper->ctx, c->call);
+        bool ok = jdo_setPermission(c.handle_ctx, path, perm, c.options);
+        const char* err = nullptr;
+        int32_t code = 0;
+        JindoStatus status = status_from_bool_result(c.handle_ctx, ok, &err, &code);
+        cb(status, err, userdata);
+        finish_async_base(&c, is_reusable_operation_ctx(status));
         return JINDO_STATUS_OK;
     } catch (const std::exception& e) {
         g_last_error = e.what();
@@ -926,39 +908,17 @@ JindoStatus jindo_filesystem_set_owner_async(JindoFileSystemHandle fs, const cha
     }
     try {
         auto* wrapper = reinterpret_cast<JindoFileSystemWrapper*>(fs);
-        if (!wrapper->initialized || !wrapper->ctx) {
-            g_last_error = "Filesystem not initialized";
+        AsyncBase c;
+        if (!prepare_async_context(wrapper, &c)) {
             return JINDO_STATUS_ERROR;
         }
 
-        auto* c = new AsyncStatusCtx();
-        c->cb = cb;
-        c->userdata = userdata;
-        c->s1 = strdup(path);
-        c->s2 = strdup(user);
-        c->s3 = strdup(group);
-        c->options = jdo_createOptions();
-        if (!c->options) {
-            free_async_strings(c);
-            delete c;
-            g_last_error = "Failed to create options";
-            return JINDO_STATUS_ERROR;
-        }
-        jdo_setBoolCallback(c->options, jindo_internal_bool_to_status_cb);
-        jdo_setCallbackContext(c->options, c);
-
-        c->call = jdo_setOwnerAsync(wrapper->ctx, c->s1, c->s2, c->s3, c->options);
-        if (!c->call) {
-            const char* em = jdo_getHandleCtxErrorMsg(wrapper->ctx);
-            g_last_error = em ? em : "setOwnerAsync failed";
-            jdo_freeOptions(c->options);
-            c->options = nullptr;
-            free_async_strings(c);
-            delete c;
-            return JINDO_STATUS_ERROR;
-        }
-
-        jdo_perform(wrapper->ctx, c->call);
+        bool ok = jdo_setOwner(c.handle_ctx, path, user, group, c.options);
+        const char* err = nullptr;
+        int32_t code = 0;
+        JindoStatus status = status_from_bool_result(c.handle_ctx, ok, &err, &code);
+        cb(status, err, userdata);
+        finish_async_base(&c, is_reusable_operation_ctx(status));
         return JINDO_STATUS_OK;
     } catch (const std::exception& e) {
         g_last_error = e.what();
@@ -966,7 +926,7 @@ JindoStatus jindo_filesystem_set_owner_async(JindoFileSystemHandle fs, const cha
     }
 }
 
-// Writer functions (async open/write/flush/tell/close are implemented below)
+// Writer functions.
 
 void jindo_writer_free(JindoWriterHandle writer) {
     if (!writer) return;
@@ -976,7 +936,7 @@ void jindo_writer_free(JindoWriterHandle writer) {
     delete io_wrapper;
 }
 
-// Reader functions (async open/read/pread/seek/tell/get_file_length/close are implemented below)
+// Reader functions.
 
 void jindo_reader_free(JindoReaderHandle reader) {
     if (!reader) return;
@@ -986,105 +946,24 @@ void jindo_reader_free(JindoReaderHandle reader) {
     delete io_wrapper;
 }
 
-// =========================
-// Async open (writer/reader)
-// =========================
-
-static void jindo_internal_open_io_cb(JdoHandleCtx_t ctx, JdoIOContext_t io_ctx, void* ud, bool is_writer, JindoFileSystemWrapper* fsw) {
-    if (!ud) {
-        if (io_ctx) jdo_freeIOContext(io_ctx);
-        return;
-    }
-
+static void jindo_internal_io_status_cb(JdoHandleCtx_t ctx, bool ok, void* ud) {
+    auto* c = reinterpret_cast<AsyncStatusCtx*>(ud);
     const char* err = nullptr;
+    JindoStatus st = JINDO_STATUS_OK;
     int32_t code = jdo_getHandleCtxErrorCode(ctx);
-    if (code != 0 || !io_ctx) {
+    if (code != 0 || !ok) {
         err = jdo_getHandleCtxErrorMsg(ctx);
-        JindoStatus st = map_error_code_to_status(code);
-        if (st == JINDO_STATUS_FILE_NOT_FOUND) st = JINDO_STATUS_ERROR;
-
-        if (is_writer) {
-            auto* c = reinterpret_cast<AsyncOpenWriterCtx*>(ud);
-            if (c->cb) c->cb(st, nullptr, err, c->userdata);
-            if (c->call) jdo_freeOperationCall(c->call);
-            if (c->options) jdo_freeOptions(c->options);
-            free_async_strings(c);
-            delete c;
-        } else {
-            auto* c = reinterpret_cast<AsyncOpenReaderCtx*>(ud);
-            if (c->cb) c->cb(st, nullptr, err, c->userdata);
-            if (c->call) jdo_freeOperationCall(c->call);
-            if (c->options) jdo_freeOptions(c->options);
-            free_async_strings(c);
-            delete c;
-        }
-        if (io_ctx) jdo_freeIOContext(io_ctx);
-        return;
+        st = map_error_code_to_status(code);
     }
 
-    // Create handle context for this IO context
-    JdoHandleCtx_t handle_ctx = jdo_createHandleCtx2(fsw->store, io_ctx);
-    if (!handle_ctx) {
-        err = "Failed to create handle context for IO";
-        if (is_writer) {
-            auto* c = reinterpret_cast<AsyncOpenWriterCtx*>(ud);
-            if (c->cb) c->cb(JINDO_STATUS_ERROR, nullptr, err, c->userdata);
-            if (c->call) jdo_freeOperationCall(c->call);
-            if (c->options) jdo_freeOptions(c->options);
-            free_async_strings(c);
-            delete c;
-        } else {
-            auto* c = reinterpret_cast<AsyncOpenReaderCtx*>(ud);
-            if (c->cb) c->cb(JINDO_STATUS_ERROR, nullptr, err, c->userdata);
-            if (c->call) jdo_freeOperationCall(c->call);
-            if (c->options) jdo_freeOptions(c->options);
-            free_async_strings(c);
-            delete c;
-        }
-        jdo_freeIOContext(io_ctx);
-        return;
+    if (c && c->cb) {
+        c->cb(st, err, c->userdata);
     }
 
-    auto* io_wrapper = new JindoIOWrapper();
-    io_wrapper->io_ctx = io_ctx;
-    io_wrapper->handle_ctx = handle_ctx;
-    io_wrapper->store = fsw->store;
-
-    if (is_writer) {
-        auto* c = reinterpret_cast<AsyncOpenWriterCtx*>(ud);
-        if (c->cb) c->cb(JINDO_STATUS_OK, io_wrapper, nullptr, c->userdata);
-        if (c->call) jdo_freeOperationCall(c->call);
-        if (c->options) jdo_freeOptions(c->options);
+    if (c) {
+        free_io_async_base(c);
         free_async_strings(c);
         delete c;
-    } else {
-        auto* c = reinterpret_cast<AsyncOpenReaderCtx*>(ud);
-        if (c->cb) c->cb(JINDO_STATUS_OK, io_wrapper, nullptr, c->userdata);
-        if (c->call) jdo_freeOperationCall(c->call);
-        if (c->options) jdo_freeOptions(c->options);
-        free_async_strings(c);
-        delete c;
-    }
-}
-
-struct OpenCtxWrapper {
-    void* inner; // AsyncOpenWriterCtx* or AsyncOpenReaderCtx*
-    JindoFileSystemWrapper* fsw;
-    bool is_writer;
-};
-
-static void jindo_internal_open_io_trampoline(JdoHandleCtx_t ctx, JdoIOContext_t io_ctx, void* ud) {
-    auto* w = reinterpret_cast<OpenCtxWrapper*>(ud);
-    if (!w) {
-        if (io_ctx) jdo_freeIOContext(io_ctx);
-        return;
-    }
-    if (w->is_writer) {
-        jindo_internal_open_io_cb(ctx, io_ctx, w->inner, true, w->fsw);
-        delete w;
-    } else {
-        jindo_internal_open_io_cb(ctx, io_ctx, w->inner, false, w->fsw);
-        delete w;
     }
 }
 
@@ -1095,50 +974,49 @@ JindoStatus jindo_filesystem_open_writer_async(JindoFileSystemHandle fs, const c
     }
     try {
         auto* fsw = reinterpret_cast<JindoFileSystemWrapper*>(fs);
-        if (!fsw->initialized || !fsw->ctx || !fsw->store) {
-            g_last_error = "Filesystem not initialized";
+        AsyncBase c;
+        if (!prepare_async_context(fsw, &c)) {
             return JINDO_STATUS_ERROR;
         }
 
-        auto* c = new AsyncOpenWriterCtx();
-        c->cb = cb;
-        c->userdata = userdata;
-        c->path = strdup(path);
-        c->options = jdo_createOptions();
-        if (!c->options) {
-            free_async_strings(c);
-            delete c;
-            g_last_error = "Failed to create options";
-            return JINDO_STATUS_ERROR;
-        }
-
-        auto* wrap = new OpenCtxWrapper();
-        wrap->inner = c;
-        wrap->fsw = fsw;
-        wrap->is_writer = true;
-
-        jdo_setIOContextCallback(c->options, jindo_internal_open_io_trampoline);
-        jdo_setCallbackContext(c->options, wrap);
-
-        c->call = jdo_openAsync(
-            fsw->ctx,
-            c->path,
+        JdoIOContext_t io_ctx = jdo_open(
+            c.handle_ctx,
+            path,
             JDO_OPEN_FLAG_CREATE | JDO_OPEN_FLAG_OVERWRITE,
             0644,
-            c->options
+            c.options
         );
-        if (!c->call) {
-            const char* em = jdo_getHandleCtxErrorMsg(fsw->ctx);
-            g_last_error = em ? em : "openAsync failed";
-            delete wrap;
-            jdo_freeOptions(c->options);
-            c->options = nullptr;
-            free_async_strings(c);
-            delete c;
-            return JINDO_STATUS_ERROR;
+
+        const char* err = nullptr;
+        int32_t code = jdo_getHandleCtxErrorCode(c.handle_ctx);
+        JindoStatus status = JINDO_STATUS_OK;
+        if (code != 0 || !io_ctx) {
+            err = jdo_getHandleCtxErrorMsg(c.handle_ctx);
+            status = map_error_code_to_status(code);
+            cb(status, nullptr, err, userdata);
+            if (io_ctx) {
+                jdo_freeIOContext(io_ctx);
+            }
+            finish_async_base(&c, false);
+            return JINDO_STATUS_OK;
         }
 
-        jdo_perform(fsw->ctx, c->call);
+        JdoHandleCtx_t handle_ctx = jdo_createHandleCtx2(c.store_shard->store, io_ctx);
+        if (!handle_ctx) {
+            err = "Failed to create handle context for IO";
+            cb(JINDO_STATUS_ERROR, nullptr, err, userdata);
+            jdo_freeIOContext(io_ctx);
+            finish_async_base(&c, false);
+            return JINDO_STATUS_OK;
+        }
+
+        auto* io_wrapper = new JindoIOWrapper();
+        io_wrapper->io_ctx = io_ctx;
+        io_wrapper->handle_ctx = handle_ctx;
+        io_wrapper->store = c.store_shard->store;
+
+        cb(JINDO_STATUS_OK, io_wrapper, nullptr, userdata);
+        finish_async_base(&c, true);
         return JINDO_STATUS_OK;
     } catch (const std::exception& e) {
         g_last_error = e.what();
@@ -1153,50 +1031,49 @@ JindoStatus jindo_filesystem_open_writer_append_async(JindoFileSystemHandle fs, 
     }
     try {
         auto* fsw = reinterpret_cast<JindoFileSystemWrapper*>(fs);
-        if (!fsw->initialized || !fsw->ctx || !fsw->store) {
-            g_last_error = "Filesystem not initialized";
+        AsyncBase c;
+        if (!prepare_async_context(fsw, &c)) {
             return JINDO_STATUS_ERROR;
         }
 
-        auto* c = new AsyncOpenWriterCtx();
-        c->cb = cb;
-        c->userdata = userdata;
-        c->path = strdup(path);
-        c->options = jdo_createOptions();
-        if (!c->options) {
-            free_async_strings(c);
-            delete c;
-            g_last_error = "Failed to create options";
-            return JINDO_STATUS_ERROR;
-        }
-
-        auto* wrap = new OpenCtxWrapper();
-        wrap->inner = c;
-        wrap->fsw = fsw;
-        wrap->is_writer = true;
-
-        jdo_setIOContextCallback(c->options, jindo_internal_open_io_trampoline);
-        jdo_setCallbackContext(c->options, wrap);
-
-        c->call = jdo_openAsync(
-            fsw->ctx,
-            c->path,
+        JdoIOContext_t io_ctx = jdo_open(
+            c.handle_ctx,
+            path,
             JDO_OPEN_FLAG_CREATE | JDO_OPEN_FLAG_APPEND,
             0644,
-            c->options
+            c.options
         );
-        if (!c->call) {
-            const char* em = jdo_getHandleCtxErrorMsg(fsw->ctx);
-            g_last_error = em ? em : "openAsync append failed";
-            delete wrap;
-            jdo_freeOptions(c->options);
-            c->options = nullptr;
-            free_async_strings(c);
-            delete c;
-            return JINDO_STATUS_ERROR;
+
+        const char* err = nullptr;
+        int32_t code = jdo_getHandleCtxErrorCode(c.handle_ctx);
+        JindoStatus status = JINDO_STATUS_OK;
+        if (code != 0 || !io_ctx) {
+            err = jdo_getHandleCtxErrorMsg(c.handle_ctx);
+            status = map_error_code_to_status(code);
+            cb(status, nullptr, err, userdata);
+            if (io_ctx) {
+                jdo_freeIOContext(io_ctx);
+            }
+            finish_async_base(&c, false);
+            return JINDO_STATUS_OK;
         }
 
-        jdo_perform(fsw->ctx, c->call);
+        JdoHandleCtx_t handle_ctx = jdo_createHandleCtx2(c.store_shard->store, io_ctx);
+        if (!handle_ctx) {
+            err = "Failed to create handle context for IO";
+            cb(JINDO_STATUS_ERROR, nullptr, err, userdata);
+            jdo_freeIOContext(io_ctx);
+            finish_async_base(&c, false);
+            return JINDO_STATUS_OK;
+        }
+
+        auto* io_wrapper = new JindoIOWrapper();
+        io_wrapper->io_ctx = io_ctx;
+        io_wrapper->handle_ctx = handle_ctx;
+        io_wrapper->store = c.store_shard->store;
+
+        cb(JINDO_STATUS_OK, io_wrapper, nullptr, userdata);
+        finish_async_base(&c, true);
         return JINDO_STATUS_OK;
     } catch (const std::exception& e) {
         g_last_error = e.what();
@@ -1211,50 +1088,49 @@ JindoStatus jindo_filesystem_open_reader_async(JindoFileSystemHandle fs, const c
     }
     try {
         auto* fsw = reinterpret_cast<JindoFileSystemWrapper*>(fs);
-        if (!fsw->initialized || !fsw->ctx || !fsw->store) {
-            g_last_error = "Filesystem not initialized";
+        AsyncBase c;
+        if (!prepare_async_context(fsw, &c)) {
             return JINDO_STATUS_ERROR;
         }
 
-        auto* c = new AsyncOpenReaderCtx();
-        c->cb = cb;
-        c->userdata = userdata;
-        c->path = strdup(path);
-        c->options = jdo_createOptions();
-        if (!c->options) {
-            free_async_strings(c);
-            delete c;
-            g_last_error = "Failed to create options";
-            return JINDO_STATUS_ERROR;
-        }
-
-        auto* wrap = new OpenCtxWrapper();
-        wrap->inner = c;
-        wrap->fsw = fsw;
-        wrap->is_writer = false;
-
-        jdo_setIOContextCallback(c->options, jindo_internal_open_io_trampoline);
-        jdo_setCallbackContext(c->options, wrap);
-
-        c->call = jdo_openAsync(
-            fsw->ctx,
-            c->path,
+        JdoIOContext_t io_ctx = jdo_open(
+            c.handle_ctx,
+            path,
             JDO_OPEN_FLAG_READ_ONLY,
             0,
-            c->options
+            c.options
         );
-        if (!c->call) {
-            const char* em = jdo_getHandleCtxErrorMsg(fsw->ctx);
-            g_last_error = em ? em : "openAsync reader failed";
-            delete wrap;
-            jdo_freeOptions(c->options);
-            c->options = nullptr;
-            free_async_strings(c);
-            delete c;
-            return JINDO_STATUS_ERROR;
+
+        const char* err = nullptr;
+        int32_t code = jdo_getHandleCtxErrorCode(c.handle_ctx);
+        JindoStatus status = JINDO_STATUS_OK;
+        if (code != 0 || !io_ctx) {
+            err = jdo_getHandleCtxErrorMsg(c.handle_ctx);
+            status = map_error_code_to_status(code);
+            cb(status, nullptr, err, userdata);
+            if (io_ctx) {
+                jdo_freeIOContext(io_ctx);
+            }
+            finish_async_base(&c, false);
+            return JINDO_STATUS_OK;
         }
 
-        jdo_perform(fsw->ctx, c->call);
+        JdoHandleCtx_t handle_ctx = jdo_createHandleCtx2(c.store_shard->store, io_ctx);
+        if (!handle_ctx) {
+            err = "Failed to create handle context for IO";
+            cb(JINDO_STATUS_ERROR, nullptr, err, userdata);
+            jdo_freeIOContext(io_ctx);
+            finish_async_base(&c, false);
+            return JINDO_STATUS_OK;
+        }
+
+        auto* io_wrapper = new JindoIOWrapper();
+        io_wrapper->io_ctx = io_ctx;
+        io_wrapper->handle_ctx = handle_ctx;
+        io_wrapper->store = c.store_shard->store;
+
+        cb(JINDO_STATUS_OK, io_wrapper, nullptr, userdata);
+        finish_async_base(&c, true);
         return JINDO_STATUS_OK;
     } catch (const std::exception& e) {
         g_last_error = e.what();
@@ -1274,15 +1150,12 @@ static void jindo_internal_i64_cb(JdoHandleCtx_t ctx, int64_t value, void* ud) {
     if (code != 0) {
         err = jdo_getHandleCtxErrorMsg(ctx);
         st = map_error_code_to_status(code);
-        if (st == JINDO_STATUS_FILE_NOT_FOUND) st = JINDO_STATUS_ERROR;
-        if (st == JINDO_STATUS_ERROR) st = JINDO_STATUS_ERROR;
     }
 
     if (c && c->cb) c->cb(st, value, err, c->userdata);
 
     if (c) {
-        if (c->call) jdo_freeOperationCall(c->call);
-        if (c->options) jdo_freeOptions(c->options);
+        free_io_async_base(c);
         delete c;
     }
 }
@@ -1338,7 +1211,7 @@ JindoStatus jindo_writer_flush_async(JindoWriterHandle writer, JindoStatusCallba
             return JINDO_STATUS_ERROR;
         }
         // bool-returning async op: normalize completion into JindoStatus via shared callback
-        jdo_setBoolCallback(c->options, jindo_internal_bool_to_status_cb);
+        jdo_setBoolCallback(c->options, jindo_internal_io_status_cb);
         jdo_setCallbackContext(c->options, c);
         c->call = jdo_flushAsync(io->handle_ctx, c->options);
         if (!c->call) {
@@ -1407,7 +1280,7 @@ JindoStatus jindo_writer_close_async(JindoWriterHandle writer, JindoStatusCallba
             return JINDO_STATUS_ERROR;
         }
         // bool-returning async op: normalize completion into JindoStatus via shared callback
-        jdo_setBoolCallback(c->options, jindo_internal_bool_to_status_cb);
+        jdo_setBoolCallback(c->options, jindo_internal_io_status_cb);
         jdo_setCallbackContext(c->options, c);
         c->call = jdo_closeAsync(io->handle_ctx, c->options);
         if (!c->call) {
@@ -1515,8 +1388,6 @@ JindoStatus jindo_reader_seek_async(JindoReaderHandle reader, int64_t offset, Ji
             if (code != 0 || value < 0) {
                 err = jdo_getHandleCtxErrorMsg(ctx);
                 st = map_error_code_to_status(code);
-                if (st == JINDO_STATUS_FILE_NOT_FOUND) st = JINDO_STATUS_ERROR;
-                st = JINDO_STATUS_ERROR;
             }
 
             if (c && c->cb) c->cb(st, err, c->userdata);
@@ -1639,7 +1510,7 @@ JindoStatus jindo_reader_close_async(JindoReaderHandle reader, JindoStatusCallba
             return JINDO_STATUS_ERROR;
         }
         // bool-returning async op: normalize completion into JindoStatus via shared callback
-        jdo_setBoolCallback(c->options, jindo_internal_bool_to_status_cb);
+        jdo_setBoolCallback(c->options, jindo_internal_io_status_cb);
         jdo_setCallbackContext(c->options, c);
         c->call = jdo_closeAsync(io->handle_ctx, c->options);
         if (!c->call) {
@@ -1664,5 +1535,23 @@ const char* jindo_get_last_error(void) {
 void jindo_free(void* p) {
     if (p) free(p);
 }
+
+#ifdef CURVINE_OSS_HDFS_FFI_TEST
+size_t jindo_test_default_filesystem_store_shards(void) {
+    return kDefaultFilesystemStoreShards;
+}
+
+size_t jindo_test_max_filesystem_store_shards(void) {
+    return kMaxFilesystemStoreShards;
+}
+
+int64_t jindo_test_filesystem_store_shard_wait_timeout_ms(void) {
+    return kFilesystemStoreShardWaitTimeoutMs;
+}
+
+bool jindo_test_is_reusable_operation_ctx(JindoStatus status) {
+    return is_reusable_operation_ctx(status);
+}
+#endif
 
 } // extern "C"

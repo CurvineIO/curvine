@@ -36,6 +36,18 @@ impl<T> AsyncSender<T> {
         Ok(())
     }
 
+    /// Whether this is a bounded channel. A bounded `send(...).await` can suspend
+    /// when the channel is full (and is therefore cancellable mid-await), whereas
+    /// `Unbounded::send` completes synchronously.
+    ///
+    /// This is intended **only** for cancellation-sensitive send paths that must
+    /// not be interrupted between committing state and enqueuing — they use it to
+    /// choose a `reserve()`-then-`Permit::send` path on bounded channels. Ordinary
+    /// callers should just use `send()` and not branch on the channel kind.
+    pub fn is_bounded(&self) -> bool {
+        matches!(self, AsyncSender::Bounded(_))
+    }
+
     pub fn send_sync(&self, value: T) -> IOResult<()> {
         match self {
             AsyncSender::Unbounded(s) => {

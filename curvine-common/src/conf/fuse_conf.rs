@@ -30,6 +30,19 @@ pub struct FuseConf {
 
     pub audit_logging_enabled: bool,
 
+    // Master on/off switch for FUSE metrics instrumentation (request/error/
+    // latency/notify series). Read once at startup; when false the reply path
+    // takes the legacy zero-cost path and emits no per-request metrics.
+    // Defaults to true (Phase 1–3 ship everything enabled).
+    //
+    // Scope: this is a per-request *emission* switch, not a cardinality/footprint
+    // downgrade. The metric families are registered unconditionally at startup
+    // (`FuseMetrics::ensure_init`), so when disabled they still appear in the
+    // scrape as zero-valued series — this keeps a stable scrape schema and lets
+    // the switch flip back on without re-registration. "Disabled" means "no
+    // emission", not "no registration".
+    pub metrics_enabled: bool,
+
     pub io_threads: usize,
 
     pub worker_threads: usize,
@@ -144,6 +157,20 @@ pub struct FuseConf {
 
     pub state_dir: String,
 
+    /// Override for the FUSE mount BDI `max_readahead_kb` (in KB).
+    ///
+    /// Defaults to [`FuseConf::DEFAULT_MAX_READAHEAD_KB`] (1024 = 1 MiB) for
+    /// all construction paths, including TOML `[fuse]` tables that omit this
+    /// field. When `Some(kb)` with `kb > 0`, curvine-fuse writes the value to
+    /// `/sys/class/bdi/<major>:<minor>/max_readahead_kb` after each successful
+    /// mount and bumps FUSE init `max_readahead` to at least `kb * 1024` bytes
+    /// so the kernel can issue larger sequential read requests.
+    ///
+    /// Set to `None` programmatically to keep the kernel default (no BDI
+    /// override). Linux only; on other platforms the value is accepted but has
+    /// no effect.
+    pub max_readahead_kb: Option<u32>,
+
     /// The following are some time types, which are initialized only after init is called.
     #[serde(skip_serializing, skip_deserializing)]
     pub attr_ttl: Duration,
@@ -178,6 +205,9 @@ impl FuseConf {
 
     pub const UMASK: u32 = 0o22;
 
+    /// Default FUSE BDI readahead window: 1 MiB (`1024` KB).
+    pub const DEFAULT_MAX_READAHEAD_KB: u32 = 1024;
+
     pub fn init(&mut self) -> CommonResult<()> {
         self.attr_ttl = Duration::from_secs_f64(self.attr_timeout);
         self.entry_ttl = Duration::from_secs_f64(self.entry_timeout);
@@ -188,6 +218,11 @@ impl FuseConf {
         if self.mnt_per_task == 0 {
             self.mnt_per_task = self.io_threads;
         }
+
+        if let Some(0) = self.max_readahead_kb {
+            return err_box!("fuse.max_readahead_kb must be > 0 when set");
+        }
+
         Ok(())
     }
 
@@ -278,6 +313,7 @@ impl Default for FuseConf {
         let mut conf = Self {
             debug: false,
             audit_logging_enabled: false,
+            metrics_enabled: true,
 
             io_threads: 32,
             worker_threads: Utils::worker_threads(32),
@@ -321,6 +357,7 @@ impl Default for FuseConf {
 
             state_dir: std::env::temp_dir().to_string_lossy().to_string(),
 
+            max_readahead_kb: Some(Self::DEFAULT_MAX_READAHEAD_KB),
             attr_ttl: Default::default(),
             entry_ttl: Default::default(),
             negative_ttl: Default::default(),
@@ -333,5 +370,78 @@ impl Default for FuseConf {
 
         conf.init().unwrap();
         conf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_max_readahead_kb_is_one_mib() {
+        let conf = FuseConf::default();
+        assert_eq!(
+            conf.max_readahead_kb,
+            Some(FuseConf::DEFAULT_MAX_READAHEAD_KB)
+        );
+    }
+
+    #[test]
+    fn init_rejects_zero_max_readahead_kb() {
+        let mut conf = FuseConf {
+            max_readahead_kb: Some(0),
+            ..Default::default()
+        };
+        let err = conf.init().expect_err("zero must be rejected");
+        assert!(
+            err.to_string().contains("max_readahead_kb"),
+            "error message should mention the field, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn init_accepts_positive_max_readahead_kb() {
+        let mut conf = FuseConf {
+            max_readahead_kb: Some(1024),
+            ..Default::default()
+        };
+        conf.init().expect("positive value must be accepted");
+        assert_eq!(conf.max_readahead_kb, Some(1024));
+    }
+
+    #[test]
+    fn toml_round_trip_with_max_readahead_kb() {
+        let toml = r#"
+max_readahead_kb = 1024
+"#;
+        let conf: FuseConf = toml::from_str(toml).expect("parse");
+        assert_eq!(conf.max_readahead_kb, Some(1024));
+    }
+
+    #[test]
+    fn toml_omitted_max_readahead_kb_uses_default() {
+        let conf: FuseConf = toml::from_str("io_threads = 16").expect("parse partial");
+        assert_eq!(
+            conf.max_readahead_kb,
+            Some(FuseConf::DEFAULT_MAX_READAHEAD_KB)
+        );
+    }
+
+    #[test]
+    fn toml_fuse_section_omitted_max_readahead_kb_uses_default() {
+        use crate::conf::ClusterConf;
+
+        let conf: ClusterConf = toml::from_str(
+            r#"
+[fuse]
+io_threads = 16
+"#,
+        )
+        .expect("parse cluster conf");
+        assert_eq!(
+            conf.fuse.max_readahead_kb,
+            Some(FuseConf::DEFAULT_MAX_READAHEAD_KB)
+        );
     }
 }

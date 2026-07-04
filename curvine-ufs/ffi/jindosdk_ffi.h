@@ -70,6 +70,7 @@ typedef struct {
 // =========================
 // NOTE: For async APIs below, `err` is a UTF-8 C string (may be NULL). The pointer is only
 // guaranteed to be valid for the duration of the callback invocation (Rust must copy it).
+// `JindoContentSummaryResultCallback.summary` follows the same callback-only lifetime.
 typedef void (*JindoStatusCallback)(JindoStatus status, const char* err, void* userdata);
 typedef void (*JindoBoolResultCallback)(JindoStatus status, bool value, const char* err, void* userdata);
 typedef void (*JindoFileInfoResultCallback)(JindoStatus status, JindoFileInfo* info, const char* err, void* userdata);
@@ -95,13 +96,14 @@ JindoStatus jindo_filesystem_init(
 );
 void jindo_filesystem_free(JindoFileSystemHandle fs);
 
-// Async directory/meta operations (sync APIs removed; async only)
+// Directory/meta operations keep the async callback ABI. The shim may call blocking
+// JindoSDK APIs internally, so Rust must invoke these through a blocking executor.
 JindoStatus jindo_filesystem_mkdir_async(JindoFileSystemHandle fs, const char* path, bool recursive, JindoStatusCallback cb, void* userdata);
 JindoStatus jindo_filesystem_rename_async(JindoFileSystemHandle fs, const char* oldpath, const char* newpath, JindoStatusCallback cb, void* userdata);
 JindoStatus jindo_filesystem_remove_async(JindoFileSystemHandle fs, const char* path, bool recursive, JindoStatusCallback cb, void* userdata);
 JindoStatus jindo_filesystem_exists_async(JindoFileSystemHandle fs, const char* path, JindoBoolResultCallback cb, void* userdata);
 
-// Async file info / list / summary (sync APIs removed; async only)
+// File info / list / summary operations keep the async callback ABI.
 JindoStatus jindo_filesystem_get_file_info_async(JindoFileSystemHandle fs, const char* path, JindoFileInfoResultCallback cb, void* userdata);
 JindoStatus jindo_filesystem_list_dir_async(JindoFileSystemHandle fs, const char* path, bool recursive, JindoListResultCallback cb, void* userdata);
 JindoStatus jindo_filesystem_get_content_summary_async(JindoFileSystemHandle fs, const char* path, bool recursive, JindoContentSummaryResultCallback cb, void* userdata);
@@ -137,9 +139,15 @@ const char* jindo_get_last_error(void);
 // Generic heap free helper (frees pointers allocated by this shim with malloc).
 void jindo_free(void* p);
 
+#ifdef CURVINE_OSS_HDFS_FFI_TEST
+size_t jindo_test_default_filesystem_store_shards(void);
+size_t jindo_test_max_filesystem_store_shards(void);
+int64_t jindo_test_filesystem_store_shard_wait_timeout_ms(void);
+bool jindo_test_is_reusable_operation_ctx(JindoStatus status);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
 
 #endif // JINDOSDK_FFI_H
-

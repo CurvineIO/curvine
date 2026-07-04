@@ -29,6 +29,12 @@ impl FuseError {
     pub fn new(errno: i32, error: CommonError) -> Self {
         Self { errno, error }
     }
+
+    /// The POSIX errno this error maps to. Used by the metrics finish path to
+    /// stash the errno label source.
+    pub(crate) fn errno(&self) -> i32 {
+        self.errno
+    }
 }
 
 impl From<String> for FuseError {
@@ -74,6 +80,7 @@ impl From<FsError> for FuseError {
             FsError::ParentNotDir(_) => Some(libc::ENOTDIR),
             FsError::NotADirectory(_) => Some(libc::ENOTDIR),
             FsError::InvalidPath(_) => Some(libc::EINVAL),
+            FsError::InvalidFileSize(_) => Some(libc::EFBIG),
             FsError::InvalidArgument(_) => Some(libc::EINVAL),
             FsError::DiskOutOfSpace(_) => Some(libc::ENOSPC),
             FsError::Timeout(_) => Some(libc::ETIMEDOUT),
@@ -149,13 +156,37 @@ pub(crate) fn errno_label(errno: i32) -> &'static str {
         libc::ENOMEM => "ENOMEM",
         libc::EBUSY => "EBUSY",
         libc::ENAMETOOLONG => "ENAMETOOLONG",
+        libc::EFBIG => "EFBIG",
         _ => "OTHER",
+    }
+}
+
+/// Low-cardinality lowercase label for a splice/receive errno, used by
+/// `receive_errors_total{errno}`. Deliberately separate from [`errno_label`]:
+/// receive errors occur before a request is decoded and the design fixes this
+/// to the small lowercase set the receiver loop actually matches on, rather
+/// than the full uppercase POSIX table.
+pub(crate) fn splice_errno_label(errno: i32) -> &'static str {
+    match errno {
+        libc::ENOENT => "enoent",
+        libc::EINTR => "eintr",
+        libc::EAGAIN => "eagain",
+        libc::ENODEV => "enodev",
+        _ => "other",
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::errno_label;
+    use super::{errno_label, splice_errno_label, FuseError};
+    use curvine_common::error::FsError;
+
+    #[test]
+    fn invalid_file_size_maps_to_efbig() {
+        let err: FuseError = FsError::file_too_large(1 << 60).into();
+        assert_eq!(err.errno, libc::EFBIG);
+        assert_eq!(errno_label(err.errno), "EFBIG");
+    }
 
     #[test]
     fn errno_label_maps_the_closed_set() {
@@ -185,6 +216,7 @@ mod tests {
             (libc::ENOMEM, "ENOMEM"),
             (libc::EBUSY, "EBUSY"),
             (libc::ENAMETOOLONG, "ENAMETOOLONG"),
+            (libc::EFBIG, "EFBIG"),
         ];
         for (e, expected) in table {
             assert_eq!(errno_label(e), expected, "label mismatch for errno {}", e);
@@ -197,5 +229,18 @@ mod tests {
         assert_eq!(errno_label(libc::ELOOP), "OTHER");
         assert_eq!(errno_label(0), "OTHER");
         assert_eq!(errno_label(99999), "OTHER");
+    }
+
+    #[test]
+    fn splice_errno_label_maps_the_lowercase_set() {
+        // The 5 lowercase values the receiver loop actually matches on.
+        assert_eq!(splice_errno_label(libc::ENOENT), "enoent");
+        assert_eq!(splice_errno_label(libc::EINTR), "eintr");
+        assert_eq!(splice_errno_label(libc::EAGAIN), "eagain");
+        assert_eq!(splice_errno_label(libc::ENODEV), "enodev");
+        // Anything else (incl. 0 / unknown) collapses to lowercase "other".
+        assert_eq!(splice_errno_label(libc::EIO), "other");
+        assert_eq!(splice_errno_label(0), "other");
+        assert_eq!(splice_errno_label(99999), "other");
     }
 }

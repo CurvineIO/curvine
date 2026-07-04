@@ -211,6 +211,18 @@ impl DBEngine {
         Ok(iter)
     }
 
+    /// Full-CF scan with bulk-scan ReadOptions (total_order_seek + fill_cache(false)
+    /// + 64 MiB readahead).  Use for one-shot bulk loads such as snapshot restore.
+    pub fn bulk_scan<'a: 'b, 'b>(
+        &'a self,
+        cf: &str,
+    ) -> CommonResult<DBIteratorWithThreadMode<'b, DB>> {
+        let cf = self.cf(cf)?;
+        let opt = self.conf.create_bulk_scan_opt();
+        let iter = self.db.iterator_cf_opt(cf, opt, IteratorMode::Start);
+        Ok(iter)
+    }
+
     pub fn get_db(&self) -> &DB {
         &self.db
     }
@@ -254,9 +266,7 @@ impl DBEngine {
             info!("Delete(format) exists db path {:?}", base_dir)
         }
 
-        if FileUtils::exists(base_dir) {
-            FileUtils::create_dir(base_dir, true)?;
-        }
+        FileUtils::create_dir(base_dir, true)?;
 
         Ok(())
     }

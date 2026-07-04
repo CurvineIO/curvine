@@ -102,6 +102,9 @@ pub struct JournalConf {
 
     pub ignore_reply_error: bool,
     pub max_retry_num: u64,
+    // If leader UFS replay keeps failing after max_retry_num, advance the UFS
+    // replay watermark and keep the master alive. Metadata replay is not skipped.
+    pub skip_failed_ufs_replay_after_retry: bool,
     pub scan_batch_size: u64,
     pub retry_interval_secs: u64,
 
@@ -260,6 +263,7 @@ impl Default for JournalConf {
 
             ignore_reply_error: false,
             max_retry_num: 1000,
+            skip_failed_ufs_replay_after_retry: true,
             scan_batch_size: 1000,
             retry_interval_secs: 10,
             ufs_copy_timeout: "20m".to_owned(), // 20 minutes

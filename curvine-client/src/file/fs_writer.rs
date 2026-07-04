@@ -151,8 +151,11 @@ impl Writer for FsWriter {
     }
 
     async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
+        let len = opts.len;
         self.flush_chunk().await?;
-        self.inner.resize(opts).await
+        self.inner.resize(opts).await?;
+        self.pos = self.pos.min(len);
+        Ok(())
     }
 }
 

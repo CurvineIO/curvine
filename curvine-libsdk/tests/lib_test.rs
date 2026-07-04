@@ -13,6 +13,14 @@
 // limitations under the License.
 
 #[test]
-fn compile() {
-    println!("111")
+fn compiles_with_default_java_sdk_feature() {
+    let _ = std::any::type_name::<curvine_libsdk::LibFilesystem>();
+}
+
+#[cfg(feature = "rust-sdk")]
+#[test]
+fn compiles_with_rust_sdk_feature() {
+    use curvine_libsdk::lib_curvine::{ConnectOptions, LibCurvine};
+    let _ = ConnectOptions::MasterAddrs(vec!["127.0.0.1:8995".to_string()]);
+    let _ = LibCurvine::builder();
 }

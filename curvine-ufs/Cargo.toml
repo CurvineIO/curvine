@@ -42,3 +42,4 @@ jni = ["dep:jni", "dep:anyhow", "dep:tracing"]  # JNI support (now local to curv
 
 ## OSS implementation using JindoSDK C++ library (async-only)
 oss-hdfs = []
+oss-hdfs-ffi-test = ["oss-hdfs"]

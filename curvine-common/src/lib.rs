@@ -37,4 +37,7 @@ pub type FsResult<T> = Result<T, FsError>;
 
 pub const FILE_BUFFER_SIZE: usize = 128 * 1024;
 
+/// Maximum supported file size (1 PiB).
+pub const MAX_FILE_SIZE: i64 = 1 << 50;
+
 pub const UFS_INODE_ID: i64 = 0;

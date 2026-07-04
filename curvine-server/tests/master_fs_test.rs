@@ -22,7 +22,7 @@ use curvine_common::proto::{
 use curvine_common::raft::storage::{AppStorage, ApplyMsg};
 use curvine_common::state::MountOptions;
 use curvine_common::state::{
-    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, WorkerInfo,
+    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, FileAllocOpts, WorkerInfo,
 };
 use curvine_common::state::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_common::utils::SerdeUtils;
@@ -479,6 +479,21 @@ fn rename_posix_semantics(fs: &MasterFilesystem) -> CommonResult<()> {
     )?;
     assert!(!fs.exists("/a/noreplace_src")?);
     assert!(fs.exists("/a/noreplace_new")?);
+
+    // src symlink, dst symlink -> overwrite existing symlink and keep dst deletable.
+    fs.symlink("nobody", "/a/symbolic", false, 0o777)?;
+    fs.rename("/a/symbolic", "/a/asymbolic", RenameFlags::empty())?;
+    assert!(!fs.exists("/a/symbolic")?);
+    assert!(fs.exists("/a/asymbolic")?);
+
+    fs.create("/a/object", true)?;
+    fs.symlink("object", "/a/symbolic", false, 0o777)?;
+    fs.rename("/a/symbolic", "/a/asymbolic", RenameFlags::empty())?;
+    assert!(!fs.exists("/a/symbolic")?);
+    assert!(fs.exists("/a/asymbolic")?);
+    fs.delete("/a/asymbolic", false)?;
+    assert!(!fs.exists("/a/asymbolic")?);
+    fs.delete("/a/object", false)?;
 
     Ok(())
 }
@@ -1275,4 +1290,19 @@ fn test_idempotent_set_locks() -> CommonResult<()> {
     replay_all_then_duplicate_last(&js, &loader)?;
     assert_eq!(fs.sum_hash(), fs2.sum_hash());
     Ok(())
+}
+
+#[test]
+fn resize_rejects_extreme_file_size() {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "resize-extreme");
+    fs.create("/extreme.log", true).unwrap();
+
+    let err = fs
+        .resize("/extreme.log", FileAllocOpts::with_truncate(1_i64 << 60))
+        .unwrap_err();
+    assert!(matches!(err, FsError::InvalidFileSize(_)));
+
+    let status = fs.file_status("/extreme.log").unwrap();
+    assert_eq!(status.len, 0);
 }

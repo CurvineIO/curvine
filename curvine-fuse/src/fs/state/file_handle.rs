@@ -15,6 +15,7 @@
 use crate::fs::operator::{Read, Write};
 use crate::fs::state::NodeState;
 use crate::fs::{FuseReader, FuseWriter};
+use crate::raw::fuse_abi::fuse_write_out;
 use crate::session::FuseResponse;
 use crate::{err_fuse, FuseError, FuseResult};
 use curvine_common::fs::{Path, StateReader, StateWriter};
@@ -96,6 +97,17 @@ impl FileHandle {
 
     pub async fn write(&self, op: Write<'_>, reply: FuseResponse) -> FuseResult<()> {
         if op.data.is_empty() {
+            // A zero-length write is a valid no-op, but it must still send a
+            // reply (size=0) rather than returning silently: silently returning
+            // would leave the request's metrics context un-finished (the guard
+            // would only be released by passive drop, never reaching a terminal
+            // state-machine transition). Reply normally so it finishes like any
+            // other replied request.
+            let res: FuseResult<fuse_write_out> = Ok(fuse_write_out {
+                size: 0,
+                padding: 0,
+            });
+            reply.send_rep(res).await?;
             return Ok(());
         }
 
