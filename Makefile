@@ -14,6 +14,9 @@ ifeq ($(IS_UBUNTU),1)
   SHELL_CMD := bash
 endif
 
+FLUID_IMAGE ?= curvine-fluid:latest
+FLUID_BASE_IMAGE_TAG ?= latest
+
 # Default target - show help
 help:
 	@echo "Curvine Build System - Available Commands:"
@@ -36,6 +39,7 @@ help:
 	@echo ""
 	@echo "Fluid (Kubernetes):"
 	@echo "  make docker-build-fluid          - Build unified Fluid Docker image (supports both cache-runtime and thin-runtime)"
+	@echo "                                    FLUID_IMAGE=curvine-fluid:latest FLUID_BASE_IMAGE_TAG=latest"
 	@echo ""
 	@echo "CSI (Container Storage Interface):"
 	@echo "  make curvine-csi                 - Build curvine-csi Docker image"
@@ -125,34 +129,34 @@ docker-compile:
 	docker run --rm --entrypoint="" -v $(PWD):/workspace -w /workspace curvine/curvine-compile:build-cached bash -c "make all"
 
 # 7.1. Build Fluid CacheRuntime Docker image
-docker-build-fluid-cache:
-	@echo "Building Fluid CacheRuntime Docker image..."
-	@bash curvine-docker/fluid/cache-runtime/build-image.sh
+docker-build-fluid-cache: docker-build-fluid
 
 # 7.2. Build Fluid ThinRuntime Docker image
-docker-build-fluid-thin:
-	@echo "Building Fluid ThinRuntime Docker image..."
-	@bash curvine-docker/fluid/thin-runtime/build-image.sh
+docker-build-fluid-thin: docker-build-fluid
 
 # 7.3. Build unified Fluid Docker image
 docker-build-fluid:
 	@echo "Building unified Fluid Docker image..."
 	@echo "This image supports both cache-runtime and thin-runtime modes"
-	@if ! docker image inspect ghcr.io/curvineio/curvine:latest >/dev/null 2>&1; then \
-		echo "Warning: Base image ghcr.io/curvineio/curvine:latest not found locally."; \
+	@if ! docker image inspect ghcr.io/curvineio/curvine:$(FLUID_BASE_IMAGE_TAG) >/dev/null 2>&1; then \
+		echo "Warning: Base image ghcr.io/curvineio/curvine:$(FLUID_BASE_IMAGE_TAG) not found locally."; \
 		echo "Attempting to pull from registry..."; \
-		docker pull ghcr.io/curvineio/curvine:latest || \
+		docker pull ghcr.io/curvineio/curvine:$(FLUID_BASE_IMAGE_TAG) || \
 		(echo "Error: Failed to pull base image. Please build it first with 'make docker-build' or pull from registry." && exit 1); \
 	fi
-	@cd curvine-docker/fluid && docker build -f Dockerfile -t curvine-fluid:latest .
-	@echo "✓ Unified Fluid Docker image built successfully: curvine-fluid:latest"
+	@docker build \
+		--build-arg BASE_IMAGE_TAG=$(FLUID_BASE_IMAGE_TAG) \
+		-f curvine-docker/fluid/Dockerfile \
+		-t $(FLUID_IMAGE) \
+		curvine-docker/fluid
+	@echo "✓ Unified Fluid Docker image built successfully: $(FLUID_IMAGE)"
 	@echo ""
 	@echo "Usage examples:"
 	@echo "  # CacheRuntime mode:"
-	@echo "  docker run -e FLUID_RUNTIME_COMPONENT_TYPE=master curvine-fluid:latest master start"
+	@echo "  docker run -e FLUID_RUNTIME_COMPONENT_TYPE=master $(FLUID_IMAGE) master start"
 	@echo ""
 	@echo "  # ThinRuntime mode:"
-	@echo "  docker run curvine-fluid:latest fluid-thin-runtime"
+	@echo "  docker run $(FLUID_IMAGE) fluid-thin-runtime"
 
 # 8. CSI (Container Storage Interface) target
 .PHONY: curvine-csi
@@ -225,8 +229,7 @@ docker-compose-spdk:
 	@echo "  sudo modprobe uio_pci_generic"
 	@echo "  sudo modprobe nvme nvme-fabrics nvme-tcp"
 	@echo ""
-	DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1 \
-	docker compose -f curvine-docker/deploy/spdk/docker-compose.yml up --build -d
+	cd curvine-docker/deploy/spdk && docker compose up --build -d
 	@echo "✓ SPDK stack started. Check status with: docker compose -f curvine-docker/deploy/spdk/docker-compose.yml ps"
 
 # Stop SPDK target + initiator stack
