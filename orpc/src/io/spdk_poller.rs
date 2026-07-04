@@ -610,11 +610,11 @@ impl SpdkPoller {
     }
 
     /// Process admin completions on all controllers to service keep-alive.
-    fn process_admin_completions(ctrlrs: &[*mut spdk_ffi::spdk_nvme_ctrlr]) {
-        for &ctrlr in ctrlrs {
-            let rc = unsafe { spdk_ffi::spdk_nvme_ctrlr_process_admin_completions(ctrlr) };
+    fn process_admin_completions(ctrlrs: &[CtrlHandle]) {
+        for handle in ctrlrs {
+            let rc = unsafe { spdk_ffi::spdk_nvme_ctrlr_process_admin_completions(handle.0) };
             if rc < 0 {
-                warn!("ctrlr {:p} admin completion error: rc={}", ctrlr, rc);
+                warn!("ctrlr {:p} admin completion error: rc={}", handle.0, rc);
             }
         }
     }
