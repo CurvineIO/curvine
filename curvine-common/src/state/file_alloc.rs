@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::error::FsError;
 use crate::FsResult;
+use crate::MAX_FILE_SIZE;
 use bitflags::bitflags;
-use orpc::err_box;
+use orpc::{err_box, err_ext};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 bitflags! {
@@ -120,7 +122,11 @@ impl FileAllocOpts {
         }
 
         if self.len < 0 {
-            return err_box!("len must be >= 0 for allocate operation, got {}", self.len);
+            return err_box!("len must be >= 0, got {}", self.len);
+        }
+
+        if self.len > MAX_FILE_SIZE {
+            return err_ext!(FsError::file_too_large(self.len));
         }
 
         if !self.truncate {
@@ -143,5 +149,36 @@ impl FileAllocOpts {
             len,
             ..self.clone()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::FsError;
+
+    #[test]
+    fn validate_rejects_extreme_truncate_size() {
+        let opts = FileAllocOpts::with_truncate(1 << 60);
+        let err = opts.validate().unwrap_err();
+        assert!(matches!(err, FsError::InvalidFileSize(_)));
+    }
+
+    #[test]
+    fn validate_allows_max_supported_size() {
+        let opts = FileAllocOpts::with_truncate(MAX_FILE_SIZE);
+        assert!(opts.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_extreme_size_for_keep_size_allocate() {
+        let opts = FileAllocOpts {
+            truncate: false,
+            off: 0,
+            len: 1 << 60,
+            mode: FileAllocMode::KEEP_SIZE,
+        };
+        let err = opts.validate().unwrap_err();
+        assert!(matches!(err, FsError::InvalidFileSize(_)));
     }
 }

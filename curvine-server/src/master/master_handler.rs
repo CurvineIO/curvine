@@ -28,6 +28,7 @@ use curvine_common::state::{
 };
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
+use log::error;
 use orpc::err_box;
 use orpc::handler::{FrameBuf, MessageHandler};
 use orpc::io::net::ConnState;
@@ -427,12 +428,18 @@ impl MasterHandler {
 
     pub fn worker_heartbeat(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: WorkerHeartbeatRequest = ctx.parse_header()?;
+        let status = HeartbeatStatus::from(header.status);
+        let address = ProtoUtils::worker_address_from_pb(&header.address);
+        if matches!(status, HeartbeatStatus::Start) {
+            self.fs.reset_full_block_report(address.worker_id);
+        }
+
         let mut wm = self.fs.worker_manager.write();
 
         let cmds = wm.heartbeat(
             &header.cluster_id,
-            HeartbeatStatus::from(header.status),
-            ProtoUtils::worker_address_from_pb(&header.address),
+            status,
+            address,
             ProtoUtils::storage_info_list_from_pb(header.storages),
         )?;
         drop(wm);
@@ -446,7 +453,21 @@ impl MasterHandler {
     pub fn block_report(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: BlockReportListRequest = ctx.parse_header()?;
         let list = ProtoUtils::block_report_list_from_pb(header);
-        self.fs.block_report(list)?;
+        let worker_id = list.worker_id;
+        let stale_block_ids = self.fs.block_report(list)?;
+        let stale_block_count = stale_block_ids.len();
+        if stale_block_count > 0 {
+            if let Some(replication_handler) = &self.replication_handler {
+                if let Err(e) =
+                    replication_handler.report_under_replicated_blocks(worker_id, stale_block_ids)
+                {
+                    error!(
+                        "Errors on reporting under-replicated {} blocks from full block report reconciliation. err: {:?}",
+                        stale_block_count, e
+                    );
+                }
+            }
+        }
 
         let rep_header = BlockReportListResponse::default();
         ctx.response_buf(rep_header, &mut self.buf)

@@ -21,6 +21,7 @@ use curvine_common::state::StorageType;
 use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::{ByteUnit, TimeSpent};
+use orpc::error::ErrorExt;
 use orpc::handler::MessageHandler;
 use orpc::io::{BlockDevice, BlockIO};
 use orpc::message::{Builder, Message, RequestStatus};
@@ -59,7 +60,10 @@ impl ReadHandler {
 
     pub fn open(&mut self, msg: &Message) -> FsResult<Message> {
         let mut context = ReadContext::from_req(msg)?;
-        let meta = self.store.get_block(context.block_id)?;
+        let meta = self.store.get_block(context.block_id).map_err(|e| {
+            FsError::block_not_found(context.block_id)
+                .ctx(format!("worker block store lookup failed: {}", e))
+        })?;
 
         if context.off > meta.len {
             return err_box!(

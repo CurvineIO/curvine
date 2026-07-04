@@ -1,0 +1,154 @@
+name: Trigger Helm Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to sync to curvine-helm (e.g. v0.3.0)'
+        required: true
+        type: string
+      commit_sha:
+        description: 'Curvine commit SHA for the release (optional)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  packages: read
+
+concurrency:
+  group: trigger-helm-release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  trigger-helm-release:
+    name: Wait for images and dispatch helm release
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Resolve release metadata
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+            SHA="${{ inputs.commit_sha }}"
+            if [ -z "$SHA" ]; then
+              SHA="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TAG}" --jq '.sha')"
+            fi
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+            SHA="${GITHUB_SHA}"
+          fi
+
+          if [[ ! "$TAG" =~ ^v ]]; then
+            echo "::error::Release tag must start with v, got: $TAG"
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
+          echo "Source commit: $SHA"
+
+      - name: Wait for runtime and CSI image workflows
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          SHA="${{ steps.meta.outputs.sha }}"
+          WORKFLOWS=(
+            "build-runtime-image.yml:push"
+            "build-csi-image.yml:push"
+          )
+          DEADLINE=$((SECONDS + 7200))
+
+          wait_for_workflow() {
+            local workflow_file="$1"
+            local expected_event="$2"
+            local status conclusion
+
+            while [ "$SECONDS" -lt "$DEADLINE" ]; do
+              local query
+              query='first(.workflow_runs[] | select(.event == "'"${expected_event}"'") | "\(.status) \(.conclusion // "null")") // "null null"'
+
+              read -r status conclusion < <(
+                gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_file}/runs" \
+                  -f head_sha="$SHA" \
+                  -f per_page=10 \
+                  --jq "$query" \
+                  | awk '{print $1, $2}'
+              )
+
+              if [ -z "${status:-}" ] || [ "$status" = "null" ]; then
+                echo "Waiting for ${workflow_file} (${expected_event}) to start..."
+                sleep 30
+                continue
+              fi
+
+              if [ "$status" = "completed" ]; then
+                if [ "$conclusion" = "success" ]; then
+                  echo "${workflow_file} completed successfully"
+                  return 0
+                fi
+
+                echo "::error::${workflow_file} completed with conclusion: ${conclusion}"
+                return 1
+              fi
+
+              echo "${workflow_file} (${expected_event}) status: ${status}"
+              sleep 30
+            done
+
+            echo "::error::Timed out waiting for ${workflow_file}"
+            return 1
+          }
+
+          for workflow in "${WORKFLOWS[@]}"; do
+            IFS=: read -r workflow_file expected_event <<< "$workflow"
+            wait_for_workflow "$workflow_file" "$expected_event"
+          done
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify release images in GHCR
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+
+          for image in ghcr.io/curvineio/curvine ghcr.io/curvineio/curvine-csi ghcr.io/curvineio/curvine-fluid; do
+            echo "Inspecting ${image}:${TAG}"
+            docker buildx imagetools inspect "${image}:${TAG}"
+          done
+
+      - name: Dispatch curvine-helm release
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.CURVINE_HELM_DISPATCH_TOKEN }}
+          repository: CurvineIO/curvine-helm
+          event-type: curvine-release
+          client-payload: >-
+            {
+              "tag": "${{ steps.meta.outputs.tag }}",
+              "sha": "${{ steps.meta.outputs.sha }}",
+              "repository": "${{ github.repository }}"
+            }
+
+      - name: Dispatch summary
+        run: |
+          {
+            echo "## Helm Release Dispatch"
+            echo "- **Tag**: ${{ steps.meta.outputs.tag }}"
+            echo "- **Source commit**: ${{ steps.meta.outputs.sha }}"
+            echo "- **Target repository**: CurvineIO/curvine-helm"
+            echo "- **Event**: curvine-release"
+          } >> "$GITHUB_STEP_SUMMARY"

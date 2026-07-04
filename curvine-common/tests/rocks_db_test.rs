@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use curvine_common::rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
-use orpc::common::FileUtils;
+use orpc::common::{FileUtils, Utils};
 use orpc::CommonResult;
 
 // Rocksdb database core function test
@@ -27,6 +27,22 @@ fn test_rocksdb_scan_and_range_operations() {
 
     scan_test1(&db, "scan1").unwrap();
     scan_test2(&db, "scan2").unwrap();
+}
+
+#[test]
+fn test_rocksdb_non_format_creates_missing_base_dir() -> CommonResult<()> {
+    let base_dir = Utils::test_sub_dir(format!("rocks_non_format_missing_{}", Utils::rand_str(6)));
+    FileUtils::delete_path(&base_dir, true)?;
+
+    let conf = DBConf::new(&base_dir);
+    let db = DBEngine::new(conf.clone(), false)?;
+    db.put("k".as_bytes(), "v")?;
+
+    assert!(std::path::Path::new(&conf.data_dir)
+        .join("CURRENT")
+        .is_file());
+
+    Ok(())
 }
 
 #[test]

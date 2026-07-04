@@ -68,3 +68,128 @@ pub enum FuseOpCode {
 
     CUSE_INIT = 4096,
 }
+
+impl FuseOpCode {
+    /// Returns a stable, low-cardinality `&'static str` name for this opcode,
+    /// suitable for use as a metric label. Zero-allocation: the metrics hot
+    /// path must never `format!("{:?}", op)`.
+    ///
+    /// Names are short CamelCase (e.g. `Lookup`, `GetAttr`, `Read`) matching
+    /// the `opcode` label convention in the FUSE metrics design.
+    // Phase 0 enabling primitive: defined here, wired to call sites in Phase 1.
+    #[allow(dead_code)]
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            FuseOpCode::NOT_SUPPORTED => "NotSupported",
+            FuseOpCode::FUSE_LOOKUP => "Lookup",
+            FuseOpCode::FUSE_FORGET => "Forget",
+            FuseOpCode::FUSE_GETATTR => "GetAttr",
+            FuseOpCode::FUSE_SETATTR => "SetAttr",
+            FuseOpCode::FUSE_READLINK => "Readlink",
+            FuseOpCode::FUSE_SYMLINK => "Symlink",
+            FuseOpCode::FUSE_MKNOD => "MkNod",
+            FuseOpCode::FUSE_MKDIR => "Mkdir",
+            FuseOpCode::FUSE_UNLINK => "Unlink",
+            FuseOpCode::FUSE_RMDIR => "RmDir",
+            FuseOpCode::FUSE_RENAME => "Rename",
+            FuseOpCode::FUSE_LINK => "Link",
+            FuseOpCode::FUSE_OPEN => "Open",
+            FuseOpCode::FUSE_READ => "Read",
+            FuseOpCode::FUSE_WRITE => "Write",
+            FuseOpCode::FUSE_STATFS => "StatFs",
+            FuseOpCode::FUSE_RELEASE => "Release",
+            FuseOpCode::FUSE_FSYNC => "Fsync",
+            FuseOpCode::FUSE_SETXATTR => "SetXAttr",
+            FuseOpCode::FUSE_GETXATTR => "GetXAttr",
+            FuseOpCode::FUSE_LISTXATTR => "ListXAttr",
+            FuseOpCode::FUSE_REMOVEXATTR => "RemoveXAttr",
+            FuseOpCode::FUSE_FLUSH => "Flush",
+            FuseOpCode::FUSE_INIT => "Init",
+            FuseOpCode::FUSE_OPENDIR => "OpenDir",
+            FuseOpCode::FUSE_READDIR => "ReadDir",
+            FuseOpCode::FUSE_RELEASEDIR => "ReleaseDir",
+            FuseOpCode::FUSE_FSYNCDIR => "FsyncDir",
+            FuseOpCode::FUSE_GETLK => "GetLk",
+            FuseOpCode::FUSE_SETLK => "SetLk",
+            FuseOpCode::FUSE_SETLKW => "SetLkW",
+            FuseOpCode::FUSE_ACCESS => "Access",
+            FuseOpCode::FUSE_CREATE => "Create",
+            FuseOpCode::FUSE_INTERRUPT => "Interrupt",
+            FuseOpCode::FUSE_BMAP => "BMap",
+            FuseOpCode::FUSE_DESTROY => "Destroy",
+            FuseOpCode::FUSE_IOCTL => "Ioctl",
+            FuseOpCode::FUSE_POLL => "Poll",
+            FuseOpCode::FUSE_NOTIFY_REPLY => "NotifyReply",
+            FuseOpCode::FUSE_BATCH_FORGET => "BatchForget",
+            FuseOpCode::FUSE_FALLOCATE => "FAllocate",
+            FuseOpCode::FUSE_READDIRPLUS => "ReadDirPlus",
+            FuseOpCode::FUSE_RENAME2 => "Rename2",
+            FuseOpCode::FUSE_LSEEK => "Lseek",
+            FuseOpCode::CUSE_INIT => "CuseInit",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FuseOpCode;
+
+    #[test]
+    fn as_str_matches_the_full_label_table() {
+        // Full (variant, expected-label) table covering every enum variant.
+        // Any accidental relabeling must update this table (and the design
+        // doc's `opcode` label convention) together, so a Prometheus series
+        // name can never drift silently.
+        let table = [
+            (FuseOpCode::NOT_SUPPORTED, "NotSupported"),
+            (FuseOpCode::FUSE_LOOKUP, "Lookup"),
+            (FuseOpCode::FUSE_FORGET, "Forget"),
+            (FuseOpCode::FUSE_GETATTR, "GetAttr"),
+            (FuseOpCode::FUSE_SETATTR, "SetAttr"),
+            (FuseOpCode::FUSE_READLINK, "Readlink"),
+            (FuseOpCode::FUSE_SYMLINK, "Symlink"),
+            (FuseOpCode::FUSE_MKNOD, "MkNod"),
+            (FuseOpCode::FUSE_MKDIR, "Mkdir"),
+            (FuseOpCode::FUSE_UNLINK, "Unlink"),
+            (FuseOpCode::FUSE_RMDIR, "RmDir"),
+            (FuseOpCode::FUSE_RENAME, "Rename"),
+            (FuseOpCode::FUSE_LINK, "Link"),
+            (FuseOpCode::FUSE_OPEN, "Open"),
+            (FuseOpCode::FUSE_READ, "Read"),
+            (FuseOpCode::FUSE_WRITE, "Write"),
+            (FuseOpCode::FUSE_STATFS, "StatFs"),
+            (FuseOpCode::FUSE_RELEASE, "Release"),
+            (FuseOpCode::FUSE_FSYNC, "Fsync"),
+            (FuseOpCode::FUSE_SETXATTR, "SetXAttr"),
+            (FuseOpCode::FUSE_GETXATTR, "GetXAttr"),
+            (FuseOpCode::FUSE_LISTXATTR, "ListXAttr"),
+            (FuseOpCode::FUSE_REMOVEXATTR, "RemoveXAttr"),
+            (FuseOpCode::FUSE_FLUSH, "Flush"),
+            (FuseOpCode::FUSE_INIT, "Init"),
+            (FuseOpCode::FUSE_OPENDIR, "OpenDir"),
+            (FuseOpCode::FUSE_READDIR, "ReadDir"),
+            (FuseOpCode::FUSE_RELEASEDIR, "ReleaseDir"),
+            (FuseOpCode::FUSE_FSYNCDIR, "FsyncDir"),
+            (FuseOpCode::FUSE_GETLK, "GetLk"),
+            (FuseOpCode::FUSE_SETLK, "SetLk"),
+            (FuseOpCode::FUSE_SETLKW, "SetLkW"),
+            (FuseOpCode::FUSE_ACCESS, "Access"),
+            (FuseOpCode::FUSE_CREATE, "Create"),
+            (FuseOpCode::FUSE_INTERRUPT, "Interrupt"),
+            (FuseOpCode::FUSE_BMAP, "BMap"),
+            (FuseOpCode::FUSE_DESTROY, "Destroy"),
+            (FuseOpCode::FUSE_IOCTL, "Ioctl"),
+            (FuseOpCode::FUSE_POLL, "Poll"),
+            (FuseOpCode::FUSE_NOTIFY_REPLY, "NotifyReply"),
+            (FuseOpCode::FUSE_BATCH_FORGET, "BatchForget"),
+            (FuseOpCode::FUSE_FALLOCATE, "FAllocate"),
+            (FuseOpCode::FUSE_READDIRPLUS, "ReadDirPlus"),
+            (FuseOpCode::FUSE_RENAME2, "Rename2"),
+            (FuseOpCode::FUSE_LSEEK, "Lseek"),
+            (FuseOpCode::CUSE_INIT, "CuseInit"),
+        ];
+        for (op, expected) in table {
+            assert_eq!(op.as_str(), expected, "label mismatch for {:?}", op);
+        }
+    }
+}

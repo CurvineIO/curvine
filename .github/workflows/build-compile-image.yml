@@ -8,6 +8,11 @@ on:
         required: false
         default: false
         type: boolean
+      build_types:
+        description: 'Build types (comma-separated: rocky9, ubuntu22.04, ubuntu24.04, amzn2, centos7, or "all")'
+        required: false
+        default: 'all'
+        type: string
       platforms:
         description: 'Target platforms (comma-separated)'
         required: false
@@ -19,83 +24,112 @@ permissions:
   packages: write
 
 jobs:
-  # Build for each build type and architecture on native runners
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      build_matrix: ${{ steps.set-matrix.outputs.build_matrix }}
+      manifest_matrix: ${{ steps.set-matrix.outputs.manifest_matrix }}
+      build_types_summary: ${{ steps.set-matrix.outputs.build_types_summary }}
+    steps:
+      - name: Resolve build matrix
+        id: set-matrix
+        env:
+          BUILD_TYPES: ${{ inputs.build_types }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+
+          ALL_BUILD_MATRIX='[
+            {"build_type":"rocky9","dockerfile":"Dockerfile_rocky9","context":"./curvine-docker/compile","tag":"rocky9","arch":"amd64","runner":"ubuntu-latest"},
+            {"build_type":"rocky9","dockerfile":"Dockerfile_rocky9","context":"./curvine-docker/compile","tag":"rocky9","arch":"arm64","runner":"ubuntu-24.04-arm"},
+            {"build_type":"ubuntu22.04","dockerfile":"Dockerfile_ubuntu22","context":"./curvine-docker/compile","tag":"ubuntu22.04","arch":"amd64","runner":"ubuntu-latest"},
+            {"build_type":"ubuntu22.04","dockerfile":"Dockerfile_ubuntu22","context":"./curvine-docker/compile","tag":"ubuntu22.04","arch":"arm64","runner":"ubuntu-24.04-arm"},
+            {"build_type":"ubuntu24.04","dockerfile":"Dockerfile_ubuntu24","context":"./curvine-docker/compile","tag":"ubuntu24.04","arch":"amd64","runner":"ubuntu-latest"},
+            {"build_type":"ubuntu24.04","dockerfile":"Dockerfile_ubuntu24","context":"./curvine-docker/compile","tag":"ubuntu24.04","arch":"arm64","runner":"ubuntu-24.04-arm"},
+            {"build_type":"amzn2","dockerfile":"Dockerfile_amzn2","context":"./curvine-docker/compile","tag":"amzn2","arch":"amd64","runner":"ubuntu-latest"},
+            {"build_type":"amzn2","dockerfile":"Dockerfile_amzn2","context":"./curvine-docker/compile","tag":"amzn2","arch":"arm64","runner":"ubuntu-24.04-arm"},
+            {"build_type":"centos7","dockerfile":"Dockerfile_centos7","context":"./curvine-docker/compile","tag":"centos7","arch":"amd64","runner":"ubuntu-latest"}
+          ]'
+
+          BUILD_TYPES="${BUILD_TYPES:-all}"
+          PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm64}"
+
+          if [ "$BUILD_TYPES" = "all" ]; then
+            FILTERED_BUILD_MATRIX="$ALL_BUILD_MATRIX"
+          else
+            IFS=',' read -ra REQUESTED_TYPES <<< "$BUILD_TYPES"
+            FILTERED_BUILD_MATRIX='[]'
+            for requested in "${REQUESTED_TYPES[@]}"; do
+              requested="$(echo "$requested" | xargs)"
+              if [ -z "$requested" ]; then
+                continue
+              fi
+              case "$requested" in
+                rocky9|ubuntu22.04|ubuntu24.04|amzn2|centos7) ;;
+                *)
+                  echo "::error::Unknown build type: ${requested}"
+                  exit 1
+                  ;;
+              esac
+              MATCHED=$(echo "$ALL_BUILD_MATRIX" | jq -c --arg tag "$requested" '[.[] | select(.tag == $tag)]')
+              FILTERED_BUILD_MATRIX=$(echo "$FILTERED_BUILD_MATRIX $MATCHED" | jq -sc 'add')
+            done
+          fi
+
+          if [ "$(echo "$FILTERED_BUILD_MATRIX" | jq 'length')" -eq 0 ]; then
+            echo "::error::No build matrix entries matched build_types=${BUILD_TYPES}"
+            exit 1
+          fi
+
+          INCLUDE_AMD64=false
+          INCLUDE_ARM64=false
+          if [[ "$PLATFORMS" == *"amd64"* ]]; then INCLUDE_AMD64=true; fi
+          if [[ "$PLATFORMS" == *"arm64"* ]]; then INCLUDE_ARM64=true; fi
+          if [ "$INCLUDE_AMD64" = false ] && [ "$INCLUDE_ARM64" = false ]; then
+            echo "::error::No supported architectures found in platforms=${PLATFORMS}"
+            exit 1
+          fi
+
+          FILTERED_BUILD_MATRIX=$(echo "$FILTERED_BUILD_MATRIX" | jq -c \
+            --argjson include_amd64 "$INCLUDE_AMD64" \
+            --argjson include_arm64 "$INCLUDE_ARM64" \
+            '[.[] | select((.arch == "amd64" and $include_amd64) or (.arch == "arm64" and $include_arm64))]')
+
+          if [ "$(echo "$FILTERED_BUILD_MATRIX" | jq 'length')" -eq 0 ]; then
+            echo "::error::No build matrix entries matched platforms=${PLATFORMS}"
+            exit 1
+          fi
+
+          MANIFEST_MATRIX=$(echo "$FILTERED_BUILD_MATRIX" | jq -c '
+            group_by(.tag)
+            | map({
+                tag: .[0].tag,
+                archs: [.[].arch] | unique
+              })
+          ')
+          BUILD_TYPES_SUMMARY=$(echo "$FILTERED_BUILD_MATRIX" | jq -r '[.[].tag] | unique | join(", ")')
+
+          {
+            echo "build_matrix<<EOF"
+            echo "$FILTERED_BUILD_MATRIX"
+            echo "EOF"
+            echo "manifest_matrix<<EOF"
+            echo "$MANIFEST_MATRIX"
+            echo "EOF"
+            echo "build_types_summary=${BUILD_TYPES_SUMMARY}"
+          } >> "$GITHUB_OUTPUT"
+
+  # Build for each selected build type and architecture on native runners
   build-image:
+    needs: prepare
     strategy:
+      fail-fast: false
       matrix:
-        include:
-          # Rocky Linux 9 (standard)
-          - build_type: rocky9
-            dockerfile: Dockerfile_rocky9
-            context: ./curvine-docker/compile
-            tag: rocky9
-            arch: amd64
-            runner: ubuntu-latest
-          - build_type: rocky9
-            dockerfile: Dockerfile_rocky9
-            context: ./curvine-docker/compile
-            tag: rocky9
-            arch: arm64
-            runner: ubuntu-24.04-arm
-          # Rocky Linux 9 (cached)
-          - build_type: rocky9_cached
-            dockerfile: Dockerfile_rocky9_cached
-            context: .
-            tag: rocky9_cached
-            arch: amd64
-            runner: ubuntu-latest
-          - build_type: rocky9_cached
-            dockerfile: Dockerfile_rocky9_cached
-            context: .
-            tag: rocky9_cached
-            arch: arm64
-            runner: ubuntu-24.04-arm
-          # Ubuntu 22.04
-          - build_type: ubuntu22.04
-            dockerfile: Dockerfile_ubuntu22
-            context: ./curvine-docker/compile
-            tag: ubuntu22.04
-            arch: amd64
-            runner: ubuntu-latest
-          - build_type: ubuntu22.04
-            dockerfile: Dockerfile_ubuntu22
-            context: ./curvine-docker/compile
-            tag: ubuntu22.04
-            arch: arm64
-            runner: ubuntu-24.04-arm
-          # Ubuntu 24.04
-          - build_type: ubuntu24.04
-            dockerfile: Dockerfile_ubuntu24
-            context: ./curvine-docker/compile
-            tag: ubuntu24.04
-            arch: amd64
-            runner: ubuntu-latest
-          - build_type: ubuntu24.04
-            dockerfile: Dockerfile_ubuntu24
-            context: ./curvine-docker/compile
-            tag: ubuntu24.04
-            arch: arm64
-            runner: ubuntu-24.04-arm
-          # Amazon Linux 2
-          - build_type: amzn2
-            dockerfile: Dockerfile_amzn2
-            context: ./curvine-docker/compile
-            tag: amzn2
-            arch: amd64
-            runner: ubuntu-latest
-          - build_type: amzn2
-            dockerfile: Dockerfile_amzn2
-            context: ./curvine-docker/compile
-            tag: amzn2
-            arch: arm64
-            runner: ubuntu-24.04-arm
+        include: ${{ fromJSON(needs.prepare.outputs.build_matrix) }}
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
       
       - name: Login to GitHub Container Registry
         if: inputs.push_image == true
@@ -112,42 +146,34 @@ jobs:
           username: curvine
           password: ${{ secrets.PAT_DOCKERIO_TOKEN }}
       
-      - name: Build and push compile image for ${{ matrix.build_type }} (${{ matrix.arch }})
-        uses: docker/build-push-action@v5
-        with:
-          context: ${{ matrix.context }}
-          file: ./curvine-docker/compile/${{ matrix.dockerfile }}
-          platforms: linux/${{ matrix.arch }}
-          push: ${{ inputs.push_image }}
-          tags: |
-            ghcr.io/curvineio/curvine-compile:${{ matrix.tag }}-${{ matrix.arch }}
-            curvine/curvine-compile:${{ matrix.tag }}-${{ matrix.arch }}
-          cache-from: type=gha,scope=compile-${{ matrix.build_type }}-${{ matrix.arch }}
-          # Transient GHA cache API errors (e.g. 502) must not fail the job after image build/push succeeds.
-          cache-to: type=gha,mode=max,scope=compile-${{ matrix.build_type }}-${{ matrix.arch }},ignore-error=true
+      - name: Build compile image for ${{ matrix.build_type }} (${{ matrix.arch }})
+        run: |
+          docker build \
+            -f ./curvine-docker/compile/${{ matrix.dockerfile }} \
+            -t ghcr.io/curvineio/curvine-compile:${{ matrix.tag }}-${{ matrix.arch }} \
+            -t curvine/curvine-compile:${{ matrix.tag }}-${{ matrix.arch }} \
+            ${{ matrix.context }}
+
+      - name: Push compile image for ${{ matrix.build_type }} (${{ matrix.arch }})
+        if: inputs.push_image == true
+        run: |
+          docker push ghcr.io/curvineio/curvine-compile:${{ matrix.tag }}-${{ matrix.arch }}
+          docker push curvine/curvine-compile:${{ matrix.tag }}-${{ matrix.arch }}
       
       - name: Build summary for ${{ matrix.build_type }} (${{ matrix.arch }})
         run: |
           echo "✅ Built compile image for ${{ matrix.build_type }} (${{ matrix.arch }})" >> $GITHUB_STEP_SUMMARY
           echo "Image: ghcr.io/curvineio/curvine-compile:${{ matrix.tag }}-${{ matrix.arch }}" >> $GITHUB_STEP_SUMMARY
 
-  # Create multi-arch manifests for each build type
+  # Create multi-arch manifests for each selected build type
   create-manifest:
-    needs: build-image
+    needs: [prepare, build-image]
     runs-on: ubuntu-latest
     if: inputs.push_image == true
     strategy:
       matrix:
-        include:
-          - tag: rocky9
-          - tag: rocky9_cached
-          - tag: ubuntu22.04
-          - tag: ubuntu24.04
-          - tag: amzn2
+        include: ${{ fromJSON(needs.prepare.outputs.manifest_matrix) }}
     steps:
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -162,67 +188,92 @@ jobs:
           password: ${{ secrets.PAT_DOCKERIO_TOKEN }}
       
       - name: Create and push multi-arch manifest for ${{ matrix.tag }}
+        env:
+          TAG: ${{ matrix.tag }}
+          ARCHS: ${{ toJSON(matrix.archs) }}
         run: |
-          # Create manifest for GHCR
-          docker buildx imagetools create -t ghcr.io/curvineio/curvine-compile:${{ matrix.tag }} \
-            ghcr.io/curvineio/curvine-compile:${{ matrix.tag }}-amd64 \
-            ghcr.io/curvineio/curvine-compile:${{ matrix.tag }}-arm64
-          
-          # Create manifest for Docker Hub
-          docker buildx imagetools create -t curvine/curvine-compile:${{ matrix.tag }} \
-            curvine/curvine-compile:${{ matrix.tag }}-amd64 \
-            curvine/curvine-compile:${{ matrix.tag }}-arm64
+          set -euo pipefail
+
+          GHCR_REFS=()
+          DOCKERHUB_REFS=()
+          for arch in $(echo "$ARCHS" | jq -r '.[]'); do
+            GHCR_REFS+=("ghcr.io/curvineio/curvine-compile:${TAG}-${arch}")
+            DOCKERHUB_REFS+=("curvine/curvine-compile:${TAG}-${arch}")
+          done
+
+          if [ "${#GHCR_REFS[@]}" -eq 1 ]; then
+            docker buildx imagetools create -t "ghcr.io/curvineio/curvine-compile:${TAG}" "${GHCR_REFS[0]}"
+            docker buildx imagetools create -t "curvine/curvine-compile:${TAG}" "${DOCKERHUB_REFS[0]}"
+          else
+            docker manifest rm "ghcr.io/curvineio/curvine-compile:${TAG}" || true
+            docker manifest create "ghcr.io/curvineio/curvine-compile:${TAG}" "${GHCR_REFS[@]}"
+            docker manifest push "ghcr.io/curvineio/curvine-compile:${TAG}"
+
+            docker manifest rm "curvine/curvine-compile:${TAG}" || true
+            docker manifest create "curvine/curvine-compile:${TAG}" "${DOCKERHUB_REFS[@]}"
+            docker manifest push "curvine/curvine-compile:${TAG}"
+          fi
       
       - name: Manifest creation summary for ${{ matrix.tag }}
+        env:
+          TAG: ${{ matrix.tag }}
+          ARCHS_JSON: ${{ toJSON(matrix.archs) }}
         run: |
-          echo "### Multi-arch Manifest Created for ${{ matrix.tag }} 🎉" >> $GITHUB_STEP_SUMMARY
+          ARCH_COUNT=$(echo "$ARCHS_JSON" | jq 'length')
+          ARCHS=$(echo "$ARCHS_JSON" | jq -r 'join(", ")')
+          if [ "$ARCH_COUNT" -eq 1 ]; then
+            echo "### Single-arch Image Published for ${TAG}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### Multi-arch Manifest Created for ${TAG}" >> $GITHUB_STEP_SUMMARY
+          fi
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Tag:** \`${{ matrix.tag }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Combined architectures:** amd64, arm64" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** \`${TAG}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Architectures:** ${ARCHS}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Manifests created:**" >> $GITHUB_STEP_SUMMARY
-          echo "- \`ghcr.io/curvineio/curvine-compile:${{ matrix.tag }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- \`curvine/curvine-compile:${{ matrix.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Images published:**" >> $GITHUB_STEP_SUMMARY
+          echo "- \`ghcr.io/curvineio/curvine-compile:${TAG}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`curvine/curvine-compile:${TAG}\`" >> $GITHUB_STEP_SUMMARY
 
   # Final summary
   summary:
-    needs: [build-image, create-manifest]
+    needs: [prepare, build-image, create-manifest]
     runs-on: ubuntu-latest
     if: always()
     steps:
       - name: Final build summary
+        env:
+          BUILD_TYPES_SUMMARY: ${{ needs.prepare.outputs.build_types_summary }}
+          MANIFEST_MATRIX: ${{ needs.prepare.outputs.manifest_matrix }}
         run: |
           echo "### Compile Image Build Summary 🚀" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Build Types:** rocky9, rocky9_cached, ubuntu22.04, ubuntu24.04, amzn2" >> $GITHUB_STEP_SUMMARY
-          echo "**Architectures:** amd64 (native), arm64 (native)" >> $GITHUB_STEP_SUMMARY
+          echo "**Build Types:** ${BUILD_TYPES_SUMMARY}" >> $GITHUB_STEP_SUMMARY
+          echo "**Architectures:** ${{ inputs.platforms }}" >> $GITHUB_STEP_SUMMARY
           echo "**Build Strategy:** Native runners for each architecture" >> $GITHUB_STEP_SUMMARY
           echo "**Trigger:** workflow_dispatch" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
           if [ "${{ inputs.push_image }}" == "true" ]; then
-            echo "**Multi-arch images pushed to:**" >> $GITHUB_STEP_SUMMARY
-            echo "- \`ghcr.io/curvineio/curvine-compile:rocky9\`" >> $GITHUB_STEP_SUMMARY
-            echo "- \`ghcr.io/curvineio/curvine-compile:rocky9_cached\`" >> $GITHUB_STEP_SUMMARY
-            echo "- \`ghcr.io/curvineio/curvine-compile:ubuntu22.04\`" >> $GITHUB_STEP_SUMMARY
-            echo "- \`ghcr.io/curvineio/curvine-compile:ubuntu24.04\`" >> $GITHUB_STEP_SUMMARY
-            echo "- \`ghcr.io/curvineio/curvine-compile:amzn2\`" >> $GITHUB_STEP_SUMMARY
+            echo "**Images pushed to:**" >> $GITHUB_STEP_SUMMARY
+            IFS=',' read -ra TAGS <<< "${BUILD_TYPES_SUMMARY}"
+            for tag in "${TAGS[@]}"; do
+              tag="$(echo "$tag" | xargs)"
+              echo "- \`ghcr.io/curvineio/curvine-compile:${tag}\`" >> $GITHUB_STEP_SUMMARY
+            done
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**Pull commands:**" >> $GITHUB_STEP_SUMMARY
             echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
-            echo "# Rocky Linux 9 (standard)" >> $GITHUB_STEP_SUMMARY
-            echo "docker pull ghcr.io/curvineio/curvine-compile:rocky9" >> $GITHUB_STEP_SUMMARY
-            echo "# Rocky Linux 9 (cached)" >> $GITHUB_STEP_SUMMARY
-            echo "docker pull ghcr.io/curvineio/curvine-compile:rocky9_cached" >> $GITHUB_STEP_SUMMARY
-            echo "# Ubuntu 22.04" >> $GITHUB_STEP_SUMMARY
-            echo "docker pull ghcr.io/curvineio/curvine-compile:ubuntu22.04" >> $GITHUB_STEP_SUMMARY
-            echo "# Ubuntu 24.04" >> $GITHUB_STEP_SUMMARY
-            echo "docker pull ghcr.io/curvineio/curvine-compile:ubuntu24.04" >> $GITHUB_STEP_SUMMARY
-            echo "# Amazon Linux 2" >> $GITHUB_STEP_SUMMARY
-            echo "docker pull ghcr.io/curvineio/curvine-compile:amzn2" >> $GITHUB_STEP_SUMMARY
+            for tag in "${TAGS[@]}"; do
+              tag="$(echo "$tag" | xargs)"
+              echo "docker pull ghcr.io/curvineio/curvine-compile:${tag}" >> $GITHUB_STEP_SUMMARY
+            done
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "# Verify multi-arch" >> $GITHUB_STEP_SUMMARY
-            echo "docker buildx imagetools inspect ghcr.io/curvineio/curvine-compile:rocky9" >> $GITHUB_STEP_SUMMARY
+            FIRST_TAG="$(echo "${TAGS[0]}" | xargs)"
+            FIRST_ARCH_COUNT=$(echo "$MANIFEST_MATRIX" | jq -r --arg tag "$FIRST_TAG" '.[] | select(.tag == $tag) | .archs | length')
+            if [ "${FIRST_ARCH_COUNT:-0}" -gt 1 ]; then
+              echo "# Verify multi-arch" >> $GITHUB_STEP_SUMMARY
+              echo "docker manifest inspect ghcr.io/curvineio/curvine-compile:${FIRST_TAG}" >> $GITHUB_STEP_SUMMARY
+            fi
             echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           else
             echo "**Note:** Images were built but not pushed (push_image=false)" >> $GITHUB_STEP_SUMMARY

@@ -22,6 +22,7 @@ use log::warn;
 use orpc::error::ErrorImpl;
 use orpc::handler::MessageHandler;
 use orpc::message::Message;
+use orpc::CommonResult;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -32,6 +33,15 @@ pub struct MasterReplicationHandler {
 impl MasterReplicationHandler {
     pub fn new(manager: Arc<MasterReplicationManager>) -> Self {
         Self { manager }
+    }
+
+    pub fn report_under_replicated_blocks(
+        &self,
+        worker_id: u32,
+        block_ids: Vec<i64>,
+    ) -> CommonResult<()> {
+        self.manager
+            .report_under_replicated_blocks(worker_id, block_ids)
     }
 
     pub fn report_replication_result(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {

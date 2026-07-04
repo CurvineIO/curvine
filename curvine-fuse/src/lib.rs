@@ -99,6 +99,10 @@ pub const FUSE_DO_RENAME2: u32 = 1 << 11;
 /// has changed (CAP_AUTO_INVAL_DATA, available since Linux 2.6.35).
 pub const FUSE_AUTO_INVAL_DATA: u32 = 1 << 12;
 
+/// Kernel exportfs support: enables `name_to_handle_at` / `open_by_handle_at` via
+/// `LOOKUP(nodeid, ".")` / `LOOKUP(nodeid, "..")` reconstruction.
+pub const FUSE_EXPORT_SUPPORT: u32 = 1 << 4;
+
 pub const FUSE_MAX_NAME_LENGTH: usize = 255;
 
 pub const FUSE_UNKNOWN_INODES: u64 = 0xffffffff;

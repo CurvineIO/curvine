@@ -1,0 +1,212 @@
+# docker build -t curvine-compile-centos7 -f Dockerfile_centos7 .
+# Use the official CentOS 7 image as a base
+FROM centos:7
+
+# Add metadata labels
+ARG REPO_URL=https://github.com/curvineio/curvine
+LABEL org.opencontainers.image.source="${REPO_URL}"
+
+# CentOS 7 is EOL; switch yum repos to vault.centos.org
+RUN for repo in /etc/yum.repos.d/CentOS-*.repo; do \
+        sed -i 's/^mirrorlist=/#mirrorlist=/g' "$repo"; \
+        sed -i 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' "$repo"; \
+        sed -i 's|^baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' "$repo"; \
+    done
+
+# 1. Install the basic toolchain and dependencies
+# CentOS 7 ships gcc 4.8; devtoolset-11 provides a modern compiler for Rust builds.
+RUN yum install -y centos-release-scl && \
+    printf '%s\n' \
+      '[centos-sclo-rh]' \
+      'name=CentOS-7 - SCLo rh' \
+      'baseurl=http://vault.centos.org/centos/7/sclo/$basearch/rh/' \
+      'gpgcheck=1' \
+      'enabled=1' \
+      'gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-SIG-SCLo' \
+      > /etc/yum.repos.d/CentOS-SCLo-scl-rh.repo && \
+    printf '%s\n' \
+      '[centos-sclo-sclo]' \
+      'name=CentOS-7 - SCLo sclo' \
+      'baseurl=http://vault.centos.org/centos/7/sclo/$basearch/sclo/' \
+      'gpgcheck=1' \
+      'enabled=0' \
+      'gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-SIG-SCLo' \
+      > /etc/yum.repos.d/CentOS-SCLo-scl.repo && \
+    yum install -y epel-release && \
+    sed -i 's/^metalink/#metalink/' /etc/yum.repos.d/epel*.repo && \
+    sed -i 's|^#baseurl=|baseurl=|' /etc/yum.repos.d/epel*.repo && \
+    sed -i 's|download.fedoraproject.org/pub/epel|download.fedoraproject.org/pub/archive/epel|' /etc/yum.repos.d/epel*.repo && \
+    yum install -y \
+    devtoolset-11-gcc \
+    devtoolset-11-gcc-c++ \
+    devtoolset-11-binutils \
+    llvm-toolset-7-clang \
+    llvm-toolset-7-llvm-devel \
+    make \
+    pkgconfig \
+    libuuid-devel \
+    fuse3 \
+    fuse3-devel \
+    git \
+    wget \
+    curl \
+    zip \
+    unzip \
+    jq \
+    python3 \
+    python3-pip \
+    java-1.8.0-openjdk-devel \
+    which \
+    openssl-devel \
+    libstdc++-devel \
+    libstdc++-static \
+    zlib-devel \
+    zlib-static \
+    fio \
+    && yum clean all
+
+# Enable devtoolset-11 and llvm-toolset-7 for all subsequent build steps
+ENV PATH="/opt/rh/devtoolset-11/root/usr/bin:/opt/rh/llvm-toolset-7/root/usr/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/opt/rh/devtoolset-11/root/usr/lib64:/opt/rh/devtoolset-11/root/usr/lib:/opt/rh/llvm-toolset-7/root/usr/lib64:/opt/rh/llvm-toolset-7/root/usr/lib:${LD_LIBRARY_PATH:-}"
+ENV MANPATH=/opt/rh/devtoolset-11/root/usr/share/man
+
+# Set JAVA_HOME for JNI support (required for opendal-hdfs feature)
+ENV JAVA_HOME=/usr/lib/jvm/java-1.8.0-openjdk
+# Create symlink for hdfs-sys compatibility (it looks for jre/include)
+RUN if [ -d "$JAVA_HOME/include" ] && [ ! -d "$JAVA_HOME/jre/include" ]; then \
+        mkdir -p "$JAVA_HOME/jre" && \
+        ln -s ../include "$JAVA_HOME/jre/include"; \
+    fi
+
+# 1.1. Install Node.js 16 LTS (CentOS 7 glibc 2.17; Node 22 requires glibc >= 2.28)
+RUN NODE_VERSION=16.20.2 && \
+    ARCH=$(uname -m) && \
+    case "${ARCH}" in \
+        x86_64) NODE_ARCH="x64" ;; \
+        aarch64) NODE_ARCH="arm64" ;; \
+        *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    esac && \
+    echo "Installing Node.js ${NODE_VERSION} for ${NODE_ARCH}..." && \
+    curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" | \
+        tar -xJ -C /usr/local --strip-components=1 && \
+    echo "✓ Node.js ${NODE_VERSION} installed successfully for ${ARCH}"
+
+# 2. Install the Rust toolchain
+# uncomment the following two lines if you met network problem
+#ENV RUSTUP_UPDATE_ROOT=https://mirrors.aliyun.com/rustup/rustup
+#ENV RUSTUP_DIST_SERVER=https://mirrors.aliyun.com/rustup
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.92.0 && \
+    source $HOME/.cargo/env && \
+    rustup default 1.92.0
+
+# 2.1. Install cargo-nextest for fast test runs (used by CI and regression script)
+RUN cargo install cargo-nextest --locked
+
+# 3. Install protoc with multi-arch support
+RUN PROTOC_VERSION=27.2 && \
+    ARCH=$(uname -m) && \
+    case "${ARCH}" in \
+        x86_64) PROTOC_ARCH="x86_64" ;; \
+        aarch64) PROTOC_ARCH="aarch_64" ;; \
+        *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    esac && \
+    echo "Installing protoc ${PROTOC_VERSION} for ${PROTOC_ARCH}..." && \
+    mkdir -p /app/protoc && cd /app/protoc && \
+    curl -LO "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip" && \
+    unzip "protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip" && \
+    chmod +x bin/protoc && \
+    rm -f *.zip && \
+    echo "✓ protoc installed successfully for ${ARCH}"
+ENV PATH="/app/protoc/bin:${PATH}"
+
+# 4. Install Maven
+RUN cd /app && \
+    MAVEN_VERSION=3.9.16 && \
+    MAVEN_PACKAGE=apache-maven-${MAVEN_VERSION}-bin.tar.gz && \
+    MAVEN_ARCHIVE_URL=https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/${MAVEN_PACKAGE} && \
+    curl -fL -o ${MAVEN_PACKAGE} ${MAVEN_ARCHIVE_URL} && \
+    tar -xzf ${MAVEN_PACKAGE} && \
+    mv apache-maven-${MAVEN_VERSION} maven && \
+    rm -f *.tar.gz && \
+    echo "✓ Maven ${MAVEN_VERSION} installed successfully"
+ENV PATH="/app/maven/bin:${PATH}"
+
+# 4.1. Install JindoSDK (Alibaba Cloud OSS-HDFS SDK) with multi-arch support
+RUN cd /opt && \
+    JINDOSDK_VERSION=6.10.3 && \
+    ARCH=$(uname -m) && \
+    echo "Installing JindoSDK ${JINDOSDK_VERSION} for ${ARCH}..." && \
+    case "${ARCH}" in \
+        x86_64) \
+            JINDOSDK_FILE="jindosdk-${JINDOSDK_VERSION}-linux.tar.gz" ;; \
+        aarch64) \
+            JINDOSDK_FILE="jindosdk-${JINDOSDK_VERSION}-linux-el7-aarch64.tar.gz" ;; \
+        *) \
+            echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    esac && \
+    echo "Downloading ${JINDOSDK_FILE}..." && \
+    curl -fL -o ${JINDOSDK_FILE} \
+        https://jindodata-binary.oss-cn-shanghai.aliyuncs.com/release/${JINDOSDK_VERSION}/${JINDOSDK_FILE} && \
+    tar -xzf ${JINDOSDK_FILE} && \
+    rm -f ${JINDOSDK_FILE} && \
+    echo "Checking extracted directory..." && \
+    ls -la /opt/ && \
+    if [ ! -d jindosdk ]; then \
+        EXTRACTED_DIR=$(ls -d jindosdk*/ | head -n1 | sed 's|/$||') && \
+        echo "Found directory: ${EXTRACTED_DIR}" && \
+        mv "$EXTRACTED_DIR" jindosdk; \
+    fi && \
+    echo "✓ JindoSDK ${JINDOSDK_VERSION} installed successfully for ${ARCH}"
+ENV JINDOSDK_HOME=/opt/jindosdk
+ENV LD_LIBRARY_PATH="${JINDOSDK_HOME}/lib:${LD_LIBRARY_PATH}"
+
+# 5. Install Go toolchain with multi-arch support
+RUN ARCH=$(uname -m) && \
+    case "${ARCH}" in \
+        x86_64) GO_ARCH="amd64" ;; \
+        aarch64) GO_ARCH="arm64" ;; \
+        *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    esac && \
+    echo "Installing Go 1.23.4 for ${GO_ARCH}..." && \
+    wget -O go1.23.linux-${GO_ARCH}.tar.gz https://go.dev/dl/go1.23.4.linux-${GO_ARCH}.tar.gz && \
+    tar -C /usr/local -xzf go1.23.linux-${GO_ARCH}.tar.gz && \
+    rm go1.23.linux-${GO_ARCH}.tar.gz && \
+    echo "✓ Go installed successfully for ${ARCH}"
+ENV PATH="/usr/local/go/bin:${PATH}"
+ENV GOPATH=/go
+ENV GOROOT=/usr/local/go
+
+#6. Replace the configuration
+RUN mkdir -p /app/maven/conf
+COPY settings.xml /app/maven/conf/settings.xml
+
+RUN mkdir -p /root/.cargo
+COPY config /root/.cargo/config.toml
+
+# Add useful aliases and settings to .bashrc for interactive sessions
+RUN echo 'source /opt/rh/devtoolset-11/enable' >> /root/.bashrc && \
+    echo 'source /opt/rh/llvm-toolset-7/enable' >> /root/.bashrc && \
+    echo 'export PS1="\[\033[01;32m\]curvine\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "' >> /root/.bashrc && \
+    echo 'alias ll="ls -la"' >> /root/.bashrc && \
+    echo 'alias cb="cargo build"' >> /root/.bashrc && \
+    echo 'alias ct="cargo test"' >> /root/.bashrc && \
+    echo 'alias cr="cargo run"' >> /root/.bashrc
+
+# Add after all installation commands
+RUN rm -rf \
+    /var/cache/yum/* \
+    /tmp/* \
+    /var/tmp/*
+
+
+WORKDIR /workspace
+
+# Verify toolchains. Do not `npm install -g npm@latest`: it replaces distro npm and can leave broken deps (e.g. MODULE_NOT_FOUND promise-retry).
+RUN rustc --version && cargo --version && protoc --version && mvn --version && node --version && \
+    npm --version && \
+    go version
+
+# Use ENTRYPOINT to ensure environment is loaded
+ENTRYPOINT ["/bin/bash", "-c"]
+CMD ["bash"]

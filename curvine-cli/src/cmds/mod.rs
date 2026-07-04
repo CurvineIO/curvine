@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod bench;
 mod fs;
 mod load;
 mod load_cancel;
@@ -21,6 +22,7 @@ mod node;
 mod report;
 mod umount;
 
+pub use bench::BenchCommand;
 pub use fs::FsCommand;
 pub use load::LoadCommand;
 pub use load_cancel::CancelLoadCommand;

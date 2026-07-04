@@ -391,6 +391,8 @@ impl InodeFile {
     /// # Returns
     /// * `Vec<BlockMeta>` - Blocks that were removed during truncation (empty if extended or unchanged)
     pub fn resize(&mut self, opts: FileAllocOpts) -> FsResult<Vec<BlockMeta>> {
+        opts.validate()?;
+
         if self.len == opts.len {
             Ok(vec![])
         } else if opts.len < self.len {

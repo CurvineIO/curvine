@@ -10,7 +10,7 @@ use crate::io::spdk_ffi;
 /// ## Disconnect Detection
 /// Detected via periodic keep-alive poll every 1s while idle (~1s latency).
 /// TODO: SPDK fabric eventfd for immediate detection.
-use log::{error, info};
+use log::{error, info, warn};
 use nix::sys::eventfd::{EfdFlags, EventFd};
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 const EVENTSZ: usize = std::mem::size_of::<u64>();
 /// I/O operation submitted to the poller thread.
@@ -94,10 +95,10 @@ impl IoCompletion {
                 inner = self.cond.wait(inner).unwrap();
             }
         } else {
-            let timeout = std::time::Duration::from_micros(timeout_us);
-            let deadline = std::time::Instant::now() + timeout;
+            let timeout = Duration::from_micros(timeout_us);
+            let deadline = Instant::now() + timeout;
             while !inner.done {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     return -libc::ETIMEDOUT;
                 }
@@ -117,7 +118,7 @@ pub struct IoRequest {
     pub op: IoOp,
     pub completion: Arc<IoCompletion>,
     /// Per-bdev in-flight counter. Decremented on completion.
-    pub bdev_inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub bdev_inflight: std::sync::Arc<AtomicUsize>,
     /// Per-qpair dead flag. Set by the poller when qpair poll fails;
     /// checked by the bdev to fail subsequent I/Os fast.
     pub qpair_dead: std::sync::Arc<AtomicBool>,
@@ -134,11 +135,19 @@ enum PollerState {
     Idle,
 }
 
+/// SPDK NVMe controller handle — thread-safe.
+#[repr(transparent)]
+pub struct CtrlHandle(pub *mut spdk_ffi::spdk_nvme_ctrlr);
+
+// SAFETY: opaque SPDK handle; admin completion is thread-safe.
+unsafe impl Send for CtrlHandle {}
+
 /// Configuration for the poller thread.
 pub struct PollerConfig {
     pub poll_interval_ms: u64,
     pub spin_iter: u32,
     pub io_queue_depth: usize,
+    pub ctrlrs: Vec<CtrlHandle>,
 }
 
 /// Poller thread handle.
@@ -213,13 +222,13 @@ impl SpdkPoller {
         let req = IoRequest {
             op: IoOp::UnregisterQpair { qpair, ack: ack_tx },
             completion: IoCompletion::new(),
-            bdev_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
             qpair_dead: Arc::new(AtomicBool::new(false)),
         };
         if let Some(tx) = &self.tx {
             let _ = tx.send(req);
             let _ = self.eventfd.write(1);
-            match ack_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            match ack_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(()) => true,
                 Err(_) => {
                     error!("Unregister timeout: poller may be stuck, qpair not removed");
@@ -247,9 +256,10 @@ impl SpdkPoller {
         shutdown: Arc<AtomicBool>,
         is_sleeping: Arc<AtomicBool>,
         eventfd: RawFd,
-        config: PollerConfig,
+        mut config: PollerConfig,
     ) {
         let mut active_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
+        let active_ctrlrs: Vec<CtrlHandle> = std::mem::take(&mut config.ctrlrs);
         let mut state = PollerState::Idle;
         // Tracks per-qpair state (dead flag + pending Vec) for force-completion.
         let mut dead_qpairs: HashMap<usize, Box<QpairState>> = HashMap::new();
@@ -271,7 +281,11 @@ impl SpdkPoller {
 
             // Active state: drain all pending I/Os and poll completions
             if matches!(state, PollerState::Active) {
-                // Drain pending requests (non-blocking)
+                // Drain pending requests (non-blocking) - yield to admin completions every ~128 ops
+                // to prevent keep-alive timeout during heavy I/O bursts.
+                let delta = Duration::from_millis(config.poll_interval_ms);
+                let mut deadline = Instant::now() + delta;
+                let mut drain_count: u64 = 0;
                 while let Ok(req) = rx.try_recv() {
                     if matches!(req.op, IoOp::UnregisterQpair { .. }) {
                         Self::handle_unregister(&req, &mut active_qpairs, &mut dead_qpairs);
@@ -282,6 +296,11 @@ impl SpdkPoller {
                             &mut dead_qpairs,
                             config.io_queue_depth,
                         );
+                    }
+                    drain_count += 1;
+                    if drain_count & 0x7F == 0 && Instant::now() >= deadline {
+                        Self::process_admin_completions(&active_ctrlrs);
+                        deadline = Instant::now() + delta;
                     }
                 }
 
@@ -307,6 +326,9 @@ impl SpdkPoller {
                         failed_qpairs.len()
                     );
                 }
+
+                // Process admin completions (keep-alive)
+                Self::process_admin_completions(&active_ctrlrs);
 
                 // Spin briefly before Idle to avoid eventfd round-trip for back-to-back I/O
                 if rx.is_empty() && active_qpairs.is_empty() {
@@ -363,7 +385,10 @@ impl SpdkPoller {
                             libc::read(eventfd, buf.as_mut_ptr() as *mut c_void, EVENTSZ)
                         };
 
-                        // Drain any pending channel data
+                        // Drain any pending channel data — yield to admin completions every ~128 ops.
+                        let delta = Duration::from_millis(config.poll_interval_ms);
+                        let mut deadline = Instant::now() + delta;
+                        let mut drain_count: u64 = 0;
                         while let Ok(req) = rx.try_recv() {
                             if matches!(req.op, IoOp::UnregisterQpair { .. }) {
                                 Self::handle_unregister(&req, &mut active_qpairs, &mut dead_qpairs);
@@ -374,6 +399,11 @@ impl SpdkPoller {
                                     &mut dead_qpairs,
                                     config.io_queue_depth,
                                 );
+                            }
+                            drain_count += 1;
+                            if drain_count & 0x7F == 0 && Instant::now() >= deadline {
+                                Self::process_admin_completions(&active_ctrlrs);
+                                deadline = Instant::now() + delta;
                             }
                         }
 
@@ -403,6 +433,9 @@ impl SpdkPoller {
                                 failed_qpairs.len()
                             );
                         }
+
+                        // Process admin completions (keep-alive)
+                        Self::process_admin_completions(&active_ctrlrs);
 
                         state = PollerState::Idle;
                     }
@@ -572,6 +605,16 @@ impl SpdkPoller {
         }
         dead_qpairs.remove(&key);
     }
+
+    /// Process admin completions on all controllers to service keep-alive.
+    fn process_admin_completions(ctrlrs: &[CtrlHandle]) {
+        for handle in ctrlrs {
+            let rc = unsafe { spdk_ffi::spdk_nvme_ctrlr_process_admin_completions(handle.0) };
+            if rc < 0 {
+                warn!("ctrlr {:p} admin completion error: rc={}", handle.0, rc);
+            }
+        }
+    }
 }
 
 /// Per-qpair state tracked on the poller thread. Holds the dead flag and
@@ -585,7 +628,7 @@ struct QpairState {
 struct CallbackCtx {
     completion: Arc<IoCompletion>,
     async_ctx: spdk_ffi::curvine_async_ctx,
-    bdev_inflight: Arc<std::sync::atomic::AtomicUsize>,
+    bdev_inflight: Arc<AtomicUsize>,
     /// Points back to the qpair's QpairState
     qpair_state: *mut QpairState,
     /// Index into QpairState::pending

@@ -20,13 +20,12 @@ use crate::raft::raft_error::RaftError;
 use crate::raft::storage::{AppStorage, ApplyMsg, LogStorage, PeerStorage};
 use crate::raft::*;
 use crate::utils::SerdeUtils;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use orpc::client::dispatch::{Callback, Envelope};
 use orpc::common::{DurationUnit, LocalTime, TimeSpent};
 use orpc::io::net::InetAddr;
 use orpc::message::{Builder, RefMessage, ResponseStatus};
 use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::try_err;
 use prost::Message as PMessage;
 use raft::eraftpb::{ConfChange, Entry, EntryType, MessageType, Snapshot};
 use raft::prelude::ConfChangeType;
@@ -296,12 +295,37 @@ where
         Ok(())
     }
 
+    fn send_request_error(env: Envelope, error: RaftError) -> RaftResult<()> {
+        warn!(
+            "raft request {:?} failed: {}",
+            RaftCode::from(env.msg.code()),
+            error
+        );
+        let msg = Ok(env.msg.error_ext(&error));
+        env.send_with_log(msg);
+        Ok(())
+    }
+
+    fn send_malformed_request_error(env: Envelope, error: RaftError) -> RaftResult<()> {
+        debug!(
+            "malformed raft request {:?}: {}",
+            RaftCode::from(env.msg.code()),
+            error
+        );
+        let msg = Ok(env.msg.error_ext(&error));
+        env.send_with_log(msg);
+        Ok(())
+    }
+
     fn handle_conf_change(
         &mut self,
         env: Envelope,
         promise: &mut HashMap<i64, Callback>,
     ) -> RaftResult<()> {
-        let header: ConfChangeRequest = env.msg.parse_header()?;
+        let header: ConfChangeRequest = match env.msg.parse_header() {
+            Ok(header) => header,
+            Err(e) => return Self::send_malformed_request_error(env, e.into()),
+        };
         let mut change: ConfChange = header.change;
 
         if !self.is_leader() {
@@ -312,7 +336,9 @@ where
             }
 
             let context = SerdeUtils::serialize(&env.msg.req_id())?;
-            self.raw.propose_conf_change(context, change)?;
+            if let Err(e) = self.raw.propose_conf_change(context, change) {
+                return Self::send_request_error(env, e.into());
+            }
             promise.insert(env.msg.req_id(), env.cb);
         }
 
@@ -321,9 +347,14 @@ where
 
     // Handle raft internal messages, such as elections, heartbeats, voting, etc.
     fn handle_raft(&mut self, env: Envelope) -> RaftResult<()> {
-        let raft: RaftRequest = try_err!(env.msg.parse_header());
+        let raft: RaftRequest = match env.msg.parse_header() {
+            Ok(raft) => raft,
+            Err(e) => return Self::send_malformed_request_error(env, e.into()),
+        };
 
-        self.raw.step(raft.message)?;
+        if let Err(e) = self.raw.step(raft.message) {
+            return Self::send_request_error(env, e.into());
+        }
         let rep_msg = Builder::success(&env.msg)
             .proto_header(RaftResponse::default())
             .build();
@@ -341,9 +372,14 @@ where
         }
 
         let before_index = self.raw.raft.raft_log.last_index() + 1;
-        let header: ProposeRequest = env.msg.parse_header()?;
+        let header: ProposeRequest = match env.msg.parse_header() {
+            Ok(header) => header,
+            Err(e) => return Self::send_malformed_request_error(env, e.into()),
+        };
         let context = SerdeUtils::serialize(&env.msg.req_id())?;
-        self.raw.propose(context, header.data)?;
+        if let Err(e) = self.raw.propose(context, header.data) {
+            return Self::send_request_error(env, e.into());
+        }
 
         let after_index = self.raw.raft.raft_log.last_index() + 1;
         if before_index == after_index {

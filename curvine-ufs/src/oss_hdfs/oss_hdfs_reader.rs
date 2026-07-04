@@ -19,9 +19,11 @@ use curvine_common::state::FileStatus;
 use curvine_common::FsResult;
 use orpc::sys::DataSlice;
 use std::os::raw::c_void;
+use std::sync::Arc;
 
 use crate::oss_hdfs::callback_ctx::{I64CallbackCtx, StatusCallbackCtx};
 use crate::oss_hdfs::ffi::*;
+use crate::oss_hdfs::{check_jindo_status, jindo_error};
 
 // Extension methods for OSS-HDFS Reader
 impl OssHdfsReader {
@@ -60,8 +62,7 @@ impl OssHdfsReader {
             self.buf.set_len(n);
         }
         let mut buffer = self.buf.split_to(n);
-        // Per-call ctx.
-        let ctx = Box::new(I64CallbackCtx::default());
+        let ctx = Arc::new(I64CallbackCtx::default());
         ctx.reset();
         extern "C" fn cb(
             status: JindoStatus,
@@ -69,12 +70,11 @@ impl OssHdfsReader {
             err: *const std::os::raw::c_char,
             userdata: *mut c_void,
         ) {
-            let ctx = unsafe { &*(userdata as *const I64CallbackCtx) };
-            ctx.complete(status, value, err);
+            unsafe { I64CallbackCtx::complete_userdata(userdata, status, value, err) };
         }
 
         {
-            let userdata = (&*ctx as *const I64CallbackCtx) as *mut c_void;
+            let userdata = I64CallbackCtx::into_userdata(&ctx);
             let start_status = unsafe {
                 jindo_reader_pread_async(
                     handle.as_raw(),
@@ -86,20 +86,16 @@ impl OssHdfsReader {
                 )
             };
             if start_status != JindoStatus::Ok {
+                unsafe { I64CallbackCtx::drop_userdata(userdata) };
                 buffer.clear();
-                let err_msg = jindo_last_error();
-                return Err(FsError::common(format!(
-                    "Failed to start pread: {}",
-                    err_msg
-                )));
+                check_jindo_status(start_status, "Failed to start pread", None)?;
             }
         }
 
         let (status, actual_read, err) = ctx.wait().await?;
         if status != JindoStatus::Ok {
             buffer.clear();
-            let err_msg = err.unwrap_or_else(jindo_last_error);
-            return Err(FsError::common(format!("Failed to pread: {}", err_msg)));
+            check_jindo_status(status, "Failed to pread", err)?;
         }
 
         let actual_read = usize::try_from(actual_read.max(0)).unwrap_or(0);
@@ -111,7 +107,7 @@ impl OssHdfsReader {
     pub async fn tell(&self) -> FsResult<i64> {
         let handle = self.reader_handle()?;
 
-        let ctx = Box::new(I64CallbackCtx::default());
+        let ctx = Arc::new(I64CallbackCtx::default());
         ctx.reset();
         extern "C" fn cb(
             status: JindoStatus,
@@ -119,27 +115,22 @@ impl OssHdfsReader {
             err: *const std::os::raw::c_char,
             userdata: *mut c_void,
         ) {
-            let ctx = unsafe { &*(userdata as *const I64CallbackCtx) };
-            ctx.complete(status, value, err);
+            unsafe { I64CallbackCtx::complete_userdata(userdata, status, value, err) };
         }
 
         {
-            let userdata = (&*ctx as *const I64CallbackCtx) as *mut c_void;
+            let userdata = I64CallbackCtx::into_userdata(&ctx);
             let start_status =
                 unsafe { jindo_reader_tell_async(handle.as_raw(), Some(cb), userdata) };
             if start_status != JindoStatus::Ok {
-                let err_msg = jindo_last_error();
-                return Err(FsError::common(format!(
-                    "Failed to start tell: {}",
-                    err_msg
-                )));
+                unsafe { I64CallbackCtx::drop_userdata(userdata) };
+                check_jindo_status(start_status, "Failed to start tell", None)?;
             }
         }
 
         let (status, offset, err) = ctx.wait().await?;
         if status != JindoStatus::Ok {
-            let err_msg = err.unwrap_or_else(jindo_last_error);
-            return Err(FsError::common(format!("Failed to tell: {}", err_msg)));
+            check_jindo_status(status, "Failed to tell", err)?;
         }
         Ok(offset)
     }
@@ -150,7 +141,7 @@ impl OssHdfsReader {
     pub async fn get_file_length(&self) -> FsResult<i64> {
         let handle = self.reader_handle()?;
 
-        let ctx = Box::new(I64CallbackCtx::default());
+        let ctx = Arc::new(I64CallbackCtx::default());
         ctx.reset();
         extern "C" fn cb(
             status: JindoStatus,
@@ -158,15 +149,15 @@ impl OssHdfsReader {
             err: *const std::os::raw::c_char,
             userdata: *mut c_void,
         ) {
-            let ctx = unsafe { &*(userdata as *const I64CallbackCtx) };
-            ctx.complete(status, value, err);
+            unsafe { I64CallbackCtx::complete_userdata(userdata, status, value, err) };
         }
 
         {
-            let userdata = (&*ctx as *const I64CallbackCtx) as *mut c_void;
+            let userdata = I64CallbackCtx::into_userdata(&ctx);
             let start_status =
                 unsafe { jindo_reader_get_file_length_async(handle.as_raw(), Some(cb), userdata) };
             if start_status != JindoStatus::Ok {
+                unsafe { I64CallbackCtx::drop_userdata(userdata) };
                 return Ok(self.length);
             }
         }
@@ -198,8 +189,8 @@ pub struct OssHdfsReader {
     /// `reserve` -> `set_len` -> hand pointer to FFI -> `truncate`.
     pub(crate) buf: BytesMut,
     // Reusable callback contexts for &mut self operations.
-    pub(crate) read_ctx: I64CallbackCtx,
-    pub(crate) status_ctx: StatusCallbackCtx,
+    pub(crate) read_ctx: Arc<I64CallbackCtx>,
+    pub(crate) status_ctx: Arc<StatusCallbackCtx>,
 }
 
 impl Reader for OssHdfsReader {
@@ -263,12 +254,11 @@ impl Reader for OssHdfsReader {
                 err: *const std::os::raw::c_char,
                 userdata: *mut c_void,
             ) {
-                let ctx = unsafe { &*(userdata as *const I64CallbackCtx) };
-                ctx.complete(status, value, err);
+                unsafe { I64CallbackCtx::complete_userdata(userdata, status, value, err) };
             }
 
             {
-                let userdata = (&self.read_ctx as *const I64CallbackCtx) as *mut c_void;
+                let userdata = I64CallbackCtx::into_userdata(&self.read_ctx);
                 let start_status = unsafe {
                     jindo_reader_read_async(
                         handle.as_raw(),
@@ -279,12 +269,9 @@ impl Reader for OssHdfsReader {
                     )
                 };
                 if start_status != JindoStatus::Ok {
+                    unsafe { I64CallbackCtx::drop_userdata(userdata) };
                     buffer.clear();
-                    let err_msg = jindo_last_error();
-                    return Err(FsError::common(format!(
-                        "Failed to start read: {}",
-                        err_msg
-                    )));
+                    check_jindo_status(start_status, "Failed to start read", None)?;
                 }
             }
 
@@ -294,8 +281,7 @@ impl Reader for OssHdfsReader {
                     buffer.clear();
                     return Ok(DataSlice::Buffer(buffer));
                 }
-                let err_msg = err.unwrap_or_else(jindo_last_error);
-                return Err(FsError::common(format!("Failed to read: {}", err_msg)));
+                return Err(jindo_error(status, "Failed to read", err));
             }
 
             let actual_read = usize::try_from(actual_read.max(0)).unwrap_or(0);
@@ -344,27 +330,22 @@ impl Reader for OssHdfsReader {
                 err: *const std::os::raw::c_char,
                 userdata: *mut c_void,
             ) {
-                let ctx = unsafe { &*(userdata as *const StatusCallbackCtx) };
-                ctx.complete(status, err);
+                unsafe { StatusCallbackCtx::complete_userdata(userdata, status, err) };
             }
 
             {
-                let userdata = (&self.status_ctx as *const StatusCallbackCtx) as *mut c_void;
+                let userdata = StatusCallbackCtx::into_userdata(&self.status_ctx);
                 let start_status =
                     unsafe { jindo_reader_seek_async(handle.as_raw(), pos, Some(cb), userdata) };
                 if start_status != JindoStatus::Ok {
-                    let err_msg = jindo_last_error();
-                    return Err(FsError::common(format!(
-                        "Failed to start seek: {}",
-                        err_msg
-                    )));
+                    unsafe { StatusCallbackCtx::drop_userdata(userdata) };
+                    check_jindo_status(start_status, "Failed to start seek", None)?;
                 }
             }
 
             let (status, err) = self.status_ctx.wait().await?;
             if status != JindoStatus::Ok {
-                let err_msg = err.unwrap_or_else(jindo_last_error);
-                return Err(FsError::common(format!("Failed to seek: {}", err_msg)));
+                check_jindo_status(status, "Failed to seek", err)?;
             }
         } // handle is dropped here, releasing the borrow
 
@@ -380,38 +361,30 @@ impl Reader for OssHdfsReader {
 
         if let Some(handle) = handle {
             self.status_ctx.reset();
-            let userdata = (&self.status_ctx as *const StatusCallbackCtx) as *mut c_void;
+            let userdata = StatusCallbackCtx::into_userdata(&self.status_ctx);
             extern "C" fn cb(
                 status: JindoStatus,
                 err: *const std::os::raw::c_char,
                 userdata: *mut c_void,
             ) {
-                let ctx = unsafe { &*(userdata as *const StatusCallbackCtx) };
-                ctx.complete(status, err);
+                unsafe { StatusCallbackCtx::complete_userdata(userdata, status, err) };
             }
 
             let start_status =
                 unsafe { jindo_reader_close_async(handle.as_raw(), Some(cb), userdata) };
             if start_status != JindoStatus::Ok {
+                unsafe { StatusCallbackCtx::drop_userdata(userdata) };
                 unsafe {
                     jindo_reader_free(handle.as_raw());
                 }
-                let err_msg = jindo_last_error();
-                return Err(FsError::common(format!(
-                    "Failed to start close reader: {}",
-                    err_msg
-                )));
+                check_jindo_status(start_status, "Failed to start close reader", None)?;
             }
 
             let (status, err) = self.status_ctx.wait().await?;
             unsafe { jindo_reader_free(handle.as_raw()) };
 
             if status != JindoStatus::Ok {
-                let err_msg = err.unwrap_or_else(jindo_last_error);
-                return Err(FsError::common(format!(
-                    "Failed to close reader: {}",
-                    err_msg
-                )));
+                check_jindo_status(status, "Failed to close reader", err)?;
             }
         }
         Ok(())

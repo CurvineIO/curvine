@@ -56,13 +56,17 @@ fn main() {
     eprintln!("[JindoSDK]   Include path: {}", include_dir);
 
     // Compile the FFI wrapper
-    cc::Build::new()
+    let mut build = cc::Build::new();
+    build
         .cpp(true)
         .std("c++17")
         .file(&ffi_cpp)
         .include(&ffi_dir)
-        .include(&include_dir)
-        .compile("jindosdk_ffi");
+        .include(&include_dir);
+    if env::var("CARGO_FEATURE_OSS_HDFS_FFI_TEST").is_ok() {
+        build.define("CURVINE_OSS_HDFS_FFI_TEST", None);
+    }
+    build.compile("jindosdk_ffi");
 
     // Explicitly add the output directory to the link search path
     // This ensures dependent crates can find the static library

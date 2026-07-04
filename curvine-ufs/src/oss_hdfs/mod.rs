@@ -18,8 +18,33 @@ mod oss_hdfs_filesystem;
 mod oss_hdfs_reader;
 mod oss_hdfs_writer;
 
+use curvine_common::error::FsError;
+use curvine_common::FsResult;
+use orpc::error::ErrorExt;
+
+use self::ffi::{jindo_last_error, JindoStatus};
+
 pub use self::oss_hdfs_filesystem::OssHdfsFileSystem;
 pub use self::oss_hdfs_reader::OssHdfsReader;
 pub use self::oss_hdfs_writer::OssHdfsWriter;
 
 pub const SCHEME: &str = "oss";
+
+pub(crate) fn jindo_error(status: JindoStatus, operation: &str, err: Option<String>) -> FsError {
+    let detail = err.unwrap_or_else(jindo_last_error);
+    match status {
+        JindoStatus::FileNotFound => FsError::file_not_found(detail).ctx(operation),
+        _ => FsError::common(format!("{}: {}", operation, detail)),
+    }
+}
+
+pub(crate) fn check_jindo_status(
+    status: JindoStatus,
+    operation: &str,
+    err: Option<String>,
+) -> FsResult<()> {
+    match status {
+        JindoStatus::Ok => Ok(()),
+        _ => Err(jindo_error(status, operation, err)),
+    }
+}

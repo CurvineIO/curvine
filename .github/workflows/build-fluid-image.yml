@@ -1,12 +1,21 @@
 name: Build Curvine Fluid Docker Image
 
 on:
-  push:
-    tags:
-      - 'v*'
-    paths:
-      - 'curvine-docker/fluid/**'
-      - '.github/workflows/build-fluid-image.yml'
+  workflow_call:
+    inputs:
+      push_image:
+        description: 'Whether to push image to registries'
+        required: true
+        type: boolean
+      image_tag:
+        description: 'Image tag to build'
+        required: true
+        type: string
+      base_image_tag:
+        description: 'Base runtime image tag'
+        required: false
+        default: ''
+        type: string
   workflow_dispatch:
     inputs:
       push_image:
@@ -48,22 +57,38 @@ jobs:
     steps:
       - name: Extract metadata for Docker
         id: meta
+        env:
+          INPUT_IMAGE_TAG: ${{ inputs.image_tag }}
+          INPUT_PUSH_IMAGE: ${{ inputs.push_image }}
+          INPUT_BASE_IMAGE_TAG: ${{ inputs.base_image_tag }}
         run: |
-          # Determine tag: use git tag if triggered by push, otherwise use input or 'latest'
-          if [ "${{ github.event_name }}" == "push" ]; then
-            # Extract tag from ref (refs/tags/v1.0.0 -> v1.0.0)
-            TAG="${GITHUB_REF#refs/tags/}"
-            PUSH_IMAGE="true"
-            echo "Triggered by tag push: ${TAG}"
-          elif [ -n "${{ inputs.image_tag }}" ]; then
-            TAG="${{ inputs.image_tag }}"
-            PUSH_IMAGE="${{ inputs.push_image }}"
-            echo "Using manual tag: ${TAG}"
+          set -euo pipefail
+
+          validate_docker_tag() {
+            local name="$1"
+            local value="$2"
+            if [[ ! "${value}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+              echo "::error::Invalid ${name}: ${value}"
+              exit 1
+            fi
+          }
+
+          if [ -n "${INPUT_IMAGE_TAG}" ]; then
+            TAG="${INPUT_IMAGE_TAG}"
+            PUSH_IMAGE="${INPUT_PUSH_IMAGE:-false}"
+            echo "Using input tag: ${TAG}"
           else
             TAG="latest"
-            PUSH_IMAGE="${{ inputs.push_image }}"
+            PUSH_IMAGE="${INPUT_PUSH_IMAGE:-false}"
             echo "Using default tag: ${TAG}"
           fi
+
+          if [ "${PUSH_IMAGE}" != "true" ] && [ "${PUSH_IMAGE}" != "false" ]; then
+            echo "::error::push_image must be true or false, got: ${PUSH_IMAGE}"
+            exit 1
+          fi
+
+          validate_docker_tag "image tag" "${TAG}"
           
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
           echo "push_image=${PUSH_IMAGE}" >> $GITHUB_OUTPUT
@@ -84,8 +109,8 @@ jobs:
           fi
           
           # Determine base image tag: use input if provided, otherwise auto-detect from tag
-          if [ -n "${{ inputs.base_image_tag }}" ]; then
-            BASE_IMAGE_TAG="${{ inputs.base_image_tag }}"
+          if [ -n "${INPUT_BASE_IMAGE_TAG}" ]; then
+            BASE_IMAGE_TAG="${INPUT_BASE_IMAGE_TAG}"
             echo "Using manual base image tag: ${BASE_IMAGE_TAG}"
           elif [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
             # Use the same version tag for base image
@@ -96,6 +121,8 @@ jobs:
             BASE_IMAGE_TAG="latest"
             echo "Using default base image tag: ${BASE_IMAGE_TAG}"
           fi
+
+          validate_docker_tag "base image tag" "${BASE_IMAGE_TAG}"
           
           echo "base_image_tag=${BASE_IMAGE_TAG}" >> $GITHUB_OUTPUT
 
@@ -131,11 +158,29 @@ jobs:
         with:
           username: curvine
           password: ${{ secrets.PAT_DOCKERIO_TOKEN }}
+
+      - name: Check base runtime image
+        run: |
+          BASE_IMAGE="ghcr.io/curvineio/curvine:${{ needs.prepare.outputs.base_image_tag }}"
+          echo "Checking base image: ${BASE_IMAGE}"
+
+          for attempt in 1 2 3 4 5 6; do
+            if docker buildx imagetools inspect "${BASE_IMAGE}" >/dev/null; then
+              echo "Base image is available: ${BASE_IMAGE}"
+              exit 0
+            fi
+
+            echo "Base image is not available yet (attempt ${attempt}/6)"
+            sleep 30
+          done
+
+          echo "::error::Base runtime image ${BASE_IMAGE} is not available. Build Runtime Docker Image must publish it before Fluid starts."
+          exit 1
       
       - name: Build and push Fluid image for ${{ matrix.arch }}
         uses: docker/build-push-action@v5
         with:
-          context: .
+          context: ./curvine-docker/fluid
           file: ./curvine-docker/fluid/Dockerfile
           platforms: linux/${{ matrix.arch }}
           push: ${{ needs.prepare.outputs.push_image == 'true' }}
@@ -220,7 +265,7 @@ jobs:
   summary:
     needs: [prepare, build-arch, create-manifest]
     runs-on: ubuntu-latest
-    if: always()
+    if: ${{ always() && needs.prepare.result != 'skipped' }}
     steps:
       - name: Final build summary
         run: |
@@ -280,4 +325,3 @@ jobs:
           else
             echo "**Note:** Image was built but not pushed (push_image=false)" >> $GITHUB_STEP_SUMMARY
           fi
-

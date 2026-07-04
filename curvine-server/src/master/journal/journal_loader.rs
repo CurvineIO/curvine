@@ -26,7 +26,7 @@ use curvine_common::raft::{RaftClient, RaftResult, RaftUtils};
 use curvine_common::state::RenameFlags;
 use curvine_common::utils::SerdeUtils;
 use log::{debug, error, info, warn};
-use orpc::common::{FileUtils, LocalTime};
+use orpc::common::{FileUtils, LocalTime, TimeSpent};
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel};
 use orpc::{err_box, ternary, CommonResult};
@@ -51,6 +51,7 @@ pub struct JournalLoader {
     retain_checkpoint_num: usize,
     ignore_reply_error: bool,
     max_retry_num: u64,
+    skip_failed_ufs_replay_after_retry: bool,
     batch_size: u64,
     retry_interval: Duration,
     metrics: &'static MasterMetrics,
@@ -127,6 +128,7 @@ impl JournalLoader {
             retain_checkpoint_num: 3.max(conf.retain_checkpoint_num),
             ignore_reply_error: conf.ignore_reply_error,
             max_retry_num: conf.max_retry_num,
+            skip_failed_ufs_replay_after_retry: conf.skip_failed_ufs_replay_after_retry,
             batch_size: conf.scan_batch_size,
             retry_interval: Duration::from_secs(conf.retry_interval_secs),
             metrics: Master::get_metrics(),
@@ -187,7 +189,12 @@ impl JournalLoader {
         }
     }
 
-    async fn apply0(&self, is_leader: bool, entry: &Entry) -> CommonResult<()> {
+    async fn apply0(
+        &self,
+        is_leader: bool,
+        entry: &Entry,
+        skip_ufs_error: bool,
+    ) -> CommonResult<()> {
         if entry.data.is_empty() {
             return Ok(());
         }
@@ -241,6 +248,14 @@ impl JournalLoader {
             };
 
             if let Err(e) = res {
+                if is_leader && skip_ufs_error {
+                    error!(
+                        "skip failed UFS replay after retries, entry index={}, term={}, journal={:?}, error={}",
+                        entry.index, entry.term, op_entry, e
+                    );
+                    continue;
+                }
+
                 return err_box!("failed to apply journal: {:?}: {}", op_entry, e);
             }
         }
@@ -262,15 +277,24 @@ impl JournalLoader {
         Ok(())
     }
 
-    async fn apply_msg(&self, is_leader: bool, msg: &ApplyMsg) -> CommonResult<()> {
+    async fn apply_msg(
+        &self,
+        is_leader: bool,
+        msg: &ApplyMsg,
+        skip_ufs_error: bool,
+    ) -> CommonResult<()> {
         match msg {
             ApplyMsg::Entry(entry) => {
-                self.apply0(is_leader, entry).await?;
+                self.apply0(is_leader, entry, skip_ufs_error).await?;
                 Ok(())
             }
 
             ApplyMsg::Scan(applied_index) => {
                 let mut last_applied = applied_index.index;
+                if is_leader && skip_ufs_error {
+                    last_applied = last_applied.max(self.get_fsm_state().ufs_applied.index);
+                }
+
                 let commit_index = self.log_store.hard_state().commit;
                 loop {
                     if last_applied >= commit_index {
@@ -292,8 +316,11 @@ impl JournalLoader {
                     );
 
                     for entry in list {
-                        self.apply0(is_leader, &entry).await?;
+                        self.apply0(is_leader, &entry, skip_ufs_error).await?;
                         last_applied = entry.index;
+                        if skip_ufs_error {
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -356,7 +383,7 @@ impl JournalLoader {
                     break;
                 }
 
-                msg => match self.apply_msg(is_leader, &msg).await {
+                msg => match self.apply_msg(is_leader, &msg, false).await {
                     Ok(_) => retry_num = 0,
 
                     Err(error) => {
@@ -366,12 +393,34 @@ impl JournalLoader {
                             retry_num += 1;
 
                             if retry_num >= self.max_retry_num {
-                                panic!("apply entry failed(retry_num={}): {}", retry_num, error);
+                                if self.skip_failed_ufs_replay_after_retry {
+                                    error!(
+                                        "apply entry failed(retry_num={}), skipping failed UFS replay to keep master alive: {}",
+                                        retry_num, error
+                                    );
+                                    let continue_scan = matches!(msg, ApplyMsg::Scan(_));
+                                    if let Err(skip_error) =
+                                        self.apply_msg(is_leader, &msg, true).await
+                                    {
+                                        panic!(
+                                            "apply entry failed while skipping failed UFS replay: {}",
+                                            skip_error
+                                        );
+                                    }
+                                    retry_num = 0;
+                                    if continue_scan {
+                                        retry_msg.replace(msg);
+                                    }
+                                } else {
+                                    panic!(
+                                        "apply entry failed(retry_num={}): {}",
+                                        retry_num, error
+                                    );
+                                }
                             } else {
                                 error!("apply entry failed(retry_num={}): {}", retry_num, error);
+                                retry_msg.replace(msg);
                             }
-
-                            retry_msg.replace(msg);
                         } else {
                             panic!("apply entry failed: {}", error);
                         }
@@ -399,25 +448,56 @@ impl JournalLoader {
     }
 
     fn apply_snapshot0(&self, snapshot: SnapshotData) -> RaftResult<()> {
-        let mut fs_dir = self.fs_dir.write();
-        match snapshot.files_data {
-            None => {
-                let dir = fs_dir.get_checkpoint_path(LocalTime::mills());
-                FileUtils::create_dir(&dir, true)?;
-                fs_dir.restore(dir)?;
-                fs_dir.update_op_id(snapshot.fsm_state.op_id());
-            }
+        let mut spend = TimeSpent::new();
 
+        // Compute checkpoint_size outside the write lock to avoid adding
+        // filesystem traversal I/O to the restore critical section.
+        // The traversal is skipped entirely when info logging is disabled.
+        let (restore_path, checkpoint_size) = match &snapshot.files_data {
             Some(data) => {
-                fs_dir.restore(&data.dir)?;
-                fs_dir.update_op_id(snapshot.fsm_state.op_id());
+                let size = if log::log_enabled!(log::Level::Info) {
+                    FileUtils::dir_size(&data.dir).unwrap_or_else(|e| {
+                        warn!("failed to compute checkpoint size for {}: {}", data.dir, e);
+                        0
+                    })
+                } else {
+                    0
+                };
+                (data.dir.clone(), size)
             }
-        }
+            None => {
+                let dir = self.fs_dir.read().get_checkpoint_path(LocalTime::mills());
+                FileUtils::create_dir(&dir, true)?;
+                let size = if log::log_enabled!(log::Level::Info) {
+                    FileUtils::dir_size(&dir).unwrap_or_else(|e| {
+                        warn!("failed to compute checkpoint size for {}: {}", dir, e);
+                        0
+                    })
+                } else {
+                    0
+                };
+                (dir, size)
+            }
+        };
+
+        let mut fs_dir = self.fs_dir.write();
+        fs_dir.restore(&restore_path, checkpoint_size)?;
+        fs_dir.update_op_id(snapshot.fsm_state.op_id());
         drop(fs_dir);
+        let restore_ms = spend.used_ms();
+        spend.reset();
 
         self.mnt_mgr.restore();
+        let mount_ms = spend.used_ms();
 
         *self.fsm_state.lock().unwrap() = snapshot.fsm_state;
+
+        info!(
+            "apply_snapshot: fs_dir_restore={} ms, mount_restore={} ms, total={} ms",
+            restore_ms,
+            mount_ms,
+            restore_ms + mount_ms
+        );
 
         Ok(())
     }
@@ -747,7 +827,7 @@ impl JournalLoader {
 impl AppStorage for JournalLoader {
     async fn apply(&self, wait: bool, msg: ApplyMsg) -> RaftResult<()> {
         if wait || !self.has_apply_worker {
-            if let Err(e) = self.apply_msg(false, &msg).await {
+            if let Err(e) = self.apply_msg(false, &msg, false).await {
                 if self.ignore_reply_error {
                     error!("apply entry failed: {}", e);
                     Ok(())

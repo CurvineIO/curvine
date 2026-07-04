@@ -29,10 +29,38 @@ use opendal::{
     layers::{LoggingLayer, RetryLayer, TimeoutLayer},
     ErrorKind, Metadata, Operator,
 };
+use orpc::error::ErrorExt;
 use orpc::sys::DataSlice;
 use orpc::{err_box, err_ext, try_option_mut};
 use std::collections::HashMap;
 use std::time::Duration;
+
+fn storage_error(
+    operation: impl AsRef<str>,
+    path: impl AsRef<str>,
+    e: impl std::fmt::Display,
+    not_found: bool,
+) -> FsError {
+    if not_found {
+        FsError::file_not_found(path.as_ref()).ctx(format!("{}: {}", operation.as_ref(), e))
+    } else {
+        FsError::common(format!("{} {}: {}", operation.as_ref(), path.as_ref(), e))
+    }
+}
+
+fn opendal_error(operation: impl AsRef<str>, path: impl AsRef<str>, e: opendal::Error) -> FsError {
+    let not_found = e.kind() == ErrorKind::NotFound;
+    storage_error(operation, path, e, not_found)
+}
+
+fn opendal_io_error(
+    operation: impl AsRef<str>,
+    path: impl AsRef<str>,
+    e: std::io::Error,
+) -> FsError {
+    let not_found = e.kind() == std::io::ErrorKind::NotFound;
+    storage_error(operation, path, e, not_found)
+}
 
 /// OpenDAL Reader implementation
 pub struct OpendalReader {
@@ -88,13 +116,13 @@ impl Reader for OpendalReader {
                 .reader_with(&self.object_path)
                 .chunk(self.chunk_size)
                 .await
-                .map_err(|e| FsError::common(format!("Failed to create reader: {}", e)))?;
+                .map_err(|e| opendal_error("Failed to create reader", &self.object_path, e))?;
 
             self.byte_stream = Some(
                 reader
                     .into_bytes_stream(self.pos as u64..self.length as u64)
                     .await
-                    .map_err(|e| FsError::common(format!("Failed to create stream: {}", e)))?,
+                    .map_err(|e| opendal_error("Failed to create stream", &self.object_path, e))?,
             );
         }
 
@@ -102,7 +130,11 @@ impl Reader for OpendalReader {
             if let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => Ok(DataSlice::Bytes(chunk)),
-                    Err(e) => err_box!("Failed to read chunk: {}", e),
+                    Err(e) => Err(opendal_io_error(
+                        "Failed to read chunk",
+                        &self.object_path,
+                        e,
+                    )),
                 }
             } else {
                 Ok(DataSlice::Empty)
@@ -183,7 +215,7 @@ impl Writer for OpendalWriter {
                 self.operator
                     .writer(&self.object_path)
                     .await
-                    .map_err(|e| FsError::common(format!("Failed to create writer: {}", e)))?,
+                    .map_err(|e| opendal_error("Failed to create writer", &self.object_path, e))?,
             );
         }
 
@@ -194,7 +226,7 @@ impl Writer for OpendalWriter {
         writer
             .write(data)
             .await
-            .map_err(|e| FsError::common(format!("Failed to write: {}", e)))?;
+            .map_err(|e| opendal_error("Failed to write", &self.object_path, e))?;
 
         Ok(len as i64)
     }
@@ -211,7 +243,7 @@ impl Writer for OpendalWriter {
             writer
                 .close()
                 .await
-                .map_err(|e| FsError::common(format!("Failed to close writer: {}", e)))?;
+                .map_err(|e| opendal_error("Failed to close writer", &self.object_path, e))?;
         }
 
         Ok(())
@@ -422,6 +454,20 @@ impl OpendalFileSystem {
                     .unwrap_or(true);
                 if !force_path_style {
                     builder = builder.enable_virtual_host_style();
+                }
+
+                // Select the S3 ListObjects API version via `s3.list_objects_version`.
+                //
+                // Defaults to v2 (OpenDAL's default). Some S3-compatible services (e.g. Baidu
+                // BOS) return `is_truncated=true` in a ListObjectsV2 response but omit the
+                // `NextContinuationToken`; OpenDAL's v2 lister then resends the request with an
+                // empty token, gets the same page back, and loops forever (mount/list hangs).
+                // Setting `s3.list_objects_version=v1` switches to ListObjects v1, whose lister
+                // falls back to using the last object key as the marker and advances correctly.
+                if resolve_disable_list_objects_v2(
+                    conf.get("s3.list_objects_version").map(|s| s.as_str()),
+                )? {
+                    builder = builder.disable_list_objects_v2();
                 }
 
                 let base_op = Operator::new(builder)
@@ -683,7 +729,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
         self.operator
             .create_dir(&object_path)
             .await
-            .map_err(|e| FsError::common(format!("Failed to create directory: {}", e)))?;
+            .map_err(|e| opendal_error("Failed to create directory", &object_path, e))?;
 
         Ok(true)
     }
@@ -705,13 +751,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
             self.operator
                 .write(&object_path, opendal::Buffer::new())
                 .await
-                .map_err(|e| {
-                    FsError::common(format!(
-                        "Failed to create empty file {}: {}",
-                        path.full_path(),
-                        e
-                    ))
-                })?;
+                .map_err(|e| opendal_error("Failed to create empty file", path.full_path(), e))?;
         }
 
         let status = Self::write_status(path);
@@ -739,11 +779,11 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
             Some(s) => {
                 if s.len < 8 * 1024 * 1024 {
                     let chunk = self.operator.read(&object_path).await.map_err(|e| {
-                        FsError::common(format!(
-                            "Failed to read existing file {} for append: {}",
+                        opendal_error(
+                            "Failed to read existing file for append",
                             path.full_path(),
-                            e
-                        ))
+                            e,
+                        )
                     })?;
                     return Ok(OpendalWriter {
                         operator: self.operator.clone(),
@@ -778,7 +818,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
             .operator
             .stat(&object_path)
             .await
-            .map_err(|e| FsError::common(format!("Failed to stat file: {}", e)))?;
+            .map_err(|e| opendal_error("Failed to stat file", &object_path, e))?;
         let status = Self::read_status(path, &metadata);
 
         Ok(OpendalReader {
@@ -816,7 +856,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
                         "rename directory on this backend (e.g. S3)"
                     ));
                 }
-                return Err(FsError::from_error(e));
+                return Err(opendal_error("Failed to rename directory", &src_path, e));
             }
         } else {
             let src_path = self.get_object_path(src)?;
@@ -826,13 +866,12 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
                     self.operator
                         .copy(&src_path, &dst_path)
                         .await
-                        .map_err(FsError::from_error)?;
-                    self.operator
-                        .delete(&src_path)
-                        .await
-                        .map_err(FsError::from_error)?;
+                        .map_err(|e| opendal_error("Failed to copy for rename", &src_path, e))?;
+                    self.operator.delete(&src_path).await.map_err(|e| {
+                        opendal_error("Failed to delete source for rename", &src_path, e)
+                    })?;
                 } else {
-                    return Err(FsError::from_error(e));
+                    return Err(opendal_error("Failed to rename file", &src_path, e));
                 }
             }
         }
@@ -855,7 +894,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
                 self.operator
                     .remove_all(&dir_path)
                     .await
-                    .map_err(FsError::from_error)?;
+                    .map_err(|e| opendal_error("Failed to remove directory", &dir_path, e))?;
             } else {
                 let opts = opendal::options::ListOptions {
                     limit: Some(2),
@@ -865,25 +904,27 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
                     .operator
                     .lister_options(&dir_path, opts)
                     .await
-                    .map_err(FsError::from_error)?;
+                    .map_err(|e| opendal_error("Failed to list directory", &dir_path, e))?;
 
                 if let Some(result) = list.next().await {
                     // Propagate any error from listing instead of treating it as a non-empty directory.
-                    result.map_err(FsError::from_error)?;
+                    result.map_err(|e| {
+                        opendal_error("Failed to list directory entry", &dir_path, e)
+                    })?;
                     // If we successfully retrieved an entry, the directory is not empty.
                     return err_ext!(FsError::dir_not_empty(path.full_path()));
                 }
                 self.operator
                     .delete(&dir_path)
                     .await
-                    .map_err(FsError::from_error)?;
+                    .map_err(|e| opendal_error("Failed to delete directory", &dir_path, e))?;
             }
         } else {
             let object_path = self.get_object_path(path)?;
             self.operator
                 .delete(&object_path)
                 .await
-                .map_err(FsError::from_error)?;
+                .map_err(|e| opendal_error("Failed to delete file", &object_path, e))?;
         }
 
         Ok(())
@@ -903,7 +944,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
             .operator
             .list(&dir_path)
             .await
-            .map_err(|e| FsError::common(format!("Failed to list directory: {}", e)))?;
+            .map_err(|e| opendal_error("Failed to list directory", &dir_path, e))?;
 
         let mut statuses = Vec::new();
         for entry in list_result {
@@ -945,10 +986,10 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
             .operator
             .lister_options(&dir_path, opts)
             .await
-            .map_err(FsError::from_error)?;
+            .map_err(|e| opendal_error("Failed to list directory", &dir_path, e))?;
 
         let stream = lister
-            .map_err(FsError::from_error)
+            .map_err(move |e| opendal_error("Failed to list directory entry", &dir_path, e))
             .try_filter_map(move |entry| {
                 let raw_path = format!(
                     "{}://{}/{}",
@@ -971,5 +1012,61 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
             });
 
         Ok(ListStream::new(stream))
+    }
+}
+
+/// Resolve the `s3.list_objects_version` mount option into "should disable ListObjectsV2".
+///
+/// Accepted values (case-insensitive, surrounding whitespace ignored):
+/// - unset / empty / `v2` -> use ListObjects V2 (OpenDAL default) -> returns `false`
+/// - `v1` -> fall back to ListObjects V1 -> returns `true`
+///
+/// Any other value is rejected with an `invalid_argument` error (POSIX EINVAL).
+#[cfg(feature = "opendal-s3")]
+fn resolve_disable_list_objects_v2(value: Option<&str>) -> FsResult<bool> {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("v2") => Ok(false),
+        Some("v1") => Ok(true),
+        Some(other) => Err(FsError::invalid_argument(format!(
+            "Invalid s3.list_objects_version '{}': expected 'v1' or 'v2'",
+            other
+        ))),
+    }
+}
+
+#[cfg(all(test, feature = "opendal-s3"))]
+mod list_objects_version_tests {
+    use super::resolve_disable_list_objects_v2;
+
+    #[test]
+    fn defaults_to_v2_when_unset_or_empty() {
+        assert!(!resolve_disable_list_objects_v2(None).unwrap());
+        assert!(!resolve_disable_list_objects_v2(Some("")).unwrap());
+        assert!(!resolve_disable_list_objects_v2(Some("   ")).unwrap());
+    }
+
+    #[test]
+    fn v2_keeps_default() {
+        assert!(!resolve_disable_list_objects_v2(Some("v2")).unwrap());
+        assert!(!resolve_disable_list_objects_v2(Some("V2")).unwrap());
+        assert!(!resolve_disable_list_objects_v2(Some("  v2 ")).unwrap());
+    }
+
+    #[test]
+    fn v1_disables_v2() {
+        assert!(resolve_disable_list_objects_v2(Some("v1")).unwrap());
+        assert!(resolve_disable_list_objects_v2(Some("V1")).unwrap());
+        assert!(resolve_disable_list_objects_v2(Some(" v1 ")).unwrap());
+    }
+
+    #[test]
+    fn rejects_invalid_values() {
+        for bad in ["1", "2", "v3", "true", "list-v1", "foo"] {
+            let err = resolve_disable_list_objects_v2(Some(bad)).unwrap_err();
+            assert!(
+                err.to_string().contains("s3.list_objects_version"),
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
     }
 }

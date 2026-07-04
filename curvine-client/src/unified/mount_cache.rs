@@ -66,10 +66,12 @@ use crate::unified::{UfsFileSystem, UnifiedFileSystem};
 use curvine_common::fs::Path;
 use curvine_common::state::MountInfo;
 use curvine_common::FsResult;
-use log::debug;
+use log::{debug, warn};
 use orpc::common::{FastHashMap, LocalTime};
+use orpc::runtime::RpcRuntime;
 use orpc::sync::AtomicCounter;
 use orpc::CommonResult;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 
@@ -162,12 +164,28 @@ impl InnerMap {
     }
 }
 
+/// RAII guard that clears the `refreshing` flag on drop. This guarantees the
+/// flag is released on *every* exit path of the background task — normal
+/// completion, early return, and panic-unwind alike.
+struct RefreshingGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl Drop for RefreshingGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
 pub struct MountCache {
     mounts: RwLock<InnerMap>,
     update_interval: u64,
     last_update: AtomicCounter,
     /// Single-flight lock: only one task performs full refresh when TTL expires.
     refresh_lock: Mutex<()>,
+    /// True while a background refresh has been scheduled but not yet finished.
+    /// Used to avoid spawning more than one concurrent background refresh task.
+    refreshing: AtomicBool,
 }
 
 impl MountCache {
@@ -177,6 +195,7 @@ impl MountCache {
             update_interval,
             last_update: AtomicCounter::new(0),
             refresh_lock: Mutex::new(()),
+            refreshing: AtomicBool::new(false),
         }
     }
 
@@ -184,16 +203,15 @@ impl MountCache {
         LocalTime::mills() > self.update_interval + self.last_update.get()
     }
 
-    pub async fn check_update(&self, fs: &UnifiedFileSystem, force: bool) -> FsResult<()> {
-        if !self.need_update() && !force {
-            return Ok(());
-        }
+    /// Whether the cache has ever been successfully populated. `last_update` is
+    /// 0 until the first successful refresh sets it to a real wall-clock millis.
+    fn is_initialized(&self) -> bool {
+        self.last_update.get() != 0
+    }
 
-        let _guard = self.refresh_lock.lock().await;
-        if !self.need_update() && !force {
-            return Ok(());
-        }
-
+    /// Performs the actual full refresh of the mount table from the master.
+    /// Guarded by `refresh_lock` so only one refresh runs at a time.
+    async fn do_refresh(&self, fs: &UnifiedFileSystem) -> FsResult<()> {
         let mounts = fs.get_mount_table().await?;
         let mut state = self.mounts.write().unwrap();
 
@@ -207,14 +225,94 @@ impl MountCache {
         Ok(())
     }
 
+    /// Synchronous refresh: blocks until the mount table is up to date.
+    /// Used when the caller must observe the latest state immediately
+    /// (e.g. right after a `mount` call). `force` bypasses the TTL check.
+    pub async fn check_update(&self, fs: &UnifiedFileSystem, force: bool) -> FsResult<()> {
+        if !self.need_update() && !force {
+            return Ok(());
+        }
+
+        let _guard = self.refresh_lock.lock().await;
+        if !self.need_update() && !force {
+            return Ok(());
+        }
+
+        self.do_refresh(fs).await
+    }
+
+    /// Non-blocking refresh trigger: if the cache is stale, spawn a background
+    /// task to refresh it and return immediately, letting the caller keep using
+    /// the current (possibly stale) snapshot.
+    ///
+    /// At most one background refresh runs at a time: the `refreshing` flag is
+    /// claimed via compare_exchange, and a duplicate trigger is a no-op until the
+    /// in-flight task clears it. The task takes ownership of cloned handles
+    /// (`Arc<MountCache>` and `UnifiedFileSystem`), so it can outlive the current
+    /// request.
+    fn trigger_async_update(self: &Arc<Self>, fs: &UnifiedFileSystem) {
+        if !self.need_update() {
+            return;
+        }
+
+        // Ensure at most one background refresh is in flight. compare_exchange
+        // returning Err means another task already set the flag and will publish
+        // a fresh snapshot soon, so this call becomes a no-op.
+        if self
+            .refreshing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let cache = self.clone();
+        let fs = fs.clone();
+        let rt = fs.clone_runtime();
+        rt.spawn(async move {
+            // Take ownership of the claimed `refreshing` flag via an RAII guard
+            // so it is cleared on every exit path — including a panic in
+            // `do_refresh` (e.g. a poisoned RwLock) — not just on the normal
+            // tail. Without this, a panic here would leak the flag and wedge all
+            // future refreshes. Created before the lock so it covers the whole
+            // task body.
+            let _refreshing = RefreshingGuard {
+                flag: &cache.refreshing,
+            };
+            // Hold the single-flight lock for the whole refresh so the semantics
+            // match the synchronous path and double-refresh is impossible.
+            let _guard = cache.refresh_lock.lock().await;
+            if cache.need_update() {
+                if let Err(e) = cache.do_refresh(&fs).await {
+                    warn!("background mount cache refresh failed: {:?}", e);
+                }
+            }
+        });
+    }
+
     /// Finds mount point for a path using hierarchical lookup.
     /// Returns the most specific mount that contains the given path.
+    ///
+    /// Refresh policy:
+    /// - On cold start (cache never populated) the first call refreshes
+    ///   synchronously so a freshly-created client observes the correct mount
+    ///   table instead of an empty one.
+    /// - Once populated, a stale cache triggers a background refresh that is NOT
+    ///   awaited: the lookup proceeds against the current snapshot so the caller
+    ///   is never blocked on a master round-trip. The refreshed table becomes
+    ///   visible to subsequent calls.
     pub async fn get_mount(
-        &self,
+        self: &Arc<Self>,
         fs: &UnifiedFileSystem,
         path: &Path,
     ) -> FsResult<Option<Arc<MountValue>>> {
-        self.check_update(fs, false).await?;
+        if self.is_initialized() {
+            self.trigger_async_update(fs);
+        } else {
+            // First access: block once to populate the cache. check_update is
+            // single-flight, so concurrent first callers share one refresh.
+            self.check_update(fs, false).await?;
+        }
 
         let state = self.mounts.read().unwrap();
         if state.is_empty() {

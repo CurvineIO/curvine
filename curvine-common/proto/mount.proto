@@ -20,6 +20,8 @@ message MountInfoProto {
     optional int32 replicas = 10;
     required WriteTypeProto write_type = 11;
     optional ProviderProto provider = 12;
+    optional bool auto_cache = 13 [default = true];
+    optional AccessModeProto access_mode = 14 [default = ACCESS_MODE_PROTO_READ_ONLY];
 }
 
 message MountOptionsProto {
@@ -34,12 +36,19 @@ message MountOptionsProto {
     repeated string remove_properties = 10;
     required WriteTypeProto write_type = 11;
     optional ProviderProto provider = 12;
+    optional bool auto_cache = 13;
+    optional AccessModeProto access_mode = 14;
 }
 
 enum ProviderProto {
     PROVIDER_PROTO_AUTO = 0;
     PROVIDER_PROTO_OSS_HDFS = 1;
     PROVIDER_PROTO_OPENDAL = 2;
+}
+
+enum AccessModeProto {
+    ACCESS_MODE_PROTO_READ_ONLY = 0;
+    ACCESS_MODE_PROTO_READ_WRITE = 1;
 }
 
 message MountRequest {
