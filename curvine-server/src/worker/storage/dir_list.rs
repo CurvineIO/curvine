@@ -18,7 +18,7 @@ use indexmap::map::Values;
 use indexmap::IndexMap;
 use log::{info, warn};
 use orpc::common::ByteUnit;
-use orpc::CommonResult;
+use orpc::{err_box, CommonResult};
 use std::ops::Index;
 
 // Directory list.
@@ -28,19 +28,19 @@ pub struct DirList {
 }
 
 impl DirList {
-    pub fn new(list: Vec<VfsDir>) -> Self {
+    pub fn new(list: Vec<VfsDir>) -> CommonResult<Self> {
         let mut dirs = IndexMap::new();
         for dir in list {
             if dirs.contains_key(&dir.id()) {
-                panic!("Storage ID hash conflict")
+                return err_box!("Storage ID hash conflict for dir {}", dir.id());
             }
             dirs.insert(dir.id(), dir);
         }
 
-        Self {
+        Ok(Self {
             dirs,
             chooser: ChoosingPolicy::Robin(RobinChoosingPolicy::new()),
-        }
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -171,7 +171,7 @@ mod tests {
             VfsDir::from_dir(id, dirs[2].clone())?,
         ];
 
-        let mut list = DirList::new(vfs_dir);
+        let mut list = DirList::new(vfs_dir)?;
 
         let mem = list.choose_dir_with_str(StorageType::Mem, "5MB")?;
         println!("choose mem: {:?}", mem.base_path());

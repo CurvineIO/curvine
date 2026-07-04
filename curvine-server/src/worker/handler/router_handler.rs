@@ -15,15 +15,16 @@
 use axum::routing::get;
 use axum::Router;
 
+use curvine_common::FsResult;
 use curvine_web::router::RouterHandler;
 
 use crate::worker::Worker;
 
 pub struct WorkerRouterHandler;
 
-async fn metrics() -> String {
-    let metrics = Worker::get_metrics();
-    metrics.text_output().unwrap()
+async fn metrics() -> FsResult<String> {
+    let metrics = Worker::get_metrics()?;
+    Ok(metrics.text_output()?)
 }
 
 impl RouterHandler for WorkerRouterHandler {

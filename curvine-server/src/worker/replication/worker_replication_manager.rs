@@ -24,7 +24,7 @@ use log::{error, info};
 use once_cell::sync::OnceCell;
 use orpc::io::BlockIO;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
-use orpc::{err_box, try_option, CommonResult};
+use orpc::{err_box, CommonResult};
 use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Semaphore;
@@ -92,7 +92,12 @@ impl WorkerReplicationManager {
         job: &ReplicationJob,
         err_msg: Option<String>,
     ) -> CommonResult<ReportBlockReplicationResponse> {
-        let storage_type = try_option!(job.storage_type);
+        let Some(storage_type) = job.storage_type else {
+            return err_box!(
+                "missing storage type when reporting replication result for block {}",
+                job.block_id
+            );
+        };
         let request = ReportBlockReplicationRequest {
             block_id: job.block_id,
             storage_type: storage_type.into(),
@@ -100,7 +105,9 @@ impl WorkerReplicationManager {
             message: err_msg,
         };
 
-        let master_client = try_option!(self.master_client.get());
+        let Some(master_client) = self.master_client.get() else {
+            return err_box!("master client is not initialized for worker replication reporting");
+        };
 
         let response: ReportBlockReplicationResponse = master_client
             .fs_client
@@ -110,12 +117,10 @@ impl WorkerReplicationManager {
     }
 
     async fn replicate_block(&self, job: &mut ReplicationJob) -> CommonResult<()> {
-        let _permit = self
-            .replication_semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .unwrap();
+        let _permit = match self.replication_semaphore.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(e) => return err_box!("replication semaphore closed: {}", e),
+        };
         let block_meta = self.block_store.get_block(job.block_id)?;
         if block_meta.state != BlockState::Finalized {
             return err_box!("Block: {} is not finalized", job.block_id);
@@ -127,7 +132,7 @@ impl WorkerReplicationManager {
         info!(
             "Replicating block_id: {} from {} to {}",
             job.block_id,
-            self.block_store.worker_id(),
+            self.block_store.worker_id()?,
             job.target_worker_addr.worker_id
         );
         let mut writer = BlockWriterRemote::new(

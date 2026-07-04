@@ -38,7 +38,11 @@ pub struct VfsDataset {
 }
 
 impl VfsDataset {
-    fn new(cluster_id: &str, dir_list: DirList, spdk_meta: Option<Arc<SpdkMetaStore>>) -> Self {
+    fn new(
+        cluster_id: &str,
+        dir_list: DirList,
+        spdk_meta: Option<Arc<SpdkMetaStore>>,
+    ) -> CommonResult<Self> {
         let worker_id = match dir_list.get_dir_index(0) {
             None => 0,
             Some(v) => v.version().worker_id,
@@ -53,12 +57,12 @@ impl VfsDataset {
             num_blocks_to_delete: AtomicUsize::new(0),
             spdk_meta,
         };
-        ds.initialize();
-        ds
+        ds.initialize()?;
+        Ok(ds)
     }
 
     pub fn from_conf(cluster_id: &str, conf: &ClusterConf) -> CommonResult<Self> {
-        let mut dir_list = DirList::new(vec![]);
+        let mut dir_list = DirList::new(vec![])?;
         let dir_reserved = ByteUnit::from_str(&conf.worker.dir_reserved)?.as_byte();
 
         let mut worker_id: Option<u32> = None;
@@ -121,7 +125,7 @@ impl VfsDataset {
             None
         };
 
-        Ok(Self::new(cluster_id, dir_list, spdk_meta))
+        Self::new(cluster_id, dir_list, spdk_meta)
     }
 
     // Initialize.
@@ -129,20 +133,20 @@ impl VfsDataset {
     // 2. Block is added to block_map.
     // 3. Update capacity usage.
     // TODO: pre-filter to avoid scan_all() per SPDK dir
-    fn initialize(&mut self) {
+    fn initialize(&mut self) -> CommonResult<()> {
         let spent = TimeSpent::new();
         for dir in self.dir_list.dir_iter() {
             let blocks = if dir.storage_type() == StorageType::SpdkDisk {
                 // SPDK dirs: restore from RocksDB
                 match &self.spdk_meta {
-                    Some(store) => dir.scan_spdk_blocks(store).unwrap(),
+                    Some(store) => dir.scan_spdk_blocks(store)?,
                     None => {
                         warn!("SPDK dir {} has no meta store — starting empty", dir.id());
                         vec![]
                     }
                 }
             } else {
-                dir.scan_blocks().unwrap()
+                dir.scan_blocks()?
             };
             for block in blocks {
                 dir.reserve_space(true, block.len);
@@ -154,6 +158,7 @@ impl VfsDataset {
             spent.used_ms(),
             self.block_map.len()
         );
+        Ok(())
     }
 
     pub fn find_dir(&self, id: u32) -> CommonResult<&VfsDir> {
@@ -309,6 +314,17 @@ impl Dataset for VfsDataset {
 
     fn finalize_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         let meta = self.get_block_check(block.id)?;
+        if meta.state() == &BlockState::Finalized {
+            if meta.len() == block.len {
+                return Ok(meta.clone());
+            }
+            return err_box!(
+                "finalized block {} length mismatch, expected: {}, actual: {}",
+                meta.id(),
+                block.len,
+                meta.len()
+            );
+        }
         if meta.state() != &BlockState::Writing {
             return err_box!(
                 "block {} status incorrect, expected {:?}, actual: {:?}",
@@ -339,7 +355,7 @@ impl Dataset for VfsDataset {
 
     fn abort_block(&mut self, block: &ExtendedBlock) -> CommonResult<()> {
         let meta = match self.block_map.remove(&block.id) {
-            None => return err_box!("block {} not exists", block.id),
+            None => return Ok(()),
             Some(v) => v,
         };
 
@@ -427,9 +443,9 @@ mod test {
         }
     }
 
-    fn spdk_dataset() -> VfsDataset {
+    fn spdk_dataset() -> CommonResult<VfsDataset> {
         let st = spdk_state(1);
-        VfsDataset::new("t", DirList::new(vec![spdk_dir(st)]), None)
+        VfsDataset::new("t", DirList::new(vec![spdk_dir(st)])?, None)
     }
 
     #[test]
@@ -475,7 +491,7 @@ mod test {
     #[test]
     fn abort_spdk() -> CommonResult<()> {
         let st = spdk_state(1);
-        let mut ds = VfsDataset::new("t", DirList::new(vec![spdk_dir(st.clone())]), None);
+        let mut ds = VfsDataset::new("t", DirList::new(vec![spdk_dir(st.clone())])?, None)?;
         let meta = BlockMeta {
             id: 1,
             len: 4096,
@@ -498,7 +514,7 @@ mod test {
     }
     #[test]
     fn spdk_create_abort_reuse_offset() -> CommonResult<()> {
-        let mut ds = spdk_dataset();
+        let mut ds = spdk_dataset()?;
         let block1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
         let meta1 = ds.open_block(&block1)?;
         assert_eq!(meta1.bdev_offset, 0, "first block should get offset 0");
@@ -517,7 +533,7 @@ mod test {
     }
     #[test]
     fn spdk_create_abort_interleaved() -> CommonResult<()> {
-        let mut ds = spdk_dataset();
+        let mut ds = spdk_dataset()?;
         let b1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
         let b2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
         let b3 = ExtendedBlock::new(3, 4096, StorageType::SpdkDisk, FileType::File);
@@ -551,7 +567,7 @@ mod test {
     #[test]
     fn spdk_restore_free_list() -> CommonResult<()> {
         let st = spdk_state(1);
-        let mut ds = VfsDataset::new("t", DirList::new(vec![spdk_dir(st.clone())]), None);
+        let mut ds = VfsDataset::new("t", DirList::new(vec![spdk_dir(st.clone())])?, None)?;
         let b1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
         let b2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
         let b3 = ExtendedBlock::new(3, 4096, StorageType::SpdkDisk, FileType::File);

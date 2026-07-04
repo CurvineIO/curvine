@@ -19,10 +19,9 @@ use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     BlockWriteRequest, BlockWriteResponse, BlocksBatchCommitRequest, BlocksBatchCommitResponse,
-    BlocksBatchWriteRequest, BlocksBatchWriteResponse, FilesBatchWriteRequest,
+    BlocksBatchWriteRequest, BlocksBatchWriteResponse, DataHeaderProto, FilesBatchWriteRequest,
     FilesBatchWriteResponse,
 };
-use curvine_common::state::ExtendedBlock;
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use orpc::err_box;
@@ -30,56 +29,58 @@ use orpc::handler::MessageHandler;
 use orpc::io::{BlockDevice, BlockIO};
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::sys::DataSlice;
+use orpc::CommonResult;
 
 pub struct BatchWriteHandler {
     pub(crate) store: BlockStore,
     pub(crate) context: Option<Vec<WriteContext>>,
-    pub(crate) file: Option<Vec<BlockDevice>>,
+    pub(crate) file: Option<Vec<Option<BlockDevice>>>,
     pub(crate) is_commit: bool,
     pub(crate) write_handler: WriteHandler,
 }
 
 impl BatchWriteHandler {
-    pub fn new(store: BlockStore) -> Self {
+    pub fn new(store: BlockStore) -> CommonResult<Self> {
         let store_clone = store.clone();
-        Self {
+        Ok(Self {
             store,
             context: None,
             file: None,
             is_commit: false,
-            write_handler: WriteHandler::new(store_clone),
-        }
+            write_handler: WriteHandler::new(store_clone)?,
+        })
     }
 
-    fn check_context(context: &WriteContext, msg: &Message) -> FsResult<()> {
-        if context.req_id != msg.req_id() {
+    fn check_context(context: &WriteContext, expected_req_id: i64) -> FsResult<()> {
+        if context.req_id != expected_req_id {
             return err_box!(
                 "Request id mismatch, expected {}, actual {}",
                 context.req_id,
-                msg.req_id()
+                expected_req_id
             );
         }
         Ok(())
     }
 
-    fn commit_block(&self, block: &ExtendedBlock, commit: bool) -> FsResult<()> {
-        if commit {
-            self.store.finalize_block(block)?;
-        } else {
-            self.store.abort_block(block)?;
+    fn abort_open_contexts(store: &BlockStore, contexts: &[WriteContext]) {
+        for context in contexts {
+            if let Err(e) = store.abort_block(&context.block) {
+                log::warn!(
+                    "failed to abort batch-opened block {} after open error: {}",
+                    context.block.id,
+                    e
+                );
+            }
         }
-        Ok(())
     }
 
     pub fn open_batch(&mut self, msg: &Message) -> FsResult<Message> {
         let header: BlocksBatchWriteRequest = msg.parse_header()?;
         let mut responses = Vec::with_capacity(header.blocks.len());
+        let mut files = Vec::with_capacity(header.blocks.len());
+        let mut contexts = Vec::with_capacity(header.blocks.len());
 
-        // Initialize ONCE with capacity
-        self.file = Some(Vec::with_capacity(header.blocks.len()));
-        self.context = Some(Vec::with_capacity(header.blocks.len()));
-
-        for (i, block_proto) in header.blocks.into_iter().enumerate() {
+        for (i, block_proto) in header.blocks.iter().cloned().enumerate() {
             let unique_req_id = msg.req_id() + i as i64;
             // Create a single BlockWriteRequest from the block
             let header = BlockWriteRequest {
@@ -101,18 +102,42 @@ impl BatchWriteHandler {
                 .proto_header(header)
                 .build();
 
-            let response = self.write_handler.open(&single_msg_req)?;
-            let block_response: BlockWriteResponse = response.parse_header()?;
-            responses.push(block_response);
+            let response = match self.write_handler.open(&single_msg_req) {
+                Ok(response) => response,
+                Err(e) => {
+                    Self::abort_open_contexts(&self.store, &contexts);
+                    return Err(e);
+                }
+            };
 
             // Extract file and context from handler and store in batch vectors
-            if let Some(file) = self.write_handler.file.take() {
-                self.file.as_mut().unwrap().push(file);
-            }
-            if let Some(context) = self.write_handler.context.take() {
-                self.context.as_mut().unwrap().push(context);
-            }
+            let Some(context) = self.write_handler.context.take() else {
+                Self::abort_open_contexts(&self.store, &contexts);
+                return err_box!(
+                    "batch open did not create write context for block index {}",
+                    i
+                );
+            };
+            let block_response: BlockWriteResponse = match response.parse_header() {
+                Ok(response) => response,
+                Err(e) => {
+                    if let Err(abort_err) = self.store.abort_block(&context.block) {
+                        log::warn!(
+                            "failed to abort batch-opened block {} after response parse error: {}",
+                            context.block.id,
+                            abort_err
+                        );
+                    }
+                    Self::abort_open_contexts(&self.store, &contexts);
+                    return Err(e.into());
+                }
+            };
+            responses.push(block_response);
+            files.push(self.write_handler.file.take());
+            contexts.push(context);
         }
+        self.file = Some(files);
+        self.context = Some(contexts);
         let batch_response = BlocksBatchWriteResponse { responses };
 
         Ok(Builder::success(msg).proto_header(batch_response).build())
@@ -131,45 +156,68 @@ impl BatchWriteHandler {
             };
         }
 
-        // Process each block independently
+        let Some(contexts) = self.context.as_ref() else {
+            return err_box!("batch commit without open context");
+        };
+        let Some(files) = self.file.as_mut() else {
+            return err_box!("batch commit without open files");
+        };
+        if contexts.len() != header.blocks.len() || files.len() != header.blocks.len() {
+            return err_box!(
+                "batch commit block count mismatch: blocks={}, contexts={}, files={}",
+                header.blocks.len(),
+                contexts.len(),
+                files.len()
+            );
+        }
+
+        let mut commit_blocks = Vec::with_capacity(header.blocks.len());
         for (i, block_proto) in header.blocks.into_iter().enumerate() {
-            if let Some(context) = self.context.take() {
-                if context.len() > 1 {
-                    Self::check_context(&context[i], msg)?;
-                }
-            }
-
-            // Flush and close the file (same as complete)
-            let file = self.file.take();
-            if let Some(mut file) = file {
-                if file.len() > 1 {
-                    file[i].flush()?;
-                    drop(file);
-                }
-            }
-
-            // Create context manually for each block from block_proto
-            let unique_req_id = msg.req_id() + i as i64;
-            let context = WriteContext {
-                block: ProtoUtils::extend_block_from_pb(block_proto),
-                req_id: unique_req_id,
-                chunk_size: header.block_size as i32,
-                short_circuit: false,
-                off: header.off,
-                block_size: header.block_size,
+            let Some(context) = contexts.get(i) else {
+                return err_box!("missing batch write context at index {}", i);
             };
+            let expected_req_id = msg.req_id() + i as i64;
+            Self::check_context(context, expected_req_id)?;
 
-            // Validate block length (same as complete)
-            if context.block.len > context.block_size {
+            let block = ProtoUtils::extend_block_from_pb(block_proto);
+            if block.id != context.block.id
+                || block.storage_type != context.block.storage_type
+                || block.file_type != context.block.file_type
+            {
+                return err_box!(
+                    "batch commit block mismatch at index {}: opened={:?}, committed={:?}",
+                    i,
+                    context.block,
+                    block
+                );
+            }
+            if block.len > context.block_size {
                 return err_box!(
                     "Invalid write offset: {}, block size: {}",
-                    context.block.len,
+                    block.len,
                     context.block_size
                 );
             }
+            commit_blocks.push(block);
+        }
 
-            // Commit the block
-            self.commit_block(&context.block, commit)?;
+        for file in files.iter_mut() {
+            if let Some(file) = file.as_mut() {
+                file.flush()?;
+            }
+        }
+        for file in files.iter_mut() {
+            if let Some(file) = file.take() {
+                drop(file);
+            }
+        }
+
+        for block in commit_blocks {
+            if commit {
+                self.store.finalize_block(&block)?;
+            } else {
+                self.store.abort_block(&block)?;
+            }
             results.push(true);
         }
         self.is_commit = true;
@@ -180,14 +228,30 @@ impl BatchWriteHandler {
 
     pub fn write_batch(&mut self, msg: &Message) -> FsResult<Message> {
         let header: FilesBatchWriteRequest = msg.parse_header()?;
-        let mut results = Vec::new();
 
         // Use drain to extract elements while preserving the vector's allocated memory
-        let files_vec = self.file.as_mut().unwrap();
-        let contexts_vec = self.context.as_mut().unwrap();
+        let Some(files_vec) = self.file.as_mut() else {
+            return err_box!("batch write without open files");
+        };
+        let Some(contexts_vec) = self.context.as_mut() else {
+            return err_box!("batch write without open context");
+        };
+        if header.files.len() != files_vec.len() || header.files.len() != contexts_vec.len() {
+            return err_box!(
+                "batch write file count mismatch: request={}, files={}, contexts={}",
+                header.files.len(),
+                files_vec.len(),
+                contexts_vec.len()
+            );
+        }
+        if files_vec.iter().any(Option::is_none) {
+            return err_box!(
+                "batch remote write received running data for short-circuit batch writer"
+            );
+        }
 
-        let files_drain: Vec<_> = std::mem::take(files_vec);
-        let contexts_drain: Vec<_> = std::mem::take(contexts_vec);
+        let files_drain = std::mem::take(files_vec);
+        let contexts_drain = std::mem::take(contexts_vec);
 
         // Process each file in order
         let mut files_iter = files_drain.into_iter();
@@ -208,27 +272,86 @@ impl BatchWriteHandler {
                 .build();
 
             // Get the next file and context from iterators (preserves original order)
-            let file = files_iter.next().unwrap();
-            let context = contexts_iter.next().unwrap();
+            let Some(file) = files_iter.next() else {
+                return err_box!("missing batch write file at index {}", i);
+            };
+            let Some(file) = file else {
+                return err_box!("batch remote write missing file state at index {}", i);
+            };
+            let Some(context) = contexts_iter.next() else {
+                return err_box!("missing batch write context at index {}", i);
+            };
 
             self.write_handler.file = Some(file);
             self.write_handler.context = Some(context);
 
-            let response = self.write_handler.write(&single_msg);
+            if let Err(e) = self.write_handler.write(&single_msg) {
+                let Some(file) = self.write_handler.file.take() else {
+                    return err_box!(
+                        "batch write lost file state after write error at index {}",
+                        i
+                    );
+                };
+                let Some(context) = self.write_handler.context.take() else {
+                    return err_box!(
+                        "batch write lost context state after write error at index {}",
+                        i
+                    );
+                };
+                files_vec.push(Some(file));
+                contexts_vec.push(context);
+                files_vec.extend(files_iter);
+                contexts_vec.extend(contexts_iter);
+                return Err(e);
+            }
 
             // Collect processed file and context back into the original vectors
-            let file = self.write_handler.file.take().unwrap();
-            let context = self.write_handler.context.take().unwrap();
+            let Some(file) = self.write_handler.file.take() else {
+                return err_box!("batch write lost file state at index {}", i);
+            };
+            let Some(context) = self.write_handler.context.take() else {
+                return err_box!("batch write lost context state at index {}", i);
+            };
 
             // Push back to reuse the pre-allocated capacity from open_batch
-            files_vec.push(file);
+            files_vec.push(Some(file));
             contexts_vec.push(context);
-
-            results.push(response.is_ok());
         }
 
-        let batch_response = FilesBatchWriteResponse { results };
+        let batch_response = FilesBatchWriteResponse {
+            results: vec![true; header.files.len()],
+        };
         Ok(Builder::success(msg).proto_header(batch_response).build())
+    }
+
+    pub fn flush_batch(&mut self, msg: &Message) -> FsResult<Message> {
+        let header: DataHeaderProto = msg.parse_header()?;
+        if !header.flush {
+            return err_box!("batch writer received non-flush WriteBlock running request");
+        }
+
+        let Some(files) = self.file.as_mut() else {
+            return err_box!("batch flush without open files");
+        };
+        let Some(contexts) = self.context.as_ref() else {
+            return err_box!("batch flush without open context");
+        };
+        if files.len() != contexts.len() {
+            return err_box!(
+                "batch flush state mismatch: files={}, contexts={}",
+                files.len(),
+                contexts.len()
+            );
+        }
+        for (i, (file, context)) in files.iter_mut().zip(contexts.iter()).enumerate() {
+            let expected_req_id = msg.req_id() + i as i64;
+            Self::check_context(context, expected_req_id)?;
+            if let Some(file) = file.as_mut() {
+                file.flush()?;
+            }
+        }
+
+        Ok(msg.success())
     }
 }
 
@@ -239,6 +362,9 @@ impl MessageHandler for BatchWriteHandler {
         match request_status {
             // batch operations
             RequestStatus::Open => self.open_batch(msg),
+            RequestStatus::Running if RpcCode::from(msg.code()) == RpcCode::WriteBlock => {
+                self.flush_batch(msg)
+            }
             RequestStatus::Running => self.write_batch(msg),
             RequestStatus::Complete => self.complete_batch(msg, true),
             RequestStatus::Cancel => self.complete_batch(msg, false),
