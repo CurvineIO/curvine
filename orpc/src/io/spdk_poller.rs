@@ -150,9 +150,6 @@ pub struct PollerConfig {
     pub ctrlrs: Vec<CtrlHandle>,
 }
 
-// SAFETY: only used for admin completion polling, which is thread-safe.
-unsafe impl Send for PollerConfig {}
-
 /// Poller thread handle.
 pub struct SpdkPoller {
     /// Channel sender for I/O submissions
