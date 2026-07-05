@@ -1,3 +1,4 @@
+use crate::block::BlockClient;
 use crate::file::FsContext;
 use curvine_common::error::FsError;
 use curvine_common::fs::Path;
@@ -12,12 +13,13 @@ use std::sync::Arc;
 
 pub struct BatchBlockWriterLocal {
     rt: Arc<Runtime>,
-    fs_context: Arc<FsContext>,
     blocks: Vec<ExtendedBlock>,
     worker_address: WorkerAddress,
+    client: BlockClient,
     files: Vec<RawPtr<LocalFile>>,
     block_size: i64,
     pos: i64,
+    req_id: i64,
 }
 
 impl BatchBlockWriterLocal {
@@ -54,12 +56,13 @@ impl BatchBlockWriterLocal {
 
         Ok(Self {
             rt: fs_context.clone_runtime(),
-            fs_context,
             blocks,
             worker_address,
+            client,
             files,
             block_size,
             pos: 0,
+            req_id,
         })
     }
 
@@ -67,13 +70,12 @@ impl BatchBlockWriterLocal {
     pub async fn complete(&mut self) -> FsResult<()> {
         // flush before commit
         self.flush().await?;
-        let client = self.fs_context.block_client(&self.worker_address).await?;
-        client
+        self.client
             .write_commit_batch(
                 &self.blocks,
                 self.pos,
                 self.block_size,
-                Utils::req_id(),
+                self.req_id,
                 0,
                 false,
             )
