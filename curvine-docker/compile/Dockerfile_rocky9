@@ -156,11 +156,17 @@ RUN cd /tmp && \
     make install && \
     ldconfig && \
     cd /tmp/spdk-src && \
+    ARCH=$(uname -m) && \
+    case "${ARCH}" in \
+        x86_64) TARGET_ARCH="nehalem" ;; \
+        aarch64) TARGET_ARCH="native" ;; \
+        *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    esac && \
     ./configure \
         --disable-tests \
         --with-rdma \
         --without-vfio-user \
-        --target-arch=native \
+        --target-arch=${TARGET_ARCH} \
         --with-shared && \
     make -j$(nproc) && \
     mkdir -p /opt/spdk/build/bin \
