@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::conf::ClusterConf;
+use crate::fs::Path;
 use orpc::common::{DurationUnit, FileUtils, LogConf, Utils};
 use orpc::sys::{CString, FFIUtils};
 use orpc::{err_box, sys, try_err, CommonResult};
@@ -34,8 +35,10 @@ use std::time::Duration;
 //    These trade metadata freshness for fewer upcalls into user space.
 //
 // 2. User-side caching (maintained inside curvine-fuse itself):
-//    - `enable_meta_cache` / `meta_cache_capacity` / `meta_cache_ttl` -> the
+//    - `enable_meta_cache` / `meta_cache_capacity` / `meta_cache_timeout` -> the
 //      bounded metadata cache backed by `MetaCache` (capacity IS enforced).
+//    - `meta_cache_ttl` (derived from `meta_cache_timeout` in `init()`) -> TTL
+//      for metadata cache entries.
 //    - `node_cache_timeout` -> TTL-based eviction of the inode/node map.
 //
 // 3. IO caching / data-path switches (control how file *data* is cached by the
@@ -147,12 +150,8 @@ pub struct FuseConf {
     // Whether to enable metadata cache
     pub enable_meta_cache: bool,
 
-    // Metadata cache capacity (number of entries)
-    pub meta_cache_capacity: u64,
-
-    // Metadata cache TTL (time to live)
-    pub meta_cache_ttl: String,
-
+    // Metadata cache TTL string (parsed into `meta_cache_ttl` by `init()`)
+    pub meta_cache_timeout: String,
     pub node_cache_timeout: String,
 
     // File and directory related options
@@ -202,7 +201,7 @@ pub struct FuseConf {
     pub node_cache_ttl: Duration,
 
     #[serde(skip_serializing, skip_deserializing)]
-    pub meta_cache_ttl_duration: Duration,
+    pub meta_cache_ttl: Duration,
 
     pub list_limit: usize,
 
@@ -212,6 +211,8 @@ pub struct FuseConf {
     /// When disabled, both use plain read/writev (extra memory copy but no
     /// pipe management overhead). Default: true.
     pub enable_splice: bool,
+
+    pub path_lock_stripes: usize,
 
     pub log: LogConf,
 }
@@ -232,6 +233,12 @@ impl FuseConf {
     /// Default umask applied to file-system-generated permission bits (octal 022).
     pub const DEFAULT_UMASK: u32 = 0o22;
 
+    pub const MAX_READ: u32 = 128 * 1024;
+
+    pub const MAX_WRITE: u32 = 128 * 1024;
+
+    pub const MAX_READ_AHEAD: u32 = 128 * 1024;
+
     /// Default FUSE BDI readahead window: 1 MiB (`1024` KB).
     pub const DEFAULT_MAX_READAHEAD_KB: u32 = 1024;
 
@@ -240,11 +247,17 @@ impl FuseConf {
         self.entry_ttl = Duration::from_millis(self.entry_timeout_ms);
         self.negative_ttl = Duration::from_millis(self.negative_timeout_ms);
         self.node_cache_ttl = DurationUnit::from_str(&self.node_cache_timeout)?.as_duration();
-        self.meta_cache_ttl_duration = DurationUnit::from_str(&self.meta_cache_ttl)?.as_duration();
+        self.meta_cache_ttl = DurationUnit::from_str(&self.meta_cache_timeout)?.as_duration();
 
         if self.mnt_per_task == 0 {
             self.mnt_per_task = self.io_threads;
         }
+
+        let fs_path = Path::from_str(&self.fs_path)?;
+        self.fs_path = fs_path.path().to_owned();
+
+        let mnt_path = Path::from_str(&self.mnt_path)?;
+        self.mnt_path = mnt_path.path().to_owned();
 
         if let Some(0) = self.max_readahead_kb {
             return err_box!("fuse.max_readahead_kb must be > 0 when set");
@@ -380,9 +393,7 @@ impl Default for FuseConf {
             congestion_threshold: 192,
 
             enable_meta_cache: false,
-            meta_cache_capacity: 100000,
-            meta_cache_ttl: "120s".to_string(),
-
+            meta_cache_timeout: "60s".to_string(),
             node_cache_timeout: "1h".to_string(),
 
             direct_io: false,
@@ -399,10 +410,13 @@ impl Default for FuseConf {
             entry_ttl: Default::default(),
             negative_ttl: Default::default(),
             node_cache_ttl: Default::default(),
-            meta_cache_ttl_duration: Default::default(),
+            meta_cache_ttl: Default::default(),
 
             list_limit: 1000,
             enable_splice: true,
+
+            path_lock_stripes: 1024,
+
             log: LogConf::default(),
         };
 

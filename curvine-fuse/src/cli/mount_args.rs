@@ -120,7 +120,7 @@ pub struct FuseMountArgs {
     #[arg(long, help = "Fill inode number when reading directory (optional)")]
     pub read_dir_fill_ino: Option<bool>,
 
-    #[arg(long, help = "Enable write-back cache (optional)")]
+    #[arg(long, help = "Enable kernel write-back cache (optional)")]
     pub write_back_cache: Option<bool>,
 
     #[arg(long, help = "Enable non-seekable mode (optional)")]
@@ -137,9 +137,6 @@ pub struct FuseMountArgs {
 
     #[arg(long, help = "Enable in-kernel metadata cache (optional)")]
     pub enable_meta_cache: Option<bool>,
-
-    #[arg(long, help = "Metadata cache capacity in number of entries (optional)")]
-    pub meta_cache_capacity: Option<u64>,
 
     #[arg(long, help = "Metadata cache TTL (e.g., '120s', '2m') (optional)")]
     pub meta_cache_ttl: Option<String>,
@@ -292,12 +289,9 @@ impl FuseMountArgs {
             conf.fuse.enable_meta_cache = enable_meta_cache;
         }
 
-        if let Some(meta_cache_capacity) = self.meta_cache_capacity {
-            conf.fuse.meta_cache_capacity = meta_cache_capacity;
-        }
-
+        // FuseConf::meta_cache_ttl is a Duration parsed by init() from meta_cache_timeout.
         if let Some(meta_cache_ttl) = &self.meta_cache_ttl {
-            conf.fuse.meta_cache_ttl = meta_cache_ttl.clone();
+            conf.fuse.meta_cache_timeout = meta_cache_ttl.clone();
         }
 
         if let Some(remember) = self.remember {

@@ -112,7 +112,7 @@ pub(crate) const PATH_TYPE_FALLBACK: &str = "fallback";
 pub(crate) const PATH_TYPE_LOCAL: &str = "local";
 pub(crate) const PATH_TYPE_UNKNOWN: &str = "unknown";
 
-// Phase 3a `cache` label values (on `user_meta_cache_*`): the MetaCache namespace.
+// Phase 3a `cache` label values (on `user_meta_cache_*`): the meta-cache namespace.
 pub(crate) const CACHE_STATUS: &str = "status";
 pub(crate) const CACHE_LIST: &str = "list";
 pub(crate) const CACHE_BLOCKS: &str = "blocks";
@@ -126,7 +126,7 @@ pub(crate) const CACHE_RESULT_PUT: &str = "put";
 pub(crate) const NODE_CACHE_OP_LOOKUP: &str = "lookup";
 
 // Phase 3a `reason` label values on `user_meta_cache_invalidations_total`, one per
-// real `invalidate_cache` call site (see the design doc's 15-value enum).
+// real `invalid_cache` call site (see the design doc's 15-value enum).
 pub(crate) const INVAL_REASON_SETATTR: &str = "setattr";
 pub(crate) const INVAL_REASON_RESIZE: &str = "resize";
 pub(crate) const INVAL_REASON_SETXATTR: &str = "setxattr";
@@ -235,6 +235,11 @@ pub struct FuseMetrics {
     pub inode_num: Gauge,
     pub file_handle_num: Gauge,
     pub dir_handle_num: Gauge,
+    pub fuse_used_memory_bytes: Gauge,
+
+    pub write_back_active_inode_num: Gauge,
+    pub write_back_mem_usage: Gauge,
+    pub write_back_mem_limit: Gauge,
 
     // --- Phase 3b-1: namespaced aliases of the legacy gauges above ---
     // Event-driven at the same insert/remove/restore sites, kept exactly in
@@ -391,7 +396,7 @@ pub struct FuseMetrics {
     /// fetch), so a backend error / ENOENT after a miss is still in the
     /// denominator; `put` only when the value is actually written back.
     pub(crate) user_meta_cache_total: CounterVec,
-    /// Requested MetaCache invalidations at the `invalidate_cache(path, reason)`
+    /// Requested meta-cache invalidations at the `invalid_cache(ino, name, reason)`
     /// call site (not confirmed removals). `cache` ∈ {status,list,blocks},
     /// `reason` is one of 15 call-site reasons. One inc PER affected cache
     /// namespace, so a single call emits 3–4 series (`cache=list` usually twice:
@@ -494,6 +499,19 @@ impl FuseMetrics {
             inode_num: m::new_gauge("inode_num", "FUSE inode count in dcache")?,
             file_handle_num: m::new_gauge("file_handle_num", "FUSE open file handle count")?,
             dir_handle_num: m::new_gauge("dir_handle_num", "FUSE open directory handle count")?,
+            fuse_used_memory_bytes: m::new_gauge("fuse_used_memory_bytes", "Total memory used")?,
+            write_back_active_inode_num: m::new_gauge(
+                "write_back_active_inode_num",
+                "FUSE write-back active inode count",
+            )?,
+            write_back_mem_usage: m::new_gauge(
+                "write_back_mem_usage",
+                "FUSE write-back page cache usage (bytes)",
+            )?,
+            write_back_mem_limit: m::new_gauge(
+                "write_back_mem_limit",
+                "FUSE write-back page cache size limit (bytes)",
+            )?,
 
             // Phase 3b-1: namespaced aliases (same values, event-driven in lockstep).
             inode_count: m::new_gauge(
