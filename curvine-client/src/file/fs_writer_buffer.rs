@@ -211,12 +211,18 @@ impl FsWriterBuffer {
             let select_task = tokio::select! {
                 biased;
 
-                chunk = chunk_receiver.recv_check() => {
-                   SelectTask::Data(chunk?)
+                chunk = chunk_receiver.recv() => {
+                   let Some(chunk) = chunk else {
+                        return Ok(())
+                    };
+                   SelectTask::Data(chunk)
                 }
 
-                task = task_receiver.recv_check() => {
-                    SelectTask::Control(task?)
+                task = task_receiver.recv() => {
+                    let Some(task) = task else {
+                        return Ok(())
+                    };
+                    SelectTask::Control(task)
                 }
             };
 
