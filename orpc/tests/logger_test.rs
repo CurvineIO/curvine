@@ -13,13 +13,20 @@
 // limitations under the License.
 
 use orpc::common::{LogConf, Logger};
+use tracing::dispatcher;
 
 #[test]
 fn logger_init_does_not_panic_when_global_subscriber_already_set() {
-    let _ = tracing_subscriber::fmt()
+    let init_result = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::ERROR)
         .with_test_writer()
         .try_init();
+
+    assert!(
+        init_result.is_ok() || dispatcher::has_been_set(),
+        "expected global tracing subscriber to be installed"
+    );
+    assert!(dispatcher::has_been_set());
 
     Logger::init(LogConf::default());
 }
