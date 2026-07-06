@@ -55,13 +55,13 @@ Usage notes:
 </skill>
 
 <skill>
-<name>cv-review-first</name>
+<name>cv-submit-pr-review</name>
 <description>Perform a direct code review of a Curvine PR by reading the diff and changed files, analyzing correctness, safety, and design issues, and producing structured findings. Use when user asks to review a PR's code, do a code review, or check a PR before merge.</description>
 <location>project</location>
 </skill>
 
 <skill>
-<name>cv-review-pr</name>
+<name>cv-address-pr-review</name>
 <description>Review an existing Curvine PR, analyze review comments one by one with an accept/reject table, fix after user approval, update the PR, reply to comments, and resolve threads. Use when user asks to review a PR, handle review comments, or provides a PR URL.</description>
 <location>project</location>
 </skill>

@@ -140,5 +140,5 @@ gh pr edit <number> --title "..." --body "..."
 
 ## Related
 
-- Review feedback → [cv-review-pr](../cv-review-pr/SKILL.md)
+- Review feedback → [cv-address-pr-review](../cv-address-pr-review/SKILL.md)
 - Fix issue workflow → [cv-handle-issue](../cv-handle-issue/SKILL.md)

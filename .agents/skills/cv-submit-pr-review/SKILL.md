@@ -1,9 +1,9 @@
 ---
-name: cv-review-first
+name: cv-submit-pr-review
 description: Perform a direct code review of a Curvine PR by reading the diff and changed files, analyzing correctness, safety, and design issues, and producing structured findings. Use when user asks to review a PR's code, do a code review, or check a PR before merge.
 ---
 
-# cv-review-first
+# cv-submit-pr-review
 
 Review a Curvine PR's code content directly: locate PR → read diff → gather context → analyze → report findings → optionally post review.
 
@@ -14,7 +14,7 @@ Review a Curvine PR's code content directly: locate PR → read diff → gather 
 - User provides a PR URL or number and asks for review
 - User asks "is this PR OK?" or "review this change"
 
-**Not for:** responding to existing reviewer comments → use [cv-review-pr](../cv-review-pr/SKILL.md).
+**Not for:** responding to existing reviewer comments → use [cv-address-pr-review](../cv-address-pr-review/SKILL.md).
 
 ## Review Scope
 
@@ -165,6 +165,6 @@ Review states: `--request` (request changes), `--approve`, or `--comment` (neutr
 
 ## Related
 
-- Handle existing reviewer comments → [cv-review-pr](../cv-review-pr/SKILL.md)
+- Handle existing reviewer comments → [cv-address-pr-review](../cv-address-pr-review/SKILL.md)
 - Fix findings and update PR → [cv-create-pr](../cv-create-pr/SKILL.md)
 - Review during issue fix → [cv-handle-issue](../cv-handle-issue/SKILL.md)

@@ -11,7 +11,7 @@ Cross-agent workflow rules. Cursor-specific rules live in `.cursor/rules/` (`.md
 | Create issue | `cv-create-issue` |
 | Fix issue | `cv-handle-issue` |
 | Create / update PR | `cv-create-pr` |
-| Review comments | `cv-review-pr` |
+| Review comments | `cv-address-pr-review` |
 | Run CI workflow | `cv-run-workflow` |
 
 ## Issue → PR flow

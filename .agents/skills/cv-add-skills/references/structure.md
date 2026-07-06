@@ -68,7 +68,7 @@ cv-tasks-breakdown → cv-create-issue (sub-issues)
 cv-create-issue → cv-handle-issue
 cv-handle-issue → cv-tasks-breakdown (large scope)
 cv-handle-issue → cv-create-pr
-cv-create-pr → cv-review-pr
+cv-create-pr → cv-address-pr-review
 cv-run-workflow → cv-create-pr (for workflow YAML changes)
 ```
 
