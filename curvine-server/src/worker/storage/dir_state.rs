@@ -15,7 +15,7 @@
 use curvine_common::state::StorageType;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 #[derive(Debug, Default)]
 pub struct DirState {
@@ -88,10 +88,21 @@ impl BdevOffsetAllocator {
             }),
         }
     }
+
+    fn lock_inner(&self) -> MutexGuard<'_, OffsetAllocInner> {
+        match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(e) => {
+                log::error!("fatal bdev offset allocator lock poisoned: {}", e);
+                std::process::abort();
+            }
+        }
+    }
+
     /// Allocate bytes for block_id. Returns bdev offset (aligned to block size).
     /// First checks the free-list (first-fit), then falls back to bump cursor.
     pub fn allocate(&self, block_id: i64, size: i64) -> Result<i64, String> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         if inner.map.contains_key(&block_id) {
             return Err(format!(
                 "block {} already allocated at offset {}",
@@ -131,17 +142,17 @@ impl BdevOffsetAllocator {
     }
     /// Get offset for allocated block.
     pub fn get(&self, block_id: i64) -> Option<i64> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock_inner();
         inner.map.get(&block_id).map(|&(off, _)| off)
     }
     /// Get (offset, size) for allocated block.
     pub fn get_entry(&self, block_id: i64) -> Option<(i64, i64)> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock_inner();
         inner.map.get(&block_id).copied()
     }
     /// Remove mapping and return space to the free-list with coalescing.
     pub fn free(&self, block_id: i64) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         let (offset, size) = match inner.map.remove(&block_id) {
             Some(v) => v,
             None => return,
@@ -180,12 +191,12 @@ impl BdevOffsetAllocator {
     }
     /// Number of allocated blocks.
     pub fn allocated_count(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock_inner();
         inner.map.len()
     }
     /// Current cursor (next free offset).
     pub fn cursor(&self) -> i64 {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock_inner();
         inner.cursor
     }
 }
@@ -198,7 +209,7 @@ impl Default for BdevOffsetAllocator {
 impl BdevOffsetAllocator {
     /// Export state for persistence: Vec<(block_id, offset, size)>.
     pub fn snapshot(&self) -> Vec<(i64, i64, i64)> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock_inner();
         inner
             .map
             .iter()
@@ -209,7 +220,7 @@ impl BdevOffsetAllocator {
     /// Restore from snapshot. Rebuilds map, cursor = max(offset + size), and reconstructs
     /// the free-list from gaps between allocated blocks within [0, cursor).
     pub fn restore(&self, entries: &[(i64, i64, i64)]) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         inner.map.clear();
         inner.free_list.clear();
         inner.cursor = 0;
@@ -234,33 +245,33 @@ impl BdevOffsetAllocator {
 
     /// Alignment value used by this allocator.
     pub fn align(&self) -> i64 {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock_inner();
         inner.align
     }
 
     /// Size of the free-list (number of free ranges).
     pub fn free_list_size(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock_inner();
         inner.free_list.len()
     }
 
     /// Total free bytes in the free-list.
     pub fn free_list_bytes(&self) -> i64 {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock_inner();
         inner.free_list.iter().map(|(_, &v)| v).sum()
     }
 
     #[cfg(test)]
     /// Expose free-list entries for test introspection.
     pub fn free_list_entries(&self) -> Vec<(i64, i64)> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock_inner();
         inner.free_list.iter().map(|(&k, &v)| (k, v)).collect()
     }
 }
 
 impl std::fmt::Debug for BdevOffsetAllocator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock_inner();
         f.debug_struct("BdevOffsetAllocator")
             .field("cursor", &inner.cursor)
             .field("capacity", &inner.capacity)

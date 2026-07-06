@@ -76,7 +76,7 @@ impl WorkerMetrics {
     }
 
     pub fn text_output(&self) -> CommonResult<String> {
-        let state = self.store.read();
+        let state = self.store.read()?;
 
         self.capacity.set(state.capacity());
         self.available.set(state.available());

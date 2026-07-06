@@ -24,7 +24,7 @@ use orpc::common::{ByteUnit, TimeSpent};
 use orpc::handler::MessageHandler;
 use orpc::io::{BlockDevice, BlockIO};
 use orpc::message::{Builder, Message, RequestStatus};
-use orpc::{err_box, ternary, try_option_mut};
+use orpc::{err_box, ternary, try_option_mut, CommonResult};
 use std::mem;
 
 pub struct WriteHandler {
@@ -37,17 +37,17 @@ pub struct WriteHandler {
 }
 
 impl WriteHandler {
-    pub fn new(store: BlockStore) -> Self {
-        let conf = Worker::get_conf();
-        let metrics = Worker::get_metrics();
-        Self {
+    pub fn new(store: BlockStore) -> CommonResult<Self> {
+        let conf = Worker::get_conf()?;
+        let metrics = Worker::get_metrics()?;
+        Ok(Self {
             store,
             context: None,
             file: None,
             is_commit: false,
             io_slow_us: conf.worker.io_slow_us(),
             metrics,
-        }
+        })
     }
 
     pub fn resize(file: &mut BlockDevice, ctx: &WriteContext) -> FsResult<()> {
@@ -103,9 +103,31 @@ impl WriteHandler {
         };
 
         let meta = self.store.open_block(&open_block)?;
-        let mut file = meta.create_writer(context.off, false)?;
+        let mut file = match meta.create_writer(context.off, false) {
+            Ok(file) => file,
+            Err(e) => {
+                if let Err(abort_err) = self.store.abort_block(&context.block) {
+                    log::warn!(
+                        "failed to abort block {} after create_writer error: {}",
+                        context.block.id,
+                        abort_err
+                    );
+                }
+                return Err(e.into());
+            }
+        };
         // check file resize
-        Self::resize(&mut file, &context)?;
+        if let Err(e) = Self::resize(&mut file, &context) {
+            drop(file);
+            if let Err(abort_err) = self.store.abort_block(&context.block) {
+                log::warn!(
+                    "failed to abort block {} after resize error: {}",
+                    context.block.id,
+                    abort_err
+                );
+            }
+            return Err(e);
+        }
 
         let is_short_circuit = context.short_circuit && file.supports_short_circuit();
         let (label, path, file) = if is_short_circuit {

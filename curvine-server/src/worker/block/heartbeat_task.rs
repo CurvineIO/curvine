@@ -50,9 +50,12 @@ impl HeartbeatTask {
                             continue;
                         }
 
+                        if let Err(e) = store
+                            .write()
+                            .map(|state| state.increment_blocks_to_delete())
                         {
-                            let state = store.write();
-                            state.increment_blocks_to_delete();
+                            error!("failed to mark block {} deleting: {}", block, e);
+                            continue;
                         }
 
                         // Whether or not it is successfully deleted, it is marked as deleted
@@ -104,7 +107,13 @@ impl LoopTask for HeartbeatTask {
 
     fn run(&self) -> FsResult<()> {
         // Perform heartbeat sending.
-        let info = self.store.get_and_check_storages();
+        let info = match self.store.get_and_check_storages() {
+            Ok(info) => info,
+            Err(e) => {
+                error!("collect worker storage info failed {}", e);
+                return Ok(());
+            }
+        };
         let res = self.client.heartbeat(HeartbeatStatus::Running, info);
         match res {
             Ok(v) => {

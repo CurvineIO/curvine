@@ -122,7 +122,12 @@ impl MiniCluster {
     pub fn start_worker(&self) {
         for conf in &self.worker_conf {
             let worker = Worker::with_conf(conf.clone()).unwrap();
-            thread::spawn(move || worker.block_on_start());
+            thread::spawn(move || {
+                if let Err(e) = worker.block_on_start() {
+                    log::error!("mini cluster worker failed to start: {}", e);
+                    std::process::abort();
+                }
+            });
         }
     }
 
