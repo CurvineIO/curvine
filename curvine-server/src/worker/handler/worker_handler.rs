@@ -24,7 +24,7 @@ use curvine_common::utils::SerdeUtils;
 use curvine_common::FsResult;
 use orpc::err_box;
 use orpc::handler::MessageHandler;
-use orpc::message::{Builder, Message, RequestStatus};
+use orpc::message::{Builder, Message, RequestStatus, ResponseStatus};
 use orpc::runtime::Runtime;
 use std::sync::Arc;
 
@@ -52,10 +52,14 @@ impl MessageHandler for WorkerHandler {
                 let h = self.get_handler(msg)?;
                 let res = h.handle(msg);
 
-                if matches!(
-                    msg.request_status(),
-                    RequestStatus::Cancel | RequestStatus::Complete
-                ) {
+                if res
+                    .as_ref()
+                    .is_ok_and(|msg| msg.response_status() == ResponseStatus::Success)
+                    && matches!(
+                        msg.request_status(),
+                        RequestStatus::Cancel | RequestStatus::Complete
+                    )
+                {
                     let _ = self.handler.take();
                 };
 
@@ -69,9 +73,10 @@ impl WorkerHandler {
     fn get_handler(&mut self, msg: &Message) -> FsResult<&mut BlockHandler> {
         let code = RpcCode::from(msg.code());
 
-        let need_new_handler = self.handler.is_none()
-            || !matches!(msg.request_status(), RequestStatus::Running)
-            || !Self::handler_matches_code(&self.handler, code);
+        let need_new_handler = match msg.request_status() {
+            RequestStatus::Open => true,
+            _ => self.handler.is_none() || !Self::handler_matches_code(&self.handler, code),
+        };
 
         if need_new_handler {
             let handler = BlockHandler::new(code, self.store.clone())?;
@@ -94,6 +99,7 @@ impl WorkerHandler {
                     Some(BlockHandler::BatchWriter(_)),
                     RpcCode::WriteBlocksBatch
                 )
+                | (Some(BlockHandler::BatchWriter(_)), RpcCode::WriteBlock)
         )
     }
 

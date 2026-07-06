@@ -14,7 +14,6 @@
 
 use crate::worker::storage::{DirState, VfsDir, ACTIVE_DIR, STAGING_DIR};
 use curvine_common::state::{ExtendedBlock, StorageType};
-use once_cell::sync::Lazy;
 use orpc::common::{ByteUnit, FileUtils};
 use orpc::io::{BlockDevice, IOResult, LocalFile};
 
@@ -24,13 +23,10 @@ use log::info;
 use orpc::io::SpdkBdev;
 
 use orpc::{err_box, sys, try_err, CommonResult};
-use regex::Regex;
 use std::fmt::Formatter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fmt, fs};
-
-static FILE_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"^blk_(\w+)$").unwrap());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(i8)]
@@ -46,16 +42,11 @@ impl BlockState {
     }
 
     pub fn check_file(file: &str) -> Option<i64> {
-        match FILE_REGEX.captures(file) {
-            None => None,
-            Some(v) => {
-                let id = match v.get(1) {
-                    None => return None,
-                    Some(v) => v.as_str().parse::<i64>().unwrap(),
-                };
-                Some(id)
-            }
+        let id = file.strip_prefix("blk_")?;
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
         }
+        id.parse::<i64>().ok()
     }
 }
 

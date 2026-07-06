@@ -43,7 +43,7 @@ fn main() -> CommonResult<()> {
 
         ServiceType::Worker => {
             let worker = Worker::with_conf(conf)?;
-            worker.block_on_start();
+            worker.block_on_start()?;
         }
     }
 

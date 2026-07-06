@@ -26,7 +26,7 @@ use orpc::handler::MessageHandler;
 use orpc::io::{BlockDevice, BlockIO};
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::sys::{CacheManager, ReadAheadTask};
-use orpc::{err_box, ternary, try_option_mut};
+use orpc::{err_box, ternary, try_option_mut, CommonResult};
 use std::mem;
 
 pub struct ReadHandler {
@@ -43,10 +43,10 @@ pub struct ReadHandler {
 impl ReadHandler {
     pub const MAX_READ_AHEAD: i64 = 16 * 1024 * 1024;
 
-    pub fn new(store: BlockStore) -> Self {
-        let metrics = Worker::get_metrics();
-        let conf = Worker::get_conf();
-        Self {
+    pub fn new(store: BlockStore) -> CommonResult<Self> {
+        let metrics = Worker::get_metrics()?;
+        let conf = Worker::get_conf()?;
+        Ok(Self {
             store,
             os_cache: CacheManager::with_place(),
             context: None,
@@ -55,7 +55,7 @@ impl ReadHandler {
             io_slow_us: conf.worker.io_slow_us(),
             enable_send_file: conf.worker.enable_send_file,
             metrics,
-        }
+        })
     }
 
     pub fn open(&mut self, msg: &Message) -> FsResult<Message> {

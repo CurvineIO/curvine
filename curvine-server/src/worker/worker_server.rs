@@ -24,13 +24,14 @@ use curvine_web::server::{WebHandlerService, WebServer};
 use log::info;
 use once_cell::sync::OnceCell;
 use orpc::common::{LocalTime, Logger};
+use orpc::error::StringError;
 use orpc::handler::HandlerService;
 use orpc::io::net::ConnState;
 #[cfg(feature = "spdk")]
 use orpc::io::spdk_env::SpdkEnv;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::server::{RpcServer, ServerStateListener};
-use orpc::CommonResult;
+use orpc::{CommonError, CommonResult};
 use std::sync::Arc;
 use std::thread;
 
@@ -102,8 +103,8 @@ pub struct Worker {
     pub start_ms: u64,
     pub worker_id: u32,
     pub addr: WorkerAddress,
-    rpc_server: RpcServer<WorkerService>,
-    web_server: WebServer<WorkerService>,
+    rpc_server: Option<RpcServer<WorkerService>>,
+    web_server: Option<WebServer<WorkerService>>,
     block_actor: BlockActor,
 }
 
@@ -177,10 +178,10 @@ impl Worker {
 
         let rt = Arc::new(conf.worker_server_conf().create_runtime());
         let service: WorkerService = WorkerService::with_conf(&conf, rt.clone())?;
-        let worker_id = service.store.worker_id();
+        let worker_id = service.store.worker_id()?;
 
         CLUSTER_CONF.get_or_init(|| conf.clone());
-        WORKER_METRICS.get_or_init(|| WorkerMetrics::new(service.store.clone()).unwrap());
+        WORKER_METRICS.get_or_try_init(|| WorkerMetrics::new(service.store.clone()))?;
         conf.print();
 
         let block_store = service.store.clone();
@@ -202,7 +203,7 @@ impl Worker {
             addr.clone(),
             block_store.clone(),
             rpc_server.new_state_ctl(),
-        );
+        )?;
 
         let master_client = block_actor.client.clone();
         service
@@ -225,58 +226,82 @@ impl Worker {
             start_ms: LocalTime::mills(),
             worker_id,
             addr,
-            rpc_server,
-            web_server,
+            rpc_server: Some(rpc_server),
+            web_server: Some(web_server),
             block_actor,
         };
 
         Ok(worker)
     }
 
-    pub async fn start(self) -> ServerStateListener {
+    pub async fn start(&mut self) -> CommonResult<ServerStateListener> {
         // step 3: Start rpc server
-        let mut rpc_status = self.rpc_server.start();
-        rpc_status.wait_running().await.unwrap();
+        let rpc_server = self
+            .rpc_server
+            .take()
+            .expect("worker rpc server must be initialized before startup");
+        let mut rpc_status = rpc_server.start();
+        rpc_status.wait_running().await?;
 
         // step 4: Start the web server
-        let web_name = self.web_server.server_name().to_string();
-        let bind_addr = self.web_server.resolve_bind_addr();
-        let mut web_status = self.web_server.start();
-        WebServer::<WorkerService>::wait_bind(&mut web_status, &web_name, &bind_addr)
-            .await
-            .unwrap();
+        let web_server = self
+            .web_server
+            .take()
+            .expect("worker web server must be initialized before startup");
+        let web_name = web_server.server_name().to_string();
+        let bind_addr = web_server.resolve_bind_addr();
+        let mut web_status = web_server.start();
+        WebServer::<WorkerService>::wait_bind(&mut web_status, &web_name, &bind_addr).await?;
 
         // step 5: Start block heartbeat check service
-        thread::spawn(move || self.block_actor.start())
+        let block_actor = self.block_actor.clone();
+        thread::spawn(move || block_actor.start())
             .join()
-            .unwrap();
+            .map_err(|_| {
+                CommonError::from(StringError::from(
+                    "worker block actor startup thread panicked",
+                ))
+            })
+            .and_then(|result| result)?;
 
-        rpc_status
+        Ok(rpc_status)
     }
 
-    pub fn block_on_start(self) {
-        let rt = self.rpc_server.clone_rt();
+    pub fn block_on_start(mut self) -> CommonResult<()> {
+        let rt = self
+            .rpc_server
+            .as_ref()
+            .expect("worker rpc server must be initialized before startup")
+            .clone_rt();
 
-        rt.block_on(async move {
-            let mut rpc_status = self.start().await;
-            rpc_status.wait_stop().await.unwrap();
-        })
+        let mut rpc_status = rt.block_on(async { self.start().await })?;
+        rt.block_on(async { rpc_status.wait_stop().await })
     }
 
     // Start a standalone worker.
     pub fn start_standalone(&self) {
-        self.rpc_server.block_on_start();
+        self.rpc_server
+            .as_ref()
+            .expect("worker rpc server must be initialized")
+            .block_on_start();
     }
 
-    pub fn get_conf<'a>() -> &'a ClusterConf {
-        CLUSTER_CONF.get().expect("Worker get conf error!")
+    pub fn get_conf<'a>() -> CommonResult<&'a ClusterConf> {
+        CLUSTER_CONF
+            .get()
+            .ok_or_else(|| orpc::CommonError::from("worker cluster config is not initialized"))
     }
 
-    pub fn get_metrics<'a>() -> &'a WorkerMetrics {
-        WORKER_METRICS.get().expect("Worker get metrics error!")
+    pub fn get_metrics<'a>() -> CommonResult<&'a WorkerMetrics> {
+        WORKER_METRICS
+            .get()
+            .ok_or_else(|| orpc::CommonError::from("worker metrics are not initialized"))
     }
 
     pub fn service(&self) -> &WorkerService {
-        self.rpc_server.service()
+        self.rpc_server
+            .as_ref()
+            .expect("worker rpc server must be initialized")
+            .service()
     }
 }

@@ -36,49 +36,61 @@ impl BlockStore {
         Ok(block_store)
     }
 
-    pub(crate) fn write(&self) -> RwLockWriteGuard<'_, BlockDataset> {
-        self.state.write().unwrap()
+    pub(crate) fn write(&self) -> CommonResult<RwLockWriteGuard<'_, BlockDataset>> {
+        match self.state.write() {
+            Ok(state) => Ok(state),
+            Err(e) => {
+                log::error!("fatal block store write lock poisoned: {}", e);
+                std::process::abort();
+            }
+        }
     }
 
-    pub(crate) fn read(&self) -> RwLockReadGuard<'_, BlockDataset> {
-        self.state.read().unwrap()
+    pub(crate) fn read(&self) -> CommonResult<RwLockReadGuard<'_, BlockDataset>> {
+        match self.state.read() {
+            Ok(state) => Ok(state),
+            Err(e) => {
+                log::error!("fatal block store read lock poisoned: {}", e);
+                std::process::abort();
+            }
+        }
     }
 
     pub fn open_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
-        self.write().open_block(block)
+        self.write()?.open_block(block)
     }
 
     pub fn finalize_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
-        self.write().finalize_block(block)
+        self.write()?.finalize_block(block)
     }
 
     pub fn abort_block(&self, block: &ExtendedBlock) -> CommonResult<()> {
-        self.write().abort_block(block)
+        self.write()?.abort_block(block)
     }
 
     pub fn get_block(&self, id: i64) -> CommonResult<BlockMeta> {
-        let state = self.read();
+        let state = self.read()?;
         let b = state.get_block_check(id)?;
         Ok(b.clone())
     }
 
-    pub fn worker_id(&self) -> u32 {
-        let state = self.read();
-        state.worker_id()
+    pub fn worker_id(&self) -> CommonResult<u32> {
+        let state = self.read()?;
+        Ok(state.worker_id())
     }
 
-    pub fn cluster_id(&self) -> String {
-        let state = self.read();
-        state.cluster_id().to_string()
+    pub fn cluster_id(&self) -> CommonResult<String> {
+        let state = self.read()?;
+        Ok(state.cluster_id().to_string())
     }
 
-    pub fn all_blocks(&self) -> Vec<BlockMeta> {
-        let state = self.read();
-        state.all_blocks()
+    pub fn all_blocks(&self) -> CommonResult<Vec<BlockMeta>> {
+        let state = self.read()?;
+        Ok(state.all_blocks())
     }
 
     pub fn remove_block(&self, id: i64) -> CommonResult<()> {
-        let mut state = self.write();
+        let mut state = self.write()?;
         let block = ExtendedBlock::with_id(id);
         state.remove_block(&block)
     }
@@ -86,7 +98,7 @@ impl BlockStore {
     // Asynchronously delete block.
     pub fn async_remove_block(&self, id: i64) -> CommonResult<BlockMeta> {
         // Delete the original data.
-        let mut state = self.write();
+        let mut state = self.write()?;
         let meta = state.block_map.remove(&id);
 
         let meta = match meta {
@@ -113,7 +125,7 @@ impl BlockStore {
         }
 
         // Update disk space.
-        let state = self.read();
+        let state = self.read()?;
         let dir = state.find_dir(meta.dir_id())?;
         dir.release_space(meta.is_final(), meta.actual_len);
         drop(state);
@@ -124,8 +136,8 @@ impl BlockStore {
     // Get all storage information and check whether the storage directory is normal.
     // If the directory is not normal, the storage will be marked as failed.
     // This method is called by the heartbeat thread and returns all storage information, including failed storage.
-    pub fn get_and_check_storages(&self) -> Vec<StorageInfo> {
-        let state = self.read();
+    pub fn get_and_check_storages(&self) -> CommonResult<Vec<StorageInfo>> {
+        let state = self.read()?;
         let mut vec = vec![];
         for item in state.dir_iter() {
             let failed = match item.check_dir() {
@@ -152,6 +164,6 @@ impl BlockStore {
             vec.push(info);
         }
 
-        vec
+        Ok(vec)
     }
 }
