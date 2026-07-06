@@ -1,9 +1,9 @@
 ---
-name: cv-review-pr
+name: cv-address-pr-review
 description: Review an existing Curvine PR, analyze review comments one by one with an accept/reject table, fix after user approval, update the PR, reply to comments, and resolve threads. Use when user asks to review a PR, handle review comments, or provides a PR URL.
 ---
 
-# cv-review-pr
+# cv-address-pr-review
 
 Process PR review comments systematically: analyze → propose → user approves → fix → update PR → reply → resolve.
 
