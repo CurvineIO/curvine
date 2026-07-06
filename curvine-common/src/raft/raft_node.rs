@@ -634,26 +634,42 @@ where
             if entry.get_data().is_empty() {
                 continue;
             }
-            let req_id: i64 = SerdeUtils::deserialize(entry.get_context())?;
 
-            let rep_msg = if let EntryType::EntryConfChange = entry.get_entry_type() {
+            let is_conf_change = matches!(entry.get_entry_type(), EntryType::EntryConfChange);
+            let should_respond = self.is_leader();
+            let (entry_index, entry_term, entry_context) = if should_respond {
+                (entry.index, entry.term, Some(entry.get_context().to_vec()))
+            } else {
+                (0, 0, None)
+            };
+            let rep_msg = if is_conf_change {
                 let rep = self.apply_config_change(&entry)?;
                 Builder::new_rpc(RaftCode::ConfChange)
                     .response(ResponseStatus::Success)
-                    .req_id(req_id)
                     .proto_header(rep)
-                    .build()
             } else {
                 let rep = self.apply_propose(entry).await?;
                 Builder::new_rpc(RaftCode::Propose)
                     .response(ResponseStatus::Success)
-                    .req_id(req_id)
                     .proto_header(rep)
-                    .build()
             };
 
             // Followers only need to replay the message and do not need to respond to the customer service.
-            if self.is_leader() {
+            if should_respond {
+                let Some(entry_context) = entry_context else {
+                    continue;
+                };
+                let req_id: i64 = match SerdeUtils::deserialize(&entry_context) {
+                    Ok(req_id) => req_id,
+                    Err(e) => {
+                        warn!(
+                            "failed to decode raft entry context for response, index {}, term {}: {}",
+                            entry_index, entry_term, e
+                        );
+                        continue;
+                    }
+                };
+                let rep_msg = rep_msg.req_id(req_id).build();
                 match client_send.remove(&req_id) {
                     Some(sender) => {
                         if sender.send(Ok(rep_msg)).is_err() {
