@@ -110,7 +110,12 @@ impl MiniCluster {
                 index,
                 MasterEntry(master.get_fs(), master.get_replication_manager()),
             );
-            thread::spawn(move || master.block_on_start());
+            thread::spawn(move || {
+                if let Err(e) = master.block_on_start() {
+                    log::error!("mini cluster master failed to start: {}", e);
+                    std::process::abort();
+                }
+            });
         }
     }
 

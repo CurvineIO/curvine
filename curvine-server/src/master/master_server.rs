@@ -24,7 +24,7 @@ use orpc::handler::HandlerService;
 use orpc::io::net::ConnState;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::server::{RpcServer, ServerStateListener};
-use orpc::CommonResult;
+use orpc::{err_box, CommonResult};
 
 use crate::master::fs::{FsRetryCache, MasterActor, MasterFilesystem};
 use crate::master::journal::JournalSystem;
@@ -45,9 +45,11 @@ pub struct MasterService {
     job_manager: Arc<JobManager>,
     rt: Arc<Runtime>,
     replication_manager: Arc<MasterReplicationManager>,
+    metrics: &'static MasterMetrics,
 }
 
 impl MasterService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         conf: ClusterConf,
         fs: MasterFilesystem,
@@ -56,6 +58,7 @@ impl MasterService {
         job_manager: Arc<JobManager>,
         rt: Arc<Runtime>,
         replication_manager: Arc<MasterReplicationManager>,
+        metrics: &'static MasterMetrics,
     ) -> Self {
         Self {
             conf,
@@ -65,6 +68,7 @@ impl MasterService {
             job_manager,
             rt,
             replication_manager,
+            metrics,
         }
     }
 
@@ -101,6 +105,7 @@ impl HandlerService for MasterService {
             self.mount_manager.clone(),
             JobHandler::new(self.job_manager.clone()),
             self.replication_manager.clone(),
+            self.metrics,
         )
     }
 }
@@ -109,15 +114,15 @@ impl WebHandlerService for MasterService {
     type Item = MasterRouterHandler;
 
     fn get_handler(&self) -> Self::Item {
-        MasterRouterHandler::new(self.conf.clone(), self.fs.clone())
+        MasterRouterHandler::new(self.conf.clone(), self.fs.clone(), self.metrics)
     }
 }
 
 pub struct Master {
     pub start_time: u64,
-    rpc_server: RpcServer<MasterService>,
-    web_server: WebServer<MasterService>,
-    journal_system: JournalSystem,
+    rpc_server: Option<RpcServer<MasterService>>,
+    web_server: Option<WebServer<MasterService>>,
+    journal_system: Option<JournalSystem>,
     actor: MasterActor,
     mount_manager: Arc<MountManager>,
     job_manager: Arc<JobManager>,
@@ -132,7 +137,7 @@ impl Master {
         }
 
         Logger::init(log);
-        MASTER_METRICS.get_or_init(|| MasterMetrics::new().unwrap());
+        let metrics = MASTER_METRICS.get_or_try_init(MasterMetrics::new)?;
         conf.print();
 
         // step1: Create a journal system, the journal system determines how to create a fs dir.
@@ -145,7 +150,7 @@ impl Master {
 
         let rt = Arc::new(conf.master_server_conf().create_runtime());
 
-        let replication_manager = MasterReplicationManager::new(&fs, &conf, &rt, &worker_manager);
+        let replication_manager = MasterReplicationManager::new(&fs, &conf, &rt, &worker_manager)?;
 
         let actor = MasterActor::new(
             fs.clone(),
@@ -156,7 +161,7 @@ impl Master {
         );
 
         // step3: Create rpc server.
-        let retry_cache = FsRetryCache::with_conf(&conf.master);
+        let retry_cache = FsRetryCache::with_conf(&conf.master)?;
         let service = MasterService::new(
             conf.clone(),
             fs,
@@ -165,6 +170,7 @@ impl Master {
             job_manager.clone(),
             rt.clone(),
             replication_manager.clone(),
+            metrics,
         );
 
         let rpc_conf = conf.master_server_conf();
@@ -176,9 +182,9 @@ impl Master {
 
         Ok(Self {
             start_time: LocalTime::mills(),
-            rpc_server,
-            web_server,
-            journal_system,
+            rpc_server: Some(rpc_server),
+            web_server: Some(web_server),
+            journal_system: Some(journal_system),
             actor,
             mount_manager,
             job_manager,
@@ -190,61 +196,76 @@ impl Master {
         Self::new(conf)
     }
 
-    pub async fn start(mut self) -> ServerStateListener {
+    pub async fn start(&mut self) -> CommonResult<ServerStateListener> {
         // step 1: Start journal_system, raft server and raft node will be started internally
-        let mut listener = self.journal_system.start().await.unwrap();
-        listener.wait_role().await.unwrap();
+        let journal_system = match self.journal_system.take() {
+            Some(journal_system) => journal_system,
+            None => return err_box!("master journal system is not initialized"),
+        };
+        let mut listener = journal_system.start().await?;
+        listener.wait_role().await?;
 
         // step 2: Start rpc server
-        let mut rpc_status = self.rpc_server.start();
-        rpc_status.wait_running().await.unwrap();
+        let rpc_server = match self.rpc_server.take() {
+            Some(rpc_server) => rpc_server,
+            None => return err_box!("master rpc server is not initialized"),
+        };
+        let mut rpc_status = rpc_server.start();
+        rpc_status.wait_running().await?;
 
         // step3: Start the web server
-        let web_name = self.web_server.server_name().to_string();
-        let bind_addr = self.web_server.resolve_bind_addr();
-        let mut web_status = self.web_server.start();
-        WebServer::<MasterService>::wait_bind(&mut web_status, &web_name, &bind_addr)
-            .await
-            .unwrap();
+        let web_server = match self.web_server.take() {
+            Some(web_server) => web_server,
+            None => return err_box!("master web server is not initialized"),
+        };
+        let web_name = web_server.server_name().to_string();
+        let bind_addr = web_server.resolve_bind_addr();
+        let mut web_status = web_server.start();
+        WebServer::<MasterService>::wait_bind(&mut web_status, &web_name, &bind_addr).await?;
 
         // step4: Start master actor
-        self.actor.start();
+        self.actor.start()?;
 
         // reload mount info
-        self.mount_manager.restore();
+        self.mount_manager.restore_best_effort();
 
         // step5: Start job manager
-        self.job_manager.start();
+        self.job_manager.start()?;
 
         // step6: Start TTL scheduler (requires mount_manager and job_manager)
         if let Err(e) = self.actor.start_ttl_scheduler() {
             error!("Failed to start inode ttl scheduler: {}", e);
         }
 
-        rpc_status
+        Ok(rpc_status)
     }
 
-    pub fn block_on_start(self) {
-        let rt = self.rpc_server.clone_rt();
-        rt.block_on(async move {
-            let mut status = self.start().await;
-            status.wait_stop().await.unwrap();
-        });
+    pub fn block_on_start(mut self) -> CommonResult<()> {
+        let rt = match self.rpc_server.as_ref() {
+            Some(rpc_server) => rpc_server.clone_rt(),
+            None => return err_box!("master rpc server is not initialized"),
+        };
+        let mut status = rt.block_on(async { self.start().await })?;
+        rt.block_on(async { status.wait_stop().await })
     }
 
-    pub fn get_metrics<'a>() -> &'a MasterMetrics {
-        MASTER_METRICS.get().expect("Master get metrics error!")
+    pub fn get_metrics<'a>() -> CommonResult<&'a MasterMetrics> {
+        MASTER_METRICS.get_or_try_init(MasterMetrics::new)
     }
 
     // Instantiate metrics during testing
     pub fn init_test_metrics() {
-        let metrics = MasterMetrics::new().unwrap();
-        MASTER_METRICS.get_or_init(|| metrics);
+        let _ = Self::get_metrics();
     }
 
     // for test
     pub fn get_fs(&self) -> MasterFilesystem {
-        self.rpc_server.service().fs.clone()
+        self.rpc_server
+            .as_ref()
+            .expect("master rpc server must be initialized")
+            .service()
+            .fs
+            .clone()
     }
 
     // for test
@@ -253,6 +274,9 @@ impl Master {
     }
 
     pub fn service(&self) -> &MasterService {
-        self.rpc_server.service()
+        self.rpc_server
+            .as_ref()
+            .expect("master rpc server must be initialized")
+            .service()
     }
 }

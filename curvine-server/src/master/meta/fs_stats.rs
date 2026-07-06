@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::master::{Master, MasterMetrics};
+use orpc::CommonResult;
 
 /// File system statistics tracker for maintaining real-time counts
 /// of files and directories without expensive traversal operations.
@@ -22,10 +23,10 @@ pub struct FileSystemStats {
 }
 
 impl FileSystemStats {
-    pub fn new() -> Self {
-        Self {
-            metrics: Master::get_metrics(),
-        }
+    pub fn new() -> CommonResult<Self> {
+        Ok(Self {
+            metrics: Master::get_metrics()?,
+        })
     }
 
     pub fn increment_file_count(&self) {
@@ -58,11 +59,5 @@ impl FileSystemStats {
     pub fn set_counts(&self, file_count: i64, dir_count: i64) {
         self.metrics.inode_file_num.set(file_count);
         self.metrics.inode_dir_num.set(dir_count);
-    }
-}
-
-impl Default for FileSystemStats {
-    fn default() -> Self {
-        Self::new()
     }
 }

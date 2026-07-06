@@ -19,7 +19,6 @@ use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::{
     Inode, InodeDir, InodeFile, InodePtr, PATH_SEPARATOR, ROOT_INODE_ID,
 };
-use core::panic;
 use curvine_common::state::{FileStatus, FileType, SetAttrOpts, StoragePolicy, TtlAction};
 use curvine_common::utils::SerdeUtils;
 use orpc::common::{LocalTime, Utils};
@@ -333,91 +332,82 @@ impl InodeView {
         }
     }
 
-    pub fn acl(&self) -> &AclFeature {
+    pub fn acl(&self) -> CommonResult<&AclFeature> {
         match self {
-            File(f) => &f.features.acl,
-            Dir(d) => &d.features.acl,
+            File(f) => Ok(&f.features.acl),
+            Dir(d) => Ok(&d.features.acl),
+            FileEntry(..) => err_box!("FileEntry does not support ACL access: {}", self.name()),
+        }
+    }
+
+    pub fn acl_mut(&mut self) -> CommonResult<&mut AclFeature> {
+        match self {
+            File(f) => Ok(&mut f.features.acl),
+            Dir(d) => Ok(&mut d.features.acl),
+            FileEntry(..) => err_box!("FileEntry does not support mutable ACL access"),
+        }
+    }
+
+    pub fn storage_policy(&self) -> CommonResult<&StoragePolicy> {
+        match self {
+            File(f) => Ok(&f.storage_policy),
+            Dir(d) => Ok(&d.storage_policy),
             FileEntry(..) => {
-                panic!("FileEntry does not support ACL access")
+                err_box!(
+                    "FileEntry does not support storage policy access: {}",
+                    self.name()
+                )
             }
         }
     }
 
-    pub fn acl_mut(&mut self) -> &mut AclFeature {
+    pub fn storage_policy_mut(&mut self) -> CommonResult<&mut StoragePolicy> {
         match self {
-            File(f) => &mut f.features.acl,
-            Dir(d) => &mut d.features.acl,
-            FileEntry(..) => {
-                panic!("FileEntry does not support mutable ACL access")
-            }
+            File(f) => Ok(&mut f.storage_policy),
+            Dir(d) => Ok(&mut d.storage_policy),
+            FileEntry(..) => err_box!("FileEntry does not support mutable storage policy access"),
         }
     }
 
-    pub fn storage_policy(&self) -> &StoragePolicy {
-        match self {
-            File(f) => &f.storage_policy,
-            Dir(d) => &d.storage_policy,
-            FileEntry(..) => {
-                panic!("FileEntry does not support storage policy access")
-            }
-        }
-    }
-
-    pub fn storage_policy_mut(&mut self) -> &mut StoragePolicy {
-        match self {
-            File(f) => &mut f.storage_policy,
-            Dir(d) => &mut d.storage_policy,
-            FileEntry(..) => {
-                panic!("FileEntry does not support mutable storage policy access")
-            }
-        }
-    }
-
-    pub fn expiration_ms(&self) -> Option<i64> {
-        let sp = self.storage_policy();
+    pub fn expiration_ms(&self) -> CommonResult<Option<i64>> {
+        let sp = self.storage_policy()?;
         if sp.ttl_ms > 0 && sp.ttl_action != TtlAction::None {
-            Some(self.mtime().saturating_add(sp.ttl_ms))
+            Ok(Some(self.mtime().saturating_add(sp.ttl_ms)))
         } else {
-            None
+            Ok(None)
         }
     }
 
-    pub fn is_expired(&self) -> bool {
-        let sp = self.storage_policy();
+    pub fn is_expired(&self) -> CommonResult<bool> {
+        let sp = self.storage_policy()?;
         if sp.ttl_action != TtlAction::None && sp.ttl_ms > 0 {
-            LocalTime::mills() as i64 > self.mtime().saturating_add(sp.ttl_ms)
+            Ok(LocalTime::mills() as i64 > self.mtime().saturating_add(sp.ttl_ms))
         } else {
-            false
+            Ok(false)
         }
     }
 
-    pub fn x_attr(&self) -> &HashMap<String, Vec<u8>> {
+    pub fn x_attr(&self) -> CommonResult<&HashMap<String, Vec<u8>>> {
         match self {
-            File(f) => &f.features.x_attr,
-            Dir(d) => &d.features.x_attr,
-            FileEntry(..) => {
-                panic!("FileEntry does not support x_attr access")
-            }
+            File(f) => Ok(&f.features.x_attr),
+            Dir(d) => Ok(&d.features.x_attr),
+            FileEntry(..) => err_box!("FileEntry does not support x_attr access: {}", self.name()),
         }
     }
 
-    pub fn x_attr_mut(&mut self) -> &mut HashMap<String, Vec<u8>> {
+    pub fn x_attr_mut(&mut self) -> CommonResult<&mut HashMap<String, Vec<u8>>> {
         match self {
-            File(f) => &mut f.features.x_attr,
-            Dir(d) => &mut d.features.x_attr,
-            FileEntry(..) => {
-                panic!("FileEntry does not support mutable x_attr access")
-            }
+            File(f) => Ok(&mut f.features.x_attr),
+            Dir(d) => Ok(&mut d.features.x_attr),
+            FileEntry(..) => err_box!("FileEntry does not support mutable x_attr access"),
         }
     }
 
-    pub fn nlink(&self) -> u32 {
+    pub fn nlink(&self) -> CommonResult<u32> {
         match self {
-            File(f) => f.nlink(),
-            Dir(d) => d.nlink(),
-            FileEntry(_) => {
-                panic!("FileEntry does not support nlink")
-            }
+            File(f) => Ok(f.nlink()),
+            Dir(d) => Ok(d.nlink()),
+            FileEntry(_) => err_box!("FileEntry does not support nlink: {}", self.name()),
         }
     }
 
@@ -425,17 +415,17 @@ impl InodeView {
         InodePtr::from_ref(self)
     }
 
-    pub fn set_attr(&mut self, opts: SetAttrOpts) {
+    pub fn set_attr(&mut self, opts: SetAttrOpts) -> CommonResult<()> {
         if let Some(owner) = opts.owner {
-            self.acl_mut().owner = owner;
+            self.acl_mut()?.owner = owner;
         }
 
         if let Some(group) = opts.group {
-            self.acl_mut().group = group;
+            self.acl_mut()?.group = group;
         }
 
         if let Some(mode) = opts.mode {
-            self.acl_mut().mode = mode;
+            self.acl_mut()?.mode = mode;
         }
 
         // Handle time modifications
@@ -456,79 +446,87 @@ impl InodeView {
         }
 
         if let Some(ttl_ms) = opts.ttl_ms {
-            self.storage_policy_mut().ttl_ms = ttl_ms;
+            self.storage_policy_mut()?.ttl_ms = ttl_ms;
         }
 
         if let Some(ttl_action) = opts.ttl_action {
-            if self.storage_policy_mut().ttl_action != TtlAction::Free {
-                self.storage_policy_mut().ttl_action = ttl_action;
+            let storage_policy = self.storage_policy_mut()?;
+            if storage_policy.ttl_action != TtlAction::Free {
+                storage_policy.ttl_action = ttl_action;
             }
         }
 
         for attr in opts.add_x_attr {
-            self.x_attr_mut().insert(attr.0, attr.1);
+            self.x_attr_mut()?.insert(attr.0, attr.1);
         }
 
         for key in opts.remove_x_attr {
-            let _ = self.x_attr_mut().remove(&key);
+            let _ = self.x_attr_mut()?.remove(&key);
         }
 
         if let Some(ufs_mtime) = opts.ufs_mtime {
             if self.is_file() {
-                self.storage_policy_mut().save_ufs(ufs_mtime);
+                self.storage_policy_mut()?.save_ufs(ufs_mtime);
             }
         }
+
+        Ok(())
     }
 
-    pub fn to_file_status(&self, path: &str) -> FileStatus {
-        let acl = self.acl();
-        let mut status = FileStatus {
-            id: self.id(),
-            path: path.to_owned(),
-            name: self.name().to_owned(),
-            is_dir: self.is_dir(),
-            mtime: self.mtime(),
-            atime: self.atime(),
-            children_num: self.child_len() as i32,
-            is_complete: false,
-            len: 0,
-            replicas: 0,
-            block_size: 0,
-            file_type: FileType::File,
-            x_attr: Default::default(),
-            storage_policy: Default::default(),
-            owner: acl.owner.to_owned(),
-            group: acl.group.to_owned(),
-            mode: acl.mode,
-            nlink: self.nlink(),
-            target: None,
-        };
-
+    pub fn to_file_status(&self, path: &str) -> CommonResult<FileStatus> {
         match self {
             File(f) => {
-                status.is_complete = f.is_complete();
-                status.len = f.len;
-                status.replicas = f.replicas as i32;
-                status.block_size = f.block_size as i64;
-                status.file_type = f.file_type;
-                status.x_attr = f.features.x_attr.clone();
-                status.storage_policy = f.storage_policy.clone();
-                status.target = f.target.clone();
+                let acl = &f.features.acl;
+                Ok(FileStatus {
+                    id: self.id(),
+                    path: path.to_owned(),
+                    name: self.name().to_owned(),
+                    is_dir: false,
+                    mtime: self.mtime(),
+                    atime: self.atime(),
+                    children_num: 0,
+                    is_complete: f.is_complete(),
+                    len: f.len,
+                    replicas: f.replicas as i32,
+                    block_size: f.block_size as i64,
+                    file_type: f.file_type,
+                    x_attr: f.features.x_attr.clone(),
+                    storage_policy: f.storage_policy.clone(),
+                    owner: acl.owner.to_owned(),
+                    group: acl.group.to_owned(),
+                    mode: acl.mode,
+                    nlink: f.nlink(),
+                    target: f.target.clone(),
+                })
             }
 
             Dir(d) => {
-                status.file_type = FileType::Dir;
-                status.len = d.children_len() as i64;
-                status.x_attr = d.features.x_attr.clone();
-                status.storage_policy = d.storage_policy.clone();
+                let acl = &d.features.acl;
+                Ok(FileStatus {
+                    id: self.id(),
+                    path: path.to_owned(),
+                    name: self.name().to_owned(),
+                    is_dir: true,
+                    mtime: self.mtime(),
+                    atime: self.atime(),
+                    children_num: self.child_len() as i32,
+                    is_complete: false,
+                    len: d.children_len() as i64,
+                    replicas: 0,
+                    block_size: 0,
+                    file_type: FileType::Dir,
+                    x_attr: d.features.x_attr.clone(),
+                    storage_policy: d.storage_policy.clone(),
+                    owner: acl.owner.to_owned(),
+                    group: acl.group.to_owned(),
+                    mode: acl.mode,
+                    nlink: d.nlink(),
+                    target: None,
+                })
             }
 
-            FileEntry(_) => {
-                panic!("FileEntry does not support to_file_status");
-            }
+            FileEntry(_) => err_box!("FileEntry does not support to_file_status: {}", self.name()),
         }
-
-        status
     }
 
     /// Print directory structure, output is the same as the linux tree command
@@ -570,17 +568,15 @@ impl InodeView {
         }
     }
 
-    pub fn sum_hash(&self) -> u128 {
+    pub fn sum_hash(&self) -> CommonResult<u128> {
         let mut res: u128 = 0;
         let mut stack = LinkedList::new();
         stack.push_back(self);
 
         while let Some(v) = stack.pop_front() {
-            let bytes = SerdeUtils::serialize(&v).unwrap();
+            let bytes = SerdeUtils::serialize(&v)?;
             if !v.is_root() {
                 let hash = Utils::crc32(&bytes) as u128;
-                // let inode: InodeView = SerdeUtils::deserialize(&bytes).unwrap();
-                // info!("id = {}[{}], detail = {:?}", inode.id(), hash, inode);
                 res += hash
             }
 
@@ -589,7 +585,7 @@ impl InodeView {
             }
         }
 
-        res
+        Ok(res)
     }
 }
 

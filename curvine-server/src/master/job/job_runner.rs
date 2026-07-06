@@ -209,11 +209,16 @@ impl LoadJobRunner {
         if let Err(err) = self.submit_all_task(tasks).await {
             warn!("dispatch load job {} failed: {}", job_id, err);
             // @todo Cancel sub-tasks that may have already been dispatched.
-            self.jobs.update_state(
+            if let Err(update_err) = self.jobs.update_state(
                 &job_id,
                 JobTaskState::Failed,
                 format!("dispatch failed: {}", err),
-            );
+            ) {
+                error!(
+                    "failed to mark load job {} as failed after dispatch error: {}",
+                    job_id, update_err
+                );
+            }
             return Err(err);
         }
 
@@ -343,11 +348,16 @@ impl LoadJobRunner {
 
             if let Err(e) = res {
                 error!("failed to send cancel request to worker {}: {}", worker, e);
-                self.jobs.update_state(
+                if let Err(update_err) = self.jobs.update_state(
                     job_id,
                     JobTaskState::Canceled,
                     format!("failed to send cancel request to worker {}: {}", worker, e),
-                );
+                ) {
+                    error!(
+                        "failed to mark load job {} as canceled after worker cancel error: {}",
+                        job_id, update_err
+                    );
+                }
             }
         }
 

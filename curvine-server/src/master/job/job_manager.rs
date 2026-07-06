@@ -28,7 +28,7 @@ use curvine_common::FsResult;
 use log::{debug, info};
 use orpc::common::LocalTime;
 use orpc::runtime::{LoopTask, Runtime};
-use orpc::{err_box, err_ext};
+use orpc::{err_box, err_ext, CommonResult};
 use std::sync::Arc;
 use tokio::time::timeout;
 
@@ -66,22 +66,26 @@ impl JobManager {
     }
 
     /// Start the job manager
-    pub fn start(&self) {
+    pub fn start(&self) -> CommonResult<()> {
         let cleanup_interval = self.job_cleanup_ttl.as_millis() as u64;
         let ttl_ms = self.job_life_ttl.as_millis() as i64;
 
         let executor = ScheduledExecutor::new("job_cleanup", cleanup_interval);
-        executor
-            .start(JobCleanupTask {
-                jobs: self.jobs.clone(),
-                ttl_ms,
-            })
-            .unwrap();
+        executor.start(JobCleanupTask {
+            jobs: self.jobs.clone(),
+            ttl_ms,
+        })?;
 
         info!("JobManager started");
+        Ok(())
     }
 
-    fn update_state(&self, job_id: &str, state: JobTaskState, message: impl Into<String>) {
+    fn update_state(
+        &self,
+        job_id: &str,
+        state: JobTaskState,
+        message: impl Into<String>,
+    ) -> FsResult<()> {
         self.jobs.update_state(job_id, state, message)
     }
 
@@ -187,7 +191,7 @@ impl JobManager {
                         "job {} is already in final state {:?}, source_path: {}, target_path: {}",
                         job_id, state, job.info.source_path, job.info.target_path
                     );
-                    self.update_state(job_id, JobTaskState::Canceled, "Canceling job by user");
+                    self.update_state(job_id, JobTaskState::Canceled, "Canceling job by user")?;
                     return Ok(());
                 }
 
@@ -197,7 +201,7 @@ impl JobManager {
             }
         };
 
-        self.update_state(job_id, JobTaskState::Canceled, "Canceling job by user");
+        self.update_state(job_id, JobTaskState::Canceled, "Canceling job by user")?;
 
         let job_runner = self.create_runner();
         job_runner.cancel_job(&job_id, assigned_workers).await?;

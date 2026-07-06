@@ -13,8 +13,10 @@
 // limitations under the License.
 
 use crate::master::meta::inode::InodeView;
+use crate::master::Master;
 use log::{debug, info, warn};
 use orpc::common::FastHashSet;
+use orpc::{err_box, CommonResult};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -85,19 +87,22 @@ pub struct TtlBucketList {
 }
 
 impl TtlBucketList {
-    pub fn new(interval_duration_ms: i64) -> Self {
+    pub fn new(interval_duration_ms: i64) -> CommonResult<Self> {
         if interval_duration_ms <= 0 {
-            panic!("interval_duration_ms must be positive");
+            return err_box!(
+                "ttl bucket interval_duration_ms must be positive, actual {}",
+                interval_duration_ms
+            );
         }
 
         info!(
             "Creating TTL bucket list with sorted storage, interval duration: {}ms",
             interval_duration_ms
         );
-        Self {
+        Ok(Self {
             buckets: Arc::new(Mutex::new(BTreeMap::new())),
             interval_duration_ms,
-        }
+        })
     }
 
     pub fn total_inodes(&self) -> u64 {
@@ -141,7 +146,18 @@ impl TtlBucketList {
             return;
         }
 
-        if let Some(expiration_ms) = inode.expiration_ms() {
+        let expiration_ms = match inode.expiration_ms() {
+            Ok(Some(expiration_ms)) => expiration_ms,
+            Ok(None) => return,
+            Err(e) => {
+                warn!("ttl_bucket: skip add for inode {}: {}", inode.id(), e);
+                if let Ok(metrics) = Master::get_metrics() {
+                    metrics.ttl_skipped_inodes.inc();
+                }
+                return;
+            }
+        };
+        {
             let bucket = self.get_or_create_bucket(expiration_ms);
             bucket.add(inode.id());
 
@@ -163,15 +179,19 @@ impl TtlBucketList {
             return false;
         }
 
-        if let Some(expiration_ms) = inode.expiration_ms() {
-            let interval_start = self.get_bucket_interval_start(expiration_ms);
-            if let Some(bucket) = self.buckets.lock().get(&interval_start) {
-                let res = bucket.remove(inode.id());
-                debug!("removed inode {} from sorted TTL bucket list", inode.id());
-                res
-            } else {
-                false
+        let expiration_ms = match inode.expiration_ms() {
+            Ok(Some(expiration_ms)) => expiration_ms,
+            Ok(None) => return false,
+            Err(e) => {
+                warn!("ttl_bucket: skip remove for inode {}: {}", inode.id(), e);
+                return false;
             }
+        };
+        let interval_start = self.get_bucket_interval_start(expiration_ms);
+        if let Some(bucket) = self.buckets.lock().get(&interval_start) {
+            let res = bucket.remove(inode.id());
+            debug!("removed inode {} from sorted TTL bucket list", inode.id());
+            res
         } else {
             false
         }
@@ -214,9 +234,13 @@ mod tests {
         InodeView::new_file("t".to_string(), InodeFile::new(id, mtime))
     }
 
+    fn ttl_bucket_list() -> TtlBucketList {
+        TtlBucketList::new(INTERVAL_MS).expect("valid ttl bucket interval")
+    }
+
     #[test]
     fn add_skips_when_ttl_disabled() {
-        let list = TtlBucketList::new(INTERVAL_MS);
+        let list = ttl_bucket_list();
         list.add(&file_no_ttl(1, 0));
         assert_eq!(list.total_inodes(), 0);
         assert_eq!(list.buckets_len(), 0);
@@ -224,7 +248,7 @@ mod tests {
 
     #[test]
     fn add_places_inode_in_quantized_bucket() {
-        let list = TtlBucketList::new(INTERVAL_MS);
+        let list = ttl_bucket_list();
         // expiration = mtime + ttl_ms = 100 + 500 = 600 -> interval_start 0
         list.add(&file_with_ttl(42, 100, 500));
         assert_eq!(list.total_inodes(), 1);
@@ -233,7 +257,7 @@ mod tests {
 
     #[test]
     fn add_same_interval_merges_into_one_bucket() {
-        let list = TtlBucketList::new(INTERVAL_MS);
+        let list = ttl_bucket_list();
         list.add(&file_with_ttl(1, 0, 400)); // exp 400 -> start 0
         list.add(&file_with_ttl(2, 50, 350)); // exp 400 -> start 0
         assert_eq!(list.total_inodes(), 2);
@@ -242,7 +266,7 @@ mod tests {
 
     #[test]
     fn add_different_intervals_use_multiple_buckets() {
-        let list = TtlBucketList::new(INTERVAL_MS);
+        let list = ttl_bucket_list();
         list.add(&file_with_ttl(1, 0, 500)); // exp 500 -> start 0
         list.add(&file_with_ttl(2, 500, 1000)); // exp 1500 -> start 1000
         assert_eq!(list.total_inodes(), 2);
@@ -251,7 +275,7 @@ mod tests {
 
     #[test]
     fn remove_drops_inode_from_bucket() {
-        let list = TtlBucketList::new(INTERVAL_MS);
+        let list = ttl_bucket_list();
         let f = file_with_ttl(7, 0, 100);
         list.add(&f);
         assert_eq!(list.total_inodes(), 1);
@@ -261,14 +285,14 @@ mod tests {
 
     #[test]
     fn remove_unknown_returns_false() {
-        let list = TtlBucketList::new(INTERVAL_MS);
+        let list = ttl_bucket_list();
         let f = file_with_ttl(9, 0, 100);
         assert!(!list.remove(&f));
     }
 
     #[test]
     fn get_expired_buckets_at_drains_and_matches_time_rule() {
-        let list = TtlBucketList::new(INTERVAL_MS);
+        let list = ttl_bucket_list();
         list.add(&file_with_ttl(1, 0, 500)); // exp 500, bucket [0, INTERVAL_MS)
 
         let now = 2000_i64;
@@ -283,7 +307,7 @@ mod tests {
 
     #[test]
     fn get_expired_buckets_at_empty_when_not_yet_expired() {
-        let list = TtlBucketList::new(INTERVAL_MS);
+        let list = ttl_bucket_list();
         // exp = 0 + 10_000 = 10_000 -> interval_start 10_000
         list.add(&file_with_ttl(1, 0, 10_000));
 

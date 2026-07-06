@@ -51,7 +51,7 @@ impl MasterActor {
         }
     }
 
-    pub fn start(&mut self) {
+    pub fn start(&mut self) -> CommonResult<()> {
         info!("start master actor");
         Self::start_heartbeat_checker(
             self.fs.clone(),
@@ -59,8 +59,8 @@ impl MasterActor {
             self.executor.clone(),
             self.replication_manager.clone(),
             self.quota_manager.clone(),
-        )
-        .unwrap();
+        )?;
+        Ok(())
     }
 
     pub fn start_ttl_scheduler(&mut self) -> CommonResult<()> {

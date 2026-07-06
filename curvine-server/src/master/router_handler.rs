@@ -28,35 +28,36 @@ use orpc::common::LocalTime;
 use orpc::err_box;
 
 use crate::master::fs::MasterFilesystem;
-use crate::master::Master;
+use crate::master::MasterMetrics;
 
 #[derive(Clone)]
 pub struct MasterRouterHandler {
     fs: MasterFilesystem,
     conf: ClusterConf,
     start_time: String,
+    metrics: &'static MasterMetrics,
 }
 
 impl MasterRouterHandler {
-    pub fn new(conf: ClusterConf, fs: MasterFilesystem) -> Self {
+    pub fn new(conf: ClusterConf, fs: MasterFilesystem, metrics: &'static MasterMetrics) -> Self {
         Self {
             fs,
             conf,
             start_time: LocalTime::now_datetime(),
+            metrics,
         }
     }
 }
 
-fn get_report(fs: MasterFilesystem) -> HashMap<String, String> {
-    let metrics = Master::get_metrics();
-    let output = metrics.text_output(fs).unwrap();
+fn get_report(fs: MasterFilesystem, metrics: &MasterMetrics) -> FsResult<HashMap<String, String>> {
+    let output = metrics.text_output(fs)?;
     let report = output
         .lines()
         .filter(|line| !line.starts_with("#"))
-        .map(|line| {
+        .filter_map(|line| {
             let mut parts = line.split_whitespace();
-            let name = parts.next().unwrap();
-            let value = parts.next().unwrap();
+            let name = parts.next()?;
+            let value = parts.next()?;
             let value = match name {
                 "capacity" | "available" | "fs_used" => {
                     let v = value.parse::<f64>().unwrap_or(0.0);
@@ -66,26 +67,26 @@ fn get_report(fs: MasterFilesystem) -> HashMap<String, String> {
                 _ => value.to_string(),
             };
             let name = name.to_string();
-            (name, value)
+            Some((name, value))
         })
         .collect();
-    report
+    Ok(report)
 }
 
-async fn metrics(Extension(instance): Extension<Arc<MasterRouterHandler>>) -> String {
-    let metrics = Master::get_metrics();
-    metrics.text_output(instance.fs.clone()).unwrap()
+async fn metrics(Extension(instance): Extension<Arc<MasterRouterHandler>>) -> FsResult<String> {
+    Ok(instance.metrics.text_output(instance.fs.clone())?)
 }
 
-async fn report(Extension(instance): Extension<Arc<MasterRouterHandler>>) -> String {
-    let report = get_report(instance.fs.clone());
-    let available = &report.get("available").unwrap();
-    let capacity = &report.get("capacity").unwrap();
-    let fs_used = &report.get("fs_used").unwrap();
-    let dir_total = &report.get("inode_dir_num").unwrap();
-    let files_total = &report.get("inode_file_num").unwrap();
-    let live_workers = &report.get("live_workers").unwrap();
-    let lost_workers = &report.get("lost_workers").unwrap();
+async fn report(Extension(instance): Extension<Arc<MasterRouterHandler>>) -> FsResult<String> {
+    let report = get_report(instance.fs.clone(), instance.metrics)?;
+    let metric = |key: &str| report.get(key).map(String::as_str).unwrap_or("N/A");
+    let available = metric("available");
+    let capacity = metric("capacity");
+    let fs_used = metric("fs_used");
+    let dir_total = metric("inode_dir_num");
+    let files_total = metric("inode_file_num");
+    let live_workers = metric("live_workers");
+    let lost_workers = metric("lost_workers");
 
     let result = format!(
         r#"Curvine cluster summary:
@@ -98,7 +99,7 @@ async fn report(Extension(instance): Extension<Arc<MasterRouterHandler>>) -> Str
     lost_workers: {lost_workers}
     "#
     );
-    result
+    Ok(result)
 }
 
 async fn overview(
@@ -107,7 +108,7 @@ async fn overview(
     let fs = &instance.fs;
     let conf = &instance.conf;
     let start_time = &instance.start_time;
-    let master_info = fs.master_info().unwrap();
+    let master_info = fs.master_info()?;
 
     let (files_total, dir_total) = {
         let (f, d) = fs.get_file_counts();
@@ -167,7 +168,10 @@ async fn block_locations(
     Query(params): Query<HashMap<String, String>>,
 ) -> FsResult<Json<FileBlocks>> {
     let fs = &instance.fs;
-    let path = params.get("path").expect("not found path");
+    let path = match params.get("path") {
+        Some(path) => path,
+        None => return err_box!("missing required query parameter: path"),
+    };
     let files = fs.get_block_locations(path)?;
     Ok(Json(files))
 }

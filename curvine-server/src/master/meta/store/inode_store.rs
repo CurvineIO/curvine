@@ -101,12 +101,12 @@ pub struct InodeStore {
 }
 
 impl InodeStore {
-    pub fn new(store: RocksInodeStore, ttl_bucket_list: Arc<TtlBucketList>) -> Self {
-        InodeStore {
+    pub fn new(store: RocksInodeStore, ttl_bucket_list: Arc<TtlBucketList>) -> CommonResult<Self> {
+        Ok(InodeStore {
             store: Arc::new(store),
-            fs_stats: Arc::new(FileSystemStats::new()),
+            fs_stats: Arc::new(FileSystemStats::new()?),
             ttl_bucket_list,
-        }
+        })
     }
 
     pub fn get_ttl_bucket_list(&self) -> Arc<TtlBucketList> {
@@ -492,7 +492,7 @@ impl InodeStore {
         let edges_iter = self.store.bulk_scan_edges()?;
         for item in edges_iter {
             let (key, value) = try_err!(item);
-            let (parent_id, child_name) = RocksUtils::i64_str_from_bytes(&key).unwrap();
+            let (parent_id, child_name) = RocksUtils::i64_str_from_bytes(&key)?;
             let child_id = RocksUtils::i64_from_bytes(&value)?;
             edges
                 .entry(parent_id)
@@ -620,8 +620,7 @@ impl InodeStore {
                 // Check for duplicate directory edge BEFORE removing from inodes.
                 // A directory can only have one parent; if we've already seen this
                 // directory id, the current edge is a duplicate and must be deleted.
-                if dir_edges.contains_key(child_id) {
-                    let (old_parent_id, old_name) = dir_edges.get(child_id).unwrap();
+                if let Some((old_parent_id, old_name)) = dir_edges.get(child_id) {
                     log::warn!(
                         "create_tree: directory inode {} has multiple parent edges: keeping parent {} name '{}', dropping parent {} name '{}'",
                         child_id, old_parent_id, old_name, parent_id, edge_name
@@ -770,7 +769,7 @@ impl InodeStore {
                 scan_inodes.push((index, RocksUtils::i64_to_bytes(inode.id())));
             } else {
                 let child_path = inp.child_path(inode.name());
-                out[index] = inode.to_file_status(&child_path);
+                out[index] = inode.to_file_status(&child_path)?;
             }
         }
 
@@ -781,8 +780,18 @@ impl InodeStore {
         let keys = scan_inodes.iter().map(|x| &x.1);
         let batch_res = self.store.batched_multi_get_inodes(keys, false)?;
         for (i, item) in batch_res.into_iter().enumerate() {
-            let index = try_option!(scan_inodes.get(i)).0;
-            let file_entry = try_option!(list.get(index));
+            let index = try_option!(
+                scan_inodes.get(i),
+                "batched_get_inodes: missing scan entry for batch result index {}",
+                i
+            )
+            .0;
+            let file_entry = try_option!(
+                list.get(index),
+                "batched_get_inodes: file entry index {} out of range, list len {}",
+                index,
+                list.len()
+            );
 
             if let Some(bytes) = try_err!(item) {
                 let mut inode: InodeView = SerdeUtils::deserialize(bytes.as_ref())?;
@@ -797,7 +806,7 @@ impl InodeStore {
 
                 inode.change_name(file_entry.name().to_owned());
                 let child_path = inp.child_path(file_entry.name());
-                out[index] = inode.to_file_status(&child_path);
+                out[index] = inode.to_file_status(&child_path)?;
             } else {
                 return err_box!(
                     "batched_get_inodes: inode missing in store path {}, id {}",
@@ -810,15 +819,15 @@ impl InodeStore {
         Ok(out)
     }
 
-    pub fn cf_hash(&self, cf: &str) -> u128 {
-        let iter = self.store.iter_cf(cf).unwrap();
+    pub fn cf_hash(&self, cf: &str) -> CommonResult<u128> {
+        let iter = self.store.iter_cf(cf)?;
         let mut hash = 0;
         for inode in iter {
-            let kv = inode.unwrap();
+            let kv = inode?;
             hash += Utils::crc32(kv.0.as_ref()) as u128;
             hash += Utils::crc32(kv.1.as_ref()) as u128;
         }
-        hash
+        Ok(hash)
     }
 
     pub fn create_checkpoint(&self, id: u64) -> CommonResult<String> {
@@ -916,7 +925,7 @@ mod tests {
             Utils::rand_str(6)
         )));
         let rocks = RocksInodeStore::new(conf, true)?;
-        Ok(InodeStore::new(rocks, Arc::new(TtlBucketList::new(60_000))))
+        InodeStore::new(rocks, Arc::new(TtlBucketList::new(60_000)?))
     }
 
     #[test]

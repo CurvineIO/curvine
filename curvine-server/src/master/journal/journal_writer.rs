@@ -42,27 +42,29 @@ pub struct JournalWriter {
 }
 
 impl JournalWriter {
-    pub fn new(testing: bool, client: RaftClient, conf: &JournalConf) -> Self {
+    pub fn new(testing: bool, client: RaftClient, conf: &JournalConf) -> FsResult<Self> {
+        let node_id = conf.node_id()?;
+        let metrics = Master::get_metrics()?;
         let (sender, receiver) = BlockingChannel::new(conf.writer_channel_size).split();
 
         let receiver = if !testing {
             // Start the send log thread.
-            let task = SenderTask::new(client, conf, 0);
-            task.spawn(receiver).unwrap();
+            let task = SenderTask::new(client, conf, 0)?;
+            task.spawn(receiver)?;
             None
         } else {
             Some(Mutex::new(receiver))
         };
 
-        Self {
+        Ok(Self {
             enable: conf.enable,
-            node_id: conf.node_id().unwrap(),
+            node_id,
             sender,
-            metrics: Master::get_metrics(),
+            metrics,
             receiver,
             snapshot_entries: conf.snapshot_entries,
             entries_since_snapshot: AtomicCounter::new(0),
-        }
+        })
     }
 
     fn send_inner(&self, entry: JournalEntry) -> FsResult<()> {
@@ -332,7 +334,16 @@ impl JournalWriter {
     // for testing
     pub fn take_entries(&self) -> Vec<JournalEntry> {
         let mut entries = vec![];
-        let receiver = self.receiver.as_ref().unwrap().lock().unwrap();
+        let Some(receiver) = self.receiver.as_ref() else {
+            return entries;
+        };
+        let receiver = match receiver.lock() {
+            Ok(receiver) => receiver,
+            Err(e) => {
+                log::error!("failed to take journal entries: {}", e);
+                return entries;
+            }
+        };
         while let Ok(v) = receiver.try_recv() {
             entries.push(v);
         }

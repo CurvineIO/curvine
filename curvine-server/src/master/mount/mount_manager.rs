@@ -21,7 +21,7 @@ use curvine_common::fs::{self, CurvineURI, Path};
 use curvine_common::state::{MkdirOpts, MountInfo, MountOptions};
 use curvine_common::FsResult;
 use log::info;
-use orpc::{err_box, err_msg, try_option};
+use orpc::err_box;
 use std::collections::HashMap;
 
 pub struct MountManager {
@@ -39,8 +39,12 @@ impl MountManager {
     }
 
     /// recovery mount points from store
-    pub fn restore(&self) {
-        self.mount_table.restore();
+    pub fn restore(&self) -> FsResult<()> {
+        self.mount_table.restore()
+    }
+
+    pub fn restore_best_effort(&self) {
+        self.mount_table.restore_best_effort()
     }
 
     fn create_mount_point(&self, mount_path: &str) -> FsResult<bool> {
@@ -78,7 +82,9 @@ impl MountManager {
 
     fn update_mount(&self, cv_path: &str, mnt_opt: &MountOptions) -> FsResult<()> {
         let path = Path::from_str(cv_path)?;
-        let existing = try_option!(self.get_mount_info(&path)?);
+        let Some(existing) = self.get_mount_info(&path)? else {
+            return err_box!("mount point {} not found for update", cv_path);
+        };
         let merged = existing.merge_with(mnt_opt.clone());
 
         self.mount_table.update_mount(merged)
@@ -119,7 +125,7 @@ impl MountManager {
         self.mount_table.unprotected_umount_by_id(id)
     }
 
-    pub fn has_mounted(&self, id: u32) -> bool {
+    pub fn has_mounted(&self, id: u32) -> FsResult<bool> {
         self.mount_table.has_mounted(id)
     }
 

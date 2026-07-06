@@ -103,11 +103,11 @@ impl InodeTtlExecutor {
             return err_box!("Inode {} not found", inode_id);
         };
 
-        if !inode.is_expired() {
+        if !inode.is_expired()? {
             return Ok((false, inode));
         }
 
-        let action = inode.storage_policy().ttl_action;
+        let action = inode.storage_policy()?.ttl_action;
 
         debug!(
             "Executing ttl action {:?} for inode {} based on StoragePolicy",

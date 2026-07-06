@@ -57,11 +57,12 @@ impl MasterHandler {
         mount_manager: Arc<MountManager>,
         job_handler: JobHandler,
         replication_manager: Arc<MasterReplicationManager>,
+        metrics: &'static MasterMetrics,
     ) -> Self {
         Self {
             fs,
             retry_cache,
-            metrics: Master::get_metrics(),
+            metrics,
             audit_logging_enabled: conf.master.audit_logging_enabled,
             conn_state,
             mount_manager,
@@ -578,7 +579,7 @@ impl MasterHandler {
         let header: MetricsReportRequest = ctx.parse_header()?;
 
         let metrics = ProtoUtils::metrics_report_from_pb(header.metrics);
-        Master::get_metrics().metrics_report(metrics)?;
+        Master::get_metrics()?.metrics_report(metrics)?;
 
         ctx.response_buf(MetricsReportResponse {}, &mut self.buf)
     }

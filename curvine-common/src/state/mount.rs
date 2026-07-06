@@ -15,11 +15,14 @@
 use crate::conf::ClientConf;
 use crate::fs::Path;
 use crate::state::{CreateFileOpts, CreateFileOptsBuilder, StoragePolicy, StorageType, TtlAction};
+use bincode::Options;
+use log::warn;
 use num_enum::{FromPrimitive, IntoPrimitive};
 use orpc::common::DurationUnit;
 use orpc::{err_box, CommonError, CommonResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::ErrorKind;
 
 #[repr(i32)]
 #[derive(
@@ -116,7 +119,69 @@ pub struct MountInfo {
     pub access_mode: AccessMode,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyMountInfo {
+    cv_path: String,
+    ufs_path: String,
+    mount_id: u32,
+    properties: HashMap<String, String>,
+    ttl_ms: i64,
+    ttl_action: TtlAction,
+    read_verify_ufs: bool,
+    storage_type: Option<StorageType>,
+    block_size: Option<i64>,
+    replicas: Option<i32>,
+    write_type: WriteType,
+    provider: Option<Provider>,
+}
+
+impl From<LegacyMountInfo> for MountInfo {
+    fn from(info: LegacyMountInfo) -> Self {
+        Self {
+            cv_path: info.cv_path,
+            ufs_path: info.ufs_path,
+            mount_id: info.mount_id,
+            properties: info.properties,
+            ttl_ms: info.ttl_ms,
+            ttl_action: info.ttl_action,
+            read_verify_ufs: info.read_verify_ufs,
+            storage_type: info.storage_type,
+            block_size: info.block_size,
+            replicas: info.replicas,
+            write_type: info.write_type,
+            provider: info.provider,
+            auto_cache: true,
+            access_mode: AccessMode::ReadOnly,
+        }
+    }
+}
+
 impl MountInfo {
+    pub fn decode_persisted(bytes: &[u8]) -> CommonResult<Self> {
+        match bincode::deserialize::<Self>(bytes) {
+            Ok(info) => Ok(info),
+            Err(e) if Self::is_unexpected_eof(&e) => {
+                let legacy: LegacyMountInfo = bincode::DefaultOptions::new()
+                    .with_fixint_encoding()
+                    .reject_trailing_bytes()
+                    .deserialize(bytes)
+                    .map_err(|legacy_e| {
+                        warn!("legacy MountInfo decode also failed: {}", legacy_e);
+                        e
+                    })?;
+                Ok(legacy.into())
+            }
+            Err(e) => err_box!(e),
+        }
+    }
+
+    fn is_unexpected_eof(err: &bincode::Error) -> bool {
+        matches!(
+            err.as_ref(),
+            bincode::ErrorKind::Io(e) if e.kind() == ErrorKind::UnexpectedEof
+        )
+    }
+
     pub fn auto_cache(&self) -> bool {
         self.auto_cache && self.ttl_ms > 0
     }
