@@ -150,6 +150,7 @@ ls -la .github/skills .cursor/skills .claude/skills
 | `cv-create-pr` | PR |
 | `cv-csi-test` | Testing |
 | `cv-handle-issue` | Issue |
+| `cv-review-first` | PR |
 | `cv-review-pr` | PR |
 | `cv-run-workflow` | CI |
 | `cv-tasks-breakdown` | Planning |
