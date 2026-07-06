@@ -20,6 +20,7 @@ use std::collections::HashSet;
 use std::io;
 use std::str::FromStr;
 use std::sync::Arc;
+use tracing::dispatcher;
 use tracing::Level;
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::filter::{filter_fn, LevelFilter};
@@ -78,17 +79,26 @@ impl Logger {
     pub const TARGET_STDERR: &'static str = "stderr";
 
     pub fn new(conf: LogConf) -> Self {
+        if dispatcher::has_been_set() {
+            Self::log_skip_existing_subscriber();
+            return Logger { inner: vec![] };
+        }
+
         if !conf.targets.is_empty() {
             Self::init_with_target(conf)
         } else {
             let level = Level::from_str(&conf.level).unwrap_or(Level::INFO);
             let (writer, guard) = Self::create_writer(&conf);
-            tracing_subscriber::fmt()
-                .with_max_level(level)
-                .with_ansi(false)
-                .event_format(LogFormatter::new(&conf))
-                .with_writer(writer)
-                .init();
+            if !Self::try_install(|| {
+                tracing_subscriber::fmt()
+                    .with_max_level(level)
+                    .with_ansi(false)
+                    .event_format(LogFormatter::new(&conf))
+                    .with_writer(writer)
+                    .try_init()
+            }) {
+                return Logger { inner: vec![] };
+            }
             Logger { inner: vec![guard] }
         }
     }
@@ -170,11 +180,35 @@ impl Logger {
         // Global level filter: sets MAX_LEVEL_HINT so tracing callsite macros
         // skip disabled events before constructing them, consistent with the
         // simple path's .with_max_level(level).
-        tracing_subscriber::registry()
-            .with(layers)
-            .with(LevelFilter::from_level(level))
-            .init();
+        if !Self::try_install(|| {
+            tracing_subscriber::registry()
+                .with(layers)
+                .with(LevelFilter::from_level(level))
+                .try_init()
+        }) {
+            return Logger { inner: vec![] };
+        }
         Logger { inner: guards }
+    }
+
+    /// Installs a global tracing subscriber when none is set yet.
+    ///
+    /// Returns `false` when installation fails (e.g. a race with another initializer).
+    fn try_install<E>(install: impl FnOnce() -> Result<(), E>) -> bool {
+        match install() {
+            Ok(()) => true,
+            Err(_) => {
+                Self::log_skip_existing_subscriber();
+                false
+            }
+        }
+    }
+
+    fn log_skip_existing_subscriber() {
+        tracing::warn!(
+            target: "orpc::logger",
+            "global tracing subscriber already set; skipping Curvine logger initialization"
+        );
     }
 
     pub fn default() {
