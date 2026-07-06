@@ -66,6 +66,7 @@ pub struct MasterMetrics {
 
     pub(crate) ttl_bucket_len: Gauge,
     pub(crate) ttl_total_inodes: Gauge,
+    pub(crate) ttl_skipped_inodes: Counter,
 }
 
 impl MasterMetrics {
@@ -156,6 +157,10 @@ impl MasterMetrics {
             )?,
             ttl_bucket_len: m::new_gauge("ttl_bucket_len", "Number of TTL buckets")?,
             ttl_total_inodes: m::new_gauge("ttl_total_inodes", "Total number of inodes")?,
+            ttl_skipped_inodes: m::new_counter(
+                "ttl_skipped_inodes",
+                "Total number of inodes skipped while updating TTL buckets",
+            )?,
         };
 
         Ok(wm)

@@ -97,13 +97,13 @@ impl JournalSystem {
         rt: Arc<Runtime>,
         master_monitor: MasterMonitor,
     ) -> FsResult<FsInitParts> {
-        let worker_manager = SyncWorkerManager::new(WorkerManager::new(conf));
+        let worker_manager = SyncWorkerManager::new(WorkerManager::new(conf)?);
         let client = RaftClient::from_conf(rt.clone(), &conf.journal);
-        let journal_writer = Arc::new(JournalWriter::new(conf.testing, client, &conf.journal));
+        let journal_writer = Arc::new(JournalWriter::new(conf.testing, client, &conf.journal)?);
 
         let ttl_bucket_list = Arc::new(TtlBucketList::new(
             conf.master.ttl_bucket_interval_ms() as i64
-        ));
+        )?);
         let eviction_conf = EvictionConf::from_conf(conf);
         let evictor: Arc<dyn Evictor> = match eviction_conf.policy {
             EvictionPolicy::Lru => Arc::new(LRUEvictor::new(eviction_conf.clone())),
@@ -284,7 +284,7 @@ impl JournalSystem {
                 parts.job_manager.clone(),
                 log_store,
                 parts.journal_writer.clone(),
-            ),
+            )?,
             conf.journal.clone(),
             role_monitor,
         );

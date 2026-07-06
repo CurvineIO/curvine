@@ -16,7 +16,7 @@ use crate::master::fs::policy::{ChooseContext, WorkerPolicy};
 use curvine_common::state::{WorkerAddress, WorkerInfo};
 use indexmap::IndexMap;
 use orpc::sync::AtomicLen;
-use orpc::{err_box, try_option, CommonResult};
+use orpc::{err_box, CommonResult};
 
 // Poll selector.
 pub struct RobinWorkerPolicy {
@@ -55,7 +55,13 @@ impl WorkerPolicy for RobinWorkerPolicy {
         let mut res = vec![];
 
         while res.len() < ctx.replicas as usize {
-            let (id, worker) = try_option!(workers.get_index(index));
+            let Some((id, worker)) = workers.get_index(index) else {
+                return err_box!(
+                    "worker selection index {} out of range, workers={}",
+                    index,
+                    workers.len()
+                );
+            };
 
             if !ctx.exclude_workers.contains(id)
                 && worker.available > ctx.block_size

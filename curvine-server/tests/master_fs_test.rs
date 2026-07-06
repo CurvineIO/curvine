@@ -156,12 +156,14 @@ fn new_handler() -> MasterHandler {
     let journal_system = JournalSystem::from_conf(&conf).unwrap();
     let fs = MasterFilesystem::with_js(&conf, &journal_system);
     fs.add_test_worker(WorkerInfo::default());
-    let retry_cache = FsRetryCache::with_conf(&conf.master);
+    let retry_cache = FsRetryCache::with_conf(&conf.master)
+        .expect("test master retry cache configuration should be valid");
 
     let mount_manager = journal_system.mount_manager();
     let rt = Arc::new(AsyncRuntime::single());
     let replication_manager =
-        MasterReplicationManager::new(&fs, &conf, &rt, &journal_system.worker_manager());
+        MasterReplicationManager::new(&fs, &conf, &rt, &journal_system.worker_manager())
+            .expect("test master replication manager should initialize");
     let job_manager = Arc::new(JobManager::from_cluster_conf(
         fs.clone(),
         mount_manager.clone(),
@@ -176,6 +178,7 @@ fn new_handler() -> MasterHandler {
         mount_manager,
         JobHandler::new(job_manager),
         replication_manager,
+        Master::get_metrics().expect("test master metrics should initialize"),
     )
 }
 
@@ -226,7 +229,7 @@ fn test_filesystem_metadata_persistence_and_restore() -> CommonResult<()> {
         let fs = new_fs(true, "restore");
         fs.mkdir("/a", false)?;
         fs.mkdir("/x1/x2/x3", true)?;
-        let hash = fs.sum_hash();
+        let hash = fs.sum_hash()?;
         drop(fs);
         hash
     }; // Scope ensures all resources are dropped before reopening DB
@@ -237,7 +240,7 @@ fn test_filesystem_metadata_persistence_and_restore() -> CommonResult<()> {
 
     assert!(fs.exists("/a")?);
     assert!(fs.exists("/x1/x2/x3")?);
-    let hash2 = fs.sum_hash();
+    let hash2 = fs.sum_hash()?;
     assert_eq!(hash1, hash2);
 
     Ok(())
@@ -251,7 +254,7 @@ fn test_filesystem_metadata_restore_with_full_journal_system_reopen() -> CommonR
         let (fs, js) = new_fs_with_journal(true, &test_name)?;
         fs.mkdir("/a", false)?;
         fs.mkdir("/x1/x2/x3", true)?;
-        let hash = fs.sum_hash();
+        let hash = fs.sum_hash()?;
         drop(fs);
         js.shutdown();
         hash
@@ -262,7 +265,7 @@ fn test_filesystem_metadata_restore_with_full_journal_system_reopen() -> CommonR
 
     assert!(fs.exists("/a")?);
     assert!(fs.exists("/x1/x2/x3")?);
-    assert_eq!(hash1, fs.sum_hash());
+    assert_eq!(hash1, fs.sum_hash()?);
 
     drop(fs);
     js.shutdown();
@@ -715,11 +718,11 @@ fn state(fs: &MasterFilesystem) -> CommonResult<()> {
 
     fs.print_tree();
     let fs_dir = fs.fs_dir.read();
-    let mem_hash = fs_dir.root_dir().sum_hash();
+    let mem_hash = fs_dir.root_dir().sum_hash()?;
 
     let state_tree = fs_dir.create_tree()?;
     state_tree.print_tree();
-    let state_hash = state_tree.sum_hash();
+    let state_hash = state_tree.sum_hash()?;
 
     println!("mem_hash = {}, state_hash = {}", mem_hash, state_hash);
     assert_eq!(mem_hash, state_hash);
@@ -995,7 +998,7 @@ fn test_idempotent_mkdir() -> CommonResult<()> {
     let (fs, js, loader, _js2, fs2) = setup_pair("mkdir");
     fs.mkdir("/data", false)?;
     replay_all_then_duplicate_last(&js, &loader)?;
-    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
     Ok(())
 }
 
@@ -1005,7 +1008,7 @@ fn test_idempotent_create_file() -> CommonResult<()> {
     let (fs, js, loader, _js2, fs2) = setup_pair("create-file");
     fs.create("/file.log", true)?;
     replay_all_then_duplicate_last(&js, &loader)?;
-    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
     Ok(())
 }
 
@@ -1037,7 +1040,7 @@ fn test_idempotent_delete() -> CommonResult<()> {
         "follower file counts must stay non-negative: {:?}",
         follower_counts
     );
-    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
     Ok(())
 }
 
@@ -1048,7 +1051,7 @@ fn test_idempotent_rename() -> CommonResult<()> {
     fs.mkdir("/src", false)?;
     fs.rename("/src", "/dst", RenameFlags::empty())?;
     replay_all_then_duplicate_last(&js, &loader)?;
-    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
     Ok(())
 }
 
@@ -1062,7 +1065,7 @@ fn test_idempotent_free() -> CommonResult<()> {
     fs.set_attr("/file.log", set_opts)?;
     fs.free("/file.log", false)?;
     replay_all_then_duplicate_last(&js, &loader)?;
-    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
     Ok(())
 }
 
@@ -1074,7 +1077,7 @@ fn test_idempotent_set_attr() -> CommonResult<()> {
     let opts = SetAttrOptsBuilder::new().owner("test_owner").build();
     fs.set_attr("/data", opts)?;
     replay_all_then_duplicate_last(&js, &loader)?;
-    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
     Ok(())
 }
 
@@ -1087,7 +1090,7 @@ fn test_idempotent_unmount() -> CommonResult<()> {
     mnt_mgr.mount(None, "/mnt/test", "oss://bucket/", &mnt_opt)?;
     mnt_mgr.umount("/mnt/test")?;
     replay_all_then_duplicate_last(&js, &loader)?;
-    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
     Ok(())
 }
 
@@ -1194,7 +1197,7 @@ fn test_idempotent_symlink() -> CommonResult<()> {
         "follower file counts must stay non-negative: {:?}",
         follower_counts
     );
-    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
     Ok(())
 }
 
@@ -1272,7 +1275,7 @@ fn test_idempotent_mount() -> CommonResult<()> {
         &mnt_opt,
     )?;
     replay_all_then_duplicate_last(&js, &loader)?;
-    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
     Ok(())
 }
 
@@ -1292,7 +1295,7 @@ fn test_idempotent_set_locks() -> CommonResult<()> {
     };
     fs.set_lock("/lockfile.log", lock)?;
     replay_all_then_duplicate_last(&js, &loader)?;
-    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
     Ok(())
 }
 

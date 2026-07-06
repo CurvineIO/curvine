@@ -88,7 +88,13 @@ impl QuotaManager {
         }
 
         // Update LRU cache size metric
-        let metrics = Master::get_metrics();
+        let metrics = match Master::get_metrics() {
+            Ok(metrics) => metrics,
+            Err(e) => {
+                log::warn!("cluster-evict: master metrics unavailable: {}", e);
+                return;
+            }
+        };
         metrics
             .eviction_lru_cache_size
             .set(self.evictor.cache_size() as i64);
@@ -213,7 +219,13 @@ impl QuotaManager {
             return;
         };
 
-        let metrics = Master::get_metrics();
+        let metrics = match Master::get_metrics() {
+            Ok(metrics) => metrics,
+            Err(e) => {
+                log::warn!("cluster-evict: master metrics unavailable: {}", e);
+                return;
+            }
+        };
         let mut successfully_evicted = Vec::with_capacity(inode_ids.len());
         let mut total_bytes_freed = 0_i64;
 

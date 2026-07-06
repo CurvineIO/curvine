@@ -19,6 +19,7 @@ use mini_moka::sync::{Cache, CacheBuilder};
 use num_enum::{FromPrimitive, IntoPrimitive};
 use orpc::common::DurationUnit;
 use orpc::err_ext;
+use orpc::error::ErrorExt;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,15 +46,21 @@ impl FsRetryCache {
         Self(Arc::new(cache))
     }
 
-    pub fn with_conf(conf: &MasterConf) -> Option<FsRetryCache> {
+    pub fn with_conf(conf: &MasterConf) -> FsResult<Option<FsRetryCache>> {
         if conf.retry_cache_enable {
             let ttl = DurationUnit::from_str(&conf.retry_cache_ttl)
-                .unwrap()
+                .map_err(FsError::from)
+                .map_err(|e| {
+                    e.ctx(format!(
+                        "invalid master retry_cache_ttl: {}",
+                        conf.retry_cache_ttl
+                    ))
+                })?
                 .as_duration();
             let cache = Self::new(conf.retry_cache_size, ttl);
-            Some(cache)
+            Ok(Some(cache))
         } else {
-            None
+            Ok(None)
         }
     }
 

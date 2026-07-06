@@ -55,7 +55,7 @@ impl FsDir {
         let db_conf = conf.db_conf();
 
         let store = RocksInodeStore::new(db_conf, conf.format_master)?;
-        let state = InodeStore::new(store, ttl_bucket_list);
+        let state = InodeStore::new(store, ttl_bucket_list)?;
         let (last_inode_id, root_dir) = state.create_blank_tree()?;
 
         let fs_dir = Self {
@@ -443,7 +443,7 @@ impl FsDir {
         };
 
         let status = match inode.as_ref() {
-            File(..) | Dir(..) => inode.to_file_status(inp.path()),
+            File(..) | Dir(..) => inode.to_file_status(inp.path())?,
             FileEntry(..) => {
                 return err_box!("FileEntry is not supported");
             }
@@ -459,7 +459,7 @@ impl FsDir {
         };
 
         match inode.as_ref() {
-            File(_) => Ok(vec![inode.to_file_status(inp.path())]),
+            File(_) => Ok(vec![inode.to_file_status(inp.path())?]),
 
             Dir(d) => {
                 let iter = d.children_iter().collect();
@@ -470,7 +470,7 @@ impl FsDir {
             FileEntry(e) => {
                 let inode_opt = self.store.get_inode(e.id, Some(&e.name))?;
                 match inode_opt {
-                    Some(inode_view) => Ok(vec![inode_view.to_file_status(inp.path())]),
+                    Some(inode_view) => Ok(vec![inode_view.to_file_status(inp.path())?]),
                     None => err_ext!(FsError::file_not_found(inp.path())),
                 }
             }
@@ -497,7 +497,7 @@ impl FsDir {
 
         match inode.as_ref() {
             File(_) => {
-                let status = inode.to_file_status(inp.path());
+                let status = inode.to_file_status(inp.path())?;
                 Ok(Self::list_single_file(status, opts))
             }
 
@@ -511,7 +511,7 @@ impl FsDir {
                 let inode_opt = self.store.get_inode(e.id, Some(&e.name))?;
                 match inode_opt {
                     Some(inode_view) => {
-                        let status = inode_view.to_file_status(inp.path());
+                        let status = inode_view.to_file_status(inp.path())?;
                         Ok(Self::list_single_file(status, opts))
                     }
                     None => err_ext!(FsError::file_not_found(inp.path())),
@@ -616,7 +616,7 @@ impl FsDir {
 
         let file = inode.as_file_mut()?;
         let _ = file.reopen(client_name);
-        let status = inode.to_file_status(inp.path());
+        let status = inode.to_file_status(inp.path())?;
 
         self.store.apply_reopen_file(&inode)?;
         self.journal_writer
@@ -688,13 +688,13 @@ impl FsDir {
         self.root_dir.print_tree()
     }
 
-    pub fn sum_hash(&self) -> u128 {
-        let mut tree_hash = self.root_dir.sum_hash();
-        tree_hash += self.store.cf_hash(RocksInodeStore::CF_INODES);
-        tree_hash += self.store.cf_hash(RocksInodeStore::CF_EDGES);
-        tree_hash += self.store.cf_hash(RocksInodeStore::CF_LOCATION);
-        tree_hash += self.store.cf_hash(RocksInodeStore::CF_BLOCK);
-        tree_hash
+    pub fn sum_hash(&self) -> CommonResult<u128> {
+        let mut tree_hash = self.root_dir.sum_hash()?;
+        tree_hash += self.store.cf_hash(RocksInodeStore::CF_INODES)?;
+        tree_hash += self.store.cf_hash(RocksInodeStore::CF_EDGES)?;
+        tree_hash += self.store.cf_hash(RocksInodeStore::CF_LOCATION)?;
+        tree_hash += self.store.cf_hash(RocksInodeStore::CF_BLOCK)?;
+        Ok(tree_hash)
     }
 
     pub fn last_inode_id(&self) -> i64 {
@@ -837,7 +837,7 @@ impl FsDir {
 
         self.unprotected_set_attr(inode.clone(), opts.clone())?;
         self.journal_writer.log_set_attr(self, &inp, opts)?;
-        Ok(inode.to_file_status(inp.path()))
+        Ok(inode.to_file_status(inp.path())?)
     }
 
     pub fn unprotected_set_attr(&mut self, inode: InodePtr, opts: SetAttrOpts) -> FsResult<()> {
@@ -856,7 +856,7 @@ impl FsDir {
                 } else {
                     opts.clone()
                 };
-                cur_inode.as_mut().set_attr(set_opts);
+                cur_inode.as_mut().set_attr(set_opts)?;
                 change_inodes.push(cur_inode.as_ref().clone());
             }
 
@@ -1072,7 +1072,7 @@ impl FsDir {
         block_id: i64,
         workers: &[WorkerAddress],
     ) -> FsResult<ExtendedBlock> {
-        let mut inode = try_option!(inp.get_last_inode());
+        let mut inode = try_option!(inp.get_last_inode(), "File {} not exists", inp.path());
         let file = inode.as_file_mut()?;
 
         let block = file.search_block_mut_check(block_id)?;

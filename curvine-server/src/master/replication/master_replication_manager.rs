@@ -64,7 +64,7 @@ impl MasterReplicationManager {
         conf: &ClusterConf,
         rt: &Arc<AsyncRuntime>,
         worker_manager: &SyncWorkerManager,
-    ) -> Arc<Self> {
+    ) -> CommonResult<Arc<Self>> {
         let async_runtime = rt.clone();
         let semaphore = Semaphore::new(conf.master.block_replication_concurrency_limit);
         let (send, recv) = tokio::sync::mpsc::channel(Semaphore::MAX_PERMITS);
@@ -77,13 +77,13 @@ impl MasterReplicationManager {
             inflight_blocks: Default::default(),
             worker_client_factory: Arc::new(Default::default()),
             replication_enabled: conf.master.block_replication_enabled,
-            metrics: Master::get_metrics(),
+            metrics: Master::get_metrics()?,
         };
         let manager = Arc::new(manager);
         Self::handle(async_runtime, manager.clone(), recv);
 
         info!("Master replication manager is initialized");
-        manager
+        Ok(manager)
     }
 
     fn handle(async_runtime: Arc<AsyncRuntime>, me: Arc<Self>, mut recv: Receiver<BlockId>) {
@@ -91,13 +91,13 @@ impl MasterReplicationManager {
         async_runtime.spawn(async move {
             let manager = fork;
             while let Some(block_id) = recv.recv().await {
-                // todo: graceful handle the acquire error
-                let permit = manager
-                    .replication_semaphore
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .unwrap();
+                let permit = match manager.replication_semaphore.clone().acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(e) => {
+                        error!("Block replication loop stopped: semaphore closed: {}", e);
+                        break;
+                    }
+                };
                 if let Err(e) = manager.replicate_block(block_id, permit).await {
                     error!("Failed to replicate block: {}. err: {}", block_id, e);
                 }
@@ -118,10 +118,16 @@ impl MasterReplicationManager {
     fn assign(&self, exclusive_worker_ids: Vec<WorkerId>) -> CommonResult<WorkerAddress> {
         let worker_manager = self.worker_manager.read();
         let mut assignment = worker_manager.choose_workers(1, exclusive_worker_ids)?;
-        let worker_id = try_option!(assignment.pop()).worker_id;
-        let worker_addr = try_option!(worker_manager.get_worker(worker_id))
-            .address
-            .clone();
+        let Some(worker_id) = assignment.pop().map(|worker| worker.worker_id) else {
+            return err_box!("no target worker selected for block replication");
+        };
+        let Some(worker) = worker_manager.get_worker(worker_id) else {
+            return err_box!(
+                "selected replication target worker {} no longer exists",
+                worker_id
+            );
+        };
+        let worker_addr = worker.address.clone();
         Ok(worker_addr)
     }
 

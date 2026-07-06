@@ -17,12 +17,12 @@ use curvine_common::conf::{UfsConf, UfsConfBuilder};
 use curvine_common::fs::Path;
 use curvine_common::state::{MountInfo, MountOptions};
 use curvine_common::FsResult;
-use log::info;
-use orpc::{err_box, try_option};
+use log::{info, warn};
+use orpc::err_box;
 use rand::Rng;
 use std::collections::HashMap;
 use std::convert::Into;
-use std::sync::RwLock;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 pub struct MountTableInner {
     ufs2mountid: HashMap<String, u32>,
@@ -47,29 +47,84 @@ impl MountTable {
         }
     }
 
+    fn read_inner(&self) -> FsResult<RwLockReadGuard<'_, MountTableInner>> {
+        match self.inner.read() {
+            Ok(inner) => Ok(inner),
+            Err(e) => err_box!("mount table read lock poisoned: {}", e),
+        }
+    }
+
+    fn write_inner(&self) -> FsResult<RwLockWriteGuard<'_, MountTableInner>> {
+        match self.inner.write() {
+            Ok(inner) => Ok(inner),
+            Err(e) => err_box!("mount table write lock poisoned: {}", e),
+        }
+    }
+
     //for new master node
-    pub fn restore(&self) {
-        if let Ok(mounts) = self.fs_dir.read().get_mount_table() {
-            for mnt in mounts {
-                self.unprotected_add_mount(mnt).unwrap();
+    pub fn restore(&self) -> FsResult<()> {
+        let mounts = self.fs_dir.read().get_mount_table()?;
+        self.replace_with_mounts(mounts)
+    }
+
+    pub fn restore_best_effort(&self) {
+        match self.fs_dir.read().get_mount_table() {
+            Ok(mounts) => {
+                if let Err(e) = self.replace_with_mounts(mounts) {
+                    warn!("failed to restore mount table: {}", e);
+                }
+            }
+            Err(e) => {
+                warn!("failed to restore mount table: {}", e);
             }
         }
     }
 
+    fn replace_with_mounts(&self, mounts: Vec<MountInfo>) -> FsResult<()> {
+        let mut restored = MountTableInner {
+            ufs2mountid: HashMap::new(),
+            mountid2entry: HashMap::new(),
+            mountpath2id: HashMap::new(),
+        };
+
+        for mnt in mounts {
+            if restored
+                .ufs2mountid
+                .insert(mnt.ufs_path.to_string(), mnt.mount_id)
+                .is_some()
+            {
+                return err_box!("duplicate restored UFS mount path {}", mnt.ufs_path);
+            }
+            if restored
+                .mountpath2id
+                .insert(mnt.cv_path.to_string(), mnt.mount_id)
+                .is_some()
+            {
+                return err_box!("duplicate restored CV mount path {}", mnt.cv_path);
+            }
+            if restored.mountid2entry.insert(mnt.mount_id, mnt).is_some() {
+                return err_box!("duplicate restored mount id");
+            }
+        }
+
+        *self.write_inner()? = restored;
+        Ok(())
+    }
+
     // ufs maybe mounted already or has prefix overlap with existing mounts
-    pub fn exists(&self, ufs_path: &str) -> bool {
-        let inner = self.inner.read().unwrap();
+    pub fn exists(&self, ufs_path: &str) -> FsResult<bool> {
+        let inner = self.read_inner()?;
 
         // full match check
         if inner.ufs2mountid.contains_key(ufs_path) {
-            return true;
+            return Ok(true);
         }
 
-        false
+        Ok(false)
     }
 
     pub fn check_conflict(&self, cv_path: &str, ufs_path: &str) -> FsResult<()> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.read_inner()?;
         for info in inner.mountid2entry.values() {
             if Path::has_prefix(cv_path, &info.cv_path) {
                 return err_box!("mount point {} is a prefix of {}", info.cv_path, cv_path);
@@ -91,21 +146,21 @@ impl MountTable {
     }
 
     // mountid maybe occupied
-    pub fn has_mounted(&self, mount_id: u32) -> bool {
-        let inner = self.inner.read().unwrap();
-        inner.mountid2entry.contains_key(&mount_id)
+    pub fn has_mounted(&self, mount_id: u32) -> FsResult<bool> {
+        let inner = self.read_inner()?;
+        Ok(inner.mountid2entry.contains_key(&mount_id))
     }
 
     // mount_path maybe mounted by other ufs
-    fn mount_point_inuse(&self, cv_path: &str) -> bool {
-        let inner = self.inner.read().unwrap();
-        inner.mountpath2id.contains_key(cv_path)
+    fn mount_point_inuse(&self, cv_path: &str) -> FsResult<bool> {
+        let inner = self.read_inner()?;
+        Ok(inner.mountpath2id.contains_key(cv_path))
     }
 
     pub fn unprotected_add_mount(&self, info: MountInfo) -> FsResult<()> {
         info!("add mount: {:?}", info);
 
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.write_inner()?;
         inner
             .ufs2mountid
             .insert(info.ufs_path.to_string(), info.mount_id);
@@ -124,11 +179,11 @@ impl MountTable {
         ufs_path: &str,
         mnt_opt: &MountOptions,
     ) -> FsResult<()> {
-        if self.exists(ufs_path) {
+        if self.exists(ufs_path)? {
             return err_box!("{} already exists in mount table", ufs_path);
         }
 
-        if self.mount_point_inuse(cv_path) {
+        if self.mount_point_inuse(cv_path)? {
             return err_box!("{} already exists in mount table", cv_path);
         }
 
@@ -159,7 +214,7 @@ impl MountTable {
         let mut rng = rand::thread_rng();
         for _ in 0..10 {
             let new_id = rng.gen::<u32>();
-            if !self.has_mounted(new_id) {
+            if !self.has_mounted(new_id)? {
                 return Ok(new_id);
             }
         }
@@ -168,7 +223,7 @@ impl MountTable {
     }
 
     pub fn umount(&self, mount_path: &str) -> FsResult<()> {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.write_inner()?;
 
         let mount_id = match inner.mountpath2id.get(mount_path) {
             Some(&id) => id,
@@ -192,7 +247,7 @@ impl MountTable {
 
     /// use ufs_uri to find ufs config
     pub fn get_ufs_conf(&self, ufs_path: &String) -> FsResult<UfsConf> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.read_inner()?;
 
         let mount_id = match inner.ufs2mountid.get(ufs_path) {
             Some(&id) => id,
@@ -215,7 +270,7 @@ impl MountTable {
     pub fn get_mount_info(&self, path: &Path) -> FsResult<Option<MountInfo>> {
         let list = path.get_possible_mounts();
         let is_cv = path.is_cv();
-        let inner = self.inner.read().unwrap();
+        let inner = self.read_inner()?;
 
         for mnt in list {
             let option_id = if is_cv {
@@ -224,7 +279,13 @@ impl MountTable {
                 inner.ufs2mountid.get(&mnt)
             };
             if let Some(id) = option_id {
-                let entry = try_option!(inner.mountid2entry.get(id));
+                let Some(entry) = inner.mountid2entry.get(id) else {
+                    return err_box!(
+                        "mount table corrupt: path {} references missing mount id {}",
+                        mnt,
+                        id
+                    );
+                };
                 return Ok(Some(entry.clone()));
             }
         }
@@ -233,7 +294,7 @@ impl MountTable {
     }
 
     pub fn get_mount_info_by_id(&self, mount_id: u32) -> FsResult<MountInfo> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.read_inner()?;
         let entry = match inner.mountid2entry.get(&mount_id) {
             Some(entry) => entry.clone(),
             None => return err_box!("failed found {} entry", mount_id),
@@ -242,13 +303,13 @@ impl MountTable {
     }
 
     pub fn get_mount_table(&self) -> FsResult<Vec<MountInfo>> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.read_inner()?;
         let table = inner.mountid2entry.values().cloned().collect();
         Ok(table)
     }
 
     pub fn unprotected_umount_by_id(&self, mount_id: u32) -> FsResult<()> {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.write_inner()?;
 
         let info = match inner.mountid2entry.remove(&mount_id) {
             Some(entry) => entry,

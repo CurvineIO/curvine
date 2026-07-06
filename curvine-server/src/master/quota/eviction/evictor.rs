@@ -18,6 +18,14 @@ use std::sync::Mutex;
 use crate::master::quota::eviction::lfu;
 use crate::master::quota::eviction::types::EvictionConf;
 
+const DEFAULT_EVICTION_CACHE_CAPACITY: usize = 5_000_000;
+
+fn eviction_cache_capacity(configured_capacity: usize) -> NonZeroUsize {
+    NonZeroUsize::new(configured_capacity).unwrap_or_else(|| {
+        NonZeroUsize::new(DEFAULT_EVICTION_CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN)
+    })
+}
+
 pub trait Evictor: Send + Sync {
     fn on_access(&self, inode_id: i64);
     fn select_victims(&self, limit: usize) -> Vec<i64>;
@@ -32,8 +40,7 @@ pub struct LRUEvictor {
 
 impl LRUEvictor {
     pub fn new(conf: EvictionConf) -> Self {
-        let capacity = NonZeroUsize::new(conf.capacity)
-            .unwrap_or_else(|| NonZeroUsize::new(5_000_000).unwrap());
+        let capacity = eviction_cache_capacity(conf.capacity);
 
         Self {
             caches: Mutex::new(lru::LruCache::new(capacity)),
@@ -98,8 +105,7 @@ pub struct LFUEvictor {
 
 impl LFUEvictor {
     pub fn new(conf: EvictionConf) -> Self {
-        let capacity = NonZeroUsize::new(conf.capacity)
-            .unwrap_or_else(|| NonZeroUsize::new(5_000_000).unwrap());
+        let capacity = eviction_cache_capacity(conf.capacity);
 
         Self {
             caches: Mutex::new(lfu::LFUCache::new(capacity.get())),
