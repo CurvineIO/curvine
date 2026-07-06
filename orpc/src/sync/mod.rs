@@ -46,3 +46,6 @@ pub use self::rw_lock_hash_map::RwLockHashMap;
 
 mod mutex;
 pub use self::mutex::*;
+
+mod async_map;
+pub use self::async_map::AsyncSharedMap;
