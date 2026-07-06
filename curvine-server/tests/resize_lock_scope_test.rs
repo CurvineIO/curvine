@@ -43,7 +43,7 @@ fn resize_does_not_hold_fs_lock_while_waiting_worker_manager() {
         ip_addr: "127.0.0.1".into(),
         port: 0,
     };
-    fs.add_block("/resize/file.log", client, vec![], vec![], 0, None)
+    fs.add_block("/resize/file.log", None, client, vec![], vec![], 0, None)
         .unwrap();
 
     let fs = Arc::new(fs);
