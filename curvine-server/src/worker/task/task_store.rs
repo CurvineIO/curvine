@@ -15,7 +15,7 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
-use curvine_common::state::LoadTaskInfo;
+use curvine_common::state::{JobTaskState, LoadTaskInfo};
 use orpc::sync::FastDashMap;
 
 use crate::worker::task::TaskContext;
@@ -60,6 +60,7 @@ impl TaskStore {
     pub fn cancel(&self, job_id: impl AsRef<str>) -> Vec<Arc<TaskContext>> {
         let all_tasks = self.get_all_tasks(job_id);
         for context in all_tasks.iter() {
+            context.update_state(JobTaskState::Canceled, "canceled by master");
             let _ = self.tasks.remove(&context.info.task_id);
         }
 

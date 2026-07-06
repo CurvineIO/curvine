@@ -25,11 +25,13 @@ use curvine_common::state::{
     JobStatus, JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobResult,
 };
 use curvine_common::FsResult;
-use log::{debug, info};
+use log::{debug, info, warn};
 use orpc::common::LocalTime;
-use orpc::runtime::{LoopTask, Runtime};
+use orpc::runtime::{LoopTask, RpcRuntime, Runtime};
+use orpc::sync::AtomicCounter;
 use orpc::{err_box, err_ext, CommonResult};
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 /// Load the Task Manager
@@ -42,6 +44,8 @@ pub struct JobManager {
     job_life_ttl: Duration,
     job_cleanup_ttl: Duration,
     job_max_files: usize,
+    run_seq: Arc<AtomicCounter>,
+    load_job_semaphore: Arc<Semaphore>,
 }
 
 impl JobManager {
@@ -62,6 +66,8 @@ impl JobManager {
             job_life_ttl: conf.job.job_life_ttl,
             job_cleanup_ttl: conf.job.job_cleanup_ttl,
             job_max_files: conf.job.job_max_files,
+            run_seq: Arc::new(AtomicCounter::new(0)),
+            load_job_semaphore: Arc::new(Semaphore::new(conf.job.master_max_concurrent_load_jobs)),
         }
     }
 
@@ -139,6 +145,7 @@ impl JobManager {
             self.master_fs.clone(),
             self.factory.clone(),
             self.job_max_files,
+            self.run_seq.clone(),
         )
     }
 
@@ -173,7 +180,38 @@ impl JobManager {
         };
 
         let job_runner = self.create_runner();
-        job_runner.submit_load_task(command, mnt).await
+        let (res, queued) = job_runner.enqueue_load_job(command, mnt)?;
+
+        if let Some(queued) = queued {
+            let runner = self.create_runner();
+            let job_id = res.job_id.clone();
+            let semaphore = self.load_job_semaphore.clone();
+            let jobs = self.jobs.clone();
+            self.rt.spawn(async move {
+                let _permit = match semaphore.acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(err) => {
+                        warn!(
+                            "async load job {} failed to acquire permit: {}",
+                            job_id, err
+                        );
+                        jobs.update_state_if_run(
+                            &queued.job_id,
+                            queued.run_id,
+                            JobTaskState::Failed,
+                            format!("async load job failed to acquire permit: {}", err),
+                        );
+                        return;
+                    }
+                };
+
+                if let Err(err) = runner.run_queued_load_job(queued).await {
+                    warn!("async load job {} failed: {}", job_id, err);
+                }
+            });
+        }
+
+        Ok(res)
     }
 
     /// Handle cancellation of tasks
@@ -191,7 +229,6 @@ impl JobManager {
                         "job {} is already in final state {:?}, source_path: {}, target_path: {}",
                         job_id, state, job.info.source_path, job.info.target_path
                     );
-                    self.update_state(job_id, JobTaskState::Canceled, "Canceling job by user")?;
                     return Ok(());
                 }
 

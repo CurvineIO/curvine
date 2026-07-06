@@ -79,10 +79,18 @@ impl LoadTaskRunner {
     }
 
     async fn run0(&self) -> FsResult<()> {
+        if self.task.is_cancel() {
+            info!("task {} was cancelled", self.task.info.task_id);
+            return Ok(());
+        }
         self.task
             .update_state(JobTaskState::Loading, "Task started");
 
         let (mut reader, mut writer) = self.create_stream().await?;
+        if self.task.is_cancel() {
+            info!("task {} was cancelled", self.task.info.task_id);
+            return Ok(());
+        }
         let mut last_progress_time = LocalTime::mills();
         let mut read_cost_ms = 0;
         let mut total_cost_ms = 0;
@@ -90,7 +98,7 @@ impl LoadTaskRunner {
         loop {
             if self.task.is_cancel() {
                 info!("task {} was cancelled", self.task.info.task_id);
-                break;
+                return Ok(());
             }
 
             let spend = TimeSpent::new();

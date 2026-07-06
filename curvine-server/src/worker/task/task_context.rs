@@ -72,6 +72,11 @@ impl TaskContext {
 
     pub fn update_state(&self, state: JobTaskState, message: impl Into<String>) {
         let mut lock = self.progress();
+        if self.state.state::<JobTaskState>() == JobTaskState::Canceled
+            && state != JobTaskState::Canceled
+        {
+            return;
+        }
         self.state.set_state(state);
         lock.message = message.into();
         lock.update_time = LocalTime::mills() as i64;
@@ -84,6 +89,15 @@ impl TaskContext {
         is_last: bool,
     ) -> JobTaskProgress {
         let mut lock = self.progress();
+        if self.state.state::<JobTaskState>() == JobTaskState::Canceled {
+            return JobTaskProgress {
+                state: JobTaskState::Canceled,
+                total_size: lock.total_size,
+                loaded_size: lock.loaded_size,
+                update_time: lock.update_time,
+                message: lock.message.clone(),
+            };
+        }
 
         lock.loaded_size = loaded_size;
         lock.total_size = total_size;

@@ -15,6 +15,7 @@
 use crate::master::JobContext;
 use curvine_common::state::{JobTaskProgress, JobTaskState};
 use curvine_common::FsResult;
+use log::{debug, error};
 use orpc::err_box;
 use orpc::sync::FastDashMap;
 use std::collections::HashMap;
@@ -128,6 +129,21 @@ impl JobStore {
         };
 
         let old_state: JobTaskState = job.state.state();
+        if old_state.is_finish() {
+            debug!(
+                "ignore task report for terminal job {}, task {}, state {:?}",
+                job_id, task_id, old_state
+            );
+            return Ok(());
+        }
+
+        if !job.tasks.contains_key(task_id) {
+            debug!(
+                "ignore stale task report for job {}, unknown task {}",
+                job_id, task_id
+            );
+            return Ok(());
+        }
 
         job.update_progress(task_id, progress)?;
 
@@ -163,6 +179,41 @@ impl JobStore {
             }
         }
         Ok(())
+    }
+
+    pub fn update_state_if_run(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        state: JobTaskState,
+        message: impl Into<String>,
+    ) -> bool {
+        let mut job = match self.jobs.get_mut(job_id) {
+            Some(job) => job,
+            None => return false,
+        };
+
+        let old_state: JobTaskState = job.state.state();
+        if job.run_id != run_id || !old_state.is_running() {
+            return false;
+        }
+
+        job.update_state(state, message);
+        let new_state = state;
+
+        if old_state != new_state {
+            let job_clone = (*job).clone();
+            drop(job);
+
+            if let Err(err) = self.trigger_callbacks(job_id, old_state, new_state, &job_clone) {
+                error!(
+                    "failed to trigger job callbacks for {} after run-scoped state update: {}",
+                    job_id, err
+                );
+            }
+        }
+
+        true
     }
 
     pub fn remove_callbacks(&self, job_id: &str) -> FsResult<()> {
