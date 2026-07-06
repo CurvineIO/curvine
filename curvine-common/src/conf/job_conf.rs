@@ -14,6 +14,7 @@
 
 use crate::FsResult;
 use orpc::common::DurationUnit;
+use orpc::err_box;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -36,6 +37,9 @@ pub struct JobConf {
     // Maximum number of files allowed to be loaded by a job
     pub job_max_files: usize,
 
+    // Maximum concurrent master-side load job planning tasks
+    pub master_max_concurrent_load_jobs: usize,
+
     // Maximum execution time allowed for a task.
     #[serde(skip)]
     pub task_timeout: Duration,
@@ -56,6 +60,7 @@ impl JobConf {
     pub const DEFAULT_JOB_LIFE_TTL: &'static str = "24h";
     pub const DEFAULT_JOB_CLEANUP_TTL_STR: &'static str = "10m";
     pub const DEFAULT_JOB_MAX_FILES: usize = 100000;
+    pub const DEFAULT_MASTER_MAX_CONCURRENT_LOAD_JOBS: usize = 16;
     pub const DEFAULT_TASK_TIMEOUT: &'static str = "1h";
     pub const DEFAULT_TASK_REPORT_INTERVAL: &'static str = "10s";
     pub const DEFAULT_WORKER_MAX_CONCURRENT_TASKS: usize = 100;
@@ -66,6 +71,9 @@ impl JobConf {
         self.task_timeout = DurationUnit::from_str(&self.task_timeout_str)?.as_duration();
         self.task_report_interval =
             DurationUnit::from_str(&self.task_report_interval_str)?.as_duration();
+        if self.master_max_concurrent_load_jobs == 0 {
+            return err_box!("job.master_max_concurrent_load_jobs must be > 0");
+        }
 
         Ok(())
     }
@@ -80,6 +88,7 @@ impl Default for JobConf {
             job_cleanup_ttl_str: Self::DEFAULT_JOB_CLEANUP_TTL_STR.to_string(),
 
             job_max_files: Self::DEFAULT_JOB_MAX_FILES,
+            master_max_concurrent_load_jobs: Self::DEFAULT_MASTER_MAX_CONCURRENT_LOAD_JOBS,
 
             task_timeout: Default::default(),
             task_timeout_str: Self::DEFAULT_TASK_TIMEOUT.to_string(),

@@ -41,6 +41,7 @@ impl TaskDetail {
 #[derive(Clone)]
 pub struct JobContext {
     pub info: LoadJobInfo,
+    pub run_id: u64,
     pub state: StateMonitor,
     pub progress: JobTaskProgress,
     pub assigned_workers: FastHashSet<WorkerAddress>,
@@ -55,6 +56,7 @@ impl JobContext {
         target_path: String,
         mnt: &MountInfo,
         client_conf: &ClientConf,
+        run_id: u64,
     ) -> Self {
         let replicas = job_conf
             .replicas
@@ -88,6 +90,7 @@ impl JobContext {
 
         JobContext {
             info: job,
+            run_id,
             state: StateMonitor::new(JobTaskState::Pending.into()),
             progress: Default::default(),
             assigned_workers: Default::default(),
@@ -103,6 +106,15 @@ impl JobContext {
         self.assigned_workers.insert(task.worker.clone());
         self.tasks
             .insert(task.task_id.clone(), TaskDetail::new(task));
+    }
+
+    pub fn add_task_detail(&mut self, task_id: String, detail: TaskDetail) {
+        self.update_state(
+            JobTaskState::Loading,
+            format!("Assigned to worker {}", detail.task.worker),
+        );
+        self.assigned_workers.insert(detail.task.worker.clone());
+        self.tasks.insert(task_id, detail);
     }
 
     pub fn update_state(&mut self, state: JobTaskState, message: impl Into<String>) {
