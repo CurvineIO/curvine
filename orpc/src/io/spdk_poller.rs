@@ -527,7 +527,7 @@ impl SpdkPoller {
         }
 
         // Pre-push: poller_callback needs the entry in pending if SPDK completes synchronously during the submit call.
-        qs.pending.push(cb_ctx_ptr);
+        unsafe { (*qs_ptr).pending.push(cb_ctx_ptr) };
 
         let rc = match &req.op {
             IoOp::Read {
@@ -573,14 +573,17 @@ impl SpdkPoller {
         if rc != 0 {
             // If callback fired during submit and removed this entry from
             // pending via swap_remove, position() returns None - skip.
-            if let Some(pos) = qs.pending.iter().position(|&p| p == cb_ctx_ptr) {
-                qs.pending.swap_remove(pos);
-                if pos < qs.pending.len() {
-                    unsafe { (*qs.pending[pos]).pending_idx = pos };
+            unsafe {
+                if let Some(pos) = (*qs_ptr).pending.iter().position(|&p| p == cb_ctx_ptr) {
+                    (*qs_ptr).pending.swap_remove(pos);
+                    if pos < (*qs_ptr).pending.len() {
+                        (*(&mut (*qs_ptr).pending)[pos]).pending_idx = pos;
+                    }
+                    drop(Box::from_raw(cb_ctx_ptr));
+                    if req.completion.complete(rc) {
+                        req.bdev_inflight.fetch_sub(1, Ordering::Release);
+                    }
                 }
-                unsafe { drop(Box::from_raw(cb_ctx_ptr)) };
-                req.bdev_inflight.fetch_sub(1, Ordering::Release);
-                req.completion.complete(rc);
             }
             return;
         }
