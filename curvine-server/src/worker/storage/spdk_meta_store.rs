@@ -1,4 +1,6 @@
 //! RocksDB-backed SPDK block metadata.
+use crate::worker::block::BlockMeta;
+use crate::worker::storage::meta_store::BlockMetaStore;
 /// Key: block_id (8B). Value: dir_id(4B) | offset(8B) | size(8B) | len(8B) | finalized(1B) = 29B.
 /// O(1) per block
 use byteorder::{BigEndian, ByteOrder};
@@ -121,6 +123,29 @@ impl SpdkMetaStore {
             len: BigEndian::read_i64(&bytes[20..28]),
             finalized: bytes[28] != 0,
         })
+    }
+}
+
+impl BlockMetaStore for SpdkMetaStore {
+    fn put_block_meta(&self, meta: &BlockMeta) -> CommonResult<()> {
+        let alloc_size = meta
+            .dir
+            .offset_alloc
+            .get_entry(meta.id())
+            .map_or(meta.actual_len, |(_, size)| size);
+
+        self.put(
+            meta.id(),
+            meta.dir_id(),
+            meta.bdev_offset,
+            alloc_size,
+            meta.len(),
+            meta.is_final(),
+        )
+    }
+
+    fn remove_block_meta(&self, meta: &BlockMeta) -> CommonResult<()> {
+        self.delete(meta.id())
     }
 }
 #[cfg(test)]

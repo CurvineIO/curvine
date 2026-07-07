@@ -33,6 +33,12 @@ pub use self::dir_state::{DirState, DEFAULT_BLOCK_ALIGN};
 mod spdk_meta_store;
 pub use self::spdk_meta_store::SpdkMetaStore;
 
+mod meta_store;
+pub use self::meta_store::*;
+
+mod layout;
+pub use self::layout::*;
+
 mod vfs_dataset;
 pub use self::vfs_dataset::VfsDataset;
 
