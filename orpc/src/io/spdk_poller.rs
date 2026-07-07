@@ -795,15 +795,15 @@ mod test {
             pending_idx: 0,
         });
         let cb_ctx_ptr = Box::into_raw(cb_ctx);
-        qs.pending.push(cb_ctx_ptr);
-        assert_eq!(qs.pending.len(), 1);
+        unsafe { (*qs_ptr).pending.push(cb_ctx_ptr) };
+        assert_eq!(unsafe { (*qs_ptr).pending.len() }, 1);
 
         // Sync callback: poller_callback removes entry from pending.
         unsafe { poller_callback(cb_ctx_ptr as *mut c_void, -libc::EIO) };
-        assert!(qs.pending.is_empty());
+        assert!(unsafe { (*qs_ptr).pending.is_empty() });
 
         // Post-check: already removed, position() returns None (skips cleanup).
-        let pos = qs.pending.iter().position(|&p| p == cb_ctx_ptr);
+        let pos = unsafe { (*qs_ptr).pending.iter().position(|&p| p == cb_ctx_ptr) };
         assert!(pos.is_none());
     }
 
