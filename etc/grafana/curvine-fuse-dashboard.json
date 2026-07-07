@@ -411,7 +411,7 @@
         "textMode": "value_and_name",
         "orientation": "horizontal"
       },
-      "description": "Fleet FUSE-fd health counts over reachable instances: HEALTHY = kernel_fd_health==1, UNHEALTHY = kernel_fd_health==0 (process reachable but FUSE fd/session unhealthy). UNHEALTHY>0 turns red. NOTE: a down process (up==0) exports no kernel_fd_health, so it appears in NEITHER count — read this together with the Availability DOWN count. Sizes are independent of instance count; per-instance detail is in the 'Per-instance overview' table."
+      "description": "Fleet FUSE-fd health counts over reachable instances: HEALTHY = kernel_fd_health==1, UNHEALTHY = kernel_fd_health==0 (process reachable but FUSE fd/session unhealthy). UNHEALTHY>0 turns red. NOTE: a down process (up==0) exports no kernel_fd_health, so it appears in NEITHER count \u2014 read this together with the Availability DOWN count. Sizes are independent of instance count; per-instance detail is in the 'Per-instance overview' table."
     },
     {
       "id": 4,
@@ -878,6 +878,18 @@
               "Value #A": "p99 (\u00b5s)",
               "Value #B": "QPS",
               "Value #C": "non-success (range)"
+            },
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "Time 3": true,
+              "Time 4": true,
+              "Time 5": true,
+              "Time 6": true,
+              "Time 7": true,
+              "Time 8": true,
+              "Time 9": true
             }
           }
         },
@@ -1118,6 +1130,18 @@
           "options": {
             "renameByName": {
               "Value": "non-success samples (range)"
+            },
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "Time 3": true,
+              "Time 4": true,
+              "Time 5": true,
+              "Time 6": true,
+              "Time 7": true,
+              "Time 8": true,
+              "Time 9": true
             }
           }
         }
@@ -1940,6 +1964,18 @@
               "Value #G": "reply_queue",
               "Value #H": "write_queue",
               "Value #I": "meta_inflight"
+            },
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "Time 3": true,
+              "Time 4": true,
+              "Time 5": true,
+              "Time 6": true,
+              "Time 7": true,
+              "Time 8": true,
+              "Time 9": true
             }
           }
         }
@@ -3405,6 +3441,18 @@
                   "Value #B": "req p99 (\u00b5s)",
                   "Value #C": "op p99 (\u00b5s)",
                   "Value #D": "non-success (range)"
+                },
+                "excludeByName": {
+                  "Time": true,
+                  "Time 1": true,
+                  "Time 2": true,
+                  "Time 3": true,
+                  "Time 4": true,
+                  "Time 5": true,
+                  "Time 6": true,
+                  "Time 7": true,
+                  "Time 8": true,
+                  "Time 9": true
                 }
               }
             }
@@ -4046,6 +4094,18 @@
                   "Value #B": "throughput (B/s)",
                   "Value #C": "backend p99 (\u00b5s)",
                   "Value #D": "error rate"
+                },
+                "excludeByName": {
+                  "Time": true,
+                  "Time 1": true,
+                  "Time 2": true,
+                  "Time 3": true,
+                  "Time 4": true,
+                  "Time 5": true,
+                  "Time 6": true,
+                  "Time 7": true,
+                  "Time 8": true,
+                  "Time 9": true
                 }
               }
             }
@@ -4240,6 +4300,114 @@
               "sort": "desc"
             }
           }
+        },
+        {
+          "id": 80,
+          "type": "timeseries",
+          "title": "Per-instance data throughput (B/s, by io_type)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 0,
+            "y": 179
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "expr": "sum by(instance,io_type)(rate(curvine_fuse_io_bytes_total{instance=~\"$instance\",io_type=~\"$io_type\",path_type=~\"$path_type\",status=\"success\"}[$__rate_interval]))",
+              "refId": "A",
+              "legendFormat": "{{instance}}/{{io_type}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": true
+              },
+              "unit": "Bps"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "description": "Successful data-IO throughput per instance, split by io_type (read/write). sum by(instance,io_type) so each selected instance shows its own read+write lines when $instance=All. path_type is filtered by $path_type but not split into separate lines. Success bytes only. For fleet totals see the companion IO throughput panel."
+        },
+        {
+          "id": 81,
+          "type": "timeseries",
+          "title": "Per-instance IOPS (io_requests/s, by io_type)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 12,
+            "y": 179
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "expr": "sum by(instance,io_type)(rate(curvine_fuse_io_requests_total{instance=~\"$instance\",io_type=~\"$io_type\",path_type=~\"$path_type\"}[$__rate_interval]))",
+              "refId": "A",
+              "legendFormat": "{{instance}}/{{io_type}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": true
+              },
+              "unit": "iops"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "description": "Data-IO operations/sec per instance, split by io_type (read/write). ALL statuses (success+error) so it reflects total offered IOPS; pair with the IO error rate panel for the failing fraction. sum by(instance,io_type); path_type filtered by $path_type but not split. For fleet totals see the read/write comparison table."
         }
       ]
     },
@@ -5009,6 +5177,307 @@
             }
           },
           "description": "Namespaced (not legacy *_num). Kept per-instance, not summed across instances."
+        }
+      ]
+    },
+    {
+      "id": 82,
+      "type": "row",
+      "title": "Process resources (per-instance)",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 223
+      },
+      "panels": [
+        {
+          "id": 83,
+          "type": "timeseries",
+          "title": "Process CPU usage (cores)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 0,
+            "y": 224
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "expr": "rate(process_cpu_seconds_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval])",
+              "refId": "A",
+              "legendFormat": "{{instance}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": true
+              },
+              "unit": "none",
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "description": "Per-instance CPU usage in CORES (rate of process_cpu_seconds_total). 1.0 = one full core; a value >1 means multi-core (async runtime worker/io threads). process_* metrics are exported by the Prometheus client library from /proc, NOT by curvine code. Filtered to job=~$job (fuse only) - master/worker CPU is out of this dashboard's scope."
+        },
+        {
+          "id": 84,
+          "type": "timeseries",
+          "title": "Process resident memory (RSS)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 12,
+            "y": 224
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "expr": "process_resident_memory_bytes{job=~\"$job\",instance=~\"$instance\"}",
+              "refId": "A",
+              "legendFormat": "{{instance}} RSS"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "expr": "process_virtual_memory_bytes{job=~\"$job\",instance=~\"$instance\"}",
+              "refId": "B",
+              "legendFormat": "{{instance}} virt"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": true
+              },
+              "unit": "bytes",
+              "min": 0
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": ".*virt.*"
+                },
+                "properties": [
+                  {
+                    "id": "custom.fillOpacity",
+                    "value": 0
+                  },
+                  {
+                    "id": "custom.lineStyle",
+                    "value": {
+                      "fill": "dash",
+                      "dash": [
+                        6,
+                        6
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "description": "Per-instance memory: RSS (process_resident_memory_bytes, solid) is the real physical footprint; virtual (dashed) is address-space reservation and normally much larger - watch RSS for leaks/pressure. Exported by the Prometheus client library from /proc. job=~$job (fuse only)."
+        },
+        {
+          "id": 85,
+          "type": "timeseries",
+          "title": "Open file descriptors vs max",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 0,
+            "y": 231
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "expr": "process_open_fds{job=~\"$job\",instance=~\"$instance\"}",
+              "refId": "A",
+              "legendFormat": "{{instance}} open"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "expr": "process_max_fds{job=~\"$job\",instance=~\"$instance\"}",
+              "refId": "B",
+              "legendFormat": "{{instance}} max"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": true
+              },
+              "unit": "none",
+              "min": 0
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": ".*max.*"
+                },
+                "properties": [
+                  {
+                    "id": "custom.lineStyle",
+                    "value": {
+                      "fill": "dash",
+                      "dash": [
+                        6,
+                        6
+                      ]
+                    }
+                  },
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "red"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "description": "Per-instance open fds (solid) against the RLIMIT_NOFILE ceiling (dashed red). FUSE holds kernel /dev/fuse fds plus backend connections; open approaching max signals an fd leak or an undersized ulimit. Exported from /proc by the Prometheus client library. job=~$job (fuse only)."
+        },
+        {
+          "id": 86,
+          "type": "timeseries",
+          "title": "OS threads",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 12,
+            "y": 231
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "expr": "process_threads{job=~\"$job\",instance=~\"$instance\"}",
+              "refId": "A",
+              "legendFormat": "{{instance}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": true
+              },
+              "unit": "none",
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "description": "Per-instance OS thread count (process_threads). Roughly tracks the async runtime io_threads + worker_threads plus blocking-pool growth; a steadily climbing count with flat load can indicate blocking-pool thread accumulation. Exported from /proc. job=~$job (fuse only)."
         }
       ]
     }
