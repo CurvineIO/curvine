@@ -266,6 +266,26 @@ impl UnifiedFileSystem {
                 None => err_box!(
                     "the current path is not mounted to ufs, so the `free` command cannot be executed."
                 ),
+                Some((_, mount)) if mount.info.is_cache_mode() => {
+                    let free_res = self.cv.free(path, recursive).await?;
+
+                    if path.path() == mount.info.cv_path {
+                        if recursive {
+                            for status in self.cv.list_status(path).await? {
+                                let child = Path::from_str(status.path)?;
+                                if let Err(e) = self.cv.delete(&child, true).await {
+                                    if !matches!(e, FsError::FileNotFound(_)) {
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        self.cv.delete(path, recursive).await?;
+                    }
+
+                    Ok(free_res)
+                }
                 Some(_) => self.cv.free(path, recursive).await,
             }
         };

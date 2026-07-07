@@ -15,7 +15,7 @@
 use bytes::BytesMut;
 use curvine_client::unified::{UfsFileSystem, UnifiedFileSystem, UnifiedReader};
 use curvine_common::fs::{FileSystem, Path, Reader, RpcCode, Writer};
-use curvine_common::state::{MountOptionsBuilder, WriteType};
+use curvine_common::state::{AccessMode, MountOptionsBuilder, WriteType};
 use curvine_tests::Testing;
 use orpc::common::Utils;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
@@ -163,19 +163,33 @@ fn test_cache_mode_free() {
         )
         .into();
         let mut writer = fs.create(&path, true).await.unwrap();
-        writer.write_string(data).await.unwrap();
+        writer.write_string(&data).await.unwrap();
         writer.complete().await.unwrap();
 
         let _ = fs.open(&path).await.unwrap();
         fs.wait_job_complete(&path, false).await.unwrap();
 
+        let (ufs_path, mnt) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(mnt.ufs.exists(&ufs_path).await.unwrap());
+
         fs.free(&path, false).await.unwrap();
 
-        // Check cache file exists
-        assert!(fs.cv().exists(&path).await.unwrap());
+        assert!(
+            !fs.cv().exists(&path).await.unwrap(),
+            "cache mode free should remove Curvine file metadata"
+        );
+        assert!(
+            mnt.ufs.exists(&ufs_path).await.unwrap(),
+            "cache mode free must not delete the UFS file"
+        );
 
-        let reader = fs.open(&path).await.unwrap();
+        let mut reader = fs.open(&path).await.unwrap();
         assert!(!matches!(reader, UnifiedReader::Cv(_)));
+        assert_eq!(reader.read_as_string().await.unwrap(), data);
     });
 }
 
@@ -447,6 +461,9 @@ async fn mount(fs: &UnifiedFileSystem, write_type: WriteType) {
     }
 
     let mut opts_builder = MountOptionsBuilder::new().write_type(write_type);
+    if write_type == WriteType::CacheMode {
+        opts_builder = opts_builder.access_mode(AccessMode::ReadWrite);
+    }
 
     // Add properties from environment variable if set
     if let Ok(props_str) = env::var("UFS_TEST_PROPERTIES") {
