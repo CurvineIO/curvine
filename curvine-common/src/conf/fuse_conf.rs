@@ -189,6 +189,13 @@ pub struct FuseConf {
 
     pub list_limit: usize,
 
+    /// Whether to use splice (zero-copy) for FUSE data transfer.
+    /// When enabled, the receiver uses splice(/dev/fuse → pipe → buf) and the
+    /// sender uses vmsplice + splice (pipe → /dev/fuse) for large responses.
+    /// When disabled, both use plain read/writev (extra memory copy but no
+    /// pipe management overhead). Default: true.
+    pub enable_splice: bool,
+
     pub log: LogConf,
 }
 
@@ -365,6 +372,7 @@ impl Default for FuseConf {
             meta_cache_ttl_duration: Default::default(),
 
             list_limit: 1000,
+            enable_splice: true,
             log: LogConf::default(),
         };
 

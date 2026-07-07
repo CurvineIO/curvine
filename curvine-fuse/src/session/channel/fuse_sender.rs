@@ -24,8 +24,13 @@ use orpc::io::IOResult;
 use orpc::runtime::Runtime;
 use orpc::sync::channel::AsyncReceiver;
 use orpc::sys::pipe::{AsyncFd, Pipe2, PipeFd};
-use orpc::{err_box, sys};
+use orpc::{err_box, sys, try_option_ref};
 use std::sync::Arc;
+
+/// Responses smaller than this threshold use writev (1 syscall) instead of
+/// vmsplice + splice (2 syscalls).  The zero-copy benefit of splice only
+/// outweighs the extra syscall for larger payloads.
+const SPLICE_THRESHOLD: usize = 8192;
 
 /// FuseSender
 /// Reads data from queue and writes to fuse fd.
@@ -36,7 +41,7 @@ pub struct FuseSender<T> {
     rt: Arc<Runtime>,
     kernel_fd: Arc<AsyncFd>,
     receiver: AsyncReceiver<FuseTask>,
-    pipe2: Pipe2,
+    pipe2: Option<Pipe2>,
     debug: bool,
 }
 
@@ -48,8 +53,13 @@ impl<T: FileSystem> FuseSender<T> {
         receiver: AsyncReceiver<FuseTask>,
         buf_size: usize,
         debug: bool,
+        enable_splice: bool,
     ) -> IOResult<Self> {
-        let pipe2 = Pipe2::new(PipeFd::new(buf_size, false, false)?)?;
+        let pipe2 = if enable_splice {
+            Some(Pipe2::new(PipeFd::new(buf_size, false, false)?)?)
+        } else {
+            None
+        };
         let fuse_rx = Self {
             fs,
             rt,
@@ -178,33 +188,73 @@ impl<T: FileSystem> FuseSender<T> {
     }
 
     // Send response data to fuse.
+    // Small responses use writev (1 syscall); large responses use splice
+    // (vmsplice + splice, 2 syscalls but zero-copy).
     pub async fn send(&mut self, rep: ResponseData) -> IOResult<()> {
         if self.debug {
             info!("reply {:?}", rep.header);
         }
-        self.splice(rep).await
+
+        let len = rep.header.len as usize;
+        if self.pipe2.is_some() && len >= SPLICE_THRESHOLD {
+            self.splice(rep).await
+        } else {
+            self.write(rep).await
+        }
     }
 
     pub async fn write(&mut self, rep: ResponseData) -> IOResult<()> {
-        let (_, iovec) = rep.as_iovec()?;
-        self.kernel_fd
+        let (len, iovec) = rep.as_iovec()?;
+        let written = self
+            .kernel_fd
             .async_write(|fd| sys::writev(fd.fd(), &iovec))
             .await?;
+        if written as usize != len {
+            return err_box!("short writev: wrote {} of {}", written, len);
+        }
         Ok(())
     }
 
-    async fn splice(&mut self, rep: ResponseData) -> IOResult<()> {
+    async fn splice(&self, rep: ResponseData) -> IOResult<()> {
+        let pipe2 = try_option_ref!(self.pipe2);
+
         let (len, iovec) = rep.as_iovec()?;
-        let write_len = self.pipe2.write_iov(&iovec).await?;
-        if write_len != len {
-            return err_box!("io return value error, res: {}, expect: {}", write_len, len);
+        if let Err(e) = pipe2.write_iov(len, &iovec).await {
+            Self::drain_pipe(pipe2);
+            return Err(e);
         }
 
-        let read_len = self.pipe2.read_io(&self.kernel_fd, len).await?;
-        if read_len != len {
-            err_box!("io return value error, res: {}, expect: {}", read_len, len)
-        } else {
-            Ok(())
+        if let Err(e) = pipe2.read_io(&self.kernel_fd, len).await {
+            Self::drain_pipe(pipe2);
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    /// Drain any residual bytes left in the pipe after a failed transfer.
+    /// This prevents the pipe from being permanently poisoned (issue #965):
+    /// without draining, stale bytes at the head of the FIFO would corrupt
+    /// every subsequent response.
+    ///
+    /// EINTR is retried so that a signal during draining cannot leave the
+    /// pipe partially filled.  The loop stops when the non-blocking pipe
+    /// reports EAGAIN/EWOULDBLOCK (empty) or on EOF/any other error.
+    fn drain_pipe(pipe2: &Pipe2) {
+        let fd = pipe2.read_raw_fd();
+        let mut buf = [0u8; 8192];
+        loop {
+            match sys::read(fd, &mut buf) {
+                Ok(n) if n > 0 => continue,
+                Ok(_) => break, // EOF
+                Err(e) => {
+                    if e.raw_error().raw_os_error() == Some(libc::EINTR) {
+                        continue; // interrupted; retry
+                    }
+                    // EAGAIN/EWOULDBLOCK: pipe is empty; any other error: stop.
+                    break;
+                }
+            }
         }
     }
 }
