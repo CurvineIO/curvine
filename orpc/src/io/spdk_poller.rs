@@ -641,7 +641,8 @@ unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
 
     let qs = &mut *(ctx.qpair_state as *mut QpairState);
 
-    // Defensive guard against UB underflow on empty pending.
+    // Underflow guard only (runs after Box::from_raw + deref, not a UAF guard).
+    // TODO: add orphan lifecycle for late-callback safety.
     if qs.pending.is_empty() {
         return;
     }
