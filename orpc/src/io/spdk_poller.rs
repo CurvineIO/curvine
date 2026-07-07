@@ -790,12 +790,43 @@ mod test {
     }
 
     #[test]
-    fn complete_second_call_does_not_decrement_inflight() {
+    fn complete_is_idempotent_first_call_wins() {
         let completion = IoCompletion::new();
         assert!(completion.complete(42));
         assert_eq!(completion.wait(0), 42);
 
         assert!(!completion.complete(99));
         assert_eq!(completion.wait(0), 42);
+    }
+
+    #[test]
+    fn poller_callback_fetch_sub_guard_runs_once() {
+        let completion = IoCompletion::new();
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let mut qs = Box::new(QpairState {
+            dead: Arc::new(AtomicBool::new(false)),
+            pending: Vec::new(),
+        });
+
+        // Simulate force_complete_qpair signaling first.
+        assert!(completion.complete(42));
+        inflight.fetch_sub(1, Ordering::Release);
+        assert_eq!(inflight.load(Ordering::Acquire), 0);
+
+        // Now poller_callback fires on the same ctx.
+        let ctx = Box::into_raw(Box::new(CallbackCtx {
+            completion: completion.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight.clone(),
+            qpair_state: &mut *qs as *mut QpairState,
+            pending_idx: 0,
+        }));
+        qs.pending.push(ctx);
+
+        // complete() returns false -> fetch_sub skipped.
+        unsafe { poller_callback(ctx as *mut c_void, 99) };
+
+        assert_eq!(completion.wait(0), 42, "first signal wins");
+        assert_eq!(inflight.load(Ordering::Acquire), 0, "no double-decrement");
     }
 }
