@@ -841,7 +841,6 @@ mod test {
         assert_eq!(completion.wait(0), 42);
     }
 
-
     #[test]
     fn complete_is_idempotent_first_call_wins() {
         let completion = IoCompletion::new();
