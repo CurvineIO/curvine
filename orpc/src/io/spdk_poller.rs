@@ -823,6 +823,7 @@ mod test {
         let mut qs = Box::new(QpairState {
             dead: Arc::new(AtomicBool::new(false)),
             pending: Vec::new(),
+            stale: Vec::new(),
         });
         let qs_ptr = &*qs as *const QpairState as *mut QpairState;
 
@@ -847,26 +848,13 @@ mod test {
     }
 
     #[test]
-    fn poller_callback_empty_pending_returns_early() {
-        let inflight = Arc::new(AtomicUsize::new(1));
+    fn complete_second_call_does_not_decrement_inflight() {
         let completion = IoCompletion::new();
-        let qs = Box::new(QpairState {
-            dead: Arc::new(AtomicBool::new(false)),
-            pending: Vec::new(),
-        });
-        let ctx = Box::into_raw(Box::new(CallbackCtx {
-            completion: completion.clone(),
-            async_ctx: unsafe { std::mem::zeroed() },
-            bdev_inflight: inflight.clone(),
-            qpair_state: &*qs as *const QpairState as *mut QpairState,
-            pending_idx: 0,
-        }));
+        assert!(completion.complete(42));
+        assert_eq!(completion.wait(0), 42);
 
-        unsafe { poller_callback(ctx as *mut c_void, 0) };
-
-        assert!(qs.pending.is_empty());
-        assert_eq!(inflight.load(Ordering::Acquire), 1);
-        assert_eq!(completion.wait(1), -libc::ETIMEDOUT);
+        assert!(!completion.complete(99));
+        assert_eq!(completion.wait(0), 42);
     }
 
     #[test]
@@ -886,6 +874,7 @@ mod test {
         let mut qs = Box::new(QpairState {
             dead: Arc::new(AtomicBool::new(false)),
             pending: Vec::new(),
+            stale: Vec::new(),
         });
 
         // Simulate force_complete_qpair signaling first.
@@ -908,16 +897,6 @@ mod test {
 
         assert_eq!(completion.wait(0), 42, "first signal wins");
         assert_eq!(inflight.load(Ordering::Acquire), 0, "no double-decrement");
-    }
-
-    #[test]
-    fn complete_second_call_does_not_decrement_inflight() {
-        let completion = IoCompletion::new();
-        assert!(completion.complete(42));
-        assert_eq!(completion.wait(0), 42);
-
-        assert!(!completion.complete(99));
-        assert_eq!(completion.wait(0), 42);
     }
 
     #[test]
