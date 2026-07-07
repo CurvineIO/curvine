@@ -94,22 +94,59 @@ impl Pipe2 {
         Ok(res as usize)
     }
 
-    // Write IoSlice data into the pipeline, iov -> pipe writer
-    pub async fn write_iov(&self, iov: &[IoSlice<'_>]) -> IOResult<usize> {
-        let res = self
-            .writer
-            .async_write(|fd| sys::vm_splice(fd.fd(), iov))
-            .await?;
-        Ok(res as usize)
+    // Write IoSlice data into the pipeline, iov -> pipe writer.
+    pub async fn write_iov(&self, len: usize, iov: &[IoSlice<'_>]) -> IOResult<()> {
+        if len > self.buf_size {
+            return err_box!(
+                "write_iov: data size {} exceeds pipe buffer size {}",
+                len,
+                self.buf_size
+            );
+        }
+
+        let mut written = 0;
+        while written < len {
+            let res = if written == 0 {
+                self.writer
+                    .async_write(|fd| sys::vm_splice(fd.fd(), iov))
+                    .await?
+            } else {
+                let cur_iov = Self::skip_iov_bytes(iov, written);
+                self.writer
+                    .async_write(|fd| sys::vm_splice(fd.fd(), &cur_iov))
+                    .await?
+            };
+            if res == 0 {
+                return err_box!("vmsplice returned 0");
+            }
+            written += res as usize;
+        }
+        Ok(())
     }
 
-    // Read data in the pipeline, write to the io object, pipe reader -> fd out
-    pub async fn read_io(&self, fd_out: &AsyncFd, len: usize) -> IOResult<usize> {
+    // Read data in the pipeline, write to the io object, pipe reader -> fd out.
+    // Loops to completion: a partial splice (short transfer under SPLICE_F_NONBLOCK)
+    // is retried until all bytes are transferred, preventing pipe poisoning (issue #965).
+    pub async fn read_io(&self, fd_out: &AsyncFd, len: usize) -> IOResult<()> {
+        if len > self.buf_size {
+            return err_box!(
+                "read_io: request size {} exceeds pipe buffer size {}",
+                len,
+                self.buf_size
+            );
+        }
         let fd_in = self.reader.raw_fd();
-        let res = fd_out
-            .async_write(|fd| sys::splice(fd_in, None, fd.fd(), None, len))
-            .await?;
-        Ok(res as usize)
+        let mut remaining = len;
+        while remaining > 0 {
+            let res = fd_out
+                .async_write(|fd| sys::splice(fd_in, None, fd.fd(), None, remaining))
+                .await?;
+            if res == 0 {
+                return err_box!("splice returned 0");
+            }
+            remaining -= res as usize;
+        }
+        Ok(())
     }
 
     // Read the data of the pipeline into buf, pipe read -> buf
@@ -127,6 +164,23 @@ impl Pipe2 {
 
     pub fn take_fd(&mut self) -> PipeFd {
         self.pipe_fd.take().unwrap()
+    }
+
+    /// Build a new iovec that skips the first `offset` bytes from `iov`.
+    /// Used by `write_iov` to resume a partially completed vmsplice transfer.
+    fn skip_iov_bytes<'a>(iov: &'a [IoSlice<'a>], mut offset: usize) -> Vec<IoSlice<'a>> {
+        let mut result = Vec::with_capacity(iov.len());
+        for slice in iov {
+            if offset == 0 {
+                result.push(IoSlice::new(&slice[..]));
+            } else if slice.len() <= offset {
+                offset -= slice.len();
+            } else {
+                result.push(IoSlice::new(&slice[offset..]));
+                offset = 0;
+            }
+        }
+        result
     }
 }
 
