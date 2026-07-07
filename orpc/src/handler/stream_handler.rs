@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::err_box;
 use crate::handler::{Frame, MessageHandler};
 use crate::io::IOResult;
-use crate::message::Message;
+use crate::message::{Builder, Message};
 use crate::runtime::{RpcRuntime, Runtime};
 use crate::server::ServerConf;
 use crate::sys::RawPtr;
@@ -86,9 +85,19 @@ impl<F: Frame, M: MessageHandler> StreamHandler<F, M> {
                 })
                 .await?
         } else {
+            let error_response_base = Builder::new()
+                .code(request.code())
+                .request(request.request_status())
+                .req_id(request.req_id())
+                .seq_id(request.seq_id())
+                .build();
+            let req_id = request.req_id();
             match self.handler.as_mut().async_handle(request).await {
                 Ok(v) => v,
-                Err(e) => return err_box!("{}", e),
+                Err(e) => {
+                    debug!("handler request {} error: {}", req_id, e);
+                    error_response_base.error_ext(&e)
+                }
             }
         };
 

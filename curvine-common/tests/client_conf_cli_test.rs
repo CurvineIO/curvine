@@ -83,6 +83,42 @@ fn normalizes_non_positive_read_parallel_settings_to_defaults() {
 }
 
 #[test]
+fn validates_auto_cache_submit_backpressure_conf() {
+    let mut conf = ClientConf::default();
+    assert_eq!(
+        conf.auto_cache_submit_queue_size,
+        ClientConf::DEFAULT_AUTO_CACHE_SUBMIT_QUEUE_SIZE
+    );
+    assert_eq!(
+        conf.auto_cache_submit_retry_max,
+        ClientConf::DEFAULT_AUTO_CACHE_SUBMIT_RETRY_MAX
+    );
+
+    conf.auto_cache_submit_queue_size = 0;
+    let err = conf.init().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("client.auto_cache_submit_queue_size must be > 0"),
+        "unexpected error: {}",
+        err
+    );
+
+    let mut conf = ClientConf {
+        auto_cache_submit_retry_min_sleep_ms: 200,
+        auto_cache_submit_retry_max_sleep_ms: 100,
+        ..Default::default()
+    };
+    let err = conf.init().unwrap_err();
+    assert!(
+        err.to_string().contains(
+            "client.auto_cache_submit_retry_max_sleep_ms must be >= client.auto_cache_submit_retry_min_sleep_ms"
+        ),
+        "unexpected error: {}",
+        err
+    );
+}
+
+#[test]
 fn parses_c4_chunk_unified_fs_and_audit_flags() {
     let parsed = CliHarness::try_parse_from([
         "curvine-fuse",

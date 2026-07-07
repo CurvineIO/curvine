@@ -17,27 +17,37 @@ use curvine_common::error::FsError;
 use curvine_common::fs::CurvineURI;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
-    CreateFileRequest, DeleteRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
+    CreateFileRequest, DeleteRequest, GetBlockLocationsRequest, MkdirOptsProto, MkdirRequest,
+    RenameRequest,
 };
 use curvine_common::raft::storage::{AppStorage, ApplyMsg};
+use curvine_common::raft::RoleState;
 use curvine_common::state::MountOptions;
 use curvine_common::state::{
-    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, FileAllocOpts, WorkerInfo,
+    BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
+    CreateFileOpts, FileAllocOpts, HeartbeatStatus, StorageType, WorkerAddress, WorkerCommand,
+    WorkerInfo,
 };
 use curvine_common::state::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_common::utils::SerdeUtils;
 use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader, JournalSystem};
+use curvine_server::master::meta::InodeId;
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
-use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
+use curvine_server::master::{
+    JobHandler, JobManager, Master, MasterHandler, MasterMonitor, RpcContext,
+};
 use orpc::common::LocalTime;
 use orpc::common::Utils;
-use orpc::message::Builder;
-use orpc::runtime::{AsyncRuntime, RpcRuntime};
+use orpc::handler::MessageHandler;
+use orpc::message::{Builder, ResponseStatus};
+use orpc::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
+use orpc::sync::StateCtl;
 use orpc::CommonResult;
 use raft::eraftpb::Entry;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 // Master metrics gauges are process-wide; master_fs_test cases must not run in parallel or
 // inode_file_num / inode_dir_num race with other tests' format/init.
@@ -145,16 +155,32 @@ fn file_counts(fs: &MasterFilesystem) -> (i64, i64) {
 }
 
 fn new_handler() -> MasterHandler {
+    new_handler_with_role_and_read_limit(RoleState::Leader, 8)
+}
+
+fn new_active_handler_with_read_limit(read_limit: usize) -> MasterHandler {
+    new_handler_with_role_and_read_limit(RoleState::Leader, read_limit)
+}
+
+fn new_handler_with_role_and_read_limit(role: RoleState, read_limit: usize) -> MasterHandler {
     Master::init_test_metrics();
 
     let mut conf = ClusterConf::format();
     conf.journal.enable = false;
+    let suffix = Utils::rand_str(6);
 
-    conf.master.meta_dir = Utils::test_sub_dir("master-fs-test/meta-retry");
-    conf.journal.journal_dir = Utils::test_sub_dir("master-fs-test/journal-retry");
+    conf.master.meta_dir = Utils::test_sub_dir(format!("master-fs-test/meta-handler-{suffix}"));
+    conf.journal.journal_dir =
+        Utils::test_sub_dir(format!("master-fs-test/journal-handler-{suffix}"));
 
     let journal_system = JournalSystem::from_conf(&conf).unwrap();
-    let fs = MasterFilesystem::with_js(&conf, &journal_system);
+    let raw_fs = MasterFilesystem::with_js(&conf, &journal_system);
+    let fs = MasterFilesystem::new(
+        &conf,
+        raw_fs.fs_dir.clone(),
+        raw_fs.worker_manager.clone(),
+        MasterMonitor::new(StateCtl::new(role.into()), StateCtl::new(0)),
+    );
     fs.add_test_worker(WorkerInfo::default());
     let retry_cache = FsRetryCache::with_conf(&conf.master)
         .expect("test master retry cache configuration should be valid");
@@ -177,9 +203,108 @@ fn new_handler() -> MasterHandler {
         None,
         mount_manager,
         JobHandler::new(job_manager),
+        Arc::new(GroupExecutor::new("test-heartbeat-rpc", 1, 8)),
+        Arc::new(GroupExecutor::new("test-block-report-rpc", 1, 8)),
+        Arc::new(GroupExecutor::new("test-block-report-reconcile", 1, 8)),
+        Arc::new(GroupExecutor::new("test-control-rpc", 1, 8)),
+        Arc::new(GroupExecutor::new("test-list-rpc", 1, 8)),
+        Arc::new(GroupExecutor::new("test-get-block-locations-rpc", 1, 8)),
+        Arc::new(Semaphore::new(read_limit)),
         replication_manager,
         Master::get_metrics().expect("test master metrics should initialize"),
     )
+}
+
+#[test]
+fn worker_reports_do_not_share_master_sync_blocking_pool() {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler();
+
+    let submit_job = Builder::new_rpc(RpcCode::SubmitJob).build();
+    let get_block_locations = Builder::new_rpc(RpcCode::GetBlockLocations).build();
+    let get_master_info = Builder::new_rpc(RpcCode::GetMasterInfo).build();
+    let list_status = Builder::new_rpc(RpcCode::ListStatus).build();
+    let list_options = Builder::new_rpc(RpcCode::ListOptions).build();
+    let heartbeat = Builder::new_rpc(RpcCode::WorkerHeartbeat).build();
+    let block_report = Builder::new_rpc(RpcCode::WorkerBlockReport).build();
+
+    assert!(
+        !handler.is_sync(&submit_job),
+        "SubmitJob must use async admission instead of the master sync blocking pool"
+    );
+    assert!(
+        !handler.is_sync(&get_block_locations),
+        "GetBlockLocations must use the dedicated read executor instead of the master sync blocking pool"
+    );
+    assert!(
+        !handler.is_sync(&get_master_info),
+        "GetMasterInfo must use the control executor instead of the master sync blocking pool"
+    );
+    assert!(
+        !handler.is_sync(&list_status),
+        "ListStatus must use the control executor instead of the master sync blocking pool"
+    );
+    assert!(
+        !handler.is_sync(&list_options),
+        "ListOptions must use the control executor instead of the master sync blocking pool"
+    );
+    assert!(
+        !handler.is_sync(&heartbeat),
+        "WorkerHeartbeat must use the dedicated heartbeat executor instead of the master sync blocking pool"
+    );
+    assert!(
+        !handler.is_sync(&block_report),
+        "WorkerBlockReport must use the dedicated block-report executor instead of the master sync blocking pool"
+    );
+}
+
+#[test]
+fn get_block_locations_limit_returns_rpc_error_response() {
+    let _serial = master_fs_test_serial();
+    let mut handler = new_active_handler_with_read_limit(0);
+    assert!(handler.clone_fs().master_monitor.is_active());
+    let request = Builder::new_rpc(RpcCode::GetBlockLocations)
+        .proto_header(GetBlockLocationsRequest {
+            path: "/busy-file".to_string(),
+        })
+        .build();
+
+    let runtime = AsyncRuntime::single();
+    let response = runtime.block_on(handler.async_handle(request)).expect(
+        "async handler should return an RPC error response instead of closing the connection",
+    );
+
+    assert_eq!(response.response_status(), ResponseStatus::Error);
+    assert!(
+        response
+            .to_error_msg()
+            .contains("GetBlockLocations concurrency limit exceeded"),
+        "unexpected error response: {}",
+        response.to_error_msg()
+    );
+}
+
+#[test]
+fn async_rpc_to_standby_returns_rpc_error_response() {
+    let _serial = master_fs_test_serial();
+    let mut handler = new_handler_with_role_and_read_limit(RoleState::Follower, 8);
+    let request = Builder::new_rpc(RpcCode::GetBlockLocations)
+        .proto_header(GetBlockLocationsRequest {
+            path: "/standby-file".to_string(),
+        })
+        .build();
+
+    let runtime = AsyncRuntime::single();
+    let response = runtime.block_on(handler.async_handle(request)).expect(
+        "async handler should return a not-leader RPC error response instead of closing the connection",
+    );
+
+    assert_eq!(response.response_status(), ResponseStatus::Error);
+    assert!(
+        response.to_error_msg().contains("Not a leader master"),
+        "unexpected error response: {}",
+        response.to_error_msg()
+    );
 }
 
 #[test]
@@ -194,6 +319,46 @@ fn test_master_filesystem_core_operations() -> CommonResult<()> {
     get_file_info(&fs)?;
     list_status(&fs)?;
     state(&fs)?;
+
+    Ok(())
+}
+
+#[test]
+fn block_report_for_non_file_inode_schedules_worker_delete() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "block-report-non-file");
+    fs.mkdir("/dir-block", true)?;
+    let dir_status = fs.file_status("/dir-block")?;
+    let block_id = InodeId::create_block_id(dir_status.id, 0)?;
+
+    let result = fs.block_report(BlockReportList {
+        cluster_id: "curvine".into(),
+        worker_id: 100,
+        full_report: false,
+        total_len: 1,
+        blocks: vec![BlockReportInfo::new(
+            block_id,
+            BlockReportStatus::Finalized,
+            StorageType::Disk,
+            1,
+        )],
+    })?;
+
+    assert_eq!(result.delete_blocks, vec![block_id]);
+
+    let cmds = fs.worker_manager.write().heartbeat(
+        "curvine",
+        HeartbeatStatus::Running,
+        WorkerAddress {
+            worker_id: 100,
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    assert!(cmds.iter().any(|cmd| matches!(
+        cmd,
+        WorkerCommand::DeleteBlock(delete) if delete.blocks.contains(&block_id)
+    )));
 
     Ok(())
 }

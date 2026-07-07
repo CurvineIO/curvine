@@ -290,8 +290,8 @@ mkdir -p "$DIST_DIR"/lib
 mkdir -p "$DIST_DIR"/tests
 
 
-# Copy configuration files and bin
-cp "$FS_HOME"/etc/* "$DIST_DIR"/conf
+# Copy configuration files and directories.
+cp -R "$FS_HOME"/etc/. "$DIST_DIR"/conf/
 
 cp "$FS_HOME"/build/bin/* "$DIST_DIR"/bin
 chmod +x "$DIST_DIR"/bin/*

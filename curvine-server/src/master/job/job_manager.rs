@@ -14,7 +14,10 @@
 
 use crate::common::UfsFactory;
 use crate::master::fs::MasterFilesystem;
-use crate::master::{JobStore, LoadJobRunner, MountManager};
+use crate::master::job::job_runner::{
+    LoadJobPrepareResult, QueuedLoadJob, QueuedLoadJobValidation,
+};
+use crate::master::{JobStore, LoadJobRunner, Master, MasterMetrics, MountManager};
 use core::time::Duration;
 use curvine_client::unified::MountValue;
 use curvine_common::conf::ClusterConf;
@@ -28,24 +31,153 @@ use curvine_common::FsResult;
 use log::{debug, info, warn};
 use orpc::common::LocalTime;
 use orpc::runtime::{LoopTask, RpcRuntime, Runtime};
+use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender};
 use orpc::sync::AtomicCounter;
 use orpc::{err_box, err_ext, CommonResult};
-use std::sync::Arc;
-use tokio::sync::Semaphore;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
+use tokio::sync::{watch, Mutex};
 use tokio::time::timeout;
 
-/// Load the Task Manager
+struct QueuedLoadJobRequest {
+    job_id: String,
+    queued: QueuedLoadJob,
+}
+
+#[derive(Clone)]
+struct LoadJobWorkerContext {
+    jobs: JobStore,
+    master_fs: MasterFilesystem,
+    factory: Weak<UfsFactory>,
+    job_max_files: usize,
+    run_seq: Arc<AtomicCounter>,
+    shutdown_rx: watch::Receiver<bool>,
+    metrics: Option<&'static MasterMetrics>,
+}
+
+#[derive(Clone)]
+struct LoadJobSubmitContext {
+    jobs: JobStore,
+    master_fs: MasterFilesystem,
+    factory: Weak<UfsFactory>,
+    job_max_files: usize,
+    run_seq: Arc<AtomicCounter>,
+    load_job_sender: AsyncSender<QueuedLoadJobRequest>,
+    shutdown: Arc<AtomicBool>,
+    metrics: Option<&'static MasterMetrics>,
+}
+
+impl LoadJobWorkerContext {
+    fn create_runner(&self) -> Option<LoadJobRunner> {
+        self.factory.upgrade().map(|factory| {
+            LoadJobRunner::new(
+                self.jobs.clone(),
+                self.master_fs.clone(),
+                factory,
+                self.job_max_files,
+                self.run_seq.clone(),
+            )
+        })
+    }
+}
+
+impl LoadJobSubmitContext {
+    fn create_runner(&self) -> Option<LoadJobRunner> {
+        self.factory.upgrade().map(|factory| {
+            LoadJobRunner::new(
+                self.jobs.clone(),
+                self.master_fs.clone(),
+                factory,
+                self.job_max_files,
+                self.run_seq.clone(),
+            )
+        })
+    }
+
+    async fn forward_queued_load_job(&self, request: QueuedLoadJobRequest) {
+        let job_id = request.job_id.clone();
+        let run_id = request.queued.run_id;
+        if self.shutdown.load(Ordering::SeqCst) {
+            self.fail_queued_load_job(job_id, run_id, "load job manager is shutting down");
+            return;
+        }
+
+        let Some(runner) = self.create_runner() else {
+            self.fail_queued_load_job(job_id, run_id, "load job manager is shutting down");
+            return;
+        };
+        let validation = runner.validate_queued_source(&request.queued).await;
+        tokio::task::block_in_place(move || drop(runner));
+        match validation {
+            Ok(QueuedLoadJobValidation::Ready) => {}
+            Ok(QueuedLoadJobValidation::Failed) => {
+                self.finish_queued_load_job(true);
+                return;
+            }
+            Ok(QueuedLoadJobValidation::Stale) => {
+                self.finish_queued_load_job(false);
+                return;
+            }
+            Err(err) => {
+                warn!(
+                    "queued load job {} source validation failed: {}",
+                    job_id, err
+                );
+                self.finish_queued_load_job(true);
+                return;
+            }
+        }
+
+        if self.shutdown.load(Ordering::SeqCst) {
+            self.fail_queued_load_job(job_id, run_id, "load job manager is shutting down");
+            return;
+        }
+
+        if let Err(err) = self.load_job_sender.send(request).await {
+            self.fail_queued_load_job(job_id, run_id, format!("queue load job failed: {}", err));
+        }
+    }
+
+    fn fail_queued_load_job(&self, job_id: String, run_id: u64, message: impl Into<String>) {
+        let message = message.into();
+        warn!("queued load job {} skipped: {}", job_id, message);
+        self.jobs
+            .update_state_if_run(&job_id, run_id, JobTaskState::Failed, message);
+        if let Some(metrics) = self.metrics {
+            metrics.load_job_queue_len.dec();
+            metrics.load_job_failure_count.inc();
+        }
+    }
+
+    fn finish_queued_load_job(&self, failed: bool) {
+        if let Some(metrics) = self.metrics {
+            metrics.load_job_queue_len.dec();
+            if failed {
+                metrics.load_job_failure_count.inc();
+            }
+        }
+    }
+}
+
+/// Load job manager
 pub struct JobManager {
     rt: Arc<Runtime>,
+    // Soft-isolates load planning from the master RPC/Raft runtime. Process-level
+    // resources are still shared, so queue and concurrency limits remain required.
+    background_rt: Arc<Runtime>,
     jobs: JobStore,
     master_fs: MasterFilesystem,
     factory: Arc<UfsFactory>,
     mount_manager: Arc<MountManager>,
     job_life_ttl: Duration,
     job_cleanup_ttl: Duration,
+    failed_retry_interval: Duration,
     job_max_files: usize,
     run_seq: Arc<AtomicCounter>,
-    load_job_semaphore: Arc<Semaphore>,
+    submit_job_sender: AsyncSender<QueuedLoadJobRequest>,
+    shutdown: Arc<AtomicBool>,
+    shutdown_tx: watch::Sender<bool>,
+    metrics: Option<&'static MasterMetrics>,
 }
 
 impl JobManager {
@@ -55,20 +187,187 @@ impl JobManager {
         rt: Arc<Runtime>,
         conf: &ClusterConf,
     ) -> Self {
-        let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
+        let background_rt = Arc::new(Runtime::new(
+            "master-load-job",
+            conf.job.master_load_job_runtime_threads,
+            conf.job.master_load_job_blocking_threads,
+        ));
+        let factory = Arc::new(UfsFactory::with_rt(&conf.client, background_rt.clone()));
+        let jobs = JobStore::new();
+        let run_seq = Arc::new(AtomicCounter::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let metrics = Master::get_metrics().ok();
+        let (submit_job_sender, submit_job_receiver) =
+            AsyncChannel::new(conf.job.master_max_pending_load_job_submits).split();
+        let (load_job_sender, load_job_receiver) =
+            AsyncChannel::new(conf.job.master_max_background_load_jobs).split();
+        let load_job_worker_num = conf.job.master_max_concurrent_load_jobs;
+        let submit_worker_num = conf.job.master_load_job_runtime_threads;
+
+        Self::spawn_submit_workers(
+            background_rt.clone(),
+            submit_job_receiver,
+            submit_worker_num,
+            LoadJobSubmitContext {
+                jobs: jobs.clone(),
+                master_fs: master_fs.clone(),
+                factory: Arc::downgrade(&factory),
+                job_max_files: conf.job.job_max_files,
+                run_seq: run_seq.clone(),
+                load_job_sender: load_job_sender.clone(),
+                shutdown: shutdown.clone(),
+                metrics,
+            },
+        );
+
+        Self::spawn_load_job_workers(
+            background_rt.clone(),
+            load_job_receiver,
+            load_job_worker_num,
+            LoadJobWorkerContext {
+                jobs: jobs.clone(),
+                master_fs: master_fs.clone(),
+                factory: Arc::downgrade(&factory),
+                job_max_files: conf.job.job_max_files,
+                run_seq: run_seq.clone(),
+                shutdown_rx,
+                metrics,
+            },
+        );
 
         Self {
             rt,
-            jobs: JobStore::new(),
+            background_rt,
+            jobs,
             master_fs,
             factory,
             mount_manager,
             job_life_ttl: conf.job.job_life_ttl,
             job_cleanup_ttl: conf.job.job_cleanup_ttl,
+            failed_retry_interval: conf.job.master_failed_load_job_retry_interval,
             job_max_files: conf.job.job_max_files,
-            run_seq: Arc::new(AtomicCounter::new(0)),
-            load_job_semaphore: Arc::new(Semaphore::new(conf.job.master_max_concurrent_load_jobs)),
+            run_seq,
+            submit_job_sender,
+            shutdown,
+            shutdown_tx,
+            metrics,
         }
+    }
+
+    fn spawn_submit_workers(
+        rt: Arc<Runtime>,
+        receiver: AsyncReceiver<QueuedLoadJobRequest>,
+        workers: usize,
+        context: LoadJobSubmitContext,
+    ) {
+        let receiver = Arc::new(Mutex::new(receiver));
+
+        for _ in 0..workers {
+            let receiver = receiver.clone();
+            let context = context.clone();
+            rt.spawn(async move {
+                loop {
+                    let request = {
+                        let mut receiver = receiver.lock().await;
+                        receiver.recv().await
+                    };
+                    let Some(request) = request else {
+                        break;
+                    };
+                    context.forward_queued_load_job(request).await;
+                }
+            });
+        }
+    }
+
+    fn spawn_load_job_workers(
+        rt: Arc<Runtime>,
+        receiver: AsyncReceiver<QueuedLoadJobRequest>,
+        workers: usize,
+        context: LoadJobWorkerContext,
+    ) {
+        let receiver = Arc::new(Mutex::new(receiver));
+
+        for _ in 0..workers {
+            let receiver = receiver.clone();
+            let context = context.clone();
+            rt.spawn(async move {
+                let mut shutdown_rx = context.shutdown_rx.clone();
+                loop {
+                    let request = {
+                        let mut receiver = receiver.lock().await;
+                        if *shutdown_rx.borrow() {
+                            match receiver.try_recv() {
+                                Ok(Some(request)) => Some(request),
+                                Ok(None) => None,
+                                Err(err) => {
+                                    debug!("load job receiver closed during shutdown: {}", err);
+                                    None
+                                }
+                            }
+                        } else {
+                            tokio::select! {
+                                request = receiver.recv() => request,
+                                changed = shutdown_rx.changed() => {
+                                    if changed.is_err() {
+                                        None
+                                    } else {
+                                        match receiver.try_recv() {
+                                            Ok(Some(request)) => Some(request),
+                                            Ok(None) => None,
+                                            Err(err) => {
+                                                debug!("load job receiver closed during shutdown: {}", err);
+                                                None
+                                            }
+                                        }
+                                    }
+                                },
+                            }
+                        }
+                    };
+                    let Some(request) = request else {
+                        break;
+                    };
+                    let QueuedLoadJobRequest { job_id, queued } = request;
+                    if let Some(metrics) = context.metrics {
+                        metrics.load_job_queue_len.dec();
+                        metrics.load_job_running_num.inc();
+                    }
+                    match context.create_runner() {
+                        Some(runner) => {
+                            let result = runner.run_queued_load_job(queued).await;
+                            tokio::task::block_in_place(move || drop(runner));
+                            if let Err(err) = result {
+                                warn!("async load job {} failed: {}", job_id, err);
+                                if let Some(metrics) = context.metrics {
+                                    metrics.load_job_failure_count.inc();
+                                }
+                            }
+                        }
+                        None => {
+                            let message = "load job manager is shutting down";
+                            warn!("async load job {} skipped: {}", job_id, message);
+                            let _ =
+                                context
+                                    .jobs
+                                    .update_state(&job_id, JobTaskState::Failed, message);
+                            if let Some(metrics) = context.metrics {
+                                metrics.load_job_failure_count.inc();
+                            }
+                        }
+                    }
+                    if let Some(metrics) = context.metrics {
+                        metrics.load_job_running_num.dec();
+                    }
+                }
+            });
+        }
+    }
+
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        let _ = self.shutdown_tx.send(true);
     }
 
     /// Start the job manager
@@ -164,15 +463,19 @@ impl JobManager {
         &self.rt
     }
 
-    /// See `LoadJobRunner::submit_load_task` for the concurrency contract: concurrent
-    /// submits for the same path while a load is running return the **existing** run’s
-    /// result; the new command’s options are not applied (first submitter wins).
-    pub async fn submit_load_job(&self, command: LoadJobCommand) -> FsResult<LoadJobResult> {
-        let source_path = Path::from_str(&command.source_path)?;
+    pub fn background_rt(&self) -> &Runtime {
+        &self.background_rt
+    }
 
-        // Check mount info for both UFS and CV paths
-        // - For UFS path: Import (UFS → Curvine)
-        // - For CV path: Export (Curvine → UFS), requires mount info to determine target UFS
+    /// See `LoadJobRunner::submit_load_task` for the concurrency contract: concurrent
+    /// submits for the same path while a load is running return the **existing** run's
+    /// result; the new command's options are not applied (first submitter wins).
+    pub async fn submit_load_job(&self, command: LoadJobCommand) -> FsResult<LoadJobResult> {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return err_box!("load job manager is shutting down");
+        }
+
+        let source_path = Path::from_str(&command.source_path)?;
         let mnt = if let Some(mnt) = self.mount_manager.get_mount_info(&source_path)? {
             mnt
         } else {
@@ -180,35 +483,39 @@ impl JobManager {
         };
 
         let job_runner = self.create_runner();
-        let (res, queued) = job_runner.enqueue_load_job(command, mnt)?;
+        if let Some(res) = job_runner.running_job_result_for_command(&command, &mnt)? {
+            if let Some(metrics) = self.metrics {
+                metrics.load_job_duplicate_count.inc();
+            }
+            return Ok(res);
+        }
 
+        let prepared = match job_runner.admit_load_job(command, mnt, self.failed_retry_interval)? {
+            LoadJobPrepareResult::Done(result) => return Ok(result),
+            LoadJobPrepareResult::Ready(prepared) => prepared,
+        };
+
+        let channel_permit = match self.submit_job_sender.try_reserve()? {
+            Some(permit) => permit,
+            None => {
+                return Err(FsError::resource_exhausted(
+                    "master load job submit queue is full; retry later",
+                ))
+            }
+        };
+
+        let (res, queued) = job_runner.commit_prepared_load_job(prepared)?;
         if let Some(queued) = queued {
-            let runner = self.create_runner();
             let job_id = res.job_id.clone();
-            let semaphore = self.load_job_semaphore.clone();
-            let jobs = self.jobs.clone();
-            self.rt.spawn(async move {
-                let _permit = match semaphore.acquire_owned().await {
-                    Ok(permit) => permit,
-                    Err(err) => {
-                        warn!(
-                            "async load job {} failed to acquire permit: {}",
-                            job_id, err
-                        );
-                        jobs.update_state_if_run(
-                            &queued.job_id,
-                            queued.run_id,
-                            JobTaskState::Failed,
-                            format!("async load job failed to acquire permit: {}", err),
-                        );
-                        return;
-                    }
-                };
-
-                if let Err(err) = runner.run_queued_load_job(queued).await {
-                    warn!("async load job {} failed: {}", job_id, err);
-                }
-            });
+            let request = QueuedLoadJobRequest {
+                job_id: job_id.clone(),
+                queued,
+            };
+            if let Some(metrics) = self.metrics {
+                metrics.load_job_queue_len.inc();
+                metrics.load_job_enqueue_count.inc();
+            }
+            channel_permit.send(request);
         }
 
         Ok(res)
@@ -257,6 +564,10 @@ impl JobManager {
 
     pub fn jobs(&self) -> &JobStore {
         &self.jobs
+    }
+
+    pub fn master_fs(&self) -> &MasterFilesystem {
+        &self.master_fs
     }
 
     pub fn factory(&self) -> &Arc<UfsFactory> {

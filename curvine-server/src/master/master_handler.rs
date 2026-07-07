@@ -24,16 +24,18 @@ use curvine_common::fs::Path;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
 use curvine_common::state::{
-    CreateFileOpts, FileBlocks, FileStatus, FreeResult, HeartbeatStatus, OpenFlags, RenameFlags,
+    CreateFileOpts, DeleteBlockCmd, FileBlocks, FileStatus, FreeResult, HeartbeatStatus,
+    ListOptions, MasterInfo, OpenFlags, RenameFlags, WorkerCommand,
 };
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
-use log::error;
 use orpc::err_box;
 use orpc::handler::{FrameBuf, MessageHandler};
 use orpc::io::net::ConnState;
 use orpc::message::Message;
+use orpc::runtime::GroupExecutor;
 use std::sync::Arc;
+use tokio::sync::{oneshot, Semaphore};
 
 pub struct MasterHandler {
     pub(crate) fs: MasterFilesystem,
@@ -43,6 +45,13 @@ pub struct MasterHandler {
     pub(crate) conn_state: Option<ConnState>,
     pub(crate) job_handler: JobHandler,
     pub(crate) mount_manager: Arc<MountManager>,
+    pub(crate) heartbeat_rpc_executor: Arc<GroupExecutor>,
+    pub(crate) block_report_rpc_executor: Arc<GroupExecutor>,
+    pub(crate) block_report_reconcile_executor: Arc<GroupExecutor>,
+    pub(crate) control_rpc_executor: Arc<GroupExecutor>,
+    pub(crate) list_rpc_executor: Arc<GroupExecutor>,
+    pub(crate) get_block_locations_rpc_executor: Arc<GroupExecutor>,
+    pub(crate) get_block_locations_limiter: Arc<Semaphore>,
     pub(crate) replication_handler: Option<MasterReplicationHandler>,
     pub(crate) buf: FrameBuf,
 }
@@ -56,6 +65,13 @@ impl MasterHandler {
         conn_state: Option<ConnState>,
         mount_manager: Arc<MountManager>,
         job_handler: JobHandler,
+        heartbeat_rpc_executor: Arc<GroupExecutor>,
+        block_report_rpc_executor: Arc<GroupExecutor>,
+        block_report_reconcile_executor: Arc<GroupExecutor>,
+        control_rpc_executor: Arc<GroupExecutor>,
+        list_rpc_executor: Arc<GroupExecutor>,
+        get_block_locations_rpc_executor: Arc<GroupExecutor>,
+        get_block_locations_limiter: Arc<Semaphore>,
         replication_manager: Arc<MasterReplicationManager>,
         metrics: &'static MasterMetrics,
     ) -> Self {
@@ -67,6 +83,13 @@ impl MasterHandler {
             conn_state,
             mount_manager,
             job_handler,
+            heartbeat_rpc_executor,
+            block_report_rpc_executor,
+            block_report_reconcile_executor,
+            control_rpc_executor,
+            list_rpc_executor,
+            get_block_locations_rpc_executor,
+            get_block_locations_limiter,
             replication_handler: Some(MasterReplicationHandler::new(replication_manager)),
             buf: FrameBuf::new(conf.master.buffer_size),
         }
@@ -276,6 +299,10 @@ impl MasterHandler {
         ctx.response_buf(rep_header, &mut self.buf)
     }
 
+    fn process_list_status(fs: MasterFilesystem, path: String) -> FsResult<Vec<FileStatus>> {
+        fs.list_status(&path)
+    }
+
     // The add block internally determines whether it is a retry request.
     pub fn add_block(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: AddBlockRequest = ctx.parse_header()?;
@@ -417,12 +444,24 @@ impl MasterHandler {
     pub fn get_block_locations(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: GetBlockLocationsRequest = ctx.parse_header()?;
         ctx.set_audit(Some(req.path.to_string()), None);
+        let _permit = self
+            .get_block_locations_limiter
+            .try_acquire()
+            .map_err(|_| {
+                FsError::resource_exhausted(
+                    "master GetBlockLocations concurrency limit exceeded; retry later",
+                )
+            })?;
 
         let blocks = self.fs.get_block_locations(req.path)?;
         let rep_header = GetBlockLocationsResponse {
             blocks: ProtoUtils::file_blocks_to_pb(blocks),
         };
         ctx.response_buf(rep_header, &mut self.buf)
+    }
+
+    fn process_get_block_locations(fs: MasterFilesystem, path: String) -> FsResult<FileBlocks> {
+        fs.get_block_locations(path)
     }
 
     pub fn get_master_info(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -433,24 +472,13 @@ impl MasterHandler {
         ctx.response_buf(rep_header, &mut self.buf)
     }
 
+    fn process_get_master_info(fs: MasterFilesystem) -> FsResult<MasterInfo> {
+        fs.master_info()
+    }
+
     pub fn worker_heartbeat(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: WorkerHeartbeatRequest = ctx.parse_header()?;
-        let status = HeartbeatStatus::from(header.status);
-        let address = ProtoUtils::worker_address_from_pb(&header.address);
-        if matches!(status, HeartbeatStatus::Start) {
-            self.fs.reset_full_block_report(address.worker_id);
-        }
-
-        let mut wm = self.fs.worker_manager.write();
-
-        let cmds = wm.heartbeat(
-            &header.cluster_id,
-            status,
-            address,
-            ProtoUtils::storage_info_list_from_pb(header.storages),
-        )?;
-        drop(wm);
-
+        let cmds = Self::process_worker_heartbeat(self.fs.clone(), header)?;
         let rep_header = WorkerHeartbeatResponse {
             cmds: ProtoUtils::worker_cmd_to_pb(cmds),
         };
@@ -459,25 +487,73 @@ impl MasterHandler {
 
     pub fn block_report(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: BlockReportListRequest = ctx.parse_header()?;
-        let list = ProtoUtils::block_report_list_from_pb(header);
-        let worker_id = list.worker_id;
-        let stale_block_ids = self.fs.block_report(list)?;
-        let stale_block_count = stale_block_ids.len();
-        if stale_block_count > 0 {
-            if let Some(replication_handler) = &self.replication_handler {
-                if let Err(e) =
-                    replication_handler.report_under_replicated_blocks(worker_id, stale_block_ids)
-                {
-                    error!(
-                        "Errors on reporting under-replicated {} blocks from full block report reconciliation. err: {:?}",
-                        stale_block_count, e
-                    );
-                }
-            }
+        let cmds = Self::process_block_report(
+            self.fs.clone(),
+            self.block_report_reconcile_executor.clone(),
+            self.replication_handler.clone(),
+            header,
+        )?;
+        let rep_header = BlockReportListResponse {
+            cmds: ProtoUtils::worker_cmd_to_pb(cmds),
+        };
+        ctx.response_buf(rep_header, &mut self.buf)
+    }
+
+    fn process_worker_heartbeat(
+        fs: MasterFilesystem,
+        header: WorkerHeartbeatRequest,
+    ) -> FsResult<Vec<WorkerCommand>> {
+        let status = HeartbeatStatus::from(header.status);
+        let address = ProtoUtils::worker_address_from_pb(&header.address);
+        if matches!(status, HeartbeatStatus::Start) {
+            fs.reset_full_block_report(address.worker_id);
         }
 
-        let rep_header = BlockReportListResponse::default();
-        ctx.response_buf(rep_header, &mut self.buf)
+        let mut wm = fs.worker_manager.write();
+        let cmds = wm.heartbeat(
+            &header.cluster_id,
+            status,
+            address,
+            ProtoUtils::storage_info_list_from_pb(header.storages),
+        )?;
+        Ok(cmds)
+    }
+
+    fn process_block_report(
+        fs: MasterFilesystem,
+        reconcile_executor: Arc<GroupExecutor>,
+        replication_handler: Option<MasterReplicationHandler>,
+        header: BlockReportListRequest,
+    ) -> FsResult<Vec<WorkerCommand>> {
+        let list = ProtoUtils::block_report_list_from_pb(header);
+        let result = fs.block_report(list)?;
+        if let Some(reported_blocks) = result.full_reported_blocks {
+            fs.submit_full_block_reconcile(
+                reconcile_executor,
+                result.worker_id,
+                reported_blocks,
+                replication_handler,
+            )?;
+        }
+        if result.delete_blocks.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Ok(vec![WorkerCommand::DeleteBlock(DeleteBlockCmd {
+                blocks: result.delete_blocks,
+            })])
+        }
+    }
+
+    async fn run_master_rpc_task<T, F>(executor: Arc<GroupExecutor>, task: F) -> FsResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> FsResult<T> + Send + 'static,
+    {
+        let (tx, rx) = oneshot::channel();
+        executor.try_spawn(move || {
+            let _ = tx.send(task());
+        })?;
+        rx.await?
     }
 
     fn client_ip(&self) -> &str {
@@ -676,6 +752,115 @@ impl MasterHandler {
         let rep_header = ListOptionsResponse { statuses: res };
         ctx.response_buf(rep_header, &mut self.buf)
     }
+
+    fn process_list_options(
+        fs: MasterFilesystem,
+        path: String,
+        opts: ListOptions,
+    ) -> FsResult<Vec<FileStatus>> {
+        fs.list_options(&path, opts)
+    }
+
+    async fn async_get_block_locations(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let req: GetBlockLocationsRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(req.path.to_string()), None);
+        let permit = self
+            .get_block_locations_limiter
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                FsError::resource_exhausted(
+                    "master GetBlockLocations concurrency limit exceeded; retry later",
+                )
+            })?;
+        let fs = self.fs.clone();
+        let blocks =
+            Self::run_master_rpc_task(self.get_block_locations_rpc_executor.clone(), move || {
+                let _permit = permit;
+                Self::process_get_block_locations(fs, req.path)
+            })
+            .await?;
+        let rep_header = GetBlockLocationsResponse {
+            blocks: ProtoUtils::file_blocks_to_pb(blocks),
+        };
+        ctx.response_buf(rep_header, &mut self.buf)
+    }
+
+    async fn async_get_master_info(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let _: GetMasterInfoRequest = ctx.parse_header()?;
+        let fs = self.fs.clone();
+        let info = Self::run_master_rpc_task(self.control_rpc_executor.clone(), move || {
+            Self::process_get_master_info(fs)
+        })
+        .await?;
+        let rep_header = ProtoUtils::master_info_to_pb(info);
+        ctx.response_buf(rep_header, &mut self.buf)
+    }
+
+    async fn async_list_status(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: ListStatusRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(header.path.to_string()), None);
+        let fs = self.fs.clone();
+        let list = Self::run_master_rpc_task(self.list_rpc_executor.clone(), move || {
+            Self::process_list_status(fs, header.path)
+        })
+        .await?;
+        let statuses = list
+            .into_iter()
+            .map(ProtoUtils::file_status_to_pb)
+            .collect();
+        ctx.response_buf(ListStatusResponse { statuses }, &mut self.buf)
+    }
+
+    async fn async_list_options(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: ListOptionsRequest = ctx.parse_header()?;
+        if header.options.limit.unwrap_or(0) < 0 {
+            return err_box!("list options limit must be greater than 0");
+        }
+        let opts = ProtoUtils::list_options_from_pb(header.options);
+        let audit_path = format!("{}[{}]", header.path, opts);
+        ctx.set_audit(Some(audit_path), None);
+        let fs = self.fs.clone();
+        let list = Self::run_master_rpc_task(self.list_rpc_executor.clone(), move || {
+            Self::process_list_options(fs, header.path, opts)
+        })
+        .await?;
+        let statuses = list
+            .into_iter()
+            .map(ProtoUtils::file_status_to_pb)
+            .collect();
+        ctx.response_buf(ListOptionsResponse { statuses }, &mut self.buf)
+    }
+
+    async fn async_worker_heartbeat(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: WorkerHeartbeatRequest = ctx.parse_header()?;
+        let fs = self.fs.clone();
+        let cmds = Self::run_master_rpc_task(self.heartbeat_rpc_executor.clone(), move || {
+            Self::process_worker_heartbeat(fs, header)
+        })
+        .await?;
+        let rep_header = WorkerHeartbeatResponse {
+            cmds: ProtoUtils::worker_cmd_to_pb(cmds),
+        };
+        ctx.response_buf(rep_header, &mut self.buf)
+    }
+
+    async fn async_worker_block_report(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: BlockReportListRequest = ctx.parse_header()?;
+        let fs = self.fs.clone();
+        let reconcile_executor = self.block_report_reconcile_executor.clone();
+        let replication_handler = self.replication_handler.clone();
+        let cmds = Self::run_master_rpc_task(self.block_report_rpc_executor.clone(), move || {
+            Self::process_block_report(fs, reconcile_executor, replication_handler, header)
+        })
+        .await?;
+        ctx.response_buf(
+            BlockReportListResponse {
+                cmds: ProtoUtils::worker_cmd_to_pb(cmds),
+            },
+            &mut self.buf,
+        )
+    }
 }
 
 impl MessageHandler for MasterHandler {
@@ -685,7 +870,16 @@ impl MessageHandler for MasterHandler {
         let code = RpcCode::from(msg.code());
         !matches!(
             code,
-            RpcCode::SubmitJob | RpcCode::GetJobStatus | RpcCode::CancelJob | RpcCode::ReportTask
+            RpcCode::SubmitJob
+                | RpcCode::GetJobStatus
+                | RpcCode::CancelJob
+                | RpcCode::ReportTask
+                | RpcCode::GetBlockLocations
+                | RpcCode::GetMasterInfo
+                | RpcCode::ListStatus
+                | RpcCode::ListOptions
+                | RpcCode::WorkerHeartbeat
+                | RpcCode::WorkerBlockReport
         )
     }
 
@@ -780,7 +974,7 @@ impl MessageHandler for MasterHandler {
 
         // Check whether the master is active
         if !self.fs.master_monitor.is_active() {
-            return Err(FsError::not_leader_master(ctx.code, self.client_ip()));
+            return Ok(msg.error_ext(&FsError::not_leader_master(ctx.code, self.client_ip())));
         }
 
         let res = match code {
@@ -788,9 +982,30 @@ impl MessageHandler for MasterHandler {
             RpcCode::GetJobStatus => self.job_handler.get_load_status(ctx, &mut self.buf),
             RpcCode::CancelJob => self.job_handler.cancel_job(ctx, &mut self.buf).await,
             RpcCode::ReportTask => self.job_handler.task_report(ctx, &mut self.buf),
+            RpcCode::GetBlockLocations => self.async_get_block_locations(ctx).await,
+            RpcCode::GetMasterInfo => self.async_get_master_info(ctx).await,
+            RpcCode::ListStatus => self.async_list_status(ctx).await,
+            RpcCode::ListOptions => self.async_list_options(ctx).await,
+            RpcCode::WorkerHeartbeat => self.async_worker_heartbeat(ctx).await,
+            RpcCode::WorkerBlockReport => self.async_worker_block_report(ctx).await,
 
             v => err_box!("unsupported operation {:?}", v),
         };
+
+        if ctx.code == RpcCode::GetBlockLocations {
+            let used_us = ctx.spent.used_us();
+            if self.audit_logging_enabled {
+                ctx.audit_log(&res, used_us, self.conn_state.as_ref());
+            }
+
+            let code_label = format!("{:?}", ctx.code);
+            self.metrics.rpc_request_total_time.inc_by(used_us as i64);
+            self.metrics.rpc_request_total_count.inc();
+            self.metrics
+                .operation_duration
+                .with_label_values(&[&code_label])
+                .observe(used_us as f64);
+        }
 
         match res {
             Ok(v) => Ok(v),
