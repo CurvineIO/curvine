@@ -30,6 +30,7 @@ extern "C" {
     pub fn curvine_spdk_env_opts_set_name(opts: *mut spdk_env_opts, name: *const c_char);
     pub fn curvine_spdk_env_opts_set_core_mask(opts: *mut spdk_env_opts, mask: *const c_char);
     pub fn curvine_spdk_env_opts_set_mem_size(opts: *mut spdk_env_opts, mem_size: c_int);
+    pub fn curvine_spdk_env_opts_set_iova_mode(opts: *mut spdk_env_opts, mode: *const c_char);
     pub fn curvine_spdk_env_init(opts: *mut spdk_env_opts) -> c_int;
     pub fn spdk_env_fini();
     // Transport ID (via C helper)

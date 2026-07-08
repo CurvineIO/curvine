@@ -24,6 +24,9 @@ void curvine_spdk_env_opts_set_core_mask(struct spdk_env_opts *opts, const char 
 void curvine_spdk_env_opts_set_mem_size(struct spdk_env_opts *opts, int size_mb) {
     opts->mem_size = size_mb;
 }
+void curvine_spdk_env_opts_set_iova_mode(struct spdk_env_opts *opts, const char *mode) {
+    opts->iova_mode = mode;
+}
 int curvine_spdk_env_init(struct spdk_env_opts *opts) {
     return spdk_env_init(opts);
 }
