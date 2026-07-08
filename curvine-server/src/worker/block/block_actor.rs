@@ -17,6 +17,7 @@ use curvine_client::file::FsContext;
 use curvine_common::conf::ClusterConf;
 use curvine_common::executor::ScheduledExecutor;
 use curvine_common::state::{BlockReportInfo, HeartbeatStatus, WorkerAddress};
+use curvine_common::utils::ProtoUtils;
 use dashmap::DashMap;
 use log::info;
 use orpc::common::TimeSpent;
@@ -115,16 +116,30 @@ impl BlockActor {
     pub fn full_block_report(&self) -> CommonResult<usize> {
         let blocks = self.store.all_blocks()?;
         if blocks.is_empty() {
-            let _ = self.client.full_block_report(0, &[])?;
+            let response = self.client.full_block_report(0, &[])?;
+            let cmds = ProtoUtils::worker_cmd_from_pb(response.cmds);
+            HeartbeatTask::delete_block_task(
+                self.executor.clone(),
+                self.store.clone(),
+                cmds,
+                self.report_blocks.clone(),
+            );
             return Ok(0);
         }
 
         let mut off = 0;
         while off < blocks.len() {
             let end = (off + self.block_report_limit).min(blocks.len());
-            let _ = self
+            let response = self
                 .client
                 .full_block_report(blocks.len(), &blocks[off..end])?;
+            let cmds = ProtoUtils::worker_cmd_from_pb(response.cmds);
+            HeartbeatTask::delete_block_task(
+                self.executor.clone(),
+                self.store.clone(),
+                cmds,
+                self.report_blocks.clone(),
+            );
             off = end;
         }
 

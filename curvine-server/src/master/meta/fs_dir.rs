@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::DeleteResult;
+use crate::master::fs::{BlockInodeState, DeleteResult};
 use crate::master::journal::{JournalEntry, JournalWriter};
 use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
@@ -625,22 +625,16 @@ impl FsDir {
         Ok(status)
     }
 
-    // Determine whether the current block has been deleted.
-    //Judge whether the block's inode exists. Block will only be deleted if the inode is deleted. All this judgment is not problematic.
-    pub fn block_exists(&self, block_id: i64) -> FsResult<bool> {
+    pub(crate) fn block_inode_state(&self, block_id: i64) -> FsResult<BlockInodeState> {
         let file_id = InodeId::get_id(block_id);
         let inode = self.store.get_inode(file_id, None)?;
         match inode {
-            None => Ok(false),
+            None => Ok(BlockInodeState::Missing),
             Some(v) => {
                 if v.is_file() {
-                    Ok(true)
+                    Ok(BlockInodeState::File)
                 } else {
-                    err_box!(
-                        "block_id {} resolves to inode {:?} which is not a file",
-                        block_id,
-                        v
-                    )
+                    Ok(BlockInodeState::NotFile)
                 }
             }
         }

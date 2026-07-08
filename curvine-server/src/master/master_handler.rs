@@ -24,11 +24,11 @@ use curvine_common::fs::Path;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
 use curvine_common::state::{
-    CreateFileOpts, FileBlocks, FileStatus, FreeResult, HeartbeatStatus, OpenFlags, RenameFlags,
+    CreateFileOpts, DeleteBlockCmd, FileBlocks, FileStatus, FreeResult, HeartbeatStatus, OpenFlags,
+    RenameFlags, WorkerCommand,
 };
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
-use log::error;
 use orpc::err_box;
 use orpc::handler::{FrameBuf, MessageHandler};
 use orpc::io::net::ConnState;
@@ -460,23 +460,20 @@ impl MasterHandler {
     pub fn block_report(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: BlockReportListRequest = ctx.parse_header()?;
         let list = ProtoUtils::block_report_list_from_pb(header);
-        let worker_id = list.worker_id;
-        let stale_block_ids = self.fs.block_report(list)?;
-        let stale_block_count = stale_block_ids.len();
-        if stale_block_count > 0 {
-            if let Some(replication_handler) = &self.replication_handler {
-                if let Err(e) =
-                    replication_handler.report_under_replicated_blocks(worker_id, stale_block_ids)
-                {
-                    error!(
-                        "Errors on reporting under-replicated {} blocks from full block report reconciliation. err: {:?}",
-                        stale_block_count, e
-                    );
-                }
-            }
-        }
+        let result = self
+            .fs
+            .block_report(list, self.replication_handler.clone())?;
 
-        let rep_header = BlockReportListResponse::default();
+        let cmds = if result.delete_blocks.is_empty() {
+            Vec::new()
+        } else {
+            vec![WorkerCommand::DeleteBlock(DeleteBlockCmd {
+                blocks: result.delete_blocks,
+            })]
+        };
+        let rep_header = BlockReportListResponse {
+            cmds: ProtoUtils::worker_cmd_to_pb(cmds),
+        };
         ctx.response_buf(rep_header, &mut self.buf)
     }
 

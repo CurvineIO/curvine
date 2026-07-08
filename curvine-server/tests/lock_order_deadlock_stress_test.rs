@@ -108,7 +108,7 @@ fn stress_add_block_vs_block_report_no_hang() {
                 )],
             };
 
-            let res = fs_b.block_report(report);
+            let res = fs_b.block_report(report, None);
             if res.is_ok() {
                 ok += 1;
             } else {
@@ -187,6 +187,6 @@ fn sanity_single_thread_paths_progress() {
                 0,
             )],
         };
-        let _ = fs.block_report(report);
+        let _ = fs.block_report(report, None);
     }
 }
