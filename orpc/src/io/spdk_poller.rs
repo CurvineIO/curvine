@@ -640,6 +640,13 @@ unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
     let ctx = Box::from_raw(cb_arg as *mut CallbackCtx);
 
     let qs = &mut *(ctx.qpair_state as *mut QpairState);
+
+    // Underflow guard only (runs after Box::from_raw + deref, not a UAF guard).
+    // TODO: add orphan lifecycle for late-callback safety.
+    if qs.pending.is_empty() {
+        return;
+    }
+
     let idx = ctx.pending_idx;
     let last = qs.pending.len() - 1;
     if idx != last {
@@ -650,8 +657,10 @@ unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
         qs.pending.pop();
     }
 
-    ctx.bdev_inflight.fetch_sub(1, Ordering::Release);
-    ctx.completion.complete(status);
+    // Guard against double-decrement on repeated complete()
+    if ctx.completion.complete(status) {
+        ctx.bdev_inflight.fetch_sub(1, Ordering::Release);
+    }
 }
 
 impl Drop for SpdkPoller {
@@ -755,5 +764,69 @@ mod test {
                 unsafe { drop(Box::from_raw(cb_ptr as *mut CallbackCtx)) };
             }
         }
+    }
+
+    #[test]
+    fn poller_callback_empty_pending_returns_early() {
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let completion = IoCompletion::new();
+        let qs = Box::new(QpairState {
+            dead: Arc::new(AtomicBool::new(false)),
+            pending: Vec::new(),
+        });
+        let ctx = Box::into_raw(Box::new(CallbackCtx {
+            completion: completion.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight.clone(),
+            qpair_state: &*qs as *const QpairState as *mut QpairState,
+            pending_idx: 0,
+        }));
+
+        unsafe { poller_callback(ctx as *mut c_void, 0) };
+
+        assert!(qs.pending.is_empty());
+        assert_eq!(inflight.load(Ordering::Acquire), 1);
+        assert_eq!(completion.wait(1), -libc::ETIMEDOUT);
+    }
+
+    #[test]
+    fn complete_is_idempotent_first_call_wins() {
+        let completion = IoCompletion::new();
+        assert!(completion.complete(42));
+        assert_eq!(completion.wait(0), 42);
+
+        assert!(!completion.complete(99));
+        assert_eq!(completion.wait(0), 42);
+    }
+
+    #[test]
+    fn poller_callback_fetch_sub_guard_runs_once() {
+        let completion = IoCompletion::new();
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let mut qs = Box::new(QpairState {
+            dead: Arc::new(AtomicBool::new(false)),
+            pending: Vec::new(),
+        });
+
+        // Simulate force_complete_qpair signaling first.
+        assert!(completion.complete(42));
+        inflight.fetch_sub(1, Ordering::Release);
+        assert_eq!(inflight.load(Ordering::Acquire), 0);
+
+        // Now poller_callback fires on the same ctx.
+        let ctx = Box::into_raw(Box::new(CallbackCtx {
+            completion: completion.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight.clone(),
+            qpair_state: &mut *qs as *mut QpairState,
+            pending_idx: 0,
+        }));
+        qs.pending.push(ctx);
+
+        // complete() returns false -> fetch_sub skipped.
+        unsafe { poller_callback(ctx as *mut c_void, 99) };
+
+        assert_eq!(completion.wait(0), 42, "first signal wins");
+        assert_eq!(inflight.load(Ordering::Acquire), 0, "no double-decrement");
     }
 }
