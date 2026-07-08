@@ -17,7 +17,8 @@ use curvine_common::error::FsError;
 use curvine_common::fs::CurvineURI;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
-    CreateFileRequest, DeleteRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
+    CreateFileRequest, DeleteRequest, GetMasterInfoRequest, MkdirOptsProto, MkdirRequest,
+    RenameRequest,
 };
 use curvine_common::raft::storage::{AppStorage, ApplyMsg};
 use curvine_common::state::MountOptions;
@@ -32,8 +33,9 @@ use curvine_server::master::replication::master_replication_manager::MasterRepli
 use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
 use orpc::common::LocalTime;
 use orpc::common::Utils;
+use orpc::handler::MessageHandler;
 use orpc::message::Builder;
-use orpc::runtime::{AsyncRuntime, RpcRuntime};
+use orpc::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
 use orpc::CommonResult;
 use raft::eraftpb::Entry;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -147,11 +149,13 @@ fn file_counts(fs: &MasterFilesystem) -> (i64, i64) {
 fn new_handler() -> MasterHandler {
     Master::init_test_metrics();
 
+    let test_id = Utils::rand_str(8);
     let mut conf = ClusterConf::format();
     conf.journal.enable = false;
 
-    conf.master.meta_dir = Utils::test_sub_dir("master-fs-test/meta-retry");
-    conf.journal.journal_dir = Utils::test_sub_dir("master-fs-test/journal-retry");
+    conf.master.meta_dir = Utils::test_sub_dir(format!("master-fs-test/meta-retry-{test_id}"));
+    conf.journal.journal_dir =
+        Utils::test_sub_dir(format!("master-fs-test/journal-retry-{test_id}"));
 
     let journal_system = JournalSystem::from_conf(&conf).unwrap();
     let fs = MasterFilesystem::with_js(&conf, &journal_system);
@@ -177,9 +181,60 @@ fn new_handler() -> MasterHandler {
         None,
         mount_manager,
         JobHandler::new(job_manager),
+        Arc::new(GroupExecutor::new("test-master-heartbeat-rpc", 1, 8)),
+        Arc::new(GroupExecutor::new("test-master-block-report-rpc", 1, 8)),
+        Arc::new(GroupExecutor::new("test-master-control-rpc", 1, 8)),
+        Arc::new(GroupExecutor::new("test-master-list-rpc", 1, 8)),
+        Arc::new(GroupExecutor::new(
+            "test-master-get-block-locations-rpc",
+            1,
+            8,
+        )),
         replication_manager,
         Master::get_metrics().expect("test master metrics should initialize"),
     )
+}
+
+#[test]
+fn worker_reports_and_metadata_reads_do_not_use_master_sync_pool() {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler();
+
+    for code in [
+        RpcCode::SubmitJob,
+        RpcCode::GetJobStatus,
+        RpcCode::CancelJob,
+        RpcCode::ReportTask,
+        RpcCode::GetBlockLocations,
+        RpcCode::GetMasterInfo,
+        RpcCode::ListStatus,
+        RpcCode::ListOptions,
+        RpcCode::WorkerHeartbeat,
+        RpcCode::WorkerBlockReport,
+    ] {
+        let msg = Builder::new_rpc(code).build();
+        assert!(!handler.is_sync(&msg), "{code:?} must use an async lane");
+    }
+
+    let mkdir = Builder::new_rpc(RpcCode::Mkdir).build();
+    assert!(handler.is_sync(&mkdir));
+}
+
+#[test]
+fn async_rpc_to_standby_returns_rpc_error_response() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let mut handler = new_handler();
+    let msg = Builder::new_rpc(RpcCode::GetMasterInfo)
+        .proto_header(GetMasterInfoRequest::default())
+        .build();
+
+    let rt = AsyncRuntime::single();
+    let response = rt.block_on(handler.async_handle(msg))?;
+
+    assert!(!response.is_success());
+    let err = response.check_error_ext::<FsError>().unwrap_err();
+    assert!(matches!(err, FsError::NotLeaderMaster(_)));
+    Ok(())
 }
 
 #[test]
