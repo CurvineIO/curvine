@@ -811,6 +811,7 @@ mod test {
 
     #[test]
     fn pre_push_entry_removed_by_callback_skips_cleanup() {
+        // Pre-push: entry added before SPDK submit call.
         let inflight = Arc::new(AtomicUsize::new(1));
         let completion = IoCompletion::new();
 
@@ -832,9 +833,11 @@ mod test {
         unsafe { (*qs_ptr).pending.push(cb_ctx_ptr) };
         assert_eq!(unsafe { (*qs_ptr).pending.len() }, 1);
 
+        // Sync callback: poller_callback removes entry from pending.
         unsafe { poller_callback(cb_ctx_ptr as *mut c_void, -libc::EIO) };
         assert!(unsafe { (*qs_ptr).pending.is_empty() });
 
+        // Post-check: already removed, position() returns None (skips cleanup).
         let pos = unsafe { (*qs_ptr).pending.iter().position(|&p| p == cb_ctx_ptr) };
         assert!(pos.is_none());
     }
@@ -887,6 +890,7 @@ mod test {
         inflight.fetch_sub(1, Ordering::Release);
         assert_eq!(inflight.load(Ordering::Acquire), 0);
 
+        // Now poller_callback fires on the same ctx.
         let ctx = Box::into_raw(Box::new(CallbackCtx {
             completion: completion.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
