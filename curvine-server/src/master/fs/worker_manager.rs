@@ -135,12 +135,12 @@ impl WorkerManager {
 
     pub fn add_blacklist_worker(&mut self, id: u32) -> Option<WorkerInfo> {
         match self.worker_map.workers.get_mut(&id) {
-            Some(v) => {
+            Some(v) if v.status != WorkerStatus::Blacklist => {
                 v.status = WorkerStatus::Blacklist;
                 Some(v.clone())
             }
 
-            None => None,
+            _ => None,
         }
     }
 
