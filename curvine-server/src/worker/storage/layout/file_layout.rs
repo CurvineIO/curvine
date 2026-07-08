@@ -18,7 +18,7 @@ use crate::worker::storage::VfsDir;
 use curvine_common::state::ExtendedBlock;
 use orpc::common::FileUtils;
 use orpc::CommonResult;
-use std::fs::{self, File};
+use std::fs::File;
 
 #[derive(Clone, Copy)]
 pub struct FileLayout;
@@ -60,7 +60,7 @@ impl BlockLayout for FileLayout {
     }
 
     fn deallocate(&self, meta: &BlockMeta) -> CommonResult<()> {
-        fs::remove_file(meta.get_block_path()?)?;
+        FileUtils::delete_path(meta.get_block_path()?, false)?;
         Ok(())
     }
 }

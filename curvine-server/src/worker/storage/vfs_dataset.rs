@@ -202,10 +202,9 @@ impl VfsDataset {
         };
 
         let layout = self.layouts.get(meta.storage_type());
-        if meta.storage_type() == StorageType::SpdkDisk {
-            self.find_dir(meta.dir_id())?;
+        if self.find_dir(meta.dir_id()).is_ok() {
+            layout.release(&meta)?;
         }
-        layout.release(&meta)?;
 
         Ok((meta, layout.clone()))
     }
