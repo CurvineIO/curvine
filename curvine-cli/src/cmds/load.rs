@@ -23,9 +23,6 @@ use orpc::CommonResult;
 pub struct LoadCommand {
     path: String,
 
-    #[arg(long, default_value = "${CURVINE_CONF_FILE}")]
-    conf: String,
-
     /// Watch load job status after submission
     #[arg(long, short = 'w')]
     watch: bool,
@@ -46,12 +43,8 @@ impl LoadCommand {
         println!("{}", rep);
 
         if self.watch {
-            let status_command = LoadStatusCommand::new(
-                rep.job_id.clone(),
-                false,
-                "1s".to_string(),
-                self.conf.clone(),
-            );
+            let status_command =
+                LoadStatusCommand::new(rep.job_id.clone(), false, "1s".to_string());
 
             status_command.execute(client).await?;
         }
