@@ -832,16 +832,6 @@ mod test {
     }
 
     #[test]
-    fn complete_second_call_does_not_decrement_inflight() {
-        let completion = IoCompletion::new();
-        assert!(completion.complete(42));
-        assert_eq!(completion.wait(0), 42);
-
-        assert!(!completion.complete(99));
-        assert_eq!(completion.wait(0), 42);
-    }
-
-    #[test]
     fn complete_is_idempotent_first_call_wins() {
         let completion = IoCompletion::new();
         assert!(completion.complete(42));
