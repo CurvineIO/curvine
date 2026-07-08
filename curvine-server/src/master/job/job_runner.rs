@@ -56,6 +56,7 @@ struct PlannedLoadJob {
 
 impl LoadJobRunner {
     const RUN_ID_SEQ_MOD: u64 = 1_000_000;
+    const SOURCE_NOT_FOUND_PREFIX: &'static str = "source file not found";
 
     pub fn new(
         jobs: JobStore,
@@ -154,6 +155,34 @@ impl LoadJobRunner {
         // Target looks valid locally; confirm against UFS source before skipping.
         let source_status = mnt.ufs.get_status(source_path).await?;
         Ok(cv_status.cv_valid(Some(&source_status)))
+    }
+
+    async fn check_source_root_exists(&self, source_path: &Path, mnt: &MountValue) -> FsResult<()> {
+        if source_path.is_cv() {
+            self.master_fs.file_status(source_path.path())?;
+        } else {
+            mnt.ufs.get_status(source_path).await?;
+        }
+        Ok(())
+    }
+
+    fn fail_source_not_found(
+        &self,
+        queued: &QueuedLoadJob,
+        source_path: &Path,
+        err: impl std::fmt::Display,
+    ) -> bool {
+        self.jobs.update_state_if_run(
+            &queued.job_id,
+            queued.run_id,
+            JobTaskState::Failed,
+            format!(
+                "{}: {} ({})",
+                Self::SOURCE_NOT_FOUND_PREFIX,
+                source_path.full_path(),
+                err
+            ),
+        )
     }
 
     pub(crate) fn enqueue_load_job(
@@ -351,6 +380,26 @@ impl LoadJobRunner {
                 return Err(err);
             }
         };
+
+        match self
+            .check_source_root_exists(&source_path, &mnt_value)
+            .await
+        {
+            Ok(()) => {}
+            Err(FsError::FileNotFound(err)) => {
+                self.fail_source_not_found(&queued, &source_path, err);
+                return Ok(());
+            }
+            Err(err) => {
+                self.jobs.update_state_if_run(
+                    &queued.job_id,
+                    queued.run_id,
+                    JobTaskState::Failed,
+                    format!("check source file failed: {}", err),
+                );
+                return Err(err);
+            }
+        }
 
         let already_loaded = match self
             .check_already_loaded(&mnt_value, &source_path, &target_path)

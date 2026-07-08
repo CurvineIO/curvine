@@ -107,8 +107,9 @@ fn submit_load_job_returns_before_ufs_planning() -> CommonResult<()> {
             let status = job_manager.get_job_status(&result.job_id)?;
             if status.state == JobTaskState::Failed {
                 assert!(
-                    !status.progress.message.is_empty(),
-                    "failed job should keep a diagnostic message"
+                    status.progress.message.contains("source file not found"),
+                    "failed job should keep a source-not-found diagnostic: {}",
+                    status.progress.message
                 );
                 assert!(
                     status.progress.update_time > 0,
