@@ -18,6 +18,9 @@ pub use self::worker_manager::WorkerManager;
 mod heartbeat_checker;
 pub use self::heartbeat_checker::HeartbeatChecker;
 
+mod fs_dir_watchdog;
+pub use self::fs_dir_watchdog::FsDirWatchdog;
+
 mod master_actor;
 pub use self::master_actor::MasterActor;
 
