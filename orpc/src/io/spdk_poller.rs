@@ -526,6 +526,9 @@ impl SpdkPoller {
             );
         }
 
+        // Pre-push: poller_callback needs the entry in pending if SPDK completes synchronously during the submit call.
+        unsafe { (*qs_ptr).pending.push(cb_ctx_ptr) };
+
         let rc = match &req.op {
             IoOp::Read {
                 ns,
@@ -568,15 +571,22 @@ impl SpdkPoller {
         };
 
         if rc != 0 {
-            // Submission failed - reclaim allocation and complete with error
-            unsafe { drop(Box::from_raw(cb_ctx_ptr)) };
-            req.bdev_inflight.fetch_sub(1, Ordering::Release);
-            req.completion.complete(rc);
+            // If callback fired during submit and removed this entry from
+            // pending via swap_remove, position() returns None - skip.
+            unsafe {
+                if let Some(pos) = (*qs_ptr).pending.iter().position(|&p| p == cb_ctx_ptr) {
+                    (*qs_ptr).pending.swap_remove(pos);
+                    if pos < (*qs_ptr).pending.len() {
+                        (*(&mut (*qs_ptr).pending)[pos]).pending_idx = pos;
+                    }
+                    drop(Box::from_raw(cb_ctx_ptr));
+                    if req.completion.complete(rc) {
+                        req.bdev_inflight.fetch_sub(1, Ordering::Release);
+                    }
+                }
+            }
             return;
         }
-
-        qs.pending.push(cb_ctx_ptr);
-
         // Track active qpair
         if !active_qpairs.contains(&qpair) {
             active_qpairs.push(qpair);
@@ -764,6 +774,38 @@ mod test {
                 unsafe { drop(Box::from_raw(cb_ptr as *mut CallbackCtx)) };
             }
         }
+    }
+
+    #[test]
+    fn pre_push_entry_removed_by_callback_skips_cleanup() {
+        // Pre-push: entry added before SPDK submit call.
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let completion = IoCompletion::new();
+
+        let mut qs = Box::new(QpairState {
+            dead: Arc::new(AtomicBool::new(false)),
+            pending: Vec::new(),
+        });
+        let qs_ptr = &*qs as *const QpairState as *mut QpairState;
+
+        let cb_ctx = Box::new(CallbackCtx {
+            completion: completion.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight.clone(),
+            qpair_state: qs_ptr,
+            pending_idx: 0,
+        });
+        let cb_ctx_ptr = Box::into_raw(cb_ctx);
+        unsafe { (*qs_ptr).pending.push(cb_ctx_ptr) };
+        assert_eq!(unsafe { (*qs_ptr).pending.len() }, 1);
+
+        // Sync callback: poller_callback removes entry from pending.
+        unsafe { poller_callback(cb_ctx_ptr as *mut c_void, -libc::EIO) };
+        assert!(unsafe { (*qs_ptr).pending.is_empty() });
+
+        // Post-check: already removed, position() returns None (skips cleanup).
+        let pos = unsafe { (*qs_ptr).pending.iter().position(|&p| p == cb_ctx_ptr) };
+        assert!(pos.is_none());
     }
 
     #[test]
