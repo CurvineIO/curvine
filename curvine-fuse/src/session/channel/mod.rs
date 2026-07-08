@@ -14,7 +14,7 @@
 
 use crate::fs::FileSystem;
 use crate::session::FuseMnt;
-use crate::{FuseResult, FuseUtils};
+use crate::{FuseResult, FuseUtils, FUSE_BUFFER_HEADER_SIZE};
 use curvine_common::conf::FuseConf;
 use orpc::runtime::Runtime;
 use orpc::sync::channel::AsyncChannel;
@@ -34,7 +34,9 @@ pub struct FuseChannel<T> {
 
 impl<T: FileSystem> FuseChannel<T> {
     pub fn new(fs: Arc<T>, rt: Arc<Runtime>, mnt: &FuseMnt, conf: &FuseConf) -> FuseResult<Self> {
-        let buf_size = FuseUtils::get_fuse_buf_size();
+        let max_readahead = conf.max_readahead_kb.unwrap_or(0).saturating_mul(1024);
+        let buf_size =
+            FuseUtils::get_fuse_buf_size().max(max_readahead as usize + FUSE_BUFFER_HEADER_SIZE);
 
         let mut receivers = Vec::with_capacity(conf.mnt_per_task);
         let mut senders = Vec::with_capacity(conf.mnt_per_task);
@@ -43,8 +45,15 @@ impl<T: FileSystem> FuseChannel<T> {
             let (tx, rx) = AsyncChannel::new(conf.fuse_channel_size).split();
             let fd = mnt.create_async_task_fd(conf.clone_fd)?;
 
-            let sender =
-                FuseSender::new(fs.clone(), rt.clone(), fd.clone(), rx, buf_size, conf.debug)?;
+            let sender = FuseSender::new(
+                fs.clone(),
+                rt.clone(),
+                fd.clone(),
+                rx,
+                buf_size,
+                conf.debug,
+                conf.enable_splice,
+            )?;
 
             let receiver = FuseReceiver::new(
                 fs.clone(),
@@ -56,6 +65,7 @@ impl<T: FileSystem> FuseChannel<T> {
                 conf.audit_logging_enabled,
                 conf.metrics_enabled,
                 pending_requests.clone(),
+                conf.enable_splice,
             )?;
 
             senders.push(sender);
