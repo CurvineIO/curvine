@@ -23,6 +23,7 @@ use orpc::common::TimeSpent;
 use orpc::runtime::{GroupExecutor, Runtime};
 use orpc::sync::StateCtl;
 use orpc::CommonResult;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 /// Worker block management role.
@@ -147,6 +148,7 @@ impl BlockActor {
             client,
             store,
             report_blocks,
+            report_in_flight: Arc::new(AtomicBool::new(false)),
         };
 
         scheduler.start(task)?;
