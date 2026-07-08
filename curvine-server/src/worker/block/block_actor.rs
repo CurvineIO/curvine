@@ -15,15 +15,19 @@
 use crate::worker::block::{BlockStore, HeartbeatTask, MasterClient};
 use curvine_client::file::FsContext;
 use curvine_common::conf::ClusterConf;
+use curvine_common::error::FsError;
 use curvine_common::executor::ScheduledExecutor;
 use curvine_common::state::{BlockReportInfo, HeartbeatStatus, WorkerAddress};
 use curvine_common::utils::ProtoUtils;
+use curvine_common::FsResult;
 use dashmap::DashMap;
-use log::info;
+use log::{error, info};
 use orpc::common::TimeSpent;
-use orpc::runtime::{GroupExecutor, Runtime};
+use orpc::runtime::{GroupExecutor, LoopTask, Runtime};
+use orpc::server::ServerState;
 use orpc::sync::StateCtl;
 use orpc::CommonResult;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Worker block management role.
@@ -86,14 +90,6 @@ impl BlockActor {
         self.register()?;
         info!("worker register success");
 
-        let spend = TimeSpent::new();
-        let total_len = self.full_block_report()?;
-        info!(
-            "worker block report success, total blocks {}, used {} ms",
-            total_len,
-            spend.used_ms()
-        );
-
         Self::start_heartbeat(
             self.executor.clone(),
             self.worker_ctl.clone(),
@@ -102,6 +98,7 @@ impl BlockActor {
             self.report_blocks.clone(),
             self.heartbeat_interval_ms,
         )?;
+        self.start_full_block_report_retry()?;
         Ok(())
     }
 
@@ -146,6 +143,15 @@ impl BlockActor {
         Ok(blocks.len())
     }
 
+    fn start_full_block_report_retry(&self) -> CommonResult<()> {
+        let scheduler =
+            ScheduledExecutor::new("worker-full-block-report", self.heartbeat_interval_ms);
+        scheduler.start(FullBlockReportTask {
+            actor: self.clone(),
+            complete: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
     pub fn start_heartbeat(
         executor: Arc<GroupExecutor>,
         worker_ctl: StateCtl,
@@ -162,9 +168,42 @@ impl BlockActor {
             client,
             store,
             report_blocks,
+            report_in_flight: Arc::new(AtomicBool::new(false)),
         };
 
         scheduler.start(task)?;
         Ok(())
+    }
+}
+
+struct FullBlockReportTask {
+    actor: BlockActor,
+    complete: Arc<AtomicBool>,
+}
+
+impl LoopTask for FullBlockReportTask {
+    type Error = FsError;
+
+    fn run(&self) -> FsResult<()> {
+        let spend = TimeSpent::new();
+        match self.actor.full_block_report() {
+            Ok(total_len) => {
+                info!(
+                    "worker block report success, total blocks {}, used {} ms",
+                    total_len,
+                    spend.used_ms()
+                );
+                self.complete.store(true, Ordering::Release);
+            }
+            Err(e) => {
+                error!("worker full block report failed: {}; will retry", e);
+            }
+        }
+        Ok(())
+    }
+
+    fn terminate(&self) -> bool {
+        self.complete.load(Ordering::Acquire)
+            || self.actor.worker_ctl.state::<ServerState>() == ServerState::Stop
     }
 }
