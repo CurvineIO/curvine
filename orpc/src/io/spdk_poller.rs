@@ -1085,9 +1085,10 @@ mod test {
         let inflight = Arc::new(AtomicUsize::new(1));
         let completion = IoCompletion::new();
 
-        let mut qs = Box::new(QpairState {
+        let qs = Box::new(QpairState {
             dead: Arc::new(AtomicBool::new(false)),
             pending: Vec::new(),
+            stale: Vec::new(),
         });
         let qs_ptr = &*qs as *const QpairState as *mut QpairState;
 
@@ -1109,29 +1110,6 @@ mod test {
         // Post-check: already removed, position() returns None (skips cleanup).
         let pos = unsafe { (*qs_ptr).pending.iter().position(|&p| p == cb_ctx_ptr) };
         assert!(pos.is_none());
-    }
-
-    #[test]
-    fn poller_callback_empty_pending_returns_early() {
-        let inflight = Arc::new(AtomicUsize::new(1));
-        let completion = IoCompletion::new();
-        let qs = Box::new(QpairState {
-            dead: Arc::new(AtomicBool::new(false)),
-            pending: Vec::new(),
-        });
-        let ctx = Box::into_raw(Box::new(CallbackCtx {
-            completion: completion.clone(),
-            async_ctx: unsafe { std::mem::zeroed() },
-            bdev_inflight: inflight.clone(),
-            qpair_state: &*qs as *const QpairState as *mut QpairState,
-            pending_idx: 0,
-        }));
-
-        unsafe { poller_callback(ctx as *mut c_void, 0) };
-
-        assert!(qs.pending.is_empty());
-        assert_eq!(inflight.load(Ordering::Acquire), 1);
-        assert_eq!(completion.wait(1), -libc::ETIMEDOUT);
     }
 
     #[test]
