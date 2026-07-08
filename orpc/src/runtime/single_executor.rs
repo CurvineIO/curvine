@@ -15,7 +15,7 @@
 use crate::{err_box, try_err, try_log, CommonResult};
 use log::{error, warn};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::thread::JoinHandle;
@@ -57,6 +57,17 @@ impl SingleExecutor {
     {
         try_err!(self.sender.send(Box::new(task)));
         Ok(())
+    }
+
+    pub fn try_spawn<F>(&self, task: F) -> CommonResult<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        match self.sender.try_send(Box::new(task)) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => err_box!("executor {} queue is full", self.name),
+            Err(TrySendError::Disconnected(_)) => err_box!("executor {} has stopped", self.name),
+        }
     }
 
     pub fn spawn_blocking<F, R>(&self, task: F) -> CommonResult<R>

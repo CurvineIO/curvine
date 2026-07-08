@@ -63,6 +63,13 @@ impl GroupExecutor {
         self.get_robin_thread().spawn(task)
     }
 
+    pub fn try_spawn<F>(&self, task: F) -> CommonResult<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.get_robin_thread().try_spawn(task)
+    }
+
     pub fn spawn_blocking<F, R>(&self, task: F) -> CommonResult<R>
     where
         F: FnOnce() -> R + Send + 'static,
@@ -76,6 +83,13 @@ impl GroupExecutor {
         F: FnOnce() + Send + 'static,
     {
         self.get_fix_thread(id).spawn(task)
+    }
+
+    pub fn fixed_try_spawn<F>(&self, id: i64, task: F) -> CommonResult<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.get_fix_thread(id).try_spawn(task)
     }
 
     pub fn fixed_spawn_blocking<F, R>(&self, id: i64, task: F) -> CommonResult<R>

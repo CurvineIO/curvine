@@ -49,6 +49,33 @@ fn test_single_thread_executor_spawn_blocking() -> CommonResult<()> {
 }
 
 #[test]
+fn single_executor_try_spawn_returns_error_when_queue_is_full() -> CommonResult<()> {
+    let executor = SingleExecutor::new("try-spawn-full", 1);
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+
+    executor.spawn(move || {
+        started_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    })?;
+    started_rx.recv()?;
+
+    executor.try_spawn(|| {})?;
+    let err = executor.try_spawn(|| {}).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("executor try-spawn-full queue is full"),
+        "unexpected error: {}",
+        err
+    );
+
+    release_tx.send(())?;
+    drop(executor);
+
+    Ok(())
+}
+
+#[test]
 fn test_group_executor_fixed_thread_allocation_for_thread_safety() {
     let executor = Arc::new(GroupExecutor::new("test", 2, 10));
 
