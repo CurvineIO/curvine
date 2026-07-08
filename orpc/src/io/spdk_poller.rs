@@ -716,7 +716,6 @@ mod test {
 
     #[test]
     fn force_complete_reclaims_callback_ctx() {
-        // Allocate CallbackCtx as submit_one does, one per simulated I/O.
         let completion_1 = IoCompletion::new();
         let inflight_1 = Arc::new(AtomicUsize::new(1));
         let completion_2 = IoCompletion::new();
@@ -724,7 +723,6 @@ mod test {
         let completion_3 = IoCompletion::new();
         let inflight_3 = Arc::new(AtomicUsize::new(1));
 
-        // Create QpairState for DEAD qpair.
         let dead_flag = Arc::new(AtomicBool::new(false));
         let mut qs_dead = Box::new(QpairState {
             dead: dead_flag.clone(),
@@ -732,7 +730,6 @@ mod test {
             stale: Vec::new(),
         });
 
-        // Allocate and push 2 CallbackCtx entries into DEAD's pending Vec.
         let ctx_1 = Box::into_raw(Box::new(CallbackCtx {
             completion: completion_1.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
@@ -751,7 +748,6 @@ mod test {
         }));
         qs_dead.pending.push(ctx_2);
 
-        // Create QpairState for LIVE qpair (control — should be untouched).
         let live_flag = Arc::new(AtomicBool::new(false));
         let mut qs_live = Box::new(QpairState {
             dead: live_flag,
@@ -768,45 +764,29 @@ mod test {
         }));
         qs_live.pending.push(ctx_3);
 
-        // Build dead_qpairs map.
         let mut dead_qpairs: HashMap<usize, Box<QpairState>> = HashMap::new();
         dead_qpairs.insert(DEAD, qs_dead);
         dead_qpairs.insert(LIVE, qs_live);
 
-        // Act.
         SpdkPoller::force_complete_qpair(DEAD, &mut dead_qpairs);
 
-        // Assert: DEAD entries completed with -EIO.
         assert_eq!(completion_1.wait(0), -libc::EIO);
         assert_eq!(completion_2.wait(0), -libc::EIO);
-
-        // Assert: LIVE entry NOT completed (timeout with 1ms).
         assert_eq!(completion_3.wait(1000), -libc::ETIMEDOUT);
-
-        // Assert: DEAD entries' bdev_inflight decremented.
         assert_eq!(inflight_1.load(Ordering::Acquire), 0);
         assert_eq!(inflight_2.load(Ordering::Acquire), 0);
-
-        // Assert: LIVE entry's bdev_inflight unchanged.
         assert_eq!(inflight_3.load(Ordering::Acquire), 1);
-
-        // Assert: DEAD stays in dead_qpairs with entries in stale.
         assert!(dead_qpairs.contains_key(&DEAD));
         assert_eq!(dead_qpairs[&DEAD].stale.len(), 2);
         assert_eq!(dead_qpairs[&DEAD].pending.len(), 0);
         assert!(dead_flag.load(Ordering::Acquire));
 
-        // Reclaim stale entries (frees CallbackCtx, signals already done).
         if let Some(qs) = dead_qpairs.get_mut(&DEAD) {
             qs.reclaim_stale();
         }
         dead_qpairs.remove(&DEAD);
 
-        // Assert: LIVE still present and untouched.
         assert!(dead_qpairs.contains_key(&LIVE));
-
-        // Clean up LIVE entry (force_complete did not touch it).
-        // The raw pointer in qs_live.pending must be reclaimed.
         if let Some(qs) = dead_qpairs.get_mut(&LIVE) {
             for cb_ptr in qs.pending.drain(..) {
                 unsafe { drop(Box::from_raw(cb_ptr as *mut CallbackCtx)) };
@@ -814,9 +794,61 @@ mod test {
         }
     }
 
+    #[test]
+    fn pre_push_entry_removed_by_callback_skips_cleanup() {
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let completion = IoCompletion::new();
+
+        let qs = Box::new(QpairState {
+            dead: Arc::new(AtomicBool::new(false)),
+            pending: Vec::new(),
+            stale: Vec::new(),
+        });
+        let qs_ptr = &*qs as *const QpairState as *mut QpairState;
+
+        let cb_ctx = Box::new(CallbackCtx {
+            completion: completion.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight.clone(),
+            qpair_state: qs_ptr,
+            pending_idx: 0,
+        });
+        let cb_ctx_ptr = Box::into_raw(cb_ctx);
+        unsafe { (*qs_ptr).pending.push(cb_ctx_ptr) };
+        assert_eq!(unsafe { (*qs_ptr).pending.len() }, 1);
+
+        unsafe { poller_callback(cb_ctx_ptr as *mut c_void, -libc::EIO) };
+        assert!(unsafe { (*qs_ptr).pending.is_empty() });
+
+        let pos = unsafe { (*qs_ptr).pending.iter().position(|&p| p == cb_ctx_ptr) };
+        assert!(pos.is_none());
+    }
 
     #[test]
-    fn complete_second_call_does_not_decrement_inflight() {
+    fn poller_callback_empty_pending_skips_swap_remove_only() {
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let completion = IoCompletion::new();
+        let qs = Box::new(QpairState {
+            dead: Arc::new(AtomicBool::new(false)),
+            pending: Vec::new(),
+            stale: Vec::new(),
+        });
+
+        let ctx = Box::into_raw(Box::new(CallbackCtx {
+            completion: completion.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight.clone(),
+            qpair_state: &*qs as *const QpairState as *mut QpairState,
+            pending_idx: 0,
+        }));
+        unsafe { poller_callback(ctx as *mut c_void, 0) };
+
+        assert_eq!(completion.wait(0), 0, "completion signaled");
+        assert_eq!(inflight.load(Ordering::Acquire), 0, "inflight decremented");
+    }
+
+    #[test]
+    fn complete_is_idempotent_first_call_wins() {
         let completion = IoCompletion::new();
         assert!(completion.complete(42));
         assert_eq!(completion.wait(0), 42);
@@ -835,12 +867,10 @@ mod test {
             stale: Vec::new(),
         });
 
-        // Simulate force_complete_qpair signaling first.
         assert!(completion.complete(42));
         inflight.fetch_sub(1, Ordering::Release);
         assert_eq!(inflight.load(Ordering::Acquire), 0);
 
-        // Now poller_callback fires on the same ctx.
         let ctx = Box::into_raw(Box::new(CallbackCtx {
             completion: completion.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
@@ -850,7 +880,6 @@ mod test {
         }));
         qs.pending.push(ctx);
 
-        // complete() returns false -> fetch_sub skipped.
         unsafe { poller_callback(ctx as *mut c_void, 99) };
 
         assert_eq!(completion.wait(0), 42, "first signal wins");
@@ -858,28 +887,13 @@ mod test {
     }
 
     #[test]
-    fn poller_callback_empty_pending_skips_swap_remove_only() {
-        let inflight = Arc::new(AtomicUsize::new(1));
+    fn complete_second_call_does_not_decrement_inflight() {
         let completion = IoCompletion::new();
-        let qs = Box::new(QpairState {
-            dead: Arc::new(AtomicBool::new(false)),
-            pending: Vec::new(),
-            stale: Vec::new(),
-        });
+        assert!(completion.complete(42));
+        assert_eq!(completion.wait(0), 42);
 
-        // complete() returns true with empty pending: underflow guard skips swap_remove,
-        // but fetch_sub and free still run.
-        let ctx = Box::into_raw(Box::new(CallbackCtx {
-            completion: completion.clone(),
-            async_ctx: unsafe { std::mem::zeroed() },
-            bdev_inflight: inflight.clone(),
-            qpair_state: &*qs as *const QpairState as *mut QpairState,
-            pending_idx: 0,
-        }));
-        unsafe { poller_callback(ctx as *mut c_void, 0) };
-
-        assert_eq!(completion.wait(0), 0, "completion signaled");
-        assert_eq!(inflight.load(Ordering::Acquire), 0, "inflight decremented");
+        assert!(!completion.complete(99));
+        assert_eq!(completion.wait(0), 42);
     }
 
     #[test]
@@ -902,7 +916,6 @@ mod test {
         let cb_ctx_ptr = Box::into_raw(cb_ctx);
         qs.pending.push(cb_ctx_ptr);
 
-        // Simulate rc != 0 path: entry still in pending -> position() finds it.
         if let Some(pos) = qs.pending.iter().position(|&p| p == cb_ctx_ptr) {
             qs.pending.swap_remove(pos);
             if pos < qs.pending.len() {
@@ -938,15 +951,12 @@ mod test {
         let cb_ctx_ptr = Box::into_raw(cb_ctx);
         qs.pending.push(cb_ctx_ptr);
 
-        // Simulate callback firing during submit via the real callback.
         unsafe { poller_callback(cb_ctx_ptr as *mut c_void, 0) };
         assert!(qs.pending.is_empty());
 
-        // Simulate rc != 0 path: position() returns None -> skip.
         let found = qs.pending.iter().position(|&p| p == cb_ctx_ptr);
         assert!(found.is_none());
 
-        // Completion and inflight unchanged from callback.
         assert_eq!(completion.wait(0), 0);
         assert_eq!(inflight.load(Ordering::Acquire), 0);
     }
@@ -981,7 +991,6 @@ mod test {
         }));
         qs.pending.push(ctx_1);
 
-        // Simulate rc != 0 for ctx_0 (position 0 → swap with last = ctx_1).
         if let Some(pos) = qs.pending.iter().position(|&p| p == ctx_0) {
             qs.pending.swap_remove(pos);
             if pos < qs.pending.len() {
@@ -992,17 +1001,14 @@ mod test {
             completion_0.complete(-libc::EIO);
         }
 
-        // ctx_0 freed and cleaned up.
         assert_eq!(qs.pending.len(), 1);
         assert_eq!(completion_0.wait(0), -libc::EIO);
         assert_eq!(inflight_0.load(Ordering::Acquire), 0);
 
-        // ctx_1 still alive, reindexed to 0.
         assert_eq!(unsafe { (*qs.pending[0]).pending_idx }, 0);
         assert_eq!(completion_1.wait(1), -libc::ETIMEDOUT);
         assert_eq!(inflight_1.load(Ordering::Acquire), 1);
 
-        // Clean up ctx_1.
         unsafe { drop(Box::from_raw(ctx_1)) };
     }
 
@@ -1016,11 +1022,9 @@ mod test {
             stale: Vec::new(),
         });
 
-        // Simulate force_complete signaling first.
         assert!(completion.complete(-libc::EIO));
         assert_eq!(inflight.load(Ordering::Acquire), 0);
 
-        // Now simulate the late SPDK callback.
         let ctx = Box::into_raw(Box::new(CallbackCtx {
             completion: completion.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
@@ -1030,12 +1034,9 @@ mod test {
         }));
         unsafe { poller_callback(ctx as *mut c_void, 0) };
 
-        // Completion unchanged (still -EIO from force_complete).
         assert_eq!(completion.wait(0), -libc::EIO);
-        // Inflight unchanged (force_complete already decremented).
         assert_eq!(inflight.load(Ordering::Acquire), 0);
 
-        // Late path doesn't free — reclaim manually.
         unsafe { drop(Box::from_raw(ctx)) };
     }
 
@@ -1064,61 +1065,16 @@ mod test {
 
         SpdkPoller::force_complete_qpair(0xDEAD, &mut dead_qpairs);
 
-        // QpairState stays alive with entry in stale.
         assert!(dead_qpairs.contains_key(&0xDEAD));
         assert_eq!(dead_qpairs[&0xDEAD].stale.len(), 1);
         assert_eq!(dead_qpairs[&0xDEAD].pending.len(), 0);
         assert!(dead_flag.load(Ordering::Acquire));
 
-        // reclaim_stale frees the stale CallbackCtx.
         if let Some(qs) = dead_qpairs.get_mut(&0xDEAD) {
             qs.reclaim_stale();
         }
         assert_eq!(dead_qpairs[&0xDEAD].stale.len(), 0);
         assert_eq!(completion.wait(0), -libc::EIO);
         assert_eq!(inflight.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn pre_push_entry_removed_by_callback_skips_cleanup() {
-        // Pre-push: entry added before SPDK submit call.
-        let inflight = Arc::new(AtomicUsize::new(1));
-        let completion = IoCompletion::new();
-
-        let qs = Box::new(QpairState {
-            dead: Arc::new(AtomicBool::new(false)),
-            pending: Vec::new(),
-            stale: Vec::new(),
-        });
-        let qs_ptr = &*qs as *const QpairState as *mut QpairState;
-
-        let cb_ctx = Box::new(CallbackCtx {
-            completion: completion.clone(),
-            async_ctx: unsafe { std::mem::zeroed() },
-            bdev_inflight: inflight.clone(),
-            qpair_state: qs_ptr,
-            pending_idx: 0,
-        });
-        let cb_ctx_ptr = Box::into_raw(cb_ctx);
-        unsafe { (*qs_ptr).pending.push(cb_ctx_ptr) };
-        assert_eq!(unsafe { (*qs_ptr).pending.len() }, 1);
-
-        // Sync callback: poller_callback removes entry from pending.
-        unsafe { poller_callback(cb_ctx_ptr as *mut c_void, -libc::EIO) };
-        assert!(unsafe { (*qs_ptr).pending.is_empty() });
-
-        // Post-check: already removed, position() returns None (skips cleanup).
-        let pos = unsafe { (*qs_ptr).pending.iter().position(|&p| p == cb_ctx_ptr) };
-        assert!(pos.is_none());
-    }
-
-    #[test]
-    fn complete_is_idempotent_first_call_wins() {
-        let completion = IoCompletion::new();
-        assert!(completion.complete(42));
-        assert_eq!(completion.wait(0), 42);
-
-        assert!(!completion.complete(99));
-        assert_eq!(completion.wait(0), 42);
     }
 }
