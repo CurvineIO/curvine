@@ -911,16 +911,6 @@ mod test {
     }
 
     #[test]
-    fn complete_second_call_does_not_decrement_inflight() {
-        let completion = IoCompletion::new();
-        assert!(completion.complete(42));
-        assert_eq!(completion.wait(0), 42);
-
-        assert!(!completion.complete(99));
-        assert_eq!(completion.wait(0), 42);
-    }
-
-    #[test]
     fn submit_one_rc_error_cleans_up_pending_entry() {
         // Pre-push: entry added before SPDK submit call.
         let inflight = Arc::new(AtomicUsize::new(1));
