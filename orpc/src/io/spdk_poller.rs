@@ -779,11 +779,14 @@ mod test {
         // Assert: DEAD entries completed with -EIO.
         assert_eq!(completion_1.wait(0), -libc::EIO);
         assert_eq!(completion_2.wait(0), -libc::EIO);
+
         // Assert: LIVE entry NOT completed (timeout with 1ms).
         assert_eq!(completion_3.wait(1000), -libc::ETIMEDOUT);
+
         // Assert: DEAD entries' bdev_inflight decremented.
         assert_eq!(inflight_1.load(Ordering::Acquire), 0);
         assert_eq!(inflight_2.load(Ordering::Acquire), 0);
+
         // Assert: LIVE entry's bdev_inflight unchanged.
         assert_eq!(inflight_3.load(Ordering::Acquire), 1);
         // Assert: DEAD stays in dead_qpairs with entries in stale.
@@ -851,7 +854,6 @@ mod test {
             pending: Vec::new(),
             stale: Vec::new(),
         });
-
         let ctx = Box::into_raw(Box::new(CallbackCtx {
             completion: completion.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
@@ -859,6 +861,7 @@ mod test {
             qpair_state: &*qs as *const QpairState as *mut QpairState,
             pending_idx: 0,
         }));
+
         unsafe { poller_callback(ctx as *mut c_void, 0) };
 
         assert_eq!(completion.wait(0), 0, "completion signaled");
