@@ -461,7 +461,9 @@ impl MasterHandler {
         let header: BlockReportListRequest = ctx.parse_header()?;
         let list = ProtoUtils::block_report_list_from_pb(header);
         let worker_id = list.worker_id;
-        let stale_block_ids = self.fs.block_report(list)?;
+        let stale_block_ids = self
+            .fs
+            .block_report(list, self.replication_handler.clone())?;
         let stale_block_count = stale_block_ids.len();
         if stale_block_count > 0 {
             if let Some(replication_handler) = &self.replication_handler {
