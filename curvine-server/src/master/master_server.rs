@@ -175,6 +175,8 @@ impl Master {
 
         let rpc_conf = conf.master_server_conf();
         let rpc_server = RpcServer::with_rt(rt.clone(), rpc_conf, service.clone());
+        let shutdown_job_manager = job_manager.clone();
+        rpc_server.add_shutdown_hook(move || shutdown_job_manager.shutdown());
 
         // step4: Create a web server
         let web_conf = conf.master_web_conf();

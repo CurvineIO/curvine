@@ -33,7 +33,9 @@ use orpc::common::{ByteUnit, FastHashMap, FastHashSet, LocalTime};
 use orpc::err_box;
 use orpc::sync::AtomicCounter;
 use std::collections::LinkedList;
+use std::fmt::Display;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub struct LoadJobRunner {
     jobs: JobStore,
@@ -54,8 +56,24 @@ struct PlannedLoadJob {
     total_size: i64,
 }
 
+pub(crate) enum LoadJobPrepareResult {
+    Ready(Box<PreparedLoadJob>),
+    Done(LoadJobResult),
+}
+
+pub(crate) enum QueuedLoadJobValidation {
+    Ready,
+    Failed,
+    Stale,
+}
+
+pub(crate) struct PreparedLoadJob {
+    job_context: JobContext,
+}
+
 impl LoadJobRunner {
     const RUN_ID_SEQ_MOD: u64 = 1_000_000;
+    const SOURCE_NOT_FOUND_PREFIX: &'static str = "source file not found";
 
     pub fn new(
         jobs: JobStore,
@@ -123,6 +141,95 @@ impl LoadJobRunner {
         })
     }
 
+    fn reusable_job_result(
+        &self,
+        job_id: &str,
+        failed_retry_interval: Duration,
+    ) -> Option<LoadJobResult> {
+        self.jobs.get(job_id).and_then(|exist_job| {
+            let state: JobTaskState = exist_job.state.state();
+            if state.is_running() {
+                debug!(
+                    "job {} already running during admission (state={:?})",
+                    job_id, state
+                );
+                return Some(LoadJobResult::with_state(&exist_job.info, state));
+            }
+            if let Some(result) =
+                self.reusable_source_not_found_result(&exist_job, failed_retry_interval)
+            {
+                debug!(
+                    "job {} reuses recent source-not-found failure during retry interval",
+                    job_id
+                );
+                return Some(result);
+            }
+            None
+        })
+    }
+
+    fn reusable_source_not_found_result(
+        &self,
+        job: &JobContext,
+        retry_interval: Duration,
+    ) -> Option<LoadJobResult> {
+        let state: JobTaskState = job.state.state();
+        if state != JobTaskState::Failed {
+            return None;
+        }
+        if !job
+            .progress
+            .message
+            .starts_with(Self::SOURCE_NOT_FOUND_PREFIX)
+        {
+            return None;
+        }
+        let update_time = job.progress.update_time;
+        if update_time <= 0 {
+            return None;
+        }
+        let now = LocalTime::mills() as i64;
+        let retry_interval_ms = retry_interval.as_millis() as i64;
+        if retry_interval_ms > 0 && now.saturating_sub(update_time) <= retry_interval_ms {
+            Some(LoadJobResult::with_state(&job.info, state))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn running_job_result_for_command(
+        &self,
+        command: &LoadJobCommand,
+        mnt: &MountInfo,
+    ) -> FsResult<Option<LoadJobResult>> {
+        let (job_context, _, _) = self.build_job_context(command, mnt)?;
+        Ok(self.running_job_result(&job_context.info.job_id))
+    }
+
+    pub(crate) fn admit_load_job(
+        &self,
+        command: LoadJobCommand,
+        mnt: MountInfo,
+        failed_retry_interval: Duration,
+    ) -> FsResult<LoadJobPrepareResult> {
+        let (job_context, source_path, target_path) = self.build_job_context(&command, &mnt)?;
+        let job_id = job_context.info.job_id.clone();
+
+        if let Some(result) = self.reusable_job_result(&job_id, failed_retry_interval) {
+            return Ok(LoadJobPrepareResult::Done(result));
+        }
+
+        debug!(
+            "admitted load job {}: {} -> {}",
+            job_id,
+            source_path.full_path(),
+            target_path.full_path()
+        );
+        Ok(LoadJobPrepareResult::Ready(Box::new(PreparedLoadJob {
+            job_context,
+        })))
+    }
+
     async fn check_already_loaded(
         &self,
         mnt: &MountValue,
@@ -156,14 +263,83 @@ impl LoadJobRunner {
         Ok(cv_status.cv_valid(Some(&source_status)))
     }
 
-    pub(crate) fn enqueue_load_job(
+    async fn check_source_root_exists(&self, source_path: &Path, mnt: &MountInfo) -> FsResult<()> {
+        if source_path.is_cv() {
+            self.master_fs.file_status(source_path.path())?;
+        } else {
+            let ufs = self.factory.get_ufs(mnt)?;
+            ufs.get_status(source_path).await?;
+        }
+        Ok(())
+    }
+
+    fn fail_source_not_found(
         &self,
-        command: LoadJobCommand,
-        mnt: MountInfo,
+        queued: &QueuedLoadJob,
+        source_path: &Path,
+        err: impl Display,
+    ) -> bool {
+        self.jobs.update_state_if_run(
+            &queued.job_id,
+            queued.run_id,
+            JobTaskState::Failed,
+            format!(
+                "{}: {} ({})",
+                Self::SOURCE_NOT_FOUND_PREFIX,
+                source_path.full_path(),
+                err
+            ),
+        )
+    }
+
+    fn fail_source_check(&self, queued: &QueuedLoadJob, err: impl Display) -> bool {
+        self.jobs.update_state_if_run(
+            &queued.job_id,
+            queued.run_id,
+            JobTaskState::Failed,
+            format!("check source file failed: {}", err),
+        )
+    }
+
+    pub(crate) async fn validate_queued_source(
+        &self,
+        queued: &QueuedLoadJob,
+    ) -> FsResult<QueuedLoadJobValidation> {
+        let job_info = match self.current_job_info(queued) {
+            Some(job_info) => job_info,
+            None => return Ok(QueuedLoadJobValidation::Stale),
+        };
+        let source_path = Path::from_str(&job_info.source_path)?;
+        let mnt = job_info.mount_info;
+
+        match self.check_source_root_exists(&source_path, &mnt).await {
+            Ok(()) => Ok(QueuedLoadJobValidation::Ready),
+            Err(FsError::FileNotFound(err)) => {
+                if self.fail_source_not_found(queued, &source_path, err) {
+                    Ok(QueuedLoadJobValidation::Failed)
+                } else {
+                    Ok(QueuedLoadJobValidation::Stale)
+                }
+            }
+            Err(err) => {
+                if self.fail_source_check(queued, &err) {
+                    Err(err)
+                } else {
+                    Ok(QueuedLoadJobValidation::Stale)
+                }
+            }
+        }
+    }
+
+    pub(crate) fn commit_prepared_load_job(
+        &self,
+        prepared: Box<PreparedLoadJob>,
     ) -> FsResult<(LoadJobResult, Option<QueuedLoadJob>)> {
-        let (job_context, source_path, target_path) = self.build_job_context(&command, &mnt)?;
+        let PreparedLoadJob { job_context } = *prepared;
         let job_id = job_context.info.job_id.clone();
         let run_id = job_context.run_id;
+        let source_path = job_context.info.source_path.clone();
+        let target_path = job_context.info.target_path.clone();
 
         match self.jobs.entry(job_id.clone()) {
             Entry::Occupied(mut e) => {
@@ -171,7 +347,7 @@ impl LoadJobRunner {
                 if state.is_running() {
                     let existing = e.get();
                     debug!(
-                        "job {} already running during enqueue (state={:?})",
+                        "job {} already running during commit (state={:?})",
                         job_id, state
                     );
                     return Ok((LoadJobResult::with_state(&existing.info, state), None));
@@ -190,9 +366,7 @@ impl LoadJobRunner {
 
         debug!(
             "queued load job {}: {} -> {}",
-            job_id,
-            source_path.full_path(),
-            target_path.full_path()
+            job_id, source_path, target_path
         );
 
         let job = match self.jobs.get(&job_id) {
@@ -357,6 +531,10 @@ impl LoadJobRunner {
             .await
         {
             Ok(already_loaded) => already_loaded,
+            Err(FsError::FileNotFound(err)) => {
+                self.fail_source_not_found(&queued, &source_path, &err);
+                return Err(FsError::FileNotFound(err));
+            }
             Err(err) => {
                 self.jobs.update_state_if_run(
                     &queued.job_id,
@@ -388,6 +566,10 @@ impl LoadJobRunner {
             .await
         {
             Ok(planned) => planned,
+            Err(FsError::FileNotFound(err)) => {
+                self.fail_source_not_found(&queued, &source_path, &err);
+                return Err(FsError::FileNotFound(err));
+            }
             Err(err) => {
                 self.jobs.update_state_if_run(
                     &queued.job_id,

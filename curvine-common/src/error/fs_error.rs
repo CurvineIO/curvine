@@ -64,6 +64,7 @@ pub enum ErrorKind {
     NotADirectory = 27,
     InvalidArgument = 28,
     BlockNotFound = 29,
+    ResourceExhausted = 30,
 
     #[num_enum(default)]
     Common = 10000,
@@ -184,6 +185,10 @@ pub enum FsError {
     #[error("{0}")]
     JobNotFound(ErrorImpl<StringError>),
 
+    // The server or client side resource limit was reached.
+    #[error("{0}")]
+    ResourceExhausted(ErrorImpl<StringError>),
+
     // Other errors that are not defined.
     #[error("{0}")]
     Common(ErrorImpl<StringError>),
@@ -239,6 +244,10 @@ impl FsError {
     pub fn job_not_found(job_id: impl AsRef<str>) -> Self {
         let msg = format!("Job {} not found", job_id.as_ref());
         Self::JobNotFound(ErrorImpl::with_source(msg.into()))
+    }
+
+    pub fn resource_exhausted(msg: impl Into<String>) -> Self {
+        Self::ResourceExhausted(ErrorImpl::with_source(msg.into().into()))
     }
 
     pub fn file_exists(path: impl AsRef<str>) -> Self {
@@ -370,6 +379,7 @@ impl FsError {
             FsError::Pipeline(_) => ErrorKind::Pipeline,
             FsError::MinReplicasNotMet(_) => ErrorKind::MinReplicasNotMet,
             FsError::JobNotFound(_) => ErrorKind::JobNotFound,
+            FsError::ResourceExhausted(_) => ErrorKind::ResourceExhausted,
             FsError::Common(_) => ErrorKind::Common,
         }
     }
@@ -516,6 +526,7 @@ impl ErrorExt for FsError {
             FsError::Pipeline(e) => FsError::Pipeline(e.ctx(ctx)),
             FsError::MinReplicasNotMet(e) => FsError::MinReplicasNotMet(e.ctx(ctx)),
             FsError::JobNotFound(e) => FsError::JobNotFound(e.ctx(ctx)),
+            FsError::ResourceExhausted(e) => FsError::ResourceExhausted(e.ctx(ctx)),
             FsError::Common(e) => FsError::Common(e.ctx(ctx)),
         }
     }
@@ -551,6 +562,7 @@ impl ErrorExt for FsError {
             FsError::Pipeline(e) => e.encode(ErrorKind::Pipeline),
             FsError::MinReplicasNotMet(e) => e.encode(ErrorKind::MinReplicasNotMet),
             FsError::JobNotFound(e) => e.encode(ErrorKind::JobNotFound),
+            FsError::ResourceExhausted(e) => e.encode(ErrorKind::ResourceExhausted),
             FsError::Common(e) => e.encode(ErrorKind::Common),
         }
     }
@@ -589,6 +601,7 @@ impl ErrorExt for FsError {
             ErrorKind::Pipeline => FsError::Pipeline(de.into_string()),
             ErrorKind::MinReplicasNotMet => FsError::MinReplicasNotMet(de.into_string()),
             ErrorKind::JobNotFound => FsError::JobNotFound(de.into_string()),
+            ErrorKind::ResourceExhausted => FsError::ResourceExhausted(de.into_string()),
             ErrorKind::Common => FsError::Common(de.into_string()),
         }
     }

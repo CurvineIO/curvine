@@ -16,3 +16,22 @@ fn block_not_found_round_trips_with_structured_kind() {
         other => panic!("expected BlockNotFound, got {:?}", other),
     }
 }
+
+#[test]
+fn resource_exhausted_round_trips_with_structured_kind() {
+    let error = FsError::resource_exhausted("master load job queue is full; retry later");
+    assert!(matches!(error.kind(), ErrorKind::ResourceExhausted));
+
+    let decoded = FsError::decode(error.encode());
+    assert!(matches!(decoded.kind(), ErrorKind::ResourceExhausted));
+
+    match decoded {
+        FsError::ResourceExhausted(error) => {
+            assert_eq!(
+                error.source.to_string(),
+                "master load job queue is full; retry later"
+            );
+        }
+        other => panic!("expected ResourceExhausted, got {:?}", other),
+    }
+}
