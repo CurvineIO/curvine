@@ -27,6 +27,7 @@ fn test_spdk_conf() -> SpdkConf {
     let subnqn =
         std::env::var("SPDK_TARGET_NQN").unwrap_or("nqn.2024-01.io.curvine:test".to_string());
     let trtype = std::env::var("SPDK_TRANSPORT_TYPE").unwrap_or("tcp".to_string());
+    let iova_mode = crate::io::spdk_env::spdk_iova_mode_for_test();
 
     SpdkConf {
         enabled: true,
@@ -37,6 +38,7 @@ fn test_spdk_conf() -> SpdkConf {
             .unwrap_or(256),
         reactor_mask: std::env::var("SPDK_REACTOR_MASK").unwrap_or("0x1".to_string()),
         keep_alive_timeout_ms: 500,
+        iova_mode,
 
         targets: vec![NvmeTarget {
             traddr,
