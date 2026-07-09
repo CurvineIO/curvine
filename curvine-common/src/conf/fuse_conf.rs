@@ -162,8 +162,6 @@ pub struct FuseConf {
     // Metadata cache TTL (time to live)
     pub meta_cache_ttl: String,
 
-    pub node_cache_size: u64,
-
     pub node_cache_timeout: String,
 
     // File and directory related options
@@ -381,7 +379,6 @@ impl Default for FuseConf {
             meta_cache_capacity: 100000,
             meta_cache_ttl: "120s".to_string(),
 
-            node_cache_size: 200000,
             node_cache_timeout: "1h".to_string(),
 
             direct_io: false,
@@ -480,5 +477,20 @@ io_threads = 16
             conf.fuse.max_readahead_kb,
             Some(FuseConf::DEFAULT_MAX_READAHEAD_KB)
         );
+    }
+
+    #[test]
+    fn toml_with_removed_node_cache_size_loads_clean() {
+        // node_cache_size was removed as a dead param (issue #1023 §1): the node
+        // map is evicted by node_cache_timeout (TTL) only, the capacity was never
+        // enforced. FuseConf is #[serde(default)] with no deny_unknown_fields, so
+        // legacy TOML carrying this key must still deserialize (key ignored).
+        let toml = r#"
+io_threads = 16
+node_cache_size = 200000
+"#;
+        let conf: FuseConf =
+            toml::from_str(toml).expect("legacy node_cache_size key must be ignored, not rejected");
+        assert_eq!(conf.io_threads, 16);
     }
 }

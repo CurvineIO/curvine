@@ -95,9 +95,6 @@ pub struct FuseMountArgs {
     pub congestion_threshold: Option<u16>,
 
     // Node cache settings
-    #[arg(long, help = "Node cache size (optional)")]
-    pub node_cache_size: Option<u64>,
-
     #[arg(long, help = "Node cache timeout (e.g., '1h', '30m') (optional)")]
     pub node_cache_timeout: Option<String>,
 
@@ -253,10 +250,6 @@ impl FuseMountArgs {
 
         if let Some(congestion_threshold) = self.congestion_threshold {
             conf.fuse.congestion_threshold = congestion_threshold;
-        }
-
-        if let Some(node_cache_size) = self.node_cache_size {
-            conf.fuse.node_cache_size = node_cache_size;
         }
 
         if let Some(node_cache_timeout) = &self.node_cache_timeout {
