@@ -13,15 +13,17 @@
 // limitations under the License.
 
 use crate::worker::block::{BlockMeta, BlockState};
-use crate::worker::storage::{Dataset, DirList, SpdkMetaStore, StorageVersion, VfsDir};
+use crate::worker::storage::{
+    BlockLayout, BlockLayoutKind, BlockLayouts, Dataset, DirList, SpdkMetaStore, StorageVersion,
+    VfsDir, VfsMetaStore,
+};
 use curvine_common::conf::{ClusterConf, WorkerDataDir};
 use curvine_common::state::{ExtendedBlock, StorageType};
 use indexmap::map::Values;
-use log::{info, warn};
+use log::info;
 use orpc::common::{ByteUnit, FileUtils, LocalTime, TimeSpent};
-use orpc::{err_box, try_err, CommonResult};
+use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
-use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -30,11 +32,9 @@ pub struct VfsDataset {
     worker_id: u32,
     ctime: u64,
     dir_list: DirList,
-    pub(crate) block_map: HashMap<i64, BlockMeta>,
+    meta: VfsMetaStore,
+    layouts: BlockLayouts,
     num_blocks_to_delete: AtomicUsize,
-    /// RocksDB-backed store for SPDK block metadata. `None` when no SPDK
-    /// directories are configured.
-    spdk_meta: Option<Arc<SpdkMetaStore>>,
 }
 
 impl VfsDataset {
@@ -53,9 +53,9 @@ impl VfsDataset {
             worker_id,
             ctime: LocalTime::mills(),
             dir_list,
-            block_map: HashMap::new(),
+            meta: VfsMetaStore::new(spdk_meta.clone()),
+            layouts: BlockLayouts::new(spdk_meta),
             num_blocks_to_delete: AtomicUsize::new(0),
-            spdk_meta,
         };
         ds.initialize()?;
         Ok(ds)
@@ -130,33 +130,23 @@ impl VfsDataset {
 
     // Initialize.
     // 1. Scan all blocks in the directory (filesystem or RocksDB for SPDK)
-    // 2. Block is added to block_map.
+    // 2. Block is added to meta store.
     // 3. Update capacity usage.
     // TODO: pre-filter to avoid scan_all() per SPDK dir
     fn initialize(&mut self) -> CommonResult<()> {
         let spent = TimeSpent::new();
         for dir in self.dir_list.dir_iter() {
-            let blocks = if dir.storage_type() == StorageType::SpdkDisk {
-                // SPDK dirs: restore from RocksDB
-                match &self.spdk_meta {
-                    Some(store) => dir.scan_spdk_blocks(store)?,
-                    None => {
-                        warn!("SPDK dir {} has no meta store — starting empty", dir.id());
-                        vec![]
-                    }
-                }
-            } else {
-                dir.scan_blocks()?
-            };
+            let layout = self.layouts.get(dir.storage_type());
+            let blocks = layout.scan(dir)?;
             for block in blocks {
                 dir.reserve_space(true, block.len);
-                self.block_map.insert(block.id, block);
+                self.meta.put(block);
             }
         }
         info!(
             "Dataset initialize, used {} ms, total block {}",
             spent.used_ms(),
-            self.block_map.len()
+            self.meta.block_count()
         );
         Ok(())
     }
@@ -187,46 +177,7 @@ impl VfsDataset {
     }
 
     pub fn all_blocks(&self) -> Vec<BlockMeta> {
-        let mut vec = vec![];
-        for meta in self.block_map.values() {
-            vec.push(meta.clone());
-        }
-        vec
-    }
-    /// Persist one SPDK block's metadata to RocksDB. No-op if no SPDK store.
-    fn spdk_put(&self, meta: &BlockMeta) {
-        if meta.storage_type() != StorageType::SpdkDisk {
-            return;
-        }
-        if let Some(ref store) = self.spdk_meta {
-            let alloc_size = meta
-                .dir
-                .offset_alloc
-                .get_entry(meta.id)
-                .map_or(meta.actual_len, |(_, sz)| sz);
-            if let Err(e) = store.put(
-                meta.id,
-                meta.dir_id(),
-                meta.bdev_offset,
-                alloc_size,
-                meta.len,
-                meta.is_final(),
-            ) {
-                warn!("SpdkMetaStore put failed for block {}: {}", meta.id, e);
-            }
-        }
-    }
-
-    /// Remove one SPDK block's metadata from RocksDB. No-op if no SPDK store.
-    pub(crate) fn spdk_delete(&self, block_id: i64, storage_type: StorageType) {
-        if storage_type != StorageType::SpdkDisk {
-            return;
-        }
-        if let Some(ref store) = self.spdk_meta {
-            if let Err(e) = store.delete(block_id) {
-                warn!("SpdkMetaStore delete failed for block {}: {}", block_id, e);
-            }
-        }
+        self.meta.all_blocks()
     }
 
     #[cfg(test)]
@@ -239,6 +190,36 @@ impl VfsDataset {
             .dir_iter()
             .find(|d| d.id() == dir_id)
             .map(|d| &d.state.offset_alloc)
+    }
+
+    pub(crate) fn remove_block_state_by_id(
+        &mut self,
+        id: i64,
+    ) -> CommonResult<(BlockMeta, BlockLayoutKind)> {
+        let meta = match self.meta.remove(id) {
+            None => return err_box!("Not found block {}", id),
+            Some(meta) => meta,
+        };
+
+        let layout = self.layouts.get(meta.storage_type());
+        if self.find_dir(meta.dir_id()).is_ok() {
+            layout.release(&meta)?;
+        }
+
+        Ok((meta, layout.clone()))
+    }
+
+    pub(crate) fn release_block_space(&self, meta: &BlockMeta) -> CommonResult<()> {
+        let dir = self.find_dir(meta.dir_id())?;
+        dir.release_space(meta.is_final(), meta.actual_len);
+        Ok(())
+    }
+
+    pub(crate) fn remove_block_by_id(&mut self, id: i64) -> CommonResult<BlockMeta> {
+        let (meta, layout) = self.remove_block_state_by_id(id)?;
+        layout.deallocate(&meta)?;
+        self.release_block_space(&meta)?;
+        Ok(meta)
     }
 }
 
@@ -256,7 +237,7 @@ impl Dataset for VfsDataset {
     }
 
     fn num_blocks(&self) -> usize {
-        self.block_map.len()
+        self.meta.block_count()
     }
 
     fn num_blocks_to_delete(&self) -> usize {
@@ -272,11 +253,11 @@ impl Dataset for VfsDataset {
     }
 
     fn get_block(&self, id: i64) -> Option<&BlockMeta> {
-        self.block_map.get(&id)
+        self.meta.get(id)
     }
 
     fn open_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
-        match self.block_map.get(&block.id) {
+        match self.meta.get(block.id).cloned() {
             Some(meta) => {
                 if meta.is_active() {
                     let dir = self.find_dir(meta.dir_id())?;
@@ -286,8 +267,7 @@ impl Dataset for VfsDataset {
 
                     dir.release_space(meta.is_final(), meta.actual_len);
                     dir.reserve_space(false, new_meta.len);
-                    self.block_map.insert(new_meta.id(), new_meta.clone());
-                    self.spdk_put(&new_meta);
+                    self.meta.put(new_meta.clone());
 
                     Ok(new_meta)
                 } else {
@@ -301,11 +281,11 @@ impl Dataset for VfsDataset {
 
             None => {
                 let dir = self.dir_list.choose_dir(block)?;
-                let meta = dir.create_block(block)?;
+                let layout = self.layouts.get(dir.storage_type());
+                let meta = layout.allocate(dir, block)?;
 
-                self.block_map.insert(meta.id(), meta.clone());
+                self.meta.put(meta.clone());
                 dir.reserve_space(false, block.len);
-                self.spdk_put(&meta);
 
                 Ok(meta)
             }
@@ -313,66 +293,56 @@ impl Dataset for VfsDataset {
     }
 
     fn finalize_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
-        let meta = self.get_block_check(block.id)?;
-        if meta.state() == &BlockState::Finalized {
-            if meta.len() == block.len {
-                return Ok(meta.clone());
+        // Keep the meta borrow scoped before mutating the meta store and dir accounting.
+        let (dir_id, actual_len, final_meta) = {
+            let meta = self.get_block_check(block.id)?;
+            if meta.state() == &BlockState::Finalized {
+                if meta.len() == block.len {
+                    return Ok(meta.clone());
+                }
+                return err_box!(
+                    "finalized block {} length mismatch, expected: {}, actual: {}",
+                    meta.id(),
+                    block.len,
+                    meta.len()
+                );
             }
-            return err_box!(
-                "finalized block {} length mismatch, expected: {}, actual: {}",
-                meta.id(),
-                block.len,
-                meta.len()
-            );
-        }
-        if meta.state() != &BlockState::Writing {
-            return err_box!(
-                "block {} status incorrect, expected {:?}, actual: {:?}",
-                meta.id(),
-                BlockState::Writing,
-                meta.state()
-            );
-        }
+            if meta.state() != &BlockState::Writing {
+                return err_box!(
+                    "block {} status incorrect, expected {:?}, actual: {:?}",
+                    meta.id(),
+                    BlockState::Writing,
+                    meta.state()
+                );
+            }
 
-        let dir = self.find_dir(meta.dir_id())?;
-        let final_meta = dir.finalize_block(meta, block.len)?;
-        if block.len != final_meta.len() {
-            return err_box!(
-                "Block {} length mismatch, expected: {}, actual: {}",
-                meta.id(),
-                block.len,
-                final_meta.len()
-            );
-        }
+            let layout = self.layouts.get(meta.storage_type());
+            let final_meta = layout.finalize(meta, block.len)?;
+            if block.len != final_meta.len() {
+                return err_box!(
+                    "Block {} length mismatch, expected: {}, actual: {}",
+                    meta.id(),
+                    block.len,
+                    final_meta.len()
+                );
+            }
 
-        dir.release_space(false, meta.actual_len);
+            (meta.dir_id(), meta.actual_len, final_meta)
+        };
+
+        let dir = self.find_dir(dir_id)?;
+        dir.release_space(false, actual_len);
         dir.reserve_space(true, final_meta.actual_len);
-        self.block_map.insert(final_meta.id(), final_meta.clone());
-        self.spdk_put(&final_meta);
+        self.meta.put(final_meta.clone());
 
         Ok(final_meta)
     }
 
     fn abort_block(&mut self, block: &ExtendedBlock) -> CommonResult<()> {
-        let meta = match self.block_map.remove(&block.id) {
-            None => return Ok(()),
-            Some(v) => v,
-        };
-
-        let dir_id = meta.dir_id();
-        let is_spdk = meta.storage_type() == StorageType::SpdkDisk;
-        // SPDK: no filesystem file - nothing to delete.
-        if !is_spdk {
-            let file = meta.get_block_path()?;
-            try_err!(fs::remove_file(file));
+        if self.meta.get(block.id).is_none() {
+            return Ok(());
         }
-        let dir = self.find_dir(dir_id)?;
-
-        if is_spdk {
-            self.spdk_delete(block.id, meta.storage_type());
-            dir.state.offset_alloc.free(block.id);
-        }
-        dir.release_space(meta.is_final(), meta.actual_len);
+        self.remove_block_by_id(block.id)?;
         Ok(())
     }
 
@@ -383,8 +353,6 @@ impl Dataset for VfsDataset {
 
 #[cfg(test)]
 mod test {
-    use crate::worker::block::BlockMeta;
-    use crate::worker::block::BlockState;
     use crate::worker::storage::{Dataset, DirList, DirState, StorageVersion, VfsDataset, VfsDir};
     use curvine_common::conf::{ClusterConf, WorkerConf};
     use curvine_common::state::{ExtendedBlock, FileType, StorageType};
@@ -485,31 +453,16 @@ mod test {
         }
         drop(ds);
         let ds = create_data_set(false, "init");
-        assert_eq!(ds.block_map.len(), 11);
+        assert_eq!(ds.num_blocks(), 11);
         Ok(())
     }
     #[test]
     fn abort_spdk() -> CommonResult<()> {
-        let st = spdk_state(1);
-        let mut ds = VfsDataset::new("t", DirList::new(vec![spdk_dir(st.clone())])?, None)?;
-        let meta = BlockMeta {
-            id: 1,
-            len: 4096,
-            state: BlockState::Writing,
-            dir: st,
-            actual_len: 4096,
-            bdev_offset: 0,
-        };
-        ds.block_map.insert(1, meta);
-        let ok = ds
-            .abort_block(&ExtendedBlock::new(
-                1,
-                4096,
-                StorageType::SpdkDisk,
-                FileType::File,
-            ))
-            .is_ok();
-        assert!(ok && !ds.block_map.contains_key(&1));
+        let mut ds = spdk_dataset()?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&block)?;
+        let ok = ds.abort_block(&block).is_ok();
+        assert!(ok && ds.get_block(1).is_none());
         Ok(())
     }
     #[test]
@@ -521,7 +474,7 @@ mod test {
         assert_eq!(ds.offset_alloc_for_dir(1).unwrap().allocated_count(), 1);
 
         ds.abort_block(&block1)?;
-        assert!(!ds.block_map.contains_key(&1));
+        assert!(ds.get_block(1).is_none());
         assert_eq!(ds.offset_alloc_for_dir(1).unwrap().free_list_size(), 1);
 
         let block2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
