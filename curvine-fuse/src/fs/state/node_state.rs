@@ -1426,7 +1426,6 @@ mod test {
     pub fn ttl() -> CommonResult<()> {
         let mut conf = ClusterConf {
             fuse: FuseConf {
-                node_cache_size: 2,
                 node_cache_timeout: "100ms".to_string(),
                 ..Default::default()
             },

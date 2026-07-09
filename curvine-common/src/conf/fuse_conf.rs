@@ -22,6 +22,34 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 // fuse configuration file.
+//
+// Caching in curvine-fuse spans three layers that are easy to conflate; the
+// boundaries are:
+//
+// 1. Kernel-side caching (the kernel caches on our behalf, controlled via the
+//    FUSE reply `entry_valid` / `attr_valid` fields):
+//    - `entry_timeout`   -> how long the kernel trusts a name->inode lookup.
+//    - `negative_timeout`-> how long the kernel caches a negative lookup (ENOENT).
+//    - `attr_timeout`    -> how long the kernel trusts cached file/dir attributes.
+//    - `ac_attr_timeout*`-> attr-cache timeout used for auto-cache refresh.
+//    These trade metadata freshness for fewer upcalls into user space.
+//
+// 2. User-side caching (maintained inside curvine-fuse itself):
+//    - `enable_meta_cache` / `meta_cache_capacity` / `meta_cache_ttl` -> the
+//      bounded metadata cache backed by `MetaCache` (capacity IS enforced).
+//    - `node_cache_timeout` -> TTL-based eviction of the inode/node map.
+//
+// 3. IO caching / data-path switches (control how file *data* is cached by the
+//    page cache, mutually interacting per open):
+//    - `direct_io`            -> bypass the page cache for all opens.
+//    - `open_direct_on_stale` -> per-open fallback to direct I/O only when the
+//      local metadata is detected stale (weaker global impact than `direct_io`).
+//    - `write_back_cache`     -> let the kernel buffer writes (write-back) vs
+//      write-through; interacts with `direct_io` (direct I/O disables it).
+//
+// Rule of thumb: layer 1 tunes how stale the *kernel* may be, layer 2 tunes the
+// process-local metadata caches, and layer 3 decides whether file *data* flows
+// through the page cache at all.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FuseConf {
@@ -134,8 +162,6 @@ pub struct FuseConf {
     // Metadata cache TTL (time to live)
     pub meta_cache_ttl: String,
 
-    pub node_cache_size: u64,
-
     pub node_cache_timeout: String,
 
     // File and directory related options
@@ -202,15 +228,16 @@ pub struct FuseConf {
 impl FuseConf {
     pub const FS_NAME: &'static str = "curvine-fuse";
 
-    pub const MAX_READ: u32 = 128 * 1024;
+    /// Default kernel dentry (name lookup) cache timeout, in seconds.
+    pub const DEFAULT_ENTRY_TIMEOUT: f64 = 1.0;
 
-    pub const MAX_WRITE: u32 = 128 * 1024;
+    /// Default kernel attribute cache timeout, in seconds. Also used as the
+    /// default for the auto-cache attr timeouts (`ac_attr_timeout*`), which the
+    /// FUSE convention sets equal to `attr_timeout`.
+    pub const DEFAULT_ATTR_TIMEOUT: f64 = 1.0;
 
-    pub const MAX_READ_AHEAD: u32 = 128 * 1024;
-
-    pub const TTR_TIMEOUT: f64 = 1.0;
-
-    pub const UMASK: u32 = 0o22;
+    /// Default umask applied to file-system-generated permission bits (octal 022).
+    pub const DEFAULT_UMASK: u32 = 0o22;
 
     /// Default FUSE BDI readahead window: 1 MiB (`1024` KB).
     pub const DEFAULT_MAX_READAHEAD_KB: u32 = 1024;
@@ -333,15 +360,15 @@ impl Default for FuseConf {
             fuse_channel_size: 0,
             stream_channel_size: 0,
             fuse_opts: vec![],
-            umask: Self::UMASK,
+            umask: Self::DEFAULT_UMASK,
             uid: sys::get_uid(),
             gid: sys::get_gid(),
             read_dir_fill_ino: true,
-            entry_timeout: FuseConf::TTR_TIMEOUT,
+            entry_timeout: FuseConf::DEFAULT_ENTRY_TIMEOUT,
             negative_timeout: 0.0,
-            attr_timeout: FuseConf::TTR_TIMEOUT,
-            ac_attr_timeout: FuseConf::TTR_TIMEOUT,
-            ac_attr_timeout_set: FuseConf::TTR_TIMEOUT,
+            attr_timeout: FuseConf::DEFAULT_ATTR_TIMEOUT,
+            ac_attr_timeout: FuseConf::DEFAULT_ATTR_TIMEOUT,
+            ac_attr_timeout_set: FuseConf::DEFAULT_ATTR_TIMEOUT,
             remember: false,
             web_port: ClusterConf::DEFAULT_FUSE_WEB_PORT,
 
@@ -352,7 +379,6 @@ impl Default for FuseConf {
             meta_cache_capacity: 100000,
             meta_cache_ttl: "120s".to_string(),
 
-            node_cache_size: 200000,
             node_cache_timeout: "1h".to_string(),
 
             direct_io: false,
@@ -451,5 +477,20 @@ io_threads = 16
             conf.fuse.max_readahead_kb,
             Some(FuseConf::DEFAULT_MAX_READAHEAD_KB)
         );
+    }
+
+    #[test]
+    fn toml_with_removed_node_cache_size_loads_clean() {
+        // node_cache_size was removed as a dead param (issue #1023 §1): the node
+        // map is evicted by node_cache_timeout (TTL) only, the capacity was never
+        // enforced. FuseConf is #[serde(default)] with no deny_unknown_fields, so
+        // legacy TOML carrying this key must still deserialize (key ignored).
+        let toml = r#"
+io_threads = 16
+node_cache_size = 200000
+"#;
+        let conf: FuseConf =
+            toml::from_str(toml).expect("legacy node_cache_size key must be ignored, not rejected");
+        assert_eq!(conf.io_threads, 16);
     }
 }
