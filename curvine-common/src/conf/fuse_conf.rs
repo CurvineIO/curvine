@@ -323,13 +323,18 @@ impl FuseConf {
     }
 
     pub fn set_fuse_opts(&self, mount_options: &mut String) {
+        let mut ro_added = false;
         if self.readonly {
             mount_options.push_str(",ro");
+            ro_added = true;
         }
 
         self.fuse_opts.iter().for_each(|opt| match opt.as_str() {
             "ro" => {
-                mount_options.push_str(",ro");
+                if !ro_added {
+                    mount_options.push_str(",ro");
+                    ro_added = true;
+                }
             }
             "default_permissions" => {
                 mount_options.push_str(",default_permissions");
@@ -482,6 +487,22 @@ max_readahead_kb = 1024
         let mut mount_options = String::new();
         conf.set_fuse_opts(&mut mount_options);
         assert!(mount_options.split(',').any(|opt| opt == "ro"));
+    }
+
+    #[test]
+    fn readonly_does_not_duplicate_ro_mount_option() {
+        let conf = FuseConf {
+            readonly: true,
+            fuse_opts: vec!["ro".to_string()],
+            ..Default::default()
+        };
+        let mut mount_options = String::new();
+        conf.set_fuse_opts(&mut mount_options);
+
+        assert_eq!(
+            mount_options.split(',').filter(|opt| *opt == "ro").count(),
+            1
+        );
     }
 
     #[test]

@@ -1365,9 +1365,6 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn write(&self, op: Write<'_>, reply: FuseResponse) -> FuseResult<()> {
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
-        let path = self.state.get_path(op.header.nodeid)?;
-        self.ensure_writable_path(&path, RpcCode::CreateFile)
-            .await?;
         handle.write(op, reply).await
     }
 
