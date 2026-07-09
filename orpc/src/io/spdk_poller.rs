@@ -616,8 +616,6 @@ impl SpdkPoller {
             return;
         }
 
-        qs.pending.push(cb_ctx_ptr);
-
         // Track active qpair
         if !active_qpairs.contains(&qpair) {
             active_qpairs.push(qpair);
@@ -907,12 +905,10 @@ mod test {
 
         // Assert: LIVE entry's bdev_inflight unchanged.
         assert_eq!(inflight_3.load(Ordering::Acquire), 1);
-
         // Assert: DEAD stays in dead_qpairs with entries in stale.
         assert!(dead_qpairs.contains_key(&DEAD));
         assert_eq!(dead_qpairs[&DEAD].stale.len(), 2);
         assert_eq!(dead_qpairs[&DEAD].pending.len(), 0);
-
         assert!(dead_flag.load(Ordering::Acquire));
 
         // Reclaim stale entries (frees CallbackCtx, signals already done).
