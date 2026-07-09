@@ -81,13 +81,6 @@ pub struct FuseConf {
 
     pub web_port: u16,
 
-    // Whether to fill the fuse node id when traversing the directory.
-    // When executing list_status, if the node id is not filled, the node id returned to the kernel is in curvine and does not exist in the node cache.
-    // file attr has cache time. During the cache time, look up will not be executed. If you access this file, an error will be reported (node ​​does not exist)
-    // Setting will be true, which is equivalent to executing a lookup for each node before returning data to the kernel, and there will be no node.
-    // The default value is true
-    pub read_dir_fill_ino: bool,
-
     // Name search cache time.
     // After performing a name search, if the same name is requested again, the kernel will check the cache first.
     // If the buffer record is still valid, the cache result will be returned directly, unlike user space for requests.
@@ -116,10 +109,6 @@ pub struct FuseConf {
     // By default, it is set to the same value as attr_timeout (i.e. 1.0 seconds).
     pub ac_attr_timeout_set: f64,
 
-    // Parameters are used to specify whether the file system should remember the opened files and directories.
-    // By default, the FUSE file system clears the cache when a file or directory is closed.
-    pub remember: bool,
-
     // The maximum number of concurrent execution of backend tasks in the file system.It directly affects the performance and stability of the file system, and is important especially when dealing with high load or asynchronous I/O scenarios.
     pub max_background: u16,
 
@@ -133,8 +122,6 @@ pub struct FuseConf {
 
     // Metadata cache TTL (time to live)
     pub meta_cache_ttl: String,
-
-    pub node_cache_size: u64,
 
     pub node_cache_timeout: String,
 
@@ -336,13 +323,11 @@ impl Default for FuseConf {
             umask: Self::UMASK,
             uid: sys::get_uid(),
             gid: sys::get_gid(),
-            read_dir_fill_ino: true,
             entry_timeout: FuseConf::TTR_TIMEOUT,
             negative_timeout: 0.0,
             attr_timeout: FuseConf::TTR_TIMEOUT,
             ac_attr_timeout: FuseConf::TTR_TIMEOUT,
             ac_attr_timeout_set: FuseConf::TTR_TIMEOUT,
-            remember: false,
             web_port: ClusterConf::DEFAULT_FUSE_WEB_PORT,
 
             max_background: 256,
@@ -352,7 +337,6 @@ impl Default for FuseConf {
             meta_cache_capacity: 100000,
             meta_cache_ttl: "120s".to_string(),
 
-            node_cache_size: 200000,
             node_cache_timeout: "1h".to_string(),
 
             direct_io: false,
@@ -451,5 +435,22 @@ io_threads = 16
             conf.fuse.max_readahead_kb,
             Some(FuseConf::DEFAULT_MAX_READAHEAD_KB)
         );
+    }
+
+    #[test]
+    fn toml_with_removed_dead_keys_loads_clean() {
+        // read_dir_fill_ino / remember / node_cache_size were removed as dead
+        // params (issue #1023 §1). FuseConf is #[serde(default)] with no
+        // deny_unknown_fields, so legacy TOML carrying these keys must still
+        // deserialize without error (the keys are silently ignored).
+        let toml = r#"
+io_threads = 16
+read_dir_fill_ino = true
+remember = false
+node_cache_size = 200000
+"#;
+        let conf: FuseConf =
+            toml::from_str(toml).expect("legacy keys must be ignored, not rejected");
+        assert_eq!(conf.io_threads, 16);
     }
 }
