@@ -28,10 +28,9 @@ use std::time::Duration;
 //
 // 1. Kernel-side caching (the kernel caches on our behalf, controlled via the
 //    FUSE reply `entry_valid` / `attr_valid` fields):
-//    - `entry_timeout`   -> how long the kernel trusts a name->inode lookup.
-//    - `negative_timeout`-> how long the kernel caches a negative lookup (ENOENT).
-//    - `attr_timeout`    -> how long the kernel trusts cached file/dir attributes.
-//    - `ac_attr_timeout*`-> attr-cache timeout used for auto-cache refresh.
+//    - `entry_timeout_ms`   -> how long the kernel trusts a name->inode lookup.
+//    - `negative_timeout_ms`-> how long the kernel caches a negative lookup (ENOENT).
+//    - `attr_timeout_ms`    -> how long the kernel trusts cached file/dir attributes.
 //    These trade metadata freshness for fewer upcalls into user space.
 //
 // 2. User-side caching (maintained inside curvine-fuse itself):
@@ -116,33 +115,22 @@ pub struct FuseConf {
     // The default value is true
     pub read_dir_fill_ino: bool,
 
-    // Name search cache time.
+    // Name search cache time, in milliseconds.
     // After performing a name search, if the same name is requested again, the kernel will check the cache first.
     // If the buffer record is still valid, the cache result will be returned directly, unlike user space for requests.
-    // Default 1.0 seconds
-    pub entry_timeout: f64,
+    // Default 1000ms (1 second). Sub-second granularity is supported (e.g. 500 = 0.5s).
+    pub entry_timeout_ms: u64,
 
-    // The timeout (in seconds) of cache negative lookups.This means that if the file does not exist (find returns ENOENT)
+    // The timeout (in milliseconds) of cache negative lookups. This means that if the file does not exist (find returns ENOENT)
     // Then the search will only be redone after the timeout, and the file/directory will be assumed to not exist before this.
-    // The default value is 0.0 seconds, which means cache negative lookup is disabled.
-    pub negative_timeout: f64,
+    // The default value is 0ms, which means cache negative lookup is disabled.
+    pub negative_timeout_ms: u64,
 
-    // Cache time for file and directory attributes.
+    // Cache time for file and directory attributes, in milliseconds.
     // This means that after a file or directory attribute search, if the same attribute is requested again, the kernel will first check the cache.
     // If the record in the cache is still valid (i.e. the timeout time has not exceeded), the cached result will be returned directly without making a request to the user space again
-    // Default is 1.0 seconds.
-    pub attr_timeout: f64,
-
-    // Parameters are used to specify the file attribute cache timeout for automatic cache refresh.
-    // By default, it is set to the same value as attr_timeout (i.e. 1.0 seconds).
-    //
-    // When the file is opened, if the automatic cache (auto_cache) needs to refresh the file data, the kernel will check whether the cache of the file attributes has expired.
-    // If the cache record of file attributes is still valid (i.e. the timeout time has not exceeded), the automatic cache will refresh the file data.
-    pub ac_attr_timeout: f64,
-
-    // Parameters are used to specify the file attribute cache timeout for automatic cache refresh.
-    // By default, it is set to the same value as attr_timeout (i.e. 1.0 seconds).
-    pub ac_attr_timeout_set: f64,
+    // Default is 1000ms (1 second). Sub-second granularity is supported (e.g. 500 = 0.5s).
+    pub attr_timeout_ms: u64,
 
     // Parameters are used to specify whether the file system should remember the opened files and directories.
     // By default, the FUSE file system clears the cache when a file or directory is closed.
@@ -228,13 +216,15 @@ pub struct FuseConf {
 impl FuseConf {
     pub const FS_NAME: &'static str = "curvine-fuse";
 
-    /// Default kernel dentry (name lookup) cache timeout, in seconds.
-    pub const DEFAULT_ENTRY_TIMEOUT: f64 = 1.0;
+    /// Default kernel dentry (name lookup) cache timeout, in milliseconds.
+    pub const DEFAULT_ENTRY_TIMEOUT_MS: u64 = 1000;
 
-    /// Default kernel attribute cache timeout, in seconds. Also used as the
-    /// default for the auto-cache attr timeouts (`ac_attr_timeout*`), which the
-    /// FUSE convention sets equal to `attr_timeout`.
-    pub const DEFAULT_ATTR_TIMEOUT: f64 = 1.0;
+    /// Default kernel negative-lookup (ENOENT) cache timeout, in milliseconds.
+    /// `0` disables negative-lookup caching.
+    pub const DEFAULT_NEGATIVE_TIMEOUT_MS: u64 = 0;
+
+    /// Default kernel attribute cache timeout, in milliseconds.
+    pub const DEFAULT_ATTR_TIMEOUT_MS: u64 = 1000;
 
     /// Default umask applied to file-system-generated permission bits (octal 022).
     pub const DEFAULT_UMASK: u32 = 0o22;
@@ -243,9 +233,9 @@ impl FuseConf {
     pub const DEFAULT_MAX_READAHEAD_KB: u32 = 1024;
 
     pub fn init(&mut self) -> CommonResult<()> {
-        self.attr_ttl = Duration::from_secs_f64(self.attr_timeout);
-        self.entry_ttl = Duration::from_secs_f64(self.entry_timeout);
-        self.negative_ttl = Duration::from_secs_f64(self.negative_timeout);
+        self.attr_ttl = Duration::from_millis(self.attr_timeout_ms);
+        self.entry_ttl = Duration::from_millis(self.entry_timeout_ms);
+        self.negative_ttl = Duration::from_millis(self.negative_timeout_ms);
         self.node_cache_ttl = DurationUnit::from_str(&self.node_cache_timeout)?.as_duration();
         self.meta_cache_ttl_duration = DurationUnit::from_str(&self.meta_cache_ttl)?.as_duration();
 
@@ -364,11 +354,9 @@ impl Default for FuseConf {
             uid: sys::get_uid(),
             gid: sys::get_gid(),
             read_dir_fill_ino: true,
-            entry_timeout: FuseConf::DEFAULT_ENTRY_TIMEOUT,
-            negative_timeout: 0.0,
-            attr_timeout: FuseConf::DEFAULT_ATTR_TIMEOUT,
-            ac_attr_timeout: FuseConf::DEFAULT_ATTR_TIMEOUT,
-            ac_attr_timeout_set: FuseConf::DEFAULT_ATTR_TIMEOUT,
+            entry_timeout_ms: FuseConf::DEFAULT_ENTRY_TIMEOUT_MS,
+            negative_timeout_ms: FuseConf::DEFAULT_NEGATIVE_TIMEOUT_MS,
+            attr_timeout_ms: FuseConf::DEFAULT_ATTR_TIMEOUT_MS,
             remember: false,
             web_port: ClusterConf::DEFAULT_FUSE_WEB_PORT,
 

@@ -78,14 +78,14 @@ pub struct FuseMountArgs {
     pub cache_readdir: Option<bool>,
 
     // Timeout settings
-    #[arg(long, help = "Entry timeout in seconds (optional)")]
-    pub entry_timeout: Option<f64>,
+    #[arg(long, help = "Entry timeout in milliseconds (optional)")]
+    pub entry_timeout_ms: Option<u64>,
 
-    #[arg(long, help = "Attribute timeout in seconds (optional)")]
-    pub attr_timeout: Option<f64>,
+    #[arg(long, help = "Attribute timeout in milliseconds (optional)")]
+    pub attr_timeout_ms: Option<u64>,
 
-    #[arg(long, help = "Negative timeout in seconds (optional)")]
-    pub negative_timeout: Option<f64>,
+    #[arg(long, help = "Negative timeout in milliseconds (optional)")]
+    pub negative_timeout_ms: Option<u64>,
 
     // Performance settings
     #[arg(long, help = "Max background operations (optional)")]
@@ -139,9 +139,6 @@ pub struct FuseMountArgs {
 
     #[arg(long, help = "Remember opened inodes across FUSE sessions (optional)")]
     pub remember: Option<bool>,
-
-    #[arg(long, help = "Auto-cache attr timeout in seconds (optional)")]
-    pub ac_attr_timeout: Option<f64>,
 
     #[arg(
         long,
@@ -232,16 +229,16 @@ impl FuseMountArgs {
             conf.fuse.cache_readdir = cache_readdir;
         }
 
-        if let Some(entry_timeout) = self.entry_timeout {
-            conf.fuse.entry_timeout = entry_timeout;
+        if let Some(entry_timeout_ms) = self.entry_timeout_ms {
+            conf.fuse.entry_timeout_ms = entry_timeout_ms;
         }
 
-        if let Some(attr_timeout) = self.attr_timeout {
-            conf.fuse.attr_timeout = attr_timeout;
+        if let Some(attr_timeout_ms) = self.attr_timeout_ms {
+            conf.fuse.attr_timeout_ms = attr_timeout_ms;
         }
 
-        if let Some(negative_timeout) = self.negative_timeout {
-            conf.fuse.negative_timeout = negative_timeout;
+        if let Some(negative_timeout_ms) = self.negative_timeout_ms {
+            conf.fuse.negative_timeout_ms = negative_timeout_ms;
         }
 
         if let Some(max_background) = self.max_background {
@@ -294,10 +291,6 @@ impl FuseMountArgs {
 
         if let Some(remember) = self.remember {
             conf.fuse.remember = remember;
-        }
-
-        if let Some(ac_attr_timeout) = self.ac_attr_timeout {
-            conf.fuse.ac_attr_timeout = ac_attr_timeout;
         }
 
         if let Some(list_limit) = self.list_limit {
