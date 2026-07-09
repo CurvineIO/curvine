@@ -99,6 +99,7 @@ impl BlockLayout for BdevLayout {
         Ok(())
     }
 
+    // SPDK blocks have no filesystem file; offset release happens in release().
     fn deallocate(&self, _meta: &BlockMeta) -> CommonResult<()> {
         Ok(())
     }

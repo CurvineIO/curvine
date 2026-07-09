@@ -55,6 +55,7 @@ impl BlockLayout for FileLayout {
         Ok(blocks)
     }
 
+    // Filesystem blocks own no under-lock state; offset/file teardown is in deallocate().
     fn release(&self, _meta: &BlockMeta) -> CommonResult<()> {
         Ok(())
     }
