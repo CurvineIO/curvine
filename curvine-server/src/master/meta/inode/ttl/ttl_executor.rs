@@ -72,7 +72,13 @@ impl InodeTtlExecutor {
 
             let inode_view = match fs_dir.store.get_inode(current_id, None)? {
                 Some(inode_view) => inode_view,
-                None => return err_box!("Cannot resolve path for inode {}", inode_id),
+                None => {
+                    return err_box!(
+                        "Cannot resolve path for inode {} (missing ancestor {})",
+                        inode_id,
+                        current_id
+                    );
+                }
             };
 
             match &inode_view {
@@ -90,10 +96,6 @@ impl InodeTtlExecutor {
                     break;
                 }
             }
-        }
-
-        if components.is_empty() {
-            return Ok("/".to_string());
         }
 
         components.reverse();
