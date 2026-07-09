@@ -175,7 +175,15 @@ impl CurvineFileSystem {
             return Err(FsError::read_only(path.full_path()).into());
         }
 
-        self.fs.get_mount(path, rpc_code).await?;
+        if let Some((_, mnt)) = self.fs.get_mount(path, RpcCode::FileStatus).await? {
+            if mnt.info.is_read_only_cache_mode() {
+                return Err(FsError::read_only(format!(
+                    "{} on read_only cache_mode mount {}",
+                    rpc_code, path
+                ))
+                .into());
+            }
+        }
         Ok(())
     }
 
