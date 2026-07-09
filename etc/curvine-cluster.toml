@@ -54,6 +54,14 @@ subnqn = "nqn.2024-01.io.curvine:subsystem2"
 
 # fuse configuration
 [fuse]
+# Kernel-side metadata cache timeouts (milliseconds).
+# NOTE: renamed in a breaking change — the old second-based f64 keys
+# (attr_timeout / entry_timeout / negative_timeout) are no longer recognized
+# and are silently ignored. Migrate by switching to the *_ms keys below and
+# multiplying the old value by 1000.
+attr_timeout_ms = 1000       # kernel attribute cache; 0 disables it
+entry_timeout_ms = 1000      # kernel dentry (name lookup) cache; 0 disables it
+negative_timeout_ms = 0      # negative-lookup (ENOENT) cache; 0 = disabled
 
 # The log configuration of the customer service side, and the customer service side of rust, java, and fuse use this log file.
 [log]
