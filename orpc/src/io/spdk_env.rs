@@ -429,15 +429,26 @@ impl Default for SpdkConf {
 
 impl Display for SpdkConf {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let iova_mode_label = if self.iova_mode.is_empty() {
+            "auto"
+        } else {
+            self.iova_mode.as_str()
+        };
         write!(
             f,
-            "SpdkConf(enabled={}, hugepage={}MB, reactor_mask={}, targets={})",
+            "SpdkConf(enabled={}, hugepage={}MB, reactor_mask={}, iova_mode={}, targets={})",
             self.enabled,
             self.hugepage_mb,
             self.reactor_mask,
+            iova_mode_label,
             self.targets.len()
         )
     }
+}
+
+#[cfg(test)]
+pub(crate) fn spdk_iova_mode_for_test() -> String {
+    std::env::var("SPDK_IOVA_MODE").unwrap_or_else(|_| "va".to_string())
 }
 
 // Bdev descriptor (discovered after init)

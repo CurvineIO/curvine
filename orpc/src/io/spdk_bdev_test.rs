@@ -27,7 +27,7 @@ fn test_spdk_conf() -> SpdkConf {
     let subnqn =
         std::env::var("SPDK_TARGET_NQN").unwrap_or("nqn.2024-01.io.curvine:test".to_string());
     let trtype = std::env::var("SPDK_TRANSPORT_TYPE").unwrap_or("tcp".to_string());
-    let iova_mode = std::env::var("SPDK_IOVA_MODE").unwrap_or_else(|_| "va".to_string());
+    let iova_mode = crate::io::spdk_env::spdk_iova_mode_for_test();
 
     SpdkConf {
         enabled: true,
