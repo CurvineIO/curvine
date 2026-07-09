@@ -95,7 +95,7 @@ impl FuseReader {
         self.err_monitor.take_error().unwrap_or(e)
     }
 
-    pub async fn read(&mut self, op: Read<'_>, reply: FuseResponse) -> FsResult<()> {
+    pub async fn read(&self, op: Read<'_>, reply: FuseResponse) -> FsResult<()> {
         let res = self
             .sender
             .send(ReadTask::Read(
@@ -108,7 +108,7 @@ impl FuseReader {
         res
     }
 
-    pub async fn complete(&mut self, reply: Option<FuseResponse>) -> FsResult<()> {
+    pub async fn complete(&self, reply: Option<FuseResponse>) -> FsResult<()> {
         let fun = async {
             let (rx, tx) = CallChannel::channel();
             self.sender.send(ReadTask::Complete(rx, reply)).await?;
@@ -279,7 +279,7 @@ mod tests {
             let reader = UnifiedReader::Local(LocalReader::new(&path, 4096).unwrap());
             assert_eq!(reader.path_type(), "local");
             let rt2 = Arc::new(AsyncRuntime::single());
-            let mut fuse_reader = FuseReader::new(&conf, rt2.clone(), reader);
+            let fuse_reader = FuseReader::new(&conf, rt2.clone(), reader);
             // Leak our Arc so this runtime is never the-last-Arc-dropped inside the
             // outer async block (dropping a tokio runtime from an async context panics).
             std::mem::forget(rt2);

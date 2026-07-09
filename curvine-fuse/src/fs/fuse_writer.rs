@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::fs::operator::Write;
 use crate::fuse_metrics::{mono_now, ActiveGuard, FuseMetrics, IO_TYPE_WRITE};
 use crate::raw::fuse_abi::fuse_write_out;
 use crate::session::FuseResponse;
@@ -25,13 +24,13 @@ use curvine_common::FsResult;
 use log::error;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
-use orpc::sync::{AtomicCounter, ErrorMonitor};
+use orpc::sync::{AtomicCounter, AtomicLong, ErrorMonitor};
 use orpc::sys::DataSlice;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio_util::bytes::Bytes;
 
 enum WriteTask {
-    Write(i64, Bytes, FuseResponse),
+    Write(i64, Bytes, Option<FuseResponse>),
     Flush(CallSender<i8>, Option<FuseResponse>),
     Complete(CallSender<i8>, Option<FuseResponse>),
     Resize(CallSender<i8>, FileAllocOpts),
@@ -55,9 +54,8 @@ pub struct FuseWriter {
     err_monitor: Arc<ErrorMonitor<FsError>>,
     status: FileStatus,
     is_ufs: bool,
-    len: Arc<Mutex<i64>>,
+    len: Arc<AtomicLong>,
     write_ver: AtomicCounter,
-    completed: bool,
     /// Phase 2b kill-switch flag: decides whether `send_queued_task` creates a
     /// `stream_write_queue_depth` guard. (The `path_type` label is captured as a
     /// local and moved into the writer task, not stored here.)
@@ -83,7 +81,7 @@ impl FuseWriter {
 
         let status = writer.status().clone();
         let monitor = err_monitor.clone();
-        let len = Arc::new(Mutex::new(status.len));
+        let len = Arc::new(AtomicLong::new(status.len));
         let write_ver = AtomicCounter::new(0);
         // Phase 2b: backend kind + metrics gate, captured at open and moved into
         // the writer task for the per-IO observe (same as FuseReader).
@@ -111,7 +109,6 @@ impl FuseWriter {
             is_ufs,
             len,
             write_ver,
-            completed: false,
             metrics_enabled,
         }
     }
@@ -129,10 +126,6 @@ impl FuseWriter {
 
     pub fn is_ufs(&self) -> bool {
         self.is_ufs
-    }
-
-    pub fn is_completed(&self) -> bool {
-        self.completed
     }
 
     fn check_error(&self, e: FsError) -> FsError {
@@ -172,18 +165,18 @@ impl FuseWriter {
         Ok(())
     }
 
-    pub async fn write(&mut self, op: Write<'_>, reply: FuseResponse) -> FsResult<()> {
+    pub async fn write(&self, off: i64, data: Bytes, reply: Option<FuseResponse>) -> FsResult<()> {
         // `write_ver.incr()` stays BEFORE the enqueue (unchanged): the read path
         // (`FileHandle::read`) compares write_ver to decide a dirty-read flush+reopen,
         // so its timing is a consistency invariant, not something to reorder for
         // metrics.
         self.write_ver.incr();
-        self.send_queued_task(WriteTask::Write(op.arg.offset as i64, op.data, reply))
+        self.send_queued_task(WriteTask::Write(off, data, reply))
             .await
             .map_err(|e| self.check_error(e))
     }
 
-    pub async fn flush(&mut self, reply: Option<FuseResponse>) -> FsResult<()> {
+    pub async fn flush(&self, reply: Option<FuseResponse>) -> FsResult<()> {
         let fun = async {
             let (rx, tx) = CallChannel::channel();
             self.send_queued_task(WriteTask::Flush(rx, reply)).await?;
@@ -193,8 +186,7 @@ impl FuseWriter {
         fun.await.map_err(|e| self.check_error(e))
     }
 
-    pub async fn complete(&mut self, reply: Option<FuseResponse>) -> FsResult<()> {
-        self.completed = true;
+    pub async fn complete(&self, reply: Option<FuseResponse>) -> FsResult<()> {
         let fun = async {
             let (rx, tx) = CallChannel::channel();
             self.send_queued_task(WriteTask::Complete(rx, reply))
@@ -205,7 +197,7 @@ impl FuseWriter {
         fun.await.map_err(|e| self.check_error(e))
     }
 
-    pub async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
+    pub async fn resize(&self, opts: FileAllocOpts) -> FsResult<()> {
         let len = opts.len;
         let fun = async {
             let (rx, tx) = CallChannel::channel();
@@ -217,13 +209,12 @@ impl FuseWriter {
         // before awaiting it) — unchanged consistency timing.
         self.write_ver.incr();
         fun.await.map_err(|e| self.check_error(e))?;
-        let mut lock = self.len.lock().unwrap();
-        *lock = len;
+        self.len.set(len);
         Ok(())
     }
 
     pub fn len(&self) -> i64 {
-        *self.len.lock().unwrap()
+        self.len.get()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -233,11 +224,10 @@ impl FuseWriter {
     async fn writer_future(
         mut writer: UnifiedWriter,
         mut req_receiver: AsyncReceiver<QueuedWriteTask>,
-        file_len: Arc<Mutex<i64>>,
+        file_len: Arc<AtomicLong>,
         path_type: &'static str,
         metrics_enabled: bool,
     ) -> FsResult<()> {
-        let mut complete = false;
         while let Some(mut queued) = req_receiver.recv().await {
             // Dequeue point: drop the queue guard FIRST (before any backend work),
             // so `stream_write_queue_depth` counts only channel backlog. An
@@ -281,11 +271,15 @@ impl FuseWriter {
                     }
 
                     if res.is_ok() {
-                        let mut lock = file_len.lock().unwrap();
-                        *lock = lock.max(off + len as i64);
+                        let cur_len = file_len.get();
+                        file_len.set(cur_len.max(off + len as i64))
                     }
 
-                    reply.send_rep(res).await?;
+                    if let Some(reply) = reply {
+                        reply.send_rep(res).await?;
+                    } else {
+                        res?;
+                    }
                 }
 
                 WriteTask::Flush(tx, reply) => {
@@ -297,16 +291,7 @@ impl FuseWriter {
                 }
 
                 WriteTask::Complete(tx, reply) => {
-                    let res = if !complete {
-                        let res = writer.complete().await;
-                        if res.is_ok() {
-                            complete = true;
-                        }
-                        res
-                    } else {
-                        Ok(())
-                    };
-
+                    let res = writer.complete().await;
                     if let Some(reply) = reply {
                         reply.send_rep(res).await?;
                     }
@@ -511,7 +496,7 @@ mod tests {
                 let writer = UnifiedWriter::Local(LocalWriter::new(&path, 4096).unwrap());
                 assert_eq!(writer.path_type(), "local");
                 let rt2 = Arc::new(AsyncRuntime::single());
-                let mut fuse_writer = FuseWriter::new(&conf, rt2.clone(), writer);
+                let fuse_writer = FuseWriter::new(&conf, rt2.clone(), writer);
                 // Leak our Arc so this runtime is never the-last-Arc-dropped inside
                 // the outer async block (dropping a tokio runtime from an async
                 // context panics).
@@ -529,7 +514,10 @@ mod tests {
                     arg: &arg,
                     data: vec![3u8; 2048].into(),
                 };
-                fuse_writer.write(op, reply).await.unwrap();
+                fuse_writer
+                    .write(op.arg.offset as i64, op.data.clone(), Some(reply))
+                    .await
+                    .unwrap();
 
                 for _ in 0..50 {
                     if mx

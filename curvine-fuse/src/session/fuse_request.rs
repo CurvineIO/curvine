@@ -86,6 +86,10 @@ impl FuseRequest {
         )
     }
 
+    pub fn is_meta(&self) -> bool {
+        !matches!(self.opcode, FUSE_READ | FUSE_WRITE)
+    }
+
     fn get_write_bytes(&self, size: usize) -> FuseResult<Bytes> {
         let start = FUSE_IN_HEADER_LEN + size_of::<fuse_write_in>();
         let end = start + size;
