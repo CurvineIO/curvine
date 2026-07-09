@@ -85,6 +85,12 @@ impl BlockClient {
         self.uptime = LocalTime::mills();
     }
 
+    pub fn is_active(&self) -> bool {
+        self.client
+            .as_ref()
+            .is_some_and(|client| client.is_active())
+    }
+
     pub async fn rpc(&self, msg: Message) -> FsResult<Message> {
         let client = try_option_ref!(self.client);
         let rep_msg = client.timeout_rpc(self.timeout, msg).await?;

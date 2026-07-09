@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::block::BlockClient;
 use crate::file::FsContext;
 use bytes::BytesMut;
 use curvine_common::error::FsError;
@@ -26,7 +27,7 @@ use std::sync::Arc;
 
 pub struct BlockReaderLocal {
     rt: Arc<Runtime>,
-    fs_context: Arc<FsContext>,
+    client: BlockClient,
     os_cache: CacheManager,
     last_task: Option<ReadAheadTask>,
     block: ExtendedBlock,
@@ -69,7 +70,7 @@ impl BlockReaderLocal {
 
         let reader = Self {
             rt: fs_context.clone_runtime(),
-            fs_context: fs_context.clone(),
+            client,
             os_cache: fs_context.clone_os_cache(),
             last_task: None,
             block,
@@ -155,8 +156,7 @@ impl BlockReaderLocal {
     // Reading is completed and the server needs to be notified.
     pub async fn complete(&mut self) -> FsResult<()> {
         let next_seq_id = self.next_seq_id();
-        let client = self.fs_context.acquire_read(&self.worker_address).await?;
-        client
+        self.client
             .read_commit(&self.block, self.req_id, next_seq_id)
             .await?;
         Ok(())
