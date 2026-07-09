@@ -64,6 +64,7 @@ pub enum ErrorKind {
     NotADirectory = 27,
     InvalidArgument = 28,
     BlockNotFound = 29,
+    ReadOnly = 30,
 
     #[num_enum(default)]
     Common = 10000,
@@ -173,6 +174,10 @@ pub enum FsError {
     #[error("{0}")]
     UnsupportedUfsRead(ErrorImpl<StringError>),
 
+    // Read-only file system or mount
+    #[error("{0}")]
+    ReadOnly(ErrorImpl<StringError>),
+
     // Pipeline replication error with failed worker info
     #[error("{0}")]
     Pipeline(ErrorImpl<StringError>),
@@ -234,6 +239,11 @@ impl FsError {
     pub fn unsupported_ufs_read(path: impl AsRef<str>) -> Self {
         let msg = format!("File {} unsupported ufs read", path.as_ref());
         Self::UnsupportedUfsRead(ErrorImpl::with_source(msg.into()))
+    }
+
+    pub fn read_only(path: impl AsRef<str>) -> Self {
+        let msg = format!("{} is on a read-only mount", path.as_ref());
+        Self::ReadOnly(ErrorImpl::with_source(msg.into()))
     }
 
     pub fn job_not_found(job_id: impl AsRef<str>) -> Self {
@@ -367,6 +377,7 @@ impl FsError {
             FsError::Ufs(_) => ErrorKind::Ufs,
             FsError::Expired(_) => ErrorKind::Expired,
             FsError::UnsupportedUfsRead(_) => ErrorKind::UnsupportedUfsRead,
+            FsError::ReadOnly(_) => ErrorKind::ReadOnly,
             FsError::Pipeline(_) => ErrorKind::Pipeline,
             FsError::MinReplicasNotMet(_) => ErrorKind::MinReplicasNotMet,
             FsError::JobNotFound(_) => ErrorKind::JobNotFound,
@@ -513,6 +524,7 @@ impl ErrorExt for FsError {
             FsError::Ufs(e) => FsError::Ufs(e.ctx(ctx)),
             FsError::Expired(e) => FsError::Expired(e.ctx(ctx)),
             FsError::UnsupportedUfsRead(e) => FsError::UnsupportedUfsRead(e.ctx(ctx)),
+            FsError::ReadOnly(e) => FsError::ReadOnly(e.ctx(ctx)),
             FsError::Pipeline(e) => FsError::Pipeline(e.ctx(ctx)),
             FsError::MinReplicasNotMet(e) => FsError::MinReplicasNotMet(e.ctx(ctx)),
             FsError::JobNotFound(e) => FsError::JobNotFound(e.ctx(ctx)),
@@ -548,6 +560,7 @@ impl ErrorExt for FsError {
             FsError::Ufs(e) => e.encode(ErrorKind::Ufs),
             FsError::Expired(e) => e.encode(ErrorKind::Expired),
             FsError::UnsupportedUfsRead(e) => e.encode(ErrorKind::UnsupportedUfsRead),
+            FsError::ReadOnly(e) => e.encode(ErrorKind::ReadOnly),
             FsError::Pipeline(e) => e.encode(ErrorKind::Pipeline),
             FsError::MinReplicasNotMet(e) => e.encode(ErrorKind::MinReplicasNotMet),
             FsError::JobNotFound(e) => e.encode(ErrorKind::JobNotFound),
@@ -586,6 +599,7 @@ impl ErrorExt for FsError {
             ErrorKind::Ufs => FsError::Ufs(de.into_string()),
             ErrorKind::Expired => FsError::Expired(de.into_string()),
             ErrorKind::UnsupportedUfsRead => FsError::UnsupportedUfsRead(de.into_string()),
+            ErrorKind::ReadOnly => FsError::ReadOnly(de.into_string()),
             ErrorKind::Pipeline => FsError::Pipeline(de.into_string()),
             ErrorKind::MinReplicasNotMet => FsError::MinReplicasNotMet(de.into_string()),
             ErrorKind::JobNotFound => FsError::JobNotFound(de.into_string()),
@@ -650,6 +664,16 @@ mod tests {
         let error = FsError::pipeline_error(789, "Test error");
 
         assert!(matches!(error.kind(), ErrorKind::Pipeline));
+    }
+
+    #[test]
+    pub fn read_only_error_kind_test() {
+        let error = FsError::read_only("/mnt/ro");
+
+        assert!(matches!(error.kind(), ErrorKind::ReadOnly));
+        let bytes = error.encode();
+        let decoded = FsError::decode(bytes);
+        assert!(matches!(decoded.kind(), ErrorKind::ReadOnly));
     }
 
     #[test]
