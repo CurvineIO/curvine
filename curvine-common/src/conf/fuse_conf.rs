@@ -375,7 +375,7 @@ impl Default for FuseConf {
             max_background: 256,
             congestion_threshold: 192,
 
-            enable_meta_cache: false,
+            enable_meta_cache: true,
             meta_cache_capacity: 100000,
             meta_cache_ttl: "120s".to_string(),
 
