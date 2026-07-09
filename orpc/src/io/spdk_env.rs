@@ -1187,7 +1187,7 @@ mod test {
 
         #[test]
         fn validate_rejects_low_keep_alive() {
-            let mut conf = SpdkConf {
+            let conf = SpdkConf {
                 enabled: true,
                 poll_interval_ms: 100,
                 targets: vec![NvmeTarget {
@@ -1209,7 +1209,7 @@ mod test {
 
         #[test]
         fn validate_accepts_high_keep_alive() {
-            let mut conf = SpdkConf {
+            let conf = SpdkConf {
                 enabled: true,
                 poll_interval_ms: 100,
                 targets: vec![NvmeTarget {
@@ -1227,7 +1227,7 @@ mod test {
 
         #[test]
         fn validate_rejects_inherited_low_keep_alive() {
-            let mut conf = SpdkConf {
+            let conf = SpdkConf {
                 enabled: true,
                 poll_interval_ms: 100,
                 keep_alive_timeout_ms: 50, // global is too low
