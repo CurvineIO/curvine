@@ -29,7 +29,7 @@ use crate::{err_fuse, FuseError, FuseResult, FuseUtils};
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::{ClusterConf, FuseConf};
 use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, Path, StateReader, StateWriter};
+use curvine_common::fs::{FileSystem, Path, RpcCode, StateReader, StateWriter};
 use curvine_common::state::{
     CreateFileOptsBuilder, FileAllocMode, FileAllocOpts, FileLock, FileStatus, LockFlags, LockType,
     MkdirOptsBuilder, OpenFlags, SetAttrOpts,
@@ -168,6 +168,15 @@ impl CurvineFileSystem {
             attr_valid_nsec: conf.attr_ttl.subsec_nanos(),
             attr,
         }
+    }
+
+    async fn ensure_writable_path(&self, path: &Path, rpc_code: RpcCode) -> FuseResult<()> {
+        if self.conf.readonly {
+            return Err(FsError::read_only(path.full_path()).into());
+        }
+
+        self.fs.get_mount(path, rpc_code).await?;
+        Ok(())
     }
 
     pub fn new_dot_status(name: &str) -> FileStatus {
@@ -878,6 +887,7 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn set_xattr(&self, op: SetXAttr<'_>) -> FuseResult<()> {
         let name = try_option!(op.name.to_str());
         let path = self.state.get_path(op.header.nodeid)?;
+        self.ensure_writable_path(&path, RpcCode::SetAttr).await?;
 
         // Get the xattr value from the request
         let value_slice: &[u8] = op.value;
@@ -921,6 +931,7 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn remove_xattr(&self, op: RemoveXAttr<'_>) -> FuseResult<()> {
         let name = try_option!(op.name.to_str());
         let path = self.state.get_path(op.header.nodeid)?;
+        self.ensure_writable_path(&path, RpcCode::SetAttr).await?;
 
         debug!("Removing xattr: path='{}' name='{}'", path, name);
 
@@ -1019,6 +1030,7 @@ impl fs::FileSystem for CurvineFileSystem {
             op.header.nodeid, op.arg
         );
         let path = self.state.get_path(op.header.nodeid)?;
+        self.ensure_writable_path(&path, RpcCode::SetAttr).await?;
 
         // Convert setattr to opts with UID/GID numeric fallback
         let mut opts = match Self::fuse_setattr_to_opts(op.arg) {
@@ -1158,6 +1170,7 @@ impl fs::FileSystem for CurvineFileSystem {
         }
 
         let path = self.state.get_path_name(op.header.nodeid, name)?;
+        self.ensure_writable_path(&path, RpcCode::Mkdir).await?;
 
         let mut opts = MkdirOptsBuilder::with_conf(&self.fs.conf().client);
         // Apply requested mode and ownership to directory if provided
@@ -1188,6 +1201,8 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn allocate(&self, op: FAllocate<'_>) -> FuseResult<()> {
         let path = self.state.get_path(op.header.nodeid)?;
+        self.ensure_writable_path(&path, RpcCode::ResizeFile)
+            .await?;
 
         let opts = FileAllocOpts {
             truncate: false,
@@ -1227,6 +1242,11 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path(op.header.nodeid)?;
         // Check file access permissions before opening
         let action = OpenAction::try_from(op.arg.flags)?;
+        let truncate = (op.arg.flags & libc::O_TRUNC as u32) != 0;
+        if action.write() || truncate {
+            self.ensure_writable_path(&path, RpcCode::CreateFile)
+                .await?;
+        }
         self.check_permissions(&path, op.header, action.acl_mask())
             .await?;
 
@@ -1301,6 +1321,8 @@ impl fs::FileSystem for CurvineFileSystem {
         }
 
         let path = self.state.get_path_common(id, Some(name))?;
+        self.ensure_writable_path(&path, RpcCode::CreateFile)
+            .await?;
         let node = self.state.find_node(id, Some(name))?;
         let flags = op.arg.flags;
 
@@ -1343,6 +1365,9 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn write(&self, op: Write<'_>, reply: FuseResponse) -> FuseResult<()> {
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
+        let path = self.state.get_path(op.header.nodeid)?;
+        self.ensure_writable_path(&path, RpcCode::CreateFile)
+            .await?;
         handle.write(op, reply).await
     }
 
@@ -1399,6 +1424,7 @@ impl fs::FileSystem for CurvineFileSystem {
         let parent_ino = op.header.nodeid;
 
         let path = self.state.get_path_common(parent_ino, Some(name))?;
+        self.ensure_writable_path(&path, RpcCode::Delete).await?;
         if self.state.should_delete_now(parent_ino, Some(name))? {
             self.fs.delete(&path, false).await?;
         }
@@ -1414,6 +1440,8 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let des_path = self.state.get_path_common(op.header.nodeid, Some(name))?;
         let src_path = self.state.get_path(oldnodeid)?;
+        self.ensure_writable_path(&src_path, RpcCode::Link).await?;
+        self.ensure_writable_path(&des_path, RpcCode::Link).await?;
 
         debug!(
             "link: src_path={}, des_path={}, oldnodeid={}, parent={}",
@@ -1438,6 +1466,7 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn rm_dir(&self, op: RmDir<'_>) -> FuseResult<()> {
         let name = try_option!(op.name.to_str());
         let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
+        self.ensure_writable_path(&path, RpcCode::Delete).await?;
 
         self.fs.delete(&path, false).await?;
         self.state.unlink_node(op.header.nodeid, Some(name))?;
@@ -1456,6 +1485,10 @@ impl fs::FileSystem for CurvineFileSystem {
         let (old_path, new_path) =
             self.state
                 .get_path2(op.header.nodeid, old_name, op.arg.newdir, new_name)?;
+        self.ensure_writable_path(&old_path, RpcCode::Rename)
+            .await?;
+        self.ensure_writable_path(&new_path, RpcCode::Rename)
+            .await?;
 
         self.fs.rename(&old_path, &new_path).await?;
 
@@ -1493,6 +1526,8 @@ impl fs::FileSystem for CurvineFileSystem {
         };
 
         let link_path = self.state.get_path_common(parent, linkname)?;
+        self.ensure_writable_path(&link_path, RpcCode::Symlink)
+            .await?;
         self.fs.symlink(target, &link_path, false).await?;
 
         self.invalidate_cache(&link_path, INVAL_REASON_SYMLINK)?;
@@ -1532,6 +1567,11 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn fsync(&self, op: FSync<'_>, reply: FuseResponse) -> FuseResult<()> {
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
+        if handle.writer.is_some() {
+            let path = self.state.get_path(op.header.nodeid)?;
+            self.ensure_writable_path(&path, RpcCode::CreateFile)
+                .await?;
+        }
         handle.flush(Some(reply)).await?;
 
         let path = Path::from_str(&handle.status.path)?;
@@ -1624,6 +1664,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn set_lk(&self, op: SetLk<'_>) -> FuseResult<()> {
         let path = self.state.get_path(op.header.nodeid)?;
+        self.ensure_writable_path(&path, RpcCode::SetLock).await?;
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
 
         let lock = self.to_file_lock(op.arg);
@@ -1640,6 +1681,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn set_lkw(&self, op: SetLkW<'_>) -> FuseResult<()> {
         let path = self.state.get_path(op.header.nodeid)?;
+        self.ensure_writable_path(&path, RpcCode::SetLock).await?;
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
 
         let conf = &self.fs.conf().client;

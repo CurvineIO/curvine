@@ -109,6 +109,13 @@ pub struct FuseMountArgs {
     #[arg(short, long)]
     options: Vec<String>,
 
+    #[arg(
+        long,
+        action = clap::ArgAction::SetTrue,
+        help = "Mount the entire FUSE filesystem read-only"
+    )]
+    readonly: bool,
+
     // Additional FuseConf fields
     #[arg(long, help = "Fill inode number when reading directory (optional)")]
     pub read_dir_fill_ino: Option<bool>,
@@ -262,6 +269,10 @@ impl FuseMountArgs {
 
         if let Some(read_dir_fill_ino) = self.read_dir_fill_ino {
             conf.fuse.read_dir_fill_ino = read_dir_fill_ino;
+        }
+
+        if self.readonly {
+            conf.fuse.readonly = true;
         }
 
         if let Some(write_back_cache) = self.write_back_cache {

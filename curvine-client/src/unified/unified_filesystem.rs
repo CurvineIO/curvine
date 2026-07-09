@@ -152,7 +152,7 @@ impl UnifiedFileSystem {
         let state = self.mount_cache.get_mount(self, path).await?;
         if let Some(mnt) = state {
             if mnt.info.is_read_only_cache_mode() && Self::is_mount_write_rpc(rpc_code) {
-                return err_ext!(FsError::unsupported(format!(
+                return err_ext!(FsError::read_only(format!(
                     "{} on read_only cache_mode mount {}",
                     rpc_code, path
                 )));
@@ -284,6 +284,7 @@ impl UnifiedFileSystem {
 
     pub async fn link(&self, src_path: &Path, dst_path: &Path) -> FsResult<()> {
         let fut = async {
+            let _ = self.get_mount_checked(dst_path, RpcCode::Link).await?;
             match self.get_mount_checked(src_path, RpcCode::Link).await? {
                 None => self.cv.link(src_path, dst_path).await,
                 Some(_) => err_ext!(FsError::unsupported("link")),

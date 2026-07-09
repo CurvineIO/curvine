@@ -98,6 +98,9 @@ pub struct FuseConf {
     // Mount the configuration, needs to be passed to the linux kernel.
     pub fuse_opts: Vec<String>,
 
+    // Mount the whole FUSE filesystem read-only at the kernel level.
+    pub readonly: bool,
+
     // Overwrite the permission bits set by the file system in st_mode.
     // The generated permission bit is the missing permission bit in the given umask value.This value is given in octal representation.
     // Default value 022
@@ -320,7 +323,14 @@ impl FuseConf {
     }
 
     pub fn set_fuse_opts(&self, mount_options: &mut String) {
+        if self.readonly {
+            mount_options.push_str(",ro");
+        }
+
         self.fuse_opts.iter().for_each(|opt| match opt.as_str() {
+            "ro" => {
+                mount_options.push_str(",ro");
+            }
             "default_permissions" => {
                 mount_options.push_str(",default_permissions");
             }
@@ -360,6 +370,7 @@ impl Default for FuseConf {
             fuse_channel_size: 0,
             stream_channel_size: 0,
             fuse_opts: vec![],
+            readonly: false,
             umask: Self::DEFAULT_UMASK,
             uid: sys::get_uid(),
             gid: sys::get_gid(),
@@ -460,6 +471,23 @@ max_readahead_kb = 1024
             conf.max_readahead_kb,
             Some(FuseConf::DEFAULT_MAX_READAHEAD_KB)
         );
+    }
+
+    #[test]
+    fn readonly_adds_ro_mount_option() {
+        let conf = FuseConf {
+            readonly: true,
+            ..Default::default()
+        };
+        let mut mount_options = String::new();
+        conf.set_fuse_opts(&mut mount_options);
+        assert!(mount_options.split(',').any(|opt| opt == "ro"));
+    }
+
+    #[test]
+    fn toml_readonly_is_parsed() {
+        let conf: FuseConf = toml::from_str("readonly = true").expect("parse");
+        assert!(conf.readonly);
     }
 
     #[test]
