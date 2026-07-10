@@ -161,9 +161,6 @@ pub struct SpdkPoller {
     /// Whether poller is blocked on eventfd (idle). Bdevs check this to
     /// skip eventfd write syscall when poller is already active.
     is_sleeping: Arc<AtomicBool>,
-    /// Orphaned QpairState entries keyed by qpair address.
-    /// Kept alive for late SPDK callbacks during free_io_qpair.
-    orphaned: Arc<Mutex<HashMap<usize, Box<QpairState>>>>,
 }
 
 impl SpdkPoller {
@@ -182,7 +179,6 @@ impl SpdkPoller {
         let eventfd_arc = Arc::new(eventfd);
 
         let orphaned = Arc::new(Mutex::new(HashMap::new()));
-        let orphaned_clone = orphaned.clone();
 
         let handle = std::thread::Builder::new()
             .name("spdk-poller".to_string())
@@ -193,7 +189,7 @@ impl SpdkPoller {
                     is_sleeping_clone,
                     eventfd_raw,
                     config,
-                    orphaned_clone,
+                    orphaned,
                 );
             })
             .expect("Failed to spawn SPDK poller thread");
@@ -204,7 +200,6 @@ impl SpdkPoller {
             shutdown,
             handle: Some(handle),
             is_sleeping,
-            orphaned,
         }
     }
 
@@ -662,57 +657,6 @@ impl SpdkPoller {
 }
 
 impl SpdkPoller {
-    /// True if orphaned map contains entries for this qpair.
-    pub fn has_orphaned_for_qpair(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> bool {
-        if let Ok(guard) = self.orphaned.lock() {
-            guard.contains_key(&(qpair as usize))
-        } else {
-            false
-        }
-    }
-
-    /// Remove orphaned QpairState for this qpair and free all entries.
-    /// Safe to call only after free_io_qpair has completed for this qpair
-    /// (all late SPDK callbacks have fired).
-    pub fn reclaim_orphaned_for_qpair(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> bool {
-        if let Ok(mut guard) = self.orphaned.lock() {
-            if let Some(mut qs) = guard.remove(&(qpair as usize)) {
-                for ptr in qs.stale.drain(..) {
-                    unsafe {
-                        drop(Box::from_raw(ptr));
-                    }
-                }
-                for ptr in qs.pending.drain(..) {
-                    unsafe {
-                        drop(Box::from_raw(ptr));
-                    }
-                }
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Reclaim all orphaned QpairState entries.
-    /// SAFETY: Call only after all late SPDK callbacks have fired
-    /// (i.e., after qpair_pool::drain_all in SpdkEnv::shutdown).
-    pub fn reclaim_stale(&self) {
-        if let Ok(mut guard) = self.orphaned.lock() {
-            for (_key, mut qs) in guard.drain() {
-                for ptr in qs.stale.drain(..) {
-                    unsafe {
-                        drop(Box::from_raw(ptr));
-                    }
-                }
-                for ptr in qs.pending.drain(..) {
-                    unsafe {
-                        drop(Box::from_raw(ptr));
-                    }
-                }
-            }
-        }
-    }
-
     /// Poll all active qpairs, handle errors.
     /// On error: force_complete + move QpairState from dead_qpairs to orphaned HashMap.
     fn poll_and_sweep(
@@ -768,6 +712,7 @@ struct QpairState {
 unsafe impl Send for QpairState {}
 
 impl QpairState {
+    #[cfg(test)]
     fn reclaim_stale(&mut self) {
         for ptr in self.stale.drain(..) {
             unsafe { drop(Box::from_raw(ptr as *mut CallbackCtx)) };
@@ -1464,7 +1409,11 @@ mod test {
 
         // force_complete did not re-signal stale entries
         assert_eq!(completion_1.wait(1), -libc::ETIMEDOUT);
-        assert_eq!(inflight_1.load(Ordering::Acquire), 1, "stale entry inflight must not be decremented");
+        assert_eq!(
+            inflight_1.load(Ordering::Acquire),
+            1,
+            "stale entry inflight must not be decremented"
+        );
         // pending entry was signaled with -EIO
         assert_eq!(completion_2.wait(0), -libc::EIO);
         assert_eq!(inflight_2.load(Ordering::Acquire), 0);
