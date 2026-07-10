@@ -21,9 +21,9 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, FsKind, ListStream, Path, Reader, RpcCode, Writer};
 use curvine_common::state::{
-    CreateFileOpts, FileAllocOpts, FileLock, FileStatus, FreeResult, JobStatus, ListOptions,
-    LoadJobCommand, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags,
-    SetAttrOpts,
+    CreateFileOpts, FileAllocOpts, FileLock, FileStatus, FreeResult, JobStatus, JobTaskState,
+    ListOptions, LoadJobCommand, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions,
+    OpenFlags, SetAttrOpts,
 };
 use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
@@ -558,18 +558,18 @@ impl UnifiedFileSystem {
     }
 
     pub async fn wait_job_complete(&self, path: &Path, fail_if_not_found: bool) -> FsResult<()> {
-        let job_id = self.load_job_id_for_path(path).await?;
-        let client = JobMasterClient::new(self.fs_client());
-        client.wait_job_complete(job_id, fail_if_not_found).await
+        let job_ids = self.load_job_ids_for_path(path).await?;
+        self.wait_load_job_complete(job_ids, fail_if_not_found)
+            .await
     }
 
     pub async fn get_job_status(&self, path: &Path) -> FsResult<JobStatus> {
         let client = JobMasterClient::new(self.fs_client());
-        let job_id = self.load_job_id_for_path(path).await?;
-        client.get_job_status(job_id).await
+        let job_ids = self.load_job_ids_for_path(path).await?;
+        Self::get_first_load_job_status(&client, &job_ids).await
     }
 
-    async fn load_job_id_for_path(&self, path: &Path) -> FsResult<String> {
+    async fn load_job_ids_for_path(&self, path: &Path) -> FsResult<Vec<String>> {
         if !path.is_cv() {
             return err_box!("the current file {} is not a cache file", path);
         }
@@ -578,17 +578,136 @@ impl UnifiedFileSystem {
             None => return err_box!("the current file {} is not mounted to ufs", path),
         };
 
-        let source = if mnt.info.is_fs_mode() {
-            match self.cv.get_status(path).await {
-                Ok(status) if status.storage_policy.ufs_only() => ufs_path.full_path(),
-                Ok(_) | Err(FsError::FileNotFound(_)) => path.full_path(),
-                Err(err) => return Err(err),
-            }
-        } else {
-            ufs_path.full_path()
+        let cv_job_id = CommonUtils::create_job_id(path.full_path());
+        let ufs_job_id = CommonUtils::create_job_id(ufs_path.full_path());
+
+        if !mnt.info.is_fs_mode() {
+            return Ok(vec![ufs_job_id]);
+        }
+
+        let prefer_ufs = match self.cv.get_status(path).await {
+            Ok(status) => status.storage_policy.ufs_only(),
+            Err(FsError::FileNotFound(_)) => true,
+            Err(err) => return Err(err),
         };
 
-        Ok(CommonUtils::create_job_id(source))
+        if prefer_ufs {
+            Ok(Self::unique_job_ids([ufs_job_id, cv_job_id]))
+        } else {
+            Ok(Self::unique_job_ids([cv_job_id, ufs_job_id]))
+        }
+    }
+
+    fn unique_job_ids(job_ids: impl IntoIterator<Item = String>) -> Vec<String> {
+        let mut unique = Vec::new();
+        for job_id in job_ids {
+            if !unique.contains(&job_id) {
+                unique.push(job_id);
+            }
+        }
+        unique
+    }
+
+    async fn get_first_load_job_status(
+        client: &JobMasterClient,
+        job_ids: &[String],
+    ) -> FsResult<JobStatus> {
+        let mut first_not_found = None;
+
+        for job_id in job_ids {
+            match client.get_job_status(job_id).await {
+                Ok(status) => return Ok(status),
+                Err(err @ FsError::JobNotFound(_)) => {
+                    first_not_found.get_or_insert(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(first_not_found.unwrap_or_else(|| FsError::job_not_found(job_ids.join(","))))
+    }
+
+    async fn wait_load_job_complete(
+        &self,
+        job_ids: Vec<String>,
+        fail_if_not_found: bool,
+    ) -> FsResult<()> {
+        let timeout = self.conf().client.max_sync_wait_timeout;
+        time::timeout(
+            timeout,
+            self.wait_load_job_complete0(job_ids, fail_if_not_found),
+        )
+        .await?
+    }
+
+    async fn wait_load_job_complete0(
+        &self,
+        job_ids: Vec<String>,
+        fail_if_not_found: bool,
+    ) -> FsResult<()> {
+        let client = JobMasterClient::new(self.fs_client());
+        let conf = &self.conf().client;
+        let sync_check_interval_min = conf.sync_check_interval_min;
+        let sync_check_interval_max = conf.sync_check_interval_max;
+        let sync_check_log_tick = conf.sync_check_log_tick;
+        let mut ticks = 0;
+        let time = TimeSpent::new();
+
+        loop {
+            let mut first_not_found = None;
+            let mut last_pending = None;
+
+            for job_id in &job_ids {
+                let status = match client.get_job_status(job_id).await {
+                    Ok(status) => status,
+                    Err(err @ FsError::JobNotFound(_)) => {
+                        first_not_found.get_or_insert(err);
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
+
+                match status.state {
+                    JobTaskState::Completed => return Ok(()),
+                    JobTaskState::Failed | JobTaskState::Canceled => {
+                        return err_box!(
+                            "job {} {:?}: {}",
+                            status.job_id,
+                            status.state,
+                            status.progress.message
+                        )
+                    }
+                    _ => last_pending = Some(status),
+                }
+            }
+
+            if last_pending.is_none() && fail_if_not_found {
+                return Err(
+                    first_not_found.unwrap_or_else(|| FsError::job_not_found(job_ids.join(",")))
+                );
+            }
+
+            ticks += 1;
+            let sleep_time = sync_check_interval_max.min(sync_check_interval_min * ticks);
+            time::sleep(sleep_time).await;
+
+            if sync_check_log_tick > 0 && ticks % sync_check_log_tick == 0 {
+                if let Some(status) = &last_pending {
+                    info!(
+                        "waiting for job {} to complete, elapsed: {} ms, progress: {}",
+                        status.job_id,
+                        time.used_ms(),
+                        status.progress_string(false)
+                    );
+                } else {
+                    info!(
+                        "waiting for one of jobs {:?} to appear, elapsed: {} ms",
+                        job_ids,
+                        time.used_ms()
+                    );
+                }
+            }
+        }
     }
 
     pub async fn cleanup(&self) {

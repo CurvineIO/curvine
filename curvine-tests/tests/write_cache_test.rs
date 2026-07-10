@@ -388,6 +388,59 @@ fn test_fs_mode_ufs_only_wait_uses_ufs_job_id() {
 }
 
 #[test]
+fn test_fs_mode_auto_cache_status_uses_ufs_job_after_load() {
+    let fs = get_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::FsMode).await;
+
+        let path = Path::from_str(format!(
+            "/write_cache_{:?}/ufs_auto_cache_status.log",
+            WriteType::FsMode
+        ))
+        .unwrap();
+        let data = Utils::rand_str(1024);
+        let (ufs_path, mnt) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut ufs_writer = mnt.ufs.create(&ufs_path, true).await.unwrap();
+        ufs_writer.write_string(&data).await.unwrap();
+        ufs_writer.complete().await.unwrap();
+        let ufs_status = mnt.ufs.get_status(&ufs_path).await.unwrap();
+        let sync_opts = mnt
+            .info
+            .get_sync_opts(&fs.conf().client, ufs_status.mtime, ufs_status.len);
+        let writer = fs
+            .cv()
+            .create_with_opts(&path, sync_opts, true)
+            .await
+            .unwrap();
+        drop(writer);
+
+        let ufs_job_id = CommonUtils::create_job_id(ufs_path.full_path());
+        let cv_job_id = CommonUtils::create_job_id(path.full_path());
+        let mut reader = fs.open(&path).await.unwrap();
+        assert!(
+            !matches!(reader, UnifiedReader::Cv(_)),
+            "read should come from UFS and submit auto-cache"
+        );
+        let mut read_data = BytesMut::zeroed(reader.len() as usize);
+        reader.read_full(&mut read_data).await.unwrap();
+        reader.complete().await.unwrap();
+        assert_eq!(Utils::crc32(&read_data), Utils::crc32(data.as_bytes()));
+
+        fs.wait_job_complete(&path, false).await.unwrap();
+        wait_for_cv_ufs_consistency(&fs, &path).await;
+
+        let status = fs.get_job_status(&path).await.unwrap();
+        assert_eq!(status.job_id, ufs_job_id);
+        assert_ne!(status.job_id, cv_job_id);
+    });
+}
+
+#[test]
 fn test_fs_mode_ufs_write_append() {
     let fs = get_fs();
     let rt = fs.clone_runtime();
