@@ -180,13 +180,34 @@ fn fs_mode_cv_path_load_uses_ufs_source_when_metadata_is_ufs_only() -> CommonRes
 }
 
 #[test]
-fn direct_export_task_keeps_cv_source_for_fs_mode_journal_sync() -> CommonResult<()> {
-    let (job_manager, rt, _missing_source, master_fs) = new_job_manager_with_fs("direct-export")?;
-    let cv_path = "/mnt/export-file";
+fn cv_path_load_without_ufs_only_metadata_is_rejected() -> CommonResult<()> {
+    let (job_manager, rt, _missing_source, master_fs) =
+        new_job_manager_with_fs("cv-load-rejects-export")?;
+    let cv_path = "/mnt/native-file";
     let create_opts = curvine_common::state::CreateFileOptsBuilder::new()
         .create_parent(true)
         .build();
     master_fs.create_with_opts(cv_path, create_opts, OpenFlags::new_create())?;
+
+    rt.block_on(async {
+        let err = job_manager
+            .submit_load_job(LoadJobCommand::builder(cv_path).build())
+            .await
+            .expect_err("ordinary CV load should not fall back to CV-to-UFS export");
+        assert!(
+            err.to_string().contains("requires UFS-only metadata"),
+            "unexpected error: {}",
+            err
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn direct_export_task_keeps_cv_source_for_fs_mode_journal_sync() -> CommonResult<()> {
+    let (job_manager, rt, _missing_source, master_fs) = new_job_manager_with_fs("direct-export")?;
+    let cv_path = "/mnt/export-dir";
+    master_fs.mkdir(cv_path, true)?;
     let expected_target = job_manager
         .get_mnt(&curvine_common::fs::Path::from_str(cv_path)?)?
         .expect("test CV path should match mount")
@@ -198,16 +219,6 @@ fn direct_export_task_keeps_cv_source_for_fs_mode_journal_sync() -> CommonResult
 
     let command = LoadJobCommand::builder(cv_path).build();
     let expected_job_id = CommonUtils::create_job_id(cv_path);
-    let running = JobContext::with_conf(
-        &command,
-        expected_job_id.clone(),
-        cv_path.to_string(),
-        expected_target.clone(),
-        &mount.info,
-        &ClientConf::default(),
-        1,
-    );
-    job_manager.jobs().insert(expected_job_id.clone(), running);
 
     rt.block_on(async {
         let result = job_manager
@@ -217,10 +228,7 @@ fn direct_export_task_keeps_cv_source_for_fs_mode_journal_sync() -> CommonResult
 
         assert_eq!(result.job_id, expected_job_id);
         assert_eq!(result.target_path, expected_target);
-
-        let status = job_manager.get_job_status(&result.job_id)?;
-        assert_eq!(status.source_path, cv_path);
-        assert_eq!(status.target_path, expected_target);
+        assert_eq!(result.state, JobTaskState::Completed);
         Ok(())
     })
 }

@@ -170,9 +170,9 @@ impl JobManager {
     pub async fn submit_load_job(&self, command: LoadJobCommand) -> FsResult<LoadJobResult> {
         let source_path = Path::from_str(&command.source_path)?;
 
-        // Check mount info for both UFS and CV paths
-        // - For UFS path: Import (UFS → Curvine)
-        // - For CV path: Export (Curvine → UFS), requires mount info to determine target UFS
+        // Check mount info for both UFS and CV paths. Public load jobs import
+        // from UFS into Curvine; CV paths are accepted only when existing
+        // metadata marks them as UFS-only.
         let mnt = if let Some(mnt) = self.mount_manager.get_mount_info(&source_path)? {
             mnt
         } else {

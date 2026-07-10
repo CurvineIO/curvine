@@ -97,26 +97,31 @@ impl LoadJobRunner {
         cv_source_mode: CvSourceMode,
     ) -> FsResult<(JobContext, Path, Path)> {
         let command_source = Path::from_str(&command.source_path)?;
-        let load_cv_from_ufs = if !command_source.is_cv() {
-            false
-        } else {
-            match cv_source_mode {
-                CvSourceMode::LoadUfsOnlyFromUfs => {
-                    match self.master_fs.file_status(command_source.path()) {
-                        Ok(status) => status.storage_policy.ufs_only(),
-                        Err(FsError::FileNotFound(_)) => false,
-                        Err(err) => return Err(err),
-                    }
-                }
-                CvSourceMode::ExportCurvineToUfs => false,
+        let (source_path, target_path) = match (cv_source_mode, command_source.is_cv()) {
+            (CvSourceMode::LoadUfsOnlyFromUfs, false) => {
+                let target_path = mnt.get_cv_path(&command_source)?;
+                (command_source, target_path)
             }
-        };
-
-        let (source_path, target_path) = if load_cv_from_ufs {
-            (mnt.get_ufs_path(&command_source)?, command_source)
-        } else {
-            let target_path = mnt.toggle_path(&command_source)?;
-            (command_source, target_path)
+            (CvSourceMode::LoadUfsOnlyFromUfs, true) => {
+                let status = self.master_fs.file_status(command_source.path())?;
+                if !status.storage_policy.ufs_only() {
+                    return err_box!(
+                        "load job for CV path {} requires UFS-only metadata",
+                        command_source.full_path()
+                    );
+                }
+                (mnt.get_ufs_path(&command_source)?, command_source)
+            }
+            (CvSourceMode::ExportCurvineToUfs, true) => {
+                let target_path = mnt.get_ufs_path(&command_source)?;
+                (command_source, target_path)
+            }
+            (CvSourceMode::ExportCurvineToUfs, false) => {
+                return err_box!(
+                    "export job source path {} must be a CV path",
+                    command_source.full_path()
+                );
+            }
         };
         let job_id = CommonUtils::create_job_id(source_path.full_path());
         let run_id = self.next_run_id();
