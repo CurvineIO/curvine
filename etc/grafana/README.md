@@ -122,6 +122,19 @@ signals are the inflight/queue gauges: `active_requests`, `reply_queue_depth`,
 - `{inode,file_handle,dir_handle}_count` → kept **per-instance**, not summed
   across instances.
 
+### Data I/O: fleet total vs per-instance
+
+The Stream IO row has two complementary views of read/write throughput and IOPS:
+
+- **Fleet total** (`IO throughput`, `read/write comparison`) → `sum by(io_type,
+  path_type)` — collapses all selected instances into one read + one write line.
+  Use it for the aggregate rate across the fleet.
+- **Per-instance** (`Per-instance data throughput`, `Per-instance IOPS`) → `sum
+  by(instance,io_type)` — one line per instance per io_type, so with
+  `$instance=All` you can compare each instance's data-IO throughput (B/s, success
+  bytes) and IOPS (io_requests/s, all statuses). `$path_type` still filters but is
+  not split into separate lines, to keep the legend readable.
+
 ## DevOps Triage Matrix
 
 Enter from a **symptom**; the row tells you where to look and what to do next.
@@ -158,6 +171,25 @@ shows a domain is slow, the next hop is a different system:
 - `path_type=fallback` is not a real UFS-fallback outcome (see above).
 
 The dashboard does not decompose Curvine master/worker/server internals.
+
+## Process resources row
+
+The **Process resources (per-instance)** row shows CPU (cores), resident/virtual
+memory, open-fds-vs-max, and OS thread count per fuse instance. Two things to
+know:
+
+- These `process_*` series are exported by the **Prometheus client library**
+  (read from `/proc/self`), **not** by curvine code — so they exist even for
+  builds with `metrics_enabled=false`, and they are named `process_*`, not
+  `curvine_fuse_*`.
+- The panels filter on `job=~"$job"` (fuse only), so **master/worker CPU/memory
+  are not shown here** even though those processes export the same `process_*`
+  metrics — that stays consistent with the scope boundary above. Point a separate
+  panel/dashboard at `job=curvine-master|curvine-worker` if you need those.
+
+CPU is in **cores** (`rate(process_cpu_seconds_total)`; 1.0 = one full core, >1 =
+multi-core). Watch **RSS** (not virtual) for memory pressure, and **open fds**
+approaching **max** for fd leaks / an undersized ulimit.
 
 ## Tables and implementation limits
 
