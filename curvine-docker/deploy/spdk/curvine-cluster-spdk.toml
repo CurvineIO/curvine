@@ -36,6 +36,7 @@ enabled = true
 app_name = "curvine"  
 hugepage = "10MB"
 reactor_mask = "0x30"  
+# iova_mode = "va"  # set on VM/container hosts if env_init fails with PA IOVA error
 # NVMe-oF targets  
 [[worker.spdk_disk.targets]]
 trtype = "tcp"  

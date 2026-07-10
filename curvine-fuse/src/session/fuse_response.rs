@@ -130,7 +130,12 @@ impl FuseResponse {
     }
 
     fn rep_log(&self, e: &FuseError) {
-        if self.debug || !matches!(e.errno, libc::ENOENT | libc::ENODATA | libc::ENOSYS) {
+        if self.debug
+            || !matches!(
+                e.errno,
+                libc::ENOENT | libc::ENODATA | libc::ENOSYS | libc::ENOTEMPTY
+            )
+        {
             warn!("send_rep unique {}: {}", self.unique, e);
         }
     }

@@ -30,3 +30,5 @@ pub use self::fuse_reader::FuseReader;
 
 mod fuse_writer;
 pub use self::fuse_writer::FuseWriter;
+
+pub mod dcache;

@@ -87,6 +87,7 @@ impl From<FsError> for FuseError {
             FsError::Unsupported(_) => Some(libc::ENOSYS),
             FsError::InProgress(_) => Some(libc::EBUSY),
             FsError::UnsupportedUfsRead(_) => Some(libc::EOPNOTSUPP),
+            FsError::ReadOnly(_) => Some(libc::EROFS),
             _ => None,
         };
 
@@ -157,6 +158,7 @@ pub(crate) fn errno_label(errno: i32) -> &'static str {
         libc::EBUSY => "EBUSY",
         libc::ENAMETOOLONG => "ENAMETOOLONG",
         libc::EFBIG => "EFBIG",
+        libc::EROFS => "EROFS",
         _ => "OTHER",
     }
 }
@@ -189,6 +191,13 @@ mod tests {
     }
 
     #[test]
+    fn read_only_maps_to_erofs() {
+        let err: FuseError = FsError::read_only("/mnt/ro").into();
+        assert_eq!(err.errno, libc::EROFS);
+        assert_eq!(errno_label(err.errno), "EROFS");
+    }
+
+    #[test]
     fn errno_label_maps_the_closed_set() {
         // Full (errno, expected-label) table. Any accidental relabeling must
         // update this table and the design doc's errno Label rules together.
@@ -217,6 +226,7 @@ mod tests {
             (libc::EBUSY, "EBUSY"),
             (libc::ENAMETOOLONG, "ENAMETOOLONG"),
             (libc::EFBIG, "EFBIG"),
+            (libc::EROFS, "EROFS"),
         ];
         for (e, expected) in table {
             assert_eq!(errno_label(e), expected, "label mismatch for errno {}", e);

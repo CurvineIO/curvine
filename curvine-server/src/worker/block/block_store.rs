@@ -13,12 +13,11 @@
 // limitations under the License.
 
 use crate::worker::block::BlockMeta;
-use crate::worker::storage::{BlockDataset, Dataset};
+use crate::worker::storage::{BlockDataset, BlockLayout, Dataset};
 use curvine_common::conf::ClusterConf;
-use curvine_common::state::{ExtendedBlock, StorageInfo, StorageType};
+use curvine_common::state::{ExtendedBlock, StorageInfo};
 use log::error;
-use orpc::common::FileUtils;
-use orpc::{err_box, CommonResult};
+use orpc::CommonResult;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(Clone)]
@@ -97,39 +96,16 @@ impl BlockStore {
 
     // Asynchronously delete block.
     pub fn async_remove_block(&self, id: i64) -> CommonResult<BlockMeta> {
-        // Delete the original data.
-        let mut state = self.write()?;
-        let meta = state.block_map.remove(&id);
-
-        let meta = match meta {
-            None => return err_box!("Not found block {}", id),
-            Some(v) => v,
+        let (meta, layout) = {
+            let mut state = self.write()?;
+            let (meta, layout) = state.remove_block_state_by_id(id)?;
+            state.decrement_blocks_to_delete();
+            (meta, layout)
         };
-        state.decrement_blocks_to_delete();
-        let dir_id = meta.dir_id();
-        let is_spdk = meta.storage_type() == StorageType::SpdkDisk;
 
-        // SPDK: free bdev offset + persist metadata while holding write lock.
-        if is_spdk {
-            if let Ok(dir) = state.find_dir(dir_id) {
-                dir.state.offset_alloc.free(id);
-            }
-            state.spdk_delete(id, StorageType::SpdkDisk);
-        }
-        drop(state);
-
-        // Delete the file.
-        // SPDK blocks have no filesystem file — skip deletion.
-        if !is_spdk {
-            FileUtils::delete_path(meta.get_block_path()?, false)?;
-        }
-
-        // Update disk space.
+        layout.deallocate(&meta)?;
         let state = self.read()?;
-        let dir = state.find_dir(meta.dir_id())?;
-        dir.release_space(meta.is_final(), meta.actual_len);
-        drop(state);
-
+        state.release_block_space(&meta)?;
         Ok(meta)
     }
 

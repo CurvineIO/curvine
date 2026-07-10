@@ -78,14 +78,14 @@ pub struct FuseMountArgs {
     pub cache_readdir: Option<bool>,
 
     // Timeout settings
-    #[arg(long, help = "Entry timeout in seconds (optional)")]
-    pub entry_timeout: Option<f64>,
+    #[arg(long, help = "Entry timeout in milliseconds (optional)")]
+    pub entry_timeout_ms: Option<u64>,
 
-    #[arg(long, help = "Attribute timeout in seconds (optional)")]
-    pub attr_timeout: Option<f64>,
+    #[arg(long, help = "Attribute timeout in milliseconds (optional)")]
+    pub attr_timeout_ms: Option<u64>,
 
-    #[arg(long, help = "Negative timeout in seconds (optional)")]
-    pub negative_timeout: Option<f64>,
+    #[arg(long, help = "Negative timeout in milliseconds (optional)")]
+    pub negative_timeout_ms: Option<u64>,
 
     // Performance settings
     #[arg(long, help = "Max background operations (optional)")]
@@ -95,9 +95,6 @@ pub struct FuseMountArgs {
     pub congestion_threshold: Option<u16>,
 
     // Node cache settings
-    #[arg(long, help = "Node cache size (optional)")]
-    pub node_cache_size: Option<u64>,
-
     #[arg(long, help = "Node cache timeout (e.g., '1h', '30m') (optional)")]
     pub node_cache_timeout: Option<String>,
 
@@ -112,11 +109,18 @@ pub struct FuseMountArgs {
     #[arg(short, long)]
     options: Vec<String>,
 
+    #[arg(
+        long,
+        action = clap::ArgAction::SetTrue,
+        help = "Mount the entire FUSE filesystem read-only"
+    )]
+    readonly: bool,
+
     // Additional FuseConf fields
     #[arg(long, help = "Fill inode number when reading directory (optional)")]
     pub read_dir_fill_ino: Option<bool>,
 
-    #[arg(long, help = "Enable write-back cache (optional)")]
+    #[arg(long, help = "Enable kernel write-back cache (optional)")]
     pub write_back_cache: Option<bool>,
 
     #[arg(long, help = "Enable non-seekable mode (optional)")]
@@ -134,17 +138,11 @@ pub struct FuseMountArgs {
     #[arg(long, help = "Enable in-kernel metadata cache (optional)")]
     pub enable_meta_cache: Option<bool>,
 
-    #[arg(long, help = "Metadata cache capacity in number of entries (optional)")]
-    pub meta_cache_capacity: Option<u64>,
-
     #[arg(long, help = "Metadata cache TTL (e.g., '120s', '2m') (optional)")]
     pub meta_cache_ttl: Option<String>,
 
     #[arg(long, help = "Remember opened inodes across FUSE sessions (optional)")]
     pub remember: Option<bool>,
-
-    #[arg(long, help = "Auto-cache attr timeout in seconds (optional)")]
-    pub ac_attr_timeout: Option<f64>,
 
     #[arg(
         long,
@@ -235,16 +233,16 @@ impl FuseMountArgs {
             conf.fuse.cache_readdir = cache_readdir;
         }
 
-        if let Some(entry_timeout) = self.entry_timeout {
-            conf.fuse.entry_timeout = entry_timeout;
+        if let Some(entry_timeout_ms) = self.entry_timeout_ms {
+            conf.fuse.entry_timeout_ms = entry_timeout_ms;
         }
 
-        if let Some(attr_timeout) = self.attr_timeout {
-            conf.fuse.attr_timeout = attr_timeout;
+        if let Some(attr_timeout_ms) = self.attr_timeout_ms {
+            conf.fuse.attr_timeout_ms = attr_timeout_ms;
         }
 
-        if let Some(negative_timeout) = self.negative_timeout {
-            conf.fuse.negative_timeout = negative_timeout;
+        if let Some(negative_timeout_ms) = self.negative_timeout_ms {
+            conf.fuse.negative_timeout_ms = negative_timeout_ms;
         }
 
         if let Some(max_background) = self.max_background {
@@ -253,10 +251,6 @@ impl FuseMountArgs {
 
         if let Some(congestion_threshold) = self.congestion_threshold {
             conf.fuse.congestion_threshold = congestion_threshold;
-        }
-
-        if let Some(node_cache_size) = self.node_cache_size {
-            conf.fuse.node_cache_size = node_cache_size;
         }
 
         if let Some(node_cache_timeout) = &self.node_cache_timeout {
@@ -269,6 +263,10 @@ impl FuseMountArgs {
 
         if let Some(read_dir_fill_ino) = self.read_dir_fill_ino {
             conf.fuse.read_dir_fill_ino = read_dir_fill_ino;
+        }
+
+        if self.readonly {
+            conf.fuse.readonly = true;
         }
 
         if let Some(write_back_cache) = self.write_back_cache {
@@ -291,20 +289,13 @@ impl FuseMountArgs {
             conf.fuse.enable_meta_cache = enable_meta_cache;
         }
 
-        if let Some(meta_cache_capacity) = self.meta_cache_capacity {
-            conf.fuse.meta_cache_capacity = meta_cache_capacity;
-        }
-
+        // FuseConf::meta_cache_ttl is a Duration parsed by init() from meta_cache_timeout.
         if let Some(meta_cache_ttl) = &self.meta_cache_ttl {
-            conf.fuse.meta_cache_ttl = meta_cache_ttl.clone();
+            conf.fuse.meta_cache_timeout = meta_cache_ttl.clone();
         }
 
         if let Some(remember) = self.remember {
             conf.fuse.remember = remember;
-        }
-
-        if let Some(ac_attr_timeout) = self.ac_attr_timeout {
-            conf.fuse.ac_attr_timeout = ac_attr_timeout;
         }
 
         if let Some(list_limit) = self.list_limit {
