@@ -17,6 +17,7 @@ use curvine_common::state::{
     JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobInfo, LoadTaskInfo, MountInfo,
     MountOptions, StorageType, TtlAction, WorkerAddress, WorkerInfo,
 };
+use curvine_common::utils::CommonUtils;
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::JournalSystem;
 use curvine_server::master::{JobContext, JobManager, JobStore, Master};
@@ -28,10 +29,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 fn new_job_manager(name: &str) -> CommonResult<(Arc<JobManager>, Arc<Runtime>, String)> {
+    new_job_manager_with_conf(name, |_| {})
+}
+
+fn new_job_manager_with_conf(
+    name: &str,
+    update_conf: impl FnOnce(&mut ClusterConf),
+) -> CommonResult<(Arc<JobManager>, Arc<Runtime>, String)> {
     Master::init_test_metrics();
     let test_name = format!("{}-{}", name, Utils::rand_id());
 
-    let conf = ClusterConf {
+    let mut conf = ClusterConf {
         format_master: true,
         testing: true,
         master: MasterConf {
@@ -45,6 +53,8 @@ fn new_job_manager(name: &str) -> CommonResult<(Arc<JobManager>, Arc<Runtime>, S
         },
         ..Default::default()
     };
+    update_conf(&mut conf);
+    conf.job.init()?;
 
     let journal_system = JournalSystem::from_conf(&conf)?;
     let master_fs = MasterFilesystem::with_js(&conf, &journal_system);
@@ -94,9 +104,10 @@ fn load_task(task_id: &str, job_id: &str) -> LoadTaskInfo {
 #[test]
 fn submit_load_job_returns_before_ufs_planning() -> CommonResult<()> {
     let (job_manager, rt, missing_source) = new_job_manager("async-missing-source")?;
+    let job_manager_task = job_manager.clone();
 
-    rt.block_on(async move {
-        let result = job_manager
+    rt.block_on(async {
+        let result = job_manager_task
             .submit_load_job(LoadJobCommand::builder(missing_source).build())
             .await?;
 
@@ -104,7 +115,7 @@ fn submit_load_job_returns_before_ufs_planning() -> CommonResult<()> {
         assert_eq!(result.state, JobTaskState::Pending);
 
         for _ in 0..50 {
-            let status = job_manager.get_job_status(&result.job_id)?;
+            let status = job_manager_task.get_job_status(&result.job_id)?;
             if status.state == JobTaskState::Failed {
                 assert!(
                     !status.progress.message.is_empty(),
@@ -120,11 +131,145 @@ fn submit_load_job_returns_before_ufs_planning() -> CommonResult<()> {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        let status = job_manager.get_job_status(&result.job_id)?;
+        let status = job_manager_task.get_job_status(&result.job_id)?;
         panic!(
             "load job did not fail in background, state={:?}, message={}",
             status.state, status.progress.message
         );
+    })
+}
+
+#[test]
+fn missing_source_load_failure_is_reused_during_retry_interval() -> CommonResult<()> {
+    let (job_manager, rt, missing_source) =
+        new_job_manager_with_conf("missing-source-cooldown", |conf| {
+            conf.job.master_failed_load_job_retry_interval_str = "1h".to_string();
+        })?;
+    let source = missing_source.clone();
+
+    rt.block_on(async {
+        let first = job_manager
+            .submit_load_job(LoadJobCommand::builder(source.clone()).build())
+            .await?;
+
+        let mut failed_status = None;
+        for _ in 0..100 {
+            let status = job_manager.get_job_status(&first.job_id)?;
+            if status.state == JobTaskState::Failed {
+                failed_status = Some(status);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let failed_status = match failed_status {
+            Some(status) => status,
+            None => {
+                let status = job_manager.get_job_status(&first.job_id)?;
+                panic!(
+                    "missing source load did not fail during cooldown test, state={:?}, message={}",
+                    status.state, status.progress.message
+                );
+            }
+        };
+        assert!(
+            failed_status
+                .progress
+                .message
+                .contains("source file not found"),
+            "unexpected failed message: {}",
+            failed_status.progress.message
+        );
+
+        let duplicate = job_manager
+            .submit_load_job(LoadJobCommand::builder(source).build())
+            .await?;
+
+        assert_eq!(duplicate.job_id, first.job_id);
+        assert_eq!(duplicate.state, JobTaskState::Failed);
+        let status_after_duplicate = job_manager.get_job_status(&first.job_id)?;
+        assert_eq!(status_after_duplicate.state, JobTaskState::Failed);
+        assert_eq!(
+            status_after_duplicate.progress.update_time, failed_status.progress.update_time,
+            "duplicate submit should not replace the failed job during cooldown"
+        );
+
+        Ok(())
+    })
+}
+
+#[test]
+fn job_manager_uses_dedicated_background_runtime() -> CommonResult<()> {
+    let (job_manager, _rt, _missing_source) = new_job_manager("background-runtime")?;
+
+    assert_eq!(job_manager.rt().thread_name(), "single");
+    assert_eq!(job_manager.background_rt().thread_name(), "master-load-job");
+    assert_eq!(
+        job_manager.background_rt().io_threads(),
+        curvine_common::conf::JobConf::DEFAULT_MASTER_LOAD_JOB_RUNTIME_THREADS
+    );
+    assert_eq!(
+        job_manager.background_rt().worker_threads(),
+        curvine_common::conf::JobConf::DEFAULT_MASTER_LOAD_JOB_BLOCKING_THREADS
+    );
+    Ok(())
+}
+
+#[test]
+fn submit_load_job_reuses_pending_job_for_same_path() -> CommonResult<()> {
+    let (job_manager, rt, missing_source) = new_job_manager("pending-dedupe")?;
+    let source_path = curvine_common::fs::Path::from_str(&missing_source)?;
+    let (_, mount) = job_manager
+        .get_mnt(&source_path)?
+        .expect("test source should match mount");
+    let target_path = mount.info.toggle_path(&source_path)?;
+    let command = LoadJobCommand::builder(missing_source.clone()).build();
+    let job_id = CommonUtils::create_job_id(source_path.full_path());
+    let pending = JobContext::with_conf(
+        &command,
+        job_id.clone(),
+        source_path.clone_uri(),
+        target_path.clone_uri(),
+        &mount.info,
+        &ClientConf::default(),
+        1,
+    );
+    job_manager.jobs().insert(job_id.clone(), pending);
+
+    rt.block_on(async {
+        let duplicate = job_manager.submit_load_job(command).await?;
+
+        assert_eq!(duplicate.job_id, job_id);
+        assert_eq!(duplicate.target_path, target_path.clone_uri());
+        assert_eq!(duplicate.state, JobTaskState::Pending);
+        Ok(())
+    })
+}
+
+#[test]
+fn submit_load_job_rejects_after_shutdown_without_creating_job() -> CommonResult<()> {
+    let (job_manager, rt, missing_source) = new_job_manager("shutdown-no-half-job")?;
+    job_manager.shutdown();
+    let source = missing_source.clone();
+    let source_path = curvine_common::fs::Path::from_str(&source)?;
+    let job_id = CommonUtils::create_job_id(source_path.full_path());
+
+    rt.block_on(async {
+        let err = job_manager
+            .submit_load_job(LoadJobCommand::builder(source).build())
+            .await
+            .expect_err("submit should fail after shutdown before creating a job");
+
+        assert!(
+            err.to_string()
+                .contains("load job manager is shutting down"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            job_manager.jobs().get(&job_id).is_none(),
+            "failed admission must not leave a half-created job"
+        );
+        Ok(())
     })
 }
 
@@ -136,9 +281,10 @@ fn empty_directory_load_completes_without_worker_reports() -> CommonResult<()> {
         .strip_prefix("file://")
         .expect("test UFS path uses file scheme");
     std::fs::create_dir_all(local_source)?;
+    let job_manager_task = job_manager.clone();
 
-    rt.block_on(async move {
-        let result = job_manager
+    rt.block_on(async {
+        let result = job_manager_task
             .submit_load_job(LoadJobCommand::builder(source).build())
             .await?;
 
@@ -146,7 +292,7 @@ fn empty_directory_load_completes_without_worker_reports() -> CommonResult<()> {
         assert_eq!(result.state, JobTaskState::Pending);
 
         for _ in 0..50 {
-            let status = job_manager.get_job_status(&result.job_id)?;
+            let status = job_manager_task.get_job_status(&result.job_id)?;
             if status.state == JobTaskState::Completed {
                 assert_eq!(status.progress.message, "No load tasks to dispatch");
                 return Ok(());
@@ -154,7 +300,7 @@ fn empty_directory_load_completes_without_worker_reports() -> CommonResult<()> {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        let status = job_manager.get_job_status(&result.job_id)?;
+        let status = job_manager_task.get_job_status(&result.job_id)?;
         panic!(
             "empty directory load did not complete, state={:?}, message={}",
             status.state, status.progress.message

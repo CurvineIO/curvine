@@ -67,6 +67,12 @@ pub struct MasterMetrics {
     pub(crate) ttl_bucket_len: Gauge,
     pub(crate) ttl_total_inodes: Gauge,
     pub(crate) ttl_skipped_inodes: Counter,
+
+    pub(crate) load_job_queue_len: Gauge,
+    pub(crate) load_job_running_num: Gauge,
+    pub(crate) load_job_enqueue_count: Counter,
+    pub(crate) load_job_duplicate_count: Counter,
+    pub(crate) load_job_failure_count: Counter,
 }
 
 impl MasterMetrics {
@@ -160,6 +166,26 @@ impl MasterMetrics {
             ttl_skipped_inodes: m::new_counter(
                 "ttl_skipped_inodes",
                 "Total number of inodes skipped while updating TTL buckets",
+            )?,
+            load_job_queue_len: m::new_gauge(
+                "load_job_queue_len",
+                "Number of master load jobs waiting in the FIFO queue",
+            )?,
+            load_job_running_num: m::new_gauge(
+                "load_job_running_num",
+                "Number of master load jobs currently being planned",
+            )?,
+            load_job_enqueue_count: m::new_counter(
+                "load_job_enqueue_count",
+                "Total number of master load jobs enqueued",
+            )?,
+            load_job_duplicate_count: m::new_counter(
+                "load_job_duplicate_count",
+                "Total number of duplicate master load job submissions",
+            )?,
+            load_job_failure_count: m::new_counter(
+                "load_job_failure_count",
+                "Total number of master load jobs that failed in background planning",
             )?,
         };
 

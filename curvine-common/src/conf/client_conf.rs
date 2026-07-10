@@ -18,7 +18,7 @@ use curvine_common_macros::ClientCliArgs;
 use orpc::client::ClientConf as RpcConf;
 use orpc::common::{ByteUnit, DurationUnit, Utils};
 use orpc::io::net::InetAddr;
-use orpc::CommonResult;
+use orpc::{err_box, CommonResult};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -121,6 +121,22 @@ pub struct ClientConf {
     /// Same as auto_cache_ttl, but as Option<String> type, it is convenient to use in the API
     #[client_cli(skip)]
     pub default_cache_ttl: Option<String>,
+
+    /// Maximum number of auto-cache submit requests waiting in the client process.
+    #[client_cli]
+    pub auto_cache_submit_queue_size: usize,
+
+    /// Maximum retries when the master rejects auto-cache submit due to resource pressure.
+    #[client_cli]
+    pub auto_cache_submit_retry_max: u32,
+
+    /// Initial retry sleep for auto-cache submit resource pressure.
+    #[client_cli]
+    pub auto_cache_submit_retry_min_sleep_ms: u64,
+
+    /// Maximum retry sleep for auto-cache submit resource pressure.
+    #[client_cli]
+    pub auto_cache_submit_retry_max_sleep_ms: u64,
 
     // Set up the customer service retry policy
     #[client_cli]
@@ -292,12 +308,28 @@ impl ClientConf {
 
     pub const DEFAULT_MAX_READ_PARALLEL: i64 = 8;
 
+    pub const DEFAULT_AUTO_CACHE_SUBMIT_QUEUE_SIZE: usize = 1024;
+    pub const DEFAULT_AUTO_CACHE_SUBMIT_RETRY_MAX: u32 = 3;
+    pub const DEFAULT_AUTO_CACHE_SUBMIT_RETRY_MIN_SLEEP_MS: u64 = 100;
+    pub const DEFAULT_AUTO_CACHE_SUBMIT_RETRY_MAX_SLEEP_MS: u64 = 2_000;
+
     pub fn init(&mut self) -> CommonResult<()> {
         if self.read_parallel <= 0 {
             self.read_parallel = Self::DEFAULT_READ_PARALLEL;
         }
         if self.max_read_parallel <= 0 {
             self.max_read_parallel = Self::DEFAULT_MAX_READ_PARALLEL;
+        }
+        if self.auto_cache_submit_queue_size == 0 {
+            return err_box!("client.auto_cache_submit_queue_size must be > 0");
+        }
+        if self.auto_cache_submit_retry_min_sleep_ms == 0 {
+            return err_box!("client.auto_cache_submit_retry_min_sleep_ms must be > 0");
+        }
+        if self.auto_cache_submit_retry_max_sleep_ms < self.auto_cache_submit_retry_min_sleep_ms {
+            return err_box!(
+                "client.auto_cache_submit_retry_max_sleep_ms must be >= client.auto_cache_submit_retry_min_sleep_ms"
+            );
         }
 
         self.block_size = ByteUnit::from_str(&self.block_size_str)?.as_byte() as i64;
@@ -422,6 +454,12 @@ impl Default for ClientConf {
             auto_cache_enabled: false,
             auto_cache_ttl: "7d".to_string(),
             default_cache_ttl: Some("7d".to_string()),
+            auto_cache_submit_queue_size: Self::DEFAULT_AUTO_CACHE_SUBMIT_QUEUE_SIZE,
+            auto_cache_submit_retry_max: Self::DEFAULT_AUTO_CACHE_SUBMIT_RETRY_MAX,
+            auto_cache_submit_retry_min_sleep_ms:
+                Self::DEFAULT_AUTO_CACHE_SUBMIT_RETRY_MIN_SLEEP_MS,
+            auto_cache_submit_retry_max_sleep_ms:
+                Self::DEFAULT_AUTO_CACHE_SUBMIT_RETRY_MAX_SLEEP_MS,
 
             conn_retry_max_duration_ms: 60 * 1000,
             conn_retry_min_sleep_ms: 100,

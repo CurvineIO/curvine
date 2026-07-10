@@ -21,25 +21,193 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, FsKind, ListStream, Path, Reader, RpcCode, Writer};
 use curvine_common::state::{
-    CreateFileOpts, FileAllocOpts, FileLock, FileStatus, FreeResult, JobStatus, ListOptions,
-    LoadJobCommand, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags,
-    SetAttrOpts,
+    CreateFileOpts, FileAllocOpts, FileLock, FileStatus, FreeResult, JobStatus, JobTaskState,
+    ListOptions, LoadJobCommand, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions,
+    OpenFlags, SetAttrOpts,
 };
 use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
 use log::{debug, error, info, warn};
 use orpc::common::TimeSpent;
 use orpc::runtime::{RpcRuntime, Runtime};
+use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender};
 use orpc::{err_box, err_ext};
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
+use tokio::time;
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 enum CacheValidity {
     Valid,
     Invalid(Option<FileStatus>),
+}
+
+struct AsyncCacheSubmitter {
+    sender: AsyncSender<String>,
+    pending: Arc<StdMutex<HashSet<String>>>,
+}
+
+impl AsyncCacheSubmitter {
+    fn new(
+        fs_client: Arc<FsClient>,
+        rt: Arc<Runtime>,
+        conf: &ClusterConf,
+        metrics: &'static ClientMetrics,
+        audit_logging_enabled: bool,
+    ) -> Self {
+        let (sender, receiver) =
+            AsyncChannel::new(conf.client.auto_cache_submit_queue_size).split();
+        let pending = Arc::new(StdMutex::new(HashSet::new()));
+
+        Self::spawn_worker(
+            rt,
+            receiver,
+            fs_client,
+            pending.clone(),
+            AsyncCacheRetryPolicy {
+                max_retries: conf.client.auto_cache_submit_retry_max,
+                min_sleep: Duration::from_millis(conf.client.auto_cache_submit_retry_min_sleep_ms),
+                max_sleep: Duration::from_millis(conf.client.auto_cache_submit_retry_max_sleep_ms),
+            },
+            metrics,
+            audit_logging_enabled,
+        );
+
+        Self { sender, pending }
+    }
+
+    fn enqueue(&self, source_path: String) {
+        if !Self::insert_pending(&self.pending, source_path.clone()) {
+            debug!("async cache submit already queued for {}", source_path);
+            return;
+        }
+
+        match self.sender.try_reserve() {
+            Ok(Some(permit)) => permit.send(source_path),
+            Ok(None) => {
+                Self::remove_pending(&self.pending, &source_path);
+                warn!("async cache submit queue is full, drop {}", source_path);
+            }
+            Err(err) => {
+                Self::remove_pending(&self.pending, &source_path);
+                warn!(
+                    "async cache submit queue is closed for {}: {}",
+                    source_path, err
+                );
+            }
+        }
+    }
+
+    fn spawn_worker(
+        rt: Arc<Runtime>,
+        mut receiver: AsyncReceiver<String>,
+        fs_client: Arc<FsClient>,
+        pending: Arc<StdMutex<HashSet<String>>>,
+        retry_policy: AsyncCacheRetryPolicy,
+        metrics: &'static ClientMetrics,
+        audit_logging_enabled: bool,
+    ) {
+        rt.spawn(async move {
+            let client = JobMasterClient::new(fs_client);
+            while let Some(source_path) = receiver.recv().await {
+                Self::submit_with_retry(
+                    &client,
+                    source_path.clone(),
+                    retry_policy,
+                    metrics,
+                    audit_logging_enabled,
+                )
+                .await;
+                Self::remove_pending(&pending, &source_path);
+            }
+        });
+    }
+
+    async fn submit_with_retry(
+        client: &JobMasterClient,
+        source_path: String,
+        retry_policy: AsyncCacheRetryPolicy,
+        metrics: &'static ClientMetrics,
+        audit_logging_enabled: bool,
+    ) {
+        let mut retries = 0;
+        let mut sleep_time = retry_policy.min_sleep;
+
+        loop {
+            let time = TimeSpent::new();
+            let command = LoadJobCommand::builder(source_path.clone()).build();
+            let res = client.submit_load_job(command).await;
+            let used_us = time.used_us();
+
+            metrics
+                .metadata_operation_duration
+                .with_label_values(&["SubmitJob"])
+                .observe(used_us as f64);
+
+            match res {
+                Ok(res) => {
+                    if audit_logging_enabled {
+                        info!(
+                            target: "audit",
+                            "cmd={} ok={} src={} dst={} usedUs={}",
+                            "SubmitJob",
+                            true,
+                            source_path,
+                            res.target_path,
+                            used_us
+                        );
+                    }
+                    return;
+                }
+                Err(err)
+                    if matches!(err, FsError::ResourceExhausted(_))
+                        && retries < retry_policy.max_retries =>
+                {
+                    retries += 1;
+                    warn!(
+                        "async cache submit resource exhausted for {}, retry {}/{} after {:?}: {}",
+                        source_path, retries, retry_policy.max_retries, sleep_time, err
+                    );
+                    time::sleep(sleep_time).await;
+                    sleep_time = retry_policy.max_sleep.min(sleep_time + sleep_time);
+                }
+                Err(err) => {
+                    warn!("submit async cache error for {}: {}", source_path, err);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn insert_pending(pending: &StdMutex<HashSet<String>>, source_path: String) -> bool {
+        match pending.lock() {
+            Ok(mut pending) => pending.insert(source_path),
+            Err(err) => {
+                warn!("async cache pending set poisoned: {}", err);
+                false
+            }
+        }
+    }
+
+    fn remove_pending(pending: &StdMutex<HashSet<String>>, source_path: &str) {
+        match pending.lock() {
+            Ok(mut pending) => {
+                pending.remove(source_path);
+            }
+            Err(err) => warn!("async cache pending set poisoned: {}", err),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AsyncCacheRetryPolicy {
+    max_retries: u32,
+    min_sleep: Duration,
+    max_sleep: Duration,
 }
 
 #[derive(Clone)]
@@ -49,6 +217,7 @@ pub struct UnifiedFileSystem {
     enable_unified: bool,
     enable_read_ufs: bool,
     audit_logging_enabled: bool,
+    async_cache_submitter: Arc<AsyncCacheSubmitter>,
     metrics: &'static ClientMetrics,
 }
 
@@ -60,13 +229,22 @@ impl UnifiedFileSystem {
         let audit_logging_enabled = conf.client.audit_logging_enabled;
 
         let cv = CurvineFileSystem::with_rt(conf, rt.clone())?;
+        let metrics = FsContext::get_metrics();
+        let async_cache_submitter = Arc::new(AsyncCacheSubmitter::new(
+            cv.fs_client(),
+            rt,
+            cv.conf(),
+            metrics,
+            audit_logging_enabled,
+        ));
         let fs = UnifiedFileSystem {
             cv,
             mount_cache: Arc::new(MountCache::new(update_interval.as_millis() as u64)),
             enable_unified,
             enable_read_ufs,
             audit_logging_enabled,
-            metrics: FsContext::get_metrics(),
+            async_cache_submitter,
+            metrics,
         };
 
         Ok(fs)
@@ -375,44 +553,23 @@ impl UnifiedFileSystem {
     }
 
     pub fn async_cache(&self, source_path: &Path) -> FsResult<()> {
-        let client = JobMasterClient::new(self.fs_client());
-        let source_path = source_path.clone_uri();
-        let log = self.audit_logging_enabled;
-        let metrics = self.metrics;
-
-        self.fs_context().rt().spawn(async move {
-            let time = TimeSpent::new();
-            let command = LoadJobCommand::builder(source_path.clone()).build();
-            let res = client.submit_load_job(command).await;
-
-            let used_us = time.used_us();
-            metrics
-                .metadata_operation_duration
-                .with_label_values(&["SubmitJob"])
-                .observe(used_us as f64);
-
-            match res {
-                Err(e) => warn!("submit async cache error for {}: {}", source_path, e),
-                Ok(res) => {
-                    if log {
-                        info!(
-                            target: "audit",
-                            "cmd={} ok={} src={} dst={} usedUs={}",
-                            "SubmitJob",
-                            true,
-                            source_path,
-                            res.target_path,
-                           used_us
-                        );
-                    }
-                }
-            }
-        });
-
+        self.async_cache_submitter.enqueue(source_path.clone_uri());
         Ok(())
     }
 
     pub async fn wait_job_complete(&self, path: &Path, fail_if_not_found: bool) -> FsResult<()> {
+        let job_ids = self.load_job_ids_for_path(path).await?;
+        self.wait_load_job_complete(job_ids, fail_if_not_found)
+            .await
+    }
+
+    pub async fn get_job_status(&self, path: &Path) -> FsResult<JobStatus> {
+        let client = JobMasterClient::new(self.fs_client());
+        let job_ids = self.load_job_ids_for_path(path).await?;
+        Self::get_first_load_job_status(&client, &job_ids).await
+    }
+
+    async fn load_job_ids_for_path(&self, path: &Path) -> FsResult<Vec<String>> {
         if !path.is_cv() {
             return err_box!("the current file {} is not a cache file", path);
         }
@@ -421,19 +578,136 @@ impl UnifiedFileSystem {
             None => return err_box!("the current file {} is not mounted to ufs", path),
         };
 
-        let job_id = if mnt.info.is_fs_mode() {
-            CommonUtils::create_job_id(path.full_path())
-        } else {
-            CommonUtils::create_job_id(ufs_path.full_path())
+        let cv_job_id = CommonUtils::create_job_id(path.full_path());
+        let ufs_job_id = CommonUtils::create_job_id(ufs_path.full_path());
+
+        if !mnt.info.is_fs_mode() {
+            return Ok(vec![ufs_job_id]);
+        }
+
+        let prefer_ufs = match self.cv.get_status(path).await {
+            Ok(status) => status.storage_policy.ufs_only(),
+            Err(FsError::FileNotFound(_)) => true,
+            Err(err) => return Err(err),
         };
-        let client = JobMasterClient::new(self.fs_client());
-        client.wait_job_complete(job_id, fail_if_not_found).await
+
+        if prefer_ufs {
+            Ok(Self::unique_job_ids([ufs_job_id, cv_job_id]))
+        } else {
+            Ok(Self::unique_job_ids([cv_job_id, ufs_job_id]))
+        }
     }
 
-    pub async fn get_job_status(&self, path: &Path) -> FsResult<JobStatus> {
+    fn unique_job_ids(job_ids: impl IntoIterator<Item = String>) -> Vec<String> {
+        let mut unique = Vec::new();
+        for job_id in job_ids {
+            if !unique.contains(&job_id) {
+                unique.push(job_id);
+            }
+        }
+        unique
+    }
+
+    async fn get_first_load_job_status(
+        client: &JobMasterClient,
+        job_ids: &[String],
+    ) -> FsResult<JobStatus> {
+        let mut first_not_found = None;
+
+        for job_id in job_ids {
+            match client.get_job_status(job_id).await {
+                Ok(status) => return Ok(status),
+                Err(err @ FsError::JobNotFound(_)) => {
+                    first_not_found.get_or_insert(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(first_not_found.unwrap_or_else(|| FsError::job_not_found(job_ids.join(","))))
+    }
+
+    async fn wait_load_job_complete(
+        &self,
+        job_ids: Vec<String>,
+        fail_if_not_found: bool,
+    ) -> FsResult<()> {
+        let timeout = self.conf().client.max_sync_wait_timeout;
+        time::timeout(
+            timeout,
+            self.wait_load_job_complete0(job_ids, fail_if_not_found),
+        )
+        .await?
+    }
+
+    async fn wait_load_job_complete0(
+        &self,
+        job_ids: Vec<String>,
+        fail_if_not_found: bool,
+    ) -> FsResult<()> {
         let client = JobMasterClient::new(self.fs_client());
-        let job_id = CommonUtils::create_job_id(path.full_path());
-        client.get_job_status(job_id).await
+        let conf = &self.conf().client;
+        let sync_check_interval_min = conf.sync_check_interval_min;
+        let sync_check_interval_max = conf.sync_check_interval_max;
+        let sync_check_log_tick = conf.sync_check_log_tick;
+        let mut ticks = 0;
+        let time = TimeSpent::new();
+
+        loop {
+            let mut first_not_found = None;
+            let mut last_pending = None;
+
+            for job_id in &job_ids {
+                let status = match client.get_job_status(job_id).await {
+                    Ok(status) => status,
+                    Err(err @ FsError::JobNotFound(_)) => {
+                        first_not_found.get_or_insert(err);
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
+
+                match status.state {
+                    JobTaskState::Completed => return Ok(()),
+                    JobTaskState::Failed | JobTaskState::Canceled => {
+                        return err_box!(
+                            "job {} {:?}: {}",
+                            status.job_id,
+                            status.state,
+                            status.progress.message
+                        )
+                    }
+                    _ => last_pending = Some(status),
+                }
+            }
+
+            if last_pending.is_none() && fail_if_not_found {
+                return Err(
+                    first_not_found.unwrap_or_else(|| FsError::job_not_found(job_ids.join(",")))
+                );
+            }
+
+            ticks += 1;
+            let sleep_time = sync_check_interval_max.min(sync_check_interval_min * ticks);
+            time::sleep(sleep_time).await;
+
+            if sync_check_log_tick > 0 && ticks % sync_check_log_tick == 0 {
+                if let Some(status) = &last_pending {
+                    info!(
+                        "waiting for job {} to complete, elapsed: {} ms, progress: {}",
+                        status.job_id,
+                        time.used_ms(),
+                        status.progress_string(false)
+                    );
+                } else {
+                    info!(
+                        "waiting for one of jobs {:?} to appear, elapsed: {} ms",
+                        job_ids,
+                        time.used_ms()
+                    );
+                }
+            }
+        }
     }
 
     pub async fn cleanup(&self) {
@@ -690,16 +964,23 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                     .with_label_values(&[mount.mount_id()])
                     .inc();
 
-                if mount.info.auto_cache() {
-                    self.async_cache(&ufs_path)?;
-                }
-
                 read_path = ufs_path.full_path().to_owned();
                 // Reading from ufs
                 if self.enable_read_ufs {
                     debug!("read from ufs, ufs path {}, cv path: {}", ufs_path, path);
-                    mount.ufs.open(&ufs_path).await
+                    let reader = mount.ufs.open(&ufs_path).await?;
+                    if mount.info.auto_cache() {
+                        self.async_cache(&ufs_path)?;
+                    }
+                    Ok(reader)
                 } else {
+                    if mount.info.auto_cache() {
+                        let status = mount.ufs.get_status(&ufs_path).await?;
+                        if status.is_dir {
+                            return err_ext!(FsError::is_a_directory(ufs_path.path()));
+                        }
+                        self.async_cache(&ufs_path)?;
+                    }
                     err_ext!(FsError::unsupported_ufs_read(path.path()))
                 }
             }
