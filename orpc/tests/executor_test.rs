@@ -76,6 +76,41 @@ fn single_executor_try_spawn_returns_error_when_queue_is_full() -> CommonResult<
 }
 
 #[test]
+fn group_executor_try_spawn_uses_available_worker() -> CommonResult<()> {
+    let executor = GroupExecutor::new("group-try-spawn", 2, 128);
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+
+    executor.fixed_spawn(0, move || {
+        started_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    })?;
+    started_rx.recv()?;
+
+    for _ in 0..128 {
+        executor.fixed_try_spawn(0, || {})?;
+    }
+
+    let (done_tx, done_rx) = mpsc::sync_channel(64);
+    for _ in 0..64 {
+        let done_tx = done_tx.clone();
+        executor.try_spawn(move || {
+            done_tx.send(()).unwrap();
+        })?;
+    }
+    drop(done_tx);
+
+    for _ in 0..64 {
+        done_rx.recv()?;
+    }
+
+    release_tx.send(())?;
+    drop(executor);
+
+    Ok(())
+}
+
+#[test]
 fn test_group_executor_fixed_thread_allocation_for_thread_safety() {
     let executor = Arc::new(GroupExecutor::new("test", 2, 10));
 

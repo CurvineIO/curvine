@@ -21,7 +21,7 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-type Task = Box<dyn FnOnce() + 'static + Send>;
+pub(super) type Task = Box<dyn FnOnce() + 'static + Send>;
 
 #[derive(Debug)]
 pub struct SingleExecutor {
@@ -63,11 +63,15 @@ impl SingleExecutor {
     where
         F: FnOnce() + Send + 'static,
     {
-        match self.sender.try_send(Box::new(task)) {
+        match self.try_spawn_task(Box::new(task)) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => err_box!("executor {} queue is full", self.name),
             Err(TrySendError::Disconnected(_)) => err_box!("executor {} has stopped", self.name),
         }
+    }
+
+    pub(super) fn try_spawn_task(&self, task: Task) -> Result<(), TrySendError<Task>> {
+        self.sender.try_send(task)
     }
 
     pub fn spawn_blocking<F, R>(&self, task: F) -> CommonResult<R>

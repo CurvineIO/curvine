@@ -35,6 +35,7 @@ use orpc::handler::{FrameBuf, MessageHandler};
 use orpc::io::net::ConnState;
 use orpc::message::Message;
 use orpc::runtime::GroupExecutor;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
@@ -735,9 +736,29 @@ impl MasterHandler {
     {
         let (tx, rx) = oneshot::channel();
         executor.try_spawn(move || {
-            let _ = tx.send(task());
+            let res = panic::catch_unwind(AssertUnwindSafe(task))
+                .unwrap_or_else(|_| err_box!("master rpc lane task panicked"));
+            let _ = tx.send(res);
         })?;
         rx.await?
+    }
+
+    fn record_rpc_observability(&self, ctx: &RpcContext<'_>, response: &FsResult<Message>) {
+        let used_us = ctx.spent.used_us();
+        if self.audit_logging_enabled {
+            ctx.audit_log(response, used_us, self.conn_state.as_ref());
+        }
+
+        let code_label = format!("{:?}", ctx.code);
+        self.metrics.rpc_request_total_time.inc_by(used_us as i64);
+        self.metrics.rpc_request_total_count.inc();
+
+        if ctx.code != RpcCode::WorkerHeartbeat {
+            self.metrics
+                .operation_duration
+                .with_label_values(&[&code_label])
+                .observe(used_us as f64);
+        };
     }
 
     async fn async_get_block_locations(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -907,22 +928,7 @@ impl MessageHandler for MasterHandler {
             _ => err_box!("Unsupported operation"),
         };
 
-        // Record request processing time and audit log
-        let used_us = ctx.spent.used_us();
-        if self.audit_logging_enabled {
-            ctx.audit_log(&response, used_us, self.conn_state.as_ref());
-        }
-
-        let code_label = format!("{:?}", ctx.code);
-        self.metrics.rpc_request_total_time.inc_by(used_us as i64);
-        self.metrics.rpc_request_total_count.inc();
-
-        if ctx.code != RpcCode::WorkerHeartbeat {
-            self.metrics
-                .operation_duration
-                .with_label_values(&[&code_label])
-                .observe(used_us as f64);
-        };
+        self.record_rpc_observability(ctx, &response);
 
         match response {
             Ok(v) => Ok(v),
@@ -935,25 +941,26 @@ impl MessageHandler for MasterHandler {
         let ctx = &mut rpc_context;
         let code = RpcCode::from(msg.code());
 
-        // Check whether the master is active
-        if !self.fs.master_monitor.is_active() {
-            return Ok(msg.error_ext(&FsError::not_leader_master(ctx.code, self.client_ip())));
-        }
+        let res = if !self.fs.master_monitor.is_active() {
+            Err(FsError::not_leader_master(ctx.code, self.client_ip()))
+        } else {
+            match code {
+                RpcCode::SubmitJob => self.job_handler.submit_load_job(ctx, &mut self.buf).await,
+                RpcCode::GetJobStatus => self.job_handler.get_load_status(ctx, &mut self.buf),
+                RpcCode::CancelJob => self.job_handler.cancel_job(ctx, &mut self.buf).await,
+                RpcCode::ReportTask => self.job_handler.task_report(ctx, &mut self.buf),
+                RpcCode::GetBlockLocations => self.async_get_block_locations(ctx).await,
+                RpcCode::GetMasterInfo => self.async_get_master_info(ctx).await,
+                RpcCode::ListStatus => self.async_list_status(ctx).await,
+                RpcCode::ListOptions => self.async_list_options(ctx).await,
+                RpcCode::WorkerHeartbeat => self.async_worker_heartbeat(ctx).await,
+                RpcCode::WorkerBlockReport => self.async_worker_block_report(ctx).await,
 
-        let res = match code {
-            RpcCode::SubmitJob => self.job_handler.submit_load_job(ctx, &mut self.buf).await,
-            RpcCode::GetJobStatus => self.job_handler.get_load_status(ctx, &mut self.buf),
-            RpcCode::CancelJob => self.job_handler.cancel_job(ctx, &mut self.buf).await,
-            RpcCode::ReportTask => self.job_handler.task_report(ctx, &mut self.buf),
-            RpcCode::GetBlockLocations => self.async_get_block_locations(ctx).await,
-            RpcCode::GetMasterInfo => self.async_get_master_info(ctx).await,
-            RpcCode::ListStatus => self.async_list_status(ctx).await,
-            RpcCode::ListOptions => self.async_list_options(ctx).await,
-            RpcCode::WorkerHeartbeat => self.async_worker_heartbeat(ctx).await,
-            RpcCode::WorkerBlockReport => self.async_worker_block_report(ctx).await,
-
-            v => err_box!("unsupported operation {:?}", v),
+                v => err_box!("unsupported operation {:?}", v),
+            }
         };
+
+        self.record_rpc_observability(ctx, &res);
 
         match res {
             Ok(v) => Ok(v),
