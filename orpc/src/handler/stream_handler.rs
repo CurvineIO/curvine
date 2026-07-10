@@ -85,17 +85,20 @@ impl<F: Frame, M: MessageHandler> StreamHandler<F, M> {
                 })
                 .await?
         } else {
-            let error_response_base = Builder::new()
-                .code(request.code())
-                .request(request.request_status())
-                .req_id(request.req_id())
-                .seq_id(request.seq_id())
-                .build();
+            let code = request.code();
+            let request_status = request.request_status();
             let req_id = request.req_id();
+            let seq_id = request.seq_id();
             match self.handler.as_mut().async_handle(request).await {
                 Ok(v) => v,
                 Err(e) => {
                     debug!("handler request {} error: {}", req_id, e);
+                    let error_response_base = Builder::new()
+                        .code(code)
+                        .request(request_status)
+                        .req_id(req_id)
+                        .seq_id(seq_id)
+                        .build();
                     error_response_base.error_ext(&e)
                 }
             }
