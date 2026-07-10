@@ -52,7 +52,7 @@ mod reentry_guard {
     }
 
     pub(super) fn unmark_held(id: u64) {
-        HELD_LOCKS.with(|held| {
+        let _ = HELD_LOCKS.try_with(|held| {
             let mut held = held.borrow_mut();
             if let Some(pos) = held.iter().rposition(|x| *x == id) {
                 held.remove(pos);
