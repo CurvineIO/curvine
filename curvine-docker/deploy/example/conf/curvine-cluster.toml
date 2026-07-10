@@ -38,7 +38,12 @@ master_addrs = [
 
 [fuse]
 debug = false
-
+# Kernel-side metadata cache timeouts (milliseconds).
+# BREAKING: the old second-based keys attr_timeout / entry_timeout /
+# negative_timeout were renamed to *_ms (value x1000) and are now ignored.
+attr_timeout_ms = 1000
+entry_timeout_ms = 1000
+negative_timeout_ms = 0
 
 [log]
 level = "info"

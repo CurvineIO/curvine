@@ -1871,7 +1871,9 @@ fn fs_error_to_object_store(location: &Path, error: FsError) -> OsError {
             path: location.to_string(),
             source: Box::new(e),
         },
-        e @ FsError::Unsupported(_) | e @ FsError::UnsupportedUfsRead(_) => OsError::NotSupported {
+        e @ FsError::Unsupported(_)
+        | e @ FsError::UnsupportedUfsRead(_)
+        | e @ FsError::ReadOnly(_) => OsError::NotSupported {
             source: Box::new(e),
         },
         e => OsError::Generic {
@@ -1931,6 +1933,14 @@ mod tests {
         let message = "[curvine-master] ERROR: File /tmp/lancedb/events.lance/_versions not exists(curvine-server/src/master/meta/fs_dir.rs:452): ";
 
         assert!(is_curvine_missing_common_message(message));
+    }
+
+    #[test]
+    fn readonly_fs_error_maps_to_object_store_not_supported() {
+        let location = Path::from("dataset.lance");
+        let err = fs_error_to_object_store(&location, FsError::read_only("read-only mount"));
+
+        assert!(matches!(err, OsError::NotSupported { .. }));
     }
 
     #[test]

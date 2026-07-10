@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::block::{BlockMeta, BlockState};
 use crate::worker::storage::{
     DirState, StorageVersion, ACTIVE_DIR, DEFAULT_BLOCK_ALIGN, STAGING_DIR,
 };
 use curvine_common::conf::WorkerDataDir;
-use curvine_common::state::{ExtendedBlock, StorageType};
+use curvine_common::state::StorageType;
 use log::*;
 use orpc::common::{ByteUnit, FileUtils};
 #[cfg(feature = "spdk")]
@@ -25,9 +24,8 @@ use orpc::io::spdk_env::SpdkEnv;
 use orpc::io::LocalFile;
 use orpc::sync::AtomicLong;
 use orpc::sys::FsStats;
-use orpc::{try_err, CommonResult};
+use orpc::CommonResult;
 use std::fmt::{Debug, Formatter};
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -304,115 +302,6 @@ impl VfsDir {
         }
     }
 
-    pub fn create_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
-        let mut meta = BlockMeta::with_tmp(block, self);
-        if self.storage_type == StorageType::SpdkDisk {
-            // Allocate a non-overlapping offset range on the bdev for this block.
-            let offset = self
-                .state
-                .offset_alloc
-                .allocate(block.id, block.len)
-                .map_err(|e| {
-                    orpc::err_msg!(format!(
-                        "Failed to allocate bdev offset for block {}: {}",
-                        block.id, e
-                    ))
-                })?;
-            meta.bdev_offset = offset;
-        } else {
-            let file = meta.get_block_path()?;
-            let _ = try_err!(File::create(file));
-        }
-        Ok(meta)
-    }
-
-    pub fn finalize_block(&self, meta: &BlockMeta, committed_len: i64) -> CommonResult<BlockMeta> {
-        if self.storage_type == StorageType::SpdkDisk {
-            // SPDK: skip metadata stat (use in-memory BlockMeta)
-            return Ok(BlockMeta::with_final_spdk(meta, committed_len));
-        }
-        let final_meta = BlockMeta::with_final(meta)?;
-        Ok(final_meta)
-    }
-
-    // Scan all blocks in the directory
-    pub fn scan_blocks(&self) -> CommonResult<Vec<BlockMeta>> {
-        // SPDK bdevs don't store blocks on the filesystem — nothing to scan
-        if self.storage_type == StorageType::SpdkDisk {
-            // SPDK: loaded via scan_spdk_blocks() in VfsDataset
-            return Ok(vec![]);
-        }
-        let active_dir = FileUtils::list_files(&self.active_dir, true)?;
-        let staging_dir = FileUtils::list_files(&self.staging_dir, true)?;
-
-        let mut vec = vec![];
-        for file in active_dir {
-            if let Ok(v) = BlockMeta::from_file(&file, BlockState::Finalized, self) {
-                vec.push(v);
-            }
-        }
-
-        for file in staging_dir {
-            if let Ok(v) = BlockMeta::from_file(&file, BlockState::Recovering, self) {
-                vec.push(v);
-            }
-        }
-
-        Ok(vec)
-    }
-
-    /// Restore SPDK block metadata from RocksDB on restart.
-    /// Called during dataset initialization for SPDK directories.
-    /// - Loads all block records from RocksDB
-    /// - Filters to this directory's dir_id
-    /// - Restores the offset allocator state
-    /// - Returns blocks as BlockMeta (non-finalized blocks become Recovering state)
-    pub fn scan_spdk_blocks(&self, store: &super::SpdkMetaStore) -> CommonResult<Vec<BlockMeta>> {
-        let all_records = store.scan_all()?;
-        let all_records_len = all_records.len();
-        // Filter to only records belonging to this directory.
-        let records: Vec<_> = all_records
-            .into_iter()
-            .filter(|r| r.dir_id == self.id())
-            .collect();
-
-        // Restore the offset allocator from the saved entries.
-        let alloc_entries: Vec<(i64, i64, i64)> = records
-            .iter()
-            .map(|r| (r.block_id, r.offset, r.size))
-            .collect();
-        self.state.offset_alloc.restore(&alloc_entries);
-
-        // Reconstruct BlockMeta for each saved block.
-        let mut blocks = Vec::with_capacity(records.len());
-        for rec in &records {
-            let state = if rec.finalized {
-                BlockState::Finalized
-            } else {
-                // Non-finalized blocks found after restart are treated as
-                // recovering — the write was interrupted.
-                BlockState::Recovering
-            };
-            let block = BlockMeta {
-                id: rec.block_id,
-                len: rec.len,
-                state,
-                dir: self.state.clone(),
-                actual_len: rec.len,
-                bdev_offset: rec.offset,
-            };
-            blocks.push(block);
-        }
-
-        info!(
-            "Restored {} SPDK blocks for dir {} from RocksDB (skipped {} from other dirs)",
-            blocks.len(),
-            self.id(),
-            all_records_len - blocks.len(),
-        );
-        Ok(blocks)
-    }
-
     pub fn check_dir(&self) -> CommonResult<()> {
         if self.storage_type == StorageType::SpdkDisk {
             return Ok(());
@@ -463,9 +352,11 @@ impl Debug for VfsDir {
 #[cfg(all(test, feature = "spdk"))]
 mod test {
     use super::*;
+    use crate::worker::block::{BlockMeta, BlockState};
     use crate::worker::storage::vfs_dir::VfsDir;
-    use crate::worker::storage::StorageVersion;
-    use crate::worker::storage::DEFAULT_BLOCK_ALIGN;
+    use crate::worker::storage::{
+        BdevLayout, BlockLayout, FileLayout, StorageVersion, DEFAULT_BLOCK_ALIGN,
+    };
     use curvine_common::conf::WorkerDataDir;
     use curvine_common::state::{ExtendedBlock, StorageType};
     use orpc::common::{ByteUnit, FileUtils};
@@ -545,7 +436,8 @@ mod test {
 
         // add tmp block
         let block = ExtendedBlock::with_size_str(1122, "10MB", StorageType::Mem)?;
-        let tmp = dir.create_block(&block)?;
+        let layout = FileLayout;
+        let tmp = layout.allocate(&dir, &block)?;
         dir.reserve_space(false, block.len);
 
         let tmp_file = tmp.get_block_path()?;
@@ -564,7 +456,7 @@ mod test {
 
         // commit block
         // commit block (committed_len = 1MB, the actual data written)
-        let final1 = dir.finalize_block(&tmp, ByteUnit::MB as i64)?;
+        let final1 = layout.finalize(&tmp, ByteUnit::MB as i64)?;
         let file = final1.get_block_path()?;
         dir.release_space(false, block.len);
         dir.reserve_space(false, final1.len);
@@ -581,9 +473,8 @@ mod test {
     // SPDK: finalize_block skips path.metadata()
     #[test]
     fn finalize_block_spdk() -> CommonResult<()> {
-        use crate::worker::block::{BlockMeta, BlockState};
         let st = spdk_state("/spdk/final", 1 << 30);
-        let dir = spdk_dir("/spdk/final", st.clone(), 1 << 30);
+        let _dir = spdk_dir("/spdk/final", st.clone(), 1 << 30);
         let meta = BlockMeta {
             id: 1,
             len: 4096,
@@ -592,7 +483,8 @@ mod test {
             actual_len: 4096,
             bdev_offset: 0,
         };
-        let r = dir.finalize_block(&meta, 2048)?;
+        let layout = BdevLayout::new(None);
+        let r = layout.finalize(&meta, 2048)?;
         assert_eq!(r.len, 2048);
         Ok(())
     }

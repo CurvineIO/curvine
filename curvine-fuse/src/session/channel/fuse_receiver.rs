@@ -380,14 +380,15 @@ impl<T: FileSystem> FuseReceiver<T> {
                                     req.opcode(),
                                 );
                             }
+                            if req.is_meta() {
+                                self.audit(&req);
+                            }
 
                             if req.is_stream() {
                                 if let Err(e) = self.send_stream(req).await {
                                     error!("failed to dispatch stream request: {}", e);
                                 }
                             } else {
-                                self.audit(&req);
-
                                 let labels = self.maybe_req_labels(&req);
                                 let reply = self.new_reply(req.unique(), labels);
                                 let fs = self.fs.clone();
