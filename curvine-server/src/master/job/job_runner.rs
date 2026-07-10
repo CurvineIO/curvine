@@ -54,6 +54,12 @@ struct PlannedLoadJob {
     total_size: i64,
 }
 
+#[derive(Clone, Copy)]
+enum CvSourceMode {
+    LoadUfsOnlyFromUfs,
+    ExportCurvineToUfs,
+}
+
 impl LoadJobRunner {
     const RUN_ID_SEQ_MOD: u64 = 1_000_000;
 
@@ -88,9 +94,35 @@ impl LoadJobRunner {
         &self,
         command: &LoadJobCommand,
         mnt: &MountInfo,
+        cv_source_mode: CvSourceMode,
     ) -> FsResult<(JobContext, Path, Path)> {
-        let source_path = Path::from_str(&command.source_path)?;
-        let target_path = mnt.toggle_path(&source_path)?;
+        let command_source = Path::from_str(&command.source_path)?;
+        let (source_path, target_path) = match (cv_source_mode, command_source.is_cv()) {
+            (CvSourceMode::LoadUfsOnlyFromUfs, false) => {
+                let target_path = mnt.get_cv_path(&command_source)?;
+                (command_source, target_path)
+            }
+            (CvSourceMode::LoadUfsOnlyFromUfs, true) => {
+                let status = self.master_fs.file_status(command_source.path())?;
+                if !status.storage_policy.ufs_only() {
+                    return err_box!(
+                        "load job for CV path {} requires UFS-only metadata",
+                        command_source.full_path()
+                    );
+                }
+                (mnt.get_ufs_path(&command_source)?, command_source)
+            }
+            (CvSourceMode::ExportCurvineToUfs, true) => {
+                let target_path = mnt.get_ufs_path(&command_source)?;
+                (command_source, target_path)
+            }
+            (CvSourceMode::ExportCurvineToUfs, false) => {
+                return err_box!(
+                    "export job source path {} must be a CV path",
+                    command_source.full_path()
+                );
+            }
+        };
         let job_id = CommonUtils::create_job_id(source_path.full_path());
         let run_id = self.next_run_id();
         let job_context = JobContext::with_conf(
@@ -161,7 +193,8 @@ impl LoadJobRunner {
         command: LoadJobCommand,
         mnt: MountInfo,
     ) -> FsResult<(LoadJobResult, Option<QueuedLoadJob>)> {
-        let (job_context, source_path, target_path) = self.build_job_context(&command, &mnt)?;
+        let (job_context, source_path, target_path) =
+            self.build_job_context(&command, &mnt, CvSourceMode::LoadUfsOnlyFromUfs)?;
         let job_id = job_context.info.job_id.clone();
         let run_id = job_context.run_id;
 
@@ -219,7 +252,32 @@ impl LoadJobRunner {
         command: LoadJobCommand,
         mnt: MountInfo,
     ) -> FsResult<LoadJobResult> {
-        let (mut job_context, source_path, target_path) = self.build_job_context(&command, &mnt)?;
+        self.submit_direct_task(command, mnt, CvSourceMode::LoadUfsOnlyFromUfs, "load")
+            .await
+    }
+
+    /// Submits a durable export job used by fs_mode journal replay.
+    ///
+    /// CV source paths stay CV sources here. This preserves the journal contract:
+    /// committed Curvine data is copied back to the mounted UFS.
+    pub async fn submit_export_task(
+        &self,
+        command: LoadJobCommand,
+        mnt: MountInfo,
+    ) -> FsResult<LoadJobResult> {
+        self.submit_direct_task(command, mnt, CvSourceMode::ExportCurvineToUfs, "export")
+            .await
+    }
+
+    async fn submit_direct_task(
+        &self,
+        command: LoadJobCommand,
+        mnt: MountInfo,
+        cv_source_mode: CvSourceMode,
+        job_kind: &str,
+    ) -> FsResult<LoadJobResult> {
+        let (mut job_context, source_path, target_path) =
+            self.build_job_context(&command, &mnt, cv_source_mode)?;
         let job_id = job_context.info.job_id.clone();
         let run_id = job_context.run_id;
 
@@ -233,7 +291,8 @@ impl LoadJobRunner {
             .await?
         {
             info!(
-                "skip load job {}: source_path {} already loaded or in progress",
+                "skip {} job {}: source_path {} already loaded or in progress",
+                job_kind,
                 job_id,
                 source_path.full_path()
             );
@@ -244,7 +303,8 @@ impl LoadJobRunner {
         }
 
         debug!(
-            "submitting load job {}: {} -> {}",
+            "submitting {} job {}: {} -> {}",
+            job_kind,
             job_id,
             source_path.full_path(),
             target_path.full_path()
@@ -256,7 +316,8 @@ impl LoadJobRunner {
         let total_size = planned.total_size;
         if planned.tasks.is_empty() {
             info!(
-                "load job {} has no tasks: {} -> {}",
+                "{} job {} has no tasks: {} -> {}",
+                job_kind,
                 job_id,
                 source_path.full_path(),
                 target_path.full_path()
@@ -272,7 +333,8 @@ impl LoadJobRunner {
         }
 
         info!(
-            "load job {} submitted: {} -> {}, tasks {}, total_size {}",
+            "{} job {} submitted: {} -> {}, tasks {}, total_size {}",
+            job_kind,
             job_id,
             source_path.full_path(),
             target_path.full_path(),
@@ -285,7 +347,7 @@ impl LoadJobRunner {
         // Install / replace the ctx into the store atomically. We branch into:
         //   - Vacant: first submitter, install and dispatch.
         //   - Occupied + running: another submitter won the race; return that job’s
-        //     state (this request’s command is not applied—see `submit_load_task` doc).
+        //     state (this request's command options are not applied).
         //   - Occupied + terminal: previous run finished/failed/canceled and
         //     hasn't been cleaned up yet. Replace with the new ctx and dispatch.
         match self.jobs.entry(job_id.clone()) {
@@ -312,7 +374,7 @@ impl LoadJobRunner {
         }
 
         if let Err(err) = self.submit_all_task(tasks).await {
-            warn!("dispatch load job {} failed: {}", job_id, err);
+            warn!("dispatch {} job {} failed: {}", job_kind, job_id, err);
             // @todo Cancel sub-tasks that may have already been dispatched.
             if let Err(update_err) = self.jobs.update_state(
                 &job_id,
@@ -320,8 +382,8 @@ impl LoadJobRunner {
                 format!("dispatch failed: {}", err),
             ) {
                 error!(
-                    "failed to mark load job {} as failed after dispatch error: {}",
-                    job_id, update_err
+                    "failed to mark {} job {} as failed after dispatch error: {}",
+                    job_kind, job_id, update_err
                 );
             }
             return Err(err);

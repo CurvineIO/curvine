@@ -22,7 +22,7 @@ use log::error;
 use orpc::common::{LocalTime, Logger};
 use orpc::handler::HandlerService;
 use orpc::io::net::ConnState;
-use orpc::runtime::{RpcRuntime, Runtime};
+use orpc::runtime::{GroupExecutor, RpcRuntime, Runtime};
 use orpc::server::{RpcServer, ServerStateListener};
 use orpc::{err_box, CommonResult};
 
@@ -44,6 +44,11 @@ pub struct MasterService {
     mount_manager: Arc<MountManager>,
     job_manager: Arc<JobManager>,
     rt: Arc<Runtime>,
+    heartbeat_rpc_executor: Arc<GroupExecutor>,
+    block_report_rpc_executor: Arc<GroupExecutor>,
+    control_rpc_executor: Arc<GroupExecutor>,
+    list_rpc_executor: Arc<GroupExecutor>,
+    get_block_locations_rpc_executor: Arc<GroupExecutor>,
     replication_manager: Arc<MasterReplicationManager>,
     metrics: &'static MasterMetrics,
 }
@@ -57,6 +62,11 @@ impl MasterService {
         mount_manager: Arc<MountManager>,
         job_manager: Arc<JobManager>,
         rt: Arc<Runtime>,
+        heartbeat_rpc_executor: Arc<GroupExecutor>,
+        block_report_rpc_executor: Arc<GroupExecutor>,
+        control_rpc_executor: Arc<GroupExecutor>,
+        list_rpc_executor: Arc<GroupExecutor>,
+        get_block_locations_rpc_executor: Arc<GroupExecutor>,
         replication_manager: Arc<MasterReplicationManager>,
         metrics: &'static MasterMetrics,
     ) -> Self {
@@ -67,6 +77,11 @@ impl MasterService {
             mount_manager,
             job_manager,
             rt,
+            heartbeat_rpc_executor,
+            block_report_rpc_executor,
+            control_rpc_executor,
+            list_rpc_executor,
+            get_block_locations_rpc_executor,
             replication_manager,
             metrics,
         }
@@ -104,6 +119,11 @@ impl HandlerService for MasterService {
             client_state,
             self.mount_manager.clone(),
             JobHandler::new(self.job_manager.clone()),
+            self.heartbeat_rpc_executor.clone(),
+            self.block_report_rpc_executor.clone(),
+            self.control_rpc_executor.clone(),
+            self.list_rpc_executor.clone(),
+            self.get_block_locations_rpc_executor.clone(),
             self.replication_manager.clone(),
             self.metrics,
         )
@@ -149,6 +169,22 @@ impl Master {
         let job_manager = journal_system.job_manager();
 
         let rt = Arc::new(conf.master_server_conf().create_runtime());
+        let heartbeat_rpc_executor = Arc::new(GroupExecutor::new("master-heartbeat-rpc", 2, 1024));
+        let block_report_rpc_executor =
+            Arc::new(GroupExecutor::new("master-block-report-rpc", 2, 128));
+        let control_rpc_executor = Arc::new(GroupExecutor::new("master-control-rpc", 2, 1024));
+        let read_lane_threads = conf.master.worker_threads.saturating_sub(4).max(1);
+        let read_lane_queue = conf.master.worker_threads.saturating_mul(2).max(1);
+        let list_rpc_executor = Arc::new(GroupExecutor::new(
+            "master-list-rpc",
+            read_lane_threads,
+            read_lane_queue,
+        ));
+        let get_block_locations_rpc_executor = Arc::new(GroupExecutor::new(
+            "master-get-block-locations-rpc",
+            read_lane_threads,
+            read_lane_queue,
+        ));
 
         let replication_manager = MasterReplicationManager::new(&fs, &conf, &rt, &worker_manager)?;
 
@@ -169,6 +205,11 @@ impl Master {
             mount_manager.clone(),
             job_manager.clone(),
             rt.clone(),
+            heartbeat_rpc_executor,
+            block_report_rpc_executor,
+            control_rpc_executor,
+            list_rpc_executor,
+            get_block_locations_rpc_executor,
             replication_manager.clone(),
             metrics,
         );

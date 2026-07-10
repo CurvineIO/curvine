@@ -14,6 +14,7 @@
 
 use crate::master::fs::heartbeat_checker::HeartbeatChecker;
 use crate::master::fs::master_filesystem::MasterFilesystem;
+use crate::master::fs::FsDirWatchdog;
 use crate::master::meta::inode::ttl::TtlHeartbeatChecker;
 use crate::master::meta::inode::ttl::TtlHeartbeatConfig;
 use crate::master::meta::inode::ttl::{InodeTtlExecutor, InodeTtlManager};
@@ -35,6 +36,11 @@ pub struct MasterActor {
 }
 
 impl MasterActor {
+    // fs_dir stall watchdog cadence. The threshold is well above any legitimate
+    // brief write burst; a read lock unacquirable this long means a wedge.
+    const FS_DIR_WATCHDOG_INTERVAL_MS: u64 = 1000;
+    const FS_DIR_WATCHDOG_STALL_THRESHOLD_MS: i64 = 15000;
+
     pub fn new(
         fs: MasterFilesystem,
         master_monitor: MasterMonitor,
@@ -60,6 +66,20 @@ impl MasterActor {
             self.replication_manager.clone(),
             self.quota_manager.clone(),
         )?;
+        Self::start_fs_dir_watchdog(self.fs.clone())?;
+        Ok(())
+    }
+
+    fn start_fs_dir_watchdog(fs: MasterFilesystem) -> CommonResult<()> {
+        let scheduler =
+            ScheduledExecutor::new("fs-dir-watchdog", Self::FS_DIR_WATCHDOG_INTERVAL_MS);
+        let watchdog = FsDirWatchdog::new(fs, Self::FS_DIR_WATCHDOG_STALL_THRESHOLD_MS);
+        scheduler.start(watchdog)?;
+        info!(
+            "fs_dir watchdog started, interval {} ms, stall threshold {} ms",
+            Self::FS_DIR_WATCHDOG_INTERVAL_MS,
+            Self::FS_DIR_WATCHDOG_STALL_THRESHOLD_MS
+        );
         Ok(())
     }
 
