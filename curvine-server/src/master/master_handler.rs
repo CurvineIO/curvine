@@ -24,12 +24,11 @@ use curvine_common::fs::Path;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
 use curvine_common::state::{
-    CreateFileOpts, FileBlocks, FileStatus, FreeResult, HeartbeatStatus, ListOptions, MasterInfo,
-    OpenFlags, RenameFlags, WorkerCommand,
+    CreateFileOpts, DeleteBlockCmd, FileBlocks, FileStatus, FreeResult, HeartbeatStatus,
+    ListOptions, MasterInfo, OpenFlags, RenameFlags, WorkerCommand,
 };
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
-use log::error;
 use orpc::err_box;
 use orpc::handler::{FrameBuf, MessageHandler};
 use orpc::io::net::ConnState;
@@ -495,8 +494,11 @@ impl MasterHandler {
 
     pub fn block_report(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: BlockReportListRequest = ctx.parse_header()?;
-        Self::process_block_report(self.fs.clone(), self.replication_handler.clone(), header)?;
-        let rep_header = BlockReportListResponse::default();
+        let cmds =
+            Self::process_block_report(self.fs.clone(), self.replication_handler.clone(), header)?;
+        let rep_header = BlockReportListResponse {
+            cmds: ProtoUtils::worker_cmd_to_pb(cmds),
+        };
         ctx.response_buf(rep_header, &mut self.buf)
     }
 
@@ -504,24 +506,17 @@ impl MasterHandler {
         fs: MasterFilesystem,
         replication_handler: Option<MasterReplicationHandler>,
         header: BlockReportListRequest,
-    ) -> FsResult<()> {
+    ) -> FsResult<Vec<WorkerCommand>> {
         let list = ProtoUtils::block_report_list_from_pb(header);
-        let worker_id = list.worker_id;
-        let stale_block_ids = fs.block_report(list)?;
-        let stale_block_count = stale_block_ids.len();
-        if stale_block_count > 0 {
-            if let Some(replication_handler) = &replication_handler {
-                if let Err(e) =
-                    replication_handler.report_under_replicated_blocks(worker_id, stale_block_ids)
-                {
-                    error!(
-                        "Errors on reporting under-replicated {} blocks from full block report reconciliation. err: {:?}",
-                        stale_block_count, e
-                    );
-                }
-            }
+        let result = fs.block_report(list, replication_handler)?;
+
+        if result.delete_blocks.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Ok(vec![WorkerCommand::DeleteBlock(DeleteBlockCmd {
+                blocks: result.delete_blocks,
+            })])
         }
-        Ok(())
     }
 
     fn client_ip(&self) -> &str {
@@ -839,11 +834,14 @@ impl MasterHandler {
         let header: BlockReportListRequest = ctx.parse_header()?;
         let fs = self.fs.clone();
         let replication_handler = self.replication_handler.clone();
-        Self::run_master_rpc_task(self.block_report_rpc_executor.clone(), move || {
+        let cmds = Self::run_master_rpc_task(self.block_report_rpc_executor.clone(), move || {
             Self::process_block_report(fs, replication_handler, header)
         })
         .await?;
-        ctx.response_buf(BlockReportListResponse::default(), &mut self.buf)
+        let rep_header = BlockReportListResponse {
+            cmds: ProtoUtils::worker_cmd_to_pb(cmds),
+        };
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 }
 

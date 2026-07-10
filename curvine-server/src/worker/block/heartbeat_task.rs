@@ -36,7 +36,7 @@ pub struct HeartbeatTask {
 
 impl HeartbeatTask {
     // Asynchronously delete the block file.
-    fn delete_block_task(
+    pub(crate) fn delete_block_task(
         executor: Arc<GroupExecutor>,
         store: BlockStore,
         cmds: Vec<WorkerCommand>,
@@ -141,8 +141,14 @@ impl LoopTask for HeartbeatTask {
 
         let res = self.client.incr_block_report(&report_blocks);
         match res {
-            Ok(_cmds) => {
-                // @todo handles cmds returned by master.
+            Ok(v) => {
+                let cmds = ProtoUtils::worker_cmd_from_pb(v.cmds);
+                Self::delete_block_task(
+                    self.executor.clone(),
+                    self.store.clone(),
+                    cmds,
+                    self.report_blocks.clone(),
+                );
             }
 
             Err(e) => {

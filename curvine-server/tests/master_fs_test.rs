@@ -23,14 +23,15 @@ use curvine_common::proto::{
 use curvine_common::raft::storage::{AppStorage, ApplyMsg};
 use curvine_common::state::MountOptions;
 use curvine_common::state::{
-    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, CreateFileOptsBuilder,
-    FileAllocOpts, TtlAction, WorkerInfo,
+    BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
+    CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, StorageType, TtlAction, WorkerInfo,
 };
 use curvine_common::state::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_common::utils::SerdeUtils;
 use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader, JournalSystem};
 use curvine_server::master::meta::inode::ttl::InodeTtlExecutor;
+use curvine_server::master::meta::InodeId;
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
 use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
 use orpc::common::LocalTime;
@@ -251,6 +252,256 @@ fn test_master_filesystem_core_operations() -> CommonResult<()> {
     get_file_info(&fs)?;
     list_status(&fs)?;
     state(&fs)?;
+
+    Ok(())
+}
+
+#[test]
+fn block_report_for_non_file_inode_schedules_worker_delete() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "block-report-non-file");
+    fs.mkdir("/dir-block", true)?;
+    let dir_status = fs.file_status("/dir-block")?;
+    let block_id = InodeId::create_block_id(dir_status.id, 0)?;
+
+    let result = fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 0,
+            full_report: false,
+            total_len: 1,
+            blocks: vec![BlockReportInfo::new(
+                block_id,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                1,
+            )],
+        },
+        None,
+    )?;
+
+    assert_eq!(result.delete_blocks, vec![block_id]);
+    Ok(())
+}
+
+#[test]
+fn full_block_report_reconcile_removes_stale_location_async() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "full-block-reconcile-async");
+    let path = "/full-block-reconcile.log";
+    let addr = ClientAddress::default();
+    let status = fs.create(path, false)?;
+
+    let first = fs.add_block(path, None, addr.clone(), vec![], vec![], 0, None)?;
+    let first_commit = CommitBlock {
+        block_id: first.block.id,
+        block_len: status.block_size,
+        locations: vec![BlockLocation::with_id(100)],
+    };
+    let second = fs.add_block(
+        path,
+        None,
+        addr,
+        vec![first_commit],
+        vec![],
+        status.block_size,
+        Some(first.block.clone()),
+    )?;
+
+    fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            full_report: false,
+            total_len: 0,
+            blocks: vec![
+                BlockReportInfo::new(
+                    first.block.id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    first.block.len,
+                ),
+                BlockReportInfo::new(
+                    second.block.id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    second.block.len,
+                ),
+            ],
+        },
+        None,
+    )?;
+
+    let before = fs.get_block_locations(path)?;
+    assert_eq!(before.block_locs.len(), 2);
+    assert!(!before.block_locs[1].locs.is_empty());
+
+    fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            full_report: true,
+            total_len: 1,
+            blocks: vec![BlockReportInfo::new(
+                first.block.id,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                first.block.len,
+            )],
+        },
+        None,
+    )?;
+
+    for _ in 0..50 {
+        let blocks = fs.get_block_locations(path)?;
+        let stale = blocks
+            .block_locs
+            .iter()
+            .find(|block| block.block.id == second.block.id)
+            .expect("second block metadata should remain");
+        if stale.locs.is_empty() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let blocks = fs.get_block_locations(path)?;
+    panic!(
+        "stale worker location for block {} was not reconciled: {:?}",
+        second.block.id, blocks
+    );
+}
+
+#[test]
+fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "full-block-report-invalidate-session");
+    let path = "/full-block-report-invalidate-session.log";
+    let addr = ClientAddress::default();
+    let status = fs.create(path, false)?;
+
+    let first = fs.add_block(path, None, addr.clone(), vec![], vec![], 0, None)?;
+    let first_commit = CommitBlock {
+        block_id: first.block.id,
+        block_len: status.block_size,
+        locations: vec![BlockLocation::with_id(100)],
+    };
+    let second = fs.add_block(
+        path,
+        None,
+        addr.clone(),
+        vec![first_commit],
+        vec![],
+        status.block_size,
+        Some(first.block.clone()),
+    )?;
+    let second_commit = CommitBlock {
+        block_id: second.block.id,
+        block_len: status.block_size,
+        locations: vec![BlockLocation::with_id(100)],
+    };
+    let third = fs.add_block(
+        path,
+        None,
+        addr,
+        vec![second_commit],
+        vec![],
+        status.block_size * 2,
+        Some(second.block.clone()),
+    )?;
+
+    fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            full_report: false,
+            total_len: 0,
+            blocks: vec![
+                BlockReportInfo::new(
+                    first.block.id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    first.block.len,
+                ),
+                BlockReportInfo::new(
+                    second.block.id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    second.block.len,
+                ),
+                BlockReportInfo::new(
+                    third.block.id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    third.block.len,
+                ),
+            ],
+        },
+        None,
+    )?;
+
+    fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            full_report: true,
+            total_len: 2,
+            blocks: vec![BlockReportInfo::new(
+                first.block.id,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                first.block.len,
+            )],
+        },
+        None,
+    )?;
+
+    fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            full_report: false,
+            total_len: 0,
+            blocks: vec![BlockReportInfo::new(
+                second.block.id,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                second.block.len,
+            )],
+        },
+        None,
+    )?;
+
+    fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            full_report: true,
+            total_len: 2,
+            blocks: vec![BlockReportInfo::new(
+                third.block.id,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                third.block.len,
+            )],
+        },
+        None,
+    )?;
+
+    for _ in 0..50 {
+        let blocks = fs.get_block_locations(path)?;
+        let protected = blocks
+            .block_locs
+            .iter()
+            .find(|block| block.block.id == second.block.id)
+            .expect("second block metadata should remain");
+        assert!(
+            !protected.locs.is_empty(),
+            "incremental report should protect block {} from stale full-report reconciliation",
+            second.block.id
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     Ok(())
 }

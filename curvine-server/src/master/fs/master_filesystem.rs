@@ -20,13 +20,15 @@ use crate::master::meta::FsDir;
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
+use crate::master::replication::master_replication_handler::MasterReplicationHandler;
 use crate::master::{Master, MasterMonitor, SyncFsDir, SyncWorkerManager};
 use curvine_common::conf::{ClusterConf, MasterConf};
 use curvine_common::error::FsError;
 use curvine_common::state::*;
 use curvine_common::FsResult;
-use log::warn;
+use log::{error, info, warn};
 use orpc::common::LocalTime;
+use orpc::runtime::GroupExecutor;
 use orpc::sync::ArcRwLock;
 use orpc::{err_box, err_ext, try_option, CommonResult};
 use parking_lot::Mutex;
@@ -40,17 +42,46 @@ pub struct MasterFilesystem {
     pub master_monitor: MasterMonitor,
     pub conf: Arc<MasterConf>,
     full_block_reports: Arc<Mutex<HashMap<u32, FullBlockReportState>>>,
+    full_block_reconciles: Arc<Mutex<HashMap<u32, FullBlockReconcileState>>>,
+    full_block_reconcile_executor: Arc<GroupExecutor>,
+}
+
+pub struct BlockReportResult {
+    pub delete_blocks: Vec<i64>,
+}
+
+pub(crate) enum BlockInodeState {
+    File,
+    Missing,
+    NotFile,
 }
 
 struct FullBlockReportState {
     total_len: u64,
     update_time_ms: u64,
     reported_blocks: HashSet<i64>,
+    invalidated: bool,
+}
+
+struct FullBlockReconcileState {
+    running: bool,
+    generation: u64,
+    pending: Option<FullBlockReconcileJob>,
+}
+
+struct FullBlockReconcileJob {
+    generation: u64,
+    reported_blocks: HashSet<i64>,
 }
 
 const FULL_BLOCK_REPORT_TTL_MS: u64 = 60 * 60 * 1000;
+const FULL_BLOCK_RECONCILE_THREADS: usize = 2;
+const FULL_BLOCK_RECONCILE_QUEUE_SIZE: usize = 128;
 
 impl MasterFilesystem {
+    // Max block-report location updates applied under a single fs_dir write lock.
+    const BLOCK_REPORT_WRITE_CHUNK: usize = 4096;
+
     pub fn new(
         conf: &ClusterConf,
         fs_dir: SyncFsDir,
@@ -63,6 +94,12 @@ impl MasterFilesystem {
             master_monitor,
             conf: Arc::new(conf.master.clone()),
             full_block_reports: Default::default(),
+            full_block_reconciles: Default::default(),
+            full_block_reconcile_executor: Arc::new(GroupExecutor::new(
+                "master-full-block-reconcile",
+                FULL_BLOCK_RECONCILE_THREADS,
+                FULL_BLOCK_RECONCILE_QUEUE_SIZE,
+            )),
         }
     }
 
@@ -73,6 +110,12 @@ impl MasterFilesystem {
             master_monitor: js.master_monitor(),
             conf: Arc::new(conf.master.clone()),
             full_block_reports: Default::default(),
+            full_block_reconciles: Default::default(),
+            full_block_reconcile_executor: Arc::new(GroupExecutor::new(
+                "master-full-block-reconcile",
+                FULL_BLOCK_RECONCILE_THREADS,
+                FULL_BLOCK_RECONCILE_QUEUE_SIZE,
+            )),
         }
     }
 
@@ -717,9 +760,9 @@ impl MasterFilesystem {
         fs_dir.restore_from_rocksdb()
     }
 
-    fn block_exists(&self, id: i64) -> FsResult<bool> {
+    fn block_inode_state(&self, id: i64) -> FsResult<BlockInodeState> {
         let fs_dir = self.fs_dir.read();
-        fs_dir.block_exists(id)
+        fs_dir.block_inode_state(id)
     }
 
     fn collect_full_block_report(&self, list: &BlockReportList) -> Option<HashSet<i64>> {
@@ -738,7 +781,13 @@ impl MasterFilesystem {
                 total_len: list.total_len,
                 update_time_ms: now,
                 reported_blocks: HashSet::with_capacity(list.total_len as usize),
+                invalidated: false,
             });
+
+        if report.invalidated {
+            report.update_time_ms = now;
+            return None;
+        }
 
         if report.total_len != list.total_len {
             warn!(
@@ -751,6 +800,7 @@ impl MasterFilesystem {
             report.total_len = list.total_len;
             report.reported_blocks.clear();
             report.reported_blocks.reserve(list.total_len as usize);
+            report.invalidated = false;
         }
         report.update_time_ms = now;
 
@@ -769,32 +819,103 @@ impl MasterFilesystem {
 
     pub fn reset_full_block_report(&self, worker_id: u32) {
         self.full_block_reports.lock().remove(&worker_id);
+        self.invalidate_full_block_reconcile(worker_id);
+    }
+
+    fn invalidate_full_block_report_session(&self, worker_id: u32) {
+        let now = LocalTime::mills();
+        let mut reports = self.full_block_reports.lock();
+        let report = reports
+            .entry(worker_id)
+            .or_insert_with(|| FullBlockReportState {
+                total_len: 0,
+                update_time_ms: now,
+                reported_blocks: HashSet::new(),
+                invalidated: true,
+            });
+        report.update_time_ms = now;
+        report.reported_blocks.clear();
+        report.invalidated = true;
+    }
+
+    fn invalidate_full_block_state(&self, worker_id: u32) {
+        self.invalidate_full_block_report_session(worker_id);
+        self.invalidate_full_block_reconcile(worker_id);
+    }
+
+    fn invalidate_full_block_reconcile(&self, worker_id: u32) {
+        let mut reconciles = self.full_block_reconciles.lock();
+        if let Some(state) = reconciles.get_mut(&worker_id) {
+            state.generation = state.generation.saturating_add(1);
+            state.pending = None;
+            if !state.running {
+                reconciles.remove(&worker_id);
+            }
+        }
     }
 
     /// Process block reports
-    pub fn block_report(&self, list: BlockReportList) -> FsResult<Vec<i64>> {
+    pub fn block_report(
+        &self,
+        list: BlockReportList,
+        replication_handler: Option<MasterReplicationHandler>,
+    ) -> FsResult<BlockReportResult> {
         // @todo check cluster.
+        let invalidate_full_reconcile = !list.full_report
+            && list.blocks.iter().any(|block| {
+                matches!(
+                    block.status,
+                    BlockReportStatus::Finalized | BlockReportStatus::Writing
+                )
+            });
+        if invalidate_full_reconcile {
+            self.invalidate_full_block_state(list.worker_id);
+        }
+
         let full_reported_blocks = self.collect_full_block_report(&list);
         if list.blocks.is_empty() && full_reported_blocks.is_none() {
-            return Ok(Vec::new());
+            return Ok(BlockReportResult {
+                delete_blocks: Vec::new(),
+            });
         }
 
         //(Whether to increase, block id, block location)
         let mut checked = Vec::with_capacity(list.blocks.len());
+        let mut delete_blocks = Vec::new();
+        let mut missing_blocks = 0usize;
+        let mut not_file_blocks = 0usize;
         for item in list.blocks {
             match item.status {
                 BlockReportStatus::Finalized | BlockReportStatus::Writing => {
-                    let exists = match self.block_exists(item.id) {
+                    let state = match self.block_inode_state(item.id) {
                         Ok(v) => v,
                         Err(e) => {
                             warn!("block_report {item:?}: {e}");
                             continue;
                         }
                     };
-                    checked.push((item, Some(exists)));
+                    match state {
+                        BlockInodeState::File => checked.push((item, Some(BlockInodeState::File))),
+                        BlockInodeState::Missing => {
+                            missing_blocks += 1;
+                            delete_blocks.push(item.id);
+                            checked.push((item, Some(BlockInodeState::Missing)));
+                        }
+                        BlockInodeState::NotFile => {
+                            not_file_blocks += 1;
+                            delete_blocks.push(item.id);
+                            checked.push((item, Some(BlockInodeState::NotFile)));
+                        }
+                    }
                 }
                 BlockReportStatus::Deleted => checked.push((item, None)),
             }
+        }
+        if missing_blocks > 0 || not_file_blocks > 0 {
+            warn!(
+                "block_report found {} missing-inode and {} non-file-inode blocks for worker {}; scheduling worker deletion",
+                missing_blocks, not_file_blocks, list.worker_id
+            );
         }
 
         let mut batch: Vec<(bool, i64, BlockLocation)> = vec![];
@@ -803,21 +924,23 @@ impl MasterFilesystem {
             let loc = BlockLocation::new(list.worker_id, item.storage_type);
             match item.status {
                 BlockReportStatus::Finalized | BlockReportStatus::Writing => {
-                    let exists = match exists {
+                    let state = match exists {
                         Some(v) => v,
                         None => {
                             warn!(
-                                "block_report invariant violated: missing existence flag for block {}",
+                                "block_report invariant violated: missing inode state for block {}",
                                 item.id
                             );
                             continue;
                         }
                     };
 
-                    if exists {
-                        batch.push((true, item.id, loc));
-                    } else {
-                        wm.remove_block(list.worker_id, item.id);
+                    match state {
+                        BlockInodeState::File => batch.push((true, item.id, loc)),
+                        BlockInodeState::Missing | BlockInodeState::NotFile => {
+                            batch.push((false, item.id, loc));
+                            wm.remove_block(list.worker_id, item.id);
+                        }
                     }
                 }
                 BlockReportStatus::Deleted => {
@@ -828,29 +951,186 @@ impl MasterFilesystem {
         }
         drop(wm);
 
-        let mut stale_block_ids = Vec::new();
-        let mut fs_dir = self.fs_dir.write();
         if let Some(reported_blocks) = full_reported_blocks {
-            let existing_blocks = fs_dir.get_worker_block_ids(list.worker_id)?;
-            for block_id in existing_blocks {
-                if !reported_blocks.contains(&block_id) {
-                    batch.push((false, block_id, BlockLocation::with_id(list.worker_id)));
-                    stale_block_ids.push(block_id);
+            self.submit_full_block_reconcile(list.worker_id, reported_blocks, replication_handler)?;
+        }
+
+        self.apply_block_report_batch(batch)?;
+
+        Ok(BlockReportResult { delete_blocks })
+    }
+
+    fn submit_full_block_reconcile(
+        &self,
+        worker_id: u32,
+        reported_blocks: HashSet<i64>,
+        replication_handler: Option<MasterReplicationHandler>,
+    ) -> FsResult<()> {
+        let should_spawn = {
+            let mut reconciles = self.full_block_reconciles.lock();
+            let state = reconciles
+                .entry(worker_id)
+                .or_insert_with(|| FullBlockReconcileState {
+                    running: false,
+                    generation: 0,
+                    pending: None,
+                });
+            state.generation = state.generation.saturating_add(1);
+            let generation = state.generation;
+            state.pending = Some(FullBlockReconcileJob {
+                generation,
+                reported_blocks,
+            });
+            if state.running {
+                false
+            } else {
+                state.running = true;
+                true
+            }
+        };
+
+        if !should_spawn {
+            return Ok(());
+        }
+
+        let fs = self.clone();
+        let res = self
+            .full_block_reconcile_executor
+            .fixed_spawn(worker_id as i64, move || {
+                fs.run_full_block_reconcile(worker_id, replication_handler);
+            });
+        if let Err(e) = &res {
+            self.full_block_reconciles.lock().remove(&worker_id);
+            error!("submit full block report reconcile for worker {worker_id} failed: {e}");
+        }
+        res?;
+        Ok(())
+    }
+
+    fn run_full_block_reconcile(
+        &self,
+        worker_id: u32,
+        replication_handler: Option<MasterReplicationHandler>,
+    ) {
+        loop {
+            let job = {
+                let mut reconciles = self.full_block_reconciles.lock();
+                match reconciles.get_mut(&worker_id) {
+                    Some(state) => match state.pending.take() {
+                        Some(v) => v,
+                        None => {
+                            reconciles.remove(&worker_id);
+                            return;
+                        }
+                    },
+                    None => return,
+                }
+            };
+
+            if !self.is_full_block_reconcile_current(worker_id, job.generation) {
+                info!(
+                    "skip stale full block report reconcile for worker {}, generation {}",
+                    worker_id, job.generation
+                );
+                continue;
+            }
+
+            match self.reconcile_full_block_report(worker_id, job.generation, job.reported_blocks) {
+                Ok(stale_block_ids) => {
+                    let stale_block_count = stale_block_ids.len();
+                    if stale_block_count > 0 {
+                        info!(
+                            "full block report reconciled {} stale block locations for worker {}",
+                            stale_block_count, worker_id
+                        );
+                        if let Some(replication_handler) = &replication_handler {
+                            if let Err(e) = replication_handler
+                                .report_under_replicated_blocks(worker_id, stale_block_ids)
+                            {
+                                error!(
+                                    "Errors on reporting under-replicated {} blocks from full block report reconciliation. err: {:?}",
+                                    stale_block_count, e
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "full block report reconcile for worker {} failed: {}",
+                        worker_id, e
+                    );
                 }
             }
         }
+    }
 
-        fs_dir.block_report(batch)?;
+    fn reconcile_full_block_report(
+        &self,
+        worker_id: u32,
+        generation: u64,
+        reported_blocks: HashSet<i64>,
+    ) -> FsResult<Vec<i64>> {
+        let existing_blocks = {
+            let fs_dir = self.fs_dir.read();
+            fs_dir.get_worker_block_ids(worker_id)?
+        };
 
-        if !stale_block_ids.is_empty() {
-            warn!(
-                "full block report reconciled {} stale block locations for worker {}",
-                stale_block_ids.len(),
-                list.worker_id
-            );
+        let mut stale_block_ids = Vec::new();
+        let mut batch = Vec::new();
+        for block_id in existing_blocks {
+            if !reported_blocks.contains(&block_id) {
+                batch.push((false, block_id, BlockLocation::with_id(worker_id)));
+                stale_block_ids.push(block_id);
+            }
+        }
+
+        if !batch.is_empty() {
+            let reconciles = self.full_block_reconciles.lock();
+            if !reconciles
+                .get(&worker_id)
+                .map(|state| state.generation == generation)
+                .unwrap_or(false)
+            {
+                info!(
+                    "skip stale full block report reconcile apply for worker {}, generation {}",
+                    worker_id, generation
+                );
+                return Ok(Vec::new());
+            }
+            self.apply_block_report_batch(batch)?;
         }
 
         Ok(stale_block_ids)
+    }
+
+    /// Applies block-report location updates in bounded chunks so the global
+    /// fs_dir write lock is held only briefly per chunk. Each entry is an
+    /// independent add/remove for one block location, so chunk boundaries do
+    /// not break cross-entry invariants.
+    fn apply_block_report_batch(&self, batch: Vec<(bool, i64, BlockLocation)>) -> FsResult<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        let mut iter = batch.into_iter();
+        loop {
+            let chunk: Vec<_> = iter.by_ref().take(Self::BLOCK_REPORT_WRITE_CHUNK).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            let mut fs_dir = self.fs_dir.write();
+            fs_dir.block_report(chunk)?;
+        }
+        Ok(())
+    }
+
+    fn is_full_block_reconcile_current(&self, worker_id: u32, generation: u64) -> bool {
+        self.full_block_reconciles
+            .lock()
+            .get(&worker_id)
+            .map(|state| state.generation == generation)
+            .unwrap_or(false)
     }
 
     pub fn delete_locations(&self, worker_id: u32) -> FsResult<Vec<i64>> {
