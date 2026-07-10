@@ -60,6 +60,7 @@ struct FullBlockReportState {
     total_len: u64,
     update_time_ms: u64,
     reported_blocks: HashSet<i64>,
+    invalidated: bool,
 }
 
 struct FullBlockReconcileState {
@@ -780,7 +781,13 @@ impl MasterFilesystem {
                 total_len: list.total_len,
                 update_time_ms: now,
                 reported_blocks: HashSet::with_capacity(list.total_len as usize),
+                invalidated: false,
             });
+
+        if report.invalidated {
+            report.update_time_ms = now;
+            return None;
+        }
 
         if report.total_len != list.total_len {
             warn!(
@@ -793,6 +800,7 @@ impl MasterFilesystem {
             report.total_len = list.total_len;
             report.reported_blocks.clear();
             report.reported_blocks.reserve(list.total_len as usize);
+            report.invalidated = false;
         }
         report.update_time_ms = now;
 
@@ -811,6 +819,27 @@ impl MasterFilesystem {
 
     pub fn reset_full_block_report(&self, worker_id: u32) {
         self.full_block_reports.lock().remove(&worker_id);
+        self.invalidate_full_block_reconcile(worker_id);
+    }
+
+    fn invalidate_full_block_report_session(&self, worker_id: u32) {
+        let now = LocalTime::mills();
+        let mut reports = self.full_block_reports.lock();
+        let report = reports
+            .entry(worker_id)
+            .or_insert_with(|| FullBlockReportState {
+                total_len: 0,
+                update_time_ms: now,
+                reported_blocks: HashSet::new(),
+                invalidated: true,
+            });
+        report.update_time_ms = now;
+        report.reported_blocks.clear();
+        report.invalidated = true;
+    }
+
+    fn invalidate_full_block_state(&self, worker_id: u32) {
+        self.invalidate_full_block_report_session(worker_id);
         self.invalidate_full_block_reconcile(worker_id);
     }
 
@@ -840,7 +869,7 @@ impl MasterFilesystem {
                 )
             });
         if invalidate_full_reconcile {
-            self.invalidate_full_block_reconcile(list.worker_id);
+            self.invalidate_full_block_state(list.worker_id);
         }
 
         let full_reported_blocks = self.collect_full_block_report(&list);
@@ -1057,7 +1086,12 @@ impl MasterFilesystem {
         }
 
         if !batch.is_empty() {
-            if !self.is_full_block_reconcile_current(worker_id, generation) {
+            let reconciles = self.full_block_reconciles.lock();
+            if !reconciles
+                .get(&worker_id)
+                .map(|state| state.generation == generation)
+                .unwrap_or(false)
+            {
                 info!(
                     "skip stale full block report reconcile apply for worker {}, generation {}",
                     worker_id, generation

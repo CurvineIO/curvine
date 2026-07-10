@@ -317,6 +317,140 @@ fn full_block_report_reconcile_removes_stale_location_async() -> CommonResult<()
 }
 
 #[test]
+fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "full-block-report-invalidate-session");
+    let path = "/full-block-report-invalidate-session.log";
+    let addr = ClientAddress::default();
+    let status = fs.create(path, false)?;
+
+    let first = fs.add_block(path, None, addr.clone(), vec![], vec![], 0, None)?;
+    let first_commit = CommitBlock {
+        block_id: first.block.id,
+        block_len: status.block_size,
+        locations: vec![BlockLocation::with_id(100)],
+    };
+    let second = fs.add_block(
+        path,
+        None,
+        addr.clone(),
+        vec![first_commit],
+        vec![],
+        status.block_size,
+        Some(first.block.clone()),
+    )?;
+    let second_commit = CommitBlock {
+        block_id: second.block.id,
+        block_len: status.block_size,
+        locations: vec![BlockLocation::with_id(100)],
+    };
+    let third = fs.add_block(
+        path,
+        None,
+        addr,
+        vec![second_commit],
+        vec![],
+        status.block_size * 2,
+        Some(second.block.clone()),
+    )?;
+
+    fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            full_report: false,
+            total_len: 0,
+            blocks: vec![
+                BlockReportInfo::new(
+                    first.block.id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    first.block.len,
+                ),
+                BlockReportInfo::new(
+                    second.block.id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    second.block.len,
+                ),
+                BlockReportInfo::new(
+                    third.block.id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    third.block.len,
+                ),
+            ],
+        },
+        None,
+    )?;
+
+    fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            full_report: true,
+            total_len: 2,
+            blocks: vec![BlockReportInfo::new(
+                first.block.id,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                first.block.len,
+            )],
+        },
+        None,
+    )?;
+
+    fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            full_report: false,
+            total_len: 0,
+            blocks: vec![BlockReportInfo::new(
+                second.block.id,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                second.block.len,
+            )],
+        },
+        None,
+    )?;
+
+    fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            full_report: true,
+            total_len: 2,
+            blocks: vec![BlockReportInfo::new(
+                third.block.id,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                third.block.len,
+            )],
+        },
+        None,
+    )?;
+
+    for _ in 0..50 {
+        let blocks = fs.get_block_locations(path)?;
+        let protected = blocks
+            .block_locs
+            .iter()
+            .find(|block| block.block.id == second.block.id)
+            .expect("second block metadata should remain");
+        assert!(
+            !protected.locs.is_empty(),
+            "incremental report should protect block {} from stale full-report reconciliation",
+            second.block.id
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    Ok(())
+}
+
+#[test]
 fn test_rename_posix_semantics() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let fs = new_fs(true, "rename-posix");
