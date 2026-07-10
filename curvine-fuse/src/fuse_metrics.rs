@@ -127,19 +127,30 @@ pub(crate) const NODE_CACHE_OP_LOOKUP: &str = "lookup";
 
 // Phase 3a `reason` label values on `user_meta_cache_invalidations_total`, one per
 // real `invalid_cache` call site (see the design doc's 15-value enum).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const INVAL_REASON_SETATTR: &str = "setattr";
 pub(crate) const INVAL_REASON_RESIZE: &str = "resize";
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const INVAL_REASON_SETXATTR: &str = "setxattr";
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const INVAL_REASON_REMOVEXATTR: &str = "removexattr";
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const INVAL_REASON_MKDIR: &str = "mkdir";
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const INVAL_REASON_CREATE: &str = "create";
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const INVAL_REASON_OPEN_WRITE: &str = "open_write";
 pub(crate) const INVAL_REASON_FLUSH: &str = "flush";
 pub(crate) const INVAL_REASON_RELEASE: &str = "release";
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const INVAL_REASON_UNLINK: &str = "unlink";
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const INVAL_REASON_LINK: &str = "link";
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const INVAL_REASON_RMDIR: &str = "rmdir";
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const INVAL_REASON_RENAME: &str = "rename";
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const INVAL_REASON_SYMLINK: &str = "symlink";
 pub(crate) const INVAL_REASON_FSYNC: &str = "fsync";
 

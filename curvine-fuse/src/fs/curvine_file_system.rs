@@ -16,10 +16,7 @@ use crate::fs::dcache::CleanerTask;
 use crate::fs::operator::*;
 use crate::fs::state::{FileHandle, NodeState};
 use crate::fuse_metrics::{
-    ReaddirTimer, INVAL_REASON_CREATE, INVAL_REASON_FLUSH, INVAL_REASON_FSYNC, INVAL_REASON_LINK,
-    INVAL_REASON_MKDIR, INVAL_REASON_OPEN_WRITE, INVAL_REASON_RELEASE, INVAL_REASON_REMOVEXATTR,
-    INVAL_REASON_RENAME, INVAL_REASON_RESIZE, INVAL_REASON_RMDIR, INVAL_REASON_SETATTR,
-    INVAL_REASON_SETXATTR, INVAL_REASON_SYMLINK, INVAL_REASON_UNLINK,
+    ReaddirTimer, INVAL_REASON_FLUSH, INVAL_REASON_FSYNC, INVAL_REASON_RELEASE, INVAL_REASON_RESIZE,
 };
 use crate::raw::fuse_abi::*;
 use crate::raw::FuseDirentList;
@@ -512,8 +509,6 @@ impl fs::FileSystem for CurvineFileSystem {
         };
 
         let _ = self.state.fs_set_attr(op.header.nodeid, opts).await?;
-        self.state
-            .invalid_cache(op.header.nodeid, None, INVAL_REASON_SETXATTR);
         Ok(())
     }
 
@@ -533,8 +528,6 @@ impl fs::FileSystem for CurvineFileSystem {
             ..Default::default()
         };
         let _ = self.state.fs_set_attr(op.header.nodeid, opts).await?;
-        self.state
-            .invalid_cache(op.header.nodeid, None, INVAL_REASON_REMOVEXATTR);
 
         Ok(())
     }
@@ -633,11 +626,10 @@ impl fs::FileSystem for CurvineFileSystem {
                     .fs_resize(op.header.nodeid, op.arg.fh, resize_opts)
                     .await?;
                 status.len = expect_len;
+                self.state
+                    .invalid_cache(op.header.nodeid, None, INVAL_REASON_RESIZE);
             }
         }
-
-        self.state
-            .invalid_cache(op.header.nodeid, None, INVAL_REASON_SETATTR);
 
         let mut attr = FuseUtils::status_to_attr(&self.conf, &status)?;
         attr.ino = op.header.nodeid;
@@ -713,8 +705,6 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let opts = FuseUtils::mkdir_opts(&op, &self.fs);
         let attr = self.state.fs_mkdir(ino, name, opts).await?;
-        self.state
-            .invalid_cache(ino, Some(name), INVAL_REASON_MKDIR);
         Ok(FuseUtils::create_entry_out(&self.conf, attr))
     }
 
@@ -775,11 +765,6 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let handle = self.state.fs_open(ino, op.arg.flags, opts).await?;
 
-        // Opening for write is a mutation of the cached view of `ino`.
-        if OpenFlags::new(op.arg.flags).access_mode() != OpenFlags::RDONLY {
-            self.state.invalid_cache(ino, None, INVAL_REASON_OPEN_WRITE);
-        }
-
         let mut open_flags = op.arg.flags;
         if self.conf.direct_io {
             open_flags |= FUSE_FOPEN_DIRECT_IO;
@@ -836,8 +821,6 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let opts = FuseUtils::create_opts(&op, &self.fs);
         let handle = self.state.fs_create(ino, name, op.arg.flags, opts).await?;
-        self.state
-            .invalid_cache(ino, Some(name), INVAL_REASON_CREATE);
         let attr = FuseUtils::status_to_attr(&self.conf, handle.status())?;
 
         if attr.ino != handle.ino() {
@@ -892,16 +875,16 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let handle = self.state.release_handle(ino, op.arg.fh).await?;
 
+        if handle.has_writer() {
+            self.state
+                .invalid_cache(op.header.nodeid, None, INVAL_REASON_RELEASE);
+        }
+
         let unlock_result = self
             .fs_unlock(&handle, LockFlags::Flock)
             .await
             .and(self.fs_unlock(&handle, LockFlags::Plock).await);
         unlock_result?;
-
-        if handle.has_writer() {
-            self.state
-                .invalid_cache(op.header.nodeid, None, INVAL_REASON_RELEASE);
-        }
 
         if self.state.deferred_delete_ready(ino).await? {
             debug!(
@@ -927,8 +910,6 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
         self.ensure_writable_path(&path, RpcCode::Delete).await?;
         self.state.fs_unlink(op.header.nodeid, name).await?;
-        self.state
-            .invalid_cache(op.header.nodeid, Some(name), INVAL_REASON_UNLINK);
         Ok(())
     }
 
@@ -954,12 +935,6 @@ impl fs::FileSystem for CurvineFileSystem {
             .lookup_link(op.header.nodeid, name, oldnodeid)
             .await?;
 
-        // Both the new link (named under `header.nodeid`) and the existing source
-        // inode's cached view are invalidated by the link.
-        self.state
-            .invalid_cache(op.header.nodeid, Some(name), INVAL_REASON_LINK);
-        self.state.invalid_cache(oldnodeid, None, INVAL_REASON_LINK);
-
         let result = FuseUtils::create_entry_out(&self.conf, attr);
         Ok(result)
     }
@@ -971,8 +946,6 @@ impl fs::FileSystem for CurvineFileSystem {
 
         self.fs.delete(&path, false).await?;
         self.state.unlink(op.header.nodeid, name, false)?;
-        self.state
-            .invalid_cache(op.header.nodeid, Some(name), INVAL_REASON_RMDIR);
 
         Ok(())
     }
@@ -995,12 +968,6 @@ impl fs::FileSystem for CurvineFileSystem {
         self.state
             .fs_rename(op.header.nodeid, old_name, op.arg.newdir, new_name)
             .await?;
-        // Both the source and destination entries (each a named child of a parent
-        // directory) are invalidated by the rename.
-        self.state
-            .invalid_cache(op.header.nodeid, Some(old_name), INVAL_REASON_RENAME);
-        self.state
-            .invalid_cache(op.arg.newdir, Some(new_name), INVAL_REASON_RENAME);
         Ok(())
     }
 
@@ -1028,8 +995,6 @@ impl fs::FileSystem for CurvineFileSystem {
         self.fs.symlink(target, &link_path, false).await?;
 
         let attr = self.state.lookup_common(id, linkname).await?;
-        self.state
-            .invalid_cache(id, Some(linkname), INVAL_REASON_SYMLINK);
         Ok(FuseUtils::create_entry_out(&self.conf, attr))
     }
 

@@ -193,9 +193,9 @@ impl NodeState {
         &self,
         parent: u64,
         name: &str,
-        status: FileStatus,
+        status: &FileStatus,
     ) -> FuseResult<fuse_attr> {
-        self.do_lookup_recorded(parent, name, &status, false, false)
+        self.do_lookup(parent, name, status)
     }
 
     pub fn do_lookup(&self, parent: u64, name: &str, status: &FileStatus) -> FuseResult<fuse_attr> {
@@ -212,19 +212,16 @@ impl NodeState {
     ) -> FuseResult<fuse_attr> {
         let record = is_real_lookup && metrics_enabled;
 
-        let cache_hit = if record {
-            self.dir_read().get_inode(parent, Some(name)).is_some()
-        } else {
-            false
-        };
-
-        let before = self.dir_read().inode_lens();
         let mut dir = self.dir_write();
-
-        let inode = dir.lookup(parent, name, status.clone())?;
-        let attr = inode.to_attr(&self.conf)?;
+        let cache_hit = record && dir.get_inode(parent, Some(name)).is_some();
+        let before = dir.inode_lens();
+        let attr = {
+            let inode = dir.lookup(parent, name, status.clone())?;
+            inode.to_attr(&self.conf)?
+        };
         let after = dir.inode_lens();
         drop(dir);
+
         for _ in 0..after.saturating_sub(before) {
             FuseMetrics::with(|m| {
                 Self::inc_gauges_lockstep(&m.inode_num, &m.inode_count);
@@ -250,7 +247,7 @@ impl NodeState {
 
     pub async fn lookup_common(&self, parent: u64, name: &str) -> FuseResult<fuse_attr> {
         let status = self.fs_stat(parent, Some(name)).await?;
-        self.lookup_status(parent, name, status)
+        self.lookup_status(parent, name, &status)
     }
 
     pub async fn lookup_link(
@@ -906,7 +903,7 @@ impl NodeState {
             None => self.fs.get_status(&path).await?,
         };
 
-        self.lookup_status(ino, name, status.clone())
+        self.lookup_status(ino, name, &status)
     }
 
     pub async fn fs_create(
@@ -921,7 +918,7 @@ impl NodeState {
         let _guard = self.lock_path(&path).await;
 
         let handle = self.new_handle(None, &path, flags, opts).await?;
-        self.lookup_status(ino, name, handle.status().clone())?;
+        self.lookup_status(ino, name, handle.status())?;
         Ok(handle)
     }
 
