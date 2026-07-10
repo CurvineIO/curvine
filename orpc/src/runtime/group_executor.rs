@@ -13,10 +13,12 @@
 // limitations under the License.
 
 use crate::common::Utils;
+use crate::runtime::single_executor::Task;
 use crate::runtime::SingleExecutor;
-use crate::CommonResult;
+use crate::{err_box, CommonResult};
 use std::fmt::{Debug, Display, Formatter};
 use std::io::Cursor;
+use std::sync::mpsc::TrySendError;
 
 /// Thread group
 #[derive(Debug)]
@@ -63,6 +65,33 @@ impl GroupExecutor {
         self.get_robin_thread().spawn(task)
     }
 
+    pub fn try_spawn<F>(&self, task: F) -> CommonResult<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let mut task = Some(Box::new(task) as Task);
+        let start = Utils::rand_id() as usize % self.thread_num;
+        let mut stopped = 0usize;
+
+        for offset in 0..self.thread_num {
+            let index = (start + offset) % self.thread_num;
+            match self.workers[index].try_spawn_task(task.take().unwrap()) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(t)) => task = Some(t),
+                Err(TrySendError::Disconnected(t)) => {
+                    stopped += 1;
+                    task = Some(t);
+                }
+            }
+        }
+
+        if stopped == self.thread_num {
+            err_box!("executor group {} has stopped", self.name_prefix)
+        } else {
+            err_box!("executor group {} queue is full", self.name_prefix)
+        }
+    }
+
     pub fn spawn_blocking<F, R>(&self, task: F) -> CommonResult<R>
     where
         F: FnOnce() -> R + Send + 'static,
@@ -76,6 +105,13 @@ impl GroupExecutor {
         F: FnOnce() + Send + 'static,
     {
         self.get_fix_thread(id).spawn(task)
+    }
+
+    pub fn fixed_try_spawn<F>(&self, id: i64, task: F) -> CommonResult<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.get_fix_thread(id).try_spawn(task)
     }
 
     pub fn fixed_spawn_blocking<F, R>(&self, id: i64, task: F) -> CommonResult<R>
