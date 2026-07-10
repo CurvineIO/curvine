@@ -3,6 +3,209 @@ kind: CacheRuntimeClass
 metadata:
   name: curvine
 fileSystemType: curvinefs
+dataOperationSpecs:
+- name: DataLoad
+  command:
+  - /bin/bash
+  - -c
+  args:
+  - |
+    set -euo pipefail
+
+    curvine_home="${CURVINE_HOME:-/app/curvine}"
+    conf_file="${CURVINE_CONF_FILE:-${curvine_home}/conf/curvine-cluster.toml}"
+    config_path="${FLUID_RUNTIME_CONFIG_PATH:-/etc/fluid/config/config.json}"
+    cv_bin="${CURVINE_CLI:-${curvine_home}/bin/cv}"
+    conf_dir="${CURVINE_CONF_DIR:-${conf_file%/*}}"
+
+    if [ "$conf_dir" = "$conf_file" ]; then
+      conf_dir="."
+    fi
+    export CURVINE_CONF_DIR="$conf_dir"
+    mkdir -p "$CURVINE_CONF_DIR"
+
+    write_minimal_config() {
+      local dataset="$1"
+      local namespace="$2"
+      local master_host="${CURVINE_DATALOAD_MASTER_HOST:-${dataset}-master-0.svc-${dataset}-master.${namespace}.svc.cluster.local}"
+
+      cat > "$conf_file" <<EOF
+    [journal]
+    rpc_port = 8996
+    journal_addrs = [
+        { id = 1, hostname = "$master_host", port = 8996 }
+    ]
+
+    [client]
+    master_addrs = [
+        { hostname = "$master_host", port = 8995 }
+    ]
+    EOF
+    }
+
+    get_dataset_from_pod_label() {
+      local namespace="$1"
+
+      python3 - "$namespace" <<'PY'
+    import json
+    import os
+    import ssl
+    import sys
+    import urllib.error
+    import urllib.request
+
+    namespace = sys.argv[1]
+    pod_name = os.environ.get("HOSTNAME", "")
+    api_host = os.environ.get("KUBERNETES_SERVICE_HOST", "")
+    api_port = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
+    serviceaccount_dir = os.environ.get("CURVINE_SERVICEACCOUNT_DIR", "/var/run/secrets/kubernetes.io/serviceaccount")
+    token_path = os.path.join(serviceaccount_dir, "token")
+    ca_path = os.path.join(serviceaccount_dir, "ca.crt")
+
+    if not pod_name or not api_host or not os.path.exists(token_path):
+        sys.exit(1)
+
+    with open(token_path, encoding="utf-8") as token_file:
+        token = token_file.read().strip()
+
+    url = f"https://{api_host}:{api_port}/api/v1/namespaces/{namespace}/pods/{pod_name}"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    context = ssl.create_default_context(cafile=ca_path) if os.path.exists(ca_path) else ssl.create_default_context()
+
+    try:
+        with urllib.request.urlopen(req, context=context, timeout=5) as response:
+            pod = json.load(response)
+    except urllib.error.HTTPError as err:
+        print(f"Unable to read current pod labels from Kubernetes API: HTTP {err.code} {err.reason}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as err:
+        print(f"Unable to read current pod labels from Kubernetes API: {err}", file=sys.stderr)
+        sys.exit(1)
+
+    labels = pod.get("metadata", {}).get("labels", {})
+    dataset = labels.get("targetDataset", "")
+
+    if not dataset:
+        dataset_id = labels.get("fluid.io/dataset-id", "")
+        prefix = namespace + "-"
+        if dataset_id.startswith(prefix) and len(dataset_id) > len(prefix):
+            dataset = dataset_id[len(prefix):]
+
+    if not dataset:
+        print("Current pod labels do not include targetDataset or fluid.io/dataset-id", file=sys.stderr)
+        sys.exit(1)
+
+    print(dataset)
+    PY
+    }
+
+    if [ -f "$config_path" ]; then
+      echo "Generating Curvine config from Fluid runtime config: $config_path"
+      FLUID_RUNTIME_COMPONENT_TYPE="${FLUID_RUNTIME_COMPONENT_TYPE:-worker}" python3 "$curvine_home/generate_config.py" >/tmp/curvine-dataload-env.sh
+      generated_conf="${CURVINE_CONF_DIR}/curvine-cluster.toml"
+      if [ "$generated_conf" != "$conf_file" ] && [ -f "$generated_conf" ]; then
+        cp "$generated_conf" "$conf_file"
+      fi
+    else
+      namespace="${CURVINE_DATALOAD_NAMESPACE:-${FLUID_DATASET_NAMESPACE:-$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo default)}}"
+      dataset="${CURVINE_DATALOAD_DATASET:-${FLUID_DATASET_NAME:-}}"
+
+      if [ -z "$dataset" ]; then
+        dataset="$(get_dataset_from_pod_label "$namespace")" || dataset=""
+      fi
+
+      if [ -z "$dataset" ]; then
+        echo "Fluid runtime config is not mounted and Curvine dataset name is unavailable; set CURVINE_DATALOAD_DATASET/FLUID_DATASET_NAME or allow reading the Fluid targetDataset pod label" >&2
+        exit 1
+      fi
+
+      echo "Fluid runtime config not found at $config_path; using Curvine master service for dataset: $dataset"
+      write_minimal_config "$dataset" "$namespace"
+    fi
+
+    resolve_load_path() {
+      local input_path="$1"
+      local mount_output
+
+      if [[ "$input_path" == *"://"* ]]; then
+        printf '%s\n' "$input_path"
+        return 0
+      fi
+
+      if ! mount_output="$("$cv_bin" mount --conf "$conf_file" 2>/dev/null)"; then
+        printf '%s\n' "$input_path"
+        return 0
+      fi
+
+      awk -F '|' -v path="$input_path" '
+        function trim(s) {
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+          return s
+        }
+        function strip_trailing_slashes(s) {
+          sub(/\/+$/, "", s)
+          return s == "" ? "/" : s
+        }
+        BEGIN {
+          best_len = -1
+          best_ufs = ""
+        }
+        /^\|/ && $0 !~ /Curvine Path/ {
+          id = trim($2)
+          if (id !~ /^[0-9]+$/) {
+            next
+          }
+
+          cv_path = strip_trailing_slashes(trim($3))
+          ufs_path = strip_trailing_slashes(trim($4))
+          cv_prefix = cv_path
+          sub(/\/+$/, "", cv_prefix)
+
+          if ((path == cv_path || index(path, cv_prefix "/") == 1) && length(cv_path) > best_len) {
+            best_len = length(cv_path)
+            best_ufs = ufs_path
+          }
+        }
+        END {
+          if (best_len < 0) {
+            print path
+          } else {
+            suffix = substr(path, best_len + 1)
+            sub(/^\/+/, "", suffix)
+            print best_ufs (suffix == "" ? "/" : "/" suffix)
+          }
+        }
+      ' <<< "$mount_output" || printf '%s\n' "$input_path"
+    }
+
+    if [ -z "${FLUID_DATALOAD_DATA_PATH:-}" ]; then
+      echo "No DataLoad paths provided, skip Curvine load"
+      exit 0
+    fi
+
+    IFS=: read -ra paths <<< "$FLUID_DATALOAD_DATA_PATH"
+    for path in "${paths[@]}"; do
+      if [ -z "$path" ]; then
+        continue
+      fi
+      load_path="$(resolve_load_path "$path")"
+      if [ "$load_path" != "$path" ]; then
+        echo "Resolved DataLoad path $path to Curvine load source: $load_path"
+      else
+        echo "Loading Curvine source path: $load_path"
+      fi
+      log_file="$(mktemp)"
+      if ! "$cv_bin" load "$load_path" --watch --conf "$conf_file" 2>&1 | tee "$log_file"; then
+        rm -f "$log_file"
+        exit 1
+      fi
+      if grep -Eiq 'Status: .*(Failed|Canceled)|(^|[[:space:]])ERROR:| failed:' "$log_file"; then
+        echo "Curvine load reported failure for path: $load_path (requested: $path)" >&2
+        rm -f "$log_file"
+        exit 1
+      fi
+      rm -f "$log_file"
+    done
 topology:
   master:
     service:
