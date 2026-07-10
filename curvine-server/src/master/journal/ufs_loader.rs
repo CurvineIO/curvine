@@ -80,17 +80,17 @@ impl UfsLoader {
         }
     }
 
-    pub async fn submit_load_task(&self, path: &Path, mnt: &MountValue) -> FsResult<()> {
+    pub async fn submit_export_task(&self, path: &Path, mnt: &MountValue) -> FsResult<()> {
         let command = LoadJobCommand::builder(path.clone_uri()).build();
         let runner = self.job_manager.create_runner();
-        let res = match runner.submit_load_task(command, mnt.info.clone()).await {
+        let res = match runner.submit_export_task(command, mnt.info.clone()).await {
             Ok(res) => res,
             Err(e) => {
                 return if matches!(e, FsError::FileNotFound(_)) {
-                    info!("file {} not found, skipping load job", path.full_path());
+                    info!("file {} not found, skipping export job", path.full_path());
                     Ok(())
                 } else {
-                    err_box!("load job failed: {}", e)
+                    err_box!("export job failed: {}", e)
                 };
             }
         };
@@ -107,7 +107,7 @@ impl UfsLoader {
             Ok(())
         } else {
             err_box!(
-                "load job failed: {} {}",
+                "export job failed: {} {}",
                 status.state,
                 status.progress.message
             )
@@ -141,7 +141,7 @@ impl UfsLoader {
 
         let path = Path::from_str(&e.path)?;
         if let Some((_, mnt)) = self.get_mnt(&path)? {
-            self.submit_load_task(&path, &mnt).await?;
+            self.submit_export_task(&path, &mnt).await?;
             Ok(())
         } else {
             Ok(())
@@ -154,13 +154,13 @@ impl UfsLoader {
         if let Some((src_ufs_path, mnt)) = self.get_mnt(&src)? {
             if !mnt.ufs.exists(&src_ufs_path).await? {
                 warn!(
-                    "rename: src file not exists: {}, loading dst {}",
+                    "rename: src file not exists: {}, exporting dst {}",
                     src_ufs_path,
                     dst.full_path()
                 );
                 if let Some((_, dst_mnt)) = self.get_mnt(&dst)? {
                     // Keep journal apply aligned with fs_mode's durable export contract.
-                    self.submit_load_task(&dst, &dst_mnt).await?;
+                    self.submit_export_task(&dst, &dst_mnt).await?;
                 }
                 return Ok(());
             }
@@ -181,7 +181,7 @@ impl UfsLoader {
                 Ok(())
             } else {
                 mnt.ufs.delete(&src_ufs_path, true).await?;
-                self.submit_load_task(&dst, &mnt).await?;
+                self.submit_export_task(&dst, &mnt).await?;
                 Ok(())
             }
         } else {

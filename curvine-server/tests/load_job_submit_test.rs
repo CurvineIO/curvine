@@ -15,8 +15,9 @@
 use curvine_common::conf::{ClientConf, ClusterConf, JournalConf, MasterConf};
 use curvine_common::state::{
     JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobInfo, LoadTaskInfo, MountInfo,
-    MountOptions, StorageType, TtlAction, WorkerAddress, WorkerInfo,
+    MountOptions, OpenFlags, StorageType, TtlAction, WorkerAddress, WorkerInfo,
 };
+use curvine_common::utils::CommonUtils;
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::JournalSystem;
 use curvine_server::master::{JobContext, JobManager, JobStore, Master};
@@ -28,6 +29,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 fn new_job_manager(name: &str) -> CommonResult<(Arc<JobManager>, Arc<Runtime>, String)> {
+    let (job_manager, rt, missing_source, _) = new_job_manager_with_fs(name)?;
+    Ok((job_manager, rt, missing_source))
+}
+
+fn new_job_manager_with_fs(
+    name: &str,
+) -> CommonResult<(Arc<JobManager>, Arc<Runtime>, String, MasterFilesystem)> {
     Master::init_test_metrics();
     let test_name = format!("{}-{}", name, Utils::rand_id());
 
@@ -49,6 +57,7 @@ fn new_job_manager(name: &str) -> CommonResult<(Arc<JobManager>, Arc<Runtime>, S
     let journal_system = JournalSystem::from_conf(&conf)?;
     let master_fs = MasterFilesystem::with_js(&conf, &journal_system);
     master_fs.add_test_worker(WorkerInfo::default());
+    let master_fs_ref = master_fs.clone();
 
     let mount_manager = journal_system.mount_manager();
     let rt = Arc::new(AsyncRuntime::single());
@@ -63,7 +72,12 @@ fn new_job_manager(name: &str) -> CommonResult<(Arc<JobManager>, Arc<Runtime>, S
     let ufs_root = format!("file://{}", ufs_root_dir);
     mount_manager.mount(None, "/mnt", &ufs_root, &MountOptions::builder().build())?;
 
-    Ok((job_manager, rt, format!("{}/missing-file", ufs_root)))
+    Ok((
+        job_manager,
+        rt,
+        format!("{}/missing-file", ufs_root),
+        master_fs_ref,
+    ))
 }
 
 fn load_task(task_id: &str, job_id: &str) -> LoadTaskInfo {
@@ -125,6 +139,97 @@ fn submit_load_job_returns_before_ufs_planning() -> CommonResult<()> {
             "load job did not fail in background, state={:?}, message={}",
             status.state, status.progress.message
         );
+    })
+}
+
+#[test]
+fn fs_mode_cv_path_load_uses_ufs_source_when_metadata_is_ufs_only() -> CommonResult<()> {
+    let (job_manager, rt, missing_source, master_fs) =
+        new_job_manager_with_fs("fs-cv-load-ufs-only")?;
+    let source = missing_source.replace("/missing-file", "/ufs-only-file");
+    let local_source = source
+        .strip_prefix("file://")
+        .expect("test UFS path uses file scheme");
+    if let Some(parent) = std::path::Path::new(local_source).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(local_source, b"load-data")?;
+
+    let cv_path = "/mnt/ufs-only-file";
+    let source_path = curvine_common::fs::Path::from_str(&source)?;
+    let (_, mount) = job_manager
+        .get_mnt(&source_path)?
+        .expect("test source should match mount");
+    let sync_opts = mount.info.get_sync_opts(&ClientConf::default(), 1, 9);
+    master_fs.create_with_opts(cv_path, sync_opts, OpenFlags::new_create())?;
+    let expected_job_id = CommonUtils::create_job_id(&source);
+
+    rt.block_on(async {
+        let result = job_manager
+            .submit_load_job(LoadJobCommand::builder(cv_path).build())
+            .await?;
+
+        assert_eq!(result.job_id, expected_job_id);
+        assert_eq!(result.target_path, cv_path);
+
+        let status = job_manager.get_job_status(&result.job_id)?;
+        assert_eq!(status.source_path, source);
+        assert_eq!(status.target_path, cv_path);
+        Ok(())
+    })
+}
+
+#[test]
+fn cv_path_load_without_ufs_only_metadata_is_rejected() -> CommonResult<()> {
+    let (job_manager, rt, _missing_source, master_fs) =
+        new_job_manager_with_fs("cv-load-rejects-export")?;
+    let cv_path = "/mnt/native-file";
+    let create_opts = curvine_common::state::CreateFileOptsBuilder::new()
+        .create_parent(true)
+        .build();
+    master_fs.create_with_opts(cv_path, create_opts, OpenFlags::new_create())?;
+
+    rt.block_on(async {
+        let err = job_manager
+            .submit_load_job(LoadJobCommand::builder(cv_path).build())
+            .await
+            .expect_err("ordinary CV load should not fall back to CV-to-UFS export");
+        assert!(
+            err.to_string().contains("requires UFS-only metadata"),
+            "unexpected error: {}",
+            err
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn direct_export_task_keeps_cv_source_for_fs_mode_journal_sync() -> CommonResult<()> {
+    let (job_manager, rt, _missing_source, master_fs) = new_job_manager_with_fs("direct-export")?;
+    let cv_path = "/mnt/export-dir";
+    master_fs.mkdir(cv_path, true)?;
+    let expected_target = job_manager
+        .get_mnt(&curvine_common::fs::Path::from_str(cv_path)?)?
+        .expect("test CV path should match mount")
+        .0
+        .clone_uri();
+    let (_, mount) = job_manager
+        .get_mnt(&curvine_common::fs::Path::from_str(cv_path)?)?
+        .expect("test CV path should match mount");
+
+    let command = LoadJobCommand::builder(cv_path).build();
+    let expected_job_id = CommonUtils::create_job_id(cv_path);
+
+    rt.block_on(async {
+        let result = job_manager
+            .create_runner()
+            .submit_export_task(command, mount.info.clone())
+            .await?;
+
+        assert_eq!(result.job_id, expected_job_id);
+        assert_eq!(result.target_path, expected_target);
+        assert_eq!(result.state, JobTaskState::Completed);
+        Ok(())
     })
 }
 
