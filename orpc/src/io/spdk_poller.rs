@@ -1462,8 +1462,9 @@ mod test {
             "pending entry must move to stale"
         );
 
-        // stale entry was already signaled (not re-signaled by force_complete)
+        // force_complete did not re-signal stale entries
         assert_eq!(completion_1.wait(1), -libc::ETIMEDOUT);
+        assert_eq!(inflight_1.load(Ordering::Acquire), 1, "stale entry inflight must not be decremented");
         // pending entry was signaled with -EIO
         assert_eq!(completion_2.wait(0), -libc::EIO);
         assert_eq!(inflight_2.load(Ordering::Acquire), 0);
