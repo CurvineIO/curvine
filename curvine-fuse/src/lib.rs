@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #![allow(clippy::unnecessary_cast)]
+#![recursion_limit = "256"]
 
 use crate::raw::fuse_abi::{fuse_in_header, fuse_out_header};
 use once_cell::sync::Lazy;
@@ -70,6 +71,8 @@ pub const FUSE_MAX_MAX_PAGES: usize = 256;
 pub const FUSE_BUFFER_HEADER_SIZE: usize = 0x1000; // 4096
 
 pub const FUSE_DEFAULT_PAGE_SIZE: usize = 4096;
+
+pub const FUSE_PATH_MAX_DEPTH: usize = 4096;
 
 pub const FUSE_MAX_PAGES: u32 = 1 << 22;
 

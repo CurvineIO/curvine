@@ -284,6 +284,7 @@ impl UnifiedFileSystem {
 
     pub async fn link(&self, src_path: &Path, dst_path: &Path) -> FsResult<()> {
         let fut = async {
+            let _ = self.get_mount_checked(dst_path, RpcCode::Link).await?;
             match self.get_mount_checked(src_path, RpcCode::Link).await? {
                 None => self.cv.link(src_path, dst_path).await,
                 Some(_) => err_ext!(FsError::unsupported("link")),

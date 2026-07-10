@@ -256,6 +256,10 @@ pub struct SpdkConf {
     #[serde(skip)]
     pub hugepage_mb: u32, // parsed by init()
     pub reactor_mask: String, // hex, e.g. "0x3"
+    /// DPDK IOVA mode override. Empty = let SPDK/DPDK auto-detect (default).
+    /// Set to "va" when auto-detect fails (VM/virtio/AMD IOMMU, spdk/spdk#2683),
+    /// or "pa" for bare metal that requires physical addresses.
+    pub iova_mode: String,
     pub targets: Vec<NvmeTarget>,
     pub io_queue_depth: u32,
     pub io_queue_requests: u32,
@@ -351,6 +355,13 @@ impl SpdkConf {
             );
         }
 
+        if !self.iova_mode.is_empty() && self.iova_mode != "va" && self.iova_mode != "pa" {
+            return err_box!(
+                "SpdkConf: iova_mode must be 'va', 'pa', or empty (auto-detect), got '{}'",
+                self.iova_mode
+            );
+        }
+
         for (i, target) in self.targets.iter().enumerate() {
             target.validate().map_err(|e| {
                 let msg = format!("SpdkConf: targets[{}]: {}", i, e);
@@ -399,6 +410,7 @@ impl Default for SpdkConf {
             hugepage_str: "1024MB".to_string(),
             hugepage_mb: 1024,
             reactor_mask: "0x1".to_string(),
+            iova_mode: String::new(),
             targets: vec![],
             io_queue_depth: 128,
             io_queue_requests: 512,
@@ -417,15 +429,26 @@ impl Default for SpdkConf {
 
 impl Display for SpdkConf {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let iova_mode_label = if self.iova_mode.is_empty() {
+            "auto"
+        } else {
+            self.iova_mode.as_str()
+        };
         write!(
             f,
-            "SpdkConf(enabled={}, hugepage={}MB, reactor_mask={}, targets={})",
+            "SpdkConf(enabled={}, hugepage={}MB, reactor_mask={}, iova_mode={}, targets={})",
             self.enabled,
             self.hugepage_mb,
             self.reactor_mask,
+            iova_mode_label,
             self.targets.len()
         )
     }
+}
+
+#[cfg(test)]
+pub(crate) fn spdk_iova_mode_for_test() -> String {
+    std::env::var("SPDK_IOVA_MODE").unwrap_or_else(|_| "va".to_string())
 }
 
 // Bdev descriptor (discovered after init)
@@ -850,14 +873,25 @@ impl SpdkEnv {
 
     fn env_init(&self) -> CommonResult<()> {
         use std::ffi::CString;
+        let iova_mode_label = if self.conf.iova_mode.is_empty() {
+            "auto"
+        } else {
+            self.conf.iova_mode.as_str()
+        };
         info!(
-            "SPDK env_init: app={}, hugepage={}MB, mask={}",
-            self.conf.app_name, self.conf.hugepage_mb, self.conf.reactor_mask
+            "SPDK env_init: app={}, hugepage={}MB, mask={}, iova_mode={}",
+            self.conf.app_name, self.conf.hugepage_mb, self.conf.reactor_mask, iova_mode_label
         );
         let app_name = CString::new(self.conf.app_name.as_str())
             .map_err(|e| err_msg!(format!("invalid app_name: {}", e)))?;
         let core_mask = CString::new(self.conf.reactor_mask.as_str())
             .map_err(|e| err_msg!(format!("invalid reactor_mask: {}", e)))?;
+        let iova_mode = (!self.conf.iova_mode.is_empty())
+            .then(|| {
+                CString::new(self.conf.iova_mode.as_str())
+                    .map_err(|e| err_msg!(format!("invalid iova_mode: {}", e)))
+            })
+            .transpose()?;
         unsafe {
             // Verify our opaque buffer is large enough.
             let real_size = spdk_ffi::curvine_spdk_env_opts_sizeof();
@@ -877,6 +911,9 @@ impl SpdkEnv {
             spdk_ffi::curvine_spdk_env_opts_set_name(&mut opts, app_name.as_ptr());
             spdk_ffi::curvine_spdk_env_opts_set_core_mask(&mut opts, core_mask.as_ptr());
             spdk_ffi::curvine_spdk_env_opts_set_mem_size(&mut opts, self.conf.hugepage_mb as i32);
+            if let Some(ref mode) = iova_mode {
+                spdk_ffi::curvine_spdk_env_opts_set_iova_mode(&mut opts, mode.as_ptr());
+            }
             let rc = spdk_ffi::curvine_spdk_env_init(&mut opts);
             if rc != 0 {
                 return err_box!("spdk_env_init failed with rc={}", rc);
@@ -1187,7 +1224,7 @@ mod test {
 
         #[test]
         fn validate_rejects_low_keep_alive() {
-            let mut conf = SpdkConf {
+            let conf = SpdkConf {
                 enabled: true,
                 poll_interval_ms: 100,
                 targets: vec![NvmeTarget {
@@ -1209,7 +1246,7 @@ mod test {
 
         #[test]
         fn validate_accepts_high_keep_alive() {
-            let mut conf = SpdkConf {
+            let conf = SpdkConf {
                 enabled: true,
                 poll_interval_ms: 100,
                 targets: vec![NvmeTarget {
@@ -1227,7 +1264,7 @@ mod test {
 
         #[test]
         fn validate_rejects_inherited_low_keep_alive() {
-            let mut conf = SpdkConf {
+            let conf = SpdkConf {
                 enabled: true,
                 poll_interval_ms: 100,
                 keep_alive_timeout_ms: 50, // global is too low
@@ -1301,6 +1338,49 @@ mod test {
             assert_eq!(conf.keep_alive_timeout_ms, 10_000);
             assert_eq!(conf.poll_interval_ms, 100);
             assert!(conf.hugepage_mb > 0);
+            assert!(conf.iova_mode.is_empty());
+        }
+
+        #[test]
+        fn iova_mode_empty_means_auto_detect() {
+            let conf = SpdkConf::default();
+            assert!(conf.iova_mode.is_empty());
+        }
+
+        #[test]
+        fn validate_rejects_unknown_iova_mode() {
+            let mut conf = SpdkConf {
+                enabled: true,
+                iova_mode: "dc".into(),
+                targets: vec![NvmeTarget {
+                    traddr: "10.0.0.1".into(),
+                    trsvcid: 4420,
+                    subnqn: "nqn.test".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            conf.init().unwrap();
+            assert!(conf.validate().is_err());
+        }
+
+        #[test]
+        fn validate_accepts_va_and_pa_iova_mode() {
+            for mode in ["va", "pa"] {
+                let mut conf = SpdkConf {
+                    enabled: true,
+                    iova_mode: mode.into(),
+                    targets: vec![NvmeTarget {
+                        traddr: "10.0.0.1".into(),
+                        trsvcid: 4420,
+                        subnqn: "nqn.test".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                conf.init().unwrap();
+                assert!(conf.validate().is_ok(), "mode={mode}");
+            }
         }
 
         #[test]

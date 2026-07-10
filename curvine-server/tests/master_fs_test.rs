@@ -23,12 +23,13 @@ use curvine_common::raft::storage::{AppStorage, ApplyMsg};
 use curvine_common::state::MountOptions;
 use curvine_common::state::{
     BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
-    CreateFileOpts, FileAllocOpts, StorageType, WorkerInfo,
+    CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, StorageType, TtlAction, WorkerInfo,
 };
 use curvine_common::state::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_common::utils::SerdeUtils;
 use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader, JournalSystem};
+use curvine_server::master::meta::inode::ttl::InodeTtlExecutor;
 use curvine_server::master::meta::InodeId;
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
 use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
@@ -446,6 +447,105 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+
+    Ok(())
+}
+
+#[test]
+fn ttl_executor_deletes_nested_expired_inode() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "ttl-executor-nested-delete");
+    let opts = CreateFileOptsBuilder::new()
+        .create_parent(true)
+        .ttl_ms(1)
+        .ttl_action(TtlAction::Delete)
+        .build();
+    let status = fs.create_with_opts(
+        "/ttl/a/b/file.log",
+        opts,
+        OpenFlags::new_create().set_overwrite(true),
+    )?;
+
+    std::thread::sleep(Duration::from_millis(10));
+    let executor = InodeTtlExecutor::with_managers(fs.clone());
+    let (processed, inode) = executor.execute_by_id(status.id)?;
+
+    assert!(
+        processed,
+        "expired inode should be processed by TTL executor"
+    );
+    assert_eq!(inode.id(), status.id);
+    assert!(
+        fs.file_status("/ttl/a/b/file.log").is_err(),
+        "TTL delete should remove the nested file path resolved from inode id"
+    );
+
+    Ok(())
+}
+
+// Regression: TTL path resolution must not re-acquire the fs_dir read lock while
+// already holding it. std::sync::RwLock is writer-preferring, so a reentrant read
+// deadlocks once a writer is queued. This reproduces the 2026-07-08 freeze shape:
+// a deep path resolved under continuous concurrent writers. It must complete
+// within the timeout.
+#[test]
+fn ttl_path_resolution_no_reentrant_deadlock_under_writers() -> CommonResult<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "ttl-reentrant-deadlock");
+
+    let mut deep_path = String::new();
+    for level in 0..12 {
+        deep_path.push_str(&format!("/d{}", level));
+    }
+    deep_path.push_str("/file.log");
+
+    let opts = CreateFileOptsBuilder::new()
+        .create_parent(true)
+        .ttl_ms(1)
+        .ttl_action(TtlAction::Delete)
+        .build();
+    let status = fs.create_with_opts(
+        &deep_path,
+        opts,
+        OpenFlags::new_create().set_overwrite(true),
+    )?;
+    std::thread::sleep(Duration::from_millis(10));
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer_fs = fs.clone();
+    let writer_stop = stop.clone();
+    let writer = std::thread::spawn(move || {
+        let mut i = 0u64;
+        while !writer_stop.load(Ordering::Relaxed) {
+            let _ = writer_fs.mkdir(format!("/writer/{}", i), true);
+            i += 1;
+        }
+    });
+
+    let (tx, rx) = mpsc::channel();
+    let exec_fs = fs.clone();
+    let inode_id = status.id;
+    let resolver = std::thread::spawn(move || {
+        let executor = InodeTtlExecutor::with_managers(exec_fs);
+        let _ = tx.send(executor.execute_by_id(inode_id));
+    });
+
+    let result = rx.recv_timeout(Duration::from_secs(10));
+    stop.store(true, Ordering::Relaxed);
+    let _ = writer.join();
+    let _ = resolver.join();
+
+    let (processed, inode) = result
+        .expect("TTL path resolution deadlocked: no result within 10s under concurrent writers")?;
+    assert!(processed, "expired inode should be processed");
+    assert_eq!(inode.id(), status.id);
+    assert!(
+        fs.file_status(&deep_path).is_err(),
+        "TTL delete should remove the deep path resolved from inode id"
+    );
 
     Ok(())
 }

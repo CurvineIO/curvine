@@ -53,6 +53,7 @@ fn get_worker() -> &'static ClusterConf {
             hugepage_str: format!("{}MB", hugepage_mb),
             hugepage_mb,
             reactor_mask: std::env::var("SPDK_REACTOR_MASK").unwrap_or_else(|_| "0x2".to_string()),
+            iova_mode: common::spdk_iova_mode_for_test(),
             targets: vec![NvmeTarget {
                 traddr,
                 trsvcid,

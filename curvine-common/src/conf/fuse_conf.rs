@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::conf::ClusterConf;
+use crate::fs::Path;
 use orpc::common::{DurationUnit, FileUtils, LogConf, Utils};
 use orpc::sys::{CString, FFIUtils};
 use orpc::{err_box, sys, try_err, CommonResult};
@@ -22,6 +23,35 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 // fuse configuration file.
+//
+// Caching in curvine-fuse spans three layers that are easy to conflate; the
+// boundaries are:
+//
+// 1. Kernel-side caching (the kernel caches on our behalf, controlled via the
+//    FUSE reply `entry_valid` / `attr_valid` fields):
+//    - `entry_timeout_ms`   -> how long the kernel trusts a name->inode lookup.
+//    - `negative_timeout_ms`-> how long the kernel caches a negative lookup (ENOENT).
+//    - `attr_timeout_ms`    -> how long the kernel trusts cached file/dir attributes.
+//    These trade metadata freshness for fewer upcalls into user space.
+//
+// 2. User-side caching (maintained inside curvine-fuse itself):
+//    - `enable_meta_cache` / `meta_cache_capacity` / `meta_cache_timeout` -> the
+//      bounded metadata cache backed by `MetaCache` (capacity IS enforced).
+//    - `meta_cache_ttl` (derived from `meta_cache_timeout` in `init()`) -> TTL
+//      for metadata cache entries.
+//    - `node_cache_timeout` -> TTL-based eviction of the inode/node map.
+//
+// 3. IO caching / data-path switches (control how file *data* is cached by the
+//    page cache, mutually interacting per open):
+//    - `direct_io`            -> bypass the page cache for all opens.
+//    - `open_direct_on_stale` -> per-open fallback to direct I/O only when the
+//      local metadata is detected stale (weaker global impact than `direct_io`).
+//    - `write_back_cache`     -> let the kernel buffer writes (write-back) vs
+//      write-through; interacts with `direct_io` (direct I/O disables it).
+//
+// Rule of thumb: layer 1 tunes how stale the *kernel* may be, layer 2 tunes the
+// process-local metadata caches, and layer 3 decides whether file *data* flows
+// through the page cache at all.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FuseConf {
@@ -70,6 +100,9 @@ pub struct FuseConf {
     // Mount the configuration, needs to be passed to the linux kernel.
     pub fuse_opts: Vec<String>,
 
+    // Mount the whole FUSE filesystem read-only at the kernel level.
+    pub readonly: bool,
+
     // Overwrite the permission bits set by the file system in st_mode.
     // The generated permission bit is the missing permission bit in the given umask value.This value is given in octal representation.
     // Default value 022
@@ -88,33 +121,22 @@ pub struct FuseConf {
     // The default value is true
     pub read_dir_fill_ino: bool,
 
-    // Name search cache time.
+    // Name search cache time, in milliseconds.
     // After performing a name search, if the same name is requested again, the kernel will check the cache first.
     // If the buffer record is still valid, the cache result will be returned directly, unlike user space for requests.
-    // Default 1.0 seconds
-    pub entry_timeout: f64,
+    // Default 1000ms (1 second). Sub-second granularity is supported (e.g. 500 = 0.5s).
+    pub entry_timeout_ms: u64,
 
-    // The timeout (in seconds) of cache negative lookups.This means that if the file does not exist (find returns ENOENT)
+    // The timeout (in milliseconds) of cache negative lookups. This means that if the file does not exist (find returns ENOENT)
     // Then the search will only be redone after the timeout, and the file/directory will be assumed to not exist before this.
-    // The default value is 0.0 seconds, which means cache negative lookup is disabled.
-    pub negative_timeout: f64,
+    // The default value is 0ms, which means cache negative lookup is disabled.
+    pub negative_timeout_ms: u64,
 
-    // Cache time for file and directory attributes.
+    // Cache time for file and directory attributes, in milliseconds.
     // This means that after a file or directory attribute search, if the same attribute is requested again, the kernel will first check the cache.
     // If the record in the cache is still valid (i.e. the timeout time has not exceeded), the cached result will be returned directly without making a request to the user space again
-    // Default is 1.0 seconds.
-    pub attr_timeout: f64,
-
-    // Parameters are used to specify the file attribute cache timeout for automatic cache refresh.
-    // By default, it is set to the same value as attr_timeout (i.e. 1.0 seconds).
-    //
-    // When the file is opened, if the automatic cache (auto_cache) needs to refresh the file data, the kernel will check whether the cache of the file attributes has expired.
-    // If the cache record of file attributes is still valid (i.e. the timeout time has not exceeded), the automatic cache will refresh the file data.
-    pub ac_attr_timeout: f64,
-
-    // Parameters are used to specify the file attribute cache timeout for automatic cache refresh.
-    // By default, it is set to the same value as attr_timeout (i.e. 1.0 seconds).
-    pub ac_attr_timeout_set: f64,
+    // Default is 1000ms (1 second). Sub-second granularity is supported (e.g. 500 = 0.5s).
+    pub attr_timeout_ms: u64,
 
     // Parameters are used to specify whether the file system should remember the opened files and directories.
     // By default, the FUSE file system clears the cache when a file or directory is closed.
@@ -128,14 +150,8 @@ pub struct FuseConf {
     // Whether to enable metadata cache
     pub enable_meta_cache: bool,
 
-    // Metadata cache capacity (number of entries)
-    pub meta_cache_capacity: u64,
-
-    // Metadata cache TTL (time to live)
-    pub meta_cache_ttl: String,
-
-    pub node_cache_size: u64,
-
+    // Metadata cache TTL string (parsed into `meta_cache_ttl` by `init()`)
+    pub meta_cache_timeout: String,
     pub node_cache_timeout: String,
 
     // File and directory related options
@@ -185,7 +201,7 @@ pub struct FuseConf {
     pub node_cache_ttl: Duration,
 
     #[serde(skip_serializing, skip_deserializing)]
-    pub meta_cache_ttl_duration: Duration,
+    pub meta_cache_ttl: Duration,
 
     pub list_limit: usize,
 
@@ -196,11 +212,26 @@ pub struct FuseConf {
     /// pipe management overhead). Default: true.
     pub enable_splice: bool,
 
+    pub path_lock_stripes: usize,
+
     pub log: LogConf,
 }
 
 impl FuseConf {
     pub const FS_NAME: &'static str = "curvine-fuse";
+
+    /// Default kernel dentry (name lookup) cache timeout, in milliseconds.
+    pub const DEFAULT_ENTRY_TIMEOUT_MS: u64 = 1000;
+
+    /// Default kernel negative-lookup (ENOENT) cache timeout, in milliseconds.
+    /// `0` disables negative-lookup caching.
+    pub const DEFAULT_NEGATIVE_TIMEOUT_MS: u64 = 0;
+
+    /// Default kernel attribute cache timeout, in milliseconds.
+    pub const DEFAULT_ATTR_TIMEOUT_MS: u64 = 1000;
+
+    /// Default umask applied to file-system-generated permission bits (octal 022).
+    pub const DEFAULT_UMASK: u32 = 0o22;
 
     pub const MAX_READ: u32 = 128 * 1024;
 
@@ -208,23 +239,25 @@ impl FuseConf {
 
     pub const MAX_READ_AHEAD: u32 = 128 * 1024;
 
-    pub const TTR_TIMEOUT: f64 = 1.0;
-
-    pub const UMASK: u32 = 0o22;
-
     /// Default FUSE BDI readahead window: 1 MiB (`1024` KB).
     pub const DEFAULT_MAX_READAHEAD_KB: u32 = 1024;
 
     pub fn init(&mut self) -> CommonResult<()> {
-        self.attr_ttl = Duration::from_secs_f64(self.attr_timeout);
-        self.entry_ttl = Duration::from_secs_f64(self.entry_timeout);
-        self.negative_ttl = Duration::from_secs_f64(self.negative_timeout);
+        self.attr_ttl = Duration::from_millis(self.attr_timeout_ms);
+        self.entry_ttl = Duration::from_millis(self.entry_timeout_ms);
+        self.negative_ttl = Duration::from_millis(self.negative_timeout_ms);
         self.node_cache_ttl = DurationUnit::from_str(&self.node_cache_timeout)?.as_duration();
-        self.meta_cache_ttl_duration = DurationUnit::from_str(&self.meta_cache_ttl)?.as_duration();
+        self.meta_cache_ttl = DurationUnit::from_str(&self.meta_cache_timeout)?.as_duration();
 
         if self.mnt_per_task == 0 {
             self.mnt_per_task = self.io_threads;
         }
+
+        let fs_path = Path::from_str(&self.fs_path)?;
+        self.fs_path = fs_path.path().to_owned();
+
+        let mnt_path = Path::from_str(&self.mnt_path)?;
+        self.mnt_path = mnt_path.path().to_owned();
 
         if let Some(0) = self.max_readahead_kb {
             return err_box!("fuse.max_readahead_kb must be > 0 when set");
@@ -293,7 +326,19 @@ impl FuseConf {
     }
 
     pub fn set_fuse_opts(&self, mount_options: &mut String) {
+        let mut ro_added = false;
+        if self.readonly {
+            mount_options.push_str(",ro");
+            ro_added = true;
+        }
+
         self.fuse_opts.iter().for_each(|opt| match opt.as_str() {
+            "ro" => {
+                if !ro_added {
+                    mount_options.push_str(",ro");
+                    ro_added = true;
+                }
+            }
             "default_permissions" => {
                 mount_options.push_str(",default_permissions");
             }
@@ -333,15 +378,14 @@ impl Default for FuseConf {
             fuse_channel_size: 0,
             stream_channel_size: 0,
             fuse_opts: vec![],
-            umask: Self::UMASK,
+            readonly: false,
+            umask: Self::DEFAULT_UMASK,
             uid: sys::get_uid(),
             gid: sys::get_gid(),
             read_dir_fill_ino: true,
-            entry_timeout: FuseConf::TTR_TIMEOUT,
-            negative_timeout: 0.0,
-            attr_timeout: FuseConf::TTR_TIMEOUT,
-            ac_attr_timeout: FuseConf::TTR_TIMEOUT,
-            ac_attr_timeout_set: FuseConf::TTR_TIMEOUT,
+            entry_timeout_ms: FuseConf::DEFAULT_ENTRY_TIMEOUT_MS,
+            negative_timeout_ms: FuseConf::DEFAULT_NEGATIVE_TIMEOUT_MS,
+            attr_timeout_ms: FuseConf::DEFAULT_ATTR_TIMEOUT_MS,
             remember: false,
             web_port: ClusterConf::DEFAULT_FUSE_WEB_PORT,
 
@@ -349,10 +393,7 @@ impl Default for FuseConf {
             congestion_threshold: 192,
 
             enable_meta_cache: false,
-            meta_cache_capacity: 100000,
-            meta_cache_ttl: "120s".to_string(),
-
-            node_cache_size: 200000,
+            meta_cache_timeout: "60s".to_string(),
             node_cache_timeout: "1h".to_string(),
 
             direct_io: false,
@@ -369,10 +410,13 @@ impl Default for FuseConf {
             entry_ttl: Default::default(),
             negative_ttl: Default::default(),
             node_cache_ttl: Default::default(),
-            meta_cache_ttl_duration: Default::default(),
+            meta_cache_ttl: Default::default(),
 
             list_limit: 1000,
             enable_splice: true,
+
+            path_lock_stripes: 1024,
+
             log: LogConf::default(),
         };
 
@@ -437,6 +481,39 @@ max_readahead_kb = 1024
     }
 
     #[test]
+    fn readonly_adds_ro_mount_option() {
+        let conf = FuseConf {
+            readonly: true,
+            ..Default::default()
+        };
+        let mut mount_options = String::new();
+        conf.set_fuse_opts(&mut mount_options);
+        assert!(mount_options.split(',').any(|opt| opt == "ro"));
+    }
+
+    #[test]
+    fn readonly_does_not_duplicate_ro_mount_option() {
+        let conf = FuseConf {
+            readonly: true,
+            fuse_opts: vec!["ro".to_string()],
+            ..Default::default()
+        };
+        let mut mount_options = String::new();
+        conf.set_fuse_opts(&mut mount_options);
+
+        assert_eq!(
+            mount_options.split(',').filter(|opt| *opt == "ro").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn toml_readonly_is_parsed() {
+        let conf: FuseConf = toml::from_str("readonly = true").expect("parse");
+        assert!(conf.readonly);
+    }
+
+    #[test]
     fn toml_fuse_section_omitted_max_readahead_kb_uses_default() {
         use crate::conf::ClusterConf;
 
@@ -451,5 +528,20 @@ io_threads = 16
             conf.fuse.max_readahead_kb,
             Some(FuseConf::DEFAULT_MAX_READAHEAD_KB)
         );
+    }
+
+    #[test]
+    fn toml_with_removed_node_cache_size_loads_clean() {
+        // node_cache_size was removed as a dead param (issue #1023 §1): the node
+        // map is evicted by node_cache_timeout (TTL) only, the capacity was never
+        // enforced. FuseConf is #[serde(default)] with no deny_unknown_fields, so
+        // legacy TOML carrying this key must still deserialize (key ignored).
+        let toml = r#"
+io_threads = 16
+node_cache_size = 200000
+"#;
+        let conf: FuseConf =
+            toml::from_str(toml).expect("legacy node_cache_size key must be ignored, not rejected");
+        assert_eq!(conf.io_threads, 16);
     }
 }

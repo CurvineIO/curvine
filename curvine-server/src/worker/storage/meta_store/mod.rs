@@ -12,14 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod node_state;
-pub use self::node_state::NodeState;
+mod mem_meta_store;
+mod vfs_meta_store;
 
-mod file_handle;
-pub use self::file_handle::*;
+pub use self::mem_meta_store::MemMetaStore;
+pub use self::vfs_meta_store::VfsMetaStore;
 
-mod dir_handle;
-pub use self::dir_handle::DirHandle;
+use crate::worker::block::BlockMeta;
+use orpc::CommonResult;
 
-mod backend_handle;
-pub use self::backend_handle::BackendHandle;
+/// Persistent side-car store for block metadata records.
+///
+/// The in-memory index remains owned by `VfsMetaStore`; this trait is the narrow
+/// adapter used for stores such as the current SPDK RocksDB records.
+pub trait BlockMetaStore: Send + Sync {
+    fn put_block_meta(&self, meta: &BlockMeta) -> CommonResult<()>;
+
+    fn remove_block_meta(&self, meta: &BlockMeta) -> CommonResult<()>;
+}

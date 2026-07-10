@@ -116,6 +116,10 @@ RUN ARCH=$(uname -m) && \
 
 ENV JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
 
+# Runtime image only needs master/worker runtime binaries, CLI/FUSE helpers, and WebUI.
+# Override with --build-arg BUILD_ARGS="..." when building SDKs, WebUI, tests, or alternate UFS sets.
+ARG BUILD_ARGS="-p server -p client -p cli -p fuse -p web --skip-java-sdk --skip-python-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs --ufs opendal-webhdfs --ufs oss-hdfs"
+
 # Copy and build source code if building from source
 COPY . /workspace/
 WORKDIR /workspace
@@ -133,28 +137,7 @@ RUN ARCH=$(uname -m) && \
     esac && \
     echo "JAVA_HOME set to: ${JAVA_HOME}"
 
-# 7. Pre-install WebUI dependencies and fix vue-cli-service module resolution
-RUN if [ -d "/workspace/curvine-web/webui" ]; then \
-        echo "Pre-installing WebUI dependencies..."; \
-        cd /workspace/curvine-web/webui && \
-        npm install --legacy-peer-deps && \
-        echo "npm install completed" && \
-        # Fix: vue-cli-service wrapper script expects node_modules/package.json
-        # Create symlink to @vue/cli-service/package.json
-        ln -s @vue/cli-service/package.json node_modules/package.json && \
-        echo "Created symlink: node_modules/package.json -> @vue/cli-service/package.json" && \
-        ls -la node_modules/package.json; \
-    fi
-
-# 8. Patch build.sh to use direct vue-cli-service.js call
-RUN if [ -f "/workspace/build/build.sh" ]; then \
-        echo "Patching build.sh to fix vue-cli-service wrapper script issue..."; \
-        sed -i 's/npm run build/node node_modules\/@vue\/cli-service\/bin\/vue-cli-service.js build/g' /workspace/build/build.sh && \
-        echo "Patch applied" && \
-        grep -n "vue-cli-service" /workspace/build/build.sh || true; \
-    fi
-
-# 9. Build the project from source with all UFS support
+# 7. Build the runtime project from source with UFS support.
 RUN echo "Building Curvine from source..." && \
     # Set JAVA_HOME for current architecture
     ARCH=$(uname -m) && \
@@ -175,11 +158,11 @@ RUN echo "Building Curvine from source..." && \
     mkdir -p /workspace/tmp && \
     export TMPDIR=/workspace/tmp && \
     echo "Using TMPDIR=$TMPDIR for compilation temporary files" && \
-    echo "Running 'make all' with --skip-java-sdk and all UFS support..." && \
-    # Build with retry mechanism and all UFS support
+    echo "Running runtime build with retry mechanism: make all ARGS=\"${BUILD_ARGS}\"" && \
+    # Build with retry mechanism and runtime UFS support
     for attempt in 1 2 3; do \
         echo "Build attempt $attempt..." && \
-        if make all ARGS='--skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs --ufs opendal-webhdfs --ufs oss-hdfs'; then \
+        if make all ARGS="${BUILD_ARGS}"; then \
             echo "✓ Build succeeded with all UFS support" && \
             break; \
         else \
@@ -291,4 +274,3 @@ EXPOSE 8995 8996 8997 9000 9001
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["master", "start"]
-
