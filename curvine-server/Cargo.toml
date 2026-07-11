@@ -28,7 +28,6 @@ once_cell = { workspace = true }
 tokio = { workspace = true }
 glob = { workspace = true }
 futures = { workspace = true }
-tokio-util = { workspace = true }
 toml = { workspace = true }
 num_enum = { workspace = true }
 indexmap = { workspace = true }

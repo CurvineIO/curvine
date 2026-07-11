@@ -15,6 +15,7 @@
 use crate::fuse_metrics::{mono_now, ActiveGuard, FuseMetrics, IO_TYPE_WRITE};
 use crate::raw::fuse_abi::fuse_write_out;
 use crate::session::FuseResponse;
+use bytes::Bytes;
 use curvine_client::unified::UnifiedWriter;
 use curvine_common::conf::FuseConf;
 use curvine_common::error::FsError;
@@ -27,7 +28,6 @@ use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel,
 use orpc::sync::{AtomicCounter, AtomicLong, ErrorMonitor};
 use orpc::sys::DataSlice;
 use std::sync::Arc;
-use tokio_util::bytes::Bytes;
 
 enum WriteTask {
     Write(i64, Bytes, Option<FuseResponse>),

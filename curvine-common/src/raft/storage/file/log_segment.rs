@@ -17,7 +17,7 @@ use std::io::{BufWriter, Write};
 use prost::bytes::BytesMut;
 use prost::Message;
 use raft::eraftpb::Entry;
-use tokio_util::bytes::BufMut;
+use bytes::BufMut;
 use orpc::err_box;
 use orpc::os::LocalFile;
 use crate::raft::RaftResult;

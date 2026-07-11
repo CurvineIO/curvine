@@ -25,7 +25,6 @@ tracing-subscriber = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true }
 futures =  { workspace = true }
-tokio-util = { workspace = true }
 bytes = { workspace = true }
 pin-project-lite = { workspace = true }
 dashmap = { workspace = true }

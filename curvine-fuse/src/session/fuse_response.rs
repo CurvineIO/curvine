@@ -22,6 +22,7 @@ use crate::raw::fuse_abi::{
 use crate::session::{FuseNotifyCode, FuseTask};
 use crate::{FuseError, FuseResult, FuseUtils};
 use crate::{FUSE_NOTIFY_UNIQUE, FUSE_OUT_HEADER_LEN, FUSE_SUCCESS};
+use bytes::BytesMut;
 use log::{info, warn};
 use orpc::io::IOResult;
 use orpc::sync::channel::AsyncSender;
@@ -32,7 +33,6 @@ use std::fmt::Debug;
 use std::io::IoSlice;
 use std::sync::Arc;
 use std::vec;
-use tokio_util::bytes::BytesMut;
 
 pub struct ResponseData {
     pub header: fuse_out_header,
