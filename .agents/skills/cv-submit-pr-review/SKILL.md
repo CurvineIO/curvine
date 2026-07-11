@@ -1,6 +1,6 @@
 ---
 name: cv-submit-pr-review
-description: Perform a direct code review of a Curvine PR by reading the diff and changed files, analyzing correctness, safety, and design issues, and producing structured findings. Use when user asks to review a PR's code, do a code review, or check a PR before merge.Review a pull request by inspecting the native PR diff with GitHub CLI, draft original review comments in English, ignore Copilot-generated comments, show the draft comments locally first, and only submit them to GitHub after explicit user confirmation.
+description: Perform a direct code review of a Curvine PR by reading the diff and changed files, analyzing correctness, safety, and design issues, and producing structured findings. Use when user asks to review a PR's code, do a code review, or check a PR before merge.
 ---
 
 # Review PR Workflow
@@ -258,9 +258,9 @@ Post only the comments the user approved.
 
 ## Related
 
-* Handle existing reviewer comments → [cv-address-pr-review](https://../cv-address-pr-review/SKILL.md)
+* Handle existing reviewer comments → [cv-address-pr-review](../cv-address-pr-review/SKILL.md)
 
-* Fix findings and update PR → [cv-create-pr](https://../cv-create-pr/SKILL.md)
+* Fix findings and update PR → [cv-create-pr](../cv-create-pr/SKILL.md)
 
-* Review during issue fix → [cv-handle-issue](https://../cv-handle-issue/SKILL.md)
+* Review during issue fix → [cv-handle-issue](../cv-handle-issue/SKILL.md)
 
