@@ -119,9 +119,6 @@ pub struct IoRequest {
     pub completion: Arc<IoCompletion>,
     /// Per-bdev in-flight counter. Decremented on completion.
     pub bdev_inflight: Arc<AtomicUsize>,
-    /// Per-qpair dead flag. Set by the poller when qpair poll fails;
-    /// checked by the bdev to fail subsequent I/Os fast.
-    pub qpair_dead: Arc<AtomicBool>,
 }
 
 // SAFETY: exclusive ownership - blocks until completion.
@@ -232,7 +229,6 @@ impl SpdkPoller {
             op: IoOp::UnregisterQpair { qpair, ack: ack_tx },
             completion: IoCompletion::new(),
             bdev_inflight: Arc::new(AtomicUsize::new(0)),
-            qpair_dead: Arc::new(AtomicBool::new(false)),
         };
         if let Some(tx) = &self.tx {
             let _ = tx.send(req);
@@ -530,18 +526,11 @@ impl SpdkPoller {
         // Register/retrieve QpairState on first sight of this qpair.
         let qs = dead_qpairs.entry(key).or_insert_with(|| {
             Box::new(QpairState {
-                dead: req.qpair_dead.clone(),
+                dead: Arc::new(AtomicBool::new(false)),
                 pending: Vec::with_capacity(io_queue_depth),
                 stale: Vec::new(),
             })
         });
-
-        // Fast-fail if this qpair is already known dead.
-        if req.qpair_dead.load(Ordering::Acquire) {
-            req.bdev_inflight.fetch_sub(1, Ordering::Release);
-            req.completion.complete(-libc::ENXIO);
-            return;
-        }
 
         let pending_idx = qs.pending.len();
         let qs_ptr = &mut **qs as *mut QpairState;
@@ -880,6 +869,8 @@ mod test {
         assert!(dead_qpairs.contains_key(&DEAD));
         assert_eq!(dead_qpairs[&DEAD].stale.len(), 2);
         assert_eq!(dead_qpairs[&DEAD].pending.len(), 0);
+
+        // Assert: dead flag set.
         assert!(dead_flag.load(Ordering::Acquire));
 
         // Reclaim stale entries (frees CallbackCtx, signals already done).
@@ -998,6 +989,30 @@ mod test {
     }
 
     #[test]
+    fn poller_callback_empty_pending_signals_completion() {
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let completion = IoCompletion::new();
+        let qs = Box::new(QpairState {
+            dead: Arc::new(AtomicBool::new(false)),
+            pending: Vec::new(),
+            stale: Vec::new(),
+        });
+        let ctx = Box::into_raw(Box::new(CallbackCtx {
+            completion: completion.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight.clone(),
+            qpair_state: &*qs as *const QpairState as *mut QpairState,
+            pending_idx: 0,
+        }));
+
+        unsafe { poller_callback(ctx as *mut c_void, 42) };
+
+        // Hot path always signals completion and decrements inflight.
+        assert_eq!(completion.wait(0), 42);
+        assert_eq!(inflight.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn submit_one_rc_error_cleans_up_pending_entry() {
         // Pre-push: entry added before SPDK submit call.
         let inflight = Arc::new(AtomicUsize::new(1));
@@ -1109,14 +1124,22 @@ mod test {
             completion_0.complete(-libc::EIO);
         }
 
+        // ctx_0 freed and cleaned up.
         assert_eq!(qs.pending.len(), 1);
         assert_eq!(completion_0.wait(0), -libc::EIO);
         assert_eq!(inflight_0.load(Ordering::Acquire), 0);
 
+        // ctx_1 still alive, reindexed to 0.
         assert_eq!(unsafe { (*qs.pending[0]).pending_idx }, 0);
         assert_eq!(completion_1.wait(1), -libc::ETIMEDOUT);
+        assert_eq!(
+            inflight_1.load(Ordering::Acquire),
+            1,
+            "stale entry inflight must not be decremented"
+        );
         assert_eq!(inflight_1.load(Ordering::Acquire), 1);
 
+        // Clean up ctx_1.
         unsafe { drop(Box::from_raw(ctx_1)) };
     }
 
@@ -1237,7 +1260,6 @@ mod test {
             op: IoOp::UnregisterQpair { qpair, ack: ack_tx },
             completion: IoCompletion::new(),
             bdev_inflight: Arc::new(AtomicUsize::new(0)),
-            qpair_dead: Arc::new(AtomicBool::new(false)),
         };
 
         SpdkPoller::handle_unregister(&req, &mut active_qpairs, &mut dead_qpairs, &orphaned);
@@ -1334,7 +1356,6 @@ mod test {
             op: IoOp::UnregisterQpair { qpair, ack: ack_tx },
             completion: IoCompletion::new(),
             bdev_inflight: Arc::new(AtomicUsize::new(0)),
-            qpair_dead: Arc::new(AtomicBool::new(false)),
         };
 
         SpdkPoller::handle_unregister(&req, &mut active_qpairs, &mut dead_qpairs, &orphaned);
