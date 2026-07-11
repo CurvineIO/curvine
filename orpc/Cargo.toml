@@ -28,7 +28,7 @@ tracing-subscriber = { workspace = true }
 rolling-file = { workspace = true }
 log = { workspace = true }
 pin-project-lite = { workspace = true }
-prometheus = { workspace = true, features = ["process"] }
+prometheus = { workspace = true }
 sysinfo = { workspace = true }
 fs2 = { workspace = true }
 toml = { workspace = true }

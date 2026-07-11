@@ -95,13 +95,13 @@ regex = "1.9.4"
 num_enum = "0.7.5"
 hyper = "1.2.0"
 pin-project-lite = "0.2.15"
-uuid = { version = "1.11.0", features = ["v4", "fast-rng", "macro-diagnostics"] }
+uuid = { version = "1.11.0", features = ["v4", "fast-rng"] }
 rand = '0.8.5'
 murmur3 = "0.5.2"
 crc32fast = "1.4.2"
 socket2 = "0.5.8"
 chrono = { version = "0.4.31", default-features = false, features = ["clock"] }
-prometheus = { version = "0.13.4", features = ["process"] }
+prometheus = "0.13.4"
 sysinfo = "0.30.13"
 fs2 = "0.4.3"
 byteorder = "1.5.0"
@@ -117,13 +117,12 @@ tower-http = "0.5.2"
 
 thiserror = "1.0.58"
 mini-moka = "0.10.3"
-moka = { version = "0.12.10", features = ["sync", "future"] }
+moka = { version = "0.12.10", features = ["sync"] }
 flate2 = { version = "1.0.29", features = ["zlib"], default-features = false }
 crossbeam = "0.8.4"
 dashmap = "5.5.3"
 linked-hash-map = "0.5.6"
 fxhash = "0.2.1"
-serde_with = "3.12.0"
 parking_lot = "0.12.3"
 anyhow = "1.0.97"
 url = "2.2.2"
