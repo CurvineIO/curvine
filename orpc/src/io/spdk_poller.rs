@@ -442,14 +442,25 @@ impl SpdkPoller {
         // Thread exiting — drain remaining QpairStates into orphaned map for safe reclamation.
         // Do NOT call reclaim_stale here — late SPDK callbacks may still fire
         // (caller is responsible for calling reclaim_stale after qpair_pool::drain_all).
-        if let Ok(mut guard) = orphaned.lock() {
-            for (key, mut qs) in dead_qpairs.drain() {
-                if let Some(mut prev) = guard.remove(&key) {
-                    qs.stale.extend(prev.stale.drain(..));
-                    qs.stale.extend(prev.pending.drain(..));
-                }
-                guard.insert(key, qs);
+        // Force-complete any remaining pending I/Os before the lock so cleanup
+        // cannot be skipped by a poisoned mutex.
+        let dead_keys: Vec<usize> = dead_qpairs.keys().copied().collect();
+        for &key in &dead_keys {
+            Self::force_complete_qpair(key, &mut dead_qpairs);
+        }
+        let mut guard = match orphaned.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("orphaned lock poisoned at thread exit, recovering");
+                e.into_inner()
             }
+        };
+        for (key, mut qs) in dead_qpairs.drain() {
+            if let Some(mut prev) = guard.remove(&key) {
+                qs.stale.extend(prev.stale.drain(..));
+                qs.stale.extend(prev.pending.drain(..));
+            }
+            guard.insert(key, qs);
         }
         info!("SPDK poller thread exiting");
     }
@@ -480,14 +491,19 @@ impl SpdkPoller {
                 let pending = std::mem::take(&mut qs.pending);
                 qs.stale.extend(pending);
                 // Move QpairState to orphaned map for late callback safety
-                if let Ok(mut guard) = orphaned.lock() {
-                    if let Some(mut prev) = guard.remove(&key) {
-                        qs.stale.extend(prev.stale.drain(..));
-                        qs.stale.extend(prev.pending.drain(..));
+                let mut guard = match orphaned.lock() {
+                    Ok(g) => g,
+                    Err(e) => {
+                        error!("orphaned lock poisoned in handle_unregister, recovering");
+                        e.into_inner()
                     }
-                    qs.dead.store(true, Ordering::Release);
-                    guard.insert(key, qs);
+                };
+                if let Some(mut prev) = guard.remove(&key) {
+                    qs.stale.extend(prev.stale.drain(..));
+                    qs.stale.extend(prev.pending.drain(..));
                 }
+                qs.dead.store(true, Ordering::Release);
+                guard.insert(key, qs);
             }
             let _ = ack.send(());
         }
@@ -681,9 +697,11 @@ impl SpdkPoller {
             return;
         }
         active_qpairs.retain(|&qp| !err_keys.contains(&(qp as usize)));
+        for &key in &err_keys {
+            Self::force_complete_qpair(key, dead_qpairs);
+        }
         if let Ok(mut guard) = orphaned.lock() {
             for &key in &err_keys {
-                Self::force_complete_qpair(key, dead_qpairs);
                 if let Some(mut qs) = dead_qpairs.remove(&key) {
                     if let Some(mut prev) = guard.remove(&key) {
                         qs.stale.extend(prev.stale.drain(..));
