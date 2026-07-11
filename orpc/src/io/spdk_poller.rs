@@ -700,15 +700,20 @@ impl SpdkPoller {
         for &key in &err_keys {
             Self::force_complete_qpair(key, dead_qpairs);
         }
-        if let Ok(mut guard) = orphaned.lock() {
-            for &key in &err_keys {
-                if let Some(mut qs) = dead_qpairs.remove(&key) {
-                    if let Some(mut prev) = guard.remove(&key) {
-                        qs.stale.extend(prev.stale.drain(..));
-                        qs.stale.extend(prev.pending.drain(..));
-                    }
-                    guard.insert(key, qs);
+        let mut guard = match orphaned.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("orphaned lock poisoned in poll_and_sweep, recovering");
+                e.into_inner()
+            }
+        };
+        for &key in &err_keys {
+            if let Some(mut qs) = dead_qpairs.remove(&key) {
+                if let Some(mut prev) = guard.remove(&key) {
+                    qs.stale.extend(prev.stale.drain(..));
+                    qs.stale.extend(prev.pending.drain(..));
                 }
+                guard.insert(key, qs);
             }
         }
         error!(
