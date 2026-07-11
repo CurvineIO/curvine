@@ -19,7 +19,6 @@ once_cell = { workspace = true }
 crc32fast = { workspace = true }
 socket2 = { workspace = true }
 prost = { workspace = true }
-prost-build = { workspace = true }
 num_enum = { workspace = true }
 serde = { workspace = true }
 chrono = { workspace = true }

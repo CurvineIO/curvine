@@ -42,5 +42,4 @@ fuse2 = []
 fuse3 = []
 
 [build-dependencies]
-bindgen = { workspace = true }
 pkg-config = "0.3.27"
