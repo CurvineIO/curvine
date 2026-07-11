@@ -25,6 +25,10 @@ Measured in this workspace after `T1`:
 | `target/release/deps` | 1.2G |
 | `target/release/build` | 232M |
 
+Rechecked after `T6`: the existing cached `target` directory is still 1.5G.
+This is not an impact measurement because the workspace has not been rebuilt
+from a fresh target after the dependency changes.
+
 Largest build-script outputs currently observed:
 
 | Path pattern | Size signal |
@@ -81,7 +85,8 @@ High-impact families:
 
 Large transitive stacks:
 
-- `curvine-cli` uses `reqwest 0.11`.
+- `curvine-cli` used `reqwest 0.11` before `T5`; it now depends on `reqwest
+  0.12`, matching the stack already used by OpenDAL/ObjectStore/Lance.
 - `opendal`, `object_store`, Lance, and LanceDB pull the `reqwest 0.12`,
   `hyper 1.x`, and `http 1.x` stack.
 - Lance and LanceDB pull DataFusion and Arrow families. These remain required
@@ -92,27 +97,49 @@ Large transitive stacks:
 These candidates are based on direct manifest declarations and source usage.
 They must be verified one at a time.
 
-| Candidate | Current signal | Proposed next check |
-| --------- | -------------- | ------------------- |
-| `moka` | Workspace enables `sync` and `future`; source currently uses `moka::sync` and `moka::policy` | Check whether `future` can be removed without affecting any enabled target |
-| `prometheus` | `process` feature enabled; source usage found only metrics types and `proto::MetricType` | Check whether `process` is unused and removable |
-| `uuid` | Workspace enables `v4`, `fast-rng`, `macro-diagnostics`; source uses `Uuid::new_v4`, no `uuid!` macro found | Check whether `macro-diagnostics` can be removed |
-| `tokio-util` | Workspace enables `full`; source uses `codec` and re-exported `bytes` | Move `tokio_util::bytes` imports to `bytes`, then narrow to `codec` |
+| Candidate | Current signal | Status |
+| --------- | -------------- | ------ |
+| `moka` | Workspace enabled `sync` and `future`; source uses `moka::sync` and `moka::policy` | `future` removed in `c337093` |
+| `prometheus` | `process` feature enabled; source usage found only metrics types and `proto::MetricType` | `process` removed in `c337093` |
+| `uuid` | Workspace enabled `v4`, `fast-rng`, `macro-diagnostics`; source uses `Uuid::new_v4`, no `uuid!` macro found | `macro-diagnostics` removed in `c337093` |
+| `tokio-util` | Workspace enabled `full`; source uses `codec` and re-exported `bytes` | `bytes` imports moved to direct crate and feature narrowed to `codec` in `a627075` |
 | `tokio` | Workspace enables `full`; source uses runtime, macros, net, io, sync, time, signal, fs | Narrow only after exact feature matrix is verified |
-| `serde_with` | No source usage found by static grep | Confirm whether it can be removed or if generated/macros use it indirectly |
-| `reqwest` | CLI uses `0.11`; transitive deps use `0.12` | Investigate upgrading CLI to `0.12` without behavior changes |
+| `serde_with` | No source usage found by static grep | Removed in `c337093` |
+| `reqwest` | CLI used `0.11`; transitive deps use `0.12` | CLI manifest upgraded to `0.12` in `d01e8fc`; lock cleanup requires online Cargo |
+| `opendal` | Required; service features are selected explicitly by Curvine features | Default OpenDAL crate features disabled in `76a9a2f`; Curvine default still enables `opendal-s3` |
 
 ## Phased Tasks
 
 | Task | Purpose | Behavior impact |
 | ---- | ------- | --------------- |
 | T1 | Remove unused direct dependencies | None intended; completed in `f37b31b` |
-| T2 | Record dependency audit baseline | None; this document |
-| T3 | Trim low-risk direct features | None intended |
-| T4 | Narrow `tokio-util` and then `tokio` features | None intended; requires broad checks |
-| T5 | Align duplicate HTTP dependency stack where compatible | None intended; CLI path needs focused validation |
-| T6 | Review heavy native/build dependency boundaries | None intended unless separately approved |
-| T7 | Record final before/after impact | None |
+| T2 | Record dependency audit baseline | None; completed in `3b86a0e` |
+| T3 | Trim low-risk direct features | None intended; completed in `c337093` |
+| T4 | Narrow `tokio-util` feature usage | None intended; completed in `a627075` |
+| T5 | Align duplicate HTTP dependency stack where compatible | None intended; CLI manifest completed in `d01e8fc`; lock cleanup awaits online Cargo |
+| T6 | Review heavy native/build dependency boundaries | None intended; OpenDAL default feature narrowing completed in `76a9a2f` |
+| T7 | Record final impact and limitations | None; this update |
+
+## Completed Commit Sequence
+
+1. `f37b31b` - `build(cargo): remove unused direct dependencies`
+2. `3b86a0e` - `docs(cargo): record dependency optimization baseline`
+3. `c337093` - `build(cargo): trim low-risk dependency features`
+4. `a627075` - `build(cargo): narrow tokio-util feature usage`
+5. `d01e8fc` - `build(cargo): align cli reqwest with http stack`
+6. `76a9a2f` - `build(cargo): avoid implicit opendal default features`
+
+## Follow-up Checks
+
+- Run `cargo check --workspace --locked` with network access or a complete local
+  Cargo cache.
+- Run `cargo tree -d --locked` after Cargo can update/read the full registry
+  index. In particular, verify whether the old `reqwest 0.11`/`hyper 0.14`
+  stack disappears from the resolved graph after lock cleanup.
+- Run a clean build into a fresh target directory before comparing disk usage:
+  `CARGO_TARGET_DIR=/tmp/curvine-target-after cargo build --workspace --locked`.
+- Revisit `tokio/full` only after a crate-by-crate feature matrix is available;
+  it is intentionally not changed in this phase.
 
 ## Verification Commands
 
@@ -128,5 +155,7 @@ cargo tree --workspace --edges features --locked
 du -hd 2 target
 ```
 
-Current local limitation: `cargo tree --offline` fails because the local cache is
-missing `libmimalloc-sys`, and online Cargo commands may require network access.
+Current local limitation: `cargo tree --offline` and focused `cargo check`
+commands fail because the local cache/index is missing crates such as `symlink`
+for `tracing-appender`. The sandbox also cannot connect to the local proxy at
+`127.0.0.1:7890`, so online checks could not be completed here.
