@@ -732,6 +732,9 @@ struct QpairState {
     /// Force-completed entries kept alive for late callbacks. Freed by reclaim_stale().
     stale: Vec<*mut CallbackCtx>,
 }
+// SAFETY: QpairState moves from the poller thread into the orphaned
+// Mutex after force_complete_qpair sets dead=true, preventing late
+// callbacks from following the stale raw pointers.
 unsafe impl Send for QpairState {}
 
 impl QpairState {
