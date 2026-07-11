@@ -69,6 +69,10 @@ impl CurvineFileSystem {
         &self.conf
     }
 
+    pub(crate) fn fs(&self) -> &UnifiedFileSystem {
+        &self.fs
+    }
+
     async fn ensure_writable_path(&self, path: &Path, rpc_code: RpcCode) -> FuseResult<()> {
         if self.conf.readonly {
             return Err(FsError::read_only(path.full_path()).into());
