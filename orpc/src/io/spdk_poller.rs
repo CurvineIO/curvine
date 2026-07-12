@@ -733,6 +733,7 @@ impl SpdkPoller {
             }
         }
         has_orphaned.store(true, Ordering::Release);
+        // TODO: reset has_orphaned when orphaned map drains empty (in reclaim_stale)
         error!(
             "{} qpair(s) failed, removed from active set",
             err_keys.len()
@@ -756,6 +757,7 @@ unsafe impl Send for QpairState {}
 
 impl QpairState {
     #[cfg(test)]
+    // TODO: when this becomes production (deferred cleanup PR), reset has_orphaned after draining empty
     fn reclaim_stale(&mut self) {
         for ptr in self.stale.drain(..) {
             unsafe { drop(Box::from_raw(ptr as *mut CallbackCtx)) };
