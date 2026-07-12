@@ -142,6 +142,4 @@ glob = "0.3"
 lru = "0.16.1"
 
 mimalloc = "0.1.48"
-tikv-jemallocator = { version = "0.6.1", features = ["stats", "unprefixed_malloc_on_supported_platforms"] }
-tikv-jemalloc-ctl = { version = "0.6.1"}
-tikv-jemalloc-sys = { version = "0.6.1", features = ["stats"] }
+tikv-jemallocator = { version = "0.6.1", features = ["unprefixed_malloc_on_supported_platforms"] }

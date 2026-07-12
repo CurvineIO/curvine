@@ -51,15 +51,9 @@ mimalloc = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true }
-tikv-jemalloc-ctl = { workspace = true, optional = true }
-tikv-jemalloc-sys = { workspace = true, optional = true }
 
 [features]
-jemalloc = [
-    "dep:tikv-jemallocator",
-    "dep:tikv-jemalloc-ctl",
-    "dep:tikv-jemalloc-sys",
-]
+jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
 system = []
 
