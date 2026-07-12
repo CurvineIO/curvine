@@ -597,8 +597,6 @@ impl SpdkPoller {
             }
             return;
         }
-
-        qs.pending.push(cb_ctx_ptr);
     }
 
     /// Force-complete all outstanding I/Os on a failed qpair using the
