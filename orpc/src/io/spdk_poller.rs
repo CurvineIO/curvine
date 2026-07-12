@@ -541,8 +541,9 @@ impl SpdkPoller {
         if has_orphaned.load(Ordering::Acquire) {
             if let Ok(guard) = orphaned.lock() {
                 if guard.contains_key(&key) {
-                    req.completion.complete(-libc::ENODEV);
-                    req.bdev_inflight.fetch_sub(1, Ordering::Release);
+                    if req.completion.complete(-libc::EIO) {
+                        req.bdev_inflight.fetch_sub(1, Ordering::Release);
+                    }
                     return;
                 }
             }
