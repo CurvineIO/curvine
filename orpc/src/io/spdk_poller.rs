@@ -275,6 +275,7 @@ impl SpdkPoller {
         let mut state = PollerState::Idle;
         // Tracks per-qpair state (dead flag + pending Vec) for force-completion.
         let mut qpair_state: HashMap<usize, Box<QpairState>> = HashMap::new();
+        let has_orphaned = AtomicBool::new(false);
 
         // Verify curvine_async_ctx buffer fits the C struct.
         debug_assert!(
@@ -305,7 +306,13 @@ impl SpdkPoller {
                     if matches!(req.op, IoOp::UnregisterQpair { .. }) {
                         Self::handle_unregister(&req, &mut qpair_state, &*orphaned);
                     } else {
-                        Self::submit_one(&req, &mut qpair_state, config.io_queue_depth);
+                        Self::submit_one(
+                            &req,
+                            &mut qpair_state,
+                            &*orphaned,
+                            &has_orphaned,
+                            config.io_queue_depth,
+                        );
                     }
                     drain_count += 1;
                     if drain_count & 0x7F == 0 && Instant::now() >= deadline {
@@ -315,7 +322,7 @@ impl SpdkPoller {
                 }
 
                 // Poll qpairs for completions and detect failures
-                Self::poll_and_sweep(&mut qpair_state, &*orphaned, "poller");
+                Self::poll_and_sweep(&mut qpair_state, &*orphaned, &has_orphaned, "poller");
 
                 // Process admin completions (keep-alive)
                 Self::process_admin_completions(&active_ctrlrs);
@@ -383,7 +390,13 @@ impl SpdkPoller {
                             if matches!(req.op, IoOp::UnregisterQpair { .. }) {
                                 Self::handle_unregister(&req, &mut qpair_state, &*orphaned);
                             } else {
-                                Self::submit_one(&req, &mut qpair_state, config.io_queue_depth);
+                                Self::submit_one(
+                                    &req,
+                                    &mut qpair_state,
+                                    &*orphaned,
+                                    &has_orphaned,
+                                    config.io_queue_depth,
+                                );
                             }
                             drain_count += 1;
                             if drain_count & 0x7F == 0 && Instant::now() >= deadline {
@@ -397,7 +410,12 @@ impl SpdkPoller {
                     }
                     0 => {
                         // Timeout - poll active qpairs to check connection health
-                        Self::poll_and_sweep(&mut qpair_state, &*orphaned, "keep-alive");
+                        Self::poll_and_sweep(
+                            &mut qpair_state,
+                            &*orphaned,
+                            &has_orphaned,
+                            "keep-alive",
+                        );
 
                         // Process admin completions (keep-alive)
                         Self::process_admin_completions(&active_ctrlrs);
@@ -492,6 +510,8 @@ impl SpdkPoller {
     fn submit_one(
         req: &IoRequest,
         qpair_state: &mut HashMap<usize, Box<QpairState>>,
+        orphaned: &Mutex<HashMap<usize, Box<QpairState>>>,
+        has_orphaned: &AtomicBool,
         io_queue_depth: usize,
     ) {
         let qpair = match &req.op {
@@ -504,6 +524,18 @@ impl SpdkPoller {
         };
 
         let key = qpair as usize;
+
+        // Fast-fail if this qpair was previously orphaned (poller-detected death).
+        if has_orphaned.load(Ordering::Acquire) {
+            if let Ok(guard) = orphaned.lock() {
+                if guard.contains_key(&key) {
+                    if req.completion.complete(-libc::EIO) {
+                        req.bdev_inflight.fetch_sub(1, Ordering::Release);
+                    }
+                    return;
+                }
+            }
+        }
 
         // Register/retrieve QpairState on first sight of this qpair.
         let qs = qpair_state.entry(key).or_insert_with(|| {
@@ -644,6 +676,7 @@ impl SpdkPoller {
     fn poll_and_sweep(
         qpair_state: &mut HashMap<usize, Box<QpairState>>,
         orphaned: &Mutex<HashMap<usize, Box<QpairState>>>,
+        has_orphaned: &AtomicBool,
         context: &str,
     ) {
         let err_keys: Vec<usize> = qpair_state
@@ -684,6 +717,8 @@ impl SpdkPoller {
                 guard.insert(key, qs);
             }
         }
+        has_orphaned.store(true, Ordering::Release);
+        // TODO: reset has_orphaned when orphaned map drains empty (in reclaim_stale)
         error!(
             "{} qpair(s) failed, removed from active set",
             err_keys.len()
@@ -707,6 +742,7 @@ unsafe impl Send for QpairState {}
 
 impl QpairState {
     #[cfg(test)]
+    // TODO: when this becomes production (deferred cleanup PR), reset has_orphaned after draining empty
     fn reclaim_stale(&mut self) {
         for ptr in self.stale.drain(..) {
             unsafe { drop(Box::from_raw(ptr as *mut CallbackCtx)) };
