@@ -24,7 +24,19 @@ export CLASSPATH=$(echo $CURVINE_HOME/lib/curvine-hadoop-*shade.jar | tr ' ' ':'
 # Choose whether to use a Java client or a Rust client according to the command
 if [ "$1" = "fs" ] || [ "$1" = "report" ]; then
     # Use Java client to process file system commands
-    java -Xms256m -Xmx256m \
+    # Java 8 reports versions as 1.8.x, while Java 9+ reports the major version first.
+    JAVA_MAJOR_VERSION=$(java -version 2>&1 | awk -F '"' '/version/ {
+        split($2, version, /[._-]/)
+        print version[1] == 1 ? version[2] : version[1]
+        exit
+    }')
+    JAVA_OPTS=()
+    # --add-opens was introduced in Java 9 and is required for Curvine's NIO access.
+    if [[ "$JAVA_MAJOR_VERSION" =~ ^[0-9]+$ ]] && (( JAVA_MAJOR_VERSION >= 9 )); then
+        JAVA_OPTS+=(--add-opens=java.base/java.nio=ALL-UNNAMED)
+    fi
+
+    java "${JAVA_OPTS[@]}" -Xms256m -Xmx256m \
     -Dcurvine.conf.dir=${CURVINE_HOME}/conf \
     io.curvine.CurvineShell "$@"
 else

@@ -58,7 +58,7 @@ start() {
       --service ${SERVICE_NAME} \
       --conf ${CURVINE_CONF_FILE} \
       > ${OUT_FILE} 2>&1 < /dev/null  &
-     elif [[ "$SERVICE_NAME" = "fuse" ]]; then
+    elif [[ "$SERVICE_NAME" = "fuse" ]]; then
        name="curvine-fuse"
        nohup ${CURVINE_HOME}/lib/curvine-fuse \
        $PARAMS \
@@ -103,7 +103,7 @@ stop() {
     if kill -0 $PID > /dev/null 2>&1; then
       echo "stopping ${SERVICE_NAME}"
 
-      kill ${PID} && rm -f "PID_FILE"
+      kill ${PID}
       waitPid $PID;
 
       if kill -0 $PID > /dev/null 2>&1; then
@@ -112,6 +112,10 @@ stop() {
       else
         echo "${SERVICE_NAME} stop gracefully"
       fi
+      rm -f "${PID_FILE}"
+    elif [ -d "/proc/${PID}" ]; then
+      echo "process pid=${PID} cannot be signalled; it may belong to another user. Please check permissions"
+      exit 1
     else
       echo "no ${SERVICE_NAME} to stop"
     fi
@@ -222,4 +226,3 @@ esac
 }
 
 run ${ACTION}
-
