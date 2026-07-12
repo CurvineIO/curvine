@@ -12,14 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use bigdecimal::BigDecimal;
 use curvine_ufs::S3Conf;
-use num_bigint::BigInt;
 use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;
-use std::str::FromStr;
 use std::time::Duration;
 
 pub async fn handle_rpc_result<T, E: Display>(operation: impl Future<Output = Result<T, E>>) -> T {
@@ -194,60 +191,49 @@ pub fn format_duration(duration: &Duration) -> String {
     }
 }
 
-pub fn bytes_to_string(size: &BigInt) -> String {
-    let eib = BigInt::from(1i64 << 60);
-    let pib = BigInt::from(1i64 << 50);
-    let tib = BigInt::from(1i64 << 40);
-    let gib = BigInt::from(1i64 << 30);
-    let mib = BigInt::from(1i64 << 20);
-    let kib = BigInt::from(1i64 << 10);
+pub fn bytes_to_string(size: i64) -> String {
+    const KIB: i64 = 1_i64 << 10;
+    const MIB: i64 = 1_i64 << 20;
+    const GIB: i64 = 1_i64 << 30;
+    const TIB: i64 = 1_i64 << 40;
+    const PIB: i64 = 1_i64 << 50;
+    const EIB: i64 = 1_i64 << 60;
 
-    let eib_threshold = &BigInt::from(1i64 << 11) * &eib;
-
-    if size >= &eib_threshold {
-        let bd = BigDecimal::from_str(&size.to_string()).unwrap().round(3);
-        format!("{} B", bd)
+    let (value, unit) = if size >= EIB * 2 {
+        (size as f64 / EIB as f64, "EB")
+    } else if size >= PIB * 2 {
+        (size as f64 / PIB as f64, "PB")
+    } else if size >= TIB * 2 {
+        (size as f64 / TIB as f64, "TB")
+    } else if size >= GIB * 2 {
+        (size as f64 / GIB as f64, "GB")
+    } else if size >= MIB * 2 {
+        (size as f64 / MIB as f64, "MB")
+    } else if size >= KIB * 2 {
+        (size as f64 / KIB as f64, "KB")
     } else {
-        let (value, unit) = if size >= &(&eib * 2) {
-            (
-                BigDecimal::from_str(&size.to_string()).unwrap()
-                    / BigDecimal::from_str(&eib.to_string()).unwrap(),
-                "EB",
-            )
-        } else if size >= &(&pib * 2) {
-            (
-                BigDecimal::from_str(&size.to_string()).unwrap()
-                    / BigDecimal::from_str(&pib.to_string()).unwrap(),
-                "PB",
-            )
-        } else if size >= &(&tib * 2) {
-            (
-                BigDecimal::from_str(&size.to_string()).unwrap()
-                    / BigDecimal::from_str(&tib.to_string()).unwrap(),
-                "TB",
-            )
-        } else if size >= &(&gib * 2) {
-            (
-                BigDecimal::from_str(&size.to_string()).unwrap()
-                    / BigDecimal::from_str(&gib.to_string()).unwrap(),
-                "GB",
-            )
-        } else if size >= &(&mib * 2) {
-            (
-                BigDecimal::from_str(&size.to_string()).unwrap()
-                    / BigDecimal::from_str(&mib.to_string()).unwrap(),
-                "MB",
-            )
-        } else if size >= &(&kib * 2) {
-            (
-                BigDecimal::from_str(&size.to_string()).unwrap()
-                    / BigDecimal::from_str(&kib.to_string()).unwrap(),
-                "KB",
-            )
-        } else {
-            (BigDecimal::from_str(&size.to_string()).unwrap(), "B")
-        };
+        (size as f64, "B")
+    };
 
-        format!("{:.1}{}", value, unit)
+    format!("{value:.1}{unit}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bytes_to_string;
+
+    #[test]
+    fn bytes_to_string_formats_report_capacity_values() {
+        assert_eq!(bytes_to_string(0), "0.0B");
+        assert_eq!(bytes_to_string(1), "1.0B");
+        assert_eq!(bytes_to_string(1024), "1024.0B");
+        assert_eq!(bytes_to_string(2047), "2047.0B");
+        assert_eq!(bytes_to_string(2048), "2.0KB");
+        assert_eq!(bytes_to_string(3 * (1_i64 << 20)), "3.0MB");
+        assert_eq!(bytes_to_string(5 * (1_i64 << 30)), "5.0GB");
+        assert_eq!(bytes_to_string(7 * (1_i64 << 40)), "7.0TB");
+        assert_eq!(bytes_to_string(9 * (1_i64 << 50)), "9.0PB");
+        assert_eq!(bytes_to_string(2 * (1_i64 << 60)), "2.0EB");
+        assert_eq!(bytes_to_string(i64::MAX), "8.0EB");
     }
 }

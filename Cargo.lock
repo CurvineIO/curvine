@@ -1940,7 +1940,6 @@ dependencies = [
 name = "curvine-cli"
 version = "0.2.0"
 dependencies = [
- "bigdecimal",
  "bytes",
  "chrono",
  "clap",
@@ -1948,7 +1947,6 @@ dependencies = [
  "curvine-client",
  "curvine-common",
  "curvine-ufs",
- "num-bigint",
  "orpc",
  "reqwest",
  "serde",
