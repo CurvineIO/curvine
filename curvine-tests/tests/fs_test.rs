@@ -13,13 +13,17 @@
 // limitations under the License.
 
 use bytes::BytesMut;
-use curvine_client::file::{CurvineFileSystem, FsContext};
+use curvine_client::block::BatchBlockWriter;
+use curvine_client::file::{
+    BatchAddBlockRequest, BatchCompleteFileRequest, CurvineFileSystem, FsContext,
+};
 use curvine_client::ClientMetrics;
 use curvine_common::conf::ClusterConf;
+use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Reader, Writer};
 use curvine_common::state::{
-    CreateFileOptsBuilder, ListOptions, MkdirOptsBuilder, SetAttrOptsBuilder, StorageState,
-    TtlAction,
+    CreateFileOptsBuilder, ListOptions, MkdirOptsBuilder, OpenFlags, SetAttrOptsBuilder,
+    StorageState, TtlAction,
 };
 use curvine_common::state::{FileLock, LockFlags, LockType};
 use curvine_common::FsResult;
@@ -54,6 +58,49 @@ fn test_filesystem_end_to_end_operations_on_cluster() -> FsResult<()> {
     Ok(())
 }
 
+#[test]
+fn test_batch_worker_partial_failure_end_to_end() -> FsResult<()> {
+    let rt = Arc::new(AsyncRuntime::single());
+    let testing = Testing::builder().default().build()?;
+    testing.start_cluster()?;
+    let mut conf = testing.get_active_cluster_conf()?;
+
+    // Keep the payloads in one batch while making one item exceed its block.
+    // This exercises a real Worker per-item write failure through the public API.
+    conf.client.short_circuit = false;
+    conf.client.write_chunk_size = 64;
+    conf.client.write_chunk_size_str = "64B".to_string();
+    conf.client.block_size = 8;
+    conf.client.block_size_str = "8B".to_string();
+    run_batch_worker_partial_failure_end_to_end(&testing, &rt, conf)
+}
+
+fn run_batch_worker_partial_failure_end_to_end(
+    testing: &Testing,
+    rt: &Arc<AsyncRuntime>,
+    conf: ClusterConf,
+) -> FsResult<()> {
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+    rt.block_on(async move {
+        let root = Path::from_str("/batch_worker_partial_failure")?;
+        let _ = fs.delete(&root, true).await;
+
+        let oversized = Path::from_str("/batch_worker_partial_failure/oversized")?;
+        let successful = Path::from_str("/batch_worker_partial_failure/successful")?;
+        let files = [(oversized.clone(), "too-large"), (successful.clone(), "ok")];
+
+        let outcomes = fs.write_batch_string(&files).await?;
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes[0].is_err());
+        assert!(outcomes[1].is_ok());
+        assert_eq!(fs.read_string(&successful).await?, "ok");
+        let failed_status = fs.get_status(&oversized).await?;
+        assert!(!failed_status.is_complete);
+        assert_eq!(failed_status.len, 0);
+        Ok(())
+    })
+}
+
 fn run_filesystem_end_to_end_operations_on_cluster(
     testing: &Testing,
     rt: &Arc<AsyncRuntime>,
@@ -75,6 +122,9 @@ fn run_filesystem_end_to_end_operations_on_cluster(
 
         test_batch_writing(&fs).await?;
         println!("test_batch_writing done");
+
+        test_batch_inode_identity_survives_rename(&fs).await?;
+        println!("test_batch_inode_identity_survives_rename done");
 
         file_status(&fs).await?;
         println!("file_status done");
@@ -315,7 +365,11 @@ async fn test_batch_writing(fs: &CurvineFileSystem) -> CommonResult<()> {
         batch_files.push((path, test_small_data.as_str()));
     }
 
-    fs.write_batch_string(&batch_files).await?;
+    let outcomes = fs.write_batch_string(&batch_files).await?;
+    assert_eq!(outcomes.len(), batch_files.len());
+    for outcome in outcomes {
+        outcome?;
+    }
     // Using batch
     // Get block locations for all files
     let mut results = Vec::new();
@@ -360,6 +414,83 @@ async fn test_batch_writing(fs: &CurvineFileSystem) -> CommonResult<()> {
         println!("Verified file_{}: len={}, content matches", i, status.len);
     }
     println!("✓ All {} files written and verified correctly", num_files);
+
+    let parent_file = Path::from_str("/batch_test/batch/mixed_parent")?;
+    let invalid_child = Path::from_str("/batch_test/batch/mixed_parent/child")?;
+    let mixed_files = [
+        (parent_file.clone(), "successful item"),
+        (invalid_child, "failed item"),
+    ];
+    let mixed_outcomes = fs.write_batch_string(&mixed_files).await?;
+    assert_eq!(mixed_outcomes.len(), 2);
+    assert!(mixed_outcomes[0].is_ok());
+    assert!(mixed_outcomes[1].is_err());
+    assert_eq!(
+        read_file_content(fs, &parent_file).await?,
+        "successful item"
+    );
+
+    Ok(())
+}
+
+async fn test_batch_inode_identity_survives_rename(fs: &CurvineFileSystem) -> FsResult<()> {
+    let original = Path::from_str("/fs_test/batch_inode_original")?;
+    let renamed = Path::from_str("/fs_test/batch_inode_renamed")?;
+    let content = "batch inode identity";
+    let opts = fs.create_opts_builder().create_parent(true).build();
+    let flags = OpenFlags::new_write_only()
+        .set_create(true)
+        .set_overwrite(true);
+
+    let mut create_results = fs
+        .fs_client()
+        .create_files_batch(vec![(original.encode(), opts, flags)])
+        .await?;
+    let status = create_results
+        .pop()
+        .ok_or_else(|| FsError::common("missing batch create result"))?
+        .map_err(FsError::common)?;
+
+    assert!(fs.rename(&original, &renamed).await?);
+
+    let mut add_results = fs
+        .fs_client()
+        .add_blocks_batch(vec![BatchAddBlockRequest {
+            path: original.encode(),
+            inode_id: status.id,
+        }])
+        .await?;
+    let located_block = add_results
+        .pop()
+        .ok_or_else(|| FsError::common("missing batch add-block result"))?
+        .map_err(FsError::common)?;
+
+    let mut writer = BatchBlockWriter::new(fs.fs_context(), vec![located_block]).await?;
+    writer.write(&[(&renamed, content)]).await?;
+    let commit_block = writer
+        .complete()
+        .await
+        .pop()
+        .flatten()
+        .ok_or_else(|| FsError::common("batch worker commit failed"))?;
+
+    let mut complete_results = fs
+        .fs_client()
+        .complete_files_batch(vec![BatchCompleteFileRequest {
+            path: original.encode(),
+            inode_id: status.id,
+            len: content.len() as i64,
+            commit_blocks: vec![commit_block],
+            client_name: fs.fs_context().clone_client_name(),
+            only_flush: false,
+        }])
+        .await?;
+    complete_results
+        .pop()
+        .ok_or_else(|| FsError::common("missing batch complete result"))?
+        .map_err(FsError::common)?;
+
+    assert_eq!(fs.read_string(&renamed).await?, content);
     Ok(())
 }
 

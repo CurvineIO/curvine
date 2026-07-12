@@ -59,17 +59,29 @@ message CreateFileResponse {
 message CreateFilesBatchRequest {  
     repeated CreateFileRequest requests = 1;  
 }  
-  
+
+message CreateFileBatchResult {
+    optional FileStatusProto file_status = 1;
+    optional string error = 2;
+}
+
 message CreateFilesBatchResponse {  
-    repeated FileStatusProto file_statuses = 1;  
+    repeated FileStatusProto file_statuses = 1;
+    repeated CreateFileBatchResult results = 2;
 }  
-  
+
 message CompleteFilesBatchRequest {  
     repeated CompleteFileRequest requests = 1;  
-}  
-  
-message CompleteFilesBatchResponse {  
-    repeated bool results = 1;  
+}
+
+message CompleteFileBatchResult {
+    required bool success = 1;
+    optional string error = 2;
+}
+
+message CompleteFilesBatchResponse {
+    repeated bool results = 1;
+    repeated CompleteFileBatchResult details = 2;
 }
 
 message OpenFileRequest {
@@ -156,10 +168,16 @@ message AddBlockResponse {
 // apply for allocation of blocks batch
 message AddBlocksBatchRequest {  
     repeated AddBlockRequest requests = 1;  
-}  
-  
-message AddBlocksBatchResponse {  
-    repeated LocatedBlockProto blocks = 1;  
+}
+
+message AddBlockBatchResult {
+    optional LocatedBlockProto block = 1;
+    optional string error = 2;
+}
+
+message AddBlocksBatchResponse {
+    repeated LocatedBlockProto blocks = 1;
+    repeated AddBlockBatchResult results = 2;
 }
 
 message RequestReplacementWorkerRequest {

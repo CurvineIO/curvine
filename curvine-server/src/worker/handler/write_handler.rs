@@ -234,13 +234,70 @@ impl WriteHandler {
         Ok(msg.success())
     }
 
-    fn commit_block(&self, block: &ExtendedBlock, commit: bool) -> FsResult<()> {
-        if commit {
-            self.store.finalize_block(block)?;
-        } else {
-            self.store.abort_block(block)?;
+    pub(crate) fn complete_block(
+        store: &BlockStore,
+        file: Option<BlockWriteContext>,
+        opened: Option<&WriteContext>,
+        requested: &WriteContext,
+        commit: bool,
+    ) -> FsResult<()> {
+        let opened_block = opened.map(|context| &context.block);
+        let mut file = file;
+        let result = (|| {
+            if let Some(opened) = opened {
+                if opened.req_id != requested.req_id {
+                    return err_box!(
+                        "Request id mismatch, expected {}, actual {}",
+                        opened.req_id,
+                        requested.req_id
+                    );
+                }
+                if opened.block.id != requested.block.id
+                    || opened.block.storage_type != requested.block.storage_type
+                    || opened.block.file_type != requested.block.file_type
+                {
+                    return err_box!(
+                        "write block mismatch: opened={:?}, completed={:?}",
+                        opened.block,
+                        requested.block
+                    );
+                }
+            }
+
+            if requested.block.len > requested.block_size {
+                return err_box!(
+                    "Invalid block length: {}, block size: {}",
+                    requested.block.len,
+                    requested.block_size
+                );
+            }
+
+            if !commit {
+                drop(file.take());
+                store.abort_block(opened_block.unwrap_or(&requested.block))?;
+                return Ok(());
+            }
+
+            if let Some(file) = file.as_mut() {
+                file.flush()?;
+            }
+            drop(file.take());
+            store.finalize_block(&requested.block)?;
+            Ok(())
+        })();
+
+        if result.is_err() {
+            drop(file.take());
+            if let Some(opened_block) = opened_block {
+                if let Err(abort_error) = store.abort_block(opened_block) {
+                    warn!(
+                        "failed to abort block {} after completion error: {}",
+                        opened_block.id, abort_error
+                    );
+                }
+            }
         }
-        Ok(())
+        result
     }
 
     pub fn complete(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {
@@ -252,51 +309,32 @@ impl WriteHandler {
             };
         }
 
-        if let Some(context) = self.context.take() {
-            Self::check_context(&context, msg)?;
-        }
-        let context = WriteContext::from_req(msg)?;
-
-        let file = self.file.take();
-        if let Some(mut file) = file {
-            if let Err(flush_err) = file.flush() {
-                drop(file);
-                if let Err(abort_err) = self.store.abort_block(&context.block) {
-                    log::warn!(
-                        "failed to abort block {} after flush error: {}",
-                        context.block.id,
-                        abort_err
-                    );
+        let requested = match WriteContext::from_req(msg) {
+            Ok(requested) => requested,
+            Err(error) => {
+                drop(self.file.take());
+                if let Some(opened) = self.context.take() {
+                    if let Err(abort_error) = self.store.abort_block(&opened.block) {
+                        warn!(
+                            "failed to abort block {} after invalid completion request: {}",
+                            opened.block.id, abort_error
+                        );
+                    }
                 }
-                return Err(flush_err.into());
+                return Err(error);
             }
-            drop(file);
-        }
-
-        if context.block.len > context.block_size {
-            if let Err(abort_err) = self.store.abort_block(&context.block) {
-                log::warn!(
-                    "failed to abort block {} after length check failed: {}",
-                    context.block.id,
-                    abort_err
-                );
-            }
-            return err_box!(
-                "Invalid block length: {}, block size: {}",
-                context.block.len,
-                context.block_size
-            );
-        }
-
-        self.commit_block(&context.block, commit)?;
+        };
+        let opened = self.context.take();
+        let file = self.file.take();
+        Self::complete_block(&self.store, file, opened.as_ref(), &requested, commit)?;
         self.is_commit = true;
 
         info!(
             "write block end for req_id {}, is commit: {}, off: {}, len: {}",
             msg.req_id(),
             commit,
-            context.off,
-            context.block.len
+            requested.off,
+            requested.block.len
         );
 
         Ok(msg.success())

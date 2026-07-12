@@ -366,15 +366,25 @@ impl MasterHandler {
 
             // Generate unique req_id for each file in batch
             let unique_req_id = ctx.msg.req_id() + index as i64;
-            let status = self.create_file0(unique_req_id, req.path, opts, flags)?;
-            results.push(status);
+            let result = match self.create_file0(unique_req_id, req.path, opts, flags) {
+                Ok(status) => {
+                    let status = ProtoUtils::file_status_to_pb(status);
+                    CreateFileBatchResult {
+                        file_status: Some(status),
+                        error: None,
+                    }
+                }
+                Err(error) => CreateFileBatchResult {
+                    file_status: None,
+                    error: Some(error.to_string()),
+                },
+            };
+            results.push(result);
         }
 
         let rep_header = CreateFilesBatchResponse {
-            file_statuses: results
-                .into_iter()
-                .map(ProtoUtils::file_status_to_pb)
-                .collect(),
+            file_statuses: Vec::new(),
+            results,
         };
         ctx.response_buf(rep_header, &mut self.buf)
     }
@@ -392,7 +402,7 @@ impl MasterHandler {
                 .collect();
 
             let last_block = req.last_block.map(ProtoUtils::extend_block_from_pb);
-            let located_block = self.fs.add_block(
+            let result = self.fs.add_block(
                 path,
                 req.inode_id,
                 client_addr,
@@ -400,39 +410,63 @@ impl MasterHandler {
                 req.exclude_workers,
                 req.file_len,
                 last_block,
-            )?;
-            results.push(ProtoUtils::located_block_to_pb(located_block));
+            );
+            results.push(match result {
+                Ok(block) => {
+                    let block = ProtoUtils::located_block_to_pb(block);
+                    AddBlockBatchResult {
+                        block: Some(block),
+                        error: None,
+                    }
+                }
+                Err(error) => AddBlockBatchResult {
+                    block: None,
+                    error: Some(error.to_string()),
+                },
+            });
         }
 
-        let rep_header = AddBlocksBatchResponse { blocks: results };
+        let rep_header = AddBlocksBatchResponse {
+            blocks: Vec::new(),
+            results,
+        };
         ctx.response_buf(rep_header, &mut self.buf)
     }
 
     pub fn complete_files_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: CompleteFilesBatchRequest = ctx.parse_header()?;
 
-        let mut results = Vec::new();
+        let mut details = Vec::with_capacity(header.requests.len());
         for req in header.requests {
             let commit_blocks = req
                 .commit_blocks
                 .into_iter()
                 .map(ProtoUtils::commit_block_from_pb)
                 .collect();
-            let result = self
-                .fs
-                .complete_file(
-                    req.path,
-                    req.inode_id,
-                    req.len,
-                    commit_blocks,
-                    req.client_name,
-                    req.only_flush,
-                )
-                .is_ok();
-            results.push(result);
+            let result = self.fs.complete_file(
+                req.path,
+                req.inode_id,
+                req.len,
+                commit_blocks,
+                req.client_name,
+                req.only_flush,
+            );
+            details.push(match result {
+                Ok(_) => CompleteFileBatchResult {
+                    success: true,
+                    error: None,
+                },
+                Err(error) => CompleteFileBatchResult {
+                    success: false,
+                    error: Some(error.to_string()),
+                },
+            });
         }
 
-        let rep_header = CompleteFilesBatchResponse { results };
+        let rep_header = CompleteFilesBatchResponse {
+            results: Vec::new(),
+            details,
+        };
         ctx.response_buf(rep_header, &mut self.buf)
     }
 

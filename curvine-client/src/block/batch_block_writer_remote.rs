@@ -18,7 +18,6 @@ use curvine_common::fs::Path;
 use curvine_common::state::{ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use orpc::common::Utils;
-use orpc::err_box;
 
 pub struct BatchBlockWriterRemote {
     blocks: Vec<ExtendedBlock>,
@@ -36,33 +35,58 @@ impl BatchBlockWriterRemote {
         blocks: Vec<ExtendedBlock>,
         worker_address: WorkerAddress,
         pos: i64,
-    ) -> FsResult<Self> {
+    ) -> FsResult<(Self, Vec<bool>)> {
         let req_id = Utils::req_id();
         let seq_id = 0;
         let block_size = fs_context.block_size();
 
         let client = fs_context.block_client(&worker_address).await?;
-        let write_context = client
+        let write_context = match client
             .write_blocks_batch(
                 &blocks,
                 0,
                 block_size,
                 req_id,
-                fs_context.write_chunk_size() as i32,
+                seq_id,
                 fs_context.write_chunk_size() as i32,
                 false,
             )
-            .await?;
-
-        for context in &write_context.contexts {
-            if block_size != context.block_size {
-                return err_box!(
-                    "Abnormal block size, expected length {}, actual length {}",
-                    block_size,
-                    context.block_size
-                );
+            .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                let cancels = vec![true; blocks.len()];
+                if let Err(cancel_error) = client
+                    .write_commit_batch(&blocks, pos, block_size, req_id, seq_id + 1, &cancels)
+                    .await
+                {
+                    log::warn!(
+                        "failed to cancel remote batch blocks after open error: {}",
+                        cancel_error
+                    );
+                }
+                return Err(error);
             }
-        }
+        };
+
+        let open_results = write_context
+            .into_iter()
+            .map(|result| match result {
+                Ok(context) if block_size == context.block_size => true,
+                Ok(context) => {
+                    log::warn!(
+                        "abnormal batch block size, expected {}, actual {}",
+                        block_size,
+                        context.block_size
+                    );
+                    false
+                }
+                Err(error) => {
+                    log::warn!("failed to open remote batch block: {}", error);
+                    false
+                }
+            })
+            .collect();
 
         let writer = Self {
             blocks,
@@ -74,7 +98,7 @@ impl BatchBlockWriterRemote {
             block_size,
         };
 
-        Ok(writer)
+        Ok((writer, open_results))
     }
 
     fn next_seq_id(&mut self) -> i32 {
@@ -83,34 +107,25 @@ impl BatchBlockWriterRemote {
     }
 
     // Write data.
-    pub async fn write(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {
+    pub async fn write(&mut self, files: &[(&Path, &str)]) -> FsResult<Vec<bool>> {
         let next_seq_id = self.next_seq_id();
 
-        // Send all files in one RPC call
-        self.client
+        let results = self
+            .client
             .write_files_batch(files, self.req_id, next_seq_id)
             .await?;
 
-        for (i, (_, content)) in files.iter().enumerate() {
-            if i < self.blocks.len() {
+        for (i, ((_, content), success)) in files.iter().zip(results.iter()).enumerate() {
+            if *success && i < self.blocks.len() {
                 let file_len = content.len() as i64;
                 self.blocks[i].len = file_len;
             }
         }
-        Ok(())
-    }
-
-    pub async fn flush(&mut self) -> FsResult<()> {
-        let next_seq_id = self.next_seq_id();
-        self.client
-            .write_flush(self.pos, self.req_id, next_seq_id)
-            .await?;
-
-        Ok(())
+        Ok(results)
     }
 
     // Write complete
-    pub async fn complete(&mut self) -> FsResult<()> {
+    pub async fn complete(&mut self, cancels: &[bool]) -> FsResult<Vec<bool>> {
         let next_seq_id = self.next_seq_id();
         self.client
             .write_commit_batch(
@@ -119,10 +134,9 @@ impl BatchBlockWriterRemote {
                 self.block_size,
                 self.req_id,
                 next_seq_id,
-                false,
+                cancels,
             )
-            .await?;
-        Ok(())
+            .await
     }
 
     pub fn worker_address(&self) -> &WorkerAddress {

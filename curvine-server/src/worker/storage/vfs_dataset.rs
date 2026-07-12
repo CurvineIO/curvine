@@ -433,6 +433,20 @@ mod test {
         Ok(())
     }
     #[test]
+    fn abort_releases_reserved_space_and_removes_block() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "abort-release");
+        let block = ExtendedBlock::with_mem(1, "100B")?;
+        let initial_available = ds.available();
+        ds.open_block(&block)?;
+        assert_eq!(ds.available(), initial_available - 100);
+
+        ds.abort_block(&block)?;
+
+        assert_eq!(ds.available(), initial_available);
+        assert!(ds.get_block(block.id).is_none());
+        Ok(())
+    }
+    #[test]
     fn append() -> CommonResult<()> {
         let mut ds = create_data_set(true, "append");
         let mut block = ExtendedBlock::with_mem(1, "100B")?;

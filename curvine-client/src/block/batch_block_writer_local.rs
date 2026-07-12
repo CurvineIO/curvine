@@ -8,7 +8,6 @@ use orpc::common::Utils;
 use orpc::io::LocalFile;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::RawPtr;
-use orpc::try_option;
 use std::sync::Arc;
 
 pub struct BatchBlockWriterLocal {
@@ -16,7 +15,7 @@ pub struct BatchBlockWriterLocal {
     blocks: Vec<ExtendedBlock>,
     worker_address: WorkerAddress,
     client: BlockClient,
-    files: Vec<RawPtr<LocalFile>>,
+    files: Vec<Option<RawPtr<LocalFile>>>,
     block_size: i64,
     pos: i64,
     req_id: i64,
@@ -28,13 +27,13 @@ impl BatchBlockWriterLocal {
         blocks: Vec<ExtendedBlock>,
         worker_address: WorkerAddress,
         pos: i64,
-    ) -> FsResult<Self> {
+    ) -> FsResult<(Self, Vec<bool>)> {
         let req_id = Utils::req_id();
         let block_size = fs_context.block_size();
         let client = fs_context.block_client(&worker_address).await?;
 
         // SINGLE RPC call to setup multiple blocks
-        let write_context = client
+        let write_context = match client
             .write_blocks_batch(
                 &blocks,
                 0,
@@ -44,32 +43,72 @@ impl BatchBlockWriterLocal {
                 fs_context.write_chunk_size() as i32,
                 true,
             )
-            .await?;
+            .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                let cancels = vec![true; blocks.len()];
+                if let Err(cancel_error) = client
+                    .write_commit_batch(&blocks, 0, block_size, req_id, 1, &cancels)
+                    .await
+                {
+                    log::warn!(
+                        "failed to cancel local batch blocks after open error: {}",
+                        cancel_error
+                    );
+                }
+                return Err(error);
+            }
+        };
 
-        // Create multiple files, one for each block context
-        let mut files = Vec::new();
-        for context in &write_context.contexts {
-            let path = try_option!(&context.path);
-            let file = LocalFile::with_write_offset(path, false, pos)?;
-            files.push(RawPtr::from_owned(file));
+        let mut files = Vec::with_capacity(write_context.len());
+        let mut results = Vec::with_capacity(write_context.len());
+        for result in write_context {
+            let file = match result {
+                Ok(context) => match context.path.as_deref() {
+                    Some(path) => match LocalFile::with_write_offset(path, false, pos) {
+                        Ok(file) => Some(RawPtr::from_owned(file)),
+                        Err(error) => {
+                            log::warn!("failed to open local batch file {}: {}", path, error);
+                            None
+                        }
+                    },
+                    None => {
+                        log::warn!("local batch open response is missing a file path");
+                        None
+                    }
+                },
+                Err(error) => {
+                    log::warn!("failed to open local batch block: {}", error);
+                    None
+                }
+            };
+            results.push(file.is_some());
+            files.push(file);
         }
 
-        Ok(Self {
-            rt: fs_context.clone_runtime(),
-            blocks,
-            worker_address,
-            client,
-            files,
-            block_size,
-            pos: 0,
-            req_id,
-        })
+        Ok((
+            Self {
+                rt: fs_context.clone_runtime(),
+                blocks,
+                worker_address,
+                client,
+                files,
+                block_size,
+                pos: 0,
+                req_id,
+            },
+            results,
+        ))
     }
 
     // SINGLE RPC call to complete all blocks
-    pub async fn complete(&mut self) -> FsResult<()> {
-        // flush before commit
-        self.flush().await?;
+    pub async fn complete(&mut self, cancels: &[bool]) -> FsResult<Vec<bool>> {
+        for (file, cancel) in self.files.iter_mut().zip(cancels.iter()) {
+            if *cancel {
+                file.take();
+            }
+        }
         self.client
             .write_commit_batch(
                 &self.blocks,
@@ -77,31 +116,62 @@ impl BatchBlockWriterLocal {
                 self.block_size,
                 self.req_id,
                 0,
-                false,
+                cancels,
             )
             .await
     }
 
-    pub async fn flush(&mut self) -> FsResult<()> {
-        for file in &mut self.files {
+    /// Flush only still-active short-circuit files before mixed commit/cancel.
+    /// Inactive or already-failed items are reported as `false` without flushing.
+    pub async fn flush_active(&mut self, active: &[bool]) -> FsResult<Vec<bool>> {
+        if active.len() != self.files.len() {
+            return orpc::err_box!(
+                "batch local flush count mismatch, active={}, files={}",
+                active.len(),
+                self.files.len()
+            );
+        }
+        let mut results = Vec::with_capacity(self.files.len());
+        for (file, active) in self.files.iter_mut().zip(active.iter()) {
+            let Some(file) = file else {
+                results.push(false);
+                continue;
+            };
+            if !active {
+                results.push(false);
+                continue;
+            }
             let file_clone = file.clone();
-            self.rt
+            let result = self
+                .rt
                 .spawn_blocking(move || {
                     file_clone.as_mut().flush()?;
                     Ok::<(), FsError>(())
                 })
-                .await??;
+                .await?;
+            results.push(result.is_ok());
         }
-        Ok(())
+        Ok(results)
     }
 
     pub fn worker_address(&self) -> &WorkerAddress {
         &self.worker_address
     }
 
-    pub async fn write(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {
+    pub async fn write(&mut self, files: &[(&Path, &str)]) -> FsResult<Vec<bool>> {
+        if files.len() != self.files.len() {
+            return orpc::err_box!(
+                "batch local write count mismatch, request={}, files={}",
+                files.len(),
+                self.files.len()
+            );
+        }
+        let mut results = Vec::with_capacity(files.len());
         for (index, file) in files.iter().enumerate() {
-            let local_file = self.files[index].clone();
+            let Some(local_file) = self.files[index].clone() else {
+                results.push(false);
+                continue;
+            };
             let current_pos = file.1.len() as i64;
             let content_owned = file.1.to_string();
             let handle = self.rt.spawn_blocking(move || {
@@ -109,14 +179,13 @@ impl BatchBlockWriterLocal {
                 local_file.as_mut().write_all(&bytes_content)?;
                 Ok::<(), FsError>(())
             });
-            handle.await??;
-
-            // update length of block
-            if current_pos > self.blocks[index].len {
+            let result = handle.await?;
+            if result.is_ok() && current_pos > self.blocks[index].len {
                 self.blocks[index].len = current_pos;
             }
+            results.push(result.is_ok());
         }
 
-        Ok(())
+        Ok(results)
     }
 }

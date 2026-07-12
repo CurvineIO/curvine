@@ -13,7 +13,10 @@
 // limitations under the License.
 
 use crate::block::BatchBlockWriter;
-use crate::file::{FsClient, FsContext, FsReader, FsWriter, FsWriterBase};
+use crate::file::{
+    BatchAddBlockRequest, BatchCompleteFileRequest, FsClient, FsContext, FsReader, FsWriter,
+    FsWriterBase,
+};
 use crate::ClientMetrics;
 use async_stream::stream;
 use bytes::BytesMut;
@@ -21,11 +24,11 @@ use curvine_common::alloc::allocator_type_name;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, FsKind, ListStream, Path, Reader, Writer};
-use curvine_common::state::{CommitBlock, FreeResult, ListOptions};
 use curvine_common::state::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
     MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
 };
+use curvine_common::state::{FreeResult, ListOptions};
 use curvine_common::utils::ProtoUtils;
 use curvine_common::version::GIT_VERSION;
 use curvine_common::FsResult;
@@ -42,6 +45,13 @@ use tokio::time::timeout;
 pub struct CurvineFileSystem {
     pub(crate) fs_context: Arc<FsContext>,
     pub(crate) fs_client: Arc<FsClient>,
+}
+
+struct BatchFileItem<'a> {
+    index: usize,
+    path: &'a Path,
+    content: &'a str,
+    inode_id: i64,
 }
 
 impl CurvineFileSystem {
@@ -390,45 +400,94 @@ impl CurvineFileSystem {
         }
     }
 
-    pub async fn write_batch_string(&self, files: &[(Path, &str)]) -> FsResult<()> {
+    pub async fn write_batch_string(&self, files: &[(Path, &str)]) -> FsResult<Vec<FsResult<()>>> {
         let chunk_size = self.fs_context().write_chunk_size();
         let mut batch = Vec::with_capacity(files.len());
         let mut batch_memory = 0;
+        let mut results: Vec<Option<FsResult<()>>> =
+            std::iter::repeat_with(|| None).take(files.len()).collect();
 
-        for (path, content) in files.iter() {
+        for (index, (path, content)) in files.iter().enumerate() {
             let content_size: usize = content.len();
 
             if content_size >= chunk_size {
-                self.write_string(path, content.to_string()).await?;
+                if !batch.is_empty() {
+                    self.collect_batch_file_results(&batch, &mut results).await;
+                    batch.clear();
+                    batch_memory = 0;
+                }
+                results[index] = Some(self.write_string(path, *content).await);
                 continue;
             }
 
             if batch_memory + content_size > chunk_size {
-                self.handle_batch_files(&batch).await?;
+                self.collect_batch_file_results(&batch, &mut results).await;
                 batch.clear();
                 batch_memory = 0;
             }
 
-            batch.push((path, content));
+            batch.push((index, path, *content));
             batch_memory += content_size;
         }
 
-        // Final flush
         if !batch.is_empty() {
-            self.handle_batch_files(&batch).await?;
+            self.collect_batch_file_results(&batch, &mut results).await;
         }
 
-        Ok(())
+        Ok(results
+            .into_iter()
+            .enumerate()
+            .map(|(index, result)| {
+                result.unwrap_or_else(|| {
+                    Err(FsError::common(format!(
+                        "missing batch write outcome for {} at index {}",
+                        files[index].0.encode(),
+                        index
+                    )))
+                })
+            })
+            .collect())
     }
 
-    async fn handle_batch_files(&self, files: &[(&Path, &str)]) -> FsResult<()> {
+    async fn collect_batch_file_results(
+        &self,
+        files: &[(usize, &Path, &str)],
+        outcomes: &mut [Option<FsResult<()>>],
+    ) {
+        let Err(error) = self.handle_batch_files(files, outcomes).await else {
+            return;
+        };
+        let error = error.to_string();
+        Self::record_batch_file_error(files, outcomes, &error);
+    }
+
+    fn record_batch_file_error(
+        files: &[(usize, &Path, &str)],
+        outcomes: &mut [Option<FsResult<()>>],
+        error: &str,
+    ) {
+        for (index, path, _content) in files {
+            if outcomes[*index].is_none() {
+                outcomes[*index] = Some(Err(FsError::common(format!(
+                    "failed to write batch file {}: {}",
+                    path.encode(),
+                    error
+                ))));
+            }
+        }
+    }
+
+    async fn handle_batch_files(
+        &self,
+        files: &[(usize, &Path, &str)],
+        outcomes: &mut [Option<FsResult<()>>],
+    ) -> FsResult<()> {
         if files.is_empty() {
             return Ok(());
         }
 
-        // Step 1: Batch create files
         let mut create_requests = Vec::with_capacity(files.len());
-        for (path, _) in files {
+        for (_index, path, _content) in files {
             let opts = self.create_opts_builder().create_parent(true).build();
             let flags = OpenFlags::new_write_only()
                 .set_create(true)
@@ -436,44 +495,110 @@ impl CurvineFileSystem {
             create_requests.push((path.encode(), opts, flags));
         }
 
-        let file_statuses = self.fs_client().create_files_batch(create_requests).await?;
-
-        // Step 2: Batch allocate blocks
-        let mut add_block_requests = Vec::with_capacity(file_statuses.len());
-        for ((path, _content), _status) in files.iter().zip(file_statuses.iter()) {
-            add_block_requests.push(path.encode());
+        let create_results = self.fs_client().create_files_batch(create_requests).await?;
+        let mut created = Vec::new();
+        for ((index, path, content), result) in files.iter().zip(create_results.into_iter()) {
+            match result {
+                Ok(status) => created.push(BatchFileItem {
+                    index: *index,
+                    path,
+                    content,
+                    inode_id: status.id,
+                }),
+                Err(error) => {
+                    outcomes[*index] = Some(Err(FsError::common(format!(
+                        "failed to create batch file {}: {}",
+                        path.encode(),
+                        error
+                    ))));
+                }
+            }
+        }
+        if created.is_empty() {
+            return Ok(());
         }
 
-        let allocated_blocks: Vec<curvine_common::state::LocatedBlock> = self
+        let add_block_requests = created
+            .iter()
+            .map(|item| BatchAddBlockRequest {
+                path: item.path.encode(),
+                inode_id: item.inode_id,
+            })
+            .collect();
+        let add_results = self
             .fs_client()
             .add_blocks_batch(add_block_requests)
             .await?;
-
-        // The allocated blocks should correspond to the add_block_requests sent above.
-        let mut batch_writer =
-            BatchBlockWriter::new(self.fs_context.clone(), allocated_blocks).await?;
-
-        // Write all data (no flushing yet)
-        batch_writer.write(files).await?;
-
-        // Step 4: Complete all files at worker side
-        let commit_blocks = batch_writer.complete().await?;
-
-        // Step 5: Batch complete at master side
-        let mut complete_requests: Vec<(String, i64, Vec<CommitBlock>, String, bool)> =
-            Vec::with_capacity(files.len());
-        for ((path, content), commit_block) in files.iter().zip(commit_blocks.iter()) {
-            complete_requests.push((
-                path.encode(),
-                content.len() as i64,
-                vec![commit_block.clone()],
-                self.fs_context().clone_client_name(),
-                false,
-            ));
+        let mut worker_items = Vec::new();
+        let mut located_blocks = Vec::new();
+        for (item, result) in created.into_iter().zip(add_results.into_iter()) {
+            match result {
+                Ok(block) => {
+                    worker_items.push(item);
+                    located_blocks.push(block);
+                }
+                Err(error) => {
+                    outcomes[item.index] = Some(Err(FsError::common(format!(
+                        "failed to allocate block for {}: {}",
+                        item.path.encode(),
+                        error
+                    ))));
+                }
+            }
         }
-        self.fs_client()
+        if worker_items.is_empty() {
+            return Ok(());
+        }
+
+        let worker_files: Vec<(&Path, &str)> = worker_items
+            .iter()
+            .map(|item| (item.path, item.content))
+            .collect();
+        let mut batch_writer =
+            BatchBlockWriter::new(self.fs_context.clone(), located_blocks).await?;
+        batch_writer.write(&worker_files).await?;
+        let worker_results = batch_writer.complete().await;
+
+        let mut complete_requests = Vec::new();
+        let mut complete_indices = Vec::new();
+        for (item, commit_block) in worker_items.iter().zip(worker_results.into_iter()) {
+            match commit_block {
+                Some(commit_block) => {
+                    complete_requests.push(BatchCompleteFileRequest {
+                        path: item.path.encode(),
+                        inode_id: item.inode_id,
+                        len: item.content.len() as i64,
+                        commit_blocks: vec![commit_block],
+                        client_name: self.fs_context().clone_client_name(),
+                        only_flush: false,
+                    });
+                    complete_indices.push((item.index, item.path));
+                }
+                None => {
+                    outcomes[item.index] = Some(Err(FsError::common(format!(
+                        "failed to complete worker blocks for {}",
+                        item.path.encode()
+                    ))));
+                }
+            }
+        }
+        if complete_requests.is_empty() {
+            return Ok(());
+        }
+
+        let complete_results = self
+            .fs_client()
             .complete_files_batch(complete_requests)
             .await?;
+        for ((index, path), result) in complete_indices.into_iter().zip(complete_results) {
+            outcomes[index] = Some(result.map_err(|error| {
+                FsError::common(format!(
+                    "failed to complete batch file {}: {}",
+                    path.encode(),
+                    error
+                ))
+            }));
+        }
         Ok(())
     }
 }
@@ -542,5 +667,40 @@ impl FileSystem<FsWriter, FsReader> for CurvineFileSystem {
 
     async fn list_stream(&self, path: &Path, opts: ListOptions) -> FsResult<ListStream> {
         self.list_stream(path, opts).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_error_preserves_results_from_other_items() {
+        let item_error = Path::from("/item-error");
+        let batch_error = Path::from("/batch-error");
+        let files = [(1, &item_error, "b"), (2, &batch_error, "c")];
+        let mut outcomes = vec![
+            Some(Ok(())),
+            Some(Err(FsError::common("specific item error"))),
+            None,
+        ];
+
+        CurvineFileSystem::record_batch_file_error(&files, &mut outcomes, "worker unavailable");
+
+        assert!(outcomes[0].as_ref().unwrap().is_ok());
+        assert!(outcomes[1]
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("specific item error"));
+        assert!(outcomes[2]
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("worker unavailable"));
     }
 }

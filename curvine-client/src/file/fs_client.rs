@@ -29,6 +29,20 @@ use prost::Message as PMessage;
 use std::collections::LinkedList;
 use std::sync::Arc;
 
+pub struct BatchAddBlockRequest {
+    pub path: String,
+    pub inode_id: i64,
+}
+
+pub struct BatchCompleteFileRequest {
+    pub path: String,
+    pub inode_id: i64,
+    pub len: i64,
+    pub commit_blocks: Vec<CommitBlock>,
+    pub client_name: String,
+    pub only_flush: bool,
+}
+
 #[derive(Clone)]
 pub struct FsClient {
     context: Arc<FsContext>,
@@ -75,7 +89,8 @@ impl FsClient {
     pub async fn create_files_batch(
         &self,
         requests: Vec<(String, CreateFileOpts, OpenFlags)>,
-    ) -> FsResult<Vec<FileStatus>> {
+    ) -> FsResult<Vec<Result<FileStatus, String>>> {
+        let expected = requests.len();
         let pb_requests: Vec<CreateFileRequest> = requests
             .into_iter()
             .map(|(path, opts, flags)| CreateFileRequest {
@@ -90,10 +105,26 @@ impl FsClient {
         };
 
         let rep: CreateFilesBatchResponse = self.rpc(RpcCode::CreateFilesBatch, header).await?;
+        if rep.results.len() != expected {
+            return err_box!(
+                "create batch result count mismatch, expected {}, actual {}",
+                expected,
+                rep.results.len()
+            );
+        }
         Ok(rep
-            .file_statuses
+            .results
             .into_iter()
-            .map(ProtoUtils::file_status_from_pb)
+            .map(|result| {
+                result
+                    .file_status
+                    .map(ProtoUtils::file_status_from_pb)
+                    .ok_or_else(|| {
+                        result
+                            .error
+                            .unwrap_or_else(|| "create file failed".to_string())
+                    })
+            })
             .collect())
     }
 
@@ -321,20 +352,24 @@ impl FsClient {
         Ok(locate_block)
     }
 
-    pub async fn add_blocks_batch(&self, requests: Vec<String>) -> FsResult<Vec<LocatedBlock>> {
+    pub async fn add_blocks_batch(
+        &self,
+        requests: Vec<BatchAddBlockRequest>,
+    ) -> FsResult<Vec<Result<LocatedBlock, String>>> {
+        let expected = requests.len();
         let pb_requests: Vec<AddBlockRequest> = requests
             .into_iter()
-            .map(|path| {
+            .map(|request| {
                 let commit_blocks: Vec<CommitBlockProto> = Vec::new();
                 AddBlockRequest {
-                    path,
+                    path: request.path,
                     commit_blocks,
                     exclude_workers: self.context.exclude_workers(),
                     located: true,
                     client_address: self.context.client_addr_pb(),
                     file_len: 0,
                     last_block: None,
-                    inode_id: None,
+                    inode_id: Some(request.inode_id),
                 }
             })
             .collect();
@@ -343,10 +378,26 @@ impl FsClient {
             requests: pb_requests,
         };
         let rep: AddBlocksBatchResponse = self.rpc(RpcCode::AddBlocksBatch, header).await?;
+        if rep.results.len() != expected {
+            return err_box!(
+                "add block batch result count mismatch, expected {}, actual {}",
+                expected,
+                rep.results.len()
+            );
+        }
         Ok(rep
-            .blocks
+            .results
             .into_iter()
-            .map(ProtoUtils::located_block_from_pb)
+            .map(|result| {
+                result
+                    .block
+                    .map(ProtoUtils::located_block_from_pb)
+                    .ok_or_else(|| {
+                        result
+                            .error
+                            .unwrap_or_else(|| "add block failed".to_string())
+                    })
+            })
             .collect())
     }
 
@@ -403,22 +454,24 @@ impl FsClient {
 
     pub async fn complete_files_batch(
         &self,
-        requests: Vec<(String, i64, Vec<CommitBlock>, String, bool)>,
-    ) -> FsResult<Vec<bool>> {
+        requests: Vec<BatchCompleteFileRequest>,
+    ) -> FsResult<Vec<Result<(), String>>> {
+        let expected = requests.len();
         let pb_requests: Vec<CompleteFileRequest> = requests
             .into_iter()
-            .map(|(path, len, commit_blocks, client_name, only_flush)| {
-                let commit_blocks = commit_blocks
+            .map(|request| {
+                let commit_blocks = request
+                    .commit_blocks
                     .into_iter()
                     .map(ProtoUtils::commit_block_to_pb)
                     .collect();
                 CompleteFileRequest {
-                    path,
-                    len,
-                    client_name,
+                    path: request.path,
+                    len: request.len,
+                    client_name: request.client_name,
                     commit_blocks,
-                    only_flush,
-                    inode_id: None,
+                    only_flush: request.only_flush,
+                    inode_id: Some(request.inode_id),
                 }
             })
             .collect();
@@ -428,7 +481,26 @@ impl FsClient {
         };
 
         let rep: CompleteFilesBatchResponse = self.rpc(RpcCode::CompleteFilesBatch, header).await?;
-        Ok(rep.results)
+        if rep.details.len() != expected {
+            return err_box!(
+                "complete batch result count mismatch, expected {}, actual {}",
+                expected,
+                rep.details.len()
+            );
+        }
+        Ok(rep
+            .details
+            .into_iter()
+            .map(|result| {
+                if result.success {
+                    Ok(())
+                } else {
+                    Err(result
+                        .error
+                        .unwrap_or_else(|| "complete file failed".to_string()))
+                }
+            })
+            .collect())
     }
 
     pub async fn get_block_locations(&self, path: &Path) -> FsResult<FileBlocks> {
