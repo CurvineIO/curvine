@@ -496,7 +496,7 @@ impl UnifiedFileSystem {
         let mut write_path = path.path().to_owned();
 
         let fut = async {
-            let rpc_code = if flags.read_only() {
+            let rpc_code = if flags.read_only() && !flags.create() {
                 RpcCode::OpenFile
             } else {
                 RpcCode::CreateFile

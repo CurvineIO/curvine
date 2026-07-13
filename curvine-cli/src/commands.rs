@@ -31,6 +31,10 @@ pub enum Commands {
     #[command(name = "load")]
     Load(LoadCommand),
 
+    /// Exporting Curvine files to mounted UFS
+    #[command(name = "export")]
+    Export(ExportCommand),
+
     /// Query loading task status
     #[command(name = "load-status")]
     LoadStatus(LoadStatusCommand),

@@ -97,32 +97,74 @@ impl LoadJobRunner {
         cv_source_mode: CvSourceMode,
     ) -> FsResult<(JobContext, Path, Path)> {
         let command_source = Path::from_str(&command.source_path)?;
-        let (source_path, target_path) = match (cv_source_mode, command_source.is_cv()) {
-            (CvSourceMode::LoadUfsOnlyFromUfs, false) => {
-                let target_path = mnt.get_cv_path(&command_source)?;
-                (command_source, target_path)
-            }
-            (CvSourceMode::LoadUfsOnlyFromUfs, true) => {
-                let status = self.master_fs.file_status(command_source.path())?;
-                if !status.storage_policy.ufs_only() {
+        let command_target = match command.target_path.as_ref() {
+            Some(target_path) => Some(Path::from_str(target_path)?),
+            None => None,
+        };
+
+        let (source_path, target_path) =
+            match (cv_source_mode, command_source.is_cv(), command_target) {
+                (CvSourceMode::LoadUfsOnlyFromUfs, false, Some(target_path)) => {
+                    if !target_path.is_cv() {
+                        return err_box!(
+                            "load job target path {} must be a CV path",
+                            target_path.full_path()
+                        );
+                    }
+
+                    let mounted_target = mnt.get_cv_path(&command_source)?;
+                    if mounted_target != target_path {
+                        let requested = target_path.full_path();
+                        let mounted = mounted_target.full_path();
+                        let source = command_source.full_path();
+                        return err_box!(
+                        "load job target path {} does not match mounted CV path {} for source {}",
+                        requested,
+                        mounted,
+                        source
+                    );
+                    }
+
+                    (command_source, target_path)
+                }
+                (CvSourceMode::LoadUfsOnlyFromUfs, false, None) => {
+                    let target_path = mnt.get_cv_path(&command_source)?;
+                    (command_source, target_path)
+                }
+                (CvSourceMode::LoadUfsOnlyFromUfs, true, Some(_)) => {
+                    let source = command_source.full_path();
                     return err_box!(
-                        "load job for CV path {} requires UFS-only metadata",
+                    "load job with explicit target requires a UFS source path, got CV source {}",
+                    source
+                );
+                }
+                (CvSourceMode::LoadUfsOnlyFromUfs, true, None) => {
+                    let status = self.master_fs.file_status(command_source.path())?;
+                    if !status.is_dir && !status.storage_policy.ufs_exists() {
+                        return err_box!(
+                            "load job for CV path {} requires UFS-backed metadata",
+                            command_source.full_path()
+                        );
+                    }
+                    (mnt.get_ufs_path(&command_source)?, command_source)
+                }
+                (CvSourceMode::ExportCurvineToUfs, true, Some(_)) => {
+                    return err_box!(
+                        "export job source path {} does not accept an explicit target path",
                         command_source.full_path()
                     );
                 }
-                (mnt.get_ufs_path(&command_source)?, command_source)
-            }
-            (CvSourceMode::ExportCurvineToUfs, true) => {
-                let target_path = mnt.get_ufs_path(&command_source)?;
-                (command_source, target_path)
-            }
-            (CvSourceMode::ExportCurvineToUfs, false) => {
-                return err_box!(
-                    "export job source path {} must be a CV path",
-                    command_source.full_path()
-                );
-            }
-        };
+                (CvSourceMode::ExportCurvineToUfs, true, None) => {
+                    let target_path = mnt.get_ufs_path(&command_source)?;
+                    (command_source, target_path)
+                }
+                (CvSourceMode::ExportCurvineToUfs, false, _) => {
+                    return err_box!(
+                        "export job source path {} must be a CV path",
+                        command_source.full_path()
+                    );
+                }
+            };
         let job_id = CommonUtils::create_job_id(source_path.full_path());
         let run_id = self.next_run_id();
         let job_context = JobContext::with_conf(

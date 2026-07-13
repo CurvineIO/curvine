@@ -85,9 +85,21 @@ impl BlockClient {
         self.uptime = LocalTime::mills();
     }
 
+    pub fn is_active(&self) -> bool {
+        self.client
+            .as_ref()
+            .is_some_and(|client| client.is_active())
+    }
+
     pub async fn rpc(&self, msg: Message) -> FsResult<Message> {
         let client = try_option_ref!(self.client);
-        let rep_msg = client.timeout_rpc(self.timeout, msg).await?;
+        let rep_msg = match client.timeout_rpc(self.timeout, msg).await {
+            Ok(rep_msg) => rep_msg,
+            Err(err) => {
+                client.set_closed();
+                return Err(FsError::from(err));
+            }
+        };
         match rep_msg.check_error_ext::<FsError>() {
             Ok(_) => Ok(rep_msg),
             Err(e) => Err(e.ctx(format!("rpc failed to worker {}", self.worker_addr))),

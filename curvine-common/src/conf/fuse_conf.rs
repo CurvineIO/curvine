@@ -35,8 +35,8 @@ use std::time::Duration;
 //    These trade metadata freshness for fewer upcalls into user space.
 //
 // 2. User-side caching (maintained inside curvine-fuse itself):
-//    - `enable_meta_cache` / `meta_cache_capacity` / `meta_cache_timeout` -> the
-//      bounded metadata cache backed by `MetaCache` (capacity IS enforced).
+//    - `enable_meta_cache` / `meta_cache_timeout` -> the userspace metadata
+//      cache (inode validity / directory-scan results) kept in `NodeState`.
 //    - `meta_cache_ttl` (derived from `meta_cache_timeout` in `init()`) -> TTL
 //      for metadata cache entries.
 //    - `node_cache_timeout` -> TTL-based eviction of the inode/node map.
@@ -86,7 +86,11 @@ pub struct FuseConf {
     pub mnt_number: usize,
 
     // How many tasks can be read and write data at each mount point.
-    pub mnt_per_task: usize,
+    // `mnt_per_task` alias kept for backward compatibility with pre-rename TOML
+    // configs (issue #1023 §2); without it `#[serde(default)]` would silently
+    // drop the old key and fall back to the default.
+    #[serde(alias = "mnt_per_task")]
+    pub tasks_per_mnt: usize,
 
     // Whether to enable the clone fd feature
     pub clone_fd: bool,
@@ -233,12 +237,6 @@ impl FuseConf {
     /// Default umask applied to file-system-generated permission bits (octal 022).
     pub const DEFAULT_UMASK: u32 = 0o22;
 
-    pub const MAX_READ: u32 = 128 * 1024;
-
-    pub const MAX_WRITE: u32 = 128 * 1024;
-
-    pub const MAX_READ_AHEAD: u32 = 128 * 1024;
-
     /// Default FUSE BDI readahead window: 1 MiB (`1024` KB).
     pub const DEFAULT_MAX_READAHEAD_KB: u32 = 1024;
 
@@ -249,8 +247,8 @@ impl FuseConf {
         self.node_cache_ttl = DurationUnit::from_str(&self.node_cache_timeout)?.as_duration();
         self.meta_cache_ttl = DurationUnit::from_str(&self.meta_cache_timeout)?.as_duration();
 
-        if self.mnt_per_task == 0 {
-            self.mnt_per_task = self.io_threads;
+        if self.tasks_per_mnt == 0 {
+            self.tasks_per_mnt = self.io_threads;
         }
 
         let fs_path = Path::from_str(&self.fs_path)?;
@@ -373,7 +371,7 @@ impl Default for FuseConf {
             mnt_path: "/curvine-fuse".to_string(),
             fs_path: "/".to_string(),
             mnt_number: 1,
-            mnt_per_task: 0,
+            tasks_per_mnt: 0,
             clone_fd: true,
             fuse_channel_size: 0,
             stream_channel_size: 0,
@@ -543,5 +541,20 @@ node_cache_size = 200000
         let conf: FuseConf =
             toml::from_str(toml).expect("legacy node_cache_size key must be ignored, not rejected");
         assert_eq!(conf.io_threads, 16);
+    }
+
+    #[test]
+    fn toml_legacy_mnt_per_task_alias_preserved() {
+        // mnt_per_task was renamed to tasks_per_mnt (issue #1023 §2). FuseConf is
+        // #[serde(default)] without deny_unknown_fields, so without a serde alias the
+        // old key would be silently dropped and fall back to the default (0 ->
+        // io_threads) — a silent behavioral regression. The alias must preserve the
+        // user-set value.
+        let toml = r#"
+mnt_per_task = 7
+"#;
+        let conf: FuseConf =
+            toml::from_str(toml).expect("legacy mnt_per_task key must deserialize via alias");
+        assert_eq!(conf.tasks_per_mnt, 7);
     }
 }

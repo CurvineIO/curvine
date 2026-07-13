@@ -13,10 +13,7 @@ clap = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_with = { workspace = true }
-num-bigint = { workspace = true }
-bigdecimal = { workspace = true }
 chrono = { workspace = true }
 bytes = { workspace = true }
-reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false}
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false}
 comfy-table = { version = "7.2.2", default-features = false }

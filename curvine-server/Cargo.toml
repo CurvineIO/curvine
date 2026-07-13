@@ -19,7 +19,6 @@ curvine-client = { workspace = true }
 curvine-ufs = { workspace = true }
 curvine-web = { workspace = true }
 prost = { workspace = true }
-prost-build = { workspace = true }
 bincode = { workspace = true }
 serde = { workspace = true }
 rocksdb = { workspace = true }
@@ -29,7 +28,6 @@ once_cell = { workspace = true }
 tokio = { workspace = true }
 glob = { workspace = true }
 futures = { workspace = true }
-tokio-util = { workspace = true }
 toml = { workspace = true }
 num_enum = { workspace = true }
 indexmap = { workspace = true }

@@ -11,14 +11,12 @@ orpc = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 async-stream =  { workspace = true }
-tokio-util = { workspace = true }
+bytes = { workspace = true }
 log = { workspace = true }
 raft = { workspace = true }
 prost = { workspace = true }
-prost-build = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_with = { workspace = true }
 clap = { workspace = true }
 toml = { workspace = true }
 once_cell = { workspace = true }
@@ -53,15 +51,9 @@ mimalloc = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true }
-tikv-jemalloc-ctl = { workspace = true, optional = true }
-tikv-jemalloc-sys = { workspace = true, optional = true }
 
 [features]
-jemalloc = [
-    "dep:tikv-jemallocator",
-    "dep:tikv-jemalloc-ctl",
-    "dep:tikv-jemalloc-sys",
-]
+jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
 system = []
 

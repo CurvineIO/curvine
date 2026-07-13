@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::block::BlockClient;
 use crate::file::FsContext;
 use curvine_common::error::FsError;
 use curvine_common::state::{ExtendedBlock, WorkerAddress};
@@ -25,7 +26,7 @@ use std::sync::Arc;
 
 pub struct BlockWriterLocal {
     rt: Arc<Runtime>,
-    fs_context: Arc<FsContext>,
+    client: BlockClient,
     block: ExtendedBlock,
     worker_address: WorkerAddress,
     file: RawPtr<LocalFile>,
@@ -64,7 +65,7 @@ impl BlockWriterLocal {
 
         let writer = Self {
             rt: fs_context.clone_runtime(),
-            fs_context,
+            client,
             block,
             worker_address,
             file: RawPtr::from_owned(file),
@@ -118,8 +119,7 @@ impl BlockWriterLocal {
     pub async fn complete(&mut self) -> FsResult<()> {
         self.flush().await?;
         let next_seq_id = self.next_seq_id();
-        let client = self.fs_context.acquire_write(&self.worker_address).await?;
-        client
+        self.client
             .write_commit(
                 &self.block,
                 self.pos(),
@@ -133,8 +133,7 @@ impl BlockWriterLocal {
 
     pub async fn cancel(&mut self) -> FsResult<()> {
         let next_seq_id = self.next_seq_id();
-        let client = self.fs_context.acquire_write(&self.worker_address).await?;
-        client
+        self.client
             .write_commit(
                 &self.block,
                 self.pos(),

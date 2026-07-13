@@ -16,7 +16,6 @@ use crate::util::*;
 use clap::{Parser, Subcommand};
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::state::MasterInfo;
-use num_bigint::ToBigInt;
 use orpc::CommonResult;
 
 #[derive(Parser, Debug)]
@@ -113,13 +112,13 @@ impl CurvineReport {
         builder.push_str(&format!(
             "{:>20}: {}\n",
             "capacity",
-            bytes_to_string(&self.info.capacity.to_bigint().unwrap())
+            bytes_to_string(self.info.capacity)
         ));
 
         let available = format!(
             "{:>20}: {} ({:.2}%)\n",
             "available",
-            bytes_to_string(&self.info.available.to_bigint().unwrap()),
+            bytes_to_string(self.info.available),
             Self::get_percent(self.info.available, self.info.capacity)
         );
         builder.push_str(&available);
@@ -127,7 +126,7 @@ impl CurvineReport {
         let used = format!(
             "{:>20}: {} ({:.2}%)\n",
             "fs_used",
-            bytes_to_string(&self.info.fs_used.to_bigint().unwrap()),
+            bytes_to_string(self.info.fs_used),
             Self::get_percent(self.info.fs_used, self.info.capacity)
         );
         builder.push_str(&used);
@@ -135,7 +134,7 @@ impl CurvineReport {
         builder.push_str(&format!(
             "{:>20}: {}\n",
             "non_fs_used",
-            bytes_to_string(&self.info.non_fs_used.to_bigint().unwrap()),
+            bytes_to_string(self.info.non_fs_used),
         ));
         builder.push_str(&format!(
             "{:>20}: {}\n",
@@ -169,8 +168,8 @@ impl CurvineReport {
                     "{}:{},{}/{} ({:.2}%)",
                     worker.address.hostname,
                     worker.address.rpc_port,
-                    bytes_to_string(&worker.available.to_bigint().unwrap()),
-                    bytes_to_string(&worker.capacity.to_bigint().unwrap()),
+                    bytes_to_string(worker.available),
+                    bytes_to_string(worker.capacity),
                     Self::get_percent(worker.available, worker.capacity)
                 );
                 if i == 0 {
@@ -209,21 +208,21 @@ impl CurvineReport {
         builder.push_str("=== Cluster Capacity ===\n");
         builder.push_str(&format!(
             "Total Capacity: {}\n",
-            bytes_to_string(&self.info.capacity.to_bigint().unwrap())
+            bytes_to_string(self.info.capacity)
         ));
         builder.push_str(&format!(
             "Total Available: {} ({:.2}%)\n",
-            bytes_to_string(&self.info.available.to_bigint().unwrap()),
+            bytes_to_string(self.info.available),
             Self::get_percent(self.info.available, self.info.capacity)
         ));
         builder.push_str(&format!(
             "Total fs-used: {} ({:.2}%)\n",
-            bytes_to_string(&self.info.fs_used.to_bigint().unwrap()),
+            bytes_to_string(self.info.fs_used),
             Self::get_percent(self.info.fs_used, self.info.capacity)
         ));
         builder.push_str(&format!(
             "Total Non-FS Used: {}\n",
-            bytes_to_string(&self.info.non_fs_used.to_bigint().unwrap())
+            bytes_to_string(self.info.non_fs_used)
         ));
 
         builder
@@ -251,23 +250,20 @@ impl CurvineReport {
             "=== Worker {}:{} ===\n",
             worker.address.hostname, worker.address.rpc_port
         ));
-        builder.push_str(&format!(
-            "Capacity: {}\n",
-            bytes_to_string(&worker.capacity.to_bigint().unwrap())
-        ));
+        builder.push_str(&format!("Capacity: {}\n", bytes_to_string(worker.capacity)));
         builder.push_str(&format!(
             "Available: {} ({:.2}%)\n",
-            bytes_to_string(&worker.available.to_bigint().unwrap()),
+            bytes_to_string(worker.available),
             Self::get_percent(worker.available, worker.capacity)
         ));
         builder.push_str(&format!(
             "Fs-used: {} ({:.2}%)\n",
-            bytes_to_string(&worker.fs_used.to_bigint().unwrap()),
+            bytes_to_string(worker.fs_used),
             Self::get_percent(worker.fs_used, worker.capacity)
         ));
         builder.push_str(&format!(
             "Non-FS Used: {}\n",
-            bytes_to_string(&worker.non_fs_used.to_bigint().unwrap())
+            bytes_to_string(worker.non_fs_used)
         ));
         builder.push('\n');
 
@@ -286,21 +282,21 @@ impl CurvineReport {
                 ));
                 builder.push_str(&format!(
                     "    Capacity: {}\n",
-                    bytes_to_string(&storage.capacity.to_bigint().unwrap())
+                    bytes_to_string(storage.capacity)
                 ));
                 builder.push_str(&format!(
                     "    Available: {} ({:.2}%)\n",
-                    bytes_to_string(&storage.available.to_bigint().unwrap()),
+                    bytes_to_string(storage.available),
                     Self::get_percent(storage.available, storage.capacity)
                 ));
                 builder.push_str(&format!(
                     "    Fs-used: {} ({:.2}%)\n",
-                    bytes_to_string(&storage.fs_used.to_bigint().unwrap()),
+                    bytes_to_string(storage.fs_used),
                     Self::get_percent(storage.fs_used, storage.capacity)
                 ));
                 builder.push_str(&format!(
                     "    Non-FS Used: {}\n",
-                    bytes_to_string(&storage.non_fs_used.to_bigint().unwrap())
+                    bytes_to_string(storage.non_fs_used)
                 ));
                 if storage.failed {
                     builder.push_str("    Status: FAILED\n");
@@ -320,7 +316,7 @@ impl CurvineReport {
                     "{}:{}  {}",
                     worker.address.hostname,
                     worker.address.rpc_port,
-                    bytes_to_string(&worker.fs_used.to_bigint().unwrap()),
+                    bytes_to_string(worker.fs_used),
                 );
                 builder.push_str(&format!("{}\n", str));
             }
@@ -337,7 +333,7 @@ impl CurvineReport {
                     "{}:{}  {}",
                     worker.address.hostname,
                     worker.address.rpc_port,
-                    bytes_to_string(&worker.available.to_bigint().unwrap()),
+                    bytes_to_string(worker.available),
                 );
                 builder.push_str(&format!("{}\n", str));
             }

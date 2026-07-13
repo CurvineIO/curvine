@@ -199,8 +199,8 @@ bin/cv report
 
 执行文件系统命令：
 ```bash
-bin/dfs fs mkdir /a
-bin/dfs fs ls /
+bin/dfs fs -mkdir /a
+bin/dfs fs -ls /
 ```
 
 访问 Web 界面：
@@ -215,6 +215,17 @@ Curvine 使用 TOML 格式的配置文件。示例配置位于 conf/curvine-clus
 - 存储策略（缓存大小、存储类型）
 - 集群配置（节点数量、副本因子）
 - 性能调优参数
+
+停止:
+
+```bash
+# Stop the FUSE mount
+bin/curvine-fuse.sh stop
+
+# Stop the worker and master nodes
+bin/curvine-worker.sh stop
+bin/curvine-master.sh stop
+```
 
 ## 🏗️ 架构设计
 

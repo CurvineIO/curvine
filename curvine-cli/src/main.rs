@@ -180,6 +180,7 @@ fn main() -> CommonResult<()> {
             Commands::Fs(cmd) => cmd.execute(curvine_fs).await,
             Commands::Report(cmd) => cmd.execute(curvine_fs).await,
             Commands::Load(cmd) => cmd.execute(load_client).await,
+            Commands::Export(cmd) => cmd.execute(load_client).await,
             Commands::LoadStatus(cmd) => cmd.execute(load_client).await,
             Commands::CancelLoad(cmd) => cmd.execute(load_client).await,
             Commands::Mount(cmd) => cmd.execute(curvine_fs).await,
@@ -197,4 +198,17 @@ fn main() -> CommonResult<()> {
 
         result
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_subcommand_is_available() {
+        let args = CurvineArgs::try_parse_from(["curvine", "export", "/mnt/file", "--watch"])
+            .expect("export command should parse");
+
+        assert!(matches!(args.command, Commands::Export(_)));
+    }
 }

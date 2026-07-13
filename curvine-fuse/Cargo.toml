@@ -14,7 +14,7 @@ log = { workspace = true }
 clap = { workspace = true }
 pin-project-lite = { workspace = true }
 tokio  = { workspace = true }
-tokio-util = { workspace = true }
+bytes = { workspace = true }
 num_enum = { workspace = true }
 libc = { workspace = true }
 memchr = { workspace = true }
@@ -42,5 +42,4 @@ fuse2 = []
 fuse3 = []
 
 [build-dependencies]
-bindgen = { workspace = true }
 pkg-config = "0.3.27"

@@ -17,6 +17,7 @@
 use crate::fs::operator::{Create, MkDir};
 use crate::raw::fuse_abi::{fuse_attr, fuse_entry_out, fuse_setattr_in};
 use crate::*;
+use bytes::BytesMut;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::FuseConf;
 use curvine_common::fs::Path;
@@ -30,7 +31,6 @@ use orpc::sys;
 use orpc::sys::{FFIUtils, RawIO};
 use std::process::Command;
 use std::slice;
-use tokio_util::bytes::BytesMut;
 
 pub struct FuseUtils;
 

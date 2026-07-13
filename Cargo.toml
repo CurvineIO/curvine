@@ -62,7 +62,7 @@ libc = "0.2.167"
 tokio = { version = "1.42.0", features = ["full"] }
 futures = "0.3.31"
 async-stream = "0.3.6"
-tokio-util = { version = "0.7.12", features = ["full"] }
+tokio-util = { version = "0.7.12", features = ["codec"] }
 bytes = "1.9.0"
 serde = { version = "1.0.215", features = ["derive"] }
 rocksdb = { version = "0.22.0", default-features = false, features = ["lz4"] }
@@ -95,7 +95,7 @@ regex = "1.9.4"
 num_enum = "0.7.5"
 hyper = "1.2.0"
 pin-project-lite = "0.2.15"
-uuid = { version = "1.11.0", features = ["v4", "fast-rng", "macro-diagnostics"] }
+uuid = { version = "1.11.0", features = ["v4", "fast-rng"] }
 rand = '0.8.5'
 murmur3 = "0.5.2"
 crc32fast = "1.4.2"
@@ -117,13 +117,12 @@ tower-http = "0.5.2"
 
 thiserror = "1.0.58"
 mini-moka = "0.10.3"
-moka = { version = "0.12.10", features = ["sync", "future"] }
+moka = { version = "0.12.10", features = ["sync"] }
 flate2 = { version = "1.0.29", features = ["zlib"], default-features = false }
 crossbeam = "0.8.4"
 dashmap = "5.5.3"
 linked-hash-map = "0.5.6"
 fxhash = "0.2.1"
-serde_with = "3.12.0"
 parking_lot = "0.12.3"
 anyhow = "1.0.97"
 url = "2.2.2"
@@ -132,8 +131,6 @@ fastrand = "1.9.0"
 num_cpus = "1.16.0"
 slog = "2.7.0"
 slog-stdlog = "4.1.0"
-num-bigint = "0.4.6"
-bigdecimal = "0.4.8"
 bitvec = "1.0.1"
 config = "0.13.4"
 tempfile = "3.21.0"
@@ -143,6 +140,4 @@ glob = "0.3"
 lru = "0.16.1"
 
 mimalloc = "0.1.48"
-tikv-jemallocator = { version = "0.6.1", features = ["stats", "unprefixed_malloc_on_supported_platforms"] }
-tikv-jemalloc-ctl = { version = "0.6.1"}
-tikv-jemalloc-sys = { version = "0.6.1", features = ["stats"] }
+tikv-jemallocator = { version = "0.6.1", features = ["unprefixed_malloc_on_supported_platforms"] }

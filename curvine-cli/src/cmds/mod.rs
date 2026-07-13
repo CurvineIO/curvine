@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod bench;
+mod export;
 mod fs;
 mod load;
 mod load_cancel;
@@ -23,6 +24,7 @@ mod report;
 mod umount;
 
 pub use bench::BenchCommand;
+pub use export::ExportCommand;
 pub use fs::FsCommand;
 pub use load::LoadCommand;
 pub use load_cancel::CancelLoadCommand;

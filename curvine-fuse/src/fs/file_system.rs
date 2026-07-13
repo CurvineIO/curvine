@@ -17,9 +17,9 @@ use crate::raw::fuse_abi::*;
 use crate::raw::FuseDirentList;
 use crate::session::FuseResponse;
 use crate::{err_fuse, FuseResult};
+use bytes::BytesMut;
 use curvine_common::fs::{StateReader, StateWriter};
 use std::future::Future;
-use tokio_util::bytes::BytesMut;
 
 pub trait FileSystem: Send + Sync + 'static {
     fn init(&self, op: Init<'_>) -> impl Future<Output = FuseResult<fuse_init_out>> + Send {

@@ -15,11 +15,11 @@
 use crate::fs::Path;
 use crate::state::{FileAllocOpts, FileStatus};
 use crate::FsResult;
+use bytes::{BufMut, BytesMut};
 use orpc::err_box;
 use orpc::runtime::RpcRuntime;
 use orpc::{runtime::Runtime, sys::DataSlice};
 use std::future::Future;
-use tokio_util::bytes::{BufMut, BytesMut};
 
 pub trait Writer {
     fn status(&self) -> &FileStatus;

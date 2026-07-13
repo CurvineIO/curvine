@@ -14,7 +14,7 @@
 
 use crate::raw::fuse_abi::fuse_getxattr_out;
 use crate::FuseUtils;
-use tokio_util::bytes::BytesMut;
+use bytes::BytesMut;
 
 pub struct FuseBuf {
     buf: BytesMut,

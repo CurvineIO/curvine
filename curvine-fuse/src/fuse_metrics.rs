@@ -757,12 +757,12 @@ impl FuseMetrics {
             // Phase 3a: cache + readdir.
             user_meta_cache_total: m::new_counter_vec(
                 "curvine_fuse_user_meta_cache_total",
-                "MetaCache hit/miss/put by cache namespace. status=hit|miss|put",
+                "userspace metadata cache (NodeState/DirTree) hit/miss/put by cache namespace. status=hit|miss|put",
                 &["cache", "status"],
             )?,
             user_meta_cache_invalidations_total: m::new_counter_vec(
                 "curvine_fuse_user_meta_cache_invalidations_total",
-                "Requested MetaCache invalidations at the call site, one inc per affected cache \
+                "Requested userspace metadata cache (NodeState/DirTree) invalidations at the call site, one inc per affected cache \
                  namespace (NOT per invalidate_cache call)",
                 &["cache", "reason"],
             )?,

@@ -943,7 +943,7 @@ impl MessageHandler for MasterHandler {
             Err(FsError::not_leader_master(ctx.code, self.client_ip()))
         } else {
             match code {
-                RpcCode::SubmitJob => self.job_handler.submit_load_job(ctx, &mut self.buf).await,
+                RpcCode::SubmitJob => self.job_handler.submit_job(ctx, &mut self.buf).await,
                 RpcCode::GetJobStatus => self.job_handler.get_load_status(ctx, &mut self.buf),
                 RpcCode::CancelJob => self.job_handler.cancel_job(ctx, &mut self.buf).await,
                 RpcCode::ReportTask => self.job_handler.task_report(ctx, &mut self.buf),

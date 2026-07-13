@@ -15,7 +15,7 @@
 use curvine_common::conf::{ClientConf, ClusterConf, JournalConf, MasterConf};
 use curvine_common::state::{
     JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobInfo, LoadTaskInfo, MountInfo,
-    MountOptions, OpenFlags, StorageType, TtlAction, WorkerAddress, WorkerInfo,
+    MountOptions, OpenFlags, StorageType, TtlAction, WorkerAddress, WorkerInfo, WriteType,
 };
 use curvine_common::utils::CommonUtils;
 use curvine_server::master::fs::MasterFilesystem;
@@ -35,6 +35,20 @@ fn new_job_manager(name: &str) -> CommonResult<(Arc<JobManager>, Arc<Runtime>, S
 
 fn new_job_manager_with_fs(
     name: &str,
+) -> CommonResult<(Arc<JobManager>, Arc<Runtime>, String, MasterFilesystem)> {
+    new_job_manager_with_mount_options(name, MountOptions::builder().build())
+}
+
+fn new_job_manager_with_write_type(
+    name: &str,
+    write_type: WriteType,
+) -> CommonResult<(Arc<JobManager>, Arc<Runtime>, String, MasterFilesystem)> {
+    new_job_manager_with_mount_options(name, MountOptions::builder().write_type(write_type).build())
+}
+
+fn new_job_manager_with_mount_options(
+    name: &str,
+    mount_options: MountOptions,
 ) -> CommonResult<(Arc<JobManager>, Arc<Runtime>, String, MasterFilesystem)> {
     Master::init_test_metrics();
     let test_name = format!("{}-{}", name, Utils::rand_id());
@@ -70,7 +84,7 @@ fn new_job_manager_with_fs(
 
     let ufs_root_dir = Utils::test_sub_dir(format!("load-job-submit/ufs-{}", test_name));
     let ufs_root = format!("file://{}", ufs_root_dir);
-    mount_manager.mount(None, "/mnt", &ufs_root, &MountOptions::builder().build())?;
+    mount_manager.mount(None, "/mnt", &ufs_root, &mount_options)?;
 
     Ok((
         job_manager,
@@ -103,6 +117,13 @@ fn load_task(task_id: &str, job_id: &str) -> LoadTaskInfo {
         target_path: "/mnt/source".to_string(),
         create_time: 0,
     }
+}
+
+fn ufs_root_from_missing_source(missing_source: &str) -> String {
+    missing_source
+        .strip_suffix("/missing-file")
+        .expect("test helper returns a missing file below the UFS root")
+        .to_string()
 }
 
 #[test]
@@ -145,7 +166,7 @@ fn submit_load_job_returns_before_ufs_planning() -> CommonResult<()> {
 #[test]
 fn fs_mode_cv_path_load_uses_ufs_source_when_metadata_is_ufs_only() -> CommonResult<()> {
     let (job_manager, rt, missing_source, master_fs) =
-        new_job_manager_with_fs("fs-cv-load-ufs-only")?;
+        new_job_manager_with_write_type("fs-cv-load-ufs-only", WriteType::FsMode)?;
     let source = missing_source.replace("/missing-file", "/ufs-only-file");
     let local_source = source
         .strip_prefix("file://")
@@ -180,9 +201,162 @@ fn fs_mode_cv_path_load_uses_ufs_source_when_metadata_is_ufs_only() -> CommonRes
 }
 
 #[test]
-fn cv_path_load_without_ufs_only_metadata_is_rejected() -> CommonResult<()> {
+fn cache_mode_mount_root_directory_load_uses_ufs_source() -> CommonResult<()> {
+    let (job_manager, rt, missing_source, _master_fs) =
+        new_job_manager_with_write_type("cache-root-dir-load", WriteType::CacheMode)?;
+    let source = ufs_root_from_missing_source(&missing_source);
+    let local_source = source
+        .strip_prefix("file://")
+        .expect("test UFS path uses file scheme");
+    std::fs::create_dir_all(local_source)?;
+    std::fs::write(
+        std::path::Path::new(local_source).join("file.txt"),
+        b"load-data",
+    )?;
+
+    let cv_path = "/mnt";
+    let (expected_source, _) = job_manager
+        .get_mnt(&curvine_common::fs::Path::from_str(cv_path)?)?
+        .expect("test CV path should match mount");
+    let expected_source = expected_source.clone_uri();
+    let expected_job_id = CommonUtils::create_job_id(&expected_source);
+
+    rt.block_on(async {
+        let result = job_manager
+            .submit_load_job(LoadJobCommand::builder(cv_path).build())
+            .await?;
+
+        assert_eq!(result.job_id, expected_job_id);
+        assert_eq!(result.target_path, cv_path);
+
+        let status = job_manager.get_job_status(&result.job_id)?;
+        assert_eq!(status.source_path, expected_source);
+        assert_eq!(status.target_path, cv_path);
+        Ok(())
+    })
+}
+
+#[test]
+fn fs_mode_mount_root_directory_load_uses_ufs_source() -> CommonResult<()> {
+    let (job_manager, rt, missing_source, _master_fs) =
+        new_job_manager_with_write_type("fs-root-dir-load", WriteType::FsMode)?;
+    let source = ufs_root_from_missing_source(&missing_source);
+    let local_source = source
+        .strip_prefix("file://")
+        .expect("test UFS path uses file scheme");
+    std::fs::create_dir_all(local_source)?;
+    std::fs::write(
+        std::path::Path::new(local_source).join("file.txt"),
+        b"load-data",
+    )?;
+
+    let cv_path = "/mnt";
+    let (expected_source, _) = job_manager
+        .get_mnt(&curvine_common::fs::Path::from_str(cv_path)?)?
+        .expect("test CV path should match mount");
+    let expected_source = expected_source.clone_uri();
+    let expected_job_id = CommonUtils::create_job_id(&expected_source);
+
+    rt.block_on(async {
+        let result = job_manager
+            .submit_load_job(LoadJobCommand::builder(cv_path).build())
+            .await?;
+
+        assert_eq!(result.job_id, expected_job_id);
+        assert_eq!(result.target_path, cv_path);
+
+        let status = job_manager.get_job_status(&result.job_id)?;
+        assert_eq!(status.source_path, expected_source);
+        assert_eq!(status.target_path, cv_path);
+        Ok(())
+    })
+}
+
+#[test]
+fn cv_child_directory_load_under_mount_uses_ufs_source_without_ufs_only_metadata(
+) -> CommonResult<()> {
+    let (job_manager, rt, missing_source, master_fs) =
+        new_job_manager_with_write_type("cv-child-dir-load", WriteType::FsMode)?;
+    let source = missing_source.replace("/missing-file", "/dir");
+    let local_source = source
+        .strip_prefix("file://")
+        .expect("test UFS path uses file scheme");
+    std::fs::create_dir_all(local_source)?;
+    std::fs::write(
+        std::path::Path::new(local_source).join("file.txt"),
+        b"load-data",
+    )?;
+
+    let cv_path = "/mnt/dir";
+    master_fs.mkdir(cv_path, true)?;
+    let cv_status = master_fs.file_status(cv_path)?;
+    assert!(cv_status.is_dir);
+    assert!(!cv_status.storage_policy.ufs_only());
+    let expected_job_id = CommonUtils::create_job_id(&source);
+
+    rt.block_on(async {
+        let result = job_manager
+            .submit_load_job(LoadJobCommand::builder(cv_path).build())
+            .await?;
+
+        assert_eq!(result.job_id, expected_job_id);
+        assert_eq!(result.target_path, cv_path);
+
+        let status = job_manager.get_job_status(&result.job_id)?;
+        assert_eq!(status.source_path, source);
+        assert_eq!(status.target_path, cv_path);
+        Ok(())
+    })
+}
+
+#[test]
+fn cv_file_load_with_ufs_backed_cached_metadata_uses_ufs_source() -> CommonResult<()> {
+    let (job_manager, rt, missing_source, master_fs) =
+        new_job_manager_with_fs("fs-cv-load-ufs-backed")?;
+    let source = missing_source.replace("/missing-file", "/ufs-backed-file");
+    let local_source = source
+        .strip_prefix("file://")
+        .expect("test UFS path uses file scheme");
+    if let Some(parent) = std::path::Path::new(local_source).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(local_source, b"load-data")?;
+
+    let cv_path = "/mnt/ufs-backed-file";
+    let source_path = curvine_common::fs::Path::from_str(&source)?;
+    let (_, mount) = job_manager
+        .get_mnt(&source_path)?
+        .expect("test source should match mount");
+    let sync_opts = mount.info.get_sync_opts(&ClientConf::default(), 1, 9);
+    master_fs.create_with_opts(cv_path, sync_opts, OpenFlags::new_create())?;
+    master_fs.set_attr(
+        cv_path,
+        curvine_common::state::SetAttrOptsBuilder::new()
+            .ufs_mtime(1)
+            .build(),
+    )?;
+    let cv_status = master_fs.file_status(cv_path)?;
+    assert!(cv_status.storage_policy.both_exists());
+    let expected_job_id = CommonUtils::create_job_id(&source);
+
+    rt.block_on(async {
+        let result = job_manager
+            .submit_load_job(LoadJobCommand::builder(cv_path).build())
+            .await?;
+
+        assert_eq!(result.job_id, expected_job_id);
+        assert_eq!(result.target_path, cv_path);
+
+        let status = job_manager.get_job_status(&result.job_id)?;
+        assert_eq!(status.source_path, source);
+        assert_eq!(status.target_path, cv_path);
+        Ok(())
+    })
+}
+
+fn assert_cv_only_file_load_is_rejected(name: &str, write_type: WriteType) -> CommonResult<()> {
     let (job_manager, rt, _missing_source, master_fs) =
-        new_job_manager_with_fs("cv-load-rejects-export")?;
+        new_job_manager_with_write_type(name, write_type)?;
     let cv_path = "/mnt/native-file";
     let create_opts = curvine_common::state::CreateFileOptsBuilder::new()
         .create_parent(true)
@@ -195,7 +369,99 @@ fn cv_path_load_without_ufs_only_metadata_is_rejected() -> CommonResult<()> {
             .await
             .expect_err("ordinary CV load should not fall back to CV-to-UFS export");
         assert!(
-            err.to_string().contains("requires UFS-only metadata"),
+            err.to_string().contains("requires UFS-backed metadata"),
+            "unexpected error: {}",
+            err
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn cache_mode_cv_path_load_without_ufs_backed_metadata_is_rejected() -> CommonResult<()> {
+    assert_cv_only_file_load_is_rejected("cache-cv-load-rejects-export", WriteType::CacheMode)
+}
+
+#[test]
+fn fs_mode_cv_path_load_without_ufs_backed_metadata_is_rejected() -> CommonResult<()> {
+    assert_cv_only_file_load_is_rejected("fs-cv-load-rejects-export", WriteType::FsMode)
+}
+
+#[test]
+fn ufs_load_with_explicit_cv_target_uses_import_direction() -> CommonResult<()> {
+    let (job_manager, rt, missing_source) = new_job_manager("explicit-load-target")?;
+    let source = missing_source.replace("/missing-file", "/explicit-target-file");
+    let local_source = source
+        .strip_prefix("file://")
+        .expect("test UFS path uses file scheme");
+    if let Some(parent) = std::path::Path::new(local_source).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(local_source, b"load-data")?;
+
+    let target = "/mnt/explicit-target-file";
+    let expected_job_id = CommonUtils::create_job_id(&source);
+
+    rt.block_on(async {
+        let result = job_manager
+            .submit_load_job(LoadJobCommand::builder(&source).target_path(target).build())
+            .await?;
+
+        assert_eq!(result.job_id, expected_job_id);
+        assert_eq!(result.target_path, target);
+
+        let status = job_manager.get_job_status(&result.job_id)?;
+        assert_eq!(status.source_path, source);
+        assert_eq!(status.target_path, target);
+        Ok(())
+    })
+}
+
+#[test]
+fn ufs_load_with_mismatched_explicit_cv_target_is_rejected() -> CommonResult<()> {
+    let (job_manager, rt, missing_source) = new_job_manager("explicit-load-target-mismatch")?;
+    let source = missing_source.replace("/missing-file", "/source-file");
+
+    rt.block_on(async {
+        let err = job_manager
+            .submit_load_job(
+                LoadJobCommand::builder(source)
+                    .target_path("/mnt/other-file")
+                    .build(),
+            )
+            .await
+            .expect_err("explicit target must match the mount mapping");
+        assert!(
+            err.to_string().contains("does not match mounted CV path"),
+            "unexpected error: {}",
+            err
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn load_with_explicit_target_rejects_cv_source_to_prevent_export() -> CommonResult<()> {
+    let (job_manager, rt, _missing_source, master_fs) =
+        new_job_manager_with_fs("explicit-load-target-cv-source")?;
+    let cv_path = "/mnt/native-export-file";
+    let create_opts = curvine_common::state::CreateFileOptsBuilder::new()
+        .create_parent(true)
+        .build();
+    master_fs.create_with_opts(cv_path, create_opts, OpenFlags::new_create())?;
+
+    rt.block_on(async {
+        let err = job_manager
+            .submit_load_job(
+                LoadJobCommand::builder(cv_path)
+                    .target_path("file:///tmp/native-export-file")
+                    .build(),
+            )
+            .await
+            .expect_err("load must not use explicit target to export CV data");
+        assert!(
+            err.to_string()
+                .contains("explicit target requires a UFS source path"),
             "unexpected error: {}",
             err
         );
@@ -229,6 +495,48 @@ fn direct_export_task_keeps_cv_source_for_fs_mode_journal_sync() -> CommonResult
         assert_eq!(result.job_id, expected_job_id);
         assert_eq!(result.target_path, expected_target);
         assert_eq!(result.state, JobTaskState::Completed);
+        Ok(())
+    })
+}
+
+#[test]
+fn submit_export_job_keeps_cv_source_for_user_export() -> CommonResult<()> {
+    let (job_manager, rt, _missing_source, master_fs) = new_job_manager_with_fs("public-export")?;
+    let cv_path = "/mnt/public-export-dir";
+    master_fs.mkdir(cv_path, true)?;
+    let expected_target = job_manager
+        .get_mnt(&curvine_common::fs::Path::from_str(cv_path)?)?
+        .expect("test CV path should match mount")
+        .0
+        .clone_uri();
+    let expected_job_id = CommonUtils::create_job_id(cv_path);
+
+    rt.block_on(async {
+        let result = job_manager
+            .submit_export_job(LoadJobCommand::builder(cv_path).build())
+            .await?;
+
+        assert_eq!(result.job_id, expected_job_id);
+        assert_eq!(result.target_path, expected_target);
+        assert_eq!(result.state, JobTaskState::Completed);
+        Ok(())
+    })
+}
+
+#[test]
+fn submit_export_job_rejects_ufs_source_path() -> CommonResult<()> {
+    let (job_manager, rt, missing_source) = new_job_manager("public-export-ufs")?;
+
+    rt.block_on(async {
+        let err = job_manager
+            .submit_export_job(LoadJobCommand::builder(missing_source).build())
+            .await
+            .expect_err("export must not accept a UFS source path");
+        assert!(
+            err.to_string().contains("must be a CV path"),
+            "unexpected error: {}",
+            err
+        );
         Ok(())
     })
 }
