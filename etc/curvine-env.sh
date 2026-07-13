@@ -18,17 +18,28 @@
 
 export CURVINE_HOME="$(cd "$(dirname "$0")"/..; pwd)"
 
-LOCAL_HOSTNAME=localhost
+OS_NAME=$(uname)
+# Get the IP address from hostname, taking the last network interface address
+LOCAL_HOSTNAME="$(hostname || echo localhost)"
+
+if [ "$OS_NAME" == "Linux" ]; then
+    LOCAL_IP=$(hostname -I | awk '{print $NF}')
+elif [ "$OS_NAME" == "Darwin" ]; then
+    LOCAL_IP=$(ifconfig | grep "inet " | awk '{print $2}' | grep -v 127.0.0.1 | tail -n 1)
+else
+    echo "Unsupported OS: $OS_NAME"
+    exit 1
+fi
 
 # master bound host name
-export CURVINE_MASTER_HOSTNAME=$LOCAL_HOSTNAME
+export CURVINE_MASTER_HOSTNAME=${CURVINE_MASTER_HOSTNAME:-$LOCAL_HOSTNAME}
 
 # worker bound host name
-export CURVINE_WORKER_HOSTNAME=$LOCAL_HOSTNAME
+export CURVINE_WORKER_HOSTNAME=${CURVINE_WORKER_HOSTNAME:-$LOCAL_IP}
 
 # The client server hostname is used to determine whether the worker and client are on the same machine.
-export CURVINE_CLIENT_HOSTNAME=$LOCAL_HOSTNAME
+export CURVINE_CLIENT_HOSTNAME=${CURVINE_CLIENT_HOSTNAME:-$LOCAL_IP}
 
 export ORPC_BIND_HOSTNAME=0.0.0.0
 
-export CURVINE_CONF_FILE=$CURVINE_HOME/conf/curvine-cluster.toml
+export CURVINE_CONF_FILE=${CURVINE_CONF_FILE:-$CURVINE_HOME/conf/curvine-cluster.toml}
