@@ -180,7 +180,7 @@ impl JobMasterClient {
 
                     let sleep_ms = conf
                         .sync_check_interval_max_ms
-                        .min(conf.sync_check_interval_min_ms * ticks);
+                        .min(conf.sync_check_interval_min_ms.saturating_mul(ticks));
                     time::sleep(Duration::from_millis(sleep_ms)).await;
 
                     if ticks.is_multiple_of(conf.sync_check_log_tick as u64) {

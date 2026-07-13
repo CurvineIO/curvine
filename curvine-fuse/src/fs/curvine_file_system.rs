@@ -1179,7 +1179,7 @@ impl fs::FileSystem for CurvineFileSystem {
             }
 
             ticks += 1;
-            let sleep_ms = check_interval_max_ms.min(check_interval_min_ms * ticks);
+            let sleep_ms = check_interval_max_ms.min(check_interval_min_ms.saturating_mul(ticks));
             tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
 
             if ticks.is_multiple_of(log_ticks as u64) {
