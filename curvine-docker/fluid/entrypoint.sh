@@ -34,6 +34,7 @@ CURVINE_LOG_DIR="${CURVINE_HOME}/logs"
 FLUID_MODE=false
 FLUID_RUNTIME_TYPE_ENV="${FLUID_RUNTIME_TYPE:-}"
 FLUID_RUNTIME_TYPE=""
+ENTRY_ARG="${1:-}"
 
 if [ -n "$FLUID_RUNTIME_TYPE_ENV" ]; then
     FLUID_MODE=true
@@ -44,7 +45,7 @@ if [ -n "$FLUID_RUNTIME_TYPE_ENV" ]; then
         FLUID_RUNTIME_TYPE="cache-runtime"
         echo "Detected Fluid cache-runtime mode (from FLUID_RUNTIME_TYPE=$FLUID_RUNTIME_TYPE_ENV)"
     fi
-elif [ "$1" = "fluid-thin-runtime" ]; then
+elif [ "$ENTRY_ARG" = "fluid-thin-runtime" ]; then
     FLUID_MODE=true
     FLUID_RUNTIME_TYPE="thin-runtime"
     echo "Detected Fluid thin-runtime mode (from parameter)"

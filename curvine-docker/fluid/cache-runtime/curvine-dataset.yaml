@@ -19,6 +19,9 @@ metadata:
   namespace: default
 spec:
   runtimeClassName: curvine
+  # Demo/e2e default only: emptyDir is deleted with the pod.
+  # Use PVC/hostPath or another production volume for metadata, journal,
+  # logs, or cache data that must survive pod recreation.
   volumes:
   - name: curvine-logs
     emptyDir: {}

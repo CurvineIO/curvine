@@ -27,7 +27,10 @@ dataOperationSpecs:
     write_minimal_config() {
       local dataset="$1"
       local namespace="$2"
-      local master_host="${CURVINE_DATALOAD_MASTER_HOST:-${dataset}-master-0.svc-${dataset}-master.${namespace}.svc.cluster.local}"
+      local master_host="${CURVINE_DATALOAD_MASTER_HOST:-${3:-}}"
+      if [ -z "$master_host" ]; then
+        master_host="${dataset}-master-0.svc-${dataset}-master.${namespace}.svc.cluster.local"
+      fi
 
       cat > "$conf_file" <<EOF
     [journal]
@@ -76,10 +79,10 @@ dataOperationSpecs:
         with urllib.request.urlopen(req, context=context, timeout=5) as response:
             pod = json.load(response)
     except urllib.error.HTTPError as err:
-        print(f"Unable to read current pod labels from Kubernetes API: HTTP {err.code} {err.reason}", file=sys.stderr)
+        print(f"Unable to read current pod labels from Kubernetes API: HTTP {err.code} {err.reason}; caller will try DataLoad name inference", file=sys.stderr)
         sys.exit(1)
     except Exception as err:
-        print(f"Unable to read current pod labels from Kubernetes API: {err}", file=sys.stderr)
+        print(f"Unable to read current pod labels from Kubernetes API: {err}; caller will try DataLoad name inference", file=sys.stderr)
         sys.exit(1)
 
     labels = pod.get("metadata", {}).get("labels", {})
@@ -99,6 +102,65 @@ dataOperationSpecs:
     PY
     }
 
+    # Legacy fallback for Fluid versions or custom DataLoad charts that do not
+    # mount the runtime config file or expose dataset env vars. Prefer exact
+    # metadata via Kubernetes API when RBAC allows it; this hostname fallback
+    # only works when the DataLoad name is derived from the dataset name, for
+    # example <dataset>-load.
+    infer_dataset_from_hostname() {
+      local namespace="$1"
+      local host="${HOSTNAME:-}"
+      local dataload=""
+      local candidate
+      local master_host
+      local candidates=()
+
+      if [[ "$host" == *"-loader-job-"* ]]; then
+        dataload="${host%-loader-job-*}"
+      elif [[ "$host" == *"-loader-"* ]]; then
+        dataload="${host%-loader-*}"
+      fi
+
+      add_candidate() {
+        local value="$1"
+        local existing
+        if [ -z "$value" ]; then
+          return
+        fi
+        for existing in "${candidates[@]}"; do
+          if [ "$existing" = "$value" ]; then
+            return
+          fi
+        done
+        candidates+=("$value")
+      }
+
+      add_candidate "$dataload"
+      add_candidate "${dataload%-load}"
+      add_candidate "${dataload%-dataload}"
+      add_candidate "${dataload%-data-load}"
+      add_candidate "${dataload%-loader}"
+
+      for candidate in "${candidates[@]}"; do
+        master_host="${candidate}-master-0.svc-${candidate}-master.${namespace}.svc.cluster.local"
+        if python3 - "$master_host" <<'PY'
+    import socket
+    import sys
+
+    try:
+        socket.getaddrinfo(sys.argv[1], None)
+    except OSError:
+        sys.exit(1)
+    PY
+        then
+          printf '%s %s\n' "$candidate" "$master_host"
+          return 0
+        fi
+      done
+
+      return 1
+    }
+
     if [ -f "$config_path" ]; then
       echo "Generating Curvine config from Fluid runtime config: $config_path"
       FLUID_RUNTIME_COMPONENT_TYPE="${FLUID_RUNTIME_COMPONENT_TYPE:-worker}" python3 "$curvine_home/generate_config.py" >/tmp/curvine-dataload-env.sh
@@ -109,18 +171,30 @@ dataOperationSpecs:
     else
       namespace="${CURVINE_DATALOAD_NAMESPACE:-${FLUID_DATASET_NAMESPACE:-$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo default)}}"
       dataset="${CURVINE_DATALOAD_DATASET:-${FLUID_DATASET_NAME:-}}"
+      master_host="${CURVINE_DATALOAD_MASTER_HOST:-}"
 
       if [ -z "$dataset" ]; then
         dataset="$(get_dataset_from_pod_label "$namespace")" || dataset=""
       fi
 
+      if [ -n "$dataset" ]; then
+        echo "Resolved Curvine dataset from DataLoad pod metadata: $dataset"
+      else
+        inferred="$(infer_dataset_from_hostname "$namespace")" || inferred=""
+        if [ -n "$inferred" ]; then
+          dataset="${inferred%% *}"
+          master_host="${inferred#* }"
+          echo "Inferred Curvine dataset from DataLoad pod hostname: $dataset"
+        fi
+      fi
+
       if [ -z "$dataset" ]; then
-        echo "Fluid runtime config is not mounted and Curvine dataset name is unavailable; set CURVINE_DATALOAD_DATASET/FLUID_DATASET_NAME or allow reading the Fluid targetDataset pod label" >&2
+        echo "Fluid runtime config is not mounted and Curvine dataset name is unavailable; set CURVINE_DATALOAD_DATASET/FLUID_DATASET_NAME, allow reading the Fluid targetDataset pod label, or name DataLoad as <dataset>-load" >&2
         exit 1
       fi
 
       echo "Fluid runtime config not found at $config_path; using Curvine master service for dataset: $dataset"
-      write_minimal_config "$dataset" "$namespace"
+      write_minimal_config "$dataset" "$namespace" "$master_host"
     fi
 
     resolve_load_path() {
@@ -222,7 +296,7 @@ topology:
         restartPolicy: Always
         containers:
         - name: master
-          image: curvine-fluid:latest
+          image: curvine:latest
           command:
           - /entrypoint.sh
           args:
@@ -245,6 +319,14 @@ topology:
             mountPath: /app/curvine/logs
           - name: curvine-master-data
             mountPath: /app/curvine/data
+        volumes:
+        # e2e/demo default only: emptyDir is deleted with the pod.
+        # For production, replace this with a persistent volume if Curvine
+        # master metadata and journal must survive pod recreation.
+        - name: curvine-logs
+          emptyDir: {}
+        - name: curvine-master-data
+          emptyDir: {}
   worker:
     service:
       headless: {}
@@ -253,7 +335,7 @@ topology:
         restartPolicy: Always
         containers:
         - name: worker
-          image: curvine-fluid:latest
+          image: curvine:latest
           command:
           - /entrypoint.sh
           args:
@@ -276,13 +358,21 @@ topology:
             mountPath: /app/curvine/logs
           - name: curvine-cache
             mountPath: /app/curvine/data
+        volumes:
+        # e2e/demo default only: emptyDir is deleted with the pod.
+        # Worker cache persistence is controlled by the CacheRuntime tieredStore
+        # and any production volume you configure for the cache path.
+        - name: curvine-logs
+          emptyDir: {}
+        - name: curvine-cache
+          emptyDir: {}
   client:
     template:
       spec:
         restartPolicy: Always
         containers:
         - name: client
-          image: curvine-fluid:latest
+          image: curvine:latest
           command:
           - /entrypoint.sh
           args:
