@@ -18,9 +18,9 @@ use crate::session::fuse_decoder::FuseDecoder;
 use crate::session::FuseOpCode::{self, *};
 use crate::FuseResult;
 use crate::FUSE_IN_HEADER_LEN;
+use bytes::Bytes;
 use orpc::{err_box, CommonResult};
 use std::fmt::{Display, Formatter};
-use tokio_util::bytes::Bytes;
 
 // fuse request data
 pub struct FuseRequest {

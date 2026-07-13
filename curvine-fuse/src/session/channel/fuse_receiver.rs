@@ -22,6 +22,7 @@ use crate::fuse_metrics::{
 use crate::raw::fuse_abi::fuse_out_header;
 use crate::session::{FuseOpCode, FuseRequest, FuseResponse, FuseTask};
 use crate::{err_fuse, FuseResult, FUSE_IN_HEADER_LEN};
+use bytes::BytesMut;
 use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
 use log::{debug, error, info, warn};
 use orpc::io::IOResult;
@@ -32,7 +33,6 @@ use orpc::sys::pipe::{AsyncFd, Pipe2, PipeFd};
 use orpc::{err_box, sys, try_option_ref};
 use std::sync::Arc;
 use tokio::sync::{watch, Notify};
-use tokio_util::bytes::BytesMut;
 
 /// FuseReceiver provides the following functionality:
 /// 1. Receive data from fuse fd using splice
@@ -776,11 +776,11 @@ mod tests {
         use crate::raw::fuse_abi::{fuse_forget_in, fuse_in_header};
         use crate::session::{FuseRequest, FuseResponse, FuseTask};
         use crate::FuseUtils;
+        use bytes::{BufMut, BytesMut};
         use curvine_common::conf::FuseConf;
         use orpc::common::Metrics as m;
         use orpc::sync::channel::{AsyncChannel, AsyncReceiver};
         use orpc::sync::FastDashMap;
-        use tokio_util::bytes::{BufMut, BytesMut};
 
         // FUSE opcodes used here (avoid pulling the whole abi into scope). Each
         // test uses a DISTINCT opcode so their `operation_duration_us` label
@@ -1244,10 +1244,10 @@ mod tests {
         };
         use crate::session::{FuseRequest, FuseResponse};
         use crate::FuseUtils;
+        use bytes::{BufMut, BytesMut};
         use orpc::runtime::{AsyncRuntime, RpcRuntime};
         use orpc::sync::channel::AsyncChannel;
         use std::sync::Arc;
-        use tokio_util::bytes::{BufMut, BytesMut};
 
         const OP_READ: u32 = 15;
         const OP_WRITE: u32 = 16;

@@ -13,7 +13,6 @@ curvine-ufs = { workspace = true, optional = true }
 once_cell = { workspace = true }
 hyper = { workspace = true }
 prost = { workspace = true }
-prost-build = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }

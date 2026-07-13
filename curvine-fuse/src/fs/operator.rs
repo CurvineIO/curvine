@@ -14,9 +14,9 @@
 
 use crate::raw::fuse_abi::*;
 use crate::{err_fuse, FuseResult};
+use bytes::Bytes;
 use std::ffi::OsStr;
 use std::fmt::{Debug, Formatter};
-use tokio_util::bytes::Bytes;
 
 #[derive(Debug)]
 pub enum FuseOperator<'a> {

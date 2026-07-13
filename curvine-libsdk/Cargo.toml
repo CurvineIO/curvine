@@ -25,16 +25,11 @@ tracing-subscriber = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true }
 futures =  { workspace = true }
-tokio-util = { workspace = true }
 bytes = { workspace = true }
 pin-project-lite = { workspace = true }
 dashmap = { workspace = true }
 toml = { workspace = true }
 serde = { workspace = true }
 prost = { workspace = true }
-prost-build = { workspace = true }
 jni = { version = "0.21.1", optional = true }
 pyo3 = { version = "0.25.1", features = ["extension-module","abi3-py38","num-complex"], optional = true }
-
-[build-dependencies]
-cc = "1.1.7"

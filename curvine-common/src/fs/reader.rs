@@ -15,10 +15,10 @@
 use crate::fs::Path;
 use crate::state::FileStatus;
 use crate::FsResult;
+use bytes::BytesMut;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::DataSlice;
 use std::future::Future;
-use tokio_util::bytes::BytesMut;
 
 pub trait Reader {
     fn status(&self) -> &FileStatus;

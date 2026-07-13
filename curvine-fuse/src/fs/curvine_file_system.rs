@@ -23,6 +23,7 @@ use crate::raw::FuseDirentList;
 use crate::session::{FuseBuf, FuseResponse};
 use crate::*;
 use crate::{err_fuse, FuseResult, FuseUtils};
+use bytes::BytesMut;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::{ClusterConf, FuseConf};
 use curvine_common::error::FsError;
@@ -38,7 +39,6 @@ use orpc::sys::FFIUtils;
 use orpc::{sys, ternary, try_option};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio_util::bytes::BytesMut;
 
 pub struct CurvineFileSystem {
     fs: UnifiedFileSystem,
