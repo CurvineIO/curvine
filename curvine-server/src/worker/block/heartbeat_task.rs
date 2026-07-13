@@ -106,16 +106,11 @@ impl HeartbeatTask {
         blocks: Vec<BlockReportInfo>,
     ) {
         for block in blocks {
-            report_blocks.insert(block.id, block);
+            report_blocks.entry(block.id).or_insert(block);
         }
     }
 
     fn submit_block_report(&self, report_blocks: Vec<BlockReportInfo>) {
-        if self.report_in_flight.swap(true, Ordering::AcqRel) {
-            self.put_missing_report(report_blocks);
-            return;
-        }
-
         let client = self.client.clone();
         let executor = self.executor.clone();
         let store = self.store.clone();
@@ -187,8 +182,13 @@ impl LoopTask for HeartbeatTask {
         };
 
         // Execute block report
+        if self.report_in_flight.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+
         let report_blocks = self.get_report_blocks();
         if report_blocks.is_empty() {
+            self.report_in_flight.store(false, Ordering::Release);
             return Ok(());
         }
 

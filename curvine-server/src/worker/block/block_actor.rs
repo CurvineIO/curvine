@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::block::{BlockStore, HeartbeatTask, MasterClient};
+use crate::worker::block::{BlockMeta, BlockStore, HeartbeatTask, MasterClient};
 use curvine_client::file::FsContext;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
@@ -28,7 +28,7 @@ use orpc::server::ServerState;
 use orpc::sync::StateCtl;
 use orpc::CommonResult;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Worker block management role.
 /// 1. Register worker with master
@@ -112,6 +112,10 @@ impl BlockActor {
 
     pub fn full_block_report(&self) -> CommonResult<usize> {
         let blocks = self.store.all_blocks()?;
+        self.full_block_report_snapshot(&blocks)
+    }
+
+    fn full_block_report_snapshot(&self, blocks: &[BlockMeta]) -> CommonResult<usize> {
         if blocks.is_empty() {
             let response = self.client.full_block_report(0, &[])?;
             let cmds = ProtoUtils::worker_cmd_from_pb(response.cmds);
@@ -149,6 +153,7 @@ impl BlockActor {
         scheduler.start(FullBlockReportTask {
             actor: self.clone(),
             complete: Arc::new(AtomicBool::new(false)),
+            snapshot: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -179,20 +184,47 @@ impl BlockActor {
 struct FullBlockReportTask {
     actor: BlockActor,
     complete: Arc<AtomicBool>,
+    snapshot: Arc<Mutex<Option<Vec<BlockMeta>>>>,
 }
 
 impl LoopTask for FullBlockReportTask {
     type Error = FsError;
 
     fn run(&self) -> FsResult<()> {
+        let blocks = {
+            let mut snapshot = self
+                .snapshot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match snapshot.as_ref() {
+                Some(blocks) => blocks.clone(),
+                None => {
+                    let blocks = match self.actor.store.all_blocks() {
+                        Ok(blocks) => blocks,
+                        Err(e) => {
+                            error!("worker full block report snapshot failed: {}", e);
+                            return Ok(());
+                        }
+                    };
+                    *snapshot = Some(blocks.clone());
+                    blocks
+                }
+            }
+        };
+
         let spend = TimeSpent::new();
-        match self.actor.full_block_report() {
+        match self.actor.full_block_report_snapshot(&blocks) {
             Ok(total_len) => {
                 info!(
                     "worker block report success, total blocks {}, used {} ms",
                     total_len,
                     spend.used_ms()
                 );
+                let mut snapshot = self
+                    .snapshot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                snapshot.take();
                 self.complete.store(true, Ordering::Release);
             }
             Err(e) => {
