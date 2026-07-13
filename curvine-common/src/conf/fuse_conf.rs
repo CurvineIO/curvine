@@ -35,8 +35,8 @@ use std::time::Duration;
 //    These trade metadata freshness for fewer upcalls into user space.
 //
 // 2. User-side caching (maintained inside curvine-fuse itself):
-//    - `enable_meta_cache` / `meta_cache_capacity` / `meta_cache_timeout` -> the
-//      bounded metadata cache backed by `MetaCache` (capacity IS enforced).
+//    - `enable_meta_cache` / `meta_cache_timeout` -> the userspace metadata
+//      cache (inode validity / directory-scan results) kept in `NodeState`.
 //    - `meta_cache_ttl` (derived from `meta_cache_timeout` in `init()`) -> TTL
 //      for metadata cache entries.
 //    - `node_cache_timeout` -> TTL-based eviction of the inode/node map.
@@ -232,12 +232,6 @@ impl FuseConf {
 
     /// Default umask applied to file-system-generated permission bits (octal 022).
     pub const DEFAULT_UMASK: u32 = 0o22;
-
-    pub const MAX_READ: u32 = 128 * 1024;
-
-    pub const MAX_WRITE: u32 = 128 * 1024;
-
-    pub const MAX_READ_AHEAD: u32 = 128 * 1024;
 
     /// Default FUSE BDI readahead window: 1 MiB (`1024` KB).
     pub const DEFAULT_MAX_READAHEAD_KB: u32 = 1024;
