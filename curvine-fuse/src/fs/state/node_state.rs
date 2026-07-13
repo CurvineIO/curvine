@@ -917,7 +917,20 @@ impl NodeState {
         let path = self.get_path_name(ino, name)?;
         let _guard = self.lock_path(&path).await;
 
-        let handle = self.new_handle(None, &path, flags, opts).await?;
+        let handle = if flags.read_only() {
+            let writer = self
+                .new_writer(&path, flags.set_write_only(), opts.clone())
+                .await?;
+            let mut status = writer.status().clone();
+            writer.complete(None).await?;
+
+            let child_ino = self.next_ino(&status);
+            status.id = child_ino as i64;
+            let _ = self.lookup_status(ino, name, &status)?;
+            return self.new_handle(Some(child_ino), &path, flags, opts).await;
+        } else {
+            self.new_handle(None, &path, flags, opts).await?
+        };
         self.lookup_status(ino, name, handle.status())?;
         Ok(handle)
     }
