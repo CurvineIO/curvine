@@ -19,6 +19,7 @@ enum JobTaskStateProto {
 
 enum JobTaskTypeProto {
   LOAD = 1;
+  EXPORT = 2;
 }
 
 message JobTaskProgressProto {
