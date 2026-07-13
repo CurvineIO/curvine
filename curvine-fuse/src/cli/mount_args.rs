@@ -56,7 +56,12 @@ pub struct FuseMountArgs {
     pub worker_threads: Option<usize>,
 
     // How many tasks can read and write data at each mount point
-    #[arg(long, help = "Tasks per mount point (optional)")]
+    // `mnt-per-task` alias kept so existing Fluid/mount scripts do not fail on upgrade.
+    #[arg(
+        long,
+        alias = "mnt-per-task",
+        help = "Tasks per mount point (optional)"
+    )]
     pub tasks_per_mnt: Option<usize>,
 
     // Whether to enable the clone fd feature

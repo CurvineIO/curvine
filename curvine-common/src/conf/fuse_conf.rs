@@ -86,6 +86,10 @@ pub struct FuseConf {
     pub mnt_number: usize,
 
     // How many tasks can be read and write data at each mount point.
+    // `mnt_per_task` alias kept for backward compatibility with pre-rename TOML
+    // configs (issue #1023 §2); without it `#[serde(default)]` would silently
+    // drop the old key and fall back to the default.
+    #[serde(alias = "mnt_per_task")]
     pub tasks_per_mnt: usize,
 
     // Whether to enable the clone fd feature
@@ -537,5 +541,20 @@ node_cache_size = 200000
         let conf: FuseConf =
             toml::from_str(toml).expect("legacy node_cache_size key must be ignored, not rejected");
         assert_eq!(conf.io_threads, 16);
+    }
+
+    #[test]
+    fn toml_legacy_mnt_per_task_alias_preserved() {
+        // mnt_per_task was renamed to tasks_per_mnt (issue #1023 §2). FuseConf is
+        // #[serde(default)] without deny_unknown_fields, so without a serde alias the
+        // old key would be silently dropped and fall back to the default (0 ->
+        // io_threads) — a silent behavioral regression. The alias must preserve the
+        // user-set value.
+        let toml = r#"
+mnt_per_task = 7
+"#;
+        let conf: FuseConf =
+            toml::from_str(toml).expect("legacy mnt_per_task key must deserialize via alias");
+        assert_eq!(conf.tasks_per_mnt, 7);
     }
 }
