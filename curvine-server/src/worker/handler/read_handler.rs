@@ -14,16 +14,15 @@
 
 use crate::worker::block::BlockStore;
 use crate::worker::handler::ReadContext;
+use crate::worker::storage::BlockReadContext;
 use crate::worker::{Worker, WorkerMetrics};
 use curvine_common::error::FsError;
 use curvine_common::proto::{BlockReadResponse, DataHeaderProto};
-use curvine_common::state::StorageType;
 use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::{ByteUnit, TimeSpent};
 use orpc::error::ErrorExt;
 use orpc::handler::MessageHandler;
-use orpc::io::{BlockDevice, BlockIO};
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::sys::{CacheManager, ReadAheadTask};
 use orpc::{err_box, ternary, try_option_mut, CommonResult};
@@ -33,7 +32,7 @@ pub struct ReadHandler {
     pub(crate) store: BlockStore,
     pub(crate) os_cache: CacheManager,
     pub(crate) context: Option<ReadContext>,
-    pub(crate) file: Option<BlockDevice>,
+    pub(crate) file: Option<BlockReadContext>,
     pub(crate) last_task: Option<ReadAheadTask>,
     pub(crate) io_slow_us: u64,
     pub(crate) enable_send_file: bool,
@@ -59,12 +58,19 @@ impl ReadHandler {
     }
 
     pub fn open(&mut self, msg: &Message) -> FsResult<Message> {
-        let mut context = ReadContext::from_req(msg)?;
+        let context = ReadContext::from_req(msg)?;
         let meta = self.store.get_block(context.block_id).map_err(|e| {
             FsError::block_not_found(context.block_id)
                 .ctx(format!("worker block store lookup failed: {}", e))
         })?;
 
+        if context.off < 0 {
+            return err_box!(
+                "Invalid read offset: {}, block length: {}",
+                context.off,
+                meta.len
+            );
+        }
         if context.off > meta.len {
             return err_box!(
                 "The length of the requested data exceeds the maximum length of the block file, \
@@ -87,16 +93,20 @@ impl ReadHandler {
             );
         }
 
-        // Check short-circuit before open. SPDK has no filesystem path.
-        let is_short_circuit =
-            context.short_circuit && meta.storage_type() != StorageType::SpdkDisk;
-        let (label, path, file) = if is_short_circuit {
-            let path = meta.get_block_file()?;
-            ("local", path, None)
+        let sc_path = if context.short_circuit {
+            self.store.short_circuit(&meta)?
         } else {
-            let file = meta.create_reader(context.off as u64)?;
-            ("remote", file.path().to_string(), Some(file))
+            None
         };
+
+        let (is_short_circuit, path, file) = if let Some(path) = sc_path {
+            (true, path, None)
+        } else {
+            let file = self.store.open_reader(&meta, context.off)?;
+            let path = file.path().to_string();
+            (false, path, Some(file))
+        };
+        let label = if is_short_circuit { "local" } else { "remote" };
 
         self.os_cache = CacheManager::new(
             context.enable_read_ahead,
@@ -124,7 +134,6 @@ impl ReadHandler {
         };
 
         let _ = mem::replace(&mut self.file, file);
-        context.bdev_offset = meta.bdev_offset;
         let _ = self.context.replace(context);
 
         self.metrics.read_blocks.with_label_values(&[label]).inc();
@@ -150,23 +159,14 @@ impl ReadHandler {
 
         if msg.header_len() > 0 {
             let header: DataHeaderProto = msg.parse_header()?;
-            let abs_offset = if file.supports_short_circuit() {
-                header.offset
-            } else {
-                context.bdev_offset + header.offset
-            };
-            if abs_offset != file.pos() {
-                file.seek(abs_offset)?;
-            }
+            file.seek_to(header.offset)?;
         }
 
         let spend = TimeSpent::new();
-        // OS page cache read-ahead is only available for local files
         if let Some(local) = file.as_local_mut() {
             self.last_task = local.read_ahead(&self.os_cache, self.last_task.take());
         }
 
-        // SPDK bypasses kernel — sendfile unavailable
         let enable_send_file = self.enable_send_file && file.supports_send_file();
         let region = file.read_region(enable_send_file, context.chunk_size)?;
 
@@ -186,25 +186,16 @@ impl ReadHandler {
         Ok(msg.success_with_data(None, region))
     }
 
-    // Reading is completed and the file is closed.
     pub fn complete(&mut self, msg: &Message) -> FsResult<Message> {
         let _block_id = match &self.context {
             Some(v) => {
-                //Remote reading
                 Self::check_context(v, msg)?;
                 v.block_id
             }
-
-            None => {
-                // Local short circuit reading, block information is in the header.
-                // let c = ReadContext::from_req(msg)?;
-                // c.block_id
-                -1
-            }
+            None => -1,
         };
 
-        let file = self.file.take();
-        drop(file);
+        self.file = None;
 
         info!("Read block end for req_id {}", msg.req_id());
         Ok(msg.success())

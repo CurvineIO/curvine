@@ -22,7 +22,6 @@ use curvine_common::proto::{ReportBlockReplicationRequest, ReportBlockReplicatio
 use curvine_common::state::{ExtendedBlock, FileType};
 use log::{error, info};
 use once_cell::sync::OnceCell;
-use orpc::io::BlockIO;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::{err_box, CommonResult};
 use std::sync::Arc;
@@ -142,13 +141,14 @@ impl WorkerReplicationManager {
             0,
         )
         .await?;
-        let mut reader = block_meta.create_reader(0)?;
+        let mut reader = self.block_store.open_reader(&block_meta, 0)?;
         let mut remaining = block_meta.len;
         while remaining > 0 {
             let size = remaining.min(self.replicate_chunk_size as i64);
             let slice = reader.read_region(true, size as i32)?;
+            let read_len = slice.len() as i64;
             writer.write(slice).await?;
-            remaining -= size;
+            remaining -= read_len;
         }
         writer.flush().await?;
         writer.complete().await?;

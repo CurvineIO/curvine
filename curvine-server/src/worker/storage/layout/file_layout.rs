@@ -13,10 +13,11 @@
 // limitations under the License.
 
 use crate::worker::block::{BlockMeta, BlockState};
-use crate::worker::storage::layout::BlockLayout;
-use crate::worker::storage::VfsDir;
+use crate::worker::storage::layout::{validate_open_offset, BlockLayout};
+use crate::worker::storage::{BlockReadContext, BlockWriteContext, VfsDir};
 use curvine_common::state::ExtendedBlock;
 use orpc::common::FileUtils;
+use orpc::io::{BlockDevice, IOError, IOResult, LocalFile};
 use orpc::CommonResult;
 use std::fs::File;
 
@@ -63,5 +64,25 @@ impl BlockLayout for FileLayout {
     fn deallocate(&self, meta: &BlockMeta) -> CommonResult<()> {
         FileUtils::delete_path(meta.get_block_path()?, false)?;
         Ok(())
+    }
+
+    fn open_writer(&self, meta: &BlockMeta, off: i64) -> IOResult<BlockWriteContext> {
+        validate_open_offset(meta, off)?;
+        let file = meta.get_block_file()?;
+        let device = BlockDevice::Local(LocalFile::with_write_offset(file, false, off)?);
+        BlockWriteContext::new(device, 0, meta.len, off)
+    }
+
+    fn open_reader(&self, meta: &BlockMeta, off: i64) -> IOResult<BlockReadContext> {
+        validate_open_offset(meta, off)?;
+        let read_off = u64::try_from(off)
+            .map_err(|_| IOError::from(format!("Invalid read offset: {}", off)))?;
+        let file = meta.get_block_file()?;
+        let device = BlockDevice::Local(LocalFile::with_read(file, read_off)?);
+        BlockReadContext::new(device, 0, meta.len, off)
+    }
+
+    fn short_circuit(&self, meta: &BlockMeta) -> CommonResult<Option<String>> {
+        Ok(Some(meta.get_block_file()?))
     }
 }

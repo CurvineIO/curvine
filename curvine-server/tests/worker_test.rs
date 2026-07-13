@@ -19,7 +19,7 @@ use curvine_common::proto::{
     BlocksBatchCommitRequest, BlocksBatchWriteRequest, BlocksBatchWriteResponse, DataHeaderProto,
     FileWriteData, FilesBatchWriteRequest,
 };
-use curvine_common::state::{ExtendedBlock, FileType, StorageType};
+use curvine_common::state::{ExtendedBlock, FileAllocOpts, FileType, StorageType};
 use curvine_common::utils::ProtoUtils;
 use curvine_server::worker::Worker;
 use orpc::common::Utils;
@@ -60,6 +60,69 @@ fn test_worker_block_write_and_read_with_checksum_validation() -> CommonResult<(
     let read_ck = block_read(block_id, &conf)?;
 
     assert_eq!(write_ck, read_ck);
+    Ok(())
+}
+
+#[test]
+fn test_worker_complete_oversized_block_aborts_pending_block() -> CommonResult<()> {
+    let conf = start_worker();
+    let client = conf.worker_sync_client()?;
+    let block_id = Utils::req_id().abs();
+    let block_size = CHUNK_SIZE as i64;
+    let block = ExtendedBlock::new(block_id, block_size + 1, StorageType::Disk, FileType::File);
+    let request = BlockWriteRequest {
+        block: ProtoUtils::extend_block_to_pb(block),
+        off: 0,
+        block_size,
+        short_circuit: false,
+        client_name: "test".to_string(),
+        chunk_size: CHUNK_SIZE,
+        pipeline_stream: Vec::new(),
+    };
+    let req_id = Utils::req_id();
+
+    let open = Builder::new()
+        .code(RpcCode::WriteBlock)
+        .request(RequestStatus::Open)
+        .req_id(req_id)
+        .seq_id(0)
+        .proto_header(request.clone())
+        .build();
+    let _: BlockWriteResponse = client.rpc_check(open)?.parse_header()?;
+
+    let complete = Builder::new()
+        .code(RpcCode::WriteBlock)
+        .request(RequestStatus::Complete)
+        .req_id(req_id)
+        .seq_id(1)
+        .proto_header(request)
+        .build();
+    let err = client.rpc_check(complete).unwrap_err();
+    assert!(err.to_string().contains("Invalid write offset"));
+
+    let read_client = conf.worker_sync_client()?;
+    let read = BlockReadRequest {
+        id: block_id,
+        off: 0,
+        len: 1,
+        chunk_size: CHUNK_SIZE,
+        short_circuit: false,
+        ..Default::default()
+    };
+    let read_open = Builder::new()
+        .code(RpcCode::ReadBlock)
+        .request(RequestStatus::Open)
+        .req_id(Utils::req_id())
+        .seq_id(0)
+        .proto_header(read)
+        .build();
+    let err = read_client.rpc_check(read_open).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains(&format!("Block {} not found", block_id)),
+        "unexpected read error: {err}"
+    );
+
     Ok(())
 }
 
@@ -361,6 +424,69 @@ fn block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
     let _: Message = client.rpc(msg)?;
 
     Ok(checksum)
+}
+
+#[test]
+fn test_worker_short_circuit_open_resizes_block_file() -> CommonResult<()> {
+    let conf = start_worker();
+    let block_id = Utils::req_id().abs();
+    let block_size = CHUNK_SIZE as i64;
+    let target_len = block_size / 2;
+    let mut block = ExtendedBlock::new(block_id, target_len, StorageType::Disk, FileType::File);
+    block.alloc_opts = Some(FileAllocOpts::with_truncate(target_len));
+
+    let request = BlockWriteRequest {
+        block: ProtoUtils::extend_block_to_pb(block.clone()),
+        off: 0,
+        block_size,
+        short_circuit: true,
+        client_name: "test".to_string(),
+        chunk_size: CHUNK_SIZE,
+        pipeline_stream: Vec::new(),
+    };
+
+    let req_id = Utils::req_id();
+    let open = Builder::new()
+        .code(RpcCode::WriteBlock)
+        .request(RequestStatus::Open)
+        .req_id(req_id)
+        .seq_id(0)
+        .proto_header(request)
+        .build();
+
+    let client = conf.worker_sync_client()?;
+    let response: BlockWriteResponse = client.rpc(open)?.parse_header()?;
+    let path = response
+        .path
+        .as_ref()
+        .expect("short-circuit write should return local path");
+    assert_eq!(
+        std::fs::metadata(path)?.len(),
+        target_len as u64,
+        "short-circuit open must apply alloc_opts resize on worker before client writes"
+    );
+
+    block.len = target_len;
+    let complete_block = ProtoUtils::extend_block_to_pb(block);
+    let complete = BlockWriteRequest {
+        block: complete_block,
+        off: 0,
+        block_size,
+        short_circuit: true,
+        client_name: "test".to_string(),
+        chunk_size: CHUNK_SIZE,
+        pipeline_stream: Vec::new(),
+    };
+    let complete_msg = Builder::new()
+        .code(RpcCode::WriteBlock)
+        .request(RequestStatus::Complete)
+        .req_id(req_id)
+        .seq_id(1)
+        .proto_header(complete)
+        .build();
+    let _: Message = client.rpc(complete_msg)?;
+
+    Ok(())
 }
 
 fn block_read(id: i64, conf: &ClusterConf) -> CommonResult<u64> {

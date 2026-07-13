@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::worker::block::BlockMeta;
-use crate::worker::storage::{BlockDataset, BlockLayout, Dataset};
+use crate::worker::storage::{
+    BlockDataset, BlockLayout, BlockReadContext, BlockWriteContext, Dataset,
+};
 use curvine_common::conf::ClusterConf;
 use curvine_common::state::{ExtendedBlock, StorageInfo};
 use log::error;
@@ -71,6 +73,30 @@ impl BlockStore {
         let state = self.read()?;
         let b = state.get_block_check(id)?;
         Ok(b.clone())
+    }
+
+    pub fn open_writer(&self, meta: &BlockMeta, off: i64) -> CommonResult<BlockWriteContext> {
+        let layout = {
+            let state = self.read()?;
+            state.layout_for(meta)
+        };
+        layout.open_writer(meta, off).map_err(Into::into)
+    }
+
+    pub fn open_reader(&self, meta: &BlockMeta, off: i64) -> CommonResult<BlockReadContext> {
+        let layout = {
+            let state = self.read()?;
+            state.layout_for(meta)
+        };
+        layout.open_reader(meta, off).map_err(Into::into)
+    }
+
+    pub fn short_circuit(&self, meta: &BlockMeta) -> CommonResult<Option<String>> {
+        let layout = {
+            let state = self.read()?;
+            state.layout_for(meta)
+        };
+        layout.short_circuit(meta)
     }
 
     pub fn worker_id(&self) -> CommonResult<u32> {

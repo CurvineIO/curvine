@@ -221,6 +221,10 @@ impl VfsDataset {
         self.release_block_space(&meta)?;
         Ok(meta)
     }
+
+    pub fn layout_for(&self, meta: &BlockMeta) -> BlockLayoutKind {
+        self.layouts.get(meta.storage_type()).clone()
+    }
 }
 
 impl Dataset for VfsDataset {

@@ -96,6 +96,11 @@ impl BlockDevice {
     pub fn supports_short_circuit(&self) -> bool {
         matches!(self, BlockDevice::Local(_))
     }
+    /// Whether this device supports resize (fallocate/truncate).
+    /// SPDK blocks live in pre-allocated bdev extents; resize is meaningless.
+    pub fn supports_resize(&self) -> bool {
+        matches!(self, BlockDevice::Local(_))
+    }
     /// Get the inner `LocalFile`, if this is a local device.
     #[allow(unreachable_patterns)]
     pub fn as_local(&self) -> Option<&LocalFile> {
