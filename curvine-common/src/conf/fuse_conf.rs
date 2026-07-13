@@ -241,6 +241,10 @@ impl FuseConf {
     pub const DEFAULT_MAX_READAHEAD_KB: u32 = 1024;
 
     pub fn init(&mut self) -> CommonResult<()> {
+        if self.io_threads == 0 {
+            return err_box!("fuse.io_threads must be > 0");
+        }
+
         self.attr_ttl = Duration::from_millis(self.attr_timeout_ms);
         self.entry_ttl = Duration::from_millis(self.entry_timeout_ms);
         self.negative_ttl = Duration::from_millis(self.negative_timeout_ms);
@@ -434,6 +438,29 @@ mod tests {
             conf.max_readahead_kb,
             Some(FuseConf::DEFAULT_MAX_READAHEAD_KB)
         );
+    }
+
+    #[test]
+    fn init_rejects_zero_io_threads() {
+        let mut conf = FuseConf {
+            io_threads: 0,
+            ..Default::default()
+        };
+        let err = conf.init().expect_err("zero io_threads must be rejected");
+        assert!(
+            err.to_string().contains("fuse.io_threads must be > 0"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn init_accepts_positive_io_threads() {
+        let mut conf = FuseConf {
+            io_threads: 1,
+            ..Default::default()
+        };
+        conf.init().expect("positive io_threads must be accepted");
     }
 
     #[test]
