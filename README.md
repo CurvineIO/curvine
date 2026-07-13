@@ -185,6 +185,17 @@ Curvine uses TOML - formatted configuration files. An example configuration is l
 - Cluster configuration (number of nodes, replication factor)
 - Performance tuning parameters
 
+Stop the cluster:
+
+```bash
+# Stop the FUSE mount
+bin/curvine-fuse.sh stop
+
+# Stop the worker and master nodes
+bin/curvine-worker.sh stop
+bin/curvine-master.sh stop
+```
+
 ## 🏗️ Architecture Design
 
 Curvine adopts a master-slave architecture:
