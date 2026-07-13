@@ -350,7 +350,6 @@ impl SpdkBdev {
                 },
                 completion: completion.clone(),
                 bdev_inflight: self.inflight.clone(),
-                qpair_dead: self.io_channel.qpair_dead.clone(),
             };
             if self.io_channel.poller_tx.send(req).is_err() {
                 self.inflight
@@ -368,6 +367,9 @@ impl SpdkBdev {
             }
             let rc = completion.wait(self.io_timeout_ms * 1000);
             if rc != 0 {
+                if rc == -libc::EIO {
+                    self.io_channel.qpair_dead.store(true, Ordering::Release);
+                }
                 return err_box!(
                     "NVMe read failed on '{}' at offset={}: {}",
                     self.name,
@@ -430,7 +432,6 @@ impl SpdkBdev {
                     },
                     completion: completion.clone(),
                     bdev_inflight: self.inflight.clone(),
-                    qpair_dead: self.io_channel.qpair_dead.clone(),
                 };
                 if self.io_channel.poller_tx.send(req).is_err() {
                     self.inflight
@@ -449,6 +450,9 @@ impl SpdkBdev {
                 let rc = completion.wait(self.io_timeout_ms * 1000);
 
                 if rc != 0 {
+                    if rc == -libc::EIO {
+                        self.io_channel.qpair_dead.store(true, Ordering::Release);
+                    }
                     return err_box!(
                         "Read-modify-write: read failed on '{}' at offset={}: {}",
                         self.name,
@@ -479,7 +483,6 @@ impl SpdkBdev {
                 },
                 completion: completion.clone(),
                 bdev_inflight: self.inflight.clone(),
-                qpair_dead: self.io_channel.qpair_dead.clone(),
             };
             if self.io_channel.poller_tx.send(req).is_err() {
                 self.inflight
@@ -497,6 +500,9 @@ impl SpdkBdev {
             }
             let rc = completion.wait(self.io_timeout_ms * 1000);
             if rc != 0 {
+                if rc == -libc::EIO {
+                    self.io_channel.qpair_dead.store(true, Ordering::Release);
+                }
                 return err_box!(
                     "NVMe write failed on '{}' at offset={}, len={}: {}",
                     self.name,
@@ -528,7 +534,6 @@ impl SpdkBdev {
             },
             completion: completion.clone(),
             bdev_inflight: self.inflight.clone(),
-            qpair_dead: self.io_channel.qpair_dead.clone(),
         };
         if self.io_channel.poller_tx.send(req).is_err() {
             return err_box!("SPDK poller thread is gone");
@@ -544,6 +549,9 @@ impl SpdkBdev {
         }
         let rc = completion.wait(self.io_timeout_ms * 1000);
         if rc != 0 {
+            if rc == -libc::EIO {
+                self.io_channel.qpair_dead.store(true, Ordering::Release);
+            }
             return err_box!(
                 "NVMe flush failed on '{}': {}",
                 self.name,
