@@ -952,6 +952,11 @@ impl NodeState {
             let handle = self.find_handle(ino, fh)?;
             handle.resize(opts).await?;
         } else if let Some(writer) = self.find_writer(ino).await {
+            // fh-less path resize (truncate(path), fallocate paths) must stay
+            // ordered with the inode's active writer; otherwise backend resize
+            // bypasses buffered writer state and open fds can observe stale
+            // metadata or EIO. This restores the PR #962 behavior after the
+            // dcache refactor moved resize handling into NodeState.
             writer.resize(opts).await?;
         } else {
             self.fs.resize(&path, opts).await?;

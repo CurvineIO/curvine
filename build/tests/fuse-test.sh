@@ -61,6 +61,7 @@ This script tests basic filesystem operations including:
   - Pwrite visibility (file size and content after pwrite)
   - POSIX rename semantics (EISDIR, ENOTEMPTY, EINVAL)
   - Mmap read/write (MAP_SHARED mmap ↔ pread coherence, issue #850)
+  - Active-writer path truncate regression (PR #962)
 
 For FIO performance tests, use fio-test.sh instead.
 
@@ -1359,6 +1360,15 @@ test_file_handle_at() {
         "file_handle_at_test.py" --dir "$TEST_DIR"
 }
 
+# Test 21: active writer path truncate regression
+test_pr962_active_writer_truncate() {
+    CURRENT_TEST_GROUP="Test 21: Active Writer Path Truncate"
+    print_header "$CURRENT_TEST_GROUP"
+    run_python_script_test \
+        "Testing fh-less path truncate routes through active writer (PR #962)" \
+        "pr962_active_writer_truncate_repro.py" --dir "$TEST_DIR"
+}
+
 # Print final report
 print_report() {
     print_header "Test Summary"
@@ -1464,6 +1474,7 @@ main() {
     test_pwrite_visibility
     test_rename
     test_file_handle_at
+    test_pr962_active_writer_truncate
 
     test_git_clone
 
