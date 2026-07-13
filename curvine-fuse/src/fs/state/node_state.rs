@@ -951,6 +951,8 @@ impl NodeState {
         if fh != 0 {
             let handle = self.find_handle(ino, fh)?;
             handle.resize(opts).await?;
+        } else if let Some(writer) = self.find_writer(ino).await {
+            writer.resize(opts).await?;
         } else {
             self.fs.resize(&path, opts).await?;
         }
