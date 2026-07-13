@@ -96,6 +96,7 @@ impl WriteHandler {
                 context.block_size
             );
         }
+        self.is_commit = false;
 
         let open_block = ExtendedBlock {
             len: context.block_size,

@@ -79,6 +79,7 @@ impl BatchWriteHandler {
         let mut responses = Vec::with_capacity(header.blocks.len());
         let mut files = Vec::with_capacity(header.blocks.len());
         let mut contexts = Vec::with_capacity(header.blocks.len());
+        self.is_commit = false;
 
         for (i, block_proto) in header.blocks.iter().cloned().enumerate() {
             let unique_req_id = msg.req_id() + i as i64;

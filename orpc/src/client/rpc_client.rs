@@ -95,9 +95,21 @@ impl RpcClient {
         let rep_msg = match &self.sender {
             BoxSender::Frame(f) => {
                 let frame = f.as_mut();
-                frame.send(msg).await?;
-                let msg = frame.receive().await?;
+                if let Err(e) = frame.send(msg).await {
+                    self.set_closed();
+                    return Err(e);
+                }
+
+                let msg = match frame.receive().await {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        self.set_closed();
+                        return Err(e);
+                    }
+                };
+
                 if msg.is_empty() {
+                    self.set_closed();
                     return err_box!("Connection {} is closed", self.state.conn_info());
                 } else {
                     msg

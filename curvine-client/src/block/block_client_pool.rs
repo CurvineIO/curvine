@@ -112,12 +112,12 @@ impl BlockClientPool {
             let idle_duration = current_time.saturating_sub(client.uptime());
             self.cur_idle_size.decr();
 
-            if idle_duration < self.idle_time_ms {
+            if idle_duration < self.idle_time_ms && client.is_active() {
                 debug!("acquiring connection for worker {} from pool", addr);
                 return Ok(client);
             } else {
                 debug!(
-                    "connection for worker {} expired (idle={}ms), removing from pool",
+                    "connection for worker {} is inactive or expired (idle={}ms), removing from pool",
                     addr, idle_duration
                 );
                 client.clear_pool();
@@ -140,7 +140,13 @@ impl BlockClientPool {
             Some(pool) if pool.id == self.id => {
                 let addr = client.worker_addr().clone();
 
-                if self.cur_idle_size.get() >= self.max_idle_size {
+                if !client.is_active() {
+                    debug!(
+                        "connection for worker {} is closed, not returning to pool",
+                        client.worker_addr()
+                    );
+                    client.clear_pool();
+                } else if self.cur_idle_size.get() >= self.max_idle_size {
                     debug!(
                         "pool full(max={}), closing connection for worker {}",
                         self.max_idle_size,
