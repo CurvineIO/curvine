@@ -17,7 +17,7 @@ use curvine_common::proto::{
     CancelJobRequest, CancelJobResponse, GetJobStatusRequest, GetJobStatusResponse,
     SubmitJobRequest, SubmitJobResponse, TaskReportRequest, TaskReportResponse,
 };
-use curvine_common::state::LoadJobCommand;
+use curvine_common::state::{JobTaskType, LoadJobCommand};
 use curvine_common::utils::{ProtoUtils, SerdeUtils};
 use curvine_common::FsResult;
 use orpc::err_box;
@@ -37,11 +37,11 @@ impl JobHandler {
         Self { job_manager }
     }
 
-    /// Submit loading task
+    /// Submit a load or export job.
     ///
-    /// Handles the submission of a new load job by parsing the request,
-    /// validating parameters, and forwarding to the load manager.
-    pub async fn submit_load_job(
+    /// Handles the submission of a new job by parsing the request,
+    /// validating parameters, and forwarding to the job manager.
+    pub async fn submit_job(
         &self,
         ctx: &mut RpcContext<'_>,
         buf: &mut FrameBuf,
@@ -54,7 +54,13 @@ impl JobHandler {
             return err_box!("Path cannot be empty");
         }
 
-        let res = self.job_manager.submit_load_job(command).await?;
+        let res = match req.job_type {
+            v if v == JobTaskType::Load as i32 => self.job_manager.submit_load_job(command).await?,
+            v if v == JobTaskType::Export as i32 => {
+                self.job_manager.submit_export_job(command).await?
+            }
+            v => return err_box!("Unsupported job type: {}", v),
+        };
         let response = SubmitJobResponse {
             job_id: res.job_id,
             target_path: res.target_path,

@@ -106,6 +106,7 @@ impl LoadJobResult {
 pub enum JobTaskType {
     #[num_enum(default)]
     Load = 1,
+    Export = 2,
 }
 
 #[derive(Default)]

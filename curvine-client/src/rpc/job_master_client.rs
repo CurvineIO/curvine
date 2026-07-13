@@ -55,8 +55,21 @@ impl JobMasterClient {
 
     // Submit loading task
     pub async fn submit_load_job(&self, command: LoadJobCommand) -> FsResult<LoadJobResult> {
+        self.submit_job(JobTaskType::Load, command).await
+    }
+
+    // Submit export task
+    pub async fn submit_export_job(&self, command: LoadJobCommand) -> FsResult<LoadJobResult> {
+        self.submit_job(JobTaskType::Export, command).await
+    }
+
+    async fn submit_job(
+        &self,
+        job_type: JobTaskType,
+        command: LoadJobCommand,
+    ) -> FsResult<LoadJobResult> {
         let req = SubmitJobRequest {
-            job_type: JobTaskType::Load.into(),
+            job_type: job_type.into(),
             job_command: SerdeUtils::serialize(&command)?,
         };
 
