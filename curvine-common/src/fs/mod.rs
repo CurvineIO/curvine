@@ -30,9 +30,6 @@ pub use self::writer::Writer;
 mod filesystem;
 pub use self::filesystem::FileSystem;
 
-mod meta_cache;
-pub use self::meta_cache::MetaCache;
-
 mod state_file;
 pub use self::state_file::*;
 

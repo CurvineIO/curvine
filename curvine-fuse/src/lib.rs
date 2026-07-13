@@ -123,8 +123,6 @@ pub const FUSE_S_ISGID: u32 = 0x400;
 // Default file permission code
 pub const FUSE_DEFAULT_MODE: u32 = 0o777;
 
-pub const FUSE_DEFAULT_UMASK: u32 = 0o022;
-
 pub const FUSE_UNKNOWN_INO: u64 = 0xffffffff;
 
 pub const FUSE_FOPEN_DIRECT_IO: u32 = 1 << 0;
