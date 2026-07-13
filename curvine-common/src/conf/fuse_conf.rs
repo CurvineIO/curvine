@@ -86,7 +86,7 @@ pub struct FuseConf {
     pub mnt_number: usize,
 
     // How many tasks can be read and write data at each mount point.
-    pub mnt_per_task: usize,
+    pub tasks_per_mnt: usize,
 
     // Whether to enable the clone fd feature
     pub clone_fd: bool,
@@ -249,8 +249,8 @@ impl FuseConf {
         self.node_cache_ttl = DurationUnit::from_str(&self.node_cache_timeout)?.as_duration();
         self.meta_cache_ttl = DurationUnit::from_str(&self.meta_cache_timeout)?.as_duration();
 
-        if self.mnt_per_task == 0 {
-            self.mnt_per_task = self.io_threads;
+        if self.tasks_per_mnt == 0 {
+            self.tasks_per_mnt = self.io_threads;
         }
 
         let fs_path = Path::from_str(&self.fs_path)?;
@@ -373,7 +373,7 @@ impl Default for FuseConf {
             mnt_path: "/curvine-fuse".to_string(),
             fs_path: "/".to_string(),
             mnt_number: 1,
-            mnt_per_task: 0,
+            tasks_per_mnt: 0,
             clone_fd: true,
             fuse_channel_size: 0,
             stream_channel_size: 0,

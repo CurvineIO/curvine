@@ -38,10 +38,10 @@ impl<T: FileSystem> FuseChannel<T> {
         let buf_size =
             FuseUtils::get_fuse_buf_size().max(max_readahead as usize + FUSE_BUFFER_HEADER_SIZE);
 
-        let mut receivers = Vec::with_capacity(conf.mnt_per_task);
-        let mut senders = Vec::with_capacity(conf.mnt_per_task);
+        let mut receivers = Vec::with_capacity(conf.tasks_per_mnt);
+        let mut senders = Vec::with_capacity(conf.tasks_per_mnt);
         let pending_requests = Arc::new(FastDashMap::default());
-        for _ in 0..conf.mnt_per_task {
+        for _ in 0..conf.tasks_per_mnt {
             let (tx, rx) = AsyncChannel::new(conf.fuse_channel_size).split();
             let fd = mnt.create_async_task_fd(conf.clone_fd)?;
 
