@@ -71,7 +71,7 @@ public class FilesystemConf {
     public String read_ahead_len = "0";
     public String drop_cache_len = "1MB";
 
-    public String failed_worker_ttl = "10m";
+    public long failed_worker_ttl_ms = 10 * 60 * 1000;
 
     public boolean enable_unified_fs  = true;
 
@@ -81,19 +81,19 @@ public class FilesystemConf {
 
     public int umask = 022;
 
-    public String mount_update_ttl = "10s";
+    public long mount_update_ttl_ms = 10 * 1000;
 
-    public String sync_check_interval_min = "100ms";
+    public long sync_check_interval_min_ms = 100;
 
-    public String sync_check_interval_max = "1s";
+    public long sync_check_interval_max_ms = 1000;
 
-    public String max_sync_wait_timeout = "5m";
+    public long max_sync_wait_timeout_ms = 5 * 60 * 1000;
 
     public int sync_check_log_tick = 3;
 
     public boolean enable_block_conn_pool = true;
     public int block_conn_idle_size = 128;
-    public String block_conn_idle_time = "60s";
+    public long block_conn_idle_time_ms = 60 * 1000;
 
     public String small_file_size = "4MB";
 
@@ -242,19 +242,19 @@ public class FilesystemConf {
                 ", enable_read_ahead=" + enable_read_ahead +
                 ", read_ahead_len='" + read_ahead_len + '\'' +
                 ", drop_cache_len='" + drop_cache_len + '\'' +
-                ", failed_worker_ttl='" + failed_worker_ttl + '\'' +
+                ", failed_worker_ttl_ms=" + failed_worker_ttl_ms +
                 ", enable_unified_fs=" + enable_unified_fs +
                 ", enable_read_ufs=" + enable_rust_read_ufs +
                 ", enable_fallback_read_ufs=" + enable_fallback_read_ufs +
                 ", umask=" + umask +
-                ", mount_update_ttl='" + mount_update_ttl + '\'' +
-                ", sync_check_interval_min='" + sync_check_interval_min + '\'' +
-                ", sync_check_interval_max='" + sync_check_interval_max + '\'' +
-                ", max_sync_wait_timeout='" + max_sync_wait_timeout + '\'' +
+                ", mount_update_ttl_ms=" + mount_update_ttl_ms +
+                ", sync_check_interval_min_ms=" + sync_check_interval_min_ms +
+                ", sync_check_interval_max_ms=" + sync_check_interval_max_ms +
+                ", max_sync_wait_timeout_ms=" + max_sync_wait_timeout_ms +
                 ", sync_check_log_tick=" + sync_check_log_tick +
                 ", enable_block_conn_pool=" + enable_block_conn_pool +
                 ", block_conn_idle_size=" + block_conn_idle_size +
-                ", block_conn_idle_time='" + block_conn_idle_time + '\'' +
+                ", block_conn_idle_time_ms=" + block_conn_idle_time_ms +
                 ", small_file_size='" + small_file_size + '\'' +
                 ", enable_smart_prefetch=" + enable_smart_prefetch +
                 ", large_file_size='" + large_file_size + '\'' +

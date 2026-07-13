@@ -88,20 +88,26 @@ pub struct FilesystemConf {
     pub display_thread: bool,
     pub display_position: bool,
 
+    #[serde(alias = "failed_worker_ttl")]
     pub failed_worker_ttl_ms: u64,
 
     pub enable_unified_fs: bool,
     pub enable_rust_read_ufs: bool,
 
+    #[serde(alias = "mount_update_ttl")]
     pub mount_update_ttl_ms: u64,
 
+    #[serde(alias = "sync_check_interval_min")]
     pub sync_check_interval_min_ms: u64,
+    #[serde(alias = "sync_check_interval_max")]
     pub sync_check_interval_max_ms: u64,
+    #[serde(alias = "max_sync_wait_timeout")]
     pub max_sync_wait_timeout_ms: u64,
     pub sync_check_log_tick: u32,
 
     pub enable_block_conn_pool: bool,
     pub block_conn_idle_size: usize,
+    #[serde(alias = "block_conn_idle_time")]
     pub block_conn_idle_time_ms: u64,
 
     pub small_file_size: String,

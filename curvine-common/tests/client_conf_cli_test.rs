@@ -256,6 +256,23 @@ block_conn_idle_time = 60000
 }
 
 #[test]
+fn toml_legacy_string_duration_is_rejected() {
+    // The string->ms migration is intentionally breaking: a human-readable
+    // duration like "10m" must NOT silently deserialize into a u64 ms field.
+    // This locks the contract so we cannot regress into accepting duration
+    // strings again (which would reintroduce the DurationUnit dependency).
+    let toml = r#"
+failed_worker_ttl = "10m"
+"#;
+    let result = toml::from_str::<ClientConf>(toml);
+    assert!(
+        result.is_err(),
+        "string duration value must be rejected, got: {:?}",
+        result.map(|c| c.failed_worker_ttl_ms)
+    );
+}
+
+#[test]
 fn client_cli_flags_parse_alongside_mount_io_threads() {
     #[derive(Debug, Parser)]
     struct MountLikeArgs {
