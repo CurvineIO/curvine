@@ -233,9 +233,10 @@ mod tests {
     use std::fs::remove_file;
 
     /// Open the underlying LocalFile at position 0 (no pre-positioning) so
-    /// `Block{Read,Write}Context::new` is solely responsible for establishing the
-    /// `device.pos() == device_base + block_pos` invariant. This mirrors the
-    /// shared-device scenario (bdev/pool) that the abstraction targets.
+    /// `BlockWriteContext::new` / `BlockReadContext::new` are solely responsible
+    /// for establishing the `device.pos() == device_base + block_pos` invariant.
+    /// This mirrors the shared-device scenario (bdev/pool) that the abstraction
+    /// targets.
     fn shared_write_device(path: &str) -> IOResult<BlockDevice> {
         Ok(BlockDevice::Local(LocalFile::with_write(path, false)?))
     }

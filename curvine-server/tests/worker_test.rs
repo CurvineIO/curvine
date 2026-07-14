@@ -98,7 +98,7 @@ fn test_worker_complete_oversized_block_aborts_pending_block() -> CommonResult<(
         .proto_header(request)
         .build();
     let err = client.rpc_check(complete).unwrap_err();
-    assert!(err.to_string().contains("Invalid write offset"));
+    assert!(err.to_string().contains("Invalid block length"));
 
     let read_client = conf.worker_sync_client()?;
     let read = BlockReadRequest {

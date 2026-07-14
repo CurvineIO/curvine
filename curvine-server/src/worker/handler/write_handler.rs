@@ -282,7 +282,7 @@ impl WriteHandler {
                 );
             }
             return err_box!(
-                "Invalid write offset: {}, block size: {}",
+                "Invalid block length: {}, block size: {}",
                 context.block.len,
                 context.block_size
             );

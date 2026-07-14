@@ -194,7 +194,7 @@ impl BatchWriteHandler {
             }
             if block.len > context.block_size {
                 return err_box!(
-                    "Invalid write offset: {}, block size: {}",
+                    "Invalid block length: {}, block size: {}",
                     block.len,
                     context.block_size
                 );
