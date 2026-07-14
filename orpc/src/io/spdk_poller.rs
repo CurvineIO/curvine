@@ -255,6 +255,13 @@ impl SpdkPoller {
         }
     }
 
+    /// Returns true if any qpair is active (pollable, not yet dead).
+    fn has_active_qpairs(qpair_state: &HashMap<usize, Box<QpairState>>) -> bool {
+        qpair_state
+            .values()
+            .any(|qs| !qs.pending.is_empty() && !qs.dead.load(Ordering::Acquire))
+    }
+
     /// Main poller loop. Runs on dedicated thread.
     fn poller_loop(
         rx: crossbeam::channel::Receiver<IoRequest>,
@@ -264,11 +271,10 @@ impl SpdkPoller {
         mut config: PollerConfig,
         orphaned: Arc<Mutex<HashMap<usize, Box<QpairState>>>>,
     ) {
-        let mut active_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
         let active_ctrlrs: Vec<CtrlHandle> = std::mem::take(&mut config.ctrlrs);
         let mut state = PollerState::Idle;
         // Tracks per-qpair state (dead flag + pending Vec) for force-completion.
-        let mut dead_qpairs: HashMap<usize, Box<QpairState>> = HashMap::new();
+        let mut qpair_state: HashMap<usize, Box<QpairState>> = HashMap::new();
         let has_orphaned = AtomicBool::new(false);
 
         // Verify curvine_async_ctx buffer fits the C struct.
@@ -282,7 +288,10 @@ impl SpdkPoller {
         let poll_interval = config.poll_interval_ms as i32;
         loop {
             // Check shutdown first
-            if shutdown.load(Ordering::Acquire) && rx.is_empty() && active_qpairs.is_empty() {
+            if shutdown.load(Ordering::Acquire)
+                && rx.is_empty()
+                && !Self::has_active_qpairs(&qpair_state)
+            {
                 break;
             }
 
@@ -295,17 +304,11 @@ impl SpdkPoller {
                 let mut drain_count: u64 = 0;
                 while let Ok(req) = rx.try_recv() {
                     if matches!(req.op, IoOp::UnregisterQpair { .. }) {
-                        Self::handle_unregister(
-                            &req,
-                            &mut active_qpairs,
-                            &mut dead_qpairs,
-                            &*orphaned,
-                        );
+                        Self::handle_unregister(&req, &mut qpair_state, &*orphaned);
                     } else {
                         Self::submit_one(
                             &req,
-                            &mut active_qpairs,
-                            &mut dead_qpairs,
+                            &mut qpair_state,
                             &*orphaned,
                             &has_orphaned,
                             config.io_queue_depth,
@@ -319,19 +322,13 @@ impl SpdkPoller {
                 }
 
                 // Poll qpairs for completions and detect failures
-                Self::poll_and_sweep(
-                    &mut active_qpairs,
-                    &mut dead_qpairs,
-                    &*orphaned,
-                    &has_orphaned,
-                    "poller",
-                );
+                Self::poll_and_sweep(&mut qpair_state, &*orphaned, &has_orphaned, "poller");
 
                 // Process admin completions (keep-alive)
                 Self::process_admin_completions(&active_ctrlrs);
 
                 // Spin briefly before Idle to avoid eventfd round-trip for back-to-back I/O
-                if rx.is_empty() && active_qpairs.is_empty() {
+                if rx.is_empty() && !Self::has_active_qpairs(&qpair_state) {
                     state = PollerState::Idle;
                     for _ in 0..config.spin_iter {
                         std::hint::spin_loop();
@@ -391,17 +388,11 @@ impl SpdkPoller {
                         let mut drain_count: u64 = 0;
                         while let Ok(req) = rx.try_recv() {
                             if matches!(req.op, IoOp::UnregisterQpair { .. }) {
-                                Self::handle_unregister(
-                                    &req,
-                                    &mut active_qpairs,
-                                    &mut dead_qpairs,
-                                    &*orphaned,
-                                );
+                                Self::handle_unregister(&req, &mut qpair_state, &*orphaned);
                             } else {
                                 Self::submit_one(
                                     &req,
-                                    &mut active_qpairs,
-                                    &mut dead_qpairs,
+                                    &mut qpair_state,
                                     &*orphaned,
                                     &has_orphaned,
                                     config.io_queue_depth,
@@ -420,8 +411,7 @@ impl SpdkPoller {
                     0 => {
                         // Timeout - poll active qpairs to check connection health
                         Self::poll_and_sweep(
-                            &mut active_qpairs,
-                            &mut dead_qpairs,
+                            &mut qpair_state,
                             &*orphaned,
                             &has_orphaned,
                             "keep-alive",
@@ -452,9 +442,9 @@ impl SpdkPoller {
         // (caller is responsible for calling reclaim_stale after qpair_pool::drain_all).
         // Force-complete any remaining pending I/Os before the lock so cleanup
         // cannot be skipped by a poisoned mutex.
-        let dead_keys: Vec<usize> = dead_qpairs.keys().copied().collect();
+        let dead_keys: Vec<usize> = qpair_state.keys().copied().collect();
         for &key in &dead_keys {
-            Self::force_complete_qpair(key, &mut dead_qpairs);
+            Self::force_complete_qpair(key, &mut qpair_state);
         }
         let mut guard = match orphaned.lock() {
             Ok(g) => g,
@@ -463,7 +453,7 @@ impl SpdkPoller {
                 e.into_inner()
             }
         };
-        for (key, mut qs) in dead_qpairs.drain() {
+        for (key, mut qs) in qpair_state.drain() {
             if let Some(mut prev) = guard.remove(&key) {
                 qs.stale.extend(prev.stale.drain(..));
                 qs.stale.extend(prev.pending.drain(..));
@@ -480,15 +470,14 @@ impl SpdkPoller {
     /// late callbacks during free_io_qpair.
     fn handle_unregister(
         req: &IoRequest,
-        active_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>,
-        dead_qpairs: &mut HashMap<usize, Box<QpairState>>,
+        qpair_state: &mut HashMap<usize, Box<QpairState>>,
         orphaned: &Mutex<HashMap<usize, Box<QpairState>>>,
     ) {
         if let IoOp::UnregisterQpair { qpair, ack } = &req.op {
-            active_qpairs.retain(|&qp| qp != *qpair);
             let key = *qpair as usize;
             // Signal pending entries with -ESHUTDOWN, move to stale, then orphan
-            if let Some(mut qs) = dead_qpairs.remove(&key) {
+            if let Some(mut qs) = qpair_state.remove(&key) {
+                qs.dead.store(true, Ordering::Release);
                 for &ptr in &qs.pending {
                     unsafe {
                         if (*ptr).completion.complete(-libc::ESHUTDOWN) {
@@ -520,8 +509,7 @@ impl SpdkPoller {
     /// Submit a single I/O request on the poller thread.
     fn submit_one(
         req: &IoRequest,
-        active_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>,
-        dead_qpairs: &mut HashMap<usize, Box<QpairState>>,
+        qpair_state: &mut HashMap<usize, Box<QpairState>>,
         orphaned: &Mutex<HashMap<usize, Box<QpairState>>>,
         has_orphaned: &AtomicBool,
         io_queue_depth: usize,
@@ -550,7 +538,7 @@ impl SpdkPoller {
         }
 
         // Register/retrieve QpairState on first sight of this qpair.
-        let qs = dead_qpairs.entry(key).or_insert_with(|| {
+        let qs = qpair_state.entry(key).or_insert_with(|| {
             Box::new(QpairState {
                 dead: Arc::new(AtomicBool::new(false)),
                 pending: Vec::with_capacity(io_queue_depth),
@@ -641,17 +629,12 @@ impl SpdkPoller {
             }
             return;
         }
-
-        // Track active qpair
-        if !active_qpairs.contains(&qpair) {
-            active_qpairs.push(qpair);
-        }
     }
 
     /// Force-complete all outstanding I/Os on a failed qpair using the
     /// per-qpair pending Vec, then mark the qpair dead so future submissions fail fast.
-    fn force_complete_qpair(key: usize, dead_qpairs: &mut HashMap<usize, Box<QpairState>>) {
-        if let Some(qs) = dead_qpairs.get_mut(&key) {
+    fn force_complete_qpair(key: usize, qpair_state: &mut HashMap<usize, Box<QpairState>>) {
+        if let Some(qs) = qpair_state.get_mut(&key) {
             qs.dead.store(true, Ordering::Release);
             let pending = std::mem::take(&mut qs.pending);
             let count = pending.len();
@@ -689,21 +672,24 @@ impl SpdkPoller {
 
 impl SpdkPoller {
     /// Poll all active qpairs, handle errors.
-    /// On error: force_complete + move QpairState from dead_qpairs to orphaned HashMap.
+    /// On error: force_complete + move QpairState from qpair_state to orphaned HashMap.
     fn poll_and_sweep(
-        active_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>,
-        dead_qpairs: &mut HashMap<usize, Box<QpairState>>,
+        qpair_state: &mut HashMap<usize, Box<QpairState>>,
         orphaned: &Mutex<HashMap<usize, Box<QpairState>>>,
         has_orphaned: &AtomicBool,
         context: &str,
     ) {
-        let err_keys: Vec<usize> = active_qpairs
+        let err_keys: Vec<usize> = qpair_state
             .iter()
-            .filter_map(|&qpair| {
+            .filter_map(|(&key, qs)| {
+                if qs.dead.load(Ordering::Acquire) {
+                    return None;
+                }
+                let qpair = key as *mut spdk_ffi::spdk_nvme_qpair;
                 let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(qpair, 0) };
                 if rc < 0 {
                     error!("{}: qpair poll error: rc={}", context, rc);
-                    Some(qpair as usize)
+                    Some(key)
                 } else {
                     None
                 }
@@ -712,9 +698,8 @@ impl SpdkPoller {
         if err_keys.is_empty() {
             return;
         }
-        active_qpairs.retain(|&qp| !err_keys.contains(&(qp as usize)));
         for &key in &err_keys {
-            Self::force_complete_qpair(key, dead_qpairs);
+            Self::force_complete_qpair(key, qpair_state);
         }
         let mut guard = match orphaned.lock() {
             Ok(g) => g,
@@ -724,7 +709,7 @@ impl SpdkPoller {
             }
         };
         for &key in &err_keys {
-            if let Some(mut qs) = dead_qpairs.remove(&key) {
+            if let Some(mut qs) = qpair_state.remove(&key) {
                 if let Some(mut prev) = guard.remove(&key) {
                     qs.stale.extend(prev.stale.drain(..));
                     qs.stale.extend(prev.pending.drain(..));
@@ -874,13 +859,13 @@ mod test {
         }));
         qs_live.pending.push(ctx_3);
 
-        // Build dead_qpairs map.
-        let mut dead_qpairs: HashMap<usize, Box<QpairState>> = HashMap::new();
-        dead_qpairs.insert(DEAD, qs_dead);
-        dead_qpairs.insert(LIVE, qs_live);
+        // Build qpair_state map.
+        let mut qpair_state: HashMap<usize, Box<QpairState>> = HashMap::new();
+        qpair_state.insert(DEAD, qs_dead);
+        qpair_state.insert(LIVE, qs_live);
 
         // Act.
-        SpdkPoller::force_complete_qpair(DEAD, &mut dead_qpairs);
+        SpdkPoller::force_complete_qpair(DEAD, &mut qpair_state);
 
         // Assert: DEAD entries completed with -EIO.
         assert_eq!(completion_1.wait(0), -libc::EIO);
@@ -895,25 +880,24 @@ mod test {
 
         // Assert: LIVE entry's bdev_inflight unchanged.
         assert_eq!(inflight_3.load(Ordering::Acquire), 1);
-        // Assert: DEAD stays in dead_qpairs with entries in stale.
-        assert!(dead_qpairs.contains_key(&DEAD));
-        assert_eq!(dead_qpairs[&DEAD].stale.len(), 2);
-        assert_eq!(dead_qpairs[&DEAD].pending.len(), 0);
-
-        // Assert: dead flag set.
+        // Assert: DEAD stays in qpair_state with entries in stale.
+        assert!(qpair_state.contains_key(&DEAD));
+        assert_eq!(qpair_state[&DEAD].stale.len(), 2);
+        assert_eq!(qpair_state[&DEAD].pending.len(), 0);
         assert!(dead_flag.load(Ordering::Acquire));
 
         // Reclaim stale entries (frees CallbackCtx, signals already done).
-        if let Some(qs) = dead_qpairs.get_mut(&DEAD) {
+        if let Some(qs) = qpair_state.get_mut(&DEAD) {
             qs.reclaim_stale();
         }
-        dead_qpairs.remove(&DEAD);
+        qpair_state.remove(&DEAD);
 
         // Assert: LIVE still present and untouched.
-        assert!(dead_qpairs.contains_key(&LIVE));
+        assert!(qpair_state.contains_key(&LIVE));
+
         // Clean up LIVE entry (force_complete did not touch it).
         // The raw pointer in qs_live.pending must be reclaimed.
-        if let Some(qs) = dead_qpairs.get_mut(&LIVE) {
+        if let Some(qs) = qpair_state.get_mut(&LIVE) {
             for cb_ptr in qs.pending.drain(..) {
                 unsafe { drop(Box::from_raw(cb_ptr as *mut CallbackCtx)) };
             }
@@ -1114,6 +1098,16 @@ mod test {
     }
 
     #[test]
+    fn complete_second_call_does_not_decrement_inflight() {
+        let completion = IoCompletion::new();
+        assert!(completion.complete(42));
+        assert_eq!(completion.wait(0), 42);
+
+        assert!(!completion.complete(99));
+        assert_eq!(completion.wait(0), 42);
+    }
+
+    #[test]
     fn submit_one_rc_error_reindexes_on_swap_remove() {
         let inflight_0 = Arc::new(AtomicUsize::new(1));
         let completion_0 = IoCompletion::new();
@@ -1207,6 +1201,81 @@ mod test {
     }
 
     #[test]
+    fn poller_callback_out_of_order_reindexes_pending_idx() {
+        // 3 I/Os, completed out of order - verifies swap_remove + reindex
+        // in the callback hot path (not just the submit_one error path).
+        let inflight: Vec<Arc<AtomicUsize>> =
+            (0..3).map(|_| Arc::new(AtomicUsize::new(1))).collect();
+        let completions: Vec<Arc<IoCompletion>> = (0..3).map(|_| IoCompletion::new()).collect();
+        let mut qs = Box::new(QpairState {
+            dead: Arc::new(AtomicBool::new(false)),
+            pending: Vec::new(),
+            stale: Vec::new(),
+        });
+
+        let mut ctxs: Vec<*mut CallbackCtx> = Vec::new();
+        for i in 0..3 {
+            let ctx = Box::into_raw(Box::new(CallbackCtx {
+                completion: completions[i].clone(),
+                async_ctx: unsafe { std::mem::zeroed() },
+                bdev_inflight: inflight[i].clone(),
+                qpair_state: &mut *qs as *mut QpairState,
+                pending_idx: i,
+            }));
+            qs.pending.push(ctx);
+            ctxs.push(ctx);
+        }
+
+        // Complete index 0 first — swap_remove(0) reindexes last to 0.
+        unsafe { poller_callback(ctxs[0] as *mut c_void, 42) };
+        assert_eq!(qs.pending.len(), 2);
+        // ctx_1 was last (idx=1), now at position 0 after swap.
+        assert_eq!(unsafe { (*qs.pending[0]).pending_idx }, 0);
+        assert_eq!(unsafe { (*qs.pending[1]).pending_idx }, 1);
+
+        // Complete original index 1 next — it's now at position 1 (last), pop.
+        unsafe { poller_callback(ctxs[1] as *mut c_void, 43) };
+        assert_eq!(qs.pending.len(), 1);
+        // Only ctx_2 remains, reindexed to 0 from the first swap.
+        assert_eq!(unsafe { (*qs.pending[0]).pending_idx }, 0);
+
+        // Complete original index 2 last — it's the only entry, pop.
+        unsafe { poller_callback(ctxs[2] as *mut c_void, 44) };
+        assert!(qs.pending.is_empty());
+
+        // All completions signaled with correct status.
+        assert_eq!(completions[0].wait(0), 42);
+        assert_eq!(completions[1].wait(0), 43);
+        assert_eq!(completions[2].wait(0), 44);
+
+        // All inflight decremented exactly once.
+        for i in 0..3 {
+            assert_eq!(inflight[i].load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn submit_to_dead_qpair_does_not_push_pending() {
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let completion = IoCompletion::new();
+        let qs = Box::new(QpairState {
+            dead: Arc::new(AtomicBool::new(true)),
+            pending: Vec::new(),
+            stale: Vec::new(),
+        });
+
+        // Simulate the fast-fail path from submit_one: dead check before push.
+        if qs.dead.load(Ordering::Acquire) {
+            inflight.fetch_sub(1, Ordering::Release);
+            completion.complete(-libc::ENXIO);
+        }
+
+        assert!(qs.pending.is_empty(), "dead qpair must not push to pending");
+        assert_eq!(inflight.load(Ordering::Acquire), 0);
+        assert_eq!(completion.wait(0), -libc::ENXIO);
+    }
+
+    #[test]
     fn force_complete_into_stale_reclaimable() {
         let completion = IoCompletion::new();
         let inflight = Arc::new(AtomicUsize::new(1));
@@ -1226,22 +1295,22 @@ mod test {
         }));
         qs.pending.push(ctx);
 
-        let mut dead_qpairs: HashMap<usize, Box<QpairState>> = HashMap::new();
-        dead_qpairs.insert(0xDEAD, qs);
+        let mut qpair_state: HashMap<usize, Box<QpairState>> = HashMap::new();
+        qpair_state.insert(0xDEAD, qs);
 
-        SpdkPoller::force_complete_qpair(0xDEAD, &mut dead_qpairs);
+        SpdkPoller::force_complete_qpair(0xDEAD, &mut qpair_state);
 
         // QpairState stays alive with entry in stale.
-        assert!(dead_qpairs.contains_key(&0xDEAD));
-        assert_eq!(dead_qpairs[&0xDEAD].stale.len(), 1);
-        assert_eq!(dead_qpairs[&0xDEAD].pending.len(), 0);
+        assert!(qpair_state.contains_key(&0xDEAD));
+        assert_eq!(qpair_state[&0xDEAD].stale.len(), 1);
+        assert_eq!(qpair_state[&0xDEAD].pending.len(), 0);
         assert!(dead_flag.load(Ordering::Acquire));
 
         // reclaim_stale frees the stale CallbackCtx.
-        if let Some(qs) = dead_qpairs.get_mut(&0xDEAD) {
+        if let Some(qs) = qpair_state.get_mut(&0xDEAD) {
             qs.reclaim_stale();
         }
-        assert_eq!(dead_qpairs[&0xDEAD].stale.len(), 0);
+        assert_eq!(qpair_state[&0xDEAD].stale.len(), 0);
         assert_eq!(completion.wait(0), -libc::EIO);
         assert_eq!(inflight.load(Ordering::Acquire), 0);
     }
@@ -1249,8 +1318,7 @@ mod test {
     #[test]
     fn handle_unregister_orphans_pending_entries() {
         let qpair = 0x1 as *mut _;
-        let mut active_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
-        let mut dead_qpairs: HashMap<usize, Box<QpairState>> = HashMap::new();
+        let mut qpair_state: HashMap<usize, Box<QpairState>> = HashMap::new();
         let orphaned = Arc::new(Mutex::new(HashMap::new()));
 
         let dead_flag = Arc::new(AtomicBool::new(false));
@@ -1283,7 +1351,7 @@ mod test {
         }));
         qs.pending.push(ctx_2);
 
-        dead_qpairs.insert(qpair as usize, qs);
+        qpair_state.insert(qpair as usize, qs);
 
         let (ack_tx, ack_rx) = mpsc::channel();
         let req = IoRequest {
@@ -1292,21 +1360,15 @@ mod test {
             bdev_inflight: Arc::new(AtomicUsize::new(0)),
         };
 
-        SpdkPoller::handle_unregister(&req, &mut active_qpairs, &mut dead_qpairs, &orphaned);
+        SpdkPoller::handle_unregister(&req, &mut qpair_state, &orphaned);
 
-        // 1: removed from active_qpairs
+        // 1: qpair_state is empty
         assert!(
-            active_qpairs.is_empty(),
-            "unregistered qpair must be removed from active"
+            qpair_state.is_empty(),
+            "qpair_state must be empty after unregister"
         );
 
-        // 2: dead_qpairs is empty
-        assert!(
-            dead_qpairs.is_empty(),
-            "dead_qpairs must be empty after unregister"
-        );
-
-        // 3: orphaned has the entry with pending->stale, signaled with -ESHUTDOWN
+        // 2: orphaned has the entry with pending->stale, signaled with -ESHUTDOWN
         let guard = orphaned.lock().unwrap();
         let orphaned_qs = guard
             .get(&(qpair as usize))
@@ -1327,7 +1389,7 @@ mod test {
         assert!(orphaned_qs.stale.contains(&ctx_1));
         assert!(orphaned_qs.stale.contains(&ctx_2));
 
-        // 4: pending entries signaled with -ESHUTDOWN, inflight decremented
+        // 3: pending entries signaled with -ESHUTDOWN, inflight decremented
         assert_eq!(completion_1.wait(0), -libc::ESHUTDOWN);
         assert_eq!(completion_2.wait(0), -libc::ESHUTDOWN);
         assert_eq!(inflight_1.load(Ordering::Acquire), 0);
@@ -1341,8 +1403,7 @@ mod test {
     #[test]
     fn handle_unregister_orphan_collision_merges_entries() {
         let qpair = 0x1 as *mut _;
-        let mut active_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
-        let mut dead_qpairs: HashMap<usize, Box<QpairState>> = HashMap::new();
+        let mut qpair_state: HashMap<usize, Box<QpairState>> = HashMap::new();
         let orphaned = Arc::new(Mutex::new(HashMap::new()));
 
         // Pre-populate orphaned with a stale entry for this qpair
@@ -1379,7 +1440,7 @@ mod test {
             pending_idx: 0,
         }));
         qs.pending.push(new_ctx);
-        dead_qpairs.insert(qpair as usize, qs);
+        qpair_state.insert(qpair as usize, qs);
 
         let (ack_tx, ack_rx) = mpsc::channel();
         let req = IoRequest {
@@ -1388,11 +1449,10 @@ mod test {
             bdev_inflight: Arc::new(AtomicUsize::new(0)),
         };
 
-        SpdkPoller::handle_unregister(&req, &mut active_qpairs, &mut dead_qpairs, &orphaned);
+        SpdkPoller::handle_unregister(&req, &mut qpair_state, &orphaned);
 
-        // active + dead_qpairs are empty
-        assert!(active_qpairs.is_empty(), "active_qpairs must be empty");
-        assert!(dead_qpairs.is_empty(), "dead_qpairs must be empty");
+        // qpair_state is empty (qpair moved to orphaned)
+        assert!(qpair_state.is_empty(), "qpair_state must be empty");
 
         // orphaned has the entry with BOTH old and new stale entries
         let guard = orphaned.lock().unwrap();
@@ -1456,31 +1516,31 @@ mod test {
         }));
         qs.pending.push(pending_ctx);
 
-        let mut dead_qpairs: HashMap<usize, Box<QpairState>> = HashMap::new();
-        dead_qpairs.insert(0xDEAD, qs);
+        let mut qpair_state: HashMap<usize, Box<QpairState>> = HashMap::new();
+        qpair_state.insert(0xDEAD, qs);
 
-        SpdkPoller::force_complete_qpair(0xDEAD, &mut dead_qpairs);
+        SpdkPoller::force_complete_qpair(0xDEAD, &mut qpair_state);
 
         assert!(
             dead_flag.load(Ordering::Acquire),
             "force_complete must mark qpair dead"
         );
         assert_eq!(
-            dead_qpairs[&0xDEAD].pending.len(),
+            qpair_state[&0xDEAD].pending.len(),
             0,
             "pending must be drained"
         );
         assert_eq!(
-            dead_qpairs[&0xDEAD].stale.len(),
+            qpair_state[&0xDEAD].stale.len(),
             2,
             "stale must contain original stale + moved pending"
         );
         assert!(
-            dead_qpairs[&0xDEAD].stale.contains(&stale_ctx),
+            qpair_state[&0xDEAD].stale.contains(&stale_ctx),
             "original stale entry must survive"
         );
         assert!(
-            dead_qpairs[&0xDEAD].stale.contains(&pending_ctx),
+            qpair_state[&0xDEAD].stale.contains(&pending_ctx),
             "pending entry must move to stale"
         );
 
