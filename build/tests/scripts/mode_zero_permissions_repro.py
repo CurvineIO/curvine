@@ -14,21 +14,15 @@
 #  // limitations under the License.
 
 """
-chmod/fchmod mode bits not persisted on Curvine FUSE — reproducer for LTP failures.
+Regression test for mode 0000 persistence on Curvine FUSE.
 
-Root cause: setattr (chmod/fchmod) and create-time umask application do not
-persist permission mode 0000.  chmod(2)/fchmod(2) return success, but stat()
-still reports the previous mode (e.g. 0755).  Likewise creat(2) under
-umask(0777) should yield mode 0000 but the file keeps a non-zero mode.
-
-Covered LTP cases (each line is one minimal repro scenario):
-  chmod01  — chmod(path, 0000) succeeds yet stat() mode stays 0755 (TFAIL test 1)
-  fchmod01 — fchmod(fd, 0000) succeeds yet fstat() mode stays 0755 (TFAIL)
-  umask01  — umask(0777) + creat(0777) yields mode 0755 instead of 0000 (TFAIL)
+chmod(2), fchmod(2), and create-time umask application can all legitimately
+produce permission mode 0000. Curvine used to treat mode 0 as "unset", so stat()
+reported a default non-zero mode instead of preserving the requested mode.
 
 Usage:
-    python3 curvine_ltp_chmod_mode_repro.py --dir /curvine-fuse/fuse-test
-    python3 curvine_ltp_chmod_mode_repro.py --dir /curvine-fuse/fuse-test --allow-non-mount
+    python3 mode_zero_permissions_repro.py --dir /curvine-fuse/fuse-test
+    python3 mode_zero_permissions_repro.py --dir /curvine-fuse/fuse-test --allow-non-mount
 """
 
 import argparse
@@ -40,8 +34,7 @@ from typing import Callable
 
 DEFAULT_DIR = "/curvine-fuse/fuse-test"
 
-# LTP chmod01 / fchmod01 initial file mode (S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH).
-_LTP_FILE_MODE = 0o644
+_INITIAL_FILE_MODE = 0o644
 
 
 def expect_ok(name: str, fn: Callable[[], None]) -> int:
@@ -112,13 +105,12 @@ def _raise_mode_mismatch(actual: int, expected: int, label: str) -> None:
 
 
 def test_chmod_zero_mode_persisted(root: str) -> int:
-    # Related LTP cases: chmod01
     # chmod(2) with mode 0000 must clear all permission bits visible via stat(2).
     workdir = case_dir(root, "chmod_zero_mode")
     target = os.path.join(workdir, "testfile")
 
     def run_chmod_zero() -> None:
-        fd = os.open(target, os.O_CREAT | os.O_RDWR, _LTP_FILE_MODE)
+        fd = os.open(target, os.O_CREAT | os.O_RDWR, _INITIAL_FILE_MODE)
         os.close(fd)
         os.chmod(target, 0)
         actual = _low9_mode(os.stat(target).st_mode)
@@ -126,19 +118,18 @@ def test_chmod_zero_mode_persisted(root: str) -> int:
             _raise_mode_mismatch(actual, 0, "stat after chmod(path, 0000)")
 
     return expect_ok(
-        "chmod(path, 0000) then stat() shows mode 0000 (chmod01)",
+        "chmod(path, 0000) then stat() shows mode 0000",
         run_chmod_zero,
     )
 
 
 def test_fchmod_zero_mode_persisted(root: str) -> int:
-    # Related LTP cases: fchmod01
     # fchmod(2) with mode 0000 must clear all permission bits visible via fstat(2).
     workdir = case_dir(root, "fchmod_zero_mode")
     target = os.path.join(workdir, "testfile")
 
     def run_fchmod_zero() -> None:
-        fd = os.open(target, os.O_CREAT | os.O_RDWR, _LTP_FILE_MODE)
+        fd = os.open(target, os.O_CREAT | os.O_RDWR, _INITIAL_FILE_MODE)
         os.fchmod(fd, 0)
         actual = _low9_mode(os.fstat(fd).st_mode)
         os.close(fd)
@@ -146,13 +137,12 @@ def test_fchmod_zero_mode_persisted(root: str) -> int:
             _raise_mode_mismatch(actual, 0, "fstat after fchmod(fd, 0000)")
 
     return expect_ok(
-        "fchmod(fd, 0000) then fstat() shows mode 0000 (fchmod01)",
+        "fchmod(fd, 0000) then fstat() shows mode 0000",
         run_fchmod_zero,
     )
 
 
 def test_creat_under_full_umask_has_zero_mode(root: str) -> int:
-    # Related LTP cases: umask01
     # creat(2) under umask(0777) must produce a file whose low 9 mode bits are 0000.
     workdir = case_dir(root, "umask_zero_mode")
     target = os.path.join(workdir, "testfile")
@@ -169,7 +159,7 @@ def test_creat_under_full_umask_has_zero_mode(root: str) -> int:
             os.umask(prev)
 
     return expect_ok(
-        "umask(0777)+creat(0777) yields file mode 0000 (umask01)",
+        "umask(0777)+creat(0777) yields file mode 0000",
         run_umask_creat_zero,
     )
 
@@ -177,17 +167,17 @@ def test_creat_under_full_umask_has_zero_mode(root: str) -> int:
 TESTS: list[tuple[str, str, Callable[..., int]]] = [
     (
         "1",
-        "chmod(path, 0000) persists via stat (chmod01)",
+        "chmod(path, 0000) persists via stat",
         test_chmod_zero_mode_persisted,
     ),
     (
         "2",
-        "fchmod(fd, 0000) persists via fstat (fchmod01)",
+        "fchmod(fd, 0000) persists via fstat",
         test_fchmod_zero_mode_persisted,
     ),
     (
         "3",
-        "umask(0777)+creat yields mode 0000 (umask01)",
+        "umask(0777)+creat yields mode 0000",
         test_creat_under_full_umask_has_zero_mode,
     ),
 ]
@@ -195,7 +185,7 @@ TESTS: list[tuple[str, str, Callable[..., int]]] = [
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="chmod/fchmod mode-0000 not persisted on Curvine FUSE — reproducer",
+        description="mode-0000 persistence regression test for Curvine FUSE",
     )
     parser.add_argument(
         "--dir",
