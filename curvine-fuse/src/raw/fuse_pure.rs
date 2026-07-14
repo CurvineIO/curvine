@@ -21,6 +21,7 @@ use orpc::sys::RawIO;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::ErrorKind;
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::path::Path;
 
 use std::os::unix::fs::PermissionsExt;
@@ -126,10 +127,13 @@ fn fuse_mount_sys(mnt: &Path, conf: &FuseConf) -> IOResult<RawIO> {
             return Err(std::io::Error::from(ErrorKind::Other).into());
         }
     };
+    // SAFETY: open returned a fresh descriptor whose ownership is transferred here.
+    // Keep ownership until mount succeeds so every failure path closes /dev/fuse.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let mut flags = 0;
     let mut mount_options = format!(
         "fd={},rootmode={:o},user_id={},group_id={}",
-        fd,
+        fd.as_raw_fd(),
         mountpoint_mode,
         getuid(),
         getgid()
@@ -167,16 +171,21 @@ fn fuse_mount_sys(mnt: &Path, conf: &FuseConf) -> IOResult<RawIO> {
         }
     };
 
+    complete_mount(fd, result, mnt)
+}
+
+fn complete_mount(fd: OwnedFd, result: libc::c_int, mnt: &Path) -> IOResult<RawIO> {
     if result != 0 {
+        let error = std::io::Error::last_os_error();
         error!(
             "Mount fuse failed, {} with result {}",
             mnt.display(),
             result
         );
-        return err_io!(-1);
+        return Err(error.into());
     }
     info!("Mounted at {}", mnt.display());
-    Ok(fd)
+    Ok(fd.into_raw_fd())
 }
 
 fn detect_fusermount_bin() -> String {
@@ -222,5 +231,41 @@ pub fn fuse_umount_pure(mnt: &Path) {
 
     if let Ok(output) = builder.output() {
         info!("fusermount: {}", String::from_utf8_lossy(&output.stdout));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::complete_mount;
+    use std::fs::File;
+    use std::os::unix::io::{AsRawFd, OwnedFd};
+    use std::path::Path;
+
+    #[test]
+    fn failed_mount_closes_fuse_fd() {
+        let fd: OwnedFd = File::open("/dev/null").expect("open test fd").into();
+        let raw_fd = fd.as_raw_fd();
+
+        assert!(complete_mount(fd, -1, Path::new("/invalid-mount")).is_err());
+
+        let result = unsafe { libc::fcntl(raw_fd, libc::F_GETFD) };
+        assert_eq!(result, -1, "failed mount must close the owned FUSE fd");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+    }
+
+    #[test]
+    fn successful_mount_transfers_fuse_fd() {
+        let fd: OwnedFd = File::open("/dev/null").expect("open test fd").into();
+        let raw_fd = fd.as_raw_fd();
+
+        let returned_fd =
+            complete_mount(fd, 0, Path::new("/test-mount")).expect("successful mount transfers fd");
+
+        assert_eq!(returned_fd, raw_fd);
+        assert_ne!(unsafe { libc::fcntl(returned_fd, libc::F_GETFD) }, -1);
+        assert_eq!(unsafe { libc::close(returned_fd) }, 0);
     }
 }
