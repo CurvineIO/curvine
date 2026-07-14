@@ -356,3 +356,35 @@ impl FuseMountArgs {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::FuseMountArgs;
+    use clap::Parser;
+    use orpc::common::Utils;
+    use std::fs;
+
+    #[test]
+    fn get_conf_rejects_zero_io_threads_cli_override() {
+        let conf_path = Utils::temp_file();
+        fs::write(&conf_path, "[fuse]\nio_threads = 1\n").expect("write test config");
+
+        let args = FuseMountArgs::try_parse_from([
+            "curvine-fuse",
+            "--conf",
+            &conf_path,
+            "--io-threads",
+            "0",
+        ])
+        .expect("parse mount arguments");
+        let result = args.get_conf();
+        let _ = fs::remove_file(&conf_path);
+
+        let err = result.expect_err("zero io_threads override must be rejected");
+        assert!(
+            err.to_string().contains("fuse.io_threads must be > 0"),
+            "unexpected error: {}",
+            err
+        );
+    }
+}
