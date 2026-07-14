@@ -266,6 +266,28 @@ impl UnifiedFileSystem {
                 None => err_box!(
                     "the current path is not mounted to ufs, so the `free` command cannot be executed."
                 ),
+                // Cache mode: drop Curvine metadata (and its blocks) via delete.
+                // Master delete already releases worker blocks; calling free first
+                // would only clear locs then delete the inode — redundant.
+                // Use cv.delete (not UnifiedFileSystem::delete) so UFS is untouched.
+                Some((_, mount)) if mount.info.is_cache_mode() => {
+                    if path.path() == mount.info.cv_path {
+                        if recursive {
+                            for status in self.cv.list_status(path).await? {
+                                let child = Path::from_str(status.path)?;
+                                if let Err(e) = self.cv.delete(&child, true).await {
+                                    if !matches!(e, FsError::FileNotFound(_)) {
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        self.cv.delete(path, recursive).await?;
+                    }
+
+                    Ok(FreeResult::default())
+                }
                 Some(_) => self.cv.free(path, recursive).await,
             }
         };
