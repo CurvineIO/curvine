@@ -16,6 +16,10 @@ use crate::cli::FuseRuntimeArgs;
 use crate::fs::CurvineFileSystem;
 use crate::session::FuseSession;
 use crate::web_server::WebServer;
+use curvine_common::conf::FuseConf;
+use curvine_common::error::FsError;
+use curvine_common::fs::{FileSystem, Path};
+use log::info;
 use orpc::common::Logger;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::CommonResult;
@@ -43,6 +47,8 @@ pub fn run_mount(args: FuseRuntimeArgs) -> CommonResult<()> {
         let fs = CurvineFileSystem::new(cluster_conf, fuse_rt.clone()).unwrap();
         let conf = fs.conf().clone();
 
+        ensure_fs_path_exists(&fs, &conf).await?;
+
         let node_state = fs.state().clone();
         let web_port = conf.web_port;
         fuse_rt.spawn(async move {
@@ -56,4 +62,25 @@ pub fn run_mount(args: FuseRuntimeArgs) -> CommonResult<()> {
     })?;
 
     Ok(())
+}
+
+async fn ensure_fs_path_exists(fs: &CurvineFileSystem, conf: &FuseConf) -> CommonResult<()> {
+    let path = Path::from_str(&conf.fs_path)?;
+    if path.is_root() || !path.is_cv() {
+        return Ok(());
+    }
+
+    match fs.fs().get_status(&path).await {
+        Ok(status) if status.is_dir => Ok(()),
+        Ok(_) => Err(FsError::not_a_directory(path.full_path()).into()),
+        Err(FsError::FileNotFound(_)) => {
+            if conf.readonly {
+                return Err(FsError::read_only(path.full_path()).into());
+            }
+            fs.fs().mkdir(&path, true).await?;
+            info!("created missing FUSE fs-path {}", path.full_path());
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
