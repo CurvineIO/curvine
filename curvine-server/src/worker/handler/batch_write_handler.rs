@@ -15,6 +15,7 @@
 use crate::worker::block::BlockStore;
 use crate::worker::handler::WriteContext;
 use crate::worker::handler::WriteHandler;
+use crate::worker::storage::BlockWriteContext;
 use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
@@ -26,7 +27,6 @@ use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use orpc::err_box;
 use orpc::handler::MessageHandler;
-use orpc::io::{BlockDevice, BlockIO};
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::sys::DataSlice;
 use orpc::CommonResult;
@@ -34,7 +34,7 @@ use orpc::CommonResult;
 pub struct BatchWriteHandler {
     pub(crate) store: BlockStore,
     pub(crate) context: Option<Vec<WriteContext>>,
-    pub(crate) file: Option<Vec<Option<BlockDevice>>>,
+    pub(crate) file: Option<Vec<Option<BlockWriteContext>>>,
     pub(crate) is_commit: bool,
     pub(crate) write_handler: WriteHandler,
 }
@@ -194,7 +194,7 @@ impl BatchWriteHandler {
             }
             if block.len > context.block_size {
                 return err_box!(
-                    "Invalid write offset: {}, block size: {}",
+                    "Invalid block length: {}, block size: {}",
                     block.len,
                     context.block_size
                 );
@@ -208,9 +208,7 @@ impl BatchWriteHandler {
             }
         }
         for file in files.iter_mut() {
-            if let Some(file) = file.take() {
-                drop(file);
-            }
+            file.take();
         }
 
         for block in commit_blocks {
@@ -254,7 +252,6 @@ impl BatchWriteHandler {
         let files_drain = std::mem::take(files_vec);
         let contexts_drain = std::mem::take(contexts_vec);
 
-        // Process each file in order
         let mut files_iter = files_drain.into_iter();
         let mut contexts_iter = contexts_drain.into_iter();
 
@@ -306,7 +303,6 @@ impl BatchWriteHandler {
                 return Err(e);
             }
 
-            // Collect processed file and context back into the original vectors
             let Some(file) = self.write_handler.file.take() else {
                 return err_box!("batch write lost file state at index {}", i);
             };
@@ -314,7 +310,6 @@ impl BatchWriteHandler {
                 return err_box!("batch write lost context state at index {}", i);
             };
 
-            // Push back to reuse the pre-allocated capacity from open_batch
             files_vec.push(Some(file));
             contexts_vec.push(context);
         }

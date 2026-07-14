@@ -14,6 +14,7 @@
 
 use crate::worker::block::BlockStore;
 use crate::worker::handler::WriteContext;
+use crate::worker::storage::BlockWriteContext;
 use crate::worker::{Worker, WorkerMetrics};
 use curvine_common::error::FsError;
 use curvine_common::proto::{BlockWriteResponse, DataHeaderProto};
@@ -22,7 +23,6 @@ use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::{ByteUnit, TimeSpent};
 use orpc::handler::MessageHandler;
-use orpc::io::{BlockDevice, BlockIO};
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::{err_box, ternary, try_option_mut, CommonResult};
 use std::mem;
@@ -30,7 +30,7 @@ use std::mem;
 pub struct WriteHandler {
     pub(crate) store: BlockStore,
     pub(crate) context: Option<WriteContext>,
-    pub(crate) file: Option<BlockDevice>,
+    pub(crate) file: Option<BlockWriteContext>,
     pub(crate) is_commit: bool,
     pub(crate) io_slow_us: u64,
     pub(crate) metrics: &'static WorkerMetrics,
@@ -50,7 +50,7 @@ impl WriteHandler {
         })
     }
 
-    pub fn resize(file: &mut BlockDevice, ctx: &WriteContext) -> FsResult<()> {
+    pub fn resize(file: &mut BlockWriteContext, ctx: &WriteContext) -> FsResult<()> {
         let opts = if let Some(opts) = &ctx.block.alloc_opts {
             opts
         } else {
@@ -64,22 +64,20 @@ impl WriteHandler {
                 ctx.block_size
             );
         }
-        // SPDK: NVMe namespace has fixed capacity, just validate fits.
-        if !file.supports_short_circuit() {
+        if !file.supports_resize() {
             return Ok(());
         }
 
-        // Remove KEEP_SIZE flag to fix length mismatch at finalization.
         let mut mode = opts.mode;
         mode.remove(FileAllocMode::KEEP_SIZE);
         file.resize(opts.truncate, opts.off, opts.len, mode.bits())?;
 
-        if opts.len != file.len() {
+        if opts.len != file.device_len() {
             return err_box!(
                 "invalid resize file {} operation: resize {} != actual {}, opts={:?}",
                 file.path(),
                 opts.len,
-                file.len(),
+                file.device_len(),
                 opts
             );
         }
@@ -89,7 +87,7 @@ impl WriteHandler {
 
     pub fn open(&mut self, msg: &Message) -> FsResult<Message> {
         let context = WriteContext::from_req(msg)?;
-        if context.off > context.block_size {
+        if context.off < 0 || context.off > context.block_size {
             return err_box!(
                 "Invalid write offset: {}, block size: {}",
                 context.off,
@@ -104,12 +102,12 @@ impl WriteHandler {
         };
 
         let meta = self.store.open_block(&open_block)?;
-        let mut file = match meta.create_writer(context.off, false) {
+        let mut file = match self.store.open_writer(&meta, context.off) {
             Ok(file) => file,
             Err(e) => {
                 if let Err(abort_err) = self.store.abort_block(&context.block) {
                     log::warn!(
-                        "failed to abort block {} after create_writer error: {}",
+                        "failed to abort block {} after open_writer error: {}",
                         context.block.id,
                         abort_err
                     );
@@ -117,7 +115,6 @@ impl WriteHandler {
                 return Err(e.into());
             }
         };
-        // check file resize
         if let Err(e) = Self::resize(&mut file, &context) {
             drop(file);
             if let Err(abort_err) = self.store.abort_block(&context.block) {
@@ -130,9 +127,29 @@ impl WriteHandler {
             return Err(e);
         }
 
-        let is_short_circuit = context.short_circuit && file.supports_short_circuit();
-        let (label, path, file) = if is_short_circuit {
-            ("local", file.path().to_string(), None)
+        // Same source of truth as the read path: layout decides short-circuit
+        // eligibility and the local path (None for layouts without one, e.g. bdev).
+        let sc_path = if context.short_circuit {
+            match self.store.short_circuit(&meta) {
+                Ok(path) => path,
+                Err(e) => {
+                    drop(file);
+                    if let Err(abort_err) = self.store.abort_block(&context.block) {
+                        log::warn!(
+                            "failed to abort block {} after short_circuit error: {}",
+                            context.block.id,
+                            abort_err
+                        );
+                    }
+                    return Err(e.into());
+                }
+            }
+        } else {
+            None
+        };
+        let is_short_circuit = sc_path.is_some();
+        let (label, path, file) = if let Some(path) = sc_path {
+            ("local", path, None)
         } else {
             ("remote", file.path().to_string(), Some(file))
         };
@@ -181,10 +198,8 @@ impl WriteHandler {
         let context = try_option_mut!(self.context);
         Self::check_context(context, msg)?;
 
-        // msg.header
         if msg.header_len() > 0 {
             let header: DataHeaderProto = msg.parse_header()?;
-            // Flush operation should not trigger seek or boundary check
             if !header.flush {
                 if header.offset < 0 || header.offset >= context.block_size {
                     return err_box!(
@@ -193,36 +208,12 @@ impl WriteHandler {
                         context.block_size
                     );
                 }
-                // SPDK: file.pos()/seek() = absolute bdev offset
-                let abs_offset = if file.supports_short_circuit() {
-                    header.offset
-                } else {
-                    (file.len() - context.block_size) + header.offset
-                };
-                file.seek(abs_offset)?;
+                file.seek_to(header.offset)?;
             }
         }
 
-        // Write existing data blocks.
         let data_len = msg.data_len() as i64;
         if data_len > 0 {
-            // SPDK: pos() = absolute bdev offset
-            let write_limit = if file.supports_short_circuit() {
-                // Local files: pos() is relative to file start
-                context.block_size
-            } else {
-                // SPDK bdevs: pos() is absolute, len() is the upper bound
-                file.len()
-            };
-            if file.pos() + data_len > write_limit {
-                return err_box!(
-                    "Write range [{}, {}) exceeds block size {}",
-                    file.pos(),
-                    file.pos() + data_len,
-                    context.block_size
-                );
-            }
-
             let spend = TimeSpent::new();
             file.write_region(&msg.data)?;
 
@@ -266,22 +257,37 @@ impl WriteHandler {
         }
         let context = WriteContext::from_req(msg)?;
 
-        // flush and close the file.
         let file = self.file.take();
         if let Some(mut file) = file {
-            file.flush()?;
+            if let Err(flush_err) = file.flush() {
+                drop(file);
+                if let Err(abort_err) = self.store.abort_block(&context.block) {
+                    log::warn!(
+                        "failed to abort block {} after flush error: {}",
+                        context.block.id,
+                        abort_err
+                    );
+                }
+                return Err(flush_err.into());
+            }
             drop(file);
         }
 
         if context.block.len > context.block_size {
+            if let Err(abort_err) = self.store.abort_block(&context.block) {
+                log::warn!(
+                    "failed to abort block {} after length check failed: {}",
+                    context.block.id,
+                    abort_err
+                );
+            }
             return err_box!(
-                "Invalid write offset: {}, block size: {}",
+                "Invalid block length: {}, block size: {}",
                 context.block.len,
                 context.block_size
             );
         }
 
-        // Submit block.
         self.commit_block(&context.block, commit)?;
         self.is_commit = true;
 

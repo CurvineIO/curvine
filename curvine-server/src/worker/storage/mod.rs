@@ -39,6 +39,9 @@ pub use self::meta_store::*;
 mod layout;
 pub use self::layout::*;
 
+mod block_io_context;
+pub use self::block_io_context::{BlockReadContext, BlockWriteContext};
+
 mod vfs_dataset;
 pub use self::vfs_dataset::VfsDataset;
 

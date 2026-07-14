@@ -19,10 +19,18 @@ pub use self::bdev_layout::BdevLayout;
 pub use self::file_layout::FileLayout;
 
 use crate::worker::block::BlockMeta;
-use crate::worker::storage::{SpdkMetaStore, VfsDir};
+use crate::worker::storage::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};
 use curvine_common::state::{ExtendedBlock, StorageType};
-use orpc::CommonResult;
+use orpc::io::IOResult;
+use orpc::{err_box, CommonResult};
 use std::sync::Arc;
+
+fn validate_open_offset(meta: &BlockMeta, off: i64) -> IOResult<()> {
+    if off < 0 || off > meta.len {
+        return err_box!("Invalid block offset: {}, block length: {}", off, meta.len);
+    }
+    Ok(())
+}
 
 pub trait BlockLayout {
     fn allocate(&self, dir: &VfsDir, block: &ExtendedBlock) -> CommonResult<BlockMeta>;
@@ -36,6 +44,15 @@ pub trait BlockLayout {
 
     /// Remove backing resources. Callers may run this outside the dataset lock.
     fn deallocate(&self, meta: &BlockMeta) -> CommonResult<()>;
+
+    fn open_writer(&self, meta: &BlockMeta, off: i64) -> IOResult<BlockWriteContext>;
+
+    fn open_reader(&self, meta: &BlockMeta, off: i64) -> IOResult<BlockReadContext>;
+
+    /// Local path a co-located client can open directly, `Ok(None)` if the
+    /// layout cannot expose one (e.g. raw bdev). Errors are propagated so
+    /// callers can distinguish "not eligible" from "path resolution failed".
+    fn short_circuit(&self, meta: &BlockMeta) -> CommonResult<Option<String>>;
 }
 
 #[derive(Clone)]
@@ -109,6 +126,27 @@ impl BlockLayout for BlockLayoutKind {
         match self {
             Self::File(layout) => layout.deallocate(meta),
             Self::Bdev(layout) => layout.deallocate(meta),
+        }
+    }
+
+    fn open_writer(&self, meta: &BlockMeta, off: i64) -> IOResult<BlockWriteContext> {
+        match self {
+            Self::File(layout) => layout.open_writer(meta, off),
+            Self::Bdev(layout) => layout.open_writer(meta, off),
+        }
+    }
+
+    fn open_reader(&self, meta: &BlockMeta, off: i64) -> IOResult<BlockReadContext> {
+        match self {
+            Self::File(layout) => layout.open_reader(meta, off),
+            Self::Bdev(layout) => layout.open_reader(meta, off),
+        }
+    }
+
+    fn short_circuit(&self, meta: &BlockMeta) -> CommonResult<Option<String>> {
+        match self {
+            Self::File(layout) => layout.short_circuit(meta),
+            Self::Bdev(layout) => layout.short_circuit(meta),
         }
     }
 }

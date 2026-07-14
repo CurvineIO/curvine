@@ -13,12 +13,16 @@
 // limitations under the License.
 
 use crate::worker::block::{BlockMeta, BlockState};
-use crate::worker::storage::layout::BlockLayout;
-use crate::worker::storage::{SpdkMetaStore, VfsDir};
+use crate::worker::storage::layout::{validate_open_offset, BlockLayout};
+use crate::worker::storage::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};
 use curvine_common::state::ExtendedBlock;
 use log::{info, warn};
-use orpc::CommonResult;
+use orpc::io::IOResult;
+use orpc::{err_box, CommonResult};
 use std::sync::Arc;
+
+#[cfg(feature = "spdk")]
+use orpc::io::{BlockDevice, IOError, SpdkBdev};
 
 #[derive(Clone)]
 pub struct BdevLayout {
@@ -102,5 +106,75 @@ impl BlockLayout for BdevLayout {
     // SPDK blocks have no filesystem file; offset release happens in release().
     fn deallocate(&self, _meta: &BlockMeta) -> CommonResult<()> {
         Ok(())
+    }
+
+    fn open_writer(&self, meta: &BlockMeta, off: i64) -> IOResult<BlockWriteContext> {
+        validate_open_offset(meta, off)?;
+        #[cfg(feature = "spdk")]
+        {
+            let bdev_name = meta.get_bdev_name()?;
+            let abs_offset = meta.bdev_offset.checked_add(off).ok_or_else(|| {
+                IOError::from(format!(
+                    "Block write offset overflow: base={}, offset={}",
+                    meta.bdev_offset, off
+                ))
+            })?;
+            let max_len = 0.max(meta.len - off);
+            info!(
+                "Opening SPDK bdev '{}' for writing at offset {} (block {} base={}, max_len={})",
+                bdev_name, abs_offset, meta.id, meta.bdev_offset, max_len
+            );
+            if max_len == 0 {
+                return err_box!("Cannot open SPDK writer: no space remaining");
+            }
+            let bdev = SpdkBdev::open_write(&bdev_name, abs_offset, max_len)?;
+            let device = BlockDevice::Spdk(bdev);
+            BlockWriteContext::new(device, meta.bdev_offset, meta.len, off)
+        }
+        #[cfg(not(feature = "spdk"))]
+        {
+            let _ = (meta, off);
+            err_box!("SPDK support not compiled in")
+        }
+    }
+
+    fn open_reader(&self, meta: &BlockMeta, off: i64) -> IOResult<BlockReadContext> {
+        validate_open_offset(meta, off)?;
+        #[cfg(feature = "spdk")]
+        {
+            let bdev_name = meta.get_bdev_name()?;
+            let abs_offset = meta.bdev_offset.checked_add(off).ok_or_else(|| {
+                IOError::from(format!(
+                    "Block read offset overflow: base={}, offset={}",
+                    meta.bdev_offset, off
+                ))
+            })?;
+            let abs_offset = u64::try_from(abs_offset).map_err(|_| {
+                IOError::from(format!(
+                    "Invalid absolute block read offset: {}",
+                    abs_offset
+                ))
+            })?;
+            let max_len = 0.max(meta.len - off);
+            info!(
+                "Opening SPDK bdev '{}' for reading at offset {} (block {} base={}, max_len={})",
+                bdev_name, abs_offset, meta.id, meta.bdev_offset, max_len
+            );
+            if max_len == 0 {
+                return err_box!("Cannot open SPDK reader: no space remaining");
+            }
+            let bdev = SpdkBdev::open_read(&bdev_name, abs_offset, max_len)?;
+            let device = BlockDevice::Spdk(bdev);
+            BlockReadContext::new(device, meta.bdev_offset, meta.len, off)
+        }
+        #[cfg(not(feature = "spdk"))]
+        {
+            let _ = (meta, off);
+            err_box!("SPDK support not compiled in")
+        }
+    }
+
+    fn short_circuit(&self, _meta: &BlockMeta) -> CommonResult<Option<String>> {
+        Ok(None)
     }
 }

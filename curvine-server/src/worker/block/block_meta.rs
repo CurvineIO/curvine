@@ -15,12 +15,10 @@
 use crate::worker::storage::{DirState, VfsDir, ACTIVE_DIR, STAGING_DIR};
 use curvine_common::state::{ExtendedBlock, StorageType};
 use orpc::common::{ByteUnit, FileUtils};
-use orpc::io::{BlockDevice, IOResult, LocalFile};
+use orpc::io::LocalFile;
 
 #[cfg(feature = "spdk")]
-use log::info;
-#[cfg(feature = "spdk")]
-use orpc::io::SpdkBdev;
+use orpc::io::{IOError, IOResult};
 
 use orpc::{err_box, sys, try_err, CommonResult};
 use std::fmt::Formatter;
@@ -232,60 +230,11 @@ impl BlockMeta {
         Ok(file)
     }
 
-    pub fn create_writer(&self, off: i64, overwrite: bool) -> IOResult<BlockDevice> {
-        match self.storage_type() {
-            #[cfg(feature = "spdk")]
-            StorageType::SpdkDisk => {
-                let bdev_name = self.get_bdev_name()?;
-                let abs_offset = self.bdev_offset + off;
-                let max_len = 0.max(self.len - off);
-                info!(
-                    "Opening SPDK bdev '{}' for writing at offset {} (block {} base={}, max_len={})",
-                    bdev_name, abs_offset, self.id, self.bdev_offset, max_len
-                );
-                if max_len == 0 {
-                    return err_box!("Cannot open SPDK writer: no space remaining");
-                }
-                let bdev = SpdkBdev::open_write(&bdev_name, abs_offset, max_len)?;
-                Ok(BlockDevice::Spdk(bdev))
-            }
-            _ => {
-                let file = self.get_block_file()?;
-                let local = LocalFile::with_write_offset(file, overwrite, off)?;
-                Ok(BlockDevice::Local(local))
-            }
-        }
-    }
-
-    pub fn create_reader(&self, offset: u64) -> IOResult<BlockDevice> {
-        match self.storage_type() {
-            #[cfg(feature = "spdk")]
-            StorageType::SpdkDisk => {
-                let bdev_name = self.get_bdev_name()?;
-                let abs_offset = self.bdev_offset as u64 + offset;
-                let max_len = 0.max(self.len - offset as i64);
-                info!(
-                    "Opening SPDK bdev '{}' for reading at offset {} (block {} base={}, max_len={})",
-                    bdev_name, abs_offset, self.id, self.bdev_offset, max_len
-                );
-                if max_len == 0 {
-                    return err_box!("Cannot open SPDK reader: no space remaining");
-                }
-                let bdev = SpdkBdev::open_read(&bdev_name, abs_offset, max_len)?;
-                Ok(BlockDevice::Spdk(bdev))
-            }
-            _ => {
-                let local = LocalFile::with_read(self.get_block_file()?, offset)?;
-                Ok(BlockDevice::Local(local))
-            }
-        }
-    }
-
     /// Get the SPDK bdev name for this block.
     #[cfg(feature = "spdk")]
-    fn get_bdev_name(&self) -> IOResult<String> {
+    pub(crate) fn get_bdev_name(&self) -> IOResult<String> {
         self.dir.bdev_name.clone().ok_or_else(|| {
-            orpc::io::IOError::from(format!(
+            IOError::from(format!(
                 "block {} has StorageType::SpdkDisk but dir (dir_id={}) has no bdev_name assigned",
                 self.id, self.dir.dir_id
             ))
