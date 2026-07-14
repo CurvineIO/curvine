@@ -11,7 +11,7 @@ profiles:
     allowed_voters:
       teams:
         - curvine-toc-voters
-      users：
+      users:
         - thuongle2210
       exclude_team_maintainers: false
     close_on_passing: true
