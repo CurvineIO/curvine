@@ -14,6 +14,21 @@ rust-sdk = []
 java-sdk = ["dep:jni"]
 python-sdk = ["dep:pyo3"]
 
+# Forward optional UFS backends from curvine-client so Java/Python/Rust
+# consumers can enable them without depending on curvine-client directly.
+# Defaults stay lean: only java-sdk; no UFS backend is forced here.
+# (curvine-client still enables its own default `opendal-s3` unless consumers
+#  set `default-features = false` on that dependency elsewhere.)
+opendal-s3 = ["curvine-client/opendal-s3"]
+opendal-oss = ["curvine-client/opendal-oss"]
+opendal-gcs = ["curvine-client/opendal-gcs"]
+opendal-azblob = ["curvine-client/opendal-azblob"]
+opendal-cos = ["curvine-client/opendal-cos"]
+opendal-hdfs = ["curvine-client/opendal-hdfs"]
+opendal-webhdfs = ["curvine-client/opendal-webhdfs"]
+opendal-hdfs-native = ["curvine-client/opendal-hdfs-native"]
+oss-hdfs = ["curvine-client/oss-hdfs"]
+
 [dependencies]
 orpc = { workspace = true }
 curvine-client = { workspace = true }
