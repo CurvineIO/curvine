@@ -125,7 +125,7 @@ jobs:
           set -euo pipefail
           TAG="${{ steps.meta.outputs.tag }}"
 
-          for image in ghcr.io/curvineio/curvine ghcr.io/curvineio/curvine-csi ghcr.io/curvineio/curvine-fluid; do
+          for image in ghcr.io/curvineio/curvine ghcr.io/curvineio/curvine-csi; do
             echo "Inspecting ${image}:${TAG}"
             docker buildx imagetools inspect "${image}:${TAG}"
           done

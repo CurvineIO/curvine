@@ -5,7 +5,7 @@ metadata:
 spec:
   containers:
   - name: test
-    image: curvine-fluid:latest
+    image: curvine:latest
     imagePullPolicy: IfNotPresent
     command: ["bash"]
     args:

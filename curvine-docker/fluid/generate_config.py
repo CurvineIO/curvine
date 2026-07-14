@@ -56,7 +56,7 @@ def generate_curvine_config():
         
         current_hostname = os.environ.get('HOSTNAME', 'localhost')
         component_type = _determine_component_type(current_hostname)
-        namespace = os.environ.get('FLUID_DATASET_NAMESPACE', 'default')
+        namespace = _runtime_namespace(fluid_config)
         
         master_runtime = _component_config(fluid_config, 'master')
         worker_runtime = _component_config(fluid_config, 'worker')
@@ -166,6 +166,45 @@ def _cluster_id(fluid_config):
         if cluster_id:
             return cluster_id
     return 'curvine'
+
+def _runtime_namespace(fluid_config):
+    for env_name in ('FLUID_DATASET_NAMESPACE', 'CURVINE_DATASET_NAMESPACE', 'POD_NAMESPACE'):
+        value = os.environ.get(env_name)
+        if value:
+            return value
+
+    for key in ('namespace', 'datasetNamespace', 'runtimeNamespace'):
+        value = fluid_config.get(key)
+        if value:
+            return str(value)
+
+    target_path = fluid_config.get('targetPath') or _component_config(fluid_config, 'client').get('targetPath', '')
+    namespace = _namespace_from_target_path(target_path)
+    if namespace:
+        return namespace
+
+    serviceaccount_dir = os.environ.get('CURVINE_SERVICEACCOUNT_DIR', '/var/run/secrets/kubernetes.io/serviceaccount')
+    namespace_file = os.path.join(serviceaccount_dir, 'namespace')
+    try:
+        with open(namespace_file, encoding='utf-8') as f:
+            namespace = f.read().strip()
+            if namespace:
+                return namespace
+    except OSError:
+        pass
+
+    return 'default'
+
+def _namespace_from_target_path(target_path):
+    if not target_path:
+        return ''
+
+    parts = [part for part in str(target_path).split('/') if part]
+    for index, part in enumerate(parts):
+        if part == 'cache' and index + 2 < len(parts):
+            return parts[index + 1]
+
+    return ''
 
 def _service_name(component_config):
     service = component_config.get('service', {})

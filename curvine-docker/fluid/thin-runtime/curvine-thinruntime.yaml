@@ -5,7 +5,7 @@ metadata:
 spec:
   fileSystemType: fuse
   fuse:
-    image: ghcr.io/curvineio/curvine-fluid
+    image: ghcr.io/curvineio/curvine
     imageTag: latest
     imagePullPolicy: IfNotPresent
 ---

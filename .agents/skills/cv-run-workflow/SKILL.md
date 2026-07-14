@@ -38,7 +38,6 @@ Common workflows in this repo:
 | `build-runtime-image.yml` | Runtime images |
 | `build-tests-image.yml` | Test images |
 | `build-csi-image.yml` | CSI images |
-| `build-fluid-image.yml` | Fluid images |
 | `build-java-sdk.yml` | Java SDK build |
 | `daily-ut-coverage.yml` | UT coverage |
 | `release.yml` | Release |

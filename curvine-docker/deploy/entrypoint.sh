@@ -18,6 +18,33 @@
 
 set -euo pipefail
 
+FLUID_RUNTIME_CONFIG_PATH="${FLUID_RUNTIME_CONFIG_PATH:-/etc/fluid/config/config.json}"
+FLUID_RUNTIME_TYPE="${FLUID_RUNTIME_TYPE:-}"
+FLUID_RUNTIME_COMPONENT_TYPE="${FLUID_RUNTIME_COMPONENT_TYPE:-}"
+
+is_fluid_mode() {
+  case "${1:-}" in
+    fluid-thin-runtime)
+      return 0
+      ;;
+  esac
+
+  if [[ -n "${FLUID_RUNTIME_TYPE}" || -n "${FLUID_RUNTIME_COMPONENT_TYPE}" ]]; then
+    return 0
+  fi
+
+  [[ -f "${FLUID_RUNTIME_CONFIG_PATH}" ]]
+}
+
+if is_fluid_mode "${1:-}"; then
+  if [[ ! -x /fluid-entrypoint.sh ]]; then
+    echo "Fluid runtime mode detected, but /fluid-entrypoint.sh is missing or not executable"
+    exit 1
+  fi
+
+  exec /fluid-entrypoint.sh "$@"
+fi
+
 # Start the curvine service process
 # Service type: master, worker
 SERVER_TYPE=${1:-master}
@@ -178,4 +205,3 @@ case "$SERVER_TYPE" in
     exec "$@"
     ;;
 esac
-
