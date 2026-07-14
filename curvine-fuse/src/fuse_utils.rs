@@ -174,16 +174,13 @@ impl FuseUtils {
     }
 
     pub fn create_opts(op: &Create<'_>, fs: &UnifiedFileSystem) -> CreateFileOpts {
-        let mut builder = CreateFileOptsBuilder::with_conf(&fs.conf().client);
-        if op.arg.mode != 0 {
-            builder = builder.acl(
+        CreateFileOptsBuilder::with_conf(&fs.conf().client)
+            .acl(
                 op.header.uid,
                 op.header.gid,
                 op.arg.mode & 0o7777 & !op.arg.umask,
             )
-        }
-
-        builder.build()
+            .build()
     }
 
     pub fn check_xattr(name: &str, read: bool) -> FuseResult<()> {
@@ -262,11 +259,12 @@ impl FuseUtils {
             }
         };
 
-        let mode = if status.mode != 0 {
-            FuseUtils::get_mode(status.mode, status.file_type)
+        let perm = if status.id == FUSE_UNKNOWN_INO as i64 && FuseUtils.is_dot(&status.name) {
+            FUSE_DEFAULT_MODE & !conf.umask
         } else {
-            FuseUtils::get_mode(FUSE_DEFAULT_MODE & !conf.umask, status.file_type)
+            status.mode
         };
+        let mode = FuseUtils::get_mode(perm, status.file_type);
         let size = FuseUtils::fuse_st_size(status);
 
         // For links, nlink should be greater than 1
@@ -294,16 +292,13 @@ impl FuseUtils {
     }
 
     pub fn mkdir_opts(op: &MkDir<'_>, fs: &UnifiedFileSystem) -> MkdirOpts {
-        let mut builder = MkdirOptsBuilder::with_conf(&fs.conf().client);
-        if op.arg.mode != 0 {
-            builder = builder.acl(
+        MkdirOptsBuilder::with_conf(&fs.conf().client)
+            .acl(
                 op.header.uid,
                 op.header.gid,
                 op.arg.mode & 0o7777 & !op.arg.umask,
             )
-        }
-
-        builder.build()
+            .build()
     }
 
     pub fn create_entry_out(conf: &FuseConf, attr: fuse_attr) -> fuse_entry_out {
