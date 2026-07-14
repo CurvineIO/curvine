@@ -75,7 +75,7 @@ impl TryFrom<&str> for StorageType {
             "HDD" => Self::Hdd,
             "UFS" => Self::Ufs,
             "DISK" => Self::Disk,
-            "SPDK_DISK" => Self::SpdkDisk,
+            "SPDK" | "SPDK_DISK" => Self::SpdkDisk,
 
             _ => return err_box!("invalid storage type: {}", value),
         };
@@ -119,6 +119,10 @@ mod test {
         // Case-insensitive
         let typ2 = StorageType::try_from("spdk_disk").unwrap();
         assert_eq!(typ2, StorageType::SpdkDisk);
+
+        // Backward-compatible alias used by early SPDK configurations.
+        let alias = StorageType::try_from("spdk").unwrap();
+        assert_eq!(alias, StorageType::SpdkDisk);
 
         // Numeric value
         let val: i32 = StorageType::SpdkDisk.into();
