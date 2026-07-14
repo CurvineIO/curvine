@@ -10,6 +10,49 @@ Rust **`cdylib`** with **Java (JNI)** and **Python (PyO3)**. Crate path: **`curv
 
 ---
 
+## UFS Cargo features
+
+`curvine-libsdk` forwards optional UFS backends from `curvine-client`. Default features remain **`java-sdk` only** — no extra UFS backends are enabled by the libsdk crate itself. Enable backends explicitly when you need them (e.g. load jobs against OSS-HDFS).
+
+| Feature | Forwards to |
+|---------|-------------|
+| `opendal-s3` | `curvine-client/opendal-s3` |
+| `opendal-oss` | `curvine-client/opendal-oss` |
+| `opendal-gcs` | `curvine-client/opendal-gcs` |
+| `opendal-azblob` | `curvine-client/opendal-azblob` |
+| `opendal-cos` | `curvine-client/opendal-cos` |
+| `opendal-hdfs` | `curvine-client/opendal-hdfs` |
+| `opendal-webhdfs` | `curvine-client/opendal-webhdfs` |
+| `opendal-hdfs-native` | `curvine-client/opendal-hdfs-native` |
+| `oss-hdfs` | `curvine-client/oss-hdfs` (JindoSDK; needs `JINDOSDK_HOME`) |
+
+**Rust consumers**
+
+```toml
+curvine-libsdk = { path = "...", features = ["java-sdk", "oss-hdfs"] }
+# or: features = ["rust-sdk", "opendal-oss"]
+```
+
+```bash
+cargo build -p curvine-libsdk --no-default-features --features "java-sdk,oss-hdfs"
+```
+
+**Java / Python packaging (`make` / `build/build.sh`)**
+
+`--ufs` flags are passed through into the libsdk cdylib / wheel build:
+
+```bash
+# Java JNI .so with OSS-HDFS + default OpenDAL S3
+make build ARGS='--package java --ufs oss-hdfs'
+
+# Python wheel with an extra OpenDAL backend
+make build ARGS='--package python --ufs opendal-oss'
+```
+
+`oss-hdfs` requires JindoSDK at build/link time (`JINDOSDK_HOME`, default `/opt/jindosdk`). Do not enable it for default public artifacts unless that native SDK is available on the build host.
+
+---
+
 ## Python SDK (recommended)
 
 **1. Build** — from workspace root:

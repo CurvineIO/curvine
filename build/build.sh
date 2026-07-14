@@ -369,10 +369,24 @@ if should_build_package "tests"; then
   COPY_TARGETS+=("curvine-bench")
 fi
 
+# Join libsdk SDK feature + UFS passthrough features (forwarded to curvine-client).
+libsdk_features() {
+  local sdk_feature="$1"
+  local alloc_feature="$2"
+  local features="${alloc_feature},${sdk_feature}"
+  local ufs
+  for ufs in "${UFS_TYPES[@]}"; do
+    features="${features},${ufs}"
+  done
+  echo "$features"
+}
+
 build_curvine_libsdk() {
   local sdk_feature="$1"
-  local sdk_cmd="cargo build $PROFILE -p curvine-libsdk --no-default-features --features curvine-common/system,${sdk_feature}"
-  echo "Building curvine-libsdk with feature: ${sdk_feature}"
+  local features
+  features="$(libsdk_features "$sdk_feature" "curvine-common/system")"
+  local sdk_cmd="cargo build $PROFILE -p curvine-libsdk --no-default-features --features ${features}"
+  echo "Building curvine-libsdk with features: ${features}"
   echo "Build command: ${sdk_cmd}"
   eval "$sdk_cmd"
 }
@@ -677,8 +691,10 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
 
   echo "Building Python wheel (maturin) into ${DIST_DIR}/lib ..."
   cd "$FS_HOME/curvine-libsdk"
+  PY_SDK_FEATURES="$(libsdk_features "python-sdk" "curvine-common/${ALLOC}")"
+  echo "maturin features: ${PY_SDK_FEATURES}"
   "${MATURIN_CMD[@]}" build --no-default-features \
-    --features "curvine-common/${ALLOC},python-sdk" \
+    --features "${PY_SDK_FEATURES}" \
     "${MATURIN_RELEASE[@]}" \
     --interpreter "$PYTHON_SDK_VENV/bin/python" \
     --compatibility "$MATURIN_COMPAT" \
