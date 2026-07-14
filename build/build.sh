@@ -376,6 +376,13 @@ libsdk_features() {
   local features="${alloc_feature},${sdk_feature}"
   local ufs
   for ufs in "${UFS_TYPES[@]}"; do
+    # Reject shell metacharacters / unexpected tokens from --ufs before they enter argv.
+    case "$ufs" in
+      *[!a-zA-Z0-9_-]*|"")
+        echo "Error: invalid --ufs value: ${ufs}" >&2
+        return 1
+        ;;
+    esac
     features="${features},${ufs}"
   done
   echo "$features"
@@ -384,11 +391,16 @@ libsdk_features() {
 build_curvine_libsdk() {
   local sdk_feature="$1"
   local features
-  features="$(libsdk_features "$sdk_feature" "curvine-common/system")"
-  local sdk_cmd="cargo build $PROFILE -p curvine-libsdk --no-default-features --features ${features}"
+  features="$(libsdk_features "$sdk_feature" "curvine-common/system")" || exit 1
+  # Invoke cargo via argv (no eval) so --ufs values cannot inject shell metacharacters.
+  local -a sdk_cmd=(cargo build)
+  if [ -n "$PROFILE" ]; then
+    sdk_cmd+=("$PROFILE")
+  fi
+  sdk_cmd+=(-p curvine-libsdk --no-default-features --features "$features")
   echo "Building curvine-libsdk with features: ${features}"
-  echo "Build command: ${sdk_cmd}"
-  eval "$sdk_cmd"
+  echo "Build command: ${sdk_cmd[*]}"
+  "${sdk_cmd[@]}"
 }
 
 # Base command
@@ -691,7 +703,7 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
 
   echo "Building Python wheel (maturin) into ${DIST_DIR}/lib ..."
   cd "$FS_HOME/curvine-libsdk"
-  PY_SDK_FEATURES="$(libsdk_features "python-sdk" "curvine-common/${ALLOC}")"
+  PY_SDK_FEATURES="$(libsdk_features "python-sdk" "curvine-common/${ALLOC}")" || exit 1
   echo "maturin features: ${PY_SDK_FEATURES}"
   "${MATURIN_CMD[@]}" build --no-default-features \
     --features "${PY_SDK_FEATURES}" \
