@@ -65,6 +65,7 @@ pub enum ErrorKind {
     InvalidArgument = 28,
     BlockNotFound = 29,
     ReadOnly = 30,
+    NoAvailableWorker = 31,
 
     #[num_enum(default)]
     Common = 10000,
@@ -185,6 +186,15 @@ pub enum FsError {
     // Pipeline replication does not meet minimum replicas
     #[error("{0}")]
     MinReplicasNotMet(ErrorImpl<StringError>),
+
+    // No worker replica is available to serve a block read (e.g. all replicas
+    // failed mid-read, or the block has no locations). This is a worker-level
+    // failure and, unlike a generic Common error, is typed so that fallback
+    // logic (FallbackFsReader::is_worker_err) can detect it without matching on
+    // the error message string.
+    #[error("{0}")]
+    NoAvailableWorker(ErrorImpl<StringError>),
+
     // Job not found
     #[error("{0}")]
     JobNotFound(ErrorImpl<StringError>),
@@ -317,6 +327,10 @@ impl FsError {
         Self::MinReplicasNotMet(ErrorImpl::with_source(msg.into()))
     }
 
+    pub fn no_available_worker(msg: impl Into<String>) -> Self {
+        Self::NoAvailableWorker(ErrorImpl::with_source(msg.into().into()))
+    }
+
     pub fn is_pipeline_error(&self) -> bool {
         matches!(self, FsError::Pipeline(_))
     }
@@ -380,6 +394,7 @@ impl FsError {
             FsError::ReadOnly(_) => ErrorKind::ReadOnly,
             FsError::Pipeline(_) => ErrorKind::Pipeline,
             FsError::MinReplicasNotMet(_) => ErrorKind::MinReplicasNotMet,
+            FsError::NoAvailableWorker(_) => ErrorKind::NoAvailableWorker,
             FsError::JobNotFound(_) => ErrorKind::JobNotFound,
             FsError::Common(_) => ErrorKind::Common,
         }
@@ -527,6 +542,7 @@ impl ErrorExt for FsError {
             FsError::ReadOnly(e) => FsError::ReadOnly(e.ctx(ctx)),
             FsError::Pipeline(e) => FsError::Pipeline(e.ctx(ctx)),
             FsError::MinReplicasNotMet(e) => FsError::MinReplicasNotMet(e.ctx(ctx)),
+            FsError::NoAvailableWorker(e) => FsError::NoAvailableWorker(e.ctx(ctx)),
             FsError::JobNotFound(e) => FsError::JobNotFound(e.ctx(ctx)),
             FsError::Common(e) => FsError::Common(e.ctx(ctx)),
         }
@@ -563,6 +579,7 @@ impl ErrorExt for FsError {
             FsError::ReadOnly(e) => e.encode(ErrorKind::ReadOnly),
             FsError::Pipeline(e) => e.encode(ErrorKind::Pipeline),
             FsError::MinReplicasNotMet(e) => e.encode(ErrorKind::MinReplicasNotMet),
+            FsError::NoAvailableWorker(e) => e.encode(ErrorKind::NoAvailableWorker),
             FsError::JobNotFound(e) => e.encode(ErrorKind::JobNotFound),
             FsError::Common(e) => e.encode(ErrorKind::Common),
         }
@@ -602,6 +619,7 @@ impl ErrorExt for FsError {
             ErrorKind::ReadOnly => FsError::ReadOnly(de.into_string()),
             ErrorKind::Pipeline => FsError::Pipeline(de.into_string()),
             ErrorKind::MinReplicasNotMet => FsError::MinReplicasNotMet(de.into_string()),
+            ErrorKind::NoAvailableWorker => FsError::NoAvailableWorker(de.into_string()),
             ErrorKind::JobNotFound => FsError::JobNotFound(de.into_string()),
             ErrorKind::Common => FsError::Common(de.into_string()),
         }
@@ -684,5 +702,19 @@ mod tests {
         let bytes = error.encode();
         let decoded = FsError::decode(bytes);
         assert!(matches!(decoded.kind(), ErrorKind::MinReplicasNotMet));
+    }
+
+    #[test]
+    pub fn no_available_worker_error_kind_test() {
+        let error = FsError::no_available_worker("There is no available worker");
+
+        assert!(matches!(error.kind(), ErrorKind::NoAvailableWorker));
+        assert!(matches!(error, FsError::NoAvailableWorker(_)));
+
+        // Round-trips across RPC encode/decode without collapsing into Common.
+        let bytes = error.encode();
+        let decoded = FsError::decode(bytes);
+        assert!(matches!(decoded.kind(), ErrorKind::NoAvailableWorker));
+        assert!(matches!(decoded, FsError::NoAvailableWorker(_)));
     }
 }

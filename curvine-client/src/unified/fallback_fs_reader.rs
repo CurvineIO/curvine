@@ -98,7 +98,7 @@ impl FallbackFsReader {
 pub(crate) fn is_worker_err(e: &FsError) -> bool {
     if matches!(
         e,
-        FsError::IO(_) | FsError::Pipeline(_) | FsError::Timeout(_)
+        FsError::IO(_) | FsError::Pipeline(_) | FsError::Timeout(_) | FsError::NoAvailableWorker(_)
     ) {
         return true;
     }
@@ -283,5 +283,30 @@ mod tests {
     fn test_is_worker_err_common_connection_refused() {
         let e = FsError::common("Connection refused (os error 111)");
         assert!(is_worker_err(&e));
+    }
+
+    // TC: a "no available worker" failure (all block replicas exhausted mid-read)
+    // must be classified as a worker error so FallbackFsReader falls back to UFS.
+    // It is a typed variant (FsError::NoAvailableWorker), so classification does
+    // NOT depend on the error message string — the block_reader message can be
+    // reworded without regressing fallback.
+    #[test]
+    fn test_is_worker_err_no_available_worker() {
+        let e = FsError::no_available_worker(
+            "There is no available worker, locs: [], failed workers: []",
+        );
+        assert!(is_worker_err(&e));
+    }
+
+    // Regression guard: this is exactly the bug we fixed. Before typing the
+    // error, block_reader produced a generic FsError::Common("There is no
+    // available worker ..."), whose message is NOT in the Common transport-
+    // failure whitelist, so is_worker_err returned false and fallback silently
+    // did not trigger (user saw EIO). Assert the untyped Common form is still
+    // NOT matched, proving the typed variant is what makes fallback work.
+    #[test]
+    fn test_is_worker_err_common_no_available_worker_not_matched() {
+        let e = FsError::common("There is no available worker, locs: [], failed workers: []");
+        assert!(!is_worker_err(&e));
     }
 }
