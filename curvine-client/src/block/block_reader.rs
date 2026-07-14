@@ -15,6 +15,7 @@
 use crate::block::block_reader::ReaderAdapter::{Hole, Local, Remote};
 use crate::block::{BlockReaderHole, BlockReaderLocal, BlockReaderRemote};
 use crate::file::FsContext;
+use curvine_common::error::FsError;
 use curvine_common::state::{ClientAddress, ExtendedBlock, LocatedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use log::warn;
@@ -22,7 +23,7 @@ use orpc::common::Utils;
 use orpc::error::ErrorExt;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::DataSlice;
-use orpc::{err_box, CommonResult};
+use orpc::CommonResult;
 use std::sync::Arc;
 
 enum ReaderAdapter {
@@ -206,11 +207,11 @@ impl BlockReader {
             }
         }
 
-        err_box!(
+        Err(FsError::no_available_worker(format!(
             "There is no available worker, locs: {:?}, failed workers: {:?}",
             locs,
             fs_context.get_failed_workers()
-        )
+        )))
     }
 
     // Based on network transmission efficiency considerations, the data size of the underlying tcp is fixed each time.
