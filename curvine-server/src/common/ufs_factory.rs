@@ -34,7 +34,7 @@ impl UfsFactory {
         let client_factory = ClientFactory::with_rt(conf.client_rpc_conf(), rt);
         Self {
             client_factory,
-            ufs_cache: FastSyncCache::with_ttl(conf.mount_update_ttl),
+            ufs_cache: FastSyncCache::with_ttl(Duration::from_millis(conf.mount_update_ttl_ms)),
         }
     }
 

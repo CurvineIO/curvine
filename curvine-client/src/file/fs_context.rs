@@ -33,6 +33,7 @@ use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::CacheManager;
 use std::hash::BuildHasherDefault;
 use std::sync::Arc;
+use std::time::Duration;
 
 static CLIENT_METRICS: OnceCell<ClientMetrics> = OnceCell::new();
 
@@ -81,14 +82,14 @@ impl FsContext {
         );
 
         let exclude_workers = CacheBuilder::default()
-            .time_to_live(conf.client.failed_worker_ttl)
+            .time_to_live(Duration::from_millis(conf.client.failed_worker_ttl_ms))
             .eviction_policy(EvictionPolicy::lru())
             .build_with_hasher(BuildHasherDefault::<FxHasher>::default());
 
         let block_pool = Arc::new(BlockClientPool::new(
             conf.client.enable_block_conn_pool,
             conf.client.block_conn_idle_size,
-            conf.client.block_conn_idle_time.as_millis() as u64,
+            conf.client.block_conn_idle_time_ms,
         ));
 
         let context = Self {
@@ -206,7 +207,7 @@ impl FsContext {
 
     pub fn start_clean_task(fs: CurvineFileSystem, pool: Arc<BlockClientPool>) {
         let metric_report_enable = fs.conf().client.metric_report_enable;
-        let interval = fs.conf().client.clean_task_interval;
+        let interval = Duration::from_millis(fs.conf().client.clean_task_interval_ms);
 
         fs.clone_runtime().spawn(async move {
             let mut interval = tokio::time::interval(interval);

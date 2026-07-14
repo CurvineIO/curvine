@@ -51,7 +51,7 @@ fn create_test_context() -> FsContext {
     let mut conf = ClusterConf::default();
     conf.client.enable_block_conn_pool = true;
     conf.client.block_conn_idle_size = 10;
-    conf.client.block_conn_idle_time = Duration::from_secs(30);
+    conf.client.block_conn_idle_time_ms = 30_000;
 
     let rt = TEST_SERVER.1.clone();
     FsContext::with_rt(conf, rt).unwrap()

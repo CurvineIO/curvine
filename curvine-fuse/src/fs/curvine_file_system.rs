@@ -1157,11 +1157,11 @@ impl fs::FileSystem for CurvineFileSystem {
         self.state.fs_fsync(op.header.nodeid, None).await?;
 
         let conf = &self.fs.conf().client;
-        let check_interval_min = conf.sync_check_interval_min;
-        let check_interval_max = conf.sync_check_interval_max;
+        let check_interval_min_ms = conf.sync_check_interval_min_ms;
+        let check_interval_max_ms = conf.sync_check_interval_max_ms;
         let log_ticks = conf.sync_check_log_tick;
 
-        let mut ticks = 0;
+        let mut ticks: u64 = 0;
         let time = TimeSpent::new();
 
         // NOTE: `setlkw_wait_duration_us` is NOT observed here. Its RAII timer is
@@ -1179,10 +1179,10 @@ impl fs::FileSystem for CurvineFileSystem {
             }
 
             ticks += 1;
-            let sleep_time = check_interval_max.min(check_interval_min * ticks);
-            tokio::time::sleep(sleep_time).await;
+            let sleep_ms = check_interval_max_ms.min(check_interval_min_ms.saturating_mul(ticks));
+            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
 
-            if ticks % log_ticks == 0 {
+            if ticks.is_multiple_of(log_ticks as u64) {
                 info!("waiting lock for {}, elapsed: {} ms", path, time.used_ms());
             }
         }

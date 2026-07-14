@@ -15,6 +15,7 @@
 use curvine_common::error::FsError;
 use log::info;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::time;
 
 use curvine_common::fs::RpcCode;
@@ -128,7 +129,7 @@ impl JobMasterClient {
         job_id: impl AsRef<str>,
         fail_if_not_found: bool,
     ) -> FsResult<()> {
-        let time = self.client.conf().client.max_sync_wait_timeout;
+        let time = Duration::from_millis(self.client.conf().client.max_sync_wait_timeout_ms);
         time::timeout(time, self.wait_job_complete0(job_id, fail_if_not_found)).await?
     }
 
@@ -137,7 +138,7 @@ impl JobMasterClient {
         job_id: impl AsRef<str>,
         fail_if_not_found: bool,
     ) -> FsResult<()> {
-        let mut ticks = 0;
+        let mut ticks: u64 = 0;
         let time = TimeSpent::new();
         let conf = &self.client.conf().client;
         let job_id = job_id.as_ref();
@@ -150,7 +151,8 @@ impl JobMasterClient {
                         if fail_if_not_found {
                             return Err(err);
                         } else {
-                            time::sleep(conf.sync_check_interval_min).await;
+                            time::sleep(Duration::from_millis(conf.sync_check_interval_min_ms))
+                                .await;
                             JobStatus {
                                 job_id: job_id.to_string(),
                                 ..Default::default()
@@ -176,12 +178,12 @@ impl JobMasterClient {
                 _ => {
                     ticks += 1;
 
-                    let sleep_time = conf
-                        .sync_check_interval_max
-                        .min(conf.sync_check_interval_min * ticks);
-                    time::sleep(sleep_time).await;
+                    let sleep_ms = conf
+                        .sync_check_interval_max_ms
+                        .min(conf.sync_check_interval_min_ms.saturating_mul(ticks));
+                    time::sleep(Duration::from_millis(sleep_ms)).await;
 
-                    if ticks % conf.sync_check_log_tick == 0 {
+                    if ticks.is_multiple_of(conf.sync_check_log_tick as u64) {
                         info!(
                             "waiting for job {} to complete, elapsed: {} ms, progress: {}",
                             status.job_id,

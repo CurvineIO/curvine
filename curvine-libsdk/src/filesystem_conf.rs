@@ -20,7 +20,6 @@ use orpc::common::LogConf;
 use orpc::io::net::InetAddr;
 use orpc::{err_box, try_err};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -89,21 +88,27 @@ pub struct FilesystemConf {
     pub display_thread: bool,
     pub display_position: bool,
 
-    pub failed_worker_ttl: String,
+    #[serde(alias = "failed_worker_ttl")]
+    pub failed_worker_ttl_ms: u64,
 
     pub enable_unified_fs: bool,
     pub enable_rust_read_ufs: bool,
 
-    pub mount_update_ttl: String,
+    #[serde(alias = "mount_update_ttl")]
+    pub mount_update_ttl_ms: u64,
 
-    pub sync_check_interval_min: String,
-    pub sync_check_interval_max: String,
-    pub max_sync_wait_timeout: String,
+    #[serde(alias = "sync_check_interval_min")]
+    pub sync_check_interval_min_ms: u64,
+    #[serde(alias = "sync_check_interval_max")]
+    pub sync_check_interval_max_ms: u64,
+    #[serde(alias = "max_sync_wait_timeout")]
+    pub max_sync_wait_timeout_ms: u64,
     pub sync_check_log_tick: u32,
 
     pub enable_block_conn_pool: bool,
     pub block_conn_idle_size: usize,
-    pub block_conn_idle_time: String,
+    #[serde(alias = "block_conn_idle_time")]
+    pub block_conn_idle_time_ms: u64,
 
     pub small_file_size: String,
 
@@ -146,12 +151,12 @@ impl FilesystemConf {
             ttl_ms: "0".to_string(),
             ttl_action: "none".to_string(),
             storage_type: "disk".to_string(),
-            failed_worker_ttl: "30s".to_string(),
-            mount_update_ttl: "5m".to_string(),
-            sync_check_interval_min: "1s".to_string(),
-            sync_check_interval_max: "5s".to_string(),
-            max_sync_wait_timeout: "30s".to_string(),
-            block_conn_idle_time: "30s".to_string(),
+            failed_worker_ttl_ms: 30_000,
+            mount_update_ttl_ms: 5 * 60_000,
+            sync_check_interval_min_ms: 1_000,
+            sync_check_interval_max_ms: 5_000,
+            max_sync_wait_timeout_ms: 30_000,
+            block_conn_idle_time_ms: 30_000,
             small_file_size: "1MB".to_string(),
             large_file_size: "64MB".to_string(),
             log_level: log.level,
@@ -229,21 +234,20 @@ impl FilesystemConf {
             auto_cache_ttl: self.auto_cache_ttl,
             default_cache_ttl: self.default_cache_ttl,
 
-            failed_worker_ttl: Duration::default(),
-            failed_worker_ttl_str: self.failed_worker_ttl,
+            failed_worker_ttl_ms: self.failed_worker_ttl_ms,
 
             enable_unified_fs: self.enable_unified_fs,
             enable_rust_read_ufs: self.enable_rust_read_ufs,
-            mount_update_ttl_str: self.mount_update_ttl,
+            mount_update_ttl_ms: self.mount_update_ttl_ms,
 
-            sync_check_interval_min_str: self.sync_check_interval_min,
-            sync_check_interval_max_str: self.sync_check_interval_max,
-            max_sync_wait_timeout_str: self.max_sync_wait_timeout,
+            sync_check_interval_min_ms: self.sync_check_interval_min_ms,
+            sync_check_interval_max_ms: self.sync_check_interval_max_ms,
+            max_sync_wait_timeout_ms: self.max_sync_wait_timeout_ms,
             sync_check_log_tick: self.sync_check_log_tick,
 
             enable_block_conn_pool: self.enable_block_conn_pool,
             block_conn_idle_size: self.block_conn_idle_size,
-            block_conn_idle_time_str: self.block_conn_idle_time,
+            block_conn_idle_time_ms: self.block_conn_idle_time_ms,
 
             small_file_size_str: self.small_file_size,
 

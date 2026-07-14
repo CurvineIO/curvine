@@ -20,7 +20,6 @@ use orpc::common::{ByteUnit, DurationUnit, Utils};
 use orpc::io::net::InetAddr;
 use orpc::CommonResult;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ClientCliArgs)]
 #[client_cli(prefix = "client", strip_suffix = "_str", opt_in)]
@@ -170,12 +169,10 @@ pub struct ClientConf {
     #[client_cli]
     pub drop_cache_len_str: String,
 
-    // Worker blacklist survival time
-    #[serde(skip)]
-    pub failed_worker_ttl: Duration,
+    // Worker blacklist survival time, in milliseconds.
     #[serde(alias = "failed_worker_ttl")]
     #[client_cli]
-    pub failed_worker_ttl_str: String,
+    pub failed_worker_ttl_ms: u64,
 
     // Whether to enable the unified file system
     #[client_cli]
@@ -190,12 +187,10 @@ pub struct ClientConf {
     #[client_cli]
     pub audit_logging_enabled: bool,
 
-    // Mount information update interval
-    #[serde(skip)]
-    pub mount_update_ttl: Duration,
+    // Mount information update interval, in milliseconds.
     #[serde(alias = "mount_update_ttl")]
     #[client_cli]
-    pub mount_update_ttl_str: String,
+    pub mount_update_ttl_ms: u64,
 
     // File creation umask in octal notation (e.g. 022 or 0o22).
     #[client_cli(octal)]
@@ -204,11 +199,10 @@ pub struct ClientConf {
     #[client_cli]
     pub metric_report_enable: bool,
 
-    #[serde(skip)]
-    pub clean_task_interval: Duration,
+    // Cleanup task interval, in milliseconds.
     #[serde(alias = "clean_task_interval")]
     #[client_cli]
-    pub clean_task_interval_str: String,
+    pub clean_task_interval_ms: u64,
 
     #[client_cli]
     pub close_timeout_secs: u64,
@@ -216,26 +210,20 @@ pub struct ClientConf {
     #[client_cli(skip)]
     pub metadata_operation_buckets: Vec<f64>,
 
-    // Minimum interval for checking if ufs sync task is complete / checking if curvine file data has updates
-    #[serde(skip)]
-    pub sync_check_interval_min: Duration,
+    // Minimum interval for checking if ufs sync task is complete / checking if curvine file data has updates, in milliseconds
     #[serde(alias = "sync_check_interval_min")]
     #[client_cli]
-    pub sync_check_interval_min_str: String,
+    pub sync_check_interval_min_ms: u64,
 
-    // Maximum interval for checking if ufs sync task is complete / checking if curvine file data has updates
-    #[serde(skip)]
-    pub sync_check_interval_max: Duration,
+    // Maximum interval for checking if ufs sync task is complete / checking if curvine file data has updates, in milliseconds
     #[serde(alias = "sync_check_interval_max")]
     #[client_cli]
-    pub sync_check_interval_max_str: String,
+    pub sync_check_interval_max_ms: u64,
 
-    // Maximum timeout for waiting for sync job to complete
-    #[serde(skip)]
-    pub max_sync_wait_timeout: Duration,
+    // Maximum timeout for waiting for sync job to complete, in milliseconds
     #[serde(alias = "max_sync_wait_timeout")]
     #[client_cli]
-    pub max_sync_wait_timeout_str: String,
+    pub max_sync_wait_timeout_ms: u64,
 
     // Number of sync_check_interval cycles before logging
     #[client_cli]
@@ -246,11 +234,10 @@ pub struct ClientConf {
     #[client_cli]
     pub block_conn_idle_size: usize,
 
-    #[serde(skip)]
-    pub block_conn_idle_time: Duration,
+    // Block connection idle time, in milliseconds.
     #[serde(alias = "block_conn_idle_time")]
     #[client_cli]
-    pub block_conn_idle_time_str: String,
+    pub block_conn_idle_time_ms: u64,
 
     #[serde(skip)]
     pub small_file_size: i64,
@@ -284,7 +271,7 @@ impl ClientConf {
 
     pub const DEFAULT_FILE_SYSTEM_MODE: u32 = 0o777;
 
-    pub const DEFAULT_CLEAN_TASK_INTERVAL_STR: &'static str = "60s";
+    pub const DEFAULT_CLEAN_TASK_INTERVAL_MS: u64 = 60 * 1000;
 
     pub const DEFAULT_CLOSE_TIMEOUT_SECS: u64 = 5;
 
@@ -325,28 +312,11 @@ impl ClientConf {
             self.enable_read_ahead = false
         }
 
-        self.failed_worker_ttl = DurationUnit::from_str(&self.failed_worker_ttl_str)?.as_duration();
-        self.mount_update_ttl = DurationUnit::from_str(&self.mount_update_ttl_str)?.as_duration();
-
         self.small_file_size = ByteUnit::from_str(&self.small_file_size_str)?.as_byte() as i64;
-
-        self.block_conn_idle_time =
-            DurationUnit::from_str(&self.block_conn_idle_time_str)?.as_duration();
 
         self.ttl_ms = DurationUnit::from_str(&self.ttl_ms_str)?.as_millis() as i64;
         self.ttl_action = TtlAction::try_from(self.ttl_action_str.as_str())?;
         self.storage_type = StorageType::try_from(self.storage_type_str.as_str())?;
-
-        self.clean_task_interval =
-            DurationUnit::from_str(&self.clean_task_interval_str)?.as_duration();
-
-        self.sync_check_interval_min =
-            DurationUnit::from_str(&self.sync_check_interval_min_str)?.as_duration();
-        self.sync_check_interval_max =
-            DurationUnit::from_str(&self.sync_check_interval_max_str)?.as_duration();
-
-        self.max_sync_wait_timeout =
-            DurationUnit::from_str(&self.max_sync_wait_timeout_str)?.as_duration();
 
         // Process smart prefetch configuration
         self.large_file_size = ByteUnit::from_str(&self.large_file_size_str)?.as_byte() as i64;
@@ -444,23 +414,20 @@ impl Default for ClientConf {
             drop_cache_len: 0,
             drop_cache_len_str: "1MB".to_string(),
 
-            failed_worker_ttl: Duration::default(),
-            failed_worker_ttl_str: "10m".to_owned(),
+            failed_worker_ttl_ms: 10 * 60 * 1000,
 
             enable_unified_fs: true,
             enable_rust_read_ufs: true,
 
             audit_logging_enabled: true,
 
-            mount_update_ttl: Default::default(),
-            mount_update_ttl_str: "10s".to_string(),
+            mount_update_ttl_ms: 10 * 1000,
 
             umask: Self::DEFAULT_FILE_SYSTEM_UMASK,
 
             metric_report_enable: true,
 
-            clean_task_interval: Default::default(),
-            clean_task_interval_str: Self::DEFAULT_CLEAN_TASK_INTERVAL_STR.to_string(),
+            clean_task_interval_ms: Self::DEFAULT_CLEAN_TASK_INTERVAL_MS,
 
             close_timeout_secs: Self::DEFAULT_CLOSE_TIMEOUT_SECS,
 
@@ -468,14 +435,11 @@ impl Default for ClientConf {
                 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0, 100000.0,
             ],
 
-            sync_check_interval_min: Default::default(),
-            sync_check_interval_min_str: "100ms".to_string(),
+            sync_check_interval_min_ms: 100,
 
-            sync_check_interval_max: Default::default(),
-            sync_check_interval_max_str: "1s".to_string(),
+            sync_check_interval_max_ms: 1000,
 
-            max_sync_wait_timeout: Default::default(),
-            max_sync_wait_timeout_str: "5m".to_string(),
+            max_sync_wait_timeout_ms: 5 * 60 * 1000,
 
             sync_check_log_tick: 3,
 
@@ -485,8 +449,7 @@ impl Default for ClientConf {
             small_file_size: 0,
             small_file_size_str: "4MB".to_string(),
 
-            block_conn_idle_time: Duration::from_secs(60),
-            block_conn_idle_time_str: "60s".to_string(),
+            block_conn_idle_time_ms: 60 * 1000,
 
             enable_smart_prefetch: true,
             large_file_size: 0,

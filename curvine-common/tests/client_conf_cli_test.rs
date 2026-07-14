@@ -221,7 +221,7 @@ fn apply_to_updates_c6_fields() {
     let overrides = ClientConfCliOverrides {
         hostname: Some("node-a".to_string()),
         auto_cache_ttl: Some("14d".to_string()),
-        failed_worker_ttl_str: Some("30m".to_string()),
+        failed_worker_ttl_ms: Some(30 * 60 * 1000),
         sync_check_log_tick: Some(5),
         enable_smart_prefetch: Some(false),
         ..Default::default()
@@ -231,9 +231,45 @@ fn apply_to_updates_c6_fields() {
 
     assert_eq!(conf.hostname, "node-a");
     assert_eq!(conf.auto_cache_ttl, "14d");
-    assert_eq!(conf.failed_worker_ttl_str, "30m");
+    assert_eq!(conf.failed_worker_ttl_ms, 30 * 60 * 1000);
     assert_eq!(conf.sync_check_log_tick, 5);
     assert!(!conf.enable_smart_prefetch);
+}
+
+#[test]
+fn toml_legacy_time_field_aliases_preserved() {
+    // The *_ms time fields were renamed from String (e.g. failed_worker_ttl = "10m")
+    // to u64 milliseconds (issue #1023-style hygiene). ClientConf is #[serde(default)]
+    // without deny_unknown_fields, so a serde alias on each renamed field keeps legacy
+    // numeric configs working. NOTE: legacy *string* values ("10m") no longer parse —
+    // this is an intentional breaking change; only numeric (ms) legacy values are kept.
+    let toml = r#"
+failed_worker_ttl = 600000
+mount_update_ttl = 10000
+block_conn_idle_time = 60000
+"#;
+    let conf: ClientConf =
+        toml::from_str(toml).expect("legacy numeric time keys must deserialize via alias");
+    assert_eq!(conf.failed_worker_ttl_ms, 600000);
+    assert_eq!(conf.mount_update_ttl_ms, 10000);
+    assert_eq!(conf.block_conn_idle_time_ms, 60000);
+}
+
+#[test]
+fn toml_legacy_string_duration_is_rejected() {
+    // The string->ms migration is intentionally breaking: a human-readable
+    // duration like "10m" must NOT silently deserialize into a u64 ms field.
+    // This locks the contract so we cannot regress into accepting duration
+    // strings again (which would reintroduce the DurationUnit dependency).
+    let toml = r#"
+failed_worker_ttl = "10m"
+"#;
+    let result = toml::from_str::<ClientConf>(toml);
+    assert!(
+        result.is_err(),
+        "string duration value must be rejected, got: {:?}",
+        result.map(|c| c.failed_worker_ttl_ms)
+    );
 }
 
 #[test]
