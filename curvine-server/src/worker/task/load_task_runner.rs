@@ -282,6 +282,10 @@ impl LoadTaskRunner {
         let block_size = self.task.info.job.block_size.max(1);
         let seg = Self::segment_len(src_len, streams, block_size);
         let spend = TimeSpent::new();
+        // Absolute deadline shared by every stream, so a single hung stream is
+        // caught mid-segment instead of only after the whole (multi-GiB) segment
+        // finishes. Same budget as the outer join-loop timeout check.
+        let deadline_ms = LocalTime::mills() + self.task_timeout_ms;
 
         // Pre-create + resize the target to src_len so ALL blocks are allocated
         // up front (see property 1 above). We drop the owner writer WITHOUT
@@ -295,6 +299,7 @@ impl LoadTaskRunner {
 
         // Fan out: each stream reads its range from UFS and writes it to the
         // (already allocated) target region with its own reader + writer.
+        let task_timeout_ms = self.task_timeout_ms;
         let mut handles = Vec::with_capacity(streams);
         for i in 0..streams {
             let off = i as i64 * seg;
@@ -307,6 +312,7 @@ impl LoadTaskRunner {
             let src = source_path.clone();
             let dst = target_path.clone();
             let rt = self.fs.clone_runtime();
+            let task = self.task.clone();
             handles.push(rt.spawn(async move {
                 let mut reader = ufs.open(&src).await?;
                 reader.seek(off).await?;
@@ -317,6 +323,26 @@ impl LoadTaskRunner {
 
                 let mut remaining = len;
                 while remaining > 0 {
+                    // Honor cancellation and the shared deadline INSIDE the
+                    // segment loop: a segment can be multiple GiB, so checking
+                    // only between segments would let a canceled/timed-out job
+                    // keep reading from UFS and committing blocks. On early exit
+                    // cancel the writer so it does not complete() a partial
+                    // segment onto the pre-resized target.
+                    if task.is_cancel() {
+                        let _ = writer.cancel().await;
+                        return FsResult::Ok(0);
+                    }
+                    if LocalTime::mills() > deadline_ms {
+                        let _ = writer.cancel().await;
+                        return err_box!(
+                            "Task {} exceed timeout {} ms (segment [{}, {}))",
+                            task.info.task_id,
+                            task_timeout_ms,
+                            off,
+                            off + len
+                        );
+                    }
                     let want = remaining.min(Self::READ_CHUNK_BYTES) as usize;
                     let chunk = reader.async_read(Some(want)).await?;
                     if chunk.is_empty() {
@@ -330,6 +356,7 @@ impl LoadTaskRunner {
                 // hole in this segment. Fail loudly instead of committing partial
                 // data that would later read back as corrupt.
                 if remaining != 0 {
+                    let _ = writer.cancel().await;
                     return err_box!(
                         "short read on segment [{}, {}): {} bytes missing (source shorter than stat len?)",
                         off,
@@ -337,27 +364,46 @@ impl LoadTaskRunner {
                         remaining
                     );
                 }
+                // All writers share one FsContext client_name, so whichever
+                // stream completes first clears the file's write feature while
+                // other streams may still be committing blocks. This is safe
+                // ONLY because of correctness property (1) above: resize()
+                // pre-allocated every block so compute_len == file.len already
+                // holds regardless of commit order. Do NOT "fix" this into
+                // per-stream client IDs -- it is intentional.
                 writer.complete().await?;
                 reader.complete().await?;
                 FsResult::Ok(len)
             }));
         }
 
+        // Join all streams. On ANY early exit (cancel, segment error, timeout)
+        // abort the handles we have not yet awaited: a task blocked in a UFS read
+        // never observes is_cancel() on its own, so without this it could keep
+        // reading and complete() onto the target after the job is done/failed.
         let mut written: i64 = 0;
-        for h in handles {
+        for idx in 0..handles.len() {
             if self.task.is_cancel() {
                 info!("task {} was cancelled", self.task.info.task_id);
+                Self::abort_remaining(&handles, idx);
                 return Ok(());
             }
-            match h.await {
+            match (&mut handles[idx]).await {
                 Ok(Ok(n)) => {
                     written += n;
                     self.update_progress(written, src_len, false).await;
                 }
-                Ok(Err(e)) => return Err(e),
-                Err(e) => return err_box!("parallel load join error: {}", e),
+                Ok(Err(e)) => {
+                    Self::abort_remaining(&handles, idx + 1);
+                    return Err(e);
+                }
+                Err(e) => {
+                    Self::abort_remaining(&handles, idx + 1);
+                    return err_box!("parallel load join error: {}", e);
+                }
             }
             if spend.used_ms() > self.task_timeout_ms {
+                Self::abort_remaining(&handles, idx + 1);
                 return err_box!(
                     "Task {} exceed timeout {} ms",
                     self.task.info.task_id,
@@ -385,6 +431,18 @@ impl LoadTaskRunner {
         );
 
         Ok(())
+    }
+
+    /// Abort every not-yet-awaited stream handle in `handles[from..]`. Called on
+    /// any early exit from the join loop so background streams stop reading UFS
+    /// and never complete() onto the target after the job is done/failed. Tokio
+    /// abort is best-effort (it fires at the next await point); combined with the
+    /// in-loop is_cancel()/deadline checks this bounds how long a stream can run
+    /// past the parent's decision to stop.
+    fn abort_remaining(handles: &[orpc::runtime::JoinHandle<FsResult<i64>>], from: usize) {
+        for h in handles.iter().skip(from) {
+            h.abort();
+        }
     }
 
     async fn create_stream(&self) -> FsResult<(UnifiedReader, UnifiedWriter)> {
