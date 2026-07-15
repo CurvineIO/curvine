@@ -103,10 +103,12 @@ impl LoadTaskRunner {
         // one serial stream.
         let source_path = Path::from_str(&self.task.info.source_path)?;
         let target_path = Path::from_str(&self.task.info.target_path)?;
-        if !source_path.is_cv() && target_path.is_cv() && self.parallel_streams() > 1 {
-            // Probe source length cheaply to decide whether fan-out is worth it.
+        if !source_path.is_cv() && target_path.is_cv() && self.max_parallel_streams() > 1 {
+            // Probe source length cheaply, then let effective_streams() decide
+            // the fan-out width from file size. A small file yields 1 stream, so
+            // we fall through to the serial path below.
             let src_len = self.get_ufs()?.get_status(&source_path).await?.len;
-            if src_len >= self.parallel_threshold() {
+            if self.effective_streams(src_len) > 1 {
                 return self.run_parallel(&source_path, &target_path, src_len).await;
             }
         }
@@ -196,10 +198,12 @@ impl LoadTaskRunner {
         Ok(())
     }
 
-    /// Number of independent reader+writer streams to fan a large UFS->CV load
-    /// into. Read from the mount property `load_task.parallel_streams`
-    /// (per-bucket tunable), defaulting to 8. Clamped to >= 1.
-    fn parallel_streams(&self) -> usize {
+    /// Upper bound on the number of independent reader+writer streams a large
+    /// UFS->CV load may fan out into. Read from the mount property
+    /// `load_task.parallel_streams` (per-bucket tunable), defaulting to 8.
+    /// Clamped to >= 1. This is a CAP: the actual stream count is derived from
+    /// file size by [`Self::effective_streams`].
+    fn max_parallel_streams(&self) -> usize {
         self.task
             .info
             .job
@@ -211,21 +215,51 @@ impl LoadTaskRunner {
             .max(1)
     }
 
-    /// File-size threshold above which a load fans out into multiple streams.
-    /// Below this, one stream is fine and fan-out overhead (extra opens / stat)
-    /// is not worth it. Configurable via the mount property
-    /// `load_task.parallel_threshold` (per-bucket tunable), defaulting to 64 MiB.
-    /// Clamped to >= 1.
-    fn parallel_threshold(&self) -> i64 {
+    /// Minimum number of bytes a single stream must be responsible for before
+    /// fanning out is worthwhile. Each extra stream carries fixed setup cost
+    /// (UFS open, open_for_write RPC, per-block add_block, complete) that does
+    /// NOT shrink with file size, so a stream only pays off once it moves at
+    /// least this many bytes. Configurable via the mount property
+    /// `load_task.min_bytes_per_stream` (per-bucket tunable), defaulting to
+    /// 256 MiB. Clamped to >= 1.
+    ///
+    /// This subsumes the old boolean `load_task.parallel_threshold`: a file
+    /// smaller than this value yields `effective_streams == 1`, i.e. no fan-out.
+    fn min_bytes_per_stream(&self) -> i64 {
         self.task
             .info
             .job
             .mount_info
             .properties
-            .get("load_task.parallel_threshold")
+            .get("load_task.min_bytes_per_stream")
             .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(64 * 1024 * 1024)
+            .unwrap_or(256 * 1024 * 1024)
             .max(1)
+    }
+
+    /// Derive the stream count for a load of `src_len` bytes, growing the count
+    /// with file size instead of always jumping to the cap. Fixed per-stream
+    /// setup cost (opens/RPCs/complete) is independent of file size, so a
+    /// mid-size file over-parallelized to the full cap can be slower than a
+    /// smaller fan-out. We give each stream at least `min_bytes_per_stream` and
+    /// clamp to `[1, max_parallel_streams]`:
+    ///
+    ///   effective = clamp(src_len / min_bytes_per_stream, 1, cap)
+    ///
+    /// Examples (min=256 MiB, cap=8): 100 MiB -> 1 stream (no fan-out),
+    /// 512 MiB -> 2, 1 GiB -> 4, 2 GiB -> 8, 200 GiB -> 8 (capped).
+    fn effective_streams(&self, src_len: i64) -> usize {
+        Self::stream_count(src_len, self.min_bytes_per_stream(), self.max_parallel_streams())
+    }
+
+    /// Pure fan-out width math (extracted for unit testing): give each stream at
+    /// least `min_bytes` bytes, clamp to `[1, cap]`. `min_bytes` and `cap` are
+    /// treated as >= 1.
+    fn stream_count(src_len: i64, min_bytes: i64, cap: usize) -> usize {
+        let min_bytes = min_bytes.max(1);
+        let cap = cap.max(1);
+        let by_size = (src_len / min_bytes).max(0) as usize;
+        by_size.clamp(1, cap)
     }
 
     /// Compute the per-stream segment length for a parallel load.
@@ -278,7 +312,7 @@ impl LoadTaskRunner {
         target_path: &Path,
         src_len: i64,
     ) -> FsResult<()> {
-        let streams = self.parallel_streams();
+        let streams = self.effective_streams(src_len);
         let block_size = self.task.info.job.block_size.max(1);
         let seg = Self::segment_len(src_len, streams, block_size);
         let spend = TimeSpent::new();
@@ -629,5 +663,29 @@ mod tests {
         let ranges = plan(4 * MB, 8, 4 * MB);
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0], (0, 4 * MB));
+    }
+
+    #[test]
+    fn stream_count_grows_with_size_and_caps() {
+        let min = 256 * MB;
+        let cap = 8;
+        // Below min_bytes -> single stream (no fan-out), subsumes old threshold.
+        assert_eq!(LoadTaskRunner::stream_count(100 * MB, min, cap), 1);
+        assert_eq!(LoadTaskRunner::stream_count(min - 1, min, cap), 1);
+        // Grows linearly with size.
+        assert_eq!(LoadTaskRunner::stream_count(512 * MB, min, cap), 2);
+        assert_eq!(LoadTaskRunner::stream_count(1024 * MB, min, cap), 4);
+        assert_eq!(LoadTaskRunner::stream_count(2048 * MB, min, cap), 8);
+        // Clamped at the cap for very large files.
+        assert_eq!(LoadTaskRunner::stream_count(200 * 1024 * MB, min, cap), 8);
+    }
+
+    #[test]
+    fn stream_count_defensive_bounds() {
+        // Zero/negative length -> 1 (never 0), zero min_bytes/cap clamped to 1.
+        assert_eq!(LoadTaskRunner::stream_count(0, 256 * MB, 8), 1);
+        assert_eq!(LoadTaskRunner::stream_count(-5, 256 * MB, 8), 1);
+        assert_eq!(LoadTaskRunner::stream_count(1024 * MB, 0, 8), 8);
+        assert_eq!(LoadTaskRunner::stream_count(1024 * MB, 256 * MB, 0), 1);
     }
 }
