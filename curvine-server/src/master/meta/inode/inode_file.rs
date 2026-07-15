@@ -122,7 +122,14 @@ impl InodeFile {
         file
     }
 
-    pub fn with_link(id: i64, time: i64, target: impl Into<String>, mode: u32) -> Self {
+    pub fn with_link(
+        id: i64,
+        time: i64,
+        target: impl Into<String>,
+        mode: u32,
+        owner: Option<String>,
+        group: Option<String>,
+    ) -> Self {
         Self {
             id,
             file_type: FileType::Link,
@@ -136,7 +143,11 @@ impl InodeFile {
             features: FileFeature {
                 x_attr: Default::default(),
                 file_write: None,
-                acl: AclFeature::with_mode(mode),
+                acl: AclFeature {
+                    mode,
+                    owner: owner.unwrap_or_default(),
+                    group: group.unwrap_or_default(),
+                },
             },
 
             blocks: vec![],

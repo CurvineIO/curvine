@@ -304,6 +304,27 @@ impl UnifiedFileSystem {
         self.track("Symlink", target, link.path(), fut).await
     }
 
+    pub async fn symlink_with_owner_group(
+        &self,
+        target: &str,
+        link: &Path,
+        force: bool,
+        owner: Option<String>,
+        group: Option<String>,
+    ) -> FsResult<()> {
+        let fut = async {
+            match self.get_mount_checked(link, RpcCode::Symlink).await? {
+                None => {
+                    self.cv
+                        .symlink_with_owner_group(target, link, force, owner, group)
+                        .await
+                }
+                Some(_) => err_ext!(FsError::unsupported("symlink")),
+            }
+        };
+        self.track("Symlink", target, link.path(), fut).await
+    }
+
     pub async fn link(&self, src_path: &Path, dst_path: &Path) -> FsResult<()> {
         let fut = async {
             let _ = self.get_mount_checked(dst_path, RpcCode::Link).await?;

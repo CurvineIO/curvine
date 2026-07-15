@@ -608,8 +608,14 @@ impl MasterHandler {
             return ctx.response_buf(SymlinkResponse::default(), &mut self.buf);
         }
 
-        self.fs
-            .symlink(&header.target, &header.link, header.force, header.mode)?;
+        self.fs.symlink_with_owner_group(
+            &header.target,
+            &header.link,
+            header.force,
+            header.mode,
+            header.owner,
+            header.group,
+        )?;
 
         ctx.response_buf(SymlinkResponse::default(), &mut self.buf)
     }
