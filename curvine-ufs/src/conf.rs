@@ -203,6 +203,11 @@ impl OpendalConf {
         // via mount properties: benchmarking showed the defaults saturate the
         // link, and the outer parallel-load fan-out (load_task.parallel_streams)
         // is the knob that matters. Kept as internal constants.
+        //
+        // NOTE: this is a silent behavior change. These used to be per-mount
+        // tunables (legacy keys `opendal.read_chunk_size_in_bytes` /
+        // `opendal.read_concurrent`). Existing mounts that still carry those keys
+        // are now ignored -- not rejected -- so the values below always win.
         let read_chunk_size = Self::DEFAULT_READ_CHUNK_SIZE.max(1);
         let read_concurrent = Self::DEFAULT_READ_CONCURRENT.max(1);
 

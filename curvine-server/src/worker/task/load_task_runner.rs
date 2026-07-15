@@ -91,11 +91,16 @@ impl LoadTaskRunner {
             .update_state(JobTaskState::Loading, "Task started");
 
         // Fast path: UFS(e.g. S3) -> Curvine of a large file. A single OpenDAL
-        // reader's internal `.concurrent(N)` prefetch scales poorly (measured
-        // ~300-430 MB/s regardless of N), whereas N *independent* readers each
-        // pulling a disjoint byte range scale near-linearly (8 streams ~1.9 GB/s,
-        // 32 ~5.5 GB/s). So for a big UFS->CV load we fan out into N independent
-        // readers writing to N contiguous regions, instead of one serial stream.
+        // reader does not scale by cranking its internal `.concurrent(N)`
+        // prefetch alone -- that knob only hides single-connection latency (a
+        // small value like 2 is enough to saturate one connection); pushing it
+        // higher plateaus because one reader still commits through one writer.
+        // The way to scale is N *independent* streams, each an independent reader
+        // pulling a disjoint byte range into its own writer, which scale
+        // near-linearly (measured on BOS S3, single node: 8 streams ~1.36 GB/s
+        // vs ~215 MB/s single stream, ~6x). So for a big UFS->CV load we fan out
+        // into N independent readers writing to N contiguous regions, instead of
+        // one serial stream.
         let source_path = Path::from_str(&self.task.info.source_path)?;
         let target_path = Path::from_str(&self.task.info.target_path)?;
         if !source_path.is_cv() && target_path.is_cv() && self.parallel_streams() > 1 {
@@ -258,10 +263,11 @@ impl LoadTaskRunner {
     ///   single writer tops out around one block-writer's throughput.
     ///
     /// Correctness relies on three Curvine properties:
-    /// 1. `resize(src_len)` up front allocates every block and sets each block's
-    ///    length to `block_size`, so the master-side `complete()` length check
-    ///    (`compute_len == file.len`) already holds no matter which writer
-    ///    commits when.
+    /// 1. `resize(src_len)` up front allocates every block, giving each full
+    ///    block length `block_size` and the final block the remainder, so
+    ///    `compute_len()` already sums to exactly `src_len`. The master-side
+    ///    `complete()` length check (`compute_len == file.len`) therefore holds
+    ///    no matter which writer commits when.
     /// 2. Segments are rounded up to a whole number of `block_size` blocks, so no
     ///    two writers ever touch the same block (the unit of allocation/commit).
     /// 3. Curvine natively supports multiple concurrent writers on one file
