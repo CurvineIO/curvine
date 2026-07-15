@@ -20,6 +20,7 @@ use crate::worker::task::TaskManager;
 use crate::worker::WorkerMetrics;
 use curvine_common::conf::ClusterConf;
 use curvine_common::state::{HeartbeatStatus, WorkerAddress};
+use curvine_fault::FaultHttpControl;
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::info;
 use once_cell::sync::OnceCell;
@@ -46,10 +47,13 @@ pub struct WorkerService {
     task_manager: Arc<TaskManager>,
     rt: Arc<Runtime>,
     replication_manager: Arc<WorkerReplicationManager>,
+    fault_http: FaultHttpControl,
 }
 
 impl WorkerService {
     pub fn with_conf(conf: &ClusterConf, rt: Arc<Runtime>) -> CommonResult<Self> {
+        let fault_http = FaultHttpControl::from_env(&conf.fault_injection)
+            .map_err(|error| CommonError::from(error.to_string()))?;
         let store: BlockStore = BlockStore::new(&conf.cluster_id, conf)?;
 
         let task_manager = TaskManager::with_rt(rt.clone(), conf)?;
@@ -63,6 +67,7 @@ impl WorkerService {
             task_manager: Arc::new(task_manager),
             rt,
             replication_manager,
+            fault_http,
         };
         Ok(ws)
     }
@@ -94,7 +99,9 @@ impl WebHandlerService for WorkerService {
     type Item = WorkerRouterHandler;
 
     fn get_handler(&self) -> Self::Item {
-        WorkerRouterHandler {}
+        WorkerRouterHandler {
+            fault_http: self.fault_http.clone(),
+        }
     }
 }
 

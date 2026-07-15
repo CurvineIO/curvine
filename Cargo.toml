@@ -11,6 +11,7 @@ resolver = "2"
 
 members = [
     "orpc",
+    "curvine-fault",
     "curvine-common",
     "curvine-common/macros",
     "curvine-server",
@@ -28,6 +29,7 @@ members = [
 # curvine-lancedb stays opt-in because it pulls heavy Lance/Arrow dependencies.
 default-members = [
     "orpc",
+    "curvine-fault",
     "curvine-common",
     "curvine-server",
     "curvine-client",
@@ -46,6 +48,7 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 orpc = { path = "orpc" }
+curvine-fault = { path = "curvine-fault" }
 curvine-common = { path = "curvine-common" }
 curvine-client = { path = "curvine-client" }
 curvine-libsdk = { path = "curvine-libsdk" }
@@ -124,6 +127,7 @@ dashmap = "5.5.3"
 linked-hash-map = "0.5.6"
 fxhash = "0.2.1"
 parking_lot = "0.12.3"
+linkme = "0.3.35"
 anyhow = "1.0.97"
 url = "2.2.2"
 async-trait = "0.1.76"
@@ -138,6 +142,7 @@ md-5 = "0.10.6"
 bitflags = { version = "2.10.0", features = ["serde"] }
 glob = "0.3"
 lru = "0.16.1"
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
 
 mimalloc = "0.1.48"
 tikv-jemallocator = { version = "0.6.1", features = ["unprefixed_malloc_on_supported_platforms"] }
