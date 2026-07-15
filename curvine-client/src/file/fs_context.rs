@@ -26,11 +26,12 @@ use moka::policy::EvictionPolicy;
 use moka::sync::{Cache, CacheBuilder};
 use once_cell::sync::OnceCell;
 use orpc::client::{ClientConf, ClusterConnector};
-use orpc::common::Utils;
+use orpc::common::{TimeSpent, Utils};
 use orpc::io::net::NetUtils;
 use orpc::io::IOResult;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::CacheManager;
+use std::future::Future;
 use std::hash::BuildHasherDefault;
 use std::sync::Arc;
 use std::time::Duration;
@@ -177,6 +178,19 @@ impl FsContext {
 
     pub fn get_metrics<'a>() -> &'a ClientMetrics {
         CLIENT_METRICS.get().expect("client get metrics error!")
+    }
+
+    pub async fn metrics_track<F, T>(operation: &'static str, future: F) -> FsResult<T>
+    where
+        F: Future<Output = FsResult<T>>,
+    {
+        let spent = TimeSpent::new();
+        let result = future.await;
+        Self::get_metrics()
+            .metadata_operation_duration
+            .with_label_values(&[operation])
+            .observe(spent.used_us() as f64);
+        result
     }
 
     // Exclude a worker
