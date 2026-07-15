@@ -196,7 +196,7 @@ impl BackendHandle {
         let writer = if has_writer {
             let opts = CreateFileOptsBuilder::with_conf(state.client_conf()).build();
             let writer = state
-                .get_or_create_writer(Some(ino), &path, OpenFlags::new_write_only(), opts)
+                .get_or_create_writer(ino, &path, OpenFlags::new_write_only(), opts)
                 .await?;
             Some(writer)
         } else {

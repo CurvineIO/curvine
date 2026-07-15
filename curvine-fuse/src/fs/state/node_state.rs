@@ -23,8 +23,8 @@ use crate::fuse_metrics::{
 };
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{
-    err_fuse, FuseMetrics, FuseResult, FuseUtils, FUSE_CURRENT_DIR, FUSE_PARENT_DIR, FUSE_ROOT_ID,
-    STATE_FILE_MAGIC, STATE_FILE_VERSION,
+    err_fuse, FuseError, FuseMetrics, FuseResult, FuseUtils, FUSE_CURRENT_DIR, FUSE_PARENT_DIR,
+    FUSE_ROOT_ID, STATE_FILE_MAGIC, STATE_FILE_VERSION,
 };
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::{ClientConf, ClusterConf, FuseConf};
@@ -336,27 +336,23 @@ impl NodeState {
         self.writers.get(&ino).await
     }
 
+    // Get or create the writer registered under `ino`. The caller is
+    // responsible for resolving the inode first (see `new_handle`), so that the
+    // writer-map key and the handle ino are guaranteed to be the same value.
     pub async fn get_or_create_writer(
         &self,
-        ino: Option<u64>,
+        ino: u64,
         path: &Path,
         flags: OpenFlags,
         opts: CreateFileOpts,
     ) -> FuseResult<Arc<FuseWriter>> {
-        if let Some(ino) = ino {
-            self.writers
-                .get_or_create(ino, async {
-                    let writer = self.fs.open_with_opts(path, opts, flags).await?;
-                    let writer = FuseWriter::new(&self.conf, self.fs.clone_runtime(), writer);
-                    Ok(Arc::new(writer))
-                })
-                .await
-        } else {
-            let writer = self.fs.open_with_opts(path, opts, flags).await?;
-            let writer = Arc::new(FuseWriter::new(&self.conf, self.fs.clone_runtime(), writer));
-            let ino = self.next_ino(writer.status());
-            self.writers.insert(ino, writer.clone()).await
-        }
+        self.writers
+            .get_or_create(ino, async {
+                let writer = self.fs.open_with_opts(path, opts, flags).await?;
+                let writer = FuseWriter::new(&self.conf, self.fs.clone_runtime(), writer);
+                Ok(Arc::new(writer))
+            })
+            .await
     }
 
     pub async fn new_writer(
@@ -393,55 +389,65 @@ impl NodeState {
         flags: OpenFlags,
         opts: CreateFileOpts,
     ) -> FuseResult<Arc<FileHandle>> {
-        let (reader, writer) = match flags.access_mode() {
-            mode if mode == OpenFlags::RDONLY => {
-                let reader = self.new_reader(path).await?;
-                (Some(RawPtr::from_owned(reader)), None)
-            }
+        let mode = flags.access_mode();
 
-            mode if mode == OpenFlags::WRONLY => {
+        // Read-only: only a reader, no writer to register in the writers map.
+        if mode == OpenFlags::RDONLY {
+            let reader = self.new_reader(path).await?;
+            let mut status = reader.status().clone();
+            let ino = ino.unwrap_or(self.next_ino(&status));
+            status.id = ino as i64;
+            let handle = self
+                .insert_handle_with_writer(ino, Some(RawPtr::from_owned(reader)), None, status)
+                .await;
+            return Ok(handle);
+        }
+
+        if mode != OpenFlags::WRONLY && mode != OpenFlags::RDWR {
+            return err_fuse!(libc::EINVAL, "Invalid access mode: {:?}", mode);
+        }
+
+        // Write modes (WRONLY / RDWR): resolve the inode ONCE and register the
+        // writer under that same ino, so the writer-map key always equals the
+        // handle ino. When `ino` is provided (open / restore) we reuse it; when
+        // it is None (create) we open the writer first, derive the ino from its
+        // status a single time, then insert it under that key. This avoids the
+        // previous double `next_ino` call that could diverge for a freshly
+        // created file whose backend id was not yet assigned.
+        let (ino, writer) = match ino {
+            Some(ino) => {
                 let writer = self.get_or_create_writer(ino, path, flags, opts).await?;
-                (None, Some(writer))
+                (ino, writer)
             }
-
-            mode if mode == OpenFlags::RDWR => {
-                let writer = self.get_or_create_writer(ino, path, flags, opts).await?;
-                let reader = if writer.is_ufs() {
-                    warn!(
-                        "ufs {} -> {} does not support read-write mode for file opening, reader will be None",
-                        path,
-                        writer.path().full_path()
-                    );
-                    None
-                } else {
-                    let reader = self.new_reader(path).await?;
-                    Some(RawPtr::from_owned(reader))
-                };
-
-                (reader, Some(writer))
+            None => {
+                let writer = self.new_writer(path, flags, opts).await?;
+                let ino = self.next_ino(writer.status());
+                let writer = self.writers.insert::<FuseError>(ino, writer).await?;
+                (ino, writer)
             }
+        };
 
-            _ => {
-                return err_fuse!(
-                    libc::EINVAL,
-                    "Invalid access mode: {:?}",
-                    flags.access_mode()
+        let reader = if mode == OpenFlags::RDWR {
+            if writer.is_ufs() {
+                warn!(
+                    "ufs {} -> {} does not support read-write mode for file opening, reader will be None",
+                    path,
+                    writer.path().full_path()
                 );
+                None
+            } else {
+                let reader = self.new_reader(path).await?;
+                Some(RawPtr::from_owned(reader))
             }
+        } else {
+            None
         };
 
-        let mut status = if let Some(writer) = &writer {
-            writer.status().clone()
-        } else if let Some(reader) = &reader {
-            reader.status().clone()
-        } else {
-            return err_fuse!(libc::EINVAL, "Invalid flags: {:?}", flags);
-        };
-        let ino = ino.unwrap_or(self.next_ino(&status));
+        let mut status = writer.status().clone();
         status.id = ino as i64;
 
         let handle = self
-            .insert_handle_with_writer(ino, reader, writer, status)
+            .insert_handle_with_writer(ino, reader, Some(writer), status)
             .await;
 
         Ok(handle)
