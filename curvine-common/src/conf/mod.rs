@@ -21,6 +21,8 @@ pub use self::worker_conf::*;
 mod cluster_conf;
 pub use self::cluster_conf::*;
 
+pub use curvine_fault::FaultHttpConfig;
+
 mod client_conf;
 pub use self::client_conf::*;
 

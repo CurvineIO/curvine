@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 orpc = { workspace = true }
+curvine-fault = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 async-stream =  { workspace = true }

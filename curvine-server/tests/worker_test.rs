@@ -30,8 +30,29 @@ use orpc::CommonResult;
 use prost::bytes::BytesMut;
 use std::thread;
 
+#[cfg(feature = "fault-injection")]
+use curvine_fault::{
+    FaultController, FaultHttpController, FaultRuleBuilder, FaultRuntime, FaultTestSession,
+    FaultValue,
+};
+#[cfg(feature = "fault-injection")]
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+#[cfg(feature = "fault-injection")]
+use std::time::Duration;
+
 const CHUNK_SIZE: i32 = 1024;
 const LOOP_NUM: i32 = 100;
+
+#[cfg(feature = "fault-injection")]
+static WORKER_FAULT_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[cfg(feature = "fault-injection")]
+fn worker_fault_test_serial() -> MutexGuard<'static, ()> {
+    WORKER_FAULT_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 // Test the worker interface function.
 fn start_worker() -> ClusterConf {
@@ -48,6 +69,38 @@ fn start_worker() -> ClusterConf {
 
     let server = Worker::with_conf(conf.clone()).unwrap();
     thread::spawn(move || server.start_standalone());
+    conf
+}
+
+#[cfg(feature = "fault-injection")]
+fn start_worker_with_faults() -> ClusterConf {
+    const TOKEN_ENV: &str = "CURVINE_WORKER_TEST_FAULT_TOKEN";
+    std::env::set_var(TOKEN_ENV, "worker-test-secret");
+
+    let mut conf = ClusterConf::default();
+    conf.worker.rpc_port = NetUtils::hold_available_port();
+    conf.worker.web_port = NetUtils::hold_available_port();
+    conf.worker.data_dir = vec![format!(
+        "[MEM:10MB]../testing/worker-fault-test-{}",
+        Utils::req_id().abs()
+    )];
+    conf.fault_injection.enabled = true;
+    conf.fault_injection.auth_token_env = TOKEN_ENV.to_string();
+    conf.client.init().unwrap();
+
+    let server = Worker::with_conf(conf.clone()).unwrap();
+    let faults = FaultRuntime::process();
+    faults
+        .clear()
+        .expect("fault-enabled Worker test must start from a clean Runtime");
+    // Use Worker::block_on_start so the Web control plane is bound; the older
+    // start_standalone path only starts the RPC server.
+    thread::spawn(move || {
+        if let Err(error) = server.block_on_start() {
+            log::error!("fault-enabled worker failed to start: {error}");
+            std::process::abort();
+        }
+    });
     conf
 }
 
@@ -300,6 +353,122 @@ fn test_worker_batch_remote_write_complete_and_read_back() -> CommonResult<()> {
         );
     }
 
+    Ok(())
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+// Host-integration coverage: the generic crate tests cannot prove that a
+// Worker mounts the HTTP router and evaluates a real RPC point in one process.
+fn test_worker_fault_http_control_plane_e2e() -> CommonResult<()> {
+    let _serial = worker_fault_test_serial();
+    let conf = start_worker_with_faults();
+    let token = std::env::var("CURVINE_WORKER_TEST_FAULT_TOKEN")
+        .expect("start_worker_with_faults sets the fault token env");
+    let base = format!("http://{}:{}", conf.worker.hostname, conf.worker.web_port);
+    let open_req_id = Utils::req_id();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let session = rt.block_on(async {
+        let controller = Arc::new(
+            FaultHttpController::new(&base, &token)
+                .map_err(|e| orpc::CommonError::from(e.to_string()))?,
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            match controller.status().await {
+                Ok(status) => {
+                    assert!(status
+                        .points
+                        .iter()
+                        .any(|point| point.name == "worker.rpc.before_dispatch"));
+                    break;
+                }
+                Err(error) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let _ = error;
+                }
+                Err(error) => {
+                    return Err(orpc::CommonError::from(format!(
+                        "worker fault HTTP never became ready at {base}: {error}"
+                    )));
+                }
+            }
+        }
+
+        let mut session = FaultTestSession::new();
+        session.add_target("worker", controller);
+        session
+            .preflight()
+            .await
+            .map_err(|e| orpc::CommonError::from(e.to_string()))?;
+        let rule = FaultRuleBuilder::named("worker.rpc.before_dispatch")
+            .matches("req_id", open_req_id)
+            .and_then(|builder| builder.matches("rpc_code", RpcCode::WriteBlock as i32))
+            .and_then(|builder| builder.matches("request_status", i8::from(RequestStatus::Open)))
+            .and_then(|builder| builder.times(1))
+            .and_then(|builder| builder.return_error("worker HTTP control-plane failure"))
+            .map_err(|e| orpc::CommonError::from(e.to_string()))?;
+        session
+            .configure("worker", "http-fail-write-open", rule)
+            .await
+            .map_err(|e| orpc::CommonError::from(e.to_string()))?;
+
+        Ok::<FaultTestSession, orpc::CommonError>(session)
+    })?;
+
+    let block_size = (CHUNK_SIZE * LOOP_NUM) as i64;
+    let request = BlockWriteRequest {
+        block: ProtoUtils::extend_block_to_pb(ExtendedBlock::new(
+            Utils::req_id().abs(),
+            block_size,
+            StorageType::Disk,
+            FileType::File,
+        )),
+        off: 0,
+        block_size,
+        short_circuit: false,
+        client_name: "fault-http-test".to_string(),
+        chunk_size: CHUNK_SIZE,
+        pipeline_stream: Vec::new(),
+    };
+    let open = Builder::new()
+        .code(RpcCode::WriteBlock)
+        .request(RequestStatus::Open)
+        .req_id(open_req_id)
+        .seq_id(0)
+        .proto_header(request)
+        .build();
+    assert!(conf.worker_sync_client()?.rpc_check(open).is_err());
+
+    rt.block_on(async {
+        let rule = session
+            .wait_for_executions("worker", "http-fail-write-open", 1, Duration::from_secs(5))
+            .await
+            .map_err(|e| orpc::CommonError::from(e.to_string()))?;
+        assert_eq!(rule.executions, 1);
+        assert_eq!(
+            rule.last_context.as_ref().unwrap().get("rpc_code"),
+            Some(&FaultValue::I64(RpcCode::WriteBlock as i64))
+        );
+        assert_eq!(
+            rule.last_context.as_ref().unwrap().get("request_status"),
+            Some(&FaultValue::I64(RequestStatus::Open as i8 as i64))
+        );
+        session
+            .cleanup()
+            .await
+            .map_err(|e| orpc::CommonError::from(e.to_string()))?;
+        Ok::<(), orpc::CommonError>(())
+    })?;
+
+    let healthy_block = Utils::req_id().abs();
+    let write_ck = block_write(healthy_block, &conf)?;
+    let read_ck = block_read(healthy_block, &conf)?;
+    assert_eq!(write_ck, read_ck);
     Ok(())
 }
 

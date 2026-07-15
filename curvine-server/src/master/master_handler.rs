@@ -866,6 +866,17 @@ impl MessageHandler for MasterHandler {
     }
 
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {
+        crate::fault_point! {
+            sync,
+            name: "master.rpc.before_sync_dispatch",
+            description: "Before a synchronous Master RPC is dispatched to its business handler",
+            context: {
+                "req_id" => msg.req_id(),
+                "rpc_code" => msg.code() as i32,
+            },
+            return_error: |fault| Ok(msg.error_ext(&FsError::common(fault.message))),
+        }
+
         let mut rpc_context = RpcContext::new(msg);
         let ctx = &mut rpc_context;
         let code = RpcCode::from(msg.code());
@@ -935,6 +946,19 @@ impl MessageHandler for MasterHandler {
     }
 
     async fn async_handle(&mut self, msg: Message) -> FsResult<Message> {
+        crate::fault_point! {
+            async,
+            name: "master.rpc.before_async_dispatch",
+            description: "Before an asynchronous Master RPC is dispatched to its business handler",
+            context: {
+                "req_id" => msg.req_id(),
+                "rpc_code" => msg.code() as i32,
+            },
+            return_error: |fault| async {
+                Ok(msg.error_ext(&FsError::common(fault.message)))
+            },
+        }
+
         let mut rpc_context = RpcContext::new(&msg);
         let ctx = &mut rpc_context;
         let code = RpcCode::from(msg.code());

@@ -5,6 +5,17 @@
 format_master = false
 format_worker = false
 
+# Test-only remote fault control. Exposing the HTTP API requires BOTH:
+#   1) enabled = true below, and
+#   2) binaries built with `--features fault-injection`
+#      (e.g. curvine-server/fault-injection).
+# Enabling this without rebuilding fails server startup instead of silently
+# omitting the requested route.
+# Keep disabled in normal runs.
+[fault_injection]
+enabled = false
+auth_token_env = "CURVINE_FAULT_TOKEN"
+
 
 # master configuration
 [master]

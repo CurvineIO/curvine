@@ -40,6 +40,18 @@ impl MessageHandler for WorkerHandler {
     type Error = FsError;
 
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {
+        crate::fault_point! {
+            sync,
+            name: "worker.rpc.before_dispatch",
+            description: "Before a Worker RPC is dispatched to its business handler",
+            context: {
+                "req_id" => msg.req_id(),
+                "rpc_code" => msg.code() as i32,
+                "request_status" => i8::from(msg.request_status()),
+            },
+            return_error: |fault| Err(FsError::common(fault.message)),
+        }
+
         let code = RpcCode::from(msg.code());
         match code {
             RpcCode::SubmitTask => self.task_submit(msg),
