@@ -18,24 +18,8 @@
 
 export CURVINE_HOME="$(cd "$(dirname "$0")"/..; pwd)"
 
-OS_NAME=$(uname 2>/dev/null || echo unknown)
-LOCAL_HOSTNAME=$(hostname 2>/dev/null || true)
-LOCAL_HOSTNAME=${LOCAL_HOSTNAME:-localhost}
-
-# Get the last IP address from local network interfaces, falling back to loopback.
-LOCAL_IP=127.0.0.1
-case "$OS_NAME" in
-    Linux)
-        DETECTED_IP=$(hostname -I 2>/dev/null | awk '{print $NF}')
-        ;;
-    Darwin)
-        DETECTED_IP=$(ifconfig 2>/dev/null | awk '$1 == "inet" && $2 != "127.0.0.1" { ip = $2 } END { print ip }')
-        ;;
-    *)
-        DETECTED_IP=
-        ;;
-esac
-LOCAL_IP=${DETECTED_IP:-$LOCAL_IP}
+LOCAL_HOSTNAME=localhost
+LOCAL_IP=localhost
 
 # master bound host name
 export CURVINE_MASTER_HOSTNAME=${CURVINE_MASTER_HOSTNAME:-$LOCAL_HOSTNAME}
