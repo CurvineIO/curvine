@@ -64,6 +64,7 @@ This script tests basic filesystem operations including:
   - Active-writer path truncate regression (PR #962)
   - Read-only open with O_CREAT creates a missing file
   - Mode 0000 is preserved by chmod, fchmod, and umask-filtered create
+  - Overlong lookup names return ENAMETOOLONG
 
 For FIO performance tests, use fio-test.sh instead.
 
@@ -1389,6 +1390,15 @@ test_mode_zero_permissions() {
         "mode_zero_permissions_repro.py" --dir "$TEST_DIR"
 }
 
+# Test 24: lookup of an overlong name returns ENAMETOOLONG
+test_lookup_enametoolong() {
+    CURRENT_TEST_GROUP="Test 24: Lookup ENAMETOOLONG"
+    print_header "$CURRENT_TEST_GROUP"
+    run_python_script_test \
+        "Testing lookup on overlong names returns ENAMETOOLONG" \
+        "lookup_enametoolong_repro.py" --dir "$TEST_DIR"
+}
+
 # Print final report
 print_report() {
     print_header "Test Summary"
@@ -1497,6 +1507,7 @@ main() {
     test_pr962_active_writer_truncate
     test_open_creat_rdonly
     test_mode_zero_permissions
+    test_lookup_enametoolong
 
     test_git_clone
 
