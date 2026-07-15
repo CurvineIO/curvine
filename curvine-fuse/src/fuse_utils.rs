@@ -46,21 +46,23 @@ impl FuseUtils {
         BytesMut::from(bytes)
     }
 
-    pub fn get_kernel_version() -> f32 {
-        let output = Command::new("uname")
-            .arg("-r")
-            .output()
-            .expect("Failed to execute 'uname -r'");
-
-        // Convert output to string and remove the line break at the end
-        let kernel_ver = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-        let parts: Vec<&str> = kernel_ver.split('.').collect();
-        if parts.len() < 2 {
-            1f32
-        } else {
-            format!("{}.{}", parts[0], parts[1]).parse::<f32>().unwrap()
+    pub fn get_kernel_version() -> (u32, u32) {
+        let Ok(output) = Command::new("uname").arg("-r").output() else {
+            return (0, 0);
+        };
+        if !output.status.success() {
+            return (0, 0);
         }
+
+        let kernel_release = String::from_utf8_lossy(&output.stdout);
+        Self::parse_kernel_version(kernel_release.trim()).unwrap_or((0, 0))
+    }
+
+    fn parse_kernel_version(kernel_release: &str) -> Option<(u32, u32)> {
+        let mut parts = kernel_release.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        Some((major, minor))
     }
 
     pub fn get_mode(perm: u32, typ: FileType) -> u32 {
@@ -385,5 +387,32 @@ impl FuseUtils {
             nlink: 1,
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FuseUtils;
+    use crate::FUSE_CLONE_FD_MIN_VERSION;
+
+    #[test]
+    fn kernel_version_6_10_compares_greater_than_6_9() {
+        let version = FuseUtils::parse_kernel_version("6.10.3").unwrap();
+
+        assert!(version > (6, 9));
+    }
+
+    #[test]
+    fn kernel_version_4_10_enables_clone_fd() {
+        let version = FuseUtils::parse_kernel_version("4.10.0").unwrap();
+
+        assert!(version >= FUSE_CLONE_FD_MIN_VERSION);
+    }
+
+    #[test]
+    fn kernel_version_parse_failure_disables_clone_fd() {
+        let version = FuseUtils::parse_kernel_version("unexpected").unwrap_or((0, 0));
+
+        assert!(version < FUSE_CLONE_FD_MIN_VERSION);
     }
 }
