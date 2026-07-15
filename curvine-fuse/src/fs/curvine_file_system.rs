@@ -823,7 +823,12 @@ impl fs::FileSystem for CurvineFileSystem {
         self.ensure_writable_path(&path, RpcCode::CreateFile)
             .await?;
 
-        let opts = FuseUtils::create_opts(&op, &self.fs);
+        let mut opts = FuseUtils::create_opts(&op, &self.fs);
+        let parent_status = self.state.fs_stat(ino, None).await?;
+        if parent_status.mode & FUSE_S_ISGID != 0 {
+            opts.group = parent_status.group;
+        }
+
         let handle = self.state.fs_create(ino, name, op.arg.flags, opts).await?;
         let attr = FuseUtils::status_to_attr(&self.conf, handle.status())?;
 
