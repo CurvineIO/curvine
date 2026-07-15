@@ -249,7 +249,11 @@ impl LoadTaskRunner {
     /// Examples (min=256 MiB, cap=8): 100 MiB -> 1 stream (no fan-out),
     /// 512 MiB -> 2, 1 GiB -> 4, 2 GiB -> 8, 200 GiB -> 8 (capped).
     fn effective_streams(&self, src_len: i64) -> usize {
-        Self::stream_count(src_len, self.min_bytes_per_stream(), self.max_parallel_streams())
+        Self::stream_count(
+            src_len,
+            self.min_bytes_per_stream(),
+            self.max_parallel_streams(),
+        )
     }
 
     /// Pure fan-out width math (extracted for unit testing): give each stream at
