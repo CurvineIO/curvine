@@ -67,6 +67,7 @@ use curvine_common::fs::Path;
 use curvine_common::state::MountInfo;
 use curvine_common::FsResult;
 use log::{debug, warn};
+use once_cell::sync::OnceCell;
 use orpc::common::{FastHashMap, LocalTime};
 use orpc::runtime::RpcRuntime;
 use orpc::sync::AtomicCounter;
@@ -79,21 +80,28 @@ use tokio::sync::Mutex;
 /// Contains mount metadata, UFS handler, and path conversion utilities.
 pub struct MountValue {
     pub info: MountInfo,
-    pub ufs: UfsFileSystem,
+    ufs: OnceCell<UfsFileSystem>,
     pub mount_id: String,
 }
 
 impl MountValue {
     pub fn new(info: MountInfo) -> FsResult<Self> {
-        let ufs_path = Path::from_str(&info.ufs_path)?;
-        let ufs = UfsFileSystem::new(&ufs_path, info.properties.clone(), info.provider)?;
         let mount_id = format!("{}", info.mount_id);
 
         Ok(Self {
             info,
-            ufs,
+            ufs: OnceCell::new(),
             mount_id,
         })
+    }
+
+    pub fn ufs(&self) -> FsResult<UfsFileSystem> {
+        self.ufs
+            .get_or_try_init(|| {
+                let ufs_path = Path::from_str(&self.info.ufs_path)?;
+                UfsFileSystem::new(&ufs_path, self.info.properties.clone(), self.info.provider)
+            })
+            .cloned()
     }
 
     /// Converts CV path to UFS path
@@ -331,5 +339,60 @@ impl MountCache {
     pub fn remove(&self, path: &Path) {
         let mut state = self.mounts.write().unwrap();
         state.remove(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_common::state::{AccessMode, MountInfo, Provider, TtlAction, WriteType};
+    use std::collections::HashMap;
+
+    fn opendal_oss_mount() -> MountInfo {
+        MountInfo {
+            cv_path: "/oss-mount/data".to_string(),
+            ufs_path: "oss://example-bucket/data".to_string(),
+            mount_id: 1,
+            properties: HashMap::new(),
+            ttl_ms: 7 * 24 * 60 * 60 * 1000,
+            ttl_action: TtlAction::Delete,
+            read_verify_ufs: false,
+            storage_type: None,
+            block_size: None,
+            replicas: None,
+            write_type: WriteType::CacheMode,
+            provider: Some(Provider::Opendal),
+            auto_cache: true,
+            access_mode: AccessMode::ReadOnly,
+        }
+    }
+
+    #[test]
+    fn cache_insert_is_metadata_only_for_unsupported_provider() {
+        let mut mounts = InnerMap::default();
+
+        mounts
+            .insert(opendal_oss_mount())
+            .expect("mount cache refresh should not initialize UFS providers");
+
+        assert!(mounts.get(true, "/flink/checkpoints").is_none());
+        let mount = mounts
+            .get(true, "/oss-mount/data")
+            .expect("mounted path should be cached");
+        assert!(mount.ufs.get().is_none());
+    }
+
+    #[test]
+    fn unsupported_provider_error_is_lazy_until_mount_use() {
+        let mut mounts = InnerMap::default();
+        mounts
+            .insert(opendal_oss_mount())
+            .expect("mount cache refresh should not initialize UFS providers");
+
+        let mount = mounts
+            .get(true, "/oss-mount/data")
+            .expect("mounted path should be cached");
+
+        assert!(mount.ufs().is_err());
     }
 }

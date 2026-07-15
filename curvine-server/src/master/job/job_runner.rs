@@ -226,7 +226,7 @@ impl LoadJobRunner {
         }
 
         // Target looks valid locally; confirm against UFS source before skipping.
-        let source_status = mnt.ufs.get_status(source_path).await?;
+        let source_status = mnt.ufs()?.get_status(source_path).await?;
         Ok(cv_status.cv_valid(Some(&source_status)))
     }
 

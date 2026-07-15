@@ -155,7 +155,7 @@ async fn write_ufs_and_warm_cache(
         .unwrap()
         .unwrap();
 
-    let mut w = mount.ufs.create(&ufs_path, true).await.unwrap();
+    let mut w = mount.ufs().unwrap().create(&ufs_path, true).await.unwrap();
     w.write(data.as_bytes()).await.unwrap();
     w.complete().await.unwrap();
 
@@ -223,7 +223,7 @@ async fn build_reader_with_unreachable_worker(
     FallbackFsReader::new(
         cv_reader,
         ufs_path,
-        mount.ufs.clone(),
+        mount.ufs().unwrap(),
         mount.info.is_fs_mode(),
     )
 }
@@ -398,7 +398,7 @@ fn test_tc12_worker_failure_ufs_mtime_mismatch_returns_error() {
             .await
             .unwrap()
             .unwrap();
-        let mut ufs_writer = mount.ufs.create(&ufs_path, true).await.unwrap();
+        let mut ufs_writer = mount.ufs().unwrap().create(&ufs_path, true).await.unwrap();
         ufs_writer.write(b"changed-in-ufs").await.unwrap();
         ufs_writer.complete().await.unwrap();
 
@@ -510,7 +510,7 @@ fn test_tc17_cachemode_worker_failure_pos0_reads_current_s3() {
             .await
             .unwrap()
             .unwrap();
-        let mut w = mount.ufs.create(&ufs_path, true).await.unwrap();
+        let mut w = mount.ufs().unwrap().create(&ufs_path, true).await.unwrap();
         w.write(changed.as_bytes()).await.unwrap();
         w.complete().await.unwrap();
 
@@ -556,7 +556,7 @@ fn test_tc18_cachemode_worker_failure_shrunk_past_pos_errors() {
             .await
             .unwrap()
             .unwrap();
-        let mut w = mount.ufs.create(&ufs_path, true).await.unwrap();
+        let mut w = mount.ufs().unwrap().create(&ufs_path, true).await.unwrap();
         w.write(changed.as_bytes()).await.unwrap();
         w.complete().await.unwrap();
 
@@ -636,7 +636,7 @@ fn test_tc20_cachemode_worker_failure_grown_reads_current_s3() {
             .await
             .unwrap()
             .unwrap();
-        let mut w = mount.ufs.create(&ufs_path, true).await.unwrap();
+        let mut w = mount.ufs().unwrap().create(&ufs_path, true).await.unwrap();
         w.write(changed.as_bytes()).await.unwrap();
         w.complete().await.unwrap();
 
@@ -683,7 +683,7 @@ fn test_tc21_cachemode_fallback_len_reflects_current_s3() {
             .await
             .unwrap()
             .unwrap();
-        let mut w = mount.ufs.create(&ufs_path, true).await.unwrap();
+        let mut w = mount.ufs().unwrap().create(&ufs_path, true).await.unwrap();
         w.write(changed.as_bytes()).await.unwrap();
         w.complete().await.unwrap();
 
