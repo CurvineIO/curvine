@@ -145,12 +145,16 @@ impl ProgressDisplay for BasicProgress {
         if self.total == 0 {
             0.0
         } else {
-            (self.completed as f64 / self.total as f64) * 100.0
+            ((self.completed as f64 / self.total as f64) * 100.0).min(100.0)
         }
     }
 
     fn completed_size(&self) -> u64 {
-        self.completed
+        if self.total == 0 {
+            self.completed
+        } else {
+            self.completed.min(self.total)
+        }
     }
 
     fn total_size(&self) -> u64 {
@@ -465,5 +469,18 @@ mod tests {
 
         let bar = progress.format_progress_bar(&opts);
         assert_eq!(bar, "#######---");
+    }
+
+    #[test]
+    fn test_basic_progress_caps_over_complete_display() {
+        let progress = BasicProgress::new(66, 33);
+
+        assert_eq!(progress.progress(), 100.0);
+
+        let display = progress.format_progress();
+        assert!(display.contains("100.0%"));
+        assert!(display.contains("33/33"));
+        assert!(!display.contains("200.0%"));
+        assert!(!display.contains("66/33"));
     }
 }
