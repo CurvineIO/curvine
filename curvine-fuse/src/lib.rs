@@ -96,7 +96,11 @@ pub const FUSE_WRITEBACK_CACHE: u32 = 1 << 16;
 
 pub const FUSE_POSIX_ACL: u32 = 1 << 20;
 
-pub const FUSE_DO_RENAME2: u32 = 1 << 11;
+/// FUSE init capability bit `1 << 11` (uapi `fuse.h`): the kernel supports
+/// ioctl on directories. NOTE: RENAME2 is an *opcode* (`FUSE_RENAME2 = 45`),
+/// not an init flag — bit 11 is `FUSE_HAS_IOCTL_DIR`. Not yet negotiated by
+/// this daemon.
+pub const FUSE_HAS_IOCTL_DIR: u32 = 1 << 11;
 
 /// Kernel automatically invalidates the page cache on open when mtime or size
 /// has changed (CAP_AUTO_INVAL_DATA, available since Linux 2.6.35).
