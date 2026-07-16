@@ -665,7 +665,7 @@ impl fs::FileSystem for CurvineFileSystem {
             .state
             .new_dir_handle(op.header.nodeid, &dir_path)
             .await?;
-        let open_flags = FuseUtils::fill_open_flags(&self.conf, op.arg.flags);
+        let open_flags = FuseUtils::dir_open_flags(&self.conf);
         let attr = fuse_open_out {
             fh: handle.fh,
             open_flags,
@@ -772,9 +772,8 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let handle = self.state.fs_open(ino, op.arg.flags, opts).await?;
 
-        let mut open_flags = op.arg.flags;
-        if self.conf.direct_io {
-            open_flags |= FUSE_FOPEN_DIRECT_IO;
+        let keep_cache = if self.conf.direct_io {
+            false
         } else {
             // Page cache consistency is handled here rather than via explicit inode
             // invalidation notifications, for two reasons:
@@ -794,13 +793,9 @@ impl fs::FileSystem for CurvineFileSystem {
             // keep_cache may return true even after a remote modification, causing stale
             // reads.  This is intentional — metadata caching trades strict consistency
             // for performance, and callers that enable it accept this trade-off.
-            let keep_cache = self.state.keep_cache(ino, &handle.status());
-            if keep_cache {
-                open_flags |= FUSE_FOPEN_KEEP_CACHE;
-            } else if self.conf.open_direct_on_stale {
-                open_flags |= FUSE_FOPEN_DIRECT_IO;
-            }
-        }
+            self.state.keep_cache(ino, &handle.status())
+        };
+        let open_flags = FuseUtils::file_open_flags(&self.conf, keep_cache);
 
         let entry = fuse_open_out {
             fh: handle.fh(),
@@ -856,7 +851,7 @@ impl fs::FileSystem for CurvineFileSystem {
             },
             fuse_open_out {
                 fh: handle.fh(),
-                open_flags: op.arg.flags,
+                open_flags: FuseUtils::file_open_flags(&self.conf, true),
                 padding: 0,
             },
         );
