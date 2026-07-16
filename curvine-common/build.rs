@@ -126,6 +126,12 @@ fn emit_git_rerun_if_changed() {
             }
         }
     }
+
+    // After `git pack-refs`, the loose ref may be absent and tip updates only
+    // touch packed-refs; watch it so incremental builds still refresh VERSION.
+    if let Some(packed_refs) = git_path("packed-refs") {
+        println!("cargo:rerun-if-changed={}", packed_refs.display());
+    }
 }
 
 fn git_path(path: &str) -> Option<PathBuf> {
