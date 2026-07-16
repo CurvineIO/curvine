@@ -20,10 +20,16 @@ use once_cell::sync::Lazy;
 
 pub mod cli;
 pub mod fs;
-pub mod macros;
+// Crate-internal only: `macros` exposes no public API (its sole item, the
+// `err_fuse!` macro, is `pub(crate)`), so the module is `mod`, not `pub mod`.
+mod macros;
 pub mod raw;
 pub mod session;
 pub mod web_server;
+
+// Re-export the crate-internal `err_fuse!` macro at the crate root so existing
+// `use crate::err_fuse;` imports resolve. Not `#[macro_export]`ed — see macros.rs.
+pub(crate) use macros::err_fuse;
 
 mod fuse_error;
 pub use self::fuse_error::FuseError;

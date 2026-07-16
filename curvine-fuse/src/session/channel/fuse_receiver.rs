@@ -527,7 +527,7 @@ impl<T: FileSystem> FuseReceiver<T> {
 
             _ = notify.notified() => {
                 pending_requests.remove(&req.unique());
-                let err: FuseResult<()> = err_fuse!(EINTR, "operation interrupted");
+                let err: FuseResult<()> = err_fuse!(libc::EINTR, "operation interrupted");
                 // Source-tagged as interrupted (the SETLKW interrupt-notify path),
                 // not inferred from the EINTR errno.
                 reply.send_rep_tagged(err, None, true).await.map_err(|x| x.into())
