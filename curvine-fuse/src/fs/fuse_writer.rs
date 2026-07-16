@@ -23,6 +23,7 @@ use curvine_common::fs::{Path, Writer};
 use curvine_common::state::{FileAllocOpts, FileStatus};
 use curvine_common::FsResult;
 use log::error;
+use orpc::common::LocalTime;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
 use orpc::sync::{AtomicCounter, AtomicLong, ErrorMonitor};
@@ -55,6 +56,7 @@ pub struct FuseWriter {
     status: FileStatus,
     is_ufs: bool,
     len: Arc<AtomicLong>,
+    mtime: Arc<AtomicLong>,
     write_ver: AtomicCounter,
     /// Phase 2b kill-switch flag: decides whether `send_queued_task` creates a
     /// `stream_write_queue_depth` guard. (The `path_type` label is captured as a
@@ -82,6 +84,7 @@ impl FuseWriter {
         let status = writer.status().clone();
         let monitor = err_monitor.clone();
         let len = Arc::new(AtomicLong::new(status.len));
+        let mtime = Arc::new(AtomicLong::new(status.mtime));
         let write_ver = AtomicCounter::new(0);
         // Phase 2b: backend kind + metrics gate, captured at open and moved into
         // the writer task for the per-IO observe (same as FuseReader).
@@ -89,8 +92,11 @@ impl FuseWriter {
         let metrics_enabled = conf.metrics_enabled;
 
         let len1 = len.clone();
+        let mtime1 = mtime.clone();
         rt.spawn(async move {
-            let res = Self::writer_future(writer, receiver, len1, path_type, metrics_enabled).await;
+            let res =
+                Self::writer_future(writer, receiver, len1, mtime1, path_type, metrics_enabled)
+                    .await;
             match res {
                 Ok(_) => (),
 
@@ -108,6 +114,7 @@ impl FuseWriter {
             status,
             is_ufs,
             len,
+            mtime,
             write_ver,
             metrics_enabled,
         }
@@ -217,6 +224,10 @@ impl FuseWriter {
         self.len.get()
     }
 
+    pub fn mtime(&self) -> i64 {
+        self.mtime.get()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -225,6 +236,7 @@ impl FuseWriter {
         mut writer: UnifiedWriter,
         mut req_receiver: AsyncReceiver<QueuedWriteTask>,
         file_len: Arc<AtomicLong>,
+        file_mtime: Arc<AtomicLong>,
         path_type: &'static str,
         metrics_enabled: bool,
     ) -> FsResult<()> {
@@ -272,7 +284,8 @@ impl FuseWriter {
 
                     if res.is_ok() {
                         let cur_len = file_len.get();
-                        file_len.set(cur_len.max(off + len as i64))
+                        file_len.set(cur_len.max(off + len as i64));
+                        file_mtime.set(LocalTime::mills() as i64);
                     }
 
                     if let Some(reply) = reply {

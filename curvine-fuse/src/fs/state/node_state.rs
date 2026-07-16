@@ -876,11 +876,26 @@ impl NodeState {
         if let Some(len) = self.get_writer_len(attr.ino).await {
             attr.size = attr.size.max(len)
         }
+
+        if let Some(mtime) = self.get_writer_mtime(attr.ino).await {
+            attr.mtime = (mtime.max(0) / 1000) as u64;
+            attr.mtimensec = ((mtime.max(0) % 1000) * 1_000_000) as u32;
+            attr.ctime = attr.mtime;
+            attr.ctimensec = attr.mtimensec;
+        }
     }
 
     pub async fn get_writer_len(&self, ino: u64) -> Option<u64> {
         if let Some(writer) = self.find_writer(ino).await {
             return Some(writer.len() as u64);
+        }
+
+        None
+    }
+
+    pub async fn get_writer_mtime(&self, ino: u64) -> Option<i64> {
+        if let Some(writer) = self.find_writer(ino).await {
+            return Some(writer.mtime());
         }
 
         None
