@@ -17,7 +17,7 @@
 use crate::raw::fuse_abi::fuse_args;
 use crate::raw::fuse_mount_pure;
 use crate::raw::fuse_umount_pure;
-use crate::{FuseUtils, RawSession, FUSE_CLONE_FD_MIN_VERSION, UNIX_KERNEL_VERSION};
+use crate::{FuseUtils, FUSE_CLONE_FD_MIN_VERSION, UNIX_KERNEL_VERSION};
 use curvine_common::conf::FuseConf;
 use log::{debug, error, info};
 use orpc::io::IOResult;
