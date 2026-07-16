@@ -75,12 +75,52 @@ impl FuseUtils {
         Some((major, minor))
     }
 
+    // Per-type default permission bits, used only as a fallback when a status
+    // carries no mode (mode == 0). File / Stream / Agg / Object all count as
+    // regular files.
+    fn default_mode(typ: FileType) -> u32 {
+        match typ {
+            FileType::Dir => FUSE_DEFAULT_DIR_MODE,
+            FileType::Link => FUSE_DEFAULT_SYMLINK_MODE,
+            _ => FUSE_DEFAULT_FILE_MODE,
+        }
+    }
+
+    // Decide the permission bits to report for a status.
+    //
+    // - Symlinks always report the default (the kernel ignores symlink perm bits).
+    // - mode == 0 means the status carries no mode (synthetic / default-constructed
+    //   status); fall back to a per-type default masked by umask, matching what a
+    //   fresh create would have produced.
+    // - Otherwise report the stored mode verbatim (only stray/high bits stripped).
+    //   umask is NOT re-applied: it is a create-time mask, and getattr must report
+    //   the mode as stored.
+    //
+    // NOTE (trade-off): mode == 0 is treated as "unset" and gets a default, which
+    // also overrides the literal meaning of an explicit `chmod 000`. This does not
+    // grant access in practice: curvine's own `check_access_permissions` uses the
+    // raw `status.mode`, so with the default `check_permission = true` a 000 file is
+    // still denied. The literal 000 is only lost if `check_permission` is disabled
+    // and access is left to the kernel's `default_permissions`.
+    pub fn effective_perm(mode: u32, typ: FileType, umask: u32) -> u32 {
+        if typ == FileType::Link {
+            return FUSE_DEFAULT_SYMLINK_MODE;
+        }
+        if mode == 0 {
+            Self::default_mode(typ) & !umask
+        } else {
+            mode & 0o7777
+        }
+    }
+
     pub fn get_mode(perm: u32, typ: FileType) -> u32 {
+        // Strip any file-type / stray high bits before OR-ing the correct type bit.
+        let perm = perm & 0o7777;
         match typ {
             FileType::Dir => perm | (libc::S_IFDIR as u32),
 
             #[cfg(target_os = "linux")]
-            FileType::Link => FUSE_DEFAULT_MODE | (libc::S_IFLNK as u32),
+            FileType::Link => perm | (libc::S_IFLNK as u32),
 
             _ => perm | (libc::S_IFREG as u32),
         }
@@ -181,12 +221,26 @@ impl FuseUtils {
         Ok(clone_fd)
     }
 
-    pub fn fuse_st_size(status: &FileStatus) -> u64 {
-        match status.file_type {
+    pub fn fuse_st_size(status: &FileStatus) -> FuseResult<u64> {
+        let size = match status.file_type {
             FileType::Link => status.target.as_ref().map(|x| x.len()).unwrap_or(0) as u64,
             FileType::Dir => FUSE_DEFAULT_PAGE_SIZE as u64,
-            _ => status.len as u64,
-        }
+            // Regular files (File / Stream / Agg / Object) take their size from
+            // `status.len`. Defend the FUSE boundary against abnormal backend
+            // data: a negative len would cast to a huge u64, so reject it.
+            _ => {
+                if status.len < 0 {
+                    return err_fuse!(
+                        libc::EINVAL,
+                        "negative file length {} for ino {}",
+                        status.len,
+                        status.id
+                    );
+                }
+                status.len as u64
+            }
+        };
+        Ok(size)
     }
 
     pub fn is_dot(&self, name: &str) -> bool {
@@ -254,7 +308,11 @@ impl FuseUtils {
     }
 
     pub fn status_to_attr(conf: &FuseConf, status: &FileStatus) -> FuseResult<fuse_attr> {
-        let blocks = ((status.len + 511) / 512) as u64;
+        // Derive size first (rejects negative len for regular files), then blocks
+        // from the reported size so the two stay consistent (a directory reports
+        // size = 4096 ⇒ blocks = 8, not 0). `div_ceil` on a u64 cannot overflow.
+        let size = FuseUtils::fuse_st_size(status)?;
+        let blocks = size.div_ceil(512);
 
         let mtime_sec = (status.mtime.max(0) / 1000) as u64;
         let mtime_nsec = ((status.mtime.max(0) % 1000) * 1_000_000) as u32;
@@ -287,17 +345,12 @@ impl FuseUtils {
             }
         };
 
-        let perm = if status.id == FUSE_UNKNOWN_INO as i64 && FuseUtils.is_dot(&status.name) {
-            FUSE_DEFAULT_MODE & !conf.umask
-        } else {
-            status.mode
-        };
+        let perm = FuseUtils::effective_perm(status.mode, status.file_type, conf.umask);
         let mode = FuseUtils::get_mode(perm, status.file_type);
-        let size = FuseUtils::fuse_st_size(status);
 
-        // For links, nlink should be greater than 1
-        // Now we use the actual nlink from FileStatus
-        let nlink = status.nlink;
+        // A regular file/dir has at least one link; some backends (UFS/object
+        // store) do not populate nlink, leaving it 0. Report at least 1.
+        let nlink = if status.nlink == 0 { 1 } else { status.nlink };
 
         Ok(fuse_attr {
             ino: status.id as u64,
@@ -603,5 +656,106 @@ mod tests {
 
         // `r` is already closed inside clone_fd_ioctl; only close the write end.
         let _ = sys::close(w);
+    }
+
+    fn file_status(file_type: FileType, len: i64, mode: u32) -> FileStatus {
+        FileStatus {
+            file_type,
+            len,
+            mode,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn status_to_attr_rejects_negative_len() {
+        let conf = FuseConf::default();
+
+        // A regular file with a negative len is rejected (size comes from len).
+        let err =
+            FuseUtils::status_to_attr(&conf, &file_status(FileType::File, -1, 0o644)).unwrap_err();
+        assert_eq!(err.errno(), libc::EINVAL);
+
+        // Dir / Link sizes do not come from len, so a negative len is harmless.
+        assert!(FuseUtils::status_to_attr(&conf, &file_status(FileType::Dir, -1, 0o755)).is_ok());
+        let mut link = file_status(FileType::Link, -1, 0);
+        link.target = Some("x".to_string());
+        assert!(FuseUtils::status_to_attr(&conf, &link).is_ok());
+    }
+
+    #[test]
+    fn blocks_derived_from_fuse_size() {
+        let conf = FuseConf::default();
+
+        // Directory: size = 4096 ⇒ blocks = 8 (old code used raw len 0 ⇒ 0).
+        let dir = FuseUtils::status_to_attr(&conf, &file_status(FileType::Dir, 0, 0o755)).unwrap();
+        assert_eq!(dir.size, 4096);
+        assert_eq!(dir.blocks, 8);
+
+        // Regular file: blocks = ceil(size / 512).
+        let f =
+            FuseUtils::status_to_attr(&conf, &file_status(FileType::File, 1000, 0o644)).unwrap();
+        assert_eq!(f.blocks, 2);
+        let empty =
+            FuseUtils::status_to_attr(&conf, &file_status(FileType::File, 0, 0o644)).unwrap();
+        assert_eq!(empty.blocks, 0);
+    }
+
+    #[test]
+    fn mode_zero_uses_default_mode() {
+        let conf = FuseConf::default(); // umask = 0o22
+
+        // Regular file with mode == 0 falls back to 0o666 & !0o22 = 0o644.
+        let f = FuseUtils::status_to_attr(&conf, &file_status(FileType::File, 0, 0)).unwrap();
+        assert_eq!(f.mode & 0o7777, 0o644);
+        assert_eq!(f.mode & libc::S_IFMT as u32, libc::S_IFREG as u32);
+
+        // Directory with mode == 0 falls back to 0o777 & !0o22 = 0o755.
+        let d = FuseUtils::status_to_attr(&conf, &file_status(FileType::Dir, 0, 0)).unwrap();
+        assert_eq!(d.mode & 0o7777, 0o755);
+        assert_eq!(d.mode & libc::S_IFMT as u32, libc::S_IFDIR as u32);
+
+        // Regression: a synthetic dot dir (id == FUSE_UNKNOWN_INO, mode == 0) still
+        // reports 0o755, matching the old dedicated dot branch.
+        let mut dot = file_status(FileType::Dir, 0, 0);
+        dot.id = FUSE_UNKNOWN_INO as i64;
+        dot.name = ".".to_string();
+        let dot_attr = FuseUtils::status_to_attr(&conf, &dot).unwrap();
+        assert_eq!(dot_attr.mode & 0o7777, 0o755);
+    }
+
+    #[test]
+    fn get_mode_masks_permission_bits() {
+        // A stray file-type bit in `perm` must be stripped before the correct
+        // type bit is applied.
+        let mode = FuseUtils::get_mode(libc::S_IFDIR as u32 | 0o755, FileType::File);
+        assert_eq!(mode & 0o7777, 0o755);
+        assert_eq!(mode & libc::S_IFMT as u32, libc::S_IFREG as u32);
+    }
+
+    #[test]
+    fn default_file_mode_is_not_executable() {
+        // The regular-file default must not carry execute bits.
+        assert_eq!(FUSE_DEFAULT_FILE_MODE & 0o111, 0);
+
+        // A regular file with mode == 0 is reported non-executable.
+        let conf = FuseConf::default();
+        let f = FuseUtils::status_to_attr(&conf, &file_status(FileType::File, 0, 0)).unwrap();
+        assert_eq!(f.mode & 0o111, 0);
+    }
+
+    #[test]
+    fn status_to_attr_nlink_defaults_to_one() {
+        let conf = FuseConf::default();
+
+        // nlink == 0 (e.g. UFS/object store that does not set it) becomes 1.
+        let mut zero = file_status(FileType::File, 0, 0o644);
+        zero.nlink = 0;
+        assert_eq!(FuseUtils::status_to_attr(&conf, &zero).unwrap().nlink, 1);
+
+        // A real nlink is preserved.
+        let mut three = file_status(FileType::File, 0, 0o644);
+        three.nlink = 3;
+        assert_eq!(FuseUtils::status_to_attr(&conf, &three).unwrap().nlink, 3);
     }
 }

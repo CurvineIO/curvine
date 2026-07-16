@@ -133,8 +133,12 @@ pub const FUSE_S_ISUID: u32 = 0x800;
 
 pub const FUSE_S_ISGID: u32 = 0x400;
 
-// Default file permission code
-pub const FUSE_DEFAULT_MODE: u32 = 0o777;
+// Per-type default permission bits, applied ONLY when a status carries no mode
+// (mode == 0, i.e. a synthetic / default-constructed status). Real backends
+// (master ACL / UFS) always set a mode, so these are fallbacks, not overrides.
+pub const FUSE_DEFAULT_FILE_MODE: u32 = 0o666; // regular files: rw, no exec
+pub const FUSE_DEFAULT_DIR_MODE: u32 = 0o777; // dirs: rwx (exec needed to traverse)
+pub const FUSE_DEFAULT_SYMLINK_MODE: u32 = 0o777; // symlink perm bits are ignored by the kernel
 
 /// Sentinel "invalid inode number": used for synthetic `.`/`..` dirents and
 /// reserved by `DirTree::next_id` so it is never handed out as a real inode.
