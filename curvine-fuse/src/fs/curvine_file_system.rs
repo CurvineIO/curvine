@@ -370,6 +370,20 @@ impl CurvineFileSystem {
             has_permission
         }
     }
+
+    /// Combine the daemon's baseline init flags with the flags the kernel
+    /// offered, then strip any capability Curvine must not advertise.
+    ///
+    /// Currently that means clearing `FUSE_ATOMIC_O_TRUNC`: `open` does not
+    /// perform the truncate itself, so if we advertised atomic O_TRUNC the
+    /// kernel would skip the follow-up `SETATTR(size=0)` and O_TRUNC would be
+    /// silently lost whenever a writer for the inode already exists (the shared
+    /// writer ignores the second open's flags). Clearing it forces the kernel
+    /// back to the open + SETATTR path, which `set_attr` handles via
+    /// `fs_resize`. See issue #1122.
+    fn negotiate_out_flags(base: u32, kernel_flags: u32) -> u32 {
+        (base | kernel_flags) & !FUSE_ATOMIC_O_TRUNC
+    }
 }
 
 impl fs::FileSystem for CurvineFileSystem {
@@ -402,7 +416,7 @@ impl fs::FileSystem for CurvineFileSystem {
             0
         };
 
-        out_flags |= op.arg.flags;
+        out_flags = Self::negotiate_out_flags(out_flags, op.arg.flags);
         if self.conf.write_back_cache {
             out_flags |= FUSE_WRITEBACK_CACHE;
         } else {
@@ -1259,5 +1273,55 @@ mod tests {
              CurvineFileSystem::new so the legacy gauges' event-driven updates \
              (FuseMetrics::with) land on an initialized singleton"
         );
+    }
+
+    use super::CurvineFileSystem;
+    use crate::FUSE_ATOMIC_O_TRUNC;
+
+    // #1122: the daemon must never advertise FUSE_ATOMIC_O_TRUNC, because `open`
+    // does not truncate. If the kernel offers it, negotiate_out_flags must strip
+    // it so the kernel falls back to the open + SETATTR(size=0) path.
+    #[test]
+    fn negotiate_out_flags_strips_atomic_o_trunc_offered_by_kernel() {
+        // Kernel offers ATOMIC_O_TRUNC plus some other capability bit.
+        let other = 1u32 << 15; // FUSE_ASYNC_DIO, arbitrary unrelated bit
+        let kernel_flags = FUSE_ATOMIC_O_TRUNC | other;
+        let base = 1u32 << 5; // FUSE_BIG_WRITES, arbitrary baseline bit
+
+        let out = CurvineFileSystem::negotiate_out_flags(base, kernel_flags);
+
+        assert_eq!(
+            out & FUSE_ATOMIC_O_TRUNC,
+            0,
+            "FUSE_ATOMIC_O_TRUNC must be cleared even when the kernel offers it"
+        );
+        // Unrelated kernel-offered and baseline bits must be preserved.
+        assert_eq!(out & other, other, "unrelated kernel bit must survive");
+        assert_eq!(out & base, base, "baseline bit must survive");
+    }
+
+    // Even if the baseline set somehow contained the bit, it must not leak out.
+    #[test]
+    fn negotiate_out_flags_strips_atomic_o_trunc_from_base() {
+        let base = FUSE_ATOMIC_O_TRUNC | (1u32 << 4);
+        let out = CurvineFileSystem::negotiate_out_flags(base, 0);
+        assert_eq!(out & FUSE_ATOMIC_O_TRUNC, 0);
+        assert_eq!(out & (1u32 << 4), 1u32 << 4);
+    }
+
+    // When the kernel does not offer the bit, output is a clean union with
+    // nothing spuriously added.
+    #[test]
+    fn negotiate_out_flags_is_union_when_bit_absent() {
+        let base = 1u32 << 5;
+        let kernel_flags = 1u32 << 14;
+        let out = CurvineFileSystem::negotiate_out_flags(base, kernel_flags);
+        assert_eq!(out, base | kernel_flags);
+    }
+
+    #[test]
+    fn atomic_o_trunc_bit_value_matches_uapi() {
+        // uapi fuse.h: FUSE_ATOMIC_O_TRUNC = (1 << 3)
+        assert_eq!(FUSE_ATOMIC_O_TRUNC, 1 << 3);
     }
 }
