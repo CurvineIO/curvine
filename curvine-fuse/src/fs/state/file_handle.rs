@@ -53,9 +53,9 @@ impl FileHandle {
         }
     }
 
-    pub fn status(&self) -> &FileStatus {
+    pub fn status(&self) -> FileStatus {
         match self {
-            FileHandle::Backend(h) => &h.status,
+            FileHandle::Backend(h) => h.status(),
         }
     }
 
