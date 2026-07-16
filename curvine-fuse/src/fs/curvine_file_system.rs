@@ -640,6 +640,10 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let mut attr = FuseUtils::status_to_attr(&self.conf, &status)?;
         attr.ino = op.header.nodeid;
+        // Metadata-only setattr (for example fchmod after write) may race ahead of
+        // the writer's final metadata commit. Never let its stale size shrink the
+        // kernel inode below the bytes already accepted by the active writer.
+        self.state.update_writer_len(&mut attr).await;
         let attr = fuse_attr_out {
             attr_valid: self.conf.attr_ttl.as_secs(),
             attr_valid_nsec: self.conf.attr_ttl.subsec_nanos(),

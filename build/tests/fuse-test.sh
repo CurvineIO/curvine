@@ -1338,6 +1338,9 @@ test_mmap() {
     run_python_script_test \
         "Testing MAP_SHARED mmap write visible to pread after cache-miss open" \
         "mmap_test.py" --dir "$TEST_DIR"
+    run_python_script_test \
+        "Testing mmap read after write and fchmod does not raise SIGBUS" \
+        "curvine_ltp_mmap_sigbus_repro.py" --dir "$TEST_DIR"
 }
 
 # Test 18: Pwrite visibility test
