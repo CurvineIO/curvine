@@ -741,7 +741,7 @@ mod tests {
         let (len, iovec) = response.as_iovec().unwrap();
         assert_eq!(len, FUSE_OUT_HEADER_LEN + payload.len());
         assert_eq!(iovec.len(), 2);
-        assert_eq!(iovec[1].as_ref(), payload);
+        assert_eq!(&*iovec[1], payload);
     }
 
     // The finish paths (`finish_no_reply` / `finish_early` / enqueue-failure)
