@@ -61,6 +61,14 @@ impl ResponseData {
 
         // write data
         for data in &self.data {
+            // FUSE iovec responses can only contain memory-backed data. An
+            // IOSlice refers to an fd-backed region and cannot be represented
+            // as an std::io::IoSlice without a separate transfer path.
+            if matches!(data, DataSlice::IOSlice(_)) {
+                return orpc::err_box!(
+                    "DataSlice::IOSlice is not supported in FUSE iovec responses"
+                );
+            }
             iovec.push(IoSlice::new(data.as_slice()));
         }
         Ok((self.header.len as usize, iovec))
@@ -699,6 +707,42 @@ mod tests {
     };
     use orpc::common::{Gauge, Metrics as m};
     use orpc::sync::channel::{AsyncChannel, AsyncReceiver};
+
+    #[test]
+    fn as_iovec_rejects_io_slice_without_panicking() {
+        let response = ResponseData::new(
+            fuse_out_header {
+                len: (FUSE_OUT_HEADER_LEN + 1) as u32,
+                error: 0,
+                unique: 1,
+            },
+            vec![DataSlice::io_slice(-1, None, 1)],
+        );
+
+        let error = match response.as_iovec() {
+            Ok(_) => panic!("IOSlice response must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("DataSlice::IOSlice"));
+    }
+
+    #[test]
+    fn as_iovec_accepts_memory_backed_data() {
+        let payload = b"reply";
+        let response = ResponseData::new(
+            fuse_out_header {
+                len: (FUSE_OUT_HEADER_LEN + payload.len()) as u32,
+                error: 0,
+                unique: 1,
+            },
+            vec![DataSlice::buffer(BytesMut::from(&payload[..]))],
+        );
+
+        let (len, iovec) = response.as_iovec().unwrap();
+        assert_eq!(len, FUSE_OUT_HEADER_LEN + payload.len());
+        assert_eq!(iovec.len(), 2);
+        assert_eq!(&*iovec[1], payload);
+    }
 
     // The finish paths (`finish_no_reply` / `finish_early` / enqueue-failure)
     // now read `FuseMetrics::get()`, which panics if the process-global registry
