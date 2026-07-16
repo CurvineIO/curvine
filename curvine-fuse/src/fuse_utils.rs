@@ -35,13 +35,23 @@ use std::slice;
 pub struct FuseUtils;
 
 impl FuseUtils {
-    pub fn struct_as_bytes<T>(dst: &T) -> &[u8] {
+    /// Reinterpret a value as its raw bytes for writing to the FUSE device.
+    ///
+    /// SAFETY / usage contract: `T` MUST be a FUSE C-ABI (`#[repr(C)]`) struct.
+    /// `slice::from_raw_parts` reads all `size_of::<T>()` bytes verbatim,
+    /// *including padding* — so the caller must ensure `T` has no uninitialized
+    /// padding (all current FUSE ABI structs zero their `padding` fields, e.g.
+    /// `fuse_attr` in `status_to_attr`). Passing a non-`repr(C)` type, or one
+    /// with pointers / uninit fields, risks ABI mismatch and info leakage.
+    /// Kept crate-private so only FUSE ABI structs reach it.
+    pub(crate) fn struct_as_bytes<T>(dst: &T) -> &[u8] {
         let len = size_of::<T>();
         let ptr = dst as *const T as *const u8;
         unsafe { slice::from_raw_parts(ptr, len) }
     }
 
-    pub fn struct_as_buf<T>(dst: &T) -> BytesMut {
+    /// Owned-buffer variant of [`struct_as_bytes`]; same C-ABI contract applies.
+    pub(crate) fn struct_as_buf<T>(dst: &T) -> BytesMut {
         let bytes = Self::struct_as_bytes(dst);
         BytesMut::from(bytes)
     }
@@ -115,15 +125,6 @@ impl FuseUtils {
         file_type == libc::S_IFDIR as u32
     }
 
-    pub fn aligned_sub_buf(buf: &mut [u8], alignment: usize) -> &mut [u8] {
-        let off = alignment - (buf.as_ptr() as usize) % alignment;
-        if off == alignment {
-            buf
-        } else {
-            &mut buf[off..]
-        }
-    }
-
     // In fuse 2, this default size is 132kb (128 + 4)
     pub fn get_fuse_buf_size() -> usize {
         let page_size = sys::get_pagesize().unwrap_or(FUSE_DEFAULT_PAGE_SIZE);
@@ -151,14 +152,31 @@ impl FuseUtils {
     pub fn fuse_clone_fd(source_fd: RawIO) -> IOResult<RawIO> {
         let path = FFIUtils::new_cs_string(FUSE_DEVICE_NAME);
         let clone_fd = sys::open(&path, libc::O_RDWR)?;
+        Self::clone_fd_ioctl(clone_fd, source_fd)
+    }
 
+    // Issue the FUSE_DEV_IOC_CLONE ioctl on an already-opened `clone_fd`.
+    // On failure, close `clone_fd` before propagating so it does not leak:
+    // the caller (fuse_mnt.rs) falls back to dup(self.fd) and never sees this
+    // fd again, so nothing else would ever close it.
+    //
+    // NOTE: close(2) releases the fd even when it returns an error (EINTR/EIO),
+    // so we log-and-ignore the close error rather than retry — retrying would
+    // risk a double-close of a since-reused fd. The original ioctl error is
+    // returned unchanged because it carries the more useful diagnostic.
+    pub(crate) fn clone_fd_ioctl(clone_fd: RawIO, source_fd: RawIO) -> IOResult<RawIO> {
         let request = Self::fuse_dev_ioc_clone();
         let mut master_fd = source_fd;
-        sys::ioctl(
+        if let Err(e) = sys::ioctl(
             clone_fd,
             request,
             &mut master_fd as *mut _ as *mut libc::c_void,
-        )?;
+        ) {
+            if let Err(ce) = sys::close(clone_fd) {
+                log::warn!("fuse_clone_fd: close leaked fd {} failed: {}", clone_fd, ce);
+            }
+            return Err(e);
+        }
 
         Ok(clone_fd)
     }
@@ -425,9 +443,8 @@ impl FuseUtils {
 
 #[cfg(test)]
 mod tests {
-    use super::FuseUtils;
+    use super::*;
     use crate::raw::fuse_abi::fuse_setattr_in;
-    use crate::{FATTR_ATIME, FATTR_MTIME, FUSE_CLONE_FD_MIN_VERSION};
 
     #[test]
     fn setattr_preserves_millisecond_from_nsec() {
@@ -485,5 +502,39 @@ mod tests {
         let version = FuseUtils::parse_kernel_version("unexpected").unwrap_or((0, 0));
 
         assert!(version < FUSE_CLONE_FD_MIN_VERSION);
+    }
+
+    // Regression for the clone-fd leak: when the FUSE_DEV_IOC_CLONE ioctl fails,
+    // `clone_fd_ioctl` must close the fd it was handed before returning the error,
+    // otherwise it leaks (the caller falls back to dup and never sees this fd).
+    //
+    // We drive this without touching /dev/fuse: a plain pipe fd does not accept
+    // the FUSE clone ioctl, so `sys::ioctl` fails deterministically and the
+    // close path is exercised. `fcntl(F_GETFD)` on the now-closed fd returns
+    // EBADF, confirming the close happened. Linux-only: pipe2/ioctl/fcntl_get
+    // are not available on other targets.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fuse_clone_fd_closes_fd_on_ioctl_error() {
+        // Non-zero pipe size: pipe2 sets F_SETPIPE_SZ, which rejects 0 on some
+        // kernels; a page size is rounded up to the kernel minimum and is safe.
+        let [r, w] = sys::pipe2(4096).expect("pipe2");
+
+        let res = FuseUtils::clone_fd_ioctl(r, w);
+        // The bogus ioctl on a pipe fd must fail (ENOTTY/EINVAL), and the error
+        // is propagated unchanged.
+        assert!(res.is_err(), "ioctl on a pipe fd should fail");
+
+        // `r` should have been closed by the error path: F_GETFD now returns EBADF.
+        // (Primary guarantee is the propagated error above; this is a best-effort
+        // check — in theory another thread could reuse the fd number, but not in
+        // this single-threaded test.)
+        assert!(
+            sys::fcntl_get(r).is_err(),
+            "clone_fd should have been closed on ioctl error"
+        );
+
+        // `r` is already closed inside clone_fd_ioctl; only close the write end.
+        let _ = sys::close(w);
     }
 }
