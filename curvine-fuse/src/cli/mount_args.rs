@@ -178,6 +178,12 @@ impl FuseRuntimeArgs {
         conf.client.init()?;
         Ok(conf)
     }
+
+    /// Path to the configuration file that `get_conf` loads from. Used by
+    /// `validate-config` to re-read the raw TOML for unknown-key detection.
+    pub fn conf_path(&self) -> &str {
+        &self.mount.conf
+    }
 }
 
 impl FuseMountArgs {
