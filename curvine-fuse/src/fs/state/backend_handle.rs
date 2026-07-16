@@ -17,7 +17,7 @@ use crate::fs::state::NodeState;
 use crate::fs::{FuseReader, FuseWriter};
 use crate::raw::fuse_abi::fuse_write_out;
 use crate::session::FuseResponse;
-use crate::{err_fuse, FuseError, FuseResult};
+use crate::{err_fuse, FuseError, FuseResult, FuseUtils};
 use curvine_common::fs::{Path, StateReader, StateWriter};
 use curvine_common::state::{CreateFileOptsBuilder, FileStatus, LockFlags, OpenFlags};
 use orpc::err_box;
@@ -64,12 +64,52 @@ impl BackendHandle {
         }
     }
 
+    /// Defensive upper bound for a single read/write request size. FUSE `size`
+    /// is a `u32` from the kernel and is normally already capped by the
+    /// `max_write`/`max_readahead` negotiated at init, but userspace still
+    /// validates it so an abnormal request cannot drive an oversized backend IO.
+    /// Same source as the `max_write` computed in `init`.
+    fn max_io_size() -> u64 {
+        FuseUtils::get_fuse_buf_size() as u64
+    }
+
+    /// Validate that a FUSE request offset (`u64`) fits in the signed `i64` the
+    /// backend uses; an offset `> i64::MAX` would wrap to a negative position
+    /// when cast `as i64`. Returns `EINVAL` instead of letting it reach the
+    /// backend.
+    fn check_offset(offset: u64) -> FuseResult<()> {
+        if offset > i64::MAX as u64 {
+            return err_fuse!(libc::EINVAL, "offset {} exceeds i64::MAX", offset);
+        }
+        Ok(())
+    }
+
+    /// Validate that a write length fits in the `u32` reported back to the kernel
+    /// (`fuse_write_out.size`); a larger length would truncate and silently
+    /// under-report the written byte count, so reject it with `EFBIG`.
+    fn check_write_len(len: usize) -> FuseResult<()> {
+        if len as u64 > u32::MAX as u64 {
+            return err_fuse!(libc::EFBIG, "write len {} exceeds u32::MAX", len);
+        }
+        Ok(())
+    }
+
     pub async fn read(
         &self,
         state: &NodeState,
         op: Read<'_>,
         reply: FuseResponse,
     ) -> FuseResult<()> {
+        Self::check_offset(op.arg.offset)?;
+        if op.arg.size as u64 > Self::max_io_size() {
+            return err_fuse!(
+                libc::EINVAL,
+                "read size {} exceeds max {}",
+                op.arg.size,
+                Self::max_io_size()
+            );
+        }
+
         let reader = match &self.reader {
             Some(v) => v,
             None => return err_fuse!(libc::EIO),
@@ -102,6 +142,11 @@ impl BackendHandle {
             reply.send_rep(res).await?;
             return Ok(());
         }
+
+        Self::check_offset(op.arg.offset)?;
+        // The write reply reports the written length as `u32` (`fuse_write_out.size`);
+        // reject anything that would truncate instead of silently under-reporting.
+        Self::check_write_len(op.data.len())?;
 
         if let Some(writer) = &self.writer {
             writer
@@ -216,9 +261,55 @@ impl BackendHandle {
             reader,
             writer,
             status,
+
             fh_locks: std::sync::Mutex::new(locks),
             read_ver: AtomicCounter::new(0),
         };
         Ok(handle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BackendHandle;
+
+    // An offset within i64 range passes; an offset > i64::MAX (which would wrap
+    // negative when cast `as i64`) is rejected with EINVAL before it can reach
+    // the backend.
+    #[test]
+    fn offset_over_i64_max_returns_einval() {
+        assert!(BackendHandle::check_offset(0).is_ok());
+        assert!(BackendHandle::check_offset(i64::MAX as u64).is_ok());
+
+        let err = BackendHandle::check_offset(i64::MAX as u64 + 1)
+            .expect_err("offset > i64::MAX must be rejected");
+        assert_eq!(err.errno(), libc::EINVAL);
+
+        let err =
+            BackendHandle::check_offset(u64::MAX).expect_err("u64::MAX offset must be rejected");
+        assert_eq!(err.errno(), libc::EINVAL);
+    }
+
+    // The defensive read/write size bound is the FUSE buffer size, matching the
+    // `max_write` computed in `init`.
+    #[test]
+    fn max_io_size_matches_fuse_buf_size() {
+        assert_eq!(
+            BackendHandle::max_io_size(),
+            crate::FuseUtils::get_fuse_buf_size() as u64
+        );
+    }
+
+    // A write length that fits in the `u32` reply size passes; one that would
+    // truncate (`> u32::MAX`) is rejected with EFBIG.
+    #[test]
+    fn write_len_over_u32_returns_efbig() {
+        assert!(BackendHandle::check_write_len(0).is_ok());
+        assert!(BackendHandle::check_write_len(u32::MAX as usize).is_ok());
+
+        // usize is 64-bit on the supported targets, so u32::MAX + 1 is representable.
+        let err = BackendHandle::check_write_len(u32::MAX as usize + 1)
+            .expect_err("write len > u32::MAX must be rejected");
+        assert_eq!(err.errno(), libc::EFBIG);
     }
 }
