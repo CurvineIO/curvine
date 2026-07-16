@@ -441,6 +441,9 @@ impl fs::FileSystem for CurvineFileSystem {
     // Query inode.
     async fn lookup(&self, op: Lookup<'_>) -> FuseResult<fuse_entry_out> {
         let name = try_option!(op.name.to_str());
+        if name.len() > FUSE_MAX_NAME_LENGTH {
+            return err_fuse!(libc::ENAMETOOLONG);
+        }
 
         self.check_permissions(op.header, libc::X_OK as u32).await?;
 

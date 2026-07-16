@@ -64,6 +64,7 @@ This script tests basic filesystem operations including:
   - Active-writer path truncate regression (PR #962)
   - Read-only open with O_CREAT creates a missing file
   - Mode 0000 is preserved by chmod, fchmod, and umask-filtered create
+  - Overlong lookup names return ENAMETOOLONG
   - Files created in setgid directories inherit the parent group
   - Symlink owner and group metadata
 
@@ -1391,14 +1392,21 @@ test_mode_zero_permissions() {
         "mode_zero_permissions_repro.py" --dir "$TEST_DIR"
 }
 
-# Test 24: files created in setgid directories inherit the parent group
+# Test 24: lookup of an overlong name returns ENAMETOOLONG
+test_lookup_enametoolong() {
+    CURRENT_TEST_GROUP="Test 24: Lookup ENAMETOOLONG"
+    print_header "$CURRENT_TEST_GROUP"
+    run_python_script_test \
+        "Testing lookup on overlong names returns ENAMETOOLONG" \
+        "lookup_enametoolong_repro.py" --dir "$TEST_DIR"
+# Test 25: files created in setgid directories inherit the parent group
 test_setgid_group_inherit() {
     CURRENT_TEST_GROUP="Test 24: Setgid Group Inheritance"
     print_header "$CURRENT_TEST_GROUP"
     run_python_script_test \
         "Testing file group inheritance in setgid directories" \
         "setgid_group_inherit_repro.py" --dir "$TEST_DIR"
-# Test 25: symlink owner/group metadata
+# Test 26: symlink owner/group metadata
 test_symlink_owner() {
     CURRENT_TEST_GROUP="Test 24: Symlink Owner"
     print_header "$CURRENT_TEST_GROUP"
@@ -1515,6 +1523,7 @@ main() {
     test_pr962_active_writer_truncate
     test_open_creat_rdonly
     test_mode_zero_permissions
+    test_lookup_enametoolong
     test_setgid_group_inherit
     test_symlink_owner
 
