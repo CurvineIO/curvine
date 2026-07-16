@@ -937,7 +937,7 @@ impl NodeState {
         } else {
             self.new_handle(None, &path, flags, opts).await?
         };
-        self.lookup_status(ino, name, handle.status())?;
+        self.lookup_status(ino, name, &handle.status())?;
         Ok(handle)
     }
 

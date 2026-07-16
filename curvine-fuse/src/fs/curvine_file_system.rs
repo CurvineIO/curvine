@@ -791,7 +791,7 @@ impl fs::FileSystem for CurvineFileSystem {
             // keep_cache may return true even after a remote modification, causing stale
             // reads.  This is intentional — metadata caching trades strict consistency
             // for performance, and callers that enable it accept this trade-off.
-            let keep_cache = self.state.keep_cache(ino, handle.status());
+            let keep_cache = self.state.keep_cache(ino, &handle.status());
             if keep_cache {
                 open_flags |= FUSE_FOPEN_KEEP_CACHE;
             } else if self.conf.open_direct_on_stale {
@@ -825,7 +825,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let opts = FuseUtils::create_opts(&op, &self.fs);
         let handle = self.state.fs_create(ino, name, op.arg.flags, opts).await?;
-        let attr = FuseUtils::status_to_attr(&self.conf, handle.status())?;
+        let attr = FuseUtils::status_to_attr(&self.conf, &handle.status())?;
 
         if attr.ino != handle.ino() {
             return err_fuse!(

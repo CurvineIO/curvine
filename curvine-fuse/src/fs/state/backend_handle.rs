@@ -38,7 +38,9 @@ pub struct BackendHandle {
 
     pub reader: Option<RawPtr<FuseReader>>,
     pub writer: Option<Arc<FuseWriter>>, // Writer uses Arc for global sharing
-    pub status: FileStatus,
+    /// Open-time file status snapshot. Guarded by a lock because the read path
+    /// refreshes it in place after a dirty-read reopen (`read()` takes `&self`).
+    status: std::sync::RwLock<FileStatus>,
 
     fh_locks: std::sync::Mutex<HandleLock>,
 
@@ -58,7 +60,7 @@ impl BackendHandle {
             fh,
             reader,
             writer,
-            status,
+            status: std::sync::RwLock::new(status),
             fh_locks: std::sync::Mutex::new(HandleLock::default()),
             read_ver: AtomicCounter::new(0),
         }
@@ -122,6 +124,11 @@ impl BackendHandle {
 
                 let path = reader.path().clone();
                 let new_reader = state.new_reader(&path).await?;
+                // Refresh the handle's status snapshot from the freshly reopened
+                // reader before installing it, so `status()` reflects the current
+                // file (length/mtime) after a dirty-read reopen rather than the
+                // stale open-time snapshot.
+                self.refresh_status(new_reader.status().clone());
                 reader.replace(new_reader);
 
                 self.read_ver.set(writer_ver);
@@ -175,8 +182,18 @@ impl BackendHandle {
         Ok(())
     }
 
-    pub fn status(&self) -> &FileStatus {
-        &self.status
+    /// A clone of the current file status. Returns an owned value (not a
+    /// reference) because the status is lock-guarded: the read path can refresh
+    /// it in place after a dirty-read reopen.
+    pub fn status(&self) -> FileStatus {
+        self.status.read().unwrap().clone()
+    }
+
+    /// Replace the open-time status snapshot with a fresh one. Called from the
+    /// read path after a dirty-read reopen so `status()` no longer reports the
+    /// stale open-time length/mtime.
+    fn refresh_status(&self, status: FileStatus) {
+        *self.status.write().unwrap() = status;
     }
 
     // Add lock, only save the owner_id of the first lock
@@ -210,7 +227,7 @@ impl BackendHandle {
 
         writer.write_len(self.ino)?;
         writer.write_len(self.fh)?;
-        writer.write_struct(&self.status)?;
+        writer.write_struct(&*self.status.read().unwrap())?;
 
         writer.write_struct(&self.writer.is_some())?;
         writer.write_struct(&self.reader.is_some())?;
@@ -260,7 +277,7 @@ impl BackendHandle {
             fh,
             reader,
             writer,
-            status,
+            status: std::sync::RwLock::new(status),
 
             fh_locks: std::sync::Mutex::new(locks),
             read_ver: AtomicCounter::new(0),
@@ -311,5 +328,35 @@ mod tests {
         let err = BackendHandle::check_write_len(u32::MAX as usize + 1)
             .expect_err("write len > u32::MAX must be rejected");
         assert_eq!(err.errno(), libc::EFBIG);
+    }
+
+    // After a dirty-read reopen the read path calls `refresh_status` (through a
+    // shared `&self`); `status()` must then reflect the reopened file's
+    // length/mtime, not the stale open-time snapshot.
+    #[test]
+    fn refresh_status_updates_snapshot_through_shared_ref() {
+        use curvine_common::state::FileStatus;
+
+        let mut open_status = FileStatus::with_name(1, "f".to_string(), false);
+        open_status.len = 100;
+        open_status.mtime = 10;
+        let handle = BackendHandle::new(1, 10, None, None, open_status);
+        assert_eq!(handle.status().len, 100);
+        assert_eq!(handle.status().mtime, 10);
+
+        // Simulate the post-reopen refresh: a writer extended the file to 4096.
+        let mut new_status = FileStatus::with_name(1, "f".to_string(), false);
+        new_status.len = 4096;
+        new_status.mtime = 20;
+        // `handle` is an immutable binding — refresh_status takes `&self` and
+        // mutates through the lock, exactly as the read path does.
+        handle.refresh_status(new_status);
+
+        assert_eq!(
+            handle.status().len,
+            4096,
+            "status().len must reflect the reopened file, not the open-time 100"
+        );
+        assert_eq!(handle.status().mtime, 20);
     }
 }
