@@ -38,11 +38,16 @@ use orpc::common::LocalTime;
 use orpc::common::Utils;
 use orpc::handler::MessageHandler;
 use orpc::message::Builder;
+#[cfg(feature = "fault-injection")]
+use orpc::message::ResponseStatus;
 use orpc::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
 use orpc::CommonResult;
 use raft::eraftpb::Entry;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+
+#[cfg(feature = "fault-injection")]
+use curvine_fault::{FaultRuleBuilder, FaultRuntime};
 
 // Master metrics gauges are process-wide; master_fs_test cases must not run in parallel or
 // inode_file_num / inode_dir_num race with other tests' format/init.
@@ -150,15 +155,20 @@ fn file_counts(fs: &MasterFilesystem) -> (i64, i64) {
 }
 
 fn new_handler() -> MasterHandler {
+    new_handler_for_test("retry")
+}
+
+fn new_handler_for_test(test_name: &str) -> MasterHandler {
     Master::init_test_metrics();
 
     let test_id = Utils::rand_str(8);
     let mut conf = ClusterConf::format();
     conf.journal.enable = false;
 
-    conf.master.meta_dir = Utils::test_sub_dir(format!("master-fs-test/meta-retry-{test_id}"));
+    conf.master.meta_dir =
+        Utils::test_sub_dir(format!("master-fs-test/meta-{test_name}-{test_id}"));
     conf.journal.journal_dir =
-        Utils::test_sub_dir(format!("master-fs-test/journal-retry-{test_id}"));
+        Utils::test_sub_dir(format!("master-fs-test/journal-{test_name}-{test_id}"));
 
     let journal_system = JournalSystem::from_conf(&conf).unwrap();
     let fs = MasterFilesystem::with_js(&conf, &journal_system);
@@ -196,6 +206,52 @@ fn new_handler() -> MasterHandler {
         replication_manager,
         Master::get_metrics().expect("test master metrics should initialize"),
     )
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn test_master_sync_and_async_rpc_points_follow_dispatch_paths() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let faults = FaultRuntime::process();
+    faults.clear()?;
+    for (id, point, code) in [
+        (
+            "sync-dispatch",
+            "master.rpc.before_sync_dispatch",
+            RpcCode::Mkdir,
+        ),
+        (
+            "async-dispatch",
+            "master.rpc.before_async_dispatch",
+            RpcCode::SubmitJob,
+        ),
+    ] {
+        let rule = FaultRuleBuilder::named(point)
+            .matches("rpc_code", code as i32)?
+            .times(1)?
+            .return_error(id)?;
+        faults.configure(id, rule)?;
+    }
+
+    let mut handler = new_handler_for_test("fault-dispatch");
+    let sync_request = Builder::new_rpc(RpcCode::Mkdir).build();
+    let sync_response = handler.handle(&sync_request)?;
+
+    let async_request = Builder::new_rpc(RpcCode::SubmitJob).build();
+    let rt = AsyncRuntime::single();
+    let async_response = rt.block_on(handler.async_handle(async_request))?;
+    for response in [sync_response, async_response] {
+        assert_eq!(response.response_status(), ResponseStatus::Error);
+        assert!(matches!(
+            response.check_error_ext::<FsError>(),
+            Err(FsError::Common(_))
+        ));
+    }
+
+    let status = faults.status();
+    assert!(status.rules.iter().all(|rule| rule.executions == 1));
+    faults.clear()?;
+    Ok(())
 }
 
 #[test]

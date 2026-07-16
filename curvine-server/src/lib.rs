@@ -16,3 +16,9 @@ pub mod common;
 pub mod master;
 pub mod test;
 pub mod worker;
+
+#[cfg(feature = "fault-injection")]
+pub(crate) use curvine_fault::fault_point;
+
+#[cfg(not(feature = "fault-injection"))]
+pub(crate) use curvine_fault::__noop_fault_point as fault_point;

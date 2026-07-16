@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 use curvine_common::conf::ClusterConf;
 use curvine_common::state::{FileBlocks, FileStatus, WorkerInfo};
 use curvine_common::FsResult;
+use curvine_fault::FaultHttpControl;
 use curvine_web::router::RouterHandler;
 use orpc::common::LocalTime;
 use orpc::err_box;
@@ -36,15 +37,22 @@ pub struct MasterRouterHandler {
     conf: ClusterConf,
     start_time: String,
     metrics: &'static MasterMetrics,
+    fault_http: FaultHttpControl,
 }
 
 impl MasterRouterHandler {
-    pub fn new(conf: ClusterConf, fs: MasterFilesystem, metrics: &'static MasterMetrics) -> Self {
+    pub(crate) fn new(
+        conf: ClusterConf,
+        fs: MasterFilesystem,
+        metrics: &'static MasterMetrics,
+        fault_http: FaultHttpControl,
+    ) -> Self {
         Self {
             fs,
             conf,
             start_time: LocalTime::now_datetime(),
             metrics,
+            fault_http,
         }
     }
 }
@@ -247,7 +255,7 @@ impl RouterHandler for MasterRouterHandler {
     fn router(&self) -> Router {
         let instance = Arc::new(self.clone());
         let conf = self.conf.clone();
-        Router::new()
+        let router = Router::new()
             .route("/metrics", get(metrics))
             .route("/report", get(report))
             .route("/api/overview", get(overview))
@@ -259,6 +267,8 @@ impl RouterHandler for MasterRouterHandler {
             .route("/get-dcm", get(get_dcm))
             .route("/remove-dcm", get(remove_dcm))
             .route("/workers", get(workers1))
-            .layer(Extension(instance))
+            .layer(Extension(instance));
+
+        self.fault_http.mount(router)
     }
 }

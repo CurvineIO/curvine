@@ -268,6 +268,89 @@ impl FuseConf {
         Ok(())
     }
 
+    /// Validates that `state_dir` is — or can be made — a writable directory.
+    ///
+    /// The SIGUSR1 persist/restore state file lives under `state_dir`
+    /// (`FuseSession::state_file`). Runtime `init()` stays lenient and never
+    /// touches it, so a bad `state_dir` (missing, not a directory, or
+    /// non-writable) would otherwise only fail at persist/restore time —
+    /// potentially during a graceful upgrade. `validate-config` calls this to
+    /// surface the problem before mount.
+    pub fn validate_state_dir(&self) -> CommonResult<()> {
+        let path = std::path::Path::new(&self.state_dir);
+
+        if path.exists() {
+            if !path.is_dir() {
+                return err_box!(
+                    "fuse.state_dir '{}' exists but is not a directory",
+                    self.state_dir
+                );
+            }
+        } else if let Err(e) = std::fs::create_dir_all(path) {
+            return err_box!(
+                "fuse.state_dir '{}' does not exist and could not be created: {}",
+                self.state_dir,
+                e
+            );
+        }
+
+        // Probe writability by creating (then removing) a temp file. Directory
+        // permission bits alone can be misleading (e.g. read-only mounts), so a
+        // real create is the reliable check.
+        let probe = path.join(format!(".curvine_fuse_state_probe_{}", std::process::id()));
+        match std::fs::File::create(&probe) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+                Ok(())
+            }
+            Err(e) => err_box!("fuse.state_dir '{}' is not writable: {}", self.state_dir, e),
+        }
+    }
+
+    /// Canonical TOML key names for `FuseConf` fields, derived by serializing the
+    /// default so it cannot drift from the struct definition. `#[serde(skip_*)]`
+    /// runtime-only fields (the `*_ttl` durations) are excluded automatically.
+    fn known_field_names() -> Vec<String> {
+        match toml::Value::try_from(FuseConf::default()) {
+            Ok(toml::Value::Table(t)) => t.keys().cloned().collect(),
+            _ => vec![],
+        }
+    }
+
+    /// Returns keys in a raw `[fuse]` TOML table that do not match any current
+    /// `FuseConf` field. These are surfaced as warnings by `validate-config`:
+    /// they are silently dropped on load (FuseConf is `#[serde(default)]` with
+    /// no `deny_unknown_fields`), so a typo would otherwise never take effect
+    /// and never be noticed. Result is sorted for stable output.
+    ///
+    /// Note: a renamed field kept alive by `#[serde(alias)]` (e.g. the old
+    /// `mnt_per_task`) is reported here too — its canonical name is what
+    /// `FuseConf` exposes — so the value DOES still take effect via the alias.
+    /// The warning is intentionally phrased to cover both cases (typo vs.
+    /// deprecated/renamed) rather than claiming the setting was ignored.
+    pub fn unrecognized_fuse_keys(fuse_table: &toml::value::Table) -> Vec<String> {
+        let known: std::collections::HashSet<String> =
+            Self::known_field_names().into_iter().collect();
+
+        let mut unknown: Vec<String> = fuse_table
+            .keys()
+            .filter(|k| !known.contains(k.as_str()))
+            .cloned()
+            .collect();
+        unknown.sort();
+        unknown
+    }
+
+    /// Parses raw cluster TOML text and returns the unrecognized keys found
+    /// under the `[fuse]` table. Missing `[fuse]` table yields an empty list.
+    pub fn unrecognized_fuse_keys_from_toml(raw: &str) -> CommonResult<Vec<String>> {
+        let value: toml::Value = try_err!(toml::from_str(raw));
+        match value.get("fuse").and_then(|v| v.as_table()) {
+            Some(t) => Ok(Self::unrecognized_fuse_keys(t)),
+            None => Ok(vec![]),
+        }
+    }
+
     pub fn parse_fuse_opts(&self) -> Vec<CString> {
         let mut opts = vec![];
         opts.push(FFIUtils::new_cs_string("curvine-fuse"));
@@ -583,5 +666,98 @@ mnt_per_task = 7
         let conf: FuseConf =
             toml::from_str(toml).expect("legacy mnt_per_task key must deserialize via alias");
         assert_eq!(conf.tasks_per_mnt, 7);
+    }
+
+    #[test]
+    fn validate_state_dir_accepts_writable_dir() {
+        let dir = std::env::temp_dir().join(format!("cv_state_ok_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = FuseConf {
+            state_dir: dir.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        conf.validate_state_dir()
+            .expect("writable directory must pass");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_state_dir_creates_missing_dir() {
+        let dir =
+            std::env::temp_dir().join(format!("cv_state_missing_{}/nested", std::process::id()));
+        // Ensure it does not pre-exist.
+        let _ = std::fs::remove_dir_all(&dir);
+        let conf = FuseConf {
+            state_dir: dir.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        conf.validate_state_dir()
+            .expect("missing state_dir must be created");
+        assert!(dir.is_dir(), "state_dir should have been created");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_state_dir_rejects_non_directory() {
+        let file = std::env::temp_dir().join(format!("cv_state_file_{}", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        let conf = FuseConf {
+            state_dir: file.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let err = conf
+            .validate_state_dir()
+            .expect_err("a regular file must be rejected");
+        assert!(
+            err.to_string().contains("is not a directory"),
+            "unexpected error: {}",
+            err
+        );
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn unrecognized_fuse_keys_flags_typo_and_legacy() {
+        // Every key not matching a current FuseConf field is flagged so the user
+        // can investigate: the typo (direct_iox), the dropped legacy param
+        // (node_cache_size), and the renamed key still alive via #[serde(alias)]
+        // (mnt_per_task). A current field (io_threads) is NOT flagged.
+        let raw = r#"
+[fuse]
+io_threads = 16
+node_cache_size = 200000
+mnt_per_task = 7
+direct_iox = true
+"#;
+        let unknown = FuseConf::unrecognized_fuse_keys_from_toml(raw).unwrap();
+        assert_eq!(
+            unknown,
+            vec![
+                "direct_iox".to_string(),
+                "mnt_per_task".to_string(),
+                "node_cache_size".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unrecognized_fuse_keys_empty_when_all_known() {
+        let raw = r#"
+[fuse]
+io_threads = 16
+direct_io = true
+state_dir = "/tmp"
+"#;
+        let unknown = FuseConf::unrecognized_fuse_keys_from_toml(raw).unwrap();
+        assert!(unknown.is_empty(), "unexpected unknown keys: {:?}", unknown);
+    }
+
+    #[test]
+    fn unrecognized_fuse_keys_empty_without_fuse_table() {
+        let raw = r#"
+cluster_id = "test"
+"#;
+        let unknown = FuseConf::unrecognized_fuse_keys_from_toml(raw).unwrap();
+        assert!(unknown.is_empty());
     }
 }

@@ -17,6 +17,7 @@ use std::sync::Arc;
 use once_cell::sync::OnceCell;
 
 use curvine_common::conf::ClusterConf;
+use curvine_fault::FaultHttpControl;
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::error;
 use orpc::common::{LocalTime, Logger};
@@ -24,7 +25,7 @@ use orpc::handler::HandlerService;
 use orpc::io::net::ConnState;
 use orpc::runtime::{GroupExecutor, RpcRuntime, Runtime};
 use orpc::server::{RpcServer, ServerStateListener};
-use orpc::{err_box, CommonResult};
+use orpc::{err_box, CommonError, CommonResult};
 
 use crate::master::fs::{FsRetryCache, MasterActor, MasterFilesystem};
 use crate::master::journal::JournalSystem;
@@ -51,11 +52,12 @@ pub struct MasterService {
     get_block_locations_rpc_executor: Arc<GroupExecutor>,
     replication_manager: Arc<MasterReplicationManager>,
     metrics: &'static MasterMetrics,
+    fault_http: FaultHttpControl,
 }
 
 impl MasterService {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         conf: ClusterConf,
         fs: MasterFilesystem,
         retry_cache: Option<FsRetryCache>,
@@ -69,6 +71,7 @@ impl MasterService {
         get_block_locations_rpc_executor: Arc<GroupExecutor>,
         replication_manager: Arc<MasterReplicationManager>,
         metrics: &'static MasterMetrics,
+        fault_http: FaultHttpControl,
     ) -> Self {
         Self {
             conf,
@@ -84,6 +87,7 @@ impl MasterService {
             get_block_locations_rpc_executor,
             replication_manager,
             metrics,
+            fault_http,
         }
     }
 
@@ -134,7 +138,12 @@ impl WebHandlerService for MasterService {
     type Item = MasterRouterHandler;
 
     fn get_handler(&self) -> Self::Item {
-        MasterRouterHandler::new(self.conf.clone(), self.fs.clone(), self.metrics)
+        MasterRouterHandler::new(
+            self.conf.clone(),
+            self.fs.clone(),
+            self.metrics,
+            self.fault_http.clone(),
+        )
     }
 }
 
@@ -157,6 +166,8 @@ impl Master {
         }
 
         Logger::init(log);
+        let fault_http = FaultHttpControl::from_env(&conf.fault_injection)
+            .map_err(|error| CommonError::from(error.to_string()))?;
         let metrics = MASTER_METRICS.get_or_try_init(MasterMetrics::new)?;
         conf.print();
 
@@ -212,6 +223,7 @@ impl Master {
             get_block_locations_rpc_executor,
             replication_manager.clone(),
             metrics,
+            fault_http,
         );
 
         let rpc_conf = conf.master_server_conf();

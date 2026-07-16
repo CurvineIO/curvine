@@ -20,10 +20,16 @@ use once_cell::sync::Lazy;
 
 pub mod cli;
 pub mod fs;
-pub mod macros;
+// Crate-internal only: `macros` exposes no public API (its sole item, the
+// `err_fuse!` macro, is `pub(crate)`), so the module is `mod`, not `pub mod`.
+mod macros;
 pub mod raw;
 pub mod session;
 pub mod web_server;
+
+// Re-export the crate-internal `err_fuse!` macro at the crate root so existing
+// `use crate::err_fuse;` imports resolve. Not `#[macro_export]`ed — see macros.rs.
+pub(crate) use macros::err_fuse;
 
 mod fuse_error;
 pub use self::fuse_error::FuseError;
@@ -36,12 +42,7 @@ pub use self::fuse_utils::FuseUtils;
 
 pub type FuseResult<T> = Result<T, FuseError>;
 
-// fuse3 session type
-pub type RawSession = *mut core::ffi::c_void;
-
 pub const FUSE_DEVICE_NAME: &str = "/dev/fuse";
-
-pub const FUSE_NAME: &str = "curvine-fuse";
 
 pub const FUSE_IN_HEADER_LEN: usize = size_of::<fuse_in_header>();
 
@@ -49,14 +50,11 @@ pub const FUSE_SUCCESS: i32 = 0;
 
 pub const FUSE_OUT_HEADER_LEN: usize = size_of::<fuse_out_header>();
 
-pub const FILE_HANDLE_READ_BIT: u64 = 1 << 63;
+pub(crate) const FILE_HANDLE_READ_BIT: u64 = 1 << 63;
 
-pub const FILE_HANDLE_WRITE_BIT: u64 = 1 << 62;
+pub(crate) const FILE_HANDLE_WRITE_BIT: u64 = 1 << 62;
 
 pub const FUSE_ROOT_ID: u64 = 1;
-
-// curvine root node id.
-pub const FS_ROOT_ID: i64 = 1000;
 
 pub const FUSE_PATH_SEPARATOR: &str = "/";
 
@@ -66,6 +64,10 @@ pub const FUSE_KERNEL_VERSION: u32 = 7;
 
 pub const FUSE_KERNEL_MINOR_VERSION: u32 = 31;
 
+/// Upper bound on `max_pages` (the number of pages per request), matching the
+/// kernel's internal `FUSE_MAX_MAX_PAGES = 256` (`fs/fuse/fuse_i.h` on v5.4–v5.10;
+/// newer kernels moved it to the `fuse_max_pages_limit` sysctl). NOTE: this is a
+/// page-count LIMIT, distinct from the `FUSE_MAX_PAGES` init capability bit below.
 pub const FUSE_MAX_MAX_PAGES: usize = 256;
 
 pub const FUSE_BUFFER_HEADER_SIZE: usize = 0x1000; // 4096
@@ -74,6 +76,10 @@ pub const FUSE_DEFAULT_PAGE_SIZE: usize = 4096;
 
 pub const FUSE_PATH_MAX_DEPTH: usize = 4096;
 
+/// FUSE init capability bit (uapi `fuse.h`: `FUSE_MAX_PAGES = (1 << 22)`):
+/// negotiates that `fuse_init_out.max_pages` carries the per-request page count.
+/// NOTE: this is a capability BIT, distinct from the `FUSE_MAX_MAX_PAGES` page
+/// limit above — the near-identical names are both kernel-official.
 pub const FUSE_MAX_PAGES: u32 = 1 << 22;
 
 pub const FUSE_BIG_WRITES: u32 = 1 << 5;
@@ -96,7 +102,11 @@ pub const FUSE_WRITEBACK_CACHE: u32 = 1 << 16;
 
 pub const FUSE_POSIX_ACL: u32 = 1 << 20;
 
-pub const FUSE_DO_RENAME2: u32 = 1 << 11;
+/// FUSE init capability bit `1 << 11` (uapi `fuse.h`): the kernel supports
+/// ioctl on directories. NOTE: RENAME2 is an *opcode* (`FUSE_RENAME2 = 45`),
+/// not an init flag — bit 11 is `FUSE_HAS_IOCTL_DIR`. Not yet negotiated by
+/// this daemon.
+pub const FUSE_HAS_IOCTL_DIR: u32 = 1 << 11;
 
 /// Kernel automatically invalidates the page cache on open when mtime or size
 /// has changed (CAP_AUTO_INVAL_DATA, available since Linux 2.6.35).
@@ -108,9 +118,12 @@ pub const FUSE_EXPORT_SUPPORT: u32 = 1 << 4;
 
 pub const FUSE_MAX_NAME_LENGTH: usize = 255;
 
+/// Placeholder for the statfs `files`/`ffree` counts (total/free inodes) when the
+/// count is unknown — Curvine's distributed backend keeps no global inode
+/// statistics. The kernel passes this value through verbatim (it is not a
+/// kernel-recognized "unknown" sentinel), so `df -i` reports it as a large count.
+/// Distinct from `FUSE_UNKNOWN_INO` (an inode-number sentinel) despite the equal value.
 pub const FUSE_UNKNOWN_INODES: u64 = 0xffffffff;
-
-pub const FUSE_MAX_BACKGROUND: u16 = 16;
 
 pub const FUSE_CURRENT_DIR: &str = ".";
 
@@ -123,6 +136,10 @@ pub const FUSE_S_ISGID: u32 = 0x400;
 // Default file permission code
 pub const FUSE_DEFAULT_MODE: u32 = 0o777;
 
+/// Sentinel "invalid inode number": used for synthetic `.`/`..` dirents and
+/// reserved by `DirTree::next_id` so it is never handed out as a real inode.
+/// A non-zero sentinel is deliberate — `d_ino == 0` can be filtered by filldir.
+/// Distinct from `FUSE_UNKNOWN_INODES` (a statfs count) despite the equal value.
 pub const FUSE_UNKNOWN_INO: u64 = 0xffffffff;
 
 pub const FUSE_FOPEN_DIRECT_IO: u32 = 1 << 0;
@@ -133,11 +150,16 @@ pub const FUSE_FOPEN_NONSEEKABLE: u32 = 1 << 2;
 
 pub const FUSE_FOPEN_CACHE_DIR: u32 = 1 << 3;
 
-pub const FUSE_FOPEN_STREAM: u32 = 1 << 4;
+// FUSE FOPEN response flags kept for ABI completeness (kernel `fuse.h`), not yet
+// negotiated by this daemon; crate-internal until a feature wires them up.
+#[allow(dead_code)]
+pub(crate) const FUSE_FOPEN_STREAM: u32 = 1 << 4;
 
-pub const FUSE_FOPEN_NOFLUSH: u32 = 1 << 5;
+#[allow(dead_code)]
+pub(crate) const FUSE_FOPEN_NOFLUSH: u32 = 1 << 5;
 
-pub const FUSE_FOPEN_PARALLEL_DIRECT_WRITES: i32 = 1 << 6;
+#[allow(dead_code)]
+pub(crate) const FUSE_FOPEN_PARALLEL_DIRECT_WRITES: u32 = 1 << 6;
 
 // FUSE setattr valid bit flags (aligned with linux/fs/fuse definitions)
 pub const FATTR_MODE: u32 = 1 << 0;

@@ -998,4 +998,46 @@ mod test {
             "cache_ttl=0 still evicts when last_access + ttl <= now"
         );
     }
+
+    /// Root cause of CurvineIO/curvine#1121: for a freshly created file whose
+    /// backend id is not yet stable (`id <= FUSE_ROOT_ID` or `== FUSE_UNKNOWN_INO`),
+    /// `next_id` falls through to the auto-increment allocator, so calling it
+    /// TWICE for the same status yields two DIFFERENT inos. The create flow must
+    /// therefore resolve the ino exactly once and reuse it for both the writers
+    /// map key and the handle ino — otherwise `find_writer(handle.ino())` /
+    /// `release(handle.ino())` cannot locate the writer registered at create.
+    #[test]
+    fn next_id_diverges_when_backend_id_unassigned() {
+        use crate::FUSE_UNKNOWN_INO;
+        let t = DirTree::default();
+
+        // id == 0 (<= FUSE_ROOT_ID): both calls allocate, and must differ.
+        let a = t.next_id(0);
+        let b = t.next_id(0);
+        assert_ne!(
+            a, b,
+            "two next_id(0) calls must return distinct inos (this is why create must not call next_ino twice)"
+        );
+
+        // id == FUSE_UNKNOWN_INO: same divergence.
+        let c = t.next_id(FUSE_UNKNOWN_INO as i64);
+        let d = t.next_id(FUSE_UNKNOWN_INO as i64);
+        assert_ne!(
+            c, d,
+            "two next_id(FUSE_UNKNOWN_INO) calls must return distinct inos"
+        );
+
+        // Allocated inos never collide with reserved sentinels.
+        for id in [a, b, c, d] {
+            assert_ne!(id, FUSE_ROOT_ID);
+            assert_ne!(id, FUSE_UNKNOWN_INO);
+        }
+
+        // Contrast: a stable backend id (> FUSE_ROOT_ID, not yet in the tree) is
+        // returned verbatim and is stable across calls — the "common case" that
+        // masked the bug in end-to-end tests.
+        let stable = 12_345_u64;
+        assert_eq!(t.next_id(stable as i64), stable);
+        assert_eq!(t.next_id(stable as i64), stable);
+    }
 }

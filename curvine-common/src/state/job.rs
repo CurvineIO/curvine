@@ -265,11 +265,16 @@ impl JobTaskProgress {
     pub fn progress_string(&self, show_bar: bool) -> String {
         let loaded = self.loaded_size.max(0) as u64;
         let total = self.total_size.max(0) as u64;
+        let display_loaded = if total == 0 {
+            loaded
+        } else {
+            loaded.min(total)
+        };
 
         let percentage = if total == 0 {
             0.0
         } else {
-            (loaded as f64 / total as f64 * 100.0).min(100.0)
+            display_loaded as f64 / total as f64 * 100.0
         };
 
         if show_bar {
@@ -277,7 +282,7 @@ impl JobTaskProgress {
                 return format!(
                     "[{}] 0.0% ({} / {})",
                     "░".repeat(20),
-                    ByteUnit::byte_to_string(loaded),
+                    ByteUnit::byte_to_string(display_loaded),
                     ByteUnit::byte_to_string(total)
                 );
             }
@@ -291,16 +296,39 @@ impl JobTaskProgress {
                 "[{}] {:.1}% ({} / {})",
                 progress_bar,
                 percentage,
-                ByteUnit::byte_to_string(loaded),
+                ByteUnit::byte_to_string(display_loaded),
                 ByteUnit::byte_to_string(total)
             )
         } else {
             format!(
                 "{:.1}% ({} / {})",
                 percentage,
-                ByteUnit::byte_to_string(loaded),
+                ByteUnit::byte_to_string(display_loaded),
                 ByteUnit::byte_to_string(total)
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JobTaskProgress;
+    use orpc::common::ByteUnit;
+
+    #[test]
+    fn progress_string_caps_loaded_bytes_at_total() {
+        let progress = JobTaskProgress {
+            loaded_size: 66,
+            total_size: 33,
+            ..Default::default()
+        };
+        let expected_counts = format!(
+            "{} / {}",
+            ByteUnit::byte_to_string(33),
+            ByteUnit::byte_to_string(33)
+        );
+
+        assert!(progress.progress_string(false).contains(&expected_counts));
+        assert!(progress.progress_string(true).contains(&expected_counts));
     }
 }

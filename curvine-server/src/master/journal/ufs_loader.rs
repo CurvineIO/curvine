@@ -63,18 +63,18 @@ impl UfsLoader {
 
     async fn mkdir_parent(&self, path: &Path, mnt: &MountValue) -> FsResult<()> {
         if let Some(parent) = mnt.info.get_ufs_path(path)?.parent()? {
-            mnt.ufs.mkdir(&parent, true).await?;
+            mnt.ufs()?.mkdir(&parent, true).await?;
         }
         Ok(())
     }
 
     async fn mkdir_with_parent_retry(&self, path: &Path, mnt: &MountValue) -> FsResult<bool> {
         let ufs_path = mnt.info.get_ufs_path(path)?;
-        match mnt.ufs.mkdir(&ufs_path, false).await {
+        match mnt.ufs()?.mkdir(&ufs_path, false).await {
             Ok(created) => Ok(created),
             Err(FsError::FileNotFound(_)) => {
                 self.mkdir_parent(path, mnt).await?;
-                mnt.ufs.mkdir(&ufs_path, false).await
+                mnt.ufs()?.mkdir(&ufs_path, false).await
             }
             Err(e) => Err(e),
         }
@@ -152,7 +152,8 @@ impl UfsLoader {
         let src = Path::from_str(&e.src)?;
         let dst = Path::from_str(&e.dst)?;
         if let Some((src_ufs_path, mnt)) = self.get_mnt(&src)? {
-            if !mnt.ufs.exists(&src_ufs_path).await? {
+            let ufs = mnt.ufs()?;
+            if !ufs.exists(&src_ufs_path).await? {
                 warn!(
                     "rename: src file not exists: {}, exporting dst {}",
                     src_ufs_path,
@@ -166,21 +167,21 @@ impl UfsLoader {
             }
 
             let src_dst_path = mnt.info.get_ufs_path(&dst)?;
-            if mnt.ufs.fs_kind().support_rename() {
-                match mnt.ufs.rename(&src_ufs_path, &src_dst_path).await {
+            if ufs.fs_kind().support_rename() {
+                match ufs.rename(&src_ufs_path, &src_dst_path).await {
                     Ok(_) => {}
                     Err(e @ FsError::FileNotFound(_)) => {
-                        if !mnt.ufs.exists(&src_ufs_path).await? {
+                        if !ufs.exists(&src_ufs_path).await? {
                             return Err(e.into());
                         }
                         self.mkdir_parent(&dst, &mnt).await?;
-                        mnt.ufs.rename(&src_ufs_path, &src_dst_path).await?;
+                        ufs.rename(&src_ufs_path, &src_dst_path).await?;
                     }
                     Err(e) => return Err(e.into()),
                 }
                 Ok(())
             } else {
-                mnt.ufs.delete(&src_ufs_path, true).await?;
+                ufs.delete(&src_ufs_path, true).await?;
                 self.submit_export_task(&dst, &mnt).await?;
                 Ok(())
             }
@@ -192,8 +193,9 @@ impl UfsLoader {
     pub async fn delete(&self, e: &DeleteEntry) -> CommonResult<()> {
         let path = Path::from_str(&e.path)?;
         if let Some((ufs_path, mnt)) = self.get_mnt(&path)? {
-            if mnt.ufs.exists(&ufs_path).await? {
-                mnt.ufs.delete(&ufs_path, true).await?;
+            let ufs = mnt.ufs()?;
+            if ufs.exists(&ufs_path).await? {
+                ufs.delete(&ufs_path, true).await?;
             } else {
                 warn!("delete: src file not exists: {}", ufs_path);
             }

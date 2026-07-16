@@ -111,7 +111,11 @@ pub struct FuseMountArgs {
     pub master_addrs: Option<String>,
 
     // FUSE options
-    #[arg(short, long)]
+    #[arg(
+        short,
+        long,
+        help = "FUSE options; when provided, replace options from the config file"
+    )]
     options: Vec<String>,
 
     #[arg(
@@ -173,6 +177,12 @@ impl FuseRuntimeArgs {
         self.client.apply_to(&mut conf.client)?;
         conf.client.init()?;
         Ok(conf)
+    }
+
+    /// Path to the configuration file that `get_conf` loads from. Used by
+    /// `validate-config` to re-read the raw TOML for unknown-key detection.
+    pub fn conf_path(&self) -> &str {
+        &self.mount.conf
     }
 }
 
@@ -321,10 +331,11 @@ impl FuseMountArgs {
             conf.client.master_addrs = vec;
         }
 
-        // FUSE options - override if provided
+        // CLI options replace config-file options when provided. Otherwise preserve
+        // configured options and apply defaults only when neither source supplies any.
         if !self.options.is_empty() {
             conf.fuse.fuse_opts = self.options.clone()
-        } else {
+        } else if conf.fuse.fuse_opts.is_empty() {
             conf.fuse.fuse_opts = Self::default_mnt_opts();
         }
 
@@ -361,8 +372,49 @@ impl FuseMountArgs {
 mod tests {
     use super::FuseMountArgs;
     use clap::Parser;
+    use curvine_common::conf::ClusterConf;
     use orpc::common::Utils;
     use std::fs;
+
+    fn get_conf(config: &str, extra_args: &[&str]) -> ClusterConf {
+        let conf_path = Utils::temp_file();
+        fs::write(&conf_path, config).expect("write test config");
+
+        let mut argv = vec!["curvine-fuse", "--conf", conf_path.as_str()];
+        argv.extend_from_slice(extra_args);
+        let args = FuseMountArgs::try_parse_from(argv).expect("parse mount arguments");
+        let result = args.get_conf();
+        let _ = fs::remove_file(&conf_path);
+
+        result.expect("load mount configuration")
+    }
+
+    #[test]
+    fn get_conf_preserves_config_fuse_opts_without_cli_override() {
+        let conf = get_conf(
+            "[fuse]\nio_threads = 1\nfuse_opts = [\"allow_root\", \"ro\"]\n",
+            &[],
+        );
+
+        assert_eq!(conf.fuse.fuse_opts, vec!["allow_root", "ro"]);
+    }
+
+    #[test]
+    fn get_conf_cli_fuse_opts_replace_config_fuse_opts() {
+        let conf = get_conf(
+            "[fuse]\nio_threads = 1\nfuse_opts = [\"allow_root\"]\n",
+            &["--options", "ro"],
+        );
+
+        assert_eq!(conf.fuse.fuse_opts, vec!["ro"]);
+    }
+
+    #[test]
+    fn get_conf_uses_default_fuse_opts_when_no_source_provides_any() {
+        let conf = get_conf("[fuse]\nio_threads = 1\n", &[]);
+
+        assert_eq!(conf.fuse.fuse_opts, FuseMountArgs::default_mnt_opts());
+    }
 
     #[test]
     fn get_conf_rejects_zero_io_threads_cli_override() {

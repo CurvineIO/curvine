@@ -11,10 +11,14 @@ default = []
 jni = ["curvine-ufs/jni"]
 spdk = ["orpc/spdk"]
 spdk-rdma = ["spdk", "orpc/spdk-rdma"]
+fault-injection = [
+    "curvine-fault/http-server",
+]
 
 [dependencies]
 orpc = { workspace = true }
 curvine-common = { workspace = true }
+curvine-fault = { workspace = true }
 curvine-client = { workspace = true }
 curvine-ufs = { workspace = true }
 curvine-web = { workspace = true }
@@ -47,3 +51,6 @@ url = { workspace = true }
 parking_lot = { workspace = true }
 lru = { workspace = true }
 byteorder = { workspace = true }
+
+[dev-dependencies]
+curvine-fault = { workspace = true, features = ["http-client"] }
