@@ -90,6 +90,44 @@ fn close_out_health<F: FnOnce(bool)>(enabled: bool, set_health: F) {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum FdWatcherPollResult {
+    Healthy,
+    Interrupted,
+    UnhealthyEvent { fd: RawIO, revents: i16 },
+    PollError { errno: Option<i32> },
+}
+
+#[cfg(target_os = "linux")]
+fn classify_fd_watcher_poll(
+    result: libc::c_int,
+    pfds: &[libc::pollfd],
+    errno: Option<i32>,
+) -> FdWatcherPollResult {
+    if result < 0 {
+        return if errno == Some(libc::EINTR) {
+            FdWatcherPollResult::Interrupted
+        } else {
+            FdWatcherPollResult::PollError { errno }
+        };
+    }
+
+    if result == 0 {
+        return FdWatcherPollResult::Healthy;
+    }
+
+    let fatal_events = (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) as i16;
+    pfds.iter()
+        .find(|pfd| pfd.revents & fatal_events != 0)
+        .map_or(FdWatcherPollResult::Healthy, |pfd| {
+            FdWatcherPollResult::UnhealthyEvent {
+                fd: pfd.fd,
+                revents: pfd.revents,
+            }
+        })
+}
+
 impl<T: FileSystem> FuseSession<T> {
     pub const STATE_PATH: &'static str = "CURVINE_FUSE_STATE_PATH";
 
@@ -283,25 +321,44 @@ impl<T: FileSystem> FuseSession<T> {
                 .collect();
             loop {
                 // Non-blocking poll; do not stall the runtime
-                let res = unsafe { poll(pfds.as_mut_ptr(), pfds.len() as u64, 0) };
-                if res > 0 {
-                    for p in &pfds {
-                        let revents = p.revents as i16;
-                        if (revents & ((POLLERR | POLLHUP) as i16)) != 0 {
-                            info!("fd_watcher detected HUP/ERR on FUSE fd; broadcasting shutdown");
-                            // Phase 3b (D4/P2-2): one synchronous, ordered burst —
-                            // record the reason, set health 0, THEN broadcast
-                            // shutdown, then return. `send` is last so a cleanup
-                            // abort (which only fires after run() is already
-                            // unwinding) cannot truncate the record/health write.
-                            shutdown_once.record_once(SHUTDOWN_FD_WATCHER);
-                            if enabled {
-                                FuseMetrics::with(|m| m.set_kernel_fd_health(false));
-                            }
-                            let _ = shutdown_tx.send(true);
-                            return;
-                        }
+                let result = unsafe { poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 0) };
+                let errno = if result < 0 {
+                    std::io::Error::last_os_error().raw_os_error()
+                } else {
+                    None
+                };
+
+                let unhealthy = match classify_fd_watcher_poll(result, &pfds, errno) {
+                    FdWatcherPollResult::Healthy => false,
+                    FdWatcherPollResult::Interrupted => continue,
+                    FdWatcherPollResult::UnhealthyEvent { fd, revents } => {
+                        info!(
+                            "fd_watcher detected fatal event on FUSE fd {}, revents={:#x}; broadcasting shutdown",
+                            fd, revents
+                        );
+                        true
                     }
+                    FdWatcherPollResult::PollError { errno } => {
+                        error!(
+                            "fd_watcher poll failed, errno={:?}; broadcasting shutdown",
+                            errno
+                        );
+                        true
+                    }
+                };
+
+                if unhealthy {
+                    // Phase 3b (D4/P2-2): one synchronous, ordered burst —
+                    // record the reason, set health 0, THEN broadcast shutdown,
+                    // then return. `send` is last so a cleanup abort (which only
+                    // fires after run() is already unwinding) cannot truncate the
+                    // record/health write.
+                    shutdown_once.record_once(SHUTDOWN_FD_WATCHER);
+                    if enabled {
+                        FuseMetrics::with(|m| m.set_kernel_fd_health(false));
+                    }
+                    let _ = shutdown_tx.send(true);
+                    return;
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
@@ -498,6 +555,59 @@ impl<T: FileSystem> FuseSession<T> {
             ts.used_ms()
         );
         Ok(mnts)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod fd_watcher_tests {
+    use super::{classify_fd_watcher_poll, FdWatcherPollResult};
+    use libc::{pollfd, EINTR, EIO, POLLERR, POLLHUP, POLLIN, POLLNVAL};
+
+    #[test]
+    fn pollnval_is_unhealthy() {
+        let pfds = [pollfd {
+            fd: 42,
+            events: (POLLERR | POLLHUP) as i16,
+            revents: POLLNVAL as i16,
+        }];
+
+        assert_eq!(
+            classify_fd_watcher_poll(1, &pfds, None),
+            FdWatcherPollResult::UnhealthyEvent {
+                fd: 42,
+                revents: POLLNVAL as i16,
+            }
+        );
+    }
+
+    #[test]
+    fn interrupted_poll_is_retried() {
+        assert_eq!(
+            classify_fd_watcher_poll(-1, &[], Some(EINTR)),
+            FdWatcherPollResult::Interrupted
+        );
+    }
+
+    #[test]
+    fn non_eintr_poll_error_is_unhealthy() {
+        assert_eq!(
+            classify_fd_watcher_poll(-1, &[], Some(EIO)),
+            FdWatcherPollResult::PollError { errno: Some(EIO) }
+        );
+    }
+
+    #[test]
+    fn non_fatal_revents_remain_healthy() {
+        let pfds = [pollfd {
+            fd: 42,
+            events: POLLIN as i16,
+            revents: POLLIN as i16,
+        }];
+
+        assert_eq!(
+            classify_fd_watcher_poll(1, &pfds, None),
+            FdWatcherPollResult::Healthy
+        );
     }
 }
 
