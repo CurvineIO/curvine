@@ -35,6 +35,8 @@ use std::collections::{HashMap, LinkedList};
 use std::mem;
 use std::sync::Arc;
 
+const MODE_SETGID: u32 = 0o2000;
+
 /// Note: The modification operation uses &mut self, which is a necessary improvement. We use the unsafe API to perform modifications.
 pub struct FsDir {
     pub(crate) root_dir: InodeView,
@@ -115,13 +117,19 @@ impl FsDir {
     // Create the first subdirectory that does not exist.
     // 1. If all directories on the path already exist, skip and return successful.
     // 2. If the parent directory does not exist, an error is returned.
-    fn create_single_dir(&mut self, mut inp: InodePath, opts: MkdirOpts) -> FsResult<InodePath> {
+    fn create_single_dir(
+        &mut self,
+        mut inp: InodePath,
+        mut opts: MkdirOpts,
+    ) -> FsResult<InodePath> {
         if inp.is_full() || inp.is_root() {
             return Ok(inp);
         }
 
         let pos = inp.existing_len() - 1;
         let name = inp.get_component(pos + 1)?.to_string();
+
+        Self::apply_setgid_directory_inheritance(&inp, &mut opts)?;
 
         let dir = InodeDir::with_opts(self.next_inode_id()?, LocalTime::mills() as i64, opts);
 
@@ -131,6 +139,23 @@ impl FsDir {
         self.journal_writer.log_mkdir(self, &parent_path, &dir)?;
 
         Ok(inp)
+    }
+
+    fn apply_setgid_directory_inheritance(inp: &InodePath, opts: &mut MkdirOpts) -> FsResult<()> {
+        if inp.existing_len() == 0 {
+            return Ok(());
+        }
+        let parent_pos = inp.existing_len() as i32 - 1;
+        let parent = match inp.get_inode(parent_pos) {
+            Some(parent) => parent,
+            None => return Ok(()),
+        };
+        let acl = parent.as_ref().acl()?;
+        if acl.mode & MODE_SETGID != 0 {
+            opts.group = acl.group.clone();
+            opts.mode |= MODE_SETGID;
+        }
+        Ok(())
     }
 
     // Create all previous directories that may be missing on the path.

@@ -24,7 +24,8 @@ use curvine_common::raft::storage::{AppStorage, ApplyMsg};
 use curvine_common::state::MountOptions;
 use curvine_common::state::{
     BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
-    CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, StorageType, TtlAction, WorkerInfo,
+    CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, MkdirOptsBuilder, StorageType, TtlAction,
+    WorkerInfo,
 };
 use curvine_common::state::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_common::utils::SerdeUtils;
@@ -757,6 +758,33 @@ fn mkdir(fs: &MasterFilesystem) -> CommonResult<()> {
     assert_eq!(list.len(), 3);
 
     fs.print_tree();
+
+    Ok(())
+}
+
+#[test]
+fn mkdir_inherits_setgid_parent_group_and_mode() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "mkdir-setgid-inherit");
+
+    let parent_opts = MkdirOptsBuilder::new()
+        .owner("parent-owner".to_string())
+        .group("parent-group".to_string())
+        .mode(0o2775)
+        .build();
+    fs.mkdir_with_opts("/parent", parent_opts)?;
+
+    let child_opts = MkdirOptsBuilder::new()
+        .owner("child-owner".to_string())
+        .group("child-group".to_string())
+        .mode(0o775)
+        .build();
+    fs.mkdir_with_opts("/parent/child", child_opts)?;
+
+    let child = fs.file_status("/parent/child")?;
+    assert_eq!("parent-group", child.group);
+    assert_eq!(0o2000, child.mode & 0o2000);
+    assert_eq!(0o775, child.mode & 0o777);
 
     Ok(())
 }
