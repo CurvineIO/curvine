@@ -299,6 +299,19 @@ impl CurvineFileSystem {
         self.fs_client.symlink(target, link, force).await
     }
 
+    pub async fn symlink_with_owner_group(
+        &self,
+        target: &str,
+        link: &Path,
+        force: bool,
+        owner: Option<String>,
+        group: Option<String>,
+    ) -> FsResult<()> {
+        self.fs_client
+            .symlink_with_owner_group(target, link, force, owner, group)
+            .await
+    }
+
     pub async fn link(&self, src_path: &Path, dst_path: &Path) -> FsResult<()> {
         self.fs_client.link(src_path, dst_path).await
     }

@@ -886,10 +886,19 @@ impl FsDir {
         link: InodePath,
         force: bool,
         mode: u32,
+        owner: Option<String>,
+        group: Option<String>,
     ) -> FsResult<()> {
         let op_ms = LocalTime::mills();
 
-        let new_inode = InodeFile::with_link(self.inode_id.next()?, op_ms as i64, target, mode);
+        let new_inode = InodeFile::with_link(
+            self.inode_id.next()?,
+            op_ms as i64,
+            target,
+            mode,
+            owner,
+            group,
+        );
 
         let link = self.unprotected_symlink(link, new_inode.clone(), force)?;
         self.journal_writer

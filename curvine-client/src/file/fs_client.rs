@@ -528,11 +528,25 @@ impl FsClient {
     }
 
     pub async fn symlink(&self, target: &str, link: &Path, force: bool) -> FsResult<()> {
+        self.symlink_with_owner_group(target, link, force, None, None)
+            .await
+    }
+
+    pub async fn symlink_with_owner_group(
+        &self,
+        target: &str,
+        link: &Path,
+        force: bool,
+        owner: Option<String>,
+        group: Option<String>,
+    ) -> FsResult<()> {
         let req = SymlinkRequest {
             target: target.to_string(),
             link: link.encode(),
             force,
             mode: ClientConf::DEFAULT_FILE_SYSTEM_MODE,
+            owner,
+            group,
         };
         let _: SymlinkResponse = self.rpc(RpcCode::Symlink, req).await?;
         Ok(())

@@ -257,6 +257,8 @@ message SymlinkRequest {
     required string link = 2;
     required bool force = 3;
     required uint32 mode = 4;
+    optional string owner = 5;
+    optional string group = 6;
 }
 
 message SymlinkResponse {
