@@ -226,7 +226,7 @@ impl BlockClient {
             .proto_header(header)
             .build();
 
-        let _ = self.rpc(msg).await?;
+        let _ = FsContext::metrics_track("WriteCommitBlock", self.rpc(msg)).await?;
         Ok(())
     }
 
@@ -260,7 +260,7 @@ impl BlockClient {
             .proto_header(request)
             .build();
 
-        let rep = self.rpc(msg).await?;
+        let rep = FsContext::metrics_track("OpenBlock", self.rpc(msg)).await?;
         let rep_header: BlockReadResponse = rep.parse_header()?;
 
         Ok(BlockReadContext::from_req(rep_header))
@@ -285,7 +285,7 @@ impl BlockClient {
             .proto_header(request)
             .build();
 
-        let _ = self.rpc(msg).await?;
+        let _ = FsContext::metrics_track("ReadCommitBlock", self.rpc(msg)).await?;
         Ok(())
     }
 

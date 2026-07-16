@@ -316,7 +316,8 @@ impl FsClient {
             inode_id,
         };
 
-        let rep_header = self.rpc(RpcCode::AddBlock, header).await?;
+        let rep_header =
+            FsContext::metrics_track("AddBlock", self.rpc(RpcCode::AddBlock, header)).await?;
         let locate_block = ProtoUtils::located_block_from_pb(rep_header);
         Ok(locate_block)
     }
@@ -396,7 +397,9 @@ impl FsClient {
             inode_id,
         };
 
-        let rep: CompleteFileResponse = self.rpc(RpcCode::CompleteFile, header).await?;
+        let operation = if only_flush { "Flush" } else { "Complete" };
+        let rep: CompleteFileResponse =
+            FsContext::metrics_track(operation, self.rpc(RpcCode::CompleteFile, header)).await?;
 
         Ok(rep.file_blocks.map(ProtoUtils::file_blocks_from_pb))
     }
