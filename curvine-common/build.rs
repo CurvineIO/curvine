@@ -12,10 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs, str};
 
 fn main() {
+    let proto_files = [
+        "proto/common.proto",
+        "proto/master.proto",
+        "proto/worker.proto",
+        "proto/job.proto",
+        "proto/mount.proto",
+        "proto/replication.proto",
+        "proto/raft.proto",
+        "proto/eraftpb.proto",
+    ];
+
+    // Emitting any rerun-if-changed disables Cargo's default "watch whole package"
+    // heuristic, so proto inputs must be listed explicitly alongside Git paths.
+    for path in &proto_files {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    emit_git_rerun_if_changed();
+
     let src = vec![
         "common.proto",
         "master.proto",
@@ -88,6 +107,54 @@ pub static VERSION: &str = "{}";
     );
 
     fs::write(ver_file, version_content).unwrap();
+}
+
+/// Tell Cargo to re-run this build script when Git HEAD (or the branch it
+/// points at) changes. Uses `git rev-parse --git-path` so git worktrees work
+/// (literal `.git/HEAD` is a file there, not a directory).
+fn emit_git_rerun_if_changed() {
+    let Some(head_path) = git_path("HEAD") else {
+        return;
+    };
+    println!("cargo:rerun-if-changed={}", head_path.display());
+
+    if let Ok(contents) = fs::read_to_string(&head_path) {
+        if let Some(git_ref) = contents.strip_prefix("ref: ") {
+            let git_ref = git_ref.trim();
+            if let Some(ref_path) = git_path(git_ref) {
+                println!("cargo:rerun-if-changed={}", ref_path.display());
+            }
+        }
+    }
+
+    // After `git pack-refs`, the loose ref may be absent and tip updates only
+    // touch packed-refs; watch it so incremental builds still refresh VERSION.
+    if let Some(packed_refs) = git_path("packed-refs") {
+        println!("cargo:rerun-if-changed={}", packed_refs.display());
+    }
+}
+
+fn git_path(path: &str) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--git-path", path])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = str::from_utf8(&output.stdout).ok()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        // `git rev-parse --git-path` may return a cwd-relative path; resolve
+        // against the package directory so Cargo can watch it reliably.
+        let manifest_dir = env::var_os("CARGO_MANIFEST_DIR")?;
+        Some(PathBuf::from(manifest_dir).join(path))
+    }
 }
 
 fn get_git_head_commit() -> String {
