@@ -71,6 +71,8 @@ pub struct OpendalReader {
     pos: i64,
     chunk: DataSlice,
     chunk_size: usize,
+    /// Number of concurrent range requests OpenDAL prefetches for this object.
+    concurrent: usize,
     byte_stream: Option<opendal::FuturesBytesStream>,
     status: FileStatus,
 }
@@ -115,6 +117,7 @@ impl Reader for OpendalReader {
                 .operator
                 .reader_with(&self.object_path)
                 .chunk(self.chunk_size)
+                .concurrent(self.concurrent)
                 .await
                 .map_err(|e| opendal_error("Failed to create reader", &self.object_path, e))?;
 
@@ -269,6 +272,10 @@ pub struct OpendalFileSystem {
     operator: Operator,
     scheme: String,
     bucket_or_container: String,
+    /// Per-object read buffer size (bytes); internal constant, see OpendalConf.
+    read_chunk_size: usize,
+    /// Concurrent range requests per object; internal constant, see OpendalConf.
+    read_concurrent: usize,
 }
 
 impl OpendalFileSystem {
@@ -553,10 +560,15 @@ impl OpendalFileSystem {
             }
         };
 
+        let opendal_conf = OpendalConf::from_map(&conf)
+            .map_err(|e| FsError::common(format!("Failed to parse OpenDAL config: {}", e)))?;
+
         Ok(Self {
             operator,
             scheme: scheme.to_string(),
             bucket_or_container,
+            read_chunk_size: opendal_conf.read_chunk_size,
+            read_concurrent: opendal_conf.read_concurrent,
         })
     }
 
@@ -828,7 +840,8 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
             length: status.len,
             pos: 0,
             chunk: DataSlice::Empty,
-            chunk_size: 8 * 1024 * 1024,
+            chunk_size: self.read_chunk_size,
+            concurrent: self.read_concurrent,
             byte_stream: None,
             status,
         })

@@ -304,6 +304,27 @@ impl UnifiedFileSystem {
         self.track("Symlink", target, link.path(), fut).await
     }
 
+    pub async fn symlink_with_owner_group(
+        &self,
+        target: &str,
+        link: &Path,
+        force: bool,
+        owner: Option<String>,
+        group: Option<String>,
+    ) -> FsResult<()> {
+        let fut = async {
+            match self.get_mount_checked(link, RpcCode::Symlink).await? {
+                None => {
+                    self.cv
+                        .symlink_with_owner_group(target, link, force, owner, group)
+                        .await
+                }
+                Some(_) => err_ext!(FsError::unsupported("symlink")),
+            }
+        };
+        self.track("Symlink", target, link.path(), fut).await
+    }
+
     pub async fn link(&self, src_path: &Path, dst_path: &Path) -> FsResult<()> {
         let fut = async {
             let _ = self.get_mount_checked(dst_path, RpcCode::Link).await?;
@@ -333,7 +354,7 @@ impl UnifiedFileSystem {
         mount: &MountValue,
     ) -> FsResult<CacheValidity> {
         if mount.info.read_verify_ufs {
-            let ufs_status = mount.ufs.get_status(ufs_path).await?;
+            let ufs_status = mount.ufs()?.get_status(ufs_path).await?;
             if cv_status.cv_valid(Some(&ufs_status)) {
                 Ok(CacheValidity::Valid)
             } else {
@@ -368,7 +389,7 @@ impl UnifiedFileSystem {
                 Ok(Some(FallbackFsReader::new(
                     cv_reader,
                     ufs_path.clone(),
-                    mount.ufs.clone(),
+                    mount.ufs()?,
                     mount.info.is_fs_mode(),
                 )))
             } else if blocks.ufs_exists() {
@@ -387,7 +408,7 @@ impl UnifiedFileSystem {
                     Ok(Some(FallbackFsReader::new(
                         cv_reader,
                         ufs_path.clone(),
-                        mount.ufs.clone(),
+                        mount.ufs()?,
                         mount.info.is_fs_mode(),
                     )))
                 }
@@ -475,7 +496,7 @@ impl UnifiedFileSystem {
     ) -> FsResult<()> {
         let opts = mnt.info.merge_create_opts(opts);
         let ufs_path = mnt.get_ufs_path(path)?;
-        let mut reader = mnt.ufs.open(&ufs_path).await?;
+        let mut reader = mnt.ufs()?.open(&ufs_path).await?;
         if reader.len() != cv_len {
             return err_box!(
                 "file length mismatch: cv_path={:?}, ufs_path={:?}, ufs_len={}, cv_len={}",
@@ -558,10 +579,11 @@ impl UnifiedFileSystem {
                     }
 
                     write_path = ufs_path.full_path().to_owned();
+                    let ufs = mount.ufs()?;
                     if flags.append() {
-                        mount.ufs.append(&ufs_path).await
+                        ufs.append(&ufs_path).await
                     } else {
-                        mount.ufs.create(&ufs_path, flags.overwrite()).await
+                        ufs.create(&ufs_path, flags.overwrite()).await
                     }
                 }
             }
@@ -586,7 +608,7 @@ impl UnifiedFileSystem {
                 None => Ok(Some(self.cv.mkdir_with_opts(path, opts).await?)),
 
                 Some((ufs_path, mount)) => {
-                    let flag = mount.ufs.mkdir(&ufs_path, opts.create_parent).await?;
+                    let flag = mount.ufs()?.mkdir(&ufs_path, opts.create_parent).await?;
                     if !flag {
                         err_ext!(FsError::file_exists(ufs_path.path()))
                     } else {
@@ -671,7 +693,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         let fut = async {
             match self.get_mount_checked(path, RpcCode::Exists).await? {
                 None => self.cv.exists(path).await,
-                Some((ufs_path, mount)) => mount.ufs.exists(&ufs_path).await,
+                Some((ufs_path, mount)) => mount.ufs()?.exists(&ufs_path).await,
             }
         };
         self.track("Exists", path.path(), "", fut).await
@@ -720,7 +742,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                 // Reading from ufs
                 if self.enable_read_ufs {
                     debug!("read from ufs, ufs path {}, cv path: {}", ufs_path, path);
-                    mount.ufs.open(&ufs_path).await
+                    mount.ufs()?.open(&ufs_path).await
                 } else {
                     err_ext!(FsError::unsupported_ufs_read(path.path()))
                 }
@@ -742,7 +764,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                 None => self.cv.rename(src, dst).await,
                 Some((src_ufs, mount)) => {
                     let dst_ufs = mount.get_ufs_path(dst)?;
-                    let res = mount.ufs.rename(&src_ufs, &dst_ufs).await?;
+                    let res = mount.ufs()?.rename(&src_ufs, &dst_ufs).await?;
 
                     // After rename, the file's mtime changes, making the cached data invalid
                     if let Err(e) = self.cv.delete(src, true).await {
@@ -771,7 +793,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                         );
                     }
 
-                    mount.ufs.delete(&ufs_path, recursive).await?;
+                    mount.ufs()?.delete(&ufs_path, recursive).await?;
 
                     // delete cache
                     if let Err(e) = self.cv.delete(path, recursive).await {
@@ -801,14 +823,14 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                             Ok(v)
                         }
                         CacheValidity::Invalid(Some(ufs_status)) => Ok(ufs_status),
-                        CacheValidity::Invalid(None) => mnt.ufs.get_status(&ufs_path).await,
+                        CacheValidity::Invalid(None) => mnt.ufs()?.get_status(&ufs_path).await,
                     },
 
                     Err(e) => {
                         if !matches!(e, FsError::FileNotFound(_) | FsError::Expired(_)) {
                             warn!("failed to get status file {}: {}", path, e);
                         };
-                        mnt.ufs.get_status(&ufs_path).await
+                        mnt.ufs()?.get_status(&ufs_path).await
                     }
                 },
             }
@@ -820,7 +842,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         let fut = async {
             match self.get_mount_checked(path, RpcCode::ListStatus).await? {
                 None => self.cv.list_status(path).await,
-                Some((ufs_path, mount)) => mount.ufs.list_status(&ufs_path).await,
+                Some((ufs_path, mount)) => mount.ufs()?.list_status(&ufs_path).await,
             }
         };
         self.track("ListStatus", path.path(), "", fut).await
@@ -830,7 +852,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         let fut = async {
             match self.get_mount_checked(path, RpcCode::ListStatus).await? {
                 None => self.cv.list_status_bytes(path).await,
-                Some((ufs_path, mount)) => mount.ufs.list_status_bytes(&ufs_path).await,
+                Some((ufs_path, mount)) => mount.ufs()?.list_status_bytes(&ufs_path).await,
             }
         };
         self.track("ListStatus", path.path(), "", fut).await
@@ -840,7 +862,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         let fut = async {
             match self.get_mount_checked(path, RpcCode::ListOptions).await? {
                 None => self.cv.list_options(path, options).await,
-                Some((ufs_path, mount)) => mount.ufs.list_options(&ufs_path, options).await,
+                Some((ufs_path, mount)) => mount.ufs()?.list_options(&ufs_path, options).await,
             }
         };
         self.track("ListOptions", path.path(), "", fut).await
@@ -850,7 +872,9 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         let fut = async {
             match self.get_mount_checked(path, RpcCode::ListOptions).await? {
                 None => self.cv.list_options_bytes(path, options).await,
-                Some((ufs_path, mount)) => mount.ufs.list_options_bytes(&ufs_path, options).await,
+                Some((ufs_path, mount)) => {
+                    mount.ufs()?.list_options_bytes(&ufs_path, options).await
+                }
             }
         };
         self.track("ListOptions", path.path(), "", fut).await
@@ -860,7 +884,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         let fut = async {
             match self.get_mount_checked(path, RpcCode::ListOptions).await? {
                 None => self.cv.list_stream(path, options).await,
-                Some((ufs_path, mount)) => mount.ufs.list_stream(&ufs_path, options).await,
+                Some((ufs_path, mount)) => mount.ufs()?.list_stream(&ufs_path, options).await,
             }
         };
         self.track("ListStream", path.path(), "", fut).await

@@ -12,15 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::worker::Worker;
 use axum::routing::get;
 use axum::Router;
-
 use curvine_common::FsResult;
+use curvine_fault::FaultHttpControl;
 use curvine_web::router::RouterHandler;
 
-use crate::worker::Worker;
-
-pub struct WorkerRouterHandler;
+#[derive(Clone)]
+pub struct WorkerRouterHandler {
+    pub(crate) fault_http: FaultHttpControl,
+}
 
 async fn metrics() -> FsResult<String> {
     let metrics = Worker::get_metrics()?;
@@ -29,6 +31,8 @@ async fn metrics() -> FsResult<String> {
 
 impl RouterHandler for WorkerRouterHandler {
     fn router(&self) -> Router {
-        Router::new().route("/metrics", get(metrics))
+        let router = Router::new().route("/metrics", get(metrics));
+
+        self.fault_http.mount(router)
     }
 }

@@ -26,14 +26,58 @@ pub struct FuseError {
 }
 
 impl FuseError {
-    pub fn new(errno: i32, error: CommonError) -> Self {
+    // crate-private: the public safe constructor is `from_errno_msg`, which
+    // normalizes the errno. Keeping `new` internal prevents external/future code
+    // from bypassing normalization and building an illegal (non-positive) errno.
+    pub(crate) fn new(errno: i32, error: CommonError) -> Self {
+        // Internal invariant: FuseError always holds a positive POSIX errno.
+        // `ResponseData::create` negates it (`-error`) when encoding the reply, so
+        // a negative/zero errno here would produce an illegal FUSE reply frame.
+        // Surfaced loudly in debug; release callers should route arbitrary integers
+        // through `err_fuse!` / `from_errno_msg`, which normalize the value.
+        debug_assert!(
+            errno > 0,
+            "FuseError errno must be a positive POSIX errno, got {}",
+            errno
+        );
         Self { errno, error }
+    }
+
+    /// Build a `FuseError` from an arbitrary integer errno, normalizing it to a
+    /// positive POSIX errno via [`normalize_errno`]. This is the construction
+    /// path used by `err_fuse!`; it also lets callers that need a `FuseError`
+    /// value (not a `Result`) build one directly — e.g. before passing it to
+    /// `send_rep_tagged` — without the `let _: FuseResult<_> = err_fuse!(...)`
+    /// detour.
+    pub fn from_errno_msg<E: TryInto<i32>>(errno: E, error: CommonError) -> Self {
+        Self::new(normalize_errno(errno), error)
     }
 
     /// The POSIX errno this error maps to. Used by the metrics finish path to
     /// stash the errno label source.
     pub(crate) fn errno(&self) -> i32 {
         self.errno
+    }
+}
+
+/// Normalize an arbitrary integer errno into a positive POSIX errno.
+///
+/// Uses `TryInto<i32>` for a genuine range check (no `as` truncation/wrapping):
+/// a value that does not fit in `i32`, or is non-positive, falls back to `EIO`.
+/// This keeps `FuseError`'s "positive errno" invariant and prevents an illegal
+/// FUSE reply frame (the reply path negates the errno). Release-safe — never
+/// panics — but a non-positive / out-of-range input trips a `debug_assert` so a
+/// caller bug is surfaced in debug/test builds rather than silently coerced.
+pub(crate) fn normalize_errno<E: TryInto<i32>>(errno: E) -> i32 {
+    match errno.try_into() {
+        Ok(e) if e > 0 => e,
+        _ => {
+            debug_assert!(
+                false,
+                "err_fuse! errno is non-positive or out of i32 range; falling back to EIO"
+            );
+            libc::EIO
+        }
     }
 }
 
@@ -47,7 +91,7 @@ impl std::error::Error for FuseError {}
 
 impl fmt::Display for FuseError {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        write!(fmt, "errno {}: {}", self.error, self.errno)
+        write!(fmt, "errno {}: {}", self.errno, self.error)
     }
 }
 
@@ -111,7 +155,9 @@ impl From<FsError> for FuseError {
 
 impl From<Elapsed> for FuseError {
     fn from(value: Elapsed) -> Self {
-        Self::new(libc::EIO, value.into())
+        // A tokio timeout is a timeout, same as FsError::Timeout -> ETIMEDOUT;
+        // keep both conversion paths consistent instead of degrading to EIO.
+        Self::new(libc::ETIMEDOUT, value.into())
     }
 }
 
@@ -182,6 +228,33 @@ pub(crate) fn splice_errno_label(errno: i32) -> &'static str {
 mod tests {
     use super::{errno_label, splice_errno_label, FuseError};
     use curvine_common::error::FsError;
+
+    // Display prints the errno NUMBER first, then the message ("errno 2: ...").
+    #[test]
+    fn display_prints_errno_before_message() {
+        let err = FuseError::new(libc::ENOENT, "no such file".into());
+        let s = format!("{}", err);
+        assert!(
+            s.starts_with(&format!("errno {}: ", libc::ENOENT)),
+            "expected errno number first, got: {}",
+            s
+        );
+        assert!(s.contains("no such file"));
+    }
+
+    // A tokio timeout maps to ETIMEDOUT, consistent with FsError::Timeout — not EIO.
+    #[tokio::test]
+    async fn elapsed_maps_to_etimedout() {
+        let elapsed = tokio::time::timeout(
+            std::time::Duration::from_millis(0),
+            std::future::pending::<()>(),
+        )
+        .await
+        .expect_err("zero-duration timeout must elapse");
+        let err: FuseError = elapsed.into();
+        assert_eq!(err.errno, libc::ETIMEDOUT);
+        assert_eq!(errno_label(err.errno), "ETIMEDOUT");
+    }
 
     #[test]
     fn invalid_file_size_maps_to_efbig() {

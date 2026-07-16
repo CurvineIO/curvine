@@ -53,14 +53,15 @@ fn test_cache_mode() {
             .await
             .unwrap()
             .unwrap();
-        let ufs_reader_before = mnt.ufs.open(&ufs_path).await.unwrap();
+        let ufs = mnt.ufs().unwrap();
+        let ufs_reader_before = ufs.open(&ufs_path).await.unwrap();
         let mtime_before = ufs_reader_before.status().mtime;
         drop(ufs_reader_before);
 
         fs.async_cache(&path).unwrap();
         fs.wait_job_complete(&path, false).await.unwrap();
 
-        let ufs_reader_after = mnt.ufs.open(&ufs_path).await.unwrap();
+        let ufs_reader_after = ufs.open(&ufs_path).await.unwrap();
         let mtime_after = ufs_reader_after.status().mtime;
         drop(ufs_reader_after);
         assert_eq!(
@@ -140,7 +141,7 @@ fn test_fs_mode() {
         let mut ufs_gone = awaitility::at_most(Duration::from_secs(60));
         ufs_gone.poll_interval(Duration::from_millis(100));
         ufs_gone
-            .until_async(|| async { !mnt.ufs.exists(&ufs_path).await.unwrap_or(true) })
+            .until_async(|| async { !mnt.ufs().unwrap().exists(&ufs_path).await.unwrap_or(true) })
             .await;
         ufs_gone
             .result()
@@ -174,7 +175,7 @@ fn test_cache_mode_free() {
             .await
             .unwrap()
             .unwrap();
-        assert!(mnt.ufs.exists(&ufs_path).await.unwrap());
+        assert!(mnt.ufs().unwrap().exists(&ufs_path).await.unwrap());
 
         fs.free(&path, false).await.unwrap();
 
@@ -183,7 +184,7 @@ fn test_cache_mode_free() {
             "cache mode free should remove Curvine file metadata"
         );
         assert!(
-            mnt.ufs.exists(&ufs_path).await.unwrap(),
+            mnt.ufs().unwrap().exists(&ufs_path).await.unwrap(),
             "cache mode free must not delete the UFS file"
         );
 
@@ -402,7 +403,7 @@ async fn try_verify_cv_ufs_consistency(fs: &UnifiedFileSystem, path: &Path) -> b
         Ok(Some(v)) => v,
         _ => return false,
     };
-    let mut ufs_reader = match mnt.ufs.open(&ufs_path).await {
+    let mut ufs_reader = match mnt.ufs().unwrap().open(&ufs_path).await {
         Ok(r) => r,
         Err(_) => return false,
     };

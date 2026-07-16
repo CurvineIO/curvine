@@ -14,7 +14,9 @@
 
 use crate::alloc::allocator_type_name;
 use crate::conf::CliConf;
-use crate::conf::{ClientConf, FuseConf, JobConf, JournalConf, MasterConf, WorkerConf};
+use crate::conf::{
+    ClientConf, FaultHttpConfig, FuseConf, JobConf, JournalConf, MasterConf, WorkerConf,
+};
 use crate::rocksdb::DBConf;
 use crate::version;
 use log::info;
@@ -49,6 +51,13 @@ pub struct ClusterConf {
     pub journal: JournalConf,
 
     pub worker: WorkerConf,
+
+    /// Test-only fault HTTP control plane.
+    ///
+    /// Fault point instrumentation is controlled by Cargo features. This
+    /// setting only controls HTTP route exposure; enabling it without the
+    /// corresponding Cargo feature fails server startup.
+    pub fault_injection: FaultHttpConfig,
 
     pub log: LogConf,
 
@@ -280,6 +289,7 @@ impl Default for ClusterConf {
             master: Default::default(),
             journal: Default::default(),
             worker: Default::default(),
+            fault_injection: Default::default(),
             log: Default::default(),
             client: Default::default(),
             fuse: FuseConf::default(),

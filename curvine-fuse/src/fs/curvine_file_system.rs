@@ -999,7 +999,11 @@ impl fs::FileSystem for CurvineFileSystem {
         let link_path = self.state.get_path_common(id, Some(linkname))?;
         self.ensure_writable_path(&link_path, RpcCode::Symlink)
             .await?;
-        self.fs.symlink(target, &link_path, false).await?;
+        let owner = sys::get_username_by_uid(op.header.uid).unwrap_or(op.header.uid.to_string());
+        let group = sys::get_groupname_by_gid(op.header.gid).unwrap_or(op.header.gid.to_string());
+        self.fs
+            .symlink_with_owner_group(target, &link_path, false, Some(owner), Some(group))
+            .await?;
 
         let attr = self.state.lookup_common(id, linkname).await?;
         Ok(FuseUtils::create_entry_out(&self.conf, attr))

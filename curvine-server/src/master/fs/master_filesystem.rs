@@ -1151,10 +1151,22 @@ impl MasterFilesystem {
         force: bool,
         mode: u32,
     ) -> FsResult<()> {
+        self.symlink_with_owner_group(target, link, force, mode, None, None)
+    }
+
+    pub fn symlink_with_owner_group<T: AsRef<str>>(
+        &self,
+        target: T,
+        link: T,
+        force: bool,
+        mode: u32,
+        owner: Option<String>,
+        group: Option<String>,
+    ) -> FsResult<()> {
         let mut fs_dir = self.fs_dir.write();
         let target = target.as_ref().to_string();
         let link = Self::resolve_path(&fs_dir, link.as_ref())?;
-        fs_dir.symlink(target, link, force, mode)
+        fs_dir.symlink(target, link, force, mode, owner, group)
     }
 
     pub fn link<T: AsRef<str>>(&self, src_path: T, dst_path: T) -> FsResult<()> {

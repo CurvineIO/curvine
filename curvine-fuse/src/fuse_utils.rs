@@ -318,6 +318,9 @@ impl FuseUtils {
     }
 
     pub fn fuse_setattr_to_opts(setattr: &fuse_setattr_in) -> FuseResult<SetAttrOpts> {
+        // FATTR_SIZE is intentionally handled by CurvineFileSystem::set_attr because resizing
+        // requires the file handle and cache invalidation managed by the caller.
+
         // Only set fields when the corresponding valid flag is present
         let owner = if (setattr.valid & FATTR_UID) != 0 {
             match sys::get_username_by_uid(setattr.uid) {
@@ -349,13 +352,21 @@ impl FuseUtils {
         let mut mtime = None;
 
         if (setattr.valid & FATTR_ATIME) != 0 {
-            atime = Some((setattr.atime * 1000) as i64);
+            atime = Some(Self::timestamp_to_millis(
+                "atime",
+                setattr.atime,
+                setattr.atimensec,
+            )?);
         } else if (setattr.valid & FATTR_ATIME_NOW) != 0 {
             atime = Some(LocalTime::mills() as i64);
         }
 
         if (setattr.valid & FATTR_MTIME) != 0 {
-            mtime = Some((setattr.mtime * 1000) as i64);
+            mtime = Some(Self::timestamp_to_millis(
+                "mtime",
+                setattr.mtime,
+                setattr.mtimensec,
+            )?);
         } else if (setattr.valid & FATTR_MTIME_NOW) != 0 {
             mtime = Some(LocalTime::mills() as i64);
         }
@@ -368,6 +379,28 @@ impl FuseUtils {
             mtime,
             ..Default::default()
         })
+    }
+
+    fn timestamp_to_millis(field: &str, seconds: u64, nanoseconds: u32) -> FuseResult<i64> {
+        if nanoseconds >= 1_000_000_000 {
+            return err_fuse!(
+                libc::EINVAL,
+                "{} nanoseconds out of range: {}",
+                field,
+                nanoseconds
+            );
+        }
+
+        // FUSE represents seconds as u64, including negative Unix timestamps encoded in two's
+        // complement. Reinterpret it as i64 before doing checked arithmetic.
+        let seconds = seconds as i64;
+        match seconds
+            .checked_mul(1000)
+            .and_then(|millis| millis.checked_add(i64::from(nanoseconds / 1_000_000)))
+        {
+            Some(millis) => Ok(millis),
+            None => err_fuse!(libc::EINVAL, "{} timestamp out of range", field),
+        }
     }
 
     pub fn file_opts_to_status(path: &Path, opts: &CreateFileOpts) -> FileStatus {
@@ -384,6 +417,50 @@ impl FuseUtils {
             group: opts.group.to_owned(),
             nlink: 1,
             ..Default::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FuseUtils;
+    use crate::raw::fuse_abi::fuse_setattr_in;
+    use crate::{FATTR_ATIME, FATTR_MTIME};
+
+    #[test]
+    fn setattr_preserves_millisecond_from_nsec() {
+        let setattr = fuse_setattr_in {
+            valid: FATTR_ATIME | FATTR_MTIME,
+            atime: 1_700_000_000,
+            mtime: 1_800_000_000,
+            atimensec: 123_456_789,
+            mtimensec: 987_654_321,
+            ..Default::default()
+        };
+
+        let opts = FuseUtils::fuse_setattr_to_opts(&setattr).unwrap();
+
+        assert_eq!(opts.atime, Some(1_700_000_000_123));
+        assert_eq!(opts.mtime, Some(1_800_000_000_987));
+    }
+
+    #[test]
+    fn setattr_rejects_out_of_range_nsec() {
+        for setattr in [
+            fuse_setattr_in {
+                valid: FATTR_ATIME,
+                atimensec: 1_000_000_000,
+                ..Default::default()
+            },
+            fuse_setattr_in {
+                valid: FATTR_MTIME,
+                mtimensec: 1_000_000_000,
+                ..Default::default()
+            },
+        ] {
+            let err = FuseUtils::fuse_setattr_to_opts(&setattr).unwrap_err();
+
+            assert_eq!(err.errno(), libc::EINVAL);
         }
     }
 }

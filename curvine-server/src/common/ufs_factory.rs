@@ -58,6 +58,6 @@ impl UfsFactory {
     }
 
     pub fn get_ufs(&self, mnt: &MountInfo) -> FsResult<UfsFileSystem> {
-        self.get_mnt(mnt).map(|x| x.ufs.clone())
+        self.get_mnt(mnt)?.ufs()
     }
 }
