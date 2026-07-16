@@ -83,6 +83,15 @@ pub struct OpendalConf {
     pub read_timeout: Duration,
     pub retry_interval_ms: u64,
     pub retry_max_delay_ms: u64,
+    /// Per-request read buffer size (bytes) for the object reader. Also the size
+    /// of each concurrent range chunk when `read_concurrent > 1`. Internal
+    /// constant (not user-tunable); defaults to [`Self::DEFAULT_READ_CHUNK_SIZE`].
+    pub read_chunk_size: usize,
+    /// Number of concurrent range requests issued against a single object while
+    /// reading. Internal constant (not user-tunable); defaults to
+    /// [`Self::DEFAULT_READ_CONCURRENT`]. Parallelism for large loads is driven
+    /// instead by the outer fan-out (`load_task.parallel_streams`).
+    pub read_concurrent: usize,
 }
 
 impl S3Conf {
@@ -161,6 +170,8 @@ impl OpendalConf {
     pub const DEFAULT_READ_TIMEOUT: &'static str = S3Conf::DEFAULT_READ_TIMEOUT; // "120s"
     pub const DEFAULT_RETRY_INTERVAL_MS: u64 = 1000; // 1 second
     pub const DEFAULT_RETRY_MAX_DELAY_MS: u64 = 10000; // 10 seconds
+    pub const DEFAULT_READ_CHUNK_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+    pub const DEFAULT_READ_CONCURRENT: usize = 2; // 2 parallel range requests per object
 
     /// Create OpendalConf from configuration map
     pub fn from_map(properties: &HashMap<String, String>) -> CommonResult<Self> {
@@ -188,12 +199,26 @@ impl OpendalConf {
             .get_u64(Self::RETRY_MAX_DELAY_MS)
             .unwrap_or(Self::DEFAULT_RETRY_MAX_DELAY_MS);
 
+        // read_chunk_size and read_concurrent are intentionally NOT user-tunable
+        // via mount properties: benchmarking showed the defaults saturate the
+        // link, and the outer parallel-load fan-out (load_task.parallel_streams)
+        // is the knob that matters. Kept as internal constants.
+        //
+        // NOTE: this is a silent behavior change. These used to be per-mount
+        // tunables (legacy keys `opendal.read_chunk_size_in_bytes` /
+        // `opendal.read_concurrent`). Existing mounts that still carry those keys
+        // are now ignored -- not rejected -- so the values below always win.
+        let read_chunk_size = Self::DEFAULT_READ_CHUNK_SIZE.max(1);
+        let read_concurrent = Self::DEFAULT_READ_CONCURRENT.max(1);
+
         Ok(Self {
             retry_times,
             connect_timeout,
             read_timeout,
             retry_interval_ms,
             retry_max_delay_ms,
+            read_chunk_size,
+            read_concurrent,
         })
     }
 
@@ -286,5 +311,36 @@ impl Deref for OssHdfsConf {
 
     fn deref(&self) -> &Self::Target {
         &self.properties
+    }
+}
+
+#[cfg(test)]
+mod opendal_conf_tests {
+    use super::OpendalConf;
+    use std::collections::HashMap;
+
+    #[test]
+    fn defaults_when_unset() {
+        let conf = OpendalConf::from_map(&HashMap::new()).unwrap();
+        assert_eq!(conf.read_chunk_size, OpendalConf::DEFAULT_READ_CHUNK_SIZE);
+        assert_eq!(conf.read_concurrent, OpendalConf::DEFAULT_READ_CONCURRENT);
+        // Locks in the tuned defaults (16 MiB chunk, 2 concurrent range GETs).
+        assert_eq!(conf.read_chunk_size, 16 * 1024 * 1024);
+        assert_eq!(conf.read_concurrent, 2);
+    }
+
+    #[test]
+    fn read_tuning_is_not_user_overridable() {
+        // read_chunk_size / read_concurrent are internal constants now: any mount
+        // property with those (legacy) keys must be ignored, not applied.
+        let mut props = HashMap::new();
+        props.insert(
+            "opendal.read_chunk_size_in_bytes".to_string(),
+            "1024".to_string(),
+        );
+        props.insert("opendal.read_concurrent".to_string(), "32".to_string());
+        let conf = OpendalConf::from_map(&props).unwrap();
+        assert_eq!(conf.read_chunk_size, OpendalConf::DEFAULT_READ_CHUNK_SIZE);
+        assert_eq!(conf.read_concurrent, OpendalConf::DEFAULT_READ_CONCURRENT);
     }
 }
