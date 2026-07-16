@@ -43,6 +43,16 @@ fn test_filesystem_end_to_end_operations_on_cluster() -> FsResult<()> {
     conf.client.write_chunk_size_str = "64B".to_string(); // Update string field
     conf.client.metric_report_enable = true;
 
+    // A file's block size may be overridden independently of the client default.
+    // Verify both remote and short-circuit writers use the file metadata value.
+    let mut override_conf = conf.clone();
+    override_conf.client.block_size = 64;
+    override_conf.client.block_size_str = "64B".to_string();
+    override_conf.client.short_circuit = false;
+    test_file_block_size_override(&testing, &rt, override_conf.clone())?;
+    override_conf.client.short_circuit = true;
+    test_file_block_size_override(&testing, &rt, override_conf)?;
+
     // Test short_circuit = false
     conf.client.short_circuit = false;
     run_filesystem_end_to_end_operations_on_cluster(&testing, &rt, conf.clone())?;
@@ -52,6 +62,44 @@ fn test_filesystem_end_to_end_operations_on_cluster() -> FsResult<()> {
     run_filesystem_end_to_end_operations_on_cluster(&testing, &rt, conf.clone())?;
 
     Ok(())
+}
+
+fn test_file_block_size_override(
+    testing: &Testing,
+    rt: &Arc<AsyncRuntime>,
+    conf: ClusterConf,
+) -> FsResult<()> {
+    let short_circuit = conf.client.short_circuit;
+    let opts = CreateFileOptsBuilder::with_conf(&conf.client)
+        .create_parent(true)
+        .block_size(128)
+        .build();
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+
+    rt.block_on(async move {
+        let path = Path::from_str(format!(
+            "/fs_test/block_size_override_{}.log",
+            short_circuit
+        ))?;
+        let data = vec![0x5a; 192];
+
+        let mut writer = fs.create_with_opts(&path, opts, true).await?;
+        writer.write(&data).await?;
+        writer.complete().await?;
+
+        let status = fs.get_status(&path).await?;
+        assert_eq!(status.block_size, 128);
+        assert_eq!(status.len, data.len() as i64);
+
+        let mut reader = fs.open(&path).await?;
+        let mut actual = BytesMut::zeroed(data.len());
+        let read = reader.read_full(&mut actual).await?;
+        reader.complete().await?;
+
+        assert_eq!(read, data.len());
+        assert_eq!(actual.as_ref(), data.as_slice());
+        Ok(())
+    })
 }
 
 fn run_filesystem_end_to_end_operations_on_cluster(

@@ -41,11 +41,10 @@ impl BlockWriterLocal {
         block: ExtendedBlock,
         worker_address: WorkerAddress,
         pos: i64,
+        block_size: i64,
     ) -> FsResult<Self> {
         let req_id = Utils::req_id();
         let seq_id = 0;
-
-        let block_size = fs_context.block_size();
         let client = fs_context.acquire_write(&worker_address).await?;
         let write_context = client
             .write_block(
