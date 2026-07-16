@@ -224,18 +224,26 @@ impl FuseUtils {
         }
     }
 
-    pub fn fill_open_flags(conf: &FuseConf, v: u32) -> u32 {
-        let mut flags = v;
+    pub fn file_open_flags(conf: &FuseConf, keep_cache: bool) -> u32 {
+        let mut flags = 0;
         if conf.direct_io {
             flags |= FUSE_FOPEN_DIRECT_IO;
-        } else {
+        } else if keep_cache {
             flags |= FUSE_FOPEN_KEEP_CACHE;
-        }
-        if conf.cache_readdir {
-            flags |= FUSE_FOPEN_CACHE_DIR
+        } else if conf.open_direct_on_stale {
+            flags |= FUSE_FOPEN_DIRECT_IO;
         }
         if conf.non_seekable {
-            flags |= FUSE_FOPEN_NONSEEKABLE
+            flags |= FUSE_FOPEN_NONSEEKABLE;
+        }
+
+        flags
+    }
+
+    pub fn dir_open_flags(conf: &FuseConf) -> u32 {
+        let mut flags = Self::file_open_flags(conf, true);
+        if conf.cache_readdir {
+            flags |= FUSE_FOPEN_CACHE_DIR;
         }
 
         flags
@@ -445,6 +453,65 @@ impl FuseUtils {
 mod tests {
     use super::*;
     use crate::raw::fuse_abi::fuse_setattr_in;
+
+    #[test]
+    fn file_open_flags_are_built_only_from_response_flags() {
+        let mut conf = FuseConf::default();
+
+        assert_eq!(
+            FuseUtils::file_open_flags(&conf, true),
+            FUSE_FOPEN_KEEP_CACHE
+        );
+        assert_eq!(FuseUtils::file_open_flags(&conf, false), 0);
+
+        conf.open_direct_on_stale = true;
+        assert_eq!(
+            FuseUtils::file_open_flags(&conf, false),
+            FUSE_FOPEN_DIRECT_IO
+        );
+
+        conf.non_seekable = true;
+        assert_eq!(
+            FuseUtils::file_open_flags(&conf, false),
+            FUSE_FOPEN_DIRECT_IO | FUSE_FOPEN_NONSEEKABLE
+        );
+
+        conf.direct_io = true;
+        assert_eq!(
+            FuseUtils::file_open_flags(&conf, true),
+            FUSE_FOPEN_DIRECT_IO | FUSE_FOPEN_NONSEEKABLE
+        );
+
+        let request_only_flags = (libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND) as u32;
+        assert_eq!(
+            FuseUtils::file_open_flags(&conf, true) & request_only_flags,
+            0
+        );
+    }
+
+    #[test]
+    fn cache_dir_flag_is_limited_to_directory_responses() {
+        let mut conf = FuseConf {
+            cache_readdir: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            FuseUtils::file_open_flags(&conf, true),
+            FUSE_FOPEN_KEEP_CACHE
+        );
+        assert_eq!(
+            FuseUtils::dir_open_flags(&conf),
+            FUSE_FOPEN_KEEP_CACHE | FUSE_FOPEN_CACHE_DIR
+        );
+
+        conf.direct_io = true;
+        conf.non_seekable = true;
+        assert_eq!(
+            FuseUtils::dir_open_flags(&conf),
+            FUSE_FOPEN_DIRECT_IO | FUSE_FOPEN_NONSEEKABLE | FUSE_FOPEN_CACHE_DIR
+        );
+    }
 
     #[test]
     fn setattr_preserves_millisecond_from_nsec() {
