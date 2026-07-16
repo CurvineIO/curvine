@@ -59,7 +59,8 @@ impl FuseMnt {
     }
 
     fn create_task_fd(&self, clone: bool) -> IOResult<BorrowedFd> {
-        let clone_fd = if clone && *UNIX_KERNEL_VERSION >= FUSE_CLONE_FD_MIN_VERSION {
+        let kernel_version = *UNIX_KERNEL_VERSION;
+        let clone_fd = if clone && kernel_version >= FUSE_CLONE_FD_MIN_VERSION {
             match FuseUtils::fuse_clone_fd(self.fd) {
                 Ok(clone_fd) => {
                     debug!("Fuse clone fd, {} -> {}", self.fd, clone_fd);
@@ -68,9 +69,9 @@ impl FuseMnt {
 
                 Err(e) => {
                     error!(
-                        "clone fd failed, will fall back to shared fd mode; kernel version: {},\
+                        "clone fd failed, will fall back to shared fd mode; kernel version: {}.{},\
                      source fd {}, cause: {}",
-                        *UNIX_KERNEL_VERSION, self.fd, e
+                        kernel_version.0, kernel_version.1, self.fd, e
                     );
                     sys::dup(self.fd)?
                 }

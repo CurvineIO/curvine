@@ -179,7 +179,7 @@ pub const FATTR_ATIME_NOW: u32 = 1 << 7;
 pub const FATTR_MTIME_NOW: u32 = 1 << 8;
 
 // The minimum version of the clone fd feature can be used.
-pub const FUSE_CLONE_FD_MIN_VERSION: f32 = 4.2f32;
+pub const FUSE_CLONE_FD_MIN_VERSION: (u32, u32) = (4, 2);
 
 pub const FUSE_NOTIFY_UNIQUE: u64 = 0;
 
@@ -187,4 +187,4 @@ pub const STATE_FILE_MAGIC: &[u8; 4] = b"cvfs";
 
 pub const STATE_FILE_VERSION: u64 = 1;
 
-pub static UNIX_KERNEL_VERSION: Lazy<f32> = Lazy::new(FuseUtils::get_kernel_version);
+pub static UNIX_KERNEL_VERSION: Lazy<(u32, u32)> = Lazy::new(FuseUtils::get_kernel_version);
