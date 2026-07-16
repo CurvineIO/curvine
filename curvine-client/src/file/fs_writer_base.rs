@@ -219,7 +219,13 @@ impl FsWriterBase {
                                 } else {
                                     lb
                                 };
-                                BlockWriter::new(self.fs_context.clone(), lb, off).await?
+                                BlockWriter::new(
+                                    self.fs_context.clone(),
+                                    lb,
+                                    off,
+                                    self.file_blocks.status.block_size,
+                                )
+                                .await?
                             }
                         };
 
@@ -242,8 +248,13 @@ impl FsWriterBase {
                             )
                             .await?;
                         self.file_blocks.add_block(lb.clone())?;
-                        let writer =
-                            BlockWriter::new(self.fs_context.clone(), lb.clone(), 0).await?;
+                        let writer = BlockWriter::new(
+                            self.fs_context.clone(),
+                            lb.clone(),
+                            0,
+                            self.file_blocks.status.block_size,
+                        )
+                        .await?;
 
                         self.cur_writer.replace(writer);
                     }
@@ -331,6 +342,7 @@ impl FsWriterBase {
         // Step 2: Execute resize operation
         let file_blocks = self.fs_client.resize(&self.path, opts).await?;
         let mut file_blocks = WriteFileBlocks::new(file_blocks);
+        let block_size = file_blocks.status.block_size;
         if file_blocks.len() != len {
             return err_box!(
                 "Cannot resize file: {}, expect len {}, actual len {}",
@@ -344,7 +356,8 @@ impl FsWriterBase {
         // At most one such block exists.
         for lb in &mut file_blocks.block_locs {
             if lb.should_resize() {
-                let mut writer = BlockWriter::new(self.fs_context.clone(), lb.clone(), 0).await?;
+                let mut writer =
+                    BlockWriter::new(self.fs_context.clone(), lb.clone(), 0, block_size).await?;
                 let commit_block = writer.complete().await?;
                 self.file_blocks.add_commit(commit_block)?;
             }

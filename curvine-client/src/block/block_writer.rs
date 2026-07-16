@@ -109,6 +109,7 @@ impl WriterAdapter {
         located_block: &LocatedBlock,
         worker_addr: &WorkerAddress,
         pos: i64,
+        block_size: i64,
     ) -> FsResult<Self> {
         let conf = &fs_context.conf.client;
         // SPDK bypasses kernel — no local path for writes
@@ -122,6 +123,7 @@ impl WriterAdapter {
                 located_block.block.clone(),
                 worker_addr.clone(),
                 pos,
+                block_size,
             )
             .await?;
             Local(writer)
@@ -131,6 +133,7 @@ impl WriterAdapter {
                 located_block.block.clone(),
                 worker_addr.clone(),
                 pos,
+                block_size,
             )
             .await?;
             Remote(writer)
@@ -147,14 +150,20 @@ pub struct BlockWriter {
 }
 
 impl BlockWriter {
-    pub async fn new(fs_context: Arc<FsContext>, locate: LocatedBlock, pos: i64) -> FsResult<Self> {
+    pub async fn new(
+        fs_context: Arc<FsContext>,
+        locate: LocatedBlock,
+        pos: i64,
+        block_size: i64,
+    ) -> FsResult<Self> {
         if locate.locs.is_empty() {
             return err_box!("There is no available worker");
         }
 
         let mut inners = Vec::with_capacity(locate.locs.len());
         for addr in &locate.locs {
-            let adapter = WriterAdapter::new(fs_context.clone(), &locate, addr, pos).await?;
+            let adapter =
+                WriterAdapter::new(fs_context.clone(), &locate, addr, pos, block_size).await?;
             inners.push(adapter);
         }
 
