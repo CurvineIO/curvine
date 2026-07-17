@@ -116,6 +116,17 @@ pub const FUSE_AUTO_INVAL_DATA: u32 = 1 << 12;
 /// `LOOKUP(nodeid, ".")` / `LOOKUP(nodeid, "..")` reconstruction.
 pub const FUSE_EXPORT_SUPPORT: u32 = 1 << 4;
 
+/// Kernel init capability bit: the daemon handles O_TRUNC atomically inside
+/// `open`, so the kernel skips the follow-up SETATTR(size=0). Curvine's `open`
+/// does NOT truncate, so this bit must never be advertised -- otherwise
+/// O_TRUNC is silently lost when a writer for the inode already exists (the
+/// shared writer ignores the second open's flags). See issue #1122.
+///
+/// Value `1 << 3` per:
+///   - linux/fuse.h:339        `#define FUSE_ATOMIC_O_TRUNC     (1 << 3)`
+///   - fuse3/fuse_common.h:158 `#define FUSE_CAP_ATOMIC_O_TRUNC (1 << 3)`
+pub const FUSE_ATOMIC_O_TRUNC: u32 = 1 << 3;
+
 pub const FUSE_MAX_NAME_LENGTH: usize = 255;
 
 /// Placeholder for the statfs `files`/`ffree` counts (total/free inodes) when the
