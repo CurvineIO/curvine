@@ -121,8 +121,9 @@ impl BackendHandle {
             let writer_ver = writer.write_ver();
             let read_ver = self.read_ver.get();
             if read_ver != writer_ver {
-                writer.flush(None).await?;
+                let result = writer.flush(None).await;
                 state.invalidate_file_blocks(self.ino);
+                result?;
 
                 let path = reader.path().clone();
                 let new_reader = state.open_reader(Some(self.ino), &path).await?;
@@ -169,8 +170,9 @@ impl BackendHandle {
 
     pub async fn flush(&self, state: &NodeState, reply: Option<FuseResponse>) -> FuseResult<()> {
         if let Some(writer) = &self.writer {
-            writer.flush(reply).await?;
+            let result = writer.flush(reply).await;
             state.invalidate_file_blocks(self.ino);
+            result?;
         } else if let Some(reply) = reply {
             reply.send_rep(Ok::<(), FuseError>(())).await?;
         }

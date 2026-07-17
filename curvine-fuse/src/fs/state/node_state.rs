@@ -409,7 +409,9 @@ impl NodeState {
             return Ok(self.wrap_reader(unified));
         }
 
-        self.record_blocks_cache(CACHE_RESULT_MISS);
+        if self.enable_meta_cache {
+            self.record_blocks_cache(CACHE_RESULT_MISS);
+        }
         let unified = self.fs.open(path).await?;
         if self.enable_meta_cache {
             if let (Some(ino), UnifiedReader::Cv(reader)) = (ino, &unified) {
@@ -421,8 +423,9 @@ impl NodeState {
 
     pub async fn flush_writer(&self, ino: u64) -> FuseResult<()> {
         if let Some(existing_writer) = self.find_writer(ino).await {
-            existing_writer.flush(None).await?;
+            let result = existing_writer.flush(None).await;
             self.invalidate_file_blocks(ino);
+            result?;
         }
         Ok(())
     }

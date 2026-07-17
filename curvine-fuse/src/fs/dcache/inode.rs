@@ -326,3 +326,51 @@ impl DerefMut for Inode {
         &mut self.status
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Inode;
+    use curvine_common::state::{FileBlocks, FileStatus, LocatedBlock};
+
+    fn file_status(len: i64, mtime: i64) -> FileStatus {
+        let mut status = FileStatus::with_name(42, "file".to_owned(), false);
+        status.len = len;
+        status.mtime = mtime;
+        status
+    }
+
+    #[test]
+    fn file_blocks_put_get_and_expire() {
+        let mut inode = Inode::with_status(42, 1, "file", file_status(10, 1));
+        let blocks = FileBlocks::new(file_status(20, 2), vec![LocatedBlock::default()]);
+
+        assert!(inode.get_file_blocks(60_000).is_none());
+
+        inode.put_file_blocks(&blocks);
+        let cached = inode
+            .get_file_blocks(60_000)
+            .expect("put file blocks should make them available");
+        assert_eq!(cached.status.id, 42);
+        assert_eq!(cached.status.name, "file");
+        assert_eq!(cached.status.len, 20);
+        assert_eq!(cached.status.mtime, 2);
+        assert_eq!(cached.block_locs.len(), 1);
+
+        inode.last_access = 0;
+        assert!(inode.get_file_blocks(0).is_none());
+    }
+
+    #[test]
+    fn file_blocks_are_invalidated_explicitly_and_on_status_change() {
+        let mut inode = Inode::with_status(42, 1, "file", file_status(10, 1));
+        let blocks = FileBlocks::new(file_status(10, 1), vec![LocatedBlock::default()]);
+
+        inode.put_file_blocks(&blocks);
+        inode.invalidate_file_blocks();
+        assert!(inode.get_file_blocks(60_000).is_none());
+
+        inode.put_file_blocks(&blocks);
+        inode.update_status(file_status(11, 2));
+        assert!(inode.get_file_blocks(60_000).is_none());
+    }
+}
