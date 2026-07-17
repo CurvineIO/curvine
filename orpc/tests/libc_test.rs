@@ -100,7 +100,9 @@ fn test_cache_manager_read_ahead_optimization() {
 #[cfg(target_os = "linux")]
 #[test]
 fn test_tmpfs_filesystem_detection_on_linux() {
-    assert!(sys::is_tmpfs("/run").unwrap());
+    assert!(["/dev/shm", "/run"]
+        .iter()
+        .any(|path| sys::is_tmpfs(path).unwrap_or(false)));
     assert!(!sys::is_tmpfs("/").unwrap());
 }
 

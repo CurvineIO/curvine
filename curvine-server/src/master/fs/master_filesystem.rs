@@ -775,6 +775,14 @@ impl MasterFilesystem {
         reports.retain(|_, report| {
             now.saturating_sub(report.update_time_ms) <= FULL_BLOCK_REPORT_TTL_MS
         });
+        if reports
+            .get(&list.worker_id)
+            .map(|report| report.invalidated)
+            .unwrap_or(false)
+        {
+            reports.remove(&list.worker_id);
+        }
+
         let report = reports
             .entry(list.worker_id)
             .or_insert_with(|| FullBlockReportState {
@@ -783,11 +791,6 @@ impl MasterFilesystem {
                 reported_blocks: HashSet::with_capacity(list.total_len as usize),
                 invalidated: false,
             });
-
-        if report.invalidated {
-            report.update_time_ms = now;
-            return None;
-        }
 
         if report.total_len != list.total_len {
             warn!(
@@ -825,17 +828,11 @@ impl MasterFilesystem {
     fn invalidate_full_block_report_session(&self, worker_id: u32) {
         let now = LocalTime::mills();
         let mut reports = self.full_block_reports.lock();
-        let report = reports
-            .entry(worker_id)
-            .or_insert_with(|| FullBlockReportState {
-                total_len: 0,
-                update_time_ms: now,
-                reported_blocks: HashSet::new(),
-                invalidated: true,
-            });
-        report.update_time_ms = now;
-        report.reported_blocks.clear();
-        report.invalidated = true;
+        if let Some(report) = reports.get_mut(&worker_id) {
+            report.update_time_ms = now;
+            report.reported_blocks.clear();
+            report.invalidated = true;
+        }
     }
 
     fn invalidate_full_block_state(&self, worker_id: u32) {

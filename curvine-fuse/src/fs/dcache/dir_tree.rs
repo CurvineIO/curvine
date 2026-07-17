@@ -198,11 +198,10 @@ impl DirTree {
             }
 
             None => {
-                let inode = (status.id > FUSE_ROOT_ID as i64)
-                    .then(|| self.get_inode(status.id as u64, None))
-                    .flatten();
-
-                let ino = match inode {
+                match (status.id > FUSE_ROOT_ID as i64)
+                    .then_some(status.id as u64)
+                    .and_then(|ino| self.get_inode_mut(ino, None))
+                {
                     Some(inode) => {
                         if inode.is_deleted() {
                             return err_fuse!(
@@ -211,15 +210,21 @@ impl DirTree {
                                 inode.ino
                             );
                         }
+
+                        inode.add_lookup(1);
+                        inode.add_ref(1);
+                        inode.update_status(status);
+                        inode.parent = parent;
+                        inode.name = name.to_string();
                         inode.ino
                     }
-
-                    None => self.next_id(status.id),
-                };
-
-                self.inodes
-                    .insert(ino, Inode::with_status(ino, parent, name, status));
-                ino
+                    None => {
+                        let ino = self.next_id(status.id);
+                        self.inodes
+                            .insert(ino, Inode::with_status(ino, parent, name, status));
+                        ino
+                    }
+                }
             }
         };
 
@@ -231,18 +236,26 @@ impl DirTree {
     }
 
     pub fn unlink(&mut self, parent: u64, name: &str, mark_delete: bool) -> FuseResult<()> {
-        let inode = self.get_inode_mut_check(parent, Some(name))?;
-        if mark_delete {
-            inode.mark_delete = true;
-        }
-        inode.sub_ref(1);
-        inode.sub_link(1);
+        let ino;
+        let should_unref = {
+            let inode = self.get_inode_mut_check(parent, Some(name))?;
+            if mark_delete {
+                inode.mark_delete = true;
+            }
+            inode.sub_ref(1);
+            inode.sub_link(1);
+            ino = inode.ino;
+            inode.should_unref()
+        };
 
         // Remove directory entry; keep parent inode's `DirEntry` even when `children` is empty.
         let dir = self.get_dir_mut_check(parent)?;
         dir.remove_child(name);
         if mark_delete {
             dir.mark_deleted_child(name);
+        }
+        if should_unref {
+            self.remove_inode(ino);
         }
 
         Ok(())

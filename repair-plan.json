@@ -1,0 +1,57 @@
+{
+  "schema_version": "1.0",
+  "run_id": "20260717T150708Z-dc4f3876",
+  "head_sha": "bbaef66e2911b08d24da87be84a7fe7d94681e75",
+  "fingerprint": "sha256:5cf90b24abcd8e38ba95ef0580e4bf51fd3b01df3b5700488f8243f8768bce8e",
+  "root_cause_hypothesis": "Eight of nine integration failures share three root causes: (1) Utils::test_file calls create_parent_dir on ../testing which does not create the testing directory itself, causing ENOENT in state_file/raft_snapshot tests; (2) DirTree::lookup re-inserts inodes for existing server IDs and unlink does not remove zero-ref inodes; (3) collect_full_block_report returns early on invalidated sessions without clearing state, so subsequent full reports never reconcile stale locations. Tmpfs tests hard-code /run which is not tmpfs on oppo-arm-native. Replication integrity failure reproduced in harness but passed locally after unrelated fixes; treated as residual/flaky risk pending harness re-run.",
+  "affected_modules": [
+    "orpc/src/common/utils.rs",
+    "orpc/tests/libc_test.rs",
+    "orpc/tests/pipe_test.rs",
+    "curvine-fuse/src/fs/dcache/dir_tree.rs",
+    "curvine-server/src/master/fs/master_filesystem.rs"
+  ],
+  "planned_changes": [
+    "Make Utils::testing_root/test_file/test_sub_dir create the testing directory (with tempdir fallback)",
+    "Fix DirTree::lookup to update existing inode in place and DirTree::unlink to remove_inode when should_unref",
+    "On invalidated full-block-report sessions, drop state so the next full report can collect and reconcile",
+    "Relax tmpfs detection tests to accept /dev/shm or /run",
+    "Investigate and fix replication/journal failures if still reproducible after above"
+  ],
+  "not_goals": [
+    "No harness runner or CI workflow changes",
+    "No dependency upgrades or Cargo.lock churn",
+    "No unrelated FUSE/master refactors",
+    "No GitHub PR/push/image publish in current integration phase",
+    "No changes to port 9000 services or nailu cluster"
+  ],
+  "verification_plan": [
+    "cargo fmt --all -- --check",
+    "cargo clippy -p orpc -p curvine-fuse -p curvine-server --tests -- -D warnings",
+    "cargo test -p curvine-common --lib -- test_write_read",
+    "cargo test -p curvine-common --test raft_snapshot_file_test",
+    "cargo test -p curvine-fuse --lib -- create_then_forget_then_unlink create_lookup_rename_link_unlink_forget_keeps_tree_consistent lookup_existing_server_id_updates_inode_path_without_reinsert",
+    "cargo test -p orpc --test libc_test -- test_tmpfs_filesystem_detection_on_linux",
+    "cargo test -p orpc --test pipe_test -- test_tmpfs_filesystem_detection",
+    "cargo test -p curvine-server --test master_fs_test -- full_block_report_reconcile_removes_stale_location_async",
+    "cargo test -p curvine-tests --test replication_test -- --test-threads=1",
+    "cargo test -p curvine-server --test journal_test -- test_raft_consensus_and_state_synchronization_between_two_masters"
+  ],
+  "estimated_source_lines": 120,
+  "risk": {
+    "level": "medium",
+    "policy_version": 1,
+    "matched_rules": [
+      "fuse_dcache_lookup_unlink_semantics",
+      "master_full_block_report_session_lifecycle"
+    ],
+    "changed_paths": [
+      "orpc/src/common/utils.rs",
+      "orpc/tests/libc_test.rs",
+      "orpc/tests/pipe_test.rs",
+      "curvine-fuse/src/fs/dcache/dir_tree.rs",
+      "curvine-server/src/master/fs/master_filesystem.rs",
+      "repair-plan.json"
+    ]
+  }
+}

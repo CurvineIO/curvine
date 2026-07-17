@@ -16,6 +16,8 @@
 #[test]
 fn test_tmpfs_filesystem_detection() {
     use orpc::sys;
-    assert!(sys::is_tmpfs("/run").unwrap());
+    assert!(["/dev/shm", "/run"]
+        .iter()
+        .any(|path| sys::is_tmpfs(path).unwrap_or(false)));
     assert!(!sys::is_tmpfs("/").unwrap());
 }

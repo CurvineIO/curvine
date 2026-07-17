@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{FileUtils, LocalTime};
+use crate::common::LocalTime;
 use crate::runtime::Runtime;
 use crate::CommonResult;
 use md5::{Digest, Md5};
@@ -143,24 +143,39 @@ impl Utils {
         format!("{}", path.display())
     }
 
-    // Returns a test file name.Located in the testing directory.
-    pub fn test_file() -> String {
+    fn testing_root() -> PathBuf {
         let mut path = env::current_dir().unwrap_or(PathBuf::from("."));
         path.push("../testing");
+        if fs::create_dir_all(&path).is_ok() {
+            return path;
+        }
 
-        // Ensure the testing directory exists
-        let _ = FileUtils::create_parent_dir(&path, true);
+        let mut path = env::temp_dir();
+        path.push("curvine-testing");
+        let _ = fs::create_dir_all(&path);
+        path
+    }
 
+    // Returns a test file name.Located in the testing directory.
+    pub fn test_file() -> String {
+        let mut path = Self::testing_root();
         path.push(format!("test-{}", Self::rand_id()));
         format!("{}", path.display())
     }
 
     pub fn test_sub_dir<T: AsRef<Path>>(sub: T) -> String {
-        let mut path = env::current_dir().unwrap_or(PathBuf::from("."));
-        path.push("../testing");
+        let sub = sub.as_ref();
+        let mut path = Self::testing_root();
         path.push(sub);
 
         // Ensure the sub directory exists
+        if fs::create_dir_all(&path).is_ok() {
+            return format!("{}", path.display());
+        }
+
+        let mut path = env::temp_dir();
+        path.push("curvine-testing");
+        path.push(sub);
         let _ = fs::create_dir_all(&path);
 
         format!("{}", path.display())
