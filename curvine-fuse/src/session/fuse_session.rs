@@ -295,10 +295,12 @@ impl<T: FileSystem> FuseSession<T> {
 
                 // Record the shutdown intent BEFORE persist: sigusr1_persist
                 // denotes intent, not a completed unmount (persist success/failure
-                // is a separate state_persist_total{status}). A run_all or persist
-                // error below may return before the explicit fs.unmount() hook;
-                // FuseMnt drop still unmounts, and RunCleanupGuard aborts the
-                // watcher and sets health 0 on those paths.
+                // is a separate state_persist_total{status}). A run_all error
+                // returns before persist, so `mnts` still auto-unmounts on drop.
+                // A persist error may occur after `persist_inner` disables
+                // `auto_unmount` for fd inheritance, so those mounts remain mounted.
+                // RunCleanupGuard still aborts the watcher and sets health 0 on
+                // either path.
                 shutdown_once.record_once(SHUTDOWN_SIGUSR1_PERSIST);
                 let _ = self.shutdown_tx.send(true);
                 if let Err(e) = flatten_run_all_result(run_all_handle.await) {
