@@ -119,11 +119,13 @@ impl BackendHandle {
 
         if let Some(writer) = state.find_writer(self.ino).await {
             let writer_ver = writer.write_ver();
-            if self.read_ver.get() != writer_ver {
+            let read_ver = self.read_ver.get();
+            if read_ver != writer_ver {
                 writer.flush(None).await?;
+                state.invalidate_file_blocks(self.ino);
 
                 let path = reader.path().clone();
-                let new_reader = state.new_reader(&path).await?;
+                let new_reader = state.open_reader(Some(self.ino), &path).await?;
                 // Refresh the handle's status snapshot from the freshly reopened
                 // reader before installing it, so `status()` reflects the current
                 // file (length/mtime) after a dirty-read reopen rather than the
@@ -165,9 +167,10 @@ impl BackendHandle {
         }
     }
 
-    pub async fn flush(&self, reply: Option<FuseResponse>) -> FuseResult<()> {
+    pub async fn flush(&self, state: &NodeState, reply: Option<FuseResponse>) -> FuseResult<()> {
         if let Some(writer) = &self.writer {
             writer.flush(reply).await?;
+            state.invalidate_file_blocks(self.ino);
         } else if let Some(reply) = reply {
             reply.send_rep(Ok::<(), FuseError>(())).await?;
         }
@@ -266,7 +269,7 @@ impl BackendHandle {
         };
 
         let reader = if has_reader {
-            let reader = state.new_reader(&path).await?;
+            let reader = state.open_reader(Some(ino), &path).await?;
             Some(RawPtr::from_owned(reader))
         } else {
             None

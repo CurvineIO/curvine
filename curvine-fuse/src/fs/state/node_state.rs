@@ -17,21 +17,23 @@ use crate::fs::state::file_handle::FileHandle;
 use crate::fs::state::DirHandle;
 use crate::fs::{FuseReader, FuseWriter};
 use crate::fuse_metrics::{
-    StateStageTimer, CACHE_RESULT_HIT, CACHE_RESULT_MISS, CACHE_RESULT_PUT, CACHE_STATUS,
-    STATE_KIND_DIR_HANDLES, STATE_KIND_FILE_HANDLES, STATE_KIND_NODE_MAP, STATE_STAGE_DIR_HANDLES,
-    STATE_STAGE_FILE_HANDLES, STATE_STAGE_NODE_MAP,
+    StateStageTimer, CACHE_BLOCKS, CACHE_RESULT_HIT, CACHE_RESULT_MISS, CACHE_RESULT_PUT,
+    CACHE_STATUS, STATE_KIND_DIR_HANDLES, STATE_KIND_FILE_HANDLES, STATE_KIND_NODE_MAP,
+    STATE_STAGE_DIR_HANDLES, STATE_STAGE_FILE_HANDLES, STATE_STAGE_NODE_MAP,
 };
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{
     err_fuse, FuseError, FuseMetrics, FuseResult, FuseUtils, FUSE_CURRENT_DIR, FUSE_PARENT_DIR,
     FUSE_ROOT_ID, STATE_FILE_MAGIC, STATE_FILE_VERSION,
 };
-use curvine_client::unified::UnifiedFileSystem;
+use curvine_client::file::FsReader;
+use curvine_client::unified::{UnifiedFileSystem, UnifiedReader};
 use curvine_common::conf::{ClientConf, ClusterConf, FuseConf};
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, ListStream, Path, StateReader, StateWriter};
 use curvine_common::state::{
-    CreateFileOpts, FileAllocOpts, FileStatus, ListOptions, MkdirOpts, OpenFlags, SetAttrOpts,
+    CreateFileOpts, FileAllocOpts, FileBlocks, FileStatus, ListOptions, MkdirOpts, OpenFlags,
+    SetAttrOpts,
 };
 use futures::stream::{self, StreamExt};
 use log::{debug, error, info, warn};
@@ -369,15 +371,58 @@ impl NodeState {
         )))
     }
 
-    pub async fn new_reader(&self, path: &Path) -> FuseResult<FuseReader> {
-        let reader = self.fs.open(path).await?;
-        let reader = FuseReader::new(&self.conf, self.fs.clone_runtime(), reader);
-        Ok(reader)
+    fn get_file_blocks(&self, ino: Option<u64>) -> Option<FileBlocks> {
+        if !self.enable_meta_cache {
+            return None;
+        }
+        let ino = ino?;
+        self.dir_read()
+            .get_inode(ino, None)
+            .and_then(|inode| inode.get_file_blocks(self.meta_cache_ttl))
+    }
+
+    fn wrap_reader(&self, unified: UnifiedReader) -> FuseReader {
+        FuseReader::new(&self.conf, self.fs.clone_runtime(), unified)
+    }
+
+    fn put_file_blocks(&self, ino: u64, blocks: &FileBlocks) {
+        if let Some(inode) = self.dir_write().get_inode_mut(ino, None) {
+            inode.put_file_blocks(blocks);
+            self.record_blocks_cache(CACHE_RESULT_PUT);
+        }
+    }
+
+    pub fn invalidate_file_blocks(&self, ino: u64) {
+        if let Some(inode) = self.dir_write().get_inode_mut(ino, None) {
+            inode.invalidate_file_blocks();
+        }
+    }
+
+    pub async fn open_reader(&self, ino: Option<u64>, path: &Path) -> FuseResult<FuseReader> {
+        if let Some(blocks) = self.get_file_blocks(ino) {
+            self.record_blocks_cache(CACHE_RESULT_HIT);
+            let unified = UnifiedReader::Cv(FsReader::new(
+                path.clone(),
+                self.fs.fs_context().clone(),
+                blocks,
+            )?);
+            return Ok(self.wrap_reader(unified));
+        }
+
+        self.record_blocks_cache(CACHE_RESULT_MISS);
+        let unified = self.fs.open(path).await?;
+        if self.enable_meta_cache {
+            if let (Some(ino), UnifiedReader::Cv(reader)) = (ino, &unified) {
+                self.put_file_blocks(ino, reader.file_blocks());
+            }
+        }
+        Ok(self.wrap_reader(unified))
     }
 
     pub async fn flush_writer(&self, ino: u64) -> FuseResult<()> {
         if let Some(existing_writer) = self.find_writer(ino).await {
             existing_writer.flush(None).await?;
+            self.invalidate_file_blocks(ino);
         }
         Ok(())
     }
@@ -393,7 +438,7 @@ impl NodeState {
 
         // Read-only: only a reader, no writer to register in the writers map.
         if mode == OpenFlags::RDONLY {
-            let reader = self.new_reader(path).await?;
+            let reader = self.open_reader(ino, path).await?;
             let mut status = reader.status().clone();
             let ino = ino.unwrap_or(self.next_ino(&status));
             status.id = ino as i64;
@@ -436,7 +481,7 @@ impl NodeState {
                 );
                 None
             } else {
-                let reader = self.new_reader(path).await?;
+                let reader = self.open_reader(Some(ino), path).await?;
                 Some(RawPtr::from_owned(reader))
             }
         } else {
@@ -589,7 +634,7 @@ impl NodeState {
                     .await;
 
                 if !released {
-                    handle.flush(None).await
+                    handle.flush(self, None).await
                 } else {
                     res
                 }
@@ -781,6 +826,12 @@ impl NodeState {
     fn record_status_cache(&self, status: &'static str) {
         if self.conf.metrics_enabled {
             FuseMetrics::with(|m| m.record_user_meta_cache(CACHE_STATUS, status));
+        }
+    }
+
+    fn record_blocks_cache(&self, status: &'static str) {
+        if self.conf.metrics_enabled {
+            FuseMetrics::with(|m| m.record_user_meta_cache(CACHE_BLOCKS, status));
         }
     }
 

@@ -83,9 +83,9 @@ impl FileHandle {
         }
     }
 
-    pub async fn flush(&self, reply: Option<FuseResponse>) -> FuseResult<()> {
+    pub async fn flush(&self, state: &NodeState, reply: Option<FuseResponse>) -> FuseResult<()> {
         match self {
-            FileHandle::Backend(h) => h.flush(reply).await,
+            FileHandle::Backend(h) => h.flush(state, reply).await,
         }
     }
 

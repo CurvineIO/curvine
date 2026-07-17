@@ -16,7 +16,9 @@ use crate::fs::dcache::{DirEntry, Lifecycle};
 use crate::raw::fuse_abi::fuse_attr;
 use crate::{err_fuse, FuseResult, FuseUtils, FUSE_PATH_SEPARATOR, FUSE_ROOT_ID};
 use curvine_common::conf::FuseConf;
-use curvine_common::state::{FileStatus, LocatedBlock, SetAttrOpts, SetAttrOptsBuilder};
+use curvine_common::state::{
+    FileBlocks, FileStatus, LocatedBlock, SetAttrOpts, SetAttrOptsBuilder,
+};
 use orpc::common::LocalTime;
 use orpc::try_option_mut;
 use serde::{Deserialize, Serialize};
@@ -124,6 +126,10 @@ impl Inode {
             let _ = self.dir.take();
         }
 
+        if self.status.mtime != status.mtime || self.status.len != status.len {
+            self.invalidate_file_blocks();
+        }
+
         status.id = self.ino as i64;
         self.status = status;
 
@@ -134,7 +140,34 @@ impl Inode {
     pub fn invalid_cache(&mut self) {
         if matches!(self.lifecycle, Lifecycle::Cached) {
             self.lifecycle = Lifecycle::Invalid;
+            self.invalidate_file_blocks();
         }
+    }
+
+    pub fn get_file_blocks(&self, ttl: u64) -> Option<FileBlocks> {
+        if self.cache_valid(ttl) {
+            self.locs
+                .as_ref()
+                .map(|locs| FileBlocks::new(self.clone_status(), (**locs).clone()))
+        } else {
+            None
+        }
+    }
+
+    pub fn put_file_blocks(&mut self, blocks: &FileBlocks) {
+        self.locs = Some(Box::new(blocks.block_locs.clone()));
+
+        if !self.is_dirty() {
+            self.status = blocks.status.clone();
+            self.status.id = self.ino as i64;
+
+            self.lifecycle = Lifecycle::Cached;
+            self.last_access = LocalTime::mills();
+        }
+    }
+
+    pub fn invalidate_file_blocks(&mut self) {
+        self.locs.take();
     }
 
     pub fn is_root(&self) -> bool {

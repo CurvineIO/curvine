@@ -890,7 +890,7 @@ impl fs::FileSystem for CurvineFileSystem {
         }
 
         self.fs_unlock(&handle, LockFlags::Plock).await?;
-        handle.flush(Some(reply)).await
+        handle.flush(&self.state, Some(reply)).await
     }
 
     async fn release(&self, op: Release<'_>, reply: FuseResponse) -> FuseResult<()> {
@@ -1067,7 +1067,7 @@ impl fs::FileSystem for CurvineFileSystem {
             self.ensure_writable_path(&path, RpcCode::CreateFile)
                 .await?;
         }
-        handle.flush(Some(reply)).await?;
+        handle.flush(&self.state, Some(reply)).await?;
 
         if handle.has_writer() {
             self.state
