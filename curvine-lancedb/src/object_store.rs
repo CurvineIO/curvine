@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
@@ -924,12 +925,12 @@ impl CurvineObjectStore {
         cv_path: &CurvinePath,
     ) -> OsResult<()> {
         let lock = self.acquire_object_write_lock(location).await?;
-        let result = match self.context.fs.get_status(&cv_path).await {
+        let result = match self.context.fs.get_status(cv_path).await {
             Ok(status) if status.is_dir => Ok(()),
             Ok(_) => {
                 self.context
                     .fs
-                    .delete(&cv_path, false)
+                    .delete(cv_path, false)
                     .await
                     .map_err(|e| fs_error_to_object_store(location, e))?;
                 Ok(())
@@ -1353,7 +1354,7 @@ impl CurvineObjectStore {
             }
         }
 
-        dirs.sort_by(|left, right| right.full_path().len().cmp(&left.full_path().len()));
+        dirs.sort_by_key(|dir| Reverse(dir.full_path().len()));
         for dir in dirs {
             match self.context.fs.delete(&dir, false).await {
                 Ok(()) => {}
