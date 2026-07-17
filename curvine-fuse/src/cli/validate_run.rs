@@ -119,6 +119,26 @@ state_dir = "{}"
     }
 
     #[test]
+    fn validate_config_errors_when_config_file_is_missing() {
+        let conf =
+            std::env::temp_dir().join(format!("cv_validate_missing_{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&conf);
+
+        run_validate_config(args_for(conf.to_str().unwrap()))
+            .expect_err("missing config file must fail validation");
+    }
+
+    #[test]
+    fn validate_config_errors_when_toml_is_invalid() {
+        let conf = write_temp_toml("invalid", "[fuse\nio_threads = 8\n");
+
+        run_validate_config(args_for(conf.to_str().unwrap()))
+            .expect_err("invalid TOML must fail validation");
+
+        let _ = std::fs::remove_file(&conf);
+    }
+
+    #[test]
     fn validate_config_errors_when_state_dir_is_a_file() {
         // Point state_dir at an existing regular file → hard error.
         let file = std::env::temp_dir().join(format!("cv_vc_notdir_{}", std::process::id()));

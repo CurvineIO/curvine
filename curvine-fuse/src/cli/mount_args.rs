@@ -189,17 +189,8 @@ impl FuseRuntimeArgs {
 impl FuseMountArgs {
     /// Parses the cluster configuration file and applies CLI overrides.
     pub fn get_conf(&self) -> CommonResult<ClusterConf> {
-        let mut conf = match ClusterConf::from(&self.conf) {
-            Ok(c) => {
-                println!("Loaded configuration from {}", self.conf);
-                c
-            }
-            Err(e) => {
-                eprintln!("Warning: Failed to load config file '{}': {}", self.conf, e);
-                eprintln!("Using default configuration");
-                Self::create_default_conf()
-            }
-        };
+        let mut conf = ClusterConf::from(&self.conf)?;
+        println!("Loaded configuration from {}", self.conf);
 
         // FUSE configuration - only override if command line values are specified
         if let Some(mnt_path) = &self.mnt_path {
@@ -343,10 +334,6 @@ impl FuseMountArgs {
         conf.fuse.init()?;
 
         Ok(conf)
-    }
-
-    fn create_default_conf() -> ClusterConf {
-        ClusterConf::default()
     }
 
     pub fn default_mnt_opts() -> Vec<String> {
