@@ -47,7 +47,7 @@ use std::time::Duration;
 //    - `open_direct_on_stale` -> per-open fallback to direct I/O only when the
 //      local metadata is detected stale (weaker global impact than `direct_io`).
 //    - `write_back_cache`     -> let the kernel buffer writes (write-back) vs
-//      write-through; interacts with `direct_io` (direct I/O disables it).
+//      write-through; conflicts with `direct_io` and is rejected by `init()`.
 //
 // Rule of thumb: layer 1 tunes how stale the *kernel* may be, layer 2 tunes the
 // process-local metadata caches, and layer 3 decides whether file *data* flows
@@ -265,6 +265,16 @@ impl FuseConf {
 
         if let Some(0) = self.max_readahead_kb {
             return err_box!("fuse.max_readahead_kb must be > 0 when set");
+        }
+
+        // direct_io bypasses the page cache; write_back_cache relies on the kernel
+        // buffering writes in that same page cache. Enabling both is semantically
+        // conflicting, so reject it rather than silently letting one win.
+        if self.direct_io && self.write_back_cache {
+            return err_box!(
+                "fuse.direct_io and fuse.write_back_cache cannot both be enabled: \
+                 direct I/O bypasses the page cache that write-back caching depends on"
+            );
         }
 
         Ok(())
@@ -570,6 +580,44 @@ mod tests {
         };
         conf.init().expect("positive value must be accepted");
         assert_eq!(conf.max_readahead_kb, Some(1024));
+    }
+
+    #[test]
+    fn init_rejects_direct_io_with_write_back_cache() {
+        let mut conf = FuseConf {
+            direct_io: true,
+            write_back_cache: true,
+            ..Default::default()
+        };
+        let err = conf
+            .init()
+            .expect_err("direct_io + write_back_cache must be rejected");
+        assert!(
+            err.to_string().contains("direct_io") && err.to_string().contains("write_back_cache"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn init_allows_direct_io_alone() {
+        let mut conf = FuseConf {
+            direct_io: true,
+            write_back_cache: false,
+            ..Default::default()
+        };
+        conf.init().expect("direct_io alone must be accepted");
+    }
+
+    #[test]
+    fn init_allows_write_back_cache_alone() {
+        let mut conf = FuseConf {
+            direct_io: false,
+            write_back_cache: true,
+            ..Default::default()
+        };
+        conf.init()
+            .expect("write_back_cache alone must be accepted");
     }
 
     #[test]
