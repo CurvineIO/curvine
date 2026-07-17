@@ -17,7 +17,7 @@ use curvine_common::fs::{Path, Reader};
 use curvine_common::state::{FileBlocks, FileStatus};
 use curvine_common::FsResult;
 use log::debug;
-use orpc::common::{ByteUnit, TimeSpent};
+use orpc::common::ByteUnit;
 use orpc::err_box;
 use orpc::sys::DataSlice;
 use std::sync::Arc;
@@ -31,6 +31,7 @@ pub struct FsReader {
     pos: i64,
     len: i64,
     file_blocks: FileBlocks,
+    metrics: &'static crate::ClientMetrics,
 }
 
 impl FsReader {
@@ -55,6 +56,7 @@ impl FsReader {
         );
 
         let inner = FsReaderBuffer::new(path, fs_context, file_blocks.clone(), read_detector)?;
+        let metrics = FsContext::get_metrics();
         let reader = Self {
             inner,
             chunk: DataSlice::Empty,
@@ -62,6 +64,7 @@ impl FsReader {
             pos: 0,
             len,
             file_blocks,
+            metrics,
         };
         Ok(reader)
     }
@@ -101,9 +104,7 @@ impl Reader for FsReader {
     }
 
     async fn read_chunk0(&mut self) -> FsResult<DataSlice> {
-        let _timer =
-            TimeSpent::timer_counter(Arc::new(FsContext::get_metrics().read_time_us.clone()));
-        self.inner.read().await
+        self.metrics.track_read(self.inner.read()).await
     }
 
     async fn seek(&mut self, pos: i64) -> FsResult<()> {

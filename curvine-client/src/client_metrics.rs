@@ -14,12 +14,15 @@
 
 use crate::file::FsContext;
 use curvine_common::state::{MetricType, MetricValue};
-use orpc::common::{Counter, CounterVec, HistogramVec, Metrics as m};
+use curvine_common::FsResult;
+use orpc::common::{Counter, CounterVec, HistogramVec, Metrics as m, TimeSpent};
 use orpc::common::{Gauge, Metrics};
 use orpc::sync::FastDashMap;
+use orpc::sys::DataSlice;
 use orpc::CommonResult;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
+use std::future::Future;
 
 pub struct ClientMetrics {
     pub mount_cache_hits: CounterVec,
@@ -66,6 +69,34 @@ impl ClientMetrics {
         };
 
         Ok(cm)
+    }
+
+    /// Run a write future and record elapsed time; bytes are counted only on success.
+    pub async fn track_write<F>(&self, len: i64, fut: F) -> FsResult<i64>
+    where
+        F: Future<Output = FsResult<()>>,
+    {
+        let spent = TimeSpent::new();
+        let res = fut.await;
+        self.write_time_us.inc_by(spent.used_us() as i64);
+
+        res?;
+        self.write_bytes.inc_by(len);
+        Ok(len)
+    }
+
+    /// Run a read future and record elapsed time; returned bytes are counted on success.
+    pub async fn track_read<F>(&self, fut: F) -> FsResult<DataSlice>
+    where
+        F: Future<Output = FsResult<DataSlice>>,
+    {
+        let spent = TimeSpent::new();
+        let res = fut.await;
+        self.read_time_us.inc_by(spent.used_us() as i64);
+
+        let slice = res?;
+        self.read_bytes.inc_by(slice.len() as i64);
+        Ok(slice)
     }
 
     pub fn text_output(&self) -> CommonResult<String> {
