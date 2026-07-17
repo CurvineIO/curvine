@@ -642,8 +642,9 @@ impl FuseResponse {
     }
 
     pub fn send_none(&self, res: FuseResult<()>) -> IOResult<()> {
-        // No reply is sent to the kernel for Forget/BatchForget, but the request
-        // context must still be finished (guard dropped, result classified).
+        // No reply is sent to the kernel for protocol no-reply operations such as
+        // Forget, BatchForget, and Interrupt, but the request context must still
+        // be finished (guard dropped, result classified).
         self.finish_no_reply(res);
         Ok(())
     }
