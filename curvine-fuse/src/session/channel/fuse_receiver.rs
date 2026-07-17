@@ -626,7 +626,7 @@ impl<T: FileSystem> FuseReceiver<T> {
                 } else {
                     fs.interrupt(op).await
                 };
-                reply.send_rep(res).await
+                reply.send_none(res)
             }
 
             FuseOperator::Symlink(op) => reply.send_rep(fs.symlink(op).await).await,
@@ -773,7 +773,7 @@ mod tests {
         use crate::fuse_metrics::{
             FuseMetrics, FuseReqCtx, FuseReqKind, FuseReqLabels, FuseReqStatus,
         };
-        use crate::raw::fuse_abi::{fuse_forget_in, fuse_in_header};
+        use crate::raw::fuse_abi::{fuse_forget_in, fuse_in_header, fuse_interrupt_in};
         use crate::session::{FuseRequest, FuseResponse, FuseTask};
         use crate::FuseUtils;
         use bytes::{BufMut, BytesMut};
@@ -792,6 +792,7 @@ mod tests {
         const OP_GETATTR: u32 = 3;
         const OP_STATFS: u32 = 17;
         const OP_ACCESS: u32 = 34;
+        const OP_INTERRUPT: u32 = 36;
 
         // Build a raw FUSE request: header (len auto-filled) + payload, then parse.
         fn make_request(opcode: u32, unique: u64, nodeid: u64, payload: &[u8]) -> FuseRequest {
@@ -831,6 +832,13 @@ mod tests {
         fn forget_request(unique: u64) -> FuseRequest {
             let arg = fuse_forget_in { nlookup: 1 };
             make_request(OP_FORGET, unique, 2, FuseUtils::struct_as_bytes(&arg))
+        }
+
+        fn interrupt_request(unique: u64, interrupted_unique: u64) -> FuseRequest {
+            let arg = fuse_interrupt_in {
+                unique: interrupted_unique,
+            };
+            make_request(OP_INTERRUPT, unique, 0, FuseUtils::struct_as_bytes(&arg))
         }
 
         // A reply whose metrics slot is live (active guard backed by a throwaway
@@ -882,6 +890,17 @@ mod tests {
 
         fn fs() -> TestFileSystem {
             TestFileSystem::new(FuseConf::default())
+        }
+
+        struct InterruptTrackingFileSystem {
+            called: Arc<AtomicBool>,
+        }
+
+        impl FileSystem for InterruptTrackingFileSystem {
+            async fn interrupt(&self, _op: crate::fs::operator::Interrupt<'_>) -> FuseResult<()> {
+                self.called.store(true, Ordering::SeqCst);
+                Ok(())
+            }
         }
 
         // (1a) GetAttr succeeds (TestFileSystem returns Ok) -> operation sample
@@ -954,6 +973,68 @@ mod tests {
             assert!(
                 rx.try_recv().unwrap().is_none(),
                 "Forget is no-reply: no task enqueued"
+            );
+        }
+
+        #[tokio::test]
+        async fn interrupt_notifies_pending_request_and_enqueues_nothing() {
+            let interrupted_unique = 2001;
+            let pending = FastDashMap::default();
+            let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+            pending.insert(interrupted_unique, notify.clone());
+            let (reply, mut rx) = metrics_reply(1006, "Interrupt");
+            let fallback_called = Arc::new(AtomicBool::new(false));
+            let fs = InterruptTrackingFileSystem {
+                called: fallback_called.clone(),
+            };
+
+            super::super::FuseReceiver::dispatch_meta(
+                &pending,
+                &fs,
+                &interrupt_request(1006, interrupted_unique),
+                &reply,
+            )
+            .await
+            .unwrap();
+
+            tokio::time::timeout(std::time::Duration::from_secs(1), notify.notified())
+                .await
+                .expect("pending request is notified");
+            assert!(
+                rx.try_recv().unwrap().is_none(),
+                "Interrupt is no-reply: no task enqueued"
+            );
+            assert!(
+                !fallback_called.load(Ordering::SeqCst),
+                "pending request notification is the primary interrupt path"
+            );
+        }
+
+        #[tokio::test]
+        async fn late_interrupt_enqueues_nothing() {
+            let pending = FastDashMap::default();
+            let (reply, mut rx) = metrics_reply(1007, "Interrupt");
+            let fallback_called = Arc::new(AtomicBool::new(false));
+            let fs = InterruptTrackingFileSystem {
+                called: fallback_called.clone(),
+            };
+
+            super::super::FuseReceiver::dispatch_meta(
+                &pending,
+                &fs,
+                &interrupt_request(1007, 2002),
+                &reply,
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                rx.try_recv().unwrap().is_none(),
+                "late Interrupt is no-reply: no task enqueued"
+            );
+            assert!(
+                fallback_called.load(Ordering::SeqCst),
+                "late Interrupt invokes the best-effort filesystem fallback"
             );
         }
 

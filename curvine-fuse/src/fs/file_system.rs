@@ -157,6 +157,10 @@ pub trait FileSystem: Send + Sync + 'static {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
+    /// Best-effort fallback for an interrupt whose target is no longer present in
+    /// the dispatcher's pending-request map. The pending-request notification is
+    /// the primary cancellation path; this result reports internal handling only,
+    /// because the FUSE protocol does not send a reply for the interrupt request.
     fn interrupt(&self, _op: Interrupt<'_>) -> impl Future<Output = FuseResult<()>> + Send {
         async move { Ok(()) }
     }
