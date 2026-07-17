@@ -401,6 +401,7 @@ mod tests {
     // journal address (journal.hostname:rpc_port) resolves to a node id in
     // journal_addrs. When journal_addrs contains a matching entry, it passes.
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn check_master_hostname_net_interface_matching_journal_addr_ok() {
         let mut conf = ClusterConf::default();
         conf.net_interface = "eth0".to_string();
@@ -418,6 +419,7 @@ mod tests {
     // journal_addrs, node_id resolution fails and check_master_hostname must
     // surface a clear error instead of deferring to an opaque raft failure.
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn check_master_hostname_net_interface_missing_journal_addr_errors() {
         let mut conf = ClusterConf::default();
         conf.net_interface = "eth0".to_string();
