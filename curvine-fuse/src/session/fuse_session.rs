@@ -55,7 +55,7 @@ pub struct FuseSession<T> {
 }
 
 /// Phase 3b (P2-1/P2-2/P3-1): closes out a `run()` invocation on EVERY exit path
-/// — normal completion, signal arms, and the SIGUSR1-persist `?` early return.
+/// — normal completion, signal arms, and the SIGUSR1 run-all/persist error returns.
 /// Its `Drop` is deliberately lightweight, synchronous, infallible, non-blocking:
 /// it only `abort()`s the fd-watcher task (so a stale watcher can't cross-session
 /// overwrite the process-global `kernel_fd_health`) and sets that gauge to 0
@@ -87,6 +87,21 @@ impl Drop for RunCleanupGuard {
 fn close_out_health<F: FnOnce(bool)>(enabled: bool, set_health: F) {
     if enabled {
         set_health(false);
+    }
+}
+
+/// Flatten the result returned by awaiting the spawned `run_all` task.
+///
+/// The outer result reports whether the Tokio task joined successfully, while
+/// the inner result reports whether `run_all` itself succeeded. Signal shutdown
+/// paths must inspect both layers so a clean task join cannot hide a real
+/// receiver/sender error.
+fn flatten_run_all_result(
+    result: Result<CommonResult<()>, tokio::task::JoinError>,
+) -> CommonResult<()> {
+    match result {
+        Ok(inner) => inner,
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -211,7 +226,7 @@ impl<T: FileSystem> FuseSession<T> {
 
         // Phase 3b (P2-2/P3-1): the fd watcher returns a JoinHandle; a
         // RunCleanupGuard holds it and, on EVERY run() exit path (including the
-        // SIGUSR1-persist `?` early return below), aborts the watcher and sets
+        // SIGUSR1 run-all/persist error returns below), aborts the watcher and sets
         // kernel_fd_health=0. This both closes out the health gauge and prevents a
         // stale watcher from cross-session-overwriting the process-global gauge.
         #[cfg(target_os = "linux")]
@@ -263,8 +278,8 @@ impl<T: FileSystem> FuseSession<T> {
 
                 shutdown_once.record_once(SHUTDOWN_TERM_SIGNAL);
                 let _ = self.shutdown_tx.send(true);
-                if let Err(e) = run_all_handle.await {
-                    error!("run_all task panicked during shutdown: {:?}", e);
+                if let Err(e) = flatten_run_all_result(run_all_handle.await) {
+                    error!("run_all failed during termination shutdown: {:?}", e);
                 }
             }
 
@@ -280,14 +295,20 @@ impl<T: FileSystem> FuseSession<T> {
 
                 // Record the shutdown intent BEFORE persist: sigusr1_persist
                 // denotes intent, not a completed unmount (persist success/failure
-                // is a separate state_persist_total{status}). The `?` below may
-                // early-return on persist error WITHOUT unmount (unchanged control
-                // flow); the RunCleanupGuard still aborts the watcher + sets
-                // health 0 on that path.
+                // is a separate state_persist_total{status}). A run_all error
+                // returns before persist, so `mnts` still auto-unmounts on drop.
+                // A persist error may occur after `persist_inner` disables
+                // `auto_unmount` for fd inheritance, so those mounts remain mounted.
+                // RunCleanupGuard still aborts the watcher and sets health 0 on
+                // either path.
                 shutdown_once.record_once(SHUTDOWN_SIGUSR1_PERSIST);
                 let _ = self.shutdown_tx.send(true);
-                if let Err(e) = run_all_handle.await {
-                    error!("run_all task panicked during shutdown: {:?}", e);
+                if let Err(e) = flatten_run_all_result(run_all_handle.await) {
+                    error!(
+                        "run_all failed during SIGUSR1 shutdown; refusing to persist state: {:?}",
+                        e
+                    );
+                    return Err(e);
                 }
                 self.persist(mnts).await?;
             }
@@ -673,5 +694,37 @@ mod cleanup_guard_tests {
         set.set(None);
         super::close_out_health(false, |h| set.set(Some(h)));
         assert_eq!(set.get(), None, "disabled => does not touch health");
+    }
+}
+
+#[cfg(test)]
+mod run_all_shutdown_result_tests {
+    use super::flatten_run_all_result;
+
+    #[test]
+    fn clean_inner_result_succeeds() {
+        assert!(flatten_run_all_result(Ok(Ok(()))).is_ok());
+    }
+
+    #[test]
+    fn inner_run_all_error_is_preserved() {
+        let inner: orpc::CommonResult<()> = Err(std::io::Error::other("receiver failed").into());
+
+        let err = flatten_run_all_result(Ok(inner)).expect_err("inner error must be returned");
+
+        assert_eq!(err.to_string(), "receiver failed");
+    }
+
+    #[tokio::test]
+    async fn join_error_is_preserved() {
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok::<(), orpc::CommonError>(())
+        });
+        handle.abort();
+
+        let err = flatten_run_all_result(handle.await).expect_err("join error must be returned");
+
+        assert!(err.to_string().contains("cancelled"));
     }
 }
