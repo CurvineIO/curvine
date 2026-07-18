@@ -469,6 +469,19 @@ impl fs::FileSystem for CurvineFileSystem {
             unused: 0,
         };
 
+        // Log the negotiated capability set: what we advertise vs. what the
+        // kernel offered but we did not enable (so an operator can see why a
+        // capability is inactive). Note SPLICE/WRITEBACK may appear in "enabled"
+        // without being kernel-offered — they are config-gated daemon requests.
+        let dropped = op.arg.flags & !out_flags;
+        info!(
+            "FUSE init negotiated: abi={}.{} enabled=[{}] kernel_offered_not_enabled=[{}]",
+            op.arg.major,
+            op.arg.minor,
+            fuse_init_flag_names(out_flags).join(", "),
+            fuse_init_flag_names(dropped).join(", "),
+        );
+
         Ok(out)
     }
 
@@ -1301,9 +1314,10 @@ mod tests {
 
     use super::CurvineFileSystem;
     use crate::{
-        FUSE_ATOMIC_O_TRUNC, FUSE_DO_READDIRPLUS, FUSE_FLOCK_LOCKS, FUSE_HAS_IOCTL_DIR,
-        FUSE_MAX_PAGES, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_SPLICE_MOVE, FUSE_SPLICE_READ,
-        FUSE_SPLICE_WRITE, FUSE_WRITEBACK_CACHE, SUPPORTED_INIT_FLAGS,
+        fuse_init_flag_names, FUSE_ATOMIC_O_TRUNC, FUSE_BIG_WRITES, FUSE_DO_READDIRPLUS,
+        FUSE_FLOCK_LOCKS, FUSE_HAS_IOCTL_DIR, FUSE_MAX_PAGES, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS,
+        FUSE_SPLICE_MOVE, FUSE_SPLICE_READ, FUSE_SPLICE_WRITE, FUSE_WRITEBACK_CACHE,
+        SUPPORTED_INIT_FLAGS,
     };
 
     // #1122 + allowlist: the daemon must never advertise FUSE_ATOMIC_O_TRUNC
@@ -1398,5 +1412,20 @@ mod tests {
     fn atomic_o_trunc_bit_value_matches_uapi() {
         // uapi fuse.h: FUSE_ATOMIC_O_TRUNC = (1 << 3)
         assert_eq!(FUSE_ATOMIC_O_TRUNC, 1 << 3);
+    }
+
+    #[test]
+    fn fuse_init_flag_names_maps_known_and_unknown() {
+        // Known bits render as names.
+        let names = fuse_init_flag_names(FUSE_POSIX_LOCKS | FUSE_DO_READDIRPLUS);
+        assert!(names.contains(&"POSIX_LOCKS".to_string()));
+        assert!(names.contains(&"DO_READDIRPLUS".to_string()));
+        // Empty flags => empty list.
+        assert!(fuse_init_flag_names(0).is_empty());
+        // An unknown bit is surfaced as a hex token, not silently dropped.
+        let unknown = 1u32 << 30;
+        let names = fuse_init_flag_names(FUSE_BIG_WRITES | unknown);
+        assert!(names.contains(&"BIG_WRITES".to_string()));
+        assert!(names.iter().any(|n| n == "0x40000000"));
     }
 }

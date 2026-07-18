@@ -163,6 +163,42 @@ pub const SUPPORTED_INIT_FLAGS: u32 = FUSE_ASYNC_READ
     | FUSE_FLOCK_LOCKS
     | FUSE_MAX_PAGES;
 
+/// Human-readable names of the FUSE init-capability bits set in `flags`, for
+/// logging the negotiated capability set. Known bits are named; any leftover
+/// unknown bits are appended as a single `0x…` hex token so nothing is hidden.
+pub fn fuse_init_flag_names(flags: u32) -> Vec<String> {
+    const KNOWN: &[(u32, &str)] = &[
+        (FUSE_ASYNC_READ, "ASYNC_READ"),
+        (FUSE_POSIX_LOCKS, "POSIX_LOCKS"),
+        (FUSE_ATOMIC_O_TRUNC, "ATOMIC_O_TRUNC"),
+        (FUSE_EXPORT_SUPPORT, "EXPORT_SUPPORT"),
+        (FUSE_BIG_WRITES, "BIG_WRITES"),
+        (FUSE_SPLICE_WRITE, "SPLICE_WRITE"),
+        (FUSE_SPLICE_MOVE, "SPLICE_MOVE"),
+        (FUSE_SPLICE_READ, "SPLICE_READ"),
+        (FUSE_FLOCK_LOCKS, "FLOCK_LOCKS"),
+        (FUSE_HAS_IOCTL_DIR, "HAS_IOCTL_DIR"),
+        (FUSE_AUTO_INVAL_DATA, "AUTO_INVAL_DATA"),
+        (FUSE_DO_READDIRPLUS, "DO_READDIRPLUS"),
+        (FUSE_READDIRPLUS_AUTO, "READDIRPLUS_AUTO"),
+        (FUSE_ASYNC_DIO, "ASYNC_DIO"),
+        (FUSE_WRITEBACK_CACHE, "WRITEBACK_CACHE"),
+        (FUSE_POSIX_ACL, "POSIX_ACL"),
+        (FUSE_MAX_PAGES, "MAX_PAGES"),
+    ];
+    let mut names: Vec<String> = KNOWN
+        .iter()
+        .filter(|(bit, _)| flags & bit != 0)
+        .map(|(_, name)| name.to_string())
+        .collect();
+    let known_mask: u32 = KNOWN.iter().fold(0, |acc, (bit, _)| acc | bit);
+    let unknown = flags & !known_mask;
+    if unknown != 0 {
+        names.push(format!("0x{:x}", unknown));
+    }
+    names
+}
+
 /// Minimum FUSE ABI (major, minor) the daemon accepts. curvine only implements
 /// the 7.31 struct layout / semantics, so it rejects older kernels and, on
 /// negotiation, advertises exactly this version rather than echoing the kernel.
