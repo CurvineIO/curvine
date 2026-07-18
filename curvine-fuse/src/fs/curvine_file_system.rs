@@ -371,57 +371,73 @@ impl CurvineFileSystem {
         }
     }
 
-    /// Combine the daemon's baseline init flags with the flags the kernel
-    /// offered, then strip any capability Curvine must not advertise.
+    /// Negotiate the init reply flags as an explicit allowlist rather than
+    /// blindly echoing every kernel-offered capability.
     ///
-    /// Currently that means clearing `FUSE_ATOMIC_O_TRUNC`: `open` does not
-    /// perform the truncate itself, so if we advertised atomic O_TRUNC the
-    /// kernel would skip the follow-up `SETATTR(size=0)` and O_TRUNC would be
-    /// silently lost whenever a writer for the inode already exists (the shared
-    /// writer ignores the second open's flags). Clearing it forces the kernel
-    /// back to the open + SETATTR path, which `set_attr` handles via
-    /// `fs_resize`. See issue #1122.
-    fn negotiate_out_flags(base: u32, kernel_flags: u32) -> u32 {
-        (base | kernel_flags) & !FUSE_ATOMIC_O_TRUNC
+    /// Two categories:
+    /// 1. Kernel-negotiated caps: `SUPPORTED_INIT_FLAGS & kernel_flags` — only
+    ///    bits the daemon implements AND the kernel offered. This inherently
+    ///    excludes `FUSE_ATOMIC_O_TRUNC` (open does not truncate, #1122),
+    ///    `FUSE_POSIX_ACL`, `FUSE_HAS_IOCTL_DIR`, and any unknown/future bit,
+    ///    since none are in `SUPPORTED_INIT_FLAGS`. `FUSE_MAX_PAGES` survives
+    ///    only when the kernel offers it.
+    /// 2. Config-gated daemon-requested caps, forced on (NOT masked by the
+    ///    kernel offer): `FUSE_WRITEBACK_CACHE` when `write_back_cache`, and the
+    ///    `FUSE_SPLICE_*` bits when `enable_splice`. Splice is driven by the
+    ///    channel talking splice(2) on the fuse fd directly, independent of an
+    ///    init-flag offer, so it must be advertised on config alone.
+    fn negotiate_out_flags(kernel_flags: u32, write_back_cache: bool, enable_splice: bool) -> u32 {
+        let mut out = SUPPORTED_INIT_FLAGS & kernel_flags;
+        if write_back_cache {
+            out |= FUSE_WRITEBACK_CACHE;
+        }
+        if enable_splice {
+            out |= FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE | FUSE_SPLICE_READ;
+        }
+        out
+    }
+
+    /// Whether the daemon accepts the kernel's advertised FUSE ABI version.
+    ///
+    /// Compared as a `(major, minor)` tuple against `FUSE_MIN_ABI`: reject any
+    /// version below 7.31 (this correctly rejects a low-major/high-minor combo
+    /// such as 6.40, which the old `major < 7 && minor < 31` check let through).
+    /// A higher major is accepted; the kernel re-issues INIT at the daemon's
+    /// major after we reply with our own version.
+    fn abi_supported(major: u32, minor: u32) -> bool {
+        (major, minor) >= FUSE_MIN_ABI
     }
 }
 
 impl fs::FileSystem for CurvineFileSystem {
     async fn init(&self, op: Init<'_>) -> FuseResult<fuse_init_out> {
-        if op.arg.major < FUSE_KERNEL_VERSION && op.arg.minor < FUSE_KERNEL_MINOR_VERSION {
+        if !Self::abi_supported(op.arg.major, op.arg.minor) {
             return err_fuse!(
                 libc::EPROTO,
-                "Unsupported FUSE ABI version {}.{}",
+                "unsupported FUSE ABI {}.{}: curvine requires >= {}.{}",
                 op.arg.major,
-                op.arg.minor
+                op.arg.minor,
+                FUSE_KERNEL_VERSION,
+                FUSE_KERNEL_MINOR_VERSION
             );
         }
 
-        let mut out_flags = FUSE_BIG_WRITES
-            | FUSE_ASYNC_READ
-            | FUSE_ASYNC_DIO
-            | FUSE_SPLICE_MOVE
-            | FUSE_SPLICE_WRITE
-            | FUSE_SPLICE_READ
-            | FUSE_READDIRPLUS_AUTO
-            | FUSE_AUTO_INVAL_DATA
-            | FUSE_EXPORT_SUPPORT;
+        // Negotiate an explicit allowlist (see `negotiate_out_flags`): only caps
+        // the daemon implements AND the kernel offered, plus config-gated
+        // writeback/splice. `max_pages` then keys off the negotiated result.
+        let out_flags = Self::negotiate_out_flags(
+            op.arg.flags,
+            self.conf.write_back_cache,
+            self.conf.enable_splice,
+        );
 
         let max_write = FuseUtils::get_fuse_buf_size() - FUSE_BUFFER_HEADER_SIZE;
         let page_size = sys::get_pagesize()?;
-        let max_pages = if op.arg.flags & FUSE_MAX_PAGES != 0 {
-            out_flags |= FUSE_MAX_PAGES;
+        let max_pages = if out_flags & FUSE_MAX_PAGES != 0 {
             (max_write - 1) / page_size + 1
         } else {
             0
         };
-
-        out_flags = Self::negotiate_out_flags(out_flags, op.arg.flags);
-        if self.conf.write_back_cache {
-            out_flags |= FUSE_WRITEBACK_CACHE;
-        } else {
-            out_flags &= !FUSE_WRITEBACK_CACHE;
-        }
 
         // If `fuse.max_readahead_kb` is configured, raise the negotiated
         // `max_readahead` so the kernel cap (min(bdi.max_readahead_kb,
@@ -432,8 +448,12 @@ impl fs::FileSystem for CurvineFileSystem {
         };
 
         let out = fuse_init_out {
-            major: op.arg.major,
-            minor: op.arg.minor,
+            // Advertise the daemon's own ABI, not the kernel's: curvine only
+            // implements the 7.31 struct/semantics, so it must not claim a higher
+            // version. On a higher-major kernel this makes the kernel re-issue
+            // INIT at our major (init is idempotent, dispatched per INIT).
+            major: FUSE_KERNEL_VERSION,
+            minor: FUSE_KERNEL_MINOR_VERSION,
             max_readahead,
             flags: out_flags,
             max_background: self.conf.max_background,
@@ -1280,47 +1300,98 @@ mod tests {
     }
 
     use super::CurvineFileSystem;
-    use crate::FUSE_ATOMIC_O_TRUNC;
+    use crate::{
+        FUSE_ATOMIC_O_TRUNC, FUSE_DO_READDIRPLUS, FUSE_FLOCK_LOCKS, FUSE_HAS_IOCTL_DIR,
+        FUSE_MAX_PAGES, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_SPLICE_MOVE, FUSE_SPLICE_READ,
+        FUSE_SPLICE_WRITE, FUSE_WRITEBACK_CACHE, SUPPORTED_INIT_FLAGS,
+    };
 
-    // #1122: the daemon must never advertise FUSE_ATOMIC_O_TRUNC, because `open`
-    // does not truncate. If the kernel offers it, negotiate_out_flags must strip
-    // it so the kernel falls back to the open + SETATTR(size=0) path.
+    // #1122 + allowlist: the daemon must never advertise FUSE_ATOMIC_O_TRUNC
+    // (open does not truncate) or any other unsupported capability, even when
+    // the kernel offers it. The allowlist mask drops them.
     #[test]
-    fn negotiate_out_flags_strips_atomic_o_trunc_offered_by_kernel() {
-        // Kernel offers ATOMIC_O_TRUNC plus some other capability bit.
-        let other = 1u32 << 15; // FUSE_ASYNC_DIO, arbitrary unrelated bit
-        let kernel_flags = FUSE_ATOMIC_O_TRUNC | other;
-        let base = 1u32 << 5; // FUSE_BIG_WRITES, arbitrary baseline bit
-
-        let out = CurvineFileSystem::negotiate_out_flags(base, kernel_flags);
-
+    fn negotiate_out_flags_drops_unsupported_kernel_caps() {
+        let unsupported = FUSE_ATOMIC_O_TRUNC | FUSE_POSIX_ACL | FUSE_HAS_IOCTL_DIR | (1u32 << 30);
+        let out = CurvineFileSystem::negotiate_out_flags(unsupported, false, false);
         assert_eq!(
-            out & FUSE_ATOMIC_O_TRUNC,
-            0,
-            "FUSE_ATOMIC_O_TRUNC must be cleared even when the kernel offers it"
+            out, 0,
+            "no unsupported kernel-offered bit may be advertised"
         );
-        // Unrelated kernel-offered and baseline bits must be preserved.
-        assert_eq!(out & other, other, "unrelated kernel bit must survive");
-        assert_eq!(out & base, base, "baseline bit must survive");
     }
 
-    // Even if the baseline set somehow contained the bit, it must not leak out.
+    // Supported caps pass through when the kernel offers them. Guards against
+    // regressing distributed locking / readdirplus, which were only enabled by
+    // the old blind OR.
     #[test]
-    fn negotiate_out_flags_strips_atomic_o_trunc_from_base() {
-        let base = FUSE_ATOMIC_O_TRUNC | (1u32 << 4);
-        let out = CurvineFileSystem::negotiate_out_flags(base, 0);
-        assert_eq!(out & FUSE_ATOMIC_O_TRUNC, 0);
-        assert_eq!(out & (1u32 << 4), 1u32 << 4);
+    fn negotiate_out_flags_passes_through_supported_caps() {
+        let out = CurvineFileSystem::negotiate_out_flags(SUPPORTED_INIT_FLAGS, false, false);
+        assert_eq!(
+            out, SUPPORTED_INIT_FLAGS,
+            "all supported+offered caps survive"
+        );
+        // Explicit regression guards for the previously-implicit caps.
+        assert_eq!(out & FUSE_POSIX_LOCKS, FUSE_POSIX_LOCKS);
+        assert_eq!(out & FUSE_FLOCK_LOCKS, FUSE_FLOCK_LOCKS);
+        assert_eq!(out & FUSE_DO_READDIRPLUS, FUSE_DO_READDIRPLUS);
     }
 
-    // When the kernel does not offer the bit, output is a clean union with
-    // nothing spuriously added.
+    // A supported cap the kernel did NOT offer must not be advertised (no
+    // phantom capabilities).
     #[test]
-    fn negotiate_out_flags_is_union_when_bit_absent() {
-        let base = 1u32 << 5;
-        let kernel_flags = 1u32 << 14;
-        let out = CurvineFileSystem::negotiate_out_flags(base, kernel_flags);
-        assert_eq!(out, base | kernel_flags);
+    fn negotiate_out_flags_no_phantom_when_kernel_offers_nothing() {
+        let out = CurvineFileSystem::negotiate_out_flags(0, false, false);
+        assert_eq!(out, 0);
+        assert_eq!(out & FUSE_MAX_PAGES, 0);
+        assert_eq!(out & FUSE_POSIX_LOCKS, 0);
+    }
+
+    // WRITEBACK is a config-gated daemon-requested cap: present iff write_back,
+    // absent otherwise even when the kernel offers it.
+    #[test]
+    fn negotiate_out_flags_writeback_is_config_gated() {
+        let on = CurvineFileSystem::negotiate_out_flags(0, true, false);
+        assert_eq!(on & FUSE_WRITEBACK_CACHE, FUSE_WRITEBACK_CACHE);
+        let off = CurvineFileSystem::negotiate_out_flags(FUSE_WRITEBACK_CACHE, false, false);
+        assert_eq!(off & FUSE_WRITEBACK_CACHE, 0);
+    }
+
+    // SPLICE is config-gated and forced (not masked by the kernel offer, since
+    // the channel drives splice(2) directly).
+    #[test]
+    fn negotiate_out_flags_splice_is_config_gated() {
+        let splice = FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE | FUSE_SPLICE_READ;
+        let on = CurvineFileSystem::negotiate_out_flags(0, false, true);
+        assert_eq!(
+            on & splice,
+            splice,
+            "splice advertised on config even if kernel omits it"
+        );
+        let off = CurvineFileSystem::negotiate_out_flags(splice, false, false);
+        assert_eq!(off & splice, 0, "splice not advertised when disabled");
+    }
+
+    // Containment: output never contains a bit outside the allowed universe,
+    // regardless of what the kernel offers.
+    #[test]
+    fn negotiate_out_flags_containment() {
+        let splice = FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE | FUSE_SPLICE_READ;
+        let allowed = SUPPORTED_INIT_FLAGS | splice | FUSE_WRITEBACK_CACHE;
+        let out = CurvineFileSystem::negotiate_out_flags(0xFFFF_FFFF, true, true);
+        assert_eq!(out & !allowed, 0, "no bit outside the allowed universe");
+    }
+
+    #[test]
+    fn abi_supported_tuple_comparison() {
+        // Accept >= 7.31, including a higher major.
+        assert!(CurvineFileSystem::abi_supported(7, 31));
+        assert!(CurvineFileSystem::abi_supported(7, 32));
+        assert!(CurvineFileSystem::abi_supported(8, 0));
+        // Reject anything below 7.31 — including the low-major/high-minor combo
+        // the old `major < 7 && minor < 31` check let through.
+        assert!(!CurvineFileSystem::abi_supported(7, 30));
+        assert!(!CurvineFileSystem::abi_supported(6, 40));
+        assert!(!CurvineFileSystem::abi_supported(6, 0));
+        assert!(!CurvineFileSystem::abi_supported(0, 0));
     }
 
     #[test]

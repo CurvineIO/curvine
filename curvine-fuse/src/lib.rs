@@ -98,6 +98,16 @@ pub const FUSE_DO_READDIRPLUS: u32 = 1 << 13;
 
 pub const FUSE_READDIRPLUS_AUTO: u32 = 1 << 14;
 
+/// FUSE init capability bit (uapi `fuse.h`: `FUSE_POSIX_LOCKS = (1 << 1)`):
+/// remote POSIX (fcntl) file locking. Implemented via `get_lk`/`set_lk`/
+/// `set_lkw`, which route to the distributed backend's lock service.
+pub const FUSE_POSIX_LOCKS: u32 = 1 << 1;
+
+/// FUSE init capability bit (uapi `fuse.h`: `FUSE_FLOCK_LOCKS = (1 << 10)`):
+/// remote BSD (flock) file locking. Implemented via the same lock path;
+/// `release`/`flush` drop flock/posix locks through `LockFlags::Flock`/`Plock`.
+pub const FUSE_FLOCK_LOCKS: u32 = 1 << 10;
+
 pub const FUSE_WRITEBACK_CACHE: u32 = 1 << 16;
 
 pub const FUSE_POSIX_ACL: u32 = 1 << 20;
@@ -126,6 +136,37 @@ pub const FUSE_EXPORT_SUPPORT: u32 = 1 << 4;
 ///   - linux/fuse.h:339        `#define FUSE_ATOMIC_O_TRUNC     (1 << 3)`
 ///   - fuse3/fuse_common.h:158 `#define FUSE_CAP_ATOMIC_O_TRUNC (1 << 3)`
 pub const FUSE_ATOMIC_O_TRUNC: u32 = 1 << 3;
+
+/// Init capabilities the daemon actually implements, negotiated as an explicit
+/// allowlist: `init` advertises `SUPPORTED_INIT_FLAGS & op.arg.flags` (only what
+/// BOTH the daemon supports and the kernel offered), instead of blindly echoing
+/// every kernel-offered flag. Each bit here maps to a real implementation:
+/// ASYNC_READ/ASYNC_DIO (async read + direct-io pipeline), BIG_WRITES (writer
+/// handles >4KiB writes), AUTO_INVAL_DATA (kernel auto-invalidates page cache on
+/// open), EXPORT_SUPPORT (`.`/`..` lookup reconstruction), READDIRPLUS_AUTO +
+/// DO_READDIRPLUS (`read_dir_plus`), POSIX_LOCKS + FLOCK_LOCKS
+/// (`get_lk`/`set_lk`/`set_lkw`), MAX_PAGES (negotiated only if the kernel offers it).
+///
+/// Deliberately EXCLUDED (never advertised): FUSE_ATOMIC_O_TRUNC (open does not
+/// truncate, #1122), FUSE_POSIX_ACL (no ACL handling), FUSE_HAS_IOCTL_DIR (no
+/// ioctl), and any unknown/future kernel bit. FUSE_WRITEBACK_CACHE and the
+/// FUSE_SPLICE_* bits are config-gated daemon-requested caps handled separately
+/// (see `negotiate_out_flags`), not part of this kernel-masked allowlist.
+pub const SUPPORTED_INIT_FLAGS: u32 = FUSE_ASYNC_READ
+    | FUSE_BIG_WRITES
+    | FUSE_ASYNC_DIO
+    | FUSE_AUTO_INVAL_DATA
+    | FUSE_EXPORT_SUPPORT
+    | FUSE_READDIRPLUS_AUTO
+    | FUSE_DO_READDIRPLUS
+    | FUSE_POSIX_LOCKS
+    | FUSE_FLOCK_LOCKS
+    | FUSE_MAX_PAGES;
+
+/// Minimum FUSE ABI (major, minor) the daemon accepts. curvine only implements
+/// the 7.31 struct layout / semantics, so it rejects older kernels and, on
+/// negotiation, advertises exactly this version rather than echoing the kernel.
+pub const FUSE_MIN_ABI: (u32, u32) = (FUSE_KERNEL_VERSION, FUSE_KERNEL_MINOR_VERSION);
 
 pub const FUSE_MAX_NAME_LENGTH: usize = 255;
 
