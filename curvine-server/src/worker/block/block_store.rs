@@ -18,7 +18,6 @@ use crate::worker::storage::{
 };
 use curvine_common::conf::ClusterConf;
 use curvine_common::state::{ExtendedBlock, StorageInfo};
-use log::error;
 use orpc::CommonResult;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -141,33 +140,7 @@ impl BlockStore {
     // This method is called by the heartbeat thread and returns all storage information, including failed storage.
     pub fn get_and_check_storages(&self) -> CommonResult<Vec<StorageInfo>> {
         let state = self.read()?;
-        let mut vec = vec![];
-        for item in state.dir_iter() {
-            let failed = match item.check_dir() {
-                Ok(_) => false,
-                Err(e) => {
-                    error!("check_dir {}: {}", item.id(), e);
-                    item.set_failed();
-                    true
-                }
-            };
-            let info = StorageInfo {
-                dir_id: item.id(),
-                storage_id: item.version().storage_id.to_string(),
-                failed,
-                capacity: item.capacity(),
-                fs_used: item.fs_used(),
-                non_fs_used: item.non_fs_used(),
-                available: item.available(),
-                reserved_bytes: item.reserved_bytes(),
-                storage_type: item.storage_type(),
-                block_num: state.num_blocks() as i64,
-                dir_path: item.path_str().to_string(),
-            };
-            vec.push(info);
-        }
-
-        Ok(vec)
+        Ok(state.get_and_check_storages())
     }
 }
 

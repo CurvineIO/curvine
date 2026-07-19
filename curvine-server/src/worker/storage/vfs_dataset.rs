@@ -14,11 +14,11 @@
 
 use crate::worker::block::{BlockMeta, BlockState};
 use crate::worker::storage::{
-    BlockLayout, BlockLayoutKind, BlockLayouts, Dataset, DirList, SpdkMetaStore, StorageVersion,
-    VfsDir, VfsMetaStore,
+    BlockLayout, BlockLayoutKind, BlockLayouts, Dataset, DirList, SpdkMetaStore, StorageRequest,
+    StorageVersion, VfsDir, VfsMetaStore,
 };
 use curvine_common::conf::{ClusterConf, WorkerDataDir};
-use curvine_common::state::{ExtendedBlock, StorageType};
+use curvine_common::state::{ExtendedBlock, StorageInfo, StorageType};
 use indexmap::map::Values;
 use log::info;
 use orpc::common::{ByteUnit, FileUtils, LocalTime, TimeSpent};
@@ -152,7 +152,9 @@ impl VfsDataset {
             let layout = self.layouts.get(dir.storage_type());
             let blocks = layout.scan(dir)?;
             for block in blocks {
-                dir.reserve_space(block.is_final(), block.physical_bytes());
+                let physical_bytes = block.physical_bytes();
+                self.dir_list
+                    .reserve_space(dir.id(), block.is_final(), physical_bytes)?;
                 self.meta.put(block);
             }
         }
@@ -231,9 +233,8 @@ impl VfsDataset {
     }
 
     pub(crate) fn release_block_space(&self, meta: &BlockMeta) -> CommonResult<()> {
-        let dir = self.find_dir(meta.dir_id())?;
-        dir.release_space(meta.is_final(), meta.physical_bytes());
-        Ok(())
+        self.dir_list
+            .release_space(meta.dir_id(), meta.is_final(), meta.physical_bytes())
     }
 
     pub(crate) fn remove_block_by_id(&mut self, id: i64) -> CommonResult<BlockMeta> {
@@ -249,6 +250,19 @@ impl VfsDataset {
             Some(dir) => dir.clone(),
         };
         Ok((self.layouts.get(meta.storage_type()).clone(), dir))
+    }
+
+    pub fn get_and_check_storages(&self) -> Vec<StorageInfo> {
+        self.dir_list
+            .get_and_check_storages(self.meta.block_count() as i64)
+    }
+
+    pub fn failed_storage_count(&self) -> usize {
+        self.dir_list.failed_count()
+    }
+
+    pub fn storage_count(&self) -> usize {
+        self.dir_list.len()
     }
 }
 
@@ -295,8 +309,12 @@ impl Dataset for VfsDataset {
                     let new_meta = layout.prepare_write(dir, &meta, block)?;
                     let new_physical_bytes = new_meta.physical_bytes();
 
-                    dir.release_space(meta.is_final(), old_physical_bytes);
-                    dir.reserve_space(false, new_physical_bytes);
+                    self.dir_list.update_write_space(
+                        meta.dir_id(),
+                        meta.is_final(),
+                        old_physical_bytes,
+                        new_physical_bytes,
+                    )?;
                     self.meta.put(new_meta.clone());
 
                     Ok(new_meta)
@@ -310,12 +328,15 @@ impl Dataset for VfsDataset {
             }
 
             None => {
-                let dir = self.dir_list.choose_dir(block)?;
+                let dir = self
+                    .dir_list
+                    .choose_dir(StorageRequest::new(block.storage_type, block.len)?)?;
                 let layout = self.layouts.get(dir.storage_type());
                 let meta = layout.allocate(&dir, block)?;
 
+                self.dir_list
+                    .reserve_space(dir.id(), false, meta.physical_bytes())?;
                 self.meta.put(meta.clone());
-                dir.reserve_space(false, meta.physical_bytes());
 
                 Ok(meta)
             }
@@ -363,9 +384,8 @@ impl Dataset for VfsDataset {
             (meta.dir_id(), reserved_bytes, final_bytes, final_meta)
         };
 
-        let dir = self.find_dir(dir_id)?;
-        dir.release_space(false, reserved_bytes);
-        dir.reserve_space(true, final_bytes);
+        self.dir_list
+            .update_final_space(dir_id, reserved_bytes, final_bytes)?;
         self.meta.put(final_meta.clone());
 
         Ok(final_meta)
@@ -386,11 +406,13 @@ impl Dataset for VfsDataset {
 
 #[cfg(test)]
 mod test {
+    use crate::worker::block::BlockMeta;
     use crate::worker::storage::{
-        Dataset, DirList, DirState, SpdkMetaStore, StorageVersion, VfsDataset, VfsDir,
+        Dataset, DirList, DirState, FileLayout, SpdkMetaStore, StorageVersion, VfsDataset, VfsDir,
     };
     use curvine_common::conf::{ClusterConf, WorkerConf};
     use curvine_common::state::{ExtendedBlock, FileType, StorageType};
+    use orpc::common::FileUtils;
     use orpc::sync::AtomicLong;
     use orpc::sys::FsStats;
     use orpc::CommonResult;
@@ -487,10 +509,109 @@ mod test {
     #[test]
     fn abort_spdk() -> CommonResult<()> {
         let mut ds = spdk_dataset()?;
-        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        let block = ExtendedBlock::new(1, 1, StorageType::SpdkDisk, FileType::File);
+        let available = ds.available();
         ds.open_block(&block)?;
+        assert_eq!(ds.available(), available - 4096);
         let ok = ds.abort_block(&block).is_ok();
         assert!(ok && ds.get_block(1).is_none());
+        assert_eq!(ds.available(), available);
+        Ok(())
+    }
+    #[test]
+    fn spdk_prepare_write_preserves_extent_charge() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let mut block = ExtendedBlock::new(1, 1, StorageType::SpdkDisk, FileType::File);
+        let available = ds.available();
+        ds.open_block(&block)?;
+        ds.finalize_block(&block)?;
+        assert_eq!(ds.available(), available - 4096);
+
+        block.len = 4097;
+        assert!(ds.open_block(&block).is_err());
+        assert_eq!(ds.available(), available - 4096);
+        assert!(ds.get_block(block.id).unwrap().is_final());
+
+        ds.abort_block(&block)?;
+        assert_eq!(ds.available(), available);
+        Ok(())
+    }
+    #[test]
+    fn abort_and_failed_prepare_write_preserve_capacity() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "capacity-rollback");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let available = ds.available();
+        ds.open_block(&block)?;
+        assert_eq!(ds.available(), available - 100);
+        ds.abort_block(&block)?;
+        assert_eq!(ds.available(), available);
+
+        let meta = ds.open_block(&block)?;
+        ds.write_test_data(&meta, "50B")?;
+        block.len = 50;
+        ds.finalize_block(&block)?;
+        let finalized_available = ds.available();
+
+        block.len = 101;
+        assert!(ds.open_block(&block).is_err());
+        assert_eq!(ds.available(), finalized_available);
+        assert!(ds.get_block(block.id).unwrap().is_final());
+        Ok(())
+    }
+    #[test]
+    fn failed_file_deallocate_keeps_capacity_reserved() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "deallocate-failure");
+        let block = ExtendedBlock::with_mem(1, "100B")?;
+        let available = ds.available();
+        let meta = ds.open_block(&block)?;
+        let dir = ds.find_dir(meta.dir_id())?;
+        let block_path = FileLayout::block_path(dir, &meta)?;
+
+        FileUtils::delete_path(&block_path, false)?;
+        std::fs::create_dir(&block_path)?;
+        std::fs::write(block_path.join("child"), b"data")?;
+
+        assert!(ds.abort_block(&block).is_err());
+        assert!(ds.get_block(block.id).is_none());
+        assert_eq!(ds.available(), available - 100);
+
+        FileUtils::delete_path(block_path, true)?;
+        Ok(())
+    }
+    #[test]
+    fn failed_file_allocate_does_not_reserve_capacity() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "allocate-failure");
+        let block = ExtendedBlock::with_mem(1, "100B")?;
+        let available = ds.available();
+        let dir = ds.dir_iter().next().unwrap().clone();
+        let meta = BlockMeta::with_tmp(&block, &dir);
+        let block_path = FileLayout::block_path(&dir, &meta)?;
+
+        std::fs::create_dir(&block_path)?;
+
+        assert!(ds.open_block(&block).is_err());
+        assert!(ds.get_block(block.id).is_none());
+        assert_eq!(ds.available(), available);
+
+        FileUtils::delete_path(block_path, true)?;
+        Ok(())
+    }
+    #[test]
+    fn smaller_prepared_write_holds_old_capacity_until_completion() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "smaller-prepared-write");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let total_available = ds.available();
+        let meta = ds.open_block(&block)?;
+        ds.write_test_data(&meta, "50B")?;
+        block.len = 50;
+        ds.finalize_block(&block)?;
+        let finalized_available = ds.available();
+
+        block.len = 20;
+        ds.open_block(&block)?;
+        assert_eq!(ds.available(), finalized_available);
+        ds.abort_block(&block)?;
+        assert_eq!(ds.available(), total_available);
         Ok(())
     }
     #[test]

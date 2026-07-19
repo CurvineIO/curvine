@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::worker::storage::VfsDir;
-use curvine_common::state::{ExtendedBlock, StorageType};
+use curvine_common::state::StorageType;
 use indexmap::IndexMap;
 use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
@@ -27,10 +27,11 @@ impl ChoosingPolicy {
     pub fn choose_dir<'a>(
         &mut self,
         dirs: &'a IndexMap<u32, Arc<VfsDir>>,
-        block: &ExtendedBlock,
+        storage_type: StorageType,
+        required_bytes: i64,
     ) -> CommonResult<&'a Arc<VfsDir>> {
         match self {
-            ChoosingPolicy::Robin(c) => c.choose_dir(dirs, block),
+            ChoosingPolicy::Robin(c) => c.choose_dir(dirs, storage_type, required_bytes),
         }
     }
 }
@@ -55,17 +56,26 @@ impl RobinChoosingPolicy {
     fn choose_dir<'a>(
         &mut self,
         dirs: &'a IndexMap<u32, Arc<VfsDir>>,
-        block: &ExtendedBlock,
+        storage_type: StorageType,
+        required_bytes: i64,
     ) -> CommonResult<&'a Arc<VfsDir>> {
-        let mut res = self.get_next_dir(dirs, block.storage_type, block.len);
-        if res.is_none() && block.storage_type != StorageType::Disk {
-            res = self.get_next_dir(dirs, StorageType::Disk, block.len)
+        if dirs.is_empty() {
+            return err_box!("No physical storage directories are configured");
+        }
+
+        let mut res = self.get_next_dir(dirs, storage_type, required_bytes);
+        if res.is_none() && storage_type != StorageType::Disk {
+            res = self.get_next_dir(dirs, StorageType::Disk, required_bytes)
         }
 
         if let Some(v) = res {
             Ok(v)
         } else {
-            err_box!("Not enough space to save {} block", block.size_string())
+            err_box!(
+                "Not enough {:?} storage capacity for {} bytes",
+                storage_type,
+                required_bytes
+            )
         }
     }
 
