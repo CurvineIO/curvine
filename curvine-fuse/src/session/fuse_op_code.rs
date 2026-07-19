@@ -175,6 +175,12 @@ impl FuseOpCode {
             // Not dispatched as a FileSystem op: NOT_SUPPORTED is the num_enum
             // default for unknown raw opcodes; CUSE_INIT is a CUSE handshake, not
             // a filesystem path; NOTIFY_REPLY is a daemon->kernel notify channel.
+            // These have no `parse_operator` arm, so they never reach the
+            // dispatcher during normal operation. If one ever did, it would fall
+            // through the dispatch wildcard like `Unsupported` (NOT_SUPPORTED as
+            // `unknown_opcode`, the others as `unimplemented_opcode`); `Internal`
+            // records that we intentionally do not route them, not that reaching
+            // dispatch is impossible.
             FuseOpCode::NOT_SUPPORTED | FuseOpCode::CUSE_INIT | FuseOpCode::FUSE_NOTIFY_REPLY => {
                 Internal
             }
