@@ -198,12 +198,19 @@ impl DirTree {
             }
 
             None => {
-                let inode = (status.id > FUSE_ROOT_ID as i64)
-                    .then(|| self.get_inode(status.id as u64, None))
-                    .flatten();
+                // Resolve by server-id without holding a borrow across mutation.
+                let existing_ino = if status.id > FUSE_ROOT_ID as i64 {
+                    self.get_inode(status.id as u64, None).map(|i| i.ino)
+                } else {
+                    None
+                };
 
-                let ino = match inode {
-                    Some(inode) => {
+                match existing_ino {
+                    Some(ino) => {
+                        // Path B: new dentry name maps to an already-cached inode.
+                        // Bump both counters (hard-link-like) and update cached path;
+                        // do NOT re-insert (that would reset ref_ctr / n_lookup).
+                        let inode = self.get_inode_mut_check(ino, None)?;
                         if inode.is_deleted() {
                             return err_fuse!(
                                 libc::ENOENT,
@@ -211,15 +218,20 @@ impl DirTree {
                                 inode.ino
                             );
                         }
-                        inode.ino
+                        inode.add_lookup(1);
+                        inode.add_ref(1);
+                        inode.update_status(status);
+                        inode.parent = parent;
+                        inode.name = name.to_owned();
+                        ino
                     }
-
-                    None => self.next_id(status.id),
-                };
-
-                self.inodes
-                    .insert(ino, Inode::with_status(ino, parent, name, status));
-                ino
+                    None => {
+                        let ino = self.next_id(status.id);
+                        self.inodes
+                            .insert(ino, Inode::with_status(ino, parent, name, status));
+                        ino
+                    }
+                }
             }
         };
 
@@ -231,18 +243,27 @@ impl DirTree {
     }
 
     pub fn unlink(&mut self, parent: u64, name: &str, mark_delete: bool) -> FuseResult<()> {
-        let inode = self.get_inode_mut_check(parent, Some(name))?;
-        if mark_delete {
-            inode.mark_delete = true;
-        }
-        inode.sub_ref(1);
-        inode.sub_link(1);
+        let ino = self.get_ino_check(parent, Some(name))?;
+        let should_remove = {
+            let inode = self.get_inode_mut_check(ino, None)?;
+            if mark_delete {
+                inode.mark_delete = true;
+            }
+            inode.sub_ref(1);
+            inode.sub_link(1);
+            inode.should_unref()
+        };
 
         // Remove directory entry; keep parent inode's `DirEntry` even when `children` is empty.
         let dir = self.get_dir_mut_check(parent)?;
         dir.remove_child(name);
         if mark_delete {
             dir.mark_deleted_child(name);
+        }
+
+        // Mirror rename's destination-unlink: drop inode when both counters hit zero.
+        if should_remove {
+            self.remove_inode(ino);
         }
 
         Ok(())
