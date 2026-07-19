@@ -35,24 +35,37 @@ fn validate_open_offset(meta: &BlockMeta, off: i64) -> IOResult<()> {
 pub trait BlockLayout {
     fn allocate(&self, dir: &VfsDir, block: &ExtendedBlock) -> CommonResult<BlockMeta>;
 
-    fn finalize(&self, meta: &BlockMeta, committed_len: i64) -> CommonResult<BlockMeta>;
+    /// Prepare an existing physical allocation for writing.
+    fn prepare_write(
+        &self,
+        dir: &VfsDir,
+        meta: &BlockMeta,
+        block: &ExtendedBlock,
+    ) -> CommonResult<BlockMeta>;
+
+    fn finalize(
+        &self,
+        dir: &VfsDir,
+        meta: &BlockMeta,
+        committed_len: i64,
+    ) -> CommonResult<BlockMeta>;
 
     fn scan(&self, dir: &VfsDir) -> CommonResult<Vec<BlockMeta>>;
 
     /// Release layout-owned state while the dataset lock is still held.
-    fn release(&self, meta: &BlockMeta) -> CommonResult<()>;
+    fn release(&self, dir: &VfsDir, meta: &BlockMeta);
 
     /// Remove backing resources. Callers may run this outside the dataset lock.
-    fn deallocate(&self, meta: &BlockMeta) -> CommonResult<()>;
+    fn deallocate(&self, dir: &VfsDir, meta: &BlockMeta) -> CommonResult<()>;
 
-    fn open_writer(&self, meta: &BlockMeta, off: i64) -> IOResult<BlockWriteContext>;
+    fn open_writer(&self, dir: &VfsDir, meta: &BlockMeta, off: i64) -> IOResult<BlockWriteContext>;
 
-    fn open_reader(&self, meta: &BlockMeta, off: i64) -> IOResult<BlockReadContext>;
+    fn open_reader(&self, dir: &VfsDir, meta: &BlockMeta, off: i64) -> IOResult<BlockReadContext>;
 
     /// Local path a co-located client can open directly, `Ok(None)` if the
     /// layout cannot expose one (e.g. raw bdev). Errors are propagated so
     /// callers can distinguish "not eligible" from "path resolution failed".
-    fn short_circuit(&self, meta: &BlockMeta) -> CommonResult<Option<String>>;
+    fn short_circuit(&self, dir: &VfsDir, meta: &BlockMeta) -> CommonResult<Option<String>>;
 }
 
 #[derive(Clone)]
@@ -101,10 +114,27 @@ impl BlockLayout for BlockLayoutKind {
         }
     }
 
-    fn finalize(&self, meta: &BlockMeta, committed_len: i64) -> CommonResult<BlockMeta> {
+    fn prepare_write(
+        &self,
+        dir: &VfsDir,
+        meta: &BlockMeta,
+        block: &ExtendedBlock,
+    ) -> CommonResult<BlockMeta> {
         match self {
-            Self::File(layout) => layout.finalize(meta, committed_len),
-            Self::Bdev(layout) => layout.finalize(meta, committed_len),
+            Self::File(layout) => layout.prepare_write(dir, meta, block),
+            Self::Bdev(layout) => layout.prepare_write(dir, meta, block),
+        }
+    }
+
+    fn finalize(
+        &self,
+        dir: &VfsDir,
+        meta: &BlockMeta,
+        committed_len: i64,
+    ) -> CommonResult<BlockMeta> {
+        match self {
+            Self::File(layout) => layout.finalize(dir, meta, committed_len),
+            Self::Bdev(layout) => layout.finalize(dir, meta, committed_len),
         }
     }
 
@@ -115,38 +145,38 @@ impl BlockLayout for BlockLayoutKind {
         }
     }
 
-    fn release(&self, meta: &BlockMeta) -> CommonResult<()> {
+    fn release(&self, dir: &VfsDir, meta: &BlockMeta) {
         match self {
-            Self::File(layout) => layout.release(meta),
-            Self::Bdev(layout) => layout.release(meta),
+            Self::File(layout) => layout.release(dir, meta),
+            Self::Bdev(layout) => layout.release(dir, meta),
         }
     }
 
-    fn deallocate(&self, meta: &BlockMeta) -> CommonResult<()> {
+    fn deallocate(&self, dir: &VfsDir, meta: &BlockMeta) -> CommonResult<()> {
         match self {
-            Self::File(layout) => layout.deallocate(meta),
-            Self::Bdev(layout) => layout.deallocate(meta),
+            Self::File(layout) => layout.deallocate(dir, meta),
+            Self::Bdev(layout) => layout.deallocate(dir, meta),
         }
     }
 
-    fn open_writer(&self, meta: &BlockMeta, off: i64) -> IOResult<BlockWriteContext> {
+    fn open_writer(&self, dir: &VfsDir, meta: &BlockMeta, off: i64) -> IOResult<BlockWriteContext> {
         match self {
-            Self::File(layout) => layout.open_writer(meta, off),
-            Self::Bdev(layout) => layout.open_writer(meta, off),
+            Self::File(layout) => layout.open_writer(dir, meta, off),
+            Self::Bdev(layout) => layout.open_writer(dir, meta, off),
         }
     }
 
-    fn open_reader(&self, meta: &BlockMeta, off: i64) -> IOResult<BlockReadContext> {
+    fn open_reader(&self, dir: &VfsDir, meta: &BlockMeta, off: i64) -> IOResult<BlockReadContext> {
         match self {
-            Self::File(layout) => layout.open_reader(meta, off),
-            Self::Bdev(layout) => layout.open_reader(meta, off),
+            Self::File(layout) => layout.open_reader(dir, meta, off),
+            Self::Bdev(layout) => layout.open_reader(dir, meta, off),
         }
     }
 
-    fn short_circuit(&self, meta: &BlockMeta) -> CommonResult<Option<String>> {
+    fn short_circuit(&self, dir: &VfsDir, meta: &BlockMeta) -> CommonResult<Option<String>> {
         match self {
-            Self::File(layout) => layout.short_circuit(meta),
-            Self::Bdev(layout) => layout.short_circuit(meta),
+            Self::File(layout) => layout.short_circuit(dir, meta),
+            Self::Bdev(layout) => layout.short_circuit(dir, meta),
         }
     }
 }

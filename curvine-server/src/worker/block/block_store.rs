@@ -76,27 +76,27 @@ impl BlockStore {
     }
 
     pub fn open_writer(&self, meta: &BlockMeta, off: i64) -> CommonResult<BlockWriteContext> {
-        let layout = {
+        let (layout, dir) = {
             let state = self.read()?;
-            state.layout_for(meta)
+            state.layout_for(meta)?
         };
-        layout.open_writer(meta, off).map_err(Into::into)
+        layout.open_writer(&dir, meta, off).map_err(Into::into)
     }
 
     pub fn open_reader(&self, meta: &BlockMeta, off: i64) -> CommonResult<BlockReadContext> {
-        let layout = {
+        let (layout, dir) = {
             let state = self.read()?;
-            state.layout_for(meta)
+            state.layout_for(meta)?
         };
-        layout.open_reader(meta, off).map_err(Into::into)
+        layout.open_reader(&dir, meta, off).map_err(Into::into)
     }
 
     pub fn short_circuit(&self, meta: &BlockMeta) -> CommonResult<Option<String>> {
-        let layout = {
+        let (layout, dir) = {
             let state = self.read()?;
-            state.layout_for(meta)
+            state.layout_for(meta)?
         };
-        layout.short_circuit(meta)
+        layout.short_circuit(&dir, meta)
     }
 
     pub fn worker_id(&self) -> CommonResult<u32> {
@@ -122,17 +122,16 @@ impl BlockStore {
 
     // Asynchronously delete block.
     pub fn async_remove_block(&self, id: i64) -> CommonResult<BlockMeta> {
-        let (meta, layout) = {
+        let removed = {
             let mut state = self.write()?;
-            let (meta, layout) = state.remove_block_state_by_id(id)?;
+            let removed = state.remove_block_state_by_id(id)?;
             state.decrement_blocks_to_delete();
-            (meta, layout)
+            removed
         };
 
-        layout.deallocate(&meta)?;
-        let state = self.read()?;
-        state.release_block_space(&meta)?;
-        Ok(meta)
+        removed.layout.deallocate(&removed.dir, &removed.meta)?;
+        self.read()?.release_block_space(&removed.meta)?;
+        Ok(removed.meta)
     }
 
     // Get all storage information and check whether the storage directory is normal.

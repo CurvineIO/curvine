@@ -13,18 +13,21 @@
 // limitations under the License.
 
 use crate::worker::storage::{ChoosingPolicy, RobinChoosingPolicy, VfsDir};
-use curvine_common::state::{ExtendedBlock, FileType, StorageType};
+use curvine_common::state::ExtendedBlock;
+#[cfg(test)]
+use curvine_common::state::{FileType, StorageType};
 use indexmap::map::Values;
 use indexmap::IndexMap;
 use log::{info, warn};
 use orpc::common::ByteUnit;
 use orpc::{err_box, CommonResult};
 use std::ops::Index;
+use std::sync::Arc;
 
 // Directory list.
 pub struct DirList {
-    pub(crate) dirs: IndexMap<u32, VfsDir>,
-    pub(crate) chooser: ChoosingPolicy,
+    dirs: IndexMap<u32, Arc<VfsDir>>,
+    chooser: ChoosingPolicy,
 }
 
 impl DirList {
@@ -34,7 +37,7 @@ impl DirList {
             if dirs.contains_key(&dir.id()) {
                 return err_box!("Storage ID hash conflict for dir {}", dir.id());
             }
-            dirs.insert(dir.id(), dir);
+            dirs.insert(dir.id(), Arc::new(dir));
         }
 
         Ok(Self {
@@ -51,15 +54,15 @@ impl DirList {
         self.len() == 0
     }
 
-    pub fn dir_iter(&self) -> Values<'_, u32, VfsDir> {
+    pub fn dir_iter(&self) -> Values<'_, u32, Arc<VfsDir>> {
         self.dirs.values()
     }
 
-    pub fn get_dir(&self, dir_id: u32) -> Option<&VfsDir> {
+    pub fn get_dir(&self, dir_id: u32) -> Option<&Arc<VfsDir>> {
         self.dirs.get(&dir_id)
     }
 
-    pub fn get_dir_index(&self, index: usize) -> Option<&VfsDir> {
+    pub fn get_dir_index(&self, index: usize) -> Option<&Arc<VfsDir>> {
         self.dirs.get_index(index).map(|x| x.1)
     }
 
@@ -93,18 +96,18 @@ impl DirList {
         used
     }
 
-    pub fn choose_dir(&mut self, block: &ExtendedBlock) -> CommonResult<&VfsDir> {
-        self.chooser.choose_dir(&self.dirs, block)
+    pub fn choose_dir(&mut self, block: &ExtendedBlock) -> CommonResult<Arc<VfsDir>> {
+        Ok(self.chooser.choose_dir(&self.dirs, block)?.clone())
     }
 
-    // Test-specific.
-    pub fn choose_dir_with_str<S: AsRef<str>>(
+    #[cfg(test)]
+    fn choose_dir_with_str<S: AsRef<str>>(
         &mut self,
         stg_type: StorageType,
         size_str: S,
-    ) -> CommonResult<&VfsDir> {
-        let block_size = ByteUnit::from_str(size_str.as_ref())?.as_byte();
-        let block = ExtendedBlock::new(0, block_size as i64, stg_type, FileType::File);
+    ) -> CommonResult<Arc<VfsDir>> {
+        let bytes = ByteUnit::from_str(size_str.as_ref())?.as_byte() as i64;
+        let block = ExtendedBlock::new(0, bytes, stg_type, FileType::File);
         self.choose_dir(&block)
     }
 
@@ -118,7 +121,7 @@ impl DirList {
                 ByteUnit::byte_to_string(dir.capacity() as u64),
                 ByteUnit::byte_to_string(dir.available() as u64),
             );
-            self.dirs.insert(dir.id(), dir);
+            self.dirs.insert(dir.id(), Arc::new(dir));
         } else {
             warn!("Dir {:?} already exists", dir)
         }
@@ -139,7 +142,7 @@ impl DirList {
 }
 
 impl Index<usize> for DirList {
-    type Output = VfsDir;
+    type Output = Arc<VfsDir>;
 
     fn index(&self, index: usize) -> &Self::Output {
         &self.dirs[index]

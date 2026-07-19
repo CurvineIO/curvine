@@ -46,9 +46,3 @@ mod vfs_dataset;
 pub use self::vfs_dataset::VfsDataset;
 
 pub type BlockDataset = VfsDataset;
-
-// Normal block directory.
-pub const ACTIVE_DIR: &str = "active";
-
-// Temporary block directory, such as blocks triggered for recovery or replication status
-pub const STAGING_DIR: &str = "staging";

@@ -37,6 +37,12 @@ pub struct VfsDataset {
     num_blocks_to_delete: AtomicUsize,
 }
 
+pub(crate) struct RemovedBlockState {
+    pub(crate) meta: BlockMeta,
+    pub(crate) layout: BlockLayoutKind,
+    pub(crate) dir: Arc<VfsDir>,
+}
+
 impl VfsDataset {
     fn new(
         cluster_id: &str,
@@ -153,9 +159,7 @@ impl VfsDataset {
 
     pub fn find_dir(&self, id: u32) -> CommonResult<&VfsDir> {
         match self.dir_list.get_dir(id) {
-            None => {
-                err_box!("No storage directory found: {:?}", id)
-            }
+            None => err_box!("No storage directory found: {:?}", id),
             Some(v) => Ok(v),
         }
     }
@@ -172,12 +176,18 @@ impl VfsDataset {
         self.ctime
     }
 
-    pub fn dir_iter(&self) -> Values<'_, u32, VfsDir> {
+    pub fn dir_iter(&self) -> Values<'_, u32, Arc<VfsDir>> {
         self.dir_list.dir_iter()
     }
 
     pub fn all_blocks(&self) -> Vec<BlockMeta> {
         self.meta.all_blocks()
+    }
+
+    #[cfg(test)]
+    fn write_test_data(&self, meta: &BlockMeta, size: &str) -> CommonResult<()> {
+        let dir = self.find_dir(meta.dir_id())?;
+        super::FileLayout::write_test_data(dir, meta, size)
     }
 
     #[cfg(test)]
@@ -192,38 +202,45 @@ impl VfsDataset {
             .map(|d| &d.state.offset_alloc)
     }
 
-    pub(crate) fn remove_block_state_by_id(
-        &mut self,
-        id: i64,
-    ) -> CommonResult<(BlockMeta, BlockLayoutKind)> {
+    pub(crate) fn remove_block_state_by_id(&mut self, id: i64) -> CommonResult<RemovedBlockState> {
+        let meta = match self.meta.get(id) {
+            None => return err_box!("Not found block {}", id),
+            Some(meta) => meta,
+        };
+        let layout = self.layouts.get(meta.storage_type()).clone();
+        let dir = match self.dir_list.get_dir(meta.dir_id()) {
+            None => return err_box!("No storage directory found: {:?}", meta.dir_id()),
+            Some(dir) => dir.clone(),
+        };
+
         let meta = match self.meta.remove(id) {
             None => return err_box!("Not found block {}", id),
             Some(meta) => meta,
         };
+        layout.release(&dir, &meta);
 
-        let layout = self.layouts.get(meta.storage_type());
-        if self.find_dir(meta.dir_id()).is_ok() {
-            layout.release(&meta)?;
-        }
-
-        Ok((meta, layout.clone()))
+        Ok(RemovedBlockState { meta, layout, dir })
     }
 
     pub(crate) fn release_block_space(&self, meta: &BlockMeta) -> CommonResult<()> {
         let dir = self.find_dir(meta.dir_id())?;
-        dir.release_space(meta.is_final(), meta.actual_len);
+        dir.release_space(meta.is_final(), meta.physical_bytes());
         Ok(())
     }
 
     pub(crate) fn remove_block_by_id(&mut self, id: i64) -> CommonResult<BlockMeta> {
-        let (meta, layout) = self.remove_block_state_by_id(id)?;
-        layout.deallocate(&meta)?;
-        self.release_block_space(&meta)?;
-        Ok(meta)
+        let removed = self.remove_block_state_by_id(id)?;
+        removed.layout.deallocate(&removed.dir, &removed.meta)?;
+        self.release_block_space(&removed.meta)?;
+        Ok(removed.meta)
     }
 
-    pub fn layout_for(&self, meta: &BlockMeta) -> BlockLayoutKind {
-        self.layouts.get(meta.storage_type()).clone()
+    pub fn layout_for(&self, meta: &BlockMeta) -> CommonResult<(BlockLayoutKind, Arc<VfsDir>)> {
+        let dir = match self.dir_list.get_dir(meta.dir_id()) {
+            None => return err_box!("No storage directory found: {:?}", meta.dir_id()),
+            Some(dir) => dir.clone(),
+        };
+        Ok((self.layouts.get(meta.storage_type()).clone(), dir))
     }
 }
 
@@ -265,12 +282,13 @@ impl Dataset for VfsDataset {
             Some(meta) => {
                 if meta.is_active() {
                     let dir = self.find_dir(meta.dir_id())?;
-                    // Create a new block meta, where block.len represents the block size
-                    let mut new_meta = BlockMeta::new(meta.id, block.len, dir);
-                    new_meta.bdev_offset = meta.bdev_offset; // preserve allocated offset
+                    let layout = self.layouts.get(meta.storage_type());
+                    let old_physical_bytes = meta.physical_bytes();
+                    let new_meta = layout.prepare_write(dir, &meta, block)?;
+                    let new_physical_bytes = new_meta.physical_bytes();
 
-                    dir.release_space(meta.is_final(), meta.actual_len);
-                    dir.reserve_space(false, new_meta.len);
+                    dir.release_space(meta.is_final(), old_physical_bytes);
+                    dir.reserve_space(false, new_physical_bytes);
                     self.meta.put(new_meta.clone());
 
                     Ok(new_meta)
@@ -286,10 +304,10 @@ impl Dataset for VfsDataset {
             None => {
                 let dir = self.dir_list.choose_dir(block)?;
                 let layout = self.layouts.get(dir.storage_type());
-                let meta = layout.allocate(dir, block)?;
+                let meta = layout.allocate(&dir, block)?;
 
                 self.meta.put(meta.clone());
-                dir.reserve_space(false, block.len);
+                dir.reserve_space(false, meta.physical_bytes());
 
                 Ok(meta)
             }
@@ -298,7 +316,7 @@ impl Dataset for VfsDataset {
 
     fn finalize_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         // Keep the meta borrow scoped before mutating the meta store and dir accounting.
-        let (dir_id, actual_len, final_meta) = {
+        let (dir_id, reserved_bytes, final_bytes, final_meta) = {
             let meta = self.get_block_check(block.id)?;
             if meta.state() == &BlockState::Finalized {
                 if meta.len() == block.len {
@@ -320,8 +338,10 @@ impl Dataset for VfsDataset {
                 );
             }
 
+            let dir = self.find_dir(meta.dir_id())?;
             let layout = self.layouts.get(meta.storage_type());
-            let final_meta = layout.finalize(meta, block.len)?;
+            let reserved_bytes = meta.physical_bytes();
+            let final_meta = layout.finalize(dir, meta, block.len)?;
             if block.len != final_meta.len() {
                 return err_box!(
                     "Block {} length mismatch, expected: {}, actual: {}",
@@ -331,12 +351,13 @@ impl Dataset for VfsDataset {
                 );
             }
 
-            (meta.dir_id(), meta.actual_len, final_meta)
+            let final_bytes = final_meta.physical_bytes();
+            (meta.dir_id(), reserved_bytes, final_bytes, final_meta)
         };
 
         let dir = self.find_dir(dir_id)?;
-        dir.release_space(false, actual_len);
-        dir.reserve_space(true, final_meta.actual_len);
+        dir.release_space(false, reserved_bytes);
+        dir.reserve_space(true, final_bytes);
         self.meta.put(final_meta.clone());
 
         Ok(final_meta)
@@ -363,7 +384,6 @@ mod test {
     use orpc::sync::AtomicLong;
     use orpc::sys::FsStats;
     use orpc::CommonResult;
-    use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
@@ -385,26 +405,20 @@ mod test {
         VfsDataset::from_conf("test", &conf).unwrap()
     }
 
-    fn spdk_state(dir_id: u32) -> Arc<DirState> {
+    fn spdk_state() -> Arc<DirState> {
         Arc::new(DirState {
-            dir_id,
-            base_path: PathBuf::from("/tmp/spdk"),
-            storage_type: StorageType::SpdkDisk,
             bdev_name: Some("nvme0".into()),
             bdev_capacity: 1 << 30,
             offset_alloc: DirState::new_offset_alloc(StorageType::SpdkDisk, 1 << 30, 4096),
         })
     }
 
-    fn spdk_dir(state: Arc<DirState>) -> VfsDir {
-        let dir_id = state.dir_id;
+    fn spdk_dir(dir_id: u32, state: Arc<DirState>) -> VfsDir {
         let mut version = StorageVersion::with_cluster("t");
         version.dir_id = dir_id;
         VfsDir {
             version,
             stats: FsStats::new("/tmp"),
-            active_dir: PathBuf::from("/tmp/a"),
-            staging_dir: PathBuf::from("/tmp/s"),
             storage_type: StorageType::SpdkDisk,
             conf_capacity: 1 << 30,
             reserved_bytes: 0,
@@ -416,8 +430,8 @@ mod test {
     }
 
     fn spdk_dataset() -> CommonResult<VfsDataset> {
-        let st = spdk_state(1);
-        VfsDataset::new("t", DirList::new(vec![spdk_dir(st)])?, None)
+        let st = spdk_state();
+        VfsDataset::new("t", DirList::new(vec![spdk_dir(1, st)])?, None)
     }
 
     #[test]
@@ -426,7 +440,7 @@ mod test {
         let mut block = ExtendedBlock::with_mem(1, "100B")?;
         let meta = ds.open_block(&block)?;
         assert_eq!(ds.available(), 400);
-        meta.write_test_data("50B")?;
+        ds.write_test_data(&meta, "50B")?;
         block.len = 50;
         ds.finalize_block(&block)?;
         assert_eq!(ds.available(), 450);
@@ -437,12 +451,12 @@ mod test {
         let mut ds = create_data_set(true, "append");
         let mut block = ExtendedBlock::with_mem(1, "100B")?;
         let meta = ds.open_block(&block)?;
-        meta.write_test_data("50B")?;
+        ds.write_test_data(&meta, "50B")?;
         block.len = 50;
         ds.finalize_block(&block)?;
         block.len = 70;
         let meta2 = ds.open_block(&block)?;
-        meta2.write_test_data("20B")?;
+        ds.write_test_data(&meta2, "20B")?;
         ds.finalize_block(&block)?;
         assert_eq!(ds.available(), 430);
         Ok(())
@@ -452,8 +466,8 @@ mod test {
         let mut ds = create_data_set(true, "init");
         for id in 1..12 {
             let block = ExtendedBlock::with_mem(id, &format!("{}B", id))?;
-            ds.open_block(&block)?
-                .write_test_data(&format!("{}B", id))?;
+            let meta = ds.open_block(&block)?;
+            ds.write_test_data(&meta, &format!("{}B", id))?;
         }
         drop(ds);
         let ds = create_data_set(false, "init");
@@ -523,8 +537,8 @@ mod test {
     }
     #[test]
     fn spdk_restore_free_list() -> CommonResult<()> {
-        let st = spdk_state(1);
-        let mut ds = VfsDataset::new("t", DirList::new(vec![spdk_dir(st.clone())])?, None)?;
+        let st = spdk_state();
+        let mut ds = VfsDataset::new("t", DirList::new(vec![spdk_dir(1, st.clone())])?, None)?;
         let b1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
         let b2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
         let b3 = ExtendedBlock::new(3, 4096, StorageType::SpdkDisk, FileType::File);
@@ -535,7 +549,7 @@ mod test {
         ds.abort_block(&b2)?;
         let snap = st.offset_alloc.snapshot();
 
-        let st2 = spdk_state(1);
+        let st2 = spdk_state();
         st2.offset_alloc.restore(&snap);
 
         let entries = st2.offset_alloc.free_list_entries();
