@@ -21,7 +21,6 @@ use std::fmt::{Debug, Formatter};
 #[derive(Debug)]
 pub enum FuseOperator<'a> {
     Notimplemented,
-    Empty,
     Init(Init<'a>),
     StatFs(StatFs<'a>),
     ReadDir(ReadDir<'a>),
@@ -54,6 +53,8 @@ pub enum FuseOperator<'a> {
     Interrupt(Interrupt<'a>),
     ListXAttr(ListXAttr<'a>),
     FSync(FSync<'a>),
+    FSyncDir(FSyncDir<'a>),
+    Destroy(Destroy<'a>),
     Symlink(Symlink<'a>),
     Readlink(Readlink<'a>),
     GetLk(GetLk<'a>),
@@ -351,6 +352,15 @@ pub struct ListXAttr<'a> {
 
 #[derive(Debug)]
 pub struct FSync<'a> {
+    pub header: &'a fuse_in_header,
+    pub arg: &'a fuse_fsync_in,
+}
+
+// fsync on a directory fd. Shares `fuse_fsync_in` with file FSync, but is a
+// distinct operator: FSYNC is stream-routed to `fsync`, FSYNCDIR is meta-routed
+// to `fsync_dir`.
+#[derive(Debug)]
+pub struct FSyncDir<'a> {
     pub header: &'a fuse_in_header,
     pub arg: &'a fuse_fsync_in,
 }

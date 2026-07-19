@@ -39,6 +39,7 @@ use orpc::runtime::Runtime;
 use orpc::sys::FFIUtils;
 use orpc::{sys, ternary, try_option};
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::sync::Arc;
 
 pub struct CurvineFileSystem {
@@ -189,6 +190,40 @@ impl CurvineFileSystem {
         if first.is_ok() {
             *first = next;
         }
+    }
+
+    /// Shared rename path resolution used by both `rename` and `rename2`.
+    async fn rename_paths(
+        &self,
+        old_id: u64,
+        old_name: &OsStr,
+        new_dir: u64,
+        new_name: &OsStr,
+    ) -> FuseResult<()> {
+        let old_name = try_option!(old_name.to_str());
+        let new_name = try_option!(new_name.to_str());
+        if new_name.len() > FUSE_MAX_NAME_LENGTH {
+            return err_fuse!(libc::ENAMETOOLONG);
+        }
+
+        let (old_path, new_path) = self.state.get_path2(old_id, old_name, new_dir, new_name)?;
+        self.ensure_writable_path(&old_path, RpcCode::Rename)
+            .await?;
+        self.ensure_writable_path(&new_path, RpcCode::Rename)
+            .await?;
+
+        self.state
+            .fs_rename(old_id, old_name, new_dir, new_name)
+            .await
+    }
+
+    /// Whether a RENAME2 `flags` value is supported. Checked against the RAW
+    /// value (not `RenameFlags::from_bits_truncate`, which would silently drop
+    /// unknown high bits and let a flag the kernel required pass as a plain
+    /// rename). The FUSE-facing client only issues flag-less renames, so any
+    /// non-zero flag (NO_REPLACE/EXCHANGE/WHITEOUT/…) is rejected with ENOSYS.
+    fn rename2_flags_supported(flags: u32) -> bool {
+        flags == 0
     }
 
     fn to_file_lock(&self, arg: &fuse_lk_in) -> FileLock {
@@ -1203,24 +1238,24 @@ impl fs::FileSystem for CurvineFileSystem {
     }
 
     async fn rename(&self, op: Rename<'_>) -> FuseResult<()> {
-        let old_name = try_option!(op.old_name.to_str());
-        let new_name = try_option!(op.new_name.to_str());
-        if new_name.len() > FUSE_MAX_NAME_LENGTH {
-            return err_fuse!(libc::ENAMETOOLONG);
+        self.rename_paths(op.header.nodeid, op.old_name, op.arg.newdir, op.new_name)
+            .await
+    }
+
+    async fn rename2(&self, op: Rename2<'_>) -> FuseResult<()> {
+        // The FUSE-facing client rename path only issues flag-less renames, so
+        // NO_REPLACE/EXCHANGE/WHITEOUT are not plumbed through to the master RPC.
+        // Reject any flag with ENOSYS (POSIX-correct, and strictly better than
+        // the previous "all RENAME2 -> ENOSYS via the dispatch wildcard").
+        if !Self::rename2_flags_supported(op.arg.flags) {
+            return err_fuse!(
+                libc::ENOSYS,
+                "RENAME2 flags 0x{:x} not supported (flag-less rename only)",
+                op.arg.flags
+            );
         }
-
-        let (old_path, new_path) =
-            self.state
-                .get_path2(op.header.nodeid, old_name, op.arg.newdir, new_name)?;
-        self.ensure_writable_path(&old_path, RpcCode::Rename)
-            .await?;
-        self.ensure_writable_path(&new_path, RpcCode::Rename)
-            .await?;
-
-        self.state
-            .fs_rename(op.header.nodeid, old_name, op.arg.newdir, new_name)
-            .await?;
-        Ok(())
+        self.rename_paths(op.header.nodeid, op.old_name, op.arg.newdir, op.new_name)
+            .await
     }
 
     async fn batch_forget(&self, op: BatchForget<'_>) -> FuseResult<()> {
@@ -1729,5 +1764,18 @@ mod tests {
         let names = fuse_init_flag_names(FUSE_BIG_WRITES | unknown);
         assert!(names.contains(&"BIG_WRITES".to_string()));
         assert!(names.iter().any(|n| n == "0x40000000"));
+    }
+
+    #[test]
+    fn rename2_flags_supported_only_accepts_zero() {
+        // Flag-less rename is the only supported form.
+        assert!(CurvineFileSystem::rename2_flags_supported(0));
+        // Known rename flags are rejected (client does not plumb them through).
+        assert!(!CurvineFileSystem::rename2_flags_supported(1)); // RENAME_NOREPLACE
+        assert!(!CurvineFileSystem::rename2_flags_supported(2)); // RENAME_EXCHANGE
+        assert!(!CurvineFileSystem::rename2_flags_supported(4)); // RENAME_WHITEOUT
+                                                                 // An unknown high bit must also be rejected — checked against the raw
+                                                                 // value, so it is not silently truncated away (the RenameFlags footgun).
+        assert!(!CurvineFileSystem::rename2_flags_supported(1 << 6));
     }
 }

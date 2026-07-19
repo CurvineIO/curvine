@@ -309,6 +309,16 @@ impl FuseRequest {
                 arg: decoder.get_struct()?,
             }),
 
+            FUSE_FSYNCDIR => FuseOperator::FSyncDir(FSyncDir {
+                header,
+                arg: decoder.get_struct()?,
+            }),
+
+            FUSE_DESTROY => FuseOperator::Destroy(Destroy { header }),
+
+            // Opcodes with no arm fall through to `Notimplemented` -> ENOSYS.
+            // Whether that is intentional (BMAP/POLL/IOCTL/LSEEK etc.) or a gap
+            // is recorded authoritatively by `FuseOpCode::expected_dispatch`.
             _ => FuseOperator::Notimplemented,
         };
 
