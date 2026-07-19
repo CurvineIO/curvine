@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{FileUtils, LocalTime};
+use crate::common::LocalTime;
 use crate::runtime::Runtime;
 use crate::CommonResult;
 use md5::{Digest, Md5};
@@ -148,8 +148,9 @@ impl Utils {
         let mut path = env::current_dir().unwrap_or(PathBuf::from("."));
         path.push("../testing");
 
-        // Ensure the testing directory exists
-        let _ = FileUtils::create_parent_dir(&path, true);
+        // Ensure the testing directory itself exists (not only its parent).
+        // create_parent_dir(../testing) would only create the workspace root.
+        let _ = fs::create_dir_all(&path);
 
         path.push(format!("test-{}", Self::rand_id()));
         format!("{}", path.display())
@@ -355,5 +356,42 @@ mod tests {
     fn cur_dir() {
         let dir = Utils::cur_dir_sub("meta");
         println!("{}", dir)
+    }
+
+    #[test]
+    fn test_file_creates_testing_dir() {
+        use std::env;
+        use std::fs;
+        use std::path::Path;
+        use std::sync::Mutex;
+
+        // Serialize CWD mutations across parallel tests in this crate.
+        static CWD_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = CWD_LOCK.lock().unwrap();
+
+        let base = env::temp_dir().join(format!("orpc-test-file-{}", Utils::rand_id()));
+        let work = base.join("crate_cwd");
+        fs::create_dir_all(&work).unwrap();
+
+        let testing = base.join("testing");
+        assert!(!testing.exists());
+
+        let prev = env::current_dir().unwrap();
+        env::set_current_dir(&work).unwrap();
+
+        let file = Utils::test_file();
+        let parent = Path::new(&file)
+            .parent()
+            .and_then(|p| p.canonicalize().ok());
+        let testing_canon = testing.canonicalize().ok();
+        let ok = testing.is_dir() && parent == testing_canon;
+
+        env::set_current_dir(prev).unwrap();
+        let _ = fs::remove_dir_all(&base);
+
+        assert!(
+            ok,
+            "test_file() must create ../testing and place the file under it"
+        );
     }
 }
