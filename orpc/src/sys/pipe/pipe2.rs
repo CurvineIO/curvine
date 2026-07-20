@@ -16,7 +16,7 @@ use crate::io::IOResult;
 use crate::sys::pipe::{AsyncFd, PipeFd, PipePool, PipeReader, PipeWriter};
 use crate::sys::RawIO;
 use crate::{err_box, sys};
-use std::io::IoSlice;
+use std::io::{ErrorKind, IoSlice};
 use std::sync::Arc;
 
 pub struct Pipe2 {
@@ -155,6 +155,52 @@ impl Pipe2 {
         Ok(res as usize)
     }
 
+    /// Read exactly `buf.len()` bytes from the pipe.
+    ///
+    /// The pipe is non-blocking, so a single read may consume only part of a
+    /// transfer. `PipeReader::async_read` waits for readiness again after
+    /// `EAGAIN`; this loop handles successful short reads and retries `EINTR`.
+    /// A zero-length read is terminal because otherwise the loop could wait
+    /// forever for bytes that will never arrive.
+    pub async fn read_buf_full(&mut self, buf: &mut [u8]) -> IOResult<()> {
+        if buf.len() > self.buf_size {
+            return err_box!(
+                "read_buf_full: request size {} exceeds pipe buffer size {}",
+                buf.len(),
+                self.buf_size
+            );
+        }
+
+        let expected = buf.len();
+        let mut read = 0;
+        while read < expected {
+            match self.read_buf(&mut buf[read..]).await {
+                Ok(0) => {
+                    // Do not return a partially consumed pipe to its pool. The
+                    // FuseReceiver uses an unpooled pipe, but keeping this rule
+                    // here makes the helper safe for pooled callers as well.
+                    let _ = self.pool.take();
+                    return err_box!(
+                        "read_buf_full: pipe closed after {} of {} bytes",
+                        read,
+                        expected
+                    );
+                }
+                Ok(len) => read += len,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    // A terminal error may leave unread bytes in the pipe. Drop
+                    // rather than pool it so those bytes cannot poison a later
+                    // transfer.
+                    let _ = self.pool.take();
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn deregister(&mut self) -> PipeFd {
         let _ = self.reader.deregister();
         let _ = self.writer.deregister();
@@ -192,5 +238,42 @@ impl Drop for Pipe2 {
             // The pipeline in the resource is returned to the resource pool, not close.
             pool.release(self)
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::Pipe2;
+    use crate::sys;
+    use crate::sys::pipe::{AsyncFd, OwnedFd, PipeFd};
+    use std::io::IoSlice;
+
+    #[tokio::test]
+    async fn read_buf_full_waits_for_all_partial_reads() {
+        let mut pipe = Pipe2::new(PipeFd::new(4096, false, false).unwrap()).unwrap();
+        let first = b"first-half";
+        let second = b"second-half";
+        let mut actual = vec![0; first.len() + second.len()];
+        let write_owner = OwnedFd::new(sys::dup(pipe.write_raw_fd()).unwrap());
+        let write_fd = AsyncFd::new(write_owner.as_borrowed()).unwrap();
+
+        pipe.write_iov(first.len(), &[IoSlice::new(first)])
+            .await
+            .unwrap();
+
+        let (read_result, ()) = tokio::join!(pipe.read_buf_full(&mut actual), async {
+            // The reader consumes the first half and then observes EAGAIN.
+            // Supplying the second half later proves it waits for readiness
+            // and resumes instead of treating the first short read as fatal.
+            tokio::task::yield_now().await;
+            let written = write_fd
+                .async_write(|fd| sys::writev(fd.fd(), &[IoSlice::new(second)]))
+                .await
+                .unwrap();
+            assert_eq!(written as usize, second.len());
+        });
+
+        read_result.unwrap();
+        assert_eq!(actual, [first.as_slice(), second.as_slice()].concat());
     }
 }

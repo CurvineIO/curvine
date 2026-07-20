@@ -30,7 +30,7 @@ use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::AsyncSender;
 use orpc::sync::FastDashMap;
 use orpc::sys::pipe::{AsyncFd, Pipe2, PipeFd};
-use orpc::{err_box, sys, try_option_ref};
+use orpc::{err_box, sys, try_option_mut};
 use std::sync::Arc;
 use tokio::sync::{watch, Notify};
 
@@ -119,7 +119,7 @@ impl<T: FileSystem> FuseReceiver<T> {
     }
 
     pub async fn splice(&mut self) -> IOResult<BytesMut> {
-        let pipe2 = try_option_ref!(self.pipe2);
+        let pipe2 = try_option_mut!(self.pipe2);
 
         let write_len = pipe2.write_io(&self.kernel_fd, None, self.fuse_len).await?;
 
@@ -128,19 +128,15 @@ impl<T: FileSystem> FuseReceiver<T> {
             self.buf.set_len(write_len);
         }
 
-        let read_len = pipe2.read_buf(&mut self.buf[..write_len]).await?;
-        if write_len != read_len {
-            return err_box!(
-                "splice read and write lengths are inconsistent, write len {}, read len {}",
-                write_len,
-                read_len
-            );
-        }
-        if read_len < FUSE_IN_HEADER_LEN {
+        // `write_len` is the number of bytes splice actually moved from
+        // /dev/fuse, not the configured maximum request size. A pipe read may
+        // return fewer bytes, so consume exactly that transfer before parsing.
+        pipe2.read_buf_full(&mut self.buf[..write_len]).await?;
+        if write_len < FUSE_IN_HEADER_LEN {
             return err_box!("short read on fuse device");
         };
 
-        Ok(self.buf.split_to(read_len))
+        Ok(self.buf.split_to(write_len))
     }
 
     /// Build a reply handle for `unique`. When `labels` is `Some`, a metrics
