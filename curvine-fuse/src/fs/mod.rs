@@ -32,3 +32,6 @@ mod fuse_writer;
 pub use self::fuse_writer::FuseWriter;
 
 pub mod dcache;
+
+mod stream_result;
+pub(crate) use self::stream_result::deliver_stream_result;
