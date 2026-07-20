@@ -1147,8 +1147,6 @@ impl NodeState {
                     StateStageTimer::start(metrics_enabled, false, STATE_STAGE_FILE_HANDLES);
                 info!("node_state::restore: restoring file_handles");
                 let handles_count = reader.read_len()?;
-                let mut restored_handles = 0;
-                let mut any_failed = false;
                 for i in 0..handles_count {
                     let handle = match FileHandle::restore(reader, self).await {
                         Ok(handle) => handle,
@@ -1159,8 +1157,7 @@ impl NodeState {
                                 handles_count,
                                 e
                             );
-                            any_failed = true;
-                            continue;
+                            return Err(e);
                         }
                     };
 
@@ -1169,16 +1166,13 @@ impl NodeState {
                         .entry(handle.ino())
                         .or_default()
                         .insert(handle.fh(), Arc::new(handle));
-                    restored_handles += 1;
                 }
                 info!(
-                    "node_state::restore: {}/{} file_handles restored",
-                    restored_handles, handles_count
+                    "node_state::restore: {} file_handles restored",
+                    handles_count
                 );
                 if let Some(stage) = stage {
-                    if !any_failed {
-                        stage.success();
-                    }
+                    stage.success();
                 }
             }
 
@@ -1230,7 +1224,7 @@ mod test {
     use curvine_client::unified::{UnifiedFileSystem, UnifiedWriter};
     use curvine_common::conf::ClusterConf;
     use curvine_common::fs::local::LocalWriter;
-    use curvine_common::fs::{ListStream, Path, StateWriter, Writer};
+    use curvine_common::fs::{ListStream, Path, StateReader, StateWriter, Writer};
     use curvine_common::state::FileStatus;
     use orpc::common::{FastHashMap, Utils};
     use orpc::runtime::{AsyncRuntime, RpcRuntime};
@@ -1370,6 +1364,47 @@ mod test {
         NodeState::dec_gauges_lockstep(&legacy, &alias);
         assert_eq!(legacy.get(), 1);
         assert_eq!(alias.get(), 1);
+    }
+
+    #[test]
+    fn restore_returns_error_on_corrupt_file_handle_record() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let task_rt = rt.clone();
+
+        rt.block_on(async move {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), task_rt).unwrap();
+            let persisted_state = NodeState::new(fs.clone()).unwrap();
+            let restored_state = NodeState::new(fs).unwrap();
+
+            let state_path = Utils::temp_file();
+            let _ = std::fs::remove_file(&state_path);
+            let mut writer = StateWriter::new(&state_path).unwrap();
+            writer.write_all(crate::STATE_FILE_MAGIC).unwrap();
+            writer.write_len(crate::STATE_FILE_VERSION).unwrap();
+            persisted_state.dir_read().persist(&mut writer).unwrap();
+
+            writer.write_len(1).unwrap();
+            writer.write_struct(&FileHandle::TYPE_BACKEND).unwrap();
+            writer.write_all(b"not-json\n").unwrap();
+
+            // A restore loop that swallows the corrupt handle reads these as
+            // dir_handles_count and fh_creator, then incorrectly returns Ok.
+            writer.write_len(0).unwrap();
+            writer.write_len(0).unwrap();
+            writer.flush().unwrap();
+            drop(writer);
+
+            let mut reader = StateReader::new(&state_path).unwrap();
+            let result = restored_state.restore(&mut reader).await;
+            drop(reader);
+            let _ = std::fs::remove_file(&state_path);
+
+            assert!(
+                result.is_err(),
+                "a corrupt file-handle record must fail the whole state restore"
+            );
+        });
     }
 
     #[cfg(target_os = "linux")]
