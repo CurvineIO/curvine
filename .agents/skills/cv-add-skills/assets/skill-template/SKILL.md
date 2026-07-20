@@ -1,6 +1,6 @@
 ---
 name: cv-<name>
-description: <One sentence: what this skill does>. Use when <comma-separated triggers>.
+description: "<One sentence: what this skill does>. Use when <comma-separated triggers>."
 ---
 
 # cv-<name>
