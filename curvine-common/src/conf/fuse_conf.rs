@@ -107,11 +107,10 @@ pub struct FuseConf {
     // Mount the whole FUSE filesystem read-only at the kernel level.
     pub readonly: bool,
 
-    // Octal umask applied ONLY when synthesizing default permission bits for a
-    // status that carries no mode (mode == 0) in `status_to_attr`. It does NOT
-    // mask the reported mode of files that already have one (getattr reports the
-    // stored mode as-is), nor the create path (which applies the per-request
-    // umask from the FUSE request). Default value 022.
+    // Octal umask applied when synthesizing permission bits for `.`/`..` entries.
+    // It does NOT mask persisted file modes (getattr reports the stored mode as-is),
+    // nor the create path (which applies the per-request umask from the FUSE
+    // request). Default value 022.
     pub umask: u32,
 
     pub uid: u32,
