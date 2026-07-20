@@ -33,6 +33,8 @@ auth_token_env = "CURVINE_FAULT_TOKEN"
 # master configuration
 [master]
 meta_dir = "testing/meta"
+# Worker selection policy: local, robin, random, load_based, or weighted.
+# worker_policy = "weighted"
 log = { level = "info", log_dir = "stdout", file_name = "master.log" }
 
 
@@ -46,6 +48,10 @@ journal_dir = "testing/journal"
 
 # Worker configuration
 [worker]
+# Relative allocation weight used when master.worker_policy = "weighted".
+# Set higher values on more capable nodes; 0 disables new allocations to this worker.
+# This is trusted administrator configuration and is not capped by the master.
+weight = 1
 dir_reserved = "0"
 data_dir = [
     "[DISK]testing/data",

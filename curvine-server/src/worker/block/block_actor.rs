@@ -61,6 +61,7 @@ impl BlockActor {
             store.cluster_id()?,
             store.worker_id()?,
             worker_addr,
+            conf.worker.weight,
         );
         let executor = GroupExecutor::new(
             "worker-block-executor",

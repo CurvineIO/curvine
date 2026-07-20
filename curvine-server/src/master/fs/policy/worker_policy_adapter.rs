@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::policy::WorkerPolicyAdapter::{LoadBased, Local, Random, Robin};
+use crate::master::fs::policy::WorkerPolicyAdapter::{LoadBased, Local, Random, Robin, Weighted};
 use crate::master::fs::policy::{
     ChooseContext, LoadBasedWorkerPolicy, LocalWorkerPolicy, RandomWorkerPolicy, RobinWorkerPolicy,
-    WorkerPolicy,
+    WeightedWorkerPolicy, WorkerPolicy,
 };
 use curvine_common::conf::ClusterConf;
 use curvine_common::state::{WorkerAddress, WorkerInfo};
@@ -27,6 +27,7 @@ pub enum WorkerPolicyAdapter {
     Local(LocalWorkerPolicy),
     Random(RandomWorkerPolicy),
     LoadBased(LoadBasedWorkerPolicy),
+    Weighted(WeightedWorkerPolicy),
 }
 
 impl WorkerPolicyAdapter {
@@ -34,6 +35,7 @@ impl WorkerPolicyAdapter {
     pub const LOCAL: &'static str = "local";
     pub const RANDOM: &'static str = "random";
     pub const LOAD_BASED: &'static str = "load_based";
+    pub const WEIGHTED: &'static str = "weighted";
 
     pub fn from_conf(conf: &ClusterConf) -> CommonResult<Self> {
         let policy_str = conf.master.worker_policy.as_str();
@@ -42,6 +44,7 @@ impl WorkerPolicyAdapter {
             Self::ROBIN => Robin(RobinWorkerPolicy::new()),
             Self::RANDOM => Random(RandomWorkerPolicy::new()),
             Self::LOAD_BASED => LoadBased(LoadBasedWorkerPolicy::new()),
+            Self::WEIGHTED => Weighted(WeightedWorkerPolicy::new()),
             _ => return err_box!("Unsupported worker policy {}", policy_str),
         };
         Ok(policy)
@@ -57,6 +60,7 @@ impl WorkerPolicyAdapter {
             Local(ref f) => f.choose(workers, ctx),
             Random(ref f) => f.choose(workers, ctx),
             LoadBased(ref f) => f.choose(workers, ctx),
+            Weighted(ref f) => f.choose(workers, ctx),
         }
     }
 
@@ -71,6 +75,7 @@ impl WorkerPolicyAdapter {
             Local(ref f) => f.choose_workers(workers, Some(count), exclude_workers),
             Random(ref f) => f.choose_workers(workers, Some(count), exclude_workers),
             LoadBased(ref f) => f.choose_workers(workers, Some(count), exclude_workers),
+            Weighted(ref f) => f.choose_workers(workers, Some(count), exclude_workers),
         }
     }
 }

@@ -79,6 +79,7 @@ message WorkerHeartbeatRequest {
 
     repeated StorageInfoProto storages = 8;
     repeated BlockReportInfoProto blocks = 9;
+    optional uint32 weight = 10 [default = 1];
 }
 
 message WorkerHeartbeatResponse {
