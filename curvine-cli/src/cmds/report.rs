@@ -17,6 +17,7 @@ use clap::{Parser, Subcommand};
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::state::MasterInfo;
 use orpc::CommonResult;
+use serde::Serialize;
 
 #[derive(Parser, Debug)]
 pub struct ReportCommand {
@@ -35,6 +36,8 @@ pub enum ReportSubCommand {
         #[clap(value_name = "WORKER_ADDRESS")]
         worker_address: Option<String>,
     },
+    /// Print Fluid CacheRuntime ReportSummary JSON
+    FluidSummary,
     Used,
     Available,
 }
@@ -58,6 +61,9 @@ impl ReportCommand {
                         println!("{}", report.capacity_cluster());
                     }
                 }
+                ReportSubCommand::FluidSummary => {
+                    println!("{}", report.fluid_summary());
+                }
                 ReportSubCommand::Used => {
                     println!("{}", report.used());
                 }
@@ -75,6 +81,17 @@ impl ReportCommand {
 
 struct CurvineReport {
     info: MasterInfo,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FluidReportSummary {
+    cached: String,
+    cached_percentage: String,
+    cache_capacity: String,
+    cache_hit_ratio: String,
+    file_num: String,
+    ufs_total: String,
 }
 
 impl CurvineReport {
@@ -342,6 +359,22 @@ impl CurvineReport {
         builder
     }
 
+    pub fn fluid_summary(&self) -> String {
+        // Fluid defines cachedPercentage against UFS total. Curvine does not
+        // keep UFS total as cheap master metadata yet, so avoid deriving it
+        // from cache capacity.
+        let summary = FluidReportSummary {
+            cached: fluid_bytes_to_string(self.info.fs_used),
+            cached_percentage: "0".to_string(),
+            cache_capacity: fluid_bytes_to_string(self.info.capacity),
+            cache_hit_ratio: "0".to_string(),
+            file_num: self.info.inode_file_num.to_string(),
+            ufs_total: "0".to_string(),
+        };
+
+        serde_json::to_string(&summary).expect("Fluid report summary serialization should not fail")
+    }
+
     // Helper method to calculate percentage
     fn get_percent(numerator: i64, denominator: i64) -> f64 {
         if denominator == 0 {
@@ -349,4 +382,29 @@ impl CurvineReport {
         }
         (numerator as f64 / denominator as f64) * 100.0
     }
+}
+
+fn fluid_bytes_to_string(size: i64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    const TIB: f64 = GIB * 1024.0;
+    const PIB: f64 = TIB * 1024.0;
+
+    let size = size.max(0) as f64;
+    let (value, unit) = if size >= PIB {
+        (size / PIB, "PiB")
+    } else if size >= TIB {
+        (size / TIB, "TiB")
+    } else if size >= GIB {
+        (size / GIB, "GiB")
+    } else if size >= MIB {
+        (size / MIB, "MiB")
+    } else if size >= KIB {
+        (size / KIB, "KiB")
+    } else {
+        (size, "B")
+    };
+
+    format!("{value:.2}{unit}")
 }
