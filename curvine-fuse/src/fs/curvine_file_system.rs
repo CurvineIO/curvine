@@ -32,6 +32,7 @@ use curvine_common::state::{
     FileAllocMode, FileAllocOpts, FileLock, FileStatus, FileType, LockFlags, LockType, OpenFlags,
     SetAttrOpts,
 };
+use curvine_common::MAX_FILE_SIZE;
 use log::{debug, info, warn};
 use orpc::common::{ByteUnit, TimeSpent};
 use orpc::runtime::Runtime;
@@ -67,6 +68,78 @@ impl CurvineFileSystem {
 
     pub fn conf(&self) -> &FuseConf {
         &self.conf
+    }
+
+    fn normalize_fallocate(
+        current_len: i64,
+        offset: u64,
+        length: u64,
+        raw_mode: u32,
+    ) -> FuseResult<Option<FileAllocOpts>> {
+        if length == 0 {
+            return err_fuse!(libc::EINVAL, "fallocate length must be greater than zero");
+        }
+
+        let mode = match FileAllocMode::from_bits(raw_mode as i32) {
+            Some(mode) => mode,
+            None => {
+                return err_fuse!(
+                    libc::EOPNOTSUPP,
+                    "unsupported fallocate mode: {:#x}",
+                    raw_mode
+                )
+            }
+        };
+        // The backend resize API only accepts a target file length and cannot
+        // preserve the byte range required by ZERO_RANGE.
+        let allowed = FileAllocMode::DEFAULT | FileAllocMode::KEEP_SIZE;
+        if !(mode & !allowed).is_empty() {
+            return err_fuse!(
+                libc::EOPNOTSUPP,
+                "unsupported fallocate mode: {:#x}",
+                raw_mode
+            );
+        }
+
+        let offset = match i64::try_from(offset) {
+            Ok(offset) => offset,
+            Err(_) => return err_fuse!(libc::EFBIG, "fallocate offset exceeds supported size"),
+        };
+        let length = match i64::try_from(length) {
+            Ok(length) => length,
+            Err(_) => return err_fuse!(libc::EFBIG, "fallocate length exceeds supported size"),
+        };
+        let end = match offset.checked_add(length) {
+            Some(end) => end,
+            None => return err_fuse!(libc::EFBIG, "fallocate range overflows"),
+        };
+        if end > MAX_FILE_SIZE {
+            return err_fuse!(
+                libc::EFBIG,
+                "fallocate end {} exceeds maximum file size {}",
+                end,
+                MAX_FILE_SIZE
+            );
+        }
+
+        // Curvine allocates storage lazily across the cluster, so KEEP_SIZE has
+        // no logical metadata change to apply. Writes into the range still
+        // allocate blocks normally without exposing a larger st_size early.
+        if mode.contains(FileAllocMode::KEEP_SIZE) {
+            return Ok(None);
+        }
+
+        let target_len = current_len.max(end);
+        if target_len == current_len {
+            return Ok(None);
+        }
+
+        Ok(Some(FileAllocOpts {
+            truncate: false,
+            off: 0,
+            len: target_len,
+            mode,
+        }))
     }
 
     pub(crate) fn fs(&self) -> &UnifiedFileSystem {
@@ -738,11 +811,18 @@ impl fs::FileSystem for CurvineFileSystem {
         self.ensure_writable_path(&path, RpcCode::ResizeFile)
             .await?;
 
-        let opts = FileAllocOpts {
-            truncate: false,
-            off: op.arg.offset as i64,
-            len: op.arg.length as i64,
-            mode: FileAllocMode::from_bits_truncate(op.arg.mode as i32),
+        let status = self.state.fs_stat(op.header.nodeid, None).await?;
+        let writer_len = self
+            .state
+            .get_writer_len(op.header.nodeid)
+            .await
+            .map(|len| len as i64)
+            .unwrap_or(status.len);
+        let current_len = status.len.max(writer_len);
+        let Some(opts) =
+            Self::normalize_fallocate(current_len, op.arg.offset, op.arg.length, op.arg.mode)?
+        else {
+            return Ok(());
         };
 
         self.state
@@ -1228,6 +1308,59 @@ impl fs::FileSystem for CurvineFileSystem {
 
 #[cfg(test)]
 mod tests {
+    use curvine_common::state::FileAllocMode;
+
+    #[test]
+    fn fallocate_default_converts_range_to_target_length() {
+        let opts = super::CurvineFileSystem::normalize_fallocate(4096, 4096, 4096, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(opts.off, 0);
+        assert_eq!(opts.len, 8192);
+        assert_eq!(opts.mode, FileAllocMode::DEFAULT);
+    }
+
+    #[test]
+    fn fallocate_inside_file_does_not_shrink_it() {
+        let opts = super::CurvineFileSystem::normalize_fallocate(8192, 1024, 4096, 0).unwrap();
+        assert!(opts.is_none());
+    }
+
+    #[test]
+    fn fallocate_keep_size_preserves_logical_length() {
+        let opts = super::CurvineFileSystem::normalize_fallocate(
+            4096,
+            4096,
+            4096,
+            FileAllocMode::KEEP_SIZE.bits() as u32,
+        )
+        .unwrap();
+        assert!(opts.is_none());
+    }
+
+    #[test]
+    fn fallocate_rejects_invalid_ranges_and_modes() {
+        let zero_len = super::CurvineFileSystem::normalize_fallocate(0, 0, 0, 0).unwrap_err();
+        assert_eq!(zero_len.errno, libc::EINVAL);
+
+        let too_large =
+            super::CurvineFileSystem::normalize_fallocate(0, u64::MAX, 1, 0).unwrap_err();
+        assert_eq!(too_large.errno, libc::EFBIG);
+
+        let unsupported =
+            super::CurvineFileSystem::normalize_fallocate(0, 0, 4096, 0x02).unwrap_err();
+        assert_eq!(unsupported.errno, libc::EOPNOTSUPP);
+
+        let zero_range = super::CurvineFileSystem::normalize_fallocate(
+            8192,
+            4096,
+            4096,
+            FileAllocMode::ZERO_RANGE.bits() as u32,
+        )
+        .unwrap_err();
+        assert_eq!(zero_range.errno, libc::EOPNOTSUPP);
+    }
+
     /// Pin the production init-order invariant that Phase 1b-2 depends on:
     /// `FuseMetrics::ensure_init()` MUST run before `NodeState::new()` in
     /// `CurvineFileSystem::new`. After 1b-2 removed the scrape-time

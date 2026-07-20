@@ -913,6 +913,44 @@ test_fallocate() {
         handle_error "Failed to allocate space" "$cmd"
         return
     fi
+
+    # Test 2: A non-zero offset past EOF extends the logical file size.
+    local range_file="$TEST_DIR/fallocate_offset_test.txt"
+    local initial_size=4096
+    local range_len=4096
+    truncate -s "$initial_size" "$range_file"
+    print_test "Allocating a range from a non-zero EOF offset"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    cmd="fallocate -o $initial_size -l $range_len $range_file"
+    print_command "$cmd"
+    if eval "$cmd"; then
+        file_size=$(stat -f%z "$range_file" 2>/dev/null || stat -c%s "$range_file")
+        if [ "$file_size" -eq $((initial_size + range_len)) ]; then
+            print_success "Non-zero-offset fallocate extended the file successfully"
+        else
+            handle_error "Non-zero-offset fallocate returned the wrong size: $file_size" "$cmd"
+        fi
+    else
+        handle_error "Non-zero-offset fallocate failed" "$cmd"
+    fi
+
+    # Test 3: KEEP_SIZE accepts the same range without exposing a larger st_size.
+    local keep_size_file="$TEST_DIR/fallocate_keep_size_test.txt"
+    truncate -s "$initial_size" "$keep_size_file"
+    print_test "Allocating a non-zero-offset range with KEEP_SIZE"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    cmd="fallocate -n -o $initial_size -l $range_len $keep_size_file"
+    print_command "$cmd"
+    if eval "$cmd"; then
+        file_size=$(stat -f%z "$keep_size_file" 2>/dev/null || stat -c%s "$keep_size_file")
+        if [ "$file_size" -eq "$initial_size" ]; then
+            print_success "KEEP_SIZE preserved the logical file size"
+        else
+            handle_error "KEEP_SIZE changed the file size to $file_size" "$cmd"
+        fi
+    else
+        handle_error "KEEP_SIZE fallocate failed" "$cmd"
+    fi
 }
 
 # Test 12: File locks (POSIX and BSD locks)
