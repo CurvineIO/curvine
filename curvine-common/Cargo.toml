@@ -48,6 +48,10 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 bitflags = { workspace = true }
 
+# Enumerate network interface addresses (getifaddrs) to resolve the local IPv4
+# from a named interface such as `eth0`. `net` feature adds the ifaddrs API.
+nix = { workspace = true, features = ["net"] }
+
 mimalloc = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
