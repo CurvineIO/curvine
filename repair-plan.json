@@ -1,0 +1,29 @@
+{
+  "issue": "CurvineIO/curvine#1206",
+  "multica_issue": "CUR-61",
+  "fingerprint": "sha256:660915368bb66282898d7d2cae6d0ff6cb3e8437dc0ac87bb707b55fccf1ee95",
+  "head_sha": "ea9978a4b77ead56a2ea59b41cd05ef66cbbda41",
+  "root_cause_hypothesis": "empty_static_voter_panics_on_leader_commit_above_local_last_index correctly triggers raft-rs panic (commit > last_index), but constructs PeerStorage with RaftClient + dual Runtimes + GroupExecutor. Under nextest parallelism those background threads do not shut down after catch_unwind, so the test hangs in futex until SIGKILL (~1499s) even though the panic already happened.",
+  "affected_modules": [
+    "curvine-common/tests/raft_node_test.rs"
+  ],
+  "planned_changes": [
+    "Rewrite the characterization test to use NoSnapshotLogStorage directly as RawNode storage (no PeerStorage/RaftClient/Runtime).",
+    "Keep asserting that node.step(heartbeat with commit=10) panics when last_index=0."
+  ],
+  "not_goals": [
+    "Do not change raft-rs or production PeerStorage shutdown semantics in this fix.",
+    "Do not alter HA empty-startup refusal logic from #942 beyond restoring a non-hanging regression test."
+  ],
+  "verification_plan": [
+    "cargo test -p curvine-common --test raft_node_test empty_static_voter_panics_on_leader_commit_above_local_last_index",
+    "cargo nextest run -p curvine-common empty_static_voter_panics_on_leader_commit_above_local_last_index (with short timeout expectation)",
+    "cargo fmt --check / make format as available",
+    "cargo clippy -p curvine-common --tests -- -D warnings (scoped)"
+  ],
+  "estimated_non_generated_source_line_delta": 40,
+  "risk": {
+    "level": "low",
+    "rationale": "Test-only change; product code untouched. Preserves the raft-rs invariant assertion while removing unnecessary runtime lifecycle."
+  }
+}
