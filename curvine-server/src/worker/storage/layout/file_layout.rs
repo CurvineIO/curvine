@@ -102,6 +102,9 @@ impl BlockLayout for FileLayout {
         meta: &BlockMeta,
         block: &ExtendedBlock,
     ) -> CommonResult<BlockMeta> {
+        if block.len < 0 {
+            return err_box!("Invalid file block size: {}", block.len);
+        }
         let mut prepared = BlockMeta::new(meta.id(), block.len, dir);
         // The old file still occupies space until resize/finalize. Keep the
         // larger physical charge so preparing a smaller write cannot temporarily

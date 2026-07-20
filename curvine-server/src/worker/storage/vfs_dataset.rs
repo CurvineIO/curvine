@@ -43,6 +43,13 @@ pub(crate) struct RemovedBlockState {
     pub(crate) dir: Arc<VfsDir>,
 }
 
+impl RemovedBlockState {
+    pub(crate) fn release_space(&self) {
+        self.dir
+            .release_space(self.meta.is_final(), self.meta.physical_bytes());
+    }
+}
+
 impl VfsDataset {
     fn new(
         cluster_id: &str,
@@ -145,7 +152,7 @@ impl VfsDataset {
             let layout = self.layouts.get(dir.storage_type());
             let blocks = layout.scan(dir)?;
             for block in blocks {
-                dir.reserve_space(true, block.len);
+                dir.reserve_space(block.is_final(), block.physical_bytes());
                 self.meta.put(block);
             }
         }
@@ -202,8 +209,13 @@ impl VfsDataset {
             .map(|d| &d.state.offset_alloc)
     }
 
+    #[cfg(test)]
+    pub(crate) fn put_test_meta(&mut self, meta: BlockMeta) {
+        self.meta.put(meta);
+    }
+
     pub(crate) fn remove_block_state_by_id(&mut self, id: i64) -> CommonResult<RemovedBlockState> {
-        let meta = match self.meta.get(id) {
+        let meta = match self.meta.remove(id) {
             None => return err_box!("Not found block {}", id),
             Some(meta) => meta,
         };
@@ -213,10 +225,6 @@ impl VfsDataset {
             Some(dir) => dir.clone(),
         };
 
-        let meta = match self.meta.remove(id) {
-            None => return err_box!("Not found block {}", id),
-            Some(meta) => meta,
-        };
         layout.release(&dir, &meta);
 
         Ok(RemovedBlockState { meta, layout, dir })
@@ -378,7 +386,9 @@ impl Dataset for VfsDataset {
 
 #[cfg(test)]
 mod test {
-    use crate::worker::storage::{Dataset, DirList, DirState, StorageVersion, VfsDataset, VfsDir};
+    use crate::worker::storage::{
+        Dataset, DirList, DirState, SpdkMetaStore, StorageVersion, VfsDataset, VfsDir,
+    };
     use curvine_common::conf::{ClusterConf, WorkerConf};
     use curvine_common::state::{ExtendedBlock, FileType, StorageType};
     use orpc::sync::AtomicLong;
@@ -481,6 +491,49 @@ mod test {
         ds.open_block(&block)?;
         let ok = ds.abort_block(&block).is_ok();
         assert!(ok && ds.get_block(1).is_none());
+        Ok(())
+    }
+    #[test]
+    fn spdk_initialize_restores_physical_capacity() -> CommonResult<()> {
+        let path = "../testing/spdk_capacity_restore";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+        store.put(1, 1, 0, 4096, 1, true)?;
+
+        let dir = spdk_dir(1, spdk_state());
+        let available = dir.available();
+        let mut ds = VfsDataset::new("t", DirList::new(vec![dir])?, Some(store.clone()))?;
+
+        let meta = ds.get_block(1).unwrap();
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta.physical_bytes(), 4096);
+        assert_eq!(ds.available(), available - 4096);
+
+        ds.abort_block(&ExtendedBlock::with_id(1))?;
+        assert_eq!(ds.available(), available);
+        drop(ds);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+    #[test]
+    fn negative_file_prepare_write_keeps_metadata() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "negative-prepare-write");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let meta = ds.open_block(&block)?;
+        ds.write_test_data(&meta, "50B")?;
+        block.len = 50;
+        let finalized = ds.finalize_block(&block)?;
+        let available = ds.available();
+
+        block.len = -1;
+        assert!(ds.open_block(&block).is_err());
+
+        let current = ds.get_block(block.id).unwrap();
+        assert!(current.is_final());
+        assert_eq!(current.len(), finalized.len());
+        assert_eq!(current.physical_bytes(), finalized.physical_bytes());
+        assert_eq!(ds.available(), available);
         Ok(())
     }
     #[test]

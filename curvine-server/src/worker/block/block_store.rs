@@ -124,13 +124,15 @@ impl BlockStore {
     pub fn async_remove_block(&self, id: i64) -> CommonResult<BlockMeta> {
         let removed = {
             let mut state = self.write()?;
-            let removed = state.remove_block_state_by_id(id)?;
+            let remove_result = state.remove_block_state_by_id(id);
+            // Heartbeat increments this counter before scheduling the task.
+            // Consume it even when metadata removal reports an error.
             state.decrement_blocks_to_delete();
-            removed
-        };
+            remove_result
+        }?;
 
         removed.layout.deallocate(&removed.dir, &removed.meta)?;
-        self.read()?.release_block_space(&removed.meta)?;
+        removed.release_space();
         Ok(removed.meta)
     }
 
@@ -166,5 +168,53 @@ impl BlockStore {
         }
 
         Ok(vec)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::storage::Dataset;
+    use curvine_common::conf::WorkerConf;
+
+    fn create_store(name: &str) -> CommonResult<BlockStore> {
+        let conf = ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                dir_reserved: "0".to_string(),
+                data_dir: vec![format!("[MEM:1KB]../testing/block-store-{name}")],
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        };
+        BlockStore::new("test", &conf)
+    }
+
+    #[test]
+    fn async_remove_missing_block_releases_delete_count() -> CommonResult<()> {
+        let store = create_store("missing-block")?;
+        store.read()?.increment_blocks_to_delete();
+
+        assert!(store.async_remove_block(1).is_err());
+        assert_eq!(store.read()?.num_blocks_to_delete(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn async_remove_invalid_dir_releases_delete_count() -> CommonResult<()> {
+        let store = create_store("invalid-dir")?;
+        {
+            let mut state = store.write()?;
+            let mut meta = BlockMeta::new(1, 100, state.dir_iter().next().unwrap());
+            meta.dir_id = u32::MAX;
+            state.put_test_meta(meta);
+            state.increment_blocks_to_delete();
+        }
+
+        assert!(store.async_remove_block(1).is_err());
+        let state = store.read()?;
+        assert!(state.get_block(1).is_none());
+        assert_eq!(state.num_blocks_to_delete(), 0);
+        Ok(())
     }
 }
