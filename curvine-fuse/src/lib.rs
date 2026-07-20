@@ -144,9 +144,9 @@ pub const FUSE_S_ISUID: u32 = 0x800;
 
 pub const FUSE_S_ISGID: u32 = 0x400;
 
-// Per-type default permission bits, applied ONLY when a status carries no mode
-// (mode == 0, i.e. a synthetic / default-constructed status). Real backends
-// (master ACL / UFS) always set a mode, so these are fallbacks, not overrides.
+// Per-type default permission bits for synthetic entries such as `.` and `..`.
+// Real backends (master ACL / UFS) set a mode, so these are not overrides for
+// persisted permission mode 0000.
 pub const FUSE_DEFAULT_FILE_MODE: u32 = 0o666; // regular files: rw, no exec
 pub const FUSE_DEFAULT_DIR_MODE: u32 = 0o777; // dirs: rwx (exec needed to traverse)
 pub const FUSE_DEFAULT_SYMLINK_MODE: u32 = 0o777; // symlink perm bits are ignored by the kernel

@@ -75,9 +75,8 @@ impl FuseUtils {
         Some((major, minor))
     }
 
-    // Per-type default permission bits, used only as a fallback when a status
-    // carries no mode (mode == 0). File / Stream / Agg / Object all count as
-    // regular files.
+    // Per-type default permission bits for synthetic entries. File / Stream /
+    // Agg / Object all count as regular files.
     fn default_mode(typ: FileType) -> u32 {
         match typ {
             FileType::Dir => FUSE_DEFAULT_DIR_MODE,
@@ -89,27 +88,19 @@ impl FuseUtils {
     // Decide the permission bits to report for a status.
     //
     // - Symlinks always report the default (the kernel ignores symlink perm bits).
-    // - mode == 0 means the status carries no mode (synthetic / default-constructed
-    //   status); fall back to a per-type default masked by umask, matching what a
-    //   fresh create would have produced.
-    // - Otherwise report the stored mode verbatim (only stray/high bits stripped).
-    //   umask is NOT re-applied: it is a create-time mask, and getattr must report
-    //   the mode as stored.
-    //
-    // NOTE (trade-off): mode == 0 is treated as "unset" and gets a default, which
-    // also overrides the literal meaning of an explicit `chmod 000`. This does not
-    // grant access in practice: curvine's own `check_access_permissions` uses the
-    // raw `status.mode`, so with the default `check_permission = true` a 000 file is
-    // still denied. The literal 000 is only lost if `check_permission` is disabled
-    // and access is left to the kernel's `default_permissions`.
-    pub fn effective_perm(mode: u32, typ: FileType, umask: u32) -> u32 {
-        if typ == FileType::Link {
+    // - Synthetic `.`/`..` entries have no persisted ACL, so report a default
+    //   masked by the configured umask.
+    // - Real entries report the stored mode verbatim, including the valid POSIX
+    //   mode 0000. Umask is a create-time mask and must not be re-applied here.
+    pub fn effective_perm(status: &FileStatus, umask: u32) -> u32 {
+        if status.file_type == FileType::Link {
             return FUSE_DEFAULT_SYMLINK_MODE;
         }
-        if mode == 0 {
-            Self::default_mode(typ) & !umask
+
+        if status.id == FUSE_UNKNOWN_INO as i64 && FuseUtils.is_dot(&status.name) {
+            Self::default_mode(status.file_type) & !umask
         } else {
-            mode & 0o7777
+            status.mode & 0o7777
         }
     }
 
@@ -345,7 +336,7 @@ impl FuseUtils {
             }
         };
 
-        let perm = FuseUtils::effective_perm(status.mode, status.file_type, conf.umask);
+        let perm = FuseUtils::effective_perm(status, conf.umask);
         let mode = FuseUtils::get_mode(perm, status.file_type);
 
         // A regular file/dir has at least one link; some backends (UFS/object
@@ -702,21 +693,26 @@ mod tests {
     }
 
     #[test]
-    fn mode_zero_uses_default_mode() {
+    fn real_mode_zero_is_preserved() {
         let conf = FuseConf::default(); // umask = 0o22
 
-        // Regular file with mode == 0 falls back to 0o666 & !0o22 = 0o644.
+        // POSIX mode 0000 is valid and must not be confused with a missing mode.
         let f = FuseUtils::status_to_attr(&conf, &file_status(FileType::File, 0, 0)).unwrap();
-        assert_eq!(f.mode & 0o7777, 0o644);
+        assert_eq!(f.mode & 0o7777, 0);
         assert_eq!(f.mode & libc::S_IFMT as u32, libc::S_IFREG as u32);
 
-        // Directory with mode == 0 falls back to 0o777 & !0o22 = 0o755.
+        // Directories may also legitimately have mode 0000.
         let d = FuseUtils::status_to_attr(&conf, &file_status(FileType::Dir, 0, 0)).unwrap();
-        assert_eq!(d.mode & 0o7777, 0o755);
+        assert_eq!(d.mode & 0o7777, 0);
         assert_eq!(d.mode & libc::S_IFMT as u32, libc::S_IFDIR as u32);
+    }
 
-        // Regression: a synthetic dot dir (id == FUSE_UNKNOWN_INO, mode == 0) still
-        // reports 0o755, matching the old dedicated dot branch.
+    #[test]
+    fn synthetic_dot_uses_default_mode() {
+        let conf = FuseConf::default(); // umask = 0o22
+
+        // Synthetic dot entries have no persisted ACL and still need usable
+        // directory permissions.
         let mut dot = file_status(FileType::Dir, 0, 0);
         dot.id = FUSE_UNKNOWN_INO as i64;
         dot.name = ".".to_string();
@@ -738,10 +734,10 @@ mod tests {
         // The regular-file default must not carry execute bits.
         assert_eq!(FUSE_DEFAULT_FILE_MODE & 0o111, 0);
 
-        // A regular file with mode == 0 is reported non-executable.
+        // An explicit mode 0000 remains non-executable and is preserved.
         let conf = FuseConf::default();
         let f = FuseUtils::status_to_attr(&conf, &file_status(FileType::File, 0, 0)).unwrap();
-        assert_eq!(f.mode & 0o111, 0);
+        assert_eq!(f.mode & 0o7777, 0);
     }
 
     #[test]
