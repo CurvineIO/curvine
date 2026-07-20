@@ -34,6 +34,53 @@ use orpc::{err_box, sys, try_option_ref};
 use std::sync::Arc;
 use tokio::sync::{watch, Notify};
 
+/// Removes one interruptible request registration when its dispatch future ends.
+///
+/// The normal completion/interrupt branches remove eagerly to preserve their
+/// existing timing. `Drop` covers cancellation paths where neither branch runs,
+/// such as aborting the spawned metadata task during shutdown.
+struct PendingRequestGuard {
+    pending_requests: Arc<FastDashMap<u64, Arc<Notify>>>,
+    unique: u64,
+    notify: Arc<Notify>,
+    registered: bool,
+}
+
+impl PendingRequestGuard {
+    fn register(
+        pending_requests: Arc<FastDashMap<u64, Arc<Notify>>>,
+        unique: u64,
+        notify: Arc<Notify>,
+    ) -> Self {
+        pending_requests.insert(unique, notify.clone());
+        Self {
+            pending_requests,
+            unique,
+            notify,
+            registered: true,
+        }
+    }
+
+    fn remove(&mut self) {
+        if !self.registered {
+            return;
+        }
+
+        // Only remove the registration installed by this guard. A defensive
+        // same-unique replacement must not be deleted by an older future's Drop.
+        let _ = self.pending_requests.remove_if(&self.unique, |_, current| {
+            Arc::ptr_eq(current, &self.notify)
+        });
+        self.registered = false;
+    }
+}
+
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        self.remove();
+    }
+}
+
 /// FuseReceiver provides the following functionality:
 /// 1. Receive data from fuse fd using splice
 /// 2. For metadata requests (mkdir, ls), spawn a task to execute
@@ -476,7 +523,8 @@ impl<T: FileSystem> FuseReceiver<T> {
         }
 
         let notify = Arc::new(Notify::new());
-        pending_requests.insert(req.unique(), notify.clone());
+        let mut pending_request =
+            PendingRequestGuard::register(pending_requests.clone(), req.unique(), notify.clone());
 
         // This branch is reached only for FUSE_SETLKW (`is_interrupt()` is true
         // only there), so the SETLKW metrics live here, wrapping the whole
@@ -508,25 +556,19 @@ impl<T: FileSystem> FuseReceiver<T> {
         // singleton is initialized whenever that holds), so disabled builds create
         // neither.
         //
-        // **Scope caveat — gauge/histogram only, NOT the map.** RAII here keeps
-        // `setlkw_inflight` and the wait histogram correct under cancellation, but
-        // it does NOT clean up the `pending_requests` map: the map `remove` runs
-        // only in the two `select!` branches below. If the whole future is aborted
-        // after the `insert` (runtime shutdown, task drop, a future-added timeout),
-        // the map entry leaks and a stray later interrupt could match a waiter that
-        // no longer exists. That is pre-existing behaviour, unchanged by Phase 2a;
-        // only the gauge/histogram are guaranteed cancellation-safe here.
+        // The pending-request map has its own RAII guard above. The two select
+        // branches remove eagerly, while the guard's Drop covers task abort/drop.
         let _setlkw_inflight = FuseMetrics::setlkw_inflight_guard(reply.metrics.is_some());
         let _setlkw_wait = FuseMetrics::setlkw_wait_timer(reply.metrics.is_some());
 
         let res = tokio::select! {
             result = Self::dispatch_meta(&pending_requests, &fs, &req, &reply) => {
-                pending_requests.remove(&req.unique());
+                pending_request.remove();
                 result
             }
 
             _ = notify.notified() => {
-                pending_requests.remove(&req.unique());
+                pending_request.remove();
                 let err: FuseResult<()> = err_fuse!(libc::EINTR, "operation interrupted");
                 // Source-tagged as interrupted (the SETLKW interrupt-notify path),
                 // not inferred from the EINTR errno.
@@ -729,9 +771,12 @@ fn receive_error_labels(os_errno: Option<i32>) -> (&'static str, &'static str) {
 
 #[cfg(test)]
 mod tests {
-    use super::receive_error_labels;
+    use super::{receive_error_labels, PendingRequestGuard};
     use crate::fuse_metrics::{RECEIVE_ACTION_CONTINUE, RECEIVE_ACTION_EXIT};
     use libc::{EAGAIN, EINTR, EIO, ENODEV, ENOENT};
+    use orpc::sync::FastDashMap;
+    use std::sync::Arc;
+    use tokio::sync::Notify;
 
     #[test]
     fn receive_error_labels_classify_errno_and_action() {
@@ -759,6 +804,23 @@ mod tests {
             ("other", RECEIVE_ACTION_EXIT)
         );
         assert_eq!(receive_error_labels(None), ("other", RECEIVE_ACTION_EXIT));
+    }
+
+    #[test]
+    fn pending_request_guard_does_not_remove_replacement() {
+        let pending: Arc<FastDashMap<u64, Arc<Notify>>> = Arc::new(FastDashMap::default());
+        let original = Arc::new(Notify::new());
+        let guard = PendingRequestGuard::register(pending.clone(), 1, original);
+
+        let replacement = Arc::new(Notify::new());
+        pending.insert(1, replacement.clone());
+        drop(guard);
+
+        let current = pending.get(&1).expect("replacement remains registered");
+        assert!(
+            Arc::ptr_eq(current.value(), &replacement),
+            "an older guard must not remove a same-unique replacement"
+        );
     }
 
     // --- Phase 2a: dispatch_meta integration (operation_duration_us wiring) ---
@@ -1250,6 +1312,55 @@ mod tests {
             assert!(
                 pending2.get(&2001).is_none(),
                 "interrupt branch removed the pending_requests entry"
+            );
+        }
+
+        #[tokio::test]
+        async fn aborted_blocking_setlkw_removes_pending_request() {
+            let polled = Arc::new(AtomicBool::new(false));
+            let fs = Arc::new(BlockingSetlkwFs {
+                polled: polled.clone(),
+            });
+            let pending: Arc<FastDashMap<u64, Arc<tokio::sync::Notify>>> =
+                Arc::new(FastDashMap::default());
+            let pending2 = pending.clone();
+            let (reply, _rx) = metrics_reply(2003, "SetLkW");
+
+            let handle = tokio::spawn(async move {
+                super::super::FuseReceiver::dispatch_meta_interrupt(
+                    fs,
+                    pending,
+                    setlkw_request(2003),
+                    reply,
+                )
+                .await
+            });
+
+            // Wait until dispatch has entered the indefinitely blocking SETLKW.
+            // At that point the pending-request registration is definitely live.
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if polled.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("set_lkw() must be polled within the timeout");
+            assert!(
+                pending2.get(&2003).is_some(),
+                "SETLKW is registered while its dispatch is pending"
+            );
+
+            // Aborting drops the dispatch future without selecting either normal
+            // completion or interrupt, so cleanup must come from the RAII guard.
+            handle.abort();
+            let join_err = handle.await.expect_err("the SETLKW task was aborted");
+            assert!(join_err.is_cancelled(), "join error reports cancellation");
+            assert!(
+                pending2.get(&2003).is_none(),
+                "aborting SETLKW removes its pending_requests entry"
             );
         }
 
