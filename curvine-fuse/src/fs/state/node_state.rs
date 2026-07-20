@@ -1053,18 +1053,20 @@ impl NodeState {
             info!("node_state::persist: saving file_handles");
             let handles = self.all_handles();
             writer.write_len(handles.len() as u64)?;
-            let mut any_failed = false;
             for handle in &handles {
                 if let Err(e) = handle.persist(writer).await {
-                    error!("node_state::persist: error saving file_handle {:?}", e);
-                    any_failed = true;
+                    error!(
+                        "node_state::persist: error saving file_handle ino={}, fh={}: {:?}",
+                        handle.ino(),
+                        handle.fh(),
+                        e
+                    );
+                    return Err(e);
                 }
             }
             info!("node_state::persist: {} file_handles saved", handles.len());
             if let Some(stage) = stage {
-                if !any_failed {
-                    stage.success();
-                }
+                stage.success();
             }
         }
 
@@ -1223,9 +1225,15 @@ impl NodeState {
 mod test {
     use crate::fs::state::file_handle::FileHandle;
     use crate::fs::state::{DirHandle, NodeState};
-    use curvine_common::fs::{ListStream, Path};
+    use crate::fs::FuseWriter;
+    use bytes::Bytes;
+    use curvine_client::unified::{UnifiedFileSystem, UnifiedWriter};
+    use curvine_common::conf::ClusterConf;
+    use curvine_common::fs::local::LocalWriter;
+    use curvine_common::fs::{ListStream, Path, StateWriter, Writer};
     use curvine_common::state::FileStatus;
-    use orpc::common::FastHashMap;
+    use orpc::common::{FastHashMap, Utils};
+    use orpc::runtime::{AsyncRuntime, RpcRuntime};
     use std::sync::Arc;
 
     fn file_handle(ino: u64, fh: u64) -> Arc<FileHandle> {
@@ -1362,5 +1370,49 @@ mod test {
         NodeState::dec_gauges_lockstep(&legacy, &alias);
         assert_eq!(legacy.get(), 1);
         assert_eq!(alias.get(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persist_returns_error_when_file_handle_persist_fails() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let task_rt = rt.clone();
+
+        rt.block_on(async move {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), task_rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+
+            // /dev/full deterministically fails backend writes with ENOSPC. Queue a
+            // write before persisting so BackendHandle::persist's complete() sees
+            // the worker failure and returns it to NodeState::persist.
+            let full_path = Path::from_str("/dev/full").unwrap();
+            let local_writer = LocalWriter::new(&full_path, 1).unwrap();
+            let status = local_writer.status().clone();
+            let fuse_writer = Arc::new(FuseWriter::new(
+                &state.conf,
+                task_rt,
+                UnifiedWriter::Local(local_writer),
+            ));
+            fuse_writer
+                .write(0, Bytes::from_static(b"x"), None)
+                .await
+                .unwrap();
+            state
+                .insert_handle_with_writer(1, None, Some(fuse_writer), status)
+                .await;
+
+            let state_path = Utils::temp_file();
+            let _ = std::fs::remove_file(&state_path);
+            let mut writer = StateWriter::new(&state_path).unwrap();
+            let result = state.persist(&mut writer).await;
+            drop(writer);
+            let _ = std::fs::remove_file(&state_path);
+
+            assert!(
+                result.is_err(),
+                "a file-handle persist failure must fail the whole state persist"
+            );
+        });
     }
 }
