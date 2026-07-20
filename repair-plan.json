@@ -1,0 +1,27 @@
+{
+  "issue": "CurvineIO/curvine#1193",
+  "multica_issue": "CUR-61",
+  "fingerprint": "reuse:full_block_report_reconcile",
+  "head_sha": "ea9978a4b77ead56a2ea59b41cd05ef66cbbda41",
+  "root_cause_hypothesis": "After an incremental block report invalidates the full-report session, collect_full_block_report sees invalidated=true and returns None without starting a fresh session. A subsequent full report with a new total_len is therefore discarded, so async reconcile never clears the stale second-block location.",
+  "affected_modules": [
+    "curvine-server/src/master/fs/master_filesystem.rs"
+  ],
+  "planned_changes": [
+    "If an existing full-report session is invalidated, remove it so the next full report starts clean.",
+    "Only mark existing sessions invalidated (do not insert a stub invalidated session for unknown workers).",
+    "Keep total_len-change restart behavior."
+  ],
+  "not_goals": [
+    "Do not change worker-side report scheduling.",
+    "Do not refactor unrelated master FS APIs."
+  ],
+  "verification_plan": [
+    "cargo test -p curvine-server --test master_fs_test full_block_report_reconcile_removes_stale_location_async"
+  ],
+  "estimated_non_generated_source_line_delta": 30,
+  "risk": {
+    "level": "low",
+    "rationale": "Localized session lifecycle fix; matches prior CUR-49 patch that is not yet on upstream/main."
+  }
+}
