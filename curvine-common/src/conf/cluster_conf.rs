@@ -100,6 +100,27 @@ impl ClusterConf {
         // interface honors the per-role hostname env-var overrides instead.
         if !conf.net_interface.is_empty() {
             let ip = Self::interface_ipv4(&conf.net_interface)?;
+
+            // net_interface takes precedence over the CURVINE_*_HOSTNAME env
+            // vars. Warn (rather than silently ignore) when any of them is also
+            // set, so an operator who exported a hostname override but sees it
+            // have no effect can tell why. `from()` runs during config loading,
+            // before `Logger::init`, so the log macros would be dropped — use
+            // eprintln! to make the warning visible on stderr.
+            for env_key in [
+                Self::ENV_MASTER_HOSTNAME,
+                Self::ENV_WORKER_HOSTNAME,
+                Self::ENV_CLIENT_HOSTNAME,
+            ] {
+                if let Ok(v) = env::var(env_key) {
+                    eprintln!(
+                        "[WARN] net_interface '{}' is set (resolved to {}); ignoring {}='{}'. \
+                         net_interface overrides the CURVINE_*_HOSTNAME env vars.",
+                        conf.net_interface, ip, env_key, v
+                    );
+                }
+            }
+
             conf.master.hostname = ip.clone();
             conf.journal.hostname = ip.clone();
             conf.worker.hostname = ip.clone();
