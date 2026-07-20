@@ -397,15 +397,36 @@ impl CurvineFileSystem {
         out
     }
 
-    /// Whether the daemon accepts the kernel's advertised FUSE ABI version.
+    /// Whether the kernel's advertised FUSE ABI version is at least the
+    /// daemon's minimum.
     ///
     /// Compared as a `(major, minor)` tuple against `FUSE_MIN_ABI`: reject any
     /// version below 7.31 (this correctly rejects a low-major/high-minor combo
     /// such as 6.40, which the old `major < 7 && minor < 31` check let through).
-    /// A higher major is accepted; the kernel re-issues INIT at the daemon's
-    /// major after we reply with our own version.
+    /// A higher major also compares as supported here; `init` handles that case
+    /// separately with a version-only reply (see `version_only_init_out`) before
+    /// this predicate gates the too-old case.
     fn abi_supported(major: u32, minor: u32) -> bool {
         (major, minor) >= FUSE_MIN_ABI
+    }
+
+    /// The INIT reply for a kernel whose major ABI is newer than the daemon's:
+    /// advertise only the daemon's own `(major, minor)` with no negotiated
+    /// flags, and leave every other field zeroed.
+    ///
+    /// Per the fuse.h version-negotiation convention, when the kernel major is
+    /// larger than the daemon's, userspace replies with its own major and skips
+    /// negotiation, and the kernel is expected to re-issue INIT at a matching
+    /// major. This mirrors libfuse `_do_init`'s `arg->major > 7` early return:
+    /// a `fuse_init_in` at an unknown higher major may not share our field
+    /// layout, so we must not interpret its flags. The kernel does not read the
+    /// other reply fields on a major mismatch, so they stay 0.
+    fn version_only_init_out() -> fuse_init_out {
+        fuse_init_out {
+            major: FUSE_KERNEL_VERSION,
+            minor: FUSE_KERNEL_MINOR_VERSION,
+            ..Default::default()
+        }
     }
 }
 
@@ -420,6 +441,23 @@ impl fs::FileSystem for CurvineFileSystem {
                 FUSE_KERNEL_VERSION,
                 FUSE_KERNEL_MINOR_VERSION
             );
+        }
+
+        // Kernel major newer than ours: reply with our own version only and do
+        // NOT negotiate flags — the `fuse_init_in` layout at an unknown higher
+        // major cannot be trusted (see `version_only_init_out`). Only when the
+        // majors already match do we run the allowlist negotiation below.
+        if op.arg.major > FUSE_KERNEL_VERSION {
+            info!(
+                "FUSE init: kernel offered abi={}.{} (major > {}); replying version-only \
+                 {}.{} and skipping capability negotiation",
+                op.arg.major,
+                op.arg.minor,
+                FUSE_KERNEL_VERSION,
+                FUSE_KERNEL_VERSION,
+                FUSE_KERNEL_MINOR_VERSION,
+            );
+            return Ok(Self::version_only_init_out());
         }
 
         // Negotiate an explicit allowlist (see `negotiate_out_flags`): only caps
@@ -450,8 +488,9 @@ impl fs::FileSystem for CurvineFileSystem {
         let out = fuse_init_out {
             // Advertise the daemon's own ABI, not the kernel's: curvine only
             // implements the 7.31 struct/semantics, so it must not claim a higher
-            // version. On a higher-major kernel this makes the kernel re-issue
-            // INIT at our major (init is idempotent, dispatched per INIT).
+            // version. The higher-major case is already handled above; here the
+            // majors match, and we reply with our own minor so we never claim a
+            // minor the kernel does not have.
             major: FUSE_KERNEL_VERSION,
             minor: FUSE_KERNEL_MINOR_VERSION,
             max_readahead,
@@ -471,11 +510,19 @@ impl fs::FileSystem for CurvineFileSystem {
 
         // Log the negotiated capability set: what we advertise vs. what the
         // kernel offered but we did not enable (so an operator can see why a
-        // capability is inactive). Note SPLICE/WRITEBACK may appear in "enabled"
-        // without being kernel-offered — they are config-gated daemon requests.
+        // capability is inactive). Report BOTH the version we advertise on the
+        // wire (`negotiated_abi`, always our own) and what the kernel offered
+        // (`kernel_offered_abi`) — the two differ in minor when the kernel is
+        // newer (e.g. offered 7.40, connection runs at 7.31), so a single "abi="
+        // field would misreport the live version. Note SPLICE/WRITEBACK may
+        // appear in "enabled" without being kernel-offered — they are
+        // config-gated daemon requests.
         let dropped = op.arg.flags & !out_flags;
         info!(
-            "FUSE init negotiated: abi={}.{} enabled=[{}] kernel_offered_not_enabled=[{}]",
+            "FUSE init negotiated: negotiated_abi={}.{} kernel_offered_abi={}.{} \
+             enabled=[{}] kernel_offered_not_enabled=[{}]",
+            FUSE_KERNEL_VERSION,
+            FUSE_KERNEL_MINOR_VERSION,
             op.arg.major,
             op.arg.minor,
             fuse_init_flag_names(out_flags).join(", "),
@@ -1315,9 +1362,9 @@ mod tests {
     use super::CurvineFileSystem;
     use crate::{
         fuse_init_flag_names, FUSE_ATOMIC_O_TRUNC, FUSE_BIG_WRITES, FUSE_DO_READDIRPLUS,
-        FUSE_FLOCK_LOCKS, FUSE_HAS_IOCTL_DIR, FUSE_MAX_PAGES, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS,
-        FUSE_SPLICE_MOVE, FUSE_SPLICE_READ, FUSE_SPLICE_WRITE, FUSE_WRITEBACK_CACHE,
-        SUPPORTED_INIT_FLAGS,
+        FUSE_FLOCK_LOCKS, FUSE_HAS_IOCTL_DIR, FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,
+        FUSE_MAX_PAGES, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_SPLICE_MOVE, FUSE_SPLICE_READ,
+        FUSE_SPLICE_WRITE, FUSE_WRITEBACK_CACHE, SUPPORTED_INIT_FLAGS,
     };
 
     // #1122 + allowlist: the daemon must never advertise FUSE_ATOMIC_O_TRUNC
@@ -1406,6 +1453,24 @@ mod tests {
         assert!(!CurvineFileSystem::abi_supported(6, 40));
         assert!(!CurvineFileSystem::abi_supported(6, 0));
         assert!(!CurvineFileSystem::abi_supported(0, 0));
+    }
+
+    // Higher-major short reply (mirrors libfuse `_do_init`'s `arg->major > 7`
+    // path): advertise only our own version, negotiate no flags, zero the rest.
+    #[test]
+    fn version_only_init_out_advertises_own_version_no_flags() {
+        let out = CurvineFileSystem::version_only_init_out();
+        assert_eq!(out.major, FUSE_KERNEL_VERSION);
+        assert_eq!(out.minor, FUSE_KERNEL_MINOR_VERSION);
+        assert_eq!(
+            out.flags, 0,
+            "no capability negotiation on a major mismatch"
+        );
+        // Fields the kernel does not read on a major mismatch stay zeroed.
+        assert_eq!(out.max_readahead, 0);
+        assert_eq!(out.max_write, 0);
+        assert_eq!(out.max_background, 0);
+        assert_eq!(out.congestion_threshold, 0);
     }
 
     #[test]
