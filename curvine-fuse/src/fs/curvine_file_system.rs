@@ -1290,12 +1290,11 @@ impl fs::FileSystem for CurvineFileSystem {
 
 #[cfg(test)]
 mod tests {
-    use super::CurvineFileSystem;
     use curvine_common::state::FileAllocMode;
 
     #[test]
     fn fallocate_default_converts_range_to_target_length() {
-        let opts = CurvineFileSystem::normalize_fallocate(4096, 4096, 4096, 0)
+        let opts = super::CurvineFileSystem::normalize_fallocate(4096, 4096, 4096, 0)
             .unwrap()
             .unwrap();
         assert_eq!(opts.off, 0);
@@ -1305,13 +1304,13 @@ mod tests {
 
     #[test]
     fn fallocate_inside_file_does_not_shrink_it() {
-        let opts = CurvineFileSystem::normalize_fallocate(8192, 1024, 4096, 0).unwrap();
+        let opts = super::CurvineFileSystem::normalize_fallocate(8192, 1024, 4096, 0).unwrap();
         assert!(opts.is_none());
     }
 
     #[test]
     fn fallocate_keep_size_preserves_logical_length() {
-        let opts = CurvineFileSystem::normalize_fallocate(
+        let opts = super::CurvineFileSystem::normalize_fallocate(
             4096,
             4096,
             4096,
@@ -1323,16 +1322,18 @@ mod tests {
 
     #[test]
     fn fallocate_rejects_invalid_ranges_and_modes() {
-        let zero_len = CurvineFileSystem::normalize_fallocate(0, 0, 0, 0).unwrap_err();
+        let zero_len = super::CurvineFileSystem::normalize_fallocate(0, 0, 0, 0).unwrap_err();
         assert_eq!(zero_len.errno, libc::EINVAL);
 
-        let too_large = CurvineFileSystem::normalize_fallocate(0, u64::MAX, 1, 0).unwrap_err();
+        let too_large =
+            super::CurvineFileSystem::normalize_fallocate(0, u64::MAX, 1, 0).unwrap_err();
         assert_eq!(too_large.errno, libc::EFBIG);
 
-        let unsupported = CurvineFileSystem::normalize_fallocate(0, 0, 4096, 0x02).unwrap_err();
+        let unsupported =
+            super::CurvineFileSystem::normalize_fallocate(0, 0, 4096, 0x02).unwrap_err();
         assert_eq!(unsupported.errno, libc::EOPNOTSUPP);
 
-        let zero_range = CurvineFileSystem::normalize_fallocate(
+        let zero_range = super::CurvineFileSystem::normalize_fallocate(
             8192,
             4096,
             4096,
