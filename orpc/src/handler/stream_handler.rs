@@ -73,33 +73,25 @@ impl<F: Frame, M: MessageHandler> StreamHandler<F, M> {
 
     pub async fn call(&mut self, request: Message) -> IOResult<()> {
         let response = if self.handler.is_sync(&request) {
-            let handler = self.handler.clone();
-            self.rt
-                .spawn_blocking(move || match handler.as_mut().handle(&request) {
-                    Err(e) => {
-                        debug!("handler request {} error: {}", request.req_id(), e);
-                        request.error_ext(&e)
-                    }
+            let rt = self.handler.get_rt(&request).unwrap_or(&self.rt);
 
-                    Ok(v) => v,
-                })
-                .await?
+            let handler = self.handler.clone();
+            rt.spawn_blocking(move || match handler.as_mut().handle(&request) {
+                Err(e) => {
+                    debug!("handler request {} error: {}", request.req_id(), e);
+                    request.error_ext(&e)
+                }
+
+                Ok(v) => v,
+            })
+            .await?
         } else {
-            let code = request.code();
-            let request_status = request.request_status();
-            let req_id = request.req_id();
-            let seq_id = request.seq_id();
+            let protocol = request.protocol;
             match self.handler.as_mut().async_handle(request).await {
                 Ok(v) => v,
                 Err(e) => {
-                    debug!("handler request {} error: {}", req_id, e);
-                    let error_response_base = Builder::new()
-                        .code(code)
-                        .request(request_status)
-                        .req_id(req_id)
-                        .seq_id(seq_id)
-                        .build();
-                    error_response_base.error_ext(&e)
+                    debug!("handler request {} error: {}", protocol.req_id, e);
+                    Builder::protocol(protocol).build().error_ext(&e)
                 }
             }
         };

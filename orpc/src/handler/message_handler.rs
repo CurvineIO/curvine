@@ -14,6 +14,7 @@
 
 use crate::error::{CommonErrorExt, ErrorExt};
 use crate::message::Message;
+use crate::runtime::Runtime;
 use crate::sys::DataSlice;
 use bytes::BytesMut;
 use log::info;
@@ -41,6 +42,10 @@ pub trait MessageHandler: Send + Sync + 'static {
         msg: Message,
     ) -> impl Future<Output = Result<Message, Self::Error>> + Send {
         async { panic!("Please implement the async_handle method") }
+    }
+
+    fn get_rt(&self, _msg: &Message) -> Option<&Runtime> {
+        None
     }
 }
 
