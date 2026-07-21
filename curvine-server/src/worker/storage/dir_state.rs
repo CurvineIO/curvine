@@ -14,18 +14,11 @@
 
 use curvine_common::state::StorageType;
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
 #[derive(Debug, Default)]
 pub struct DirState {
-    pub(crate) dir_id: u32,
-    pub(crate) base_path: PathBuf,
-    pub(crate) storage_type: StorageType,
-    #[cfg(feature = "spdk")]
-    pub(crate) bdev_name: Option<String>,
-    #[cfg(not(feature = "spdk"))]
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "spdk"), allow(dead_code))]
     pub(crate) bdev_name: Option<String>,
     pub(crate) bdev_capacity: i64,
     pub(crate) offset_alloc: BdevOffsetAllocator,
@@ -109,7 +102,12 @@ impl BdevOffsetAllocator {
                 block_id, inner.map[&block_id].0
             ));
         }
-        let aligned_size = align_up_i64(size, inner.align);
+        let aligned_size = align_up_i64(size, inner.align).ok_or_else(|| {
+            format!(
+                "invalid allocation size {} for alignment {}",
+                size, inner.align
+            )
+        })?;
 
         // Try free-list first
         let candidate = inner
@@ -130,13 +128,19 @@ impl BdevOffsetAllocator {
 
         // Fall back to bump
         let offset = inner.cursor;
-        if offset + aligned_size > inner.capacity {
+        let end = offset.checked_add(aligned_size).ok_or_else(|| {
+            format!(
+                "bdev allocation overflow: offset {}, size {}",
+                offset, aligned_size
+            )
+        })?;
+        if end > inner.capacity {
             return Err(format!(
                 "bdev full: need {} bytes at offset {}, capacity {}",
                 aligned_size, offset, inner.capacity
             ));
         }
-        inner.cursor += aligned_size;
+        inner.cursor = end;
         inner.map.insert(block_id, (offset, aligned_size));
         Ok(offset)
     }
@@ -249,6 +253,12 @@ impl BdevOffsetAllocator {
         inner.align
     }
 
+    /// Physical bytes charged for a logical allocation size.
+    pub fn allocation_size(&self, size: i64) -> Option<i64> {
+        let inner = self.lock_inner();
+        align_up_i64(size, inner.align)
+    }
+
     /// Size of the free-list (number of free ranges).
     pub fn free_list_size(&self) -> usize {
         let inner = self.lock_inner();
@@ -281,8 +291,11 @@ impl std::fmt::Debug for BdevOffsetAllocator {
     }
 }
 #[inline]
-fn align_up_i64(n: i64, align: i64) -> i64 {
-    (n + align - 1) & !(align - 1)
+fn align_up_i64(n: i64, align: i64) -> Option<i64> {
+    if n < 0 {
+        return None;
+    }
+    n.checked_add(align - 1).map(|v| v & !(align - 1))
 }
 // ---------------------------------------------------------------------------
 // Tests
@@ -302,6 +315,11 @@ mod test {
         a.allocate(1, 4096).unwrap();
         a.allocate(2, 4096).unwrap();
         assert!(a.allocate(3, 4096).is_err());
+    }
+    #[test]
+    fn allocation_size_overflow_is_rejected() {
+        let a = BdevOffsetAllocator::new(i64::MAX, 4096);
+        assert!(a.allocate(1, i64::MAX).is_err());
     }
     #[test]
     fn duplicate_block() {
