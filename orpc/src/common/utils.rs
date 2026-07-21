@@ -162,7 +162,9 @@ impl Utils {
         path.push(sub);
 
         // Ensure the sub directory exists
-        let _ = fs::create_dir_all(&path);
+        fs::create_dir_all(&path).unwrap_or_else(|e| {
+            panic!("failed to create testing sub dir {}: {}", path.display(), e);
+        });
 
         format!("{}", path.display())
     }
@@ -372,5 +374,44 @@ mod tests {
         // Ensure the returned path is writable (the original ENOENT failure mode).
         std::fs::File::create(&path).expect("should be able to create file under testing/");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Regression for #1184: from a clean CWD where `../testing` does not yet
+    /// exist, `test_file()` must create it and return a path under it.
+    #[test]
+    fn test_file_creates_testing_dir() {
+        use std::env;
+        use std::fs;
+        use std::path::Path;
+        use std::sync::Mutex;
+
+        // Serialize CWD mutations across parallel tests in this crate.
+        static CWD_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = CWD_LOCK.lock().unwrap();
+
+        let base = env::temp_dir().join(format!("orpc-test-file-{}", Utils::rand_id()));
+        let work = base.join("crate_cwd");
+        fs::create_dir_all(&work).unwrap();
+
+        let testing = base.join("testing");
+        assert!(!testing.exists());
+
+        let prev = env::current_dir().unwrap();
+        env::set_current_dir(&work).unwrap();
+
+        let file = Utils::test_file();
+        let parent = Path::new(&file)
+            .parent()
+            .and_then(|p| p.canonicalize().ok());
+        let testing_canon = testing.canonicalize().ok();
+        let ok = testing.is_dir() && parent == testing_canon;
+
+        env::set_current_dir(prev).unwrap();
+        let _ = fs::remove_dir_all(&base);
+
+        assert!(
+            ok,
+            "test_file() must create ../testing and place the file under it"
+        );
     }
 }
