@@ -130,11 +130,16 @@ impl FuseOpCode {
     }
 }
 
-/// The dispatch status of an opcode: the single source of truth for whether an
-/// opcode is handled, and — for the unhandled ones — whether that is deliberate.
-/// Kept as an exhaustive match (no wildcard) so a newly-added `FuseOpCode`
-/// variant fails to compile until it is consciously classified here, preventing
-/// silent half-wiring (a parsed opcode with no dispatch arm, as RENAME2 once was).
+/// The dispatch status of an opcode: an opcode-level record of whether an
+/// opcode is handled, and — for the unhandled ones — whether that is deliberate
+/// (`Unsupported`) or protocol-internal (`Internal`), with the rationale.
+///
+/// The compile-time guarantee that a *parsed* operator actually has a dispatch
+/// arm lives in the exhaustive (no-`_`) matches in `dispatch_meta` and
+/// `send_stream_dispatch`: adding a `FuseOperator` variant with no arm fails to
+/// compile there. This matrix complements that with the opcode-level intent
+/// (why BMAP/POLL/etc. are ENOSYS, which opcodes are protocol-internal); its own
+/// exhaustive match likewise forces a newly-added `FuseOpCode` to be classified.
 #[cfg(test)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum DispatchStatus {

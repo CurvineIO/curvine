@@ -331,7 +331,7 @@ impl<T: FileSystem> FuseReceiver<T> {
 
         // NOTE: keep this match's stream arms in sync with `FuseRequest::is_stream()`
         // (Read/Write/Flush/Release/Fsync). `send_stream` is only entered when
-        // `is_stream()` is true, so the wildcard is unreachable today; it exists
+        // `is_stream()` is true, so the fallback is unreachable today; it exists
         // as a defensive branch in case the two ever drift.
         let res = match operator {
             FuseOperator::Read(op) => fs.read(op, rep).await,
@@ -344,11 +344,48 @@ impl<T: FileSystem> FuseReceiver<T> {
 
             FuseOperator::FSync(op) => fs.fsync(op, rep).await,
 
-            _ => {
-                // Defensive: a stream-gated request whose operator is not a known
-                // stream op. Tag it `unimplemented_opcode` so it classifies as
-                // Unsupported — the same semantics as the metadata `dispatch_meta`
-                // wildcard — rather than a plain backend Error.
+            // Exhaustive fallback — NOT a `_` wildcard: naming every non-stream
+            // variant keeps the match exhaustive, so a newly-added `FuseOperator`
+            // variant that is not wired here (or in `dispatch_meta`) fails to
+            // compile. Reaching any of these is a routing bug (`send_stream` is
+            // only entered when `is_stream()`), so tag `unimplemented_opcode` —
+            // same Unsupported classification as the `dispatch_meta` fallback —
+            // rather than a plain backend Error.
+            FuseOperator::Notimplemented
+            | FuseOperator::Init(_)
+            | FuseOperator::StatFs(_)
+            | FuseOperator::ReadDir(_)
+            | FuseOperator::Lookup(_)
+            | FuseOperator::GetAttr(_)
+            | FuseOperator::SetAttr(_)
+            | FuseOperator::GetXAttr(_)
+            | FuseOperator::SetXAttr(_)
+            | FuseOperator::RemoveXAttr(_)
+            | FuseOperator::OpenDir(_)
+            | FuseOperator::Mkdir(_)
+            | FuseOperator::FAllocate(_)
+            | FuseOperator::ReleaseDir(_)
+            | FuseOperator::Access(_)
+            | FuseOperator::ReadDirPlus(_)
+            | FuseOperator::Forget(_)
+            | FuseOperator::Open(_)
+            | FuseOperator::MkNod(_)
+            | FuseOperator::Create(_)
+            | FuseOperator::Unlink(_)
+            | FuseOperator::RmDir(_)
+            | FuseOperator::Link(_)
+            | FuseOperator::BatchForget(_)
+            | FuseOperator::Rename(_)
+            | FuseOperator::Rename2(_)
+            | FuseOperator::Interrupt(_)
+            | FuseOperator::ListXAttr(_)
+            | FuseOperator::FSyncDir(_)
+            | FuseOperator::Destroy(_)
+            | FuseOperator::Symlink(_)
+            | FuseOperator::Readlink(_)
+            | FuseOperator::GetLk(_)
+            | FuseOperator::SetLk(_)
+            | FuseOperator::SetLkW(_) => {
                 let err: FuseResult<fuse_out_header> = err_fuse!(
                     libc::ENOSYS,
                     "unsupported stream operation {:?}",
@@ -687,17 +724,31 @@ impl<T: FileSystem> FuseReceiver<T> {
 
             FuseOperator::SetLkW(op) => reply.send_rep(fs.set_lkw(op).await).await,
 
-            _ => {
-                // A parsed-but-unhandled opcode: source-tagged as Unsupported so
-                // it classifies that way (not a backend Error). The reason splits
-                // two cases the kernel can produce:
-                //   - opcode == NOT_SUPPORTED (the num_enum default, raw opcode
-                //     this build has no enum value for) -> `unknown_opcode`
-                //     (a kernel/daemon protocol-compatibility signal).
-                //   - a known but intentionally-unsupported opcode (BMAP/POLL/
-                //     IOCTL/LSEEK) -> `unimplemented_opcode`. Which opcodes are
-                //     intentionally unsupported vs. a real gap is recorded
-                //     authoritatively by `FuseOpCode::expected_dispatch`.
+            // Exhaustive fallback — NOT a `_` wildcard, deliberately: listing the
+            // remaining variants makes the match exhaustive, so adding a new
+            // `FuseOperator` variant without a dispatch arm here (or in
+            // `send_stream_dispatch`) fails to compile. This is the compile-time
+            // guarantee `expected_dispatch` cannot give (it is `#[cfg(test)]` and
+            // opcode-level, not arm-level), and is what would have caught the
+            // RENAME2 half-wiring. The arms handled here:
+            //   - `Notimplemented`: parse mapped an unknown/unsupported opcode to
+            //     the catch-all variant.
+            //   - the five stream ops (Read/Write/Flush/Release/FSync): these are
+            //     dispatched by `send_stream_dispatch`, never through this
+            //     metadata path, so reaching them here is a routing bug — but they
+            //     must still be named to keep the match exhaustive.
+            // Source-tag as Unsupported (not a backend Error). Split the reason:
+            //   - opcode == NOT_SUPPORTED (num_enum default for a raw opcode this
+            //     build has no enum value for) -> `unknown_opcode`.
+            //   - a known but intentionally-unsupported opcode (BMAP/POLL/IOCTL/
+            //     LSEEK) -> `unimplemented_opcode`. The authoritative
+            //     intentional-vs-gap record is `FuseOpCode::expected_dispatch`.
+            FuseOperator::Notimplemented
+            | FuseOperator::Read(_)
+            | FuseOperator::Write(_)
+            | FuseOperator::Flush(_)
+            | FuseOperator::Release(_)
+            | FuseOperator::FSync(_) => {
                 let reason = if req.opcode() == FuseOpCode::NOT_SUPPORTED {
                     "unknown_opcode"
                 } else {
