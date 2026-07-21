@@ -17,11 +17,9 @@
 use curvine_common::conf::JournalConf;
 use curvine_common::proto::raft::{FsmState, SnapshotData};
 use curvine_common::raft::storage::{
-    AppStorage, HashAppStorage, LogStorage, MemLogStorage, PeerStorage, RocksLogStorage,
+    AppStorage, HashAppStorage, LogStorage, MemLogStorage, RocksLogStorage,
 };
-use curvine_common::raft::{
-    RaftClient, RaftCode, RaftError, RaftGroup, RaftJournal, RaftPeer, RaftResult, RoleMonitor,
-};
+use curvine_common::raft::{RaftClient, RaftCode, RaftError, RaftJournal, RaftResult, RoleMonitor};
 use curvine_common::utils::SerdeUtils;
 use orpc::client::{ClientConf, RpcClient};
 use orpc::common::{FileUtils, Logger, Utils};
@@ -364,24 +362,10 @@ fn run_candidate_returns_snapshot_restore_error_without_panicking() -> CommonRes
 
 #[test]
 fn empty_static_voter_panics_on_leader_commit_above_local_last_index() -> CommonResult<()> {
-    let conf = JournalConf {
-        hostname: "node3".to_string(),
-        rpc_port: 8996,
-        journal_addrs: vec![
-            RaftPeer::new(1, "node1", 8996),
-            RaftPeer::new(2, "node2", 8996),
-            RaftPeer::new(3, "node3", 8996),
-        ],
-        ..JournalConf::with_test()
-    };
-    let group = RaftGroup::from_conf(&conf);
-    let storage = PeerStorage::new(
-        conf.create_runtime(),
-        NoSnapshotLogStorage,
-        FailingSnapshotAppStorage,
-        RaftClient::new(conf.create_runtime(), &group, conf.new_client_conf()),
-        &conf,
-    );
+    // Characterization test for raft-rs: a heartbeat that advances commit past
+    // last_index must panic. Use NoSnapshotLogStorage directly — wrapping it in
+    // PeerStorage + RaftClient + Runtime previously left executor threads alive
+    // after catch_unwind and hung under nextest until SIGKILL (~25min).
     let config = Config {
         id: 3,
         applied: 0,
@@ -390,7 +374,7 @@ fn empty_static_voter_panics_on_leader_commit_above_local_last_index() -> Common
         ..Default::default()
     };
     let logger = slog::Logger::root(slog::Discard, slog::o!());
-    let mut node = RawNode::new(&config, storage, &logger)?;
+    let mut node = RawNode::new(&config, NoSnapshotLogStorage, &logger)?;
 
     let mut heartbeat = RaftMessage::default();
     heartbeat.set_msg_type(MessageType::MsgHeartbeat);
