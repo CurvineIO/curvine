@@ -148,11 +148,9 @@ impl Utils {
         let mut path = env::current_dir().unwrap_or(PathBuf::from("."));
         path.push("../testing");
 
-        // Ensure the testing directory itself exists (not only its parent).
-        // create_parent_dir(../testing) would only create the workspace root.
-        fs::create_dir_all(&path).unwrap_or_else(|e| {
-            panic!("failed to create testing dir {}: {}", path.display(), e);
-        });
+        // Create the testing/ directory itself (create_parent_dir would only
+        // ensure the parent of ../testing, i.e. the workspace root).
+        fs::create_dir_all(&path).expect("failed to create testing/ for Utils::test_file");
 
         path.push(format!("test-{}", Self::rand_id()));
         format!("{}", path.display())
@@ -362,6 +360,24 @@ mod tests {
         println!("{}", dir)
     }
 
+    #[test]
+    fn test_file_creates_testing_directory() {
+        use std::path::Path;
+
+        let path = Utils::test_file();
+        let parent = Path::new(&path).parent().expect("test file has parent");
+        assert!(
+            parent.is_dir(),
+            "Utils::test_file must create testing/; missing {:?}",
+            parent
+        );
+        // Ensure the returned path is writable (the original ENOENT failure mode).
+        std::fs::File::create(&path).expect("should be able to create file under testing/");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Regression for #1184: from a clean CWD where `../testing` does not yet
+    /// exist, `test_file()` must create it and return a path under it.
     #[test]
     fn test_file_creates_testing_dir() {
         use std::env;

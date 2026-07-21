@@ -33,10 +33,21 @@ impl BdevLayout {
     pub fn new(spdk_meta: Option<Arc<SpdkMetaStore>>) -> Self {
         Self { spdk_meta }
     }
+
+    #[cfg(feature = "spdk")]
+    fn bdev_name(dir: &VfsDir) -> IOResult<&str> {
+        dir.state.bdev_name.as_deref().ok_or_else(|| {
+            IOError::from(format!("SPDK dir {} has no bdev name assigned", dir.id()))
+        })
+    }
 }
 
 impl BlockLayout for BdevLayout {
     fn allocate(&self, dir: &VfsDir, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
+        let allocated_bytes = match dir.state.offset_alloc.allocation_size(block.len) {
+            Some(size) => size,
+            None => return err_box!("Invalid bdev allocation size: {}", block.len),
+        };
         let mut meta = BlockMeta::with_tmp(block, dir);
         let offset = dir
             .state
@@ -49,10 +60,45 @@ impl BlockLayout for BdevLayout {
                 ))
             })?;
         meta.bdev_offset = offset;
+        meta.actual_len = allocated_bytes;
         Ok(meta)
     }
 
-    fn finalize(&self, meta: &BlockMeta, committed_len: i64) -> CommonResult<BlockMeta> {
+    fn prepare_write(
+        &self,
+        dir: &VfsDir,
+        meta: &BlockMeta,
+        block: &ExtendedBlock,
+    ) -> CommonResult<BlockMeta> {
+        let (offset, allocated_bytes) =
+            dir.state.offset_alloc.get_entry(meta.id()).ok_or_else(|| {
+                orpc::err_msg!(format!(
+                    "No bdev allocation found for block {} in dir {}",
+                    meta.id(),
+                    dir.id()
+                ))
+            })?;
+        if block.len < 0 || block.len > allocated_bytes {
+            return err_box!(
+                "Block {} write size {} exceeds bdev extent {}",
+                meta.id(),
+                block.len,
+                allocated_bytes
+            );
+        }
+
+        let mut prepared = BlockMeta::new(meta.id(), block.len, dir);
+        prepared.bdev_offset = offset;
+        prepared.actual_len = allocated_bytes;
+        Ok(prepared)
+    }
+
+    fn finalize(
+        &self,
+        _dir: &VfsDir,
+        meta: &BlockMeta,
+        committed_len: i64,
+    ) -> CommonResult<BlockMeta> {
         Ok(BlockMeta::with_final_spdk(meta, committed_len))
     }
 
@@ -82,8 +128,9 @@ impl BlockLayout for BdevLayout {
                 id: record.block_id,
                 len: record.len,
                 state,
-                dir: dir.state.clone(),
-                actual_len: record.len,
+                dir_id: dir.id(),
+                storage_type: dir.storage_type(),
+                actual_len: record.size,
                 bdev_offset: record.offset,
             });
         }
@@ -98,55 +145,56 @@ impl BlockLayout for BdevLayout {
         Ok(blocks)
     }
 
-    fn release(&self, meta: &BlockMeta) -> CommonResult<()> {
-        meta.dir.offset_alloc.free(meta.id());
-        Ok(())
+    fn release(&self, dir: &VfsDir, meta: &BlockMeta) {
+        dir.state.offset_alloc.free(meta.id());
     }
 
     // SPDK blocks have no filesystem file; offset release happens in release().
-    fn deallocate(&self, _meta: &BlockMeta) -> CommonResult<()> {
+    fn deallocate(&self, _dir: &VfsDir, _meta: &BlockMeta) -> CommonResult<()> {
         Ok(())
     }
 
-    fn open_writer(&self, meta: &BlockMeta, off: i64) -> IOResult<BlockWriteContext> {
+    fn open_writer(&self, dir: &VfsDir, meta: &BlockMeta, off: i64) -> IOResult<BlockWriteContext> {
         validate_open_offset(meta, off)?;
         #[cfg(feature = "spdk")]
         {
-            let bdev_name = meta.get_bdev_name()?;
-            let abs_offset = meta.bdev_offset.checked_add(off).ok_or_else(|| {
+            let bdev_name = Self::bdev_name(dir)?;
+            let base_offset = meta.bdev_offset;
+            let abs_offset = base_offset.checked_add(off).ok_or_else(|| {
                 IOError::from(format!(
                     "Block write offset overflow: base={}, offset={}",
-                    meta.bdev_offset, off
+                    base_offset, off
                 ))
             })?;
             let max_len = 0.max(meta.len - off);
             info!(
                 "Opening SPDK bdev '{}' for writing at offset {} (block {} base={}, max_len={})",
-                bdev_name, abs_offset, meta.id, meta.bdev_offset, max_len
+                bdev_name, abs_offset, meta.id, base_offset, max_len
             );
             if max_len == 0 {
                 return err_box!("Cannot open SPDK writer: no space remaining");
             }
-            let bdev = SpdkBdev::open_write(&bdev_name, abs_offset, max_len)?;
+            let bdev = SpdkBdev::open_write(bdev_name, abs_offset, max_len)?;
             let device = BlockDevice::Spdk(bdev);
-            BlockWriteContext::new(device, meta.bdev_offset, meta.len, off)
+            BlockWriteContext::new(device, base_offset, meta.len, off)
         }
         #[cfg(not(feature = "spdk"))]
         {
-            let _ = (meta, off);
+            let _ = (dir, meta, off);
             err_box!("SPDK support not compiled in")
         }
     }
 
-    fn open_reader(&self, meta: &BlockMeta, off: i64) -> IOResult<BlockReadContext> {
+    fn open_reader(&self, dir: &VfsDir, meta: &BlockMeta, off: i64) -> IOResult<BlockReadContext> {
         validate_open_offset(meta, off)?;
         #[cfg(feature = "spdk")]
         {
-            let bdev_name = meta.get_bdev_name()?;
-            let abs_offset = meta.bdev_offset.checked_add(off).ok_or_else(|| {
+            let bdev_name = Self::bdev_name(dir)?;
+            let base_offset = meta.bdev_offset;
+            let abs_offset = base_offset.checked_add(off).ok_or_else(|| {
                 IOError::from(format!(
                     "Block read offset overflow: base={}, offset={}",
-                    meta.bdev_offset, off
+                    base_offset, off
                 ))
             })?;
             let abs_offset = u64::try_from(abs_offset).map_err(|_| {
@@ -158,23 +206,23 @@ impl BlockLayout for BdevLayout {
             let max_len = 0.max(meta.len - off);
             info!(
                 "Opening SPDK bdev '{}' for reading at offset {} (block {} base={}, max_len={})",
-                bdev_name, abs_offset, meta.id, meta.bdev_offset, max_len
+                bdev_name, abs_offset, meta.id, base_offset, max_len
             );
             if max_len == 0 {
                 return err_box!("Cannot open SPDK reader: no space remaining");
             }
-            let bdev = SpdkBdev::open_read(&bdev_name, abs_offset, max_len)?;
+            let bdev = SpdkBdev::open_read(bdev_name, abs_offset, max_len)?;
             let device = BlockDevice::Spdk(bdev);
-            BlockReadContext::new(device, meta.bdev_offset, meta.len, off)
+            BlockReadContext::new(device, base_offset, meta.len, off)
         }
         #[cfg(not(feature = "spdk"))]
         {
-            let _ = (meta, off);
+            let _ = (dir, meta, off);
             err_box!("SPDK support not compiled in")
         }
     }
 
-    fn short_circuit(&self, _meta: &BlockMeta) -> CommonResult<Option<String>> {
+    fn short_circuit(&self, _dir: &VfsDir, _meta: &BlockMeta) -> CommonResult<Option<String>> {
         Ok(None)
     }
 }

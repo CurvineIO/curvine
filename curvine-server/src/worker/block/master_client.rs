@@ -30,6 +30,7 @@ pub struct MasterClient {
     pub(crate) cluster_id: String,
     pub(crate) worker_id: u32,
     pub(crate) worker_addr: WorkerAddress,
+    pub(crate) worker_weight: u32,
 }
 
 impl MasterClient {
@@ -38,6 +39,7 @@ impl MasterClient {
         cluster_id: impl Into<String>,
         worker_id: u32,
         worker_addr: WorkerAddress,
+        worker_weight: u32,
     ) -> Self {
         // Directly reused file system client service.
         let fs_client = FsClient::new(context);
@@ -46,6 +48,7 @@ impl MasterClient {
             cluster_id: cluster_id.into(),
             worker_id,
             worker_addr,
+            worker_weight,
         }
     }
 
@@ -60,6 +63,7 @@ impl MasterClient {
             cluster_id: self.cluster_id.clone(),
             worker_id: self.worker_id,
             address: ProtoUtils::worker_address_to_pb(&self.worker_addr),
+            weight: Some(self.worker_weight),
             ..Default::default()
         };
         for item in storages {

@@ -32,12 +32,14 @@ use curvine_common::state::{
     FileAllocMode, FileAllocOpts, FileLock, FileStatus, FileType, LockFlags, LockType, OpenFlags,
     SetAttrOpts,
 };
+use curvine_common::MAX_FILE_SIZE;
 use log::{debug, info, warn};
 use orpc::common::{ByteUnit, TimeSpent};
 use orpc::runtime::Runtime;
 use orpc::sys::FFIUtils;
 use orpc::{sys, ternary, try_option};
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::sync::Arc;
 
 pub struct CurvineFileSystem {
@@ -69,8 +71,98 @@ impl CurvineFileSystem {
         &self.conf
     }
 
+    fn normalize_fallocate(
+        current_len: i64,
+        offset: u64,
+        length: u64,
+        raw_mode: u32,
+    ) -> FuseResult<Option<FileAllocOpts>> {
+        if length == 0 {
+            return err_fuse!(libc::EINVAL, "fallocate length must be greater than zero");
+        }
+
+        let mode = match FileAllocMode::from_bits(raw_mode as i32) {
+            Some(mode) => mode,
+            None => {
+                return err_fuse!(
+                    libc::EOPNOTSUPP,
+                    "unsupported fallocate mode: {:#x}",
+                    raw_mode
+                )
+            }
+        };
+        // The backend resize API only accepts a target file length and cannot
+        // preserve the byte range required by ZERO_RANGE.
+        let allowed = FileAllocMode::DEFAULT | FileAllocMode::KEEP_SIZE;
+        if !(mode & !allowed).is_empty() {
+            return err_fuse!(
+                libc::EOPNOTSUPP,
+                "unsupported fallocate mode: {:#x}",
+                raw_mode
+            );
+        }
+
+        let offset = match i64::try_from(offset) {
+            Ok(offset) => offset,
+            Err(_) => return err_fuse!(libc::EFBIG, "fallocate offset exceeds supported size"),
+        };
+        let length = match i64::try_from(length) {
+            Ok(length) => length,
+            Err(_) => return err_fuse!(libc::EFBIG, "fallocate length exceeds supported size"),
+        };
+        let end = match offset.checked_add(length) {
+            Some(end) => end,
+            None => return err_fuse!(libc::EFBIG, "fallocate range overflows"),
+        };
+        if end > MAX_FILE_SIZE {
+            return err_fuse!(
+                libc::EFBIG,
+                "fallocate end {} exceeds maximum file size {}",
+                end,
+                MAX_FILE_SIZE
+            );
+        }
+
+        // Curvine allocates storage lazily across the cluster, so KEEP_SIZE has
+        // no logical metadata change to apply. Writes into the range still
+        // allocate blocks normally without exposing a larger st_size early.
+        if mode.contains(FileAllocMode::KEEP_SIZE) {
+            return Ok(None);
+        }
+
+        let target_len = current_len.max(end);
+        if target_len == current_len {
+            return Ok(None);
+        }
+
+        Ok(Some(FileAllocOpts {
+            truncate: false,
+            off: 0,
+            len: target_len,
+            mode,
+        }))
+    }
+
     pub(crate) fn fs(&self) -> &UnifiedFileSystem {
         &self.fs
+    }
+
+    fn validate_set_xattr_flags(flags: u32, exists: bool) -> FuseResult<()> {
+        let create = libc::XATTR_CREATE as u32;
+        let replace = libc::XATTR_REPLACE as u32;
+        let known = create | replace;
+
+        if flags & !known != 0 || flags & known == known {
+            return err_fuse!(libc::EINVAL, "Invalid setxattr flags: {:#x}", flags);
+        }
+        if flags & create != 0 && exists {
+            return err_fuse!(libc::EEXIST, "Extended attribute already exists");
+        }
+        if flags & replace != 0 && !exists {
+            return err_fuse!(libc::ENODATA, "Extended attribute does not exist");
+        }
+
+        Ok(())
     }
 
     async fn ensure_writable_path(&self, path: &Path, rpc_code: RpcCode) -> FuseResult<()> {
@@ -92,6 +184,46 @@ impl CurvineFileSystem {
 
     pub fn state(&self) -> &Arc<NodeState> {
         &self.state
+    }
+
+    fn retain_first_error(first: &mut FuseResult<()>, next: FuseResult<()>) {
+        if first.is_ok() {
+            *first = next;
+        }
+    }
+
+    /// Shared rename path resolution used by both `rename` and `rename2`.
+    async fn rename_paths(
+        &self,
+        old_id: u64,
+        old_name: &OsStr,
+        new_dir: u64,
+        new_name: &OsStr,
+    ) -> FuseResult<()> {
+        let old_name = try_option!(old_name.to_str());
+        let new_name = try_option!(new_name.to_str());
+        if new_name.len() > FUSE_MAX_NAME_LENGTH {
+            return err_fuse!(libc::ENAMETOOLONG);
+        }
+
+        let (old_path, new_path) = self.state.get_path2(old_id, old_name, new_dir, new_name)?;
+        self.ensure_writable_path(&old_path, RpcCode::Rename)
+            .await?;
+        self.ensure_writable_path(&new_path, RpcCode::Rename)
+            .await?;
+
+        self.state
+            .fs_rename(old_id, old_name, new_dir, new_name)
+            .await
+    }
+
+    /// Whether a RENAME2 `flags` value is supported. Checked against the RAW
+    /// value (not `RenameFlags::from_bits_truncate`, which would silently drop
+    /// unknown high bits and let a flag the kernel required pass as a plain
+    /// rename). The FUSE-facing client only issues flag-less renames, so any
+    /// non-zero flag (NO_REPLACE/EXCHANGE/WHITEOUT/…) is rejected with ENOSYS.
+    fn rename2_flags_supported(flags: u32) -> bool {
+        flags == 0
     }
 
     fn to_file_lock(&self, arg: &fuse_lk_in) -> FileLock {
@@ -125,7 +257,12 @@ impl CurvineFileSystem {
                 lock.end = u64::MAX;
             }
 
-            self.fs.set_lock(&path, lock).await?;
+            if let Err(e) = self.fs.set_lock(&path, lock).await {
+                // Preserve the owner locally when the backend unlock fails so a
+                // retained handle can retry the cleanup.
+                handler.add_lock(flags, owner_id);
+                return Err(e.into());
+            }
         }
 
         Ok(())
@@ -371,57 +508,111 @@ impl CurvineFileSystem {
         }
     }
 
-    /// Combine the daemon's baseline init flags with the flags the kernel
-    /// offered, then strip any capability Curvine must not advertise.
+    /// Negotiate the init reply flags as an explicit allowlist rather than
+    /// blindly echoing every kernel-offered capability.
     ///
-    /// Currently that means clearing `FUSE_ATOMIC_O_TRUNC`: `open` does not
-    /// perform the truncate itself, so if we advertised atomic O_TRUNC the
-    /// kernel would skip the follow-up `SETATTR(size=0)` and O_TRUNC would be
-    /// silently lost whenever a writer for the inode already exists (the shared
-    /// writer ignores the second open's flags). Clearing it forces the kernel
-    /// back to the open + SETATTR path, which `set_attr` handles via
-    /// `fs_resize`. See issue #1122.
-    fn negotiate_out_flags(base: u32, kernel_flags: u32) -> u32 {
-        (base | kernel_flags) & !FUSE_ATOMIC_O_TRUNC
+    /// Two categories:
+    /// 1. Kernel-negotiated caps: `SUPPORTED_INIT_FLAGS & kernel_flags` — only
+    ///    bits the daemon implements AND the kernel offered. This inherently
+    ///    excludes `FUSE_ATOMIC_O_TRUNC` (open does not truncate, #1122),
+    ///    `FUSE_POSIX_ACL`, `FUSE_HAS_IOCTL_DIR`, and any unknown/future bit,
+    ///    since none are in `SUPPORTED_INIT_FLAGS`. `FUSE_MAX_PAGES` survives
+    ///    only when the kernel offers it.
+    /// 2. Config-gated daemon-requested caps, forced on (NOT masked by the
+    ///    kernel offer): `FUSE_WRITEBACK_CACHE` when `write_back_cache`, and the
+    ///    `FUSE_SPLICE_*` bits when `enable_splice`. Splice is driven by the
+    ///    channel talking splice(2) on the fuse fd directly, independent of an
+    ///    init-flag offer, so it must be advertised on config alone.
+    fn negotiate_out_flags(kernel_flags: u32, write_back_cache: bool, enable_splice: bool) -> u32 {
+        let mut out = SUPPORTED_INIT_FLAGS & kernel_flags;
+        if write_back_cache {
+            out |= FUSE_WRITEBACK_CACHE;
+        }
+        if enable_splice {
+            out |= FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE | FUSE_SPLICE_READ;
+        }
+        out
+    }
+
+    /// Whether the kernel's advertised FUSE ABI version is at least the
+    /// daemon's minimum.
+    ///
+    /// Compared as a `(major, minor)` tuple against `FUSE_MIN_ABI`: reject any
+    /// version below 7.31 (this correctly rejects a low-major/high-minor combo
+    /// such as 6.40, which the old `major < 7 && minor < 31` check let through).
+    /// A higher major also compares as supported here; `init` handles that case
+    /// separately with a version-only reply (see `version_only_init_out`) before
+    /// this predicate gates the too-old case.
+    fn abi_supported(major: u32, minor: u32) -> bool {
+        (major, minor) >= FUSE_MIN_ABI
+    }
+
+    /// The INIT reply for a kernel whose major ABI is newer than the daemon's:
+    /// advertise only the daemon's own `(major, minor)` with no negotiated
+    /// flags, and leave every other field zeroed.
+    ///
+    /// Per the fuse.h version-negotiation convention, when the kernel major is
+    /// larger than the daemon's, userspace replies with its own major and skips
+    /// negotiation, and the kernel is expected to re-issue INIT at a matching
+    /// major. This mirrors libfuse `_do_init`'s `arg->major > 7` early return:
+    /// a `fuse_init_in` at an unknown higher major may not share our field
+    /// layout, so we must not interpret its flags. The kernel does not read the
+    /// other reply fields on a major mismatch, so they stay 0.
+    fn version_only_init_out() -> fuse_init_out {
+        fuse_init_out {
+            major: FUSE_KERNEL_VERSION,
+            minor: FUSE_KERNEL_MINOR_VERSION,
+            ..Default::default()
+        }
     }
 }
 
 impl fs::FileSystem for CurvineFileSystem {
     async fn init(&self, op: Init<'_>) -> FuseResult<fuse_init_out> {
-        if op.arg.major < FUSE_KERNEL_VERSION && op.arg.minor < FUSE_KERNEL_MINOR_VERSION {
+        if !Self::abi_supported(op.arg.major, op.arg.minor) {
             return err_fuse!(
                 libc::EPROTO,
-                "Unsupported FUSE ABI version {}.{}",
+                "unsupported FUSE ABI {}.{}: curvine requires >= {}.{}",
                 op.arg.major,
-                op.arg.minor
+                op.arg.minor,
+                FUSE_KERNEL_VERSION,
+                FUSE_KERNEL_MINOR_VERSION
             );
         }
 
-        let mut out_flags = FUSE_BIG_WRITES
-            | FUSE_ASYNC_READ
-            | FUSE_ASYNC_DIO
-            | FUSE_SPLICE_MOVE
-            | FUSE_SPLICE_WRITE
-            | FUSE_SPLICE_READ
-            | FUSE_READDIRPLUS_AUTO
-            | FUSE_AUTO_INVAL_DATA
-            | FUSE_EXPORT_SUPPORT;
+        // Kernel major newer than ours: reply with our own version only and do
+        // NOT negotiate flags — the `fuse_init_in` layout at an unknown higher
+        // major cannot be trusted (see `version_only_init_out`). Only when the
+        // majors already match do we run the allowlist negotiation below.
+        if op.arg.major > FUSE_KERNEL_VERSION {
+            info!(
+                "FUSE init: kernel offered abi={}.{} (major > {}); replying version-only \
+                 {}.{} and skipping capability negotiation",
+                op.arg.major,
+                op.arg.minor,
+                FUSE_KERNEL_VERSION,
+                FUSE_KERNEL_VERSION,
+                FUSE_KERNEL_MINOR_VERSION,
+            );
+            return Ok(Self::version_only_init_out());
+        }
+
+        // Negotiate an explicit allowlist (see `negotiate_out_flags`): only caps
+        // the daemon implements AND the kernel offered, plus config-gated
+        // writeback/splice. `max_pages` then keys off the negotiated result.
+        let out_flags = Self::negotiate_out_flags(
+            op.arg.flags,
+            self.conf.write_back_cache,
+            self.conf.enable_splice,
+        );
 
         let max_write = FuseUtils::get_fuse_buf_size() - FUSE_BUFFER_HEADER_SIZE;
         let page_size = sys::get_pagesize()?;
-        let max_pages = if op.arg.flags & FUSE_MAX_PAGES != 0 {
-            out_flags |= FUSE_MAX_PAGES;
+        let max_pages = if out_flags & FUSE_MAX_PAGES != 0 {
             (max_write - 1) / page_size + 1
         } else {
             0
         };
-
-        out_flags = Self::negotiate_out_flags(out_flags, op.arg.flags);
-        if self.conf.write_back_cache {
-            out_flags |= FUSE_WRITEBACK_CACHE;
-        } else {
-            out_flags &= !FUSE_WRITEBACK_CACHE;
-        }
 
         // If `fuse.max_readahead_kb` is configured, raise the negotiated
         // `max_readahead` so the kernel cap (min(bdi.max_readahead_kb,
@@ -432,8 +623,13 @@ impl fs::FileSystem for CurvineFileSystem {
         };
 
         let out = fuse_init_out {
-            major: op.arg.major,
-            minor: op.arg.minor,
+            // Advertise the daemon's own ABI, not the kernel's: curvine only
+            // implements the 7.31 struct/semantics, so it must not claim a higher
+            // version. The higher-major case is already handled above; here the
+            // majors match, and we reply with our own minor so we never claim a
+            // minor the kernel does not have.
+            major: FUSE_KERNEL_VERSION,
+            minor: FUSE_KERNEL_MINOR_VERSION,
             max_readahead,
             flags: out_flags,
             max_background: self.conf.max_background,
@@ -448,6 +644,27 @@ impl fs::FileSystem for CurvineFileSystem {
             #[cfg(feature = "fuse3")]
             unused: 0,
         };
+
+        // Log the negotiated capability set: what we advertise vs. what the
+        // kernel offered but we did not enable (so an operator can see why a
+        // capability is inactive). Report BOTH the version we advertise on the
+        // wire (`negotiated_abi`, always our own) and what the kernel offered
+        // (`kernel_offered_abi`) — the two differ in minor when the kernel is
+        // newer (e.g. offered 7.40, connection runs at 7.31), so a single "abi="
+        // field would misreport the live version. Note SPLICE/WRITEBACK may
+        // appear in "enabled" without being kernel-offered — they are
+        // config-gated daemon requests.
+        let dropped = op.arg.flags & !out_flags;
+        info!(
+            "FUSE init negotiated: negotiated_abi={}.{} kernel_offered_abi={}.{} \
+             enabled=[{}] kernel_offered_not_enabled=[{}]",
+            FUSE_KERNEL_VERSION,
+            FUSE_KERNEL_MINOR_VERSION,
+            op.arg.major,
+            op.arg.minor,
+            fuse_init_flag_names(out_flags).join(", "),
+            fuse_init_flag_names(dropped).join(", "),
+        );
 
         Ok(out)
     }
@@ -487,7 +704,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn get_xattr(&self, op: GetXAttr<'_>) -> FuseResult<BytesMut> {
         let name = try_option!(op.name.to_str());
-        FuseUtils::check_xattr(name, true)?;
+        FuseUtils::check_xattr(name, XattrOp::Get)?;
 
         let status = self.state.fs_stat(op.header.nodeid, None).await?;
         let mut buf = FuseBuf::default();
@@ -513,9 +730,15 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn set_xattr(&self, op: SetXAttr<'_>) -> FuseResult<()> {
         let name = try_option!(op.name.to_str());
-        FuseUtils::check_xattr(name, true)?;
+        FuseUtils::check_xattr(name, XattrOp::Set)?;
         let path = self.state.get_path(op.header.nodeid)?;
         self.ensure_writable_path(&path, RpcCode::SetAttr).await?;
+
+        // Serialize the existence check and update within this FUSE process so
+        // concurrent CREATE/REPLACE requests cannot both validate stale state.
+        let _guard = self.state.lock_path(&path).await;
+        let status = self.state.fs_stat(op.header.nodeid, None).await?;
+        Self::validate_set_xattr_flags(op.arg.flags, status.x_attr.contains_key(name))?;
 
         // Get the xattr value from the request
         let value_slice: &[u8] = op.value;
@@ -535,12 +758,14 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn remove_xattr(&self, op: RemoveXAttr<'_>) -> FuseResult<()> {
         let name = try_option!(op.name.to_str());
-        if FuseUtils::check_xattr(name, false).is_err() {
-            return Ok(());
-        }
+        FuseUtils::check_xattr(name, XattrOp::Remove)?;
 
         let path = self.state.get_path(op.header.nodeid)?;
         self.ensure_writable_path(&path, RpcCode::SetAttr).await?;
+
+        // Share the same path lock as set_xattr so a conditional REPLACE does
+        // not validate existence immediately before a concurrent removal.
+        let _guard = self.state.lock_path(&path).await;
 
         debug!("Removing xattr: path='{}' name='{}'", path, name);
 
@@ -561,12 +786,14 @@ impl fs::FileSystem for CurvineFileSystem {
 
         // Add custom xattr names from the file
         for name in status.x_attr.keys() {
+            // Hidden/protected attributes must not be advertised when getxattr
+            // deliberately makes them unreadable.
+            if FuseUtils::check_xattr(name, XattrOp::Get).is_err() {
+                continue;
+            }
             xattr_names.extend_from_slice(name.as_bytes());
             xattr_names.push(0); // null terminator
         }
-
-        // Add the special "id" attribute
-        xattr_names.extend_from_slice(b"id\0");
 
         let mut buf = FuseBuf::default();
 
@@ -738,11 +965,18 @@ impl fs::FileSystem for CurvineFileSystem {
         self.ensure_writable_path(&path, RpcCode::ResizeFile)
             .await?;
 
-        let opts = FileAllocOpts {
-            truncate: false,
-            off: op.arg.offset as i64,
-            len: op.arg.length as i64,
-            mode: FileAllocMode::from_bits_truncate(op.arg.mode as i32),
+        let status = self.state.fs_stat(op.header.nodeid, None).await?;
+        let writer_len = self
+            .state
+            .get_writer_len(op.header.nodeid)
+            .await
+            .map(|len| len as i64)
+            .unwrap_or(status.len);
+        let current_len = status.len.max(writer_len);
+        let Some(opts) =
+            Self::normalize_fallocate(current_len, op.arg.offset, op.arg.length, op.arg.mode)?
+        else {
+            return Ok(());
         };
 
         self.state
@@ -898,31 +1132,59 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path(ino)?;
         let _guard = self.state.lock_path(&path).await;
 
-        let handle = self.state.release_handle(ino, op.arg.fh).await?;
+        let (handle, mut release_result) = self.state.release_handle(ino, op.arg.fh).await?;
 
         if handle.has_writer() {
             self.state
                 .invalid_cache(op.header.nodeid, None, INVAL_REASON_RELEASE);
         }
 
-        let unlock_result = self
-            .fs_unlock(&handle, LockFlags::Flock)
-            .await
-            .and(self.fs_unlock(&handle, LockFlags::Plock).await);
-        unlock_result?;
-
-        if self.state.deferred_delete_ready(ino).await? {
-            debug!(
-                "release ino={}: no more open handles, executing delayed deletion of {}",
-                ino, path
+        let flock_result = self.fs_unlock(&handle, LockFlags::Flock).await;
+        if let Err(e) = &flock_result {
+            warn!(
+                "failed to release flock for ino={}, path={}: {}",
+                ino, path, e
             );
-            if let Err(e) = self.fs.delete(&path, false).await {
-                warn!("failed to delete {} after last handle closed: {}", path, e);
+        }
+        Self::retain_first_error(&mut release_result, flock_result);
+
+        let plock_result = self.fs_unlock(&handle, LockFlags::Plock).await;
+        if let Err(e) = &plock_result {
+            warn!(
+                "failed to release plock for ino={}, path={}: {}",
+                ino, path, e
+            );
+        }
+        Self::retain_first_error(&mut release_result, plock_result);
+
+        match self.state.deferred_delete_ready(ino).await {
+            Ok(true) => {
+                debug!(
+                    "release ino={}: no more open handles, executing delayed deletion of {}",
+                    ino, path
+                );
+                let delete_result = self
+                    .state
+                    .complete_deferred_delete(ino, self.fs.delete(&path, false).await);
+                if let Err(e) = &delete_result {
+                    warn!(
+                        "failed to delete {} after last handle closed; retaining pending delete: {}",
+                        path, e
+                    );
+                }
+                Self::retain_first_error(&mut release_result, delete_result);
             }
-            self.state.clear_mark_delete(ino)?;
+            Ok(false) => {}
+            Err(e) => {
+                warn!(
+                    "failed to evaluate deferred delete for ino={}, path={}: {}",
+                    ino, path, e
+                );
+                Self::retain_first_error(&mut release_result, Err(e));
+            }
         }
 
-        reply.send_rep::<(), FuseError>(Ok(())).await?;
+        reply.send_rep(release_result).await?;
         Ok(())
     }
 
@@ -976,24 +1238,24 @@ impl fs::FileSystem for CurvineFileSystem {
     }
 
     async fn rename(&self, op: Rename<'_>) -> FuseResult<()> {
-        let old_name = try_option!(op.old_name.to_str());
-        let new_name = try_option!(op.new_name.to_str());
-        if new_name.len() > FUSE_MAX_NAME_LENGTH {
-            return err_fuse!(libc::ENAMETOOLONG);
+        self.rename_paths(op.header.nodeid, op.old_name, op.arg.newdir, op.new_name)
+            .await
+    }
+
+    async fn rename2(&self, op: Rename2<'_>) -> FuseResult<()> {
+        // The FUSE-facing client rename path only issues flag-less renames, so
+        // NO_REPLACE/EXCHANGE/WHITEOUT are not plumbed through to the master RPC.
+        // Reject any flag with ENOSYS (POSIX-correct, and strictly better than
+        // the previous "all RENAME2 -> ENOSYS via the dispatch wildcard").
+        if !Self::rename2_flags_supported(op.arg.flags) {
+            return err_fuse!(
+                libc::ENOSYS,
+                "RENAME2 flags 0x{:x} not supported (flag-less rename only)",
+                op.arg.flags
+            );
         }
-
-        let (old_path, new_path) =
-            self.state
-                .get_path2(op.header.nodeid, old_name, op.arg.newdir, new_name)?;
-        self.ensure_writable_path(&old_path, RpcCode::Rename)
-            .await?;
-        self.ensure_writable_path(&new_path, RpcCode::Rename)
-            .await?;
-
-        self.state
-            .fs_rename(op.header.nodeid, old_name, op.arg.newdir, new_name)
-            .await?;
-        Ok(())
+        self.rename_paths(op.header.nodeid, op.old_name, op.arg.newdir, op.new_name)
+            .await
     }
 
     async fn batch_forget(&self, op: BatchForget<'_>) -> FuseResult<()> {
@@ -1107,7 +1369,8 @@ impl fs::FileSystem for CurvineFileSystem {
                 name: op.name,
             };
             let res = self.create(op).await?;
-            let _ = self.state.release_handle(res.0.nodeid, res.1.fh).await?;
+            let (_, close_result) = self.state.release_handle(res.0.nodeid, res.1.fh).await?;
+            close_result?;
             let out = fuse_entry_out {
                 nodeid: res.0.nodeid,
                 generation: res.0.generation,
@@ -1228,6 +1491,59 @@ impl fs::FileSystem for CurvineFileSystem {
 
 #[cfg(test)]
 mod tests {
+    use curvine_common::state::FileAllocMode;
+
+    #[test]
+    fn fallocate_default_converts_range_to_target_length() {
+        let opts = super::CurvineFileSystem::normalize_fallocate(4096, 4096, 4096, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(opts.off, 0);
+        assert_eq!(opts.len, 8192);
+        assert_eq!(opts.mode, FileAllocMode::DEFAULT);
+    }
+
+    #[test]
+    fn fallocate_inside_file_does_not_shrink_it() {
+        let opts = super::CurvineFileSystem::normalize_fallocate(8192, 1024, 4096, 0).unwrap();
+        assert!(opts.is_none());
+    }
+
+    #[test]
+    fn fallocate_keep_size_preserves_logical_length() {
+        let opts = super::CurvineFileSystem::normalize_fallocate(
+            4096,
+            4096,
+            4096,
+            FileAllocMode::KEEP_SIZE.bits() as u32,
+        )
+        .unwrap();
+        assert!(opts.is_none());
+    }
+
+    #[test]
+    fn fallocate_rejects_invalid_ranges_and_modes() {
+        let zero_len = super::CurvineFileSystem::normalize_fallocate(0, 0, 0, 0).unwrap_err();
+        assert_eq!(zero_len.errno, libc::EINVAL);
+
+        let too_large =
+            super::CurvineFileSystem::normalize_fallocate(0, u64::MAX, 1, 0).unwrap_err();
+        assert_eq!(too_large.errno, libc::EFBIG);
+
+        let unsupported =
+            super::CurvineFileSystem::normalize_fallocate(0, 0, 4096, 0x02).unwrap_err();
+        assert_eq!(unsupported.errno, libc::EOPNOTSUPP);
+
+        let zero_range = super::CurvineFileSystem::normalize_fallocate(
+            8192,
+            4096,
+            4096,
+            FileAllocMode::ZERO_RANGE.bits() as u32,
+        )
+        .unwrap_err();
+        assert_eq!(zero_range.errno, libc::EOPNOTSUPP);
+    }
+
     /// Pin the production init-order invariant that Phase 1b-2 depends on:
     /// `FuseMetrics::ensure_init()` MUST run before `NodeState::new()` in
     /// `CurvineFileSystem::new`. After 1b-2 removed the scrape-time
@@ -1280,52 +1596,186 @@ mod tests {
     }
 
     use super::CurvineFileSystem;
-    use crate::FUSE_ATOMIC_O_TRUNC;
+    use crate::{
+        fuse_init_flag_names, FUSE_ATOMIC_O_TRUNC, FUSE_BIG_WRITES, FUSE_DO_READDIRPLUS,
+        FUSE_FLOCK_LOCKS, FUSE_HAS_IOCTL_DIR, FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,
+        FUSE_MAX_PAGES, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_SPLICE_MOVE, FUSE_SPLICE_READ,
+        FUSE_SPLICE_WRITE, FUSE_WRITEBACK_CACHE, SUPPORTED_INIT_FLAGS,
+    };
 
-    // #1122: the daemon must never advertise FUSE_ATOMIC_O_TRUNC, because `open`
-    // does not truncate. If the kernel offers it, negotiate_out_flags must strip
-    // it so the kernel falls back to the open + SETATTR(size=0) path.
     #[test]
-    fn negotiate_out_flags_strips_atomic_o_trunc_offered_by_kernel() {
-        // Kernel offers ATOMIC_O_TRUNC plus some other capability bit.
-        let other = 1u32 << 15; // FUSE_ASYNC_DIO, arbitrary unrelated bit
-        let kernel_flags = FUSE_ATOMIC_O_TRUNC | other;
-        let base = 1u32 << 5; // FUSE_BIG_WRITES, arbitrary baseline bit
+    fn set_xattr_flags_enforce_create_and_replace_semantics() {
+        let create = libc::XATTR_CREATE as u32;
+        let replace = libc::XATTR_REPLACE as u32;
 
-        let out = CurvineFileSystem::negotiate_out_flags(base, kernel_flags);
+        CurvineFileSystem::validate_set_xattr_flags(0, false).unwrap();
+        CurvineFileSystem::validate_set_xattr_flags(0, true).unwrap();
+        CurvineFileSystem::validate_set_xattr_flags(create, false).unwrap();
+        CurvineFileSystem::validate_set_xattr_flags(replace, true).unwrap();
 
         assert_eq!(
-            out & FUSE_ATOMIC_O_TRUNC,
-            0,
-            "FUSE_ATOMIC_O_TRUNC must be cleared even when the kernel offers it"
+            CurvineFileSystem::validate_set_xattr_flags(create, true)
+                .unwrap_err()
+                .errno(),
+            libc::EEXIST
         );
-        // Unrelated kernel-offered and baseline bits must be preserved.
-        assert_eq!(out & other, other, "unrelated kernel bit must survive");
-        assert_eq!(out & base, base, "baseline bit must survive");
+        assert_eq!(
+            CurvineFileSystem::validate_set_xattr_flags(replace, false)
+                .unwrap_err()
+                .errno(),
+            libc::ENODATA
+        );
+        assert_eq!(
+            CurvineFileSystem::validate_set_xattr_flags(create | replace, false)
+                .unwrap_err()
+                .errno(),
+            libc::EINVAL
+        );
+        assert_eq!(
+            CurvineFileSystem::validate_set_xattr_flags(1 << 31, false)
+                .unwrap_err()
+                .errno(),
+            libc::EINVAL
+        );
     }
 
-    // Even if the baseline set somehow contained the bit, it must not leak out.
+    // #1122 + allowlist: the daemon must never advertise FUSE_ATOMIC_O_TRUNC
+    // (open does not truncate) or any other unsupported capability, even when
+    // the kernel offers it. The allowlist mask drops them.
     #[test]
-    fn negotiate_out_flags_strips_atomic_o_trunc_from_base() {
-        let base = FUSE_ATOMIC_O_TRUNC | (1u32 << 4);
-        let out = CurvineFileSystem::negotiate_out_flags(base, 0);
-        assert_eq!(out & FUSE_ATOMIC_O_TRUNC, 0);
-        assert_eq!(out & (1u32 << 4), 1u32 << 4);
+    fn negotiate_out_flags_drops_unsupported_kernel_caps() {
+        let unsupported = FUSE_ATOMIC_O_TRUNC | FUSE_POSIX_ACL | FUSE_HAS_IOCTL_DIR | (1u32 << 30);
+        let out = CurvineFileSystem::negotiate_out_flags(unsupported, false, false);
+        assert_eq!(
+            out, 0,
+            "no unsupported kernel-offered bit may be advertised"
+        );
     }
 
-    // When the kernel does not offer the bit, output is a clean union with
-    // nothing spuriously added.
+    // Supported caps pass through when the kernel offers them. Guards against
+    // regressing distributed locking / readdirplus, which were only enabled by
+    // the old blind OR.
     #[test]
-    fn negotiate_out_flags_is_union_when_bit_absent() {
-        let base = 1u32 << 5;
-        let kernel_flags = 1u32 << 14;
-        let out = CurvineFileSystem::negotiate_out_flags(base, kernel_flags);
-        assert_eq!(out, base | kernel_flags);
+    fn negotiate_out_flags_passes_through_supported_caps() {
+        let out = CurvineFileSystem::negotiate_out_flags(SUPPORTED_INIT_FLAGS, false, false);
+        assert_eq!(
+            out, SUPPORTED_INIT_FLAGS,
+            "all supported+offered caps survive"
+        );
+        // Explicit regression guards for the previously-implicit caps.
+        assert_eq!(out & FUSE_POSIX_LOCKS, FUSE_POSIX_LOCKS);
+        assert_eq!(out & FUSE_FLOCK_LOCKS, FUSE_FLOCK_LOCKS);
+        assert_eq!(out & FUSE_DO_READDIRPLUS, FUSE_DO_READDIRPLUS);
+    }
+
+    // A supported cap the kernel did NOT offer must not be advertised (no
+    // phantom capabilities).
+    #[test]
+    fn negotiate_out_flags_no_phantom_when_kernel_offers_nothing() {
+        let out = CurvineFileSystem::negotiate_out_flags(0, false, false);
+        assert_eq!(out, 0);
+        assert_eq!(out & FUSE_MAX_PAGES, 0);
+        assert_eq!(out & FUSE_POSIX_LOCKS, 0);
+    }
+
+    // WRITEBACK is a config-gated daemon-requested cap: present iff write_back,
+    // absent otherwise even when the kernel offers it.
+    #[test]
+    fn negotiate_out_flags_writeback_is_config_gated() {
+        let on = CurvineFileSystem::negotiate_out_flags(0, true, false);
+        assert_eq!(on & FUSE_WRITEBACK_CACHE, FUSE_WRITEBACK_CACHE);
+        let off = CurvineFileSystem::negotiate_out_flags(FUSE_WRITEBACK_CACHE, false, false);
+        assert_eq!(off & FUSE_WRITEBACK_CACHE, 0);
+    }
+
+    // SPLICE is config-gated and forced (not masked by the kernel offer, since
+    // the channel drives splice(2) directly).
+    #[test]
+    fn negotiate_out_flags_splice_is_config_gated() {
+        let splice = FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE | FUSE_SPLICE_READ;
+        let on = CurvineFileSystem::negotiate_out_flags(0, false, true);
+        assert_eq!(
+            on & splice,
+            splice,
+            "splice advertised on config even if kernel omits it"
+        );
+        let off = CurvineFileSystem::negotiate_out_flags(splice, false, false);
+        assert_eq!(off & splice, 0, "splice not advertised when disabled");
+    }
+
+    // Containment: output never contains a bit outside the allowed universe,
+    // regardless of what the kernel offers.
+    #[test]
+    fn negotiate_out_flags_containment() {
+        let splice = FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE | FUSE_SPLICE_READ;
+        let allowed = SUPPORTED_INIT_FLAGS | splice | FUSE_WRITEBACK_CACHE;
+        let out = CurvineFileSystem::negotiate_out_flags(0xFFFF_FFFF, true, true);
+        assert_eq!(out & !allowed, 0, "no bit outside the allowed universe");
+    }
+
+    #[test]
+    fn abi_supported_tuple_comparison() {
+        // Accept >= 7.31, including a higher major.
+        assert!(CurvineFileSystem::abi_supported(7, 31));
+        assert!(CurvineFileSystem::abi_supported(7, 32));
+        assert!(CurvineFileSystem::abi_supported(8, 0));
+        // Reject anything below 7.31 — including the low-major/high-minor combo
+        // the old `major < 7 && minor < 31` check let through.
+        assert!(!CurvineFileSystem::abi_supported(7, 30));
+        assert!(!CurvineFileSystem::abi_supported(6, 40));
+        assert!(!CurvineFileSystem::abi_supported(6, 0));
+        assert!(!CurvineFileSystem::abi_supported(0, 0));
+    }
+
+    // Higher-major short reply (mirrors libfuse `_do_init`'s `arg->major > 7`
+    // path): advertise only our own version, negotiate no flags, zero the rest.
+    #[test]
+    fn version_only_init_out_advertises_own_version_no_flags() {
+        let out = CurvineFileSystem::version_only_init_out();
+        assert_eq!(out.major, FUSE_KERNEL_VERSION);
+        assert_eq!(out.minor, FUSE_KERNEL_MINOR_VERSION);
+        assert_eq!(
+            out.flags, 0,
+            "no capability negotiation on a major mismatch"
+        );
+        // Fields the kernel does not read on a major mismatch stay zeroed.
+        assert_eq!(out.max_readahead, 0);
+        assert_eq!(out.max_write, 0);
+        assert_eq!(out.max_background, 0);
+        assert_eq!(out.congestion_threshold, 0);
     }
 
     #[test]
     fn atomic_o_trunc_bit_value_matches_uapi() {
         // uapi fuse.h: FUSE_ATOMIC_O_TRUNC = (1 << 3)
         assert_eq!(FUSE_ATOMIC_O_TRUNC, 1 << 3);
+    }
+
+    #[test]
+    fn fuse_init_flag_names_maps_known_and_unknown() {
+        // Known bits render as names.
+        let names = fuse_init_flag_names(FUSE_POSIX_LOCKS | FUSE_DO_READDIRPLUS);
+        assert!(names.contains(&"POSIX_LOCKS".to_string()));
+        assert!(names.contains(&"DO_READDIRPLUS".to_string()));
+        // Empty flags => empty list.
+        assert!(fuse_init_flag_names(0).is_empty());
+        // An unknown bit is surfaced as a hex token, not silently dropped.
+        let unknown = 1u32 << 30;
+        let names = fuse_init_flag_names(FUSE_BIG_WRITES | unknown);
+        assert!(names.contains(&"BIG_WRITES".to_string()));
+        assert!(names.iter().any(|n| n == "0x40000000"));
+    }
+
+    #[test]
+    fn rename2_flags_supported_only_accepts_zero() {
+        // Flag-less rename is the only supported form.
+        assert!(CurvineFileSystem::rename2_flags_supported(0));
+        // Known rename flags are rejected (client does not plumb them through).
+        assert!(!CurvineFileSystem::rename2_flags_supported(1)); // RENAME_NOREPLACE
+        assert!(!CurvineFileSystem::rename2_flags_supported(2)); // RENAME_EXCHANGE
+        assert!(!CurvineFileSystem::rename2_flags_supported(4)); // RENAME_WHITEOUT
+                                                                 // An unknown high bit must also be rejected — checked against the raw
+                                                                 // value, so it is not silently truncated away (the RenameFlags footgun).
+        assert!(!CurvineFileSystem::rename2_flags_supported(1 << 6));
     }
 }

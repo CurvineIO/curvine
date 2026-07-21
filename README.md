@@ -20,10 +20,11 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Rust](https://img.shields.io/badge/Rust-1.86%2B-orange)](https://www.rust-lang.org)
 
-- **Curvine : AI-Native & Cloud-Native FS** A high-performance file semantic layer for cloud object storage, integrated with high-speed cache.
+> **Curvine: AI-Native & Cloud-Native File System** — A high-performance POSIX file semantic layer built on top of cloud object storage, with an integrated multi-tier distributed cache, designed from the ground up for large-scale AI workloads and AI Agent platforms.
 
-- **Name Origin** The name "Curvine" is derived from the concatenation of the words "Curvature" and "Engine". It refers to an accelerator for spacecraft in the science fiction novel The Three-Body Problem, symbolizing extremely high performance.
+> **Name Origin** — "Curvine" is derived from *"Curvature Engine"*, the faster-than-light propulsion device in Liu Cixin's sci-fi novel *The Three-Body Problem*. It symbolizes the project's pursuit of extreme acceleration for data access.
 
+---
 
 ## 📚 Documentation Resources
 
@@ -41,27 +42,65 @@ For more detailed information, please refer to:
 ## Roadmap 2026
 ![Evolution from Distributed Cache to AI Agent-Native Infrastructure ](https://github.com/CurvineIO/curvine/discussions/549)
 
-## Use Case
-![use_case](https://raw.githubusercontent.com/CurvineIO/curvine-doc/refs/heads/main/docs/1-Overview/img/curvine-scene.png)
+## 🎯 Why Curvine
 
-- **Case1**: LLM Training acceleration Acceleration
-- **Case2**: LLM Model distribution Acceleration
-- **Case3**: Multimodal Data Lake Access Acceleration
-- **Case4**: OLAP Engine Query Acceleration in Compute-Storage Separation Scenarios
-- **Case5**: Multi-cloud data caching
+The AI infrastructure landscape is undergoing a fundamental architectural shift: from a centralized model where a single large model instance serves all requests, to a distributed model where **tens of thousands of Agent instances run independently**. Each Agent is not a stateless HTTP handler — it is a stateful process with its own working directory, persistent context files, `node_modules`, `.git` history, and a need for an isolated POSIX workspace.
+
+This "massive small stateful instances" workload pattern is fundamentally different from traditional stateful applications, and it exposes the hard limits of existing storage options:
+
+| Storage Option | Limitation for Agent-at-Scale |
+|----------------|-------------------------------|
+| Block storage (e.g. EBS) | Per-node volume attach limit (e.g. 28 on most Nitro instances), single-AZ binding, slow cross-AZ failover |
+| Managed NFS (e.g. EFS) | Access Point creation is throttled by cloud API rate limits; large-scale parallel provisioning becomes a bottleneck |
+| Object storage (e.g. S3) | No POSIX semantics — no in-place mutation, no atomic rename, no consistent directory listing |
+
+**Curvine closes this gap.** It layers a distributed POSIX file system over cloud object storage, so that:
+
+- Provisioning a PVC is just `mkdir` on a distributed file system — **millisecond-level, no cloud control-plane API calls, no rate limits**.
+- Each Agent Pod gets an isolated file system view via the native CSI driver, with the same logical isolation as block storage but **without the per-node attach-count ceiling**.
+- Pods can be scheduled across nodes and AZs freely; data stays reachable because it lives in the shared Curvine namespace, not a node-bound volume.
+
+## 🤖 AI Agent Use Case
+
+Curvine is purpose-built to back large-scale AI Agent platforms on Kubernetes. In a production validation on **Amazon EKS**, Curvine sustained **10,000 independent stateful Pods** with reliable persistent storage:
+
+| Metric | Result |
+|--------|--------|
+| Provisioned PVCs | 10,000 — all `Bound`, zero `Pending`, zero `Failed` |
+| Running Pods | 10,000 — all `Running`, zero `CrashLoopBackOff` |
+| Storage cluster footprint | **1 Master + 3 Workers = 4 core Pods** serving 10,000 PVCs |
+| Pod density per node | ~100 Agent Pods per `r6g.4xlarge` node (vs. ~28 with EBS) |
+| Node resource utilization | CPU 88% / Memory 98% (compute, not storage, is the bound) |
+| Provisioning latency | Milliseconds (local `mkdir`, no cloud API) |
+| Durability | Data survives Pod restart and cross-node rescheduling |
+
+> Read the full story: **[AI Agent 存储选型：Curvine 如何在 EKS 上支撑万级 Agent 运行](https://aws.amazon.com/cn/blogs/china/ai-agent-storage-curvine-how-to-eks-agent/)**
 
 
 ## 🚀 Core Features
 
-- **Multi-Cloud Support**: Curvine is compatible with object storage services from multiple cloud providers as its underlying storage layer, enabling transparent data migration across different vendors' object storage platforms.
-- **Cloud-Native**: Curvine supports CSI-based cloud-native integration with Kubernetes, enabling deployment and management of Curvine clusters via Helm charts.
-- **Multi-tir Cache**: Supports multi-tir cache strategies for memory, SSD, and HDD.
-- **POSIX Semantic Support**: Curvine delivers comprehensive POSIX semantic compatibility, implementing a high-performance FUSE layer to facilitate the manipulation of distributed cached data as if it were local disk storage.
-- **Compatibility with S3 and HDFS Protocols**: The system supports both S3 and HDFS read/write interfaces, facilitating seamless integration with artificial intelligence and big data technology ecosystems.
-- **High Performance**: Curvine employs "zero-copy" techniques multiple times throughout its data read/write pipeline and leverages asynchronous operations. Additionally, its core engine is built with Rust, ensuring optimal performance is achieved.
-- **Raft Consensus**: Uses the Raft algorithm to ensure the master's data consistency and high availability.
-- **Monitoring and Metrics**: Curvine features a comprehensive built-in observability metrics system, facilitating detailed monitoring of the performance of each component.
-- **Web Interface**: Provides a web management interface for convenient system monitoring and management.
+- **AI-Native Positioning**: First-class support for AI training acceleration and AI Agent cloud-native storage as primary use cases, not an afterthought.
+- **Multi-Cloud Object Storage Backend**: Compatible with object storage services from multiple cloud providers as the durable underlying layer, enabling transparent data migration across vendors.
+- **Cloud-Native Kubernetes Integration**: Native CSI driver enables dynamic PVC provisioning, `Immediate` binding, volume expansion, and Helm-based cluster deployment.
+- **Multi-Tier Cache**: Memory → SSD → HDD automatic tiering; hot data is transparently promoted to faster tiers.
+- **Full POSIX Semantics via FUSE**: A high-performance FUSE layer presents distributed cached data as a local file system — `open`, `read`, `write`, `seek`, `rename`, `list` — enabling tools like Vite, `inotify`/`fswatch`, and `git` to work unmodified.
+- **S3 & HDFS Protocol Compatibility**: Read/write through both S3 and HDFS interfaces for seamless integration with AI and big-data ecosystems.
+- **Extreme Performance**: Rust core with Tokio async runtime, zero-copy data paths, and a GC-free memory model — ~100μs-class latency and 100K+ stable QPS.
+- **Massive Metadata Capacity**: A single cluster supports **5 billion** small files, absorbing the aggregate metadata pressure of tens of thousands of Agents.
+- **Metadata Independence**: Curvine's file metadata path maps **1:1** to the underlying S3 object path. Even if the Curvine service is unavailable, objects on S3 keep their original structure and remain independently accessible — fast and simple recovery.
+- **Raft Consensus**: Master metadata is replicated via Raft for consistency and high availability.
+- **Observability**: Built-in metrics system and Web UI for per-component performance monitoring.
+
+## 📈 Use Cases
+
+![use_case](https://raw.githubusercontent.com/CurvineIO/curvine-doc/refs/heads/main/docs/1-Overview/img/curvine-scene.png)
+
+- **Case 1 — AI Agent Platform Storage**: Backing tens of thousands of stateful Agent Pods on Kubernetes with isolated POSIX workspaces, millisecond provisioning, and no per-node volume limits.
+- **Case 2 — LLM Training Acceleration**: Caching training datasets and checkpoints close to GPU nodes to shorten training cycles.
+- **Case 3 — LLM Model Distribution Acceleration**: Fast multi-region model artifact distribution through the distributed cache.
+- **Case 4 — Multimodal Data Lake Access Acceleration**: POSIX access over multimodal lakes without copying data locally.
+- **Case 5 — OLAP Query Acceleration**: Accelerating compute-storage separated OLAP engines with a hot data cache.
+- **Case 6 — Multi-Cloud Data Caching**: A unified cache layer across multi-cloud object storage backends.
 
 ## 📦 System Requirements
 
@@ -69,8 +108,7 @@ For more detailed information, please refer to:
 - Linux or macOS (Limited support on Windows)
 - FUSE library (for file system functionality)
 
-
-**Officially Supported Linux Distributions**​
+**Officially Supported Linux Distributions**
 
 | OS Distribution     | Kernel Requirement | Tested Version | Dependencies |
 |---------------------|--------------------|----------------|--------------|
@@ -79,7 +117,6 @@ For more detailed information, please refer to:
 | ​**Rocky Linux 9**​ | ≥5.14.0            | 9.5            | fuse3-3.10.2 |
 | ​**RHEL 9**​        | ≥5.14.0            | 9.5            | fuse3-3.10.2 |
 | ​**Ubuntu 22**​      | ≥5.15.0            | 22.4           | fuse3-3.10.5 |
-
 
 ## 🛠 Build Instructions
 
@@ -116,7 +153,6 @@ make build ARGS="-p core"
 make build ARGS="-p core -p fuse"
 ```
 
-
 Using build.sh directly:
 
 ```bash
@@ -145,7 +181,7 @@ make docker-build-cached
 
 After successful compilation, target file will be generated in the build/dist directory. This file is the Curvine installation package that can be used for deployment or building images.
 
-### 🖥️  Start a single - node cluster
+### 🖥️  Start a single-node cluster
 ```bash
 cd build/dist
 
@@ -198,21 +234,22 @@ bin/curvine-master.sh stop
 
 ## 🏗️ Architecture Design
 
-Curvine adopts a master-slave architecture:
+Curvine adopts a Master-Worker architecture:
 
-- **Master Node**: Responsible for metadata management, worker node coordination, and load balancing.
-- **Worker Node**: Responsible for data storage and processing.
-- **Client**: Communicates with the Master and Worker nodes via RPC.
+- **Master Node**: Responsible for metadata management, worker node coordination, and load balancing. Uses the Raft consensus algorithm to guarantee metadata consistency and high availability.
+- **Worker Node**: Responsible for data caching and service. Supports multi-tier cache (memory, SSD, HDD) with automatic hot-data promotion.
+- **Client**: Communicates with the Master and Worker nodes via RPC; accesses data through FUSE (POSIX), S3, or HDFS-compatible interfaces.
 
-The system uses the Raft consensus algorithm to ensure metadata consistency and supports multiple storage strategies (memory, SSD, HDD) to optimize performance and cost.
+The core idea: layer a distributed file system cache over cloud object storage, exposing full POSIX semantics upward and using object storage as the durable persistence layer downward. For Kubernetes workloads, the native CSI driver mounts the file system directly as a PVC — provisioning does not call any external cloud API, it simply creates a directory on the distributed file system, which completes in milliseconds.
 
 ## 📈 Performance
 
 Curvine performs excellently in high-concurrency scenarios and supports:
 
 - High-throughput data read and write
-- Low-latency operations
+- ~100μs-class latency and 100K+ stable QPS
 - Large-scale concurrent connections
+- 5 billion small files per cluster
 
 ## Contributing
 Please read Curvine [Contribute guidelines](CONTRIBUTING.md)

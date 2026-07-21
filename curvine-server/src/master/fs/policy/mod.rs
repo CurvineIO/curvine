@@ -27,6 +27,9 @@ pub use self::random_worker_policy::RandomWorkerPolicy;
 mod load_based_worker_policy;
 pub use self::load_based_worker_policy::LoadBasedWorkerPolicy;
 
+mod weighted_worker_policy;
+pub use self::weighted_worker_policy::WeightedWorkerPolicy;
+
 mod worker_policy_adapter;
 pub use self::worker_policy_adapter::WorkerPolicyAdapter;
 

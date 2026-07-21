@@ -18,7 +18,6 @@ use crate::worker::storage::{
 };
 use curvine_common::conf::ClusterConf;
 use curvine_common::state::{ExtendedBlock, StorageInfo};
-use log::error;
 use orpc::CommonResult;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -76,27 +75,27 @@ impl BlockStore {
     }
 
     pub fn open_writer(&self, meta: &BlockMeta, off: i64) -> CommonResult<BlockWriteContext> {
-        let layout = {
+        let (layout, dir) = {
             let state = self.read()?;
-            state.layout_for(meta)
+            state.layout_for(meta)?
         };
-        layout.open_writer(meta, off).map_err(Into::into)
+        layout.open_writer(&dir, meta, off).map_err(Into::into)
     }
 
     pub fn open_reader(&self, meta: &BlockMeta, off: i64) -> CommonResult<BlockReadContext> {
-        let layout = {
+        let (layout, dir) = {
             let state = self.read()?;
-            state.layout_for(meta)
+            state.layout_for(meta)?
         };
-        layout.open_reader(meta, off).map_err(Into::into)
+        layout.open_reader(&dir, meta, off).map_err(Into::into)
     }
 
     pub fn short_circuit(&self, meta: &BlockMeta) -> CommonResult<Option<String>> {
-        let layout = {
+        let (layout, dir) = {
             let state = self.read()?;
-            state.layout_for(meta)
+            state.layout_for(meta)?
         };
-        layout.short_circuit(meta)
+        layout.short_circuit(&dir, meta)
     }
 
     pub fn worker_id(&self) -> CommonResult<u32> {
@@ -122,17 +121,18 @@ impl BlockStore {
 
     // Asynchronously delete block.
     pub fn async_remove_block(&self, id: i64) -> CommonResult<BlockMeta> {
-        let (meta, layout) = {
+        let removed = {
             let mut state = self.write()?;
-            let (meta, layout) = state.remove_block_state_by_id(id)?;
+            let remove_result = state.remove_block_state_by_id(id);
+            // Heartbeat increments this counter before scheduling the task.
+            // Consume it even when metadata removal reports an error.
             state.decrement_blocks_to_delete();
-            (meta, layout)
-        };
+            remove_result
+        }?;
 
-        layout.deallocate(&meta)?;
-        let state = self.read()?;
-        state.release_block_space(&meta)?;
-        Ok(meta)
+        removed.layout.deallocate(&removed.dir, &removed.meta)?;
+        removed.release_space();
+        Ok(removed.meta)
     }
 
     // Get all storage information and check whether the storage directory is normal.
@@ -140,32 +140,54 @@ impl BlockStore {
     // This method is called by the heartbeat thread and returns all storage information, including failed storage.
     pub fn get_and_check_storages(&self) -> CommonResult<Vec<StorageInfo>> {
         let state = self.read()?;
-        let mut vec = vec![];
-        for item in state.dir_iter() {
-            let failed = match item.check_dir() {
-                Ok(_) => false,
-                Err(e) => {
-                    error!("check_dir {}: {}", item.id(), e);
-                    item.set_failed();
-                    true
-                }
-            };
-            let info = StorageInfo {
-                dir_id: item.id(),
-                storage_id: item.version().storage_id.to_string(),
-                failed,
-                capacity: item.capacity(),
-                fs_used: item.fs_used(),
-                non_fs_used: item.non_fs_used(),
-                available: item.available(),
-                reserved_bytes: item.reserved_bytes(),
-                storage_type: item.storage_type(),
-                block_num: state.num_blocks() as i64,
-                dir_path: item.path_str().to_string(),
-            };
-            vec.push(info);
+        Ok(state.get_and_check_storages())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::storage::Dataset;
+    use curvine_common::conf::WorkerConf;
+
+    fn create_store(name: &str) -> CommonResult<BlockStore> {
+        let conf = ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                dir_reserved: "0".to_string(),
+                data_dir: vec![format!("[MEM:1KB]../testing/block-store-{name}")],
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        };
+        BlockStore::new("test", &conf)
+    }
+
+    #[test]
+    fn async_remove_missing_block_releases_delete_count() -> CommonResult<()> {
+        let store = create_store("missing-block")?;
+        store.read()?.increment_blocks_to_delete();
+
+        assert!(store.async_remove_block(1).is_err());
+        assert_eq!(store.read()?.num_blocks_to_delete(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn async_remove_invalid_dir_releases_delete_count() -> CommonResult<()> {
+        let store = create_store("invalid-dir")?;
+        {
+            let mut state = store.write()?;
+            let mut meta = BlockMeta::new(1, 100, state.dir_iter().next().unwrap());
+            meta.dir_id = u32::MAX;
+            state.put_test_meta(meta);
+            state.increment_blocks_to_delete();
         }
 
-        Ok(vec)
+        assert!(store.async_remove_block(1).is_err());
+        let state = store.read()?;
+        assert!(state.get_block(1).is_none());
+        assert_eq!(state.num_blocks_to_delete(), 0);
+        Ok(())
     }
 }

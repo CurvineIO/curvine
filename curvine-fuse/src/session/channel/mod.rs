@@ -38,10 +38,17 @@ impl<T: FileSystem> FuseChannel<T> {
         let buf_size =
             FuseUtils::get_fuse_buf_size().max(max_readahead as usize + FUSE_BUFFER_HEADER_SIZE);
 
-        let mut receivers = Vec::with_capacity(conf.tasks_per_mnt);
-        let mut senders = Vec::with_capacity(conf.tasks_per_mnt);
+        // Resolve `tasks_per_mnt == 0` ("follow io_threads") here, on read, rather
+        // than normalizing it in FuseConf::init. init() runs twice (once in
+        // ClusterConf::from, once after CLI overrides in mount_args), so mutating the
+        // field on the first pass would freeze it and a later `--io-threads` override
+        // would not be tracked. Resolving on read lets this consumer always see the
+        // current io_threads. See FuseConf::effective_tasks_per_mnt.
+        let tasks_per_mnt = conf.effective_tasks_per_mnt();
+        let mut receivers = Vec::with_capacity(tasks_per_mnt);
+        let mut senders = Vec::with_capacity(tasks_per_mnt);
         let pending_requests = Arc::new(FastDashMap::default());
-        for _ in 0..conf.tasks_per_mnt {
+        for _ in 0..tasks_per_mnt {
             let (tx, rx) = AsyncChannel::new(conf.fuse_channel_size).split();
             let fd = mnt.create_async_task_fd(conf.clone_fd)?;
 

@@ -130,6 +130,107 @@ impl FuseOpCode {
     }
 }
 
+/// The dispatch status of an opcode: an opcode-level record of whether an
+/// opcode is handled, and — for the unhandled ones — whether that is deliberate
+/// (`Unsupported`) or protocol-internal (`Internal`), with the rationale.
+///
+/// The compile-time guarantee that a *parsed* operator actually has a dispatch
+/// arm lives in the exhaustive (no-`_`) matches in `dispatch_meta` and
+/// `send_stream_dispatch`: adding a `FuseOperator` variant with no arm fails to
+/// compile there. This matrix complements that with the opcode-level intent
+/// (why BMAP/POLL/etc. are ENOSYS, which opcodes are protocol-internal); its own
+/// exhaustive match likewise forces a newly-added `FuseOpCode` to be classified.
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum DispatchStatus {
+    /// Has a real `dispatch_meta`/`send_stream_dispatch` arm.
+    Handled,
+    /// Dispatched via `send_none` (no reply to the kernel).
+    NoReply,
+    /// Intentionally falls through the dispatch wildcard to ENOSYS.
+    Unsupported,
+    /// Not dispatched to a `FileSystem` op here (protocol/enum-internal).
+    Internal,
+}
+
+#[cfg(test)]
+impl FuseOpCode {
+    pub(crate) fn expected_dispatch(&self) -> DispatchStatus {
+        use DispatchStatus::*;
+        match self {
+            // No-reply ops (send_none).
+            FuseOpCode::FUSE_FORGET
+            | FuseOpCode::FUSE_BATCH_FORGET
+            | FuseOpCode::FUSE_INTERRUPT => NoReply,
+
+            // Intentionally unsupported (ENOSYS via wildcard):
+            //   - FUSE_BMAP:  logical->physical block map, only for block-backed
+            //     (fuseblk) filesystems; meaningless for a distributed fs.
+            //   - FUSE_POLL:  readiness for special/char files; regular files are
+            //     always ready, so the VFS never needs it here.
+            //   - FUSE_IOCTL: device/fs-specific ioctls; no passthrough (and
+            //     FUSE_HAS_IOCTL_DIR is deliberately not negotiated in init).
+            //   - FUSE_LSEEK: SEEK_HOLE/SEEK_DATA only; ENOSYS is a safe VFS
+            //     fallback (kernel treats the file as hole-less).
+            FuseOpCode::FUSE_BMAP
+            | FuseOpCode::FUSE_POLL
+            | FuseOpCode::FUSE_IOCTL
+            | FuseOpCode::FUSE_LSEEK => Unsupported,
+
+            // Not dispatched as a FileSystem op: NOT_SUPPORTED is the num_enum
+            // default for unknown raw opcodes; CUSE_INIT is a CUSE handshake, not
+            // a filesystem path; NOTIFY_REPLY is a daemon->kernel notify channel.
+            // These have no `parse_operator` arm, so they never reach the
+            // dispatcher during normal operation. If one ever did, it would fall
+            // through the dispatch wildcard like `Unsupported` (NOT_SUPPORTED as
+            // `unknown_opcode`, the others as `unimplemented_opcode`); `Internal`
+            // records that we intentionally do not route them, not that reaching
+            // dispatch is impossible.
+            FuseOpCode::NOT_SUPPORTED | FuseOpCode::CUSE_INIT | FuseOpCode::FUSE_NOTIFY_REPLY => {
+                Internal
+            }
+
+            // Everything else has a real dispatch arm.
+            FuseOpCode::FUSE_LOOKUP
+            | FuseOpCode::FUSE_GETATTR
+            | FuseOpCode::FUSE_SETATTR
+            | FuseOpCode::FUSE_READLINK
+            | FuseOpCode::FUSE_SYMLINK
+            | FuseOpCode::FUSE_MKNOD
+            | FuseOpCode::FUSE_MKDIR
+            | FuseOpCode::FUSE_UNLINK
+            | FuseOpCode::FUSE_RMDIR
+            | FuseOpCode::FUSE_RENAME
+            | FuseOpCode::FUSE_LINK
+            | FuseOpCode::FUSE_OPEN
+            | FuseOpCode::FUSE_READ
+            | FuseOpCode::FUSE_WRITE
+            | FuseOpCode::FUSE_STATFS
+            | FuseOpCode::FUSE_RELEASE
+            | FuseOpCode::FUSE_FSYNC
+            | FuseOpCode::FUSE_SETXATTR
+            | FuseOpCode::FUSE_GETXATTR
+            | FuseOpCode::FUSE_LISTXATTR
+            | FuseOpCode::FUSE_REMOVEXATTR
+            | FuseOpCode::FUSE_FLUSH
+            | FuseOpCode::FUSE_INIT
+            | FuseOpCode::FUSE_OPENDIR
+            | FuseOpCode::FUSE_READDIR
+            | FuseOpCode::FUSE_RELEASEDIR
+            | FuseOpCode::FUSE_FSYNCDIR
+            | FuseOpCode::FUSE_GETLK
+            | FuseOpCode::FUSE_SETLK
+            | FuseOpCode::FUSE_SETLKW
+            | FuseOpCode::FUSE_ACCESS
+            | FuseOpCode::FUSE_CREATE
+            | FuseOpCode::FUSE_DESTROY
+            | FuseOpCode::FUSE_FALLOCATE
+            | FuseOpCode::FUSE_READDIRPLUS
+            | FuseOpCode::FUSE_RENAME2 => Handled,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::FuseOpCode;
@@ -190,6 +291,71 @@ mod tests {
         ];
         for (op, expected) in table {
             assert_eq!(op.as_str(), expected, "label mismatch for {:?}", op);
+        }
+    }
+
+    #[test]
+    fn expected_dispatch_classifies_every_opcode() {
+        use super::DispatchStatus::*;
+        // Full (variant, expected-status) table. `expected_dispatch` is an
+        // exhaustive match, so adding a FuseOpCode variant already fails to
+        // compile until classified there; this table additionally pins the
+        // intended status so a reclassification is a conscious edit.
+        let table = [
+            (FuseOpCode::NOT_SUPPORTED, Internal),
+            (FuseOpCode::FUSE_LOOKUP, Handled),
+            (FuseOpCode::FUSE_FORGET, NoReply),
+            (FuseOpCode::FUSE_GETATTR, Handled),
+            (FuseOpCode::FUSE_SETATTR, Handled),
+            (FuseOpCode::FUSE_READLINK, Handled),
+            (FuseOpCode::FUSE_SYMLINK, Handled),
+            (FuseOpCode::FUSE_MKNOD, Handled),
+            (FuseOpCode::FUSE_MKDIR, Handled),
+            (FuseOpCode::FUSE_UNLINK, Handled),
+            (FuseOpCode::FUSE_RMDIR, Handled),
+            (FuseOpCode::FUSE_RENAME, Handled),
+            (FuseOpCode::FUSE_LINK, Handled),
+            (FuseOpCode::FUSE_OPEN, Handled),
+            (FuseOpCode::FUSE_READ, Handled),
+            (FuseOpCode::FUSE_WRITE, Handled),
+            (FuseOpCode::FUSE_STATFS, Handled),
+            (FuseOpCode::FUSE_RELEASE, Handled),
+            (FuseOpCode::FUSE_FSYNC, Handled),
+            (FuseOpCode::FUSE_SETXATTR, Handled),
+            (FuseOpCode::FUSE_GETXATTR, Handled),
+            (FuseOpCode::FUSE_LISTXATTR, Handled),
+            (FuseOpCode::FUSE_REMOVEXATTR, Handled),
+            (FuseOpCode::FUSE_FLUSH, Handled),
+            (FuseOpCode::FUSE_INIT, Handled),
+            (FuseOpCode::FUSE_OPENDIR, Handled),
+            (FuseOpCode::FUSE_READDIR, Handled),
+            (FuseOpCode::FUSE_RELEASEDIR, Handled),
+            (FuseOpCode::FUSE_FSYNCDIR, Handled),
+            (FuseOpCode::FUSE_GETLK, Handled),
+            (FuseOpCode::FUSE_SETLK, Handled),
+            (FuseOpCode::FUSE_SETLKW, Handled),
+            (FuseOpCode::FUSE_ACCESS, Handled),
+            (FuseOpCode::FUSE_CREATE, Handled),
+            (FuseOpCode::FUSE_INTERRUPT, NoReply),
+            (FuseOpCode::FUSE_BMAP, Unsupported),
+            (FuseOpCode::FUSE_DESTROY, Handled),
+            (FuseOpCode::FUSE_IOCTL, Unsupported),
+            (FuseOpCode::FUSE_POLL, Unsupported),
+            (FuseOpCode::FUSE_NOTIFY_REPLY, Internal),
+            (FuseOpCode::FUSE_BATCH_FORGET, NoReply),
+            (FuseOpCode::FUSE_FALLOCATE, Handled),
+            (FuseOpCode::FUSE_READDIRPLUS, Handled),
+            (FuseOpCode::FUSE_RENAME2, Handled),
+            (FuseOpCode::FUSE_LSEEK, Unsupported),
+            (FuseOpCode::CUSE_INIT, Internal),
+        ];
+        for (op, expected) in table {
+            assert_eq!(
+                op.expected_dispatch(),
+                expected,
+                "dispatch status mismatch for {:?}",
+                op
+            );
         }
     }
 }

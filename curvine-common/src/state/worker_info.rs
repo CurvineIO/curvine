@@ -23,6 +23,8 @@ use std::fmt::{Display, Formatter};
 #[serde(default)]
 pub struct WorkerInfo {
     pub address: WorkerAddress,
+    #[serde(default = "WorkerInfo::default_weight")]
+    pub weight: u32,
     pub capacity: i64,
     pub available: i64,
     pub fs_used: i64,
@@ -35,9 +37,14 @@ pub struct WorkerInfo {
 }
 
 impl WorkerInfo {
-    pub fn new(addr: WorkerAddress) -> Self {
+    pub const fn default_weight() -> u32 {
+        1
+    }
+
+    pub fn new(addr: WorkerAddress, weight: u32) -> Self {
         Self {
             address: addr,
+            weight,
             capacity: 0,
             available: 0,
             fs_used: 0,
@@ -109,6 +116,7 @@ impl Default for WorkerInfo {
 
         Self {
             address,
+            weight: Self::default_weight(),
             capacity: 1 << 30,
             available: 1 << 30,
             fs_used: 0,

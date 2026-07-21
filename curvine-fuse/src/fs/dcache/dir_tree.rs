@@ -184,6 +184,7 @@ impl DirTree {
     ) -> FuseResult<&mut Inode> {
         let ino = match self.get_inode_mut(parent, Some(name)) {
             Some(inode) => {
+                // Path A: same (parent, name) dentry already cached.
                 if inode.is_deleted() {
                     return err_fuse!(
                         libc::ENOENT,
@@ -198,12 +199,20 @@ impl DirTree {
             }
 
             None => {
-                let inode = (status.id > FUSE_ROOT_ID as i64)
-                    .then(|| self.get_inode(status.id as u64, None))
-                    .flatten();
+                // Resolve by server-id without holding a borrow across mutation.
+                let existing_ino = if status.id > FUSE_ROOT_ID as i64 {
+                    self.get_inode(status.id as u64, None).map(|i| i.ino)
+                } else {
+                    None
+                };
 
-                let ino = match inode {
-                    Some(inode) => {
+                match existing_ino {
+                    Some(ino) => {
+                        // Path B: new dentry name maps to an already-cached inode.
+                        // Bump lookup/ref and update cached path; do NOT re-insert
+                        // (that would reset ref_ctr / n_lookup). nlink comes from
+                        // FileStatus via update_status (LOOKUP is not a hard link).
+                        let inode = self.get_inode_mut_check(ino, None)?;
                         if inode.is_deleted() {
                             return err_fuse!(
                                 libc::ENOENT,
@@ -211,15 +220,22 @@ impl DirTree {
                                 inode.ino
                             );
                         }
-                        inode.ino
+                        inode.add_lookup(1);
+                        inode.add_ref(1);
+                        inode.update_status(status);
+                        inode.parent = parent;
+                        inode.name = name.to_owned();
+                        ino
                     }
 
-                    None => self.next_id(status.id),
-                };
-
-                self.inodes
-                    .insert(ino, Inode::with_status(ino, parent, name, status));
-                ino
+                    // Path C: brand-new inode.
+                    None => {
+                        let ino = self.next_id(status.id);
+                        self.inodes
+                            .insert(ino, Inode::with_status(ino, parent, name, status));
+                        ino
+                    }
+                }
             }
         };
 
@@ -231,18 +247,29 @@ impl DirTree {
     }
 
     pub fn unlink(&mut self, parent: u64, name: &str, mark_delete: bool) -> FuseResult<()> {
-        let inode = self.get_inode_mut_check(parent, Some(name))?;
-        if mark_delete {
-            inode.mark_delete = true;
-        }
-        inode.sub_ref(1);
-        inode.sub_link(1);
+        let ino = self.get_ino_check(parent, Some(name))?;
+        let should_remove = {
+            let inode = self.get_inode_mut_check(ino, None)?;
+            if mark_delete {
+                inode.mark_delete = true;
+            }
+            inode.sub_ref(1);
+            inode.sub_link(1);
+            inode.should_unref()
+        };
 
         // Remove directory entry; keep parent inode's `DirEntry` even when `children` is empty.
         let dir = self.get_dir_mut_check(parent)?;
         dir.remove_child(name);
         if mark_delete {
             dir.mark_deleted_child(name);
+        }
+
+        // Mirror rename's destination-unlink: drop inode when both counters hit zero.
+        // When mark_delete=true (deferred delete via fs_unlink), keep the inode so
+        // clear_mark_delete(ino) can still clear parent.deleted_children later.
+        if should_remove && !mark_delete {
+            self.remove_inode(ino);
         }
 
         Ok(())
@@ -663,6 +690,25 @@ mod test {
         assert_eq!(t.get_inode_check(200, None).unwrap().n_lookup, 0);
         t.unlink(FUSE_ROOT_ID, "c", false).unwrap();
         assert!(t.get_inode(200, None).is_none());
+    }
+
+    /// Deferred delete (`mark_delete=true`) must keep the inode even when counters hit
+    /// zero, so `clear_mark_delete` can clear parent `deleted_children`.
+    #[test]
+    fn unlink_mark_delete_keeps_inode_for_clear_mark_delete() {
+        let mut t = DirTree::default();
+        t.lookup(FUSE_ROOT_ID, "d", file_st("d", 300)).unwrap();
+        let n0 = t.get_inode_check(300, None).unwrap().n_lookup;
+        t.forget(300, n0).unwrap();
+        assert_eq!(t.get_inode_check(300, None).unwrap().n_lookup, 0);
+
+        t.unlink(FUSE_ROOT_ID, "d", true).unwrap();
+        assert!(t.get_inode(300, None).is_some());
+        assert!(t.get_dir_check(FUSE_ROOT_ID).unwrap().is_deleted_child("d"));
+
+        t.clear_mark_delete(300).unwrap();
+        assert!(!t.get_dir_check(FUSE_ROOT_ID).unwrap().is_deleted_child("d"));
+        assert!(!t.get_inode_check(300, None).unwrap().mark_delete);
     }
 
     /// Repeated lookup on the same name: n_lookup increases each time; ref_ctr increments only on first dirent.

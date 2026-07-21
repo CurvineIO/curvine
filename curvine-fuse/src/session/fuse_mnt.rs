@@ -36,26 +36,23 @@ pub struct FuseMnt {
 }
 
 impl FuseMnt {
-    pub fn new(path: PathBuf, conf: &FuseConf) -> Self {
-        let res = fuse_mount_pure(path.as_path(), conf);
-        match res {
-            Ok(fd) => Self::from_fd(path, conf, fd),
-
-            Err(e) => {
-                panic!("fuse mount failed, path {:?}, err {:?}", path, e);
-            }
-        }
+    pub fn new(path: PathBuf, conf: &FuseConf) -> IOResult<Self> {
+        let fd = fuse_mount_pure(path.as_path(), conf)?;
+        Self::from_fd(path, conf, fd)
     }
 
-    pub fn from_fd(path: PathBuf, conf: &FuseConf, fd: RawIO) -> Self {
-        sys::set_pipe_blocking(fd, false).unwrap();
-        info!("fuse mount success, path {:?}, fd {}", path, fd);
-        Self {
+    pub fn from_fd(path: PathBuf, _conf: &FuseConf, fd: RawIO) -> IOResult<Self> {
+        // Construct the RAII owner before fallible fd setup. If setup fails,
+        // `mnt` is dropped and the mount is cleaned up instead of becoming stale.
+        let mnt = Self {
             path,
             fd,
             clone_fds: Mutex::new(vec![]),
             auto_unmount: true,
-        }
+        };
+        sys::set_pipe_blocking(mnt.fd, false)?;
+        info!("fuse mount success, path {:?}, fd {}", mnt.path, mnt.fd);
+        Ok(mnt)
     }
 
     fn create_task_fd(&self, clone: bool) -> IOResult<BorrowedFd> {
@@ -108,5 +105,43 @@ impl Drop for FuseMnt {
             fuse_umount_pure(self.path.as_path());
             info!("unmount path={:?}, fd={}", self.path, self.fd);
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::FuseMnt;
+    use curvine_common::conf::FuseConf;
+    use std::path::PathBuf;
+
+    fn missing_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "curvine-missing-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the Unix epoch")
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn mount_failure_returns_error() {
+        let conf = FuseConf::default();
+
+        assert!(
+            FuseMnt::new(missing_path("mount"), &conf).is_err(),
+            "an invalid mount point must return an error instead of panicking"
+        );
+    }
+
+    #[test]
+    fn fd_setup_failure_returns_error() {
+        let conf = FuseConf::default();
+
+        assert!(
+            FuseMnt::from_fd(missing_path("fd"), &conf, -1).is_err(),
+            "an invalid FUSE fd must return an error instead of panicking"
+        );
     }
 }

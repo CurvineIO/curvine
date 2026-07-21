@@ -430,7 +430,7 @@ impl<T: FileSystem> FuseSession<T> {
             let mut mnts = vec![];
             let all_mnt_paths = conf.get_all_mnt_path()?;
             for path in all_mnt_paths {
-                mnts.push(FuseMnt::new(path, conf));
+                mnts.push(FuseMnt::new(path, conf)?);
             }
             Ok(mnts)
         }
@@ -561,7 +561,7 @@ impl<T: FileSystem> FuseSession<T> {
                 sys::fcntl_set(fd, flags | libc::FD_CLOEXEC)?;
 
                 let path_buf = PathBuf::from(path);
-                mnts.push(FuseMnt::from_fd(path_buf, conf, fd));
+                mnts.push(FuseMnt::from_fd(path_buf, conf, fd)?);
             }
             if let Some(stage) = stage {
                 stage.success();
