@@ -1754,6 +1754,29 @@ mod tests {
             }
         }
 
+        // A FileSystem whose `read` REPLIES via the passed-in `reply` and THEN returns
+        // `Err`. This is the "Verified nuance" from #1089: an op that already answered
+        // the kernel but still surfaces an error. It exercises the exact end-to-end path
+        // `send_stream_dispatch` guards — the reply is sent through the original `rep`,
+        // then `if res.is_err() { err_rep.send_rep(res) }` fires on the shared clone — so
+        // driving it through `dispatch_and_collect` proves the fallback CANNOT
+        // double-reply, not just that the slot guard works in isolation.
+        //
+        // `cfg(not(debug_assertions))`: its only user, `err_rep_fallback_after_a_reply_
+        // is_noop`, is release-only (a real double reply trips `commit_reply_task`'s
+        // `debug_assert!` in debug), so gating the mock the same way avoids a
+        // "never constructed" warning in debug builds.
+        #[cfg(not(debug_assertions))]
+        struct ReplyThenErrFs;
+        #[cfg(not(debug_assertions))]
+        impl FileSystem for ReplyThenErrFs {
+            async fn read(&self, _op: Read<'_>, reply: FuseResponse) -> FuseResult<()> {
+                // Answer the kernel first (empty success frame), then report an error.
+                reply.send_rep::<(), crate::FuseError>(Ok(())).await?;
+                err_fuse!(ERRNO, "late error after a successful reply")
+            }
+        }
+
         fn make_request(opcode: u32, unique: u64, payload: &[u8]) -> FuseRequest {
             let header = fuse_in_header {
                 len: (size_of::<fuse_in_header>() + payload.len()) as u32,
@@ -1821,8 +1844,8 @@ mod tests {
         // is still alive. (One is: `observer` below holds a sender for the whole drain,
         // so in practice we hit the `Ok(None)` empty case — but the loop must not depend
         // on that.)
-        fn dispatch_and_collect(
-            fs: Arc<PreDispatchErrFs>,
+        fn dispatch_and_collect<F: FileSystem>(
+            fs: Arc<F>,
             with_metrics_ctx: bool,
             req: FuseRequest,
         ) -> (FuseResult<()>, Vec<FuseTask>, FuseResponse) {
@@ -1850,10 +1873,8 @@ mod tests {
                 // the `err_rep` the dispatch builds internally.
                 let observer = rep.clone();
 
-                let res = super::super::FuseReceiver::<PreDispatchErrFs>::send_stream_dispatch(
-                    &fs, req, rep,
-                )
-                .await;
+                let res =
+                    super::super::FuseReceiver::<F>::send_stream_dispatch(&fs, req, rep).await;
 
                 // Drain whatever the (fully awaited) dispatch buffered. Stop on empty
                 // OR closed — `Ok(Some(_))` only — so the loop can never panic on a
@@ -1961,12 +1982,14 @@ mod tests {
             }
         }
 
-        // The double-reply guard makes the `err_rep` fallback safe: if a stream op
-        // BOTH replies (via the original `rep`) AND then returns Err, the fallback
-        // `err_rep.send_rep(res)` is a no-op — the kernel gets exactly one reply, not
-        // two. This is the "Verified nuance" #1089 relies on, pinned at the
-        // send_stream layer (a shared clone), complementing the generic guard tests in
-        // `fuse_response.rs` (`t13_*`).
+        // The double-reply guard makes the `err_rep` fallback safe END TO END: if a
+        // stream op BOTH replies (via the original `rep`) AND then returns Err, the
+        // fallback `if res.is_err() { err_rep.send_rep(res) }` is a no-op — the kernel
+        // gets exactly one reply, not two. This is the "Verified nuance" #1089 relies
+        // on. Unlike the generic slot-guard tests in `fuse_response.rs` (`t13_*`), this
+        // drives the real `send_stream_dispatch` seam via `dispatch_and_collect` with a
+        // mock that replies-then-errors, so it proves the dispatch fallback itself
+        // cannot double-reply — not just that the shared slot guard works in isolation.
         //
         // Release-only: a genuine double reply trips `commit_reply_task`'s
         // `debug_assert!(!finished)` in debug builds (see `double_reply_panics_in_debug`
@@ -1975,40 +1998,28 @@ mod tests {
         #[test]
         #[cfg(not(debug_assertions))]
         fn err_rep_fallback_after_a_reply_is_noop() {
-            FuseMetrics::ensure_init().unwrap();
-            let rt = AsyncRuntime::single();
-            rt.block_on(async {
-                let (tx, mut rx) = AsyncChannel::new(64).split();
-                let gauge = orpc::common::Metrics::new_gauge(
-                    "sec_dbl_active_9007".to_string(),
-                    "test".to_string(),
-                )
-                .unwrap();
-                let ctx = FuseReqCtx {
-                    labels: FuseReqLabels::new("Read", FuseReqKind::Stream, 64),
-                    active: Some(ActiveGuard::new(gauge)),
-                };
-                let rep = FuseResponse::new_reply(9007, tx, false, Some(ctx));
-                // Mirror `send_stream_dispatch`: an error-path clone sharing one slot.
-                let err_rep = rep.clone();
-
-                // The op "replied" successfully first (the original rep).
-                rep.send_rep::<(), crate::FuseError>(Ok(())).await.unwrap();
-                // ...and then the fallback fires because res.is_err(). It must no-op.
-                err_rep
-                    .send_rep::<(), _>(err_fuse!(ERRNO, "late error after reply"))
-                    .await
-                    .unwrap();
-
-                let mut count = 0;
-                while rx.try_recv().unwrap().is_some() {
-                    count += 1;
-                }
-                assert_eq!(
-                    count, 1,
-                    "reply-then-error enqueues exactly one reply; the err_rep fallback is a no-op"
-                );
-            });
+            let fs = Arc::new(ReplyThenErrFs);
+            let (res, tasks, observer) = dispatch_and_collect(fs, true, read_request(9007));
+            // The op replied successfully, so the dispatch returns Ok even though the
+            // op body returned Err: the fallback's `send_rep` on the already-finished
+            // shared slot is a no-op that returns Ok.
+            assert!(
+                res.is_ok(),
+                "reply-then-error: the op already answered; dispatch returns Ok"
+            );
+            // Exactly ONE task on the wire — the success reply from the op body. The
+            // `err_rep` fallback did NOT enqueue a second (error) reply.
+            assert_eq!(
+                tasks.len(),
+                1,
+                "reply-then-error enqueues exactly one reply; the err_rep fallback is a no-op"
+            );
+            assert!(
+                matches!(tasks[0], FuseTask::RequestReply { .. }),
+                "the single reply is the op's own success reply"
+            );
+            // Shared slot finished exactly once (the fallback did not double-finish).
+            assert_finished_once(&observer);
         }
     }
 }
