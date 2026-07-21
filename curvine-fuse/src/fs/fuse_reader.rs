@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 enum ReadTask {
     Read(i64, usize, FuseResponse),
-    Complete(CallSender<i8>, Option<FuseResponse>),
+    Complete(CallSender<FsResult<()>>, Option<FuseResponse>),
 }
 
 pub struct FuseReader {
@@ -112,7 +112,9 @@ impl FuseReader {
         let fun = async {
             let (rx, tx) = CallChannel::channel();
             self.sender.send(ReadTask::Complete(rx, reply)).await?;
-            tx.receive().await?;
+            // Double `?`: unwrap the channel receive, then propagate the real
+            // backend complete result (issue #1118).
+            tx.receive().await??;
             Ok::<(), FsError>(())
         };
         fun.await.map_err(|e| self.check_error(e))
@@ -168,10 +170,9 @@ impl FuseReader {
                     // flush from fsync from release, and a reader+writer double
                     // observe would double-count. So no io_* observe here.
                     let res = reader.complete().await;
-                    if let Some(reply) = reply {
-                        reply.send_rep(res).await?;
-                    }
-                    tx.send(1)?;
+                    // Deliver the real backend result to the caller (tx) first,
+                    // then the kernel reply (issue #1118).
+                    crate::fs::deliver_stream_result(res, tx, reply).await?;
                 }
             }
         }

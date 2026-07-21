@@ -32,9 +32,9 @@ use std::sync::Arc;
 
 enum WriteTask {
     Write(i64, Bytes, Option<FuseResponse>),
-    Flush(CallSender<i8>, Option<FuseResponse>),
-    Complete(CallSender<i8>, Option<FuseResponse>),
-    Resize(CallSender<i8>, FileAllocOpts),
+    Flush(CallSender<FsResult<()>>, Option<FuseResponse>),
+    Complete(CallSender<FsResult<()>>, Option<FuseResponse>),
+    Resize(CallSender<FsResult<()>>, FileAllocOpts),
 }
 
 /// A `WriteTask` plus the `stream_write_queue_depth` guard that rides with it
@@ -187,7 +187,11 @@ impl FuseWriter {
         let fun = async {
             let (rx, tx) = CallChannel::channel();
             self.send_queued_task(WriteTask::Flush(rx, reply)).await?;
-            tx.receive().await?;
+            // The writer task sends back the backend flush result itself (not a
+            // bare completion signal), so a flush failure on the reply=None path
+            // (dirty-read flush / flush_writer) propagates here instead of being
+            // silently swallowed.
+            tx.receive().await??;
             Ok::<(), FsError>(())
         };
         fun.await.map_err(|e| self.check_error(e))
@@ -198,7 +202,9 @@ impl FuseWriter {
             let (rx, tx) = CallChannel::channel();
             self.send_queued_task(WriteTask::Complete(rx, reply))
                 .await?;
-            tx.receive().await?;
+            // Double `?`: the outer unwraps the channel receive, the inner
+            // propagates the real backend complete result (issue #1118).
+            tx.receive().await??;
             Ok::<(), FsError>(())
         };
         fun.await.map_err(|e| self.check_error(e))
@@ -209,7 +215,9 @@ impl FuseWriter {
         let fun = async {
             let (rx, tx) = CallChannel::channel();
             self.send_queued_task(WriteTask::Resize(rx, opts)).await?;
-            tx.receive().await?;
+            // Double `?`: unwrap the channel receive, then propagate the real
+            // backend resize result (issue #1118).
+            tx.receive().await??;
             Ok::<(), FsError>(())
         };
         // `write_ver.incr()` stays at its existing position (after building `fun`,
@@ -297,23 +305,23 @@ impl FuseWriter {
 
                 WriteTask::Flush(tx, reply) => {
                     let res = writer.flush().await;
-                    if let Some(reply) = reply {
-                        reply.send_rep(res).await?;
-                    }
-                    tx.send(1)?;
+                    // Deliver the real backend result to the caller (tx) first,
+                    // then the kernel reply. See `deliver_stream_result`
+                    // (issue #1118).
+                    crate::fs::deliver_stream_result(res, tx, reply).await?;
                 }
 
                 WriteTask::Complete(tx, reply) => {
                     let res = writer.complete().await;
-                    if let Some(reply) = reply {
-                        reply.send_rep(res).await?;
-                    }
-                    tx.send(1)?;
+                    crate::fs::deliver_stream_result(res, tx, reply).await?;
                 }
 
                 WriteTask::Resize(tx, opts) => {
-                    writer.resize(opts).await?;
-                    tx.send(1)?;
+                    // A resize failure must propagate to the caller via `tx`
+                    // rather than `?`-ing out of the worker (which would kill it
+                    // and leave the caller hanging). No kernel reply on this path.
+                    let res = writer.resize(opts).await;
+                    crate::fs::deliver_stream_result(res, tx, None).await?;
                 }
             }
         }
@@ -326,6 +334,7 @@ impl FuseWriter {
 mod tests {
     use super::{mark_dequeued, QueuedWriteTask, WriteTask};
     use crate::fuse_metrics::ActiveGuard;
+    use curvine_common::FsResult;
     use orpc::common::Metrics as m;
     use orpc::sync::channel::{AsyncChannel, CallChannel};
 
@@ -333,7 +342,7 @@ mod tests {
     // WriteTask is a Flush (it only needs a CallChannel sender, no FuseResponse), so
     // these tests exercise the queue-depth guard lifecycle without a backend.
     fn queued_task(gauge: &orpc::common::Gauge) -> QueuedWriteTask {
-        let (rx, _tx) = CallChannel::channel::<i8>();
+        let (rx, _tx) = CallChannel::channel::<FsResult<()>>();
         QueuedWriteTask {
             task: WriteTask::Flush(rx, None),
             queue_guard: Some(ActiveGuard::new(gauge.clone())),
@@ -394,7 +403,7 @@ mod tests {
         let permit = tx.try_reserve().unwrap().expect("one permit");
         permit.send(QueuedWriteTask {
             task: {
-                let (rx, _tx) = CallChannel::channel::<i8>();
+                let (rx, _tx) = CallChannel::channel::<FsResult<()>>();
                 WriteTask::Flush(rx, None)
             },
             queue_guard: None,
@@ -417,7 +426,7 @@ mod tests {
     // no-op and the task carries nothing.
     #[tokio::test]
     async fn queue_depth_disabled_carries_no_guard() {
-        let (rx, _tx) = CallChannel::channel::<i8>();
+        let (rx, _tx) = CallChannel::channel::<FsResult<()>>();
         let mut queued = QueuedWriteTask {
             task: WriteTask::Flush(rx, None),
             queue_guard: None,
