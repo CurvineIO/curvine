@@ -146,6 +146,24 @@ impl CurvineFileSystem {
         &self.fs
     }
 
+    fn validate_set_xattr_flags(flags: u32, exists: bool) -> FuseResult<()> {
+        let create = libc::XATTR_CREATE as u32;
+        let replace = libc::XATTR_REPLACE as u32;
+        let known = create | replace;
+
+        if flags & !known != 0 || flags & known == known {
+            return err_fuse!(libc::EINVAL, "Invalid setxattr flags: {:#x}", flags);
+        }
+        if flags & create != 0 && exists {
+            return err_fuse!(libc::EEXIST, "Extended attribute already exists");
+        }
+        if flags & replace != 0 && !exists {
+            return err_fuse!(libc::ENODATA, "Extended attribute does not exist");
+        }
+
+        Ok(())
+    }
+
     async fn ensure_writable_path(&self, path: &Path, rpc_code: RpcCode) -> FuseResult<()> {
         if self.conf.readonly {
             return Err(FsError::read_only(path.full_path()).into());
@@ -640,7 +658,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn get_xattr(&self, op: GetXAttr<'_>) -> FuseResult<BytesMut> {
         let name = try_option!(op.name.to_str());
-        FuseUtils::check_xattr(name, true)?;
+        FuseUtils::check_xattr(name, XattrOp::Get)?;
 
         let status = self.state.fs_stat(op.header.nodeid, None).await?;
         let mut buf = FuseBuf::default();
@@ -666,9 +684,15 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn set_xattr(&self, op: SetXAttr<'_>) -> FuseResult<()> {
         let name = try_option!(op.name.to_str());
-        FuseUtils::check_xattr(name, true)?;
+        FuseUtils::check_xattr(name, XattrOp::Set)?;
         let path = self.state.get_path(op.header.nodeid)?;
         self.ensure_writable_path(&path, RpcCode::SetAttr).await?;
+
+        // Serialize the existence check and update within this FUSE process so
+        // concurrent CREATE/REPLACE requests cannot both validate stale state.
+        let _guard = self.state.lock_path(&path).await;
+        let status = self.state.fs_stat(op.header.nodeid, None).await?;
+        Self::validate_set_xattr_flags(op.arg.flags, status.x_attr.contains_key(name))?;
 
         // Get the xattr value from the request
         let value_slice: &[u8] = op.value;
@@ -688,12 +712,14 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn remove_xattr(&self, op: RemoveXAttr<'_>) -> FuseResult<()> {
         let name = try_option!(op.name.to_str());
-        if FuseUtils::check_xattr(name, false).is_err() {
-            return Ok(());
-        }
+        FuseUtils::check_xattr(name, XattrOp::Remove)?;
 
         let path = self.state.get_path(op.header.nodeid)?;
         self.ensure_writable_path(&path, RpcCode::SetAttr).await?;
+
+        // Share the same path lock as set_xattr so a conditional REPLACE does
+        // not validate existence immediately before a concurrent removal.
+        let _guard = self.state.lock_path(&path).await;
 
         debug!("Removing xattr: path='{}' name='{}'", path, name);
 
@@ -714,12 +740,14 @@ impl fs::FileSystem for CurvineFileSystem {
 
         // Add custom xattr names from the file
         for name in status.x_attr.keys() {
+            // Hidden/protected attributes must not be advertised when getxattr
+            // deliberately makes them unreadable.
+            if FuseUtils::check_xattr(name, XattrOp::Get).is_err() {
+                continue;
+            }
             xattr_names.extend_from_slice(name.as_bytes());
             xattr_names.push(0); // null terminator
         }
-
-        // Add the special "id" attribute
-        xattr_names.extend_from_slice(b"id\0");
 
         let mut buf = FuseBuf::default();
 
@@ -1499,6 +1527,42 @@ mod tests {
         FUSE_MAX_PAGES, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_SPLICE_MOVE, FUSE_SPLICE_READ,
         FUSE_SPLICE_WRITE, FUSE_WRITEBACK_CACHE, SUPPORTED_INIT_FLAGS,
     };
+
+    #[test]
+    fn set_xattr_flags_enforce_create_and_replace_semantics() {
+        let create = libc::XATTR_CREATE as u32;
+        let replace = libc::XATTR_REPLACE as u32;
+
+        CurvineFileSystem::validate_set_xattr_flags(0, false).unwrap();
+        CurvineFileSystem::validate_set_xattr_flags(0, true).unwrap();
+        CurvineFileSystem::validate_set_xattr_flags(create, false).unwrap();
+        CurvineFileSystem::validate_set_xattr_flags(replace, true).unwrap();
+
+        assert_eq!(
+            CurvineFileSystem::validate_set_xattr_flags(create, true)
+                .unwrap_err()
+                .errno(),
+            libc::EEXIST
+        );
+        assert_eq!(
+            CurvineFileSystem::validate_set_xattr_flags(replace, false)
+                .unwrap_err()
+                .errno(),
+            libc::ENODATA
+        );
+        assert_eq!(
+            CurvineFileSystem::validate_set_xattr_flags(create | replace, false)
+                .unwrap_err()
+                .errno(),
+            libc::EINVAL
+        );
+        assert_eq!(
+            CurvineFileSystem::validate_set_xattr_flags(1 << 31, false)
+                .unwrap_err()
+                .errno(),
+            libc::EINVAL
+        );
+    }
 
     // #1122 + allowlist: the daemon must never advertise FUSE_ATOMIC_O_TRUNC
     // (open does not truncate) or any other unsupported capability, even when

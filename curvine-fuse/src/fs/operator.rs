@@ -247,10 +247,10 @@ pub struct GetXAttr<'a> {
 
 /// SetXAttr request structure:
 /// ```text
-/// +0                         +40                    +56           +56+len(name)+1
+/// +0                         +40                    +48           +48+len(name)+1
 /// |--------------------------|---------------------|-------------|--------------------------|
 /// |    fuse_in_header        | fuse_setxattr_in    |    name     |    value                 |
-/// |      (40 bytes)          |     (16 bytes)      | (variable)  | (size bytes)             |
+/// |      (40 bytes)          |      (8 bytes)      | (variable)  | (size bytes)             |
 /// |--------------------------|---------------------|-------------|--------------------------|
 /// ```
 

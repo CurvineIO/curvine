@@ -32,6 +32,13 @@ use orpc::sys::{FFIUtils, RawIO};
 use std::process::Command;
 use std::slice;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XattrOp {
+    Get,
+    Set,
+    Remove,
+}
+
 pub struct FuseUtils;
 
 impl FuseUtils {
@@ -248,7 +255,7 @@ impl FuseUtils {
             .build()
     }
 
-    pub fn check_xattr(name: &str, read: bool) -> FuseResult<()> {
+    pub fn check_xattr(name: &str, op: XattrOp) -> FuseResult<()> {
         // Handle system extended attributes FIRST, before any path resolution
         // This avoids unnecessary operations and provides fastest response
         // Kernel may still query these even if FUSE_POSIX_ACL is disabled in init response
@@ -258,13 +265,13 @@ impl FuseUtils {
             "security.capability"
             | "security.selinux"
             | "system.posix_acl_access"
-            | "system.posix_acl_default" => {
-                if read {
-                    err_fuse!(libc::ENODATA, "get_xattr {}", name)
-                } else {
-                    err_fuse!(libc::EOPNOTSUPP, "set_xattr {}", name)
+            | "system.posix_acl_default" => match op {
+                XattrOp::Get => err_fuse!(libc::ENODATA, "get_xattr {}", name),
+                XattrOp::Set => err_fuse!(libc::EOPNOTSUPP, "set_xattr {}", name),
+                XattrOp::Remove => {
+                    err_fuse!(libc::EOPNOTSUPP, "remove_xattr {}", name)
                 }
-            }
+            },
             _ => Ok(()),
         }
     }
@@ -497,6 +504,42 @@ impl FuseUtils {
 mod tests {
     use super::*;
     use crate::raw::fuse_abi::fuse_setattr_in;
+
+    #[test]
+    fn protected_xattr_errors_match_operation() {
+        for name in [
+            "security.capability",
+            "security.selinux",
+            "system.posix_acl_access",
+            "system.posix_acl_default",
+        ] {
+            assert_eq!(
+                FuseUtils::check_xattr(name, XattrOp::Get)
+                    .unwrap_err()
+                    .errno(),
+                libc::ENODATA
+            );
+            assert_eq!(
+                FuseUtils::check_xattr(name, XattrOp::Set)
+                    .unwrap_err()
+                    .errno(),
+                libc::EOPNOTSUPP
+            );
+            assert_eq!(
+                FuseUtils::check_xattr(name, XattrOp::Remove)
+                    .unwrap_err()
+                    .errno(),
+                libc::EOPNOTSUPP
+            );
+        }
+    }
+
+    #[test]
+    fn user_xattr_is_allowed_for_every_operation() {
+        for op in [XattrOp::Get, XattrOp::Set, XattrOp::Remove] {
+            FuseUtils::check_xattr("user.curvine", op).unwrap();
+        }
+    }
 
     #[test]
     fn file_open_flags_are_built_only_from_response_flags() {
