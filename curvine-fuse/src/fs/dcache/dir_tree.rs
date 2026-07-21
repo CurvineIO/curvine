@@ -184,6 +184,7 @@ impl DirTree {
     ) -> FuseResult<&mut Inode> {
         let ino = match self.get_inode_mut(parent, Some(name)) {
             Some(inode) => {
+                // Path A: same (parent, name) dentry already cached.
                 if inode.is_deleted() {
                     return err_fuse!(
                         libc::ENOENT,
@@ -208,8 +209,9 @@ impl DirTree {
                 match existing_ino {
                     Some(ino) => {
                         // Path B: new dentry name maps to an already-cached inode.
-                        // Bump both counters (hard-link-like) and update cached path;
-                        // do NOT re-insert (that would reset ref_ctr / n_lookup).
+                        // Bump lookup/ref and update cached path; do NOT re-insert
+                        // (that would reset ref_ctr / n_lookup). nlink comes from
+                        // FileStatus via update_status (LOOKUP is not a hard link).
                         let inode = self.get_inode_mut_check(ino, None)?;
                         if inode.is_deleted() {
                             return err_fuse!(
@@ -225,6 +227,8 @@ impl DirTree {
                         inode.name = name.to_owned();
                         ino
                     }
+
+                    // Path C: brand-new inode.
                     None => {
                         let ino = self.next_id(status.id);
                         self.inodes
