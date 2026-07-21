@@ -262,7 +262,9 @@ impl DirTree {
         }
 
         // Mirror rename's destination-unlink: drop inode when both counters hit zero.
-        if should_remove {
+        // When mark_delete=true (deferred delete via fs_unlink), keep the inode so
+        // clear_mark_delete(ino) can still clear parent.deleted_children later.
+        if should_remove && !mark_delete {
             self.remove_inode(ino);
         }
 
@@ -684,6 +686,25 @@ mod test {
         assert_eq!(t.get_inode_check(200, None).unwrap().n_lookup, 0);
         t.unlink(FUSE_ROOT_ID, "c", false).unwrap();
         assert!(t.get_inode(200, None).is_none());
+    }
+
+    /// Deferred delete (`mark_delete=true`) must keep the inode even when counters hit
+    /// zero, so `clear_mark_delete` can clear parent `deleted_children`.
+    #[test]
+    fn unlink_mark_delete_keeps_inode_for_clear_mark_delete() {
+        let mut t = DirTree::default();
+        t.lookup(FUSE_ROOT_ID, "d", file_st("d", 300)).unwrap();
+        let n0 = t.get_inode_check(300, None).unwrap().n_lookup;
+        t.forget(300, n0).unwrap();
+        assert_eq!(t.get_inode_check(300, None).unwrap().n_lookup, 0);
+
+        t.unlink(FUSE_ROOT_ID, "d", true).unwrap();
+        assert!(t.get_inode(300, None).is_some());
+        assert!(t.get_dir_check(FUSE_ROOT_ID).unwrap().is_deleted_child("d"));
+
+        t.clear_mark_delete(300).unwrap();
+        assert!(!t.get_dir_check(FUSE_ROOT_ID).unwrap().is_deleted_child("d"));
+        assert!(!t.get_inode_check(300, None).unwrap().mark_delete);
     }
 
     /// Repeated lookup on the same name: n_lookup increases each time; ref_ctr increments only on first dirent.
