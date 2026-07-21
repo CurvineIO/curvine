@@ -331,7 +331,7 @@ impl<T: FileSystem> FuseReceiver<T> {
 
         // NOTE: keep this match's stream arms in sync with `FuseRequest::is_stream()`
         // (Read/Write/Flush/Release/Fsync). `send_stream` is only entered when
-        // `is_stream()` is true, so the wildcard is unreachable today; it exists
+        // `is_stream()` is true, so the fallback is unreachable today; it exists
         // as a defensive branch in case the two ever drift.
         let res = match operator {
             FuseOperator::Read(op) => fs.read(op, rep).await,
@@ -344,11 +344,48 @@ impl<T: FileSystem> FuseReceiver<T> {
 
             FuseOperator::FSync(op) => fs.fsync(op, rep).await,
 
-            _ => {
-                // Defensive: a stream-gated request whose operator is not a known
-                // stream op. Tag it `unimplemented_opcode` so it classifies as
-                // Unsupported — the same semantics as the metadata `dispatch_meta`
-                // wildcard — rather than a plain backend Error.
+            // Exhaustive fallback — NOT a `_` wildcard: naming every non-stream
+            // variant keeps the match exhaustive, so a newly-added `FuseOperator`
+            // variant that is not wired here (or in `dispatch_meta`) fails to
+            // compile. Reaching any of these is a routing bug (`send_stream` is
+            // only entered when `is_stream()`), so tag `unimplemented_opcode` —
+            // same Unsupported classification as the `dispatch_meta` fallback —
+            // rather than a plain backend Error.
+            FuseOperator::Notimplemented
+            | FuseOperator::Init(_)
+            | FuseOperator::StatFs(_)
+            | FuseOperator::ReadDir(_)
+            | FuseOperator::Lookup(_)
+            | FuseOperator::GetAttr(_)
+            | FuseOperator::SetAttr(_)
+            | FuseOperator::GetXAttr(_)
+            | FuseOperator::SetXAttr(_)
+            | FuseOperator::RemoveXAttr(_)
+            | FuseOperator::OpenDir(_)
+            | FuseOperator::Mkdir(_)
+            | FuseOperator::FAllocate(_)
+            | FuseOperator::ReleaseDir(_)
+            | FuseOperator::Access(_)
+            | FuseOperator::ReadDirPlus(_)
+            | FuseOperator::Forget(_)
+            | FuseOperator::Open(_)
+            | FuseOperator::MkNod(_)
+            | FuseOperator::Create(_)
+            | FuseOperator::Unlink(_)
+            | FuseOperator::RmDir(_)
+            | FuseOperator::Link(_)
+            | FuseOperator::BatchForget(_)
+            | FuseOperator::Rename(_)
+            | FuseOperator::Rename2(_)
+            | FuseOperator::Interrupt(_)
+            | FuseOperator::ListXAttr(_)
+            | FuseOperator::FSyncDir(_)
+            | FuseOperator::Destroy(_)
+            | FuseOperator::Symlink(_)
+            | FuseOperator::Readlink(_)
+            | FuseOperator::GetLk(_)
+            | FuseOperator::SetLk(_)
+            | FuseOperator::SetLkW(_) => {
                 let err: FuseResult<fuse_out_header> = err_fuse!(
                     libc::ENOSYS,
                     "unsupported stream operation {:?}",
@@ -661,6 +698,12 @@ impl<T: FileSystem> FuseReceiver<T> {
 
             FuseOperator::Rename(op) => reply.send_rep(fs.rename(op).await).await,
 
+            FuseOperator::Rename2(op) => reply.send_rep(fs.rename2(op).await).await,
+
+            FuseOperator::FSyncDir(op) => reply.send_rep(fs.fsync_dir(op).await).await,
+
+            FuseOperator::Destroy(op) => reply.send_rep(fs.destroy(op).await).await,
+
             FuseOperator::Interrupt(op) => {
                 let res = if let Some(notify) = pending_requests.get(&op.arg.unique) {
                     notify.notify_one();
@@ -681,15 +724,31 @@ impl<T: FileSystem> FuseReceiver<T> {
 
             FuseOperator::SetLkW(op) => reply.send_rep(fs.set_lkw(op).await).await,
 
-            _ => {
-                // A parsed-but-unhandled opcode: source-tagged as Unsupported so
-                // it classifies that way (not a backend Error). The reason splits
-                // two cases the kernel can produce:
-                //   - opcode == NOT_SUPPORTED (the num_enum default, raw opcode
-                //     this build has no enum value for) -> `unknown_opcode`
-                //     (a kernel/daemon protocol-compatibility signal).
-                //   - a known opcode with no dispatch arm (e.g. Rename2) ->
-                //     `unimplemented_opcode` (an implementation-gap signal).
+            // Exhaustive fallback — NOT a `_` wildcard, deliberately: listing the
+            // remaining variants makes the match exhaustive, so adding a new
+            // `FuseOperator` variant without a dispatch arm here (or in
+            // `send_stream_dispatch`) fails to compile. This is the compile-time
+            // guarantee `expected_dispatch` cannot give (it is `#[cfg(test)]` and
+            // opcode-level, not arm-level), and is what would have caught the
+            // RENAME2 half-wiring. The arms handled here:
+            //   - `Notimplemented`: parse mapped an unknown/unsupported opcode to
+            //     the catch-all variant.
+            //   - the five stream ops (Read/Write/Flush/Release/FSync): these are
+            //     dispatched by `send_stream_dispatch`, never through this
+            //     metadata path, so reaching them here is a routing bug — but they
+            //     must still be named to keep the match exhaustive.
+            // Source-tag as Unsupported (not a backend Error). Split the reason:
+            //   - opcode == NOT_SUPPORTED (num_enum default for a raw opcode this
+            //     build has no enum value for) -> `unknown_opcode`.
+            //   - a known but intentionally-unsupported opcode (BMAP/POLL/IOCTL/
+            //     LSEEK) -> `unimplemented_opcode`. The authoritative
+            //     intentional-vs-gap record is `FuseOpCode::expected_dispatch`.
+            FuseOperator::Notimplemented
+            | FuseOperator::Read(_)
+            | FuseOperator::Write(_)
+            | FuseOperator::Flush(_)
+            | FuseOperator::Release(_)
+            | FuseOperator::FSync(_) => {
                 let reason = if req.opcode() == FuseOpCode::NOT_SUPPORTED {
                     "unknown_opcode"
                 } else {
@@ -835,7 +894,9 @@ mod tests {
         use crate::fuse_metrics::{
             FuseMetrics, FuseReqCtx, FuseReqKind, FuseReqLabels, FuseReqStatus,
         };
-        use crate::raw::fuse_abi::{fuse_forget_in, fuse_in_header, fuse_interrupt_in};
+        use crate::raw::fuse_abi::{
+            fuse_forget_in, fuse_fsync_in, fuse_in_header, fuse_interrupt_in, fuse_rename2_in,
+        };
         use crate::session::{FuseRequest, FuseResponse, FuseTask};
         use crate::FuseUtils;
         use bytes::{BufMut, BytesMut};
@@ -1411,6 +1472,91 @@ mod tests {
                 pending2.get(&2002).is_none(),
                 "malformed SETLKW dispatch branch removed its pending_requests entry"
             );
+        }
+
+        // --- Issue #1088: opcode coverage — arm-wired vs intentional wildcard ---
+
+        const OP_RENAME2: u32 = 45;
+        const OP_FSYNCDIR: u32 = 30;
+        const OP_DESTROY: u32 = 38;
+        const OP_BMAP: u32 = 37;
+
+        // Drive dispatch_meta and return the enqueued RequestReply's
+        // (unsupported_reason, errno). Panics if no RequestReply was enqueued.
+        async fn dispatch_reason_errno(
+            req: &FuseRequest,
+            opcode: &'static str,
+        ) -> (Option<&'static str>, i32) {
+            let pending = FastDashMap::default();
+            let (reply, mut rx) = metrics_reply(req.get_header().unwrap().unique, opcode);
+            let _ = super::super::FuseReceiver::dispatch_meta(&pending, &fs(), req, &reply).await;
+            match rx.try_recv().unwrap().expect("a RequestReply task") {
+                FuseTask::RequestReply {
+                    unsupported_reason,
+                    errno,
+                    ..
+                } => (unsupported_reason, errno),
+                _ => panic!("expected a RequestReply task"),
+            }
+        }
+
+        // RENAME2 with flags==0 reaches the real arm (not the wildcard). The
+        // TestFileSystem inherits the trait-default rename2 (ENOSYS), so errno is
+        // ENOSYS here, but the key assertion is unsupported_reason == None (arm
+        // wired, not half-wired via the wildcard).
+        #[tokio::test]
+        async fn rename2_flagless_reaches_dispatch_arm() {
+            let arg = fuse_rename2_in {
+                newdir: 2,
+                flags: 0,
+                padding: 0,
+            };
+            let mut payload = Vec::from(FuseUtils::struct_as_bytes(&arg));
+            payload.extend_from_slice(b"old\0new\0");
+            let req = make_request(OP_RENAME2, 3001, 1, &payload);
+            let (reason, _errno) = dispatch_reason_errno(&req, "Rename2").await;
+            assert_eq!(
+                reason, None,
+                "RENAME2 must reach its dispatch arm, not the wildcard"
+            );
+        }
+
+        // FSYNCDIR is wired to the no-op fsync_dir default -> empty success reply,
+        // untagged.
+        #[tokio::test]
+        async fn fsyncdir_reaches_dispatch_arm_and_succeeds() {
+            let req = make_request(
+                OP_FSYNCDIR,
+                3002,
+                1,
+                FuseUtils::struct_as_bytes(&fuse_fsync_in::default()),
+            );
+            let (reason, errno) = dispatch_reason_errno(&req, "FsyncDir").await;
+            assert_eq!(reason, None, "FSYNCDIR must reach its dispatch arm");
+            assert_eq!(errno, 0, "fsync_dir default is a no-op success");
+        }
+
+        // DESTROY is reply-expecting (send_rep, NOT send_none): it MUST enqueue a
+        // RequestReply, and the no-op default yields an empty success reply.
+        #[tokio::test]
+        async fn destroy_reaches_dispatch_arm_and_succeeds() {
+            let req = make_request(OP_DESTROY, 3003, 0, &[]);
+            let (reason, errno) = dispatch_reason_errno(&req, "Destroy").await;
+            assert_eq!(reason, None, "DESTROY must reach its dispatch arm");
+            assert_eq!(errno, 0, "destroy default acks with an empty success reply");
+        }
+
+        // BMAP has no arm on purpose -> wildcard, tagged unimplemented_opcode.
+        #[tokio::test]
+        async fn bmap_falls_through_wildcard_as_unimplemented() {
+            let req = make_request(OP_BMAP, 3004, 1, &[]);
+            let (reason, errno) = dispatch_reason_errno(&req, "BMap").await;
+            assert_eq!(
+                reason,
+                Some("unimplemented_opcode"),
+                "BMAP is intentionally unsupported -> wildcard"
+            );
+            assert_eq!(errno, libc::ENOSYS);
         }
     }
 
