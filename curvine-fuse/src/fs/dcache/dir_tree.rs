@@ -231,18 +231,31 @@ impl DirTree {
     }
 
     pub fn unlink(&mut self, parent: u64, name: &str, mark_delete: bool) -> FuseResult<()> {
-        let inode = self.get_inode_mut_check(parent, Some(name))?;
-        if mark_delete {
-            inode.mark_delete = true;
-        }
-        inode.sub_ref(1);
-        inode.sub_link(1);
+        let (ino, should_remove) = {
+            let inode = self.get_inode_mut_check(parent, Some(name))?;
+            if mark_delete {
+                inode.mark_delete = true;
+            }
+            inode.sub_ref(1);
+            inode.sub_link(1);
+            // Never reclaim while mark_delete is set: the inode must outlive the
+            // deferred-delete flow (pending_delete / clear_mark_delete look it up
+            // by ino after the server-side delete completes).
+            (inode.ino, !mark_delete && inode.should_unref())
+        };
 
         // Remove directory entry; keep parent inode's `DirEntry` even when `children` is empty.
         let dir = self.get_dir_mut_check(parent)?;
         dir.remove_child(name);
         if mark_delete {
             dir.mark_deleted_child(name);
+        }
+
+        // #1162: when this unlink drops the last reference (kernel already
+        // forgot the inode), reclaim it here just like `forget` does; otherwise
+        // the inode leaks in the dcache.
+        if should_remove {
+            self.remove_inode(ino);
         }
 
         Ok(())
