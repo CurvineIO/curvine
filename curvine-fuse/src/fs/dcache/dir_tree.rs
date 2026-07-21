@@ -198,11 +198,16 @@ impl DirTree {
             }
 
             None => {
-                let inode = (status.id > FUSE_ROOT_ID as i64)
-                    .then(|| self.get_inode(status.id as u64, None))
+                let existing = (status.id > FUSE_ROOT_ID as i64)
+                    .then(|| self.get_inode_mut(status.id as u64, None))
                     .flatten();
 
-                let ino = match inode {
+                match existing {
+                    // #1162: a new dentry name whose server-id resolves to an
+                    // already-existing inode (rename target / hard-link-like).
+                    // Reuse the inode in place: bump ref counters and re-point
+                    // parent/name. Must NOT re-insert, or the fresh `Inode`
+                    // would reset ref_ctr/n_lookup and leak the old entry.
                     Some(inode) => {
                         if inode.is_deleted() {
                             return err_fuse!(
@@ -211,15 +216,22 @@ impl DirTree {
                                 inode.ino
                             );
                         }
+                        inode.add_lookup(1);
+                        inode.add_ref(1);
+                        inode.parent = parent;
+                        inode.name = name.to_owned();
+                        inode.update_status(status);
                         inode.ino
                     }
 
-                    None => self.next_id(status.id),
-                };
-
-                self.inodes
-                    .insert(ino, Inode::with_status(ino, parent, name, status));
-                ino
+                    // A brand-new inode: allocate an id and insert.
+                    None => {
+                        let ino = self.next_id(status.id);
+                        self.inodes
+                            .insert(ino, Inode::with_status(ino, parent, name, status));
+                        ino
+                    }
+                }
             }
         };
 
