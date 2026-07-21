@@ -128,17 +128,11 @@ impl SpdkMetaStore {
 
 impl BlockMetaStore for SpdkMetaStore {
     fn put_block_meta(&self, meta: &BlockMeta) -> CommonResult<()> {
-        let alloc_size = meta
-            .dir
-            .offset_alloc
-            .get_entry(meta.id())
-            .map_or(meta.actual_len, |(_, size)| size);
-
         self.put(
             meta.id(),
             meta.dir_id(),
             meta.bdev_offset,
-            alloc_size,
+            meta.actual_len,
             meta.len(),
             meta.is_final(),
         )

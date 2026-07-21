@@ -291,6 +291,12 @@ topology:
         - -c
         - /app/curvine/mountUfs.sh
         timeout: 120
+      ReportSummary:
+        command:
+        - bash
+        - -c
+        - /app/curvine/reportSummary.sh
+        timeout: 30
     template:
       spec:
         restartPolicy: Always

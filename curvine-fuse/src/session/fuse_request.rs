@@ -309,6 +309,16 @@ impl FuseRequest {
                 arg: decoder.get_struct()?,
             }),
 
+            FUSE_FSYNCDIR => FuseOperator::FSyncDir(FSyncDir {
+                header,
+                arg: decoder.get_struct()?,
+            }),
+
+            FUSE_DESTROY => FuseOperator::Destroy(Destroy { header }),
+
+            // Opcodes with no arm fall through to `Notimplemented` -> ENOSYS.
+            // Whether that is intentional (BMAP/POLL/IOCTL/LSEEK etc.) or a gap
+            // is recorded authoritatively by `FuseOpCode::expected_dispatch`.
             _ => FuseOperator::Notimplemented,
         };
 
@@ -325,5 +335,51 @@ impl Display for FuseRequest {
             self.opcode,
             self.buf.len() - FUSE_IN_HEADER_LEN
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raw::fuse_abi::fuse_setxattr_in;
+    use crate::FuseUtils;
+    use bytes::BytesMut;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn setxattr_uses_compat_header_and_preserves_name_and_value() {
+        assert_eq!(size_of::<fuse_setxattr_in>(), 8);
+
+        let name = b"user.curvine.full-name\0";
+        let value = b"xattr-value";
+        let arg = fuse_setxattr_in {
+            size: value.len() as u32,
+            flags: libc::XATTR_CREATE as u32,
+        };
+        let request_len =
+            size_of::<fuse_in_header>() + size_of::<fuse_setxattr_in>() + name.len() + value.len();
+        let header = fuse_in_header {
+            len: request_len as u32,
+            opcode: FUSE_SETXATTR as u32,
+            unique: 42,
+            nodeid: 7,
+            ..Default::default()
+        };
+
+        let mut bytes = BytesMut::with_capacity(request_len);
+        bytes.extend_from_slice(FuseUtils::struct_as_bytes(&header));
+        bytes.extend_from_slice(FuseUtils::struct_as_bytes(&arg));
+        bytes.extend_from_slice(name);
+        bytes.extend_from_slice(value);
+
+        let request = FuseRequest::from_bytes(bytes.freeze()).unwrap();
+        match request.parse_operator().unwrap() {
+            FuseOperator::SetXAttr(op) => {
+                assert_eq!(op.name, OsStr::new("user.curvine.full-name"));
+                assert_eq!(op.value, value);
+                assert_eq!(op.arg.flags, libc::XATTR_CREATE as u32);
+            }
+            other => panic!("expected SetXAttr, got {other:?}"),
+        }
     }
 }

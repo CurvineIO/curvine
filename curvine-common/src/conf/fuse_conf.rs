@@ -89,6 +89,10 @@ pub struct FuseConf {
     // `mnt_per_task` alias kept for backward compatibility with pre-rename TOML
     // configs (issue #1023 §2); without it `#[serde(default)]` would silently
     // drop the old key and fall back to the default.
+    //
+    // Raw user input; `0` means "follow io_threads". Consumers must NOT read
+    // this directly — use `FuseConf::effective_tasks_per_mnt()` so the `0`
+    // fallback is applied against the (possibly CLI-overridden) io_threads.
     #[serde(alias = "mnt_per_task")]
     pub tasks_per_mnt: usize,
 
@@ -107,11 +111,10 @@ pub struct FuseConf {
     // Mount the whole FUSE filesystem read-only at the kernel level.
     pub readonly: bool,
 
-    // Octal umask applied ONLY when synthesizing default permission bits for a
-    // status that carries no mode (mode == 0) in `status_to_attr`. It does NOT
-    // mask the reported mode of files that already have one (getattr reports the
-    // stored mode as-is), nor the create path (which applies the per-request
-    // umask from the FUSE request). Default value 022.
+    // Octal umask applied when synthesizing permission bits for `.`/`..` entries.
+    // It does NOT mask persisted file modes (getattr reports the stored mode as-is),
+    // nor the create path (which applies the per-request umask from the FUSE
+    // request). Default value 022.
     pub umask: u32,
 
     pub uid: u32,
@@ -246,6 +249,39 @@ impl FuseConf {
         if self.io_threads == 0 {
             return err_box!("fuse.io_threads must be > 0");
         }
+        if self.mnt_number == 0 {
+            return err_box!("fuse.mnt_number must be > 0");
+        }
+        if self.list_limit == 0 {
+            return err_box!("fuse.list_limit must be > 0");
+        }
+        // path_lock_stripes is used as the modulus in NodeState::lock_path
+        // (hash % path_locks.len()); 0 stripes => empty vec => divide-by-zero
+        // panic on create/release.
+        if self.path_lock_stripes == 0 {
+            return err_box!("fuse.path_lock_stripes must be > 0");
+        }
+        // Upper-bound sanity check on the umask (input hygiene, e.g. an octal
+        // value mistakenly written as decimal); the low bits are the meaningful
+        // permission mask.
+        if self.umask > 0o7777 {
+            return err_box!("fuse.umask must be <= 0o7777 (octal file-permission bits)");
+        }
+        // max_background / congestion_threshold are returned verbatim in the
+        // FUSE init reply; a zero window or an inverted threshold is nonsensical
+        // to the kernel. Check max_background first: the congestion message
+        // references it.
+        if self.max_background == 0 {
+            return err_box!("fuse.max_background must be > 0");
+        }
+        if self.congestion_threshold == 0 || self.congestion_threshold > self.max_background {
+            return err_box!(
+                "fuse.congestion_threshold must be > 0 and <= fuse.max_background \
+                 (congestion_threshold = {}, max_background = {})",
+                self.congestion_threshold,
+                self.max_background
+            );
+        }
 
         self.attr_ttl = Duration::from_millis(self.attr_timeout_ms);
         self.entry_ttl = Duration::from_millis(self.entry_timeout_ms);
@@ -253,9 +289,12 @@ impl FuseConf {
         self.node_cache_ttl = DurationUnit::from_str(&self.node_cache_timeout)?.as_duration();
         self.meta_cache_ttl = DurationUnit::from_str(&self.meta_cache_timeout)?.as_duration();
 
-        if self.tasks_per_mnt == 0 {
-            self.tasks_per_mnt = self.io_threads;
-        }
+        // NOTE: `tasks_per_mnt == 0` means "follow io_threads". This is resolved
+        // at the consumption point (FuseChannel::new via `effective_tasks_per_mnt`),
+        // NOT normalized in place here: init() runs twice (once in
+        // ClusterConf::from, once after CLI overrides), and mutating the field on
+        // the first pass would freeze it so a later `--io-threads` override is not
+        // tracked. Keeping the raw value lets the consumer re-resolve every time.
 
         let fs_path = Path::from_str(&self.fs_path)?;
         self.fs_path = fs_path.path().to_owned();
@@ -278,6 +317,18 @@ impl FuseConf {
         }
 
         Ok(())
+    }
+
+    /// Effective per-mount IO task count: `tasks_per_mnt`, or `io_threads` when
+    /// `tasks_per_mnt == 0` ("follow io_threads"). Resolved on read rather than
+    /// stored, so a CLI `--io-threads` override applied after the config is
+    /// loaded is always tracked.
+    pub fn effective_tasks_per_mnt(&self) -> usize {
+        if self.tasks_per_mnt == 0 {
+            self.io_threads
+        } else {
+            self.tasks_per_mnt
+        }
     }
 
     /// Validates that `state_dir` is — or can be made — a writable directory.
@@ -618,6 +669,168 @@ mod tests {
         };
         conf.init()
             .expect("write_back_cache alone must be accepted");
+    }
+
+    #[test]
+    fn init_rejects_zero_path_lock_stripes() {
+        let mut conf = FuseConf {
+            path_lock_stripes: 0,
+            ..Default::default()
+        };
+        let err = conf
+            .init()
+            .expect_err("zero path_lock_stripes must be rejected");
+        assert!(
+            err.to_string().contains("path_lock_stripes"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn init_rejects_zero_list_limit() {
+        let mut conf = FuseConf {
+            list_limit: 0,
+            ..Default::default()
+        };
+        let err = conf.init().expect_err("zero list_limit must be rejected");
+        assert!(
+            err.to_string().contains("list_limit"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn init_rejects_zero_mnt_number() {
+        let mut conf = FuseConf {
+            mnt_number: 0,
+            ..Default::default()
+        };
+        let err = conf.init().expect_err("zero mnt_number must be rejected");
+        assert!(
+            err.to_string().contains("mnt_number"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn init_rejects_zero_max_background() {
+        let mut conf = FuseConf {
+            max_background: 0,
+            ..Default::default()
+        };
+        let err = conf
+            .init()
+            .expect_err("zero max_background must be rejected");
+        assert!(
+            err.to_string().contains("max_background"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn init_rejects_zero_congestion_threshold() {
+        let mut conf = FuseConf {
+            congestion_threshold: 0,
+            ..Default::default()
+        };
+        let err = conf
+            .init()
+            .expect_err("zero congestion_threshold must be rejected");
+        assert!(
+            err.to_string().contains("congestion_threshold"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn init_rejects_congestion_threshold_above_max_background() {
+        let mut conf = FuseConf {
+            max_background: 100,
+            congestion_threshold: 200,
+            ..Default::default()
+        };
+        let err = conf
+            .init()
+            .expect_err("congestion_threshold > max_background must be rejected");
+        assert!(
+            err.to_string().contains("congestion_threshold"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn init_accepts_congestion_threshold_equal_max_background() {
+        let mut conf = FuseConf {
+            max_background: 200,
+            congestion_threshold: 200,
+            ..Default::default()
+        };
+        conf.init()
+            .expect("congestion_threshold == max_background must be accepted");
+    }
+
+    #[test]
+    fn init_rejects_umask_out_of_range() {
+        let mut conf = FuseConf {
+            umask: 0o10000,
+            ..Default::default()
+        };
+        let err = conf.init().expect_err("umask > 0o7777 must be rejected");
+        assert!(
+            err.to_string().contains("umask"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn init_accepts_max_umask() {
+        let mut conf = FuseConf {
+            umask: 0o7777,
+            ..Default::default()
+        };
+        conf.init().expect("umask == 0o7777 must be accepted");
+    }
+
+    #[test]
+    fn effective_tasks_per_mnt_follows_io_threads_when_zero() {
+        // tasks_per_mnt == 0 means "follow io_threads"; resolution reads the
+        // current io_threads (so a CLI --io-threads override after init is tracked).
+        let mut conf = FuseConf {
+            tasks_per_mnt: 0,
+            io_threads: 64,
+            ..Default::default()
+        };
+        conf.init().expect("valid conf");
+        assert_eq!(conf.effective_tasks_per_mnt(), 64);
+
+        // Simulate a later CLI override of io_threads; re-init is idempotent and
+        // the raw tasks_per_mnt is untouched, so resolution tracks the new value.
+        conf.io_threads = 32;
+        conf.init().expect("valid conf");
+        assert_eq!(conf.effective_tasks_per_mnt(), 32);
+    }
+
+    #[test]
+    fn effective_tasks_per_mnt_preserves_explicit_value() {
+        let mut conf = FuseConf {
+            tasks_per_mnt: 5,
+            io_threads: 64,
+            ..Default::default()
+        };
+        conf.init().expect("valid conf");
+        // Explicit non-zero value is kept regardless of io_threads.
+        assert_eq!(conf.effective_tasks_per_mnt(), 5);
+        assert_eq!(
+            conf.tasks_per_mnt, 5,
+            "raw tasks_per_mnt must not be mutated"
+        );
     }
 
     #[test]

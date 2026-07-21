@@ -3,6 +3,19 @@ format_master = false
 format_worker = false
 cluster_id = "curvine"
 
+# Network interface (e.g. "eth0") used to auto-resolve this node's local IPv4.
+# When set (non-empty), on startup the resolved IPv4 is applied to the
+# master/journal/worker/client hostnames, and the CURVINE_*_HOSTNAME env vars
+# are ignored. When empty (the default), hostnames come from the config below
+# and may be overridden by the CURVINE_*_HOSTNAME env vars.
+#
+# Multi-node note: this only fills THIS node's own hostname. The cluster
+# membership lists (journal.journal_addrs and client.master_addrs) must still
+# be written out explicitly, and each node's entry must use the exact IPv4 that
+# its interface resolves to -- otherwise the node cannot locate itself in the
+# raft group and startup fails with a clear error.
+# net_interface = "eth0"
+
 [master]
 rpc_port = 8995
 web_port = 9000

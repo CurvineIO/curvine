@@ -157,6 +157,29 @@ pub trait FileSystem: Send + Sync + 'static {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
+    /// `renameat2(2)` with flags. Default ENOSYS (like `rename`); an
+    /// implementation may delegate the flag-less case to `rename` and reject
+    /// unsupported flags.
+    fn rename2(&self, op: Rename2<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
+    }
+
+    /// `fsync(2)`/`fdatasync(2)` on a directory fd. Default is a benign no-op:
+    /// directory metadata is synchronized to the master via RPC on each
+    /// mutation, so there is no client-side directory write buffer to flush.
+    fn fsync_dir(&self, _op: FSyncDir<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { Ok(()) }
+    }
+
+    /// The kernel's teardown signal, sent synchronously on a clean umount and
+    /// awaiting an (empty) reply. Curvine performs its real unmount cleanup
+    /// out-of-band via `FuseSession` (which calls `unmount()`), so `destroy`
+    /// only acknowledges with an empty reply and deliberately does NOT call
+    /// `unmount()` here, to avoid a double unmount.
+    fn destroy(&self, _op: Destroy<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { Ok(()) }
+    }
+
     /// Best-effort fallback for an interrupt whose target is no longer present in
     /// the dispatcher's pending-request map. The pending-request notification is
     /// the primary cancellation path; this result reports internal handling only,

@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::storage::{
-    DirState, StorageVersion, ACTIVE_DIR, DEFAULT_BLOCK_ALIGN, STAGING_DIR,
-};
+use crate::worker::storage::{DirState, StorageVersion, DEFAULT_BLOCK_ALIGN};
 use curvine_common::conf::WorkerDataDir;
 use curvine_common::state::StorageType;
 use log::*;
@@ -30,11 +28,14 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+/// A physical worker storage directory.
+///
+/// This type owns medium identity, capacity accounting, health, and the
+/// medium-specific device handle. It deliberately has no knowledge of how a
+/// block layout names or arranges data inside the directory.
 pub struct VfsDir {
     pub(crate) version: StorageVersion,
     pub(crate) stats: FsStats,
-    pub(crate) active_dir: PathBuf,
-    pub(crate) staging_dir: PathBuf,
     pub(crate) storage_type: StorageType,
     pub(crate) conf_capacity: i64,
     pub(crate) reserved_bytes: i64,
@@ -57,13 +58,9 @@ impl VfsDir {
         };
         let stats = FsStats::new(&stg_dir);
 
-        let active_dir = stats.path().join(ACTIVE_DIR);
-        let staging_dir = stats.path().join(STAGING_DIR);
-
         // SPDK: skip filesystem (no local dir, version file, or filesystem checks).
         if conf.storage_type != StorageType::SpdkDisk {
-            FileUtils::create_dir(&active_dir, true)?;
-            FileUtils::create_dir(&staging_dir, true)?;
+            FileUtils::create_dir(stats.path(), true)?;
             stats.check_dir()?;
             // Save version
             let ver_file = PathBuf::from_str(&stg_dir)?.join("version");
@@ -122,9 +119,6 @@ impl VfsDir {
         };
 
         let state = DirState {
-            dir_id: version.dir_id,
-            base_path: stats.path().to_path_buf(),
-            storage_type: conf.storage_type,
             bdev_name: bdev_name_str,
             bdev_capacity,
             offset_alloc: super::DirState::new_offset_alloc(
@@ -136,8 +130,6 @@ impl VfsDir {
         let dir = Self {
             version,
             stats,
-            active_dir,
-            staging_dir,
             storage_type: conf.storage_type,
             conf_capacity: conf.capacity as i64,
             reserved_bytes: reserved_bytes as i64,
@@ -246,7 +238,7 @@ impl VfsDir {
     }
 
     // Allocate reserved space for writing blocks.
-    pub fn reserve_space(&self, is_final: bool, size: i64) {
+    pub(super) fn reserve_space(&self, is_final: bool, size: i64) {
         if size <= 0 {
             return;
         }
@@ -259,7 +251,7 @@ impl VfsDir {
     }
 
     // Free up space.
-    pub fn release_space(&self, is_final: bool, size: i64) {
+    pub(super) fn release_space(&self, is_final: bool, size: i64) {
         if size <= 0 {
             return;
         }
@@ -269,7 +261,7 @@ impl VfsDir {
                 let mut new_bytes = old_bytes - size;
                 if new_bytes < 0 {
                     warn!(
-                        "tmp bytes become negative {}, reset to 0, dir {:?}",
+                        "final bytes become negative {}, reset to 0, dir {:?}",
                         new_bytes,
                         self.stats.path()
                     );
@@ -309,10 +301,23 @@ impl VfsDir {
         self.stats.check_dir()
     }
 
+    pub(super) fn allocation_size(&self, requested_bytes: i64) -> Option<i64> {
+        if requested_bytes < 0 {
+            return None;
+        }
+        if self.storage_type == StorageType::SpdkDisk {
+            self.state.offset_alloc.allocation_size(requested_bytes)
+        } else {
+            Some(requested_bytes)
+        }
+    }
+
     pub fn can_allocate(&self, stg_type: StorageType, block_size: i64) -> bool {
         (stg_type == StorageType::Disk || stg_type == self.storage_type)
             && !self.is_failed()
-            && self.available() > block_size
+            && self
+                .allocation_size(block_size)
+                .is_some_and(|required| self.available() >= required)
     }
 
     pub fn is_failed(&self) -> bool {
@@ -364,15 +369,11 @@ mod test {
     use orpc::sync::AtomicLong;
     use orpc::sys::FsStats;
     use orpc::CommonResult;
-    use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
-    fn spdk_state(p: &str, cap: i64) -> Arc<DirState> {
+    fn spdk_state(_p: &str, cap: i64) -> Arc<DirState> {
         Arc::new(DirState {
-            dir_id: 1,
-            base_path: PathBuf::from(p),
-            storage_type: StorageType::SpdkDisk,
             bdev_name: Some("nvme0".into()),
             bdev_capacity: cap,
             offset_alloc: DirState::new_offset_alloc(StorageType::SpdkDisk, cap, 4096),
@@ -383,8 +384,6 @@ mod test {
         VfsDir {
             version: StorageVersion::with_cluster("t"),
             stats: FsStats::new(p),
-            active_dir: PathBuf::from(p).join("a"),
-            staging_dir: PathBuf::from(p).join("s"),
             storage_type: StorageType::SpdkDisk,
             conf_capacity: conf,
             reserved_bytes: 0,
@@ -395,11 +394,8 @@ mod test {
         }
     }
 
-    fn local_state(p: &str) -> Arc<DirState> {
+    fn local_state(_p: &str) -> Arc<DirState> {
         Arc::new(DirState {
-            dir_id: 1,
-            base_path: PathBuf::from(p),
-            storage_type: StorageType::Ssd,
             bdev_name: None,
             bdev_capacity: 0,
             offset_alloc: DirState::new_offset_alloc(StorageType::Ssd, 0, DEFAULT_BLOCK_ALIGN),
@@ -410,8 +406,6 @@ mod test {
         VfsDir {
             version: StorageVersion::with_cluster("t"),
             stats: FsStats::new(p),
-            active_dir: PathBuf::from(p).join("a"),
-            staging_dir: PathBuf::from(p).join("s"),
             storage_type: StorageType::Ssd,
             conf_capacity: 1 << 30,
             reserved_bytes: 0,
@@ -440,7 +434,7 @@ mod test {
         let tmp = layout.allocate(&dir, &block)?;
         dir.reserve_space(false, block.len);
 
-        let tmp_file = tmp.get_block_path()?;
+        let tmp_file = FileLayout::block_path(&dir, &tmp)?;
         LocalFile::write_string(
             tmp_file.as_path(),
             "1".repeat(ByteUnit::MB as usize).as_str(),
@@ -456,10 +450,10 @@ mod test {
 
         // commit block
         // commit block (committed_len = 1MB, the actual data written)
-        let final1 = layout.finalize(&tmp, ByteUnit::MB as i64)?;
-        let file = final1.get_block_path()?;
+        let final1 = layout.finalize(&dir, &tmp, ByteUnit::MB as i64)?;
+        let file = FileLayout::block_path(&dir, &final1)?;
         dir.release_space(false, block.len);
-        dir.reserve_space(false, final1.len);
+        dir.reserve_space(true, final1.len);
         println!(
             "final_file = {:?}, available = {}",
             file,
@@ -474,17 +468,18 @@ mod test {
     #[test]
     fn finalize_block_spdk() -> CommonResult<()> {
         let st = spdk_state("/spdk/final", 1 << 30);
-        let _dir = spdk_dir("/spdk/final", st.clone(), 1 << 30);
+        let dir = spdk_dir("/spdk/final", st, 1 << 30);
         let meta = BlockMeta {
             id: 1,
             len: 4096,
             state: BlockState::Writing,
-            dir: st,
+            dir_id: dir.id(),
+            storage_type: StorageType::SpdkDisk,
             actual_len: 4096,
             bdev_offset: 0,
         };
         let layout = BdevLayout::new(None);
-        let r = layout.finalize(&meta, 2048)?;
+        let r = layout.finalize(&dir, &meta, 2048)?;
         assert_eq!(r.len, 2048);
         Ok(())
     }

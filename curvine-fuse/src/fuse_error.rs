@@ -115,42 +115,52 @@ impl From<IOError> for FuseError {
 
 impl From<FsError> for FuseError {
     fn from(value: FsError) -> Self {
-        // Map well-known FsError kinds directly to POSIX errno
-        let mapped = match &value {
-            FsError::FileAlreadyExists(_) => Some(libc::EEXIST),
-            FsError::FileNotFound(_) => Some(libc::ENOENT),
-            FsError::DirNotEmpty(_) => Some(libc::ENOTEMPTY),
-            FsError::IsADirectory(_) => Some(libc::EISDIR),
-            FsError::ParentNotDir(_) => Some(libc::ENOTDIR),
-            FsError::NotADirectory(_) => Some(libc::ENOTDIR),
-            FsError::InvalidPath(_) => Some(libc::EINVAL),
-            FsError::InvalidFileSize(_) => Some(libc::EFBIG),
-            FsError::InvalidArgument(_) => Some(libc::EINVAL),
-            FsError::DiskOutOfSpace(_) => Some(libc::ENOSPC),
-            FsError::Timeout(_) => Some(libc::ETIMEDOUT),
-            FsError::Unsupported(_) => Some(libc::ENOSYS),
-            FsError::InProgress(_) => Some(libc::EBUSY),
-            FsError::UnsupportedUfsRead(_) => Some(libc::EOPNOTSUPP),
-            FsError::ReadOnly(_) => Some(libc::EROFS),
-            _ => None,
-        };
-
-        if let Some(errno) = mapped {
-            return Self::new(errno, value.into());
-        }
-
-        // Fallback: infer from message content for UFS/common errors (e.g., opendal PermissionDenied)
-        let msg = value.to_string().to_lowercase();
-        if msg.contains("permission denied") || msg.contains("os error 13") {
-            return Self::new(libc::EACCES, value.into());
-        }
-        if msg.contains("not implemented") || msg.contains("unsupported") {
-            return Self::new(libc::ENOSYS, value.into());
-        }
-
-        // Default to EIO
-        Self::new(libc::EIO, value.into())
+        let errno = errno_of(&value);
+        Self::new(errno, value.into())
     }
+}
+
+/// The POSIX errno an `FsError` maps to, computed by borrowing the error rather
+/// than consuming it. `From<FsError>` delegates here; callers that must consume
+/// the error elsewhere (e.g. send it back to a waiter on a channel) while still
+/// building an errno-only kernel reply can borrow the errno without cloning the
+/// non-`Clone` `FsError`.
+pub(crate) fn errno_of(value: &FsError) -> i32 {
+    // Map well-known FsError kinds directly to POSIX errno
+    let mapped = match value {
+        FsError::FileAlreadyExists(_) => Some(libc::EEXIST),
+        FsError::FileNotFound(_) => Some(libc::ENOENT),
+        FsError::DirNotEmpty(_) => Some(libc::ENOTEMPTY),
+        FsError::IsADirectory(_) => Some(libc::EISDIR),
+        FsError::ParentNotDir(_) => Some(libc::ENOTDIR),
+        FsError::NotADirectory(_) => Some(libc::ENOTDIR),
+        FsError::InvalidPath(_) => Some(libc::EINVAL),
+        FsError::InvalidFileSize(_) => Some(libc::EFBIG),
+        FsError::InvalidArgument(_) => Some(libc::EINVAL),
+        FsError::DiskOutOfSpace(_) => Some(libc::ENOSPC),
+        FsError::Timeout(_) => Some(libc::ETIMEDOUT),
+        FsError::Unsupported(_) => Some(libc::ENOSYS),
+        FsError::InProgress(_) => Some(libc::EBUSY),
+        FsError::UnsupportedUfsRead(_) => Some(libc::EOPNOTSUPP),
+        FsError::ReadOnly(_) => Some(libc::EROFS),
+        _ => None,
+    };
+
+    if let Some(errno) = mapped {
+        return errno;
+    }
+
+    // Fallback: infer from message content for UFS/common errors (e.g., opendal PermissionDenied)
+    let msg = value.to_string().to_lowercase();
+    if msg.contains("permission denied") || msg.contains("os error 13") {
+        return libc::EACCES;
+    }
+    if msg.contains("not implemented") || msg.contains("unsupported") {
+        return libc::ENOSYS;
+    }
+
+    // Default to EIO
+    libc::EIO
 }
 
 impl From<Elapsed> for FuseError {

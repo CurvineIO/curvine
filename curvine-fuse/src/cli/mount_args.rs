@@ -93,10 +93,13 @@ pub struct FuseMountArgs {
     pub negative_timeout_ms: Option<u64>,
 
     // Performance settings
-    #[arg(long, help = "Max background operations (optional)")]
+    #[arg(long, help = "Max background operations; must be > 0 (optional)")]
     pub max_background: Option<u16>,
 
-    #[arg(long, help = "Congestion threshold (optional)")]
+    #[arg(
+        long,
+        help = "Congestion threshold; must be > 0 and <= max_background (optional)"
+    )]
     pub congestion_threshold: Option<u16>,
 
     // Node cache settings

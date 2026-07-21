@@ -14,6 +14,7 @@
 
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::CurvineURI;
+use curvine_common::proto::raft::{AppliedIndex, FsmState, SnapshotData, SnapshotFileList};
 use curvine_common::raft::storage::{AppStorage, ApplyMsg};
 use curvine_common::raft::{NodeId, RaftPeer};
 use curvine_common::state::{
@@ -27,7 +28,7 @@ use curvine_server::master::journal::{
 };
 use curvine_server::master::{Master, MountManager};
 use log::info;
-use orpc::common::{Logger, TimeSpent};
+use orpc::common::{FileUtils, Logger, TimeSpent, Utils};
 use orpc::io::net::NetUtils;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::{err_box, CommonResult};
@@ -461,5 +462,110 @@ fn test_master_restart_with_snapshot_recovery() -> CommonResult<()> {
     drop(mnt_mgr);
     js.shutdown();
 
+    Ok(())
+}
+
+fn empty_checkpoint_snapshot(empty_dir: &str) -> SnapshotData {
+    let fsm_state = FsmState {
+        applied: AppliedIndex {
+            term: 1,
+            index: 1,
+            op_id: 0,
+            rpc_id: 0,
+        },
+        ufs_applied: AppliedIndex {
+            term: 1,
+            index: 1,
+            op_id: 0,
+            rpc_id: 0,
+        },
+    };
+    SnapshotData {
+        snapshot_id: 1,
+        node_id: 1,
+        create_time: 0,
+        bytes_data: None,
+        files_data: Some(SnapshotFileList {
+            dir: empty_dir.to_string(),
+            files: vec![],
+        }),
+        fsm_state,
+    }
+}
+
+// Refuse empty checkpoint over a FS that already has files; allow when file_count == 0
+// even if directories exist (tuple order: get_file_counts -> (dir_count, file_count)).
+#[test]
+fn test_apply_snapshot_refuses_empty_over_populated_files() -> CommonResult<()> {
+    Logger::default();
+    Master::init_test_metrics();
+
+    let test_id = Utils::rand_str(8);
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!("meta-empty-snap-refuse-{}", test_id));
+
+    let js = JournalSystem::from_conf(&conf)?;
+    let fs = MasterFilesystem::with_js(&conf, &js);
+    fs.add_test_worker(WorkerInfo::default());
+    let loader = js.journal_loader();
+    let rt = AsyncRuntime::single();
+
+    // Directories only: guard must not refuse (file_count == 0).
+    fs.mkdir("/only-dirs/nested", true)?;
+    let (dir_count, file_count) = fs.get_file_counts();
+    assert!(
+        dir_count > 0,
+        "expected dirs after mkdir, got {}",
+        dir_count
+    );
+    assert_eq!(file_count, 0);
+
+    let empty_dirs = Utils::test_sub_dir(format!("empty-snap-dirs-{}", test_id));
+    FileUtils::create_dir(&empty_dirs, true)?;
+    assert_eq!(FileUtils::dir_size(&empty_dirs).unwrap_or(1), 0);
+
+    let dirs_only = rt.block_on(loader.apply_snapshot(empty_checkpoint_snapshot(&empty_dirs)));
+    if let Err(e) = &dirs_only {
+        let msg = e.to_string();
+        assert!(
+            !msg.contains("refusing to apply empty snapshot"),
+            "dirs-only FS must not hit the empty-snapshot guard: {}",
+            msg
+        );
+    }
+
+    // Rebuild a populated FS with files: empty checkpoint must be refused.
+    fs.mkdir("/with-files", true)?;
+    fs.create("/with-files/file.log", false)?;
+    let (dir_count, file_count) = fs.get_file_counts();
+    assert!(file_count > 0, "expected files after create");
+
+    let empty_files = Utils::test_sub_dir(format!("empty-snap-files-{}", test_id));
+    FileUtils::create_dir(&empty_files, true)?;
+    assert_eq!(FileUtils::dir_size(&empty_files).unwrap_or(1), 0);
+
+    let err = rt
+        .block_on(loader.apply_snapshot(empty_checkpoint_snapshot(&empty_files)))
+        .expect_err("empty snapshot over populated files must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("refusing to apply empty snapshot"),
+        "unexpected error: {}",
+        msg
+    );
+    assert!(
+        msg.contains(&format!("{} files", file_count))
+            && msg.contains(&format!("{} dirs", dir_count)),
+        "error should report (file_count, dir_count)=({}, {}); got: {}",
+        file_count,
+        dir_count,
+        msg
+    );
+
+    drop(fs);
+    js.shutdown();
     Ok(())
 }

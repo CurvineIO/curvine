@@ -5,6 +5,19 @@
 format_master = false
 format_worker = false
 
+# Network interface (e.g. "eth0") used to auto-resolve this node's local IPv4.
+# When set (non-empty), on startup the resolved IPv4 is applied to the
+# master/journal/worker/client hostnames, and the CURVINE_*_HOSTNAME env vars
+# are ignored. When empty (the default), hostnames come from the config below
+# and may be overridden by the CURVINE_*_HOSTNAME env vars.
+#
+# Multi-node note: this only fills THIS node's own hostname. The cluster
+# membership lists (journal.journal_addrs and client.master_addrs) must still
+# be written out explicitly, and each node's entry must use the exact IPv4 that
+# its interface resolves to -- otherwise the node cannot locate itself in the
+# raft group and startup fails with a clear error.
+# net_interface = "eth0"
+
 # Test-only remote fault control. Exposing the HTTP API requires BOTH:
 #   1) enabled = true below, and
 #   2) binaries built with `--features fault-injection`
@@ -20,6 +33,8 @@ auth_token_env = "CURVINE_FAULT_TOKEN"
 # master configuration
 [master]
 meta_dir = "testing/meta"
+# Worker selection policy: local, robin, random, load_based, or weighted.
+# worker_policy = "weighted"
 log = { level = "info", log_dir = "stdout", file_name = "master.log" }
 
 
@@ -33,6 +48,10 @@ journal_dir = "testing/journal"
 
 # Worker configuration
 [worker]
+# Relative allocation weight used when master.worker_policy = "weighted".
+# Set higher values on more capable nodes; 0 disables new allocations to this worker.
+# This is trusted administrator configuration and is not capped by the master.
+weight = 1
 dir_reserved = "0"
 data_dir = [
     "[DISK]testing/data",

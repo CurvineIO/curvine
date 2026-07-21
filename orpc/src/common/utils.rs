@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{FileUtils, LocalTime};
+use crate::common::LocalTime;
 use crate::runtime::Runtime;
 use crate::CommonResult;
 use md5::{Digest, Md5};
@@ -148,8 +148,9 @@ impl Utils {
         let mut path = env::current_dir().unwrap_or(PathBuf::from("."));
         path.push("../testing");
 
-        // Ensure the testing directory exists
-        let _ = FileUtils::create_parent_dir(&path, true);
+        // Create the testing/ directory itself (create_parent_dir would only
+        // ensure the parent of ../testing, i.e. the workspace root).
+        fs::create_dir_all(&path).expect("failed to create testing/ for Utils::test_file");
 
         path.push(format!("test-{}", Self::rand_id()));
         format!("{}", path.display())
@@ -355,5 +356,21 @@ mod tests {
     fn cur_dir() {
         let dir = Utils::cur_dir_sub("meta");
         println!("{}", dir)
+    }
+
+    #[test]
+    fn test_file_creates_testing_directory() {
+        use std::path::Path;
+
+        let path = Utils::test_file();
+        let parent = Path::new(&path).parent().expect("test file has parent");
+        assert!(
+            parent.is_dir(),
+            "Utils::test_file must create testing/; missing {:?}",
+            parent
+        );
+        // Ensure the returned path is writable (the original ENOENT failure mode).
+        std::fs::File::create(&path).expect("should be able to create file under testing/");
+        let _ = std::fs::remove_file(&path);
     }
 }

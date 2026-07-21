@@ -482,35 +482,46 @@ impl JournalLoader {
     fn apply_snapshot0(&self, snapshot: SnapshotData) -> RaftResult<()> {
         let mut spend = TimeSpent::new();
 
-        // Compute checkpoint_size outside the write lock to avoid adding
-        // filesystem traversal I/O to the restore critical section.
-        // The traversal is skipped entirely when info logging is disabled.
-        let (restore_path, checkpoint_size) = match &snapshot.files_data {
-            Some(data) => {
-                let size = if log::log_enabled!(log::Level::Info) {
-                    FileUtils::dir_size(&data.dir).unwrap_or_else(|e| {
-                        warn!("failed to compute checkpoint size for {}: {}", data.dir, e);
-                        0
-                    })
-                } else {
-                    0
-                };
-                (data.dir.clone(), size)
-            }
+        // Resolve restore path first. Always measure dir size for safety checks;
+        // the logged checkpoint_size may still be 0 when info logging is disabled.
+        let restore_path = match &snapshot.files_data {
+            Some(data) => data.dir.clone(),
             None => {
                 let dir = self.fs_dir.read().get_checkpoint_path(LocalTime::mills());
                 FileUtils::create_dir(&dir, true)?;
-                let size = if log::log_enabled!(log::Level::Info) {
-                    FileUtils::dir_size(&dir).unwrap_or_else(|e| {
-                        warn!("failed to compute checkpoint size for {}: {}", dir, e);
-                        0
-                    })
-                } else {
-                    0
-                };
-                (dir, size)
+                dir
             }
         };
+        let actual_size = FileUtils::dir_size(&restore_path).unwrap_or_else(|e| {
+            warn!(
+                "failed to compute checkpoint size for {}: {}",
+                restore_path, e
+            );
+            0
+        });
+        let checkpoint_size = if log::log_enabled!(log::Level::Info) {
+            actual_size
+        } else {
+            0
+        };
+
+        // Never wipe a populated filesystem with an empty checkpoint. Harness
+        // daily failures showed FileNotFound after restore from checkpoint_size=0
+        // following raft quorum loss (CurvineIO/curvine#1207).
+        // get_file_counts() returns (dir_count, file_count).
+        {
+            let fs_dir = self.fs_dir.read();
+            let (dir_count, file_count) = fs_dir.get_file_counts();
+            if actual_size == 0 && file_count > 0 {
+                return err_box!(
+                    "refusing to apply empty snapshot at {} ({} bytes) over filesystem with {} files and {} dirs",
+                    restore_path,
+                    actual_size,
+                    file_count,
+                    dir_count
+                );
+            }
+        }
 
         let mut fs_dir = self.fs_dir.write();
         fs_dir.restore(&restore_path, checkpoint_size)?;

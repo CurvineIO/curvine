@@ -85,17 +85,10 @@ impl WorkerMetrics {
         self.num_blocks_to_delete
             .set(state.num_blocks_to_delete() as i64);
 
-        let mut storage_failed = 0;
-        for item in state.dir_iter() {
-            if item.is_failed() {
-                storage_failed += 1;
-            }
-        }
-        self.storage_failed.set(storage_failed);
+        self.storage_failed.set(state.failed_storage_count() as i64);
         self.used_memory_bytes.set(SysUtils::used_memory() as i64);
 
-        let total_disks = state.dir_iter().count();
-        self.store_total_disks.set(total_disks as i64);
+        self.store_total_disks.set(state.storage_count() as i64);
 
         Metrics::text_output()
     }

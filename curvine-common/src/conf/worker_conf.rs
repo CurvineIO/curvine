@@ -114,6 +114,12 @@ impl WorkerDataDir {
 pub struct WorkerConf {
     pub hostname: String,
 
+    /// Relative allocation weight used by the master's `weighted` worker policy.
+    /// A value of 0 keeps the worker registered but excludes it from new allocations.
+    /// This is trusted administrator configuration; use values that reflect the
+    /// intended relative capacity of workers in the cluster.
+    pub weight: u32,
+
     pub rpc_port: u16,
     pub web_port: u16,
 
@@ -177,6 +183,7 @@ impl Default for WorkerConf {
     fn default() -> Self {
         Self {
             hostname: ClusterConf::DEFAULT_HOSTNAME.to_string(),
+            weight: 1,
             rpc_port: ClusterConf::DEFAULT_WORKER_PORT,
             web_port: ClusterConf::DEFAULT_WORKER_WEB_PORT,
             dir_reserved: "0".to_string(),

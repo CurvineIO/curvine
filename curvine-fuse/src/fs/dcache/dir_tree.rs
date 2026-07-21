@@ -199,7 +199,7 @@ impl DirTree {
             }
 
             None => {
-                // Path B: new dentry name whose server-id already maps to a cached inode.
+                // Resolve by server-id without holding a borrow across mutation.
                 let existing_ino = if status.id > FUSE_ROOT_ID as i64 {
                     self.get_inode(status.id as u64, None).map(|i| i.ino)
                 } else {
@@ -208,6 +208,10 @@ impl DirTree {
 
                 match existing_ino {
                     Some(ino) => {
+                        // Path B: new dentry name maps to an already-cached inode.
+                        // Bump lookup/ref and update cached path; do NOT re-insert
+                        // (that would reset ref_ctr / n_lookup). nlink comes from
+                        // FileStatus via update_status (LOOKUP is not a hard link).
                         let inode = self.get_inode_mut_check(ino, None)?;
                         if inode.is_deleted() {
                             return err_fuse!(
@@ -216,8 +220,6 @@ impl DirTree {
                                 inode.ino
                             );
                         }
-                        // New dentry + kernel lookup ref — bump lookup/ref only.
-                        // nlink comes from FileStatus via update_status (LOOKUP is not a hard link).
                         inode.add_lookup(1);
                         inode.add_ref(1);
                         inode.update_status(status);
@@ -263,8 +265,9 @@ impl DirTree {
             dir.mark_deleted_child(name);
         }
 
-        // Drop inode when both counters hit zero, but keep it when mark_delete=true
-        // so clear_mark_delete(ino) can still clear parent.deleted_children.
+        // Mirror rename's destination-unlink: drop inode when both counters hit zero.
+        // When mark_delete=true (deferred delete via fs_unlink), keep the inode so
+        // clear_mark_delete(ino) can still clear parent.deleted_children later.
         if should_remove && !mark_delete {
             self.remove_inode(ino);
         }
@@ -701,16 +704,10 @@ mod test {
 
         t.unlink(FUSE_ROOT_ID, "d", true).unwrap();
         assert!(t.get_inode(300, None).is_some());
-        assert!(t
-            .get_dir_check(FUSE_ROOT_ID)
-            .unwrap()
-            .is_deleted_child("d"));
+        assert!(t.get_dir_check(FUSE_ROOT_ID).unwrap().is_deleted_child("d"));
 
         t.clear_mark_delete(300).unwrap();
-        assert!(!t
-            .get_dir_check(FUSE_ROOT_ID)
-            .unwrap()
-            .is_deleted_child("d"));
+        assert!(!t.get_dir_check(FUSE_ROOT_ID).unwrap().is_deleted_child("d"));
         assert!(!t.get_inode_check(300, None).unwrap().mark_delete);
     }
 

@@ -53,6 +53,7 @@ impl WorkerManager {
         cluster_id: &str,
         status: HeartbeatStatus,
         addr: WorkerAddress,
+        weight: u32,
         storages: Vec<StorageInfo>,
     ) -> FsResult<Vec<WorkerCommand>> {
         // The cluster id must match to prevent misregistration.
@@ -85,7 +86,7 @@ impl WorkerManager {
             }
         };
 
-        self.worker_map.insert(addr, storages)?;
+        self.worker_map.insert(addr, weight, storages)?;
         Ok(cmds)
     }
 

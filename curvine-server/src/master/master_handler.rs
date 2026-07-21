@@ -25,7 +25,7 @@ use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
 use curvine_common::state::{
     CreateFileOpts, DeleteBlockCmd, FileBlocks, FileStatus, FreeResult, HeartbeatStatus,
-    ListOptions, MasterInfo, OpenFlags, RenameFlags, WorkerCommand,
+    ListOptions, MasterInfo, OpenFlags, RenameFlags, WorkerCommand, WorkerInfo,
 };
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
@@ -478,6 +478,9 @@ impl MasterHandler {
     ) -> FsResult<Vec<WorkerCommand>> {
         let status = HeartbeatStatus::from(header.status);
         let address = ProtoUtils::worker_address_from_pb(&header.address);
+        // Worker weight comes from trusted administrator configuration. Preserve the
+        // configured u32 value so the master does not silently alter allocation ratios.
+        let weight = header.weight.unwrap_or_else(WorkerInfo::default_weight);
         if matches!(status, HeartbeatStatus::Start) {
             fs.reset_full_block_report(address.worker_id);
         }
@@ -487,6 +490,7 @@ impl MasterHandler {
             &header.cluster_id,
             status,
             address,
+            weight,
             ProtoUtils::storage_info_list_from_pb(header.storages),
         )?;
         Ok(cmds)

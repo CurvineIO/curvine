@@ -44,20 +44,23 @@ pub fn run_mount(args: FuseRuntimeArgs) -> CommonResult<()> {
     let fuse_rt = rt.clone();
 
     rt.block_on(async move {
-        let fs = CurvineFileSystem::new(cluster_conf, fuse_rt.clone()).unwrap();
+        let fs = CurvineFileSystem::new(cluster_conf, fuse_rt.clone())?;
         let conf = fs.conf().clone();
 
         ensure_fs_path_exists(&fs, &conf).await?;
 
         let node_state = fs.state().clone();
         let web_port = conf.web_port;
+        let mut session = FuseSession::new(fuse_rt.clone(), fs, conf).await?;
+
+        // Do not leave the metrics server running when session construction fails.
+        // Build every startup-critical component before spawning background work.
         fuse_rt.spawn(async move {
             if let Err(e) = WebServer::start(web_port, node_state).await {
                 log::error!("Failed to start metrics server: {}", e);
             }
         });
 
-        let mut session = FuseSession::new(fuse_rt.clone(), fs, conf).await.unwrap();
         session.run().await
     })?;
 
