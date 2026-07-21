@@ -153,8 +153,7 @@ impl VfsDataset {
             let blocks = layout.scan(dir)?;
             for block in blocks {
                 let physical_bytes = block.physical_bytes();
-                self.dir_list
-                    .reserve_space(dir.id(), block.is_final(), physical_bytes)?;
+                dir.reserve_space(block.is_final(), physical_bytes);
                 self.meta.put(block);
             }
         }
@@ -334,8 +333,7 @@ impl Dataset for VfsDataset {
                 let layout = self.layouts.get(dir.storage_type());
                 let meta = layout.allocate(&dir, block)?;
 
-                self.dir_list
-                    .reserve_space(dir.id(), false, meta.physical_bytes())?;
+                dir.reserve_space(false, meta.physical_bytes());
                 self.meta.put(meta.clone());
 
                 Ok(meta)

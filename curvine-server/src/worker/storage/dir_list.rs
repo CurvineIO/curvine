@@ -128,12 +128,6 @@ impl DirList {
             .clone())
     }
 
-    /// Add physical bytes after allocation succeeds or during startup restoration.
-    pub fn reserve_space(&self, dir_id: u32, is_final: bool, bytes: i64) -> CommonResult<()> {
-        self.get_dir_check(dir_id)?.reserve_space(is_final, bytes);
-        Ok(())
-    }
-
     /// Update space usage when an existing block enters writing.
     pub fn update_write_space(
         &self,
@@ -228,7 +222,7 @@ impl DirList {
     ) -> CommonResult<Arc<VfsDir>> {
         let bytes = ByteUnit::from_str(size_str.as_ref())?.as_byte() as i64;
         let dir = self.choose_dir(StorageRequest::new(stg_type, bytes)?)?;
-        self.reserve_space(dir.id(), false, bytes)?;
+        dir.reserve_space(false, bytes);
         Ok(dir)
     }
 
@@ -338,7 +332,7 @@ mod tests {
             10 * ByteUnit::MB as i64,
         )?)?;
         assert_eq!(group.available(), before);
-        group.reserve_space(dir.id(), false, 10 * ByteUnit::MB as i64)?;
+        dir.reserve_space(false, 10 * ByteUnit::MB as i64);
         assert_eq!(group.available(), before - 10 * ByteUnit::MB as i64);
         Ok(())
     }
@@ -359,7 +353,7 @@ mod tests {
         let available = group.available();
         let dir = group.choose_dir(StorageRequest::new(StorageType::Ssd, available)?)?;
         assert_eq!(group.available(), available);
-        group.reserve_space(dir.id(), false, available)?;
+        dir.reserve_space(false, available);
         assert_eq!(group.available(), 0);
         group.release_space(dir.id(), false, available)?;
         assert_eq!(group.available(), available);
