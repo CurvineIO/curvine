@@ -238,7 +238,7 @@ impl VfsDir {
     }
 
     // Allocate reserved space for writing blocks.
-    pub fn reserve_space(&self, is_final: bool, size: i64) {
+    pub(super) fn reserve_space(&self, is_final: bool, size: i64) {
         if size <= 0 {
             return;
         }
@@ -251,7 +251,7 @@ impl VfsDir {
     }
 
     // Free up space.
-    pub fn release_space(&self, is_final: bool, size: i64) {
+    pub(super) fn release_space(&self, is_final: bool, size: i64) {
         if size <= 0 {
             return;
         }
@@ -261,7 +261,7 @@ impl VfsDir {
                 let mut new_bytes = old_bytes - size;
                 if new_bytes < 0 {
                     warn!(
-                        "tmp bytes become negative {}, reset to 0, dir {:?}",
+                        "final bytes become negative {}, reset to 0, dir {:?}",
                         new_bytes,
                         self.stats.path()
                     );
@@ -301,10 +301,23 @@ impl VfsDir {
         self.stats.check_dir()
     }
 
+    pub(super) fn allocation_size(&self, requested_bytes: i64) -> Option<i64> {
+        if requested_bytes < 0 {
+            return None;
+        }
+        if self.storage_type == StorageType::SpdkDisk {
+            self.state.offset_alloc.allocation_size(requested_bytes)
+        } else {
+            Some(requested_bytes)
+        }
+    }
+
     pub fn can_allocate(&self, stg_type: StorageType, block_size: i64) -> bool {
         (stg_type == StorageType::Disk || stg_type == self.storage_type)
             && !self.is_failed()
-            && self.available() > block_size
+            && self
+                .allocation_size(block_size)
+                .is_some_and(|required| self.available() >= required)
     }
 
     pub fn is_failed(&self) -> bool {
