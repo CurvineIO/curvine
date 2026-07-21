@@ -603,8 +603,10 @@ impl NodeState {
             _ => Ok(()),
         };
 
-        // A failed close keeps both the handle and its shared-writer reference,
-        // allowing cleanup to be retried without losing pending-delete state.
+        // A failed close keeps both the handle and its shared-writer reference
+        // so cleanup state is not silently discarded. FUSE normally sends
+        // RELEASE only once; automatic retry of retained state is tracked by
+        // #1221.
         if close_result.is_ok() {
             let _ = self.remove_handle(ino, fh);
         }
@@ -630,6 +632,8 @@ impl NodeState {
         ino: u64,
         delete_result: Result<(), FsError>,
     ) -> FuseResult<()> {
+        // Keep the mark observable after failure. The background retry needed
+        // to reclaim it without another FUSE request is tracked by #1221.
         match delete_result {
             Ok(()) | Err(FsError::FileNotFound(_)) => self.clear_mark_delete(ino),
             Err(e) => Err(e.into()),
