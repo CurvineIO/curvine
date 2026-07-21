@@ -150,7 +150,9 @@ impl Utils {
 
         // Ensure the testing directory itself exists (not only its parent).
         // create_parent_dir(../testing) would only create the workspace root.
-        let _ = fs::create_dir_all(&path);
+        fs::create_dir_all(&path).unwrap_or_else(|e| {
+            panic!("failed to create testing dir {}: {}", path.display(), e);
+        });
 
         path.push(format!("test-{}", Self::rand_id()));
         format!("{}", path.display())
@@ -162,7 +164,9 @@ impl Utils {
         path.push(sub);
 
         // Ensure the sub directory exists
-        let _ = fs::create_dir_all(&path);
+        fs::create_dir_all(&path).unwrap_or_else(|e| {
+            panic!("failed to create testing sub dir {}: {}", path.display(), e);
+        });
 
         format!("{}", path.display())
     }
