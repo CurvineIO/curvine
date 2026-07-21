@@ -216,10 +216,10 @@ impl DirTree {
                                 inode.ino
                             );
                         }
-                        // New dentry + kernel lookup ref — mirror `link()` counter bumps.
+                        // New dentry + kernel lookup ref — bump lookup/ref only.
+                        // nlink comes from FileStatus via update_status (LOOKUP is not a hard link).
                         inode.add_lookup(1);
                         inode.add_ref(1);
-                        inode.add_link(1);
                         inode.update_status(status);
                         inode.parent = parent;
                         inode.name = name.to_owned();
@@ -263,7 +263,9 @@ impl DirTree {
             dir.mark_deleted_child(name);
         }
 
-        if should_remove {
+        // Drop inode when both counters hit zero, but keep it when mark_delete=true
+        // so clear_mark_delete(ino) can still clear parent.deleted_children.
+        if should_remove && !mark_delete {
             self.remove_inode(ino);
         }
 
@@ -685,6 +687,31 @@ mod test {
         assert_eq!(t.get_inode_check(200, None).unwrap().n_lookup, 0);
         t.unlink(FUSE_ROOT_ID, "c", false).unwrap();
         assert!(t.get_inode(200, None).is_none());
+    }
+
+    /// Deferred delete (`mark_delete=true`) must keep the inode even when counters hit
+    /// zero, so `clear_mark_delete` can clear parent `deleted_children`.
+    #[test]
+    fn unlink_mark_delete_keeps_inode_for_clear_mark_delete() {
+        let mut t = DirTree::default();
+        t.lookup(FUSE_ROOT_ID, "d", file_st("d", 300)).unwrap();
+        let n0 = t.get_inode_check(300, None).unwrap().n_lookup;
+        t.forget(300, n0).unwrap();
+        assert_eq!(t.get_inode_check(300, None).unwrap().n_lookup, 0);
+
+        t.unlink(FUSE_ROOT_ID, "d", true).unwrap();
+        assert!(t.get_inode(300, None).is_some());
+        assert!(t
+            .get_dir_check(FUSE_ROOT_ID)
+            .unwrap()
+            .is_deleted_child("d"));
+
+        t.clear_mark_delete(300).unwrap();
+        assert!(!t
+            .get_dir_check(FUSE_ROOT_ID)
+            .unwrap()
+            .is_deleted_child("d"));
+        assert!(!t.get_inode_check(300, None).unwrap().mark_delete);
     }
 
     /// Repeated lookup on the same name: n_lookup increases each time; ref_ctr increments only on first dirent.
