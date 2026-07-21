@@ -508,16 +508,17 @@ impl JournalLoader {
         // Never wipe a populated filesystem with an empty checkpoint. Harness
         // daily failures showed FileNotFound after restore from checkpoint_size=0
         // following raft quorum loss (CurvineIO/curvine#1207).
+        // get_file_counts() returns (dir_count, file_count).
         {
             let fs_dir = self.fs_dir.read();
-            let (files, dirs) = fs_dir.get_file_counts();
-            if actual_size == 0 && files > 0 {
+            let (dir_count, file_count) = fs_dir.get_file_counts();
+            if actual_size == 0 && file_count > 0 {
                 return err_box!(
                     "refusing to apply empty snapshot at {} ({} bytes) over filesystem with {} files and {} dirs",
                     restore_path,
                     actual_size,
-                    files,
-                    dirs
+                    file_count,
+                    dir_count
                 );
             }
         }
