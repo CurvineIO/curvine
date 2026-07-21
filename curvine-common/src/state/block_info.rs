@@ -128,11 +128,16 @@ impl ExtendedBlock {
 pub struct LocatedBlock {
     pub block: ExtendedBlock,
     pub locs: Vec<WorkerAddress>,
+    pub has_spdk: bool,
 }
 
 impl LocatedBlock {
     pub fn new(block: ExtendedBlock, locs: Vec<WorkerAddress>) -> Self {
-        Self { block, locs }
+        Self {
+            block,
+            locs,
+            has_spdk: false,
+        }
     }
 
     pub fn should_resize(&self) -> bool {

@@ -107,6 +107,7 @@ message LocatedBlockProto {
     required ExtendedBlockProto block = 1;
     required int64 offset = 2;
     repeated WorkerAddressProto locs = 3;
+    optional bool has_spdk = 4 [default = false];
 }
 
 // All block information in the file.

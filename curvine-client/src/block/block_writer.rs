@@ -17,7 +17,8 @@
 use crate::block::block_writer::WriterAdapter::{Local, Remote};
 use crate::block::{BlockWriterLocal, BlockWriterRemote};
 use crate::file::FsContext;
-use curvine_common::state::{BlockLocation, CommitBlock, LocatedBlock, StorageType, WorkerAddress};
+use curvine_common::error::FsError;
+use curvine_common::state::{BlockLocation, CommitBlock, LocatedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use futures::future::try_join_all;
 use orpc::err_box;
@@ -112,21 +113,38 @@ impl WriterAdapter {
         block_size: i64,
     ) -> FsResult<Self> {
         let conf = &fs_context.conf.client;
-        // SPDK bypasses kernel — no local path for writes
+        // SPDK bypasses kernel — no local path for writes.
+        // Use has_spdk (from worker-reported actual storage type)
         let short_circuit = conf.short_circuit
             && fs_context.is_local_worker(worker_addr)
-            && located_block.block.storage_type != StorageType::SpdkDisk;
+            && !located_block.has_spdk;
 
         let adapter = if short_circuit {
-            let writer = BlockWriterLocal::new(
-                fs_context,
+            match BlockWriterLocal::new(
+                fs_context.clone(),
                 located_block.block.clone(),
                 worker_addr.clone(),
                 pos,
                 block_size,
             )
-            .await?;
-            Local(writer)
+            .await
+            {
+                Ok(writer) => Local(writer),
+                Err(FsError::NoLocalPath(_)) => {
+                    // Server has no local path for this block (e.g. SPDK bdev).
+                    // BlockWriterLocal already aborted the open; retry via remote.
+                    let writer = BlockWriterRemote::new(
+                        &fs_context,
+                        located_block.block.clone(),
+                        worker_addr.clone(),
+                        pos,
+                        block_size,
+                    )
+                    .await?;
+                    Remote(writer)
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             let writer = BlockWriterRemote::new(
                 &fs_context,

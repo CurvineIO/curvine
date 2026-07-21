@@ -25,7 +25,7 @@ use curvine_common::state::MountOptions;
 use curvine_common::state::{
     BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, MkdirOptsBuilder, StorageType, TtlAction,
-    WorkerInfo,
+    WorkerAddress, WorkerInfo,
 };
 use curvine_common::state::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_common::utils::SerdeUtils;
@@ -1803,4 +1803,172 @@ fn resize_rejects_extreme_file_size() {
 
     let status = fs.file_status("/extreme.log").unwrap();
     assert_eq!(status.len, 0);
+}
+
+#[test]
+fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+
+    // Scenario A: worker reports SpdkDisk -> has_spdk should be true
+    {
+        let fs = new_fs(true, "has-spdk-spdk");
+        let path = "/has-spdk-spdk.log";
+        let addr = ClientAddress::default();
+        fs.create(path, false)?;
+
+        let block = fs.add_block(path, None, addr.clone(), vec![], vec![], 0, None)?;
+
+        fs.block_report(
+            BlockReportList {
+                cluster_id: "curvine".into(),
+                worker_id: block.locs[0].worker_id,
+                full_report: true,
+                total_len: 1,
+                blocks: vec![BlockReportInfo::new(
+                    block.block.id,
+                    BlockReportStatus::Finalized,
+                    StorageType::SpdkDisk,
+                    block.block.len,
+                )],
+            },
+            None,
+        )?;
+
+        let fb = fs.get_block_locations(path)?;
+        assert_eq!(fb.block_locs.len(), 1);
+        assert!(
+            fb.block_locs[0].has_spdk,
+            "has_spdk should be true when worker reports SpdkDisk"
+        );
+    }
+
+    // Scenario B: worker reports Mem -> has_spdk should be false
+    {
+        let fs = new_fs(true, "has-spdk-mem");
+        let path = "/has-spdk-mem.log";
+        let addr = ClientAddress::default();
+        fs.create(path, false)?;
+
+        let block = fs.add_block(path, None, addr.clone(), vec![], vec![], 0, None)?;
+
+        fs.block_report(
+            BlockReportList {
+                cluster_id: "curvine".into(),
+                worker_id: block.locs[0].worker_id,
+                full_report: true,
+                total_len: 1,
+                blocks: vec![BlockReportInfo::new(
+                    block.block.id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Mem,
+                    block.block.len,
+                )],
+            },
+            None,
+        )?;
+
+        let fb = fs.get_block_locations(path)?;
+        assert_eq!(fb.block_locs.len(), 1);
+        assert!(
+            !fb.block_locs[0].has_spdk,
+            "has_spdk should be false when worker reports Mem"
+        );
+    }
+
+    // Scenario C: worker reports Disk -> has_spdk should be false
+    {
+        let fs = new_fs(true, "has-spdk-disk");
+        let path = "/has-spdk-disk.log";
+        let addr = ClientAddress::default();
+        fs.create(path, false)?;
+
+        let block = fs.add_block(path, None, addr.clone(), vec![], vec![], 0, None)?;
+
+        fs.block_report(
+            BlockReportList {
+                cluster_id: "curvine".into(),
+                worker_id: block.locs[0].worker_id,
+                full_report: true,
+                total_len: 1,
+                blocks: vec![BlockReportInfo::new(
+                    block.block.id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    block.block.len,
+                )],
+            },
+            None,
+        )?;
+
+        let fb = fs.get_block_locations(path)?;
+        assert_eq!(fb.block_locs.len(), 1);
+        assert!(
+            !fb.block_locs[0].has_spdk,
+            "has_spdk should be false when worker reports Disk"
+        );
+    }
+
+    // Scenario D: mixed replicas across 2 workers — one SpdkDisk, one Disk -> has_spdk should be true
+    {
+        let fs = new_fs(true, "has-spdk-mixed");
+        let path = "/has-spdk-mixed.log";
+        let addr = ClientAddress::default();
+        fs.create(path, false)?;
+
+        // Add second worker (worker_id=200) so we can have 2 replicas on different workers
+        let worker2_addr = WorkerAddress {
+            worker_id: 200,
+            ip_addr: "127.0.0.2".to_string(),
+            rpc_port: 667,
+            ..Default::default()
+        };
+        let worker2 = WorkerInfo::new(worker2_addr, 0);
+        fs.add_test_worker(worker2);
+
+        let block = fs.add_block(path, None, addr.clone(), vec![], vec![], 0, None)?;
+
+        // Worker 100 (default) reports block as SpdkDisk
+        fs.block_report(
+            BlockReportList {
+                cluster_id: "curvine".into(),
+                worker_id: 100,
+                full_report: true,
+                total_len: 1,
+                blocks: vec![BlockReportInfo::new(
+                    block.block.id,
+                    BlockReportStatus::Finalized,
+                    StorageType::SpdkDisk,
+                    block.block.len,
+                )],
+            },
+            None,
+        )?;
+
+        // Worker 200 reports same block as Disk
+        fs.block_report(
+            BlockReportList {
+                cluster_id: "curvine".into(),
+                worker_id: 200,
+                full_report: false,
+                total_len: 0,
+                blocks: vec![BlockReportInfo::new(
+                    block.block.id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    block.block.len,
+                )],
+            },
+            None,
+        )?;
+
+        let fb = fs.get_block_locations(path)?;
+        assert_eq!(fb.block_locs.len(), 1);
+        assert_eq!(fb.block_locs[0].locs.len(), 2, "should have 2 replicas");
+        assert!(
+            fb.block_locs[0].has_spdk,
+            "has_spdk should be true when any replica reports SpdkDisk"
+        );
+    }
+
+    Ok(())
 }

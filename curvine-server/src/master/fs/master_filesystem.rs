@@ -570,11 +570,16 @@ impl MasterFilesystem {
         }
 
         let choose_workers = self.choose_worker_for_file(file, client_addr, exclude_workers)?;
+        let has_spdk = {
+            let wm = self.worker_manager.read();
+            wm.workers_have_spdk(&choose_workers)
+        };
         let block =
             fs_dir.acquire_new_block(path, inode, commit_blocks, &choose_workers, file_len)?;
         let located = LocatedBlock {
             block,
             locs: choose_workers,
+            has_spdk,
         };
 
         Ok(located)
@@ -1218,11 +1223,16 @@ impl MasterFilesystem {
         let inp = Self::resolve_path(&fs_dir, path)?;
 
         let choose_workers = self.choose_worker(&inp, client_addr, exclude_workers)?;
+        let has_spdk = {
+            let wm = self.worker_manager.read();
+            wm.workers_have_spdk(&choose_workers)
+        };
         let block = fs_dir.assign_worker(inp, block.id, &choose_workers)?;
 
         Ok(LocatedBlock {
             block,
             locs: choose_workers,
+            has_spdk,
         })
     }
 
