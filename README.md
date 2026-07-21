@@ -76,26 +76,6 @@ Curvine is purpose-built to back large-scale AI Agent platforms on Kubernetes. I
 
 > Read the full story: **[AI Agent 存储选型：Curvine 如何在 EKS 上支撑万级 Agent 运行](https://aws.amazon.com/cn/blogs/china/ai-agent-storage-curvine-how-to-eks-agent/)**
 
-### Example StorageClass
-
-```yaml
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: curvine-sc
-provisioner: curvine
-reclaimPolicy: Delete
-volumeBindingMode: Immediate
-allowVolumeExpansion: true
-parameters:
-  master-addrs: "curvine-master-0.curvine-master.curvine.svc.cluster.local:8995"
-  fs-path: "/k8s-volumes"
-  path-type: "DirectoryOrCreate"
-  io-threads: "4"
-  worker-threads: "8"
-```
-
-`volumeBindingMode: Immediate` binds the PVC immediately, and `path-type: DirectoryOrCreate` means each PVC is simply a directory on the Curvine file system — created far faster than any cloud-volume API path.
 
 ## 🚀 Core Features
 
