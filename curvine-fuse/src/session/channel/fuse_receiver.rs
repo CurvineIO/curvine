@@ -1938,4 +1938,345 @@ mod tests {
             );
         }
     }
+
+    // --- Issue #1089: stream pre-dispatch error-reply coverage ---
+    //
+    // These prove the property the issue asks for: when a stream op
+    // (read/write/flush/release/fsync) fails BEFORE it replies to the kernel (a
+    // "pre-dispatch error" — e.g. a handle-lookup miss), `send_stream_dispatch`
+    // enqueues EXACTLY ONE error reply, via the `if res.is_err() { err_rep.send_rep }`
+    // fallback (`fuse_receiver.rs` ~:317), and never double-replies.
+    //
+    // FD-FREE, same construction as `send_stream_integration::dispatch_one`: the
+    // dispatch core takes only `&fs` + a pre-built `FuseResponse` over an in-memory
+    // channel, so there is no `kernel_fd`/`Pipe2`/reactor and no fd lifecycle hazard.
+    //
+    // Unlike the sibling metrics tests (which share process-global label children and
+    // can only assert lower bounds), these assert an EXACT count of `== 1`: the reply
+    // channel is per-test (never shared), so counting its enqueued `FuseTask`s is
+    // deterministic and parallel-safe.
+    mod stream_error_coverage {
+        use crate::err_fuse;
+        use crate::fs::operator::{FSync, Flush, Read, Release, Write};
+        use crate::fs::FileSystem;
+        use crate::fuse_metrics::{
+            ActiveGuard, FuseMetrics, FuseReqCtx, FuseReqKind, FuseReqLabels,
+        };
+        use crate::raw::fuse_abi::{
+            fuse_flush_in, fuse_fsync_in, fuse_in_header, fuse_read_in, fuse_release_in,
+            fuse_write_in,
+        };
+        use crate::session::{FuseRequest, FuseResponse, FuseTask};
+        use crate::{FuseResult, FuseUtils};
+        use bytes::{BufMut, BytesMut};
+        use orpc::runtime::{AsyncRuntime, RpcRuntime};
+        use orpc::sync::channel::AsyncChannel;
+        use std::sync::Arc;
+
+        const OP_READ: u32 = 15;
+        const OP_WRITE: u32 = 16;
+        const OP_RELEASE: u32 = 18;
+        const OP_FSYNC: u32 = 20;
+        const OP_FLUSH: u32 = 25;
+
+        // A pre-dispatch error errno. `find_handle` returns EBADF (not EIO) on a
+        // handle-lookup miss (`node_state.rs` `find_handle`), which is the real
+        // pre-dispatch failure the kernel sees; issue #1089's prose says "EIO", but
+        // the handle-lookup path is EBADF, so we model that.
+        const ERRNO: i32 = libc::EBADF;
+
+        // A FileSystem whose stream ops fail WITHOUT touching `_reply` — the exact
+        // shape of a pre-dispatch error (handle lookup fails, or backend returns Err
+        // before replying). Only these five are overridden; every other op keeps the
+        // trait default (see `BlockingSetlkwFs` for the same "override one, inherit
+        // the rest" pattern). This is deliberately more explicit than reusing
+        // `TestFileSystem` (whose defaults return ENOSYS): a dedicated mock lets the
+        // assertions pin the errno on the wire, and documents the EBADF nuance above.
+        struct PreDispatchErrFs;
+        impl FileSystem for PreDispatchErrFs {
+            async fn read(&self, _op: Read<'_>, _reply: FuseResponse) -> FuseResult<()> {
+                err_fuse!(ERRNO, "read: no handle")
+            }
+            async fn write(&self, _op: Write<'_>, _reply: FuseResponse) -> FuseResult<()> {
+                err_fuse!(ERRNO, "write: no handle")
+            }
+            async fn flush(&self, _op: Flush<'_>, _reply: FuseResponse) -> FuseResult<()> {
+                err_fuse!(ERRNO, "flush: no handle")
+            }
+            async fn release(&self, _op: Release<'_>, _reply: FuseResponse) -> FuseResult<()> {
+                err_fuse!(ERRNO, "release: no handle")
+            }
+            async fn fsync(&self, _op: FSync<'_>, _reply: FuseResponse) -> FuseResult<()> {
+                err_fuse!(ERRNO, "fsync: no handle")
+            }
+        }
+
+        // A FileSystem whose `read` REPLIES via the passed-in `reply` and THEN returns
+        // `Err`. This is the "Verified nuance" from #1089: an op that already answered
+        // the kernel but still surfaces an error. It exercises the exact end-to-end path
+        // `send_stream_dispatch` guards — the reply is sent through the original `rep`,
+        // then `if res.is_err() { err_rep.send_rep(res) }` fires on the shared clone — so
+        // driving it through `dispatch_and_collect` proves the fallback CANNOT
+        // double-reply, not just that the slot guard works in isolation.
+        //
+        // `cfg(not(debug_assertions))`: its only user, `err_rep_fallback_after_a_reply_
+        // is_noop`, is release-only (a real double reply trips `commit_reply_task`'s
+        // `debug_assert!` in debug), so gating the mock the same way avoids a
+        // "never constructed" warning in debug builds.
+        #[cfg(not(debug_assertions))]
+        struct ReplyThenErrFs;
+        #[cfg(not(debug_assertions))]
+        impl FileSystem for ReplyThenErrFs {
+            async fn read(&self, _op: Read<'_>, reply: FuseResponse) -> FuseResult<()> {
+                // Answer the kernel first (empty success frame), then report an error.
+                reply.send_rep::<(), crate::FuseError>(Ok(())).await?;
+                err_fuse!(ERRNO, "late error after a successful reply")
+            }
+        }
+
+        fn make_request(opcode: u32, unique: u64, payload: &[u8]) -> FuseRequest {
+            let header = fuse_in_header {
+                len: (size_of::<fuse_in_header>() + payload.len()) as u32,
+                opcode,
+                unique,
+                nodeid: 1,
+                uid: 0,
+                gid: 0,
+                pid: 0,
+                padding: 0,
+            };
+            let mut buf = BytesMut::new();
+            buf.put_slice(FuseUtils::struct_as_bytes(&header));
+            buf.put_slice(payload);
+            FuseRequest::from_bytes(buf.freeze()).expect("parse stream request")
+        }
+
+        fn read_request(unique: u64) -> FuseRequest {
+            make_request(
+                OP_READ,
+                unique,
+                FuseUtils::struct_as_bytes(&fuse_read_in::default()),
+            )
+        }
+        fn write_request(unique: u64) -> FuseRequest {
+            make_request(
+                OP_WRITE,
+                unique,
+                FuseUtils::struct_as_bytes(&fuse_write_in::default()),
+            )
+        }
+        fn flush_request(unique: u64) -> FuseRequest {
+            make_request(
+                OP_FLUSH,
+                unique,
+                FuseUtils::struct_as_bytes(&fuse_flush_in::default()),
+            )
+        }
+        fn release_request(unique: u64) -> FuseRequest {
+            make_request(
+                OP_RELEASE,
+                unique,
+                FuseUtils::struct_as_bytes(&fuse_release_in::default()),
+            )
+        }
+        fn fsync_request(unique: u64) -> FuseRequest {
+            make_request(
+                OP_FSYNC,
+                unique,
+                FuseUtils::struct_as_bytes(&fuse_fsync_in::default()),
+            )
+        }
+
+        // Drive one stream op through the real `send_stream_dispatch` against `fs` and
+        // return `(dispatch result, every FuseTask enqueued to the reply channel,
+        // the shared reply handle)`. FD-free; the reply handle is returned so the
+        // caller can inspect the shared metrics slot (finished / active guard).
+        //
+        // Draining: `send_stream_dispatch` is fully awaited on a single-thread runtime,
+        // so by the time it returns everything it enqueued is already buffered in `rx`.
+        // We just drain what's there — no drainer task needed. The loop stops on BOTH
+        // empty AND closed (`while let Ok(Some(_))`): `try_recv` maps an empty channel
+        // to `Ok(None)` but a *closed* one to `Err` (`orpc::sync::channel`), so matching
+        // only `Ok(Some(_))` makes the drain robust regardless of whether a sender clone
+        // is still alive. (One is: `observer` below holds a sender for the whole drain,
+        // so in practice we hit the `Ok(None)` empty case — but the loop must not depend
+        // on that.)
+        fn dispatch_and_collect<F: FileSystem>(
+            fs: Arc<F>,
+            with_metrics_ctx: bool,
+            req: FuseRequest,
+        ) -> (FuseResult<()>, Vec<FuseTask>, FuseResponse) {
+            FuseMetrics::ensure_init().unwrap();
+            let rt = AsyncRuntime::single();
+            rt.block_on(async {
+                let (tx, mut rx) = AsyncChannel::new(64).split();
+                let opcode = req.opcode().as_str();
+                let ctx = if with_metrics_ctx {
+                    let gauge = orpc::common::Metrics::new_gauge(
+                        format!("sec_active_{}", req.unique()),
+                        "test".to_string(),
+                    )
+                    .unwrap();
+                    Some(FuseReqCtx {
+                        labels: FuseReqLabels::new(opcode, FuseReqKind::Stream, 64),
+                        active: Some(ActiveGuard::new(gauge)),
+                    })
+                } else {
+                    None
+                };
+                let rep = FuseResponse::new_reply(req.unique(), tx, false, ctx);
+                // Keep a handle to the SAME shared slot so we can assert finished/active
+                // after dispatch. This clone shares the `Arc<Mutex<..>>`, exactly like
+                // the `err_rep` the dispatch builds internally.
+                let observer = rep.clone();
+
+                let res =
+                    super::super::FuseReceiver::<F>::send_stream_dispatch(&fs, req, rep).await;
+
+                // Drain whatever the (fully awaited) dispatch buffered. Stop on empty
+                // OR closed — `Ok(Some(_))` only — so the loop can never panic on a
+                // `Disconnected` error even if no sender clone were alive.
+                let mut tasks = Vec::new();
+                while let Ok(Some(t)) = rx.try_recv() {
+                    tasks.push(t);
+                }
+                (res, tasks, observer)
+            })
+        }
+
+        // Assert the single enqueued task is an error reply carrying `errno`
+        // (metrics-enabled path builds a `RequestReply { status: Error, errno }`).
+        fn assert_single_error_reply(tasks: &[FuseTask]) {
+            use crate::fuse_metrics::FuseReqStatus;
+            assert_eq!(
+                tasks.len(),
+                1,
+                "pre-dispatch error enqueues exactly one error reply"
+            );
+            match &tasks[0] {
+                FuseTask::RequestReply { status, errno, .. } => {
+                    assert_eq!(*status, FuseReqStatus::Error, "error frame, not success");
+                    assert_eq!(*errno, ERRNO, "error reply carries the pre-dispatch errno");
+                }
+                FuseTask::NotifyReply { .. } => panic!("expected RequestReply, got NotifyReply"),
+                FuseTask::Reply(_) => panic!("expected RequestReply, got legacy Reply"),
+            }
+        }
+
+        // Assert the shared slot finished exactly once and the active guard was taken
+        // (moved onto the reply task) — i.e. no double-finish, no guard leak.
+        fn assert_finished_once(observer: &FuseResponse) {
+            let slot = observer.metrics.as_ref().unwrap().lock();
+            assert!(slot.finished, "shared slot finished exactly once");
+            assert!(
+                slot.active.is_none(),
+                "active guard was taken (moved onto the reply task), not leaked"
+            );
+        }
+
+        // One test per stream family. Each proves: the dispatch returns Ok (the error
+        // was DELIVERED as an error reply frame, not propagated as a Rust Err — the
+        // `err_rep.send_rep` fallback succeeded), exactly one error reply carrying
+        // EBADF was enqueued, and the shared slot finished exactly once.
+        macro_rules! pre_dispatch_error_test {
+            ($name:ident, $req:ident, $unique:expr) => {
+                #[test]
+                fn $name() {
+                    let fs = Arc::new(PreDispatchErrFs);
+                    let (res, tasks, observer) = dispatch_and_collect(fs, true, $req($unique));
+                    assert!(
+                        res.is_ok(),
+                        "pre-dispatch error is delivered as a reply frame; dispatch returns Ok"
+                    );
+                    assert_single_error_reply(&tasks);
+                    assert_finished_once(&observer);
+                }
+            };
+        }
+
+        pre_dispatch_error_test!(read_pre_dispatch_error_replies_once, read_request, 9001);
+        pre_dispatch_error_test!(write_pre_dispatch_error_replies_once, write_request, 9002);
+        pre_dispatch_error_test!(flush_pre_dispatch_error_replies_once, flush_request, 9003);
+        pre_dispatch_error_test!(
+            release_pre_dispatch_error_replies_once,
+            release_request,
+            9004
+        );
+        pre_dispatch_error_test!(fsync_pre_dispatch_error_replies_once, fsync_request, 9005);
+
+        // The metrics-disabled path enqueues the SAME single error reply, as the
+        // legacy `FuseTask::Reply` variant (no ctx → `send_stream_dispatch` derives
+        // `metrics_enabled=false` from `rep.metrics.is_none()`). Guards the disabled
+        // wiring: a pre-dispatch error must still reply exactly once.
+        #[test]
+        fn disabled_pre_dispatch_error_replies_once() {
+            let fs = Arc::new(PreDispatchErrFs);
+            let (res, tasks, _observer) = dispatch_and_collect(fs, false, read_request(9006));
+            assert!(
+                res.is_ok(),
+                "disabled path also delivers the error as a reply"
+            );
+            assert_eq!(
+                tasks.len(),
+                1,
+                "exactly one error reply on the disabled path"
+            );
+            // Legacy Reply variant AND the same errno on the wire. The FUSE error
+            // frame encodes the errno negated (`ResponseData::create`: header.error =
+            // -errno), so a pre-dispatch EBADF surfaces as `-EBADF` — matching the
+            // enabled path's `errno == EBADF` check, just read off the raw frame.
+            match &tasks[0] {
+                FuseTask::Reply(d) => assert_eq!(
+                    d.header.error, -ERRNO,
+                    "disabled path propagates the pre-dispatch errno on the wire"
+                ),
+                FuseTask::RequestReply { .. } => {
+                    panic!("disabled path must use the legacy Reply variant, got RequestReply")
+                }
+                FuseTask::NotifyReply { .. } => {
+                    panic!("disabled path must use the legacy Reply variant, got NotifyReply")
+                }
+            }
+        }
+
+        // The double-reply guard makes the `err_rep` fallback safe END TO END: if a
+        // stream op BOTH replies (via the original `rep`) AND then returns Err, the
+        // fallback `if res.is_err() { err_rep.send_rep(res) }` is a no-op — the kernel
+        // gets exactly one reply, not two. This is the "Verified nuance" #1089 relies
+        // on. Unlike the generic slot-guard tests in `fuse_response.rs` (`t13_*`), this
+        // drives the real `send_stream_dispatch` seam via `dispatch_and_collect` with a
+        // mock that replies-then-errors, so it proves the dispatch fallback itself
+        // cannot double-reply — not just that the shared slot guard works in isolation.
+        //
+        // Release-only: a genuine double reply trips `commit_reply_task`'s
+        // `debug_assert!(!finished)` in debug builds (see `double_reply_panics_in_debug`
+        // in fuse_response.rs); the release behaviour is the safe warn + no-op asserted
+        // here.
+        #[test]
+        #[cfg(not(debug_assertions))]
+        fn err_rep_fallback_after_a_reply_is_noop() {
+            let fs = Arc::new(ReplyThenErrFs);
+            let (res, tasks, observer) = dispatch_and_collect(fs, true, read_request(9007));
+            // The op replied successfully, so the dispatch returns Ok even though the
+            // op body returned Err: the fallback's `send_rep` on the already-finished
+            // shared slot is a no-op that returns Ok.
+            assert!(
+                res.is_ok(),
+                "reply-then-error: the op already answered; dispatch returns Ok"
+            );
+            // Exactly ONE task on the wire — the success reply from the op body. The
+            // `err_rep` fallback did NOT enqueue a second (error) reply.
+            assert_eq!(
+                tasks.len(),
+                1,
+                "reply-then-error enqueues exactly one reply; the err_rep fallback is a no-op"
+            );
+            assert!(
+                matches!(tasks[0], FuseTask::RequestReply { .. }),
+                "the single reply is the op's own success reply"
+            );
+            // Shared slot finished exactly once (the fallback did not double-finish).
+            assert_finished_once(&observer);
+        }
+    }
 }
