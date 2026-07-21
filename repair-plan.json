@@ -1,0 +1,29 @@
+{
+  "issue": "CurvineIO/curvine#1207",
+  "multica_issue": "CUR-61",
+  "fingerprint": "sha256:15fb19075be2d2fe6df145554fc1c3d1453d5a79ff97ee56eaa5b0ca69fe94bb",
+  "head_sha": "ea9978a4b77ead56a2ea59b41cd05ef66cbbda41",
+  "root_cause_hypothesis": "Under nextest load, the 2-master test cluster loses raft quorum (`quorum is not active`). A subsequent snapshot apply restores from an empty checkpoint (checkpoint_size=0, create_tree files=0), wiping metadata so FileStatus(/repl_test_3.dat) returns FileNotFound. Isolated runs pass; the wipe—not replication itself—is the failure mode.",
+  "affected_modules": [
+    "curvine-server/src/master/journal/journal_loader.rs"
+  ],
+  "planned_changes": [
+    "Before fs_dir.restore in apply_snapshot0, compute actual checkpoint dir size (independent of log level).",
+    "If the checkpoint is empty and the live filesystem already has files, refuse the apply instead of wiping metadata."
+  ],
+  "not_goals": [
+    "Do not change replication manager job scheduling.",
+    "Do not rewrite raft election/quorum timeouts in this PR.",
+    "Do not weaken legitimate format/empty-cluster bootstrap (still allow empty apply when live FS has no files)."
+  ],
+  "verification_plan": [
+    "cargo test -p curvine-tests --test replication_test test_replication_with_simulated_worker_failure",
+    "cargo test -p curvine-server --test journal_test (snapshot-related if present)",
+    "Unit-level coverage via journal_loader refusal path if testable"
+  ],
+  "estimated_non_generated_source_line_delta": 40,
+  "risk": {
+    "level": "medium",
+    "rationale": "Changes HA snapshot apply safety. Rejecting a bad empty snapshot is safer than wiping production metadata, but a node may remain on older FSM state until a valid snapshot/log catch-up; needs harness daily rerun."
+  }
+}
