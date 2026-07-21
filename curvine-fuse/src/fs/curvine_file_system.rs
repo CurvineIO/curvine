@@ -185,6 +185,12 @@ impl CurvineFileSystem {
         &self.state
     }
 
+    fn retain_first_error(first: &mut FuseResult<()>, next: FuseResult<()>) {
+        if first.is_ok() {
+            *first = next;
+        }
+    }
+
     fn to_file_lock(&self, arg: &fuse_lk_in) -> FileLock {
         let client_id = self.fs.cv().fs_context().clone_client_name();
         FileLock {
@@ -216,7 +222,12 @@ impl CurvineFileSystem {
                 lock.end = u64::MAX;
             }
 
-            self.fs.set_lock(&path, lock).await?;
+            if let Err(e) = self.fs.set_lock(&path, lock).await {
+                // Preserve the owner locally when the backend unlock fails so a
+                // retained handle can retry the cleanup.
+                handler.add_lock(flags, owner_id);
+                return Err(e.into());
+            }
         }
 
         Ok(())
@@ -1086,31 +1097,59 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path(ino)?;
         let _guard = self.state.lock_path(&path).await;
 
-        let handle = self.state.release_handle(ino, op.arg.fh).await?;
+        let (handle, mut release_result) = self.state.release_handle(ino, op.arg.fh).await?;
 
         if handle.has_writer() {
             self.state
                 .invalid_cache(op.header.nodeid, None, INVAL_REASON_RELEASE);
         }
 
-        let unlock_result = self
-            .fs_unlock(&handle, LockFlags::Flock)
-            .await
-            .and(self.fs_unlock(&handle, LockFlags::Plock).await);
-        unlock_result?;
-
-        if self.state.deferred_delete_ready(ino).await? {
-            debug!(
-                "release ino={}: no more open handles, executing delayed deletion of {}",
-                ino, path
+        let flock_result = self.fs_unlock(&handle, LockFlags::Flock).await;
+        if let Err(e) = &flock_result {
+            warn!(
+                "failed to release flock for ino={}, path={}: {}",
+                ino, path, e
             );
-            if let Err(e) = self.fs.delete(&path, false).await {
-                warn!("failed to delete {} after last handle closed: {}", path, e);
+        }
+        Self::retain_first_error(&mut release_result, flock_result);
+
+        let plock_result = self.fs_unlock(&handle, LockFlags::Plock).await;
+        if let Err(e) = &plock_result {
+            warn!(
+                "failed to release plock for ino={}, path={}: {}",
+                ino, path, e
+            );
+        }
+        Self::retain_first_error(&mut release_result, plock_result);
+
+        match self.state.deferred_delete_ready(ino).await {
+            Ok(true) => {
+                debug!(
+                    "release ino={}: no more open handles, executing delayed deletion of {}",
+                    ino, path
+                );
+                let delete_result = self
+                    .state
+                    .complete_deferred_delete(ino, self.fs.delete(&path, false).await);
+                if let Err(e) = &delete_result {
+                    warn!(
+                        "failed to delete {} after last handle closed; retaining pending delete: {}",
+                        path, e
+                    );
+                }
+                Self::retain_first_error(&mut release_result, delete_result);
             }
-            self.state.clear_mark_delete(ino)?;
+            Ok(false) => {}
+            Err(e) => {
+                warn!(
+                    "failed to evaluate deferred delete for ino={}, path={}: {}",
+                    ino, path, e
+                );
+                Self::retain_first_error(&mut release_result, Err(e));
+            }
         }
 
-        reply.send_rep::<(), FuseError>(Ok(())).await?;
+        reply.send_rep(release_result).await?;
         Ok(())
     }
 
@@ -1295,7 +1334,8 @@ impl fs::FileSystem for CurvineFileSystem {
                 name: op.name,
             };
             let res = self.create(op).await?;
-            let _ = self.state.release_handle(res.0.nodeid, res.1.fh).await?;
+            let (_, close_result) = self.state.release_handle(res.0.nodeid, res.1.fh).await?;
+            close_result?;
             let out = fuse_entry_out {
                 nodeid: res.0.nodeid,
                 generation: res.0.generation,

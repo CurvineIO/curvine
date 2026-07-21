@@ -573,7 +573,11 @@ impl NodeState {
         Self::remove_file_handle_locked(&mut lock, ino, fh)
     }
 
-    pub async fn release_handle(&self, ino: u64, fh: u64) -> FuseResult<Arc<FileHandle>> {
+    pub async fn release_handle(
+        &self,
+        ino: u64,
+        fh: u64,
+    ) -> FuseResult<(Arc<FileHandle>, FuseResult<()>)> {
         // Find the handle without removing it yet.  The handle stays in
         // self.handles while complete()/flush() runs so that
         // has_open_handles() keeps returning true during the commit —
@@ -581,29 +585,33 @@ impl NodeState {
         // file before the data upload finishes.
         let handle = self.find_handle(ino, fh)?;
 
-        let result: FuseResult<()> = match handle.as_ref() {
+        let close_result: FuseResult<()> = match handle.as_ref() {
             FileHandle::Backend(_) if handle.has_writer() => {
-                let (released, res) = self
-                    .writers
-                    .release(handle.ino(), async { handle.complete(None).await })
-                    .await;
-
-                if !released {
-                    handle.flush(None).await
-                } else {
-                    res
-                }
+                let cleanup_handle = handle.clone();
+                self.writers
+                    .release_with_cleanup(handle.ino(), move |last| async move {
+                        if last {
+                            cleanup_handle.complete(None).await
+                        } else {
+                            cleanup_handle.flush(None).await
+                        }
+                    })
+                    .await
+                    .map(|_| ())
             }
 
             _ => Ok(()),
         };
 
-        // Remove the handle *after* complete/flush has finished so that the
-        // file is not prematurely deleted while the commit is still running.
-        let _ = self.remove_handle(ino, fh);
+        // A failed close keeps both the handle and its shared-writer reference
+        // so cleanup state is not silently discarded. FUSE normally sends
+        // RELEASE only once; automatic retry of retained state is tracked by
+        // #1221.
+        if close_result.is_ok() {
+            let _ = self.remove_handle(ino, fh);
+        }
 
-        result?;
-        Ok(handle)
+        Ok((handle, close_result))
     }
 
     pub fn has_open_handles(&self, ino: u64) -> bool {
@@ -617,6 +625,19 @@ impl NodeState {
 
     pub fn clear_mark_delete(&self, ino: u64) -> FuseResult<()> {
         self.dir_write().clear_mark_delete(ino)
+    }
+
+    pub fn complete_deferred_delete(
+        &self,
+        ino: u64,
+        delete_result: Result<(), FsError>,
+    ) -> FuseResult<()> {
+        // Keep the mark observable after failure. The background retry needed
+        // to reclaim it without another FUSE request is tracked by #1221.
+        match delete_result {
+            Ok(()) | Err(FsError::FileNotFound(_)) => self.clear_mark_delete(ino),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub async fn fs_unlink(&self, parent: u64, name: &str) -> FuseResult<()> {
@@ -1220,9 +1241,11 @@ mod test {
     use crate::fs::state::file_handle::FileHandle;
     use crate::fs::state::{DirHandle, NodeState};
     use crate::fs::FuseWriter;
+    use crate::{FuseError, FUSE_ROOT_ID};
     use bytes::Bytes;
     use curvine_client::unified::{UnifiedFileSystem, UnifiedWriter};
     use curvine_common::conf::ClusterConf;
+    use curvine_common::error::FsError;
     use curvine_common::fs::local::LocalWriter;
     use curvine_common::fs::{ListStream, Path, StateReader, StateWriter, Writer};
     use curvine_common::state::FileStatus;
@@ -1448,6 +1471,81 @@ mod test {
                 result.is_err(),
                 "a file-handle persist failure must fail the whole state persist"
             );
+        });
+    }
+
+    #[test]
+    fn deferred_delete_error_retains_mark_until_success_or_not_found() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+        let ino = {
+            let mut dir = state.dir_write();
+            let status = FileStatus::with_name(123, "pending".to_string(), false);
+            let ino = dir.lookup(FUSE_ROOT_ID, "pending", status).unwrap().ino;
+            dir.unlink(FUSE_ROOT_ID, "pending", true).unwrap();
+            ino
+        };
+
+        assert!(state.dir_read().pending_delete(ino));
+        assert!(state
+            .complete_deferred_delete(ino, Err(FsError::common("delete failed")))
+            .is_err());
+        assert!(state.dir_read().pending_delete(ino));
+
+        state
+            .complete_deferred_delete(ino, Err(FsError::file_not_found("/pending")))
+            .unwrap();
+        assert!(!state.dir_read().pending_delete(ino));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn release_handle_failure_retains_handle_and_writer_for_retry() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let task_rt = rt.clone();
+
+        rt.block_on(async move {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), task_rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+
+            let full_path = Path::from_str("/dev/full").unwrap();
+            let local_writer = LocalWriter::new(&full_path, 1).unwrap();
+            let status = local_writer.status().clone();
+            let fuse_writer = Arc::new(FuseWriter::new(
+                &state.conf,
+                task_rt,
+                UnifiedWriter::Local(local_writer),
+            ));
+            state
+                .writers
+                .insert::<FuseError>(1, fuse_writer.clone())
+                .await
+                .unwrap();
+            let handle = state
+                .insert_handle_with_writer(1, None, Some(fuse_writer.clone()), status)
+                .await;
+            fuse_writer
+                .write(0, Bytes::from_static(b"x"), None)
+                .await
+                .unwrap();
+
+            let (_, first_result) = state.release_handle(1, handle.fh()).await.unwrap();
+            assert!(first_result.is_err());
+            assert!(state.find_handle(1, handle.fh()).is_ok());
+            assert!(Arc::ptr_eq(
+                &state.find_writer(1).await.unwrap(),
+                &fuse_writer
+            ));
+
+            let (_, retry_result) = state.release_handle(1, handle.fh()).await.unwrap();
+            assert!(retry_result.is_err());
+            assert!(state.find_handle(1, handle.fh()).is_ok());
+            assert!(Arc::ptr_eq(
+                &state.find_writer(1).await.unwrap(),
+                &fuse_writer
+            ));
         });
     }
 }
