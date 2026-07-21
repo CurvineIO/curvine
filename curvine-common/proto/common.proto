@@ -163,6 +163,7 @@ message WorkerInfoProto {
     required uint64 last_update = 6;
     map<string, StorageInfoProto> storage_map = 7;
     required int64 reserved_bytes = 8 [default = 0];
+    optional uint32 weight = 9 [default = 1];
 }
 
 message FileAllocOptsProto {

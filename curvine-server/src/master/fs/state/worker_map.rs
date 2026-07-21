@@ -56,12 +56,17 @@ impl WorkerMap {
         Ok(())
     }
 
-    pub fn insert(&mut self, addr: WorkerAddress, storages: Vec<StorageInfo>) -> FsResult<()> {
+    pub fn insert(
+        &mut self,
+        addr: WorkerAddress,
+        weight: u32,
+        storages: Vec<StorageInfo>,
+    ) -> FsResult<()> {
         self.ensure_worker_id_addr(&addr)?;
 
         // Register the worker and update the storage information.
         // @todo Heartbeat may be too simple and directly covers historical data.
-        let mut info = WorkerInfo::new(addr);
+        let mut info = WorkerInfo::new(addr, weight);
         let worker_id = info.worker_id();
         for item in storages {
             info.add_storage(item);

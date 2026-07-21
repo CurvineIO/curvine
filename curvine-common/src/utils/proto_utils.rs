@@ -332,6 +332,7 @@ impl ProtoUtils {
             non_fs_used: src.non_fs_used,
             last_update: src.last_update,
             reserved_bytes: src.reserved_bytes,
+            weight: Some(src.weight),
             storage_map: Default::default(),
         };
 
@@ -372,6 +373,7 @@ impl ProtoUtils {
                 fs_used: info.fs_used,
                 non_fs_used: info.non_fs_used,
                 reserved_bytes: info.reserved_bytes,
+                weight: info.weight.unwrap_or_else(WorkerInfo::default_weight),
                 ..Default::default()
             };
             for (k, v) in info.storage_map {
