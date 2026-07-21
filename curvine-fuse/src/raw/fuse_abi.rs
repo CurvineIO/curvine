@@ -234,14 +234,13 @@ pub struct fuse_getxattr_in {
     pub padding: u32,
 }
 
+/// The 8-byte compatibility form used unless `FUSE_SETXATTR_EXT` is negotiated.
+/// Curvine's INIT capability allowlist does not advertise that extension.
 #[repr(C)]
 #[derive(Debug, Default)]
 pub struct fuse_setxattr_in {
     pub size: u32,
     pub flags: u32,
-    //maybe different in version
-    pub setxattr_flags: u32,
-    pub padding: u32,
 }
 
 #[allow(non_camel_case_types)]

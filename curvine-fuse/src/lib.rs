@@ -38,7 +38,7 @@ pub mod fuse_metrics;
 pub use self::fuse_metrics::FuseMetrics;
 
 mod fuse_utils;
-pub use self::fuse_utils::FuseUtils;
+pub use self::fuse_utils::{FuseUtils, XattrOp};
 
 pub type FuseResult<T> = Result<T, FuseError>;
 
