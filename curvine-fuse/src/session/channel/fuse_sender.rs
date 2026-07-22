@@ -20,6 +20,7 @@ use crate::fuse_metrics::{
 use crate::session::{FuseTask, ResponseData};
 use crate::FuseResult;
 use log::{info, warn};
+use orpc::common::Gauge;
 use orpc::io::IOResult;
 use orpc::runtime::Runtime;
 use orpc::sync::channel::AsyncReceiver;
@@ -43,9 +44,15 @@ pub struct FuseSender<T> {
     receiver: AsyncReceiver<FuseTask>,
     pipe2: Option<Pipe2>,
     debug: bool,
+    /// Per-sender `sender_last_progress_unixtime` child gauge, fetched once at
+    /// construction (no per-reply label lookup). `None` when metrics are
+    /// disabled. Set after every successful reply write; a growing scrape-side
+    /// age on one sender localizes a stalled reply sender (issue #1215).
+    progress: Option<Gauge>,
 }
 
 impl<T: FileSystem> FuseSender<T> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         fs: Arc<T>,
         rt: Arc<Runtime>,
@@ -54,9 +61,16 @@ impl<T: FileSystem> FuseSender<T> {
         buf_size: usize,
         debug: bool,
         enable_splice: bool,
+        idx: usize,
+        metrics_enabled: bool,
     ) -> IOResult<Self> {
         let pipe2 = if enable_splice {
             Some(Pipe2::new(PipeFd::new(buf_size, false, false)?)?)
+        } else {
+            None
+        };
+        let progress = if metrics_enabled {
+            Some(FuseMetrics::get().sender_progress_gauge(idx))
         } else {
             None
         };
@@ -67,6 +81,7 @@ impl<T: FileSystem> FuseSender<T> {
             receiver,
             pipe2,
             debug,
+            progress,
         };
 
         Ok(fuse_rx)
@@ -147,6 +162,17 @@ impl<T: FileSystem> FuseSender<T> {
 
                     // Finish point: drop the in-flight guard after the write.
                     drop(active);
+
+                    // Observability (#1215): record sender liveness on a
+                    // successful delivery. A stalled sender stops advancing this
+                    // timestamp while siblings keep refreshing, localizing the
+                    // stall at scrape time. Not recorded on a failed write (the
+                    // sender is still alive; the failure has its own metric).
+                    if matches!(write, WriteOutcome::Success) {
+                        if let Some(g) = &self.progress {
+                            FuseMetrics::record_sender_progress(g);
+                        }
+                    }
                 }
 
                 // A kernel notification: same splice, no request guard/finish.
@@ -163,7 +189,13 @@ impl<T: FileSystem> FuseSender<T> {
                     let id = data.header.unique;
                     let metrics = FuseMetrics::get();
                     match self.send(data).await {
-                        Ok(()) => metrics.record_notify_result(code, NOTIFY_SUCCESS),
+                        Ok(()) => {
+                            metrics.record_notify_result(code, NOTIFY_SUCCESS);
+                            // Same liveness signal as the request path (#1215).
+                            if let Some(g) = &self.progress {
+                                FuseMetrics::record_sender_progress(g);
+                            }
+                        }
                         Err(e) => {
                             if e.raw_error().raw_os_error() != Some(libc::ENOENT) {
                                 warn!("error send notify {}: {}", id, e);

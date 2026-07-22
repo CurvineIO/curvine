@@ -48,7 +48,7 @@ impl<T: FileSystem> FuseChannel<T> {
         let mut receivers = Vec::with_capacity(tasks_per_mnt);
         let mut senders = Vec::with_capacity(tasks_per_mnt);
         let pending_requests = Arc::new(FastDashMap::default());
-        for _ in 0..tasks_per_mnt {
+        for idx in 0..tasks_per_mnt {
             let (tx, rx) = AsyncChannel::new(conf.fuse_channel_size).split();
             let fd = mnt.create_async_task_fd(conf.clone_fd)?;
 
@@ -60,6 +60,8 @@ impl<T: FileSystem> FuseChannel<T> {
                 buf_size,
                 conf.debug,
                 conf.enable_splice,
+                idx,
+                conf.metrics_enabled,
             )?;
 
             let receiver = FuseReceiver::new(

@@ -17,7 +17,9 @@ use std::time::Instant;
 use log::warn;
 use once_cell::sync::OnceCell;
 
-use orpc::common::{Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, Metrics as m};
+use orpc::common::{
+    Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, LocalTime, Metrics as m,
+};
 use orpc::CommonResult;
 
 use crate::fuse_error::errno_label;
@@ -332,6 +334,15 @@ pub struct FuseMetrics {
     /// created at enqueue and dropped when the sender dequeues (or when an
     /// un-received task is dropped). No `_total` suffix (it is a gauge).
     pub(crate) reply_queue_depth: Gauge,
+    /// Per-sender last-progress timestamp (Unix seconds), labelled by `sender`
+    /// (the sender's channel index). Set after every successful reply write in
+    /// `FuseSender`. This is the Prometheus "last success timestamp" pattern:
+    /// scrape-side `time() - curvine_fuse_sender_last_progress_unixtime` yields
+    /// the age since a sender last delivered a reply, so a single sender stalled
+    /// in `send().await` (issue #1215) shows a growing age while its siblings
+    /// keep refreshing — which a global gauge cannot distinguish. Observability
+    /// only; no automatic action is taken on a stale sender here.
+    pub(crate) sender_last_progress_unixtime: GaugeVec,
     /// SETLKW interruptible-request scope in flight (NOT a `pending_requests` map
     /// size): the guard spans the whole `dispatch_meta_interrupt` scope, so under
     /// reply-channel backpressure it can stay non-zero after the map entry is
@@ -664,6 +675,14 @@ impl FuseMetrics {
             reply_queue_depth: m::new_gauge(
                 "curvine_fuse_reply_queue_depth",
                 "Reply-channel backlog (tasks enqueued but not yet received by the sender)",
+            )?,
+            sender_last_progress_unixtime: m::new_gauge_vec(
+                "curvine_fuse_sender_last_progress_unixtime",
+                "Unix timestamp (seconds) of the last successful reply write per sender \
+                 (label sender=channel index). Use time() - <this> at scrape time to get \
+                 the age since a sender last delivered a reply; a growing age on one sender \
+                 while siblings refresh indicates a stalled reply sender (issue #1215)",
+                &["sender"],
             )?,
             setlkw_inflight: m::new_gauge(
                 "curvine_fuse_setlkw_inflight",
@@ -1411,6 +1430,26 @@ impl FuseMetrics {
     pub(crate) fn set_kernel_fd_health(&self, healthy: bool) {
         self.kernel_fd_health.set(if healthy { 1 } else { 0 });
     }
+
+    /// Return the per-sender child gauge for `sender_last_progress_unixtime`.
+    /// Fetched ONCE per sender (the child is an Arc-backed handle, cheap to hold
+    /// and cheap to `.set()`), so the hot reply path does no label lookup or
+    /// string allocation. Call `record_sender_progress` on the returned handle.
+    pub(crate) fn sender_progress_gauge(&self, idx: usize) -> Gauge {
+        self.sender_last_progress_unixtime
+            .with_label_values(&[&idx.to_string()])
+    }
+
+    /// Set a sender's last-progress gauge to now (Unix seconds). Deliberately
+    /// WALL-CLOCK (unlike `mono_now`'s monotonic duration source): this is a
+    /// timestamp meant to be compared against Prometheus `time()` at scrape,
+    /// which is also wall-clock — the two must share the same clock. An NTP step
+    /// only perturbs the derived age transiently, acceptable for a coarse
+    /// staleness signal.
+    pub(crate) fn record_sender_progress(gauge: &Gauge) {
+        let secs = (LocalTime::mills() / 1000) as i64;
+        gauge.set(secs);
+    }
 }
 
 /// Map a stream opcode to the read/write `io_type` for `io_dispatch_duration_us`,
@@ -1857,6 +1896,30 @@ mod tests {
         assert_send::<ActiveGuard>();
         assert_send::<HistogramTimer>();
         assert_send::<FuseReqLabels>();
+    }
+
+    // #1215 observability: record_sender_progress writes the current wall-clock
+    // Unix time (seconds) into the given gauge. Uses an INJECTED isolated gauge
+    // (not the process-global vec) so it is parallel-safe. Asserts the value is a
+    // plausible current Unix timestamp — i.e. the production mills()/1000 clock
+    // conversion actually lands in seconds, not millis.
+    #[test]
+    fn record_sender_progress_sets_current_unix_seconds() {
+        let g = m::new_gauge("test_sender_progress_gauge", "test").unwrap();
+        assert_eq!(g.get(), 0, "fresh gauge starts at 0");
+
+        let before = (LocalTime::mills() / 1000) as i64;
+        FuseMetrics::record_sender_progress(&g);
+        let after = (LocalTime::mills() / 1000) as i64;
+
+        let v = g.get();
+        assert!(
+            v >= before && v <= after,
+            "gauge {} must be a current Unix-second timestamp in [{}, {}]",
+            v,
+            before,
+            after
+        );
     }
 
     #[test]
