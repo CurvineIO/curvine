@@ -14,11 +14,14 @@
 
 use crate::block::BlockWriter;
 use crate::file::{FsClient, FsContext};
+use curvine_common::error::FsError;
 use curvine_common::fs::Path;
-use curvine_common::state::{FileAllocOpts, FileBlocks, FileStatus, WriteFileBlocks};
+use curvine_common::state::{CommitBlock, FileAllocOpts, FileBlocks, FileStatus, WriteFileBlocks};
 use curvine_common::FsResult;
 use fxhash::FxHasher;
 use linked_hash_map::LinkedHashMap;
+use log::warn;
+use orpc::common::FastHashSet;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::DataSlice;
 use orpc::{err_box, try_option_mut};
@@ -37,6 +40,12 @@ pub struct FsWriterBase {
 
     cache_limit: usize,
     cache_writers: LinkedHashMap<i64, BlockWriter, BuildHasherDefault<FxHasher>>,
+    /// Blocks whose contents must not be aborted during abnormal cleanup.
+    ///
+    /// This includes blocks already visible in the file when the writer was
+    /// opened, blocks published by a successful flush, and blocks finalized on
+    /// workers but still waiting for their commit metadata to reach the master.
+    durable_blocks: FastHashSet<i64>,
 }
 
 impl FsWriterBase {
@@ -44,6 +53,14 @@ impl FsWriterBase {
         let fs_client = FsClient::new(fs_context.clone());
         let cache_limit = fs_context.conf.client.max_cache_block_handles;
         let len = status.len;
+        let durable_blocks = FastHashSet::with_vec(
+            status
+                .block_locs
+                .iter()
+                .filter(|block| block.block.len > 0 && !block.locs.is_empty())
+                .map(|block| block.block.id)
+                .collect(),
+        );
         let file_blocks = WriteFileBlocks::new(status);
 
         let cache_writers = LinkedHashMap::with_capacity_and_hasher(
@@ -60,6 +77,7 @@ impl FsWriterBase {
             cur_writer: None,
             cache_limit,
             cache_writers,
+            durable_blocks,
         }
     }
 
@@ -164,11 +182,118 @@ impl FsWriterBase {
         Ok(())
     }
 
+    fn add_durable_commit(&mut self, commit: CommitBlock) -> FsResult<()> {
+        let block_id = commit.block_id;
+        self.file_blocks.add_commit(commit)?;
+        self.durable_blocks.insert(block_id);
+        Ok(())
+    }
+
+    fn restore_commit_blocks(&mut self, commits: &[CommitBlock]) {
+        for commit in commits {
+            if let Err(e) = self.add_durable_commit(commit.clone()) {
+                warn!(
+                    "failed to restore pending commit for block {}: {}",
+                    commit.block_id, e
+                );
+            }
+        }
+    }
+
+    fn committed_len(&self) -> i64 {
+        self.file_blocks
+            .block_locs
+            .iter()
+            .map(|block| block.block.len)
+            .sum()
+    }
+
+    /// Clean up every backend write session without invalidating durable data.
+    ///
+    /// A brand-new block that has never been flushed/finalized can be aborted.
+    /// Once a block was published by flush, existed before this writer, or was
+    /// finalized on a worker, aborting it would delete data the master may
+    /// already reference. Such a block is finalized instead, and any pending
+    /// commit metadata is submitted to the master with `only_flush=true`.
+    /// Cleanup remains best effort: preserve the first error while attempting
+    /// all remaining writers and the metadata submission.
+    pub async fn cancel(&mut self) -> FsResult<()> {
+        let mut first_error: Option<FsError> = None;
+        let mut cleanup_commits = Vec::new();
+
+        if let Some(mut writer) = self.cur_writer.take() {
+            if self.durable_blocks.contains(&writer.block_id()) {
+                match writer.complete().await {
+                    Ok(commit) => cleanup_commits.push(commit),
+                    Err(e) => first_error = Some(e),
+                }
+            } else if let Err(e) = writer.cancel().await {
+                first_error = Some(e);
+            }
+        }
+
+        for (_, writer) in self.cache_writers.iter_mut() {
+            if self.durable_blocks.contains(&writer.block_id()) {
+                match writer.complete().await {
+                    Ok(commit) => cleanup_commits.push(commit),
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
+                }
+            } else if let Err(e) = writer.cancel().await {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+        self.cache_writers.clear();
+
+        for commit in cleanup_commits {
+            if let Err(e) = self.add_durable_commit(commit) {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+
+        let commit_blocks = self.file_blocks.take_commit_blocks();
+        if !commit_blocks.is_empty() {
+            let committed_len = self.committed_len();
+            let result = self
+                .fs_client
+                .complete_file_by_id(
+                    &self.path,
+                    self.file_blocks.status.id,
+                    committed_len,
+                    commit_blocks.clone(),
+                    true,
+                )
+                .await;
+            if let Err(e) = result {
+                // Retain the metadata in case the owner can retry cleanup. More
+                // importantly, never compensate an ambiguous master response by
+                // deleting blocks that may already have been published.
+                self.restore_commit_blocks(&commit_blocks);
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     async fn complete0(&mut self, only_flush: bool) -> FsResult<Option<FileBlocks>> {
         if let Some(writer) = self.cur_writer.take() {
             self.cache_writers.insert(writer.block_id(), writer);
         };
 
+        let mut writer_commits = Vec::with_capacity(self.cache_writers.len());
         for (_, writer) in self.cache_writers.iter_mut() {
             let commit_block = if only_flush {
                 writer.flush().await?;
@@ -177,23 +302,39 @@ impl FsWriterBase {
                 writer.complete().await?
             };
 
-            self.file_blocks.add_commit(commit_block)?;
+            writer_commits.push(commit_block);
+        }
+
+        for commit in writer_commits {
+            self.file_blocks.add_commit(commit)?;
         }
 
         if !only_flush {
             self.cache_writers.clear();
         }
 
-        let commits_blocks = self.file_blocks.take_commit_blocks();
-        self.fs_client
+        let commit_blocks = self.file_blocks.take_commit_blocks();
+        // From this point onward a request may have reached the master even if
+        // its response is lost. Treat every submitted block as durable before
+        // crossing that ambiguity boundary so later cleanup never aborts it.
+        for commit in &commit_blocks {
+            self.durable_blocks.insert(commit.block_id);
+        }
+
+        let result = self
+            .fs_client
             .complete_file_by_id(
                 &self.path,
                 self.file_blocks.status.id,
                 self.len,
-                commits_blocks,
+                commit_blocks.clone(),
                 only_flush,
             )
-            .await
+            .await;
+        if result.is_err() {
+            self.restore_commit_blocks(&commit_blocks);
+        }
+        result
     }
 
     async fn get_writer(&mut self) -> FsResult<&mut BlockWriter> {
@@ -243,16 +384,23 @@ impl FsWriterBase {
 
                         let commit_blocks = self.file_blocks.take_commit_blocks();
                         let last_block = self.file_blocks.last_block();
-                        let lb = self
+                        let add_result = self
                             .fs_client
                             .add_block_by_id(
                                 &self.path,
                                 self.file_blocks.status.id,
-                                commit_blocks,
+                                commit_blocks.clone(),
                                 self.len,
                                 last_block,
                             )
-                            .await?;
+                            .await;
+                        let lb = match add_result {
+                            Ok(block) => block,
+                            Err(e) => {
+                                self.restore_commit_blocks(&commit_blocks);
+                                return Err(e);
+                            }
+                        };
                         self.file_blocks.add_block(lb.clone())?;
                         let writer = BlockWriter::new(
                             self.fs_context.clone(),
@@ -307,13 +455,13 @@ impl FsWriterBase {
             if self.cache_writers.len() >= self.cache_limit {
                 if let Some((_, mut removed)) = self.cache_writers.pop_front() {
                     let commit_blocks = removed.complete().await?;
-                    self.file_blocks.add_commit(commit_blocks)?;
+                    self.add_durable_commit(commit_blocks)?;
                 }
             }
             self.cache_writers.insert(old.block_id(), old);
         } else {
             let commit_blocks = old.complete().await?;
-            self.file_blocks.add_commit(commit_blocks)?;
+            self.add_durable_commit(commit_blocks)?;
         }
 
         Ok(())
@@ -368,7 +516,7 @@ impl FsWriterBase {
                 let mut writer =
                     BlockWriter::new(self.fs_context.clone(), lb.clone(), 0, block_size).await?;
                 let commit_block = writer.complete().await?;
-                self.file_blocks.add_commit(commit_block)?;
+                self.add_durable_commit(commit_block)?;
             }
         }
 
@@ -376,6 +524,14 @@ impl FsWriterBase {
         self.pos = self.pos.min(len);
         self.len = len;
         self.file_blocks = file_blocks;
+        self.durable_blocks = FastHashSet::with_vec(
+            self.file_blocks
+                .block_locs
+                .iter()
+                .filter(|block| block.block.len > 0 && !block.locs.is_empty())
+                .map(|block| block.block.id)
+                .collect(),
+        );
 
         Ok(())
     }

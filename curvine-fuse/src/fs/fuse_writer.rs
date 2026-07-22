@@ -22,7 +22,7 @@ use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Writer};
 use curvine_common::state::{FileAllocOpts, FileStatus};
 use curvine_common::FsResult;
-use log::error;
+use log::{error, warn};
 use orpc::common::LocalTime;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
@@ -240,13 +240,71 @@ impl FuseWriter {
         self.len() == 0
     }
 
-    async fn writer_future(
-        mut writer: UnifiedWriter,
+    async fn writer_future<W: Writer>(
+        mut writer: W,
         mut req_receiver: AsyncReceiver<QueuedWriteTask>,
         file_len: Arc<AtomicLong>,
         file_mtime: Arc<AtomicLong>,
         path_type: &'static str,
         metrics_enabled: bool,
+    ) -> FsResult<()> {
+        let mut completed = false;
+        // Sticky once an operation may have made backend data durable or
+        // visible. Later writes do not clear it: aborting a shared block after
+        // an earlier fsync could delete the already-published prefix as well.
+        let mut preserve_on_exit = false;
+        let worker_result = Self::run_writer_tasks(
+            &mut writer,
+            &mut req_receiver,
+            &file_len,
+            &file_mtime,
+            path_type,
+            metrics_enabled,
+            &mut completed,
+            &mut preserve_on_exit,
+        )
+        .await;
+
+        if completed {
+            return worker_result;
+        }
+
+        // Before the first durability boundary, aborting is the right cleanup
+        // for a brand-new unfinished upload. After flush/complete/resize was
+        // attempted, the backend or master may already reference the data even
+        // when its response was lost. Finalize instead: cancellation could
+        // delete a block that a successful fsync already published.
+        let cleanup_result = if preserve_on_exit {
+            writer.complete().await
+        } else {
+            writer.cancel().await
+        };
+        match (worker_result, cleanup_result) {
+            (Err(worker_error), Err(cleanup_error)) => {
+                // Cleanup is best effort and must not hide the error that caused
+                // the worker to exit.
+                error!(
+                    "failed to clean up writer after worker error: {}",
+                    cleanup_error
+                );
+                Err(worker_error)
+            }
+            (Err(worker_error), Ok(())) => Err(worker_error),
+            (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_writer_tasks<W: Writer>(
+        writer: &mut W,
+        req_receiver: &mut AsyncReceiver<QueuedWriteTask>,
+        file_len: &AtomicLong,
+        file_mtime: &AtomicLong,
+        path_type: &'static str,
+        metrics_enabled: bool,
+        completed: &mut bool,
+        preserve_on_exit: &mut bool,
     ) -> FsResult<()> {
         while let Some(mut queued) = req_receiver.recv().await {
             // Dequeue point: drop the queue guard FIRST (before any backend work),
@@ -255,6 +313,10 @@ impl FuseWriter {
             mark_dequeued(&mut queued.queue_guard);
             match queued.task {
                 WriteTask::Write(off, data, reply) => {
+                    // A new write makes a prior complete no longer sufficient for
+                    // this worker's final state. Set this before backend IO so a
+                    // partial failed write is also cancelled on exit.
+                    *completed = false;
                     let len = data.len();
                     // Phase 2b: observe the write backend IO (io_type=write). The
                     // inflight guard wraps ONLY the `fuse_write` call; dropped
@@ -297,13 +359,22 @@ impl FuseWriter {
                     }
 
                     if let Some(reply) = reply {
-                        reply.send_rep(res).await?;
+                        if let Err(e) = reply.send_rep(res).await {
+                            // The backend operation is already finished. A reply
+                            // enqueue failure means that this request's receiver
+                            // has gone away; it must not terminate the long-lived
+                            // writer worker and break later requests on the handle.
+                            warn!("failed to send FUSE write reply: {}", e);
+                        }
                     } else {
                         res?;
                     }
                 }
 
                 WriteTask::Flush(tx, reply) => {
+                    // Set this before the await because a lost/failed response
+                    // cannot prove that the master did not publish the flush.
+                    *preserve_on_exit = true;
                     let res = writer.flush().await;
                     // Deliver the real backend result to the caller (tx) first,
                     // then the kernel reply. See `deliver_stream_result`
@@ -312,11 +383,15 @@ impl FuseWriter {
                 }
 
                 WriteTask::Complete(tx, reply) => {
+                    *preserve_on_exit = true;
                     let res = writer.complete().await;
+                    *completed = res.is_ok();
                     crate::fs::deliver_stream_result(res, tx, reply).await?;
                 }
 
                 WriteTask::Resize(tx, opts) => {
+                    *completed = false;
+                    *preserve_on_exit = true;
                     // A resize failure must propagate to the caller via `tx`
                     // rather than `?`-ing out of the worker (which would kill it
                     // and leave the caller hanging). No kernel reply on this path.
@@ -332,11 +407,269 @@ impl FuseWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::{mark_dequeued, QueuedWriteTask, WriteTask};
+    use super::{mark_dequeued, FuseWriter, QueuedWriteTask, WriteTask};
     use crate::fuse_metrics::ActiveGuard;
+    use bytes::{Bytes, BytesMut};
+    use curvine_common::error::FsError;
+    use curvine_common::fs::{Path, Writer};
+    use curvine_common::state::FileStatus;
     use curvine_common::FsResult;
     use orpc::common::Metrics as m;
     use orpc::sync::channel::{AsyncChannel, CallChannel};
+    use orpc::sync::AtomicLong;
+    use orpc::sys::DataSlice;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct TrackingWriter {
+        path: Path,
+        status: FileStatus,
+        pos: i64,
+        chunk: BytesMut,
+        cancel_count: Arc<AtomicUsize>,
+        complete_count: Arc<AtomicUsize>,
+        fail_write: bool,
+        fail_cancel: bool,
+    }
+
+    impl TrackingWriter {
+        fn new(cancel_count: Arc<AtomicUsize>, complete_count: Arc<AtomicUsize>) -> Self {
+            Self {
+                path: Path::from_str("/tmp/fuse-writer-lifecycle").unwrap(),
+                status: FileStatus::default(),
+                pos: 0,
+                chunk: BytesMut::new(),
+                cancel_count,
+                complete_count,
+                fail_write: false,
+                fail_cancel: false,
+            }
+        }
+    }
+
+    impl Writer for TrackingWriter {
+        fn status(&self) -> &FileStatus {
+            &self.status
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn pos(&self) -> i64 {
+            self.pos
+        }
+
+        fn pos_mut(&mut self) -> &mut i64 {
+            &mut self.pos
+        }
+
+        fn chunk_mut(&mut self) -> &mut BytesMut {
+            &mut self.chunk
+        }
+
+        fn chunk_size(&self) -> usize {
+            4096
+        }
+
+        async fn write_chunk(&mut self, chunk: DataSlice) -> FsResult<i64> {
+            if self.fail_write {
+                Err(FsError::common("injected backend write failure"))
+            } else {
+                Ok(chunk.len() as i64)
+            }
+        }
+
+        async fn flush(&mut self) -> FsResult<()> {
+            Ok(())
+        }
+
+        async fn complete(&mut self) -> FsResult<()> {
+            self.complete_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn cancel(&mut self) -> FsResult<()> {
+            self.cancel_count.fetch_add(1, Ordering::SeqCst);
+            if self.fail_cancel {
+                Err(FsError::common("injected cancellation failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn seek(&mut self, pos: i64) -> FsResult<()> {
+            self.pos = pos;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn abnormal_channel_close_cancels_backend_writer_once() {
+        let cancel_count = Arc::new(AtomicUsize::new(0));
+        let complete_count = Arc::new(AtomicUsize::new(0));
+        let writer = TrackingWriter::new(cancel_count.clone(), complete_count.clone());
+        let (sender, receiver) = AsyncChannel::new(1).split();
+        drop(sender);
+
+        FuseWriter::writer_future(
+            writer,
+            receiver,
+            Arc::new(AtomicLong::new(0)),
+            Arc::new(AtomicLong::new(0)),
+            "test",
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 1);
+        assert_eq!(complete_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn normal_complete_does_not_cancel_backend_writer() {
+        let cancel_count = Arc::new(AtomicUsize::new(0));
+        let complete_count = Arc::new(AtomicUsize::new(0));
+        let writer = TrackingWriter::new(cancel_count.clone(), complete_count.clone());
+        let (sender, receiver) = AsyncChannel::new(1).split();
+        let (result_tx, result_rx) = CallChannel::channel::<FsResult<()>>();
+        sender
+            .send(QueuedWriteTask {
+                task: WriteTask::Complete(result_tx, None),
+                queue_guard: None,
+            })
+            .await
+            .unwrap();
+        drop(sender);
+
+        FuseWriter::writer_future(
+            writer,
+            receiver,
+            Arc::new(AtomicLong::new(0)),
+            Arc::new(AtomicLong::new(0)),
+            "test",
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(result_rx.receive().await.unwrap().is_ok());
+        assert_eq!(complete_count.load(Ordering::SeqCst), 1);
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn successful_flush_is_finalized_instead_of_cancelled_on_channel_close() {
+        let cancel_count = Arc::new(AtomicUsize::new(0));
+        let complete_count = Arc::new(AtomicUsize::new(0));
+        let writer = TrackingWriter::new(cancel_count.clone(), complete_count.clone());
+        let (sender, receiver) = AsyncChannel::new(1).split();
+        let (result_tx, result_rx) = CallChannel::channel::<FsResult<()>>();
+        sender
+            .send(QueuedWriteTask {
+                task: WriteTask::Flush(result_tx, None),
+                queue_guard: None,
+            })
+            .await
+            .unwrap();
+        drop(sender);
+
+        FuseWriter::writer_future(
+            writer,
+            receiver,
+            Arc::new(AtomicLong::new(0)),
+            Arc::new(AtomicLong::new(0)),
+            "test",
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(result_rx.receive().await.unwrap().is_ok());
+        assert_eq!(complete_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            cancel_count.load(Ordering::SeqCst),
+            0,
+            "cancelling here could delete data published by the flush"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_after_flush_keeps_the_durable_cleanup_boundary() {
+        let cancel_count = Arc::new(AtomicUsize::new(0));
+        let complete_count = Arc::new(AtomicUsize::new(0));
+        let writer = TrackingWriter::new(cancel_count.clone(), complete_count.clone());
+        let (sender, receiver) = AsyncChannel::new(2).split();
+        let (result_tx, result_rx) = CallChannel::channel::<FsResult<()>>();
+        sender
+            .send(QueuedWriteTask {
+                task: WriteTask::Flush(result_tx, None),
+                queue_guard: None,
+            })
+            .await
+            .unwrap();
+        sender
+            .send(QueuedWriteTask {
+                task: WriteTask::Write(0, Bytes::from_static(b"later"), None),
+                queue_guard: None,
+            })
+            .await
+            .unwrap();
+        drop(sender);
+
+        FuseWriter::writer_future(
+            writer,
+            receiver,
+            Arc::new(AtomicLong::new(0)),
+            Arc::new(AtomicLong::new(0)),
+            "test",
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(result_rx.receive().await.unwrap().is_ok());
+        assert_eq!(complete_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            cancel_count.load(Ordering::SeqCst),
+            0,
+            "a later write must not make an earlier durable block abortable"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_failure_does_not_mask_worker_error() {
+        let cancel_count = Arc::new(AtomicUsize::new(0));
+        let complete_count = Arc::new(AtomicUsize::new(0));
+        let mut writer = TrackingWriter::new(cancel_count.clone(), complete_count);
+        writer.fail_write = true;
+        writer.fail_cancel = true;
+        let (sender, receiver) = AsyncChannel::new(1).split();
+        sender
+            .send(QueuedWriteTask {
+                task: WriteTask::Write(0, Bytes::from_static(b"data"), None),
+                queue_guard: None,
+            })
+            .await
+            .unwrap();
+        drop(sender);
+
+        let error = FuseWriter::writer_future(
+            writer,
+            receiver,
+            Arc::new(AtomicLong::new(0)),
+            Arc::new(AtomicLong::new(0)),
+            "test",
+            false,
+        )
+        .await
+        .expect_err("the backend write failure remains visible");
+
+        assert!(error.to_string().contains("injected backend write failure"));
+        assert!(!error.to_string().contains("injected cancellation failure"));
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 1);
+    }
 
     // Build a QueuedWriteTask carrying a queue guard backed by `gauge`. The wrapped
     // WriteTask is a Flush (it only needs a CallChannel sender, no FuseResponse), so
@@ -447,6 +780,7 @@ mod tests {
         };
         use crate::raw::fuse_abi::{fuse_in_header, fuse_write_in};
         use crate::session::{FuseResponse, FuseTask};
+        use bytes::Bytes;
         use curvine_client::unified::UnifiedWriter;
         use curvine_common::conf::FuseConf;
         use curvine_common::fs::local::LocalWriter;
@@ -470,6 +804,67 @@ mod tests {
                 active: Some(ActiveGuard::new(gauge)),
             };
             FuseResponse::new_reply(1, tx, false, Some(ctx))
+        }
+
+        fn closed_reply(unique: u64) -> FuseResponse {
+            let (tx, rx) = AsyncChannel::<FuseTask>::new(1).split();
+            drop(rx);
+            FuseResponse::new_reply(unique, tx, false, None)
+        }
+
+        #[test]
+        fn reply_send_error_does_not_kill_writer_worker() {
+            let rt = AsyncRuntime::single();
+            rt.block_on(async {
+                let path_buf = std::env::temp_dir().join(format!(
+                    "fw_reply_failure_{}_{:?}",
+                    std::process::id(),
+                    std::thread::current().id()
+                ));
+                let path = curvine_common::fs::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+
+                // This is a lifecycle test, not a metrics test. Keep it isolated
+                // from the process-global metric counters used by parallel tests.
+                let conf = FuseConf {
+                    metrics_enabled: false,
+                    ..Default::default()
+                };
+                let writer = UnifiedWriter::Local(LocalWriter::new(&path, 4096).unwrap());
+                let rt2 = Arc::new(AsyncRuntime::single());
+                let fuse_writer = FuseWriter::new(&conf, rt2.clone(), writer);
+                std::mem::forget(rt2);
+
+                // The first write succeeds in the backend, but its reply receiver
+                // is already closed. The following flush must still be handled by
+                // the same worker.
+                fuse_writer
+                    .write(0, Bytes::from_static(b"first"), Some(closed_reply(1)))
+                    .await
+                    .unwrap();
+                fuse_writer
+                    .flush(None)
+                    .await
+                    .expect("writer survives a write reply-send failure");
+
+                // Exercise the shared flush/complete result helper as well. Its
+                // internal completion arrives before this closed kernel reply;
+                // a later write and complete prove that the worker kept running.
+                fuse_writer
+                    .flush(Some(closed_reply(2)))
+                    .await
+                    .expect("flush caller receives the backend result");
+                fuse_writer
+                    .write(5, Bytes::from_static(b"second"), None)
+                    .await
+                    .unwrap();
+                fuse_writer
+                    .complete(None)
+                    .await
+                    .expect("writer survives a flush reply-send failure");
+
+                assert_eq!(std::fs::read(&path_buf).unwrap(), b"firstsecond");
+                let _ = std::fs::remove_file(&path_buf);
+            });
         }
 
         // A real FuseWriter over UnifiedWriter::Local drives the write task body via
