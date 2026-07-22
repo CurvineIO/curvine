@@ -1901,5 +1901,109 @@ mod tests {
                 result
             );
         }
+
+        // Multi-batch variant that exercises the `FuseDirentList` response-size
+        // cutoff path (reviewer request on PR #1236). The real
+        // `read_dir_common_inner` stops filling a response when
+        // `res.add_dirent(...)` returns false (kernel buffer full), pushes the
+        // rejected entry back, and only advances `index` for entries actually
+        // emitted — so the kernel resumes from the LAST EMITTED entry's cookie,
+        // not from the whole `get_batch` result. `max_emit_per_round` models that
+        // buffer limit: at most that many entries are handed to the kernel each
+        // round, the rest are dropped (as if pushed back), and the next request
+        // resumes from the last emitted cookie. This pins that `index + 1` still
+        // advances correctly when a listing is split across several responses.
+        fn replay_readdir_batched<F>(
+            names: &[&str],
+            cookie: F,
+            max_emit_per_round: usize,
+            max_rounds: usize,
+        ) -> Result<Vec<String>, String>
+        where
+            F: Fn(u64) -> u64,
+        {
+            assert!(max_emit_per_round >= 1, "must emit at least one per round");
+            let rt = AsyncRuntime::single();
+            rt.block_on(async {
+                let path = Path::from_str("/d").unwrap();
+                let mut seen = Vec::new();
+                let mut offset: u64 = 0;
+
+                for _ in 0..max_rounds {
+                    let handle =
+                        DirHandle::new(1, 1, &path, 1000, ListStream::from_vec(entries(names)));
+                    let batch = handle.get_batch(offset as usize).await.unwrap();
+                    if batch.is_empty() {
+                        return Ok(seen); // kernel sees 0 entries => readdir done
+                    }
+
+                    // Emit at most `max_emit_per_round` entries this round, mirroring
+                    // the response-buffer cutoff. `index` only advances for emitted
+                    // entries; the next offset is the last EMITTED entry's cookie.
+                    let mut index = offset;
+                    let mut last_cookie = offset;
+                    for st in batch.into_iter().take(max_emit_per_round) {
+                        seen.push(st.name.clone());
+                        last_cookie = cookie(index);
+                        index += 1;
+                    }
+                    offset = last_cookie;
+                }
+                Err(format!(
+                    "readdir did not terminate within {} rounds (offset stuck at {}, {} entries emitted)",
+                    max_rounds,
+                    offset,
+                    seen.len()
+                ))
+            })
+        }
+
+        // With the production cookie, a listing split across many small responses
+        // still enumerates every entry exactly once, in order, and terminates.
+        #[test]
+        fn production_cookie_terminates_across_multiple_response_buffers() {
+            let names = ["a", "b", "c", "d", "e", "f", "g"];
+            // Emit 2 per round => 4 rounds of data + 1 terminating empty round.
+            let seen = replay_readdir_batched(
+                &names,
+                super::CurvineFileSystem::readdir_next_cookie,
+                2,
+                100,
+            )
+            .expect("production cookie must terminate under a split response buffer");
+            assert_eq!(
+                seen,
+                names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "split-response readdir enumerates each entry once, in order, no repeats/gaps"
+            );
+        }
+
+        // Even down to a single entry per response (the harshest split), the
+        // production cookie advances correctly and terminates.
+        #[test]
+        fn production_cookie_terminates_with_single_entry_responses() {
+            let names = ["a", "b", "c"];
+            let seen = replay_readdir_batched(
+                &names,
+                super::CurvineFileSystem::readdir_next_cookie,
+                1,
+                100,
+            )
+            .expect("production cookie must terminate at one entry per response");
+            assert_eq!(seen, vec!["a", "b", "c"]);
+        }
+
+        // Discriminator for the split path: cookie=index loops forever here too,
+        // proving the multi-batch harness genuinely exercises the regression.
+        #[test]
+        fn prefix_cookie_loops_forever_under_split_response() {
+            let names = ["a", "b", "c", "d", "e", "f", "g"];
+            let result = replay_readdir_batched(&names, |index| index, 2, 100);
+            assert!(
+                result.is_err(),
+                "cookie=index must fail to terminate under split responses, got {:?}",
+                result
+            );
+        }
     }
 }
