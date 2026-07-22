@@ -151,6 +151,12 @@ impl FsWriterBase {
         Ok(())
     }
 
+    fn has_pending_blocks(&self) -> bool {
+        self.cur_writer.is_some()
+            || !self.cache_writers.is_empty()
+            || self.file_blocks.has_commit_blocks()
+    }
+
     // Write is completed, perform the following operations
     // 1. Submit the last block.
     pub async fn complete(&mut self) -> FsResult<()> {
@@ -334,8 +340,11 @@ impl FsWriterBase {
         opts.validate()?;
         let len = opts.len;
 
-        // Step 1: Submit all blocks before resize
-        if self.len > 0 {
+        // Step 1: Flush only when there are uncommitted block writers. A
+        // fallocate(2) extend on an open fd often follows fully committed
+        // writes; forcing complete() whenever len > 0 can surface EIO from a
+        // redundant metadata complete on an already-consistent file.
+        if self.has_pending_blocks() {
             self.complete().await?;
         }
 
