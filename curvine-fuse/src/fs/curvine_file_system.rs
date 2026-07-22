@@ -366,6 +366,15 @@ impl CurvineFileSystem {
         Ok((res, entries))
     }
 
+    /// Whether access(2) must enforce mode bits for the caller.
+    ///
+    /// Linux lets root bypass R_OK/W_OK checks, but still validates X_OK against
+    /// the file mode (see access(2)). Other FUSE ops keep the broader root bypass
+    /// in `check_permissions`.
+    fn posix_access_requires_mode_check(uid: u32, mask: u32) -> bool {
+        uid != 0 || (mask & libc::X_OK as u32) != 0
+    }
+
     async fn check_permissions(&self, header: &fuse_in_header, mask: u32) -> FuseResult<()> {
         if header.uid == 0 || !self.conf.check_permission {
             return Ok(());
@@ -396,7 +405,7 @@ impl CurvineFileSystem {
             file_uid, file_gid, header.uid, header.gid, status.mode, permission_bits, mask
         );
 
-        let has_permission = self.check_permission_mask(permission_bits, mask);
+        let has_permission = Self::permission_mask_allows(permission_bits, mask);
         debug!("Final access result: {}", has_permission);
         if has_permission {
             Ok(())
@@ -480,10 +489,10 @@ impl CurvineFileSystem {
     }
 
     /// Check if the permission bits satisfy the requested access mask
-    #[allow(unused)]
-    fn check_permission_mask(&self, permission_bits: u32, mask: u32) -> bool {
+    fn permission_mask_allows(permission_bits: u32, mask: u32) -> bool {
         #[cfg(not(target_os = "linux"))]
         {
+            let _ = (permission_bits, mask);
             true
         }
 
@@ -534,6 +543,11 @@ impl CurvineFileSystem {
 
             has_permission
         }
+    }
+
+    #[allow(unused)]
+    fn check_permission_mask(&self, permission_bits: u32, mask: u32) -> bool {
+        Self::permission_mask_allows(permission_bits, mask)
     }
 
     /// Negotiate init reply flags as an explicit allowlist, not a blind echo:
@@ -916,7 +930,14 @@ impl fs::FileSystem for CurvineFileSystem {
     }
 
     async fn access(&self, op: Access<'_>) -> FuseResult<()> {
-        self.check_permissions(op.header, op.arg.mask).await
+        if !self.conf.check_permission {
+            return Ok(());
+        }
+        if !Self::posix_access_requires_mode_check(op.header.uid, op.arg.mask) {
+            return Ok(());
+        }
+        let status = self.state.fs_stat(op.header.nodeid, None).await?;
+        self.check_access_permissions(&status, op.header, op.arg.mask)
     }
 
     // Open the directory.
@@ -1526,6 +1547,62 @@ impl fs::FileSystem for CurvineFileSystem {
 #[cfg(test)]
 mod tests {
     use curvine_common::state::FileAllocMode;
+
+    #[test]
+    fn posix_access_requires_mode_check_for_root() {
+        use super::CurvineFileSystem;
+
+        assert!(!CurvineFileSystem::posix_access_requires_mode_check(
+            0,
+            libc::R_OK as u32
+        ));
+        assert!(!CurvineFileSystem::posix_access_requires_mode_check(
+            0,
+            libc::W_OK as u32
+        ));
+        assert!(!CurvineFileSystem::posix_access_requires_mode_check(0, 0));
+        assert!(CurvineFileSystem::posix_access_requires_mode_check(
+            0,
+            libc::X_OK as u32
+        ));
+        assert!(CurvineFileSystem::posix_access_requires_mode_check(
+            0,
+            (libc::W_OK | libc::X_OK) as u32
+        ));
+        assert!(CurvineFileSystem::posix_access_requires_mode_check(
+            1000,
+            libc::R_OK as u32
+        ));
+    }
+
+    #[test]
+    fn access01_mode_masks_deny_root_x_ok_on_non_executable_files() {
+        use super::CurvineFileSystem;
+
+        let readonly_owner = (0o100400u32 >> 6) & 0o7;
+        let writeonly_owner = (0o100200u32 >> 6) & 0o7;
+
+        assert!(!CurvineFileSystem::permission_mask_allows(
+            readonly_owner,
+            libc::X_OK as u32
+        ));
+        assert!(!CurvineFileSystem::permission_mask_allows(
+            writeonly_owner,
+            libc::X_OK as u32
+        ));
+        assert!(!CurvineFileSystem::permission_mask_allows(
+            readonly_owner,
+            (libc::W_OK | libc::X_OK) as u32
+        ));
+        assert!(CurvineFileSystem::permission_mask_allows(
+            readonly_owner,
+            libc::R_OK as u32
+        ));
+        assert!(CurvineFileSystem::permission_mask_allows(
+            writeonly_owner,
+            libc::W_OK as u32
+        ));
+    }
 
     #[test]
     fn fallocate_default_converts_range_to_target_length() {
