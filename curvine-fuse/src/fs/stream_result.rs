@@ -18,33 +18,18 @@ use curvine_common::FsResult;
 use log::warn;
 use orpc::sync::channel::CallSender;
 
-/// Deliver a backend stream-op result (`Flush`/`Complete`/`Resize`) to the
-/// correct single consumer, which differs by whether this op originated from a
-/// kernel request (`reply = Some`) or an internal caller (`reply = None`).
+/// Deliver a backend stream-op result (`Flush`/`Complete`/`Resize`) to the one
+/// correct consumer, which differs by origin:
 ///
-/// Why the split (PR #1201 review): the kernel reply and the `tx` completion
-/// channel are BOTH ways a result travels back, but for a kernel request they
-/// are two ends of the SAME FUSE request. If we sent the real `Err` on `tx`,
-/// the caller (`flush()/complete()/resize()`) would return it up the dispatch
-/// chain, where `send_stream_dispatch` treats any `Err` as a pre-reply dispatch
-/// failure and calls `err_rep.send_rep(res)` — enqueuing a SECOND kernel reply
-/// for the same request. So the helper is the single decision point:
-///
-///   * `reply = Some` (kernel request): the kernel reply is the authoritative
-///     response. Send the real (errno-mapped) result to the kernel, and hand
-///     the in-process caller a bare `Ok(())` so it does NOT re-propagate the
-///     error and trigger a duplicate reply. Ordering (issue #1118): notify `tx`
-///     FIRST, then the kernel reply, so a blocked/failing reply channel cannot
-///     gate the caller's completion notification.
-///   * `reply = None` (internal caller: read-path dirty-read flush, flush_writer,
-///     release's `complete(None)`, resize): `tx` is the ONLY channel back, so
-///     the real backend result MUST travel on it — otherwise a backend failure
-///     is silently swallowed (the bug issue #1118 fixed).
-///
-/// `FsError` is not `Clone`, but that is no longer a constraint here: on the
-/// `reply = Some` path only the kernel reply needs the error (via a borrowed
-/// `errno_of`), and the caller receives a value-free `Ok(())` signal; on the
-/// `reply = None` path the single `res` is simply moved onto `tx`.
+///   * `reply = Some` (kernel request): the kernel reply is authoritative. Send
+///     the real (errno-mapped) result to the kernel and hand the in-process
+///     caller a bare `Ok(())` — if the caller re-propagated the `Err`,
+///     `send_stream_dispatch` would treat it as a dispatch failure and enqueue a
+///     SECOND kernel reply for the same request. Notify `tx` FIRST, then reply,
+///     so a blocked reply channel cannot gate the caller's completion (#1118).
+///   * `reply = None` (internal caller: dirty-read flush, flush_writer,
+///     release's `complete(None)`, resize): `tx` is the ONLY channel back, so the
+///     real result MUST travel on it, else a backend failure is swallowed (#1118).
 pub(crate) async fn deliver_stream_result(
     res: FsResult<()>,
     tx: CallSender<FsResult<()>>,

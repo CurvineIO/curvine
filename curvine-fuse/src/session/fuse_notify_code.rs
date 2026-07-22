@@ -41,7 +41,7 @@ impl FuseNotifyCode {
     /// `code_max`) collapse to `other` so the `notify_total{code}` series stays
     /// bounded to exactly the documented values. If a new code needs its own
     /// label, add it here and to the design doc's Label rules together.
-    // Phase 0 enabling primitive: defined here, wired to call sites in Phase 1.
+    // Enabling primitive: defined here, wired to call sites separately.
     #[allow(dead_code)]
     pub(crate) fn as_str(&self) -> &'static str {
         match self {

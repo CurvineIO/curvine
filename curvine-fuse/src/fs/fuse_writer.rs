@@ -38,7 +38,7 @@ enum WriteTask {
 }
 
 /// A `WriteTask` plus the `stream_write_queue_depth` guard that rides with it
-/// through the writer channel (Phase 2b). The guard is created at the enqueue
+/// through the writer channel. The guard is created at the enqueue
 /// boundary (reserve-first on a bounded channel, so a producer parked in
 /// `reserve().await` is not counted) and dropped the moment `writer_future`
 /// dequeues — or, if the task is never received (writer task exit / channel drop),
@@ -58,7 +58,7 @@ pub struct FuseWriter {
     len: Arc<AtomicLong>,
     mtime: Arc<AtomicLong>,
     write_ver: AtomicCounter,
-    /// Phase 2b kill-switch flag: decides whether `send_queued_task` creates a
+    /// kill-switch flag: decides whether `send_queued_task` creates a
     /// `stream_write_queue_depth` guard. (The `path_type` label is captured as a
     /// local and moved into the writer task, not stored here.)
     metrics_enabled: bool,
@@ -86,7 +86,7 @@ impl FuseWriter {
         let len = Arc::new(AtomicLong::new(status.len));
         let mtime = Arc::new(AtomicLong::new(status.mtime));
         let write_ver = AtomicCounter::new(0);
-        // Phase 2b: backend kind + metrics gate, captured at open and moved into
+        // backend kind + metrics gate, captured at open and moved into
         // the writer task for the per-IO observe (same as FuseReader).
         let path_type = writer.path_type();
         let metrics_enabled = conf.metrics_enabled;
@@ -139,18 +139,14 @@ impl FuseWriter {
         self.err_monitor.take_error().unwrap_or(e)
     }
 
-    /// Enqueue a `WriteTask` into the writer channel, carrying the
-    /// `stream_write_queue_depth` guard (Phase 2b). Reserve-first on a bounded
-    /// channel so a producer parked in `reserve().await` (channel full) is NOT
-    /// counted as backlog — the guard is created only AFTER a permit is in hand
-    /// (bounded) or just before the synchronous unbounded send. No manual
-    /// inc/dec/rollback: the guard rides the task and the writer drops it at the
-    /// dequeue point (or it is dropped with an un-received task on teardown).
+    /// Enqueue a `WriteTask`, carrying the `stream_write_queue_depth` guard.
+    /// Reserve-first on a bounded channel so a producer parked in `reserve().await`
+    /// isn't counted as backlog (guard created only after a permit is in hand); the
+    /// guard rides the task and drops at the writer's dequeue point.
     ///
-    /// IMPORTANT: this helper only handles the queue guard + channel send. It must
-    /// NOT touch `write_ver` — the producers below keep `write_ver.incr()` at its
-    /// existing position (a read-after-write consistency dependency, not a metrics
-    /// concern), see `write`/`resize`.
+    /// IMPORTANT: only handles the queue guard + send — it must NOT touch
+    /// `write_ver` (the producers keep `write_ver.incr()` where it is, a
+    /// read-after-write consistency dependency; see `write`/`resize`).
     async fn send_queued_task(&self, task: WriteTask) -> Result<(), FsError> {
         if self.sender.is_bounded() {
             // Reserve a permit first WITHOUT a guard; a cancelled reserve leaves the
@@ -318,7 +314,7 @@ impl FuseWriter {
                     // partial failed write is also cancelled on exit.
                     *completed = false;
                     let len = data.len();
-                    // Phase 2b: observe the write backend IO (io_type=write). The
+                    // observe the write backend IO (io_type=write). The
                     // inflight guard wraps ONLY the `fuse_write` call; dropped
                     // before the reply enqueue. zero-length writes never reach here
                     // (FileHandle::write direct-replies), so every sample is a real
@@ -704,8 +700,8 @@ mod tests {
     }
 
     // (b) A task enqueued but NEVER received (writer task exit / channel drop) still
-    // balances: the guard rides the task and drops with it. Covers R3 P1#3 (worker
-    // exit) + channel drop teardown.
+    // balances: the guard rides the task and drops with it. Covers the
+    // worker-exit + channel-drop teardown case.
     #[tokio::test]
     async fn queue_depth_unreceived_task_drop_balances() {
         let g = m::new_gauge("test_swqd_unrecv", "test").unwrap();
@@ -769,7 +765,7 @@ mod tests {
         assert!(queued.queue_guard.is_none());
     }
 
-    // --- Phase 2b: real FuseWriter task-body integration (codex review P1-2) ---
+    // --- real FuseWriter task-body integration ---
 
     mod task_body_integration {
         use super::super::FuseWriter;

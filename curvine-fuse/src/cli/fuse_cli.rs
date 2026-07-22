@@ -173,7 +173,7 @@ mod tests {
         assert_eq!(args.mount.io_threads, Some(8));
     }
 
-    // Kill switch: FuseConf defaults metrics on (Phase 1–3 ship enabled).
+    // Kill switch: FuseConf defaults metrics on (ships enabled).
     #[test]
     fn metrics_enabled_defaults_to_true() {
         use curvine_common::conf::FuseConf;
