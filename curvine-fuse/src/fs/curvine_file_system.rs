@@ -1598,9 +1598,9 @@ mod tests {
     use super::CurvineFileSystem;
     use crate::{
         fuse_init_flag_names, FUSE_ATOMIC_O_TRUNC, FUSE_BIG_WRITES, FUSE_DO_READDIRPLUS,
-        FUSE_FLOCK_LOCKS, FUSE_HAS_IOCTL_DIR, FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,
-        FUSE_MAX_PAGES, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_SPLICE_MOVE, FUSE_SPLICE_READ,
-        FUSE_SPLICE_WRITE, FUSE_WRITEBACK_CACHE, SUPPORTED_INIT_FLAGS,
+        FUSE_EXPORT_SUPPORT, FUSE_FLOCK_LOCKS, FUSE_HAS_IOCTL_DIR, FUSE_KERNEL_MINOR_VERSION,
+        FUSE_KERNEL_VERSION, FUSE_MAX_PAGES, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_SPLICE_MOVE,
+        FUSE_SPLICE_READ, FUSE_SPLICE_WRITE, FUSE_WRITEBACK_CACHE, SUPPORTED_INIT_FLAGS,
     };
 
     #[test]
@@ -1642,13 +1642,36 @@ mod tests {
     // #1122 + allowlist: the daemon must never advertise FUSE_ATOMIC_O_TRUNC
     // (open does not truncate) or any other unsupported capability, even when
     // the kernel offers it. The allowlist mask drops them.
+    //
+    // FUSE_EXPORT_SUPPORT is included here (dropped even when offered): its `.`/`..`
+    // reconstruction relies on root `.`/`..` lookups that currently return ENOENT,
+    // so the daemon must not advertise it. Not advertising it leaves the kernel's
+    // `fc->export_support` unset, so the kernel never issues the root `.`/`..` LOOKUP.
     #[test]
     fn negotiate_out_flags_drops_unsupported_kernel_caps() {
-        let unsupported = FUSE_ATOMIC_O_TRUNC | FUSE_POSIX_ACL | FUSE_HAS_IOCTL_DIR | (1u32 << 30);
+        let unsupported = FUSE_ATOMIC_O_TRUNC
+            | FUSE_POSIX_ACL
+            | FUSE_HAS_IOCTL_DIR
+            | FUSE_EXPORT_SUPPORT
+            | (1u32 << 30);
         let out = CurvineFileSystem::negotiate_out_flags(unsupported, false, false);
         assert_eq!(
             out, 0,
             "no unsupported kernel-offered bit may be advertised"
+        );
+    }
+
+    // EXPORT_SUPPORT must NOT be in the allowlist: advertising it turns on the
+    // kernel's `.`/`..` handle-reconstruction path, which the daemon cannot serve
+    // (root `.`/`..` lookups return ENOENT). This pins that a future edit cannot
+    // silently re-add it. Paired with `negotiate_out_flags_drops_unsupported_kernel_caps`
+    // (proves it is dropped even when the kernel offers it).
+    #[test]
+    fn export_support_not_in_allowlist() {
+        assert_eq!(
+            SUPPORTED_INIT_FLAGS & FUSE_EXPORT_SUPPORT,
+            0,
+            "FUSE_EXPORT_SUPPORT must not be advertised until root `.`/`..` lookup works"
         );
     }
 
@@ -1764,6 +1787,10 @@ mod tests {
         let names = fuse_init_flag_names(FUSE_BIG_WRITES | unknown);
         assert!(names.contains(&"BIG_WRITES".to_string()));
         assert!(names.iter().any(|n| n == "0x40000000"));
+        // EXPORT_SUPPORT stays wired into logging even though it left the allowlist
+        // (the documented reason the constant is retained), so an offered-but-dropped
+        // bit is still rendered by name rather than as an opaque hex token.
+        assert!(fuse_init_flag_names(FUSE_EXPORT_SUPPORT).contains(&"EXPORT_SUPPORT".to_string()));
     }
 
     #[test]
