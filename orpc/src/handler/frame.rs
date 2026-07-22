@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::handler::{ReadFrame, WriteFrame};
 use std::future::Future;
 
 use crate::io::net::ConnState;
@@ -24,4 +25,6 @@ pub trait Frame {
     fn receive(&mut self) -> impl Future<Output = IOResult<Message>>;
 
     fn new_conn_state(&self) -> ConnState;
+
+    fn split(self) -> (ReadFrame, WriteFrame);
 }

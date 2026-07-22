@@ -30,15 +30,15 @@ pub trait MessageHandler: Send + Sync + 'static {
         true
     }
 
-    // Process messages in synchronization, and call rt.spawn_blocking in the io thread to process.
-    // There is currently no good way to unify asynchronous and synchronous code.
-    fn handle(&mut self, msg: &Message) -> Result<Message, Self::Error>;
+    // Process synchronous messages on the runtime blocking pool. Implementations
+    // keep request state local or protect connection-local mutable state explicitly.
+    fn handle(&self, msg: &Message) -> Result<Message, Self::Error>;
 
     // 1.7.5 starts to support async trait.
     // In some scenarios, messages will not be processed directly, and messages need to be sent through the channel, and asynchronous functions are required.
     #[allow(unused)]
     fn async_handle(
-        &mut self,
+        &self,
         msg: Message,
     ) -> impl Future<Output = Result<Message, Self::Error>> + Send {
         async { panic!("Please implement the async_handle method") }
@@ -55,7 +55,7 @@ pub struct TestMessageHandler;
 impl MessageHandler for TestMessageHandler {
     type Error = CommonErrorExt;
 
-    fn handle(&mut self, msg: &Message) -> Result<Message, Self::Error> {
+    fn handle(&self, msg: &Message) -> Result<Message, Self::Error> {
         info!("request = {:?}", msg);
 
         let res = match msg.header_bytes() {

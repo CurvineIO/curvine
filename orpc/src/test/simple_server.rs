@@ -34,7 +34,7 @@ pub struct SimpleHandler {
 impl MessageHandler for SimpleHandler {
     type Error = CommonErrorExt;
 
-    fn handle(&mut self, msg: &Message) -> CommonResultExt<Message> {
+    fn handle(&self, msg: &Message) -> CommonResultExt<Message> {
         let id = msg.req_id();
         if self.mock && !self.call_map.contains_key(&id) {
             self.call_map.insert(id, 1);

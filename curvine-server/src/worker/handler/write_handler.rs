@@ -22,7 +22,6 @@ use curvine_common::state::{ExtendedBlock, FileAllocMode};
 use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::{ByteUnit, TimeSpent};
-use orpc::handler::MessageHandler;
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::{err_box, ternary, try_option_mut, CommonResult};
 use std::mem;
@@ -301,12 +300,8 @@ impl WriteHandler {
 
         Ok(msg.success())
     }
-}
 
-impl MessageHandler for WriteHandler {
-    type Error = FsError;
-
-    fn handle(&mut self, msg: &Message) -> FsResult<Message> {
+    pub fn handle(&mut self, msg: &Message) -> FsResult<Message> {
         let request_status = msg.request_status();
 
         match request_status {

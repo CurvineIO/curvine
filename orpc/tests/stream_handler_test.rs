@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use orpc::error::CommonErrorExt;
-use orpc::handler::{Frame, MessageHandler, StreamHandler};
+use orpc::handler::{Frame, MessageHandler, ReadFrame, StreamHandler, WriteFrame};
 use orpc::io::net::ConnState;
 use orpc::io::IOResult;
 use orpc::message::{BoxMessage, Builder, Message, RefMessage, RequestStatus};
@@ -38,6 +38,10 @@ impl Frame for MemoryFrame {
     fn new_conn_state(&self) -> ConnState {
         ConnState::default()
     }
+
+    fn split(self) -> (ReadFrame, WriteFrame) {
+        panic!("MemoryFrame does not support split")
+    }
 }
 
 struct AsyncErrorHandler;
@@ -49,11 +53,11 @@ impl MessageHandler for AsyncErrorHandler {
         false
     }
 
-    fn handle(&mut self, _msg: &Message) -> Result<Message, Self::Error> {
+    fn handle(&self, _msg: &Message) -> Result<Message, Self::Error> {
         unreachable!("test handler only uses async_handle")
     }
 
-    async fn async_handle(&mut self, _msg: Message) -> Result<Message, Self::Error> {
+    async fn async_handle(&self, _msg: Message) -> Result<Message, Self::Error> {
         Err(CommonErrorExt::from("async handler failed".to_string()))
     }
 }

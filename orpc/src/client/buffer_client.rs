@@ -15,7 +15,7 @@
 use crate::client::dispatch::{CallMap, Envelope};
 use crate::client::raw_client::RawClient;
 use crate::client::{ClientConf, ClientState};
-use crate::handler::{ReadFrame, WriteFrame};
+use crate::handler::{Frame, ReadFrame, WriteFrame};
 use crate::io::net::InetAddr;
 use crate::io::{IOError, IOResult};
 use crate::message::{BoxMessage, Message, RefMessage};

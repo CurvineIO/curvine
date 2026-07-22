@@ -17,7 +17,6 @@ use crate::io::IOResult;
 use crate::message::{Builder, Message};
 use crate::runtime::{RpcRuntime, Runtime};
 use crate::server::ServerConf;
-use crate::sys::RawPtr;
 use log::debug;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,7 +26,7 @@ use tokio::time::timeout;
 pub struct StreamHandler<F, M> {
     rt: Arc<Runtime>,
     frame: F,
-    handler: RawPtr<M>,
+    handler: Arc<M>,
     close_idle: bool,
     timeout: Duration,
 }
@@ -37,7 +36,7 @@ impl<F: Frame, M: MessageHandler> StreamHandler<F, M> {
         StreamHandler {
             rt,
             frame,
-            handler: RawPtr::from_owned(handler),
+            handler: Arc::new(handler),
             close_idle: conf.close_idle,
             timeout: Duration::from_millis(conf.timeout_ms),
         }
@@ -76,7 +75,7 @@ impl<F: Frame, M: MessageHandler> StreamHandler<F, M> {
             let rt = self.handler.get_rt(&request).unwrap_or(&self.rt);
 
             let handler = self.handler.clone();
-            rt.spawn_blocking(move || match handler.as_mut().handle(&request) {
+            rt.spawn_blocking(move || match handler.handle(&request) {
                 Err(e) => {
                     debug!("handler request {} error: {}", request.req_id(), e);
                     request.error_ext(&e)
@@ -87,7 +86,7 @@ impl<F: Frame, M: MessageHandler> StreamHandler<F, M> {
             .await?
         } else {
             let protocol = request.protocol;
-            match self.handler.as_mut().async_handle(request).await {
+            match self.handler.async_handle(request).await {
                 Ok(v) => v,
                 Err(e) => {
                     debug!("handler request {} error: {}", protocol.req_id, e);

@@ -64,7 +64,7 @@ impl MasterReplicationHandler {
 impl MessageHandler for MasterReplicationHandler {
     type Error = FsError;
 
-    fn handle(&mut self, msg: &Message) -> FsResult<Message> {
+    fn handle(&self, msg: &Message) -> FsResult<Message> {
         let code = RpcCode::from(msg.code());
 
         // Create RpcContext

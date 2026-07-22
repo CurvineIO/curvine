@@ -185,13 +185,6 @@ impl RpcFrame {
     pub fn into_tokio_frame(self) -> Framed<TcpStream, RpcCodec> {
         Framed::with_capacity(self.io, RpcCodec::new(), self.buf.buf_size())
     }
-
-    pub fn split(self) -> (ReadFrame, WriteFrame) {
-        let (read, write) = tokio::io::split(self.io);
-        let read_frame = ReadFrame::new(read, self.buf.clone());
-        let write_frame = WriteFrame::new(write, self.buf);
-        (read_frame, write_frame)
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -268,5 +261,12 @@ impl Frame for RpcFrame {
         let client_addr = self.io.peer_addr().unwrap_or(ip);
         let local_addr = self.io.local_addr().unwrap_or(ip);
         ConnState::new(client_addr.into(), local_addr.into())
+    }
+
+    fn split(self) -> (ReadFrame, WriteFrame) {
+        let (read, write) = tokio::io::split(self.io);
+        let read_frame = ReadFrame::new(read, self.buf.clone());
+        let write_frame = WriteFrame::new(write, self.buf);
+        (read_frame, write_frame)
     }
 }
