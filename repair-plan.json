@@ -1,30 +1,32 @@
 {
-  "issue": "CurvineIO/curvine#1225",
-  "multica_issue": "CUR-81",
-  "fingerprint": "sha256:e65c1ac301a58707e070d5c5ee13a39c9e24f46ff722caa252ab909f22bee6b7",
+  "issue": "CurvineIO/curvine#1251",
+  "multica_issue": "CUR-84",
+  "fingerprint": "sha256:1a0cf36c58902b91bb92f759f6733f61575db461d57269b889fcdd1df4d5b446",
   "head_sha": "abe42934895c49a3203d8a202c00241bc9d8402a",
-  "root_cause_hypothesis": "After fallocate, fio writes 256KiB blocks. When a block writer fills, get_writer rotates to the next preallocated block but update_writer cached the full block without committing metadata. The next write at offset 262144 hits EIO. Redundant complete_file with empty commits during resize also contributed to EIO before #1231.",
+  "root_cause_hypothesis": "FUSE mknod for char/block/fifo special nodes uses the caller gid from the FUSE header without applying POSIX setgid-directory group inheritance, unlike create(). LTP mknod03/04 expect the parent directory group when S_ISGID is set.",
   "affected_modules": [
-    "curvine-client/src/file/fs_writer_base.rs"
+    "curvine-fuse/src/fs/curvine_file_system.rs",
+    "curvine-fuse/src/fuse_utils.rs"
   ],
   "planned_changes": [
-    "Commit exhausted block writers instead of caching them when rotating to the next block.",
-    "Skip complete_file RPC when complete0 has no commit blocks after draining writers."
+    "Extract apply_setgid_parent_group helper shared by create() and mknod special-file path.",
+    "Apply parent setgid group inheritance before create_special_node in mk_nod."
   ],
   "not_goals": [
-    "Do not change fallocate punch-hole modes or unrelated FUSE ops.",
-    "Do not modify harness runner configuration."
+    "Do not change regular-file or mkdir mknod delegation paths (already correct).",
+    "Do not alter server-side mkdir setgid handling.",
+    "Do not add socket mknod support."
   ],
   "verification_plan": [
     "make format",
-    "cargo clippy -p curvine-client -p curvine-fuse -p curvine-common -- -D warnings",
-    "cargo test -p curvine-fuse fallocate",
-    "cargo test -p curvine-client --lib fs_writer",
-    "CURVINE_SHA=<fix> privileged fuse harness fio sub-tests"
+    "cargo clippy -p curvine-fuse -- -D warnings",
+    "cargo test -p curvine-fuse apply_setgid_parent_group",
+    "cargo test -p curvine-fuse special_file_type",
+    "CURVINE_SHA=<fix> harness privileged-fuse mknod03/04/setxattr02 when available"
   ],
-  "estimated_non_generated_source_line_delta": 12,
+  "estimated_non_generated_source_line_delta": 20,
   "risk": {
     "level": "low",
-    "rationale": "Narrows writer-cache eligibility to in-progress blocks; empty complete short-circuit is idempotent."
+    "rationale": "Mirrors existing create() setgid inheritance for mknod special nodes only."
   }
 }
