@@ -68,6 +68,10 @@ pub trait HandlerService: Send + Sync + 'static {
         StreamHandler::new(rt, frame, handler, conf)
     }
 
+    fn is_stream(&self) -> bool {
+        true
+    }
+
     fn get_limit(&self) -> LimitConf {
         panic!("BufferHandler service must provide a shared LimitConf")
     }
