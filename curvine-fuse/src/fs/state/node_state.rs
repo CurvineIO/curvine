@@ -851,13 +851,19 @@ impl NodeState {
     }
 
     pub async fn fs_lookup(&self, ino: u64, name: &str) -> FuseResult<fuse_attr> {
-        // NOTE: the `.`/`..` branches below are BROKEN for the root inode: root's
-        // `parent` is the `0` sentinel, so `LOOKUP(root, ".")` resolves to `(0, "/")`
-        // and `LOOKUP(root, "..")` does `get_inode_check(0)` — both miss (inode 0 does
-        // not exist) and return ENOENT. This is why `FUSE_EXPORT_SUPPORT` is kept out
-        // of `SUPPORTED_INIT_FLAGS` (see `crate::FUSE_EXPORT_SUPPORT`): advertising it
-        // is the only thing that makes the kernel send a root `.`/`..` LOOKUP. If this
-        // is ever fixed to handle root correctly, revisit re-adding that capability.
+        // NOTE: the `.`/`..` branches below are BROKEN wherever they resolve through
+        // the root, because root's `parent` is the `0` sentinel and inode 0 does not
+        // exist. Two cases both miss and return ENOENT:
+        //   - `LOOKUP(root, ".")` -> `(root.parent, ..)` = `(0, "/")`, and
+        //     `LOOKUP(root, "..")` -> `get_inode_check(root.parent=0)`.
+        //   - `LOOKUP(child_of_root, "..")` -> `get_inode_check(parent.parent)` where
+        //     `parent` is root, i.e. `get_inode_check(0)` — so ANY direct child of the
+        //     mount root fails too, not just the root inode.
+        // This is why `FUSE_EXPORT_SUPPORT` is kept out of `SUPPORTED_INIT_FLAGS` (see
+        // `crate::FUSE_EXPORT_SUPPORT`): advertising it is the only thing that makes
+        // the kernel send these `.`/`..` LOOKUPs (`fuse_get_parent` walks `..` for any
+        // direct child of the mount root). A follow-up that re-adds the capability must
+        // special-case `parent == root` (and root itself), not only `LOOKUP(root, .)`.
         let (ino, cow_name) = if name == FUSE_CURRENT_DIR {
             let dir = self.dir_read();
             let inode = dir.get_inode_check(ino, None)?;

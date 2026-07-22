@@ -126,12 +126,13 @@ pub const FUSE_AUTO_INVAL_DATA: u32 = 1 << 12;
 /// `LOOKUP(nodeid, ".")` / `LOOKUP(nodeid, "..")` reconstruction.
 ///
 /// Deliberately NOT in `SUPPORTED_INIT_FLAGS` (see there): the reconstruction it
-/// promises relies on `NodeState::fs_lookup` handling root `.`/`..`, which today
-/// returns ENOENT for the root inode (root's `parent` is the `0` sentinel, so
-/// `LOOKUP(root, ".")` resolves to `(0, "/")` and `LOOKUP(root, "..")` hits
-/// `get_inode_check(0)` — both miss). Advertising the cap would expose a protocol
-/// path the daemon cannot satisfy. The constant is retained for
-/// `fuse_init_flag_names` (so an offered-but-not-enabled bit is still logged).
+/// promises relies on `NodeState::fs_lookup` handling `.`/`..` through the root,
+/// which today returns ENOENT wherever the resolution hits root's `0`-sentinel
+/// parent — both `LOOKUP(root, "."/"..")` AND `LOOKUP(child_of_root, "..")` (any
+/// direct child of the mount root, which is exactly what `fuse_get_parent` walks).
+/// Advertising the cap would expose a protocol path the daemon cannot satisfy; a
+/// follow-up must special-case `parent == root` (and root itself). The constant is
+/// retained for `fuse_init_flag_names` (so an offered-but-not-enabled bit is logged).
 pub const FUSE_EXPORT_SUPPORT: u32 = 1 << 4;
 
 /// Kernel init capability bit: the daemon handles O_TRUNC atomically inside
