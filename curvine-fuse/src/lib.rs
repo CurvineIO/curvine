@@ -124,6 +124,15 @@ pub const FUSE_AUTO_INVAL_DATA: u32 = 1 << 12;
 
 /// Kernel exportfs support: enables `name_to_handle_at` / `open_by_handle_at` via
 /// `LOOKUP(nodeid, ".")` / `LOOKUP(nodeid, "..")` reconstruction.
+///
+/// Deliberately NOT in `SUPPORTED_INIT_FLAGS` (see there): the reconstruction it
+/// promises relies on `NodeState::fs_lookup` handling `.`/`..` through the root,
+/// which today returns ENOENT wherever the resolution hits root's `0`-sentinel
+/// parent — both `LOOKUP(root, "."/"..")` AND `LOOKUP(child_of_root, "..")` (any
+/// direct child of the mount root, which is exactly what `fuse_get_parent` walks).
+/// Advertising the cap would expose a protocol path the daemon cannot satisfy; a
+/// follow-up must special-case `parent == root` (and root itself). The constant is
+/// retained for `fuse_init_flag_names` (so an offered-but-not-enabled bit is logged).
 pub const FUSE_EXPORT_SUPPORT: u32 = 1 << 4;
 
 /// Kernel init capability bit: the daemon handles O_TRUNC atomically inside
@@ -143,20 +152,27 @@ pub const FUSE_ATOMIC_O_TRUNC: u32 = 1 << 3;
 /// every kernel-offered flag. Each bit here maps to a real implementation:
 /// ASYNC_READ/ASYNC_DIO (async read + direct-io pipeline), BIG_WRITES (writer
 /// handles >4KiB writes), AUTO_INVAL_DATA (kernel auto-invalidates page cache on
-/// open), EXPORT_SUPPORT (`.`/`..` lookup reconstruction), READDIRPLUS_AUTO +
-/// DO_READDIRPLUS (`read_dir_plus`), POSIX_LOCKS + FLOCK_LOCKS
-/// (`get_lk`/`set_lk`/`set_lkw`), MAX_PAGES (negotiated only if the kernel offers it).
+/// open), READDIRPLUS_AUTO + DO_READDIRPLUS (`read_dir_plus`), POSIX_LOCKS +
+/// FLOCK_LOCKS (`get_lk`/`set_lk`/`set_lkw`), MAX_PAGES (negotiated only if the
+/// kernel offers it).
 ///
 /// Deliberately EXCLUDED (never advertised): FUSE_ATOMIC_O_TRUNC (open does not
 /// truncate, #1122), FUSE_POSIX_ACL (no ACL handling), FUSE_HAS_IOCTL_DIR (no
-/// ioctl), and any unknown/future kernel bit. FUSE_WRITEBACK_CACHE and the
-/// FUSE_SPLICE_* bits are config-gated daemon-requested caps handled separately
-/// (see `negotiate_out_flags`), not part of this kernel-masked allowlist.
+/// ioctl), FUSE_EXPORT_SUPPORT (its `.`/`..` reconstruction relies on root
+/// `.`/`..` lookups that currently return ENOENT — see `FUSE_EXPORT_SUPPORT`),
+/// and any unknown/future kernel bit. FUSE_WRITEBACK_CACHE and the FUSE_SPLICE_*
+/// bits are config-gated daemon-requested caps handled separately (see
+/// `negotiate_out_flags`), not part of this kernel-masked allowlist.
+///
+/// Not advertising EXPORT_SUPPORT is sufficient to keep the broken root `.`/`..`
+/// path unreachable: the kernel's `fuse_get_parent` / `fuse_get_dentry` (the only
+/// sites that emit a `.`/`..` LOOKUP to the daemon) both short-circuit with
+/// `-ESTALE` when `fc->export_support` is unset, and normal path walk resolves
+/// `.`/`..` in-kernel without a FUSE request.
 pub const SUPPORTED_INIT_FLAGS: u32 = FUSE_ASYNC_READ
     | FUSE_BIG_WRITES
     | FUSE_ASYNC_DIO
     | FUSE_AUTO_INVAL_DATA
-    | FUSE_EXPORT_SUPPORT
     | FUSE_READDIRPLUS_AUTO
     | FUSE_DO_READDIRPLUS
     | FUSE_POSIX_LOCKS
