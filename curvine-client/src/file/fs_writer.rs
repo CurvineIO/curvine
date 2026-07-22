@@ -122,7 +122,10 @@ impl Writer for FsWriter {
     }
 
     async fn cancel(&mut self) -> FsResult<()> {
-        Ok(())
+        // Bytes still in the front buffer have never reached the backend and
+        // must not be flushed after cancellation.
+        self.buf.clear();
+        self.inner.cancel().await
     }
 
     async fn seek(&mut self, pos: i64) -> FsResult<()> {

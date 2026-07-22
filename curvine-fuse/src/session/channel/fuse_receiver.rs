@@ -258,16 +258,16 @@ impl<T: FileSystem> FuseReceiver<T> {
         Self::send_stream_dispatch(&self.fs, req, rep).await
     }
 
-    /// The stream dispatch + Phase 2b IO attribution core, factored out of
-    /// `send_stream` so it can be driven in tests against a hand-built
-    /// `FuseResponse` without a real `FuseReceiver`/`kernel_fd`/`Pipe2`/reactor.
-    /// `rep` is the reply handle already built by the caller (`new_reply`).
+    /// The stream dispatch + IO attribution core, factored out of `send_stream`
+    /// so it can be driven in tests against a hand-built `FuseResponse` without a
+    /// real `FuseReceiver`/`kernel_fd`/`Pipe2`/reactor. `rep` is the reply handle
+    /// already built by the caller (`new_reply`).
     ///
     /// The metrics kill switch is derived from a SINGLE source of truth —
-    /// `rep.metrics.is_some()` — NOT a separate `metrics_enabled` flag (review
-    /// round-5 P2-1): when metrics are disabled, `new_reply` builds the legacy
-    /// ctx-less reply (`metrics == None`), and when enabled it builds the ctx-bearing
-    /// one. Deriving the gate from `rep` makes it impossible to wire a "record stream
+    /// `rep.metrics.is_some()` — NOT a separate `metrics_enabled` flag: when
+    /// metrics are disabled, `new_reply` builds the legacy ctx-less reply
+    /// (`metrics == None`), and when enabled it builds the ctx-bearing one.
+    /// Deriving the gate from `rep` makes it impossible to wire a "record stream
     /// metrics but no request ctx" (or the inverse) split-brain state. Kept private
     /// (the tests module is a child module and reaches it without `pub(crate)`).
     async fn send_stream_dispatch(
@@ -295,29 +295,19 @@ impl<T: FileSystem> FuseReceiver<T> {
         // fresh context.
         let err_rep = rep.clone();
 
-        // Phase 2b: IO attribution at the send_stream layer, created AFTER parse
-        // success and BEFORE the match, so they cover the match arm AND the
-        // `if res.is_err()` error reply enqueue below (a pre-dispatch error — e.g.
-        // a handle lookup failure — replies there, not inside `fs.<io>`). For a
-        // known stream opcode exactly one of these is `Some`:
-        //   - read/write  -> `io_dispatch_duration_us{io_type}` RAII timer (dispatch
-        //     latency: may include a read-after-write consistency flush/reopen for
-        //     read, or a zero-length no-op direct reply for write — NOT pure enqueue).
-        //   - flush/fsync/release -> a `StreamLifecycleScope` (attempt counted now,
-        //     duration timer + inflight guard held across the whole arm).
-        // The read/write backend `io_*` (duration/bytes/size/inflight) is recorded
-        // separately in the reader/writer task body (C2); this layer does NOT
-        // re-record it. Gated on `metrics_enabled` (disabled => both None, no
-        // attempt counted, no clock read).
+        // IO attribution, created after parse success and before the match so it
+        // covers the match arm AND the `if res.is_err()` error-reply enqueue below
+        // (a pre-dispatch error replies there, not inside `fs.<io>`). Exactly one is
+        // `Some` per known stream opcode: read/write -> `io_dispatch_duration_us`
+        // RAII timer; flush/fsync/release -> a `StreamLifecycleScope`. The backend
+        // `io_*` is recorded in the reader/writer task body, not re-recorded here.
+        // Gated on `metrics_enabled`.
         //
-        // ⚠ INVARIANT (do not break): there must be NO `.await` and NO early
-        // return between `parse_operator()` succeeding above and the two scopes
-        // below. `stream_lifecycle_scope` counts the attempt and arms the
-        // duration timer + inflight guard as one atomic step; inserting a
-        // suspension/return in this window could count an attempt whose timer
-        // never observes (or vice versa), unbalancing the lifecycle family. The
-        // first awaits are the `fs.<io>(op, rep).await` calls inside the match,
-        // already covered by the scopes.
+        // ⚠ INVARIANT: NO `.await` and NO early return between `parse_operator()`
+        // above and the two scopes below — `stream_lifecycle_scope` counts the
+        // attempt and arms its timer + inflight guard as one atomic step, so a
+        // suspension here could unbalance the lifecycle family. The first awaits are
+        // the `fs.<io>(op, rep).await` calls inside the match, already covered.
         let _dispatch = if metrics_enabled {
             dispatch_io_type(req.opcode()).map(FuseMetrics::io_dispatch_timer)
         } else {
@@ -407,18 +397,12 @@ impl<T: FileSystem> FuseReceiver<T> {
     pub async fn start(mut self, mut shutdown_rx: watch::Receiver<bool>) -> FuseResult<()> {
         debug!("fuse receiver started");
         loop {
-            // Receiver loop wait covers idle wait for the next kernel request
-            // plus the splice and header parse below. Observed only on the
-            // `receive()` Ok path (splice errors are counted by
-            // receive_errors_total instead). framework health -> metrics_enabled:
-            // when disabled we don't even read the clock (matches meta_spawn's
-            // `Option<Instant>` and the kill-switch "no machinery" goal).
-            //
-            // The clock is read before the `select!`, so a wake from the
-            // shutdown branch (rather than `receive()`) reads an `Instant` that
-            // is never observed. Acceptable: shutdown is rare and the read is
-            // cheap; scoping the start to only the receive branch would tangle
-            // with the `&mut self` borrow inside `select!` for no real gain.
+            // Loop-wait timer: idle wait for the next request + splice + header
+            // parse, observed only on the `receive()` Ok path (splice errors go to
+            // receive_errors_total). Read before the `select!`, so a shutdown-branch
+            // wake reads an `Instant` that is never observed — acceptable (shutdown
+            // is rare; scoping it to the receive branch would tangle the `&mut self`
+            // borrow inside `select!`). Gated on `metrics_enabled`.
             let wait_start = if self.metrics_enabled {
                 Some(mono_now())
             } else {
@@ -450,14 +434,11 @@ impl<T: FileSystem> FuseReceiver<T> {
                             };
 
                             if self.debug {
-                                // Debug logging must NOT parse the operator here:
-                                // a parse failure would `?`-return out of the
-                                // receiver loop *before* the context is created,
-                                // both terminating the receiver and bypassing the
-                                // dispatch-path `finish_early` cleanup. The
-                                // dispatch path (`dispatch_meta` / `send_stream`)
-                                // is the single parse + cleanup site. Log only the
-                                // fields available without parsing the body.
+                                // Do NOT parse the operator here: a parse failure
+                                // would `?`-return out of the loop before the ctx
+                                // exists, bypassing the dispatch path's `finish_early`
+                                // cleanup (the single parse+cleanup site). Log only
+                                // the header fields.
                                 info!(
                                     "receive unique: {}, code: {:?}",
                                     req.unique(),
@@ -477,18 +458,12 @@ impl<T: FileSystem> FuseReceiver<T> {
                                 let reply = self.new_reply(req.unique(), labels);
                                 let fs = self.fs.clone();
                                 let pending_requests = self.pending_requests.clone();
-                                // meta_task_inflight guard + meta_spawn stage are
-                                // created BEFORE spawn so they cover the runtime
-                                // queue wait (submission -> first poll). Both gated
-                                // on metrics_enabled (None / no observe when off);
-                                // production disabled path must NOT use a noop guard.
-                                //
-                                // Boundary: `meta_spawn` measures tasks that reach
-                                // first poll. If the runtime drops/aborts a task
-                                // before its first poll (e.g. shutdown), the guard
-                                // still dec's meta_task_inflight on drop, but no
-                                // meta_spawn sample is recorded. Out of scope for
-                                // 1b-1 (would need spawn-drop instrumentation).
+                                // meta_task_inflight guard + meta_spawn stage created
+                                // BEFORE spawn so they cover the runtime queue wait
+                                // (submission -> first poll). Gated on metrics_enabled
+                                // (None when off — not a noop guard). A task
+                                // dropped before its first poll still dec's the guard
+                                // but records no meta_spawn sample (out of scope).
                                 let meta_guard = FuseMetrics::meta_task_guard(self.metrics_enabled);
                                 let spawn_start =
                                     if self.metrics_enabled { Some(mono_now()) } else { None };
@@ -563,38 +538,16 @@ impl<T: FileSystem> FuseReceiver<T> {
         let mut pending_request =
             PendingRequestGuard::register(pending_requests.clone(), req.unique(), notify.clone());
 
-        // This branch is reached only for FUSE_SETLKW (`is_interrupt()` is true
-        // only there), so the SETLKW metrics live here, wrapping the whole
-        // interruptible-request scope (parse + dispatch_meta + lock polling +
-        // reply enqueue):
-        //
-        // - `setlkw_inflight`: SETLKW interruptible-request scopes in flight.
-        // - `setlkw_wait_duration_us`: the interruptible-request-duration timer.
-        //   It is created here, BEFORE the `select!`, NOT inside `set_lkw()` — so
-        //   an interrupt that wins the `select!` before `dispatch_meta`'s future
-        //   ever polls into `set_lkw()` (immediate / fast cancellation) still
-        //   records a sample on drop; placing it inside `set_lkw()` would miss
-        //   exactly that case.
-        //
-        // CONSEQUENCE (review R2 P1#1): this is NOT pure lock-acquisition time —
-        // the scope spans parse, dispatch, AND the reply-channel enqueue, so
-        // reply-channel backpressure can inflate it. The metric is deliberately
-        // an "interruptible-request duration" wrapper, not a lock-contention gauge
-        // (see its help); dashboards must not read it as lock wait. Likewise a
-        // malformed SETLKW that fails `parse_operator()` produces a near-zero
-        // sample (timer exists before parse). This wrapper framing was the chosen
-        // trade-off over special-casing the SETLKW dispatch arm (which would touch
-        // the dispatch matrix the design avoids).
-        //
-        // Both are RAII: their Drop — not the `pending_requests.remove` — does the
-        // gauge dec / histogram observe, so every `select!` branch (and any future
-        // drop / cancellation) balances the gauge and records a sample exactly
-        // once. Gated by `reply.metrics.is_some()` (== metrics_enabled; the
-        // singleton is initialized whenever that holds), so disabled builds create
-        // neither.
-        //
-        // The pending-request map has its own RAII guard above. The two select
-        // branches remove eagerly, while the guard's Drop covers task abort/drop.
+        // FUSE_SETLKW only. The `setlkw_wait_duration_us` timer + `setlkw_inflight`
+        // gauge wrap the WHOLE interruptible-request scope (parse + dispatch + lock
+        // poll + reply enqueue), created BEFORE the `select!` so an interrupt that
+        // wins before `set_lkw()` is ever polled still records a sample on drop.
+        // Consequence: this is NOT lock-acquisition time (reply-channel backpressure
+        // can inflate it; a parse failure yields a near-zero sample) — it is an
+        // interruptible-request-duration wrapper, not a lock-contention gauge.
+        // Both are RAII (Drop does the observe/dec, so every branch balances exactly
+        // once) and gated by `reply.metrics.is_some()`. The pending-request map has
+        // its own RAII guard above.
         let _setlkw_inflight = FuseMetrics::setlkw_inflight_guard(reply.metrics.is_some());
         let _setlkw_wait = FuseMetrics::setlkw_wait_timer(reply.metrics.is_some());
 
@@ -634,7 +587,7 @@ impl<T: FileSystem> FuseReceiver<T> {
         };
 
         // operation_duration_us: a single timer around the whole match (NOT
-        // per-arm — the design's anti-goal is touching the ~30 dispatch arms).
+        // per-arm — deliberately avoids touching the ~30 dispatch arms).
         // Gated by `reply.metrics.is_some()` (the disabled-mode signal — this is
         // a free fn with no `metrics_enabled` field), so disabled mode does not
         // even read the clock. Started after parse success, so a parse failure
@@ -724,25 +677,15 @@ impl<T: FileSystem> FuseReceiver<T> {
 
             FuseOperator::SetLkW(op) => reply.send_rep(fs.set_lkw(op).await).await,
 
-            // Exhaustive fallback — NOT a `_` wildcard, deliberately: listing the
-            // remaining variants makes the match exhaustive, so adding a new
-            // `FuseOperator` variant without a dispatch arm here (or in
-            // `send_stream_dispatch`) fails to compile. This is the compile-time
-            // guarantee `expected_dispatch` cannot give (it is `#[cfg(test)]` and
-            // opcode-level, not arm-level), and is what would have caught the
-            // RENAME2 half-wiring. The arms handled here:
-            //   - `Notimplemented`: parse mapped an unknown/unsupported opcode to
-            //     the catch-all variant.
-            //   - the five stream ops (Read/Write/Flush/Release/FSync): these are
-            //     dispatched by `send_stream_dispatch`, never through this
-            //     metadata path, so reaching them here is a routing bug — but they
-            //     must still be named to keep the match exhaustive.
-            // Source-tag as Unsupported (not a backend Error). Split the reason:
-            //   - opcode == NOT_SUPPORTED (num_enum default for a raw opcode this
-            //     build has no enum value for) -> `unknown_opcode`.
-            //   - a known but intentionally-unsupported opcode (BMAP/POLL/IOCTL/
-            //     LSEEK) -> `unimplemented_opcode`. The authoritative
-            //     intentional-vs-gap record is `FuseOpCode::expected_dispatch`.
+            // Exhaustive fallback, NOT a `_` wildcard: naming the remaining variants
+            // makes adding a new `FuseOperator` without a dispatch arm a compile
+            // error — the arm-level guarantee `expected_dispatch` can't give, which
+            // would have caught the RENAME2 half-wiring. The stream ops here are a
+            // routing bug (they go through `send_stream_dispatch`) but must be named
+            // for exhaustiveness. Tag Unsupported (not backend Error): NOT_SUPPORTED
+            // (unknown raw opcode) -> `unknown_opcode`; a known-but-unsupported op
+            // (BMAP/POLL/IOCTL/LSEEK) -> `unimplemented_opcode`. See
+            // `FuseOpCode::expected_dispatch` for the intentional-vs-gap record.
             FuseOperator::Notimplemented
             | FuseOperator::Read(_)
             | FuseOperator::Write(_)
@@ -760,29 +703,16 @@ impl<T: FileSystem> FuseReceiver<T> {
             }
         };
 
-        // operation_duration_us{opcode,kind=metadata,status}: observe once, after
-        // the whole match. `status` is the stashed `op_status` (the FS-operation
-        // result computed by `finish_status`), NOT the `IOResult` of `res` — a
-        // successful enqueue of an error frame returns `Ok(())`, so deriving status
-        // from `res` would mislabel almost everything `success`. The send helpers
-        // stash `op_status` synchronously before enqueuing, and each match arm
-        // awaits its send, so by here the slot's `op_status` is the FS result.
-        //
-        // `op_start` is `Some` iff metrics are enabled (it was built with
-        // `reply.metrics.is_some().then(mono_now)`), so a disabled request never
-        // read the clock and skips the observe here too. A missing `op_status`
-        // (e.g. a no-reply path that didn't stash, or a defensive gap) is treated
-        // as `Error` rather than silently dropped — the only realistic miss is a
-        // wiring bug, and `Error` is the safe non-success bucket.
+        // operation_duration_us{opcode,kind=metadata,status}: observe once after the
+        // match. `status` is the stashed `op_status` (the FS result), NOT `res` — a
+        // successful enqueue of an error frame returns `Ok(())`, so `res` would
+        // mislabel almost everything `success`. `op_start` is `Some` iff metrics are
+        // enabled, so disabled requests skip this.
         if let Some(start) = op_start {
-            // Every dispatched metadata op should have stashed `op_status` via a
-            // send helper / no-reply finish before the match returned. A `None`
-            // here means some arm bypassed that — a wiring bug. Surface it loudly
-            // in debug (debug_assert) AND leave a release-visible `warn!` so a
-            // production occurrence is diagnosable (it would otherwise only show as
-            // an unexplained `status=error` latency sample). Release still falls
-            // back to `Error` (the safe non-success bucket) rather than dropping
-            // the sample (review R1 P2#6 / R2 P2#8).
+            // A missing `op_status` means a dispatch arm bypassed the send/no-reply
+            // finish helpers — a wiring bug. Surface it (debug_assert + release
+            // warn!) and fall back to `Error` (the safe non-success bucket) rather
+            // than dropping the sample.
             let op_status = match reply.metrics_op_status() {
                 Some(s) => s,
                 None => {
@@ -882,7 +812,7 @@ mod tests {
         );
     }
 
-    // --- Phase 2a: dispatch_meta integration (operation_duration_us wiring) ---
+    // --- dispatch_meta integration (operation_duration_us wiring) ---
     //
     // These drive the real `dispatch_meta` link — parse_operator -> match arm ->
     // send helper stashes op_status -> post-match `record_operation` reads it back
@@ -1227,7 +1157,7 @@ mod tests {
             assert_eq!(op_dur_count("Access", "error"), e_before);
         }
 
-        // --- R2 P1#5: immediate-interrupt SETLKW records a wait sample ---
+        // --- immediate-interrupt SETLKW records a wait sample ---
 
         const OP_SETLKW: u32 = 33;
 
@@ -1281,7 +1211,7 @@ mod tests {
         // pending_requests Notify, so the notify branch wins and the dispatch
         // (set_lkw) branch is cancelled.
         //
-        // SCOPE (review R3 P1#1): this covers "set_lkw entered, then interrupted",
+        // SCOPE: this covers "set_lkw entered, then interrupted",
         // NOT "interrupt wins before set_lkw is ever polled" — the assertion
         // `polled == true` makes that explicit. The complementary case where the
         // timer's outer placement matters even though `set_lkw()` is NEVER reached
@@ -1311,15 +1241,11 @@ mod tests {
                 .await
             });
 
-            // Wait until `set_lkw()` has ACTUALLY been polled (it sets `polled`
-            // then blocks forever), THEN fire the interrupt. Waiting on the
-            // `pending_requests` entry would be racy: the entry is inserted BEFORE
-            // the `select!`, so seeing it does NOT prove the dispatch branch (and
-            // thus `set_lkw()`) has been polled — under some schedules notify could
-            // win before `set_lkw()` is ever entered, breaking the `polled==true`
-            // assertion. Gating on `polled` makes this test deterministically cover
-            // "set_lkw entered, then interrupted". A timeout prevents a dead wait if
-            // that invariant ever regresses.
+            // Wait until `set_lkw()` has actually been polled (it sets `polled` then
+            // blocks forever) BEFORE firing the interrupt. Gating on the
+            // `pending_requests` entry would be racy — it is inserted before the
+            // `select!`, so notify could win before `set_lkw()` is entered, breaking
+            // the `polled==true` assertion. The timeout guards against a dead wait.
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
                     if polled.load(Ordering::SeqCst) {
@@ -1363,7 +1289,7 @@ mod tests {
                 polled.load(Ordering::SeqCst),
                 "set_lkw was polled (the dispatch branch started)"
             );
-            // The core P1#1 invariant: a wait sample is recorded even though the
+            // The core invariant: a wait sample is recorded even though the
             // lock poll loop never completed.
             assert!(
                 setlkw_wait_count() > wait_before,
@@ -1425,7 +1351,7 @@ mod tests {
             );
         }
 
-        // R3 P1#1: the case that actually justifies hoisting the timer OUT of
+        // The case that actually justifies hoisting the timer OUT of
         // `set_lkw()`. A malformed SETLKW (empty payload) fails `parse_operator()`
         // inside `dispatch_meta`, so `set_lkw()` is NEVER called — yet because the
         // timer is created in `dispatch_meta_interrupt` BEFORE the `select!`, a
@@ -1560,7 +1486,7 @@ mod tests {
         }
     }
 
-    // --- Phase 2b: send_stream IO attribution integration ---
+    // --- send_stream IO attribution integration ---
     //
     // These drive the real stream dispatch core `FuseReceiver::send_stream_dispatch`
     // (extracted from `send_stream` so it needs only `&fs`, a `FuseRequest`, and a
@@ -1649,38 +1575,17 @@ mod tests {
             )
         }
 
-        // Drive ONE stream op through the REAL `send_stream_dispatch` core and run it
-        // to completion. `op` is the FUSE opcode; `unique`/`payload` build the
-        // request. Returns the dispatch result.
+        // Drive ONE stream op through the real `send_stream_dispatch` to completion.
         //
-        // FD-FREE by construction (review round-2/3/4 P1): earlier rounds built a
-        // real `FuseReceiver` here just to reach `send_stream`, which dragged in a
-        // `kernel_fd` `AsyncFd` + an internal `Pipe2` whose Drop deregisters from the
-        // tokio reactor AFTER closing its fds — aborting the process with `IO Safety
-        // violation` under the default parallel harness, and which leak workarounds
-        // failed to tame across two rounds. The real fix (codex's repeated
-        // recommendation): `send_stream`'s metrics/dispatch logic was extracted into
-        // `FuseReceiver::send_stream_dispatch`, which takes a pre-built `FuseResponse`
-        // (the metrics gate is derived from `rep.metrics.is_some()`) and only needs
-        // `&fs` — NO fd, NO Pipe2, NO reactor. So this helper builds just a
-        // `FuseResponse` over an in-memory reply channel
-        // and a single-thread runtime to `block_on` the async fn (which spawns
-        // nothing and touches no fd). Nothing here registers with a reactor, so there
-        // is no fd/runtime lifecycle hazard at all.
-        //
-        // The reply channel is drained by a spawned task so the error-reply enqueue
-        // inside the dispatch (the path the lifecycle/dispatch RAII scope covers)
-        // never blocks regardless of how many ops a body drives (review round-4 P2-1).
-        //
-        // Parallel-safety of the ASSERTIONS: these feed the process-global registry
-        // under FIXED io_type labels shared by every send_stream test, so the tests
-        // assert only POSITIVE LOWER BOUNDS on each op's own label ("incremented by
-        // at least 1"), never exact deltas. The deterministic negatives are covered
-        // by the structural unit tests in `fuse_metrics`.
-        // `with_metrics_ctx` decides whether the built `FuseResponse` carries a metrics
-        // ctx — which, since `send_stream_dispatch` derives its gate from
-        // `rep.metrics.is_some()`, IS the metrics on/off switch for the dispatch. It is
-        // NOT a separate flag passed to the dispatch (there is none).
+        // FD-FREE: `send_stream_dispatch` needs only `&fs` + a pre-built
+        // `FuseResponse`, so an in-memory channel + single-thread runtime suffice —
+        // NO fd/Pipe2/reactor. This matters: reaching dispatch via a real
+        // `FuseReceiver` drags in a `Pipe2` whose Drop deregisters from the reactor
+        // AFTER closing its fds, aborting with `IO Safety violation` under the
+        // parallel harness. Assertions use LOWER BOUNDS, not exact deltas: the
+        // process-global registry uses FIXED io_type labels a concurrent test can
+        // also bump (deterministic negatives live in `fuse_metrics` unit tests).
+        // `with_metrics_ctx` = the metrics on/off switch (gate is `rep.metrics.is_some()`).
         fn dispatch_one(with_metrics_ctx: bool, req: FuseRequest) {
             use crate::fuse_metrics::{FuseReqCtx, FuseReqKind, FuseReqLabels};
             FuseMetrics::ensure_init().unwrap();
@@ -1689,16 +1594,10 @@ mod tests {
                 let fs = Arc::new(TestFileSystem::new(
                     curvine_common::conf::FuseConf::default(),
                 ));
-                // Reply channel with a drainer so any enqueued error reply is consumed
-                // (never blocks), independent of how many ops the caller drives.
+                // Drainer so an enqueued error reply never blocks.
                 let (tx, mut rx) = AsyncChannel::new(64).split();
                 let drainer = tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
-                // Build the reply handle exactly as `send_stream`'s caller would.
-                // with-ctx => an active guard backed by a throwaway gauge; without =>
-                // None (the legacy zero-cost path). The presence of the ctx IS the
-                // metrics gate — `send_stream_dispatch` derives it from
-                // `rep.metrics.is_some()`, so there is no separate flag to pass.
                 let opcode = req.opcode().as_str();
                 let ctx = if with_metrics_ctx {
                     let gauge = curvine_core::common::Metrics::new_gauge(
@@ -1745,7 +1644,7 @@ mod tests {
                 .get_sample_count()
         }
 
-        // E21/E26: a flush whose backend errors (pre-dispatch ENOSYS) STILL records a
+        // a flush whose backend errors (pre-dispatch ENOSYS) STILL records a
         // lifecycle attempt (counted before the match) AND a duration sample (the RAII
         // timer observes on drop, covering the error reply enqueue that happens inside
         // the scope), under {io_type=flush,path_type=unknown}. Lower-bound asserts.
@@ -1783,7 +1682,7 @@ mod tests {
             );
         }
 
-        // E15 (release attributed at send_stream): one FUSE Release opcode increments
+        // release attributed at send_stream: one FUSE Release opcode increments
         // stream_lifecycle_requests_total{release}. Doing it here (one operator arm =
         // one increment) is what avoids the reader+writer double-count the task-body
         // approach would have. Lower-bound assert (parallel-safe).
@@ -1800,7 +1699,7 @@ mod tests {
             );
         }
 
-        // E20/E25: read/write at send_stream record io_dispatch_duration_us{io_type}.
+        // read/write at send_stream record io_dispatch_duration_us{io_type}.
         // The backend io_* (duration/bytes/size) is recorded in the task body, not
         // here, so a pre-dispatch ENOSYS read/write records dispatch only — which is
         // exactly what this asserts (the dispatch timer fired). Lower-bound asserts.
@@ -1823,30 +1722,18 @@ mod tests {
             );
         }
 
-        // P2-2 (review round-2): a direct disabled-path integration test for
-        // `send_stream`. The send_stream gate (`self.metrics_enabled`) is a DIFFERENT
-        // source from the reader/writer task body's gate (`FuseConf.metrics_enabled`),
-        // so this guards the send_stream wiring specifically.
-        //
-        // What this is (review round-3 P2-2): a SMOKE test, not a no-emission proof.
-        // - It proves: one op of EACH stream family runs end-to-end through the real
-        //   disabled `send_stream` and completes (no panic, no hang). It is a guard
-        //   against the disabled send_stream path being wired so badly it cannot even
-        //   run all five families.
-        // - It does NOT prove "disabled emits nothing": the metrics singleton is
-        //   already initialized in the test binary, so a regression that wrongly built
-        //   the dispatch timer / lifecycle scope on the disabled path would NOT panic
-        //   here — it would just (wrongly) emit. The deterministic "disabled => guard
-        //   is None, emits nothing" guarantee is pinned by the isolated helper `*_gate`
-        //   unit tests instead. An `== before` count assertion is deliberately avoided:
-        //   the io_type labels are a fixed set shared with the enabled send_stream
-        //   tests, so it would be flaky under the default parallel harness. This split
-        //   — smoke for wiring here, isolated unit test for the no-emission guarantee —
-        //   is the same discipline the rest of this metrics work follows.
+        // A SMOKE test for the disabled `send_stream` wiring (its gate,
+        // `self.metrics_enabled`, is a different source from the task body's
+        // `FuseConf.metrics_enabled`): it proves one op of each stream family runs
+        // end-to-end with metrics off and completes. It does NOT prove "emits
+        // nothing" — the singleton is already initialized in the test binary, and an
+        // `== before` count would be flaky on the shared io_type labels; the
+        // deterministic no-emission guarantee is pinned by the isolated `*_gate`
+        // unit tests instead.
         #[test]
         fn disabled_send_stream_runs_clean_for_all_families() {
             // ENOSYS replies (TestFileSystem); the point is the metrics gate, not the
-            // op result. None of these may touch the Phase 2b stream metrics.
+            // op result. None of these may touch the stream metrics.
             dispatch_one(false, flush_request(7101));
             dispatch_one(false, fsync_request(7102));
             dispatch_one(false, release_request(7103));
@@ -1856,14 +1743,11 @@ mod tests {
             // five op families to completion with `metrics_enabled=false`.
         }
 
-        // P2-2 (review round-5): a malformed stream request whose `parse_operator()`
-        // fails AFTER the ctx was built. This is the ctx-before-parse corner case the
-        // round-4 seam refactor must preserve: the parse failure must finish the ctx
-        // early (drop the active guard, record the parse decode error) and must NOT
-        // enter the dispatch/lifecycle RAII scope (no io_dispatch / lifecycle sample).
-        // Pins the seam's most fragile behaviour — that nobody inserts an early
-        // return / await between ctx creation and the scope in a way that leaks the
-        // guard or emits a stray dispatch sample on the parse-failure path.
+        // A malformed stream request whose `parse_operator()` fails AFTER the ctx
+        // was built: the parse failure must finish the ctx early (drop the active
+        // guard, record the parse decode error) and must NOT enter the
+        // dispatch/lifecycle RAII scope. Pins that nobody inserts an early
+        // return/await between ctx creation and the scope.
         #[test]
         fn malformed_stream_request_finishes_early_without_dispatch_or_lifecycle() {
             use crate::fuse_metrics::{FuseReqCtx, FuseReqKind, FuseReqLabels, DECODE_PHASE_PARSE};
@@ -1941,20 +1825,12 @@ mod tests {
 
     // --- Issue #1089: stream pre-dispatch error-reply coverage ---
     //
-    // These prove the property the issue asks for: when a stream op
-    // (read/write/flush/release/fsync) fails BEFORE it replies to the kernel (a
-    // "pre-dispatch error" — e.g. a handle-lookup miss), `send_stream_dispatch`
-    // enqueues EXACTLY ONE error reply, via the `if res.is_err() { err_rep.send_rep }`
-    // fallback (`fuse_receiver.rs` ~:317), and never double-replies.
-    //
-    // FD-FREE, same construction as `send_stream_integration::dispatch_one`: the
-    // dispatch core takes only `&fs` + a pre-built `FuseResponse` over an in-memory
-    // channel, so there is no `kernel_fd`/`Pipe2`/reactor and no fd lifecycle hazard.
-    //
-    // Unlike the sibling metrics tests (which share process-global label children and
-    // can only assert lower bounds), these assert an EXACT count of `== 1`: the reply
-    // channel is per-test (never shared), so counting its enqueued `FuseTask`s is
-    // deterministic and parallel-safe.
+    // Prove that when a stream op fails BEFORE replying (a "pre-dispatch error",
+    // e.g. a handle-lookup miss), `send_stream_dispatch` enqueues EXACTLY ONE error
+    // reply via its `if res.is_err() { err_rep.send_rep }` fallback and never
+    // double-replies. FD-free (same `dispatch_one` construction). These assert an
+    // EXACT `== 1` (not lower bounds): the reply channel is per-test, so counting
+    // its enqueued `FuseTask`s is deterministic.
     mod stream_error_coverage {
         use crate::err_fuse;
         use crate::fs::operator::{FSync, Flush, Read, Release, Write};
@@ -1985,13 +1861,9 @@ mod tests {
         // the handle-lookup path is EBADF, so we model that.
         const ERRNO: i32 = libc::EBADF;
 
-        // A FileSystem whose stream ops fail WITHOUT touching `_reply` — the exact
-        // shape of a pre-dispatch error (handle lookup fails, or backend returns Err
-        // before replying). Only these five are overridden; every other op keeps the
-        // trait default (see `BlockingSetlkwFs` for the same "override one, inherit
-        // the rest" pattern). This is deliberately more explicit than reusing
-        // `TestFileSystem` (whose defaults return ENOSYS): a dedicated mock lets the
-        // assertions pin the errno on the wire, and documents the EBADF nuance above.
+        // A FileSystem whose stream ops fail WITHOUT touching `_reply` — the shape of
+        // a pre-dispatch error. A dedicated mock (rather than `TestFileSystem`'s
+        // ENOSYS default) lets the assertions pin EBADF on the wire.
         struct PreDispatchErrFs;
         impl FileSystem for PreDispatchErrFs {
             async fn read(&self, _op: Read<'_>, _reply: FuseResponse) -> FuseResult<()> {
@@ -2012,17 +1884,11 @@ mod tests {
         }
 
         // A FileSystem whose `read` REPLIES via the passed-in `reply` and THEN returns
-        // `Err`. This is the "Verified nuance" from #1089: an op that already answered
-        // the kernel but still surfaces an error. It exercises the exact end-to-end path
-        // `send_stream_dispatch` guards — the reply is sent through the original `rep`,
-        // then `if res.is_err() { err_rep.send_rep(res) }` fires on the shared clone — so
-        // driving it through `dispatch_and_collect` proves the fallback CANNOT
-        // double-reply, not just that the slot guard works in isolation.
-        //
-        // `cfg(not(debug_assertions))`: its only user, `err_rep_fallback_after_a_reply_
-        // is_noop`, is release-only (a real double reply trips `commit_reply_task`'s
-        // `debug_assert!` in debug), so gating the mock the same way avoids a
-        // "never constructed" warning in debug builds.
+        // `Err` — the #1089 "Verified nuance". Driven through `dispatch_and_collect`,
+        // it proves the `if res.is_err() { err_rep.send_rep(res) }` fallback cannot
+        // double-reply end-to-end, not just that the slot guard works in isolation.
+        // `cfg(not(debug_assertions))` matches its only (release-only) user, so the
+        // mock is not "never constructed" in debug.
         #[cfg(not(debug_assertions))]
         struct ReplyThenErrFs;
         #[cfg(not(debug_assertions))]

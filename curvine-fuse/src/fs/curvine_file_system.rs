@@ -36,7 +36,7 @@ use curvine_common::MAX_FILE_SIZE;
 use curvine_core::common::{ByteUnit, TimeSpent};
 use curvine_core::runtime::Runtime;
 use curvine_core::sys::FFIUtils;
-use curvine_core::{sys, ternary, try_option};
+use curvine_core::{sys, try_option};
 use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -242,27 +242,40 @@ impl CurvineFileSystem {
 
     async fn fs_unlock(&self, handler: &FileHandle, flags: LockFlags) -> FuseResult<()> {
         if let Some(owner_id) = handler.remove_lock(flags) {
-            let client_id = self.fs.cv().fs_context().clone_client_name();
-            let path = Path::from_str(&handler.status().path)?;
-
-            let mut lock = FileLock {
-                client_id,
-                owner_id,
-                lock_type: LockType::UnLock,
-                lock_flags: flags,
-                ..Default::default()
-            };
-            if flags == LockFlags::Plock {
-                lock.start = 0;
-                lock.end = u64::MAX;
-            }
-
-            if let Err(e) = self.fs.set_lock(&path, lock).await {
+            if let Err(e) = self.fs_unlock_owner(handler, flags, owner_id).await {
                 // Preserve the owner locally when the backend unlock fails so a
                 // retained handle can retry the cleanup.
                 handler.add_lock(flags, owner_id);
-                return Err(e.into());
+                return Err(e);
             }
+        }
+
+        Ok(())
+    }
+
+    async fn fs_unlock_owner(
+        &self,
+        handler: &FileHandle,
+        flags: LockFlags,
+        owner_id: u64,
+    ) -> FuseResult<()> {
+        let client_id = self.fs.cv().fs_context().clone_client_name();
+        let path = Path::from_str(&handler.status().path)?;
+
+        let mut lock = FileLock {
+            client_id,
+            owner_id,
+            lock_type: LockType::UnLock,
+            lock_flags: flags,
+            ..Default::default()
+        };
+        if flags == LockFlags::Plock {
+            lock.start = 0;
+            lock.end = u64::MAX;
+        }
+
+        if let Err(e) = self.fs.set_lock(&path, lock).await {
+            return Err(e.into());
         }
 
         Ok(())
@@ -296,6 +309,18 @@ impl CurvineFileSystem {
         Ok(res)
     }
 
+    /// The readdir resume cookie for the entry at zero-based directory position
+    /// `index`: the offset the kernel must pass on the next readdir to continue
+    /// AFTER this entry, i.e. the position of the FOLLOWING entry (`index + 1`).
+    ///
+    /// This is deliberately a tiny named function so the +1 is covered by a
+    /// regression test: encoding `index` instead makes the last entry of a batch
+    /// carry a cookie equal to the batch's start offset, so the kernel re-requests
+    /// the same offset forever and readdir never terminates (issue #1116).
+    fn readdir_next_cookie(index: u64) -> u64 {
+        index + 1
+    }
+
     /// Returns the encoded dirent list plus the number of entries successfully
     /// added this batch (`index - arg.offset`), which is what `readdir_entries`
     /// observes — NOT `FuseDirentList`'s byte length and NOT the directory total.
@@ -325,7 +350,10 @@ impl CurvineFileSystem {
                 };
 
                 let entry = FuseUtils::create_entry_out(&self.conf, attr);
-                if !res.add_dirent(plus, index, &status, entry) {
+                // dirent `off` is the resume cookie = position of the NEXT entry.
+                // See `readdir_next_cookie` (issue #1116 infinite-loop guard).
+                let next_off = Self::readdir_next_cookie(index);
+                if !res.add_dirent(plus, next_off, &status, entry) {
                     batch.push_front(status);
                     break;
                 }
@@ -508,21 +536,14 @@ impl CurvineFileSystem {
         }
     }
 
-    /// Negotiate the init reply flags as an explicit allowlist rather than
-    /// blindly echoing every kernel-offered capability.
-    ///
-    /// Two categories:
-    /// 1. Kernel-negotiated caps: `SUPPORTED_INIT_FLAGS & kernel_flags` — only
-    ///    bits the daemon implements AND the kernel offered. This inherently
-    ///    excludes `FUSE_ATOMIC_O_TRUNC` (open does not truncate, #1122),
-    ///    `FUSE_POSIX_ACL`, `FUSE_HAS_IOCTL_DIR`, and any unknown/future bit,
-    ///    since none are in `SUPPORTED_INIT_FLAGS`. `FUSE_MAX_PAGES` survives
-    ///    only when the kernel offers it.
-    /// 2. Config-gated daemon-requested caps, forced on (NOT masked by the
-    ///    kernel offer): `FUSE_WRITEBACK_CACHE` when `write_back_cache`, and the
-    ///    `FUSE_SPLICE_*` bits when `enable_splice`. Splice is driven by the
-    ///    channel talking splice(2) on the fuse fd directly, independent of an
-    ///    init-flag offer, so it must be advertised on config alone.
+    /// Negotiate init reply flags as an explicit allowlist, not a blind echo:
+    /// 1. Kernel-negotiated: `SUPPORTED_INIT_FLAGS & kernel_flags` (only caps the
+    ///    daemon implements AND the kernel offered — see `SUPPORTED_INIT_FLAGS` for
+    ///    what that deliberately excludes).
+    /// 2. Config-gated, forced on regardless of the kernel offer:
+    ///    `FUSE_WRITEBACK_CACHE` (when `write_back_cache`) and `FUSE_SPLICE_*` (when
+    ///    `enable_splice` — splice drives the fuse fd directly, so it is advertised
+    ///    on config alone).
     fn negotiate_out_flags(kernel_flags: u32, write_back_cache: bool, enable_splice: bool) -> u32 {
         let mut out = SUPPORTED_INIT_FLAGS & kernel_flags;
         if write_back_cache {
@@ -1040,24 +1061,13 @@ impl fs::FileSystem for CurvineFileSystem {
         let keep_cache = if self.conf.direct_io {
             false
         } else {
-            // Page cache consistency is handled here rather than via explicit inode
-            // invalidation notifications, for two reasons:
-            //
-            // 1. Sending inode-invalidation notifications (FUSE_NOTIFY_INVAL_INODE) on
-            //    some older kernel versions can trigger a deadlock inside send_inode_out.
-            //
-            // 2. On open, the kernel always issues a fresh getattr to the FUSE daemon
-            //    regardless of whether the attr cache is still valid.  The kernel then
-            //    compares mtime and file size; if either has changed it automatically
-            //    invalidates the page cache for that inode.  This behaviour is governed
-            //    by the CAP_AUTO_INVAL_DATA capability (available since Linux 2.6.35,
-            //    enabled by default), so no additional notification is required from
-            //    our side.
-            //
-            // Note: if the user-space metadata cache (enable_meta_cache) is enabled,
-            // keep_cache may return true even after a remote modification, causing stale
-            // reads.  This is intentional — metadata caching trades strict consistency
-            // for performance, and callers that enable it accept this trade-off.
+            // Page cache consistency is handled here, not via explicit inode
+            // invalidation, because: (1) FUSE_NOTIFY_INVAL_INODE can deadlock inside
+            // send_inode_out on some older kernels; (2) on open the kernel issues a
+            // fresh getattr and auto-invalidates the page cache if mtime/size changed
+            // (CAP_AUTO_INVAL_DATA, on by default since Linux 2.6.35), so no notify is
+            // needed. Note: with enable_meta_cache, keep_cache may return true after a
+            // remote modification (stale reads) — an intentional consistency/perf trade.
             self.state.keep_cache(ino, &handle.status())
         };
         let open_flags = FuseUtils::file_open_flags(&self.conf, keep_cache);
@@ -1142,7 +1152,11 @@ impl fs::FileSystem for CurvineFileSystem {
                 .invalid_cache(op.header.nodeid, None, INVAL_REASON_FLUSH);
         }
 
-        self.fs_unlock(&handle, LockFlags::Plock).await?;
+        if op.arg.lock_owner != 0 {
+            self.fs_unlock_owner(&handle, LockFlags::Plock, op.arg.lock_owner)
+                .await?;
+            handle.take_plock_if_owner(op.arg.lock_owner);
+        }
         handle.flush(Some(reply)).await
     }
 
@@ -1358,23 +1372,11 @@ impl fs::FileSystem for CurvineFileSystem {
         Ok(())
     }
 
-    /// Create a file system node (mknod system call)
-    ///
-    /// This function handles the creation of file system nodes:
-    /// - For regular files: delegates to `create()` and immediately closes the handle
-    /// - For directories: delegates to `mkdir()`
-    /// - For char/block/fifo device nodes: creates metadata-only special nodes
-    /// - For other types (sockets, etc.): returns EPERM error
-    ///
-    /// # Arguments
-    /// * `op` - MkNod operation containing:
-    ///   - `mode`: file type and permissions
-    ///   - `umask`: file creation mask
-    ///   - `name`: name of the node to create
-    ///
-    /// # Returns
-    /// * `Ok(fuse_entry_out)` - Entry information for the created node
-    /// * `Err(FuseError)` - Error if creation fails or unsupported type
+    /// Create a filesystem node (`mknod`):
+    /// - regular file: delegates to `create()` then closes the handle;
+    /// - directory: delegates to `mkdir()`;
+    /// - char/block/fifo: creates a metadata-only special node;
+    /// - other types (sockets, …): returns EPERM.
     async fn mk_nod(&self, op: MkNod<'_>) -> FuseResult<fuse_entry_out> {
         let name = try_option!(op.name.to_str());
         if name.len() > FUSE_MAX_NAME_LENGTH {
@@ -1433,7 +1435,6 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn get_lk(&self, op: GetLk<'_>) -> FuseResult<fuse_lk_out> {
         let path = self.state.get_path(op.header.nodeid)?;
         let lock = self.to_file_lock(op.arg);
-        let client_id = lock.client_id.clone();
 
         self.state.fs_fsync(op.header.nodeid, None).await?;
 
@@ -1443,7 +1444,7 @@ impl fs::FileSystem for CurvineFileSystem {
                 start: lk.start,
                 end: lk.end,
                 typ: lk.lock_type as u32,
-                pid: ternary!(client_id == lk.client_id, lk.pid, 0),
+                pid: lk.pid,
             },
 
             None => fuse_file_lock {
@@ -1577,29 +1578,13 @@ mod tests {
         assert_eq!(zero_range.errno, libc::EOPNOTSUPP);
     }
 
-    /// Pin the production init-order invariant that Phase 1b-2 depends on:
-    /// `FuseMetrics::ensure_init()` MUST run before `NodeState::new()` in
-    /// `CurvineFileSystem::new`. After 1b-2 removed the scrape-time
-    /// `set_metrics()` refresh, the legacy gauges are only correct if their
-    /// event-driven updates (routed through `FuseMetrics::with`) land on an
-    /// initialized singleton; the `NodeMap::new` root baseline `set(1)` is the
-    /// first such update and fires inside `NodeState::new`. If a refactor moved
-    /// `ensure_init()` after `NodeState::new` (or dropped it), that baseline —
-    /// and every subsequent inc/dec — would be silently no-op'd by `with`, and
-    /// the gauges would drift permanently low with no panic.
-    ///
-    /// A behavioral assertion (construct, then check the singleton is init) is
-    /// useless here: the process-global `OnceCell` is already initialized by
-    /// other tests in this binary, so it would pass even if `ensure_init` were
-    /// deleted. We assert on the source text instead, which catches both a
-    /// reordering and an outright removal.
-    ///
-    /// The search is scoped to the body of `fn new` so the literals in this
-    /// test's own doc comment / assert message do not satisfy `find()` — that
-    /// self-reference would make the `.expect` guards dead (the strings always
-    /// exist in this file) and let a removal of the real call slip through by
-    /// matching the prose instead. Slicing to `fn new` keeps `.expect` a real
-    /// "the call was deleted" guard.
+    /// Pin that `FuseMetrics::ensure_init()` runs before `NodeState::new()` in
+    /// `CurvineFileSystem::new`: the event-driven gauges are silently no-op'd by
+    /// `with()` (drifting permanently low, no panic) if a mutation fires before
+    /// init. A behavioral check is useless (the process-global `OnceCell` is
+    /// already init by other tests in this binary), so we assert on the source
+    /// text — scoped to the body of `fn new`, so this test's own doc/assert
+    /// literals don't satisfy `find()` and mask a real removal.
     #[test]
     fn ensure_init_precedes_node_state() {
         let src = include_str!("curvine_file_system.rs");
@@ -1810,5 +1795,328 @@ mod tests {
                                                                  // An unknown high bit must also be rejected — checked against the raw
                                                                  // value, so it is not silently truncated away (the RenameFlags footgun).
         assert!(!CurvineFileSystem::rename2_flags_supported(1 << 6));
+    }
+
+    // Issue #1116: readdir must terminate. The dirent `off` field is the kernel's
+    // resume cookie; encoding the current entry's position instead of the next
+    // one makes the last entry of a batch carry a cookie equal to the offset the
+    // kernel resumes at, so the kernel re-requests the same offset forever.
+    //
+    // This harness faithfully replays the kernel readdir protocol against the
+    // PRODUCTION pieces: each round calls the real `DirHandle::get_batch` (which
+    // owns the forward-only skip/positioning semantics) to fetch entries starting
+    // at `offset`, then derives the next `offset` from the last entry's cookie via
+    // the production `CurvineFileSystem::readdir_next_cookie`. Termination, no
+    // duplicates, and no omissions are all asserted. With the pre-fix cookie
+    // formula (`index`) the loop never advances past the tail entry and the round
+    // guard trips — which is exactly the regression this pins.
+    mod readdir_termination {
+        use crate::fs::state::DirHandle;
+        use curvine_common::fs::{ListStream, Path};
+        use curvine_common::state::FileStatus;
+        use curvine_core::runtime::{AsyncRuntime, RpcRuntime};
+
+        fn entries(names: &[&str]) -> Vec<FileStatus> {
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| FileStatus::with_name(i as i64, n.to_string(), false))
+                .collect()
+        }
+
+        // Replay the kernel readdir loop with a caller-supplied cookie function so
+        // the test can exercise both the production formula and (as a discriminator)
+        // the buggy pre-fix one. Returns the sequence of names handed to the kernel,
+        // or Err if the loop fails to terminate within `max_rounds`.
+        fn replay_readdir<F>(
+            names: &[&str],
+            cookie: F,
+            max_rounds: usize,
+        ) -> Result<Vec<String>, String>
+        where
+            F: Fn(u64) -> u64,
+        {
+            let rt = AsyncRuntime::single();
+            rt.block_on(async {
+                let path = Path::from_str("/d").unwrap();
+                let mut seen = Vec::new();
+                let mut offset: u64 = 0;
+
+                for _ in 0..max_rounds {
+                    // A fresh handle each round models the worst case where the
+                    // stream is (re)positioned purely from `offset` — the same
+                    // path the real daemon takes on a resumed/rebuilt readdir.
+                    let handle = DirHandle::new(
+                        1,
+                        1,
+                        &path,
+                        1000,
+                        ListStream::from_vec(entries(names)),
+                    );
+                    let batch = handle.get_batch(offset as usize).await.unwrap();
+                    if batch.is_empty() {
+                        return Ok(seen); // kernel sees 0 entries => readdir done
+                    }
+
+                    // The kernel consumes the batch and remembers the LAST entry's
+                    // cookie as the offset for its next request.
+                    let mut index = offset;
+                    let mut last_cookie = offset;
+                    for st in batch {
+                        seen.push(st.name.clone());
+                        last_cookie = cookie(index);
+                        index += 1;
+                    }
+                    offset = last_cookie;
+                }
+                Err(format!(
+                    "readdir did not terminate within {} rounds (offset stuck at {}, {} entries emitted)",
+                    max_rounds,
+                    offset,
+                    seen.len()
+                ))
+            })
+        }
+
+        #[test]
+        fn production_cookie_terminates_and_enumerates_each_entry_once() {
+            let names = ["a", "b", "c", "d", "e"];
+            let seen = replay_readdir(&names, super::CurvineFileSystem::readdir_next_cookie, 100)
+                .expect("production readdir_next_cookie must let readdir terminate");
+            assert_eq!(
+                seen,
+                names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "every entry enumerated exactly once, in order, with no repeats"
+            );
+        }
+
+        // Discriminator: the pre-fix formula (cookie = current index) makes the
+        // loop stick on the tail entry and never terminate. This proves the
+        // harness above actually catches an off-by-one regression rather than
+        // passing vacuously.
+        #[test]
+        fn prefix_cookie_would_loop_forever() {
+            let names = ["a", "b", "c", "d", "e"];
+            let result = replay_readdir(&names, |index| index, 100);
+            assert!(
+                result.is_err(),
+                "cookie=index (pre-#1116 bug) must fail to terminate, got {:?}",
+                result
+            );
+        }
+
+        // Multi-batch variant that exercises the `FuseDirentList` response-size
+        // cutoff path (reviewer request on PR #1236). The real
+        // `read_dir_common_inner` stops filling a response when
+        // `res.add_dirent(...)` returns false (kernel buffer full), pushes the
+        // rejected entry back, and only advances `index` for entries actually
+        // emitted — so the kernel resumes from the LAST EMITTED entry's cookie,
+        // not from the whole `get_batch` result. `max_emit_per_round` models that
+        // buffer limit: at most that many entries are handed to the kernel each
+        // round, the rest are dropped (as if pushed back), and the next request
+        // resumes from the last emitted cookie. This pins that `index + 1` still
+        // advances correctly when a listing is split across several responses.
+        fn replay_readdir_batched<F>(
+            names: &[&str],
+            cookie: F,
+            max_emit_per_round: usize,
+            max_rounds: usize,
+        ) -> Result<Vec<String>, String>
+        where
+            F: Fn(u64) -> u64,
+        {
+            assert!(max_emit_per_round >= 1, "must emit at least one per round");
+            let rt = AsyncRuntime::single();
+            rt.block_on(async {
+                let path = Path::from_str("/d").unwrap();
+                let mut seen = Vec::new();
+                let mut offset: u64 = 0;
+
+                for _ in 0..max_rounds {
+                    let handle =
+                        DirHandle::new(1, 1, &path, 1000, ListStream::from_vec(entries(names)));
+                    let batch = handle.get_batch(offset as usize).await.unwrap();
+                    if batch.is_empty() {
+                        return Ok(seen); // kernel sees 0 entries => readdir done
+                    }
+
+                    // Emit at most `max_emit_per_round` entries this round, mirroring
+                    // the response-buffer cutoff. `index` only advances for emitted
+                    // entries; the next offset is the last EMITTED entry's cookie.
+                    let mut index = offset;
+                    let mut last_cookie = offset;
+                    for st in batch.into_iter().take(max_emit_per_round) {
+                        seen.push(st.name.clone());
+                        last_cookie = cookie(index);
+                        index += 1;
+                    }
+                    offset = last_cookie;
+                }
+                Err(format!(
+                    "readdir did not terminate within {} rounds (offset stuck at {}, {} entries emitted)",
+                    max_rounds,
+                    offset,
+                    seen.len()
+                ))
+            })
+        }
+
+        // With the production cookie, a listing split across many small responses
+        // still enumerates every entry exactly once, in order, and terminates.
+        #[test]
+        fn production_cookie_terminates_across_multiple_response_buffers() {
+            let names = ["a", "b", "c", "d", "e", "f", "g"];
+            // Emit 2 per round => 4 rounds of data + 1 terminating empty round.
+            let seen = replay_readdir_batched(
+                &names,
+                super::CurvineFileSystem::readdir_next_cookie,
+                2,
+                100,
+            )
+            .expect("production cookie must terminate under a split response buffer");
+            assert_eq!(
+                seen,
+                names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "split-response readdir enumerates each entry once, in order, no repeats/gaps"
+            );
+        }
+
+        // Even down to a single entry per response (the harshest split), the
+        // production cookie advances correctly and terminates.
+        #[test]
+        fn production_cookie_terminates_with_single_entry_responses() {
+            let names = ["a", "b", "c"];
+            let seen = replay_readdir_batched(
+                &names,
+                super::CurvineFileSystem::readdir_next_cookie,
+                1,
+                100,
+            )
+            .expect("production cookie must terminate at one entry per response");
+            assert_eq!(seen, vec!["a", "b", "c"]);
+        }
+
+        // Discriminator for the split path: cookie=index loops forever here too,
+        // proving the multi-batch harness genuinely exercises the regression.
+        #[test]
+        fn prefix_cookie_loops_forever_under_split_response() {
+            let names = ["a", "b", "c", "d", "e", "f", "g"];
+            let result = replay_readdir_batched(&names, |index| index, 2, 100);
+            assert!(
+                result.is_err(),
+                "cookie=index must fail to terminate under split responses, got {:?}",
+                result
+            );
+        }
+
+        // Reviewer request (PR #1236): the two harnesses above rebuild a fresh
+        // DirHandle with limit=1000 every round, so `get_batch` returns the whole
+        // remainder in one shot and never drives DirHandle's OWN batching — the
+        // `buf.len() < limit` fill loop and the `set_buf` push-back of leftovers.
+        // That is the reused-stream production path (a directory is opened once
+        // and the same stream is reused across every readdir in the session).
+        //
+        // This harness keeps a SINGLE handle across rounds with a SMALL limit, and
+        // models the FUSE response cutoff by emitting at most `max_emit_per_round`
+        // of what `get_batch` returned and pushing the rest back with the real
+        // `set_buf` — exactly what `read_dir_common_inner` does when
+        // `add_dirent` reports the kernel buffer is full. So cookie advancement is
+        // validated together with DirHandle's real limit batching + set_buf
+        // leftovers, not just a harness-side `take()`.
+        //
+        // Note: with a reused stream the resume `off` never re-enters get_batch's
+        // skip branch (that fires only on a fresh `index == 0`); the stream just
+        // advances forward and leftovers ride in `buf`. Termination here comes
+        // from the stream draining, and the cookie must still march 1:1 with the
+        // entries so nothing is dropped or repeated across the buf boundary.
+        fn replay_readdir_reused_handle<F>(
+            names: &[&str],
+            cookie: F,
+            limit: usize,
+            max_emit_per_round: usize,
+            max_rounds: usize,
+        ) -> Result<Vec<String>, String>
+        where
+            F: Fn(u64) -> u64,
+        {
+            assert!(limit >= 1, "limit must be >= 1");
+            assert!(max_emit_per_round >= 1, "must emit at least one per round");
+            let rt = AsyncRuntime::single();
+            rt.block_on(async {
+                let path = Path::from_str("/d").unwrap();
+                // One handle, reused across all rounds — the production session path.
+                let handle =
+                    DirHandle::new(1, 1, &path, limit, ListStream::from_vec(entries(names)));
+                let mut seen = Vec::new();
+                let mut offset: u64 = 0;
+
+                for _ in 0..max_rounds {
+                    let mut batch = handle.get_batch(offset as usize).await.unwrap();
+                    if batch.is_empty() {
+                        return Ok(seen); // kernel sees 0 entries => readdir done
+                    }
+
+                    // Emit at most `max_emit_per_round`; `index` (and the cookie)
+                    // advance only for emitted entries.
+                    let mut index = offset;
+                    let mut last_cookie = offset;
+                    let mut emitted = 0;
+                    while emitted < max_emit_per_round {
+                        match batch.pop_front() {
+                            Some(st) => {
+                                seen.push(st.name.clone());
+                                last_cookie = cookie(index);
+                                index += 1;
+                                emitted += 1;
+                            }
+                            None => break,
+                        }
+                    }
+                    // Push the unemitted remainder back, exactly as the daemon does
+                    // when the kernel response buffer fills mid-batch.
+                    handle.set_buf(batch).await.unwrap();
+                    offset = last_cookie;
+                }
+                Err(format!(
+                    "readdir did not terminate within {} rounds (offset stuck at {}, {} entries emitted)",
+                    max_rounds,
+                    offset,
+                    seen.len()
+                ))
+            })
+        }
+
+        // Reused handle + small DirHandle limit (2) + response cutoff (1 per round):
+        // DirHandle's own fill/limit batching and set_buf leftovers are both on the
+        // path, and the production cookie still enumerates every entry once, in
+        // order, and terminates.
+        //
+        // This test is NOT vacuous: it calls the real `get_batch`/`set_buf`, so a
+        // regression in the limit fill loop or the leftover push-back would drop,
+        // duplicate, or reorder entries and the exact-sequence assertion below
+        // would fail. A cookie=index discriminator is deliberately NOT added on
+        // this path: with a reused stream the resume `off` is never used to
+        // position the stream (the stream only moves forward and leftovers ride in
+        // `buf`), so even the buggy cookie terminates here — which is exactly why
+        // the bug stayed latent in production (see PR summary). The infinite-loop
+        // regression is pinned by the fresh-handle discriminators above
+        // (`prefix_cookie_would_loop_forever` / `_under_split_response`).
+        #[test]
+        fn production_cookie_terminates_with_reused_handle_small_limit() {
+            let names = ["a", "b", "c", "d", "e", "f", "g"];
+            let seen = replay_readdir_reused_handle(
+                &names,
+                super::CurvineFileSystem::readdir_next_cookie,
+                2, // DirHandle limit: real batching, not one-shot
+                1, // emit 1 per round: forces set_buf push-back of the leftover
+                100,
+            )
+            .expect("production cookie must terminate on a reused handle with a small limit");
+            assert_eq!(
+                seen,
+                names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "reused-handle batching enumerates each entry once, in order, no repeats/gaps"
+            );
+        }
     }
 }

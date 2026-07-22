@@ -181,4 +181,12 @@ mod tests {
         let err = opts.validate().unwrap_err();
         assert!(matches!(err, FsError::InvalidFileSize(_)));
     }
+
+    #[test]
+    fn from_bits_accepts_default_and_keep_size() {
+        let default = FileAllocMode::from_bits(0).expect("mode 0 must be valid");
+        assert!(!default.contains(FileAllocMode::KEEP_SIZE));
+        let keep = FileAllocMode::from_bits(1).expect("mode 1 must be valid");
+        assert!(keep.contains(FileAllocMode::KEEP_SIZE));
+    }
 }

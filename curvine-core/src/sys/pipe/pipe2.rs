@@ -14,10 +14,24 @@
 
 use crate::io::IOResult;
 use crate::sys::pipe::{AsyncFd, PipeFd, PipePool, PipeReader, PipeWriter};
-use crate::sys::RawIO;
+use crate::sys::{CInt, RawIO};
 use crate::{err_box, sys};
+use log::warn;
 use std::io::IoSlice;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+// Backoff bounds for the splice-path EAGAIN retry loop (see `splice_retry`).
+// /dev/fuse is permanently level-writable, so its writable edge never fires
+// again after tokio's edge-triggered readiness clears on an EAGAIN from the
+// non-blocking splice. Awaiting the WRITABLE readiness there hangs forever
+// (issue #1215); instead we retry the raw splice behind a bounded async backoff.
+const SPLICE_RETRY_MIN: Duration = Duration::from_micros(50);
+const SPLICE_RETRY_MAX: Duration = Duration::from_millis(5);
+// While retrying continuous EAGAIN, log a warning this often. Until the sender
+// watchdog lands (#1215 PR-B), a stuck sender is otherwise invisible (it makes
+// no progress and emits no error); this surfaces the failure mode in the field.
+const SPLICE_RETRY_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct Pipe2 {
     buf_size: usize,
@@ -136,17 +150,74 @@ impl Pipe2 {
             );
         }
         let fd_in = self.reader.raw_fd();
+        let fd_out = fd_out.raw_fd();
         let mut remaining = len;
         while remaining > 0 {
-            let res = fd_out
-                .async_write(|fd| sys::splice(fd_in, None, fd.fd(), None, remaining))
-                .await?;
+            // /dev/fuse is permanently level-writable, so on EAGAIN its writable
+            // edge never fires again and awaiting AsyncFd WRITABLE readiness
+            // hangs forever (#1215). Retry the raw splice behind a bounded async
+            // backoff rather than waiting on the tokio readiness.
+            let res =
+                Self::splice_retry(|| sys::splice(fd_in, None, fd_out, None, remaining)).await?;
             if res == 0 {
                 return err_box!("splice returned 0");
             }
             remaining -= res as usize;
         }
         Ok(())
+    }
+
+    // Run the non-blocking splice syscall, retrying on EAGAIN behind a bounded
+    // exponential async backoff. Used on the FUSE reply path where the
+    // destination fd (/dev/fuse) is permanently level-writable, so tokio's
+    // edge-triggered WRITABLE readiness never fires again after an EAGAIN and
+    // awaiting it hangs forever (#1215). EINTR is retried immediately; any other
+    // error propagates. The backoff sleeps on the tokio timer so it yields the
+    // worker instead of busy-spinning. Note: if the destination stays EAGAIN
+    // forever this retries indefinitely (bounded-rate, not a hang) by design;
+    // detecting a stuck sender and giving up is the watchdog's job (#1215 PR-B).
+    // While it keeps hitting EAGAIN it logs a warning every
+    // SPLICE_RETRY_WARN_INTERVAL so the otherwise-silent HOL-blocked sender is
+    // visible in the field before the watchdog lands.
+    async fn splice_retry(mut f: impl FnMut() -> IOResult<CInt>) -> IOResult<CInt> {
+        let mut delay = SPLICE_RETRY_MIN;
+        // Set on the first EAGAIN; measures how long this call has been stalled
+        // on continuous would-block. (Ok / real errors return, so there is no
+        // interleaved success to reset it within a single call.)
+        let mut eagain_since: Option<Instant> = None;
+        let mut next_warn = SPLICE_RETRY_WARN_INTERVAL;
+        loop {
+            match f() {
+                Ok(res) => return Ok(res),
+                Err(e) => {
+                    let os = e.raw_error().raw_os_error();
+                    if os == Some(libc::EINTR) {
+                        continue;
+                    }
+                    if e.is_would_block() {
+                        let stalled = match eagain_since {
+                            Some(start) => start.elapsed(),
+                            None => {
+                                eagain_since = Some(Instant::now());
+                                Duration::ZERO
+                            }
+                        };
+                        if stalled >= next_warn {
+                            warn!(
+                                "splice to fuse fd stuck on EAGAIN for {:?}; still retrying \
+                                 (bounded-rate). A sender may be HOL-blocked (#1215).",
+                                stalled
+                            );
+                            next_warn += SPLICE_RETRY_WARN_INTERVAL;
+                        }
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(SPLICE_RETRY_MAX);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
     }
 
     // Read the data of the pipeline into buf, pipe read -> buf
@@ -192,5 +263,77 @@ impl Drop for Pipe2 {
             // The pipeline in the resource is returned to the resource pool, not close.
             pool.release(self)
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::Pipe2;
+    use crate::io::{IOError, IOResult};
+    use crate::sys::CInt;
+    use std::cell::Cell;
+    use std::io;
+
+    fn eagain() -> IOError {
+        IOError::new(io::Error::from_raw_os_error(libc::EAGAIN))
+    }
+
+    fn eintr() -> IOError {
+        IOError::new(io::Error::from_raw_os_error(libc::EINTR))
+    }
+
+    // Regression for #1215: on a permanently level-writable fd (/dev/fuse), the
+    // syscall returns EAGAIN but tokio's edge-triggered WRITABLE readiness never
+    // fires again. `splice_retry` must NOT propagate WouldBlock nor hang — it
+    // must retry the raw syscall until it succeeds. The OLD code awaited
+    // async_write readiness here and hung forever, so this test fails against it.
+    #[tokio::test]
+    async fn splice_retry_retries_eagain_until_ok() {
+        let calls = Cell::new(0u32);
+        let f = || -> IOResult<CInt> {
+            let n = calls.get();
+            calls.set(n + 1);
+            // First 5 attempts report EAGAIN (would-block), then succeed.
+            if n < 5 {
+                Err(eagain())
+            } else {
+                Ok(4096)
+            }
+        };
+
+        let res = Pipe2::splice_retry(f)
+            .await
+            .expect("must complete, not hang");
+        assert_eq!(res, 4096);
+        assert_eq!(calls.get(), 6, "5 EAGAIN retries + 1 success");
+    }
+
+    // EINTR is retried immediately (no backoff), like the drain loop in #965.
+    #[tokio::test]
+    async fn splice_retry_retries_eintr() {
+        let calls = Cell::new(0u32);
+        let f = || -> IOResult<CInt> {
+            let n = calls.get();
+            calls.set(n + 1);
+            if n < 3 {
+                Err(eintr())
+            } else {
+                Ok(1)
+            }
+        };
+        let res = Pipe2::splice_retry(f).await.unwrap();
+        assert_eq!(res, 1);
+        assert_eq!(calls.get(), 4);
+    }
+
+    // A genuine (non-would-block, non-EINTR) error must propagate, not be
+    // swallowed by the retry loop — otherwise a real splice failure would spin
+    // forever. Uses EPIPE (broken pipe), a real splice failure mode.
+    #[tokio::test]
+    async fn splice_retry_propagates_real_error() {
+        let f =
+            || -> IOResult<CInt> { Err(IOError::new(io::Error::from_raw_os_error(libc::EPIPE))) };
+        let err = Pipe2::splice_retry(f).await.unwrap_err();
+        assert_eq!(err.raw_error().raw_os_error(), Some(libc::EPIPE));
     }
 }

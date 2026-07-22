@@ -55,11 +55,11 @@ pub(crate) enum FuseTask {
         errno: i32,
         /// Source tag for `status == Unsupported`, carried so the sender can emit
         /// `unsupported_total{reason}` without reaching back into the metrics
-        /// slot. Phase 1a-2 emits `unknown_opcode` / `unimplemented_opcode`;
+        /// slot. Emits `unknown_opcode` / `unimplemented_opcode`;
         /// `trait_default` is reserved for a later phase (no source site yet).
         /// `None` for non-unsupported replies.
         unsupported_reason: Option<&'static str>,
-        /// Phase 2a `reply_queue_depth` guard, created at the enqueue boundary so
+        /// `reply_queue_depth` guard, created at the enqueue boundary so
         /// the gauge counts this task's time in the reply channel. The sender
         /// `take()`s/drops it the moment it dequeues (the dequeue point, NOT after
         /// the splice); a task dropped without ever being received (sender exit /
@@ -72,7 +72,7 @@ pub(crate) enum FuseTask {
     NotifyReply {
         data: ResponseData,
         code: &'static str,
-        /// Phase 2a `reply_queue_depth` guard — same lifecycle as the
+        /// `reply_queue_depth` guard — same lifecycle as the
         /// `RequestReply` variant's. Notifications share the reply channel, so
         /// they count toward the same backlog. `None` when metrics disabled.
         queue_guard: Option<ActiveGuard>,

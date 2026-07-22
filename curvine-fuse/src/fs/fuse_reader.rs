@@ -26,7 +26,7 @@ use curvine_core::sync::channel::{
     AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender,
 };
 use curvine_core::sync::ErrorMonitor;
-use log::error;
+use log::{error, warn};
 use std::sync::Arc;
 
 enum ReadTask {
@@ -49,7 +49,7 @@ impl FuseReader {
         let err_monitor = Arc::new(ErrorMonitor::new());
         let (sender, receiver) = AsyncChannel::new(conf.stream_channel_size).split();
         let status = reader.status().clone();
-        // Phase 2b: capture the backend kind and the metrics gate at open time and
+        // capture the backend kind and the metrics gate at open time and
         // move them into the read task, so the per-IO observe in `read_future` has
         // the `path_type` label without re-resolving it on the hot path.
         let path_type = reader.path_type();
@@ -131,7 +131,7 @@ impl FuseReader {
         while let Some(task) = req_receiver.recv().await {
             match task {
                 ReadTask::Read(off, len, reply) => {
-                    // Phase 2b: observe the read backend IO (io_type=read). The
+                    // observe the read backend IO (io_type=read). The
                     // inflight guard wraps ONLY the `fuse_read` call (backend
                     // concurrency), and is dropped before the reply enqueue so the
                     // gauge excludes reply-channel time. Then record duration /
@@ -163,7 +163,12 @@ impl FuseReader {
                         );
                     }
 
-                    reply.send_data(data.map_err(|x| x.into())).await?;
+                    if let Err(e) = reply.send_data(data.map_err(|x| x.into())).await {
+                        // The read itself is complete. Losing this request's reply
+                        // receiver must not kill the shared worker and make every
+                        // later read on the handle fail.
+                        warn!("failed to send FUSE read reply: {}", e);
+                    }
                 }
 
                 ReadTask::Complete(tx, reply) => {
@@ -218,6 +223,12 @@ mod tests {
         FuseResponse::new_reply(1, tx, false, Some(ctx))
     }
 
+    fn closed_reply(unique: u64) -> FuseResponse {
+        let (tx, rx) = AsyncChannel::<FuseTask>::new(1).split();
+        drop(rx);
+        FuseResponse::new_reply(unique, tx, false, None)
+    }
+
     fn read_op_arg(offset: u64, size: u32) -> fuse_read_in {
         fuse_read_in {
             fh: 0,
@@ -228,6 +239,66 @@ mod tests {
             flags: 0,
             padding: 0,
         }
+    }
+
+    #[test]
+    fn reply_send_error_does_not_kill_reader_worker() {
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            let path_buf = std::env::temp_dir().join(format!(
+                "fr_reply_failure_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            {
+                let mut file = std::fs::File::create(&path_buf).unwrap();
+                file.write_all(b"reader-worker-survives").unwrap();
+            }
+            let path = curvine_common::fs::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+
+            // This is a lifecycle test, not a metrics test. Keep it isolated
+            // from the process-global metric counters used by parallel tests.
+            let conf = FuseConf {
+                metrics_enabled: false,
+                ..Default::default()
+            };
+            let reader = UnifiedReader::Local(LocalReader::new(&path, 4096).unwrap());
+            let rt2 = Arc::new(AsyncRuntime::single());
+            let fuse_reader = FuseReader::new(&conf, rt2.clone(), reader);
+            std::mem::forget(rt2);
+
+            let header = fuse_in_header::default();
+            let first_arg = read_op_arg(0, 6);
+            fuse_reader
+                .read(
+                    Read {
+                        header: &header,
+                        arg: &first_arg,
+                    },
+                    closed_reply(1),
+                )
+                .await
+                .unwrap();
+
+            // Submit a normal second read. Receiving its response proves that the
+            // worker survived the first request's closed reply channel.
+            let (reply_tx, mut reply_rx) = AsyncChannel::<FuseTask>::new(1).split();
+            let second_arg = read_op_arg(7, 6);
+            fuse_reader
+                .read(
+                    Read {
+                        header: &header,
+                        arg: &second_arg,
+                    },
+                    FuseResponse::new_reply(2, reply_tx, false, None),
+                )
+                .await
+                .unwrap();
+            fuse_reader.complete(None).await.unwrap();
+
+            assert!(matches!(reply_rx.recv().await, Some(FuseTask::Reply(_))));
+            let _ = std::fs::remove_file(&path_buf);
+        });
     }
 
     // A real FuseReader over UnifiedReader::Local drives the read task body through

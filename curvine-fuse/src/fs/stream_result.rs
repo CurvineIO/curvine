@@ -16,34 +16,20 @@ use crate::fuse_error::{errno_of, FuseError};
 use crate::session::FuseResponse;
 use curvine_common::FsResult;
 use curvine_core::sync::channel::CallSender;
+use log::warn;
 
-/// Deliver a backend stream-op result (`Flush`/`Complete`/`Resize`) to the
-/// correct single consumer, which differs by whether this op originated from a
-/// kernel request (`reply = Some`) or an internal caller (`reply = None`).
+/// Deliver a backend stream-op result (`Flush`/`Complete`/`Resize`) to the one
+/// correct consumer, which differs by origin:
 ///
-/// Why the split (PR #1201 review): the kernel reply and the `tx` completion
-/// channel are BOTH ways a result travels back, but for a kernel request they
-/// are two ends of the SAME FUSE request. If we sent the real `Err` on `tx`,
-/// the caller (`flush()/complete()/resize()`) would return it up the dispatch
-/// chain, where `send_stream_dispatch` treats any `Err` as a pre-reply dispatch
-/// failure and calls `err_rep.send_rep(res)` — enqueuing a SECOND kernel reply
-/// for the same request. So the helper is the single decision point:
-///
-///   * `reply = Some` (kernel request): the kernel reply is the authoritative
-///     response. Send the real (errno-mapped) result to the kernel, and hand
-///     the in-process caller a bare `Ok(())` so it does NOT re-propagate the
-///     error and trigger a duplicate reply. Ordering (issue #1118): notify `tx`
-///     FIRST, then the kernel reply, so a blocked/failing reply channel cannot
-///     gate the caller's completion notification.
-///   * `reply = None` (internal caller: read-path dirty-read flush, flush_writer,
-///     release's `complete(None)`, resize): `tx` is the ONLY channel back, so
-///     the real backend result MUST travel on it — otherwise a backend failure
-///     is silently swallowed (the bug issue #1118 fixed).
-///
-/// `FsError` is not `Clone`, but that is no longer a constraint here: on the
-/// `reply = Some` path only the kernel reply needs the error (via a borrowed
-/// `errno_of`), and the caller receives a value-free `Ok(())` signal; on the
-/// `reply = None` path the single `res` is simply moved onto `tx`.
+///   * `reply = Some` (kernel request): the kernel reply is authoritative. Send
+///     the real (errno-mapped) result to the kernel and hand the in-process
+///     caller a bare `Ok(())` — if the caller re-propagated the `Err`,
+///     `send_stream_dispatch` would treat it as a dispatch failure and enqueue a
+///     SECOND kernel reply for the same request. Notify `tx` FIRST, then reply,
+///     so a blocked reply channel cannot gate the caller's completion (#1118).
+///   * `reply = None` (internal caller: dirty-read flush, flush_writer,
+///     release's `complete(None)`, resize): `tx` is the ONLY channel back, so the
+///     real result MUST travel on it, else a backend failure is swallowed (#1118).
 pub(crate) async fn deliver_stream_result(
     res: FsResult<()>,
     tx: CallSender<FsResult<()>>,
@@ -58,14 +44,29 @@ pub(crate) async fn deliver_stream_result(
                 Ok(()) => Ok(()),
                 Err(e) => Err(FuseError::from_errno_msg(errno_of(e), e.to_string().into())),
             };
-            tx.send(Ok(()))?;
-            reply.send_rep(kernel_rep).await?;
+            if let Err(e) = tx.send(Ok(())) {
+                // The dispatch future was cancelled after submitting the task.
+                // Still attempt the authoritative kernel reply, and keep the
+                // stream worker alive for subsequent operations.
+                warn!("failed to deliver stream result to internal caller: {}", e);
+            }
+            if let Err(e) = reply.send_rep(kernel_rep).await {
+                // The backend work and internal notification are already done.
+                // A closed reply channel is local to this request and must not
+                // terminate the long-lived reader/writer worker.
+                warn!("failed to send FUSE stream reply: {}", e);
+            }
         }
 
         // Internal-caller path: tx is the only way back, so the real backend
         // result must travel on it (do not swallow the error — issue #1118).
         None => {
-            tx.send(res)?;
+            if let Err(e) = tx.send(res) {
+                // An internal caller can be cancelled while its backend task is
+                // in flight. Treat the abandoned receiver like a reply-send
+                // failure instead of killing the shared worker.
+                warn!("failed to deliver stream result to internal caller: {}", e);
+            }
         }
     }
 
@@ -189,5 +190,26 @@ mod tests {
             ),
             _ => panic!("expected FuseTask::Reply"),
         }
+    }
+
+    #[tokio::test]
+    async fn closed_reply_channel_does_not_fail_internal_completion() {
+        use crate::session::{FuseResponse, FuseTask};
+        use curvine_core::sync::channel::AsyncChannel;
+
+        let (task_tx, task_rx) = AsyncChannel::<FuseTask>::new(1).split();
+        drop(task_rx);
+        let reply = FuseResponse::new_reply(1, task_tx, false, None);
+        let (tx, rx) = CallChannel::channel::<FsResult<()>>();
+
+        deliver_stream_result(Ok(()), tx, Some(reply))
+            .await
+            .expect("reply-send failure is best effort");
+
+        assert!(rx
+            .receive()
+            .await
+            .expect("internal completion is delivered first")
+            .is_ok());
     }
 }

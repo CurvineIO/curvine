@@ -54,7 +54,7 @@ pub struct FuseSession<T> {
     conf: FuseConf,
 }
 
-/// Phase 3b (P2-1/P2-2/P3-1): closes out a `run()` invocation on EVERY exit path
+/// closes out a `run()` invocation on EVERY exit path
 /// — normal completion, signal arms, and the SIGUSR1 run-all/persist error returns.
 /// Its `Drop` is deliberately lightweight, synchronous, infallible, non-blocking:
 /// it only `abort()`s the fd-watcher task (so a stale watcher can't cross-session
@@ -82,7 +82,7 @@ impl Drop for RunCleanupGuard {
 /// The health close-out decision used by `RunCleanupGuard::drop`: when metrics
 /// are enabled, set the kernel-fd-health gauge to 0 (session no longer serving).
 /// Extracted as a `set_health` taker so the enabled-gate close-out is unit-testable
-/// against an injected isolated gauge (R2 P3#3) without touching the process-global
+/// against an injected isolated gauge without touching the process-global
 /// gauge or constructing a real `FuseSession`.
 fn close_out_health<F: FnOnce(bool)>(enabled: bool, set_health: F) {
     if enabled {
@@ -147,7 +147,7 @@ impl<T: FileSystem> FuseSession<T> {
     pub const STATE_PATH: &'static str = "CURVINE_FUSE_STATE_PATH";
 
     pub async fn new(rt: Arc<Runtime>, fs: T, conf: FuseConf) -> FuseResult<Self> {
-        // Phase 3b (D11/P2-5): record session_init_total once. Capture
+        // record session_init_total once. Capture
         // `metrics_enabled` BEFORE `conf` is moved into the session. The whole
         // body runs in an inner async so every early `?` is counted as `error`.
         let enabled = conf.metrics_enabled;
@@ -161,7 +161,7 @@ impl<T: FileSystem> FuseSession<T> {
             FuseMetrics::with(|m| m.record_session_init(res));
             if result.is_ok() {
                 // Health is set to 1 only once the whole session is built and
-                // about to be returned Ok — not at function entry (P2-4), so a
+                // about to be returned Ok — not at function entry, so a
                 // channel-build failure never briefly shows health=1.
                 FuseMetrics::with(|m| m.set_kernel_fd_health(true));
             }
@@ -220,11 +220,11 @@ impl<T: FileSystem> FuseSession<T> {
         let mnts = std::mem::take(&mut self.mnts);
         let enabled = self.conf.metrics_enabled;
 
-        // Phase 3b (D4): one ShutdownOnce records session_shutdown_total exactly
+        // one ShutdownOnce records session_shutdown_total exactly
         // once — the first cause (fd_watcher / signal / run_all completion) wins.
         let shutdown_once = ShutdownOnce::new(enabled);
 
-        // Phase 3b (P2-2/P3-1): the fd watcher returns a JoinHandle; a
+        // the fd watcher returns a JoinHandle; a
         // RunCleanupGuard holds it and, on EVERY run() exit path (including the
         // SIGUSR1 run-all/persist error returns below), aborts the watcher and sets
         // kernel_fd_health=0. This both closes out the health gauge and prevents a
@@ -369,7 +369,7 @@ impl<T: FileSystem> FuseSession<T> {
                 };
 
                 if unhealthy {
-                    // Phase 3b (D4/P2-2): one synchronous, ordered burst —
+                    // one synchronous, ordered burst —
                     // record the reason, set health 0, THEN broadcast shutdown,
                     // then return. `send` is last so a cleanup abort (which only
                     // fires after run() is already unwinding) cannot truncate the
@@ -437,7 +437,7 @@ impl<T: FileSystem> FuseSession<T> {
     }
 
     async fn persist(&self, mnts: Vec<FuseMnt>) -> CommonResult<()> {
-        // Phase 3b: record the top-level persist outcome once, and time the
+        // record the top-level persist outcome once, and time the
         // mount_fds stage here (node_map/file_handles/dir_handles stages are timed
         // inside self.fs.persist -> NodeState::persist).
         let enabled = self.conf.metrics_enabled;
@@ -470,7 +470,7 @@ impl<T: FileSystem> FuseSession<T> {
                 mnt.auto_unmount(false);
 
                 let flags = sys::fcntl_get(mnt.fd)?;
-                // Propagate the F_SETFD failure (Phase 3b P1): if clearing
+                // Propagate the F_SETFD failure: if clearing
                 // FD_CLOEXEC fails the persisted fd cannot be inherited by the
                 // child, so the persist must fail — the `?` drops the mount_fds
                 // StateStageTimer as error and the top-level state_persist_total
@@ -491,7 +491,7 @@ impl<T: FileSystem> FuseSession<T> {
 
         self.fs.persist(&mut writer).await?;
 
-        // Phase 3b (R2 P3#2): explicitly flush the BufWriter BEFORE spawning the
+        // explicitly flush the BufWriter BEFORE spawning the
         // child. `reload_param` spawn()s a new process that immediately opens this
         // same state file for restore; the BufWriter would otherwise only flush on
         // drop (after persist_inner returns, i.e. after the child has started), so
@@ -516,7 +516,7 @@ impl<T: FileSystem> FuseSession<T> {
     }
 
     async fn restore(file: &str, conf: &FuseConf, fs: &T) -> CommonResult<Vec<FuseMnt>> {
-        // Phase 3b: record the top-level restore outcome once. `conf` is available
+        // record the top-level restore outcome once. `conf` is available
         // on this static fn, so the metrics_enabled kill-switch is reachable. A
         // NodeState magic/version header failure inside fs.restore records
         // state_restore_total{error}; note mount_fds may already have recorded
@@ -636,7 +636,7 @@ mod fd_watcher_tests {
 mod cleanup_guard_tests {
     use super::RunCleanupGuard;
 
-    // Phase 3b P3#4: the RunCleanupGuard close-out is the control-flow-sensitive
+    // The RunCleanupGuard close-out is the control-flow-sensitive
     // seam reviewers flagged repeatedly. Prove fd-free (no real FuseSession/Pipe2,
     // just a trivial spawned task) that Drop ABORTS the held watcher handle on
     // every exit path. The health-gauge side (set 0) is exercised by the
@@ -679,7 +679,7 @@ mod cleanup_guard_tests {
         // dropping here must not panic
     }
 
-    // Phase 3b R2 P3#3: the health close-out side of the guard. enabled=true must
+    // The health close-out side of the guard. enabled=true must
     // set health 0 (the SIGUSR1-persist-error early-return path relies on this);
     // enabled=false must not touch the gauge. Tested against an injected captured
     // value (deterministic, no process-global gauge).

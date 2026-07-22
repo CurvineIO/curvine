@@ -24,8 +24,28 @@ use curvine_core::err_box;
 use curvine_core::error::ErrorExt;
 use curvine_core::runtime::{RpcRuntime, Runtime};
 use curvine_core::sys::DataSlice;
-use futures::future::try_join_all;
+use futures::future::{join_all, try_join_all};
 use std::sync::Arc;
+
+async fn finish_all_cancellations<I, F>(futures: I) -> FsResult<()>
+where
+    I: IntoIterator<Item = F>,
+    F: std::future::Future<Output = FsResult<()>>,
+{
+    let mut first_error = None;
+    for result in join_all(futures).await {
+        if let Err(e) = result {
+            if first_error.is_none() {
+                first_error = Some(e);
+            }
+        }
+    }
+
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
 
 enum WriterAdapter {
     Local(BlockWriterLocal),
@@ -244,17 +264,16 @@ impl BlockWriter {
     }
 
     pub async fn cancel(&mut self) -> FsResult<()> {
-        let futures = self.inners.iter_mut().map(|writer| async move {
-            writer
-                .cancel()
-                .await
-                .map_err(|e| (writer.worker_address().clone(), e))
+        let futures = self.inners.iter_mut().map(|writer| {
+            let worker_addr = writer.worker_address().clone();
+            async move {
+                writer
+                    .cancel()
+                    .await
+                    .map_err(|e| e.ctx(format!("failed to cancel block on {}", worker_addr)))
+            }
         });
-
-        if let Err((worker_addr, e)) = try_join_all(futures).await {
-            return Err(e.ctx(format!("failed to cancel block on {}", worker_addr)));
-        }
-        Ok(())
+        finish_all_cancellations(futures).await
     }
 
     pub fn remaining(&self) -> i64 {
@@ -317,5 +336,36 @@ impl BlockWriter {
             block_len: self.len(),
             locations: locs,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::finish_all_cancellations;
+    use curvine_common::error::FsError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn cancellation_attempts_all_futures_and_returns_an_error() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let futures = (0..3).map(|index| {
+            let attempts = attempts.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                if index == 1 {
+                    Err(FsError::common("injected cancellation failure"))
+                } else {
+                    Ok(())
+                }
+            }
+        });
+
+        assert!(finish_all_cancellations(futures).await.is_err());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "one failure must not prevent the remaining cancellations"
+        );
     }
 }

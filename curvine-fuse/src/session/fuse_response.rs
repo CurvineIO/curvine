@@ -91,7 +91,7 @@ impl ResponseData {
 
 // Send fuse response to the mount point.
 //
-// `metrics` is the per-request metrics slot (Phase 1a): `Some` when metrics are
+// `metrics` is the per-request metrics slot: `Some` when metrics are
 // enabled, `None` for the disabled fast path. It is `Arc<Mutex<…>>` so that
 // cloning a `FuseResponse` (used by `dispatch_meta`, which borrows `&self`)
 // shares the *same* slot — the active guard is taken exactly once regardless of
@@ -129,7 +129,7 @@ impl FuseResponse {
     }
 
     /// The stashed FS-operation status, read back after the reply path has run
-    /// (Phase 2a `operation_duration_us`). `None` when metrics are disabled (no
+    /// (for `operation_duration_us`). `None` when metrics are disabled (no
     /// slot) or when nothing finished the request yet. The send helpers stash
     /// `op_status` synchronously before enqueueing, so by the time `dispatch_meta`
     /// finishes its match this reflects the FS result, not the enqueue outcome.
@@ -152,8 +152,8 @@ impl FuseResponse {
     /// source tag — **never from errno alone** (a backend `ENOSYS`/`EINTR` with
     /// no tag stays `Error`). `Unsupported`/`Interrupted` are reached only when
     /// the caller passes the matching tag (set at the wildcard / `Notimplemented`
-    /// / SETLKW-interrupt sites). Phase 1a-1 wires this as control flow; the
-    /// status-labelled metrics read the stashed value in Phase 1a-2.
+    /// / SETLKW-interrupt sites). This is control flow; the status-labelled
+    /// metrics read the stashed value.
     fn err_status(unsupported_reason: Option<&'static str>, interrupted: bool) -> FuseReqStatus {
         // The two source tags are mutually exclusive — no current call site
         // passes both, and the classification below would silently drop the
@@ -171,21 +171,14 @@ impl FuseResponse {
         }
     }
 
-    /// Build the reply task and enqueue it. The single finish entry point for a
-    /// replied request:
-    ///
-    /// - metrics enabled: stash status/errno, `take()` the active guard out of
-    ///   the shared slot (move-only, exactly once), mark `finished`, then send a
-    ///   `RequestReply`. All slot access is scoped *before* the `.await` so the
-    ///   `parking_lot` guard is never held across the await. **If the enqueue
-    ///   fails**, the request never reaches the sender, so we re-lock and correct
-    ///   `request_status` to `Error` (the `Pending → FinishedEarly(enqueue err)`
-    ///   transition) while leaving `op_status` as the FS-operation result.
-    /// - metrics disabled: send the legacy `Reply`.
-    ///
-    /// `status`/`errno` are computed by the caller (which still holds the typed
-    /// result); they cannot be derived from the enqueue outcome because a
-    /// successful enqueue of an error frame returns `Ok(())`.
+    /// Build the reply task and enqueue it — the single finish entry point for a
+    /// replied request. Metrics enabled: stash status/errno, `take()` the active
+    /// guard from the shared slot (all slot access scoped before the `.await`, so
+    /// the `parking_lot` guard never crosses it), mark `finished`, send a
+    /// `RequestReply`; on enqueue failure, re-lock and correct `request_status` to
+    /// `Error` (leaving `op_status` as the FS result). Metrics disabled: legacy
+    /// `Reply`. `status`/`errno` come from the caller — a successful enqueue of an
+    /// error frame returns `Ok(())`, so they can't be derived from the outcome.
     async fn finish_request(
         &self,
         data: ResponseData,
@@ -198,18 +191,13 @@ impl FuseResponse {
             Some(slot) => slot,
         };
 
-        // **Cancellation safety on bounded channels.** A bounded `send().await`
-        // can suspend (channel full); if the holding task is cancelled mid-await,
-        // the task — and the `ActiveGuard` moved into it — is dropped, decrementing
-        // `active_requests` but emitting NO terminal metric. To avoid that
-        // "silent finish", on bounded channels we first `reserve()` a permit
-        // WITHOUT touching the slot. The only suspendable point is the reserve;
-        // if cancelled there, the slot is still `finished=false` and the guard is
-        // still in the slot, so the request is simply dropped (guard decremented
-        // by its own Drop) with no half-finished state. Once the permit is in
-        // hand, we commit the slot and `permit.send(...)` synchronously (no await,
-        // cannot be cancelled). Unbounded `send` is already synchronous, so it
-        // keeps the simple commit-then-send fast path.
+        // Cancellation safety on bounded channels: a bounded `send().await` can
+        // suspend when full, and cancellation there would drop the guard (dec'ing
+        // `active_requests`) while emitting NO terminal metric. So on bounded
+        // channels we `reserve()` a permit FIRST without touching the slot (the only
+        // suspendable point); if cancelled there the slot is untouched and the
+        // request is cleanly dropped. Once the permit is in hand we commit the slot
+        // and `permit.send(...)` synchronously. Unbounded `send` is already sync.
         if self.sender.is_bounded() {
             let permit = match self.sender.reserve().await {
                 Ok(p) => p,
@@ -422,17 +410,12 @@ impl FuseResponse {
         }
     }
 
-    /// Finish a request that errored **before** any reply could be produced —
-    /// e.g. a structural `parse_operator()` failure after the context was
-    /// created. Drops the active guard and marks the slot `finished` so the
-    /// `active_requests` count cannot leak, but enqueues **no** task and emits
-    /// no `requests_total` (the request never dispatched).
-    ///
-    /// `reason` is the `&'static str` parse-failure reason
-    /// (`short_read`/`invalid_header`/`length_mismatch`/`other`) — stashed now,
-    /// read by `decode_errors_total{phase="parse",reason}` in Phase 1a-2. A
-    /// reason rather than an errno is carried because structural parse failures
-    /// have no stable OS errno; `errno` is kept too for diagnostics.
+    /// Finish a request that errored BEFORE any reply (e.g. a `parse_operator()`
+    /// failure after the ctx was created): drop the active guard and mark the slot
+    /// `finished` so `active_requests` can't leak, but enqueue NO task and emit no
+    /// `requests_total` (never dispatched). `reason` (stashed for
+    /// `decode_errors_total{phase=parse}`) is carried instead of an errno because
+    /// structural parse failures have no stable OS errno.
     pub(crate) fn finish_early(&self, errno: i32, reason: &'static str) {
         if let Some(slot) = &self.metrics {
             {
@@ -450,8 +433,8 @@ impl FuseResponse {
 
             // A structural parse failure after the ctx existed: record the
             // decode error, but NOT `requests_total` (the request never
-            // dispatched). Phase 1a-2 only ever passes reason="other" (the
-            // `finish_early` call sites); finer reasons need decoder changes.
+            // dispatched). The `finish_early` call sites only ever pass
+            // reason="other"; finer reasons need decoder changes.
             FuseMetrics::get().record_parse_error(reason);
         }
     }
@@ -528,16 +511,11 @@ impl FuseResponse {
 
     /// Metrics-enabled `send_notify`: enqueue a `NotifyReply` carrying a
     /// `reply_queue_depth` guard, using the same reserve-first discipline as the
-    /// request reply path so a producer blocked on a full bounded channel is not
-    /// counted as backlog. The guard is created only *after* the enqueue boundary
-    /// is committed (bounded: permit acquired; unbounded: just before the
-    /// synchronous send), and rides on the task to the sender's dequeue point.
-    ///
-    /// `enqueue_failed` is recorded at every point the notify fails to enter the
-    /// channel — the bounded `reserve()` error path (NEW: previously only the
-    /// `send()` error was counted) and the unbounded `send()` error path. A
-    /// *cancelled* bounded `reserve().await` is not a failure: no guard was
-    /// created and nothing is recorded.
+    /// reply path (guard created only after the enqueue boundary is committed, so a
+    /// producer blocked on a full channel isn't counted as backlog). `enqueue_failed`
+    /// is recorded on both the bounded `reserve()` and unbounded `send()` error
+    /// paths; a cancelled `reserve().await` is not a failure (no guard, nothing
+    /// recorded).
     async fn send_notify_metrics(&self, code: FuseNotifyCode, data: ResponseData) -> IOResult<()> {
         let code_str = code.as_str();
 
@@ -954,7 +932,7 @@ mod tests {
             assert_eq!(
                 slot.parse_reason,
                 Some("other"),
-                "parse reason stashed for 1a-2"
+                "parse reason stashed for decode_errors"
             );
             assert_eq!(slot.op_status, Some(FuseReqStatus::Error));
         }
@@ -1181,7 +1159,7 @@ mod tests {
         assert_eq!(g.get(), 0, "guard dropped once with the consumed task");
     }
 
-    // P1#1: enqueue failure layered on a FAILED op must still record the
+    // enqueue failure layered on a FAILED op must still record the
     // op-level terminal counter with the real FS errno — the channel error must
     // not swallow the operation failure (symmetric with the sender write-failure
     // path's op/request status split).
@@ -1217,7 +1195,7 @@ mod tests {
         assert_eq!(g.get(), 0);
     }
 
-    // P1#1: enqueue failure layered on a tagged-unsupported op still records
+    // enqueue failure layered on a tagged-unsupported op still records
     // unsupported_total{reason}.
     #[tokio::test]
     async fn enqueue_failure_on_unsupported_op_still_records_unsupported_total() {
@@ -1242,7 +1220,7 @@ mod tests {
         assert_eq!(g.get(), 0);
     }
 
-    // P1#1: enqueue failure layered on an interrupted op still records
+    // enqueue failure layered on an interrupted op still records
     // interrupted_total.
     #[tokio::test]
     async fn enqueue_failure_on_interrupted_op_still_records_interrupted_total() {
@@ -1264,7 +1242,7 @@ mod tests {
         assert_eq!(g.get(), 0);
     }
 
-    // P1#2 (round-2): a stream worker (FuseReader::read_future /
+    // a stream worker (FuseReader::read_future /
     // FuseWriter::writer_future) holds the `FuseResponse` and replies via
     // `send_data`/`send_rep` from *inside* the task. If the reply channel is
     // closed by then (sender shutdown), the worker's `send_*().await` returns Err
@@ -1308,7 +1286,7 @@ mod tests {
         assert_eq!(errors_total(OP, "metadata", "OTHER"), 0);
     }
 
-    // P1#2 companion: the writer worker's `send_rep` path on a closed channel.
+    // companion: the writer worker's `send_rep` path on a closed channel.
     #[tokio::test]
     async fn stream_worker_send_rep_enqueue_failure_finishes_without_leak() {
         init_metrics();
@@ -1329,7 +1307,7 @@ mod tests {
         );
     }
 
-    // P2#2 (round-3): the worker enqueue-failure finish records under the real
+    // the worker enqueue-failure finish records under the real
     // stream kind label — verifies `request_duration_us{kind="stream",error}`.
     #[tokio::test]
     async fn stream_worker_enqueue_failure_records_stream_kind_duration() {
@@ -1393,7 +1371,7 @@ mod tests {
         (FuseResponse::new_reply(unique, tx, false, Some(ctx)), rx)
     }
 
-    // P1 (round-3): on a bounded channel, if the task is cancelled while the
+    // on a bounded channel, if the task is cancelled while the
     // reply is suspended on `reserve().await` (channel full), the request must
     // NOT enter a "silent finished" state — the slot stays `finished=false` and
     // the guard is released by passive Drop, so a retry/cleanup is still possible
@@ -1447,7 +1425,7 @@ mod tests {
         );
     }
 
-    // P1 (round-3): bounded channel, reserve succeeds (slot free) -> the reply
+    // bounded channel, reserve succeeds (slot free) -> the reply
     // finishes normally (RequestReply enqueued, slot finished, guard rides task).
     #[tokio::test]
     async fn bounded_reserve_success_finishes_normally() {
@@ -1537,7 +1515,7 @@ mod tests {
         assert_eq!(g.get(), 0, "guard dropped on early finish");
     }
 
-    // --- Phase 2a: reply_queue_depth task-embedded guard ---
+    // --- reply_queue_depth task-embedded guard ---
     //
     // The production `reply_queue_guard()` increments the *process-global*
     // `reply_queue_depth` gauge, which every parallel test in this binary shares.
@@ -1690,7 +1668,7 @@ mod tests {
         }
     }
 
-    // --- Phase 2a: reply_queue_depth REAL queue lifecycle (review P1#4) ---
+    // --- reply_queue_depth REAL queue lifecycle ---
     //
     // These drive an actual channel with locally-gauged guards (NOT the global
     // `reply_queue_depth`, which parallel tests share and would make absolute/delta
@@ -1715,7 +1693,7 @@ mod tests {
         }
     }
 
-    // P1#4 (a): recv dequeues -> the queue guard drops at the dequeue point, so
+    // recv dequeues -> the queue guard drops at the dequeue point, so
     // queue depth returns to baseline BEFORE any splice; the active guard is a
     // SEPARATE scope and is still held (active stays 1 while queue is back to 0).
     #[tokio::test]
@@ -1754,7 +1732,7 @@ mod tests {
         }
     }
 
-    // P1#4 (b): a task enqueued but NEVER received (sender/channel dropped) still
+    // a task enqueued but NEVER received (sender/channel dropped) still
     // balances — the queue guard rides the task and drops with it, no leak.
     #[tokio::test]
     async fn reply_queue_depth_unreceived_task_drop_balances() {
@@ -1779,21 +1757,13 @@ mod tests {
         assert_eq!(active_g.get(), 0, "and the active guard too");
     }
 
-    // P1#4 (c): bounded-full reserve-first does NOT inflate queue depth. The real
-    // `commit_reply_task` creates the queue guard only AFTER a permit is acquired
-    // (see `finish_request`), so a producer parked in `reserve().await` on a full
-    // channel holds no guard.
-    //
-    // SCOPE (review R2 P2#6): this is a PROTOCOL-LEVEL STAND-IN, not a real
-    // blocked-producer test. It asserts the reserve-first invariant directly
-    // against a full bounded channel (`try_reserve()` yields no permit -> no guard
-    // built -> local gauge stays 0); it does NOT drive `FuseResponse::finish_request`
-    // through a pending `reserve().await` and observe the guard's absence while the
-    // send future is parked. The cancellation half of that production path —
-    // `reserve()` cancelled mid-await leaves the slot unfinished — IS covered by
-    // `bounded_reserve_cancellation_leaves_slot_unfinished`. Driving a genuinely
-    // parked producer + observing queue depth would need the shared global gauge
-    // (parallel-unsafe) or a custom waker harness; deferred as not worth the flake.
+    // bounded-full reserve-first does NOT inflate queue depth: the queue guard is
+    // created only AFTER a permit is acquired, so a producer parked in
+    // `reserve().await` holds none. A PROTOCOL-LEVEL STAND-IN — it asserts the
+    // invariant against a full channel (`try_reserve()` -> no permit -> gauge 0),
+    // not a genuinely parked producer (which would need the shared global gauge or
+    // a waker harness). The cancellation half is covered by
+    // `bounded_reserve_cancellation_leaves_slot_unfinished`.
     #[tokio::test]
     async fn reply_queue_depth_bounded_full_does_not_inflate() {
         let queue_g = m::new_gauge("qd_bounded_full_queue", "test").unwrap();

@@ -19,6 +19,7 @@ use crate::fuse_metrics::{
 };
 use crate::session::{FuseTask, ResponseData};
 use crate::FuseResult;
+use curvine_core::common::Gauge;
 use curvine_core::io::IOResult;
 use curvine_core::runtime::Runtime;
 use curvine_core::sync::channel::AsyncReceiver;
@@ -43,9 +44,15 @@ pub struct FuseSender<T> {
     receiver: AsyncReceiver<FuseTask>,
     pipe2: Option<Pipe2>,
     debug: bool,
+    /// Per-sender `sender_last_progress_unixtime` child gauge, fetched once at
+    /// construction (no per-reply label lookup). `None` when metrics are
+    /// disabled. Set after every successful reply write; a growing scrape-side
+    /// age on one sender localizes a stalled reply sender (issue #1215).
+    progress: Option<Gauge>,
 }
 
 impl<T: FileSystem> FuseSender<T> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         fs: Arc<T>,
         rt: Arc<Runtime>,
@@ -54,9 +61,23 @@ impl<T: FileSystem> FuseSender<T> {
         buf_size: usize,
         debug: bool,
         enable_splice: bool,
+        mnt: &str,
+        idx: usize,
+        metrics_enabled: bool,
     ) -> IOResult<Self> {
         let pipe2 = if enable_splice {
             Some(Pipe2::new(PipeFd::new(buf_size, false, false)?)?)
+        } else {
+            None
+        };
+        let progress = if metrics_enabled {
+            let g = FuseMetrics::get().sender_progress_gauge(mnt, idx);
+            // Seed the cold series with construction time, not the default 0, so a
+            // scrape-side `time() - <metric>` is ~0 for a freshly built / idle
+            // sender instead of a huge age that would false-page at startup (#1215
+            // review). The real signal is a series whose value stops advancing.
+            FuseMetrics::record_sender_progress(&g);
+            Some(g)
         } else {
             None
         };
@@ -67,6 +88,7 @@ impl<T: FileSystem> FuseSender<T> {
             receiver,
             pipe2,
             debug,
+            progress,
         };
 
         Ok(fuse_rx)
@@ -147,6 +169,17 @@ impl<T: FileSystem> FuseSender<T> {
 
                     // Finish point: drop the in-flight guard after the write.
                     drop(active);
+
+                    // Observability (#1215): record sender liveness on a
+                    // successful delivery. A stalled sender stops advancing this
+                    // timestamp while siblings keep refreshing, localizing the
+                    // stall at scrape time. Not recorded on a failed write (the
+                    // sender is still alive; the failure has its own metric).
+                    if matches!(write, WriteOutcome::Success) {
+                        if let Some(g) = &self.progress {
+                            FuseMetrics::record_sender_progress(g);
+                        }
+                    }
                 }
 
                 // A kernel notification: same splice, no request guard/finish.
@@ -163,7 +196,13 @@ impl<T: FileSystem> FuseSender<T> {
                     let id = data.header.unique;
                     let metrics = FuseMetrics::get();
                     match self.send(data).await {
-                        Ok(()) => metrics.record_notify_result(code, NOTIFY_SUCCESS),
+                        Ok(()) => {
+                            metrics.record_notify_result(code, NOTIFY_SUCCESS);
+                            // Same liveness signal as the request path (#1215).
+                            if let Some(g) = &self.progress {
+                                FuseMetrics::record_sender_progress(g);
+                            }
+                        }
                         Err(e) => {
                             if e.raw_error().raw_os_error() != Some(libc::ENOENT) {
                                 warn!("error send notify {}: {}", id, e);
@@ -203,6 +242,16 @@ impl<T: FileSystem> FuseSender<T> {
         }
     }
 
+    // Non-splice reply path. This uses AsyncFd::async_write (edge-triggered
+    // WRITABLE), which is the same readiness model that hangs the splice path in
+    // #1215 — but writev to /dev/fuse does not hit that trap. A FUSE reply write
+    // is matched to a pending kernel request and copied out; the fuse device has
+    // no send-buffer watermark, so a well-formed reply does not return EAGAIN the
+    // way the SPLICE_F_NONBLOCK pipe->device transfer does. It fails with a real
+    // errno (e.g. ENOENT for an unknown request) instead, which propagates here.
+    // This is why enable_splice=false is a sound workaround for #1215, not just an
+    // empirical one, and why the splice_retry helper is intentionally NOT applied
+    // to writev.
     pub async fn write(&mut self, rep: ResponseData) -> IOResult<()> {
         let (len, iovec) = rep.as_iovec()?;
         let written = self
