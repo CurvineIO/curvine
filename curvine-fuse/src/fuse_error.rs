@@ -186,7 +186,7 @@ impl From<std::io::Error> for FuseError {
 /// `FsError -> errno` mapping above). Any errno outside the table collapses to
 /// `"OTHER"`; if a new errno starts being produced, add it here and to the
 /// design doc's label table together.
-// Phase 0 enabling primitive: defined here, wired to call sites in Phase 1.
+// Enabling primitive: defined here, wired to call sites separately.
 #[allow(dead_code)]
 pub(crate) fn errno_label(errno: i32) -> &'static str {
     match errno {

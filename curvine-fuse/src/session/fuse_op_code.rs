@@ -76,7 +76,7 @@ impl FuseOpCode {
     ///
     /// Names are short CamelCase (e.g. `Lookup`, `GetAttr`, `Read`) matching
     /// the `opcode` label convention in the FUSE metrics design.
-    // Phase 0 enabling primitive: defined here, wired to call sites in Phase 1.
+    // Enabling primitive: defined here, wired to call sites separately.
     #[allow(dead_code)]
     pub(crate) fn as_str(&self) -> &'static str {
         match self {

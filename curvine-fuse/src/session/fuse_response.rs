@@ -91,7 +91,7 @@ impl ResponseData {
 
 // Send fuse response to the mount point.
 //
-// `metrics` is the per-request metrics slot (Phase 1a): `Some` when metrics are
+// `metrics` is the per-request metrics slot: `Some` when metrics are
 // enabled, `None` for the disabled fast path. It is `Arc<Mutex<…>>` so that
 // cloning a `FuseResponse` (used by `dispatch_meta`, which borrows `&self`)
 // shares the *same* slot — the active guard is taken exactly once regardless of
@@ -129,7 +129,7 @@ impl FuseResponse {
     }
 
     /// The stashed FS-operation status, read back after the reply path has run
-    /// (Phase 2a `operation_duration_us`). `None` when metrics are disabled (no
+    /// (for `operation_duration_us`). `None` when metrics are disabled (no
     /// slot) or when nothing finished the request yet. The send helpers stash
     /// `op_status` synchronously before enqueueing, so by the time `dispatch_meta`
     /// finishes its match this reflects the FS result, not the enqueue outcome.
@@ -152,8 +152,8 @@ impl FuseResponse {
     /// source tag — **never from errno alone** (a backend `ENOSYS`/`EINTR` with
     /// no tag stays `Error`). `Unsupported`/`Interrupted` are reached only when
     /// the caller passes the matching tag (set at the wildcard / `Notimplemented`
-    /// / SETLKW-interrupt sites). Phase 1a-1 wires this as control flow; the
-    /// status-labelled metrics read the stashed value in Phase 1a-2.
+    /// / SETLKW-interrupt sites). This is control flow; the status-labelled
+    /// metrics read the stashed value.
     fn err_status(unsupported_reason: Option<&'static str>, interrupted: bool) -> FuseReqStatus {
         // The two source tags are mutually exclusive — no current call site
         // passes both, and the classification below would silently drop the
@@ -430,7 +430,7 @@ impl FuseResponse {
     ///
     /// `reason` is the `&'static str` parse-failure reason
     /// (`short_read`/`invalid_header`/`length_mismatch`/`other`) — stashed now,
-    /// read by `decode_errors_total{phase="parse",reason}` in Phase 1a-2. A
+    /// read by `decode_errors_total{phase="parse",reason}`. A
     /// reason rather than an errno is carried because structural parse failures
     /// have no stable OS errno; `errno` is kept too for diagnostics.
     pub(crate) fn finish_early(&self, errno: i32, reason: &'static str) {
@@ -450,8 +450,8 @@ impl FuseResponse {
 
             // A structural parse failure after the ctx existed: record the
             // decode error, but NOT `requests_total` (the request never
-            // dispatched). Phase 1a-2 only ever passes reason="other" (the
-            // `finish_early` call sites); finer reasons need decoder changes.
+            // dispatched). The `finish_early` call sites only ever pass
+            // reason="other"; finer reasons need decoder changes.
             FuseMetrics::get().record_parse_error(reason);
         }
     }
@@ -954,7 +954,7 @@ mod tests {
             assert_eq!(
                 slot.parse_reason,
                 Some("other"),
-                "parse reason stashed for 1a-2"
+                "parse reason stashed for decode_errors"
             );
             assert_eq!(slot.op_status, Some(FuseReqStatus::Error));
         }
@@ -1181,7 +1181,7 @@ mod tests {
         assert_eq!(g.get(), 0, "guard dropped once with the consumed task");
     }
 
-    // P1#1: enqueue failure layered on a FAILED op must still record the
+    // enqueue failure layered on a FAILED op must still record the
     // op-level terminal counter with the real FS errno — the channel error must
     // not swallow the operation failure (symmetric with the sender write-failure
     // path's op/request status split).
@@ -1217,7 +1217,7 @@ mod tests {
         assert_eq!(g.get(), 0);
     }
 
-    // P1#1: enqueue failure layered on a tagged-unsupported op still records
+    // enqueue failure layered on a tagged-unsupported op still records
     // unsupported_total{reason}.
     #[tokio::test]
     async fn enqueue_failure_on_unsupported_op_still_records_unsupported_total() {
@@ -1242,7 +1242,7 @@ mod tests {
         assert_eq!(g.get(), 0);
     }
 
-    // P1#1: enqueue failure layered on an interrupted op still records
+    // enqueue failure layered on an interrupted op still records
     // interrupted_total.
     #[tokio::test]
     async fn enqueue_failure_on_interrupted_op_still_records_interrupted_total() {
@@ -1264,7 +1264,7 @@ mod tests {
         assert_eq!(g.get(), 0);
     }
 
-    // P1#2 (round-2): a stream worker (FuseReader::read_future /
+    // a stream worker (FuseReader::read_future /
     // FuseWriter::writer_future) holds the `FuseResponse` and replies via
     // `send_data`/`send_rep` from *inside* the task. If the reply channel is
     // closed by then (sender shutdown), the worker's `send_*().await` returns Err
@@ -1308,7 +1308,7 @@ mod tests {
         assert_eq!(errors_total(OP, "metadata", "OTHER"), 0);
     }
 
-    // P1#2 companion: the writer worker's `send_rep` path on a closed channel.
+    // companion: the writer worker's `send_rep` path on a closed channel.
     #[tokio::test]
     async fn stream_worker_send_rep_enqueue_failure_finishes_without_leak() {
         init_metrics();
@@ -1329,7 +1329,7 @@ mod tests {
         );
     }
 
-    // P2#2 (round-3): the worker enqueue-failure finish records under the real
+    // the worker enqueue-failure finish records under the real
     // stream kind label — verifies `request_duration_us{kind="stream",error}`.
     #[tokio::test]
     async fn stream_worker_enqueue_failure_records_stream_kind_duration() {
@@ -1393,7 +1393,7 @@ mod tests {
         (FuseResponse::new_reply(unique, tx, false, Some(ctx)), rx)
     }
 
-    // P1 (round-3): on a bounded channel, if the task is cancelled while the
+    // on a bounded channel, if the task is cancelled while the
     // reply is suspended on `reserve().await` (channel full), the request must
     // NOT enter a "silent finished" state — the slot stays `finished=false` and
     // the guard is released by passive Drop, so a retry/cleanup is still possible
@@ -1447,7 +1447,7 @@ mod tests {
         );
     }
 
-    // P1 (round-3): bounded channel, reserve succeeds (slot free) -> the reply
+    // bounded channel, reserve succeeds (slot free) -> the reply
     // finishes normally (RequestReply enqueued, slot finished, guard rides task).
     #[tokio::test]
     async fn bounded_reserve_success_finishes_normally() {
@@ -1537,7 +1537,7 @@ mod tests {
         assert_eq!(g.get(), 0, "guard dropped on early finish");
     }
 
-    // --- Phase 2a: reply_queue_depth task-embedded guard ---
+    // --- reply_queue_depth task-embedded guard ---
     //
     // The production `reply_queue_guard()` increments the *process-global*
     // `reply_queue_depth` gauge, which every parallel test in this binary shares.
@@ -1690,7 +1690,7 @@ mod tests {
         }
     }
 
-    // --- Phase 2a: reply_queue_depth REAL queue lifecycle (review P1#4) ---
+    // --- reply_queue_depth REAL queue lifecycle ---
     //
     // These drive an actual channel with locally-gauged guards (NOT the global
     // `reply_queue_depth`, which parallel tests share and would make absolute/delta
@@ -1715,7 +1715,7 @@ mod tests {
         }
     }
 
-    // P1#4 (a): recv dequeues -> the queue guard drops at the dequeue point, so
+    // recv dequeues -> the queue guard drops at the dequeue point, so
     // queue depth returns to baseline BEFORE any splice; the active guard is a
     // SEPARATE scope and is still held (active stays 1 while queue is back to 0).
     #[tokio::test]
@@ -1754,7 +1754,7 @@ mod tests {
         }
     }
 
-    // P1#4 (b): a task enqueued but NEVER received (sender/channel dropped) still
+    // a task enqueued but NEVER received (sender/channel dropped) still
     // balances — the queue guard rides the task and drops with it, no leak.
     #[tokio::test]
     async fn reply_queue_depth_unreceived_task_drop_balances() {
@@ -1779,12 +1779,12 @@ mod tests {
         assert_eq!(active_g.get(), 0, "and the active guard too");
     }
 
-    // P1#4 (c): bounded-full reserve-first does NOT inflate queue depth. The real
+    // bounded-full reserve-first does NOT inflate queue depth. The real
     // `commit_reply_task` creates the queue guard only AFTER a permit is acquired
     // (see `finish_request`), so a producer parked in `reserve().await` on a full
     // channel holds no guard.
     //
-    // SCOPE (review R2 P2#6): this is a PROTOCOL-LEVEL STAND-IN, not a real
+    // SCOPE: this is a PROTOCOL-LEVEL STAND-IN, not a real
     // blocked-producer test. It asserts the reserve-first invariant directly
     // against a full bounded channel (`try_reserve()` yields no permit -> no guard
     // built -> local gauge stays 0); it does NOT drive `FuseResponse::finish_request`

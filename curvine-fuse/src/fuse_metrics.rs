@@ -41,7 +41,7 @@ const STAGE_DURATION_BUCKETS_US: &[f64] = &[
     100000.0,
 ];
 
-/// Buckets (bytes) for a single stream read/write size (Phase 2b `io_size_bytes`).
+/// Buckets (bytes) for a single stream read/write size (`io_size_bytes`).
 /// 8 buckets spanning 4KiB–64MiB. The first bucket (`le=4096`) is NOT a minimum
 /// observation floor — a sub-4KiB read/write (e.g. a 1-byte read) is observed
 /// normally and lands in this first bucket. Zero-length writes are a *semantic*
@@ -51,8 +51,8 @@ const IO_SIZE_BUCKETS: &[f64] = &[
     4096.0, 16384.0, 65536.0, 262144.0, 1048576.0, 4194304.0, 16777216.0, 67108864.0,
 ];
 
-/// Buckets (entry count) for a single `read_dir_common` batch (Phase 3a
-/// `readdir_entries`). A batch is one readdir syscall's worth of dirents, not the
+/// Buckets (entry count) for a single `read_dir_common` batch (`readdir_entries`).
+/// A batch is one readdir syscall's worth of dirents, not the
 /// whole directory; the upper buckets cover large single batches. Spans 1–4096.
 const READDIR_ENTRIES_BUCKETS: &[f64] = &[1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4096.0];
 
@@ -60,18 +60,18 @@ const READDIR_ENTRIES_BUCKETS: &[f64] = &[1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4
 pub(crate) const REPLY_TYPE_REPLIED: &str = "replied";
 pub(crate) const REPLY_TYPE_NO_REPLY: &str = "no_reply";
 
-// `stage` label values. `reply_write` ships in 1a-2; `meta_spawn` in 1b
-// (rt.spawn submission -> first poll scheduling delay); `operation` in 2a (the
-// whole metadata dispatch_meta match). NOTE: `stream_enqueue` is a reserved
-// stage value that Phase 2 deliberately does NOT emit — the send_stream
-// read/write dispatch is covered by the dedicated `io_dispatch_duration_us`
-// metric instead (it can include a consistency flush/reopen, so it is not a
-// pure channel push). Do not add a STAGE_STREAM_ENQUEUE const.
+// `stage` label values. `meta_spawn` is the rt.spawn submission -> first poll
+// scheduling delay; `operation` is the whole metadata dispatch_meta match. NOTE:
+// `stream_enqueue` is a reserved stage value that is deliberately NOT emitted —
+// the send_stream read/write dispatch is covered by the dedicated
+// `io_dispatch_duration_us` metric instead (it can include a consistency
+// flush/reopen, so it is not a pure channel push). Do not add a
+// STAGE_STREAM_ENQUEUE const.
 pub(crate) const STAGE_REPLY_WRITE: &str = "reply_write";
 pub(crate) const STAGE_META_SPAWN: &str = "meta_spawn";
 pub(crate) const STAGE_OPERATION: &str = "operation";
-// Phase 2b: the read/write backend call in the reader/writer task body. This is
-// the ONLY `stage_duration_us` emission point Phase 2b adds. flush/fsync/release
+// The read/write backend call in the reader/writer task body — the ONLY
+// `stage_duration_us` emission point for stream IO. flush/fsync/release
 // deliberately emit NO stage (their result status is not clean — it mixes backend
 // and reply-enqueue errors — so a `stage_duration_us{status}` would carry that
 // pollution); they use the status-less `stream_lifecycle_*` family instead. The
@@ -79,7 +79,7 @@ pub(crate) const STAGE_OPERATION: &str = "operation";
 // `io_dispatch_duration_us`); see the `STAGE_STREAM_ENQUEUE` note above.
 pub(crate) const STAGE_STREAM_IO: &str = "stream_io";
 
-// `io_type` label values (Phase 2b). Lowercase, low-cardinality, zero-allocation.
+// `io_type` label values. Lowercase, low-cardinality, zero-allocation.
 // read/write feed the `io_*` families (with `status`); flush/fsync/release feed
 // the independent `stream_lifecycle_*` families (no `status`). The two never mix.
 pub(crate) const IO_TYPE_READ: &str = "read";
@@ -88,7 +88,7 @@ pub(crate) const IO_TYPE_FLUSH: &str = "flush";
 pub(crate) const IO_TYPE_FSYNC: &str = "fsync";
 pub(crate) const IO_TYPE_RELEASE: &str = "release";
 
-// `path_type` label values (Phase 2b), the backend a stream IO targets. read/write
+// `path_type` label values, the backend a stream IO targets. read/write
 // resolve the real backend via `UnifiedReader/Writer::path_type()` (which returns
 // these same literals from curvine-client); flush/fsync/release use `unknown` for
 // now (the send_stream layer does not look up the handle). Only `unknown` is read
@@ -114,20 +114,20 @@ pub(crate) const PATH_TYPE_FALLBACK: &str = "fallback";
 pub(crate) const PATH_TYPE_LOCAL: &str = "local";
 pub(crate) const PATH_TYPE_UNKNOWN: &str = "unknown";
 
-// Phase 3a `cache` label values (on `user_meta_cache_*`): the meta-cache namespace.
+// `cache` label values (on `user_meta_cache_*`): the meta-cache namespace.
 pub(crate) const CACHE_STATUS: &str = "status";
 pub(crate) const CACHE_LIST: &str = "list";
 pub(crate) const CACHE_BLOCKS: &str = "blocks";
 
-// Phase 3a `status` label values on the `*_cache_total` counters.
+// `status` label values on the `*_cache_total` counters.
 pub(crate) const CACHE_RESULT_HIT: &str = "hit";
 pub(crate) const CACHE_RESULT_MISS: &str = "miss";
 pub(crate) const CACHE_RESULT_PUT: &str = "put";
 
-// Phase 3a `operation` label value on `node_cache_total`.
+// `operation` label value on `node_cache_total`.
 pub(crate) const NODE_CACHE_OP_LOOKUP: &str = "lookup";
 
-// Phase 3a `reason` label values on `user_meta_cache_invalidations_total`, one per
+// `reason` label values on `user_meta_cache_invalidations_total`, one per
 // real `invalid_cache` call site (see the design doc's 15-value enum).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const INVAL_REASON_SETATTR: &str = "setattr";
@@ -156,11 +156,11 @@ pub(crate) const INVAL_REASON_RENAME: &str = "rename";
 pub(crate) const INVAL_REASON_SYMLINK: &str = "symlink";
 pub(crate) const INVAL_REASON_FSYNC: &str = "fsync";
 
-// Phase 3a `status` label on the readdir histograms.
+// `status` label on the readdir histograms.
 pub(crate) const READDIR_STATUS_SUCCESS: &str = "success";
 pub(crate) const READDIR_STATUS_ERROR: &str = "error";
 
-// Phase 3b `stage` label values on the DEDICATED state-recovery families
+// `stage` label values on the DEDICATED state-recovery families
 // (`state_persist_stage_duration_us` / `state_restore_stage_duration_us`). These
 // are a SEPARATE domain from the request `stage_duration_us` enum
 // (reply_write/meta_spawn/operation/stream_io) — they share the label NAME but
@@ -171,20 +171,20 @@ pub(crate) const STATE_STAGE_FILE_HANDLES: &str = "file_handles";
 pub(crate) const STATE_STAGE_DIR_HANDLES: &str = "dir_handles";
 pub(crate) const STATE_STAGE_MOUNT_FDS: &str = "mount_fds";
 
-// Phase 3b `kind` label on `state_persist_handle_count`.
+// `kind` label on `state_persist_handle_count`.
 pub(crate) const STATE_KIND_NODE_MAP: &str = "node_map";
 pub(crate) const STATE_KIND_FILE_HANDLES: &str = "file_handles";
 pub(crate) const STATE_KIND_DIR_HANDLES: &str = "dir_handles";
 
-// Phase 3b `status` label on state_persist/restore families + stage timers.
+// `status` label on state_persist/restore families + stage timers.
 pub(crate) const STATE_STATUS_SUCCESS: &str = "success";
 pub(crate) const STATE_STATUS_ERROR: &str = "error";
 
-// Phase 3b `result` label on `session_init_total`.
+// `result` label on `session_init_total`.
 pub(crate) const SESSION_INIT_SUCCESS: &str = "success";
 pub(crate) const SESSION_INIT_ERROR: &str = "error";
 
-// Phase 3b `reason` label on `session_shutdown_total` (6 bounded values). The
+// `reason` label on `session_shutdown_total` (6 bounded values). The
 // `run_all` select arm splits its three match outcomes; the signal arms and the
 // fd-watcher contribute the rest. Recorded once via a `ShutdownOnce` CAS.
 pub(crate) const SHUTDOWN_COMPLETED: &str = "completed";
@@ -194,8 +194,8 @@ pub(crate) const SHUTDOWN_TERM_SIGNAL: &str = "term_signal";
 pub(crate) const SHUTDOWN_SIGUSR1_PERSIST: &str = "sigusr1_persist";
 pub(crate) const SHUTDOWN_FD_WATCHER: &str = "fd_watcher";
 
-// `phase` label values (`decode_errors_total`). `parse` (parse-after-ctx
-// cleanup) ships in 1a-2; `decode` (from_bytes failures) in 1b.
+// `phase` label values (`decode_errors_total`). `parse` is parse-after-ctx
+// cleanup; `decode` is a `from_bytes` failure.
 pub(crate) const DECODE_PHASE_PARSE: &str = "parse";
 pub(crate) const DECODE_PHASE_DECODE: &str = "decode";
 
@@ -205,45 +205,37 @@ pub(crate) const DECODE_PHASE_DECODE: &str = "decode";
 pub(crate) const RECEIVE_ACTION_CONTINUE: &str = "continue";
 pub(crate) const RECEIVE_ACTION_EXIT: &str = "exit";
 
-// `reason` label value for `reply_enqueue_errors_total`. Phase 1a-2 only uses
-// `channel_closed`: a tokio `SendError` means exactly "channel closed" and
-// cannot reliably distinguish runtime shutdown, so we do not invent a reason
-// from the error string (see plan R6).
+// `reason` label value for `reply_enqueue_errors_total`. Only `channel_closed`
+// is used: a tokio `SendError` means exactly "channel closed" and cannot reliably
+// distinguish runtime shutdown, so we do not invent a reason from the error string.
 pub(crate) const ENQUEUE_REASON_CHANNEL_CLOSED: &str = "channel_closed";
 
 // `status` label values for `notify_total`. These are a delivery lifecycle,
 // NOT a request status — deliberately separate consts so they are never
-// confused with `FuseReqStatus::as_str()` (see plan R12).
+// confused with `FuseReqStatus::as_str()`.
 pub(crate) const NOTIFY_SUCCESS: &str = "success";
 pub(crate) const NOTIFY_ENQUEUE_FAILED: &str = "enqueue_failed";
 pub(crate) const NOTIFY_WRITE_FAILED: &str = "write_failed";
 
 // Defensive `reason` label used only when an `Unsupported` status reaches the
-// finish helper with no source tag — which is a wiring bug (every 1a-2
-// Unsupported site tags its reason). It is surfaced via debug_assert!/warn! and
-// bucketed distinctly so a missing tag never masquerades as a real
-// `unimplemented_opcode` gap.
+// finish helper with no source tag — which is a wiring bug (every Unsupported
+// site tags its reason). It is surfaced via debug_assert!/warn! and bucketed
+// distinctly so a missing tag never masquerades as a real `unimplemented_opcode`
+// gap.
 const UNSUPPORTED_REASON_MISSING: &str = "missing_reason";
 
 /// Fallback `errno` label when a delivery (kernel-fd write) failure carries no
 /// OS errno — used by `response_write_errors_total` instead of `errno_label(0)`
-/// so a missing errno never reads as a literal "raw 0" (see plan R7).
+/// so a missing errno never reads as a literal "raw 0".
 const ERRNO_LABEL_OTHER: &str = "OTHER";
 
 static FUSE_METRICS: OnceCell<FuseMetrics> = OnceCell::new();
 
 /// Process-global FUSE metrics registry.
 ///
-/// The struct is intentionally shaped so that **each implementation phase
-/// registers the concrete metric families it first uses** — it is *not*
-/// front-loaded with every future metric. Adding a later phase's metrics is an
-/// additive change (a new field + a registration line), never a refactor of the
-/// existing fields. This keeps each phase's diff self-contained and avoids
-/// locking metric names / label sets before the code that uses them exists.
-///
-/// Phase 0 registers only the three pre-existing runtime gauges; the helper
-/// types below (`FuseReqLabels`, `ActiveGuard`, `HistogramTimer`) are the
-/// enabling primitives that later phases build on, and carry no call sites yet.
+/// Adding a metric is an additive change (a new field + a registration line in
+/// `register`), never a refactor of the existing fields — so metric names /
+/// label sets are only locked once the code that uses them exists.
 pub struct FuseMetrics {
     pub inode_num: Gauge,
     pub file_handle_num: Gauge,
@@ -254,7 +246,7 @@ pub struct FuseMetrics {
     pub write_back_mem_usage: Gauge,
     pub write_back_mem_limit: Gauge,
 
-    // --- Phase 3b-1: namespaced aliases of the legacy gauges above ---
+    // --- namespaced aliases of the legacy gauges above ---
     // Event-driven at the same insert/remove/restore sites, kept exactly in
     // lockstep with their legacy counterparts (updated inside the same
     // `FuseMetrics::with` closure). The legacy `*_num` gauges are deprecated and
@@ -263,7 +255,7 @@ pub struct FuseMetrics {
     pub file_handle_count: Gauge,
     pub dir_handle_count: Gauge,
 
-    // --- Phase 1a-2: end-to-end request metrics ---
+    // --- end-to-end request metrics ---
     /// E2E in-flight requests, driven by `ActiveGuard`: incremented at ctx
     /// creation, decremented at the sender/no-reply finish. `kind`.
     pub(crate) active_requests: GaugeVec,
@@ -276,13 +268,13 @@ pub struct FuseMetrics {
     pub(crate) errors_total: CounterVec,
     /// Interrupted requests (the SETLKW interrupt-notify path). `opcode`.
     pub(crate) interrupted_total: CounterVec,
-    /// Unsupported requests. `opcode,reason`. Phase 1a-2 emits
+    /// Unsupported requests. `opcode,reason`. Emits
     /// `unknown_opcode` / `unimplemented_opcode`; `trait_default` reserved.
     pub(crate) unsupported_total: CounterVec,
     /// Kernel notifications. `code,status` where status is a delivery lifecycle
     /// (`success|enqueue_failed|write_failed`), not a request status.
     pub(crate) notify_total: CounterVec,
-    /// Structural decode/parse failures. `phase,reason`. Phase 1a-2 emits only
+    /// Structural decode/parse failures. `phase,reason`. Emits only
     /// `phase=parse,reason=other`; the schema supports the full reason set but
     /// other series are not pre-created.
     pub(crate) decode_errors_total: CounterVec,
@@ -293,15 +285,15 @@ pub struct FuseMetrics {
     /// `opcode,request_status`.
     pub(crate) response_bytes_total: CounterVec,
     /// Reply-channel enqueue failures (request never reaches the sender).
-    /// `opcode,reason`. Phase 1a-2 only uses reason `channel_closed`.
+    /// `opcode,reason`. Only uses reason `channel_closed`.
     pub(crate) reply_enqueue_errors_total: CounterVec,
     /// Kernel-fd write failures in the sender (delivery failure). `opcode,errno`.
     pub(crate) response_write_errors_total: CounterVec,
     /// Per-stage latency, opcode-free. `stage,kind,status`. Bounded `stage`
-    /// enum emitted by the current build (reply_write in 1a-2, meta_spawn in 1b).
+    /// enum (reply_write, meta_spawn, operation, stream_io).
     pub(crate) stage_duration_us: HistogramVec,
 
-    // --- Phase 1b-1: framework health + scrape hygiene ---
+    // --- framework health + scrape hygiene ---
     /// Receiver loop wait: splice + header-parse, INCLUDING idle wait for the
     /// next kernel request. A saturation/health histogram, NOT request latency.
     pub(crate) receive_loop_wait_duration_us: Histogram,
@@ -316,7 +308,7 @@ pub struct FuseMetrics {
     /// `/metrics` last scrape output size in bytes. Self-observation gauge.
     pub(crate) metrics_scrape_bytes: Gauge,
 
-    // --- Phase 2a: metadata operation, reply-queue depth, SETLKW ---
+    // --- metadata operation, reply-queue depth, SETLKW ---
     /// Per-op metadata operation latency, observed at a single timer around the
     /// whole `dispatch_meta` match. `opcode,kind,status` (kind always
     /// `metadata`). Status is the stashed `op_status` (FS-operation result),
@@ -356,14 +348,14 @@ pub struct FuseMetrics {
     /// No label.
     pub(crate) setlkw_inflight: Gauge,
 
-    // --- Phase 2b: stream IO (read/write backend + flush/fsync/release lifecycle) ---
+    // --- stream IO (read/write backend + flush/fsync/release lifecycle) ---
     //
     // Two deliberately-separate families. `io_*` covers read/write backend IO and
     // carries `status` (the backend result is clean). `stream_lifecycle_*` covers
     // flush/fsync/release and carries NO status (their result mixes backend and
     // reply-enqueue errors, so a status label would be dishonest) — and because a
     // Prometheus family's label set is fixed at registration, the two cannot share
-    // a family (R3 P0#1).
+    // a family.
     /// read/write backend IO latency, observed in the reader/writer task body when
     /// the backend `fuse_read`/`fuse_write` returns. `io_type` ∈ {read,write},
     /// `path_type` is the resolved backend, `status` ∈ {success,error}.
@@ -417,7 +409,7 @@ pub struct FuseMetrics {
     /// `_total` suffix (a gauge), no label.
     pub(crate) stream_write_queue_depth: Gauge,
 
-    // --- Phase 3a: cache + readdir metrics ---
+    // --- cache + readdir metrics ---
     /// MetaCache hit/miss/put on the daemon's userspace metadata cache.
     /// `cache` ∈ {status,list,blocks}, `status` ∈ {hit,miss,put}. `miss` is
     /// recorded the moment the cache read returns `None` (before the backend
@@ -449,7 +441,7 @@ pub struct FuseMetrics {
     /// the full-traversal cost is a deferred `opendir_duration_us`. `status`.
     pub(crate) readdir_duration_us: HistogramVec,
 
-    // --- Phase 3b: state recovery + session lifecycle ---
+    // --- state recovery + session lifecycle ---
     /// Persist attempts (SIGUSR1). `status` ∈ {success,error}, recorded once at
     /// the `fuse_session.rs::persist` entry/exit.
     pub(crate) state_persist_total: CounterVec,
@@ -496,12 +488,10 @@ impl FuseMetrics {
     /// no-op when not (instead of `get()`'s panic).
     ///
     /// This is the access path for the **legacy compatibility gauges**
-    /// (`inode_num` / `file_handle_num` / `dir_handle_num`) **and their Phase 3b-1
+    /// (`inode_num` / `file_handle_num` / `dir_handle_num`) **and their
     /// namespaced aliases** (`curvine_fuse_{inode,file_handle,dir_handle}_count`),
-    /// which are updated unconditionally at their inode/handle mutation sites
-    /// (Phase 1b-2 made them event-driven and removed the scrape-time
-    /// `set_metrics()` refresh; 3b-1 added the aliases in lockstep at the same
-    /// sites). Those sites live in `NodeState`/`NodeMap`, whose unit tests
+    /// which are updated unconditionally (event-driven) at their inode/handle
+    /// mutation sites, in lockstep. Those sites live in `NodeState`/`NodeMap`, whose unit tests
     /// construct state with a bare `NodeState::new` and never call
     /// `ensure_init()`; routing every gauge write through `with()` keeps them
     /// from panicking on the uninitialized singleton. The aliases MUST use this
@@ -541,7 +531,7 @@ impl FuseMetrics {
                 "FUSE write-back page cache size limit (bytes)",
             )?,
 
-            // Phase 3b-1: namespaced aliases (same values, event-driven in lockstep).
+            // Namespaced aliases (same values, event-driven in lockstep).
             inode_count: m::new_gauge(
                 "curvine_fuse_inode_count",
                 "FUSE inode count in dcache (namespaced alias of inode_num)",
@@ -781,7 +771,7 @@ impl FuseMetrics {
                  task-embedded guard, dropped at the dequeue point",
             )?,
 
-            // Phase 3a: cache + readdir.
+            // cache + readdir.
             user_meta_cache_total: m::new_counter_vec(
                 "curvine_fuse_user_meta_cache_total",
                 "userspace metadata cache (NodeState/DirTree) hit/miss/put by cache namespace. status=hit|miss|put",
@@ -817,7 +807,7 @@ impl FuseMetrics {
                 REQUEST_DURATION_BUCKETS_US,
             )?,
 
-            // Phase 3b: state recovery + session lifecycle.
+            // state recovery + session lifecycle.
             state_persist_total: m::new_counter_vec(
                 "curvine_fuse_state_persist_total",
                 "FUSE state-persist attempts (SIGUSR1). status=success|error",
@@ -869,7 +859,7 @@ impl FuseMetrics {
         })
     }
 
-    // --- Phase 1a-2 emission helpers ---
+    // --- emission helpers ---
     //
     // These are the single place each metric's `with_label_values` lives, so the
     // finish paths (sender / no-reply / enqueue-failure / parse-early) never hand
@@ -907,7 +897,7 @@ impl FuseMetrics {
     /// The full sender finish emission: request total + duration, response
     /// write latency/bytes, the `reply_write` stage, and the per-status error /
     /// unsupported / interrupted / delivery-failure counters. Pure (no IO), so
-    /// it is unit-testable without a kernel fd (plan R13).
+    /// it is unit-testable without a kernel fd.
     ///
     /// **Two statuses, deliberately separate** (design doc "operation vs request
     /// status"):
@@ -977,7 +967,7 @@ impl FuseMetrics {
     ///
     /// **Call exactly once per request, only from a request terminal path.**
     /// Calling it twice double-counts the op-level counters for one request. In
-    /// particular, the Phase 2 `operation_duration_us` timer must only `observe`
+    /// particular, the `operation_duration_us` timer must only `observe`
     /// latency — it must NOT call this (the request terminal already did).
     pub(crate) fn record_op_terminal(
         &self,
@@ -995,8 +985,8 @@ impl FuseMetrics {
             }
             FuseReqStatus::Unsupported => {
                 // Source-tagged reason is the only authority (never inferred from
-                // errno). 1a-2 always tags Unsupported at its source sites; a
-                // missing tag is a wiring bug, surfaced (not silently bucketed).
+                // errno). Every Unsupported site tags its reason; a missing tag is
+                // a wiring bug, surfaced (not silently bucketed).
                 let reason = match unsupported_reason {
                     Some(r) => r,
                     None => {
@@ -1026,7 +1016,7 @@ impl FuseMetrics {
     }
 
     /// `reply_enqueue_errors_total +1` — the reply never reached the sender.
-    /// `reason` is a channel-level reason const (Phase 1a-2 only uses
+    /// `reason` is a channel-level reason const (only
     /// `ENQUEUE_REASON_CHANNEL_CLOSED`).
     pub(crate) fn record_reply_enqueue_error(&self, opcode: &'static str, reason: &'static str) {
         self.reply_enqueue_errors_total
@@ -1036,14 +1026,14 @@ impl FuseMetrics {
 
     /// `decode_errors_total{phase="parse"} +1` — a structural parse failure that
     /// happened after the request ctx existed. `reason` is the parse-failure
-    /// reason (Phase 1a-2 only emits `"other"`).
+    /// reason (only `"other"` is emitted).
     pub(crate) fn record_parse_error(&self, reason: &'static str) {
         self.decode_errors_total
             .with_label_values(&[DECODE_PHASE_PARSE, reason])
             .inc();
     }
 
-    // --- Phase 1b-1 framework health helpers ---
+    // --- framework health helpers ---
 
     /// `decode_errors_total{phase="decode"} +1` — a structural `from_bytes`
     /// failure before any request ctx exists. `reason` is `"other"` for now
@@ -1106,11 +1096,11 @@ impl FuseMetrics {
         }
     }
 
-    // --- Phase 2a emission helpers ---
+    // --- emission helpers ---
 
     /// Observe the metadata operation latency once around the whole
     /// `dispatch_meta` match, feeding **two** families from one timer (the same
-    /// dual-emit shape as the 2b `stream_io` call site):
+    /// dual-emit shape as the `stream_io` call site):
     /// - `operation_duration_us{opcode,kind=metadata,status}` — per-opcode detail.
     /// - `stage_duration_us{stage=operation,kind=metadata,status}` — the
     ///   opcode-free stage view, so the operation stage is comparable against the
@@ -1150,8 +1140,8 @@ impl FuseMetrics {
     /// Uses `get()` (strict), like `setlkw_inflight_guard` / `setlkw_wait_timer`:
     /// because this is only ever reached on the metrics-enabled path, an
     /// uninitialized singleton here is a wiring/init-order regression and SHOULD
-    /// surface as a panic rather than silently drop `reply_queue_depth` (review
-    /// P1#5). Production order guarantees init before any reply (ensure_init
+    /// surface as a panic rather than silently drop `reply_queue_depth`.
+    /// Production order guarantees init before any reply (ensure_init
     /// precedes NodeState; pinned by `ensure_init_precedes_node_state`); the
     /// enabled-path unit tests call `ensure_init()` in their fixtures. The guard is
     /// moved into the `RequestReply`/`NotifyReply` task and decrements when the
@@ -1197,7 +1187,7 @@ impl FuseMetrics {
         }
     }
 
-    // --- Phase 2b emission helpers ---
+    // --- emission helpers ---
 
     /// Record one read/write backend IO in the reader/writer task body, feeding
     /// the read/write `io_*` families plus the opcode-free `stage_duration_us`
@@ -1246,7 +1236,7 @@ impl FuseMetrics {
             .with_label_values(&[io_type, path_type])
             .observe(request_size as f64);
         if ok {
-            // Success-only byte series, fixed status=success (R3 P0#2).
+            // Success-only byte series, fixed status=success.
             self.io_bytes_total
                 .with_label_values(&[io_type, path_type, FuseReqStatus::Success.as_str()])
                 .inc_by(transferred_bytes as i64);
@@ -1330,7 +1320,7 @@ impl FuseMetrics {
         }
     }
 
-    // --- Phase 3a emission helpers (called via `FuseMetrics::with`) ---
+    // --- emission helpers (called via `FuseMetrics::with`) ---
 
     /// `user_meta_cache_total{cache,status} +1`. `cache` ∈ {status,list,blocks},
     /// `status` ∈ {hit,miss,put}.
@@ -1386,7 +1376,7 @@ impl FuseMetrics {
             .observe(elapsed_us as f64);
     }
 
-    // --- Phase 3b emission helpers (called via `FuseMetrics::with`) ---
+    // --- emission helpers (called via `FuseMetrics::with`) ---
 
     /// `state_persist_total{status} +1` / `state_restore_total{status} +1`.
     pub(crate) fn record_state_total(&self, is_persist: bool, status: &'static str) {
@@ -1540,15 +1530,15 @@ impl FuseReqKind {
 /// task.
 ///
 /// The move-only request context that *owns* the in-flight guard (`FuseReqCtx`)
-/// is defined where it is used (Phase 1a-1); these labels are the part that
-/// travels onto the reply.
+/// is defined where it is used; these labels are the part that travels onto the
+/// reply.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FuseReqLabels {
     pub(crate) opcode: &'static str,
     pub(crate) kind: FuseReqKind,
     pub(crate) start: Instant,
     /// Request size from the parsed header. Carried for a future per-request
-    /// byte metric; not read by any Phase 1a-2 series yet.
+    /// byte metric; not read by any series yet.
     #[allow(dead_code)]
     pub(crate) request_bytes: u32,
 }
@@ -1628,17 +1618,17 @@ pub(crate) struct FuseReqCtx {
 ///
 /// `op_status` / `errno` / `unsupported_reason` are stored **independently of**
 /// `active`, so taking the guard out into the reply task does not clear the
-/// status the operation-duration timer reads later (Phase 1a-2 / Phase 2).
+/// status the operation-duration timer reads later.
 #[derive(Debug)]
 pub(crate) struct FuseRespMetrics {
     pub(crate) labels: FuseReqLabels,
     /// The E2E guard; `take()`n exactly once when the reply is built.
     pub(crate) active: Option<ActiveGuard>,
     /// FS-operation result status. Stashed by every finish path and asserted by
-    /// tests; the production read (the `operation_duration_us{status}` timer)
-    /// lands in Phase 2. Kept separate from `request_status` because the two can
-    /// diverge (op succeeds, delivery fails).
-    #[allow(dead_code)] // production reader is operation_duration_us in Phase 2.
+    /// tests; the production read is the `operation_duration_us{status}` timer.
+    /// Kept separate from `request_status` because the two can diverge (op
+    /// succeeds, delivery fails).
+    #[allow(dead_code)] // production reader is operation_duration_us.
     pub(crate) op_status: Option<FuseReqStatus>,
     /// Final delivery/result status. The replied path carries status on the
     /// `RequestReply` task (read by the sender), so this slot copy exists for the
@@ -1691,10 +1681,9 @@ impl FuseRespMetrics {
 /// type can back different scopes (`active_requests`, `stream_io_inflight`,
 /// `meta_task_inflight`) just by being constructed from different gauges.
 ///
-/// The `None` (no-op) form is what Phase 1a-1 uses: it exercises the full
-/// move-and-drop lifetime — proving single-take / single-drop ownership — while
-/// touching no real gauge. Phase 1a-2 swaps in `new(active_requests_gauge)` so
-/// the same plumbing then drives the real metric.
+/// The `None` (no-op) form exercises the full move-and-drop lifetime — proving
+/// single-take / single-drop ownership — while touching no real gauge;
+/// `new(active_requests_gauge)` uses the same plumbing to drive the real metric.
 #[derive(Debug)]
 pub(crate) struct ActiveGuard {
     gauge: Option<Gauge>,
@@ -1707,8 +1696,8 @@ impl ActiveGuard {
         Self { gauge: Some(gauge) }
     }
 
-    /// A no-op guard: same move/drop semantics, but touches no gauge. Used in
-    /// Phase 1a-1 to validate ownership before the real gauge is wired (1a-2).
+    /// A no-op guard: same move/drop semantics, but touches no gauge. Used to
+    /// validate ownership without a real gauge.
     pub(crate) fn noop() -> Self {
         Self { gauge: None }
     }
@@ -1732,8 +1721,8 @@ impl Drop for ActiveGuard {
 ///
 /// Durations are measured with the monotonic clock (`Instant`).
 ///
-/// Wired to call sites since Phase 2a (`setlkw_wait_timer`) and Phase 2b
-/// (`io_dispatch_timer` / the `stream_lifecycle_scope` duration timer).
+/// Backs `setlkw_wait_timer`, `io_dispatch_timer`, and the
+/// `stream_lifecycle_scope` duration timer.
 #[derive(Debug)]
 pub(crate) struct HistogramTimer {
     start: Instant,
@@ -1756,7 +1745,7 @@ impl Drop for HistogramTimer {
     }
 }
 
-/// Phase 3a readdir timer for `read_dir_common`. Records
+/// Readdir timer for `read_dir_common`. Records
 /// `readdir_duration_us{status=error}` on drop UNLESS `success(entries)` was
 /// called, which instead records `readdir_duration_us{status=success}` +
 /// `readdir_entries{status=success}`. So an early `?` return or an async
@@ -1803,7 +1792,7 @@ impl Drop for ReaddirTimer {
     }
 }
 
-/// Phase 3b per-stage timer for state persist/restore (D9). Records the stage
+/// Per-stage timer for state persist/restore. Records the stage
 /// duration on drop with `status=error` UNLESS `success()` is called first (which
 /// records `status=success` and disarms the error drop). So an early `?` return
 /// or async cancellation mid-stage is counted as `error` ("the attempt did not
@@ -1852,7 +1841,7 @@ impl Drop for StateStageTimer {
     }
 }
 
-/// Phase 3b shutdown-reason de-duplicator (D4). `session_shutdown_total` must be
+/// Shutdown-reason de-duplicator. `session_shutdown_total` must be
 /// recorded exactly once per session, by the FIRST cause: the fd-watcher, a
 /// signal arm, and the `run_all` completion arm can all race to report a reason.
 /// A single `compare_exchange` CAS lets the first caller win; later callers
@@ -1898,7 +1887,7 @@ mod tests {
     use orpc::common::Metrics as m;
 
     // Compile-time guarantee that the guards/timer are `Send`. They must travel
-    // into spawned tasks and onto reply tasks (Phase 1a); if a future field
+    // into spawned tasks and onto reply tasks; if a future field
     // change made them `!Send`, this fails to compile here rather than silently
     // at the first cross-task move.
     #[test]
@@ -2046,7 +2035,7 @@ mod tests {
         assert_eq!(FuseReqStatus::Unsupported.as_str(), "unsupported");
     }
 
-    // test 1: a successful replied request increments requests_total{replied,
+    // a successful replied request increments requests_total{replied,
     // success} + request_duration once, response_write/bytes/reply_write stage
     // once, and NO error/unsupported/interrupted counter.
     #[test]
@@ -2117,7 +2106,7 @@ mod tests {
         );
     }
 
-    // test 14: a real error (untagged) increments errors_total with the errno
+    // a real error (untagged) increments errors_total with the errno
     // label and NOT unsupported_total.
     #[test]
     fn record_request_finish_error_emits_errors_total_with_errno() {
@@ -2186,7 +2175,7 @@ mod tests {
         );
     }
 
-    // test 16 / P1#1: op succeeds but the kernel-fd write fails. The kernel
+    // op succeeds but the kernel-fd write fails. The kernel
     // observes a failed request, so the request_status-labelled series go to
     // `error`, while the op-level counters stay clean (op succeeded). The write
     // errno is the independent delivery dimension.
@@ -2259,7 +2248,7 @@ mod tests {
         );
     }
 
-    // P1#2: a defensive guard — an Unsupported op_status with no source tag is a
+    // a defensive guard — an Unsupported op_status with no source tag is a
     // wiring bug. It must not silently masquerade as unimplemented_opcode; it is
     // bucketed under missing_reason (and asserts in debug). Pass request_status
     // == op_status (write succeeded) so only the op-status path is exercised.
@@ -2312,7 +2301,7 @@ mod tests {
         );
     }
 
-    // test 12: notify lifecycle states are distinct counters under notify_total.
+    // notify lifecycle states are distinct counters under notify_total.
     #[test]
     fn record_notify_result_counts_three_states() {
         FuseMetrics::ensure_init().unwrap();
@@ -2340,8 +2329,6 @@ mod tests {
             1
         );
     }
-
-    // --- Phase 1b-1 ---
 
     // receive_errors_total: errno + action labels recorded as a delta.
     #[test]
@@ -2373,8 +2360,8 @@ mod tests {
         );
     }
 
-    // record_decode_error emits under phase=decode (the 1b site; 1a-2 already
-    // had phase=parse via record_parse_error). We assert only the decode series
+    // record_decode_error emits under phase=decode (record_parse_error already
+    // covers phase=parse). We assert only the decode series
     // delta: a cross-series ("parse untouched") assertion can't be made reliably
     // against the process-global registry under parallel tests, and a `>=` guard
     // would prove nothing — so we don't pretend to. `decode` vs `parse` being
@@ -2449,7 +2436,7 @@ mod tests {
     }
 
     // record_meta_spawn observes the stage_duration_us{meta_spawn,metadata,success}
-    // series — guards against a label/status/kind typo in the core 1b-1 helper.
+    // series — guards against a label/status/kind typo in the core helper.
     #[test]
     fn record_meta_spawn_observes_correct_labels() {
         FuseMetrics::ensure_init().unwrap();
@@ -2482,9 +2469,9 @@ mod tests {
         );
     }
 
-    // --- Phase 2a helper tests ---
+    // --- helper tests ---
 
-    // E1: record_operation feeds BOTH families from one timer — the per-opcode
+    // record_operation feeds BOTH families from one timer — the per-opcode
     // `operation_duration_us{opcode,kind=metadata,status}` and the opcode-free
     // `stage_duration_us{stage=operation,kind=metadata,status}` — under the
     // stashed op_status (here: success). Unique opcode + delta on the shared
@@ -2531,7 +2518,7 @@ mod tests {
         );
     }
 
-    // E2: status comes through verbatim (here: error) — the timer observes
+    // status comes through verbatim (here: error) — the timer observes
     // whatever op_status the caller read back from the slot, NOT a hard-coded
     // success. Guards against a status-source regression in the helper labels.
     #[test]
@@ -2562,7 +2549,7 @@ mod tests {
         );
     }
 
-    // E (B2 gate): reply_queue_guard returns Some once the singleton is
+    // B2 gate: reply_queue_guard returns Some once the singleton is
     // initialized, inc on create / dec on drop. (The disabled path produces the
     // legacy Reply and never calls this; the gate lives at the FuseResponse call
     // site, so there is no `false` arm to assert here.)
@@ -2586,7 +2573,7 @@ mod tests {
         );
     }
 
-    // E4: setlkw_inflight_guard gate — disabled is None (never noop), enabled
+    // setlkw_inflight_guard gate — disabled is None (never noop), enabled
     // inc/dec balances the gauge.
     #[test]
     fn setlkw_inflight_guard_gate() {
@@ -2604,7 +2591,7 @@ mod tests {
         assert_eq!(mx.setlkw_inflight.get(), before, "guard dec on drop");
     }
 
-    // E17: setlkw_wait_timer gate — disabled builds NO timer (no clock read, no
+    // setlkw_wait_timer gate — disabled builds NO timer (no clock read, no
     // observe on drop), enabled observes exactly once on drop.
     #[test]
     fn setlkw_wait_timer_gate() {
@@ -2634,7 +2621,7 @@ mod tests {
         );
     }
 
-    // --- Phase 2b helper tests ---
+    // --- helper tests ---
     //
     // The process-global registry accumulates across parallel tests, so value
     // assertions read a child's counter/histogram before and after and check the
@@ -2644,7 +2631,7 @@ mod tests {
     // takes `path_type` as a parameter, so a test-only label is just as valid a
     // child as a real backend and never collides with another test or with e2e.
 
-    // E (dispatch_io_type / lifecycle_io_type closed maps, R-overall P1#6): the 5
+    // dispatch_io_type / lifecycle_io_type closed maps: the 5
     // stream opcodes map to the LOWERCASE io_type consts (NOT opcode.as_str(), which
     // is "Read"/"Fsync" etc.); non-stream / non-IO opcodes map to None; and exactly
     // one of the two maps is Some for any known stream opcode.
@@ -2699,7 +2686,7 @@ mod tests {
         }
     }
 
-    // E7/E13/E14 (read/write io family): a successful read records duration + stage
+    // read/write io family: a successful read records duration + stage
     // + requests{success} + size + bytes{success}; an error records duration + stage
     // + requests{error} + size, but creates NO bytes child (never inc_by(0)). Uses a
     // unique path_type so the children are isolated on the shared registry.
@@ -2808,7 +2795,7 @@ mod tests {
         );
     }
 
-    // E6 (stream_io_inflight gate): disabled is None (never noop); enabled is Some
+    // stream_io_inflight gate: disabled is None (never noop); enabled is Some
     // and inc/dec balances the GaugeVec child for the given io_type. Uses the real
     // read child but reads before/after deltas so it is parallel-safe.
     #[test]
@@ -2842,11 +2829,10 @@ mod tests {
         );
     }
 
-    // E21 (stream_lifecycle_scope): opening the scope counts the attempt
+    // stream_lifecycle_scope: opening the scope counts the attempt
     // immediately (before the backend runs), holds the inflight guard while alive
     // (gauge>0), and observes the duration once on drop; the inflight returns to
-    // baseline after drop. Asserts the FULL {io_type,path_type="unknown"} label set
-    // (R-overall P1#5).
+    // baseline after drop. Asserts the FULL {io_type,path_type="unknown"} label set.
     #[test]
     fn stream_lifecycle_scope_counts_attempt_holds_inflight_observes_on_drop() {
         FuseMetrics::ensure_init().unwrap();
@@ -2907,7 +2893,7 @@ mod tests {
         );
     }
 
-    // E (io_dispatch_timer): observes once on drop under the io_type child.
+    // io_dispatch_timer: observes once on drop under the io_type child.
     #[test]
     fn io_dispatch_timer_observes_once_on_drop() {
         FuseMetrics::ensure_init().unwrap();
@@ -2928,7 +2914,7 @@ mod tests {
         );
     }
 
-    // E4 (stream_write_queue_guard gate): disabled None (never noop), enabled inc/dec
+    // stream_write_queue_guard gate: disabled None (never noop), enabled inc/dec
     // balances the gauge.
     #[test]
     fn stream_write_queue_guard_gate() {
@@ -2954,7 +2940,7 @@ mod tests {
         );
     }
 
-    // E24 (negative assertion, io family is read/write only): record_stream_io must
+    // negative assertion, io family is read/write only: record_stream_io must
     // never be called with a flush/fsync/release io_type in production — the family
     // SPLIT is structural (lifecycle uses stream_lifecycle_*). Here we assert the
     // closed maps enforce that split: an io_type that would land in io_* only ever
@@ -2996,22 +2982,22 @@ mod tests {
         assert_eq!(PATH_TYPE_UNKNOWN, "unknown");
     }
 
-    // E27 (negative assertion): there is NO STAGE_STREAM_ENQUEUE const and
-    // stage=stream_io is the only Phase 2b stage value. This is a compile-time-ish
-    // guard: STAGE_STREAM_IO is "stream_io" and there is no "stream_enqueue" stage
-    // const to reference (grep-enforced in review; asserted by value here).
+    // negative assertion: there is NO STAGE_STREAM_ENQUEUE const and
+    // stage=stream_io is the only stream stage value. STAGE_STREAM_IO is
+    // "stream_io" and there is no "stream_enqueue" stage const to reference
+    // (asserted by value here).
     #[test]
-    fn stage_stream_io_is_the_only_phase2b_stage() {
+    fn stage_stream_io_is_the_only_stream_stage() {
         assert_eq!(STAGE_STREAM_IO, "stream_io");
         // No STAGE_STREAM_ENQUEUE exists; if one were added this test's neighbors
         // (the no-enqueue rule) and the send_stream code review would catch it.
     }
 
-    // --- Phase 3a helper tests ---
+    // --- helper tests ---
     //
-    // Same parallel-safety discipline as Phase 2b: the process-global registry
-    // accumulates across parallel tests, so value assertions read a child's
-    // counter before/after on a label set the test owns. `user_meta_cache_total`
+    // Same parallel-safety discipline as the stream IO tests: the process-global
+    // registry accumulates across parallel tests, so value assertions read a
+    // child's counter before/after on a label set the test owns. `user_meta_cache_total`
     // and `*_invalidations_total` take the `cache` label as a param, so each test
     // uses a UNIQUE synthetic `cache` value to isolate its children. The no-label
     // `negative_entry_returned_total` uses a before/after delta.
@@ -3221,12 +3207,12 @@ mod tests {
             INVAL_REASON_FSYNC,
         ];
         assert_eq!(reasons.len(), 15);
-        // No catch-all `other` and no `kernel_notify` (dropped in Phase 3a).
+        // No catch-all `other` and no `kernel_notify`.
         assert!(!reasons.contains(&"other"));
         assert!(!reasons.contains(&"kernel_notify"));
     }
 
-    // --- Phase 3b seam tests ---
+    // --- seam tests ---
 
     // ShutdownOnce records exactly once (first cause wins); later callers no-op.
     // Verified via the return-value of record_once (true only for the winner),
@@ -3350,7 +3336,7 @@ mod tests {
         }
     }
 
-    // P3#5: the lifecycle record helpers actually emit through the singleton
+    // the lifecycle record helpers actually emit through the singleton
     // (exercises the `FuseMetrics::with(|m| m.record_session_init/...)` path the
     // session uses). Shared global children → lower-bound deltas, parallel-safe.
     #[test]
@@ -3394,7 +3380,7 @@ mod tests {
         assert!(v == 0 || v == 1, "health gauge is binary");
     }
 
-    // P3#5: gate decision (enabled vs disabled) is deterministic against an
+    // gate decision (enabled vs disabled) is deterministic against an
     // isolated counter — the exact `if enabled { emit }` shape the session call
     // sites use to gate every lifecycle/state emission on metrics_enabled.
     #[test]

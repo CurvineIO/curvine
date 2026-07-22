@@ -47,7 +47,7 @@ impl FuseReader {
         let err_monitor = Arc::new(ErrorMonitor::new());
         let (sender, receiver) = AsyncChannel::new(conf.stream_channel_size).split();
         let status = reader.status().clone();
-        // Phase 2b: capture the backend kind and the metrics gate at open time and
+        // capture the backend kind and the metrics gate at open time and
         // move them into the read task, so the per-IO observe in `read_future` has
         // the `path_type` label without re-resolving it on the hot path.
         let path_type = reader.path_type();
@@ -129,7 +129,7 @@ impl FuseReader {
         while let Some(task) = req_receiver.recv().await {
             match task {
                 ReadTask::Read(off, len, reply) => {
-                    // Phase 2b: observe the read backend IO (io_type=read). The
+                    // observe the read backend IO (io_type=read). The
                     // inflight guard wraps ONLY the `fuse_read` call (backend
                     // concurrency), and is dropped before the reply enqueue so the
                     // gauge excludes reply-channel time. Then record duration /

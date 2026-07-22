@@ -33,7 +33,7 @@ impl WebServer {
 
 // The `NodeState` is still injected into the router (`with_state`) so
 // `WebServer::start`'s public signature is unchanged, but the handler no longer
-// reads it: Phase 1b-2 made the legacy gauges (inode/handle) event-driven and
+// reads it: the legacy gauges (inode/handle) are event-driven and
 // removed the scrape-time `set_metrics()` refresh, so the scrape is now a pure
 // `text_output()` with no map traversal under read locks.
 async fn metrics_handler(State(_): State<Arc<NodeState>>) -> String {
@@ -46,7 +46,7 @@ async fn metrics_handler(State(_): State<Arc<NodeState>>) -> String {
     // "last scrape"; do not reorder. Recorded on both success and the
     // error-body fallback.
     //
-    // As of 1b-2 the scrape-time `set_metrics()` map traversal is gone, so this
+    // The scrape-time `set_metrics()` map traversal is gone, so this
     // timer covers the meaningful scrape work — the `text_output()` render —
     // rather than under-counting by that traversal. It deliberately does NOT
     // include Axum's `State` extraction or the `FuseMetrics::get()` before

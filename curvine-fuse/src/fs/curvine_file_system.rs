@@ -1608,10 +1608,10 @@ mod tests {
         assert_eq!(zero_range.errno, libc::EOPNOTSUPP);
     }
 
-    /// Pin the production init-order invariant that Phase 1b-2 depends on:
+    /// Pin the production init-order invariant the event-driven gauges depend on:
     /// `FuseMetrics::ensure_init()` MUST run before `NodeState::new()` in
-    /// `CurvineFileSystem::new`. After 1b-2 removed the scrape-time
-    /// `set_metrics()` refresh, the legacy gauges are only correct if their
+    /// `CurvineFileSystem::new`. Since the scrape-time `set_metrics()` refresh
+    /// was removed, the legacy gauges are only correct if their
     /// event-driven updates (routed through `FuseMetrics::with`) land on an
     /// initialized singleton; the `NodeMap::new` root baseline `set(1)` is the
     /// first such update and fires inside `NodeState::new`. If a refactor moved
