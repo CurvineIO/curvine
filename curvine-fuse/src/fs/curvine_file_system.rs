@@ -309,6 +309,18 @@ impl CurvineFileSystem {
         Ok(res)
     }
 
+    /// The readdir resume cookie for the entry at zero-based directory position
+    /// `index`: the offset the kernel must pass on the next readdir to continue
+    /// AFTER this entry, i.e. the position of the FOLLOWING entry (`index + 1`).
+    ///
+    /// This is deliberately a tiny named function so the +1 is covered by a
+    /// regression test: encoding `index` instead makes the last entry of a batch
+    /// carry a cookie equal to the batch's start offset, so the kernel re-requests
+    /// the same offset forever and readdir never terminates (issue #1116).
+    fn readdir_next_cookie(index: u64) -> u64 {
+        index + 1
+    }
+
     /// Returns the encoded dirent list plus the number of entries successfully
     /// added this batch (`index - arg.offset`), which is what `readdir_entries`
     /// observes — NOT `FuseDirentList`'s byte length and NOT the directory total.
@@ -338,7 +350,10 @@ impl CurvineFileSystem {
                 };
 
                 let entry = FuseUtils::create_entry_out(&self.conf, attr);
-                if !res.add_dirent(plus, index, &status, entry) {
+                // dirent `off` is the resume cookie = position of the NEXT entry.
+                // See `readdir_next_cookie` (issue #1116 infinite-loop guard).
+                let next_off = Self::readdir_next_cookie(index);
+                if !res.add_dirent(plus, next_off, &status, entry) {
                     batch.push_front(status);
                     break;
                 }
@@ -1826,5 +1841,328 @@ mod tests {
                                                                  // An unknown high bit must also be rejected — checked against the raw
                                                                  // value, so it is not silently truncated away (the RenameFlags footgun).
         assert!(!CurvineFileSystem::rename2_flags_supported(1 << 6));
+    }
+
+    // Issue #1116: readdir must terminate. The dirent `off` field is the kernel's
+    // resume cookie; encoding the current entry's position instead of the next
+    // one makes the last entry of a batch carry a cookie equal to the offset the
+    // kernel resumes at, so the kernel re-requests the same offset forever.
+    //
+    // This harness faithfully replays the kernel readdir protocol against the
+    // PRODUCTION pieces: each round calls the real `DirHandle::get_batch` (which
+    // owns the forward-only skip/positioning semantics) to fetch entries starting
+    // at `offset`, then derives the next `offset` from the last entry's cookie via
+    // the production `CurvineFileSystem::readdir_next_cookie`. Termination, no
+    // duplicates, and no omissions are all asserted. With the pre-fix cookie
+    // formula (`index`) the loop never advances past the tail entry and the round
+    // guard trips — which is exactly the regression this pins.
+    mod readdir_termination {
+        use crate::fs::state::DirHandle;
+        use curvine_common::fs::{ListStream, Path};
+        use curvine_common::state::FileStatus;
+        use orpc::runtime::{AsyncRuntime, RpcRuntime};
+
+        fn entries(names: &[&str]) -> Vec<FileStatus> {
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| FileStatus::with_name(i as i64, n.to_string(), false))
+                .collect()
+        }
+
+        // Replay the kernel readdir loop with a caller-supplied cookie function so
+        // the test can exercise both the production formula and (as a discriminator)
+        // the buggy pre-fix one. Returns the sequence of names handed to the kernel,
+        // or Err if the loop fails to terminate within `max_rounds`.
+        fn replay_readdir<F>(
+            names: &[&str],
+            cookie: F,
+            max_rounds: usize,
+        ) -> Result<Vec<String>, String>
+        where
+            F: Fn(u64) -> u64,
+        {
+            let rt = AsyncRuntime::single();
+            rt.block_on(async {
+                let path = Path::from_str("/d").unwrap();
+                let mut seen = Vec::new();
+                let mut offset: u64 = 0;
+
+                for _ in 0..max_rounds {
+                    // A fresh handle each round models the worst case where the
+                    // stream is (re)positioned purely from `offset` — the same
+                    // path the real daemon takes on a resumed/rebuilt readdir.
+                    let handle = DirHandle::new(
+                        1,
+                        1,
+                        &path,
+                        1000,
+                        ListStream::from_vec(entries(names)),
+                    );
+                    let batch = handle.get_batch(offset as usize).await.unwrap();
+                    if batch.is_empty() {
+                        return Ok(seen); // kernel sees 0 entries => readdir done
+                    }
+
+                    // The kernel consumes the batch and remembers the LAST entry's
+                    // cookie as the offset for its next request.
+                    let mut index = offset;
+                    let mut last_cookie = offset;
+                    for st in batch {
+                        seen.push(st.name.clone());
+                        last_cookie = cookie(index);
+                        index += 1;
+                    }
+                    offset = last_cookie;
+                }
+                Err(format!(
+                    "readdir did not terminate within {} rounds (offset stuck at {}, {} entries emitted)",
+                    max_rounds,
+                    offset,
+                    seen.len()
+                ))
+            })
+        }
+
+        #[test]
+        fn production_cookie_terminates_and_enumerates_each_entry_once() {
+            let names = ["a", "b", "c", "d", "e"];
+            let seen = replay_readdir(&names, super::CurvineFileSystem::readdir_next_cookie, 100)
+                .expect("production readdir_next_cookie must let readdir terminate");
+            assert_eq!(
+                seen,
+                names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "every entry enumerated exactly once, in order, with no repeats"
+            );
+        }
+
+        // Discriminator: the pre-fix formula (cookie = current index) makes the
+        // loop stick on the tail entry and never terminate. This proves the
+        // harness above actually catches an off-by-one regression rather than
+        // passing vacuously.
+        #[test]
+        fn prefix_cookie_would_loop_forever() {
+            let names = ["a", "b", "c", "d", "e"];
+            let result = replay_readdir(&names, |index| index, 100);
+            assert!(
+                result.is_err(),
+                "cookie=index (pre-#1116 bug) must fail to terminate, got {:?}",
+                result
+            );
+        }
+
+        // Multi-batch variant that exercises the `FuseDirentList` response-size
+        // cutoff path (reviewer request on PR #1236). The real
+        // `read_dir_common_inner` stops filling a response when
+        // `res.add_dirent(...)` returns false (kernel buffer full), pushes the
+        // rejected entry back, and only advances `index` for entries actually
+        // emitted — so the kernel resumes from the LAST EMITTED entry's cookie,
+        // not from the whole `get_batch` result. `max_emit_per_round` models that
+        // buffer limit: at most that many entries are handed to the kernel each
+        // round, the rest are dropped (as if pushed back), and the next request
+        // resumes from the last emitted cookie. This pins that `index + 1` still
+        // advances correctly when a listing is split across several responses.
+        fn replay_readdir_batched<F>(
+            names: &[&str],
+            cookie: F,
+            max_emit_per_round: usize,
+            max_rounds: usize,
+        ) -> Result<Vec<String>, String>
+        where
+            F: Fn(u64) -> u64,
+        {
+            assert!(max_emit_per_round >= 1, "must emit at least one per round");
+            let rt = AsyncRuntime::single();
+            rt.block_on(async {
+                let path = Path::from_str("/d").unwrap();
+                let mut seen = Vec::new();
+                let mut offset: u64 = 0;
+
+                for _ in 0..max_rounds {
+                    let handle =
+                        DirHandle::new(1, 1, &path, 1000, ListStream::from_vec(entries(names)));
+                    let batch = handle.get_batch(offset as usize).await.unwrap();
+                    if batch.is_empty() {
+                        return Ok(seen); // kernel sees 0 entries => readdir done
+                    }
+
+                    // Emit at most `max_emit_per_round` entries this round, mirroring
+                    // the response-buffer cutoff. `index` only advances for emitted
+                    // entries; the next offset is the last EMITTED entry's cookie.
+                    let mut index = offset;
+                    let mut last_cookie = offset;
+                    for st in batch.into_iter().take(max_emit_per_round) {
+                        seen.push(st.name.clone());
+                        last_cookie = cookie(index);
+                        index += 1;
+                    }
+                    offset = last_cookie;
+                }
+                Err(format!(
+                    "readdir did not terminate within {} rounds (offset stuck at {}, {} entries emitted)",
+                    max_rounds,
+                    offset,
+                    seen.len()
+                ))
+            })
+        }
+
+        // With the production cookie, a listing split across many small responses
+        // still enumerates every entry exactly once, in order, and terminates.
+        #[test]
+        fn production_cookie_terminates_across_multiple_response_buffers() {
+            let names = ["a", "b", "c", "d", "e", "f", "g"];
+            // Emit 2 per round => 4 rounds of data + 1 terminating empty round.
+            let seen = replay_readdir_batched(
+                &names,
+                super::CurvineFileSystem::readdir_next_cookie,
+                2,
+                100,
+            )
+            .expect("production cookie must terminate under a split response buffer");
+            assert_eq!(
+                seen,
+                names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "split-response readdir enumerates each entry once, in order, no repeats/gaps"
+            );
+        }
+
+        // Even down to a single entry per response (the harshest split), the
+        // production cookie advances correctly and terminates.
+        #[test]
+        fn production_cookie_terminates_with_single_entry_responses() {
+            let names = ["a", "b", "c"];
+            let seen = replay_readdir_batched(
+                &names,
+                super::CurvineFileSystem::readdir_next_cookie,
+                1,
+                100,
+            )
+            .expect("production cookie must terminate at one entry per response");
+            assert_eq!(seen, vec!["a", "b", "c"]);
+        }
+
+        // Discriminator for the split path: cookie=index loops forever here too,
+        // proving the multi-batch harness genuinely exercises the regression.
+        #[test]
+        fn prefix_cookie_loops_forever_under_split_response() {
+            let names = ["a", "b", "c", "d", "e", "f", "g"];
+            let result = replay_readdir_batched(&names, |index| index, 2, 100);
+            assert!(
+                result.is_err(),
+                "cookie=index must fail to terminate under split responses, got {:?}",
+                result
+            );
+        }
+
+        // Reviewer request (PR #1236): the two harnesses above rebuild a fresh
+        // DirHandle with limit=1000 every round, so `get_batch` returns the whole
+        // remainder in one shot and never drives DirHandle's OWN batching — the
+        // `buf.len() < limit` fill loop and the `set_buf` push-back of leftovers.
+        // That is the reused-stream production path (a directory is opened once
+        // and the same stream is reused across every readdir in the session).
+        //
+        // This harness keeps a SINGLE handle across rounds with a SMALL limit, and
+        // models the FUSE response cutoff by emitting at most `max_emit_per_round`
+        // of what `get_batch` returned and pushing the rest back with the real
+        // `set_buf` — exactly what `read_dir_common_inner` does when
+        // `add_dirent` reports the kernel buffer is full. So cookie advancement is
+        // validated together with DirHandle's real limit batching + set_buf
+        // leftovers, not just a harness-side `take()`.
+        //
+        // Note: with a reused stream the resume `off` never re-enters get_batch's
+        // skip branch (that fires only on a fresh `index == 0`); the stream just
+        // advances forward and leftovers ride in `buf`. Termination here comes
+        // from the stream draining, and the cookie must still march 1:1 with the
+        // entries so nothing is dropped or repeated across the buf boundary.
+        fn replay_readdir_reused_handle<F>(
+            names: &[&str],
+            cookie: F,
+            limit: usize,
+            max_emit_per_round: usize,
+            max_rounds: usize,
+        ) -> Result<Vec<String>, String>
+        where
+            F: Fn(u64) -> u64,
+        {
+            assert!(limit >= 1, "limit must be >= 1");
+            assert!(max_emit_per_round >= 1, "must emit at least one per round");
+            let rt = AsyncRuntime::single();
+            rt.block_on(async {
+                let path = Path::from_str("/d").unwrap();
+                // One handle, reused across all rounds — the production session path.
+                let handle =
+                    DirHandle::new(1, 1, &path, limit, ListStream::from_vec(entries(names)));
+                let mut seen = Vec::new();
+                let mut offset: u64 = 0;
+
+                for _ in 0..max_rounds {
+                    let mut batch = handle.get_batch(offset as usize).await.unwrap();
+                    if batch.is_empty() {
+                        return Ok(seen); // kernel sees 0 entries => readdir done
+                    }
+
+                    // Emit at most `max_emit_per_round`; `index` (and the cookie)
+                    // advance only for emitted entries.
+                    let mut index = offset;
+                    let mut last_cookie = offset;
+                    let mut emitted = 0;
+                    while emitted < max_emit_per_round {
+                        match batch.pop_front() {
+                            Some(st) => {
+                                seen.push(st.name.clone());
+                                last_cookie = cookie(index);
+                                index += 1;
+                                emitted += 1;
+                            }
+                            None => break,
+                        }
+                    }
+                    // Push the unemitted remainder back, exactly as the daemon does
+                    // when the kernel response buffer fills mid-batch.
+                    handle.set_buf(batch).await.unwrap();
+                    offset = last_cookie;
+                }
+                Err(format!(
+                    "readdir did not terminate within {} rounds (offset stuck at {}, {} entries emitted)",
+                    max_rounds,
+                    offset,
+                    seen.len()
+                ))
+            })
+        }
+
+        // Reused handle + small DirHandle limit (2) + response cutoff (1 per round):
+        // DirHandle's own fill/limit batching and set_buf leftovers are both on the
+        // path, and the production cookie still enumerates every entry once, in
+        // order, and terminates.
+        //
+        // This test is NOT vacuous: it calls the real `get_batch`/`set_buf`, so a
+        // regression in the limit fill loop or the leftover push-back would drop,
+        // duplicate, or reorder entries and the exact-sequence assertion below
+        // would fail. A cookie=index discriminator is deliberately NOT added on
+        // this path: with a reused stream the resume `off` is never used to
+        // position the stream (the stream only moves forward and leftovers ride in
+        // `buf`), so even the buggy cookie terminates here — which is exactly why
+        // the bug stayed latent in production (see PR summary). The infinite-loop
+        // regression is pinned by the fresh-handle discriminators above
+        // (`prefix_cookie_would_loop_forever` / `_under_split_response`).
+        #[test]
+        fn production_cookie_terminates_with_reused_handle_small_limit() {
+            let names = ["a", "b", "c", "d", "e", "f", "g"];
+            let seen = replay_readdir_reused_handle(
+                &names,
+                super::CurvineFileSystem::readdir_next_cookie,
+                2, // DirHandle limit: real batching, not one-shot
+                1, // emit 1 per round: forces set_buf push-back of the leftover
+                100,
+            )
+            .expect("production cookie must terminate on a reused handle with a small limit");
+            assert_eq!(
+                seen,
+                names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "reused-handle batching enumerates each entry once, in order, no repeats/gaps"
+            );
+        }
     }
 }
