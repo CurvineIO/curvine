@@ -1,0 +1,30 @@
+{
+  "issue": "CurvineIO/curvine#1254",
+  "multica_issue": "CUR-87",
+  "fingerprint": "sha256:4b909c8ea40865b603e4b7525c9d5c82f5a01cb774c590f13f27b901b2ba1145",
+  "head_sha": "abe42934895c49a3203d8a202c00241bc9d8402a",
+  "root_cause_hypothesis": "FUSE set_lkw polls set_lock in a loop without tracking waiters or detecting circular POSIX lock waits, so fcntl17 deadlock scenarios block until alarm expiry instead of returning EDEADLK.",
+  "affected_modules": [
+    "curvine-fuse/src/fs/curvine_file_system.rs",
+    "curvine-fuse/src/fs/plock_wait_registry.rs"
+  ],
+  "planned_changes": [
+    "Add a per-mount PlockWaitRegistry tracking F_SETLKW waiters and their blockers.",
+    "Before sleeping in set_lkw, register the waiter and return EDEADLK when a wait cycle is detected.",
+    "Unit-test the wait-graph cycle detection."
+  ],
+  "not_goals": [
+    "Do not change server-side LockMeta conflict rules or unrelated FUSE ops.",
+    "Do not modify harness runner configuration."
+  ],
+  "verification_plan": [
+    "cargo fmt -p curvine-fuse",
+    "cargo clippy -p curvine-fuse -- -D warnings",
+    "cargo test -p curvine-fuse plock_wait"
+  ],
+  "estimated_non_generated_source_line_delta": 120,
+  "risk": {
+    "level": "low",
+    "rationale": "Adds wait tracking only on the blocking SETLKW path; successful lock acquisition and non-blocking SETLK paths are unchanged."
+  }
+}

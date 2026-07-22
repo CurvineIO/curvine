@@ -21,6 +21,8 @@ pub use self::test_file_system::TestFileSystem;
 mod curvine_file_system;
 pub use self::curvine_file_system::CurvineFileSystem;
 
+mod plock_wait_registry;
+
 pub mod state;
 
 pub mod operator;
