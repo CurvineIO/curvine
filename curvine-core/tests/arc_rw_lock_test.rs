@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use orpc::sync::ArcRwLock;
+use curvine_core::sync::ArcRwLock;
 
 #[test]
 #[should_panic(expected = "ArcRwLock reentrant read")]

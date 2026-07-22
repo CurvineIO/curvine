@@ -18,9 +18,9 @@ use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path, Reader};
 use curvine_common::state::{FileBlocks, FileStatus};
 use curvine_common::FsResult;
+use curvine_core::err_box;
+use curvine_core::sys::DataSlice;
 use log::warn;
-use orpc::err_box;
-use orpc::sys::DataSlice;
 
 /// A wrapper around `FsReader` that transparently falls back to UFS when Curvine
 /// becomes unavailable (master down at open time handled externally, worker down
@@ -234,7 +234,7 @@ impl Reader for FallbackFsReader {
 mod tests {
     use super::*;
     use curvine_common::error::FsError;
-    use orpc::error::ErrorImpl;
+    use curvine_core::error::ErrorImpl;
     use std::io;
     use std::time::Duration;
 

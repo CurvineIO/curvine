@@ -25,10 +25,10 @@ use curvine_common::state::{
     CreateFileOpts, CreateFileOptsBuilder, FileStatus, FileType, MkdirOpts, MkdirOptsBuilder,
     SetAttrOpts, MKNOD_RDEV_XATTR,
 };
-use orpc::common::LocalTime;
-use orpc::io::IOResult;
-use orpc::sys;
-use orpc::sys::{FFIUtils, RawIO};
+use curvine_core::common::LocalTime;
+use curvine_core::io::IOResult;
+use curvine_core::sys;
+use curvine_core::sys::{FFIUtils, RawIO};
 use std::process::Command;
 use std::slice;
 

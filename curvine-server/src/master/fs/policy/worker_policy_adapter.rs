@@ -19,8 +19,8 @@ use crate::master::fs::policy::{
 };
 use curvine_common::conf::ClusterConf;
 use curvine_common::state::{WorkerAddress, WorkerInfo};
+use curvine_core::{err_box, CommonResult};
 use indexmap::IndexMap;
-use orpc::{err_box, CommonResult};
 
 pub enum WorkerPolicyAdapter {
     Robin(RobinWorkerPolicy),

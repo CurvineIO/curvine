@@ -16,7 +16,7 @@ use curvine_common::proto::{BlockReadRequest, BlockWriteRequest};
 use curvine_common::state::ExtendedBlock;
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
-use orpc::message::Message;
+use curvine_core::message::Message;
 
 #[derive(Debug)]
 pub struct WriteContext {

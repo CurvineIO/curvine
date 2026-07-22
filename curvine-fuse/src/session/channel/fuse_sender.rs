@@ -19,12 +19,12 @@ use crate::fuse_metrics::{
 };
 use crate::session::{FuseTask, ResponseData};
 use crate::FuseResult;
+use curvine_core::io::IOResult;
+use curvine_core::runtime::Runtime;
+use curvine_core::sync::channel::AsyncReceiver;
+use curvine_core::sys::pipe::{AsyncFd, Pipe2, PipeFd};
+use curvine_core::{err_box, sys, try_option_ref};
 use log::{info, warn};
-use orpc::io::IOResult;
-use orpc::runtime::Runtime;
-use orpc::sync::channel::AsyncReceiver;
-use orpc::sys::pipe::{AsyncFd, Pipe2, PipeFd};
-use orpc::{err_box, sys, try_option_ref};
 use std::sync::Arc;
 
 /// Responses smaller than this threshold use writev (1 syscall) instead of
@@ -273,7 +273,7 @@ fn mark_dequeued(queue_guard: Option<ActiveGuard>) {
 mod tests {
     use super::mark_dequeued;
     use crate::fuse_metrics::ActiveGuard;
-    use orpc::common::Metrics as m;
+    use curvine_core::common::Metrics as m;
 
     // `mark_dequeued` decrements at the dequeue point. Uses an INJECTED isolated
     // gauge (not the process-global `reply_queue_depth`) so it is parallel-safe

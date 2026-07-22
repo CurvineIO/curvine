@@ -14,8 +14,8 @@
 
 use crate::utils::SerdeUtils;
 use crate::FILE_BUFFER_SIZE;
-use orpc::io::IOResult;
-use orpc::try_err;
+use curvine_core::io::IOResult;
+use curvine_core::try_err;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
@@ -129,7 +129,7 @@ impl StateReader {
 #[cfg(test)]
 mod tests {
     use super::{StateReader, StateWriter};
-    use orpc::common::{FastHashMap, FastHashSet, Utils};
+    use curvine_core::common::{FastHashMap, FastHashSet, Utils};
     use std::fs;
 
     #[test]

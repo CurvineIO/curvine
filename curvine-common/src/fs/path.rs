@@ -15,9 +15,9 @@
 #![allow(clippy::should_implement_trait)]
 
 use crate::fs::FsKind;
+use curvine_core::CommonResult;
 use hyper::Uri;
 use once_cell::sync::Lazy;
-use orpc::CommonResult;
 use regex::Regex;
 use std::fmt::{Display, Formatter};
 use std::path::MAIN_SEPARATOR;
@@ -330,7 +330,7 @@ impl From<&str> for Path {
 #[cfg(test)]
 mod tests {
     use crate::fs::Path;
-    use orpc::CommonResult;
+    use curvine_core::CommonResult;
 
     #[test]
     fn normalize_path() -> CommonResult<()> {

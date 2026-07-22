@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_core::{err_box, CommonError};
 use num_enum::{FromPrimitive, IntoPrimitive};
-use orpc::{err_box, CommonError};
 use serde::{Deserialize, Serialize};
 
 #[repr(i32)]

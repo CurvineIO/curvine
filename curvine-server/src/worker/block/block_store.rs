@@ -18,7 +18,7 @@ use crate::worker::storage::{
 };
 use curvine_common::conf::ClusterConf;
 use curvine_common::state::{ExtendedBlock, StorageInfo};
-use orpc::CommonResult;
+use curvine_core::CommonResult;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(Clone)]

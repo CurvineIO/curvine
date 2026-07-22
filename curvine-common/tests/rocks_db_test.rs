@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use curvine_common::rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
-use orpc::common::{FileUtils, Utils};
-use orpc::CommonResult;
+use curvine_core::common::{FileUtils, Utils};
+use curvine_core::CommonResult;
 
 // Rocksdb database core function test
 #[test]

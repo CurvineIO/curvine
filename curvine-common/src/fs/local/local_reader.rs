@@ -16,8 +16,8 @@ use crate::fs::{Path, Reader};
 use crate::state::FileStatus;
 use crate::utils::CommonUtils;
 use crate::FsResult;
-use orpc::io::LocalFile;
-use orpc::sys::DataSlice;
+use curvine_core::io::LocalFile;
+use curvine_core::sys::DataSlice;
 
 pub struct LocalReader {
     path: Path,

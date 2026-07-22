@@ -17,7 +17,7 @@ use crate::util::*;
 use clap::Parser;
 use curvine_client::rpc::JobMasterClient;
 use curvine_common::state::LoadJobCommand;
-use orpc::CommonResult;
+use curvine_core::CommonResult;
 
 #[derive(Parser, Debug)]
 pub struct ExportCommand {

@@ -14,11 +14,11 @@
 
 use crate::worker::storage::{ChoosingPolicy, RobinChoosingPolicy, VfsDir};
 use curvine_common::state::{StorageInfo, StorageType};
+use curvine_core::common::ByteUnit;
+use curvine_core::{err_box, CommonResult};
 use indexmap::map::Values;
 use indexmap::IndexMap;
 use log::{error, info, warn};
-use orpc::common::ByteUnit;
-use orpc::{err_box, CommonResult};
 use std::ops::Index;
 use std::sync::Arc;
 
@@ -269,8 +269,8 @@ mod tests {
     use crate::worker::storage::{DirList, StorageRequest, VfsDir};
     use curvine_common::conf::WorkerDataDir;
     use curvine_common::state::StorageType;
-    use orpc::common::{ByteUnit, FileUtils};
-    use orpc::CommonResult;
+    use curvine_core::common::{ByteUnit, FileUtils};
+    use curvine_core::CommonResult;
 
     #[test]
     fn robin() -> CommonResult<()> {

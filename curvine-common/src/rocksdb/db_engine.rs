@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::rocksdb::{DBConf, RocksUtils};
+use curvine_core::common::{FileUtils, Utils};
+use curvine_core::{err_box, try_err, CommonResult};
 use log::{info, warn};
-use orpc::common::{FileUtils, Utils};
-use orpc::{err_box, try_err, CommonResult};
 use rocksdb::checkpoint::Checkpoint;
 use rocksdb::properties;
 use rocksdb::statistics::Ticker;

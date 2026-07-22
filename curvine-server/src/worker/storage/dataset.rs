@@ -14,8 +14,8 @@
 
 use crate::worker::block::BlockMeta;
 use curvine_common::state::ExtendedBlock;
-use orpc::common::ByteUnit;
-use orpc::{err_box, CommonResult};
+use curvine_core::common::ByteUnit;
+use curvine_core::{err_box, CommonResult};
 
 // block data collection.
 pub trait Dataset {

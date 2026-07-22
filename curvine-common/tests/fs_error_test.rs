@@ -1,5 +1,5 @@
 use curvine_common::error::{ErrorKind, FsError};
-use orpc::error::ErrorExt;
+use curvine_core::error::ErrorExt;
 
 #[test]
 fn block_not_found_round_trips_with_structured_kind() {

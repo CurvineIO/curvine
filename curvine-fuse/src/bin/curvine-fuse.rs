@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use clap::Parser;
+use curvine_core::CommonResult;
 use curvine_fuse::cli::{
     run_list_config_flags, run_mount, run_validate_config, FuseCli, FuseSubcommand,
 };
-use orpc::CommonResult;
 
 // fuse mount.
 // Debugging, after starting the cluster, execute the following naming, mount fuse

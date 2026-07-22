@@ -20,7 +20,7 @@ use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Writer};
 use curvine_common::state::FileStatus;
 use curvine_common::FsResult;
-use orpc::sys::DataSlice;
+use curvine_core::sys::DataSlice;
 use std::os::raw::c_void;
 use std::sync::Arc;
 

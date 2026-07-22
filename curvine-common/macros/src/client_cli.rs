@@ -97,7 +97,7 @@ fn derive_client_cli_args_impl(input: &DeriveInput) -> syn::Result<TokenStream2>
 
         impl #overrides_name {
             /// Applies CLI overrides onto the target configuration struct.
-            pub fn apply_to(&self, target: &mut #conf_name) -> ::orpc::CommonResult<()> {
+            pub fn apply_to(&self, target: &mut #conf_name) -> ::curvine_core::CommonResult<()> {
                 #(#apply_stmts)*
                 Ok(())
             }
@@ -203,7 +203,7 @@ fn apply_octal_override_stmt(
         let parsed = match u32::from_str_radix(body, 8) {
             Ok(parsed) => parsed,
             Err(err) => {
-                return ::orpc::err_box!("invalid octal value for {} ('{}'): {}", stringify!(#ident), trimmed, err);
+                return ::curvine_core::err_box!("invalid octal value for {} ('{}'): {}", stringify!(#ident), trimmed, err);
             }
         };
     };

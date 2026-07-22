@@ -14,9 +14,9 @@
 
 use crate::worker::block::BlockStore;
 use crate::worker::storage::Dataset;
-use orpc::common::{Counter, CounterVec, Gauge, Metrics as m, Metrics};
-use orpc::sys::SysUtils;
-use orpc::CommonResult;
+use curvine_core::common::{Counter, CounterVec, Gauge, Metrics as m, Metrics};
+use curvine_core::sys::SysUtils;
+use curvine_core::CommonResult;
 use std::fmt::{Debug, Formatter};
 
 pub struct WorkerMetrics {

@@ -15,10 +15,10 @@
 use curvine_common::conf::JournalConf;
 use curvine_common::raft::storage::{RocksAppStorage, RocksLogStorage};
 use curvine_common::raft::{RaftJournal, RaftPeer, RoleMonitor};
+use curvine_core::common::{Logger, Utils};
+use curvine_core::runtime::RpcRuntime;
+use curvine_core::CommonResult;
 use log::info;
-use orpc::common::{Logger, Utils};
-use orpc::runtime::RpcRuntime;
-use orpc::CommonResult;
 
 // rocksdb storage, snapshot testing.
 fn main() -> CommonResult<()> {

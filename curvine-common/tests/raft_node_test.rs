@@ -21,11 +21,11 @@ use curvine_common::raft::storage::{
 };
 use curvine_common::raft::{RaftClient, RaftCode, RaftError, RaftJournal, RaftResult, RoleMonitor};
 use curvine_common::utils::SerdeUtils;
-use orpc::client::{ClientConf, RpcClient};
-use orpc::common::{FileUtils, Logger, Utils};
-use orpc::message::{Builder, ResponseStatus};
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::CommonResult;
+use curvine_core::client::{ClientConf, RpcClient};
+use curvine_core::common::{FileUtils, Logger, Utils};
+use curvine_core::message::{Builder, ResponseStatus};
+use curvine_core::runtime::{RpcRuntime, Runtime};
+use curvine_core::CommonResult;
 use prost::bytes::BytesMut;
 use prost::Message;
 use raft::eraftpb::{ConfState, Entry, HardState, Message as RaftMessage, MessageType, Snapshot};

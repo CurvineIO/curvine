@@ -33,12 +33,12 @@ use curvine_common::fs::{FileSystem, ListStream, Path, StateReader, StateWriter}
 use curvine_common::state::{
     CreateFileOpts, FileAllocOpts, FileStatus, ListOptions, MkdirOpts, OpenFlags, SetAttrOpts,
 };
+use curvine_core::common::FastHashMap;
+use curvine_core::err_box;
+use curvine_core::sync::{AsyncMutex, AsyncSharedMap, AtomicCounter, RwLockHashMap};
+use curvine_core::sys::RawPtr;
 use futures::stream::{self, StreamExt};
 use log::{debug, error, info, warn};
-use orpc::common::FastHashMap;
-use orpc::err_box;
-use orpc::sync::{AsyncMutex, AsyncSharedMap, AtomicCounter, RwLockHashMap};
-use orpc::sys::RawPtr;
 use std::borrow::Cow;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -778,12 +778,18 @@ impl NodeState {
         });
     }
 
-    fn inc_gauges_lockstep(legacy: &orpc::common::Gauge, alias: &orpc::common::Gauge) {
+    fn inc_gauges_lockstep(
+        legacy: &curvine_core::common::Gauge,
+        alias: &curvine_core::common::Gauge,
+    ) {
         legacy.inc();
         alias.inc();
     }
 
-    fn dec_gauges_lockstep(legacy: &orpc::common::Gauge, alias: &orpc::common::Gauge) {
+    fn dec_gauges_lockstep(
+        legacy: &curvine_core::common::Gauge,
+        alias: &curvine_core::common::Gauge,
+    ) {
         legacy.dec();
         alias.dec();
     }
@@ -1249,8 +1255,8 @@ mod test {
     use curvine_common::fs::local::LocalWriter;
     use curvine_common::fs::{ListStream, Path, StateReader, StateWriter, Writer};
     use curvine_common::state::FileStatus;
-    use orpc::common::{FastHashMap, Utils};
-    use orpc::runtime::{AsyncRuntime, RpcRuntime};
+    use curvine_core::common::{FastHashMap, Utils};
+    use curvine_core::runtime::{AsyncRuntime, RpcRuntime};
     use std::sync::Arc;
 
     fn file_handle(ino: u64, fh: u64) -> Arc<FileHandle> {
@@ -1368,12 +1374,12 @@ mod test {
 
     #[test]
     fn inc_dec_gauges_lockstep_move_both_together() {
-        let legacy = orpc::common::Metrics::new_gauge(
+        let legacy = curvine_core::common::Metrics::new_gauge(
             "test_lockstep_legacy_gauge_unique",
             "isolated legacy gauge",
         )
         .unwrap();
-        let alias = orpc::common::Metrics::new_gauge(
+        let alias = curvine_core::common::Metrics::new_gauge(
             "test_lockstep_alias_gauge_unique",
             "isolated alias gauge",
         )

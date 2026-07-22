@@ -12,21 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use orpc::common::{LogConf, Logger};
-use tracing::dispatcher;
-
+#[cfg(target_os = "linux")]
 #[test]
-fn logger_init_does_not_panic_when_global_subscriber_already_set() {
-    let init_result = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::ERROR)
-        .with_test_writer()
-        .try_init();
-
-    assert!(
-        init_result.is_ok() || dispatcher::has_been_set(),
-        "expected global tracing subscriber to be installed"
-    );
-    assert!(dispatcher::has_been_set());
-
-    Logger::init(LogConf::default());
+fn test_tmpfs_filesystem_detection() {
+    use curvine_core::sys;
+    assert!(sys::is_tmpfs("/run").unwrap());
+    assert!(!sys::is_tmpfs("/").unwrap());
 }

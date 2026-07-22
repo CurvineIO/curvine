@@ -16,7 +16,7 @@
 //
 // Crate-internal macro: NOT `#[macro_export]`ed, because its expansion
 // references crate-private helpers (`crate::fuse_error::normalize_errno` /
-// `errno_label`) and `orpc::err_msg!`, which are not reachable from an external
+// `errno_label`) and `curvine_core::err_msg!`, which are not reachable from an external
 // crate — exporting it would advertise an unusable public macro. It is made
 // importable within the crate via `pub(crate) use err_fuse;` below (re-exported
 // at the crate root in lib.rs) so existing `use crate::err_fuse;` imports keep
@@ -32,17 +32,17 @@ macro_rules! err_fuse {
         // Single-arg form: synthesize a default message with the symbolic errno
         // label (e.g. "err_fuse ENOSYS") using the normalized errno.
         let errno = $crate::fuse_error::normalize_errno($errno);
-        let msg = orpc::err_msg!("err_fuse {}", $crate::fuse_error::errno_label(errno));
+        let msg = curvine_core::err_msg!("err_fuse {}", $crate::fuse_error::errno_label(errno));
         Err($crate::FuseError::from_errno_msg(errno, msg.into()))
     });
 
     ($errno:expr, $msg:expr) => ({
-        let msg = orpc::err_msg!("{}", $msg);
+        let msg = curvine_core::err_msg!("{}", $msg);
         Err($crate::FuseError::from_errno_msg($errno, msg.into()))
     });
 
     ($errno:expr, $f:tt, $($arg:expr),+) => ({
-        let msg = orpc::err_msg!($f, $($arg),+);
+        let msg = curvine_core::err_msg!($f, $($arg),+);
         Err($crate::FuseError::from_errno_msg($errno, msg.into()))
     });
 }

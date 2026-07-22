@@ -14,8 +14,8 @@
 
 use crate::conf::ClientConf;
 use crate::state::*;
-use orpc::common::ByteUnit;
-use orpc::sys;
+use curvine_core::common::ByteUnit;
+use curvine_core::sys;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;

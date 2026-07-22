@@ -30,6 +30,8 @@ use curvine_common::fs::{Path as CurvinePath, Reader, Writer};
 use curvine_common::state::{
     FileLock, FileStatus, LockFlags, LockType, SetAttrOpts, SetAttrOptsBuilder,
 };
+use curvine_core::io::net::InetAddr;
+use curvine_core::sys::DataSlice;
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
 use lance_core::error::Result;
@@ -48,8 +50,6 @@ use object_store::{
     PutOptions, PutPayload, PutResult, Result as OsResult, UploadPart,
 };
 use once_cell::sync::Lazy;
-use orpc::io::net::InetAddr;
-use orpc::sys::DataSlice;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration, Instant};
 use url::Url;

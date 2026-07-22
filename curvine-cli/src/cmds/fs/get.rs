@@ -2,7 +2,7 @@ use bytes::BytesMut;
 use clap::Subcommand;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::fs::{CurvineURI, FileSystem, Reader};
-use orpc::CommonResult;
+use curvine_core::CommonResult;
 use std::path::PathBuf;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;

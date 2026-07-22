@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use bytes::{Bytes, BytesMut};
-use orpc::sys::DataSlice;
+use curvine_core::sys::DataSlice;
 
 pub mod bench;
 pub mod block;

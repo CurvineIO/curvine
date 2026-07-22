@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use crate::raft::RoleState;
+use curvine_core::runtime::MutEvent;
+use curvine_core::server::ServerState;
+use curvine_core::sync::StateCtl;
+use curvine_core::{err_box, CommonResult};
 use log::error;
-use orpc::runtime::MutEvent;
-use orpc::server::ServerState;
-use orpc::sync::StateCtl;
-use orpc::{err_box, CommonResult};
 use std::error::Error;
 use std::sync::mpsc;
 use std::sync::mpsc::RecvTimeoutError;

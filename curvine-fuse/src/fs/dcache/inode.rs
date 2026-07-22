@@ -17,8 +17,8 @@ use crate::raw::fuse_abi::fuse_attr;
 use crate::{err_fuse, FuseResult, FuseUtils, FUSE_PATH_SEPARATOR, FUSE_ROOT_ID};
 use curvine_common::conf::FuseConf;
 use curvine_common::state::{FileStatus, LocatedBlock, SetAttrOpts, SetAttrOptsBuilder};
-use orpc::common::LocalTime;
-use orpc::try_option_mut;
+use curvine_core::common::LocalTime;
+use curvine_core::try_option_mut;
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 

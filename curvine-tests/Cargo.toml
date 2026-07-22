@@ -22,7 +22,7 @@ path = "tests/lancedb_object_store_e2e.rs"
 required-features = ["lancedb"]
 
 [dependencies]
-orpc = { workspace = true }
+curvine-core = { workspace = true }
 curvine-common = { workspace = true }
 curvine-server = { workspace = true }
 curvine-client = { workspace = true }

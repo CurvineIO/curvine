@@ -15,7 +15,7 @@
 use clap::Parser;
 use curvine_client::rpc::JobMasterClient;
 use curvine_common::state::JobTaskState;
-use orpc::CommonResult;
+use curvine_core::CommonResult;
 
 use crate::util::*;
 

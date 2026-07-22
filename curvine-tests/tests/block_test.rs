@@ -22,11 +22,11 @@ use curvine_common::fs::Path;
 use curvine_common::fs::Reader;
 use curvine_common::fs::Writer;
 use curvine_common::state::{FileAllocMode, FileAllocOpts};
+use curvine_core::common::{LocalTime, Utils};
+use curvine_core::runtime::RpcRuntime;
+use curvine_core::{err_box, CommonError, CommonResult};
 use curvine_tests::Testing;
 use log::info;
-use orpc::common::{LocalTime, Utils};
-use orpc::runtime::RpcRuntime;
-use orpc::{err_box, CommonError, CommonResult};
 use std::sync::Arc;
 use std::time::Duration;
 // Test local short-circuit read and write

@@ -20,9 +20,9 @@ use curvine_common::proto::{
 use curvine_common::state::{JobTaskType, LoadJobCommand};
 use curvine_common::utils::{ProtoUtils, SerdeUtils};
 use curvine_common::FsResult;
-use orpc::err_box;
-use orpc::handler::FrameBuf;
-use orpc::message::Message;
+use curvine_core::err_box;
+use curvine_core::handler::FrameBuf;
+use curvine_core::message::Message;
 use std::sync::Arc;
 
 /// The master loads the task service

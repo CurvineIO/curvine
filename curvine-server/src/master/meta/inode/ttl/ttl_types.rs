@@ -13,7 +13,7 @@
 // limitations under the License.
 
 pub use curvine_common::state::TtlAction;
-use orpc::common::LocalTime;
+use curvine_core::common::LocalTime;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 

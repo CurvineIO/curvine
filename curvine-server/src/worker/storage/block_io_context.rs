@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use orpc::io::{BlockDevice, BlockIO, IOError, IOResult, LocalFile};
-use orpc::sys::DataSlice;
-use orpc::{err_box, try_err};
+use curvine_core::io::{BlockDevice, BlockIO, IOError, IOResult, LocalFile};
+use curvine_core::sys::DataSlice;
+use curvine_core::{err_box, try_err};
 
 fn absolute_offset(device_base: i64, block_off: i64) -> IOResult<i64> {
     device_base
@@ -229,7 +229,7 @@ impl BlockReadContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orpc::common::Utils;
+    use curvine_core::common::Utils;
     use std::fs::remove_file;
 
     /// Open the underlying LocalFile at position 0 (no pre-positioning) so

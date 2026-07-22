@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_core::common::Logger;
+use curvine_core::CommonResult;
 use curvine_tests::{BenchArgs, CurvineBench};
-use orpc::common::Logger;
-use orpc::CommonResult;
 
 fn main() -> CommonResult<()> {
     Logger::default();

@@ -14,9 +14,9 @@
 
 use crate::proto::raft::{SnapshotDownloadRequest, SnapshotDownloadResponse, SnapshotFileInfo};
 use crate::raft::{RaftCode, RaftError, RaftResult};
-use orpc::client::SyncClient;
-use orpc::common::Utils;
-use orpc::message::{Builder, Message, RequestStatus};
+use curvine_core::client::SyncClient;
+use curvine_core::common::Utils;
+use curvine_core::message::{Builder, Message, RequestStatus};
 
 // Snapshot data download client service.
 // Change the customer service side to synchronous operation.

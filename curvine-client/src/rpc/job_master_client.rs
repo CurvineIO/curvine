@@ -28,8 +28,8 @@ use curvine_common::state::{
 };
 use curvine_common::utils::{ProtoUtils, SerdeUtils};
 use curvine_common::FsResult;
-use orpc::common::TimeSpent;
-use orpc::err_box;
+use curvine_core::common::TimeSpent;
+use curvine_core::err_box;
 
 use crate::file::{FsClient, FsContext};
 

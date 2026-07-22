@@ -17,7 +17,7 @@ use crate::master::meta::LockMeta;
 use curvine_common::rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
 use curvine_common::state::{BlockLocation, FileLock, MountInfo};
 use curvine_common::utils::SerdeUtils as Serde;
-use orpc::CommonResult;
+use curvine_core::CommonResult;
 use rocksdb::{DBIteratorWithThreadMode, DBPinnableSlice, Error, WriteBatchWithTransaction, DB};
 use std::collections::HashMap;
 

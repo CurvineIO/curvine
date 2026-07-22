@@ -37,10 +37,10 @@ pub const FOLDER_SUFFIX: &str = "/";
 #[macro_export]
 macro_rules! err_ufs {
     ($e:expr) => ({
-        Err(orpc::err_msg!($e).into())
+        Err(curvine_core::err_msg!($e).into())
     });
 
     ($f:tt, $($arg:expr),+) => ({
-        orpc::err_box!(format!($f, $($arg),+))
+        curvine_core::err_box!(format!($f, $($arg),+))
     });
 }

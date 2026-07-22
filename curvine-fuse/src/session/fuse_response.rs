@@ -23,11 +23,11 @@ use crate::session::{FuseNotifyCode, FuseTask};
 use crate::{FuseError, FuseResult, FuseUtils};
 use crate::{FUSE_NOTIFY_UNIQUE, FUSE_OUT_HEADER_LEN, FUSE_SUCCESS};
 use bytes::BytesMut;
+use curvine_core::io::IOResult;
+use curvine_core::sync::channel::AsyncSender;
+use curvine_core::sys::DataSlice;
+use curvine_core::ternary;
 use log::{info, warn};
-use orpc::io::IOResult;
-use orpc::sync::channel::AsyncSender;
-use orpc::sys::DataSlice;
-use orpc::ternary;
 use parking_lot::Mutex;
 use std::fmt::Debug;
 use std::io::IoSlice;
@@ -65,7 +65,7 @@ impl ResponseData {
             // IOSlice refers to an fd-backed region and cannot be represented
             // as an std::io::IoSlice without a separate transfer path.
             if matches!(data, DataSlice::IOSlice(_)) {
-                return orpc::err_box!(
+                return curvine_core::err_box!(
                     "DataSlice::IOSlice is not supported in FUSE iovec responses"
                 );
             }
@@ -706,8 +706,8 @@ mod tests {
         ENQUEUE_REASON_CHANNEL_CLOSED, NOTIFY_ENQUEUE_FAILED, REPLY_TYPE_NO_REPLY,
         REPLY_TYPE_REPLIED,
     };
-    use orpc::common::{Gauge, Metrics as m};
-    use orpc::sync::channel::{AsyncChannel, AsyncReceiver};
+    use curvine_core::common::{Gauge, Metrics as m};
+    use curvine_core::sync::channel::{AsyncChannel, AsyncReceiver};
 
     #[test]
     fn as_iovec_rejects_io_slice_without_panicking() {

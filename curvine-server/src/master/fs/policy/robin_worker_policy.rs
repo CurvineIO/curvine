@@ -14,9 +14,9 @@
 
 use crate::master::fs::policy::{ChooseContext, WorkerPolicy};
 use curvine_common::state::{WorkerAddress, WorkerInfo};
+use curvine_core::sync::AtomicLen;
+use curvine_core::{err_box, CommonResult};
 use indexmap::IndexMap;
-use orpc::sync::AtomicLen;
-use orpc::{err_box, CommonResult};
 
 // Poll selector.
 pub struct RobinWorkerPolicy {

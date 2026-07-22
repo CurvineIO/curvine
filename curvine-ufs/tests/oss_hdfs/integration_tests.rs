@@ -17,9 +17,9 @@ mod tests {
     use super::super::test_utils::{create_test_conf, create_test_path, get_test_bucket};
     use curvine_common::fs::{FileSystem, Path, Reader, Writer};
     use curvine_common::state::SetAttrOpts;
+    use curvine_core::sys::DataSlice;
     use curvine_ufs::oss_hdfs::OssHdfsFileSystem;
     use curvine_ufs::OssHdfsConf;
-    use orpc::sys::DataSlice;
     use std::collections::HashMap;
     use std::sync::Arc;
 

@@ -11,7 +11,7 @@ curvine-client = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 curvine-common = { workspace = true }
-orpc = { workspace = true }
+curvine-core = { workspace = true }
 log = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true, features = ["trace", "fs"] }

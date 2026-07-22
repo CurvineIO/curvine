@@ -20,8 +20,8 @@ use curvine_common::error::FsError;
 use curvine_common::fs::{self, CurvineURI, Path};
 use curvine_common::state::{MkdirOpts, MountInfo, MountOptions};
 use curvine_common::FsResult;
+use curvine_core::err_box;
 use log::info;
-use orpc::err_box;
 use std::collections::HashMap;
 
 pub struct MountManager {

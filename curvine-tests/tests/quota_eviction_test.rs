@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_core::CommonResult;
 use curvine_server::master::quota::eviction::evictor::{Evictor, LRUEvictor};
 use curvine_server::master::quota::eviction::types::{EvictionConf, EvictionMode, EvictionPolicy};
-use orpc::CommonResult;
 
 // ============================================================================
 // Helper Functions

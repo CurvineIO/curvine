@@ -15,14 +15,14 @@
 use crate::worker::storage::{DirState, StorageVersion, DEFAULT_BLOCK_ALIGN};
 use curvine_common::conf::WorkerDataDir;
 use curvine_common::state::StorageType;
-use log::*;
-use orpc::common::{ByteUnit, FileUtils};
+use curvine_core::common::{ByteUnit, FileUtils};
 #[cfg(feature = "spdk")]
-use orpc::io::spdk_env::SpdkEnv;
-use orpc::io::LocalFile;
-use orpc::sync::AtomicLong;
-use orpc::sys::FsStats;
-use orpc::CommonResult;
+use curvine_core::io::spdk_env::SpdkEnv;
+use curvine_core::io::LocalFile;
+use curvine_core::sync::AtomicLong;
+use curvine_core::sys::FsStats;
+use curvine_core::CommonResult;
+use log::*;
 use std::fmt::{Debug, Formatter};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -70,16 +70,16 @@ impl VfsDir {
         // SPDK: resolve bdev name from global SpdkEnv (one bdev per data_dir)
         #[cfg(feature = "spdk")]
         let bdev_name: Option<(String, i64)> = if conf.storage_type == StorageType::SpdkDisk {
-            use orpc::io::spdk_env::SpdkEnv;
+            use curvine_core::io::spdk_env::SpdkEnv;
             let env = SpdkEnv::global().ok_or_else(|| {
-                orpc::err_msg!(
+                curvine_core::err_msg!(
                     "StorageType::SpdkDisk dir '{}' requires SPDK environment, but it is not initialized",
                     conf.path
                 )
             })?;
             let names = env.bdev_names();
             if names.is_empty() {
-                return orpc::err_box!(
+                return curvine_core::err_box!(
                     "StorageType::SpdkDisk dir '{}' but no bdevs discovered from SPDK targets",
                     conf.path
                 );
@@ -98,7 +98,7 @@ impl VfsDir {
         };
         #[cfg(not(feature = "spdk"))]
         let bdev_name: Option<(String, i64)> = if conf.storage_type == StorageType::SpdkDisk {
-            return orpc::err_box!(
+            return curvine_core::err_box!(
                 "StorageType::SpdkDisk is not available. Compile with --features spdk"
             );
         } else {
@@ -108,7 +108,7 @@ impl VfsDir {
             Some((name, cap)) => {
                 #[cfg(feature = "spdk")]
                 let bs = SpdkEnv::global()
-                    .and_then(|env: &orpc::io::spdk_env::SpdkEnv| env.get_bdev(&name))
+                    .and_then(|env: &curvine_core::io::spdk_env::SpdkEnv| env.get_bdev(&name))
                     .map(|b| b.block_size as i64)
                     .unwrap_or(DEFAULT_BLOCK_ALIGN);
                 #[cfg(not(feature = "spdk"))]
@@ -364,11 +364,11 @@ mod test {
     };
     use curvine_common::conf::WorkerDataDir;
     use curvine_common::state::{ExtendedBlock, StorageType};
-    use orpc::common::{ByteUnit, FileUtils};
-    use orpc::io::LocalFile;
-    use orpc::sync::AtomicLong;
-    use orpc::sys::FsStats;
-    use orpc::CommonResult;
+    use curvine_core::common::{ByteUnit, FileUtils};
+    use curvine_core::io::LocalFile;
+    use curvine_core::sync::AtomicLong;
+    use curvine_core::sys::FsStats;
+    use curvine_core::CommonResult;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 

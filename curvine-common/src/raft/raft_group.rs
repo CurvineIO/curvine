@@ -15,8 +15,8 @@
 use crate::conf::JournalConf;
 use crate::proto::raft::RaftPeerProto;
 use crate::raft::{NodeId, RaftPeer};
-use orpc::io::net::InetAddr;
-use orpc::{err_box, CommonResult};
+use curvine_core::io::net::InetAddr;
+use curvine_core::{err_box, CommonResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

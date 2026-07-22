@@ -23,14 +23,14 @@ use crate::raw::fuse_abi::fuse_out_header;
 use crate::session::{FuseOpCode, FuseRequest, FuseResponse, FuseTask};
 use crate::{err_fuse, FuseResult, FUSE_IN_HEADER_LEN};
 use bytes::BytesMut;
+use curvine_core::io::IOResult;
+use curvine_core::runtime::{RpcRuntime, Runtime};
+use curvine_core::sync::channel::AsyncSender;
+use curvine_core::sync::FastDashMap;
+use curvine_core::sys::pipe::{AsyncFd, Pipe2, PipeFd};
+use curvine_core::{err_box, sys, try_option_ref};
 use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
 use log::{debug, error, info, warn};
-use orpc::io::IOResult;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sync::channel::AsyncSender;
-use orpc::sync::FastDashMap;
-use orpc::sys::pipe::{AsyncFd, Pipe2, PipeFd};
-use orpc::{err_box, sys, try_option_ref};
 use std::sync::Arc;
 use tokio::sync::{watch, Notify};
 
@@ -832,8 +832,8 @@ fn receive_error_labels(os_errno: Option<i32>) -> (&'static str, &'static str) {
 mod tests {
     use super::{receive_error_labels, PendingRequestGuard};
     use crate::fuse_metrics::{RECEIVE_ACTION_CONTINUE, RECEIVE_ACTION_EXIT};
+    use curvine_core::sync::FastDashMap;
     use libc::{EAGAIN, EINTR, EIO, ENODEV, ENOENT};
-    use orpc::sync::FastDashMap;
     use std::sync::Arc;
     use tokio::sync::Notify;
 
@@ -901,9 +901,9 @@ mod tests {
         use crate::FuseUtils;
         use bytes::{BufMut, BytesMut};
         use curvine_common::conf::FuseConf;
-        use orpc::common::Metrics as m;
-        use orpc::sync::channel::{AsyncChannel, AsyncReceiver};
-        use orpc::sync::FastDashMap;
+        use curvine_core::common::Metrics as m;
+        use curvine_core::sync::channel::{AsyncChannel, AsyncReceiver};
+        use curvine_core::sync::FastDashMap;
 
         // FUSE opcodes used here (avoid pulling the whole abi into scope). Each
         // test uses a DISTINCT opcode so their `operation_duration_us` label
@@ -1583,8 +1583,8 @@ mod tests {
         use crate::session::{FuseRequest, FuseResponse};
         use crate::FuseUtils;
         use bytes::{BufMut, BytesMut};
-        use orpc::runtime::{AsyncRuntime, RpcRuntime};
-        use orpc::sync::channel::AsyncChannel;
+        use curvine_core::runtime::{AsyncRuntime, RpcRuntime};
+        use curvine_core::sync::channel::AsyncChannel;
         use std::sync::Arc;
 
         const OP_READ: u32 = 15;
@@ -1701,7 +1701,7 @@ mod tests {
                 // `rep.metrics.is_some()`, so there is no separate flag to pass.
                 let opcode = req.opcode().as_str();
                 let ctx = if with_metrics_ctx {
-                    let gauge = orpc::common::Metrics::new_gauge(
+                    let gauge = curvine_core::common::Metrics::new_gauge(
                         format!("ss_dispatch_active_{}", req.unique()),
                         "test".to_string(),
                     )
@@ -1889,7 +1889,7 @@ mod tests {
                 let (tx, mut rx) = AsyncChannel::new(16).split();
                 let drainer = tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
-                let active_g = orpc::common::Metrics::new_gauge(
+                let active_g = curvine_core::common::Metrics::new_gauge(
                     "ss_malformed_active_7201".to_string(),
                     "test".to_string(),
                 )
@@ -1969,8 +1969,8 @@ mod tests {
         use crate::session::{FuseRequest, FuseResponse, FuseTask};
         use crate::{FuseResult, FuseUtils};
         use bytes::{BufMut, BytesMut};
-        use orpc::runtime::{AsyncRuntime, RpcRuntime};
-        use orpc::sync::channel::AsyncChannel;
+        use curvine_core::runtime::{AsyncRuntime, RpcRuntime};
+        use curvine_core::sync::channel::AsyncChannel;
         use std::sync::Arc;
 
         const OP_READ: u32 = 15;
@@ -2096,7 +2096,7 @@ mod tests {
         // so by the time it returns everything it enqueued is already buffered in `rx`.
         // We just drain what's there — no drainer task needed. The loop stops on BOTH
         // empty AND closed (`while let Ok(Some(_))`): `try_recv` maps an empty channel
-        // to `Ok(None)` but a *closed* one to `Err` (`orpc::sync::channel`), so matching
+        // to `Ok(None)` but a *closed* one to `Err` (`curvine_core::sync::channel`), so matching
         // only `Ok(Some(_))` makes the drain robust regardless of whether a sender clone
         // is still alive. (One is: `observer` below holds a sender for the whole drain,
         // so in practice we hit the `Ok(None)` empty case — but the loop must not depend
@@ -2112,7 +2112,7 @@ mod tests {
                 let (tx, mut rx) = AsyncChannel::new(64).split();
                 let opcode = req.opcode().as_str();
                 let ctx = if with_metrics_ctx {
-                    let gauge = orpc::common::Metrics::new_gauge(
+                    let gauge = curvine_core::common::Metrics::new_gauge(
                         format!("sec_active_{}", req.unique()),
                         "test".to_string(),
                     )

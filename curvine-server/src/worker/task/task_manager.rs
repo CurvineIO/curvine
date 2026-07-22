@@ -19,9 +19,9 @@ use curvine_client::file::{CurvineFileSystem, FsContext};
 use curvine_common::conf::ClusterConf;
 use curvine_common::state::{JobTaskState, LoadTaskInfo};
 use curvine_common::FsResult;
+use curvine_core::runtime::{RpcRuntime, Runtime};
 use dashmap::mapref::entry::Entry;
 use log::{debug, info, warn};
-use orpc::runtime::{RpcRuntime, Runtime};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 

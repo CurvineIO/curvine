@@ -14,7 +14,7 @@
 //
 
 use super::WorkloadKind;
-use orpc::{err_box, CommonResult};
+use curvine_core::{err_box, CommonResult};
 use serde::Serialize;
 
 pub const DEFAULT_DURATION_MS: u64 = 30_000;

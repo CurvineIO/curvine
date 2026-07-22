@@ -23,11 +23,11 @@ use curvine_common::state::{
     CreateFileOptsBuilder, FileAllocOpts, JobTaskState, SetAttrOptsBuilder,
 };
 use curvine_common::FsResult;
+use curvine_core::common::{LocalTime, TimeSpent};
+use curvine_core::err_box;
+use curvine_core::runtime::RpcRuntime;
+use curvine_core::sys::DataSlice;
 use log::{error, info, warn};
-use orpc::common::{LocalTime, TimeSpent};
-use orpc::err_box;
-use orpc::runtime::RpcRuntime;
-use orpc::sys::DataSlice;
 use std::sync::Arc;
 
 pub struct LoadTaskRunner {
@@ -477,7 +477,7 @@ impl LoadTaskRunner {
     /// abort is best-effort (it fires at the next await point); combined with the
     /// in-loop is_cancel()/deadline checks this bounds how long a stream can run
     /// past the parent's decision to stop.
-    fn abort_remaining(handles: &[orpc::runtime::JoinHandle<FsResult<i64>>], from: usize) {
+    fn abort_remaining(handles: &[curvine_core::runtime::JoinHandle<FsResult<i64>>], from: usize) {
         for h in handles.iter().skip(from) {
             h.abort();
         }

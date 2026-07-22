@@ -17,8 +17,8 @@ use crate::file::FsContext;
 use curvine_common::fs::Path;
 use curvine_common::state::{ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
-use orpc::common::Utils;
-use orpc::err_box;
+use curvine_core::common::Utils;
+use curvine_core::err_box;
 
 pub struct BatchBlockWriterRemote {
     blocks: Vec<ExtendedBlock>,

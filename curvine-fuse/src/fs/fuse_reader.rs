@@ -21,10 +21,12 @@ use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Reader};
 use curvine_common::state::FileStatus;
 use curvine_common::FsResult;
+use curvine_core::runtime::{RpcRuntime, Runtime};
+use curvine_core::sync::channel::{
+    AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender,
+};
+use curvine_core::sync::ErrorMonitor;
 use log::error;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
-use orpc::sync::ErrorMonitor;
 use std::sync::Arc;
 
 enum ReadTask {
@@ -191,9 +193,9 @@ mod tests {
     use crate::session::{FuseResponse, FuseTask};
     use curvine_client::unified::UnifiedReader;
     use curvine_common::fs::local::LocalReader;
-    use orpc::common::Metrics as m;
-    use orpc::runtime::AsyncRuntime;
-    use orpc::sync::channel::AsyncChannel;
+    use curvine_core::common::Metrics as m;
+    use curvine_core::runtime::AsyncRuntime;
+    use curvine_core::sync::channel::AsyncChannel;
     use std::io::Write as _;
 
     // Build a metrics-enabled FuseResponse over a real channel, and spawn a drainer

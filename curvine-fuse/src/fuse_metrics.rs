@@ -17,8 +17,10 @@ use std::time::Instant;
 use log::warn;
 use once_cell::sync::OnceCell;
 
-use orpc::common::{Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, Metrics as m};
-use orpc::CommonResult;
+use curvine_core::common::{
+    Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, Metrics as m,
+};
+use curvine_core::CommonResult;
 
 use crate::fuse_error::errno_label;
 use crate::session::FuseOpCode;
@@ -1452,7 +1454,7 @@ pub(crate) struct StreamLifecycleScope {
 
 /// Monotonic time source for durations.
 ///
-/// `orpc::common::LocalTime::nanos()` is wall-clock (`SystemTime::now()`) and
+/// `curvine_core::common::LocalTime::nanos()` is wall-clock (`SystemTime::now()`) and
 /// must **not** be used for latency: an NTP step or suspend/resume can produce
 /// skewed or negative deltas. All FUSE duration metrics use `std::time::Instant`
 /// instead, accessed through this single helper so the choice is centralized.
@@ -1677,7 +1679,7 @@ impl Drop for ActiveGuard {
 /// Holds an already-resolved `Histogram` (e.g. obtained once via
 /// `HistogramVec::with_label_values(...)` and stored), so its `drop` is a single
 /// `observe()` with **no allocation and no per-call label-map probe**. This is
-/// the hot-path replacement for `orpc`'s `MetricTimerVec`, which re-allocates a
+/// the hot-path replacement for `curvine_core`'s `MetricTimerVec`, which re-allocates a
 /// `Vec<&str>` on every drop and must not be used per request.
 ///
 /// Durations are measured with the monotonic clock (`Instant`).
@@ -1845,7 +1847,7 @@ impl ShutdownOnce {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orpc::common::Metrics as m;
+    use curvine_core::common::Metrics as m;
 
     // Compile-time guarantee that the guards/timer are `Send`. They must travel
     // into spawned tasks and onto reply tasks (Phase 1a); if a future field
@@ -3294,12 +3296,12 @@ mod tests {
     // sites use to gate every lifecycle/state emission on metrics_enabled.
     #[test]
     fn lifecycle_gate_suppresses_when_disabled() {
-        fn record_if(enabled: bool, counter: &orpc::common::Counter) {
+        fn record_if(enabled: bool, counter: &curvine_core::common::Counter) {
             if enabled {
                 counter.inc();
             }
         }
-        let counter = orpc::common::Metrics::new_counter(
+        let counter = curvine_core::common::Metrics::new_counter(
             "test_lifecycle_gate_isolated_counter_unique",
             "isolated lifecycle gate counter",
         )

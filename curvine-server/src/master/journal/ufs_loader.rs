@@ -22,9 +22,9 @@ use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{JobTaskState, LoadJobCommand};
 use curvine_common::FsResult;
+use curvine_core::common::DurationUnit;
+use curvine_core::{err_box, CommonResult};
 use log::{info, warn};
-use orpc::common::DurationUnit;
-use orpc::{err_box, CommonResult};
 use std::sync::Arc;
 use std::time::Duration;
 

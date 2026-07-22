@@ -19,8 +19,8 @@ use curvine_common::error::FsError;
 use curvine_common::fs::Path;
 use curvine_common::state::{CommitBlock, ExtendedBlock, LocatedBlock, WorkerAddress};
 use curvine_common::FsResult;
+use curvine_core::err_box;
 use futures::future::try_join_all;
-use orpc::err_box;
 use std::sync::Arc;
 
 enum BatchWriterAdapter {

@@ -18,10 +18,10 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::fs::{Path, Writer};
 use curvine_common::state::FileStatus;
 use curvine_common::FsResult;
-use orpc::err_box;
-use orpc::handler::FrameBuf;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sys::DataSlice;
+use curvine_core::err_box;
+use curvine_core::handler::FrameBuf;
+use curvine_core::runtime::{RpcRuntime, Runtime};
+use curvine_core::sys::DataSlice;
 use std::sync::Arc;
 
 pub struct LibFsWriter {

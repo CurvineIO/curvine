@@ -17,7 +17,7 @@ use crate::proto::raft::{
 };
 use crate::raft::RaftResult;
 use crate::rocksdb::DBEngine;
-use orpc::common::{FileUtils, LocalTime};
+use curvine_core::common::{FileUtils, LocalTime};
 use std::path::PathBuf;
 
 // Some tools and methods of raft.

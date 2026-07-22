@@ -16,7 +16,7 @@ use crate::util::*;
 use clap::Parser;
 use curvine_client::file::FsClient;
 use curvine_common::conf::ClusterConf;
-use orpc::{common::ByteUnit, err_box, CommonResult};
+use curvine_core::{common::ByteUnit, err_box, CommonResult};
 use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Arc;

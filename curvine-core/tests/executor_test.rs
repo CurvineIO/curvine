@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use orpc::common::Logger;
-use orpc::runtime::{GroupExecutor, SingleExecutor};
-use orpc::sync::AtomicCounter;
-use orpc::sys::RawPtr;
-use orpc::CommonResult;
+use curvine_core::common::Logger;
+use curvine_core::runtime::{GroupExecutor, SingleExecutor};
+use curvine_core::sync::AtomicCounter;
+use curvine_core::sys::RawPtr;
+use curvine_core::CommonResult;
 use std::sync::{mpsc, Arc};
 use std::thread;
 

@@ -15,9 +15,9 @@
 use curvine_common::fs::{ListStream, Path};
 use curvine_common::state::FileStatus;
 use curvine_common::FsResult;
+use curvine_core::err_box;
 use futures::StreamExt;
 use log::info;
-use orpc::err_box;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::mem;

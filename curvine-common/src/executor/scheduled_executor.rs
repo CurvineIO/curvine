@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_core::common::LocalTime;
+use curvine_core::runtime::LoopTask;
+use curvine_core::CommonResult;
 use log::warn;
-use orpc::common::LocalTime;
-use orpc::runtime::LoopTask;
-use orpc::CommonResult;
 use std::thread;
 use std::time::Duration;
 

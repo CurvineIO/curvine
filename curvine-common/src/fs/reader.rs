@@ -16,8 +16,8 @@ use crate::fs::Path;
 use crate::state::FileStatus;
 use crate::FsResult;
 use bytes::BytesMut;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sys::DataSlice;
+use curvine_core::runtime::{RpcRuntime, Runtime};
+use curvine_core::sys::DataSlice;
 use std::future::Future;
 
 pub trait Reader {

@@ -20,19 +20,19 @@ use crate::worker::task::TaskManager;
 use crate::worker::WorkerMetrics;
 use curvine_common::conf::ClusterConf;
 use curvine_common::state::{HeartbeatStatus, WorkerAddress};
+use curvine_core::common::{LocalTime, Logger};
+use curvine_core::error::StringError;
+use curvine_core::handler::HandlerService;
+use curvine_core::io::net::ConnState;
+#[cfg(feature = "spdk")]
+use curvine_core::io::spdk_env::SpdkEnv;
+use curvine_core::runtime::{RpcRuntime, Runtime};
+use curvine_core::server::{RpcServer, ServerStateListener};
+use curvine_core::{CommonError, CommonResult};
 use curvine_fault::FaultHttpControl;
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::info;
 use once_cell::sync::OnceCell;
-use orpc::common::{LocalTime, Logger};
-use orpc::error::StringError;
-use orpc::handler::HandlerService;
-use orpc::io::net::ConnState;
-#[cfg(feature = "spdk")]
-use orpc::io::spdk_env::SpdkEnv;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::server::{RpcServer, ServerStateListener};
-use orpc::{CommonError, CommonResult};
 use std::sync::Arc;
 use std::thread;
 
@@ -148,7 +148,7 @@ impl Worker {
                         .count();
                     let num_bdevs = env.bdevs().len();
                     if num_spdk_dirs > num_bdevs {
-                        return orpc::err_box!(
+                        return curvine_core::err_box!(
                             "Configuration has {} SPDK data_dir entries but only {} bdev(s) \
                              were discovered. Multiple dirs would map to the same NVMe \
                              namespace, causing data corruption. Either reduce SPDK data_dir \
@@ -176,7 +176,7 @@ impl Worker {
         #[cfg(not(feature = "spdk"))]
         {
             if conf.worker.spdk_disk.enabled {
-                return orpc::err_box!(
+                return curvine_core::err_box!(
                     "SPDK is not enabled. Compile with --features spdk to use SPDK"
                 );
             }
@@ -225,7 +225,7 @@ impl Worker {
             if spdk_enabled {
                 info!("Shutting down SPDK environment");
                 #[cfg(feature = "spdk")]
-                orpc::io::spdk_env::SpdkEnv::shutdown_global();
+                curvine_core::io::spdk_env::SpdkEnv::shutdown_global();
             }
         });
 
@@ -294,15 +294,15 @@ impl Worker {
     }
 
     pub fn get_conf<'a>() -> CommonResult<&'a ClusterConf> {
-        CLUSTER_CONF
-            .get()
-            .ok_or_else(|| orpc::CommonError::from("worker cluster config is not initialized"))
+        CLUSTER_CONF.get().ok_or_else(|| {
+            curvine_core::CommonError::from("worker cluster config is not initialized")
+        })
     }
 
     pub fn get_metrics<'a>() -> CommonResult<&'a WorkerMetrics> {
         WORKER_METRICS
             .get()
-            .ok_or_else(|| orpc::CommonError::from("worker metrics are not initialized"))
+            .ok_or_else(|| curvine_core::CommonError::from("worker metrics are not initialized"))
     }
 
     pub fn service(&self) -> &WorkerService {

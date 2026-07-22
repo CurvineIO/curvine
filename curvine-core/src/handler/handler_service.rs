@@ -22,7 +22,7 @@ use std::sync::Arc;
 /// 1. Manage the creation of MessageHandler.
 /// 2. Global variables required to manage business logic.
 ///
-/// Unlike the ordinary rpc framework, orpc is used to handle file reading and writing. The handler is stateful and needs to pay attention to thread safety issues.
+/// Unlike the ordinary rpc framework, curvine_core is used to handle file reading and writing. The handler is stateful and needs to pay attention to thread safety issues.
 /// In order to save overhead and avoid ownership issues, naked pointers are used to call message processing functions.
 pub trait HandlerService: Send + Sync + 'static {
     type Item: MessageHandler;

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use orpc::sys::RawPtr;
+use curvine_core::sys::RawPtr;
 
 mod inode_file;
 pub use self::inode_file::*;

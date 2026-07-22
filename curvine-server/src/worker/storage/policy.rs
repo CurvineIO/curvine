@@ -14,8 +14,8 @@
 
 use crate::worker::storage::VfsDir;
 use curvine_common::state::StorageType;
+use curvine_core::{err_box, CommonResult};
 use indexmap::IndexMap;
-use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
 use std::sync::Arc;
 

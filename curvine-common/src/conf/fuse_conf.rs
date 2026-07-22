@@ -14,9 +14,9 @@
 
 use crate::conf::ClusterConf;
 use crate::fs::Path;
-use orpc::common::{DurationUnit, FileUtils, LogConf, Utils};
-use orpc::sys::{CString, FFIUtils};
-use orpc::{err_box, sys, try_err, CommonResult};
+use curvine_core::common::{DurationUnit, FileUtils, LogConf, Utils};
+use curvine_core::sys::{CString, FFIUtils};
+use curvine_core::{err_box, sys, try_err, CommonResult};
 use serde::{Deserialize, Serialize};
 use std::ffi::c_char;
 use std::path::PathBuf;

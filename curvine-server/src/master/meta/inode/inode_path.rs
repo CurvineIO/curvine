@@ -18,7 +18,7 @@ use crate::master::meta::inode::{
     InodeDir, InodeFile, InodePtr, EMPTY_PARENT_ID, PATH_SEPARATOR, ROOT_INODE_ID,
 };
 use crate::master::meta::store::InodeStore;
-use orpc::{err_box, try_option, CommonResult};
+use curvine_core::{err_box, try_option, CommonResult};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 

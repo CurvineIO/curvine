@@ -22,7 +22,7 @@ use super::report::{
 use super::workload::{BenchOp, WorkloadKind, WorkloadSpec};
 use super::{BenchConfig, CurvineBenchRunner, BENCH_DIR_PREFIX, DEFAULT_DURATION_MS};
 use crate::unified::UnifiedFileSystem;
-use orpc::{err_box, CommonResult};
+use curvine_core::{err_box, CommonResult};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;

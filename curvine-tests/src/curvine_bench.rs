@@ -16,10 +16,10 @@ use crate::{ActionType, BenchAction, BenchArgs};
 use bytes::BytesMut;
 use curvine_client::file::CurvineFileSystem;
 use curvine_common::fs::{Path, Reader, Writer};
-use orpc::common::{FileUtils, SpeedCounter, Utils};
-use orpc::io::LocalFile;
-use orpc::runtime::{JoinHandle, RpcRuntime, Runtime};
-use orpc::{err_box, CommonResult};
+use curvine_core::common::{FileUtils, SpeedCounter, Utils};
+use curvine_core::io::LocalFile;
+use curvine_core::runtime::{JoinHandle, RpcRuntime, Runtime};
+use curvine_core::{err_box, CommonResult};
 use std::sync::Arc;
 
 struct TaskResult {

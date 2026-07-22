@@ -22,16 +22,16 @@ use curvine_common::state::{
     RenameFlags, WorkerInfo, WriteType,
 };
 use curvine_common::utils::SerdeUtils;
+use curvine_core::common::{FileUtils, Logger, TimeSpent, Utils};
+use curvine_core::io::net::NetUtils;
+use curvine_core::runtime::{AsyncRuntime, RpcRuntime};
+use curvine_core::{err_box, CommonResult};
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::{
     JournalBatch, JournalEntry, JournalLoader, JournalSystem, UfsLoader,
 };
 use curvine_server::master::{Master, MountManager};
 use log::info;
-use orpc::common::{FileUtils, Logger, TimeSpent, Utils};
-use orpc::io::net::NetUtils;
-use orpc::runtime::{AsyncRuntime, RpcRuntime};
-use orpc::{err_box, CommonResult};
 use raft::eraftpb::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -92,7 +92,7 @@ fn new_test_ufs_uri(name: &str) -> CommonResult<CurvineURI> {
     let dir = std::env::temp_dir().join(format!(
         "curvine-journal-{name}-{}-{}",
         std::process::id(),
-        orpc::common::LocalTime::mills()
+        curvine_core::common::LocalTime::mills()
     ));
     std::fs::create_dir_all(&dir)?;
     CurvineURI::new(format!("file://{}/", dir.display()))
@@ -361,7 +361,7 @@ fn test_ufs_loader_mkdir_recreates_missing_ufs_parent() -> CommonResult<()> {
     };
     conf.change_test_meta_dir(format!(
         "ufs-loader-mkdir-parent-{}",
-        orpc::common::LocalTime::mills()
+        curvine_core::common::LocalTime::mills()
     ));
 
     let journal_system = JournalSystem::from_conf(&conf)?;
@@ -371,7 +371,7 @@ fn test_ufs_loader_mkdir_recreates_missing_ufs_parent() -> CommonResult<()> {
     let ufs_dir = std::env::temp_dir().join(format!(
         "curvine-ufs-loader-mkdir-{}-{}",
         std::process::id(),
-        orpc::common::LocalTime::mills()
+        curvine_core::common::LocalTime::mills()
     ));
     let _ = std::fs::remove_dir_all(&ufs_dir);
     std::fs::create_dir_all(&ufs_dir)?;

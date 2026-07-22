@@ -17,10 +17,10 @@ use bytes::BytesMut;
 use curvine_common::fs::{Path, Writer};
 use curvine_common::state::{FileAllocOpts, FileBlocks, FileStatus};
 use curvine_common::FsResult;
+use curvine_core::common::ByteUnit;
+use curvine_core::sys::DataSlice;
+use curvine_core::{err_box, ternary};
 use log::debug;
-use orpc::common::ByteUnit;
-use orpc::sys::DataSlice;
-use orpc::{err_box, ternary};
 use std::sync::Arc;
 
 type Inner = FsWriterBuffer;

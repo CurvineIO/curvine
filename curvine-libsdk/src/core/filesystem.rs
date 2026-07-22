@@ -19,7 +19,7 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::FreeResult;
 use curvine_common::FsResult;
-use orpc::runtime::RpcRuntime;
+use curvine_core::runtime::RpcRuntime;
 
 pub struct LibFilesystem {
     session: Session,
@@ -36,7 +36,7 @@ impl LibFilesystem {
         &self.session
     }
 
-    fn rt(&self) -> &std::sync::Arc<orpc::runtime::Runtime> {
+    fn rt(&self) -> &std::sync::Arc<curvine_core::runtime::Runtime> {
         self.session.runtime()
     }
 

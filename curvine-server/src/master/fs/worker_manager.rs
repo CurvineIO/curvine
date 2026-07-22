@@ -21,9 +21,9 @@ use curvine_common::state::{
     WorkerAddress, WorkerCommand, WorkerInfo, WorkerStatus,
 };
 use curvine_common::FsResult;
+use curvine_core::common::ByteUnit;
+use curvine_core::{err_box, CommonResult};
 use log::{info, warn};
-use orpc::common::ByteUnit;
-use orpc::{err_box, CommonResult};
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 

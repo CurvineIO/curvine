@@ -14,7 +14,7 @@
 
 use crate::cli::FuseRuntimeArgs;
 use curvine_common::conf::FuseConf;
-use orpc::CommonResult;
+use curvine_core::CommonResult;
 use std::fs::read_to_string;
 
 /// Validates configuration by loading and initializing cluster settings without mounting.

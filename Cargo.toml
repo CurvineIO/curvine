@@ -10,7 +10,7 @@ panic = "abort"
 resolver = "2"
 
 members = [
-    "orpc",
+    "curvine-core",
     "curvine-fault",
     "curvine-common",
     "curvine-common/macros",
@@ -28,7 +28,7 @@ members = [
 # Mirror members here unless a crate is intentionally opt-in.
 # curvine-lancedb stays opt-in because it pulls heavy Lance/Arrow dependencies.
 default-members = [
-    "orpc",
+    "curvine-core",
     "curvine-fault",
     "curvine-common",
     "curvine-server",
@@ -47,7 +47,7 @@ edition = "2021"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-orpc = { path = "orpc" }
+curvine-core = { path = "curvine-core" }
 curvine-fault = { path = "curvine-fault" }
 curvine-common = { path = "curvine-common" }
 curvine-client = { path = "curvine-client" }

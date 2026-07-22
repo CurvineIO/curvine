@@ -21,7 +21,7 @@ use crate::state::{FileStatus, ListOptions, SetAttrOpts};
 use crate::utils::CommonUtils;
 use crate::FsResult;
 use async_stream::stream;
-use orpc::err_box;
+use curvine_core::err_box;
 use std::fs;
 
 #[derive(Clone)]

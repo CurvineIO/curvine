@@ -15,10 +15,10 @@
 use crate::conf::ClusterConf;
 use crate::state::{StorageType, TtlAction};
 use curvine_common_macros::ClientCliArgs;
-use orpc::client::ClientConf as RpcConf;
-use orpc::common::{ByteUnit, DurationUnit, Utils};
-use orpc::io::net::InetAddr;
-use orpc::CommonResult;
+use curvine_core::client::ClientConf as RpcConf;
+use curvine_core::common::{ByteUnit, DurationUnit, Utils};
+use curvine_core::io::net::InetAddr;
+use curvine_core::CommonResult;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, ClientCliArgs)]

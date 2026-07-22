@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use clap::Parser;
-use orpc::server::ServerConf;
+use curvine_core::server::ServerConf;
 
 // Stress test-related configuration parameters.
 #[derive(Debug, Parser, Clone)]

@@ -47,7 +47,7 @@ mod spdk_conf;
 mod tests {
     use crate::conf::{ClusterConf, WorkerDataDir};
     use crate::state::StorageType;
-    use orpc::common::ByteUnit;
+    use curvine_core::common::ByteUnit;
 
     #[test]
     fn cluster() {

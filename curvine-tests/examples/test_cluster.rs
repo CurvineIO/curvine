@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_core::common::Logger;
+use curvine_core::runtime::{AsyncRuntime, RpcRuntime};
+use curvine_core::CommonResult;
 use curvine_tests::Testing;
-use orpc::common::Logger;
-use orpc::runtime::{AsyncRuntime, RpcRuntime};
-use orpc::CommonResult;
 
 // Start a test cluster and use it for local development and testing.
 fn main() -> CommonResult<()> {

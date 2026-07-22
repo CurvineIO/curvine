@@ -7,7 +7,7 @@ license.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-orpc = { workspace = true}
+curvine-core = { workspace = true}
 curvine-common = { workspace = true }
 curvine-client = { workspace = true }
 log = { workspace = true }

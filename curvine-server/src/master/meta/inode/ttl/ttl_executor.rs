@@ -17,8 +17,8 @@ use crate::master::meta::inode::{Inode, InodeView, ROOT_INODE_ID};
 use crate::master::meta::FsDir;
 use curvine_common::state::TtlAction;
 use curvine_common::FsResult;
+use curvine_core::err_box;
 use log::debug;
-use orpc::err_box;
 
 // TTL Executor Module
 //

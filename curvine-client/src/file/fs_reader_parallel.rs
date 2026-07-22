@@ -17,7 +17,7 @@ use crate::{FileChunk, FileSlice, FILE_MIN_ALIGN_SIZE};
 use curvine_common::fs::Path;
 use curvine_common::state::FileBlocks;
 use curvine_common::FsResult;
-use orpc::err_box;
+use curvine_core::err_box;
 use std::sync::Arc;
 
 // Shards read data

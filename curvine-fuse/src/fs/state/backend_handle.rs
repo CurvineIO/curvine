@@ -20,9 +20,9 @@ use crate::session::FuseResponse;
 use crate::{err_fuse, FuseError, FuseResult, FuseUtils};
 use curvine_common::fs::{Path, StateReader, StateWriter};
 use curvine_common::state::{CreateFileOptsBuilder, FileStatus, LockFlags, OpenFlags};
-use orpc::err_box;
-use orpc::sync::AtomicCounter;
-use orpc::sys::RawPtr;
+use curvine_core::err_box;
+use curvine_core::sync::AtomicCounter;
+use curvine_core::sys::RawPtr;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 

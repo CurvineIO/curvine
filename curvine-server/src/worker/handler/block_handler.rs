@@ -18,9 +18,9 @@ use crate::worker::handler::{BatchWriteHandler, ReadHandler, WriteHandler};
 use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::FsResult;
-use orpc::handler::MessageHandler;
-use orpc::message::Message;
-use orpc::{err_box, CommonResult};
+use curvine_core::handler::MessageHandler;
+use curvine_core::message::Message;
+use curvine_core::{err_box, CommonResult};
 
 pub enum BlockHandler {
     Writer(WriteHandler),

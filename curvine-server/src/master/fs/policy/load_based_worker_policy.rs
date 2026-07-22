@@ -14,8 +14,8 @@
 
 use crate::master::fs::policy::{ChooseContext, WorkerPolicy};
 use curvine_common::state::{WorkerAddress, WorkerInfo};
+use curvine_core::{err_box, CommonResult};
 use indexmap::IndexMap;
-use orpc::{err_box, CommonResult};
 use std::collections::HashSet;
 
 /// Load-based Worker Selection Policy

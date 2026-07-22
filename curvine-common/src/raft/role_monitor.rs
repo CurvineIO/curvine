@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_core::sync::{StateCtl, StateListener, StateMonitor};
+use curvine_core::CommonResult;
 use num_enum::{FromPrimitive, IntoPrimitive};
-use orpc::sync::{StateCtl, StateListener, StateMonitor};
-use orpc::CommonResult;
 use raft::{SoftState, StateRole};
 
 // raft node status.

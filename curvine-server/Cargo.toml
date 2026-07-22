@@ -9,14 +9,14 @@ license.workspace = true
 [features]
 default = []
 jni = ["curvine-ufs/jni"]
-spdk = ["orpc/spdk"]
-spdk-rdma = ["spdk", "orpc/spdk-rdma"]
+spdk = ["curvine-core/spdk"]
+spdk-rdma = ["spdk", "curvine-core/spdk-rdma"]
 fault-injection = [
     "curvine-fault/http-server",
 ]
 
 [dependencies]
-orpc = { workspace = true }
+curvine-core = { workspace = true }
 curvine-common = { workspace = true }
 curvine-fault = { workspace = true }
 curvine-client = { workspace = true }

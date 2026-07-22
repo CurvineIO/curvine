@@ -16,9 +16,9 @@ use crate::master::fs::MasterFilesystem;
 use crate::master::{Master, MasterMetrics};
 use curvine_common::error::FsError;
 use curvine_common::FsResult;
+use curvine_core::common::{LocalTime, TimeSpent};
+use curvine_core::runtime::LoopTask;
 use log::{error, warn};
-use orpc::common::{LocalTime, TimeSpent};
-use orpc::runtime::LoopTask;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::TryLockError;
 
@@ -145,7 +145,7 @@ mod tests {
     use crate::master::Master;
     use curvine_common::conf::{ClusterConf, JournalConf, MasterConf};
     use curvine_common::raft::RoleState;
-    use orpc::common::Utils;
+    use curvine_core::common::Utils;
 
     fn test_fs(name: &str) -> MasterFilesystem {
         Master::init_test_metrics();

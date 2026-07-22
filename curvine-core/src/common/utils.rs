@@ -389,7 +389,7 @@ mod tests {
         static CWD_LOCK: Mutex<()> = Mutex::new(());
         let _guard = CWD_LOCK.lock().unwrap();
 
-        let base = env::temp_dir().join(format!("orpc-test-file-{}", Utils::rand_id()));
+        let base = env::temp_dir().join(format!("curvine_core-test-file-{}", Utils::rand_id()));
         let work = base.join("crate_cwd");
         fs::create_dir_all(&work).unwrap();
 

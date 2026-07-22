@@ -22,9 +22,9 @@ use crate::master::quota::QuotaManager;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::MasterMonitor;
 use curvine_common::executor::ScheduledExecutor;
+use curvine_core::runtime::GroupExecutor;
+use curvine_core::CommonResult;
 use log::info;
-use orpc::runtime::GroupExecutor;
-use orpc::CommonResult;
 use std::sync::Arc;
 
 pub struct MasterActor {

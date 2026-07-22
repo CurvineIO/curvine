@@ -80,7 +80,7 @@ macro_rules! impl_writer_for_enum {
 
             async fn write_chunk(
                 &mut self,
-                chunk: ::orpc::sys::DataSlice,
+                chunk: ::curvine_core::sys::DataSlice,
             ) -> ::curvine_common::FsResult<i64> {
                 match self {
                     $(
@@ -181,7 +181,7 @@ macro_rules! impl_reader_for_enum {
                 }
             }
 
-            fn chunk_mut(&mut self) -> &mut ::orpc::sys::DataSlice {
+            fn chunk_mut(&mut self) -> &mut ::curvine_core::sys::DataSlice {
                 match self {
                     $(
                         $(#[$cfg])*
@@ -217,7 +217,7 @@ macro_rules! impl_reader_for_enum {
                 }
             }
 
-            async fn read_chunk0(&mut self) -> ::curvine_common::FsResult<::orpc::sys::DataSlice> {
+            async fn read_chunk0(&mut self) -> ::curvine_common::FsResult<::curvine_core::sys::DataSlice> {
                 match self {
                     $(
                         $(#[$cfg])*
@@ -245,7 +245,7 @@ macro_rules! impl_reader_for_enum {
             }
 
             // Forward default methods explicitly to ensure they work correctly
-            fn async_read(&mut self, len: Option<usize>) -> impl ::std::future::Future<Output = ::curvine_common::FsResult<::orpc::sys::DataSlice>> + Send {
+            fn async_read(&mut self, len: Option<usize>) -> impl ::std::future::Future<Output = ::curvine_common::FsResult<::curvine_core::sys::DataSlice>> + Send {
                 async move {
                     match self {
                         $(
@@ -256,7 +256,7 @@ macro_rules! impl_reader_for_enum {
                 }
             }
 
-            fn read_chunk(&mut self, len: Option<usize>) -> impl ::std::future::Future<Output = ::curvine_common::FsResult<::orpc::sys::DataSlice>> + Send {
+            fn read_chunk(&mut self, len: Option<usize>) -> impl ::std::future::Future<Output = ::curvine_common::FsResult<::curvine_core::sys::DataSlice>> + Send {
                 async move {
                     match self {
                         $(
@@ -278,7 +278,7 @@ macro_rules! impl_reader_for_enum {
                 }
             }
 
-            fn blocking_read(&mut self, rt: &::orpc::runtime::Runtime) -> ::curvine_common::FsResult<::orpc::sys::DataSlice> {
+            fn blocking_read(&mut self, rt: &::curvine_core::runtime::Runtime) -> ::curvine_common::FsResult<::curvine_core::sys::DataSlice> {
                 match self {
                     $(
                         $(#[$cfg])*
@@ -287,7 +287,7 @@ macro_rules! impl_reader_for_enum {
                 }
             }
 
-            fn fuse_read(&mut self, pos: i64, len: usize) -> impl ::std::future::Future<Output = ::curvine_common::FsResult<Vec<::orpc::sys::DataSlice>>> + Send {
+            fn fuse_read(&mut self, pos: i64, len: usize) -> impl ::std::future::Future<Output = ::curvine_common::FsResult<Vec<::curvine_core::sys::DataSlice>>> + Send {
                 async move {
                     match self {
                         $(

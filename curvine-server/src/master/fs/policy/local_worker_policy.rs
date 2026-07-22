@@ -14,8 +14,8 @@
 
 use crate::master::fs::policy::{ChooseContext, RobinWorkerPolicy, WorkerPolicy};
 use curvine_common::state::{WorkerAddress, WorkerInfo};
+use curvine_core::{err_box, CommonResult};
 use indexmap::IndexMap;
-use orpc::{err_box, CommonResult};
 
 /// Local workers are preferred, and polling policies are used if there are no local workers
 pub struct LocalWorkerPolicy {

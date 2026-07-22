@@ -17,10 +17,10 @@ use curvine_client::unified::{MountValue, UfsFileSystem};
 use curvine_common::conf::ClientConf;
 use curvine_common::state::{MountInfo, WorkerAddress};
 use curvine_common::FsResult;
-use orpc::client::ClientFactory;
-use orpc::io::net::InetAddr;
-use orpc::runtime::Runtime;
-use orpc::sync::FastSyncCache;
+use curvine_core::client::ClientFactory;
+use curvine_core::io::net::InetAddr;
+use curvine_core::runtime::Runtime;
+use curvine_core::sync::FastSyncCache;
 use std::sync::Arc;
 use std::time::Duration;
 

@@ -18,10 +18,10 @@ mod s3_tests {
 
     use curvine_common::fs::{FileSystem, Path, Reader, Writer};
     use curvine_common::state::FileStatus;
+    use curvine_core::common::{FileUtils, Utils};
+    use curvine_core::runtime::{AsyncRuntime, RpcRuntime};
+    use curvine_core::CommonResult;
     use curvine_ufs::opendal::OpendalFileSystem;
-    use orpc::common::{FileUtils, Utils};
-    use orpc::runtime::{AsyncRuntime, RpcRuntime};
-    use orpc::CommonResult;
     use std::collections::HashMap;
 
     const S3_CONF_PATH: &str = "testing/s3.toml";

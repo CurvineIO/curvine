@@ -16,10 +16,10 @@ use crate::file::{FsContext, FsReaderBuffer, ReadDetector};
 use curvine_common::fs::{Path, Reader};
 use curvine_common::state::{FileBlocks, FileStatus};
 use curvine_common::FsResult;
+use curvine_core::common::ByteUnit;
+use curvine_core::err_box;
+use curvine_core::sys::DataSlice;
 use log::debug;
-use orpc::common::ByteUnit;
-use orpc::err_box;
-use orpc::sys::DataSlice;
 use std::sync::Arc;
 
 type Inner = FsReaderBuffer;

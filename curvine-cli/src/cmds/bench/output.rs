@@ -18,7 +18,7 @@ use curvine_client::bench::{
     BenchConfig, BenchOpResult, BenchPrefillReport, BenchProfile, BenchReport, BenchResultGroup,
     BenchTarget, LatencyMode, WorkloadKind,
 };
-use orpc::common::ByteUnit;
+use curvine_core::common::ByteUnit;
 
 pub(super) fn print_startup_config(conf_source: &str, config: &BenchConfig) {
     let duration = config

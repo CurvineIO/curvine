@@ -87,7 +87,7 @@ impl FuseCli {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orpc::common::Utils;
+    use curvine_core::common::Utils;
     use std::fs;
 
     fn with_valid_conf<T>(extra_args: &[&str], test: impl FnOnce(FuseRuntimeArgs) -> T) -> T {

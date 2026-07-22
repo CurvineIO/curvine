@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use orpc::runtime::JobCtl;
+use curvine_core::runtime::JobCtl;
 
 #[derive(Clone, Default)]
 pub enum SnapshotState {

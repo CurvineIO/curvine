@@ -19,10 +19,10 @@ use crate::worker::storage::{
 };
 use curvine_common::conf::{ClusterConf, WorkerDataDir};
 use curvine_common::state::{ExtendedBlock, StorageInfo, StorageType};
+use curvine_core::common::{ByteUnit, FileUtils, LocalTime, TimeSpent};
+use curvine_core::{err_box, CommonResult};
 use indexmap::map::Values;
 use log::info;
-use orpc::common::{ByteUnit, FileUtils, LocalTime, TimeSpent};
-use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -111,7 +111,7 @@ impl VfsDataset {
                 if dir.storage_type() == StorageType::SpdkDisk {
                     if let Some(bdev) = dir.state.bdev_name.as_ref() {
                         if let Some(prev_id) = seen.insert(bdev.clone(), dir.id()) {
-                            return orpc::err_box!(
+                            return curvine_core::err_box!(
                                 "SPDK dirs {} and {} both map to bdev '{}' (dir_id collision).",
                                 prev_id,
                                 dir.id(),
@@ -410,10 +410,10 @@ mod test {
     };
     use curvine_common::conf::{ClusterConf, WorkerConf};
     use curvine_common::state::{ExtendedBlock, FileType, StorageType};
-    use orpc::common::FileUtils;
-    use orpc::sync::AtomicLong;
-    use orpc::sys::FsStats;
-    use orpc::CommonResult;
+    use curvine_core::common::FileUtils;
+    use curvine_core::sync::AtomicLong;
+    use curvine_core::sys::FsStats;
+    use curvine_core::CommonResult;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 

@@ -23,6 +23,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use common::{row_count, start_minicluster, unique_ns};
 use curvine_common::conf::ClusterConf;
+use curvine_core::{CommonError, CommonResult};
 use futures::{stream::FuturesUnordered, TryStreamExt};
 use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
 use lancedb::connect;
@@ -38,7 +39,6 @@ use lancedb::table::{AddDataMode, ColumnAlteration, NewColumnTransform, Optimize
 use lancedb::{DistanceType, ObjectStoreProvider};
 use object_store::path::Path as ObjectPath;
 use object_store::{Error as ObjectStoreError, ObjectStore, PutMode, PutOptions, UpdateVersion};
-use orpc::{CommonError, CommonResult};
 use std::env;
 use url::Url;
 

@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use curvine_common::error::FsError;
+use curvine_core::CommonResult;
 use jni::objects::{JObject, JString, JThrowable, JValue};
 use jni::sys::{jarray, jboolean, jstring, JNI_TRUE};
 use jni::JNIEnv;
-use orpc::CommonResult;
 
 pub struct JavaUtils;
 

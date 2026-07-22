@@ -179,7 +179,7 @@ macro_rules! __fault_point_prepare {
 /// # Sync vs async
 ///
 /// - A `sync` point executes `Delay` with `std::thread::sleep` on the caller
-///   thread. On Curvine Master/Worker sync ORPC lanes that means the
+///   thread. On Curvine Master/Worker sync RPC lanes that means the
 ///   `spawn_blocking` pool thread, which can stall other sync RPCs for the
 ///   full delay. Use only for short, intentional chaos.
 /// - An `async` point executes `Delay` with `tokio::time::sleep`, so only the

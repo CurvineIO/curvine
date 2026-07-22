@@ -134,7 +134,7 @@ COPY Cargo.toml ./
 COPY Cargo.lock ./
 
 # Create workspace member structure and generate minimal config files (merged into single RUN to reduce layers)
-RUN mkdir -p curvine-common/src curvine-server/src curvine-client/src curvine-libsdk/src curvine-tests/src curvine-fuse/src curvine-web/src curvine-ufs/src curvine-cli/src orpc/src && \
+RUN mkdir -p curvine-common/src curvine-server/src curvine-client/src curvine-libsdk/src curvine-tests/src curvine-fuse/src curvine-web/src curvine-ufs/src curvine-cli/src curvine-core/src && \
     echo '[package]\nname = "curvine-common"\nversion = "0.1.0"\nedition = "2021"' > curvine-common/Cargo.toml && \
     echo '[package]\nname = "curvine-server"\nversion = "0.1.0"\nedition = "2021"' > curvine-server/Cargo.toml && \
     echo '[package]\nname = "curvine-client"\nversion = "0.1.0"\nedition = "2021"' > curvine-client/Cargo.toml && \
@@ -144,7 +144,7 @@ RUN mkdir -p curvine-common/src curvine-server/src curvine-client/src curvine-li
     echo '[package]\nname = "curvine-web"\nversion = "0.1.0"\nedition = "2021"' > curvine-web/Cargo.toml && \
     echo '[package]\nname = "curvine-ufs"\nversion = "0.1.0"\nedition = "2021"' > curvine-ufs/Cargo.toml && \
     echo '[package]\nname = "curvine-cli"\nversion = "0.1.0"\nedition = "2021"' > curvine-cli/Cargo.toml && \
-    echo '[package]\nname = "orpc"\nversion = "0.1.0"\nedition = "2021"' > orpc/Cargo.toml && \
+    echo '[package]\nname = "curvine-core"\nversion = "0.1.0"\nedition = "2021"' > curvine-core/Cargo.toml && \
     echo 'fn main() {}' > curvine-common/src/lib.rs && \
     echo 'fn main() {}' > curvine-server/src/main.rs && \
     echo 'fn main() {}' > curvine-client/src/main.rs && \
@@ -154,7 +154,7 @@ RUN mkdir -p curvine-common/src curvine-server/src curvine-client/src curvine-li
     echo 'fn main() {}' > curvine-web/src/lib.rs && \
     echo 'fn main() {}' > curvine-ufs/src/lib.rs && \
     echo 'fn main() {}' > curvine-cli/src/main.rs && \
-    echo 'fn main() {}' > orpc/src/lib.rs
+    echo 'fn main() {}' > curvine-core/src/lib.rs
 
 # Use original project config + Cargo.lock to cache exact dependencies
 RUN cargo build --release || echo "Release build failed, continuing..."

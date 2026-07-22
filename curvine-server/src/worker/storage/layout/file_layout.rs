@@ -17,10 +17,10 @@ use crate::worker::storage::layout::{validate_open_offset, BlockLayout};
 use crate::worker::storage::{BlockReadContext, BlockWriteContext, VfsDir};
 use curvine_common::state::ExtendedBlock;
 #[cfg(test)]
-use orpc::common::ByteUnit;
-use orpc::common::FileUtils;
-use orpc::io::{BlockDevice, IOError, IOResult, LocalFile};
-use orpc::{err_box, try_err, CommonResult};
+use curvine_core::common::ByteUnit;
+use curvine_core::common::FileUtils;
+use curvine_core::io::{BlockDevice, IOError, IOResult, LocalFile};
+use curvine_core::{err_box, try_err, CommonResult};
 use std::fs::{self, File};
 use std::path::PathBuf;
 

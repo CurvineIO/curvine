@@ -16,10 +16,10 @@ use curvine_common::conf::JournalConf;
 use curvine_common::raft::storage::{LogStorage, RocksAppStorage, RocksLogStorage};
 use curvine_common::raft::{RaftClient, RaftJournal, RaftPeer, RoleMonitor};
 use curvine_common::utils::SerdeUtils;
+use curvine_core::common::{Logger, Utils};
+use curvine_core::runtime::{RpcRuntime, Runtime};
+use curvine_core::CommonResult;
 use log::info;
-use orpc::common::{Logger, Utils};
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::CommonResult;
 use std::sync::Arc;
 
 fn main() -> CommonResult<()> {

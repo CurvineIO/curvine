@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use orpc::common::{ByteUnit, FileUtils, Utils};
+use curvine_core::common::{ByteUnit, FileUtils, Utils};
 use rocksdb::*;
 use serde::{Deserialize, Serialize};
 use std::ffi::c_int;

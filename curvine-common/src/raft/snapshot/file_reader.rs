@@ -14,12 +14,12 @@
 
 use crate::raft::{RaftResult, RaftUtils};
 use bytes::BytesMut;
+use curvine_core::common::Utils;
+use curvine_core::io::LocalFile;
+use curvine_core::CommonResult;
 use flate2::read::ZlibEncoder;
 use flate2::Compression;
 use log::warn;
-use orpc::common::Utils;
-use orpc::io::LocalFile;
-use orpc::CommonResult;
 
 // Read a file and read it after compression.
 pub struct FileReader {

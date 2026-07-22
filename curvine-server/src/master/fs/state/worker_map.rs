@@ -14,9 +14,9 @@
 
 use curvine_common::state::{StorageInfo, WorkerAddress, WorkerInfo, WorkerStatus};
 use curvine_common::FsResult;
+use curvine_core::err_box;
 use indexmap::IndexMap;
 use log::{error, info, warn};
-use orpc::err_box;
 
 // Store all worker information.
 pub struct WorkerMap {

@@ -22,12 +22,14 @@ use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Writer};
 use curvine_common::state::{FileAllocOpts, FileStatus};
 use curvine_common::FsResult;
+use curvine_core::common::LocalTime;
+use curvine_core::runtime::{RpcRuntime, Runtime};
+use curvine_core::sync::channel::{
+    AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender,
+};
+use curvine_core::sync::{AtomicCounter, AtomicLong, ErrorMonitor};
+use curvine_core::sys::DataSlice;
 use log::error;
-use orpc::common::LocalTime;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
-use orpc::sync::{AtomicCounter, AtomicLong, ErrorMonitor};
-use orpc::sys::DataSlice;
 use std::sync::Arc;
 
 enum WriteTask {
@@ -335,13 +337,13 @@ mod tests {
     use super::{mark_dequeued, QueuedWriteTask, WriteTask};
     use crate::fuse_metrics::ActiveGuard;
     use curvine_common::FsResult;
-    use orpc::common::Metrics as m;
-    use orpc::sync::channel::{AsyncChannel, CallChannel};
+    use curvine_core::common::Metrics as m;
+    use curvine_core::sync::channel::{AsyncChannel, CallChannel};
 
     // Build a QueuedWriteTask carrying a queue guard backed by `gauge`. The wrapped
     // WriteTask is a Flush (it only needs a CallChannel sender, no FuseResponse), so
     // these tests exercise the queue-depth guard lifecycle without a backend.
-    fn queued_task(gauge: &orpc::common::Gauge) -> QueuedWriteTask {
+    fn queued_task(gauge: &curvine_core::common::Gauge) -> QueuedWriteTask {
         let (rx, _tx) = CallChannel::channel::<FsResult<()>>();
         QueuedWriteTask {
             task: WriteTask::Flush(rx, None),
@@ -450,9 +452,9 @@ mod tests {
         use curvine_client::unified::UnifiedWriter;
         use curvine_common::conf::FuseConf;
         use curvine_common::fs::local::LocalWriter;
-        use orpc::common::Metrics as m;
-        use orpc::runtime::{AsyncRuntime, RpcRuntime};
-        use orpc::sync::channel::AsyncChannel;
+        use curvine_core::common::Metrics as m;
+        use curvine_core::runtime::{AsyncRuntime, RpcRuntime};
+        use curvine_core::sync::channel::AsyncChannel;
         use std::sync::Arc;
 
         fn metrics_reply(rt: &AsyncRuntime) -> FuseResponse {

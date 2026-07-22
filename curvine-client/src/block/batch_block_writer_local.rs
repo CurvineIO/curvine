@@ -4,10 +4,10 @@ use curvine_common::error::FsError;
 use curvine_common::fs::Path;
 use curvine_common::state::{ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
-use orpc::common::Utils;
-use orpc::io::LocalFile;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sys::RawPtr;
+use curvine_core::common::Utils;
+use curvine_core::io::LocalFile;
+use curvine_core::runtime::{RpcRuntime, Runtime};
+use curvine_core::sys::RawPtr;
 use std::sync::Arc;
 
 pub struct BatchBlockWriterLocal {

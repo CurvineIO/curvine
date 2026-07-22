@@ -30,7 +30,7 @@ opendal-hdfs-native = ["curvine-client/opendal-hdfs-native"]
 oss-hdfs = ["curvine-client/oss-hdfs"]
 
 [dependencies]
-orpc = { workspace = true }
+curvine-core = { workspace = true }
 curvine-client = { workspace = true }
 curvine-common = { workspace = true }
 once_cell = { workspace = true }

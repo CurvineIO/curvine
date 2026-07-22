@@ -14,10 +14,10 @@
 
 use curvine_client::file::CurvineFileSystem;
 use curvine_common::fs::{Path, Writer};
+use curvine_core::runtime::{AsyncRuntime, RpcRuntime};
+use curvine_core::CommonResult;
 use curvine_tests::Testing;
 use log::info;
-use orpc::runtime::{AsyncRuntime, RpcRuntime};
-use orpc::CommonResult;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;

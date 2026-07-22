@@ -18,7 +18,7 @@ use super::report::TaskMetric;
 use super::runner::{collect, PathAction, WorkloadExecution};
 use super::seed::WorkloadSeedSet;
 use super::{BenchOp, CurvineBenchRunner, RENAMED_SUFFIX};
-use orpc::CommonResult;
+use curvine_core::CommonResult;
 use std::sync::Arc;
 use std::time::Instant;
 

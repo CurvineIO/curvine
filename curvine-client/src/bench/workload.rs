@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 
-use orpc::{err_box, CommonResult};
+use curvine_core::{err_box, CommonResult};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;

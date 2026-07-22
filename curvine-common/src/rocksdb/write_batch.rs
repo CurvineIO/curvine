@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::rocksdb::DBEngine;
-use orpc::CommonResult;
+use curvine_core::CommonResult;
 use rocksdb::WriteBatchWithTransaction;
 
 pub struct WriteBatch<'a> {

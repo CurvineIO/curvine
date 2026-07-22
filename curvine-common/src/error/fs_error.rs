@@ -17,10 +17,10 @@ use crate::raft::RaftError;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use curvine_core::error::{ErrorDecoder, ErrorExt, ErrorImpl, StringError};
+use curvine_core::io::IOError;
+use curvine_core::CommonError;
 use num_enum::{FromPrimitive, IntoPrimitive};
-use orpc::error::{ErrorDecoder, ErrorExt, ErrorImpl, StringError};
-use orpc::io::IOError;
-use orpc::CommonError;
 use prost::bytes::BytesMut;
 use prost::{DecodeError, EncodeError};
 use serde_json::json;
@@ -647,7 +647,7 @@ impl ErrorExt for FsError {
 mod tests {
     use super::ErrorKind;
     use crate::error::fs_error::FsError;
-    use orpc::error::{ErrorExt, ErrorImpl};
+    use curvine_core::error::{ErrorExt, ErrorImpl};
 
     #[test]
     pub fn error_test() {

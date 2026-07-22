@@ -13,23 +13,23 @@
 // limitations under the License.
 
 use bytes::{BufMut, BytesMut};
-use orpc::client::ClientFactory;
-use orpc::common::Utils;
-use orpc::error::CommonErrorExt;
-use orpc::io::net::{InetAddr, NetUtils};
-use orpc::message::{Builder, Message, RequestStatus};
-use orpc::runtime::RpcRuntime;
-use orpc::server::{RpcServer, ServerConf};
-use orpc::sys::DataSlice;
-use orpc::test::file::dir_location::DirLocation;
-use orpc::test::file::file_handler::{FileService, RpcCode};
-use orpc::CommonResult;
+use curvine_core::client::ClientFactory;
+use curvine_core::common::Utils;
+use curvine_core::error::CommonErrorExt;
+use curvine_core::io::net::{InetAddr, NetUtils};
+use curvine_core::message::{Builder, Message, RequestStatus};
+use curvine_core::runtime::RpcRuntime;
+use curvine_core::server::{RpcServer, ServerConf};
+use curvine_core::sys::DataSlice;
+use curvine_core::test::file::dir_location::DirLocation;
+use curvine_core::test::file::file_handler::{FileService, RpcCode};
+use curvine_core::CommonResult;
 
 #[test]
 fn test_distributed_file_location_and_creation() {
     let dirs = vec![
-        String::from("../testing/orpc-1"),
-        String::from("../testing/orpc-2"),
+        String::from("../testing/curvine_core-1"),
+        String::from("../testing/curvine_core-2"),
     ];
 
     let location = DirLocation::new(dirs);
@@ -48,8 +48,8 @@ fn test_rpc_file_server_write_read_with_checksum_validation() -> CommonResult<()
     // preventing TOCTOU races when nextest runs tests in parallel.
     let conf = ServerConf::with_hostname("127.0.0.1", NetUtils::hold_available_port());
     let dirs = vec![
-        String::from("../testing/orpc-d1"),
-        String::from("../testing/orpc-d2"),
+        String::from("../testing/curvine_core-d1"),
+        String::from("../testing/curvine_core-d2"),
     ];
     let addr = conf.bind_addr();
 

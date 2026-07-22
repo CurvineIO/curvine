@@ -16,9 +16,9 @@
 
 use curvine_common::conf::{ClientConf, ClusterConf};
 use curvine_common::FsResult;
-use orpc::common::LogConf;
-use orpc::io::net::InetAddr;
-use orpc::{err_box, try_err};
+use curvine_core::common::LogConf;
+use curvine_core::io::net::InetAddr;
+use curvine_core::{err_box, try_err};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

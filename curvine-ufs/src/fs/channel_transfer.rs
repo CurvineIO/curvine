@@ -14,7 +14,7 @@
 
 use crate::fs::{AsyncChunkReader, AsyncChunkWriter, ProgressCallback};
 use bytes::{Bytes, BytesMut};
-use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender};
+use curvine_core::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender};
 use std::io::Error;
 use std::io::Result as IoResult;
 use std::sync::atomic::{AtomicBool, Ordering};

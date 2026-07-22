@@ -17,7 +17,7 @@ use crate::proto::{GetFileStatusResponse, ListOptionsResponse, ListStatusRespons
 use crate::state::{FileStatus, ListOptions, SetAttrOpts};
 use crate::utils::ProtoUtils;
 use crate::FsResult;
-use orpc::err_box;
+use curvine_core::err_box;
 use prost::bytes::BytesMut;
 use std::future::Future;
 

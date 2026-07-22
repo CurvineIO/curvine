@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use curvine_common::state::{FileLock, LockFlags, LockType};
-use orpc::common::LocalTime;
+use curvine_core::common::LocalTime;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

@@ -17,8 +17,8 @@ use curvine_client::file::FsClient;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::ClusterConf;
 use curvine_common::FsResult;
-use orpc::common::Logger;
-use orpc::runtime::Runtime;
+use curvine_core::common::Logger;
+use curvine_core::runtime::Runtime;
 use std::sync::Arc;
 
 #[derive(Clone)]

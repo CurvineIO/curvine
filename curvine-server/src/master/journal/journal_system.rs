@@ -28,10 +28,10 @@ use curvine_common::proto::raft::SnapshotData;
 use curvine_common::raft::storage::{AppStorage, LogStorage, RocksLogStorage};
 use curvine_common::raft::{RaftClient, RaftResult, RoleMonitor, RoleStateListener};
 use curvine_common::FsResult;
-use orpc::common::FileUtils;
-use orpc::err_box;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sync::StateCtl;
+use curvine_core::common::FileUtils;
+use curvine_core::err_box;
+use curvine_core::runtime::{RpcRuntime, Runtime};
+use curvine_core::sync::StateCtl;
 use prost::Message;
 use raft::eraftpb::Entry;
 use raft::Storage;
@@ -412,7 +412,7 @@ mod tests {
     use super::*;
     use curvine_common::conf::{JournalConf, MasterConf};
     use curvine_common::raft::RaftPeer;
-    use orpc::common::Utils;
+    use curvine_core::common::Utils;
 
     fn non_format_master_conf(name: &str, multi_master: bool) -> ClusterConf {
         let mut journal = JournalConf::with_test();

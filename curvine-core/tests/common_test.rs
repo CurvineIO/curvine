@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use orpc::message::{RequestStatus, ResponseStatus, Status};
-use orpc::sys::RawPtr;
+use curvine_core::message::{RequestStatus, ResponseStatus, Status};
+use curvine_core::sys::RawPtr;
 
 #[test]
 fn test_rpc_status_encoding_and_decoding() {

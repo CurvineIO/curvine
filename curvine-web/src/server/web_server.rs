@@ -19,11 +19,11 @@ use std::sync::Arc;
 use axum::error_handling::HandleErrorLayer;
 use axum::http::StatusCode;
 use axum::Json;
+use curvine_core::io::net::{InetAddr, NetUtils};
+use curvine_core::runtime::{RpcRuntime, Runtime};
+use curvine_core::server::{ServerConf, ServerMonitor, ServerStateListener};
+use curvine_core::CommonResult;
 use log::{error, info};
-use orpc::io::net::{InetAddr, NetUtils};
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::server::{ServerConf, ServerMonitor, ServerStateListener};
-use orpc::CommonResult;
 use serde_json::json;
 use tokio::net::TcpListener;
 use tower::ServiceBuilder;
@@ -118,7 +118,7 @@ where
         name: &str,
         bind_addr: &str,
     ) -> CommonResult<()> {
-        use orpc::err_box;
+        use curvine_core::err_box;
 
         match listener.wait_startup().await {
             Ok(()) => Ok(()),

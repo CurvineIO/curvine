@@ -18,7 +18,7 @@ use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
 use curvine_common::state::{BlockReportInfo, HeartbeatStatus, StorageInfo, WorkerAddress};
 use curvine_common::utils::ProtoUtils;
-use orpc::CommonResult;
+use curvine_core::CommonResult;
 use std::sync::Arc;
 
 //Worker and master communicate with the customer client.

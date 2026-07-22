@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::raft::NodeId;
-use orpc::common::Utils;
-use orpc::io::net::InetAddr;
+use curvine_core::common::Utils;
+use curvine_core::io::net::InetAddr;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 

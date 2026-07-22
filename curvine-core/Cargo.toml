@@ -1,9 +1,9 @@
 [package]
-name = "orpc"
+name = "curvine-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "High-performance network communication framework."
+description = "Curvine core foundation library (runtime, sync, I/O, RPC, and shared utilities)."
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 

@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-orpc = { workspace = true }
+curvine-core = { workspace = true }
 curvine-common = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }

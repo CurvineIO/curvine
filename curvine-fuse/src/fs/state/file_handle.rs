@@ -20,8 +20,8 @@ use crate::session::FuseResponse;
 use crate::{err_fuse, FuseResult};
 use curvine_common::fs::{StateReader, StateWriter};
 use curvine_common::state::{FileAllocOpts, FileStatus, LockFlags};
-use orpc::err_box;
-use orpc::sys::RawPtr;
+use curvine_core::err_box;
+use curvine_core::sys::RawPtr;
 use std::sync::Arc;
 
 pub enum FileHandle {

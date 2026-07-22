@@ -9,10 +9,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, path::Path};
 
 use arrow_array::RecordBatch;
+use curvine_core::CommonResult;
 use curvine_server::test::MiniCluster;
 use curvine_tests::Testing;
 use once_cell::sync::OnceCell;
-use orpc::CommonResult;
 use tokio::runtime::Runtime;
 
 static MINICLUSTER: OnceCell<RunningMinicluster> = OnceCell::new();
@@ -38,7 +38,7 @@ fn minicluster() -> CommonResult<&'static RunningMinicluster> {
     MINICLUSTER.get_or_try_init(|| {
         if let Ok(conf_path) = env::var(CURVINE_E2E_CONF_FILE) {
             if !Path::new(&conf_path).is_file() {
-                return Err(orpc::CommonError::from(format!(
+                return Err(curvine_core::CommonError::from(format!(
                     "{CURVINE_E2E_CONF_FILE} must point to a Curvine cluster config file: {conf_path}"
                 )));
             }
@@ -67,7 +67,7 @@ pub fn start_minicluster() -> CommonResult<(&'static RunningMinicluster, Runtime
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| orpc::CommonError::from(e.to_string()))?;
+        .map_err(|e| curvine_core::CommonError::from(e.to_string()))?;
     Ok((cluster, rt))
 }
 

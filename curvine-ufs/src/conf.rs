@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use orpc::common::DurationUnit;
-use orpc::{err_box, CommonResult};
+use curvine_core::common::DurationUnit;
+use curvine_core::{err_box, CommonResult};
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::time::Duration;

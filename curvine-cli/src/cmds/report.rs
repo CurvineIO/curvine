@@ -16,7 +16,7 @@ use crate::util::*;
 use clap::{Parser, Subcommand};
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::state::MasterInfo;
-use orpc::CommonResult;
+use curvine_core::CommonResult;
 use serde::Serialize;
 
 #[derive(Parser, Debug)]

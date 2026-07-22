@@ -16,7 +16,7 @@
 use super::config::{BenchMode, BenchTarget};
 use crate::unified::UnifiedFileSystem;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-use orpc::{err_box, CommonResult};
+use curvine_core::{err_box, CommonResult};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

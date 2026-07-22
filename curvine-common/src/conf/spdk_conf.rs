@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test {
-    use orpc::io::SpdkConf;
+    use curvine_core::io::SpdkConf;
 
     #[test]
     fn spdk_conf_toml_deserialization_with_targets() {
@@ -43,7 +43,7 @@ mod test {
     #[test]
     fn minimal_toml_test() {
         let toml_str = "enabled = true\n";
-        let conf: orpc::io::SpdkConf = toml::from_str(toml_str).unwrap();
+        let conf: curvine_core::io::SpdkConf = toml::from_str(toml_str).unwrap();
         println!("parsed: {:?}", conf.enabled);
     }
 }
