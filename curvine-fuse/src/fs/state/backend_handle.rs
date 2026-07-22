@@ -222,6 +222,14 @@ impl BackendHandle {
         }
     }
 
+    pub fn take_plock_if_owner(&self, owner_id: u64) -> Option<u64> {
+        let mut fh_locks = self.fh_locks.lock().unwrap();
+        match fh_locks.plock_owner_id {
+            Some(tracked) if tracked == owner_id => fh_locks.plock_owner_id.take(),
+            _ => None,
+        }
+    }
+
     pub async fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {
         self.complete(None).await?;
 

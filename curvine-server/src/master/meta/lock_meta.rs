@@ -79,35 +79,87 @@ impl LockMeta {
         (&self.plock, &self.flock)
     }
 
+    fn regions_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
+        a_start <= b_end && b_start <= a_end
+    }
+
+    fn subtract_region(
+        region_start: u64,
+        region_end: u64,
+        remove_start: u64,
+        remove_end: u64,
+    ) -> Vec<(u64, u64)> {
+        if !Self::regions_overlap(region_start, region_end, remove_start, remove_end) {
+            return vec![(region_start, region_end)];
+        }
+
+        let mut out = Vec::new();
+        if region_start < remove_start {
+            out.push((region_start, remove_start.saturating_sub(1)));
+        }
+        if region_end > remove_end {
+            out.push((remove_end.saturating_add(1), region_end));
+        }
+        out
+    }
+
+    fn same_owner(a: &FileLock, b: &FileLock) -> bool {
+        a.client_id == b.client_id && a.owner_id == b.owner_id
+    }
+
+    fn types_conflict(query: LockType, existing: LockType) -> bool {
+        matches!(
+            (query, existing),
+            (LockType::WriteLock, _) | (_, LockType::WriteLock)
+        )
+    }
+
+    fn purge_expired_plocks(&mut self, expire_ms: u64) {
+        self.plock.retain(|_, owner_locks| {
+            owner_locks.retain(|lock| !Self::is_lock_expired(lock, expire_ms));
+            !owner_locks.is_empty()
+        });
+    }
+
+    fn subtract_owner_regions(owner_locks: &mut Vec<FileLock>, remove_start: u64, remove_end: u64) {
+        let mut next = Vec::new();
+        for existing in owner_locks.drain(..) {
+            for (start, end) in
+                Self::subtract_region(existing.start, existing.end, remove_start, remove_end)
+            {
+                next.push(FileLock {
+                    start,
+                    end,
+                    ..existing.clone()
+                });
+            }
+        }
+        *owner_locks = next;
+    }
+
     fn check_plock_conflict(&mut self, lock: &FileLock, expire_ms: u64) -> Option<FileLock> {
+        self.purge_expired_plocks(expire_ms);
+
         let mut conflict_lock = None;
+        for existing_lock in self.plock.values().flatten() {
+            if Self::same_owner(lock, existing_lock) {
+                continue;
+            }
+            if !Self::types_conflict(lock.lock_type, existing_lock.lock_type) {
+                continue;
+            }
+            if !Self::regions_overlap(lock.start, lock.end, existing_lock.start, existing_lock.end)
+            {
+                continue;
+            }
 
-        for owner_locks in self.plock.values_mut() {
-            owner_locks.retain(|existing_lock| {
-                if Self::is_lock_expired(existing_lock, expire_ms) {
-                    return false;
-                }
-
-                if conflict_lock.is_none()
-                    && (existing_lock.client_id != lock.client_id
-                        || existing_lock.owner_id != lock.owner_id)
-                {
-                    let is_conflict = matches!(
-                        (lock.lock_type, existing_lock.lock_type),
-                        (LockType::WriteLock, _) | (_, LockType::WriteLock)
-                    );
-
-                    if is_conflict {
-                        let has_overlap =
-                            lock.end >= existing_lock.start && lock.start <= existing_lock.end;
-                        if has_overlap {
-                            conflict_lock = Some(existing_lock.clone());
-                        }
-                    }
-                }
-
-                true
-            });
+            let replace = conflict_lock
+                .as_ref()
+                .map(|best: &FileLock| existing_lock.start < best.start)
+                .unwrap_or(true);
+            if replace {
+                conflict_lock = Some(existing_lock.clone());
+            }
         }
 
         conflict_lock
@@ -168,20 +220,14 @@ impl LockMeta {
         let key = Self::key(&lock);
 
         if lock.lock_type == LockType::UnLock {
+            self.purge_expired_plocks(expire_ms);
             if lock.start == 0 && lock.end == u64::MAX {
                 self.plock.remove(&key);
                 return None;
             }
 
             if let Some(owner_locks) = self.plock.get_mut(&key) {
-                let unlock_start = lock.start;
-                let unlock_end = lock.end;
-
-                owner_locks.retain(|existing| {
-                    let overlaps = existing.end >= unlock_start && existing.start <= unlock_end;
-                    !overlaps
-                });
-
+                Self::subtract_owner_regions(owner_locks, lock.start, lock.end);
                 if owner_locks.is_empty() {
                     self.plock.remove(&key);
                 }
@@ -191,6 +237,11 @@ impl LockMeta {
 
         if let Some(conflict) = self.check_plock_conflict(&lock, expire_ms) {
             return Some(conflict);
+        }
+
+        self.purge_expired_plocks(expire_ms);
+        if let Some(owner_locks) = self.plock.get_mut(&key) {
+            Self::subtract_owner_regions(owner_locks, lock.start, lock.end);
         }
 
         lock.acquire_time = LocalTime::mills();
@@ -459,5 +510,112 @@ mod tests {
         let lock2 = create_flock("client2", 200, LockType::ReadLock);
         let conflict = meta.check_conflict(&lock2, expire_ms);
         assert!(conflict.is_none(), "read locks should not conflict");
+    }
+
+    #[test]
+    fn test_getlk_reports_earliest_conflicting_plock() {
+        let mut meta = LockMeta::default();
+        let expire_ms = 3000;
+
+        assert!(meta
+            .set_lock(
+                create_plock("client1", 100, LockType::WriteLock, 10, 14),
+                expire_ms
+            )
+            .is_none());
+        assert!(meta
+            .set_lock(
+                create_plock("client1", 100, LockType::ReadLock, 1, 5),
+                expire_ms
+            )
+            .is_none());
+
+        let query = create_plock("client2", 200, LockType::WriteLock, 0, u64::MAX);
+        let conflict = meta.check_conflict(&query, expire_ms).expect("conflict");
+        assert_eq!(conflict.lock_type, LockType::ReadLock);
+        assert_eq!(conflict.start, 1);
+        assert_eq!(conflict.end, 5);
+        assert_eq!(conflict.pid, 1000);
+    }
+
+    #[test]
+    fn test_partial_unlock_splits_plock_region() {
+        let mut meta = LockMeta::default();
+        let expire_ms = 3000;
+
+        assert!(meta
+            .set_lock(
+                create_plock("client1", 100, LockType::WriteLock, 10, 14),
+                expire_ms
+            )
+            .is_none());
+        assert!(meta
+            .set_lock(
+                create_plock("client1", 100, LockType::UnLock, 5, 10),
+                expire_ms
+            )
+            .is_none());
+
+        let locks = meta.to_vec();
+        assert_eq!(locks.len(), 1);
+        assert_eq!(locks[0].start, 11);
+        assert_eq!(locks[0].end, 14);
+        assert_eq!(locks[0].lock_type, LockType::WriteLock);
+    }
+
+    #[test]
+    fn test_same_owner_overlapping_plock_replaces_region() {
+        let mut meta = LockMeta::default();
+        let expire_ms = 3000;
+
+        assert!(meta
+            .set_lock(
+                create_plock("client1", 100, LockType::WriteLock, 0, 100),
+                expire_ms
+            )
+            .is_none());
+        assert!(meta
+            .set_lock(
+                create_plock("client1", 100, LockType::WriteLock, 50, 60),
+                expire_ms
+            )
+            .is_none());
+
+        let mut locks = meta.to_vec();
+        locks.sort_by_key(|lock| lock.start);
+        assert_eq!(locks.len(), 3);
+        assert_eq!(locks[0].start, 0);
+        assert_eq!(locks[0].end, 49);
+        assert_eq!(locks[1].start, 50);
+        assert_eq!(locks[1].end, 60);
+        assert_eq!(locks[2].start, 61);
+        assert_eq!(locks[2].end, 100);
+    }
+
+    #[test]
+    fn test_partial_unlock_splits_plock_interior_hole() {
+        let mut meta = LockMeta::default();
+        let expire_ms = 3000;
+
+        assert!(meta
+            .set_lock(
+                create_plock("client1", 100, LockType::WriteLock, 10, 20),
+                expire_ms
+            )
+            .is_none());
+        assert!(meta
+            .set_lock(
+                create_plock("client1", 100, LockType::UnLock, 12, 15),
+                expire_ms
+            )
+            .is_none());
+
+        let mut locks = meta.to_vec();
+        locks.sort_by_key(|lock| lock.start);
+        assert_eq!(locks.len(), 2);
+        assert_eq!(locks[0].start, 10);
+        assert_eq!(locks[0].end, 11);
+        assert_eq!(locks[1].start, 16);
+        assert_eq!(locks[1].end, 20);
     }
 }

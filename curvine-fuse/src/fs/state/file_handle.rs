@@ -107,6 +107,12 @@ impl FileHandle {
         }
     }
 
+    pub fn take_plock_if_owner(&self, owner_id: u64) -> Option<u64> {
+        match self {
+            FileHandle::Backend(h) => h.take_plock_if_owner(owner_id),
+        }
+    }
+
     pub async fn resize(&self, opts: FileAllocOpts) -> FuseResult<()> {
         match self {
             FileHandle::Backend(h) => {
