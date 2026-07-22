@@ -29,6 +29,7 @@ use std::sync::Arc;
 enum WriterTask {
     Flush(CallSender<i8>),
     Complete((bool, CallSender<i8>)),
+    Cancel(CallSender<FsResult<()>>),
     Seek((i64, CallSender<i8>)),
     Resize((FileAllocOpts, CallSender<FileBlocks>)),
 }
@@ -36,6 +37,21 @@ enum WriterTask {
 enum SelectTask {
     Control(WriterTask),
     Data(DataSlice),
+}
+
+async fn recv_task(
+    chunk_receiver: &mut AsyncReceiver<DataSlice>,
+    task_receiver: &mut AsyncReceiver<WriterTask>,
+) -> Option<SelectTask> {
+    tokio::select! {
+        biased;
+
+        // Control tasks take priority. Flush/complete/seek/resize drain the data
+        // queue explicitly, while cancel intentionally does not; prioritizing
+        // data here would keep writing queued chunks after cancellation arrived.
+        task = task_receiver.recv() => task.map(SelectTask::Control),
+        chunk = chunk_receiver.recv() => chunk.map(SelectTask::Data),
+    }
 }
 
 struct BufferChannel {
@@ -74,6 +90,16 @@ impl BufferChannel {
             self.task_sender.send(WriterTask::Flush(tx)).await?;
             rx.receive().await?;
             Ok::<(), IOError>(())
+        };
+        fun.await.map_err(|e| self.check_error(e))
+    }
+
+    async fn cancel(&mut self) -> FsResult<()> {
+        let fun = async {
+            let (tx, rx) = CallChannel::channel();
+            self.task_sender.send(WriterTask::Cancel(tx)).await?;
+            rx.receive().await??;
+            Ok::<(), FsError>(())
         };
         fun.await.map_err(|e| self.check_error(e))
     }
@@ -188,6 +214,10 @@ impl FsWriterBuffer {
         self.writer.flush().await
     }
 
+    pub async fn cancel(&mut self) -> FsResult<()> {
+        self.writer.cancel().await
+    }
+
     pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
         self.writer.seek(pos).await?;
         self.pos = pos;
@@ -208,22 +238,9 @@ impl FsWriterBuffer {
     ) -> FsResult<()> {
         loop {
             // The queue can be written and controlled to complete any future.
-            let select_task = tokio::select! {
-                biased;
-
-                chunk = chunk_receiver.recv() => {
-                   let Some(chunk) = chunk else {
-                        return Ok(())
-                    };
-                   SelectTask::Data(chunk)
-                }
-
-                task = task_receiver.recv() => {
-                    let Some(task) = task else {
-                        return Ok(())
-                    };
-                    SelectTask::Control(task)
-                }
+            let select_task = match recv_task(&mut chunk_receiver, &mut task_receiver).await {
+                Some(task) => task,
+                None => return Ok(()),
             };
 
             match select_task {
@@ -242,6 +259,16 @@ impl FsWriterBuffer {
                         }
                         writer.complete().await?;
                         tx.send(1)?;
+                        return Ok(());
+                    }
+
+                    WriterTask::Cancel(tx) => {
+                        // Do not drain chunk_receiver: queued chunks are
+                        // uncommitted data and cancellation intentionally drops
+                        // them. FsWriterBase::cancel attempts every active block
+                        // writer before returning its first error.
+                        let res = writer.cancel().await;
+                        tx.send(res)?;
                         return Ok(());
                     }
 
@@ -277,5 +304,31 @@ impl FsWriterBuffer {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{recv_task, SelectTask, WriterTask};
+    use bytes::Bytes;
+    use curvine_common::FsResult;
+    use orpc::sync::channel::{AsyncChannel, CallChannel};
+    use orpc::sys::DataSlice;
+
+    #[tokio::test]
+    async fn cancel_control_preempts_queued_data() {
+        let (chunk_tx, mut chunk_rx) = AsyncChannel::new(2).split();
+        let (task_tx, mut task_rx) = AsyncChannel::new(2).split();
+        chunk_tx
+            .send(DataSlice::Bytes(Bytes::from_static(b"queued")))
+            .await
+            .unwrap();
+        let (cancel_tx, _cancel_rx) = CallChannel::channel::<FsResult<()>>();
+        task_tx.send(WriterTask::Cancel(cancel_tx)).await.unwrap();
+
+        assert!(matches!(
+            recv_task(&mut chunk_rx, &mut task_rx).await,
+            Some(SelectTask::Control(WriterTask::Cancel(_)))
+        ));
     }
 }

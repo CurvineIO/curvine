@@ -14,6 +14,7 @@
 
 use crate::block::BlockWriter;
 use crate::file::{FsClient, FsContext};
+use curvine_common::error::FsError;
 use curvine_common::fs::Path;
 use curvine_common::state::{FileAllocOpts, FileBlocks, FileStatus, WriteFileBlocks};
 use curvine_common::FsResult;
@@ -156,6 +157,33 @@ impl FsWriterBase {
     pub async fn complete(&mut self) -> FsResult<()> {
         self.complete0(false).await?;
         Ok(())
+    }
+
+    /// Cancel every block writer that still owns an uncommitted backend write
+    /// session. Cleanup is best effort: keep the first error for the caller, but
+    /// continue cancelling the remaining writers before dropping their state.
+    pub async fn cancel(&mut self) -> FsResult<()> {
+        let mut first_error: Option<FsError> = None;
+
+        if let Some(mut writer) = self.cur_writer.take() {
+            if let Err(e) = writer.cancel().await {
+                first_error = Some(e);
+            }
+        }
+
+        for (_, writer) in self.cache_writers.iter_mut() {
+            if let Err(e) = writer.cancel().await {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+        self.cache_writers.clear();
+
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     async fn complete0(&mut self, only_flush: bool) -> FsResult<Option<FileBlocks>> {
