@@ -17,8 +17,8 @@ use crate::master::meta::inode::{Inode, EMPTY_PARENT_ID};
 use crate::master::meta::store::InodeStore;
 use crate::master::meta::{BlockMeta, InodeId};
 use curvine_common::state::{
-    BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileType,
-    StoragePolicy,
+    is_special_file_type, BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts,
+    FileType, StoragePolicy,
 };
 use curvine_common::FsResult;
 use orpc::common::LocalTime;
@@ -110,7 +110,7 @@ impl InodeFile {
             parent_id: EMPTY_PARENT_ID,
         };
 
-        if !opts.sync_ufs_meta {
+        if !opts.sync_ufs_meta && !is_special_file_type(opts.file_type) {
             file.features.set_writing(opts.client_name);
         }
         if !opts.x_attr.is_empty() {

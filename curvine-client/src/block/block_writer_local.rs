@@ -18,10 +18,10 @@ use curvine_common::error::FsError;
 use curvine_common::state::{ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use orpc::common::Utils;
+use orpc::err_box;
 use orpc::io::LocalFile;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::{DataSlice, RawPtr};
-use orpc::{err_box, try_option};
 use std::sync::Arc;
 
 pub struct BlockWriterLocal {
@@ -59,7 +59,20 @@ impl BlockWriterLocal {
             )
             .await?;
 
-        let path = try_option!(write_context.path);
+        let path = match write_context.path {
+            Some(p) => p,
+            None => {
+                // No local path available (e.g. SPDK bdev without filesystem path).
+                // Abort the block on the server before returning so state is clean.
+                let _ = client
+                    .write_commit(&block, pos, block_size, req_id, 0, true)
+                    .await;
+                return Err(FsError::no_local_path(format!(
+                    "no local path for block {} (storage type {:?})",
+                    block.id, block.storage_type
+                )));
+            }
+        };
         let file = LocalFile::with_write_offset(path, false, pos)?;
 
         let writer = Self {

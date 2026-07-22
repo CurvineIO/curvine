@@ -29,8 +29,8 @@ use curvine_common::conf::{ClusterConf, FuseConf};
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path, RpcCode, StateReader, StateWriter};
 use curvine_common::state::{
-    FileAllocMode, FileAllocOpts, FileLock, FileStatus, FileType, LockFlags, LockType, OpenFlags,
-    SetAttrOpts,
+    is_special_file_type, FileAllocMode, FileAllocOpts, FileLock, FileStatus, FileType, LockFlags,
+    LockType, OpenFlags, SetAttrOpts,
 };
 use curvine_common::MAX_FILE_SIZE;
 use log::{debug, info, warn};
@@ -1006,12 +1006,25 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn read(&self, op: Read<'_>, reply: FuseResponse) -> FuseResult<()> {
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
+        if is_special_file_type(handle.status().file_type) {
+            return err_fuse!(
+                libc::EOPNOTSUPP,
+                "read not supported for special file nodes"
+            );
+        }
         handle.read(&self.state, op, reply).await
     }
 
     async fn open(&self, op: Open<'_>) -> FuseResult<fuse_open_out> {
         let action = OpenAction::try_from(op.arg.flags)?;
         let path = self.state.get_path(op.header.nodeid)?;
+        let status = self.state.fs_stat(op.header.nodeid, None).await?;
+        if is_special_file_type(status.file_type) {
+            return err_fuse!(
+                libc::EOPNOTSUPP,
+                "open not supported for special file nodes"
+            );
+        }
         let truncate = (op.arg.flags & libc::O_TRUNC as u32) != 0;
         if action.write() || truncate {
             self.ensure_writable_path(&path, RpcCode::CreateFile)
@@ -1113,6 +1126,12 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn write(&self, op: Write<'_>, reply: FuseResponse) -> FuseResult<()> {
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
+        if is_special_file_type(handle.status().file_type) {
+            return err_fuse!(
+                libc::EOPNOTSUPP,
+                "write not supported for special file nodes"
+            );
+        }
         handle.write(op, reply).await
     }
 
@@ -1344,7 +1363,8 @@ impl fs::FileSystem for CurvineFileSystem {
     /// This function handles the creation of file system nodes:
     /// - For regular files: delegates to `create()` and immediately closes the handle
     /// - For directories: delegates to `mkdir()`
-    /// - For other types (devices, fifos, etc.): returns EPERM error
+    /// - For char/block/fifo device nodes: creates metadata-only special nodes
+    /// - For other types (sockets, etc.): returns EPERM error
     ///
     /// # Arguments
     /// * `op` - MkNod operation containing:
@@ -1356,6 +1376,11 @@ impl fs::FileSystem for CurvineFileSystem {
     /// * `Ok(fuse_entry_out)` - Entry information for the created node
     /// * `Err(FuseError)` - Error if creation fails or unsupported type
     async fn mk_nod(&self, op: MkNod<'_>) -> FuseResult<fuse_entry_out> {
+        let name = try_option!(op.name.to_str());
+        if name.len() > FUSE_MAX_NAME_LENGTH {
+            return err_fuse!(libc::ENAMETOOLONG);
+        }
+
         if FuseUtils::s_isreg(op.arg.mode) {
             let create_in = fuse_create_in {
                 flags: OpenFlags::new_create().value(),
@@ -1392,6 +1417,14 @@ impl fs::FileSystem for CurvineFileSystem {
                 name: op.name,
             };
             self.mkdir(op).await
+        } else if let Some(file_type) = FuseUtils::special_file_type_from_mode(op.arg.mode) {
+            let path = self.state.get_path_name(op.header.nodeid, name)?;
+            self.ensure_writable_path(&path, RpcCode::CreateFile)
+                .await?;
+            let opts = FuseUtils::mknod_opts(&op, &self.fs, file_type);
+            self.fs.create_special_node(&path, opts).await?;
+            let attr = self.state.lookup_common(op.header.nodeid, name).await?;
+            Ok(FuseUtils::create_entry_out(&self.conf, attr))
         } else {
             err_fuse!(libc::EPERM)
         }

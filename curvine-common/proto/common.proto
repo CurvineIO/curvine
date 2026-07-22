@@ -35,6 +35,9 @@ enum FileTypeProto {
     FILE_TYPE_PROTO_STREAM = 3;
     FILE_TYPE_PROTO_AGG = 4;
     FILE_TYPE_PROTO_OBJECT = 5;
+    FILE_TYPE_PROTO_FIFO = 6;
+    FILE_TYPE_PROTO_CHAR = 7;
+    FILE_TYPE_PROTO_BLOCK = 8;
 }
 
 enum StorageStateProto {
@@ -107,6 +110,7 @@ message LocatedBlockProto {
     required ExtendedBlockProto block = 1;
     required int64 offset = 2;
     repeated WorkerAddressProto locs = 3;
+    optional bool has_spdk = 4 [default = false];
 }
 
 // All block information in the file.
