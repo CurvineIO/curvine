@@ -536,21 +536,14 @@ impl CurvineFileSystem {
         }
     }
 
-    /// Negotiate the init reply flags as an explicit allowlist rather than
-    /// blindly echoing every kernel-offered capability.
-    ///
-    /// Two categories:
-    /// 1. Kernel-negotiated caps: `SUPPORTED_INIT_FLAGS & kernel_flags` — only
-    ///    bits the daemon implements AND the kernel offered. This inherently
-    ///    excludes `FUSE_ATOMIC_O_TRUNC` (open does not truncate, #1122),
-    ///    `FUSE_POSIX_ACL`, `FUSE_HAS_IOCTL_DIR`, and any unknown/future bit,
-    ///    since none are in `SUPPORTED_INIT_FLAGS`. `FUSE_MAX_PAGES` survives
-    ///    only when the kernel offers it.
-    /// 2. Config-gated daemon-requested caps, forced on (NOT masked by the
-    ///    kernel offer): `FUSE_WRITEBACK_CACHE` when `write_back_cache`, and the
-    ///    `FUSE_SPLICE_*` bits when `enable_splice`. Splice is driven by the
-    ///    channel talking splice(2) on the fuse fd directly, independent of an
-    ///    init-flag offer, so it must be advertised on config alone.
+    /// Negotiate init reply flags as an explicit allowlist, not a blind echo:
+    /// 1. Kernel-negotiated: `SUPPORTED_INIT_FLAGS & kernel_flags` (only caps the
+    ///    daemon implements AND the kernel offered — see `SUPPORTED_INIT_FLAGS` for
+    ///    what that deliberately excludes).
+    /// 2. Config-gated, forced on regardless of the kernel offer:
+    ///    `FUSE_WRITEBACK_CACHE` (when `write_back_cache`) and `FUSE_SPLICE_*` (when
+    ///    `enable_splice` — splice drives the fuse fd directly, so it is advertised
+    ///    on config alone).
     fn negotiate_out_flags(kernel_flags: u32, write_back_cache: bool, enable_splice: bool) -> u32 {
         let mut out = SUPPORTED_INIT_FLAGS & kernel_flags;
         if write_back_cache {
@@ -1068,24 +1061,13 @@ impl fs::FileSystem for CurvineFileSystem {
         let keep_cache = if self.conf.direct_io {
             false
         } else {
-            // Page cache consistency is handled here rather than via explicit inode
-            // invalidation notifications, for two reasons:
-            //
-            // 1. Sending inode-invalidation notifications (FUSE_NOTIFY_INVAL_INODE) on
-            //    some older kernel versions can trigger a deadlock inside send_inode_out.
-            //
-            // 2. On open, the kernel always issues a fresh getattr to the FUSE daemon
-            //    regardless of whether the attr cache is still valid.  The kernel then
-            //    compares mtime and file size; if either has changed it automatically
-            //    invalidates the page cache for that inode.  This behaviour is governed
-            //    by the CAP_AUTO_INVAL_DATA capability (available since Linux 2.6.35,
-            //    enabled by default), so no additional notification is required from
-            //    our side.
-            //
-            // Note: if the user-space metadata cache (enable_meta_cache) is enabled,
-            // keep_cache may return true even after a remote modification, causing stale
-            // reads.  This is intentional — metadata caching trades strict consistency
-            // for performance, and callers that enable it accept this trade-off.
+            // Page cache consistency is handled here, not via explicit inode
+            // invalidation, because: (1) FUSE_NOTIFY_INVAL_INODE can deadlock inside
+            // send_inode_out on some older kernels; (2) on open the kernel issues a
+            // fresh getattr and auto-invalidates the page cache if mtime/size changed
+            // (CAP_AUTO_INVAL_DATA, on by default since Linux 2.6.35), so no notify is
+            // needed. Note: with enable_meta_cache, keep_cache may return true after a
+            // remote modification (stale reads) — an intentional consistency/perf trade.
             self.state.keep_cache(ino, &handle.status())
         };
         let open_flags = FuseUtils::file_open_flags(&self.conf, keep_cache);
@@ -1390,23 +1372,11 @@ impl fs::FileSystem for CurvineFileSystem {
         Ok(())
     }
 
-    /// Create a file system node (mknod system call)
-    ///
-    /// This function handles the creation of file system nodes:
-    /// - For regular files: delegates to `create()` and immediately closes the handle
-    /// - For directories: delegates to `mkdir()`
-    /// - For char/block/fifo device nodes: creates metadata-only special nodes
-    /// - For other types (sockets, etc.): returns EPERM error
-    ///
-    /// # Arguments
-    /// * `op` - MkNod operation containing:
-    ///   - `mode`: file type and permissions
-    ///   - `umask`: file creation mask
-    ///   - `name`: name of the node to create
-    ///
-    /// # Returns
-    /// * `Ok(fuse_entry_out)` - Entry information for the created node
-    /// * `Err(FuseError)` - Error if creation fails or unsupported type
+    /// Create a filesystem node (`mknod`):
+    /// - regular file: delegates to `create()` then closes the handle;
+    /// - directory: delegates to `mkdir()`;
+    /// - char/block/fifo: creates a metadata-only special node;
+    /// - other types (sockets, …): returns EPERM.
     async fn mk_nod(&self, op: MkNod<'_>) -> FuseResult<fuse_entry_out> {
         let name = try_option!(op.name.to_str());
         if name.len() > FUSE_MAX_NAME_LENGTH {
@@ -1608,29 +1578,13 @@ mod tests {
         assert_eq!(zero_range.errno, libc::EOPNOTSUPP);
     }
 
-    /// Pin the production init-order invariant the event-driven gauges depend on:
-    /// `FuseMetrics::ensure_init()` MUST run before `NodeState::new()` in
-    /// `CurvineFileSystem::new`. Since the scrape-time `set_metrics()` refresh
-    /// was removed, the legacy gauges are only correct if their
-    /// event-driven updates (routed through `FuseMetrics::with`) land on an
-    /// initialized singleton; the `NodeMap::new` root baseline `set(1)` is the
-    /// first such update and fires inside `NodeState::new`. If a refactor moved
-    /// `ensure_init()` after `NodeState::new` (or dropped it), that baseline —
-    /// and every subsequent inc/dec — would be silently no-op'd by `with`, and
-    /// the gauges would drift permanently low with no panic.
-    ///
-    /// A behavioral assertion (construct, then check the singleton is init) is
-    /// useless here: the process-global `OnceCell` is already initialized by
-    /// other tests in this binary, so it would pass even if `ensure_init` were
-    /// deleted. We assert on the source text instead, which catches both a
-    /// reordering and an outright removal.
-    ///
-    /// The search is scoped to the body of `fn new` so the literals in this
-    /// test's own doc comment / assert message do not satisfy `find()` — that
-    /// self-reference would make the `.expect` guards dead (the strings always
-    /// exist in this file) and let a removal of the real call slip through by
-    /// matching the prose instead. Slicing to `fn new` keeps `.expect` a real
-    /// "the call was deleted" guard.
+    /// Pin that `FuseMetrics::ensure_init()` runs before `NodeState::new()` in
+    /// `CurvineFileSystem::new`: the event-driven gauges are silently no-op'd by
+    /// `with()` (drifting permanently low, no panic) if a mutation fires before
+    /// init. A behavioral check is useless (the process-global `OnceCell` is
+    /// already init by other tests in this binary), so we assert on the source
+    /// text — scoped to the body of `fn new`, so this test's own doc/assert
+    /// literals don't satisfy `find()` and mask a real removal.
     #[test]
     fn ensure_init_precedes_node_state() {
         let src = include_str!("curvine_file_system.rs");

@@ -171,21 +171,14 @@ impl FuseResponse {
         }
     }
 
-    /// Build the reply task and enqueue it. The single finish entry point for a
-    /// replied request:
-    ///
-    /// - metrics enabled: stash status/errno, `take()` the active guard out of
-    ///   the shared slot (move-only, exactly once), mark `finished`, then send a
-    ///   `RequestReply`. All slot access is scoped *before* the `.await` so the
-    ///   `parking_lot` guard is never held across the await. **If the enqueue
-    ///   fails**, the request never reaches the sender, so we re-lock and correct
-    ///   `request_status` to `Error` (the `Pending → FinishedEarly(enqueue err)`
-    ///   transition) while leaving `op_status` as the FS-operation result.
-    /// - metrics disabled: send the legacy `Reply`.
-    ///
-    /// `status`/`errno` are computed by the caller (which still holds the typed
-    /// result); they cannot be derived from the enqueue outcome because a
-    /// successful enqueue of an error frame returns `Ok(())`.
+    /// Build the reply task and enqueue it — the single finish entry point for a
+    /// replied request. Metrics enabled: stash status/errno, `take()` the active
+    /// guard from the shared slot (all slot access scoped before the `.await`, so
+    /// the `parking_lot` guard never crosses it), mark `finished`, send a
+    /// `RequestReply`; on enqueue failure, re-lock and correct `request_status` to
+    /// `Error` (leaving `op_status` as the FS result). Metrics disabled: legacy
+    /// `Reply`. `status`/`errno` come from the caller — a successful enqueue of an
+    /// error frame returns `Ok(())`, so they can't be derived from the outcome.
     async fn finish_request(
         &self,
         data: ResponseData,
@@ -198,18 +191,13 @@ impl FuseResponse {
             Some(slot) => slot,
         };
 
-        // **Cancellation safety on bounded channels.** A bounded `send().await`
-        // can suspend (channel full); if the holding task is cancelled mid-await,
-        // the task — and the `ActiveGuard` moved into it — is dropped, decrementing
-        // `active_requests` but emitting NO terminal metric. To avoid that
-        // "silent finish", on bounded channels we first `reserve()` a permit
-        // WITHOUT touching the slot. The only suspendable point is the reserve;
-        // if cancelled there, the slot is still `finished=false` and the guard is
-        // still in the slot, so the request is simply dropped (guard decremented
-        // by its own Drop) with no half-finished state. Once the permit is in
-        // hand, we commit the slot and `permit.send(...)` synchronously (no await,
-        // cannot be cancelled). Unbounded `send` is already synchronous, so it
-        // keeps the simple commit-then-send fast path.
+        // Cancellation safety on bounded channels: a bounded `send().await` can
+        // suspend when full, and cancellation there would drop the guard (dec'ing
+        // `active_requests`) while emitting NO terminal metric. So on bounded
+        // channels we `reserve()` a permit FIRST without touching the slot (the only
+        // suspendable point); if cancelled there the slot is untouched and the
+        // request is cleanly dropped. Once the permit is in hand we commit the slot
+        // and `permit.send(...)` synchronously. Unbounded `send` is already sync.
         if self.sender.is_bounded() {
             let permit = match self.sender.reserve().await {
                 Ok(p) => p,
@@ -422,17 +410,12 @@ impl FuseResponse {
         }
     }
 
-    /// Finish a request that errored **before** any reply could be produced —
-    /// e.g. a structural `parse_operator()` failure after the context was
-    /// created. Drops the active guard and marks the slot `finished` so the
-    /// `active_requests` count cannot leak, but enqueues **no** task and emits
-    /// no `requests_total` (the request never dispatched).
-    ///
-    /// `reason` is the `&'static str` parse-failure reason
-    /// (`short_read`/`invalid_header`/`length_mismatch`/`other`) — stashed now,
-    /// read by `decode_errors_total{phase="parse",reason}`. A
-    /// reason rather than an errno is carried because structural parse failures
-    /// have no stable OS errno; `errno` is kept too for diagnostics.
+    /// Finish a request that errored BEFORE any reply (e.g. a `parse_operator()`
+    /// failure after the ctx was created): drop the active guard and mark the slot
+    /// `finished` so `active_requests` can't leak, but enqueue NO task and emit no
+    /// `requests_total` (never dispatched). `reason` (stashed for
+    /// `decode_errors_total{phase=parse}`) is carried instead of an errno because
+    /// structural parse failures have no stable OS errno.
     pub(crate) fn finish_early(&self, errno: i32, reason: &'static str) {
         if let Some(slot) = &self.metrics {
             {
@@ -528,16 +511,11 @@ impl FuseResponse {
 
     /// Metrics-enabled `send_notify`: enqueue a `NotifyReply` carrying a
     /// `reply_queue_depth` guard, using the same reserve-first discipline as the
-    /// request reply path so a producer blocked on a full bounded channel is not
-    /// counted as backlog. The guard is created only *after* the enqueue boundary
-    /// is committed (bounded: permit acquired; unbounded: just before the
-    /// synchronous send), and rides on the task to the sender's dequeue point.
-    ///
-    /// `enqueue_failed` is recorded at every point the notify fails to enter the
-    /// channel — the bounded `reserve()` error path (NEW: previously only the
-    /// `send()` error was counted) and the unbounded `send()` error path. A
-    /// *cancelled* bounded `reserve().await` is not a failure: no guard was
-    /// created and nothing is recorded.
+    /// reply path (guard created only after the enqueue boundary is committed, so a
+    /// producer blocked on a full channel isn't counted as backlog). `enqueue_failed`
+    /// is recorded on both the bounded `reserve()` and unbounded `send()` error
+    /// paths; a cancelled `reserve().await` is not a failure (no guard, nothing
+    /// recorded).
     async fn send_notify_metrics(&self, code: FuseNotifyCode, data: ResponseData) -> IOResult<()> {
         let code_str = code.as_str();
 
@@ -1779,21 +1757,13 @@ mod tests {
         assert_eq!(active_g.get(), 0, "and the active guard too");
     }
 
-    // bounded-full reserve-first does NOT inflate queue depth. The real
-    // `commit_reply_task` creates the queue guard only AFTER a permit is acquired
-    // (see `finish_request`), so a producer parked in `reserve().await` on a full
-    // channel holds no guard.
-    //
-    // SCOPE: this is a PROTOCOL-LEVEL STAND-IN, not a real
-    // blocked-producer test. It asserts the reserve-first invariant directly
-    // against a full bounded channel (`try_reserve()` yields no permit -> no guard
-    // built -> local gauge stays 0); it does NOT drive `FuseResponse::finish_request`
-    // through a pending `reserve().await` and observe the guard's absence while the
-    // send future is parked. The cancellation half of that production path —
-    // `reserve()` cancelled mid-await leaves the slot unfinished — IS covered by
-    // `bounded_reserve_cancellation_leaves_slot_unfinished`. Driving a genuinely
-    // parked producer + observing queue depth would need the shared global gauge
-    // (parallel-unsafe) or a custom waker harness; deferred as not worth the flake.
+    // bounded-full reserve-first does NOT inflate queue depth: the queue guard is
+    // created only AFTER a permit is acquired, so a producer parked in
+    // `reserve().await` holds none. A PROTOCOL-LEVEL STAND-IN — it asserts the
+    // invariant against a full channel (`try_reserve()` -> no permit -> gauge 0),
+    // not a genuinely parked producer (which would need the shared global gauge or
+    // a waker harness). The cancellation half is covered by
+    // `bounded_reserve_cancellation_leaves_slot_unfinished`.
     #[tokio::test]
     async fn reply_queue_depth_bounded_full_does_not_inflate() {
         let queue_g = m::new_gauge("qd_bounded_full_queue", "test").unwrap();

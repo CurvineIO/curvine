@@ -99,15 +99,11 @@ pub(crate) const IO_TYPE_RELEASE: &str = "release";
 pub(crate) const PATH_TYPE_CURVINE: &str = "curvine";
 #[cfg_attr(not(test), allow(dead_code))] // value produced by path_type(); fuse-side use is test-only.
 pub(crate) const PATH_TYPE_UFS: &str = "ufs";
-// ⚠ `fallback` is the READER WRAPPER TYPE, not the backend a given read actually
-// hit. `UnifiedReader::Fallback(FallbackFsReader)` tries Curvine first and only
-// switches to UFS after a worker error, but `path_type` is captured ONCE at handle
-// construction — so a long-lived fallback-capable reader reports EVERY read
-// (including Curvine cache hits) as `fallback`. Read it as "this handle is
-// fallback-capable", NOT "this read fell back to UFS". A precise per-read backend
-// label would need the reader to surface its actual outcome per `fuse_read`
-// (deferred to a behaviour PR). Dashboards must not treat `fallback` latency/bytes
-// as real UFS-fallback IO.
+// ⚠ `fallback` is the READER WRAPPER TYPE, not the backend a read actually hit:
+// `path_type` is captured once at handle construction, so a fallback-capable
+// reader reports EVERY read (incl. Curvine cache hits) as `fallback`. Read it as
+// "this handle is fallback-capable", NOT "this read fell back to UFS" — dashboards
+// must not treat `fallback` latency/bytes as real UFS-fallback IO.
 #[cfg_attr(not(test), allow(dead_code))] // reader-only Fallback variant; fuse-side use is test-only.
 pub(crate) const PATH_TYPE_FALLBACK: &str = "fallback";
 #[cfg_attr(not(test), allow(dead_code))] // value produced by path_type(); fuse-side use is test-only.
@@ -484,28 +480,18 @@ impl FuseMetrics {
             .expect("FuseMetrics not initialized; call ensure_init from CurvineFileSystem::new")
     }
 
-    /// Run `f` against the metrics singleton iff it has been initialized; a
-    /// no-op when not (instead of `get()`'s panic).
+    /// Run `f` against the metrics singleton iff initialized; a silent no-op when
+    /// not (instead of `get()`'s panic).
     ///
-    /// This is the access path for the **legacy compatibility gauges**
-    /// (`inode_num` / `file_handle_num` / `dir_handle_num`) **and their
-    /// namespaced aliases** (`curvine_fuse_{inode,file_handle,dir_handle}_count`),
-    /// which are updated unconditionally (event-driven) at their inode/handle
-    /// mutation sites, in lockstep. Those sites live in `NodeState`/`NodeMap`, whose unit tests
-    /// construct state with a bare `NodeState::new` and never call
-    /// `ensure_init()`; routing every gauge write through `with()` keeps them
-    /// from panicking on the uninitialized singleton. The aliases MUST use this
-    /// same `with()` path — do NOT switch them to `FuseMetrics::get()`, which
-    /// would reintroduce that panic on the bare-`NodeState` test paths.
-    ///
-    /// The uninit branch is a deliberate, silent no-op — NOT a `debug_assert!`.
-    /// Tests run in debug with a process-global `OnceCell` whose init order
-    /// across parallel tests is unspecified, so a `node_state` test that fires
-    /// a mutation before any `ensure_init()` would trip the assert and reintroduce
-    /// exactly the flakiness this helper removes. The production invariant
-    /// (`ensure_init()` before `NodeState::new`) is instead pinned by the
-    /// `ensure_init_precedes_node_state` test below, which is the right place to
-    /// catch an ordering regression.
+    /// This is the access path for the legacy compatibility gauges and their
+    /// namespaced aliases, updated event-driven at inode/handle mutation sites in
+    /// `NodeState`/`NodeMap` — whose unit tests use a bare `NodeState::new` without
+    /// `ensure_init()`. Routing every gauge write through `with()` keeps those from
+    /// panicking; the aliases MUST use this path too — do NOT switch them to
+    /// `FuseMetrics::get()`. The uninit branch is a no-op, NOT a `debug_assert!`
+    /// (parallel tests have unspecified `OnceCell` init order). The production
+    /// invariant (`ensure_init()` before `NodeState::new`) is pinned by
+    /// `ensure_init_precedes_node_state`.
     pub(crate) fn with<F: FnOnce(&Self)>(f: F) {
         if let Some(m) = FUSE_METRICS.get() {
             f(m);
@@ -894,25 +880,18 @@ impl FuseMetrics {
             .observe(elapsed_us as f64);
     }
 
-    /// The full sender finish emission: request total + duration, response
-    /// write latency/bytes, the `reply_write` stage, and the per-status error /
-    /// unsupported / interrupted / delivery-failure counters. Pure (no IO), so
-    /// it is unit-testable without a kernel fd.
+    /// The full sender finish emission (request total + duration, response
+    /// write latency/bytes, `reply_write` stage, per-status counters). Pure, so
+    /// unit-testable without a kernel fd.
     ///
-    /// **Two statuses, deliberately separate** (design doc "operation vs request
-    /// status"):
-    /// - `op_status` — the FS-operation result. Drives `errors_total` /
-    ///   `unsupported_total` / `interrupted_total`, which carry the real errno /
-    ///   reason. A delivery failure does NOT change these (a write failure on a
-    ///   successful op is not an FS error).
-    /// - `request_status` — the final result the kernel observes. Equal to
-    ///   `op_status` on the common path, but `Error` when delivery fails (the
-    ///   `WriteOutcome::Failed` case here, or enqueue failure on the early-finish
-    ///   path). Drives `requests_total` / `request_duration_us` /
-    ///   `response_write_duration_us` / `response_bytes_total`.
+    /// Two statuses, deliberately separate:
+    /// - `op_status` — the FS result. Drives `errors_total` / `unsupported_total`
+    ///   / `interrupted_total`; a delivery failure does NOT change these.
+    /// - `request_status` — what the kernel observes: `op_status`, but `Error` when
+    ///   delivery/enqueue fails. Drives `requests_total` / `request_duration_us` /
+    ///   `response_write_*`.
     ///
-    /// The kernel-fd write errno itself is the independent delivery dimension and
-    /// lands in `response_write_errors_total{opcode,errno}`.
+    /// The write errno itself lands in `response_write_errors_total{opcode,errno}`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_request_finish(
         &self,
@@ -1098,20 +1077,12 @@ impl FuseMetrics {
 
     // --- emission helpers ---
 
-    /// Observe the metadata operation latency once around the whole
-    /// `dispatch_meta` match, feeding **two** families from one timer (the same
-    /// dual-emit shape as the `stream_io` call site):
-    /// - `operation_duration_us{opcode,kind=metadata,status}` — per-opcode detail.
-    /// - `stage_duration_us{stage=operation,kind=metadata,status}` — the
-    ///   opcode-free stage view, so the operation stage is comparable against the
-    ///   other framework stages (`reply_enqueue`/`reply_write`/`meta_spawn`) at
-    ///   bounded cardinality.
-    ///
-    /// `status` is the stashed `op_status` (FS-operation result), read back after
-    /// the match — NOT the enqueue outcome. The duration includes the awaited
-    /// reply enqueue by construction. It does NOT call `record_op_terminal`: the
-    /// request terminal path already counted the op outcome; this only observes
-    /// latency.
+    /// Observe metadata operation latency once around the whole `dispatch_meta`
+    /// match, feeding two families from one timer: per-opcode
+    /// `operation_duration_us{opcode,kind=metadata,status}` and the opcode-free
+    /// `stage_duration_us{stage=operation,...}`. `status` is the stashed `op_status`
+    /// (FS result), not the enqueue outcome. Only observes latency — the request
+    /// terminal already counted the op outcome (does NOT call `record_op_terminal`).
     pub(crate) fn record_operation(
         &self,
         opcode: &'static str,
@@ -1132,33 +1103,21 @@ impl FuseMetrics {
     /// Build the `reply_queue_depth` guard for a task entering the reply channel.
     /// Returns `Some(ActiveGuard)` (incrementing the gauge).
     ///
-    /// **Call only from the metrics-enabled reply path** (`self.metrics.is_some()`
-    /// in `FuseResponse`). The disabled path produces the legacy `Reply` variant
-    /// and never reaches here, so the "disabled = `None`, never `noop()`" contract
-    /// is enforced at the call site, not by a `metrics_enabled` flag here.
-    ///
-    /// Uses `get()` (strict), like `setlkw_inflight_guard` / `setlkw_wait_timer`:
-    /// because this is only ever reached on the metrics-enabled path, an
-    /// uninitialized singleton here is a wiring/init-order regression and SHOULD
-    /// surface as a panic rather than silently drop `reply_queue_depth`.
-    /// Production order guarantees init before any reply (ensure_init
-    /// precedes NodeState; pinned by `ensure_init_precedes_node_state`); the
-    /// enabled-path unit tests call `ensure_init()` in their fixtures. The guard is
-    /// moved into the `RequestReply`/`NotifyReply` task and decrements when the
-    /// sender dequeues (or when an un-received task is dropped).
+    /// Call only from the metrics-enabled reply path; the disabled path uses the
+    /// legacy `Reply` and never reaches here. Uses strict `get()` on purpose: an
+    /// uninitialized singleton on this path is a wiring/init-order regression that
+    /// SHOULD panic rather than silently drop `reply_queue_depth` (production init
+    /// order is pinned by `ensure_init_precedes_node_state`). The guard rides the
+    /// reply task and decrements when the sender dequeues it (or it is dropped).
     pub(crate) fn reply_queue_guard() -> Option<ActiveGuard> {
         Some(ActiveGuard::new(Self::get().reply_queue_depth.clone()))
     }
 
-    /// Build the `setlkw_inflight` guard for a SETLKW interruptible-request scope.
-    /// `Some` when enabled, `None` when disabled (never `noop()`). Created after
-    /// the `pending_requests` insert and held across the whole `select!`; its Drop
-    /// — not the `pending_requests.remove` — decrements the gauge, so every
-    /// `select!` branch / early return / cancellation balances. NOTE: the guard
-    /// scope is the whole `dispatch_meta_interrupt`, NOT the `pending_requests` map
-    /// entry — under reply-channel backpressure the gauge can stay non-zero after
-    /// the map entry is already removed (the interrupt branch removes before the
-    /// reply enqueue completes).
+    /// The `setlkw_inflight` guard for a SETLKW scope: `Some` when enabled, `None`
+    /// (never `noop()`) when disabled. Held across the whole `select!`; its Drop
+    /// (not `pending_requests.remove`) decrements, so every branch/cancellation
+    /// balances. Its scope is the whole `dispatch_meta_interrupt`, NOT the map
+    /// entry — so under backpressure the gauge can outlive the removed entry.
     pub(crate) fn setlkw_inflight_guard(metrics_enabled: bool) -> Option<ActiveGuard> {
         if metrics_enabled {
             Some(ActiveGuard::new(Self::get().setlkw_inflight.clone()))
@@ -1167,16 +1126,11 @@ impl FuseMetrics {
         }
     }
 
-    /// Build the SETLKW interruptible-request timer (RAII): `Some(HistogramTimer)`
-    /// when enabled, `None` when disabled (no clock read, no observe). Created in
-    /// `dispatch_meta_interrupt` BEFORE the `select!`, so its scope is the WHOLE
-    /// interruptible SETLKW request (parse, dispatch, `set_lkw()` lock polling, and
-    /// reply enqueue) — NOT pure lock-acquisition time (matches the registration
-    /// help; reply-channel backpressure can inflate it, so do not read it as lock
-    /// contention). It observes on every drop: normal completion, interrupt
-    /// cancellation, AND a malformed SETLKW whose `parse_operator()` fails before
-    /// `set_lkw()` is ever called (near-zero sample — the reason the timer lives
-    /// here and not inside `set_lkw()`).
+    /// The SETLKW request timer (RAII): `Some` when enabled, `None` when disabled.
+    /// Created before the `select!` so its scope is the WHOLE interruptible request
+    /// (not pure lock-acquisition time — backpressure can inflate it). Observes on
+    /// every drop, including a malformed SETLKW that fails parse before `set_lkw()`
+    /// is called — the reason it lives here and not inside `set_lkw()`.
     pub(crate) fn setlkw_wait_timer(metrics_enabled: bool) -> Option<HistogramTimer> {
         if metrics_enabled {
             Some(HistogramTimer::new(
@@ -1189,22 +1143,14 @@ impl FuseMetrics {
 
     // --- emission helpers ---
 
-    /// Record one read/write backend IO in the reader/writer task body, feeding
-    /// the read/write `io_*` families plus the opcode-free `stage_duration_us`
-    /// (the same dual-emit shape as `record_operation`: `io_*` carries
-    /// `path_type` detail, the stage view stays opcode-free at bounded
-    /// cardinality). `io_type` is `IO_TYPE_READ`/`IO_TYPE_WRITE`; `path_type` is
-    /// the backend resolved at handle open.
-    ///
-    /// - `io_duration_us{io_type,path_type,status}` + `stage_duration_us{stage=
-    ///   stream_io,kind=stream,status}`: observed on success AND error.
-    /// - `io_requests_total{io_type,path_type,status}`: +1 every attempt, error
-    ///   included.
-    /// - `io_size_bytes{io_type,path_type}`: the *request* size (read=requested,
-    ///   write=input len), observed on success and error.
-    /// - `io_bytes_total{io_type,path_type,status=success}`: the *transferred*
-    ///   bytes, ONLY on success (an error creates no byte series — never
-    ///   `inc_by(0)`).
+    /// Record one read/write backend IO in the reader/writer task body, feeding the
+    /// `io_*` families plus the opcode-free `stage_duration_us` (dual-emit, like
+    /// `record_operation`). Emits:
+    /// - `io_duration_us` + `stage_duration_us{stage=stream_io}`: success AND error.
+    /// - `io_requests_total`: +1 every attempt, error included.
+    /// - `io_size_bytes`: the *request* size (read=requested, write=input len).
+    /// - `io_bytes_total{status=success}`: the *transferred* bytes, success ONLY
+    ///   (an error creates no byte series — never `inc_by(0)`).
     pub(crate) fn record_stream_io(
         &self,
         io_type: &'static str,
@@ -1291,19 +1237,13 @@ impl FuseMetrics {
     }
 
     /// Open a flush/fsync/release lifecycle scope at `send_stream`: count the
-    /// attempt now (`stream_lifecycle_requests_total{io_type,path_type=unknown}`,
-    /// before the backend runs so a pre-dispatch error still counts) and return a
-    /// `StreamLifecycleScope` holding the duration timer and the inflight guard.
-    /// Both release together at the end of the send_stream arm (the timer
-    /// observes, the guard decrements); the drop *order* between them carries no
-    /// observable semantics. `io_type` is `IO_TYPE_FLUSH`/`FSYNC`/`RELEASE`.
-    ///
-    /// All three sub-metrics use the fixed `path_type=unknown` (the send_stream
-    /// layer does not look up the handle). Attempt-count and timer/guard are wired
-    /// here together with no `.await`/early-return between them, so the family is
-    /// never half-balanced. Like the other guard helpers, this is only ever
-    /// reached on the metrics-enabled path (the caller maps it in behind an
-    /// `enabled` check), so `get()` (strict) is correct.
+    /// attempt now (before the backend runs, so a pre-dispatch error still counts)
+    /// and return a `StreamLifecycleScope` holding the duration timer + inflight
+    /// guard, which release together at the end of the arm. All three sub-metrics
+    /// use fixed `path_type=unknown` (this layer does not look up the handle).
+    /// Attempt-count and timer/guard are wired with no `.await`/early-return
+    /// between them, so the family is never half-balanced. Metrics-enabled path
+    /// only, so strict `get()` is correct.
     pub(crate) fn stream_lifecycle_scope(io_type: &'static str) -> StreamLifecycleScope {
         let m = Self::get();
         m.stream_lifecycle_requests_total
@@ -1673,17 +1613,10 @@ impl FuseRespMetrics {
 }
 
 /// RAII guard for an in-flight gauge: increments on construction, decrements
-/// exactly once on drop.
-///
-/// It is `Send` and movable (so it can travel into a spawned task or onto a
-/// reply task), and deliberately **not** `Copy` — a `Copy` guard could
-/// double-decrement. The guard holds an optional `Gauge` handle so a single
-/// type can back different scopes (`active_requests`, `stream_io_inflight`,
-/// `meta_task_inflight`) just by being constructed from different gauges.
-///
-/// The `None` (no-op) form exercises the full move-and-drop lifetime — proving
-/// single-take / single-drop ownership — while touching no real gauge;
-/// `new(active_requests_gauge)` uses the same plumbing to drive the real metric.
+/// exactly once on drop. `Send` and movable (travels into a spawned/reply task),
+/// deliberately NOT `Copy` (which could double-decrement). The optional `Gauge`
+/// lets one type back different scopes (`active_requests`, `stream_io_inflight`,
+/// …); the `None` form exercises the same move/drop lifetime with no real gauge.
 #[derive(Debug)]
 pub(crate) struct ActiveGuard {
     gauge: Option<Gauge>,
@@ -1711,18 +1644,12 @@ impl Drop for ActiveGuard {
     }
 }
 
-/// Zero-allocation RAII timer for a histogram.
+/// Zero-allocation RAII timer for a histogram (monotonic clock).
 ///
-/// Holds an already-resolved `Histogram` (e.g. obtained once via
-/// `HistogramVec::with_label_values(...)` and stored), so its `drop` is a single
-/// `observe()` with **no allocation and no per-call label-map probe**. This is
-/// the hot-path replacement for `orpc`'s `MetricTimerVec`, which re-allocates a
-/// `Vec<&str>` on every drop and must not be used per request.
-///
-/// Durations are measured with the monotonic clock (`Instant`).
-///
-/// Backs `setlkw_wait_timer`, `io_dispatch_timer`, and the
-/// `stream_lifecycle_scope` duration timer.
+/// Holds an already-resolved `Histogram`, so its `drop` is a single `observe()`
+/// with no allocation and no per-call label-map probe — the hot-path replacement
+/// for `orpc`'s `MetricTimerVec` (which re-allocates per drop). Backs
+/// `setlkw_wait_timer`, `io_dispatch_timer`, and `stream_lifecycle_scope`.
 #[derive(Debug)]
 pub(crate) struct HistogramTimer {
     start: Instant,

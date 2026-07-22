@@ -139,18 +139,14 @@ impl FuseWriter {
         self.err_monitor.take_error().unwrap_or(e)
     }
 
-    /// Enqueue a `WriteTask` into the writer channel, carrying the
-    /// `stream_write_queue_depth` guard. Reserve-first on a bounded
-    /// channel so a producer parked in `reserve().await` (channel full) is NOT
-    /// counted as backlog — the guard is created only AFTER a permit is in hand
-    /// (bounded) or just before the synchronous unbounded send. No manual
-    /// inc/dec/rollback: the guard rides the task and the writer drops it at the
-    /// dequeue point (or it is dropped with an un-received task on teardown).
+    /// Enqueue a `WriteTask`, carrying the `stream_write_queue_depth` guard.
+    /// Reserve-first on a bounded channel so a producer parked in `reserve().await`
+    /// isn't counted as backlog (guard created only after a permit is in hand); the
+    /// guard rides the task and drops at the writer's dequeue point.
     ///
-    /// IMPORTANT: this helper only handles the queue guard + channel send. It must
-    /// NOT touch `write_ver` — the producers below keep `write_ver.incr()` at its
-    /// existing position (a read-after-write consistency dependency, not a metrics
-    /// concern), see `write`/`resize`.
+    /// IMPORTANT: only handles the queue guard + send — it must NOT touch
+    /// `write_ver` (the producers keep `write_ver.incr()` where it is, a
+    /// read-after-write consistency dependency; see `write`/`resize`).
     async fn send_queued_task(&self, task: WriteTask) -> Result<(), FsError> {
         if self.sender.is_bounded() {
             // Reserve a permit first WITHOUT a guard; a cancelled reserve leaves the
