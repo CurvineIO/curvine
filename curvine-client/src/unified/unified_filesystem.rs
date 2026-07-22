@@ -325,6 +325,20 @@ impl UnifiedFileSystem {
         self.track("Symlink", target, link.path(), fut).await
     }
 
+    pub async fn create_special_node(
+        &self,
+        path: &Path,
+        opts: CreateFileOpts,
+    ) -> FsResult<FileStatus> {
+        let fut = async {
+            match self.get_mount_checked(path, RpcCode::CreateFile).await? {
+                None => self.cv.create_special_node(path, opts).await,
+                Some(_) => err_ext!(FsError::unsupported("mknod")),
+            }
+        };
+        self.track("CreateSpecialNode", "", path.path(), fut).await
+    }
+
     pub async fn link(&self, src_path: &Path, dst_path: &Path) -> FsResult<()> {
         let fut = async {
             let _ = self.get_mount_checked(dst_path, RpcCode::Link).await?;

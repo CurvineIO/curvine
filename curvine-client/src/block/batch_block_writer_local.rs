@@ -8,7 +8,6 @@ use orpc::common::Utils;
 use orpc::io::LocalFile;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::RawPtr;
-use orpc::try_option;
 use std::sync::Arc;
 
 pub struct BatchBlockWriterLocal {
@@ -49,9 +48,24 @@ impl BatchBlockWriterLocal {
         // Create multiple files, one for each block context
         let mut files = Vec::new();
         for context in &write_context.contexts {
-            let path = try_option!(&context.path);
-            let file = LocalFile::with_write_offset(path, false, pos)?;
-            files.push(RawPtr::from_owned(file));
+            match &context.path {
+                Some(path) => {
+                    let file = LocalFile::with_write_offset(path, false, pos)?;
+                    files.push(RawPtr::from_owned(file));
+                }
+                None => {
+                    // No local path available (e.g. SPDK bdev without filesystem path).
+                    // Abort all blocks on the server before returning so state is clean.
+                    let _ = client
+                        .write_commit_batch(&blocks, pos, block_size, req_id, 0, true)
+                        .await;
+                    return Err(FsError::no_local_path(format!(
+                        "no local path for batch block {} (storage type {:?})",
+                        blocks[files.len()].id,
+                        context.storage_type
+                    )));
+                }
+            }
         }
 
         Ok(Self {

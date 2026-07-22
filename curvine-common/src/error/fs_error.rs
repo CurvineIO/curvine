@@ -66,6 +66,7 @@ pub enum ErrorKind {
     BlockNotFound = 29,
     ReadOnly = 30,
     NoAvailableWorker = 31,
+    NoLocalPath = 32,
 
     #[num_enum(default)]
     Common = 10000,
@@ -195,6 +196,10 @@ pub enum FsError {
     #[error("{0}")]
     NoAvailableWorker(ErrorImpl<StringError>),
 
+    // The server has no local filesystem path for this block (e.g. SPDK bdev).
+    #[error("{0}")]
+    NoLocalPath(ErrorImpl<StringError>),
+
     // Job not found
     #[error("{0}")]
     JobNotFound(ErrorImpl<StringError>),
@@ -212,6 +217,10 @@ impl FsError {
 
     pub fn from_error<E: std::error::Error>(e: E) -> Self {
         Self::Common(ErrorImpl::with_source(e.to_string().into()))
+    }
+
+    pub fn no_local_path(msg: impl Into<String>) -> Self {
+        Self::NoLocalPath(ErrorImpl::with_source(msg.into().into()))
     }
 
     pub fn not_leader_master(code: RpcCode, client_ip: &str) -> Self {
@@ -395,6 +404,7 @@ impl FsError {
             FsError::Pipeline(_) => ErrorKind::Pipeline,
             FsError::MinReplicasNotMet(_) => ErrorKind::MinReplicasNotMet,
             FsError::NoAvailableWorker(_) => ErrorKind::NoAvailableWorker,
+            FsError::NoLocalPath(_) => ErrorKind::NoLocalPath,
             FsError::JobNotFound(_) => ErrorKind::JobNotFound,
             FsError::Common(_) => ErrorKind::Common,
         }
@@ -543,6 +553,7 @@ impl ErrorExt for FsError {
             FsError::Pipeline(e) => FsError::Pipeline(e.ctx(ctx)),
             FsError::MinReplicasNotMet(e) => FsError::MinReplicasNotMet(e.ctx(ctx)),
             FsError::NoAvailableWorker(e) => FsError::NoAvailableWorker(e.ctx(ctx)),
+            FsError::NoLocalPath(e) => FsError::NoLocalPath(e.ctx(ctx)),
             FsError::JobNotFound(e) => FsError::JobNotFound(e.ctx(ctx)),
             FsError::Common(e) => FsError::Common(e.ctx(ctx)),
         }
@@ -580,6 +591,7 @@ impl ErrorExt for FsError {
             FsError::Pipeline(e) => e.encode(ErrorKind::Pipeline),
             FsError::MinReplicasNotMet(e) => e.encode(ErrorKind::MinReplicasNotMet),
             FsError::NoAvailableWorker(e) => e.encode(ErrorKind::NoAvailableWorker),
+            FsError::NoLocalPath(e) => e.encode(ErrorKind::NoLocalPath),
             FsError::JobNotFound(e) => e.encode(ErrorKind::JobNotFound),
             FsError::Common(e) => e.encode(ErrorKind::Common),
         }
@@ -620,6 +632,7 @@ impl ErrorExt for FsError {
             ErrorKind::Pipeline => FsError::Pipeline(de.into_string()),
             ErrorKind::MinReplicasNotMet => FsError::MinReplicasNotMet(de.into_string()),
             ErrorKind::NoAvailableWorker => FsError::NoAvailableWorker(de.into_string()),
+            ErrorKind::NoLocalPath => FsError::NoLocalPath(de.into_string()),
             ErrorKind::JobNotFound => FsError::JobNotFound(de.into_string()),
             ErrorKind::Common => FsError::Common(de.into_string()),
         }
