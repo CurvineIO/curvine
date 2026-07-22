@@ -397,6 +397,59 @@ impl CurvineFileSystem {
         }
     }
 
+    /// POSIX `stat(2)` requires execute (search) permission on every directory in
+    /// the path prefix. FUSE getattr is inode-based, so enforce that by walking the
+    /// dcache parent chain (nftw FTW_NS when a parent directory is not searchable).
+    async fn check_traverse_permissions(
+        &self,
+        ino: u64,
+        header: &fuse_in_header,
+    ) -> FuseResult<()> {
+        if header.uid == 0 || !self.conf.check_permission {
+            return Ok(());
+        }
+
+        let mut dir_ino = {
+            let dir = self.state.dir_read();
+            match dir.get_inode(ino, None) {
+                None => return Ok(()),
+                Some(inode) if inode.is_root() => return Ok(()),
+                Some(inode) => inode.parent,
+            }
+        };
+
+        while dir_ino != 0 {
+            let check_header = fuse_in_header {
+                uid: header.uid,
+                gid: header.gid,
+                nodeid: dir_ino,
+                ..Default::default()
+            };
+            let cached_status = {
+                let dir = self.state.dir_read();
+                dir.get_inode(dir_ino, None)
+                    .map(|inode| inode.clone_status())
+            };
+            if let Some(status) = cached_status {
+                self.check_access_permissions(&status, &check_header, libc::X_OK as u32)?;
+            } else {
+                self.check_permissions(&check_header, libc::X_OK as u32)
+                    .await?;
+            }
+
+            let is_root = {
+                let dir = self.state.dir_read();
+                dir.get_inode_check(dir_ino, None)?.is_root()
+            };
+            if is_root {
+                break;
+            }
+            dir_ino = self.state.get_parent_ino(dir_ino)?;
+        }
+
+        Ok(())
+    }
+
     /// Check if the current user has the requested access permissions
     fn check_access_permissions(
         &self,
@@ -889,6 +942,9 @@ impl fs::FileSystem for CurvineFileSystem {
     }
 
     async fn get_attr(&self, op: GetAttr<'_>) -> FuseResult<fuse_attr_out> {
+        self.check_traverse_permissions(op.header.nodeid, op.header)
+            .await?;
+
         let status = self.state.fs_stat(op.header.nodeid, None).await?;
 
         let mut fuse_attr = FuseUtils::status_to_attr(&self.conf, &status)?;
@@ -910,6 +966,9 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn set_attr(&self, op: SetAttr<'_>) -> FuseResult<fuse_attr_out> {
         let path = self.state.get_path(op.header.nodeid)?;
         self.ensure_writable_path(&path, RpcCode::SetAttr).await?;
+
+        self.check_traverse_permissions(op.header.nodeid, op.header)
+            .await?;
 
         let cur_status = self.state.fs_stat(op.header.nodeid, None).await?;
         let file_uid = self.resolve_file_uid(&cur_status.owner);
@@ -1603,6 +1662,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
 #[cfg(test)]
 mod tests {
+    use crate::{FATTR_MTIME, FATTR_UID};
     use curvine_common::state::FileAllocMode;
 
     #[test]
@@ -1731,6 +1791,28 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(zero_range.errno, libc::EOPNOTSUPP);
+    }
+
+    #[test]
+    fn setattr_permission_denies_non_owner_chown() {
+        let err = super::CurvineFileSystem::check_setattr_permission(true, 1000, 0, FATTR_UID)
+            .unwrap_err();
+        assert_eq!(err.errno(), libc::EPERM);
+    }
+
+    #[test]
+    fn setattr_permission_allows_owner_chown() {
+        super::CurvineFileSystem::check_setattr_permission(true, 1000, 1000, FATTR_UID).unwrap();
+    }
+
+    #[test]
+    fn setattr_permission_allows_root_chown() {
+        super::CurvineFileSystem::check_setattr_permission(true, 0, 1000, FATTR_UID).unwrap();
+    }
+
+    #[test]
+    fn setattr_permission_ignores_mtime_only_changes() {
+        super::CurvineFileSystem::check_setattr_permission(true, 1000, 0, FATTR_MTIME).unwrap();
     }
 
     /// Pin that `FuseMetrics::ensure_init()` runs before `NodeState::new()` in
