@@ -316,6 +316,14 @@ impl CurvineFileSystem {
         self.fs_client.link(src_path, dst_path).await
     }
 
+    pub async fn create_special_node(
+        &self,
+        path: &Path,
+        opts: CreateFileOpts,
+    ) -> FsResult<FileStatus> {
+        self.fs_client.create_special_node(path, opts).await
+    }
+
     pub async fn get_mount_info(&self, path: &Path) -> FsResult<Option<MountInfo>> {
         self.fs_client.get_mount_info(path).await
     }

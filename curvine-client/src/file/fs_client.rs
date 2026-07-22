@@ -578,6 +578,22 @@ impl FsClient {
         Ok(())
     }
 
+    pub async fn create_special_node(
+        &self,
+        path: &Path,
+        opts: CreateFileOpts,
+    ) -> FsResult<FileStatus> {
+        let flags = OpenFlags::new_create();
+        let header = CreateFileRequest {
+            path: path.encode(),
+            opts: ProtoUtils::create_opts_to_pb(opts, self.context.clone_client_name()),
+            flags: flags.value(),
+        };
+
+        let rep_header: CreateFileResponse = self.rpc(RpcCode::CreateFile, header).await?;
+        Ok(ProtoUtils::file_status_from_pb(rep_header.file_status))
+    }
+
     pub async fn resize(&self, path: &Path, alloc_opts: FileAllocOpts) -> FsResult<FileBlocks> {
         let req = FileResizeRequest {
             path: path.encode(),

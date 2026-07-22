@@ -14,7 +14,7 @@
 
 #![allow(unused_variables)]
 
-use crate::fs::operator::{Create, MkDir};
+use crate::fs::operator::{Create, MkDir, MkNod};
 use crate::raw::fuse_abi::{fuse_attr, fuse_entry_out, fuse_setattr_in};
 use crate::*;
 use bytes::BytesMut;
@@ -23,7 +23,7 @@ use curvine_common::conf::FuseConf;
 use curvine_common::fs::Path;
 use curvine_common::state::{
     CreateFileOpts, CreateFileOptsBuilder, FileStatus, FileType, MkdirOpts, MkdirOptsBuilder,
-    SetAttrOpts,
+    SetAttrOpts, MKNOD_RDEV_XATTR,
 };
 use orpc::common::LocalTime;
 use orpc::io::IOResult;
@@ -112,16 +112,45 @@ impl FuseUtils {
     }
 
     pub fn get_mode(perm: u32, typ: FileType) -> u32 {
-        // Strip any file-type / stray high bits before OR-ing the correct type bit.
         let perm = perm & 0o7777;
         match typ {
             FileType::Dir => perm | (libc::S_IFDIR as u32),
-
             #[cfg(target_os = "linux")]
             FileType::Link => perm | (libc::S_IFLNK as u32),
-
+            #[cfg(target_os = "linux")]
+            FileType::Fifo => perm | (libc::S_IFIFO as u32),
+            #[cfg(target_os = "linux")]
+            FileType::Char => perm | (libc::S_IFCHR as u32),
+            #[cfg(target_os = "linux")]
+            FileType::Block => perm | (libc::S_IFBLK as u32),
             _ => perm | (libc::S_IFREG as u32),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn special_file_type_from_mode(mode: u32) -> Option<FileType> {
+        match mode & libc::S_IFMT as u32 {
+            t if t == libc::S_IFIFO as u32 => Some(FileType::Fifo),
+            t if t == libc::S_IFCHR as u32 => Some(FileType::Char),
+            t if t == libc::S_IFBLK as u32 => Some(FileType::Block),
+            _ => None,
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn special_file_type_from_mode(_mode: u32) -> Option<FileType> {
+        None
+    }
+
+    pub fn rdev_from_status(status: &FileStatus) -> u32 {
+        status
+            .x_attr
+            .get(MKNOD_RDEV_XATTR)
+            .and_then(|bytes| {
+                let arr: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+                Some(u32::from_le_bytes(arr))
+            })
+            .unwrap_or(0)
     }
 
     pub fn s_isreg(mode: u32) -> bool {
@@ -223,6 +252,7 @@ impl FuseUtils {
         let size = match status.file_type {
             FileType::Link => status.target.as_ref().map(|x| x.len()).unwrap_or(0) as u64,
             FileType::Dir => FUSE_DEFAULT_PAGE_SIZE as u64,
+            FileType::Fifo | FileType::Char | FileType::Block => 0,
             // Regular files (File / Stream / Agg / Object) take their size from
             // `status.len`. Defend the FUSE boundary against abnormal backend
             // data: a negative len would cast to a huge u64, so reject it.
@@ -262,7 +292,8 @@ impl FuseUtils {
         // Kernel requested POSIX_ACL support (kernel_requested_POSIX_ACL: 1048576)
         // but we disabled it in our response, yet kernel still queries ACL attributes
         match name {
-            "security.capability"
+            MKNOD_RDEV_XATTR
+            | "security.capability"
             | "security.selinux"
             | "system.posix_acl_access"
             | "system.posix_acl_default" => match op {
@@ -345,6 +376,7 @@ impl FuseUtils {
 
         let perm = FuseUtils::effective_perm(status, conf.umask);
         let mode = FuseUtils::get_mode(perm, status.file_type);
+        let rdev = FuseUtils::rdev_from_status(status);
 
         // A regular file/dir has at least one link; some backends (UFS/object
         // store) do not populate nlink, leaving it 0. Report at least 1.
@@ -364,7 +396,7 @@ impl FuseUtils {
             nlink,
             uid,
             gid,
-            rdev: 0,
+            rdev,
             blksize: FUSE_BLOCK_SIZE as u32,
             padding: 0,
         })
@@ -376,6 +408,22 @@ impl FuseUtils {
                 op.header.uid,
                 op.header.gid,
                 op.arg.mode & 0o7777 & !op.arg.umask,
+            )
+            .build()
+    }
+
+    pub fn mknod_opts(
+        op: &MkNod<'_>,
+        fs: &UnifiedFileSystem,
+        file_type: FileType,
+    ) -> CreateFileOpts {
+        let mode = op.arg.mode & 0o7777 & !op.arg.umask;
+        CreateFileOptsBuilder::with_conf(&fs.conf().client)
+            .file_type(file_type)
+            .acl(op.header.uid, op.header.gid, mode)
+            .x_attr(
+                MKNOD_RDEV_XATTR.to_string(),
+                op.arg.rdev.to_le_bytes().to_vec(),
             )
             .build()
     }
@@ -539,6 +587,28 @@ mod tests {
         for op in [XattrOp::Get, XattrOp::Set, XattrOp::Remove] {
             FuseUtils::check_xattr("user.curvine", op).unwrap();
         }
+    }
+
+    #[test]
+    fn mknod_rdev_xattr_is_internal_only() {
+        assert_eq!(
+            FuseUtils::check_xattr(MKNOD_RDEV_XATTR, XattrOp::Get)
+                .unwrap_err()
+                .errno(),
+            libc::ENODATA
+        );
+        assert_eq!(
+            FuseUtils::check_xattr(MKNOD_RDEV_XATTR, XattrOp::Set)
+                .unwrap_err()
+                .errno(),
+            libc::EOPNOTSUPP
+        );
+        assert_eq!(
+            FuseUtils::check_xattr(MKNOD_RDEV_XATTR, XattrOp::Remove)
+                .unwrap_err()
+                .errno(),
+            libc::EOPNOTSUPP
+        );
     }
 
     #[test]
@@ -796,5 +866,36 @@ mod tests {
         let mut three = file_status(FileType::File, 0, 0o644);
         three.nlink = 3;
         assert_eq!(FuseUtils::status_to_attr(&conf, &three).unwrap().nlink, 3);
+    }
+
+    #[test]
+    fn special_file_type_from_mode_maps_chr_blk_fifo() {
+        assert_eq!(
+            FuseUtils::special_file_type_from_mode(0o20777),
+            Some(FileType::Char)
+        );
+        assert_eq!(
+            FuseUtils::special_file_type_from_mode(0o60777),
+            Some(FileType::Block)
+        );
+        assert_eq!(
+            FuseUtils::special_file_type_from_mode(0o10777),
+            Some(FileType::Fifo)
+        );
+        assert!(FuseUtils::special_file_type_from_mode(0o100644).is_none());
+    }
+
+    #[test]
+    fn status_to_attr_reports_special_node_mode_and_rdev() {
+        let conf = FuseConf::default();
+        let mut chr = file_status(FileType::Char, 0, 0o777);
+        chr.x_attr
+            .insert(MKNOD_RDEV_XATTR.to_string(), 42u32.to_le_bytes().to_vec());
+
+        let attr = FuseUtils::status_to_attr(&conf, &chr).unwrap();
+        assert_eq!(attr.mode & libc::S_IFMT as u32, libc::S_IFCHR as u32);
+        assert_eq!(attr.mode & 0o7777, 0o777);
+        assert_eq!(attr.rdev, 42);
+        assert_eq!(attr.size, 0);
     }
 }
