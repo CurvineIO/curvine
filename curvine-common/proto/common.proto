@@ -35,6 +35,9 @@ enum FileTypeProto {
     FILE_TYPE_PROTO_STREAM = 3;
     FILE_TYPE_PROTO_AGG = 4;
     FILE_TYPE_PROTO_OBJECT = 5;
+    FILE_TYPE_PROTO_FIFO = 6;
+    FILE_TYPE_PROTO_CHAR = 7;
+    FILE_TYPE_PROTO_BLOCK = 8;
 }
 
 enum StorageStateProto {

@@ -1344,7 +1344,8 @@ impl fs::FileSystem for CurvineFileSystem {
     /// This function handles the creation of file system nodes:
     /// - For regular files: delegates to `create()` and immediately closes the handle
     /// - For directories: delegates to `mkdir()`
-    /// - For other types (devices, fifos, etc.): returns EPERM error
+    /// - For char/block/fifo device nodes: creates metadata-only special nodes
+    /// - For other types (sockets, etc.): returns EPERM error
     ///
     /// # Arguments
     /// * `op` - MkNod operation containing:
@@ -1356,6 +1357,11 @@ impl fs::FileSystem for CurvineFileSystem {
     /// * `Ok(fuse_entry_out)` - Entry information for the created node
     /// * `Err(FuseError)` - Error if creation fails or unsupported type
     async fn mk_nod(&self, op: MkNod<'_>) -> FuseResult<fuse_entry_out> {
+        let name = try_option!(op.name.to_str());
+        if name.len() > FUSE_MAX_NAME_LENGTH {
+            return err_fuse!(libc::ENAMETOOLONG);
+        }
+
         if FuseUtils::s_isreg(op.arg.mode) {
             let create_in = fuse_create_in {
                 flags: OpenFlags::new_create().value(),
@@ -1392,6 +1398,14 @@ impl fs::FileSystem for CurvineFileSystem {
                 name: op.name,
             };
             self.mkdir(op).await
+        } else if let Some(file_type) = FuseUtils::special_file_type_from_mode(op.arg.mode) {
+            let path = self.state.get_path_name(op.header.nodeid, name)?;
+            self.ensure_writable_path(&path, RpcCode::CreateFile)
+                .await?;
+            let opts = FuseUtils::mknod_opts(&op, &self.fs, file_type);
+            self.fs.create_special_node(&path, opts).await?;
+            let attr = self.state.lookup_common(op.header.nodeid, name).await?;
+            Ok(FuseUtils::create_entry_out(&self.conf, attr))
         } else {
             err_fuse!(libc::EPERM)
         }
