@@ -29,8 +29,8 @@ use curvine_common::conf::{ClusterConf, FuseConf};
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path, RpcCode, StateReader, StateWriter};
 use curvine_common::state::{
-    FileAllocMode, FileAllocOpts, FileLock, FileStatus, FileType, LockFlags, LockType, OpenFlags,
-    SetAttrOpts,
+    is_special_file_type, FileAllocMode, FileAllocOpts, FileLock, FileStatus, FileType, LockFlags,
+    LockType, OpenFlags, SetAttrOpts,
 };
 use curvine_common::MAX_FILE_SIZE;
 use log::{debug, info, warn};
@@ -1006,12 +1006,25 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn read(&self, op: Read<'_>, reply: FuseResponse) -> FuseResult<()> {
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
+        if is_special_file_type(handle.status().file_type) {
+            return err_fuse!(
+                libc::EOPNOTSUPP,
+                "read not supported for special file nodes"
+            );
+        }
         handle.read(&self.state, op, reply).await
     }
 
     async fn open(&self, op: Open<'_>) -> FuseResult<fuse_open_out> {
         let action = OpenAction::try_from(op.arg.flags)?;
         let path = self.state.get_path(op.header.nodeid)?;
+        let status = self.state.fs_stat(op.header.nodeid, None).await?;
+        if is_special_file_type(status.file_type) {
+            return err_fuse!(
+                libc::EOPNOTSUPP,
+                "open not supported for special file nodes"
+            );
+        }
         let truncate = (op.arg.flags & libc::O_TRUNC as u32) != 0;
         if action.write() || truncate {
             self.ensure_writable_path(&path, RpcCode::CreateFile)
@@ -1113,6 +1126,12 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn write(&self, op: Write<'_>, reply: FuseResponse) -> FuseResult<()> {
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
+        if is_special_file_type(handle.status().file_type) {
+            return err_fuse!(
+                libc::EOPNOTSUPP,
+                "write not supported for special file nodes"
+            );
+        }
         handle.write(op, reply).await
     }
 

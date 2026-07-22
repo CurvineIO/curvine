@@ -581,9 +581,8 @@ impl FsClient {
     pub async fn create_special_node(
         &self,
         path: &Path,
-        mut opts: CreateFileOpts,
+        opts: CreateFileOpts,
     ) -> FsResult<FileStatus> {
-        opts.sync_ufs_meta = true;
         let flags = OpenFlags::new_create();
         let header = CreateFileRequest {
             path: path.encode(),

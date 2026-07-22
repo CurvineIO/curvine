@@ -292,7 +292,8 @@ impl FuseUtils {
         // Kernel requested POSIX_ACL support (kernel_requested_POSIX_ACL: 1048576)
         // but we disabled it in our response, yet kernel still queries ACL attributes
         match name {
-            "security.capability"
+            MKNOD_RDEV_XATTR
+            | "security.capability"
             | "security.selinux"
             | "system.posix_acl_access"
             | "system.posix_acl_default" => match op {
@@ -586,6 +587,28 @@ mod tests {
         for op in [XattrOp::Get, XattrOp::Set, XattrOp::Remove] {
             FuseUtils::check_xattr("user.curvine", op).unwrap();
         }
+    }
+
+    #[test]
+    fn mknod_rdev_xattr_is_internal_only() {
+        assert_eq!(
+            FuseUtils::check_xattr(MKNOD_RDEV_XATTR, XattrOp::Get)
+                .unwrap_err()
+                .errno(),
+            libc::ENODATA
+        );
+        assert_eq!(
+            FuseUtils::check_xattr(MKNOD_RDEV_XATTR, XattrOp::Set)
+                .unwrap_err()
+                .errno(),
+            libc::EOPNOTSUPP
+        );
+        assert_eq!(
+            FuseUtils::check_xattr(MKNOD_RDEV_XATTR, XattrOp::Remove)
+                .unwrap_err()
+                .errno(),
+            libc::EOPNOTSUPP
+        );
     }
 
     #[test]
