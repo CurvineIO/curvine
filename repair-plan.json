@@ -1,29 +1,33 @@
 {
-  "issue": "CurvineIO/curvine#1207",
-  "multica_issue": "CUR-61",
-  "fingerprint": "sha256:15fb19075be2d2fe6df145554fc1c3d1453d5a79ff97ee56eaa5b0ca69fe94bb",
-  "head_sha": "ea9978a4b77ead56a2ea59b41cd05ef66cbbda41",
-  "root_cause_hypothesis": "Under nextest load, the 2-master test cluster loses raft quorum (`quorum is not active`). A subsequent snapshot apply restores from an empty checkpoint (checkpoint_size=0, create_tree files=0), wiping metadata so FileStatus(/repl_test_3.dat) returns FileNotFound. Isolated runs pass; the wipe—not replication itself—is the failure mode.",
+  "issue": "CurvineIO/curvine#1226",
+  "multica_issue": "CUR-74",
+  "fingerprint": "sha256:1125a9a375fd909fd467ae07580a0aad8755f149504ee84cde813fa83c99add3",
+  "head_sha": "b5db9cb2fc576e49e0c7ba68235d3cdb2358e90c",
+  "root_cause_hypothesis": "FUSE fallocate on an open fd routes through FsWriterBase::resize, which always called complete() when len>0; redundant complete on already-committed data surfaces generic FsError mapped to EIO during LTP fallocate01/03.",
   "affected_modules": [
-    "curvine-server/src/master/journal/journal_loader.rs"
+    "curvine-client/src/file/fs_writer_base.rs",
+    "curvine-fuse/src/fs/state/node_state.rs",
+    "curvine-common/src/state/file_alloc.rs"
   ],
   "planned_changes": [
-    "Before fs_dir.restore in apply_snapshot0, compute actual checkpoint dir size (independent of log level).",
-    "If the checkpoint is empty and the live filesystem already has files, refuse the apply instead of wiping metadata."
+    "Flush pending block writers before resize only when cur_writer/cache_writers are non-empty.",
+    "Refresh local FileBlocks from CompleteFile response so resize runs against current metadata.",
+    "Prefer inode-level active writer in fs_resize for fallocate/truncate ordering."
   ],
   "not_goals": [
-    "Do not change replication manager job scheduling.",
-    "Do not rewrite raft election/quorum timeouts in this PR.",
-    "Do not weaken legitimate format/empty-cluster bootstrap (still allow empty apply when live FS has no files)."
+    "Do not change punch-hole or zero-range fallocate modes.",
+    "Do not alter unrelated fcntl/mknod/FIO paths.",
+    "Do not add new RPC codes."
   ],
   "verification_plan": [
-    "cargo test -p curvine-tests --test replication_test test_replication_with_simulated_worker_failure",
-    "cargo test -p curvine-server --test journal_test (snapshot-related if present)",
-    "Unit-level coverage via journal_loader refusal path if testable"
+    "cargo fmt --all",
+    "cargo clippy -p curvine-client -p curvine-fuse -p curvine-common -- -D warnings",
+    "cargo test -p curvine-common --lib file_alloc",
+    "cargo test -p curvine-fuse fallocate"
   ],
-  "estimated_non_generated_source_line_delta": 40,
+  "estimated_non_generated_source_line_delta": 35,
   "risk": {
-    "level": "medium",
-    "rationale": "Changes HA snapshot apply safety. Rejecting a bad empty snapshot is safer than wiping production metadata, but a node may remain on older FSM state until a valid snapshot/log catch-up; needs harness daily rerun."
+    "level": "low",
+    "rationale": "Tightens resize/complete coordination for open writers; behavior unchanged when no pending blocks."
   }
 }
