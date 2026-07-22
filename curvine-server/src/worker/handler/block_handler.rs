@@ -15,10 +15,8 @@
 use crate::worker::block::BlockStore;
 use crate::worker::handler::BlockHandler::{BatchWriter, Reader, Writer};
 use crate::worker::handler::{BatchWriteHandler, ReadHandler, WriteHandler};
-use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::FsResult;
-use orpc::handler::MessageHandler;
 use orpc::message::Message;
 use orpc::{err_box, CommonResult};
 
@@ -42,12 +40,8 @@ impl BlockHandler {
 
         Ok(handler)
     }
-}
 
-impl MessageHandler for BlockHandler {
-    type Error = FsError;
-
-    fn handle(&mut self, msg: &Message) -> FsResult<Message> {
+    pub fn handle(&mut self, msg: &Message) -> FsResult<Message> {
         let response = match self {
             Writer(h) => h.handle(msg),
             Reader(h) => h.handle(msg),

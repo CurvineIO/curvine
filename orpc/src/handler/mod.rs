@@ -19,7 +19,7 @@ mod message_handler;
 pub use self::message_handler::*;
 
 mod handler_service;
-pub use self::handler_service::HandlerService;
+pub use self::handler_service::{HandlerService, LimitConf};
 
 mod rpc_codec;
 pub use self::rpc_codec::RpcCodec;

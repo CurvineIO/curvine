@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use bytes::BytesMut;
 use curvine_common::fs::RpcCode;
 use curvine_common::FsResult;
 use log::info;
 use orpc::common::TimeSpent;
-use orpc::handler::FrameBuf;
 use orpc::io::net::ConnState;
 use orpc::message::{Builder, Message};
 use orpc::CommonResult;
@@ -53,20 +53,10 @@ impl<'a> RpcContext<'a> {
     }
 
     pub fn response<T: PMessage + Default>(&self, header: T) -> FsResult<Message> {
-        let rep_msg = Builder::success_with_header(self.msg, header).build();
-        Ok(rep_msg)
-    }
+        let mut buf = BytesMut::with_capacity(header.encoded_len());
+        header.encode(&mut buf)?;
 
-    pub fn response_buf<T: PMessage + Default>(
-        &self,
-        header: T,
-        buf: &mut FrameBuf,
-    ) -> FsResult<Message> {
-        let len = header.encoded_len();
-        let mut encode_buf = buf.take_capacity(len);
-        header.encode(&mut encode_buf)?;
-
-        let rep_msg = Builder::success(self.msg).header(encode_buf).build();
+        let rep_msg = Builder::success(self.msg).header(buf).build();
         Ok(rep_msg)
     }
 

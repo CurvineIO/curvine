@@ -24,6 +24,7 @@ use orpc::io::net::ConnState;
 use orpc::message::Message;
 use orpc::runtime::Runtime;
 use orpc::server::{RpcServer, ServerConf, ServerStateListener};
+use orpc::sync::FastMutex;
 use orpc::{err_box, try_option, CommonResult};
 use std::sync::Arc;
 use std::time::Duration;
@@ -94,7 +95,7 @@ impl HandlerService for RaftService {
     fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
         RaftHandler {
             sender: self.sender.clone(),
-            download_handler: SnapshotDownloadHandler::new(1024 * 1024),
+            download_handler: FastMutex::new(SnapshotDownloadHandler::new(1024 * 1024)),
             retry_cache: self.retry_cache.clone(),
         }
     }
@@ -102,7 +103,7 @@ impl HandlerService for RaftService {
 
 pub struct RaftHandler {
     sender: mpsc::Sender<Envelope>,
-    download_handler: SnapshotDownloadHandler,
+    download_handler: FastMutex<SnapshotDownloadHandler>,
     retry_cache: Arc<Cache<i64, ()>>,
 }
 
@@ -114,16 +115,16 @@ impl MessageHandler for RaftHandler {
         matches!(code, RaftCode::SnapshotDownload)
     }
 
-    fn handle(&mut self, msg: &Message) -> RaftResult<Message> {
+    fn handle(&self, msg: &Message) -> RaftResult<Message> {
         let code = RaftCode::from(msg.code());
         match code {
-            RaftCode::SnapshotDownload => self.download_handler.handle(msg),
+            RaftCode::SnapshotDownload => self.download_handler.lock().handle(msg),
 
             _ => err_box!("Unsupported request type: {:?}", code),
         }
     }
 
-    async fn async_handle(&mut self, msg: Message) -> Result<Message, Self::Error> {
+    async fn async_handle(&self, msg: Message) -> Result<Message, Self::Error> {
         // Check for duplicate requests
         if RaftCode::from(msg.code()) == RaftCode::Propose {
             match self.retry_cache.get(&msg.req_id()) {

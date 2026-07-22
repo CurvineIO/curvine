@@ -26,11 +26,12 @@ use orpc::err_box;
 use orpc::handler::MessageHandler;
 use orpc::message::{Builder, Message, RequestStatus, ResponseStatus};
 use orpc::runtime::Runtime;
+use orpc::sync::FastMutex;
 use std::sync::Arc;
 
 pub struct WorkerHandler {
     pub store: BlockStore,
-    pub handler: Option<BlockHandler>,
+    pub handler: FastMutex<Option<BlockHandler>>,
     pub task_manager: Arc<TaskManager>,
     pub rt: Arc<Runtime>,
     pub replication_handler: WorkerReplicationHandler,
@@ -39,7 +40,7 @@ pub struct WorkerHandler {
 impl MessageHandler for WorkerHandler {
     type Error = FsError;
 
-    fn handle(&mut self, msg: &Message) -> FsResult<Message> {
+    fn handle(&self, msg: &Message) -> FsResult<Message> {
         crate::fault_point! {
             sync,
             name: "worker.rpc.before_dispatch",
@@ -61,7 +62,8 @@ impl MessageHandler for WorkerHandler {
             RpcCode::SubmitBlockReplicationJob => self.replication_handler.handle(msg),
 
             _ => {
-                let h = self.get_handler(msg)?;
+                let mut handler = self.handler.lock();
+                let h = self.get_handler(msg, &mut handler)?;
                 let res = h.handle(msg);
 
                 if res
@@ -72,7 +74,7 @@ impl MessageHandler for WorkerHandler {
                         RequestStatus::Cancel | RequestStatus::Complete
                     )
                 {
-                    let _ = self.handler.take();
+                    let _ = handler.take();
                 };
 
                 res
@@ -82,20 +84,23 @@ impl MessageHandler for WorkerHandler {
 }
 
 impl WorkerHandler {
-    fn get_handler(&mut self, msg: &Message) -> FsResult<&mut BlockHandler> {
+    fn get_handler<'a>(
+        &self,
+        msg: &Message,
+        handler: &'a mut Option<BlockHandler>,
+    ) -> FsResult<&'a mut BlockHandler> {
         let code = RpcCode::from(msg.code());
 
         let need_new_handler = match msg.request_status() {
             RequestStatus::Open => true,
-            _ => self.handler.is_none() || !Self::handler_matches_code(&self.handler, code),
+            _ => handler.is_none() || !Self::handler_matches_code(handler, code),
         };
 
         if need_new_handler {
-            let handler = BlockHandler::new(code, self.store.clone())?;
-            let _ = self.handler.replace(handler);
+            let _ = handler.replace(BlockHandler::new(code, self.store.clone())?);
         }
 
-        match self.handler.as_mut() {
+        match handler.as_mut() {
             None => err_box!("The request is not initialized"),
             Some(v) => Ok(v),
         }

@@ -226,7 +226,7 @@ fn test_master_sync_and_async_rpc_points_follow_dispatch_paths() -> CommonResult
         faults.configure(id, rule)?;
     }
 
-    let mut handler = new_handler_for_test("fault-dispatch");
+    let handler = new_handler_for_test("fault-dispatch");
     let sync_request = Builder::new_rpc(RpcCode::Mkdir).build();
     let sync_response = handler.handle(&sync_request)?;
 
@@ -248,7 +248,7 @@ fn test_master_sync_and_async_rpc_points_follow_dispatch_paths() -> CommonResult
 }
 
 #[test]
-fn worker_reports_and_metadata_reads_do_not_use_master_sync_pool() {
+fn only_job_requests_use_the_async_handler() {
     let _serial = master_fs_test_serial();
     let handler = new_handler();
 
@@ -257,6 +257,15 @@ fn worker_reports_and_metadata_reads_do_not_use_master_sync_pool() {
         RpcCode::GetJobStatus,
         RpcCode::CancelJob,
         RpcCode::ReportTask,
+    ] {
+        let msg = Builder::new_rpc(code).build();
+        assert!(
+            !handler.is_sync(&msg),
+            "{code:?} must use the async handler"
+        );
+    }
+
+    for code in [
         RpcCode::GetBlockLocations,
         RpcCode::GetMasterInfo,
         RpcCode::ListStatus,
@@ -265,7 +274,7 @@ fn worker_reports_and_metadata_reads_do_not_use_master_sync_pool() {
         RpcCode::WorkerBlockReport,
     ] {
         let msg = Builder::new_rpc(code).build();
-        assert!(!handler.is_sync(&msg), "{code:?} must use an async lane");
+        assert!(handler.is_sync(&msg), "{code:?} must use the sync handler");
     }
 
     let mkdir = Builder::new_rpc(RpcCode::Mkdir).build();
@@ -273,15 +282,14 @@ fn worker_reports_and_metadata_reads_do_not_use_master_sync_pool() {
 }
 
 #[test]
-fn async_rpc_to_standby_returns_rpc_error_response() -> CommonResult<()> {
+fn sync_rpc_to_standby_returns_rpc_error_response() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let mut handler = new_handler();
+    let handler = new_handler();
     let msg = Builder::new_rpc(RpcCode::GetMasterInfo)
         .proto_header(GetMasterInfoRequest::default())
         .build();
 
-    let rt = AsyncRuntime::single();
-    let response = rt.block_on(handler.async_handle(msg))?;
+    let response = handler.handle(&msg)?;
 
     assert!(!response.is_success());
     let err = response.check_error_ext::<FsError>().unwrap_err();

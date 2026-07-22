@@ -54,7 +54,7 @@ impl WorkerReplicationHandler {
 impl MessageHandler for WorkerReplicationHandler {
     type Error = FsError;
 
-    fn handle(&mut self, msg: &Message) -> FsResult<Message> {
+    fn handle(&self, msg: &Message) -> FsResult<Message> {
         let code = RpcCode::from(msg.code());
 
         let mut rpc_context = RpcContext::new(msg);

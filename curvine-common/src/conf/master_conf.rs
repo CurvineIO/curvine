@@ -35,6 +35,9 @@ pub struct MasterConf {
     pub io_timeout: String,
     pub io_close_idle: bool,
 
+    // Whether metadata requests can be processed concurrently within a connection.
+    pub meta_request_concurrent: bool,
+
     // Metadata configuration, currently only supports rocksdb.
     // rocksdb configuration.
     pub meta_dir: String,
@@ -131,6 +134,9 @@ pub struct MasterConf {
 
     pub buffer_size: usize,
 
+    pub conn_limit: usize,
+    pub global_limit: usize,
+
     #[serde(default = "MasterConf::rocksdb_default")]
     pub rocksdb: DBConf,
 }
@@ -163,6 +169,14 @@ impl MasterConf {
 
         if self.heartbeat_interval_unit > self.worker_lost_interval_unit {
             return err_box!("Worker_lost_interval must be greater than heartbeat_interval");
+        }
+
+        if self.conn_limit == 0 {
+            return err_box!("master.conn_limit must be greater than zero");
+        }
+
+        if self.global_limit == 0 {
+            return err_box!("master.global_limit must be greater than zero");
         }
 
         Ok(())
@@ -249,6 +263,7 @@ impl Default for MasterConf {
             actor_threads: 4,
             io_timeout: "10m".to_string(),
             io_close_idle: true,
+            meta_request_concurrent: true,
 
             meta_dir: dir,
 
@@ -319,6 +334,9 @@ impl Default for MasterConf {
             lock_expire_time_unit: Default::default(),
 
             buffer_size: 128 * 1024,
+
+            conn_limit: 8,
+            global_limit: 4096,
 
             rocksdb,
         };

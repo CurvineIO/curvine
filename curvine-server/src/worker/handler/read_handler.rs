@@ -22,7 +22,6 @@ use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::{ByteUnit, TimeSpent};
 use orpc::error::ErrorExt;
-use orpc::handler::MessageHandler;
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::sys::{CacheManager, ReadAheadTask};
 use orpc::{err_box, ternary, try_option_mut, CommonResult};
@@ -200,12 +199,8 @@ impl ReadHandler {
         info!("Read block end for req_id {}", msg.req_id());
         Ok(msg.success())
     }
-}
 
-impl MessageHandler for ReadHandler {
-    type Error = FsError;
-
-    fn handle(&mut self, msg: &Message) -> FsResult<Message> {
+    pub fn handle(&mut self, msg: &Message) -> FsResult<Message> {
         let request_status = msg.request_status();
 
         match request_status {

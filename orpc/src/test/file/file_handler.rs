@@ -17,6 +17,7 @@ use crate::handler::{HandlerService, MessageHandler};
 use crate::io::net::ConnState;
 use crate::io::LocalFile;
 use crate::message::*;
+use crate::sync::FastMutex;
 use crate::sys::{CacheManager, DataSlice, ReadAheadTask};
 use crate::test::file::dir_location::DirLocation;
 use crate::{err_box, CommonResultExt};
@@ -34,8 +35,12 @@ pub enum RpcCode {
 pub struct FileHandler {
     location: Arc<DirLocation>,
     os_cache: Arc<CacheManager>,
-    file: Option<LocalFile>,
     chunk_size: i32,
+    state: FastMutex<FileHandlerState>,
+}
+
+struct FileHandlerState {
+    file: Option<LocalFile>,
     last_task: Option<ReadAheadTask>,
 }
 
@@ -44,13 +49,20 @@ impl FileHandler {
         FileHandler {
             location,
             os_cache,
-            file: None,
             chunk_size,
-            last_task: None,
+            state: FastMutex::new(FileHandlerState {
+                file: None,
+                last_task: None,
+            }),
         }
     }
 
-    pub fn do_open(&mut self, msg: &Message, for_write: bool) -> CommonResultExt<Message> {
+    fn do_open(
+        &self,
+        state: &mut FileHandlerState,
+        msg: &Message,
+        for_write: bool,
+    ) -> CommonResultExt<Message> {
         let block_id = if let Some(ref v) = msg.header {
             let mut bytes = [0; 8];
             bytes.copy_from_slice(&v[0..8]);
@@ -59,16 +71,17 @@ impl FileHandler {
             0
         };
 
-        self.file = Some(self.location.get_or_create(block_id, for_write)?);
+        state.file = Some(self.location.get_or_create(block_id, for_write)?);
         Ok(msg.success_with_data(None, DataSlice::Empty))
     }
 
-    pub fn do_write(&mut self, msg: &Message) -> CommonResultExt<Message> {
+    pub fn do_write(&self, msg: &Message) -> CommonResultExt<Message> {
+        let mut state = self.state.lock();
         match msg.request_status() {
-            RequestStatus::Open => self.do_open(msg, true),
+            RequestStatus::Open => self.do_open(&mut state, msg, true),
 
             RequestStatus::Running => {
-                if let Some(ref mut f) = self.file {
+                if let Some(ref mut f) = state.file {
                     f.write_region(&msg.data)?;
                     Ok(msg.success_with_data(None, DataSlice::Empty))
                 } else {
@@ -80,14 +93,17 @@ impl FileHandler {
         }
     }
 
-    pub fn do_read(&mut self, msg: &Message) -> CommonResultExt<Message> {
+    pub fn do_read(&self, msg: &Message) -> CommonResultExt<Message> {
+        let mut state = self.state.lock();
         match msg.request_status() {
-            RequestStatus::Open => self.do_open(msg, false),
+            RequestStatus::Open => self.do_open(&mut state, msg, false),
 
             RequestStatus::Running => {
-                if let Some(ref mut f) = self.file {
-                    self.last_task = f.read_ahead(&self.os_cache, self.last_task.take());
+                let last_task = state.last_task.take();
+                if let Some(ref mut f) = state.file {
+                    let next_task = f.read_ahead(&self.os_cache, last_task);
                     let region = f.read_region(true, self.chunk_size)?;
+                    state.last_task = next_task;
                     Ok(msg.success_with_data(None, region))
                 } else {
                     err_box!("file not initialized")
@@ -102,7 +118,7 @@ impl FileHandler {
 impl MessageHandler for FileHandler {
     type Error = CommonErrorExt;
 
-    fn handle(&mut self, msg: &Message) -> CommonResultExt<Message> {
+    fn handle(&self, msg: &Message) -> CommonResultExt<Message> {
         let code = RpcCode::from(msg.protocol.code);
         match code {
             RpcCode::Write => self.do_write(msg),

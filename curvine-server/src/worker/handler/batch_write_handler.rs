@@ -16,7 +16,6 @@ use crate::worker::block::BlockStore;
 use crate::worker::handler::WriteContext;
 use crate::worker::handler::WriteHandler;
 use crate::worker::storage::BlockWriteContext;
-use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     BlockWriteRequest, BlockWriteResponse, BlocksBatchCommitRequest, BlocksBatchCommitResponse,
@@ -26,7 +25,6 @@ use curvine_common::proto::{
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use orpc::err_box;
-use orpc::handler::MessageHandler;
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::sys::DataSlice;
 use orpc::CommonResult;
@@ -349,11 +347,8 @@ impl BatchWriteHandler {
 
         Ok(msg.success())
     }
-}
 
-impl MessageHandler for BatchWriteHandler {
-    type Error = FsError;
-    fn handle(&mut self, msg: &Message) -> FsResult<Message> {
+    pub fn handle(&mut self, msg: &Message) -> FsResult<Message> {
         let request_status = msg.request_status();
         match request_status {
             // batch operations

@@ -21,7 +21,7 @@ use curvine_fault::FaultHttpControl;
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::error;
 use orpc::common::{LocalTime, Logger};
-use orpc::handler::HandlerService;
+use orpc::handler::{HandlerService, LimitConf};
 use orpc::io::net::ConnState;
 use orpc::runtime::{AsyncRuntime, RpcRuntime, Runtime};
 use orpc::server::{RpcServer, ServerStateListener};
@@ -47,6 +47,7 @@ pub struct MasterService {
     rt: Arc<Runtime>,
     actor_rt: Arc<Runtime>,
     replication_manager: Arc<MasterReplicationManager>,
+    limit: LimitConf,
     metrics: &'static MasterMetrics,
     fault_http: FaultHttpControl,
 }
@@ -69,6 +70,7 @@ impl MasterService {
             1,
             conf.master.actor_threads,
         ));
+        let limit = LimitConf::new(conf.master.conn_limit, conf.master.global_limit);
         Self {
             conf,
             fs,
@@ -78,6 +80,7 @@ impl MasterService {
             rt,
             actor_rt,
             replication_manager,
+            limit,
             metrics,
             fault_http,
         }
@@ -119,6 +122,14 @@ impl HandlerService for MasterService {
             self.actor_rt.clone(),
             self.metrics,
         )
+    }
+
+    fn is_stream(&self) -> bool {
+        !self.conf.master.meta_request_concurrent
+    }
+
+    fn get_limit(&self) -> LimitConf {
+        self.limit.clone()
     }
 }
 

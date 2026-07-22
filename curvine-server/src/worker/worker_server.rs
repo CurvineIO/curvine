@@ -32,6 +32,7 @@ use orpc::io::net::ConnState;
 use orpc::io::spdk_env::SpdkEnv;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::server::{RpcServer, ServerStateListener};
+use orpc::sync::FastMutex;
 use orpc::{CommonError, CommonResult};
 use std::sync::Arc;
 use std::thread;
@@ -87,7 +88,7 @@ impl HandlerService for WorkerService {
     fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
         WorkerHandler {
             store: self.store.clone(),
-            handler: None,
+            handler: FastMutex::new(None),
             task_manager: self.task_manager.clone(),
             rt: self.rt.clone(),
             replication_handler: WorkerReplicationHandler::new(&self.replication_manager),

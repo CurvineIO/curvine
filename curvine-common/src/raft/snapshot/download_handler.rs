@@ -14,9 +14,8 @@
 
 use crate::proto::raft::{SnapshotDownloadRequest, SnapshotDownloadResponse};
 use crate::raft::snapshot::FileReader;
-use crate::raft::{RaftError, RaftResult, RaftUtils};
+use crate::raft::{RaftResult, RaftUtils};
 use log::{debug, error};
-use orpc::handler::MessageHandler;
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::sys::DataSlice;
 use orpc::{err_box, try_option_mut};
@@ -93,12 +92,8 @@ impl SnapshotDownloadHandler {
         let _ = self.reader.take();
         Ok(msg.success())
     }
-}
 
-impl MessageHandler for SnapshotDownloadHandler {
-    type Error = RaftError;
-
-    fn handle(&mut self, msg: &Message) -> RaftResult<Message> {
+    pub fn handle(&mut self, msg: &Message) -> RaftResult<Message> {
         let res = match msg.request_status() {
             RequestStatus::Open => self.open(msg),
 
