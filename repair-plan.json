@@ -1,0 +1,36 @@
+{
+  "github_issue": 1255,
+  "topic_id": "FUSE-XATTR-SEMANTICS",
+  "fingerprint": "sha256:6caf8b60df8a3b54139b6be443925ae988ae95ff509e1a77a35ed36c6a8858d3",
+  "curvine_sha": "abe42934895c49a3203d8a202c00241bc9d8402a",
+  "root_cause": "curvine-fuse xattr and file-flag semantics diverge from Linux: removexattr succeeds when attribute is absent; user.* xattrs are not rejected on special nodes; socket mknod/bind is unsupported; FS_IOC_SETFLAGS is unimplemented so immutable setup fails.",
+  "affected_modules": [
+    "curvine-fuse/src/fs/curvine_file_system.rs",
+    "curvine-fuse/src/fuse_utils.rs",
+    "curvine-fuse/src/raw/fuse_abi.rs",
+    "curvine-fuse/src/session/fuse_request.rs",
+    "curvine-fuse/src/fs/operator.rs",
+    "curvine-common/src/state/file_type.rs",
+    "curvine-common/proto/common.proto"
+  ],
+  "planned_changes": [
+    "Return ENODATA when removexattr targets a missing user attribute",
+    "Reject user.* xattr get/set on fifo/char/block/socket nodes with ENODATA",
+    "Add socket special-file mknod support and read-only metadata open handles",
+    "Implement FUSE_IOCTL FS_IOC_GETFLAGS/SETFLAGS via internal curvine.i_flags xattr",
+    "Block setxattr/removexattr on immutable/append-only files with EPERM"
+  ],
+  "not_goals": [
+    "Full AF_UNIX bind/connect semantics beyond socket node creation (issue #1257)",
+    "Trusted or security xattr namespaces",
+    "General ioctl passthrough beyond file flags"
+  ],
+  "verification_plan": [
+    "make format",
+    "cargo test -p curvine-fuse xattr -- --nocapture",
+    "cargo test -p curvine-fuse ioctl -- --nocapture",
+    "cargo clippy -p curvine-fuse --all-targets"
+  ],
+  "estimated_source_line_delta": 280,
+  "risk": "low"
+}

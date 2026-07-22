@@ -28,7 +28,9 @@ mod worker_node_tree;
 pub use self::worker_node_tree::WorkerNodeTree;
 
 mod file_type;
-pub use self::file_type::{is_special_file_type, FileType, MKNOD_RDEV_XATTR};
+pub use self::file_type::{
+    is_special_file_type, FileType, FS_APPEND_FL, FS_IMMUTABLE_FL, IFLAGS_XATTR, MKNOD_RDEV_XATTR,
+};
 
 mod ttl_action;
 pub use self::ttl_action::TtlAction;

@@ -23,12 +23,13 @@ use curvine_common::conf::FuseConf;
 use curvine_common::fs::Path;
 use curvine_common::state::{
     CreateFileOpts, CreateFileOptsBuilder, FileStatus, FileType, MkdirOpts, MkdirOptsBuilder,
-    SetAttrOpts, MKNOD_RDEV_XATTR,
+    SetAttrOpts, FS_APPEND_FL, FS_IMMUTABLE_FL, IFLAGS_XATTR, MKNOD_RDEV_XATTR,
 };
 use orpc::common::LocalTime;
 use orpc::io::IOResult;
 use orpc::sys;
 use orpc::sys::{FFIUtils, RawIO};
+use std::collections::HashMap;
 use std::process::Command;
 use std::slice;
 
@@ -123,6 +124,8 @@ impl FuseUtils {
             FileType::Char => perm | (libc::S_IFCHR as u32),
             #[cfg(target_os = "linux")]
             FileType::Block => perm | (libc::S_IFBLK as u32),
+            #[cfg(target_os = "linux")]
+            FileType::Socket => perm | (libc::S_IFSOCK as u32),
             _ => perm | (libc::S_IFREG as u32),
         }
     }
@@ -133,6 +136,7 @@ impl FuseUtils {
             t if t == libc::S_IFIFO as u32 => Some(FileType::Fifo),
             t if t == libc::S_IFCHR as u32 => Some(FileType::Char),
             t if t == libc::S_IFBLK as u32 => Some(FileType::Block),
+            t if t == libc::S_IFSOCK as u32 => Some(FileType::Socket),
             _ => None,
         }
     }
@@ -252,7 +256,7 @@ impl FuseUtils {
         let size = match status.file_type {
             FileType::Link => status.target.as_ref().map(|x| x.len()).unwrap_or(0) as u64,
             FileType::Dir => FUSE_DEFAULT_PAGE_SIZE as u64,
-            FileType::Fifo | FileType::Char | FileType::Block => 0,
+            FileType::Fifo | FileType::Char | FileType::Block | FileType::Socket => 0,
             // Regular files (File / Stream / Agg / Object) take their size from
             // `status.len`. Defend the FUSE boundary against abnormal backend
             // data: a negative len would cast to a huge u64, so reject it.
@@ -292,7 +296,7 @@ impl FuseUtils {
         // Kernel requested POSIX_ACL support (kernel_requested_POSIX_ACL: 1048576)
         // but we disabled it in our response, yet kernel still queries ACL attributes
         match name {
-            MKNOD_RDEV_XATTR
+            MKNOD_RDEV_XATTR | IFLAGS_XATTR
             | "security.capability"
             | "security.selinux"
             | "system.posix_acl_access"
@@ -306,6 +310,67 @@ impl FuseUtils {
             _ => Ok(()),
         }
     }
+
+    /// Linux `FS_IOC_GETFLAGS` on aarch64/x86_64.
+    pub const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
+
+    /// Linux `FS_IOC_SETFLAGS` on aarch64/x86_64.
+    pub const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
+
+    const FS_IOCTL_MUTABLE_FLAGS: u32 = FS_IMMUTABLE_FL | FS_APPEND_FL;
+
+    pub fn user_xattr_supported(file_type: FileType) -> bool {
+        matches!(
+            file_type,
+            FileType::File | FileType::Dir | FileType::Link
+        )
+    }
+
+    pub fn check_user_xattr_namespace(file_type: FileType, name: &str) -> FuseResult<()> {
+        if name.starts_with("user.") && !Self::user_xattr_supported(file_type) {
+            return err_fuse!(
+                libc::ENODATA,
+                "user xattr not supported on {:?}",
+                file_type
+            );
+        }
+        Ok(())
+    }
+
+    pub fn file_flags_from_status(status: &FileStatus) -> u32 {
+        status
+            .x_attr
+            .get(IFLAGS_XATTR)
+            .and_then(|bytes| {
+                let arr: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+                Some(u32::from_le_bytes(arr))
+            })
+            .unwrap_or(0)
+    }
+
+    pub fn file_has_immutable_or_append(status: &FileStatus) -> bool {
+        let flags = Self::file_flags_from_status(status);
+        flags & Self::FS_IOCTL_MUTABLE_FLAGS != 0
+    }
+
+    pub fn set_attr_for_file_flags(_status: &FileStatus, new_flags: u32) -> SetAttrOpts {
+        let mut add_x_attr = HashMap::new();
+        add_x_attr.insert(
+            IFLAGS_XATTR.to_string(),
+            Self::normalize_ioctl_file_flags(new_flags)
+                .to_le_bytes()
+                .to_vec(),
+        );
+        SetAttrOpts {
+            add_x_attr,
+            ..Default::default()
+        }
+    }
+
+    pub fn normalize_ioctl_file_flags(flags: u32) -> u32 {
+        flags & Self::FS_IOCTL_MUTABLE_FLAGS
+    }
+
 
     pub fn file_open_flags(conf: &FuseConf, keep_cache: bool) -> u32 {
         let mut flags = 0;
@@ -882,7 +947,31 @@ mod tests {
             FuseUtils::special_file_type_from_mode(0o10777),
             Some(FileType::Fifo)
         );
+        assert_eq!(
+            FuseUtils::special_file_type_from_mode(0o140777),
+            Some(FileType::Socket)
+        );
         assert!(FuseUtils::special_file_type_from_mode(0o100644).is_none());
+    }
+
+    #[test]
+    fn user_xattr_namespace_rejects_special_nodes() {
+        let err = FuseUtils::check_user_xattr_namespace(FileType::Fifo, "user.test")
+            .unwrap_err();
+        assert_eq!(err.errno(), libc::ENODATA);
+        FuseUtils::check_user_xattr_namespace(FileType::File, "user.test").unwrap();
+    }
+
+    #[test]
+    fn file_flags_round_trip_through_internal_xattr() {
+        let mut status = file_status(FileType::File, 0, 0o644);
+        let opts = FuseUtils::set_attr_for_file_flags(&status, FS_IMMUTABLE_FL | FS_APPEND_FL);
+        status.x_attr.extend(opts.add_x_attr);
+        assert_eq!(
+            FuseUtils::file_flags_from_status(&status),
+            FS_IMMUTABLE_FL | FS_APPEND_FL
+        );
+        assert!(FuseUtils::file_has_immutable_or_append(&status));
     }
 
     #[test]

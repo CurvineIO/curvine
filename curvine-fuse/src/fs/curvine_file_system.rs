@@ -728,6 +728,7 @@ impl fs::FileSystem for CurvineFileSystem {
         FuseUtils::check_xattr(name, XattrOp::Get)?;
 
         let status = self.state.fs_stat(op.header.nodeid, None).await?;
+        FuseUtils::check_user_xattr_namespace(status.file_type, name)?;
         let mut buf = FuseBuf::default();
         if let Some(value) = status.x_attr.get(name) {
             if op.arg.size == 0 {
@@ -749,6 +750,47 @@ impl fs::FileSystem for CurvineFileSystem {
         Ok(buf.take())
     }
 
+    async fn ioctl(&self, op: Ioctl<'_>) -> FuseResult<BytesMut> {
+        let path = self.state.get_path(op.header.nodeid)?;
+        let mut status = self.state.fs_stat(op.header.nodeid, None).await?;
+        let (result, out_flags) = match op.arg.cmd {
+            FuseUtils::FS_IOC_GETFLAGS => {
+                if op.arg.out_size < 4 {
+                    return err_fuse!(libc::EINVAL, "ioctl out buffer too small");
+                }
+                (0, FuseUtils::file_flags_from_status(&status))
+            }
+            FuseUtils::FS_IOC_SETFLAGS => {
+                self.ensure_writable_path(&path, RpcCode::SetAttr).await?;
+                if op.in_data.len() < 4 {
+                    return err_fuse!(libc::EINVAL, "ioctl in buffer too small");
+                }
+                if op.arg.out_size < 4 {
+                    return err_fuse!(libc::EINVAL, "ioctl out buffer too small");
+                }
+                let mut bytes = [0u8; 4];
+                bytes.copy_from_slice(&op.in_data[..4]);
+                let requested = u32::from_ne_bytes(bytes);
+                let new_flags = FuseUtils::normalize_ioctl_file_flags(requested);
+                let opts = FuseUtils::set_attr_for_file_flags(&status, new_flags);
+                status = self.state.fs_set_attr(op.header.nodeid, opts).await?;
+                (0, FuseUtils::file_flags_from_status(&status))
+            }
+            _ => return err_fuse!(libc::ENOTTY, "unsupported ioctl cmd {:#x}", op.arg.cmd),
+        };
+
+        let out = fuse_ioctl_out {
+            result,
+            flags: 0,
+            in_iovs: 0,
+            out_iovs: 0,
+        };
+        let mut buf = BytesMut::from(FuseUtils::struct_as_bytes(&out));
+        buf.extend_from_slice(&out_flags.to_ne_bytes());
+        Ok(buf)
+    }
+
+
     async fn set_xattr(&self, op: SetXAttr<'_>) -> FuseResult<()> {
         let name = try_option!(op.name.to_str());
         FuseUtils::check_xattr(name, XattrOp::Set)?;
@@ -759,6 +801,13 @@ impl fs::FileSystem for CurvineFileSystem {
         // concurrent CREATE/REPLACE requests cannot both validate stale state.
         let _guard = self.state.lock_path(&path).await;
         let status = self.state.fs_stat(op.header.nodeid, None).await?;
+        FuseUtils::check_user_xattr_namespace(status.file_type, name)?;
+        if FuseUtils::file_has_immutable_or_append(&status) {
+            return err_fuse!(
+                libc::EPERM,
+                "xattr modification not permitted on immutable/append-only file"
+            );
+        }
         Self::validate_set_xattr_flags(op.arg.flags, status.x_attr.contains_key(name))?;
 
         // Get the xattr value from the request
@@ -787,6 +836,17 @@ impl fs::FileSystem for CurvineFileSystem {
         // Share the same path lock as set_xattr so a conditional REPLACE does
         // not validate existence immediately before a concurrent removal.
         let _guard = self.state.lock_path(&path).await;
+        let status = self.state.fs_stat(op.header.nodeid, None).await?;
+        FuseUtils::check_user_xattr_namespace(status.file_type, name)?;
+        if FuseUtils::file_has_immutable_or_append(&status) {
+            return err_fuse!(
+                libc::EPERM,
+                "xattr modification not permitted on immutable/append-only file"
+            );
+        }
+        if !status.x_attr.contains_key(name) {
+            return err_fuse!(libc::ENODATA, "No such attribute: {}", name);
+        }
 
         debug!("Removing xattr: path='{}' name='{}'", path, name);
 
@@ -1041,10 +1101,22 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path(op.header.nodeid)?;
         let status = self.state.fs_stat(op.header.nodeid, None).await?;
         if is_special_file_type(status.file_type) {
-            return err_fuse!(
-                libc::EOPNOTSUPP,
-                "open not supported for special file nodes"
-            );
+            let truncate = (op.arg.flags & libc::O_TRUNC as u32) != 0;
+            if action.write() || truncate {
+                return err_fuse!(
+                    libc::EACCES,
+                    "special file nodes are read-only metadata"
+                );
+            }
+            self.check_permissions(op.header, action.acl_mask()).await?;
+            let ino = op.header.nodeid;
+            let handle = self.state.new_meta_handle(ino, status).await?;
+            let open_flags = FuseUtils::file_open_flags(&self.conf, false);
+            return Ok(fuse_open_out {
+                fh: handle.fh(),
+                open_flags,
+                padding: 0,
+            });
         }
         let truncate = (op.arg.flags & libc::O_TRUNC as u32) != 0;
         if action.write() || truncate {

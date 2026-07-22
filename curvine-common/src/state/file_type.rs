@@ -48,11 +48,25 @@ pub enum FileType {
     Char = 7,
 
     Block = 8,
+
+    Socket = 9,
 }
 
 /// Extended attribute key storing the device number (little-endian u32) for special nodes.
 pub const MKNOD_RDEV_XATTR: &str = "curvine.rdev";
 
+/// Extended attribute key storing Linux FS_IOC_* file flags (little-endian u32).
+pub const IFLAGS_XATTR: &str = "curvine.i_flags";
+
+/// Linux `FS_IMMUTABLE_FL` (see `linux/fs.h`).
+pub const FS_IMMUTABLE_FL: u32 = 0x0000_0010;
+
+/// Linux `FS_APPEND_FL` (see `linux/fs.h`).
+pub const FS_APPEND_FL: u32 = 0x0000_0020;
+
 pub fn is_special_file_type(file_type: FileType) -> bool {
-    matches!(file_type, FileType::Fifo | FileType::Char | FileType::Block)
+    matches!(
+        file_type,
+        FileType::Fifo | FileType::Char | FileType::Block | FileType::Socket
+    )
 }

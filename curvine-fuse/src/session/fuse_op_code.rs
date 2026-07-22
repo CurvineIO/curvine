@@ -168,14 +168,9 @@ impl FuseOpCode {
             //     (fuseblk) filesystems; meaningless for a distributed fs.
             //   - FUSE_POLL:  readiness for special/char files; regular files are
             //     always ready, so the VFS never needs it here.
-            //   - FUSE_IOCTL: device/fs-specific ioctls; no passthrough (and
-            //     FUSE_HAS_IOCTL_DIR is deliberately not negotiated in init).
             //   - FUSE_LSEEK: SEEK_HOLE/SEEK_DATA only; ENOSYS is a safe VFS
             //     fallback (kernel treats the file as hole-less).
-            FuseOpCode::FUSE_BMAP
-            | FuseOpCode::FUSE_POLL
-            | FuseOpCode::FUSE_IOCTL
-            | FuseOpCode::FUSE_LSEEK => Unsupported,
+            FuseOpCode::FUSE_BMAP | FuseOpCode::FUSE_POLL | FuseOpCode::FUSE_LSEEK => Unsupported,
 
             // Not dispatched as a FileSystem op: NOT_SUPPORTED is the num_enum
             // default for unknown raw opcodes; CUSE_INIT is a CUSE handshake, not
@@ -226,7 +221,8 @@ impl FuseOpCode {
             | FuseOpCode::FUSE_DESTROY
             | FuseOpCode::FUSE_FALLOCATE
             | FuseOpCode::FUSE_READDIRPLUS
-            | FuseOpCode::FUSE_RENAME2 => Handled,
+            | FuseOpCode::FUSE_RENAME2
+            | FuseOpCode::FUSE_IOCTL => Handled,
         }
     }
 }
@@ -339,7 +335,7 @@ mod tests {
             (FuseOpCode::FUSE_INTERRUPT, NoReply),
             (FuseOpCode::FUSE_BMAP, Unsupported),
             (FuseOpCode::FUSE_DESTROY, Handled),
-            (FuseOpCode::FUSE_IOCTL, Unsupported),
+            (FuseOpCode::FUSE_IOCTL, Handled),
             (FuseOpCode::FUSE_POLL, Unsupported),
             (FuseOpCode::FUSE_NOTIFY_REPLY, Internal),
             (FuseOpCode::FUSE_BATCH_FORGET, NoReply),
