@@ -296,6 +296,18 @@ impl CurvineFileSystem {
         Ok(res)
     }
 
+    /// The readdir resume cookie for the entry at zero-based directory position
+    /// `index`: the offset the kernel must pass on the next readdir to continue
+    /// AFTER this entry, i.e. the position of the FOLLOWING entry (`index + 1`).
+    ///
+    /// This is deliberately a tiny named function so the +1 is covered by a
+    /// regression test: encoding `index` instead makes the last entry of a batch
+    /// carry a cookie equal to the batch's start offset, so the kernel re-requests
+    /// the same offset forever and readdir never terminates (issue #1116).
+    fn readdir_next_cookie(index: u64) -> u64 {
+        index + 1
+    }
+
     /// Returns the encoded dirent list plus the number of entries successfully
     /// added this batch (`index - arg.offset`), which is what `readdir_entries`
     /// observes — NOT `FuseDirentList`'s byte length and NOT the directory total.
@@ -325,7 +337,10 @@ impl CurvineFileSystem {
                 };
 
                 let entry = FuseUtils::create_entry_out(&self.conf, attr);
-                if !res.add_dirent(plus, index, &status, entry) {
+                // dirent `off` is the resume cookie = position of the NEXT entry.
+                // See `readdir_next_cookie` (issue #1116 infinite-loop guard).
+                let next_off = Self::readdir_next_cookie(index);
+                if !res.add_dirent(plus, next_off, &status, entry) {
                     batch.push_front(status);
                     break;
                 }
@@ -1777,5 +1792,114 @@ mod tests {
                                                                  // An unknown high bit must also be rejected — checked against the raw
                                                                  // value, so it is not silently truncated away (the RenameFlags footgun).
         assert!(!CurvineFileSystem::rename2_flags_supported(1 << 6));
+    }
+
+    // Issue #1116: readdir must terminate. The dirent `off` field is the kernel's
+    // resume cookie; encoding the current entry's position instead of the next
+    // one makes the last entry of a batch carry a cookie equal to the offset the
+    // kernel resumes at, so the kernel re-requests the same offset forever.
+    //
+    // This harness faithfully replays the kernel readdir protocol against the
+    // PRODUCTION pieces: each round calls the real `DirHandle::get_batch` (which
+    // owns the forward-only skip/positioning semantics) to fetch entries starting
+    // at `offset`, then derives the next `offset` from the last entry's cookie via
+    // the production `CurvineFileSystem::readdir_next_cookie`. Termination, no
+    // duplicates, and no omissions are all asserted. With the pre-fix cookie
+    // formula (`index`) the loop never advances past the tail entry and the round
+    // guard trips — which is exactly the regression this pins.
+    mod readdir_termination {
+        use crate::fs::state::DirHandle;
+        use curvine_common::fs::{ListStream, Path};
+        use curvine_common::state::FileStatus;
+        use orpc::runtime::{AsyncRuntime, RpcRuntime};
+
+        fn entries(names: &[&str]) -> Vec<FileStatus> {
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| FileStatus::with_name(i as i64, n.to_string(), false))
+                .collect()
+        }
+
+        // Replay the kernel readdir loop with a caller-supplied cookie function so
+        // the test can exercise both the production formula and (as a discriminator)
+        // the buggy pre-fix one. Returns the sequence of names handed to the kernel,
+        // or Err if the loop fails to terminate within `max_rounds`.
+        fn replay_readdir<F>(
+            names: &[&str],
+            cookie: F,
+            max_rounds: usize,
+        ) -> Result<Vec<String>, String>
+        where
+            F: Fn(u64) -> u64,
+        {
+            let rt = AsyncRuntime::single();
+            rt.block_on(async {
+                let path = Path::from_str("/d").unwrap();
+                let mut seen = Vec::new();
+                let mut offset: u64 = 0;
+
+                for _ in 0..max_rounds {
+                    // A fresh handle each round models the worst case where the
+                    // stream is (re)positioned purely from `offset` — the same
+                    // path the real daemon takes on a resumed/rebuilt readdir.
+                    let handle = DirHandle::new(
+                        1,
+                        1,
+                        &path,
+                        1000,
+                        ListStream::from_vec(entries(names)),
+                    );
+                    let batch = handle.get_batch(offset as usize).await.unwrap();
+                    if batch.is_empty() {
+                        return Ok(seen); // kernel sees 0 entries => readdir done
+                    }
+
+                    // The kernel consumes the batch and remembers the LAST entry's
+                    // cookie as the offset for its next request.
+                    let mut index = offset;
+                    let mut last_cookie = offset;
+                    for st in batch {
+                        seen.push(st.name.clone());
+                        last_cookie = cookie(index);
+                        index += 1;
+                    }
+                    offset = last_cookie;
+                }
+                Err(format!(
+                    "readdir did not terminate within {} rounds (offset stuck at {}, {} entries emitted)",
+                    max_rounds,
+                    offset,
+                    seen.len()
+                ))
+            })
+        }
+
+        #[test]
+        fn production_cookie_terminates_and_enumerates_each_entry_once() {
+            let names = ["a", "b", "c", "d", "e"];
+            let seen = replay_readdir(&names, super::CurvineFileSystem::readdir_next_cookie, 100)
+                .expect("production readdir_next_cookie must let readdir terminate");
+            assert_eq!(
+                seen,
+                names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "every entry enumerated exactly once, in order, with no repeats"
+            );
+        }
+
+        // Discriminator: the pre-fix formula (cookie = current index) makes the
+        // loop stick on the tail entry and never terminate. This proves the
+        // harness above actually catches an off-by-one regression rather than
+        // passing vacuously.
+        #[test]
+        fn prefix_cookie_would_loop_forever() {
+            let names = ["a", "b", "c", "d", "e"];
+            let result = replay_readdir(&names, |index| index, 100);
+            assert!(
+                result.is_err(),
+                "cookie=index (pre-#1116 bug) must fail to terminate, got {:?}",
+                result
+            );
+        }
     }
 }
