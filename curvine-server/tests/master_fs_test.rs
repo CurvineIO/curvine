@@ -284,7 +284,7 @@ fn only_job_requests_use_the_async_handler() {
 #[test]
 fn async_rpc_to_standby_returns_rpc_error_response() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let mut handler = new_handler();
+    let handler = new_handler();
     let msg = Builder::new_rpc(RpcCode::GetMasterInfo)
         .proto_header(GetMasterInfoRequest::default())
         .build();
