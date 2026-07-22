@@ -15,6 +15,7 @@
 use crate::fuse_error::{errno_of, FuseError};
 use crate::session::FuseResponse;
 use curvine_common::FsResult;
+use log::warn;
 use orpc::sync::channel::CallSender;
 
 /// Deliver a backend stream-op result (`Flush`/`Complete`/`Resize`) to the
@@ -58,14 +59,29 @@ pub(crate) async fn deliver_stream_result(
                 Ok(()) => Ok(()),
                 Err(e) => Err(FuseError::from_errno_msg(errno_of(e), e.to_string().into())),
             };
-            tx.send(Ok(()))?;
-            reply.send_rep(kernel_rep).await?;
+            if let Err(e) = tx.send(Ok(())) {
+                // The dispatch future was cancelled after submitting the task.
+                // Still attempt the authoritative kernel reply, and keep the
+                // stream worker alive for subsequent operations.
+                warn!("failed to deliver stream result to internal caller: {}", e);
+            }
+            if let Err(e) = reply.send_rep(kernel_rep).await {
+                // The backend work and internal notification are already done.
+                // A closed reply channel is local to this request and must not
+                // terminate the long-lived reader/writer worker.
+                warn!("failed to send FUSE stream reply: {}", e);
+            }
         }
 
         // Internal-caller path: tx is the only way back, so the real backend
         // result must travel on it (do not swallow the error — issue #1118).
         None => {
-            tx.send(res)?;
+            if let Err(e) = tx.send(res) {
+                // An internal caller can be cancelled while its backend task is
+                // in flight. Treat the abandoned receiver like a reply-send
+                // failure instead of killing the shared worker.
+                warn!("failed to deliver stream result to internal caller: {}", e);
+            }
         }
     }
 
@@ -189,5 +205,26 @@ mod tests {
             ),
             _ => panic!("expected FuseTask::Reply"),
         }
+    }
+
+    #[tokio::test]
+    async fn closed_reply_channel_does_not_fail_internal_completion() {
+        use crate::session::{FuseResponse, FuseTask};
+        use orpc::sync::channel::AsyncChannel;
+
+        let (task_tx, task_rx) = AsyncChannel::<FuseTask>::new(1).split();
+        drop(task_rx);
+        let reply = FuseResponse::new_reply(1, task_tx, false, None);
+        let (tx, rx) = CallChannel::channel::<FsResult<()>>();
+
+        deliver_stream_result(Ok(()), tx, Some(reply))
+            .await
+            .expect("reply-send failure is best effort");
+
+        assert!(rx
+            .receive()
+            .await
+            .expect("internal completion is delivered first")
+            .is_ok());
     }
 }

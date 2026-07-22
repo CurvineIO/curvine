@@ -22,7 +22,7 @@ use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Writer};
 use curvine_common::state::{FileAllocOpts, FileStatus};
 use curvine_common::FsResult;
-use log::error;
+use log::{error, warn};
 use orpc::common::LocalTime;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
@@ -297,7 +297,13 @@ impl FuseWriter {
                     }
 
                     if let Some(reply) = reply {
-                        reply.send_rep(res).await?;
+                        if let Err(e) = reply.send_rep(res).await {
+                            // The backend operation is already finished. A reply
+                            // enqueue failure means that this request's receiver
+                            // has gone away; it must not terminate the long-lived
+                            // writer worker and break later requests on the handle.
+                            warn!("failed to send FUSE write reply: {}", e);
+                        }
                     } else {
                         res?;
                     }
@@ -447,6 +453,7 @@ mod tests {
         };
         use crate::raw::fuse_abi::{fuse_in_header, fuse_write_in};
         use crate::session::{FuseResponse, FuseTask};
+        use bytes::Bytes;
         use curvine_client::unified::UnifiedWriter;
         use curvine_common::conf::FuseConf;
         use curvine_common::fs::local::LocalWriter;
@@ -470,6 +477,65 @@ mod tests {
                 active: Some(ActiveGuard::new(gauge)),
             };
             FuseResponse::new_reply(1, tx, false, Some(ctx))
+        }
+
+        fn closed_reply(unique: u64) -> FuseResponse {
+            let (tx, rx) = AsyncChannel::<FuseTask>::new(1).split();
+            drop(rx);
+            FuseResponse::new_reply(unique, tx, false, None)
+        }
+
+        #[test]
+        fn reply_send_error_does_not_kill_writer_worker() {
+            let rt = AsyncRuntime::single();
+            rt.block_on(async {
+                let path_buf = std::env::temp_dir().join(format!(
+                    "fw_reply_failure_{}_{:?}",
+                    std::process::id(),
+                    std::thread::current().id()
+                ));
+                let path = curvine_common::fs::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+
+                // This is a lifecycle test, not a metrics test. Keep it isolated
+                // from the process-global metric counters used by parallel tests.
+                let mut conf = FuseConf::default();
+                conf.metrics_enabled = false;
+                let writer = UnifiedWriter::Local(LocalWriter::new(&path, 4096).unwrap());
+                let rt2 = Arc::new(AsyncRuntime::single());
+                let fuse_writer = FuseWriter::new(&conf, rt2.clone(), writer);
+                std::mem::forget(rt2);
+
+                // The first write succeeds in the backend, but its reply receiver
+                // is already closed. The following flush must still be handled by
+                // the same worker.
+                fuse_writer
+                    .write(0, Bytes::from_static(b"first"), Some(closed_reply(1)))
+                    .await
+                    .unwrap();
+                fuse_writer
+                    .flush(None)
+                    .await
+                    .expect("writer survives a write reply-send failure");
+
+                // Exercise the shared flush/complete result helper as well. Its
+                // internal completion arrives before this closed kernel reply;
+                // a later write and complete prove that the worker kept running.
+                fuse_writer
+                    .flush(Some(closed_reply(2)))
+                    .await
+                    .expect("flush caller receives the backend result");
+                fuse_writer
+                    .write(5, Bytes::from_static(b"second"), None)
+                    .await
+                    .unwrap();
+                fuse_writer
+                    .complete(None)
+                    .await
+                    .expect("writer survives a flush reply-send failure");
+
+                assert_eq!(std::fs::read(&path_buf).unwrap(), b"firstsecond");
+                let _ = std::fs::remove_file(&path_buf);
+            });
         }
 
         // A real FuseWriter over UnifiedWriter::Local drives the write task body via
