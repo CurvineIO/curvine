@@ -16,7 +16,6 @@ use crate::worker::block::BlockStore;
 use crate::worker::handler::WriteContext;
 use crate::worker::storage::BlockWriteContext;
 use crate::worker::{Worker, WorkerMetrics};
-use curvine_common::error::FsError;
 use curvine_common::proto::{BlockWriteResponse, DataHeaderProto};
 use curvine_common::state::{ExtendedBlock, FileAllocMode};
 use curvine_common::FsResult;

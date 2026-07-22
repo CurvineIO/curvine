@@ -16,7 +16,6 @@ use crate::worker::block::BlockStore;
 use crate::worker::handler::WriteContext;
 use crate::worker::handler::WriteHandler;
 use crate::worker::storage::BlockWriteContext;
-use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     BlockWriteRequest, BlockWriteResponse, BlocksBatchCommitRequest, BlocksBatchCommitResponse,
