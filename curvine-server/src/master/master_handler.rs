@@ -738,7 +738,11 @@ impl MessageHandler for MasterHandler {
         let code = RpcCode::from(msg.code());
         !matches!(
             code,
-            RpcCode::SubmitJob | RpcCode::GetJobStatus | RpcCode::CancelJob | RpcCode::ReportTask
+            RpcCode::SubmitJob
+                | RpcCode::GetJobStatus
+                | RpcCode::CancelJob
+                | RpcCode::ReportTask
+                | RpcCode::GetMasterInfo
         )
     }
 
@@ -760,7 +764,10 @@ impl MessageHandler for MasterHandler {
 
         // Check whether the master is active
         if !self.fs.master_monitor.is_active() {
-            return Err(FsError::not_leader_master(ctx.code, self.client_ip()));
+            return Ok(msg.error_ext(&FsError::not_leader_master(
+                ctx.code,
+                self.client_ip(),
+            )));
         }
 
         // Unified processing of all RPC requests
@@ -848,6 +855,7 @@ impl MessageHandler for MasterHandler {
                 RpcCode::GetJobStatus => self.job_handler.get_load_status(ctx),
                 RpcCode::CancelJob => self.job_handler.cancel_job(ctx).await,
                 RpcCode::ReportTask => self.job_handler.task_report(ctx),
+                RpcCode::GetMasterInfo => self.get_master_info(ctx),
 
                 v => err_box!("unsupported operation {:?}", v),
             }
