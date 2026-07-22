@@ -249,6 +249,10 @@ impl FuseWriter {
         metrics_enabled: bool,
     ) -> FsResult<()> {
         let mut completed = false;
+        // Sticky once an operation may have made backend data durable or
+        // visible. Later writes do not clear it: aborting a shared block after
+        // an earlier fsync could delete the already-published prefix as well.
+        let mut preserve_on_exit = false;
         let worker_result = Self::run_writer_tasks(
             &mut writer,
             &mut req_receiver,
@@ -257,6 +261,7 @@ impl FuseWriter {
             path_type,
             metrics_enabled,
             &mut completed,
+            &mut preserve_on_exit,
         )
         .await;
 
@@ -264,22 +269,28 @@ impl FuseWriter {
             return worker_result;
         }
 
-        // Channel closure or a fatal task error before the last successful
-        // complete is an abnormal exit. Explicitly cancel the backend writer so
-        // unfinished upload/block sessions are not left to an implicit drop.
-        let cancel_result = writer.cancel().await;
-        match (worker_result, cancel_result) {
-            (Err(worker_error), Err(cancel_error)) => {
+        // Before the first durability boundary, aborting is the right cleanup
+        // for a brand-new unfinished upload. After flush/complete/resize was
+        // attempted, the backend or master may already reference the data even
+        // when its response was lost. Finalize instead: cancellation could
+        // delete a block that a successful fsync already published.
+        let cleanup_result = if preserve_on_exit {
+            writer.complete().await
+        } else {
+            writer.cancel().await
+        };
+        match (worker_result, cleanup_result) {
+            (Err(worker_error), Err(cleanup_error)) => {
                 // Cleanup is best effort and must not hide the error that caused
                 // the worker to exit.
                 error!(
-                    "failed to cancel writer after worker error: {}",
-                    cancel_error
+                    "failed to clean up writer after worker error: {}",
+                    cleanup_error
                 );
                 Err(worker_error)
             }
             (Err(worker_error), Ok(())) => Err(worker_error),
-            (Ok(()), Err(cancel_error)) => Err(cancel_error),
+            (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
             (Ok(()), Ok(())) => Ok(()),
         }
     }
@@ -293,6 +304,7 @@ impl FuseWriter {
         path_type: &'static str,
         metrics_enabled: bool,
         completed: &mut bool,
+        preserve_on_exit: &mut bool,
     ) -> FsResult<()> {
         while let Some(mut queued) = req_receiver.recv().await {
             // Dequeue point: drop the queue guard FIRST (before any backend work),
@@ -360,6 +372,9 @@ impl FuseWriter {
                 }
 
                 WriteTask::Flush(tx, reply) => {
+                    // Set this before the await because a lost/failed response
+                    // cannot prove that the master did not publish the flush.
+                    *preserve_on_exit = true;
                     let res = writer.flush().await;
                     // Deliver the real backend result to the caller (tx) first,
                     // then the kernel reply. See `deliver_stream_result`
@@ -368,6 +383,7 @@ impl FuseWriter {
                 }
 
                 WriteTask::Complete(tx, reply) => {
+                    *preserve_on_exit = true;
                     let res = writer.complete().await;
                     *completed = res.is_ok();
                     crate::fs::deliver_stream_result(res, tx, reply).await?;
@@ -375,6 +391,7 @@ impl FuseWriter {
 
                 WriteTask::Resize(tx, opts) => {
                     *completed = false;
+                    *preserve_on_exit = true;
                     // A resize failure must propagate to the caller via `tx`
                     // rather than `?`-ing out of the worker (which would kill it
                     // and leave the caller hanging). No kernel reply on this path.
@@ -540,6 +557,85 @@ mod tests {
         assert!(result_rx.receive().await.unwrap().is_ok());
         assert_eq!(complete_count.load(Ordering::SeqCst), 1);
         assert_eq!(cancel_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn successful_flush_is_finalized_instead_of_cancelled_on_channel_close() {
+        let cancel_count = Arc::new(AtomicUsize::new(0));
+        let complete_count = Arc::new(AtomicUsize::new(0));
+        let writer = TrackingWriter::new(cancel_count.clone(), complete_count.clone());
+        let (sender, receiver) = AsyncChannel::new(1).split();
+        let (result_tx, result_rx) = CallChannel::channel::<FsResult<()>>();
+        sender
+            .send(QueuedWriteTask {
+                task: WriteTask::Flush(result_tx, None),
+                queue_guard: None,
+            })
+            .await
+            .unwrap();
+        drop(sender);
+
+        FuseWriter::writer_future(
+            writer,
+            receiver,
+            Arc::new(AtomicLong::new(0)),
+            Arc::new(AtomicLong::new(0)),
+            "test",
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(result_rx.receive().await.unwrap().is_ok());
+        assert_eq!(complete_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            cancel_count.load(Ordering::SeqCst),
+            0,
+            "cancelling here could delete data published by the flush"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_after_flush_keeps_the_durable_cleanup_boundary() {
+        let cancel_count = Arc::new(AtomicUsize::new(0));
+        let complete_count = Arc::new(AtomicUsize::new(0));
+        let writer = TrackingWriter::new(cancel_count.clone(), complete_count.clone());
+        let (sender, receiver) = AsyncChannel::new(2).split();
+        let (result_tx, result_rx) = CallChannel::channel::<FsResult<()>>();
+        sender
+            .send(QueuedWriteTask {
+                task: WriteTask::Flush(result_tx, None),
+                queue_guard: None,
+            })
+            .await
+            .unwrap();
+        sender
+            .send(QueuedWriteTask {
+                task: WriteTask::Write(0, Bytes::from_static(b"later"), None),
+                queue_guard: None,
+            })
+            .await
+            .unwrap();
+        drop(sender);
+
+        FuseWriter::writer_future(
+            writer,
+            receiver,
+            Arc::new(AtomicLong::new(0)),
+            Arc::new(AtomicLong::new(0)),
+            "test",
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(result_rx.receive().await.unwrap().is_ok());
+        assert_eq!(complete_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            cancel_count.load(Ordering::SeqCst),
+            0,
+            "a later write must not make an earlier durable block abortable"
+        );
     }
 
     #[tokio::test]
