@@ -15,8 +15,9 @@
 use crate::block::batch_block_writer::BatchWriterAdapter::{BatchLocal, BatchRemote};
 use crate::block::{BatchBlockWriterLocal, BatchBlockWriterRemote};
 use crate::file::FsContext;
+use curvine_common::error::FsError;
 use curvine_common::fs::Path;
-use curvine_common::state::{CommitBlock, ExtendedBlock, LocatedBlock, StorageType, WorkerAddress};
+use curvine_common::state::{CommitBlock, ExtendedBlock, LocatedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use futures::future::try_join_all;
 use orpc::err_box;
@@ -64,17 +65,32 @@ impl BatchWriterAdapter {
     ) -> FsResult<Self> {
         let conf = &fs_context.conf.client;
         // SPDK bypasses kernel — no local path. Disable short-circuit if any block uses SPDK.
-        let has_spdk = located_blocks
-            .iter()
-            .any(|lb| lb.block.storage_type == StorageType::SpdkDisk);
+        // Use has_spdk from worker-reported actual storage type, not block.storage_type
+        let has_spdk = located_blocks.iter().any(|lb| lb.has_spdk);
         let short_circuit =
             conf.short_circuit && fs_context.is_local_worker(worker_addr) && !has_spdk;
 
         let blocks: Vec<ExtendedBlock> = located_blocks.iter().map(|lb| lb.block.clone()).collect();
         let adapter = if short_circuit {
-            let writer =
-                BatchBlockWriterLocal::new(fs_context, blocks, worker_addr.clone(), 0).await?;
-            BatchLocal(writer)
+            match BatchBlockWriterLocal::new(
+                fs_context.clone(),
+                blocks.clone(),
+                worker_addr.clone(),
+                0,
+            )
+            .await
+            {
+                Ok(writer) => BatchLocal(writer),
+                Err(FsError::NoLocalPath(_)) => {
+                    // Server has no local path for batch blocks (e.g. SPDK bdev).
+                    // BatchBlockWriterLocal already aborted the open; retry via remote.
+                    let writer =
+                        BatchBlockWriterRemote::new(&fs_context, blocks, worker_addr.clone(), 0)
+                            .await?;
+                    BatchRemote(writer)
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             let writer =
                 BatchBlockWriterRemote::new(&fs_context, blocks, worker_addr.clone(), 0).await?;

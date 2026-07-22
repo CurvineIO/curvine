@@ -172,6 +172,7 @@ impl ProtoUtils {
             block: b,
             offset: 0,
             locs,
+            has_spdk: Some(block.has_spdk),
         }
     }
 
@@ -185,6 +186,7 @@ impl ProtoUtils {
         LocatedBlock {
             block: Self::extend_block_from_pb(block.block),
             locs,
+            has_spdk: block.has_spdk.unwrap_or(false),
         }
     }
 
