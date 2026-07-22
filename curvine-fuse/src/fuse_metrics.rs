@@ -334,9 +334,15 @@ pub struct FuseMetrics {
     /// created at enqueue and dropped when the sender dequeues (or when an
     /// un-received task is dropped). No `_total` suffix (it is a gauge).
     pub(crate) reply_queue_depth: Gauge,
-    /// Per-sender last-progress timestamp (Unix seconds), labelled by `sender`
-    /// (the sender's channel index). Set after every successful reply write in
-    /// `FuseSender`. This is the Prometheus "last success timestamp" pattern:
+    /// Per-sender last-progress timestamp (Unix seconds), labelled by `mnt`
+    /// (the mount path) and `sender` (the sender's channel index within that
+    /// mount). Set after every successful reply write in `FuseSender`, and
+    /// initialized to the sender's construction time so a cold series is not a
+    /// spurious 0. The `mnt` dimension is required: FuseSession creates one
+    /// FuseChannel per mount and every mount's senders are indexed 0..N against
+    /// this process-global vec, so without `mnt` two mounts would collide on
+    /// `sender="0"` and an active mount could mask a stalled mount's series.
+    /// This is the Prometheus "last success timestamp" pattern:
     /// scrape-side `time() - curvine_fuse_sender_last_progress_unixtime` yields
     /// the age since a sender last delivered a reply, so a single sender stalled
     /// in `send().await` (issue #1215) shows a growing age while its siblings
@@ -679,10 +685,12 @@ impl FuseMetrics {
             sender_last_progress_unixtime: m::new_gauge_vec(
                 "curvine_fuse_sender_last_progress_unixtime",
                 "Unix timestamp (seconds) of the last successful reply write per sender \
-                 (label sender=channel index). Use time() - <this> at scrape time to get \
-                 the age since a sender last delivered a reply; a growing age on one sender \
-                 while siblings refresh indicates a stalled reply sender (issue #1215)",
-                &["sender"],
+                 (labels mnt=mount path, sender=channel index within the mount; initialized \
+                 to sender construction time so a cold series is not a spurious 0). Use \
+                 time() - <this> at scrape time to get the age since a sender last delivered \
+                 a reply; a growing age on one series while siblings refresh indicates a \
+                 stalled reply sender (issue #1215)",
+                &["mnt", "sender"],
             )?,
             setlkw_inflight: m::new_gauge(
                 "curvine_fuse_setlkw_inflight",
@@ -1431,13 +1439,16 @@ impl FuseMetrics {
         self.kernel_fd_health.set(if healthy { 1 } else { 0 });
     }
 
-    /// Return the per-sender child gauge for `sender_last_progress_unixtime`.
-    /// Fetched ONCE per sender (the child is an Arc-backed handle, cheap to hold
-    /// and cheap to `.set()`), so the hot reply path does no label lookup or
-    /// string allocation. Call `record_sender_progress` on the returned handle.
-    pub(crate) fn sender_progress_gauge(&self, idx: usize) -> Gauge {
+    /// Return the per-sender child gauge for `sender_last_progress_unixtime`,
+    /// keyed by mount path + channel index. Fetched ONCE per sender (the child is
+    /// an Arc-backed handle, cheap to hold and cheap to `.set()`), so the hot
+    /// reply path does no label lookup or string allocation. The `mnt` label
+    /// disambiguates senders across mounts (each mount indexes its senders
+    /// 0..N, so the index alone is not unique). Call `record_sender_progress` on
+    /// the returned handle.
+    pub(crate) fn sender_progress_gauge(&self, mnt: &str, idx: usize) -> Gauge {
         self.sender_last_progress_unixtime
-            .with_label_values(&[&idx.to_string()])
+            .with_label_values(&[mnt, &idx.to_string()])
     }
 
     /// Set a sender's last-progress gauge to now (Unix seconds). Deliberately
@@ -1919,6 +1930,37 @@ mod tests {
             v,
             before,
             after
+        );
+    }
+
+    // #1215 review fix: the metric must carry a `mnt` dimension so senders with
+    // the same channel index on DIFFERENT mounts do not collide on one series
+    // (which would let an active mount mask a stalled mount's stall). Fetches two
+    // child gauges with the same idx but different mnt from the real process-wide
+    // vec and asserts they are independent series — a write to one does not move
+    // the other. Uses unique mnt paths so it is safe under parallel test runs.
+    #[test]
+    fn sender_progress_gauge_distinct_per_mount_same_index() {
+        FuseMetrics::ensure_init().unwrap();
+        let m = FuseMetrics::get();
+        let ga = m.sender_progress_gauge("/test/mnt-collision-a", 0);
+        let gb = m.sender_progress_gauge("/test/mnt-collision-b", 0);
+
+        ga.set(111);
+        gb.set(222);
+        assert_eq!(ga.get(), 111, "mount A series holds its own value");
+        assert_eq!(
+            gb.get(),
+            222,
+            "mount B series is independent; same idx on another mount must not collide"
+        );
+
+        // Re-fetching the same (mnt, idx) returns the same underlying series.
+        let ga2 = m.sender_progress_gauge("/test/mnt-collision-a", 0);
+        assert_eq!(
+            ga2.get(),
+            111,
+            "same (mnt, idx) maps to the same child gauge"
         );
     }
 

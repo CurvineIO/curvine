@@ -61,6 +61,7 @@ impl<T: FileSystem> FuseSender<T> {
         buf_size: usize,
         debug: bool,
         enable_splice: bool,
+        mnt: &str,
         idx: usize,
         metrics_enabled: bool,
     ) -> IOResult<Self> {
@@ -70,7 +71,13 @@ impl<T: FileSystem> FuseSender<T> {
             None
         };
         let progress = if metrics_enabled {
-            Some(FuseMetrics::get().sender_progress_gauge(idx))
+            let g = FuseMetrics::get().sender_progress_gauge(mnt, idx);
+            // Seed the cold series with construction time, not the default 0, so a
+            // scrape-side `time() - <metric>` is ~0 for a freshly built / idle
+            // sender instead of a huge age that would false-page at startup (#1215
+            // review). The real signal is a series whose value stops advancing.
+            FuseMetrics::record_sender_progress(&g);
+            Some(g)
         } else {
             None
         };
