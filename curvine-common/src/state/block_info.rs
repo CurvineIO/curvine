@@ -251,6 +251,10 @@ impl WriteFileBlocks {
         self.status.len == 0
     }
 
+    pub fn has_commit_blocks(&self) -> bool {
+        !self.commit_blocks.is_empty()
+    }
+
     pub fn get_block(&self, file_pos: i64) -> Option<(i64, LocatedBlock)> {
         let index = self.search_off.partition_point(|x| x.end <= file_pos);
         if let Some(lc) = self.block_locs.get(index) {
