@@ -37,7 +37,7 @@ use log::{debug, info, warn};
 use orpc::common::{ByteUnit, TimeSpent};
 use orpc::runtime::Runtime;
 use orpc::sys::FFIUtils;
-use orpc::{sys, ternary, try_option};
+use orpc::{sys, try_option};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::Arc;
@@ -242,27 +242,40 @@ impl CurvineFileSystem {
 
     async fn fs_unlock(&self, handler: &FileHandle, flags: LockFlags) -> FuseResult<()> {
         if let Some(owner_id) = handler.remove_lock(flags) {
-            let client_id = self.fs.cv().fs_context().clone_client_name();
-            let path = Path::from_str(&handler.status().path)?;
-
-            let mut lock = FileLock {
-                client_id,
-                owner_id,
-                lock_type: LockType::UnLock,
-                lock_flags: flags,
-                ..Default::default()
-            };
-            if flags == LockFlags::Plock {
-                lock.start = 0;
-                lock.end = u64::MAX;
-            }
-
-            if let Err(e) = self.fs.set_lock(&path, lock).await {
+            if let Err(e) = self.fs_unlock_owner(handler, flags, owner_id).await {
                 // Preserve the owner locally when the backend unlock fails so a
                 // retained handle can retry the cleanup.
                 handler.add_lock(flags, owner_id);
-                return Err(e.into());
+                return Err(e);
             }
+        }
+
+        Ok(())
+    }
+
+    async fn fs_unlock_owner(
+        &self,
+        handler: &FileHandle,
+        flags: LockFlags,
+        owner_id: u64,
+    ) -> FuseResult<()> {
+        let client_id = self.fs.cv().fs_context().clone_client_name();
+        let path = Path::from_str(&handler.status().path)?;
+
+        let mut lock = FileLock {
+            client_id,
+            owner_id,
+            lock_type: LockType::UnLock,
+            lock_flags: flags,
+            ..Default::default()
+        };
+        if flags == LockFlags::Plock {
+            lock.start = 0;
+            lock.end = u64::MAX;
+        }
+
+        if let Err(e) = self.fs.set_lock(&path, lock).await {
+            return Err(e.into());
         }
 
         Ok(())
@@ -1123,7 +1136,10 @@ impl fs::FileSystem for CurvineFileSystem {
                 .invalid_cache(op.header.nodeid, None, INVAL_REASON_FLUSH);
         }
 
-        self.fs_unlock(&handle, LockFlags::Plock).await?;
+        if op.arg.lock_owner != 0 {
+            self.fs_unlock_owner(&handle, LockFlags::Plock, op.arg.lock_owner)
+                .await?;
+        }
         handle.flush(Some(reply)).await
     }
 
@@ -1400,7 +1416,6 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn get_lk(&self, op: GetLk<'_>) -> FuseResult<fuse_lk_out> {
         let path = self.state.get_path(op.header.nodeid)?;
         let lock = self.to_file_lock(op.arg);
-        let client_id = lock.client_id.clone();
 
         self.state.fs_fsync(op.header.nodeid, None).await?;
 
@@ -1410,7 +1425,7 @@ impl fs::FileSystem for CurvineFileSystem {
                 start: lk.start,
                 end: lk.end,
                 typ: lk.lock_type as u32,
-                pid: ternary!(client_id == lk.client_id, lk.pid, 0),
+                pid: lk.pid,
             },
 
             None => fuse_file_lock {

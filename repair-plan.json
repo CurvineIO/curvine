@@ -1,29 +1,31 @@
 {
-  "issue": "CurvineIO/curvine#1207",
-  "multica_issue": "CUR-61",
-  "fingerprint": "sha256:15fb19075be2d2fe6df145554fc1c3d1453d5a79ff97ee56eaa5b0ca69fe94bb",
-  "head_sha": "ea9978a4b77ead56a2ea59b41cd05ef66cbbda41",
-  "root_cause_hypothesis": "Under nextest load, the 2-master test cluster loses raft quorum (`quorum is not active`). A subsequent snapshot apply restores from an empty checkpoint (checkpoint_size=0, create_tree files=0), wiping metadata so FileStatus(/repl_test_3.dat) returns FileNotFound. Isolated runs pass; the wipe—not replication itself—is the failure mode.",
+  "issue": "CurvineIO/curvine#1227",
+  "multica_issue": "CUR-75",
+  "fingerprint": "sha256:9ea6ad50b9604e7dcfbc308344f7f83f4fe60497bce3ecce8fab9875200a2e2d",
+  "head_sha": "b5db9cb2fc576e49e0c7ba68235d3cdb2358e90c",
+  "root_cause_hypothesis": "POSIX byte-range lock metadata in LockMeta does not implement Linux F_GETLK/F_SETLK semantics: partial unlock removes whole locks instead of splitting, same-owner overlapping sets accumulate stale ranges, F_GETLK returns an arbitrary conflicting lock instead of the earliest overlap, flush unconditionally releases POSIX locks on every FUSE_FLUSH leaving stale/conflicting state, and get_lk masks holder pid when client_id differs.",
   "affected_modules": [
-    "curvine-server/src/master/journal/journal_loader.rs"
+    "curvine-server/src/master/meta/lock_meta.rs",
+    "curvine-fuse/src/fs/curvine_file_system.rs"
   ],
   "planned_changes": [
-    "Before fs_dir.restore in apply_snapshot0, compute actual checkpoint dir size (independent of log level).",
-    "If the checkpoint is empty and the live filesystem already has files, refuse the apply instead of wiping metadata."
+    "Implement inclusive region overlap/split helpers and rewrite POSIX lock set/check paths for partial unlock, same-owner replacement, and earliest-conflict F_GETLK reporting.",
+    "Only release POSIX locks on FUSE_FLUSH when lock_owner is non-zero, targeting that owner instead of unconditionally clearing handle plock state.",
+    "Return conflicting lock holder pid from get_lk regardless of client_id match."
   ],
   "not_goals": [
-    "Do not change replication manager job scheduling.",
-    "Do not rewrite raft election/quorum timeouts in this PR.",
-    "Do not weaken legitimate format/empty-cluster bootstrap (still allow empty apply when live FS has no files)."
+    "Do not implement kernel-style deadlock detection (EDEADLK) for fcntl17 in this change.",
+    "Do not change BSD flock semantics beyond shared cleanup paths.",
+    "Do not modify unrelated LTP failure groups (mknod, fallocate, FUSE EIO)."
   ],
   "verification_plan": [
-    "cargo test -p curvine-tests --test replication_test test_replication_with_simulated_worker_failure",
-    "cargo test -p curvine-server --test journal_test (snapshot-related if present)",
-    "Unit-level coverage via journal_loader refusal path if testable"
+    "cargo test -p curvine-server lock_meta",
+    "cargo test -p curvine-tests --test fs_test get_lock set_lock",
+    "python3 build/tests/scripts/curvine_ltp_fgetlk_wrong_repro.py (with local cluster if available)"
   ],
-  "estimated_non_generated_source_line_delta": 40,
+  "estimated_non_generated_source_line_delta": 180,
   "risk": {
     "level": "medium",
-    "rationale": "Changes HA snapshot apply safety. Rejecting a bad empty snapshot is safer than wiping production metadata, but a node may remain on older FSM state until a valid snapshot/log catch-up; needs harness daily rerun."
+    "rationale": "Touches distributed lock metadata semantics used by FUSE and RPC clients; incorrect region math could regress existing fs_test lock coverage or introduce new lock leaks."
   }
 }
