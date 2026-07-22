@@ -152,17 +152,15 @@ impl FsWriterBase {
     }
 
     fn has_pending_blocks(&self) -> bool {
-        self.cur_writer.is_some() || !self.cache_writers.is_empty()
+        self.cur_writer.is_some()
+            || !self.cache_writers.is_empty()
+            || self.file_blocks.has_commit_blocks()
     }
 
     // Write is completed, perform the following operations
     // 1. Submit the last block.
     pub async fn complete(&mut self) -> FsResult<()> {
-        if let Some(blocks) = self.complete0(false).await? {
-            self.pos = self.pos.min(blocks.len);
-            self.len = blocks.len;
-            self.file_blocks = WriteFileBlocks::new(blocks);
-        }
+        self.complete0(false).await?;
         Ok(())
     }
 
