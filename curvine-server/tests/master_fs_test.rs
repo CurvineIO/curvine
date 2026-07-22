@@ -41,7 +41,7 @@ use orpc::handler::MessageHandler;
 use orpc::message::Builder;
 #[cfg(feature = "fault-injection")]
 use orpc::message::ResponseStatus;
-use orpc::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
+use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::CommonResult;
 use raft::eraftpb::Entry;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -195,16 +195,8 @@ fn new_handler_for_test(test_name: &str) -> MasterHandler {
         None,
         mount_manager,
         JobHandler::new(job_manager),
-        Arc::new(GroupExecutor::new("test-master-heartbeat-rpc", 1, 8)),
-        Arc::new(GroupExecutor::new("test-master-block-report-rpc", 1, 8)),
-        Arc::new(GroupExecutor::new("test-master-control-rpc", 1, 8)),
-        Arc::new(GroupExecutor::new("test-master-list-rpc", 1, 8)),
-        Arc::new(GroupExecutor::new(
-            "test-master-get-block-locations-rpc",
-            1,
-            8,
-        )),
         replication_manager,
+        rt,
         Master::get_metrics().expect("test master metrics should initialize"),
     )
 }

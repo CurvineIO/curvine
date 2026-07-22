@@ -43,6 +43,17 @@ impl MessageBuilder {
         }
     }
 
+    pub fn protocol(protocol: Protocol) -> Self {
+        Builder {
+            code: protocol.code,
+            status: protocol.status,
+            req_id: protocol.req_id,
+            seq_id: protocol.seq_id,
+            header: None,
+            data: DataSlice::Empty,
+        }
+    }
+
     // Create a RequestStatus::Rpc request.
     pub fn new_rpc<T: Into<i8>>(code: T) -> Self {
         Builder {

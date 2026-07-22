@@ -29,6 +29,7 @@ pub struct MasterConf {
     pub web_port: u16,
     pub io_threads: usize,
     pub worker_threads: usize,
+    pub actor_threads: usize,
 
     // Master network read and write data timeout time, and whether to close idle connection; the default timeout is 10 minutes, close connections with timeout without data.
     pub io_timeout: String,
@@ -245,6 +246,7 @@ impl Default for MasterConf {
             web_port: ClusterConf::DEFAULT_MASTER_WEB_PORT,
             io_threads: 32,
             worker_threads: Utils::worker_threads(32),
+            actor_threads: 4,
             io_timeout: "10m".to_string(),
             io_close_idle: true,
 
