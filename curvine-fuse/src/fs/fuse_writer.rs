@@ -729,8 +729,10 @@ mod tests {
 
                 // This is a lifecycle test, not a metrics test. Keep it isolated
                 // from the process-global metric counters used by parallel tests.
-                let mut conf = FuseConf::default();
-                conf.metrics_enabled = false;
+                let conf = FuseConf {
+                    metrics_enabled: false,
+                    ..Default::default()
+                };
                 let writer = UnifiedWriter::Local(LocalWriter::new(&path, 4096).unwrap());
                 let rt2 = Arc::new(AsyncRuntime::single());
                 let fuse_writer = FuseWriter::new(&conf, rt2.clone(), writer);
