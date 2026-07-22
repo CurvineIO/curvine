@@ -562,4 +562,60 @@ mod tests {
         assert_eq!(locks[0].end, 14);
         assert_eq!(locks[0].lock_type, LockType::WriteLock);
     }
+
+    #[test]
+    fn test_same_owner_overlapping_plock_replaces_region() {
+        let mut meta = LockMeta::default();
+        let expire_ms = 3000;
+
+        assert!(meta
+            .set_lock(
+                create_plock("client1", 100, LockType::WriteLock, 0, 100),
+                expire_ms
+            )
+            .is_none());
+        assert!(meta
+            .set_lock(
+                create_plock("client1", 100, LockType::WriteLock, 50, 60),
+                expire_ms
+            )
+            .is_none());
+
+        let mut locks = meta.to_vec();
+        locks.sort_by_key(|lock| lock.start);
+        assert_eq!(locks.len(), 3);
+        assert_eq!(locks[0].start, 0);
+        assert_eq!(locks[0].end, 49);
+        assert_eq!(locks[1].start, 50);
+        assert_eq!(locks[1].end, 60);
+        assert_eq!(locks[2].start, 61);
+        assert_eq!(locks[2].end, 100);
+    }
+
+    #[test]
+    fn test_partial_unlock_splits_plock_interior_hole() {
+        let mut meta = LockMeta::default();
+        let expire_ms = 3000;
+
+        assert!(meta
+            .set_lock(
+                create_plock("client1", 100, LockType::WriteLock, 10, 20),
+                expire_ms
+            )
+            .is_none());
+        assert!(meta
+            .set_lock(
+                create_plock("client1", 100, LockType::UnLock, 12, 15),
+                expire_ms
+            )
+            .is_none());
+
+        let mut locks = meta.to_vec();
+        locks.sort_by_key(|lock| lock.start);
+        assert_eq!(locks.len(), 2);
+        assert_eq!(locks[0].start, 10);
+        assert_eq!(locks[0].end, 11);
+        assert_eq!(locks[1].start, 16);
+        assert_eq!(locks[1].end, 20);
+    }
 }

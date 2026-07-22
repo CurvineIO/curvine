@@ -1139,6 +1139,7 @@ impl fs::FileSystem for CurvineFileSystem {
         if op.arg.lock_owner != 0 {
             self.fs_unlock_owner(&handle, LockFlags::Plock, op.arg.lock_owner)
                 .await?;
+            handle.take_plock_if_owner(op.arg.lock_owner);
         }
         handle.flush(Some(reply)).await
     }
