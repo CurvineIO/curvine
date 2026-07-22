@@ -16,9 +16,10 @@ use crate::io::IOResult;
 use crate::sys::pipe::{AsyncFd, PipeFd, PipePool, PipeReader, PipeWriter};
 use crate::sys::{CInt, RawIO};
 use crate::{err_box, sys};
+use log::warn;
 use std::io::IoSlice;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // Backoff bounds for the splice-path EAGAIN retry loop (see `splice_retry`).
 // /dev/fuse is permanently level-writable, so its writable edge never fires
@@ -27,6 +28,10 @@ use std::time::Duration;
 // (issue #1215); instead we retry the raw splice behind a bounded async backoff.
 const SPLICE_RETRY_MIN: Duration = Duration::from_micros(50);
 const SPLICE_RETRY_MAX: Duration = Duration::from_millis(5);
+// While retrying continuous EAGAIN, log a warning this often. Until the sender
+// watchdog lands (#1215 PR-B), a stuck sender is otherwise invisible (it makes
+// no progress and emits no error); this surfaces the failure mode in the field.
+const SPLICE_RETRY_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct Pipe2 {
     buf_size: usize,
@@ -171,8 +176,16 @@ impl Pipe2 {
     // worker instead of busy-spinning. Note: if the destination stays EAGAIN
     // forever this retries indefinitely (bounded-rate, not a hang) by design;
     // detecting a stuck sender and giving up is the watchdog's job (#1215 PR-B).
+    // While it keeps hitting EAGAIN it logs a warning every
+    // SPLICE_RETRY_WARN_INTERVAL so the otherwise-silent HOL-blocked sender is
+    // visible in the field before the watchdog lands.
     async fn splice_retry(mut f: impl FnMut() -> IOResult<CInt>) -> IOResult<CInt> {
         let mut delay = SPLICE_RETRY_MIN;
+        // Set on the first EAGAIN; measures how long this call has been stalled
+        // on continuous would-block. (Ok / real errors return, so there is no
+        // interleaved success to reset it within a single call.)
+        let mut eagain_since: Option<Instant> = None;
+        let mut next_warn = SPLICE_RETRY_WARN_INTERVAL;
         loop {
             match f() {
                 Ok(res) => return Ok(res),
@@ -182,6 +195,21 @@ impl Pipe2 {
                         continue;
                     }
                     if e.is_would_block() {
+                        let stalled = match eagain_since {
+                            Some(start) => start.elapsed(),
+                            None => {
+                                eagain_since = Some(Instant::now());
+                                Duration::ZERO
+                            }
+                        };
+                        if stalled >= next_warn {
+                            warn!(
+                                "splice to fuse fd stuck on EAGAIN for {:?}; still retrying \
+                                 (bounded-rate). A sender may be HOL-blocked (#1215).",
+                                stalled
+                            );
+                            next_warn += SPLICE_RETRY_WARN_INTERVAL;
+                        }
                         tokio::time::sleep(delay).await;
                         delay = (delay * 2).min(SPLICE_RETRY_MAX);
                         continue;

@@ -203,6 +203,16 @@ impl<T: FileSystem> FuseSender<T> {
         }
     }
 
+    // Non-splice reply path. This uses AsyncFd::async_write (edge-triggered
+    // WRITABLE), which is the same readiness model that hangs the splice path in
+    // #1215 — but writev to /dev/fuse does not hit that trap. A FUSE reply write
+    // is matched to a pending kernel request and copied out; the fuse device has
+    // no send-buffer watermark, so a well-formed reply does not return EAGAIN the
+    // way the SPLICE_F_NONBLOCK pipe->device transfer does. It fails with a real
+    // errno (e.g. ENOENT for an unknown request) instead, which propagates here.
+    // This is why enable_splice=false is a sound workaround for #1215, not just an
+    // empirical one, and why the splice_retry helper is intentionally NOT applied
+    // to writev.
     pub async fn write(&mut self, rep: ResponseData) -> IOResult<()> {
         let (len, iovec) = rep.as_iovec()?;
         let written = self
