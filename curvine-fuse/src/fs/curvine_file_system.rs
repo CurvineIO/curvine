@@ -1098,9 +1098,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let mut opts = FuseUtils::create_opts(&op, &self.fs);
         let parent_status = self.state.fs_stat(ino, None).await?;
-        if parent_status.mode & FUSE_S_ISGID != 0 {
-            opts.group = parent_status.group;
-        }
+        FuseUtils::apply_setgid_parent_group(&mut opts, &parent_status);
 
         let handle = self.state.fs_create(ino, name, op.arg.flags, opts).await?;
         let attr = FuseUtils::status_to_attr(&self.conf, &handle.status())?;
@@ -1423,7 +1421,9 @@ impl fs::FileSystem for CurvineFileSystem {
             let path = self.state.get_path_name(op.header.nodeid, name)?;
             self.ensure_writable_path(&path, RpcCode::CreateFile)
                 .await?;
-            let opts = FuseUtils::mknod_opts(&op, &self.fs, file_type);
+            let mut opts = FuseUtils::mknod_opts(&op, &self.fs, file_type);
+            let parent_status = self.state.fs_stat(op.header.nodeid, None).await?;
+            FuseUtils::apply_setgid_parent_group(&mut opts, &parent_status);
             self.fs.create_special_node(&path, opts).await?;
             let attr = self.state.lookup_common(op.header.nodeid, name).await?;
             Ok(FuseUtils::create_entry_out(&self.conf, attr))

@@ -285,6 +285,13 @@ impl FuseUtils {
             .build()
     }
 
+    /// When the parent directory has the setgid bit, new nodes inherit its group.
+    pub fn apply_setgid_parent_group(opts: &mut CreateFileOpts, parent: &FileStatus) {
+        if parent.mode & FUSE_S_ISGID != 0 {
+            opts.group.clone_from(&parent.group);
+        }
+    }
+
     pub fn check_xattr(name: &str, op: XattrOp) -> FuseResult<()> {
         // Handle system extended attributes FIRST, before any path resolution
         // This avoids unnecessary operations and provides fastest response
@@ -866,6 +873,23 @@ mod tests {
         let mut three = file_status(FileType::File, 0, 0o644);
         three.nlink = 3;
         assert_eq!(FuseUtils::status_to_attr(&conf, &three).unwrap().nlink, 3);
+    }
+
+    #[test]
+    fn apply_setgid_parent_group_inherits_parent_group() {
+        let mut opts = CreateFileOpts::with_create(false);
+        opts.group = "nogroup".to_string();
+
+        let mut parent = file_status(FileType::Dir, 0, 0o2775);
+        parent.group = "project".to_string();
+
+        FuseUtils::apply_setgid_parent_group(&mut opts, &parent);
+        assert_eq!(opts.group, "project");
+
+        parent.mode = 0o755;
+        opts.group = "nogroup".to_string();
+        FuseUtils::apply_setgid_parent_group(&mut opts, &parent);
+        assert_eq!(opts.group, "nogroup");
     }
 
     #[test]
