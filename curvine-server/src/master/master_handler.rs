@@ -760,7 +760,12 @@ impl MessageHandler for MasterHandler {
 
         // Check whether the master is active
         if !self.fs.master_monitor.is_active() {
-            return Err(FsError::not_leader_master(ctx.code, self.client_ip()));
+            let response = Err(FsError::not_leader_master(ctx.code, self.client_ip()));
+            self.record_rpc_observability(ctx, &response);
+            return match response {
+                Ok(v) => Ok(v),
+                Err(e) => Ok(msg.error_ext(&e)),
+            };
         }
 
         // Unified processing of all RPC requests
