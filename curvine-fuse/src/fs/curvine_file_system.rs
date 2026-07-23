@@ -564,6 +564,28 @@ impl CurvineFileSystem {
         Self::permission_mask_allows(permission_bits, mask)
     }
 
+    fn check_setattr_permission(
+        check_permission: bool,
+        caller_uid: u32,
+        file_uid: u32,
+        valid: u32,
+    ) -> FuseResult<()> {
+        if !check_permission || caller_uid == 0 {
+            return Ok(());
+        }
+
+        let changing_owner_or_mode = (valid & (FATTR_MODE | FATTR_UID | FATTR_GID)) != 0;
+        if changing_owner_or_mode && caller_uid != file_uid {
+            return err_fuse!(
+                libc::EPERM,
+                "setattr denied for non-owner uid {}",
+                caller_uid
+            );
+        }
+
+        Ok(())
+    }
+
     /// Negotiate init reply flags as an explicit allowlist, not a blind echo:
     /// 1. Kernel-negotiated: `SUPPORTED_INIT_FLAGS & kernel_flags` (only caps the
     ///    daemon implements AND the kernel offered — see `SUPPORTED_INIT_FLAGS` for
@@ -889,29 +911,46 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path(op.header.nodeid)?;
         self.ensure_writable_path(&path, RpcCode::SetAttr).await?;
 
+        let cur_status = self.state.fs_stat(op.header.nodeid, None).await?;
+        let file_uid = self.resolve_file_uid(&cur_status.owner);
+        let file_gid = self.resolve_file_gid(&cur_status.group);
+        Self::check_setattr_permission(
+            self.conf.check_permission,
+            op.header.uid,
+            file_uid,
+            op.arg.valid,
+        )?;
+
         // Convert setattr to opts with UID/GID numeric fallback
         let mut opts = FuseUtils::fuse_setattr_to_opts(op.arg)?;
 
+        if (op.arg.valid & FATTR_MODE) != 0 {
+            if let Some(mode) = opts.mode {
+                let in_file_group = FuseUtils::caller_in_file_group(op.header.gid, file_gid);
+                opts.mode = Some(FuseUtils::normalize_chmod_mode(
+                    mode,
+                    op.header.uid,
+                    in_file_group,
+                ));
+            }
+        }
+
         // Apply chown suid/sgid rules when owner or group changes on regular files.
         // If kernel didn't provide FATTR_MODE, we still need to clear bits accordingly.
-        if (op.arg.valid & (FATTR_UID | FATTR_GID)) != 0 {
-            // Fetch current status to determine file type and mode
-            let cur_status = self.state.fs_stat(op.header.nodeid, None).await?;
-            if cur_status.file_type == FileType::File {
-                let mut new_mode = if let Some(mode) = opts.mode {
-                    mode
-                } else {
-                    cur_status.mode
-                };
-                // Always clear S_ISUID on chown
-                new_mode &= !libc::S_ISUID as u32;
-                // Clear S_ISGID when file is group-executable; keep it when not group-executable
-                let group_exec = (new_mode & 0o010) != 0;
-                if group_exec {
-                    new_mode &= !libc::S_ISGID as u32;
-                }
-                opts.mode = Some(new_mode & 0o7777);
+        if (op.arg.valid & (FATTR_UID | FATTR_GID)) != 0 && cur_status.file_type == FileType::File {
+            let mut new_mode = if let Some(mode) = opts.mode {
+                mode
+            } else {
+                cur_status.mode
+            };
+            // Always clear S_ISUID on chown
+            new_mode &= !libc::S_ISUID as u32;
+            // Clear S_ISGID when file is group-executable; keep it when not group-executable
+            let group_exec = (new_mode & 0o010) != 0;
+            if group_exec {
+                new_mode &= !libc::S_ISGID as u32;
             }
+            opts.mode = Some(new_mode & 0o7777);
         }
 
         let mut status = self.state.fs_set_attr(op.header.nodeid, opts).await?;

@@ -451,6 +451,31 @@ impl FuseUtils {
         FileStatus::with_name(FUSE_UNKNOWN_INO as i64, name.to_string(), true)
     }
 
+    /// Whether the caller's effective group matches `file_gid`.
+    ///
+    /// FUSE only exposes the requester's effective gid via `fuse_in_header.gid`;
+    /// supplementary groups are not available, so only the effective gid is compared.
+    pub fn caller_in_file_group(effective_gid: u32, file_gid: u32) -> bool {
+        effective_gid == file_gid
+    }
+
+    /// Apply Linux chmod/fchmod security rules for special mode bits.
+    ///
+    /// For non-root callers, setgid is cleared when the caller is not in the inode's
+    /// group (see chmod(2) and LTP chmod05/fchmod05). Setuid is preserved for the
+    /// file owner, matching Linux chmod(2).
+    pub fn normalize_chmod_mode(mode: u32, caller_uid: u32, in_file_group: bool) -> u32 {
+        let mut mode = mode & 0o7777;
+        if caller_uid == 0 {
+            return mode;
+        }
+
+        if !in_file_group {
+            mode &= !(libc::S_ISGID as u32);
+        }
+        mode
+    }
+
     pub fn fuse_setattr_to_opts(setattr: &fuse_setattr_in) -> FuseResult<SetAttrOpts> {
         // FATTR_SIZE is intentionally handled by CurvineFileSystem::set_attr because resizing
         // requires the file handle and cache invalidation managed by the caller.
@@ -675,6 +700,36 @@ mod tests {
             FuseUtils::dir_open_flags(&conf),
             FUSE_FOPEN_DIRECT_IO | FUSE_FOPEN_NONSEEKABLE | FUSE_FOPEN_CACHE_DIR
         );
+    }
+
+    #[test]
+    fn caller_in_file_group_matches_effective_gid_only() {
+        assert!(FuseUtils::caller_in_file_group(100, 100));
+        assert!(!FuseUtils::caller_in_file_group(100, 200));
+    }
+
+    #[test]
+    fn normalize_chmod_mode_strips_setgid_for_non_group_member() {
+        let mode = FuseUtils::normalize_chmod_mode(0o3777, 1000, false);
+        assert_eq!(mode, 0o1777);
+    }
+
+    #[test]
+    fn normalize_chmod_mode_preserves_setgid_for_group_member() {
+        let mode = FuseUtils::normalize_chmod_mode(0o3777, 1000, true);
+        assert_eq!(mode, 0o3777);
+    }
+
+    #[test]
+    fn normalize_chmod_mode_preserves_setuid_for_non_root() {
+        let mode = FuseUtils::normalize_chmod_mode(0o6777, 1000, true);
+        assert_eq!(mode, 0o6777);
+    }
+
+    #[test]
+    fn normalize_chmod_mode_allows_special_bits_for_root() {
+        let mode = FuseUtils::normalize_chmod_mode(0o4777, 0, false);
+        assert_eq!(mode, 0o4777);
     }
 
     #[test]
