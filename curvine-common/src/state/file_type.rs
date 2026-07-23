@@ -48,11 +48,16 @@ pub enum FileType {
     Char = 7,
 
     Block = 8,
+
+    Socket = 9,
 }
 
 /// Extended attribute key storing the device number (little-endian u32) for special nodes.
 pub const MKNOD_RDEV_XATTR: &str = "curvine.rdev";
 
 pub fn is_special_file_type(file_type: FileType) -> bool {
-    matches!(file_type, FileType::Fifo | FileType::Char | FileType::Block)
+    matches!(
+        file_type,
+        FileType::Fifo | FileType::Char | FileType::Block | FileType::Socket
+    )
 }

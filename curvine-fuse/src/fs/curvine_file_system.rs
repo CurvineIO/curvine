@@ -14,6 +14,7 @@
 
 use crate::fs::dcache::CleanerTask;
 use crate::fs::operator::*;
+use crate::fs::plock_wait_registry::{LockOwner, PlockWaitGuard, PlockWaitRegistry};
 use crate::fs::state::{FileHandle, NodeState};
 use crate::fuse_metrics::{
     ReaddirTimer, INVAL_REASON_FLUSH, INVAL_REASON_FSYNC, INVAL_REASON_RELEASE, INVAL_REASON_RESIZE,
@@ -46,6 +47,7 @@ pub struct CurvineFileSystem {
     fs: UnifiedFileSystem,
     state: Arc<NodeState>,
     conf: FuseConf,
+    plock_waits: Arc<PlockWaitRegistry>,
 }
 
 impl CurvineFileSystem {
@@ -62,6 +64,7 @@ impl CurvineFileSystem {
             fs,
             state,
             conf: fuse_conf,
+            plock_waits: PlockWaitRegistry::new(),
         };
 
         Ok(fuse_fs)
@@ -1510,8 +1513,8 @@ impl fs::FileSystem for CurvineFileSystem {
     /// Create a filesystem node (`mknod`):
     /// - regular file: delegates to `create()` then closes the handle;
     /// - directory: delegates to `mkdir()`;
-    /// - char/block/fifo: creates a metadata-only special node;
-    /// - other types (sockets, …): returns EPERM.
+    /// - char/block/fifo/socket: creates a metadata-only special node;
+    /// - other types: returns EPERM.
     async fn mk_nod(&self, op: MkNod<'_>) -> FuseResult<fuse_entry_out> {
         let name = try_option!(op.name.to_str());
         if name.len() > FUSE_MAX_NAME_LENGTH {
@@ -1634,11 +1637,24 @@ impl fs::FileSystem for CurvineFileSystem {
         // that immediate-cancellation case. See the comment there.
 
         let lock = self.to_file_lock(op.arg);
+        let wait_guard = PlockWaitGuard::new(
+            self.plock_waits.clone(),
+            LockOwner::new(lock.client_id.clone(), lock.owner_id),
+        );
         loop {
+            wait_guard.clear_blocked_by();
+
             let conflict = self.fs.set_lock(&path, lock.clone()).await?;
             if conflict.is_none() {
                 handle.add_lock(lock.lock_flags, lock.owner_id);
                 return Ok(());
+            }
+
+            let blocker = conflict.as_ref().expect("conflict lock");
+            if wait_guard
+                .register_blocked_by(LockOwner::new(blocker.client_id.clone(), blocker.owner_id))
+            {
+                return err_fuse!(libc::EDEADLK);
             }
 
             ticks += 1;
