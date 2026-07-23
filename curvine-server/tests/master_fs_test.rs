@@ -257,7 +257,6 @@ fn only_job_requests_use_the_async_handler() {
         RpcCode::GetJobStatus,
         RpcCode::CancelJob,
         RpcCode::ReportTask,
-        RpcCode::GetMasterInfo,
     ] {
         let msg = Builder::new_rpc(code).build();
         assert!(
@@ -268,6 +267,7 @@ fn only_job_requests_use_the_async_handler() {
 
     for code in [
         RpcCode::GetBlockLocations,
+        RpcCode::GetMasterInfo,
         RpcCode::ListStatus,
         RpcCode::ListOptions,
         RpcCode::WorkerHeartbeat,
@@ -282,15 +282,14 @@ fn only_job_requests_use_the_async_handler() {
 }
 
 #[test]
-fn async_rpc_to_standby_returns_rpc_error_response() -> CommonResult<()> {
+fn sync_rpc_to_standby_returns_rpc_error_response() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let handler = new_handler();
     let msg = Builder::new_rpc(RpcCode::GetMasterInfo)
         .proto_header(GetMasterInfoRequest::default())
         .build();
 
-    let rt = AsyncRuntime::single();
-    let response = rt.block_on(handler.async_handle(msg))?;
+    let response = handler.handle(&msg)?;
 
     assert!(!response.is_success());
     let err = response.check_error_ext::<FsError>().unwrap_err();

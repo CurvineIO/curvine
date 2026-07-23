@@ -738,11 +738,7 @@ impl MessageHandler for MasterHandler {
         let code = RpcCode::from(msg.code());
         !matches!(
             code,
-            RpcCode::SubmitJob
-                | RpcCode::GetJobStatus
-                | RpcCode::CancelJob
-                | RpcCode::ReportTask
-                | RpcCode::GetMasterInfo
+            RpcCode::SubmitJob | RpcCode::GetJobStatus | RpcCode::CancelJob | RpcCode::ReportTask
         )
     }
 
@@ -852,7 +848,6 @@ impl MessageHandler for MasterHandler {
                 RpcCode::GetJobStatus => self.job_handler.get_load_status(ctx),
                 RpcCode::CancelJob => self.job_handler.cancel_job(ctx).await,
                 RpcCode::ReportTask => self.job_handler.task_report(ctx),
-                RpcCode::GetMasterInfo => self.get_master_info(ctx),
 
                 v => err_box!("unsupported operation {:?}", v),
             }
