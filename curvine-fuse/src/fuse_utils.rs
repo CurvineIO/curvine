@@ -288,7 +288,7 @@ impl FuseUtils {
     /// When the parent directory has the setgid bit, new nodes inherit its group.
     pub fn apply_setgid_parent_group(opts: &mut CreateFileOpts, parent: &FileStatus) {
         if parent.mode & FUSE_S_ISGID != 0 {
-            opts.group = parent.group.clone();
+            opts.group.clone_from(&parent.group);
         }
     }
 
