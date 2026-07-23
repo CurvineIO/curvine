@@ -353,6 +353,26 @@ pub struct fuse_lseek_in {
 
 #[repr(C)]
 #[derive(Debug, Default)]
+pub struct fuse_ioctl_in {
+    pub fh: u64,
+    pub flags: u32,
+    pub cmd: u32,
+    pub arg: u64,
+    pub in_size: u32,
+    pub out_size: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct fuse_ioctl_out {
+    pub result: i32,
+    pub flags: u32,
+    pub in_iovs: u32,
+    pub out_iovs: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Default)]
 pub struct fuse_fsync_in {
     pub fh: u64,
     pub fsync_flags: u32,

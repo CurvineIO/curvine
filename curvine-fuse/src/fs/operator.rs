@@ -60,6 +60,7 @@ pub enum FuseOperator<'a> {
     GetLk(GetLk<'a>),
     SetLk(SetLk<'a>),
     SetLkW(SetLkW<'a>),
+    Ioctl(Ioctl<'a>),
 }
 
 #[repr(i8)]
@@ -401,4 +402,11 @@ pub struct SetLk<'a> {
 pub struct SetLkW<'a> {
     pub header: &'a fuse_in_header,
     pub arg: &'a fuse_lk_in,
+}
+
+#[derive(Debug)]
+pub struct Ioctl<'a> {
+    pub header: &'a fuse_in_header,
+    pub arg: &'a fuse_ioctl_in,
+    pub in_data: &'a [u8],
 }

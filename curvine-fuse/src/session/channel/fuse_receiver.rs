@@ -375,7 +375,8 @@ impl<T: FileSystem> FuseReceiver<T> {
             | FuseOperator::Readlink(_)
             | FuseOperator::GetLk(_)
             | FuseOperator::SetLk(_)
-            | FuseOperator::SetLkW(_) => {
+            | FuseOperator::SetLkW(_)
+            | FuseOperator::Ioctl(_) => {
                 let err: FuseResult<fuse_out_header> = err_fuse!(
                     libc::ENOSYS,
                     "unsupported stream operation {:?}",
@@ -676,6 +677,8 @@ impl<T: FileSystem> FuseReceiver<T> {
             FuseOperator::SetLk(op) => reply.send_rep(fs.set_lk(op).await).await,
 
             FuseOperator::SetLkW(op) => reply.send_rep(fs.set_lkw(op).await).await,
+
+            FuseOperator::Ioctl(op) => reply.send_buf(fs.ioctl(op).await).await,
 
             // Exhaustive fallback, NOT a `_` wildcard: naming the remaining variants
             // makes adding a new `FuseOperator` without a dispatch arm a compile

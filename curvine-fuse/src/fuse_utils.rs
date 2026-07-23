@@ -23,12 +23,13 @@ use curvine_common::conf::FuseConf;
 use curvine_common::fs::Path;
 use curvine_common::state::{
     CreateFileOpts, CreateFileOptsBuilder, FileStatus, FileType, MkdirOpts, MkdirOptsBuilder,
-    SetAttrOpts, MKNOD_RDEV_XATTR,
+    SetAttrOpts, FS_APPEND_FL, FS_IMMUTABLE_FL, IFLAGS_XATTR, MKNOD_RDEV_XATTR,
 };
 use orpc::common::LocalTime;
 use orpc::io::IOResult;
 use orpc::sys;
 use orpc::sys::{FFIUtils, RawIO};
+use std::collections::HashMap;
 use std::process::Command;
 use std::slice;
 
@@ -303,6 +304,7 @@ impl FuseUtils {
         // but we disabled it in our response, yet kernel still queries ACL attributes
         match name {
             MKNOD_RDEV_XATTR
+            | IFLAGS_XATTR
             | "security.capability"
             | "security.selinux"
             | "system.posix_acl_access"
@@ -314,6 +316,96 @@ impl FuseUtils {
                 }
             },
             _ => Ok(()),
+        }
+    }
+
+    /// Linux `FS_IOC_GETFLAGS` on aarch64/x86_64.
+    pub const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
+
+    /// Linux `FS_IOC_SETFLAGS` on aarch64/x86_64.
+    pub const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
+
+    const FS_IOCTL_MUTABLE_FLAGS: u32 = FS_IMMUTABLE_FL | FS_APPEND_FL;
+
+    pub fn user_xattr_supported(file_type: FileType) -> bool {
+        matches!(file_type, FileType::File | FileType::Dir | FileType::Link)
+    }
+
+    pub fn check_user_xattr_namespace(file_type: FileType, name: &str) -> FuseResult<()> {
+        if name.starts_with("user.") && !Self::user_xattr_supported(file_type) {
+            return err_fuse!(libc::EPERM, "user xattr not permitted on {:?}", file_type);
+        }
+        Ok(())
+    }
+
+    pub fn file_flags_from_status(status: &FileStatus) -> u32 {
+        status
+            .x_attr
+            .get(IFLAGS_XATTR)
+            .and_then(|bytes| {
+                let arr: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+                Some(u32::from_le_bytes(arr))
+            })
+            .unwrap_or(0)
+    }
+
+    pub fn file_has_immutable_or_append(status: &FileStatus) -> bool {
+        let flags = Self::file_flags_from_status(status);
+        flags & Self::FS_IOCTL_MUTABLE_FLAGS != 0
+    }
+
+    pub fn set_attr_for_file_flags(_status: &FileStatus, new_flags: u32) -> SetAttrOpts {
+        let mut add_x_attr = HashMap::new();
+        add_x_attr.insert(
+            IFLAGS_XATTR.to_string(),
+            Self::normalize_ioctl_file_flags(new_flags)
+                .to_le_bytes()
+                .to_vec(),
+        );
+        SetAttrOpts {
+            add_x_attr,
+            ..Default::default()
+        }
+    }
+
+    pub fn normalize_ioctl_file_flags(flags: u32) -> u32 {
+        flags & Self::FS_IOCTL_MUTABLE_FLAGS
+    }
+
+    pub fn ioctl_flag_bytes() -> usize {
+        std::mem::size_of::<libc::c_long>()
+    }
+
+    pub fn decode_ioctl_file_flags(data: &[u8]) -> FuseResult<u32> {
+        let nbytes = Self::ioctl_flag_bytes();
+        if data.len() < nbytes {
+            return err_fuse!(libc::EINVAL, "ioctl in buffer too small");
+        }
+        let value = match nbytes {
+            8 => i64::from_ne_bytes(data[..8].try_into().unwrap()) as u32,
+            4 => u32::from_ne_bytes(data[..4].try_into().unwrap()),
+            _ => {
+                return err_fuse!(
+                    libc::EINVAL,
+                    "unsupported ioctl flag transfer size {}",
+                    nbytes
+                );
+            }
+        };
+        Ok(value)
+    }
+
+    pub fn append_ioctl_file_flags(buf: &mut BytesMut, flags: u32, out_size: u32) {
+        if out_size == 0 {
+            return;
+        }
+        let nbytes = Self::ioctl_flag_bytes();
+        let want = out_size as usize;
+        let encoded = (flags as libc::c_long).to_ne_bytes();
+        let copy = want.min(nbytes).min(encoded.len());
+        buf.extend_from_slice(&encoded[..copy]);
+        if want > copy {
+            buf.resize(buf.len() + (want - copy), 0);
         }
     }
 
@@ -969,6 +1061,36 @@ mod tests {
             Some(FileType::Socket)
         );
         assert!(FuseUtils::special_file_type_from_mode(0o100644).is_none());
+    }
+
+    #[test]
+    fn user_xattr_namespace_rejects_special_nodes() {
+        let err = FuseUtils::check_user_xattr_namespace(FileType::Fifo, "user.test").unwrap_err();
+        assert_eq!(err.errno(), libc::EPERM);
+        FuseUtils::check_user_xattr_namespace(FileType::File, "user.test").unwrap();
+    }
+
+    #[test]
+    fn ioctl_file_flags_round_trip_native_long() {
+        use bytes::BytesMut;
+
+        let flags = FS_IMMUTABLE_FL | FS_APPEND_FL;
+        let mut buf = BytesMut::new();
+        FuseUtils::append_ioctl_file_flags(&mut buf, flags, FuseUtils::ioctl_flag_bytes() as u32);
+        assert_eq!(buf.len(), FuseUtils::ioctl_flag_bytes());
+        assert_eq!(FuseUtils::decode_ioctl_file_flags(&buf).unwrap(), flags);
+    }
+
+    #[test]
+    fn file_flags_round_trip_through_internal_xattr() {
+        let mut status = file_status(FileType::File, 0, 0o644);
+        let opts = FuseUtils::set_attr_for_file_flags(&status, FS_IMMUTABLE_FL | FS_APPEND_FL);
+        status.x_attr.extend(opts.add_x_attr);
+        assert_eq!(
+            FuseUtils::file_flags_from_status(&status),
+            FS_IMMUTABLE_FL | FS_APPEND_FL
+        );
+        assert!(FuseUtils::file_has_immutable_or_append(&status));
     }
 
     #[test]

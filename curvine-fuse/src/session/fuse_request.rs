@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::fs::operator::*;
-use crate::raw::fuse_abi::{fuse_batch_forget_in, fuse_forget_one, fuse_in_header, fuse_write_in};
+use crate::raw::fuse_abi::{
+    fuse_batch_forget_in, fuse_forget_one, fuse_in_header, fuse_ioctl_in, fuse_write_in,
+};
 use crate::session::fuse_decoder::FuseDecoder;
 use crate::session::FuseOpCode::{self, *};
 use crate::FuseResult;
@@ -308,6 +310,16 @@ impl FuseRequest {
                 header,
                 arg: decoder.get_struct()?,
             }),
+
+            FUSE_IOCTL => {
+                let arg: &fuse_ioctl_in = decoder.get_struct()?;
+                let in_data = decoder.get_bytes(arg.in_size as usize)?;
+                FuseOperator::Ioctl(Ioctl {
+                    header,
+                    arg,
+                    in_data,
+                })
+            }
 
             FUSE_FSYNCDIR => FuseOperator::FSyncDir(FSyncDir {
                 header,

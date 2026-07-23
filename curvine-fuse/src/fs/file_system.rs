@@ -46,6 +46,10 @@ pub trait FileSystem: Send + Sync + 'static {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
+    fn ioctl(&self, op: Ioctl<'_>) -> impl Future<Output = FuseResult<BytesMut>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
+    }
+
     fn get_attr(&self, op: GetAttr<'_>) -> impl Future<Output = FuseResult<fuse_attr_out>> + Send {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }

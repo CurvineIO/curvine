@@ -1001,6 +1001,17 @@ impl NodeState {
         self.new_handle(Some(ino), &path, flags, opts).await
     }
 
+    pub async fn new_meta_handle(
+        &self,
+        ino: u64,
+        mut status: FileStatus,
+    ) -> FuseResult<Arc<FileHandle>> {
+        status.id = ino as i64;
+        Ok(self
+            .insert_handle_with_writer(ino, None, None, status)
+            .await)
+    }
+
     pub async fn fs_set_attr(&self, ino: u64, opts: SetAttrOpts) -> FuseResult<FileStatus> {
         let path = self.get_path_common(ino, None)?;
         let status = match self.fs.fuse_set_attr(&path, opts).await? {
