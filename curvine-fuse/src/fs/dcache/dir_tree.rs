@@ -176,11 +176,42 @@ impl DirTree {
     }
 
     // LOOKUP: create inode and parent directory entry as needed.
+    // Establishes a kernel lookup ref (n_lookup += 1); the kernel will later
+    // balance it with a FORGET. Used by the real LOOKUP op and READDIRPLUS.
     pub fn lookup(
         &mut self,
         parent: u64,
         name: &str,
         status: FileStatus,
+    ) -> FuseResult<&mut Inode> {
+        self.lookup_impl(parent, name, status, true)
+    }
+
+    // READDIR: materialize the child into the dcache (local dentry ref) WITHOUT
+    // taking a kernel lookup ref. Plain READDIR returns names only; the kernel
+    // does not cache the child, does not increment its lookup count, and never
+    // sends a FORGET for it (unlike READDIRPLUS). Bumping n_lookup here would
+    // inflate the daemon-side count past the kernel's real value with no FORGET
+    // to balance it, which defeats unlink's immediate `should_unref` reclaim
+    // (issue #1114).
+    pub fn lookup_no_kref(
+        &mut self,
+        parent: u64,
+        name: &str,
+        status: FileStatus,
+    ) -> FuseResult<&mut Inode> {
+        self.lookup_impl(parent, name, status, false)
+    }
+
+    // `bump_kref` = whether to take a kernel lookup ref (n_lookup += 1). The
+    // local dcache dentry ref (ref_ctr) is taken regardless, since either op
+    // materializes the child into the dcache.
+    fn lookup_impl(
+        &mut self,
+        parent: u64,
+        name: &str,
+        status: FileStatus,
+        bump_kref: bool,
     ) -> FuseResult<&mut Inode> {
         let ino = match self.get_inode_mut(parent, Some(name)) {
             Some(inode) => {
@@ -193,7 +224,9 @@ impl DirTree {
                     );
                 }
 
-                inode.add_lookup(1);
+                if bump_kref {
+                    inode.add_lookup(1);
+                }
                 inode.update_status(status);
                 inode.ino
             }
@@ -220,7 +253,9 @@ impl DirTree {
                                 inode.ino
                             );
                         }
-                        inode.add_lookup(1);
+                        if bump_kref {
+                            inode.add_lookup(1);
+                        }
                         inode.add_ref(1);
                         inode.update_status(status);
                         inode.parent = parent;
@@ -231,8 +266,14 @@ impl DirTree {
                     // Path C: brand-new inode.
                     None => {
                         let ino = self.next_id(status.id);
-                        self.inodes
-                            .insert(ino, Inode::with_status(ino, parent, name, status));
+                        let mut inode = Inode::with_status(ino, parent, name, status);
+                        // with_status seeds n_lookup=1 (the LOOKUP case). READDIR
+                        // takes no kernel lookup ref, so drop it back to 0 while
+                        // keeping ref_ctr=1 for the local dcache dentry.
+                        if !bump_kref {
+                            inode.sub_lookup(1);
+                        }
+                        self.inodes.insert(ino, inode);
                         ino
                     }
                 }
@@ -690,6 +731,57 @@ mod test {
         assert_eq!(t.get_inode_check(200, None).unwrap().n_lookup, 0);
         t.unlink(FUSE_ROOT_ID, "c", false).unwrap();
         assert!(t.get_inode(200, None).is_none());
+    }
+
+    /// issue #1114: plain READDIR materializes a child into the dcache but must NOT
+    /// take a kernel lookup ref (the kernel never sends a FORGET for it). New inode
+    /// gets ref_ctr=1, n_lookup=0; a repeat readdir does not accumulate n_lookup.
+    #[test]
+    fn readdir_does_not_increment_lookup_refs() {
+        let mut t = DirTree::default();
+        // Path C: brand-new inode via readdir.
+        let f = t
+            .lookup_no_kref(FUSE_ROOT_ID, "r", file_st("r", 0))
+            .unwrap()
+            .ino;
+        assert_eq!(t.get_inode_check(f, None).unwrap().ref_ctr, 1);
+        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, 0);
+
+        // Path A: repeat readdir on same name leaves n_lookup at 0.
+        t.lookup_no_kref(FUSE_ROOT_ID, "r", file_st("r", 0))
+            .unwrap();
+        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, 0);
+    }
+
+    /// issue #1114: READDIRPLUS keeps the kernel-lookup-ref semantics of a real
+    /// LOOKUP (n_lookup += 1 each time), balanced later by FORGET.
+    #[test]
+    fn readdirplus_increments_lookup_refs() {
+        let mut t = DirTree::default();
+        let f = t.lookup(FUSE_ROOT_ID, "p", file_st("p", 0)).unwrap().ino;
+        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, 1);
+        t.lookup(FUSE_ROOT_ID, "p", file_st("p", 0)).unwrap();
+        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, 2);
+    }
+
+    /// issue #1114 fix-proof: a file the kernel no longer references, seen only by
+    /// a plain READDIR, must be reclaimed immediately on unlink — not deferred to
+    /// the TTL cleaner. Pre-fix READDIR bumped n_lookup to 1, so should_unref()
+    /// stayed false and the inode survived unlink (regressing to TTL fallback).
+    #[test]
+    fn unlink_reclaims_inode_seen_only_by_readdir() {
+        let mut t = DirTree::default();
+        let f = t
+            .lookup_no_kref(FUSE_ROOT_ID, "d", file_st("d", 0))
+            .unwrap()
+            .ino;
+        // No kernel lookup ref, one local dcache dentry ref.
+        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, 0);
+        assert_eq!(t.get_inode_check(f, None).unwrap().ref_ctr, 1);
+
+        t.unlink(FUSE_ROOT_ID, "d", false).unwrap();
+        // ref_ctr→0 and n_lookup==0 → should_unref() true → immediate removal.
+        assert!(t.get_inode(f, None).is_none());
     }
 
     /// Deferred delete (`mark_delete=true`) must keep the inode even when counters hit

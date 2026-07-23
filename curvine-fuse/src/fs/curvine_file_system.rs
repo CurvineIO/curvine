@@ -342,7 +342,15 @@ impl CurvineFileSystem {
             let mut dir = self.state.dir_write();
             while let Some(status) = batch.pop_front() {
                 let attr = if status.name != FUSE_CURRENT_DIR && status.name != FUSE_PARENT_DIR {
-                    let inode = dir.lookup(header.nodeid, &status.name, status.clone())?;
+                    // READDIRPLUS takes a kernel lookup ref (kernel caches the
+                    // dentry and will send a FORGET); plain READDIR must not
+                    // (kernel returns names only, no lookup count, no FORGET) —
+                    // issue #1114.
+                    let inode = if plus {
+                        dir.lookup(header.nodeid, &status.name, status.clone())?
+                    } else {
+                        dir.lookup_no_kref(header.nodeid, &status.name, status.clone())?
+                    };
                     let attr = FuseUtils::status_to_attr(&self.conf, &inode.status)?;
                     // readdir materializes the child into the dcache; count it as a
                     // status-cache put (mirrors the pre-refactor read_dir_common).
