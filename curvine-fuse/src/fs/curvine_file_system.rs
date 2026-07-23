@@ -74,6 +74,19 @@ impl CurvineFileSystem {
         &self.conf
     }
 
+    fn setattr_size_needs_resize(
+        target_len: u64,
+        status_len: i64,
+        writer_len: Option<u64>,
+    ) -> bool {
+        let status_matches = u64::try_from(status_len) == Ok(target_len);
+        let writer_matches = match writer_len {
+            Some(len) => len == target_len,
+            None => true,
+        };
+        !status_matches || !writer_matches
+    }
+
     fn normalize_fallocate(
         current_len: i64,
         offset: u64,
@@ -1114,7 +1127,8 @@ impl fs::FileSystem for CurvineFileSystem {
         let mut status = self.state.fs_set_attr(op.header.nodeid, opts).await?;
         if (op.arg.valid & FATTR_SIZE) != 0 {
             let expect_len = op.arg.size as i64;
-            if expect_len != status.len {
+            let writer_len = self.state.get_writer_len(op.header.nodeid).await;
+            if Self::setattr_size_needs_resize(op.arg.size, status.len, writer_len) {
                 let resize_opts = FileAllocOpts::with_truncate(expect_len);
                 self.state
                     .fs_resize(op.header.nodeid, op.arg.fh, resize_opts)
@@ -1889,6 +1903,35 @@ mod tests {
         )
         .unwrap();
         assert!(opts.is_none());
+    }
+
+    #[test]
+    fn setattr_size_resizes_when_active_writer_differs_from_master() {
+        let target = 0x75000;
+
+        assert!(!super::CurvineFileSystem::setattr_size_needs_resize(
+            target,
+            target as i64,
+            Some(target),
+        ));
+        assert!(!super::CurvineFileSystem::setattr_size_needs_resize(
+            target,
+            target as i64,
+            None,
+        ));
+
+        // generic/091: Master already has the truncate target, while the active
+        // writer still exposes the page appended immediately before ftruncate.
+        assert!(super::CurvineFileSystem::setattr_size_needs_resize(
+            target,
+            target as i64,
+            Some(0x76000),
+        ));
+        assert!(super::CurvineFileSystem::setattr_size_needs_resize(
+            target,
+            0x74000,
+            Some(target),
+        ));
     }
 
     #[test]
