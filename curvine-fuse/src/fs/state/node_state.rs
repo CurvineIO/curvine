@@ -1278,6 +1278,8 @@ mod test {
     use curvine_common::error::FsError;
     #[cfg(target_os = "linux")]
     use curvine_common::fs::local::LocalWriter;
+    #[cfg(target_os = "linux")]
+    use curvine_common::fs::Writer;
     use curvine_common::fs::{ListStream, Path, StateReader, StateWriter};
     use curvine_common::state::FileStatus;
     use orpc::common::{FastHashMap, Utils};
