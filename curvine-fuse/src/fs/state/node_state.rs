@@ -588,7 +588,8 @@ impl NodeState {
         let close_result: FuseResult<()> = match handle.as_ref() {
             FileHandle::Backend(_) if handle.has_writer() => {
                 let cleanup_handle = handle.clone();
-                self.writers
+                let (_, cleanup_result) = self
+                    .writers
                     .release_with_cleanup(handle.ino(), move |last| async move {
                         if last {
                             cleanup_handle.complete(None).await
@@ -596,20 +597,18 @@ impl NodeState {
                             cleanup_handle.flush(None).await
                         }
                     })
-                    .await
-                    .map(|_| ())
+                    .await;
+                cleanup_result
             }
 
             _ => Ok(()),
         };
 
-        // A failed close keeps both the handle and its shared-writer reference
-        // so cleanup state is not silently discarded. FUSE normally sends
-        // RELEASE only once; automatic retry of retained state is tracked by
-        // #1221.
-        if close_result.is_ok() {
-            let _ = self.remove_handle(ino, fh);
-        }
+        // FUSE sends RELEASE once per open handle, and its error is not retried.
+        // Remove the handle regardless of the close result so open-handle and
+        // shared-writer accounting continue to reflect kernel ownership.
+        // Retriable backend cleanup must be tracked separately (#1221).
+        let _ = self.remove_handle(ino, fh);
 
         Ok((handle, close_result))
     }
@@ -1525,7 +1524,7 @@ mod test {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn release_handle_failure_retains_handle_and_writer_for_retry() {
+    fn release_handle_failure_releases_handle_and_writer_reference() {
         let rt = Arc::new(AsyncRuntime::single());
         let task_rt = rt.clone();
 
@@ -1557,19 +1556,66 @@ mod test {
 
             let (_, first_result) = state.release_handle(1, handle.fh()).await.unwrap();
             assert!(first_result.is_err());
-            assert!(state.find_handle(1, handle.fh()).is_ok());
-            assert!(Arc::ptr_eq(
-                &state.find_writer(1).await.unwrap(),
-                &fuse_writer
-            ));
+            assert!(state.find_handle(1, handle.fh()).is_err());
+            assert!(!state.has_open_handles(1));
+            assert!(state.find_writer(1).await.is_none());
+        });
+    }
 
-            let (_, retry_result) = state.release_handle(1, handle.fh()).await.unwrap();
-            assert!(retry_result.is_err());
-            assert!(state.find_handle(1, handle.fh()).is_ok());
-            assert!(Arc::ptr_eq(
-                &state.find_writer(1).await.unwrap(),
-                &fuse_writer
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn release_handle_failure_decrements_shared_writer_reference() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let task_rt = rt.clone();
+
+        rt.block_on(async move {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), task_rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+
+            let full_path = Path::from_str("/dev/full").unwrap();
+            let local_writer = LocalWriter::new(&full_path, 1).unwrap();
+            let status = local_writer.status().clone();
+            let fuse_writer = Arc::new(FuseWriter::new(
+                &state.conf,
+                task_rt,
+                UnifiedWriter::Local(local_writer),
             ));
+            state
+                .writers
+                .insert::<FuseError>(1, fuse_writer.clone())
+                .await
+                .unwrap();
+            let first_handle = state
+                .insert_handle_with_writer(1, None, Some(fuse_writer.clone()), status.clone())
+                .await;
+
+            let shared_writer = state
+                .writers
+                .get_or_create(1, async { Ok::<_, FuseError>(fuse_writer.clone()) })
+                .await
+                .unwrap();
+            let second_handle = state
+                .insert_handle_with_writer(1, None, Some(shared_writer), status)
+                .await;
+
+            fuse_writer
+                .write(0, Bytes::from_static(b"x"), None)
+                .await
+                .unwrap();
+
+            let (_, first_result) = state.release_handle(1, first_handle.fh()).await.unwrap();
+            assert!(first_result.is_err());
+            assert!(state.find_handle(1, first_handle.fh()).is_err());
+            assert!(state.find_handle(1, second_handle.fh()).is_ok());
+            assert!(state.has_open_handles(1));
+            assert!(state.find_writer(1).await.is_some());
+
+            let (_, second_result) = state.release_handle(1, second_handle.fh()).await.unwrap();
+            assert!(second_result.is_err());
+            assert!(state.find_handle(1, second_handle.fh()).is_err());
+            assert!(!state.has_open_handles(1));
+            assert!(state.find_writer(1).await.is_none());
         });
     }
 }
