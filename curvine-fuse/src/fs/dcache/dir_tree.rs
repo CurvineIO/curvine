@@ -266,13 +266,10 @@ impl DirTree {
                     // Path C: brand-new inode.
                     None => {
                         let ino = self.next_id(status.id);
-                        let mut inode = Inode::with_status(ino, parent, name, status);
-                        // with_status seeds n_lookup=1 (the LOOKUP case). READDIR
-                        // takes no kernel lookup ref, so drop it back to 0 while
-                        // keeping ref_ctr=1 for the local dcache dentry.
-                        if !bump_kref {
-                            inode.sub_lookup(1);
-                        }
+                        // Real LOOKUP / READDIRPLUS take a kernel lookup ref
+                        // (n_lookup=1); plain READDIR takes none (n_lookup=0).
+                        let n_lookup = if bump_kref { 1 } else { 0 };
+                        let inode = Inode::with_status(ino, parent, name, status, n_lookup);
                         self.inodes.insert(ino, inode);
                         ino
                     }
