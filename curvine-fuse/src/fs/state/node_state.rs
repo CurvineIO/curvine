@@ -1263,14 +1263,14 @@ impl NodeState {
 mod test {
     use crate::fs::state::file_handle::FileHandle;
     use crate::fs::state::{DirHandle, NodeState};
-    use crate::fs::FuseWriter;
-    use crate::{FuseError, FUSE_ROOT_ID};
-    use bytes::Bytes;
-    use curvine_client::unified::{UnifiedFileSystem, UnifiedWriter};
+
+    use crate::FUSE_ROOT_ID;
+
+    use curvine_client::unified::UnifiedFileSystem;
     use curvine_common::conf::ClusterConf;
     use curvine_common::error::FsError;
-    use curvine_common::fs::local::LocalWriter;
-    use curvine_common::fs::{ListStream, Path, StateReader, StateWriter, Writer};
+
+    use curvine_common::fs::{ListStream, Path, StateReader, StateWriter};
     use curvine_common::state::FileStatus;
     use orpc::common::{FastHashMap, Utils};
     use orpc::runtime::{AsyncRuntime, RpcRuntime};

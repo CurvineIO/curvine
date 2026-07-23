@@ -217,6 +217,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     --package=*)
+      require_option_value "--package" "${1#*=}"
       add_package_arg "${1#*=}"
       shift
       ;;
@@ -226,6 +227,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     --ufs=*)
+      require_option_value "--ufs" "${1#*=}"
       UFS_TYPES+=("${1#*=}")
       shift
       ;;
@@ -235,6 +237,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     --features=*)
+      require_option_value "--features" "${1#*=}"
       add_features_arg "${1#*=}"
       shift
       ;;
@@ -244,6 +247,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     --alloc=*)
+      require_option_value "--alloc" "${1#*=}"
       ALLOC="${1#*=}"
       shift
       ;;
@@ -269,6 +273,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     --spdk-dir=*)
+      require_option_value "--spdk-dir" "${1#*=}"
       SPDK_DIR="${1#*=}"
       shift
       ;;

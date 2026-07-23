@@ -161,19 +161,19 @@ Using build.sh directly:
 
 ```bash
 # Build all modules
-sh build/build.sh 
+bash build/build.sh
 
 # Display command help 
-sh build/build.sh -h
+bash build/build.sh -h
 
 # Build core modules only: server client cli
-sh build/build.sh -p core
+bash build/build.sh -p core
 
 # Build fuse and core modules
-sh build/build.sh -p core -p fuse
+bash build/build.sh -p core -p fuse
 
 # Build only the server-native SPDK/RDMA artifact
-sh build/build.sh -p server --spdk-rdma --spdk-dir /opt/spdk
+bash build/build.sh -p server --spdk-rdma --spdk-dir /opt/spdk
 ```
 
 Building Docker images:

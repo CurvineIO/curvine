@@ -71,6 +71,7 @@ jobs:
 
       - name: Dependency boundary guardrails
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           scripts/check-deps.sh --mode report
         
       - name: Run clippy
