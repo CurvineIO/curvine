@@ -475,9 +475,18 @@ impl FuseConf {
 
     pub fn set_fuse_opts(&self, mount_options: &mut String) {
         let mut ro_added = false;
+        let mut default_permissions_added = false;
         if self.readonly {
             mount_options.push_str(",ro");
             ro_added = true;
+        }
+
+        // The kernel can distinguish an executable load from a normal read while
+        // FUSE_OPEN only exposes O_RDONLY for both. Keep permission enforcement in
+        // the VFS whenever Curvine permission checks are enabled.
+        if self.check_permission {
+            mount_options.push_str(",default_permissions");
+            default_permissions_added = true;
         }
 
         self.fuse_opts.iter().for_each(|opt| match opt.as_str() {
@@ -488,7 +497,10 @@ impl FuseConf {
                 }
             }
             "default_permissions" => {
-                mount_options.push_str(",default_permissions");
+                if !default_permissions_added {
+                    mount_options.push_str(",default_permissions");
+                    default_permissions_added = true;
+                }
             }
             "allow_other" => {
                 mount_options.push_str(",allow_other");
@@ -876,6 +888,57 @@ max_readahead_kb = 1024
             mount_options.split(',').filter(|opt| *opt == "ro").count(),
             1
         );
+    }
+
+    #[test]
+    fn permission_checks_enable_kernel_default_permissions() {
+        let conf = FuseConf {
+            check_permission: true,
+            ..Default::default()
+        };
+        let mut mount_options = String::new();
+        conf.set_fuse_opts(&mut mount_options);
+
+        assert_eq!(
+            mount_options
+                .split(',')
+                .filter(|opt| *opt == "default_permissions")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn explicit_default_permissions_is_not_duplicated() {
+        let conf = FuseConf {
+            check_permission: true,
+            fuse_opts: vec!["default_permissions".to_string()],
+            ..Default::default()
+        };
+        let mut mount_options = String::new();
+        conf.set_fuse_opts(&mut mount_options);
+
+        assert_eq!(
+            mount_options
+                .split(',')
+                .filter(|opt| *opt == "default_permissions")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn disabled_permission_checks_do_not_force_default_permissions() {
+        let conf = FuseConf {
+            check_permission: false,
+            ..Default::default()
+        };
+        let mut mount_options = String::new();
+        conf.set_fuse_opts(&mut mount_options);
+
+        assert!(!mount_options
+            .split(',')
+            .any(|opt| opt == "default_permissions"));
     }
 
     #[test]
