@@ -383,6 +383,20 @@ impl CurvineFileSystem {
         self.check_access_permissions(&status, header, mask)
     }
 
+    /// Linux root access(2) bypasses R_OK/W_OK but still validates X_OK against any
+    /// execute bit in the file mode, not the caller's owner/group/other class.
+    fn check_root_access_permissions(status: &FileStatus) -> FuseResult<()> {
+        if (status.mode & 0o111) != 0 {
+            Ok(())
+        } else {
+            err_fuse!(
+                libc::EACCES,
+                "Permission denied: root X_OK requires any execute bit in mode {:o}",
+                status.mode
+            )
+        }
+    }
+
     /// Check if the current user has the requested access permissions
     fn check_access_permissions(
         &self,
@@ -937,7 +951,11 @@ impl fs::FileSystem for CurvineFileSystem {
             return Ok(());
         }
         let status = self.state.fs_stat(op.header.nodeid, None).await?;
-        self.check_access_permissions(&status, op.header, op.arg.mask)
+        if op.header.uid == 0 {
+            Self::check_root_access_permissions(&status)
+        } else {
+            self.check_access_permissions(&status, op.header, op.arg.mask)
+        }
     }
 
     // Open the directory.
@@ -1573,6 +1591,27 @@ mod tests {
             1000,
             libc::R_OK as u32
         ));
+    }
+
+    #[test]
+    fn root_access_checks_any_execute_bit_not_owner_class() {
+        use super::CurvineFileSystem;
+        use curvine_common::state::{FileStatus, FileType};
+
+        let mut readonly = FileStatus::with_name(1, "readonly".to_string(), false);
+        readonly.file_type = FileType::File;
+        readonly.mode = 0o100400;
+        assert!(CurvineFileSystem::check_root_access_permissions(&readonly).is_err());
+
+        let mut other_execute = FileStatus::with_name(2, "other-x".to_string(), false);
+        other_execute.file_type = FileType::File;
+        other_execute.mode = 0o100001;
+        assert!(CurvineFileSystem::check_root_access_permissions(&other_execute).is_ok());
+
+        let mut group_execute = FileStatus::with_name(3, "group-x".to_string(), false);
+        group_execute.file_type = FileType::File;
+        group_execute.mode = 0o100010;
+        assert!(CurvineFileSystem::check_root_access_permissions(&group_execute).is_ok());
     }
 
     #[test]
