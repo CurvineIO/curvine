@@ -451,27 +451,19 @@ impl FuseUtils {
         FileStatus::with_name(FUSE_UNKNOWN_INO as i64, name.to_string(), true)
     }
 
-    /// Whether the caller's effective or supplementary groups include `file_gid`.
+    /// Whether the caller's effective group matches `file_gid`.
+    ///
+    /// FUSE only exposes the requester's effective gid via `fuse_in_header.gid`;
+    /// supplementary groups are not available, so only the effective gid is compared.
     pub fn caller_in_file_group(effective_gid: u32, file_gid: u32) -> bool {
-        if effective_gid == file_gid {
-            return true;
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            use nix::unistd::getgroups;
-            if let Ok(groups) = getgroups() {
-                return groups.iter().any(|gid| gid.as_raw() == file_gid);
-            }
-        }
-
-        false
+        effective_gid == file_gid
     }
 
     /// Apply Linux chmod/fchmod security rules for special mode bits.
     ///
-    /// Non-root callers cannot set setuid; setgid is cleared when the caller is
-    /// not in the inode's group (see chmod(2) and LTP chmod05/fchmod05).
+    /// For non-root callers, setgid is cleared when the caller is not in the inode's
+    /// group (see chmod(2) and LTP chmod05/fchmod05). Setuid is preserved for the
+    /// file owner, matching Linux chmod(2).
     pub fn normalize_chmod_mode(mode: u32, caller_uid: u32, in_file_group: bool) -> u32 {
         let mut mode = mode & 0o7777;
         if caller_uid == 0 {
@@ -708,6 +700,12 @@ mod tests {
             FuseUtils::dir_open_flags(&conf),
             FUSE_FOPEN_DIRECT_IO | FUSE_FOPEN_NONSEEKABLE | FUSE_FOPEN_CACHE_DIR
         );
+    }
+
+    #[test]
+    fn caller_in_file_group_matches_effective_gid_only() {
+        assert!(FuseUtils::caller_in_file_group(100, 100));
+        assert!(!FuseUtils::caller_in_file_group(100, 200));
     }
 
     #[test]
