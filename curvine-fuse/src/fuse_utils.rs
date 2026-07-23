@@ -123,6 +123,8 @@ impl FuseUtils {
             FileType::Char => perm | (libc::S_IFCHR as u32),
             #[cfg(target_os = "linux")]
             FileType::Block => perm | (libc::S_IFBLK as u32),
+            #[cfg(target_os = "linux")]
+            FileType::Socket => perm | (libc::S_IFSOCK as u32),
             _ => perm | (libc::S_IFREG as u32),
         }
     }
@@ -133,6 +135,7 @@ impl FuseUtils {
             t if t == libc::S_IFIFO as u32 => Some(FileType::Fifo),
             t if t == libc::S_IFCHR as u32 => Some(FileType::Char),
             t if t == libc::S_IFBLK as u32 => Some(FileType::Block),
+            t if t == libc::S_IFSOCK as u32 => Some(FileType::Socket),
             _ => None,
         }
     }
@@ -252,7 +255,7 @@ impl FuseUtils {
         let size = match status.file_type {
             FileType::Link => status.target.as_ref().map(|x| x.len()).unwrap_or(0) as u64,
             FileType::Dir => FUSE_DEFAULT_PAGE_SIZE as u64,
-            FileType::Fifo | FileType::Char | FileType::Block => 0,
+            FileType::Fifo | FileType::Char | FileType::Block | FileType::Socket => 0,
             // Regular files (File / Stream / Agg / Object) take their size from
             // `status.len`. Defend the FUSE boundary against abnormal backend
             // data: a negative len would cast to a huge u64, so reject it.
@@ -948,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    fn special_file_type_from_mode_maps_chr_blk_fifo() {
+    fn special_file_type_from_mode_maps_chr_blk_fifo_sock() {
         assert_eq!(
             FuseUtils::special_file_type_from_mode(0o20777),
             Some(FileType::Char)
@@ -960,6 +963,10 @@ mod tests {
         assert_eq!(
             FuseUtils::special_file_type_from_mode(0o10777),
             Some(FileType::Fifo)
+        );
+        assert_eq!(
+            FuseUtils::special_file_type_from_mode(0o140777),
+            Some(FileType::Socket)
         );
         assert!(FuseUtils::special_file_type_from_mode(0o100644).is_none());
     }

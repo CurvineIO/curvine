@@ -1454,8 +1454,8 @@ impl fs::FileSystem for CurvineFileSystem {
     /// Create a filesystem node (`mknod`):
     /// - regular file: delegates to `create()` then closes the handle;
     /// - directory: delegates to `mkdir()`;
-    /// - char/block/fifo: creates a metadata-only special node;
-    /// - other types (sockets, …): returns EPERM.
+    /// - char/block/fifo/socket: creates a metadata-only special node;
+    /// - other types: returns EPERM.
     async fn mk_nod(&self, op: MkNod<'_>) -> FuseResult<fuse_entry_out> {
         let name = try_option!(op.name.to_str());
         if name.len() > FUSE_MAX_NAME_LENGTH {
