@@ -1505,6 +1505,8 @@ impl fs::FileSystem for CurvineFileSystem {
             LockOwner::new(lock.client_id.clone(), lock.owner_id),
         );
         loop {
+            wait_guard.clear_blocked_by();
+
             let conflict = self.fs.set_lock(&path, lock.clone()).await?;
             if conflict.is_none() {
                 handle.add_lock(lock.lock_flags, lock.owner_id);
