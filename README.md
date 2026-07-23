@@ -151,6 +151,10 @@ make build ARGS="-p core"
 
 # Build fuse and core modules
 make build ARGS="-p core -p fuse"
+
+# Build server-native SPDK/RDMA support. Client-side artifacts such as
+# curvine-cli and curvine-fuse are built in isolated client-safe profiles.
+make build ARGS="-p core -p fuse --spdk-rdma --spdk-dir /opt/spdk"
 ```
 
 Using build.sh directly:
@@ -167,6 +171,9 @@ sh build/build.sh -p core
 
 # Build fuse and core modules
 sh build/build.sh -p core -p fuse
+
+# Build only the server-native SPDK/RDMA artifact
+sh build/build.sh -p server --spdk-rdma --spdk-dir /opt/spdk
 ```
 
 Building Docker images:

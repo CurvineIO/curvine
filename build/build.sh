@@ -129,8 +129,8 @@ print_help() {
   echo "  -d, --debug           Build in debug mode (default: release mode)"
   echo "  -f, --features LIST   Comma-separated list of extra features to enable"
   echo "  -z, --zip             Create zip archive"
-  echo "  --spdk                Enable SPDK NVMe-oF initiator support (TCP transport)"
-  echo "  --spdk-rdma           Enable SPDK NVMe-oF initiator support (TCP + RDMA transport)"
+  echo "  --spdk                Enable SPDK NVMe-oF initiator support for the server-native build (TCP transport)"
+  echo "  --spdk-rdma           Enable SPDK NVMe-oF initiator support for the server-native build (TCP + RDMA transport)"
   echo "  --spdk-dir PATH       Path to pre-built SPDK installation (default: /opt/spdk or \$SPDK_DIR)"
   echo "  --skip-java-sdk        Skip Java SDK compilation (useful for Docker builds)"
   echo "  --skip-python-sdk      Skip Python SDK compilation (useful for Docker builds)"
@@ -144,9 +144,10 @@ print_help() {
   echo "  $0 --ufs opendal-hdfs --ufs opendal-webhdfs  # Build with HDFS support"
   echo "  $0 --ufs oss-hdfs                         # Build with OSS-HDFS support (JindoSDK)"
   echo "  $0 --features jni --package client     # Build client with JNI support"
-  echo "  $0 --spdk                               # Build with SPDK TCP initiator support"
-  echo "  $0 --spdk-rdma                          # Build with SPDK RDMA initiator support"
-  echo "  $0 --spdk-rdma --spdk-dir /opt/spdk    # Build with SPDK at custom path"
+  echo "  $0 -p server --spdk                     # Build server-native artifacts with SPDK TCP initiator support"
+  echo "  $0 -p server --spdk-rdma                # Build server-native artifacts with SPDK RDMA initiator support"
+  echo "  $0 -p core --spdk-rdma --spdk-dir /opt/spdk"
+  echo "                                          # Build server-native SPDK/RDMA separately from client/CLI artifacts"
   echo "  $0 --skip-java-sdk                      # Build all packages except Java SDK"
   echo "  $0 --skip-python-sdk                    # Build all packages except Python SDK"
   echo "  $0 -p java -p python                    # Build both Java and Python SDKs"
@@ -181,37 +182,70 @@ ENABLE_SPDK=0      # Flag to enable SPDK TCP initiator support
 ENABLE_SPDK_RDMA=0 # Flag to enable SPDK RDMA initiator support
 SPDK_DIR="${SPDK_DIR:-}"  # Path to pre-built SPDK installation
 
-# Parse command line arguments
-TEMP=$(getopt -o p:u:f:a:dzhv --long package:,ufs:,features:,alloc:,debug,zip,spdk,spdk-rdma,spdk-dir:,skip-java-sdk,skip-python-sdk,help -n "$0" -- "$@")
-if [ $? != 0 ] ; then print_help ; exit 1 ; fi
+# Parse command line arguments. Avoid external getopt: BSD getopt silently
+# rewrites GNU-style long options differently and can make local runs build all.
+require_option_value() {
+  local opt="$1"
+  if [ $# -lt 2 ] || [ -z "$2" ]; then
+    echo "Error: ${opt} requires a value" >&2
+    print_help >&2
+    exit 1
+  fi
+}
 
-eval set -- "$TEMP"
+add_package_arg() {
+  if [ ${#PACKAGES[@]} -eq 1 ] && [ "${PACKAGES[0]}" = "all" ]; then
+    PACKAGES=()
+  fi
+  PACKAGES+=("$1")
+}
 
-while true ; do
+add_features_arg() {
+  local feature
+  local -a FEATURE_ARRAY=()
+  IFS=',' read -ra FEATURE_ARRAY <<< "$1"
+  for feature in "${FEATURE_ARRAY[@]}"; do
+    EXTRA_FEATURES+=("$feature")
+  done
+}
+
+while [ $# -gt 0 ]; do
   case "$1" in
     -p|--package)
-      # If this is the first -p argument, clear the default "all"
-      if [ ${#PACKAGES[@]} -eq 1 ] && [ "${PACKAGES[0]}" = "all" ]; then
-        PACKAGES=()
-      fi
-      PACKAGES+=("$2")
+      require_option_value "$1" "${2:-}"
+      add_package_arg "$2"
       shift 2
       ;;
+    --package=*)
+      add_package_arg "${1#*=}"
+      shift
+      ;;
     -u|--ufs)
+      require_option_value "$1" "${2:-}"
       UFS_TYPES+=("$2")
       shift 2
       ;;
+    --ufs=*)
+      UFS_TYPES+=("${1#*=}")
+      shift
+      ;;
     -f|--features)
-      # Parse comma-separated features
-      IFS=',' read -ra FEATURE_ARRAY <<< "$2"
-      for feature in "${FEATURE_ARRAY[@]}"; do
-        EXTRA_FEATURES+=("$feature")
-      done
+      require_option_value "$1" "${2:-}"
+      add_features_arg "$2"
       shift 2
       ;;
+    --features=*)
+      add_features_arg "${1#*=}"
+      shift
+      ;;
     -a|--alloc)
+      require_option_value "$1" "${2:-}"
       ALLOC="$2"
       shift 2
+      ;;
+    --alloc=*)
+      ALLOC="${1#*=}"
+      shift
       ;;
     -d|--debug)
       PROFILE=""
@@ -230,8 +264,13 @@ while true ; do
       shift
       ;;
     --spdk-dir)
+      require_option_value "$1" "${2:-}"
       SPDK_DIR="$2"
       shift 2
+      ;;
+    --spdk-dir=*)
+      SPDK_DIR="${1#*=}"
+      shift
       ;;
     --skip-java-sdk)
       SKIP_JAVA_SDK=1
@@ -247,9 +286,15 @@ while true ; do
       ;;
     --)
       shift
+      if [ $# -gt 0 ]; then
+        echo "Error: unexpected positional arguments: $*" >&2
+        print_help >&2
+        exit 1
+      fi
       break
       ;;
     *)
+      echo "Unknown argument: $1" >&2
       print_help
       exit 1
       ;;
@@ -281,6 +326,12 @@ fi
 
 # Export UFS types as comma-separated string
 CURVINE_UFS_TYPE=$(IFS=,; echo "${UFS_TYPES[*]}")
+SERVER_NATIVE_PROFILE="none"
+if [ $ENABLE_SPDK_RDMA -eq 1 ]; then
+  SERVER_NATIVE_PROFILE="spdk-rdma"
+elif [ $ENABLE_SPDK -eq 1 ]; then
+  SERVER_NATIVE_PROFILE="spdk"
+fi
 
 # Create necessary directories
 rm -rf "$DIST_DIR"
@@ -309,6 +360,7 @@ echo "os=${OS_VERSION}_$ARCH_NAME" >> "$DIST_DIR"/build-version
 echo "fuse=${FUSE_VERSION:-none}" >> "$DIST_DIR"/build-version
 echo "version=$CURVINE_VERSION" >> "$DIST_DIR"/build-version
 echo "ufs_types=${CURVINE_UFS_TYPE}" >> "$DIST_DIR"/build-version
+echo "server_native_profile=${SERVER_NATIVE_PROFILE}" >> "$DIST_DIR"/build-version
 
 
 # Check if a package should be built
@@ -338,36 +390,274 @@ if should_build_package "rust-sdk"; then
   BUILD_RUST_SDK=1
 fi
 
-# Collect all rust packages to build
-declare -a RUST_BUILD_ARGS=()
+# Collect rust packages by release profile. Keep server-native features out of
+# client entrypoints so Cargo feature unification cannot leak native links.
+declare -a SERVER_RUST_BUILD_ARGS=()
+declare -a CLIENT_RUST_BUILD_ARGS=()
+declare -a CLI_RUST_BUILD_ARGS=()
+declare -a TEST_RUST_BUILD_ARGS=()
 declare -a COPY_TARGETS=()
+declare -a CLIENT_ARTIFACT_CHECK_TARGETS=()
 
 # Add required packages
 if should_build_package "server"; then
-  RUST_BUILD_ARGS+=("-p" "curvine-server")
+  SERVER_RUST_BUILD_ARGS+=("-p" "curvine-server")
   COPY_TARGETS+=("curvine-server")
 fi
 
 if should_build_package "client"; then
-  RUST_BUILD_ARGS+=("-p" "curvine-client")
+  CLIENT_RUST_BUILD_ARGS+=("-p" "curvine-client")
   # COPY_TARGETS+=("curvine-client")
 fi
 
 if should_build_package "cli"; then
-  RUST_BUILD_ARGS+=("-p" "curvine-cli")
+  CLI_RUST_BUILD_ARGS+=("-p" "curvine-cli")
   COPY_TARGETS+=("curvine-cli")
+  CLIENT_ARTIFACT_CHECK_TARGETS+=("curvine-cli")
 fi
 
 # Add optional rust packages
 if should_build_package "fuse" && [ -n "$FUSE_VERSION" ]; then
-  RUST_BUILD_ARGS+=("-p" "curvine-fuse")
+  CLIENT_RUST_BUILD_ARGS+=("-p" "curvine-fuse")
   COPY_TARGETS+=("curvine-fuse")
+  CLIENT_ARTIFACT_CHECK_TARGETS+=("curvine-fuse")
 fi
 
 if should_build_package "tests"; then
-  RUST_BUILD_ARGS+=("-p" "curvine-tests")
+  TEST_RUST_BUILD_ARGS+=("-p" "curvine-tests")
   COPY_TARGETS+=("curvine-bench")
 fi
+
+declare -a FEATURES=()
+declare -a CLIENT_SKIPPED_NATIVE_UFS=()
+
+validate_feature_name() {
+  local feature="$1"
+  case "$feature" in
+    *[!a-zA-Z0-9_./-]*|"")
+      echo "Error: invalid feature value: ${feature}" >&2
+      return 1
+      ;;
+  esac
+}
+
+add_feature() {
+  local feature="$1"
+  local existing
+  validate_feature_name "$feature" || exit 1
+  for existing in "${FEATURES[@]}"; do
+    if [ "$existing" = "$feature" ]; then
+      return 0
+    fi
+  done
+  FEATURES+=("$feature")
+}
+
+remember_skipped_native_ufs() {
+  local ufs="$1"
+  local existing
+  for existing in "${CLIENT_SKIPPED_NATIVE_UFS[@]}"; do
+    if [ "$existing" = "$ufs" ]; then
+      return 0
+    fi
+  done
+  CLIENT_SKIPPED_NATIVE_UFS+=("$ufs")
+}
+
+is_client_native_ufs() {
+  case "$1" in
+    oss-hdfs|opendal-hdfs|opendal-hdfs-native)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+append_ufs_feature() {
+  local scope="$1"
+  local ufs="$2"
+
+  case "$ufs" in
+    *[!a-zA-Z0-9_-]*|"")
+      echo "Error: invalid --ufs value: ${ufs}" >&2
+      exit 1
+      ;;
+  esac
+
+  if [ "$scope" = "client-safe" ] && is_client_native_ufs "$ufs"; then
+    remember_skipped_native_ufs "$ufs"
+    return 0
+  fi
+
+  case "$ufs" in
+    oss-hdfs)
+      add_feature "curvine-ufs/oss-hdfs"
+      add_feature "curvine-client/oss-hdfs"
+      ;;
+    opendal-hdfs)
+      add_feature "curvine-ufs/opendal-hdfs"
+      add_feature "curvine-client/opendal-hdfs"
+      add_feature "curvine-ufs/jni"
+      add_feature "curvine-server/jni"
+      ;;
+    opendal-webhdfs)
+      add_feature "curvine-ufs/opendal-webhdfs"
+      add_feature "curvine-client/opendal-webhdfs"
+      ;;
+    *)
+      add_feature "curvine-client/$ufs"
+      ;;
+  esac
+}
+
+append_ufs_features() {
+  local scope="$1"
+  local ufs
+  for ufs in "${UFS_TYPES[@]}"; do
+    append_ufs_feature "$scope" "$ufs"
+  done
+}
+
+append_extra_features() {
+  local scope="$1"
+  local feature
+  for feature in "${EXTRA_FEATURES[@]}"; do
+    validate_feature_name "$feature" || exit 1
+    case "$feature" in
+      oss-hdfs|opendal-hdfs|opendal-webhdfs|opendal-cos|opendal-hdfs-native)
+        append_ufs_feature "$scope" "$feature"
+        ;;
+      jni|curvine-server/jni|curvine-ufs/jni)
+        if [ "$scope" = "server-native" ] || [ "$scope" = "tests" ]; then
+          add_feature "curvine-ufs/jni"
+          add_feature "curvine-server/jni"
+        else
+          remember_skipped_native_ufs "jni"
+        fi
+        ;;
+      spdk|curvine-server/spdk)
+        if [ "$scope" = "server-native" ] || [ "$scope" = "tests" ]; then
+          add_feature "curvine-server/spdk"
+        fi
+        ;;
+      spdk-rdma|curvine-server/spdk-rdma)
+        if [ "$scope" = "server-native" ] || [ "$scope" = "tests" ]; then
+          add_feature "curvine-server/spdk-rdma"
+        fi
+        ;;
+      orpc/spdk|orpc/spdk-rdma|curvine-ufs/oss-hdfs|curvine-ufs/opendal-hdfs|curvine-ufs/opendal-hdfs-native|curvine-client/oss-hdfs|curvine-client/opendal-hdfs|curvine-client/opendal-hdfs-native)
+        if [ "$scope" = "server-native" ] || [ "$scope" = "tests" ]; then
+          add_feature "$feature"
+        else
+          remember_skipped_native_ufs "$feature"
+        fi
+        ;;
+      curvine-server/*)
+        if [ "$scope" = "server-native" ] || [ "$scope" = "tests" ]; then
+          add_feature "$feature"
+        fi
+        ;;
+      *)
+        add_feature "$feature"
+        ;;
+    esac
+  done
+}
+
+append_alloc_feature() {
+  add_feature "curvine-common/${ALLOC}"
+}
+
+feature_list() {
+  local IFS=,
+  echo "$*"
+}
+
+build_rust_packages() {
+  local label="$1"
+  shift
+  local -a build_args=()
+  while [ $# -gt 0 ] && [ "$1" != "--" ]; do
+    build_args+=("$1")
+    shift
+  done
+  if [ $# -eq 0 ]; then
+    echo "Internal error: missing feature separator for ${label}" >&2
+    exit 1
+  fi
+  shift
+  local -a features=("$@")
+
+  if [ ${#build_args[@]} -eq 0 ]; then
+    return 0
+  fi
+
+  local -a build_cmd=(cargo build)
+  if [ -n "$PROFILE" ]; then
+    build_cmd+=("$PROFILE")
+  fi
+  build_cmd+=("${build_args[@]}")
+  if [ ${#features[@]} -gt 0 ]; then
+    build_cmd+=(--no-default-features --features "$(feature_list "${features[@]}")")
+  fi
+
+  echo "Building ${label} crates with command: ${build_cmd[*]}"
+  "${build_cmd[@]}"
+}
+
+artifact_dynamic_entries() {
+  local inspector="$1"
+  local artifact="$2"
+
+  case "$inspector" in
+    readelf)
+      readelf -d "$artifact" 2>/dev/null | grep -E 'NEEDED|RPATH|RUNPATH' || true
+      ;;
+    llvm-readelf)
+      llvm-readelf -d "$artifact" 2>/dev/null | grep -E 'NEEDED|RPATH|RUNPATH' || true
+      ;;
+    otool)
+      otool -L "$artifact" 2>/dev/null || true
+      ;;
+  esac
+}
+
+check_minimal_artifact_deps() {
+  local label="$1"
+  local artifact="$2"
+
+  if [ ! -e "$artifact" ]; then
+    return 0
+  fi
+
+  local inspector=""
+  if command -v readelf >/dev/null 2>&1 && readelf -h "$artifact" >/dev/null 2>&1; then
+    inspector="readelf"
+  elif command -v llvm-readelf >/dev/null 2>&1 && llvm-readelf -h "$artifact" >/dev/null 2>&1; then
+    inspector="llvm-readelf"
+  elif command -v otool >/dev/null 2>&1 && otool -hv "$artifact" >/dev/null 2>&1; then
+    inspector="otool"
+  else
+    echo "Warn: no readelf/llvm-readelf/otool inspector found; skipping runtime dependency check for ${label}" >&2
+    return 0
+  fi
+
+  if [ -z "$inspector" ]; then
+    echo "Skipping runtime dependency check for non-ELF artifact: ${label}"
+    return 0
+  fi
+
+  local needed
+  needed="$(artifact_dynamic_entries "$inspector" "$artifact")"
+  if grep -E 'libibverbs\.so|librdmacm\.so|libspdk|librte_|libjindosdk|libhdfs|libjvm|libjli' <<<"$needed" >/dev/null; then
+    echo "Error: ${label} contains native server/storage runtime dependencies forbidden for minimal client artifacts:" >&2
+    echo "$needed" >&2
+    exit 1
+  fi
+  echo "OK runtime deps: ${label}"
+}
 
 # Join libsdk SDK feature + UFS passthrough features (forwarded to curvine-client).
 libsdk_features() {
@@ -376,13 +666,16 @@ libsdk_features() {
   local features="${alloc_feature},${sdk_feature}"
   local ufs
   for ufs in "${UFS_TYPES[@]}"; do
-    # Reject shell metacharacters / unexpected tokens from --ufs before they enter argv.
     case "$ufs" in
       *[!a-zA-Z0-9_-]*|"")
         echo "Error: invalid --ufs value: ${ufs}" >&2
         return 1
         ;;
     esac
+    if is_client_native_ufs "$ufs"; then
+      remember_skipped_native_ufs "$ufs"
+      continue
+    fi
     features="${features},${ufs}"
   done
   echo "$features"
@@ -403,173 +696,57 @@ build_curvine_libsdk() {
   "${sdk_cmd[@]}"
 }
 
-# Base command
-cmd="cargo build $PROFILE"
-
-# Add package arguments if any
-if [ ${#RUST_BUILD_ARGS[@]} -gt 0 ]; then
-  cmd="$cmd ${RUST_BUILD_ARGS[@]}"
-fi
-
-# Collect all features
-declare -a FEATURES=()
-
 # Check FUSE availability if needed
-if [[ " ${RUST_BUILD_ARGS[@]} " =~ " -p curvine-fuse " ]] || [[ " ${PACKAGES[@]} " =~ " all " ]]; then
+if should_build_package "fuse" || [[ " ${PACKAGES[@]} " =~ " all " ]]; then
   if [ -z "$FUSE_VERSION" ]; then
     echo "Warn: FUSE package requested but FUSE is not available on this system" >&2
   fi
 fi
 
-# Add features based on what we're actually building
-if [ ${#RUST_BUILD_ARGS[@]} -gt 0 ]; then
-  # Add FUSE features if we're building fuse
-  if [[ " ${RUST_BUILD_ARGS[@]} " =~ " -p curvine-fuse " ]]; then
-    FEATURES+=("curvine-fuse/$FUSE_VERSION")
-    # FUSE depends on curvine-client, so we need to add UFS features for client
-    # to enable OSS and other storage backend support in fuse
-    for ufs in "${UFS_TYPES[@]}"; do
-      case $ufs in
-        oss-hdfs)
-          # OSS uses JindoSDK. curvine-client/oss-hdfs already includes curvine-ufs/oss-hdfs,
-          # but we specify both explicitly for clarity and to ensure all packages can use it
-          FEATURES+=("curvine-ufs/oss-hdfs")
-          FEATURES+=("curvine-client/oss-hdfs")
-          ;;
-        opendal-hdfs)
-          # HDFS native support requires JNI
-          FEATURES+=("curvine-ufs/opendal-hdfs")
-          FEATURES+=("curvine-client/opendal-hdfs")
-          FEATURES+=("curvine-ufs/jni")
-          FEATURES+=("curvine-server/jni")
-          ;;
-        opendal-webhdfs)
-          # WebHDFS support (no JNI required)
-          FEATURES+=("curvine-ufs/opendal-webhdfs")
-          FEATURES+=("curvine-client/opendal-webhdfs")
-          ;;
-        *)
-          FEATURES+=("curvine-client/$ufs")
-          ;;
-      esac
-    done
-  fi
-
-  # Add UFS features if we're building client
-  if [[ " ${RUST_BUILD_ARGS[@]} " =~ " -p curvine-client " ]]; then
-    for ufs in "${UFS_TYPES[@]}"; do
-      case $ufs in
-        oss-hdfs)
-          # OSS uses JindoSDK. curvine-client/oss-hdfs already includes curvine-ufs/oss-hdfs,
-          # but we specify both explicitly for clarity and to ensure all packages can use it
-          FEATURES+=("curvine-ufs/oss-hdfs")
-          FEATURES+=("curvine-client/oss-hdfs")
-          ;;
-        opendal-hdfs)
-          # HDFS native support requires JNI
-          FEATURES+=("curvine-ufs/opendal-hdfs")
-          FEATURES+=("curvine-client/opendal-hdfs")
-          FEATURES+=("curvine-ufs/jni")
-          FEATURES+=("curvine-server/jni")
-          ;;
-        opendal-webhdfs)
-          # WebHDFS support (no JNI required)
-          FEATURES+=("curvine-ufs/opendal-webhdfs")
-          FEATURES+=("curvine-client/opendal-webhdfs")
-          ;;
-        *)
-          FEATURES+=("curvine-client/$ufs")
-          ;;
-      esac
-    done
-  fi
-else
-  # If building all packages, add all relevant features
-  FEATURES+=("curvine-fuse/$FUSE_VERSION")  # FUSE check already done above
-  for ufs in "${UFS_TYPES[@]}"; do
-    case $ufs in
-      oss-hdfs)
-        # OSS uses JindoSDK. curvine-client/oss-hdfs already includes curvine-ufs/oss-hdfs,
-        # but we specify both explicitly for clarity and to ensure all packages can use it
-        FEATURES+=("curvine-ufs/oss-hdfs")
-        FEATURES+=("curvine-client/oss-hdfs")
-        ;;
-      opendal-hdfs)
-        # HDFS native support requires JNI
-        FEATURES+=("curvine-ufs/opendal-hdfs")
-        FEATURES+=("curvine-client/opendal-hdfs")
-        FEATURES+=("curvine-ufs/jni")
-        FEATURES+=("curvine-server/jni")
-        ;;
-      opendal-webhdfs)
-        # WebHDFS support (no JNI required)
-        FEATURES+=("curvine-ufs/opendal-webhdfs")
-        FEATURES+=("curvine-client/opendal-webhdfs")
-        ;;
-      *)
-        FEATURES+=("curvine-client/$ufs")
-        ;;
-    esac
-  done
-fi
-
-# Add extra features if specified
-if [ ${#EXTRA_FEATURES[@]} -gt 0 ]; then
-  for feature in "${EXTRA_FEATURES[@]}"; do
-    case $feature in
-      opendal-hdfs)
-        # HDFS features need to be added to the correct packages
-        FEATURES+=("curvine-ufs/opendal-hdfs")
-        FEATURES+=("curvine-client/opendal-hdfs")
-        ;;
-      opendal-webhdfs)
-        # WebHDFS features need to be added to the correct packages
-        FEATURES+=("curvine-ufs/opendal-webhdfs")
-        FEATURES+=("curvine-client/opendal-webhdfs")
-        ;;
-      opendal-cos)
-        # COS features need to be added to the correct packages
-        FEATURES+=("curvine-ufs/opendal-cos")
-        FEATURES+=("curvine-client/opendal-cos")
-        ;;
-      oss-hdfs)
-        # OSS-HDFS features need to be added to the correct packages
-        # curvine-client/oss-hdfs already includes curvine-ufs/oss-hdfs,
-        # but we specify both explicitly for clarity and to ensure all packages can use it
-        FEATURES+=("curvine-ufs/oss-hdfs")
-        FEATURES+=("curvine-client/oss-hdfs")
-        ;;
-      jni)
-        # JNI features need to be added to curvine-ufs and curvine-server
-        FEATURES+=("curvine-ufs/jni")
-        FEATURES+=("curvine-server/jni")
-        ;;
-      spdk)
-        FEATURES+=("curvine-server/spdk")
-        ;;
-      spdk-rdma)
-        FEATURES+=("curvine-server/spdk-rdma")
-        ;;
-      *)
-        # For other features, add as-is (might be package-specific)
-        FEATURES+=("$feature")
-        ;;
-    esac
-  done
-fi
-
-# Append --alloc as a workspace feature: curvine-common/{jemalloc|mimalloc} → cargo --features
-FEATURES+=("curvine-common/${ALLOC}")
-
-# Add SPDK features if specified
+FEATURES=()
+append_ufs_features "server-native"
+append_extra_features "server-native"
+append_alloc_feature
 if [ $ENABLE_SPDK -eq 1 ]; then
-  FEATURES+=("curvine-server/spdk")
+  add_feature "curvine-server/spdk"
   echo "Enabling SPDK NVMe-oF initiator support (TCP transport)"
 fi
-
 if [ $ENABLE_SPDK_RDMA -eq 1 ]; then
-  FEATURES+=("curvine-server/spdk-rdma")
+  add_feature "curvine-server/spdk-rdma"
   echo "Enabling SPDK NVMe-oF initiator support (TCP + RDMA transport)"
+fi
+SERVER_FEATURES=("${FEATURES[@]}")
+
+FEATURES=()
+if [ ${#CLIENT_RUST_BUILD_ARGS[@]} -gt 0 ]; then
+  if [[ " ${CLIENT_RUST_BUILD_ARGS[@]} " =~ " -p curvine-fuse " ]] && [ -n "$FUSE_VERSION" ]; then
+    add_feature "curvine-fuse/$FUSE_VERSION"
+  fi
+  append_ufs_features "client-safe"
+fi
+append_extra_features "client-safe"
+append_alloc_feature
+CLIENT_FEATURES=("${FEATURES[@]}")
+
+FEATURES=()
+append_extra_features "cli-minimal"
+append_alloc_feature
+CLI_FEATURES=("${FEATURES[@]}")
+
+FEATURES=()
+append_ufs_features "tests"
+append_extra_features "tests"
+append_alloc_feature
+if [ $ENABLE_SPDK -eq 1 ]; then
+  add_feature "curvine-server/spdk"
+fi
+if [ $ENABLE_SPDK_RDMA -eq 1 ]; then
+  add_feature "curvine-server/spdk-rdma"
+fi
+TEST_FEATURES=("${FEATURES[@]}")
+
+if [ ${#CLIENT_SKIPPED_NATIVE_UFS[@]} -gt 0 ]; then
+  echo "Client-safe/minimal artifacts skip native server/storage features: ${CLIENT_SKIPPED_NATIVE_UFS[*]}"
 fi
 
 # Set SPDK_DIR environment variable for build.rs
@@ -581,24 +758,14 @@ elif [ -d "/opt/spdk" ]; then
   echo "Using default SPDK_DIR=/opt/spdk"
 fi
 
-# Add features to command if any
-if [ ${#FEATURES[@]} -gt 0 ]; then
-  # Join features with comma for --features
-  IFS=, eval 'FEATURE_LIST="${FEATURES[*]}"'
-  cmd="$cmd --no-default-features --features $FEATURE_LIST"
-fi
-
 # Skip cargo build when no non-SDK rust package was selected
-if [ ${#RUST_BUILD_ARGS[@]} -eq 0 ]; then
+if [ ${#SERVER_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#CLIENT_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#CLI_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#TEST_RUST_BUILD_ARGS[@]} -eq 0 ]; then
   echo "No non-SDK rust packages selected, skipping workspace cargo build..."
 else
-  echo "Building crates with command: $cmd"
-  eval "$cmd"
-
-  if [ $? -ne 0 ]; then
-    echo "Cargo build failed. Exiting..."
-    exit 1
-  fi
+  build_rust_packages "server-native" "${SERVER_RUST_BUILD_ARGS[@]}" -- "${SERVER_FEATURES[@]}"
+  build_rust_packages "tests" "${TEST_RUST_BUILD_ARGS[@]}" -- "${TEST_FEATURES[@]}"
+  build_rust_packages "client-safe" "${CLIENT_RUST_BUILD_ARGS[@]}" -- "${CLIENT_FEATURES[@]}"
+  build_rust_packages "cli-minimal" "${CLI_RUST_BUILD_ARGS[@]}" -- "${CLI_FEATURES[@]}"
 fi
 
 if [ $BUILD_JAVA_SDK -eq 1 ]; then
@@ -736,6 +903,16 @@ fi
 echo "Copying Rust binaries into ${DIST_DIR}/lib ..."
 for target in "${COPY_TARGETS[@]}"; do
   cp -f "$FS_HOME"/target/${TARGET_DIR}/${target} "$DIST_DIR"/lib
+done
+
+echo "Checking minimal client artifact runtime dependencies ..."
+for target in "${CLIENT_ARTIFACT_CHECK_TARGETS[@]}"; do
+  check_minimal_artifact_deps "$target" "$DIST_DIR/lib/$target"
+done
+for sdk_artifact in "$DIST_DIR"/lib/libcurvine_libsdk*.so "$DIST_DIR"/lib/curvine_libsdk*.dll; do
+  if [ -e "$sdk_artifact" ]; then
+    check_minimal_artifact_deps "$(basename "$sdk_artifact")" "$sdk_artifact"
+  fi
 done
 
 # create zip

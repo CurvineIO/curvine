@@ -68,6 +68,10 @@ jobs:
           
           echo "After fmt, disk usage:"
           df -h
+
+      - name: Dependency boundary guardrails
+        run: |
+          scripts/check-deps.sh --mode report
         
       - name: Run clippy
         env:
