@@ -879,7 +879,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn apply_setgid_parent_group_inherits_parent_group() {
         let mut opts = CreateFileOpts::with_create(false);
         opts.group = "nogroup".to_string();
@@ -897,10 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn special_file_type_from_mode_maps_chr_blk_fifo() {
-=======
     fn special_file_type_from_mode_maps_chr_blk_fifo_sock() {
->>>>>>> 581364e (fix(fuse): support mknod for unix domain socket nodes (#1257))
         assert_eq!(
             FuseUtils::special_file_type_from_mode(0o20777),
             Some(FileType::Char)
