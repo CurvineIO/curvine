@@ -790,7 +790,6 @@ impl fs::FileSystem for CurvineFileSystem {
         Ok(buf)
     }
 
-
     async fn set_xattr(&self, op: SetXAttr<'_>) -> FuseResult<()> {
         let name = try_option!(op.name.to_str());
         FuseUtils::check_xattr(name, XattrOp::Set)?;
@@ -1103,10 +1102,7 @@ impl fs::FileSystem for CurvineFileSystem {
         if is_special_file_type(status.file_type) {
             let truncate = (op.arg.flags & libc::O_TRUNC as u32) != 0;
             if action.write() || truncate {
-                return err_fuse!(
-                    libc::EACCES,
-                    "special file nodes are read-only metadata"
-                );
+                return err_fuse!(libc::EACCES, "special file nodes are read-only metadata");
             }
             self.check_permissions(op.header, action.acl_mask()).await?;
             let ino = op.header.nodeid;

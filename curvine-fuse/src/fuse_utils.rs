@@ -296,7 +296,8 @@ impl FuseUtils {
         // Kernel requested POSIX_ACL support (kernel_requested_POSIX_ACL: 1048576)
         // but we disabled it in our response, yet kernel still queries ACL attributes
         match name {
-            MKNOD_RDEV_XATTR | IFLAGS_XATTR
+            MKNOD_RDEV_XATTR
+            | IFLAGS_XATTR
             | "security.capability"
             | "security.selinux"
             | "system.posix_acl_access"
@@ -320,19 +321,12 @@ impl FuseUtils {
     const FS_IOCTL_MUTABLE_FLAGS: u32 = FS_IMMUTABLE_FL | FS_APPEND_FL;
 
     pub fn user_xattr_supported(file_type: FileType) -> bool {
-        matches!(
-            file_type,
-            FileType::File | FileType::Dir | FileType::Link
-        )
+        matches!(file_type, FileType::File | FileType::Dir | FileType::Link)
     }
 
     pub fn check_user_xattr_namespace(file_type: FileType, name: &str) -> FuseResult<()> {
         if name.starts_with("user.") && !Self::user_xattr_supported(file_type) {
-            return err_fuse!(
-                libc::ENODATA,
-                "user xattr not supported on {:?}",
-                file_type
-            );
+            return err_fuse!(libc::ENODATA, "user xattr not supported on {:?}", file_type);
         }
         Ok(())
     }
@@ -370,7 +364,6 @@ impl FuseUtils {
     pub fn normalize_ioctl_file_flags(flags: u32) -> u32 {
         flags & Self::FS_IOCTL_MUTABLE_FLAGS
     }
-
 
     pub fn file_open_flags(conf: &FuseConf, keep_cache: bool) -> u32 {
         let mut flags = 0;
@@ -956,8 +949,7 @@ mod tests {
 
     #[test]
     fn user_xattr_namespace_rejects_special_nodes() {
-        let err = FuseUtils::check_user_xattr_namespace(FileType::Fifo, "user.test")
-            .unwrap_err();
+        let err = FuseUtils::check_user_xattr_namespace(FileType::Fifo, "user.test").unwrap_err();
         assert_eq!(err.errno(), libc::ENODATA);
         FuseUtils::check_user_xattr_namespace(FileType::File, "user.test").unwrap();
     }

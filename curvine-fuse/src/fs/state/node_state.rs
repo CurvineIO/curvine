@@ -1007,7 +1007,9 @@ impl NodeState {
         mut status: FileStatus,
     ) -> FuseResult<Arc<FileHandle>> {
         status.id = ino as i64;
-        Ok(self.insert_handle_with_writer(ino, None, None, status).await)
+        Ok(self
+            .insert_handle_with_writer(ino, None, None, status)
+            .await)
     }
 
     pub async fn fs_set_attr(&self, ino: u64, opts: SetAttrOpts) -> FuseResult<FileStatus> {
