@@ -1178,7 +1178,12 @@ impl fs::FileSystem for CurvineFileSystem {
     }
 
     // Get file system profile information.
-    async fn stat_fs(&self, _: StatFs<'_>) -> FuseResult<fuse_kstatfs> {
+    async fn stat_fs(&self, op: StatFs<'_>) -> FuseResult<fuse_kstatfs> {
+        // POSIX statfs(2) requires search permission on every directory in the path
+        // prefix (LTP statfs03/statfs03_64).
+        self.check_traverse_permissions(op.header.nodeid, op.header)
+            .await?;
+
         let info = self.fs.get_master_info().await?;
 
         let block_size = 4 * ByteUnit::KB as u32;
