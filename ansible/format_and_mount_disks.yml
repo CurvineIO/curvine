@@ -1,0 +1,117 @@
+---
+# 格式化和挂载未格式化的磁盘
+# 使用方法: ansible-playbook format_and_mount_disks.yml -e @disk_format_plan.yml
+
+- name: Format and Mount Disks
+  hosts: all
+  gather_facts: no
+  any_errors_fatal: false
+  ignore_unreachable: yes
+  serial: 1
+  
+  tasks:
+    - name: Check if disk_plan is defined for this host
+      set_fact:
+        host_disks: "{{ disk_plan[inventory_hostname] | default([]) }}"
+      when: disk_plan is defined
+
+    - name: Display disks to format
+      debug:
+        msg: |
+          节点: {{ inventory_hostname }}
+          将要格式化的磁盘: {{ host_disks | length }} 个
+          {% for disk in host_disks %}
+          - {{ disk.device }} -> {{ disk.mountpoint }}
+          {% endfor %}
+      when: host_disks is defined and host_disks | length > 0
+
+    - name: Skip if no disks to format
+      debug:
+        msg: "节点 {{ inventory_hostname }} 没有需要格式化的磁盘，跳过"
+      when: host_disks is not defined or host_disks | length == 0
+
+    - name: Format disks with ext4
+      shell: mkfs.ext4 -F /dev/{{ item.device }}
+      loop: "{{ host_disks }}"
+      when: host_disks is defined and host_disks | length > 0
+      register: format_result
+
+    - name: Display format results
+      debug:
+        msg: "✓ /dev/{{ item.item.device }} 格式化完成"
+      loop: "{{ format_result.results }}"
+      when: format_result is defined and not item.skipped | default(false)
+
+    - name: Create mount point directories
+      file:
+        path: "{{ item.mountpoint }}"
+        state: directory
+        mode: '0755'
+      loop: "{{ host_disks }}"
+      when: host_disks is defined and host_disks | length > 0
+
+    - name: Mount disks
+      mount:
+        path: "{{ item.mountpoint }}"
+        src: /dev/{{ item.device }}
+        fstype: ext4
+        state: mounted
+        opts: defaults
+      loop: "{{ host_disks }}"
+      when: host_disks is defined and host_disks | length > 0
+      register: mount_result
+
+    - name: Display mount results
+      debug:
+        msg: "✓ /dev/{{ item.item.device }} 已挂载到 {{ item.item.mountpoint }}"
+      loop: "{{ mount_result.results }}"
+      when: mount_result is defined and not item.skipped | default(false)
+
+    - name: Update /etc/fstab for persistence
+      mount:
+        path: "{{ item.mountpoint }}"
+        src: /dev/{{ item.device }}
+        fstype: ext4
+        state: present
+        opts: defaults
+      loop: "{{ host_disks }}"
+      when: host_disks is defined and host_disks | length > 0
+
+    - name: Verify mount
+      shell: df -h | grep '/dev/{{ item.device }}'
+      loop: "{{ host_disks }}"
+      when: host_disks is defined and host_disks | length > 0
+      register: verify_mount
+      ignore_errors: yes
+
+    - name: Display verification
+      debug:
+        msg: "{{ item.stdout }}"
+      loop: "{{ verify_mount.results }}"
+      when: verify_mount is defined and not item.skipped | default(false) and item.stdout is defined
+
+    - name: Get updated lsblk
+      shell: lsblk -o NAME,SIZE,TYPE,MOUNTPOINT
+      register: updated_lsblk
+      when: host_disks is defined and host_disks | length > 0
+
+    - name: Get updated df -h
+      shell: df -h | head -1; df -h | grep '^/dev'
+      register: updated_df
+      when: host_disks is defined and host_disks | length > 0
+
+    - name: Display updated disk info
+      debug:
+        msg: |
+          ========================================
+          节点 {{ inventory_hostname }} 格式化和挂载完成
+          ========================================
+          
+          更新后的lsblk:
+          {{ updated_lsblk.stdout }}
+          
+          更新后的df -h:
+          {{ updated_df.stdout }}
+          
+      when: host_disks is defined and host_disks | length > 0
+

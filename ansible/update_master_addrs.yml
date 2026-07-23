@@ -1,0 +1,117 @@
+---
+# 更新配置文件中的master_addrs和journal_addrs
+# 使用方法: ansible-playbook update_master_addrs.yml
+
+- name: Update Master Addresses in Config
+  hosts: all
+  gather_facts: no
+  any_errors_fatal: false
+  ignore_unreachable: yes
+  vars:
+    curvine_install_dir: /root/dist
+    curvine_config_file: "{{ curvine_install_dir }}/conf/curvine-cluster.toml"
+    master_port: 8995
+    journal_port: 8996
+  
+  tasks:
+    - name: Get master IPs from inventory
+      set_fact:
+        master_ips: "{{ groups['master'] | list }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Display master IPs
+      debug:
+        msg: "Master节点IP列表: {{ master_ips }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Check if config file exists
+      stat:
+        path: "{{ curvine_config_file }}"
+      register: config_exists
+
+    - name: Skip if config file not exists
+      debug:
+        msg: "配置文件不存在，跳过更新"
+      when: not config_exists.stat.exists
+
+    - name: Backup config file
+      copy:
+        src: "{{ curvine_config_file }}"
+        dest: "{{ curvine_config_file }}.before_master_addrs_update"
+        remote_src: yes
+      when: config_exists.stat.exists
+
+    - name: Build master_addrs string
+      set_fact:
+        master_addrs_str: "{{ master_ips | map('regex_replace', '^(.*)$', '{ hostname = \"\\1\", port = ' + master_port|string + ' }') | join(',\n    ') }}"
+      when: config_exists.stat.exists
+
+    - name: Build journal_addrs string
+      set_fact:
+        journal_addrs_str: "{{ master_ips | map('regex_replace', '^(.*)$', '{id = ' + (ansible_loop.index|default(1))|string + ', hostname = \"\\1\", port = ' + journal_port|string + '}') | join(',\n    ') }}"
+      when: config_exists.stat.exists
+
+    - name: Update master_addrs in config
+      shell: |
+        cd {{ curvine_install_dir }}/conf
+        python3 << 'PYPEOF'
+import re
+
+# 读取配置
+with open('curvine-cluster.toml', 'r') as f:
+    content = f.read()
+
+# 构建新的master_addrs
+master_ips = {{ master_ips | to_json }}
+master_addrs_lines = []
+for ip in master_ips:
+    master_addrs_lines.append(f'    {{ hostname = "{ip}", port = {{ master_port }} }}')
+new_master_addrs = "master_addrs = [\n" + ",\n".join(master_addrs_lines) + "\n]"
+
+# 替换master_addrs
+pattern = r'master_addrs\s*=\s*\[.*?\]'
+content = re.sub(pattern, new_master_addrs, content, flags=re.DOTALL)
+
+# 构建新的journal_addrs
+journal_addrs_lines = []
+for idx, ip in enumerate(master_ips, 1):
+    journal_addrs_lines.append(f'    {{id = {idx}, hostname = "{ip}", port = {{ journal_port }} }}')
+new_journal_addrs = "journal_addrs = [\n" + ",\n".join(journal_addrs_lines) + "\n]"
+
+# 替换journal_addrs
+pattern = r'journal_addrs\s*=\s*\[.*?\]'
+content = re.sub(pattern, new_journal_addrs, content, flags=re.DOTALL)
+
+# 写回
+with open('curvine-cluster.toml', 'w') as f:
+    f.write(content)
+
+print("master_addrs和journal_addrs已更新")
+PYPEOF
+      args:
+        executable: /bin/bash
+      when: config_exists.stat.exists
+      register: update_result
+
+    - name: Display update result
+      debug:
+        msg: "{{ update_result.stdout }}"
+      when: config_exists.stat.exists and update_result is defined
+
+    - name: Verify updated config
+      shell: |
+        echo "=== master_addrs ==="
+        grep -A 10 'master_addrs' {{ curvine_config_file }} | head -15
+        echo ""
+        echo "=== journal_addrs ==="
+        grep -A 10 'journal_addrs' {{ curvine_config_file }} | head -15
+      register: verify_config
+      when: config_exists.stat.exists
+
+    - name: Display verification
+      debug:
+        msg: "{{ verify_config.stdout_lines }}"
+      when: config_exists.stat.exists and verify_config is defined
+
