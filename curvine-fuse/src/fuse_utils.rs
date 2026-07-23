@@ -326,7 +326,7 @@ impl FuseUtils {
 
     pub fn check_user_xattr_namespace(file_type: FileType, name: &str) -> FuseResult<()> {
         if name.starts_with("user.") && !Self::user_xattr_supported(file_type) {
-            return err_fuse!(libc::ENODATA, "user xattr not supported on {:?}", file_type);
+            return err_fuse!(libc::EPERM, "user xattr not permitted on {:?}", file_type);
         }
         Ok(())
     }
@@ -363,6 +363,43 @@ impl FuseUtils {
 
     pub fn normalize_ioctl_file_flags(flags: u32) -> u32 {
         flags & Self::FS_IOCTL_MUTABLE_FLAGS
+    }
+
+    pub fn ioctl_flag_bytes() -> usize {
+        std::mem::size_of::<libc::c_long>()
+    }
+
+    pub fn decode_ioctl_file_flags(data: &[u8]) -> FuseResult<u32> {
+        let nbytes = Self::ioctl_flag_bytes();
+        if data.len() < nbytes {
+            return err_fuse!(libc::EINVAL, "ioctl in buffer too small");
+        }
+        let value = match nbytes {
+            8 => i64::from_ne_bytes(data[..8].try_into().unwrap()) as u32,
+            4 => u32::from_ne_bytes(data[..4].try_into().unwrap()),
+            _ => {
+                return err_fuse!(
+                    libc::EINVAL,
+                    "unsupported ioctl flag transfer size {}",
+                    nbytes
+                );
+            }
+        };
+        Ok(value)
+    }
+
+    pub fn append_ioctl_file_flags(buf: &mut BytesMut, flags: u32, out_size: u32) {
+        if out_size == 0 {
+            return;
+        }
+        let nbytes = Self::ioctl_flag_bytes();
+        let want = out_size as usize;
+        let encoded = (flags as libc::c_long).to_ne_bytes();
+        let copy = want.min(nbytes).min(encoded.len());
+        buf.extend_from_slice(&encoded[..copy]);
+        if want > copy {
+            buf.resize(buf.len() + (want - copy), 0);
+        }
     }
 
     pub fn file_open_flags(conf: &FuseConf, keep_cache: bool) -> u32 {
@@ -950,8 +987,19 @@ mod tests {
     #[test]
     fn user_xattr_namespace_rejects_special_nodes() {
         let err = FuseUtils::check_user_xattr_namespace(FileType::Fifo, "user.test").unwrap_err();
-        assert_eq!(err.errno(), libc::ENODATA);
+        assert_eq!(err.errno(), libc::EPERM);
         FuseUtils::check_user_xattr_namespace(FileType::File, "user.test").unwrap();
+    }
+
+    #[test]
+    fn ioctl_file_flags_round_trip_native_long() {
+        use bytes::BytesMut;
+
+        let flags = FS_IMMUTABLE_FL | FS_APPEND_FL;
+        let mut buf = BytesMut::new();
+        FuseUtils::append_ioctl_file_flags(&mut buf, flags, FuseUtils::ioctl_flag_bytes() as u32);
+        assert_eq!(buf.len(), FuseUtils::ioctl_flag_bytes());
+        assert_eq!(FuseUtils::decode_ioctl_file_flags(&buf).unwrap(), flags);
     }
 
     #[test]

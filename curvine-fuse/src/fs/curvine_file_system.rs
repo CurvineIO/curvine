@@ -753,24 +753,20 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn ioctl(&self, op: Ioctl<'_>) -> FuseResult<BytesMut> {
         let path = self.state.get_path(op.header.nodeid)?;
         let mut status = self.state.fs_stat(op.header.nodeid, None).await?;
+        let flag_bytes = FuseUtils::ioctl_flag_bytes() as u32;
         let (result, out_flags) = match op.arg.cmd {
             FuseUtils::FS_IOC_GETFLAGS => {
-                if op.arg.out_size < 4 {
+                if op.arg.out_size < flag_bytes {
                     return err_fuse!(libc::EINVAL, "ioctl out buffer too small");
                 }
                 (0, FuseUtils::file_flags_from_status(&status))
             }
             FuseUtils::FS_IOC_SETFLAGS => {
                 self.ensure_writable_path(&path, RpcCode::SetAttr).await?;
-                if op.in_data.len() < 4 {
+                if op.arg.in_size < flag_bytes {
                     return err_fuse!(libc::EINVAL, "ioctl in buffer too small");
                 }
-                if op.arg.out_size < 4 {
-                    return err_fuse!(libc::EINVAL, "ioctl out buffer too small");
-                }
-                let mut bytes = [0u8; 4];
-                bytes.copy_from_slice(&op.in_data[..4]);
-                let requested = u32::from_ne_bytes(bytes);
+                let requested = FuseUtils::decode_ioctl_file_flags(op.in_data)?;
                 let new_flags = FuseUtils::normalize_ioctl_file_flags(requested);
                 let opts = FuseUtils::set_attr_for_file_flags(&status, new_flags);
                 status = self.state.fs_set_attr(op.header.nodeid, opts).await?;
@@ -786,7 +782,7 @@ impl fs::FileSystem for CurvineFileSystem {
             out_iovs: 0,
         };
         let mut buf = BytesMut::from(FuseUtils::struct_as_bytes(&out));
-        buf.extend_from_slice(&out_flags.to_ne_bytes());
+        FuseUtils::append_ioctl_file_flags(&mut buf, out_flags, op.arg.out_size);
         Ok(buf)
     }
 
