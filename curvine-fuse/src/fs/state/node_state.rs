@@ -216,7 +216,7 @@ impl NodeState {
         let cache_hit = record && dir.get_inode(parent, Some(name)).is_some();
         let before = dir.inode_lens();
         let attr = {
-            let inode = dir.lookup(parent, name, status.clone())?;
+            let inode = dir.lookup(parent, name, status.clone(), true)?;
             inode.to_attr(&self.conf)?
         };
         let after = dir.inode_lens();
@@ -1506,7 +1506,7 @@ mod test {
         let ino = {
             let mut dir = state.dir_write();
             let status = FileStatus::with_name(123, "pending".to_string(), false);
-            let ino = dir.lookup(FUSE_ROOT_ID, "pending", status).unwrap().ino;
+            let ino = dir.lookup(FUSE_ROOT_ID, "pending", status, true).unwrap().ino;
             dir.unlink(FUSE_ROOT_ID, "pending", true).unwrap();
             ino
         };

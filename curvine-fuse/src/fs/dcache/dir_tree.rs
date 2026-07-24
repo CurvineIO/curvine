@@ -176,37 +176,16 @@ impl DirTree {
     }
 
     // LOOKUP: create inode and parent directory entry as needed.
-    // Establishes a kernel lookup ref (n_lookup += 1); the kernel will later
-    // balance it with a FORGET. Used by the real LOOKUP op and READDIRPLUS.
+    // Materializes the child into the dcache (local dentry ref, taken
+    // regardless). `bump_kref` controls the kernel lookup ref (n_lookup += 1):
+    //   - true  = real LOOKUP / READDIRPLUS: the kernel caches the child and
+    //     later balances the ref with a FORGET.
+    //   - false = plain READDIR: returns names only, the kernel does not cache
+    //     the child, never bumps its lookup count, and never sends a FORGET.
+    //     Bumping n_lookup here would inflate the daemon-side count past the
+    //     kernel's real value with no FORGET to balance it, defeating unlink's
+    //     immediate `should_unref` reclaim (issue #1114).
     pub fn lookup(
-        &mut self,
-        parent: u64,
-        name: &str,
-        status: FileStatus,
-    ) -> FuseResult<&mut Inode> {
-        self.lookup_impl(parent, name, status, true)
-    }
-
-    // READDIR: materialize the child into the dcache (local dentry ref) WITHOUT
-    // taking a kernel lookup ref. Plain READDIR returns names only; the kernel
-    // does not cache the child, does not increment its lookup count, and never
-    // sends a FORGET for it (unlike READDIRPLUS). Bumping n_lookup here would
-    // inflate the daemon-side count past the kernel's real value with no FORGET
-    // to balance it, which defeats unlink's immediate `should_unref` reclaim
-    // (issue #1114).
-    pub fn lookup_no_kref(
-        &mut self,
-        parent: u64,
-        name: &str,
-        status: FileStatus,
-    ) -> FuseResult<&mut Inode> {
-        self.lookup_impl(parent, name, status, false)
-    }
-
-    // `bump_kref` = whether to take a kernel lookup ref (n_lookup += 1). The
-    // local dcache dentry ref (ref_ctr) is taken regardless, since either op
-    // materializes the child into the dcache.
-    fn lookup_impl(
         &mut self,
         parent: u64,
         name: &str,
@@ -662,11 +641,11 @@ mod test {
     fn create_lookup_rename_link_unlink_forget_keeps_tree_consistent() {
         let mut t = DirTree::default();
 
-        t.lookup(FUSE_ROOT_ID, "d", dir_st("d", 100)).unwrap();
+        t.lookup(FUSE_ROOT_ID, "d", dir_st("d", 100), true).unwrap();
         assert!(t.get_inode_check(100, None).unwrap().is_dir);
         assert_eq!(t.get_inode(FUSE_ROOT_ID, Some("d")).unwrap().ino, 100);
 
-        let f = t.lookup(FUSE_ROOT_ID, "f", file_st("f", 0)).unwrap().ino;
+        let f = t.lookup(FUSE_ROOT_ID, "f", file_st("f", 0), true).unwrap().ino;
         assert_eq!(t.get_inode_check(f, None).unwrap().ref_ctr, 1);
         assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, 1);
 
@@ -700,7 +679,7 @@ mod test {
     #[test]
     fn unlink_drops_inode_when_last_ref_forget_is_idempotent() {
         let mut t = DirTree::default();
-        let f = t.lookup(FUSE_ROOT_ID, "x", file_st("x", 0)).unwrap().ino;
+        let f = t.lookup(FUSE_ROOT_ID, "x", file_st("x", 0), true).unwrap().ino;
         assert_eq!(t.get_inode_check(f, None).unwrap().ref_ctr, 1);
         assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, 1);
         t.unlink(FUSE_ROOT_ID, "x", false).unwrap();
@@ -722,7 +701,7 @@ mod test {
     #[test]
     fn create_then_forget_then_unlink() {
         let mut t = DirTree::default();
-        t.lookup(FUSE_ROOT_ID, "c", file_st("c", 200)).unwrap();
+        t.lookup(FUSE_ROOT_ID, "c", file_st("c", 200), true).unwrap();
         let n0 = t.get_inode_check(200, None).unwrap().n_lookup;
         t.forget(200, n0).unwrap();
         assert_eq!(t.get_inode_check(200, None).unwrap().n_lookup, 0);
@@ -738,14 +717,14 @@ mod test {
         let mut t = DirTree::default();
         // Path C: brand-new inode via readdir.
         let f = t
-            .lookup_no_kref(FUSE_ROOT_ID, "r", file_st("r", 0))
+            .lookup(FUSE_ROOT_ID, "r", file_st("r", 0), false)
             .unwrap()
             .ino;
         assert_eq!(t.get_inode_check(f, None).unwrap().ref_ctr, 1);
         assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, 0);
 
         // Path A: repeat readdir on same name leaves n_lookup at 0.
-        t.lookup_no_kref(FUSE_ROOT_ID, "r", file_st("r", 0))
+        t.lookup(FUSE_ROOT_ID, "r", file_st("r", 0), false)
             .unwrap();
         assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, 0);
     }
@@ -755,9 +734,9 @@ mod test {
     #[test]
     fn readdirplus_increments_lookup_refs() {
         let mut t = DirTree::default();
-        let f = t.lookup(FUSE_ROOT_ID, "p", file_st("p", 0)).unwrap().ino;
+        let f = t.lookup(FUSE_ROOT_ID, "p", file_st("p", 0), true).unwrap().ino;
         assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, 1);
-        t.lookup(FUSE_ROOT_ID, "p", file_st("p", 0)).unwrap();
+        t.lookup(FUSE_ROOT_ID, "p", file_st("p", 0), true).unwrap();
         assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, 2);
     }
 
@@ -769,7 +748,7 @@ mod test {
     fn unlink_reclaims_inode_seen_only_by_readdir() {
         let mut t = DirTree::default();
         let f = t
-            .lookup_no_kref(FUSE_ROOT_ID, "d", file_st("d", 0))
+            .lookup(FUSE_ROOT_ID, "d", file_st("d", 0), false)
             .unwrap()
             .ino;
         // No kernel lookup ref, one local dcache dentry ref.
@@ -786,7 +765,7 @@ mod test {
     #[test]
     fn unlink_mark_delete_keeps_inode_for_clear_mark_delete() {
         let mut t = DirTree::default();
-        t.lookup(FUSE_ROOT_ID, "d", file_st("d", 300)).unwrap();
+        t.lookup(FUSE_ROOT_ID, "d", file_st("d", 300), true).unwrap();
         let n0 = t.get_inode_check(300, None).unwrap().n_lookup;
         t.forget(300, n0).unwrap();
         assert_eq!(t.get_inode_check(300, None).unwrap().n_lookup, 0);
@@ -805,8 +784,8 @@ mod test {
     fn repeated_lookup_accumulates_ref_and_nlookup() {
         let mut t = DirTree::default();
         let st = file_st("p", 0);
-        let i = t.lookup(FUSE_ROOT_ID, "p", st.clone()).unwrap().ino;
-        t.lookup(FUSE_ROOT_ID, "p", st).unwrap();
+        let i = t.lookup(FUSE_ROOT_ID, "p", st.clone(), true).unwrap().ino;
+        t.lookup(FUSE_ROOT_ID, "p", st, true).unwrap();
         assert_eq!(t.get_inode_check(i, None).unwrap().ref_ctr, 1);
         assert_eq!(t.get_inode_check(i, None).unwrap().n_lookup, 2);
     }
@@ -814,10 +793,10 @@ mod test {
     #[test]
     fn lookup_existing_server_id_updates_inode_path_without_reinsert() {
         let mut t = DirTree::default();
-        t.lookup(FUSE_ROOT_ID, "d", dir_st("d", 700)).unwrap();
-        let i = t.lookup(FUSE_ROOT_ID, "a", file_st("a", 701)).unwrap().ino;
+        t.lookup(FUSE_ROOT_ID, "d", dir_st("d", 700), true).unwrap();
+        let i = t.lookup(FUSE_ROOT_ID, "a", file_st("a", 701), true).unwrap().ino;
 
-        t.lookup(700, "b", file_st("b", 701)).unwrap();
+        t.lookup(700, "b", file_st("b", 701), true).unwrap();
 
         let inode = t.get_inode_check(i, None).unwrap();
         assert_eq!(inode.parent, 700);
@@ -831,9 +810,9 @@ mod test {
     #[test]
     fn lookup_dir_inserts_dirs_map_and_child_visible() {
         let mut t = DirTree::default();
-        let d_ino = t.lookup(FUSE_ROOT_ID, "sub", dir_st("sub", 0)).unwrap().ino;
+        let d_ino = t.lookup(FUSE_ROOT_ID, "sub", dir_st("sub", 0), true).unwrap().ino;
         assert!(t.get_inode_check(d_ino, None).unwrap().is_dir);
-        let inner_ino = t.lookup(d_ino, "inner", file_st("inner", 0)).unwrap().ino;
+        let inner_ino = t.lookup(d_ino, "inner", file_st("inner", 0), true).unwrap().ino;
         assert_eq!(t.get_inode(d_ino, Some("inner")).unwrap().ino, inner_ino);
     }
 
@@ -854,7 +833,7 @@ mod test {
     #[test]
     fn try_get_path_dir_without_tail() {
         let mut t = DirTree::default();
-        let d_ino = t.lookup(FUSE_ROOT_ID, "sub", dir_st("sub", 0)).unwrap().ino;
+        let d_ino = t.lookup(FUSE_ROOT_ID, "sub", dir_st("sub", 0), true).unwrap().ino;
         let p = t.try_get_path(d_ino, None).unwrap();
         assert_eq!(p.full_path(), "/sub");
     }
@@ -862,7 +841,7 @@ mod test {
     #[test]
     fn try_get_path_nested_dir_and_tail() {
         let mut t = DirTree::default();
-        let d_ino = t.lookup(FUSE_ROOT_ID, "sub", dir_st("sub", 0)).unwrap().ino;
+        let d_ino = t.lookup(FUSE_ROOT_ID, "sub", dir_st("sub", 0), true).unwrap().ino;
         let p = t.try_get_path(d_ino, Some("file.txt")).unwrap();
         assert_eq!(p.full_path(), "/sub/file.txt");
     }
@@ -870,10 +849,10 @@ mod test {
     #[test]
     fn try_get_path_three_levels() {
         let mut t = DirTree::default();
-        let a_ino = t.lookup(FUSE_ROOT_ID, "a", dir_st("a", 0)).unwrap().ino;
+        let a_ino = t.lookup(FUSE_ROOT_ID, "a", dir_st("a", 0), true).unwrap().ino;
         let mut b = dir_st("b", 0);
         b.path = "/a/b".to_owned();
-        let b_ino = t.lookup(a_ino, "b", b).unwrap().ino;
+        let b_ino = t.lookup(a_ino, "b", b, true).unwrap().ino;
         let p = t.try_get_path(b_ino, Some("c")).unwrap();
         assert_eq!(p.full_path(), "/a/b/c");
     }
@@ -885,7 +864,7 @@ mod test {
             ..Default::default()
         };
         let mut t = DirTree::new(conf);
-        let d_ino = t.lookup(FUSE_ROOT_ID, "sub", dir_st("sub", 0)).unwrap().ino;
+        let d_ino = t.lookup(FUSE_ROOT_ID, "sub", dir_st("sub", 0), true).unwrap().ino;
         let p = t.try_get_path(d_ino, Some("x")).unwrap();
         assert_eq!(p.full_path(), "s3://bucket/prefix/sub/x");
     }
@@ -894,7 +873,7 @@ mod test {
     #[test]
     fn rename_within_same_parent_keeps_ino_and_ref() {
         let mut t = DirTree::default();
-        let i = t.lookup(FUSE_ROOT_ID, "a", file_st("a", 300)).unwrap().ino;
+        let i = t.lookup(FUSE_ROOT_ID, "a", file_st("a", 300), true).unwrap().ino;
         let r = t.get_inode_check(i, None).unwrap().ref_ctr;
         t.rename(FUSE_ROOT_ID, "a", FUSE_ROOT_ID, "b").unwrap();
         assert_eq!(t.get_inode(FUSE_ROOT_ID, Some("b")).unwrap().ino, i);
@@ -932,8 +911,8 @@ mod test {
     #[test]
     fn link_bumps_both_ref_and_nlookup() {
         let mut t = DirTree::default();
-        t.lookup(FUSE_ROOT_ID, "d", dir_st("d", 400)).unwrap();
-        let f = t.lookup(FUSE_ROOT_ID, "f", file_st("f", 0)).unwrap().ino;
+        t.lookup(FUSE_ROOT_ID, "d", dir_st("d", 400), true).unwrap();
+        let f = t.lookup(FUSE_ROOT_ID, "f", file_st("f", 0), true).unwrap().ino;
         let n_ref = t.get_inode_check(f, None).unwrap().ref_ctr;
         let n_lookup = t.get_inode_check(f, None).unwrap().n_lookup;
         t.link(f, 400, "hard", file_st("hard", f as i64)).unwrap();
@@ -946,9 +925,9 @@ mod test {
     #[test]
     fn hard_link_ref_count_and_unlink_removes_inode_when_zero() {
         let mut t = DirTree::default();
-        t.lookup(FUSE_ROOT_ID, "d", dir_st("d", 600)).unwrap();
+        t.lookup(FUSE_ROOT_ID, "d", dir_st("d", 600), true).unwrap();
 
-        let f_ino = t.lookup(FUSE_ROOT_ID, "f", file_st("f", 0)).unwrap().ino;
+        let f_ino = t.lookup(FUSE_ROOT_ID, "f", file_st("f", 0), true).unwrap().ino;
         assert_eq!(t.get_inode_check(f_ino, None).unwrap().ref_ctr, 1);
 
         t.link(f_ino, 600, "hard", file_st("hard", f_ino as i64))
@@ -982,11 +961,11 @@ mod test {
 
         // Create source "src" and target "dst"
         let src = t
-            .lookup(FUSE_ROOT_ID, "src", file_st("src", 0))
+            .lookup(FUSE_ROOT_ID, "src", file_st("src", 0), true)
             .unwrap()
             .ino;
         let dst = t
-            .lookup(FUSE_ROOT_ID, "dst", file_st("dst", 0))
+            .lookup(FUSE_ROOT_ID, "dst", file_st("dst", 0), true)
             .unwrap()
             .ino;
 
@@ -1016,13 +995,13 @@ mod test {
         let mut t = DirTree::default();
 
         let src = t
-            .lookup(FUSE_ROOT_ID, "src", file_st("src", 0))
+            .lookup(FUSE_ROOT_ID, "src", file_st("src", 0), true)
             .unwrap()
             .ino;
         // Two lookups on "dst": ref_ctr=1 (single dirent), n_lookup=2
-        t.lookup(FUSE_ROOT_ID, "dst", file_st("dst", 0)).unwrap();
+        t.lookup(FUSE_ROOT_ID, "dst", file_st("dst", 0), true).unwrap();
         let dst = t
-            .lookup(FUSE_ROOT_ID, "dst", file_st("dst", 0))
+            .lookup(FUSE_ROOT_ID, "dst", file_st("dst", 0), true)
             .unwrap()
             .ino;
         assert_eq!(t.get_inode_check(dst, None).unwrap().ref_ctr, 1);
@@ -1058,35 +1037,35 @@ mod test {
         // Case 1: expired, ref_ctr=0, no handles → should be evicted
         // Simulates unlinked file (ref_ctr=0) while kernel still holds dentry (n_lookup=1):
         // should_unref() false, no FORGET yet, inode still in dcache.
-        let f1 = t.lookup(FUSE_ROOT_ID, "f1", file_st("f1", 0)).unwrap().ino;
+        let f1 = t.lookup(FUSE_ROOT_ID, "f1", file_st("f1", 0), true).unwrap().ino;
         t.unlink(FUSE_ROOT_ID, "f1", false).unwrap();
         assert_eq!(t.get_inode_check(f1, None).unwrap().ref_ctr, 0);
         assert_eq!(t.get_inode_check(f1, None).unwrap().n_lookup, 1);
         t.get_inode_mut(f1, None).unwrap().last_access = 0; // force past TTL
 
         // Case 2: still linked, fresh last_access → not evicted (per-inode TTL not expired)
-        let f2 = t.lookup(FUSE_ROOT_ID, "f2", file_st("f2", 0)).unwrap().ino;
+        let f2 = t.lookup(FUSE_ROOT_ID, "f2", file_st("f2", 0), true).unwrap().ino;
         // Do not zero last_access: clear() does not consult ref_ctr; expiry is last_access-based.
 
         // Case 3: expired, ref_ctr=0, but open handle → not evicted
-        let f3 = t.lookup(FUSE_ROOT_ID, "f3", file_st("f3", 0)).unwrap().ino;
+        let f3 = t.lookup(FUSE_ROOT_ID, "f3", file_st("f3", 0), true).unwrap().ino;
         t.unlink(FUSE_ROOT_ID, "f3", false).unwrap();
         t.get_inode_mut(f3, None).unwrap().last_access = 0;
 
         // Case 4: ref_ctr=0 but not expired → not evicted
-        let f4 = t.lookup(FUSE_ROOT_ID, "f4", file_st("f4", 0)).unwrap().ino;
+        let f4 = t.lookup(FUSE_ROOT_ID, "f4", file_st("f4", 0), true).unwrap().ino;
         t.unlink(FUSE_ROOT_ID, "f4", false).unwrap();
         // last_access is fresh; within 60s TTL
 
         // Case 5: expired empty dir, ref_ctr=0 → evicted
-        let d1 = t.lookup(FUSE_ROOT_ID, "d1", dir_st("d1", 500)).unwrap().ino;
+        let d1 = t.lookup(FUSE_ROOT_ID, "d1", dir_st("d1", 500), true).unwrap().ino;
         t.unlink(FUSE_ROOT_ID, "d1", false).unwrap(); // like rmdir; DirEntry.children empty
         t.get_inode_mut(d1, None).unwrap().last_access = 0;
 
         // Case 6: expired dir with ref_ctr=0 but cached children → not evicted
         // Evicting would orphan cached children and break path reconstruction.
-        let d2 = t.lookup(FUSE_ROOT_ID, "d2", dir_st("d2", 600)).unwrap().ino;
-        t.lookup(d2, "child", file_st("child", 0)).unwrap(); // d2.children has "child"
+        let d2 = t.lookup(FUSE_ROOT_ID, "d2", dir_st("d2", 600), true).unwrap().ino;
+        t.lookup(d2, "child", file_st("child", 0), true).unwrap(); // d2.children has "child"
         t.get_inode_mut(d2, None).unwrap().ref_ctr = 0; // simulate unlinked dir inode
         t.get_inode_mut(d2, None).unwrap().last_access = 0;
 
@@ -1124,7 +1103,7 @@ mod test {
 
         // cache_ttl==0: per-inode check is `last_access + 0 <= now`; stale last_access still evicts.
         let mut t0 = DirTree::default();
-        let fx = t0.lookup(FUSE_ROOT_ID, "fx", file_st("fx", 0)).unwrap().ino;
+        let fx = t0.lookup(FUSE_ROOT_ID, "fx", file_st("fx", 0), true).unwrap().ino;
         t0.unlink(FUSE_ROOT_ID, "fx", false).unwrap();
         t0.get_inode_mut(fx, None).unwrap().last_access = 0;
         t0.clear(|_| false);

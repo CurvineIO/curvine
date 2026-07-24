@@ -346,11 +346,7 @@ impl CurvineFileSystem {
                     // dentry and will send a FORGET); plain READDIR must not
                     // (kernel returns names only, no lookup count, no FORGET) —
                     // issue #1114.
-                    let inode = if plus {
-                        dir.lookup(header.nodeid, &status.name, status.clone())?
-                    } else {
-                        dir.lookup_no_kref(header.nodeid, &status.name, status.clone())?
-                    };
+                    let inode = dir.lookup(header.nodeid, &status.name, status.clone(), plus)?;
                     let attr = FuseUtils::status_to_attr(&self.conf, &inode.status)?;
                     // readdir materializes the child into the dcache; count it as a
                     // status-cache put (mirrors the pre-refactor read_dir_common).
