@@ -45,7 +45,7 @@ mod block_info;
 pub use self::block_info::*;
 
 mod file_status;
-pub use self::file_status::FileStatus;
+pub use self::file_status::{FileStatus, INTERNAL_CTIME_XATTR};
 
 mod master_info;
 pub use self::master_info::MasterInfo;

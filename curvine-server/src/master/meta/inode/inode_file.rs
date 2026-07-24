@@ -18,7 +18,7 @@ use crate::master::meta::store::InodeStore;
 use crate::master::meta::{BlockMeta, InodeId};
 use curvine_common::state::{
     is_special_file_type, BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts,
-    FileType, StoragePolicy,
+    FileType, StoragePolicy, INTERNAL_CTIME_XATTR,
 };
 use curvine_common::FsResult;
 use orpc::common::LocalTime;
@@ -573,6 +573,15 @@ impl Inode for InodeFile {
 
     fn atime(&self) -> i64 {
         self.atime
+    }
+
+    fn ctime(&self) -> i64 {
+        self.features
+            .x_attr
+            .get(INTERNAL_CTIME_XATTR)
+            .and_then(|bytes| bytes.as_slice().try_into().ok())
+            .map(i64::from_le_bytes)
+            .unwrap_or(self.mtime)
     }
 
     fn nlink(&self) -> u32 {

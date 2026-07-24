@@ -25,6 +25,7 @@ use curvine_common::error::FsError;
 use curvine_common::state::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
     FreeResult, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, WorkerAddress,
+    INTERNAL_CTIME_XATTR,
 };
 use curvine_common::FsResult;
 use log::{debug, info, warn};
@@ -848,12 +849,19 @@ impl FsDir {
         self.store.get_mount_point(id)
     }
 
-    pub fn set_attr(&mut self, inp: InodePath, opts: SetAttrOpts) -> FsResult<FileStatus> {
+    pub fn set_attr(&mut self, inp: InodePath, mut opts: SetAttrOpts) -> FsResult<FileStatus> {
         let inode = match inp.get_last_inode() {
             Some(v) => v,
             None => return err_ext!(FsError::file_not_found(inp.path())),
         };
 
+        // Persist the operation timestamp inside the existing xattr map so journal
+        // replay restores the original ctime without changing the bincode layout.
+        let ctime = LocalTime::mills() as i64;
+        opts.add_x_attr.insert(
+            INTERNAL_CTIME_XATTR.to_string(),
+            ctime.to_le_bytes().to_vec(),
+        );
         self.unprotected_set_attr(inode.clone(), opts.clone())?;
         self.journal_writer.log_set_attr(self, &inp, opts)?;
         Ok(inode.to_file_status(inp.path())?)

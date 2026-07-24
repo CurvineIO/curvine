@@ -377,6 +377,11 @@ pub struct SetAttrOpts {
 impl SetAttrOpts {
     // Recursive setting, only allows setting acl related attributes
     pub fn child_opts(&self) -> Self {
+        let mut add_x_attr = HashMap::new();
+        if let Some(ctime) = self.add_x_attr.get(INTERNAL_CTIME_XATTR) {
+            add_x_attr.insert(INTERNAL_CTIME_XATTR.to_string(), ctime.clone());
+        }
+
         Self {
             recursive: false,
             replicas: self.replicas,
@@ -387,7 +392,7 @@ impl SetAttrOpts {
             mtime: None,
             ttl_ms: None,
             ttl_action: None,
-            add_x_attr: HashMap::default(),
+            add_x_attr,
             remove_x_attr: vec![],
             ufs_mtime: None,
         }
