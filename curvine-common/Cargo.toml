@@ -9,6 +9,12 @@ license.workspace = true
 [dependencies]
 orpc = { workspace = true }
 curvine-fault = { workspace = true }
+curvine-error = { workspace = true }
+curvine-proto = { workspace = true }
+curvine-model = { workspace = true }
+curvine-fs-api = { workspace = true }
+curvine-storage-api = { workspace = true }
+curvine-config = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 async-stream =  { workspace = true }
@@ -35,14 +41,11 @@ flate2 = { workspace = true }
 dashmap = { workspace = true }
 linked-hash-map = { workspace = true }
 crossbeam = { workspace = true }
-axum = { workspace = true }
 mini-moka = { workspace = true }
 slog = { workspace = true }
 slog-stdlog  = { workspace = true }
 chrono = { workspace = true }
 trait-variant = { workspace = true }
-
-curvine-common-macros = { path = "macros" }
 
 anyhow = { workspace = true }
 tracing = { workspace = true }

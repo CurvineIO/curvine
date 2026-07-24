@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::conf::ClusterConf;
 use crate::fs::Path;
 use orpc::common::{DurationUnit, FileUtils, LogConf, Utils};
 use orpc::sys::{CString, FFIUtils};
@@ -535,7 +534,7 @@ impl Default for FuseConf {
             negative_timeout_ms: FuseConf::DEFAULT_NEGATIVE_TIMEOUT_MS,
             attr_timeout_ms: FuseConf::DEFAULT_ATTR_TIMEOUT_MS,
             remember: false,
-            web_port: ClusterConf::DEFAULT_FUSE_WEB_PORT,
+            web_port: crate::DEFAULT_FUSE_WEB_PORT,
 
             max_background: 256,
             congestion_threshold: 192,
@@ -886,15 +885,18 @@ max_readahead_kb = 1024
 
     #[test]
     fn toml_fuse_section_omitted_max_readahead_kb_uses_default() {
-        use crate::conf::ClusterConf;
+        #[derive(Deserialize)]
+        struct FuseOnly {
+            fuse: FuseConf,
+        }
 
-        let conf: ClusterConf = toml::from_str(
+        let conf: FuseOnly = toml::from_str(
             r#"
 [fuse]
 io_threads = 16
 "#,
         )
-        .expect("parse cluster conf");
+        .expect("parse fuse wrapper");
         assert_eq!(
             conf.fuse.max_readahead_kb,
             Some(FuseConf::DEFAULT_MAX_READAHEAD_KB)

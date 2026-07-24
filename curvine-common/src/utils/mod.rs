@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod proto_utils;
-pub use self::proto_utils::ProtoUtils;
+pub use curvine_model::ProtoUtils;
 
 mod serde_utils;
 pub use self::serde_utils::SerdeUtils;

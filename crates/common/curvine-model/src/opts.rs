@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::conf::ClientConf;
 use crate::state::*;
+use crate::{ClientConfDefaults, DEFAULT_FILE_SYSTEM_MODE};
 use orpc::common::ByteUnit;
 use orpc::sys;
 use serde::{Deserialize, Serialize};
@@ -46,7 +46,7 @@ impl CreateFileOpts {
             storage_policy: Default::default(),
             create_parent,
             client_name: "".to_string(),
-            mode: ClientConf::DEFAULT_FILE_SYSTEM_MODE,
+            mode: DEFAULT_FILE_SYSTEM_MODE,
             owner: "".to_string(),
             group: "".to_string(),
             sync_ufs_meta: false,
@@ -97,7 +97,7 @@ impl CreateFileOptsBuilder {
             file_type: FileType::File,
             x_attr: HashMap::new(),
             storage_policy: StoragePolicy::default(),
-            mode: ClientConf::DEFAULT_FILE_SYSTEM_MODE,
+            mode: DEFAULT_FILE_SYSTEM_MODE,
             client_name: None,
             owner: "".to_string(),
             group: "".to_string(),
@@ -106,20 +106,20 @@ impl CreateFileOptsBuilder {
         }
     }
 
-    pub fn with_conf(conf: &ClientConf) -> Self {
+    pub fn with_conf(conf: &impl ClientConfDefaults) -> Self {
         Self {
             create_parent: false,
-            replicas: conf.replicas,
-            block_size: conf.block_size,
+            replicas: conf.replicas(),
+            block_size: conf.block_size(),
             file_type: FileType::File,
             x_attr: Default::default(),
             storage_policy: StoragePolicy {
-                storage_type: conf.storage_type,
-                ttl_ms: conf.ttl_ms,
-                ttl_action: conf.ttl_action,
+                storage_type: conf.storage_type(),
+                ttl_ms: conf.ttl_ms(),
+                ttl_action: conf.ttl_action(),
                 ..Default::default()
             },
-            mode: conf.get_mode(),
+            mode: conf.mode(),
             client_name: None,
             owner: "".to_string(),
             group: "".to_string(),
@@ -236,7 +236,7 @@ impl MkdirOpts {
             create_parent,
             x_attr: HashMap::default(),
             storage_policy: StoragePolicy::default(),
-            mode: ClientConf::DEFAULT_FILE_SYSTEM_MODE,
+            mode: DEFAULT_FILE_SYSTEM_MODE,
             owner: "".to_string(),
             group: "".to_string(),
         }
@@ -275,23 +275,23 @@ impl MkdirOptsBuilder {
             create_parent: false,
             x_attr: HashMap::new(),
             storage_policy: StoragePolicy::default(),
-            mode: ClientConf::DEFAULT_FILE_SYSTEM_MODE,
+            mode: DEFAULT_FILE_SYSTEM_MODE,
             owner: "".to_string(),
             group: "".to_string(),
         }
     }
 
-    pub fn with_conf(conf: &ClientConf) -> Self {
+    pub fn with_conf(conf: &impl ClientConfDefaults) -> Self {
         Self {
             create_parent: false,
             x_attr: HashMap::new(),
             storage_policy: StoragePolicy {
-                storage_type: conf.storage_type,
-                ttl_ms: conf.ttl_ms,
-                ttl_action: conf.ttl_action,
+                storage_type: conf.storage_type(),
+                ttl_ms: conf.ttl_ms(),
+                ttl_action: conf.ttl_action(),
                 ..Default::default()
             },
-            mode: conf.get_mode(),
+            mode: conf.mode(),
             owner: "".to_string(),
             group: "".to_string(),
         }

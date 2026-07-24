@@ -12,4 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use curvine_model::*;
+pub use curvine_model::{
+    BlockLocation, BlockReportInfo, BlockReportStatus, CommitBlock, DeleteBlockCmd, ExtendedBlock,
+    FileType, LocatedBlock, StorageInfo, StoragePolicy, StorageState, StorageType, WorkerAddress,
+    WorkerCommand,
+};
