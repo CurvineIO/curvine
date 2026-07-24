@@ -230,6 +230,7 @@ pub(crate) fn splice_errno_label(errno: i32) -> &'static str {
         libc::EINTR => "eintr",
         libc::EAGAIN => "eagain",
         libc::ENODEV => "enodev",
+        libc::ECONNABORTED => "econnaborted",
         _ => "other",
     }
 }
@@ -331,6 +332,7 @@ mod tests {
         assert_eq!(splice_errno_label(libc::EINTR), "eintr");
         assert_eq!(splice_errno_label(libc::EAGAIN), "eagain");
         assert_eq!(splice_errno_label(libc::ENODEV), "enodev");
+        assert_eq!(splice_errno_label(libc::ECONNABORTED), "econnaborted");
         // Anything else (incl. 0 / unknown) collapses to lowercase "other".
         assert_eq!(splice_errno_label(libc::EIO), "other");
         assert_eq!(splice_errno_label(0), "other");

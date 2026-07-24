@@ -23,7 +23,7 @@ use crate::raw::fuse_abi::fuse_out_header;
 use crate::session::{FuseOpCode, FuseRequest, FuseResponse, FuseTask};
 use crate::{err_fuse, FuseResult, FUSE_IN_HEADER_LEN};
 use bytes::BytesMut;
-use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
+use libc::{EAGAIN, ECONNABORTED, EINTR, ENODEV, ENOENT};
 use log::{debug, error, info, warn};
 use orpc::io::IOResult;
 use orpc::runtime::{RpcRuntime, Runtime};
@@ -148,10 +148,7 @@ impl<T: FileSystem> FuseReceiver<T> {
 
     // Use libc::read to read data directly into the buffer (no splice).
     pub async fn read(&mut self) -> IOResult<BytesMut> {
-        self.buf.reserve(self.fuse_len);
-        unsafe {
-            self.buf.set_len(self.fuse_len);
-        }
+        Self::prepare_receive_buf(&mut self.buf, self.fuse_len);
 
         let len = self
             .kernel_fd
@@ -159,7 +156,14 @@ impl<T: FileSystem> FuseReceiver<T> {
             .await?;
         let len = len as usize;
         if len < FUSE_IN_HEADER_LEN {
-            return err_box!("short read on fuse device");
+            // No OS errno on this err_box!, so the receive loop exits and the
+            // event is logged once, at error level, when the Err propagates to
+            // fuse_session::start.
+            return err_box!(
+                "short read on fuse device: read {} bytes, expected at least {} bytes",
+                len,
+                FUSE_IN_HEADER_LEN
+            );
         }
 
         Ok(self.buf.split_to(len))
@@ -169,25 +173,70 @@ impl<T: FileSystem> FuseReceiver<T> {
         let pipe2 = try_option_ref!(self.pipe2);
 
         let write_len = pipe2.write_io(&self.kernel_fd, None, self.fuse_len).await?;
-
-        self.buf.reserve(write_len);
-        unsafe {
-            self.buf.set_len(write_len);
+        if write_len < FUSE_IN_HEADER_LEN {
+            // Defensive drain: this err_box! carries no OS errno, so it hits the
+            // receive loop's `_ => return Err` arm and tears the receiver down —
+            // there is no "next frame" for this task to poison. We still drain in
+            // case a future change makes a short splice recoverable. The event is
+            // logged once, at error level, when the Err propagates to
+            // fuse_session::start.
+            if write_len > 0 {
+                Self::drain_pipe(pipe2);
+            }
+            return err_box!(
+                "short splice on fuse device: spliced {} bytes, expected at least {} bytes",
+                write_len,
+                FUSE_IN_HEADER_LEN
+            );
         }
 
-        let read_len = pipe2.read_buf(&mut self.buf[..write_len]).await?;
+        Self::prepare_receive_buf(&mut self.buf, write_len);
+
+        let read_len = match pipe2.read_buf(&mut self.buf[..write_len]).await {
+            Ok(read_len) => read_len,
+            Err(err) => {
+                // Recoverable path: `err` carries the real OS errno, so the
+                // receive loop may `continue` to the next frame. Draining here is
+                // what makes that safe — stale bytes would otherwise poison it.
+                Self::drain_pipe(pipe2);
+                return Err(err);
+            }
+        };
         if write_len != read_len {
+            // Defensive drain, same rationale as the short-splice path above.
+            Self::drain_pipe(pipe2);
             return err_box!(
-                "splice read and write lengths are inconsistent, write len {}, read len {}",
+                "splice read and write lengths are inconsistent: write len {}, read len {}",
                 write_len,
                 read_len
             );
         }
-        if read_len < FUSE_IN_HEADER_LEN {
-            return err_box!("short read on fuse device");
-        };
-
         Ok(self.buf.split_to(read_len))
+    }
+
+    fn drain_pipe(pipe2: &Pipe2) {
+        let fd = pipe2.read_raw_fd();
+        let mut buf = [0u8; 8192];
+        loop {
+            match sys::read(fd, &mut buf) {
+                Ok(n) if n > 0 => continue,
+                Ok(_) => break,
+                Err(err) => {
+                    if err.raw_error().raw_os_error() == Some(EINTR) {
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    fn prepare_receive_buf(buf: &mut BytesMut, len: usize) {
+        buf.clear();
+        buf.reserve(len);
+        unsafe {
+            buf.set_len(len);
+        }
     }
 
     /// Build a reply handle for `unique`. When `labels` is `Some`, a metrics
@@ -506,7 +555,14 @@ impl<T: FileSystem> FuseReceiver<T> {
                                 Some(ENOENT) => continue,
                                 Some(EINTR) => continue,
                                 Some(EAGAIN) => continue,
-                                Some(ENODEV) => break,
+                                Some(ENODEV) => {
+                                    info!("receiver exiting: fuse device gone (ENODEV)");
+                                    break;
+                                }
+                                Some(ECONNABORTED) => {
+                                    info!("receiver exiting: connection aborted (ECONNABORTED)");
+                                    break;
+                                }
                                 _ => return Err(e.into()),
                             }
                         }
@@ -751,7 +807,7 @@ impl<T: FileSystem> FuseReceiver<T> {
 /// the `start()` loop's error match and is otherwise hard to unit-test inline —
 /// is deterministically testable without constructing a `FuseReceiver`. The
 /// labels track the loop's control flow: ENOENT/EINTR/EAGAIN continue, and
-/// everything else (incl. ENODEV and unknown/None) exits.
+/// everything else (incl. ENODEV/ECONNABORTED and unknown/None) exits.
 fn receive_error_labels(os_errno: Option<i32>) -> (&'static str, &'static str) {
     let errno = splice_errno_label(os_errno.unwrap_or(0));
     let action = match os_errno {
@@ -765,7 +821,7 @@ fn receive_error_labels(os_errno: Option<i32>) -> (&'static str, &'static str) {
 mod tests {
     use super::{receive_error_labels, PendingRequestGuard};
     use crate::fuse_metrics::{RECEIVE_ACTION_CONTINUE, RECEIVE_ACTION_EXIT};
-    use libc::{EAGAIN, EINTR, EIO, ENODEV, ENOENT};
+    use libc::{EAGAIN, ECONNABORTED, EINTR, EIO, ENODEV, ENOENT};
     use orpc::sync::FastDashMap;
     use std::sync::Arc;
     use tokio::sync::Notify;
@@ -785,10 +841,14 @@ mod tests {
             receive_error_labels(Some(EAGAIN)),
             ("eagain", RECEIVE_ACTION_CONTINUE)
         );
-        // ENODEV: graceful break -> exit.
+        // ENODEV/ECONNABORTED: graceful break -> exit.
         assert_eq!(
             receive_error_labels(Some(ENODEV)),
             ("enodev", RECEIVE_ACTION_EXIT)
+        );
+        assert_eq!(
+            receive_error_labels(Some(ECONNABORTED)),
+            ("econnaborted", RECEIVE_ACTION_EXIT)
         );
         // unknown errno and missing errno -> other/exit.
         assert_eq!(
