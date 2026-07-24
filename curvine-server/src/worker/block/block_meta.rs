@@ -174,6 +174,19 @@ impl BlockMeta {
     pub fn physical_bytes(&self) -> i64 {
         self.actual_len
     }
+
+    /// Capacity the target worker must reserve when replicating this block.
+    ///
+    /// File-backed blocks can grow when reopened, so their committed logical
+    /// length is sufficient. SPDK blocks use fixed extents and must preserve
+    /// the source allocation so a partial final block can still be appended up
+    /// to its original block boundary.
+    pub fn replication_capacity(&self) -> i64 {
+        match self.storage_type {
+            StorageType::SpdkDisk => self.len.max(self.actual_len),
+            _ => self.len,
+        }
+    }
 }
 
 impl fmt::Display for BlockMeta {

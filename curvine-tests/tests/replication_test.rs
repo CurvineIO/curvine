@@ -22,7 +22,9 @@ use log::info;
 use orpc::common::Utils;
 use orpc::runtime::RpcRuntime;
 use orpc::{CommonError, CommonResult};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 /// Create a test configuration for replication testing
@@ -129,12 +131,7 @@ fn test_block_replication_e2e() -> CommonResult<()> {
     let target_block_locations = final_locations.get(&block_id);
     if let Some(locations) = target_block_locations {
         info!("Target block locations: {}", locations.len());
-        if locations.len()
-            > initial_locations
-                .get(&block_id)
-                .map(|l| l.len())
-                .unwrap_or(0)
-        {
+        if locations.len() > replica_count(&initial_locations, block_id) {
             info!(
                 "✓ Block replication succeeded - block {} now has {} replicas",
                 block_id,
@@ -271,6 +268,78 @@ fn test_replication_with_simulated_worker_failure() -> CommonResult<()> {
     Ok(())
 }
 
+/// Replication must size the target from source block metadata rather than the
+/// worker client's unrelated default block size.
+#[test]
+fn test_replication_honors_source_block_capacity() -> CommonResult<()> {
+    const CLIENT_DEFAULT_BLOCK_SIZE: i64 = 32 * 1024;
+    const FILE_BLOCK_SIZE: i64 = 64 * 1024;
+    const FILE_SIZE: usize = 96 * 1024;
+    const REPLICATION_TIMEOUT: Duration = Duration::from_secs(8);
+    const REPLICATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+    let testing = Testing::builder()
+        .default()
+        .masters(2)
+        .workers(3)
+        .mutate_conf(|conf| {
+            conf.client.block_size_str = format!("{CLIENT_DEFAULT_BLOCK_SIZE}B");
+            conf.master.min_block_size = CLIENT_DEFAULT_BLOCK_SIZE;
+            conf.master.min_replication = 1;
+            conf.master.max_replication = 3;
+            conf.master.block_replication_enabled = true;
+        })
+        .build()?;
+    let cluster = testing.start_cluster()?;
+    let mut conf = testing.get_active_cluster_conf()?;
+    conf.client.block_size_str = format!("{FILE_BLOCK_SIZE}B");
+    conf.client.init()?;
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+
+    let path = Path::from_str("/replication_large_block.dat")?;
+    let test_data = generate_test_data(FILE_SIZE);
+    let file_blocks = rt.block_on(async { write_test_file(&fs, &path, &test_data).await })?;
+    let oversized_block = file_blocks
+        .block_locs
+        .iter()
+        .find(|block| block.block.len > CLIENT_DEFAULT_BLOCK_SIZE)
+        .expect("missing block larger than the worker client default");
+    let block_id = oversized_block.block.id;
+
+    let initial_locations = rt.block_on(async { get_block_locations(&fs, &path).await })?;
+    let initial_replica_count = replica_count(&initial_locations, block_id);
+
+    cluster
+        .get_active_master_replication_manager()
+        .report_under_replicated_blocks(1, vec![block_id])?;
+
+    let deadline = Instant::now() + REPLICATION_TIMEOUT;
+    loop {
+        let current_locations = rt.block_on(async { get_block_locations(&fs, &path).await })?;
+        let current_replica_count = replica_count(&current_locations, block_id);
+        if current_replica_count > initial_replica_count {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(CommonError::from(format!(
+                "oversized block {} did not gain a replica before timeout (before={}, after={})",
+                block_id, initial_replica_count, current_replica_count
+            )));
+        }
+        std::thread::sleep(REPLICATION_POLL_INTERVAL);
+    }
+
+    let read_data = rt.block_on(async { read_test_file(&fs, &path).await })?;
+    if read_data != test_data {
+        return Err(CommonError::from(
+            "Data integrity check failed after oversized-block replication",
+        ));
+    }
+
+    Ok(())
+}
+
 async fn write_test_file(
     fs: &CurvineFileSystem,
     path: &Path,
@@ -308,15 +377,22 @@ async fn read_test_file(fs: &CurvineFileSystem, path: &Path) -> CommonResult<Vec
 async fn get_block_locations(
     fs: &CurvineFileSystem,
     path: &Path,
-) -> CommonResult<std::collections::HashMap<i64, Vec<WorkerAddress>>> {
+) -> CommonResult<HashMap<i64, Vec<WorkerAddress>>> {
     let block_locations = fs.get_block_locations(path).await?;
 
-    let mut location_map = std::collections::HashMap::new();
+    let mut location_map = HashMap::new();
     for block_location in block_locations.block_locs.iter() {
         location_map.insert(block_location.block.id, block_location.locs.clone());
     }
 
     Ok(location_map)
+}
+
+fn replica_count(locations: &HashMap<i64, Vec<WorkerAddress>>, block_id: i64) -> usize {
+    locations
+        .get(&block_id)
+        .map(|locations| locations.len())
+        .unwrap_or(0)
 }
 
 fn generate_test_data(size: usize) -> Vec<u8> {
