@@ -14,7 +14,7 @@
 
 mod filesystem;
 #[allow(dead_code)]
-mod job;
+pub(crate) mod job;
 #[allow(dead_code)]
 mod master;
 mod session;
