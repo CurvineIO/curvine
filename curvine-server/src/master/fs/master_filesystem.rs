@@ -82,6 +82,28 @@ impl MasterFilesystem {
     // Max block-report location updates applied under a single fs_dir write lock.
     const BLOCK_REPORT_WRITE_CHUNK: usize = 4096;
 
+    fn validate_alloc_capacity(
+        current_len: i64,
+        replicas: u8,
+        opts: &FileAllocOpts,
+        available: i64,
+    ) -> FsResult<()> {
+        if opts.truncate || opts.len <= current_len {
+            return Ok(());
+        }
+
+        let logical_growth = opts.len - current_len;
+        let required = logical_growth.saturating_mul(i64::from(replicas));
+        if required > available {
+            return err_ext!(FsError::disk_out_of_space(format!(
+                "fallocate requires {} bytes for {} replicas, but only {} bytes are available",
+                logical_growth, replicas, available
+            )));
+        }
+
+        Ok(())
+    }
+
     pub fn new(
         conf: &ClusterConf,
         fs_dir: SyncFsDir,
@@ -1186,10 +1208,18 @@ impl MasterFilesystem {
         opts.validate()?;
 
         let path = path.as_ref();
+        let available = if opts.truncate {
+            i64::MAX
+        } else {
+            self.worker_manager.read().available_bytes()
+        };
         let (del_res, inode_id) = {
             let mut fs_dir = self.fs_dir.write();
             let inp = Self::resolve_path(&fs_dir, path)?;
-            let inode_id = try_option!(inp.get_last_inode(), "File {} not exists", path).id();
+            let inode = try_option!(inp.get_last_inode(), "File {} not exists", path);
+            let file = inode.as_file_ref()?;
+            Self::validate_alloc_capacity(file.len, file.replicas, &opts, available)?;
+            let inode_id = inode.id();
             let del_res = fs_dir.resize(&inp, opts)?;
             (del_res, inode_id)
         };
@@ -1253,5 +1283,29 @@ impl MasterFilesystem {
         let inp = Self::resolve_path(&fs_dir, path)?;
 
         fs_dir.set_lock(inp, lock, self.conf.lock_expire_time_ms())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallocate_rejects_growth_larger_than_available_capacity() {
+        let opts = FileAllocOpts::with_alloc(200, FileAllocMode::DEFAULT);
+        let err = MasterFilesystem::validate_alloc_capacity(20, 2, &opts, 359).unwrap_err();
+        assert!(matches!(err, FsError::DiskOutOfSpace(_)));
+    }
+
+    #[test]
+    fn fallocate_accepts_exact_available_capacity() {
+        let opts = FileAllocOpts::with_alloc(200, FileAllocMode::DEFAULT);
+        assert!(MasterFilesystem::validate_alloc_capacity(20, 2, &opts, 360).is_ok());
+    }
+
+    #[test]
+    fn truncate_growth_does_not_require_physical_capacity() {
+        let opts = FileAllocOpts::with_truncate(200);
+        assert!(MasterFilesystem::validate_alloc_capacity(20, 2, &opts, 0).is_ok());
     }
 }
