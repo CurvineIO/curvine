@@ -304,13 +304,14 @@
                         <include>master.proto</include>
                         <include>worker.proto</include>
                         <include>mount.proto</include>
-                        <include>load.proto</include>
+                        <include>job.proto</include>
                     </includes>
                     <skip>false</skip>
                 </configuration>
                 <executions>
                     <execution>
-                        <phase>compile</phase>
+                        <!-- Run before scala/java compile (process-resources) so clean mvn test works. -->
+                        <phase>generate-sources</phase>
                         <goals>
                             <goal>compile</goal>
                         </goals>

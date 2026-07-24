@@ -12,8 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::core::job;
 use crate::java::JavaUtils;
 use crate::{FilesystemConf, LibFilesystem, LibFsReader, LibFsWriter};
+use curvine_common::proto::{GetJobStatusResponse, SubmitJobResponse};
+use curvine_common::state::LoadJobCommand;
+use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use jni::objects::JString;
 use jni::sys::{jarray, jboolean, jstring};
@@ -116,6 +120,64 @@ impl JavaFilesystem {
             .toggle_path(path, JavaUtils::jbool_to_bool(check_cache))?;
         let string = JavaUtils::new_jstring(env, ufs_path.map(|x| x.clone_display_path()))?;
         Ok(string)
+    }
+
+    /// Submit a UFS-to-Curvine load job. Mirrors Rust `JobClient::submit_load_job`.
+    pub fn submit_load_job(
+        &self,
+        env: &mut JNIEnv,
+        source_path: JString,
+        target_path: JString,
+        overwrite: jboolean,
+    ) -> FsResult<jarray> {
+        let source = JavaUtils::jstring_to_string(env, &source_path)?;
+        let target = if target_path.is_null() {
+            None
+        } else {
+            let value = JavaUtils::jstring_to_string(env, &target_path)?;
+            if value.trim().is_empty() {
+                None
+            } else {
+                Some(value)
+            }
+        };
+
+        let mut builder =
+            LoadJobCommand::builder(source).overwrite(JavaUtils::jbool_to_bool(overwrite));
+        if let Some(target) = target {
+            builder = builder.target_path(target);
+        }
+        let result = job::submit_load_job(self.inner.session(), builder.build())?;
+        let response = SubmitJobResponse {
+            job_id: result.job_id,
+            target_path: result.target_path,
+            state: i32::from(result.state as i8),
+        };
+        let bytes = ProtoUtils::encode(response)?;
+        let byte_arr = JavaUtils::new_jarray(env, &bytes)?;
+        Ok(byte_arr)
+    }
+
+    /// Query load job status by id. Mirrors Rust `JobClient::get_status`.
+    pub fn get_job_status(&self, env: &mut JNIEnv, job_id: JString) -> FsResult<jarray> {
+        let job_id = JavaUtils::jstring_to_string(env, &job_id)?;
+        let status = job::get_job_status(self.inner.session(), job_id)?;
+        let response = GetJobStatusResponse {
+            job_id: status.job_id,
+            state: i32::from(status.state as i8),
+            source_path: status.source_path,
+            target_path: status.target_path,
+            progress: ProtoUtils::work_progress_to_pb(status.progress),
+        };
+        let bytes = ProtoUtils::encode(response)?;
+        let byte_arr = JavaUtils::new_jarray(env, &bytes)?;
+        Ok(byte_arr)
+    }
+
+    /// Cancel a load job by id. Mirrors Rust `JobClient::cancel`.
+    pub fn cancel_job(&self, env: &mut JNIEnv, job_id: JString) -> FsResult<()> {
+        let job_id = JavaUtils::jstring_to_string(env, &job_id)?;
+        job::cancel_job(self.inner.session(), job_id)
     }
 
     pub fn cleanup(&self) {

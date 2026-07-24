@@ -289,3 +289,42 @@ pub unsafe extern "C" fn Java_io_curvine_CurvineNative_togglePath(
     let fs = &*fs_ptr;
     java_err2!(env, fs.toggle_path(&mut env, path, check_cache))
 }
+
+#[no_mangle]
+pub unsafe extern "C" fn Java_io_curvine_CurvineNative_submitLoadJob(
+    mut env: JNIEnv,
+    _this: JObject,
+    fs_ptr: *mut JavaFilesystem,
+    source_path: JString,
+    target_path: JString,
+    overwrite: jboolean,
+) -> jarray {
+    let fs = &*fs_ptr;
+    java_err2!(
+        env,
+        fs.submit_load_job(&mut env, source_path, target_path, overwrite)
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn Java_io_curvine_CurvineNative_getJobStatus(
+    mut env: JNIEnv,
+    _this: JObject,
+    fs_ptr: *mut JavaFilesystem,
+    job_id: JString,
+) -> jarray {
+    let fs = &*fs_ptr;
+    java_err2!(env, fs.get_job_status(&mut env, job_id))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn Java_io_curvine_CurvineNative_cancelJob(
+    mut env: JNIEnv,
+    _this: JObject,
+    fs_ptr: *mut JavaFilesystem,
+    job_id: JString,
+) -> jlong {
+    let fs = &*fs_ptr;
+    java_err!(env, fs.cancel_job(&mut env, job_id));
+    SUCCESS
+}
