@@ -67,7 +67,16 @@ impl Inode {
         }
     }
 
-    pub fn with_status(ino: u64, parent: u64, name: &str, mut status: FileStatus) -> Self {
+    // `n_lookup` is the initial kernel lookup count: 1 for real LOOKUP /
+    // READDIRPLUS (kernel caches the child and will FORGET it), 0 for plain
+    // READDIR (no kernel ref). `ref_ctr` is always 1 for the local dcache dentry.
+    pub fn with_status(
+        ino: u64,
+        parent: u64,
+        name: &str,
+        mut status: FileStatus,
+        n_lookup: u64,
+    ) -> Self {
         let dir = if status.is_dir {
             Some(Box::new(DirEntry::new()))
         } else {
@@ -82,7 +91,7 @@ impl Inode {
             status,
             locs: None,
             lifecycle: Lifecycle::Cached,
-            n_lookup: 1,
+            n_lookup,
             ref_ctr: 1,
             last_access: LocalTime::mills(),
             dir,
