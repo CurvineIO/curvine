@@ -318,6 +318,10 @@ impl FsError {
         Self::InvalidArgument(ErrorImpl::with_source(msg.into().into()))
     }
 
+    pub fn disk_out_of_space(msg: impl Into<String>) -> Self {
+        Self::DiskOutOfSpace(ErrorImpl::with_source(msg.into().into()))
+    }
+
     pub fn unsupported<T: Into<String>>(feature: T) -> Self {
         let msg = format!("{} is not implemented", feature.into());
         Self::Unsupported(ErrorImpl::with_source(msg.into()))

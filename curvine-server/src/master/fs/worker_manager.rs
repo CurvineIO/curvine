@@ -130,6 +130,14 @@ impl WorkerManager {
         res
     }
 
+    pub fn available_bytes(&self) -> i64 {
+        self.worker_map
+            .workers()
+            .values()
+            .map(|worker| worker.available.max(0))
+            .fold(0, i64::saturating_add)
+    }
+
     pub fn remove_expired_worker(&mut self, id: u32) -> Option<WorkerInfo> {
         self.worker_map.remove_expired(id)
     }
