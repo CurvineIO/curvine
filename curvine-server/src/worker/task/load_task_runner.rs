@@ -450,6 +450,21 @@ impl LoadTaskRunner {
             }
         }
 
+        // Cancellation may happen after the loop's pre-await check while the
+        // final stream is still running. That stream returns Ok(0), so recheck
+        // here before stamping the pre-resized target as a valid cache entry.
+        if self.task.is_cancel() {
+            info!("task {} was cancelled", self.task.info.task_id);
+            return Ok(());
+        }
+        if written != src_len {
+            return err_box!(
+                "parallel load incomplete: wrote {} of {} bytes; refusing to mark cache valid",
+                written,
+                src_len
+            );
+        }
+
         // ufs -> cv: stamp the source mtime onto the cached file (cache validity).
         let ufs_mtime = self.get_ufs()?.get_status(source_path).await?.mtime;
         let attr_opts = SetAttrOptsBuilder::new().ufs_mtime(ufs_mtime).build();
