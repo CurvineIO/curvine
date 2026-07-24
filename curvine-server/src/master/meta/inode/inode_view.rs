@@ -19,7 +19,9 @@ use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::{
     Inode, InodeDir, InodeFile, InodePtr, PATH_SEPARATOR, ROOT_INODE_ID,
 };
-use curvine_common::state::{FileStatus, FileType, SetAttrOpts, StoragePolicy, TtlAction};
+use curvine_common::state::{
+    FileStatus, FileType, SetAttrOpts, StoragePolicy, TtlAction, INTERNAL_CTIME_XATTR,
+};
 use curvine_common::utils::SerdeUtils;
 use orpc::common::{LocalTime, Utils};
 use orpc::{err_box, CommonResult};
@@ -236,6 +238,14 @@ impl InodeView {
         }
     }
 
+    pub fn ctime(&self) -> i64 {
+        match self {
+            File(f) => f.ctime(),
+            Dir(d) => d.ctime(),
+            FileEntry(..) => 0,
+        }
+    }
+
     pub fn update_mtime(&mut self, time: i64) {
         match self {
             File(f) => {
@@ -416,6 +426,25 @@ impl InodeView {
     }
 
     pub fn set_attr(&mut self, opts: SetAttrOpts) -> CommonResult<()> {
+        let ctime = opts
+            .add_x_attr
+            .get(INTERNAL_CTIME_XATTR)
+            .cloned()
+            .unwrap_or_else(|| (LocalTime::mills() as i64).to_le_bytes().to_vec());
+        match self {
+            File(f) => {
+                f.features
+                    .x_attr
+                    .insert(INTERNAL_CTIME_XATTR.to_string(), ctime.clone());
+            }
+            Dir(d) => {
+                d.features
+                    .x_attr
+                    .insert(INTERNAL_CTIME_XATTR.to_string(), ctime);
+            }
+            FileEntry(..) => (),
+        }
+
         if let Some(owner) = opts.owner {
             self.acl_mut()?.owner = owner;
         }
@@ -612,5 +641,44 @@ impl Debug for InodeView {
 impl PartialEq for InodeView {
     fn eq(&self, other: &Self) -> bool {
         self.id() == other.id()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setattr_updates_ctime_when_mtime_is_omitted() {
+        let mut inode = InodeView::new_file("file".to_string(), InodeFile::new(1, 1));
+        inode
+            .set_attr(SetAttrOpts {
+                atime: Some(2),
+                mtime: None,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let status = inode.to_file_status("/file").unwrap();
+        assert_eq!(status.atime, 2);
+        assert_eq!(status.mtime, 1);
+        assert!(status.ctime() > status.mtime);
+    }
+
+    #[test]
+    fn setattr_reuses_persisted_ctime_during_replay() {
+        let mut inode = InodeView::new_file("file".to_string(), InodeFile::new(1, 1));
+        inode
+            .set_attr(SetAttrOpts {
+                atime: Some(2),
+                add_x_attr: HashMap::from([(
+                    INTERNAL_CTIME_XATTR.to_string(),
+                    3_i64.to_le_bytes().to_vec(),
+                )]),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(inode.ctime(), 3);
     }
 }

@@ -17,7 +17,7 @@ use crate::master::meta::inode::inodes_children::InodeChildren;
 use crate::master::meta::inode::{
     ChildrenIter, Inode, InodeFile, InodePtr, InodeView, EMPTY_PARENT_ID,
 };
-use curvine_common::state::{ListOptions, MkdirOpts, StoragePolicy};
+use curvine_common::state::{ListOptions, MkdirOpts, StoragePolicy, INTERNAL_CTIME_XATTR};
 use glob::Pattern;
 use orpc::CommonResult;
 use serde::{Deserialize, Serialize};
@@ -159,6 +159,15 @@ impl Inode for InodeDir {
 
     fn atime(&self) -> i64 {
         self.atime
+    }
+
+    fn ctime(&self) -> i64 {
+        self.features
+            .x_attr
+            .get(INTERNAL_CTIME_XATTR)
+            .and_then(|bytes| bytes.as_slice().try_into().ok())
+            .map(i64::from_le_bytes)
+            .unwrap_or(self.mtime)
     }
 }
 

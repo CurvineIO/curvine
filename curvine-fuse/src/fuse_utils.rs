@@ -451,8 +451,11 @@ impl FuseUtils {
         let atime_sec = (status.atime.max(0) / 1000) as u64;
         let atime_nsec = ((status.atime.max(0) % 1000) * 1_000_000) as u32;
 
-        let ctime_sec = mtime_sec;
-        let ctime_nsec = mtime_nsec;
+        // Legacy/object-store statuses may not provide ctime yet. Falling back to mtime
+        // preserves the previous behavior without hiding a real independent ctime.
+        let ctime = status.ctime();
+        let ctime_sec = (ctime.max(0) / 1000) as u64;
+        let ctime_nsec = ((ctime.max(0) % 1000) * 1_000_000) as u32;
 
         let uid = if status.owner.is_empty() {
             conf.uid
@@ -679,6 +682,7 @@ impl FuseUtils {
 mod tests {
     use super::*;
     use crate::raw::fuse_abi::fuse_setattr_in;
+    use curvine_common::state::INTERNAL_CTIME_XATTR;
 
     #[test]
     fn protected_xattr_errors_match_operation() {
@@ -942,6 +946,21 @@ mod tests {
         let mut link = file_status(FileType::Link, -1, 0);
         link.target = Some("x".to_string());
         assert!(FuseUtils::status_to_attr(&conf, &link).is_ok());
+    }
+
+    #[test]
+    fn status_to_attr_preserves_independent_ctime() {
+        let conf = FuseConf::default();
+        let mut status = file_status(FileType::File, 0, 0o644);
+        status.mtime = 1_000;
+        status.x_attr.insert(
+            INTERNAL_CTIME_XATTR.to_string(),
+            2_500_i64.to_le_bytes().to_vec(),
+        );
+
+        let attr = FuseUtils::status_to_attr(&conf, &status).unwrap();
+        assert_eq!((attr.mtime, attr.mtimensec), (1, 0));
+        assert_eq!((attr.ctime, attr.ctimensec), (2, 500_000_000));
     }
 
     #[test]

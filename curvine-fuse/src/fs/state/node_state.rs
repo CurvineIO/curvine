@@ -913,8 +913,10 @@ impl NodeState {
         if let Some(mtime) = self.get_writer_mtime(attr.ino).await {
             attr.mtime = (mtime.max(0) / 1000) as u64;
             attr.mtimensec = ((mtime.max(0) % 1000) * 1_000_000) as u32;
-            attr.ctime = attr.mtime;
-            attr.ctimensec = attr.mtimensec;
+            if (attr.mtime, attr.mtimensec) > (attr.ctime, attr.ctimensec) {
+                attr.ctime = attr.mtime;
+                attr.ctimensec = attr.mtimensec;
+            }
         }
     }
 

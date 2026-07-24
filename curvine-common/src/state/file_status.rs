@@ -19,6 +19,10 @@ use orpc::ternary;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+// NUL cannot appear in a FUSE xattr name, so this persisted metadata key cannot
+// collide with a user-visible extended attribute.
+pub const INTERNAL_CTIME_XATTR: &str = "\0curvine.ctime";
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FileStatus {
     pub id: i64,
@@ -48,6 +52,14 @@ pub struct FileStatus {
 }
 
 impl FileStatus {
+    pub fn ctime(&self) -> i64 {
+        self.x_attr
+            .get(INTERNAL_CTIME_XATTR)
+            .and_then(|bytes| bytes.as_slice().try_into().ok())
+            .map(i64::from_le_bytes)
+            .unwrap_or(self.mtime)
+    }
+
     pub fn with_name(id: i64, name: String, is_dir: bool) -> Self {
         FileStatus {
             id,
