@@ -21,6 +21,8 @@ import io.curvine.proto.SubmitJobResponse;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.time.Duration;
+
 public class LoadJobClientTest {
 
     @Test
@@ -103,5 +105,18 @@ public class LoadJobClientTest {
                 .build());
         Assert.assertTrue(failed.isFinished());
         Assert.assertFalse(failed.isSuccessful());
+    }
+
+    @Test
+    public void saturatingDeadlineDoesNotWrap() {
+        long deadline = CurvineLoadClient.saturatingDeadlineNanos(Duration.ofNanos(Long.MAX_VALUE));
+        Assert.assertEquals(Long.MAX_VALUE, deadline);
+    }
+
+    @Test
+    public void sleepNanosAcceptsSubMillisInterval() throws InterruptedException {
+        long start = System.nanoTime();
+        CurvineLoadClient.sleepNanos(500_000L); // 0.5ms
+        Assert.assertTrue(System.nanoTime() - start >= 500_000L);
     }
 }

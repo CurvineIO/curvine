@@ -24,6 +24,7 @@ import java.io.IOException;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Independent Java client for Curvine load jobs.
@@ -51,7 +52,7 @@ public final class CurvineLoadClient implements Closeable {
     private static final long SUCCESS = 0;
 
     private final long nativeHandle;
-    private volatile boolean closed;
+    private final AtomicBoolean closed = new AtomicBoolean(false);
 
     private CurvineLoadClient(long nativeHandle) {
         this.nativeHandle = nativeHandle;
@@ -139,7 +140,7 @@ public final class CurvineLoadClient implements Closeable {
             throw new IllegalArgumentException("pollInterval must be positive");
         }
 
-        long deadlineNanos = System.nanoTime() + timeout.toNanos();
+        long deadlineNanos = saturatingDeadlineNanos(timeout);
         LoadJobStatus status;
         while (true) {
             status = getJobStatus(jobId);
@@ -153,15 +154,13 @@ public final class CurvineLoadClient implements Closeable {
                                 ? ": " + status.getProgress().getMessage()
                                 : ""));
             }
-            if (System.nanoTime() >= deadlineNanos) {
+            long remainingNanos = deadlineNanos - System.nanoTime();
+            if (remainingNanos <= 0L) {
                 throw new TimeoutException(
                         "load job " + jobId + " not complete after " + timeout
                                 + ", last state=" + status.getState());
             }
-            long sleepMs = Math.min(
-                    pollInterval.toMillis(),
-                    Math.max(1L, (deadlineNanos - System.nanoTime()) / 1_000_000L));
-            Thread.sleep(sleepMs);
+            sleepNanos(Math.min(pollInterval.toNanos(), remainingNanos));
         }
     }
 
@@ -175,10 +174,9 @@ public final class CurvineLoadClient implements Closeable {
 
     @Override
     public void close() throws IOException {
-        if (closed) {
+        if (!closed.compareAndSet(false, true)) {
             return;
         }
-        closed = true;
         long errno = CurvineNative.closeFilesystem(nativeHandle);
         if (errno < SUCCESS) {
             throw CurvineException.create((int) errno, "close CurvineLoadClient failed");
@@ -186,9 +184,28 @@ public final class CurvineLoadClient implements Closeable {
     }
 
     private void ensureOpen() throws IOException {
-        if (closed) {
+        if (closed.get()) {
             throw new IOException("CurvineLoadClient is closed");
         }
+    }
+
+    /** Compute {@code nanoTime + timeout} without wrapping on overflow. */
+    static long saturatingDeadlineNanos(Duration timeout) {
+        long now = System.nanoTime();
+        long timeoutNanos = timeout.toNanos();
+        try {
+            return Math.addExact(now, timeoutNanos);
+        } catch (ArithmeticException overflow) {
+            return Long.MAX_VALUE;
+        }
+    }
+
+    /** Sleep at least 1ns to avoid busy-looping when the interval truncates to 0ms. */
+    static void sleepNanos(long nanos) throws InterruptedException {
+        long sleepNanos = Math.max(1L, nanos);
+        long sleepMs = sleepNanos / 1_000_000L;
+        int nanoPart = (int) (sleepNanos % 1_000_000L);
+        Thread.sleep(sleepMs, nanoPart);
     }
 
     private static void requireJobId(String jobId) {
