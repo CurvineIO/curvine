@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::fs::dcache::CleanerTask;
+use crate::fs::dcache::{CleanerTask, Lifecycle};
 use crate::fs::operator::*;
 use crate::fs::plock_wait_registry::{LockOwner, PlockWaitGuard, PlockWaitRegistry};
 use crate::fs::state::{FileHandle, NodeState};
@@ -399,6 +399,17 @@ impl CurvineFileSystem {
         self.check_access_permissions(&status, header, mask)
     }
 
+    /// Read-only FUSE opens cannot distinguish an executable load from a normal
+    /// read, so the kernel handles those through `default_permissions`. Write
+    /// modes remain unambiguous and keep the userspace check as defense in depth.
+    fn open_userspace_acl_mask(action: OpenAction) -> Option<u32> {
+        match action {
+            OpenAction::ReadOnly => None,
+            OpenAction::WriteOnly => Some(libc::W_OK as u32),
+            OpenAction::ReadWrite => Some((libc::R_OK | libc::W_OK) as u32),
+        }
+    }
+
     /// Linux root access(2) bypasses R_OK/W_OK but still validates X_OK against any
     /// execute bit in the file mode, not the caller's owner/group/other class.
     fn check_root_access_permissions(status: &FileStatus) -> FuseResult<()> {
@@ -447,11 +458,22 @@ impl CurvineFileSystem {
                 nodeid: dir_ino,
                 ..Default::default()
             };
-            let cached_status = {
+            let (is_root, cached_status) = {
                 let dir = self.state.dir_read();
-                dir.get_inode(dir_ino, None)
-                    .map(|inode| inode.clone_status())
+                match dir.get_inode(dir_ino, None) {
+                    Some(inode) => {
+                        let is_root = inode.is_root();
+                        let status = if is_root && inode.lifecycle == Lifecycle::Invalid {
+                            None
+                        } else {
+                            Some(inode.clone_status())
+                        };
+                        (is_root, status)
+                    }
+                    None => (false, None),
+                }
             };
+
             if let Some(status) = cached_status {
                 self.check_access_permissions(&status, &check_header, libc::X_OK as u32)?;
             } else {
@@ -459,10 +481,6 @@ impl CurvineFileSystem {
                     .await?;
             }
 
-            let is_root = {
-                let dir = self.state.dir_read();
-                dir.get_inode_check(dir_ino, None)?.is_root()
-            };
             if is_root {
                 break;
             }
@@ -1295,7 +1313,6 @@ impl fs::FileSystem for CurvineFileSystem {
             if action.write() || truncate {
                 return err_fuse!(libc::EACCES, "special file nodes are read-only metadata");
             }
-            self.check_permissions(op.header, action.acl_mask()).await?;
             let ino = op.header.nodeid;
             let handle = self.state.new_meta_handle(ino, status).await?;
             let open_flags = FuseUtils::file_open_flags(&self.conf, false);
@@ -1310,8 +1327,9 @@ impl fs::FileSystem for CurvineFileSystem {
             self.ensure_writable_path(&path, RpcCode::CreateFile)
                 .await?;
         }
-        self.check_permissions(op.header, action.acl_mask()).await?;
-
+        if let Some(mask) = Self::open_userspace_acl_mask(action) {
+            self.check_permissions(op.header, mask).await?;
+        }
         let ino = op.header.nodeid;
         let opts = FuseUtils::open_opts(&self.fs);
 
@@ -1799,6 +1817,25 @@ impl fs::FileSystem for CurvineFileSystem {
 mod tests {
     use crate::{FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_UID};
     use curvine_common::state::FileAllocMode;
+
+    #[test]
+    fn userspace_open_checks_only_unambiguous_write_modes() {
+        use super::CurvineFileSystem;
+        use crate::fs::operator::OpenAction;
+
+        assert_eq!(
+            CurvineFileSystem::open_userspace_acl_mask(OpenAction::ReadOnly),
+            None
+        );
+        assert_eq!(
+            CurvineFileSystem::open_userspace_acl_mask(OpenAction::WriteOnly),
+            Some(libc::W_OK as u32)
+        );
+        assert_eq!(
+            CurvineFileSystem::open_userspace_acl_mask(OpenAction::ReadWrite),
+            Some((libc::R_OK | libc::W_OK) as u32)
+        );
+    }
 
     #[test]
     fn posix_access_requires_mode_check_for_root() {

@@ -942,9 +942,15 @@ impl NodeState {
         let path = self.get_path_common(ino, name)?;
         let status = self.fs.get_status(&path).await?;
 
-        if self.enable_meta_cache {
+        // The root inode starts as synthetic metadata with mode 0. Cache its first
+        // real backend status even when the general metadata cache is disabled so
+        // every path traversal does not issue another root get_status RPC.
+        let cache_root = ino == FUSE_ROOT_ID && name.is_none();
+        if self.enable_meta_cache || cache_root {
             let _ = self.update_status(ino, name, &status);
-            self.record_status_cache(CACHE_RESULT_PUT);
+            if self.enable_meta_cache {
+                self.record_status_cache(CACHE_RESULT_PUT);
+            }
         }
 
         Ok(status)
