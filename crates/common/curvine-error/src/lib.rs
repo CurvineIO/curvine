@@ -12,4 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use curvine_model::*;
+mod fs_error;
+
+pub use self::fs_error::*;
+
+pub type FsResult<T> = Result<T, FsError>;
+
+/// Maximum supported file size (1 PiB).
+pub const MAX_FILE_SIZE: i64 = 1 << 50;

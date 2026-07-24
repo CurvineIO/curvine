@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub use curvine_config::{
+    CliConf, ClientConf, ClientConfCliOverrides, FuseConf, JobConf, UfsConf, UfsConfBuilder,
+};
+
+pub use curvine_fault::FaultHttpConfig;
+
 mod master_conf;
 pub use self::master_conf::*;
 
@@ -21,26 +27,8 @@ pub use self::worker_conf::*;
 mod cluster_conf;
 pub use self::cluster_conf::*;
 
-pub use curvine_fault::FaultHttpConfig;
-
-mod client_conf;
-pub use self::client_conf::*;
-
-mod fuse_conf;
-pub use self::fuse_conf::FuseConf;
-
 mod journal_conf;
 pub use self::journal_conf::JournalConf;
-
-mod ufs_conf;
-pub use self::ufs_conf::UfsConf;
-pub use self::ufs_conf::UfsConfBuilder;
-
-mod job_conf;
-pub use self::job_conf::JobConf;
-
-mod cli_conf;
-pub use self::cli_conf::CliConf;
 
 mod spdk_conf;
 #[cfg(test)]

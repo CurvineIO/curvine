@@ -1,0 +1,73 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+pub use curvine_error::FsResult;
+
+mod path;
+pub use self::path::Path;
+
+mod fs_kind;
+pub use self::fs_kind::FsKind;
+
+mod rpc_code;
+pub use self::rpc_code::RpcCode;
+
+mod reader;
+pub use self::reader::Reader;
+
+mod writer;
+pub use self::writer::Writer;
+
+mod filesystem;
+pub use self::filesystem::FileSystem;
+
+mod list_stream;
+pub use self::list_stream::ListStream;
+
+// CurvineURI is used in the Curvine system to describe paths, including external storage.
+pub type CurvineURI = Path;
+
+impl curvine_model::CurvinePath for Path {
+    fn is_cv(&self) -> bool {
+        self.is_cv()
+    }
+
+    fn path(&self) -> &str {
+        self.path()
+    }
+
+    fn full_path(&self) -> &str {
+        self.full_path()
+    }
+
+    fn from_str(path: impl AsRef<str>) -> orpc::CommonResult<Self> {
+        Path::from_str(path)
+    }
+}
+
+pub mod fs {
+    pub use super::{CurvineURI, FileSystem, FsKind, ListStream, Path, Reader, RpcCode, Writer};
+}
+
+pub mod proto {
+    pub use curvine_proto::*;
+}
+
+pub mod state {
+    pub use curvine_model::*;
+}
+
+pub mod utils {
+    pub use curvine_model::ProtoUtils;
+}

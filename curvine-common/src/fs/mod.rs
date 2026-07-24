@@ -12,31 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod path;
-pub use self::path::Path;
-
-mod fs_kind;
-pub use self::fs_kind::FsKind;
-
-mod rpc_code;
-pub use self::rpc_code::RpcCode;
-
-mod reader;
-pub use self::reader::Reader;
-
-mod writer;
-pub use self::writer::Writer;
-
-mod filesystem;
-pub use self::filesystem::FileSystem;
+pub use curvine_fs_api::{
+    CurvineURI, FileSystem, FsKind, ListStream, Path, Reader, RpcCode, Writer,
+};
 
 mod state_file;
 pub use self::state_file::*;
 
-mod list_stream;
-pub use self::list_stream::ListStream;
-
 pub mod local;
-
-// CurvineURI is used in the Curvine system to describe paths, including external storage
-pub type CurvineURI = Path;

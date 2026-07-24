@@ -1989,7 +1989,6 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-stream",
- "axum",
  "bincode",
  "bitflags 2.10.0",
  "byteorder",
@@ -1998,8 +1997,13 @@ dependencies = [
  "clap",
  "crc32fast",
  "crossbeam",
- "curvine-common-macros",
+ "curvine-config",
+ "curvine-error",
  "curvine-fault",
+ "curvine-fs-api",
+ "curvine-model",
+ "curvine-proto",
+ "curvine-storage-api",
  "dashmap 5.5.3",
  "flate2",
  "futures",
@@ -2044,6 +2048,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-config"
+version = "0.2.0"
+dependencies = [
+ "clap",
+ "curvine-common-macros",
+ "curvine-error",
+ "curvine-fs-api",
+ "curvine-model",
+ "orpc",
+ "serde",
+ "toml",
+]
+
+[[package]]
+name = "curvine-error"
+version = "0.2.0"
+dependencies = [
+ "axum",
+ "num_enum",
+ "orpc",
+ "prost 0.11.9",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "curvine-fault"
 version = "0.2.0"
 dependencies = [
@@ -2056,6 +2087,23 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "curvine-fs-api"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "curvine-error",
+ "curvine-model",
+ "curvine-proto",
+ "futures",
+ "hyper 1.7.0",
+ "num_enum",
+ "once_cell",
+ "orpc",
+ "prost 0.11.9",
+ "regex",
 ]
 
 [[package]]
@@ -2149,6 +2197,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-model"
+version = "0.2.0"
+dependencies = [
+ "bincode",
+ "bitflags 2.10.0",
+ "chrono",
+ "clap",
+ "curvine-error",
+ "curvine-proto",
+ "indexmap 2.14.0",
+ "log",
+ "num_enum",
+ "orpc",
+ "prost 0.11.9",
+ "serde",
+]
+
+[[package]]
+name = "curvine-proto"
+version = "0.2.0"
+dependencies = [
+ "prost 0.11.9",
+ "prost-build 0.11.9",
+ "serde",
+]
+
+[[package]]
 name = "curvine-server"
 version = "0.2.0"
 dependencies = [
@@ -2160,6 +2235,7 @@ dependencies = [
  "clap",
  "curvine-client",
  "curvine-common",
+ "curvine-error",
  "curvine-fault",
  "curvine-ufs",
  "curvine-web",
@@ -2187,6 +2263,13 @@ dependencies = [
  "toml",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "curvine-storage-api"
+version = "0.2.0"
+dependencies = [
+ "curvine-model",
 ]
 
 [[package]]
@@ -6101,7 +6184,6 @@ dependencies = [
 name = "orpc"
 version = "0.2.0"
 dependencies = [
- "axum",
  "bincode",
  "bytes",
  "cc",
