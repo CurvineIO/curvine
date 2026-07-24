@@ -4,15 +4,15 @@
 
 set -euo pipefail
 
-ROOT="$(git rev-parse --show-toplevel)"
-cd "$ROOT"
-
-for bin in cargo awk grep sort; do
+for bin in git cargo awk grep sort; do
   if ! command -v "$bin" >/dev/null 2>&1; then
     echo "Missing required command: $bin" >&2
     exit 2
   fi
 done
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
 
 crates=(
   curvine-error
