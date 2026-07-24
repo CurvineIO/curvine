@@ -1,0 +1,21 @@
+[package]
+name = "curvine-fs-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+curvine-error = { workspace = true }
+curvine-model = { workspace = true }
+curvine-proto = { workspace = true }
+orpc = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+hyper = { workspace = true }
+once_cell = { workspace = true }
+regex = { workspace = true }
+num_enum = { workspace = true }
+prost = { workspace = true }
+
+[features]
+default = []

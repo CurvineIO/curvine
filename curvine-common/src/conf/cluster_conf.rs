@@ -405,7 +405,12 @@ mod tests {
     // carries 127.0.0.1, so it is a stable target for the happy path.
     #[test]
     fn interface_ipv4_resolves_loopback() {
-        let ip = ClusterConf::interface_ipv4("lo")
+        #[cfg(target_os = "macos")]
+        let loopback = "lo0";
+        #[cfg(not(target_os = "macos"))]
+        let loopback = "lo";
+
+        let ip = ClusterConf::interface_ipv4(loopback)
             .expect("loopback interface must resolve to an IPv4 address");
         assert_eq!(ip, "127.0.0.1");
     }

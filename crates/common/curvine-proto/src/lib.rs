@@ -12,4 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use curvine_model::*;
+include!(concat!(env!("OUT_DIR"), "/protos/proto.rs"));
+
+mod display;

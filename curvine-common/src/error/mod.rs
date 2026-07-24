@@ -12,5 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod fs_error;
-pub use self::fs_error::*;
+pub use curvine_error::*;
+
+impl From<crate::raft::RaftError> for FsError {
+    fn from(value: crate::raft::RaftError) -> Self {
+        Self::Raft(orpc::error::ErrorImpl::with_source(
+            value.to_string().into(),
+        ))
+    }
+}

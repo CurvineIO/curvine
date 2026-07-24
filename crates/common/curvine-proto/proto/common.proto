@@ -1,0 +1,214 @@
+syntax = "proto2";
+package proto;
+
+option java_package = "io.curvine.proto";
+option java_multiple_files = true;
+option java_outer_classname = "CommonProto";
+
+// Define the storage type.
+enum StorageTypeProto {
+    STORAGE_TYPE_PROTO_MEM = 0;
+    STORAGE_TYPE_PROTO_SSD = 1;
+    STORAGE_TYPE_PROTO_HDD = 2;
+    STORAGE_TYPE_PROTO_UFS = 3;
+    STORAGE_TYPE_PROTO_DISK = 4;
+    STORAGE_TYPE_PROTO_SPDK_DISK = 5;
+}
+
+// ttl Expiry Strategy.
+enum TtlActionProto {
+    TTL_ACTION_PROTO_NONE = 0;
+    TTL_ACTION_PROTO_DELETE = 1;
+    TTL_ACTION_PROTO_FREE = 2;
+}
+
+enum WriteTypeProto {
+    WRITE_TYPE_PROTO_CACHE_MODE = 0;
+    WRITE_TYPE_PROTO_FS_MODE = 1;
+}
+
+// Define file type
+enum FileTypeProto {
+    FILE_TYPE_PROTO_DIR = 0;
+    FILE_TYPE_PROTO_FILE = 1;
+    FILE_TYPE_PROTO_LINK = 2;
+    FILE_TYPE_PROTO_STREAM = 3;
+    FILE_TYPE_PROTO_AGG = 4;
+    FILE_TYPE_PROTO_OBJECT = 5;
+    FILE_TYPE_PROTO_FIFO = 6;
+    FILE_TYPE_PROTO_CHAR = 7;
+    FILE_TYPE_PROTO_BLOCK = 8;
+    FILE_TYPE_PROTO_SOCKET = 9;
+}
+
+enum StorageStateProto {
+    STORAGE_STATE_PROTO_CV = 1;
+    STORAGE_STATE_PROTO_UFS = 2;
+    STORAGE_STATE_PROTO_BOTH = 3;
+}
+
+// File storage policy
+message StoragePolicyProto {
+    required StorageTypeProto storage_type = 1 [default = STORAGE_TYPE_PROTO_DISK];
+    required int64 ttl_ms = 2 [default = 0];
+    required TtlActionProto ttl_action = 3 [default = TTL_ACTION_PROTO_NONE];
+    required int64 ufs_mtime = 4;
+    required StorageStateProto state = 5 [default = STORAGE_STATE_PROTO_CV];
+}
+
+message FileStatusProto {
+    required int64 id = 1;
+    required string path = 2;
+    required string name = 3;
+    required bool is_dir = 4;
+    required int64 mtime = 5;
+    required int64 atime = 6;
+    required int32 children_num = 7;
+    required bool is_complete = 8 [default = false];
+    required int64 len = 9;
+    required int32 replicas = 10;
+    required int64 block_size = 11;
+    required FileTypeProto file_type = 12 [default = FILE_TYPE_PROTO_FILE];
+
+    map<string, bytes> x_attr = 13;
+    required StoragePolicyProto storage_policy = 14;
+    required string owner = 15;
+    required string group = 16;
+    required uint32 mode = 17;
+    optional string target = 18;
+    required uint32 nlink = 19;
+}
+
+// Describe the worker address information.
+message WorkerAddressProto {
+    required uint32 worker_id = 1;
+    required string hostname = 2;
+    required string ip_addr = 3;
+    required uint32 rpc_port = 4;
+    required uint32 web_port = 5 [default = 0];
+}
+
+message BlockInfoProto {
+    required int64 block_id = 1;
+    required int64 len = 2;
+    repeated BlockLocationProto locations = 3;
+}
+
+message FileBlockInfoProto {
+    repeated BlockInfoProto info = 1;
+    required int64 off = 2;
+}
+
+message ExtendedBlockProto {
+    required int64 id = 1;
+    required int64 block_size = 2;
+    required StorageTypeProto storage_type = 3;
+    required FileTypeProto file_type = 4;
+    optional FileAllocOptsProto alloc_opts = 5;
+}
+
+message LocatedBlockProto {
+    required ExtendedBlockProto block = 1;
+    required int64 offset = 2;
+    repeated WorkerAddressProto locs = 3;
+    optional bool has_spdk = 4 [default = false];
+}
+
+// All block information in the file.
+message FileBlocksProto {
+    required FileStatusProto status = 1;
+    repeated LocatedBlockProto block_locs = 2;
+}
+
+enum HeartbeatStatusProto {
+    HEARTBEAT_STATUS_PROTO_START = 0;
+    HEARTBEAT_STATUS_PROTO_RUNNING = 1;
+    HEARTBEAT_STATUS_PROTO_END = 2;
+}
+
+message StorageInfoProto {
+    required uint32 dir_id = 1;
+    required string storage_id = 2;
+    required bool failed = 3 [default = false];
+    required int64 capacity = 4;
+    required int64 available = 5;
+    required int64 fs_used = 6;
+    required int64 non_fs_used = 7;
+    required int64 reserved_bytes = 8 [default = 0];
+    required StorageTypeProto storage_type = 9 [default = STORAGE_TYPE_PROTO_DISK];
+    required int64 block_num = 10;
+    required string dir_path = 11 [default = ""];
+}
+
+// Represents a customer service address.
+message ClientAddressProto {
+    required string client_name = 1;
+    required string hostname = 2;
+    required string ip_addr = 3;
+    required int32 port = 4 [default = 0];
+}
+
+message BlockLocationProto {
+    required uint32 worker_id = 1;
+    required StorageTypeProto storage_type = 2;
+}
+
+message CommitBlockProto {
+    required int64 block_id = 1;
+    required int64 block_len = 2;
+    repeated BlockLocationProto locations = 3;
+}
+
+message WorkerInfoProto {
+    required WorkerAddressProto address = 1;
+    required int64 capacity = 2;
+    required int64 available = 3;
+    required int64 fs_used = 4;
+    required int64 non_fs_used = 5;
+    required uint64 last_update = 6;
+    map<string, StorageInfoProto> storage_map = 7;
+    required int64 reserved_bytes = 8 [default = 0];
+    optional uint32 weight = 9 [default = 1];
+}
+
+message FileAllocOptsProto {
+    required bool truncate = 1;
+    required int64 off = 2;
+    required int64 len = 3;
+    required int32 mode = 4;
+}
+
+// Define lock type
+enum LockTypeProto {
+    LOCK_TYPE_PROTO_READ = 0;
+    LOCK_TYPE_PROTO_WRITE = 1;
+    LOCK_TYPE_PROTO_UNLOCK = 2;
+}
+
+// Define lock flags
+enum LockFlagsProto {
+    LOCK_FLAGS_PROTO_PLOCK = 0; // POSIX lock (fcntl)
+    LOCK_FLAGS_PROTO_FLOCK = 1; // BSD lock (flock)
+}
+
+// File lock information
+message FileLockProto {
+    required string client_id = 1;
+    required uint64 owner_id = 2;
+    required uint32 pid = 3;
+    required uint64 acquire_time = 4;
+    required LockTypeProto lock_type = 5 [default = LOCK_TYPE_PROTO_READ];
+    required LockFlagsProto lock_flags = 6 [default = LOCK_FLAGS_PROTO_PLOCK];
+    required uint64 start = 7;
+    required uint64 end = 8;
+}
+
+message FreeResultProto {
+    required int64 inodes = 2;
+    required int64 bytes = 3;
+}
+
+message ListOptionsProto {
+    optional int32 limit = 1;
+    optional string start_after = 2;
+}

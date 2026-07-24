@@ -1,0 +1,22 @@
+[package]
+name = "curvine-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+curvine-error = { workspace = true }
+curvine-proto = { workspace = true }
+orpc = { workspace = true }
+serde = { workspace = true }
+prost = { workspace = true }
+bincode = { workspace = true }
+log = { workspace = true }
+num_enum = { workspace = true }
+indexmap = { workspace = true }
+clap = { workspace = true }
+bitflags = { workspace = true }
+chrono = { workspace = true }
+
+[features]
+default = []

@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::conf::ClusterConf;
 use crate::state::{StorageType, TtlAction};
 use curvine_common_macros::ClientCliArgs;
 use orpc::client::ClientConf as RpcConf;
@@ -360,7 +359,7 @@ impl Default for ClientConf {
     fn default() -> Self {
         let mut conf = Self {
             master_addrs: vec![],
-            hostname: ClusterConf::DEFAULT_HOSTNAME.to_string(),
+            hostname: crate::DEFAULT_HOSTNAME.to_string(),
             io_threads: 16,
             worker_threads: Utils::worker_threads(16),
 

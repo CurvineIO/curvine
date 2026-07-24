@@ -1,0 +1,18 @@
+[package]
+name = "curvine-error"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+orpc = { workspace = true }
+tokio = { workspace = true }
+prost = { workspace = true }
+num_enum = { workspace = true }
+thiserror = { workspace = true }
+axum = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+default = []
+axum-response = ["dep:axum", "dep:serde_json"]

@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::fs::RpcCode;
-use crate::raft::RaftError;
+#[cfg(feature = "axum-response")]
 use axum::http::StatusCode;
+#[cfg(feature = "axum-response")]
 use axum::response::{IntoResponse, Response};
+#[cfg(feature = "axum-response")]
 use axum::Json;
 use num_enum::{FromPrimitive, IntoPrimitive};
 use orpc::error::{ErrorDecoder, ErrorExt, ErrorImpl, StringError};
@@ -23,6 +24,7 @@ use orpc::io::IOError;
 use orpc::CommonError;
 use prost::bytes::BytesMut;
 use prost::{DecodeError, EncodeError};
+#[cfg(feature = "axum-response")]
 use serde_json::json;
 use std::io;
 use std::num::ParseIntError;
@@ -223,7 +225,7 @@ impl FsError {
         Self::NoLocalPath(ErrorImpl::with_source(msg.into().into()))
     }
 
-    pub fn not_leader_master(code: RpcCode, client_ip: &str) -> Self {
+    pub fn not_leader_master(code: impl std::fmt::Debug, client_ip: &str) -> Self {
         let error = format!(
             "Not a leader master, code={:?}, client_ip={}",
             code, client_ip
@@ -427,12 +429,6 @@ impl From<CommonError> for FsError {
     }
 }
 
-impl From<RaftError> for FsError {
-    fn from(value: RaftError) -> Self {
-        Self::Raft(ErrorImpl::with_source(value.to_string().into()))
-    }
-}
-
 impl From<std::io::Error> for FsError {
     fn from(value: io::Error) -> Self {
         match value.kind() {
@@ -489,6 +485,7 @@ impl From<ParseIntError> for FsError {
     }
 }
 
+#[cfg(feature = "axum-response")]
 impl IntoResponse for FsError {
     fn into_response(self) -> Response {
         let body = Json(json!({"message": self.to_string()}));
@@ -646,7 +643,7 @@ impl ErrorExt for FsError {
 #[cfg(test)]
 mod tests {
     use super::ErrorKind;
-    use crate::error::fs_error::FsError;
+    use crate::FsError;
     use orpc::error::{ErrorExt, ErrorImpl};
 
     #[test]
