@@ -18,6 +18,13 @@ members = [
     "crates/common/curvine-fs-api",
     "crates/common/curvine-storage-api",
     "crates/common/curvine-config",
+    "crates/infra/orpc-error",
+    "crates/infra/orpc-runtime",
+    "crates/infra/orpc-net",
+    "crates/infra/orpc-rpc",
+    "crates/infra/curvine-sys",
+    "crates/infra/curvine-io",
+    "crates/adapters/curvine-storage-spdk",
     "curvine-common",
     "curvine-common/macros",
     "curvine-server",
@@ -42,6 +49,12 @@ default-members = [
     "crates/common/curvine-fs-api",
     "crates/common/curvine-storage-api",
     "crates/common/curvine-config",
+    "crates/infra/orpc-error",
+    "crates/infra/orpc-runtime",
+    "crates/infra/orpc-net",
+    "crates/infra/orpc-rpc",
+    "crates/infra/curvine-sys",
+    "crates/infra/curvine-io",
     "curvine-common",
     "curvine-server",
     "curvine-client",
@@ -60,6 +73,13 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 orpc = { path = "orpc" }
+orpc-error = { path = "crates/infra/orpc-error" }
+orpc-runtime = { path = "crates/infra/orpc-runtime" }
+orpc-net = { path = "crates/infra/orpc-net" }
+orpc-rpc = { path = "crates/infra/orpc-rpc" }
+curvine-sys = { path = "crates/infra/curvine-sys" }
+curvine-io = { path = "crates/infra/curvine-io" }
+curvine-storage-spdk = { path = "crates/adapters/curvine-storage-spdk" }
 curvine-fault = { path = "curvine-fault" }
 curvine-error = { path = "crates/common/curvine-error" }
 curvine-proto = { path = "crates/common/curvine-proto" }

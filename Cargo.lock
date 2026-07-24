@@ -2142,6 +2142,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-io"
+version = "0.2.0"
+
+[[package]]
 name = "curvine-lancedb"
 version = "0.2.0"
 dependencies = [
@@ -2237,6 +2241,7 @@ dependencies = [
  "curvine-common",
  "curvine-error",
  "curvine-fault",
+ "curvine-storage-spdk",
  "curvine-ufs",
  "curvine-web",
  "dashmap 5.5.3",
@@ -2271,6 +2276,26 @@ version = "0.2.0"
 dependencies = [
  "curvine-model",
 ]
+
+[[package]]
+name = "curvine-storage-spdk"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "cc",
+ "crossbeam",
+ "libc",
+ "log",
+ "nix",
+ "orpc",
+ "pkg-config",
+ "serde",
+ "toml",
+]
+
+[[package]]
+name = "curvine-sys"
+version = "0.2.0"
 
 [[package]]
 name = "curvine-tests"
@@ -6186,7 +6211,6 @@ version = "0.2.0"
 dependencies = [
  "bincode",
  "bytes",
- "cc",
  "chrono",
  "crc32fast",
  "crossbeam",
@@ -6203,9 +6227,9 @@ dependencies = [
  "nix",
  "num_enum",
  "once_cell",
+ "orpc-error",
  "parking_lot",
  "pin-project-lite",
- "pkg-config",
  "prometheus",
  "prost 0.11.9",
  "rand 0.8.5",
@@ -6223,6 +6247,28 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
 ]
+
+[[package]]
+name = "orpc-error"
+version = "0.2.0"
+dependencies = [
+ "bincode",
+ "bytes",
+ "log",
+ "serde",
+]
+
+[[package]]
+name = "orpc-net"
+version = "0.2.0"
+
+[[package]]
+name = "orpc-rpc"
+version = "0.2.0"
+
+[[package]]
+name = "orpc-runtime"
+version = "0.2.0"
 
 [[package]]
 name = "outref"

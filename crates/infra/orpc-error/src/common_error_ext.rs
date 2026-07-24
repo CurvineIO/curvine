@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use crate::error::ErrorExt;
-use crate::io::IOError;
 use crate::CommonError;
 use bytes::{BufMut, BytesMut};
 use std::error::Error;
@@ -62,11 +61,5 @@ impl From<String> for CommonErrorExt {
 impl From<CommonError> for CommonErrorExt {
     fn from(value: CommonError) -> Self {
         Self(value)
-    }
-}
-
-impl From<IOError> for CommonErrorExt {
-    fn from(value: IOError) -> Self {
-        Self(value.into())
     }
 }

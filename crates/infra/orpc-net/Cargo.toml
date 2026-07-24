@@ -1,0 +1,8 @@
+[package]
+name = "orpc-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ORPC network migration boundary."
+
+[dependencies]

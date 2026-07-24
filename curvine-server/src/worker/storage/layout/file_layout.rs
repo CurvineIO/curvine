@@ -19,7 +19,7 @@ use curvine_common::state::ExtendedBlock;
 #[cfg(test)]
 use orpc::common::ByteUnit;
 use orpc::common::FileUtils;
-use orpc::io::{BlockDevice, IOError, IOResult, LocalFile};
+use orpc::io::{IOError, IOResult, LocalFile};
 use orpc::{err_box, try_err, CommonResult};
 use std::fs::{self, File};
 use std::path::PathBuf;
@@ -155,7 +155,7 @@ impl BlockLayout for FileLayout {
     fn open_writer(&self, dir: &VfsDir, meta: &BlockMeta, off: i64) -> IOResult<BlockWriteContext> {
         validate_open_offset(meta, off)?;
         let file = Self::block_file(dir, meta)?;
-        let device = BlockDevice::Local(LocalFile::with_write_offset(file, false, off)?);
+        let device = LocalFile::with_write_offset(file, false, off)?;
         BlockWriteContext::new(device, 0, meta.len, off)
     }
 
@@ -164,7 +164,7 @@ impl BlockLayout for FileLayout {
         let read_off = u64::try_from(off)
             .map_err(|_| IOError::from(format!("Invalid read offset: {}", off)))?;
         let file = Self::block_file(dir, meta)?;
-        let device = BlockDevice::Local(LocalFile::with_read(file, read_off)?);
+        let device = LocalFile::with_read(file, read_off)?;
         BlockReadContext::new(device, 0, meta.len, off)
     }
 

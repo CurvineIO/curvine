@@ -1,0 +1,8 @@
+[package]
+name = "curvine-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Curvine I/O primitive migration boundary."
+
+[dependencies]

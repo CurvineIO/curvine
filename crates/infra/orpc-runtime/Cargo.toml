@@ -1,0 +1,8 @@
+[package]
+name = "orpc-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ORPC runtime migration boundary."
+
+[dependencies]

@@ -1,0 +1,8 @@
+[package]
+name = "curvine-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Curvine system primitive migration boundary."
+
+[dependencies]

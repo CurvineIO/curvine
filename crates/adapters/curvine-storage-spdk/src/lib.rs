@@ -12,25 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod client;
-pub mod common;
-pub mod error {
-    pub use orpc_error::*;
-}
-pub mod handler;
-pub mod io;
-pub mod macros;
-pub mod message;
-pub mod runtime;
-pub mod server;
-pub mod sync;
-pub mod sys;
-pub mod test;
+pub use orpc::io::{NvmeTarget, SpdkConf};
 
-pub use orpc_error::{CommonError, CommonResult, CommonResultExt};
+#[cfg(feature = "spdk")]
+pub mod spdk_bdev;
+#[cfg(feature = "spdk")]
+pub mod spdk_env;
+#[cfg(feature = "spdk")]
+pub mod spdk_ffi;
+#[cfg(feature = "spdk")]
+pub mod spdk_poller;
 
-impl From<crate::io::IOError> for crate::error::CommonErrorExt {
-    fn from(value: crate::io::IOError) -> Self {
-        Self::from(CommonError::from(value))
-    }
-}
+#[cfg(all(test, feature = "spdk"))]
+mod spdk_bdev_test;
+
+#[cfg(feature = "spdk")]
+pub use spdk_bdev::SpdkBdev;
+#[cfg(feature = "spdk")]
+pub use spdk_env::{BdevInfo, SpdkEnv, SpdkEnvState};
+#[cfg(feature = "spdk")]
+pub use spdk_poller::{CtrlHandle, PollerConfig};

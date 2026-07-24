@@ -1,0 +1,12 @@
+[package]
+name = "orpc-error"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ORPC error primitives."
+
+[dependencies]
+bincode = { workspace = true }
+bytes = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
