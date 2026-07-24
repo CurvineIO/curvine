@@ -310,7 +310,8 @@
                 </configuration>
                 <executions>
                     <execution>
-                        <phase>compile</phase>
+                        <!-- Run before scala/java compile (process-resources) so clean mvn test works. -->
+                        <phase>generate-sources</phase>
                         <goals>
                             <goal>compile</goal>
                         </goals>
