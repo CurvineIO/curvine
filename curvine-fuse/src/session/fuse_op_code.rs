@@ -70,13 +70,6 @@ pub enum FuseOpCode {
 }
 
 impl FuseOpCode {
-    /// Returns a stable, low-cardinality `&'static str` name for this opcode,
-    /// suitable for use as a metric label. Zero-allocation: the metrics hot
-    /// path must never `format!("{:?}", op)`.
-    ///
-    /// Names are short CamelCase (e.g. `Lookup`, `GetAttr`, `Read`) matching
-    /// the `opcode` label convention in the FUSE metrics design.
-    // Enabling primitive: defined here, wired to call sites separately.
     #[allow(dead_code)]
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
@@ -130,16 +123,7 @@ impl FuseOpCode {
     }
 }
 
-/// The dispatch status of an opcode: an opcode-level record of whether an
-/// opcode is handled, and — for the unhandled ones — whether that is deliberate
-/// (`Unsupported`) or protocol-internal (`Internal`), with the rationale.
-///
-/// The compile-time guarantee that a *parsed* operator actually has a dispatch
-/// arm lives in the exhaustive (no-`_`) matches in `dispatch_meta` and
-/// `send_stream_dispatch`: adding a `FuseOperator` variant with no arm fails to
-/// compile there. This matrix complements that with the opcode-level intent
-/// (why BMAP/POLL/etc. are ENOSYS, which opcodes are protocol-internal); its own
-/// exhaustive match likewise forces a newly-added `FuseOpCode` to be classified.
+/// Opcode-level dispatch status used to distinguish handled, unsupported, and internal opcodes.
 #[cfg(test)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum DispatchStatus {
@@ -172,15 +156,7 @@ impl FuseOpCode {
             //     fallback (kernel treats the file as hole-less).
             FuseOpCode::FUSE_BMAP | FuseOpCode::FUSE_POLL | FuseOpCode::FUSE_LSEEK => Unsupported,
 
-            // Not dispatched as a FileSystem op: NOT_SUPPORTED is the num_enum
-            // default for unknown raw opcodes; CUSE_INIT is a CUSE handshake, not
-            // a filesystem path; NOTIFY_REPLY is a daemon->kernel notify channel.
-            // These have no `parse_operator` arm, so they never reach the
-            // dispatcher during normal operation. If one ever did, it would fall
-            // through the dispatch wildcard like `Unsupported` (NOT_SUPPORTED as
-            // `unknown_opcode`, the others as `unimplemented_opcode`); `Internal`
-            // records that we intentionally do not route them, not that reaching
-            // dispatch is impossible.
+            // Non-FileSystem opcodes: unknown raw op, CUSE handshake, or notify reply.
             FuseOpCode::NOT_SUPPORTED | FuseOpCode::CUSE_INIT | FuseOpCode::FUSE_NOTIFY_REPLY => {
                 Internal
             }
@@ -233,10 +209,6 @@ mod tests {
 
     #[test]
     fn as_str_matches_the_full_label_table() {
-        // Full (variant, expected-label) table covering every enum variant.
-        // Any accidental relabeling must update this table (and the design
-        // doc's `opcode` label convention) together, so a Prometheus series
-        // name can never drift silently.
         let table = [
             (FuseOpCode::NOT_SUPPORTED, "NotSupported"),
             (FuseOpCode::FUSE_LOOKUP, "Lookup"),
@@ -293,10 +265,7 @@ mod tests {
     #[test]
     fn expected_dispatch_classifies_every_opcode() {
         use super::DispatchStatus::*;
-        // Full (variant, expected-status) table. `expected_dispatch` is an
-        // exhaustive match, so adding a FuseOpCode variant already fails to
-        // compile until classified there; this table additionally pins the
-        // intended status so a reclassification is a conscious edit.
+        // Full expected-status table; reclassification should be an explicit edit.
         let table = [
             (FuseOpCode::NOT_SUPPORTED, Internal),
             (FuseOpCode::FUSE_LOOKUP, Handled),

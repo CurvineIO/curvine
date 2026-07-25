@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 
 pub struct FuseMnt {
     pub(crate) path: PathBuf,
-    // OwnedFd is not used here, and in some cases fd cannot be turned off by rust.
+    // Not an OwnedFd: in some cases the fd cannot be closed by Rust.
     pub(crate) fd: RawIO,
     pub(crate) clone_fds: Mutex<Vec<OwnedFd>>,
     auto_unmount: bool,
@@ -87,7 +87,7 @@ impl FuseMnt {
         Ok(borrowed)
     }
 
-    // Get 2 fds for asynchronous reading and writing data.
+    // Get an async fd for reading and writing data.
     pub fn create_async_task_fd(&self, clone: bool) -> IOResult<Arc<AsyncFd>> {
         let fd = self.create_task_fd(clone)?;
         let fd = Arc::new(AsyncFd::new(fd)?);

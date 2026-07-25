@@ -22,23 +22,18 @@ use orpc::{err_box, CommonResult};
 #[derive(Debug, Parser, Clone)]
 #[command(version = version::VERSION)]
 pub struct FuseMountArgs {
-    // Mount the mount point, mount the file system to a directory of the machine.
     #[arg(long, help = "Mount point path (default: /curvine-fuse)")]
     pub mnt_path: Option<String>,
 
-    // Specify the root path of the mount point to access the file system, default "/"
     #[arg(long, help = "Remote filesystem path (default: /)")]
     fs_path: Option<String>,
 
-    // Number of mount points
     #[arg(long, help = "Number of mount points (default: 1)")]
     pub mnt_number: Option<usize>,
 
-    // Debug mode
     #[arg(short, long, action = clap::ArgAction::SetTrue, help = "Enable debug mode")]
     debug: bool,
 
-    // Configuration file path (optional)
     #[arg(
         short,
         long,
@@ -47,15 +42,12 @@ pub struct FuseMountArgs {
     )]
     conf: String,
 
-    // IO threads (optional)
     #[arg(long, help = "IO threads (optional)")]
     pub io_threads: Option<usize>,
 
-    // Worker threads (optional)
     #[arg(long, help = "Worker threads (optional)")]
     pub worker_threads: Option<usize>,
 
-    // How many tasks can read and write data at each mount point
     // `mnt-per-task` alias kept so existing Fluid/mount scripts do not fail on upgrade.
     #[arg(
         long,
@@ -64,15 +56,12 @@ pub struct FuseMountArgs {
     )]
     pub tasks_per_mnt: Option<usize>,
 
-    // Whether to enable the clone fd feature
     #[arg(long, help = "Enable clone fd feature (optional)")]
     pub clone_fd: Option<bool>,
 
-    // Fuse request queue size
     #[arg(long, help = "FUSE channel size (optional)")]
     pub fuse_channel_size: Option<usize>,
 
-    // Read and write file request queue size
     #[arg(long, help = "Stream channel size (optional)")]
     pub stream_channel_size: Option<usize>,
 
@@ -102,11 +91,9 @@ pub struct FuseMountArgs {
     )]
     pub congestion_threshold: Option<u16>,
 
-    // Node cache settings
     #[arg(long, help = "Node cache timeout (e.g., '1h', '30m') (optional)")]
     pub node_cache_timeout: Option<String>,
 
-    // Fuse web port
     #[arg(long, help = "Web server port (optional)")]
     pub web_port: Option<u16>,
 
@@ -298,7 +285,6 @@ impl FuseMountArgs {
             conf.fuse.enable_meta_cache = enable_meta_cache;
         }
 
-        // FuseConf::meta_cache_ttl is a Duration parsed by init() from meta_cache_timeout.
         if let Some(meta_cache_ttl) = &self.meta_cache_ttl {
             conf.fuse.meta_cache_timeout = meta_cache_ttl.clone();
         }
@@ -333,7 +319,6 @@ impl FuseMountArgs {
             conf.fuse.fuse_opts = Self::default_mnt_opts();
         }
 
-        // Re-initialise derived fields (e.g. Duration values) after applying CLI overrides.
         conf.fuse.init()?;
 
         Ok(conf)

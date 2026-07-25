@@ -184,7 +184,7 @@ impl DirTree {
     //     the child, never bumps its lookup count, and never sends a FORGET.
     //     Bumping n_lookup here would inflate the daemon-side count past the
     //     kernel's real value with no FORGET to balance it, defeating unlink's
-    //     immediate `should_unref` reclaim (issue #1114).
+    //     immediate `should_unref` reclaim.
     pub fn lookup(
         &mut self,
         parent: u64,
@@ -220,10 +220,7 @@ impl DirTree {
 
                 match existing_ino {
                     Some(ino) => {
-                        // Path B: new dentry name maps to an already-cached inode.
-                        // Bump lookup/ref and update cached path; do NOT re-insert
-                        // (that would reset ref_ctr / n_lookup). nlink comes from
-                        // FileStatus via update_status (LOOKUP is not a hard link).
+                        // Cached inode: update lookup/ref/path without reinserting.
                         let inode = self.get_inode_mut_check(ino, None)?;
                         if inode.is_deleted() {
                             return err_fuse!(
@@ -282,9 +279,6 @@ impl DirTree {
             dir.mark_deleted_child(name);
         }
 
-        // Mirror rename's destination-unlink: drop inode when both counters hit zero.
-        // When mark_delete=true (deferred delete via fs_unlink), keep the inode so
-        // clear_mark_delete(ino) can still clear parent.deleted_children later.
         if should_remove && !mark_delete {
             self.remove_inode(ino);
         }
@@ -464,14 +458,9 @@ impl DirTree {
         self.try_get_path(parent, Some(name))
     }
 
-    /// Clear the `mark_delete` flag on an inode and remove the corresponding
-    /// `deleted_child` entry from the parent directory.  Called after a
-    /// delete (direct or deferred) has completed so that a subsequent
-    /// `release` does not attempt to delete the file a second time.
+    /// Clear deferred-delete state after delete completion so release does not delete twice.
     pub fn clear_mark_delete(&mut self, ino: u64) -> FuseResult<()> {
-        // Extract parent + name in a limited scope so the &mut borrow of
-        // self.inodes ends before we call get_dir_mut_check (which also
-        // borrows self.inodes internally).
+        // Limit the inode borrow before calling get_dir_mut_check, which also borrows inodes.
         let (parent, name) = {
             let Some(inode) = self.inodes.get_mut(&ino) else {
                 return Ok(());
@@ -553,9 +542,7 @@ impl DirTree {
         Ok(res)
     }
 
-    /// Returns only dirty children under a directory; non-directories and clean entries are skipped.
-    /// Used when merging readdir results so local uncommitted changes override the remote listing
-    /// instead of stale or clean local cache masking authoritative server data.
+    /// Return dirty children so local uncommitted changes override remote readdir results.
     pub fn list_dirty(&self, ino: u64) -> FuseResult<Vec<FileStatus>> {
         let inode = self.get_inode_check(ino, None)?;
         if !inode.is_dir {
@@ -716,7 +703,7 @@ mod test {
         assert!(t.get_inode(200, None).is_none());
     }
 
-    /// issue #1114: plain READDIR materializes a child into the dcache but must NOT
+    /// plain READDIR materializes a child into the dcache but must NOT
     /// take a kernel lookup ref (the kernel never sends a FORGET for it). New inode
     /// gets ref_ctr=1, n_lookup=0; a repeat readdir does not accumulate n_lookup.
     #[test]
@@ -735,7 +722,7 @@ mod test {
         assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, 0);
     }
 
-    /// issue #1114: READDIRPLUS keeps the kernel-lookup-ref semantics of a real
+    /// READDIRPLUS keeps the kernel-lookup-ref semantics of a real
     /// LOOKUP (n_lookup += 1 each time), balanced later by FORGET.
     #[test]
     fn readdirplus_increments_lookup_refs() {
@@ -749,7 +736,7 @@ mod test {
         assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, 2);
     }
 
-    /// issue #1114 fix-proof: a file the kernel no longer references, seen only by
+    /// A file the kernel no longer references, seen only by
     /// a plain READDIR, must be reclaimed immediately on unlink — not deferred to
     /// the TTL cleaner. Pre-fix READDIR bumped n_lookup to 1, so should_unref()
     /// stayed false and the inode survived unlink (regressing to TTL fallback).
@@ -1064,7 +1051,7 @@ mod test {
     }
 
     /// `clear` evicts expired inodes but skips: open handles, not yet TTL-expired entries,
-    /// dirs with cached children, root. Throttled by `last_clean` until `cache_ttl` elapses.
+    /// dirs with cached children, root.
     #[test]
     fn clear_evicts_expired_inodes_and_respects_all_constraints() {
         use std::time::Duration;
@@ -1175,13 +1162,7 @@ mod test {
         );
     }
 
-    /// Root cause of CurvineIO/curvine#1121: for a freshly created file whose
-    /// backend id is not yet stable (`id <= FUSE_ROOT_ID` or `== FUSE_UNKNOWN_INO`),
-    /// `next_id` falls through to the auto-increment allocator, so calling it
-    /// TWICE for the same status yields two DIFFERENT inos. The create flow must
-    /// therefore resolve the ino exactly once and reuse it for both the writers
-    /// map key and the handle ino — otherwise `find_writer(handle.ino())` /
-    /// `release(handle.ino())` cannot locate the writer registered at create.
+    /// Regression: unstable backend ids must not allocate fresh ids repeatedly.
     #[test]
     fn next_id_diverges_when_backend_id_unassigned() {
         use crate::FUSE_UNKNOWN_INO;
@@ -1209,9 +1190,7 @@ mod test {
             assert_ne!(id, FUSE_UNKNOWN_INO);
         }
 
-        // Contrast: a stable backend id (> FUSE_ROOT_ID, not yet in the tree) is
-        // returned verbatim and is stable across calls — the "common case" that
-        // masked the bug in end-to-end tests.
+        // Stable backend ids are returned verbatim and stable across calls.
         let stable = 12_345_u64;
         assert_eq!(t.next_id(stable as i64), stable);
         assert_eq!(t.next_id(stable as i64), stable);

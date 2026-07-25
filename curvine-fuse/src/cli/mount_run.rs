@@ -53,8 +53,6 @@ pub fn run_mount(args: FuseRuntimeArgs) -> CommonResult<()> {
         let web_port = conf.web_port;
         let mut session = FuseSession::new(fuse_rt.clone(), fs, conf).await?;
 
-        // Do not leave the metrics server running when session construction fails.
-        // Build every startup-critical component before spawning background work.
         fuse_rt.spawn(async move {
             if let Err(e) = WebServer::start(web_port, node_state).await {
                 log::error!("Failed to start metrics server: {}", e);

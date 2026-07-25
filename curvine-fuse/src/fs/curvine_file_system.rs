@@ -139,9 +139,7 @@ impl CurvineFileSystem {
             );
         }
 
-        // Curvine allocates storage lazily across the cluster, so KEEP_SIZE has
-        // no logical metadata change to apply. Writes into the range still
-        // allocate blocks normally without exposing a larger st_size early.
+        // KEEP_SIZE has no metadata change for Curvine's lazy allocation.
         if mode.contains(FileAllocMode::KEEP_SIZE) {
             return Ok(None);
         }
@@ -245,11 +243,7 @@ impl CurvineFileSystem {
             .await
     }
 
-    /// Whether a RENAME2 `flags` value is supported. Checked against the RAW
-    /// value (not `RenameFlags::from_bits_truncate`, which would silently drop
-    /// unknown high bits and let a flag the kernel required pass as a plain
-    /// rename). The FUSE-facing client only issues flag-less renames, so any
-    /// non-zero flag (NO_REPLACE/EXCHANGE/WHITEOUT/…) is rejected with ENOSYS.
+    /// Whether raw RENAME2 flags are supported, without truncating unknown high bits.
     fn rename2_flags_supported(flags: u32) -> bool {
         flags == 0
     }
@@ -309,8 +303,6 @@ impl CurvineFileSystem {
         Ok(())
     }
 
-    /// Emit `negative_entry_returned_total`, gated on the `metrics_enabled`
-    /// observation kill-switch. No-op when metrics are disabled.
     fn record_negative_entry(&self) {
         if self.conf.metrics_enabled {
             FuseMetrics::with(|m| m.record_negative_entry());
@@ -323,12 +315,6 @@ impl CurvineFileSystem {
         arg: &fuse_read_in,
         plus: bool,
     ) -> FuseResult<FuseDirentList> {
-        // Time the whole batch. A `ReaddirTimer` guard records
-        // `readdir_duration_us{status=error}` on drop unless `success(n)` is called
-        // on the Ok path (which records duration + `readdir_entries`). An early `?`
-        // return or async cancellation between awaits is therefore counted as an
-        // error with no `entries` observation. Gated on the `metrics_enabled`
-        // kill-switch: disabled => `None`, no timing at all.
         let timer = ReaddirTimer::start(self.conf.metrics_enabled);
         let (res, entries) = self.read_dir_common_inner(header, arg, plus).await?;
         if let Some(timer) = timer {
@@ -344,14 +330,12 @@ impl CurvineFileSystem {
     /// This is deliberately a tiny named function so the +1 is covered by a
     /// regression test: encoding `index` instead makes the last entry of a batch
     /// carry a cookie equal to the batch's start offset, so the kernel re-requests
-    /// the same offset forever and readdir never terminates (issue #1116).
+    /// the same offset forever and readdir never terminates.
     fn readdir_next_cookie(index: u64) -> u64 {
         index + 1
     }
 
-    /// Returns the encoded dirent list plus the number of entries successfully
-    /// added this batch (`index - arg.offset`), which is what `readdir_entries`
-    /// observes — NOT `FuseDirentList`'s byte length and NOT the directory total.
+    /// Returns encoded dirents plus entries emitted this batch (`index - arg.offset`).
     async fn read_dir_common_inner(
         &self,
         header: &fuse_in_header,
@@ -369,8 +353,7 @@ impl CurvineFileSystem {
                 let attr = if status.name != FUSE_CURRENT_DIR && status.name != FUSE_PARENT_DIR {
                     // READDIRPLUS takes a kernel lookup ref (kernel caches the
                     // dentry and will send a FORGET); plain READDIR must not
-                    // (kernel returns names only, no lookup count, no FORGET) —
-                    // issue #1114.
+                    // (kernel returns names only, no lookup count, no FORGET).
                     let inode = dir.lookup(header.nodeid, &status.name, status.clone(), plus)?;
                     let attr = FuseUtils::status_to_attr(&self.conf, &inode.status)?;
                     // readdir materializes the child into the dcache; count it as a
@@ -383,7 +366,7 @@ impl CurvineFileSystem {
 
                 let entry = FuseUtils::create_entry_out(&self.conf, attr);
                 // dirent `off` is the resume cookie = position of the NEXT entry.
-                // See `readdir_next_cookie` (issue #1116 infinite-loop guard).
+                // See `readdir_next_cookie` (the infinite-loop guard).
                 let next_off = Self::readdir_next_cookie(index);
                 if !res.add_dirent(plus, next_off, &status, entry) {
                     batch.push_front(status);
@@ -398,11 +381,8 @@ impl CurvineFileSystem {
         Ok((res, entries))
     }
 
-    /// Whether access(2) must enforce mode bits for the caller.
-    ///
-    /// Linux lets root bypass R_OK/W_OK checks, but still validates X_OK against
-    /// the file mode (see access(2)). Other FUSE ops keep the broader root bypass
-    /// in `check_permissions`.
+    /// Whether access(2) must enforce mode bits for the caller. Linux lets root bypass R_OK/W_OK
+    /// checks, but still validates X_OK against the file mode (see access(2)).
     fn posix_access_requires_mode_check(uid: u32, mask: u32) -> bool {
         uid != 0 || (mask & libc::X_OK as u32) != 0
     }
@@ -429,9 +409,7 @@ impl CurvineFileSystem {
         }
     }
 
-    /// POSIX `stat(2)` requires execute (search) permission on every directory in
-    /// the path prefix. FUSE getattr is inode-based, so enforce that by walking the
-    /// dcache parent chain (nftw FTW_NS when a parent directory is not searchable).
+    /// Enforce POSIX path-prefix search permission for inode-based FUSE getattr.
     async fn check_traverse_permissions(
         &self,
         ino: u64,
@@ -530,12 +508,10 @@ impl CurvineFileSystem {
             return self.conf.uid;
         }
 
-        // Try to parse as numeric uid first
         if let Ok(numeric_uid) = owner.parse::<u32>() {
             return numeric_uid;
         }
 
-        // If not numeric, try to lookup by username
         match sys::get_uid_by_name(owner) {
             Some(uid) => uid,
             None => {
@@ -543,7 +519,7 @@ impl CurvineFileSystem {
                     "Failed to resolve username '{}', using fallback UID {}",
                     owner, self.conf.uid
                 );
-                self.conf.uid // Fallback to config uid
+                self.conf.uid
             }
         }
     }
@@ -554,12 +530,10 @@ impl CurvineFileSystem {
             return self.conf.gid;
         }
 
-        // Try to parse as numeric gid first
         if let Ok(numeric_gid) = group.parse::<u32>() {
             return numeric_gid;
         }
 
-        // If not numeric, try to lookup by group name
         match sys::get_gid_by_name(group) {
             Some(gid) => gid,
             None => {
@@ -567,7 +541,7 @@ impl CurvineFileSystem {
                     "Failed to resolve group '{}', using fallback GID {}",
                     group, self.conf.gid
                 );
-                self.conf.gid // Fallback to config gid
+                self.conf.gid
             }
         }
     }
@@ -582,13 +556,10 @@ impl CurvineFileSystem {
         file_gid: u32,
     ) -> u32 {
         if current_uid == file_uid {
-            // Owner permissions (bits 8-10)
             (mode >> 6) & 0o7
         } else if current_gid == file_gid {
-            // Group permissions (bits 5-7)
             (mode >> 3) & 0o7
         } else {
-            // Other permissions (bits 2-4)
             mode & 0o7
         }
     }
@@ -603,7 +574,7 @@ impl CurvineFileSystem {
 
         #[cfg(target_os = "linux")]
         {
-            // F_OK (0) - only check if file exists, no permission check needed
+            // F_OK (mask 0) is existence-only; no permission bits to check.
             if mask == 0 {
                 debug!("F_OK only check - always allowed");
                 return true;
@@ -611,7 +582,6 @@ impl CurvineFileSystem {
 
             let mut has_permission = true;
 
-            // Check read permission (R_OK = 4)
             if (mask & libc::R_OK as u32) != 0 {
                 let has_read = (permission_bits & 0o4) != 0;
                 has_permission = has_permission && has_read;
@@ -621,7 +591,6 @@ impl CurvineFileSystem {
                 );
             }
 
-            // Check write permission (W_OK = 2)
             if (mask & libc::W_OK as u32) != 0 {
                 let has_write = (permission_bits & 0o2) != 0;
                 has_permission = has_permission && has_write;
@@ -631,7 +600,6 @@ impl CurvineFileSystem {
                 );
             }
 
-            // Check execute permission (X_OK = 1)
             if (mask & libc::X_OK as u32) != 0 {
                 let has_execute = (permission_bits & 0o1) != 0;
                 has_permission = has_permission && has_execute;
@@ -705,14 +673,7 @@ impl CurvineFileSystem {
         Ok(())
     }
 
-    /// Negotiate init reply flags as an explicit allowlist, not a blind echo:
-    /// 1. Kernel-negotiated: `SUPPORTED_INIT_FLAGS & kernel_flags` (only caps the
-    ///    daemon implements AND the kernel offered — see `SUPPORTED_INIT_FLAGS` for
-    ///    what that deliberately excludes).
-    /// 2. Config-gated, forced on regardless of the kernel offer:
-    ///    `FUSE_WRITEBACK_CACHE` (when `write_back_cache`) and `FUSE_SPLICE_*` (when
-    ///    `enable_splice` — splice drives the fuse fd directly, so it is advertised
-    ///    on config alone).
+    /// Negotiate init reply flags via an explicit daemon-supported allowlist.
     fn negotiate_out_flags(kernel_flags: u32, write_back_cache: bool, enable_splice: bool) -> u32 {
         let mut out = SUPPORTED_INIT_FLAGS & kernel_flags;
         if write_back_cache {
@@ -724,30 +685,13 @@ impl CurvineFileSystem {
         out
     }
 
-    /// Whether the kernel's advertised FUSE ABI version is at least the
-    /// daemon's minimum.
-    ///
-    /// Compared as a `(major, minor)` tuple against `FUSE_MIN_ABI`: reject any
-    /// version below 7.31 (this correctly rejects a low-major/high-minor combo
-    /// such as 6.40, which the old `major < 7 && minor < 31` check let through).
-    /// A higher major also compares as supported here; `init` handles that case
-    /// separately with a version-only reply (see `version_only_init_out`) before
-    /// this predicate gates the too-old case.
+    /// Whether the kernel's advertised FUSE ABI version is at least the daemon's minimum.
     fn abi_supported(major: u32, minor: u32) -> bool {
         (major, minor) >= FUSE_MIN_ABI
     }
 
-    /// The INIT reply for a kernel whose major ABI is newer than the daemon's:
-    /// advertise only the daemon's own `(major, minor)` with no negotiated
-    /// flags, and leave every other field zeroed.
-    ///
-    /// Per the fuse.h version-negotiation convention, when the kernel major is
-    /// larger than the daemon's, userspace replies with its own major and skips
-    /// negotiation, and the kernel is expected to re-issue INIT at a matching
-    /// major. This mirrors libfuse `_do_init`'s `arg->major > 7` early return:
-    /// a `fuse_init_in` at an unknown higher major may not share our field
-    /// layout, so we must not interpret its flags. The kernel does not read the
-    /// other reply fields on a major mismatch, so they stay 0.
+    /// The INIT reply for a kernel whose major ABI is newer than the daemon's: advertise only the
+    /// daemon's own `(major, minor)` with no negotiated flags, and leave every other field zeroed.
     fn version_only_init_out() -> fuse_init_out {
         fuse_init_out {
             major: FUSE_KERNEL_VERSION,
@@ -770,10 +714,7 @@ impl fs::FileSystem for CurvineFileSystem {
             );
         }
 
-        // Kernel major newer than ours: reply with our own version only and do
-        // NOT negotiate flags — the `fuse_init_in` layout at an unknown higher
-        // major cannot be trusted (see `version_only_init_out`). Only when the
-        // majors already match do we run the allowlist negotiation below.
+        // Newer kernel major: reply with our version only and negotiate no flags.
         if op.arg.major > FUSE_KERNEL_VERSION {
             info!(
                 "FUSE init: kernel offered abi={}.{} (major > {}); replying version-only \
@@ -787,9 +728,7 @@ impl fs::FileSystem for CurvineFileSystem {
             return Ok(Self::version_only_init_out());
         }
 
-        // Negotiate an explicit allowlist (see `negotiate_out_flags`): only caps
-        // the daemon implements AND the kernel offered, plus config-gated
-        // writeback/splice. `max_pages` then keys off the negotiated result.
+        // Negotiate only daemon-supported, kernel-offered, config-gated caps.
         let out_flags = Self::negotiate_out_flags(
             op.arg.flags,
             self.conf.write_back_cache,
@@ -804,20 +743,15 @@ impl fs::FileSystem for CurvineFileSystem {
             0
         };
 
-        // If `fuse.max_readahead_kb` is configured, raise the negotiated
-        // `max_readahead` so the kernel cap (min(bdi.max_readahead_kb,
-        // fuse_conn.max_readahead)) does not silently shrink reads.
+        // Raise negotiated readahead when configured so kernel caps do not shrink reads silently.
         let max_readahead = match self.conf.max_readahead_kb {
             Some(kb) => op.arg.max_readahead.max(kb.saturating_mul(1024)),
             None => op.arg.max_readahead,
         };
 
         let out = fuse_init_out {
-            // Advertise the daemon's own ABI, not the kernel's: curvine only
-            // implements the 7.31 struct/semantics, so it must not claim a higher
-            // version. The higher-major case is already handled above; here the
-            // majors match, and we reply with our own minor so we never claim a
-            // minor the kernel does not have.
+            // Advertise the daemon's own ABI, not the kernel's: curvine only implements the 7.31
+            // struct/semantics, so it must not claim a higher version.
             major: FUSE_KERNEL_VERSION,
             minor: FUSE_KERNEL_MINOR_VERSION,
             max_readahead,
@@ -835,15 +769,8 @@ impl fs::FileSystem for CurvineFileSystem {
             unused: 0,
         };
 
-        // Log the negotiated capability set: what we advertise vs. what the
-        // kernel offered but we did not enable (so an operator can see why a
-        // capability is inactive). Report BOTH the version we advertise on the
-        // wire (`negotiated_abi`, always our own) and what the kernel offered
-        // (`kernel_offered_abi`) — the two differ in minor when the kernel is
-        // newer (e.g. offered 7.40, connection runs at 7.31), so a single "abi="
-        // field would misreport the live version. Note SPLICE/WRITEBACK may
-        // appear in "enabled" without being kernel-offered — they are
-        // config-gated daemon requests.
+        // Log the negotiated capability set: what we advertise vs. what the kernel
+        // offered but we did not enable (so an operator can see why a capability is inactive).
         let dropped = op.arg.flags & !out_flags;
         info!(
             "FUSE init negotiated: negotiated_abi={}.{} kernel_offered_abi={}.{} \
@@ -1070,9 +997,7 @@ impl fs::FileSystem for CurvineFileSystem {
         Ok(attr)
     }
 
-    // Modify properties
-    //The chown, chmod, and truncate commands will access the interface.
-    // @todo is not implemented at this time, and this interface will not cause inode to be familiar with.
+    // Handles setattr operations such as chown, chmod, and truncate.
     async fn set_attr(&self, op: SetAttr<'_>) -> FuseResult<fuse_attr_out> {
         let path = self.state.get_path(op.header.nodeid)?;
         self.ensure_writable_path(&path, RpcCode::SetAttr).await?;
@@ -1146,9 +1071,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let mut attr = FuseUtils::status_to_attr(&self.conf, &status)?;
         attr.ino = op.header.nodeid;
-        // Metadata-only setattr (for example fchmod after write) may race ahead of
-        // the writer's final metadata commit. Never let its stale size shrink the
-        // kernel inode below the bytes already accepted by the active writer.
+        // Metadata-only setattr may race ahead of writer commit; never shrink below accepted bytes.
         self.state.update_writer_len(&mut attr).await;
         let attr = fuse_attr_out {
             attr_valid: self.conf.attr_ttl.as_secs(),
@@ -1263,7 +1186,7 @@ impl fs::FileSystem for CurvineFileSystem {
         Ok(())
     }
 
-    // Release the directory, curvine does not need to implement this interface
+    // Drop the directory handle; unknown fh is EBADF.
     async fn release_dir(&self, op: ReleaseDir<'_>) -> FuseResult<()> {
         match self.state.remove_dir_handle(op.header.nodeid, op.arg.fh) {
             Some(_) => (),
@@ -1325,13 +1248,8 @@ impl fs::FileSystem for CurvineFileSystem {
         let keep_cache = if self.conf.direct_io {
             false
         } else {
-            // Page cache consistency is handled here, not via explicit inode
-            // invalidation, because: (1) FUSE_NOTIFY_INVAL_INODE can deadlock inside
-            // send_inode_out on some older kernels; (2) on open the kernel issues a
-            // fresh getattr and auto-invalidates the page cache if mtime/size changed
-            // (CAP_AUTO_INVAL_DATA, on by default since Linux 2.6.35), so no notify is
-            // needed. Note: with enable_meta_cache, keep_cache may return true after a
-            // remote modification (stale reads) — an intentional consistency/perf trade.
+            // Page cache consistency is handled by open flags; explicit inode
+            // invalidation can deadlock inside send_inode_out on some older kernels.
             self.state.keep_cache(ino, &handle.status())
         };
         let open_flags = FuseUtils::file_open_flags(&self.conf, keep_cache);
@@ -1540,8 +1458,6 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn rename2(&self, op: Rename2<'_>) -> FuseResult<()> {
         // The FUSE-facing client rename path only issues flag-less renames, so
         // NO_REPLACE/EXCHANGE/WHITEOUT are not plumbed through to the master RPC.
-        // Reject any flag with ENOSYS (POSIX-correct, and strictly better than
-        // the previous "all RENAME2 -> ENOSYS via the dispatch wildcard").
         if !Self::rename2_flags_supported(op.arg.flags) {
             return err_fuse!(
                 libc::ENOSYS,
@@ -1634,11 +1550,7 @@ impl fs::FileSystem for CurvineFileSystem {
         Ok(())
     }
 
-    /// Create a filesystem node (`mknod`):
-    /// - regular file: delegates to `create()` then closes the handle;
-    /// - directory: delegates to `mkdir()`;
-    /// - char/block/fifo/socket: creates a metadata-only special node;
-    /// - other types: returns EPERM.
+    /// Create a filesystem node, delegating regular files/dirs and metadata-only special nodes.
     async fn mk_nod(&self, op: MkNod<'_>) -> FuseResult<fuse_entry_out> {
         let name = try_option!(op.name.to_str());
         if name.len() > FUSE_MAX_NAME_LENGTH {
@@ -1753,12 +1665,6 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let mut ticks: u64 = 0;
         let time = TimeSpent::new();
-
-        // NOTE: `setlkw_wait_duration_us` is NOT observed here. Its RAII timer is
-        // created one layer up, in `FuseReceiver::dispatch_meta_interrupt` before
-        // the `select!`, so that an interrupt arriving before this poll loop ever
-        // runs still records a wait sample. Observing it here would miss exactly
-        // that immediate-cancellation case. See the comment there.
 
         let lock = self.to_file_lock(op.arg);
         let wait_guard = PlockWaitGuard::new(
@@ -2027,13 +1933,6 @@ mod tests {
             .unwrap();
     }
 
-    /// Pin that `FuseMetrics::ensure_init()` runs before `NodeState::new()` in
-    /// `CurvineFileSystem::new`: the event-driven gauges are silently no-op'd by
-    /// `with()` (drifting permanently low, no panic) if a mutation fires before
-    /// init. A behavioral check is useless (the process-global `OnceCell` is
-    /// already init by other tests in this binary), so we assert on the source
-    /// text — scoped to the body of `fn new`, so this test's own doc/assert
-    /// literals don't satisfy `find()` and mask a real removal.
     #[test]
     fn ensure_init_precedes_node_state() {
         let src = include_str!("curvine_file_system.rs");
@@ -2113,9 +2012,9 @@ mod tests {
         assert_eq!(encoded, b"user.visible\0");
     }
 
-    // #1122 + allowlist: the daemon must never advertise FUSE_ATOMIC_O_TRUNC
-    // (open does not truncate) or any other unsupported capability, even when
-    // the kernel offers it. The allowlist mask drops them.
+    // The daemon must never advertise FUSE_ATOMIC_O_TRUNC (open does not truncate)
+    // or any other unsupported capability, even when the kernel offers it. The
+    // allowlist mask drops them.
     //
     // FUSE_EXPORT_SUPPORT is included here (dropped even when offered): its `.`/`..`
     // reconstruction relies on root `.`/`..` lookups that currently return ENOENT,
@@ -2135,11 +2034,7 @@ mod tests {
         );
     }
 
-    // EXPORT_SUPPORT must NOT be in the allowlist: advertising it turns on the
-    // kernel's `.`/`..` handle-reconstruction path, which the daemon cannot serve
-    // (root `.`/`..` lookups return ENOENT). This pins that a future edit cannot
-    // silently re-add it. Paired with `negotiate_out_flags_drops_unsupported_kernel_caps`
-    // (proves it is dropped even when the kernel offers it).
+    // EXPORT_SUPPORT stays out: Curvine cannot serve kernel `.`/`..` handle reconstruction.
     #[test]
     fn export_support_not_in_allowlist() {
         assert_eq!(
@@ -2149,9 +2044,6 @@ mod tests {
         );
     }
 
-    // Supported caps pass through when the kernel offers them. Guards against
-    // regressing distributed locking / readdirplus, which were only enabled by
-    // the old blind OR.
     #[test]
     fn negotiate_out_flags_passes_through_supported_caps() {
         let out = CurvineFileSystem::negotiate_out_flags(SUPPORTED_INIT_FLAGS, false, false);
@@ -2159,7 +2051,6 @@ mod tests {
             out, SUPPORTED_INIT_FLAGS,
             "all supported+offered caps survive"
         );
-        // Explicit regression guards for the previously-implicit caps.
         assert_eq!(out & FUSE_POSIX_LOCKS, FUSE_POSIX_LOCKS);
         assert_eq!(out & FUSE_FLOCK_LOCKS, FUSE_FLOCK_LOCKS);
         assert_eq!(out & FUSE_DO_READDIRPLUS, FUSE_DO_READDIRPLUS);
@@ -2261,9 +2152,7 @@ mod tests {
         let names = fuse_init_flag_names(FUSE_BIG_WRITES | unknown);
         assert!(names.contains(&"BIG_WRITES".to_string()));
         assert!(names.iter().any(|n| n == "0x40000000"));
-        // EXPORT_SUPPORT stays wired into logging even though it left the allowlist
-        // (the documented reason the constant is retained), so an offered-but-dropped
-        // bit is still rendered by name rather than as an opaque hex token.
+        // Keep EXPORT_SUPPORT in logging so offered-but-dropped bits render by name.
         assert!(fuse_init_flag_names(FUSE_EXPORT_SUPPORT).contains(&"EXPORT_SUPPORT".to_string()));
     }
 
@@ -2280,19 +2169,6 @@ mod tests {
         assert!(!CurvineFileSystem::rename2_flags_supported(1 << 6));
     }
 
-    // Issue #1116: readdir must terminate. The dirent `off` field is the kernel's
-    // resume cookie; encoding the current entry's position instead of the next
-    // one makes the last entry of a batch carry a cookie equal to the offset the
-    // kernel resumes at, so the kernel re-requests the same offset forever.
-    //
-    // This harness faithfully replays the kernel readdir protocol against the
-    // PRODUCTION pieces: each round calls the real `DirHandle::get_batch` (which
-    // owns the forward-only skip/positioning semantics) to fetch entries starting
-    // at `offset`, then derives the next `offset` from the last entry's cookie via
-    // the production `CurvineFileSystem::readdir_next_cookie`. Termination, no
-    // duplicates, and no omissions are all asserted. With the pre-fix cookie
-    // formula (`index`) the loop never advances past the tail entry and the round
-    // guard trips — which is exactly the regression this pins.
     mod readdir_termination {
         use crate::fs::state::DirHandle;
         use curvine_common::fs::{ListStream, Path};
@@ -2307,10 +2183,8 @@ mod tests {
                 .collect()
         }
 
-        // Replay the kernel readdir loop with a caller-supplied cookie function so
-        // the test can exercise both the production formula and (as a discriminator)
-        // the buggy pre-fix one. Returns the sequence of names handed to the kernel,
-        // or Err if the loop fails to terminate within `max_rounds`.
+        // Replay the kernel readdir loop with a caller-supplied cookie function so the test
+        // can exercise both the production formula and (as a discriminator) the buggy pre-fix one.
         fn replay_readdir<F>(
             names: &[&str],
             cookie: F,
@@ -2326,9 +2200,7 @@ mod tests {
                 let mut offset: u64 = 0;
 
                 for _ in 0..max_rounds {
-                    // A fresh handle each round models the worst case where the
-                    // stream is (re)positioned purely from `offset` — the same
-                    // path the real daemon takes on a resumed/rebuilt readdir.
+                    // Fresh handles model offset-only resumed/rebuilt readdir positioning.
                     let handle = DirHandle::new(
                         1,
                         1,
@@ -2373,10 +2245,7 @@ mod tests {
             );
         }
 
-        // Discriminator: the pre-fix formula (cookie = current index) makes the
-        // loop stick on the tail entry and never terminate. This proves the
-        // harness above actually catches an off-by-one regression rather than
-        // passing vacuously.
+        // Proves the harness catches the old cookie=current-index infinite loop.
         #[test]
         fn prefix_cookie_would_loop_forever() {
             let names = ["a", "b", "c", "d", "e"];
@@ -2388,17 +2257,7 @@ mod tests {
             );
         }
 
-        // Multi-batch variant that exercises the `FuseDirentList` response-size
-        // cutoff path (reviewer request on PR #1236). The real
-        // `read_dir_common_inner` stops filling a response when
-        // `res.add_dirent(...)` returns false (kernel buffer full), pushes the
-        // rejected entry back, and only advances `index` for entries actually
-        // emitted — so the kernel resumes from the LAST EMITTED entry's cookie,
-        // not from the whole `get_batch` result. `max_emit_per_round` models that
-        // buffer limit: at most that many entries are handed to the kernel each
-        // round, the rest are dropped (as if pushed back), and the next request
-        // resumes from the last emitted cookie. This pins that `index + 1` still
-        // advances correctly when a listing is split across several responses.
+        // Exercises response-size cutoffs and verifies `index + 1` advances across split responses.
         fn replay_readdir_batched<F>(
             names: &[&str],
             cookie: F,
@@ -2423,9 +2282,7 @@ mod tests {
                         return Ok(seen); // kernel sees 0 entries => readdir done
                     }
 
-                    // Emit at most `max_emit_per_round` entries this round, mirroring
-                    // the response-buffer cutoff. `index` only advances for emitted
-                    // entries; the next offset is the last EMITTED entry's cookie.
+                    // Mirror response cutoff; advance `index` only for emitted entries.
                     let mut index = offset;
                     let mut last_cookie = offset;
                     for st in batch.into_iter().take(max_emit_per_round) {
@@ -2492,26 +2349,7 @@ mod tests {
             );
         }
 
-        // Reviewer request (PR #1236): the two harnesses above rebuild a fresh
-        // DirHandle with limit=1000 every round, so `get_batch` returns the whole
-        // remainder in one shot and never drives DirHandle's OWN batching — the
-        // `buf.len() < limit` fill loop and the `set_buf` push-back of leftovers.
-        // That is the reused-stream production path (a directory is opened once
-        // and the same stream is reused across every readdir in the session).
-        //
-        // This harness keeps a SINGLE handle across rounds with a SMALL limit, and
-        // models the FUSE response cutoff by emitting at most `max_emit_per_round`
-        // of what `get_batch` returned and pushing the rest back with the real
-        // `set_buf` — exactly what `read_dir_common_inner` does when
-        // `add_dirent` reports the kernel buffer is full. So cookie advancement is
-        // validated together with DirHandle's real limit batching + set_buf
-        // leftovers, not just a harness-side `take()`.
-        //
-        // Note: with a reused stream the resume `off` never re-enters get_batch's
-        // skip branch (that fires only on a fresh `index == 0`); the stream just
-        // advances forward and leftovers ride in `buf`. Termination here comes
-        // from the stream draining, and the cookie must still march 1:1 with the
-        // entries so nothing is dropped or repeated across the buf boundary.
+        // Reuses one DirHandle with a small limit to exercise fill-loop batching and leftovers.
         fn replay_readdir_reused_handle<F>(
             names: &[&str],
             cookie: F,
@@ -2569,21 +2407,7 @@ mod tests {
             })
         }
 
-        // Reused handle + small DirHandle limit (2) + response cutoff (1 per round):
-        // DirHandle's own fill/limit batching and set_buf leftovers are both on the
-        // path, and the production cookie still enumerates every entry once, in
-        // order, and terminates.
-        //
-        // This test is NOT vacuous: it calls the real `get_batch`/`set_buf`, so a
-        // regression in the limit fill loop or the leftover push-back would drop,
-        // duplicate, or reorder entries and the exact-sequence assertion below
-        // would fail. A cookie=index discriminator is deliberately NOT added on
-        // this path: with a reused stream the resume `off` is never used to
-        // position the stream (the stream only moves forward and leftovers ride in
-        // `buf`), so even the buggy cookie terminates here — which is exactly why
-        // the bug stayed latent in production (see PR summary). The infinite-loop
-        // regression is pinned by the fresh-handle discriminators above
-        // (`prefix_cookie_would_loop_forever` / `_under_split_response`).
+        // Reused handle exercises DirHandle batching, leftovers, and production cookies together.
         #[test]
         fn production_cookie_terminates_with_reused_handle_small_limit() {
             let names = ["a", "b", "c", "d", "e", "f", "g"];
