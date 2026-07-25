@@ -261,9 +261,10 @@ impl InodeFile {
     }
 
     // Decrement link count
-    pub fn decrement_nlink(&mut self) -> u32 {
+    pub fn decrement_nlink(&mut self, ctime: i64) -> u32 {
         if self.nlink > 0 {
             self.nlink -= 1;
+            self.update_ctime(ctime);
         }
         self.nlink
     }
@@ -289,6 +290,7 @@ impl InodeFile {
         self.block_size = opts.block_size as u32;
         self.storage_policy.overwrite(opts.storage_policy);
         self.mtime = mtime;
+        self.update_ctime(mtime);
 
         // Reset file writing state for new write operation
         self.features.set_writing(opts.client_name);
@@ -344,7 +346,9 @@ impl InodeFile {
             );
         }
 
-        self.mtime = LocalTime::mills() as i64;
+        let mtime = LocalTime::mills() as i64;
+        self.mtime = mtime;
+        self.update_ctime(mtime);
         if !only_flush {
             self.features.complete_write(client_name);
         }
@@ -354,6 +358,7 @@ impl InodeFile {
     pub fn free(&mut self, mtime: i64) -> bool {
         if self.storage_policy.free() {
             self.mtime = mtime;
+            self.update_ctime(mtime);
             self.blocks.clear();
             true
         } else {
@@ -552,6 +557,22 @@ impl InodeFile {
             self.cv_exists() && !self.blocks.is_empty()
         }
     }
+
+    pub fn update_mtime(&mut self, time: i64) {
+        if time > self.mtime {
+            self.mtime = time;
+            self.update_ctime(time);
+        }
+    }
+
+    pub fn update_ctime(&mut self, time: i64) {
+        if time > self.ctime() {
+            self.features.x_attr.insert(
+                INTERNAL_CTIME_XATTR.to_string(),
+                time.to_le_bytes().to_vec(),
+            );
+        }
+    }
 }
 
 impl Inode for InodeFile {
@@ -592,5 +613,24 @@ impl Inode for InodeFile {
 impl PartialEq for InodeFile {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complete_advances_existing_independent_ctime_with_mtime() {
+        let mut file = InodeFile::new(1, 1);
+        file.features.x_attr.insert(
+            INTERNAL_CTIME_XATTR.to_string(),
+            2_i64.to_le_bytes().to_vec(),
+        );
+
+        file.complete(0, &[], "", true).unwrap();
+
+        assert!(file.mtime > 2);
+        assert_eq!(file.ctime(), file.mtime);
     }
 }

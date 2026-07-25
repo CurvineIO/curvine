@@ -143,6 +143,7 @@ impl InodeStore {
         parent: &InodeView,
         del: &InodeView,
         del_name: &str,
+        ctime: i64,
     ) -> CommonResult<DeleteResult> {
         let mut batch = self.store.new_batch();
         batch.write_inode(parent)?;
@@ -174,7 +175,7 @@ impl InodeStore {
 
                 _ => {
                     deleted_files += 1;
-                    let res = self.decrement_inode_nlink(inode.id(), &mut batch)?;
+                    let res = self.decrement_inode_nlink(inode.id(), ctime, &mut batch)?;
                     del_res.blocks.extend(res.blocks);
                 }
             }
@@ -322,6 +323,7 @@ impl InodeStore {
         parent: &InodeView,
         new_entry: &InodeView,
         original_inode_id: i64,
+        ctime: i64,
     ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
@@ -331,7 +333,7 @@ impl InodeStore {
         batch.add_child(parent.id(), new_entry.name(), original_inode_id)?;
 
         // Increment nlink count of the original inode (in the same batch for atomicity)
-        self.increment_inode_nlink(original_inode_id, &mut batch)?;
+        self.increment_inode_nlink(original_inode_id, ctime, &mut batch)?;
 
         batch.commit()?;
 
@@ -343,12 +345,13 @@ impl InodeStore {
     fn increment_inode_nlink(
         &self,
         inode_id: i64,
+        ctime: i64,
         batch: &mut InodeWriteBatch<'_>,
     ) -> CommonResult<()> {
         if let Some(mut inode_view) = self.get_inode(inode_id, None)? {
             match &mut inode_view {
                 InodeView::File(_) => {
-                    inode_view.incr_nlink();
+                    inode_view.incr_nlink(ctime);
                     batch.write_inode(&inode_view)?;
                 }
                 _ => {
@@ -366,6 +369,7 @@ impl InodeStore {
         parent: &InodeView,
         child: &InodeView,
         child_name: &str,
+        ctime: i64,
     ) -> CommonResult<DeleteResult> {
         let mut batch = self.store.new_batch();
 
@@ -378,7 +382,7 @@ impl InodeStore {
         // Decrement nlink count of the file being unlinked.
         // If nlink reaches 0 the inode is also deleted and del_res.blocks will be populated.
         let del_res = if let InodeView::File(_) = child {
-            self.decrement_inode_nlink(child.id(), &mut batch)?
+            self.decrement_inode_nlink(child.id(), ctime, &mut batch)?
         } else {
             DeleteResult::new()
         };
@@ -396,6 +400,7 @@ impl InodeStore {
         child: &InodeView,
         child_name: &str,
         inode_id: i64,
+        ctime: i64,
     ) -> CommonResult<DeleteResult> {
         if child.id() != inode_id {
             return err_box!(
@@ -415,7 +420,7 @@ impl InodeStore {
 
         // Decrement nlink count of the original inode.
         // If nlink reaches 0 the inode is also deleted and del_res.blocks will be populated.
-        let del_res = self.decrement_inode_nlink(inode_id, &mut batch)?;
+        let del_res = self.decrement_inode_nlink(inode_id, ctime, &mut batch)?;
 
         batch.commit()?;
 
@@ -428,6 +433,7 @@ impl InodeStore {
     fn decrement_inode_nlink(
         &self,
         inode_id: i64,
+        ctime: i64,
         batch: &mut InodeWriteBatch<'_>,
     ) -> CommonResult<DeleteResult> {
         let mut del_res = DeleteResult::new();
@@ -435,7 +441,7 @@ impl InodeStore {
         if let Some(mut inode_view) = self.get_inode(inode_id, None)? {
             match &mut inode_view {
                 InodeView::File(f) => {
-                    let remaining_links = f.decrement_nlink();
+                    let remaining_links = f.decrement_nlink(ctime);
                     if remaining_links == 0 {
                         batch.delete_inode(inode_id)?;
 

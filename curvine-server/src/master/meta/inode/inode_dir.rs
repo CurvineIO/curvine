@@ -95,7 +95,17 @@ impl InodeDir {
 
     pub fn update_mtime(&mut self, time: i64) {
         if time > self.mtime {
-            self.mtime = time
+            self.mtime = time;
+            self.update_ctime(time);
+        }
+    }
+
+    pub fn update_ctime(&mut self, time: i64) {
+        if time > self.ctime() {
+            self.features.x_attr.insert(
+                INTERNAL_CTIME_XATTR.to_string(),
+                time.to_le_bytes().to_vec(),
+            );
         }
     }
 

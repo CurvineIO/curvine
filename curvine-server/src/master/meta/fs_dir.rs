@@ -224,27 +224,32 @@ impl FsDir {
                 if f.nlink() > 1 {
                     let target_inode = target.clone();
                     if let File(ref mut nf) = target_inode.as_mut() {
-                        nf.decrement_nlink();
+                        nf.decrement_nlink(mtime);
                     }
                     self.store
-                        .apply_unlink(parent.as_ref(), child, child_name)?
+                        .apply_unlink(parent.as_ref(), child, child_name, mtime)?
                 } else {
                     // This is the last link, delete the inode
                     self.store
-                        .apply_delete(parent.as_ref(), child, child_name)?
+                        .apply_delete(parent.as_ref(), child, child_name, mtime)?
                 }
             }
             FileEntry(e) => {
                 // This is a link entry, just remove the directory entry
                 // The actual inode's nlink count should be decremented
-                self.store
-                    .apply_unlink_file_entry(parent.as_ref(), child, child_name, e.id)?
+                self.store.apply_unlink_file_entry(
+                    parent.as_ref(),
+                    child,
+                    child_name,
+                    e.id,
+                    mtime,
+                )?
             }
             Dir(_) => {
-                parent.dec_nlink();
+                parent.dec_nlink(mtime);
                 // Directories are always deleted
                 self.store
-                    .apply_delete(parent.as_ref(), child, child_name)?
+                    .apply_delete(parent.as_ref(), child, child_name, mtime)?
             }
         };
 
@@ -385,6 +390,7 @@ impl FsDir {
         let mut new_inode = src_inode.as_ref().clone();
         new_inode.change_name(new_name);
         new_inode.set_parent_id(dst_parent.id());
+        new_inode.update_ctime(mtime);
 
         // Update the parent directory for the last modification time.
         src_parent.update_mtime(mtime);
@@ -452,7 +458,7 @@ impl FsDir {
         // Update the parent directory for the last modification time.
         parent.update_mtime(child.mtime());
         if child.is_dir() {
-            parent.incr_nlink();
+            parent.incr_nlink(child.mtime());
         }
 
         let added = parent.add_child(child)?;
@@ -855,8 +861,10 @@ impl FsDir {
             None => return err_ext!(FsError::file_not_found(inp.path())),
         };
 
-        // Persist the operation timestamp inside the existing xattr map so journal
-        // replay restores the original ctime without changing the bincode layout.
+        // Internal metadata is master-owned. Persist the operation timestamp in the
+        // journal so replay restores it without changing the bincode inode layout.
+        opts.add_x_attr.remove(INTERNAL_CTIME_XATTR);
+        opts.remove_x_attr.retain(|key| key != INTERNAL_CTIME_XATTR);
         let ctime = LocalTime::mills() as i64;
         opts.add_x_attr.insert(
             INTERNAL_CTIME_XATTR.to_string(),
@@ -1004,7 +1012,7 @@ impl FsDir {
         // If we have the original inode in memory, increment its nlink count
         if let Some(ref mut inode_ptr) = original_inode_ptr {
             if let File(_) = inode_ptr.as_mut() {
-                inode_ptr.incr_nlink();
+                inode_ptr.incr_nlink(op_ms as i64);
             }
         }
 
@@ -1014,7 +1022,7 @@ impl FsDir {
 
         // Log the operation
         self.journal_writer
-            .log_link(self, src_path.path(), &dst_path_str)?;
+            .log_link(self, src_path.path(), &dst_path_str, op_ms as i64)?;
 
         Ok(())
     }
@@ -1049,8 +1057,12 @@ impl FsDir {
         new_path.append(added.clone())?;
 
         // Apply changes to storage - this creates an edge pointing to the original inode
-        self.store
-            .apply_link(parent.as_ref(), added.as_ref(), original_inode_id)?;
+        self.store.apply_link(
+            parent.as_ref(),
+            added.as_ref(),
+            original_inode_id,
+            op_ms as i64,
+        )?;
 
         Ok(new_path)
     }

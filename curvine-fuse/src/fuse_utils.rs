@@ -297,6 +297,14 @@ impl FuseUtils {
     }
 
     pub fn check_xattr(name: &str, op: XattrOp) -> FuseResult<()> {
+        if name.contains('\0') {
+            return match op {
+                XattrOp::Get => err_fuse!(libc::ENODATA, "get_xattr {}", name),
+                XattrOp::Set => err_fuse!(libc::EOPNOTSUPP, "set_xattr {}", name),
+                XattrOp::Remove => err_fuse!(libc::EOPNOTSUPP, "remove_xattr {}", name),
+            };
+        }
+
         // Handle system extended attributes FIRST, before any path resolution
         // This avoids unnecessary operations and provides fastest response
         // Kernel may still query these even if FUSE_POSIX_ACL is disabled in init response
@@ -740,6 +748,24 @@ mod tests {
                 .errno(),
             libc::EOPNOTSUPP
         );
+    }
+
+    #[test]
+    fn nul_xattr_names_are_internal_only() {
+        assert_eq!(
+            FuseUtils::check_xattr(INTERNAL_CTIME_XATTR, XattrOp::Get)
+                .unwrap_err()
+                .errno(),
+            libc::ENODATA
+        );
+        for op in [XattrOp::Set, XattrOp::Remove] {
+            assert_eq!(
+                FuseUtils::check_xattr(INTERNAL_CTIME_XATTR, op)
+                    .unwrap_err()
+                    .errno(),
+                libc::EOPNOTSUPP
+            );
+        }
     }
 
     #[test]

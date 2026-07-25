@@ -181,6 +181,18 @@ impl CurvineFileSystem {
         Ok(())
     }
 
+    fn encode_visible_xattr_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        for name in names {
+            if FuseUtils::check_xattr(name, XattrOp::Get).is_err() {
+                continue;
+            }
+            encoded.extend_from_slice(name.as_bytes());
+            encoded.push(0);
+        }
+        encoded
+    }
+
     async fn ensure_writable_path(&self, path: &Path, rpc_code: RpcCode) -> FuseResult<()> {
         if self.conf.readonly {
             return Err(FsError::read_only(path.full_path()).into());
@@ -1010,19 +1022,8 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn list_xattr(&self, op: ListXAttr<'_>) -> FuseResult<BytesMut> {
         let status = self.state.fs_stat(op.header.nodeid, None).await?;
 
-        // Build the list of xattr names
-        let mut xattr_names = Vec::new();
-
-        // Add custom xattr names from the file
-        for name in status.x_attr.keys() {
-            // Hidden/protected attributes must not be advertised when getxattr
-            // deliberately makes them unreadable.
-            if FuseUtils::check_xattr(name, XattrOp::Get).is_err() {
-                continue;
-            }
-            xattr_names.extend_from_slice(name.as_bytes());
-            xattr_names.push(0); // null terminator
-        }
+        let xattr_names =
+            Self::encode_visible_xattr_names(status.x_attr.keys().map(String::as_str));
 
         let mut buf = FuseBuf::default();
 
@@ -1798,7 +1799,7 @@ impl fs::FileSystem for CurvineFileSystem {
 #[cfg(test)]
 mod tests {
     use crate::{FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_UID};
-    use curvine_common::state::FileAllocMode;
+    use curvine_common::state::{FileAllocMode, INTERNAL_CTIME_XATTR};
 
     #[test]
     fn posix_access_requires_mode_check_for_root() {
@@ -2099,6 +2100,13 @@ mod tests {
                 .errno(),
             libc::EINVAL
         );
+    }
+
+    #[test]
+    fn list_xattr_encoding_hides_internal_ctime() {
+        let names = ["user.visible", INTERNAL_CTIME_XATTR];
+        let encoded = CurvineFileSystem::encode_visible_xattr_names(names.into_iter());
+        assert_eq!(encoded, b"user.visible\0");
     }
 
     // #1122 + allowlist: the daemon must never advertise FUSE_ATOMIC_O_TRUNC

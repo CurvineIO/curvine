@@ -217,6 +217,7 @@ impl ProtoUtils {
     }
 
     pub fn file_status_to_pb(mut status: FileStatus) -> FileStatusProto {
+        let has_ctime = status.x_attr.contains_key(INTERNAL_CTIME_XATTR);
         let ctime = status.ctime();
         status.x_attr.remove(INTERNAL_CTIME_XATTR);
         FileStatusProto {
@@ -240,7 +241,7 @@ impl ProtoUtils {
             mode: status.mode,
             target: status.target,
             nlink: status.nlink,
-            ctime: Some(ctime),
+            ctime: has_ctime.then_some(ctime),
         }
     }
 
@@ -788,5 +789,20 @@ mod tests {
 
         pb.ctime = None;
         assert_eq!(ProtoUtils::file_status_from_pb(pb).ctime(), 1_000);
+    }
+
+    #[test]
+    fn file_status_proto_keeps_legacy_ctime_optional() {
+        let status = FileStatus {
+            mtime: 1_000,
+            ..Default::default()
+        };
+
+        let pb = ProtoUtils::file_status_to_pb(status);
+        assert_eq!(pb.ctime, None);
+
+        let round_trip = ProtoUtils::file_status_from_pb(pb);
+        assert_eq!(round_trip.ctime(), 1_000);
+        assert!(!round_trip.x_attr.contains_key(INTERNAL_CTIME_XATTR));
     }
 }
