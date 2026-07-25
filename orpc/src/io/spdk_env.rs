@@ -12,26 +12,120 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
+// ---------------------------------------------------------------------------
 // Qpair pool - reuse NVMe qpairs across handles
-/// Lazy allocate, cache on release
+// Lazy allocate, cache on release.
+// Per-controller limits derived from negotiated io_queues of spdk's target
+// ---------------------------------------------------------------------------
+
+// Per-controller qpair state
+struct CtrlQpairState {
+    active: AtomicUsize,
+    max_active: usize,
+}
+
+impl CtrlQpairState {
+    fn new(max_active: usize) -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            max_active,
+        }
+    }
+}
+
 pub struct QpairPool {
     inner: Mutex<HashMap<usize, Vec<*mut spdk_ffi::spdk_nvme_qpair>>>,
+    /// Per-controller active count and max limit, keyed by controller pointer.
+    ctrl_state: Mutex<HashMap<usize, CtrlQpairState>>,
+    /// Idle cache limit per controller (soft - excess freed on release).
     max_per_ctrlr: usize,
 }
 // SAFETY: exclusive ownership
 unsafe impl Send for QpairPool {}
 unsafe impl Sync for QpairPool {}
 impl QpairPool {
-    /// Default max idle qpairs per controller
+    /// Default max idle qpairs per controller (soft cache limit).
     const DEFAULT_MAX_PER_CTRLR: usize = 16;
 
     fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            ctrl_state: Mutex::new(HashMap::new()),
             max_per_ctrlr: Self::DEFAULT_MAX_PER_CTRLR,
+        }
+    }
+
+    /// Register the per-controller qpair limit from the actual negotiated IO queue count.
+    /// `actual_io_queues` is queried from SPDK after controller initialization
+    fn register_limit(&self, ctrlr_ptr: usize, actual_io_queues: u32) {
+        let limit = actual_io_queues as usize;
+        let mut state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
+        state.insert(ctrlr_ptr, CtrlQpairState::new(limit));
+        if limit == 0 {
+            warn!(
+                "QpairPool: ctrlr {:p} has 0 negotiated IO queues, qpair acquisition disabled",
+                ctrlr_ptr as *const ()
+            );
+        } else {
+            info!(
+                "QpairPool: registered ctrlr {:p} with max_active={}",
+                ctrlr_ptr as *const (), limit
+            );
+        }
+    }
+
+    /// Get (active, max_active) for a controller.
+    fn controller_stats(&self, ctrlr_ptr: usize) -> (usize, usize) {
+        let state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(s) = state.get(&ctrlr_ptr) {
+            (s.active.load(Ordering::Acquire), s.max_active)
+        } else {
+            (0, 0)
+        }
+    }
+
+    // TODO: Arc<CtrlQpairState> - release_reservation() blocked by CAS loop under contention
+    /// Atomically reserve a slot for this controller.
+    /// Returns true if reserved (active < max_active), false at capacity.
+    fn try_reserve(&self, ctrlr_ptr: usize) -> bool {
+        let state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(s) = state.get(&ctrlr_ptr) {
+            loop {
+                let cur = s.active.load(Ordering::Acquire);
+                if cur >= s.max_active {
+                    return false;
+                }
+                if s.active
+                    .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return true;
+                }
+            }
+        } else {
+            error!(
+                "QpairPool: try_reserve called for unregistered ctrlr {:p}",
+                ctrlr_ptr as *const ()
+            );
+            false
+        }
+    }
+
+    /// Release a previously reserved slot.
+    fn release_reservation(&self, ctrlr_ptr: usize) {
+        let state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(s) = state.get(&ctrlr_ptr) {
+            s.active.fetch_sub(1, Ordering::AcqRel);
+        } else {
+            warn!(
+                "QpairPool: release_reservation for unregistered ctrlr {:p} \
+                 (no active count to decrement — possible double-release or release without acquire)",
+                ctrlr_ptr as *const ()
+            );
         }
     }
 
@@ -41,6 +135,18 @@ impl QpairPool {
         ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
     ) -> CommonResult<*mut spdk_ffi::spdk_nvme_qpair> {
         let key = ctrlr as usize;
+        // Fail fast if this controller has 0 negotiated IO queues
+        {
+            let state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(ctrl) = state.get(&key) {
+                if ctrl.max_active == 0 {
+                    return err_box!(
+                        "QpairPool: ctrlr {:p} has 0 negotiated IO queues, qpair acquisition disabled",
+                        ctrlr
+                    );
+                }
+            }
+        }
         {
             let mut pool = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(stack) = pool.get_mut(&key) {
@@ -74,26 +180,29 @@ impl QpairPool {
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
     ) {
         let key = ctrlr as usize;
-        let mut pool = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let stack = pool.entry(key).or_default();
-        if stack.len() >= self.max_per_ctrlr {
-            // Pool full — free immediately to bound controller-side memory.
-            drop(pool); // release lock before FFI call
-            unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) };
-            log::trace!(
-                "QpairPool: pool full for ctrlr {:p} (max={}), freed qpair",
-                ctrlr,
-                self.max_per_ctrlr
-            );
-        } else {
-            stack.push(qpair);
-            log::trace!(
-                "QpairPool: returned qpair to pool for ctrlr {:p} ({}/{})",
-                ctrlr,
-                stack.len(),
-                self.max_per_ctrlr
-            );
-        }
+        {
+            let mut pool = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let stack = pool.entry(key).or_default();
+            if stack.len() >= self.max_per_ctrlr {
+                // Pool full — free immediately to bound controller-side memory.
+                drop(pool); // release lock before FFI call
+                unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) };
+                log::trace!(
+                    "QpairPool: pool full for ctrlr {:p} (max={}), freed qpair",
+                    ctrlr,
+                    self.max_per_ctrlr
+                );
+            } else {
+                stack.push(qpair);
+                log::trace!(
+                    "QpairPool: returned qpair to pool for ctrlr {:p} ({}/{})",
+                    ctrlr,
+                    stack.len(),
+                    self.max_per_ctrlr
+                );
+            }
+        } // inner lock dropped here
+        self.release_reservation(key);
     }
     /// Free all pooled qpairs
     fn drain_all(&self) {
@@ -611,6 +720,23 @@ impl SpdkEnv {
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
+                    // Register per-controller qpair limit from SPDK's negotiated IO queue count.
+                    if let Some(first) = bdevs.first() {
+                        let actual_io_queues = unsafe {
+                            spdk_ffi::curvine_spdk_ctrlr_get_num_io_queues(
+                                first.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr,
+                            )
+                        };
+                        info!(
+                            "Target[{}] {}: requested io_queues={}, actual negotiated={}",
+                            i,
+                            target.endpoint(),
+                            target.io_queues,
+                            actual_io_queues
+                        );
+                        self.qpair_pool
+                            .register_limit(first.ctrlr, actual_io_queues);
+                    }
                     all_bdevs.extend(bdevs);
                 }
                 Err(e) => {
@@ -1139,6 +1265,7 @@ mod test {
     fn cap() {
         let p = QpairPool {
             inner: Mutex::new(HashMap::new()),
+            ctrl_state: Mutex::new(HashMap::new()),
             max_per_ctrlr: 2,
         };
         push(&p, 1);
@@ -1173,6 +1300,112 @@ mod test {
             t.join().unwrap();
         }
         assert_eq!(tot(&p), 0);
+    }
+
+    #[test]
+    fn register_limit_overwrites() {
+        let p = QpairPool::new();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_qpair;
+
+        p.register_limit(ctrlr as usize, 64);
+        let (_, limit) = p.controller_stats(ctrlr as usize);
+        assert_eq!(limit, 64);
+
+        // Overwrite with different value
+        p.register_limit(ctrlr as usize, 128);
+        let (_, limit) = p.controller_stats(ctrlr as usize);
+        assert_eq!(limit, 128);
+    }
+
+    #[test]
+    fn per_controller_active_tracking() {
+        let p = QpairPool::new();
+        let ctrlr_a = 0x1000usize as *mut spdk_ffi::spdk_nvme_qpair;
+        let ctrlr_b = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+
+        // Register limits: A=2, B=3
+        p.register_limit(ctrlr_a as usize, 2);
+        p.register_limit(ctrlr_b as usize, 3);
+
+        // Initially zero
+        let (active_a, limit_a) = p.controller_stats(ctrlr_a as usize);
+        assert_eq!(active_a, 0);
+        assert_eq!(limit_a, 2);
+
+        let (active_b, limit_b) = p.controller_stats(ctrlr_b as usize);
+        assert_eq!(active_b, 0);
+        assert_eq!(limit_b, 3);
+
+        // Unregistered controller returns (0, 0)
+        let (active_c, limit_c) = p.controller_stats(0x3000);
+        assert_eq!(active_c, 0);
+        assert_eq!(limit_c, 0);
+    }
+
+    #[test]
+    fn try_reserve_respects_limit() {
+        let p = QpairPool::new();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_qpair;
+        p.register_limit(ctrlr as usize, 2);
+
+        // Reserve up to limit
+        assert!(p.try_reserve(ctrlr as usize));
+        assert!(p.try_reserve(ctrlr as usize));
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 2);
+
+        // At limit — should fail
+        assert!(!p.try_reserve(ctrlr as usize));
+
+        // Release one — should succeed again
+        p.release_reservation(ctrlr as usize);
+        assert!(p.try_reserve(ctrlr as usize));
+    }
+
+    #[test]
+    fn release_returns_qpair_to_pool() {
+        let p = QpairPool::new();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+
+        p.register_limit(ctrlr as usize, 4);
+
+        // Reserve a slot (simulating acquire path)
+        assert!(p.try_reserve(ctrlr as usize)); // active = 1
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 1);
+
+        // Release — qpair goes to pool, active decrements
+        p.release(ctrlr, qpair);
+
+        assert_eq!(cnt(&p, ctrlr as usize), 1);
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn release_active_count_decremented() {
+        let p = QpairPool::new();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+
+        p.register_limit(ctrlr as usize, 4);
+
+        // Reserve 3 slots
+        assert!(p.try_reserve(ctrlr as usize));
+        assert!(p.try_reserve(ctrlr as usize));
+        assert!(p.try_reserve(ctrlr as usize));
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 3);
+
+        // Release all 3
+        for i in 0..3 {
+            let qpair = (0x2000 + i) as *mut spdk_ffi::spdk_nvme_qpair;
+            p.release(ctrlr, qpair);
+        }
+
+        assert_eq!(cnt(&p, ctrlr as usize), 3);
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 0);
     }
 
     mod config_tests {
