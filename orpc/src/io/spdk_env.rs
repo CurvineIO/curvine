@@ -17,7 +17,6 @@ use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
 // Qpair pool - reuse NVMe qpairs across handles
 // Lazy allocate, cache on release.
 // Per-controller limits derived from negotiated io_queues of spdk's target
