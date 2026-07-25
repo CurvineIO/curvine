@@ -39,6 +39,9 @@ impl CtrlQpairState {
 
 pub struct QpairPool {
     inner: Mutex<HashMap<usize, Vec<*mut spdk_ffi::spdk_nvme_qpair>>>,
+    /// Per-controller active count and max limit, keyed by controller pointer.
+    ctrl_state: Mutex<HashMap<usize, CtrlQpairState>>,
+    /// Idle cache limit per controller (soft - excess freed on release).
     max_per_ctrlr: usize,
 }
 // SAFETY: exclusive ownership
