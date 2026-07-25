@@ -388,6 +388,111 @@ fn test_sequential_write_across_many_blocks_with_prefetch() -> CommonResult<()> 
     Ok(())
 }
 
+/// Exact N * block_size EOF must not leave a speculative 0-length next block
+/// after complete() (#1291 review: discard_prefetch / EOF prefetch).
+#[test]
+fn test_exact_block_multiple_complete_has_no_extra_empty_block() -> CommonResult<()> {
+    let testing = Testing::default();
+    let mut conf = testing.get_active_cluster_conf()?;
+    conf.client.short_circuit = true;
+    conf.client.block_size = 4 * 1024;
+    conf.client.block_size_str = "4KB".to_string();
+    conf.master.min_block_size = 4 * 1024;
+    conf.client.write_chunk_size = 1024;
+    conf.client.write_chunk_size_str = "1KB".to_string();
+    conf.client.write_chunk_num = 4;
+
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+    let path = Path::from_str("/exact_n_blocks_no_extra.data")?;
+
+    rt.block_on(async move {
+        let block_size = 4 * 1024usize;
+        let n_blocks = 3usize;
+        let total = block_size * n_blocks;
+        let data = BytesMut::from(Utils::rand_str(total).as_bytes());
+
+        let mut writer = fs.create(&path, true).await?;
+        let chunk = 1024;
+        let mut off = 0;
+        while off < data.len() {
+            let end = (off + chunk).min(data.len());
+            writer.write(&data[off..end]).await?;
+            off = end;
+        }
+        writer.complete().await?;
+
+        let locs = fs.get_block_locations(&path).await?;
+        assert_eq!(
+            locs.block_locs.len(),
+            n_blocks,
+            "exact N*block_size complete must not retain a prefetched empty block"
+        );
+        for (i, lb) in locs.block_locs.iter().enumerate() {
+            assert_eq!(
+                lb.block.len as usize, block_size,
+                "block {i} should be full, not 0-length leftover"
+            );
+        }
+        Ok::<(), FsError>(())
+    })?;
+
+    Ok(())
+}
+
+/// Prefetch that is discarded by seek()/flush() must cancel the opened writer
+/// and still allow a consistent complete().
+#[test]
+fn test_prefetch_discard_on_seek_and_flush() -> CommonResult<()> {
+    let testing = Testing::default();
+    let mut conf = testing.get_active_cluster_conf()?;
+    conf.client.short_circuit = true;
+    conf.client.block_size = 4 * 1024;
+    conf.client.block_size_str = "4KB".to_string();
+    conf.master.min_block_size = 4 * 1024;
+    conf.client.write_chunk_size = 1024;
+    conf.client.write_chunk_size_str = "1KB".to_string();
+    conf.client.write_chunk_num = 4;
+
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+
+    rt.block_on(async move {
+        let block_size = 4 * 1024usize;
+        // One write that overflows the first block so prefetch starts, then seek.
+        let path_seek = Path::from_str("/prefetch_discard_seek.data")?;
+        let overflow = block_size + block_size / 2;
+        let data = BytesMut::from(Utils::rand_str(overflow).as_bytes());
+        let mut writer = fs.create(&path_seek, true).await?;
+        writer.write(&data).await?;
+        // Discard in-flight/ready prefetch via seek, then finish cleanly.
+        writer.seek(0).await?;
+        writer.complete().await?;
+
+        let locs = fs.get_block_locations(&path_seek).await?;
+        assert!(
+            !locs.block_locs.is_empty(),
+            "file should retain written blocks after seek-discard"
+        );
+
+        // Overflow write then flush (also discards prefetch) then more write + complete.
+        let path_flush = Path::from_str("/prefetch_discard_flush.data")?;
+        let mut writer = fs.create(&path_flush, true).await?;
+        writer.write(&data).await?;
+        writer.flush().await?;
+        let more = BytesMut::from(Utils::rand_str(512).as_bytes());
+        writer.write(&more).await?;
+        writer.complete().await?;
+
+        let locs = fs.get_block_locations(&path_flush).await?;
+        let committed: i64 = locs.block_locs.iter().map(|b| b.block.len).sum();
+        assert_eq!(committed, (overflow + 512) as i64);
+        Ok::<(), FsError>(())
+    })?;
+
+    Ok(())
+}
+
 fn random_write(mut conf: ClusterConf, mark: &str) -> CommonResult<()> {
     let block_size = 1024;
     conf.client.block_size = block_size; // 1KB block size

@@ -149,6 +149,15 @@ impl FsWriterBase {
 
         let mut remaining = chunk.len();
         while remaining > 0 {
+            // Only prefetch when this write still needs bytes beyond the current
+            // block. Speculative prefetch near EOF would allocate an unused
+            // 0-length next block that complete()/flush()/seek() must discard.
+            if let Some(cur) = self.cur_writer.as_ref() {
+                if (remaining as i64) > cur.remaining() {
+                    self.maybe_start_prefetch();
+                }
+            }
+
             let cur_writer = self.get_writer().await?;
             let write_len = remaining.min(cur_writer.remaining() as usize);
             cur_writer.write(chunk.split_to(write_len)).await?;
@@ -158,7 +167,6 @@ impl FsWriterBase {
             if self.pos > self.len {
                 self.len = self.pos;
             }
-            self.maybe_start_prefetch();
         }
 
         Ok(())
@@ -179,6 +187,12 @@ impl FsWriterBase {
 
         let mut remaining = chunk.len();
         while remaining > 0 {
+            if let Some(cur) = self.cur_writer.as_ref() {
+                if (remaining as i64) > cur.remaining() {
+                    self.maybe_start_prefetch();
+                }
+            }
+
             let cur_writer = rt.block_on(self.get_writer())?;
             let write_len = remaining.min(cur_writer.remaining() as usize);
 
@@ -190,7 +204,6 @@ impl FsWriterBase {
             if self.pos > self.len {
                 self.len = self.pos;
             }
-            self.maybe_start_prefetch();
         }
 
         Ok(())
@@ -640,8 +653,44 @@ impl FsWriterBase {
     }
 
     async fn discard_prefetch(&mut self) {
-        if let Some(handle) = self.next_block_prefetch.take() {
-            handle.abort();
+        let Some(handle) = self.next_block_prefetch.take() else {
+            return;
+        };
+
+        // Await (do not abort) so a finished alloc/open still yields a writer we
+        // can cancel. complete/flush/seek/resize/cancel are not latency-critical
+        // relative to leaking a worker write session or an untracked next block.
+        match handle.await {
+            Ok(Ok((lb, mut writer))) => {
+                debug!(
+                    "discarding prefetched block {} for path={}",
+                    lb.id, self.path
+                );
+                if let Err(e) = writer.cancel().await {
+                    warn!(
+                        "failed to cancel unused prefetched block writer {}: {}",
+                        writer.block_id(),
+                        e
+                    );
+                }
+                // Master may still retain the empty allocated block. Overflow-only
+                // prefetch avoids this at exact N*block_size EOF; for seek/flush
+                // mid-append, a later AddBlock recovers the same next block via
+                // search_next_block. Keep prefetch_alloc_attempted so sync alloc
+                // flushes commits before AddBlock.
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "prefetch task failed while discarding for path={}: {:?}",
+                    self.path, e
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "prefetch task join failed while discarding for path={}: {}",
+                    self.path, e
+                );
+            }
         }
     }
 
