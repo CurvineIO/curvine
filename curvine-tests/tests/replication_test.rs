@@ -306,6 +306,7 @@ fn test_replication_honors_source_block_capacity() -> CommonResult<()> {
         .find(|block| block.block.len > CLIENT_DEFAULT_BLOCK_SIZE)
         .expect("missing block larger than the worker client default");
     let block_id = oversized_block.block.id;
+    let original_locations = oversized_block.locs.clone();
 
     let initial_locations = rt.block_on(async { get_block_locations(&fs, &path).await })?;
     let initial_replica_count = replica_count(&initial_locations, block_id);
@@ -329,6 +330,27 @@ fn test_replication_honors_source_block_capacity() -> CommonResult<()> {
         }
         std::thread::sleep(REPLICATION_POLL_INTERVAL);
     }
+
+    let fs_dir = cluster.get_active_master_fs().fs_dir();
+    {
+        let mut fs_dir = fs_dir.write();
+        let reports = original_locations
+            .iter()
+            .map(|location| {
+                (
+                    false,
+                    block_id,
+                    BlockLocation {
+                        worker_id: location.worker_id,
+                        storage_type: Default::default(),
+                    },
+                )
+            })
+            .collect();
+        fs_dir.block_report(reports)?;
+    }
+    let latest_locations = rt.block_on(async { get_block_locations(&fs, &path).await })?;
+    assert_eq!(1, replica_count(&latest_locations, block_id));
 
     let read_data = rt.block_on(async { read_test_file(&fs, &path).await })?;
     if read_data != test_data {
