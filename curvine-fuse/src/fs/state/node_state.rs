@@ -929,18 +929,22 @@ impl NodeState {
         let path = self.get_path_common(ino, name)?;
         let status = self.fs.get_status(&path).await?;
 
+        self.cache_resolved_status(ino, name, &status);
+
+        Ok(status)
+    }
+
+    fn cache_resolved_status(&self, ino: u64, name: Option<&str>, status: &FileStatus) {
         // The root inode starts as synthetic metadata with mode 0. Cache its first
         // real backend status even when the general metadata cache is disabled so
         // every path traversal does not issue another root get_status RPC.
         let cache_root = ino == FUSE_ROOT_ID && name.is_none();
         if self.enable_meta_cache || cache_root {
-            let _ = self.update_status(ino, name, &status);
+            let _ = self.update_status(ino, name, status);
             if self.enable_meta_cache {
                 self.record_status_cache(CACHE_RESULT_PUT);
             }
         }
-
-        Ok(status)
     }
 
     pub async fn fs_mkdir(&self, ino: u64, name: &str, opts: MkdirOpts) -> FuseResult<fuse_attr> {
@@ -1360,6 +1364,37 @@ mod test {
         assert!(NodeState::map_remove_handle(&mut map, 2, 21).1);
         assert!(map.get(&2).is_none());
         assert!(!NodeState::map_remove_handle(&mut map, 2, 99).1);
+    }
+
+    #[test]
+    fn resolved_root_status_is_cached_when_metadata_cache_is_disabled() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+        assert!(!state.enable_meta_cache);
+        assert_eq!(
+            state
+                .dir_read()
+                .get_inode(FUSE_ROOT_ID, None)
+                .unwrap()
+                .lifecycle,
+            crate::fs::dcache::Lifecycle::Invalid
+        );
+
+        state.cache_resolved_status(
+            FUSE_ROOT_ID,
+            None,
+            &FileStatus {
+                is_dir: true,
+                mode: 0o755,
+                ..Default::default()
+            },
+        );
+
+        let dir = state.dir_read();
+        let root = dir.get_inode(FUSE_ROOT_ID, None).unwrap();
+        assert_eq!(root.lifecycle, crate::fs::dcache::Lifecycle::Cached);
+        assert_eq!(root.mode, 0o755);
     }
 
     #[test]

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::fs::dcache::CleanerTask;
+use crate::fs::dcache::{CleanerTask, Inode};
 use crate::fs::operator::*;
 use crate::fs::plock_wait_registry::{LockOwner, PlockWaitGuard, PlockWaitRegistry};
 use crate::fs::state::{FileHandle, NodeState};
@@ -406,6 +406,10 @@ impl CurvineFileSystem {
         }
     }
 
+    fn traversal_cached_status(inode: &Inode, meta_ttl: u64) -> Option<FileStatus> {
+        inode.cache_valid(meta_ttl).then(|| inode.clone_status())
+    }
+
     /// Linux root access(2) bypasses R_OK/W_OK but still validates X_OK against any
     /// execute bit in the file mode, not the caller's owner/group/other class.
     fn check_root_access_permissions(status: &FileStatus) -> FuseResult<()> {
@@ -459,9 +463,7 @@ impl CurvineFileSystem {
                 match dir.get_inode(dir_ino, None) {
                     Some(inode) => {
                         let is_root = inode.is_root();
-                        let status = inode
-                            .cache_valid(meta_ttl)
-                            .then(|| inode.clone_status());
+                        let status = Self::traversal_cached_status(inode, meta_ttl);
                         (is_root, status)
                     }
                     None => (false, None),
@@ -1943,8 +1945,9 @@ impl fs::FileSystem for CurvineFileSystem {
 
 #[cfg(test)]
 mod tests {
+    use crate::fs::dcache::Inode;
     use crate::{FATTR_ATIME_NOW, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_UID};
-    use curvine_common::state::{FileAllocMode, FileType, INTERNAL_CTIME_XATTR};
+    use curvine_common::state::{FileAllocMode, FileStatus, FileType, INTERNAL_CTIME_XATTR};
 
     #[test]
     fn userspace_open_checks_only_unambiguous_write_modes() {
@@ -1963,6 +1966,27 @@ mod tests {
             CurvineFileSystem::open_userspace_acl_mask(OpenAction::ReadWrite),
             Some((libc::R_OK | libc::W_OK) as u32)
         );
+    }
+
+    #[test]
+    fn traversal_ignores_synthetic_root_until_backend_status_is_loaded() {
+        use super::CurvineFileSystem;
+
+        let mut root = Inode::new_root();
+        let meta_ttl = 60_000;
+        assert!(CurvineFileSystem::traversal_cached_status(&root, meta_ttl).is_none());
+
+        root.update_status(FileStatus {
+            is_dir: true,
+            mode: 0o755,
+            ..Default::default()
+        });
+
+        let status = CurvineFileSystem::traversal_cached_status(&root, meta_ttl).unwrap();
+        assert_eq!(status.mode, 0o755);
+
+        root.invalid_cache();
+        assert!(CurvineFileSystem::traversal_cached_status(&root, meta_ttl).is_none());
     }
 
     #[test]
