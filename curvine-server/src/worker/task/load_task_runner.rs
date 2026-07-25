@@ -80,6 +80,15 @@ impl LoadTaskRunner {
                 warn!("report task {}", e)
             }
         }
+
+        crate::fault_point! {
+            async,
+            name: "worker.load_task.after_run",
+            description: "After a worker load task runner has fully exited",
+            context: {
+                "task_id" => self.task.info.task_id.clone(),
+            },
+        }
     }
 
     async fn run0(&self) -> FsResult<()> {
@@ -359,6 +368,18 @@ impl LoadTaskRunner {
                 let mut writer = fs.open_for_write(&dst, false).await?;
                 writer.seek(off).await?;
 
+                crate::fault_point! {
+                    async,
+                    name: "worker.load_task.parallel.before_segment_copy",
+                    description: "After a parallel load segment opens its streams and before it copies data",
+                    context: {
+                        "task_id" => task.info.task_id.clone(),
+                        "stream_index" => i as i64,
+                        "segment_offset" => off,
+                        "segment_len" => len,
+                    },
+                }
+
                 let mut remaining = len;
                 while remaining > 0 {
                     // Honor cancellation and the shared deadline INSIDE the
@@ -426,6 +447,15 @@ impl LoadTaskRunner {
                 Self::abort_remaining(&handles, idx);
                 return Ok(());
             }
+            crate::fault_point! {
+                async,
+                name: "worker.load_task.parallel.before_join_await",
+                description: "After the parent cancellation check and before awaiting a parallel load stream",
+                context: {
+                    "task_id" => self.task.info.task_id.clone(),
+                    "stream_index" => idx as i64,
+                },
+            }
             match (&mut handles[idx]).await {
                 Ok(Ok(n)) => {
                     written += n;
@@ -459,7 +489,8 @@ impl LoadTaskRunner {
         }
         if written != src_len {
             return err_box!(
-                "parallel load incomplete: wrote {} of {} bytes; refusing to mark cache valid",
+                "Task {} parallel load incomplete: wrote {} of {} bytes; refusing to mark cache valid",
+                self.task.info.task_id,
                 written,
                 src_len
             );
