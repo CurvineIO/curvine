@@ -1506,7 +1506,10 @@ mod test {
         let ino = {
             let mut dir = state.dir_write();
             let status = FileStatus::with_name(123, "pending".to_string(), false);
-            let ino = dir.lookup(FUSE_ROOT_ID, "pending", status, true).unwrap().ino;
+            let ino = dir
+                .lookup(FUSE_ROOT_ID, "pending", status, true)
+                .unwrap()
+                .ino;
             dir.unlink(FUSE_ROOT_ID, "pending", true).unwrap();
             ino
         };
