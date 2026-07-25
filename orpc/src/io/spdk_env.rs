@@ -64,7 +64,6 @@ impl QpairPool {
         Self {
             inner: Mutex::new(HashMap::new()),
             ctrl_state: Mutex::new(HashMap::new()),
-            ctrl_state: Mutex::new(HashMap::new()),
             max_per_ctrlr: Self::DEFAULT_MAX_PER_CTRLR,
             notify: Condvar::new(),
             shutdown: AtomicBool::new(false),
