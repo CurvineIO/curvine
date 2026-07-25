@@ -16,18 +16,25 @@ use crate::block::BlockWriter;
 use crate::file::{FsClient, FsContext};
 use curvine_common::error::FsError;
 use curvine_common::fs::Path;
-use curvine_common::state::{CommitBlock, FileAllocOpts, FileBlocks, FileStatus, WriteFileBlocks};
+use curvine_common::state::{
+    CommitBlock, FileAllocOpts, FileBlocks, FileStatus, LocatedBlock, WriteFileBlocks,
+};
 use curvine_common::FsResult;
 use fxhash::FxHasher;
 use linked_hash_map::LinkedHashMap;
-use log::warn;
+use log::{debug, warn};
 use orpc::common::FastHashSet;
-use orpc::runtime::{RpcRuntime, Runtime};
+use orpc::runtime::{JoinHandle, RpcRuntime, Runtime};
 use orpc::sys::DataSlice;
 use orpc::{err_box, try_option_mut};
 use std::hash::BuildHasherDefault;
 use std::mem;
 use std::sync::Arc;
+use std::time::Instant;
+
+/// Background prefetch of the next sequential block so boundary switching does
+/// not serialize `add_block` + `BlockWriter::new` on the single write drain task.
+type NextBlockPrefetchHandle = JoinHandle<FsResult<(LocatedBlock, BlockWriter)>>;
 
 pub struct FsWriterBase {
     fs_context: Arc<FsContext>,
@@ -46,6 +53,15 @@ pub struct FsWriterBase {
     /// opened, blocks published by a successful flush, and blocks finalized on
     /// workers but still waiting for their commit metadata to reach the master.
     durable_blocks: FastHashSet<i64>,
+
+    /// Prefetch next block when current remaining bytes fall at or below this.
+    prefetch_threshold: i64,
+    next_block_prefetch: Option<NextBlockPrefetchHandle>,
+    /// Set when a prefetch task may have already allocated the next block on
+    /// the master. Sync allocation must flush commits via CompleteFile first,
+    /// because a repeated AddBlock returns the existing next block and ignores
+    /// piggybacked commit_blocks.
+    prefetch_alloc_attempted: bool,
 }
 
 impl FsWriterBase {
@@ -60,6 +76,10 @@ impl FsWriterBase {
                 .filter(|block| block.block.len > 0 && !block.locs.is_empty())
                 .map(|block| block.block.id)
                 .collect(),
+        );
+        let prefetch_threshold = Self::prefetch_threshold(
+            fs_context.conf.client.write_chunk_size as i64,
+            status.block_size,
         );
         let file_blocks = WriteFileBlocks::new(status);
 
@@ -78,7 +98,17 @@ impl FsWriterBase {
             cache_limit,
             cache_writers,
             durable_blocks,
+            prefetch_threshold,
+            next_block_prefetch: None,
+            prefetch_alloc_attempted: false,
         }
+    }
+
+    /// Start prefetch when a few write chunks remain in the current block.
+    fn prefetch_threshold(write_chunk_size: i64, block_size: i64) -> i64 {
+        let chunk = write_chunk_size.max(1);
+        let capped = (block_size / 8).max(chunk);
+        (chunk * 4).clamp(chunk, capped)
     }
 
     pub fn pos(&self) -> i64 {
@@ -128,6 +158,7 @@ impl FsWriterBase {
             if self.pos > self.len {
                 self.len = self.pos;
             }
+            self.maybe_start_prefetch();
         }
 
         Ok(())
@@ -159,12 +190,14 @@ impl FsWriterBase {
             if self.pos > self.len {
                 self.len = self.pos;
             }
+            self.maybe_start_prefetch();
         }
 
         Ok(())
     }
 
     pub async fn flush(&mut self) -> FsResult<()> {
+        self.discard_prefetch().await;
         self.complete0(true).await?;
         Ok(())
     }
@@ -178,6 +211,7 @@ impl FsWriterBase {
     // Write is completed, perform the following operations
     // 1. Submit the last block.
     pub async fn complete(&mut self) -> FsResult<()> {
+        self.discard_prefetch().await;
         self.complete0(false).await?;
         Ok(())
     }
@@ -218,6 +252,8 @@ impl FsWriterBase {
     /// Cleanup remains best effort: preserve the first error while attempting
     /// all remaining writers and the metadata submission.
     pub async fn cancel(&mut self) -> FsResult<()> {
+        self.discard_prefetch().await;
+
         let mut first_error: Option<FsError> = None;
         let mut cleanup_commits = Vec::new();
 
@@ -342,81 +378,271 @@ impl FsWriterBase {
             Some(v) if v.has_remaining() => (),
 
             _ => {
-                let block = self.file_blocks.get_block(self.pos);
-                match block {
-                    // step1: If block already exists, seek operation exists, need to overwrite previous block.
-                    // Multiple seek operations will automatically cache block writer, so need to check block writer cache.
-                    Some((off, lb)) => {
-                        let writer = match self.cache_writers.remove(&lb.id) {
-                            Some(mut v) => {
-                                // Writer from cache may have a different position, seek to correct offset
-                                v.seek(off).await?;
-                                v
+                if self.try_install_prefetch().await? {
+                    // Prefetched next block is ready; old block was completed and
+                    // its commit was flushed to the master separately.
+                } else {
+                    let block = self.file_blocks.get_block(self.pos);
+                    match block {
+                        // step1: If block already exists, seek operation exists, need to overwrite previous block.
+                        // Multiple seek operations will automatically cache block writer, so need to check block writer cache.
+                        Some((off, lb)) => {
+                            let writer = match self.cache_writers.remove(&lb.id) {
+                                Some(mut v) => {
+                                    // Writer from cache may have a different position, seek to correct offset
+                                    v.seek(off).await?;
+                                    v
+                                }
+
+                                None => {
+                                    let lb = if lb.should_assign() {
+                                        let assign_lb = self
+                                            .fs_client
+                                            .assign_worker(&self.path, lb.block.clone())
+                                            .await?;
+
+                                        self.file_blocks.update_locate(&assign_lb)?;
+                                        assign_lb
+                                    } else {
+                                        lb
+                                    };
+                                    BlockWriter::new(
+                                        self.fs_context.clone(),
+                                        lb,
+                                        off,
+                                        self.file_blocks.status.block_size,
+                                    )
+                                    .await?
+                                }
+                            };
+
+                            self.update_writer(Some(writer), true).await?;
+                        }
+
+                        None => {
+                            self.update_writer(None, false).await?;
+                            if self.prefetch_alloc_attempted {
+                                // Prefetch may have allocated next already; flush
+                                // commits before AddBlock or they would be dropped.
+                                self.flush_pending_commits().await?;
+                                self.prefetch_alloc_attempted = false;
                             }
 
-                            None => {
-                                let lb = if lb.should_assign() {
-                                    let assign_lb = self
-                                        .fs_client
-                                        .assign_worker(&self.path, lb.block.clone())
-                                        .await?;
-
-                                    self.file_blocks.update_locate(&assign_lb)?;
-                                    assign_lb
-                                } else {
-                                    lb
-                                };
-                                BlockWriter::new(
-                                    self.fs_context.clone(),
-                                    lb,
-                                    off,
-                                    self.file_blocks.status.block_size,
+                            let commit_blocks = self.file_blocks.take_commit_blocks();
+                            let last_block = self.file_blocks.last_block();
+                            let add_start = Instant::now();
+                            let add_result = self
+                                .fs_client
+                                .add_block_by_id(
+                                    &self.path,
+                                    self.file_blocks.status.id,
+                                    commit_blocks.clone(),
+                                    self.len,
+                                    last_block,
                                 )
-                                .await?
-                            }
-                        };
-
-                        self.update_writer(Some(writer), true).await?;
-                    }
-
-                    None => {
-                        self.update_writer(None, false).await?;
-
-                        let commit_blocks = self.file_blocks.take_commit_blocks();
-                        let last_block = self.file_blocks.last_block();
-                        let add_result = self
-                            .fs_client
-                            .add_block_by_id(
-                                &self.path,
-                                self.file_blocks.status.id,
-                                commit_blocks.clone(),
-                                self.len,
-                                last_block,
+                                .await;
+                            let lb = match add_result {
+                                Ok(block) => block,
+                                Err(e) => {
+                                    self.restore_commit_blocks(&commit_blocks);
+                                    return Err(e);
+                                }
+                            };
+                            debug!(
+                                "add_block sync path took {:?}, path={}",
+                                add_start.elapsed(),
+                                self.path
+                            );
+                            self.file_blocks.add_block(lb.clone())?;
+                            let open_start = Instant::now();
+                            let writer = BlockWriter::new(
+                                self.fs_context.clone(),
+                                lb.clone(),
+                                0,
+                                self.file_blocks.status.block_size,
                             )
-                            .await;
-                        let lb = match add_result {
-                            Ok(block) => block,
-                            Err(e) => {
-                                self.restore_commit_blocks(&commit_blocks);
-                                return Err(e);
-                            }
-                        };
-                        self.file_blocks.add_block(lb.clone())?;
-                        let writer = BlockWriter::new(
-                            self.fs_context.clone(),
-                            lb.clone(),
-                            0,
-                            self.file_blocks.status.block_size,
-                        )
-                        .await?;
+                            .await?;
+                            debug!(
+                                "BlockWriter::new sync path took {:?}, path={}",
+                                open_start.elapsed(),
+                                self.path
+                            );
 
-                        self.cur_writer.replace(writer);
-                    }
-                };
+                            self.cur_writer.replace(writer);
+                        }
+                    };
+                }
             }
         }
 
         Ok(try_option_mut!(self.cur_writer))
+    }
+
+    fn can_prefetch_next_block(&self) -> bool {
+        if self.next_block_prefetch.is_some() {
+            return false;
+        }
+        // Prefetch only helps sequential append; random writes keep existing paths.
+        if self.pos != self.len {
+            return false;
+        }
+        let Some(cur) = self.cur_writer.as_ref() else {
+            return false;
+        };
+        if cur.remaining() > self.prefetch_threshold {
+            return false;
+        }
+        let next_pos = self.pos + cur.remaining();
+        self.file_blocks.get_block(next_pos).is_none()
+    }
+
+    fn maybe_start_prefetch(&mut self) {
+        if !self.can_prefetch_next_block() {
+            return;
+        }
+
+        let fs_client = self.fs_client.clone();
+        let fs_context = self.fs_context.clone();
+        let path = self.path.clone();
+        let inode_id = self.file_blocks.status.id;
+        let last_block = self.file_blocks.last_block();
+        // Master file length must match already-committed block bytes. The
+        // current open block is still uncommitted, so use committed_len — not
+        // self.len — when allocating the next block early.
+        let committed_len = self.committed_len();
+        let block_size = self.file_blocks.status.block_size;
+        let rt = self.fs_context.clone_runtime();
+
+        debug!(
+            "prefetch next block: path={}, committed_len={}, remaining={}",
+            path,
+            committed_len,
+            self.cur_writer.as_ref().map(|w| w.remaining()).unwrap_or(0)
+        );
+
+        let handle = rt.spawn(async move {
+            let alloc_start = Instant::now();
+            let lb = fs_client
+                .add_block_by_id(&path, inode_id, vec![], committed_len, last_block)
+                .await?;
+            debug!(
+                "prefetch add_block took {:?}, path={}",
+                alloc_start.elapsed(),
+                path
+            );
+            let open_start = Instant::now();
+            let writer = BlockWriter::new(fs_context, lb.clone(), 0, block_size).await?;
+            debug!(
+                "prefetch BlockWriter::new took {:?}, path={}",
+                open_start.elapsed(),
+                path
+            );
+            Ok((lb, writer))
+        });
+
+        self.prefetch_alloc_attempted = true;
+        self.next_block_prefetch = Some(handle);
+    }
+
+    async fn take_prefetch_result(&mut self) -> Option<FsResult<(LocatedBlock, BlockWriter)>> {
+        let handle = self.next_block_prefetch.take()?;
+        match handle.await {
+            Ok(res) => Some(res),
+            Err(e) => Some(err_box!("prefetch task join failed: {}", e)),
+        }
+    }
+
+    /// Install a ready/in-flight prefetch as the current writer.
+    ///
+    /// Returns `true` when prefetch was consumed. On prefetch failure, clears
+    /// state and returns `false` so the caller can fall back to the sync path.
+    async fn try_install_prefetch(&mut self) -> FsResult<bool> {
+        let Some(result) = self.take_prefetch_result().await else {
+            return Ok(false);
+        };
+
+        let (lb, mut writer) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "prefetch next block failed, falling back to sync alloc: {:?}",
+                    e
+                );
+                // Keep prefetch_alloc_attempted so sync path flushes commits
+                // before AddBlock (master may already hold the next block).
+                return Ok(false);
+            }
+        };
+
+        // Preserve durability of the just-finished block: complete it and flush
+        // commits via CompleteFile. Re-using AddBlock would ignore commits because
+        // the next block is already allocated on the master.
+        let complete_start = Instant::now();
+        if let Err(e) = self.update_writer(None, false).await {
+            if let Err(cancel_err) = writer.cancel().await {
+                warn!(
+                    "failed to cancel prefetched writer after complete error: {}",
+                    cancel_err
+                );
+            }
+            return Err(e);
+        }
+        debug!(
+            "prefetch boundary old.complete took {:?}, path={}",
+            complete_start.elapsed(),
+            self.path
+        );
+        if let Err(e) = self.flush_pending_commits().await {
+            if let Err(cancel_err) = writer.cancel().await {
+                warn!(
+                    "failed to cancel prefetched writer after commit flush error: {}",
+                    cancel_err
+                );
+            }
+            return Err(e);
+        }
+        self.prefetch_alloc_attempted = false;
+        self.file_blocks.add_block(lb)?;
+        self.cur_writer.replace(writer);
+        Ok(true)
+    }
+
+    async fn flush_pending_commits(&mut self) -> FsResult<()> {
+        let commit_blocks = self.file_blocks.take_commit_blocks();
+        if commit_blocks.is_empty() {
+            return Ok(());
+        }
+
+        for commit in &commit_blocks {
+            self.durable_blocks.insert(commit.block_id);
+        }
+
+        let flush_start = Instant::now();
+        let result = self
+            .fs_client
+            .complete_file_by_id(
+                &self.path,
+                self.file_blocks.status.id,
+                self.len,
+                commit_blocks.clone(),
+                true,
+            )
+            .await;
+        debug!(
+            "prefetch boundary commit flush took {:?}, path={}",
+            flush_start.elapsed(),
+            self.path
+        );
+        if result.is_err() {
+            self.restore_commit_blocks(&commit_blocks);
+        }
+        result.map(|_| ())
+    }
+
+    async fn discard_prefetch(&mut self) {
+        if let Some(handle) = self.next_block_prefetch.take() {
+            handle.abort();
+        }
     }
 
     // Implement seek support for random writes
@@ -425,7 +651,11 @@ impl FsWriterBase {
             return err_box!("Cannot seek to negative position: {}", pos);
         } else if pos == self.pos() {
             return Ok(());
-        } else if pos > self.len {
+        }
+
+        self.discard_prefetch().await;
+
+        if pos > self.len {
             self.pos = pos;
             self.update_writer(None, true).await?;
             return Ok(());
@@ -488,6 +718,8 @@ impl FsWriterBase {
         opts.validate()?;
         let len = opts.len;
 
+        self.discard_prefetch().await;
+
         // Step 1: Flush only when there are uncommitted block writers. A
         // fallocate(2) extend on an open fd often follows fully committed
         // writes; forcing complete() whenever len > 0 can surface EIO from a
@@ -524,6 +756,8 @@ impl FsWriterBase {
         self.pos = self.pos.min(len);
         self.len = len;
         self.file_blocks = file_blocks;
+        self.next_block_prefetch = None;
+        self.prefetch_alloc_attempted = false;
         self.durable_blocks = FastHashSet::with_vec(
             self.file_blocks
                 .block_locs

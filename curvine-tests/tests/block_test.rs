@@ -335,6 +335,59 @@ fn test_remote_random_write_with_replication() -> CommonResult<()> {
     random_write(conf, "remote_replicas")
 }
 
+/// Sequential append across many small blocks exercises next-block prefetch
+/// (#1291): allocate/open of block N+1 overlaps writing the tail of block N.
+#[test]
+fn test_sequential_write_across_many_blocks_with_prefetch() -> CommonResult<()> {
+    let testing = Testing::default();
+    let mut conf = testing.get_active_cluster_conf()?;
+    conf.client.short_circuit = true;
+    conf.client.block_size = 4 * 1024;
+    conf.client.block_size_str = "4KB".to_string();
+    conf.master.min_block_size = 4 * 1024;
+    conf.client.write_chunk_size = 1024;
+    conf.client.write_chunk_size_str = "1KB".to_string();
+    conf.client.write_chunk_num = 4;
+
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+    let path = Path::from_str("/sequential_prefetch_many_blocks.data")?;
+
+    rt.block_on(async move {
+        let block_size = 4 * 1024usize;
+        let total = block_size * 8 + 512; // cross 8 full block boundaries
+        let data = BytesMut::from(Utils::rand_str(total).as_bytes());
+
+        let mut writer = fs.create(&path, true).await?;
+        // Write in chunk-sized pieces so remaining() crosses the prefetch threshold.
+        let chunk = 1024;
+        let mut off = 0;
+        while off < data.len() {
+            let end = (off + chunk).min(data.len());
+            writer.write(&data[off..end]).await?;
+            off = end;
+        }
+        writer.complete().await?;
+
+        let mut reader = fs.open(&path).await?;
+        let mut buf = BytesMut::zeroed(total);
+        let mut read = 0;
+        while read < total {
+            let n = reader.read(&mut buf[read..]).await?;
+            if n == 0 {
+                break;
+            }
+            read += n;
+        }
+        assert_eq!(read, total);
+        assert_eq!(&buf[..], &data[..]);
+        reader.complete().await?;
+        Ok::<(), FsError>(())
+    })?;
+
+    Ok(())
+}
+
 fn random_write(mut conf: ClusterConf, mark: &str) -> CommonResult<()> {
     let block_size = 1024;
     conf.client.block_size = block_size; // 1KB block size
