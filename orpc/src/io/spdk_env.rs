@@ -12,26 +12,79 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
+// ---------------------------------------------------------------------------
 // Qpair pool - reuse NVMe qpairs across handles
-/// Lazy allocate, cache on release
+// Lazy allocate, cache on release.
+// Per-controller limits derived from negotiated io_queues of spdk's target
+// ---------------------------------------------------------------------------
+
+// Per-controller qpair state
+struct CtrlQpairState {
+    active: AtomicUsize,
+    max_active: usize,
+}
+
+impl CtrlQpairState {
+    fn new(max_active: usize) -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            max_active,
+        }
+    }
+}
+
 pub struct QpairPool {
     inner: Mutex<HashMap<usize, Vec<*mut spdk_ffi::spdk_nvme_qpair>>>,
+    /// Per-controller active count and max limit, keyed by controller pointer.
+    ctrl_state: Mutex<HashMap<usize, CtrlQpairState>>,
+    /// Idle cache limit per controller (soft - excess freed on release).
     max_per_ctrlr: usize,
 }
 // SAFETY: exclusive ownership
 unsafe impl Send for QpairPool {}
 unsafe impl Sync for QpairPool {}
 impl QpairPool {
-    /// Default max idle qpairs per controller
+    /// Default max idle qpairs per controller (soft cache limit).
     const DEFAULT_MAX_PER_CTRLR: usize = 16;
 
     fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            ctrl_state: Mutex::new(HashMap::new()),
             max_per_ctrlr: Self::DEFAULT_MAX_PER_CTRLR,
+        }
+    }
+
+    /// Register the per-controller qpair limit from the actual negotiated IO queue count.
+    /// `actual_io_queues` is queried from SPDK after controller initialization
+    fn register_limit(&self, ctrlr_ptr: usize, actual_io_queues: u32) {
+        let limit = actual_io_queues as usize;
+        let mut state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
+        state.insert(ctrlr_ptr, CtrlQpairState::new(limit));
+        if limit == 0 {
+            warn!(
+                "QpairPool: ctrlr {:p} has 0 negotiated IO queues, qpair acquisition disabled",
+                ctrlr_ptr as *const ()
+            );
+        } else {
+            info!(
+                "QpairPool: registered ctrlr {:p} with max_active={}",
+                ctrlr_ptr as *const (), limit
+            );
+        }
+    }
+
+    /// Get (active, max_active) for a controller.
+    fn controller_stats(&self, ctrlr_ptr: usize) -> (usize, usize) {
+        let state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(s) = state.get(&ctrlr_ptr) {
+            (s.active.load(Ordering::Acquire), s.max_active)
+        } else {
+            (0, 0)
         }
     }
 
@@ -1139,6 +1192,7 @@ mod test {
     fn cap() {
         let p = QpairPool {
             inner: Mutex::new(HashMap::new()),
+            ctrl_state: Mutex::new(HashMap::new()),
             max_per_ctrlr: 2,
         };
         push(&p, 1);
@@ -1173,6 +1227,46 @@ mod test {
             t.join().unwrap();
         }
         assert_eq!(tot(&p), 0);
+    }
+
+    #[test]
+    fn register_limit_overwrites() {
+        let p = QpairPool::new();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_qpair;
+
+        p.register_limit(ctrlr as usize, 64);
+        let (_, limit) = p.controller_stats(ctrlr as usize);
+        assert_eq!(limit, 64);
+
+        // Overwrite with different value
+        p.register_limit(ctrlr as usize, 128);
+        let (_, limit) = p.controller_stats(ctrlr as usize);
+        assert_eq!(limit, 128);
+    }
+
+    #[test]
+    fn per_controller_active_tracking() {
+        let p = QpairPool::new();
+        let ctrlr_a = 0x1000usize as *mut spdk_ffi::spdk_nvme_qpair;
+        let ctrlr_b = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+
+        // Register limits: A=2, B=3
+        p.register_limit(ctrlr_a as usize, 2);
+        p.register_limit(ctrlr_b as usize, 3);
+
+        // Initially zero
+        let (active_a, limit_a) = p.controller_stats(ctrlr_a as usize);
+        assert_eq!(active_a, 0);
+        assert_eq!(limit_a, 2);
+
+        let (active_b, limit_b) = p.controller_stats(ctrlr_b as usize);
+        assert_eq!(active_b, 0);
+        assert_eq!(limit_b, 3);
+
+        // Unregistered controller returns (0, 0)
+        let (active_c, limit_c) = p.controller_stats(0x3000);
+        assert_eq!(active_c, 0);
+        assert_eq!(limit_c, 0);
     }
 
     mod config_tests {
