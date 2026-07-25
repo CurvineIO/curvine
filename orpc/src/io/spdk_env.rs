@@ -88,7 +88,7 @@ impl QpairPool {
         }
     }
 
-    // TODO: Arc<CtrlQpairState> - release_reservation() blocked by CAS loop under contention
+    // TODO: Arc<CtrlQpairState> + #[repr(align(64))] - eliminate ctrl_state Mutex from CAS, prevent false sharing
     /// Atomically reserve a slot for this controller.
     /// Returns true if reserved (active < max_active), false at capacity.
     fn try_reserve(&self, ctrlr_ptr: usize) -> bool {
