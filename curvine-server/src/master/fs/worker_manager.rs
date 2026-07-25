@@ -297,3 +297,26 @@ impl Display for WorkerManager {
         write!(f, "{}", str)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn worker_with_available(worker_id: u32, available: i64) -> WorkerInfo {
+        let mut worker = WorkerInfo::default();
+        worker.address.worker_id = worker_id;
+        worker.available = available;
+        worker
+    }
+
+    #[test]
+    fn available_bytes_clamps_negative_values_and_saturates() {
+        let mut manager = WorkerManager::new(&ClusterConf::default()).unwrap();
+        manager.add_test_worker(worker_with_available(1, -10));
+        manager.add_test_worker(worker_with_available(2, 20));
+        assert_eq!(manager.available_bytes(), 20);
+
+        manager.add_test_worker(worker_with_available(3, i64::MAX));
+        assert_eq!(manager.available_bytes(), i64::MAX);
+    }
+}

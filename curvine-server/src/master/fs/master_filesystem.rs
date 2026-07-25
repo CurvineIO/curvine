@@ -1208,6 +1208,9 @@ impl MasterFilesystem {
         opts.validate()?;
 
         let path = path.as_ref();
+        // This snapshot only rejects individually impossible requests; it is not a
+        // reservation, so concurrent fallocates may observe the same capacity.
+        // Worker-side block allocation remains the hard enforcement point.
         let available = if opts.truncate {
             i64::MAX
         } else {
