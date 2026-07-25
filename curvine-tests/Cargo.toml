@@ -6,7 +6,7 @@ edition = "2021"
 [features]
 # Enable OSS-HDFS backend specific tests / code paths (Jindo-based).
 # This is used by `#[cfg(feature = "oss-hdfs")]` in integration tests.
-oss-hdfs = ["curvine-ufs/oss-hdfs"]
+oss-hdfs = ["curvine-client/oss-hdfs"]
 lancedb = [
     "dep:curvine-lancedb",
     "dep:lance-io",
@@ -25,7 +25,7 @@ required-features = ["lancedb"]
 orpc = { workspace = true }
 curvine-common = { workspace = true }
 curvine-server = { workspace = true }
-curvine-client = { workspace = true }
+curvine-client = { workspace = true, features = ["job-client", "unified", "opendal-s3"] }
 curvine-lancedb = { workspace = true, optional = true }
 curvine-ufs = { workspace = true }
 tokio  = { workspace = true }

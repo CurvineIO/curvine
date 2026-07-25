@@ -35,6 +35,8 @@ pub use self::filesystem::FileSystem;
 mod list_stream;
 pub use self::list_stream::ListStream;
 
+pub mod local;
+
 // CurvineURI is used in the Curvine system to describe paths, including external storage.
 pub type CurvineURI = Path;
 

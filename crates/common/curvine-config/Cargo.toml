@@ -13,6 +13,8 @@ orpc = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 clap = { workspace = true }
+log = { workspace = true }
+nix = { workspace = true, features = ["net"] }
 
 [features]
 default = []

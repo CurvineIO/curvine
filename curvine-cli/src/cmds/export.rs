@@ -15,8 +15,8 @@
 use crate::cmds::LoadStatusCommand;
 use crate::util::*;
 use clap::Parser;
-use curvine_client::rpc::JobMasterClient;
-use curvine_common::state::LoadJobCommand;
+use curvine_job_client::JobMasterClient;
+use curvine_model::LoadJobCommand;
 use orpc::CommonResult;
 
 #[derive(Parser, Debug)]

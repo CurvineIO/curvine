@@ -27,12 +27,13 @@ use crate::{
     FUSE_ROOT_ID, STATE_FILE_MAGIC, STATE_FILE_VERSION,
 };
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::conf::{ClientConf, ClusterConf, FuseConf};
+use curvine_common::conf::{ClientConf, FuseConf};
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, ListStream, Path, StateReader, StateWriter};
 use curvine_common::state::{
     CreateFileOpts, FileAllocOpts, FileStatus, ListOptions, MkdirOpts, OpenFlags, SetAttrOpts,
 };
+use curvine_config::ClusterConf;
 use futures::stream::{self, StreamExt};
 use log::{debug, error, info, warn};
 use orpc::common::FastHashMap;

@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::util::*;
-use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::fs::Path;
+use curvine_fs_api::Path;
+use curvine_unified_fs::UnifiedFileSystem;
 use orpc::common::ByteUnit;
 use orpc::CommonResult;
 

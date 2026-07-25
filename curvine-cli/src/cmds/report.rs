@@ -14,8 +14,8 @@
 
 use crate::util::*;
 use clap::{Parser, Subcommand};
-use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::state::MasterInfo;
+use curvine_model::MasterInfo;
+use curvine_unified_fs::UnifiedFileSystem;
 use orpc::CommonResult;
 use serde::Serialize;
 

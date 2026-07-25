@@ -1,7 +1,7 @@
 use bytes::BytesMut;
 use clap::Subcommand;
-use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::fs::{CurvineURI, FileSystem, Reader};
+use curvine_fs_api::{CurvineURI, FileSystem, Reader};
+use curvine_unified_fs::UnifiedFileSystem;
 use orpc::CommonResult;
 
 #[derive(Subcommand, Debug)]

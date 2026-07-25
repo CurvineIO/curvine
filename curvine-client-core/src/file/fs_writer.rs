@@ -1,0 +1,170 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::file::{FsContext, FsWriterBase, FsWriterBuffer};
+use bytes::BytesMut;
+use curvine_error::FsResult;
+use curvine_fs_api::{Path, Writer};
+use curvine_model::{FileAllocOpts, FileBlocks, FileStatus};
+use log::debug;
+use orpc::common::ByteUnit;
+use orpc::sys::DataSlice;
+use orpc::{err_box, ternary};
+use std::sync::Arc;
+
+type Inner = FsWriterBuffer;
+
+pub struct FsWriter {
+    inner: Inner,
+    buf: BytesMut,
+    chunk_size: usize,
+    pos: i64,
+    append: bool,
+    metrics: &'static crate::ClientMetrics,
+}
+
+impl FsWriter {
+    pub fn new(fs_context: Arc<FsContext>, path: Path, status: FileBlocks, append: bool) -> Self {
+        let chunk_size = fs_context.write_chunk_size();
+        let chunk_num = fs_context.write_chunk_num();
+        let pos = ternary!(append, status.len, 0);
+
+        debug!(
+            "Create writer, path={}, pos={}, len = {}, block_size={}, chunk_size={}, chunk_number={}, replicas={}",
+            &status.path,
+            pos,
+            status.len,
+            ByteUnit::byte_to_string(status.block_size as u64),
+            chunk_size,
+            chunk_num,
+            status.replicas
+        );
+
+        let writer = FsWriterBase::new(fs_context, path, status, pos);
+        let inner = FsWriterBuffer::new(writer, chunk_num);
+        let metrics = FsContext::get_metrics();
+
+        Self {
+            inner,
+            buf: BytesMut::with_capacity(chunk_size),
+            chunk_size,
+            pos,
+            append,
+            metrics,
+        }
+    }
+
+    pub fn create(fs_context: Arc<FsContext>, path: Path, file_blocks: FileBlocks) -> Self {
+        Self::new(fs_context, path, file_blocks, false)
+    }
+
+    pub fn append(fs_context: Arc<FsContext>, path: Path, file_blocks: FileBlocks) -> Self {
+        Self::new(fs_context, path, file_blocks, true)
+    }
+
+    pub fn file_blocks(&self) -> &FileBlocks {
+        self.inner.file_blocks()
+    }
+}
+
+impl Writer for FsWriter {
+    fn status(&self) -> &FileStatus {
+        self.inner.status()
+    }
+
+    fn path(&self) -> &Path {
+        self.inner.path()
+    }
+
+    fn pos(&self) -> i64 {
+        self.pos
+    }
+
+    fn pos_mut(&mut self) -> &mut i64 {
+        &mut self.pos
+    }
+
+    fn chunk_mut(&mut self) -> &mut BytesMut {
+        &mut self.buf
+    }
+
+    fn chunk_size(&self) -> usize {
+        self.chunk_size
+    }
+
+    async fn write_chunk(&mut self, chunk: DataSlice) -> FsResult<i64> {
+        let len = chunk.len() as i64;
+        self.metrics.track_write(len, self.inner.write(chunk)).await
+    }
+
+    async fn flush(&mut self) -> FsResult<()> {
+        self.flush_chunk().await?;
+        self.inner.flush().await
+    }
+
+    // Write is completed, perform the following operations
+    // 1. Submit the last block.
+    async fn complete(&mut self) -> FsResult<()> {
+        self.flush_chunk().await?;
+        // The flush operation will be automatically called internally, so flush is not needed here.
+        self.inner.complete().await
+    }
+
+    async fn cancel(&mut self) -> FsResult<()> {
+        // Bytes still in the front buffer have never reached the backend and
+        // must not be flushed after cancellation.
+        self.buf.clear();
+        self.inner.cancel().await
+    }
+
+    async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        if pos < 0 {
+            return err_box!(format!("Cannot seek to negative position: {}", pos));
+        } else if self.pos == pos {
+            return Ok(());
+        }
+
+        if self.append {
+            debug!(
+                "Seek operation in append mode is ineffective,\
+             data will still be written in append mode"
+            );
+            return Ok(());
+        }
+
+        // Flush current buffer
+        self.flush_chunk().await?;
+
+        // Delegate to inner writer to execute seek
+        self.inner.seek(pos).await?;
+
+        // Update current position
+        self.pos = pos;
+        Ok(())
+    }
+
+    async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
+        let len = opts.len;
+        self.flush_chunk().await?;
+        self.inner.resize(opts).await?;
+        self.pos = self.pos.min(len);
+        Ok(())
+    }
+}
+
+impl Drop for FsWriter {
+    fn drop(&mut self) {
+        debug!("Close writer, path={}", self.path())
+    }
+}

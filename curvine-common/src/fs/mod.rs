@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub use curvine_fs_api::local;
 pub use curvine_fs_api::{
     CurvineURI, FileSystem, FsKind, ListStream, Path, Reader, RpcCode, Writer,
 };
 
 mod state_file;
 pub use self::state_file::*;
-
-pub mod local;

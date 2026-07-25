@@ -1,0 +1,17 @@
+[package]
+name = "curvine-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+curvine-unified-fs = { workspace = true }
+curvine-fs-api = { workspace = true }
+futures = { workspace = true }
+orpc = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+
+[features]
+default = []

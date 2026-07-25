@@ -1,6 +1,6 @@
 use clap::Subcommand;
-use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::fs::{CurvineURI, FileSystem, Writer};
+use curvine_fs_api::{CurvineURI, FileSystem, Writer};
+use curvine_unified_fs::UnifiedFileSystem;
 use orpc::CommonResult;
 use std::path::PathBuf;
 use tokio::fs;
