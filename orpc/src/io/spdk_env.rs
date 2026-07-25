@@ -250,7 +250,7 @@ impl QpairPool {
             let mut pool = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let stack = pool.entry(key).or_default();
             if stack.len() >= self.max_per_ctrlr {
-                // Pool full - free immediately to bound controller-side memory.
+                // Pool full — free immediately to bound controller-side memory.
                 drop(pool); // release lock before FFI call
                 unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) };
                 log::trace!(
@@ -271,7 +271,7 @@ impl QpairPool {
         self.release_reservation(key);
         self.notify.notify_one(); // safe to call without holding inner lock
     }
-    /// Free all pooled qpairs. Only frees cached (idle) qpairs — active/in-flight
+    /// Free all pooled qpairs. Only frees cached (idle) qpairs - active/in-flight
     /// qpairs are tracked by their owners and will be released normally.
     fn drain_all(&self) {
         self.shutdown.store(true, Ordering::Release);
