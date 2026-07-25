@@ -1,0 +1,30 @@
+name: Java SDK Compile Check
+
+on:
+  pull_request:
+    paths:
+      - 'curvine-libsdk/java/**'
+      - 'curvine-common/proto/**'
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@v4
+        with:
+          java-version: '8'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Compile Java SDK
+        run: |
+          cd curvine-libsdk/java
+          mvn compile -B -q
+        # protobuf:compile runs automatically (bound to compile phase).
+        # protoc is downloaded from Maven Central via protocArtifact — no separate install needed.
