@@ -17,6 +17,7 @@ use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Qpair pool - reuse NVMe qpairs across handles
 // Lazy allocate, cache on release.
 // Per-controller limits derived from negotiated io_queues of spdk's target
@@ -53,6 +54,7 @@ unsafe impl Send for QpairPool {}
 unsafe impl Sync for QpairPool {}
 impl QpairPool {
     /// Default max idle qpairs per controller (soft cache limit).
+    /// Default max idle qpairs per controller (soft cache limit).
     const DEFAULT_MAX_PER_CTRLR: usize = 16;
     /// Default acquire timeout
     /// TODO: make ACQUIRE_TIMEOUT as a config
@@ -61,6 +63,7 @@ impl QpairPool {
     pub(crate) fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            ctrl_state: Mutex::new(HashMap::new()),
             ctrl_state: Mutex::new(HashMap::new()),
             max_per_ctrlr: Self::DEFAULT_MAX_PER_CTRLR,
             notify: Condvar::new(),
@@ -804,6 +807,23 @@ impl SpdkEnv {
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
+                    // Register per-controller qpair limit from SPDK's negotiated IO queue count.
+                    if let Some(first) = bdevs.first() {
+                        let actual_io_queues = unsafe {
+                            spdk_ffi::curvine_spdk_ctrlr_get_num_io_queues(
+                                first.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr,
+                            )
+                        };
+                        info!(
+                            "Target[{}] {}: requested io_queues={}, actual negotiated={}",
+                            i,
+                            target.endpoint(),
+                            target.io_queues,
+                            actual_io_queues
+                        );
+                        self.qpair_pool
+                            .register_limit(first.ctrlr, actual_io_queues);
+                    }
                     // Register per-controller qpair limit from SPDK's negotiated IO queue count.
                     if let Some(first) = bdevs.first() {
                         let actual_io_queues = unsafe {
