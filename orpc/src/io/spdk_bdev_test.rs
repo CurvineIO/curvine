@@ -1,11 +1,15 @@
 use crate::common::Utils;
 use crate::io::block_io::BlockIO;
 use crate::io::spdk_bdev::SpdkBdev;
-use crate::io::spdk_env::{NvmeTarget, SpdkConf, SpdkEnv, SpdkEnvState};
+use crate::io::spdk_env::{NvmeTarget, QpairPool, SpdkConf, SpdkEnv, SpdkEnvState};
+use crate::io::spdk_ffi;
 use crate::sys::DataSlice;
 use bytes::BytesMut;
+use std::collections::HashMap;
 use std::sync::Once;
-
+use std::sync::{atomic::AtomicBool, Arc, Condvar, Mutex};
+use std::thread;
+use std::time::Duration;
 static INIT: Once = Once::new();
 
 /// Initialize SPDK env once for all tests.
@@ -150,7 +154,7 @@ fn spdk_full_lifecycle() {
             .map(|i| {
                 let name = bdev_name.clone();
                 let b = barrier.clone();
-                std::thread::spawn(move || {
+                thread::spawn(move || {
                     let offset = (i * aligned_len * 2) as i64;
                     let mut bdev = SpdkBdev::open_write(&name, offset, 0).unwrap();
                     let pattern = vec![(i as u8).wrapping_add(0x41); aligned_len];
@@ -175,9 +179,7 @@ fn spdk_full_lifecycle() {
     // Phase 7b: admin polling prevents KATO disconnect
     {
         let conf = test_spdk_conf();
-        std::thread::sleep(std::time::Duration::from_millis(
-            conf.keep_alive_timeout_ms * 3,
-        ));
+        thread::sleep(Duration::from_millis(conf.keep_alive_timeout_ms * 3));
         let env = get_spdk_env();
         assert!(
             !env.bdev_names().is_empty(),
@@ -187,6 +189,95 @@ fn spdk_full_lifecycle() {
         let mut buf = vec![0u8; 512];
         bdev.read_all(&mut buf).unwrap();
         println!("pass admin polling prevents KATO disconnect test");
+    }
+
+    // Phase 7c: qpair pool - release frees when pool is full
+    {
+        let env = get_spdk_env();
+        let bdev = env.bdevs().first().expect("no bdevs");
+        let ctrlr = bdev.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr;
+
+        let p = QpairPool {
+            inner: Mutex::new(HashMap::new()),
+            ctrl_state: Mutex::new(HashMap::new()),
+            notify: Condvar::new(),
+            max_per_ctrlr: 2,
+            shutdown: AtomicBool::new(false),
+        };
+        p.register_limit(ctrlr as usize, 4);
+
+        // Allocate real qpairs and fill pool to capacity
+        let q1 = unsafe { spdk_ffi::curvine_spdk_alloc_io_qpair(ctrlr) };
+        assert!(!q1.is_null());
+        let q2 = unsafe { spdk_ffi::curvine_spdk_alloc_io_qpair(ctrlr) };
+        assert!(!q2.is_null());
+        {
+            let mut pool = p.inner.lock().unwrap();
+            pool.entry(ctrlr as usize).or_default().push(q1);
+            pool.entry(ctrlr as usize).or_default().push(q2);
+        }
+
+        // Allocate one more qpair to release when pool is full
+        let q3 = unsafe { spdk_ffi::curvine_spdk_alloc_io_qpair(ctrlr) };
+        assert!(!q3.is_null());
+
+        // release() with pool full -> should free via FFI, not push
+        p.release(ctrlr, q3);
+
+        // Pool should still have 2 (not 3) - the 3rd was freed
+        let pool = p.inner.lock().unwrap();
+        assert_eq!(pool.get(&(ctrlr as usize)).map_or(0, |s| s.len()), 2);
+        println!("pass release_pool_full_frees_qpair");
+    }
+
+    // Phase 7d: acquire rolls back active count on contention
+    {
+        let env = get_spdk_env();
+        let bdev = env.bdevs().first().expect("no bdevs");
+        let ctrlr = bdev.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr;
+
+        let p = Arc::new(QpairPool {
+            inner: Mutex::new(HashMap::new()),
+            ctrl_state: Mutex::new(HashMap::new()),
+            notify: Condvar::new(),
+            max_per_ctrlr: 16,
+            shutdown: AtomicBool::new(false),
+        });
+        p.register_limit(ctrlr as usize, 1);
+
+        // First acquire → active=1 (at capacity)
+        let q1 = p.acquire(ctrlr).expect("first acquire");
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 1);
+
+        // Second acquire in another thread → blocks (at capacity)
+        let p2 = Arc::clone(&p);
+        let ctrlr_for_thread = ctrlr as usize;
+        let handle = thread::spawn(move || {
+            let ctrlr_ptr = ctrlr_for_thread as *mut spdk_ffi::spdk_nvme_ctrlr;
+            let q = p2.acquire(ctrlr_ptr).expect("second acquire failed");
+            q as usize
+        });
+
+        // Give the thread time to enter the slow path
+        thread::sleep(Duration::from_millis(50));
+
+        // Release first qpair -> unblocks the second acquire
+        p.release(ctrlr, q1);
+
+        let q2_ptr = handle.join().expect("second acquire thread panicked")
+            as *mut spdk_ffi::spdk_nvme_qpair;
+
+        // Active should be 1 (second acquire succeeded, first was released)
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 1);
+
+        // Release second qpair -> active=0
+        p.release(ctrlr, q2_ptr);
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 0);
+
+        println!("pass acquire_contention_active_count_correct");
     }
 
     // Phase 8: shutdown (must be last — destructive)
