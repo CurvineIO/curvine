@@ -53,7 +53,6 @@ unsafe impl Send for QpairPool {}
 unsafe impl Sync for QpairPool {}
 impl QpairPool {
     /// Default max idle qpairs per controller (soft cache limit).
-    /// Default max idle qpairs per controller (soft cache limit).
     const DEFAULT_MAX_PER_CTRLR: usize = 16;
     /// Default acquire timeout
     /// TODO: make ACQUIRE_TIMEOUT as a config

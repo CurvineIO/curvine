@@ -250,7 +250,7 @@ fn spdk_full_lifecycle() {
         let (active, _) = p.controller_stats(ctrlr as usize);
         assert_eq!(active, 1);
 
-        // Second acquire in another thread → blocks (at capacity)
+        // Second acquire in another thread -> blocks (at capacity)
         let p2 = Arc::clone(&p);
         let ctrlr_for_thread = ctrlr as usize;
         let handle = thread::spawn(move || {
