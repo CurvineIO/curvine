@@ -626,6 +626,19 @@ impl NodeState {
         self.dir_write().clear_mark_delete(ino)
     }
 
+    /// Clear inode `mark_delete` and the `deleted_children` entry for a specific
+    /// hardlink name under `parent` (not the inode's primary parent/name).
+    pub fn clear_unlink_state(&self, ino: u64, parent: u64, name: &str) -> FuseResult<()> {
+        let mut dir = self.dir_write();
+        if let Some(inode) = dir.get_inode_mut(ino, None) {
+            inode.mark_delete = false;
+        }
+        if let Ok(parent_dir) = dir.get_dir_mut_check(parent) {
+            parent_dir.clear_deleted_child(name);
+        }
+        Ok(())
+    }
+
     pub fn complete_deferred_delete(
         &self,
         ino: u64,
@@ -640,10 +653,25 @@ impl NodeState {
     }
 
     pub async fn fs_unlink(&self, parent: u64, name: &str) -> FuseResult<()> {
-        let (ino, path) = {
+        let path = {
             let dir = self.dir_read();
-            let inode = dir.get_inode_check(parent, Some(name))?;
-            (inode.ino, dir.get_path_name(parent, name)?)
+            dir.get_path_name(parent, name)?
+        };
+
+        let ino = {
+            let dir = self.dir_read();
+            dir.get_inode(parent, Some(name)).map(|inode| inode.ino)
+        };
+
+        // Kernel may still hold a dentry after our dcache dropped the name
+        // (hardlink + FORGET races). Best-effort delete on master; treat
+        // already-gone as success so recursive cleanup (LTP tst_rmdir) is
+        // not failed by ENOENT on a stale name.
+        let Some(ino) = ino else {
+            return match self.fs.delete(&path, false).await {
+                Ok(()) | Err(FsError::FileNotFound(_)) => Ok(()),
+                Err(e) => Err(e.into()),
+            };
         };
 
         // Always mark for deletion and remove the directory entry first,
@@ -677,14 +705,15 @@ impl NodeState {
             Ok(()) => (),
             Err(FsError::FileNotFound(_)) => (),
             Err(e) => {
-                self.clear_mark_delete(ino)?;
+                self.clear_unlink_state(ino, parent, name)?;
                 return Err(e.into());
             }
         }
 
-        // Clear mark_delete + deleted_child entry now that the server-side
-        // delete has completed.  clear_mark_delete handles both in one lock.
-        self.clear_mark_delete(ino)?;
+        // Clear mark_delete + this name's deleted_child entry now that the
+        // server-side delete has completed (use unlink parent/name, not the
+        // inode primary path — hardlinks share one inode across names).
+        self.clear_unlink_state(ino, parent, name)?;
 
         Ok(())
     }

@@ -267,7 +267,11 @@ impl DirTree {
         let ino = self.get_ino_check(parent, Some(name))?;
         let should_remove = {
             let inode = self.get_inode_mut_check(ino, None)?;
-            if mark_delete {
+            // Only mark the whole inode deleted when removing its last link.
+            // Otherwise remaining hardlink names would see is_deleted() and
+            // LOOKUP would spuriously return ENOENT (LTP prot_hsymlinks cleanup).
+            let last_link = inode.nlink <= 1;
+            if mark_delete && last_link {
                 inode.mark_delete = true;
             }
             inode.sub_ref(1);
@@ -413,8 +417,10 @@ impl DirTree {
         inode.add_link(1);
 
         inode.update_status(status);
-        inode.parent = new_id;
-        inode.name = new_name.to_string();
+        // Hardlinks share one inode across multiple (parent, name) dentries.
+        // Keep the original primary parent/name so get_path / clear_mark_delete
+        // and deferred-delete do not jump to the newest hardlink location.
+        // Unlink/lookup resolve paths via the caller's (parent, name), not these fields.
 
         Ok(inode)
     }
