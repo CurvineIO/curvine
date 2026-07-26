@@ -1489,6 +1489,10 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn unlink(&self, op: Unlink<'_>) -> FuseResult<()> {
         let name = try_option!(op.name.to_str());
+        // Linux VFS may_delete requires MAY_WRITE|MAY_EXEC on the parent directory
+        // (LTP unlink08: unwritable 0555 and unsearchable 0666 parents must EACCES).
+        self.check_permissions(op.header, (libc::W_OK | libc::X_OK) as u32)
+            .await?;
         let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
         self.ensure_writable_path(&path, RpcCode::Delete).await?;
         self.state.fs_unlink(op.header.nodeid, name).await?;
@@ -1829,6 +1833,39 @@ mod tests {
         assert!(CurvineFileSystem::posix_access_requires_mode_check(
             1000,
             libc::R_OK as u32
+        ));
+    }
+
+    #[test]
+    fn unlink_parent_may_delete_requires_write_and_search() {
+        use super::CurvineFileSystem;
+
+        // other class of 0555 (r-x): searchable but not writable
+        let unwritable_other = 0o5;
+        assert!(!CurvineFileSystem::permission_mask_allows(
+            unwritable_other,
+            (libc::W_OK | libc::X_OK) as u32
+        ));
+        assert!(CurvineFileSystem::permission_mask_allows(
+            unwritable_other,
+            libc::X_OK as u32
+        ));
+
+        // other class of 0666 (rw-): writable but not searchable
+        let unsearchable_other = 0o6;
+        assert!(!CurvineFileSystem::permission_mask_allows(
+            unsearchable_other,
+            (libc::W_OK | libc::X_OK) as u32
+        ));
+        assert!(CurvineFileSystem::permission_mask_allows(
+            unsearchable_other,
+            libc::W_OK as u32
+        ));
+
+        // other class of 0777 (rwx): may_delete allowed
+        assert!(CurvineFileSystem::permission_mask_allows(
+            0o7,
+            (libc::W_OK | libc::X_OK) as u32
         ));
     }
 
