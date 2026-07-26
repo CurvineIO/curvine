@@ -44,11 +44,14 @@ pub struct Inode {
 
 impl Inode {
     pub fn new_root() -> Self {
+        // Match master `AclFeature::DEFAULT_MODE` (0o777). A mode-0 placeholder would
+        // fail-closed on every non-root path traverse that walks the mount root.
         let root_st = FileStatus {
             is_dir: true,
             name: FUSE_PATH_SEPARATOR.to_owned(),
             path: FUSE_PATH_SEPARATOR.to_owned(),
             nlink: 2,
+            mode: 0o777,
             ..Default::default()
         };
         let dir = Some(Box::new(DirEntry::new()));

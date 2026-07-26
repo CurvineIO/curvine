@@ -282,6 +282,8 @@ pub const FATTR_ATIME: u32 = 1 << 4;
 
 pub const FATTR_MTIME: u32 = 1 << 5;
 
+pub const FATTR_FH: u32 = 1 << 6;
+
 pub const FATTR_ATIME_NOW: u32 = 1 << 7;
 
 pub const FATTR_MTIME_NOW: u32 = 1 << 8;

@@ -456,17 +456,27 @@ impl CurvineFileSystem {
             }
         };
 
+        let meta_ttl = self.conf.meta_cache_ttl.as_millis() as u64;
         while dir_ino != 0 {
             let check_header = fuse_in_header {
                 uid: header.uid,
                 gid: header.gid,
+                pid: header.pid,
                 nodeid: dir_ino,
                 ..Default::default()
             };
+            // Only trust ACL bits from a valid dcache entry. The mount-root placeholder
+            // starts as Lifecycle::Invalid; using it fail-closes every non-root traverse
+            // with EACCES (breaks LTP chmod/chown under nobody).
             let cached_status = {
                 let dir = self.state.dir_read();
-                dir.get_inode(dir_ino, None)
-                    .map(|inode| inode.clone_status())
+                dir.get_inode(dir_ino, None).and_then(|inode| {
+                    if inode.cache_valid(meta_ttl) {
+                        Some(inode.clone_status())
+                    } else {
+                        None
+                    }
+                })
             };
             if let Some(status) = cached_status {
                 self.check_access_permissions(&status, &check_header, libc::X_OK as u32)?;
@@ -501,6 +511,7 @@ impl CurvineFileSystem {
             status.mode,
             header.uid,
             header.gid,
+            header.pid,
             file_uid,
             file_gid,
         );
@@ -572,19 +583,23 @@ impl CurvineFileSystem {
         }
     }
 
-    /// Determine which permission bits to check based on user relationship to file
+    /// Determine which permission bits to check based on user relationship to file.
+    ///
+    /// Group membership includes the caller's effective gid and supplementary groups
+    /// from `/proc/<pid>/status` (same source as setattr setgid checks).
     fn get_effective_permission_bits(
         &self,
         mode: u32,
         current_uid: u32,
         current_gid: u32,
+        caller_pid: u32,
         file_uid: u32,
         file_gid: u32,
     ) -> u32 {
         if current_uid == file_uid {
             // Owner permissions (bits 8-10)
             (mode >> 6) & 0o7
-        } else if current_gid == file_gid {
+        } else if FuseUtils::caller_in_file_group(current_gid, file_gid, caller_pid) {
             // Group permissions (bits 5-7)
             (mode >> 3) & 0o7
         } else {
@@ -1089,7 +1104,10 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let mode_only = (op.arg.valid & (FATTR_UID | FATTR_GID | FATTR_SIZE)) == 0
             && (op.arg.valid & FATTR_MODE) != 0;
-        let skip_traverse = op.arg.fh != 0 || (mode_only && op.header.uid == file_uid);
+        // Path-based chmod must still traverse; fh-based fchmod/fchown must not
+        // (POSIX open-file descriptors do not re-check path search permission).
+        let skip_traverse =
+            (op.arg.valid & FATTR_FH) != 0 || (mode_only && op.header.uid == file_uid);
 
         if !skip_traverse {
             self.check_traverse_permissions(op.header.nodeid, op.header)
