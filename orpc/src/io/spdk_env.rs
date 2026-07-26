@@ -135,18 +135,6 @@ impl QpairPool {
         ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
     ) -> CommonResult<*mut spdk_ffi::spdk_nvme_qpair> {
         let key = ctrlr as usize;
-        // Fail fast if this controller has 0 negotiated IO queues
-        {
-            let state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(ctrl) = state.get(&key) {
-                if ctrl.max_active == 0 {
-                    return err_box!(
-                        "QpairPool: ctrlr {:p} has 0 negotiated IO queues, qpair acquisition disabled",
-                        ctrlr
-                    );
-                }
-            }
-        }
         {
             let mut pool = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(stack) = pool.get_mut(&key) {
