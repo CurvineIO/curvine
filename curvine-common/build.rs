@@ -17,31 +17,12 @@ use std::process::Command;
 use std::{env, fs, str};
 
 fn main() {
-    // Non-raft protos are owned by curvine-proto (compiled from this same
-    // curvine-common/proto directory for Java/Python SDK compatibility).
-    // curvine-common only generates raft bindings plus VERSION metadata.
-    let proto_files = ["proto/raft.proto", "proto/eraftpb.proto"];
-
-    // Emitting any rerun-if-changed disables Cargo's default "watch whole package"
-    // heuristic, so proto inputs must be listed explicitly alongside Git paths.
-    for path in &proto_files {
-        println!("cargo:rerun-if-changed={path}");
-    }
+    // Non-raft protos are owned by curvine-proto and raft protos are owned by
+    // curvine-raft. curvine-common only generates VERSION metadata.
     emit_git_rerun_if_changed();
 
-    let base = env::var("OUT_DIR").unwrap_or_else(|_| ".".to_string());
-    let output = format!("{}/protos", base);
-    fs::create_dir_all(&output).unwrap();
-
-    let src = vec!["raft.proto"];
-    let mut build = prost_build::Config::new();
-    build
-        .out_dir(&output)
-        .extern_path(".eraftpb", "::raft::eraftpb")
-        .compile_protos(&src, &["proto/", ""])
-        .unwrap();
-
     // Build version number file
+    let base = env::var("OUT_DIR").unwrap_or_else(|_| ".".to_string());
     let ver_file = format!("{}/version.rs", base);
     let commit = get_git_head_commit();
     let pkg_version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_string());

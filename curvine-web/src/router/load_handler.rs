@@ -19,7 +19,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use curvine_client::rpc::JobMasterClient;
+use curvine_job_client::JobMasterClient;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

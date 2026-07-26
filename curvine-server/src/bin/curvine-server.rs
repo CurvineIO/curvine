@@ -15,8 +15,8 @@
 use clap::Parser;
 use curvine_common::conf::ClusterConf;
 use curvine_common::version;
-use curvine_server::master::Master;
-use curvine_server::worker::Worker;
+use curvine_master::master::Master;
+use curvine_worker::worker::Worker;
 use orpc::common::{LocalTime, Utils};
 use orpc::{err_box, CommonResult};
 

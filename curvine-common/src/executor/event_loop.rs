@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::raft::RoleState;
 use log::error;
 use orpc::runtime::MutEvent;
 use orpc::server::ServerState;
@@ -86,8 +85,8 @@ where
         F: MutEvent<T, E> + Send + 'static,
         E: Error + From<String>,
     {
-        // @todo Modify.
-        while ctl.value() < RoleState::Exit.into() {
+        // The dependency state uses raft role values when driven by the master journal.
+        while ctl.value() < 3 {
             let event = match receiver.recv_timeout(dur) {
                 Ok(v) => Some(v),
                 Err(RecvTimeoutError::Timeout) => None,

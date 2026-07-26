@@ -1,0 +1,31 @@
+[package]
+name = "curvine-raft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Curvine raft journal implementation."
+
+[dependencies]
+curvine-common = { workspace = true }
+curvine-error = { workspace = true }
+curvine-rocksdb = { workspace = true }
+orpc = { workspace = true }
+raft = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+log = { workspace = true }
+num_enum = { workspace = true }
+slog = { workspace = true }
+slog-stdlog = { workspace = true }
+mini-moka = { workspace = true }
+flate2 = { workspace = true }
+rocksdb = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
+
+[features]
+default = []

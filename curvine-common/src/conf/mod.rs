@@ -27,6 +27,9 @@ pub use self::worker_conf::*;
 mod cluster_conf;
 pub use self::cluster_conf::*;
 
+mod raft_peer;
+pub use self::raft_peer::RaftPeer;
+
 mod journal_conf;
 pub use self::journal_conf::JournalConf;
 

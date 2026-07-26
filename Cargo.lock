@@ -2025,7 +2025,6 @@ dependencies = [
  "async-stream",
  "bincode",
  "bitflags 2.10.0",
- "byteorder",
  "bytes",
  "chrono",
  "clap",
@@ -2037,6 +2036,7 @@ dependencies = [
  "curvine-fs-api",
  "curvine-model",
  "curvine-proto",
+ "curvine-rocksdb",
  "curvine-storage-api",
  "dashmap 5.5.3",
  "flate2",
@@ -2054,9 +2054,7 @@ dependencies = [
  "percent-encoding",
  "prost 0.11.9",
  "prost-build 0.11.9",
- "raft",
  "regex",
- "rocksdb",
  "serde",
  "serde_json",
  "slog",
@@ -2095,6 +2093,20 @@ dependencies = [
  "orpc",
  "serde",
  "toml",
+]
+
+[[package]]
+name = "curvine-data-mover"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "curvine-client-core",
+ "curvine-common",
+ "curvine-ufs",
+ "curvine-unified-fs",
+ "log",
+ "orpc",
+ "prost 0.11.9",
 ]
 
 [[package]]
@@ -2271,6 +2283,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-master"
+version = "0.2.0"
+dependencies = [
+ "axum",
+ "bincode",
+ "byteorder",
+ "bytes",
+ "chrono",
+ "clap",
+ "curvine-common",
+ "curvine-data-mover",
+ "curvine-error",
+ "curvine-fault",
+ "curvine-raft",
+ "curvine-rocksdb",
+ "curvine-unified-fs",
+ "curvine-web",
+ "dashmap 5.5.3",
+ "futures",
+ "glob",
+ "indexmap 2.14.0",
+ "linked-hash-map",
+ "log",
+ "lru 0.16.1",
+ "mini-moka",
+ "num_enum",
+ "once_cell",
+ "orpc",
+ "parking_lot",
+ "prost 0.11.9",
+ "raft",
+ "rand 0.8.5",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "curvine-model"
 version = "0.2.0"
 dependencies = [
@@ -2299,6 +2354,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-raft"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "curvine-common",
+ "curvine-error",
+ "curvine-rocksdb",
+ "flate2",
+ "log",
+ "mini-moka",
+ "num_enum",
+ "orpc",
+ "prost 0.11.9",
+ "prost-build 0.11.9",
+ "raft",
+ "rocksdb",
+ "serde",
+ "slog",
+ "slog-stdlog",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "curvine-rocksdb"
+version = "0.2.0"
+dependencies = [
+ "byteorder",
+ "log",
+ "orpc",
+ "prost 0.11.9",
+ "rocksdb",
+ "serde",
+]
+
+[[package]]
 name = "curvine-sdk-core"
 version = "0.2.0"
 dependencies = [
@@ -2323,13 +2414,17 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
- "curvine-client",
+ "curvine-client-core",
  "curvine-common",
+ "curvine-data-mover",
  "curvine-error",
  "curvine-fault",
- "curvine-storage-spdk",
+ "curvine-master",
+ "curvine-raft",
+ "curvine-rocksdb",
  "curvine-ufs",
  "curvine-web",
+ "curvine-worker",
  "dashmap 5.5.3",
  "futures",
  "glob",
@@ -2361,6 +2456,21 @@ name = "curvine-storage-api"
 version = "0.2.0"
 dependencies = [
  "curvine-model",
+]
+
+[[package]]
+name = "curvine-storage-local"
+version = "0.2.0"
+dependencies = [
+ "byteorder",
+ "bytes",
+ "curvine-common",
+ "curvine-rocksdb",
+ "curvine-storage-spdk",
+ "indexmap 2.14.0",
+ "log",
+ "orpc",
+ "serde",
 ]
 
 [[package]]
@@ -2486,8 +2596,8 @@ name = "curvine-web"
 version = "0.2.0"
 dependencies = [
  "axum",
- "curvine-client",
  "curvine-common",
+ "curvine-job-client",
  "log",
  "orpc",
  "serde",
@@ -2495,6 +2605,50 @@ dependencies = [
  "tokio",
  "tower 0.4.13",
  "tower-http 0.5.2",
+]
+
+[[package]]
+name = "curvine-worker"
+version = "0.2.0"
+dependencies = [
+ "axum",
+ "bincode",
+ "byteorder",
+ "bytes",
+ "chrono",
+ "clap",
+ "curvine-client-core",
+ "curvine-common",
+ "curvine-data-mover",
+ "curvine-error",
+ "curvine-fault",
+ "curvine-job-client",
+ "curvine-storage-local",
+ "curvine-storage-spdk",
+ "curvine-unified-fs",
+ "curvine-web",
+ "dashmap 5.5.3",
+ "futures",
+ "glob",
+ "indexmap 2.14.0",
+ "linked-hash-map",
+ "log",
+ "lru 0.16.1",
+ "mini-moka",
+ "num_enum",
+ "once_cell",
+ "orpc",
+ "parking_lot",
+ "prost 0.11.9",
+ "rand 0.8.5",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "url",
+ "uuid",
 ]
 
 [[package]]

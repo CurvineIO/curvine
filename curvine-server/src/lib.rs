@@ -12,13 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod common;
-pub mod master;
+pub use curvine_data_mover::common;
+pub use curvine_master::master;
 pub mod test;
-pub mod worker;
-
-#[cfg(feature = "fault-injection")]
-pub(crate) use curvine_fault::fault_point;
-
-#[cfg(not(feature = "fault-injection"))]
-pub(crate) use curvine_fault::__noop_fault_point as fault_point;
+pub use curvine_worker::worker;

@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::conf::ClusterConf;
-use crate::raft::{RaftGroup, RaftPeer};
-use crate::rocksdb::DBConf;
-use crate::FsResult;
+use crate::conf::RaftPeer;
+use crate::{FsError, FsResult};
+use curvine_rocksdb::DBConf;
 use orpc::client::ClientConf;
 use orpc::common::{ByteUnit, Utils};
 use orpc::io::net::{InetAddr, NetUtils};
@@ -151,9 +151,12 @@ impl JournalConf {
     }
 
     pub fn node_id(&self) -> FsResult<u64> {
-        let group = RaftGroup::from_conf(self);
-        let id = group.get_node_id(&self.local_addr())?;
-        Ok(id)
+        let local = self.local_addr();
+        self.journal_addrs
+            .iter()
+            .find(|peer| peer.hostname == local.hostname && peer.port == local.port)
+            .map(|peer| peer.id)
+            .ok_or_else(|| FsError::common(format!("Not a master role, address {}", local)))
     }
 
     pub fn new_client_conf(&self) -> ClientConf {
@@ -179,26 +182,6 @@ impl JournalConf {
             conn_size: self.conn_size,
 
             use_libc: false,
-            ..Default::default()
-        }
-    }
-
-    pub fn new_raft_conf(&self, id: u64, applied: u64) -> raft::Config {
-        raft::Config {
-            id,
-            election_tick: self.raft_election_tick,
-            heartbeat_tick: self.raft_heartbeat_tick,
-            min_election_tick: self.raft_min_election_ticks,
-            max_election_tick: self.raft_max_election_ticks,
-            max_size_per_msg: self.raft_max_size_per_msg,
-            max_inflight_msgs: self.raft_max_inflight_msgs,
-            applied,
-            max_committed_size_per_ready: self.raft_max_committed_size_per_ready,
-
-            check_quorum: self.raft_check_quorum,
-            skip_bcast_commit: true,
-            pre_vote: true,
-            batch_append: true,
             ..Default::default()
         }
     }

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::conf::ClusterConf;
-use crate::rocksdb::DBConf;
+use curvine_rocksdb::DBConf;
 use orpc::common::{ByteUnit, DurationUnit, LogConf, Utils};
 use orpc::runtime::GroupExecutor;
 use orpc::{err_box, CommonResult};
