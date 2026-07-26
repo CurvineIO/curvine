@@ -12,18 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::core::job;
 use crate::java::JavaUtils;
 use crate::{FilesystemConf, LibFilesystem, LibFsReader, LibFsWriter};
-use curvine_common::error::FsError;
-use curvine_common::proto::{
+use curvine_error::{FsError, FsResult};
+use curvine_fs_api::proto::{
     GetJobStatusResponse, GetMountTableResponse, MountOptionsProto, SetAttrOptsProto,
     SubmitJobResponse,
 };
-use curvine_common::state::LoadJobCommand;
-use curvine_common::state::SetAttrOpts;
-use curvine_common::utils::ProtoUtils;
-use curvine_common::FsResult;
+use curvine_fs_api::state::{LoadJobCommand, SetAttrOpts};
+use curvine_fs_api::utils::ProtoUtils;
+use curvine_sdk_core::blocking_job as job;
 use jni::objects::{JByteArray, JString};
 use jni::sys::{jarray, jboolean, jstring};
 use jni::JNIEnv;
@@ -34,7 +32,7 @@ pub struct JavaFilesystem {
     inner: LibFilesystem,
 }
 
-fn decode_mount_options(bytes: &[u8]) -> FsResult<curvine_common::state::MountOptions> {
+fn decode_mount_options(bytes: &[u8]) -> FsResult<curvine_fs_api::state::MountOptions> {
     if bytes.is_empty() {
         return err_box!("mount options cannot be empty");
     }

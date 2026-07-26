@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::core::Session;
-use curvine_common::state::MasterInfo;
-use curvine_common::FsResult;
+use curvine_error::FsResult;
+use curvine_model::MasterInfo;
 use orpc::runtime::RpcRuntime;
 
 pub fn get_master_info(session: &Session) -> FsResult<MasterInfo> {

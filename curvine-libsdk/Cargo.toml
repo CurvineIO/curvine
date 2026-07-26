@@ -9,42 +9,32 @@ crate-type = ["rlib", "cdylib"]
 name = "curvine_libsdk"
 
 [features]
-default = ["java-sdk", "opendal-s3"]
-rust-sdk = []
-java-sdk = ["dep:jni"]
-python-sdk = ["dep:pyo3"]
+default = ["java-sdk"]
+rust-sdk = ["curvine-sdk-core/rust-sdk"]
+java-sdk = ["dep:curvine-libsdk-java"]
+python-sdk = ["dep:curvine-libsdk-python", "curvine-libsdk-python/extension-module"]
 
-# Forward optional UFS backends from curvine-client so Java/Python/Rust
-# consumers can enable them without depending on curvine-client directly.
-# The default SDK build keeps the historical OpenDAL S3 backend. Consumers that
-# need a lighter SDK can use `default-features = false` and opt in explicitly.
-opendal-s3 = ["curvine-client/opendal-s3"]
-opendal-oss = ["curvine-client/opendal-oss"]
-opendal-gcs = ["curvine-client/opendal-gcs"]
-opendal-azblob = ["curvine-client/opendal-azblob"]
-opendal-cos = ["curvine-client/opendal-cos"]
-opendal-hdfs = ["curvine-client/opendal-hdfs"]
-opendal-webhdfs = ["curvine-client/opendal-webhdfs"]
-opendal-hdfs-native = ["curvine-client/opendal-hdfs-native"]
-oss-hdfs = ["curvine-client/oss-hdfs"]
+# Explicit minimal SDK profiles. These only select the language binding and
+# keep UFS/native storage adapters disabled unless a backend feature below is
+# requested.
+java-sdk-minimal = ["java-sdk"]
+python-sdk-minimal = ["python-sdk"]
+
+# Optional UFS release profiles. Public OpenDAL backends are opt-in; the
+# OSS-HDFS/Jindo profile remains internal and explicit because it links native
+# vendor libraries.
+opendal-s3 = ["curvine-sdk-core/opendal-s3", "curvine-libsdk-java?/opendal-s3", "curvine-libsdk-python?/opendal-s3"]
+opendal-oss = ["curvine-sdk-core/opendal-oss", "curvine-libsdk-java?/opendal-oss", "curvine-libsdk-python?/opendal-oss"]
+opendal-gcs = ["curvine-sdk-core/opendal-gcs", "curvine-libsdk-java?/opendal-gcs", "curvine-libsdk-python?/opendal-gcs"]
+opendal-azblob = ["curvine-sdk-core/opendal-azblob", "curvine-libsdk-java?/opendal-azblob", "curvine-libsdk-python?/opendal-azblob"]
+opendal-cos = ["curvine-sdk-core/opendal-cos", "curvine-libsdk-java?/opendal-cos", "curvine-libsdk-python?/opendal-cos"]
+opendal-webhdfs = ["curvine-sdk-core/opendal-webhdfs", "curvine-libsdk-java?/opendal-webhdfs", "curvine-libsdk-python?/opendal-webhdfs"]
+opendal-hdfs = ["curvine-sdk-core/opendal-hdfs", "curvine-libsdk-java?/opendal-hdfs", "curvine-libsdk-python?/opendal-hdfs"]
+opendal-hdfs-native = ["curvine-sdk-core/opendal-hdfs-native", "curvine-libsdk-java?/opendal-hdfs-native", "curvine-libsdk-python?/opendal-hdfs-native"]
+internal-oss-hdfs-jindo = ["curvine-sdk-core/internal-oss-hdfs-jindo", "curvine-libsdk-java?/internal-oss-hdfs-jindo", "curvine-libsdk-python?/internal-oss-hdfs-jindo"]
+oss-hdfs = ["internal-oss-hdfs-jindo"]
 
 [dependencies]
-orpc = { workspace = true }
-curvine-client = { workspace = true, features = ["job-client", "unified"] }
-curvine-common = { workspace = true }
-curvine-config = { workspace = true }
-once_cell = { workspace = true }
-tracing = { workspace = true }
-tracing-appender = { workspace = true }
-tracing-subscriber = { workspace = true }
-log = { workspace = true }
-tokio = { workspace = true }
-futures =  { workspace = true }
-bytes = { workspace = true }
-pin-project-lite = { workspace = true }
-dashmap = { workspace = true }
-toml = { workspace = true }
-serde = { workspace = true }
-prost = { workspace = true }
-jni = { version = "0.21.1", optional = true }
-pyo3 = { version = "0.25.1", features = ["extension-module","abi3-py38","num-complex"], optional = true }
+curvine-sdk-core = { workspace = true }
+curvine-libsdk-java = { workspace = true, optional = true }
+curvine-libsdk-python = { workspace = true, optional = true }

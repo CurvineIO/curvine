@@ -1,6 +1,7 @@
 use crate::{LibFilesystem, LibFsReader, LibFsWriter};
 use bytes::BytesMut;
-use curvine_common::{conf::ClusterConf, FsResult};
+use curvine_config::ClusterConf;
+use curvine_error::FsResult;
 use pyo3::prelude::*;
 
 //Define the PythonFilesystem struct

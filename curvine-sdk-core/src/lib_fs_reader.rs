@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use curvine_client::unified::UnifiedReader;
-use curvine_common::fs::{Path, Reader};
-use curvine_common::FsResult;
+use curvine_error::FsResult;
+use curvine_fs_api::{Path, Reader};
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::DataSlice;
 use std::sync::Arc;

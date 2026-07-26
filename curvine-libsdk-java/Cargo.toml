@@ -1,0 +1,26 @@
+[package]
+name = "curvine-libsdk-java"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+opendal-s3 = ["curvine-sdk-core/opendal-s3"]
+opendal-oss = ["curvine-sdk-core/opendal-oss"]
+opendal-gcs = ["curvine-sdk-core/opendal-gcs"]
+opendal-azblob = ["curvine-sdk-core/opendal-azblob"]
+opendal-cos = ["curvine-sdk-core/opendal-cos"]
+opendal-webhdfs = ["curvine-sdk-core/opendal-webhdfs"]
+opendal-hdfs = ["curvine-sdk-core/opendal-hdfs"]
+opendal-hdfs-native = ["curvine-sdk-core/opendal-hdfs-native"]
+oss-hdfs = ["curvine-sdk-core/oss-hdfs"]
+internal-oss-hdfs-jindo = ["curvine-sdk-core/internal-oss-hdfs-jindo"]
+
+[dependencies]
+curvine-sdk-core = { workspace = true }
+curvine-error = { workspace = true }
+curvine-fs-api = { workspace = true }
+jni = "0.21.1"
+orpc = { workspace = true }
+prost = { workspace = true }

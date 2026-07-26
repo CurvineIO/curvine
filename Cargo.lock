@@ -2328,25 +2328,31 @@ dependencies = [
 name = "curvine-libsdk"
 version = "0.2.0"
 dependencies = [
- "bytes",
- "curvine-client",
- "curvine-common",
- "curvine-config",
- "dashmap 5.5.3",
- "futures",
+ "curvine-libsdk-java",
+ "curvine-libsdk-python",
+ "curvine-sdk-core",
+]
+
+[[package]]
+name = "curvine-libsdk-java"
+version = "0.2.0"
+dependencies = [
+ "curvine-error",
+ "curvine-sdk-core",
  "jni",
- "log",
- "once_cell",
  "orpc",
- "pin-project-lite",
- "prost 0.11.9",
+]
+
+[[package]]
+name = "curvine-libsdk-python"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "curvine-config",
+ "curvine-error",
+ "curvine-sdk-core",
+ "orpc",
  "pyo3",
- "serde",
- "tokio",
- "toml",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -2375,6 +2381,21 @@ dependencies = [
  "prost 0.11.9",
  "prost-build 0.11.9",
  "serde",
+]
+
+[[package]]
+name = "curvine-sdk-core"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "curvine-client",
+ "curvine-config",
+ "curvine-error",
+ "curvine-fs-api",
+ "curvine-model",
+ "orpc",
+ "serde",
+ "toml",
 ]
 
 [[package]]

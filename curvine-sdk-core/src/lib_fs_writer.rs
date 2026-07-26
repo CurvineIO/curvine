@@ -14,10 +14,10 @@
 
 use bytes::BytesMut;
 use curvine_client::unified::UnifiedWriter;
-use curvine_common::fs::{Path, Writer};
-use curvine_common::state::FileStatus;
-use curvine_common::FsResult;
 use curvine_config::ClusterConf;
+use curvine_error::FsResult;
+use curvine_fs_api::{Path, Writer};
+use curvine_model::FileStatus;
 use orpc::err_box;
 use orpc::handler::FrameBuf;
 use orpc::runtime::{RpcRuntime, Runtime};

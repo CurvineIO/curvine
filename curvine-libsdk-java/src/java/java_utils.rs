@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::error::FsError;
+use curvine_error::FsError;
 use jni::objects::{JObject, JString, JThrowable, JValue};
 use jni::sys::{jarray, jboolean, jstring, JNI_TRUE};
 use jni::JNIEnv;

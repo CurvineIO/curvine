@@ -12,19 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use curvine_sdk_core::{FilesystemConf, LibFilesystem, LibFsReader, LibFsWriter};
-
-#[cfg(feature = "rust-sdk")]
-pub use curvine_sdk_core::filesystem;
-#[cfg(feature = "rust-sdk")]
-pub use curvine_sdk_core::job;
-#[cfg(feature = "rust-sdk")]
-pub use curvine_sdk_core::lib_curvine;
-#[cfg(feature = "rust-sdk")]
-pub use curvine_sdk_core::master;
-
-#[cfg(feature = "python-sdk")]
-pub use curvine_libsdk_python as python;
-
-#[cfg(feature = "java-sdk")]
-pub use curvine_libsdk_java as java;
+fn main() {
+    println!("cargo:rustc-env=CFLAGS=\"-O3 -Werror -Wno-attributes -fPIC -fno-omit-frame-pointer -Wunused-variable -fvisibility=hidden\"");
+    println!("cargo:rustc-env=LDFLAGS=\"-Wl,--no-as-needed -lrt -Wl\"");
+}

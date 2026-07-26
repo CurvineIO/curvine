@@ -1,0 +1,30 @@
+[package]
+name = "curvine-sdk-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+rust-sdk = []
+opendal-s3 = ["curvine-client/opendal-s3"]
+opendal-oss = ["curvine-client/opendal-oss"]
+opendal-gcs = ["curvine-client/opendal-gcs"]
+opendal-azblob = ["curvine-client/opendal-azblob"]
+opendal-cos = ["curvine-client/opendal-cos"]
+opendal-webhdfs = ["curvine-client/opendal-webhdfs"]
+opendal-hdfs = ["curvine-client/opendal-hdfs"]
+opendal-hdfs-native = ["curvine-client/opendal-hdfs-native"]
+oss-hdfs = ["curvine-client/oss-hdfs"]
+internal-oss-hdfs-jindo = ["oss-hdfs"]
+
+[dependencies]
+curvine-client = { workspace = true, default-features = false, features = ["job-client", "unified"] }
+curvine-config = { workspace = true }
+curvine-error = { workspace = true }
+curvine-fs-api = { workspace = true }
+curvine-model = { workspace = true }
+bytes = { workspace = true }
+orpc = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
