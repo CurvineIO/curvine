@@ -17,12 +17,12 @@ use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::{Inode, InodeFile, InodePath, InodePtr, InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
-use curvine_common::state::{BlockLocation, CommitBlock, FileLock, FileStatus, MountInfo};
-use curvine_common::utils::SerdeUtils;
+use curvine_common_core::state::{BlockLocation, CommitBlock, FileLock, FileStatus, MountInfo};
+use curvine_common_core::utils::SerdeUtils;
 use curvine_rocksdb::{DBConf, RocksUtils};
 use log::info;
-use orpc::common::{FileUtils, Utils};
-use orpc::{err_box, try_err, try_option, CommonResult};
+use orpc_rpc::common::{FileUtils, Utils};
+use orpc_rpc::{err_box, try_err, try_option, CommonResult};
 use std::collections::{HashMap, HashSet, LinkedList, VecDeque};
 use std::sync::Arc;
 

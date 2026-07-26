@@ -6,7 +6,7 @@ license.workspace = true
 description = "Curvine RocksDB metadata adapter."
 
 [dependencies]
-orpc = { workspace = true }
+orpc-rpc = { workspace = true }
 rocksdb = { workspace = true }
 serde = { workspace = true }
 prost = { workspace = true }

@@ -13,17 +13,17 @@
 // limitations under the License.
 
 use bytes::{BufMut, BytesMut};
-use orpc::client::ClientFactory;
-use orpc::common::Utils;
-use orpc::error::CommonErrorExt;
-use orpc::io::net::{InetAddr, NetUtils};
-use orpc::message::{Builder, Message, RequestStatus};
-use orpc::runtime::RpcRuntime;
-use orpc::server::{RpcServer, ServerConf};
-use orpc::sys::DataSlice;
-use orpc::test::file::dir_location::DirLocation;
-use orpc::test::file::file_handler::{FileService, RpcCode};
-use orpc::CommonResult;
+use orpc_rpc::client::ClientFactory;
+use orpc_rpc::common::Utils;
+use orpc_rpc::error::CommonErrorExt;
+use orpc_rpc::io::net::{InetAddr, NetUtils};
+use orpc_rpc::message::{Builder, Message, RequestStatus};
+use orpc_rpc::runtime::RpcRuntime;
+use orpc_rpc::server::{RpcServer, ServerConf};
+use orpc_rpc::sys::DataSlice;
+use orpc_rpc::test::file::dir_location::DirLocation;
+use orpc_rpc::test::file::file_handler::{FileService, RpcCode};
+use orpc_rpc::CommonResult;
 
 #[test]
 fn test_distributed_file_location_and_creation() {

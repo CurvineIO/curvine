@@ -18,11 +18,11 @@ use crate::fs::{FuseReader, FuseWriter};
 use crate::raw::fuse_abi::fuse_write_out;
 use crate::session::FuseResponse;
 use crate::{err_fuse, FuseError, FuseResult, FuseUtils};
-use curvine_common::fs::{Path, StateReader, StateWriter};
-use curvine_common::state::{CreateFileOptsBuilder, FileStatus, LockFlags, OpenFlags};
-use orpc::err_box;
-use orpc::sync::AtomicCounter;
-use orpc::sys::RawPtr;
+use curvine_fs_api::{Path, StateReader, StateWriter};
+use curvine_model::{CreateFileOptsBuilder, FileStatus, LockFlags, OpenFlags};
+use orpc_rpc::err_box;
+use orpc_rpc::sync::AtomicCounter;
+use orpc_rpc::sys::RawPtr;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -324,7 +324,7 @@ mod tests {
     // After dirty-read reopen, `status()` must reflect the reopened file snapshot.
     #[test]
     fn refresh_status_updates_snapshot_through_shared_ref() {
-        use curvine_common::state::FileStatus;
+        use curvine_model::FileStatus;
 
         let mut open_status = FileStatus::with_name(1, "f".to_string(), false);
         open_status.len = 100;

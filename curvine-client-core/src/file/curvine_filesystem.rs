@@ -29,9 +29,9 @@ use curvine_model::{
 };
 use log::info;
 use log::warn;
-use orpc::client::ClientConf;
-use orpc::err_box;
-use orpc::runtime::{RpcRuntime, Runtime};
+use orpc_rpc::client::ClientConf;
+use orpc_rpc::err_box;
+use orpc_rpc::runtime::{RpcRuntime, Runtime};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;

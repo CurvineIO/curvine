@@ -15,10 +15,10 @@
 use crate::proto::{AppliedIndex, FsmState, SnapshotData};
 use crate::storage::{AppStorage, ApplyMsg};
 use crate::{RaftResult, RaftUtils};
-use curvine_common::utils::SerdeUtils;
+use curvine_common_core::utils::SerdeUtils;
 use curvine_rocksdb::DBEngine;
-use orpc::common::LocalTime;
-use orpc::{try_err, try_option_ref, CommonResult};
+use orpc_rpc::common::LocalTime;
+use orpc_rpc::{try_err, try_option_ref, CommonResult};
 use raft::StateRole;
 use serde::de::DeserializeOwned;
 use serde::Serialize;

@@ -22,12 +22,12 @@ path = "tests/lancedb_object_store_e2e.rs"
 required-features = ["lancedb"]
 
 [dependencies]
-orpc = { workspace = true }
-curvine-common = { workspace = true }
+orpc-rpc = { workspace = true }
+curvine-common-core = { workspace = true }
 curvine-server = { workspace = true }
 curvine-client = { workspace = true, features = ["job-client", "unified", "opendal-s3"] }
 curvine-lancedb = { workspace = true, optional = true }
-curvine-ufs = { workspace = true }
+curvine-ufs-api = { workspace = true }
 tokio  = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }

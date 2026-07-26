@@ -15,8 +15,8 @@
 use crate::{RaftResult, RaftUtils};
 use flate2::read::ZlibDecoder;
 use log::warn;
-use orpc::common::Utils;
-use orpc::io::LocalFile;
+use orpc_rpc::common::Utils;
+use orpc_rpc::io::LocalFile;
 use prost::bytes::BytesMut;
 
 // Decompress the compressed data block and write it to the file.

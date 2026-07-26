@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::fs::{ListStream, Path};
-use curvine_common::state::FileStatus;
-use curvine_common::FsResult;
+use curvine_error::FsResult;
+use curvine_fs_api::{ListStream, Path};
+use curvine_model::FileStatus;
 use futures::StreamExt;
 use log::info;
-use orpc::err_box;
+use orpc_rpc::err_box;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::mem;

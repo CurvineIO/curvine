@@ -18,8 +18,8 @@ use prost::bytes::BytesMut;
 use prost::Message;
 use raft::eraftpb::Entry;
 use bytes::BufMut;
-use orpc::err_box;
-use orpc::os::LocalFile;
+use orpc_rpc::err_box;
+use orpc_rpc::os::LocalFile;
 use crate::RaftResult;
 
 pub struct LogSegment {

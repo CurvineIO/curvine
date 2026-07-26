@@ -13,14 +13,14 @@
 // limitations under the License.
 
 use crate::JobWorkerClient;
-use curvine_common::conf::ClientConf;
-use curvine_common::state::{MountInfo, WorkerAddress};
-use curvine_common::FsResult;
+use curvine_common_core::conf::ClientConf;
+use curvine_common_core::state::{MountInfo, WorkerAddress};
+use curvine_common_core::FsResult;
 use curvine_unified_fs::{MountValue, UfsFileSystem};
-use orpc::client::ClientFactory;
-use orpc::io::net::InetAddr;
-use orpc::runtime::Runtime;
-use orpc::sync::FastSyncCache;
+use orpc_rpc::client::ClientFactory;
+use orpc_rpc::io::net::InetAddr;
+use orpc_rpc::runtime::Runtime;
+use orpc_rpc::sync::FastSyncCache;
 use std::sync::Arc;
 use std::time::Duration;
 

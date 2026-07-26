@@ -26,6 +26,6 @@ internal-oss-hdfs-jindo = ["curvine-sdk-core/internal-oss-hdfs-jindo"]
 curvine-sdk-core = { workspace = true }
 curvine-config = { workspace = true }
 curvine-error = { workspace = true }
-orpc = { workspace = true }
+orpc-rpc = { workspace = true }
 bytes = { workspace = true }
 pyo3 = { version = "0.25.1", features = ["abi3-py38", "num-complex"] }

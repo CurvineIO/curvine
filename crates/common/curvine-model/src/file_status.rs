@@ -14,8 +14,8 @@
 
 use crate::state::{FileType, StoragePolicy, TtlAction};
 use crate::UFS_INODE_ID;
-use orpc::common::LocalTime;
-use orpc::ternary;
+use orpc_rpc::common::LocalTime;
+use orpc_rpc::ternary;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

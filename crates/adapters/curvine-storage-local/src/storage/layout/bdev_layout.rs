@@ -15,16 +15,16 @@
 use crate::storage::layout::{validate_open_offset, BlockLayout};
 use crate::storage::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};
 use crate::{BlockMeta, BlockState};
-use curvine_common::state::ExtendedBlock;
+use curvine_common_core::state::ExtendedBlock;
 use log::{info, warn};
-use orpc::io::IOResult;
-use orpc::{err_box, CommonResult};
+use orpc_rpc::io::IOResult;
+use orpc_rpc::{err_box, CommonResult};
 use std::sync::Arc;
 
 #[cfg(feature = "spdk")]
 use curvine_storage_spdk::SpdkBdev;
 #[cfg(feature = "spdk")]
-use orpc::io::IOError;
+use orpc_rpc::io::IOError;
 
 #[derive(Clone)]
 pub struct BdevLayout {
@@ -60,7 +60,7 @@ impl BlockLayout for BdevLayout {
             .offset_alloc
             .allocate(block.id, block.len)
             .map_err(|e| {
-                orpc::err_msg!(format!(
+                orpc_rpc::err_msg!(format!(
                     "Failed to allocate bdev offset for block {}: {}",
                     block.id, e
                 ))
@@ -78,7 +78,7 @@ impl BlockLayout for BdevLayout {
     ) -> CommonResult<BlockMeta> {
         let (offset, allocated_bytes) =
             dir.state.offset_alloc.get_entry(meta.id()).ok_or_else(|| {
-                orpc::err_msg!(format!(
+                orpc_rpc::err_msg!(format!(
                     "No bdev allocation found for block {} in dir {}",
                     meta.id(),
                     dir.id()

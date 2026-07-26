@@ -19,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::{Int32Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-use curvine_common::conf::ClusterConf;
+use curvine_common_core::conf::ClusterConf;
 use futures::TryStreamExt;
 use lancedb::connect;
 use lancedb::object_store::{CURVINE_CONF_FILE_KEY, CURVINE_MASTER_ADDRS_KEY};

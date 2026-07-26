@@ -14,8 +14,6 @@
 
 pub use curvine_fs_api::local;
 pub use curvine_fs_api::{
-    CurvineURI, FileSystem, FsKind, ListStream, Path, Reader, RpcCode, Writer,
+    CurvineURI, FileSystem, FsKind, ListStream, Path, Reader, RpcCode, StateReader, StateWriter,
+    Writer,
 };
-
-mod state_file;
-pub use self::state_file::*;

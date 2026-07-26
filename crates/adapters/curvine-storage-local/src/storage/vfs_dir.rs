@@ -13,16 +13,16 @@
 // limitations under the License.
 
 use crate::storage::{DirState, StorageVersion, DEFAULT_BLOCK_ALIGN};
-use curvine_common::conf::WorkerDataDir;
-use curvine_common::state::StorageType;
+use curvine_common_core::conf::WorkerDataDir;
+use curvine_common_core::state::StorageType;
 #[cfg(feature = "spdk")]
 use curvine_storage_spdk::SpdkEnv;
 use log::*;
-use orpc::common::{ByteUnit, FileUtils};
-use orpc::io::LocalFile;
-use orpc::sync::AtomicLong;
-use orpc::sys::FsStats;
-use orpc::CommonResult;
+use orpc_rpc::common::{ByteUnit, FileUtils};
+use orpc_rpc::io::LocalFile;
+use orpc_rpc::sync::AtomicLong;
+use orpc_rpc::sys::FsStats;
+use orpc_rpc::CommonResult;
 use std::fmt::{Debug, Formatter};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -72,14 +72,14 @@ impl VfsDir {
         let bdev_name: Option<(String, i64)> = if conf.storage_type == StorageType::SpdkDisk {
             use curvine_storage_spdk::SpdkEnv;
             let env = SpdkEnv::global().ok_or_else(|| {
-                orpc::err_msg!(
+                orpc_rpc::err_msg!(
                     "StorageType::SpdkDisk dir '{}' requires SPDK environment, but it is not initialized",
                     conf.path
                 )
             })?;
             let names = env.bdev_names();
             if names.is_empty() {
-                return orpc::err_box!(
+                return orpc_rpc::err_box!(
                     "StorageType::SpdkDisk dir '{}' but no bdevs discovered from SPDK targets",
                     conf.path
                 );
@@ -98,7 +98,7 @@ impl VfsDir {
         };
         #[cfg(not(feature = "spdk"))]
         let bdev_name: Option<(String, i64)> = if conf.storage_type == StorageType::SpdkDisk {
-            return orpc::err_box!(
+            return orpc_rpc::err_box!(
                 "StorageType::SpdkDisk is not available. Compile with --features spdk"
             );
         } else {
@@ -362,13 +362,13 @@ mod test {
         BdevLayout, BlockLayout, FileLayout, StorageVersion, DEFAULT_BLOCK_ALIGN,
     };
     use crate::{BlockMeta, BlockState};
-    use curvine_common::conf::WorkerDataDir;
-    use curvine_common::state::{ExtendedBlock, StorageType};
-    use orpc::common::{ByteUnit, FileUtils};
-    use orpc::io::LocalFile;
-    use orpc::sync::AtomicLong;
-    use orpc::sys::FsStats;
-    use orpc::CommonResult;
+    use curvine_common_core::conf::WorkerDataDir;
+    use curvine_common_core::state::{ExtendedBlock, StorageType};
+    use orpc_rpc::common::{ByteUnit, FileUtils};
+    use orpc_rpc::io::LocalFile;
+    use orpc_rpc::sync::AtomicLong;
+    use orpc_rpc::sys::FsStats;
+    use orpc_rpc::CommonResult;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 

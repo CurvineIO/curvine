@@ -14,6 +14,8 @@
 
 pub use curvine_error::FsResult;
 
+pub const FILE_BUFFER_SIZE: usize = 128 * 1024;
+
 mod path;
 pub use self::path::Path;
 
@@ -35,6 +37,12 @@ pub use self::filesystem::FileSystem;
 mod list_stream;
 pub use self::list_stream::ListStream;
 
+mod state_file;
+pub use self::state_file::{StateReader, StateWriter};
+
+mod common_utils;
+pub use self::common_utils::CommonUtils;
+
 pub mod local;
 
 // CurvineURI is used in the Curvine system to describe paths, including external storage.
@@ -53,7 +61,7 @@ impl curvine_model::CurvinePath for Path {
         self.full_path()
     }
 
-    fn from_str(path: impl AsRef<str>) -> orpc::CommonResult<Self> {
+    fn from_str(path: impl AsRef<str>) -> orpc_rpc::CommonResult<Self> {
         Path::from_str(path)
     }
 }
@@ -71,5 +79,6 @@ pub mod state {
 }
 
 pub mod utils {
+    pub use super::CommonUtils;
     pub use curvine_model::ProtoUtils;
 }

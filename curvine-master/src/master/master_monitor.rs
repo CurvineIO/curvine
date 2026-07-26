@@ -14,7 +14,7 @@
 
 use curvine_raft::RoleState;
 use num_enum::{FromPrimitive, IntoPrimitive};
-use orpc::sync::StateCtl;
+use orpc_rpc::sync::StateCtl;
 
 // master state controller
 #[repr(i8)]

@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::state::{StorageInfo, WorkerAddress, WorkerInfo, WorkerStatus};
-use curvine_common::FsResult;
+use curvine_common_core::state::{StorageInfo, WorkerAddress, WorkerInfo, WorkerStatus};
+use curvine_common_core::FsResult;
 use indexmap::IndexMap;
 use log::{error, info, warn};
-use orpc::err_box;
+use orpc_rpc::err_box;
 
 // Store all worker information.
 pub struct WorkerMap {

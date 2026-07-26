@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use orpc::client::RpcClient;
-use orpc::error::ErrorExt;
-use orpc::io::IOError;
-use orpc::message::MessageBuilder;
-use orpc::CommonError;
+use orpc_rpc::client::RpcClient;
+use orpc_rpc::error::ErrorExt;
+use orpc_rpc::io::IOError;
+use orpc_rpc::message::MessageBuilder;
+use orpc_rpc::CommonError;
 use prost::Message as PMessage;
 use std::time::Duration;
 

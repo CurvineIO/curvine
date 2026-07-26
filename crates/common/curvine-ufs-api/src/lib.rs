@@ -12,14 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use curvine_model::ProtoUtils;
+pub mod fs;
 
-mod serde_utils;
-pub use self::serde_utils::SerdeUtils;
+mod ufs_utils;
+pub use self::ufs_utils::UfsUtils;
 
-pub mod display;
-mod rpc_utils;
-pub use self::rpc_utils::RpcUtils;
+mod conf;
+pub use self::conf::*;
 
-mod common_utils;
-pub use self::common_utils::CommonUtils;
+pub const FOLDER_SUFFIX: &str = "/";
+
+#[macro_export]
+macro_rules! err_ufs {
+    ($e:expr) => ({
+        Err(orpc_rpc::err_msg!($e).into())
+    });
+
+    ($f:tt, $($arg:expr),+) => ({
+        orpc_rpc::err_box!(format!($f, $($arg),+))
+    });
+}

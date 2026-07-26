@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::error::FsError;
-use orpc::io::IOError;
-use orpc::CommonError;
+use curvine_error::FsError;
+use orpc_rpc::io::IOError;
+use orpc_rpc::CommonError;
 use std::fmt;
 use std::fmt::Debug;
 use tokio::time::error::Elapsed;
@@ -197,7 +197,7 @@ pub(crate) fn splice_errno_label(errno: i32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{errno_label, splice_errno_label, FuseError};
-    use curvine_common::error::FsError;
+    use curvine_error::FsError;
 
     // Display prints the errno NUMBER first, then the message ("errno 2: ...").
     #[test]

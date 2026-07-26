@@ -16,9 +16,9 @@ use crate::worker::block::BlockMeta;
 use crate::worker::storage::{
     BlockDataset, BlockLayout, BlockReadContext, BlockWriteContext, Dataset,
 };
-use curvine_common::conf::ClusterConf;
-use curvine_common::state::{ExtendedBlock, StorageInfo};
-use orpc::CommonResult;
+use curvine_common_core::conf::ClusterConf;
+use curvine_common_core::state::{ExtendedBlock, StorageInfo};
+use orpc_rpc::CommonResult;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(Clone)]
@@ -72,7 +72,7 @@ impl BlockStore {
         let state = self.read()?;
         let b = state
             .get_readable_block(id)
-            .ok_or_else(|| orpc::err_msg!(format!("block {} not exists", id)))?;
+            .ok_or_else(|| orpc_rpc::err_msg!(format!("block {} not exists", id)))?;
         Ok(b.clone())
     }
 
@@ -150,7 +150,7 @@ impl BlockStore {
 mod tests {
     use super::*;
     use crate::worker::storage::Dataset;
-    use curvine_common::conf::WorkerConf;
+    use curvine_common_core::conf::WorkerConf;
 
     fn create_store(name: &str) -> CommonResult<BlockStore> {
         let conf = ClusterConf {

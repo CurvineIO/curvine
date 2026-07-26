@@ -13,16 +13,16 @@
 // limitations under the License.
 
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
-use curvine_common::error::FsError;
-use curvine_common::fs::RpcCode;
-use curvine_common::proto::{ReportBlockReplicationRequest, ReportBlockReplicationResponse};
-use curvine_common::FsResult;
+use curvine_common_core::error::FsError;
+use curvine_common_core::fs::RpcCode;
+use curvine_common_core::proto::{ReportBlockReplicationRequest, ReportBlockReplicationResponse};
+use curvine_common_core::FsResult;
 use curvine_data_mover::RpcContext;
 use log::warn;
-use orpc::error::ErrorImpl;
-use orpc::handler::MessageHandler;
-use orpc::message::Message;
-use orpc::CommonResult;
+use orpc_rpc::error::ErrorImpl;
+use orpc_rpc::handler::MessageHandler;
+use orpc_rpc::message::Message;
+use orpc_rpc::CommonResult;
 use std::sync::Arc;
 
 #[derive(Clone)]

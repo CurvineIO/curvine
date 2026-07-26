@@ -16,15 +16,15 @@ use crate::master::journal::{
     CompleteFileEntry, DeleteEntry, JournalEntry, MkdirEntry, RenameEntry,
 };
 use crate::master::JobManager;
-use curvine_common::conf::JournalConf;
-use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::{JobTaskState, LoadJobCommand};
-use curvine_common::FsResult;
+use curvine_common_core::conf::JournalConf;
+use curvine_common_core::error::FsError;
+use curvine_common_core::fs::{FileSystem, Path};
+use curvine_common_core::state::{JobTaskState, LoadJobCommand};
+use curvine_common_core::FsResult;
 use curvine_unified_fs::MountValue;
 use log::{info, warn};
-use orpc::common::DurationUnit;
-use orpc::{err_box, CommonResult};
+use orpc_rpc::common::DurationUnit;
+use orpc_rpc::{err_box, CommonResult};
 use std::sync::Arc;
 use std::time::Duration;
 

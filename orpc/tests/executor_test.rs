@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use orpc::common::Logger;
-use orpc::runtime::{GroupExecutor, SingleExecutor};
-use orpc::sync::AtomicCounter;
-use orpc::sys::RawPtr;
-use orpc::CommonResult;
+use orpc_rpc::common::Logger;
+use orpc_rpc::runtime::{GroupExecutor, SingleExecutor};
+use orpc_rpc::sync::AtomicCounter;
+use orpc_rpc::sys::RawPtr;
+use orpc_rpc::CommonResult;
 use std::sync::{mpsc, Arc};
 use std::thread;
 

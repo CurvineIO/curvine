@@ -19,9 +19,9 @@ use axum::response::{IntoResponse, Response};
 #[cfg(feature = "axum-response")]
 use axum::Json;
 use num_enum::{FromPrimitive, IntoPrimitive};
-use orpc::error::{ErrorDecoder, ErrorExt, ErrorImpl, StringError};
-use orpc::io::IOError;
-use orpc::CommonError;
+use orpc_rpc::error::{ErrorDecoder, ErrorExt, ErrorImpl, StringError};
+use orpc_rpc::io::IOError;
+use orpc_rpc::CommonError;
 use prost::bytes::BytesMut;
 use prost::{DecodeError, EncodeError};
 #[cfg(feature = "axum-response")]
@@ -648,7 +648,7 @@ impl ErrorExt for FsError {
 mod tests {
     use super::ErrorKind;
     use crate::FsError;
-    use orpc::error::{ErrorExt, ErrorImpl};
+    use orpc_rpc::error::{ErrorExt, ErrorImpl};
 
     #[test]
     pub fn error_test() {

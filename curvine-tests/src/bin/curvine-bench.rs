@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use curvine_tests::{BenchArgs, CurvineBench};
-use orpc::common::Logger;
-use orpc::CommonResult;
+use orpc_rpc::common::Logger;
+use orpc_rpc::CommonResult;
 
 fn main() -> CommonResult<()> {
     Logger::default();

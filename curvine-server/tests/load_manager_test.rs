@@ -14,7 +14,7 @@
 
 /*#[cfg(test)]
 mod tests {
-    use curvine_common::proto::LoadState;
+    use curvine_common_core::proto::LoadState;
     use curvine_server::master::LoadJob;
     use std::collections::HashMap;
 

@@ -17,9 +17,9 @@ use bytes::BytesMut;
 use flate2::read::ZlibEncoder;
 use flate2::Compression;
 use log::warn;
-use orpc::common::Utils;
-use orpc::io::LocalFile;
-use orpc::CommonResult;
+use orpc_rpc::common::Utils;
+use orpc_rpc::io::LocalFile;
+use orpc_rpc::CommonResult;
 
 // Read a file and read it after compression.
 pub struct FileReader {

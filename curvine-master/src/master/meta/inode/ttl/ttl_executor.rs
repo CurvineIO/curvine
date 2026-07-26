@@ -15,10 +15,10 @@
 use crate::master::fs::MasterFilesystem;
 use crate::master::meta::inode::{Inode, InodeView, ROOT_INODE_ID};
 use crate::master::meta::FsDir;
-use curvine_common::state::TtlAction;
-use curvine_common::FsResult;
+use curvine_common_core::state::TtlAction;
+use curvine_common_core::FsResult;
 use log::debug;
-use orpc::err_box;
+use orpc_rpc::err_box;
 
 // TTL Executor Module
 //

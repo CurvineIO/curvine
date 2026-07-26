@@ -15,8 +15,8 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
-use curvine_common::state::{JobTaskState, LoadTaskInfo};
-use orpc::sync::FastDashMap;
+use curvine_common_core::state::{JobTaskState, LoadTaskInfo};
+use orpc_rpc::sync::FastDashMap;
 
 use crate::worker::task::TaskContext;
 
@@ -84,8 +84,8 @@ impl Deref for TaskStore {
 mod supersede_tests {
     use super::TaskStore;
     use crate::worker::task::TaskContext;
-    use curvine_common::state::WorkerAddress;
-    use curvine_common::state::{
+    use curvine_common_core::state::WorkerAddress;
+    use curvine_common_core::state::{
         JobTaskState, LoadJobInfo, LoadTaskInfo, MountInfo, StorageType, TtlAction,
     };
     use dashmap::mapref::entry::Entry;

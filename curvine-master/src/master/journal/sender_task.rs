@@ -14,13 +14,13 @@
 
 use crate::master::journal::{JournalBatch, JournalEntry};
 use crate::master::{Master, MasterMetrics};
-use curvine_common::conf::JournalConf;
-use curvine_common::utils::SerdeUtils;
-use curvine_common::FsResult;
+use curvine_common_core::conf::JournalConf;
+use curvine_common_core::utils::SerdeUtils;
+use curvine_common_core::FsResult;
 use curvine_raft::RaftClient;
-use orpc::common::{LocalTime, TimeSpent};
-use orpc::sync::channel::BlockingReceiver;
-use orpc::CommonResult;
+use orpc_rpc::common::{LocalTime, TimeSpent};
+use orpc_rpc::sync::channel::BlockingReceiver;
+use orpc_rpc::CommonResult;
 use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
 use std::time::Duration;

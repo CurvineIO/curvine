@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use curvine_raft::snapshot::{FileReader, FileWriter};
-use orpc::common::{FileUtils, Utils};
-use orpc::io::LocalFile;
-use orpc::CommonResult;
+use orpc_rpc::common::{FileUtils, Utils};
+use orpc_rpc::io::LocalFile;
+use orpc_rpc::CommonResult;
 
 #[test]
 fn test_raft_snapshot_file_read_write_with_checksum_validation() -> CommonResult<()> {

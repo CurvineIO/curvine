@@ -3,8 +3,8 @@
 use crate::python::PythonFilesystem;
 use crate::{LibFsReader, LibFsWriter};
 use curvine_error::{ErrorKind, FsError};
-use orpc::sys::DataSlice;
-use orpc::sys::{FFIUtils, RawVec};
+use orpc_rpc::sys::DataSlice;
+use orpc_rpc::sys::{FFIUtils, RawVec};
 use pyo3::exceptions::*;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList};

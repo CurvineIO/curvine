@@ -18,15 +18,15 @@ use crate::master::journal::*;
 use crate::master::meta::inode::{InodeDir, InodeFile, InodePath};
 use crate::master::meta::FsDir;
 use crate::master::{Master, MasterMetrics};
-use curvine_common::conf::JournalConf;
-use curvine_common::state::{CommitBlock, FileLock, MountInfo, RenameFlags, SetAttrOpts};
-use curvine_common::FsResult;
+use curvine_common_core::conf::JournalConf;
+use curvine_common_core::state::{CommitBlock, FileLock, MountInfo, RenameFlags, SetAttrOpts};
+use curvine_common_core::FsResult;
 use curvine_raft::RaftClient;
 use log::{debug, info};
-use orpc::common::LocalTime;
-use orpc::err_box;
-use orpc::sync::channel::{BlockingChannel, BlockingReceiver, BlockingSender};
-use orpc::sync::AtomicCounter;
+use orpc_rpc::common::LocalTime;
+use orpc_rpc::err_box;
+use orpc_rpc::sync::channel::{BlockingChannel, BlockingReceiver, BlockingSender};
+use orpc_rpc::sync::AtomicCounter;
 use std::sync::Mutex;
 
 // Write metadata operation logs.

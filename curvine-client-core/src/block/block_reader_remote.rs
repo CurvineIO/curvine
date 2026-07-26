@@ -17,9 +17,9 @@ use crate::file::FsContext;
 use curvine_error::FsResult;
 use curvine_model::{ExtendedBlock, WorkerAddress};
 use curvine_proto::DataHeaderProto;
-use orpc::common::Utils;
-use orpc::err_box;
-use orpc::sys::DataSlice;
+use orpc_rpc::common::Utils;
+use orpc_rpc::err_box;
+use orpc_rpc::sys::DataSlice;
 
 pub struct BlockReaderRemote {
     client: BlockClient,

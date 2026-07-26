@@ -16,9 +16,9 @@ use crate::proto::{SnapshotDownloadRequest, SnapshotDownloadResponse};
 use crate::snapshot::FileReader;
 use crate::{RaftResult, RaftUtils};
 use log::{debug, error};
-use orpc::message::{Builder, Message, RequestStatus};
-use orpc::sys::DataSlice;
-use orpc::{err_box, try_option_mut};
+use orpc_rpc::message::{Builder, Message, RequestStatus};
+use orpc_rpc::sys::DataSlice;
+use orpc_rpc::{err_box, try_option_mut};
 
 // Snapshot read processor.
 pub struct SnapshotDownloadHandler {

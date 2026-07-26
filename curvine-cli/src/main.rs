@@ -23,10 +23,10 @@ use curvine_client_core::file::CurvineFileSystem;
 use curvine_config::ClusterConf;
 use curvine_job_client::JobMasterClient;
 use curvine_unified_fs::UnifiedFileSystem;
-use orpc::common::{Logger, Utils};
-use orpc::io::net::InetAddr;
-use orpc::runtime::RpcRuntime;
-use orpc::{err_box, CommonResult};
+use orpc_rpc::common::{Logger, Utils};
+use orpc_rpc::io::net::InetAddr;
+use orpc_rpc::runtime::RpcRuntime;
+use orpc_rpc::{err_box, CommonResult};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

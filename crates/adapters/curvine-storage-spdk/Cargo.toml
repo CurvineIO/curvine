@@ -11,7 +11,7 @@ spdk = []
 spdk-rdma = ["spdk"]
 
 [dependencies]
-orpc = { workspace = true }
+orpc-rpc = { workspace = true }
 bytes = { workspace = true }
 crossbeam = { workspace = true }
 libc = { workspace = true }

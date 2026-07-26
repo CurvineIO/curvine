@@ -19,16 +19,16 @@ use crate::raw::fuse_abi::{fuse_attr, fuse_entry_out, fuse_setattr_in};
 use crate::*;
 use bytes::BytesMut;
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::conf::FuseConf;
-use curvine_common::fs::Path;
-use curvine_common::state::{
+use curvine_config::FuseConf;
+use curvine_fs_api::Path;
+use curvine_model::{
     CreateFileOpts, CreateFileOptsBuilder, FileStatus, FileType, MkdirOpts, MkdirOptsBuilder,
     SetAttrOpts, FS_APPEND_FL, FS_IMMUTABLE_FL, IFLAGS_XATTR, MKNOD_RDEV_XATTR,
 };
-use orpc::common::LocalTime;
-use orpc::io::IOResult;
-use orpc::sys;
-use orpc::sys::{FFIUtils, RawIO};
+use orpc_rpc::common::LocalTime;
+use orpc_rpc::io::IOResult;
+use orpc_rpc::sys;
+use orpc_rpc::sys::{FFIUtils, RawIO};
 use std::collections::HashMap;
 use std::process::Command;
 use std::slice;
@@ -706,7 +706,7 @@ impl FuseUtils {
 mod tests {
     use super::*;
     use crate::raw::fuse_abi::fuse_setattr_in;
-    use curvine_common::state::INTERNAL_CTIME_XATTR;
+    use curvine_model::INTERNAL_CTIME_XATTR;
 
     #[test]
     fn protected_xattr_errors_match_operation() {

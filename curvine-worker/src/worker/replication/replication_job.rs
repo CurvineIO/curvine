@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::proto::SubmitBlockReplicationRequest;
-use curvine_common::state::{StorageType, WorkerAddress};
-use curvine_common::utils::ProtoUtils;
+use curvine_common_core::proto::SubmitBlockReplicationRequest;
+use curvine_common_core::state::{StorageType, WorkerAddress};
+use curvine_common_core::utils::ProtoUtils;
 
 pub struct ReplicationJob {
     pub block_id: i64,

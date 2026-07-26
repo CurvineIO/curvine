@@ -14,7 +14,7 @@
 
 use clap::Parser;
 use curvine_job_client::JobMasterClient;
-use orpc::CommonResult;
+use orpc_rpc::CommonResult;
 
 use crate::util::*;
 

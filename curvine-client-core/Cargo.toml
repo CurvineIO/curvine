@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-orpc = { workspace = true }
+orpc-rpc = { workspace = true }
 curvine-error = { workspace = true }
 curvine-proto = { workspace = true }
 curvine-model = { workspace = true }

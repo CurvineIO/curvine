@@ -26,19 +26,19 @@ use crate::*;
 use crate::{err_fuse, FuseResult, FuseUtils};
 use bytes::BytesMut;
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::conf::{ClusterConf, FuseConf};
-use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, Path, RpcCode, StateReader, StateWriter};
-use curvine_common::state::{
+use curvine_config::{ClusterConf, FuseConf};
+use curvine_error::FsError;
+use curvine_error::MAX_FILE_SIZE;
+use curvine_fs_api::{FileSystem, Path, RpcCode, StateReader, StateWriter};
+use curvine_model::{
     is_special_file_type, FileAllocMode, FileAllocOpts, FileLock, FileStatus, FileType, LockFlags,
     LockType, OpenFlags, SetAttrOpts,
 };
-use curvine_common::MAX_FILE_SIZE;
 use log::{debug, info, warn};
-use orpc::common::{ByteUnit, TimeSpent};
-use orpc::runtime::Runtime;
-use orpc::sys::FFIUtils;
-use orpc::{sys, try_option};
+use orpc_rpc::common::{ByteUnit, TimeSpent};
+use orpc_rpc::runtime::Runtime;
+use orpc_rpc::sys::FFIUtils;
+use orpc_rpc::{sys, try_option};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::Arc;
@@ -1954,7 +1954,7 @@ impl fs::FileSystem for CurvineFileSystem {
 mod tests {
     use crate::fs::dcache::Inode;
     use crate::{FATTR_ATIME_NOW, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_UID};
-    use curvine_common::state::{FileAllocMode, FileStatus, FileType, INTERNAL_CTIME_XATTR};
+    use curvine_model::{FileAllocMode, FileStatus, FileType, INTERNAL_CTIME_XATTR};
 
     #[test]
     fn userspace_open_checks_only_unambiguous_write_modes() {
@@ -2062,7 +2062,7 @@ mod tests {
     #[test]
     fn root_access_checks_any_execute_bit_not_owner_class() {
         use super::CurvineFileSystem;
-        use curvine_common::state::{FileStatus, FileType};
+        use curvine_model::{FileStatus, FileType};
 
         let mut readonly = FileStatus::with_name(1, "readonly".to_string(), false);
         readonly.file_type = FileType::File;
@@ -2635,9 +2635,9 @@ mod tests {
 
     mod readdir_termination {
         use crate::fs::state::DirHandle;
-        use curvine_common::fs::{ListStream, Path};
-        use curvine_common::state::FileStatus;
-        use orpc::runtime::{AsyncRuntime, RpcRuntime};
+        use curvine_fs_api::{ListStream, Path};
+        use curvine_model::FileStatus;
+        use orpc_rpc::runtime::{AsyncRuntime, RpcRuntime};
 
         fn entries(names: &[&str]) -> Vec<FileStatus> {
             names

@@ -25,12 +25,12 @@ use crate::{err_fuse, FuseResult, FUSE_IN_HEADER_LEN};
 use bytes::BytesMut;
 use libc::{EAGAIN, ECONNABORTED, EINTR, ENODEV, ENOENT};
 use log::{debug, error, info, warn};
-use orpc::io::IOResult;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sync::channel::AsyncSender;
-use orpc::sync::FastDashMap;
-use orpc::sys::pipe::{AsyncFd, Pipe2, PipeFd};
-use orpc::{err_box, sys, try_option_ref};
+use orpc_rpc::io::IOResult;
+use orpc_rpc::runtime::{RpcRuntime, Runtime};
+use orpc_rpc::sync::channel::AsyncSender;
+use orpc_rpc::sync::FastDashMap;
+use orpc_rpc::sys::pipe::{AsyncFd, Pipe2, PipeFd};
+use orpc_rpc::{err_box, sys, try_option_ref};
 use std::sync::Arc;
 use tokio::sync::{watch, Notify};
 
@@ -732,7 +732,7 @@ mod tests {
     use super::{receive_error_labels, PendingRequestGuard};
     use crate::fuse_metrics::{RECEIVE_ACTION_CONTINUE, RECEIVE_ACTION_EXIT};
     use libc::{EAGAIN, ECONNABORTED, EINTR, EIO, ENODEV, ENOENT};
-    use orpc::sync::FastDashMap;
+    use orpc_rpc::sync::FastDashMap;
     use std::sync::Arc;
     use tokio::sync::Notify;
 
@@ -798,10 +798,10 @@ mod tests {
         use crate::session::{FuseRequest, FuseResponse, FuseTask};
         use crate::FuseUtils;
         use bytes::{BufMut, BytesMut};
-        use curvine_common::conf::FuseConf;
-        use orpc::common::Metrics as m;
-        use orpc::sync::channel::{AsyncChannel, AsyncReceiver};
-        use orpc::sync::FastDashMap;
+        use curvine_config::FuseConf;
+        use orpc_rpc::common::Metrics as m;
+        use orpc_rpc::sync::channel::{AsyncChannel, AsyncReceiver};
+        use orpc_rpc::sync::FastDashMap;
 
         // Each test uses a DISTINCT opcode: they run in parallel and assert deltas
         // on the shared process-global registry, so a shared opcode would make the
@@ -1411,8 +1411,8 @@ mod tests {
         use crate::session::{FuseRequest, FuseResponse};
         use crate::FuseUtils;
         use bytes::{BufMut, BytesMut};
-        use orpc::runtime::{AsyncRuntime, RpcRuntime};
-        use orpc::sync::channel::AsyncChannel;
+        use orpc_rpc::runtime::{AsyncRuntime, RpcRuntime};
+        use orpc_rpc::sync::channel::AsyncChannel;
         use std::sync::Arc;
 
         const OP_READ: u32 = 15;
@@ -1488,16 +1488,14 @@ mod tests {
             FuseMetrics::ensure_init().unwrap();
             let rt = AsyncRuntime::single();
             rt.block_on(async {
-                let fs = Arc::new(TestFileSystem::new(
-                    curvine_common::conf::FuseConf::default(),
-                ));
+                let fs = Arc::new(TestFileSystem::new(curvine_config::FuseConf::default()));
                 // Drainer so an enqueued error reply never blocks.
                 let (tx, mut rx) = AsyncChannel::new(64).split();
                 let drainer = tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
                 let opcode = req.opcode().as_str();
                 let ctx = if with_metrics_ctx {
-                    let gauge = orpc::common::Metrics::new_gauge(
+                    let gauge = orpc_rpc::common::Metrics::new_gauge(
                         format!("ss_dispatch_active_{}", req.unique()),
                         "test".to_string(),
                     )
@@ -1648,13 +1646,11 @@ mod tests {
 
             let rt = AsyncRuntime::single();
             rt.block_on(async {
-                let fs = Arc::new(TestFileSystem::new(
-                    curvine_common::conf::FuseConf::default(),
-                ));
+                let fs = Arc::new(TestFileSystem::new(curvine_config::FuseConf::default()));
                 let (tx, mut rx) = AsyncChannel::new(16).split();
                 let drainer = tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
-                let active_g = orpc::common::Metrics::new_gauge(
+                let active_g = orpc_rpc::common::Metrics::new_gauge(
                     "ss_malformed_active_7201".to_string(),
                     "test".to_string(),
                 )
@@ -1717,8 +1713,8 @@ mod tests {
         use crate::session::{FuseRequest, FuseResponse, FuseTask};
         use crate::{FuseResult, FuseUtils};
         use bytes::{BufMut, BytesMut};
-        use orpc::runtime::{AsyncRuntime, RpcRuntime};
-        use orpc::sync::channel::AsyncChannel;
+        use orpc_rpc::runtime::{AsyncRuntime, RpcRuntime};
+        use orpc_rpc::sync::channel::AsyncChannel;
         use std::sync::Arc;
 
         const OP_READ: u32 = 15;
@@ -1819,12 +1815,20 @@ mod tests {
             )
         }
 
-        // Drive one stream op through `send_stream_dispatch` and return `(result,
-        // every enqueued FuseTask, the shared reply handle)`. FD-free; the handle
-        // lets the caller inspect the shared metrics slot (finished / active guard).
-        // Fully awaited on a single-thread runtime, so everything enqueued is already
-        // buffered in `rx` by the time it returns — we just drain synchronously,
-        // stopping on `Ok(Some)` so a closed channel (`Err`) can't panic the drain.
+        // Drive one stream op through the real `send_stream_dispatch` against `fs` and
+        // return `(dispatch result, every FuseTask enqueued to the reply channel,
+        // the shared reply handle)`. FD-free; the reply handle is returned so the
+        // caller can inspect the shared metrics slot (finished / active guard).
+        //
+        // Draining: `send_stream_dispatch` is fully awaited on a single-thread runtime,
+        // so by the time it returns everything it enqueued is already buffered in `rx`.
+        // We just drain what's there — no drainer task needed. The loop stops on BOTH
+        // empty AND closed (`while let Ok(Some(_))`): `try_recv` maps an empty channel
+        // to `Ok(None)` but a *closed* one to `Err` (`orpc_rpc::sync::channel`), so matching
+        // only `Ok(Some(_))` makes the drain robust regardless of whether a sender clone
+        // is still alive. (One is: `observer` below holds a sender for the whole drain,
+        // so in practice we hit the `Ok(None)` empty case — but the loop must not depend
+        // on that.)
         fn dispatch_and_collect<F: FileSystem>(
             fs: Arc<F>,
             with_metrics_ctx: bool,
@@ -1836,7 +1840,7 @@ mod tests {
                 let (tx, mut rx) = AsyncChannel::new(64).split();
                 let opcode = req.opcode().as_str();
                 let ctx = if with_metrics_ctx {
-                    let gauge = orpc::common::Metrics::new_gauge(
+                    let gauge = orpc_rpc::common::Metrics::new_gauge(
                         format!("sec_active_{}", req.unique()),
                         "test".to_string(),
                     )

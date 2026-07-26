@@ -16,12 +16,12 @@
 use crate::master::fs::MasterFilesystem;
 use crate::master::mount::MountTable;
 use crate::master::{self, SyncFsDir};
-use curvine_common::error::FsError;
-use curvine_common::fs::{self, CurvineURI, Path};
-use curvine_common::state::{MkdirOpts, MountInfo, MountOptions};
-use curvine_common::FsResult;
+use curvine_common_core::error::FsError;
+use curvine_common_core::fs::{self, CurvineURI, Path};
+use curvine_common_core::state::{MkdirOpts, MountInfo, MountOptions};
+use curvine_common_core::FsResult;
 use log::info;
-use orpc::err_box;
+use orpc_rpc::err_box;
 use std::collections::HashMap;
 
 pub struct MountManager {

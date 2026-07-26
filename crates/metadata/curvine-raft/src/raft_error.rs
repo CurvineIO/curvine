@@ -15,9 +15,9 @@
 use self::RaftError::*;
 use crate::{NodeId, RaftGroup};
 use num_enum::{FromPrimitive, IntoPrimitive};
-use orpc::error::{ErrorDecoder, ErrorExt, ErrorImpl, StringError};
-use orpc::io::IOError;
-use orpc::CommonError;
+use orpc_rpc::error::{ErrorDecoder, ErrorExt, ErrorImpl, StringError};
+use orpc_rpc::io::IOError;
+use orpc_rpc::CommonError;
 use prost::bytes::BytesMut;
 use prost::DecodeError;
 use rocksdb::Error;

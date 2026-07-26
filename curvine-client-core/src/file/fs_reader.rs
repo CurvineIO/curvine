@@ -17,9 +17,9 @@ use curvine_error::FsResult;
 use curvine_fs_api::{Path, Reader};
 use curvine_model::{FileBlocks, FileStatus};
 use log::debug;
-use orpc::common::ByteUnit;
-use orpc::err_box;
-use orpc::sys::DataSlice;
+use orpc_rpc::common::ByteUnit;
+use orpc_rpc::err_box;
+use orpc_rpc::sys::DataSlice;
 use std::sync::Arc;
 
 type Inner = FsReaderBuffer;

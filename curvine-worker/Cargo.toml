@@ -17,9 +17,9 @@ spdk-rdma = ["spdk", "curvine-storage-spdk/spdk-rdma", "curvine-storage-local/sp
 fault-injection = ["curvine-fault/http-server"]
 
 [dependencies]
-orpc = { workspace = true }
+orpc-rpc = { workspace = true }
 curvine-client-core = { workspace = true }
-curvine-common = { workspace = true }
+curvine-common-core = { workspace = true }
 curvine-data-mover = { workspace = true }
 curvine-error = { workspace = true, features = ["axum-response"] }
 curvine-fault = { workspace = true }

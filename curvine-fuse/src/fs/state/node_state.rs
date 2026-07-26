@@ -27,19 +27,19 @@ use crate::{
     FUSE_ROOT_ID, STATE_FILE_MAGIC, STATE_FILE_VERSION,
 };
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::conf::{ClientConf, FuseConf};
-use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, ListStream, Path, StateReader, StateWriter};
-use curvine_common::state::{
+use curvine_config::ClusterConf;
+use curvine_config::{ClientConf, FuseConf};
+use curvine_error::FsError;
+use curvine_fs_api::{FileSystem, ListStream, Path, StateReader, StateWriter};
+use curvine_model::{
     CreateFileOpts, FileAllocOpts, FileStatus, ListOptions, MkdirOpts, OpenFlags, SetAttrOpts,
 };
-use curvine_config::ClusterConf;
 use futures::stream::{self, StreamExt};
 use log::{debug, error, info, warn};
-use orpc::common::FastHashMap;
-use orpc::err_box;
-use orpc::sync::{AsyncMutex, AsyncSharedMap, AtomicCounter, RwLockHashMap};
-use orpc::sys::RawPtr;
+use orpc_rpc::common::FastHashMap;
+use orpc_rpc::err_box;
+use orpc_rpc::sync::{AsyncMutex, AsyncSharedMap, AtomicCounter, RwLockHashMap};
+use orpc_rpc::sys::RawPtr;
 use std::borrow::Cow;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -779,12 +779,12 @@ impl NodeState {
         });
     }
 
-    fn inc_gauges_lockstep(legacy: &orpc::common::Gauge, alias: &orpc::common::Gauge) {
+    fn inc_gauges_lockstep(legacy: &orpc_rpc::common::Gauge, alias: &orpc_rpc::common::Gauge) {
         legacy.inc();
         alias.inc();
     }
 
-    fn dec_gauges_lockstep(legacy: &orpc::common::Gauge, alias: &orpc::common::Gauge) {
+    fn dec_gauges_lockstep(legacy: &orpc_rpc::common::Gauge, alias: &orpc_rpc::common::Gauge) {
         legacy.dec();
         alias.dec();
     }
@@ -1272,16 +1272,16 @@ mod test {
     use curvine_client::unified::UnifiedFileSystem;
     #[cfg(target_os = "linux")]
     use curvine_client::unified::UnifiedWriter;
-    use curvine_common::conf::ClusterConf;
-    use curvine_common::error::FsError;
+    use curvine_config::ClusterConf;
+    use curvine_error::FsError;
     #[cfg(target_os = "linux")]
-    use curvine_common::fs::local::LocalWriter;
+    use curvine_fs_api::local::LocalWriter;
     #[cfg(target_os = "linux")]
-    use curvine_common::fs::Writer;
-    use curvine_common::fs::{ListStream, Path, StateReader, StateWriter};
-    use curvine_common::state::FileStatus;
-    use orpc::common::{FastHashMap, Utils};
-    use orpc::runtime::{AsyncRuntime, RpcRuntime};
+    use curvine_fs_api::Writer;
+    use curvine_fs_api::{ListStream, Path, StateReader, StateWriter};
+    use curvine_model::FileStatus;
+    use orpc_rpc::common::{FastHashMap, Utils};
+    use orpc_rpc::runtime::{AsyncRuntime, RpcRuntime};
     use std::sync::Arc;
 
     fn file_handle(ino: u64, fh: u64) -> Arc<FileHandle> {
@@ -1430,12 +1430,12 @@ mod test {
 
     #[test]
     fn inc_dec_gauges_lockstep_move_both_together() {
-        let legacy = orpc::common::Metrics::new_gauge(
+        let legacy = orpc_rpc::common::Metrics::new_gauge(
             "test_lockstep_legacy_gauge_unique",
             "isolated legacy gauge",
         )
         .unwrap();
-        let alias = orpc::common::Metrics::new_gauge(
+        let alias = orpc_rpc::common::Metrics::new_gauge(
             "test_lockstep_alias_gauge_unique",
             "isolated alias gauge",
         )

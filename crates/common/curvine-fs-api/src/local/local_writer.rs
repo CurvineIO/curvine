@@ -17,10 +17,10 @@ use crate::{Path, Writer};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::FileStatus;
-use orpc::common::FileUtils;
-use orpc::err_ext;
-use orpc::io::LocalFile;
-use orpc::sys::DataSlice;
+use orpc_rpc::common::FileUtils;
+use orpc_rpc::err_ext;
+use orpc_rpc::io::LocalFile;
+use orpc_rpc::sys::DataSlice;
 use prost::bytes::BytesMut;
 
 pub struct LocalWriter {

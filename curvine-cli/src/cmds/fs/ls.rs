@@ -2,8 +2,8 @@ use clap::Subcommand;
 use curvine_fs_api::{CurvineURI, FileSystem};
 use curvine_model::FileStatus;
 use curvine_unified_fs::UnifiedFileSystem;
-use orpc::common::{ByteUnit, DurationUnit};
-use orpc::CommonResult;
+use orpc_rpc::common::{ByteUnit, DurationUnit};
+use orpc_rpc::CommonResult;
 
 /// Configuration for printing file entries
 #[derive(Debug)]
@@ -349,10 +349,10 @@ async fn print_file_entry(
     let mut group = file.group.to_string(); // Default group
     if owner.is_empty() || group.is_empty() {
         // Fallback to default values if owner/group is empty
-        let uid = orpc::sys::get_uid();
-        let gid = orpc::sys::get_gid();
-        let default_owner = orpc::sys::get_username_by_uid(uid);
-        let default_group = orpc::sys::get_groupname_by_gid(gid);
+        let uid = orpc_rpc::sys::get_uid();
+        let gid = orpc_rpc::sys::get_gid();
+        let default_owner = orpc_rpc::sys::get_username_by_uid(uid);
+        let default_group = orpc_rpc::sys::get_groupname_by_gid(gid);
         if owner.is_empty() {
             owner = default_owner.unwrap_or_else(|| "root".to_string());
         }

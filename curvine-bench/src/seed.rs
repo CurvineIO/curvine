@@ -19,7 +19,7 @@ use super::report::{BenchPrefillReport, TaskMetric};
 use super::runner::{collect, PathAction, WorkloadExecution};
 use super::{BenchOp, BenchPrefillConfig, CurvineBenchRunner};
 use curvine_unified_fs::UnifiedFileSystem;
-use orpc::CommonResult;
+use orpc_rpc::CommonResult;
 use std::sync::Arc;
 use std::time::Instant;
 

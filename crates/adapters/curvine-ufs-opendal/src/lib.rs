@@ -17,10 +17,10 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, ListStream, Path, Reader, Writer};
 use curvine_model::{FileStatus, FileType, ListOptions, SetAttrOpts};
-use curvine_ufs::OpendalConf;
+use curvine_ufs_api::OpendalConf;
 #[cfg(feature = "opendal-oss")]
-use curvine_ufs::OssHdfsConf;
-use curvine_ufs::{err_ufs, FOLDER_SUFFIX};
+use curvine_ufs_api::OssHdfsConf;
+use curvine_ufs_api::{err_ufs, FOLDER_SUFFIX};
 use futures::future::ready;
 use futures::stream::TryStreamExt;
 use futures::StreamExt;
@@ -29,9 +29,9 @@ use opendal::{
     layers::{LoggingLayer, RetryLayer, TimeoutLayer},
     ErrorKind, Metadata, Operator,
 };
-use orpc::error::ErrorExt;
-use orpc::sys::DataSlice;
-use orpc::{err_box, err_ext, try_option_mut};
+use orpc_rpc::error::ErrorExt;
+use orpc_rpc::sys::DataSlice;
+use orpc_rpc::{err_box, err_ext, try_option_mut};
 use std::collections::HashMap;
 use std::time::Duration;
 

@@ -14,20 +14,20 @@
 
 use crate::worker::task::TaskContext;
 use curvine_client_core::file::CurvineFileSystem;
-use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-use curvine_common::state::{
+use curvine_common_core::error::FsError;
+use curvine_common_core::fs::{FileSystem, Path, Reader, Writer};
+use curvine_common_core::state::{
     CreateFileOptsBuilder, FileAllocOpts, JobTaskState, SetAttrOptsBuilder,
 };
-use curvine_common::FsResult;
+use curvine_common_core::FsResult;
 use curvine_data_mover::UfsFactory;
 use curvine_job_client::JobMasterClient;
 use curvine_unified_fs::{UfsFileSystem, UnifiedReader, UnifiedWriter};
 use log::{error, info, warn};
-use orpc::common::{LocalTime, TimeSpent};
-use orpc::err_box;
-use orpc::runtime::RpcRuntime;
-use orpc::sys::DataSlice;
+use orpc_rpc::common::{LocalTime, TimeSpent};
+use orpc_rpc::err_box;
+use orpc_rpc::runtime::RpcRuntime;
+use orpc_rpc::sys::DataSlice;
 use std::sync::Arc;
 
 pub struct LoadTaskRunner {
@@ -523,7 +523,7 @@ impl LoadTaskRunner {
     /// abort is best-effort (it fires at the next await point); combined with the
     /// in-loop is_cancel()/deadline checks this bounds how long a stream can run
     /// past the parent's decision to stop.
-    fn abort_remaining(handles: &[orpc::runtime::JoinHandle<FsResult<i64>>], from: usize) {
+    fn abort_remaining(handles: &[orpc_rpc::runtime::JoinHandle<FsResult<i64>>], from: usize) {
         for h in handles.iter().skip(from) {
             h.abort();
         }

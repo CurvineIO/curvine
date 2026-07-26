@@ -12,10 +12,9 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::utils::SerdeUtils;
 use crate::FILE_BUFFER_SIZE;
-use orpc::io::IOResult;
-use orpc::try_err;
+use orpc_rpc::io::IOResult;
+use orpc_rpc::try_err;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
@@ -62,7 +61,7 @@ impl StateWriter {
     }
 
     pub fn write_struct<T: Serialize>(&mut self, obj: &T) -> IOResult<()> {
-        SerdeUtils::serialize_json_into(&mut self.inner, obj)?;
+        try_err!(serde_json::to_writer(&mut self.inner, obj));
         writeln!(self.inner)?;
         Ok(())
     }
@@ -129,7 +128,7 @@ impl StateReader {
 #[cfg(test)]
 mod tests {
     use super::{StateReader, StateWriter};
-    use orpc::common::{FastHashMap, FastHashSet, Utils};
+    use orpc_rpc::common::{FastHashMap, FastHashSet, Utils};
     use std::fs;
 
     #[test]

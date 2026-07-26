@@ -21,7 +21,7 @@ use crate::session::FuseOpCode::{self, *};
 use crate::FuseResult;
 use crate::FUSE_IN_HEADER_LEN;
 use bytes::Bytes;
-use orpc::{err_box, CommonResult};
+use orpc_rpc::{err_box, CommonResult};
 use std::fmt::{Display, Formatter};
 
 // fuse request data

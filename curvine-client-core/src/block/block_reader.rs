@@ -19,11 +19,11 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{ClientAddress, ExtendedBlock, LocatedBlock, WorkerAddress};
 use log::warn;
-use orpc::common::Utils;
-use orpc::error::ErrorExt;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sys::DataSlice;
-use orpc::CommonResult;
+use orpc_rpc::common::Utils;
+use orpc_rpc::error::ErrorExt;
+use orpc_rpc::runtime::{RpcRuntime, Runtime};
+use orpc_rpc::sys::DataSlice;
+use orpc_rpc::CommonResult;
 use std::sync::Arc;
 
 enum ReaderAdapter {

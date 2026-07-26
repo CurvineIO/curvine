@@ -58,7 +58,7 @@ impl LocalStatusUtils {
 
     fn file_to_status(
         path: &crate::Path,
-        file: &orpc::io::LocalFile,
+        file: &orpc_rpc::io::LocalFile,
     ) -> curvine_error::FsResult<curvine_model::FileStatus> {
         let meta = file.metadata()?;
         Ok(Self::metadata_to_file_status(path, &meta))

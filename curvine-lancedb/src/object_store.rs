@@ -24,10 +24,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use curvine_client::file::CurvineFileSystem;
-use curvine_common::conf::ClusterConf;
-use curvine_common::error::FsError;
-use curvine_common::fs::{Path as CurvinePath, Reader, Writer};
-use curvine_common::state::{
+use curvine_common_core::conf::ClusterConf;
+use curvine_common_core::error::FsError;
+use curvine_common_core::fs::{Path as CurvinePath, Reader, Writer};
+use curvine_common_core::state::{
     FileLock, FileStatus, LockFlags, LockType, SetAttrOpts, SetAttrOptsBuilder,
 };
 use futures::stream::{self, BoxStream};
@@ -48,8 +48,8 @@ use object_store::{
     PutOptions, PutPayload, PutResult, Result as OsResult, UploadPart,
 };
 use once_cell::sync::Lazy;
-use orpc::io::net::InetAddr;
-use orpc::sys::DataSlice;
+use orpc_rpc::io::net::InetAddr;
+use orpc_rpc::sys::DataSlice;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration, Instant};
 use url::Url;

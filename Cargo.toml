@@ -18,6 +18,8 @@ members = [
     "crates/common/curvine-fs-api",
     "crates/common/curvine-storage-api",
     "crates/common/curvine-config",
+    "crates/common/curvine-common-core",
+    "crates/common/curvine-ufs-api",
     "crates/infra/orpc-error",
     "crates/infra/orpc-runtime",
     "crates/infra/orpc-net",
@@ -57,7 +59,6 @@ members = [
 # Mirror members here unless a crate is intentionally opt-in.
 # curvine-lancedb stays opt-in because it pulls heavy Lance/Arrow dependencies.
 default-members = [
-    "orpc",
     "curvine-fault",
     "crates/common/curvine-error",
     "crates/common/curvine-proto",
@@ -65,6 +66,8 @@ default-members = [
     "crates/common/curvine-fs-api",
     "crates/common/curvine-storage-api",
     "crates/common/curvine-config",
+    "crates/common/curvine-common-core",
+    "crates/common/curvine-ufs-api",
     "crates/infra/orpc-error",
     "crates/infra/orpc-runtime",
     "crates/infra/orpc-net",
@@ -74,7 +77,6 @@ default-members = [
     "crates/adapters/curvine-rocksdb",
     "crates/metadata/curvine-raft",
     "crates/adapters/curvine-storage-local",
-    "curvine-common",
     "curvine-data-mover",
     "curvine-master",
     "curvine-worker",
@@ -89,7 +91,6 @@ default-members = [
     "curvine-tests",
     "curvine-fuse",
     "curvine-web",
-    "curvine-ufs",
     "curvine-cli"
 ]
 
@@ -99,7 +100,6 @@ edition = "2021"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-orpc = { path = "orpc" }
 orpc-error = { path = "crates/infra/orpc-error" }
 orpc-runtime = { path = "crates/infra/orpc-runtime" }
 orpc-net = { path = "crates/infra/orpc-net" }
@@ -120,7 +120,8 @@ curvine-model = { path = "crates/common/curvine-model" }
 curvine-fs-api = { path = "crates/common/curvine-fs-api" }
 curvine-storage-api = { path = "crates/common/curvine-storage-api" }
 curvine-config = { path = "crates/common/curvine-config" }
-curvine-common = { path = "curvine-common" }
+curvine-common-core = { path = "crates/common/curvine-common-core" }
+curvine-ufs-api = { path = "crates/common/curvine-ufs-api" }
 curvine-common-macros = { path = "curvine-common/macros" }
 curvine-data-mover = { path = "curvine-data-mover" }
 curvine-master = { path = "curvine-master" }
@@ -136,7 +137,6 @@ curvine-libsdk-java = { path = "curvine-libsdk-java" }
 curvine-libsdk-python = { path = "curvine-libsdk-python" }
 curvine-server = { path = "curvine-server" }
 curvine-lancedb = { path = "curvine-lancedb" }
-curvine-ufs = { path = "curvine-ufs" }
 curvine-tests = { path = "curvine-tests" }
 curvine-fuse = { path = "curvine-fuse" }
 curvine-web = { path = "curvine-web" }

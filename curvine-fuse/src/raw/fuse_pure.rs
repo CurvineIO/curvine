@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::conf::FuseConf;
+use curvine_config::FuseConf;
 use log::{error, info};
 use nix::unistd::{getgid, getuid};
-use orpc::err_io;
-use orpc::io::IOResult;
-use orpc::sys::RawIO;
+use orpc_rpc::err_io;
+use orpc_rpc::io::IOResult;
+use orpc_rpc::sys::RawIO;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::ErrorKind;
@@ -27,7 +27,7 @@ use std::path::Path;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 
-use orpc::sys::open;
+use orpc_rpc::sys::open;
 
 const FUSERMOUNT_BIN: &str = "fusermount";
 const FUSERMOUNT3_BIN: &str = "fusermount3";

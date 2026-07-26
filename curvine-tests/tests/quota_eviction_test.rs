@@ -14,7 +14,7 @@
 
 use curvine_server::master::quota::eviction::evictor::{Evictor, LRUEvictor};
 use curvine_server::master::quota::eviction::types::{EvictionConf, EvictionMode, EvictionPolicy};
-use orpc::CommonResult;
+use orpc_rpc::CommonResult;
 
 // ============================================================================
 // Helper Functions

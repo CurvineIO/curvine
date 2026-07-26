@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::master::fs::context::ValidateAddBlock;
-use curvine_common::state::StoragePolicy;
+use curvine_common_core::state::StoragePolicy;
 use std::collections::HashSet;
 
 #[derive(Debug, Clone)]

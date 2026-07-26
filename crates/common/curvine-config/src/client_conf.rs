@@ -14,10 +14,10 @@
 
 use crate::state::{StorageType, TtlAction};
 use curvine_common_macros::ClientCliArgs;
-use orpc::client::ClientConf as RpcConf;
-use orpc::common::{ByteUnit, DurationUnit, Utils};
-use orpc::io::net::InetAddr;
-use orpc::CommonResult;
+use orpc_rpc::client::ClientConf as RpcConf;
+use orpc_rpc::common::{ByteUnit, DurationUnit, Utils};
+use orpc_rpc::io::net::InetAddr;
+use orpc_rpc::CommonResult;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, ClientCliArgs)]

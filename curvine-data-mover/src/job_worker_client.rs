@@ -14,12 +14,12 @@
 
 use std::time::Duration;
 
-use curvine_common::fs::RpcCode;
-use curvine_common::proto::*;
-use curvine_common::state::{JobTaskType, LoadTaskInfo};
-use curvine_common::utils::{RpcUtils, SerdeUtils};
-use curvine_common::FsResult;
-use orpc::client::RpcClient;
+use curvine_common_core::fs::RpcCode;
+use curvine_common_core::proto::*;
+use curvine_common_core::state::{JobTaskType, LoadTaskInfo};
+use curvine_common_core::utils::{RpcUtils, SerdeUtils};
+use curvine_common_core::FsResult;
+use orpc_rpc::client::RpcClient;
 use prost::Message as PMessage;
 
 #[derive(Clone)]

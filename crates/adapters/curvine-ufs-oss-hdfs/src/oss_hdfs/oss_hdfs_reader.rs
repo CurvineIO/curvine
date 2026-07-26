@@ -17,7 +17,7 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{Path, Reader};
 use curvine_model::FileStatus;
-use orpc::sys::DataSlice;
+use orpc_rpc::sys::DataSlice;
 use std::os::raw::c_void;
 use std::sync::Arc;
 

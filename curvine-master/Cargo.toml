@@ -11,8 +11,8 @@ jni = ["curvine-data-mover/opendal-hdfs"]
 fault-injection = ["curvine-fault/http-server"]
 
 [dependencies]
-orpc = { workspace = true }
-curvine-common = { workspace = true }
+orpc-rpc = { workspace = true }
+curvine-common-core = { workspace = true }
 curvine-data-mover = { workspace = true }
 curvine-error = { workspace = true, features = ["axum-response"] }
 curvine-fault = { workspace = true }

@@ -38,7 +38,7 @@ mod spdk_conf;
 mod tests {
     use crate::conf::{ClusterConf, WorkerDataDir};
     use crate::state::StorageType;
-    use orpc::common::ByteUnit;
+    use orpc_rpc::common::ByteUnit;
 
     #[test]
     fn cluster() {

@@ -12,23 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod fs;
-
-mod ufs_utils;
-pub use self::ufs_utils::UfsUtils;
-
-mod conf;
-pub use self::conf::*;
-
-pub const FOLDER_SUFFIX: &str = "/";
-
-#[macro_export]
-macro_rules! err_ufs {
-    ($e:expr) => ({
-        Err(orpc::err_msg!($e).into())
-    });
-
-    ($f:tt, $($arg:expr),+) => ({
-        orpc::err_box!(format!($f, $($arg),+))
-    });
-}
+pub use curvine_ufs_api::*;

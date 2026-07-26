@@ -20,12 +20,12 @@ use crate::fuse_metrics::{
 use crate::session::{FuseTask, ResponseData};
 use crate::FuseResult;
 use log::{info, warn};
-use orpc::common::Gauge;
-use orpc::io::IOResult;
-use orpc::runtime::Runtime;
-use orpc::sync::channel::AsyncReceiver;
-use orpc::sys::pipe::{AsyncFd, Pipe2, PipeFd};
-use orpc::{err_box, sys, try_option_ref};
+use orpc_rpc::common::Gauge;
+use orpc_rpc::io::IOResult;
+use orpc_rpc::runtime::Runtime;
+use orpc_rpc::sync::channel::AsyncReceiver;
+use orpc_rpc::sys::pipe::{AsyncFd, Pipe2, PipeFd};
+use orpc_rpc::{err_box, sys, try_option_ref};
 use std::sync::Arc;
 
 /// Small responses use writev; splice only pays off for larger payloads.
@@ -271,7 +271,7 @@ fn mark_dequeued(queue_guard: Option<ActiveGuard>) {
 mod tests {
     use super::mark_dequeued;
     use crate::fuse_metrics::ActiveGuard;
-    use orpc::common::Metrics as m;
+    use orpc_rpc::common::Metrics as m;
 
     // `mark_dequeued` decrements at the dequeue point.
     #[test]

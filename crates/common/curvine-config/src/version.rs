@@ -12,8 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod scheduled_executor;
-pub use self::scheduled_executor::ScheduledExecutor;
-
-mod event_loop;
-pub use self::event_loop::EventLoop;
+include!(concat!(env!("OUT_DIR"), "/version.rs"));

@@ -18,13 +18,13 @@ use crate::{
     err_fuse, FuseResult, FuseUtils, FUSE_CURRENT_DIR, FUSE_PARENT_DIR, FUSE_PATH_MAX_DEPTH,
     FUSE_PATH_SEPARATOR, FUSE_ROOT_ID, FUSE_UNKNOWN_INO,
 };
-use curvine_common::conf::FuseConf;
-use curvine_common::fs::{Path, StateReader, StateWriter};
-use curvine_common::state::{FileStatus, SetAttrOpts};
+use curvine_config::FuseConf;
+use curvine_fs_api::{Path, StateReader, StateWriter};
+use curvine_model::{FileStatus, SetAttrOpts};
 use log::info;
-use orpc::common::{FastHashMap, LocalTime};
-use orpc::sync::AtomicCounter;
-use orpc::try_option_ref;
+use orpc_rpc::common::{FastHashMap, LocalTime};
+use orpc_rpc::sync::AtomicCounter;
+use orpc_rpc::try_option_ref;
 use std::collections::hash_map::Iter;
 
 pub struct DirTree {
@@ -607,8 +607,8 @@ impl Default for DirTree {
 mod test {
     use crate::fs::dcache::DirTree;
     use crate::FUSE_ROOT_ID;
-    use curvine_common::conf::FuseConf;
-    use curvine_common::state::FileStatus;
+    use curvine_config::FuseConf;
+    use curvine_model::FileStatus;
 
     fn dir_st(name: &str, id: i64) -> FileStatus {
         FileStatus {

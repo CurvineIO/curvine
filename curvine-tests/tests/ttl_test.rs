@@ -13,17 +13,17 @@
 // limitations under the License.
 
 use curvine_client::file::{FsClient, FsContext, FsWriter};
-use curvine_common::conf::ClientConf;
-use curvine_common::fs::{Path, Writer};
-use curvine_common::state::{
+use curvine_common_core::conf::ClientConf;
+use curvine_common_core::fs::{Path, Writer};
+use curvine_common_core::state::{
     CreateFileOptsBuilder, FileBlocks, MkdirOptsBuilder, SetAttrOptsBuilder, StoragePolicy,
     TtlAction,
 };
 use curvine_tests::Testing;
 use log::info;
-use orpc::common::{DurationUnit, LogConf, Logger};
-use orpc::runtime::RpcRuntime;
-use orpc::CommonResult;
+use orpc_rpc::common::{DurationUnit, LogConf, Logger};
+use orpc_rpc::runtime::RpcRuntime;
+use orpc_rpc::CommonResult;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 

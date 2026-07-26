@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::state::{BlockLocation, CommitBlock, FileAllocOpts, WorkerAddress};
+use curvine_common_core::state::{BlockLocation, CommitBlock, FileAllocOpts, WorkerAddress};
 use serde::{Deserialize, Serialize};
 
 #[allow(unused)]

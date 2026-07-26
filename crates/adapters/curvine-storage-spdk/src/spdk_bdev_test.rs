@@ -1,9 +1,9 @@
 use crate::spdk_bdev::SpdkBdev;
 use crate::spdk_env::{SpdkEnv, SpdkEnvState};
 use bytes::BytesMut;
-use orpc::common::Utils;
-use orpc::io::{BlockIO, NvmeTarget, SpdkConf};
-use orpc::sys::DataSlice;
+use orpc_rpc::common::Utils;
+use orpc_rpc::io::{BlockIO, NvmeTarget, SpdkConf};
+use orpc_rpc::sys::DataSlice;
 use std::sync::Once;
 
 static INIT: Once = Once::new();

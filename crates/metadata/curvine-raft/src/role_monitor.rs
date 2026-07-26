@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use num_enum::{FromPrimitive, IntoPrimitive};
-use orpc::sync::{StateCtl, StateListener, StateMonitor};
-use orpc::CommonResult;
+use orpc_rpc::sync::{StateCtl, StateListener, StateMonitor};
+use orpc_rpc::CommonResult;
 use raft::{SoftState, StateRole};
 
 // raft node status.

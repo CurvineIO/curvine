@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use orpc::common::Utils;
-use orpc::io::net::InetAddr;
+use orpc_rpc::common::Utils;
+use orpc_rpc::io::net::InetAddr;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 

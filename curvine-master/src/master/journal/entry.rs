@@ -14,7 +14,7 @@
 
 use crate::master::meta::inode::{InodeDir, InodeFile};
 use crate::master::meta::BlockMeta;
-use curvine_common::state::{CommitBlock, FileLock, MountInfo, SetAttrOpts};
+use curvine_common_core::state::{CommitBlock, FileLock, MountInfo, SetAttrOpts};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

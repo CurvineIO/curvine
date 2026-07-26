@@ -37,8 +37,8 @@ cargo test --features opendal-hdfs,opendal-webhdfs -p curvine-ufs --test hdfs_in
 
 #[cfg(any(feature = "opendal-hdfs", feature = "opendal-webhdfs"))]
 mod hdfs_tests {
-    use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-    use curvine_ufs::opendal::OpendalFileSystem;
+    use curvine_common_core::fs::{FileSystem, Path, Reader, Writer};
+    use curvine_ufs_api::opendal::OpendalFileSystem;
     use std::collections::HashMap;
     use std::env;
 
@@ -57,7 +57,7 @@ mod hdfs_tests {
         println!("Testing JVM initialization...");
         #[cfg(feature = "jni")]
         {
-            use curvine_common::jvm::{is_jvm_available, load_jvm_memory_stats, register_jvm, JVM};
+            use curvine_common_core::jvm::{is_jvm_available, load_jvm_memory_stats, register_jvm, JVM};
 
             // Register JVM builder first - exactly like
             register_jvm();

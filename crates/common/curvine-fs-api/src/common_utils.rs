@@ -12,13 +12,12 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::fs::Path;
-use crate::state::{FileStatus, FileType};
-use crate::FsResult;
+use crate::{FsResult, Path};
+use curvine_model::{FileStatus, FileType};
 use log::info;
-use orpc::common::Utils;
-use orpc::io::LocalFile;
-use orpc::{err_msg, ternary, CommonResult};
+use orpc_rpc::common::Utils;
+use orpc_rpc::io::LocalFile;
+use orpc_rpc::{err_msg, ternary, CommonResult};
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};

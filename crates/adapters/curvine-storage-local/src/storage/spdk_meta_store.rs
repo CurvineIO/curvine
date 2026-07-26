@@ -6,7 +6,7 @@ use crate::BlockMeta;
 use byteorder::{BigEndian, ByteOrder};
 use curvine_rocksdb::{DBConf, DBEngine};
 use log::{info, warn};
-use orpc::{err_box, CommonResult};
+use orpc_rpc::{err_box, CommonResult};
 const CF_SPDK_BLOCKS: &str = "spdk_blocks";
 const VALUE_SIZE: usize = 29;
 pub struct SpdkMetaStore {

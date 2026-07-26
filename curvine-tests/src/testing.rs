@@ -14,14 +14,14 @@
 
 use curvine_client::file::CurvineFileSystem;
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::conf::ClusterConf;
-use curvine_common::fs::Path;
+use curvine_common_core::conf::ClusterConf;
+use curvine_common_core::fs::Path;
 use curvine_server::test::MiniCluster;
 use once_cell::sync::OnceCell;
-use orpc::common::{FileUtils, Logger, Utils};
-use orpc::io::LocalFile;
-use orpc::runtime::Runtime;
-use orpc::CommonResult;
+use orpc_rpc::common::{FileUtils, Logger, Utils};
+use orpc_rpc::io::LocalFile;
+use orpc_rpc::runtime::Runtime;
+use orpc_rpc::CommonResult;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};

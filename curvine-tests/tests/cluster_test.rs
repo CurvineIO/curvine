@@ -15,14 +15,14 @@
 #![allow(unused)]
 
 use curvine_client::file::CurvineFileSystem;
-use curvine_common::conf::ClusterConf;
-use curvine_common::fs::{Path, Writer};
-use curvine_common::state::FileBlocks;
+use curvine_common_core::conf::ClusterConf;
+use curvine_common_core::fs::{Path, Writer};
+use curvine_common_core::state::FileBlocks;
 use curvine_server::test::MiniCluster;
 use curvine_tests::Testing;
-use orpc::common::Utils;
-use orpc::runtime::{AsyncRuntime, RpcRuntime};
-use orpc::{CommonError, CommonResult};
+use orpc_rpc::common::Utils;
+use orpc_rpc::runtime::{AsyncRuntime, RpcRuntime};
+use orpc_rpc::{CommonError, CommonResult};
 use std::sync::Arc;
 
 // Cluster functional unit test.

@@ -13,14 +13,14 @@
 // limitations under the License.
 
 use curvine_client::file::{FsClient, FsContext};
-use curvine_common::fs::CurvineURI;
-use curvine_common::state::MountOptions;
+use curvine_common_core::fs::CurvineURI;
+use curvine_common_core::state::MountOptions;
 use curvine_server::common::ufs_manager::UfsManager;
 use curvine_tests::Testing;
 use log::info;
-use orpc::common::Logger;
-use orpc::runtime::RpcRuntime;
-use orpc::CommonResult;
+use orpc_rpc::common::Logger;
+use orpc_rpc::runtime::RpcRuntime;
+use orpc_rpc::CommonResult;
 use std::collections::HashMap;
 use std::sync::Arc;
 

@@ -12,22 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::conf::{ClusterConf, JournalConf, MasterConf};
-use curvine_common::error::FsError;
-use curvine_common::fs::CurvineURI;
-use curvine_common::fs::RpcCode;
-use curvine_common::proto::{
+use curvine_common_core::conf::{ClusterConf, JournalConf, MasterConf};
+use curvine_common_core::error::FsError;
+use curvine_common_core::fs::CurvineURI;
+use curvine_common_core::fs::RpcCode;
+use curvine_common_core::proto::{
     CreateFileRequest, DeleteRequest, GetMasterInfoRequest, MkdirOptsProto, MkdirRequest,
     RenameRequest,
 };
-use curvine_common::state::MountOptions;
-use curvine_common::state::{
+use curvine_common_core::state::MountOptions;
+use curvine_common_core::state::{
     BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, MkdirOptsBuilder, StorageType, TtlAction,
     WorkerAddress, WorkerInfo,
 };
-use curvine_common::state::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
-use curvine_common::utils::SerdeUtils;
+use curvine_common_core::state::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
+use curvine_common_core::utils::SerdeUtils;
 use curvine_raft::storage::{AppStorage, ApplyMsg};
 use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader, JournalSystem};
@@ -35,14 +35,14 @@ use curvine_server::master::meta::inode::ttl::InodeTtlExecutor;
 use curvine_server::master::meta::InodeId;
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
 use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
-use orpc::common::LocalTime;
-use orpc::common::Utils;
-use orpc::handler::MessageHandler;
-use orpc::message::Builder;
+use orpc_rpc::common::LocalTime;
+use orpc_rpc::common::Utils;
+use orpc_rpc::handler::MessageHandler;
+use orpc_rpc::message::Builder;
 #[cfg(feature = "fault-injection")]
-use orpc::message::ResponseStatus;
-use orpc::runtime::{AsyncRuntime, RpcRuntime};
-use orpc::CommonResult;
+use orpc_rpc::message::ResponseStatus;
+use orpc_rpc::runtime::{AsyncRuntime, RpcRuntime};
+use orpc_rpc::CommonResult;
 use raft::eraftpb::Entry;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -1775,11 +1775,11 @@ fn test_idempotent_set_locks() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let (fs, js, loader, _js2, fs2) = setup_pair("set-locks");
     fs.create("/lockfile.log", true)?;
-    let lock = curvine_common::state::FileLock {
+    let lock = curvine_common_core::state::FileLock {
         client_id: "client1".to_string(),
         owner_id: 1,
-        lock_type: curvine_common::state::LockType::WriteLock,
-        lock_flags: curvine_common::state::LockFlags::Plock,
+        lock_type: curvine_common_core::state::LockType::WriteLock,
+        lock_flags: curvine_common_core::state::LockFlags::Plock,
         start: 0,
         end: 100,
         ..Default::default()

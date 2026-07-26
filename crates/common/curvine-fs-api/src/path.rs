@@ -17,7 +17,7 @@
 use crate::fs::FsKind;
 use hyper::Uri;
 use once_cell::sync::Lazy;
-use orpc::CommonResult;
+use orpc_rpc::CommonResult;
 use regex::Regex;
 use std::fmt::{Display, Formatter};
 use std::path::MAIN_SEPARATOR;
@@ -330,7 +330,7 @@ impl From<&str> for Path {
 #[cfg(test)]
 mod tests {
     use crate::fs::Path;
-    use orpc::CommonResult;
+    use orpc_rpc::CommonResult;
 
     #[test]
     fn normalize_path() -> CommonResult<()> {

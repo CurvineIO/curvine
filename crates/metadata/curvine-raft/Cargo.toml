@@ -6,10 +6,10 @@ license.workspace = true
 description = "Curvine raft journal implementation."
 
 [dependencies]
-curvine-common = { workspace = true }
+curvine-common-core = { workspace = true }
 curvine-error = { workspace = true }
 curvine-rocksdb = { workspace = true }
-orpc = { workspace = true }
+orpc-rpc = { workspace = true }
 raft = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }

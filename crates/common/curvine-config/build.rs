@@ -17,19 +17,13 @@ use std::process::Command;
 use std::{env, fs, str};
 
 fn main() {
-    // Non-raft protos are owned by curvine-proto and raft protos are owned by
-    // curvine-raft. curvine-common only generates VERSION metadata.
     emit_git_rerun_if_changed();
 
-    // Build version number file
-    let base = env::var("OUT_DIR").unwrap_or_else(|_| ".".to_string());
-    let ver_file = format!("{}/version.rs", base);
-    let commit = get_git_head_commit();
+    let commit = run_git_command(&["rev-parse", "--short", "HEAD"]);
     let pkg_version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_string());
     let git_tag = get_git_tag();
     let git_branch = get_git_branch();
 
-    // Build the source info: prefer tag over branch
     let source_info = if !git_tag.is_empty() && git_tag != "unknown" {
         format!("tag: {}", git_tag)
     } else if !git_branch.is_empty() && git_branch != "unknown" {
@@ -38,7 +32,6 @@ fn main() {
         String::new()
     };
 
-    // Build full version string
     let full_version = if !source_info.is_empty() {
         format!("{} (commit: {}, {})", pkg_version, commit, source_info)
     } else {
@@ -64,12 +57,10 @@ pub static VERSION: &str = "{}";
         commit, pkg_version, git_tag, git_branch, full_version
     );
 
-    fs::write(ver_file, version_content).unwrap();
+    let base = env::var("OUT_DIR").unwrap_or_else(|_| ".".to_string());
+    fs::write(format!("{base}/version.rs"), version_content).unwrap();
 }
 
-/// Tell Cargo to re-run this build script when Git HEAD (or the branch it
-/// points at) changes. Uses `git rev-parse --git-path` so git worktrees work
-/// (literal `.git/HEAD` is a file there, not a directory).
 fn emit_git_rerun_if_changed() {
     let Some(head_path) = git_path("HEAD") else {
         return;
@@ -85,8 +76,6 @@ fn emit_git_rerun_if_changed() {
         }
     }
 
-    // After `git pack-refs`, the loose ref may be absent and tip updates only
-    // touch packed-refs; watch it so incremental builds still refresh VERSION.
     if let Some(packed_refs) = git_path("packed-refs") {
         println!("cargo:rerun-if-changed={}", packed_refs.display());
     }
@@ -108,19 +97,12 @@ fn git_path(path: &str) -> Option<PathBuf> {
     if path.is_absolute() {
         Some(path.to_path_buf())
     } else {
-        // `git rev-parse --git-path` may return a cwd-relative path; resolve
-        // against the package directory so Cargo can watch it reliably.
         let manifest_dir = env::var_os("CARGO_MANIFEST_DIR")?;
         Some(PathBuf::from(manifest_dir).join(path))
     }
 }
 
-fn get_git_head_commit() -> String {
-    run_git_command(&["rev-parse", "--short", "HEAD"])
-}
-
 fn get_git_tag() -> String {
-    // Try to get exact tag at HEAD
     let tag = run_git_command(&["describe", "--tags", "--exact-match", "HEAD"]);
     if !tag.is_empty() && tag != "unknown" {
         return tag;
@@ -130,7 +112,6 @@ fn get_git_tag() -> String {
 
 fn get_git_branch() -> String {
     let branch = run_git_command(&["rev-parse", "--abbrev-ref", "HEAD"]);
-    // Skip if it's HEAD (detached HEAD state, like in CI)
     if branch == "HEAD" {
         return String::new();
     }
@@ -148,5 +129,6 @@ fn run_git_command(args: &[&str]) -> String {
                 .to_string();
         }
     }
+
     "unknown".to_string()
 }

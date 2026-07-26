@@ -18,7 +18,7 @@ use crate::raw::fuse_abi::*;
 use crate::FuseError;
 use crate::FuseResult;
 use crate::*;
-use curvine_common::conf::FuseConf;
+use curvine_config::FuseConf;
 use log::info;
 
 pub const TEST_DIR_ATTR: fuse_attr = fuse_attr {

@@ -18,9 +18,9 @@ use curvine_error::FsResult;
 use curvine_fs_api::{Path, Writer};
 use curvine_model::{FileAllocOpts, FileBlocks, FileStatus};
 use log::debug;
-use orpc::common::ByteUnit;
-use orpc::sys::DataSlice;
-use orpc::{err_box, ternary};
+use orpc_rpc::common::ByteUnit;
+use orpc_rpc::sys::DataSlice;
+use orpc_rpc::{err_box, ternary};
 use std::sync::Arc;
 
 type Inner = FsWriterBuffer;

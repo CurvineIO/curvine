@@ -16,7 +16,7 @@ use crate::core::Session;
 use curvine_client::rpc::JobMasterClient;
 use curvine_error::FsResult;
 use curvine_model::{JobStatus, LoadJobCommand, LoadJobResult};
-use orpc::runtime::RpcRuntime;
+use orpc_rpc::runtime::RpcRuntime;
 
 pub fn submit_load(session: &Session, source: impl AsRef<str>) -> FsResult<LoadJobResult> {
     let client = JobMasterClient::new(session.fs_client());

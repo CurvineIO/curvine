@@ -72,12 +72,8 @@ jobs:
       - name: Dependency boundary guardrails
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          scripts/check-deps.sh --mode report
-
-      - name: API crate dependency boundary check
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          make check-api-crate-deps
+          scripts/check-api-crate-deps.sh
+          scripts/check-deps.sh --mode final
         
       - name: Run clippy
         env:
@@ -107,6 +103,10 @@ jobs:
           
           echo "After build, disk usage:"
           df -h
+
+      - name: Minimal artifact runtime dependency guardrails
+        run: |
+          scripts/check-minimal-artifact-deps.sh target/debug
 
       # - name: Run unit tests (skip UFS-dependent tests in CI)
       #   env:

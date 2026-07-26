@@ -10,7 +10,7 @@ curvine-error = { workspace = true }
 curvine-fs-api = { workspace = true }
 curvine-model = { workspace = true }
 curvine-proto = { workspace = true }
-orpc = { workspace = true }
+orpc-rpc = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }
 bincode = { workspace = true }

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::master::{Master, MasterMetrics};
-use orpc::CommonResult;
+use orpc_rpc::CommonResult;
 
 /// File system statistics tracker for maintaining real-time counts
 /// of files and directories without expensive traversal operations.

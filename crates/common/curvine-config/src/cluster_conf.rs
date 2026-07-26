@@ -15,11 +15,11 @@
 use crate::{CliConf, ClientConf, FuseConf, JobConf};
 use log::info;
 use nix::ifaddrs::getifaddrs;
-use orpc::client::ClientConf as RpcConf;
-use orpc::common::LogConf;
-use orpc::io::net::{InetAddr, NodeAddr};
-use orpc::io::retry::TimeBondedRetryBuilder;
-use orpc::{err_box, try_err, CommonResult};
+use orpc_rpc::client::ClientConf as RpcConf;
+use orpc_rpc::common::LogConf;
+use orpc_rpc::io::net::{InetAddr, NodeAddr};
+use orpc_rpc::io::retry::TimeBondedRetryBuilder;
+use orpc_rpc::{err_box, try_err, CommonResult};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fmt::{Display, Formatter};

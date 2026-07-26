@@ -17,8 +17,8 @@ use curvine_client_core::file::FsContext;
 use curvine_config::ClusterConf;
 use curvine_model::WorkerAddress;
 use once_cell::sync::Lazy;
-use orpc::runtime::Runtime;
-use orpc::test::SimpleServer;
+use orpc_rpc::runtime::Runtime;
+use orpc_rpc::test::SimpleServer;
 use std::sync::Arc;
 use std::time::Duration;
 

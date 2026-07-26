@@ -15,12 +15,12 @@
 use crate::proto::{SnapshotDownloadResponse, SnapshotFileInfo, SnapshotFileList};
 use crate::snapshot::{FileWriter, SnapshotClient};
 use crate::{NodeId, RaftClient, RaftResult};
-use curvine_common::conf::JournalConf;
+use curvine_common_core::conf::JournalConf;
 use log::{debug, error, info};
-use orpc::common::{ByteUnit, FileUtils, TimeSpent};
-use orpc::err_box;
-use orpc::runtime::GroupExecutor;
-use orpc::sys::DataSlice;
+use orpc_rpc::common::{ByteUnit, FileUtils, TimeSpent};
+use orpc_rpc::err_box;
+use orpc_rpc::runtime::GroupExecutor;
+use orpc_rpc::sys::DataSlice;
 use std::path::PathBuf;
 use std::sync::Arc;
 

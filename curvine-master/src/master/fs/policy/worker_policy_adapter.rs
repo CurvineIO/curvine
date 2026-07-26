@@ -17,10 +17,10 @@ use crate::master::fs::policy::{
     ChooseContext, LoadBasedWorkerPolicy, LocalWorkerPolicy, RandomWorkerPolicy, RobinWorkerPolicy,
     WeightedWorkerPolicy, WorkerPolicy,
 };
-use curvine_common::conf::ClusterConf;
-use curvine_common::state::{WorkerAddress, WorkerInfo};
+use curvine_common_core::conf::ClusterConf;
+use curvine_common_core::state::{WorkerAddress, WorkerInfo};
 use indexmap::IndexMap;
-use orpc::{err_box, CommonResult};
+use orpc_rpc::{err_box, CommonResult};
 
 pub enum WorkerPolicyAdapter {
     Robin(RobinWorkerPolicy),

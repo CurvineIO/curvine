@@ -21,7 +21,7 @@ use async_stream::stream;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{FileStatus, ListOptions, SetAttrOpts};
-use orpc::err_box;
+use orpc_rpc::err_box;
 use std::fs;
 
 #[derive(Clone)]

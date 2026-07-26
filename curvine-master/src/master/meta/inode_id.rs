@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::master::meta::inode::ROOT_INODE_ID;
-use orpc::sync::AtomicLong;
-use orpc::{err_box, CommonResult};
+use orpc_rpc::sync::AtomicLong;
+use orpc_rpc::{err_box, CommonResult};
 
 pub struct InodeId(AtomicLong);
 
@@ -94,8 +94,8 @@ impl InodeId {
 #[cfg(test)]
 mod tests {
     use crate::master::meta::InodeId;
-    use orpc::common::Utils;
-    use orpc::CommonResult;
+    use orpc_rpc::common::Utils;
+    use orpc_rpc::CommonResult;
 
     #[test]
     fn test_id_create() -> CommonResult<()> {

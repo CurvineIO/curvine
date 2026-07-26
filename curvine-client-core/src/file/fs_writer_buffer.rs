@@ -18,11 +18,11 @@ use curvine_error::FsResult;
 use curvine_fs_api::Path;
 use curvine_model::{FileAllocOpts, FileBlocks, FileStatus};
 use log::error;
-use orpc::io::IOError;
-use orpc::runtime::RpcRuntime;
-use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
-use orpc::sync::ErrorMonitor;
-use orpc::sys::DataSlice;
+use orpc_rpc::io::IOError;
+use orpc_rpc::runtime::RpcRuntime;
+use orpc_rpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
+use orpc_rpc::sync::ErrorMonitor;
+use orpc_rpc::sys::DataSlice;
 use std::sync::Arc;
 
 // Control task type
@@ -312,8 +312,8 @@ mod tests {
     use super::{recv_task, SelectTask, WriterTask};
     use bytes::Bytes;
     use curvine_error::FsResult;
-    use orpc::sync::channel::{AsyncChannel, CallChannel};
-    use orpc::sys::DataSlice;
+    use orpc_rpc::sync::channel::{AsyncChannel, CallChannel};
+    use orpc_rpc::sys::DataSlice;
 
     #[tokio::test]
     async fn cancel_control_preempts_queued_data() {

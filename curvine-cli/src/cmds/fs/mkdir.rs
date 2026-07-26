@@ -2,7 +2,7 @@ use clap::Subcommand;
 use curvine_fs_api::{CurvineURI, FileSystem};
 use curvine_model::SetAttrOpts;
 use curvine_unified_fs::UnifiedFileSystem;
-use orpc::CommonResult;
+use orpc_rpc::CommonResult;
 
 #[derive(Subcommand, Debug)]
 pub enum MkdirCommand {
@@ -23,10 +23,10 @@ impl MkdirCommand {
                 println!("Creating directory: {} (parents: {})", path, parents);
                 let path = CurvineURI::new(path)?;
                 let _ = client.mkdir(&path, *parents).await?;
-                let uid = orpc::sys::get_uid();
-                let gid = orpc::sys::get_gid();
-                let owner = orpc::sys::get_username_by_uid(uid);
-                let group = orpc::sys::get_groupname_by_gid(gid);
+                let uid = orpc_rpc::sys::get_uid();
+                let gid = orpc_rpc::sys::get_gid();
+                let owner = orpc_rpc::sys::get_username_by_uid(uid);
+                let group = orpc_rpc::sys::get_groupname_by_gid(gid);
                 let opts = SetAttrOpts {
                     owner,
                     group,

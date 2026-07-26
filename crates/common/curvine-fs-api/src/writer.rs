@@ -16,9 +16,9 @@ use crate::fs::Path;
 use crate::state::{FileAllocOpts, FileStatus};
 use crate::FsResult;
 use bytes::{BufMut, BytesMut};
-use orpc::err_box;
-use orpc::runtime::RpcRuntime;
-use orpc::{runtime::Runtime, sys::DataSlice};
+use orpc_rpc::err_box;
+use orpc_rpc::runtime::RpcRuntime;
+use orpc_rpc::{runtime::Runtime, sys::DataSlice};
 use std::future::Future;
 
 pub trait Writer {

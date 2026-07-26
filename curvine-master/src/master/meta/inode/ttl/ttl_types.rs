@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use curvine_common::state::TtlAction;
-use orpc::common::LocalTime;
+pub use curvine_common_core::state::TtlAction;
+use orpc_rpc::common::LocalTime;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -49,7 +49,7 @@ impl TtlConfig {
     }
 
     pub fn from_storage_policy(
-        storage_policy: &curvine_common::state::StoragePolicy,
+        storage_policy: &curvine_common_core::state::StoragePolicy,
     ) -> Option<Self> {
         if storage_policy.ttl_ms > 0 && storage_policy.ttl_action != TtlAction::None {
             Some(Self {
@@ -190,8 +190,8 @@ impl From<std::io::Error> for TtlError {
         TtlError::Io(err.to_string())
     }
 }
-impl From<curvine_common::error::FsError> for TtlError {
-    fn from(err: curvine_common::error::FsError) -> Self {
+impl From<curvine_common_core::error::FsError> for TtlError {
+    fn from(err: curvine_common_core::error::FsError) -> Self {
         TtlError::FsError(err.to_string())
     }
 }

@@ -7,10 +7,12 @@ license.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-orpc = { workspace = true}
-curvine-common = { workspace = true }
-curvine-client = { workspace = true, features = ["unified", "opendal-s3"] }
+orpc-rpc = { workspace = true }
+curvine-client = { workspace = true, features = ["unified"] }
 curvine-config = { workspace = true }
+curvine-error = { workspace = true }
+curvine-fs-api = { workspace = true }
+curvine-model = { workspace = true }
 log = { workspace = true }
 clap = { workspace = true }
 pin-project-lite = { workspace = true }

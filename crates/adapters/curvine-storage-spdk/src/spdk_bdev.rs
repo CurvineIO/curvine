@@ -13,10 +13,10 @@
 
 use bytes::BytesMut;
 use log::{debug, error, warn};
-use orpc::err_box;
-use orpc::io::BlockIO;
-use orpc::io::IOResult;
-use orpc::sys::DataSlice;
+use orpc_rpc::err_box;
+use orpc_rpc::io::BlockIO;
+use orpc_rpc::io::IOResult;
+use orpc_rpc::sys::DataSlice;
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicBool, Ordering};
 // ---------------------------------------------------------------------------
@@ -763,7 +763,7 @@ impl Drop for SpdkBdev {
 mod test {
     use super::*;
     use crate::spdk_env::SpdkEnv;
-    use orpc::io::SpdkConf;
+    use orpc_rpc::io::SpdkConf;
 
     fn ensure_spdk_init() {
         if SpdkEnv::global().is_some() {
@@ -783,7 +783,7 @@ mod test {
             .unwrap_or_else(|_| "nqn.2024-01.io.curvine:test".into());
         let trtype = std::env::var("SPDK_TRANSPORT_TYPE").unwrap_or_else(|_| "tcp".into());
         conf.iova_mode = std::env::var("SPDK_IOVA_MODE").unwrap_or_else(|_| "va".to_string());
-        conf.targets = vec![orpc::io::NvmeTarget {
+        conf.targets = vec![orpc_rpc::io::NvmeTarget {
             traddr,
             trsvcid,
             subnqn,

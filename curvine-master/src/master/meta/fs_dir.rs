@@ -20,18 +20,18 @@ use crate::master::meta::inode::*;
 use crate::master::meta::store::{InodeStore, RocksInodeStore};
 use crate::master::meta::{BlockMeta, InodeId};
 use crate::master::quota::eviction::evictor::Evictor;
-use curvine_common::conf::ClusterConf;
-use curvine_common::error::FsError;
-use curvine_common::state::{
+use curvine_common_core::conf::ClusterConf;
+use curvine_common_core::error::FsError;
+use curvine_common_core::state::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
     FreeResult, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, WorkerAddress,
     INTERNAL_CTIME_XATTR,
 };
-use curvine_common::FsResult;
+use curvine_common_core::FsResult;
 use log::{debug, info, warn};
-use orpc::common::{LocalTime, TimeSpent};
-use orpc::sync::AtomicCounter;
-use orpc::{err_box, err_ext, try_option, CommonResult};
+use orpc_rpc::common::{LocalTime, TimeSpent};
+use orpc_rpc::sync::AtomicCounter;
+use orpc_rpc::{err_box, err_ext, try_option, CommonResult};
 use std::collections::{HashMap, LinkedList};
 use std::mem;
 use std::sync::Arc;
@@ -998,7 +998,7 @@ impl FsDir {
             Some(inode) => match inode.as_ref() {
                 File(file) => {
                     // Check if it's a regular file (not a directory or symlink)
-                    if file.file_type != curvine_common::state::FileType::File {
+                    if file.file_type != curvine_common_core::state::FileType::File {
                         return err_ext!(FsError::common("Cannot create link to non-regular file"));
                     }
                     (file.id, Some(inode.clone()))

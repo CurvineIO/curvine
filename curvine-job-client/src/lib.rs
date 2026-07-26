@@ -28,8 +28,8 @@ use curvine_proto::{
     CancelJobRequest, CancelJobResponse, GetJobStatusRequest, GetJobStatusResponse,
     SubmitJobRequest, SubmitJobResponse, TaskReportRequest, TaskReportResponse,
 };
-use orpc::common::TimeSpent;
-use orpc::err_box;
+use orpc_rpc::common::TimeSpent;
+use orpc_rpc::err_box;
 
 use curvine_client_core::file::{FsClient, FsContext};
 
