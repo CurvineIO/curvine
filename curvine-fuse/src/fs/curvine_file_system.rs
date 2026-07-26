@@ -659,6 +659,7 @@ impl CurvineFileSystem {
         check_permission: bool,
         caller_uid: u32,
         caller_gid: u32,
+        caller_pid: u32,
         file_uid: u32,
         valid: u32,
         target_gid: Option<u32>,
@@ -684,7 +685,7 @@ impl CurvineFileSystem {
                 );
             }
             if let Some(gid) = target_gid {
-                if !FuseUtils::caller_in_file_group(caller_gid, gid) {
+                if !FuseUtils::caller_in_file_group(caller_gid, gid, caller_pid) {
                     return err_fuse!(
                         libc::EPERM,
                         "setattr gid change denied for gid {} not in caller groups",
@@ -1077,9 +1078,6 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path(op.header.nodeid)?;
         self.ensure_writable_path(&path, RpcCode::SetAttr).await?;
 
-        self.check_traverse_permissions(op.header.nodeid, op.header)
-            .await?;
-
         let cur_status = self.state.fs_stat(op.header.nodeid, None).await?;
         let file_uid = self.resolve_file_uid(&cur_status.owner);
         let file_gid = self.resolve_file_gid(&cur_status.group);
@@ -1088,10 +1086,21 @@ impl fs::FileSystem for CurvineFileSystem {
         } else {
             None
         };
+
+        let mode_only = (op.arg.valid & (FATTR_UID | FATTR_GID | FATTR_SIZE)) == 0
+            && (op.arg.valid & FATTR_MODE) != 0;
+        let skip_traverse = op.arg.fh != 0 || (mode_only && op.header.uid == file_uid);
+
+        if !skip_traverse {
+            self.check_traverse_permissions(op.header.nodeid, op.header)
+                .await?;
+        }
+
         Self::check_setattr_permission(
             self.conf.check_permission,
             op.header.uid,
             op.header.gid,
+            op.header.pid,
             file_uid,
             op.arg.valid,
             target_gid,
@@ -1102,7 +1111,8 @@ impl fs::FileSystem for CurvineFileSystem {
 
         if (op.arg.valid & FATTR_MODE) != 0 {
             if let Some(mode) = opts.mode {
-                let in_file_group = FuseUtils::caller_in_file_group(op.header.gid, file_gid);
+                let in_file_group =
+                    FuseUtils::caller_in_file_group(op.header.gid, file_gid, op.header.pid);
                 opts.mode = Some(FuseUtils::normalize_chmod_mode(
                     mode,
                     op.header.uid,
@@ -1965,7 +1975,7 @@ mod tests {
     #[test]
     fn setattr_permission_denies_non_owner_chown() {
         let err = super::CurvineFileSystem::check_setattr_permission(
-            true, 1000, 1000, 0, FATTR_UID, None,
+            true, 1000, 1000, 0, 0, FATTR_UID, None,
         )
         .unwrap_err();
         assert_eq!(err.errno(), libc::EPERM);
@@ -1974,7 +1984,7 @@ mod tests {
     #[test]
     fn setattr_permission_denies_owner_uid_change() {
         let err = super::CurvineFileSystem::check_setattr_permission(
-            true, 1000, 1000, 1000, FATTR_UID, None,
+            true, 1000, 1000, 0, 1000, FATTR_UID, None,
         )
         .unwrap_err();
         assert_eq!(err.errno(), libc::EPERM);
@@ -1982,14 +1992,14 @@ mod tests {
 
     #[test]
     fn setattr_permission_allows_root_chown() {
-        super::CurvineFileSystem::check_setattr_permission(true, 0, 0, 1000, FATTR_UID, None)
+        super::CurvineFileSystem::check_setattr_permission(true, 0, 0, 0, 1000, FATTR_UID, None)
             .unwrap();
     }
 
     #[test]
     fn setattr_permission_allows_owner_mode_change() {
         super::CurvineFileSystem::check_setattr_permission(
-            true, 1000, 1000, 1000, FATTR_MODE, None,
+            true, 1000, 1000, 0, 1000, FATTR_MODE, None,
         )
         .unwrap();
     }
@@ -2000,6 +2010,7 @@ mod tests {
             true,
             1000,
             100,
+            0,
             1000,
             FATTR_GID,
             Some(200),
@@ -2014,6 +2025,7 @@ mod tests {
             true,
             1000,
             100,
+            0,
             1000,
             FATTR_GID,
             Some(100),
@@ -2023,8 +2035,16 @@ mod tests {
 
     #[test]
     fn setattr_permission_ignores_mtime_only_changes() {
-        super::CurvineFileSystem::check_setattr_permission(true, 1000, 1000, 0, FATTR_MTIME, None)
-            .unwrap();
+        super::CurvineFileSystem::check_setattr_permission(
+            true,
+            1000,
+            1000,
+            0,
+            0,
+            FATTR_MTIME,
+            None,
+        )
+        .unwrap();
     }
 
     /// Pin that `FuseMetrics::ensure_init()` runs before `NodeState::new()` in
