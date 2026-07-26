@@ -18,8 +18,8 @@ use crate::conf::{
     ClientConf, FaultHttpConfig, FuseConf, JobConf, JournalConf, MasterConf, TransferConf,
     WorkerConf,
 };
-use crate::rocksdb::DBConf;
 use crate::version;
+use curvine_rocksdb::DBConf;
 use log::info;
 use nix::ifaddrs::getifaddrs;
 use orpc::client::{ClientConf as RpcConf, ClientFactory, SyncClient};
@@ -455,7 +455,7 @@ impl From<ClusterConf> for curvine_config::ClusterConf {
 #[cfg(test)]
 mod tests {
     use super::ClusterConf;
-    use crate::raft::RaftPeer;
+    use crate::conf::RaftPeer;
 
     // The loopback interface is present on every supported host and always
     // carries 127.0.0.1, so it is a stable target for the happy path.

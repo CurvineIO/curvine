@@ -13,11 +13,3 @@
 // limitations under the License.
 
 pub use curvine_error::*;
-
-impl From<crate::raft::RaftError> for FsError {
-    fn from(value: crate::raft::RaftError) -> Self {
-        Self::Raft(orpc::error::ErrorImpl::with_source(
-            value.to_string().into(),
-        ))
-    }
-}

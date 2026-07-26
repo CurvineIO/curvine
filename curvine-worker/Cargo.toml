@@ -1,0 +1,69 @@
+[package]
+name = "curvine-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Curvine worker server role implementation."
+
+[features]
+default = []
+jni = ["curvine-data-mover/opendal-hdfs", "curvine-unified-fs/opendal-hdfs"]
+opendal-s3 = ["curvine-data-mover/opendal-s3", "curvine-unified-fs/opendal-s3"]
+opendal-oss = ["curvine-data-mover/opendal-oss", "curvine-unified-fs/opendal-oss"]
+opendal-gcs = ["curvine-data-mover/opendal-gcs", "curvine-unified-fs/opendal-gcs"]
+opendal-azblob = ["curvine-data-mover/opendal-azblob", "curvine-unified-fs/opendal-azblob"]
+opendal-cos = ["curvine-data-mover/opendal-cos", "curvine-unified-fs/opendal-cos"]
+opendal-hdfs = ["curvine-data-mover/opendal-hdfs", "curvine-unified-fs/opendal-hdfs"]
+opendal-webhdfs = ["curvine-data-mover/opendal-webhdfs", "curvine-unified-fs/opendal-webhdfs"]
+opendal-hdfs-native = ["curvine-data-mover/opendal-hdfs-native", "curvine-unified-fs/opendal-hdfs-native"]
+oss-hdfs = ["curvine-data-mover/oss-hdfs", "curvine-unified-fs/oss-hdfs"]
+spdk = [
+    "dep:curvine-storage-spdk",
+    "curvine-storage-spdk/spdk",
+    "curvine-storage-local/spdk",
+]
+spdk-rdma = ["spdk", "curvine-storage-spdk/spdk-rdma", "curvine-storage-local/spdk-rdma"]
+fault-injection = ["curvine-fault/http-server"]
+
+[dependencies]
+orpc = { workspace = true }
+curvine-client-core = { workspace = true }
+curvine-common = { workspace = true }
+curvine-data-mover = { workspace = true }
+curvine-error = { workspace = true, features = ["axum-response"] }
+curvine-fault = { workspace = true }
+curvine-job-client = { workspace = true }
+curvine-storage-local = { workspace = true }
+curvine-storage-spdk = { workspace = true, optional = true }
+curvine-unified-fs = { workspace = true }
+curvine-web = { workspace = true }
+prost = { workspace = true }
+bincode = { workspace = true }
+serde = { workspace = true }
+log = { workspace = true }
+once_cell = { workspace = true }
+tokio = { workspace = true }
+glob = { workspace = true }
+futures = { workspace = true }
+toml = { workspace = true }
+num_enum = { workspace = true }
+indexmap = { workspace = true }
+clap = { workspace = true }
+mini-moka = { workspace = true }
+regex = { workspace = true }
+linked-hash-map = { workspace = true }
+dashmap = { workspace = true }
+axum = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+url = { workspace = true }
+parking_lot = { workspace = true }
+lru = { workspace = true }
+byteorder = { workspace = true }
+
+[dev-dependencies]
+curvine-fault = { workspace = true, features = ["http-client"] }

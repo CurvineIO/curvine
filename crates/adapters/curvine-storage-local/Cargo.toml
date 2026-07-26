@@ -1,0 +1,25 @@
+[package]
+name = "curvine-storage-local"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Curvine local and worker block storage adapter."
+
+[features]
+default = []
+spdk = ["dep:curvine-storage-spdk", "curvine-storage-spdk/spdk"]
+spdk-rdma = ["spdk", "curvine-storage-spdk/spdk-rdma"]
+
+[dependencies]
+curvine-common = { workspace = true }
+curvine-rocksdb = { workspace = true }
+curvine-storage-spdk = { workspace = true, optional = true }
+orpc = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+indexmap = { workspace = true }
+byteorder = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }

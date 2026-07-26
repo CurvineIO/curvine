@@ -1,0 +1,315 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::worker::block::{BlockActor, BlockStore};
+use crate::worker::handler::{WorkerHandler, WorkerRouterHandler};
+use crate::worker::replication::worker_replication_handler::WorkerReplicationHandler;
+use crate::worker::replication::worker_replication_manager::WorkerReplicationManager;
+use crate::worker::task::TaskManager;
+use crate::worker::WorkerMetrics;
+use curvine_common::conf::ClusterConf;
+use curvine_common::state::{HeartbeatStatus, WorkerAddress};
+use curvine_fault::FaultHttpControl;
+#[cfg(feature = "spdk")]
+use curvine_storage_spdk::SpdkEnv;
+use curvine_web::server::{WebHandlerService, WebServer};
+use log::info;
+use once_cell::sync::OnceCell;
+use orpc::common::{LocalTime, Logger};
+use orpc::error::StringError;
+use orpc::handler::HandlerService;
+use orpc::io::net::ConnState;
+use orpc::runtime::{RpcRuntime, Runtime};
+use orpc::server::{RpcServer, ServerStateListener};
+use orpc::sync::FastMutex;
+use orpc::{CommonError, CommonResult};
+use std::sync::Arc;
+use std::thread;
+
+static CLUSTER_CONF: OnceCell<ClusterConf> = OnceCell::new();
+
+static WORKER_METRICS: OnceCell<WorkerMetrics> = OnceCell::new();
+
+#[derive(Clone)]
+pub struct WorkerService {
+    store: BlockStore,
+    conf: ClusterConf,
+    task_manager: Arc<TaskManager>,
+    rt: Arc<Runtime>,
+    replication_manager: Arc<WorkerReplicationManager>,
+    fault_http: FaultHttpControl,
+}
+
+impl WorkerService {
+    pub fn with_conf(conf: &ClusterConf, rt: Arc<Runtime>) -> CommonResult<Self> {
+        let fault_http = FaultHttpControl::from_env(&conf.fault_injection)
+            .map_err(|error| CommonError::from(error.to_string()))?;
+        let store: BlockStore = BlockStore::new(&conf.cluster_id, conf)?;
+
+        let task_manager = TaskManager::with_rt(rt.clone(), conf)?;
+
+        let replication_manager =
+            WorkerReplicationManager::new(&store, &rt, conf, &task_manager.get_fs_context());
+
+        let ws = Self {
+            store,
+            conf: conf.clone(),
+            task_manager: Arc::new(task_manager),
+            rt,
+            replication_manager,
+            fault_http,
+        };
+        Ok(ws)
+    }
+
+    pub fn clone_rt(&self) -> Arc<Runtime> {
+        self.rt.clone()
+    }
+
+    pub fn conf(&self) -> &ClusterConf {
+        &self.conf
+    }
+}
+
+impl HandlerService for WorkerService {
+    type Item = WorkerHandler;
+
+    fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
+        WorkerHandler {
+            store: self.store.clone(),
+            handler: FastMutex::new(None),
+            task_manager: self.task_manager.clone(),
+            rt: self.rt.clone(),
+            replication_handler: WorkerReplicationHandler::new(&self.replication_manager),
+        }
+    }
+}
+
+impl WebHandlerService for WorkerService {
+    type Item = WorkerRouterHandler;
+
+    fn get_handler(&self) -> Self::Item {
+        WorkerRouterHandler {
+            fault_http: self.fault_http.clone(),
+        }
+    }
+}
+
+// block data start service.
+pub struct Worker {
+    pub start_ms: u64,
+    pub worker_id: u32,
+    pub addr: WorkerAddress,
+    rpc_server: Option<RpcServer<WorkerService>>,
+    web_server: Option<WebServer<WorkerService>>,
+    block_actor: BlockActor,
+}
+
+impl Worker {
+    #[cfg_attr(not(feature = "spdk"), allow(unused_mut))]
+    pub fn with_conf(mut conf: ClusterConf) -> CommonResult<Self> {
+        Logger::init(conf.worker.log.clone());
+
+        // Init SPDK before WorkerService - enables BlockMeta to open SPDK bdevs
+        #[cfg(feature = "spdk")]
+        if conf.worker.spdk_disk.enabled {
+            conf.worker.spdk_disk.init()?;
+            use curvine_common::conf::WorkerDataDir;
+            use curvine_common::state::StorageType;
+            use log::warn;
+            info!("SPDK enabled — initializing global SPDK environment");
+            match SpdkEnv::init_global(conf.worker.spdk_disk.clone()) {
+                Ok(env) => {
+                    info!(
+                        "SPDK environment ready: {} bdev(s), total capacity {}",
+                        env.bdevs().len(),
+                        env.total_capacity()
+                    );
+                    // Validate: each data_dir needs one bdev (dir_id % num_bdevs)
+                    let num_spdk_dirs = conf
+                        .worker
+                        .data_dir
+                        .iter()
+                        .filter(|d| {
+                            WorkerDataDir::from_str(d)
+                                .map(|dd| dd.storage_type == StorageType::SpdkDisk)
+                                .unwrap_or(false)
+                        })
+                        .count();
+                    let num_bdevs = env.bdevs().len();
+                    if num_spdk_dirs > num_bdevs {
+                        return orpc::err_box!(
+                            "Configuration has {} SPDK data_dir entries but only {} bdev(s) \
+                             were discovered. Multiple dirs would map to the same NVMe \
+                             namespace, causing data corruption. Either reduce SPDK data_dir \
+                             entries or add more NVMe-oF targets.",
+                            num_spdk_dirs,
+                            num_bdevs
+                        );
+                    }
+                    if num_spdk_dirs > 0 && num_spdk_dirs < num_bdevs {
+                        warn!(
+                            "{} SPDK data_dir(s) configured but {} bdev(s) discovered. \
+                             {} bdev(s) will be unused.",
+                            num_spdk_dirs,
+                            num_bdevs,
+                            num_bdevs - num_spdk_dirs
+                        );
+                    }
+                }
+                Err(e) => {
+                    // SPDK init failure is fatal — blocks on SPDK dirs would be inaccessible.
+                    return Err(e);
+                }
+            }
+        }
+        #[cfg(not(feature = "spdk"))]
+        {
+            if conf.worker.spdk_disk.enabled {
+                return orpc::err_box!(
+                    "SPDK is not enabled. Compile with --features spdk to use SPDK"
+                );
+            }
+            info!("SPDK disabled (not compiled)");
+        }
+
+        let rt = Arc::new(conf.worker_server_conf().create_runtime());
+        let service: WorkerService = WorkerService::with_conf(&conf, rt.clone())?;
+        let worker_id = service.store.worker_id()?;
+
+        CLUSTER_CONF.get_or_init(|| conf.clone());
+        WORKER_METRICS.get_or_try_init(|| WorkerMetrics::new(service.store.clone()))?;
+        conf.print();
+
+        let block_store = service.store.clone();
+        let rpc_server = RpcServer::with_rt(rt.clone(), conf.worker_server_conf(), service.clone());
+
+        let web_server = WebServer::with_rt(rt.clone(), conf.worker_web_conf(), service.clone());
+
+        let net_addr = rpc_server.bind_addr();
+        let addr = WorkerAddress {
+            worker_id,
+            hostname: net_addr.hostname.to_owned(),
+            ip_addr: net_addr.hostname.to_owned(),
+            rpc_port: net_addr.port as u32,
+            web_port: conf.worker.web_port as u32,
+        };
+        let block_actor = BlockActor::new(
+            rt.clone(),
+            &conf,
+            addr.clone(),
+            block_store.clone(),
+            rpc_server.new_state_ctl(),
+        )?;
+
+        let master_client = block_actor.client.clone();
+        service
+            .replication_manager
+            .with_master_client(master_client.clone());
+
+        let spdk_enabled = conf.worker.spdk_disk.enabled;
+        rpc_server.add_shutdown_hook(move || {
+            if let Err(e) = master_client.heartbeat(HeartbeatStatus::End, vec![]) {
+                info!("error unregister {}", e)
+            }
+            if spdk_enabled {
+                info!("Shutting down SPDK environment");
+                #[cfg(feature = "spdk")]
+                curvine_storage_spdk::SpdkEnv::shutdown_global();
+            }
+        });
+
+        let worker = Self {
+            start_ms: LocalTime::mills(),
+            worker_id,
+            addr,
+            rpc_server: Some(rpc_server),
+            web_server: Some(web_server),
+            block_actor,
+        };
+
+        Ok(worker)
+    }
+
+    pub async fn start(&mut self) -> CommonResult<ServerStateListener> {
+        // step 3: Start rpc server
+        let rpc_server = self
+            .rpc_server
+            .take()
+            .expect("worker rpc server must be initialized before startup");
+        let mut rpc_status = rpc_server.start();
+        rpc_status.wait_running().await?;
+
+        // step 4: Start the web server
+        let web_server = self
+            .web_server
+            .take()
+            .expect("worker web server must be initialized before startup");
+        let web_name = web_server.server_name().to_string();
+        let bind_addr = web_server.resolve_bind_addr();
+        let mut web_status = web_server.start();
+        WebServer::<WorkerService>::wait_bind(&mut web_status, &web_name, &bind_addr).await?;
+
+        // step 5: Start block heartbeat check service
+        let block_actor = self.block_actor.clone();
+        thread::spawn(move || block_actor.start())
+            .join()
+            .map_err(|_| {
+                CommonError::from(StringError::from(
+                    "worker block actor startup thread panicked",
+                ))
+            })
+            .and_then(|result| result)?;
+
+        Ok(rpc_status)
+    }
+
+    pub fn block_on_start(mut self) -> CommonResult<()> {
+        let rt = self
+            .rpc_server
+            .as_ref()
+            .expect("worker rpc server must be initialized before startup")
+            .clone_rt();
+
+        let mut rpc_status = rt.block_on(async { self.start().await })?;
+        rt.block_on(async { rpc_status.wait_stop().await })
+    }
+
+    // Start a standalone worker.
+    pub fn start_standalone(&self) {
+        self.rpc_server
+            .as_ref()
+            .expect("worker rpc server must be initialized")
+            .block_on_start();
+    }
+
+    pub fn get_conf<'a>() -> CommonResult<&'a ClusterConf> {
+        CLUSTER_CONF
+            .get()
+            .ok_or_else(|| orpc::CommonError::from("worker cluster config is not initialized"))
+    }
+
+    pub fn get_metrics<'a>() -> CommonResult<&'a WorkerMetrics> {
+        WORKER_METRICS
+            .get()
+            .ok_or_else(|| orpc::CommonError::from("worker metrics are not initialized"))
+    }
+
+    pub fn service(&self) -> &WorkerService {
+        self.rpc_server
+            .as_ref()
+            .expect("worker rpc server must be initialized")
+            .service()
+    }
+}

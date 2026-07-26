@@ -15,9 +15,8 @@
 use clap::Parser;
 use curvine_common::conf::ClusterConf;
 use curvine_common::version;
-use curvine_server::master::Master;
-use curvine_server::transfer::TransferServer;
-use curvine_server::worker::Worker;
+use curvine_master::master::Master;
+use curvine_worker::worker::Worker;
 use orpc::common::{LocalTime, Utils};
 use orpc::{err_box, CommonResult};
 
@@ -46,11 +45,6 @@ fn main() -> CommonResult<()> {
             let worker = Worker::with_conf(conf)?;
             worker.block_on_start()?;
         }
-
-        ServiceType::Transfer => {
-            let transfer = TransferServer::with_conf(conf)?;
-            transfer.block_on_start()?;
-        }
     }
 
     Ok(())
@@ -74,7 +68,6 @@ impl ServerArgs {
         match service.as_str() {
             "master" => Ok(ServiceType::Master),
             "worker" => Ok(ServiceType::Worker),
-            "transfer" => Ok(ServiceType::Transfer),
             v => err_box!("Unsupported service type: {}", v),
         }
     }
@@ -87,5 +80,4 @@ impl ServerArgs {
 pub enum ServiceType {
     Master,
     Worker,
-    Transfer,
 }

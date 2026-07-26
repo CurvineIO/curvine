@@ -1,0 +1,29 @@
+[package]
+name = "curvine-data-mover"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Curvine data movement helpers and orchestration clients."
+
+[features]
+default = []
+opendal = ["curvine-unified-fs/opendal"]
+opendal-s3 = ["curvine-unified-fs/opendal-s3"]
+opendal-oss = ["curvine-unified-fs/opendal-oss"]
+opendal-gcs = ["curvine-unified-fs/opendal-gcs"]
+opendal-azblob = ["curvine-unified-fs/opendal-azblob"]
+opendal-cos = ["curvine-unified-fs/opendal-cos"]
+opendal-hdfs = ["curvine-unified-fs/opendal-hdfs"]
+opendal-webhdfs = ["curvine-unified-fs/opendal-webhdfs"]
+opendal-hdfs-native = ["curvine-unified-fs/opendal-hdfs-native"]
+oss-hdfs = ["curvine-unified-fs/oss-hdfs"]
+
+[dependencies]
+curvine-client-core = { workspace = true }
+curvine-common = { workspace = true }
+curvine-unified-fs = { workspace = true }
+curvine-ufs = { workspace = true }
+bytes = { workspace = true }
+log = { workspace = true }
+orpc = { workspace = true }
+prost = { workspace = true }

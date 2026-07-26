@@ -1,0 +1,53 @@
+[package]
+name = "curvine-master"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Curvine master server role implementation."
+
+[features]
+default = []
+jni = ["curvine-data-mover/opendal-hdfs"]
+fault-injection = ["curvine-fault/http-server"]
+
+[dependencies]
+orpc = { workspace = true }
+curvine-common = { workspace = true }
+curvine-data-mover = { workspace = true }
+curvine-error = { workspace = true, features = ["axum-response"] }
+curvine-fault = { workspace = true }
+curvine-raft = { workspace = true }
+curvine-rocksdb = { workspace = true }
+curvine-unified-fs = { workspace = true }
+curvine-web = { workspace = true }
+prost = { workspace = true }
+bincode = { workspace = true }
+serde = { workspace = true }
+log = { workspace = true }
+raft = { workspace = true }
+once_cell = { workspace = true }
+tokio = { workspace = true }
+glob = { workspace = true }
+futures = { workspace = true }
+toml = { workspace = true }
+num_enum = { workspace = true }
+indexmap = { workspace = true }
+clap = { workspace = true }
+mini-moka = { workspace = true }
+regex = { workspace = true }
+linked-hash-map = { workspace = true }
+dashmap = { workspace = true }
+axum = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+url = { workspace = true }
+parking_lot = { workspace = true }
+lru = { workspace = true }
+byteorder = { workspace = true }
+
+[dev-dependencies]
+curvine-fault = { workspace = true, features = ["http-client"] }

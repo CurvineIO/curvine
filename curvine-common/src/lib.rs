@@ -17,18 +17,12 @@ pub mod conf;
 pub mod error;
 pub mod executor;
 pub mod fs;
-pub mod raft;
-pub mod rocksdb;
 pub mod state;
 pub mod utils;
 pub mod version;
 
 pub mod proto {
     pub use curvine_proto::*;
-
-    pub mod raft {
-        include!(concat!(env!("OUT_DIR"), "/protos/raft.rs"));
-    }
 }
 
 pub use curvine_error::{FsError, FsResult, MAX_FILE_SIZE};

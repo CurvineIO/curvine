@@ -24,12 +24,18 @@ members = [
     "crates/infra/orpc-rpc",
     "crates/infra/curvine-sys",
     "crates/infra/curvine-io",
+    "crates/adapters/curvine-rocksdb",
+    "crates/metadata/curvine-raft",
+    "crates/adapters/curvine-storage-local",
     "crates/adapters/curvine-storage-spdk",
     "crates/adapters/curvine-ufs-opendal",
     "crates/adapters/curvine-ufs-oss-hdfs",
     "crates/adapters/curvine-hdfs-jni",
     "curvine-common",
     "curvine-common/macros",
+    "curvine-data-mover",
+    "curvine-master",
+    "curvine-worker",
     "curvine-server",
     "curvine-client-core",
     "crates/client/curvine-job-client",
@@ -65,7 +71,13 @@ default-members = [
     "crates/infra/orpc-rpc",
     "crates/infra/curvine-sys",
     "crates/infra/curvine-io",
+    "crates/adapters/curvine-rocksdb",
+    "crates/metadata/curvine-raft",
+    "crates/adapters/curvine-storage-local",
     "curvine-common",
+    "curvine-data-mover",
+    "curvine-master",
+    "curvine-worker",
     "curvine-server",
     "curvine-client-core",
     "crates/client/curvine-job-client",
@@ -94,6 +106,9 @@ orpc-net = { path = "crates/infra/orpc-net" }
 orpc-rpc = { path = "crates/infra/orpc-rpc" }
 curvine-sys = { path = "crates/infra/curvine-sys" }
 curvine-io = { path = "crates/infra/curvine-io" }
+curvine-rocksdb = { path = "crates/adapters/curvine-rocksdb" }
+curvine-raft = { path = "crates/metadata/curvine-raft" }
+curvine-storage-local = { path = "crates/adapters/curvine-storage-local" }
 curvine-storage-spdk = { path = "crates/adapters/curvine-storage-spdk" }
 curvine-ufs-opendal = { path = "crates/adapters/curvine-ufs-opendal" }
 curvine-ufs-oss-hdfs = { path = "crates/adapters/curvine-ufs-oss-hdfs" }
@@ -107,6 +122,9 @@ curvine-storage-api = { path = "crates/common/curvine-storage-api" }
 curvine-config = { path = "crates/common/curvine-config" }
 curvine-common = { path = "curvine-common" }
 curvine-common-macros = { path = "curvine-common/macros" }
+curvine-data-mover = { path = "curvine-data-mover" }
+curvine-master = { path = "curvine-master" }
+curvine-worker = { path = "curvine-worker" }
 curvine-client-core = { path = "curvine-client-core" }
 curvine-job-client = { path = "crates/client/curvine-job-client" }
 curvine-unified-fs = { path = "curvine-unified-fs" }
