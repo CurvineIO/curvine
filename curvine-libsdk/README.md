@@ -1,10 +1,13 @@
 # Curvine libsdk
 
-Rust **`cdylib`** with **Java (JNI)** and **Python (PyO3)**. Crate path: **`curvine-libsdk/`** at the repository workspace root.
+Rust SDK facade for Java (JNI), Python (PyO3), and Rust consumers. The public compatibility package remains **`curvine-libsdk/`**, while implementation is split into FFI-neutral core and language binding crates.
 
 | Path | Role |
 |------|------|
-| `Cargo.toml`, `pyproject.toml` | Rust + wheel metadata |
+| `Cargo.toml` | Compatibility facade and release-profile features |
+| `../curvine-sdk-core/` | FFI-neutral session, filesystem, reader/writer, master, and job helpers |
+| `../curvine-libsdk-java/` | Java JNI ABI and Java-specific conversion helpers |
+| `../curvine-libsdk-python/` | Python PyO3 ABI and wheel metadata |
 | `java/` | Hadoop `FileSystem`, JUnit |
 | `python/` | `curvinefs`, package `curvine_libsdk` (re-exports PyO3 module `curvine_libsdk._native`), tests |
 
@@ -12,19 +15,21 @@ Rust **`cdylib`** with **Java (JNI)** and **Python (PyO3)**. Crate path: **`curv
 
 ## UFS Cargo features
 
-`curvine-libsdk` forwards optional UFS backends from `curvine-client`. Default features are **`java-sdk` + `opendal-s3`** to preserve the historical SDK build behavior. Use `default-features = false` and enable the required SDK/backend features explicitly when you need a leaner build or another backend (e.g. load jobs against OSS-HDFS).
+`curvine-libsdk` forwards optional UFS backends through `curvine-sdk-core` and the selected language binding crate. Default features remain **`java-sdk` only** and build a minimal Java SDK; Python is minimal with `--no-default-features --features python-sdk`. No UFS backend is enabled unless a backend feature is requested explicitly.
 
 | Feature | Forwards to |
 |---------|-------------|
-| `opendal-s3` | `curvine-client/opendal-s3` |
-| `opendal-oss` | `curvine-client/opendal-oss` |
-| `opendal-gcs` | `curvine-client/opendal-gcs` |
-| `opendal-azblob` | `curvine-client/opendal-azblob` |
-| `opendal-cos` | `curvine-client/opendal-cos` |
-| `opendal-hdfs` | `curvine-client/opendal-hdfs` |
-| `opendal-webhdfs` | `curvine-client/opendal-webhdfs` |
-| `opendal-hdfs-native` | `curvine-client/opendal-hdfs-native` |
-| `oss-hdfs` | `curvine-client/oss-hdfs` (JindoSDK; needs `JINDOSDK_HOME`) |
+| `java-sdk-minimal` | `java-sdk` without UFS backends |
+| `python-sdk-minimal` | `python-sdk` without UFS backends |
+| `opendal-s3` | `curvine-sdk-core/opendal-s3` and selected binding crate |
+| `opendal-oss` | `curvine-sdk-core/opendal-oss` and selected binding crate |
+| `opendal-gcs` | `curvine-sdk-core/opendal-gcs` and selected binding crate |
+| `opendal-azblob` | `curvine-sdk-core/opendal-azblob` and selected binding crate |
+| `opendal-cos` | `curvine-sdk-core/opendal-cos` and selected binding crate |
+| `opendal-webhdfs` | `curvine-sdk-core/opendal-webhdfs` and selected binding crate |
+| `opendal-hdfs` | `curvine-sdk-core/opendal-hdfs` and selected binding crate |
+| `opendal-hdfs-native` | `curvine-sdk-core/opendal-hdfs-native` and selected binding crate |
+| `internal-oss-hdfs-jindo`, `oss-hdfs` | Explicit internal OSS-HDFS/Jindo profile; needs `JINDOSDK_HOME` |
 
 **Rust consumers**
 
@@ -39,10 +44,13 @@ cargo build -p curvine-libsdk --no-default-features --features "java-sdk,oss-hdf
 
 **Java / Python packaging (`make` / `build/build.sh`)**
 
-`--ufs` flags are passed through into the libsdk cdylib / wheel build:
+`--ufs` flags are passed through into SDK artifacts only when present. The broader distribution still defaults server/client UFS to `opendal-s3`, but Java/Python SDK artifacts stay minimal unless `--ufs` is provided:
 
 ```bash
-# Java JNI .so with OSS-HDFS + default OpenDAL S3
+# Minimal Java JNI .so
+make build ARGS='--package java'
+
+# Java JNI .so with OSS-HDFS/Jindo only
 make build ARGS='--package java --ufs oss-hdfs'
 
 # Python wheel with an extra OpenDAL backend
@@ -89,7 +97,7 @@ Then (no `PYTHONPATH` needed):
 from curvinefs.curvineFileSystem import CurvineFileSystem
 ```
 
-Runtime deps (**`protobuf`**, **`fsspec`**) come from **`pyproject.toml`**.
+Runtime deps (**`protobuf`**, **`fsspec`**) come from **`curvine-libsdk-python/pyproject.toml`**.
 
 **4. Smoke / integration tests** — cluster + default `etc/curvine-cluster.toml`; optional **`CURVINE_CONF_FILE`**, **`CURVINE_TEST_CV_PATH`**. Example after install:
 
@@ -109,4 +117,4 @@ JDK **8**, Maven **≥ 3.8.1**. From workspace root, **`make build`** (with **`j
 
 ## Local dev (without `make`)
 
-From **`curvine-libsdk/`**: own venv, **`pip install maturin`**, **`maturin develop --release`**, then **`protoc`** into **`python/curvine_libsdk/_proto/`** and apply the same **`sed`** relative-import fix as **`build/build.sh`**, **`export PYTHONPATH=python`**.
+From **`curvine-libsdk-python/`**: own venv, **`pip install maturin`**, **`maturin develop --release --no-default-features --features extension-module`**, then run **`protoc`** into **`../curvine-libsdk/python/curvine_libsdk/_proto/`** and apply the same **`sed`** relative-import fix as **`build/build.sh`**, **`export PYTHONPATH=../curvine-libsdk/python`**.

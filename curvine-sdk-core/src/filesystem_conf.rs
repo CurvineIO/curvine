@@ -14,8 +14,8 @@
 
 #![allow(clippy::should_implement_trait)]
 
-use curvine_common::conf::{ClientConf, ClusterConf};
-use curvine_common::FsResult;
+use curvine_config::{ClientConf, ClusterConf};
+use curvine_error::FsResult;
 use orpc::common::LogConf;
 use orpc::io::net::InetAddr;
 use orpc::{err_box, try_err};

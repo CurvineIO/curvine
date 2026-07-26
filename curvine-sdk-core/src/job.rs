@@ -14,8 +14,8 @@
 
 use crate::core::Session;
 use curvine_client::rpc::JobMasterClient;
-use curvine_common::state::{JobStatus, LoadJobCommand, LoadJobResult};
-use curvine_common::FsResult;
+use curvine_error::FsResult;
+use curvine_model::{JobStatus, LoadJobCommand, LoadJobResult};
 use std::sync::Arc;
 
 #[derive(Clone)]

@@ -17,8 +17,8 @@ use crate::filesystem::FileSystemClient;
 use crate::job::JobClient;
 use crate::master::MasterClient;
 use crate::FilesystemConf;
-use curvine_common::conf::ClusterConf;
-use curvine_common::FsResult;
+use curvine_config::ClusterConf;
+use curvine_error::FsResult;
 use std::sync::Arc;
 
 /// How to establish a Curvine libsdk session.

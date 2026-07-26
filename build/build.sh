@@ -117,6 +117,7 @@ print_help() {
   echo "                          - all: all packages"
   echo
   echo "  -u, --ufs TYPE        UFS storage type (can be specified multiple times, default: opendal-s3)"
+  echo "                        SDK artifacts are minimal by default; --ufs enables only the requested SDK backend(s)"
   echo "                        Available types:"
   echo "                          - opendal-s3: OpenDAL S3"
   echo "                          - opendal-oss: OpenDAL OSS"
@@ -173,6 +174,7 @@ DIST_ZIP=curvine-${CURVINE_VERSION}-${ARCH_NAME}-${OS_VERSION}.zip
 PROFILE="--release"
 declare -a PACKAGES=("all")  # Default to build all packages
 declare -a UFS_TYPES=("opendal-s3")  # Default UFS type
+declare -a SDK_UFS_TYPES=()  # SDK artifacts stay minimal unless --ufs is requested
 declare -a EXTRA_FEATURES=()  # From -f only; --alloc is merged into FEATURES later
 ALLOC=jemalloc
 CRATE_ZIP=""
@@ -224,11 +226,13 @@ while [ $# -gt 0 ]; do
     -u|--ufs)
       require_option_value "$1" "${2:-}"
       UFS_TYPES+=("$2")
+      SDK_UFS_TYPES+=("$2")
       shift 2
       ;;
     --ufs=*)
       require_option_value "--ufs" "${1#*=}"
       UFS_TYPES+=("${1#*=}")
+      SDK_UFS_TYPES+=("${1#*=}")
       shift
       ;;
     -f|--features)
@@ -689,13 +693,14 @@ check_minimal_artifact_deps() {
   echo "OK runtime deps: ${label}"
 }
 
-# Join libsdk SDK feature + UFS passthrough features (forwarded to curvine-client).
+# Join libsdk SDK feature + explicitly requested UFS passthrough features.
+# SDK artifacts are minimal by default even though the broader distribution
+# still keeps opendal-s3 as the default UFS type for server/client builds.
 libsdk_features() {
   local sdk_feature="$1"
-  local alloc_feature="$2"
-  local features="${alloc_feature},${sdk_feature}"
+  local features="${sdk_feature}"
   local ufs
-  for ufs in "${UFS_TYPES[@]}"; do
+  for ufs in "${SDK_UFS_TYPES[@]}"; do
     case "$ufs" in
       *[!a-zA-Z0-9_-]*|"")
         echo "Error: invalid --ufs value: ${ufs}" >&2
@@ -714,7 +719,7 @@ libsdk_features() {
 build_curvine_libsdk() {
   local sdk_feature="$1"
   local features
-  features="$(libsdk_features "$sdk_feature" "curvine-common/system")" || exit 1
+  features="$(libsdk_features "$sdk_feature")" || exit 1
   # Invoke cargo via argv (no eval) so --ufs values cannot inject shell metacharacters.
   local -a sdk_cmd=(cargo build)
   if [ -n "$PROFILE" ]; then
@@ -900,8 +905,8 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
   MATURIN_AUDIT="${CURVINE_MATURIN_AUDITWHEEL:-skip}"
 
   echo "Building Python wheel (maturin) into ${DIST_DIR}/lib ..."
-  cd "$FS_HOME/curvine-libsdk"
-  PY_SDK_FEATURES="$(libsdk_features "python-sdk" "curvine-common/${ALLOC}")" || exit 1
+  cd "$FS_HOME/curvine-libsdk-python"
+  PY_SDK_FEATURES="$(libsdk_features "extension-module")" || exit 1
   echo "maturin features: ${PY_SDK_FEATURES}"
   "${MATURIN_CMD[@]}" build --no-default-features \
     --features "${PY_SDK_FEATURES}" \
@@ -917,15 +922,15 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
 
   # Optional legacy native artifacts (same binary as inside the wheel).
   mkdir -p "$FS_HOME"/curvine-libsdk/python/native
-  if [ -e "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk.dll" ]; then
-    cp -f "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk.dll" \
+  if [ -e "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk_python.dll" ]; then
+    cp -f "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk_python.dll" \
       "$FS_HOME/curvine-libsdk/python/native/curvine_libsdk_python.dll"
-    cp -f "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk.dll" \
+    cp -f "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk_python.dll" \
       "$DIST_DIR/lib/curvine_libsdk_python.dll"
-  elif [ -e "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" ]; then
-    cp -f "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" \
+  elif [ -e "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk_python.so" ]; then
+    cp -f "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk_python.so" \
       "$FS_HOME/curvine-libsdk/python/native/libcurvine_libsdk_python_${OS_VERSION}_$ARCH_NAME.so"
-    cp -f "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" \
+    cp -f "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk_python.so" \
       "$DIST_DIR/lib/libcurvine_libsdk_python_${OS_VERSION}_$ARCH_NAME.so"
   fi
 fi

@@ -15,9 +15,9 @@
 use crate::core::Session;
 use bytes::BytesMut;
 use curvine_client::unified::{UnifiedReader, UnifiedWriter};
-use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::FreeResult;
-use curvine_common::FsResult;
+use curvine_error::FsResult;
+use curvine_fs_api::{FileSystem, Path};
+use curvine_model::FreeResult;
 use std::sync::Arc;
 
 #[derive(Clone)]

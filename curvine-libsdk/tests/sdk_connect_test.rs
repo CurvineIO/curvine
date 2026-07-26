@@ -14,7 +14,7 @@
 
 #![cfg(feature = "rust-sdk")]
 
-use curvine_libsdk::lib_curvine::{ConnectOptions, LibCurvine, LibCurvineBuilder};
+use curvine_libsdk::lib_curvine::{ConnectOptions, LibCurvineBuilder};
 
 #[test]
 fn connect_options_master_addrs_roundtrip() {

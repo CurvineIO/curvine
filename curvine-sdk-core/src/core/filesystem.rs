@@ -15,10 +15,10 @@
 use crate::core::Session;
 use crate::{LibFsReader, LibFsWriter};
 use bytes::BytesMut;
-use curvine_common::conf::ClusterConf;
-use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::{FreeResult, MountInfo, MountOptions};
-use curvine_common::FsResult;
+use curvine_config::ClusterConf;
+use curvine_error::FsResult;
+use curvine_fs_api::{FileSystem, Path};
+use curvine_model::{FreeResult, MountInfo, MountOptions};
 use orpc::runtime::RpcRuntime;
 
 pub struct LibFilesystem {

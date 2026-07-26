@@ -15,8 +15,8 @@
 use crate::FilesystemConf;
 use curvine_client::file::FsClient;
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::conf::ClusterConf;
-use curvine_common::FsResult;
+use curvine_config::ClusterConf;
+use curvine_error::FsResult;
 use orpc::common::Logger;
 use orpc::runtime::Runtime;
 use std::sync::Arc;
