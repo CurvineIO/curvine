@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::proto::{FsmState, SnapshotData};
-use curvine_common::conf::JournalConf;
+use curvine_common_core::conf::JournalConf;
 use curvine_error::FsError;
-use orpc::error::ErrorImpl;
+use orpc_rpc::error::ErrorImpl;
 use raft::eraftpb;
 
 mod raft_node;
@@ -38,7 +38,7 @@ pub use self::raft_journal::RaftJournal;
 mod raft_group;
 pub use self::raft_group::RaftGroup;
 
-pub use curvine_common::conf::RaftPeer;
+pub use curvine_common_core::conf::RaftPeer;
 
 mod raft_error;
 pub use self::raft_error::RaftError;

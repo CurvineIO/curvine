@@ -17,10 +17,10 @@ use std::time::Instant;
 use log::warn;
 use once_cell::sync::OnceCell;
 
-use orpc::common::{
+use orpc_rpc::common::{
     Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, LocalTime, Metrics as m,
 };
-use orpc::CommonResult;
+use orpc_rpc::CommonResult;
 
 use crate::fuse_error::errno_label;
 use crate::session::FuseOpCode;
@@ -987,7 +987,14 @@ pub(crate) struct StreamLifecycleScope {
     _inflight: ActiveGuard,
 }
 
-/// Monotonic time source for durations; do not use wall-clock time for latency.
+/// Monotonic time source for durations.
+///
+/// `orpc_rpc::common::LocalTime::nanos()` is wall-clock (`SystemTime::now()`) and
+/// must **not** be used for latency: an NTP step or suspend/resume can produce
+/// skewed or negative deltas. All FUSE duration metrics use `std::time::Instant`
+/// instead, accessed through this single helper so the choice is centralized.
+/// Monotonic "now" for duration measurement (the sender's reply-write timer and
+/// `FuseReqLabels::start`).
 #[inline]
 pub(crate) fn mono_now() -> Instant {
     Instant::now()
@@ -1256,7 +1263,7 @@ impl ShutdownOnce {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orpc::common::Metrics as m;
+    use orpc_rpc::common::Metrics as m;
 
     // Compile-time guarantee that the guards/timer are `Send`: they travel into
     // spawned/reply tasks, so a field change making them `!Send` fails here rather
@@ -2721,12 +2728,12 @@ mod tests {
     // the shape session call sites use to gate every emission on metrics_enabled.
     #[test]
     fn lifecycle_gate_suppresses_when_disabled() {
-        fn record_if(enabled: bool, counter: &orpc::common::Counter) {
+        fn record_if(enabled: bool, counter: &orpc_rpc::common::Counter) {
             if enabled {
                 counter.inc();
             }
         }
-        let counter = orpc::common::Metrics::new_counter(
+        let counter = orpc_rpc::common::Metrics::new_counter(
             "test_lifecycle_gate_isolated_counter_unique",
             "isolated lifecycle gate counter",
         )

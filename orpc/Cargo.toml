@@ -8,45 +8,4 @@ description = "High-performance network communication framework."
 
 
 [dependencies]
-curvine-io = { workspace = true }
-curvine-sys = { workspace = true }
-orpc-error = { workspace = true }
-orpc-net = { workspace = true }
 orpc-rpc = { workspace = true }
-orpc-runtime = { workspace = true }
-tokio = { workspace = true }
-futures = { workspace = true }
-tokio-util = { workspace = true }
-bytes ={ workspace = true }
-libc = { workspace = true }
-rand = { workspace = true }
-murmur3 = { workspace = true }
-once_cell = { workspace = true }
-crc32fast = { workspace = true }
-socket2 = { workspace = true }
-prost = { workspace = true }
-num_enum = { workspace = true }
-serde = { workspace = true }
-chrono = { workspace = true }
-tracing = { workspace = true }
-tracing-appender = { workspace = true }
-tracing-subscriber = { workspace = true }
-rolling-file = { workspace = true }
-log = { workspace = true }
-pin-project-lite = { workspace = true }
-prometheus = { workspace = true, features = ["process"] }
-sysinfo = { workspace = true }
-fs2 = { workspace = true }
-toml = { workspace = true }
-uuid = { workspace = true }
-thiserror = { workspace = true }
-mini-moka = { workspace = true }
-bincode = { workspace = true }
-crossbeam = { workspace = true }
-dashmap = { workspace = true }
-tracing-log = { workspace = true }
-fxhash = { workspace = true }
-moka = { workspace = true }
-md-5 = { workspace = true }
-nix = { workspace = true }
-parking_lot = { workspace = true }

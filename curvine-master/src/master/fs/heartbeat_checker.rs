@@ -16,12 +16,12 @@ use crate::master::fs::MasterFilesystem;
 use crate::master::quota::QuotaManager;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::MasterMonitor;
-use curvine_common::error::FsError;
-use curvine_common::FsResult;
+use curvine_common_core::error::FsError;
+use curvine_common_core::FsResult;
 use log::{error, info, warn};
-use orpc::common::{LocalTime, TimeSpent};
-use orpc::runtime::{GroupExecutor, LoopTask};
-use orpc::try_log;
+use orpc_rpc::common::{LocalTime, TimeSpent};
+use orpc_rpc::runtime::{GroupExecutor, LoopTask};
+use orpc_rpc::try_log;
 use std::sync::Arc;
 
 pub struct HeartbeatChecker {

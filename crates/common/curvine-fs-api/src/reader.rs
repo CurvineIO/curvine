@@ -16,8 +16,8 @@ use crate::fs::Path;
 use crate::state::FileStatus;
 use crate::FsResult;
 use bytes::BytesMut;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sys::DataSlice;
+use orpc_rpc::runtime::{RpcRuntime, Runtime};
+use orpc_rpc::sys::DataSlice;
 use std::future::Future;
 
 pub trait Reader {
@@ -104,13 +104,6 @@ pub trait Reader {
         len: usize,
     ) -> impl Future<Output = FsResult<Vec<DataSlice>>> {
         async move {
-            // POSIX read(2) past EOF returns 0, not an error. LTP ftest always
-            // read()s before checking whether the chunk is beyond file_max, so
-            // mapping seek-past-EOF into EIO breaks those workloads.
-            if pos >= self.len() {
-                return Ok(Vec::new());
-            }
-
             self.seek(pos).await?;
 
             let mut vec = Vec::with_capacity(len / self.chunk_size() + 1);

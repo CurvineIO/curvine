@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::conf::JournalConf;
-use curvine_common::utils::SerdeUtils;
+use curvine_common_core::conf::JournalConf;
+use curvine_common_core::utils::SerdeUtils;
 use curvine_raft::storage::{LogStorage, RocksAppStorage, RocksLogStorage};
 use curvine_raft::{RaftClient, RaftJournal, RaftPeer, RoleMonitor};
 use log::info;
-use orpc::common::{Logger, Utils};
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::CommonResult;
+use orpc_rpc::common::{Logger, Utils};
+use orpc_rpc::runtime::{RpcRuntime, Runtime};
+use orpc_rpc::CommonResult;
 use std::sync::Arc;
 
 fn main() -> CommonResult<()> {

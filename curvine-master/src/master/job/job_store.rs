@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use crate::master::JobContext;
-use curvine_common::state::{JobTaskProgress, JobTaskState};
-use curvine_common::FsResult;
+use curvine_common_core::state::{JobTaskProgress, JobTaskState};
+use curvine_common_core::FsResult;
 use log::{debug, error};
-use orpc::err_box;
-use orpc::sync::FastDashMap;
+use orpc_rpc::err_box;
+use orpc_rpc::sync::FastDashMap;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::{Arc, RwLock};

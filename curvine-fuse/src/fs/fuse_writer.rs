@@ -17,27 +17,23 @@ use crate::raw::fuse_abi::fuse_write_out;
 use crate::session::FuseResponse;
 use bytes::Bytes;
 use curvine_client::unified::UnifiedWriter;
-use curvine_common::conf::FuseConf;
-use curvine_common::error::FsError;
-use curvine_common::fs::{Path, Writer};
-use curvine_common::state::{FileAllocOpts, FileStatus, SetAttrOpts};
-use curvine_common::FsResult;
+use curvine_config::FuseConf;
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_fs_api::{Path, Writer};
+use curvine_model::{FileAllocOpts, FileStatus};
 use log::{error, warn};
-use orpc::common::LocalTime;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
-use orpc::sync::{AtomicCounter, AtomicLong, ErrorMonitor};
-use orpc::sys::DataSlice;
+use orpc_rpc::common::LocalTime;
+use orpc_rpc::runtime::{RpcRuntime, Runtime};
+use orpc_rpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
+use orpc_rpc::sync::{AtomicCounter, AtomicLong, ErrorMonitor};
+use orpc_rpc::sys::DataSlice;
 use std::sync::Arc;
 
 enum WriteTask {
     Write(i64, Bytes, Option<FuseResponse>),
     Flush(CallSender<FsResult<()>>, Option<FuseResponse>),
-    Complete(
-        CallSender<FsResult<()>>,
-        Option<FuseResponse>,
-        Option<SetAttrOpts>,
-    ),
+    Complete(CallSender<FsResult<()>>, Option<FuseResponse>),
     Resize(CallSender<FsResult<()>>, FileAllocOpts),
 }
 
@@ -203,17 +199,9 @@ impl FuseWriter {
     }
 
     pub async fn complete(&self, reply: Option<FuseResponse>) -> FsResult<()> {
-        self.complete_with_attr(reply, None).await
-    }
-
-    pub async fn complete_with_attr(
-        &self,
-        reply: Option<FuseResponse>,
-        set_attr_opts: Option<SetAttrOpts>,
-    ) -> FsResult<()> {
         let fun = async {
             let (rx, tx) = CallChannel::channel();
-            self.send_queued_task(WriteTask::Complete(rx, reply, set_attr_opts))
+            self.send_queued_task(WriteTask::Complete(rx, reply))
                 .await?;
             // Double `?`: the outer unwraps the channel receive, the inner
             // propagates the real backend complete result.
@@ -286,7 +274,7 @@ impl FuseWriter {
 
         // Abort only before any durability boundary may have published the data.
         let cleanup_result = if preserve_on_exit {
-            writer.complete_with_attr(None).await
+            writer.complete().await
         } else {
             writer.cancel().await
         };
@@ -379,9 +367,9 @@ impl FuseWriter {
                     crate::fs::deliver_stream_result(res, tx, reply).await?;
                 }
 
-                WriteTask::Complete(tx, reply, opts) => {
+                WriteTask::Complete(tx, reply) => {
                     *preserve_on_exit = true;
-                    let res = writer.complete_with_attr(opts).await;
+                    let res = writer.complete().await;
                     *completed = res.is_ok();
                     crate::fs::deliver_stream_result(res, tx, reply).await?;
                 }
@@ -405,14 +393,14 @@ mod tests {
     use super::{mark_dequeued, FuseWriter, QueuedWriteTask, WriteTask};
     use crate::fuse_metrics::ActiveGuard;
     use bytes::{Bytes, BytesMut};
-    use curvine_common::error::FsError;
-    use curvine_common::fs::{Path, Writer};
-    use curvine_common::state::FileStatus;
-    use curvine_common::FsResult;
-    use orpc::common::Metrics as m;
-    use orpc::sync::channel::{AsyncChannel, CallChannel};
-    use orpc::sync::AtomicLong;
-    use orpc::sys::DataSlice;
+    use curvine_error::FsError;
+    use curvine_error::FsResult;
+    use curvine_fs_api::{Path, Writer};
+    use curvine_model::FileStatus;
+    use orpc_rpc::common::Metrics as m;
+    use orpc_rpc::sync::channel::{AsyncChannel, CallChannel};
+    use orpc_rpc::sync::AtomicLong;
+    use orpc_rpc::sys::DataSlice;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -531,7 +519,7 @@ mod tests {
         let (result_tx, result_rx) = CallChannel::channel::<FsResult<()>>();
         sender
             .send(QueuedWriteTask {
-                task: WriteTask::Complete(result_tx, None, None),
+                task: WriteTask::Complete(result_tx, None),
                 queue_guard: None,
             })
             .await
@@ -666,7 +654,10 @@ mod tests {
         assert_eq!(cancel_count.load(Ordering::SeqCst), 1);
     }
 
-    fn queued_task(gauge: &orpc::common::Gauge) -> QueuedWriteTask {
+    // Build a QueuedWriteTask carrying a queue guard backed by `gauge`. The wrapped
+    // WriteTask is a Flush (it only needs a CallChannel sender, no FuseResponse), so
+    // these tests exercise the queue-depth guard lifecycle without a backend.
+    fn queued_task(gauge: &orpc_rpc::common::Gauge) -> QueuedWriteTask {
         let (rx, _tx) = CallChannel::channel::<FsResult<()>>();
         QueuedWriteTask {
             task: WriteTask::Flush(rx, None),
@@ -754,11 +745,11 @@ mod tests {
         use crate::session::{FuseResponse, FuseTask};
         use bytes::Bytes;
         use curvine_client::unified::UnifiedWriter;
-        use curvine_common::conf::FuseConf;
-        use curvine_common::fs::local::LocalWriter;
-        use orpc::common::Metrics as m;
-        use orpc::runtime::{AsyncRuntime, RpcRuntime};
-        use orpc::sync::channel::AsyncChannel;
+        use curvine_config::FuseConf;
+        use curvine_fs_api::local::LocalWriter;
+        use orpc_rpc::common::Metrics as m;
+        use orpc_rpc::runtime::{AsyncRuntime, RpcRuntime};
+        use orpc_rpc::sync::channel::AsyncChannel;
         use std::sync::Arc;
 
         fn metrics_reply(rt: &AsyncRuntime) -> FuseResponse {
@@ -793,7 +784,7 @@ mod tests {
                     std::process::id(),
                     std::thread::current().id()
                 ));
-                let path = curvine_common::fs::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+                let path = curvine_fs_api::Path::from_str(path_buf.to_str().unwrap()).unwrap();
 
                 let conf = FuseConf {
                     metrics_enabled: false,
@@ -865,7 +856,7 @@ mod tests {
                     std::process::id(),
                     std::thread::current().id()
                 ));
-                let path = curvine_common::fs::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+                let path = curvine_fs_api::Path::from_str(path_buf.to_str().unwrap()).unwrap();
 
                 let conf = FuseConf::default();
                 let writer = UnifiedWriter::Local(LocalWriter::new(&path, 4096).unwrap());
@@ -956,7 +947,7 @@ mod tests {
                 std::process::id(),
                 std::thread::current().id()
             ));
-            let path = curvine_common::fs::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+            let path = curvine_fs_api::Path::from_str(path_buf.to_str().unwrap()).unwrap();
 
             let conf = FuseConf {
                 stream_channel_size: 1,

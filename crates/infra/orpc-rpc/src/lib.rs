@@ -12,12 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[macro_use]
-mod macros;
-
 pub mod client;
+pub mod common;
+pub mod error {
+    pub use orpc_error::*;
+}
 pub mod handler;
+pub mod io;
+pub mod macros;
 pub mod message;
+pub mod runtime;
 pub mod server;
+pub mod sync;
+pub mod sys;
+pub mod test;
 
-pub use server::ServerConf;
+pub use orpc_error::{CommonError, CommonResult, CommonResultExt};
+
+impl From<crate::io::IOError> for crate::error::CommonErrorExt {
+    fn from(value: crate::io::IOError) -> Self {
+        Self::from(CommonError::from(value))
+    }
+}

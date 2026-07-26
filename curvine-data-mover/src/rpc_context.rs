@@ -13,13 +13,13 @@
 // limitations under the License.
 
 use bytes::BytesMut;
-use curvine_common::fs::RpcCode;
-use curvine_common::FsResult;
+use curvine_common_core::fs::RpcCode;
+use curvine_common_core::FsResult;
 use log::info;
-use orpc::common::TimeSpent;
-use orpc::io::net::ConnState;
-use orpc::message::{Builder, Message};
-use orpc::CommonResult;
+use orpc_rpc::common::TimeSpent;
+use orpc_rpc::io::net::ConnState;
+use orpc_rpc::message::{Builder, Message};
+use orpc_rpc::CommonResult;
 use prost::Message as PMessage;
 use std::borrow::Cow;
 

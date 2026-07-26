@@ -14,14 +14,14 @@
 
 use bytes::BytesMut;
 use curvine_client::file::CurvineFileSystem;
-use curvine_common::conf::ClusterConf;
-use curvine_common::fs::{Path, Reader, Writer};
-use curvine_common::state::{BlockLocation, CreateFileOptsBuilder, FileBlocks, WorkerAddress};
+use curvine_common_core::conf::ClusterConf;
+use curvine_common_core::fs::{Path, Reader, Writer};
+use curvine_common_core::state::{BlockLocation, CreateFileOptsBuilder, FileBlocks, WorkerAddress};
 use curvine_tests::Testing;
 use log::info;
-use orpc::common::Utils;
-use orpc::runtime::RpcRuntime;
-use orpc::{CommonError, CommonResult};
+use orpc_rpc::common::Utils;
+use orpc_rpc::runtime::RpcRuntime;
+use orpc_rpc::{CommonError, CommonResult};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

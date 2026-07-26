@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use crate::master::fs::policy::{ChooseContext, WorkerPolicy};
-use curvine_common::state::{WorkerAddress, WorkerInfo};
+use curvine_common_core::state::{WorkerAddress, WorkerInfo};
 use indexmap::IndexMap;
-use orpc::sync::AtomicLen;
-use orpc::{err_box, CommonResult};
+use orpc_rpc::sync::AtomicLen;
+use orpc_rpc::{err_box, CommonResult};
 
 // Poll selector.
 pub struct RobinWorkerPolicy {

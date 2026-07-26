@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use clap::Parser;
-use curvine_common::conf::ClusterConf;
-use curvine_common::version;
+use curvine_common_core::conf::ClusterConf;
+use curvine_common_core::version;
 use curvine_master::master::Master;
 use curvine_worker::worker::Worker;
-use orpc::common::{LocalTime, Utils};
-use orpc::{err_box, CommonResult};
+use orpc_rpc::common::{LocalTime, Utils};
+use orpc_rpc::{err_box, CommonResult};
 
 fn main() -> CommonResult<()> {
     let args: ServerArgs = ServerArgs::parse();

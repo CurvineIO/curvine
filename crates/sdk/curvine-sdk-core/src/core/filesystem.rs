@@ -18,8 +18,8 @@ use bytes::BytesMut;
 use curvine_config::ClusterConf;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
-use curvine_model::{FreeResult, MountInfo, MountOptions, SetAttrOpts};
-use orpc::runtime::RpcRuntime;
+use curvine_model::{FreeResult, MountInfo, MountOptions};
+use orpc_rpc::runtime::RpcRuntime;
 
 pub struct LibFilesystem {
     session: Session,
@@ -36,7 +36,7 @@ impl LibFilesystem {
         &self.session
     }
 
-    fn rt(&self) -> &std::sync::Arc<orpc::runtime::Runtime> {
+    fn rt(&self) -> &std::sync::Arc<orpc_rpc::runtime::Runtime> {
         self.session.runtime()
     }
 
@@ -68,14 +68,6 @@ impl LibFilesystem {
         let path = Path::from_str(path)?;
         self.rt()
             .block_on(async { self.inner().get_status_bytes(&path).await })
-    }
-
-    pub fn set_attr(&self, path: impl AsRef<str>, opts: SetAttrOpts) -> FsResult<BytesMut> {
-        let path = Path::from_str(path)?;
-        self.rt().block_on(async {
-            self.inner().set_attr(&path, opts).await?;
-            self.inner().get_status_bytes(&path).await
-        })
     }
 
     pub fn list_status(&self, path: impl AsRef<str>) -> FsResult<BytesMut> {

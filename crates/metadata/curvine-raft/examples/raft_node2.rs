@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::conf::JournalConf;
+use curvine_common_core::conf::JournalConf;
 use curvine_raft::storage::{RocksAppStorage, RocksLogStorage};
 use curvine_raft::{RaftJournal, RaftPeer, RoleMonitor};
 use log::info;
-use orpc::common::{Logger, Utils};
-use orpc::runtime::RpcRuntime;
-use orpc::CommonResult;
+use orpc_rpc::common::{Logger, Utils};
+use orpc_rpc::runtime::RpcRuntime;
+use orpc_rpc::CommonResult;
 
 // rocksdb storage, snapshot testing.
 fn main() -> CommonResult<()> {

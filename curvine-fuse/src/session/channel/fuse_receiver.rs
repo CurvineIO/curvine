@@ -25,12 +25,12 @@ use crate::{err_fuse, FuseResult, FUSE_IN_HEADER_LEN};
 use bytes::BytesMut;
 use libc::{EAGAIN, ECONNABORTED, EINTR, ENODEV, ENOENT};
 use log::{debug, error, info, warn};
-use orpc::io::IOResult;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sync::channel::AsyncSender;
-use orpc::sync::FastDashMap;
-use orpc::sys::pipe::{AsyncFd, Pipe2, PipeFd};
-use orpc::{err_box, sys, try_option_ref};
+use orpc_rpc::io::IOResult;
+use orpc_rpc::runtime::{RpcRuntime, Runtime};
+use orpc_rpc::sync::channel::AsyncSender;
+use orpc_rpc::sync::FastDashMap;
+use orpc_rpc::sys::pipe::{AsyncFd, Pipe2, PipeFd};
+use orpc_rpc::{err_box, sys, try_option_ref};
 use std::sync::Arc;
 use tokio::sync::{watch, Notify};
 
@@ -186,7 +186,7 @@ impl<T: FileSystem> FuseReceiver<T> {
                 // Recoverable (real errno): the loop may `continue` to the next
                 // frame, so drain the stale bytes that would otherwise poison it.
                 Self::drain_pipe(pipe2);
-                return Err(err.into());
+                return Err(err);
             }
         };
         if write_len != read_len {
@@ -208,7 +208,7 @@ impl<T: FileSystem> FuseReceiver<T> {
                 Ok(n) if n > 0 => continue,
                 Ok(_) => break,
                 Err(err) => {
-                    if err.raw_os_error() == Some(EINTR) {
+                    if err.raw_error().raw_os_error() == Some(EINTR) {
                         continue;
                     }
                     break;
@@ -283,9 +283,11 @@ impl<T: FileSystem> FuseReceiver<T> {
         Self::send_stream_dispatch(&self.fs, req, rep).await
     }
 
-    /// Stream dispatch + IO attribution core, factored out of `send_stream` so tests
-    /// can drive it with a hand-built `FuseResponse`. The metrics gate derives solely
-    /// from `rep.metrics.is_some()`, so a "metrics but no ctx" state is unrepresentable.
+    /// Stream dispatch + IO attribution core, factored out of `send_stream` so
+    /// tests can drive it with a hand-built `FuseResponse` — no `FuseReceiver`/
+    /// `kernel_fd`/`Pipe2`/reactor. The metrics gate is derived solely from
+    /// `rep.metrics.is_some()` (not a separate flag), so a "metrics but no ctx"
+    /// split-brain state is unrepresentable.
     async fn send_stream_dispatch(
         fs: &Arc<T>,
         req: FuseRequest,
@@ -306,9 +308,13 @@ impl<T: FileSystem> FuseReceiver<T> {
         // failure finishes the original ctx once rather than double-counting.
         let err_rep = rep.clone();
 
-        // IO attribution timers, armed before the match so they cover the error-reply enqueue
-        // too (one Some per stream opcode). ⚠ INVARIANT: after parse succeeds, no `.await`/
-        // early return before these scopes — the lifecycle scope arms its guard atomically.
+        // IO attribution timers, armed before the match so they also cover the
+        // error-reply enqueue below. One is `Some` per stream opcode: read/write ->
+        // io_dispatch timer, flush/fsync/release -> lifecycle scope.
+        //
+        // ⚠ INVARIANT: no `.await` / early return between `parse_operator()` and
+        // these two scopes — `stream_lifecycle_scope` counts the attempt and arms
+        // its guard atomically, so a suspension here would unbalance the family.
         let _dispatch = if metrics_enabled {
             dispatch_io_type(req.opcode()).map(FuseMetrics::io_dispatch_timer)
         } else {
@@ -435,7 +441,7 @@ impl<T: FileSystem> FuseReceiver<T> {
                                     req.opcode(),
                                 );
                             }
-                            if req.should_audit() {
+                            if req.is_meta() {
                                 self.audit(&req);
                             }
 
@@ -516,7 +522,7 @@ impl<T: FileSystem> FuseReceiver<T> {
         req: FuseRequest,
         reply: FuseResponse,
     ) -> FuseResult<()> {
-        if !req.is_interruptible_wait() {
+        if !req.is_interrupt() {
             return Self::dispatch_meta(&pending_requests, &fs, &req, &reply).await;
         }
 
@@ -524,9 +530,10 @@ impl<T: FileSystem> FuseReceiver<T> {
         let mut pending_request =
             PendingRequestGuard::register(pending_requests.clone(), req.unique(), notify.clone());
 
-        // Built before the `select!` so they wrap the WHOLE interruptible scope: an
-        // interrupt winning before `set_lkw()` is polled still records. Measures
-        // request duration, NOT lock-acquisition time (backpressure inflates it).
+        // These RAII timers wrap the WHOLE interruptible-request scope and are
+        // built before the `select!`, so an interrupt that wins before `set_lkw()`
+        // is polled still records a sample. So this measures request duration, NOT
+        // lock-acquisition time (backpressure inflates it; a parse failure is ~0).
         let _setlkw_inflight = FuseMetrics::setlkw_inflight_guard(reply.metrics.is_some());
         let _setlkw_wait = FuseMetrics::setlkw_wait_timer(reply.metrics.is_some());
 
@@ -651,9 +658,10 @@ impl<T: FileSystem> FuseReceiver<T> {
 
             FuseOperator::Ioctl(op) => reply.send_buf(fs.ioctl(op).await).await,
 
-            // Named variants, NOT a `_` wildcard, so a new unwired `FuseOperator` fails
-            // to compile (caught the RENAME2 half-wiring). Tag: NOT_SUPPORTED ->
-            // `unknown_opcode`, else `unimplemented_opcode`.
+            // Named variants, NOT a `_` wildcard: a new `FuseOperator` left unwired
+            // then fails to compile (this would have caught the RENAME2 half-wiring).
+            // Tag Unsupported: NOT_SUPPORTED -> `unknown_opcode`, else
+            // `unimplemented_opcode`. See `FuseOpCode::expected_dispatch`.
             FuseOperator::Notimplemented
             | FuseOperator::Read(_)
             | FuseOperator::Write(_)
@@ -721,12 +729,10 @@ fn receive_error_labels(os_errno: Option<i32>) -> (&'static str, &'static str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{receive_error_labels, FuseReceiver, PendingRequestGuard};
-    use crate::fs::TestFileSystem;
+    use super::{receive_error_labels, PendingRequestGuard};
     use crate::fuse_metrics::{RECEIVE_ACTION_CONTINUE, RECEIVE_ACTION_EXIT};
-    use bytes::BytesMut;
     use libc::{EAGAIN, ECONNABORTED, EINTR, EIO, ENODEV, ENOENT};
-    use orpc::sync::FastDashMap;
+    use orpc_rpc::sync::FastDashMap;
     use std::sync::Arc;
     use tokio::sync::Notify;
 
@@ -779,38 +785,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prepare_receive_buf_does_not_return_stale_tail_bytes() {
-        let first = b"first-request-with-a-tail";
-        let mut buf = BytesMut::from(&first[..]);
-
-        let returned = buf.split_to(5);
-        assert_eq!(&returned[..], b"first");
-        assert!(!buf.is_empty(), "the first split leaves a stale tail");
-
-        FuseReceiver::<TestFileSystem>::prepare_receive_buf(&mut buf, 8);
-        assert_eq!(
-            buf.len(),
-            8,
-            "the next receive gets exactly its read window"
-        );
-
-        let read_len = 3;
-        buf[..read_len].copy_from_slice(b"new");
-        let returned = buf.split_to(read_len);
-        assert_eq!(&returned[..], b"new");
-        assert_eq!(
-            returned.len(),
-            read_len,
-            "only bytes reported by read are returned"
-        );
-        assert_eq!(
-            buf.len(),
-            8 - read_len,
-            "the unused read window remains internal to the reusable buffer"
-        );
-    }
-
     // Drive the real `dispatch_meta` to prove `operation_duration_us{status}`
     // comes from the stashed `op_status` (the FS result), not the send `IOResult`.
     mod dispatch_meta_integration {
@@ -819,16 +793,15 @@ mod tests {
             FuseMetrics, FuseReqCtx, FuseReqKind, FuseReqLabels, FuseReqStatus,
         };
         use crate::raw::fuse_abi::{
-            fuse_forget_in, fuse_fsync_in, fuse_getattr_in, fuse_in_header, fuse_interrupt_in,
-            fuse_rename2_in,
+            fuse_forget_in, fuse_fsync_in, fuse_in_header, fuse_interrupt_in, fuse_rename2_in,
         };
         use crate::session::{FuseRequest, FuseResponse, FuseTask};
         use crate::FuseUtils;
         use bytes::{BufMut, BytesMut};
-        use curvine_common::conf::FuseConf;
-        use orpc::common::Metrics as m;
-        use orpc::sync::channel::{AsyncChannel, AsyncReceiver};
-        use orpc::sync::FastDashMap;
+        use curvine_config::FuseConf;
+        use orpc_rpc::common::Metrics as m;
+        use orpc_rpc::sync::channel::{AsyncChannel, AsyncReceiver};
+        use orpc_rpc::sync::FastDashMap;
 
         // Each test uses a DISTINCT opcode: they run in parallel and assert deltas
         // on the shared process-global registry, so a shared opcode would make the
@@ -858,12 +831,8 @@ mod tests {
         }
 
         fn getattr_request(unique: u64) -> FuseRequest {
-            make_request(
-                OP_GETATTR,
-                unique,
-                1,
-                FuseUtils::struct_as_bytes(&fuse_getattr_in::default()),
-            )
+            // GetAttr parses only the header (no arg read).
+            make_request(OP_GETATTR, unique, 1, &[])
         }
 
         fn statfs_request(unique: u64) -> FuseRequest {
@@ -890,9 +859,10 @@ mod tests {
             make_request(OP_INTERRUPT, unique, 0, FuseUtils::struct_as_bytes(&arg))
         }
 
-        // A reply with a live metrics slot, wired to a real channel. `opcode` MUST match
-        // the request's: labels derive from it, so a mismatch routes to a different
-        // `request_duration_us` child and silently misses the assertion.
+        // A reply with a live metrics slot, wired to a real channel. `opcode` MUST
+        // match the request's opcode: labels are derived from it, so a mismatch
+        // routes `request_duration_us` to a different child and silently misses the
+        // assertion.
         fn metrics_reply(
             unique: u64,
             opcode: &'static str,
@@ -1299,9 +1269,10 @@ mod tests {
             );
         }
 
-        // Justifies hoisting the timer OUT of `set_lkw()`: a malformed SETLKW fails parse
-        // before `set_lkw()` runs, yet the timer (built before the `select!`) still
-        // records on drop. Inside `set_lkw()` this path would record nothing.
+        // Justifies hoisting the timer OUT of `set_lkw()`: a malformed SETLKW fails
+        // parse before `set_lkw()` is ever called, yet the timer (created in
+        // dispatch_meta_interrupt before the `select!`) still records a sample on
+        // drop. With the timer inside `set_lkw()` this path would record nothing.
         #[tokio::test]
         async fn malformed_setlkw_records_wait_sample_without_set_lkw() {
             FuseMetrics::ensure_init().unwrap();
@@ -1423,9 +1394,10 @@ mod tests {
         }
     }
 
-    // Drive the real `send_stream_dispatch` with only `&fs` + a pre-built `FuseResponse`.
-    // `TestFileSystem` returns ENOSYS without replying, so each op exercises the
-    // pre-dispatch-error path: the error reply is enqueued INSIDE the RAII scope under test.
+    // Drive the real `send_stream_dispatch` (needs only `&fs` + a pre-built
+    // `FuseResponse`, no fd/Pipe2/reactor). `TestFileSystem` returns ENOSYS without
+    // replying, so each op exercises the pre-dispatch-error path: the error reply is
+    // enqueued INSIDE the dispatch/lifecycle RAII scope — the boundary under test.
     mod send_stream_integration {
         use crate::fs::TestFileSystem;
         use crate::fuse_metrics::{
@@ -1439,8 +1411,8 @@ mod tests {
         use crate::session::{FuseRequest, FuseResponse};
         use crate::FuseUtils;
         use bytes::{BufMut, BytesMut};
-        use orpc::runtime::{AsyncRuntime, RpcRuntime};
-        use orpc::sync::channel::AsyncChannel;
+        use orpc_rpc::runtime::{AsyncRuntime, RpcRuntime};
+        use orpc_rpc::sync::channel::AsyncChannel;
         use std::sync::Arc;
 
         const OP_READ: u32 = 15;
@@ -1504,24 +1476,26 @@ mod tests {
             )
         }
 
-        // Drive ONE stream op through `send_stream_dispatch`, FD-free (a real `FuseReceiver`
-        // drags in a `Pipe2` whose Drop aborts with `IO Safety violation`). Assertions use
-        // LOWER BOUNDS (io_type labels are process-global). `with_metrics_ctx` toggles the gate.
+        // Drive ONE stream op through `send_stream_dispatch`. FD-free on purpose:
+        // reaching dispatch via a real `FuseReceiver` drags in a `Pipe2` whose Drop
+        // deregisters from the reactor after closing its fds, aborting with `IO
+        // Safety violation` under the parallel harness. Assertions use LOWER BOUNDS,
+        // not exact deltas — the process-global io_type labels are shared and a
+        // concurrent test can also bump them.
+        // `with_metrics_ctx` toggles the metrics gate (`rep.metrics.is_some()`).
         fn dispatch_one(with_metrics_ctx: bool, req: FuseRequest) {
             use crate::fuse_metrics::{FuseReqCtx, FuseReqKind, FuseReqLabels};
             FuseMetrics::ensure_init().unwrap();
             let rt = AsyncRuntime::single();
             rt.block_on(async {
-                let fs = Arc::new(TestFileSystem::new(
-                    curvine_common::conf::FuseConf::default(),
-                ));
+                let fs = Arc::new(TestFileSystem::new(curvine_config::FuseConf::default()));
                 // Drainer so an enqueued error reply never blocks.
                 let (tx, mut rx) = AsyncChannel::new(64).split();
                 let drainer = tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
                 let opcode = req.opcode().as_str();
                 let ctx = if with_metrics_ctx {
-                    let gauge = orpc::common::Metrics::new_gauge(
+                    let gauge = orpc_rpc::common::Metrics::new_gauge(
                         format!("ss_dispatch_active_{}", req.unique()),
                         "test".to_string(),
                     )
@@ -1635,9 +1609,10 @@ mod tests {
             );
         }
 
-        // SMOKE test: each stream family runs end-to-end with metrics off. Does NOT
-        // prove "emits nothing" (shared io_type labels make `== before` flaky) — that
-        // guarantee lives in the `*_gate` unit tests.
+        // SMOKE test: each stream family runs end-to-end with metrics off. It does
+        // NOT prove "emits nothing" (the shared io_type labels make `== before`
+        // flaky) — the deterministic no-emission guarantee lives in the `*_gate`
+        // unit tests.
         #[test]
         fn disabled_send_stream_runs_clean_for_all_families() {
             dispatch_one(false, flush_request(7101));
@@ -1647,9 +1622,11 @@ mod tests {
             dispatch_one(false, write_request(7105));
         }
 
-        // A malformed stream request whose `parse_operator()` fails AFTER the ctx was
-        // built must finish the ctx early (drop guard, record decode error) and NOT enter
-        // the RAII scope. Pins that no early return/await sits between ctx and scope.
+        // A malformed stream request whose `parse_operator()` fails AFTER the ctx
+        // was built: the parse failure must finish the ctx early (drop the active
+        // guard, record the parse decode error) and must NOT enter the
+        // dispatch/lifecycle RAII scope. Pins that nobody inserts an early
+        // return/await between ctx creation and the scope.
         #[test]
         fn malformed_stream_request_finishes_early_without_dispatch_or_lifecycle() {
             use crate::fuse_metrics::{FuseReqCtx, FuseReqKind, FuseReqLabels, DECODE_PHASE_PARSE};
@@ -1669,13 +1646,11 @@ mod tests {
 
             let rt = AsyncRuntime::single();
             rt.block_on(async {
-                let fs = Arc::new(TestFileSystem::new(
-                    curvine_common::conf::FuseConf::default(),
-                ));
+                let fs = Arc::new(TestFileSystem::new(curvine_config::FuseConf::default()));
                 let (tx, mut rx) = AsyncChannel::new(16).split();
                 let drainer = tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
-                let active_g = orpc::common::Metrics::new_gauge(
+                let active_g = orpc_rpc::common::Metrics::new_gauge(
                     "ss_malformed_active_7201".to_string(),
                     "test".to_string(),
                 )
@@ -1705,9 +1680,11 @@ mod tests {
                 drainer.abort();
             });
 
-            // "No io_dispatch/lifecycle sample on parse failure" is STRUCTURAL: the RAII
-            // scope exists only after `parse_operator()` succeeds, so an Err returns via
-            // `finish_early` first. Only the decode error shows here (shared → lower bound).
+            // "No io_dispatch/lifecycle sample on parse failure" is STRUCTURAL: the
+            // RAII scope is created only after `parse_operator()` succeeds, so an Err
+            // parse returns via `finish_early` before it exists (proven by the
+            // res.is_err() + guard-dropped asserts above). Only the decode error is
+            // observable here; decode_errors_total is shared, so assert a lower bound.
             assert!(
                 mx.decode_errors_total
                     .with_label_values(&[DECODE_PHASE_PARSE, "other"])
@@ -1718,9 +1695,10 @@ mod tests {
         }
     }
 
-    // When a stream op fails BEFORE replying (pre-dispatch error), `send_stream_dispatch`
-    // enqueues EXACTLY ONE error reply via its `if res.is_err()` fallback, never
-    // double-replies. The per-test reply channel makes the `== 1` counts deterministic.
+    // When a stream op fails BEFORE replying (pre-dispatch error, e.g. a
+    // handle-lookup miss), `send_stream_dispatch` enqueues EXACTLY ONE error reply
+    // via its `if res.is_err() { err_rep.send_rep }` fallback, never double-replies.
+    // The per-test reply channel makes the `== 1` counts deterministic.
     mod stream_error_coverage {
         use crate::err_fuse;
         use crate::fs::operator::{FSync, Flush, Read, Release, Write};
@@ -1735,8 +1713,8 @@ mod tests {
         use crate::session::{FuseRequest, FuseResponse, FuseTask};
         use crate::{FuseResult, FuseUtils};
         use bytes::{BufMut, BytesMut};
-        use orpc::runtime::{AsyncRuntime, RpcRuntime};
-        use orpc::sync::channel::AsyncChannel;
+        use orpc_rpc::runtime::{AsyncRuntime, RpcRuntime};
+        use orpc_rpc::sync::channel::AsyncChannel;
         use std::sync::Arc;
 
         const OP_READ: u32 = 15;
@@ -1770,9 +1748,10 @@ mod tests {
             }
         }
 
-        // `read` REPLIES and THEN returns `Err`, proving the `if res.is_err()` fallback
-        // cannot double-reply end-to-end. `cfg(not(debug_assertions))` matches its only
-        // (release-only) user, so the mock is not "never constructed" in debug.
+        // `read` REPLIES via `reply` and THEN returns `Err`, proving the
+        // `if res.is_err() { err_rep.send_rep(res) }` fallback cannot double-reply
+        // end-to-end. `cfg(not(debug_assertions))` matches its only (release-only)
+        // user, so the mock is not "never constructed" in debug.
         #[cfg(not(debug_assertions))]
         struct ReplyThenErrFs;
         #[cfg(not(debug_assertions))]
@@ -1836,9 +1815,20 @@ mod tests {
             )
         }
 
-        // Drive one stream op and return `(result, every enqueued FuseTask, the shared
-        // reply handle)`. FD-free. Single-thread runtime fully awaits, so all tasks are
-        // buffered in `rx` on return — drained synchronously, so a closed channel can't panic.
+        // Drive one stream op through the real `send_stream_dispatch` against `fs` and
+        // return `(dispatch result, every FuseTask enqueued to the reply channel,
+        // the shared reply handle)`. FD-free; the reply handle is returned so the
+        // caller can inspect the shared metrics slot (finished / active guard).
+        //
+        // Draining: `send_stream_dispatch` is fully awaited on a single-thread runtime,
+        // so by the time it returns everything it enqueued is already buffered in `rx`.
+        // We just drain what's there — no drainer task needed. The loop stops on BOTH
+        // empty AND closed (`while let Ok(Some(_))`): `try_recv` maps an empty channel
+        // to `Ok(None)` but a *closed* one to `Err` (`orpc_rpc::sync::channel`), so matching
+        // only `Ok(Some(_))` makes the drain robust regardless of whether a sender clone
+        // is still alive. (One is: `observer` below holds a sender for the whole drain,
+        // so in practice we hit the `Ok(None)` empty case — but the loop must not depend
+        // on that.)
         fn dispatch_and_collect<F: FileSystem>(
             fs: Arc<F>,
             with_metrics_ctx: bool,
@@ -1850,7 +1840,7 @@ mod tests {
                 let (tx, mut rx) = AsyncChannel::new(64).split();
                 let opcode = req.opcode().as_str();
                 let ctx = if with_metrics_ctx {
-                    let gauge = orpc::common::Metrics::new_gauge(
+                    let gauge = orpc_rpc::common::Metrics::new_gauge(
                         format!("sec_active_{}", req.unique()),
                         "test".to_string(),
                     )
@@ -1951,13 +1941,13 @@ mod tests {
                 1,
                 "exactly one error reply on the disabled path"
             );
-            // Legacy Reply variant AND the same errno on the wire. The FUSE error frame
-            // encodes the errno negated (header.error = -errno), so a pre-dispatch EBADF
-            // surfaces as `-EBADF` — the enabled path's check, read off the raw frame.
+            // Legacy Reply variant AND the same errno on the wire. The FUSE error
+            // frame encodes the errno negated (`ResponseData::create`: header.error =
+            // -errno), so a pre-dispatch EBADF surfaces as `-EBADF` — matching the
+            // enabled path's `errno == EBADF` check, just read off the raw frame.
             match &tasks[0] {
                 FuseTask::Reply(d) => assert_eq!(
-                    d.header().error,
-                    -ERRNO,
+                    d.header.error, -ERRNO,
                     "disabled path propagates the pre-dispatch errno on the wire"
                 ),
                 FuseTask::RequestReply { .. } => {
@@ -1969,9 +1959,12 @@ mod tests {
             }
         }
 
-        // End-to-end double-reply guard: an op that BOTH replies AND returns Err makes
-        // the `err_rep` fallback a no-op, so the kernel gets one reply. Release-only: a
-        // genuine double reply trips `commit_reply_task`'s `debug_assert!(!finished)`.
+        // End-to-end double-reply guard: an op that BOTH replies AND then returns Err
+        // makes the `err_rep` fallback a no-op, so the kernel gets one reply, not two.
+        // Drives the real `send_stream_dispatch` seam, not just the slot guard.
+        // Release-only: a genuine double reply trips `commit_reply_task`'s
+        // `debug_assert!(!finished)` in debug (see `double_reply_panics_in_debug` in
+        // fuse_response.rs); this asserts the release warn + no-op behavior.
         #[test]
         #[cfg(not(debug_assertions))]
         fn err_rep_fallback_after_a_reply_is_noop() {

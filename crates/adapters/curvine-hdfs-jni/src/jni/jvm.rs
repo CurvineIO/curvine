@@ -28,7 +28,7 @@
 //!
 //! # Usage
 //! ```rust
-//! use curvine_common::jni::jvm::{register_jvm, init_jvm_for_hdfs};
+//! use curvine_common_core::jni::jvm::{register_jvm, init_jvm_for_hdfs};
 //!
 //! // Register JVM builder (call once at startup)
 //! register_jvm();

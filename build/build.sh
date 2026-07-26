@@ -621,12 +621,12 @@ append_alloc_feature() {
       ;;
     client-safe)
       if [[ " ${CLIENT_RUST_BUILD_ARGS[@]} " =~ " -p curvine-fuse " ]]; then
-        add_feature "curvine-common/${ALLOC}"
+        add_feature "curvine-fuse/${ALLOC}"
       fi
       return 0
       ;;
     *)
-      add_feature "curvine-common/${ALLOC}"
+      add_feature "curvine-common-core/${ALLOC}"
       ;;
   esac
 }

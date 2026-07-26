@@ -20,12 +20,12 @@ use crate::fuse_metrics::{
 use crate::session::{FuseTask, ResponseData};
 use crate::FuseResult;
 use log::{info, warn};
-use orpc::common::Gauge;
-use orpc::io::IOResult;
-use orpc::runtime::Runtime;
-use orpc::sync::channel::AsyncReceiver;
-use orpc::sys::pipe::{AsyncFd, Pipe2, PipeFd};
-use orpc::{err_box, sys, try_option_ref};
+use orpc_rpc::common::Gauge;
+use orpc_rpc::io::IOResult;
+use orpc_rpc::runtime::Runtime;
+use orpc_rpc::sync::channel::AsyncReceiver;
+use orpc_rpc::sys::pipe::{AsyncFd, Pipe2, PipeFd};
+use orpc_rpc::{err_box, sys, try_option_ref};
 use std::sync::Arc;
 
 /// Small responses use writev; splice only pays off for larger payloads.
@@ -100,7 +100,7 @@ impl<T: FileSystem> FuseSender<T> {
                     queue_guard,
                 } => {
                     mark_dequeued(queue_guard);
-                    let id = data.unique();
+                    let id = data.header.unique;
                     let response_bytes = data.len();
 
                     let write_start = mono_now();
@@ -158,7 +158,7 @@ impl<T: FileSystem> FuseSender<T> {
                 } => {
                     // Same dequeue-point dec as the request path.
                     mark_dequeued(queue_guard);
-                    let id = data.unique();
+                    let id = data.header.unique;
                     let metrics = FuseMetrics::get();
                     match self.send(data).await {
                         Ok(()) => {
@@ -178,7 +178,7 @@ impl<T: FileSystem> FuseSender<T> {
                 }
 
                 FuseTask::Reply(reply) => {
-                    let id = reply.unique();
+                    let id = reply.header.unique;
                     if let Err(e) = self.send(reply).await {
                         if e.raw_error().raw_os_error() != Some(libc::ENOENT) {
                             warn!("error send unique {}: {}", id, e);
@@ -192,10 +192,10 @@ impl<T: FileSystem> FuseSender<T> {
 
     pub async fn send(&mut self, rep: ResponseData) -> IOResult<()> {
         if self.debug {
-            info!("reply {:?}", rep.header());
+            info!("reply {:?}", rep.header);
         }
 
-        let len = rep.len() as usize;
+        let len = rep.header.len as usize;
         if self.pipe2.is_some() && len >= SPLICE_THRESHOLD {
             self.splice(rep).await
         } else {
@@ -203,9 +203,13 @@ impl<T: FileSystem> FuseSender<T> {
         }
     }
 
-    // Non-splice reply path. The fuse device has no send-buffer watermark, so writev
-    // never returns EAGAIN like the SPLICE_F_NONBLOCK transfer does — it fails with a
-    // real errno. Hence enable_splice=false works and splice_retry is NOT applied here.
+    // Non-splice reply path. Uses AsyncFd::async_write (edge-triggered WRITABLE),
+    // the same readiness model that hangs the splice path — but writev to /dev/fuse
+    // does not hit that trap. The fuse device has no send-buffer watermark, so a
+    // well-formed reply never returns EAGAIN the way the SPLICE_F_NONBLOCK
+    // pipe->device transfer does; it fails with a real errno (e.g. ENOENT for an
+    // unknown request) instead. This is why enable_splice=false is a sound workaround
+    // and why splice_retry is intentionally NOT applied to writev.
     pub async fn write(&mut self, rep: ResponseData) -> IOResult<()> {
         let (len, iovec) = rep.as_iovec()?;
         let written = self
@@ -224,20 +228,21 @@ impl<T: FileSystem> FuseSender<T> {
         let (len, iovec) = rep.as_iovec()?;
         if let Err(e) = pipe2.write_iov(len, &iovec).await {
             Self::drain_pipe(pipe2);
-            return Err(e.into());
+            return Err(e);
         }
 
         if let Err(e) = pipe2.read_io(&self.kernel_fd, len).await {
             Self::drain_pipe(pipe2);
-            return Err(e.into());
+            return Err(e);
         }
 
         Ok(())
     }
 
-    /// Drain residual bytes after a failed transfer, else stale bytes at the FIFO
-    /// head poison every subsequent response. EINTR is retried; the loop stops on
-    /// EAGAIN/EWOULDBLOCK (empty), EOF, or any other error.
+    /// Drain residual bytes left in the pipe after a failed transfer, else stale
+    /// bytes at the head of the FIFO permanently poison every subsequent response.
+    /// EINTR is retried so a signal cannot leave the pipe partially filled; the loop
+    /// stops on EAGAIN/EWOULDBLOCK (empty) or EOF/any other error.
     fn drain_pipe(pipe2: &Pipe2) {
         let fd = pipe2.read_raw_fd();
         let mut buf = [0u8; 8192];
@@ -246,7 +251,7 @@ impl<T: FileSystem> FuseSender<T> {
                 Ok(n) if n > 0 => continue,
                 Ok(_) => break, // EOF
                 Err(e) => {
-                    if e.raw_os_error() == Some(libc::EINTR) {
+                    if e.raw_error().raw_os_error() == Some(libc::EINTR) {
                         continue; // interrupted; retry
                     }
                     // EAGAIN/EWOULDBLOCK: pipe is empty; any other error: stop.
@@ -266,7 +271,7 @@ fn mark_dequeued(queue_guard: Option<ActiveGuard>) {
 mod tests {
     use super::mark_dequeued;
     use crate::fuse_metrics::ActiveGuard;
-    use orpc::common::Metrics as m;
+    use orpc_rpc::common::Metrics as m;
 
     // `mark_dequeued` decrements at the dequeue point.
     #[test]

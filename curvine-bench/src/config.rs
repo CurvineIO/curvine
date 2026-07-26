@@ -14,7 +14,7 @@
 //
 
 use super::WorkloadKind;
-use orpc::{err_box, CommonResult};
+use orpc_rpc::{err_box, CommonResult};
 use serde::Serialize;
 
 pub const DEFAULT_DURATION_MS: u64 = 30_000;

@@ -16,7 +16,7 @@ use crate::util::*;
 use clap::Parser;
 use curvine_client_core::file::FsClient;
 use curvine_fs_api::Path;
-use orpc::CommonResult;
+use orpc_rpc::CommonResult;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]

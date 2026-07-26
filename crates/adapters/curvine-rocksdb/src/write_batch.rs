@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::DBEngine;
-use orpc::CommonResult;
+use orpc_rpc::CommonResult;
 use rocksdb::WriteBatchWithTransaction;
 
 pub struct WriteBatch<'a> {

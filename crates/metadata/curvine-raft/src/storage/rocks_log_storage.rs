@@ -15,7 +15,7 @@
 use crate::proto::SnapshotData;
 use crate::storage::{LogStorage, RocksStorageCore};
 use crate::{LibRaftResult, RaftError, RaftResult};
-use curvine_common::conf::JournalConf;
+use curvine_common_core::conf::JournalConf;
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
 use raft::util::limit_size;
 use raft::{GetEntriesContext, RaftState, Storage};

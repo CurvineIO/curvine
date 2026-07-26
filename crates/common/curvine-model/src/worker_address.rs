@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use orpc::io::net::InetAddr;
+use orpc_rpc::io::net::InetAddr;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
@@ -29,12 +29,6 @@ pub struct WorkerAddress {
 impl WorkerAddress {
     pub fn is_local(&self, hostname: &str) -> bool {
         self.hostname == hostname
-    }
-
-    pub fn same_endpoint(&self, other: &Self) -> bool {
-        self.hostname == other.hostname
-            && self.ip_addr == other.ip_addr
-            && self.rpc_port == other.rpc_port
     }
 
     pub fn connect_addr(&self) -> String {

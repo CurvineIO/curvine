@@ -1,0 +1,417 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::common::LocalTime;
+use crate::runtime::Runtime;
+use crate::CommonResult;
+use md5::{Digest, Md5};
+use rand::prelude::ThreadRng;
+use rand::seq::SliceRandom;
+use rand::Rng;
+use serde::de::DeserializeOwned;
+use std::backtrace::Backtrace;
+use std::io::{Cursor, Write};
+use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use std::{env, fs, panic, process, thread};
+use uuid::Uuid;
+
+pub struct Utils;
+
+impl Utils {
+    // Create a 64-bit request id
+    pub fn req_id() -> i64 {
+        let mut lsb: i64 = 0;
+        for b in Uuid::new_v4().as_bytes() {
+            lsb = (lsb << 8) | *b as i64
+        }
+        lsb
+    }
+
+    pub fn unique_id() -> u64 {
+        let mut lsb: u64 = 0;
+        for b in Uuid::new_v4().as_bytes() {
+            lsb = (lsb << 8) | *b as u64
+        }
+        lsb
+    }
+
+    pub fn new_rt<T: AsRef<str>>(name: T, threads: usize) -> Runtime {
+        Runtime::new(name, threads, threads)
+    }
+
+    pub fn rand_id() -> u64 {
+        let mut rng = rand::thread_rng();
+        rng.gen::<u64>()
+    }
+
+    pub fn rand_rng() -> ThreadRng {
+        rand::thread_rng()
+    }
+
+    pub fn shuffle<T>(vec: &mut [T]) {
+        let mut rng = Self::rand_rng();
+        vec.shuffle(&mut rng)
+    }
+
+    pub fn murmur3(bytes: &[u8]) -> u32 {
+        murmur3::murmur3_32(&mut Cursor::new(bytes), 104729).unwrap()
+    }
+
+    pub fn crc32(buf: &[u8]) -> u32 {
+        crc32fast::hash(buf)
+    }
+
+    pub fn rand_str(len: usize) -> String {
+        let mut str = String::with_capacity(len);
+        for _ in 0..len {
+            let c = rand::thread_rng().gen_range(b'a'..b'z' + 1);
+            str.push(c as char);
+        }
+        str
+    }
+
+    pub fn rand_str_line(len: usize) -> String {
+        let len = len.saturating_sub(1);
+        if len == 0 {
+            return "".to_string();
+        }
+        format!("{}\n", Self::rand_str(len))
+    }
+
+    pub fn uuid() -> String {
+        Uuid::new_v4().to_string()
+    }
+
+    pub fn machine_id() -> u32 {
+        let str = format!(
+            "cache-machine_id-{}-{}",
+            Self::rand_id(),
+            LocalTime::nanos()
+        );
+
+        murmur3::murmur3_32(&mut Cursor::new(str.as_bytes()), 104729).unwrap()
+    }
+
+    pub fn recover_panic<F, R>(f: F) -> thread::Result<R>
+    where
+        F: FnOnce() -> R,
+    {
+        panic::catch_unwind(AssertUnwindSafe(f))
+    }
+
+    pub fn sleep(time_ms: u64) {
+        thread::sleep(Duration::from_millis(time_ms));
+    }
+
+    // Get the number of CPU cores
+    pub fn cpu_nums() -> usize {
+        thread::available_parallelism()
+            .map(|x| x.get())
+            .unwrap_or(0)
+    }
+
+    // Get the current working directory.
+    pub fn cur_dir() -> String {
+        let path = env::current_dir().unwrap_or(PathBuf::from("./"));
+        format!("{}", path.display())
+    }
+
+    pub fn cur_dir_sub<T: AsRef<Path>>(sub: T) -> String {
+        let mut path = env::current_dir().unwrap_or(PathBuf::from("."));
+        path.push(sub);
+
+        format!("{}", path.display())
+    }
+
+    // Return a temporary file name
+    pub fn temp_file() -> String {
+        let mut path = env::temp_dir();
+        path.push(format!("temp-{}", Self::rand_id()));
+        format!("{}", path.display())
+    }
+
+    // Returns a test file name.Located in the testing directory.
+    pub fn test_file() -> String {
+        let mut path = env::current_dir().unwrap_or(PathBuf::from("."));
+        path.push("../testing");
+
+        // Create the testing/ directory itself (create_parent_dir would only
+        // ensure the parent of ../testing, i.e. the workspace root).
+        fs::create_dir_all(&path).expect("failed to create testing/ for Utils::test_file");
+
+        path.push(format!("test-{}", Self::rand_id()));
+        format!("{}", path.display())
+    }
+
+    pub fn test_sub_dir<T: AsRef<Path>>(sub: T) -> String {
+        let mut path = env::current_dir().unwrap_or(PathBuf::from("."));
+        path.push("../testing");
+        path.push(sub);
+
+        // Ensure the sub directory exists
+        fs::create_dir_all(&path).unwrap_or_else(|e| {
+            panic!("failed to create testing sub dir {}: {}", path.display(), e);
+        });
+
+        format!("{}", path.display())
+    }
+
+    // Set the panic capture handler, which requires setting the profile panic to abort
+    // After the program triggers panic, prints the log and exits the program.
+    //
+    // Note: In Rust 1.92+, unwind tables are generated by default even in panic="abort" mode,
+    // so backtrace should be available. However, on Windows, this may still require
+    // RUST_BACKTRACE environment variable to be set.
+    pub fn set_panic_exit_hook() {
+        if env::var("RUST_BACKTRACE").is_err() {
+            env::set_var("RUST_BACKTRACE", "1");
+        }
+
+        panic::set_hook(Box::new(|panic_info| {
+            let message = match panic_info.payload().downcast_ref::<&str>() {
+                Some(s) => *s,
+                None => match panic_info.payload().downcast_ref::<String>() {
+                    Some(s) => s.as_str(),
+                    None => "Box<Any>",
+                },
+            };
+
+            let (file, line) = match panic_info.location() {
+                Some(loc) => (loc.file(), loc.line()),
+                None => ("<unknown>", 0),
+            };
+
+            let backtrace_str = panic::catch_unwind(AssertUnwindSafe(|| {
+                let backtrace = Backtrace::capture();
+                match backtrace.status() {
+                    std::backtrace::BacktraceStatus::Captured => {
+                        format!("{:?}", backtrace)
+                    }
+                    std::backtrace::BacktraceStatus::Disabled => {
+                        "backtrace disabled. Set RUST_BACKTRACE=1 or RUST_BACKTRACE=full to enable."
+                            .to_string()
+                    }
+                    std::backtrace::BacktraceStatus::Unsupported => {
+                        "backtrace not supported on this platform.".to_string()
+                    }
+                    _ => format!("backtrace status: {:?}", backtrace.status()),
+                }
+            }))
+            .unwrap_or_else(|_| "failed to capture backtrace".to_string());
+
+            let timestamp = panic::catch_unwind(AssertUnwindSafe(LocalTime::now_datetime))
+                .unwrap_or_else(|_| "<unknown time>".to_string());
+
+            let _ = std::io::stderr().write_fmt(format_args!(
+                "{} panic occurred at {}:{}: {}\nbacktrace:\n{}\n",
+                timestamp, file, line, message, backtrace_str
+            ));
+
+            let _ = std::io::stderr().flush();
+
+            process::exit(1);
+        }));
+    }
+
+    /// Format backtrace to be more readable
+    ///
+    /// Note: std::backtrace::Backtrace doesn't expose frames() API in stable Rust,
+    /// so we parse the Debug format string instead.
+    ///
+    /// Safety: This function is designed to be safe even if the backtrace format
+    /// changes or contains unexpected characters. It will fallback to the original
+    /// format if parsing fails.
+    pub fn format_backtrace(backtrace: &Backtrace) -> String {
+        let backtrace_str = format!("{:?}", backtrace);
+        let mut formatted = String::with_capacity(backtrace_str.len());
+        let mut frame_num = 0;
+        let mut remaining = backtrace_str.as_str();
+        let mut last_remaining_len = remaining.len();
+
+        const MAX_FRAMES: usize = 1000;
+
+        while frame_num < MAX_FRAMES {
+            let Some(start) = remaining.find("fn: \"") else {
+                break;
+            };
+
+            let after_fn_start = start + 5;
+            if after_fn_start >= remaining.len() {
+                break;
+            }
+
+            let after_fn = &remaining[after_fn_start..];
+
+            let Some(end) = after_fn.find('"') else {
+                break;
+            };
+
+            let func_name = &after_fn[..end];
+
+            if !func_name.is_empty() {
+                use std::fmt::Write;
+                let _ = writeln!(formatted, "  {:2}: {}", frame_num, func_name);
+                frame_num += 1;
+            }
+
+            let next_pos = after_fn_start + end + 1;
+            if next_pos >= remaining.len() {
+                break;
+            }
+            remaining = &remaining[next_pos..];
+
+            if remaining.len() >= last_remaining_len {
+                break;
+            }
+            last_remaining_len = remaining.len();
+        }
+
+        if formatted.is_empty() {
+            formatted.push_str("  ");
+            formatted.push_str(&backtrace_str);
+            formatted.push('\n');
+        }
+
+        formatted
+    }
+
+    // Calculate the number of worker threads based on the number of CPUs
+    pub fn worker_threads(io_threads: usize) -> usize {
+        let cpus = Self::cpu_nums();
+        io_threads.max(2 * cpus)
+    }
+
+    pub fn read_toml_conf<T: DeserializeOwned>(path: impl AsRef<Path>) -> CommonResult<T> {
+        let content = std::fs::read_to_string(path)?;
+        let conf = toml::from_str::<T>(&content)?;
+        Ok(conf)
+    }
+
+    pub fn md5(source: impl AsRef<str>) -> String {
+        let mut hasher = Md5::new();
+        hasher.update(source.as_ref().as_bytes());
+        let hash = hasher.finalize();
+        format!("{:x}", hash)
+    }
+
+    pub fn thread_id() -> String {
+        format!("{:?}", thread::current().id())
+    }
+
+    pub fn thread_name() -> String {
+        thread::current().name().unwrap_or("").to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::common::Utils;
+
+    #[test]
+    pub fn uuid() {
+        println!("uuid = {}", Utils::uuid())
+    }
+
+    #[test]
+    pub fn test_md5() {
+        assert_eq!(
+            Utils::md5("hello world"),
+            "5eb63bbbe01eeed093cb22bb8f5acdc3"
+        );
+        assert_eq!(Utils::md5(""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(
+            Utils::md5("The quick brown fox jumps over the lazy dog"),
+            "9e107d9d372bb6826bd81d3542a419d6"
+        );
+        assert_eq!(Utils::md5("hello"), "5d41402abc4b2a76b9719d911017c592");
+
+        let input = "test string";
+        let hash1 = Utils::md5(input);
+        let hash2 = Utils::md5(input);
+        assert_eq!(hash1, hash2);
+
+        assert_eq!(Utils::md5("any string").len(), 32);
+
+        assert_ne!(Utils::md5("hello"), Utils::md5("world"));
+
+        println!("MD5 tests passed!");
+        println!("Examples:");
+        println!("  MD5('hello world') = {}", Utils::md5("hello world"));
+        println!("  MD5('hello') = {}", Utils::md5("hello"));
+        println!("  MD5('') = {}", Utils::md5(""));
+    }
+
+    #[test]
+    fn cur_dir() {
+        let dir = Utils::cur_dir_sub("meta");
+        println!("{}", dir)
+    }
+
+    #[test]
+    fn test_file_creates_testing_directory() {
+        use std::path::Path;
+
+        let path = Utils::test_file();
+        let parent = Path::new(&path).parent().expect("test file has parent");
+        assert!(
+            parent.is_dir(),
+            "Utils::test_file must create testing/; missing {:?}",
+            parent
+        );
+        // Ensure the returned path is writable (the original ENOENT failure mode).
+        std::fs::File::create(&path).expect("should be able to create file under testing/");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Regression for #1184: from a clean CWD where `../testing` does not yet
+    /// exist, `test_file()` must create it and return a path under it.
+    #[test]
+    fn test_file_creates_testing_dir() {
+        use std::env;
+        use std::fs;
+        use std::path::Path;
+        use std::sync::Mutex;
+
+        // Serialize CWD mutations across parallel tests in this crate.
+        static CWD_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = CWD_LOCK.lock().unwrap();
+
+        let base = env::temp_dir().join(format!("orpc-test-file-{}", Utils::rand_id()));
+        let work = base.join("crate_cwd");
+        fs::create_dir_all(&work).unwrap();
+
+        let testing = base.join("testing");
+        assert!(!testing.exists());
+
+        let prev = env::current_dir().unwrap();
+        env::set_current_dir(&work).unwrap();
+
+        let file = Utils::test_file();
+        let parent = Path::new(&file)
+            .parent()
+            .and_then(|p| p.canonicalize().ok());
+        let testing_canon = testing.canonicalize().ok();
+        let ok = testing.is_dir() && parent == testing_canon;
+
+        env::set_current_dir(prev).unwrap();
+        let _ = fs::remove_dir_all(&base);
+
+        assert!(
+            ok,
+            "test_file() must create ../testing and place the file under it"
+        );
+    }
+}

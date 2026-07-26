@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::sync::{StateCtl, StateListener, StateMonitor};
+use crate::CommonResult;
 use num_enum::{FromPrimitive, IntoPrimitive};
-use orpc_error::CommonResult;
-use orpc_runtime::sync::{StateCtl, StateListener, StateMonitor};
 
 #[repr(i8)]
 #[derive(PartialEq, PartialOrd, Debug, Clone, Copy, IntoPrimitive, FromPrimitive)]
@@ -84,6 +84,8 @@ impl ServerStateListener {
 
     /// Wait until the server reaches Running, or fail fast if it shuts down before binding.
     pub async fn wait_startup(&mut self) -> CommonResult<()> {
+        use crate::err_box;
+
         let running = ServerState::Running.into();
         let shutdown = ServerState::Shutdown.into();
 
@@ -115,7 +117,7 @@ impl ServerStateListener {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orpc_runtime::runtime::{AsyncRuntime, RpcRuntime};
+    use crate::runtime::{AsyncRuntime, RpcRuntime};
 
     #[test]
     fn wait_startup_fails_when_shutdown_before_running() {

@@ -26,7 +26,7 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 curvine-client = { workspace = true }
-curvine-common = { workspace = true }
+curvine-common-core = { workspace = true }
 futures = { workspace = true }
 lance = { version = "4.0.0", default-features = false }
 lance-core = "4.0.0"
@@ -37,7 +37,7 @@ lancedb_upstream = { package = "lancedb", version = "0.27.2", default-features =
 md-5 = { workspace = true }
 once_cell = { workspace = true }
 object_store = "0.12.5"
-orpc = { workspace = true }
+orpc-rpc = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }

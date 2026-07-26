@@ -14,9 +14,9 @@
 
 use crate::proto::{SnapshotDownloadRequest, SnapshotDownloadResponse, SnapshotFileInfo};
 use crate::{RaftCode, RaftError, RaftResult};
-use orpc::client::SyncClient;
-use orpc::common::Utils;
-use orpc::message::{Builder, Message, RequestStatus};
+use orpc_rpc::client::SyncClient;
+use orpc_rpc::common::Utils;
+use orpc_rpc::message::{Builder, Message, RequestStatus};
 
 // Snapshot data download client service.
 // Change the customer service side to synchronous operation.

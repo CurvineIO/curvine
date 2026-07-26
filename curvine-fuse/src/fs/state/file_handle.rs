@@ -18,10 +18,10 @@ use crate::fs::state::NodeState;
 use crate::fs::{FuseReader, FuseWriter};
 use crate::session::FuseResponse;
 use crate::{err_fuse, FuseResult};
-use curvine_common::fs::{StateReader, StateWriter};
-use curvine_common::state::{FileAllocOpts, FileStatus, LockFlags};
-use orpc::err_box;
-use orpc::sys::RawPtr;
+use curvine_fs_api::{StateReader, StateWriter};
+use curvine_model::{FileAllocOpts, FileStatus, LockFlags};
+use orpc_rpc::err_box;
+use orpc_rpc::sys::RawPtr;
 use std::sync::Arc;
 
 pub enum FileHandle {
@@ -110,12 +110,6 @@ impl FileHandle {
     pub fn take_plock_if_owner(&self, owner_id: u64) -> Option<u64> {
         match self {
             FileHandle::Backend(h) => h.take_plock_if_owner(owner_id),
-        }
-    }
-
-    pub fn drain_plock_owners(&self) -> Vec<u64> {
-        match self {
-            FileHandle::Backend(h) => h.drain_plock_owners(),
         }
     }
 

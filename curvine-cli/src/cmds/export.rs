@@ -19,7 +19,7 @@ use curvine_fs_api::Path;
 use curvine_job_client::{JobMasterClient, TransferClient};
 use curvine_model::{LoadJobCommand, TransferCommand, TransferKind};
 use curvine_unified_fs::UnifiedFileSystem;
-use orpc::{err_box, CommonResult};
+use orpc_rpc::{err_box, CommonResult};
 
 #[derive(Parser, Debug)]
 pub struct ExportCommand {

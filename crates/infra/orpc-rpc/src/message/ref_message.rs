@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::io::IOResult;
 use crate::message::{BoxMessage, Message};
 use bytes::BytesMut;
-use curvine_io::IOResult;
 
 /// This is to solve the rust ownership problem.
 /// For example, when the exception is retrying, Message has moved, Message cannot be used, and Message needs to be wrapped in Arc or Rc to solve the problem.

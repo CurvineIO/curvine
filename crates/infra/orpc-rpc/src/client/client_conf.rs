@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use orpc_net::retry::{TimeBondedRetry, TimeBondedRetryBuilder};
-use orpc_runtime::common::Utils;
-use orpc_runtime::runtime::Runtime;
+use crate::common::Utils;
+use crate::io::retry::{TimeBondedRetry, TimeBondedRetryBuilder};
+use crate::runtime::Runtime;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]

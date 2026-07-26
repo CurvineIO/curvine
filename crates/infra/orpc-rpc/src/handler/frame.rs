@@ -15,9 +15,9 @@
 use crate::handler::{ReadFrame, WriteFrame};
 use std::future::Future;
 
+use crate::io::net::ConnState;
+use crate::io::IOResult;
 use crate::message::{Message, RefMessage};
-use curvine_io::IOResult;
-use orpc_net::net::ConnState;
 
 pub trait Frame {
     fn send(&mut self, message: impl RefMessage) -> impl Future<Output = IOResult<()>>;

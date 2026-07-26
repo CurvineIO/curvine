@@ -18,12 +18,12 @@ use crate::raw::fuse_abi::fuse_args;
 use crate::raw::fuse_mount_pure;
 use crate::raw::fuse_umount_pure;
 use crate::{FuseUtils, FUSE_CLONE_FD_MIN_VERSION, UNIX_KERNEL_VERSION};
-use curvine_common::conf::FuseConf;
+use curvine_config::FuseConf;
 use log::{debug, error, info};
-use orpc::io::IOResult;
-use orpc::sys;
-use orpc::sys::pipe::{AsyncFd, BorrowedFd, OwnedFd};
-use orpc::sys::{CString, RawIO};
+use orpc_rpc::io::IOResult;
+use orpc_rpc::sys;
+use orpc_rpc::sys::pipe::{AsyncFd, BorrowedFd, OwnedFd};
+use orpc_rpc::sys::{CString, RawIO};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -111,7 +111,7 @@ impl Drop for FuseMnt {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::FuseMnt;
-    use curvine_common::conf::FuseConf;
+    use curvine_config::FuseConf;
     use std::path::PathBuf;
 
     fn missing_path(label: &str) -> PathBuf {

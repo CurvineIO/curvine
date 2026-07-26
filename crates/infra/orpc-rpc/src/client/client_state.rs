@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_io::IOError;
+use crate::io::io_error::IOError;
+use crate::io::net::InetAddr;
+use crate::sync::StateCtl;
 use num_enum::{FromPrimitive, IntoPrimitive};
-use orpc_net::net::InetAddr;
-use orpc_runtime::sync::StateCtl;
 use std::sync::Mutex;
 
 // Connection status

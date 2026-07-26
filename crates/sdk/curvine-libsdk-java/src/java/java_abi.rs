@@ -19,7 +19,7 @@ use crate::{java_err, java_err2, LibFsReader, LibFsWriter};
 use jni::objects::{JByteArray, JLongArray, JObject, JString};
 use jni::sys::{jarray, jboolean, jint, jlong};
 use jni::JNIEnv;
-use orpc::sys::FFIUtils;
+use orpc_rpc::sys::FFIUtils;
 
 // It's too troublesome to parse object members by jni. Here the configuration will be passed through the json string.
 #[no_mangle]
@@ -218,18 +218,6 @@ pub unsafe extern "C" fn Java_io_curvine_CurvineNative_getFileStatus(
 ) -> jarray {
     let fs = &*fs_ptr;
     java_err2!(env, fs.get_file_status(&mut env, path))
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn Java_io_curvine_CurvineNative_setAttr(
-    mut env: JNIEnv,
-    _this: JObject,
-    fs_ptr: *mut JavaFilesystem,
-    path: JString,
-    options: JByteArray,
-) -> jarray {
-    let fs = &*fs_ptr;
-    java_err2!(env, fs.set_attr(&mut env, path, options))
 }
 
 #[no_mangle]

@@ -16,11 +16,11 @@ use crate::file::{FsContext, FsWriterBase, FsWriterBuffer};
 use bytes::BytesMut;
 use curvine_error::FsResult;
 use curvine_fs_api::{Path, Writer};
-use curvine_model::{FileAllocOpts, FileBlocks, FileStatus, SetAttrOpts};
+use curvine_model::{FileAllocOpts, FileBlocks, FileStatus};
 use log::debug;
-use orpc::common::{ByteUnit, TimeSpent};
-use orpc::sys::DataSlice;
-use orpc::{err_box, ternary};
+use orpc_rpc::common::ByteUnit;
+use orpc_rpc::sys::DataSlice;
+use orpc_rpc::{err_box, ternary};
 use std::sync::Arc;
 
 type Inner = FsWriterBuffer;
@@ -31,6 +31,7 @@ pub struct FsWriter {
     chunk_size: usize,
     pos: i64,
     append: bool,
+    metrics: &'static crate::ClientMetrics,
 }
 
 impl FsWriter {
@@ -52,6 +53,7 @@ impl FsWriter {
 
         let writer = FsWriterBase::new(fs_context, path, status, pos);
         let inner = FsWriterBuffer::new(writer, chunk_num);
+        let metrics = FsContext::get_metrics();
 
         Self {
             inner,
@@ -59,6 +61,7 @@ impl FsWriter {
             chunk_size,
             pos,
             append,
+            metrics,
         }
     }
 
@@ -101,12 +104,8 @@ impl Writer for FsWriter {
     }
 
     async fn write_chunk(&mut self, chunk: DataSlice) -> FsResult<i64> {
-        let len = chunk.len();
-        let _timer =
-            TimeSpent::timer_counter(Arc::new(FsContext::get_metrics().write_time_us.clone()));
-        self.inner.write(chunk).await?;
-        FsContext::get_metrics().write_bytes.inc_by(len as i64);
-        Ok(len as i64)
+        let len = chunk.len() as i64;
+        self.metrics.track_write(len, self.inner.write(chunk)).await
     }
 
     async fn flush(&mut self) -> FsResult<()> {
@@ -122,12 +121,9 @@ impl Writer for FsWriter {
         self.inner.complete().await
     }
 
-    async fn complete_with_attr(&mut self, opts: Option<SetAttrOpts>) -> FsResult<()> {
-        self.flush_chunk().await?;
-        self.inner.complete_with_attr(opts).await
-    }
-
     async fn cancel(&mut self) -> FsResult<()> {
+        // Bytes still in the front buffer have never reached the backend and
+        // must not be flushed after cancellation.
         self.buf.clear();
         self.inner.cancel().await
     }
@@ -135,6 +131,8 @@ impl Writer for FsWriter {
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
         if pos < 0 {
             return err_box!(format!("Cannot seek to negative position: {}", pos));
+        } else if self.pos == pos {
+            return Ok(());
         }
 
         if self.append {

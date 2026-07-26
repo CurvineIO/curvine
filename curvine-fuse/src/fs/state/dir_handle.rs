@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::fs::{ListStream, Path};
-use curvine_common::state::FileStatus;
-use curvine_common::FsResult;
+use curvine_error::FsResult;
+use curvine_fs_api::{ListStream, Path};
+use curvine_model::FileStatus;
 use futures::StreamExt;
-use orpc::err_box;
+use orpc_rpc::err_box;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::future::Future;
@@ -146,9 +146,9 @@ impl DirHandle {
 mod tests {
     use super::DirHandle;
     use crate::FuseError;
-    use curvine_common::fs::{ListStream, Path};
-    use curvine_common::state::FileStatus;
-    use orpc::runtime::{AsyncRuntime, RpcRuntime};
+    use curvine_fs_api::{ListStream, Path};
+    use curvine_model::FileStatus;
+    use orpc_rpc::runtime::{AsyncRuntime, RpcRuntime};
     use std::cell::Cell;
     use std::sync::Arc;
 

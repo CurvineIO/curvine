@@ -19,7 +19,7 @@ use curvine_error::FsResult;
 use curvine_fs_api::local::{LocalFilesystem, LocalReader, LocalWriter};
 use curvine_fs_api::{FileSystem, FsKind, Path};
 use curvine_model::{MountInfo, Provider};
-use orpc::err_box;
+use orpc_rpc::err_box;
 use std::collections::HashMap;
 
 #[cfg(feature = "opendal")]

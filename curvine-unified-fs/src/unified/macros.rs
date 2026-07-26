@@ -80,7 +80,7 @@ macro_rules! impl_writer_for_enum {
 
             async fn write_chunk(
                 &mut self,
-                chunk: ::orpc::sys::DataSlice,
+                chunk: ::orpc_rpc::sys::DataSlice,
             ) -> ::curvine_error::FsResult<i64> {
                 match self {
                     $(
@@ -104,18 +104,6 @@ macro_rules! impl_writer_for_enum {
                     $(
                         $(#[$cfg])*
                         Self::$variant(v) => v.complete().await,
-                    )+
-                }
-            }
-
-            async fn complete_with_attr(
-                &mut self,
-                opts: Option<::curvine_model::SetAttrOpts>,
-            ) -> ::curvine_error::FsResult<()> {
-                match self {
-                    $(
-                        $(#[$cfg])*
-                        Self::$variant(v) => v.complete_with_attr(opts).await,
                     )+
                 }
             }
@@ -193,7 +181,7 @@ macro_rules! impl_reader_for_enum {
                 }
             }
 
-            fn chunk_mut(&mut self) -> &mut ::orpc::sys::DataSlice {
+            fn chunk_mut(&mut self) -> &mut ::orpc_rpc::sys::DataSlice {
                 match self {
                     $(
                         $(#[$cfg])*
@@ -229,7 +217,7 @@ macro_rules! impl_reader_for_enum {
                 }
             }
 
-            async fn read_chunk0(&mut self) -> ::curvine_error::FsResult<::orpc::sys::DataSlice> {
+            async fn read_chunk0(&mut self) -> ::curvine_error::FsResult<::orpc_rpc::sys::DataSlice> {
                 match self {
                     $(
                         $(#[$cfg])*
@@ -257,7 +245,7 @@ macro_rules! impl_reader_for_enum {
             }
 
             // Forward default methods explicitly to ensure they work correctly
-            fn async_read(&mut self, len: Option<usize>) -> impl ::std::future::Future<Output = ::curvine_error::FsResult<::orpc::sys::DataSlice>> + Send {
+            fn async_read(&mut self, len: Option<usize>) -> impl ::std::future::Future<Output = ::curvine_error::FsResult<::orpc_rpc::sys::DataSlice>> + Send {
                 async move {
                     match self {
                         $(
@@ -268,7 +256,7 @@ macro_rules! impl_reader_for_enum {
                 }
             }
 
-            fn read_chunk(&mut self, len: Option<usize>) -> impl ::std::future::Future<Output = ::curvine_error::FsResult<::orpc::sys::DataSlice>> + Send {
+            fn read_chunk(&mut self, len: Option<usize>) -> impl ::std::future::Future<Output = ::curvine_error::FsResult<::orpc_rpc::sys::DataSlice>> + Send {
                 async move {
                     match self {
                         $(
@@ -290,7 +278,7 @@ macro_rules! impl_reader_for_enum {
                 }
             }
 
-            fn blocking_read(&mut self, rt: &::orpc::runtime::Runtime) -> ::curvine_error::FsResult<::orpc::sys::DataSlice> {
+            fn blocking_read(&mut self, rt: &::orpc_rpc::runtime::Runtime) -> ::curvine_error::FsResult<::orpc_rpc::sys::DataSlice> {
                 match self {
                     $(
                         $(#[$cfg])*
@@ -299,7 +287,7 @@ macro_rules! impl_reader_for_enum {
                 }
             }
 
-            fn fuse_read(&mut self, pos: i64, len: usize) -> impl ::std::future::Future<Output = ::curvine_error::FsResult<Vec<::orpc::sys::DataSlice>>> + Send {
+            fn fuse_read(&mut self, pos: i64, len: usize) -> impl ::std::future::Future<Output = ::curvine_error::FsResult<Vec<::orpc_rpc::sys::DataSlice>>> + Send {
                 async move {
                     match self {
                         $(

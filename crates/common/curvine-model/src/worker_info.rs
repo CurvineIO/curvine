@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::state::{StorageInfo, WorkerAddress, WorkerStatus};
-use orpc::common::LocalTime;
+use orpc_rpc::common::LocalTime;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};

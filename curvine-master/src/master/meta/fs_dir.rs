@@ -20,18 +20,18 @@ use crate::master::meta::inode::*;
 use crate::master::meta::store::{InodeStore, RocksInodeStore};
 use crate::master::meta::{BlockMeta, InodeId};
 use crate::master::quota::eviction::evictor::Evictor;
-use curvine_common::conf::ClusterConf;
-use curvine_common::error::FsError;
-use curvine_common::state::{
+use curvine_common_core::conf::ClusterConf;
+use curvine_common_core::error::FsError;
+use curvine_common_core::state::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
     FreeResult, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, WorkerAddress,
     INTERNAL_CTIME_XATTR,
 };
-use curvine_common::FsResult;
+use curvine_common_core::FsResult;
 use log::{debug, info, warn};
-use orpc::common::{LocalTime, TimeSpent};
-use orpc::sync::AtomicCounter;
-use orpc::{err_box, err_ext, try_option, CommonResult};
+use orpc_rpc::common::{LocalTime, TimeSpent};
+use orpc_rpc::sync::AtomicCounter;
+use orpc_rpc::{err_box, err_ext, try_option, CommonResult};
 use std::collections::{HashMap, LinkedList};
 use std::mem;
 use std::sync::Arc;
@@ -326,28 +326,13 @@ impl FsDir {
         flags: RenameFlags,
     ) -> FsResult<Option<DeleteResult>> {
         let op_ms = LocalTime::mills();
-        let exchange_pre_swap_ids = if flags.exchange_mode() {
-            let src_id = src_inp
-                .get_last_inode()
-                .map(|inode| inode.id())
-                .unwrap_or(0);
-            let dst_id = dst_inp
-                .get_last_inode()
-                .map(|inode| inode.id())
-                .unwrap_or(0);
-            Some((src_id, dst_id))
-        } else {
-            None
-        };
-        let res =
-            self.unprotected_rename(src_inp, dst_inp, op_ms as i64, flags, exchange_pre_swap_ids)?;
+        let res = self.unprotected_rename(src_inp, dst_inp, op_ms as i64, flags)?;
         self.journal_writer.log_rename(
             self,
             src_inp.path(),
             dst_inp.path(),
             op_ms as i64,
             flags,
-            exchange_pre_swap_ids,
         )?;
         Ok(res)
     }
@@ -358,15 +343,13 @@ impl FsDir {
         dst_inp: &InodePath,
         mtime: i64,
         flags: RenameFlags,
-        exchange_pre_swap_ids: Option<(i64, i64)>,
     ) -> FsResult<Option<DeleteResult>> {
         let src_inode = match src_inp.get_last_inode() {
             None => return err_ext!(FsError::file_not_found(src_inp.path())),
             Some(v) => v,
         };
         if flags.exchange_mode() {
-            self.unprotected_exchange(src_inp, dst_inp, mtime, exchange_pre_swap_ids)?;
-            return Ok(None);
+            return err_box!("Rename failed, because exchange mode is not supported");
         }
 
         let mut src_parent = match src_inp.get_inode(-2) {
@@ -429,104 +412,6 @@ impl FsDir {
         let _ = dst_parent.add_child(new_inode)?;
 
         Ok(del_res)
-    }
-
-    fn unprotected_exchange(
-        &mut self,
-        src_inp: &InodePath,
-        dst_inp: &InodePath,
-        mtime: i64,
-        pre_swap_ids: Option<(i64, i64)>,
-    ) -> FsResult<()> {
-        let src_inode = match src_inp.get_last_inode() {
-            None => return err_ext!(FsError::file_not_found(src_inp.path())),
-            Some(v) => v,
-        };
-        let dst_inode = match dst_inp.get_last_inode() {
-            None => return err_ext!(FsError::file_not_found(dst_inp.path())),
-            Some(v) => v,
-        };
-
-        let src_id = src_inode.id();
-        let dst_id = dst_inode.id();
-
-        if src_id == dst_id {
-            return Ok(());
-        }
-
-        if let Some((expected_src, expected_dst)) = pre_swap_ids {
-            if expected_src != 0 && expected_dst != 0 {
-                if src_id == expected_dst && dst_id == expected_src {
-                    return Ok(());
-                }
-                if src_id != expected_src || dst_id != expected_dst {
-                    warn!(
-                        "Exchange replay inode id mismatch at {} and {}: current ({}, {}), expected ({}, {})",
-                        src_inp.path(),
-                        dst_inp.path(),
-                        src_id,
-                        dst_id,
-                        expected_src,
-                        expected_dst
-                    );
-                    return Ok(());
-                }
-            }
-        }
-
-        let mut src_parent = match src_inp.get_inode(-2) {
-            None => return err_box!("Parent not exists: {}", src_inp.path()),
-            Some(v) => v,
-        };
-        let mut dst_parent = match dst_inp.get_inode(-2) {
-            None => return err_box!("Parent not exists: {}", dst_inp.path()),
-            Some(v) => v,
-        };
-
-        let src_name = src_inp.name().to_string();
-        let dst_name = dst_inp.name().to_string();
-
-        let mut at_src = dst_inode.as_ref().clone();
-        at_src.change_name(src_name.clone());
-        at_src.set_parent_id(src_parent.id());
-
-        let mut at_dst = src_inode.as_ref().clone();
-        at_dst.change_name(dst_name.clone());
-        at_dst.set_parent_id(dst_parent.id());
-
-        src_parent.update_mtime(mtime);
-        dst_parent.update_mtime(mtime);
-
-        if src_parent.id() != dst_parent.id() {
-            let src_was_dir = src_inode.is_dir();
-            let dst_was_dir = dst_inode.is_dir();
-            if src_was_dir && !dst_was_dir {
-                src_parent.dec_nlink(mtime);
-            } else if !src_was_dir && dst_was_dir {
-                src_parent.incr_nlink(mtime);
-            }
-            if dst_was_dir && !src_was_dir {
-                dst_parent.dec_nlink(mtime);
-            } else if !dst_was_dir && src_was_dir {
-                dst_parent.incr_nlink(mtime);
-            }
-        }
-
-        self.store.apply_exchange(
-            src_parent.as_ref(),
-            &src_name,
-            dst_parent.as_ref(),
-            &dst_name,
-            &at_src,
-            &at_dst,
-        )?;
-
-        let _ = src_parent.delete_child(src_inode.id(), &src_name)?;
-        let _ = dst_parent.delete_child(dst_inode.id(), &dst_name)?;
-        let _ = src_parent.add_child(at_src)?;
-        let _ = dst_parent.add_child(at_dst)?;
-
-        Ok(())
     }
 
     pub fn create_file(&mut self, mut inp: InodePath, opts: CreateFileOpts) -> FsResult<InodePath> {
@@ -700,7 +585,6 @@ impl FsDir {
         Ok(block)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn complete_file(
         &mut self,
         path: impl AsRef<str>,
@@ -709,21 +593,11 @@ impl FsDir {
         commit_block: Vec<CommitBlock>,
         client_name: impl AsRef<str>,
         only_flush: bool,
-        set_attr_opts: Option<SetAttrOpts>,
     ) -> FsResult<bool> {
         let file = inode.as_file_mut()?;
-        let id = file.id();
         file.complete(len, &commit_block, client_name, only_flush)?;
 
-        // Only apply set_attr_opts on real complete/close, not on flush.
-        // Flush semantics should remain narrow (durability only).
-        if !only_flush {
-            if let Some(opts) = set_attr_opts {
-                inode.set_attr(opts)?;
-            }
-        }
-
-        self.evictor.on_access(id);
+        self.evictor.on_access(file.id());
 
         self.store
             .apply_complete_file(inode.as_ref(), &commit_block)?;
@@ -1123,12 +997,8 @@ impl FsDir {
         let (original_inode_id, mut original_inode_ptr) = match src_path.get_last_inode() {
             Some(inode) => match inode.as_ref() {
                 File(file) => {
-                    // Hard links to regular files and symlinks are valid; directories are not.
-                    if !matches!(
-                        file.file_type,
-                        curvine_common::state::FileType::File
-                            | curvine_common::state::FileType::Link
-                    ) {
+                    // Check if it's a regular file (not a directory or symlink)
+                    if file.file_type != curvine_common_core::state::FileType::File {
                         return err_ext!(FsError::common("Cannot create link to non-regular file"));
                     }
                     (file.id, Some(inode.clone()))

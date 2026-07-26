@@ -18,10 +18,10 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, Path};
 use curvine_model::{FileStatus, FileType, SetAttrOpts};
-use curvine_ufs::{err_ufs, OssHdfsConf};
-use orpc::common::LocalTime;
-use orpc::error::ErrorExt;
-use orpc::sys::DataSlice;
+use curvine_ufs_api::{err_ufs, OssHdfsConf};
+use orpc_rpc::common::LocalTime;
+use orpc_rpc::error::ErrorExt;
+use orpc_rpc::sys::DataSlice;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::raw::c_void;
@@ -61,11 +61,6 @@ pub struct OssHdfsFileSystem {
 struct OssHdfsFileSystemInner {
     fs_handle: JindoFileSystemHandle,
     conf: UfsConf,
-}
-
-struct JindoStartStatus {
-    status: JindoStatus,
-    error: Option<String>,
 }
 
 impl Drop for OssHdfsFileSystemInner {
@@ -239,9 +234,10 @@ impl OssHdfsFileSystem {
     }
 
     /// Execute a blocking JindoSDK filesystem operation outside Tokio worker threads.
-    async fn with_fs_handle_blocking<F>(&self, f: F) -> FsResult<JindoStartStatus>
+    async fn with_fs_handle_blocking<F, R>(&self, f: F) -> FsResult<R>
     where
-        F: FnOnce(*mut c_void) -> JindoStatus + Send + 'static,
+        F: FnOnce(*mut c_void) -> R + Send + 'static,
+        R: Send + 'static,
     {
         if self.inner.fs_handle.is_null() {
             return Err(FsError::common("Filesystem handle is null"));
@@ -252,16 +248,14 @@ impl OssHdfsFileSystem {
             if inner.fs_handle.is_null() {
                 return Err(FsError::common("Filesystem handle is null"));
             }
-            let status = f(inner.fs_handle.as_raw());
-            let error = (status != JindoStatus::Ok).then(jindo_last_error);
-            Ok(JindoStartStatus { status, error })
+            Ok(f(inner.fs_handle.as_raw()))
         })
         .await
         .map_err(|e| FsError::common(format!("OSS-HDFS blocking operation failed: {}", e)))?
     }
 
-    fn check_status(result: JindoStartStatus, operation: &str) -> FsResult<()> {
-        Self::check_status_with_err(result.status, operation, result.error)
+    fn check_status(status: JindoStatus, operation: &str) -> FsResult<()> {
+        check_jindo_status(status, operation, None)
     }
 
     fn check_status_with_err(
@@ -556,11 +550,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
                 unsafe {
                     jindo_writer_free(writer_handle.as_raw());
                 }
-                Self::check_status_with_err(
-                    start_status,
-                    "Failed to start async writer tell",
-                    None,
-                )?;
+                Self::check_status(start_status, "Failed to start async writer tell")?;
             }
         }
 
@@ -630,7 +620,10 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
                     status
                 })
                 .await?;
-            Self::check_status(start_status, "Failed to start async exists")?;
+            match start_status {
+                JindoStatus::Ok => {}
+                _ => Self::check_status(start_status, "Failed to start async exists")?,
+            }
         }
 
         let (status, exists, err) = ctx.wait().await?;

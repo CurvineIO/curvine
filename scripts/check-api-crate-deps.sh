@@ -21,9 +21,13 @@ crates=(
   curvine-fs-api
   curvine-storage-api
   curvine-config
+  curvine-ufs-api
 )
 
 forbidden=(
+  curvine-common
+  orpc
+  curvine-ufs
   rocksdb
   raft
   axum

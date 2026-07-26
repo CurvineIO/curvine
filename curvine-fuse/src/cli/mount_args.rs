@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use clap::Parser;
-use curvine_common::conf::{ClientConfCliOverrides, ClusterConf};
-use curvine_common::version;
-use orpc::io::net::InetAddr;
-use orpc::{err_box, CommonResult};
+use curvine_config::version;
+use curvine_config::{ClientConfCliOverrides, ClusterConf};
+use orpc_rpc::io::net::InetAddr;
+use orpc_rpc::{err_box, CommonResult};
 
 /// CLI arguments for the curvine-fuse mount command.
 #[derive(Debug, Parser, Clone)]
@@ -347,8 +347,8 @@ impl FuseMountArgs {
 mod tests {
     use super::FuseMountArgs;
     use clap::Parser;
-    use curvine_common::conf::ClusterConf;
-    use orpc::common::Utils;
+    use curvine_config::ClusterConf;
+    use orpc_rpc::common::Utils;
     use std::fs;
 
     fn get_conf(config: &str, extra_args: &[&str]) -> ClusterConf {

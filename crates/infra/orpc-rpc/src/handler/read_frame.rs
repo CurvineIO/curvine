@@ -20,9 +20,10 @@ use tokio::net::TcpStream;
 
 use crate::handler::rpc_frame::FrameSate;
 use crate::handler::FrameBuf;
-use crate::message;
+use crate::io::IOResult;
 use crate::message::Message;
-use curvine_io::{DataSlice, IOResult};
+use crate::sys::DataSlice;
+use crate::{err_box, message};
 
 pub struct ReadFrame {
     io: ReadHalf<TcpStream>,

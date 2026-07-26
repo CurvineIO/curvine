@@ -21,10 +21,10 @@ use crate::master::meta::inode::ttl::{InodeTtlExecutor, InodeTtlManager};
 use crate::master::quota::QuotaManager;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::MasterMonitor;
-use curvine_common::executor::ScheduledExecutor;
+use curvine_common_core::executor::ScheduledExecutor;
 use log::info;
-use orpc::runtime::GroupExecutor;
-use orpc::CommonResult;
+use orpc_rpc::runtime::GroupExecutor;
+use orpc_rpc::CommonResult;
 use std::sync::Arc;
 
 pub struct MasterActor {

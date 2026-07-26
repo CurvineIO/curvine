@@ -14,8 +14,8 @@
 
 use crate::state::*;
 use crate::{ClientConfDefaults, DEFAULT_FILE_SYSTEM_MODE};
-use orpc::common::ByteUnit;
-use orpc::sys;
+use orpc_rpc::common::ByteUnit;
+use orpc_rpc::sys;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;

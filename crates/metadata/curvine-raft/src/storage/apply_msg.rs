@@ -14,7 +14,7 @@
 
 use crate::proto::{AppliedIndex, SnapshotData};
 use crate::RaftResult;
-use orpc::sync::channel::CallSender;
+use orpc_rpc::sync::channel::CallSender;
 use raft::eraftpb::Entry;
 use raft::StateRole;
 

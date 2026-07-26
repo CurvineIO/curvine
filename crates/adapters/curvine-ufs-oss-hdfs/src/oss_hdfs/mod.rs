@@ -20,7 +20,7 @@ mod oss_hdfs_writer;
 
 use curvine_error::FsError;
 use curvine_error::FsResult;
-use orpc::error::ErrorExt;
+use orpc_rpc::error::ErrorExt;
 
 use self::ffi::{jindo_last_error, JindoStatus};
 

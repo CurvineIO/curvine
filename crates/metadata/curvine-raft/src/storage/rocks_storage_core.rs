@@ -16,7 +16,7 @@ use crate::proto::SnapshotData;
 use crate::{RaftError, RaftResult, LOG_START_INDEX};
 use curvine_rocksdb::{DBConf, DBEngine, RocksUtils, WriteBatch};
 use log::warn;
-use orpc::{err_box, err_ext, CommonResult};
+use orpc_rpc::{err_box, err_ext, CommonResult};
 use prost::Message;
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot, SnapshotMetadata};
 use raft::{GetEntriesContext, RaftState};

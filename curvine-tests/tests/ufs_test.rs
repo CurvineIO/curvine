@@ -60,12 +60,12 @@
 //! ```
 
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-use curvine_common::state::{ListOptions, MountOptions, WriteType};
+use curvine_common_core::fs::{FileSystem, Path, Reader, Writer};
+use curvine_common_core::state::{ListOptions, MountOptions, WriteType};
 use curvine_tests::Testing;
 use futures::StreamExt;
-use orpc::runtime::{AsyncRuntime, RpcRuntime};
-use orpc::CommonResult;
+use orpc_rpc::runtime::{AsyncRuntime, RpcRuntime};
+use orpc_rpc::CommonResult;
 use std::collections::HashMap;
 use std::sync::Arc;
 

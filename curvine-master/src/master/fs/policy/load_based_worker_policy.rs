@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::master::fs::policy::{ChooseContext, WorkerPolicy};
-use curvine_common::state::{WorkerAddress, WorkerInfo};
+use curvine_common_core::state::{WorkerAddress, WorkerInfo};
 use indexmap::IndexMap;
-use orpc::{err_box, CommonResult};
+use orpc_rpc::{err_box, CommonResult};
 use std::collections::HashSet;
 
 /// Load-based Worker Selection Policy

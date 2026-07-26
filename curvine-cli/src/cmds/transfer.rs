@@ -23,7 +23,7 @@ use curvine_proto::{
     ListTransfersResponse, SubmitTransferResponse, TransferJobStatusProto, TransferTaskStatusProto,
     TransferTaskSummaryProto, TransferTenantSummaryProto,
 };
-use orpc::{err_box, CommonResult};
+use orpc_rpc::{err_box, CommonResult};
 
 use crate::util::{bytes_to_string, handle_rpc_result, parse_duration};
 

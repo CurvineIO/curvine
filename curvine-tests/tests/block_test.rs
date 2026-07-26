@@ -16,17 +16,17 @@
 
 use bytes::BytesMut;
 use curvine_client::file::{CurvineFileSystem, FsWriter};
-use curvine_common::conf::ClusterConf;
-use curvine_common::error::FsError;
-use curvine_common::fs::Path;
-use curvine_common::fs::Reader;
-use curvine_common::fs::Writer;
-use curvine_common::state::{FileAllocMode, FileAllocOpts};
+use curvine_common_core::conf::ClusterConf;
+use curvine_common_core::error::FsError;
+use curvine_common_core::fs::Path;
+use curvine_common_core::fs::Reader;
+use curvine_common_core::fs::Writer;
+use curvine_common_core::state::{FileAllocMode, FileAllocOpts};
 use curvine_tests::Testing;
 use log::info;
-use orpc::common::{LocalTime, Utils};
-use orpc::runtime::RpcRuntime;
-use orpc::{err_box, CommonError, CommonResult};
+use orpc_rpc::common::{LocalTime, Utils};
+use orpc_rpc::runtime::RpcRuntime;
+use orpc_rpc::{err_box, CommonError, CommonResult};
 use std::sync::Arc;
 use std::time::Duration;
 // Test local short-circuit read and write
@@ -664,7 +664,7 @@ async fn test_resize(
     fs: &CurvineFileSystem,
     path: &Path,
     opts: FileAllocOpts,
-) -> CommonResult<curvine_common::state::FileBlocks> {
+) -> CommonResult<curvine_common_core::state::FileBlocks> {
     let block_size = fs.conf().client.block_size;
     fs.resize(path, opts.clone()).await?;
     let file_blocks = fs.get_block_locations(path).await?;

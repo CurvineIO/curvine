@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::block::{BlockClient, BlockClientPool};
-use crate::file::FsClient;
+use crate::file::CurvineFileSystem;
 use crate::ClientMetrics;
 use curvine_config::ClusterConf;
 use curvine_error::FsResult;
@@ -25,15 +25,15 @@ use log::warn;
 use moka::policy::EvictionPolicy;
 use moka::sync::{Cache, CacheBuilder};
 use once_cell::sync::OnceCell;
-use orpc::client::{ClientConf, ClusterConnector};
-use orpc::common::{TimeSpent, Utils};
-use orpc::io::net::NetUtils;
-use orpc::io::IOResult;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sys::CacheManager;
+use orpc_rpc::client::{ClientConf, ClusterConnector};
+use orpc_rpc::common::{TimeSpent, Utils};
+use orpc_rpc::io::net::NetUtils;
+use orpc_rpc::io::IOResult;
+use orpc_rpc::runtime::{RpcRuntime, Runtime};
+use orpc_rpc::sys::CacheManager;
 use std::future::Future;
 use std::hash::BuildHasherDefault;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::Duration;
 
 static CLIENT_METRICS: OnceCell<ClientMetrics> = OnceCell::new();
@@ -225,45 +225,23 @@ impl FsContext {
         self.failed_workers.iter().map(|x| x.1.worker_id).collect()
     }
 
-    pub fn start_clean_task(context: &Arc<FsContext>, pool: Arc<BlockClientPool>) {
-        let metric_report_enable = context.conf.client.metric_report_enable;
-        let interval = Duration::from_millis(context.conf.client.clean_task_interval_ms);
-        let context = Arc::downgrade(context);
+    pub fn start_clean_task(fs: CurvineFileSystem, pool: Arc<BlockClientPool>) {
+        let metric_report_enable = fs.conf().client.metric_report_enable;
+        let interval = Duration::from_millis(fs.conf().client.clean_task_interval_ms);
 
-        if let Some(strong_context) = context.upgrade() {
-            strong_context.clone_runtime().spawn(async move {
-                Self::run_clean_task(context, pool, metric_report_enable, interval).await;
-            });
-        }
-    }
+        fs.clone_runtime().spawn(async move {
+            let mut interval = tokio::time::interval(interval);
+            loop {
+                interval.tick().await;
 
-    async fn run_clean_task(
-        context: Weak<FsContext>,
-        pool: Arc<BlockClientPool>,
-        metric_report_enable: bool,
-        interval: std::time::Duration,
-    ) {
-        let mut interval = tokio::time::interval(interval);
-        loop {
-            interval.tick().await;
+                pool.clear_idle_conn();
 
-            pool.clear_idle_conn();
-
-            if metric_report_enable {
-                let Some(context) = context.upgrade() else {
-                    return;
-                };
-                if let Err(e) = Self::metrics_report(&context).await {
-                    warn!("metrics report: {}", e);
+                if metric_report_enable {
+                    if let Err(e) = fs.metrics_report().await {
+                        warn!("metrics report: {}", e)
+                    }
                 }
-            } else if context.strong_count() == 0 {
-                return;
             }
-        }
-    }
-
-    async fn metrics_report(context: &Arc<FsContext>) -> FsResult<()> {
-        let metrics = ClientMetrics::encode()?;
-        FsClient::new(context.clone()).metrics_report(metrics).await
+        });
     }
 }

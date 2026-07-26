@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::master::fs::policy::ChooseContext;
-use curvine_common::state::{WorkerAddress, WorkerInfo};
+use curvine_common_core::state::{WorkerAddress, WorkerInfo};
 use indexmap::IndexMap;
-use orpc::CommonResult;
+use orpc_rpc::CommonResult;
 
 /// Worker selects a policy
 pub trait WorkerPolicy: Send + Sync {

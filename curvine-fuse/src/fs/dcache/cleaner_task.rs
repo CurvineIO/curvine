@@ -14,8 +14,8 @@
 
 use crate::fs::state::NodeState;
 use crate::{FuseError, FuseResult};
-use curvine_common::executor::ScheduledExecutor;
-use orpc::runtime::LoopTask;
+use orpc_rpc::runtime::LoopTask;
+use orpc_rpc::runtime::ScheduledExecutor;
 use std::sync::{Arc, Weak};
 
 pub struct CleanerTask {

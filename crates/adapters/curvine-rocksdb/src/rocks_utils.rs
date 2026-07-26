@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use byteorder::{BigEndian, ByteOrder};
-use orpc::io::IOResult;
-use orpc::{err_box, CommonResult};
+use orpc_rpc::io::IOResult;
+use orpc_rpc::{err_box, CommonResult};
 use prost::bytes::BufMut;
 use std::fs;
 

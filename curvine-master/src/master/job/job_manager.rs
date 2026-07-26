@@ -15,21 +15,21 @@
 use crate::master::fs::MasterFilesystem;
 use crate::master::{JobStore, LoadJobRunner, MountManager};
 use core::time::Duration;
-use curvine_common::conf::ClusterConf;
-use curvine_common::error::FsError;
-use curvine_common::executor::ScheduledExecutor;
-use curvine_common::fs::Path;
-use curvine_common::state::{
+use curvine_common_core::conf::ClusterConf;
+use curvine_common_core::error::FsError;
+use curvine_common_core::executor::ScheduledExecutor;
+use curvine_common_core::fs::Path;
+use curvine_common_core::state::{
     JobStatus, JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobResult,
 };
-use curvine_common::FsResult;
+use curvine_common_core::FsResult;
 use curvine_data_mover::UfsFactory;
 use curvine_unified_fs::MountValue;
 use log::{debug, info, warn};
-use orpc::common::LocalTime;
-use orpc::runtime::{LoopTask, RpcRuntime, Runtime};
-use orpc::sync::AtomicCounter;
-use orpc::{err_box, err_ext, CommonResult};
+use orpc_rpc::common::LocalTime;
+use orpc_rpc::runtime::{LoopTask, RpcRuntime, Runtime};
+use orpc_rpc::sync::AtomicCounter;
+use orpc_rpc::{err_box, err_ext, CommonResult};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
@@ -41,7 +41,6 @@ pub struct JobManager {
     master_fs: MasterFilesystem,
     factory: Arc<UfsFactory>,
     mount_manager: Arc<MountManager>,
-    transfer_enabled: bool,
     job_life_ttl: Duration,
     job_cleanup_ttl: Duration,
     job_max_files: usize,
@@ -64,7 +63,6 @@ impl JobManager {
             master_fs,
             factory,
             mount_manager,
-            transfer_enabled: conf.transfer.enabled,
             job_life_ttl: conf.job.job_life_ttl,
             job_cleanup_ttl: conf.job.job_cleanup_ttl,
             job_max_files: conf.job.job_max_files,
@@ -166,20 +164,10 @@ impl JobManager {
         &self.rt
     }
 
-    fn reject_legacy_submit(&self) -> FsResult<()> {
-        if self.transfer_enabled {
-            return err_box!(
-                "Legacy Master Load API is disabled because transfer is enabled; use the Transfer service"
-            );
-        }
-        Ok(())
-    }
-
     /// See `LoadJobRunner::submit_load_task` for the concurrency contract: concurrent
     /// submits for the same path while a load is running return the **existing** run’s
     /// result; the new command’s options are not applied (first submitter wins).
     pub async fn submit_load_job(&self, command: LoadJobCommand) -> FsResult<LoadJobResult> {
-        self.reject_legacy_submit()?;
         let source_path = Path::from_str(&command.source_path)?;
 
         // Check mount info for both UFS and CV paths. Public load jobs import
@@ -227,7 +215,6 @@ impl JobManager {
     }
 
     pub async fn submit_export_job(&self, command: LoadJobCommand) -> FsResult<LoadJobResult> {
-        self.reject_legacy_submit()?;
         let source_path = Path::from_str(&command.source_path)?;
 
         let mnt = if let Some(mnt) = self.mount_manager.get_mount_info(&source_path)? {

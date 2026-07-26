@@ -16,15 +16,15 @@ use crate::fs::operator::Read;
 use crate::fuse_metrics::{mono_now, FuseMetrics, IO_TYPE_READ};
 use crate::session::FuseResponse;
 use curvine_client::unified::UnifiedReader;
-use curvine_common::conf::FuseConf;
-use curvine_common::error::FsError;
-use curvine_common::fs::{Path, Reader};
-use curvine_common::state::FileStatus;
-use curvine_common::FsResult;
+use curvine_config::FuseConf;
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_fs_api::{Path, Reader};
+use curvine_model::FileStatus;
 use log::{error, warn};
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
-use orpc::sync::ErrorMonitor;
+use orpc_rpc::runtime::{RpcRuntime, Runtime};
+use orpc_rpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
+use orpc_rpc::sync::ErrorMonitor;
 use std::sync::Arc;
 
 enum ReadTask {
@@ -182,10 +182,10 @@ mod tests {
     use crate::raw::fuse_abi::{fuse_in_header, fuse_read_in};
     use crate::session::{FuseResponse, FuseTask};
     use curvine_client::unified::UnifiedReader;
-    use curvine_common::fs::local::LocalReader;
-    use orpc::common::Metrics as m;
-    use orpc::runtime::AsyncRuntime;
-    use orpc::sync::channel::AsyncChannel;
+    use curvine_fs_api::local::LocalReader;
+    use orpc_rpc::common::Metrics as m;
+    use orpc_rpc::runtime::AsyncRuntime;
+    use orpc_rpc::sync::channel::AsyncChannel;
     use std::io::Write as _;
 
     fn metrics_reply(rt: &AsyncRuntime) -> FuseResponse {
@@ -236,7 +236,7 @@ mod tests {
                 let mut file = std::fs::File::create(&path_buf).unwrap();
                 file.write_all(b"reader-worker-survives").unwrap();
             }
-            let path = curvine_common::fs::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+            let path = curvine_fs_api::Path::from_str(path_buf.to_str().unwrap()).unwrap();
 
             let conf = FuseConf {
                 metrics_enabled: false,
@@ -318,7 +318,7 @@ mod tests {
                 let mut f = std::fs::File::create(&path_buf).unwrap();
                 f.write_all(&vec![7u8; 4096]).unwrap();
             }
-            let path = curvine_common::fs::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+            let path = curvine_fs_api::Path::from_str(path_buf.to_str().unwrap()).unwrap();
 
             let conf = FuseConf::default(); // metrics_enabled=true, unbounded channel
             let reader = UnifiedReader::Local(LocalReader::new(&path, 4096).unwrap());

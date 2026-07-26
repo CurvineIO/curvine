@@ -17,13 +17,13 @@
 use bytes::BytesMut;
 use curvine_client::file::{CurvineFileSystem, FsClient, FsContext};
 use curvine_client::rpc::JobMasterClient;
-use curvine_common::fs::{Path, Reader};
-use curvine_common::state::{JobTaskState, MountOptions, TtlAction};
+use curvine_common_core::fs::{Path, Reader};
+use curvine_common_core::state::{JobTaskState, MountOptions, TtlAction};
 use curvine_tests::Testing;
 use log::info;
-use orpc::common::Logger;
-use orpc::runtime::RpcRuntime;
-use orpc::CommonResult;
+use orpc_rpc::common::Logger;
+use orpc_rpc::runtime::RpcRuntime;
+use orpc_rpc::CommonResult;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;

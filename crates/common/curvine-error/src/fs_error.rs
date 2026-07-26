@@ -19,9 +19,9 @@ use axum::response::{IntoResponse, Response};
 #[cfg(feature = "axum-response")]
 use axum::Json;
 use num_enum::{FromPrimitive, IntoPrimitive};
-use orpc::error::{ErrorDecoder, ErrorExt, ErrorImpl, StringError};
-use orpc::io::IOError;
-use orpc::CommonError;
+use orpc_rpc::error::{ErrorDecoder, ErrorExt, ErrorImpl, StringError};
+use orpc_rpc::io::IOError;
+use orpc_rpc::CommonError;
 use prost::bytes::BytesMut;
 use prost::{DecodeError, EncodeError};
 #[cfg(feature = "axum-response")]
@@ -69,10 +69,6 @@ pub enum ErrorKind {
     ReadOnly = 30,
     NoAvailableWorker = 31,
     NoLocalPath = 32,
-    TransferOverloaded = 33,
-    TransferStoreUnavailable = 34,
-    TransferAlreadyRunning = 35,
-    TransferTargetConflict = 36,
 
     #[num_enum(default)]
     Common = 10000,
@@ -210,22 +206,6 @@ pub enum FsError {
     #[error("{0}")]
     JobNotFound(ErrorImpl<StringError>),
 
-    // Transfer service or client-side transfer queue is overloaded.
-    #[error("{0}")]
-    TransferOverloaded(ErrorImpl<StringError>),
-
-    // Transfer state store is unavailable or failed a backend operation.
-    #[error("{0}")]
-    TransferStoreUnavailable(ErrorImpl<StringError>),
-
-    // A transfer with the same job key is already running with incompatible options.
-    #[error("{0}")]
-    TransferAlreadyRunning(ErrorImpl<StringError>),
-
-    // A non-terminal transfer already owns the same target path tree.
-    #[error("{0}")]
-    TransferTargetConflict(ErrorImpl<StringError>),
-
     // Other errors that are not defined.
     #[error("{0}")]
     Common(ErrorImpl<StringError>),
@@ -262,10 +242,6 @@ impl FsError {
         Self::InProgress(ErrorImpl::with_source(msg.into()))
     }
 
-    pub fn in_progress_msg(msg: impl Into<String>) -> Self {
-        Self::InProgress(ErrorImpl::with_source(msg.into().into()))
-    }
-
     pub fn file_not_found(path: impl AsRef<str>) -> Self {
         let msg = format!("File {} not found", path.as_ref());
         Self::FileNotFound(ErrorImpl::with_source(msg.into()))
@@ -294,22 +270,6 @@ impl FsError {
     pub fn job_not_found(job_id: impl AsRef<str>) -> Self {
         let msg = format!("Job {} not found", job_id.as_ref());
         Self::JobNotFound(ErrorImpl::with_source(msg.into()))
-    }
-
-    pub fn transfer_overloaded(msg: impl Into<String>) -> Self {
-        Self::TransferOverloaded(ErrorImpl::with_source(msg.into().into()))
-    }
-
-    pub fn transfer_store_unavailable(msg: impl Into<String>) -> Self {
-        Self::TransferStoreUnavailable(ErrorImpl::with_source(msg.into().into()))
-    }
-
-    pub fn transfer_already_running(msg: impl Into<String>) -> Self {
-        Self::TransferAlreadyRunning(ErrorImpl::with_source(msg.into().into()))
-    }
-
-    pub fn transfer_target_conflict(msg: impl Into<String>) -> Self {
-        Self::TransferTargetConflict(ErrorImpl::with_source(msg.into().into()))
     }
 
     pub fn file_exists(path: impl AsRef<str>) -> Self {
@@ -452,10 +412,6 @@ impl FsError {
             FsError::NoAvailableWorker(_) => ErrorKind::NoAvailableWorker,
             FsError::NoLocalPath(_) => ErrorKind::NoLocalPath,
             FsError::JobNotFound(_) => ErrorKind::JobNotFound,
-            FsError::TransferOverloaded(_) => ErrorKind::TransferOverloaded,
-            FsError::TransferStoreUnavailable(_) => ErrorKind::TransferStoreUnavailable,
-            FsError::TransferAlreadyRunning(_) => ErrorKind::TransferAlreadyRunning,
-            FsError::TransferTargetConflict(_) => ErrorKind::TransferTargetConflict,
             FsError::Common(_) => ErrorKind::Common,
         }
     }
@@ -600,10 +556,6 @@ impl ErrorExt for FsError {
             FsError::NoAvailableWorker(e) => FsError::NoAvailableWorker(e.ctx(ctx)),
             FsError::NoLocalPath(e) => FsError::NoLocalPath(e.ctx(ctx)),
             FsError::JobNotFound(e) => FsError::JobNotFound(e.ctx(ctx)),
-            FsError::TransferOverloaded(e) => FsError::TransferOverloaded(e.ctx(ctx)),
-            FsError::TransferStoreUnavailable(e) => FsError::TransferStoreUnavailable(e.ctx(ctx)),
-            FsError::TransferAlreadyRunning(e) => FsError::TransferAlreadyRunning(e.ctx(ctx)),
-            FsError::TransferTargetConflict(e) => FsError::TransferTargetConflict(e.ctx(ctx)),
             FsError::Common(e) => FsError::Common(e.ctx(ctx)),
         }
     }
@@ -642,10 +594,6 @@ impl ErrorExt for FsError {
             FsError::NoAvailableWorker(e) => e.encode(ErrorKind::NoAvailableWorker),
             FsError::NoLocalPath(e) => e.encode(ErrorKind::NoLocalPath),
             FsError::JobNotFound(e) => e.encode(ErrorKind::JobNotFound),
-            FsError::TransferOverloaded(e) => e.encode(ErrorKind::TransferOverloaded),
-            FsError::TransferStoreUnavailable(e) => e.encode(ErrorKind::TransferStoreUnavailable),
-            FsError::TransferAlreadyRunning(e) => e.encode(ErrorKind::TransferAlreadyRunning),
-            FsError::TransferTargetConflict(e) => e.encode(ErrorKind::TransferTargetConflict),
             FsError::Common(e) => e.encode(ErrorKind::Common),
         }
     }
@@ -687,12 +635,6 @@ impl ErrorExt for FsError {
             ErrorKind::NoAvailableWorker => FsError::NoAvailableWorker(de.into_string()),
             ErrorKind::NoLocalPath => FsError::NoLocalPath(de.into_string()),
             ErrorKind::JobNotFound => FsError::JobNotFound(de.into_string()),
-            ErrorKind::TransferOverloaded => FsError::TransferOverloaded(de.into_string()),
-            ErrorKind::TransferStoreUnavailable => {
-                FsError::TransferStoreUnavailable(de.into_string())
-            }
-            ErrorKind::TransferAlreadyRunning => FsError::TransferAlreadyRunning(de.into_string()),
-            ErrorKind::TransferTargetConflict => FsError::TransferTargetConflict(de.into_string()),
             ErrorKind::Common => FsError::Common(de.into_string()),
         }
     }
@@ -706,7 +648,7 @@ impl ErrorExt for FsError {
 mod tests {
     use super::ErrorKind;
     use crate::FsError;
-    use orpc::error::{ErrorExt, ErrorImpl};
+    use orpc_rpc::error::{ErrorExt, ErrorImpl};
 
     #[test]
     pub fn error_test() {
@@ -788,49 +730,5 @@ mod tests {
         let decoded = FsError::decode(bytes);
         assert!(matches!(decoded.kind(), ErrorKind::NoAvailableWorker));
         assert!(matches!(decoded, FsError::NoAvailableWorker(_)));
-    }
-
-    #[test]
-    pub fn transfer_overloaded_round_trip_test() {
-        let error = FsError::transfer_overloaded("transfer task report queue is full");
-
-        assert!(matches!(error.kind(), ErrorKind::TransferOverloaded));
-        let bytes = error.encode();
-        let decoded = FsError::decode(bytes);
-        assert!(matches!(decoded, FsError::TransferOverloaded(_)));
-        assert!(decoded.to_string().contains("queue is full"));
-    }
-
-    #[test]
-    pub fn transfer_store_unavailable_round_trip_test() {
-        let error = FsError::transfer_store_unavailable("mysql transfer store error");
-
-        assert!(matches!(error.kind(), ErrorKind::TransferStoreUnavailable));
-        let bytes = error.encode();
-        let decoded = FsError::decode(bytes);
-        assert!(matches!(decoded, FsError::TransferStoreUnavailable(_)));
-        assert!(decoded.to_string().contains("mysql transfer store error"));
-    }
-
-    #[test]
-    pub fn transfer_already_running_round_trip_test() {
-        let error = FsError::transfer_already_running("same job key has different command");
-
-        assert!(matches!(error.kind(), ErrorKind::TransferAlreadyRunning));
-        let bytes = error.encode();
-        let decoded = FsError::decode(bytes);
-        assert!(matches!(decoded, FsError::TransferAlreadyRunning(_)));
-        assert!(decoded.to_string().contains("different command"));
-    }
-
-    #[test]
-    pub fn transfer_target_conflict_round_trip_test() {
-        let error = FsError::transfer_target_conflict("target /a conflicts with active transfer");
-
-        assert!(matches!(error.kind(), ErrorKind::TransferTargetConflict));
-        let bytes = error.encode();
-        let decoded = FsError::decode(bytes);
-        assert!(matches!(decoded, FsError::TransferTargetConflict(_)));
-        assert!(decoded.to_string().contains("/a"));
     }
 }

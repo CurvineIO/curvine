@@ -14,11 +14,11 @@
 
 use crate::worker::block::{BlockMeta, BlockState};
 use curvine_client_core::file::{FsClient, FsContext};
-use curvine_common::fs::RpcCode;
-use curvine_common::proto::*;
-use curvine_common::state::{BlockReportInfo, HeartbeatStatus, StorageInfo, WorkerAddress};
-use curvine_common::utils::ProtoUtils;
-use orpc::CommonResult;
+use curvine_common_core::fs::RpcCode;
+use curvine_common_core::proto::*;
+use curvine_common_core::state::{BlockReportInfo, HeartbeatStatus, StorageInfo, WorkerAddress};
+use curvine_common_core::utils::ProtoUtils;
+use orpc_rpc::CommonResult;
 use std::sync::Arc;
 
 //Worker and master communicate with the customer client.

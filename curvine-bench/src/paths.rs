@@ -15,7 +15,7 @@
 
 use super::{BenchMode, CurvineBenchRunner};
 use curvine_fs_api::Path;
-use orpc::{err_box, CommonResult};
+use orpc_rpc::{err_box, CommonResult};
 use std::path::PathBuf;
 use std::time::Duration;
 

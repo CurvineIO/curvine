@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::fs::Path;
-use orpc::common::{DurationUnit, FileUtils, LogConf, Utils};
-use orpc::sys::{CString, FFIUtils};
-use orpc::{err_box, sys, try_err, CommonResult};
+use orpc_rpc::common::{DurationUnit, FileUtils, LogConf, Utils};
+use orpc_rpc::sys::{CString, FFIUtils};
+use orpc_rpc::{err_box, sys, try_err, CommonResult};
 use serde::{Deserialize, Serialize};
 use std::ffi::c_char;
 use std::path::PathBuf;

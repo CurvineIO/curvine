@@ -21,10 +21,10 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{BlockLocation, CommitBlock, LocatedBlock, WorkerAddress};
 use futures::future::{join_all, try_join_all};
-use orpc::err_box;
-use orpc::error::ErrorExt;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sys::DataSlice;
+use orpc_rpc::err_box;
+use orpc_rpc::error::ErrorExt;
+use orpc_rpc::runtime::{RpcRuntime, Runtime};
+use orpc_rpc::sys::DataSlice;
 use std::sync::Arc;
 
 async fn finish_all_cancellations<I, F>(futures: I) -> FsResult<()>

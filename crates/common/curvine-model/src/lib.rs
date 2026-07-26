@@ -30,7 +30,7 @@ pub trait CurvinePath: Sized + std::fmt::Display {
     fn is_cv(&self) -> bool;
     fn path(&self) -> &str;
     fn full_path(&self) -> &str;
-    fn from_str(path: impl AsRef<str>) -> orpc::CommonResult<Self>;
+    fn from_str(path: impl AsRef<str>) -> orpc_rpc::CommonResult<Self>;
 }
 
 mod storage_info;
@@ -43,7 +43,7 @@ mod heartbeat_status;
 pub use self::heartbeat_status::HeartbeatStatus;
 
 mod worker_info;
-pub use self::worker_info::{TransferWorkerCapabilities, WorkerInfo};
+pub use self::worker_info::WorkerInfo;
 
 mod worker_node_tree;
 pub use self::worker_node_tree::WorkerNodeTree;

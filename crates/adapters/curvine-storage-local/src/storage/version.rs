@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use orpc::common::{LocalTime, Utils};
-use orpc::io::LocalFile;
-use orpc::{err_box, try_err, CommonResult};
+use orpc_rpc::common::{LocalTime, Utils};
+use orpc_rpc::io::LocalFile;
+use orpc_rpc::{err_box, try_err, CommonResult};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;

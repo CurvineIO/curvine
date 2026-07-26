@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use crate::storage::{ChoosingPolicy, RobinChoosingPolicy, VfsDir};
-use curvine_common::state::{StorageInfo, StorageType};
+use curvine_common_core::state::{StorageInfo, StorageType};
 use indexmap::map::Values;
 use indexmap::IndexMap;
 use log::{error, info, warn};
-use orpc::common::ByteUnit;
-use orpc::{err_box, CommonResult};
+use orpc_rpc::common::ByteUnit;
+use orpc_rpc::{err_box, CommonResult};
 use std::ops::Index;
 use std::sync::Arc;
 
@@ -267,10 +267,10 @@ impl Index<usize> for DirList {
 #[cfg(test)]
 mod tests {
     use crate::storage::{DirList, StorageRequest, VfsDir};
-    use curvine_common::conf::WorkerDataDir;
-    use curvine_common::state::StorageType;
-    use orpc::common::{ByteUnit, FileUtils};
-    use orpc::CommonResult;
+    use curvine_common_core::conf::WorkerDataDir;
+    use curvine_common_core::state::StorageType;
+    use orpc_rpc::common::{ByteUnit, FileUtils};
+    use orpc_rpc::CommonResult;
 
     #[test]
     fn robin() -> CommonResult<()> {

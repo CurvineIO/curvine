@@ -17,12 +17,12 @@ use crate::storage::{
     StorageVersion, VfsDir, VfsMetaStore,
 };
 use crate::{BlockMeta, BlockState};
-use curvine_common::conf::{ClusterConf, WorkerDataDir};
-use curvine_common::state::{ExtendedBlock, StorageInfo, StorageType};
+use curvine_common_core::conf::{ClusterConf, WorkerDataDir};
+use curvine_common_core::state::{ExtendedBlock, StorageInfo, StorageType};
 use indexmap::map::Values;
 use log::info;
-use orpc::common::{ByteUnit, FileUtils, LocalTime, TimeSpent};
-use orpc::{err_box, CommonResult};
+use orpc_rpc::common::{ByteUnit, FileUtils, LocalTime, TimeSpent};
+use orpc_rpc::{err_box, CommonResult};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -130,7 +130,7 @@ impl VfsDataset {
                 if dir.storage_type() == StorageType::SpdkDisk {
                     if let Some(bdev) = dir.state.bdev_name.as_ref() {
                         if let Some(prev_id) = seen.insert(bdev.clone(), dir.id()) {
-                            return orpc::err_box!(
+                            return orpc_rpc::err_box!(
                                 "SPDK dirs {} and {} both map to bdev '{}' (dir_id collision).",
                                 prev_id,
                                 dir.id(),
@@ -489,12 +489,12 @@ mod test {
         Dataset, DirList, DirState, FileLayout, SpdkMetaStore, StorageVersion, VfsDataset, VfsDir,
     };
     use crate::{BlockMeta, BlockState};
-    use curvine_common::conf::{ClusterConf, WorkerConf};
-    use curvine_common::state::{ExtendedBlock, FileType, StorageType};
-    use orpc::common::FileUtils;
-    use orpc::sync::AtomicLong;
-    use orpc::sys::FsStats;
-    use orpc::CommonResult;
+    use curvine_common_core::conf::{ClusterConf, WorkerConf};
+    use curvine_common_core::state::{ExtendedBlock, FileType, StorageType};
+    use orpc_rpc::common::FileUtils;
+    use orpc_rpc::sync::AtomicLong;
+    use orpc_rpc::sys::FsStats;
+    use orpc_rpc::CommonResult;
     use std::io::Write;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;

@@ -31,9 +31,9 @@ use curvine_model::{
 use curvine_proto::{GetCvMetadataDeltaPageResponse, GetCvMetadataSnapshotPageResponse};
 use log::info;
 use log::warn;
-use orpc::client::ClientConf;
-use orpc::err_box;
-use orpc::runtime::{RpcRuntime, Runtime};
+use orpc_rpc::client::ClientConf;
+use orpc_rpc::err_box;
+use orpc_rpc::runtime::{RpcRuntime, Runtime};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -54,7 +54,7 @@ impl CurvineFileSystem {
             fs_client: Arc::new(fs_client),
         };
 
-        FsContext::start_clean_task(&fs.fs_context, fs.fs_context.block_pool.clone());
+        FsContext::start_clean_task(fs.clone(), fs.fs_context.block_pool.clone());
 
         let c = &fs.conf().client;
         info!(

@@ -15,20 +15,20 @@
 use bytes::BytesMut;
 use curvine_client::file::{CurvineFileSystem, FsContext};
 use curvine_client::ClientMetrics;
-use curvine_common::conf::ClusterConf;
-use curvine_common::fs::{Path, Reader, Writer};
-use curvine_common::state::{
+use curvine_common_core::conf::ClusterConf;
+use curvine_common_core::fs::{Path, Reader, Writer};
+use curvine_common_core::state::{
     CreateFileOptsBuilder, ListOptions, MkdirOptsBuilder, SetAttrOptsBuilder, StorageState,
     TtlAction,
 };
-use curvine_common::state::{FileLock, LockFlags, LockType};
-use curvine_common::FsResult;
+use curvine_common_core::state::{FileLock, LockFlags, LockType};
+use curvine_common_core::FsResult;
 use curvine_tests::Testing;
 use futures::stream::StreamExt;
 use log::info;
-use orpc::common::LocalTime;
-use orpc::runtime::{AsyncRuntime, RpcRuntime};
-use orpc::CommonResult;
+use orpc_rpc::common::LocalTime;
+use orpc_rpc::runtime::{AsyncRuntime, RpcRuntime};
+use orpc_rpc::CommonResult;
 use std::sync::Arc;
 
 const PATH: &str = "/fs_test/a.log";

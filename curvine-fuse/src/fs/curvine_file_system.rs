@@ -26,19 +26,19 @@ use crate::*;
 use crate::{err_fuse, FuseResult, FuseUtils};
 use bytes::BytesMut;
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::conf::{ClusterConf, FuseConf};
-use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, Path, RpcCode, StateReader, StateWriter};
-use curvine_common::state::{
+use curvine_config::{ClusterConf, FuseConf};
+use curvine_error::FsError;
+use curvine_error::MAX_FILE_SIZE;
+use curvine_fs_api::{FileSystem, Path, RpcCode, StateReader, StateWriter};
+use curvine_model::{
     is_special_file_type, FileAllocMode, FileAllocOpts, FileLock, FileStatus, FileType, LockFlags,
-    LockType, OpenFlags, RenameFlags, SetAttrOpts,
+    LockType, OpenFlags, SetAttrOpts,
 };
-use curvine_common::MAX_FILE_SIZE;
 use log::{debug, info, warn};
-use orpc::common::{ByteUnit, TimeSpent};
-use orpc::runtime::Runtime;
-use orpc::sys::FFIUtils;
-use orpc::{sys, try_option};
+use orpc_rpc::common::{ByteUnit, TimeSpent};
+use orpc_rpc::runtime::Runtime;
+use orpc_rpc::sys::FFIUtils;
+use orpc_rpc::{sys, try_option};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::Arc;
@@ -221,21 +221,16 @@ impl CurvineFileSystem {
     /// Shared rename path resolution used by both `rename` and `rename2`.
     async fn rename_paths(
         &self,
-        header: &fuse_in_header,
         old_id: u64,
         old_name: &OsStr,
         new_dir: u64,
         new_name: &OsStr,
-        flags: RenameFlags,
     ) -> FuseResult<()> {
         let old_name = try_option!(old_name.to_str());
         let new_name = try_option!(new_name.to_str());
         if new_name.len() > FUSE_MAX_NAME_LENGTH {
             return err_fuse!(libc::ENAMETOOLONG);
         }
-
-        self.check_rename_permissions(header, old_id, old_name, new_dir, new_name, flags)
-            .await?;
 
         let (old_path, new_path) = self.state.get_path2(old_id, old_name, new_dir, new_name)?;
         self.ensure_writable_path(&old_path, RpcCode::Rename)
@@ -244,41 +239,21 @@ impl CurvineFileSystem {
             .await?;
 
         self.state
-            .fs_rename(old_id, old_name, new_dir, new_name, flags)
+            .fs_rename(old_id, old_name, new_dir, new_name)
             .await
     }
 
-    fn parse_rename2_flags(flags: u32) -> FuseResult<RenameFlags> {
-        const RENAME_NOREPLACE: u32 = 1;
-        const RENAME_EXCHANGE: u32 = 2;
-        const RENAME_WHITEOUT: u32 = 4;
-        const KNOWN: u32 = RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT;
-
-        if flags & !KNOWN != 0 {
-            return err_fuse!(libc::EINVAL, "unsupported RENAME2 flags 0x{:x}", flags);
-        }
-        if flags & RENAME_WHITEOUT != 0 {
-            return err_fuse!(libc::EINVAL, "RENAME_WHITEOUT is not supported");
-        }
-        if flags & RENAME_NOREPLACE != 0 && flags & RENAME_EXCHANGE != 0 {
-            return err_fuse!(libc::EINVAL, "invalid RENAME2 flag combination");
-        }
-        Ok(RenameFlags::from_bits(flags).unwrap_or(RenameFlags::empty()))
+    /// Whether raw RENAME2 flags are supported, without truncating unknown high bits.
+    fn rename2_flags_supported(flags: u32) -> bool {
+        flags == 0
     }
 
-    fn to_file_lock(&self, arg: &fuse_lk_in, header_pid: u32) -> FileLock {
+    fn to_file_lock(&self, arg: &fuse_lk_in) -> FileLock {
         let client_id = self.fs.cv().fs_context().clone_client_name();
-        // Prefer the flock pid from the kernel request; fall back to the FUSE
-        // header pid when the kernel leaves lk.pid unset (common on some paths).
-        let pid = if arg.lk.pid != 0 {
-            arg.lk.pid
-        } else {
-            header_pid
-        };
         FileLock {
             client_id,
             owner_id: arg.owner,
-            pid,
+            pid: arg.lk.pid,
             lock_type: LockType::from(arg.lk.typ as u8),
             lock_flags: LockFlags::from(arg.lk_flags as u8),
             start: arg.lk.start,
@@ -287,43 +262,17 @@ impl CurvineFileSystem {
         }
     }
 
-    /// Linux FUSE whole-file fcntl ranges commonly use end = OFFSET_MAX
-    /// (`i64::MAX as u64`). Master full-clear and `fs_unlock_owner` use `u64::MAX`.
-    fn is_lock_to_eof(end: u64) -> bool {
-        end == u64::MAX || end == i64::MAX as u64
-    }
-
-    fn is_full_range_unlock(lock: &FileLock) -> bool {
-        lock.lock_type == LockType::UnLock && lock.start == 0 && Self::is_lock_to_eof(lock.end)
-    }
-
     async fn fs_unlock(&self, handler: &FileHandle, flags: LockFlags) -> FuseResult<()> {
-        match flags {
-            LockFlags::Plock => {
-                let owners = handler.drain_plock_owners();
-                let mut result = Ok(());
-                for owner_id in owners {
-                    let unlock_result = self.fs_unlock_owner(handler, flags, owner_id).await;
-                    if unlock_result.is_err() {
-                        // Preserve failed owners locally for retry, but keep
-                        // best-effort unlocking the remainder (same spirit as
-                        // release flock/plock retain_first_error handling).
-                        handler.add_lock(flags, owner_id);
-                    }
-                    Self::retain_first_error(&mut result, unlock_result);
-                }
-                result
-            }
-            LockFlags::Flock => {
-                if let Some(owner_id) = handler.remove_lock(flags) {
-                    if let Err(e) = self.fs_unlock_owner(handler, flags, owner_id).await {
-                        handler.add_lock(flags, owner_id);
-                        return Err(e);
-                    }
-                }
-                Ok(())
+        if let Some(owner_id) = handler.remove_lock(flags) {
+            if let Err(e) = self.fs_unlock_owner(handler, flags, owner_id).await {
+                // Preserve the owner locally when the backend unlock fails so a
+                // retained handle can retry the cleanup.
+                handler.add_lock(flags, owner_id);
+                return Err(e);
             }
         }
+
+        Ok(())
     }
 
     async fn fs_unlock_owner(
@@ -437,77 +386,6 @@ impl CurvineFileSystem {
     /// checks, but still validates X_OK against the file mode (see access(2)).
     fn posix_access_requires_mode_check(uid: u32, mask: u32) -> bool {
         uid != 0 || (mask & libc::X_OK as u32) != 0
-    }
-
-    async fn check_permissions_on_node(
-        &self,
-        header: &fuse_in_header,
-        nodeid: u64,
-        mask: u32,
-    ) -> FuseResult<()> {
-        if header.uid == 0 || !self.conf.check_permission {
-            return Ok(());
-        }
-        let status = self.state.fs_stat(nodeid, None).await?;
-        self.check_access_permissions(&status, header, mask)
-    }
-
-    async fn check_rename_permissions(
-        &self,
-        header: &fuse_in_header,
-        old_parent: u64,
-        old_name: &str,
-        new_parent: u64,
-        new_name: &str,
-        flags: RenameFlags,
-    ) -> FuseResult<()> {
-        if header.uid == 0 || !self.conf.check_permission {
-            return Ok(());
-        }
-
-        let dir_mask = (libc::W_OK | libc::X_OK) as u32;
-        self.check_permissions_on_node(header, old_parent, dir_mask)
-            .await?;
-        let new_parent_status = if new_parent != old_parent {
-            self.check_permissions_on_node(header, new_parent, dir_mask)
-                .await?;
-            self.state.fs_stat(new_parent, None).await?
-        } else {
-            self.state.fs_stat(old_parent, None).await?
-        };
-        let old_parent_status = if new_parent == old_parent {
-            new_parent_status.clone()
-        } else {
-            self.state.fs_stat(old_parent, None).await?
-        };
-
-        if old_parent_status.mode & libc::S_ISVTX as u32 != 0 {
-            let file_status = self.state.fs_stat(old_parent, Some(old_name)).await?;
-            let parent_uid = self.resolve_file_uid(&old_parent_status.owner);
-            let file_uid = self.resolve_file_uid(&file_status.owner);
-            if header.uid != parent_uid && header.uid != file_uid {
-                return err_fuse!(
-                    libc::EPERM,
-                    "sticky directory: cannot rename file owned by another user"
-                );
-            }
-        }
-
-        let dest_exists =
-            flags.exchange_mode() || self.state.fs_stat(new_parent, Some(new_name)).await.is_ok();
-        if dest_exists && new_parent_status.mode & libc::S_ISVTX as u32 != 0 {
-            let dest_status = self.state.fs_stat(new_parent, Some(new_name)).await?;
-            let parent_uid = self.resolve_file_uid(&new_parent_status.owner);
-            let dest_uid = self.resolve_file_uid(&dest_status.owner);
-            if header.uid != parent_uid && header.uid != dest_uid {
-                return err_fuse!(
-                    libc::EPERM,
-                    "sticky directory: cannot rename over file owned by another user"
-                );
-            }
-        }
-
-        Ok(())
     }
 
     async fn check_permissions(&self, header: &fuse_in_header, mask: u32) -> FuseResult<()> {
@@ -1127,49 +1005,18 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn ioctl(&self, op: Ioctl<'_>) -> FuseResult<BytesMut> {
         let path = self.state.get_path(op.header.nodeid)?;
         let mut status = self.state.fs_stat(op.header.nodeid, None).await?;
-        let preferred = FuseUtils::ioctl_flag_bytes() as u32;
-        let min_flag_bytes = 4u32;
-        let unrestricted = (op.arg.flags & FUSE_IOCTL_UNRESTRICTED) != 0;
+        let flag_bytes = FuseUtils::ioctl_flag_bytes() as u32;
         let (result, out_flags) = match op.arg.cmd {
             FuseUtils::FS_IOC_GETFLAGS => {
-                // FUSE_IOCTL_RETRY is only legal for unrestricted ioctls;
-                // restricted undersized buffers must return EINVAL (kernel
-                // rejects retry in restricted mode with -EIO).
-                if unrestricted && op.arg.out_size < preferred {
-                    return Ok(FuseUtils::build_ioctl_retry(
-                        op.arg.arg,
-                        0,
-                        preferred as u64,
-                    ));
-                }
-                if op.arg.out_size < min_flag_bytes {
-                    return err_fuse!(
-                        libc::EINVAL,
-                        "ioctl out buffer too small (flags={:#x} out_size={})",
-                        op.arg.flags,
-                        op.arg.out_size
-                    );
+                if op.arg.out_size < flag_bytes {
+                    return err_fuse!(libc::EINVAL, "ioctl out buffer too small");
                 }
                 (0, FuseUtils::file_flags_from_status(&status))
             }
             FuseUtils::FS_IOC_SETFLAGS => {
                 self.ensure_writable_path(&path, RpcCode::SetAttr).await?;
-                // Same ABI rule as GETFLAGS: never emit RETRY unless unrestricted.
-                if unrestricted && op.arg.in_size < preferred {
-                    return Ok(FuseUtils::build_ioctl_retry(
-                        op.arg.arg,
-                        preferred as u64,
-                        0,
-                    ));
-                }
-                if op.arg.in_size < min_flag_bytes || op.in_data.len() < min_flag_bytes as usize {
-                    return err_fuse!(
-                        libc::EINVAL,
-                        "ioctl in buffer too small (flags={:#x} in_size={} data_len={})",
-                        op.arg.flags,
-                        op.arg.in_size,
-                        op.in_data.len()
-                    );
+                if op.arg.in_size < flag_bytes {
+                    return err_fuse!(libc::EINVAL, "ioctl in buffer too small");
                 }
                 let requested = FuseUtils::decode_ioctl_file_flags(op.in_data)?;
                 let new_flags = FuseUtils::normalize_ioctl_file_flags(requested);
@@ -1769,53 +1616,17 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn link(&self, op: Link<'_>) -> FuseResult<fuse_entry_out> {
         let name = try_option!(op.name.to_str());
         let oldnodeid = op.arg.oldnodeid;
-        let parent_ino = op.header.nodeid;
-
-        // Linux vfs_link requires MAY_WRITE|MAY_EXEC on the destination parent.
-        self.check_permissions(op.header, (libc::W_OK | libc::X_OK) as u32)
-            .await?;
-
-        // Sticky may_link checks use dcache only. Missing dcache entries must not
-        // abort the link: the kernel may still hold oldnodeid after FORGET, and
-        // master link of dangling symlink inodes is valid (LTP link01 case 2).
-        {
-            let dir = self.state.dir_read();
-            if let (Some(src), Some(dest_dir)) = (
-                dir.get_inode(oldnodeid, None),
-                dir.get_inode(parent_ino, None),
-            ) {
-                let src_uid = self.resolve_file_uid(&src.status.owner);
-                let dest_dir_uid = self.resolve_file_uid(&dest_dir.status.owner);
-                FuseUtils::check_sticky_hardlink(
-                    self.conf.check_permission,
-                    op.header.uid,
-                    dest_dir_uid,
-                    src_uid,
-                    dest_dir.mode,
-                )?;
-            }
-        }
 
         self.state.fs_fsync(oldnodeid, None).await?;
 
-        let des_path = self.state.get_path_common(parent_ino, Some(name))?;
+        let des_path = self.state.get_path_common(op.header.nodeid, Some(name))?;
         let src_path = self.state.get_path(oldnodeid)?;
         self.ensure_writable_path(&src_path, RpcCode::Link).await?;
         self.ensure_writable_path(&des_path, RpcCode::Link).await?;
 
         // fs.protected_hardlinks (LTP prot_hsymlinks): deny unsafe non-owner hardlinks.
-        // Prefer dcache status: fs_stat of a dangling symlink source can ENOENT even
-        // though the symlink inode itself is a valid hardlink target (LTP link01 case 2).
         if self.conf.check_permission {
-            let cached_src = {
-                let dir = self.state.dir_read();
-                dir.get_inode(oldnodeid, None)
-                    .map(|inode| inode.clone_status())
-            };
-            let src_status = match cached_src {
-                Some(status) => status,
-                None => self.state.fs_stat(oldnodeid, None).await?,
-            };
+            let src_status = self.state.fs_stat(oldnodeid, None).await?;
             let file_uid = self.resolve_file_uid(&src_status.owner);
             let has_read_write = self
                 .check_access_permissions(&src_status, op.header, (libc::R_OK | libc::W_OK) as u32)
@@ -1832,16 +1643,14 @@ impl fs::FileSystem for CurvineFileSystem {
 
         debug!(
             "link: src_path={}, des_path={}, oldnodeid={}, parent={}",
-            src_path, des_path, oldnodeid, parent_ino
+            src_path, des_path, oldnodeid, op.header.nodeid
         );
 
         self.fs.link(&src_path, &des_path).await?;
-        // Master is the source of truth for nlink after a successful link.
-        // Always refresh via lookup_link/fs_stat(parent, name) rather than
-        // synthesizing dcache_nlink+1 (concurrent hardlinks and stale dcache
-        // would otherwise under-count). Master FileType::Link hardlink support
-        // covers LTP link01 dangling-symlink targets.
-        let attr = self.state.lookup_link(parent_ino, name, oldnodeid).await?;
+        let attr = self
+            .state
+            .lookup_link(op.header.nodeid, name, oldnodeid)
+            .await?;
 
         let result = FuseUtils::create_entry_out(&self.conf, attr);
         Ok(result)
@@ -1863,28 +1672,22 @@ impl fs::FileSystem for CurvineFileSystem {
     }
 
     async fn rename(&self, op: Rename<'_>) -> FuseResult<()> {
-        self.rename_paths(
-            op.header,
-            op.header.nodeid,
-            op.old_name,
-            op.arg.newdir,
-            op.new_name,
-            RenameFlags::empty(),
-        )
-        .await
+        self.rename_paths(op.header.nodeid, op.old_name, op.arg.newdir, op.new_name)
+            .await
     }
 
     async fn rename2(&self, op: Rename2<'_>) -> FuseResult<()> {
-        let flags = Self::parse_rename2_flags(op.arg.flags)?;
-        self.rename_paths(
-            op.header,
-            op.header.nodeid,
-            op.old_name,
-            op.arg.newdir,
-            op.new_name,
-            flags,
-        )
-        .await
+        // The FUSE-facing client rename path only issues flag-less renames, so
+        // NO_REPLACE/EXCHANGE/WHITEOUT are not plumbed through to the master RPC.
+        if !Self::rename2_flags_supported(op.arg.flags) {
+            return err_fuse!(
+                libc::ENOSYS,
+                "RENAME2 flags 0x{:x} not supported (flag-less rename only)",
+                op.arg.flags
+            );
+        }
+        self.rename_paths(op.header.nodeid, op.old_name, op.arg.newdir, op.new_name)
+            .await
     }
 
     async fn batch_forget(&self, op: BatchForget<'_>) -> FuseResult<()> {
@@ -1905,12 +1708,6 @@ impl fs::FileSystem for CurvineFileSystem {
             return err_fuse!(libc::EIO, "not support name {}", linkname);
         }
 
-        // Linux vfs_symlink requires MAY_WRITE|MAY_EXEC on the parent directory
-        // (LTP link01: symlink into an unwritable/unsearchable parent must fail).
-        // Check parent ACL before mount read-only so denial prefers EACCES,
-        // matching link/unlink/rmdir ordering.
-        self.check_permissions(op.header, (libc::W_OK | libc::X_OK) as u32)
-            .await?;
         let link_path = self.state.get_path_common(id, Some(linkname))?;
         self.ensure_writable_path(&link_path, RpcCode::Symlink)
             .await?;
@@ -2058,7 +1855,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn get_lk(&self, op: GetLk<'_>) -> FuseResult<fuse_lk_out> {
         let path = self.state.get_path(op.header.nodeid)?;
-        let lock = self.to_file_lock(op.arg, op.header.pid);
+        let lock = self.to_file_lock(op.arg);
 
         self.state.fs_fsync(op.header.nodeid, None).await?;
 
@@ -2087,26 +1884,12 @@ impl fs::FileSystem for CurvineFileSystem {
 
         self.state.fs_fsync(op.header.nodeid, None).await?;
 
-        let mut lock = self.to_file_lock(op.arg, op.header.pid);
+        let lock = self.to_file_lock(op.arg);
         let (flag, owner_id) = (lock.lock_flags, lock.owner_id);
-        let is_unlock = lock.lock_type == LockType::UnLock;
-        let full_range_unlock = Self::is_full_range_unlock(&lock);
-        if full_range_unlock {
-            // Align OFFSET_MAX whole-file unlocks with Master full-clear / fs_unlock_owner.
-            lock.end = u64::MAX;
-        }
 
         let conflict = self.fs.set_lock(&path, lock).await?;
         if conflict.is_none() {
-            if is_unlock {
-                // Full-range unlock drops this owner from handle bookkeeping so a
-                // later FUSE_FLUSH does not need to talk to Master again.
-                if full_range_unlock && flag == LockFlags::Plock {
-                    handle.take_plock_if_owner(owner_id);
-                }
-            } else {
-                handle.add_lock(flag, owner_id);
-            }
+            handle.add_lock(flag, owner_id);
             Ok(())
         } else {
             err_fuse!(libc::EAGAIN)
@@ -2128,27 +1911,17 @@ impl fs::FileSystem for CurvineFileSystem {
         let mut ticks: u64 = 0;
         let time = TimeSpent::new();
 
-        let mut lock = self.to_file_lock(op.arg, op.header.pid);
-        let is_unlock = lock.lock_type == LockType::UnLock;
-        let full_range_unlock = Self::is_full_range_unlock(&lock);
-        if full_range_unlock {
-            lock.end = u64::MAX;
-        }
+        let lock = self.to_file_lock(op.arg);
         let wait_guard = PlockWaitGuard::new(
             self.plock_waits.clone(),
             LockOwner::new(lock.client_id.clone(), lock.owner_id),
         );
         loop {
+            wait_guard.clear_blocked_by();
+
             let conflict = self.fs.set_lock(&path, lock.clone()).await?;
             if conflict.is_none() {
-                wait_guard.clear_blocked_by();
-                if is_unlock {
-                    if full_range_unlock && lock.lock_flags == LockFlags::Plock {
-                        handle.take_plock_if_owner(lock.owner_id);
-                    }
-                } else {
-                    handle.add_lock(lock.lock_flags, lock.owner_id);
-                }
+                handle.add_lock(lock.lock_flags, lock.owner_id);
                 return Ok(());
             }
 
@@ -2156,30 +1929,7 @@ impl fs::FileSystem for CurvineFileSystem {
             if wait_guard
                 .register_blocked_by(LockOwner::new(blocker.client_id.clone(), blocker.owner_id))
             {
-                // Cycle in the local wait graph. Re-sample Master once while
-                // keeping our edge published so a peer in a true multi-resource
-                // deadlock (LTP fcntl17) still observes the cycle. If the lock
-                // is free now (OFD unlock/re-lock race, LTP fcntl34), acquire
-                // instead of returning a false EDEADLK.
-                let conflict2 = self.fs.set_lock(&path, lock.clone()).await?;
-                if conflict2.is_none() {
-                    wait_guard.clear_blocked_by();
-                    if is_unlock {
-                        if full_range_unlock && lock.lock_flags == LockFlags::Plock {
-                            handle.take_plock_if_owner(lock.owner_id);
-                        }
-                    } else {
-                        handle.add_lock(lock.lock_flags, lock.owner_id);
-                    }
-                    return Ok(());
-                }
-                let blocker2 = conflict2.as_ref().expect("conflict lock");
-                if wait_guard.register_blocked_by(LockOwner::new(
-                    blocker2.client_id.clone(),
-                    blocker2.owner_id,
-                )) {
-                    return err_fuse!(libc::EDEADLK);
-                }
+                return err_fuse!(libc::EDEADLK);
             }
 
             ticks += 1;
@@ -2205,35 +1955,7 @@ impl fs::FileSystem for CurvineFileSystem {
 mod tests {
     use crate::fs::dcache::Inode;
     use crate::{FATTR_ATIME_NOW, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_UID};
-    use curvine_common::state::{FileAllocMode, FileStatus, FileType, INTERNAL_CTIME_XATTR};
-
-    #[test]
-    fn full_range_unlock_accepts_kernel_offset_max_and_u64_max() {
-        use super::CurvineFileSystem;
-        use curvine_common::state::{FileLock, LockType};
-
-        assert!(CurvineFileSystem::is_lock_to_eof(u64::MAX));
-        assert!(CurvineFileSystem::is_lock_to_eof(i64::MAX as u64));
-        assert!(!CurvineFileSystem::is_lock_to_eof(i64::MAX as u64 - 1));
-
-        let mut lock = FileLock {
-            lock_type: LockType::UnLock,
-            start: 0,
-            end: i64::MAX as u64,
-            ..Default::default()
-        };
-        assert!(CurvineFileSystem::is_full_range_unlock(&lock));
-
-        lock.end = u64::MAX;
-        assert!(CurvineFileSystem::is_full_range_unlock(&lock));
-
-        lock.end = 100;
-        assert!(!CurvineFileSystem::is_full_range_unlock(&lock));
-
-        lock.end = u64::MAX;
-        lock.start = 1;
-        assert!(!CurvineFileSystem::is_full_range_unlock(&lock));
-    }
+    use curvine_model::{FileAllocMode, FileStatus, FileType, INTERNAL_CTIME_XATTR};
 
     #[test]
     fn userspace_open_checks_only_unambiguous_write_modes() {
@@ -2341,7 +2063,7 @@ mod tests {
     #[test]
     fn root_access_checks_any_execute_bit_not_owner_class() {
         use super::CurvineFileSystem;
-        use curvine_common::state::{FileStatus, FileType};
+        use curvine_model::{FileStatus, FileType};
 
         let mut readonly = FileStatus::with_name(1, "readonly".to_string(), false);
         readonly.file_type = FileType::File;
@@ -2900,24 +2622,23 @@ mod tests {
     }
 
     #[test]
-    fn parse_rename2_flags_accepts_supported_values() {
-        assert!(CurvineFileSystem::parse_rename2_flags(0).is_ok());
-        assert!(CurvineFileSystem::parse_rename2_flags(1).is_ok());
-        assert!(CurvineFileSystem::parse_rename2_flags(2).is_ok());
-    }
-
-    #[test]
-    fn parse_rename2_flags_rejects_unsupported_values() {
-        assert!(CurvineFileSystem::parse_rename2_flags(4).is_err());
-        assert!(CurvineFileSystem::parse_rename2_flags(3).is_err());
-        assert!(CurvineFileSystem::parse_rename2_flags(1 << 6).is_err());
+    fn rename2_flags_supported_only_accepts_zero() {
+        // Flag-less rename is the only supported form.
+        assert!(CurvineFileSystem::rename2_flags_supported(0));
+        // Known rename flags are rejected (client does not plumb them through).
+        assert!(!CurvineFileSystem::rename2_flags_supported(1)); // RENAME_NOREPLACE
+        assert!(!CurvineFileSystem::rename2_flags_supported(2)); // RENAME_EXCHANGE
+        assert!(!CurvineFileSystem::rename2_flags_supported(4)); // RENAME_WHITEOUT
+                                                                 // An unknown high bit must also be rejected — checked against the raw
+                                                                 // value, so it is not silently truncated away (the RenameFlags footgun).
+        assert!(!CurvineFileSystem::rename2_flags_supported(1 << 6));
     }
 
     mod readdir_termination {
         use crate::fs::state::DirHandle;
-        use curvine_common::fs::{ListStream, Path};
-        use curvine_common::state::FileStatus;
-        use orpc::runtime::{AsyncRuntime, RpcRuntime};
+        use curvine_fs_api::{ListStream, Path};
+        use curvine_model::FileStatus;
+        use orpc_rpc::runtime::{AsyncRuntime, RpcRuntime};
 
         fn entries(names: &[&str]) -> Vec<FileStatus> {
             names

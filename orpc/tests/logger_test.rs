@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use orpc::common::{LogConf, Logger};
+use orpc_rpc::common::{LogConf, Logger};
 use tracing::dispatcher;
 
 #[test]

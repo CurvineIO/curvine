@@ -13,15 +13,15 @@
 // limitations under the License.
 
 use crate::master::{JobManager, RpcContext};
-use curvine_common::proto::{
+use curvine_common_core::proto::{
     CancelJobRequest, CancelJobResponse, GetJobStatusRequest, GetJobStatusResponse,
     SubmitJobRequest, SubmitJobResponse, TaskReportRequest, TaskReportResponse,
 };
-use curvine_common::state::{JobTaskType, LoadJobCommand};
-use curvine_common::utils::{ProtoUtils, SerdeUtils};
-use curvine_common::FsResult;
-use orpc::err_box;
-use orpc::message::Message;
+use curvine_common_core::state::{JobTaskType, LoadJobCommand};
+use curvine_common_core::utils::{ProtoUtils, SerdeUtils};
+use curvine_common_core::FsResult;
+use orpc_rpc::err_box;
+use orpc_rpc::message::Message;
 use std::sync::Arc;
 
 /// The master loads the task service

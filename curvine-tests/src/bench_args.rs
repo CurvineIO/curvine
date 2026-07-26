@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use clap::Parser;
-use curvine_common::version;
+use curvine_common_core::version;
 
 #[derive(Debug, Parser, Clone, Default)]
 #[command(arg_required_else_help = true, version = version::VERSION)]

@@ -1,11 +1,11 @@
-use curvine_common::conf::{ClusterConf, JournalConf, MasterConf};
-use curvine_common::state::{
+use curvine_common_core::conf::{ClusterConf, JournalConf, MasterConf};
+use curvine_common_core::state::{
     BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, StorageType, WorkerInfo,
 };
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::JournalSystem;
 use curvine_server::master::Master;
-use orpc::common::Utils;
+use orpc_rpc::common::Utils;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     mpsc, Arc,

@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use crate::master::SyncFsDir;
-use curvine_common::conf::{UfsConf, UfsConfBuilder};
-use curvine_common::fs::Path;
-use curvine_common::state::{MountInfo, MountOptions};
-use curvine_common::FsResult;
+use curvine_common_core::conf::{UfsConf, UfsConfBuilder};
+use curvine_common_core::fs::Path;
+use curvine_common_core::state::{MountInfo, MountOptions};
+use curvine_common_core::FsResult;
 use log::{info, warn};
-use orpc::err_box;
+use orpc_rpc::err_box;
 use rand::Rng;
 use std::collections::HashMap;
 use std::convert::Into;

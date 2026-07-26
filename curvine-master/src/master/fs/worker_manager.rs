@@ -15,15 +15,15 @@
 use crate::master::fs::policy::{ChooseContext, WorkerPolicyAdapter};
 use crate::master::fs::state::{BlockMap, WorkerMap};
 use crate::master::fs::DeleteResult;
-use curvine_common::conf::ClusterConf;
-use curvine_common::state::{
+use curvine_common_core::conf::ClusterConf;
+use curvine_common_core::state::{
     BlockLocation, ExtendedBlock, HeartbeatStatus, LocatedBlock, StorageInfo, StorageType,
-    TransferWorkerCapabilities, WorkerAddress, WorkerCommand, WorkerInfo, WorkerStatus,
+    WorkerAddress, WorkerCommand, WorkerInfo, WorkerStatus,
 };
-use curvine_common::FsResult;
+use curvine_common_core::FsResult;
 use log::{info, warn};
-use orpc::common::ByteUnit;
-use orpc::{err_box, CommonResult};
+use orpc_rpc::common::ByteUnit;
+use orpc_rpc::{err_box, CommonResult};
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 
@@ -48,15 +48,12 @@ impl WorkerManager {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn heartbeat(
         &mut self,
         cluster_id: &str,
         status: HeartbeatStatus,
         addr: WorkerAddress,
         weight: u32,
-        worker_session_id: String,
-        transfer_capabilities: TransferWorkerCapabilities,
         storages: Vec<StorageInfo>,
     ) -> FsResult<Vec<WorkerCommand>> {
         // The cluster id must match to prevent misregistration.
@@ -74,13 +71,6 @@ impl WorkerManager {
                 // Enforce the same worker_id ↔ address rule as insert() before remove(): a Start
                 // from a conflicting address must not evict the live registration.
                 self.worker_map.ensure_worker_id_addr(&addr)?;
-                for stale in self.worker_map.remove_same_endpoint(&addr) {
-                    warn!(
-                        "Remove stale worker {} on restart endpoint {}",
-                        stale.simple_debug(),
-                        addr
-                    );
-                }
                 // Same node restarting: clear the slot so we do not treat it as ready or run
                 // Running heartbeat bookkeeping until insert() on the next Running beat.
                 self.worker_map.remove(&addr);
@@ -96,13 +86,7 @@ impl WorkerManager {
             }
         };
 
-        self.worker_map.insert(
-            addr,
-            weight,
-            worker_session_id,
-            transfer_capabilities,
-            storages,
-        )?;
+        self.worker_map.insert(addr, weight, storages)?;
         Ok(cmds)
     }
 

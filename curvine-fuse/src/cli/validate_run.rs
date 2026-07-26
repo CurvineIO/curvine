@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::cli::FuseRuntimeArgs;
-use curvine_common::conf::FuseConf;
-use orpc::CommonResult;
+use curvine_config::FuseConf;
+use orpc_rpc::CommonResult;
 use std::fs::read_to_string;
 
 /// Validates configuration by loading and initializing cluster settings without mounting.

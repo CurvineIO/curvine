@@ -17,12 +17,12 @@ use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::{Inode, InodeFile, InodePath, InodePtr, InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
-use curvine_common::state::{BlockLocation, CommitBlock, FileLock, FileStatus, MountInfo};
-use curvine_common::utils::SerdeUtils;
+use curvine_common_core::state::{BlockLocation, CommitBlock, FileLock, FileStatus, MountInfo};
+use curvine_common_core::utils::SerdeUtils;
 use curvine_rocksdb::{DBConf, RocksUtils};
 use log::info;
-use orpc::common::{FileUtils, Utils};
-use orpc::{err_box, try_err, try_option, CommonResult};
+use orpc_rpc::common::{FileUtils, Utils};
+use orpc_rpc::{err_box, try_err, try_option, CommonResult};
 use std::collections::{HashMap, HashSet, LinkedList, VecDeque};
 use std::sync::Arc;
 
@@ -237,31 +237,6 @@ impl InodeStore {
         Ok(())
     }
 
-    pub fn apply_exchange(
-        &self,
-        src_parent: &InodeView,
-        src_name: &str,
-        dst_parent: &InodeView,
-        dst_name: &str,
-        at_src: &InodeView,
-        at_dst: &InodeView,
-    ) -> CommonResult<()> {
-        let mut batch = self.store.new_batch();
-
-        batch.delete_child(src_parent.id(), src_name)?;
-        batch.delete_child(dst_parent.id(), dst_name)?;
-        batch.write_inode(at_src)?;
-        batch.write_inode(at_dst)?;
-        batch.add_child(src_parent.id(), at_src.name(), at_src.id())?;
-        batch.add_child(dst_parent.id(), at_dst.name(), at_dst.id())?;
-        batch.write_inode(src_parent)?;
-        batch.write_inode(dst_parent)?;
-
-        batch.commit()?;
-
-        Ok(())
-    }
-
     pub fn apply_new_block(
         &self,
         file: &InodeView,
@@ -293,13 +268,7 @@ impl InodeStore {
             }
         }
 
-        batch.commit()?;
-
-        // Refresh TTL index in case set_attr_opts changed ttl_ms/ttl_action or
-        // file.complete() advanced mtime (TTL expiration = mtime + ttl_ms).
-        self.ttl_bucket_list.add(file);
-
-        Ok(())
+        batch.commit()
     }
 
     pub fn apply_overwrite_file(&self, file: &InodeView) -> CommonResult<()> {

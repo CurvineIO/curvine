@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::io::{IOError, IOResult};
 use crate::message::RefMessage;
 use crate::message::{Message, MAX_DATE_SIZE};
 use bytes::BytesMut;
-use curvine_io::{IOError, IOResult};
 use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec};
 
 /// RPC message codec.

@@ -20,9 +20,9 @@ pub use self::file_layout::FileLayout;
 
 use crate::storage::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};
 use crate::BlockMeta;
-use curvine_common::state::{ExtendedBlock, StorageType};
-use orpc::io::IOResult;
-use orpc::{err_box, CommonResult};
+use curvine_common_core::state::{ExtendedBlock, StorageType};
+use orpc_rpc::io::IOResult;
+use orpc_rpc::{err_box, CommonResult};
 use std::sync::Arc;
 
 fn validate_open_offset(meta: &BlockMeta, off: i64) -> IOResult<()> {

@@ -5,12 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-orpc = { workspace = true }
+orpc-rpc = { workspace = true }
 curvine-client-core = { workspace = true }
 curvine-job-client = { workspace = true }
 curvine-unified-fs = { workspace = true }
 curvine-bench = { workspace = true }
-curvine-ufs = { workspace = true }
+curvine-ufs-api = { workspace = true }
 curvine-config = { workspace = true }
 curvine-error = { workspace = true }
 curvine-fs-api = { workspace = true }

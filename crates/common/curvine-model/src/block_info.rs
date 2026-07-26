@@ -14,8 +14,8 @@
 
 use crate::state::{FileAllocOpts, FileStatus, FileType, StorageType, WorkerAddress};
 use crate::FsResult;
-use orpc::common::{ByteUnit, FastHashMap};
-use orpc::{err_box, CommonResult};
+use orpc_rpc::common::{ByteUnit, FastHashMap};
+use orpc_rpc::{err_box, CommonResult};
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, Range};
 
@@ -280,10 +280,6 @@ impl WriteFileBlocks {
     pub fn add_commit(&mut self, commit: CommitBlock) -> FsResult<()> {
         if let Some(lb) = self.search_block_mut(commit.block_id) {
             lb.block.len = commit.block_len;
-            // Mirror master BlockMeta::commit: a published block must not keep
-            // stale resize alloc_opts. Otherwise the next rewrite reopen re-applies
-            // an old truncate and shrinks the staging copy (LTP ftest/pwrite).
-            lb.block.alloc_opts = None;
         } else {
             return err_box!("Not found block {}", commit.block_id);
         }

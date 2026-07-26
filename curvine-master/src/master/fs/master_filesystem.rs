@@ -22,48 +22,18 @@ use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
 use crate::master::{Master, MasterMonitor, SyncFsDir, SyncWorkerManager};
-use curvine_common::conf::{ClusterConf, MasterConf};
-use curvine_common::error::FsError;
-use curvine_common::state::*;
-use curvine_common::FsResult;
+use curvine_common_core::conf::{ClusterConf, MasterConf};
+use curvine_common_core::error::FsError;
+use curvine_common_core::state::*;
+use curvine_common_core::FsResult;
 use log::{error, info, warn};
-use orpc::common::LocalTime;
-use orpc::runtime::GroupExecutor;
-use orpc::sync::ArcRwLock;
-use orpc::{err_box, err_ext, try_option, CommonResult};
+use orpc_rpc::common::LocalTime;
+use orpc_rpc::runtime::GroupExecutor;
+use orpc_rpc::sync::ArcRwLock;
+use orpc_rpc::{err_box, err_ext, try_option, CommonResult};
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-
-pub struct CvMetadataSnapshotEntry {
-    pub status: FileStatus,
-    pub blocks: Option<FileBlocks>,
-}
-
-pub struct CvMetadataSnapshotPage {
-    pub entries: Vec<CvMetadataSnapshotEntry>,
-    pub next_page_token: Option<String>,
-    pub epoch: u64,
-}
-
-pub struct CvMetadataDeltaEntry {
-    pub path: String,
-    pub entry: Option<CvMetadataSnapshotEntry>,
-}
-
-pub struct CvMetadataDeltaPage {
-    pub entries: Vec<CvMetadataDeltaEntry>,
-    pub next_page_token: Option<String>,
-    pub from_epoch: u64,
-    pub to_epoch: u64,
-    pub full_snapshot_required: bool,
-}
-
-struct CompleteFileOptions {
-    only_flush: bool,
-    return_file_blocks: bool,
-    set_attr_opts: Option<SetAttrOpts>,
-}
 
 #[derive(Clone)]
 pub struct MasterFilesystem {
@@ -84,23 +54,6 @@ pub(crate) enum BlockInodeState {
     File,
     Missing,
     NotFile,
-}
-
-fn child_snapshot_path(parent: &str, child_name: &str) -> String {
-    if parent == "/" {
-        format!("/{child_name}")
-    } else {
-        format!("{parent}/{child_name}")
-    }
-}
-
-fn snapshot_token_in_subtree(token: &str, subtree_path: &str) -> bool {
-    token == subtree_path
-        || (subtree_path != "/"
-            && token
-                .strip_prefix(subtree_path)
-                .map(|rest| rest.starts_with(PATH_SEPARATOR))
-                .unwrap_or(false))
 }
 
 struct FullBlockReportState {
@@ -305,18 +258,6 @@ impl MasterFilesystem {
                     "cannot rename {} to {}: destination is under source",
                     src, dst
                 )));
-            }
-        }
-
-        // EXCHANGE also rejects src under dst (/a/b <-> /a would make /a its own descendant).
-        if flags.exchange_mode() {
-            if let Some(rest) = src.strip_prefix(dst) {
-                if rest.starts_with(PATH_SEPARATOR) {
-                    return err_ext!(FsError::invalid_argument(format!(
-                        "cannot exchange {} with {}: source is under destination",
-                        src, dst
-                    )));
-                }
             }
         }
 
@@ -666,7 +607,6 @@ impl MasterFilesystem {
         Ok(located)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn complete_file<T: AsRef<str>>(
         &self,
         path: T,
@@ -675,54 +615,6 @@ impl MasterFilesystem {
         commit_blocks: Vec<CommitBlock>,
         client_name: T,
         only_flush: bool,
-        set_attr_opts: Option<SetAttrOpts>,
-    ) -> FsResult<Option<FileBlocks>> {
-        self.complete_file0(
-            path,
-            inode_id,
-            len,
-            commit_blocks,
-            client_name,
-            CompleteFileOptions {
-                only_flush,
-                return_file_blocks: true,
-                set_attr_opts,
-            },
-        )
-    }
-
-    /// Flushes file metadata without building the full block-location snapshot.
-    pub fn flush_file<T: AsRef<str>>(
-        &self,
-        path: T,
-        inode_id: Option<i64>,
-        len: i64,
-        commit_blocks: Vec<CommitBlock>,
-        client_name: T,
-    ) -> FsResult<()> {
-        self.complete_file0(
-            path,
-            inode_id,
-            len,
-            commit_blocks,
-            client_name,
-            CompleteFileOptions {
-                only_flush: true,
-                return_file_blocks: false,
-                set_attr_opts: None,
-            },
-        )
-        .map(|_| ())
-    }
-
-    fn complete_file0<T: AsRef<str>>(
-        &self,
-        path: T,
-        inode_id: Option<i64>,
-        len: i64,
-        commit_blocks: Vec<CommitBlock>,
-        client_name: T,
-        options: CompleteFileOptions,
     ) -> FsResult<Option<FileBlocks>> {
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
@@ -733,18 +625,17 @@ impl MasterFilesystem {
             len,
             commit_blocks,
             client_name,
-            options.only_flush,
-            options.set_attr_opts,
+            only_flush,
         )?;
 
-        if options.only_flush && options.return_file_blocks {
+        if only_flush {
             let file = inode.as_file_ref()?;
             let locs = self.get_block_locs(path, &fs_dir, file)?;
             let status = inode.to_file_status(path)?;
-            return Ok(Some(FileBlocks::new(status, locs)));
+            Ok(Some(FileBlocks::new(status, locs)))
+        } else {
+            Ok(None)
         }
-
-        Ok(None)
     }
 
     pub fn get_file_blocks(
@@ -817,279 +708,6 @@ impl MasterFilesystem {
         };
 
         Ok(locate_blocks)
-    }
-
-    pub fn cv_metadata_snapshot_page(
-        &self,
-        page_token: Option<String>,
-        page_size: usize,
-    ) -> FsResult<CvMetadataSnapshotPage> {
-        if page_size == 0 {
-            return err_box!("cv metadata snapshot page_size must be greater than 0");
-        }
-
-        let fs_dir = self.fs_dir.read();
-        let epoch = fs_dir.op_id.get();
-        let start_after = page_token.filter(|token| !token.is_empty());
-        let mut entries = Vec::with_capacity(page_size.saturating_add(1));
-        self.collect_cv_metadata_snapshot_page(
-            &fs_dir,
-            fs_dir.root_dir(),
-            "/",
-            start_after.as_deref(),
-            page_size.saturating_add(1),
-            &mut entries,
-        )?;
-
-        let next_page_token = if entries.len() > page_size {
-            let token = entries
-                .get(page_size.saturating_sub(1))
-                .map(|entry| entry.status.path.clone());
-            entries.truncate(page_size);
-            token
-        } else {
-            None
-        };
-
-        Ok(CvMetadataSnapshotPage {
-            entries,
-            next_page_token,
-            epoch,
-        })
-    }
-
-    pub fn cv_metadata_delta_page(
-        &self,
-        from_epoch: u64,
-        target_epoch: Option<u64>,
-        page_token: Option<String>,
-        page_size: usize,
-    ) -> FsResult<CvMetadataDeltaPage> {
-        if page_size == 0 {
-            return err_box!("cv metadata delta page_size must be greater than 0");
-        }
-
-        let fs_dir = self.fs_dir.read();
-        let current_epoch = fs_dir.op_id.get();
-        let to_epoch = target_epoch.unwrap_or(current_epoch);
-        if to_epoch > current_epoch {
-            return err_box!(
-                "cv metadata delta target_epoch {} is newer than current epoch {}",
-                to_epoch,
-                current_epoch
-            );
-        }
-        if from_epoch > to_epoch {
-            return err_box!(
-                "cv metadata delta from_epoch {} is newer than target epoch {}",
-                from_epoch,
-                to_epoch
-            );
-        }
-        if target_epoch.is_some() && to_epoch < current_epoch {
-            return Ok(CvMetadataDeltaPage {
-                entries: Vec::new(),
-                next_page_token: None,
-                from_epoch,
-                to_epoch,
-                full_snapshot_required: true,
-            });
-        }
-        if from_epoch == to_epoch {
-            return Ok(CvMetadataDeltaPage {
-                entries: Vec::new(),
-                next_page_token: None,
-                from_epoch,
-                to_epoch,
-                full_snapshot_required: false,
-            });
-        }
-
-        let Some(changes) = fs_dir
-            .journal_writer
-            .cv_metadata_changes_since(from_epoch, to_epoch)
-        else {
-            return Ok(CvMetadataDeltaPage {
-                entries: Vec::new(),
-                next_page_token: None,
-                from_epoch,
-                to_epoch,
-                full_snapshot_required: true,
-            });
-        };
-
-        let mut changed_paths = BTreeMap::new();
-        for change in changes {
-            changed_paths
-                .entry(change.path)
-                .and_modify(|include_subtree| *include_subtree |= change.include_subtree)
-                .or_insert(change.include_subtree);
-        }
-
-        let mut delta_entries = BTreeMap::new();
-        for (path, include_subtree) in changed_paths {
-            if include_subtree {
-                self.collect_cv_metadata_delta_subtree(&fs_dir, &path, &mut delta_entries)?;
-            } else {
-                let entry = self.cv_metadata_entry_for_path(&fs_dir, &path)?;
-                delta_entries.insert(path, entry);
-            }
-        }
-
-        let start_after = page_token.filter(|token| !token.is_empty());
-        let mut page_entries = Vec::with_capacity(page_size.saturating_add(1));
-        for (path, entry) in delta_entries {
-            if start_after
-                .as_deref()
-                .map(|token| path.as_str() <= token)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            page_entries.push(CvMetadataDeltaEntry { path, entry });
-            if page_entries.len() > page_size {
-                break;
-            }
-        }
-
-        let next_page_token = if page_entries.len() > page_size {
-            let token = page_entries
-                .get(page_size.saturating_sub(1))
-                .map(|entry| entry.path.clone());
-            page_entries.truncate(page_size);
-            token
-        } else {
-            None
-        };
-
-        Ok(CvMetadataDeltaPage {
-            entries: page_entries,
-            next_page_token,
-            from_epoch,
-            to_epoch,
-            full_snapshot_required: false,
-        })
-    }
-
-    fn collect_cv_metadata_delta_subtree(
-        &self,
-        fs_dir: &FsDir,
-        path: &str,
-        entries: &mut BTreeMap<String, Option<CvMetadataSnapshotEntry>>,
-    ) -> FsResult<()> {
-        let Some(entry) = self.cv_metadata_entry_for_path(fs_dir, path)? else {
-            entries.insert(path.to_string(), None);
-            return Ok(());
-        };
-
-        let is_dir = entry.status.is_dir;
-        entries.insert(path.to_string(), Some(entry));
-        if !is_dir {
-            return Ok(());
-        }
-
-        let inp = Self::resolve_path(fs_dir, path)?;
-        let Some(inode) = inp.get_last_inode() else {
-            return Ok(());
-        };
-        let resolved = self.resolve_snapshot_inode(fs_dir, &inode)?;
-        if let InodeView::Dir(dir) = resolved {
-            for child in dir.children_iter() {
-                let child_path = child_snapshot_path(path, child.name());
-                self.collect_cv_metadata_delta_subtree(fs_dir, &child_path, entries)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn cv_metadata_entry_for_path(
-        &self,
-        fs_dir: &FsDir,
-        path: &str,
-    ) -> FsResult<Option<CvMetadataSnapshotEntry>> {
-        let inp = match Self::resolve_path(fs_dir, path) {
-            Ok(inp) => inp,
-            Err(_) => return Ok(None),
-        };
-        let Some(inode) = inp.get_last_inode() else {
-            return Ok(None);
-        };
-        let resolved = self.resolve_snapshot_inode(fs_dir, &inode)?;
-        let status = resolved.to_file_status(path)?;
-        let blocks = if let Ok(file) = resolved.as_file_ref() {
-            Some(FileBlocks::new(
-                status.clone(),
-                self.get_block_locs(path, fs_dir, file)?,
-            ))
-        } else {
-            None
-        };
-        Ok(Some(CvMetadataSnapshotEntry { status, blocks }))
-    }
-
-    fn collect_cv_metadata_snapshot_page(
-        &self,
-        fs_dir: &FsDir,
-        inode: &InodeView,
-        path: &str,
-        start_after: Option<&str>,
-        limit: usize,
-        entries: &mut Vec<CvMetadataSnapshotEntry>,
-    ) -> FsResult<()> {
-        if entries.len() >= limit {
-            return Ok(());
-        }
-        if let Some(token) = start_after {
-            if path != "/" && token > path && !snapshot_token_in_subtree(token, path) {
-                return Ok(());
-            }
-        }
-
-        let resolved = self.resolve_snapshot_inode(fs_dir, inode)?;
-        if start_after.map(|token| path > token).unwrap_or(true) {
-            let status = resolved.to_file_status(path)?;
-            let blocks = if let Ok(file) = resolved.as_file_ref() {
-                Some(FileBlocks::new(
-                    status.clone(),
-                    self.get_block_locs(path, fs_dir, file)?,
-                ))
-            } else {
-                None
-            };
-            entries.push(CvMetadataSnapshotEntry { status, blocks });
-            if entries.len() >= limit {
-                return Ok(());
-            }
-        }
-
-        if let InodeView::Dir(dir) = resolved {
-            for child in dir.children_iter() {
-                let child_path = child_snapshot_path(path, child.name());
-                self.collect_cv_metadata_snapshot_page(
-                    fs_dir,
-                    child,
-                    &child_path,
-                    start_after,
-                    limit,
-                    entries,
-                )?;
-                if entries.len() >= limit {
-                    return Ok(());
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn resolve_snapshot_inode(&self, fs_dir: &FsDir, inode: &InodeView) -> FsResult<InodeView> {
-        if let InodeView::FileEntry(entry) = inode {
-            return fs_dir
-                .store
-                .get_inode(entry.id, Some(&entry.name))?
-                .ok_or_else(|| FsError::file_not_found(entry.name.clone()));
-        }
-        Ok(inode.clone())
     }
 
     pub fn master_info(&self) -> FsResult<MasterInfo> {
@@ -1297,8 +915,6 @@ impl MasterFilesystem {
         for item in list.blocks {
             match item.status {
                 BlockReportStatus::Finalized | BlockReportStatus::Writing => {
-                    let defer_writing_delete =
-                        item.status == BlockReportStatus::Writing && !list.full_report;
                     let state = match self.block_inode_state(item.id) {
                         Ok(v) => v,
                         Err(e) => {
@@ -1308,18 +924,6 @@ impl MasterFilesystem {
                     };
                     match state {
                         BlockInodeState::File => checked.push((item, Some(BlockInodeState::File))),
-                        BlockInodeState::Missing if defer_writing_delete => {
-                            warn!(
-                                "block_report deferred deletion for writing block {} on worker {} because its inode is missing",
-                                item.id, list.worker_id
-                            );
-                        }
-                        BlockInodeState::NotFile if defer_writing_delete => {
-                            warn!(
-                                "block_report deferred deletion for writing block {} on worker {} because its inode is not a file",
-                                item.id, list.worker_id
-                            );
-                        }
                         BlockInodeState::Missing => {
                             missing_blocks += 1;
                             delete_blocks.push(item.id);

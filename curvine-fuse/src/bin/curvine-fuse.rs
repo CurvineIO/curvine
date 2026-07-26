@@ -12,11 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(unix)]
+#[path = "../alloc.rs"]
+mod alloc;
+
 use clap::Parser;
 use curvine_fuse::cli::{
     run_list_config_flags, run_mount, run_validate_config, FuseCli, FuseSubcommand,
 };
-use orpc::CommonResult;
+use orpc_rpc::CommonResult;
 
 // For local debugging, after starting the cluster, run the following to mount fuse:
 // umount -f /curvine-fuse; cargo run --bin curvine-fuse -- --conf /server/conf/curvine-cluster.toml

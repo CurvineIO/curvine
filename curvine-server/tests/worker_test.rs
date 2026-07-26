@@ -12,21 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::conf::ClusterConf;
-use curvine_common::fs::RpcCode;
-use curvine_common::proto::{
+use curvine_common_core::conf::ClusterConf;
+use curvine_common_core::fs::RpcCode;
+use curvine_common_core::proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,
     BlocksBatchCommitRequest, BlocksBatchWriteRequest, BlocksBatchWriteResponse, DataHeaderProto,
     FileWriteData, FilesBatchWriteRequest,
 };
-use curvine_common::state::{ExtendedBlock, FileAllocOpts, FileType, StorageType};
-use curvine_common::utils::ProtoUtils;
+use curvine_common_core::state::{ExtendedBlock, FileAllocOpts, FileType, StorageType};
+use curvine_common_core::utils::ProtoUtils;
 use curvine_server::worker::Worker;
-use orpc::common::Utils;
-use orpc::io::net::NetUtils;
-use orpc::message::{Builder, Message, RequestStatus};
-use orpc::sys::DataSlice::Buffer;
-use orpc::CommonResult;
+use orpc_rpc::common::Utils;
+use orpc_rpc::io::net::NetUtils;
+use orpc_rpc::message::{Builder, Message, RequestStatus};
+use orpc_rpc::sys::DataSlice::Buffer;
+use orpc_rpc::CommonResult;
 use prost::bytes::BytesMut;
 use std::thread;
 
@@ -437,7 +437,7 @@ fn test_worker_fault_http_control_plane_e2e() -> CommonResult<()> {
     let session = rt.block_on(async {
         let controller = Arc::new(
             FaultHttpController::new(&base, &token)
-                .map_err(|e| orpc::CommonError::from(e.to_string()))?,
+                .map_err(|e| orpc_rpc::CommonError::from(e.to_string()))?,
         );
 
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -455,7 +455,7 @@ fn test_worker_fault_http_control_plane_e2e() -> CommonResult<()> {
                     let _ = error;
                 }
                 Err(error) => {
-                    return Err(orpc::CommonError::from(format!(
+                    return Err(orpc_rpc::CommonError::from(format!(
                         "worker fault HTTP never became ready at {base}: {error}"
                     )));
                 }
@@ -467,20 +467,20 @@ fn test_worker_fault_http_control_plane_e2e() -> CommonResult<()> {
         session
             .preflight()
             .await
-            .map_err(|e| orpc::CommonError::from(e.to_string()))?;
+            .map_err(|e| orpc_rpc::CommonError::from(e.to_string()))?;
         let rule = FaultRuleBuilder::named("worker.rpc.before_dispatch")
             .matches("req_id", open_req_id)
             .and_then(|builder| builder.matches("rpc_code", RpcCode::WriteBlock as i32))
             .and_then(|builder| builder.matches("request_status", i8::from(RequestStatus::Open)))
             .and_then(|builder| builder.times(1))
             .and_then(|builder| builder.return_error("worker HTTP control-plane failure"))
-            .map_err(|e| orpc::CommonError::from(e.to_string()))?;
+            .map_err(|e| orpc_rpc::CommonError::from(e.to_string()))?;
         session
             .configure("worker", "http-fail-write-open", rule)
             .await
-            .map_err(|e| orpc::CommonError::from(e.to_string()))?;
+            .map_err(|e| orpc_rpc::CommonError::from(e.to_string()))?;
 
-        Ok::<FaultTestSession, orpc::CommonError>(session)
+        Ok::<FaultTestSession, orpc_rpc::CommonError>(session)
     })?;
 
     let block_size = (CHUNK_SIZE * LOOP_NUM) as i64;
@@ -511,7 +511,7 @@ fn test_worker_fault_http_control_plane_e2e() -> CommonResult<()> {
         let rule = session
             .wait_for_executions("worker", "http-fail-write-open", 1, Duration::from_secs(5))
             .await
-            .map_err(|e| orpc::CommonError::from(e.to_string()))?;
+            .map_err(|e| orpc_rpc::CommonError::from(e.to_string()))?;
         assert_eq!(rule.executions, 1);
         assert_eq!(
             rule.last_context.as_ref().unwrap().get("rpc_code"),
@@ -524,8 +524,8 @@ fn test_worker_fault_http_control_plane_e2e() -> CommonResult<()> {
         session
             .cleanup()
             .await
-            .map_err(|e| orpc::CommonError::from(e.to_string()))?;
-        Ok::<(), orpc::CommonError>(())
+            .map_err(|e| orpc_rpc::CommonError::from(e.to_string()))?;
+        Ok::<(), orpc_rpc::CommonError>(())
     })?;
 
     let healthy_block = Utils::req_id().abs();

@@ -20,10 +20,10 @@ oss-hdfs = ["curvine-unified-fs/oss-hdfs"]
 
 [dependencies]
 curvine-client-core = { workspace = true }
-curvine-common = { workspace = true }
+curvine-common-core = { workspace = true }
 curvine-unified-fs = { workspace = true }
-curvine-ufs = { workspace = true }
+curvine-ufs-api = { workspace = true }
 bytes = { workspace = true }
 log = { workspace = true }
-orpc = { workspace = true }
+orpc-rpc = { workspace = true }
 prost = { workspace = true }

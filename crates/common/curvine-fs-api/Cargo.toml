@@ -8,7 +8,7 @@ license.workspace = true
 curvine-error = { workspace = true }
 curvine-model = { workspace = true }
 curvine-proto = { workspace = true }
-orpc = { workspace = true }
+orpc-rpc = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 async-stream = { workspace = true }
@@ -17,6 +17,9 @@ once_cell = { workspace = true }
 regex = { workspace = true }
 num_enum = { workspace = true }
 prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
 
 [features]
 default = []

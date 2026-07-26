@@ -16,8 +16,8 @@ use crate::file::FsContext;
 use bytes::BytesMut;
 use curvine_error::FsResult;
 use curvine_model::{ExtendedBlock, WorkerAddress};
-use orpc::err_box;
-use orpc::sys::DataSlice;
+use orpc_rpc::err_box;
+use orpc_rpc::sys::DataSlice;
 use std::sync::Arc;
 
 pub struct BlockReaderHole {

@@ -14,15 +14,8 @@
 
 use crate::master::meta::inode::{InodeDir, InodeFile};
 use crate::master::meta::BlockMeta;
-use curvine_common::state::{CommitBlock, FileLock, MountInfo, SetAttrOpts};
+use curvine_common_core::state::{CommitBlock, FileLock, MountInfo, SetAttrOpts};
 use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone)]
-pub(crate) struct CvMetadataChange {
-    pub(crate) op_id: u64,
-    pub(crate) path: String,
-    pub(crate) include_subtree: bool,
-}
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct MkdirEntry {
@@ -85,11 +78,6 @@ pub struct RenameEntry {
     pub(crate) dst: String,
     pub(crate) mtime: i64,
     pub(crate) flags: u32,
-    /// Pre-exchange inode ids for idempotent EXCHANGE replay (0 when absent / legacy).
-    #[serde(default)]
-    pub(crate) src_inode_id: i64,
-    #[serde(default)]
-    pub(crate) dst_inode_id: i64,
 }
 
 // delete
@@ -256,52 +244,6 @@ impl JournalEntry {
             JournalEntry::Symlink(e) => Some(e.new_inode.id),
             JournalEntry::SetLocks(e) => Some(e.ino),
             _ => None,
-        }
-    }
-
-    pub(crate) fn cv_metadata_changes(&self) -> Vec<CvMetadataChange> {
-        match self {
-            JournalEntry::Mkdir(e) => vec![CvMetadataChange::single(e.op_id, &e.path)],
-            JournalEntry::CreateFile(e) => vec![CvMetadataChange::single(e.op_id, &e.path)],
-            JournalEntry::ReopenFile(e) => vec![CvMetadataChange::single(e.op_id, &e.path)],
-            JournalEntry::OverWriteFile(e) => vec![CvMetadataChange::single(e.op_id, &e.path)],
-            JournalEntry::AddBlock(e) => vec![CvMetadataChange::single(e.op_id, &e.path)],
-            JournalEntry::CompleteFile(e) => vec![CvMetadataChange::single(e.op_id, &e.path)],
-            JournalEntry::Rename(e) => vec![
-                CvMetadataChange::subtree(e.op_id, &e.src),
-                CvMetadataChange::subtree(e.op_id, &e.dst),
-            ],
-            JournalEntry::Delete(e) => vec![CvMetadataChange::subtree(e.op_id, &e.path)],
-            JournalEntry::SetAttr(e) => vec![CvMetadataChange::single(e.op_id, &e.path)],
-            JournalEntry::Symlink(e) => vec![CvMetadataChange::single(e.op_id, &e.link)],
-            JournalEntry::Link(e) => vec![
-                CvMetadataChange::single(e.op_id, &e.src_path),
-                CvMetadataChange::single(e.op_id, &e.dst_path),
-            ],
-            JournalEntry::Free(e) => vec![CvMetadataChange::subtree(e.op_id, &e.path)],
-            JournalEntry::Mount(_)
-            | JournalEntry::UnMount(_)
-            | JournalEntry::SetLocks(_)
-            | JournalEntry::UfsApplied(_)
-            | JournalEntry::Snapshot(_) => Vec::new(),
-        }
-    }
-}
-
-impl CvMetadataChange {
-    fn single(op_id: u64, path: &str) -> Self {
-        Self {
-            op_id,
-            path: path.to_string(),
-            include_subtree: false,
-        }
-    }
-
-    fn subtree(op_id: u64, path: &str) -> Self {
-        Self {
-            op_id,
-            path: path.to_string(),
-            include_subtree: true,
         }
     }
 }

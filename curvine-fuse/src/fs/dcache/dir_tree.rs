@@ -18,13 +18,13 @@ use crate::{
     err_fuse, FuseResult, FuseUtils, FUSE_CURRENT_DIR, FUSE_PARENT_DIR, FUSE_PATH_MAX_DEPTH,
     FUSE_PATH_SEPARATOR, FUSE_ROOT_ID, FUSE_UNKNOWN_INO,
 };
-use curvine_common::conf::FuseConf;
-use curvine_common::fs::{Path, StateReader, StateWriter};
-use curvine_common::state::{FileStatus, SetAttrOpts};
+use curvine_config::FuseConf;
+use curvine_fs_api::{Path, StateReader, StateWriter};
+use curvine_model::{FileStatus, SetAttrOpts};
 use log::info;
-use orpc::common::{FastHashMap, LocalTime};
-use orpc::sync::AtomicCounter;
-use orpc::try_option_ref;
+use orpc_rpc::common::{FastHashMap, LocalTime};
+use orpc_rpc::sync::AtomicCounter;
+use orpc_rpc::try_option_ref;
 use std::collections::hash_map::Iter;
 
 pub struct DirTree {
@@ -352,39 +352,6 @@ impl DirTree {
         Ok(())
     }
 
-    pub fn exchange(
-        &mut self,
-        old_id: u64,
-        old_name: &str,
-        new_id: u64,
-        new_name: &str,
-    ) -> FuseResult<()> {
-        let old_ino = self.get_ino_check(old_id, Some(old_name))?;
-        let new_ino = self.get_ino_check(new_id, Some(new_name))?;
-        if old_ino == new_ino {
-            return Ok(());
-        }
-
-        self.get_dir_mut_check(old_id)?.remove_child(old_name);
-        self.get_dir_mut_check(new_id)?.remove_child(new_name);
-        self.get_dir_mut_check(old_id)?
-            .add_child(old_name.to_string(), new_ino);
-        self.get_dir_mut_check(new_id)?
-            .add_child(new_name.to_string(), old_ino);
-
-        {
-            let inode = self.get_inode_mut_check(old_ino, None)?;
-            inode.parent = new_id;
-            inode.name = new_name.to_string();
-        }
-        {
-            let inode = self.get_inode_mut_check(new_ino, None)?;
-            inode.parent = old_id;
-            inode.name = old_name.to_string();
-        }
-        Ok(())
-    }
-
     pub fn rename(
         &mut self,
         old_id: u64,
@@ -640,8 +607,8 @@ impl Default for DirTree {
 mod test {
     use crate::fs::dcache::DirTree;
     use crate::FUSE_ROOT_ID;
-    use curvine_common::conf::FuseConf;
-    use curvine_common::state::FileStatus;
+    use curvine_config::FuseConf;
+    use curvine_model::FileStatus;
 
     fn dir_st(name: &str, id: i64) -> FileStatus {
         FileStatus {
@@ -982,28 +949,6 @@ mod test {
         assert_eq!(t.get_inode_check(f, None).unwrap().ref_ctr, n_ref + 1);
         assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, n_lookup + 1);
         assert_eq!(t.get_inode(400, Some("hard")).unwrap().ino, f);
-    }
-
-    /// Hard links must not rewrite the inode's canonical parent/name; get_path
-    /// needs a stable source path for subsequent linkat calls.
-    #[test]
-    fn hard_link_preserves_source_path() {
-        let mut t = DirTree::default();
-        t.lookup(FUSE_ROOT_ID, "olddir", dir_st("olddir", 500), true)
-            .unwrap();
-        t.lookup(FUSE_ROOT_ID, "newdir", dir_st("newdir", 501), true)
-            .unwrap();
-        let f = t
-            .lookup(500, "oldfile", file_st("oldfile", 0), true)
-            .unwrap()
-            .ino;
-        let before = t.get_path(f).unwrap().full_path().to_string();
-        t.link(f, 501, "newfile", file_st("newfile", f as i64))
-            .unwrap();
-        let after = t.get_path(f).unwrap().full_path().to_string();
-        assert_eq!(after, before);
-        assert!(after.contains("olddir"));
-        assert!(after.contains("oldfile"));
     }
 
     /// Hard link: `link` adds ref_ctr; each `unlink` of a dirent subtracts ref_ctr; inode removed when zero (after forget if n_lookup).

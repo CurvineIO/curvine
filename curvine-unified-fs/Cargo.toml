@@ -7,19 +7,17 @@ license.workspace = true
 [dependencies]
 curvine-client-core = { workspace = true }
 curvine-job-client = { workspace = true }
-curvine-ufs = { workspace = true }
+curvine-ufs-api = { workspace = true }
 curvine-ufs-opendal = { workspace = true, optional = true }
 curvine-ufs-oss-hdfs = { workspace = true, optional = true }
 curvine-config = { workspace = true }
 curvine-error = { workspace = true }
 curvine-fs-api = { workspace = true }
 curvine-model = { workspace = true }
-curvine-proto = { workspace = true }
 bytes = { workspace = true }
-dashmap = { workspace = true }
 log = { workspace = true }
 once_cell = { workspace = true }
-orpc = { workspace = true }
+orpc-rpc = { workspace = true }
 tokio = { workspace = true }
 
 [features]

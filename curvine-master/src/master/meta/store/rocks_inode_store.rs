@@ -14,13 +14,13 @@
 
 use crate::master::meta::inode::InodeView;
 use crate::master::meta::LockMeta;
-use curvine_common::state::{BlockLocation, FileLock, MountInfo};
-use curvine_common::utils::SerdeUtils as Serde;
+use curvine_common_core::state::{BlockLocation, FileLock, MountInfo};
+use curvine_common_core::utils::SerdeUtils as Serde;
 use curvine_rocksdb::{
     DBConf, DBEngine, DBIteratorWithThreadMode, DBPinnableSlice, Error, RocksIterator, RocksUtils,
     WriteBatchWithTransaction, DB,
 };
-use orpc::CommonResult;
+use orpc_rpc::CommonResult;
 use std::collections::HashMap;
 
 pub struct RocksInodeStore {

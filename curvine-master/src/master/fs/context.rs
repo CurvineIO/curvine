@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::state::StoragePolicy;
+use curvine_common_core::state::StoragePolicy;
 
 // adBlock request verification result.
 #[derive(Debug, Clone)]

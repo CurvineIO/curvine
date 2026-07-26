@@ -16,13 +16,14 @@ use crate::client::client_state::InnerState;
 use crate::client::dispatch::Envelope;
 use crate::client::{BufferClient, ClientConf, ClientState, RawClient};
 use crate::handler::{Frame, RpcFrame};
+use crate::io::net::InetAddr;
+use crate::io::retry::TimeBondedRetry;
+use crate::io::{IOError, IOResult};
 use crate::message::{Message, RefMessage};
-use curvine_io::{IOError, IOResult};
-use curvine_sys::RawPtr;
+use crate::runtime::Runtime;
+use crate::sys::RawPtr;
+use crate::{err_box, try_err};
 use log::warn;
-use orpc_net::net::InetAddr;
-use orpc_net::retry::TimeBondedRetry;
-use orpc_runtime::runtime::Runtime;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
@@ -217,5 +218,66 @@ impl RpcClient {
 
     pub fn take_error(&self) -> Option<IOError> {
         self.state.take_error()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::client::{ClientConf, RpcClient};
+    use crate::io::net::InetAddr;
+    use crate::io::IOResult;
+    use crate::message::Builder;
+    use crate::runtime::{RpcRuntime, Runtime};
+    use crate::sys::DataSlice;
+    use crate::test::SimpleServer;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn rpc_client_test() -> IOResult<()> {
+        let server = SimpleServer::default();
+        let addr = server.bind_addr().clone();
+        server.start(0);
+
+        let conf = ClientConf::default();
+        let rt = Arc::new(conf.create_runtime());
+
+        // Wait for server to start
+        rt.block_on(async {
+            use tokio::time::{sleep, Duration};
+            for _ in 0..50 {
+                if RpcClient::new(false, rt.clone(), &addr, &conf)
+                    .await
+                    .is_ok()
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+            panic!("Server failed to start within 5 seconds");
+        });
+
+        rt.block_on(task(&addr, true, true, &conf, rt.clone()));
+        rt.block_on(task(&addr, false, true, &conf, rt.clone()));
+
+        Ok(())
+    }
+
+    async fn task(addr: &InetAddr, buffer: bool, retry: bool, conf: &ClientConf, rt: Arc<Runtime>) {
+        let client = RpcClient::new(buffer, rt, addr, conf).await.unwrap();
+
+        assert_eq!(buffer, client.is_buffer());
+
+        let msg = Builder::new_rpc(1).data(DataSlice::from_str("abc")).build();
+
+        let rep = if retry {
+            let dur = Duration::from_millis(conf.rpc_timeout_ms);
+            let policy = conf.io_retry_policy();
+            client.retry_rpc(dur, policy, msg).await.unwrap()
+        } else {
+            client.rpc(msg).await.unwrap()
+        };
+
+        println!("rep = {:?}", rep);
     }
 }

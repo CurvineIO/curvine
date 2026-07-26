@@ -14,16 +14,16 @@
 
 use crate::worker::block::{BlockStore, HeartbeatTask, MasterClient};
 use curvine_client_core::file::FsContext;
-use curvine_common::conf::ClusterConf;
-use curvine_common::executor::ScheduledExecutor;
-use curvine_common::state::{BlockReportInfo, HeartbeatStatus, WorkerAddress};
-use curvine_common::utils::ProtoUtils;
+use curvine_common_core::conf::ClusterConf;
+use curvine_common_core::executor::ScheduledExecutor;
+use curvine_common_core::state::{BlockReportInfo, HeartbeatStatus, WorkerAddress};
+use curvine_common_core::utils::ProtoUtils;
 use dashmap::DashMap;
 use log::info;
-use orpc::common::TimeSpent;
-use orpc::runtime::{GroupExecutor, Runtime};
-use orpc::sync::StateCtl;
-use orpc::CommonResult;
+use orpc_rpc::common::TimeSpent;
+use orpc_rpc::runtime::{GroupExecutor, Runtime};
+use orpc_rpc::sync::StateCtl;
+use orpc_rpc::CommonResult;
 use std::sync::Arc;
 
 /// Worker block management role.

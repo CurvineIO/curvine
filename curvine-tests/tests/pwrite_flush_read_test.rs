@@ -1,8 +1,8 @@
-use curvine_common::fs::Path;
-use curvine_common::fs::Reader;
-use curvine_common::fs::Writer;
+use curvine_common_core::fs::Path;
+use curvine_common_core::fs::Reader;
+use curvine_common_core::fs::Writer;
 use curvine_tests::Testing;
-use orpc::runtime::RpcRuntime;
+use orpc_rpc::runtime::RpcRuntime;
 use std::sync::Arc;
 
 /// Mimic LTP pwrite01 / FUSE dirty-read: sparse pwrites, flush (master write

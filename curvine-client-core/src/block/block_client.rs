@@ -30,12 +30,12 @@ use curvine_proto::{
     BlocksBatchCommitRequest, BlocksBatchWriteRequest, BlocksBatchWriteResponse, DataHeaderProto,
     FileWriteData, FilesBatchWriteRequest,
 };
-use orpc::client::RpcClient;
-use orpc::common::LocalTime;
-use orpc::error::ErrorExt;
-use orpc::message::{Builder, Message, RequestStatus};
-use orpc::sys::DataSlice;
-use orpc::{try_option_ref, CommonResult};
+use orpc_rpc::client::RpcClient;
+use orpc_rpc::common::LocalTime;
+use orpc_rpc::error::ErrorExt;
+use orpc_rpc::message::{Builder, Message, RequestStatus};
+use orpc_rpc::sys::DataSlice;
+use orpc_rpc::{try_option_ref, CommonResult};
 use std::sync::Arc;
 use std::time::Duration;
 

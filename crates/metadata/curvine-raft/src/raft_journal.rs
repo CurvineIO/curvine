@@ -14,9 +14,9 @@
 
 use crate::storage::{AppStorage, LogStorage};
 use crate::{RaftNode, RaftResult, RaftServer, RoleMonitor, RoleStateListener};
-use curvine_common::conf::JournalConf;
-use orpc::runtime::Runtime;
-use orpc::sync::StateCtl;
+use curvine_common_core::conf::JournalConf;
+use orpc_rpc::runtime::Runtime;
+use orpc_rpc::sync::StateCtl;
 use slog::{o, Drain};
 use std::sync::Arc;
 

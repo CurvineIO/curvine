@@ -17,18 +17,17 @@
 use crate::master::fs::MasterFilesystem;
 use crate::master::meta::inode::ttl::TtlBucket;
 use crate::master::Master;
-use curvine_common::state::MetricValue;
+use curvine_common_core::state::MetricValue;
 use log::{debug, info, warn};
-use orpc::common::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics as m, Metrics};
-use orpc::sync::FastDashMap;
-use orpc::sys::SysUtils;
-use orpc::CommonResult;
+use orpc_rpc::common::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics as m, Metrics};
+use orpc_rpc::sync::FastDashMap;
+use orpc_rpc::sys::SysUtils;
+use orpc_rpc::CommonResult;
 use std::fmt::{Debug, Formatter};
 
 pub struct MasterMetrics {
     pub(crate) rpc_request_total_count: Counter,
     pub(crate) rpc_request_total_time: Counter,
-    pub(crate) active_connections: Gauge,
 
     pub(crate) capacity: Gauge,
     pub(crate) available: Gauge,
@@ -90,10 +89,6 @@ impl MasterMetrics {
             rpc_request_total_time: m::new_counter(
                 "rpc_request_time",
                 "Rpc request time duration(ms)",
-            )?,
-            active_connections: m::new_gauge(
-                "master_active_connections",
-                "Number of active RPC connections to master",
             )?,
 
             capacity: m::new_gauge("capacity", "Total storage capacity")?,

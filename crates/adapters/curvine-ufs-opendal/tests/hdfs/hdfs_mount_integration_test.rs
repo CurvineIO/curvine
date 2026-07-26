@@ -30,16 +30,16 @@
 
 #[cfg(any(feature = "opendal-hdfs", feature = "opendal-webhdfs"))]
 mod mount_integration_tests {
-    use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-    use curvine_common::state::{MountInfo, TtlAction};
-    use curvine_ufs::opendal::OpendalFileSystem;
+    use curvine_common_core::fs::{FileSystem, Path, Reader, Writer};
+    use curvine_common_core::state::{MountInfo, TtlAction};
+    use curvine_ufs_api::opendal::OpendalFileSystem;
     use std::collections::HashMap;
     use std::env;
 
     /// Helper function to create OpendalFileSystem from MountInfo
     fn create_filesystem_from_mount(
         mount_info: &MountInfo,
-    ) -> Result<OpendalFileSystem, curvine_common::error::FsError> {
+    ) -> Result<OpendalFileSystem, curvine_common_core::error::FsError> {
         let ufs_path = Path::from_str(&mount_info.ufs_path)?;
         OpendalFileSystem::new(&ufs_path, mount_info.properties.clone())
     }
@@ -57,7 +57,7 @@ mod mount_integration_tests {
         // Initialize JVM
         #[cfg(feature = "jni")]
         {
-            use curvine_common::jvm::{register_jvm, JVM};
+            use curvine_common_core::jvm::{register_jvm, JVM};
             register_jvm();
             JVM.get_or_init().expect("Failed to initialize JVM");
             println!("JVM initialized for mount integration");
@@ -81,7 +81,7 @@ mod mount_integration_tests {
                 storage_type: None,
                 block_size: None,
                 replicas: None,
-                write_type: curvine_common::state::WriteType::CacheMode,
+                write_type: curvine_common_core::state::WriteType::CacheMode,
                 provider: None,
             };
 
@@ -216,7 +216,7 @@ mod mount_integration_tests {
         // Initialize JVM
         #[cfg(feature = "jni")]
         {
-            use curvine_common::jvm::{register_jvm, JVM};
+            use curvine_common_core::jvm::{register_jvm, JVM};
             register_jvm();
             JVM.get_or_init().expect("Failed to initialize JVM");
         }
@@ -269,7 +269,7 @@ mod mount_integration_tests {
                     storage_type: None,
                     block_size: None,
                     replicas: None,
-                    write_type: curvine_common::state::WriteType::CacheMode,
+                    write_type: curvine_common_core::state::WriteType::CacheMode,
                     provider: None,
                 };
 
@@ -384,7 +384,7 @@ mod mount_integration_tests {
         // Initialize JVM
         #[cfg(feature = "jni")]
         {
-            use curvine_common::jvm::{register_jvm, JVM};
+            use curvine_common_core::jvm::{register_jvm, JVM};
             register_jvm();
             JVM.get_or_init().expect("Failed to initialize JVM");
         }
@@ -409,7 +409,7 @@ mod mount_integration_tests {
                 storage_type: None,
                 block_size: None,
                 replicas: None,
-                write_type: curvine_common::state::WriteType::CacheMode,
+                write_type: curvine_common_core::state::WriteType::CacheMode,
                 provider: None,
             };
 
@@ -458,7 +458,7 @@ mod mount_integration_tests {
                 storage_type: None,
                 block_size: None,
                 replicas: None,
-                write_type: curvine_common::state::WriteType::CacheMode,
+                write_type: curvine_common_core::state::WriteType::CacheMode,
                 provider: None,
             };
 

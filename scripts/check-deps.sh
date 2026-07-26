@@ -147,50 +147,49 @@ check_tree_forbidden() {
 }
 
 check_mixed_spdk_feature_risk() {
-  local output
-  local err
-  err="$(mktemp)"
+  check_tree_forbidden \
+    "mixed-cli-server-spdk-facade-tree" \
+    "curvine-common,orpc,curvine-ufs" \
+    -p curvine-cli \
+    -p curvine-server \
+    --features curvine-server/spdk-rdma
 
-  if output="$(
+  local output
+  output="$(
     cargo tree \
-      --no-default-features \
-      --features curvine-server/spdk-rdma,curvine-common/system \
       -p curvine-cli \
       -p curvine-server \
+      --features curvine-server/spdk-rdma \
       -e features \
       --prefix none \
-      -f '{p} {f}' 2>"$err"
-  )"; then
-    if awk '
-      $1 == "orpc" {
-        features = $0
-        sub(/^orpc v[^ ]+ /, "", features)
-        sub(/^\([^)]*\) /, "", features)
-        count = split(features, values, ",")
-        for (i = 1; i <= count; i++) {
-          gsub(/^[[:space:]]+|[[:space:]]+$/, "", values[i])
-          if (values[i] == "spdk" || values[i] == "spdk-rdma") {
-            found = 1
-          }
+      -f '{p} {f}'
+  )"
+
+  if awk '
+    $1 == "orpc-rpc" {
+      features = $0
+      sub(/^orpc-rpc v[^ ]+ /, "", features)
+      sub(/^\([^)]*\) /, "", features)
+      count = split(features, values, ",")
+      for (i = 1; i <= count; i++) {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", values[i])
+        if (values[i] == "spdk" || values[i] == "spdk-rdma" || values[i] == "rdma") {
+          found = 1
         }
       }
-      END { exit found ? 0 : 1 }
-    ' <<<"$output"; then
-      record_violation "mixed-spdk-feature-risk" "server spdk-rdma feature still enables SPDK features on shared orpc during a mixed CLI/server cargo tree"
-    else
-      record_ok "mixed-spdk-feature-risk"
-    fi
+    }
+    END { exit found ? 0 : 1 }
+  ' <<<"$output"; then
+    record_violation "mixed-spdk-feature-risk" "server spdk-rdma feature leaked native transport features onto shared orpc-rpc"
   else
-    echo "SKIP [mixed-spdk-feature-risk] cargo tree command failed, likely because legacy features were removed:"
-    sed 's/^/  /' "$err"
+    record_ok "mixed-spdk-feature-risk"
   fi
-
-  rm -f "$err"
 }
 
-common_client_forbidden="curvine-common,orpc,curvine-ufs,opendal,rocksdb,raft,curvine-storage-spdk,curvine-rocksdb,curvine-raft,curvine-ufs-oss-hdfs,curvine-hdfs-jni"
-libsdk_java_forbidden="curvine-common,orpc,curvine-ufs,opendal,rocksdb,raft,pyo3,curvine-storage-spdk,curvine-rocksdb,curvine-raft,curvine-ufs-oss-hdfs,curvine-hdfs-jni"
-libsdk_python_forbidden="curvine-common,orpc,curvine-ufs,opendal,rocksdb,raft,jni,curvine-storage-spdk,curvine-rocksdb,curvine-raft,curvine-ufs-oss-hdfs,curvine-hdfs-jni"
+common_client_forbidden="curvine-common,curvine-common-core,orpc,curvine-ufs,opendal,rocksdb,raft,curvine-storage-spdk,curvine-rocksdb,curvine-raft,curvine-ufs-oss-hdfs,curvine-hdfs-jni"
+client_core_forbidden="curvine-common,curvine-common-core,orpc,curvine-ufs,curvine-ufs-api,curvine-ufs-opendal,curvine-ufs-oss-hdfs,opendal,rocksdb,raft,curvine-storage-spdk,curvine-rocksdb,curvine-raft,curvine-hdfs-jni"
+libsdk_java_forbidden="curvine-common,curvine-common-core,orpc,curvine-ufs,opendal,rocksdb,raft,pyo3,curvine-storage-spdk,curvine-rocksdb,curvine-raft,curvine-ufs-oss-hdfs,curvine-hdfs-jni"
+libsdk_python_forbidden="curvine-common,curvine-common-core,orpc,curvine-ufs,opendal,rocksdb,raft,jni,curvine-storage-spdk,curvine-rocksdb,curvine-raft,curvine-ufs-oss-hdfs,curvine-hdfs-jni"
 
 echo "Dependency boundary check mode: $MODE"
 echo
@@ -198,6 +197,7 @@ echo
 check_facade_direct_deps
 check_tree_forbidden "curvine-cli-final-tree" "$common_client_forbidden" -p curvine-cli
 check_tree_forbidden "curvine-fuse-final-tree" "$common_client_forbidden" -p curvine-fuse
+check_tree_forbidden "curvine-client-core-final-tree" "$client_core_forbidden" -p curvine-client-core
 check_tree_forbidden "curvine-libsdk-java-min-final-tree" "$libsdk_java_forbidden" -p curvine-libsdk --no-default-features --features java-sdk
 check_tree_forbidden "curvine-libsdk-python-min-final-tree" "$libsdk_python_forbidden" -p curvine-libsdk --no-default-features --features python-sdk
 check_mixed_spdk_feature_risk
