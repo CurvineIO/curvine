@@ -721,6 +721,49 @@ impl CurvineFileSystem {
         Ok(())
     }
 
+    const SETATTR_TIME_VALID: u32 = FATTR_ATIME | FATTR_MTIME | FATTR_ATIME_NOW | FATTR_MTIME_NOW;
+
+    fn is_time_only_setattr(valid: u32) -> bool {
+        valid != 0 && (valid & !Self::SETATTR_TIME_VALID) == 0
+    }
+
+    /// Linux utime(2): owner/root may always set times; NULL/`*_NOW` also allow W_OK.
+    #[allow(clippy::too_many_arguments)]
+    fn check_utime_setattr_permission(
+        check_permission: bool,
+        valid: u32,
+        caller_uid: u32,
+        caller_gid: u32,
+        caller_pid: u32,
+        file_uid: u32,
+        file_gid: u32,
+        mode: u32,
+    ) -> FuseResult<()> {
+        if !check_permission || caller_uid == 0 || caller_uid == file_uid {
+            return Ok(());
+        }
+
+        let setting_now = (valid & (FATTR_ATIME_NOW | FATTR_MTIME_NOW)) != 0;
+        if setting_now {
+            let permission_bits =
+                if FuseUtils::caller_in_file_group(caller_gid, file_gid, caller_pid) {
+                    (mode >> 3) & 0o7
+                } else {
+                    mode & 0o7
+                };
+            if Self::permission_mask_allows(permission_bits, libc::W_OK as u32) {
+                return Ok(());
+            }
+            return err_fuse!(
+                libc::EACCES,
+                "utime denied without write access for uid {}",
+                caller_uid
+            );
+        }
+
+        err_fuse!(libc::EPERM, "utime denied for non-owner uid {}", caller_uid)
+    }
+
     /// Negotiate init reply flags as an explicit allowlist, not a blind echo:
     /// 1. Kernel-negotiated: `SUPPORTED_INIT_FLAGS & kernel_flags` (only caps the
     ///    daemon implements AND the kernel offered — see `SUPPORTED_INIT_FLAGS` for
@@ -1076,9 +1119,10 @@ impl fs::FileSystem for CurvineFileSystem {
         let mut fuse_attr = FuseUtils::status_to_attr(&self.conf, &status)?;
         fuse_attr.ino = op.header.nodeid;
         self.state.update_writer_len(&mut fuse_attr).await;
+        let (_, _, attr_valid, attr_valid_nsec) = FuseUtils::kernel_cache_timeouts(&self.conf);
         let attr = fuse_attr_out {
-            attr_valid: self.conf.attr_ttl.as_secs(),
-            attr_valid_nsec: self.conf.attr_ttl.subsec_nanos(),
+            attr_valid,
+            attr_valid_nsec,
             dummy: 0,
             attr: fuse_attr,
         };
@@ -1114,15 +1158,33 @@ impl fs::FileSystem for CurvineFileSystem {
                 .await?;
         }
 
-        Self::check_setattr_permission(
-            self.conf.check_permission,
-            op.header.uid,
-            op.header.gid,
-            op.header.pid,
-            file_uid,
-            op.arg.valid,
-            target_gid,
-        )?;
+        if Self::is_time_only_setattr(op.arg.valid) {
+            Self::check_utime_setattr_permission(
+                self.conf.check_permission,
+                op.arg.valid,
+                op.header.uid,
+                op.header.gid,
+                op.header.pid,
+                file_uid,
+                file_gid,
+                cur_status.mode,
+            )?;
+        } else {
+            Self::check_setattr_permission(
+                self.conf.check_permission,
+                op.header.uid,
+                op.header.gid,
+                op.header.pid,
+                file_uid,
+                op.arg.valid,
+                target_gid,
+            )?;
+        }
+
+        // truncate(2) / ftruncate: write permission required on the named file.
+        if (op.arg.valid & FATTR_SIZE) != 0 && self.conf.check_permission && op.header.uid != 0 {
+            self.check_access_permissions(&cur_status, op.header, libc::W_OK as u32)?;
+        }
 
         // Convert setattr to opts with UID/GID numeric fallback
         let mut opts = FuseUtils::fuse_setattr_to_opts(op.arg)?;
@@ -1178,9 +1240,10 @@ impl fs::FileSystem for CurvineFileSystem {
         // the writer's final metadata commit. Never let its stale size shrink the
         // kernel inode below the bytes already accepted by the active writer.
         self.state.update_writer_len(&mut attr).await;
+        let (_, _, attr_valid, attr_valid_nsec) = FuseUtils::kernel_cache_timeouts(&self.conf);
         let attr = fuse_attr_out {
-            attr_valid: self.conf.attr_ttl.as_secs(),
-            attr_valid_nsec: self.conf.attr_ttl.subsec_nanos(),
+            attr_valid,
+            attr_valid_nsec,
             dummy: 0,
             attr,
         };
@@ -1404,14 +1467,16 @@ impl fs::FileSystem for CurvineFileSystem {
             );
         }
 
+        let (entry_valid, entry_valid_nsec, attr_valid, attr_valid_nsec) =
+            FuseUtils::kernel_cache_timeouts(&self.conf);
         let r = fuse_create_out(
             fuse_entry_out {
                 nodeid: handle.ino(),
                 generation: 0,
-                entry_valid: self.conf.entry_ttl.as_secs(),
-                attr_valid: self.conf.attr_ttl.as_secs(),
-                entry_valid_nsec: self.conf.entry_ttl.subsec_nanos(),
-                attr_valid_nsec: self.conf.attr_ttl.subsec_nanos(),
+                entry_valid,
+                attr_valid,
+                entry_valid_nsec,
+                attr_valid_nsec,
                 attr,
             },
             fuse_open_out {
@@ -1614,6 +1679,11 @@ impl fs::FileSystem for CurvineFileSystem {
 
     // Read the target of a symbolic link
     async fn readlink(&self, op: Readlink<'_>) -> FuseResult<BytesMut> {
+        // Path-based readlink(2) requires search permission on every directory in
+        // the path prefix (LTP readlink03 EACCES).
+        self.check_traverse_permissions(op.header.nodeid, op.header)
+            .await?;
+
         // Get file status to read the symlink target
         let status = self.state.fs_stat(op.header.nodeid, None).await?;
 
@@ -1830,7 +1900,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
 #[cfg(test)]
 mod tests {
-    use crate::{FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_UID};
+    use crate::{FATTR_ATIME_NOW, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_UID};
     use curvine_common::state::{FileAllocMode, INTERNAL_CTIME_XATTR};
 
     #[test]
@@ -2063,6 +2133,64 @@ mod tests {
             None,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn is_time_only_setattr_detects_utime_flags() {
+        assert!(super::CurvineFileSystem::is_time_only_setattr(
+            FATTR_ATIME_NOW | FATTR_MTIME_NOW
+        ));
+        assert!(super::CurvineFileSystem::is_time_only_setattr(FATTR_MTIME));
+        assert!(!super::CurvineFileSystem::is_time_only_setattr(
+            FATTR_MTIME | FATTR_MODE
+        ));
+    }
+
+    #[test]
+    fn utime_setattr_allows_non_owner_with_write_for_now() {
+        super::CurvineFileSystem::check_utime_setattr_permission(
+            true,
+            FATTR_ATIME_NOW | FATTR_MTIME_NOW,
+            1000,
+            100,
+            0,
+            0,
+            100,
+            0o660,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn utime_setattr_denies_non_owner_explicit_times() {
+        let err = super::CurvineFileSystem::check_utime_setattr_permission(
+            true,
+            FATTR_MTIME,
+            1000,
+            100,
+            0,
+            0,
+            100,
+            0o666,
+        )
+        .unwrap_err();
+        assert_eq!(err.errno(), libc::EPERM);
+    }
+
+    #[test]
+    fn utime_setattr_denies_non_owner_now_without_write() {
+        let err = super::CurvineFileSystem::check_utime_setattr_permission(
+            true,
+            FATTR_ATIME_NOW | FATTR_MTIME_NOW,
+            1000,
+            100,
+            0,
+            0,
+            100,
+            0o555,
+        )
+        .unwrap_err();
+        assert_eq!(err.errno(), libc::EACCES);
     }
 
     /// Pin that `FuseMetrics::ensure_init()` runs before `NodeState::new()` in

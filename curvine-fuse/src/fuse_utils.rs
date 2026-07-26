@@ -541,14 +541,35 @@ impl FuseUtils {
             .build()
     }
 
+    /// Kernel dentry/attribute cache lifetimes for FUSE replies.
+    ///
+    /// When userspace permission checks are enabled, timeouts must be zero so the
+    /// kernel revalidates after parent mode changes (e.g. chmod removing search).
+    /// Otherwise cached LOOKUP/GETATTR can skip path-prefix X_OK and report success
+    /// where POSIX requires EACCES (LTP lstat02/stat03/readlink03).
+    pub fn kernel_cache_timeouts(conf: &FuseConf) -> (u64, u32, u64, u32) {
+        if conf.check_permission {
+            (0, 0, 0, 0)
+        } else {
+            (
+                conf.entry_ttl.as_secs(),
+                conf.entry_ttl.subsec_nanos(),
+                conf.attr_ttl.as_secs(),
+                conf.attr_ttl.subsec_nanos(),
+            )
+        }
+    }
+
     pub fn create_entry_out(conf: &FuseConf, attr: fuse_attr) -> fuse_entry_out {
+        let (entry_valid, entry_valid_nsec, attr_valid, attr_valid_nsec) =
+            Self::kernel_cache_timeouts(conf);
         fuse_entry_out {
             nodeid: attr.ino,
             generation: 0,
-            entry_valid: conf.entry_ttl.as_secs(),
-            attr_valid: conf.attr_ttl.as_secs(),
-            entry_valid_nsec: conf.entry_ttl.subsec_nanos(),
-            attr_valid_nsec: conf.attr_ttl.subsec_nanos(),
+            entry_valid,
+            attr_valid,
+            entry_valid_nsec,
+            attr_valid_nsec,
             attr,
         }
     }
