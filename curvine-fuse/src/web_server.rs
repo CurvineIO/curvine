@@ -48,7 +48,9 @@ impl WebServer {
 async fn metrics_handler(State(_): State<Arc<NodeState>>) -> String {
     let fuse_metrics = FuseMetrics::get();
 
-    // Record scrape duration/size after rendering, so this response shows previous scrape values.
+    // Last-scrape semantics: this response reflects the PREVIOUS scrape, the
+    // current one shows up next time. The order (text_output THEN record_scrape)
+    // is what makes it "last scrape" — do not reorder.
     let start = mono_now();
     let output = Metrics::text_output().unwrap_or_else(|e| format!("Error: {}", e));
     fuse_metrics.record_scrape(start.elapsed().as_micros() as u64, output.len());

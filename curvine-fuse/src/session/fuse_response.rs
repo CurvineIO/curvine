@@ -158,7 +158,11 @@ impl FuseResponse {
             Some(slot) => slot,
         };
 
-        // Reserve first so bounded-channel cancellation cannot silently finish a request.
+        // Reserve first, without touching the slot: a bounded send().await can
+        // suspend on a full channel, and a cancel there would drop the ActiveGuard
+        // (decrementing active_requests) while emitting NO terminal metric. The
+        // reserve is the only suspend point; if cancelled the slot stays unfinished
+        // and the guard is dropped cleanly, no half-finished state.
         if self.sender.is_bounded() {
             let permit = match self.sender.reserve().await {
                 Ok(p) => p,
