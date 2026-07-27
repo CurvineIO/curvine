@@ -138,7 +138,23 @@ impl FsWriterBase {
         )
     }
 
-    pub async fn write(&mut self, mut chunk: DataSlice) -> FsResult<()> {
+    pub async fn write(&mut self, chunk: DataSlice) -> FsResult<()> {
+        self.write_with_more_pending(chunk, false).await
+    }
+
+    /// Write `chunk`, optionally hinting that more application data is already
+    /// queued behind this chunk (e.g. `FsWriterBuffer` drained multiple items).
+    ///
+    /// Prefetch starts when either:
+    /// - this chunk still overflows the current block, or
+    /// - `more_data_pending` is true and the current block is within the
+    ///   prefetch threshold (so alloc/open overlaps the tail write).
+    /// Exact EOF with no queued follow-up data does not prefetch.
+    pub async fn write_with_more_pending(
+        &mut self,
+        mut chunk: DataSlice,
+        more_data_pending: bool,
+    ) -> FsResult<()> {
         if chunk.is_empty() {
             return Ok(());
         }
@@ -149,11 +165,11 @@ impl FsWriterBase {
 
         let mut remaining = chunk.len();
         while remaining > 0 {
-            // Only prefetch when this write still needs bytes beyond the current
-            // block. Speculative prefetch near EOF would allocate an unused
-            // 0-length next block that complete()/flush()/seek() must discard.
             if let Some(cur) = self.cur_writer.as_ref() {
-                if (remaining as i64) > cur.remaining() {
+                let overflows = (remaining as i64) > cur.remaining();
+                let queued_near_end =
+                    more_data_pending && cur.remaining() <= self.prefetch_threshold;
+                if overflows || queued_near_end {
                     self.maybe_start_prefetch();
                 }
             }
@@ -817,5 +833,33 @@ impl FsWriterBase {
         );
 
         Ok(())
+    }
+}
+
+impl Drop for FsWriterBase {
+    fn drop(&mut self) {
+        let Some(handle) = self.next_block_prefetch.take() else {
+            return;
+        };
+
+        // Prefer cancelling an already-finished prefetched writer. Abort alone
+        // would drop a completed BlockWriter without cancel() and leak the
+        // worker write session. In-flight tasks are aborted so they do not
+        // continue allocating after the writer is gone.
+        if handle.is_finished() {
+            let rt = self.fs_context.clone_runtime();
+            rt.spawn(async move {
+                if let Ok(Ok((_lb, mut writer))) = handle.await {
+                    if let Err(e) = writer.cancel().await {
+                        warn!(
+                            "failed to cancel prefetched writer on FsWriterBase drop: {}",
+                            e
+                        );
+                    }
+                }
+            });
+        } else {
+            handle.abort();
+        }
     }
 }

@@ -337,6 +337,10 @@ fn test_remote_random_write_with_replication() -> CommonResult<()> {
 
 /// Sequential append across many small blocks exercises next-block prefetch
 /// (#1291): allocate/open of block N+1 overlaps writing the tail of block N.
+///
+/// `write_chunk_size` must not evenly divide `block_size`, otherwise
+/// `Writer::write` delivers aligned chunks that never overflow a block and
+/// (without queued follow-up) would skip the prefetch gate.
 #[test]
 fn test_sequential_write_across_many_blocks_with_prefetch() -> CommonResult<()> {
     let testing = Testing::default();
@@ -345,9 +349,9 @@ fn test_sequential_write_across_many_blocks_with_prefetch() -> CommonResult<()> 
     conf.client.block_size = 4 * 1024;
     conf.client.block_size_str = "4KB".to_string();
     conf.master.min_block_size = 4 * 1024;
-    conf.client.write_chunk_size = 1024;
-    conf.client.write_chunk_size_str = "1KB".to_string();
-    conf.client.write_chunk_num = 4;
+    conf.client.write_chunk_size = 1500;
+    conf.client.write_chunk_size_str = "1500B".to_string();
+    conf.client.write_chunk_num = 8;
 
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
     let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
@@ -359,14 +363,9 @@ fn test_sequential_write_across_many_blocks_with_prefetch() -> CommonResult<()> 
         let data = BytesMut::from(Utils::rand_str(total).as_bytes());
 
         let mut writer = fs.create(&path, true).await?;
-        // Write in chunk-sized pieces so remaining() crosses the prefetch threshold.
-        let chunk = 1024;
-        let mut off = 0;
-        while off < data.len() {
-            let end = (off + chunk).min(data.len());
-            writer.write(&data[off..end]).await?;
-            off = end;
-        }
+        // One large write queues multiple buffer chunks so prefetch can overlap
+        // the current-block tail (and 1500 does not divide 4096).
+        writer.write(&data).await?;
         writer.complete().await?;
 
         let mut reader = fs.open(&path).await?;
@@ -398,9 +397,9 @@ fn test_exact_block_multiple_complete_has_no_extra_empty_block() -> CommonResult
     conf.client.block_size = 4 * 1024;
     conf.client.block_size_str = "4KB".to_string();
     conf.master.min_block_size = 4 * 1024;
-    conf.client.write_chunk_size = 1024;
-    conf.client.write_chunk_size_str = "1KB".to_string();
-    conf.client.write_chunk_num = 4;
+    conf.client.write_chunk_size = 1500;
+    conf.client.write_chunk_size_str = "1500B".to_string();
+    conf.client.write_chunk_num = 8;
 
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
     let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
@@ -413,13 +412,7 @@ fn test_exact_block_multiple_complete_has_no_extra_empty_block() -> CommonResult
         let data = BytesMut::from(Utils::rand_str(total).as_bytes());
 
         let mut writer = fs.create(&path, true).await?;
-        let chunk = 1024;
-        let mut off = 0;
-        while off < data.len() {
-            let end = (off + chunk).min(data.len());
-            writer.write(&data[off..end]).await?;
-            off = end;
-        }
+        writer.write(&data).await?;
         writer.complete().await?;
 
         let locs = fs.get_block_locations(&path).await?;
@@ -442,6 +435,10 @@ fn test_exact_block_multiple_complete_has_no_extra_empty_block() -> CommonResult
 
 /// Prefetch that is discarded by seek()/flush() must cancel the opened writer
 /// and still allow a consistent complete().
+///
+/// Uses `async_write` with a payload larger than `block_size` so `FsWriterBase`
+/// sees an overflowing slice and actually enters the prefetch path (unlike
+/// aligned `Writer::write` chunks that never overflow a single block).
 #[test]
 fn test_prefetch_discard_on_seek_and_flush() -> CommonResult<()> {
     let testing = Testing::default();
@@ -450,22 +447,23 @@ fn test_prefetch_discard_on_seek_and_flush() -> CommonResult<()> {
     conf.client.block_size = 4 * 1024;
     conf.client.block_size_str = "4KB".to_string();
     conf.master.min_block_size = 4 * 1024;
-    conf.client.write_chunk_size = 1024;
-    conf.client.write_chunk_size_str = "1KB".to_string();
-    conf.client.write_chunk_num = 4;
+    conf.client.write_chunk_size = 1500;
+    conf.client.write_chunk_size_str = "1500B".to_string();
+    conf.client.write_chunk_num = 8;
 
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
     let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
 
     rt.block_on(async move {
+        use orpc::sys::DataSlice;
+
         let block_size = 4 * 1024usize;
-        // One write that overflows the first block so prefetch starts, then seek.
         let path_seek = Path::from_str("/prefetch_discard_seek.data")?;
         let overflow = block_size + block_size / 2;
         let data = BytesMut::from(Utils::rand_str(overflow).as_bytes());
         let mut writer = fs.create(&path_seek, true).await?;
-        writer.write(&data).await?;
-        // Discard in-flight/ready prefetch via seek, then finish cleanly.
+        writer.async_write(DataSlice::Bytes(data.freeze())).await?;
+        // May discard an in-flight next-block prefetch if still pending.
         writer.seek(0).await?;
         writer.complete().await?;
 
@@ -475,10 +473,10 @@ fn test_prefetch_discard_on_seek_and_flush() -> CommonResult<()> {
             "file should retain written blocks after seek-discard"
         );
 
-        // Overflow write then flush (also discards prefetch) then more write + complete.
         let path_flush = Path::from_str("/prefetch_discard_flush.data")?;
+        let data = BytesMut::from(Utils::rand_str(overflow).as_bytes());
         let mut writer = fs.create(&path_flush, true).await?;
-        writer.write(&data).await?;
+        writer.async_write(DataSlice::Bytes(data.freeze())).await?;
         writer.flush().await?;
         let more = BytesMut::from(Utils::rand_str(512).as_bytes());
         writer.write(&more).await?;

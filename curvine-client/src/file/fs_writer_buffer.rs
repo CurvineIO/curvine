@@ -246,17 +246,13 @@ impl FsWriterBuffer {
             match select_task {
                 SelectTask::Control(task) => match task {
                     WriterTask::Flush(cx) => {
-                        while let Some(chunk) = chunk_receiver.try_recv()? {
-                            writer.write(chunk).await?;
-                        }
+                        Self::drain_chunks_with_prefetch(&mut chunk_receiver, &mut writer).await?;
                         writer.flush().await?;
                         cx.send(1)?;
                     }
 
                     WriterTask::Complete((_, tx)) => {
-                        while let Some(chunk) = chunk_receiver.try_recv()? {
-                            writer.write(chunk).await?;
-                        }
+                        Self::drain_chunks_with_prefetch(&mut chunk_receiver, &mut writer).await?;
                         writer.complete().await?;
                         tx.send(1)?;
                         return Ok(());
@@ -273,10 +269,7 @@ impl FsWriterBuffer {
                     }
 
                     WriterTask::Seek((pos, tx)) => {
-                        // Process all buffered data first
-                        while let Some(chunk) = chunk_receiver.try_recv()? {
-                            writer.write(chunk).await?
-                        }
+                        Self::drain_chunks_with_prefetch(&mut chunk_receiver, &mut writer).await?;
 
                         // Execute seek operation
                         writer.seek(pos).await?;
@@ -287,9 +280,7 @@ impl FsWriterBuffer {
                     }
 
                     WriterTask::Resize((opts, tx)) => {
-                        while let Some(chunk) = chunk_receiver.try_recv()? {
-                            writer.write(chunk).await?
-                        }
+                        Self::drain_chunks_with_prefetch(&mut chunk_receiver, &mut writer).await?;
 
                         writer.resize(opts).await?;
 
@@ -300,10 +291,41 @@ impl FsWriterBuffer {
                 },
 
                 SelectTask::Data(chunk) => {
-                    writer.write(chunk).await?;
+                    // Drain any already-queued chunks so we can tell FsWriterBase
+                    // whether more data is pending — required for prefetch overlap
+                    // when write_chunk_size evenly divides block_size.
+                    let mut batch = vec![chunk];
+                    while let Some(next) = chunk_receiver.try_recv()? {
+                        batch.push(next);
+                        if batch.len() >= 32 {
+                            break;
+                        }
+                    }
+                    let last = batch.len() - 1;
+                    for (i, c) in batch.into_iter().enumerate() {
+                        writer.write_with_more_pending(c, i < last).await?;
+                    }
                 }
             }
         }
+    }
+
+    async fn drain_chunks_with_prefetch(
+        chunk_receiver: &mut AsyncReceiver<DataSlice>,
+        writer: &mut FsWriterBase,
+    ) -> FsResult<()> {
+        let mut batch = Vec::new();
+        while let Some(chunk) = chunk_receiver.try_recv()? {
+            batch.push(chunk);
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let last = batch.len() - 1;
+        for (i, c) in batch.into_iter().enumerate() {
+            writer.write_with_more_pending(c, i < last).await?;
+        }
+        Ok(())
     }
 }
 
