@@ -444,6 +444,54 @@ impl MasterHandler {
         fs.master_info()
     }
 
+    pub fn get_cv_metadata_snapshot_page(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let req: GetCvMetadataSnapshotPageRequest = ctx.parse_header()?;
+        ctx.set_audit(Some("cv-metadata-snapshot".to_string()), None);
+        let page = self
+            .fs
+            .cv_metadata_snapshot_page(req.page_token, req.page_size.unwrap_or(10_000) as usize)?;
+        ctx.response(GetCvMetadataSnapshotPageResponse {
+            entries: page
+                .entries
+                .into_iter()
+                .map(|entry| CvMetadataSnapshotEntryProto {
+                    status: ProtoUtils::file_status_to_pb(entry.status),
+                    blocks: entry.blocks.map(ProtoUtils::file_blocks_to_pb),
+                })
+                .collect(),
+            next_page_token: page.next_page_token,
+            epoch: page.epoch,
+        })
+    }
+
+    pub fn get_cv_metadata_delta_page(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let req: GetCvMetadataDeltaPageRequest = ctx.parse_header()?;
+        ctx.set_audit(Some("cv-metadata-delta".to_string()), None);
+        let page = self.fs.cv_metadata_delta_page(
+            req.from_epoch,
+            req.target_epoch,
+            req.page_token,
+            req.page_size.unwrap_or(10_000) as usize,
+        )?;
+        ctx.response(GetCvMetadataDeltaPageResponse {
+            entries: page
+                .entries
+                .into_iter()
+                .map(|entry| CvMetadataDeltaEntryProto {
+                    path: entry.path,
+                    entry: entry.entry.map(|entry| CvMetadataSnapshotEntryProto {
+                        status: ProtoUtils::file_status_to_pb(entry.status),
+                        blocks: entry.blocks.map(ProtoUtils::file_blocks_to_pb),
+                    }),
+                })
+                .collect(),
+            next_page_token: page.next_page_token,
+            from_epoch: page.from_epoch,
+            to_epoch: page.to_epoch,
+            full_snapshot_required: page.full_snapshot_required,
+        })
+    }
+
     pub fn worker_heartbeat(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: WorkerHeartbeatRequest = ctx.parse_header()?;
         let cmds = Self::process_worker_heartbeat(self.fs.clone(), header)?;
@@ -801,6 +849,8 @@ impl MessageHandler for MasterHandler {
             RpcCode::WorkerHeartbeat => self.worker_heartbeat(ctx),
             RpcCode::WorkerBlockReport => self.block_report(ctx),
             RpcCode::GetMasterInfo => self.get_master_info(ctx),
+            RpcCode::GetCvMetadataSnapshotPage => self.get_cv_metadata_snapshot_page(ctx),
+            RpcCode::GetCvMetadataDeltaPage => self.get_cv_metadata_delta_page(ctx),
 
             RpcCode::ReportBlockReplicationResult => {
                 if let Some(ref replication_service) = self.replication_handler {
