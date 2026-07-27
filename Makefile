@@ -1,4 +1,4 @@
-.PHONY: help check-env format format-csi build cargo docker-build docker-build-compile docker-compile docker-build-spdk-target docker-compose-spdk docker-compose-spdk-down all dist dist-only
+.PHONY: help check-env check-api-crate-deps format format-csi build cargo docker-build docker-build-compile docker-compile docker-build-spdk-target docker-compose-spdk docker-compose-spdk-down all dist dist-only
 
 # Default target when running 'make' without arguments
 .DEFAULT_GOAL := help
@@ -20,6 +20,7 @@ help:
 	@echo ""
 	@echo "Environment:"
 	@echo "  make check-env                   - Check build environment dependencies"
+	@echo "  make check-api-crate-deps        - Enforce lightweight API/domain crate dependency boundaries"
 	@echo ""
 	@echo "Building:"
 	@echo "  make build ARGS='<args>'         - Build with specific arguments passed to build.sh"
@@ -76,6 +77,10 @@ help:
 # 1. Check build environment dependencies
 check-env:
 	$(SHELL_CMD) build/check-env.sh $(filter --skip-java-sdk --skip-python-sdk,$(ARGS))
+
+# 1.1. Enforce lightweight API/domain crate dependency boundaries
+check-api-crate-deps:
+	$(SHELL_CMD) scripts/check-api-crate-deps.sh
 
 # 2. Format the project
 format:

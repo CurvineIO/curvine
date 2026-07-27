@@ -20,3 +20,6 @@ chrono = { workspace = true }
 
 [features]
 default = []
+
+[dev-dependencies]
+curvine-fs-api = { workspace = true }

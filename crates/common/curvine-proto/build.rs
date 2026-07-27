@@ -12,23 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::path::PathBuf;
 use std::{env, fs};
 
 fn main() {
+    // Keep a single source of truth for non-raft protos under curvine-common/proto
+    // so Rust, Java, and Python SDK generation stay in sync.
+    let proto_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../curvine-common/proto");
     let proto_files = [
-        "proto/common.proto",
-        "proto/master.proto",
-        "proto/worker.proto",
-        "proto/job.proto",
-        "proto/mount.proto",
-        "proto/replication.proto",
-    ];
-
-    for path in &proto_files {
-        println!("cargo:rerun-if-changed={path}");
-    }
-
-    let src = [
         "common.proto",
         "master.proto",
         "worker.proto",
@@ -36,6 +27,10 @@ fn main() {
         "mount.proto",
         "replication.proto",
     ];
+
+    for name in &proto_files {
+        println!("cargo:rerun-if-changed={}", proto_dir.join(name).display());
+    }
 
     let base = env::var("OUT_DIR").unwrap_or_else(|_| ".".to_string());
     let output = format!("{}/protos", base);
@@ -45,6 +40,6 @@ fn main() {
     build.type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]");
     build
         .out_dir(&output)
-        .compile_protos(&src, &["proto/"])
+        .compile_protos(&proto_files, &[proto_dir])
         .unwrap();
 }

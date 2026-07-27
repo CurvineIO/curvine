@@ -73,6 +73,11 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           scripts/check-deps.sh --mode report
+
+      - name: API crate dependency boundary check
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          make check-api-crate-deps
         
       - name: Run clippy
         env:

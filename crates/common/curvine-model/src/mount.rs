@@ -519,106 +519,35 @@ impl TryFrom<&str> for WriteType {
 mod tests {
     use crate::state::{AccessMode, MountInfo, MountOptions, WriteType};
     use crate::CurvinePath;
+    use curvine_fs_api::Path;
+    use std::fmt;
 
+    /// Thin test adapter over the real `Path` parser so mount tests track
+    /// production normalization without duplicating path logic here.
     #[derive(Clone)]
-    struct TestPath {
-        full_path: String,
-        path: String,
-        cv: bool,
-    }
-
-    fn normalize_path(path: &str) -> String {
-        let mut normalized = String::with_capacity(path.len());
-        let mut prev_slash = false;
-
-        for ch in path.chars() {
-            if ch == '/' {
-                if !prev_slash {
-                    normalized.push(ch);
-                    prev_slash = true;
-                }
-            } else {
-                normalized.push(ch);
-                prev_slash = false;
-            }
-        }
-
-        if normalized.len() > 1 && normalized.ends_with('/') {
-            normalized.pop();
-        }
-
-        normalized
-    }
+    struct TestPath(Path);
 
     impl CurvinePath for TestPath {
         fn is_cv(&self) -> bool {
-            self.cv
+            self.0.is_cv()
         }
 
         fn path(&self) -> &str {
-            &self.path
+            self.0.path()
         }
 
         fn full_path(&self) -> &str {
-            &self.full_path
+            self.0.full_path()
         }
 
         fn from_str(path: impl AsRef<str>) -> orpc::CommonResult<Self> {
-            let input = path.as_ref();
-            let cv = !input.contains("://") || input.starts_with("cv://");
-
-            if let Some(scheme_end) = input.find("://") {
-                let scheme = &input[..scheme_end];
-                let after_scheme = &input[scheme_end + 3..];
-                let (authority, path) = if scheme == "file" {
-                    ("", normalize_path(after_scheme))
-                } else if let Some(path_start) = after_scheme.find('/') {
-                    (
-                        &after_scheme[..path_start],
-                        normalize_path(&after_scheme[path_start..]),
-                    )
-                } else {
-                    (after_scheme, "/".to_string())
-                };
-                let full_path = format!("{}://{}{}", scheme, authority, path);
-                let path = if cv {
-                    normalize_path(
-                        full_path
-                            .strip_prefix("cv://curvine-pro")
-                            .unwrap_or(&full_path),
-                    )
-                } else {
-                    path
-                };
-
-                return Ok(Self {
-                    full_path,
-                    path,
-                    cv,
-                });
-            }
-
-            let full_path = normalize_path(input);
-            let path = if cv {
-                full_path
-                    .strip_prefix("cv://curvine-pro")
-                    .unwrap_or(&full_path)
-                    .to_string()
-            } else {
-                full_path.clone()
-            };
-
-            Ok(Self {
-                full_path,
-                path,
-                cv,
-            })
+            Path::from_str(path).map(Self)
         }
     }
 
-    impl std::fmt::Display for TestPath {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str(&self.full_path)
+    impl fmt::Display for TestPath {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            fmt::Display::fmt(&self.0, f)
         }
     }
 
