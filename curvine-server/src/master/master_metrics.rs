@@ -28,6 +28,7 @@ use std::fmt::{Debug, Formatter};
 pub struct MasterMetrics {
     pub(crate) rpc_request_total_count: Counter,
     pub(crate) rpc_request_total_time: Counter,
+    pub(crate) active_connections: Gauge,
 
     pub(crate) capacity: Gauge,
     pub(crate) available: Gauge,
@@ -89,6 +90,10 @@ impl MasterMetrics {
             rpc_request_total_time: m::new_counter(
                 "rpc_request_time",
                 "Rpc request time duration(ms)",
+            )?,
+            active_connections: m::new_gauge(
+                "master_active_connections",
+                "Number of active RPC connections to master",
             )?,
 
             capacity: m::new_gauge("capacity", "Total storage capacity")?,
