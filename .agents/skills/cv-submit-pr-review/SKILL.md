@@ -26,6 +26,7 @@ Focus **exclusively on code content**:
 |Correctness|Logic errors, edge cases, off-by-one, None/null handling, error propagation|
 |Safety|Concurrency races, panics / unwrap in hot paths, unsafe blocks, resource leaks, lock ordering|
 |Design|Naming, module boundaries, abstractions, consistency with existing patterns|
+|Comments|Header doc-comments on a method, function, or class that exceed **3 lines**; excessive inline comments that merely restate code instead of explaining intent. Flag any single-item header comment block longer than 3 lines as a `suggestion`-level finding and ask the author to trim it (move detail into the body or remove redundant lines).|
 
 **Ignore:** commit message quality, PR description wording, pure formatting nits (run `make format` separately).
 
