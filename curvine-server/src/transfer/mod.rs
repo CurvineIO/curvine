@@ -12,14 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod common;
-pub mod master;
-pub mod test;
-pub mod transfer;
-pub mod worker;
+mod store;
+pub use self::store::*;
 
-#[cfg(feature = "fault-injection")]
-pub(crate) use curvine_fault::fault_point;
+mod memory_store;
+pub use self::memory_store::MemoryTransferStore;
 
-#[cfg(not(feature = "fault-injection"))]
-pub(crate) use curvine_fault::__noop_fault_point as fault_point;
+mod sqlite_store;
+pub use self::sqlite_store::SqliteTransferStore;

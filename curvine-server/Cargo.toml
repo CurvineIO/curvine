@@ -51,6 +51,7 @@ url = { workspace = true }
 parking_lot = { workspace = true }
 lru = { workspace = true }
 byteorder = { workspace = true }
+rusqlite = { workspace = true }
 
 [dev-dependencies]
 curvine-fault = { workspace = true, features = ["http-client"] }
