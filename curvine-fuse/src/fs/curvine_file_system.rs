@@ -1527,6 +1527,10 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn rm_dir(&self, op: RmDir<'_>) -> FuseResult<()> {
         let name = try_option!(op.name.to_str());
+        // Linux VFS may_delete / vfs_rmdir require MAY_WRITE|MAY_EXEC on the parent
+        // (same class as unlink: unwritable 0555 and unsearchable 0666 parents must EACCES).
+        self.check_permissions(op.header, (libc::W_OK | libc::X_OK) as u32)
+            .await?;
         let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
         self.ensure_writable_path(&path, RpcCode::Delete).await?;
 
@@ -1837,8 +1841,11 @@ mod tests {
     }
 
     #[test]
-    fn unlink_parent_may_delete_requires_write_and_search() {
+    fn may_delete_permission_mask_requires_write_and_search() {
         use super::CurvineFileSystem;
+
+        // Bit-mask helper used by unlink/rm_dir may_delete checks (W_OK|X_OK).
+        // Full FUSE unlink/rmdir path EACCES coverage remains an LTP/integration concern.
 
         // other class of 0555 (r-x): searchable but not writable
         let unwritable_other = 0o5;
