@@ -1520,10 +1520,17 @@ impl fs::FileSystem for CurvineFileSystem {
                 .invalid_cache(op.header.nodeid, None, INVAL_REASON_FLUSH);
         }
 
-        if op.arg.lock_owner != 0 {
-            self.fs_unlock_owner(&handle, LockFlags::Plock, op.arg.lock_owner)
-                .await?;
-            handle.take_plock_if_owner(op.arg.lock_owner);
+        // Only unlock when this handle held a plock for lock_owner. Linux fills
+        // lock_owner on almost every FUSE_FLUSH/close; unconditional unlock
+        // caused a Master SetLock+journal storm for Spark local-dirs (#1227).
+        if op.arg.lock_owner != 0 && handle.take_plock_if_owner(op.arg.lock_owner).is_some() {
+            if let Err(e) = self
+                .fs_unlock_owner(&handle, LockFlags::Plock, op.arg.lock_owner)
+                .await
+            {
+                handle.add_lock(LockFlags::Plock, op.arg.lock_owner);
+                return Err(e);
+            }
         }
         handle.flush(Some(reply)).await
     }
