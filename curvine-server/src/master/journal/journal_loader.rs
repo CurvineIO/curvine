@@ -792,7 +792,7 @@ impl JournalLoader {
 
         if let Some(mut inode_ptr) = old_path.get_last_inode() {
             if let File(_) = inode_ptr.as_mut() {
-                inode_ptr.incr_nlink();
+                inode_ptr.incr_nlink(entry.mtime);
             }
         }
 

@@ -119,20 +119,20 @@ message WriteCommitRequest {
     required bool cancel = 4;
 }
 
-message WriteBlocksBatchRequest {  
-    repeated BlockWriteRequest requests = 1;  
-}  
-  
-message WriteBlocksBatchResponse {  
-    repeated BlockWriteResponse responses = 1;  
-}  
-  
-message WriteCommitsBatchRequest {  
-    repeated WriteCommitRequest requests = 1;  
-}  
-  
-message WriteCommitsBatchResponse {  
-    repeated bool results = 1;  
+message WriteBlocksBatchRequest {
+    repeated BlockWriteRequest requests = 1;
+}
+
+message WriteBlocksBatchResponse {
+    repeated BlockWriteResponse responses = 1;
+}
+
+message WriteCommitsBatchRequest {
+    repeated WriteCommitRequest requests = 1;
+}
+
+message WriteCommitsBatchResponse {
+    repeated bool results = 1;
 }
 
 message BlocksBatchWriteRequest {

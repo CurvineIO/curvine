@@ -104,11 +104,15 @@ run_specific_test_and_summary() {
     local safe_tf="${test_file//::/_}"
     local safe_tc="${test_case//::/_}"
     local log_file="$TEST_DIR/logs/$package/${safe_tf}_${safe_tc}.log"
+    local cargo_feature_args=()
+    if [ "$package" = "curvine-server" ]; then
+        cargo_feature_args=(--features fault-injection)
+    fi
     cd "$PROJECT_ROOT"
     if [ "$test_file" = "lib" ]; then
-        cargo test --package "$package" --lib -- "$test_case" --exact --nocapture > "$log_file" 2>&1
+        cargo test --package "$package" "${cargo_feature_args[@]}" --lib -- "$test_case" --exact --nocapture > "$log_file" 2>&1
     else
-        cargo test --package "$package" --test "$test_file" -- "$test_case" --exact --nocapture > "$log_file" 2>&1
+        cargo test --package "$package" "${cargo_feature_args[@]}" --test "$test_file" -- "$test_case" --exact --nocapture > "$log_file" 2>&1
     fi
     local exit_code=$?
     set -e
@@ -150,7 +154,17 @@ run_tests_nextest() {
     local nextest_log="$TEST_DIR/nextest_run.log"
     local nextest_profile_dir="default"
     # Include skipped count in final summary (default is fail-only, so "N skipped" is hidden)
-    local nextest_args=(--config-file "$SCRIPT_DIR/nextest.toml" --no-fail-fast --workspace --final-status-level=skip)
+    # Include Curvine Server fault-injection tests in the regular Rust test
+    # discovery. Runtime fault endpoints remain disabled unless an individual
+    # test explicitly enables them in its ClusterConf.
+    local nextest_feature_args=(--features curvine-server/fault-injection)
+    local nextest_args=(
+        --config-file "$SCRIPT_DIR/nextest.toml"
+        --no-fail-fast
+        --workspace
+        --final-status-level=skip
+        "${nextest_feature_args[@]}"
+    )
     if [ -n "${NEXTEST_PROFILE}" ]; then
         nextest_profile_dir="${NEXTEST_PROFILE}"
         nextest_args+=(--profile "$NEXTEST_PROFILE")
@@ -184,8 +198,8 @@ run_tests_nextest() {
     rm -f "$skipped_list_file"
     if [ "$nextest_profile_dir" != "default" ]; then
         comm -23 \
-            <(cd "$PROJECT_ROOT" && cargo nextest list --config-file "$SCRIPT_DIR/nextest.toml" --profile default 2>/dev/null | sort) \
-            <(cd "$PROJECT_ROOT" && cargo nextest list --config-file "$SCRIPT_DIR/nextest.toml" --profile "$nextest_profile_dir" 2>/dev/null | sort) \
+            <(cd "$PROJECT_ROOT" && cargo nextest list --config-file "$SCRIPT_DIR/nextest.toml" --workspace --profile default "${nextest_feature_args[@]}" 2>/dev/null | sort) \
+            <(cd "$PROJECT_ROOT" && cargo nextest list --config-file "$SCRIPT_DIR/nextest.toml" --workspace --profile "$nextest_profile_dir" "${nextest_feature_args[@]}" 2>/dev/null | sort) \
             > "$skipped_list_file"
         skipped_count=$(wc -l < "$skipped_list_file")
         [ "$skipped_count" -lt 0 ] && skipped_count=0
@@ -316,4 +330,3 @@ main() {
 }
 
 main "$@"
-

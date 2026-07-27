@@ -17,7 +17,7 @@ use crate::master::meta::inode::inodes_children::InodeChildren;
 use crate::master::meta::inode::{
     ChildrenIter, Inode, InodeFile, InodePtr, InodeView, EMPTY_PARENT_ID,
 };
-use curvine_common::state::{ListOptions, MkdirOpts, StoragePolicy};
+use curvine_common::state::{ListOptions, MkdirOpts, StoragePolicy, INTERNAL_CTIME_XATTR};
 use glob::Pattern;
 use orpc::CommonResult;
 use serde::{Deserialize, Serialize};
@@ -95,7 +95,17 @@ impl InodeDir {
 
     pub fn update_mtime(&mut self, time: i64) {
         if time > self.mtime {
-            self.mtime = time
+            self.mtime = time;
+            self.update_ctime(time);
+        }
+    }
+
+    pub fn update_ctime(&mut self, time: i64) {
+        if time > self.ctime() {
+            self.features.x_attr.insert(
+                INTERNAL_CTIME_XATTR.to_string(),
+                time.to_le_bytes().to_vec(),
+            );
         }
     }
 
@@ -159,6 +169,15 @@ impl Inode for InodeDir {
 
     fn atime(&self) -> i64 {
         self.atime
+    }
+
+    fn ctime(&self) -> i64 {
+        self.features
+            .x_attr
+            .get(INTERNAL_CTIME_XATTR)
+            .and_then(|bytes| bytes.as_slice().try_into().ok())
+            .map(i64::from_le_bytes)
+            .unwrap_or(self.mtime)
     }
 }
 

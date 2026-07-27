@@ -26,15 +26,9 @@ pub struct FuseError {
 }
 
 impl FuseError {
-    // crate-private: the public safe constructor is `from_errno_msg`, which
-    // normalizes the errno. Keeping `new` internal prevents external/future code
-    // from bypassing normalization and building an illegal (non-positive) errno.
+    // Keep raw construction crate-private; public construction normalizes errno.
     pub(crate) fn new(errno: i32, error: CommonError) -> Self {
-        // Internal invariant: FuseError always holds a positive POSIX errno.
-        // `ResponseData::create` negates it (`-error`) when encoding the reply, so
-        // a negative/zero errno here would produce an illegal FUSE reply frame.
-        // Surfaced loudly in debug; release callers should route arbitrary integers
-        // through `err_fuse!` / `from_errno_msg`, which normalize the value.
+        // FuseError always stores a positive errno; replies encode it as `-error`.
         debug_assert!(
             errno > 0,
             "FuseError errno must be a positive POSIX errno, got {}",
@@ -43,31 +37,17 @@ impl FuseError {
         Self { errno, error }
     }
 
-    /// Build a `FuseError` from an arbitrary integer errno, normalizing it to a
-    /// positive POSIX errno via [`normalize_errno`]. This is the construction
-    /// path used by `err_fuse!`; it also lets callers that need a `FuseError`
-    /// value (not a `Result`) build one directly — e.g. before passing it to
-    /// `send_rep_tagged` — without the `let _: FuseResult<_> = err_fuse!(...)`
-    /// detour.
+    /// Build a `FuseError` from any errno-like value after normalizing it.
     pub fn from_errno_msg<E: TryInto<i32>>(errno: E, error: CommonError) -> Self {
         Self::new(normalize_errno(errno), error)
     }
 
-    /// The POSIX errno this error maps to. Used by the metrics finish path to
-    /// stash the errno label source.
     pub(crate) fn errno(&self) -> i32 {
         self.errno
     }
 }
 
-/// Normalize an arbitrary integer errno into a positive POSIX errno.
-///
-/// Uses `TryInto<i32>` for a genuine range check (no `as` truncation/wrapping):
-/// a value that does not fit in `i32`, or is non-positive, falls back to `EIO`.
-/// This keeps `FuseError`'s "positive errno" invariant and prevents an illegal
-/// FUSE reply frame (the reply path negates the errno). Release-safe — never
-/// panics — but a non-positive / out-of-range input trips a `debug_assert` so a
-/// caller bug is surfaced in debug/test builds rather than silently coerced.
+/// Normalize arbitrary errno input into a positive POSIX errno, falling back to `EIO`.
 pub(crate) fn normalize_errno<E: TryInto<i32>>(errno: E) -> i32 {
     match errno.try_into() {
         Ok(e) if e > 0 => e,
@@ -120,13 +100,8 @@ impl From<FsError> for FuseError {
     }
 }
 
-/// The POSIX errno an `FsError` maps to, computed by borrowing the error rather
-/// than consuming it. `From<FsError>` delegates here; callers that must consume
-/// the error elsewhere (e.g. send it back to a waiter on a channel) while still
-/// building an errno-only kernel reply can borrow the errno without cloning the
-/// non-`Clone` `FsError`.
+/// The POSIX errno an `FsError` maps to, computed without consuming it.
 pub(crate) fn errno_of(value: &FsError) -> i32 {
-    // Map well-known FsError kinds directly to POSIX errno
     let mapped = match value {
         FsError::FileAlreadyExists(_) => Some(libc::EEXIST),
         FsError::FileNotFound(_) => Some(libc::ENOENT),
@@ -159,7 +134,6 @@ pub(crate) fn errno_of(value: &FsError) -> i32 {
         return libc::ENOSYS;
     }
 
-    // Default to EIO
     libc::EIO
 }
 
@@ -177,16 +151,6 @@ impl From<std::io::Error> for FuseError {
     }
 }
 
-/// Maps an errno integer to a stable, low-cardinality symbolic `&'static str`
-/// label, suitable for the `errno` label on error metrics. Zero-allocation: the
-/// metrics hot path must never format the raw integer or a libc-locale string.
-///
-/// The table is the closed set of errnos actually produced in the FUSE layer
-/// (verified against `libc::E*` usage across `curvine-fuse/src/` plus the
-/// `FsError -> errno` mapping above). Any errno outside the table collapses to
-/// `"OTHER"`; if a new errno starts being produced, add it here and to the
-/// design doc's label table together.
-// Enabling primitive: defined here, wired to call sites separately.
 #[allow(dead_code)]
 pub(crate) fn errno_label(errno: i32) -> &'static str {
     match errno {
@@ -219,17 +183,13 @@ pub(crate) fn errno_label(errno: i32) -> &'static str {
     }
 }
 
-/// Low-cardinality lowercase label for a splice/receive errno, used by
-/// `receive_errors_total{errno}`. Deliberately separate from [`errno_label`]:
-/// receive errors occur before a request is decoded and the design fixes this
-/// to the small lowercase set the receiver loop actually matches on, rather
-/// than the full uppercase POSIX table.
 pub(crate) fn splice_errno_label(errno: i32) -> &'static str {
     match errno {
         libc::ENOENT => "enoent",
         libc::EINTR => "eintr",
         libc::EAGAIN => "eagain",
         libc::ENODEV => "enodev",
+        libc::ECONNABORTED => "econnaborted",
         _ => "other",
     }
 }
@@ -282,8 +242,6 @@ mod tests {
 
     #[test]
     fn errno_label_maps_the_closed_set() {
-        // Full (errno, expected-label) table. Any accidental relabeling must
-        // update this table and the design doc's errno Label rules together.
         let table = [
             (libc::ENOENT, "ENOENT"),
             (libc::EIO, "EIO"),
@@ -331,6 +289,7 @@ mod tests {
         assert_eq!(splice_errno_label(libc::EINTR), "eintr");
         assert_eq!(splice_errno_label(libc::EAGAIN), "eagain");
         assert_eq!(splice_errno_label(libc::ENODEV), "enodev");
+        assert_eq!(splice_errno_label(libc::ECONNABORTED), "econnaborted");
         // Anything else (incl. 0 / unknown) collapses to lowercase "other".
         assert_eq!(splice_errno_label(libc::EIO), "other");
         assert_eq!(splice_errno_label(0), "other");

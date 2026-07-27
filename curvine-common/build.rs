@@ -17,16 +17,10 @@ use std::process::Command;
 use std::{env, fs, str};
 
 fn main() {
-    let proto_files = [
-        "proto/common.proto",
-        "proto/master.proto",
-        "proto/worker.proto",
-        "proto/job.proto",
-        "proto/mount.proto",
-        "proto/replication.proto",
-        "proto/raft.proto",
-        "proto/eraftpb.proto",
-    ];
+    // Non-raft protos are owned by curvine-proto (compiled from this same
+    // curvine-common/proto directory for Java/Python SDK compatibility).
+    // curvine-common only generates raft bindings plus VERSION metadata.
+    let proto_files = ["proto/raft.proto", "proto/eraftpb.proto"];
 
     // Emitting any rerun-if-changed disables Cargo's default "watch whole package"
     // heuristic, so proto inputs must be listed explicitly alongside Git paths.
@@ -35,26 +29,9 @@ fn main() {
     }
     emit_git_rerun_if_changed();
 
-    let src = vec![
-        "common.proto",
-        "master.proto",
-        "worker.proto",
-        "job.proto",
-        "mount.proto",
-        "replication.proto",
-    ];
-
     let base = env::var("OUT_DIR").unwrap_or_else(|_| ".".to_string());
     let output = format!("{}/protos", base);
     fs::create_dir_all(&output).unwrap();
-
-    let mut build = prost_build::Config::new();
-    build.type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]");
-
-    build
-        .out_dir(&output)
-        .compile_protos(&src, &["proto/"])
-        .unwrap();
 
     let src = vec!["raft.proto"];
     let mut build = prost_build::Config::new();

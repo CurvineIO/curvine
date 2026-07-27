@@ -28,13 +28,10 @@ use orpc::sys::pipe::{AsyncFd, Pipe2, PipeFd};
 use orpc::{err_box, sys, try_option_ref};
 use std::sync::Arc;
 
-/// Responses smaller than this threshold use writev (1 syscall) instead of
-/// vmsplice + splice (2 syscalls).  The zero-copy benefit of splice only
-/// outweighs the extra syscall for larger payloads.
+/// Small responses use writev; splice only pays off for larger payloads.
 const SPLICE_THRESHOLD: usize = 8192;
 
-/// FuseSender
-/// Reads data from queue and writes to fuse fd.
+/// FuseSender reads data from queue and writes to fuse fd.
 /// 1. For metadata requests, write response directly
 /// 2. For read/write data requests, process then write response
 pub struct FuseSender<T> {
@@ -44,10 +41,6 @@ pub struct FuseSender<T> {
     receiver: AsyncReceiver<FuseTask>,
     pipe2: Option<Pipe2>,
     debug: bool,
-    /// Per-sender `sender_last_progress_unixtime` child gauge, fetched once at
-    /// construction (no per-reply label lookup). `None` when metrics are
-    /// disabled. Set after every successful reply write; a growing scrape-side
-    /// age on one sender localizes a stalled reply sender (issue #1215).
     progress: Option<Gauge>,
 }
 
@@ -72,10 +65,6 @@ impl<T: FileSystem> FuseSender<T> {
         };
         let progress = if metrics_enabled {
             let g = FuseMetrics::get().sender_progress_gauge(mnt, idx);
-            // Seed the cold series with construction time, not the default 0, so a
-            // scrape-side `time() - <metric>` is ~0 for a freshly built / idle
-            // sender instead of a huge age that would false-page at startup (#1215
-            // review). The real signal is a series whose value stops advancing.
             FuseMetrics::record_sender_progress(&g);
             Some(g)
         } else {
@@ -101,12 +90,6 @@ impl<T: FileSystem> FuseSender<T> {
     pub async fn start(mut self) -> FuseResult<()> {
         while let Some(task) = self.receiver.recv().await {
             match task {
-                // A replied request with metrics context. This is the E2E finish
-                // point: after the kernel-fd write, the request metrics are
-                // recorded and the `active` guard is dropped (releasing the
-                // in-flight count). The match arm only does the splice + a single
-                // helper call; all `with_label_values` lives in the helper so it
-                // is unit-testable without a kernel fd.
                 FuseTask::RequestReply {
                     data,
                     labels,
@@ -116,10 +99,6 @@ impl<T: FileSystem> FuseSender<T> {
                     unsupported_reason,
                     queue_guard,
                 } => {
-                    // reply_queue_depth dec at the DEQUEUE point: the task has left
-                    // the channel, so the subsequent splice() is NOT counted as
-                    // queue backlog. (The E2E `active` guard, dropped after the
-                    // write below, is a separate gauge.)
                     mark_dequeued(queue_guard);
                     let id = data.header.unique;
                     let response_bytes = data.len();
@@ -127,15 +106,12 @@ impl<T: FileSystem> FuseSender<T> {
                     let write_start = mono_now();
                     let send_result = self.send(data).await;
                     let write_us = write_start.elapsed().as_micros() as u64;
-                    // Taken AFTER the send so the E2E duration includes the write
-                    // (even a failed splice).
                     let total_us = labels.elapsed_us();
 
                     let write = match &send_result {
                         Ok(()) => WriteOutcome::Success,
                         Err(e) => {
                             let os_errno = e.raw_error().raw_os_error();
-                            // Keep the existing diagnostic log alongside the metric.
                             if os_errno != Some(libc::ENOENT) {
                                 warn!("error send unique {}: {}", id, e);
                             }
@@ -143,11 +119,7 @@ impl<T: FileSystem> FuseSender<T> {
                         }
                     };
 
-                    // `status` from the task is the FS-operation result
-                    // (`op_status`). The kernel-observed `request_status` is the
-                    // same, except a delivery (kernel-fd write) failure makes it
-                    // Error even when the op succeeded — see the design's
-                    // "operation vs request status".
+                    // Delivery failure turns request_status into Error without changing op_status.
                     let op_status = status;
                     let request_status = match write {
                         WriteOutcome::Success => op_status,
@@ -167,14 +139,11 @@ impl<T: FileSystem> FuseSender<T> {
                         total_us,
                     );
 
-                    // Finish point: drop the in-flight guard after the write.
                     drop(active);
 
-                    // Observability (#1215): record sender liveness on a
-                    // successful delivery. A stalled sender stops advancing this
-                    // timestamp while siblings keep refreshing, localizing the
-                    // stall at scrape time. Not recorded on a failed write (the
-                    // sender is still alive; the failure has its own metric).
+                    // Record sender liveness on a successful delivery. A stalled sender
+                    // stops advancing this timestamp while siblings keep refreshing,
+                    // localizing the stall at scrape time.
                     if matches!(write, WriteOutcome::Success) {
                         if let Some(g) = &self.progress {
                             FuseMetrics::record_sender_progress(g);
@@ -182,10 +151,6 @@ impl<T: FileSystem> FuseSender<T> {
                     }
                 }
 
-                // A kernel notification: same splice, no request guard/finish.
-                // Records notify_total at its two sender-side points: success
-                // after the write, write_failed on splice error (enqueue_failed
-                // is recorded earlier in send_notify).
                 FuseTask::NotifyReply {
                     data,
                     code,
@@ -198,7 +163,7 @@ impl<T: FileSystem> FuseSender<T> {
                     match self.send(data).await {
                         Ok(()) => {
                             metrics.record_notify_result(code, NOTIFY_SUCCESS);
-                            // Same liveness signal as the request path (#1215).
+                            // Same liveness signal as the request path.
                             if let Some(g) = &self.progress {
                                 FuseMetrics::record_sender_progress(g);
                             }
@@ -212,7 +177,6 @@ impl<T: FileSystem> FuseSender<T> {
                     }
                 }
 
-                // Legacy fast path (metrics disabled): byte-identical to before.
                 FuseTask::Reply(reply) => {
                     let id = reply.header.unique;
                     if let Err(e) = self.send(reply).await {
@@ -226,9 +190,6 @@ impl<T: FileSystem> FuseSender<T> {
         Ok(())
     }
 
-    // Send response data to fuse.
-    // Small responses use writev (1 syscall); large responses use splice
-    // (vmsplice + splice, 2 syscalls but zero-copy).
     pub async fn send(&mut self, rep: ResponseData) -> IOResult<()> {
         if self.debug {
             info!("reply {:?}", rep.header);
@@ -242,16 +203,13 @@ impl<T: FileSystem> FuseSender<T> {
         }
     }
 
-    // Non-splice reply path. This uses AsyncFd::async_write (edge-triggered
-    // WRITABLE), which is the same readiness model that hangs the splice path in
-    // #1215 — but writev to /dev/fuse does not hit that trap. A FUSE reply write
-    // is matched to a pending kernel request and copied out; the fuse device has
-    // no send-buffer watermark, so a well-formed reply does not return EAGAIN the
-    // way the SPLICE_F_NONBLOCK pipe->device transfer does. It fails with a real
-    // errno (e.g. ENOENT for an unknown request) instead, which propagates here.
-    // This is why enable_splice=false is a sound workaround for #1215, not just an
-    // empirical one, and why the splice_retry helper is intentionally NOT applied
-    // to writev.
+    // Non-splice reply path. Uses AsyncFd::async_write (edge-triggered WRITABLE),
+    // the same readiness model that hangs the splice path — but writev to /dev/fuse
+    // does not hit that trap. The fuse device has no send-buffer watermark, so a
+    // well-formed reply never returns EAGAIN the way the SPLICE_F_NONBLOCK
+    // pipe->device transfer does; it fails with a real errno (e.g. ENOENT for an
+    // unknown request) instead. This is why enable_splice=false is a sound workaround
+    // and why splice_retry is intentionally NOT applied to writev.
     pub async fn write(&mut self, rep: ResponseData) -> IOResult<()> {
         let (len, iovec) = rep.as_iovec()?;
         let written = self
@@ -281,14 +239,10 @@ impl<T: FileSystem> FuseSender<T> {
         Ok(())
     }
 
-    /// Drain any residual bytes left in the pipe after a failed transfer.
-    /// This prevents the pipe from being permanently poisoned (issue #965):
-    /// without draining, stale bytes at the head of the FIFO would corrupt
-    /// every subsequent response.
-    ///
-    /// EINTR is retried so that a signal during draining cannot leave the
-    /// pipe partially filled.  The loop stops when the non-blocking pipe
-    /// reports EAGAIN/EWOULDBLOCK (empty) or on EOF/any other error.
+    /// Drain residual bytes left in the pipe after a failed transfer, else stale
+    /// bytes at the head of the FIFO permanently poison every subsequent response.
+    /// EINTR is retried so a signal cannot leave the pipe partially filled; the loop
+    /// stops on EAGAIN/EWOULDBLOCK (empty) or EOF/any other error.
     fn drain_pipe(pipe2: &Pipe2) {
         let fd = pipe2.read_raw_fd();
         let mut buf = [0u8; 8192];
@@ -308,11 +262,6 @@ impl<T: FileSystem> FuseSender<T> {
     }
 }
 
-/// Drop a dequeued task's `reply_queue_depth` guard, decrementing the gauge at
-/// the dequeue point (immediately after `recv()`), so the gauge reflects only
-/// channel backlog and excludes the subsequent `splice()`. A named helper so the
-/// "drop on dequeue, not on completion" rule is explicit at both call sites and
-/// hard to misplace. `None` (metrics disabled) is a no-op.
 #[inline]
 fn mark_dequeued(queue_guard: Option<ActiveGuard>) {
     drop(queue_guard);
@@ -324,16 +273,12 @@ mod tests {
     use crate::fuse_metrics::ActiveGuard;
     use orpc::common::Metrics as m;
 
-    // `mark_dequeued` decrements at the dequeue point. Uses an INJECTED isolated
-    // gauge (not the process-global `reply_queue_depth`) so it is parallel-safe
-    // and asserts the exact "guard held -> +1, mark_dequeued -> back to 0"
-    // behaviour the sender relies on (dec before the splice, not after).
+    // `mark_dequeued` decrements at the dequeue point.
     #[test]
     fn mark_dequeued_drops_guard_at_dequeue() {
         let g = m::new_gauge("test_mark_dequeued_gauge", "test").unwrap();
         let guard = ActiveGuard::new(g.clone());
         assert_eq!(g.get(), 1, "guard rides the task: +1 in the channel");
-        // Sender's first line after recv(): drop the queue guard.
         mark_dequeued(Some(guard));
         assert_eq!(g.get(), 0, "dequeue decrements before any splice work");
     }

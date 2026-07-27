@@ -173,15 +173,12 @@ mod tests {
         assert_eq!(args.mount.io_threads, Some(8));
     }
 
-    // Kill switch: FuseConf defaults metrics on (ships enabled).
     #[test]
     fn metrics_enabled_defaults_to_true() {
         use curvine_common::conf::FuseConf;
         assert!(FuseConf::default().metrics_enabled);
     }
 
-    // Kill switch: `--metrics-enabled false` parses and overrides the conf to
-    // false (the production emergency-downgrade path).
     #[test]
     fn metrics_enabled_cli_override_disables() {
         with_valid_conf(&["--metrics-enabled", "false"], |args| {

@@ -1,3 +1,17 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use crate::fs::dcache::{DirTree, Inode};
 use crate::fs::state::{DirHandle, FileHandle, NodeState};
 use crate::fs::FuseWriter;
@@ -31,17 +45,12 @@ impl WebServer {
     }
 }
 
-// `NodeState` is still injected (`with_state`) to keep `WebServer::start`'s
-// signature stable, but the handler no longer reads it: the gauges are now
-// event-driven, so the scrape is a pure `text_output()` with no map traversal
-// under read locks.
 async fn metrics_handler(State(_): State<Arc<NodeState>>) -> String {
     let fuse_metrics = FuseMetrics::get();
 
-    // Scrape hygiene: time the render + record output size. Last-scrape semantics
-    // — the values in *this* response reflect the PREVIOUS scrape (order
-    // text_output THEN record_scrape; do not reorder). Covers the `text_output()`
-    // render only, not Axum's `State` extraction (tiny, out of scope).
+    // Last-scrape semantics: this response reflects the PREVIOUS scrape, the
+    // current one shows up next time. The order (text_output THEN record_scrape)
+    // is what makes it "last scrape" — do not reorder.
     let start = mono_now();
     let output = Metrics::text_output().unwrap_or_else(|e| format!("Error: {}", e));
     fuse_metrics.record_scrape(start.elapsed().as_micros() as u64, output.len());

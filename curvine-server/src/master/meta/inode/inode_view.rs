@@ -19,7 +19,9 @@ use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::{
     Inode, InodeDir, InodeFile, InodePtr, PATH_SEPARATOR, ROOT_INODE_ID,
 };
-use curvine_common::state::{FileStatus, FileType, SetAttrOpts, StoragePolicy, TtlAction};
+use curvine_common::state::{
+    FileStatus, FileType, SetAttrOpts, StoragePolicy, TtlAction, INTERNAL_CTIME_XATTR,
+};
 use curvine_common::utils::SerdeUtils;
 use orpc::common::{LocalTime, Utils};
 use orpc::{err_box, CommonResult};
@@ -236,40 +238,56 @@ impl InodeView {
         }
     }
 
+    pub fn ctime(&self) -> i64 {
+        match self {
+            File(f) => f.ctime(),
+            Dir(d) => d.ctime(),
+            FileEntry(..) => 0,
+        }
+    }
+
     pub fn update_mtime(&mut self, time: i64) {
         match self {
+            File(f) => f.update_mtime(time),
+            Dir(d) => d.update_mtime(time),
+            FileEntry(..) => (),
+        }
+    }
+
+    pub fn update_ctime(&mut self, time: i64) {
+        match self {
+            File(f) => f.update_ctime(time),
+            Dir(d) => d.update_ctime(time),
+            FileEntry(..) => (),
+        }
+    }
+
+    pub fn incr_nlink(&mut self, ctime: i64) {
+        match self {
             File(f) => {
-                if time > f.mtime {
-                    f.mtime = time
-                }
+                f.nlink += 1;
+                f.update_ctime(ctime);
             }
             Dir(d) => {
-                if time > d.mtime {
-                    d.mtime = time
-                }
+                d.nlink += 1;
+                d.update_ctime(ctime);
             }
             FileEntry(..) => (),
         }
     }
 
-    pub fn incr_nlink(&mut self) {
-        match self {
-            File(f) => f.nlink += 1,
-            Dir(d) => d.nlink += 1,
-            FileEntry(..) => (),
-        }
-    }
-
-    pub fn dec_nlink(&mut self) {
+    pub fn dec_nlink(&mut self, ctime: i64) {
         match self {
             File(f) => {
                 if f.nlink > 0 {
-                    f.nlink -= 1
+                    f.nlink -= 1;
+                    f.update_ctime(ctime);
                 }
             }
             Dir(d) => {
                 if d.nlink > 0 {
-                    d.nlink -= 1
+                    d.nlink -= 1;
+                    d.update_ctime(ctime);
                 }
             }
             FileEntry(..) => (),
@@ -461,7 +479,9 @@ impl InodeView {
         }
 
         for key in opts.remove_x_attr {
-            let _ = self.x_attr_mut()?.remove(&key);
+            if key != INTERNAL_CTIME_XATTR {
+                let _ = self.x_attr_mut()?.remove(&key);
+            }
         }
 
         if let Some(ufs_mtime) = opts.ufs_mtime {
@@ -612,5 +632,108 @@ impl Debug for InodeView {
 impl PartialEq for InodeView {
     fn eq(&self, other: &Self) -> bool {
         self.id() == other.id()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setattr_updates_ctime_when_mtime_is_omitted() {
+        let mut inode = InodeView::new_file("file".to_string(), InodeFile::new(1, 1));
+        inode
+            .set_attr(SetAttrOpts {
+                atime: Some(2),
+                mtime: None,
+                add_x_attr: HashMap::from([(
+                    INTERNAL_CTIME_XATTR.to_string(),
+                    3_i64.to_le_bytes().to_vec(),
+                )]),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let status = inode.to_file_status("/file").unwrap();
+        assert_eq!(status.atime, 2);
+        assert_eq!(status.mtime, 1);
+        assert_eq!(status.ctime(), 3);
+    }
+
+    #[test]
+    fn legacy_setattr_replay_keeps_ctime_fallback_deterministic() {
+        let mut inode = InodeView::new_file("file".to_string(), InodeFile::new(1, 1));
+        inode
+            .set_attr(SetAttrOpts {
+                atime: Some(2),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let status = inode.to_file_status("/file").unwrap();
+        assert_eq!(status.ctime(), status.mtime);
+        assert!(!status.x_attr.contains_key(INTERNAL_CTIME_XATTR));
+    }
+
+    #[test]
+    fn setattr_cannot_remove_internal_ctime() {
+        let mut inode = InodeView::new_file("file".to_string(), InodeFile::new(1, 1));
+        inode
+            .set_attr(SetAttrOpts {
+                add_x_attr: HashMap::from([(
+                    INTERNAL_CTIME_XATTR.to_string(),
+                    3_i64.to_le_bytes().to_vec(),
+                )]),
+                ..Default::default()
+            })
+            .unwrap();
+        inode
+            .set_attr(SetAttrOpts {
+                remove_x_attr: vec![INTERNAL_CTIME_XATTR.to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(inode.ctime(), 3);
+    }
+
+    #[test]
+    fn mtime_and_nlink_updates_advance_persisted_ctime() {
+        let mut inode = InodeView::new_file("file".to_string(), InodeFile::new(1, 1));
+        inode
+            .set_attr(SetAttrOpts {
+                add_x_attr: HashMap::from([(
+                    INTERNAL_CTIME_XATTR.to_string(),
+                    2_i64.to_le_bytes().to_vec(),
+                )]),
+                ..Default::default()
+            })
+            .unwrap();
+
+        inode.update_mtime(3);
+        assert_eq!(inode.ctime(), 3);
+
+        inode.incr_nlink(4);
+        assert_eq!(inode.ctime(), 4);
+
+        inode.dec_nlink(5);
+        assert_eq!(inode.ctime(), 5);
+    }
+
+    #[test]
+    fn setattr_reuses_persisted_ctime_during_replay() {
+        let mut inode = InodeView::new_file("file".to_string(), InodeFile::new(1, 1));
+        inode
+            .set_attr(SetAttrOpts {
+                atime: Some(2),
+                add_x_attr: HashMap::from([(
+                    INTERNAL_CTIME_XATTR.to_string(),
+                    3_i64.to_le_bytes().to_vec(),
+                )]),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(inode.ctime(), 3);
     }
 }

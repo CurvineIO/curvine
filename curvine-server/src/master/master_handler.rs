@@ -758,60 +758,60 @@ impl MessageHandler for MasterHandler {
         let ctx = &mut rpc_context;
         let code = RpcCode::from(msg.code());
 
-        // Check whether the master is active
-        if !self.fs.master_monitor.is_active() {
-            return Ok(msg.error_ext(&FsError::not_leader_master(ctx.code, self.client_ip())));
-        }
+        // Unified processing of all RPC requests (standby NotLeader uses the same
+        // observability + error_ext conversion path as async_handle).
+        let response = if !self.fs.master_monitor.is_active() {
+            Err(FsError::not_leader_master(ctx.code, self.client_ip()))
+        } else {
+            match code {
+                // File system operation request
+                RpcCode::Mkdir => self.mkdir(ctx),
+                RpcCode::CreateFile => self.retry_check_create_file(ctx),
+                RpcCode::OpenFile => self.retry_check_open_file(ctx),
+                RpcCode::FileStatus => self.file_status(ctx),
+                RpcCode::AddBlock => self.add_block(ctx),
+                RpcCode::CompleteFile => self.complete_file(ctx),
+                RpcCode::CreateFilesBatch => self.create_files_batch(ctx),
+                RpcCode::AddBlocksBatch => self.add_blocks_batch(ctx),
+                RpcCode::CompleteFilesBatch => self.complete_files_batch(ctx),
+                RpcCode::Exists => self.exists(ctx),
+                RpcCode::Delete => self.retry_check_delete(ctx),
+                RpcCode::Free => self.retry_check_free(ctx),
+                RpcCode::Rename => self.retry_check_rename(ctx),
+                RpcCode::ListStatus => self.list_status(ctx),
+                RpcCode::ListOptions => self.list_options(ctx),
+                RpcCode::GetBlockLocations => self.get_block_locations(ctx),
+                RpcCode::SetAttr => self.set_attr_retry_check(ctx),
+                RpcCode::Symlink => self.symlink_retry_check(ctx),
+                RpcCode::Link => self.link_retry_check(ctx),
+                RpcCode::ResizeFile => self.resize_file(ctx),
+                RpcCode::AssignWorker => self.assign_worker(ctx),
+                RpcCode::GetLock => self.get_lock(ctx),
+                RpcCode::SetLock => self.set_lock(ctx),
 
-        // Unified processing of all RPC requests
-        let response = match code {
-            // File system operation request
-            RpcCode::Mkdir => self.mkdir(ctx),
-            RpcCode::CreateFile => self.retry_check_create_file(ctx),
-            RpcCode::OpenFile => self.retry_check_open_file(ctx),
-            RpcCode::FileStatus => self.file_status(ctx),
-            RpcCode::AddBlock => self.add_block(ctx),
-            RpcCode::CompleteFile => self.complete_file(ctx),
-            RpcCode::CreateFilesBatch => self.create_files_batch(ctx),
-            RpcCode::AddBlocksBatch => self.add_blocks_batch(ctx),
-            RpcCode::CompleteFilesBatch => self.complete_files_batch(ctx),
-            RpcCode::Exists => self.exists(ctx),
-            RpcCode::Delete => self.retry_check_delete(ctx),
-            RpcCode::Free => self.retry_check_free(ctx),
-            RpcCode::Rename => self.retry_check_rename(ctx),
-            RpcCode::ListStatus => self.list_status(ctx),
-            RpcCode::ListOptions => self.list_options(ctx),
-            RpcCode::GetBlockLocations => self.get_block_locations(ctx),
-            RpcCode::SetAttr => self.set_attr_retry_check(ctx),
-            RpcCode::Symlink => self.symlink_retry_check(ctx),
-            RpcCode::Link => self.link_retry_check(ctx),
-            RpcCode::ResizeFile => self.resize_file(ctx),
-            RpcCode::AssignWorker => self.assign_worker(ctx),
-            RpcCode::GetLock => self.get_lock(ctx),
-            RpcCode::SetLock => self.set_lock(ctx),
+                RpcCode::Mount => self.mount(ctx),
+                RpcCode::UnMount => self.umount(ctx),
+                RpcCode::GetMountTable => self.get_mount_table(ctx),
+                RpcCode::GetMountInfo => self.get_mount_info(ctx),
 
-            RpcCode::Mount => self.mount(ctx),
-            RpcCode::UnMount => self.umount(ctx),
-            RpcCode::GetMountTable => self.get_mount_table(ctx),
-            RpcCode::GetMountInfo => self.get_mount_info(ctx),
+                RpcCode::MetricsReport => self.metrics_report(ctx),
 
-            RpcCode::MetricsReport => self.metrics_report(ctx),
+                // Worker related requests
+                RpcCode::WorkerHeartbeat => self.worker_heartbeat(ctx),
+                RpcCode::WorkerBlockReport => self.block_report(ctx),
+                RpcCode::GetMasterInfo => self.get_master_info(ctx),
 
-            // Worker related requests
-            RpcCode::WorkerHeartbeat => self.worker_heartbeat(ctx),
-            RpcCode::WorkerBlockReport => self.block_report(ctx),
-            RpcCode::GetMasterInfo => self.get_master_info(ctx),
-
-            RpcCode::ReportBlockReplicationResult => {
-                if let Some(ref replication_service) = self.replication_handler {
-                    return replication_service.handle(msg);
-                } else {
-                    return Err(FsError::common("Replication service not initialized"));
+                RpcCode::ReportBlockReplicationResult => {
+                    if let Some(ref replication_service) = self.replication_handler {
+                        return replication_service.handle(msg);
+                    } else {
+                        return Err(FsError::common("Replication service not initialized"));
+                    }
                 }
-            }
 
-            // Unsupported request
-            _ => err_box!("Unsupported operation"),
+                // Unsupported request
+                _ => err_box!("Unsupported operation"),
+            }
         };
 
         self.record_rpc_observability(ctx, &response);

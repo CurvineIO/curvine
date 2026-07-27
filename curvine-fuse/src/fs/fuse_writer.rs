@@ -37,13 +37,6 @@ enum WriteTask {
     Resize(CallSender<FsResult<()>>, FileAllocOpts),
 }
 
-/// A `WriteTask` plus the `stream_write_queue_depth` guard that rides with it
-/// through the writer channel. The guard is created at the enqueue
-/// boundary (reserve-first on a bounded channel, so a producer parked in
-/// `reserve().await` is not counted) and dropped the moment `writer_future`
-/// dequeues — or, if the task is never received (writer task exit / channel drop),
-/// when the task is dropped. `None` when metrics are disabled. This is the same
-/// task-embedded-guard pattern the reply channel uses (`FuseTask::RequestReply`).
 struct QueuedWriteTask {
     task: WriteTask,
     queue_guard: Option<ActiveGuard>,
@@ -58,17 +51,9 @@ pub struct FuseWriter {
     len: Arc<AtomicLong>,
     mtime: Arc<AtomicLong>,
     write_ver: AtomicCounter,
-    /// kill-switch flag: decides whether `send_queued_task` creates a
-    /// `stream_write_queue_depth` guard. (The `path_type` label is captured as a
-    /// local and moved into the writer task, not stored here.)
     metrics_enabled: bool,
 }
 
-/// Drop a dequeued task's `stream_write_queue_depth` guard, decrementing the gauge
-/// at the dequeue point (the first line after `recv()`), so the gauge reflects
-/// only channel backlog and excludes the subsequent backend work. A named helper
-/// so the "drop on dequeue, not on completion" rule is explicit and hard to
-/// misplace; mirrors `fuse_sender::mark_dequeued`. `None` (disabled) is a no-op.
 #[inline]
 fn mark_dequeued(queue_guard: &mut Option<ActiveGuard>) {
     drop(queue_guard.take());
@@ -86,8 +71,6 @@ impl FuseWriter {
         let len = Arc::new(AtomicLong::new(status.len));
         let mtime = Arc::new(AtomicLong::new(status.mtime));
         let write_ver = AtomicCounter::new(0);
-        // backend kind + metrics gate, captured at open and moved into
-        // the writer task for the per-IO observe (same as FuseReader).
         let path_type = writer.path_type();
         let metrics_enabled = conf.metrics_enabled;
 
@@ -139,28 +122,15 @@ impl FuseWriter {
         self.err_monitor.take_error().unwrap_or(e)
     }
 
-    /// Enqueue a `WriteTask`, carrying the `stream_write_queue_depth` guard.
-    /// Reserve-first on a bounded channel so a producer parked in `reserve().await`
-    /// isn't counted as backlog (guard created only after a permit is in hand); the
-    /// guard rides the task and drops at the writer's dequeue point.
-    ///
-    /// IMPORTANT: only handles the queue guard + send — it must NOT touch
-    /// `write_ver` (the producers keep `write_ver.incr()` where it is, a
-    /// read-after-write consistency dependency; see `write`/`resize`).
     async fn send_queued_task(&self, task: WriteTask) -> Result<(), FsError> {
         if self.sender.is_bounded() {
-            // Reserve a permit first WITHOUT a guard; a cancelled reserve leaves the
-            // gauge untouched. Once the permit is in hand there is no await, so no
-            // cancellation window between creating the guard and enqueuing.
+            // Reserve before creating the guard to avoid cancellation leaks.
             let permit = self.sender.reserve().await?;
             let queue_guard = FuseMetrics::stream_write_queue_guard(self.metrics_enabled);
             permit.send(QueuedWriteTask { task, queue_guard });
             return Ok(());
         }
 
-        // Unbounded: synchronous send, so no cancellation window between building
-        // the guard task and enqueuing. A send error drops the task (and its
-        // guard, decrementing the gauge).
         let queue_guard = FuseMetrics::stream_write_queue_guard(self.metrics_enabled);
         self.sender
             .send(QueuedWriteTask { task, queue_guard })
@@ -169,10 +139,7 @@ impl FuseWriter {
     }
 
     pub async fn write(&self, off: i64, data: Bytes, reply: Option<FuseResponse>) -> FsResult<()> {
-        // `write_ver.incr()` stays BEFORE the enqueue (unchanged): the read path
-        // (`FileHandle::read`) compares write_ver to decide a dirty-read flush+reopen,
-        // so its timing is a consistency invariant, not something to reorder for
-        // metrics.
+        // Keep write_ver increment before enqueue; read-after-write depends on it.
         self.write_ver.incr();
         self.send_queued_task(WriteTask::Write(off, data, reply))
             .await
@@ -183,10 +150,7 @@ impl FuseWriter {
         let fun = async {
             let (rx, tx) = CallChannel::channel();
             self.send_queued_task(WriteTask::Flush(rx, reply)).await?;
-            // The writer task sends back the backend flush result itself (not a
-            // bare completion signal), so a flush failure on the reply=None path
-            // (dirty-read flush / flush_writer) propagates here instead of being
-            // silently swallowed.
+            // Propagate backend flush failures even on reply=None paths.
             tx.receive().await??;
             Ok::<(), FsError>(())
         };
@@ -199,7 +163,7 @@ impl FuseWriter {
             self.send_queued_task(WriteTask::Complete(rx, reply))
                 .await?;
             // Double `?`: the outer unwraps the channel receive, the inner
-            // propagates the real backend complete result (issue #1118).
+            // propagates the real backend complete result.
             tx.receive().await??;
             Ok::<(), FsError>(())
         };
@@ -212,7 +176,7 @@ impl FuseWriter {
             let (rx, tx) = CallChannel::channel();
             self.send_queued_task(WriteTask::Resize(rx, opts)).await?;
             // Double `?`: unwrap the channel receive, then propagate the real
-            // backend resize result (issue #1118).
+            // backend resize result.
             tx.receive().await??;
             Ok::<(), FsError>(())
         };
@@ -245,9 +209,7 @@ impl FuseWriter {
         metrics_enabled: bool,
     ) -> FsResult<()> {
         let mut completed = false;
-        // Sticky once an operation may have made backend data durable or
-        // visible. Later writes do not clear it: aborting a shared block after
-        // an earlier fsync could delete the already-published prefix as well.
+        // Sticky once backend data may be durable or visible; later writes do not clear it.
         let mut preserve_on_exit = false;
         let worker_result = Self::run_writer_tasks(
             &mut writer,
@@ -265,11 +227,7 @@ impl FuseWriter {
             return worker_result;
         }
 
-        // Before the first durability boundary, aborting is the right cleanup
-        // for a brand-new unfinished upload. After flush/complete/resize was
-        // attempted, the backend or master may already reference the data even
-        // when its response was lost. Finalize instead: cancellation could
-        // delete a block that a successful fsync already published.
+        // Abort only before any durability boundary may have published the data.
         let cleanup_result = if preserve_on_exit {
             writer.complete().await
         } else {
@@ -303,22 +261,13 @@ impl FuseWriter {
         preserve_on_exit: &mut bool,
     ) -> FsResult<()> {
         while let Some(mut queued) = req_receiver.recv().await {
-            // Dequeue point: drop the queue guard FIRST (before any backend work),
-            // so `stream_write_queue_depth` counts only channel backlog. An
-            // un-received task on teardown drops the guard via its own Drop.
+            // Dequeue point: backlog ends before backend work starts.
             mark_dequeued(&mut queued.queue_guard);
             match queued.task {
                 WriteTask::Write(off, data, reply) => {
-                    // A new write makes a prior complete no longer sufficient for
-                    // this worker's final state. Set this before backend IO so a
-                    // partial failed write is also cancelled on exit.
+                    // New writes invalidate prior complete state before backend IO starts.
                     *completed = false;
                     let len = data.len();
-                    // observe the write backend IO (io_type=write). The
-                    // inflight guard wraps ONLY the `fuse_write` call; dropped
-                    // before the reply enqueue. zero-length writes never reach here
-                    // (FileHandle::write direct-replies), so every sample is a real
-                    // write of >0 bytes.
                     let io_start = if metrics_enabled {
                         Some(mono_now())
                     } else {
@@ -356,10 +305,7 @@ impl FuseWriter {
 
                     if let Some(reply) = reply {
                         if let Err(e) = reply.send_rep(res).await {
-                            // The backend operation is already finished. A reply
-                            // enqueue failure means that this request's receiver
-                            // has gone away; it must not terminate the long-lived
-                            // writer worker and break later requests on the handle.
+                            // Reply enqueue failure must not terminate the long-lived writer worker.
                             warn!("failed to send FUSE write reply: {}", e);
                         }
                     } else {
@@ -372,9 +318,7 @@ impl FuseWriter {
                     // cannot prove that the master did not publish the flush.
                     *preserve_on_exit = true;
                     let res = writer.flush().await;
-                    // Deliver the real backend result to the caller (tx) first,
-                    // then the kernel reply. See `deliver_stream_result`
-                    // (issue #1118).
+                    // Deliver backend result to tx before the kernel reply.
                     crate::fs::deliver_stream_result(res, tx, reply).await?;
                 }
 
@@ -388,9 +332,7 @@ impl FuseWriter {
                 WriteTask::Resize(tx, opts) => {
                     *completed = false;
                     *preserve_on_exit = true;
-                    // A resize failure must propagate to the caller via `tx`
-                    // rather than `?`-ing out of the worker (which would kill it
-                    // and leave the caller hanging). No kernel reply on this path.
+                    // Propagate resize failure via tx instead of killing the worker.
                     let res = writer.resize(opts).await;
                     crate::fs::deliver_stream_result(res, tx, None).await?;
                 }
@@ -667,9 +609,6 @@ mod tests {
         assert_eq!(cancel_count.load(Ordering::SeqCst), 1);
     }
 
-    // Build a QueuedWriteTask carrying a queue guard backed by `gauge`. The wrapped
-    // WriteTask is a Flush (it only needs a CallChannel sender, no FuseResponse), so
-    // these tests exercise the queue-depth guard lifecycle without a backend.
     fn queued_task(gauge: &orpc::common::Gauge) -> QueuedWriteTask {
         let (rx, _tx) = CallChannel::channel::<FsResult<()>>();
         QueuedWriteTask {
@@ -678,9 +617,6 @@ mod tests {
         }
     }
 
-    // (a) Dequeue: the writer's first line after recv() drops the queue guard, so
-    // depth returns to baseline BEFORE any backend work. Injected isolated gauge so
-    // it is parallel-safe (not the process-global stream_write_queue_depth).
     #[tokio::test]
     async fn queue_depth_drops_at_dequeue() {
         let g = m::new_gauge("test_swqd_dequeue", "test").unwrap();
@@ -693,15 +629,10 @@ mod tests {
         // writer_future's first line after recv.
         mark_dequeued(&mut queued.queue_guard);
         assert_eq!(g.get(), 0, "dequeue decrements before any backend work");
-        // The remaining backend processing (here: just dropping the task) does not
-        // touch the gauge again.
         drop(queued);
         assert_eq!(g.get(), 0, "no double dec");
     }
 
-    // (b) A task enqueued but NEVER received (writer task exit / channel drop) still
-    // balances: the guard rides the task and drops with it. Covers the
-    // worker-exit + channel-drop teardown case.
     #[tokio::test]
     async fn queue_depth_unreceived_task_drop_balances() {
         let g = m::new_gauge("test_swqd_unrecv", "test").unwrap();
@@ -711,24 +642,17 @@ mod tests {
         tx.send(queued_task(&g)).await.unwrap();
         assert_eq!(g.get(), 2, "two tasks enqueued, not yet received");
 
-        // Drop both ends without recv: the queued tasks (and their guards) drop.
         drop(rx);
         drop(tx);
         assert_eq!(g.get(), 0, "un-received task drop balances queue depth");
     }
 
-    // (c) Bounded-full reserve-first does NOT inflate depth: the guard is created
-    // only AFTER a permit is acquired, so a full channel (no permit) means no guard.
-    // Protocol-level stand-in (mirrors the reply-queue test): asserts the
-    // reserve-first invariant directly against a full bounded channel.
     #[tokio::test]
     async fn queue_depth_bounded_full_does_not_inflate() {
         let g = m::new_gauge("test_swqd_bounded_full", "test").unwrap();
         let (tx, _rx) = AsyncChannel::<QueuedWriteTask>::new(1).split();
         debug_assert!(tx.is_bounded());
 
-        // Fill the single slot WITHOUT a guard (simulating the first task already
-        // committed and received-pending).
         let permit = tx.try_reserve().unwrap().expect("one permit");
         permit.send(QueuedWriteTask {
             task: {
@@ -738,8 +662,6 @@ mod tests {
             queue_guard: None,
         });
 
-        // Channel full: a producer would park in reserve().await. Reserve-first
-        // means no guard is created until a permit is in hand, so depth is untouched.
         assert!(
             tx.try_reserve().unwrap().is_none(),
             "full bounded channel yields no permit"
@@ -751,8 +673,6 @@ mod tests {
         );
     }
 
-    // disabled mode: send_queued_task builds queue_guard=None, so mark_dequeued is a
-    // no-op and the task carries nothing.
     #[tokio::test]
     async fn queue_depth_disabled_carries_no_guard() {
         let (rx, _tx) = CallChannel::channel::<FsResult<()>>();
@@ -760,7 +680,6 @@ mod tests {
             task: WriteTask::Flush(rx, None),
             queue_guard: None,
         };
-        // No guard to drop; must not panic.
         mark_dequeued(&mut queued.queue_guard);
         assert!(queued.queue_guard.is_none());
     }
@@ -819,8 +738,6 @@ mod tests {
                 ));
                 let path = curvine_common::fs::Path::from_str(path_buf.to_str().unwrap()).unwrap();
 
-                // This is a lifecycle test, not a metrics test. Keep it isolated
-                // from the process-global metric counters used by parallel tests.
                 let conf = FuseConf {
                     metrics_enabled: false,
                     ..Default::default()
@@ -830,9 +747,7 @@ mod tests {
                 let fuse_writer = FuseWriter::new(&conf, rt2.clone(), writer);
                 std::mem::forget(rt2);
 
-                // The first write succeeds in the backend, but its reply receiver
-                // is already closed. The following flush must still be handled by
-                // the same worker.
+                // Closed write reply must not prevent the same worker from handling flush.
                 fuse_writer
                     .write(0, Bytes::from_static(b"first"), Some(closed_reply(1)))
                     .await
@@ -842,9 +757,7 @@ mod tests {
                     .await
                     .expect("writer survives a write reply-send failure");
 
-                // Exercise the shared flush/complete result helper as well. Its
-                // internal completion arrives before this closed kernel reply;
-                // a later write and complete prove that the worker kept running.
+                // Exercise the shared flush/complete helper after a closed kernel reply.
                 fuse_writer
                     .flush(Some(closed_reply(2)))
                     .await
@@ -863,14 +776,6 @@ mod tests {
             });
         }
 
-        // A real FuseWriter over UnifiedWriter::Local drives the write task body via
-        // the public `write()`, proving the production wiring: path_type="local"
-        // flows into the task body, io_*{write,local} + stage=stream_io are observed
-        // with the input data length for both bytes and size.
-        //
-        // Parallel-safety: (io_type=write, path_type=local) children are touched ONLY
-        // by this test, so exact deltas are safe; the shared stage child uses a lower
-        // bound. Mirrors the FuseReader integration test.
         #[test]
         fn local_writer_task_body_observes_io_with_local_path_type() {
             let rt = AsyncRuntime::single();
@@ -910,9 +815,7 @@ mod tests {
                 assert_eq!(writer.path_type(), "local");
                 let rt2 = Arc::new(AsyncRuntime::single());
                 let fuse_writer = FuseWriter::new(&conf, rt2.clone(), writer);
-                // Leak our Arc so this runtime is never the-last-Arc-dropped inside
-                // the outer async block (dropping a tokio runtime from an async
-                // context panics).
+                // Avoid dropping the last runtime Arc inside an async context.
                 std::mem::forget(rt2);
 
                 // Write 2048 bytes (a non-zero, sub-4K write — still a real backend IO).
@@ -979,14 +882,6 @@ mod tests {
                         > stage_before,
                     "write backend call also emits stage=stream_io,kind=stream"
                 );
-                // NOTE: we deliberately do NOT assert `stream_io_inflight{write}` here.
-                // It is a process-global gauge shared with other tests, so a
-                // point-in-time read (even against a baseline) races a concurrent test
-                // holding a write guard — neither `==0` nor `==before` is reliable under
-                // the default parallel harness. The guard's inc/dec balance and its
-                // "wraps only the backend call, dropped before reply" scope are pinned
-                // deterministically by the isolated `stream_io_guard_gate_and_balance`
-                // unit test instead.
 
                 let _ = std::fs::remove_file(&path_buf);
             });

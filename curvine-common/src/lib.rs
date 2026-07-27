@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::FsError;
-
 pub mod alloc;
 pub mod conf;
 pub mod error;
@@ -26,18 +24,14 @@ pub mod utils;
 pub mod version;
 
 pub mod proto {
-    include!(concat!(env!("OUT_DIR"), "/protos/proto.rs"));
+    pub use curvine_proto::*;
 
     pub mod raft {
         include!(concat!(env!("OUT_DIR"), "/protos/raft.rs"));
     }
 }
 
-pub type FsResult<T> = Result<T, FsError>;
+pub use curvine_error::{FsError, FsResult, MAX_FILE_SIZE};
+pub use curvine_model::UFS_INODE_ID;
 
 pub const FILE_BUFFER_SIZE: usize = 128 * 1024;
-
-/// Maximum supported file size (1 PiB).
-pub const MAX_FILE_SIZE: i64 = 1 << 50;
-
-pub const UFS_INODE_ID: i64 = 0;
