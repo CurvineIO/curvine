@@ -92,27 +92,27 @@ impl BlockIO for BlockDevice {
     }
 
     fn supports_read_ahead(&self) -> bool {
-        self.supports_read_ahead()
+        BlockDevice::supports_read_ahead(self)
     }
 
     fn supports_send_file(&self) -> bool {
-        self.supports_send_file()
+        BlockDevice::supports_send_file(self)
     }
 
     fn supports_short_circuit(&self) -> bool {
-        self.supports_short_circuit()
+        BlockDevice::supports_short_circuit(self)
     }
 
     fn supports_resize(&self) -> bool {
-        self.supports_resize()
+        BlockDevice::supports_resize(self)
     }
 
     fn as_local(&self) -> Option<&LocalFile> {
-        self.as_local()
+        BlockDevice::as_local(self)
     }
 
     fn as_local_mut(&mut self) -> Option<&mut LocalFile> {
-        self.as_local_mut()
+        BlockDevice::as_local_mut(self)
     }
 }
 impl BlockDevice {

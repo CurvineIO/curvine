@@ -219,6 +219,21 @@ impl SpdkConf {
             );
         }
 
+        if self.poll_interval_ms == 0 {
+            return err_box!("SpdkConf: poll_interval_ms must be > 0");
+        }
+        if self.poll_interval_ms > i32::MAX as u64 {
+            return err_box!(
+                "SpdkConf: poll_interval_ms ({}) exceeds i32::MAX ({})",
+                self.poll_interval_ms,
+                i32::MAX
+            );
+        }
+        let min_ka_ms = match self.poll_interval_ms.checked_mul(3) {
+            Some(v) => v,
+            None => return err_box!("SpdkConf: poll_interval_ms * 3 overflows u64"),
+        };
+
         for (i, target) in self.targets.iter().enumerate() {
             target.validate().map_err(|e| {
                 let msg = format!("SpdkConf: targets[{}]: {}", i, e);
@@ -229,7 +244,6 @@ impl SpdkConf {
             } else {
                 self.keep_alive_timeout_ms
             };
-            let min_ka_ms = self.poll_interval_ms * 3;
             if resolved_ka_ms < min_ka_ms {
                 return err_box!(
                     "SpdkConf: targets[{}]: keep_alive_timeout_ms ({}) must be \
@@ -240,17 +254,6 @@ impl SpdkConf {
                     min_ka_ms
                 );
             }
-        }
-
-        if self.poll_interval_ms == 0 {
-            return err_box!("SpdkConf: poll_interval_ms must be > 0");
-        }
-        if self.poll_interval_ms > i32::MAX as u64 {
-            return err_box!(
-                "SpdkConf: poll_interval_ms ({}) exceeds i32::MAX ({})",
-                self.poll_interval_ms,
-                i32::MAX
-            );
         }
 
         Ok(())
