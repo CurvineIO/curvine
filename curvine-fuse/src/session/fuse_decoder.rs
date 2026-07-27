@@ -18,7 +18,7 @@ use orpc::sys::FFIUtils;
 use std::ffi::OsStr;
 use std::mem::size_of;
 
-// fuse requests the decoder.
+// Decoder for FUSE request buffers.
 pub struct FuseDecoder<'a> {
     buf: &'a [u8],
 }
@@ -36,7 +36,6 @@ impl<'a> FuseDecoder<'a> {
         self.len() == 0
     }
 
-    // Get a structure
     pub fn get_struct<T>(&mut self) -> FuseResult<&'a T> {
         let bytes = self.get_slice(size_of::<T>())?;
         Self::parse(bytes)

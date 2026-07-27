@@ -18,8 +18,7 @@ use curvine_fuse::cli::{
 };
 use orpc::CommonResult;
 
-// fuse mount.
-// Debugging, after starting the cluster, execute the following naming, mount fuse
+// For local debugging, after starting the cluster, run the following to mount fuse:
 // umount -f /curvine-fuse; cargo run --bin curvine-fuse -- --conf /server/conf/curvine-cluster.toml
 fn main() -> CommonResult<()> {
     let cli = FuseCli::parse();

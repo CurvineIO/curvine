@@ -98,11 +98,6 @@ impl NodeState {
         self.fs.conf()
     }
 
-    /// Invalidate the cached entry for `(ino, name)` on a mutation and record the
-    /// `user_meta_cache_invalidations_total{cache,reason}` counter. Mirrors the
-    /// pre-refactor `invalidate_cache`: a no-op (and no metric) when the metadata
-    /// cache is disabled, and the metric is additionally gated on `metrics_enabled`.
-    /// `reason` is a static call-site reason; it does not change what is invalidated.
     pub fn invalid_cache(&self, ino: u64, name: Option<&str>, reason: &'static str) {
         if !self.enable_meta_cache {
             return;
@@ -336,9 +331,7 @@ impl NodeState {
         self.writers.get(&ino).await
     }
 
-    // Get or create the writer registered under `ino`. The caller is
-    // responsible for resolving the inode first (see `new_handle`), so that the
-    // writer-map key and the handle ino are guaranteed to be the same value.
+    // Caller resolves ino first so writer-map key matches the handle inode.
     pub async fn get_or_create_writer(
         &self,
         ino: u64,
@@ -407,13 +400,7 @@ impl NodeState {
             return err_fuse!(libc::EINVAL, "Invalid access mode: {:?}", mode);
         }
 
-        // Write modes (WRONLY / RDWR): resolve the inode ONCE and register the
-        // writer under that same ino, so the writer-map key always equals the
-        // handle ino. When `ino` is provided (open / restore) we reuse it; when
-        // it is None (create) we open the writer first, derive the ino from its
-        // status a single time, then insert it under that key. This avoids the
-        // previous double `next_ino` call that could diverge for a freshly
-        // created file whose backend id was not yet assigned.
+        // Resolve inode once so the writer-map key always equals the handle ino.
         let (ino, writer) = match ino {
             Some(ino) => {
                 let writer = self.get_or_create_writer(ino, path, flags, opts).await?;
@@ -578,11 +565,7 @@ impl NodeState {
         ino: u64,
         fh: u64,
     ) -> FuseResult<(Arc<FileHandle>, FuseResult<()>)> {
-        // Find the handle without removing it yet.  The handle stays in
-        // self.handles while complete()/flush() runs so that
-        // has_open_handles() keeps returning true during the commit —
-        // otherwise a concurrent unlink or deferred-delete could delete the
-        // file before the data upload finishes.
+        // Find the handle without removing it yet.
         let handle = self.find_handle(ino, fh)?;
 
         let close_result: FuseResult<()> = match handle.as_ref() {
@@ -604,10 +587,7 @@ impl NodeState {
             _ => Ok(()),
         };
 
-        // FUSE sends RELEASE once per open handle, and its error is not retried.
-        // Remove the handle regardless of the close result so open-handle and
-        // shared-writer accounting continue to reflect kernel ownership.
-        // Retriable backend cleanup must be tracked separately (#1221).
+        // RELEASE is not retried; remove the handle regardless of close result.
         let _ = self.remove_handle(ino, fh);
 
         Ok((handle, close_result))
@@ -644,8 +624,8 @@ impl NodeState {
         ino: u64,
         delete_result: Result<(), FsError>,
     ) -> FuseResult<()> {
-        // Keep the mark observable after failure. The background retry needed
-        // to reclaim it without another FUSE request is tracked by #1221.
+        // Keep the mark observable after failure; reclaiming it without another
+        // FUSE request would need a background retry, which is not yet implemented.
         match delete_result {
             Ok(()) | Err(FsError::FileNotFound(_)) => self.clear_mark_delete(ino),
             Err(e) => Err(e.into()),
@@ -674,11 +654,8 @@ impl NodeState {
             };
         };
 
-        // Always mark for deletion and remove the directory entry first,
-        // and check has_open_handles inside the same dir_write critical
-        // section.  While we hold dir_write, no concurrent fs_open/fs_create
-        // can acquire dir_read, so no new handles can be registered — the
-        // has_open_handles result is accurate.
+        // Always mark for deletion and remove the directory entry first, and check
+        // has_open_handles inside the same dir_write critical section.
         let has_handles = {
             let mut dir = self.dir_write();
             dir.unlink(parent, name, true)?;
@@ -690,9 +667,7 @@ impl NodeState {
             return Ok(());
         }
 
-        // Re-check for a concurrent fs_open that may have registered a handle
-        // while we waited.  If so, defer — release() will delete via
-        // deferred_delete_ready.
+        // Defer if a concurrent fs_open registered a handle while we waited.
         if self.has_open_handles(ino) {
             debug!(
                 "unlink ino={}, path={}: handle appeared, deferring",
@@ -724,11 +699,8 @@ impl NodeState {
             return Ok(false);
         }
 
-        // NOTE: Do NOT clear mark_delete here.  The mark stays set until
-        // after self.fs.delete() completes in release().  This ensures
-        // that a concurrent fs_open() during the delete RPC sees
-        // pending_delete=true and rejects the open, preventing a handle
-        // from being registered for a file that is about to be deleted.
+        // NOTE: Do NOT clear mark_delete here. The mark stays set until after
+        // self.fs.delete() completes in release().
         Ok(true)
     }
 
@@ -824,18 +796,13 @@ impl NodeState {
         self.writers.keys()
     }
 
-    /// Emit `user_meta_cache_total{cache=status,status}`, gated on the
-    /// `metrics_enabled` observation kill-switch (separate from the
-    /// `enable_meta_cache` feature gate). No-op when metrics are disabled.
     fn record_status_cache(&self, status: &'static str) {
         if self.conf.metrics_enabled {
             FuseMetrics::with(|m| m.record_user_meta_cache(CACHE_STATUS, status));
         }
     }
 
-    /// `user_meta_cache_total{cache=status,status=put}`, emitted when a backend
-    /// status is materialized into the dcache (e.g. readdir populating child
-    /// inodes). Only counts when the status/attr cache is actually in use.
+    /// Count backend status materialized into dcache when attr cache is active.
     pub fn record_status_put(&self) {
         if self.enable_meta_cache {
             self.record_status_cache(CACHE_RESULT_PUT);
@@ -879,19 +846,8 @@ impl NodeState {
     }
 
     pub async fn fs_lookup(&self, ino: u64, name: &str) -> FuseResult<fuse_attr> {
-        // NOTE: the `.`/`..` branches below are BROKEN wherever they resolve through
-        // the root, because root's `parent` is the `0` sentinel and inode 0 does not
-        // exist. Two cases both miss and return ENOENT:
-        //   - `LOOKUP(root, ".")` -> `(root.parent, ..)` = `(0, "/")`, and
-        //     `LOOKUP(root, "..")` -> `get_inode_check(root.parent=0)`.
-        //   - `LOOKUP(child_of_root, "..")` -> `get_inode_check(parent.parent)` where
-        //     `parent` is root, i.e. `get_inode_check(0)` — so ANY direct child of the
-        //     mount root fails too, not just the root inode.
-        // This is why `FUSE_EXPORT_SUPPORT` is kept out of `SUPPORTED_INIT_FLAGS` (see
-        // `crate::FUSE_EXPORT_SUPPORT`): advertising it is the only thing that makes
-        // the kernel send these `.`/`..` LOOKUPs (`fuse_get_parent` walks `..` for any
-        // direct child of the mount root). A follow-up that re-adds the capability must
-        // special-case `parent == root` (and root itself), not only `LOOKUP(root, .)`.
+        // NOTE: the `.`/`..` branches below are BROKEN wherever they resolve through the root, because
+        // root's `parent` is the `0` sentinel and inode 0 does not exist.
         let (ino, cow_name) = if name == FUSE_CURRENT_DIR {
             let dir = self.dir_read();
             let inode = dir.get_inode_check(ino, None)?;
@@ -1505,9 +1461,7 @@ mod test {
             let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), task_rt.clone()).unwrap();
             let state = NodeState::new(fs).unwrap();
 
-            // /dev/full deterministically fails backend writes with ENOSPC. Queue a
-            // write before persisting so BackendHandle::persist's complete() sees
-            // the worker failure and returns it to NodeState::persist.
+            // /dev/full makes persist's complete() return the queued write failure.
             let full_path = Path::from_str("/dev/full").unwrap();
             let local_writer = LocalWriter::new(&full_path, 1).unwrap();
             let status = local_writer.status().clone();

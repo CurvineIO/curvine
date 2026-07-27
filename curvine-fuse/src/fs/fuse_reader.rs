@@ -47,9 +47,6 @@ impl FuseReader {
         let err_monitor = Arc::new(ErrorMonitor::new());
         let (sender, receiver) = AsyncChannel::new(conf.stream_channel_size).split();
         let status = reader.status().clone();
-        // capture the backend kind and the metrics gate at open time and
-        // move them into the read task, so the per-IO observe in `read_future` has
-        // the `path_type` label without re-resolving it on the hot path.
         let path_type = reader.path_type();
         let metrics_enabled = conf.metrics_enabled;
 
@@ -113,7 +110,7 @@ impl FuseReader {
             let (rx, tx) = CallChannel::channel();
             self.sender.send(ReadTask::Complete(rx, reply)).await?;
             // Double `?`: unwrap the channel receive, then propagate the real
-            // backend complete result (issue #1118).
+            // backend complete result.
             tx.receive().await??;
             Ok::<(), FsError>(())
         };
@@ -129,11 +126,6 @@ impl FuseReader {
         while let Some(task) = req_receiver.recv().await {
             match task {
                 ReadTask::Read(off, len, reply) => {
-                    // observe the read backend IO (io_type=read). The
-                    // inflight guard wraps ONLY the `fuse_read` call (backend
-                    // concurrency), and is dropped before the reply enqueue so the
-                    // gauge excludes reply-channel time. Then record duration /
-                    // requests / size / bytes via the shared helper.
                     let io_start = if metrics_enabled {
                         Some(mono_now())
                     } else {
@@ -162,21 +154,16 @@ impl FuseReader {
                     }
 
                     if let Err(e) = reply.send_data(data.map_err(|x| x.into())).await {
-                        // The read itself is complete. Losing this request's reply
-                        // receiver must not kill the shared worker and make every
-                        // later read on the handle fail.
+                        // Losing this reply receiver must not kill the shared worker.
                         warn!("failed to send FUSE read reply: {}", e);
                     }
                 }
 
                 ReadTask::Complete(tx, reply) => {
-                    // Complete/release IO accounting lives at the send_stream layer
-                    // (stream_lifecycle_*), not here — the Complete arm cannot tell
-                    // flush from fsync from release, and a reader+writer double
-                    // observe would double-count. So no io_* observe here.
+                    // Complete/release IO accounting lives at send_stream to avoid double-counting.
                     let res = reader.complete().await;
                     // Deliver the real backend result to the caller (tx) first,
-                    // then the kernel reply (issue #1118).
+                    // then the kernel reply.
                     crate::fs::deliver_stream_result(res, tx, reply).await?;
                 }
             }
@@ -201,9 +188,6 @@ mod tests {
     use orpc::sync::channel::AsyncChannel;
     use std::io::Write as _;
 
-    // Build a metrics-enabled FuseResponse over a real channel, and spawn a drainer
-    // so the worker's `send_data`/`send_rep` enqueue completes (the reply task is
-    // discarded — we only care that the worker's task body ran and observed IO).
     fn metrics_reply(rt: &AsyncRuntime) -> FuseResponse {
         FuseMetrics::ensure_init().unwrap();
         let (tx, mut rx) = AsyncChannel::<FuseTask>::new(16).split();
@@ -254,8 +238,6 @@ mod tests {
             }
             let path = curvine_common::fs::Path::from_str(path_buf.to_str().unwrap()).unwrap();
 
-            // This is a lifecycle test, not a metrics test. Keep it isolated
-            // from the process-global metric counters used by parallel tests.
             let conf = FuseConf {
                 metrics_enabled: false,
                 ..Default::default()
@@ -299,15 +281,6 @@ mod tests {
         });
     }
 
-    // A real FuseReader over UnifiedReader::Local drives the read task body through
-    // the public `read()`, proving the production wiring the helper test cannot:
-    // path_type="local" flows from `path_type()` into the task body, io_* and
-    // stage=stream_io are observed with ACTUAL bytes read and REQUESTED size.
-    //
-    // Parallel-safety: the (io_type=read, path_type=local) children are touched ONLY
-    // by this test (send_stream tests use TestFileSystem which ENOSYS before the task
-    // body; the helper test uses a synthetic path_type), so exact deltas are safe.
-    // The shared stage=stream_io child uses a lower bound.
     #[test]
     fn local_reader_task_body_observes_io_with_local_path_type() {
         let rt = AsyncRuntime::single();
@@ -366,8 +339,6 @@ mod tests {
             };
             fuse_reader.read(op, reply).await.unwrap();
 
-            // The read task runs on its own spawned task; poll the metric until the
-            // observe lands (bounded wait so a wiring regression fails, not hangs).
             let deadline = 50;
             for _ in 0..deadline {
                 if mx
@@ -416,13 +387,6 @@ mod tests {
                     > stage_before,
                 "read backend call also emits stage=stream_io,kind=stream"
             );
-            // NOTE: we deliberately do NOT assert `stream_io_inflight{read}` here.
-            // It is a process-global gauge shared with other tests, so a point-in-time
-            // read (even against a baseline) races a concurrent test holding a read
-            // guard — neither `==0` nor `==before` is reliable under the default
-            // parallel harness. The guard's inc/dec balance and its "wraps only the
-            // backend call, dropped before reply" scope are pinned deterministically by
-            // the isolated `stream_io_guard_gate_and_balance` unit test instead.
 
             let _ = std::fs::remove_file(&path_buf);
         });

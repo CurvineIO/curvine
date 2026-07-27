@@ -58,7 +58,7 @@ impl FuseUtils {
         unsafe { slice::from_raw_parts(ptr, len) }
     }
 
-    /// Owned-buffer variant of [`struct_as_bytes`]; same C-ABI contract applies.
+    /// Owned-buffer variant of [`Self::struct_as_bytes`]; same C-ABI contract applies.
     pub(crate) fn struct_as_buf<T>(dst: &T) -> BytesMut {
         let bytes = Self::struct_as_bytes(dst);
         BytesMut::from(bytes)
@@ -93,13 +93,7 @@ impl FuseUtils {
         }
     }
 
-    // Decide the permission bits to report for a status.
-    //
-    // - Symlinks always report the default (the kernel ignores symlink perm bits).
-    // - Synthetic `.`/`..` entries have no persisted ACL, so report a default
-    //   masked by the configured umask.
-    // - Real entries report the stored mode verbatim, including the valid POSIX
-    //   mode 0000. Umask is a create-time mask and must not be re-applied here.
+    // Decide reported permission bits, including symlink and synthetic `.`/`..` defaults.
     pub fn effective_perm(status: &FileStatus, umask: u32) -> u32 {
         if status.file_type == FileType::Link {
             return FUSE_DEFAULT_SYMLINK_MODE;
@@ -169,8 +163,7 @@ impl FuseUtils {
         }
     }
 
-    // Determine whether it is the running file type.
-    // Currently, the file system only supports: files and directories.
+    // The file system supports regular files and directories only.
     pub fn is_allow_file_type(mode: u32) -> bool {
         let file_type = mode & libc::S_IFMT as u32;
 
@@ -189,8 +182,6 @@ impl FuseUtils {
         ((flags as i32) & libc::O_CREAT) != 0
     }
 
-    // Determine whether it is the running file type.
-    // Currently, the file system only supports: files and directories.
     pub fn is_dir(mode: u32) -> bool {
         let file_type = mode & libc::S_IFMT as u32;
         file_type == libc::S_IFDIR as u32
@@ -216,25 +207,14 @@ impl FuseUtils {
         }
     }
 
-    // Device ioctls
-    // #define FUSE_DEV_IOC_MAGIC 229
-    // #define FUSE_DEV_IOC_CLONE _IOR(FUSE_DEV_IOC_MAGIC, 0, uint32_t)
-    // fd clone is a new feature added to the Linux kernel 4.2 or above version, and its main function is to reduce competition for fd locks.
+    // FUSE_DEV_IOC_CLONE clones a FUSE fd to reduce fd-lock contention.
     pub fn fuse_clone_fd(source_fd: RawIO) -> IOResult<RawIO> {
         let path = FFIUtils::new_cs_string(FUSE_DEVICE_NAME);
         let clone_fd = sys::open(&path, libc::O_RDWR)?;
         Self::clone_fd_ioctl(clone_fd, source_fd)
     }
 
-    // Issue the FUSE_DEV_IOC_CLONE ioctl on an already-opened `clone_fd`.
-    // On failure, close `clone_fd` before propagating so it does not leak:
-    // the caller (fuse_mnt.rs) falls back to dup(self.fd) and never sees this
-    // fd again, so nothing else would ever close it.
-    //
-    // NOTE: close(2) releases the fd even when it returns an error (EINTR/EIO),
-    // so we log-and-ignore the close error rather than retry — retrying would
-    // risk a double-close of a since-reused fd. The original ioctl error is
-    // returned unchanged because it carries the more useful diagnostic.
+    // Close `clone_fd` on ioctl failure so fallback dup does not leak it.
     pub(crate) fn clone_fd_ioctl(clone_fd: RawIO, source_fd: RawIO) -> IOResult<RawIO> {
         let request = Self::fuse_dev_ioc_clone();
         let mut master_fd = source_fd;
@@ -257,9 +237,7 @@ impl FuseUtils {
             FileType::Link => status.target.as_ref().map(|x| x.len()).unwrap_or(0) as u64,
             FileType::Dir => FUSE_DEFAULT_PAGE_SIZE as u64,
             FileType::Fifo | FileType::Char | FileType::Block | FileType::Socket => 0,
-            // Regular files (File / Stream / Agg / Object) take their size from
-            // `status.len`. Defend the FUSE boundary against abnormal backend
-            // data: a negative len would cast to a huge u64, so reject it.
+            // Reject negative backend lengths before converting regular-file size.
             _ => {
                 if status.len < 0 {
                     return err_fuse!(
@@ -305,11 +283,7 @@ impl FuseUtils {
             };
         }
 
-        // Handle system extended attributes FIRST, before any path resolution
-        // This avoids unnecessary operations and provides fastest response
-        // Kernel may still query these even if FUSE_POSIX_ACL is disabled in init response
-        // Kernel requested POSIX_ACL support (kernel_requested_POSIX_ACL: 1048576)
-        // but we disabled it in our response, yet kernel still queries ACL attributes
+        // Handle system xattrs before path resolution; kernels may query them even without POSIX ACL.
         match name {
             MKNOD_RDEV_XATTR
             | IFLAGS_XATTR
@@ -447,9 +421,7 @@ impl FuseUtils {
     }
 
     pub fn status_to_attr(conf: &FuseConf, status: &FileStatus) -> FuseResult<fuse_attr> {
-        // Derive size first (rejects negative len for regular files), then blocks
-        // from the reported size so the two stay consistent (a directory reports
-        // size = 4096 ⇒ blocks = 8, not 0). `div_ceil` on a u64 cannot overflow.
+        // Derive blocks from reported size so size and blocks stay consistent.
         let size = FuseUtils::fuse_st_size(status)?;
         let blocks = size.div_ceil(512);
 
@@ -613,11 +585,9 @@ impl FuseUtils {
         Self::caller_supplementary_groups(pid).contains(&file_gid)
     }
 
-    /// Apply Linux chmod/fchmod security rules for special mode bits.
-    ///
-    /// For non-root callers, setgid is cleared when the caller is not in the inode's
-    /// group (see chmod(2) and LTP chmod05/fchmod05). Setuid is preserved for the
-    /// file owner, matching Linux chmod(2).
+    /// Apply Linux chmod/fchmod security rules for special mode bits. For non-root
+    /// callers, setgid is cleared when the caller is not in the inode's group
+    /// (see chmod(2) and LTP chmod05/fchmod05).
     pub fn normalize_chmod_mode(mode: u32, caller_uid: u32, in_file_group: bool) -> u32 {
         let mut mode = mode & 0o7777;
         if caller_uid == 0 {
@@ -634,7 +604,6 @@ impl FuseUtils {
         // FATTR_SIZE is intentionally handled by CurvineFileSystem::set_attr because resizing
         // requires the file handle and cache invalidation managed by the caller.
 
-        // Only set fields when the corresponding valid flag is present
         let owner = if (setattr.valid & FATTR_UID) != 0 {
             match sys::get_username_by_uid(setattr.uid) {
                 Some(username) => Some(username),
@@ -660,7 +629,6 @@ impl FuseUtils {
             None
         };
 
-        // Handle time modifications
         let mut atime = None;
         let mut mtime = None;
 
@@ -972,15 +940,7 @@ mod tests {
         assert!(version < FUSE_CLONE_FD_MIN_VERSION);
     }
 
-    // Regression for the clone-fd leak: when the FUSE_DEV_IOC_CLONE ioctl fails,
-    // `clone_fd_ioctl` must close the fd it was handed before returning the error,
-    // otherwise it leaks (the caller falls back to dup and never sees this fd).
-    //
-    // We drive this without touching /dev/fuse: a plain pipe fd does not accept
-    // the FUSE clone ioctl, so `sys::ioctl` fails deterministically and the
-    // close path is exercised. `fcntl(F_GETFD)` on the now-closed fd returns
-    // EBADF, confirming the close happened. Linux-only: pipe2/ioctl/fcntl_get
-    // are not available on other targets.
+    // Regression: failed clone ioctl must close the handed-in fd.
     #[cfg(target_os = "linux")]
     #[test]
     fn fuse_clone_fd_closes_fd_on_ioctl_error() {
@@ -993,10 +953,7 @@ mod tests {
         // is propagated unchanged.
         assert!(res.is_err(), "ioctl on a pipe fd should fail");
 
-        // `r` should have been closed by the error path: F_GETFD now returns EBADF.
-        // (Primary guarantee is the propagated error above; this is a best-effort
-        // check — in theory another thread could reuse the fd number, but not in
-        // this single-threaded test.)
+        // Error path should close `r`; F_GETFD should now fail with EBADF.
         assert!(
             sys::fcntl_get(r).is_err(),
             "clone_fd should have been closed on ioctl error"

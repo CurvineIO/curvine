@@ -19,19 +19,12 @@ use std::fs::read_to_string;
 
 /// Validates configuration by loading and initializing cluster settings without mounting.
 ///
-/// Beyond the hard load/parse checks done by `get_conf`, this surfaces two
-/// problems that would otherwise only appear at runtime (or never):
-///   - `fuse.state_dir` must be (or be creatable as) a writable directory —
-///     hard error, since a bad value fails the SIGUSR1 persist/restore path,
-///     often mid graceful-upgrade;
-///   - unrecognized `[fuse]` TOML keys — warning, since `FuseConf`
-///     intentionally ignores unknown keys for legacy compatibility
-///     (`#[serde(default)]`, no `deny_unknown_fields`). A misspelled key is
-///     silently dropped so its setting never takes effect; a deprecated/renamed
-///     key may still apply via `#[serde(alias)]`. Either way it is worth
-///     surfacing so the user can verify intent.
-///
-/// Exits quietly on success; failures are returned via `CommonResult` for stderr reporting.
+/// Beyond `get_conf`'s hard load/parse checks, surfaces two runtime-only problems:
+///   - `fuse.state_dir` must be a writable (or creatable) directory — hard error,
+///     since a bad value fails the SIGUSR1 persist/restore path, often mid-upgrade;
+///   - unrecognized `[fuse]` TOML keys — warning only, since `FuseConf` ignores
+///     unknown keys (`#[serde(default)]`, no `deny_unknown_fields`): a misspelled
+///     key is silently dropped, so surfacing it lets the user verify intent.
 pub fn run_validate_config(args: FuseRuntimeArgs) -> CommonResult<()> {
     let conf = args.get_conf()?;
 

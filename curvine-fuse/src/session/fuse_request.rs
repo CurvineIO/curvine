@@ -46,7 +46,7 @@ impl FuseRequest {
         Ok(req)
     }
 
-    // Get the header, to avoid life cycle problems, it will not be saved
+    // Get the header; not saved, to avoid lifetime problems.
     pub fn parse_header(&self) -> FuseResult<&fuse_in_header> {
         if self.buf.len() < FUSE_IN_HEADER_LEN {
             return err_box!("Not enough data for arguments (short read).");
@@ -80,7 +80,6 @@ impl FuseRequest {
         matches!(self.opcode, FUSE_SETLKW)
     }
 
-    // Determine whether it is a file data read and write operation
     pub fn is_stream(&self) -> bool {
         matches!(
             self.opcode,
@@ -329,7 +328,7 @@ impl FuseRequest {
             FUSE_DESTROY => FuseOperator::Destroy(Destroy { header }),
 
             // Opcodes with no arm fall through to `Notimplemented` -> ENOSYS.
-            // Whether that is intentional (BMAP/POLL/IOCTL/LSEEK etc.) or a gap
+            // Whether that is intentional (BMAP/POLL/LSEEK etc.) or a gap
             // is recorded authoritatively by `FuseOpCode::expected_dispatch`.
             _ => FuseOperator::Notimplemented,
         };
