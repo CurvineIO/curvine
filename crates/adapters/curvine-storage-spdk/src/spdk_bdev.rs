@@ -11,12 +11,12 @@
 
 #![cfg(feature = "spdk")]
 
-use crate::err_box;
-use crate::io::block_io::BlockIO;
-use crate::io::IOResult;
-use crate::sys::DataSlice;
 use bytes::BytesMut;
 use log::{debug, error, warn};
+use orpc::err_box;
+use orpc::io::BlockIO;
+use orpc::io::IOResult;
+use orpc::sys::DataSlice;
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicBool, Ordering};
 // ---------------------------------------------------------------------------
@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// SPDK I/O channel — wraps qpair and poller sender.
 pub struct SpdkIoChannel {
-    pub qpair: *mut crate::io::spdk_ffi::spdk_nvme_qpair,
-    pub poller_tx: crossbeam::channel::Sender<crate::io::spdk_poller::IoRequest>,
+    pub qpair: *mut crate::spdk_ffi::spdk_nvme_qpair,
+    pub poller_tx: crossbeam::channel::Sender<crate::spdk_poller::IoRequest>,
     /// Eventfd for waking poller on new I/O
     pub eventfd: std::sync::Arc<nix::sys::eventfd::EventFd>,
     /// Flag: poller is idle and blocked on eventfd; only write eventfd when true
@@ -58,7 +58,7 @@ impl DmaBuf {
         // Round up to block alignment
         let aligned_size = Self::align_up(size, block_size as usize);
         let ptr = unsafe {
-            crate::io::spdk_ffi::curvine_spdk_dma_malloc(aligned_size as u64, block_size as u64)
+            crate::spdk_ffi::curvine_spdk_dma_malloc(aligned_size as u64, block_size as u64)
         };
         if ptr.is_null() {
             return err_box!(
@@ -114,7 +114,7 @@ impl DmaBuf {
 impl Drop for DmaBuf {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            unsafe { crate::io::spdk_ffi::curvine_spdk_dma_free(self.ptr) }
+            unsafe { crate::spdk_ffi::curvine_spdk_dma_free(self.ptr) }
         }
     }
 }
@@ -138,11 +138,11 @@ pub struct SpdkBdev {
     /// Write buffer (avoids repeated allocation).
     write_buf: DmaBuf,
     /// Raw namespace pointer.
-    ns: *mut crate::io::spdk_ffi::spdk_nvme_ns,
+    ns: *mut crate::spdk_ffi::spdk_nvme_ns,
     /// I/O channel for this bdev.
     io_channel: SpdkIoChannel,
     /// Raw controller pointer (for qpair pool on drop).
-    ctrlr: *mut crate::io::spdk_ffi::spdk_nvme_ctrlr,
+    ctrlr: *mut crate::spdk_ffi::spdk_nvme_ctrlr,
     /// I/O timeout in milliseconds. 0 = no timeout.
     io_timeout_ms: u64,
     inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -165,8 +165,8 @@ impl SpdkBdev {
     fn open(name: &str, offset: i64, writable: bool, max_len: i64) -> IOResult<Self> {
         // Look up bdev metadata from SpdkEnv
         {
-            use crate::io::spdk_env::SpdkEnv;
-            use crate::io::spdk_ffi;
+            use crate::spdk_env::SpdkEnv;
+            use crate::spdk_ffi;
             let env = SpdkEnv::global_or_err()?;
             // Register handle so shutdown knows we're alive
             env.acquire_handle()?;
@@ -336,7 +336,7 @@ impl SpdkBdev {
             let aligned_len = DmaBuf::align_up(chunk_data + head_skip, bs);
 
             // Submit NVMe read
-            use crate::io::spdk_poller::{IoCompletion, IoOp, IoRequest};
+            use crate::spdk_poller::{IoCompletion, IoOp, IoRequest};
             let completion = IoCompletion::new();
             self.inflight
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -394,7 +394,7 @@ impl SpdkBdev {
             return err_box!("SPDK qpair is dead, device unreachable");
         }
 
-        use crate::io::spdk_poller::{IoCompletion, IoOp, IoRequest};
+        use crate::spdk_poller::{IoCompletion, IoOp, IoRequest};
 
         if !self.writable {
             return err_box!("bdev '{}' not opened for writing", self.name);
@@ -523,7 +523,7 @@ impl SpdkBdev {
             return err_box!("SPDK qpair is dead, device unreachable");
         }
 
-        use crate::io::spdk_poller::{IoCompletion, IoOp, IoRequest};
+        use crate::spdk_poller::{IoCompletion, IoOp, IoRequest};
         let completion = IoCompletion::new();
         self.inflight
             .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -735,7 +735,7 @@ impl Drop for SpdkBdev {
         }
 
         // Return qpair to pool and release handle.
-        if let Some(env) = crate::io::spdk_env::SpdkEnv::global_including_shutdown() {
+        if let Some(env) = crate::spdk_env::SpdkEnv::global_including_shutdown() {
             // Unregister qpair from poller before returning it to pool to avoid use-after-free
             let unregistered = env.unregister_qpair_from_poller(self.io_channel.qpair);
             if unregistered {
@@ -749,7 +749,7 @@ impl Drop for SpdkBdev {
             env.release_handle();
         } else {
             unsafe {
-                crate::io::spdk_ffi::curvine_spdk_free_io_qpair(self.io_channel.qpair);
+                crate::spdk_ffi::curvine_spdk_free_io_qpair(self.io_channel.qpair);
             }
         }
         debug!(
@@ -762,7 +762,8 @@ impl Drop for SpdkBdev {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::io::spdk_env::{SpdkConf, SpdkEnv};
+    use crate::spdk_env::SpdkEnv;
+    use orpc::io::SpdkConf;
 
     fn ensure_spdk_init() {
         if SpdkEnv::global().is_some() {
@@ -781,8 +782,8 @@ mod test {
         let subnqn = std::env::var("SPDK_TARGET_NQN")
             .unwrap_or_else(|_| "nqn.2024-01.io.curvine:test".into());
         let trtype = std::env::var("SPDK_TRANSPORT_TYPE").unwrap_or_else(|_| "tcp".into());
-        conf.iova_mode = crate::io::spdk_env::spdk_iova_mode_for_test();
-        conf.targets = vec![crate::io::spdk_env::NvmeTarget {
+        conf.iova_mode = std::env::var("SPDK_IOVA_MODE").unwrap_or_else(|_| "va".to_string());
+        conf.targets = vec![orpc::io::NvmeTarget {
             traddr,
             trsvcid,
             subnqn,

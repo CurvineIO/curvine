@@ -9,8 +9,8 @@ license.workspace = true
 [features]
 default = []
 jni = ["curvine-ufs/jni"]
-spdk = ["orpc/spdk"]
-spdk-rdma = ["spdk", "orpc/spdk-rdma"]
+spdk = ["dep:curvine-storage-spdk", "curvine-storage-spdk/spdk"]
+spdk-rdma = ["spdk", "curvine-storage-spdk/spdk-rdma"]
 fault-injection = [
     "curvine-fault/http-server",
 ]
@@ -20,6 +20,7 @@ orpc = { workspace = true }
 curvine-common = { workspace = true }
 curvine-error = { workspace = true, features = ["axum-response"] }
 curvine-fault = { workspace = true }
+curvine-storage-spdk = { workspace = true, optional = true }
 curvine-client = { workspace = true }
 curvine-ufs = { workspace = true }
 curvine-web = { workspace = true }

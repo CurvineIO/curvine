@@ -161,7 +161,21 @@ check_mixed_spdk_feature_risk() {
       --prefix none \
       -f '{p} {f}' 2>"$err"
   )"; then
-    if grep -E '^orpc v.*spdk' <<<"$output" >/dev/null; then
+    if awk '
+      $1 == "orpc" {
+        features = $0
+        sub(/^orpc v[^ ]+ /, "", features)
+        sub(/^\([^)]*\) /, "", features)
+        count = split(features, values, ",")
+        for (i = 1; i <= count; i++) {
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", values[i])
+          if (values[i] == "spdk" || values[i] == "spdk-rdma") {
+            found = 1
+          }
+        }
+      }
+      END { exit found ? 0 : 1 }
+    ' <<<"$output"; then
       record_violation "mixed-spdk-feature-risk" "server spdk-rdma feature still enables SPDK features on shared orpc during a mixed CLI/server cargo tree"
     else
       record_ok "mixed-spdk-feature-risk"

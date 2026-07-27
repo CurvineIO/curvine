@@ -12,19 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod net;
-pub mod retry;
+pub use orpc::io::{NvmeTarget, SpdkConf};
 
-mod local_file;
-pub use self::local_file::LocalFile;
+#[cfg(feature = "spdk")]
+pub mod spdk_bdev;
+#[cfg(feature = "spdk")]
+pub mod spdk_env;
+#[cfg(feature = "spdk")]
+pub mod spdk_ffi;
+#[cfg(feature = "spdk")]
+pub mod spdk_poller;
 
-pub mod io_error;
-pub use self::io_error::IOError;
+#[cfg(all(test, feature = "spdk"))]
+mod spdk_bdev_test;
 
-pub type IOResult<T> = Result<T, IOError>;
-
-pub mod block_io;
-pub use self::block_io::{BlockDevice, BlockIO};
-
-pub mod spdk_conf;
-pub use self::spdk_conf::{BdevInfo, NvmeTarget, SpdkConf};
+#[cfg(feature = "spdk")]
+pub use spdk_bdev::SpdkBdev;
+#[cfg(feature = "spdk")]
+pub use spdk_env::{BdevInfo, SpdkEnv, SpdkEnvState};
+#[cfg(feature = "spdk")]
+pub use spdk_poller::{CtrlHandle, PollerConfig};
