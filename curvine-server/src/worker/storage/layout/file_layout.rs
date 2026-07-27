@@ -21,6 +21,7 @@ use orpc::common::ByteUnit;
 use orpc::common::FileUtils;
 use orpc::io::{BlockDevice, IOError, IOResult, LocalFile};
 use orpc::{err_box, try_err, CommonResult};
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
 
@@ -123,6 +124,10 @@ impl BlockLayout for FileLayout {
                 );
             }
 
+            // This copy is intentionally serialized by the dataset write lock so
+            // the committed-to-staging transition cannot race another writer.
+            // Existing open readers keep using active; new metadata operations
+            // wait for the copy to finish.
             if let Err(e) = fs::copy(&committed_path, &staging_path) {
                 let _ = fs::remove_file(&staging_path);
                 return Err(e.into());
@@ -160,14 +165,23 @@ impl BlockLayout for FileLayout {
         let staging_dir = FileUtils::list_files(Self::staging_dir(dir), true)?;
 
         let mut blocks = vec![];
+        let mut active_ids = HashSet::new();
         for file in active_dir {
             if let Ok(meta) = BlockMeta::from_file(&file, BlockState::Finalized, dir) {
+                active_ids.insert(meta.id());
                 blocks.push(meta);
             }
         }
 
         for file in staging_dir {
             if let Ok(meta) = BlockMeta::from_file(&file, BlockState::Recovering, dir) {
+                // A crash during a rewrite can leave the committed active file
+                // and an incomplete staging copy. Prefer the published active
+                // generation and discard staging before capacity is reserved.
+                if active_ids.contains(&meta.id()) {
+                    fs::remove_file(file)?;
+                    continue;
+                }
                 blocks.push(meta);
             }
         }

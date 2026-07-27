@@ -729,6 +729,43 @@ mod test {
         Ok(())
     }
     #[test]
+    fn restart_during_rewrite_discards_staging_and_keeps_committed() -> CommonResult<()> {
+        let dataset_name = "restart-during-rewrite";
+        let mut ds = create_data_set(true, dataset_name);
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let writing = ds.open_block(&block)?;
+        ds.write_test_data(&writing, "40B")?;
+        block.len = 40;
+        let finalized = ds.finalize_block(&block)?;
+        let finalized_available = ds.available();
+        let active_path = {
+            let dir = ds.find_dir(finalized.dir_id())?;
+            FileLayout::block_path(dir, &finalized)?
+        };
+        let committed_bytes = std::fs::read(&active_path)?;
+
+        block.len = 60;
+        let rewriting = ds.open_block(&block)?;
+        let staging_path = {
+            let dir = ds.find_dir(rewriting.dir_id())?;
+            FileLayout::block_path(dir, &rewriting)?
+        };
+        std::fs::write(&staging_path, b"partial rewrite")?;
+        assert!(active_path.exists());
+        assert!(staging_path.exists());
+        drop(ds);
+
+        let restarted = create_data_set(false, dataset_name);
+        let recovered = restarted.get_block(block.id).unwrap();
+        assert!(recovered.is_final());
+        assert_eq!(recovered.len(), finalized.len());
+        assert_eq!(restarted.num_blocks(), 1);
+        assert_eq!(restarted.available(), finalized_available);
+        assert_eq!(std::fs::read(active_path)?, committed_bytes);
+        assert!(!staging_path.exists());
+        Ok(())
+    }
+    #[test]
     fn finalize_rewrite_publishes_staging_file() -> CommonResult<()> {
         let mut ds = create_data_set(true, "finalize-rewrite-publishes");
         let mut block = ExtendedBlock::with_mem(1, "100B")?;
