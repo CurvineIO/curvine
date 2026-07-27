@@ -111,6 +111,7 @@ impl BlockLayout for FileLayout {
             return err_box!("Invalid file block size: {}", block.len);
         }
         let mut prepared = BlockMeta::new(meta.id(), block.len, dir);
+        // A staging rewrite starts from the committed allocation and may grow, so charge the larger size.
         prepared.actual_len = meta.actual_len.max(block.len);
 
         if meta.is_final() {
