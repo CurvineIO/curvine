@@ -70,7 +70,9 @@ impl BlockStore {
 
     pub fn get_block(&self, id: i64) -> CommonResult<BlockMeta> {
         let state = self.read()?;
-        let b = state.get_block_check(id)?;
+        let b = state
+            .get_readable_block(id)
+            .ok_or_else(|| orpc::err_msg!(format!("block {} not exists", id)))?;
         Ok(b.clone())
     }
 
@@ -130,7 +132,7 @@ impl BlockStore {
             remove_result
         }?;
 
-        removed.layout.deallocate(&removed.dir, &removed.meta)?;
+        removed.deallocate()?;
         removed.release_space();
         Ok(removed.meta)
     }

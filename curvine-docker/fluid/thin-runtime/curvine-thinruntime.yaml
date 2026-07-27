@@ -8,6 +8,10 @@ spec:
     image: ghcr.io/curvineio/curvine
     imageTag: latest
     imagePullPolicy: IfNotPresent
+    command:
+    - /entrypoint.sh
+    args:
+    - fluid-thin-runtime
 ---
 # Dataset definition
 apiVersion: data.fluid.io/v1alpha1
@@ -19,7 +23,17 @@ spec:
   - mountPoint: curvine:///data  # curvine://path format
     name: curvine
     options:
-      master-endpoints: "127.0.0.1:8995"  # Replace with your Curvine master
+      master-endpoints: "curvine-master-0.curvine-master.default.svc.cluster.local:8995,curvine-master-1.curvine-master.default.svc.cluster.local:8995"
+      master-web-port: "9000"
+      # Optional advanced Curvine TOML options. Values should stay quoted in
+      # Kubernetes YAML because Fluid Dataset mount options are string maps.
+      # client.enable_unified_fs: "false"
+      # fuse.write_back_cache: "true"
+      # fuse.entry_timeout_ms: "300000"
+      # fuse.attr_timeout_ms: "300000"
+      # fuse.enable_meta_cache: "true"
+      # fuse.meta_cache_timeout: "12h"
+      # fuse.node_cache_timeout: "24h"
   accessModes:
     - ReadOnlyMany
 ---

@@ -293,11 +293,12 @@ impl JournalWriter {
         fs_dir: &FsDir,
         src_path: P,
         dst_path: P,
+        mtime: i64,
     ) -> FsResult<()> {
         let entry = LinkEntry {
             op_id: fs_dir.next_op_id(),
             rpc_id: 0,
-            mtime: LocalTime::mills() as i64,
+            mtime,
             src_path: src_path.as_ref().to_string(),
             dst_path: dst_path.as_ref().to_string(),
         };

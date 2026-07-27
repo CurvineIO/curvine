@@ -66,19 +66,14 @@ impl BackendHandle {
         }
     }
 
-    /// Defensive upper bound for a single read/write request size. FUSE `size`
-    /// is a `u32` from the kernel and is normally already capped by the
-    /// `max_write`/`max_readahead` negotiated at init, but userspace still
-    /// validates it so an abnormal request cannot drive an oversized backend IO.
+    /// Defensive upper bound for a single read/write request size.
     /// Same source as the `max_write` computed in `init`.
     fn max_io_size() -> u64 {
         FuseUtils::get_fuse_buf_size() as u64
     }
 
-    /// Validate that a FUSE request offset (`u64`) fits in the signed `i64` the
-    /// backend uses; an offset `> i64::MAX` would wrap to a negative position
-    /// when cast `as i64`. Returns `EINVAL` instead of letting it reach the
-    /// backend.
+    /// Validate that a FUSE request offset (`u64`) fits in the signed `i64` the backend uses;
+    /// an offset `> i64::MAX` would wrap to a negative position when cast `as i64`.
     fn check_offset(offset: u64) -> FuseResult<()> {
         if offset > i64::MAX as u64 {
             return err_fuse!(libc::EINVAL, "offset {} exceeds i64::MAX", offset);
@@ -86,9 +81,7 @@ impl BackendHandle {
         Ok(())
     }
 
-    /// Validate that a write length fits in the `u32` reported back to the kernel
-    /// (`fuse_write_out.size`); a larger length would truncate and silently
-    /// under-report the written byte count, so reject it with `EFBIG`.
+    /// Validate that write length fits in `fuse_write_out.size` without truncation.
     fn check_write_len(len: usize) -> FuseResult<()> {
         if len as u64 > u32::MAX as u64 {
             return err_fuse!(libc::EFBIG, "write len {} exceeds u32::MAX", len);
@@ -124,10 +117,7 @@ impl BackendHandle {
 
                 let path = reader.path().clone();
                 let new_reader = state.new_reader(&path).await?;
-                // Refresh the handle's status snapshot from the freshly reopened
-                // reader before installing it, so `status()` reflects the current
-                // file (length/mtime) after a dirty-read reopen rather than the
-                // stale open-time snapshot.
+                // Refresh status from the reopened reader before installing it.
                 self.refresh_status(new_reader.status().clone());
                 reader.replace(new_reader);
 
@@ -182,16 +172,12 @@ impl BackendHandle {
         Ok(())
     }
 
-    /// A clone of the current file status. Returns an owned value (not a
-    /// reference) because the status is lock-guarded: the read path can refresh
-    /// it in place after a dirty-read reopen.
+    /// A clone of the current lock-guarded file status.
     pub fn status(&self) -> FileStatus {
         self.status.read().unwrap().clone()
     }
 
-    /// Replace the open-time status snapshot with a fresh one. Called from the
-    /// read path after a dirty-read reopen so `status()` no longer reports the
-    /// stale open-time length/mtime.
+    /// Replace the open-time status snapshot after a dirty-read reopen.
     fn refresh_status(&self, status: FileStatus) {
         *self.status.write().unwrap() = status;
     }
@@ -211,7 +197,6 @@ impl BackendHandle {
         }
     }
 
-    // Remove lock, return owner_id
     pub fn remove_lock(&self, typ: LockFlags) -> Option<u64> {
         let mut fh_locks = self.fh_locks.lock().unwrap();
 
@@ -298,9 +283,7 @@ impl BackendHandle {
 mod tests {
     use super::BackendHandle;
 
-    // An offset within i64 range passes; an offset > i64::MAX (which would wrap
-    // negative when cast `as i64`) is rejected with EINVAL before it can reach
-    // the backend.
+    // Reject offsets that would wrap negative when cast to i64.
     #[test]
     fn offset_over_i64_max_returns_einval() {
         assert!(BackendHandle::check_offset(0).is_ok());
@@ -338,9 +321,7 @@ mod tests {
         assert_eq!(err.errno(), libc::EFBIG);
     }
 
-    // After a dirty-read reopen the read path calls `refresh_status` (through a
-    // shared `&self`); `status()` must then reflect the reopened file's
-    // length/mtime, not the stale open-time snapshot.
+    // After dirty-read reopen, `status()` must reflect the reopened file snapshot.
     #[test]
     fn refresh_status_updates_snapshot_through_shared_ref() {
         use curvine_common::state::FileStatus;

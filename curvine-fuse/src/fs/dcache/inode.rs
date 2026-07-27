@@ -44,11 +44,14 @@ pub struct Inode {
 
 impl Inode {
     pub fn new_root() -> Self {
+        // Match master `AclFeature::DEFAULT_MODE` (0o777). A mode-0 placeholder would
+        // fail-closed on every non-root path traverse that walks the mount root.
         let root_st = FileStatus {
             is_dir: true,
             name: FUSE_PATH_SEPARATOR.to_owned(),
             path: FUSE_PATH_SEPARATOR.to_owned(),
             nlink: 2,
+            mode: 0o777,
             ..Default::default()
         };
         let dir = Some(Box::new(DirEntry::new()));
@@ -67,7 +70,16 @@ impl Inode {
         }
     }
 
-    pub fn with_status(ino: u64, parent: u64, name: &str, mut status: FileStatus) -> Self {
+    // `n_lookup` is the initial kernel lookup count: 1 for real LOOKUP /
+    // READDIRPLUS (kernel caches the child and will FORGET it), 0 for plain
+    // READDIR (no kernel ref). `ref_ctr` is always 1 for the local dcache dentry.
+    pub fn with_status(
+        ino: u64,
+        parent: u64,
+        name: &str,
+        mut status: FileStatus,
+        n_lookup: u64,
+    ) -> Self {
         let dir = if status.is_dir {
             Some(Box::new(DirEntry::new()))
         } else {
@@ -82,7 +94,7 @@ impl Inode {
             status,
             locs: None,
             lifecycle: Lifecycle::Cached,
-            n_lookup: 1,
+            n_lookup,
             ref_ctr: 1,
             last_access: LocalTime::mills(),
             dir,

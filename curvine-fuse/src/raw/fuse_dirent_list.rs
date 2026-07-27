@@ -82,12 +82,12 @@ impl FuseDirentList {
         }
     }
 
-    /// Add an entry to the buffer and return false if the buff is already full.
+    /// Add an entry to the buffer and return false if the buffer is already full.
     fn add_buf<T>(&mut self, data: &T, name: &[u8]) -> bool {
         let bytes = FuseUtils::struct_as_bytes(data);
 
         let data_len = bytes.len() + name.len();
-        // 64 bytes aligned
+        // 8-byte (u64) aligned
         let align_len = (data_len + size_of::<u64>() - 1) & !(size_of::<u64>() - 1);
 
         if self.buf.len() + align_len > self.max_size {

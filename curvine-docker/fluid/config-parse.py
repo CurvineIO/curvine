@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import sys
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 
@@ -20,9 +20,10 @@ hostname = "{master_hostname}"
 rpc_port = {master_rpc_port}
 web_port = {master_web_port}
 
-[[client.master_addrs]]
-hostname = "{master_hostname}"
-port = {master_rpc_port}
+[client]
+{client_options}
+
+{client_master_addrs}
 
 [fuse]
 debug = false
@@ -30,6 +31,7 @@ io_threads = 16
 worker_threads = 32
 mnt_path = "{mount_path}"
 fs_path = "{fs_path}"
+{fuse_options}
 
 """
     
@@ -56,16 +58,52 @@ fi
 exec {fuse_cmd}
 """
     
-    FUSE_OPTIONS = [
-        'tasks-per-mnt', 'clone-fd', 'fuse-channel-size', 'stream-channel-size',
-        'direct-io', 'write-back-cache', 'cache-readdir', 'non-seekable',
-        'entry-timeout', 'attr-timeout', 'negative-timeout', 'ac-attr-timeout',
-        'max-background', 'congestion-threshold',
-        'node-cache-timeout',
-        'enable-meta-cache', 'meta-cache-ttl',
-        'read-dir-fill-ino', 'remember', 'check-permission', 'list-limit',
-        'web-port',
+    FUSE_CLI_OPTIONS = [
+        ('tasks-per-mnt', 'tasks-per-mnt'),
+        ('mnt-per-task', 'tasks-per-mnt'),
+        ('clone-fd', 'clone-fd'),
+        ('fuse-channel-size', 'fuse-channel-size'),
+        ('stream-channel-size', 'stream-channel-size'),
+        ('direct-io', 'direct-io'),
+        ('write-back-cache', 'write-back-cache'),
+        ('cache-readdir', 'cache-readdir'),
+        ('non-seekable', 'non-seekable'),
+        ('entry-timeout-ms', 'entry-timeout-ms'),
+        ('entry-timeout', 'entry-timeout-ms'),
+        ('attr-timeout-ms', 'attr-timeout-ms'),
+        ('attr-timeout', 'attr-timeout-ms'),
+        ('negative-timeout-ms', 'negative-timeout-ms'),
+        ('negative-timeout', 'negative-timeout-ms'),
+        ('max-background', 'max-background'),
+        ('congestion-threshold', 'congestion-threshold'),
+        ('node-cache-timeout', 'node-cache-timeout'),
+        ('enable-meta-cache', 'enable-meta-cache'),
+        ('meta-cache-ttl', 'meta-cache-ttl'),
+        ('meta-cache-timeout', 'meta-cache-ttl'),
+        ('read-dir-fill-ino', 'read-dir-fill-ino'),
+        ('remember', 'remember'),
+        ('check-permission', 'check-permission'),
+        ('metrics-enabled', 'metrics-enabled'),
+        ('list-limit', 'list-limit'),
+        ('web-port', 'web-port'),
     ]
+
+    CLIENT_TOML_PREFIX = "client."
+    FUSE_TOML_PREFIX = "fuse."
+    FUSE_TOML_ALIASES = {
+        "enable_write_back": "write_back_cache",
+        "meta_cache_ttl": "meta_cache_timeout",
+    }
+    MANAGED_FUSE_TOML_KEYS = {
+        "debug",
+        "io_threads",
+        "worker_threads",
+        "mnt_path",
+        "fs_path",
+    }
+    MANAGED_CLIENT_TOML_KEYS = {
+        "master_addrs",
+    }
     
     def __init__(self, config_path: Optional[str] = None):
         self.config_path = config_path or self.CONFIG_FILE
@@ -86,7 +124,22 @@ exec {fuse_cmd}
             lines = content.split('\n')
             self.config = json.loads(lines[0].strip())
         
-        self.mount_options = self.config.get('mounts', [{}])[0].get('options', {})
+        mounts = self.config.get('mounts', [])
+        if not isinstance(mounts, list):
+            raise ValueError("Curvine ThinRuntime config field mounts must be a list")
+        if len(mounts) != 1:
+            raise ValueError(
+                f"Curvine ThinRuntime expects exactly one Dataset mount, got {len(mounts)}"
+            )
+        if not isinstance(mounts[0], dict):
+            raise ValueError("Curvine ThinRuntime mount entry must be an object")
+
+        mount_options = mounts[0].get('options', {})
+        if mount_options is None:
+            mount_options = {}
+        if not isinstance(mount_options, dict):
+            raise ValueError("Curvine ThinRuntime mount options must be an object")
+        self.mount_options = mount_options
     
     def get_value(self, config_path: Union[str, List], env_var: str, 
                   required: bool = True, default: Optional[str] = None) -> Optional[str]:
@@ -118,12 +171,86 @@ exec {fuse_cmd}
         
         return None
     
+    @staticmethod
+    def has_value(value: Any) -> bool:
+        return value is not None and str(value) != ""
+
     def get_option(self, key: str, env_var: str, default: Optional[str] = None) -> Optional[str]:
         """Get option from mount_options or environment variable."""
-        return self.mount_options.get(key) or os.getenv(env_var, default)
+        if key in self.mount_options and self.has_value(self.mount_options[key]):
+            return self.mount_options[key]
+        return os.getenv(env_var, default)
+
+    def get_cli_option(self, dataset_key: str) -> Optional[str]:
+        """Get a FUSE CLI option from Dataset options or environment variables."""
+        env_var = f'CURVINE_{dataset_key.upper().replace("-", "_")}'
+        if dataset_key in self.mount_options and self.has_value(self.mount_options[dataset_key]):
+            return self.mount_options[dataset_key]
+        return os.getenv(env_var)
+
+    @staticmethod
+    def render_toml_value(value: Any) -> str:
+        """Render a Dataset option value as a TOML scalar."""
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, int) and not isinstance(value, bool):
+            return str(value)
+        if isinstance(value, float):
+            return str(value)
+
+        text = str(value).strip()
+        lower = text.lower()
+        if lower in ("true", "false"):
+            return lower
+        if re.fullmatch(r"[+-]?(0|[1-9][0-9]*)", text):
+            return text
+        if re.fullmatch(r"[+-]?(0|[1-9][0-9]*)\.[0-9]+", text):
+            return text
+        return json.dumps(text)
+
+    @staticmethod
+    def render_toml_options(options: Dict[str, Any]) -> str:
+        rendered = []
+        for key in sorted(options):
+            rendered.append(f"{key} = {ConfigParser.render_toml_value(options[key])}")
+        return "\n".join(rendered)
+
+    def collect_advanced_toml_options(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Collect Dataset options that should be written into Curvine TOML."""
+        client_options: Dict[str, Any] = {}
+        fuse_options: Dict[str, Any] = {}
+
+        for key, value in self.mount_options.items():
+            if key.startswith(self.CLIENT_TOML_PREFIX):
+                option_name = key[len(self.CLIENT_TOML_PREFIX):].strip()
+                if not option_name or "." in option_name:
+                    raise ValueError(f"Invalid client option key: {key}")
+                if option_name in self.MANAGED_CLIENT_TOML_KEYS:
+                    raise ValueError(f"Dataset option {key} is managed by Curvine ThinRuntime")
+                client_options[option_name] = value
+                continue
+
+            if key.startswith(self.FUSE_TOML_PREFIX):
+                option_name = key[len(self.FUSE_TOML_PREFIX):].strip()
+                if not option_name or "." in option_name:
+                    raise ValueError(f"Invalid fuse option key: {key}")
+                option_name = self.FUSE_TOML_ALIASES.get(option_name, option_name)
+                if option_name in self.MANAGED_FUSE_TOML_KEYS:
+                    raise ValueError(f"Dataset option {key} is managed by Curvine ThinRuntime")
+                fuse_options[option_name] = value
+
+        return client_options, fuse_options
     
-    def parse_master_endpoints(self) -> Tuple[str, str]:
-        """Parse master endpoints and return (hostname, port)."""
+    @staticmethod
+    def _split_master_endpoints(endpoints: Any) -> List[str]:
+        if isinstance(endpoints, list):
+            raw_entries = [str(entry).strip() for entry in endpoints]
+        else:
+            raw_entries = re.split(r"[,;\s]+", str(endpoints).strip())
+        return [entry for entry in raw_entries if entry]
+
+    def parse_master_endpoints(self) -> List[Tuple[str, str]]:
+        """Parse master endpoints and return all (hostname, port) pairs."""
         endpoints = self.get_option('master-endpoints', 'CURVINE_MASTER_ENDPOINTS')
         if not endpoints:
             raise ValueError(
@@ -131,14 +258,35 @@ exec {fuse_cmd}
                 "CURVINE_MASTER_ENDPOINTS environment variable"
             )
         
-        try:
-            hostname, port = endpoints.split(':', 1)
-            return hostname, port
-        except ValueError:
+        parsed_endpoints = []
+        for endpoint in self._split_master_endpoints(endpoints):
+            hostname, separator, port = endpoint.rpartition(':')
+            if not separator or not hostname or not port:
+                raise ValueError(
+                    f"Invalid master endpoint: {endpoint}, "
+                    f"expected format: hostname:port[,hostname:port...]"
+                )
+            try:
+                port_num = int(port)
+            except ValueError:
+                raise ValueError(
+                    f"Invalid master endpoint port: {endpoint}, "
+                    f"port must be an integer"
+                )
+            if port_num <= 0 or port_num > 65535:
+                raise ValueError(
+                    f"Invalid master endpoint port: {endpoint}, "
+                    f"port must be between 1 and 65535"
+                )
+            parsed_endpoints.append((hostname, str(port_num)))
+
+        if not parsed_endpoints:
             raise ValueError(
-                f"Invalid master endpoints format: {endpoints}, "
-                f"expected format: hostname:port"
+                "Master endpoints are empty, expected format: "
+                "hostname:port[,hostname:port...]"
             )
+
+        return parsed_endpoints
     
     def parse_fs_path(self, mount_point: str) -> str:
         """Parse filesystem path from mount point."""
@@ -158,27 +306,49 @@ exec {fuse_cmd}
             "--worker-threads", worker_threads
         ]
         
-        for option in self.FUSE_OPTIONS:
-            value = self.get_option(option, f'CURVINE_{option.upper().replace("-", "_")}')
-            if value:
-                cmd_parts.extend([f"--{option}", str(value)])
+        emitted_cli_flags = set()
+        for dataset_key, cli_flag in self.FUSE_CLI_OPTIONS:
+            if cli_flag in emitted_cli_flags:
+                continue
+            value = self.get_cli_option(dataset_key)
+            if self.has_value(value):
+                cmd_parts.extend([f"--{cli_flag}", str(value)])
+                emitted_cli_flags.add(cli_flag)
         
         return " ".join(f'"{arg}"' if " " in arg else arg for arg in cmd_parts)
     
-    def generate_toml_config(self, curvine_home: str, master_hostname: str,
-                             master_rpc_port: str, master_web_port: str,
+    @staticmethod
+    def render_client_master_addrs(master_endpoints: List[Tuple[str, str]]) -> str:
+        """Render Curvine client master_addrs TOML entries."""
+        rendered_entries = []
+        for hostname, port in master_endpoints:
+            rendered_entries.append(
+                "[[client.master_addrs]]\n"
+                f"hostname = {json.dumps(hostname)}\n"
+                f"port = {port}"
+            )
+        return "\n\n".join(rendered_entries)
+
+    def generate_toml_config(self, curvine_home: str, master_endpoints: List[Tuple[str, str]],
+                             master_web_port: str, client_options: Dict[str, Any],
+                             fuse_options: Dict[str, Any],
                              target_path: str, fs_path: str) -> None:
         """Generate Curvine TOML configuration file."""
         os.makedirs(f"{curvine_home}/conf", exist_ok=True)
         config_file = f"{curvine_home}/conf/curvine-cluster.toml"
+
+        master_hostname, master_rpc_port = master_endpoints[0]
         
         with open(config_file, 'w') as f:
             f.write(self.TOML_TEMPLATE.format(
                 master_hostname=master_hostname,
                 master_rpc_port=master_rpc_port,
                 master_web_port=master_web_port,
+                client_options=self.render_toml_options(client_options),
+                client_master_addrs=self.render_client_master_addrs(master_endpoints),
                 mount_path=target_path,
-                fs_path=fs_path
+                fs_path=fs_path,
+                fuse_options=self.render_toml_options(fuse_options)
             ))
     
     def generate_mount_script(self, curvine_home: str, target_path: str,
@@ -212,19 +382,20 @@ exec {fuse_cmd}
         
         mount_point = self.get_value(['mounts', 0, 'mountPoint'], 'CURVINE_MOUNT_POINT')
         target_path = self.get_value('targetPath', 'CURVINE_TARGET_PATH')
-        master_hostname, master_rpc_port = self.parse_master_endpoints()
+        master_endpoints = self.parse_master_endpoints()
         
         master_web_port = self.get_option('master-web-port', 'CURVINE_MASTER_WEB_PORT', '8080')
         io_threads = self.get_option('io-threads', 'CURVINE_IO_THREADS', '32')
         worker_threads = self.get_option('worker-threads', 'CURVINE_WORKER_THREADS', '56')
         mnt_number = self.get_option('mnt-number', 'CURVINE_MNT_NUMBER', '1')
+        client_options, fuse_options = self.collect_advanced_toml_options()
         
         fs_path = self.parse_fs_path(mount_point)
         curvine_home = os.getenv('CURVINE_HOME', '/app/curvine')
         
         self.generate_toml_config(
-            curvine_home, master_hostname, master_rpc_port,
-            master_web_port, target_path, fs_path
+            curvine_home, master_endpoints,
+            master_web_port, client_options, fuse_options, target_path, fs_path
         )
         
         fuse_cmd = self.build_fuse_command(
@@ -236,7 +407,7 @@ exec {fuse_cmd}
         config_summary = {
             'Mount path': target_path,
             'FS path': fs_path,
-            'Master endpoint': f"{master_hostname}:{master_rpc_port}",
+            'Master endpoints': ",".join(f"{host}:{port}" for host, port in master_endpoints),
             'Master web port': master_web_port,
             'Mount point': mount_point,
             'IO threads': io_threads,
@@ -244,11 +415,19 @@ exec {fuse_cmd}
             'Mount number': mnt_number,
             'curvine_home': curvine_home
         }
+        if client_options:
+            config_summary['Client TOML options'] = ",".join(sorted(client_options))
+        if fuse_options:
+            config_summary['FUSE TOML options'] = ",".join(sorted(fuse_options))
         
-        for option in self.FUSE_OPTIONS:
-            value = self.get_option(option, f'CURVINE_{option.upper().replace("-", "_")}')
-            if value:
-                config_summary[option.replace('-', ' ').title()] = value
+        emitted_cli_flags = set()
+        for dataset_key, cli_flag in self.FUSE_CLI_OPTIONS:
+            if cli_flag in emitted_cli_flags:
+                continue
+            value = self.get_cli_option(dataset_key)
+            if self.has_value(value):
+                config_summary[cli_flag.replace('-', ' ').title()] = value
+                emitted_cli_flags.add(cli_flag)
         
         self.print_config_summary(config_summary)
 
@@ -260,7 +439,7 @@ def print_error_help() -> None:
     env_vars = [
         ("CURVINE_MOUNT_POINT", "Mount point (e.g., curvine:///data)"),
         ("CURVINE_TARGET_PATH", "Target mount path (e.g., /mnt/data)"),
-        ("CURVINE_MASTER_ENDPOINTS", "Master endpoints (e.g., master:9000)"),
+        ("CURVINE_MASTER_ENDPOINTS", "Master endpoints (e.g., master-0:8995,master-1:8995)"),
         ("CURVINE_MASTER_WEB_PORT", "Master web port (default: 8080)"),
         ("CURVINE_IO_THREADS", "IO threads (default: 32)"),
         ("CURVINE_WORKER_THREADS", "Worker threads (default: 56)"),
@@ -272,11 +451,16 @@ def print_error_help() -> None:
     
     print("\nSupported Dataset options (in spec.mounts[].options):", file=sys.stderr)
     dataset_options = [
-        ("master-endpoints", "Master RPC endpoint (hostname:port) [required]"),
+        ("master-endpoints", "Master RPC endpoints (hostname:port[,hostname:port...]) [required]"),
         ("master-web-port", "Master web port (default: 8080)"),
         ("io-threads", "IO threads (default: 32)"),
         ("worker-threads", "Worker threads (default: 56)"),
         ("mnt-number", "Mount number (default: 1)"),
+        ("entry-timeout-ms", "FUSE entry timeout in milliseconds"),
+        ("attr-timeout-ms", "FUSE attr timeout in milliseconds"),
+        ("write-back-cache", "FUSE CLI write-back cache override"),
+        ("client.<key>", "Advanced Curvine [client] TOML option"),
+        ("fuse.<key>", "Advanced Curvine [fuse] TOML option"),
     ]
     
     for opt, desc in dataset_options:

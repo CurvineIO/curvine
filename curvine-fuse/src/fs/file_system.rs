@@ -161,16 +161,12 @@ pub trait FileSystem: Send + Sync + 'static {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    /// `renameat2(2)` with flags. Default ENOSYS (like `rename`); an
-    /// implementation may delegate the flag-less case to `rename` and reject
-    /// unsupported flags.
+    /// `renameat2(2)` with flags; default ENOSYS like `rename`.
     fn rename2(&self, op: Rename2<'_>) -> impl Future<Output = FuseResult<()>> + Send {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    /// `fsync(2)`/`fdatasync(2)` on a directory fd. Default is a benign no-op:
-    /// directory metadata is synchronized to the master via RPC on each
-    /// mutation, so there is no client-side directory write buffer to flush.
+    /// `fsync(2)`/`fdatasync(2)` on a directory fd; default no-op.
     fn fsync_dir(&self, _op: FSyncDir<'_>) -> impl Future<Output = FuseResult<()>> + Send {
         async move { Ok(()) }
     }
@@ -184,10 +180,8 @@ pub trait FileSystem: Send + Sync + 'static {
         async move { Ok(()) }
     }
 
-    /// Best-effort fallback for an interrupt whose target is no longer present in
-    /// the dispatcher's pending-request map. The pending-request notification is
-    /// the primary cancellation path; this result reports internal handling only,
-    /// because the FUSE protocol does not send a reply for the interrupt request.
+    /// Best-effort fallback for an interrupt whose target is no longer present
+    /// in the dispatcher's pending-request map.
     fn interrupt(&self, _op: Interrupt<'_>) -> impl Future<Output = FuseResult<()>> + Send {
         async move { Ok(()) }
     }

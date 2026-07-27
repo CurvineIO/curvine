@@ -128,7 +128,7 @@ pub struct SymlinkEntry {
 pub struct LinkEntry {
     pub(crate) op_id: u64,
     pub(crate) rpc_id: i64,
-    /// Link creation time, used during replay to set inode mtime.
+    /// Link creation time, reused during replay for parent mtime and inode ctime.
     pub(crate) mtime: i64,
     pub(crate) src_path: String,
     pub(crate) dst_path: String,

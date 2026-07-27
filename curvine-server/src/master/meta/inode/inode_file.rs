@@ -18,7 +18,7 @@ use crate::master::meta::store::InodeStore;
 use crate::master::meta::{BlockMeta, InodeId};
 use curvine_common::state::{
     is_special_file_type, BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts,
-    FileType, StoragePolicy,
+    FileType, StoragePolicy, INTERNAL_CTIME_XATTR,
 };
 use curvine_common::FsResult;
 use orpc::common::LocalTime;
@@ -261,9 +261,10 @@ impl InodeFile {
     }
 
     // Decrement link count
-    pub fn decrement_nlink(&mut self) -> u32 {
+    pub fn decrement_nlink(&mut self, ctime: i64) -> u32 {
         if self.nlink > 0 {
             self.nlink -= 1;
+            self.update_ctime(ctime);
         }
         self.nlink
     }
@@ -289,6 +290,7 @@ impl InodeFile {
         self.block_size = opts.block_size as u32;
         self.storage_policy.overwrite(opts.storage_policy);
         self.mtime = mtime;
+        self.update_ctime(mtime);
 
         // Reset file writing state for new write operation
         self.features.set_writing(opts.client_name);
@@ -344,7 +346,9 @@ impl InodeFile {
             );
         }
 
-        self.mtime = LocalTime::mills() as i64;
+        let mtime = LocalTime::mills() as i64;
+        self.mtime = mtime;
+        self.update_ctime(mtime);
         if !only_flush {
             self.features.complete_write(client_name);
         }
@@ -354,6 +358,7 @@ impl InodeFile {
     pub fn free(&mut self, mtime: i64) -> bool {
         if self.storage_policy.free() {
             self.mtime = mtime;
+            self.update_ctime(mtime);
             self.blocks.clear();
             true
         } else {
@@ -431,20 +436,23 @@ impl InodeFile {
         let block_size = self.block_size as i64;
         let mut start = self.last_block_start_off();
 
-        // Start from the last block's start position, process each block until expect_len
+        // Only the existing tail block can overlap the extension boundary.
+        if let Some(last_block) = self.blocks.last_mut() {
+            let resize_len = block_size.min(expect_len - start);
+            last_block.len = resize_len as u32;
+            last_block
+                .alloc_opts
+                .replace(opts.clone_with_len(resize_len));
+            start += block_size;
+        }
+
+        // Append new blocks directly; searching the growing vector here makes large
+        // fallocate requests quadratic while the master metadata write lock is held.
         while start < expect_len {
             let resize_len = block_size.min(expect_len - start);
             let block_opts = opts.clone_with_len(resize_len);
-
-            if let Some(block) = self.search_block_mut_by_pos(start) {
-                // Found existing block, extend its length
-                block.len = resize_len as u32;
-                block.alloc_opts.replace(block_opts);
-            } else {
-                // No block found, create new block
-                let new_block_id = self.next_block_id()?;
-                self.add_block(BlockMeta::with_alloc(new_block_id, block_opts));
-            }
+            let new_block_id = self.next_block_id()?;
+            self.add_block(BlockMeta::with_alloc(new_block_id, block_opts));
             start += block_size;
         }
 
@@ -552,6 +560,22 @@ impl InodeFile {
             self.cv_exists() && !self.blocks.is_empty()
         }
     }
+
+    pub fn update_mtime(&mut self, time: i64) {
+        if time > self.mtime {
+            self.mtime = time;
+            self.update_ctime(time);
+        }
+    }
+
+    pub fn update_ctime(&mut self, time: i64) {
+        if time > self.ctime() {
+            self.features.x_attr.insert(
+                INTERNAL_CTIME_XATTR.to_string(),
+                time.to_le_bytes().to_vec(),
+            );
+        }
+    }
 }
 
 impl Inode for InodeFile {
@@ -575,6 +599,15 @@ impl Inode for InodeFile {
         self.atime
     }
 
+    fn ctime(&self) -> i64 {
+        self.features
+            .x_attr
+            .get(INTERNAL_CTIME_XATTR)
+            .and_then(|bytes| bytes.as_slice().try_into().ok())
+            .map(i64::from_le_bytes)
+            .unwrap_or(self.mtime)
+    }
+
     fn nlink(&self) -> u32 {
         self.nlink
     }
@@ -583,5 +616,52 @@ impl Inode for InodeFile {
 impl PartialEq for InodeFile {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_common::state::FileAllocMode;
+
+    fn test_file(block_size: i64) -> InodeFile {
+        let mut opts = CreateFileOpts::with_create(false);
+        opts.block_size = block_size;
+        InodeFile::with_opts(1, 0, opts)
+    }
+
+    #[test]
+    fn extend_updates_tail_once_and_appends_blocks_in_order() {
+        let mut file = test_file(4);
+        file.resize(FileAllocOpts::with_alloc(10, FileAllocMode::DEFAULT))
+            .unwrap();
+        let original_ids = file.block_ids();
+
+        file.resize(FileAllocOpts::with_alloc(15, FileAllocMode::DEFAULT))
+            .unwrap();
+
+        assert_eq!(file.len, 15);
+        assert_eq!(
+            file.blocks
+                .iter()
+                .map(|block| block.len)
+                .collect::<Vec<_>>(),
+            vec![4, 4, 4, 3]
+        );
+        assert_eq!(&file.block_ids()[..original_ids.len()], original_ids);
+    }
+
+    #[test]
+    fn complete_advances_existing_independent_ctime_with_mtime() {
+        let mut file = InodeFile::new(1, 1);
+        file.features.x_attr.insert(
+            INTERNAL_CTIME_XATTR.to_string(),
+            2_i64.to_le_bytes().to_vec(),
+        );
+
+        file.complete(0, &[], "", true).unwrap();
+
+        assert!(file.mtime > 2);
+        assert_eq!(file.ctime(), file.mtime);
     }
 }

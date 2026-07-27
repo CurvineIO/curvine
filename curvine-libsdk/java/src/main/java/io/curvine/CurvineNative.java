@@ -330,4 +330,27 @@ public class CurvineNative {
     public static native byte[] getMountInfo(long nativeHandle, String path) throws IOException;
 
     public static native String togglePath(long nativeHandle, String path, boolean checkCache) throws IOException;
+
+    /**
+     * Submit a UFS-to-Curvine load job.
+     *
+     * @param nativeHandle filesystem native handle
+     * @param sourcePath UFS path or mounted CV path
+     * @param targetPath optional explicit CV target path; may be null
+     * @param overwrite whether to overwrite existing target
+     * @return serialized {@code SubmitJobResponse} protobuf bytes
+     */
+    public static native byte[] submitLoadJob(
+            long nativeHandle, String sourcePath, String targetPath, boolean overwrite)
+            throws IOException;
+
+    /**
+     * Query load job status by job id.
+     *
+     * @return serialized {@code GetJobStatusResponse} protobuf bytes
+     */
+    public static native byte[] getJobStatus(long nativeHandle, String jobId) throws IOException;
+
+    /** Cancel a load job by job id. */
+    public static native long cancelJob(long nativeHandle, String jobId) throws IOException;
 }

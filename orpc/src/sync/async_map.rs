@@ -218,13 +218,15 @@ impl<K: Eq + Hash + Display + Clone, T> AsyncSharedMap<K, T> {
         (true, res)
     }
 
-    /// Release one reference after its cleanup succeeds.
+    /// Release one reference after attempting its cleanup.
     ///
     /// `cleanup` receives whether this is the last reference, allowing callers
     /// to choose between per-reference cleanup (for example, flush) and final
-    /// cleanup (for example, complete). If cleanup fails, both the reference
-    /// count and resource remain unchanged so the same release can be retried.
-    pub async fn release_with_cleanup<E, F, Fut>(&self, key: K, cleanup: F) -> Result<bool, E>
+    /// cleanup (for example, complete). The reference is consumed even when
+    /// cleanup fails because the owner has already released it. The cleanup
+    /// result is returned separately so callers can report or schedule retry
+    /// work without keeping the resource in the active map.
+    pub async fn release_with_cleanup<E, F, Fut>(&self, key: K, cleanup: F) -> (bool, Result<(), E>)
     where
         E: Error,
         F: FnOnce(bool) -> Fut,
@@ -232,7 +234,7 @@ impl<K: Eq + Hash + Display + Clone, T> AsyncSharedMap<K, T> {
     {
         let entry = match self.inner.get(&key) {
             Some(entry) => entry.clone(),
-            None => return Ok(true),
+            None => return (true, Ok(())),
         };
 
         let mut state = entry.lock().await;
@@ -240,22 +242,22 @@ impl<K: Eq + Hash + Display + Clone, T> AsyncSharedMap<K, T> {
         if state.refs == 0 || state.resource.is_none() {
             drop(state);
             self.remove_entry(&key, &entry);
-            return Ok(true);
+            return (true, Ok(()));
         }
 
         let last = state.refs == 1;
-        cleanup(last).await?;
+        let result = cleanup(last).await;
 
         state.refs -= 1;
         if state.refs > 0 {
-            return Ok(false);
+            return (false, result);
         }
 
         state.resource.take();
         drop(state);
         self.remove_entry(&key, &entry);
 
-        Ok(true)
+        (true, result)
     }
 }
 
@@ -560,32 +562,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_with_cleanup_error_retains_last_reference_for_retry() {
+    async fn release_with_cleanup_error_releases_last_reference() {
         let map = AsyncSharedMap::<u64, u64>::new();
         map.insert::<StringError>(1, Arc::new(7)).await.unwrap();
 
-        let result = map
+        let (released, result) = map
             .release_with_cleanup(1, |last| async move {
                 assert!(last);
                 Err::<(), _>(StringError::from("cleanup failed"))
             })
             .await;
-        assert!(result.is_err());
-        assert_eq!(*map.get(&1).await.unwrap(), 7);
-
-        let released = map
-            .release_with_cleanup(1, |last| async move {
-                assert!(last);
-                Ok::<_, StringError>(())
-            })
-            .await
-            .unwrap();
         assert!(released);
+        assert!(result.is_err());
         assert!(map.get(&1).await.is_none());
     }
 
     #[tokio::test]
-    async fn release_with_cleanup_error_does_not_decrement_shared_reference() {
+    async fn release_with_cleanup_error_decrements_shared_reference() {
         let map = AsyncSharedMap::<u64, u64>::new();
         let first = map
             .get_or_create(1, async { Ok::<_, StringError>(Arc::new(7)) })
@@ -597,32 +590,24 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(&first, &second));
 
-        let result = map
+        let (released, result) = map
             .release_with_cleanup(1, |last| async move {
                 assert!(!last);
                 Err::<(), _>(StringError::from("flush failed"))
             })
             .await;
-        assert!(result.is_err());
-
-        let released = map
-            .release_with_cleanup(1, |last| async move {
-                assert!(!last);
-                Ok::<_, StringError>(())
-            })
-            .await
-            .unwrap();
         assert!(!released);
+        assert!(result.is_err());
         assert!(map.get(&1).await.is_some());
 
-        let released = map
+        let (released, result) = map
             .release_with_cleanup(1, |last| async move {
                 assert!(last);
                 Ok::<_, StringError>(())
             })
-            .await
-            .unwrap();
+            .await;
         assert!(released);
+        assert!(result.is_ok());
         assert!(map.get(&1).await.is_none());
     }
 
