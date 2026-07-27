@@ -1224,12 +1224,11 @@ impl fs::FileSystem for CurvineFileSystem {
             None
         };
 
-        let mode_only = (op.arg.valid & (FATTR_UID | FATTR_GID | FATTR_SIZE)) == 0
-            && (op.arg.valid & FATTR_MODE) != 0;
-        // Path-based chmod must still traverse; fh-based fchmod/fchown must not
-        // (POSIX open-file descriptors do not re-check path search permission).
-        let skip_traverse =
-            (op.arg.valid & FATTR_FH) != 0 || (mode_only && op.header.uid == file_uid);
+        // Path-based chmod(2)/chown(2)/truncate must still traverse the path prefix
+        // regardless of file ownership (POSIX search permission). Only fh-based
+        // fchmod/fchown (FATTR_FH) skips traverse — open-file descriptors do not
+        // re-check path search permission.
+        let skip_traverse = (op.arg.valid & FATTR_FH) != 0;
 
         if !skip_traverse {
             self.check_traverse_permissions(op.header.nodeid, op.header)
