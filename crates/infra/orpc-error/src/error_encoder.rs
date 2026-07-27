@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::{ErrorExt, ErrorImpl};
+use crate::{ErrorExt, ErrorImpl};
 use bytes::{BufMut, BytesMut};
 use serde::Serialize;
 use std::error::Error;

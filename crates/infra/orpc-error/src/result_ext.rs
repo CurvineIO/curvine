@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::ErrorExt;
+use crate::ErrorExt;
 
 // Extended Result type, which requires support for setting the wrong context.
 pub trait ResultExt<T, E>: Sized

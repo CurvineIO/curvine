@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::ErrorExt;
 use crate::CommonError;
+use crate::ErrorExt;
 use bytes::{BufMut, BytesMut};
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};

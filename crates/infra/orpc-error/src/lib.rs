@@ -36,9 +36,3 @@ pub use self::string_error::StringError;
 pub type CommonError = Box<dyn std::error::Error + Send + Sync>;
 pub type CommonResult<T> = Result<T, CommonError>;
 pub type CommonResultExt<T> = Result<T, CommonErrorExt>;
-
-pub mod error {
-    pub use super::{
-        CommonErrorExt, ErrorDecoder, ErrorEncoder, ErrorExt, ErrorImpl, ResultExt, StringError,
-    };
-}

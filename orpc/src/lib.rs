@@ -29,6 +29,9 @@ pub mod test;
 
 pub use orpc_error::{CommonError, CommonResult, CommonResultExt};
 
+// Kept in `orpc` (not next to `CommonErrorExt` in `orpc-error`): orphan rules
+// require a local uncovered type argument (`IOError`) to implement `From` for
+// the foreign `CommonErrorExt` type after the crate split.
 impl From<crate::io::IOError> for crate::error::CommonErrorExt {
     fn from(value: crate::io::IOError) -> Self {
         Self::from(CommonError::from(value))

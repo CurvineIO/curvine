@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::{ErrorImpl, StringError};
+use crate::{ErrorImpl, StringError};
 use bytes::{Buf, BytesMut};
 use log::warn;
 use serde::de::DeserializeOwned;
