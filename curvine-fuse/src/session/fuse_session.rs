@@ -494,7 +494,7 @@ impl<T: FileSystem> FuseSession<T> {
             let stage = StateStageTimer::start(enabled, false, STATE_STAGE_MOUNT_FDS);
             // Read and process mount point file descriptors
             let fds: HashMap<RawIO, String> = reader.read_struct()?;
-            info!("restore: write mount fds {:?}", fds);
+            info!("restore: read mount fds {:?}", fds);
             if fds.is_empty() {
                 return err_box!("no fd found in state file {}", reader.path());
             }

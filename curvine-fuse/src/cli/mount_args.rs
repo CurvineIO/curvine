@@ -97,7 +97,7 @@ pub struct FuseMountArgs {
     #[arg(long, help = "Web server port (optional)")]
     pub web_port: Option<u16>,
 
-    #[arg(long, help = "Master address (e.g., 'm1:8995,m2:8995'")]
+    #[arg(long, help = "Master address (e.g., 'm1:8995,m2:8995')")]
     pub master_addrs: Option<String>,
 
     // FUSE options
