@@ -2142,6 +2142,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-io"
+version = "0.2.0"
+
+[[package]]
 name = "curvine-lancedb"
 version = "0.2.0"
 dependencies = [
@@ -2272,6 +2276,10 @@ version = "0.2.0"
 dependencies = [
  "curvine-model",
 ]
+
+[[package]]
+name = "curvine-sys"
+version = "0.2.0"
 
 [[package]]
 name = "curvine-tests"
@@ -6204,6 +6212,7 @@ dependencies = [
  "nix",
  "num_enum",
  "once_cell",
+ "orpc-error",
  "parking_lot",
  "pin-project-lite",
  "pkg-config",
@@ -6224,6 +6233,28 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
 ]
+
+[[package]]
+name = "orpc-error"
+version = "0.2.0"
+dependencies = [
+ "bincode",
+ "bytes",
+ "log",
+ "serde",
+]
+
+[[package]]
+name = "orpc-net"
+version = "0.2.0"
+
+[[package]]
+name = "orpc-rpc"
+version = "0.2.0"
+
+[[package]]
+name = "orpc-runtime"
+version = "0.2.0"
 
 [[package]]
 name = "outref"
