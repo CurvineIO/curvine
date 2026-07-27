@@ -43,6 +43,10 @@ impl BdevLayout {
 }
 
 impl BlockLayout for BdevLayout {
+    fn preserves_committed_on_write(&self) -> bool {
+        false
+    }
+
     fn allocate(&self, dir: &VfsDir, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         let allocated_bytes = match dir.state.offset_alloc.allocation_size(block.len) {
             Some(size) => size,

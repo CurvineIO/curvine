@@ -33,6 +33,10 @@ fn validate_open_offset(meta: &BlockMeta, off: i64) -> IOResult<()> {
 }
 
 pub trait BlockLayout {
+    /// Whether rewriting a finalized block keeps the committed allocation
+    /// readable until the new write is finalized or aborted.
+    fn preserves_committed_on_write(&self) -> bool;
+
     fn allocate(&self, dir: &VfsDir, block: &ExtendedBlock) -> CommonResult<BlockMeta>;
 
     /// Prepare an existing physical allocation for writing.
@@ -107,6 +111,13 @@ impl BlockLayouts {
 }
 
 impl BlockLayout for BlockLayoutKind {
+    fn preserves_committed_on_write(&self) -> bool {
+        match self {
+            Self::File(layout) => layout.preserves_committed_on_write(),
+            Self::Bdev(layout) => layout.preserves_committed_on_write(),
+        }
+    }
+
     fn allocate(&self, dir: &VfsDir, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         match self {
             Self::File(layout) => layout.allocate(dir, block),

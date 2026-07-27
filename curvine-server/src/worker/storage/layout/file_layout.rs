@@ -21,7 +21,7 @@ use orpc::common::ByteUnit;
 use orpc::common::FileUtils;
 use orpc::io::{BlockDevice, IOError, IOResult, LocalFile};
 use orpc::{err_box, try_err, CommonResult};
-use std::fs::{self, File};
+use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
 
 #[derive(Clone, Copy)]
@@ -47,7 +47,7 @@ impl FileLayout {
 
     fn block_dir(dir: &VfsDir, meta: &BlockMeta) -> CommonResult<PathBuf> {
         let path = match meta.state() {
-            BlockState::Finalized | BlockState::Writing => {
+            BlockState::Finalized => {
                 let uid = meta.id() as u64;
                 let d1 = (uid >> 48) & 0x1F;
                 let d2 = (uid >> 32) & 0x1F;
@@ -55,7 +55,7 @@ impl FileLayout {
                     .join(format!("b{}", d1))
                     .join(format!("b{}", d2))
             }
-            BlockState::Recovering => Self::staging_dir(dir),
+            BlockState::Writing | BlockState::Recovering => Self::staging_dir(dir),
         };
 
         if path.exists() {
@@ -89,10 +89,14 @@ impl FileLayout {
 }
 
 impl BlockLayout for FileLayout {
+    fn preserves_committed_on_write(&self) -> bool {
+        true
+    }
+
     fn allocate(&self, dir: &VfsDir, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         let meta = BlockMeta::with_tmp(block, dir);
         let file = Self::block_path(dir, &meta)?;
-        File::create(file)?;
+        OpenOptions::new().write(true).create_new(true).open(file)?;
         Ok(meta)
     }
 
@@ -106,10 +110,25 @@ impl BlockLayout for FileLayout {
             return err_box!("Invalid file block size: {}", block.len);
         }
         let mut prepared = BlockMeta::new(meta.id(), block.len, dir);
-        // The old file still occupies space until resize/finalize. Keep the
-        // larger physical charge so preparing a smaller write cannot temporarily
-        // overstate available capacity or under-release on abort.
         prepared.actual_len = meta.actual_len.max(block.len);
+
+        if meta.is_final() {
+            let committed_path = Self::block_path(dir, meta)?;
+            let staging_path = Self::block_path(dir, &prepared)?;
+            if staging_path.exists() {
+                return err_box!(
+                    "Cannot rewrite block {} because staging file {} already exists",
+                    meta.id(),
+                    staging_path.display()
+                );
+            }
+
+            if let Err(e) = fs::copy(&committed_path, &staging_path) {
+                let _ = fs::remove_file(&staging_path);
+                return Err(e.into());
+            }
+        }
+
         Ok(prepared)
     }
 
@@ -117,10 +136,22 @@ impl BlockLayout for FileLayout {
         &self,
         dir: &VfsDir,
         meta: &BlockMeta,
-        _committed_len: i64,
+        committed_len: i64,
     ) -> CommonResult<BlockMeta> {
-        let path = Self::block_path(dir, meta)?;
-        BlockMeta::with_final(meta, &path)
+        let staging_path = Self::block_path(dir, meta)?;
+        let final_meta = BlockMeta::with_final(meta, &staging_path)?;
+        if final_meta.len() != committed_len {
+            return err_box!(
+                "Block {} length mismatch, expected: {}, actual: {}",
+                meta.id(),
+                committed_len,
+                final_meta.len()
+            );
+        }
+
+        let active_path = Self::block_path(dir, &final_meta)?;
+        FileUtils::rename(staging_path, active_path)?;
+        Ok(final_meta)
     }
 
     fn scan(&self, dir: &VfsDir) -> CommonResult<Vec<BlockMeta>> {
