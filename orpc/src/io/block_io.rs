@@ -21,26 +21,37 @@ pub trait BlockIO: Send {
     }
     fn path(&self) -> &str;
     fn resize(&mut self, truncate: bool, off: i64, len: i64, mode: i32) -> IOResult<()>;
+
+    fn supports_read_ahead(&self) -> bool {
+        false
+    }
+
+    fn supports_send_file(&self) -> bool {
+        false
+    }
+
+    fn supports_short_circuit(&self) -> bool {
+        false
+    }
+
+    fn supports_resize(&self) -> bool {
+        false
+    }
+
+    fn as_local(&self) -> Option<&LocalFile> {
+        None
+    }
+
+    fn as_local_mut(&mut self) -> Option<&mut LocalFile> {
+        None
+    }
 }
 
-/// Enum-based block device that dispatches to either `LocalFile` or `SpdkBdev`
+/// Enum-based block device for shared local I/O.
 pub enum BlockDevice {
     Local(LocalFile),
-    #[cfg(feature = "spdk")]
-    Spdk(crate::io::SpdkBdev),
 }
 /// Macro to delegate a method call to the inner variant.
-#[cfg(feature = "spdk")]
-macro_rules! delegate {
-    ($self:ident, $method:ident $(, $arg:expr)*) => {
-        match $self {
-            BlockDevice::Local(f) => f.$method($($arg),*),
-            BlockDevice::Spdk(b) => b.$method($($arg),*),
-        }
-    };
-}
-
-#[cfg(not(feature = "spdk"))]
 macro_rules! delegate {
     ($self:ident, $method:ident $(, $arg:expr)*) => {
         match $self {
@@ -78,6 +89,30 @@ impl BlockIO for BlockDevice {
     }
     fn resize(&mut self, truncate: bool, off: i64, len: i64, mode: i32) -> IOResult<()> {
         delegate!(self, resize, truncate, off, len, mode)
+    }
+
+    fn supports_read_ahead(&self) -> bool {
+        self.supports_read_ahead()
+    }
+
+    fn supports_send_file(&self) -> bool {
+        self.supports_send_file()
+    }
+
+    fn supports_short_circuit(&self) -> bool {
+        self.supports_short_circuit()
+    }
+
+    fn supports_resize(&self) -> bool {
+        self.supports_resize()
+    }
+
+    fn as_local(&self) -> Option<&LocalFile> {
+        self.as_local()
+    }
+
+    fn as_local_mut(&mut self) -> Option<&mut LocalFile> {
+        self.as_local_mut()
     }
 }
 impl BlockDevice {
@@ -122,8 +157,6 @@ impl Display for BlockDevice {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             BlockDevice::Local(file) => write!(f, "BlockDevice::Local({})", file.path()),
-            #[cfg(feature = "spdk")]
-            BlockDevice::Spdk(bdev) => write!(f, "BlockDevice::Spdk({})", bdev.name()),
         }
     }
 }
@@ -160,6 +193,30 @@ impl BlockIO for LocalFile {
     }
     fn resize(&mut self, truncate: bool, off: i64, len: i64, mode: i32) -> IOResult<()> {
         LocalFile::resize(self, truncate, off, len, mode)
+    }
+
+    fn supports_read_ahead(&self) -> bool {
+        true
+    }
+
+    fn supports_send_file(&self) -> bool {
+        true
+    }
+
+    fn supports_short_circuit(&self) -> bool {
+        true
+    }
+
+    fn supports_resize(&self) -> bool {
+        true
+    }
+
+    fn as_local(&self) -> Option<&LocalFile> {
+        Some(self)
+    }
+
+    fn as_local_mut(&mut self) -> Option<&mut LocalFile> {
+        Some(self)
     }
 }
 

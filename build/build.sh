@@ -552,7 +552,7 @@ append_extra_features() {
           add_feature "curvine-server/spdk-rdma"
         fi
         ;;
-      orpc/spdk|orpc/spdk-rdma|curvine-ufs/oss-hdfs|curvine-ufs/opendal-hdfs|curvine-ufs/opendal-hdfs-native|curvine-client/oss-hdfs|curvine-client/opendal-hdfs|curvine-client/opendal-hdfs-native)
+      curvine-ufs/oss-hdfs|curvine-ufs/opendal-hdfs|curvine-ufs/opendal-hdfs-native|curvine-client/oss-hdfs|curvine-client/opendal-hdfs|curvine-client/opendal-hdfs-native)
         if [ "$scope" = "server-native" ] || [ "$scope" = "tests" ]; then
           add_feature "$feature"
         else

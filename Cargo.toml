@@ -24,6 +24,7 @@ members = [
     "crates/infra/orpc-rpc",
     "crates/infra/curvine-sys",
     "crates/infra/curvine-io",
+    "crates/adapters/curvine-storage-spdk",
     "curvine-common",
     "curvine-common/macros",
     "curvine-server",
@@ -78,6 +79,7 @@ orpc-net = { path = "crates/infra/orpc-net" }
 orpc-rpc = { path = "crates/infra/orpc-rpc" }
 curvine-sys = { path = "crates/infra/curvine-sys" }
 curvine-io = { path = "crates/infra/curvine-io" }
+curvine-storage-spdk = { path = "crates/adapters/curvine-storage-spdk" }
 curvine-fault = { path = "curvine-fault" }
 curvine-error = { path = "crates/common/curvine-error" }
 curvine-proto = { path = "crates/common/curvine-proto" }

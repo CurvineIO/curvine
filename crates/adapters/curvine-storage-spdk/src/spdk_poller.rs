@@ -1,7 +1,7 @@
 #![cfg(feature = "spdk")]
 
 //! SPDK I/O poller thread - handles NVMe submit/poll on dedicated thread.
-use crate::io::spdk_ffi;
+use crate::spdk_ffi;
 /// Qpairs not thread-safe: submit + poll must on same thread.
 /// Single poller to demonstrate the correctness work.
 /// Uses eventfd for instant wake on new I/O submission.

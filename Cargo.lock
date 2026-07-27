@@ -2242,6 +2242,7 @@ dependencies = [
  "curvine-common",
  "curvine-error",
  "curvine-fault",
+ "curvine-storage-spdk",
  "curvine-ufs",
  "curvine-web",
  "dashmap 5.5.3",
@@ -2275,6 +2276,22 @@ name = "curvine-storage-api"
 version = "0.2.0"
 dependencies = [
  "curvine-model",
+]
+
+[[package]]
+name = "curvine-storage-spdk"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "cc",
+ "crossbeam",
+ "libc",
+ "log",
+ "nix",
+ "orpc",
+ "pkg-config",
+ "serde",
+ "toml",
 ]
 
 [[package]]
@@ -6195,7 +6212,6 @@ version = "0.2.0"
 dependencies = [
  "bincode",
  "bytes",
- "cc",
  "chrono",
  "crc32fast",
  "crossbeam",
@@ -6215,7 +6231,6 @@ dependencies = [
  "orpc-error",
  "parking_lot",
  "pin-project-lite",
- "pkg-config",
  "prometheus",
  "prost 0.11.9",
  "rand 0.8.5",
