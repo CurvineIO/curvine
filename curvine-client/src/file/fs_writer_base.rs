@@ -149,6 +149,7 @@ impl FsWriterBase {
     /// - this chunk still overflows the current block, or
     /// - `more_data_pending` is true and the current block is within the
     ///   prefetch threshold (so alloc/open overlaps the tail write).
+    ///
     /// Exact EOF with no queued follow-up data does not prefetch.
     pub async fn write_with_more_pending(
         &mut self,
