@@ -334,10 +334,20 @@ impl FsWriterBase {
                 only_flush,
             )
             .await;
-        if result.is_err() {
-            self.restore_commit_blocks(&commit_blocks);
+        match result {
+            Ok(Some(blocks)) if only_flush => {
+                // Keep client block locs/alloc_opts in sync with master after
+                // publish so later sparse rewrites do not reuse stale opts.
+                self.file_blocks = WriteFileBlocks::new(blocks.clone());
+                self.len = self.len.max(self.file_blocks.len());
+                Ok(Some(blocks))
+            }
+            Ok(v) => Ok(v),
+            Err(e) => {
+                self.restore_commit_blocks(&commit_blocks);
+                Err(e)
+            }
         }
-        result
     }
 
     async fn get_writer(&mut self) -> FsResult<&mut BlockWriter> {
