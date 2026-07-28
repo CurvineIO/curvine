@@ -351,6 +351,11 @@ pub struct fuse_lseek_in {
     pub padding: u64,
 }
 
+/// Request flag: ioctl is not restricted to `_IOC_*` size transfers; retry allowed.
+pub const FUSE_IOCTL_UNRESTRICTED: u32 = 1 << 1;
+/// Reply flag: kernel should retry the ioctl with the provided iovecs.
+pub const FUSE_IOCTL_RETRY: u32 = 1 << 2;
+
 #[repr(C)]
 #[derive(Debug, Default)]
 pub struct fuse_ioctl_in {
@@ -360,6 +365,13 @@ pub struct fuse_ioctl_in {
     pub arg: u64,
     pub in_size: u32,
     pub out_size: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct fuse_ioctl_iovec {
+    pub base: u64,
+    pub len: u64,
 }
 
 #[repr(C)]
