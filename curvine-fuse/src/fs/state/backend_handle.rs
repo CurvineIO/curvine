@@ -111,8 +111,15 @@ impl BackendHandle {
         };
 
         if let Some(writer) = state.find_writer(self.ino).await {
-            let writer_ver = writer.write_ver();
-            if self.read_ver.get() != writer_ver {
+            // `write_ver` advances when writes are enqueued, not when they land.
+            // Concurrent fork writers (LTP ftest) can enqueue after we schedule a
+            // flush; sample the version we flushed and loop until stable so we
+            // never publish `read_ver` past data that is still queued.
+            for _ in 0..16 {
+                let ver_before = writer.write_ver();
+                if self.read_ver.get() == ver_before {
+                    break;
+                }
                 writer.flush(None).await?;
 
                 let path = reader.path().clone();
@@ -121,7 +128,7 @@ impl BackendHandle {
                 self.refresh_status(new_reader.status().clone());
                 reader.replace(new_reader);
 
-                self.read_ver.set(writer_ver);
+                self.read_ver.set(ver_before);
             }
         }
 
