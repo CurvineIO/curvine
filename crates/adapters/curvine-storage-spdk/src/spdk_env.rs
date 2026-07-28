@@ -10,7 +10,7 @@ use orpc::{err_box, err_msg, CommonResult};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
@@ -87,6 +87,57 @@ impl QpairPool {
             (s.active.load(Ordering::Acquire), s.max_active)
         } else {
             (0, 0)
+        }
+    }
+
+    // TODO: Arc<CtrlQpairState> + #[repr(align(64))] - eliminate ctrl_state Mutex from CAS, prevent false sharing
+    /// Atomically reserve a slot for this controller.
+    /// Returns true if reserved (active < max_active), false at capacity.
+    fn try_reserve(&self, ctrlr_ptr: usize) -> bool {
+        let state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(s) = state.get(&ctrlr_ptr) {
+            loop {
+                let cur = s.active.load(Ordering::Acquire);
+                if cur >= s.max_active {
+                    return false;
+                }
+                if s.active
+                    .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return true;
+                }
+            }
+        } else {
+            error!(
+                "QpairPool: try_reserve called for unregistered ctrlr {:p}",
+                ctrlr_ptr as *const ()
+            );
+            false
+        }
+    }
+
+    /// Release a previously reserved slot.
+    /// Refuses to decrement when active == 0 to prevent usize::MAX wrap on double-release.
+    fn release_reservation(&self, ctrlr_ptr: usize) {
+        let state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(s) = state.get(&ctrlr_ptr) {
+            let cur = s.active.load(Ordering::Acquire);
+            if cur == 0 {
+                warn!(
+                    "QpairPool: release_reservation called with active=0 for ctrlr {:p} \
+                     (no reservation to release — possible double-release)",
+                    ctrlr_ptr as *const ()
+                );
+                return;
+            }
+            s.active.fetch_sub(1, Ordering::AcqRel);
+        } else {
+            warn!(
+                "QpairPool: release_reservation for unregistered ctrlr {:p} \
+                 (no active count to decrement — possible double-release or release without acquire)",
+                ctrlr_ptr as *const ()
+            );
         }
     }
 
@@ -959,6 +1010,80 @@ mod test {
         let (active_c, limit_c) = p.controller_stats(0x3000);
         assert_eq!(active_c, 0);
         assert_eq!(limit_c, 0);
+    }
+
+    #[test]
+    fn try_reserve_respects_limit() {
+        let p = QpairPool::new();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_qpair;
+        p.register_limit(ctrlr as usize, 2);
+
+        // Reserve up to limit
+        assert!(p.try_reserve(ctrlr as usize));
+        assert!(p.try_reserve(ctrlr as usize));
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 2);
+
+        // At limit — should fail
+        assert!(!p.try_reserve(ctrlr as usize));
+
+        // Release one — should succeed again
+        p.release_reservation(ctrlr as usize);
+        assert!(p.try_reserve(ctrlr as usize));
+    }
+
+    #[test]
+    fn release_returns_qpair_to_pool() {
+        let p = QpairPool::new();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+
+        p.register_limit(ctrlr as usize, 4);
+
+        // Reserve a slot (simulating acquire path)
+        assert!(p.try_reserve(ctrlr as usize)); // active = 1
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 1);
+
+        // Release — qpair goes to pool (release_reservation NOT called until wired)
+        p.release(ctrlr, qpair);
+
+        assert_eq!(cnt(&p, ctrlr as usize), 1);
+        // active still = 1 since release_reservation is not wired yet
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 1);
+
+        // Explicitly release reservation to clean up
+        p.release_reservation(ctrlr as usize);
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn release_active_count_decremented() {
+        let p = QpairPool::new();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+
+        p.register_limit(ctrlr as usize, 4);
+
+        // Reserve 3 slots
+        assert!(p.try_reserve(ctrlr as usize));
+        assert!(p.try_reserve(ctrlr as usize));
+        assert!(p.try_reserve(ctrlr as usize));
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 3);
+
+        // Release all reservations
+        p.release_reservation(ctrlr as usize);
+        p.release_reservation(ctrlr as usize);
+        p.release_reservation(ctrlr as usize);
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 0);
+
+        // Double-release on active=0 should warn and not wrap
+        p.release_reservation(ctrlr as usize);
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 0); // still 0, not usize::MAX
     }
 
     mod config_tests {
