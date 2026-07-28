@@ -14,7 +14,15 @@
 
 pub type SysResult<T> = std::io::Result<T>;
 
+// `Other` is reserved for opaque failures; pass an explicit `ErrorKind` whenever the
+// failure has a category callers can branch on (unsupported platform, bad argument, EOF).
 macro_rules! sys_error {
+    ($kind:path, $message:literal) => {
+        Err(std::io::Error::new($kind, $message))
+    };
+    ($kind:path, $format:literal, $($arg:expr),+ $(,)?) => {
+        Err(std::io::Error::new($kind, format!($format, $($arg),+)))
+    };
     ($message:expr) => {
         Err(std::io::Error::other($message))
     };
@@ -32,6 +40,26 @@ macro_rules! sys_call {
             Ok(result as CInt)
         }
     }};
+}
+
+/// Build a new iovec that skips the first `offset` bytes of `iov`, so a partially
+/// completed vectored transfer can be resumed with the remaining bytes only.
+pub fn skip_iov_bytes<'a>(
+    iov: &'a [std::io::IoSlice<'a>],
+    mut offset: usize,
+) -> Vec<std::io::IoSlice<'a>> {
+    let mut result = Vec::with_capacity(iov.len());
+    for slice in iov {
+        if offset == 0 {
+            result.push(std::io::IoSlice::new(&slice[..]));
+        } else if slice.len() <= offset {
+            offset -= slice.len();
+        } else {
+            result.push(std::io::IoSlice::new(&slice[offset..]));
+            offset = 0;
+        }
+    }
+    result
 }
 
 mod sys_libc;

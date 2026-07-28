@@ -15,7 +15,7 @@
 use crate::sys::pipe::{AsyncFd, PipeFd, PipePool, PipeReader, PipeWriter};
 use crate::sys::{self, CInt, RawIO, SysResult};
 use log::warn;
-use std::io::IoSlice;
+use std::io::{ErrorKind, IoSlice};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -76,14 +76,14 @@ impl Pipe2 {
 
     pub async fn readable(&self) -> SysResult<()> {
         match self.reader.async_fd() {
-            None => sys_error!("Unsupported operation"),
+            None => sys_error!(ErrorKind::Unsupported, "Unsupported operation"),
             Some(v) => v.readable().await,
         }
     }
 
     pub async fn writable(&self) -> SysResult<()> {
         match self.writer.async_fd() {
-            None => sys_error!("Unsupported operation"),
+            None => sys_error!(ErrorKind::Unsupported, "Unsupported operation"),
             Some(v) => v.writable().await,
         }
     }
@@ -110,6 +110,7 @@ impl Pipe2 {
     pub async fn write_iov(&self, len: usize, iov: &[IoSlice<'_>]) -> SysResult<()> {
         if len > self.buf_size {
             return sys_error!(
+                ErrorKind::InvalidInput,
                 "write_iov: data size {} exceeds pipe buffer size {}",
                 len,
                 self.buf_size
@@ -123,13 +124,13 @@ impl Pipe2 {
                     .async_write(|fd| sys::vm_splice(fd.fd(), iov))
                     .await?
             } else {
-                let cur_iov = Self::skip_iov_bytes(iov, written);
+                let cur_iov = sys::skip_iov_bytes(iov, written);
                 self.writer
                     .async_write(|fd| sys::vm_splice(fd.fd(), &cur_iov))
                     .await?
             };
             if res == 0 {
-                return sys_error!("vmsplice returned 0");
+                return sys_error!(ErrorKind::WriteZero, "vmsplice returned 0");
             }
             written += res as usize;
         }
@@ -142,6 +143,7 @@ impl Pipe2 {
     pub async fn read_io(&self, fd_out: &AsyncFd, len: usize) -> SysResult<()> {
         if len > self.buf_size {
             return sys_error!(
+                ErrorKind::InvalidInput,
                 "read_io: request size {} exceeds pipe buffer size {}",
                 len,
                 self.buf_size
@@ -158,7 +160,7 @@ impl Pipe2 {
             let res =
                 Self::splice_retry(|| sys::splice(fd_in, None, fd_out, None, remaining)).await?;
             if res == 0 {
-                return sys_error!("splice returned 0");
+                return sys_error!(ErrorKind::UnexpectedEof, "splice returned 0");
             }
             remaining -= res as usize;
         }
@@ -233,23 +235,6 @@ impl Pipe2 {
 
     pub fn take_fd(&mut self) -> PipeFd {
         self.pipe_fd.take().unwrap()
-    }
-
-    /// Build a new iovec that skips the first `offset` bytes from `iov`.
-    /// Used by `write_iov` to resume a partially completed vmsplice transfer.
-    fn skip_iov_bytes<'a>(iov: &'a [IoSlice<'a>], mut offset: usize) -> Vec<IoSlice<'a>> {
-        let mut result = Vec::with_capacity(iov.len());
-        for slice in iov {
-            if offset == 0 {
-                result.push(IoSlice::new(&slice[..]));
-            } else if slice.len() <= offset {
-                offset -= slice.len();
-            } else {
-                result.push(IoSlice::new(&slice[offset..]));
-                offset = 0;
-            }
-        }
-        result
     }
 }
 

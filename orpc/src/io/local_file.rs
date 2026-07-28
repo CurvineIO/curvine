@@ -286,7 +286,7 @@ impl LocalFile {
 
     pub fn actual_size(&self) -> IOResult<u64> {
         let meta = self.inner.metadata()?;
-        Ok(sys::file_actual_size(meta)?)
+        sys::file_actual_size(meta).map_err(Into::into)
     }
 
     pub fn metadata(&self) -> IOResult<Metadata> {

@@ -103,7 +103,11 @@ impl SignalWatch {
                     Ok(async move { ctrl_c.await.ok() }.boxed())
                 }
                 _ => {
-                    sys_error!("signal {:?} not supported on non-Linux platforms", kind)
+                    sys_error!(
+                        std::io::ErrorKind::Unsupported,
+                        "signal {:?} not supported on non-Linux platforms",
+                        kind
+                    )
                 }
             }
         }
@@ -113,7 +117,10 @@ impl SignalWatch {
         kinds: &[SignalKind],
     ) -> SysResult<Vec<(SignalKind, BoxFuture<'static, Option<()>>)>> {
         if kinds.is_empty() {
-            return sys_error!("no signals to create futures for");
+            return sys_error!(
+                std::io::ErrorKind::InvalidInput,
+                "no signals to create futures for"
+            );
         }
 
         let mut futures = Vec::with_capacity(kinds.len());
@@ -129,7 +136,7 @@ impl SignalWatch {
         let fut = Self::signal_future(target)?;
         match fut.await {
             Some(_) => Ok(target),
-            None => sys_error!("signal stream closed"),
+            None => sys_error!(std::io::ErrorKind::BrokenPipe, "signal stream closed"),
         }
     }
 
@@ -152,7 +159,7 @@ impl SignalWatch {
             let ((kind, opt), _, _) = select_all(futures).await;
             match opt {
                 Some(_) => Ok(kind),
-                None => sys_error!("signal stream closed"),
+                None => sys_error!(std::io::ErrorKind::BrokenPipe, "signal stream closed"),
             }
         }
 

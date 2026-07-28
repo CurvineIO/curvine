@@ -16,7 +16,7 @@
 
 use crate::sys::pipe::BorrowedFd;
 use crate::sys::{self, CInt, RawIO, SysResult};
-use std::io::IoSlice;
+use std::io::{ErrorKind, IoSlice};
 use tokio::io::Interest;
 
 #[cfg(target_os = "linux")]
@@ -44,7 +44,10 @@ impl AsyncFd {
         #[cfg(target_os = "linux")]
         {
             if fd.is_blocking() {
-                sys_error!("Blocking pipes cannot use async io")
+                sys_error!(
+                    ErrorKind::InvalidInput,
+                    "Blocking pipes cannot use async io"
+                )
             } else {
                 let async_fd = UnixAsyncFd::new(fd)?;
                 Ok(AsyncFd(async_fd))
@@ -76,7 +79,7 @@ impl AsyncFd {
     pub async fn writable(&self) -> SysResult<()> {
         #[cfg(not(target_os = "linux"))]
         {
-            sys_error!("unsupported operation")
+            sys_error!(ErrorKind::Unsupported, "unsupported operation")
         }
 
         #[cfg(target_os = "linux")]
@@ -89,7 +92,7 @@ impl AsyncFd {
     pub async fn readable(&self) -> SysResult<()> {
         #[cfg(not(target_os = "linux"))]
         {
-            sys_error!("unsupported operation")
+            sys_error!(ErrorKind::Unsupported, "unsupported operation")
         }
 
         #[cfg(target_os = "linux")]
@@ -106,7 +109,7 @@ impl AsyncFd {
     ) -> SysResult<R> {
         #[cfg(not(target_os = "linux"))]
         {
-            sys_error!("unsupported operation")
+            sys_error!(ErrorKind::Unsupported, "unsupported operation")
         }
 
         #[cfg(target_os = "linux")]
@@ -137,16 +140,25 @@ impl AsyncFd {
         }
     }
 
-    // Write data into fd.
+    // Write data into fd. A short writev is normal on non-blocking fds, so the
+    // remaining iovec view is advanced and the write resumed until `len` bytes land.
     pub async fn write_iov(&self, len: usize, iov: &[IoSlice<'_>]) -> SysResult<()> {
-        let len = len as CInt;
-        loop {
-            let res = self.async_write(|fd| sys::writev(fd.fd(), iov)).await;
+        let mut written = 0usize;
+        while written < len {
+            let res = if written == 0 {
+                self.async_write(|fd| sys::writev(fd.fd(), iov)).await
+            } else {
+                let remaining = sys::skip_iov_bytes(iov, written);
+                self.async_write(|fd| sys::writev(fd.fd(), &remaining))
+                    .await
+            };
 
             match res {
-                Ok(written) if written == len => break,
-                Ok(written) => return sys_error!("writev returned {}, expected {}", written, len),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Ok(0) => {
+                    return sys_error!(ErrorKind::WriteZero, "writev returned 0");
+                }
+                Ok(transferred) => written += transferred as usize,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => continue,
                 Err(error) => return Err(error),
             }
         }

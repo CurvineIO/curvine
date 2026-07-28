@@ -31,7 +31,11 @@ impl PipeReader {
         if let Some(fd) = &self.async_fd {
             fd.async_read(f).await
         } else {
-            sys_error!("fd is not asynchronous: {}", self.raw_fd())
+            sys_error!(
+                std::io::ErrorKind::InvalidInput,
+                "fd is not asynchronous: {}",
+                self.raw_fd()
+            )
         }
     }
 

@@ -81,7 +81,11 @@ impl FsStats {
         let m = self.path.metadata()?;
 
         if !m.is_dir() || m.permissions().readonly() {
-            return sys_error!("Directory is not writable: {:?}", self.path());
+            return sys_error!(
+                std::io::ErrorKind::PermissionDenied,
+                "Directory is not writable: {:?}",
+                self.path()
+            );
         }
 
         let new_device_id = sys::get_device_id(self.path());

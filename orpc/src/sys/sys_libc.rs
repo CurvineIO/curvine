@@ -19,7 +19,7 @@ use fs2::FileExt;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::fs::Metadata;
-use std::io::IoSlice;
+use std::io::{ErrorKind, IoSlice};
 use std::path::Path;
 
 #[cfg(target_os = "linux")]
@@ -39,13 +39,17 @@ where
 
 #[cfg(not(target_os = "linux"))]
 pub fn get_raw_io<T>(_: &T) -> SysResult<CInt> {
-    sys_error!("Unsupported os")
+    sys_error!(ErrorKind::Unsupported, "Unsupported os")
 }
 
 pub fn close(raw_io: RawIO) -> SysResult<()> {
     #[cfg(not(target_os = "linux"))]
     {
-        sys_error!("Unsupported close raw id {}", raw_io)
+        sys_error!(
+            ErrorKind::Unsupported,
+            "Unsupported close raw id {}",
+            raw_io
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -77,7 +81,7 @@ pub fn send_file(
 ) -> SysResult<CInt> {
     #[cfg(not(target_os = "linux"))]
     {
-        sys_error!("unsupported operation")
+        sys_error!(ErrorKind::Unsupported, "unsupported operation")
     }
 
     #[cfg(target_os = "linux")]
@@ -110,7 +114,7 @@ pub fn splice(
 ) -> SysResult<CInt> {
     #[cfg(not(target_os = "linux"))]
     {
-        sys_error!("unsupported operation")
+        sys_error!(ErrorKind::Unsupported, "unsupported operation")
     }
 
     #[cfg(target_os = "linux")]
@@ -149,7 +153,7 @@ pub fn splice_out_full(
     while remaining > 0 {
         let transferred = splice(fd_in, off_in.as_mut(), fd_out, off_out.as_mut(), remaining)?;
         if transferred == 0 {
-            return sys_error!("unsupported operation");
+            return sys_error!(ErrorKind::UnexpectedEof, "splice returned 0");
         }
         remaining -= transferred as usize;
     }
@@ -177,7 +181,7 @@ pub fn pipe_is_blocking(fd: RawIO) -> bool {
 pub fn set_pipe_blocking(fd: RawIO, blocking: bool) -> SysResult<()> {
     #[cfg(not(target_os = "linux"))]
     {
-        sys_error!("unsupported operation")
+        sys_error!(ErrorKind::Unsupported, "unsupported operation")
     }
 
     #[cfg(target_os = "linux")]
@@ -199,7 +203,7 @@ pub fn set_pipe_blocking(fd: RawIO, blocking: bool) -> SysResult<()> {
 pub fn pipe2(size: usize) -> SysResult<[RawIO; 2]> {
     #[cfg(not(target_os = "linux"))]
     {
-        sys_error!("unsupported operation")
+        sys_error!(ErrorKind::Unsupported, "unsupported operation")
     }
 
     #[cfg(target_os = "linux")]
@@ -254,7 +258,13 @@ pub fn read_ahead(file: &std::fs::File, off: i64, len: i64) -> SysResult<CInt> {
                 len as libc::off_t,
                 libc::POSIX_FADV_WILLNEED,
             );
-            sys_call!(res)
+            // posix_fadvise reports failure by returning a positive errno directly instead
+            // of returning -1 and setting errno, so `sys_call!` must not be used here.
+            if res == 0 {
+                Ok(0)
+            } else {
+                Err(std::io::Error::from_raw_os_error(res))
+            }
         }
     }
 }
@@ -268,7 +278,7 @@ pub fn is_tmpfs(file_path: &str) -> SysResult<bool> {
     #[cfg(target_os = "linux")]
     {
         let path = match std::ffi::CString::new(file_path) {
-            Err(e) => return sys_error!("CString::new {}", e),
+            Err(e) => return sys_error!(ErrorKind::InvalidInput, "CString::new {}", e),
             Ok(v) => v,
         };
 
@@ -290,7 +300,7 @@ pub fn thread_name() -> String {
 pub fn read(fd: RawIO, buf: &mut [u8]) -> SysResult<CInt> {
     #[cfg(not(target_os = "linux"))]
     {
-        sys_error!("unsupported operation")
+        sys_error!(ErrorKind::Unsupported, "unsupported operation")
     }
 
     #[cfg(target_os = "linux")]
@@ -320,7 +330,7 @@ pub fn read_full(fd: RawIO, buf: &mut [u8]) -> SysResult<()> {
 pub fn writev(fd: RawIO, bufs: &[IoSlice<'_>]) -> SysResult<CInt> {
     #[cfg(not(target_os = "linux"))]
     {
-        sys_error!("unsupported operation")
+        sys_error!(ErrorKind::Unsupported, "unsupported operation")
     }
 
     #[cfg(target_os = "linux")]
@@ -365,7 +375,7 @@ pub fn get_gid() -> u32 {
 pub fn vm_splice(fd: RawIO, iov: &[IoSlice<'_>]) -> SysResult<CInt> {
     #[cfg(not(target_os = "linux"))]
     {
-        sys_error!("unsupported operation")
+        sys_error!(ErrorKind::Unsupported, "unsupported operation")
     }
 
     #[cfg(target_os = "linux")]
@@ -391,7 +401,7 @@ pub fn vm_splice(fd: RawIO, iov: &[IoSlice<'_>]) -> SysResult<CInt> {
 pub fn open(path: &CString, flag: i32) -> SysResult<RawIO> {
     #[cfg(not(target_os = "linux"))]
     {
-        sys_error!("unsupported operation")
+        sys_error!(ErrorKind::Unsupported, "unsupported operation")
     }
 
     #[cfg(target_os = "linux")]
@@ -409,7 +419,7 @@ pub fn open(path: &CString, flag: i32) -> SysResult<RawIO> {
 pub fn ioctl(fd: RawIO, request: u64, arg: *mut libc::c_void) -> SysResult<CInt> {
     #[cfg(not(target_os = "linux"))]
     {
-        sys_error!("unsupported operation")
+        sys_error!(ErrorKind::Unsupported, "unsupported operation")
     }
 
     #[cfg(target_os = "linux")]
@@ -422,7 +432,7 @@ pub fn ioctl(fd: RawIO, request: u64, arg: *mut libc::c_void) -> SysResult<CInt>
 pub fn dup(fd: RawIO) -> SysResult<RawIO> {
     #[cfg(not(target_os = "linux"))]
     {
-        sys_error!("unsupported operation")
+        sys_error!(ErrorKind::Unsupported, "unsupported operation")
     }
 
     #[cfg(target_os = "linux")]
@@ -437,7 +447,7 @@ pub fn dup(fd: RawIO) -> SysResult<RawIO> {
 pub fn get_pagesize() -> SysResult<usize> {
     #[cfg(not(target_os = "linux"))]
     {
-        sys_error!("unsupported operation")
+        sys_error!(ErrorKind::Unsupported, "unsupported operation")
     }
 
     #[cfg(target_os = "linux")]
@@ -641,7 +651,7 @@ pub fn fcntl_get(fd: RawIO) -> SysResult<CInt> {
 
     #[cfg(not(target_os = "linux"))]
     {
-        sys_error!("unsupported operation")
+        sys_error!(ErrorKind::Unsupported, "unsupported operation")
     }
 }
 
@@ -654,6 +664,6 @@ pub fn fcntl_set(fd: RawIO, flags: CInt) -> SysResult<CInt> {
 
     #[cfg(not(target_os = "linux"))]
     {
-        sys_error!("unsupported operation")
+        sys_error!(ErrorKind::Unsupported, "unsupported operation")
     }
 }
