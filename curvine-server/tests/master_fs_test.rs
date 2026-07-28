@@ -346,6 +346,90 @@ fn block_report_for_non_file_inode_schedules_worker_delete() -> CommonResult<()>
 }
 
 #[test]
+fn block_report_for_writing_non_file_inode_defers_worker_delete() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "block-report-writing-non-file");
+    fs.mkdir("/dir-block", true)?;
+    let dir_status = fs.file_status("/dir-block")?;
+    let block_id = InodeId::create_block_id(dir_status.id, 0)?;
+
+    let result = fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 0,
+            full_report: false,
+            total_len: 1,
+            blocks: vec![BlockReportInfo::new(
+                block_id,
+                BlockReportStatus::Writing,
+                StorageType::Disk,
+                1,
+            )],
+        },
+        None,
+    )?;
+
+    assert!(result.delete_blocks.is_empty());
+    Ok(())
+}
+
+#[test]
+fn block_report_for_writing_missing_inode_defers_worker_delete() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "block-report-writing-missing");
+    let file = fs.create("/missing", false)?;
+    fs.delete("/missing", false)?;
+    let block_id = InodeId::create_block_id(file.id, 0)?;
+
+    let result = fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 0,
+            full_report: false,
+            total_len: 1,
+            blocks: vec![BlockReportInfo::new(
+                block_id,
+                BlockReportStatus::Writing,
+                StorageType::Disk,
+                1,
+            )],
+        },
+        None,
+    )?;
+
+    assert!(result.delete_blocks.is_empty());
+    Ok(())
+}
+
+#[test]
+fn full_block_report_for_writing_missing_inode_schedules_worker_delete() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "full-block-report-writing-missing");
+    let file = fs.create("/missing", false)?;
+    fs.delete("/missing", false)?;
+    let block_id = InodeId::create_block_id(file.id, 0)?;
+
+    let result = fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 0,
+            full_report: true,
+            total_len: 1,
+            blocks: vec![BlockReportInfo::new(
+                block_id,
+                BlockReportStatus::Writing,
+                StorageType::Disk,
+                1,
+            )],
+        },
+        None,
+    )?;
+
+    assert_eq!(result.delete_blocks, vec![block_id]);
+    Ok(())
+}
+
+#[test]
 fn full_block_report_reconcile_removes_stale_location_async() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let fs = new_fs(true, "full-block-reconcile-async");

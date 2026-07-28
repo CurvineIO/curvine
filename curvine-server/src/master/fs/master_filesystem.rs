@@ -1232,6 +1232,8 @@ impl MasterFilesystem {
         for item in list.blocks {
             match item.status {
                 BlockReportStatus::Finalized | BlockReportStatus::Writing => {
+                    let defer_writing_delete =
+                        item.status == BlockReportStatus::Writing && !list.full_report;
                     let state = match self.block_inode_state(item.id) {
                         Ok(v) => v,
                         Err(e) => {
@@ -1241,6 +1243,18 @@ impl MasterFilesystem {
                     };
                     match state {
                         BlockInodeState::File => checked.push((item, Some(BlockInodeState::File))),
+                        BlockInodeState::Missing if defer_writing_delete => {
+                            warn!(
+                                "block_report deferred deletion for writing block {} on worker {} because its inode is missing",
+                                item.id, list.worker_id
+                            );
+                        }
+                        BlockInodeState::NotFile if defer_writing_delete => {
+                            warn!(
+                                "block_report deferred deletion for writing block {} on worker {} because its inode is not a file",
+                                item.id, list.worker_id
+                            );
+                        }
                         BlockInodeState::Missing => {
                             missing_blocks += 1;
                             delete_blocks.push(item.id);
