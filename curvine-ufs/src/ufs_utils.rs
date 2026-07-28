@@ -14,8 +14,8 @@
 
 use crate::err_ufs;
 use crate::FOLDER_SUFFIX;
-use curvine_common::fs::Path;
-use curvine_common::FsResult;
+use curvine_error::FsResult;
+use curvine_fs_api::Path;
 
 pub struct UfsUtils;
 

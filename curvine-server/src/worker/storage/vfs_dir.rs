@@ -15,10 +15,10 @@
 use crate::worker::storage::{DirState, StorageVersion, DEFAULT_BLOCK_ALIGN};
 use curvine_common::conf::WorkerDataDir;
 use curvine_common::state::StorageType;
+#[cfg(feature = "spdk")]
+use curvine_storage_spdk::SpdkEnv;
 use log::*;
 use orpc::common::{ByteUnit, FileUtils};
-#[cfg(feature = "spdk")]
-use orpc::io::spdk_env::SpdkEnv;
 use orpc::io::LocalFile;
 use orpc::sync::AtomicLong;
 use orpc::sys::FsStats;
@@ -70,7 +70,7 @@ impl VfsDir {
         // SPDK: resolve bdev name from global SpdkEnv (one bdev per data_dir)
         #[cfg(feature = "spdk")]
         let bdev_name: Option<(String, i64)> = if conf.storage_type == StorageType::SpdkDisk {
-            use orpc::io::spdk_env::SpdkEnv;
+            use curvine_storage_spdk::SpdkEnv;
             let env = SpdkEnv::global().ok_or_else(|| {
                 orpc::err_msg!(
                     "StorageType::SpdkDisk dir '{}' requires SPDK environment, but it is not initialized",
@@ -108,7 +108,7 @@ impl VfsDir {
             Some((name, cap)) => {
                 #[cfg(feature = "spdk")]
                 let bs = SpdkEnv::global()
-                    .and_then(|env: &orpc::io::spdk_env::SpdkEnv| env.get_bdev(&name))
+                    .and_then(|env: &curvine_storage_spdk::SpdkEnv| env.get_bdev(&name))
                     .map(|b| b.block_size as i64)
                     .unwrap_or(DEFAULT_BLOCK_ALIGN);
                 #[cfg(not(feature = "spdk"))]

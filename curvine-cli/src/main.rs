@@ -12,16 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod alloc;
 mod cmds;
 mod commands;
 mod util;
 
 use clap::Parser;
 use commands::Commands;
-use curvine_client::rpc::JobMasterClient;
-use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::conf::ClusterConf;
-use curvine_common::version;
+use curvine_client_core::file::CurvineFileSystem;
+use curvine_config::ClusterConf;
+use curvine_job_client::JobMasterClient;
+use curvine_unified_fs::UnifiedFileSystem;
 use orpc::common::{Logger, Utils};
 use orpc::io::net::InetAddr;
 use orpc::runtime::RpcRuntime;
@@ -30,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
-#[command(author, version = version::VERSION, about, long_about = None)]
+#[command(author, version = env!("CARGO_PKG_VERSION"), about, long_about = None)]
 pub struct CurvineArgs {
     /// Configuration file path (optional)
     #[arg(
@@ -163,6 +164,11 @@ fn main() -> CommonResult<()> {
     let args = CurvineArgs::parse();
     Utils::set_panic_exit_hook();
 
+    if matches!(args.command, Commands::Version) {
+        println!("curvine-cli {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     let enable_default_discovery = matches!(args.command, Commands::Bench(_));
     let conf_load = args.get_conf_with_source(enable_default_discovery)?;
     let conf = conf_load.conf;
@@ -170,26 +176,51 @@ fn main() -> CommonResult<()> {
     Logger::init(conf.cli.log.clone());
 
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
-    let curvine_fs = UnifiedFileSystem::with_rt(conf.clone(), rt.clone())?;
-    let fs_client = curvine_fs.fs_client();
-    let load_client = JobMasterClient::new(fs_client.clone());
+    let fs_rt = rt.clone();
 
     rt.block_on(async move {
         let result = match args.command {
-            Commands::Bench(cmd) => cmd.execute(curvine_fs, conf_source.clone()).await,
-            Commands::Fs(cmd) => cmd.execute(curvine_fs).await,
-            Commands::Report(cmd) => cmd.execute(curvine_fs).await,
-            Commands::Load(cmd) => cmd.execute(load_client).await,
-            Commands::Export(cmd) => cmd.execute(load_client).await,
-            Commands::LoadStatus(cmd) => cmd.execute(load_client).await,
-            Commands::CancelLoad(cmd) => cmd.execute(load_client).await,
-            Commands::Mount(cmd) => cmd.execute(curvine_fs).await,
-            Commands::UnMount(cmd) => cmd.execute(fs_client).await,
-            Commands::Node(cmd) => cmd.execute(fs_client, conf.clone()).await,
-            Commands::Version => {
-                println!("curvine-cli {}", version::VERSION);
-                Ok(())
+            Commands::Bench(cmd) => {
+                let curvine_fs = UnifiedFileSystem::with_rt(conf.clone(), fs_rt.clone())?;
+                cmd.execute(curvine_fs, conf_source.clone()).await
             }
+            Commands::Fs(cmd) => {
+                let curvine_fs = UnifiedFileSystem::with_rt(conf.clone(), fs_rt.clone())?;
+                cmd.execute(curvine_fs).await
+            }
+            Commands::Report(cmd) => {
+                let curvine_fs = UnifiedFileSystem::with_rt(conf.clone(), fs_rt.clone())?;
+                cmd.execute(curvine_fs).await
+            }
+            Commands::Load(cmd) => {
+                let fs = CurvineFileSystem::with_rt(conf.clone(), fs_rt.clone())?;
+                cmd.execute(JobMasterClient::new(fs.fs_client())).await
+            }
+            Commands::Export(cmd) => {
+                let fs = CurvineFileSystem::with_rt(conf.clone(), fs_rt.clone())?;
+                cmd.execute(JobMasterClient::new(fs.fs_client())).await
+            }
+            Commands::LoadStatus(cmd) => {
+                let fs = CurvineFileSystem::with_rt(conf.clone(), fs_rt.clone())?;
+                cmd.execute(JobMasterClient::new(fs.fs_client())).await
+            }
+            Commands::CancelLoad(cmd) => {
+                let fs = CurvineFileSystem::with_rt(conf.clone(), fs_rt.clone())?;
+                cmd.execute(JobMasterClient::new(fs.fs_client())).await
+            }
+            Commands::Mount(cmd) => {
+                let curvine_fs = UnifiedFileSystem::with_rt(conf.clone(), fs_rt.clone())?;
+                cmd.execute(curvine_fs).await
+            }
+            Commands::UnMount(cmd) => {
+                let fs = CurvineFileSystem::with_rt(conf.clone(), fs_rt.clone())?;
+                cmd.execute(fs.fs_client()).await
+            }
+            Commands::Node(cmd) => {
+                let fs = CurvineFileSystem::with_rt(conf.clone(), fs_rt.clone())?;
+                cmd.execute(fs.fs_client(), conf.clone()).await
+            }
+            Commands::Version => Ok(()),
         };
 
         if let Err(e) = &result {

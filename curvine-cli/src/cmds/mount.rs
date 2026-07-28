@@ -14,13 +14,11 @@
 
 use crate::util::*;
 use clap::Parser;
-use curvine_client::unified::{UfsFileSystem, UnifiedFileSystem};
-use curvine_common::error::{ErrorKind, FsError};
-use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::{
-    AccessMode, MountOptions, Provider, StorageType, TtlAction, WriteType,
-};
-use curvine_common::utils::ProtoUtils;
+use curvine_error::{ErrorKind, FsError};
+use curvine_fs_api::{FileSystem, Path};
+use curvine_model::ProtoUtils;
+use curvine_model::{AccessMode, MountOptions, Provider, StorageType, TtlAction, WriteType};
+use curvine_unified_fs::{UfsFileSystem, UnifiedFileSystem};
 use orpc::common::{ByteUnit, DurationUnit};
 use orpc::{err_box, CommonResult};
 use std::collections::{HashMap, VecDeque};

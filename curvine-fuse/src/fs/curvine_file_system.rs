@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::fs::dcache::CleanerTask;
+use crate::fs::dcache::{CleanerTask, Inode};
 use crate::fs::operator::*;
 use crate::fs::plock_wait_registry::{LockOwner, PlockWaitGuard, PlockWaitRegistry};
 use crate::fs::state::{FileHandle, NodeState};
@@ -395,6 +395,21 @@ impl CurvineFileSystem {
         self.check_access_permissions(&status, header, mask)
     }
 
+    /// Read-only FUSE opens cannot distinguish an executable load from a normal
+    /// read, so the kernel handles those through `default_permissions`. Write
+    /// modes remain unambiguous and keep the userspace check as defense in depth.
+    fn open_userspace_acl_mask(action: OpenAction) -> Option<u32> {
+        match action {
+            OpenAction::ReadOnly => None,
+            OpenAction::WriteOnly => Some(libc::W_OK as u32),
+            OpenAction::ReadWrite => Some((libc::R_OK | libc::W_OK) as u32),
+        }
+    }
+
+    fn traversal_cached_status(inode: &Inode, meta_ttl: u64) -> Option<FileStatus> {
+        inode.cache_valid(meta_ttl).then(|| inode.clone_status())
+    }
+
     /// Linux root access(2) bypasses R_OK/W_OK but still validates X_OK against any
     /// execute bit in the file mode, not the caller's owner/group/other class.
     fn check_root_access_permissions(status: &FileStatus) -> FuseResult<()> {
@@ -443,19 +458,18 @@ impl CurvineFileSystem {
                 nodeid: dir_ino,
                 ..Default::default()
             };
-            // Only trust ACL bits from a valid dcache entry. The mount-root placeholder
-            // starts as Lifecycle::Invalid; using it fail-closes every non-root traverse
-            // with EACCES (breaks LTP chmod/chown under nobody).
-            let cached_status = {
+            let (is_root, cached_status) = {
                 let dir = self.state.dir_read();
-                dir.get_inode(dir_ino, None).and_then(|inode| {
-                    if inode.cache_valid(meta_ttl) {
-                        Some(inode.clone_status())
-                    } else {
-                        None
+                match dir.get_inode(dir_ino, None) {
+                    Some(inode) => {
+                        let is_root = inode.is_root();
+                        let status = Self::traversal_cached_status(inode, meta_ttl);
+                        (is_root, status)
                     }
-                })
+                    None => (false, None),
+                }
             };
+
             if let Some(status) = cached_status {
                 self.check_access_permissions(&status, &check_header, libc::X_OK as u32)?;
             } else {
@@ -463,10 +477,6 @@ impl CurvineFileSystem {
                     .await?;
             }
 
-            let is_root = {
-                let dir = self.state.dir_read();
-                dir.get_inode_check(dir_ino, None)?.is_root()
-            };
             if is_root {
                 break;
             }
@@ -1399,7 +1409,6 @@ impl fs::FileSystem for CurvineFileSystem {
             if action.write() || truncate {
                 return err_fuse!(libc::EACCES, "special file nodes are read-only metadata");
             }
-            self.check_permissions(op.header, action.acl_mask()).await?;
             let ino = op.header.nodeid;
             let handle = self.state.new_meta_handle(ino, status).await?;
             let open_flags = FuseUtils::file_open_flags(&self.conf, false);
@@ -1414,8 +1423,9 @@ impl fs::FileSystem for CurvineFileSystem {
             self.ensure_writable_path(&path, RpcCode::CreateFile)
                 .await?;
         }
-        self.check_permissions(op.header, action.acl_mask()).await?;
-
+        if let Some(mask) = Self::open_userspace_acl_mask(action) {
+            self.check_permissions(op.header, mask).await?;
+        }
         let ino = op.header.nodeid;
         let opts = FuseUtils::open_opts(&self.fs);
 
@@ -1510,10 +1520,17 @@ impl fs::FileSystem for CurvineFileSystem {
                 .invalid_cache(op.header.nodeid, None, INVAL_REASON_FLUSH);
         }
 
-        if op.arg.lock_owner != 0 {
-            self.fs_unlock_owner(&handle, LockFlags::Plock, op.arg.lock_owner)
-                .await?;
-            handle.take_plock_if_owner(op.arg.lock_owner);
+        // Only unlock when this handle held a plock for lock_owner. Linux fills
+        // lock_owner on almost every FUSE_FLUSH/close; unconditional unlock
+        // caused a Master SetLock+journal storm for Spark local-dirs (#1227).
+        if op.arg.lock_owner != 0 && handle.take_plock_if_owner(op.arg.lock_owner).is_some() {
+            if let Err(e) = self
+                .fs_unlock_owner(&handle, LockFlags::Plock, op.arg.lock_owner)
+                .await
+            {
+                handle.add_lock(LockFlags::Plock, op.arg.lock_owner);
+                return Err(e);
+            }
         }
         handle.flush(Some(reply)).await
     }
@@ -1935,8 +1952,49 @@ impl fs::FileSystem for CurvineFileSystem {
 
 #[cfg(test)]
 mod tests {
+    use crate::fs::dcache::Inode;
     use crate::{FATTR_ATIME_NOW, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_UID};
-    use curvine_common::state::{FileAllocMode, FileType, INTERNAL_CTIME_XATTR};
+    use curvine_common::state::{FileAllocMode, FileStatus, FileType, INTERNAL_CTIME_XATTR};
+
+    #[test]
+    fn userspace_open_checks_only_unambiguous_write_modes() {
+        use super::CurvineFileSystem;
+        use crate::fs::operator::OpenAction;
+
+        assert_eq!(
+            CurvineFileSystem::open_userspace_acl_mask(OpenAction::ReadOnly),
+            None
+        );
+        assert_eq!(
+            CurvineFileSystem::open_userspace_acl_mask(OpenAction::WriteOnly),
+            Some(libc::W_OK as u32)
+        );
+        assert_eq!(
+            CurvineFileSystem::open_userspace_acl_mask(OpenAction::ReadWrite),
+            Some((libc::R_OK | libc::W_OK) as u32)
+        );
+    }
+
+    #[test]
+    fn traversal_ignores_synthetic_root_until_backend_status_is_loaded() {
+        use super::CurvineFileSystem;
+
+        let mut root = Inode::new_root();
+        let meta_ttl = 60_000;
+        assert!(CurvineFileSystem::traversal_cached_status(&root, meta_ttl).is_none());
+
+        root.update_status(FileStatus {
+            is_dir: true,
+            mode: 0o755,
+            ..Default::default()
+        });
+
+        let status = CurvineFileSystem::traversal_cached_status(&root, meta_ttl).unwrap();
+        assert_eq!(status.mode, 0o755);
+
+        root.invalid_cache();
+        assert!(CurvineFileSystem::traversal_cached_status(&root, meta_ttl).is_none());
+    }
 
     #[test]
     fn posix_access_requires_mode_check_for_root() {

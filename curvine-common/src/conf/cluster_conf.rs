@@ -396,6 +396,42 @@ impl Display for ClusterConf {
     }
 }
 
+impl From<ClusterConf> for curvine_config::ClusterConf {
+    fn from(conf: ClusterConf) -> Self {
+        curvine_config::ClusterConf {
+            format_master: conf.format_master,
+            format_worker: conf.format_worker,
+            testing: conf.testing,
+            cluster_id: conf.cluster_id,
+            net_interface: conf.net_interface,
+            master: curvine_config::MasterConf {
+                hostname: conf.master.hostname,
+                rpc_port: conf.master.rpc_port,
+                web_port: conf.master.web_port,
+            },
+            journal: curvine_config::JournalConf {
+                hostname: conf.journal.hostname,
+                rpc_port: conf.journal.rpc_port,
+                journal_addrs: conf
+                    .journal
+                    .journal_addrs
+                    .into_iter()
+                    .map(|peer| curvine_config::JournalPeer {
+                        id: peer.id,
+                        hostname: peer.hostname,
+                        port: peer.port,
+                    })
+                    .collect(),
+            },
+            log: conf.log,
+            client: conf.client,
+            fuse: conf.fuse,
+            job: conf.job,
+            cli: conf.cli,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ClusterConf;
