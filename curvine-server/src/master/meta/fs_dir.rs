@@ -1178,7 +1178,11 @@ impl FsDir {
         };
 
         let mut meta = self.store.get_locks(inode.id())?;
-        let conflict = meta.set_lock(lock, expire_ms);
+        let (conflict, changed) = meta.set_lock_with_change(lock, expire_ms);
+
+        if !changed {
+            return Ok(conflict);
+        }
 
         let locks = meta.to_vec();
         self.store.apply_set_locks(inode.id(), &locks)?;

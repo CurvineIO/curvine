@@ -14,8 +14,8 @@
 
 #![allow(unused)]
 
-use curvine_common::conf::UfsConf;
-use curvine_common::fs::Path;
+use curvine_config::UfsConf;
+use curvine_fs_api::Path;
 use std::collections::HashMap;
 
 pub struct UFSContext {

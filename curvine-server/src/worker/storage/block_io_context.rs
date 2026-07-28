@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use orpc::io::{BlockDevice, BlockIO, IOError, IOResult, LocalFile};
+use orpc::io::{BlockIO, IOError, IOResult, LocalFile};
 use orpc::sys::DataSlice;
 use orpc::{err_box, try_err};
 
@@ -24,7 +24,7 @@ fn absolute_offset(device_base: i64, block_off: i64) -> IOResult<i64> {
 
 /// Block-relative write session produced by layout.
 pub struct BlockWriteContext {
-    device: BlockDevice,
+    device: Box<dyn BlockIO>,
     /// Base offset of the block on the backing device (0 for file-backed blocks).
     device_base: i64,
     block_size: i64,
@@ -35,12 +35,15 @@ impl BlockWriteContext {
     /// Establish the invariant `device.pos() == device_base + block_pos` by
     /// unconditionally seeking the underlying device. Callers must not rely on
     /// the layout having pre-positioned the device.
-    pub fn new(
-        mut device: BlockDevice,
+    pub fn new<D>(
+        mut device: D,
         device_base: i64,
         block_size: i64,
         initial_off: i64,
-    ) -> IOResult<Self> {
+    ) -> IOResult<Self>
+    where
+        D: BlockIO + 'static,
+    {
         if initial_off < 0 || initial_off > block_size {
             return err_box!(
                 "Invalid initial offset: {}, block length: {}",
@@ -51,7 +54,7 @@ impl BlockWriteContext {
         let absolute = absolute_offset(device_base, initial_off)?;
         try_err!(device.seek(absolute));
         Ok(Self {
-            device,
+            device: Box::new(device),
             device_base,
             block_size,
             block_pos: initial_off,
@@ -143,7 +146,7 @@ impl BlockWriteContext {
 
 /// Block-relative read session produced by layout.
 pub struct BlockReadContext {
-    device: BlockDevice,
+    device: Box<dyn BlockIO>,
     /// Base offset of the block on the backing device (0 for file-backed blocks).
     device_base: i64,
     block_size: i64,
@@ -154,12 +157,15 @@ impl BlockReadContext {
     /// Establish the invariant `device.pos() == device_base + block_pos` by
     /// unconditionally seeking the underlying device. Callers must not rely on
     /// the layout having pre-positioned the device.
-    pub fn new(
-        mut device: BlockDevice,
+    pub fn new<D>(
+        mut device: D,
         device_base: i64,
         block_size: i64,
         initial_off: i64,
-    ) -> IOResult<Self> {
+    ) -> IOResult<Self>
+    where
+        D: BlockIO + 'static,
+    {
         if initial_off < 0 || initial_off > block_size {
             return err_box!(
                 "Invalid initial offset: {}, block length: {}",
@@ -170,7 +176,7 @@ impl BlockReadContext {
         let absolute = absolute_offset(device_base, initial_off)?;
         try_err!(device.seek(absolute));
         Ok(Self {
-            device,
+            device: Box::new(device),
             device_base,
             block_size,
             block_pos: initial_off,
@@ -237,12 +243,12 @@ mod tests {
     /// for establishing the `device.pos() == device_base + block_pos` invariant.
     /// This mirrors the shared-device scenario (bdev/pool) that the abstraction
     /// targets.
-    fn shared_write_device(path: &str) -> IOResult<BlockDevice> {
-        Ok(BlockDevice::Local(LocalFile::with_write(path, false)?))
+    fn shared_write_device(path: &str) -> IOResult<LocalFile> {
+        LocalFile::with_write(path, false)
     }
 
-    fn shared_read_device(path: &str) -> IOResult<BlockDevice> {
-        Ok(BlockDevice::Local(LocalFile::with_read(path, 0)?))
+    fn shared_read_device(path: &str) -> IOResult<LocalFile> {
+        LocalFile::with_read(path, 0)
     }
 
     fn ensure_parent(path: &str) -> std::io::Result<()> {

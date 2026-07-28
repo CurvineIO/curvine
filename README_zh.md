@@ -248,7 +248,3 @@ Curvine 在高并发场景下表现优异，支持：
 ## 📜 许可证
 
 Curvine 采用 **[Apache License 2.0](LICENSE)** 开源协议授权。
-
-## 星标历史
-
-[![Star History Chart](https://api.star-history.com/svg?repos=CurvineIO/curvine&type=Date)](https://www.star-history.com/#CurvineIO/curvine&Date)

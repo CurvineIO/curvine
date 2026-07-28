@@ -1,6 +1,6 @@
 ---
 name: cv-submit-pr-review
-description: Perform a direct code review of a Curvine PR by reading the diff and changed files, analyzing correctness, safety, and design issues, and producing structured findings. Use when user asks to review a PR's code, do a code review, or check a PR before merge.
+description: Perform a direct code review of a Curvine PR by reading the diff and changed files, analyzing correctness, safety, design, and performance impact on critical paths (data read/write, RPC message communication, metadata operations), and producing structured findings. Use when user asks to review a PR's code, do a code review, or check a PR before merge.
 ---
 
 # Review PR Workflow
@@ -26,7 +26,7 @@ Focus **exclusively on code content**:
 |Correctness|Logic errors, edge cases, off-by-one, None/null handling, error propagation|
 |Safety|Concurrency races, panics / unwrap in hot paths, unsafe blocks, resource leaks, lock ordering|
 |Design|Naming, module boundaries, abstractions, consistency with existing patterns|
-|Comments|Header doc-comments on a method, function, or class that exceed **3 lines**; excessive inline comments that merely restate code instead of explaining intent. Flag any single-item header comment block longer than 3 lines as a `suggestion`-level finding and ask the author to trim it (move detail into the body or remove redundant lines).|
+|Performance|Potential performance impact on critical paths: **data read/write** (block I/O patterns, extra buffer copies, sync/fsync frequency, read amplification), **message communication** (RPC payload size, serialization/deserialization overhead, extra network round trips, connection churn), and **metadata operations** (inode lookup cost, lock granularity and hold time, journal/rocksdb write amplification). Trace hot-path call chains to judge whether the change adds work per request/block/message. Any change likely to cause a significant performance regression **must** generate a comment with concrete improvement suggestions (e.g., batching, caching, avoiding copies, narrowing locks, async-ifying blocking calls).|
 
 **Ignore:** commit message quality, PR description wording, pure formatting nits (run `make format` separately).
 
@@ -125,6 +125,8 @@ Inspect the actual code changes and look for:
 * correctness issues
 
 * regressions
+
+* performance regressions in critical paths — analyze whether the change adds overhead to data read/write, RPC message communication, or metadata operations; if the impact is significant, drafting a comment with improvement suggestions is mandatory
 
 * missing validation or edge-case handling
 
@@ -250,6 +252,8 @@ Post only the comments the user approved.
 - [ ]  Callers / definitions of changed symbols checked
 
 - [ ]  Module conventions verified (knowledge cards / existing patterns)
+
+- [ ]  Performance impact assessed for data read/write, RPC message communication, and metadata paths; significant regressions have mandatory comments with suggestions
 
 - [ ]  Findings table produced with severity per item
 

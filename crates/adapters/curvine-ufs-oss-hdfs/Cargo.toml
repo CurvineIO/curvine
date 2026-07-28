@@ -1,0 +1,26 @@
+[package]
+name = "curvine-ufs-oss-hdfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+curvine-ufs = { workspace = true }
+curvine-config = { workspace = true }
+curvine-error = { workspace = true }
+curvine-fs-api = { workspace = true }
+curvine-model = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+log = { workspace = true }
+orpc = { workspace = true }
+tokio = { workspace = true }
+
+[build-dependencies]
+cc = "1.1"
+
+[features]
+default = []
+oss-hdfs = []
+oss-hdfs-ffi-test = ["oss-hdfs"]
