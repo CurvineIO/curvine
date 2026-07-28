@@ -12,6 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub type SysResult<T> = std::io::Result<T>;
+
+macro_rules! sys_error {
+    ($message:expr) => {
+        Err(std::io::Error::other($message))
+    };
+    ($format:expr, $($arg:expr),+ $(,)?) => {
+        Err(std::io::Error::other(format!($format, $($arg),+)))
+    };
+}
+
+macro_rules! sys_call {
+    ($expression:expr) => {{
+        let result = $expression;
+        if result as CInt <= ERRNO_SENTINEL {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(result as CInt)
+        }
+    }};
+}
+
 mod sys_libc;
 pub use self::sys_libc::*;
 

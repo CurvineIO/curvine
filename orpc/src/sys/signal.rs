@@ -14,8 +14,7 @@
 
 #![allow(unused)]
 
-use crate::err_box;
-use crate::io::IOResult;
+use crate::sys::SysResult;
 use futures::future::{select_all, BoxFuture};
 use futures::FutureExt;
 use std::future::Future;
@@ -78,7 +77,7 @@ impl std::fmt::Display for SignalKind {
 pub struct SignalWatch;
 
 impl SignalWatch {
-    fn signal_future(kind: SignalKind) -> IOResult<BoxFuture<'static, Option<()>>> {
+    fn signal_future(kind: SignalKind) -> SysResult<BoxFuture<'static, Option<()>>> {
         #[cfg(target_os = "linux")]
         {
             use tokio::signal::unix::{signal, SignalKind as TokioSignalKind};
@@ -104,7 +103,7 @@ impl SignalWatch {
                     Ok(async move { ctrl_c.await.ok() }.boxed())
                 }
                 _ => {
-                    err_box!("signal {:?} not supported on non-Linux platforms", kind)
+                    sys_error!("signal {:?} not supported on non-Linux platforms", kind)
                 }
             }
         }
@@ -112,9 +111,9 @@ impl SignalWatch {
 
     fn signal_futures(
         kinds: &[SignalKind],
-    ) -> IOResult<Vec<(SignalKind, BoxFuture<'static, Option<()>>)>> {
+    ) -> SysResult<Vec<(SignalKind, BoxFuture<'static, Option<()>>)>> {
         if kinds.is_empty() {
-            return err_box!("no signals to create futures for");
+            return sys_error!("no signals to create futures for");
         }
 
         let mut futures = Vec::with_capacity(kinds.len());
@@ -126,15 +125,15 @@ impl SignalWatch {
         Ok(futures)
     }
 
-    pub async fn wait_one(target: SignalKind) -> IOResult<SignalKind> {
+    pub async fn wait_one(target: SignalKind) -> SysResult<SignalKind> {
         let fut = Self::signal_future(target)?;
         match fut.await {
             Some(_) => Ok(target),
-            None => err_box!("signal stream closed"),
+            None => sys_error!("signal stream closed"),
         }
     }
 
-    pub async fn wait_quit() -> IOResult<SignalKind> {
+    pub async fn wait_quit() -> SysResult<SignalKind> {
         #[cfg(target_os = "linux")]
         {
             let quit_signals = [
@@ -153,7 +152,7 @@ impl SignalWatch {
             let ((kind, opt), _, _) = select_all(futures).await;
             match opt {
                 Some(_) => Ok(kind),
-                None => err_box!("signal stream closed"),
+                None => sys_error!("signal stream closed"),
             }
         }
 

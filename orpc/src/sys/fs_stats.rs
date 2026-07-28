@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{err_box, sys, try_err, try_log, CommonResult};
+use crate::sys::{self, SysResult};
 use log::warn;
 use std::path::{Path, PathBuf};
 
@@ -61,15 +61,15 @@ impl FsStats {
     }
 
     pub fn total_space(&self) -> u64 {
-        try_log!(fs2::total_space(self.path()), 0)
+        Self::space_or_zero(fs2::total_space(self.path()))
     }
 
     pub fn free_space(&self) -> u64 {
-        try_log!(fs2::free_space(self.path()), 0)
+        Self::space_or_zero(fs2::free_space(self.path()))
     }
 
     pub fn available_space(&self) -> u64 {
-        try_log!(fs2::available_space(self.path()), 0)
+        Self::space_or_zero(fs2::available_space(self.path()))
     }
 
     pub fn used_space(&self) -> u64 {
@@ -77,11 +77,11 @@ impl FsStats {
         used.unwrap_or(0)
     }
 
-    pub fn check_dir(&self) -> CommonResult<()> {
-        let m = try_err!(self.path.metadata());
+    pub fn check_dir(&self) -> SysResult<()> {
+        let m = self.path.metadata()?;
 
         if !m.is_dir() || m.permissions().readonly() {
-            return err_box!("Directory is not writable: {:?}", self.path());
+            return sys_error!("Directory is not writable: {:?}", self.path());
         }
 
         let new_device_id = sys::get_device_id(self.path());
@@ -92,11 +92,20 @@ impl FsStats {
 
         Ok(())
     }
+
+    fn space_or_zero(result: SysResult<u64>) -> u64 {
+        match result {
+            Ok(value) => value,
+            Err(error) => {
+                warn!("{}", error);
+                0
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::common::ByteUnit;
     use crate::sys::FsStats;
 
     #[test]
@@ -105,10 +114,10 @@ mod tests {
         println!(
             "path = {:?}, total_space = {}, free_space = {}, available_space = {}, len = {}",
             fs.path(),
-            ByteUnit::byte_to_string(fs.total_space()),
-            ByteUnit::byte_to_string(fs.free_space()),
-            ByteUnit::byte_to_string(fs.available_space()),
-            ByteUnit::byte_to_string(fs.len()),
+            fs.total_space(),
+            fs.free_space(),
+            fs.available_space(),
+            fs.len(),
         )
     }
 }

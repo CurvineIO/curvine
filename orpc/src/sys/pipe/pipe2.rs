@@ -12,10 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::io::IOResult;
 use crate::sys::pipe::{AsyncFd, PipeFd, PipePool, PipeReader, PipeWriter};
-use crate::sys::{CInt, RawIO};
-use crate::{err_box, sys};
+use crate::sys::{self, CInt, RawIO, SysResult};
 use log::warn;
 use std::io::IoSlice;
 use std::sync::Arc;
@@ -42,7 +40,7 @@ pub struct Pipe2 {
 }
 
 impl Pipe2 {
-    pub fn new(pipe_fd: PipeFd) -> IOResult<Self> {
+    pub fn new(pipe_fd: PipeFd) -> SysResult<Self> {
         let writer = PipeWriter::new(pipe_fd.write.as_borrowed())?;
         let reader = PipeReader::new(pipe_fd.read.as_borrowed())?;
         let pipe2 = Self {
@@ -76,16 +74,16 @@ impl Pipe2 {
         self.buf_size
     }
 
-    pub async fn readable(&self) -> IOResult<()> {
+    pub async fn readable(&self) -> SysResult<()> {
         match self.reader.async_fd() {
-            None => err_box!("Unsupported operation"),
+            None => sys_error!("Unsupported operation"),
             Some(v) => v.readable().await,
         }
     }
 
-    pub async fn writable(&self) -> IOResult<()> {
+    pub async fn writable(&self) -> SysResult<()> {
         match self.writer.async_fd() {
-            None => err_box!("Unsupported operation"),
+            None => sys_error!("Unsupported operation"),
             Some(v) => v.writable().await,
         }
     }
@@ -100,7 +98,7 @@ impl Pipe2 {
         fd_in: &AsyncFd,
         mut off_in: Option<i64>,
         len: usize,
-    ) -> IOResult<usize> {
+    ) -> SysResult<usize> {
         let fd_out = self.writer.raw_fd();
         let res = fd_in
             .async_read(|fd| sys::splice(fd.fd(), off_in.as_mut(), fd_out, None, len))
@@ -109,9 +107,9 @@ impl Pipe2 {
     }
 
     // Write IoSlice data into the pipeline, iov -> pipe writer.
-    pub async fn write_iov(&self, len: usize, iov: &[IoSlice<'_>]) -> IOResult<()> {
+    pub async fn write_iov(&self, len: usize, iov: &[IoSlice<'_>]) -> SysResult<()> {
         if len > self.buf_size {
-            return err_box!(
+            return sys_error!(
                 "write_iov: data size {} exceeds pipe buffer size {}",
                 len,
                 self.buf_size
@@ -131,7 +129,7 @@ impl Pipe2 {
                     .await?
             };
             if res == 0 {
-                return err_box!("vmsplice returned 0");
+                return sys_error!("vmsplice returned 0");
             }
             written += res as usize;
         }
@@ -141,9 +139,9 @@ impl Pipe2 {
     // Read data in the pipeline, write to the io object, pipe reader -> fd out.
     // Loops to completion: a partial splice (short transfer under SPLICE_F_NONBLOCK)
     // is retried until all bytes are transferred, preventing pipe poisoning (issue #965).
-    pub async fn read_io(&self, fd_out: &AsyncFd, len: usize) -> IOResult<()> {
+    pub async fn read_io(&self, fd_out: &AsyncFd, len: usize) -> SysResult<()> {
         if len > self.buf_size {
-            return err_box!(
+            return sys_error!(
                 "read_io: request size {} exceeds pipe buffer size {}",
                 len,
                 self.buf_size
@@ -160,7 +158,7 @@ impl Pipe2 {
             let res =
                 Self::splice_retry(|| sys::splice(fd_in, None, fd_out, None, remaining)).await?;
             if res == 0 {
-                return err_box!("splice returned 0");
+                return sys_error!("splice returned 0");
             }
             remaining -= res as usize;
         }
@@ -179,7 +177,7 @@ impl Pipe2 {
     // While it keeps hitting EAGAIN it logs a warning every
     // SPLICE_RETRY_WARN_INTERVAL so the otherwise-silent HOL-blocked sender is
     // visible in the field before the watchdog lands.
-    async fn splice_retry(mut f: impl FnMut() -> IOResult<CInt>) -> IOResult<CInt> {
+    async fn splice_retry(mut f: impl FnMut() -> SysResult<CInt>) -> SysResult<CInt> {
         let mut delay = SPLICE_RETRY_MIN;
         // Set on the first EAGAIN; measures how long this call has been stalled
         // on continuous would-block. (Ok / real errors return, so there is no
@@ -190,11 +188,11 @@ impl Pipe2 {
             match f() {
                 Ok(res) => return Ok(res),
                 Err(e) => {
-                    let os = e.raw_error().raw_os_error();
+                    let os = e.raw_os_error();
                     if os == Some(libc::EINTR) {
                         continue;
                     }
-                    if e.is_would_block() {
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
                         let stalled = match eagain_since {
                             Some(start) => start.elapsed(),
                             None => {
@@ -221,7 +219,7 @@ impl Pipe2 {
     }
 
     // Read the data of the pipeline into buf, pipe read -> buf
-    pub async fn read_buf(&self, buf: &mut [u8]) -> IOResult<usize> {
+    pub async fn read_buf(&self, buf: &mut [u8]) -> SysResult<usize> {
         let res = self.reader.async_read(|fd| sys::read(fd.fd(), buf)).await?;
         Ok(res as usize)
     }
@@ -269,17 +267,16 @@ impl Drop for Pipe2 {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::Pipe2;
-    use crate::io::{IOError, IOResult};
-    use crate::sys::CInt;
+    use crate::sys::{CInt, SysResult};
     use std::cell::Cell;
     use std::io;
 
-    fn eagain() -> IOError {
-        IOError::new(io::Error::from_raw_os_error(libc::EAGAIN))
+    fn eagain() -> io::Error {
+        io::Error::from_raw_os_error(libc::EAGAIN)
     }
 
-    fn eintr() -> IOError {
-        IOError::new(io::Error::from_raw_os_error(libc::EINTR))
+    fn eintr() -> io::Error {
+        io::Error::from_raw_os_error(libc::EINTR)
     }
 
     // Regression for #1215: on a permanently level-writable fd (/dev/fuse), the
@@ -290,7 +287,7 @@ mod tests {
     #[tokio::test]
     async fn splice_retry_retries_eagain_until_ok() {
         let calls = Cell::new(0u32);
-        let f = || -> IOResult<CInt> {
+        let f = || -> SysResult<CInt> {
             let n = calls.get();
             calls.set(n + 1);
             // First 5 attempts report EAGAIN (would-block), then succeed.
@@ -312,7 +309,7 @@ mod tests {
     #[tokio::test]
     async fn splice_retry_retries_eintr() {
         let calls = Cell::new(0u32);
-        let f = || -> IOResult<CInt> {
+        let f = || -> SysResult<CInt> {
             let n = calls.get();
             calls.set(n + 1);
             if n < 3 {
@@ -331,9 +328,8 @@ mod tests {
     // forever. Uses EPIPE (broken pipe), a real splice failure mode.
     #[tokio::test]
     async fn splice_retry_propagates_real_error() {
-        let f =
-            || -> IOResult<CInt> { Err(IOError::new(io::Error::from_raw_os_error(libc::EPIPE))) };
+        let f = || -> SysResult<CInt> { Err(io::Error::from_raw_os_error(libc::EPIPE)) };
         let err = Pipe2::splice_retry(f).await.unwrap_err();
-        assert_eq!(err.raw_error().raw_os_error(), Some(libc::EPIPE));
+        assert_eq!(err.raw_os_error(), Some(libc::EPIPE));
     }
 }

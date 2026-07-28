@@ -224,12 +224,12 @@ impl<T: FileSystem> FuseSender<T> {
         let (len, iovec) = rep.as_iovec()?;
         if let Err(e) = pipe2.write_iov(len, &iovec).await {
             Self::drain_pipe(pipe2);
-            return Err(e);
+            return Err(e.into());
         }
 
         if let Err(e) = pipe2.read_io(&self.kernel_fd, len).await {
             Self::drain_pipe(pipe2);
-            return Err(e);
+            return Err(e.into());
         }
 
         Ok(())
@@ -246,7 +246,7 @@ impl<T: FileSystem> FuseSender<T> {
                 Ok(n) if n > 0 => continue,
                 Ok(_) => break, // EOF
                 Err(e) => {
-                    if e.raw_error().raw_os_error() == Some(libc::EINTR) {
+                    if e.raw_os_error() == Some(libc::EINTR) {
                         continue; // interrupted; retry
                     }
                     // EAGAIN/EWOULDBLOCK: pipe is empty; any other error: stop.

@@ -12,11 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::err_box;
-use crate::handler::RpcFrame;
-use crate::io::IOResult;
 use crate::sys::pipe::{AsyncFd, BorrowedFd};
-use crate::sys::{self, RawIO};
+use crate::sys::{RawIO, SysResult};
 
 // Write data into the pipeline.
 pub struct PipeWriter {
@@ -25,13 +22,9 @@ pub struct PipeWriter {
 }
 
 impl PipeWriter {
-    pub fn new(fd: BorrowedFd) -> IOResult<Self> {
+    pub fn new(fd: BorrowedFd) -> SysResult<Self> {
         let async_fd = AsyncFd::create(fd)?;
         Ok(Self { fd, async_fd })
-    }
-
-    pub async fn splice_in(&self, io: &RpcFrame, len: usize) -> IOResult<()> {
-        sys::splice_in_full(io, None, self.raw_fd(), None, len).await
     }
 
     pub fn raw_fd(&self) -> RawIO {
@@ -50,11 +43,11 @@ impl PipeWriter {
         self.async_fd.take().map(|x| x.deregister())
     }
 
-    pub async fn async_write<R>(&self, f: impl FnMut(&BorrowedFd) -> IOResult<R>) -> IOResult<R> {
+    pub async fn async_write<R>(&self, f: impl FnMut(&BorrowedFd) -> SysResult<R>) -> SysResult<R> {
         if let Some(fd) = &self.async_fd {
             fd.async_write(f).await
         } else {
-            err_box!("fd is not an asynchronous {}", self.raw_fd())
+            sys_error!("fd is not asynchronous: {}", self.raw_fd())
         }
     }
 }

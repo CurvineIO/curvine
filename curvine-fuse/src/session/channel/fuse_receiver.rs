@@ -186,7 +186,7 @@ impl<T: FileSystem> FuseReceiver<T> {
                 // Recoverable (real errno): the loop may `continue` to the next
                 // frame, so drain the stale bytes that would otherwise poison it.
                 Self::drain_pipe(pipe2);
-                return Err(err);
+                return Err(err.into());
             }
         };
         if write_len != read_len {
@@ -208,7 +208,7 @@ impl<T: FileSystem> FuseReceiver<T> {
                 Ok(n) if n > 0 => continue,
                 Ok(_) => break,
                 Err(err) => {
-                    if err.raw_error().raw_os_error() == Some(EINTR) {
+                    if err.raw_os_error() == Some(EINTR) {
                         continue;
                     }
                     break;

@@ -12,10 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::err_box;
-use crate::io::IOResult;
 use crate::sys::pipe::{AsyncFd, BorrowedFd};
-use crate::sys::RawIO;
+use crate::sys::{RawIO, SysResult};
 
 // Read data from the pipeline.
 pub struct PipeReader {
@@ -24,16 +22,16 @@ pub struct PipeReader {
 }
 
 impl PipeReader {
-    pub fn new(fd: BorrowedFd) -> IOResult<Self> {
+    pub fn new(fd: BorrowedFd) -> SysResult<Self> {
         let async_fd = AsyncFd::create(fd)?;
         Ok(Self { fd, async_fd })
     }
 
-    pub async fn async_read<R>(&self, f: impl FnMut(&BorrowedFd) -> IOResult<R>) -> IOResult<R> {
+    pub async fn async_read<R>(&self, f: impl FnMut(&BorrowedFd) -> SysResult<R>) -> SysResult<R> {
         if let Some(fd) = &self.async_fd {
             fd.async_read(f).await
         } else {
-            err_box!("fd is not an asynchronous {}", self.raw_fd())
+            sys_error!("fd is not asynchronous: {}", self.raw_fd())
         }
     }
 

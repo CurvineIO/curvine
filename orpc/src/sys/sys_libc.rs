@@ -14,11 +14,7 @@
 
 #![allow(unused, clippy::not_unsafe_ptr_arg_deref)]
 
-use crate::err_box;
-use crate::handler::RpcFrame;
-use crate::io::{IOResult, LocalFile};
 use crate::sys::*;
-use crate::{err_io, err_msg, try_err, try_option};
 use fs2::FileExt;
 use std::ffi::{CStr, CString};
 use std::fs;
@@ -34,34 +30,34 @@ use std::os::unix::io::AsRawFd;
 
 // Get the file descriptor of an io object (file, network), and for non-linux systems, an error is returned.
 #[cfg(target_os = "linux")]
-pub fn get_raw_io<T>(io: &T) -> IOResult<CInt>
+pub fn get_raw_io<T>(io: &T) -> SysResult<CInt>
 where
     T: AsRawFd,
 {
-    err_io!(io.as_raw_fd())
+    Ok(io.as_raw_fd())
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn get_raw_io<T>(_: &T) -> IOResult<CInt> {
-    err_box!("Unsupported os")
+pub fn get_raw_io<T>(_: &T) -> SysResult<CInt> {
+    sys_error!("Unsupported os")
 }
 
-pub fn close(raw_io: RawIO) -> IOResult<()> {
+pub fn close(raw_io: RawIO) -> SysResult<()> {
     #[cfg(not(target_os = "linux"))]
     {
-        err_box!("Unsupported close raw id {}", raw_io)
+        sys_error!("Unsupported close raw id {}", raw_io)
     }
 
     #[cfg(target_os = "linux")]
     {
         unsafe {
-            err_io!(libc::close(raw_io))?;
+            sys_call!(libc::close(raw_io))?;
         }
         Ok(())
     }
 }
 
-pub fn close_raw_io(raw_io: RawIO) -> IOResult<()> {
+pub fn close_raw_io(raw_io: RawIO) -> SysResult<()> {
     close(raw_io)
 }
 
@@ -73,10 +69,15 @@ pub fn close_raw_io(raw_io: RawIO) -> IOResult<()> {
 //     offset: *mut off_t,
 //     count: size_t
 // ) -> ssize_t
-pub fn send_file(fd_in: RawIO, fd_out: RawIO, off: Option<&mut i64>, len: usize) -> IOResult<CInt> {
+pub fn send_file(
+    fd_in: RawIO,
+    fd_out: RawIO,
+    off: Option<&mut i64>,
+    len: usize,
+) -> SysResult<CInt> {
     #[cfg(not(target_os = "linux"))]
     {
-        err_box!("unsupported operation")
+        sys_error!("unsupported operation")
     }
 
     #[cfg(target_os = "linux")]
@@ -86,40 +87,8 @@ pub fn send_file(fd_in: RawIO, fd_out: RawIO, off: Option<&mut i64>, len: usize)
             None => std::ptr::null_mut(),
         };
         let res = unsafe { libc::sendfile(fd_out, fd_in, off, len as libc::size_t) };
-        err_io!(res)
+        sys_call!(res)
     }
-}
-
-pub async fn send_file_full(
-    io_out: &RpcFrame,
-    fd_in: RawIO,
-    mut off: Option<i64>,
-    len: usize,
-) -> IOResult<()> {
-    let fd_out = get_raw_io(io_out)?;
-    let mut remaining = len;
-    while remaining > 0 {
-        let res = io_out
-            .async_write(|| send_file(fd_in, fd_out, off.as_mut(), remaining))
-            .await;
-
-        match res {
-            Ok(transferred) => {
-                if transferred == 0 {
-                    return err_box!("send_file return 0");
-                }
-                remaining -= transferred as usize;
-            }
-
-            Err(e) if e.is_would_block() => {
-                continue;
-            }
-
-            Err(e) => return Err(e),
-        }
-    }
-
-    Ok(())
 }
 
 // Linux splice function to copy data between 2 FDs.
@@ -138,10 +107,10 @@ pub fn splice(
     fd_out: RawIO,
     off_out: Option<&mut i64>,
     len: usize,
-) -> IOResult<CInt> {
+) -> SysResult<CInt> {
     #[cfg(not(target_os = "linux"))]
     {
-        err_box!("unsupported operation")
+        sys_error!("unsupported operation")
     }
 
     #[cfg(target_os = "linux")]
@@ -165,7 +134,7 @@ pub fn splice(
                 libc::SPLICE_F_NONBLOCK | libc::SPLICE_F_MOVE,
             )
         };
-        err_io!(res)
+        sys_call!(res)
     }
 }
 
@@ -175,41 +144,14 @@ pub fn splice_out_full(
     fd_out: RawIO,
     mut off_out: Option<i64>,
     len: usize,
-) -> IOResult<()> {
+) -> SysResult<()> {
     let mut remaining = len;
     while remaining > 0 {
         let transferred = splice(fd_in, off_in.as_mut(), fd_out, off_out.as_mut(), remaining)?;
         if transferred == 0 {
-            return err_box!("unsupported operation");
+            return sys_error!("unsupported operation");
         }
         remaining -= transferred as usize;
-    }
-
-    Ok(())
-}
-
-pub async fn splice_in_full(
-    io_in: &RpcFrame,
-    mut off_in: Option<i64>,
-    fd_out: RawIO,
-    mut off_out: Option<i64>,
-    len: usize,
-) -> IOResult<()> {
-    let fd_in = get_raw_io(io_in)?;
-
-    let mut remaining = len;
-    while remaining > 0 {
-        let write_res = io_in
-            .async_read(|| splice(fd_in, off_in.as_mut(), fd_out, off_out.as_mut(), remaining))
-            .await;
-
-        match write_res {
-            Ok(transferred) => remaining -= transferred as usize,
-
-            Err(e) if e.is_would_block() => continue,
-
-            Err(e) => return Err(e),
-        }
     }
 
     Ok(())
@@ -232,32 +174,32 @@ pub fn pipe_is_blocking(fd: RawIO) -> bool {
 }
 
 // Modify the pipeline blocking mode.
-pub fn set_pipe_blocking(fd: RawIO, blocking: bool) -> IOResult<()> {
+pub fn set_pipe_blocking(fd: RawIO, blocking: bool) -> SysResult<()> {
     #[cfg(not(target_os = "linux"))]
     {
-        err_box!("unsupported operation")
+        sys_error!("unsupported operation")
     }
 
     #[cfg(target_os = "linux")]
     {
         unsafe {
-            let status_flags = err_io!(libc::fcntl(fd, libc::F_GETFL))?;
+            let status_flags = sys_call!(libc::fcntl(fd, libc::F_GETFL))?;
             let res = if blocking {
                 libc::fcntl(fd, libc::F_SETFL, status_flags & !libc::O_NONBLOCK)
             } else {
                 libc::fcntl(fd, libc::F_SETFL, status_flags | libc::O_NONBLOCK)
             };
 
-            err_io!(res)?;
+            sys_call!(res)?;
             Ok(())
         }
     }
 }
 
-pub fn pipe2(size: usize) -> IOResult<[RawIO; 2]> {
+pub fn pipe2(size: usize) -> SysResult<[RawIO; 2]> {
     #[cfg(not(target_os = "linux"))]
     {
-        err_box!("unsupported operation")
+        sys_error!("unsupported operation")
     }
 
     #[cfg(target_os = "linux")]
@@ -268,16 +210,16 @@ pub fn pipe2(size: usize) -> IOResult<[RawIO; 2]> {
                 fds.as_mut_ptr() as *mut libc::c_int,
                 libc::O_CLOEXEC | libc::O_NONBLOCK,
             );
-            err_io!(res)?;
+            sys_call!(res)?;
 
             let set_buf_res = libc::fcntl(fds[1], libc::F_SETPIPE_SZ, size);
-            err_io!(set_buf_res)?;
+            sys_call!(set_buf_res)?;
 
             let set_buf_res = libc::fcntl(fds[0], libc::F_SETPIPE_SZ, size);
-            err_io!(set_buf_res)?;
+            sys_call!(set_buf_res)?;
 
             if (set_buf_res as usize) < size {
-                return err_box!(
+                return sys_error!(
                     "Failed to set pipe size, expected: {}, actual: {}",
                     size,
                     set_buf_res
@@ -296,7 +238,7 @@ pub fn pipe2(size: usize) -> IOResult<[RawIO; 2]> {
 //     len: off_t,
 //     advise: c_int
 // ) -> c_int
-pub fn read_ahead(file: &std::fs::File, off: i64, len: i64) -> IOResult<CInt> {
+pub fn read_ahead(file: &std::fs::File, off: i64, len: i64) -> SysResult<CInt> {
     #[cfg(not(target_os = "linux"))]
     {
         Ok(0)
@@ -312,12 +254,12 @@ pub fn read_ahead(file: &std::fs::File, off: i64, len: i64) -> IOResult<CInt> {
                 len as libc::off_t,
                 libc::POSIX_FADV_WILLNEED,
             );
-            err_io!(res)
+            sys_call!(res)
         }
     }
 }
 
-pub fn is_tmpfs(file_path: &str) -> IOResult<bool> {
+pub fn is_tmpfs(file_path: &str) -> SysResult<bool> {
     #[cfg(not(target_os = "linux"))]
     {
         Ok(false)
@@ -326,13 +268,13 @@ pub fn is_tmpfs(file_path: &str) -> IOResult<bool> {
     #[cfg(target_os = "linux")]
     {
         let path = match std::ffi::CString::new(file_path) {
-            Err(e) => return err_box!("CString::new {}", e),
+            Err(e) => return sys_error!("CString::new {}", e),
             Ok(v) => v,
         };
 
         unsafe {
             let mut stat: libc::statfs = std::mem::zeroed();
-            err_io!(libc::statfs(path.as_ptr(), &mut stat))?;
+            sys_call!(libc::statfs(path.as_ptr(), &mut stat))?;
             Ok(stat.f_type == libc::TMPFS_MAGIC)
         }
     }
@@ -345,10 +287,10 @@ pub fn thread_name() -> String {
         .to_string()
 }
 
-pub fn read(fd: RawIO, buf: &mut [u8]) -> IOResult<CInt> {
+pub fn read(fd: RawIO, buf: &mut [u8]) -> SysResult<CInt> {
     #[cfg(not(target_os = "linux"))]
     {
-        err_box!("unsupported operation")
+        sys_error!("unsupported operation")
     }
 
     #[cfg(target_os = "linux")]
@@ -358,11 +300,11 @@ pub fn read(fd: RawIO, buf: &mut [u8]) -> IOResult<CInt> {
             libc::read(fd, buf.as_ptr() as *mut c_void, buf.len() as size_t)
         };
 
-        err_io!(res)
+        sys_call!(res)
     }
 }
 
-pub fn read_full(fd: RawIO, buf: &mut [u8]) -> IOResult<()> {
+pub fn read_full(fd: RawIO, buf: &mut [u8]) -> SysResult<()> {
     let mut remaining = buf.len();
     let mut off = 0;
 
@@ -375,10 +317,10 @@ pub fn read_full(fd: RawIO, buf: &mut [u8]) -> IOResult<()> {
     Ok(())
 }
 
-pub fn writev(fd: RawIO, bufs: &[IoSlice<'_>]) -> IOResult<CInt> {
+pub fn writev(fd: RawIO, bufs: &[IoSlice<'_>]) -> SysResult<CInt> {
     #[cfg(not(target_os = "linux"))]
     {
-        err_box!("unsupported operation")
+        sys_error!("unsupported operation")
     }
 
     #[cfg(target_os = "linux")]
@@ -386,7 +328,7 @@ pub fn writev(fd: RawIO, bufs: &[IoSlice<'_>]) -> IOResult<CInt> {
         let res =
             unsafe { libc::writev(fd, bufs.as_ptr() as *const libc::iovec, bufs.len() as CInt) };
 
-        err_io!(res)
+        sys_call!(res)
     }
 }
 
@@ -420,10 +362,10 @@ pub fn get_gid() -> u32 {
 //     nr_segs: size_t,
 //     flags: c_uint
 // ) -> ssize_t
-pub fn vm_splice(fd: RawIO, iov: &[IoSlice<'_>]) -> IOResult<CInt> {
+pub fn vm_splice(fd: RawIO, iov: &[IoSlice<'_>]) -> SysResult<CInt> {
     #[cfg(not(target_os = "linux"))]
     {
-        err_box!("unsupported operation")
+        sys_error!("unsupported operation")
     }
 
     #[cfg(target_os = "linux")]
@@ -437,7 +379,7 @@ pub fn vm_splice(fd: RawIO, iov: &[IoSlice<'_>]) -> IOResult<CInt> {
             )
         };
 
-        err_io!(res)
+        sys_call!(res)
     }
 }
 
@@ -446,16 +388,16 @@ pub fn vm_splice(fd: RawIO, iov: &[IoSlice<'_>]) -> IOResult<CInt> {
 //     oflag: c_int,
 //     ...
 // ) -> c_int
-pub fn open(path: &CString, flag: i32) -> IOResult<RawIO> {
+pub fn open(path: &CString, flag: i32) -> SysResult<RawIO> {
     #[cfg(not(target_os = "linux"))]
     {
-        err_box!("unsupported operation")
+        sys_error!("unsupported operation")
     }
 
     #[cfg(target_os = "linux")]
     {
         let res = unsafe { libc::open(path.as_ptr(), flag | libc::O_CLOEXEC) };
-        err_io!(res)
+        sys_call!(res)
     }
 }
 
@@ -464,44 +406,44 @@ pub fn open(path: &CString, flag: i32) -> IOResult<RawIO> {
 //     request: c_ulong,
 //     ...
 // ) -> c_int
-pub fn ioctl(fd: RawIO, request: u64, arg: *mut libc::c_void) -> IOResult<CInt> {
+pub fn ioctl(fd: RawIO, request: u64, arg: *mut libc::c_void) -> SysResult<CInt> {
     #[cfg(not(target_os = "linux"))]
     {
-        err_box!("unsupported operation")
+        sys_error!("unsupported operation")
     }
 
     #[cfg(target_os = "linux")]
     {
         let res = unsafe { libc::ioctl(fd, request, arg) };
-        err_io!(res)
+        sys_call!(res)
     }
 }
 
-pub fn dup(fd: RawIO) -> IOResult<RawIO> {
+pub fn dup(fd: RawIO) -> SysResult<RawIO> {
     #[cfg(not(target_os = "linux"))]
     {
-        err_box!("unsupported operation")
+        sys_error!("unsupported operation")
     }
 
     #[cfg(target_os = "linux")]
     {
         let res = unsafe { libc::dup(fd) };
-        err_io!(res)
+        sys_call!(res)
     }
 }
 
 // Get the page size.
 // pub unsafe extern "C" fn sysconf(name: c_int) -> c_long
-pub fn get_pagesize() -> IOResult<usize> {
+pub fn get_pagesize() -> SysResult<usize> {
     #[cfg(not(target_os = "linux"))]
     {
-        err_box!("unsupported operation")
+        sys_error!("unsupported operation")
     }
 
     #[cfg(target_os = "linux")]
     {
         let res = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        err_io!(res)?;
+        sys_call!(res)?;
         Ok(res as usize)
     }
 }
@@ -618,14 +560,14 @@ pub fn get_groupname_by_gid(gid: u32) -> Option<String> {
 //     fd: c_int,
 //     length: off64_t,
 // ) -> c_int
-pub fn ftruncate(file: &fs::File, len: i64) -> IOResult<()> {
+pub fn ftruncate(file: &fs::File, len: i64) -> SysResult<()> {
     #[cfg(target_os = "linux")]
     {
         unsafe {
             let fd = get_raw_io(file)?;
             let result = libc::ftruncate64(fd, len as libc::off64_t);
 
-            err_io!(result)?;
+            sys_call!(result)?;
             Ok(())
         }
     }
@@ -643,14 +585,14 @@ pub fn ftruncate(file: &fs::File, len: i64) -> IOResult<()> {
 //     offset: off64_t,
 //     len: off64_t,
 // ) -> c_int
-pub fn fallocate(file: &fs::File, off: i64, len: i64, mode: i32) -> IOResult<()> {
+pub fn fallocate(file: &fs::File, off: i64, len: i64, mode: i32) -> SysResult<()> {
     #[cfg(target_os = "linux")]
     {
         unsafe {
             let fd = get_raw_io(file)?;
             let result = libc::fallocate64(fd, mode, off as libc::off64_t, len as libc::off64_t);
 
-            err_io!(result)?;
+            sys_call!(result)?;
             Ok(())
         }
     }
@@ -665,7 +607,7 @@ pub fn fallocate(file: &fs::File, off: i64, len: i64, mode: i32) -> IOResult<()>
 /// Get the actual size of the file
 /// - If there are no holes in the file, returns the logical file size
 /// - If there are holes, returns the actual disk space occupied
-pub fn file_actual_size(metadata: Metadata) -> IOResult<u64> {
+pub fn file_actual_size(metadata: Metadata) -> SysResult<u64> {
     // 4k
     // 1G
     let logical_size = metadata.len();
@@ -690,28 +632,28 @@ pub fn file_actual_size(metadata: Metadata) -> IOResult<u64> {
     }
 }
 
-pub fn fcntl_get(fd: RawIO) -> IOResult<CInt> {
+pub fn fcntl_get(fd: RawIO) -> SysResult<CInt> {
     #[cfg(target_os = "linux")]
     {
         let res = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        err_io!(res)
+        sys_call!(res)
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        err_box!("unsupported operation")
+        sys_error!("unsupported operation")
     }
 }
 
-pub fn fcntl_set(fd: RawIO, flags: CInt) -> IOResult<CInt> {
+pub fn fcntl_set(fd: RawIO, flags: CInt) -> SysResult<CInt> {
     #[cfg(target_os = "linux")]
     {
         let res = unsafe { libc::fcntl(fd, libc::F_SETFD, flags) };
-        err_io!(res)
+        sys_call!(res)
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        err_box!("unsupported operation")
+        sys_error!("unsupported operation")
     }
 }
