@@ -21,6 +21,8 @@ use crate::worker::WorkerMetrics;
 use curvine_common::conf::ClusterConf;
 use curvine_common::state::{HeartbeatStatus, WorkerAddress};
 use curvine_fault::FaultHttpControl;
+#[cfg(feature = "spdk")]
+use curvine_storage_spdk::SpdkEnv;
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::info;
 use once_cell::sync::OnceCell;
@@ -28,8 +30,6 @@ use orpc::common::{LocalTime, Logger};
 use orpc::error::StringError;
 use orpc::handler::HandlerService;
 use orpc::io::net::ConnState;
-#[cfg(feature = "spdk")]
-use orpc::io::spdk_env::SpdkEnv;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::server::{RpcServer, ServerStateListener};
 use orpc::sync::FastMutex;
@@ -226,7 +226,7 @@ impl Worker {
             if spdk_enabled {
                 info!("Shutting down SPDK environment");
                 #[cfg(feature = "spdk")]
-                orpc::io::spdk_env::SpdkEnv::shutdown_global();
+                curvine_storage_spdk::SpdkEnv::shutdown_global();
             }
         });
 

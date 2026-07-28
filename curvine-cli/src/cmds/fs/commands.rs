@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use curvine_client::unified::UnifiedFileSystem;
+use curvine_unified_fs::UnifiedFileSystem;
 use orpc::CommonResult;
 use std::path::PathBuf;
 

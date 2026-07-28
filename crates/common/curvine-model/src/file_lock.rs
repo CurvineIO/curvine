@@ -56,7 +56,7 @@ pub enum LockFlags {
     Flock = 1, // BSD lock (flock)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct FileLock {
     pub client_id: String,
     pub owner_id: u64,

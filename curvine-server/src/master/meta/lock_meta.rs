@@ -59,11 +59,10 @@ impl LockMeta {
         format!("{}{}", lock.client_id, lock.owner_id)
     }
 
-    fn is_lock_expired(lock: &FileLock, expire_ms: u64) -> bool {
+    fn is_lock_expired_at(lock: &FileLock, expire_ms: u64, now: u64) -> bool {
         if lock.acquire_time == 0 {
             return true;
         }
-        let now = LocalTime::mills();
         now.saturating_sub(lock.acquire_time) > expire_ms
     }
 
@@ -115,8 +114,12 @@ impl LockMeta {
     }
 
     fn purge_expired_plocks(&mut self, expire_ms: u64) {
+        if self.plock.is_empty() {
+            return;
+        }
+        let now = LocalTime::mills();
         self.plock.retain(|_, owner_locks| {
-            owner_locks.retain(|lock| !Self::is_lock_expired(lock, expire_ms));
+            owner_locks.retain(|lock| !Self::is_lock_expired_at(lock, expire_ms, now));
             !owner_locks.is_empty()
         });
     }
@@ -167,9 +170,10 @@ impl LockMeta {
 
     fn check_flock_conflict(&mut self, lock: &FileLock, expire_ms: u64) -> Option<FileLock> {
         let mut conflict_lock = None;
+        let now = LocalTime::mills();
 
         self.flock.retain(|_key, existing_lock| {
-            if Self::is_lock_expired(existing_lock, expire_ms) {
+            if Self::is_lock_expired_at(existing_lock, expire_ms, now) {
                 return false;
             }
 
@@ -216,30 +220,49 @@ impl LockMeta {
         }
     }
 
-    fn set_plock(&mut self, mut lock: FileLock, expire_ms: u64) -> Option<FileLock> {
+    fn set_plock(&mut self, mut lock: FileLock, expire_ms: u64) -> (Option<FileLock>, bool) {
         let key = Self::key(&lock);
 
         if lock.lock_type == LockType::UnLock {
+            // No-op unlock on an empty map (common for FUSE_FLUSH without prior
+            // fcntl) must not pay for a full expire scan.
+            if self.plock.is_empty() {
+                return (None, false);
+            }
+
+            let mut changed = false;
+            let len_before_purge = self.len();
             self.purge_expired_plocks(expire_ms);
+            if self.len() != len_before_purge {
+                changed = true;
+            }
+
             if lock.start == 0 && lock.end == u64::MAX {
-                self.plock.remove(&key);
-                return None;
+                changed |= self.plock.remove(&key).is_some();
+                return (None, changed);
             }
 
             if let Some(owner_locks) = self.plock.get_mut(&key) {
-                Self::subtract_owner_regions(owner_locks, lock.start, lock.end);
-                if owner_locks.is_empty() {
-                    self.plock.remove(&key);
+                if owner_locks
+                    .iter()
+                    .any(|l| Self::regions_overlap(l.start, l.end, lock.start, lock.end))
+                {
+                    Self::subtract_owner_regions(owner_locks, lock.start, lock.end);
+                    changed = true;
+                    if owner_locks.is_empty() {
+                        self.plock.remove(&key);
+                    }
                 }
             }
-            return None;
+            return (None, changed);
         }
 
+        let len_before = self.len();
+        // check_plock_conflict already purges expired entries; do not purge again.
         if let Some(conflict) = self.check_plock_conflict(&lock, expire_ms) {
-            return Some(conflict);
+            return (Some(conflict), self.len() != len_before);
         }
 
-        self.purge_expired_plocks(expire_ms);
         if let Some(owner_locks) = self.plock.get_mut(&key) {
             Self::subtract_owner_regions(owner_locks, lock.start, lock.end);
         }
@@ -247,25 +270,26 @@ impl LockMeta {
         lock.acquire_time = LocalTime::mills();
         self.plock.entry(key).or_default().push(lock);
 
-        None
+        (None, true)
     }
 
-    fn set_flock(&mut self, mut lock: FileLock, expire_ms: u64) -> Option<FileLock> {
+    fn set_flock(&mut self, mut lock: FileLock, expire_ms: u64) -> (Option<FileLock>, bool) {
         let key = Self::key(&lock);
 
         if lock.lock_type == LockType::UnLock {
-            self.flock.remove(&key);
-            return None;
+            let changed = self.flock.remove(&key).is_some();
+            return (None, changed);
         }
 
+        let len_before = self.flock.len();
         if let Some(conflict) = self.check_flock_conflict(&lock, expire_ms) {
-            return Some(conflict);
+            return (Some(conflict), self.flock.len() != len_before);
         }
 
         lock.acquire_time = LocalTime::mills();
         self.flock.insert(key, lock);
 
-        None
+        (None, true)
     }
 
     /// Set a lock (acquire or release).
@@ -286,6 +310,15 @@ impl LockMeta {
     /// * For ReadLock/WriteLock: Checks for conflicts, removes expired locks, and sets the new lock
     /// * The acquire_time of the new lock is automatically set to the current time
     pub fn set_lock(&mut self, lock: FileLock, expire_ms: u64) -> Option<FileLock> {
+        self.set_lock_with_change(lock, expire_ms).0
+    }
+
+    /// Like [`Self::set_lock`], but also reports whether persistent lock state changed.
+    pub fn set_lock_with_change(
+        &mut self,
+        lock: FileLock,
+        expire_ms: u64,
+    ) -> (Option<FileLock>, bool) {
         match lock.lock_flags {
             LockFlags::Plock => self.set_plock(lock, expire_ms),
             LockFlags::Flock => self.set_flock(lock, expire_ms),
@@ -617,5 +650,114 @@ mod tests {
         assert_eq!(locks[0].end, 11);
         assert_eq!(locks[1].start, 16);
         assert_eq!(locks[1].end, 20);
+    }
+
+    #[test]
+    fn test_unlock_empty_plock_is_noop() {
+        let mut meta = LockMeta::default();
+        let expire_ms = 3000;
+
+        let (conflict, changed) = meta.set_lock_with_change(
+            create_plock("client1", 100, LockType::UnLock, 0, u64::MAX),
+            expire_ms,
+        );
+        assert!(conflict.is_none());
+        assert!(!changed);
+        assert!(meta.to_vec().is_empty());
+    }
+
+    #[test]
+    fn test_unlock_missing_owner_does_not_mark_changed() {
+        let mut meta = LockMeta::default();
+        let expire_ms = 3000;
+
+        assert!(meta
+            .set_lock(
+                create_plock("client1", 100, LockType::WriteLock, 0, 10),
+                expire_ms
+            )
+            .is_none());
+
+        let (conflict, changed) = meta.set_lock_with_change(
+            create_plock("client2", 200, LockType::UnLock, 0, u64::MAX),
+            expire_ms,
+        );
+        assert!(conflict.is_none());
+        assert!(!changed);
+        assert_eq!(meta.to_vec().len(), 1);
+    }
+
+    #[test]
+    fn test_partial_unlock_marks_changed_when_region_splits() {
+        let mut meta = LockMeta::default();
+        let expire_ms = 3000;
+
+        assert!(meta
+            .set_lock(
+                create_plock("client1", 100, LockType::WriteLock, 10, 20),
+                expire_ms
+            )
+            .is_none());
+
+        let (conflict, changed) = meta.set_lock_with_change(
+            create_plock("client1", 100, LockType::UnLock, 12, 15),
+            expire_ms,
+        );
+        assert!(conflict.is_none());
+        assert!(changed);
+
+        let mut locks = meta.to_vec();
+        locks.sort_by_key(|lock| lock.start);
+        assert_eq!(locks.len(), 2);
+        assert_eq!(locks[0].start, 10);
+        assert_eq!(locks[0].end, 11);
+        assert_eq!(locks[1].start, 16);
+        assert_eq!(locks[1].end, 20);
+    }
+
+    #[test]
+    fn test_partial_unlock_without_overlap_does_not_mark_changed() {
+        let mut meta = LockMeta::default();
+        let expire_ms = 3000;
+
+        assert!(meta
+            .set_lock(
+                create_plock("client1", 100, LockType::WriteLock, 10, 20),
+                expire_ms
+            )
+            .is_none());
+
+        let (conflict, changed) = meta.set_lock_with_change(
+            create_plock("client1", 100, LockType::UnLock, 30, 40),
+            expire_ms,
+        );
+        assert!(conflict.is_none());
+        assert!(!changed);
+        assert_eq!(meta.to_vec().len(), 1);
+        assert_eq!(meta.to_vec()[0].start, 10);
+        assert_eq!(meta.to_vec()[0].end, 20);
+    }
+
+    #[test]
+    fn test_unlock_marks_changed_when_only_purging_expired() {
+        let mut meta = LockMeta::default();
+        let expire_ms = 50;
+
+        assert!(meta
+            .set_lock(
+                create_plock("client1", 100, LockType::WriteLock, 0, 10),
+                expire_ms
+            )
+            .is_none());
+        thread::sleep(Duration::from_millis(expire_ms + 20));
+
+        // Unlock a different owner so only expiry purge can mutate state.
+        let (conflict, changed) = meta.set_lock_with_change(
+            create_plock("client2", 200, LockType::UnLock, 0, u64::MAX),
+            expire_ms,
+        );
+        assert!(conflict.is_none());
+        assert!(changed);
+        assert!(meta.to_vec().is_empty());
     }
 }

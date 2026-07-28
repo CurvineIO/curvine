@@ -329,6 +329,16 @@ public class CurvineNative {
 
     public static native byte[] getMountInfo(long nativeHandle, String path) throws IOException;
 
+    /** Create or update a UFS mount with a serialized {@code MountOptionsProto}. */
+    public static native long mount(
+            long nativeHandle, String ufsPath, String cvPath, byte[] mountOptions) throws IOException;
+
+    /** Remove a UFS mount by Curvine path. */
+    public static native long unmount(long nativeHandle, String cvPath) throws IOException;
+
+    /** Return a serialized {@code GetMountTableResponse} protobuf. */
+    public static native byte[] getMountTable(long nativeHandle) throws IOException;
+
     public static native String togglePath(long nativeHandle, String path, boolean checkCache) throws IOException;
 
     /**

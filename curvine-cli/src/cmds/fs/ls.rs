@@ -1,7 +1,7 @@
 use clap::Subcommand;
-use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::fs::{CurvineURI, FileSystem};
-use curvine_common::state::FileStatus;
+use curvine_fs_api::{CurvineURI, FileSystem};
+use curvine_model::FileStatus;
+use curvine_unified_fs::UnifiedFileSystem;
 use orpc::common::{ByteUnit, DurationUnit};
 use orpc::CommonResult;
 

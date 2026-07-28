@@ -1,0 +1,27 @@
+[package]
+name = "curvine-storage-spdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Curvine SPDK storage adapter."
+
+[features]
+default = []
+spdk = []
+spdk-rdma = ["spdk"]
+
+[dependencies]
+orpc = { workspace = true }
+bytes = { workspace = true }
+crossbeam = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+nix = { workspace = true }
+serde = { workspace = true }
+
+[build-dependencies]
+pkg-config = "0.3"
+cc = "1"
+
+[dev-dependencies]
+toml = { workspace = true }

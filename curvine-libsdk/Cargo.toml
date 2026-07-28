@@ -9,16 +9,15 @@ crate-type = ["rlib", "cdylib"]
 name = "curvine_libsdk"
 
 [features]
-default = ["java-sdk"]
+default = ["java-sdk", "opendal-s3"]
 rust-sdk = []
 java-sdk = ["dep:jni"]
 python-sdk = ["dep:pyo3"]
 
 # Forward optional UFS backends from curvine-client so Java/Python/Rust
 # consumers can enable them without depending on curvine-client directly.
-# Defaults stay lean: only java-sdk; no UFS backend is forced here.
-# (curvine-client still enables its own default `opendal-s3` unless consumers
-#  set `default-features = false` on that dependency elsewhere.)
+# The default SDK build keeps the historical OpenDAL S3 backend. Consumers that
+# need a lighter SDK can use `default-features = false` and opt in explicitly.
 opendal-s3 = ["curvine-client/opendal-s3"]
 opendal-oss = ["curvine-client/opendal-oss"]
 opendal-gcs = ["curvine-client/opendal-gcs"]
@@ -31,8 +30,9 @@ oss-hdfs = ["curvine-client/oss-hdfs"]
 
 [dependencies]
 orpc = { workspace = true }
-curvine-client = { workspace = true }
+curvine-client = { workspace = true, features = ["job-client", "unified"] }
 curvine-common = { workspace = true }
+curvine-config = { workspace = true }
 once_cell = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }

@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::CommonErrorExt;
-
 pub mod client;
 pub mod common;
-pub mod error;
+pub mod error {
+    pub use orpc_error::*;
+}
 pub mod handler;
 pub mod io;
 pub mod macros;
@@ -27,8 +27,13 @@ pub mod sync;
 pub mod sys;
 pub mod test;
 
-pub type CommonError = Box<dyn std::error::Error + Send + Sync>;
+pub use orpc_error::{CommonError, CommonResult, CommonResultExt};
 
-pub type CommonResult<T> = Result<T, CommonError>;
-
-pub type CommonResultExt<T> = Result<T, CommonErrorExt>;
+// Kept in `orpc` (not next to `CommonErrorExt` in `orpc-error`): orphan rules
+// require a local uncovered type argument (`IOError`) to implement `From` for
+// the foreign `CommonErrorExt` type after the crate split.
+impl From<crate::io::IOError> for crate::error::CommonErrorExt {
+    fn from(value: crate::io::IOError) -> Self {
+        Self::from(CommonError::from(value))
+    }
+}
