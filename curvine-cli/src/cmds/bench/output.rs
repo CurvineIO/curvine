@@ -14,7 +14,7 @@
 //
 
 use comfy_table::{presets::ASCII_MARKDOWN, Cell, CellAlignment, Table};
-use curvine_client::bench::{
+use curvine_bench::{
     BenchConfig, BenchOpResult, BenchPrefillReport, BenchProfile, BenchReport, BenchResultGroup,
     BenchTarget, LatencyMode, WorkloadKind,
 };

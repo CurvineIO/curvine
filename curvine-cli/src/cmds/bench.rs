@@ -14,12 +14,12 @@
 //
 
 use clap::{Parser, Subcommand, ValueEnum};
-use curvine_client::bench::{
+use curvine_bench::{
     infer_mode, parse_duration, BenchConfig, BenchMode, BenchPrefillConfig, BenchProfile,
     BenchTarget, CurvineBenchRunner, WorkloadKind, DEFAULT_BASIC_BIG_FILE_COUNT,
     DEFAULT_BIG_FILE_COUNT, DEFAULT_DURATION_MS, DEFAULT_FILES_PER_DIR,
 };
-use curvine_client::unified::UnifiedFileSystem;
+use curvine_unified_fs::UnifiedFileSystem;
 use orpc::common::ByteUnit;
 use orpc::{err_box, CommonResult};
 
@@ -366,7 +366,7 @@ impl BenchPrefillCommand {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
-    use curvine_client::bench::{workset_path, BenchOpResult, BenchResultGroup, LatencyMode};
+    use curvine_bench::{workset_path, BenchOpResult, BenchResultGroup, LatencyMode};
 
     #[test]
     fn parses_path_option() {
@@ -631,7 +631,7 @@ mod tests {
     #[test]
     fn percentile_table_includes_max_latency_column() {
         let result = BenchOpResult {
-            op: curvine_client::bench::BenchOp::Create,
+            op: curvine_bench::BenchOp::Create,
             group: BenchResultGroup::Metadata,
             latency_mode: LatencyMode::Percentiles,
             item: "Create file".to_string(),
