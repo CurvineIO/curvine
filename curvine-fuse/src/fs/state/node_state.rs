@@ -31,7 +31,8 @@ use curvine_common::conf::{ClientConf, FuseConf};
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, ListStream, Path, StateReader, StateWriter};
 use curvine_common::state::{
-    CreateFileOpts, FileAllocOpts, FileStatus, ListOptions, MkdirOpts, OpenFlags, SetAttrOpts,
+    CreateFileOpts, FileAllocOpts, FileStatus, ListOptions, MkdirOpts, OpenFlags, RenameFlags,
+    SetAttrOpts,
 };
 use curvine_config::ClusterConf;
 use futures::stream::{self, StreamExt};
@@ -1047,10 +1048,18 @@ impl NodeState {
         old_name: &str,
         new_id: u64,
         new_name: &str,
+        flags: RenameFlags,
     ) -> FuseResult<()> {
         let (old_path, new_path) = self.get_path2(old_id, old_name, new_id, new_name)?;
-        self.fs.rename(&old_path, &new_path).await?;
-        self.rename(old_id, old_name, new_id, new_name)
+        self.fs
+            .rename_with_flags(&old_path, &new_path, flags)
+            .await?;
+        if flags.exchange_mode() {
+            self.dir_write()
+                .exchange(old_id, old_name, new_id, new_name)
+        } else {
+            self.rename(old_id, old_name, new_id, new_name)
+        }
     }
 
     pub async fn fs_fsync(&self, parent: u64, name: Option<&str>) -> FuseResult<()> {

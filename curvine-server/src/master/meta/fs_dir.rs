@@ -349,7 +349,8 @@ impl FsDir {
             Some(v) => v,
         };
         if flags.exchange_mode() {
-            return err_box!("Rename failed, because exchange mode is not supported");
+            self.unprotected_exchange(src_inp, dst_inp, mtime)?;
+            return Ok(None);
         }
 
         let mut src_parent = match src_inp.get_inode(-2) {
@@ -412,6 +413,65 @@ impl FsDir {
         let _ = dst_parent.add_child(new_inode)?;
 
         Ok(del_res)
+    }
+
+    fn unprotected_exchange(
+        &mut self,
+        src_inp: &InodePath,
+        dst_inp: &InodePath,
+        mtime: i64,
+    ) -> FsResult<()> {
+        let src_inode = match src_inp.get_last_inode() {
+            None => return err_ext!(FsError::file_not_found(src_inp.path())),
+            Some(v) => v,
+        };
+        let dst_inode = match dst_inp.get_last_inode() {
+            None => return err_ext!(FsError::file_not_found(dst_inp.path())),
+            Some(v) => v,
+        };
+
+        if src_inode.id() == dst_inode.id() {
+            return Ok(());
+        }
+
+        let mut src_parent = match src_inp.get_inode(-2) {
+            None => return err_box!("Parent not exists: {}", src_inp.path()),
+            Some(v) => v,
+        };
+        let mut dst_parent = match dst_inp.get_inode(-2) {
+            None => return err_box!("Parent not exists: {}", dst_inp.path()),
+            Some(v) => v,
+        };
+
+        let src_name = src_inp.name().to_string();
+        let dst_name = dst_inp.name().to_string();
+
+        let mut at_src = dst_inode.as_ref().clone();
+        at_src.change_name(src_name.clone());
+        at_src.set_parent_id(src_parent.id());
+
+        let mut at_dst = src_inode.as_ref().clone();
+        at_dst.change_name(dst_name.clone());
+        at_dst.set_parent_id(dst_parent.id());
+
+        src_parent.update_mtime(mtime);
+        dst_parent.update_mtime(mtime);
+
+        self.store.apply_exchange(
+            src_parent.as_ref(),
+            &src_name,
+            dst_parent.as_ref(),
+            &dst_name,
+            &at_src,
+            &at_dst,
+        )?;
+
+        let _ = src_parent.delete_child(src_inode.id(), &src_name)?;
+        let _ = dst_parent.delete_child(dst_inode.id(), &dst_name)?;
+        let _ = src_parent.add_child(at_src)?;
+        let _ = dst_parent.add_child(at_dst)?;
+
+        Ok(())
     }
 
     pub fn create_file(&mut self, mut inp: InodePath, opts: CreateFileOpts) -> FsResult<InodePath> {

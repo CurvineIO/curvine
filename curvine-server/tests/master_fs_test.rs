@@ -974,6 +974,14 @@ fn rename_posix_semantics(fs: &MasterFilesystem) -> CommonResult<()> {
     assert!(!fs.exists("/a/noreplace_src")?);
     assert!(fs.exists("/a/noreplace_new")?);
 
+    fs.create("/a/exchange_a", true)?;
+    fs.create("/a/exchange_b", true)?;
+    let id_a = fs.file_status("/a/exchange_a")?.id;
+    let id_b = fs.file_status("/a/exchange_b")?.id;
+    fs.rename("/a/exchange_a", "/a/exchange_b", RenameFlags::EXCHANGE)?;
+    assert_eq!(fs.file_status("/a/exchange_a")?.id, id_b);
+    assert_eq!(fs.file_status("/a/exchange_b")?.id, id_a);
+
     // src symlink, dst symlink -> overwrite existing symlink and keep dst deletable.
     fs.symlink("nobody", "/a/symbolic", false, 0o777)?;
     fs.rename("/a/symbolic", "/a/asymbolic", RenameFlags::empty())?;

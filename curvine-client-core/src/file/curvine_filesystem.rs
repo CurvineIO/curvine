@@ -25,7 +25,8 @@ use curvine_model::ProtoUtils;
 use curvine_model::{CommitBlock, FreeResult, ListOptions};
 use curvine_model::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
-    MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
+    MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, RenameFlags,
+    SetAttrOpts,
 };
 use log::info;
 use log::warn;
@@ -169,7 +170,16 @@ impl CurvineFileSystem {
     }
 
     pub async fn rename(&self, src: &Path, dst: &Path) -> FsResult<bool> {
-        self.fs_client.rename(src, dst).await
+        self.rename_with_flags(src, dst, RenameFlags::empty()).await
+    }
+
+    pub async fn rename_with_flags(
+        &self,
+        src: &Path,
+        dst: &Path,
+        flags: RenameFlags,
+    ) -> FsResult<bool> {
+        self.fs_client.rename(src, dst, flags).await
     }
 
     pub async fn delete(&self, path: &Path, recursive: bool) -> FsResult<()> {

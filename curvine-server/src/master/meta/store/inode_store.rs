@@ -237,6 +237,31 @@ impl InodeStore {
         Ok(())
     }
 
+    pub fn apply_exchange(
+        &self,
+        src_parent: &InodeView,
+        src_name: &str,
+        dst_parent: &InodeView,
+        dst_name: &str,
+        at_src: &InodeView,
+        at_dst: &InodeView,
+    ) -> CommonResult<()> {
+        let mut batch = self.store.new_batch();
+
+        batch.delete_child(src_parent.id(), src_name)?;
+        batch.delete_child(dst_parent.id(), dst_name)?;
+        batch.write_inode(at_src)?;
+        batch.write_inode(at_dst)?;
+        batch.add_child(src_parent.id(), at_src.name(), at_src.id())?;
+        batch.add_child(dst_parent.id(), at_dst.name(), at_dst.id())?;
+        batch.write_inode(src_parent)?;
+        batch.write_inode(dst_parent)?;
+
+        batch.commit()?;
+
+        Ok(())
+    }
+
     pub fn apply_new_block(
         &self,
         file: &InodeView,

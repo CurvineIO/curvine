@@ -24,7 +24,7 @@ use curvine_job_client::JobMasterClient;
 use curvine_model::{
     CreateFileOpts, FileAllocOpts, FileLock, FileStatus, FreeResult, JobStatus, ListOptions,
     LoadJobCommand, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags,
-    SetAttrOpts,
+    RenameFlags, SetAttrOpts,
 };
 use log::{debug, error, info, warn};
 use orpc::common::TimeSpent;
@@ -672,6 +672,38 @@ impl UnifiedFileSystem {
         };
         self.track("SetLock", path.path(), "", fut).await
     }
+
+    pub async fn rename_with_flags(
+        &self,
+        src: &Path,
+        dst: &Path,
+        flags: RenameFlags,
+    ) -> FsResult<bool> {
+        let fut = async {
+            let _ = self.get_mount_checked(dst, RpcCode::Rename).await?;
+            match self.get_mount_checked(src, RpcCode::Rename).await? {
+                None => self.cv.rename_with_flags(src, dst, flags).await,
+                Some((src_ufs, mount)) => {
+                    if !flags.is_empty() {
+                        return err_ext!(FsError::unsupported(
+                            "rename flags through unified mount"
+                        ));
+                    }
+                    let dst_ufs = mount.get_ufs_path(dst)?;
+                    let res = mount.ufs()?.rename(&src_ufs, &dst_ufs).await?;
+
+                    if let Err(e) = self.cv.delete(src, true).await {
+                        if !matches!(e, FsError::FileNotFound(_)) {
+                            warn!("failed to delete cache for {}: {}", src, e);
+                        }
+                    }
+
+                    Ok(res)
+                }
+            }
+        };
+        self.track("Rename", src.path(), dst.path(), fut).await
+    }
 }
 
 struct UnifiedUtils;
@@ -781,26 +813,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     }
 
     async fn rename(&self, src: &Path, dst: &Path) -> FsResult<bool> {
-        let fut = async {
-            let _ = self.get_mount_checked(dst, RpcCode::Rename).await?;
-            match self.get_mount_checked(src, RpcCode::Rename).await? {
-                None => self.cv.rename(src, dst).await,
-                Some((src_ufs, mount)) => {
-                    let dst_ufs = mount.get_ufs_path(dst)?;
-                    let res = mount.ufs()?.rename(&src_ufs, &dst_ufs).await?;
-
-                    // After rename, the file's mtime changes, making the cached data invalid
-                    if let Err(e) = self.cv.delete(src, true).await {
-                        if !matches!(e, FsError::FileNotFound(_)) {
-                            warn!("failed to delete cache for {}: {}", src, e);
-                        }
-                    }
-
-                    Ok(res)
-                }
-            }
-        };
-        self.track("Rename", src.path(), dst.path(), fut).await
+        self.rename_with_flags(src, dst, RenameFlags::empty()).await
     }
 
     async fn delete(&self, path: &Path, recursive: bool) -> FsResult<()> {

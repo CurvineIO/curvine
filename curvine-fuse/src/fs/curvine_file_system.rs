@@ -31,7 +31,7 @@ use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path, RpcCode, StateReader, StateWriter};
 use curvine_common::state::{
     is_special_file_type, FileAllocMode, FileAllocOpts, FileLock, FileStatus, FileType, LockFlags,
-    LockType, OpenFlags, SetAttrOpts,
+    LockType, OpenFlags, RenameFlags, SetAttrOpts,
 };
 use curvine_common::MAX_FILE_SIZE;
 use log::{debug, info, warn};
@@ -221,16 +221,21 @@ impl CurvineFileSystem {
     /// Shared rename path resolution used by both `rename` and `rename2`.
     async fn rename_paths(
         &self,
+        header: &fuse_in_header,
         old_id: u64,
         old_name: &OsStr,
         new_dir: u64,
         new_name: &OsStr,
+        flags: RenameFlags,
     ) -> FuseResult<()> {
         let old_name = try_option!(old_name.to_str());
         let new_name = try_option!(new_name.to_str());
         if new_name.len() > FUSE_MAX_NAME_LENGTH {
             return err_fuse!(libc::ENAMETOOLONG);
         }
+
+        self.check_rename_permissions(header, old_id, old_name, new_dir)
+            .await?;
 
         let (old_path, new_path) = self.state.get_path2(old_id, old_name, new_dir, new_name)?;
         self.ensure_writable_path(&old_path, RpcCode::Rename)
@@ -239,13 +244,26 @@ impl CurvineFileSystem {
             .await?;
 
         self.state
-            .fs_rename(old_id, old_name, new_dir, new_name)
+            .fs_rename(old_id, old_name, new_dir, new_name, flags)
             .await
     }
 
-    /// Whether raw RENAME2 flags are supported, without truncating unknown high bits.
-    fn rename2_flags_supported(flags: u32) -> bool {
-        flags == 0
+    fn parse_rename2_flags(flags: u32) -> FuseResult<RenameFlags> {
+        const RENAME_NOREPLACE: u32 = 1;
+        const RENAME_EXCHANGE: u32 = 2;
+        const RENAME_WHITEOUT: u32 = 4;
+        const KNOWN: u32 = RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT;
+
+        if flags & !KNOWN != 0 {
+            return err_fuse!(libc::EINVAL, "unsupported RENAME2 flags 0x{:x}", flags);
+        }
+        if flags & RENAME_WHITEOUT != 0 {
+            return err_fuse!(libc::EINVAL, "RENAME_WHITEOUT is not supported");
+        }
+        if flags & RENAME_NOREPLACE != 0 && flags & RENAME_EXCHANGE != 0 {
+            return err_fuse!(libc::EINVAL, "invalid RENAME2 flag combination");
+        }
+        Ok(RenameFlags::from_bits(flags).unwrap_or(RenameFlags::empty()))
     }
 
     fn to_file_lock(&self, arg: &fuse_lk_in, header_pid: u32) -> FileLock {
@@ -418,6 +436,54 @@ impl CurvineFileSystem {
     /// checks, but still validates X_OK against the file mode (see access(2)).
     fn posix_access_requires_mode_check(uid: u32, mask: u32) -> bool {
         uid != 0 || (mask & libc::X_OK as u32) != 0
+    }
+
+    async fn check_permissions_on_node(
+        &self,
+        header: &fuse_in_header,
+        nodeid: u64,
+        mask: u32,
+    ) -> FuseResult<()> {
+        if header.uid == 0 || !self.conf.check_permission {
+            return Ok(());
+        }
+        let status = self.state.fs_stat(nodeid, None).await?;
+        self.check_access_permissions(&status, header, mask)
+    }
+
+    async fn check_rename_permissions(
+        &self,
+        header: &fuse_in_header,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+    ) -> FuseResult<()> {
+        if header.uid == 0 || !self.conf.check_permission {
+            return Ok(());
+        }
+
+        let dir_mask = (libc::W_OK | libc::X_OK) as u32;
+        self.check_permissions_on_node(header, old_parent, dir_mask)
+            .await?;
+        if new_parent != old_parent {
+            self.check_permissions_on_node(header, new_parent, dir_mask)
+                .await?;
+        }
+
+        let parent_status = self.state.fs_stat(old_parent, None).await?;
+        if parent_status.mode & libc::S_ISVTX as u32 != 0 {
+            let file_status = self.state.fs_stat(old_parent, Some(old_name)).await?;
+            let parent_uid = self.resolve_file_uid(&parent_status.owner);
+            let file_uid = self.resolve_file_uid(&file_status.owner);
+            if header.uid != parent_uid && header.uid != file_uid {
+                return err_fuse!(
+                    libc::EPERM,
+                    "sticky directory: cannot rename file owned by another user"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     async fn check_permissions(&self, header: &fuse_in_header, mask: u32) -> FuseResult<()> {
@@ -1773,22 +1839,28 @@ impl fs::FileSystem for CurvineFileSystem {
     }
 
     async fn rename(&self, op: Rename<'_>) -> FuseResult<()> {
-        self.rename_paths(op.header.nodeid, op.old_name, op.arg.newdir, op.new_name)
-            .await
+        self.rename_paths(
+            op.header,
+            op.header.nodeid,
+            op.old_name,
+            op.arg.newdir,
+            op.new_name,
+            RenameFlags::empty(),
+        )
+        .await
     }
 
     async fn rename2(&self, op: Rename2<'_>) -> FuseResult<()> {
-        // The FUSE-facing client rename path only issues flag-less renames, so
-        // NO_REPLACE/EXCHANGE/WHITEOUT are not plumbed through to the master RPC.
-        if !Self::rename2_flags_supported(op.arg.flags) {
-            return err_fuse!(
-                libc::ENOSYS,
-                "RENAME2 flags 0x{:x} not supported (flag-less rename only)",
-                op.arg.flags
-            );
-        }
-        self.rename_paths(op.header.nodeid, op.old_name, op.arg.newdir, op.new_name)
-            .await
+        let flags = Self::parse_rename2_flags(op.arg.flags)?;
+        self.rename_paths(
+            op.header,
+            op.header.nodeid,
+            op.old_name,
+            op.arg.newdir,
+            op.new_name,
+            flags,
+        )
+        .await
     }
 
     async fn batch_forget(&self, op: BatchForget<'_>) -> FuseResult<()> {
@@ -2781,16 +2853,17 @@ mod tests {
     }
 
     #[test]
-    fn rename2_flags_supported_only_accepts_zero() {
-        // Flag-less rename is the only supported form.
-        assert!(CurvineFileSystem::rename2_flags_supported(0));
-        // Known rename flags are rejected (client does not plumb them through).
-        assert!(!CurvineFileSystem::rename2_flags_supported(1)); // RENAME_NOREPLACE
-        assert!(!CurvineFileSystem::rename2_flags_supported(2)); // RENAME_EXCHANGE
-        assert!(!CurvineFileSystem::rename2_flags_supported(4)); // RENAME_WHITEOUT
-                                                                 // An unknown high bit must also be rejected — checked against the raw
-                                                                 // value, so it is not silently truncated away (the RenameFlags footgun).
-        assert!(!CurvineFileSystem::rename2_flags_supported(1 << 6));
+    fn parse_rename2_flags_accepts_supported_values() {
+        assert!(CurvineFileSystem::parse_rename2_flags(0).is_ok());
+        assert!(CurvineFileSystem::parse_rename2_flags(1).is_ok());
+        assert!(CurvineFileSystem::parse_rename2_flags(2).is_ok());
+    }
+
+    #[test]
+    fn parse_rename2_flags_rejects_unsupported_values() {
+        assert!(CurvineFileSystem::parse_rename2_flags(4).is_err());
+        assert!(CurvineFileSystem::parse_rename2_flags(3).is_err());
+        assert!(CurvineFileSystem::parse_rename2_flags(1 << 6).is_err());
     }
 
     mod readdir_termination {

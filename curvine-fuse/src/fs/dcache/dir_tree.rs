@@ -352,6 +352,39 @@ impl DirTree {
         Ok(())
     }
 
+    pub fn exchange(
+        &mut self,
+        old_id: u64,
+        old_name: &str,
+        new_id: u64,
+        new_name: &str,
+    ) -> FuseResult<()> {
+        let old_ino = self.get_ino_check(old_id, Some(old_name))?;
+        let new_ino = self.get_ino_check(new_id, Some(new_name))?;
+        if old_ino == new_ino {
+            return Ok(());
+        }
+
+        self.get_dir_mut_check(old_id)?.remove_child(old_name);
+        self.get_dir_mut_check(new_id)?.remove_child(new_name);
+        self.get_dir_mut_check(old_id)?
+            .add_child(old_name.to_string(), new_ino);
+        self.get_dir_mut_check(new_id)?
+            .add_child(new_name.to_string(), old_ino);
+
+        {
+            let inode = self.get_inode_mut_check(old_ino, None)?;
+            inode.parent = new_id;
+            inode.name = new_name.to_string();
+        }
+        {
+            let inode = self.get_inode_mut_check(new_ino, None)?;
+            inode.parent = old_id;
+            inode.name = old_name.to_string();
+        }
+        Ok(())
+    }
+
     pub fn rename(
         &mut self,
         old_id: u64,

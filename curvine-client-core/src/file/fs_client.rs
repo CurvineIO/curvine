@@ -179,11 +179,11 @@ impl FsClient {
         Ok(ProtoUtils::free_res_from_pb(rep.res))
     }
 
-    pub async fn rename(&self, src: &Path, dst: &Path) -> FsResult<bool> {
+    pub async fn rename(&self, src: &Path, dst: &Path, flags: RenameFlags) -> FsResult<bool> {
         let header = RenameRequest {
             src: src.encode(),
             dst: dst.encode(),
-            flags: RenameFlags::empty().value(),
+            flags: flags.value(),
         };
 
         let rep_header: RenameResponse = self.rpc(RpcCode::Rename, header).await?;
