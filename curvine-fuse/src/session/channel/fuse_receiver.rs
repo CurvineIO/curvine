@@ -306,9 +306,9 @@ impl<T: FileSystem> FuseReceiver<T> {
         // failure finishes the original ctx once rather than double-counting.
         let err_rep = rep.clone();
 
-        // IO attribution timers, armed before the match so they cover the error-reply
-        // enqueue too (one Some per stream opcode). ⚠ INVARIANT: after parse succeeds, no
-        // `.await`/early return before these scopes — the lifecycle scope arms its guard atomically.
+        // IO attribution timers, armed before the match so they cover the error-reply enqueue
+        // too (one Some per stream opcode). ⚠ INVARIANT: after parse succeeds, no `.await`/
+        // early return before these scopes — the lifecycle scope arms its guard atomically.
         let _dispatch = if metrics_enabled {
             dispatch_io_type(req.opcode()).map(FuseMetrics::io_dispatch_timer)
         } else {
