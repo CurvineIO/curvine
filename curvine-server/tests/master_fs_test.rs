@@ -1138,6 +1138,29 @@ fn list_status(fs: &MasterFilesystem) -> CommonResult<()> {
 }
 
 #[test]
+fn test_hardlink_to_dangling_symlink_inode() -> CommonResult<()> {
+    // LTP link01 case 2: hard-link a symlink whose target does not exist.
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "link_dangling_symlink");
+    fs.mkdir("/a", true)?;
+    fs.symlink("object", "/a/symbolic", false, 0o777)?;
+    assert!(fs.exists("/a/symbolic")?);
+    assert!(!fs.exists("/a/object")?);
+
+    fs.link("/a/symbolic", "/a/nick")?;
+    assert!(fs.exists("/a/nick")?);
+
+    let symlink = fs.file_status("/a/symbolic")?;
+    let nick = fs.file_status("/a/nick")?;
+    assert_eq!(symlink.id, nick.id);
+    assert_eq!(symlink.nlink, 2);
+    assert_eq!(nick.nlink, 2);
+    assert_eq!(symlink.file_type, curvine_common::state::FileType::Link);
+    assert_eq!(nick.file_type, curvine_common::state::FileType::Link);
+    Ok(())
+}
+
+#[test]
 fn test_hardlink_creation_and_nlink_counting() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let fs = new_fs(true, "link_test");
