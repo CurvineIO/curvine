@@ -24,12 +24,31 @@ use orpc::err_box;
 use orpc::sync::AtomicCounter;
 use orpc::sys::RawPtr;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
 
+/// Per-handle lock-owner bookkeeping.
+///
+/// POSIX locks are keyed by FUSE `lock_owner`. After `fork`, parent and child can
+/// share one FUSE fh while using distinct lock_owners, so plock owners are a set.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct HandleLock {
     pub flock_owner_id: Option<u64>,
-    pub plock_owner_id: Option<u64>,
+    /// Active POSIX lock_owners that acquired a lock through this handle.
+    #[serde(default)]
+    pub plock_owners: HashSet<u64>,
+    /// Legacy single-owner field kept for state restore compatibility.
+    #[serde(default)]
+    plock_owner_id: Option<u64>,
+}
+
+impl HandleLock {
+    /// Merge legacy `plock_owner_id` into `plock_owners` after deserialize.
+    fn migrate_legacy_plock_owner(&mut self) {
+        if let Some(owner) = self.plock_owner_id.take() {
+            self.plock_owners.insert(owner);
+        }
+    }
 }
 
 pub struct BackendHandle {
@@ -182,13 +201,14 @@ impl BackendHandle {
         *self.status.write().unwrap() = status;
     }
 
-    // Add lock, only save the owner_id of the first lock
+    /// Record that `owner_id` holds a lock of `lock_flags` on this handle.
     pub fn add_lock(&self, lock_flags: LockFlags, owner_id: u64) {
         let mut fh_locks = self.fh_locks.lock().unwrap();
+        fh_locks.migrate_legacy_plock_owner();
 
         match lock_flags {
             LockFlags::Plock => {
-                fh_locks.plock_owner_id.get_or_insert(owner_id);
+                fh_locks.plock_owners.insert(owner_id);
             }
 
             LockFlags::Flock => {
@@ -197,22 +217,41 @@ impl BackendHandle {
         }
     }
 
+    /// Remove and return one tracked owner for `typ`.
+    ///
+    /// For POSIX locks, prefer [`Self::take_plock_if_owner`] or
+    /// [`Self::drain_plock_owners`] when the caller knows the owner set.
     pub fn remove_lock(&self, typ: LockFlags) -> Option<u64> {
         let mut fh_locks = self.fh_locks.lock().unwrap();
+        fh_locks.migrate_legacy_plock_owner();
 
         match typ {
-            LockFlags::Plock => fh_locks.plock_owner_id.take(),
+            LockFlags::Plock => {
+                let owner = fh_locks.plock_owners.iter().copied().next()?;
+                fh_locks.plock_owners.remove(&owner);
+                Some(owner)
+            }
 
             LockFlags::Flock => fh_locks.flock_owner_id.take(),
         }
     }
 
+    /// Remove `owner_id` from the POSIX owner set when present.
     pub fn take_plock_if_owner(&self, owner_id: u64) -> Option<u64> {
         let mut fh_locks = self.fh_locks.lock().unwrap();
-        match fh_locks.plock_owner_id {
-            Some(tracked) if tracked == owner_id => fh_locks.plock_owner_id.take(),
-            _ => None,
+        fh_locks.migrate_legacy_plock_owner();
+        if fh_locks.plock_owners.remove(&owner_id) {
+            Some(owner_id)
+        } else {
+            None
         }
+    }
+
+    /// Drain every tracked POSIX lock_owner (used on handle release).
+    pub fn drain_plock_owners(&self) -> Vec<u64> {
+        let mut fh_locks = self.fh_locks.lock().unwrap();
+        fh_locks.migrate_legacy_plock_owner();
+        fh_locks.plock_owners.drain().collect()
     }
 
     pub async fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {
@@ -225,7 +264,8 @@ impl BackendHandle {
         writer.write_struct(&self.writer.is_some())?;
         writer.write_struct(&self.reader.is_some())?;
 
-        let locks = self.fh_locks.lock().unwrap();
+        let mut locks = self.fh_locks.lock().unwrap();
+        locks.migrate_legacy_plock_owner();
         writer.write_struct(&*locks)?;
 
         Ok(())
@@ -245,7 +285,8 @@ impl BackendHandle {
                 status.path
             );
         }
-        let locks: HandleLock = reader.read_struct()?;
+        let mut locks: HandleLock = reader.read_struct()?;
+        locks.migrate_legacy_plock_owner();
 
         let path = Path::from_str(&status.path)?;
         let writer = if has_writer {
@@ -347,5 +388,59 @@ mod tests {
             "status().len must reflect the reopened file, not the open-time 100"
         );
         assert_eq!(handle.status().mtime, 20);
+    }
+
+    #[test]
+    fn plock_tracks_multiple_owners_on_shared_handle() {
+        use curvine_common::state::{FileStatus, LockFlags};
+
+        let handle = BackendHandle::new(
+            1,
+            10,
+            None,
+            None,
+            FileStatus::with_name(1, "f".into(), false),
+        );
+        handle.add_lock(LockFlags::Plock, 11);
+        handle.add_lock(LockFlags::Plock, 22);
+
+        assert_eq!(handle.take_plock_if_owner(22), Some(22));
+        assert_eq!(handle.take_plock_if_owner(22), None);
+        assert_eq!(handle.take_plock_if_owner(11), Some(11));
+        assert!(handle.drain_plock_owners().is_empty());
+    }
+
+    #[test]
+    fn drain_plock_owners_returns_all_tracked_owners() {
+        use curvine_common::state::{FileStatus, LockFlags};
+
+        let handle = BackendHandle::new(
+            1,
+            10,
+            None,
+            None,
+            FileStatus::with_name(1, "f".into(), false),
+        );
+        handle.add_lock(LockFlags::Plock, 7);
+        handle.add_lock(LockFlags::Plock, 8);
+        let mut owners = handle.drain_plock_owners();
+        owners.sort_unstable();
+        assert_eq!(owners, vec![7, 8]);
+        assert!(handle.drain_plock_owners().is_empty());
+    }
+
+    #[test]
+    fn legacy_single_plock_owner_migrates_into_set() {
+        use super::HandleLock;
+        use std::collections::HashSet;
+
+        let mut locks = HandleLock {
+            flock_owner_id: None,
+            plock_owners: HashSet::new(),
+            plock_owner_id: Some(99),
+        };
+        locks.migrate_legacy_plock_owner();
+        assert!(locks.plock_owners.contains(&99));
+        assert!(locks.plock_owner_id.is_none());
     }
 }

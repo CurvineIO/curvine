@@ -248,12 +248,19 @@ impl CurvineFileSystem {
         flags == 0
     }
 
-    fn to_file_lock(&self, arg: &fuse_lk_in) -> FileLock {
+    fn to_file_lock(&self, arg: &fuse_lk_in, header_pid: u32) -> FileLock {
         let client_id = self.fs.cv().fs_context().clone_client_name();
+        // Prefer the flock pid from the kernel request; fall back to the FUSE
+        // header pid when the kernel leaves lk.pid unset (common on some paths).
+        let pid = if arg.lk.pid != 0 {
+            arg.lk.pid
+        } else {
+            header_pid
+        };
         FileLock {
             client_id,
             owner_id: arg.owner,
-            pid: arg.lk.pid,
+            pid,
             lock_type: LockType::from(arg.lk.typ as u8),
             lock_flags: LockFlags::from(arg.lk_flags as u8),
             start: arg.lk.start,
@@ -263,16 +270,29 @@ impl CurvineFileSystem {
     }
 
     async fn fs_unlock(&self, handler: &FileHandle, flags: LockFlags) -> FuseResult<()> {
-        if let Some(owner_id) = handler.remove_lock(flags) {
-            if let Err(e) = self.fs_unlock_owner(handler, flags, owner_id).await {
-                // Preserve the owner locally when the backend unlock fails so a
-                // retained handle can retry the cleanup.
-                handler.add_lock(flags, owner_id);
-                return Err(e);
+        match flags {
+            LockFlags::Plock => {
+                let owners = handler.drain_plock_owners();
+                for owner_id in owners {
+                    if let Err(e) = self.fs_unlock_owner(handler, flags, owner_id).await {
+                        // Preserve remaining owners locally when unlock fails so a
+                        // retained handle can retry the cleanup.
+                        handler.add_lock(flags, owner_id);
+                        return Err(e);
+                    }
+                }
+                Ok(())
+            }
+            LockFlags::Flock => {
+                if let Some(owner_id) = handler.remove_lock(flags) {
+                    if let Err(e) = self.fs_unlock_owner(handler, flags, owner_id).await {
+                        handler.add_lock(flags, owner_id);
+                        return Err(e);
+                    }
+                }
+                Ok(())
             }
         }
-
-        Ok(())
     }
 
     async fn fs_unlock_owner(
@@ -1854,7 +1874,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn get_lk(&self, op: GetLk<'_>) -> FuseResult<fuse_lk_out> {
         let path = self.state.get_path(op.header.nodeid)?;
-        let lock = self.to_file_lock(op.arg);
+        let lock = self.to_file_lock(op.arg, op.header.pid);
 
         self.state.fs_fsync(op.header.nodeid, None).await?;
 
@@ -1883,12 +1903,22 @@ impl fs::FileSystem for CurvineFileSystem {
 
         self.state.fs_fsync(op.header.nodeid, None).await?;
 
-        let lock = self.to_file_lock(op.arg);
+        let lock = self.to_file_lock(op.arg, op.header.pid);
         let (flag, owner_id) = (lock.lock_flags, lock.owner_id);
+        let is_unlock = lock.lock_type == LockType::UnLock;
+        let full_range_unlock = is_unlock && lock.start == 0 && lock.end == u64::MAX;
 
         let conflict = self.fs.set_lock(&path, lock).await?;
         if conflict.is_none() {
-            handle.add_lock(flag, owner_id);
+            if is_unlock {
+                // Full-range unlock drops this owner from handle bookkeeping so a
+                // later FUSE_FLUSH does not need to talk to Master again.
+                if full_range_unlock && flag == LockFlags::Plock {
+                    handle.take_plock_if_owner(owner_id);
+                }
+            } else {
+                handle.add_lock(flag, owner_id);
+            }
             Ok(())
         } else {
             err_fuse!(libc::EAGAIN)
@@ -1910,16 +1940,15 @@ impl fs::FileSystem for CurvineFileSystem {
         let mut ticks: u64 = 0;
         let time = TimeSpent::new();
 
-        let lock = self.to_file_lock(op.arg);
+        let lock = self.to_file_lock(op.arg, op.header.pid);
         let wait_guard = PlockWaitGuard::new(
             self.plock_waits.clone(),
             LockOwner::new(lock.client_id.clone(), lock.owner_id),
         );
         loop {
-            wait_guard.clear_blocked_by();
-
             let conflict = self.fs.set_lock(&path, lock.clone()).await?;
             if conflict.is_none() {
+                wait_guard.clear_blocked_by();
                 handle.add_lock(lock.lock_flags, lock.owner_id);
                 return Ok(());
             }

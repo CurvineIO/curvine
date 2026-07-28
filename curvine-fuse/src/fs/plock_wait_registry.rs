@@ -64,10 +64,14 @@ impl PlockWaitRegistry {
         Self::reaches_waiter(&map, waiter, blocked_by)
     }
 
-    /// Atomically check for a wait cycle and register `waiter -> blocked_by`.
+    /// Atomically replace `waiter -> blocked_by` and detect a wait cycle.
     /// Returns true when the edge would close a cycle (EDEADLK).
     pub fn try_register_blocked_by(&self, waiter: LockOwner, blocked_by: LockOwner) -> bool {
         let mut map = self.waiters.lock().expect("plock wait registry poisoned");
+        // Drop any prior edge for this waiter before walking the graph so a
+        // stale self-edge cannot create a false cycle, and so the new blocker
+        // is published atomically with the deadlock check.
+        map.remove(&waiter);
         if Self::reaches_waiter(&map, &waiter, &blocked_by) {
             return true;
         }
