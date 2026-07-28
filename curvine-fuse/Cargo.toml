@@ -9,7 +9,8 @@ license.workspace = true
 [dependencies]
 orpc = { workspace = true}
 curvine-common = { workspace = true }
-curvine-client = { workspace = true }
+curvine-client = { workspace = true, features = ["unified", "opendal-s3"] }
+curvine-config = { workspace = true }
 log = { workspace = true }
 clap = { workspace = true }
 pin-project-lite = { workspace = true }

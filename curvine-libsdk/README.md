@@ -12,7 +12,7 @@ Rust **`cdylib`** with **Java (JNI)** and **Python (PyO3)**. Crate path: **`curv
 
 ## UFS Cargo features
 
-`curvine-libsdk` forwards optional UFS backends from `curvine-client`. Default features remain **`java-sdk` only** — no extra UFS backends are enabled by the libsdk crate itself. Enable backends explicitly when you need them (e.g. load jobs against OSS-HDFS).
+`curvine-libsdk` forwards optional UFS backends from `curvine-client`. Default features are **`java-sdk` + `opendal-s3`** to preserve the historical SDK build behavior. Use `default-features = false` and enable the required SDK/backend features explicitly when you need a leaner build or another backend (e.g. load jobs against OSS-HDFS).
 
 | Feature | Forwards to |
 |---------|-------------|

@@ -15,16 +15,29 @@
 use crate::core::job;
 use crate::java::JavaUtils;
 use crate::{FilesystemConf, LibFilesystem, LibFsReader, LibFsWriter};
-use curvine_common::proto::{GetJobStatusResponse, SubmitJobResponse};
+use curvine_common::error::FsError;
+use curvine_common::proto::{
+    GetJobStatusResponse, GetMountTableResponse, MountOptionsProto, SubmitJobResponse,
+};
 use curvine_common::state::LoadJobCommand;
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
-use jni::objects::JString;
+use jni::objects::{JByteArray, JString};
 use jni::sys::{jarray, jboolean, jstring};
 use jni::JNIEnv;
+use orpc::{err_box, try_err};
+use prost::Message;
 
 pub struct JavaFilesystem {
     inner: LibFilesystem,
+}
+
+fn decode_mount_options(bytes: &[u8]) -> FsResult<curvine_common::state::MountOptions> {
+    if bytes.is_empty() {
+        return err_box!("mount options cannot be empty");
+    }
+    let options = try_err!(MountOptionsProto::decode(bytes));
+    Ok(ProtoUtils::mount_options_from_pb(options))
 }
 
 impl JavaFilesystem {
@@ -108,6 +121,40 @@ impl JavaFilesystem {
         Ok(byte_arr)
     }
 
+    pub fn mount(
+        &self,
+        env: &mut JNIEnv,
+        ufs_path: JString,
+        cv_path: JString,
+        options: JByteArray,
+    ) -> FsResult<()> {
+        let ufs_path = JavaUtils::jstring_to_string(env, &ufs_path)?;
+        let cv_path = JavaUtils::jstring_to_string(env, &cv_path)?;
+        let options = env
+            .convert_byte_array(&options)
+            .map_err(FsError::from_error)?;
+        self.inner
+            .mount(ufs_path, cv_path, decode_mount_options(&options)?)
+    }
+
+    pub fn unmount(&self, env: &mut JNIEnv, cv_path: JString) -> FsResult<()> {
+        let cv_path = JavaUtils::jstring_to_string(env, &cv_path)?;
+        self.inner.umount(cv_path)
+    }
+
+    pub fn get_mount_table(&self, env: &mut JNIEnv) -> FsResult<jarray> {
+        let response = GetMountTableResponse {
+            mount_table: self
+                .inner
+                .get_mount_table()?
+                .into_iter()
+                .map(ProtoUtils::mount_info_to_pb)
+                .collect(),
+        };
+        let bytes = ProtoUtils::encode(response)?;
+        Ok(JavaUtils::new_jarray(env, &bytes)?)
+    }
+
     pub fn toggle_path(
         &self,
         env: &mut JNIEnv,
@@ -182,5 +229,16 @@ impl JavaFilesystem {
 
     pub fn cleanup(&self) {
         self.inner.cleanup()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_mount_options;
+
+    #[test]
+    fn rejects_empty_mount_options() {
+        let error = decode_mount_options(&[]).unwrap_err();
+        assert!(error.to_string().contains("mount options cannot be empty"));
     }
 }

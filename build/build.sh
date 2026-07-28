@@ -491,28 +491,32 @@ append_ufs_feature() {
       ;;
   esac
 
-  if [ "$scope" = "client-safe" ] && is_client_native_ufs "$ufs"; then
+  if { [ "$scope" = "client-safe" ] || [ "$scope" = "cli-minimal" ]; } && is_client_native_ufs "$ufs"; then
     remember_skipped_native_ufs "$ufs"
     return 0
   fi
 
   case "$ufs" in
     oss-hdfs)
-      add_feature "curvine-ufs/oss-hdfs"
       add_feature "curvine-client/oss-hdfs"
       ;;
     opendal-hdfs)
-      add_feature "curvine-ufs/opendal-hdfs"
       add_feature "curvine-client/opendal-hdfs"
-      add_feature "curvine-ufs/jni"
       add_feature "curvine-server/jni"
       ;;
     opendal-webhdfs)
-      add_feature "curvine-ufs/opendal-webhdfs"
-      add_feature "curvine-client/opendal-webhdfs"
+      if [ "$scope" = "cli-minimal" ]; then
+        add_feature "curvine-cli/opendal-webhdfs"
+      else
+        add_feature "curvine-client/opendal-webhdfs"
+      fi
       ;;
     *)
-      add_feature "curvine-client/$ufs"
+      if [ "$scope" = "cli-minimal" ]; then
+        add_feature "curvine-cli/$ufs"
+      else
+        add_feature "curvine-client/$ufs"
+      fi
       ;;
   esac
 }
@@ -536,7 +540,6 @@ append_extra_features() {
         ;;
       jni|curvine-server/jni|curvine-ufs/jni)
         if [ "$scope" = "server-native" ] || [ "$scope" = "tests" ]; then
-          add_feature "curvine-ufs/jni"
           add_feature "curvine-server/jni"
         else
           remember_skipped_native_ufs "jni"
@@ -552,7 +555,14 @@ append_extra_features() {
           add_feature "curvine-server/spdk-rdma"
         fi
         ;;
-      curvine-ufs/oss-hdfs|curvine-ufs/opendal-hdfs|curvine-ufs/opendal-hdfs-native|curvine-client/oss-hdfs|curvine-client/opendal-hdfs|curvine-client/opendal-hdfs-native)
+      curvine-ufs/oss-hdfs|curvine-ufs/opendal-hdfs|curvine-ufs/opendal-hdfs-native)
+        if [ "$scope" = "server-native" ] || [ "$scope" = "tests" ]; then
+          add_feature "curvine-client/${feature#curvine-ufs/}"
+        else
+          remember_skipped_native_ufs "$feature"
+        fi
+        ;;
+      curvine-client/oss-hdfs|curvine-client/opendal-hdfs|curvine-client/opendal-hdfs-native)
         if [ "$scope" = "server-native" ] || [ "$scope" = "tests" ]; then
           add_feature "$feature"
         else
@@ -572,7 +582,22 @@ append_extra_features() {
 }
 
 append_alloc_feature() {
-  add_feature "curvine-common/${ALLOC}"
+  local scope="${1:-}"
+  case "$scope" in
+    cli-minimal)
+      add_feature "curvine-cli/${ALLOC}"
+      return 0
+      ;;
+    client-safe)
+      if [[ " ${CLIENT_RUST_BUILD_ARGS[@]} " =~ " -p curvine-fuse " ]]; then
+        add_feature "curvine-common/${ALLOC}"
+      fi
+      return 0
+      ;;
+    *)
+      add_feature "curvine-common/${ALLOC}"
+      ;;
+  esac
 }
 
 feature_list() {
@@ -711,7 +736,7 @@ fi
 FEATURES=()
 append_ufs_features "server-native"
 append_extra_features "server-native"
-append_alloc_feature
+append_alloc_feature "server-native"
 if [ $ENABLE_SPDK -eq 1 ]; then
   add_feature "curvine-server/spdk"
   echo "Enabling SPDK NVMe-oF initiator support (TCP transport)"
@@ -730,18 +755,19 @@ if [ ${#CLIENT_RUST_BUILD_ARGS[@]} -gt 0 ]; then
   append_ufs_features "client-safe"
 fi
 append_extra_features "client-safe"
-append_alloc_feature
+append_alloc_feature "client-safe"
 CLIENT_FEATURES=("${FEATURES[@]}")
 
 FEATURES=()
+append_ufs_features "cli-minimal"
 append_extra_features "cli-minimal"
-append_alloc_feature
+append_alloc_feature "cli-minimal"
 CLI_FEATURES=("${FEATURES[@]}")
 
 FEATURES=()
 append_ufs_features "tests"
 append_extra_features "tests"
-append_alloc_feature
+append_alloc_feature "tests"
 if [ $ENABLE_SPDK -eq 1 ]; then
   add_feature "curvine-server/spdk"
 fi

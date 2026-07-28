@@ -8,7 +8,7 @@ license.workspace = true
 
 [features]
 default = []
-jni = ["curvine-ufs/jni"]
+jni = ["curvine-client/opendal-hdfs"]
 spdk = ["dep:curvine-storage-spdk", "curvine-storage-spdk/spdk"]
 spdk-rdma = ["spdk", "curvine-storage-spdk/spdk-rdma"]
 fault-injection = [
@@ -21,7 +21,7 @@ curvine-common = { workspace = true }
 curvine-error = { workspace = true, features = ["axum-response"] }
 curvine-fault = { workspace = true }
 curvine-storage-spdk = { workspace = true, optional = true }
-curvine-client = { workspace = true }
+curvine-client = { workspace = true, features = ["job-client", "unified", "opendal-s3"] }
 curvine-ufs = { workspace = true }
 curvine-web = { workspace = true }
 prost = { workspace = true }

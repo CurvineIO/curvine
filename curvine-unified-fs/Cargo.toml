@@ -1,0 +1,34 @@
+[package]
+name = "curvine-unified-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+curvine-client-core = { workspace = true }
+curvine-job-client = { workspace = true }
+curvine-ufs = { workspace = true }
+curvine-ufs-opendal = { workspace = true, optional = true }
+curvine-ufs-oss-hdfs = { workspace = true, optional = true }
+curvine-config = { workspace = true }
+curvine-error = { workspace = true }
+curvine-fs-api = { workspace = true }
+curvine-model = { workspace = true }
+bytes = { workspace = true }
+log = { workspace = true }
+once_cell = { workspace = true }
+orpc = { workspace = true }
+tokio = { workspace = true }
+
+[features]
+default = []
+opendal = ["dep:curvine-ufs-opendal"]
+opendal-s3 = ["opendal", "curvine-ufs-opendal/opendal-s3"]
+opendal-oss = ["opendal", "curvine-ufs-opendal/opendal-oss"]
+opendal-gcs = ["opendal", "curvine-ufs-opendal/opendal-gcs"]
+opendal-azblob = ["opendal", "curvine-ufs-opendal/opendal-azblob"]
+opendal-cos = ["opendal", "curvine-ufs-opendal/opendal-cos"]
+opendal-hdfs = ["opendal", "curvine-ufs-opendal/opendal-hdfs"]
+opendal-webhdfs = ["opendal", "curvine-ufs-opendal/opendal-webhdfs"]
+opendal-hdfs-native = ["opendal", "curvine-ufs-opendal/opendal-hdfs-native"]
+oss-hdfs = ["dep:curvine-ufs-oss-hdfs", "curvine-ufs-oss-hdfs/oss-hdfs"]

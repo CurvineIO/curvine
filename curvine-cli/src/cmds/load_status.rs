@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use clap::Parser;
-use curvine_client::rpc::JobMasterClient;
-use curvine_common::state::JobTaskState;
+use curvine_job_client::JobMasterClient;
+use curvine_model::JobTaskState;
 use orpc::CommonResult;
 
 use crate::util::*;
