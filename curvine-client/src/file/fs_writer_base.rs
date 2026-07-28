@@ -295,13 +295,16 @@ impl FsWriterBase {
 
         let mut writer_commits = Vec::with_capacity(self.cache_writers.len());
         for (_, writer) in self.cache_writers.iter_mut() {
-            let commit_block = if only_flush {
-                writer.flush().await?;
-                writer.to_commit_block()
-            } else {
-                writer.complete().await?
-            };
-
+            // Always finalize on the worker. `only_flush` only keeps the master
+            // write lease open; it must still publish block data.
+            //
+            // A prior resize/flush may already have finalized an older
+            // generation. Later writes reopen as a staging rewrite while
+            // `get_readable_block` prefers the committed generation. Calling
+            // `flush()` here without `complete()` leaves that rewrite
+            // unpublished, so FUSE dirty-read / LTP ftest/pwrite see EIO or
+            // stale holes after sparse write-then-read.
+            let commit_block = writer.complete().await?;
             writer_commits.push(commit_block);
         }
 
@@ -309,9 +312,9 @@ impl FsWriterBase {
             self.file_blocks.add_commit(commit)?;
         }
 
-        if !only_flush {
-            self.cache_writers.clear();
-        }
+        // `complete()` ends the worker write session; drop handles so the next
+        // write reopens against the newly published generation.
+        self.cache_writers.clear();
 
         let commit_blocks = self.file_blocks.take_commit_blocks();
         // From this point onward a request may have reached the master even if
