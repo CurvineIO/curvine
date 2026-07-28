@@ -113,7 +113,11 @@ impl FsWriterBase {
             return Ok(());
         }
 
-        if self.pos > self.len {
+        // Sparse seek-past-EOF: only call master resize when the write target is
+        // outside existing block slots. Hole writes inside an already-allocated
+        // block are handled by seek+write on the worker (Linux sparse semantics)
+        // and must not force a full-block rewrite via resize/should_resize.
+        if self.pos > self.len && self.file_blocks.get_block(self.pos).is_none() {
             self.resize(FileAllocOpts::with_truncate(self.pos)).await?;
         }
 
@@ -142,7 +146,7 @@ impl FsWriterBase {
             return Ok(());
         }
 
-        if self.pos > self.len {
+        if self.pos > self.len && self.file_blocks.get_block(self.pos).is_none() {
             rt.block_on(self.resize(FileAllocOpts::with_truncate(self.pos)))?;
         }
 

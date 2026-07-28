@@ -440,9 +440,17 @@ impl InodeFile {
         if let Some(last_block) = self.blocks.last_mut() {
             let resize_len = block_size.min(expect_len - start);
             last_block.len = resize_len as u32;
-            last_block
-                .alloc_opts
-                .replace(opts.clone_with_len(resize_len));
+            // Blocks already placed on workers must not get a fresh alloc_opts:
+            // that flag forces the client to open+rewrite the whole block on every
+            // sparse seek+write extend (e.g. LTP sendfile09 setup), which amplifies
+            // a 1-byte hole write into a multi-MiB/128MiB rewrite.
+            // Unplaced blocks still need alloc_opts so the first worker open can size
+            // the backing store.
+            if last_block.locs.is_none() {
+                last_block
+                    .alloc_opts
+                    .replace(opts.clone_with_len(resize_len));
+            }
             start += block_size;
         }
 
@@ -649,6 +657,34 @@ mod tests {
             vec![4, 4, 4, 3]
         );
         assert_eq!(&file.block_ids()[..original_ids.len()], original_ids);
+    }
+
+    #[test]
+    fn extend_does_not_force_alloc_opts_on_located_tail_block() {
+        let mut file = test_file(8);
+        file.resize(FileAllocOpts::with_truncate(3)).unwrap();
+        assert!(file.blocks[0].alloc_opts.is_some());
+
+        // Simulate a block that has already been written to workers.
+        file.blocks[0].locs = Some(vec![BlockLocation::with_id(1)]);
+        file.blocks[0].alloc_opts = None;
+
+        file.resize(FileAllocOpts::with_truncate(5)).unwrap();
+
+        assert_eq!(file.len, 5);
+        assert_eq!(file.blocks[0].len, 5);
+        assert!(
+            file.blocks[0].alloc_opts.is_none(),
+            "located tail must not get alloc_opts on sparse extend"
+        );
+
+        // Crossing into a new block still allocates the unplaced block with opts.
+        file.resize(FileAllocOpts::with_truncate(12)).unwrap();
+        assert_eq!(file.blocks.len(), 2);
+        assert!(file.blocks[0].alloc_opts.is_none());
+        assert_eq!(file.blocks[0].len, 8);
+        assert!(file.blocks[1].alloc_opts.is_some());
+        assert_eq!(file.blocks[1].len, 4);
     }
 
     #[test]
