@@ -16,7 +16,7 @@
 
 use crate::java::{JavaFilesystem, SUCCESS};
 use crate::{java_err, java_err2, LibFsReader, LibFsWriter};
-use jni::objects::{JLongArray, JObject, JString};
+use jni::objects::{JByteArray, JLongArray, JObject, JString};
 use jni::sys::{jarray, jboolean, jint, jlong};
 use jni::JNIEnv;
 use orpc::sys::FFIUtils;
@@ -276,6 +276,42 @@ pub unsafe extern "C" fn Java_io_curvine_CurvineNative_getMountInfo(
 ) -> jarray {
     let fs = &*fs_ptr;
     java_err2!(env, fs.get_mount_info(&mut env, path))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn Java_io_curvine_CurvineNative_mount(
+    mut env: JNIEnv,
+    _this: JObject,
+    fs_ptr: *mut JavaFilesystem,
+    ufs_path: JString,
+    cv_path: JString,
+    options: JByteArray,
+) -> jlong {
+    let fs = &*fs_ptr;
+    java_err!(env, fs.mount(&mut env, ufs_path, cv_path, options));
+    SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn Java_io_curvine_CurvineNative_unmount(
+    mut env: JNIEnv,
+    _this: JObject,
+    fs_ptr: *mut JavaFilesystem,
+    cv_path: JString,
+) -> jlong {
+    let fs = &*fs_ptr;
+    java_err!(env, fs.unmount(&mut env, cv_path));
+    SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn Java_io_curvine_CurvineNative_getMountTable(
+    mut env: JNIEnv,
+    _this: JObject,
+    fs_ptr: *mut JavaFilesystem,
+) -> jarray {
+    let fs = &*fs_ptr;
+    java_err2!(env, fs.get_mount_table(&mut env))
 }
 
 #[no_mangle]
