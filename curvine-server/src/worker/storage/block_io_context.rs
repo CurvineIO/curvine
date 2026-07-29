@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use bytes::BytesMut;
 use orpc::io::{BlockIO, IOError, IOResult, LocalFile};
 use orpc::sys::DataSlice;
 use orpc::{err_box, try_err};
@@ -149,7 +150,11 @@ pub struct BlockReadContext {
     device: Box<dyn BlockIO>,
     /// Base offset of the block on the backing device (0 for file-backed blocks).
     device_base: i64,
+    /// Client-visible / master logical length for this open.
     block_size: i64,
+    /// Bytes physically present on the worker. When smaller than `block_size`,
+    /// reads past this offset return sparse zeros (post-resize master inflate).
+    physical_len: i64,
     block_pos: i64,
 }
 
@@ -157,28 +162,55 @@ impl BlockReadContext {
     /// Establish the invariant `device.pos() == device_base + block_pos` by
     /// unconditionally seeking the underlying device. Callers must not rely on
     /// the layout having pre-positioned the device.
-    pub fn new<D>(
+    pub fn new<D>(device: D, device_base: i64, block_size: i64, initial_off: i64) -> IOResult<Self>
+    where
+        D: BlockIO + 'static,
+    {
+        Self::with_physical(device, device_base, block_size, block_size, initial_off)
+    }
+
+    /// Open a reader whose logical length may exceed the physical worker bytes.
+    pub fn with_physical<D>(
         mut device: D,
         device_base: i64,
-        block_size: i64,
+        logical_len: i64,
+        physical_len: i64,
         initial_off: i64,
     ) -> IOResult<Self>
     where
         D: BlockIO + 'static,
     {
-        if initial_off < 0 || initial_off > block_size {
+        if logical_len < 0 || physical_len < 0 {
+            return err_box!(
+                "Invalid block lengths: logical={}, physical={}",
+                logical_len,
+                physical_len
+            );
+        }
+        if physical_len > logical_len {
+            return err_box!(
+                "physical_len {} cannot exceed logical_len {}",
+                physical_len,
+                logical_len
+            );
+        }
+        if initial_off < 0 || initial_off > logical_len {
             return err_box!(
                 "Invalid initial offset: {}, block length: {}",
                 initial_off,
-                block_size
+                logical_len
             );
         }
-        let absolute = absolute_offset(device_base, initial_off)?;
+        // Device seeks are clamped to the physical range; the sparse logical
+        // tail is synthesized as zeros in `read_region`.
+        let device_off = initial_off.min(physical_len);
+        let absolute = absolute_offset(device_base, device_off)?;
         try_err!(device.seek(absolute));
         Ok(Self {
             device: Box::new(device),
             device_base,
-            block_size,
+            block_size: logical_len,
+            physical_len,
             block_pos: initial_off,
         })
     }
@@ -200,11 +232,30 @@ impl BlockReadContext {
             );
         }
         if block_off != self.block_pos {
-            let absolute = absolute_offset(self.device_base, block_off)?;
+            let device_off = block_off.min(self.physical_len);
+            let absolute = absolute_offset(self.device_base, device_off)?;
             try_err!(self.device.seek(absolute));
             self.block_pos = block_off;
         }
         Ok(())
+    }
+
+    fn into_buffer(region: DataSlice) -> IOResult<BytesMut> {
+        match region {
+            DataSlice::Buffer(b) => Ok(b),
+            DataSlice::Bytes(b) => {
+                let mut buf = BytesMut::with_capacity(b.len());
+                buf.extend_from_slice(&b);
+                Ok(buf)
+            }
+            DataSlice::MemSlice(b) => {
+                let mut buf = BytesMut::with_capacity(b.len());
+                buf.extend_from_slice(b.as_slice());
+                Ok(buf)
+            }
+            DataSlice::Empty => Ok(BytesMut::new()),
+            DataSlice::IOSlice(_) => err_box!("Cannot materialize IOSlice for sparse pad"),
+        }
     }
 
     pub fn read_region(&mut self, enable_send_file: bool, len: i32) -> IOResult<DataSlice> {
@@ -217,10 +268,30 @@ impl BlockReadContext {
                 self.block_pos
             );
         }
-        let region = self.device.read_region(enable_send_file, read_len as i32)?;
-        // Advance by the bytes represented by the returned region.
-        self.block_pos += region.len() as i64;
-        Ok(region)
+
+        // Entirely past physical bytes: synthesize sparse zeros.
+        if self.block_pos >= self.physical_len {
+            self.block_pos += read_len;
+            return Ok(DataSlice::buffer(BytesMut::zeroed(read_len as usize)));
+        }
+
+        let physical_chunk = (self.physical_len - self.block_pos).min(read_len);
+        // send_file/IOSlice cannot be padded; force a buffered read when the
+        // logical request extends into the sparse tail.
+        let enable_send_file = enable_send_file && physical_chunk == read_len;
+        let region = self
+            .device
+            .read_region(enable_send_file, physical_chunk as i32)?;
+        let got = region.len() as i64;
+        self.block_pos += got;
+        if got == read_len {
+            return Ok(region);
+        }
+
+        let mut buf = Self::into_buffer(region)?;
+        buf.resize(read_len as usize, 0);
+        self.block_pos += read_len - got;
+        Ok(DataSlice::buffer(buf))
     }
 
     pub fn supports_send_file(&self) -> bool {
@@ -255,6 +326,30 @@ mod tests {
         if let Some(parent) = std::path::Path::new(path).parent() {
             std::fs::create_dir_all(parent)?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn read_context_sparse_logical_tail_returns_zeros() -> Result<(), Box<dyn std::error::Error>> {
+        let path = Utils::test_file();
+        ensure_parent(&path)?;
+        LocalFile::write_string(&path, "ABCDEF", true)?;
+
+        let device = shared_read_device(&path)?;
+        // Physical file is 6 bytes; logical open length is 10 (post-resize inflate).
+        let mut ctx = BlockReadContext::with_physical(device, 0, 10, 6, 4)?;
+        let region = ctx.read_region(false, 8)?;
+        let bytes = match &region {
+            DataSlice::Bytes(b) => &b[..],
+            DataSlice::Buffer(b) => &b[..],
+            other => panic!("unexpected slice variant: {:?}", other),
+        };
+        // remaining logical bytes from off=4 is 6, so request of 8 is clamped.
+        assert_eq!(&bytes[..2], b"EF");
+        assert_eq!(&bytes[2..], &[0u8; 4]);
+        assert_eq!(ctx.block_pos(), 10);
+
+        let _ = remove_file(&path);
         Ok(())
     }
 

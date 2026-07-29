@@ -190,7 +190,14 @@ impl BlockLayout for BdevLayout {
         }
     }
 
-    fn open_reader(&self, dir: &VfsDir, meta: &BlockMeta, off: i64) -> IOResult<BlockReadContext> {
+    fn open_reader(
+        &self,
+        dir: &VfsDir,
+        meta: &BlockMeta,
+        off: i64,
+        _logical_len: i64,
+    ) -> IOResult<BlockReadContext> {
+        // Bdev blocks are fully allocated; do not synthesize a sparse logical tail.
         validate_open_offset(meta, off)?;
         #[cfg(feature = "spdk")]
         {

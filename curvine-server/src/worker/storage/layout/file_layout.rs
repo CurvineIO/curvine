@@ -219,13 +219,29 @@ impl BlockLayout for FileLayout {
         BlockWriteContext::new(device, 0, meta.len, off)
     }
 
-    fn open_reader(&self, dir: &VfsDir, meta: &BlockMeta, off: i64) -> IOResult<BlockReadContext> {
-        validate_open_offset(meta, off)?;
-        let read_off = u64::try_from(off)
-            .map_err(|_| IOError::from(format!("Invalid read offset: {}", off)))?;
+    fn open_reader(
+        &self,
+        dir: &VfsDir,
+        meta: &BlockMeta,
+        off: i64,
+        logical_len: i64,
+    ) -> IOResult<BlockReadContext> {
+        let physical_len = meta.len;
+        let logical_len = logical_len.max(physical_len);
+        if off < 0 || off > logical_len {
+            return err_box!(
+                "Invalid block offset: {}, block length: {}",
+                off,
+                logical_len
+            );
+        }
+        // Seek within the physical file; sparse logical tail is synthesized.
+        let device_off = off.min(physical_len);
+        let read_off = u64::try_from(device_off)
+            .map_err(|_| IOError::from(format!("Invalid read offset: {}", device_off)))?;
         let file = Self::block_file(dir, meta)?;
         let device = LocalFile::with_read(file, read_off)?;
-        BlockReadContext::new(device, 0, meta.len, off)
+        BlockReadContext::with_physical(device, 0, logical_len, physical_len, off)
     }
 
     fn short_circuit(&self, dir: &VfsDir, meta: &BlockMeta) -> CommonResult<Option<String>> {

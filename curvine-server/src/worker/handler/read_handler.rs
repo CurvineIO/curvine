@@ -63,19 +63,22 @@ impl ReadHandler {
                 .ctx(format!("worker block store lookup failed: {}", e))
         })?;
 
+        // Master sparse ResizeFile may raise logical block len above the
+        // worker's physical file size. Serve the logical length and synthesize
+        // zeros for the sparse tail instead of rejecting the open.
+        let logical_len = context.len.max(meta.len);
         if context.off < 0 {
             return err_box!(
                 "Invalid read offset: {}, block length: {}",
                 context.off,
-                meta.len
+                logical_len
             );
         }
-        if context.off > meta.len {
+        if context.off > logical_len {
             return err_box!(
-                "The length of the requested data exceeds the maximum length of the block file, \
-            request off {}, file len {}",
+                "The length of the requested data exceeds the maximum length of the block file,             request off {}, file len {}",
                 context.off,
-                meta.len
+                logical_len
             );
         }
 
@@ -85,14 +88,15 @@ impl ReadHandler {
 
         if context.enable_read_ahead && context.read_ahead_len > Self::MAX_READ_AHEAD {
             return err_box!(
-                "The pre-read size exceeds the maximum value allowed by the system.\
-                 The current value is {}. The maximum allowed value is: {}",
+                "The pre-read size exceeds the maximum value allowed by the system.                 The current value is {}. The maximum allowed value is: {}",
                 context.read_ahead_len,
                 Self::MAX_READ_AHEAD
             );
         }
 
-        let sc_path = if context.short_circuit {
+        // Short-circuit local reads cannot synthesize sparse tails; force the
+        // remote path when logical length exceeds physical worker bytes.
+        let sc_path = if context.short_circuit && logical_len <= meta.len {
             self.store.short_circuit(&meta)?
         } else {
             None
@@ -101,7 +105,7 @@ impl ReadHandler {
         let (is_short_circuit, path, file) = if let Some(path) = sc_path {
             (true, path, None)
         } else {
-            let file = self.store.open_reader(&meta, context.off)?;
+            let file = self.store.open_reader(&meta, context.off, logical_len)?;
             let path = file.path().to_string();
             (false, path, Some(file))
         };
@@ -127,7 +131,7 @@ impl ReadHandler {
 
         let response = BlockReadResponse {
             id: context.block_id,
-            len: meta.len,
+            len: logical_len,
             path: ternary!(is_short_circuit, Some(path), None),
             storage_type: meta.storage_type().into(),
         };

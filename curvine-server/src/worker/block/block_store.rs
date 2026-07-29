@@ -84,12 +84,19 @@ impl BlockStore {
         layout.open_writer(&dir, meta, off).map_err(Into::into)
     }
 
-    pub fn open_reader(&self, meta: &BlockMeta, off: i64) -> CommonResult<BlockReadContext> {
+    pub fn open_reader(
+        &self,
+        meta: &BlockMeta,
+        off: i64,
+        logical_len: i64,
+    ) -> CommonResult<BlockReadContext> {
         let (layout, dir) = {
             let state = self.read()?;
             state.layout_for(meta)?
         };
-        layout.open_reader(&dir, meta, off).map_err(Into::into)
+        layout
+            .open_reader(&dir, meta, off, logical_len)
+            .map_err(Into::into)
     }
 
     pub fn short_circuit(&self, meta: &BlockMeta) -> CommonResult<Option<String>> {

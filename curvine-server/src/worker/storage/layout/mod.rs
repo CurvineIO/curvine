@@ -64,7 +64,13 @@ pub trait BlockLayout {
 
     fn open_writer(&self, dir: &VfsDir, meta: &BlockMeta, off: i64) -> IOResult<BlockWriteContext>;
 
-    fn open_reader(&self, dir: &VfsDir, meta: &BlockMeta, off: i64) -> IOResult<BlockReadContext>;
+    fn open_reader(
+        &self,
+        dir: &VfsDir,
+        meta: &BlockMeta,
+        off: i64,
+        logical_len: i64,
+    ) -> IOResult<BlockReadContext>;
 
     /// Local path a co-located client can open directly, `Ok(None)` if the
     /// layout cannot expose one (e.g. raw bdev). Errors are propagated so
@@ -177,10 +183,16 @@ impl BlockLayout for BlockLayoutKind {
         }
     }
 
-    fn open_reader(&self, dir: &VfsDir, meta: &BlockMeta, off: i64) -> IOResult<BlockReadContext> {
+    fn open_reader(
+        &self,
+        dir: &VfsDir,
+        meta: &BlockMeta,
+        off: i64,
+        logical_len: i64,
+    ) -> IOResult<BlockReadContext> {
         match self {
-            Self::File(layout) => layout.open_reader(dir, meta, off),
-            Self::Bdev(layout) => layout.open_reader(dir, meta, off),
+            Self::File(layout) => layout.open_reader(dir, meta, off, logical_len),
+            Self::Bdev(layout) => layout.open_reader(dir, meta, off, logical_len),
         }
     }
 

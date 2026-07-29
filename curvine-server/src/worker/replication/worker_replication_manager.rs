@@ -145,7 +145,9 @@ impl WorkerReplicationManager {
             target_capacity,
         )
         .await?;
-        let mut reader = self.block_store.open_reader(&block_meta, 0)?;
+        let mut reader = self
+            .block_store
+            .open_reader(&block_meta, 0, block_meta.len)?;
         let mut remaining = block_meta.len;
         while remaining > 0 {
             let size = remaining.min(self.replicate_chunk_size as i64);
