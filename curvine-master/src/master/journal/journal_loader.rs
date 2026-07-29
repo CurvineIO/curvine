@@ -302,7 +302,25 @@ impl JournalLoader {
                 }
 
                 JournalCommand::Metadata(command) => {
-                    return err_box!("unsupported committed metadata command: {:?}", command);
+                    let res = self
+                        .apply_metadata_command(is_leader, command.clone())
+                        .await;
+
+                    if let Err(e) = res {
+                        if is_leader && skip_ufs_error {
+                            error!(
+                                "skip failed committed metadata command after retries, entry index={}, term={}, command={:?}, error={}",
+                                entry.index, entry.term, command, e
+                            );
+                            continue;
+                        }
+
+                        return err_box!(
+                            "failed to apply committed metadata command: {:?}: {}",
+                            command,
+                            e
+                        );
+                    }
                 }
             }
         }
@@ -652,6 +670,24 @@ impl JournalLoader {
     fn cache_invalidation(&self, entry: CacheInvalidationEntry) -> CommonResult<()> {
         let fs_dir = self.fs_dir.write();
         fs_dir.store.apply_cache_invalidations(entry.inodes)
+    }
+
+    async fn apply_metadata_command(
+        &self,
+        is_leader: bool,
+        command: MetadataCommand,
+    ) -> CommonResult<()> {
+        match command {
+            MetadataCommand::Mkdir(entry) => {
+                self.mkdir(entry.clone())?;
+                if is_leader {
+                    self.ufs_loader.mkdir(&entry).await
+                } else {
+                    Ok(())
+                }
+            }
+            MetadataCommand::CreateFile(entry) => self.create_file(entry),
+        }
     }
 
     fn mkdir(&self, entry: MkdirEntry) -> CommonResult<()> {

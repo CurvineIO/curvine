@@ -24,7 +24,7 @@ use curvine_error::FsResult;
 use curvine_model::{CommitBlock, FileLock, MountInfo, RenameFlags, SetAttrOpts};
 use curvine_raft::conf::JournalConfExt;
 use curvine_raft::raft::RaftClient;
-use curvine_runtime::common::{FileUtils, LocalTime};
+use curvine_runtime::common::{FileUtils, LocalTime, TimeSpent};
 use curvine_runtime::sync::channel::{BlockingChannel, BlockingReceiver, BlockingSender};
 use curvine_runtime::sync::AtomicCounter;
 use log::{debug, info, warn};
@@ -35,6 +35,7 @@ use std::sync::Mutex;
 pub struct JournalWriter {
     enable: bool,
     node_id: u64,
+    client: RaftClient,
     sender: BlockingSender<JournalEntry>,
     metrics: &'static MasterMetrics,
     receiver: Option<Mutex<BlockingReceiver<JournalEntry>>>,
@@ -59,7 +60,7 @@ impl JournalWriter {
 
         let receiver = if !testing {
             // Start the send log thread.
-            let task = SenderTask::new(client, conf, 0)?;
+            let task = SenderTask::new(client.clone(), conf, 0)?;
             task.spawn(receiver)?;
             None
         } else {
@@ -69,6 +70,7 @@ impl JournalWriter {
         Ok(Self {
             enable: conf.enable,
             node_id,
+            client,
             sender,
             metrics,
             receiver,
@@ -82,6 +84,30 @@ impl JournalWriter {
         debug!("send_entry {:?}", entry);
         self.sender.send(entry)?;
         self.metrics.journal_queue_len.inc();
+        Ok(())
+    }
+
+    pub fn commit_metadata_commands(&self, commands: Vec<MetadataCommand>) -> FsResult<()> {
+        if !self.enable {
+            return Ok(());
+        }
+        if commands.is_empty() {
+            return Ok(());
+        }
+
+        let spend = TimeSpent::new();
+        let seq_id = commands[0].op_id();
+        let mut batch = JournalCommandBatch::new(seq_id);
+        for command in commands {
+            batch.push_metadata(command);
+        }
+        let bytes = JournalEnvelope::encode(batch)?;
+        self.client.block_on_send_propose(bytes)?;
+
+        self.metrics.journal_flush_count.inc();
+        self.metrics
+            .journal_flush_time
+            .inc_by(spend.used_us() as i64);
         Ok(())
     }
 

@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::master::fs::{BlockInodeState, DeleteResult};
-use crate::master::journal::{JournalEntry, JournalWriter};
+use crate::master::journal::{
+    CreateFileEntry, JournalEntry, JournalWriter, MetadataCommand, MkdirEntry,
+};
 use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::*;
@@ -198,6 +200,91 @@ impl FsDir {
         }
 
         Ok(inp)
+    }
+
+    pub(crate) fn prepare_mkdir_commands(
+        &self,
+        mut inp: InodePath,
+        opts: MkdirOpts,
+    ) -> FsResult<Vec<MetadataCommand>> {
+        let mut commands = vec![];
+        if inp.is_full() || inp.is_root() {
+            return Ok(commands);
+        }
+
+        if opts.create_parent {
+            let parent_opts = opts.parent_opts();
+            while inp.existing_len() + 1 < inp.len() {
+                commands.push(MetadataCommand::Mkdir(
+                    self.prepare_mkdir_command(&mut inp, parent_opts.clone())?,
+                ));
+            }
+        }
+
+        if !inp.is_full() && !inp.is_root() {
+            commands.push(MetadataCommand::Mkdir(
+                self.prepare_mkdir_command(&mut inp, opts)?,
+            ));
+        }
+
+        Ok(commands)
+    }
+
+    fn prepare_mkdir_command(
+        &self,
+        inp: &mut InodePath,
+        mut opts: MkdirOpts,
+    ) -> FsResult<MkdirEntry> {
+        let pos = inp.existing_len() - 1;
+        let name = inp.get_component(pos + 1)?.to_string();
+
+        Self::apply_setgid_directory_inheritance(inp, &mut opts)?;
+
+        let dir = InodeDir::with_opts(self.next_inode_id()?, LocalTime::mills() as i64, opts);
+        inp.append(InodePtr::from_owned(InodeView::new_dir(name, dir.clone())))?;
+
+        Ok(MkdirEntry {
+            op_id: self.next_op_id(),
+            rpc_id: 0,
+            path: inp.get_valid_parent_path(),
+            dir,
+        })
+    }
+
+    pub(crate) fn prepare_create_file_commands(
+        &self,
+        mut inp: InodePath,
+        opts: CreateFileOpts,
+    ) -> FsResult<Vec<MetadataCommand>> {
+        if inp.get_last_inode().is_some() {
+            return err_ext!(FsError::file_exists(inp.path()));
+        }
+
+        let mut commands = vec![];
+        if opts.create_parent {
+            let dir_opts = opts.dir_opts();
+            while inp.existing_len() + 1 < inp.len() {
+                commands.push(MetadataCommand::Mkdir(
+                    self.prepare_mkdir_command(&mut inp, dir_opts.clone())?,
+                ));
+            }
+        }
+
+        let name = inp.name().to_string();
+        let path = inp.path().to_string();
+        let file = InodeFile::with_opts(self.next_inode_id()?, LocalTime::mills() as i64, opts);
+        inp.append(InodePtr::from_owned(InodeView::new_file(
+            name,
+            file.clone(),
+        )))?;
+
+        commands.push(MetadataCommand::CreateFile(CreateFileEntry {
+            op_id: self.next_op_id(),
+            rpc_id: 0,
+            path,
+            file,
+        }));
+        Ok(commands)
     }
 
     // Delete files or directories
