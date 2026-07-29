@@ -53,8 +53,20 @@ impl FuseRequest {
         }
 
         let header: &fuse_in_header = FuseDecoder::parse(&self.buf[..FUSE_IN_HEADER_LEN])?;
-        if self.buf.len() < header.len as usize {
-            return err_box!("Not enough data for arguments (short read).");
+        let declared_len = header.len as usize;
+        if declared_len < FUSE_IN_HEADER_LEN {
+            return err_box!(
+                "Invalid FUSE request length {}, expected at least {}",
+                declared_len,
+                FUSE_IN_HEADER_LEN
+            );
+        }
+        if self.buf.len() != declared_len {
+            return err_box!(
+                "FUSE request length mismatch, declared {}, actual {}",
+                declared_len,
+                self.buf.len()
+            );
         }
 
         Ok(header)
@@ -87,7 +99,7 @@ impl FuseRequest {
         )
     }
 
-    pub fn is_meta(&self) -> bool {
+    pub fn should_audit(&self) -> bool {
         !matches!(self.opcode, FUSE_READ | FUSE_WRITE)
     }
 
@@ -219,12 +231,10 @@ impl FuseRequest {
             }),
 
             FUSE_WRITE => {
-                let arg = decoder.get_struct()?;
-                FuseOperator::Write(Write {
-                    header,
-                    arg,
-                    data: self.get_write_bytes(arg.size as usize)?,
-                })
+                let arg: &fuse_write_in = decoder.get_struct()?;
+                let data = self.get_write_bytes(arg.size as usize)?;
+                let _ = decoder.get_bytes(arg.size as usize)?;
+                FuseOperator::Write(Write { header, arg, data })
             }
 
             FUSE_MKNOD => FuseOperator::MkNod(MkNod {
@@ -333,6 +343,10 @@ impl FuseRequest {
             _ => FuseOperator::Notimplemented,
         };
 
+        if !matches!(&op, FuseOperator::Notimplemented) {
+            decoder.ensure_empty()?;
+        }
+
         Ok(op)
     }
 }
@@ -352,10 +366,90 @@ impl Display for FuseRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raw::fuse_abi::fuse_setxattr_in;
+    use crate::raw::fuse_abi::{fuse_batch_forget_in, fuse_setxattr_in};
     use crate::FuseUtils;
     use bytes::BytesMut;
     use std::ffi::OsStr;
+
+    fn request_bytes(header: &fuse_in_header, body: &[u8]) -> Bytes {
+        let mut bytes = BytesMut::with_capacity(FUSE_IN_HEADER_LEN + body.len());
+        bytes.extend_from_slice(FuseUtils::struct_as_bytes(header));
+        bytes.extend_from_slice(body);
+        bytes.freeze()
+    }
+
+    fn header(opcode: FuseOpCode, len: usize) -> fuse_in_header {
+        fuse_in_header {
+            len: len as u32,
+            opcode: opcode as u32,
+            unique: 42,
+            nodeid: 7,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rejects_declared_length_smaller_than_header() {
+        let header = header(FUSE_GETATTR, FUSE_IN_HEADER_LEN - 1);
+        let err = match FuseRequest::from_bytes(request_bytes(&header, &[])) {
+            Ok(_) => panic!("invalid declared length must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("expected at least"));
+    }
+
+    #[test]
+    fn rejects_actual_length_different_from_declared_length() {
+        let header = header(FUSE_GETATTR, FUSE_IN_HEADER_LEN);
+        let err = match FuseRequest::from_bytes(request_bytes(&header, &[0])) {
+            Ok(_) => panic!("mismatched request length must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("length mismatch"));
+    }
+
+    #[test]
+    fn rejects_trailing_body_for_fixed_size_operator() {
+        let header = header(FUSE_GETATTR, FUSE_IN_HEADER_LEN + 1);
+        let request = FuseRequest::from_bytes(request_bytes(&header, &[0])).unwrap();
+        let err = request.parse_operator().unwrap_err();
+        assert!(err.to_string().contains("Unexpected trailing request data"));
+    }
+
+    #[test]
+    fn rejects_batch_forget_count_larger_than_body() {
+        let arg = fuse_batch_forget_in {
+            count: u32::MAX,
+            dummy: 0,
+        };
+        let body = FuseUtils::struct_as_bytes(&arg);
+        let header = header(FUSE_BATCH_FORGET, FUSE_IN_HEADER_LEN + body.len());
+        let request = FuseRequest::from_bytes(request_bytes(&header, body)).unwrap();
+        let err = request.parse_operator().unwrap_err();
+        assert!(err.to_string().contains("requested 4294967295"));
+        assert!(err.to_string().contains("available 0"));
+    }
+
+    #[test]
+    fn audit_classification_excludes_only_read_and_write() {
+        for opcode in [FUSE_READ, FUSE_WRITE] {
+            let request = FuseRequest {
+                unique: 1,
+                opcode,
+                buf: Bytes::new(),
+            };
+            assert!(!request.should_audit(), "{opcode:?} should not be audited");
+        }
+
+        for opcode in [FUSE_FLUSH, FUSE_RELEASE, FUSE_FSYNC, FUSE_LOOKUP] {
+            let request = FuseRequest {
+                unique: 1,
+                opcode,
+                buf: Bytes::new(),
+            };
+            assert!(request.should_audit(), "{opcode:?} should be audited");
+        }
+    }
 
     #[test]
     fn setxattr_uses_compat_header_and_preserves_name_and_value() {

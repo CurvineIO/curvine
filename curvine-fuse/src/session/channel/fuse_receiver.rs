@@ -435,7 +435,7 @@ impl<T: FileSystem> FuseReceiver<T> {
                                     req.opcode(),
                                 );
                             }
-                            if req.is_meta() {
+                            if req.should_audit() {
                                 self.audit(&req);
                             }
 
