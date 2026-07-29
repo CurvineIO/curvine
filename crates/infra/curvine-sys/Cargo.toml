@@ -6,3 +6,12 @@ license.workspace = true
 description = "Curvine system primitive migration boundary."
 
 [dependencies]
+orpc-runtime = { workspace = true }
+bytes = { workspace = true }
+fs2 = { workspace = true }
+futures = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+nix = { workspace = true }
+sysinfo = { workspace = true }
+tokio = { workspace = true }

@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::sys;
-use crate::sys::pipe::OwnedFd;
-use crate::sys::SysResult;
+use crate as sys;
+use crate::pipe::OwnedFd;
+use crate::SysResult;
 
 #[derive(Debug)]
 pub struct PipeFd {

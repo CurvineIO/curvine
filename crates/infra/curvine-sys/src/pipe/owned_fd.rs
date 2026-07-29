@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::sys;
-use crate::sys::{RawIO, SysResult};
+use crate as sys;
+use crate::{RawIO, SysResult};
 
 #[cfg(target_os = "linux")]
 use std::os::unix::io::{AsRawFd, RawFd};

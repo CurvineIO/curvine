@@ -2361,6 +2361,17 @@ dependencies = [
 [[package]]
 name = "curvine-sys"
 version = "0.2.0"
+dependencies = [
+ "bytes",
+ "fs2",
+ "futures",
+ "libc",
+ "log",
+ "nix",
+ "orpc-runtime",
+ "sysinfo",
+ "tokio",
+]
 
 [[package]]
 name = "curvine-tests"
@@ -6329,6 +6340,7 @@ dependencies = [
  "chrono",
  "crc32fast",
  "crossbeam",
+ "curvine-sys",
  "dashmap 5.5.3",
  "fs2",
  "futures",

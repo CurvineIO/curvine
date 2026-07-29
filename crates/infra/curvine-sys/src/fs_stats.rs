@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::sys::{self, SysResult};
+use crate as sys;
+use crate::SysResult;
 use log::warn;
 use std::path::{Path, PathBuf};
 
@@ -118,7 +119,7 @@ impl FsStats {
 
 #[cfg(test)]
 mod tests {
-    use crate::sys::FsStats;
+    use crate::FsStats;
 
     #[test]
     pub fn space() {

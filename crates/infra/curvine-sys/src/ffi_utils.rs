@@ -14,7 +14,7 @@
 
 #![allow(clippy::not_unsafe_ptr_arg_deref, unused)]
 
-use crate::sys::{CChar, CStr, CString, SysResult};
+use crate::{CChar, CStr, CString, SysResult};
 use std::ffi::OsStr;
 
 pub struct FFIUtils;

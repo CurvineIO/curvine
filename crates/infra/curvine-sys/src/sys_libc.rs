@@ -14,7 +14,7 @@
 
 #![allow(unused, clippy::not_unsafe_ptr_arg_deref)]
 
-use crate::sys::*;
+use crate::*;
 use fs2::FileExt;
 use std::ffi::{CStr, CString};
 use std::fs;
