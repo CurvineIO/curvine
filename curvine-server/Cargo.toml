@@ -41,6 +41,7 @@ mini-moka = { workspace = true }
 regex = { workspace = true }
 linked-hash-map = { workspace = true }
 rusqlite = { workspace = true }
+mysql = { workspace = true }
 dashmap = { workspace = true }
 axum = { workspace = true }
 serde_json = { workspace = true }
