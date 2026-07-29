@@ -104,7 +104,7 @@ impl RpcFrame {
             }
 
             DataSlice::IOSlice(io) => {
-                sys::send_file_full(self, io.raw_io(), io.off(), io.len()).await?;
+                self.send_file_full(io.raw_io(), io.off(), io.len()).await?;
                 Ok(())
             }
 
@@ -118,6 +118,31 @@ impl RpcFrame {
                 Ok(())
             }
         }
+    }
+
+    async fn send_file_full(
+        &self,
+        fd_in: sys::RawIO,
+        mut off: Option<i64>,
+        len: usize,
+    ) -> IOResult<()> {
+        let fd_out = sys::get_raw_io(self)?;
+        let mut remaining = len;
+        while remaining > 0 {
+            let result = self
+                .async_write(|| {
+                    sys::send_file(fd_in, fd_out, off.as_mut(), remaining).map_err(Into::into)
+                })
+                .await;
+
+            match result {
+                Ok(0) => return err_box!("send_file returned 0"),
+                Ok(transferred) => remaining -= transferred as usize,
+                Err(error) if error.is_would_block() => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     pub fn io(&self) -> &TcpStream {

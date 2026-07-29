@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::io::IOResult;
-use crate::sys::{self, CacheManager, DataSlice, ReadAheadTask};
+use crate::sys::{self, CacheManager, DataSlice, RawIOSlice, ReadAheadTask};
 use crate::{err_box, try_err};
 use bytes::BytesMut;
 use serde::de::DeserializeOwned;
@@ -110,7 +110,19 @@ impl LocalFile {
             );
         }
 
-        let region = DataSlice::from_file(self, enable_send_file, Some(self.pos), chunk as i32)?;
+        #[cfg(not(target_os = "linux"))]
+        let region = DataSlice::Buffer(self.read_full(Some(self.pos), chunk as usize)?);
+
+        #[cfg(target_os = "linux")]
+        let region = if enable_send_file {
+            DataSlice::IOSlice(RawIOSlice::new(
+                sys::get_raw_io(self)?,
+                Some(self.pos),
+                chunk as usize,
+            ))
+        } else {
+            DataSlice::Buffer(self.read_full(Some(self.pos), chunk as usize)?)
+        };
 
         self.pos += chunk;
         Ok(region)
@@ -274,7 +286,7 @@ impl LocalFile {
 
     pub fn actual_size(&self) -> IOResult<u64> {
         let meta = self.inner.metadata()?;
-        sys::file_actual_size(meta)
+        sys::file_actual_size(meta).map_err(Into::into)
     }
 
     pub fn metadata(&self) -> IOResult<Metadata> {

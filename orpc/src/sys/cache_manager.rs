@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::io::IOResult;
 use crate::sys;
-use crate::sys::CInt;
+use crate::sys::{CInt, SysResult};
 use std::fs::File;
 
 const LONG_READ_THRESHOLD_LEN: i64 = 256 * 1024;
@@ -24,7 +23,7 @@ const LONG_READ_THRESHOLD_LEN: i64 = 256 * 1024;
 pub struct ReadAheadTask {
     off: i64,
     len: i64,
-    handle: IOResult<CInt>,
+    handle: SysResult<CInt>,
     last_read_off: i64,
 }
 

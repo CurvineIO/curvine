@@ -99,11 +99,18 @@ build_image() {
     # Build Docker image directly from project root
     print_info "Building Docker image: $IMAGE_NAME:$IMAGE_TAG"
     print_warning "Note: Source build requires longer time, please be patient..."
+
+    GIT_VERSION="unknown"
+    if command -v git &> /dev/null && git -C "$PROJECT_ROOT" rev-parse --git-dir &> /dev/null; then
+        GIT_VERSION="$(git -C "$PROJECT_ROOT" rev-parse --short HEAD)"
+    fi
+    print_info "Using git version: $GIT_VERSION"
     
     # Build with project root as context
     # .dockerignore will filter out unnecessary files
     if ! docker build \
         --shm-size=2g \
+        --build-arg "GIT_VERSION=$GIT_VERSION" \
         -f "$SCRIPT_DIR/$DOCKERFILE_NAME" \
         -t "$IMAGE_NAME:$IMAGE_TAG" \
         "$PROJECT_ROOT"; then

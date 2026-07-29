@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::io::IOResult;
 use crate::sync::AtomicLen;
 use crate::sys::pipe::{Pipe2, PipeFd};
-use crate::sys::PIPE_BUF;
+use crate::sys::{SysResult, PIPE_BUF};
 use log::warn;
 use std::collections::LinkedList;
 use std::sync::Mutex;
@@ -63,7 +62,7 @@ impl PipePool {
         }
     }
 
-    pub fn acquire(&self) -> IOResult<Option<Pipe2>> {
+    pub fn acquire(&self) -> SysResult<Option<Pipe2>> {
         if cfg!(not(target_os = "linux")) {
             return Ok(None);
         }

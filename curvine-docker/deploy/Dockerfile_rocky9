@@ -127,9 +127,13 @@ RUN echo "Building Curvine from source..." && \
     rm -rf /workspace/tmp
 
 # 9. Create output directory and copy build artifacts from build/dist
+ARG GIT_VERSION=unknown
 RUN mkdir -p /build-output && \
     echo "Copying build/dist contents to /build-output..." && \
     cp -r /workspace/build/dist/* /build-output/ && \
+    if [ -f "/build-output/build-version" ]; then \
+        sed -i "s/^commit=.*/commit=${GIT_VERSION}/" /build-output/build-version; \
+    fi && \
     # Verify critical files exist
     if [ ! -f "/build-output/bin/launch-process.sh" ]; then \
         echo "✗ ERROR: launch-process.sh not found in build/dist/bin" && \
@@ -207,7 +211,9 @@ WORKDIR $APP_HOME
 # 8997: Worker RPC
 # 9000: Master Web UI
 # 9001: Worker Web UI / Master Web1
-EXPOSE 8995 8996 8997 9000 9001
+# 9010: Transfer RPC
+# 9011: Transfer Web UI
+EXPOSE 8995 8996 8997 9000 9001 9010 9011
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["master", "start"]

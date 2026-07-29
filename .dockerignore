@@ -2,8 +2,27 @@ curvine-libsdk/java/target/
 curvine-lancedb/target/
 target/
 **/target/
-# Keep .git directory for version info during build
-# **/.git/
+build/dist/
+build/.venv-python-sdk/
+build/testing/
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.log
+.git/
+.claude/
+.codegraph/
+.cursor/
+.vscode/
+docs/
+**/node_modules/
+**/__pycache__/
+**/.pytest_cache/
+**/testing/
+curvine-libsdk/java/native/
+curvine-libsdk/python/native/
+curvine-libsdk/python/curvine_libsdk/_proto/*_pb2.py
 **/.staging/
 **/.summary/
 .debug/

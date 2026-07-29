@@ -57,6 +57,14 @@ pub struct JournalConf {
     // How many entries are created after creating snapshots.
     pub snapshot_entries: u64,
 
+    // Internal ring buffer for Transfer metadata replica delta sync.
+    #[serde(
+        skip_serializing,
+        skip_deserializing,
+        default = "JournalConf::default_metadata_delta_log_capacity"
+    )]
+    pub metadata_delta_log_capacity: usize,
+
     pub snapshot_read_chunk_size: usize,
 
     // Network configuration between raft node communications.
@@ -118,6 +126,11 @@ pub struct JournalConf {
 
 impl JournalConf {
     pub const DEFAULT_NODE_ID: u64 = 0;
+    pub const DEFAULT_METADATA_DELTA_LOG_CAPACITY: usize = 100_000;
+
+    fn default_metadata_delta_log_capacity() -> usize {
+        Self::DEFAULT_METADATA_DELTA_LOG_CAPACITY
+    }
 
     // Create a test configuration, which will also randomly select a server port.
     pub fn with_test() -> Self {
@@ -229,6 +242,7 @@ impl Default for JournalConf {
             writer_flush_batch_ms: 10,
             snapshot_interval: "6h".to_string(),
             snapshot_entries: 1000000,
+            metadata_delta_log_capacity: Self::DEFAULT_METADATA_DELTA_LOG_CAPACITY,
             snapshot_read_chunk_size: 1024 * 1024,
 
             conn_retry_max_duration_ms: 0,

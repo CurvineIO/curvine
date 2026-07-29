@@ -19,6 +19,7 @@ enum TransferStateProto {
   TRANSFER_COMPLETED = 6;
   TRANSFER_FAILED = 7;
   TRANSFER_CANCELED = 8;
+  TRANSFER_PARTIAL_SUCCESS = 9;
 }
 
 enum TransferTaskStateProto {
@@ -48,6 +49,16 @@ message TransferTaskStatusProto {
   required TransferProgressProto progress = 8;
   required uint32 retry_count = 9;
   required int64 updated_at = 10;
+}
+
+message TransferTaskSummaryProto {
+  required uint64 pending = 1;
+  required uint64 running = 2;
+  required uint64 completed = 3;
+  required uint64 failed = 4;
+  required uint64 canceled = 5;
+  required uint64 stale = 6;
+  required int64 completed_size = 7;
 }
 
 message TransferJobStatusProto {
@@ -109,6 +120,7 @@ message GetTransferStatusResponse {
   optional uint64 lease_epoch = 15;
   optional int64 lease_expire_at = 16;
   optional uint64 cv_metadata_epoch = 17;
+  optional TransferTaskSummaryProto task_summary = 18;
 }
 
 message ListTransfersRequest {
@@ -133,6 +145,7 @@ message TransferTenantSummaryProto {
   required uint64 failed = 5;
   required uint64 canceled = 6;
   required uint64 total = 7;
+  required uint64 partial_success = 8;
 }
 
 message ListTransferTenantsRequest {
@@ -168,6 +181,7 @@ message WatchTransferResponse {
   optional uint64 lease_epoch = 13;
   optional int64 lease_expire_at = 14;
   optional uint64 cv_metadata_epoch = 15;
+  optional TransferTaskSummaryProto task_summary = 16;
 }
 
 message CancelTransferRequest {

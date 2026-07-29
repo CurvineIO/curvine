@@ -46,7 +46,7 @@ if is_fluid_mode "${1:-}"; then
 fi
 
 # Start the curvine service process
-# Service type: master, worker
+# Service type: master, worker, transfer
 SERVER_TYPE=${1:-master}
 
 # Operation type: start, stop, restart
@@ -178,7 +178,7 @@ restart_service() {
 set_hosts
 
 case "$SERVER_TYPE" in
-  (master|worker)
+  (master|worker|transfer)
     case "$ACTION_TYPE" in
       start)
         start_service "$SERVER_TYPE"

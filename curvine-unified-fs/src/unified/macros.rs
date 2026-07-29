@@ -108,6 +108,18 @@ macro_rules! impl_writer_for_enum {
                 }
             }
 
+            async fn complete_with_attr(
+                &mut self,
+                opts: Option<::curvine_model::SetAttrOpts>,
+            ) -> ::curvine_error::FsResult<()> {
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.complete_with_attr(opts).await,
+                    )+
+                }
+            }
+
             async fn cancel(&mut self) -> ::curvine_error::FsResult<()> {
                 match self {
                     $(

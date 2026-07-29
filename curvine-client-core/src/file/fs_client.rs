@@ -357,8 +357,9 @@ impl FsClient {
         len: i64,
         commit_blocks: impl IntoIterator<Item = CommitBlock>,
         only_flush: bool,
+        set_attr_opts: Option<SetAttrOpts>,
     ) -> FsResult<Option<FileBlocks>> {
-        self.complete_file0(path, None, len, commit_blocks, only_flush)
+        self.complete_file0(path, None, len, commit_blocks, only_flush, set_attr_opts)
             .await
     }
 
@@ -369,9 +370,17 @@ impl FsClient {
         len: i64,
         commit_blocks: impl IntoIterator<Item = CommitBlock>,
         only_flush: bool,
+        set_attr_opts: Option<SetAttrOpts>,
     ) -> FsResult<Option<FileBlocks>> {
-        self.complete_file0(path, Some(inode_id), len, commit_blocks, only_flush)
-            .await
+        self.complete_file0(
+            path,
+            Some(inode_id),
+            len,
+            commit_blocks,
+            only_flush,
+            set_attr_opts,
+        )
+        .await
     }
 
     // File writing is completed.
@@ -382,6 +391,7 @@ impl FsClient {
         len: i64,
         commit_blocks: impl IntoIterator<Item = CommitBlock>,
         only_flush: bool,
+        set_attr_opts: Option<SetAttrOpts>,
     ) -> FsResult<Option<FileBlocks>> {
         let commit_blocks = commit_blocks
             .into_iter()
@@ -395,6 +405,7 @@ impl FsClient {
             commit_blocks,
             only_flush,
             inode_id,
+            set_attr_opts: set_attr_opts.map(ProtoUtils::set_attr_opts_to_pb),
         };
 
         let operation = if only_flush { "Flush" } else { "Complete" };
@@ -422,6 +433,7 @@ impl FsClient {
                     commit_blocks,
                     only_flush,
                     inode_id: None,
+                    set_attr_opts: None,
                 }
             })
             .collect();
@@ -443,6 +455,34 @@ impl FsClient {
         let res = ProtoUtils::file_blocks_from_pb(rep.blocks);
 
         Ok(res)
+    }
+
+    pub async fn get_cv_metadata_snapshot_page(
+        &self,
+        page_token: Option<String>,
+        page_size: Option<u32>,
+    ) -> FsResult<GetCvMetadataSnapshotPageResponse> {
+        let header = GetCvMetadataSnapshotPageRequest {
+            page_token,
+            page_size,
+        };
+        self.rpc(RpcCode::GetCvMetadataSnapshotPage, header).await
+    }
+
+    pub async fn get_cv_metadata_delta_page(
+        &self,
+        from_epoch: u64,
+        target_epoch: Option<u64>,
+        page_token: Option<String>,
+        page_size: Option<u32>,
+    ) -> FsResult<GetCvMetadataDeltaPageResponse> {
+        let header = GetCvMetadataDeltaPageRequest {
+            from_epoch,
+            target_epoch,
+            page_token,
+            page_size,
+        };
+        self.rpc(RpcCode::GetCvMetadataDeltaPage, header).await
     }
 
     pub async fn get_master_info(&self) -> FsResult<MasterInfo> {

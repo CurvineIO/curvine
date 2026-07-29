@@ -14,14 +14,9 @@
 
 #![allow(unused, clippy::should_implement_trait)]
 
-use crate::handler::RpcFrame;
-use crate::io::{IOResult, LocalFile};
-use crate::sys;
 use crate::sys::DataSlice::{Buffer, Bytes, Empty, IOSlice, MemSlice};
 use crate::sys::{RawIO, RawIOSlice, RawVec};
-use crate::CommonResult;
 use bytes::{Buf, Bytes as TBytes, BytesMut};
-use std::fs::File;
 
 /// A data fragment, which represents a portion of the data on top of an IO stream.
 /// In many cases, in order to reduce memory copying, data reading and writing will not occur when creating data fragments.
@@ -79,60 +74,6 @@ impl DataSlice {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    // Create a network data fragment.
-    pub async fn from_frame(frame: &mut RpcFrame, enable_splice: bool, len: i32) -> IOResult<Self> {
-        if len <= 0 {
-            return Ok(Empty);
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            let buf = frame.read_full(len).await?;
-            Ok(Buffer(buf))
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            if enable_splice {
-                let fd = sys::get_raw_io(frame)?;
-                Ok(IOSlice(RawIOSlice::new(fd, None, len as usize)))
-            } else {
-                let buf = frame.read_full(len).await?;
-                Ok(Buffer(buf))
-            }
-        }
-    }
-
-    // Create a file data fragment.
-    // Usually created in business threads, it is a synchronization function.
-    pub fn from_file(
-        file: &mut LocalFile,
-        enable_send_file: bool,
-        off: Option<i64>,
-        len: i32,
-    ) -> CommonResult<Self> {
-        if len <= 0 {
-            return Ok(Empty);
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            let buf = file.read_full(off, len as usize)?;
-            Ok(Buffer(buf))
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            if enable_send_file {
-                let fd = sys::get_raw_io(file)?;
-                Ok(IOSlice(RawIOSlice::new(fd, off, len as usize)))
-            } else {
-                let buf = file.read_full(off, len as usize)?;
-                Ok(Buffer(buf))
-            }
-        }
     }
 
     pub fn to_error_msg(&self) -> String {

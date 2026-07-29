@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::io::IOResult;
 use crate::sys;
-use crate::sys::RawIO;
+use crate::sys::{RawIO, SysResult};
 
 #[cfg(target_os = "linux")]
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -40,7 +39,7 @@ impl OwnedFd {
         BorrowedFd::new(self.0)
     }
 
-    pub fn set_blocking(&self, blocking: bool) -> IOResult<()> {
+    pub fn set_blocking(&self, blocking: bool) -> SysResult<()> {
         sys::set_pipe_blocking(self.0, blocking)
     }
 }

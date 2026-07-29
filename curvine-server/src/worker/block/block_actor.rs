@@ -51,6 +51,7 @@ impl BlockActor {
         rt: Arc<Runtime>,
         conf: &ClusterConf,
         worker_addr: WorkerAddress,
+        worker_session_id: String,
         store: BlockStore,
         worker_ctl: StateCtl,
     ) -> CommonResult<BlockActor> {
@@ -62,6 +63,7 @@ impl BlockActor {
             store.worker_id()?,
             worker_addr,
             conf.worker.weight,
+            worker_session_id,
         );
         let executor = GroupExecutor::new(
             "worker-block-executor",

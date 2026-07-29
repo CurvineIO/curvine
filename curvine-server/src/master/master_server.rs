@@ -23,7 +23,7 @@ use log::error;
 use orpc::common::{LocalTime, Logger};
 use orpc::handler::{HandlerService, LimitConf};
 use orpc::io::net::ConnState;
-use orpc::runtime::{AsyncRuntime, RpcRuntime, Runtime};
+use orpc::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime, Runtime};
 use orpc::server::{RpcServer, ServerStateListener};
 use orpc::{err_box, CommonError, CommonResult};
 
@@ -46,6 +46,7 @@ pub struct MasterService {
     job_manager: Arc<JobManager>,
     rt: Arc<Runtime>,
     actor_rt: Arc<Runtime>,
+    control_rpc_executor: Arc<GroupExecutor>,
     replication_manager: Arc<MasterReplicationManager>,
     limit: LimitConf,
     metrics: &'static MasterMetrics,
@@ -70,6 +71,7 @@ impl MasterService {
             1,
             conf.master.actor_threads,
         ));
+        let control_rpc_executor = Arc::new(GroupExecutor::new("master-control-rpc", 2, 1024));
         let limit = LimitConf::new(conf.master.conn_limit, conf.master.global_limit);
         Self {
             conf,
@@ -79,6 +81,7 @@ impl MasterService {
             job_manager,
             rt,
             actor_rt,
+            control_rpc_executor,
             replication_manager,
             limit,
             metrics,
@@ -118,6 +121,7 @@ impl HandlerService for MasterService {
             client_state,
             self.mount_manager.clone(),
             JobHandler::new(self.job_manager.clone()),
+            self.control_rpc_executor.clone(),
             self.replication_manager.clone(),
             self.actor_rt.clone(),
             self.metrics,

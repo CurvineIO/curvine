@@ -293,7 +293,13 @@ impl InodeStore {
             }
         }
 
-        batch.commit()
+        batch.commit()?;
+
+        // Refresh TTL index in case set_attr_opts changed ttl_ms/ttl_action or
+        // file.complete() advanced mtime (TTL expiration = mtime + ttl_ms).
+        self.ttl_bucket_list.add(file);
+
+        Ok(())
     }
 
     pub fn apply_overwrite_file(&self, file: &InodeView) -> CommonResult<()> {

@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::client::ClientConf;
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -86,14 +85,6 @@ impl TimeBondedRetryBuilder {
             min_sleep,
             max_sleep,
         }
-    }
-
-    pub fn from_conf(conf: &ClientConf) -> Self {
-        Self::new(
-            Duration::from_millis(conf.io_retry_max_duration_ms),
-            Duration::from_millis(conf.io_retry_min_sleep_ms),
-            Duration::from_millis(conf.io_retry_max_sleep_ms),
-        )
     }
 
     pub fn build(&self) -> TimeBondedRetry {

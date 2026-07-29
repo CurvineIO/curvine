@@ -20,7 +20,7 @@ use curvine_client::unified::UnifiedWriter;
 use curvine_common::conf::FuseConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Writer};
-use curvine_common::state::{FileAllocOpts, FileStatus};
+use curvine_common::state::{FileAllocOpts, FileStatus, SetAttrOpts};
 use curvine_common::FsResult;
 use log::{error, warn};
 use orpc::common::LocalTime;
@@ -33,7 +33,11 @@ use std::sync::Arc;
 enum WriteTask {
     Write(i64, Bytes, Option<FuseResponse>),
     Flush(CallSender<FsResult<()>>, Option<FuseResponse>),
-    Complete(CallSender<FsResult<()>>, Option<FuseResponse>),
+    Complete(
+        CallSender<FsResult<()>>,
+        Option<FuseResponse>,
+        Option<SetAttrOpts>,
+    ),
     Resize(CallSender<FsResult<()>>, FileAllocOpts),
 }
 
@@ -175,9 +179,17 @@ impl FuseWriter {
     }
 
     pub async fn complete(&self, reply: Option<FuseResponse>) -> FsResult<()> {
+        self.complete_with_attr(reply, None).await
+    }
+
+    pub async fn complete_with_attr(
+        &self,
+        reply: Option<FuseResponse>,
+        set_attr_opts: Option<SetAttrOpts>,
+    ) -> FsResult<()> {
         let fun = async {
             let (rx, tx) = CallChannel::channel();
-            self.send_queued_task(WriteTask::Complete(rx, reply))
+            self.send_queued_task(WriteTask::Complete(rx, reply, set_attr_opts))
                 .await?;
             // Double `?`: the outer unwraps the channel receive, the inner
             // propagates the real backend complete result.
@@ -249,7 +261,7 @@ impl FuseWriter {
 
         // Abort only before any durability boundary may have published the data.
         let cleanup_result = if preserve_on_exit {
-            writer.complete().await
+            writer.complete_with_attr(None).await
         } else {
             writer.cancel().await
         };
@@ -342,9 +354,9 @@ impl FuseWriter {
                     crate::fs::deliver_stream_result(res, tx, reply).await?;
                 }
 
-                WriteTask::Complete(tx, reply) => {
+                WriteTask::Complete(tx, reply, opts) => {
                     *preserve_on_exit = true;
-                    let res = writer.complete().await;
+                    let res = writer.complete_with_attr(opts).await;
                     *completed = res.is_ok();
                     crate::fs::deliver_stream_result(res, tx, reply).await?;
                 }
@@ -494,7 +506,7 @@ mod tests {
         let (result_tx, result_rx) = CallChannel::channel::<FsResult<()>>();
         sender
             .send(QueuedWriteTask {
-                task: WriteTask::Complete(result_tx, None),
+                task: WriteTask::Complete(result_tx, None, None),
                 queue_guard: None,
             })
             .await
