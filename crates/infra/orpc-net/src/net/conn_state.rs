@@ -12,17 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use curvine_io::{
-    BlockDevice, BlockIO, CacheManager, DataSlice, IOError, IOResult, LocalFile, ReadAheadTask,
-};
+use crate::net::InetAddr;
 
-pub mod net {
-    pub use orpc_net::net::*;
+#[derive(Debug, Clone, Default)]
+pub struct ConnState {
+    pub remote_addr: InetAddr,
+    pub local_addr: InetAddr,
 }
 
-pub mod retry {
-    pub use orpc_net::retry::*;
+impl ConnState {
+    pub fn new(remote_addr: InetAddr, local_addr: InetAddr) -> Self {
+        Self {
+            remote_addr,
+            local_addr,
+        }
+    }
 }
-
-pub mod spdk_conf;
-pub use self::spdk_conf::{BdevInfo, NvmeTarget, SpdkConf};
