@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::fs::Path;
-use crate::state::{FileAllocOpts, FileStatus};
+use crate::state::{FileAllocOpts, FileStatus, SetAttrOpts};
 use crate::FsResult;
 use bytes::{BufMut, BytesMut};
 use orpc::err_box;
@@ -103,6 +103,16 @@ pub trait Writer {
     fn flush(&mut self) -> impl Future<Output = FsResult<()>>;
 
     fn complete(&mut self) -> impl Future<Output = FsResult<()>>;
+
+    fn complete_with_attr(
+        &mut self,
+        opts: Option<SetAttrOpts>,
+    ) -> impl Future<Output = FsResult<()>> {
+        async move {
+            let _ = &opts;
+            self.complete().await
+        }
+    }
 
     fn cancel(&mut self) -> impl Future<Output = FsResult<()>>;
 

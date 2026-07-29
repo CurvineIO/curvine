@@ -607,6 +607,7 @@ impl MasterFilesystem {
         Ok(located)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn complete_file<T: AsRef<str>>(
         &self,
         path: T,
@@ -615,6 +616,7 @@ impl MasterFilesystem {
         commit_blocks: Vec<CommitBlock>,
         client_name: T,
         only_flush: bool,
+        set_attr_opts: Option<SetAttrOpts>,
     ) -> FsResult<Option<FileBlocks>> {
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
@@ -626,6 +628,7 @@ impl MasterFilesystem {
             commit_blocks,
             client_name,
             only_flush,
+            set_attr_opts,
         )?;
 
         if only_flush {

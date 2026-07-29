@@ -16,7 +16,7 @@ use crate::file::{FsContext, FsWriterBase, FsWriterBuffer};
 use bytes::BytesMut;
 use curvine_error::FsResult;
 use curvine_fs_api::{Path, Writer};
-use curvine_model::{FileAllocOpts, FileBlocks, FileStatus};
+use curvine_model::{FileAllocOpts, FileBlocks, FileStatus, SetAttrOpts};
 use log::debug;
 use orpc::common::ByteUnit;
 use orpc::sys::DataSlice;
@@ -119,6 +119,11 @@ impl Writer for FsWriter {
         self.flush_chunk().await?;
         // The flush operation will be automatically called internally, so flush is not needed here.
         self.inner.complete().await
+    }
+
+    async fn complete_with_attr(&mut self, opts: Option<SetAttrOpts>) -> FsResult<()> {
+        self.flush_chunk().await?;
+        self.inner.complete_with_attr(opts).await
     }
 
     async fn cancel(&mut self) -> FsResult<()> {

@@ -1337,6 +1337,7 @@ fn complete_file_retry(fs: &MasterFilesystem) -> CommonResult<()> {
         vec![commit.clone()],
         &addr.client_name,
         false,
+        None,
     );
     assert!(f1.is_ok());
 
@@ -1347,6 +1348,7 @@ fn complete_file_retry(fs: &MasterFilesystem) -> CommonResult<()> {
         vec![commit.clone()],
         &addr.client_name,
         false,
+        None,
     );
     assert!(f2.is_ok());
 
@@ -1969,6 +1971,69 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
             "has_spdk should be true when any replica reports SpdkDisk"
         );
     }
+
+    Ok(())
+}
+
+#[test]
+fn complete_file_with_set_attr_applies_attributes() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "complete-with-attr");
+    let path = "/complete_with_attr.log";
+    let addr = ClientAddress::default();
+
+    // Create file and add a block
+    let _status = fs.create(path, false)?;
+    let block = fs.add_block(path, None, addr.clone(), vec![], vec![], 0, None)?;
+
+    let commit = CommitBlock {
+        block_id: block.block.id,
+        block_len: block.block.len,
+        locations: vec![BlockLocation::with_id(block.locs[0].worker_id)],
+    };
+
+    // Complete the file with SetAttrOpts — owner, group, mode, mtime, xattr
+    let custom_mtime: i64 = 1_000_000;
+    let opts = SetAttrOptsBuilder::new()
+        .owner("alice")
+        .group("dev")
+        .mode(0o644)
+        .mtime(custom_mtime)
+        .add_x_attr("user.tag".to_string(), b"v1".to_vec())
+        .build();
+
+    fs.complete_file(
+        path,
+        None,
+        block.block.len,
+        vec![commit],
+        &addr.client_name,
+        false,
+        Some(opts),
+    )?;
+
+    // Verify the attributes were applied
+    let result = fs.file_status(path)?;
+    assert!(result.is_complete, "file should be complete");
+    assert_eq!(
+        result.owner, "alice",
+        "owner should be set by complete_file"
+    );
+    assert_eq!(result.group, "dev", "group should be set by complete_file");
+    assert_eq!(
+        result.mode & 0o777,
+        0o644,
+        "mode should be set by complete_file"
+    );
+    assert_eq!(
+        result.mtime, custom_mtime,
+        "mtime should be overridden by set_attr_opts"
+    );
+    assert_eq!(
+        result.x_attr.get("user.tag"),
+        Some(&b"v1".to_vec()),
+        "xattr should be set by complete_file"
+    );
 
     Ok(())
 }

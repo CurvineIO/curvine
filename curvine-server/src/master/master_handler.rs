@@ -330,6 +330,7 @@ impl MasterHandler {
             commit_blocks,
             req.client_name,
             req.only_flush,
+            req.set_attr_opts.map(ProtoUtils::set_attr_opts_from_pb),
         )?;
         let rep_header = CompleteFileResponse {
             result: true,
@@ -409,6 +410,7 @@ impl MasterHandler {
                     commit_blocks,
                     req.client_name,
                     req.only_flush,
+                    req.set_attr_opts.map(ProtoUtils::set_attr_opts_from_pb),
                 )
                 .is_ok();
             results.push(result);
