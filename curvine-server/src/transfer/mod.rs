@@ -37,6 +37,15 @@ pub use self::service::{progress_to_proto, TransferService};
 mod scheduler;
 pub use self::scheduler::TransferScheduler;
 
+mod handler;
+pub use self::handler::TransferHandler;
+
+mod router_handler;
+pub use self::router_handler::TransferRouterHandler;
+
+mod transfer_server;
+pub use self::transfer_server::TransferServer;
+
 pub(crate) fn transfer_failure_message(
     kind: curvine_common::state::TransferKind,
     source_path: &str,
