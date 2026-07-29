@@ -22,18 +22,10 @@ pub mod macros;
 pub mod message;
 pub mod server;
 pub mod sys {
+    pub use curvine_io::{CacheManager, DataSlice, ReadAheadTask};
     pub use curvine_sys::*;
 }
 pub mod test;
 
 pub use orpc_error::{CommonError, CommonResult, CommonResultExt};
 pub use orpc_runtime::{common, runtime, sync};
-
-// Kept in `orpc` (not next to `CommonErrorExt` in `orpc-error`): orphan rules
-// require a local uncovered type argument (`IOError`) to implement `From` for
-// the foreign `CommonErrorExt` type after the crate split.
-impl From<crate::io::IOError> for crate::error::CommonErrorExt {
-    fn from(value: crate::io::IOError) -> Self {
-        Self::from(CommonError::from(value))
-    }
-}

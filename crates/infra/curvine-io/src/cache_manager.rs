@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate as sys;
-use crate::{CInt, SysResult};
+use curvine_sys::{self, CInt, SysResult};
 use std::fs::File;
 
 const LONG_READ_THRESHOLD_LEN: i64 = 256 * 1024;
@@ -125,7 +124,7 @@ impl CacheManager {
                 None
             } else {
                 let handle = if is_sequential {
-                    sys::read_ahead(file, cur_pos, len)
+                    curvine_sys::read_ahead(file, cur_pos, len)
                 } else {
                     Ok(0)
                 };

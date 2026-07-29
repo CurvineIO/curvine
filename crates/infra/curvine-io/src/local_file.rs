@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::io::IOResult;
-use crate::sys::{self, CacheManager, DataSlice, RawIOSlice, ReadAheadTask};
-use crate::{err_box, try_err};
+use crate::{CacheManager, DataSlice, IOError, IOResult, ReadAheadTask};
 use bytes::BytesMut;
+use curvine_sys::{self, RawIOSlice};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fmt::{Display, Formatter};
@@ -26,6 +25,31 @@ use std::path::Path;
 
 #[cfg(target_os = "linux")]
 use std::os::unix::io::{AsRawFd, RawFd};
+
+macro_rules! err_box {
+    ($e:expr) => {{
+        let message = format!(
+            "[{}] ERROR: {}({}:{})",
+            curvine_sys::thread_name(),
+            $e,
+            file!(),
+            line!()
+        );
+        Err(IOError::create(message))
+    }};
+    ($f:tt, $($arg:expr),+) => {{
+        err_box!(format!($f, $($arg),+))
+    }};
+}
+
+macro_rules! try_err {
+    ($expr:expr) => {{
+        match $expr {
+            Ok(result) => result,
+            Err(error) => return err_box!(error),
+        }
+    }};
+}
 
 pub struct LocalFile {
     inner: fs::File,
@@ -38,7 +62,7 @@ pub struct LocalFile {
 
 impl LocalFile {
     pub fn new<T: AsRef<str>>(path: T, mut inner: fs::File) -> IOResult<Self> {
-        let is_tmpfs = sys::is_tmpfs(path.as_ref())?;
+        let is_tmpfs = curvine_sys::is_tmpfs(path.as_ref())?;
 
         let len = inner.metadata()?.len() as i64;
         let pos = inner.stream_position()? as i64;
@@ -116,7 +140,7 @@ impl LocalFile {
         #[cfg(target_os = "linux")]
         let region = if enable_send_file {
             DataSlice::IOSlice(RawIOSlice::new(
-                sys::get_raw_io(self)?,
+                curvine_sys::get_raw_io(self)?,
                 Some(self.pos),
                 chunk as usize,
             ))
@@ -275,9 +299,9 @@ impl LocalFile {
 
     pub fn resize(&mut self, truncate: bool, off: i64, len: i64, mode: i32) -> IOResult<()> {
         if truncate {
-            sys::ftruncate(&self.inner, len)?;
+            curvine_sys::ftruncate(&self.inner, len)?;
         } else {
-            sys::fallocate(&self.inner, off, len, mode)?;
+            curvine_sys::fallocate(&self.inner, off, len, mode)?;
         }
 
         self.len = self.inner.metadata()?.len() as i64;
@@ -286,7 +310,7 @@ impl LocalFile {
 
     pub fn actual_size(&self) -> IOResult<u64> {
         let meta = self.inner.metadata()?;
-        sys::file_actual_size(meta).map_err(Into::into)
+        curvine_sys::file_actual_size(meta).map_err(Into::into)
     }
 
     pub fn metadata(&self) -> IOResult<Metadata> {

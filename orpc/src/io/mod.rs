@@ -12,19 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub use curvine_io::{
+    BlockDevice, BlockIO, CacheManager, DataSlice, IOError, IOResult, LocalFile, ReadAheadTask,
+};
+
 pub mod net;
 pub mod retry;
-
-mod local_file;
-pub use self::local_file::LocalFile;
-
-pub mod io_error;
-pub use self::io_error::IOError;
-
-pub type IOResult<T> = Result<T, IOError>;
-
-pub mod block_io;
-pub use self::block_io::{BlockDevice, BlockIO};
 
 pub mod spdk_conf;
 pub use self::spdk_conf::{BdevInfo, NvmeTarget, SpdkConf};

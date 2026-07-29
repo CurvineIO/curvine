@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::{ErrorExt, ErrorImpl};
-use crate::CommonError;
 use bytes::BytesMut;
+use orpc_error::{CommonError, CommonErrorExt, ErrorExt, ErrorImpl};
 use std::error::Error;
 use std::ffi::NulError;
 use std::io;
@@ -142,6 +141,12 @@ impl From<String> for IOError {
 impl From<CommonError> for IOError {
     fn from(value: CommonError) -> Self {
         Self::create(value)
+    }
+}
+
+impl From<IOError> for CommonErrorExt {
+    fn from(value: IOError) -> Self {
+        Self::from(CommonError::from(value))
     }
 }
 

@@ -8,6 +8,7 @@ description = "High-performance network communication framework."
 
 
 [dependencies]
+curvine-io = { workspace = true }
 curvine-sys = { workspace = true }
 orpc-error = { workspace = true }
 orpc-runtime = { workspace = true }

@@ -15,8 +15,8 @@
 #![allow(unused, clippy::should_implement_trait)]
 
 use crate::DataSlice::{Buffer, Bytes, Empty, IOSlice, MemSlice};
-use crate::{RawIO, RawIOSlice, RawVec};
 use bytes::{Buf, Bytes as TBytes, BytesMut};
+use curvine_sys::{RawIO, RawIOSlice, RawVec};
 
 /// A data fragment, which represents a portion of the data on top of an IO stream.
 /// In many cases, in order to reduce memory copying, data reading and writing will not occur when creating data fragments.
@@ -159,9 +159,9 @@ impl DataSlice {
 
     pub fn as_ptr(&self) -> *const u8 {
         match self {
-            Empty => std::ptr::null() as *const _,
+            Empty => std::ptr::null(),
             Buffer(s) => s.as_ptr(),
-            IOSlice(s) => panic!("Not support IOSlice"),
+            IOSlice(_) => panic!("Not support IOSlice"),
             MemSlice(s) => s.as_ptr(),
             Bytes(s) => s.as_ptr(),
         }

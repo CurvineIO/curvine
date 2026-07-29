@@ -2264,6 +2264,16 @@ dependencies = [
 [[package]]
 name = "curvine-io"
 version = "0.2.0"
+dependencies = [
+ "bytes",
+ "curvine-sys",
+ "orpc-error",
+ "orpc-runtime",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+]
 
 [[package]]
 name = "curvine-job-client"
@@ -6692,6 +6702,7 @@ dependencies = [
  "chrono",
  "crc32fast",
  "crossbeam",
+ "curvine-io",
  "curvine-sys",
  "dashmap 5.5.3",
  "fs2",
