@@ -29,3 +29,6 @@ pub use self::job_snapshot::job_mount_snapshot;
 
 mod planner;
 pub use self::planner::{PlannedTransfer, TransferPlanner};
+
+mod service;
+pub use self::service::TransferService;
