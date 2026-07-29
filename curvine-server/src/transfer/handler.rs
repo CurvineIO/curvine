@@ -25,7 +25,7 @@ use curvine_common::FsResult;
 use orpc::handler::MessageHandler;
 use orpc::message::{Builder, Message};
 
-use crate::transfer::{progress_to_proto, TransferService, TransferStore};
+use crate::transfer::{progress_to_proto, task_summary_to_proto, TransferService, TransferStore};
 
 pub struct TransferHandler<S> {
     service: TransferService<S>,
@@ -52,7 +52,7 @@ where
 
     fn get_transfer_status(&self, msg: &Message) -> FsResult<Message> {
         let req: GetTransferStatusRequest = msg.parse_header()?;
-        let (job, tasks, next_page_token) =
+        let (job, task_summary, tasks, next_page_token) =
             self.service
                 .get_transfer_status(&req.job_id, req.page_size, req.page_token)?;
         let response = GetTransferStatusResponse {
@@ -73,6 +73,7 @@ where
             lease_epoch: Some(job.lease_epoch),
             lease_expire_at: Some(job.lease_expire_at),
             cv_metadata_epoch: job.cv_metadata_epoch,
+            task_summary: Some(task_summary_to_proto(task_summary)),
         };
         Ok(Builder::success(msg).proto_header(response).build())
     }
@@ -102,7 +103,7 @@ where
 
     fn watch_transfer(&self, msg: &Message) -> FsResult<Message> {
         let req: WatchTransferRequest = msg.parse_header()?;
-        let (job, tasks, next_page_token, changed) = self.service.watch_transfer(
+        let (job, task_summary, tasks, next_page_token, changed) = self.service.watch_transfer(
             &req.job_id,
             req.since_updated_at,
             req.page_size,
@@ -124,6 +125,7 @@ where
             lease_epoch: Some(job.lease_epoch),
             lease_expire_at: Some(job.lease_expire_at),
             cv_metadata_epoch: job.cv_metadata_epoch,
+            task_summary: Some(task_summary_to_proto(task_summary)),
         };
         Ok(Builder::success(msg).proto_header(response).build())
     }

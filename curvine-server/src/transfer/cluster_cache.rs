@@ -74,7 +74,7 @@ impl ClusterMetadataCache {
         let snapshot = self.snapshot();
         if snapshot.updated_at <= 0 {
             return Err(FsError::common(
-                "Transfer cluster metadata is unavailable; retry shortly",
+                "Cluster metadata is unavailable; retry shortly",
             ));
         }
         self.check_snapshot_fresh(&snapshot)
@@ -158,15 +158,13 @@ impl ClusterMetadataCache {
     ) -> FsResult<MountSnapshot> {
         let snapshot = self.snapshot();
         if snapshot.mounts.is_empty() {
-            return Err(FsError::common(
-                "Transfer cluster mount snapshot is unavailable; retry shortly",
-            ));
+            return Err(FsError::common("Cluster mount snapshot is unavailable"));
         }
         self.check_snapshot_fresh(&snapshot)?;
         self.matching_mount_snapshot(kind, source, target, &snapshot)
             .ok_or_else(|| {
                 FsError::common(format!(
-                    "No mount can serve {:?} from {} to {}",
+                    "No mount found for {:?}: {} -> {}",
                     kind,
                     source.full_path(),
                     target.full_path()
@@ -206,14 +204,14 @@ impl ClusterMetadataCache {
         snapshot: &ClusterSnapshot,
     ) -> Option<MountSnapshot> {
         let source_text = if source.is_cv() {
-            source.path().to_string()
+            source.path()
         } else {
-            source.full_path().to_string()
+            source.full_path()
         };
         let target_text = if target.is_cv() {
-            target.path().to_string()
+            target.path()
         } else {
-            target.full_path().to_string()
+            target.full_path()
         };
 
         snapshot
@@ -221,12 +219,12 @@ impl ClusterMetadataCache {
             .iter()
             .find(|mount| match kind {
                 TransferKind::Load => {
-                    source_text.starts_with(&mount.ufs_path)
-                        && target_text.starts_with(&mount.cv_path)
+                    Path::has_prefix(source_text, &mount.ufs_path)
+                        && Path::has_prefix(target_text, &mount.cv_path)
                 }
                 TransferKind::Export => {
-                    source_text.starts_with(&mount.cv_path)
-                        && target_text.starts_with(&mount.ufs_path)
+                    Path::has_prefix(source_text, &mount.cv_path)
+                        && Path::has_prefix(target_text, &mount.ufs_path)
                 }
             })
             .cloned()
@@ -296,7 +294,7 @@ impl ClusterMetadataCache {
         let staleness_ms = (LocalTime::mills() as i64).saturating_sub(updated_at);
         if staleness_ms > max_staleness_ms {
             return Err(FsError::common(
-                "Transfer cluster metadata is stale; retry shortly",
+                "Cluster metadata snapshot is stale; retry shortly",
             ));
         }
         Ok(())

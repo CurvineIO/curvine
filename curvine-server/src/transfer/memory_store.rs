@@ -16,14 +16,17 @@ use std::collections::HashMap;
 
 use curvine_common::error::FsError;
 use curvine_common::state::{
-    summarize_transfer_tasks, StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease,
-    TransferListFilter, TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport,
-    TransferTaskState, TransferTenantSummary,
+    StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease, TransferListFilter,
+    TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTaskState,
+    TransferTenantSummary,
 };
 use curvine_common::FsResult;
 use parking_lot::Mutex;
 
-use crate::transfer::{TransferRequeueUpdate, TransferStore};
+use crate::transfer::{
+    apply_task_report_progress, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
+    TransferTaskStateUpdate,
+};
 
 #[derive(Default)]
 pub struct MemoryTransferStore {
@@ -359,6 +362,7 @@ impl TransferStore for MemoryTransferStore {
         if job.run_id != run_id
             || job.owner != owner
             || job.lease_epoch != lease_epoch
+            || job.lease_expire_at <= now_ms
             || job.state.is_terminal()
         {
             return Ok(false);
@@ -377,6 +381,7 @@ impl TransferStore for MemoryTransferStore {
         if job.run_id != update.run_id
             || job.owner != update.owner
             || job.lease_epoch != update.lease_epoch
+            || job.lease_expire_at <= update.now_ms
             || !update.from_states.contains(&job.state)
         {
             return Ok(false);
@@ -388,29 +393,6 @@ impl TransferStore for MemoryTransferStore {
         Ok(true)
     }
 
-    fn set_transfer_state(
-        &self,
-        job_id: &str,
-        run_id: u64,
-        state: TransferState,
-        message: impl Into<String>,
-        now_ms: i64,
-    ) -> FsResult<bool> {
-        let mut inner = self.inner.lock();
-        let Some(job) = inner.jobs.get_mut(job_id) else {
-            return Ok(false);
-        };
-        if job.run_id != run_id {
-            return Ok(false);
-        }
-
-        job.state = state;
-        job.summary.message = message.into();
-        job.summary.update_time = now_ms;
-        job.updated_at = now_ms;
-        Ok(true)
-    }
-
     fn requeue_transfer(&self, update: TransferRequeueUpdate) -> FsResult<bool> {
         let mut inner = self.inner.lock();
         let Some(job) = inner.jobs.get_mut(&update.job_id) else {
@@ -419,6 +401,7 @@ impl TransferStore for MemoryTransferStore {
         if job.run_id != update.run_id
             || job.owner != update.owner
             || job.lease_epoch != update.lease_epoch
+            || job.lease_expire_at <= update.now_ms
             || job.state != TransferState::Planning
         {
             return Ok(false);
@@ -449,6 +432,7 @@ impl TransferStore for MemoryTransferStore {
         if job.run_id != run_id
             || job.owner != owner
             || job.lease_epoch != lease_epoch
+            || job.lease_expire_at <= now_ms
             || job.state.is_terminal()
         {
             return Ok(false);
@@ -474,25 +458,58 @@ impl TransferStore for MemoryTransferStore {
         Ok(())
     }
 
-    fn update_task_state(
-        &self,
-        job_id: &str,
-        run_id: u64,
-        task_id: &str,
-        state: TransferTaskState,
-        message: impl Into<String>,
-        now_ms: i64,
-    ) -> FsResult<bool> {
+    fn persist_planned_tasks(&self, update: TransferPlannedTasks) -> FsResult<bool> {
         let mut inner = self.inner.lock();
-        let key = (job_id.to_string(), run_id, task_id.to_string());
+        let valid_owner = inner.jobs.get(&update.job_id).is_some_and(|job| {
+            job.run_id == update.run_id
+                && job.owner == update.owner
+                && job.lease_epoch == update.lease_epoch
+                && job.lease_expire_at > update.now_ms
+                && job.state == TransferState::Planning
+        });
+        if !valid_owner {
+            return Ok(false);
+        }
+        for task in update.tasks {
+            let key = (task.job_id.clone(), task.run_id, task.task_id.clone());
+            inner.tasks.entry(key).or_insert(task);
+        }
+        let job = inner
+            .jobs
+            .get_mut(&update.job_id)
+            .ok_or_else(|| FsError::job_not_found(&update.job_id))?;
+        job.state = TransferState::Dispatching;
+        job.summary.message = update.message;
+        job.summary.update_time = update.now_ms;
+        job.updated_at = update.now_ms;
+        Ok(true)
+    }
+
+    fn update_task_state(&self, update: TransferTaskStateUpdate) -> FsResult<bool> {
+        let mut inner = self.inner.lock();
+        let Some(job) = inner.jobs.get(&update.job_id) else {
+            return Ok(false);
+        };
+        if job.run_id != update.run_id
+            || job.owner != update.owner
+            || job.lease_epoch != update.lease_epoch
+            || job.lease_expire_at <= update.now_ms
+            || job.state.is_terminal()
+        {
+            return Ok(false);
+        }
+        let key = (update.job_id, update.run_id, update.task_id);
         let Some(task) = inner.tasks.get_mut(&key) else {
             return Ok(false);
         };
+        if !update.from_states.is_empty() && !update.from_states.contains(&task.state) {
+            return Ok(false);
+        }
 
-        task.state = state;
-        task.progress.message = message.into();
-        task.progress.update_time = now_ms;
-        task.updated_at = now_ms;
+        task.state = update.state;
+        task.progress.message = update.message;
+        task.progress.update_time = update.now_ms;
+        task.updated_at = update.now_ms;
         Ok(true)
     }
 
@@ -529,7 +546,11 @@ impl TransferStore for MemoryTransferStore {
         let Some(job) = inner.jobs.get(job_id) else {
             return Ok(Vec::new());
         };
-        if job.run_id != run_id || job.owner != owner || job.lease_epoch != lease_epoch {
+        if job.run_id != run_id
+            || job.owner != owner
+            || job.lease_epoch != lease_epoch
+            || job.lease_expire_at <= now_ms
+        {
             return Ok(Vec::new());
         }
 
@@ -553,10 +574,12 @@ impl TransferStore for MemoryTransferStore {
         Ok(stale)
     }
 
-    fn list_recoverable_tasks(
+    fn list_stale_running_tasks(
         &self,
         job_id: &str,
         run_id: u64,
+        stale_before_ms: i64,
+        limit: usize,
     ) -> FsResult<Vec<TransferTaskRecord>> {
         Ok(self
             .inner
@@ -566,15 +589,33 @@ impl TransferStore for MemoryTransferStore {
             .filter(|task| {
                 task.job_id == job_id
                     && task.run_id == run_id
-                    && matches!(
-                        task.state,
-                        TransferTaskState::Pending
-                            | TransferTaskState::Running
-                            | TransferTaskState::Stale
-                    )
+                    && task.state == TransferTaskState::Running
+                    && task.stale_deadline_at < stale_before_ms
             })
+            .take(limit)
             .cloned()
             .collect())
+    }
+
+    fn has_failed_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool> {
+        Ok(self.inner.lock().tasks.values().any(|task| {
+            task.job_id == job_id
+                && task.run_id == run_id
+                && task.state == TransferTaskState::Failed
+        }))
+    }
+
+    fn has_recoverable_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool> {
+        Ok(self.inner.lock().tasks.values().any(|task| {
+            task.job_id == job_id
+                && task.run_id == run_id
+                && matches!(
+                    task.state,
+                    TransferTaskState::Pending
+                        | TransferTaskState::Running
+                        | TransferTaskState::Stale
+                )
+        }))
     }
 
     fn start_task_attempt(&self, start: TaskAttemptStart) -> FsResult<bool> {
@@ -585,6 +626,7 @@ impl TransferStore for MemoryTransferStore {
         if job.run_id != start.run_id
             || job.owner != start.owner
             || job.lease_epoch != start.lease_epoch
+            || job.lease_expire_at <= start.now_ms
             || job.cancel_requested
             || job.state.is_terminal()
         {
@@ -616,7 +658,7 @@ impl TransferStore for MemoryTransferStore {
     fn update_task_report(&self, report: TransferTaskReport) -> FsResult<bool> {
         let mut inner = self.inner.lock();
         let key = (report.job_id, report.run_id, report.task_id);
-        let (task_job_id, task_state) = {
+        let (task_job_id, previous_progress) = {
             let Some(task) = inner.tasks.get_mut(&key) else {
                 return Ok(false);
             };
@@ -628,36 +670,23 @@ impl TransferStore for MemoryTransferStore {
                 return Ok(false);
             }
 
+            let previous_progress = task.progress.clone();
             task.state = report.state;
-            task.progress = report.progress;
+            task.progress = report.progress.clone();
             task.last_report_at = report.now_ms;
             task.stale_deadline_at = report.stale_deadline_at;
             task.updated_at = report.now_ms;
-            (task.job_id.clone(), task.state)
+            (task.job_id.clone(), previous_progress)
         };
 
-        let summary = summarize_transfer_tasks(
-            inner
-                .tasks
-                .values()
-                .filter(|task| task.job_id == task_job_id && task.run_id == report.run_id),
-            report.now_ms,
-        );
-        let has_failed = summary.has_failed;
-        let all_completed = summary.all_completed;
-        let has_task = summary.has_task;
-        let progress = summary.progress;
-
         if let Some(job) = inner.jobs.get_mut(&task_job_id) {
-            job.summary = progress;
+            apply_task_report_progress(
+                &mut job.summary,
+                &previous_progress,
+                &report.progress,
+                report.now_ms,
+            );
             job.updated_at = report.now_ms;
-            if has_failed {
-                job.state = TransferState::Failed;
-            } else if has_task && all_completed {
-                job.state = TransferState::Completed;
-            } else if task_state == TransferTaskState::Completed {
-                job.state = TransferState::Running;
-            }
         }
         Ok(true)
     }
@@ -691,6 +720,9 @@ fn add_job_to_tenant_summary(
         TransferState::Completed => summary.completed = summary.completed.saturating_add(1),
         TransferState::Failed => summary.failed = summary.failed.saturating_add(1),
         TransferState::Canceled => summary.canceled = summary.canceled.saturating_add(1),
+        TransferState::PartialSuccess => {
+            summary.partial_success = summary.partial_success.saturating_add(1)
+        }
     }
 }
 

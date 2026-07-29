@@ -152,8 +152,9 @@ impl TransferPlanner {
 
             if tasks.len() > self.max_tasks_per_transfer {
                 return err_box!(
-                    "Transfer {} contains more files than the service allows; reduce the source scope",
-                    job.job_id
+                    "Transfer {} files exceeds {}",
+                    job.job_id,
+                    self.max_tasks_per_transfer
                 );
             }
         }
@@ -214,23 +215,8 @@ impl TransferPlanner {
         Ok(epoch_before != epoch_after)
     }
 
-    fn load_job_info(&self, job: &TransferJobRecord, mount: &MountInfo) -> LoadJobInfo {
-        let overwrite = transfer_command(job)
-            .map(|command| command.overwrite())
-            .unwrap_or(true);
-        LoadJobInfo {
-            job_id: job.job_id.clone(),
-            source_path: job.source_path.clone(),
-            target_path: job.target_path.clone(),
-            replicas: mount.replicas.unwrap_or(self.client_conf.replicas),
-            block_size: mount.block_size.unwrap_or(self.client_conf.block_size),
-            storage_type: mount.storage_type.unwrap_or(self.client_conf.storage_type),
-            ttl_ms: mount.ttl_ms,
-            ttl_action: mount.ttl_action,
-            mount_info: mount.clone(),
-            create_time: job.created_at,
-            overwrite: Some(overwrite),
-        }
+    pub(crate) fn load_job_info(&self, job: &TransferJobRecord, mount: &MountInfo) -> LoadJobInfo {
+        load_job_info(job, mount, &self.client_conf)
     }
 
     async fn get_status(
@@ -331,6 +317,29 @@ impl TransferPlanner {
     }
 }
 
+pub(crate) fn load_job_info(
+    job: &TransferJobRecord,
+    mount: &MountInfo,
+    client_conf: &ClientConf,
+) -> LoadJobInfo {
+    let overwrite = transfer_command(job)
+        .map(|command| command.overwrite())
+        .unwrap_or(true);
+    LoadJobInfo {
+        job_id: job.job_id.clone(),
+        source_path: job.source_path.clone(),
+        target_path: job.target_path.clone(),
+        replicas: mount.replicas.unwrap_or(client_conf.replicas),
+        block_size: mount.block_size.unwrap_or(client_conf.block_size),
+        storage_type: mount.storage_type.unwrap_or(client_conf.storage_type),
+        ttl_ms: mount.ttl_ms,
+        ttl_action: mount.ttl_action,
+        mount_info: mount.clone(),
+        create_time: job.created_at,
+        overwrite: Some(overwrite),
+    }
+}
+
 struct UfsEndpointLimiter {
     max_per_endpoint: usize,
     semaphores: Mutex<HashMap<String, Arc<Semaphore>>>,
@@ -353,12 +362,10 @@ impl UfsEndpointLimiter {
                 .or_insert_with(|| Arc::new(Semaphore::new(self.max_per_endpoint)))
                 .clone()
         };
-        semaphore.acquire_owned().await.map_err(|err| {
-            FsError::common(format!(
-                "Failed to acquire UFS endpoint planning permit: {}",
-                err
-            ))
-        })
+        semaphore
+            .acquire_owned()
+            .await
+            .map_err(|_| FsError::common("Transfer planning is stopping; retry shortly"))
     }
 }
 
