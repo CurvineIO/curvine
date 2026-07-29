@@ -14,3 +14,6 @@
 
 mod job_master_client;
 pub use self::job_master_client::JobMasterClient;
+
+mod transfer_client;
+pub use self::transfer_client::TransferClient;
