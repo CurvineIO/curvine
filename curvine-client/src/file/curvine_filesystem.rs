@@ -21,6 +21,7 @@ use curvine_common::alloc::allocator_type_name;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, FsKind, ListStream, Path, Reader, Writer};
+use curvine_common::proto::{GetCvMetadataDeltaPageResponse, GetCvMetadataSnapshotPageResponse};
 use curvine_common::state::{CommitBlock, FreeResult, ListOptions};
 use curvine_common::state::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
@@ -196,6 +197,28 @@ impl CurvineFileSystem {
 
     pub async fn list_status_bytes(&self, path: &Path) -> FsResult<BytesMut> {
         self.fs_client.list_status_bytes(path).await
+    }
+
+    pub async fn get_cv_metadata_snapshot_page(
+        &self,
+        page_token: Option<String>,
+        page_size: Option<u32>,
+    ) -> FsResult<GetCvMetadataSnapshotPageResponse> {
+        self.fs_client
+            .get_cv_metadata_snapshot_page(page_token, page_size)
+            .await
+    }
+
+    pub async fn get_cv_metadata_delta_page(
+        &self,
+        from_epoch: u64,
+        target_epoch: Option<u64>,
+        page_token: Option<String>,
+        page_size: Option<u32>,
+    ) -> FsResult<GetCvMetadataDeltaPageResponse> {
+        self.fs_client
+            .get_cv_metadata_delta_page(from_epoch, target_epoch, page_token, page_size)
+            .await
     }
 
     pub async fn list_options(&self, path: &Path, opts: ListOptions) -> FsResult<Vec<FileStatus>> {
