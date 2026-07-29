@@ -1746,9 +1746,29 @@ impl MasterFilesystem {
     }
 
     pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {
+        let path = path.as_ref();
+        if self.master_monitor.is_active() {
+            return self.set_attr_committed(path, opts);
+        }
+
         let mut fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+        let inp = Self::resolve_path(&fs_dir, path)?;
         fs_dir.set_attr(inp, opts)
+    }
+
+    fn set_attr_committed(&self, path: &str, opts: SetAttrOpts) -> FsResult<FileStatus> {
+        let (command, writer) = {
+            let fs_dir = self.fs_dir.write();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            let entry = fs_dir.prepare_set_attr_command(&inp, opts)?;
+            (
+                MetadataCommand::SetAttr(entry),
+                fs_dir.journal_writer.clone(),
+            )
+        };
+
+        writer.commit_metadata_commands(vec![command])?;
+        self.file_status(path)
     }
 
     pub fn symlink<T: AsRef<str>>(

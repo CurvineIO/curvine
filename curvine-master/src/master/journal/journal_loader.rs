@@ -708,6 +708,7 @@ impl JournalLoader {
                     .apply_entry(&JournalEntry::Rename(entry.clone()))
                     .await
             }
+            MetadataCommand::SetAttr(entry) => self.set_attr(entry),
         }
     }
 
