@@ -150,13 +150,62 @@ wait_service_ready() {
     return 1
 }
 
+read_bool() {
+    local section=$1
+    local key=$2
+    local default_value=$3
+    local conf_file="${CURVINE_CONF_FILE:-$CURVINE_HOME/conf/curvine-cluster.toml}"
+
+    if [ ! -f "$conf_file" ]; then
+        echo "$default_value"
+        return
+    fi
+
+    awk -v section="[$section]" -v key="$key" -v default_value="$default_value" '
+        /^[[:space:]]*\[/ {
+            line = $0
+            sub(/[[:space:]]*#.*/, "", line)
+            gsub(/[[:space:]]/, "", line)
+            in_section = (line == section)
+        }
+        in_section {
+            line = $0
+            sub(/[[:space:]]*#.*/, "", line)
+            gsub(/[[:space:]]/, "", line)
+            if (line ~ "^" key "=") {
+                sub(/^[^=]*=/, "", line)
+                print line
+                found = 1
+                exit
+            }
+        }
+        END {
+            if (!found) {
+                print default_value
+            }
+        }
+    ' "$conf_file"
+}
+
+transfer_enabled() {
+    [ "$(read_bool "transfer" "enabled" "false")" = "true" ]
+}
+
+active_services() {
+    local services=("${SERVICES[@]}")
+    if transfer_enabled || [ -f "$CURVINE_HOME/transfer.pid" ]; then
+        services+=("transfer")
+    fi
+    echo "${services[@]}"
+}
+
 # Start all services
 start_all() {
     print_info "Starting Curvine local cluster..."
     
     # Check if there is already a service running
     local running=false
-    for service in "${SERVICES[@]}"; do
+    for service in $(active_services); do
         if [ -f "$CURVINE_HOME/${service}.pid" ]; then
             local pid=$(cat "$CURVINE_HOME/${service}.pid")
             if kill -0 "$pid" > /dev/null 2>&1; then
@@ -173,6 +222,7 @@ start_all() {
     
     local master_port=$(read_rpc_port "master" 8995)
     local worker_port=$(read_rpc_port "worker" 8997)
+    local transfer_port=$(read_rpc_port "transfer" 9010)
 
     print_info "Starting master..."
     "$BIN_DIR/curvine-master.sh" start
@@ -181,6 +231,12 @@ start_all() {
     print_info "Starting worker..."
     "$BIN_DIR/curvine-worker.sh" start
     wait_service_ready "worker" "$worker_port" 60 || return 1
+
+    if transfer_enabled; then
+        print_info "Starting transfer..."
+        "$BIN_DIR/curvine-transfer.sh" start
+        wait_service_ready "transfer" "$transfer_port" 60 || return 1
+    fi
     
     print_info "All services started. Use 'status' to check cluster status."
 }
@@ -190,8 +246,9 @@ stop_all() {
     print_info "Stopping Curvine local cluster..."
     
     # Stop service in reverse order
-    for (( idx=${#SERVICES[@]}-1 ; idx>=0 ; idx--)) ; do
-        service="${SERVICES[idx]}"
+    local services=($(active_services))
+    for (( idx=${#services[@]}-1 ; idx>=0 ; idx--)) ; do
+        service="${services[idx]}"
         print_info "Stopping $service..."
         "$BIN_DIR/curvine-${service}.sh" stop
         sleep 1
@@ -199,7 +256,7 @@ stop_all() {
     
     # Check if any service is still running
     local still_running=false
-    for service in "${SERVICES[@]}"; do
+    for service in "${services[@]}"; do
         if [ -f "$CURVINE_HOME/${service}.pid" ]; then
             local pid=$(cat "$CURVINE_HOME/${service}.pid")
             if kill -0 "$pid" > /dev/null 2>&1; then
@@ -212,7 +269,7 @@ stop_all() {
     if [ "$still_running" = true ] && [ "$1" = "force" ]; then
         print_warn "Force killing remaining processes..."
         pkill -9 -f "curvine"
-        for service in "${SERVICES[@]}"; do
+        for service in "${services[@]}"; do
             if [ -f "$CURVINE_HOME/${service}.pid" ]; then
                 rm -f "$CURVINE_HOME/${service}.pid"
             fi
@@ -234,9 +291,10 @@ restart_all() {
 show_status() {
     print_info "Curvine local cluster status:"
     echo "-----------------------------------"
+    local services=($(active_services))
     
     local all_running=true
-    for service in "${SERVICES[@]}"; do
+    for service in "${services[@]}"; do
         echo -n "$service: "
         if ! check_service_status "$service"; then
             all_running=false

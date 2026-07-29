@@ -74,3 +74,23 @@ services:
         condition: service_healthy
     command: ["worker", "start"]
     restart: unless-stopped
+
+  # ============================================================
+  # Curvine Transfer
+  # ============================================================
+  transfer:
+    build:
+      context: ../../..
+      dockerfile: curvine-docker/deploy/Dockerfile_rocky9
+      args:
+        BUILD_ARGS: "${BUILD_ARGS}"
+    network_mode: "host"
+    volumes:
+      - ${CURVINE_CONF_FILE:-./curvine-cluster-spdk.toml}:/app/curvine/conf/curvine-cluster.toml
+    depends_on:
+      master:
+        condition: service_started
+      worker:
+        condition: service_started
+    command: ["transfer", "start"]
+    restart: unless-stopped

@@ -62,6 +62,9 @@ subnqn = "nqn.2026-05.curvine:cnode1"
 [client]
 short_circuit = false
 
+[transfer]
+enabled = true
+
 # fuse configuration  
 [fuse]  
   
