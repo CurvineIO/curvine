@@ -162,6 +162,13 @@ impl QpairPool {
         // Fast path: check capacity, then try pool without blocking
         if self.try_reserve(key) {
             reserved = true;
+            if self.shutdown.load(Ordering::Acquire) {
+                self.release_reservation(key);
+                return err_box!(
+                    "QpairPool: shutdown in progress, acquire rejected for ctrlr {:p}",
+                    ctrlr
+                );
+            }
             let mut pool = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(stack) = pool.get_mut(&key) {
                 if let Some(qpair) = stack.pop() {
@@ -236,6 +243,13 @@ impl QpairPool {
 
         // Slot reserved (by fast path or slow path) - allocate the qpair
         drop(pool);
+        if self.shutdown.load(Ordering::Acquire) {
+            self.release_reservation(key);
+            return err_box!(
+                "QpairPool: shutdown in progress, acquire rejected for ctrlr {:p}",
+                ctrlr
+            );
+        }
         let qpair = unsafe { spdk_ffi::curvine_spdk_alloc_io_qpair(ctrlr) };
         if qpair.is_null() {
             self.release_reservation(key);
@@ -1259,6 +1273,30 @@ mod test {
             "error should mention shutdown: {}",
             msg
         );
+    }
+
+    #[test]
+    fn acquire_rejects_after_shutdown_with_capacity() {
+        let p = QpairPool::new();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+        p.register_limit(ctrlr as usize, 4);
+
+        // Shutdown — should reject even though capacity is available (active=0 < max_active=4)
+        p.drain_all();
+
+        // Fast path: try_reserve succeeds (active < max_active), but shutdown is set.
+        let result = p.acquire(ctrlr);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("shutdown"),
+            "error should mention shutdown: {}",
+            msg
+        );
+
+        // Active should be 0 (reservation was released)
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 0);
     }
 
     mod config_tests {
