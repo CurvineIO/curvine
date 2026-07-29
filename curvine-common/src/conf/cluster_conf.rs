@@ -15,7 +15,8 @@
 use crate::alloc::allocator_type_name;
 use crate::conf::CliConf;
 use crate::conf::{
-    ClientConf, FaultHttpConfig, FuseConf, JobConf, JournalConf, MasterConf, WorkerConf,
+    ClientConf, FaultHttpConfig, FuseConf, JobConf, JournalConf, MasterConf, TransferConf,
+    WorkerConf,
 };
 use crate::rocksdb::DBConf;
 use crate::version;
@@ -73,6 +74,8 @@ pub struct ClusterConf {
 
     pub job: JobConf,
 
+    pub transfer: TransferConf,
+
     pub cli: CliConf,
 }
 
@@ -124,7 +127,8 @@ impl ClusterConf {
             conf.master.hostname = ip.clone();
             conf.journal.hostname = ip.clone();
             conf.worker.hostname = ip.clone();
-            conf.client.hostname = ip;
+            conf.client.hostname = ip.clone();
+            conf.transfer.hostname = ip;
         } else {
             if let Ok(v) = env::var(Self::ENV_MASTER_HOSTNAME) {
                 conf.master.hostname = v.to_owned();
@@ -146,6 +150,7 @@ impl ClusterConf {
         conf.client.init()?;
         conf.fuse.init()?;
         conf.job.init()?;
+        conf.transfer.init()?;
 
         if conf.client.master_addrs.is_empty() {
             for peer in &mut conf.journal.journal_addrs {
@@ -288,6 +293,19 @@ impl ClusterConf {
         web_conf
     }
 
+    pub fn transfer_server_conf(&self) -> ServerConf {
+        self.transfer.server_conf(&self.cluster_id)
+    }
+
+    pub fn transfer_web_conf(&self) -> ServerConf {
+        let mut web_conf =
+            ServerConf::with_hostname(&self.transfer.hostname, self.transfer.web_port);
+        web_conf.name = format!("{}-transfer-web", self.cluster_id);
+        web_conf.io_threads = self.transfer.io_threads;
+        web_conf.worker_threads = self.transfer.worker_threads;
+        web_conf
+    }
+
     pub fn client_rpc_conf(&self) -> RpcConf {
         self.client.client_rpc_conf()
     }
@@ -385,6 +403,7 @@ impl Default for ClusterConf {
             client: Default::default(),
             fuse: FuseConf::default(),
             job: Default::default(),
+            transfer: Default::default(),
             cli: Default::default(),
         }
     }

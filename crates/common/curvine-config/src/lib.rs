@@ -32,6 +32,9 @@ pub use self::fuse_conf::FuseConf;
 mod job_conf;
 pub use self::job_conf::JobConf;
 
+mod transfer_conf;
+pub use self::transfer_conf::*;
+
 mod ufs_conf;
 pub use self::ufs_conf::{UfsConf, UfsConfBuilder};
 
