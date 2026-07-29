@@ -13,12 +13,11 @@
 // limitations under the License.
 
 use crate::client::{ClientConf, ClientState};
-use crate::err_box;
 use crate::handler::RpcFrame;
-use crate::io::net::InetAddr;
-use crate::io::{IOError, IOResult};
 use crate::message::Message;
+use curvine_io::{IOError, IOResult};
 use log::warn;
+use orpc_net::net::InetAddr;
 use socket2::SockRef;
 use std::time::Duration;
 use tokio::net::TcpStream;

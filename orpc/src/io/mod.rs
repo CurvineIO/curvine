@@ -13,7 +13,8 @@
 // limitations under the License.
 
 pub use curvine_io::{
-    BlockDevice, BlockIO, CacheManager, DataSlice, IOError, IOResult, LocalFile, ReadAheadTask,
+    BdevInfo, BlockDevice, BlockIO, CacheManager, DataSlice, IOError, IOResult, LocalFile,
+    NvmeTarget, ReadAheadTask, SpdkConf,
 };
 
 // `io_error` and `block_io` were public module paths before the `curvine-io`
@@ -27,6 +28,10 @@ pub mod block_io {
     pub use curvine_io::{BlockDevice, BlockIO};
 }
 
+pub mod spdk_conf {
+    pub use curvine_io::{BdevInfo, NvmeTarget, SpdkConf};
+}
+
 pub mod net {
     pub use orpc_net::net::*;
 }
@@ -34,6 +39,3 @@ pub mod net {
 pub mod retry {
     pub use orpc_net::retry::*;
 }
-
-pub mod spdk_conf;
-pub use self::spdk_conf::{BdevInfo, NvmeTarget, SpdkConf};

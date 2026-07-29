@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[macro_use]
-mod macros;
+mod server_conf;
+pub use self::server_conf::ServerConf;
 
-pub mod client;
-pub mod handler;
-pub mod message;
-pub mod server;
+mod rpc_server;
+pub use self::rpc_server::RpcServer;
 
-pub use server::ServerConf;
+mod server_monitor;
+pub use self::server_monitor::*;

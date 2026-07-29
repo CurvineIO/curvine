@@ -12,8 +12,10 @@ orpc-error = { workspace = true }
 orpc-net = { workspace = true }
 orpc-runtime = { workspace = true }
 bytes = { workspace = true }
+futures = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 prost = { workspace = true }
 num_enum = { workspace = true }
 log = { workspace = true }
+socket2 = { workspace = true }
