@@ -269,19 +269,32 @@ impl CurvineFileSystem {
         }
     }
 
+    /// Linux FUSE whole-file fcntl ranges commonly use end = OFFSET_MAX
+    /// (`i64::MAX as u64`). Master full-clear and `fs_unlock_owner` use `u64::MAX`.
+    fn is_lock_to_eof(end: u64) -> bool {
+        end == u64::MAX || end == i64::MAX as u64
+    }
+
+    fn is_full_range_unlock(lock: &FileLock) -> bool {
+        lock.lock_type == LockType::UnLock && lock.start == 0 && Self::is_lock_to_eof(lock.end)
+    }
+
     async fn fs_unlock(&self, handler: &FileHandle, flags: LockFlags) -> FuseResult<()> {
         match flags {
             LockFlags::Plock => {
                 let owners = handler.drain_plock_owners();
+                let mut result = Ok(());
                 for owner_id in owners {
-                    if let Err(e) = self.fs_unlock_owner(handler, flags, owner_id).await {
-                        // Preserve remaining owners locally when unlock fails so a
-                        // retained handle can retry the cleanup.
+                    let unlock_result = self.fs_unlock_owner(handler, flags, owner_id).await;
+                    if unlock_result.is_err() {
+                        // Preserve failed owners locally for retry, but keep
+                        // best-effort unlocking the remainder (same spirit as
+                        // release flock/plock retain_first_error handling).
                         handler.add_lock(flags, owner_id);
-                        return Err(e);
                     }
+                    Self::retain_first_error(&mut result, unlock_result);
                 }
-                Ok(())
+                result
             }
             LockFlags::Flock => {
                 if let Some(owner_id) = handler.remove_lock(flags) {
@@ -1903,10 +1916,14 @@ impl fs::FileSystem for CurvineFileSystem {
 
         self.state.fs_fsync(op.header.nodeid, None).await?;
 
-        let lock = self.to_file_lock(op.arg, op.header.pid);
+        let mut lock = self.to_file_lock(op.arg, op.header.pid);
         let (flag, owner_id) = (lock.lock_flags, lock.owner_id);
         let is_unlock = lock.lock_type == LockType::UnLock;
-        let full_range_unlock = is_unlock && lock.start == 0 && lock.end == u64::MAX;
+        let full_range_unlock = Self::is_full_range_unlock(&lock);
+        if full_range_unlock {
+            // Align OFFSET_MAX whole-file unlocks with Master full-clear / fs_unlock_owner.
+            lock.end = u64::MAX;
+        }
 
         let conflict = self.fs.set_lock(&path, lock).await?;
         if conflict.is_none() {
@@ -1940,7 +1957,12 @@ impl fs::FileSystem for CurvineFileSystem {
         let mut ticks: u64 = 0;
         let time = TimeSpent::new();
 
-        let lock = self.to_file_lock(op.arg, op.header.pid);
+        let mut lock = self.to_file_lock(op.arg, op.header.pid);
+        let is_unlock = lock.lock_type == LockType::UnLock;
+        let full_range_unlock = Self::is_full_range_unlock(&lock);
+        if full_range_unlock {
+            lock.end = u64::MAX;
+        }
         let wait_guard = PlockWaitGuard::new(
             self.plock_waits.clone(),
             LockOwner::new(lock.client_id.clone(), lock.owner_id),
@@ -1949,7 +1971,13 @@ impl fs::FileSystem for CurvineFileSystem {
             let conflict = self.fs.set_lock(&path, lock.clone()).await?;
             if conflict.is_none() {
                 wait_guard.clear_blocked_by();
-                handle.add_lock(lock.lock_flags, lock.owner_id);
+                if is_unlock {
+                    if full_range_unlock && lock.lock_flags == LockFlags::Plock {
+                        handle.take_plock_if_owner(lock.owner_id);
+                    }
+                } else {
+                    handle.add_lock(lock.lock_flags, lock.owner_id);
+                }
                 return Ok(());
             }
 
@@ -1984,6 +2012,34 @@ mod tests {
     use crate::fs::dcache::Inode;
     use crate::{FATTR_ATIME_NOW, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_UID};
     use curvine_common::state::{FileAllocMode, FileStatus, FileType, INTERNAL_CTIME_XATTR};
+
+    #[test]
+    fn full_range_unlock_accepts_kernel_offset_max_and_u64_max() {
+        use super::CurvineFileSystem;
+        use curvine_common::state::{FileLock, LockType};
+
+        assert!(CurvineFileSystem::is_lock_to_eof(u64::MAX));
+        assert!(CurvineFileSystem::is_lock_to_eof(i64::MAX as u64));
+        assert!(!CurvineFileSystem::is_lock_to_eof(i64::MAX as u64 - 1));
+
+        let mut lock = FileLock {
+            lock_type: LockType::UnLock,
+            start: 0,
+            end: i64::MAX as u64,
+            ..Default::default()
+        };
+        assert!(CurvineFileSystem::is_full_range_unlock(&lock));
+
+        lock.end = u64::MAX;
+        assert!(CurvineFileSystem::is_full_range_unlock(&lock));
+
+        lock.end = 100;
+        assert!(!CurvineFileSystem::is_full_range_unlock(&lock));
+
+        lock.end = u64::MAX;
+        lock.start = 1;
+        assert!(!CurvineFileSystem::is_full_range_unlock(&lock));
+    }
 
     #[test]
     fn userspace_open_checks_only_unambiguous_write_modes() {
