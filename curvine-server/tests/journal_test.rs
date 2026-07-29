@@ -239,7 +239,7 @@ fn replay_accepts_versioned_legacy_journal_batch() -> CommonResult<()> {
 }
 
 #[test]
-fn active_namespace_creation_replicates_without_legacy_writer_queue() -> CommonResult<()> {
+fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonResult<()> {
     Master::init_test_metrics();
 
     let port1 = NetUtils::hold_available_port();
@@ -289,6 +289,7 @@ fn active_namespace_creation_replicates_without_legacy_writer_queue() -> CommonR
 
     active.mkdir("/committed-dir", false)?;
     active.create("/committed-file", false)?;
+    active.rename("/committed-file", "/renamed-file", RenameFlags::empty())?;
     let parent_opts = MkdirOptsBuilder::new()
         .group("parent-group".to_string())
         .mode(0o2775)
@@ -308,7 +309,7 @@ fn active_namespace_creation_replicates_without_legacy_writer_queue() -> CommonR
     assert!(delta
         .entries
         .iter()
-        .any(|entry| entry.path == "/committed-file"));
+        .any(|entry| entry.path == "/renamed-file"));
     assert_eq!(
         active.file_status("/setgid-parent/child")?.group,
         "parent-group"
@@ -317,15 +318,16 @@ fn active_namespace_creation_replicates_without_legacy_writer_queue() -> CommonR
     assert!(
         !legacy_entries.iter().any(|entry| matches!(
             entry,
-            JournalEntry::Mkdir(_) | JournalEntry::CreateFile(_)
+            JournalEntry::Mkdir(_) | JournalEntry::CreateFile(_) | JournalEntry::Rename(_)
         )),
-        "active namespace creation must not emit legacy local-first namespace journal entries: {legacy_entries:?}"
+        "active namespace changes must not emit legacy local-first namespace journal entries: {legacy_entries:?}"
     );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         if standby.file_status("/committed-dir").is_ok()
-            && standby.file_status("/committed-file").is_ok()
+            && standby.file_status("/renamed-file").is_ok()
+            && standby.file_status("/committed-file").is_err()
             && standby.file_status("/setgid-parent/child").is_ok()
         {
             assert_eq!(
@@ -335,7 +337,7 @@ fn active_namespace_creation_replicates_without_legacy_writer_queue() -> CommonR
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            return err_box!("standby did not apply committed namespace creation");
+            return err_box!("standby did not apply committed namespace changes");
         }
         thread::sleep(Duration::from_millis(100));
     }

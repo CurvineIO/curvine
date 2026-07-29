@@ -14,7 +14,7 @@
 
 use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::policy::ChooseContext;
-use crate::master::journal::JournalSystem;
+use crate::master::journal::{JournalSystem, MetadataCommand};
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
 use crate::master::meta::{CacheInvalidationResult, FsDir};
 
@@ -334,6 +334,12 @@ impl MasterFilesystem {
         let src = src.as_ref();
         let dst = dst.as_ref();
 
+        if self.master_monitor.is_active() {
+            if let Some(result) = self.rename_committed(src, dst, flags)? {
+                return Ok(result);
+            }
+        }
+
         let mut fs_dir = self.fs_dir.write();
         let src_inp = Self::resolve_path(&fs_dir, src)?;
         let dst_inp = Self::resolve_path(&fs_dir, dst)?;
@@ -374,6 +380,50 @@ impl MasterFilesystem {
         }
 
         Ok(true)
+    }
+
+    fn rename_committed(&self, src: &str, dst: &str, flags: RenameFlags) -> FsResult<Option<bool>> {
+        let (command, writer) = {
+            let fs_dir = self.fs_dir.write();
+            let src_inp = Self::resolve_path(&fs_dir, src)?;
+            let dst_inp = Self::resolve_path(&fs_dir, dst)?;
+
+            if src_inp.is_root() {
+                return err_box!("Cannot rename root path");
+            }
+
+            if src == dst {
+                return Ok(Some(false));
+            }
+
+            if let Some(rest) = dst.strip_prefix(src) {
+                if rest.starts_with(PATH_SEPARATOR) {
+                    return err_ext!(FsError::invalid_argument(format!(
+                        "cannot rename {} to {}: destination is under source",
+                        src, dst
+                    )));
+                }
+            }
+
+            if dst_inp.get_last_inode().is_some() {
+                return Ok(None);
+            }
+            Self::check_parent(&dst_inp)?;
+
+            let entry = fs_dir.prepare_rename_command(
+                &src_inp,
+                &dst_inp,
+                LocalTime::mills() as i64,
+                flags,
+            )?;
+            (
+                MetadataCommand::Rename(entry),
+                fs_dir.journal_writer.clone(),
+            )
+        };
+
+        writer.commit_metadata_commands(vec![command])?;
+        Ok(Some(true))
     }
 
     pub fn create<T: AsRef<str>>(&self, path: T, create_parent: bool) -> FsResult<FileStatus> {
