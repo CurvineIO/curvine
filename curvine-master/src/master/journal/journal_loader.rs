@@ -709,6 +709,16 @@ impl JournalLoader {
                     .await
             }
             MetadataCommand::SetAttr(entry) => self.set_attr(entry),
+            MetadataCommand::Delete(entry) => {
+                self.delete(entry.clone())?;
+                if is_leader {
+                    self.ufs_loader
+                        .apply_entry(&JournalEntry::Delete(entry))
+                        .await
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 

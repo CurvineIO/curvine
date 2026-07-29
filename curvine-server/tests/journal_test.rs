@@ -289,6 +289,7 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
     };
 
     active.mkdir("/committed-dir", false)?;
+    active.mkdir("/deleted-dir", false)?;
     active.create("/committed-file", false)?;
     active.rename("/committed-file", "/renamed-file", RenameFlags::empty())?;
     let parent_opts = MkdirOptsBuilder::new()
@@ -320,6 +321,7 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
         SetAttrOptsBuilder::new().owner("committed-owner").build(),
     )?;
     assert_eq!(status.owner, "committed-owner");
+    active.delete("/deleted-dir", false)?;
     let legacy_entries = active.fs_dir.read().take_entries();
     assert!(
         !legacy_entries.iter().any(|entry| matches!(
@@ -328,6 +330,7 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
                 | JournalEntry::CreateFile(_)
                 | JournalEntry::Rename(_)
                 | JournalEntry::SetAttr(_)
+                | JournalEntry::Delete(_)
         )),
         "active namespace changes must not emit legacy local-first namespace journal entries: {legacy_entries:?}"
     );
@@ -354,6 +357,7 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
         if standby.file_status("/committed-dir").is_ok()
             && standby.file_status("/committed-file").is_err()
             && standby.file_status("/setgid-parent/child").is_ok()
+            && standby.file_status("/deleted-dir").is_err()
         {
             assert_eq!(
                 standby.file_status("/setgid-parent/child")?.group,

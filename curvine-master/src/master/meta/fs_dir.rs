@@ -14,8 +14,8 @@
 
 use crate::master::fs::{BlockInodeState, DeleteResult};
 use crate::master::journal::{
-    CreateFileEntry, JournalEntry, JournalWriter, MetadataCommand, MkdirEntry, RenameEntry,
-    SetAttrEntry,
+    CreateFileEntry, DeleteEntry, JournalEntry, JournalWriter, MetadataCommand, MkdirEntry,
+    RenameEntry, SetAttrEntry,
 };
 use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
@@ -321,6 +321,31 @@ impl FsDir {
             .log_delete(self, inp.path(), op_ms as i64)?;
 
         Ok(del_res)
+    }
+
+    pub(crate) fn prepare_empty_dir_delete_command(
+        &self,
+        inp: &InodePath,
+        mtime: i64,
+    ) -> FsResult<Option<DeleteEntry>> {
+        if inp.is_root() {
+            return err_box!("The root is not allowed to be deleted");
+        }
+
+        if inp.is_empty() || inp.get_last_inode().is_none() {
+            return err_ext!(FsError::file_not_found(inp.path()));
+        }
+
+        if !inp.is_empty_dir() {
+            return Ok(None);
+        }
+
+        Ok(Some(DeleteEntry {
+            op_id: self.next_op_id(),
+            rpc_id: 0,
+            path: inp.path().to_string(),
+            mtime,
+        }))
     }
 
     pub(crate) fn unprotected_delete(

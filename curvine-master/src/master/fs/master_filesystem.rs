@@ -303,8 +303,15 @@ impl MasterFilesystem {
     }
 
     pub fn delete<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<bool> {
+        let path = path.as_ref();
+        if self.master_monitor.is_active() {
+            if let Some(result) = self.delete_committed(path)? {
+                return Ok(result);
+            }
+        }
+
         let mut fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+        let inp = Self::resolve_path(&fs_dir, path)?;
 
         let delete_result = fs_dir.delete(&inp, recursive)?;
 
@@ -312,6 +319,25 @@ impl MasterFilesystem {
         worker_manager.remove_blocks(&delete_result);
 
         Ok(true)
+    }
+
+    fn delete_committed(&self, path: &str) -> FsResult<Option<bool>> {
+        let (command, writer) = {
+            let fs_dir = self.fs_dir.write();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            let Some(entry) =
+                fs_dir.prepare_empty_dir_delete_command(&inp, LocalTime::mills() as i64)?
+            else {
+                return Ok(None);
+            };
+            (
+                MetadataCommand::Delete(entry),
+                fs_dir.journal_writer.clone(),
+            )
+        };
+
+        writer.commit_metadata_commands(vec![command])?;
+        Ok(Some(true))
     }
 
     pub fn free<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<FreeResult> {
