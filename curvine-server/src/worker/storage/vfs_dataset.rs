@@ -801,6 +801,55 @@ mod test {
         assert!(ds.committed_rewrites.is_empty());
         Ok(())
     }
+
+    #[test]
+    fn finalize_rewrite_materializes_sparse_committed_length() -> CommonResult<()> {
+        // Mirrors post-ResizeFile rewrite: master logical block len grows while
+        // the worker still holds a short committed copy; finalize must extend
+        // the staging file to the committed logical length.
+        // Dataset Mem dir is only 100B and rewrite reserves max(old, new).
+        let mut ds = create_data_set(true, "finalize-rewrite-sparse-len");
+        let mut block = ExtendedBlock::with_mem(1, "50B")?;
+        let writing = ds.open_block(&block)?;
+        let initial_path = {
+            let dir = ds.find_dir(writing.dir_id())?;
+            FileLayout::block_path(dir, &writing)?
+        };
+        std::fs::write(&initial_path, b"B".repeat(20))?;
+        block.len = 20;
+        let finalized = ds.finalize_block(&block)?;
+        let active_path = {
+            let dir = ds.find_dir(finalized.dir_id())?;
+            FileLayout::block_path(dir, &finalized)?
+        };
+
+        // Reopen for rewrite at a higher logical length (as after sparse resize),
+        // write only into the middle, then commit the full logical length.
+        block.len = 50;
+        let rewriting = ds.open_block(&block)?;
+        let staging_path = {
+            let dir = ds.find_dir(rewriting.dir_id())?;
+            FileLayout::block_path(dir, &rewriting)?
+        };
+        let mut staging = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&staging_path)?;
+        use std::io::{Seek, SeekFrom, Write};
+        staging.seek(SeekFrom::Start(20))?;
+        staging.write_all(b"D".repeat(10).as_slice())?;
+        drop(staging);
+        assert_eq!(std::fs::metadata(&staging_path)?.len(), 30);
+
+        let published = ds.finalize_block(&block)?;
+        assert!(published.is_final());
+        assert_eq!(published.len(), 50);
+        let bytes = std::fs::read(&active_path)?;
+        assert_eq!(bytes.len(), 50);
+        assert_eq!(&bytes[..20], b"B".repeat(20).as_slice());
+        assert_eq!(&bytes[20..30], b"D".repeat(10).as_slice());
+        assert!(!staging_path.exists());
+        Ok(())
+    }
     #[test]
     fn remove_block_during_rewrite_deletes_active_and_staging_files() -> CommonResult<()> {
         let mut ds = create_data_set(true, "remove-during-rewrite");

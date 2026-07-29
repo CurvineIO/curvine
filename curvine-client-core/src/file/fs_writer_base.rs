@@ -513,6 +513,17 @@ impl FsWriterBase {
             self.complete().await?;
         }
 
+        // Capture pre-resize lengths so we can materialize sparse growth on
+        // already-committed worker blocks. Master extend may raise last-block
+        // logical len without alloc_opts (to avoid rewrite-on-every-boundary),
+        // which would otherwise leave worker files shorter than master metadata.
+        let prior_lens: std::collections::HashMap<i64, i64> = self
+            .file_blocks
+            .block_locs
+            .iter()
+            .map(|lb| (lb.block.id, lb.block.len))
+            .collect();
+
         // Step 2: Execute resize operation
         let file_blocks = self.fs_client.resize(&self.path, opts).await?;
         let mut file_blocks = WriteFileBlocks::new(file_blocks);
@@ -526,10 +537,14 @@ impl FsWriterBase {
             );
         }
 
-        // Step 3: If a block with written data triggers reassignment, request worker to reassign the block.
-        // At most one such block exists.
+        // Step 3: Materialize blocks that need worker updates after resize.
+        // - should_resize(): unplaced/assigned blocks with alloc_opts
+        // - committed blocks whose logical len grew: open+complete so the worker
+        //   staging file is extended to the new logical length (sparse holes)
         for lb in &mut file_blocks.block_locs {
-            if lb.should_resize() {
+            let prior_len = prior_lens.get(&lb.block.id).copied().unwrap_or(0);
+            let grew_committed = !lb.locs.is_empty() && lb.block.len > prior_len;
+            if lb.should_resize() || grew_committed {
                 let mut writer =
                     BlockWriter::new(self.fs_context.clone(), lb.clone(), 0, block_size).await?;
                 let commit_block = writer.complete().await?;

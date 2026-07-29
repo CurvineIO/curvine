@@ -145,6 +145,20 @@ impl BlockLayout for FileLayout {
         committed_len: i64,
     ) -> CommonResult<BlockMeta> {
         let staging_path = Self::block_path(dir, meta)?;
+        // Sparse seek-past-EOF resize can raise a committed block's logical
+        // length on the master without rewriting worker bytes. A later partial
+        // rewrite then completes with committed_len larger than the staging
+        // file size. Materialize that logical length (including holes) before
+        // the mismatch check so valid post-resize rewrites can finalize.
+        if committed_len >= 0 {
+            let current_len = staging_path.metadata()?.len() as i64;
+            if committed_len > current_len {
+                OpenOptions::new()
+                    .write(true)
+                    .open(&staging_path)?
+                    .set_len(committed_len as u64)?;
+            }
+        }
         let final_meta = BlockMeta::with_final(meta, &staging_path)?;
         if final_meta.len() != committed_len {
             return err_box!(
