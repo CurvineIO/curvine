@@ -1,0 +1,259 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::common::UfsFactory;
+use curvine_client::file::CurvineFileSystem;
+use curvine_common::conf::{ClusterConf, TransferCvMetadataReaderType, TransferStoreType};
+use curvine_common::error::FsError;
+use curvine_web::server::{WebHandlerService, WebServer};
+use log::info;
+use orpc::common::Logger;
+use orpc::handler::HandlerService;
+use orpc::io::net::ConnState;
+use orpc::runtime::RpcRuntime;
+use orpc::server::{RpcServer, ServerStateListener};
+use orpc::CommonResult;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::transfer::{
+    ClusterMetadataCache, CvMetadataReader, DisabledCvMetadataReader, MasterCvMetadataReader,
+    MemoryTransferStore, MetadataReplicaReader, MysqlTransferStore, SqliteTransferStore,
+    TransferHandler, TransferMetrics, TransferPlanner, TransferRouterHandler, TransferScheduler,
+    TransferService, TransferStoreBackend,
+};
+
+#[derive(Clone)]
+pub struct TransferRpcService {
+    service: TransferService<TransferStoreBackend>,
+    ready: Arc<AtomicBool>,
+    store_backend: &'static str,
+    cluster_cache: ClusterMetadataCache,
+    cv_metadata: Option<Arc<dyn CvMetadataReader>>,
+}
+
+impl TransferRpcService {
+    fn new(
+        service: TransferService<TransferStoreBackend>,
+        ready: Arc<AtomicBool>,
+        store_backend: &'static str,
+        cluster_cache: ClusterMetadataCache,
+        cv_metadata: Option<Arc<dyn CvMetadataReader>>,
+    ) -> Self {
+        Self {
+            service,
+            ready,
+            store_backend,
+            cluster_cache,
+            cv_metadata,
+        }
+    }
+}
+
+impl HandlerService for TransferRpcService {
+    type Item = TransferHandler<TransferStoreBackend>;
+
+    fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
+        TransferHandler::new(self.service.clone())
+    }
+}
+
+impl WebHandlerService for TransferRpcService {
+    type Item = TransferRouterHandler;
+
+    fn get_handler(&self) -> Self::Item {
+        TransferRouterHandler::new(
+            self.ready.clone(),
+            self.store_backend,
+            self.service.clone(),
+            self.cluster_cache.clone(),
+            self.cv_metadata.clone(),
+        )
+    }
+}
+
+pub struct TransferServer {
+    rpc_server: RpcServer<TransferRpcService>,
+    web_server: WebServer<TransferRpcService>,
+    cluster_cache: ClusterMetadataCache,
+    scheduler: TransferScheduler<TransferStoreBackend>,
+    metadata_replica: Option<(MetadataReplicaReader, std::time::Duration)>,
+    ready: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+}
+
+impl TransferServer {
+    pub fn with_conf(conf: ClusterConf) -> CommonResult<Self> {
+        if !conf.transfer.enabled {
+            return Err(FsError::common("curvine-transfer requires transfer.enabled=true").into());
+        }
+        if conf.transfer.endpoints.is_empty() {
+            return Err(FsError::common(
+                "curvine-transfer requires transfer.endpoints to route worker task reports",
+            )
+            .into());
+        }
+        Logger::init(conf.master.log.clone());
+        let _ = TransferMetrics::get()?;
+        conf.print();
+
+        let rt = Arc::new(conf.transfer_server_conf().create_runtime());
+        let stop = Arc::new(AtomicBool::new(false));
+        let store = Arc::new(match conf.transfer.effective_store_type() {
+            TransferStoreType::Auto => unreachable!("resolved transfer store type cannot be auto"),
+            TransferStoreType::Memory => TransferStoreBackend::Memory(MemoryTransferStore::new()),
+            TransferStoreType::Sqlite => TransferStoreBackend::Sqlite(SqliteTransferStore::open(
+                conf.transfer.sqlite_store_path(),
+            )?),
+            TransferStoreType::Mysql => TransferStoreBackend::Mysql(MysqlTransferStore::open(
+                conf.transfer.mysql_store_url(),
+            )?),
+        });
+        let store_backend = store.backend_label();
+        let fs = CurvineFileSystem::with_rt(conf.clone(), rt.clone())?;
+        let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
+        let cache = ClusterMetadataCache::with_snapshot_policy(
+            fs.clone(),
+            conf.transfer.cluster_snapshot_max_staleness,
+            conf.transfer.allow_submit_with_stale_snapshot,
+        );
+        cache.clone().start_refresh_loop(
+            Duration::from_millis(conf.client.mount_update_ttl_ms),
+            stop.clone(),
+        );
+        let mut metadata_replica = None;
+        let cv_metadata: Arc<dyn CvMetadataReader> =
+            match conf.transfer.effective_cv_metadata_reader() {
+                TransferCvMetadataReaderType::Auto => {
+                    unreachable!("resolved CV metadata reader cannot be auto")
+                }
+                TransferCvMetadataReaderType::Disabled => Arc::new(DisabledCvMetadataReader),
+                TransferCvMetadataReaderType::Master => Arc::new(MasterCvMetadataReader::new(fs)),
+                TransferCvMetadataReaderType::Replica => {
+                    let reader = MetadataReplicaReader::new(
+                        fs.clone(),
+                        conf.transfer.metadata_replica_max_entries,
+                        conf.transfer.metadata_replica_page_size(),
+                        conf.transfer.metadata_replica_history_size(),
+                        conf.transfer.metadata_replica_max_staleness,
+                    );
+                    metadata_replica = Some((
+                        reader.clone(),
+                        conf.transfer.metadata_replica_refresh_interval,
+                    ));
+                    Arc::new(reader)
+                }
+            };
+
+        let owner = if conf.transfer.instance_id.is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            conf.transfer.instance_id.clone()
+        };
+        let report_target =
+            conf.transfer.endpoints.first().cloned().unwrap_or_else(|| {
+                format!("{}:{}", conf.transfer.hostname, conf.transfer.rpc_port)
+            });
+        let planner = TransferPlanner::new(
+            cv_metadata.clone(),
+            factory.clone(),
+            cache.clone(),
+            conf.client.clone(),
+            conf.transfer.max_tasks_per_transfer,
+            conf.transfer.ufs_max_concurrency_per_endpoint,
+        );
+        let scheduler = TransferScheduler::new(
+            store.clone(),
+            planner,
+            cache.clone(),
+            factory,
+            owner,
+            report_target,
+            conf.transfer.clone(),
+        );
+
+        let ready = Arc::new(AtomicBool::new(false));
+        let service = TransferRpcService::new(
+            TransferService::with_cache_and_report_queue(
+                store,
+                cache.clone(),
+                conf.transfer.task_stale_timeout,
+                conf.transfer.task_report_queue_size(),
+                conf.transfer.worker_threads,
+            )?,
+            ready.clone(),
+            store_backend,
+            cache.clone(),
+            Some(cv_metadata.clone()),
+        );
+        let rpc_server =
+            RpcServer::with_rt(rt.clone(), conf.transfer_server_conf(), service.clone());
+        let web_server = WebServer::with_rt(rt, conf.transfer_web_conf(), service);
+        let stop_on_rpc_stop = stop.clone();
+        rpc_server.add_shutdown_hook(move || {
+            stop_on_rpc_stop.store(true, Ordering::Relaxed);
+        });
+        Ok(Self {
+            rpc_server,
+            web_server,
+            cluster_cache: cache,
+            scheduler,
+            metadata_replica,
+            ready,
+            stop,
+        })
+    }
+
+    pub async fn start(self) -> CommonResult<ServerStateListener> {
+        let ready = self.ready.clone();
+        let web_name = self.web_server.server_name().to_string();
+        let bind_addr = self.web_server.resolve_bind_addr();
+        let mut web_status = self.web_server.start();
+        WebServer::<TransferRpcService>::wait_bind(&mut web_status, &web_name, &bind_addr).await?;
+
+        let result = async {
+            self.cluster_cache.refresh().await?;
+            if let Some((reader, refresh_interval)) = &self.metadata_replica {
+                reader.refresh().await?;
+                reader.start_refresh_loop(*refresh_interval, self.stop.clone());
+            }
+            self.scheduler
+                .start(self.rpc_server.clone_rt(), self.stop.clone());
+            info!("Starting curvine-transfer rpc server");
+            let mut rpc_status = self.rpc_server.start();
+            rpc_status.wait_running().await?;
+            ready.store(true, Ordering::Relaxed);
+            Ok(rpc_status)
+        }
+        .await;
+
+        if result.is_err() {
+            self.stop.store(true, Ordering::Relaxed);
+        }
+        result
+    }
+
+    pub fn block_on_start(self) -> CommonResult<()> {
+        let rt = self.rpc_server.clone_rt();
+        rt.block_on(async move {
+            let mut status = self.start().await?;
+            if let Err(err) = status.wait_stop().await {
+                log::warn!("curvine-transfer wait stop failed: {}", err);
+            }
+            Ok(())
+        })
+    }
+}
