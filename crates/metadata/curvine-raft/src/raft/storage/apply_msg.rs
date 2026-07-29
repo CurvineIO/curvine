@@ -20,6 +20,7 @@ use raft::StateRole;
 
 pub enum ApplyMsg {
     Entry(Entry),
+    EntryWithAck((Entry, CallSender<RaftResult<()>>)),
     Scan(AppliedIndex),
     CreateSnapshot(CallSender<RaftResult<SnapshotData>>),
     ApplySnapshot((CallSender<RaftResult<()>>, SnapshotData)),
@@ -32,6 +33,10 @@ impl ApplyMsg {
         ApplyMsg::Entry(entry)
     }
 
+    pub fn new_entry_with_ack(entry: Entry, ack: CallSender<RaftResult<()>>) -> Self {
+        ApplyMsg::EntryWithAck((entry, ack))
+    }
+
     pub fn new_scan(applied_index: AppliedIndex) -> ApplyMsg {
         ApplyMsg::Scan(applied_index)
     }
@@ -39,6 +44,15 @@ impl ApplyMsg {
     pub fn take_entry(self) -> Entry {
         match self {
             ApplyMsg::Entry(entry) => entry,
+            ApplyMsg::EntryWithAck((entry, _)) => entry,
+            _ => panic!("invalid entry"),
+        }
+    }
+
+    pub fn take_entry_with_ack(self) -> (Entry, Option<CallSender<RaftResult<()>>>) {
+        match self {
+            ApplyMsg::Entry(entry) => (entry, None),
+            ApplyMsg::EntryWithAck((entry, ack)) => (entry, Some(ack)),
             _ => panic!("invalid entry"),
         }
     }

@@ -305,7 +305,7 @@ impl JournalLoader {
         skip_ufs_error: bool,
     ) -> CommonResult<()> {
         match msg {
-            ApplyMsg::Entry(entry) => {
+            ApplyMsg::Entry(entry) | ApplyMsg::EntryWithAck((entry, _)) => {
                 self.apply0(is_leader, entry, skip_ufs_error).await?;
                 Ok(())
             }
@@ -350,6 +350,31 @@ impl JournalLoader {
         }
     }
 
+    fn complete_entry_ack(msg: ApplyMsg, result: RaftResult<()>) {
+        if let ApplyMsg::EntryWithAck((_, tx)) = msg {
+            if let Err(e) = tx.send(result) {
+                warn!("send journal entry apply acknowledgement failed: {}", e);
+            }
+        }
+    }
+
+    async fn catch_up_committed_metadata(&self) -> RaftResult<()> {
+        let applied = self.fsm_state_snapshot()?.applied;
+        self.apply_msg(false, &ApplyMsg::new_scan(applied), false)
+            .await?;
+
+        let metadata_applied = self.fsm_state_snapshot()?.applied.index;
+        let committed = self.log_store.hard_state().commit;
+        if metadata_applied < committed {
+            return err_box!(
+                "metadata catch-up stopped before committed raft index: applied={}, commit={}",
+                metadata_applied,
+                committed
+            )
+            .into();
+        }
+        Ok(())
+}
     async fn next_apply_msg(
         &self,
         receiver: &mut AsyncReceiver<ApplyMsg>,
@@ -413,11 +438,15 @@ impl JournalLoader {
                 }
 
                 msg => match self.apply_msg(is_leader, &msg, false).await {
-                    Ok(_) => retry_num = 0,
+                    Ok(_) => {
+                        retry_num = 0;
+                        Self::complete_entry_ack(msg, Ok(()));
+                    }
 
                     Err(error) => {
                         if self.ignore_reply_error {
                             error!("apply entry failed(skip): {}", error);
+                            Self::complete_entry_ack(msg, Ok(()));
                         } else if is_leader {
                             retry_num += 1;
 
@@ -427,7 +456,7 @@ impl JournalLoader {
                                         "apply entry failed(retry_num={}), skipping failed UFS replay to keep master alive: {}",
                                         retry_num, error
                                     );
-                                    let continue_scan = matches!(msg, ApplyMsg::Scan(_));
+                                    let continue_scan = matches!(&msg, ApplyMsg::Scan(_));
                                     if let Err(skip_error) =
                                         self.apply_msg(is_leader, &msg, true).await
                                     {
@@ -439,6 +468,8 @@ impl JournalLoader {
                                     retry_num = 0;
                                     if continue_scan {
                                         retry_msg.replace(msg);
+                                    } else {
+                                        Self::complete_entry_ack(msg, Ok(()));
                                     }
                                 } else {
                                     Self::abort_on_fatal_apply_error(format!(
@@ -881,25 +912,45 @@ impl JournalLoader {
         rx.receive().await?;
         Ok(())
     }
+
+    async fn apply_direct(&self, msg: ApplyMsg) -> RaftResult<()> {
+        let result = if let Err(e) = self.apply_msg(false, &msg, false).await {
+            if self.ignore_reply_error {
+                error!("apply entry failed: {}", e);
+                Ok(())
+            } else {
+                Err(e.into())
+            }
+        } else {
+            Ok(())
+        };
+
+        if matches!(&msg, ApplyMsg::EntryWithAck(_)) {
+            Self::complete_entry_ack(msg, result);
+            Ok(())
+        } else {
+            result
+        }
+    }
 }
 
 impl AppStorage for JournalLoader {
     async fn apply(&self, wait: bool, msg: ApplyMsg) -> RaftResult<()> {
-        if wait || !self.has_apply_worker {
-            if let Err(e) = self.apply_msg(false, &msg, false).await {
-                if self.ignore_reply_error {
-                    error!("apply entry failed: {}", e);
-                    Ok(())
-                } else {
-                    Err(e.into())
-                }
-            } else {
-                Ok(())
-            }
-        } else {
-            self.sender.send(msg).await?;
-            Ok(())
+        if !self.has_apply_worker {
+            return self.apply_direct(msg).await;
         }
+
+        if matches!(&msg, ApplyMsg::EntryWithAck(_)) {
+            self.sender.send(msg).await?;
+            return Ok(());
+        }
+
+        if wait {
+            return self.apply_direct(msg).await;
+        }
+
+        self.sender.send(msg).await?;
+        Ok(())
     }
 
     fn get_fsm_state(&self) -> FsmState {
