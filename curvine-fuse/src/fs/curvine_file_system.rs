@@ -1009,15 +1009,17 @@ impl fs::FileSystem for CurvineFileSystem {
         let unrestricted = (op.arg.flags & FUSE_IOCTL_UNRESTRICTED) != 0;
         let (result, out_flags) = match op.arg.cmd {
             FuseUtils::FS_IOC_GETFLAGS => {
+                // FUSE_IOCTL_RETRY is only legal for unrestricted ioctls;
+                // restricted undersized buffers must return EINVAL (kernel
+                // rejects retry in restricted mode with -EIO).
+                if unrestricted && op.arg.out_size < preferred {
+                    return Ok(FuseUtils::build_ioctl_retry(
+                        op.arg.arg,
+                        0,
+                        preferred as u64,
+                    ));
+                }
                 if op.arg.out_size < min_flag_bytes {
-                    // Empty unrestricted/first-pass ioctl: ask kernel to retry.
-                    if unrestricted || op.arg.out_size == 0 {
-                        return Ok(FuseUtils::build_ioctl_retry(
-                            op.arg.arg,
-                            0,
-                            preferred as u64,
-                        ));
-                    }
                     return err_fuse!(
                         libc::EINVAL,
                         "ioctl out buffer too small (flags={:#x} out_size={})",
@@ -1029,14 +1031,15 @@ impl fs::FileSystem for CurvineFileSystem {
             }
             FuseUtils::FS_IOC_SETFLAGS => {
                 self.ensure_writable_path(&path, RpcCode::SetAttr).await?;
+                // Same ABI rule as GETFLAGS: never emit RETRY unless unrestricted.
+                if unrestricted && op.arg.in_size < preferred {
+                    return Ok(FuseUtils::build_ioctl_retry(
+                        op.arg.arg,
+                        preferred as u64,
+                        0,
+                    ));
+                }
                 if op.arg.in_size < min_flag_bytes || op.in_data.len() < min_flag_bytes as usize {
-                    if (unrestricted || op.arg.in_size == 0) && op.arg.in_size < preferred {
-                        return Ok(FuseUtils::build_ioctl_retry(
-                            op.arg.arg,
-                            preferred as u64,
-                            0,
-                        ));
-                    }
                     return err_fuse!(
                         libc::EINVAL,
                         "ioctl in buffer too small (flags={:#x} in_size={} data_len={})",
