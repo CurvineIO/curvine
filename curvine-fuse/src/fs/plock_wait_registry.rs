@@ -66,17 +66,50 @@ impl PlockWaitRegistry {
 
     /// Atomically replace `waiter -> blocked_by` and detect a wait cycle.
     /// Returns true when the edge would close a cycle (EDEADLK).
+    ///
+    /// Edges are resolved to the root non-waiting owner (follow `blocked_by`'s
+    /// chain). That keeps the graph pointing at presumed holders and avoids
+    /// waiter↔waiter cycles that appear when an OFD/POSIX holder unlocks and
+    /// immediately re-enters `F_SETLKW` while another waiter still has a stale
+    /// edge to the previous holder (LTP `fcntl34` multi-thread OFD pattern).
     pub fn try_register_blocked_by(&self, waiter: LockOwner, blocked_by: LockOwner) -> bool {
         let mut map = self.waiters.lock().expect("plock wait registry poisoned");
         // Drop any prior edge for this waiter before walking the graph so a
         // stale self-edge cannot create a false cycle, and so the new blocker
         // is published atomically with the deadlock check.
         map.remove(&waiter);
-        if Self::reaches_waiter(&map, &waiter, &blocked_by) {
+
+        let root = match Self::root_blocker(&map, &waiter, &blocked_by) {
+            Ok(root) => root,
+            Err(()) => return true,
+        };
+        if Self::reaches_waiter(&map, &waiter, &root) {
             return true;
         }
-        map.insert(waiter, blocked_by);
+        map.insert(waiter, root);
         false
+    }
+
+    /// Follow wait edges from `blocked_by` until a non-waiter (presumed holder).
+    /// Returns `Err(())` when the existing graph already cycles through `waiter`.
+    fn root_blocker(
+        map: &HashMap<LockOwner, LockOwner>,
+        waiter: &LockOwner,
+        blocked_by: &LockOwner,
+    ) -> Result<LockOwner, ()> {
+        let mut root = blocked_by.clone();
+        let mut seen = HashSet::new();
+        while let Some(next) = map.get(&root).cloned() {
+            if &root == waiter || &next == waiter {
+                return Err(());
+            }
+            if !seen.insert(root.clone()) {
+                // Cycle among other waiters; treat as deadlock.
+                return Err(());
+            }
+            root = next;
+        }
+        Ok(root)
     }
 
     fn reaches_waiter(
@@ -193,5 +226,32 @@ mod tests {
         assert!(!guard.register_blocked_by(b.clone()));
         guard.clear_blocked_by();
         assert!(!reg.would_deadlock(&b, &a));
+    }
+
+    #[test]
+    fn resolves_edge_through_waiter_chain_to_holder() {
+        let reg = PlockWaitRegistry::new();
+        let holder = LockOwner::new("c", 1);
+        let mid = LockOwner::new("c", 2);
+        let waiter = LockOwner::new("c", 3);
+
+        // mid waits on holder; a new waiter blocked by mid should wait on holder.
+        assert!(!reg.try_register_blocked_by(mid.clone(), holder.clone()));
+        assert!(!reg.try_register_blocked_by(waiter.clone(), mid.clone()));
+        let map = reg.waiters.lock().unwrap();
+        assert_eq!(map.get(&waiter), Some(&holder));
+    }
+
+    #[test]
+    fn opposite_waiter_edges_still_detect_cycle_after_root_resolve() {
+        // Registry-level A↔B remains a cycle (fcntl17 needs this). The SETLKW
+        // path re-samples Master after a transient cycle so fcntl34 unlock/re-
+        // lock races do not surface EDEADLK to userspace.
+        let reg = PlockWaitRegistry::new();
+        let a = LockOwner::new("c", 10);
+        let b = LockOwner::new("c", 20);
+
+        assert!(!reg.try_register_blocked_by(a.clone(), b.clone()));
+        assert!(reg.try_register_blocked_by(b.clone(), a.clone()));
     }
 }

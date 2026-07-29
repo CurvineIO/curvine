@@ -2132,7 +2132,34 @@ impl fs::FileSystem for CurvineFileSystem {
             if wait_guard
                 .register_blocked_by(LockOwner::new(blocker.client_id.clone(), blocker.owner_id))
             {
-                return err_fuse!(libc::EDEADLK);
+                // OFD multi-thread unlock/re-lock (LTP fcntl34) can transiently
+                // form a waiter↔prior-holder cycle in the local wait graph while
+                // the Master lock is already free or held by someone else.
+                // Drop the edge, re-sample once, and only then commit to EDEADLK
+                // so true multi-resource deadlocks (fcntl17) still fail fast.
+                wait_guard.clear_blocked_by();
+                let sleep_ms =
+                    check_interval_max_ms.min(check_interval_min_ms.saturating_mul(ticks + 1));
+                tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                let conflict2 = self.fs.set_lock(&path, lock.clone()).await?;
+                if conflict2.is_none() {
+                    wait_guard.clear_blocked_by();
+                    if is_unlock {
+                        if full_range_unlock && lock.lock_flags == LockFlags::Plock {
+                            handle.take_plock_if_owner(lock.owner_id);
+                        }
+                    } else {
+                        handle.add_lock(lock.lock_flags, lock.owner_id);
+                    }
+                    return Ok(());
+                }
+                let blocker2 = conflict2.as_ref().expect("conflict lock");
+                if wait_guard.register_blocked_by(LockOwner::new(
+                    blocker2.client_id.clone(),
+                    blocker2.owner_id,
+                )) {
+                    return err_fuse!(libc::EDEADLK);
+                }
             }
 
             ticks += 1;
