@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{err_box, CommonResult};
+use crate::CommonResult;
 use log::error;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicI8, Ordering};

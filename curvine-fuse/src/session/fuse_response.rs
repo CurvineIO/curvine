@@ -241,7 +241,13 @@ impl FuseResponse {
         unsupported_reason: Option<&'static str>,
     ) -> IOResult<()> {
         let slot = match &self.metrics {
-            None => return self.sender.send(FuseTask::Reply(data)).await,
+            None => {
+                return self
+                    .sender
+                    .send(FuseTask::Reply(data))
+                    .await
+                    .map_err(Into::into);
+            }
             Some(slot) => slot,
         };
 
@@ -256,7 +262,7 @@ impl FuseResponse {
                 Err(e) => {
                     // Channel closed before reserve: finish the pending slot now.
                     self.finish_enqueue_failure(slot, status, errno, unsupported_reason);
-                    return Err(e);
+                    return Err(e.into());
                 }
             };
             // Permit send is synchronous; commit and enqueue have no await gap.
@@ -278,7 +284,7 @@ impl FuseResponse {
         if send_result.is_err() {
             self.record_enqueue_failure_metrics(slot, status, errno, unsupported_reason);
         }
-        send_result
+        Ok(send_result?)
     }
 
     fn commit_reply_task(
@@ -484,7 +490,10 @@ impl FuseResponse {
         if self.metrics.is_some() {
             self.send_notify_metrics(code, data).await
         } else {
-            self.sender.send(FuseTask::Reply(data)).await
+            self.sender
+                .send(FuseTask::Reply(data))
+                .await
+                .map_err(Into::into)
         }
     }
 
@@ -497,7 +506,7 @@ impl FuseResponse {
                 Err(e) => {
                     // Closed channel before reserve means the notify never reaches sender.
                     FuseMetrics::get().record_notify_result(code_str, NOTIFY_ENQUEUE_FAILED);
-                    return Err(e);
+                    return Err(e.into());
                 }
             };
             permit.send(FuseTask::NotifyReply {
@@ -519,7 +528,7 @@ impl FuseResponse {
         if send_result.is_err() {
             FuseMetrics::get().record_notify_result(code_str, NOTIFY_ENQUEUE_FAILED);
         }
-        send_result
+        Ok(send_result?)
     }
 
     // `send_buf` / `send_data` have no source-tag variant; tagged errors use `send_rep_tagged`.

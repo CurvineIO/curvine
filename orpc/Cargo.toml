@@ -9,6 +9,7 @@ description = "High-performance network communication framework."
 
 [dependencies]
 orpc-error = { workspace = true }
+orpc-runtime = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 tokio-util = { workspace = true }

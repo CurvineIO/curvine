@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::err_box;
-use crate::io::IOResult;
+use crate::CommonResult;
 use std::sync::mpsc as block_mpsc;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
@@ -27,10 +26,15 @@ pub enum AsyncSender<T> {
 }
 
 impl<T> AsyncSender<T> {
-    pub async fn send(&self, value: T) -> IOResult<()> {
+    pub async fn send(&self, value: T) -> CommonResult<()> {
         match self {
-            AsyncSender::Unbounded(s) => s.send(value)?,
-            AsyncSender::Bounded(s) => s.send(value).await?,
+            AsyncSender::Unbounded(s) => s
+                .send(value)
+                .map_err(|e| orpc_error::StringError::from(e.to_string()))?,
+            AsyncSender::Bounded(s) => s
+                .send(value)
+                .await
+                .map_err(|e| orpc_error::StringError::from(e.to_string()))?,
         }
 
         Ok(())
@@ -48,17 +52,18 @@ impl<T> AsyncSender<T> {
         matches!(self, AsyncSender::Bounded(_))
     }
 
-    pub fn send_sync(&self, value: T) -> IOResult<()> {
+    pub fn send_sync(&self, value: T) -> CommonResult<()> {
         match self {
             AsyncSender::Unbounded(s) => {
-                s.send(value)?;
+                s.send(value)
+                    .map_err(|e| orpc_error::StringError::from(e.to_string()))?;
                 Ok(())
             }
             AsyncSender::Bounded(_) => err_box!("Not support"),
         }
     }
 
-    pub fn try_reserve(&self) -> IOResult<Option<Permit<'_, T>>> {
+    pub fn try_reserve(&self) -> CommonResult<Option<Permit<'_, T>>> {
         match self {
             AsyncSender::Unbounded(_) => {
                 err_box!("Not support")
@@ -75,7 +80,7 @@ impl<T> AsyncSender<T> {
         }
     }
 
-    pub async fn reserve(&self) -> IOResult<Permit<'_, T>> {
+    pub async fn reserve(&self) -> CommonResult<Permit<'_, T>> {
         match self {
             AsyncSender::Unbounded(_) => {
                 err_box!("Not support")
@@ -112,19 +117,19 @@ impl<T> AsyncReceiver<T> {
         }
     }
 
-    pub async fn recv_check(&mut self) -> IOResult<T> {
+    pub async fn recv_check(&mut self) -> CommonResult<T> {
         match self.recv().await {
             Some(v) => Ok(v),
             None => err_box!("the sender dropped"),
         }
     }
 
-    pub async fn timeout_recv(&mut self, timeout: Duration) -> IOResult<Option<T>> {
+    pub async fn timeout_recv(&mut self, timeout: Duration) -> CommonResult<Option<T>> {
         let inner = tokio::time::timeout(timeout, self.recv());
         Ok(inner.await?)
     }
 
-    pub fn try_recv(&mut self) -> IOResult<Option<T>> {
+    pub fn try_recv(&mut self) -> CommonResult<Option<T>> {
         let res = match self {
             AsyncReceiver::Unbounded(s) => s.try_recv(),
             AsyncReceiver::Bounded(s) => s.try_recv(),
@@ -176,10 +181,14 @@ pub enum BlockingSender<T> {
 }
 
 impl<T> BlockingSender<T> {
-    pub fn send(&self, value: T) -> IOResult<()> {
+    pub fn send(&self, value: T) -> CommonResult<()> {
         match self {
-            BlockingSender::Unbounded(s) => s.send(value)?,
-            BlockingSender::Bounded(s) => s.send(value)?,
+            BlockingSender::Unbounded(s) => s
+                .send(value)
+                .map_err(|e| orpc_error::StringError::from(e.to_string()))?,
+            BlockingSender::Bounded(s) => s
+                .send(value)
+                .map_err(|e| orpc_error::StringError::from(e.to_string()))?,
         }
 
         Ok(())
@@ -209,7 +218,7 @@ impl<T> BlockingReceiver<T> {
         res.ok()
     }
 
-    pub fn recv_check(&self) -> IOResult<T> {
+    pub fn recv_check(&self) -> CommonResult<T> {
         match self.recv() {
             Some(v) => Ok(v),
             None => err_box!("the sender dropped"),
@@ -267,7 +276,7 @@ impl<T> CallSender<T> {
         Self(sender)
     }
 
-    pub fn send(self, value: T) -> IOResult<()> {
+    pub fn send(self, value: T) -> CommonResult<()> {
         match self.0.send(value) {
             Ok(_) => Ok(()),
             Err(_) => err_box!("the receiver dropped"),
@@ -282,7 +291,7 @@ impl<T> CallReceiver<T> {
         Self(receiver)
     }
 
-    pub async fn receive(self) -> IOResult<T> {
+    pub async fn receive(self) -> CommonResult<T> {
         match self.0.await {
             Ok(v) => Ok(v),
             Err(_) => err_box!("the sender dropped"),

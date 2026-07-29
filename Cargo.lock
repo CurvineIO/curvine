@@ -6343,6 +6343,7 @@ dependencies = [
  "num_enum",
  "once_cell",
  "orpc-error",
+ "orpc-runtime",
  "parking_lot",
  "pin-project-lite",
  "prometheus",
@@ -6384,6 +6385,33 @@ version = "0.2.0"
 [[package]]
 name = "orpc-runtime"
 version = "0.2.0"
+dependencies = [
+ "chrono",
+ "crc32fast",
+ "dashmap 5.5.3",
+ "futures",
+ "fxhash",
+ "log",
+ "md-5",
+ "moka",
+ "murmur3",
+ "num_enum",
+ "once_cell",
+ "orpc-error",
+ "parking_lot",
+ "prometheus",
+ "rand 0.8.5",
+ "rolling-file",
+ "serde",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-appender",
+ "tracing-log",
+ "tracing-subscriber",
+ "uuid",
+]
 
 [[package]]
 name = "outref"

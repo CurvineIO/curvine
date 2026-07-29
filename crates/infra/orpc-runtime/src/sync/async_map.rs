@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::err_box;
 use crate::sync::FastDashMap;
 use std::error::Error;
 use std::fmt::Display;
@@ -264,7 +263,7 @@ impl<K: Eq + Hash + Display + Clone, T> AsyncSharedMap<K, T> {
 #[cfg(test)]
 mod tests {
     use super::AsyncSharedMap;
-    use crate::error::StringError;
+    use orpc_error::StringError;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::sync::{oneshot, Barrier};

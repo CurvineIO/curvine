@@ -6,3 +6,28 @@ license.workspace = true
 description = "ORPC runtime migration boundary."
 
 [dependencies]
+orpc-error = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tokio-util = { workspace = true }
+log = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-log = { workspace = true }
+rolling-file = { workspace = true }
+serde = { workspace = true }
+chrono = { workspace = true }
+once_cell = { workspace = true }
+prometheus = { workspace = true, features = ["process"] }
+uuid = { workspace = true }
+md-5 = { workspace = true }
+rand = { workspace = true }
+murmur3 = { workspace = true }
+crc32fast = { workspace = true }
+dashmap = { workspace = true }
+fxhash = { workspace = true }
+moka = { workspace = true }
+parking_lot = { workspace = true }
+num_enum = { workspace = true }
+toml = { workspace = true }

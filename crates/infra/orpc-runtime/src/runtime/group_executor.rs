@@ -15,7 +15,7 @@
 use crate::common::Utils;
 use crate::runtime::single_executor::Task;
 use crate::runtime::SingleExecutor;
-use crate::{err_box, CommonResult};
+use crate::CommonResult;
 use std::fmt::{Debug, Display, Formatter};
 use std::io::Cursor;
 use std::sync::mpsc::TrySendError;
