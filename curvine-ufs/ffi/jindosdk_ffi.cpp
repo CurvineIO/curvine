@@ -45,7 +45,6 @@ thread_local std::string g_last_error;
 
 static constexpr size_t kDefaultFilesystemStoreShards = 16;
 static constexpr size_t kMaxFilesystemStoreShards = 64;
-static constexpr int64_t kFilesystemStoreShardWaitTimeoutMs = 3 * 1000;
 static constexpr int64_t kFilesystemCloseWaitTimeoutMs = 30 * 1000;
 
 struct JindoFileSystemWrapper;
@@ -253,11 +252,7 @@ static bool acquire_operation_ctx(JindoFileSystemWrapper* wrapper, AsyncBase* c)
     }
 
     auto* shard = wrapper->store_shards[start].get();
-    if (!shard->mutex.try_lock_for(
-            std::chrono::milliseconds(kFilesystemStoreShardWaitTimeoutMs))) {
-        g_last_error = "Timed out waiting for OSS-HDFS store shard";
-        return false;
-    }
+    shard->mutex.lock();
 
     bool ok = prepare_store_shard_locked(wrapper, shard, c);
     if (!ok) {
@@ -1529,7 +1524,7 @@ JindoStatus jindo_reader_close_async(JindoReaderHandle reader, JindoStatusCallba
 }
 
 const char* jindo_get_last_error(void) {
-    return g_last_error.c_str();
+    return g_last_error.empty() ? nullptr : g_last_error.c_str();
 }
 
 void jindo_free(void* p) {
@@ -1543,10 +1538,6 @@ size_t jindo_test_default_filesystem_store_shards(void) {
 
 size_t jindo_test_max_filesystem_store_shards(void) {
     return kMaxFilesystemStoreShards;
-}
-
-int64_t jindo_test_filesystem_store_shard_wait_timeout_ms(void) {
-    return kFilesystemStoreShardWaitTimeoutMs;
 }
 
 bool jindo_test_is_reusable_operation_ctx(JindoStatus status) {
