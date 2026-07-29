@@ -45,7 +45,9 @@ impl ExportCommand {
         println!("\nExporting Curvine file to mounted UFS");
         println!("Source path: {}", self.path);
 
-        let command = LoadJobCommand::builder(&self.path).build();
+        let command = LoadJobCommand::builder(&self.path)
+            .overwrite(self.overwrite)
+            .build();
         let rep = handle_rpc_result(client.submit_export_job(command)).await;
 
         println!("\nExport job submitted successfully");

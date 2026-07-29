@@ -59,7 +59,7 @@ impl LoadCommand {
             println!("Target path: {}", target_path);
         }
 
-        let command_builder = LoadJobCommand::builder(&self.source_path);
+        let command_builder = LoadJobCommand::builder(&self.source_path).overwrite(self.overwrite);
         let command = if let Some(target_path) = &self.target_path {
             command_builder.target_path(target_path).build()
         } else {
