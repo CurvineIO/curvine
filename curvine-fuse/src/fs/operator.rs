@@ -139,6 +139,7 @@ pub struct Lookup<'a> {
 #[derive(Debug)]
 pub struct GetAttr<'a> {
     pub header: &'a fuse_in_header,
+    pub arg: &'a fuse_getattr_in,
 }
 
 #[derive(Debug)]

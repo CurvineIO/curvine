@@ -88,7 +88,7 @@ impl FuseRequest {
         self.opcode
     }
 
-    pub fn is_interrupt(&self) -> bool {
+    pub fn is_interruptible_wait(&self) -> bool {
         matches!(self.opcode, FUSE_SETLKW)
     }
 
@@ -101,19 +101,6 @@ impl FuseRequest {
 
     pub fn should_audit(&self) -> bool {
         !matches!(self.opcode, FUSE_READ | FUSE_WRITE)
-    }
-
-    fn get_write_bytes(&self, size: usize) -> FuseResult<Bytes> {
-        let start = FUSE_IN_HEADER_LEN + size_of::<fuse_write_in>();
-        let end = start + size;
-        if end != self.buf.len() {
-            return err_box!(
-                "Abnormal data length, expected {}, actual {}",
-                end,
-                self.buf.len()
-            );
-        }
-        Ok(self.buf.slice(start..end))
     }
 
     pub fn get_header(&self) -> FuseResult<&fuse_in_header> {
@@ -141,7 +128,10 @@ impl FuseRequest {
                 arg: decoder.get_struct()?,
             }),
 
-            FUSE_GETATTR => FuseOperator::GetAttr(GetAttr { header }),
+            FUSE_GETATTR => FuseOperator::GetAttr(GetAttr {
+                header,
+                arg: decoder.get_struct()?,
+            }),
 
             FUSE_READLINK => FuseOperator::Readlink(Readlink { header }),
 
@@ -232,8 +222,10 @@ impl FuseRequest {
 
             FUSE_WRITE => {
                 let arg: &fuse_write_in = decoder.get_struct()?;
-                let data = self.get_write_bytes(arg.size as usize)?;
+                let data_start = self.buf.len() - decoder.len();
                 let _ = decoder.get_bytes(arg.size as usize)?;
+                let data_end = self.buf.len() - decoder.len();
+                let data = self.buf.slice(data_start..data_end);
                 FuseOperator::Write(Write { header, arg, data })
             }
 
@@ -366,7 +358,9 @@ impl Display for FuseRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raw::fuse_abi::{fuse_batch_forget_in, fuse_setxattr_in};
+    use crate::raw::fuse_abi::{
+        fuse_batch_forget_in, fuse_getattr_in, fuse_setxattr_in, fuse_write_in,
+    };
     use crate::FuseUtils;
     use bytes::BytesMut;
     use std::ffi::OsStr;
@@ -410,10 +404,51 @@ mod tests {
 
     #[test]
     fn rejects_trailing_body_for_fixed_size_operator() {
-        let header = header(FUSE_GETATTR, FUSE_IN_HEADER_LEN + 1);
+        let header = header(FUSE_STATFS, FUSE_IN_HEADER_LEN + 1);
         let request = FuseRequest::from_bytes(request_bytes(&header, &[0])).unwrap();
         let err = request.parse_operator().unwrap_err();
         assert!(err.to_string().contains("Unexpected trailing request data"));
+    }
+
+    #[test]
+    fn getattr_consumes_kernel_argument() {
+        assert_eq!(size_of::<fuse_getattr_in>(), 16);
+
+        let arg = fuse_getattr_in {
+            getattr_flags: 1,
+            dummy: 0,
+            fh: 99,
+        };
+        let body = FuseUtils::struct_as_bytes(&arg);
+        let header = header(FUSE_GETATTR, FUSE_IN_HEADER_LEN + body.len());
+        let request = FuseRequest::from_bytes(request_bytes(&header, body)).unwrap();
+
+        match request.parse_operator().unwrap() {
+            FuseOperator::GetAttr(op) => {
+                assert_eq!(op.arg.getattr_flags, 1);
+                assert_eq!(op.arg.fh, 99);
+            }
+            other => panic!("expected GetAttr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_data_follows_decoder_cursor() {
+        let data = b"write-data";
+        let arg = fuse_write_in {
+            size: data.len() as u32,
+            ..Default::default()
+        };
+        let mut body = BytesMut::new();
+        body.extend_from_slice(FuseUtils::struct_as_bytes(&arg));
+        body.extend_from_slice(data);
+        let header = header(FUSE_WRITE, FUSE_IN_HEADER_LEN + body.len());
+        let request = FuseRequest::from_bytes(request_bytes(&header, &body)).unwrap();
+
+        match request.parse_operator().unwrap() {
+            FuseOperator::Write(op) => assert_eq!(&op.data[..], data),
+            other => panic!("expected Write, got {other:?}"),
+        }
     }
 
     #[test]
@@ -448,6 +483,28 @@ mod tests {
                 buf: Bytes::new(),
             };
             assert!(request.should_audit(), "{opcode:?} should be audited");
+        }
+    }
+
+    #[test]
+    fn only_setlkw_is_an_interruptible_wait() {
+        {
+            let opcode = FUSE_SETLKW;
+            let request = FuseRequest {
+                unique: 1,
+                opcode,
+                buf: Bytes::new(),
+            };
+            assert!(request.is_interruptible_wait());
+        }
+
+        for opcode in [FUSE_INTERRUPT, FUSE_SETLK, FUSE_READ] {
+            let request = FuseRequest {
+                unique: 1,
+                opcode,
+                buf: Bytes::new(),
+            };
+            assert!(!request.is_interruptible_wait(), "{opcode:?}");
         }
     }
 

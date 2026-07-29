@@ -194,6 +194,14 @@ pub struct fuse_write_out {
 
 #[repr(C)]
 #[derive(Debug, Default)]
+pub struct fuse_getattr_in {
+    pub getattr_flags: u32,
+    pub dummy: u32,
+    pub fh: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Default)]
 pub struct fuse_create_in {
     pub flags: u32,
     pub mode: u32,

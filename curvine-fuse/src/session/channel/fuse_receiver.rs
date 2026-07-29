@@ -516,7 +516,7 @@ impl<T: FileSystem> FuseReceiver<T> {
         req: FuseRequest,
         reply: FuseResponse,
     ) -> FuseResult<()> {
-        if !req.is_interrupt() {
+        if !req.is_interruptible_wait() {
             return Self::dispatch_meta(&pending_requests, &fs, &req, &reply).await;
         }
 
@@ -819,7 +819,8 @@ mod tests {
             FuseMetrics, FuseReqCtx, FuseReqKind, FuseReqLabels, FuseReqStatus,
         };
         use crate::raw::fuse_abi::{
-            fuse_forget_in, fuse_fsync_in, fuse_in_header, fuse_interrupt_in, fuse_rename2_in,
+            fuse_forget_in, fuse_fsync_in, fuse_getattr_in, fuse_in_header, fuse_interrupt_in,
+            fuse_rename2_in,
         };
         use crate::session::{FuseRequest, FuseResponse, FuseTask};
         use crate::FuseUtils;
@@ -857,8 +858,12 @@ mod tests {
         }
 
         fn getattr_request(unique: u64) -> FuseRequest {
-            // GetAttr parses only the header (no arg read).
-            make_request(OP_GETATTR, unique, 1, &[])
+            make_request(
+                OP_GETATTR,
+                unique,
+                1,
+                FuseUtils::struct_as_bytes(&fuse_getattr_in::default()),
+            )
         }
 
         fn statfs_request(unique: u64) -> FuseRequest {
