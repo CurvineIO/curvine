@@ -1004,18 +1004,49 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn ioctl(&self, op: Ioctl<'_>) -> FuseResult<BytesMut> {
         let path = self.state.get_path(op.header.nodeid)?;
         let mut status = self.state.fs_stat(op.header.nodeid, None).await?;
-        let flag_bytes = FuseUtils::ioctl_flag_bytes() as u32;
+        let preferred = FuseUtils::ioctl_flag_bytes() as u32;
+        let min_flag_bytes = 4u32;
+        let unrestricted = (op.arg.flags & FUSE_IOCTL_UNRESTRICTED) != 0;
         let (result, out_flags) = match op.arg.cmd {
             FuseUtils::FS_IOC_GETFLAGS => {
-                if op.arg.out_size < flag_bytes {
-                    return err_fuse!(libc::EINVAL, "ioctl out buffer too small");
+                // FUSE_IOCTL_RETRY is only legal for unrestricted ioctls;
+                // restricted undersized buffers must return EINVAL (kernel
+                // rejects retry in restricted mode with -EIO).
+                if unrestricted && op.arg.out_size < preferred {
+                    return Ok(FuseUtils::build_ioctl_retry(
+                        op.arg.arg,
+                        0,
+                        preferred as u64,
+                    ));
+                }
+                if op.arg.out_size < min_flag_bytes {
+                    return err_fuse!(
+                        libc::EINVAL,
+                        "ioctl out buffer too small (flags={:#x} out_size={})",
+                        op.arg.flags,
+                        op.arg.out_size
+                    );
                 }
                 (0, FuseUtils::file_flags_from_status(&status))
             }
             FuseUtils::FS_IOC_SETFLAGS => {
                 self.ensure_writable_path(&path, RpcCode::SetAttr).await?;
-                if op.arg.in_size < flag_bytes {
-                    return err_fuse!(libc::EINVAL, "ioctl in buffer too small");
+                // Same ABI rule as GETFLAGS: never emit RETRY unless unrestricted.
+                if unrestricted && op.arg.in_size < preferred {
+                    return Ok(FuseUtils::build_ioctl_retry(
+                        op.arg.arg,
+                        preferred as u64,
+                        0,
+                    ));
+                }
+                if op.arg.in_size < min_flag_bytes || op.in_data.len() < min_flag_bytes as usize {
+                    return err_fuse!(
+                        libc::EINVAL,
+                        "ioctl in buffer too small (flags={:#x} in_size={} data_len={})",
+                        op.arg.flags,
+                        op.arg.in_size,
+                        op.in_data.len()
+                    );
                 }
                 let requested = FuseUtils::decode_ioctl_file_flags(op.in_data)?;
                 let new_flags = FuseUtils::normalize_ioctl_file_flags(requested);
@@ -1615,17 +1646,53 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn link(&self, op: Link<'_>) -> FuseResult<fuse_entry_out> {
         let name = try_option!(op.name.to_str());
         let oldnodeid = op.arg.oldnodeid;
+        let parent_ino = op.header.nodeid;
+
+        // Linux vfs_link requires MAY_WRITE|MAY_EXEC on the destination parent.
+        self.check_permissions(op.header, (libc::W_OK | libc::X_OK) as u32)
+            .await?;
+
+        // Sticky may_link checks use dcache only. Missing dcache entries must not
+        // abort the link: the kernel may still hold oldnodeid after FORGET, and
+        // master link of dangling symlink inodes is valid (LTP link01 case 2).
+        {
+            let dir = self.state.dir_read();
+            if let (Some(src), Some(dest_dir)) = (
+                dir.get_inode(oldnodeid, None),
+                dir.get_inode(parent_ino, None),
+            ) {
+                let src_uid = self.resolve_file_uid(&src.status.owner);
+                let dest_dir_uid = self.resolve_file_uid(&dest_dir.status.owner);
+                FuseUtils::check_sticky_hardlink(
+                    self.conf.check_permission,
+                    op.header.uid,
+                    dest_dir_uid,
+                    src_uid,
+                    dest_dir.mode,
+                )?;
+            }
+        }
 
         self.state.fs_fsync(oldnodeid, None).await?;
 
-        let des_path = self.state.get_path_common(op.header.nodeid, Some(name))?;
+        let des_path = self.state.get_path_common(parent_ino, Some(name))?;
         let src_path = self.state.get_path(oldnodeid)?;
         self.ensure_writable_path(&src_path, RpcCode::Link).await?;
         self.ensure_writable_path(&des_path, RpcCode::Link).await?;
 
         // fs.protected_hardlinks (LTP prot_hsymlinks): deny unsafe non-owner hardlinks.
+        // Prefer dcache status: fs_stat of a dangling symlink source can ENOENT even
+        // though the symlink inode itself is a valid hardlink target (LTP link01 case 2).
         if self.conf.check_permission {
-            let src_status = self.state.fs_stat(oldnodeid, None).await?;
+            let cached_src = {
+                let dir = self.state.dir_read();
+                dir.get_inode(oldnodeid, None)
+                    .map(|inode| inode.clone_status())
+            };
+            let src_status = match cached_src {
+                Some(status) => status,
+                None => self.state.fs_stat(oldnodeid, None).await?,
+            };
             let file_uid = self.resolve_file_uid(&src_status.owner);
             let has_read_write = self
                 .check_access_permissions(&src_status, op.header, (libc::R_OK | libc::W_OK) as u32)
@@ -1642,14 +1709,16 @@ impl fs::FileSystem for CurvineFileSystem {
 
         debug!(
             "link: src_path={}, des_path={}, oldnodeid={}, parent={}",
-            src_path, des_path, oldnodeid, op.header.nodeid
+            src_path, des_path, oldnodeid, parent_ino
         );
 
         self.fs.link(&src_path, &des_path).await?;
-        let attr = self
-            .state
-            .lookup_link(op.header.nodeid, name, oldnodeid)
-            .await?;
+        // Master is the source of truth for nlink after a successful link.
+        // Always refresh via lookup_link/fs_stat(parent, name) rather than
+        // synthesizing dcache_nlink+1 (concurrent hardlinks and stale dcache
+        // would otherwise under-count). Master FileType::Link hardlink support
+        // covers LTP link01 dangling-symlink targets.
+        let attr = self.state.lookup_link(parent_ino, name, oldnodeid).await?;
 
         let result = FuseUtils::create_entry_out(&self.conf, attr);
         Ok(result)
@@ -1707,6 +1776,12 @@ impl fs::FileSystem for CurvineFileSystem {
             return err_fuse!(libc::EIO, "not support name {}", linkname);
         }
 
+        // Linux vfs_symlink requires MAY_WRITE|MAY_EXEC on the parent directory
+        // (LTP link01: symlink into an unwritable/unsearchable parent must fail).
+        // Check parent ACL before mount read-only so denial prefers EACCES,
+        // matching link/unlink/rmdir ordering.
+        self.check_permissions(op.header, (libc::W_OK | libc::X_OK) as u32)
+            .await?;
         let link_path = self.state.get_path_common(id, Some(linkname))?;
         self.ensure_writable_path(&link_path, RpcCode::Symlink)
             .await?;

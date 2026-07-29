@@ -61,6 +61,7 @@ impl MasterHandler {
         actor_rt: Arc<Runtime>,
         metrics: &'static MasterMetrics,
     ) -> Self {
+        metrics.active_connections.inc();
         Self {
             fs,
             retry_cache,
@@ -728,6 +729,12 @@ impl MasterHandler {
                 .with_label_values(&[&code_label])
                 .observe(used_us as f64);
         };
+    }
+}
+
+impl Drop for MasterHandler {
+    fn drop(&mut self) {
+        self.metrics.active_connections.dec();
     }
 }
 

@@ -997,8 +997,12 @@ impl FsDir {
         let (original_inode_id, mut original_inode_ptr) = match src_path.get_last_inode() {
             Some(inode) => match inode.as_ref() {
                 File(file) => {
-                    // Check if it's a regular file (not a directory or symlink)
-                    if file.file_type != curvine_common::state::FileType::File {
+                    // Hard links to regular files and symlinks are valid; directories are not.
+                    if !matches!(
+                        file.file_type,
+                        curvine_common::state::FileType::File
+                            | curvine_common::state::FileType::Link
+                    ) {
                         return err_ext!(FsError::common("Cannot create link to non-regular file"));
                     }
                     (file.id, Some(inode.clone()))

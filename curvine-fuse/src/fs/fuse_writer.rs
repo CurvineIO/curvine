@@ -51,6 +51,9 @@ pub struct FuseWriter {
     len: Arc<AtomicLong>,
     mtime: Arc<AtomicLong>,
     write_ver: AtomicCounter,
+    /// Count of write/resize calls currently inside `send_queued_task`.
+    /// Dirty-read waits for this to be zero before trusting a stable `write_ver`.
+    enqueue_inflight: AtomicCounter,
     metrics_enabled: bool,
 }
 
@@ -71,6 +74,7 @@ impl FuseWriter {
         let len = Arc::new(AtomicLong::new(status.len));
         let mtime = Arc::new(AtomicLong::new(status.mtime));
         let write_ver = AtomicCounter::new(0);
+        let enqueue_inflight = AtomicCounter::new(0);
         let path_type = writer.path_type();
         let metrics_enabled = conf.metrics_enabled;
 
@@ -99,12 +103,17 @@ impl FuseWriter {
             len,
             mtime,
             write_ver,
+            enqueue_inflight,
             metrics_enabled,
         }
     }
 
     pub fn write_ver(&self) -> u64 {
         self.write_ver.get()
+    }
+
+    pub fn enqueue_inflight(&self) -> u64 {
+        self.enqueue_inflight.get()
     }
 
     pub fn path(&self) -> &Path {
@@ -139,11 +148,19 @@ impl FuseWriter {
     }
 
     pub async fn write(&self, off: i64, data: Bytes, reply: Option<FuseResponse>) -> FsResult<()> {
-        // Keep write_ver increment before enqueue; read-after-write depends on it.
-        self.write_ver.incr();
-        self.send_queued_task(WriteTask::Write(off, data, reply))
+        // Bump write_ver only after the Write is queued. Track inflight around
+        // enqueue so dirty-read cannot observe a stable write_ver across the
+        // old incr-before-enqueue preemption window.
+        self.enqueue_inflight.incr();
+        let result = self
+            .send_queued_task(WriteTask::Write(off, data, reply))
             .await
-            .map_err(|e| self.check_error(e))
+            .map_err(|e| self.check_error(e));
+        if result.is_ok() {
+            self.write_ver.incr();
+        }
+        self.enqueue_inflight.decr();
+        result
     }
 
     pub async fn flush(&self, reply: Option<FuseResponse>) -> FsResult<()> {
@@ -174,15 +191,18 @@ impl FuseWriter {
         let len = opts.len;
         let fun = async {
             let (rx, tx) = CallChannel::channel();
-            self.send_queued_task(WriteTask::Resize(rx, opts)).await?;
+            self.enqueue_inflight.incr();
+            let send = self.send_queued_task(WriteTask::Resize(rx, opts)).await;
+            if send.is_ok() {
+                self.write_ver.incr();
+            }
+            self.enqueue_inflight.decr();
+            send?;
             // Double `?`: unwrap the channel receive, then propagate the real
             // backend resize result.
             tx.receive().await??;
             Ok::<(), FsError>(())
         };
-        // `write_ver.incr()` stays at its existing position (after building `fun`,
-        // before awaiting it) — unchanged consistency timing.
-        self.write_ver.incr();
         fun.await.map_err(|e| self.check_error(e))?;
         self.len.set(len);
         Ok(())

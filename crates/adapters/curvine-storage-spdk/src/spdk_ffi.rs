@@ -44,6 +44,7 @@ extern "C" {
     pub fn curvine_spdk_ctrlr_opts_sizeof() -> usize;
     pub fn curvine_spdk_ctrlr_get_default_opts(opts: *mut spdk_nvme_ctrlr_opts);
     pub fn curvine_spdk_ctrlr_opts_set_num_io_queues(opts: *mut spdk_nvme_ctrlr_opts, num: u32);
+    pub fn curvine_spdk_ctrlr_get_num_io_queues(ctrlr: *mut spdk_nvme_ctrlr) -> u32;
     pub fn curvine_spdk_ctrlr_opts_set_keep_alive_timeout_ms(
         opts: *mut spdk_nvme_ctrlr_opts,
         ms: u32,
