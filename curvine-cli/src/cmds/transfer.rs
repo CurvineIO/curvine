@@ -16,13 +16,13 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use comfy_table::{presets::ASCII_MARKDOWN, Table};
-use curvine_client::rpc::TransferClient;
-use curvine_common::proto::{
+use curvine_job_client::TransferClient;
+use curvine_model::{TransferKind, TransferState};
+use curvine_proto::{
     CancelTransferResponse, GetTransferStatusResponse, ListTransferTenantsResponse,
     ListTransfersResponse, SubmitTransferResponse, TransferJobStatusProto, TransferTaskStatusProto,
-    TransferTenantSummaryProto,
+    TransferTaskSummaryProto, TransferTenantSummaryProto,
 };
-use curvine_common::state::{TransferKind, TransferState};
 use orpc::{err_box, CommonResult};
 
 use crate::util::{bytes_to_string, handle_rpc_result, parse_duration};
@@ -577,7 +577,7 @@ fn print_jobs_table(jobs: &[TransferJobStatusProto], full_id: bool, verbose: boo
 
 fn print_status_summary(
     job: &TransferJobStatusProto,
-    task_summary: Option<&curvine_common::proto::TransferTaskSummaryProto>,
+    task_summary: Option<&TransferTaskSummaryProto>,
     verbose: bool,
 ) {
     let mut table = md_table();
@@ -700,7 +700,7 @@ fn print_tenants_table(tenants: &[TransferTenantSummaryProto]) {
     println!("{table}");
 }
 
-fn task_summary_text(summary: &curvine_common::proto::TransferTaskSummaryProto) -> String {
+fn task_summary_text(summary: &TransferTaskSummaryProto) -> String {
     let mut parts = vec![
         format!("{} completed", summary.completed),
         format!("{} failed", summary.failed),

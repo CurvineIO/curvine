@@ -2036,6 +2036,7 @@ dependencies = [
  "curvine-fs-api",
  "curvine-job-client",
  "curvine-model",
+ "curvine-proto",
  "curvine-ufs",
  "curvine-unified-fs",
  "mimalloc",
@@ -2270,6 +2271,7 @@ version = "0.2.0"
 dependencies = [
  "bincode",
  "curvine-client-core",
+ "curvine-config",
  "curvine-error",
  "curvine-fs-api",
  "curvine-model",
@@ -2277,6 +2279,7 @@ dependencies = [
  "log",
  "orpc",
  "serde",
+ "serde_json",
  "tokio",
 ]
 
@@ -2526,9 +2529,11 @@ dependencies = [
  "curvine-fs-api",
  "curvine-job-client",
  "curvine-model",
+ "curvine-proto",
  "curvine-ufs",
  "curvine-ufs-opendal",
  "curvine-ufs-oss-hdfs",
+ "dashmap 5.5.3",
  "log",
  "once_cell",
  "orpc",

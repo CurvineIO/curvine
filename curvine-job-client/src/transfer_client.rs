@@ -44,7 +44,7 @@ pub struct TransferClient {
 impl TransferClient {
     pub fn with_context(context: &Arc<FsContext>) -> FsResult<Self> {
         Self::with_endpoints(
-            context.conf.client_rpc_conf(),
+            context.conf().client_rpc_conf(),
             context.clone_runtime(),
             transfer_endpoints(context),
         )
@@ -59,7 +59,7 @@ impl TransferClient {
         endpoints: Vec<String>,
     ) -> FsResult<Self> {
         Self::with_endpoints(
-            context.conf.client_rpc_conf(),
+            context.conf().client_rpc_conf(),
             context.clone_runtime(),
             endpoints,
         )
@@ -95,7 +95,7 @@ impl TransferClient {
             client_request_id: command.client_request_id.clone(),
             submitter: command.submitter.clone(),
             tenant: command.tenant.clone(),
-            command: serde_json::to_string(&command).map_err(|e| FsError::common(e.to_string()))?,
+            command: serde_json::to_vec(&command).map_err(|e| FsError::common(e.to_string()))?,
             protocol_version: Some(TRANSFER_PROTOCOL_VERSION),
         };
         self.connector
@@ -232,7 +232,7 @@ impl TransferClient {
 }
 
 fn transfer_endpoints(context: &Arc<FsContext>) -> Vec<String> {
-    transfer_endpoints_from_conf(&context.conf)
+    transfer_endpoints_from_conf(context.conf())
 }
 
 fn transfer_endpoints_from_conf(conf: &ClusterConf) -> Vec<String> {

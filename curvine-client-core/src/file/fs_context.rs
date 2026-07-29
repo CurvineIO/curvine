@@ -110,6 +110,10 @@ impl FsContext {
         self.client_addr.client_name.clone()
     }
 
+    pub fn conf(&self) -> &ClusterConf {
+        &self.conf
+    }
+
     pub fn clone_runtime(&self) -> Arc<Runtime> {
         self.connector.clone_runtime()
     }

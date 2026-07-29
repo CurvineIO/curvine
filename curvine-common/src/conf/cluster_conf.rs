@@ -446,6 +446,7 @@ impl From<ClusterConf> for curvine_config::ClusterConf {
             client: conf.client,
             fuse: conf.fuse,
             job: conf.job,
+            transfer: conf.transfer,
             cli: conf.cli,
         }
     }
