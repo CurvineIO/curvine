@@ -797,14 +797,25 @@ mod tests {
         assert!(!buf.is_empty(), "the first split leaves a stale tail");
 
         FuseReceiver::<TestFileSystem>::prepare_receive_buf(&mut buf, 8);
-        buf[..3].copy_from_slice(b"new");
+        assert_eq!(
+            buf.len(),
+            8,
+            "the next receive gets exactly its read window"
+        );
 
-        let returned = buf.split_to(3);
+        let read_len = 3;
+        buf[..read_len].copy_from_slice(b"new");
+        let returned = buf.split_to(read_len);
         assert_eq!(&returned[..], b"new");
         assert_eq!(
             returned.len(),
-            3,
+            read_len,
             "only bytes reported by read are returned"
+        );
+        assert_eq!(
+            buf.len(),
+            8 - read_len,
+            "the unused read window remains internal to the reusable buffer"
         );
     }
 

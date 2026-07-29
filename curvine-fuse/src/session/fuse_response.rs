@@ -34,6 +34,9 @@ use std::io::IoSlice;
 use std::sync::{Arc, OnceLock};
 use std::vec;
 
+#[cfg(target_os = "linux")]
+const FALLBACK_IOV_MAX: usize = libc::UIO_MAXIOV as usize;
+#[cfg(not(target_os = "linux"))]
 const FALLBACK_IOV_MAX: usize = 16;
 
 #[derive(Debug)]
@@ -61,12 +64,19 @@ impl ResponseData {
 
     fn iovec_max() -> usize {
         static IOV_MAX: OnceLock<usize> = OnceLock::new();
-        *IOV_MAX.get_or_init(
-            || match nix::unistd::sysconf(nix::unistd::SysconfVar::IOV_MAX) {
-                Ok(Some(limit)) if limit > 0 => limit as usize,
-                _ => FALLBACK_IOV_MAX,
-            },
-        )
+        *IOV_MAX.get_or_init(|| {
+            let limit = nix::unistd::sysconf(nix::unistd::SysconfVar::IOV_MAX)
+                .ok()
+                .flatten();
+            Self::iovec_max_or_fallback(limit)
+        })
+    }
+
+    fn iovec_max_or_fallback(limit: Option<libc::c_long>) -> usize {
+        match limit {
+            Some(limit) if limit > 0 => limit as usize,
+            _ => FALLBACK_IOV_MAX,
+        }
     }
 
     fn checked_iovec_count(data: &[DataSlice]) -> IOResult<usize> {
@@ -185,6 +195,24 @@ impl FuseResponse {
             )
         {
             warn!("send_rep unique {}: {}", self.unique, e);
+        }
+    }
+
+    fn create_success_response(
+        &self,
+        data: Vec<DataSlice>,
+    ) -> IOResult<(ResponseData, FuseReqStatus, i32)> {
+        match ResponseData::create(self.unique, FUSE_SUCCESS, data) {
+            Ok(data) => Ok((data, FuseReqStatus::Success, 0)),
+            Err(error) => {
+                warn!(
+                    "failed to build FUSE response unique {}: {}; replying EIO",
+                    self.unique, error
+                );
+                let errno = libc::EIO;
+                let data = ResponseData::create(self.unique, errno, vec![])?;
+                Ok((data, FuseReqStatus::Error, errno))
+            }
         }
     }
 
@@ -427,11 +455,7 @@ impl FuseResponse {
                 } else {
                     vec![DataSlice::buffer(FuseUtils::struct_as_buf(&v))]
                 };
-                (
-                    ResponseData::create(self.unique, FUSE_SUCCESS, data)?,
-                    FuseReqStatus::Success,
-                    0,
-                )
+                self.create_success_response(data)?
             }
 
             Err(e) => {
@@ -505,11 +529,7 @@ impl FuseResponse {
                 if self.debug {
                     info!("send_buf unique {}, data len: {}", self.unique, v.len());
                 }
-                (
-                    ResponseData::create(self.unique, FUSE_SUCCESS, vec![DataSlice::Buffer(v)])?,
-                    FuseReqStatus::Success,
-                    0,
-                )
+                self.create_success_response(vec![DataSlice::Buffer(v)])?
             }
 
             Err(e) => {
@@ -533,11 +553,7 @@ impl FuseResponse {
                     let len = v.iter().map(|x| x.len()).sum::<usize>();
                     info!("send_data unique {}, data len: {}", self.unique, len);
                 }
-                (
-                    ResponseData::create(self.unique, FUSE_SUCCESS, v)?,
-                    FuseReqStatus::Success,
-                    0,
-                )
+                self.create_success_response(v)?
             }
 
             Err(e) => {
@@ -675,6 +691,16 @@ mod tests {
         assert!(error.to_string().contains("exceeds IOV_MAX"));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_iovec_fallback_uses_uio_maxiov() {
+        assert_eq!(
+            ResponseData::iovec_max_or_fallback(None),
+            libc::UIO_MAXIOV as usize
+        );
+        assert_eq!(ResponseData::iovec_max_or_fallback(Some(0)), 1024);
+    }
+
     #[test]
     fn as_iovec_rejects_header_length_mismatch() {
         let response = ResponseData {
@@ -741,6 +767,40 @@ mod tests {
     fn disabled_reply(unique: u64) -> (FuseResponse, AsyncReceiver<FuseTask>) {
         let (tx, rx) = AsyncChannel::new(16).split();
         (FuseResponse::new_reply(unique, tx, false, None), rx)
+    }
+
+    #[tokio::test]
+    async fn oversized_success_response_falls_back_to_eio_reply() {
+        let g = m::new_gauge("oversized_response_active", "test").unwrap();
+        let (reply, mut rx) =
+            reply_with_gauge_opcode_kind(64, &g, "OversizedRead", FuseReqKind::Stream);
+        let data = std::iter::repeat_with(DataSlice::empty)
+            .take(ResponseData::iovec_max())
+            .collect();
+
+        reply.send_data(Ok(data)).await.unwrap();
+
+        let task = rx.try_recv().unwrap().expect("an EIO reply was enqueued");
+        match &task {
+            FuseTask::RequestReply {
+                data,
+                status,
+                errno,
+                ..
+            } => {
+                assert_eq!(data.header().error, -libc::EIO);
+                assert_eq!(data.len() as usize, FUSE_OUT_HEADER_LEN);
+                assert_eq!(*status, FuseReqStatus::Error);
+                assert_eq!(*errno, libc::EIO);
+            }
+            _ => panic!("expected FuseTask::RequestReply"),
+        }
+        assert!(
+            reply.metrics.as_ref().unwrap().lock().finished,
+            "fallback reply must finish request metrics"
+        );
+        drop(task);
+        assert_eq!(g.get(), 0, "fallback reply drops the active guard once");
     }
 
     // T1: a normal metadata reply produces a RequestReply, finishes the slot
