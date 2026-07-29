@@ -12,10 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{ByteUnit, DurationUnit};
-use crate::{err_box, err_msg, CommonResult};
+use orpc_error::CommonResult;
+use orpc_runtime::common::{ByteUnit, DurationUnit};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
+
+macro_rules! err_msg {
+    ($error:expr) => {{
+        let thread = orpc_runtime::thread_name();
+        format!("[{}] ERROR: {}({}:{})", thread, $error, file!(), line!())
+    }};
+    ($format:tt, $($argument:expr),+) => {{
+        err_msg!(format!($format, $($argument),+))
+    }};
+}
+
+macro_rules! err_box {
+    ($error:expr) => {{
+        Err(err_msg!($error).into())
+    }};
+    ($format:tt, $($argument:expr),+) => {{
+        err_box!(format!($format, $($argument),+))
+    }};
+}
 
 /// Remote NVMe-oF target.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

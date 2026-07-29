@@ -27,12 +27,16 @@ pub use self::io_error::IOError;
 mod local_file;
 pub use self::local_file::LocalFile;
 
+mod spdk_conf;
+pub use self::spdk_conf::{BdevInfo, NvmeTarget, SpdkConf};
+
 pub type IOResult<T> = Result<T, IOError>;
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockDevice, BlockIO, CacheManager, DataSlice, IOError, IOResult, LocalFile, ReadAheadTask,
+        BdevInfo, BlockDevice, BlockIO, CacheManager, DataSlice, IOError, IOResult, LocalFile,
+        NvmeTarget, ReadAheadTask, SpdkConf,
     };
 
     #[test]
@@ -40,11 +44,14 @@ mod tests {
         fn assert_send<T: Send>() {}
 
         assert_send::<BlockDevice>();
+        assert_send::<BdevInfo>();
         assert_send::<CacheManager>();
         assert_send::<DataSlice>();
         assert_send::<IOError>();
         assert_send::<LocalFile>();
+        assert_send::<NvmeTarget>();
         assert_send::<ReadAheadTask>();
+        assert_send::<SpdkConf>();
 
         let _: Option<&dyn BlockIO> = None;
         let _: IOResult<()> = Ok(());

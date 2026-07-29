@@ -15,8 +15,9 @@
 #[macro_use]
 mod macros;
 
+pub mod client;
 pub mod handler;
 pub mod message;
-mod server_conf;
+pub mod server;
 
-pub use server_conf::ServerConf;
+pub use server::ServerConf;

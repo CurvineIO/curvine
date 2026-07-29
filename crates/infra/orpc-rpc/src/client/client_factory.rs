@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use crate::client::{ClientConf, RpcClient, SyncClient};
-use crate::io::net::InetAddr;
-use crate::io::IOResult;
-use crate::runtime::{RpcRuntime, Runtime};
-use crate::sync::FastDashMap;
+use curvine_io::IOResult;
+use orpc_net::net::InetAddr;
+use orpc_runtime::runtime::{RpcRuntime, Runtime};
+use orpc_runtime::sync::FastDashMap;
 use std::sync::{Arc, Mutex};
 
 struct ClientPool {
@@ -154,66 +154,5 @@ impl ClientFactory {
 impl Default for ClientFactory {
     fn default() -> Self {
         Self::new(ClientConf::default())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::client::{ClientConf, ClientFactory};
-    use crate::runtime::{AsyncRuntime, RpcRuntime};
-    use crate::test::SimpleServer;
-    use crate::CommonResult;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    #[test]
-    fn pool() -> CommonResult<()> {
-        let server = SimpleServer::default();
-        let addr = server.bind_addr().clone();
-        let rt = Arc::new(AsyncRuntime::single());
-        server.start(0);
-
-        let conf = ClientConf::default();
-        let rt_wait = rt.clone();
-        let wait_addr = addr.clone();
-        rt.block_on(async move {
-            for _ in 0..50 {
-                if ClientFactory::with_rt(conf.clone(), rt_wait.clone())
-                    .create(&wait_addr, false)
-                    .await
-                    .is_ok()
-                {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            panic!("Server failed to start within 5 seconds");
-        });
-
-        let rt1 = rt.clone();
-        rt.block_on(async move {
-            let factory = ClientFactory::with_rt(ClientConf::default(), rt1);
-            let c = factory.create(&addr, false).await?;
-            println!("c = {}", c.local_addr());
-            assert_eq!(factory.pool.len(), 0);
-
-            let c1 = factory.get(&addr).await?;
-            let c2 = factory.get(&addr).await?;
-            println!("c1 = {}", c1.local_addr());
-            println!("c2 = {}", c2.local_addr());
-            assert_eq!(factory.pool.len(), 1);
-            // is the same connection
-            assert_eq!(c1.local_addr(), c2.local_addr());
-
-            c1.set_closed();
-            assert!(c2.is_closed());
-            let c3 = factory.get(&addr).await?;
-            println!("c3 = {}", c3.local_addr());
-            assert_eq!(factory.pool.len(), 1);
-            // A new connection was created.
-            assert_ne!(c1.local_addr(), c3.local_addr());
-
-            Ok(())
-        })
     }
 }

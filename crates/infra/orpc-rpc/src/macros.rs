@@ -39,3 +39,12 @@ macro_rules! err_box {
         err_box!(format!($f, $($arg),+))
     }};
 }
+
+macro_rules! try_err {
+    ($expr:expr) => {{
+        match $expr {
+            Ok(result) => result,
+            Err(error) => return err_box!(error),
+        }
+    }};
+}

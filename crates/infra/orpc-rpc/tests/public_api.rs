@@ -12,11 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use orpc_rpc::{handler::RpcCodec, message::Message, ServerConf};
+use orpc_rpc::{
+    client::{ClientConf, ClientFactory, RpcClient},
+    handler::RpcCodec,
+    message::Message,
+    server::{RpcServer, ServerConf, ServerMonitor},
+};
 
 #[test]
 fn exposes_rpc_infrastructure() {
+    let _ = std::any::TypeId::of::<ClientConf>();
+    let _ = std::any::TypeId::of::<ClientFactory>();
+    let _ = std::any::TypeId::of::<RpcClient>();
     let _ = std::any::TypeId::of::<RpcCodec>();
     let _ = std::any::TypeId::of::<Message>();
+    let _ = std::any::TypeId::of::<RpcServer<()>>();
+    let _ = std::any::TypeId::of::<ServerMonitor>();
     let _ = ServerConf::with_hostname("127.0.0.1", 8995);
 }
