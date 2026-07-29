@@ -28,6 +28,9 @@ pub(crate) struct CvMetadataChange {
     pub(crate) include_subtree: bool,
 }
 
+pub const JOURNAL_ENVELOPE_MAGIC: &[u8; 8] = b"CVJNL001";
+pub const JOURNAL_ENVELOPE_VERSION: u16 = 1;
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct MkdirEntry {
     pub(crate) op_id: u64,
@@ -489,5 +492,162 @@ impl From<LegacyJournalEntry> for JournalEntry {
             LegacyJournalEntry::UfsApplied(entry) => Self::UfsApplied(entry),
             LegacyJournalEntry::Snapshot(entry) => Self::Snapshot(entry),
         }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct JournalEnvelope {
+    pub version: u16,
+    pub batch: JournalCommandBatch,
+}
+
+impl JournalEnvelope {
+    pub fn encode(batch: JournalCommandBatch) -> CommonResult<Vec<u8>> {
+        let mut bytes = JOURNAL_ENVELOPE_MAGIC.to_vec();
+        bytes.extend(SerdeUtils::serialize(&Self {
+            version: JOURNAL_ENVELOPE_VERSION,
+            batch,
+        })?);
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> CommonResult<DecodedJournalBatch> {
+        if !bytes.starts_with(JOURNAL_ENVELOPE_MAGIC) {
+            return Ok(DecodedJournalBatch::Legacy(
+                JournalBatch::deserialize_compat(bytes)?,
+            ));
+        }
+
+        let envelope: JournalEnvelope =
+            SerdeUtils::deserialize(&bytes[JOURNAL_ENVELOPE_MAGIC.len()..])?;
+        if envelope.version != JOURNAL_ENVELOPE_VERSION {
+            return err_box!(
+                "unsupported journal envelope version {}, expected {}",
+                envelope.version,
+                JOURNAL_ENVELOPE_VERSION
+            );
+        }
+        Ok(DecodedJournalBatch::Versioned(envelope.batch))
+    }
+}
+
+pub enum DecodedJournalBatch {
+    Legacy(JournalBatch),
+    Versioned(JournalCommandBatch),
+}
+
+impl DecodedJournalBatch {
+    pub fn len(&self) -> usize {
+        match self {
+            DecodedJournalBatch::Legacy(batch) => batch.len(),
+            DecodedJournalBatch::Versioned(batch) => batch.len(),
+        }
+    }
+
+    pub fn into_commands(self) -> Vec<JournalCommand> {
+        match self {
+            DecodedJournalBatch::Legacy(batch) => batch
+                .batch
+                .into_iter()
+                .map(JournalCommand::Legacy)
+                .collect(),
+            DecodedJournalBatch::Versioned(batch) => batch.commands,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct JournalCommandBatch {
+    pub seq_id: u64,
+    pub commands: Vec<JournalCommand>,
+}
+
+impl JournalCommandBatch {
+    pub fn new(seq_id: u64) -> Self {
+        Self {
+            seq_id,
+            commands: vec![],
+        }
+    }
+
+    pub fn push_legacy(&mut self, entry: JournalEntry) {
+        self.commands.push(JournalCommand::Legacy(entry))
+    }
+
+    pub fn push_metadata(&mut self, command: MetadataCommand) {
+        self.commands.push(JournalCommand::Metadata(command))
+    }
+
+    pub fn len(&self) -> usize {
+        self.commands.len()
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub enum JournalCommand {
+    Legacy(JournalEntry),
+    Metadata(MetadataCommand),
+}
+
+impl JournalCommand {
+    pub fn op_id(&self) -> u64 {
+        match self {
+            JournalCommand::Legacy(entry) => entry.op_id(),
+            JournalCommand::Metadata(command) => command.op_id(),
+        }
+    }
+
+    pub fn rpc_id(&self) -> i64 {
+        match self {
+            JournalCommand::Legacy(entry) => entry.rpc_id(),
+            JournalCommand::Metadata(command) => command.rpc_id(),
+        }
+    }
+
+    pub fn inode_id(&self) -> Option<i64> {
+        match self {
+            JournalCommand::Legacy(entry) => entry.inode_id(),
+            JournalCommand::Metadata(command) => command.inode_id(),
+        }
+    }
+
+    pub fn allocated_inode_id(&self) -> Option<i64> {
+        match self {
+            JournalCommand::Legacy(entry) => entry.allocated_inode_id(),
+            JournalCommand::Metadata(command) => command.allocated_inode_id(),
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub enum MetadataCommand {
+    Mkdir(MkdirEntry),
+    CreateFile(CreateFileEntry),
+}
+
+impl MetadataCommand {
+    pub fn op_id(&self) -> u64 {
+        match self {
+            MetadataCommand::Mkdir(entry) => entry.op_id,
+            MetadataCommand::CreateFile(entry) => entry.op_id,
+        }
+    }
+
+    pub fn rpc_id(&self) -> i64 {
+        match self {
+            MetadataCommand::Mkdir(entry) => entry.rpc_id,
+            MetadataCommand::CreateFile(entry) => entry.rpc_id,
+        }
+    }
+
+    pub fn inode_id(&self) -> Option<i64> {
+        match self {
+            MetadataCommand::Mkdir(entry) => Some(entry.dir.id),
+            MetadataCommand::CreateFile(entry) => Some(entry.file.id),
+        }
+    }
+
+    pub fn allocated_inode_id(&self) -> Option<i64> {
+        self.inode_id()
     }
 }
