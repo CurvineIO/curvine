@@ -40,6 +40,7 @@ clap = { workspace = true }
 mini-moka = { workspace = true }
 regex = { workspace = true }
 linked-hash-map = { workspace = true }
+crossbeam = { workspace = true }
 rusqlite = { workspace = true }
 mysql = { workspace = true }
 dashmap = { workspace = true }

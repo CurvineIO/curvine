@@ -2310,6 +2310,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "crossbeam",
  "curvine-client",
  "curvine-common",
  "curvine-error",
