@@ -14,9 +14,9 @@
 
 #![allow(clippy::should_implement_trait)]
 
-use crate::common::Utils;
-use crate::io::net::InetAddr;
-use crate::io::IOResult;
+use crate::net::InetAddr;
+use curvine_io::IOResult;
+use orpc_runtime::common::Utils;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::ops::Deref;
@@ -74,8 +74,8 @@ impl Deref for NodeAddr {
 
 #[cfg(test)]
 mod tests {
-    use crate::io::net::NodeAddr;
-    use crate::CommonResult;
+    use crate::net::NodeAddr;
+    use orpc_error::CommonResult;
 
     #[test]
     fn parse() -> CommonResult<()> {

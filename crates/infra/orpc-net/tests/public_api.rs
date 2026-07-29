@@ -12,19 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::io::net::InetAddr;
+use orpc_net::net::{InetAddr, NodeAddr};
+use orpc_net::retry::{LimitedRetry, TimeoutRetry};
 
-#[derive(Debug, Clone, Default)]
-pub struct ConnState {
-    pub remote_addr: InetAddr,
-    pub local_addr: InetAddr,
-}
+#[test]
+fn exposes_network_and_retry_primitives() {
+    let inet_addr = InetAddr::new("127.0.0.1", 8080);
+    let node_addr = NodeAddr::from_addr(1, inet_addr.clone());
 
-impl ConnState {
-    pub fn new(remote_addr: InetAddr, local_addr: InetAddr) -> Self {
-        Self {
-            remote_addr,
-            local_addr,
-        }
-    }
+    assert_eq!(node_addr.addr(), &inet_addr);
+    assert_eq!(LimitedRetry::new(1, 0).count(), 0);
+    assert!(TimeoutRetry::new(1, 0).attempt_blocking());
 }

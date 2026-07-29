@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{LocalTime, Utils};
+use orpc_runtime::common::{LocalTime, Utils};
 use std::time::Duration;
 
 // Timeout-based retry policy.
@@ -62,7 +62,7 @@ impl TimeoutRetry {
 
 #[cfg(test)]
 mod test {
-    use crate::io::retry::TimeoutRetry;
+    use crate::retry::TimeoutRetry;
     use std::time::Duration;
 
     #[tokio::test]

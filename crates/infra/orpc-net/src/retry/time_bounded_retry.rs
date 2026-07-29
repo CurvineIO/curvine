@@ -104,8 +104,8 @@ impl Default for TimeBondedRetryBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::common::LocalTime;
-    use crate::io::retry::TimeBondedRetry;
+    use crate::retry::TimeBondedRetry;
+    use orpc_runtime::common::LocalTime;
     use std::time::Duration;
 
     #[tokio::test]
@@ -117,7 +117,6 @@ mod tests {
         );
 
         let items: Vec<u64> = vec![10, 20, 40, 80, 100];
-
         let iter = items.into_iter();
         assert!(retry.attempt().await);
 
