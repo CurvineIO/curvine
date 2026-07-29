@@ -37,6 +37,7 @@ const TRANSFER_COMMIT_JOB_ID_XATTR: &str = "curvine.transfer.job_id";
 const TRANSFER_COMMIT_RUN_ID_XATTR: &str = "curvine.transfer.run_id";
 const TRANSFER_COMMIT_TASK_ID_XATTR: &str = "curvine.transfer.task_id";
 const TRANSFER_COMMIT_SOURCE_PATH_XATTR: &str = "curvine.transfer.source_path";
+const TRANSFER_COMMIT_TARGET_PATH_XATTR: &str = "curvine.transfer.target_path";
 
 pub struct LoadTaskRunner {
     task: Arc<TaskContext>,
@@ -196,6 +197,10 @@ impl LoadTaskRunner {
                     .add_x_attr(
                         TRANSFER_COMMIT_SOURCE_PATH_XATTR,
                         self.task.info.source_path.as_bytes().to_vec(),
+                    )
+                    .add_x_attr(
+                        TRANSFER_COMMIT_TARGET_PATH_XATTR,
+                        self.task.info.target_path.as_bytes().to_vec(),
                     );
             }
         }
@@ -398,7 +403,24 @@ impl LoadTaskRunner {
             }
         } else {
             let ufs = self.get_ufs()?;
-            commit_ufs_output(&ufs, temp_path, &stream.final_path, overwrite).await?;
+            match self
+                .validate_ufs_commit_target(&ufs, &stream.final_path, overwrite)
+                .await?
+            {
+                CommitTarget::RenameTemp => {
+                    self.mark_ufs_commit_source(&stream.final_path).await?;
+                    rename_ufs_output(&ufs, temp_path, &stream.final_path).await?;
+                }
+                CommitTarget::AlreadyCommitted => {
+                    if let Err(err) = ufs.delete(temp_path, false).await {
+                        warn!(
+                            "delete redundant transfer temp output {} failed after idempotent commit check: {}",
+                            temp_path.full_path(),
+                            err
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -437,27 +459,114 @@ impl LoadTaskRunner {
         {
             return false;
         }
+        self.has_transfer_commit_marker(target_status, None)
+    }
+
+    async fn validate_ufs_commit_target(
+        &self,
+        ufs: &UfsFileSystem,
+        path: &Path,
+        overwrite: bool,
+    ) -> FsResult<CommitTarget> {
+        match ufs.get_status(path).await {
+            Ok(status) if status.is_dir => err_box!(
+                "Transfer target {} is a directory; refusing to overwrite directory with file",
+                path.full_path()
+            ),
+            Ok(status) if !overwrite => {
+                let source_path = Path::from_str(&self.task.info.source_path)?;
+                let source_status = self.fs.get_status(&source_path).await?;
+                if self.is_committed_ufs_output(&status, source_status, path) {
+                    Ok(CommitTarget::AlreadyCommitted)
+                } else {
+                    Err(FsError::file_exists(path.full_path()))
+                }
+            }
+            Ok(_) => Ok(CommitTarget::RenameTemp),
+            Err(FsError::FileNotFound(_)) => Ok(CommitTarget::RenameTemp),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn is_committed_ufs_output(
+        &self,
+        target_status: &FileStatus,
+        source_status: FileStatus,
+        target_path: &Path,
+    ) -> bool {
+        target_status.len == source_status.len
+            && self.has_transfer_commit_marker(&source_status, Some(target_path))
+    }
+
+    fn has_transfer_commit_marker(&self, status: &FileStatus, target_path: Option<&Path>) -> bool {
         let Some(report) = &self.task.info.transfer_report else {
             return false;
         };
-
         xattr_equals(
-            target_status,
+            status,
             TRANSFER_COMMIT_JOB_ID_XATTR,
             self.task.info.job.job_id.as_bytes(),
         ) && xattr_equals(
-            target_status,
+            status,
             TRANSFER_COMMIT_RUN_ID_XATTR,
             report.run_id.to_string().as_bytes(),
         ) && xattr_equals(
-            target_status,
+            status,
             TRANSFER_COMMIT_TASK_ID_XATTR,
             self.task.info.task_id.as_bytes(),
         ) && xattr_equals(
-            target_status,
+            status,
             TRANSFER_COMMIT_SOURCE_PATH_XATTR,
             self.task.info.source_path.as_bytes(),
-        )
+        ) && target_path.is_none_or(|path| {
+            xattr_equals(
+                status,
+                TRANSFER_COMMIT_TARGET_PATH_XATTR,
+                path.full_path().as_bytes(),
+            )
+        })
+    }
+
+    async fn mark_ufs_commit_source(&self, target_path: &Path) -> FsResult<()> {
+        if self.task.info.transfer_report.is_none() {
+            return Ok(());
+        }
+        let source_path = Path::from_str(&self.task.info.source_path)?;
+        if !source_path.is_cv() {
+            return err_box!(
+                "Transfer export source {} must be a Curvine path",
+                source_path.full_path()
+            );
+        }
+        let report = self.task.info.transfer_report.as_ref().unwrap();
+        self.fs
+            .set_attr(
+                &source_path,
+                SetAttrOptsBuilder::new()
+                    .add_x_attr(
+                        TRANSFER_COMMIT_JOB_ID_XATTR,
+                        self.task.info.job.job_id.as_bytes().to_vec(),
+                    )
+                    .add_x_attr(
+                        TRANSFER_COMMIT_RUN_ID_XATTR,
+                        report.run_id.to_string().into_bytes(),
+                    )
+                    .add_x_attr(
+                        TRANSFER_COMMIT_TASK_ID_XATTR,
+                        self.task.info.task_id.as_bytes().to_vec(),
+                    )
+                    .add_x_attr(
+                        TRANSFER_COMMIT_SOURCE_PATH_XATTR,
+                        self.task.info.source_path.as_bytes().to_vec(),
+                    )
+                    .add_x_attr(
+                        TRANSFER_COMMIT_TARGET_PATH_XATTR,
+                        target_path.full_path().as_bytes().to_vec(),
+                    )
+                    .build(),
+            )
+            .await
+            .map(|_| ())
     }
 
     async fn open_unified(&self, path: &Path) -> FsResult<UnifiedReader> {
@@ -585,24 +694,11 @@ impl LoadTaskRunner {
     }
 }
 
-async fn commit_ufs_output(
+async fn rename_ufs_output(
     ufs: &UfsFileSystem,
     temp_path: &Path,
     final_path: &Path,
-    overwrite: bool,
 ) -> FsResult<()> {
-    match ufs.get_status(final_path).await {
-        Ok(status) if status.is_dir => {
-            return err_box!(
-                "Transfer target {} is a directory; refusing to overwrite directory with file",
-                final_path.full_path()
-            );
-        }
-        Ok(_) if !overwrite => return Err(FsError::file_exists(final_path.full_path())),
-        Ok(_) | Err(FsError::FileNotFound(_)) => {}
-        Err(err) => return Err(err),
-    }
-
     if let Some(parent) = final_path.parent()? {
         ufs.mkdir(&parent, true).await?;
     }
@@ -626,7 +722,7 @@ fn xattr_equals(status: &FileStatus, key: &str, expected: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::commit_ufs_output;
+    use super::rename_ufs_output;
     use curvine_client::unified::UfsFileSystem;
     use curvine_common::fs::Path;
     use orpc::runtime::{AsyncRuntime, RpcRuntime};
@@ -634,7 +730,7 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn failed_ufs_overwrite_commit_keeps_existing_target() {
+    fn failed_ufs_rename_keeps_existing_target() {
         let base_dir = std::env::temp_dir().join(format!(
             "transfer-ufs-commit-{}-{}",
             std::process::id(),
@@ -649,7 +745,7 @@ mod tests {
         let ufs = UfsFileSystem::new(&target, HashMap::new(), None).unwrap();
         let rt = AsyncRuntime::single();
         let err = rt
-            .block_on(commit_ufs_output(&ufs, &missing_temp, &target, true))
+            .block_on(rename_ufs_output(&ufs, &missing_temp, &target))
             .unwrap_err();
         assert!(err.to_string().contains("No such file") || err.to_string().contains("not found"));
         assert_eq!(
