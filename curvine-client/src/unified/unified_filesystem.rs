@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::file::{CurvineFileSystem, FsClient, FsContext, FsReader};
-use crate::rpc::JobMasterClient;
+use crate::rpc::{JobMasterClient, TransferClient};
 use crate::unified::{FallbackFsReader, MountCache, MountValue, UnifiedReader, UnifiedWriter};
 use crate::ClientMetrics;
 use bytes::BytesMut;
@@ -22,11 +22,12 @@ use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, FsKind, ListStream, Path, Reader, RpcCode, Writer};
 use curvine_common::state::{
     CreateFileOpts, FileAllocOpts, FileLock, FileStatus, FreeResult, JobStatus, ListOptions,
-    LoadJobCommand, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags,
-    SetAttrOpts,
+    MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
+    TransferCommand, TransferKind, TransferState,
 };
 use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
+use dashmap::DashSet;
 use log::{debug, error, info, warn};
 use orpc::common::TimeSpent;
 use orpc::runtime::{RpcRuntime, Runtime};
@@ -34,6 +35,10 @@ use orpc::{err_box, err_ext};
 use std::borrow::Cow;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time;
+
+const TRANSFER_SUBMIT_MAX_ATTEMPTS: usize = 3;
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
@@ -49,6 +54,7 @@ pub struct UnifiedFileSystem {
     enable_unified: bool,
     enable_read_ufs: bool,
     audit_logging_enabled: bool,
+    async_cache_pending: Arc<DashSet<String>>,
     metrics: &'static ClientMetrics,
 }
 
@@ -66,6 +72,7 @@ impl UnifiedFileSystem {
             enable_unified,
             enable_read_ufs,
             audit_logging_enabled,
+            async_cache_pending: Arc::new(DashSet::new()),
             metrics: FsContext::get_metrics(),
         };
 
@@ -432,44 +439,120 @@ impl UnifiedFileSystem {
     }
 
     pub fn async_cache(&self, source_path: &Path) -> FsResult<()> {
-        let client = JobMasterClient::new(self.fs_client());
         let source_path = source_path.clone_uri();
+        if self.async_cache_pending.contains(&source_path) {
+            debug!("async cache request already pending for {}", source_path);
+            return Ok(());
+        }
+        let pending_capacity = self.cv.conf().transfer.client_pending_queue_size();
+        if self.async_cache_pending.len() >= pending_capacity {
+            return Err(FsError::transfer_overloaded(format!(
+                "client async cache pending queue is full, capacity={}",
+                pending_capacity
+            )));
+        }
+        self.async_cache_pending.insert(source_path.clone());
+        let fs = self.clone();
         let log = self.audit_logging_enabled;
         let metrics = self.metrics;
 
         self.fs_context().rt().spawn(async move {
             let time = TimeSpent::new();
-            let command = LoadJobCommand::builder(source_path.clone()).build();
-            let res = client.submit_load_job(command).await;
+            let res = fs.submit_async_cache(&source_path).await;
 
             let used_us = time.used_us();
+            let metric_name = res
+                .as_ref()
+                .map(|(cmd, _, _)| cmd.as_str())
+                .unwrap_or("SubmitCacheJob");
             metrics
                 .metadata_operation_duration
-                .with_label_values(&["SubmitJob"])
+                .with_label_values(&[metric_name])
                 .observe(used_us as f64);
 
             match res {
                 Err(e) => warn!("submit async cache error for {}: {}", source_path, e),
-                Ok(res) => {
+                Ok((cmd, job_id, target_path)) => {
                     if log {
                         info!(
                             target: "audit",
                             "cmd={} ok={} src={} dst={} usedUs={}",
-                            "SubmitJob",
+                            cmd,
                             true,
                             source_path,
-                            res.target_path,
+                            target_path,
                            used_us
                         );
                     }
+                    debug!(
+                        "submitted async cache transfer {} for {}",
+                        job_id, source_path
+                    );
                 }
             }
+            fs.async_cache_pending.remove(&source_path);
         });
 
         Ok(())
     }
 
+    async fn submit_async_cache(&self, source_path: &str) -> FsResult<(String, String, String)> {
+        if self.cv.conf().transfer.enabled {
+            let client = TransferClient::with_context(self.fs_context())?;
+            let command = self
+                .cache_transfer_command(&Path::from_str(source_path)?)
+                .await?;
+            let target_path = command.target_path.clone();
+            let rep = submit_transfer_with_backoff(&client, command).await?;
+            return Ok(("SubmitTransfer".to_string(), rep.job_id, target_path));
+        }
+        Err(FsError::common(format!(
+            "auto cache load requires transfer.enabled=true and a running curvine-transfer service; refusing to submit legacy Master LoadJob for {}",
+            source_path
+        )))
+    }
+
+    async fn cache_transfer_command(&self, requested_path: &Path) -> FsResult<TransferCommand> {
+        let mount = self
+            .mount_cache
+            .get_mount(self, requested_path)
+            .await?
+            .ok_or_else(|| FsError::common(format!("{} is not mounted", requested_path)))?;
+        let (source, target) = if requested_path.is_cv() {
+            (mount.get_ufs_path(requested_path)?, requested_path.clone())
+        } else {
+            (requested_path.clone(), mount.get_cv_path(requested_path)?)
+        };
+        mount.ufs()?.get_status(&source).await?;
+
+        Ok(TransferCommand {
+            kind: TransferKind::Load,
+            source_path: source.clone_uri(),
+            target_path: target.clone_uri(),
+            client_request_id: TransferCommand::default_client_request_id(
+                TransferKind::Load,
+                source.clone_uri(),
+                target.clone_uri(),
+            ),
+            submitter: "curvine-client".to_string(),
+            tenant: String::new(),
+            options: Default::default(),
+        })
+    }
+
     pub async fn wait_job_complete(&self, path: &Path, fail_if_not_found: bool) -> FsResult<()> {
+        if self.cv.conf().transfer.enabled {
+            let command = self.cache_transfer_command(path).await?;
+            let client = TransferClient::with_context(self.fs_context())?;
+            let job = submit_transfer_with_backoff(&client, command).await?;
+            return wait_transfer_complete(
+                &client,
+                &job.job_id,
+                &self.cv.conf().client,
+                fail_if_not_found,
+            )
+            .await;
+        }
         if !path.is_cv() {
             return err_box!("the current file {} is not a cache file", path);
         }
@@ -670,6 +753,123 @@ impl UnifiedFileSystem {
             }
         };
         self.track("SetLock", path.path(), "", fut).await
+    }
+}
+
+async fn submit_transfer_with_backoff(
+    client: &TransferClient,
+    command: TransferCommand,
+) -> FsResult<curvine_common::proto::SubmitTransferResponse> {
+    let mut attempt = 0usize;
+    loop {
+        match client.submit(command.clone()).await {
+            Ok(response) => return Ok(response),
+            Err(err)
+                if attempt + 1 < TRANSFER_SUBMIT_MAX_ATTEMPTS
+                    && retryable_transfer_submit_error(&err) =>
+            {
+                attempt += 1;
+                let delay_ms = 200_u64.saturating_mul(1_u64 << (attempt - 1));
+                warn!(
+                    "retry transfer submit for {} after retryable error (attempt {}/{}): {}",
+                    command.source_path,
+                    attempt + 1,
+                    TRANSFER_SUBMIT_MAX_ATTEMPTS,
+                    err
+                );
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn retryable_transfer_submit_error(err: &FsError) -> bool {
+    match err {
+        FsError::IO(_)
+        | FsError::Pipeline(_)
+        | FsError::Timeout(_)
+        | FsError::TransferOverloaded(_)
+        | FsError::TransferStoreUnavailable(_) => true,
+        FsError::Common(inner) => {
+            let message = inner.to_string();
+            message.contains("TransferQueueFull")
+                || message.contains("TransferOverloaded")
+                || message.contains("TransferStoreUnavailable")
+                || message.contains("sqlite transfer store error:")
+                || message.contains("mysql transfer store error:")
+        }
+        _ => false,
+    }
+}
+
+async fn wait_transfer_complete(
+    client: &TransferClient,
+    job_id: &str,
+    client_conf: &curvine_common::conf::ClientConf,
+    fail_if_not_found: bool,
+) -> FsResult<()> {
+    time::timeout(
+        Duration::from_millis(client_conf.max_sync_wait_timeout_ms),
+        wait_transfer_complete0(client, job_id, client_conf, fail_if_not_found),
+    )
+    .await?
+}
+
+async fn wait_transfer_complete0(
+    client: &TransferClient,
+    job_id: &str,
+    client_conf: &curvine_common::conf::ClientConf,
+    fail_if_not_found: bool,
+) -> FsResult<()> {
+    let mut ticks = 0_u64;
+    let elapsed = TimeSpent::new();
+
+    loop {
+        let status = match client.status(job_id).await {
+            Ok(status) => status,
+            Err(err @ FsError::JobNotFound(_)) if !fail_if_not_found => {
+                time::sleep(Duration::from_millis(
+                    client_conf.sync_check_interval_min_ms,
+                ))
+                .await;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        let state = TransferState::from(status.state);
+        match state {
+            TransferState::Completed => return Ok(()),
+            TransferState::Failed | TransferState::Canceled | TransferState::PartialSuccess => {
+                return err_box!(
+                    "transfer {} {:?}: {}",
+                    status.job_id,
+                    state,
+                    status.progress.message
+                )
+            }
+            TransferState::Pending
+            | TransferState::Planning
+            | TransferState::Dispatching
+            | TransferState::Running
+            | TransferState::Canceling => {
+                ticks += 1;
+                let sleep_ms = client_conf
+                    .sync_check_interval_max_ms
+                    .min(client_conf.sync_check_interval_min_ms.saturating_mul(ticks));
+                time::sleep(Duration::from_millis(sleep_ms)).await;
+
+                if ticks.is_multiple_of(u64::from(client_conf.sync_check_log_tick)) {
+                    info!(
+                        "waiting for transfer {} to complete, elapsed: {} ms, loaded_size={}, total_size={}",
+                        status.job_id,
+                        elapsed.used_ms(),
+                        status.progress.loaded_size,
+                        status.progress.total_size
+                    );
+                }
+            }
+        }
     }
 }
 

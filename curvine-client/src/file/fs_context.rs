@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::block::{BlockClient, BlockClientPool};
-use crate::file::CurvineFileSystem;
+use crate::file::FsClient;
 use crate::ClientMetrics;
 use curvine_common::conf::ClusterConf;
 use curvine_common::proto::ClientAddressProto;
@@ -33,7 +33,7 @@ use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::CacheManager;
 use std::future::Future;
 use std::hash::BuildHasherDefault;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 static CLIENT_METRICS: OnceCell<ClientMetrics> = OnceCell::new();
@@ -219,23 +219,45 @@ impl FsContext {
         self.failed_workers.iter().map(|x| x.1.worker_id).collect()
     }
 
-    pub fn start_clean_task(fs: CurvineFileSystem, pool: Arc<BlockClientPool>) {
-        let metric_report_enable = fs.conf().client.metric_report_enable;
-        let interval = Duration::from_millis(fs.conf().client.clean_task_interval_ms);
+    pub fn start_clean_task(context: &Arc<FsContext>, pool: Arc<BlockClientPool>) {
+        let metric_report_enable = context.conf.client.metric_report_enable;
+        let interval = Duration::from_millis(context.conf.client.clean_task_interval_ms);
+        let context = Arc::downgrade(context);
 
-        fs.clone_runtime().spawn(async move {
-            let mut interval = tokio::time::interval(interval);
-            loop {
-                interval.tick().await;
+        if let Some(strong_context) = context.upgrade() {
+            strong_context.clone_runtime().spawn(async move {
+                Self::run_clean_task(context, pool, metric_report_enable, interval).await;
+            });
+        }
+    }
 
-                pool.clear_idle_conn();
+    async fn run_clean_task(
+        context: Weak<FsContext>,
+        pool: Arc<BlockClientPool>,
+        metric_report_enable: bool,
+        interval: std::time::Duration,
+    ) {
+        let mut interval = tokio::time::interval(interval);
+        loop {
+            interval.tick().await;
 
-                if metric_report_enable {
-                    if let Err(e) = fs.metrics_report().await {
-                        warn!("metrics report: {}", e)
-                    }
+            pool.clear_idle_conn();
+
+            if metric_report_enable {
+                let Some(context) = context.upgrade() else {
+                    return;
+                };
+                if let Err(e) = Self::metrics_report(&context).await {
+                    warn!("metrics report: {}", e);
                 }
+            } else if context.strong_count() == 0 {
+                return;
             }
-        });
+        }
+    }
+
+    async fn metrics_report(context: &Arc<FsContext>) -> FsResult<()> {
+        let metrics = ClientMetrics::encode()?;
+        FsClient::new(context.clone()).metrics_report(metrics).await
     }
 }
