@@ -376,13 +376,17 @@ impl CurvineFileSystem {
         plus: bool,
     ) -> FuseResult<(FuseDirentList, u64)> {
         let handle = self.state.find_dir_handle(header.nodeid, arg.fh)?;
+        let path = Path::from_str(&handle.path)?;
 
         let mut res = FuseDirentList::new(arg);
         let mut index = arg.offset;
-        let mut batch = handle.get_batch(arg.offset as usize).await?;
+        let mut batch = handle
+            .get_batch(arg.offset as usize, || self.state.list_stream(&path))
+            .await?;
         {
             let mut dir = self.state.dir_write();
             while let Some(status) = batch.pop_front() {
+                let status = status.as_ref();
                 let attr = if status.name != FUSE_CURRENT_DIR && status.name != FUSE_PARENT_DIR {
                     // READDIRPLUS takes a kernel lookup ref (kernel caches the
                     // dentry and will send a FORGET); plain READDIR must not
@@ -394,22 +398,19 @@ impl CurvineFileSystem {
                     self.state.record_status_put();
                     attr
                 } else {
-                    FuseUtils::status_to_attr(&self.conf, &status)?
+                    FuseUtils::status_to_attr(&self.conf, status)?
                 };
 
                 let entry = FuseUtils::create_entry_out(&self.conf, attr);
                 // dirent `off` is the resume cookie = position of the NEXT entry.
                 // See `readdir_next_cookie` (the infinite-loop guard).
                 let next_off = Self::readdir_next_cookie(index);
-                if !res.add_dirent(plus, next_off, &status, entry) {
-                    batch.push_front(status);
+                if !res.add_dirent(plus, next_off, status, entry) {
                     break;
                 }
                 index += 1;
             }
         }
-        handle.set_buf(batch).await?;
-
         let entries = index.saturating_sub(arg.offset);
         Ok((res, entries))
     }
@@ -2832,7 +2833,12 @@ mod tests {
                         1000,
                         ListStream::from_vec(entries(names)),
                     );
-                    let batch = handle.get_batch(offset as usize).await.unwrap();
+                    let batch = handle
+                        .get_batch(offset as usize, || async {
+                            Ok(ListStream::from_vec(entries(names)))
+                        })
+                        .await
+                        .unwrap();
                     if batch.is_empty() {
                         return Ok(seen); // kernel sees 0 entries => readdir done
                     }
@@ -2901,7 +2907,12 @@ mod tests {
                 for _ in 0..max_rounds {
                     let handle =
                         DirHandle::new(1, 1, &path, 1000, ListStream::from_vec(entries(names)));
-                    let batch = handle.get_batch(offset as usize).await.unwrap();
+                    let batch = handle
+                        .get_batch(offset as usize, || async {
+                            Ok(ListStream::from_vec(entries(names)))
+                        })
+                        .await
+                        .unwrap();
                     if batch.is_empty() {
                         return Ok(seen); // kernel sees 0 entries => readdir done
                     }
@@ -2996,7 +3007,12 @@ mod tests {
                 let mut offset: u64 = 0;
 
                 for _ in 0..max_rounds {
-                    let mut batch = handle.get_batch(offset as usize).await.unwrap();
+                    let mut batch = handle
+                        .get_batch(offset as usize, || async {
+                            Ok(ListStream::from_vec(entries(names)))
+                        })
+                        .await
+                        .unwrap();
                     if batch.is_empty() {
                         return Ok(seen); // kernel sees 0 entries => readdir done
                     }
@@ -3017,9 +3033,6 @@ mod tests {
                             None => break,
                         }
                     }
-                    // Push the unemitted remainder back, exactly as the daemon does
-                    // when the kernel response buffer fills mid-batch.
-                    handle.set_buf(batch).await.unwrap();
                     offset = last_cookie;
                 }
                 Err(format!(
