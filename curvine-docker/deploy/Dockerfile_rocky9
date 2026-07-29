@@ -207,7 +207,9 @@ WORKDIR $APP_HOME
 # 8997: Worker RPC
 # 9000: Master Web UI
 # 9001: Worker Web UI / Master Web1
-EXPOSE 8995 8996 8997 9000 9001
+# 9010: Transfer RPC
+# 9011: Transfer Web UI
+EXPOSE 8995 8996 8997 9000 9001 9010 9011
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["master", "start"]
