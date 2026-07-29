@@ -27,12 +27,13 @@ use crate::{
     FUSE_ROOT_ID, STATE_FILE_MAGIC, STATE_FILE_VERSION,
 };
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::conf::{ClientConf, ClusterConf, FuseConf};
+use curvine_common::conf::{ClientConf, FuseConf};
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, ListStream, Path, StateReader, StateWriter};
 use curvine_common::state::{
     CreateFileOpts, FileAllocOpts, FileStatus, ListOptions, MkdirOpts, OpenFlags, SetAttrOpts,
 };
+use curvine_config::ClusterConf;
 use futures::stream::{self, StreamExt};
 use log::{debug, error, info, warn};
 use orpc::common::FastHashMap;
@@ -98,11 +99,6 @@ impl NodeState {
         self.fs.conf()
     }
 
-    /// Invalidate the cached entry for `(ino, name)` on a mutation and record the
-    /// `user_meta_cache_invalidations_total{cache,reason}` counter. Mirrors the
-    /// pre-refactor `invalidate_cache`: a no-op (and no metric) when the metadata
-    /// cache is disabled, and the metric is additionally gated on `metrics_enabled`.
-    /// `reason` is a static call-site reason; it does not change what is invalidated.
     pub fn invalid_cache(&self, ino: u64, name: Option<&str>, reason: &'static str) {
         if !self.enable_meta_cache {
             return;
@@ -336,9 +332,7 @@ impl NodeState {
         self.writers.get(&ino).await
     }
 
-    // Get or create the writer registered under `ino`. The caller is
-    // responsible for resolving the inode first (see `new_handle`), so that the
-    // writer-map key and the handle ino are guaranteed to be the same value.
+    // Caller resolves ino first so writer-map key matches the handle inode.
     pub async fn get_or_create_writer(
         &self,
         ino: u64,
@@ -407,13 +401,7 @@ impl NodeState {
             return err_fuse!(libc::EINVAL, "Invalid access mode: {:?}", mode);
         }
 
-        // Write modes (WRONLY / RDWR): resolve the inode ONCE and register the
-        // writer under that same ino, so the writer-map key always equals the
-        // handle ino. When `ino` is provided (open / restore) we reuse it; when
-        // it is None (create) we open the writer first, derive the ino from its
-        // status a single time, then insert it under that key. This avoids the
-        // previous double `next_ino` call that could diverge for a freshly
-        // created file whose backend id was not yet assigned.
+        // Resolve inode once so the writer-map key always equals the handle ino.
         let (ino, writer) = match ino {
             Some(ino) => {
                 let writer = self.get_or_create_writer(ino, path, flags, opts).await?;
@@ -578,11 +566,7 @@ impl NodeState {
         ino: u64,
         fh: u64,
     ) -> FuseResult<(Arc<FileHandle>, FuseResult<()>)> {
-        // Find the handle without removing it yet.  The handle stays in
-        // self.handles while complete()/flush() runs so that
-        // has_open_handles() keeps returning true during the commit —
-        // otherwise a concurrent unlink or deferred-delete could delete the
-        // file before the data upload finishes.
+        // Find the handle without removing it yet.
         let handle = self.find_handle(ino, fh)?;
 
         let close_result: FuseResult<()> = match handle.as_ref() {
@@ -604,10 +588,7 @@ impl NodeState {
             _ => Ok(()),
         };
 
-        // FUSE sends RELEASE once per open handle, and its error is not retried.
-        // Remove the handle regardless of the close result so open-handle and
-        // shared-writer accounting continue to reflect kernel ownership.
-        // Retriable backend cleanup must be tracked separately (#1221).
+        // RELEASE is not retried; remove the handle regardless of close result.
         let _ = self.remove_handle(ino, fh);
 
         Ok((handle, close_result))
@@ -626,13 +607,26 @@ impl NodeState {
         self.dir_write().clear_mark_delete(ino)
     }
 
+    /// Clear inode `mark_delete` and the `deleted_children` entry for a specific
+    /// hardlink name under `parent` (not the inode's primary parent/name).
+    pub fn clear_unlink_state(&self, ino: u64, parent: u64, name: &str) -> FuseResult<()> {
+        let mut dir = self.dir_write();
+        if let Some(inode) = dir.get_inode_mut(ino, None) {
+            inode.mark_delete = false;
+        }
+        if let Ok(parent_dir) = dir.get_dir_mut_check(parent) {
+            parent_dir.clear_deleted_child(name);
+        }
+        Ok(())
+    }
+
     pub fn complete_deferred_delete(
         &self,
         ino: u64,
         delete_result: Result<(), FsError>,
     ) -> FuseResult<()> {
-        // Keep the mark observable after failure. The background retry needed
-        // to reclaim it without another FUSE request is tracked by #1221.
+        // Keep the mark observable after failure; reclaiming it without another
+        // FUSE request would need a background retry, which is not yet implemented.
         match delete_result {
             Ok(()) | Err(FsError::FileNotFound(_)) => self.clear_mark_delete(ino),
             Err(e) => Err(e.into()),
@@ -640,17 +634,29 @@ impl NodeState {
     }
 
     pub async fn fs_unlink(&self, parent: u64, name: &str) -> FuseResult<()> {
-        let (ino, path) = {
+        let path = {
             let dir = self.dir_read();
-            let inode = dir.get_inode_check(parent, Some(name))?;
-            (inode.ino, dir.get_path_name(parent, name)?)
+            dir.get_path_name(parent, name)?
         };
 
-        // Always mark for deletion and remove the directory entry first,
-        // and check has_open_handles inside the same dir_write critical
-        // section.  While we hold dir_write, no concurrent fs_open/fs_create
-        // can acquire dir_read, so no new handles can be registered — the
-        // has_open_handles result is accurate.
+        let ino = {
+            let dir = self.dir_read();
+            dir.get_inode(parent, Some(name)).map(|inode| inode.ino)
+        };
+
+        // Kernel may still hold a dentry after our dcache dropped the name
+        // (hardlink + FORGET races). Best-effort delete on master; treat
+        // already-gone as success so recursive cleanup (LTP tst_rmdir) is
+        // not failed by ENOENT on a stale name.
+        let Some(ino) = ino else {
+            return match self.fs.delete(&path, false).await {
+                Ok(()) | Err(FsError::FileNotFound(_)) => Ok(()),
+                Err(e) => Err(e.into()),
+            };
+        };
+
+        // Always mark for deletion and remove the directory entry first, and check
+        // has_open_handles inside the same dir_write critical section.
         let has_handles = {
             let mut dir = self.dir_write();
             dir.unlink(parent, name, true)?;
@@ -662,9 +668,7 @@ impl NodeState {
             return Ok(());
         }
 
-        // Re-check for a concurrent fs_open that may have registered a handle
-        // while we waited.  If so, defer — release() will delete via
-        // deferred_delete_ready.
+        // Defer if a concurrent fs_open registered a handle while we waited.
         if self.has_open_handles(ino) {
             debug!(
                 "unlink ino={}, path={}: handle appeared, deferring",
@@ -677,14 +681,15 @@ impl NodeState {
             Ok(()) => (),
             Err(FsError::FileNotFound(_)) => (),
             Err(e) => {
-                self.clear_mark_delete(ino)?;
+                self.clear_unlink_state(ino, parent, name)?;
                 return Err(e.into());
             }
         }
 
-        // Clear mark_delete + deleted_child entry now that the server-side
-        // delete has completed.  clear_mark_delete handles both in one lock.
-        self.clear_mark_delete(ino)?;
+        // Clear mark_delete + this name's deleted_child entry now that the
+        // server-side delete has completed (use unlink parent/name, not the
+        // inode primary path — hardlinks share one inode across names).
+        self.clear_unlink_state(ino, parent, name)?;
 
         Ok(())
     }
@@ -695,11 +700,8 @@ impl NodeState {
             return Ok(false);
         }
 
-        // NOTE: Do NOT clear mark_delete here.  The mark stays set until
-        // after self.fs.delete() completes in release().  This ensures
-        // that a concurrent fs_open() during the delete RPC sees
-        // pending_delete=true and rejects the open, preventing a handle
-        // from being registered for a file that is about to be deleted.
+        // NOTE: Do NOT clear mark_delete here. The mark stays set until after
+        // self.fs.delete() completes in release().
         Ok(true)
     }
 
@@ -795,18 +797,13 @@ impl NodeState {
         self.writers.keys()
     }
 
-    /// Emit `user_meta_cache_total{cache=status,status}`, gated on the
-    /// `metrics_enabled` observation kill-switch (separate from the
-    /// `enable_meta_cache` feature gate). No-op when metrics are disabled.
     fn record_status_cache(&self, status: &'static str) {
         if self.conf.metrics_enabled {
             FuseMetrics::with(|m| m.record_user_meta_cache(CACHE_STATUS, status));
         }
     }
 
-    /// `user_meta_cache_total{cache=status,status=put}`, emitted when a backend
-    /// status is materialized into the dcache (e.g. readdir populating child
-    /// inodes). Only counts when the status/attr cache is actually in use.
+    /// Count backend status materialized into dcache when attr cache is active.
     pub fn record_status_put(&self) {
         if self.enable_meta_cache {
             self.record_status_cache(CACHE_RESULT_PUT);
@@ -850,19 +847,8 @@ impl NodeState {
     }
 
     pub async fn fs_lookup(&self, ino: u64, name: &str) -> FuseResult<fuse_attr> {
-        // NOTE: the `.`/`..` branches below are BROKEN wherever they resolve through
-        // the root, because root's `parent` is the `0` sentinel and inode 0 does not
-        // exist. Two cases both miss and return ENOENT:
-        //   - `LOOKUP(root, ".")` -> `(root.parent, ..)` = `(0, "/")`, and
-        //     `LOOKUP(root, "..")` -> `get_inode_check(root.parent=0)`.
-        //   - `LOOKUP(child_of_root, "..")` -> `get_inode_check(parent.parent)` where
-        //     `parent` is root, i.e. `get_inode_check(0)` — so ANY direct child of the
-        //     mount root fails too, not just the root inode.
-        // This is why `FUSE_EXPORT_SUPPORT` is kept out of `SUPPORTED_INIT_FLAGS` (see
-        // `crate::FUSE_EXPORT_SUPPORT`): advertising it is the only thing that makes
-        // the kernel send these `.`/`..` LOOKUPs (`fuse_get_parent` walks `..` for any
-        // direct child of the mount root). A follow-up that re-adds the capability must
-        // special-case `parent == root` (and root itself), not only `LOOKUP(root, .)`.
+        // NOTE: the `.`/`..` branches below are BROKEN wherever they resolve through the root, because
+        // root's `parent` is the `0` sentinel and inode 0 does not exist.
         let (ino, cow_name) = if name == FUSE_CURRENT_DIR {
             let dir = self.dir_read();
             let inode = dir.get_inode_check(ino, None)?;
@@ -944,12 +930,22 @@ impl NodeState {
         let path = self.get_path_common(ino, name)?;
         let status = self.fs.get_status(&path).await?;
 
-        if self.enable_meta_cache {
-            let _ = self.update_status(ino, name, &status);
-            self.record_status_cache(CACHE_RESULT_PUT);
-        }
+        self.cache_resolved_status(ino, name, &status);
 
         Ok(status)
+    }
+
+    fn cache_resolved_status(&self, ino: u64, name: Option<&str>, status: &FileStatus) {
+        // The root inode starts as synthetic metadata with mode 0. Cache its first
+        // real backend status even when the general metadata cache is disabled so
+        // every path traversal does not issue another root get_status RPC.
+        let cache_root = ino == FUSE_ROOT_ID && name.is_none();
+        if self.enable_meta_cache || cache_root {
+            let _ = self.update_status(ino, name, status);
+            if self.enable_meta_cache {
+                self.record_status_cache(CACHE_RESULT_PUT);
+            }
+        }
     }
 
     pub async fn fs_mkdir(&self, ino: u64, name: &str, opts: MkdirOpts) -> FuseResult<fuse_attr> {
@@ -1372,6 +1368,37 @@ mod test {
     }
 
     #[test]
+    fn resolved_root_status_is_cached_when_metadata_cache_is_disabled() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+        assert!(!state.enable_meta_cache);
+        assert_eq!(
+            state
+                .dir_read()
+                .get_inode(FUSE_ROOT_ID, None)
+                .unwrap()
+                .lifecycle,
+            crate::fs::dcache::Lifecycle::Invalid
+        );
+
+        state.cache_resolved_status(
+            FUSE_ROOT_ID,
+            None,
+            &FileStatus {
+                is_dir: true,
+                mode: 0o755,
+                ..Default::default()
+            },
+        );
+
+        let dir = state.dir_read();
+        let root = dir.get_inode(FUSE_ROOT_ID, None).unwrap();
+        assert_eq!(root.lifecycle, crate::fs::dcache::Lifecycle::Cached);
+        assert_eq!(root.mode, 0o755);
+    }
+
+    #[test]
     fn handle_chokepoints_inc_dec_their_own_gauge_only() {
         crate::FuseMetrics::ensure_init().unwrap();
         let mx = crate::FuseMetrics::get();
@@ -1476,9 +1503,7 @@ mod test {
             let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), task_rt.clone()).unwrap();
             let state = NodeState::new(fs).unwrap();
 
-            // /dev/full deterministically fails backend writes with ENOSPC. Queue a
-            // write before persisting so BackendHandle::persist's complete() sees
-            // the worker failure and returns it to NodeState::persist.
+            // /dev/full makes persist's complete() return the queued write failure.
             let full_path = Path::from_str("/dev/full").unwrap();
             let local_writer = LocalWriter::new(&full_path, 1).unwrap();
             let status = local_writer.status().clone();

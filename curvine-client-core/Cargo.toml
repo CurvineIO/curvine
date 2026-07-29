@@ -1,0 +1,36 @@
+[package]
+name = "curvine-client-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+orpc = { workspace = true }
+curvine-error = { workspace = true }
+curvine-proto = { workspace = true }
+curvine-model = { workspace = true }
+curvine-fs-api = { workspace = true }
+curvine-config = { workspace = true }
+once_cell = { workspace = true }
+hyper = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
+log = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+pin-project-lite = { workspace = true }
+serde_json = { workspace = true }
+dashmap = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
+moka = { workspace = true }
+fxhash = { workspace = true }
+prometheus = { workspace = true }
+linked-hash-map = { workspace = true }
+rand = { workspace = true }
+
+[features]
+default = []

@@ -12,25 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Create fuse error.
-//
-// Crate-internal macro: NOT `#[macro_export]`ed, because its expansion
-// references crate-private helpers (`crate::fuse_error::normalize_errno` /
-// `errno_label`) and `orpc::err_msg!`, which are not reachable from an external
-// crate — exporting it would advertise an unusable public macro. It is made
-// importable within the crate via `pub(crate) use err_fuse;` below (re-exported
-// at the crate root in lib.rs) so existing `use crate::err_fuse;` imports keep
-// working. All call sites are inside curvine-fuse.
-//
-// The errno expression is normalized to a positive POSIX errno by
-// `FuseError::from_errno_msg` (via `normalize_errno`), so a negative / zero /
-// out-of-range input can never produce an illegal FUSE reply frame. Errno
-// normalization and construction live in `fuse_error.rs` — this macro is only
-// the `Err(...)` sugar plus the default message.
+// Crate-internal fuse error macro. Not `#[macro_export]`ed: its expansion
+// references crate-private helpers unreachable from an external crate.
 macro_rules! err_fuse {
     ($errno:expr) => ({
         // Single-arg form: synthesize a default message with the symbolic errno
-        // label (e.g. "err_fuse ENOSYS") using the normalized errno.
+        // label (e.g. "err_fuse ENOSYS").
         let errno = $crate::fuse_error::normalize_errno($errno);
         let msg = orpc::err_msg!("err_fuse {}", $crate::fuse_error::errno_label(errno));
         Err($crate::FuseError::from_errno_msg(errno, msg.into()))
@@ -47,16 +34,13 @@ macro_rules! err_fuse {
     });
 }
 
-// Make the crate-internal macro importable via a path (`use crate::err_fuse;`)
-// without `#[macro_export]`. Re-exported at the crate root in lib.rs.
+// Make the macro importable via `use crate::err_fuse;` without `#[macro_export]`.
 pub(crate) use err_fuse;
 
 #[cfg(test)]
 mod test {
     use crate::FuseResult;
 
-    // A positive libc errno is preserved unchanged, and the single-arg default
-    // message carries the symbolic errno label (not the raw number).
     #[test]
     fn err_fuse_positive_errno_preserved() {
         let err: FuseResult<u32> = err_fuse!(libc::ENOENT);
@@ -82,13 +66,7 @@ mod test {
         );
     }
 
-    // Illegal errno (out of i32 range / zero / negative) is normalized by
-    // `normalize_errno`: it trips a `debug_assert` in debug/test builds (exposing
-    // the caller bug) and falls back to EIO in release. This mirrors the crate's
-    // double-reply guard pattern (debug panics, release is safe). The release
-    // fallback is asserted in the `#[cfg(not(debug_assertions))]` variants below.
-
-    // Debug builds: an out-of-range errno panics via the debug_assert.
+    // Illegal errno normalizes to EIO in release and trips debug assertions in tests.
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "out of i32 range")]

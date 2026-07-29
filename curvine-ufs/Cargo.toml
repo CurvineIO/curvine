@@ -6,7 +6,9 @@ license.workspace = true
 
 [dependencies]
 orpc = { workspace = true }
-curvine-common = { workspace = true }
+curvine-config = { workspace = true }
+curvine-error = { workspace = true }
+curvine-fs-api = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
@@ -14,32 +16,6 @@ futures = { workspace = true }
 log = { workspace = true }
 fastrand = { workspace = true }
 
-opendal = { version = "0.55", optional = true }
-
-# JNI support for HDFS (moved from curvine-common)
-jni = { version = "0.21.1", features = ["invocation"], optional = true }
-anyhow = { workspace = true, optional = true }
-tracing = { workspace = true, optional = true }
-
-[build-dependencies]
-cc = "1.1"
-
 
 [features]
-# Storage backend implementations
-## OpenDAL implementations for various storage services
-opendal = ["dep:opendal", "opendal/services-fs"]  # local Fs for file://
-opendal-s3 = ["opendal", "opendal/services-s3"]        # Amazon S3
-opendal-oss = ["opendal", "opendal/services-oss"]      # Alibaba Cloud OSS
-opendal-cos = ["opendal", "opendal/services-cos"]      # Tencent Cloud COS
-opendal-azblob = ["opendal", "opendal/services-azblob"] # Azure Blob Storage
-opendal-gcs = ["opendal", "opendal/services-gcs"]      # Google Cloud Storage
-opendal-hdfs = ["opendal", "opendal/services-hdfs", "jni"]  
-opendal-webhdfs = ["opendal", "opendal/services-webhdfs"]
-opendal-hdfs-native = ["opendal", "opendal/services-hdfs-native"]
-
-jni = ["dep:jni", "dep:anyhow", "dep:tracing"]  # JNI support (now local to curvine-ufs)
-
-## OSS implementation using JindoSDK C++ library (async-only)
-oss-hdfs = []
-oss-hdfs-ffi-test = ["oss-hdfs"]
+default = []

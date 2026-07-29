@@ -1,0 +1,312 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::{UfsFileSystem, UfsReader};
+use curvine_client_core::file::FsReader;
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_fs_api::{FileSystem, Path, Reader};
+use curvine_model::{FileBlocks, FileStatus};
+use log::warn;
+use orpc::err_box;
+use orpc::sys::DataSlice;
+
+/// A wrapper around `FsReader` that transparently falls back to UFS when Curvine
+/// becomes unavailable (master down at open time handled externally, worker down
+/// during read handled here).
+///
+/// Design:
+/// - `cv_reader` is always present and maintains all internal state (pos, chunk, etc.).
+/// - `ufs_reader` is created lazily on the first worker failure; once set, all
+///   subsequent reads go through UFS (no retry back to Curvine).
+/// - Before falling back, consistency handling depends on the mount's write type:
+///   - **FsMode** (Curvine is the authority, UFS is a flushed copy): `validate_ufs_consistency`
+///     ensures the UFS data matches the snapshot recorded in Curvine metadata
+///     (`ufs_mtime`, `len`). A mismatch means the UFS copy is untrustworthy (incomplete
+///     flush or externally modified) and fallback is refused.
+///   - **CacheMode** (UFS/S3 is the authority, Curvine is a read-through cache): nothing is
+///     validated. We read S3 directly at the current `pos`. If S3 is still readable there,
+///     that is the authoritative data and we serve it. If S3 was deleted or shrunk so that
+///     `pos` no longer exists, the underlying `open_ufs`/`seek` fails and the error
+///     propagates — we do not clamp the seek or paper over an out-of-range position.
+pub struct FallbackFsReader {
+    /// Wraps the Curvine reader. Always present as the metadata authority (status, len).
+    cv_reader: FsReader,
+    /// Created lazily on first worker error. None = reading from Curvine.
+    /// Uses UfsReader (not UnifiedReader) to avoid a recursive type/async-fn cycle:
+    /// UnifiedReader::Fallback(FallbackFsReader) -> UfsReader (no Fallback variant).
+    ufs_reader: Option<UfsReader>,
+    ufs_path: Path,
+    ufs_fs: UfsFileSystem,
+    /// True when the mount is FsMode. Controls whether the snapshot consistency check
+    /// gates the fallback to UFS. CacheMode (false) reads S3 directly without validation.
+    is_fs_mode: bool,
+}
+
+impl FallbackFsReader {
+    pub fn new(
+        cv_reader: FsReader,
+        ufs_path: Path,
+        ufs_fs: UfsFileSystem,
+        is_fs_mode: bool,
+    ) -> Self {
+        Self {
+            cv_reader,
+            ufs_reader: None,
+            ufs_path,
+            ufs_fs,
+            is_fs_mode,
+        }
+    }
+
+    /// Expose Curvine block metadata for callers that need cache hints.
+    pub fn file_blocks(&self) -> &FileBlocks {
+        self.cv_reader.file_blocks()
+    }
+
+    /// Validates that the UFS data matches what Curvine recorded when it last flushed.
+    /// Returns an error if UFS data cannot be trusted (modified externally or never flushed).
+    async fn validate_ufs_consistency(&self) -> FsResult<()> {
+        let cv_status = self.cv_reader.status();
+        let ufs_status = self.ufs_fs.get_status(&self.ufs_path).await?;
+
+        if !cv_status.ufs_valid(&ufs_status) {
+            return err_box!(
+                "UFS data inconsistent for {}: CV and UFS len/mtime do not match or CV not valid",
+                self.ufs_path
+            );
+        }
+
+        Ok(())
+    }
+}
+
+/// Returns true for errors caused by a worker being unavailable (IO, pipeline, timeout).
+/// These trigger a UFS fallback. Other error kinds (e.g. NotLeaderMaster) are not
+/// worker errors — the RPC layer handles master failover via retry.
+pub(crate) fn is_worker_err(e: &FsError) -> bool {
+    if matches!(
+        e,
+        FsError::IO(_) | FsError::Pipeline(_) | FsError::Timeout(_) | FsError::NoAvailableWorker(_)
+    ) {
+        return true;
+    }
+
+    // In some read paths, connection-level worker failures are wrapped as Common.
+    // Treat well-known transport failure signatures as worker failures too.
+    if matches!(e, FsError::Common(_)) {
+        let msg = e.to_string().to_lowercase();
+        return msg.contains("connection refused")
+            || msg.contains("connection reset")
+            || msg.contains("early eof")
+            || msg.contains("broken pipe")
+            || msg.contains("sender dropped");
+    }
+
+    false
+}
+
+impl Reader for FallbackFsReader {
+    // Always from cv_reader — Curvine is the metadata authority in FsMode.
+    fn status(&self) -> &FileStatus {
+        self.cv_reader.status()
+    }
+
+    fn path(&self) -> &Path {
+        self.cv_reader.path()
+    }
+
+    fn len(&self) -> i64 {
+        match &self.ufs_reader {
+            // CacheMode has fallen back to S3, which is authoritative: report its
+            // live length so len()-based callers (e.g. read_as_string) see the
+            // current object size, not the stale cached Curvine length.
+            Some(u) if !self.is_fs_mode => u.len(),
+            // FsMode (or no fallback yet): Curvine remains the metadata authority.
+            _ => self.cv_reader.len(),
+        }
+    }
+
+    // pos/chunk/chunk_size delegate to whichever reader is currently active.
+    fn pos(&self) -> i64 {
+        match &self.ufs_reader {
+            Some(u) => u.pos(),
+            None => self.cv_reader.pos(),
+        }
+    }
+
+    fn pos_mut(&mut self) -> &mut i64 {
+        match &mut self.ufs_reader {
+            Some(u) => u.pos_mut(),
+            None => self.cv_reader.pos_mut(),
+        }
+    }
+
+    fn chunk_mut(&mut self) -> &mut DataSlice {
+        match &mut self.ufs_reader {
+            Some(u) => u.chunk_mut(),
+            None => self.cv_reader.chunk_mut(),
+        }
+    }
+
+    fn chunk_size(&self) -> usize {
+        match &self.ufs_reader {
+            Some(u) => u.chunk_size(),
+            None => self.cv_reader.chunk_size(),
+        }
+    }
+
+    async fn read_chunk0(&mut self) -> FsResult<DataSlice> {
+        // Already fallen back to UFS — read directly, no retry to Curvine.
+        if let Some(ufs) = &mut self.ufs_reader {
+            return ufs.read_chunk0().await;
+        }
+
+        // Try reading from Curvine.
+        match self.cv_reader.read_chunk0().await {
+            Ok(data) => Ok(data),
+
+            Err(e) if is_worker_err(&e) => {
+                let pos = self.cv_reader.pos();
+                warn!(
+                    "Curvine worker error at pos {} for {} (fs_mode={}), falling back to UFS: {}",
+                    pos,
+                    self.cv_reader.path(),
+                    self.is_fs_mode,
+                    e
+                );
+
+                // FsMode: Curvine is authoritative and UFS is only a flushed copy, so
+                // refuse to fall back if the UFS data cannot be trusted (mtime/len drift
+                // means an incomplete flush or external modification).
+                //
+                // CacheMode: S3/UFS is authoritative — there is nothing to validate.
+                // We just read S3 directly. If S3 is still readable at `pos`, that is
+                // the authoritative data and we serve it. If S3 was deleted or shrunk
+                // so that `pos` no longer exists, the read fails naturally below
+                // (open_ufs stat -> NotFound, or seek -> "Invalid seek position") and
+                // that error propagates to the caller. We deliberately do NOT clamp the
+                // seek or pre-check consistency.
+                if self.is_fs_mode {
+                    self.validate_ufs_consistency().await?;
+                }
+
+                let mut ufs: UfsReader = self.ufs_fs.open_ufs(&self.ufs_path).await?;
+                ufs.seek(pos).await?;
+                let data = ufs.read_chunk0().await?;
+                self.ufs_reader = Some(ufs);
+                Ok(data)
+            }
+
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        match &mut self.ufs_reader {
+            Some(ufs) => ufs.seek(pos).await,
+            None => self.cv_reader.seek(pos).await,
+        }
+    }
+
+    async fn complete(&mut self) -> FsResult<()> {
+        if let Some(mut ufs) = self.ufs_reader.take() {
+            // Best-effort cleanup; the worker may already be down.
+            let _ = ufs.complete().await;
+        }
+        // Always release cv_reader connections (block handles, cached readers).
+        self.cv_reader.complete().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_error::FsError;
+    use orpc::error::ErrorImpl;
+    use std::io;
+    use std::time::Duration;
+
+    // --- TC-1 to TC-5: is_worker_err classification ---
+
+    #[test]
+    fn test_is_worker_err_io() {
+        let e = FsError::IO(ErrorImpl::with_source(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "connection reset",
+        )));
+        assert!(is_worker_err(&e));
+    }
+
+    #[test]
+    fn test_is_worker_err_pipeline() {
+        // Uses the public constructor to avoid touching ErrorImpl internals.
+        let e = FsError::pipeline_error(42, "worker unreachable");
+        assert!(is_worker_err(&e));
+    }
+
+    #[tokio::test]
+    async fn test_is_worker_err_timeout() {
+        // Elapsed can only be created via an actual tokio timeout.
+        let elapsed = tokio::time::timeout(Duration::from_nanos(1), std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        let e = FsError::Timeout(ErrorImpl::with_source(elapsed));
+        assert!(is_worker_err(&e));
+    }
+
+    #[test]
+    fn test_is_worker_err_not_leader_master() {
+        // Master failover is handled by RPC retry, not UFS fallback.
+        let e = FsError::not_leader("not leader");
+        assert!(!is_worker_err(&e));
+    }
+
+    #[test]
+    fn test_is_worker_err_file_not_found() {
+        let e = FsError::file_not_found("/test/path");
+        assert!(!is_worker_err(&e));
+    }
+
+    #[test]
+    fn test_is_worker_err_common_connection_refused() {
+        let e = FsError::common("Connection refused (os error 111)");
+        assert!(is_worker_err(&e));
+    }
+
+    // TC: a "no available worker" failure (all block replicas exhausted mid-read)
+    // must be classified as a worker error so FallbackFsReader falls back to UFS.
+    // It is a typed variant (FsError::NoAvailableWorker), so classification does
+    // NOT depend on the error message string — the block_reader message can be
+    // reworded without regressing fallback.
+    #[test]
+    fn test_is_worker_err_no_available_worker() {
+        let e = FsError::no_available_worker(
+            "There is no available worker, locs: [], failed workers: []",
+        );
+        assert!(is_worker_err(&e));
+    }
+
+    // Regression guard: this is exactly the bug we fixed. Before typing the
+    // error, block_reader produced a generic FsError::Common("There is no
+    // available worker ..."), whose message is NOT in the Common transport-
+    // failure whitelist, so is_worker_err returned false and fallback silently
+    // did not trigger (user saw EIO). Assert the untyped Common form is still
+    // NOT matched, proving the typed variant is what makes fallback work.
+    #[test]
+    fn test_is_worker_err_common_no_available_worker_not_matched() {
+        let e = FsError::common("There is no available worker, locs: [], failed workers: []");
+        assert!(!is_worker_err(&e));
+    }
+}

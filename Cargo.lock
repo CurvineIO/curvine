@@ -1937,6 +1937,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-bench"
+version = "0.2.0"
+dependencies = [
+ "curvine-fs-api",
+ "curvine-unified-fs",
+ "futures",
+ "orpc",
+ "rand 0.8.5",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "curvine-cli"
 version = "0.2.0"
 dependencies = [
@@ -1944,13 +1957,21 @@ dependencies = [
  "chrono",
  "clap",
  "comfy-table",
- "curvine-client",
- "curvine-common",
+ "curvine-bench",
+ "curvine-client-core",
+ "curvine-config",
+ "curvine-error",
+ "curvine-fs-api",
+ "curvine-job-client",
+ "curvine-model",
  "curvine-ufs",
+ "curvine-unified-fs",
+ "mimalloc",
  "orpc",
  "reqwest 0.12.25",
  "serde",
  "serde_json",
+ "tikv-jemallocator",
  "tokio",
 ]
 
@@ -1958,10 +1979,23 @@ dependencies = [
 name = "curvine-client"
 version = "0.2.0"
 dependencies = [
+ "curvine-bench",
+ "curvine-client-core",
+ "curvine-job-client",
+ "curvine-unified-fs",
+]
+
+[[package]]
+name = "curvine-client-core"
+version = "0.2.0"
+dependencies = [
  "async-stream",
  "bytes",
- "curvine-common",
- "curvine-ufs",
+ "curvine-config",
+ "curvine-error",
+ "curvine-fs-api",
+ "curvine-model",
+ "curvine-proto",
  "dashmap 5.5.3",
  "futures",
  "fxhash",
@@ -1989,7 +2023,6 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-stream",
- "axum",
  "bincode",
  "bitflags 2.10.0",
  "byteorder",
@@ -1998,8 +2031,13 @@ dependencies = [
  "clap",
  "crc32fast",
  "crossbeam",
- "curvine-common-macros",
+ "curvine-config",
+ "curvine-error",
  "curvine-fault",
+ "curvine-fs-api",
+ "curvine-model",
+ "curvine-proto",
+ "curvine-storage-api",
  "dashmap 5.5.3",
  "flate2",
  "futures",
@@ -2044,6 +2082,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-config"
+version = "0.2.0"
+dependencies = [
+ "clap",
+ "curvine-common-macros",
+ "curvine-error",
+ "curvine-fs-api",
+ "curvine-model",
+ "log",
+ "nix",
+ "orpc",
+ "serde",
+ "toml",
+]
+
+[[package]]
+name = "curvine-error"
+version = "0.2.0"
+dependencies = [
+ "axum",
+ "num_enum",
+ "orpc",
+ "prost 0.11.9",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "curvine-fault"
 version = "0.2.0"
 dependencies = [
@@ -2059,6 +2126,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-fs-api"
+version = "0.2.0"
+dependencies = [
+ "async-stream",
+ "bytes",
+ "curvine-error",
+ "curvine-model",
+ "curvine-proto",
+ "futures",
+ "hyper 1.7.0",
+ "num_enum",
+ "once_cell",
+ "orpc",
+ "prost 0.11.9",
+ "regex",
+]
+
+[[package]]
 name = "curvine-fuse"
 version = "0.2.0"
 dependencies = [
@@ -2068,6 +2153,7 @@ dependencies = [
  "clap",
  "curvine-client",
  "curvine-common",
+ "curvine-config",
  "dashmap 5.5.3",
  "futures",
  "fxhash",
@@ -2091,6 +2177,35 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "trait-variant",
+]
+
+[[package]]
+name = "curvine-hdfs-jni"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "jni",
+ "tracing",
+]
+
+[[package]]
+name = "curvine-io"
+version = "0.2.0"
+
+[[package]]
+name = "curvine-job-client"
+version = "0.2.0"
+dependencies = [
+ "bincode",
+ "curvine-client-core",
+ "curvine-error",
+ "curvine-fs-api",
+ "curvine-model",
+ "curvine-proto",
+ "log",
+ "orpc",
+ "serde",
+ "tokio",
 ]
 
 [[package]]
@@ -2131,6 +2246,7 @@ dependencies = [
  "bytes",
  "curvine-client",
  "curvine-common",
+ "curvine-config",
  "dashmap 5.5.3",
  "futures",
  "jni",
@@ -2149,6 +2265,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-model"
+version = "0.2.0"
+dependencies = [
+ "bincode",
+ "bitflags 2.10.0",
+ "chrono",
+ "clap",
+ "curvine-error",
+ "curvine-fs-api",
+ "curvine-proto",
+ "indexmap 2.14.0",
+ "log",
+ "num_enum",
+ "orpc",
+ "prost 0.11.9",
+ "serde",
+]
+
+[[package]]
+name = "curvine-proto"
+version = "0.2.0"
+dependencies = [
+ "prost 0.11.9",
+ "prost-build 0.11.9",
+ "serde",
+]
+
+[[package]]
 name = "curvine-server"
 version = "0.2.0"
 dependencies = [
@@ -2160,7 +2304,9 @@ dependencies = [
  "clap",
  "curvine-client",
  "curvine-common",
+ "curvine-error",
  "curvine-fault",
+ "curvine-storage-spdk",
  "curvine-ufs",
  "curvine-web",
  "dashmap 5.5.3",
@@ -2188,6 +2334,33 @@ dependencies = [
  "url",
  "uuid",
 ]
+
+[[package]]
+name = "curvine-storage-api"
+version = "0.2.0"
+dependencies = [
+ "curvine-model",
+]
+
+[[package]]
+name = "curvine-storage-spdk"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "cc",
+ "crossbeam",
+ "libc",
+ "log",
+ "nix",
+ "orpc",
+ "pkg-config",
+ "serde",
+ "toml",
+]
+
+[[package]]
+name = "curvine-sys"
+version = "0.2.0"
 
 [[package]]
 name = "curvine-tests"
@@ -2222,19 +2395,69 @@ dependencies = [
 name = "curvine-ufs"
 version = "0.2.0"
 dependencies = [
- "anyhow",
+ "async-trait",
+ "bytes",
+ "curvine-config",
+ "curvine-error",
+ "curvine-fs-api",
+ "fastrand 1.9.0",
+ "futures",
+ "log",
+ "orpc",
+ "tokio",
+]
+
+[[package]]
+name = "curvine-ufs-opendal"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "curvine-error",
+ "curvine-fs-api",
+ "curvine-hdfs-jni",
+ "curvine-model",
+ "curvine-ufs",
+ "futures",
+ "opendal",
+ "orpc",
+]
+
+[[package]]
+name = "curvine-ufs-oss-hdfs"
+version = "0.2.0"
+dependencies = [
  "async-trait",
  "bytes",
  "cc",
- "curvine-common",
- "fastrand 1.9.0",
+ "curvine-config",
+ "curvine-error",
+ "curvine-fs-api",
+ "curvine-model",
+ "curvine-ufs",
  "futures",
- "jni",
  "log",
- "opendal",
  "orpc",
  "tokio",
- "tracing",
+]
+
+[[package]]
+name = "curvine-unified-fs"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "curvine-client-core",
+ "curvine-config",
+ "curvine-error",
+ "curvine-fs-api",
+ "curvine-job-client",
+ "curvine-model",
+ "curvine-ufs",
+ "curvine-ufs-opendal",
+ "curvine-ufs-oss-hdfs",
+ "log",
+ "once_cell",
+ "orpc",
+ "tokio",
 ]
 
 [[package]]
@@ -6101,10 +6324,8 @@ dependencies = [
 name = "orpc"
 version = "0.2.0"
 dependencies = [
- "axum",
  "bincode",
  "bytes",
- "cc",
  "chrono",
  "crc32fast",
  "crossbeam",
@@ -6121,9 +6342,9 @@ dependencies = [
  "nix",
  "num_enum",
  "once_cell",
+ "orpc-error",
  "parking_lot",
  "pin-project-lite",
- "pkg-config",
  "prometheus",
  "prost 0.11.9",
  "rand 0.8.5",
@@ -6141,6 +6362,28 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
 ]
+
+[[package]]
+name = "orpc-error"
+version = "0.2.0"
+dependencies = [
+ "bincode",
+ "bytes",
+ "log",
+ "serde",
+]
+
+[[package]]
+name = "orpc-net"
+version = "0.2.0"
+
+[[package]]
+name = "orpc-rpc"
+version = "0.2.0"
+
+[[package]]
+name = "orpc-runtime"
+version = "0.2.0"
 
 [[package]]
 name = "outref"

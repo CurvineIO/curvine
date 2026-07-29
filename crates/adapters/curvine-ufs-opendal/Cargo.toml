@@ -1,0 +1,31 @@
+[package]
+name = "curvine-ufs-opendal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+curvine-ufs = { workspace = true }
+curvine-error = { workspace = true }
+curvine-fs-api = { workspace = true }
+curvine-model = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+opendal = { version = "0.55" }
+orpc = { workspace = true }
+
+[dependencies.curvine-hdfs-jni]
+workspace = true
+optional = true
+
+[features]
+default = ["opendal"]
+opendal = ["opendal/services-fs"]
+opendal-s3 = ["opendal", "opendal/services-s3"]
+opendal-oss = ["opendal", "opendal/services-oss"]
+opendal-cos = ["opendal", "opendal/services-cos"]
+opendal-azblob = ["opendal", "opendal/services-azblob"]
+opendal-gcs = ["opendal", "opendal/services-gcs"]
+opendal-hdfs = ["opendal", "opendal/services-hdfs", "dep:curvine-hdfs-jni", "curvine-hdfs-jni/jni"]
+opendal-webhdfs = ["opendal", "opendal/services-webhdfs"]
+opendal-hdfs-native = ["opendal", "opendal/services-hdfs-native"]

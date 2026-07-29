@@ -1,0 +1,11 @@
+[package]
+name = "curvine-storage-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+curvine-model = { workspace = true }
+
+[features]
+default = []

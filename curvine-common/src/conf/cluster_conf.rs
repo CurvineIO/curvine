@@ -396,6 +396,42 @@ impl Display for ClusterConf {
     }
 }
 
+impl From<ClusterConf> for curvine_config::ClusterConf {
+    fn from(conf: ClusterConf) -> Self {
+        curvine_config::ClusterConf {
+            format_master: conf.format_master,
+            format_worker: conf.format_worker,
+            testing: conf.testing,
+            cluster_id: conf.cluster_id,
+            net_interface: conf.net_interface,
+            master: curvine_config::MasterConf {
+                hostname: conf.master.hostname,
+                rpc_port: conf.master.rpc_port,
+                web_port: conf.master.web_port,
+            },
+            journal: curvine_config::JournalConf {
+                hostname: conf.journal.hostname,
+                rpc_port: conf.journal.rpc_port,
+                journal_addrs: conf
+                    .journal
+                    .journal_addrs
+                    .into_iter()
+                    .map(|peer| curvine_config::JournalPeer {
+                        id: peer.id,
+                        hostname: peer.hostname,
+                        port: peer.port,
+                    })
+                    .collect(),
+            },
+            log: conf.log,
+            client: conf.client,
+            fuse: conf.fuse,
+            job: conf.job,
+            cli: conf.cli,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ClusterConf;
@@ -405,7 +441,12 @@ mod tests {
     // carries 127.0.0.1, so it is a stable target for the happy path.
     #[test]
     fn interface_ipv4_resolves_loopback() {
-        let ip = ClusterConf::interface_ipv4("lo")
+        #[cfg(target_os = "macos")]
+        let loopback = "lo0";
+        #[cfg(not(target_os = "macos"))]
+        let loopback = "lo";
+
+        let ip = ClusterConf::interface_ipv4(loopback)
             .expect("loopback interface must resolve to an IPv4 address");
         assert_eq!(ip, "127.0.0.1");
     }

@@ -7,40 +7,24 @@ license.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-orpc = { workspace = true }
-curvine-common = { workspace = true }
-curvine-ufs = { workspace = true, optional = true }
-once_cell = { workspace = true }
-hyper = { workspace = true }
-prost = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
-tracing-appender = { workspace = true }
-tracing-subscriber = { workspace = true }
-log = { workspace = true }
-bytes = { workspace = true }
-serde = { workspace = true }
-pin-project-lite = { workspace = true }
-serde_json = { workspace = true }
-dashmap = { workspace = true }
-futures = { workspace = true }
-async-stream = { workspace = true }
-moka = { workspace = true }
-fxhash = { workspace = true }
-prometheus = { workspace = true }
-linked-hash-map = { workspace = true }
-rand = { workspace = true }
+curvine-client-core = { workspace = true }
+curvine-job-client = { workspace = true, optional = true }
+curvine-unified-fs = { workspace = true, optional = true }
+curvine-bench = { workspace = true, optional = true }
 
 [features]
-default = ["opendal-s3"]
+default = []
 
-opendal = ["dep:curvine-ufs", "curvine-ufs/opendal"]
-opendal-s3 = ["opendal", "curvine-ufs/opendal-s3"]
-opendal-oss = ["opendal", "curvine-ufs/opendal-oss"]
-opendal-gcs = ["opendal", "curvine-ufs/opendal-gcs"]
-opendal-azblob = ["opendal", "curvine-ufs/opendal-azblob"]
-opendal-cos = ["opendal", "curvine-ufs/opendal-cos"]
-opendal-hdfs = ["opendal", "curvine-ufs/opendal-hdfs"]
-opendal-webhdfs = ["opendal", "curvine-ufs/opendal-webhdfs"]
-opendal-hdfs-native = ["opendal", "curvine-ufs/opendal-hdfs-native"]
-oss-hdfs = ["dep:curvine-ufs", "curvine-ufs/oss-hdfs"]
+job-client = ["dep:curvine-job-client"]
+unified = ["dep:curvine-unified-fs"]
+bench = ["dep:curvine-bench", "unified"]
+opendal = ["unified", "curvine-unified-fs/opendal"]
+opendal-s3 = ["unified", "curvine-unified-fs/opendal-s3"]
+opendal-oss = ["unified", "curvine-unified-fs/opendal-oss"]
+opendal-gcs = ["unified", "curvine-unified-fs/opendal-gcs"]
+opendal-azblob = ["unified", "curvine-unified-fs/opendal-azblob"]
+opendal-cos = ["unified", "curvine-unified-fs/opendal-cos"]
+opendal-hdfs = ["unified", "curvine-unified-fs/opendal-hdfs"]
+opendal-webhdfs = ["unified", "curvine-unified-fs/opendal-webhdfs"]
+opendal-hdfs-native = ["unified", "curvine-unified-fs/opendal-hdfs-native"]
+oss-hdfs = ["unified", "curvine-unified-fs/oss-hdfs"]

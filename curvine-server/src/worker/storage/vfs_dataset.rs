@@ -33,20 +33,34 @@ pub struct VfsDataset {
     ctime: u64,
     dir_list: DirList,
     meta: VfsMetaStore,
+    committed_rewrites: HashMap<i64, BlockMeta>,
     layouts: BlockLayouts,
     num_blocks_to_delete: AtomicUsize,
 }
 
 pub(crate) struct RemovedBlockState {
     pub(crate) meta: BlockMeta,
+    committed: Option<BlockMeta>,
     pub(crate) layout: BlockLayoutKind,
     pub(crate) dir: Arc<VfsDir>,
 }
 
 impl RemovedBlockState {
+    pub(crate) fn deallocate(&self) -> CommonResult<()> {
+        self.layout.deallocate(&self.dir, &self.meta)?;
+        if let Some(committed) = self.committed.as_ref() {
+            self.layout.deallocate(&self.dir, committed)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn release_space(&self) {
         self.dir
             .release_space(self.meta.is_final(), self.meta.physical_bytes());
+        if let Some(committed) = self.committed.as_ref() {
+            self.dir
+                .release_space(committed.is_final(), committed.physical_bytes());
+        }
     }
 }
 
@@ -67,6 +81,7 @@ impl VfsDataset {
             ctime: LocalTime::mills(),
             dir_list,
             meta: VfsMetaStore::new(spdk_meta.clone()),
+            committed_rewrites: HashMap::new(),
             layouts: BlockLayouts::new(spdk_meta),
             num_blocks_to_delete: AtomicUsize::new(0),
         };
@@ -189,7 +204,22 @@ impl VfsDataset {
     }
 
     pub fn all_blocks(&self) -> Vec<BlockMeta> {
-        self.meta.all_blocks()
+        self.meta
+            .all_blocks()
+            .into_iter()
+            .map(|meta| {
+                self.committed_rewrites
+                    .get(&meta.id())
+                    .cloned()
+                    .unwrap_or(meta)
+            })
+            .collect()
+    }
+
+    pub(crate) fn get_readable_block(&self, id: i64) -> Option<&BlockMeta> {
+        self.committed_rewrites
+            .get(&id)
+            .or_else(|| self.meta.get(id))
     }
 
     #[cfg(test)]
@@ -220,6 +250,7 @@ impl VfsDataset {
             None => return err_box!("Not found block {}", id),
             Some(meta) => meta,
         };
+        let committed = self.committed_rewrites.remove(&id);
         let layout = self.layouts.get(meta.storage_type()).clone();
         let dir = match self.dir_list.get_dir(meta.dir_id()) {
             None => return err_box!("No storage directory found: {:?}", meta.dir_id()),
@@ -227,19 +258,22 @@ impl VfsDataset {
         };
 
         layout.release(&dir, &meta);
+        if let Some(committed) = committed.as_ref() {
+            layout.release(&dir, committed);
+        }
 
-        Ok(RemovedBlockState { meta, layout, dir })
-    }
-
-    pub(crate) fn release_block_space(&self, meta: &BlockMeta) -> CommonResult<()> {
-        self.dir_list
-            .release_space(meta.dir_id(), meta.is_final(), meta.physical_bytes())
+        Ok(RemovedBlockState {
+            meta,
+            committed,
+            layout,
+            dir,
+        })
     }
 
     pub(crate) fn remove_block_by_id(&mut self, id: i64) -> CommonResult<BlockMeta> {
         let removed = self.remove_block_state_by_id(id)?;
-        removed.layout.deallocate(&removed.dir, &removed.meta)?;
-        self.release_block_space(&removed.meta)?;
+        removed.deallocate()?;
+        removed.release_space();
         Ok(removed.meta)
     }
 
@@ -304,16 +338,36 @@ impl Dataset for VfsDataset {
                 if meta.is_active() {
                     let dir = self.find_dir(meta.dir_id())?;
                     let layout = self.layouts.get(meta.storage_type());
+                    let preserves_committed =
+                        meta.is_final() && layout.preserves_committed_on_write();
+                    if preserves_committed {
+                        let required_bytes = meta.physical_bytes().max(block.len);
+                        if required_bytes > dir.available() {
+                            return err_box!(
+                                "Not enough space in storage dir {} for block {} rewrite: need {}, available {}",
+                                meta.dir_id(),
+                                meta.id(),
+                                required_bytes,
+                                dir.available()
+                            );
+                        }
+                    }
+
                     let old_physical_bytes = meta.physical_bytes();
                     let new_meta = layout.prepare_write(dir, &meta, block)?;
                     let new_physical_bytes = new_meta.physical_bytes();
 
-                    self.dir_list.update_write_space(
-                        meta.dir_id(),
-                        meta.is_final(),
-                        old_physical_bytes,
-                        new_physical_bytes,
-                    )?;
+                    if preserves_committed {
+                        dir.reserve_space(false, new_physical_bytes);
+                        self.committed_rewrites.insert(meta.id(), meta);
+                    } else {
+                        self.dir_list.update_write_space(
+                            meta.dir_id(),
+                            meta.is_final(),
+                            old_physical_bytes,
+                            new_physical_bytes,
+                        )?;
+                    }
                     self.meta.put(new_meta.clone());
 
                     Ok(new_meta)
@@ -382,6 +436,13 @@ impl Dataset for VfsDataset {
             (meta.dir_id(), reserved_bytes, final_bytes, final_meta)
         };
 
+        if let Some(committed) = self.committed_rewrites.remove(&block.id) {
+            self.dir_list.release_space(
+                committed.dir_id(),
+                committed.is_final(),
+                committed.physical_bytes(),
+            )?;
+        }
         self.dir_list
             .update_final_space(dir_id, reserved_bytes, final_bytes)?;
         self.meta.put(final_meta.clone());
@@ -390,21 +451,37 @@ impl Dataset for VfsDataset {
     }
 
     fn abort_block(&mut self, block: &ExtendedBlock) -> CommonResult<()> {
+        let Some(meta) = self.meta.get(block.id).cloned() else {
+            return Ok(());
+        };
+
+        if let Some(committed) = self.committed_rewrites.get(&block.id).cloned() {
+            let (layout, dir) = self.layout_for(&meta)?;
+            layout.deallocate(&dir, &meta)?;
+            layout.release(&dir, &meta);
+            dir.release_space(false, meta.physical_bytes());
+            self.meta.remove(block.id);
+            self.committed_rewrites.remove(&block.id);
+            self.meta.put(committed);
+            return Ok(());
+        }
+
+        self.remove_block_by_id(block.id)?;
+        Ok(())
+    }
+
+    fn remove_block(&mut self, block: &ExtendedBlock) -> CommonResult<()> {
         if self.meta.get(block.id).is_none() {
             return Ok(());
         }
         self.remove_block_by_id(block.id)?;
         Ok(())
     }
-
-    fn remove_block(&mut self, block: &ExtendedBlock) -> CommonResult<()> {
-        self.abort_block(block)
-    }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::worker::block::BlockMeta;
+    use crate::worker::block::{BlockMeta, BlockState};
     use crate::worker::storage::{
         Dataset, DirList, DirState, FileLayout, SpdkMetaStore, StorageVersion, VfsDataset, VfsDir,
     };
@@ -414,6 +491,7 @@ mod test {
     use orpc::sync::AtomicLong;
     use orpc::sys::FsStats;
     use orpc::CommonResult;
+    use std::io::Write;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
@@ -481,14 +559,14 @@ mod test {
         let mut ds = create_data_set(true, "append");
         let mut block = ExtendedBlock::with_mem(1, "100B")?;
         let meta = ds.open_block(&block)?;
-        ds.write_test_data(&meta, "50B")?;
-        block.len = 50;
+        ds.write_test_data(&meta, "40B")?;
+        block.len = 40;
         ds.finalize_block(&block)?;
-        block.len = 70;
+        block.len = 60;
         let meta2 = ds.open_block(&block)?;
         ds.write_test_data(&meta2, "20B")?;
         ds.finalize_block(&block)?;
-        assert_eq!(ds.available(), 430);
+        assert_eq!(ds.available(), 440);
         Ok(())
     }
     #[test]
@@ -595,10 +673,9 @@ mod test {
         Ok(())
     }
     #[test]
-    fn smaller_prepared_write_holds_old_capacity_until_completion() -> CommonResult<()> {
-        let mut ds = create_data_set(true, "smaller-prepared-write");
+    fn abort_rewrite_restores_committed_capacity() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "abort-rewrite-restores-capacity");
         let mut block = ExtendedBlock::with_mem(1, "100B")?;
-        let total_available = ds.available();
         let meta = ds.open_block(&block)?;
         ds.write_test_data(&meta, "50B")?;
         block.len = 50;
@@ -607,9 +684,148 @@ mod test {
 
         block.len = 20;
         ds.open_block(&block)?;
-        assert_eq!(ds.available(), finalized_available);
+        assert_eq!(ds.available(), finalized_available - 50);
         ds.abort_block(&block)?;
-        assert_eq!(ds.available(), total_available);
+        assert_eq!(ds.available(), finalized_available);
+        assert!(ds.get_block(block.id).unwrap().is_final());
+        Ok(())
+    }
+    #[test]
+    fn abort_rewrite_preserves_finalized_file() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "abort-rewrite-preserves-finalized");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let meta = ds.open_block(&block)?;
+        ds.write_test_data(&meta, "40B")?;
+        block.len = 40;
+        let finalized = ds.finalize_block(&block)?;
+        let finalized_available = ds.available();
+        let active_path = {
+            let dir = ds.find_dir(finalized.dir_id())?;
+            FileLayout::block_path(dir, &finalized)?
+        };
+        let committed_bytes = std::fs::read(&active_path)?;
+
+        block.len = 60;
+        let writing = ds.open_block(&block)?;
+        let staging_path = {
+            let dir = ds.find_dir(writing.dir_id())?;
+            FileLayout::block_path(dir, &writing)?
+        };
+        assert!(active_path.exists());
+        assert!(staging_path.exists());
+        assert!(ds.get_block(block.id).unwrap().state() == &BlockState::Writing);
+        assert!(ds.get_readable_block(block.id).unwrap().is_final());
+        assert!(ds.all_blocks()[0].is_final());
+
+        std::fs::write(&staging_path, b"partial rewrite")?;
+        ds.abort_block(&block)?;
+
+        let restored = ds.get_block(block.id).unwrap();
+        assert!(restored.is_final());
+        assert_eq!(restored.len(), finalized.len());
+        assert_eq!(std::fs::read(active_path)?, committed_bytes);
+        assert!(!staging_path.exists());
+        assert_eq!(ds.available(), finalized_available);
+        Ok(())
+    }
+    #[test]
+    fn restart_during_rewrite_discards_staging_and_keeps_committed() -> CommonResult<()> {
+        let dataset_name = "restart-during-rewrite";
+        let mut ds = create_data_set(true, dataset_name);
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let writing = ds.open_block(&block)?;
+        ds.write_test_data(&writing, "40B")?;
+        block.len = 40;
+        let finalized = ds.finalize_block(&block)?;
+        let finalized_available = ds.available();
+        let active_path = {
+            let dir = ds.find_dir(finalized.dir_id())?;
+            FileLayout::block_path(dir, &finalized)?
+        };
+        let committed_bytes = std::fs::read(&active_path)?;
+
+        block.len = 60;
+        let rewriting = ds.open_block(&block)?;
+        let staging_path = {
+            let dir = ds.find_dir(rewriting.dir_id())?;
+            FileLayout::block_path(dir, &rewriting)?
+        };
+        std::fs::write(&staging_path, b"partial rewrite")?;
+        assert!(active_path.exists());
+        assert!(staging_path.exists());
+        drop(ds);
+
+        let restarted = create_data_set(false, dataset_name);
+        let recovered = restarted.get_block(block.id).unwrap();
+        assert!(recovered.is_final());
+        assert_eq!(recovered.len(), finalized.len());
+        assert_eq!(restarted.num_blocks(), 1);
+        assert_eq!(restarted.available(), finalized_available);
+        assert_eq!(std::fs::read(active_path)?, committed_bytes);
+        assert!(!staging_path.exists());
+        Ok(())
+    }
+    #[test]
+    fn finalize_rewrite_publishes_staging_file() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "finalize-rewrite-publishes");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let writing = ds.open_block(&block)?;
+        let initial_path = {
+            let dir = ds.find_dir(writing.dir_id())?;
+            FileLayout::block_path(dir, &writing)?
+        };
+        std::fs::write(&initial_path, b"old")?;
+        block.len = 3;
+        let finalized = ds.finalize_block(&block)?;
+        let active_path = {
+            let dir = ds.find_dir(finalized.dir_id())?;
+            FileLayout::block_path(dir, &finalized)?
+        };
+
+        block.len = 6;
+        let rewriting = ds.open_block(&block)?;
+        let staging_path = {
+            let dir = ds.find_dir(rewriting.dir_id())?;
+            FileLayout::block_path(dir, &rewriting)?
+        };
+        let mut staging = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&staging_path)?;
+        staging.write_all(b"new")?;
+        drop(staging);
+
+        let published = ds.finalize_block(&block)?;
+        assert!(published.is_final());
+        assert_eq!(std::fs::read(active_path)?, b"oldnew");
+        assert!(!staging_path.exists());
+        assert!(ds.committed_rewrites.is_empty());
+        Ok(())
+    }
+    #[test]
+    fn remove_block_during_rewrite_deletes_active_and_staging_files() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "remove-during-rewrite");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let writing = ds.open_block(&block)?;
+        ds.write_test_data(&writing, "40B")?;
+        block.len = 40;
+        let finalized = ds.finalize_block(&block)?;
+        let active_path = {
+            let dir = ds.find_dir(finalized.dir_id())?;
+            FileLayout::block_path(dir, &finalized)?
+        };
+
+        block.len = 60;
+        let rewriting = ds.open_block(&block)?;
+        let staging_path = {
+            let dir = ds.find_dir(rewriting.dir_id())?;
+            FileLayout::block_path(dir, &rewriting)?
+        };
+        ds.remove_block(&block)?;
+
+        assert!(ds.get_block(block.id).is_none());
+        assert!(!active_path.exists());
+        assert!(!staging_path.exists());
+        assert!(ds.committed_rewrites.is_empty());
         Ok(())
     }
     #[test]

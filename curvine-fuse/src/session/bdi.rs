@@ -12,16 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Linux-only helpers to override the FUSE mount BDI's read-ahead size.
-//!
-//! After the mount syscall completes successfully, sysfs exposes
-//! `/sys/class/bdi/<major>:<minor>/read_ahead_kb` for the FUSE
-//! superblock device. Writing the desired value here lets the FUSE kernel
-//! issue larger read requests (e.g. 1 MiB) instead of the 128 KB default.
-//!
-//! Note: the user-facing config is named `fuse.max_readahead_kb` to mirror
-//! the FUSE protocol field `max_readahead`. The kernel sysfs entry, however,
-//! is `read_ahead_kb` (without the "max_" prefix), and that's what we write.
+//! Linux-only helpers for overriding the FUSE mount BDI read-ahead size by writing
+//! `/sys/class/bdi/<major>:<minor>/read_ahead_kb` after mount.
 
 use std::path::Path;
 
@@ -63,11 +55,7 @@ fn mountinfo_bdi_path_from(mountinfo: &str, mnt_path: &Path) -> Option<String> {
     None
 }
 
-/// Write `kb` into the BDI sysfs entry that backs `mnt_path`.
-///
-/// On any failure (mount path stat error, sysfs path missing, no write
-/// permission, etc.) this function logs a warning and returns: the caller's
-/// mount succeeds either way. On non-Linux platforms this is a no-op.
+/// Write `kb` into the mount's BDI sysfs entry; failures only warn.
 #[cfg(target_os = "linux")]
 pub fn apply_max_readahead_kb(mnt_path: &Path, kb: u32) {
     let bdi_path = match mountinfo_bdi_path(mnt_path) {
@@ -87,9 +75,7 @@ pub fn apply_max_readahead_kb(mnt_path: &Path, kb: u32) {
             return;
         }
     };
-    // The BDI sysfs entry may not be immediately available after the mount
-    // syscall. Retry a few times with a short delay to give the kernel time
-    // to create /sys/class/bdi/<maj>:<min>/read_ahead_kb.
+    // Retry briefly until the kernel creates the BDI sysfs entry.
     let mut tries = 10;
     while tries > 0 {
         match std::fs::write(&bdi_path, kb.to_string()) {

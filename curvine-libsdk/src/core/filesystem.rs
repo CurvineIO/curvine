@@ -17,7 +17,7 @@ use crate::{LibFsReader, LibFsWriter};
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::FreeResult;
+use curvine_common::state::{FreeResult, MountInfo, MountOptions};
 use curvine_common::FsResult;
 use orpc::runtime::RpcRuntime;
 
@@ -117,6 +117,29 @@ impl LibFilesystem {
         let path = Path::from_str(path)?;
         self.rt()
             .block_on(async { self.inner().get_mount_info_bytes(&path).await })
+    }
+
+    pub fn mount(
+        &self,
+        ufs_path: impl AsRef<str>,
+        cv_path: impl AsRef<str>,
+        opts: MountOptions,
+    ) -> FsResult<()> {
+        let ufs_path = Path::from_str(ufs_path)?;
+        let cv_path = Path::from_str(cv_path)?;
+        self.rt()
+            .block_on(async { self.inner().mount(&ufs_path, &cv_path, opts).await })
+    }
+
+    pub fn umount(&self, cv_path: impl AsRef<str>) -> FsResult<()> {
+        let cv_path = Path::from_str(cv_path)?;
+        self.rt()
+            .block_on(async { self.inner().umount(&cv_path).await })
+    }
+
+    pub fn get_mount_table(&self) -> FsResult<Vec<MountInfo>> {
+        self.rt()
+            .block_on(async { self.inner().get_mount_table().await })
     }
 
     pub fn toggle_path(&self, path: impl AsRef<str>, check_cache: bool) -> FsResult<Option<Path>> {

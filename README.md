@@ -38,6 +38,7 @@ For more detailed information, please refer to:
 - [DeepWiki](https://deepwiki.com/CurvineIO/curvine)
 - [Commit convention](COMMIT_CONVENTION.md)
 - [Contribute guidelines](CONTRIBUTING.md)
+- [Best Practices](https://curvineio.github.io/docs/User-Manuals/best-practices)
 
 ## Roadmap 2026
 ![Evolution from Distributed Cache to AI Agent-Native Infrastructure ](https://github.com/CurvineIO/curvine/discussions/549)
@@ -263,7 +264,3 @@ Please read Curvine [Contribute guidelines](CONTRIBUTING.md)
 
 ## 📜 License
 Curvine is licensed under the ​**​[Apache License 2.0](LICENSE)​**.
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=CurvineIO/curvine&type=Date)](https://www.star-history.com/#CurvineIO/curvine&Date)

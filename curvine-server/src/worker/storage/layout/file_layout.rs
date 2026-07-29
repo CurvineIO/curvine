@@ -19,9 +19,10 @@ use curvine_common::state::ExtendedBlock;
 #[cfg(test)]
 use orpc::common::ByteUnit;
 use orpc::common::FileUtils;
-use orpc::io::{BlockDevice, IOError, IOResult, LocalFile};
+use orpc::io::{IOError, IOResult, LocalFile};
 use orpc::{err_box, try_err, CommonResult};
-use std::fs::{self, File};
+use std::collections::HashSet;
+use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
 
 #[derive(Clone, Copy)]
@@ -47,7 +48,7 @@ impl FileLayout {
 
     fn block_dir(dir: &VfsDir, meta: &BlockMeta) -> CommonResult<PathBuf> {
         let path = match meta.state() {
-            BlockState::Finalized | BlockState::Writing => {
+            BlockState::Finalized => {
                 let uid = meta.id() as u64;
                 let d1 = (uid >> 48) & 0x1F;
                 let d2 = (uid >> 32) & 0x1F;
@@ -55,7 +56,7 @@ impl FileLayout {
                     .join(format!("b{}", d1))
                     .join(format!("b{}", d2))
             }
-            BlockState::Recovering => Self::staging_dir(dir),
+            BlockState::Writing | BlockState::Recovering => Self::staging_dir(dir),
         };
 
         if path.exists() {
@@ -89,10 +90,14 @@ impl FileLayout {
 }
 
 impl BlockLayout for FileLayout {
+    fn preserves_committed_on_write(&self) -> bool {
+        true
+    }
+
     fn allocate(&self, dir: &VfsDir, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         let meta = BlockMeta::with_tmp(block, dir);
         let file = Self::block_path(dir, &meta)?;
-        File::create(file)?;
+        OpenOptions::new().write(true).create_new(true).open(file)?;
         Ok(meta)
     }
 
@@ -106,10 +111,30 @@ impl BlockLayout for FileLayout {
             return err_box!("Invalid file block size: {}", block.len);
         }
         let mut prepared = BlockMeta::new(meta.id(), block.len, dir);
-        // The old file still occupies space until resize/finalize. Keep the
-        // larger physical charge so preparing a smaller write cannot temporarily
-        // overstate available capacity or under-release on abort.
+        // A staging rewrite starts from the committed allocation and may grow, so charge the larger size.
         prepared.actual_len = meta.actual_len.max(block.len);
+
+        if meta.is_final() {
+            let committed_path = Self::block_path(dir, meta)?;
+            let staging_path = Self::block_path(dir, &prepared)?;
+            if staging_path.exists() {
+                return err_box!(
+                    "Cannot rewrite block {} because staging file {} already exists",
+                    meta.id(),
+                    staging_path.display()
+                );
+            }
+
+            // This copy is intentionally serialized by the dataset write lock so
+            // the committed-to-staging transition cannot race another writer.
+            // Existing open readers keep using active; new metadata operations
+            // wait for the copy to finish.
+            if let Err(e) = fs::copy(&committed_path, &staging_path) {
+                let _ = fs::remove_file(&staging_path);
+                return Err(e.into());
+            }
+        }
+
         Ok(prepared)
     }
 
@@ -117,10 +142,22 @@ impl BlockLayout for FileLayout {
         &self,
         dir: &VfsDir,
         meta: &BlockMeta,
-        _committed_len: i64,
+        committed_len: i64,
     ) -> CommonResult<BlockMeta> {
-        let path = Self::block_path(dir, meta)?;
-        BlockMeta::with_final(meta, &path)
+        let staging_path = Self::block_path(dir, meta)?;
+        let final_meta = BlockMeta::with_final(meta, &staging_path)?;
+        if final_meta.len() != committed_len {
+            return err_box!(
+                "Block {} length mismatch, expected: {}, actual: {}",
+                meta.id(),
+                committed_len,
+                final_meta.len()
+            );
+        }
+
+        let active_path = Self::block_path(dir, &final_meta)?;
+        FileUtils::rename(staging_path, active_path)?;
+        Ok(final_meta)
     }
 
     fn scan(&self, dir: &VfsDir) -> CommonResult<Vec<BlockMeta>> {
@@ -129,14 +166,23 @@ impl BlockLayout for FileLayout {
         let staging_dir = FileUtils::list_files(Self::staging_dir(dir), true)?;
 
         let mut blocks = vec![];
+        let mut active_ids = HashSet::new();
         for file in active_dir {
             if let Ok(meta) = BlockMeta::from_file(&file, BlockState::Finalized, dir) {
+                active_ids.insert(meta.id());
                 blocks.push(meta);
             }
         }
 
         for file in staging_dir {
             if let Ok(meta) = BlockMeta::from_file(&file, BlockState::Recovering, dir) {
+                // A crash during a rewrite can leave the committed active file
+                // and an incomplete staging copy. Prefer the published active
+                // generation and discard staging before capacity is reserved.
+                if active_ids.contains(&meta.id()) {
+                    fs::remove_file(file)?;
+                    continue;
+                }
                 blocks.push(meta);
             }
         }
@@ -155,7 +201,7 @@ impl BlockLayout for FileLayout {
     fn open_writer(&self, dir: &VfsDir, meta: &BlockMeta, off: i64) -> IOResult<BlockWriteContext> {
         validate_open_offset(meta, off)?;
         let file = Self::block_file(dir, meta)?;
-        let device = BlockDevice::Local(LocalFile::with_write_offset(file, false, off)?);
+        let device = LocalFile::with_write_offset(file, false, off)?;
         BlockWriteContext::new(device, 0, meta.len, off)
     }
 
@@ -164,7 +210,7 @@ impl BlockLayout for FileLayout {
         let read_off = u64::try_from(off)
             .map_err(|_| IOError::from(format!("Invalid read offset: {}", off)))?;
         let file = Self::block_file(dir, meta)?;
-        let device = BlockDevice::Local(LocalFile::with_read(file, read_off)?);
+        let device = LocalFile::with_read(file, read_off)?;
         BlockReadContext::new(device, 0, meta.len, off)
     }
 

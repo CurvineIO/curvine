@@ -22,7 +22,9 @@ use orpc::{err_box, CommonResult};
 use std::sync::Arc;
 
 #[cfg(feature = "spdk")]
-use orpc::io::{BlockDevice, IOError, SpdkBdev};
+use curvine_storage_spdk::SpdkBdev;
+#[cfg(feature = "spdk")]
+use orpc::io::IOError;
 
 #[derive(Clone)]
 pub struct BdevLayout {
@@ -43,6 +45,10 @@ impl BdevLayout {
 }
 
 impl BlockLayout for BdevLayout {
+    fn preserves_committed_on_write(&self) -> bool {
+        false
+    }
+
     fn allocate(&self, dir: &VfsDir, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         let allocated_bytes = match dir.state.offset_alloc.allocation_size(block.len) {
             Some(size) => size,
@@ -175,8 +181,7 @@ impl BlockLayout for BdevLayout {
                 return err_box!("Cannot open SPDK writer: no space remaining");
             }
             let bdev = SpdkBdev::open_write(bdev_name, abs_offset, max_len)?;
-            let device = BlockDevice::Spdk(bdev);
-            BlockWriteContext::new(device, base_offset, meta.len, off)
+            BlockWriteContext::new(bdev, base_offset, meta.len, off)
         }
         #[cfg(not(feature = "spdk"))]
         {
@@ -212,8 +217,7 @@ impl BlockLayout for BdevLayout {
                 return err_box!("Cannot open SPDK reader: no space remaining");
             }
             let bdev = SpdkBdev::open_read(bdev_name, abs_offset, max_len)?;
-            let device = BlockDevice::Spdk(bdev);
-            BlockReadContext::new(device, base_offset, meta.len, off)
+            BlockReadContext::new(bdev, base_offset, meta.len, off)
         }
         #[cfg(not(feature = "spdk"))]
         {

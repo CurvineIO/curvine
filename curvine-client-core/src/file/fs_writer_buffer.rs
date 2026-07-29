@@ -1,0 +1,334 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::file::FsWriterBase;
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_fs_api::Path;
+use curvine_model::{FileAllocOpts, FileBlocks, FileStatus};
+use log::error;
+use orpc::io::IOError;
+use orpc::runtime::RpcRuntime;
+use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
+use orpc::sync::ErrorMonitor;
+use orpc::sys::DataSlice;
+use std::sync::Arc;
+
+// Control task type
+enum WriterTask {
+    Flush(CallSender<i8>),
+    Complete((bool, CallSender<i8>)),
+    Cancel(CallSender<FsResult<()>>),
+    Seek((i64, CallSender<i8>)),
+    Resize((FileAllocOpts, CallSender<FileBlocks>)),
+}
+
+enum SelectTask {
+    Control(WriterTask),
+    Data(DataSlice),
+}
+
+async fn recv_task(
+    chunk_receiver: &mut AsyncReceiver<DataSlice>,
+    task_receiver: &mut AsyncReceiver<WriterTask>,
+) -> Option<SelectTask> {
+    tokio::select! {
+        biased;
+
+        // Control tasks take priority. Flush/complete/seek/resize drain the data
+        // queue explicitly, while cancel intentionally does not; prioritizing
+        // data here would keep writing queued chunks after cancellation arrived.
+        task = task_receiver.recv() => task.map(SelectTask::Control),
+        chunk = chunk_receiver.recv() => chunk.map(SelectTask::Data),
+    }
+}
+
+struct BufferChannel {
+    chunk_sender: AsyncSender<DataSlice>,
+    task_sender: AsyncSender<WriterTask>,
+    err_monitor: Arc<ErrorMonitor<FsError>>,
+}
+
+impl BufferChannel {
+    fn check_error(&self, e: impl Into<FsError>) -> FsError {
+        self.err_monitor.take_error().unwrap_or(e.into())
+    }
+
+    async fn write(&mut self, data: DataSlice) -> FsResult<()> {
+        self.chunk_sender
+            .send(data)
+            .await
+            .map_err(|e| self.check_error(e))
+    }
+
+    async fn complete(&mut self) -> FsResult<()> {
+        let fun = async {
+            let (tx, rx) = CallChannel::channel();
+            self.task_sender
+                .send(WriterTask::Complete((false, tx)))
+                .await?;
+            rx.receive().await?;
+            Ok::<(), IOError>(())
+        };
+        fun.await.map_err(|e| self.check_error(e))
+    }
+
+    async fn flush(&mut self) -> FsResult<()> {
+        let fun = async {
+            let (tx, rx) = CallChannel::channel();
+            self.task_sender.send(WriterTask::Flush(tx)).await?;
+            rx.receive().await?;
+            Ok::<(), IOError>(())
+        };
+        fun.await.map_err(|e| self.check_error(e))
+    }
+
+    async fn cancel(&mut self) -> FsResult<()> {
+        let fun = async {
+            let (tx, rx) = CallChannel::channel();
+            self.task_sender.send(WriterTask::Cancel(tx)).await?;
+            rx.receive().await??;
+            Ok::<(), FsError>(())
+        };
+        fun.await.map_err(|e| self.check_error(e))
+    }
+
+    async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        let fun = async {
+            let (tx, rx) = CallChannel::channel();
+            self.task_sender.send(WriterTask::Seek((pos, tx))).await?;
+            rx.receive().await?;
+            Ok::<(), IOError>(())
+        };
+        fun.await.map_err(|e| self.check_error(e))
+    }
+
+    async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<FileBlocks> {
+        let fun = async {
+            let (tx, rx) = CallChannel::channel();
+            self.task_sender
+                .send(WriterTask::Resize((opts, tx)))
+                .await?;
+            let file_blocks = rx.receive().await?;
+            Ok::<FileBlocks, IOError>(file_blocks)
+        };
+        fun.await.map_err(|e| self.check_error(e))
+    }
+}
+
+// Reader with buffer.
+pub struct FsWriterBuffer {
+    path: Path,
+    file_blocks: FileBlocks,
+    writer: BufferChannel,
+    pos: i64,
+}
+
+impl FsWriterBuffer {
+    pub fn new(writer: FsWriterBase, chunk_num: usize) -> Self {
+        let err_monitor = Arc::new(ErrorMonitor::new());
+        let path = writer.path().clone();
+        let file_blocks = writer.file_blocks();
+        let pos = writer.pos();
+
+        let (chunk_sender, chunk_receiver) = AsyncChannel::new(chunk_num).split();
+        let (task_sender, task_receiver) = AsyncChannel::new(2).split();
+        let monitor = err_monitor.clone();
+
+        let rt = writer.fs_context().clone_runtime();
+        rt.spawn(async move {
+            let res = Self::write_future(chunk_receiver, task_receiver, writer).await;
+            match res {
+                Ok(_) => {}
+                Err(e) => {
+                    error!("buffer writer error: {:?}", e);
+                    monitor.set_error(e);
+                }
+            }
+        });
+
+        let writer = BufferChannel {
+            chunk_sender,
+            task_sender,
+            err_monitor,
+        };
+
+        Self {
+            path,
+            file_blocks,
+            writer,
+            pos,
+        }
+    }
+
+    pub fn path_str(&self) -> &str {
+        self.path.path()
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn status(&self) -> &FileStatus {
+        &self.file_blocks.status
+    }
+
+    pub fn file_blocks(&self) -> &FileBlocks {
+        &self.file_blocks
+    }
+
+    pub fn pos(&self) -> i64 {
+        self.pos
+    }
+
+    pub fn pos_mut(&mut self) -> &mut i64 {
+        &mut self.pos
+    }
+
+    pub async fn write(&mut self, data: DataSlice) -> FsResult<()> {
+        let len = data.len();
+        if len == 0 {
+            return Ok(());
+        }
+        self.writer.write(data).await?;
+        self.pos += len as i64;
+        Ok(())
+    }
+
+    pub async fn complete(&mut self) -> FsResult<()> {
+        self.writer.complete().await
+    }
+
+    pub async fn flush(&mut self) -> FsResult<()> {
+        self.writer.flush().await
+    }
+
+    pub async fn cancel(&mut self) -> FsResult<()> {
+        self.writer.cancel().await
+    }
+
+    pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        self.writer.seek(pos).await?;
+        self.pos = pos;
+        Ok(())
+    }
+
+    pub async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
+        let file_blocks = self.writer.resize(opts).await?;
+        self.pos = self.pos.min(file_blocks.len);
+        self.file_blocks = file_blocks;
+        Ok(())
+    }
+
+    async fn write_future(
+        mut chunk_receiver: AsyncReceiver<DataSlice>,
+        mut task_receiver: AsyncReceiver<WriterTask>,
+        mut writer: FsWriterBase,
+    ) -> FsResult<()> {
+        loop {
+            // The queue can be written and controlled to complete any future.
+            let select_task = match recv_task(&mut chunk_receiver, &mut task_receiver).await {
+                Some(task) => task,
+                None => return Ok(()),
+            };
+
+            match select_task {
+                SelectTask::Control(task) => match task {
+                    WriterTask::Flush(cx) => {
+                        while let Some(chunk) = chunk_receiver.try_recv()? {
+                            writer.write(chunk).await?;
+                        }
+                        writer.flush().await?;
+                        cx.send(1)?;
+                    }
+
+                    WriterTask::Complete((_, tx)) => {
+                        while let Some(chunk) = chunk_receiver.try_recv()? {
+                            writer.write(chunk).await?;
+                        }
+                        writer.complete().await?;
+                        tx.send(1)?;
+                        return Ok(());
+                    }
+
+                    WriterTask::Cancel(tx) => {
+                        // Do not drain chunk_receiver: queued chunks are
+                        // uncommitted data and cancellation intentionally drops
+                        // them. FsWriterBase::cancel attempts every active block
+                        // writer before returning its first error.
+                        let res = writer.cancel().await;
+                        tx.send(res)?;
+                        return Ok(());
+                    }
+
+                    WriterTask::Seek((pos, tx)) => {
+                        // Process all buffered data first
+                        while let Some(chunk) = chunk_receiver.try_recv()? {
+                            writer.write(chunk).await?
+                        }
+
+                        // Execute seek operation
+                        writer.seek(pos).await?;
+
+                        if let Err(e) = tx.send(1) {
+                            return Err(e.into());
+                        }
+                    }
+
+                    WriterTask::Resize((opts, tx)) => {
+                        while let Some(chunk) = chunk_receiver.try_recv()? {
+                            writer.write(chunk).await?
+                        }
+
+                        writer.resize(opts).await?;
+
+                        if let Err(e) = tx.send(writer.file_blocks()) {
+                            return Err(e.into());
+                        }
+                    }
+                },
+
+                SelectTask::Data(chunk) => {
+                    writer.write(chunk).await?;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{recv_task, SelectTask, WriterTask};
+    use bytes::Bytes;
+    use curvine_error::FsResult;
+    use orpc::sync::channel::{AsyncChannel, CallChannel};
+    use orpc::sys::DataSlice;
+
+    #[tokio::test]
+    async fn cancel_control_preempts_queued_data() {
+        let (chunk_tx, mut chunk_rx) = AsyncChannel::new(2).split();
+        let (task_tx, mut task_rx) = AsyncChannel::new(2).split();
+        chunk_tx
+            .send(DataSlice::Bytes(Bytes::from_static(b"queued")))
+            .await
+            .unwrap();
+        let (cancel_tx, _cancel_rx) = CallChannel::channel::<FsResult<()>>();
+        task_tx.send(WriterTask::Cancel(cancel_tx)).await.unwrap();
+
+        assert!(matches!(
+            recv_task(&mut chunk_rx, &mut task_rx).await,
+            Some(SelectTask::Control(WriterTask::Cancel(_)))
+        ));
+    }
+}

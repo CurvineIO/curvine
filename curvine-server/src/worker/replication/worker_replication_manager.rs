@@ -128,18 +128,21 @@ impl WorkerReplicationManager {
         job.with_storage_type(block_meta.storage_type());
         let extend_block =
             ExtendedBlock::new(block_meta.id, 0, block_meta.storage_type(), FileType::File);
+        let target_capacity = block_meta.replication_capacity();
         info!(
-            "Replicating block_id: {} from {} to {}",
+            "Replicating block_id: {} from {} to {} (copy_bytes={}, target_capacity={})",
             job.block_id,
             self.block_store.worker_id()?,
-            job.target_worker_addr.worker_id
+            job.target_worker_addr.worker_id,
+            block_meta.len,
+            target_capacity
         );
         let mut writer = BlockWriterRemote::new(
             &self.fs_client_context,
             extend_block,
             job.target_worker_addr.clone(),
             0,
-            self.fs_client_context.block_size(),
+            target_capacity,
         )
         .await?;
         let mut reader = self.block_store.open_reader(&block_meta, 0)?;
