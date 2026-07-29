@@ -68,6 +68,10 @@ void curvine_spdk_ctrlr_opts_set_keep_alive_timeout_ms(struct spdk_nvme_ctrlr_op
 void curvine_spdk_ctrlr_opts_set_hostnqn(struct spdk_nvme_ctrlr_opts *opts, const char *nqn) {
     snprintf(opts->hostnqn, sizeof(opts->hostnqn), "%s", nqn);
 }
+uint32_t curvine_spdk_ctrlr_get_num_io_queues(struct spdk_nvme_ctrlr *ctrlr) {
+    const struct spdk_nvme_ctrlr_opts *opts = spdk_nvme_ctrlr_get_opts(ctrlr);
+    return opts ? opts->num_io_queues : 0;
+}
 
 // connect
 struct spdk_nvme_ctrlr *curvine_spdk_nvme_connect(struct spdk_nvme_transport_id *trid,

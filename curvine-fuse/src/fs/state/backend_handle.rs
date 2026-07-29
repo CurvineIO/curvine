@@ -20,6 +20,7 @@ use crate::session::FuseResponse;
 use crate::{err_fuse, FuseError, FuseResult, FuseUtils};
 use curvine_common::fs::{Path, StateReader, StateWriter};
 use curvine_common::state::{CreateFileOptsBuilder, FileStatus, LockFlags, OpenFlags};
+use log::warn;
 use orpc::err_box;
 use orpc::sync::AtomicCounter;
 use orpc::sys::RawPtr;
@@ -111,24 +112,56 @@ impl BackendHandle {
         };
 
         if let Some(writer) = state.find_writer(self.ino).await {
-            // `write_ver` advances when writes are enqueued, not when they land.
+            // `write_ver` advances only after a write/resize is successfully queued.
+            // `enqueue_inflight` covers the brief window around send_queued_task so
+            // dirty-read cannot publish past a Write that is mid-enqueue.
             // Concurrent fork writers (LTP ftest) can enqueue after we schedule a
-            // flush; sample the version we flushed and loop until stable so we
-            // never publish `read_ver` past data that is still queued.
-            for _ in 0..16 {
-                let ver_before = writer.write_ver();
-                if self.read_ver.get() == ver_before {
-                    break;
+            // flush; publish until the observed version is stable with no inflight
+            // enqueues, then reopen once.
+            //
+            // Budget of 16: LTP fork-writer bursts typically stabilize within a
+            // handful of flush rounds; sustained churn returns EAGAIN rather than
+            // silently serving a stale view.
+            const DIRTY_READ_FLUSH_BUDGET: usize = 16;
+            if self.read_ver.get() != writer.write_ver() || writer.enqueue_inflight() != 0 {
+                let mut published_ver = None;
+                for _ in 0..DIRTY_READ_FLUSH_BUDGET {
+                    if writer.enqueue_inflight() != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                    let ver_before = writer.write_ver();
+                    if writer.enqueue_inflight() == 0 && self.read_ver.get() == ver_before {
+                        published_ver = Some(ver_before);
+                        break;
+                    }
+                    writer.flush(None).await?;
+                    if writer.enqueue_inflight() == 0 && writer.write_ver() == ver_before {
+                        published_ver = Some(ver_before);
+                        break;
+                    }
                 }
-                writer.flush(None).await?;
+
+                let Some(ver) = published_ver else {
+                    warn!(
+                        "dirty-read flush budget exhausted: ino={} write_ver={} read_ver={} inflight={}",
+                        self.ino,
+                        writer.write_ver(),
+                        self.read_ver.get(),
+                        writer.enqueue_inflight()
+                    );
+                    return err_fuse!(
+                        libc::EAGAIN,
+                        "dirty-read write_ver unstable after {} flushes",
+                        DIRTY_READ_FLUSH_BUDGET
+                    );
+                };
 
                 let path = reader.path().clone();
                 let new_reader = state.new_reader(&path).await?;
                 // Refresh status from the reopened reader before installing it.
                 self.refresh_status(new_reader.status().clone());
                 reader.replace(new_reader);
-
-                self.read_ver.set(ver_before);
+                self.read_ver.set(ver);
             }
         }
 
