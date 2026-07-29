@@ -619,9 +619,7 @@ impl LoadTaskRunner {
             match ufs.create(path, overwrite).await {
                 Ok(writer) => Ok(writer),
                 Err(FsError::FileNotFound(_)) => {
-                    if let Some(parent) = path.parent()? {
-                        ufs.mkdir(&parent, true).await?;
-                    }
+                    ensure_ufs_parent(&ufs, path).await?;
                     ufs.create(path, overwrite).await
                 }
                 Err(e) => Err(e),
@@ -699,15 +697,22 @@ async fn rename_ufs_output(
     temp_path: &Path,
     final_path: &Path,
 ) -> FsResult<()> {
-    if let Some(parent) = final_path.parent()? {
-        ufs.mkdir(&parent, true).await?;
-    }
+    ensure_ufs_parent(ufs, final_path).await?;
     if !ufs.rename(temp_path, final_path).await? {
         return err_box!(
             "Transfer output rename did not commit {} to {}",
             temp_path.full_path(),
             final_path.full_path()
         );
+    }
+    Ok(())
+}
+
+async fn ensure_ufs_parent(ufs: &UfsFileSystem, path: &Path) -> FsResult<()> {
+    if let Some(parent) = path.parent()? {
+        if !parent.is_root() {
+            ufs.mkdir(&parent, true).await?;
+        }
     }
     Ok(())
 }
