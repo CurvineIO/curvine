@@ -27,8 +27,13 @@ pub mod block_io {
     pub use curvine_io::{BlockDevice, BlockIO};
 }
 
-pub mod net;
-pub mod retry;
+pub mod net {
+    pub use orpc_net::net::*;
+}
+
+pub mod retry {
+    pub use orpc_net::retry::*;
+}
 
 pub mod spdk_conf;
 pub use self::spdk_conf::{BdevInfo, NvmeTarget, SpdkConf};

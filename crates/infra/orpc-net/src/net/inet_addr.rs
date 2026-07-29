@@ -14,9 +14,8 @@
 
 #![allow(clippy::should_implement_trait)]
 
-use crate::err_box;
-use crate::io::net::NetUtils;
-use crate::io::IOResult;
+use crate::net::NetUtils;
+use curvine_io::IOResult;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::net::{SocketAddr, ToSocketAddrs};

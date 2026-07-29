@@ -12,8 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[macro_use]
-mod macros;
+use crate::net::InetAddr;
 
-pub mod net;
-pub mod retry;
+#[derive(Debug, Clone, Default)]
+pub struct ConnState {
+    pub remote_addr: InetAddr,
+    pub local_addr: InetAddr,
+}
+
+impl ConnState {
+    pub fn new(remote_addr: InetAddr, local_addr: InetAddr) -> Self {
+        Self {
+            remote_addr,
+            local_addr,
+        }
+    }
+}
