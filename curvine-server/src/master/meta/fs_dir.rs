@@ -600,8 +600,12 @@ impl FsDir {
         let id = file.id();
         file.complete(len, &commit_block, client_name, only_flush)?;
 
-        if let Some(opts) = set_attr_opts {
-            inode.set_attr(opts)?;
+        // Only apply set_attr_opts on real complete/close, not on flush.
+        // Flush semantics should remain narrow (durability only).
+        if !only_flush {
+            if let Some(opts) = set_attr_opts {
+                inode.set_attr(opts)?;
+            }
         }
 
         self.evictor.on_access(id);

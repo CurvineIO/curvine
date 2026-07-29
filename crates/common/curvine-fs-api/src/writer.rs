@@ -104,12 +104,21 @@ pub trait Writer {
 
     fn complete(&mut self) -> impl Future<Output = FsResult<()>>;
 
+    /// Completes the write operation and optionally applies file attributes.
+    ///
+    /// # Default Implementation
+    ///
+    /// The default implementation **ignores** `opts` and simply calls [`complete()`](Writer::complete).
+    /// Backends that support atomic attribute setting on complete should override this method.
+    ///
+    /// Callers should not assume attributes were applied unless the backend explicitly
+    /// supports this method.
     fn complete_with_attr(
         &mut self,
         opts: Option<SetAttrOpts>,
     ) -> impl Future<Output = FsResult<()>> {
         async move {
-            let _ = &opts;
+            drop(opts);
             self.complete().await
         }
     }
