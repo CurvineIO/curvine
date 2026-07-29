@@ -103,7 +103,7 @@ impl QpairPool {
     // TODO: Arc<CtrlQpairState> + #[repr(align(64))] - eliminate ctrl_state Mutex from CAS, prevent false sharing
     /// Atomically reserve a slot for this controller.
     /// Returns true if reserved (active < max_active), false at capacity.
-    fn try_reserve(&self, ctrlr_ptr: usize) -> bool {
+    pub(crate) fn try_reserve(&self, ctrlr_ptr: usize) -> bool {
         let state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(s) = state.get(&ctrlr_ptr) {
             loop {
@@ -299,7 +299,7 @@ impl QpairPool {
     }
     /// Free all pooled qpairs. Only frees cached (idle) qpairs - active/in-flight
     /// qpairs are tracked by their owners and will be released normally.
-    fn drain_all(&self) {
+    pub(crate) fn drain_all(&self) {
         self.shutdown.store(true, Ordering::Release);
         let mut pool = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let mut total = 0usize;
