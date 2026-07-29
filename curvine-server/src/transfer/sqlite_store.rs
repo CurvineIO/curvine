@@ -1128,7 +1128,7 @@ fn select_conflicting_active_transfer(
     submitter: &str,
     client_request_id: &str,
 ) -> FsResult<Option<TransferJobRecord>> {
-    let child_prefix = format!("{}/%", target_path.trim_end_matches('/'));
+    let (child_lower, child_upper) = child_path_bounds(target_path);
     let exact_or_child = conn
         .query_row(
             job_select_sql(
@@ -1136,12 +1136,18 @@ fn select_conflicting_active_transfer(
                and not (submitter = ?2 and client_request_id = ?3)
                and (
                    target_path = ?1
-                   or target_path like ?4
+                   or (target_path >= ?4 and target_path < ?5)
                )
              limit 1",
             )
             .as_str(),
-            params![target_path, submitter, client_request_id, child_prefix],
+            params![
+                target_path,
+                submitter,
+                client_request_id,
+                child_lower,
+                child_upper
+            ],
             sqlite_job_row,
         )
         .optional()
@@ -1199,6 +1205,28 @@ fn ancestor_paths(target_path: &str) -> Vec<String> {
         ancestors.push(current.clone());
     }
     ancestors
+}
+
+fn child_path_bounds(target_path: &str) -> (String, String) {
+    let lower = if target_path == "/" {
+        "/".to_string()
+    } else {
+        format!("{}/", target_path.trim_end_matches('/'))
+    };
+    let upper = lexicographic_successor(&lower).unwrap_or_else(|| "\u{10ffff}".to_string());
+    (lower, upper)
+}
+
+fn lexicographic_successor(value: &str) -> Option<String> {
+    let mut bytes = value.as_bytes().to_vec();
+    for index in (0..bytes.len()).rev() {
+        if bytes[index] < u8::MAX {
+            bytes[index] += 1;
+            bytes.truncate(index + 1);
+            return String::from_utf8(bytes).ok();
+        }
+    }
+    None
 }
 
 fn sqlite_job_row(row: &Row<'_>) -> rusqlite::Result<TransferJobRecord> {
