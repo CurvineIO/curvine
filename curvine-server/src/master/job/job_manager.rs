@@ -41,6 +41,7 @@ pub struct JobManager {
     master_fs: MasterFilesystem,
     factory: Arc<UfsFactory>,
     mount_manager: Arc<MountManager>,
+    transfer_enabled: bool,
     job_life_ttl: Duration,
     job_cleanup_ttl: Duration,
     job_max_files: usize,
@@ -63,6 +64,7 @@ impl JobManager {
             master_fs,
             factory,
             mount_manager,
+            transfer_enabled: conf.transfer.enabled,
             job_life_ttl: conf.job.job_life_ttl,
             job_cleanup_ttl: conf.job.job_cleanup_ttl,
             job_max_files: conf.job.job_max_files,
@@ -164,10 +166,20 @@ impl JobManager {
         &self.rt
     }
 
+    fn reject_legacy_submit(&self) -> FsResult<()> {
+        if self.transfer_enabled {
+            return err_box!(
+                "Legacy Master Load API is disabled because transfer is enabled; use the Transfer service"
+            );
+        }
+        Ok(())
+    }
+
     /// See `LoadJobRunner::submit_load_task` for the concurrency contract: concurrent
     /// submits for the same path while a load is running return the **existing** run’s
     /// result; the new command’s options are not applied (first submitter wins).
     pub async fn submit_load_job(&self, command: LoadJobCommand) -> FsResult<LoadJobResult> {
+        self.reject_legacy_submit()?;
         let source_path = Path::from_str(&command.source_path)?;
 
         // Check mount info for both UFS and CV paths. Public load jobs import
@@ -215,6 +227,7 @@ impl JobManager {
     }
 
     pub async fn submit_export_job(&self, command: LoadJobCommand) -> FsResult<LoadJobResult> {
+        self.reject_legacy_submit()?;
         let source_path = Path::from_str(&command.source_path)?;
 
         let mnt = if let Some(mnt) = self.mount_manager.get_mount_info(&source_path)? {
