@@ -22,8 +22,8 @@ use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, FsKind, ListStream, Path, Reader, RpcCode, Writer};
 use curvine_common::state::{
     CreateFileOpts, FileAllocOpts, FileLock, FileStatus, FreeResult, JobStatus, ListOptions,
-    MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
-    TransferCommand, TransferKind, TransferState,
+    LoadJobCommand, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags,
+    SetAttrOpts, TransferCommand, TransferKind, TransferState,
 };
 use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
@@ -484,10 +484,7 @@ impl UnifiedFileSystem {
                            used_us
                         );
                     }
-                    debug!(
-                        "submitted async cache transfer {} for {}",
-                        job_id, source_path
-                    );
+                    debug!("submitted async cache job {} for {}", job_id, source_path);
                 }
             }
             fs.async_cache_pending.remove(&source_path);
@@ -506,10 +503,11 @@ impl UnifiedFileSystem {
             let rep = submit_transfer_with_backoff(&client, command).await?;
             return Ok(("SubmitTransfer".to_string(), rep.job_id, target_path));
         }
-        Err(FsError::common(format!(
-            "auto cache load requires transfer.enabled=true and a running curvine-transfer service; refusing to submit legacy Master LoadJob for {}",
-            source_path
-        )))
+        let client = JobMasterClient::new(self.fs_client());
+        let result = client
+            .submit_load_job(LoadJobCommand::builder(source_path).build())
+            .await?;
+        Ok(("SubmitJob".to_string(), result.job_id, result.target_path))
     }
 
     async fn cache_transfer_command(&self, requested_path: &Path) -> FsResult<TransferCommand> {
