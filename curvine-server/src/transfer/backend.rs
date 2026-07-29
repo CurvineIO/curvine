@@ -15,15 +15,14 @@
 use curvine_common::error::FsError;
 use curvine_common::state::{
     StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease, TransferListFilter,
-    TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTaskState,
-    TransferTenantSummary,
+    TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTenantSummary,
 };
 use curvine_common::FsResult;
 use std::time::Instant;
 
 use crate::transfer::{
     MemoryTransferStore, MysqlTransferStore, SqliteTransferStore, TransferMetrics,
-    TransferRequeueUpdate, TransferStore,
+    TransferPlannedTasks, TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
 };
 
 pub enum TransferStoreBackend {
@@ -217,26 +216,6 @@ impl TransferStore for TransferStoreBackend {
         })
     }
 
-    fn set_transfer_state(
-        &self,
-        job_id: &str,
-        run_id: u64,
-        state: TransferState,
-        message: impl Into<String>,
-        now_ms: i64,
-    ) -> FsResult<bool> {
-        let message = message.into();
-        self.record_store_operation("set_transfer_state", || match self {
-            Self::Memory(store) => {
-                store.set_transfer_state(job_id, run_id, state, message.clone(), now_ms)
-            }
-            Self::Sqlite(store) => {
-                store.set_transfer_state(job_id, run_id, state, message.clone(), now_ms)
-            }
-            Self::Mysql(store) => store.set_transfer_state(job_id, run_id, state, message, now_ms),
-        })
-    }
-
     fn requeue_transfer(&self, update: TransferRequeueUpdate) -> FsResult<bool> {
         self.record_store_operation("requeue_transfer", || match self {
             Self::Memory(store) => store.requeue_transfer(update),
@@ -290,25 +269,19 @@ impl TransferStore for TransferStoreBackend {
         })
     }
 
-    fn update_task_state(
-        &self,
-        job_id: &str,
-        run_id: u64,
-        task_id: &str,
-        state: TransferTaskState,
-        message: impl Into<String>,
-        now_ms: i64,
-    ) -> FsResult<bool> {
+    fn persist_planned_tasks(&self, update: TransferPlannedTasks) -> FsResult<bool> {
+        self.record_store_operation("persist_planned_tasks", || match self {
+            Self::Memory(store) => store.persist_planned_tasks(update),
+            Self::Sqlite(store) => store.persist_planned_tasks(update),
+            Self::Mysql(store) => store.persist_planned_tasks(update),
+        })
+    }
+
+    fn update_task_state(&self, update: TransferTaskStateUpdate) -> FsResult<bool> {
         self.record_store_operation("update_task_state", || match self {
-            Self::Memory(store) => {
-                store.update_task_state(job_id, run_id, task_id, state, message, now_ms)
-            }
-            Self::Sqlite(store) => {
-                store.update_task_state(job_id, run_id, task_id, state, message, now_ms)
-            }
-            Self::Mysql(store) => {
-                store.update_task_state(job_id, run_id, task_id, state, message, now_ms)
-            }
+            Self::Memory(store) => store.update_task_state(update),
+            Self::Sqlite(store) => store.update_task_state(update),
+            Self::Mysql(store) => store.update_task_state(update),
         })
     }
 
@@ -347,15 +320,39 @@ impl TransferStore for TransferStoreBackend {
         })
     }
 
-    fn list_recoverable_tasks(
+    fn list_stale_running_tasks(
         &self,
         job_id: &str,
         run_id: u64,
+        stale_before_ms: i64,
+        limit: usize,
     ) -> FsResult<Vec<TransferTaskRecord>> {
-        self.record_store_operation("list_recoverable_tasks", || match self {
-            Self::Memory(store) => store.list_recoverable_tasks(job_id, run_id),
-            Self::Sqlite(store) => store.list_recoverable_tasks(job_id, run_id),
-            Self::Mysql(store) => store.list_recoverable_tasks(job_id, run_id),
+        self.record_store_operation("list_stale_running_tasks", || match self {
+            Self::Memory(store) => {
+                store.list_stale_running_tasks(job_id, run_id, stale_before_ms, limit)
+            }
+            Self::Sqlite(store) => {
+                store.list_stale_running_tasks(job_id, run_id, stale_before_ms, limit)
+            }
+            Self::Mysql(store) => {
+                store.list_stale_running_tasks(job_id, run_id, stale_before_ms, limit)
+            }
+        })
+    }
+
+    fn has_failed_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool> {
+        self.record_store_operation("has_failed_tasks", || match self {
+            Self::Memory(store) => store.has_failed_tasks(job_id, run_id),
+            Self::Sqlite(store) => store.has_failed_tasks(job_id, run_id),
+            Self::Mysql(store) => store.has_failed_tasks(job_id, run_id),
+        })
+    }
+
+    fn has_recoverable_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool> {
+        self.record_store_operation("has_recoverable_tasks", || match self {
+            Self::Memory(store) => store.has_recoverable_tasks(job_id, run_id),
+            Self::Sqlite(store) => store.has_recoverable_tasks(job_id, run_id),
+            Self::Mysql(store) => store.has_recoverable_tasks(job_id, run_id),
         })
     }
 

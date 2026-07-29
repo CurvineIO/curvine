@@ -14,21 +14,25 @@
 
 use curvine_common::error::FsError;
 use curvine_common::state::{
-    summarize_transfer_tasks, StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease,
-    TransferListFilter, TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport,
-    TransferTaskState, TransferTenantSummary,
+    StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease, TransferListFilter,
+    TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTaskState,
+    TransferTenantSummary,
 };
 use curvine_common::FsResult;
 use mysql::prelude::*;
 use mysql::{params, Params, Pool, PooledConn, TxOpts, Value as MysqlValue};
 
-use crate::transfer::{TransferRequeueUpdate, TransferStore};
+use crate::transfer::{
+    apply_task_report_progress, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
+    TransferTaskStateUpdate,
+};
 
 const TRANSFER_SCHEMA_VERSION: u64 = 4;
 const TRANSFER_SCHEMA_V3: u64 = 3;
 
 type TenantSummaryRow = (
     String,
+    Option<u64>,
     Option<u64>,
     Option<u64>,
     Option<u64>,
@@ -118,7 +122,7 @@ impl TransferStore for MysqlTransferStore {
     fn list_active_transfers(&self) -> FsResult<Vec<TransferJobRecord>> {
         select_jobs(
             &mut self.conn()?,
-            "select record_json from transfer_jobs where state not in (6, 7, 8)",
+            "select record_json from transfer_jobs where state not in (6, 7, 8, 9)",
             Params::Empty,
         )
     }
@@ -140,7 +144,7 @@ impl TransferStore for MysqlTransferStore {
     fn count_active_transfers(&self) -> FsResult<u64> {
         self.conn()?
             .exec_first::<u64, _, _>(
-                "select count(*) from transfer_jobs where state not in (6, 7, 8)",
+                "select count(*) from transfer_jobs where state not in (6, 7, 8, 9)",
                 Params::Empty,
             )
             .map_err(mysql_err)?
@@ -184,6 +188,7 @@ impl TransferStore for MysqlTransferStore {
                         sum(case when state = 6 then 1 else 0 end) as completed,
                         sum(case when state = 7 then 1 else 0 end) as failed,
                         sum(case when state = 8 then 1 else 0 end) as canceled,
+                        sum(case when state = 9 then 1 else 0 end) as partial_success,
                         count(*) as total
                  from transfer_jobs
                  group by tenant
@@ -195,13 +200,23 @@ impl TransferStore for MysqlTransferStore {
                     "limit" => limit as u64,
                     "offset" => offset as u64,
                 },
-                |(tenant, pending, executing, completed, failed, canceled, total): TenantSummaryRow| TransferTenantSummary {
+                |(
+                    tenant,
+                    pending,
+                    executing,
+                    completed,
+                    failed,
+                    canceled,
+                    partial_success,
+                    total,
+                ): TenantSummaryRow| TransferTenantSummary {
                     tenant,
                     pending: pending.unwrap_or_default(),
                     executing: executing.unwrap_or_default(),
                     completed: completed.unwrap_or_default(),
                     failed: failed.unwrap_or_default(),
                     canceled: canceled.unwrap_or_default(),
+                    partial_success: partial_success.unwrap_or_default(),
                     total,
                 },
             )
@@ -219,7 +234,7 @@ impl TransferStore for MysqlTransferStore {
         let job_ids: Vec<String> = tx
             .exec(
                 "select job_id from transfer_jobs
-                 where state in (6, 7, 8) and updated_at < :older_than_ms
+                 where state in (6, 7, 8, 9) and updated_at < :older_than_ms
                  order by updated_at asc
                  limit :limit",
                 params! {
@@ -235,7 +250,7 @@ impl TransferStore for MysqlTransferStore {
             )
             .map_err(mysql_err)?;
             tx.exec_drop(
-                "delete from transfer_jobs where job_id = :job_id and state in (6, 7, 8)",
+                "delete from transfer_jobs where job_id = :job_id and state in (6, 7, 8, 9)",
                 params! { "job_id" => job_id },
             )
             .map_err(mysql_err)?;
@@ -249,16 +264,25 @@ impl TransferStore for MysqlTransferStore {
     }
 
     fn request_cancel(&self, job_id: &str, run_id: u64, now_ms: i64) -> FsResult<bool> {
-        let mut job = match self.get_transfer(job_id)? {
+        let mut conn = self.conn()?;
+        let mut tx = conn
+            .start_transaction(TxOpts::default())
+            .map_err(mysql_err)?;
+        let mut job = match select_job_by_id_for_update(&mut tx, job_id)? {
             Some(job) if job.run_id == run_id && !job.state.is_terminal() => job,
-            _ => return Ok(false),
+            _ => {
+                tx.commit().map_err(mysql_err)?;
+                return Ok(false);
+            }
         };
         job.cancel_requested = true;
         job.state = TransferState::Canceling;
         job.summary.message = "cancel requested".to_string();
         job.summary.update_time = now_ms;
         job.updated_at = now_ms;
-        exec_update_job(&mut self.conn()?, &job)
+        let updated = exec_update_job(&mut tx, &job)?;
+        tx.commit().map_err(mysql_err)?;
+        Ok(updated)
     }
 
     fn acquire_runnable_transfer(
@@ -380,20 +404,30 @@ impl TransferStore for MysqlTransferStore {
         lease_ms: i64,
         now_ms: i64,
     ) -> FsResult<bool> {
-        let mut job = match self.get_transfer(job_id)? {
+        let mut conn = self.conn()?;
+        let mut tx = conn
+            .start_transaction(TxOpts::default())
+            .map_err(mysql_err)?;
+        let mut job = match select_job_by_id_for_update(&mut tx, job_id)? {
             Some(job)
                 if job.run_id == run_id
                     && job.owner == owner
                     && job.lease_epoch == lease_epoch
+                    && job.lease_expire_at > now_ms
                     && !job.state.is_terminal() =>
             {
                 job
             }
-            _ => return Ok(false),
+            _ => {
+                tx.commit().map_err(mysql_err)?;
+                return Ok(false);
+            }
         };
         job.lease_expire_at = now_ms.saturating_add(lease_ms);
         job.updated_at = now_ms;
-        exec_update_job(&mut self.conn()?, &job)
+        let updated = exec_update_job(&mut tx, &job)?;
+        tx.commit().map_err(mysql_err)?;
+        Ok(updated)
     }
 
     fn update_transfer_state(&self, update: TransferStateUpdate) -> FsResult<bool> {
@@ -406,6 +440,7 @@ impl TransferStore for MysqlTransferStore {
                 if job.run_id == update.run_id
                     && job.owner == update.owner
                     && job.lease_epoch == update.lease_epoch
+                    && job.lease_expire_at > update.now_ms
                     && update.from_states.contains(&job.state) =>
             {
                 job
@@ -424,25 +459,6 @@ impl TransferStore for MysqlTransferStore {
         Ok(updated)
     }
 
-    fn set_transfer_state(
-        &self,
-        job_id: &str,
-        run_id: u64,
-        state: TransferState,
-        message: impl Into<String>,
-        now_ms: i64,
-    ) -> FsResult<bool> {
-        let mut job = match self.get_transfer(job_id)? {
-            Some(job) if job.run_id == run_id => job,
-            _ => return Ok(false),
-        };
-        job.state = state;
-        job.summary.message = message.into();
-        job.summary.update_time = now_ms;
-        job.updated_at = now_ms;
-        exec_update_job(&mut self.conn()?, &job)
-    }
-
     fn requeue_transfer(&self, update: TransferRequeueUpdate) -> FsResult<bool> {
         let mut conn = self.conn()?;
         let mut tx = conn
@@ -453,6 +469,7 @@ impl TransferStore for MysqlTransferStore {
                 if job.run_id == update.run_id
                     && job.owner == update.owner
                     && job.lease_epoch == update.lease_epoch
+                    && job.lease_expire_at > update.now_ms
                     && job.state == TransferState::Planning =>
             {
                 job
@@ -491,6 +508,7 @@ impl TransferStore for MysqlTransferStore {
                 if job.run_id == run_id
                     && job.owner == owner
                     && job.lease_epoch == lease_epoch
+                    && job.lease_expire_at > now_ms
                     && !job.state.is_terminal()
                     && job
                         .cv_metadata_epoch
@@ -522,24 +540,81 @@ impl TransferStore for MysqlTransferStore {
         Ok(())
     }
 
-    fn update_task_state(
-        &self,
-        job_id: &str,
-        run_id: u64,
-        task_id: &str,
-        state: TransferTaskState,
-        message: impl Into<String>,
-        now_ms: i64,
-    ) -> FsResult<bool> {
-        let mut task = match select_task(&mut self.conn()?, job_id, run_id, task_id)? {
-            Some(task) => task,
-            None => return Ok(false),
+    fn persist_planned_tasks(&self, update: TransferPlannedTasks) -> FsResult<bool> {
+        let mut conn = self.conn()?;
+        let mut tx = conn
+            .start_transaction(TxOpts::default())
+            .map_err(mysql_err)?;
+        let mut job = match select_job_by_id_for_update(&mut tx, &update.job_id)? {
+            Some(job)
+                if job.run_id == update.run_id
+                    && job.owner == update.owner
+                    && job.lease_epoch == update.lease_epoch
+                    && job.lease_expire_at > update.now_ms
+                    && job.state == TransferState::Planning =>
+            {
+                job
+            }
+            _ => {
+                tx.commit().map_err(mysql_err)?;
+                return Ok(false);
+            }
         };
-        task.state = state;
-        task.progress.message = message.into();
-        task.progress.update_time = now_ms;
-        task.updated_at = now_ms;
-        exec_update_task(&mut self.conn()?, &task)
+        for task in update.tasks {
+            insert_task(&mut tx, &task)?;
+        }
+        job.state = TransferState::Dispatching;
+        job.summary.message = update.message;
+        job.summary.update_time = update.now_ms;
+        job.updated_at = update.now_ms;
+        let updated = exec_update_job(&mut tx, &job)?;
+        tx.commit().map_err(mysql_err)?;
+        Ok(updated)
+    }
+
+    fn update_task_state(&self, update: TransferTaskStateUpdate) -> FsResult<bool> {
+        let mut conn = self.conn()?;
+        let mut tx = conn
+            .start_transaction(TxOpts::default())
+            .map_err(mysql_err)?;
+        match select_job_by_id_for_update(&mut tx, &update.job_id)? {
+            Some(job)
+                if job.run_id == update.run_id
+                    && job.owner == update.owner
+                    && job.lease_epoch == update.lease_epoch
+                    && job.lease_expire_at > update.now_ms
+                    && !job.state.is_terminal() =>
+            {
+                job
+            }
+            _ => {
+                tx.commit().map_err(mysql_err)?;
+                return Ok(false);
+            }
+        };
+        let mut task = match select_task_for_update(
+            &mut tx,
+            &update.job_id,
+            update.run_id,
+            &update.task_id,
+        )? {
+            Some(task) => task,
+            None => {
+                tx.commit().map_err(mysql_err)?;
+                return Ok(false);
+            }
+        };
+        if !update.from_states.is_empty() && !update.from_states.contains(&task.state) {
+            tx.commit().map_err(mysql_err)?;
+            return Ok(false);
+        }
+        task.state = update.state;
+        task.progress.message = update.message;
+        task.progress.update_time = update.now_ms;
+        task.updated_at = update.now_ms;
+        let updated = exec_update_task(&mut tx, &task)?;
+        tx.commit().map_err(mysql_err)?;
+        Ok(updated)
     }
 
     fn claim_pending_tasks(
@@ -574,12 +649,13 @@ impl TransferStore for MysqlTransferStore {
             .exec_first(
                 "select 1 from transfer_jobs
                  where job_id = :job_id and run_id = :run_id and owner = :owner
-                   and lease_epoch = :lease_epoch",
+                   and lease_epoch = :lease_epoch and lease_expire_at > :now_ms",
                 params! {
                     "job_id" => job_id,
                     "run_id" => run_id,
                     "owner" => owner,
                     "lease_epoch" => lease_epoch,
+                    "now_ms" => now_ms,
                 },
             )
             .map_err(mysql_err)?;
@@ -617,22 +693,62 @@ impl TransferStore for MysqlTransferStore {
         Ok(stale)
     }
 
-    fn list_recoverable_tasks(
+    fn list_stale_running_tasks(
         &self,
         job_id: &str,
         run_id: u64,
+        stale_before_ms: i64,
+        limit: usize,
     ) -> FsResult<Vec<TransferTaskRecord>> {
         let rows: Vec<String> = self
             .conn()?
             .exec(
                 "select record_json from transfer_tasks
-                 where job_id = :job_id and run_id = :run_id and state in (1, 2, 6)",
-                params! { "job_id" => job_id, "run_id" => run_id },
+                 where job_id = :job_id and run_id = :run_id and state = 2
+                   and stale_deadline_at < :stale_before_ms
+                 order by stale_deadline_at asc
+                 limit :limit",
+                params! {
+                    "job_id" => job_id,
+                    "run_id" => run_id,
+                    "stale_before_ms" => stale_before_ms,
+                    "limit" => limit as u64,
+                },
             )
             .map_err(mysql_err)?;
         rows.into_iter()
             .map(|row| serde_json::from_str(&row).map_err(json_err))
             .collect()
+    }
+
+    fn has_failed_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool> {
+        let result: Option<u8> = self
+            .conn()?
+            .exec_first(
+                "select 1 from transfer_tasks
+                 where job_id = :job_id and run_id = :run_id and state = :state
+                 limit 1",
+                params! {
+                    "job_id" => job_id,
+                    "run_id" => run_id,
+                    "state" => TransferTaskState::Failed as i32,
+                },
+            )
+            .map_err(mysql_err)?;
+        Ok(result.is_some())
+    }
+
+    fn has_recoverable_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool> {
+        let result: Option<u8> = self
+            .conn()?
+            .exec_first(
+                "select 1 from transfer_tasks
+                 where job_id = :job_id and run_id = :run_id and state in (1, 2, 6)
+                 limit 1",
+                params! { "job_id" => job_id, "run_id" => run_id },
+            )
+            .map_err(mysql_err)?;
+        Ok(result.is_some())
     }
 
     fn start_task_attempt(&self, start: TaskAttemptStart) -> FsResult<bool> {
@@ -647,6 +763,7 @@ impl TransferStore for MysqlTransferStore {
         if job.run_id != start.run_id
             || job.owner != start.owner
             || job.lease_epoch != start.lease_epoch
+            || job.lease_expire_at <= start.now_ms
             || job.cancel_requested
             || job.state.is_terminal()
         {
@@ -687,6 +804,13 @@ impl TransferStore for MysqlTransferStore {
         let mut tx = conn
             .start_transaction(TxOpts::default())
             .map_err(mysql_err)?;
+        let mut job = match select_job_by_id_for_update(&mut tx, &report.job_id)? {
+            Some(job) if job.run_id == report.run_id => job,
+            _ => {
+                tx.commit().map_err(mysql_err)?;
+                return Ok(false);
+            }
+        };
         let mut task = match select_task_for_update(
             &mut tx,
             &report.job_id,
@@ -706,13 +830,21 @@ impl TransferStore for MysqlTransferStore {
                 return Ok(false);
             }
         };
+        let previous_progress = task.progress.clone();
         task.state = report.state;
-        task.progress = report.progress;
+        task.progress = report.progress.clone();
         task.last_report_at = report.now_ms;
         task.stale_deadline_at = report.stale_deadline_at;
         task.updated_at = report.now_ms;
         exec_update_task(&mut tx, &task)?;
-        update_job_summary(&mut tx, &report.job_id, report.run_id, report.now_ms)?;
+        apply_task_report_progress(
+            &mut job.summary,
+            &previous_progress,
+            &report.progress,
+            report.now_ms,
+        );
+        job.updated_at = report.now_ms;
+        exec_update_job(&mut tx, &job)?;
         tx.commit().map_err(mysql_err)?;
         Ok(true)
     }
@@ -1001,7 +1133,7 @@ fn select_non_terminal_job_by_key(
     select_job(
         conn,
         "select record_json from transfer_jobs
-         where job_key = :job_key and state not in (6, 7, 8)
+         where job_key = :job_key and state not in (6, 7, 8, 9)
          limit 1",
         params! { "job_key" => job_key },
     )
@@ -1017,7 +1149,7 @@ fn select_conflicting_active_transfer(
     let exact_or_child = select_job(
         conn,
         "select record_json from transfer_jobs
-         where state not in (6, 7, 8)
+         where state not in (6, 7, 8, 9)
            and not (submitter = :submitter and client_request_id = :client_request_id)
            and (
                target_path = :target_path
@@ -1041,7 +1173,7 @@ fn select_conflicting_active_transfer(
         let ancestor_conflict = select_job(
             conn,
             "select record_json from transfer_jobs
-             where state not in (6, 7, 8)
+             where state not in (6, 7, 8, 9)
                and not (submitter = :submitter and client_request_id = :client_request_id)
                and target_path = :target_path
              limit 1
@@ -1149,24 +1281,6 @@ fn list_filter_mysql_params(filter: &TransferListFilter) -> (String, Vec<MysqlVa
     }
 }
 
-fn select_task(
-    conn: &mut impl Queryable,
-    job_id: &str,
-    run_id: u64,
-    task_id: &str,
-) -> FsResult<Option<TransferTaskRecord>> {
-    let value: Option<String> = conn
-        .exec_first(
-            "select record_json from transfer_tasks
-             where job_id = :job_id and run_id = :run_id and task_id = :task_id",
-            params! { "job_id" => job_id, "run_id" => run_id, "task_id" => task_id },
-        )
-        .map_err(mysql_err)?;
-    value
-        .map(|json| serde_json::from_str(&json).map_err(json_err))
-        .transpose()
-}
-
 fn select_task_for_update(
     conn: &mut impl Queryable,
     job_id: &str,
@@ -1248,26 +1362,6 @@ fn exec_update_task(conn: &mut impl Queryable, task: &TransferTaskRecord) -> FsR
 fn exec_affected(conn: &mut impl Queryable, sql: &str, params: mysql::Params) -> FsResult<u64> {
     let result = conn.exec_iter(sql, params).map_err(mysql_err)?;
     Ok(result.affected_rows())
-}
-
-fn update_job_summary(
-    conn: &mut impl Queryable,
-    job_id: &str,
-    run_id: u64,
-    now_ms: i64,
-) -> FsResult<()> {
-    let tasks = select_tasks(conn, job_id, run_id, None, None)?;
-    let mut job = select_job_by_id(conn, job_id)?.ok_or_else(|| FsError::job_not_found(job_id))?;
-    let summary = summarize_transfer_tasks(&tasks, now_ms);
-    job.summary = summary.progress;
-    job.updated_at = now_ms;
-    if summary.has_failed {
-        job.state = TransferState::Failed;
-    } else if summary.has_task && summary.all_completed {
-        job.state = TransferState::Completed;
-    }
-    let _ = exec_update_job(conn, &job)?;
-    Ok(())
 }
 
 fn job_params(job: &TransferJobRecord) -> FsResult<mysql::Params> {

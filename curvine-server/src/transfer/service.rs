@@ -22,11 +22,12 @@ use curvine_common::proto::{
     ListTransferTenantsRequest, ListTransferTenantsResponse, ListTransfersRequest,
     ListTransfersResponse, SubmitTransferRequest, TransferJobStatusProto, TransferKindProto,
     TransferProgressProto, TransferTaskReportRequest, TransferTaskStateProto,
-    TransferTaskStatusProto, TransferTenantSummaryProto,
+    TransferTaskStatusProto, TransferTaskSummaryProto, TransferTenantSummaryProto,
 };
 use curvine_common::state::{
-    TransferCommand, TransferJobRecord, TransferKind, TransferListFilter, TransferProgress,
-    TransferState, TransferTaskRecord, TransferTaskReport, TransferTaskState,
+    summarize_transfer_tasks, TransferCommand, TransferJobRecord, TransferKind, TransferListFilter,
+    TransferProgress, TransferState, TransferTaskCounts, TransferTaskRecord, TransferTaskReport,
+    TransferTaskState,
 };
 use curvine_common::utils::SerdeUtils;
 use curvine_common::FsResult;
@@ -41,6 +42,20 @@ const PROGRESS_REPORT_COALESCE_BATCH: usize = 256;
 const TRANSFER_PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_LIST_PAGE_SIZE: usize = 20;
 const MAX_LIST_PAGE_SIZE: usize = 1000;
+
+type TransferStatusPage = (
+    TransferJobRecord,
+    TransferTaskCounts,
+    Vec<TransferTaskStatusProto>,
+    Option<String>,
+);
+type TransferWatchPage = (
+    TransferJobRecord,
+    TransferTaskCounts,
+    Vec<TransferTaskStatusProto>,
+    Option<String>,
+    bool,
+);
 
 pub struct TransferService<S> {
     store: Arc<S>,
@@ -146,15 +161,15 @@ where
         let client_request_id = if req.client_request_id.is_empty() {
             Uuid::new_v4().to_string()
         } else {
-            req.client_request_id
+            req.client_request_id.clone()
         };
         let mut command = TransferCommand {
             kind,
             source_path: req.source_path.clone(),
             target_path: req.target_path.clone(),
-            client_request_id,
-            submitter: req.submitter,
-            tenant: req.tenant,
+            client_request_id: client_request_id.clone(),
+            submitter: req.submitter.clone(),
+            tenant: req.tenant.clone(),
             options: Default::default(),
         };
         if !req.command.is_empty() {
@@ -162,15 +177,24 @@ where
             if command.kind != kind
                 || command.source_path != req.source_path
                 || command.target_path != req.target_path
+                || command.client_request_id != client_request_id
+                || command.submitter != req.submitter
+                || command.tenant != req.tenant
             {
                 return Err(FsError::common(format!(
-                    "Transfer command payload does not match request fields: request kind={:?}, source={}, target={}; payload kind={:?}, source={}, target={}",
+                    "Transfer command payload does not match request identity fields: request kind={:?}, source={}, target={}, client request id={}, submitter={}, tenant={}; payload kind={:?}, source={}, target={}, client request id={}, submitter={}, tenant={}",
                     kind,
                     req.source_path,
                     req.target_path,
+                    client_request_id,
+                    req.submitter,
+                    req.tenant,
                     command.kind,
                     command.source_path,
-                    command.target_path
+                    command.target_path,
+                    command.client_request_id,
+                    command.submitter,
+                    command.tenant,
                 )));
             }
         }
@@ -251,9 +275,12 @@ where
 
     pub fn retry_transfer(&self, job_id: &str) -> FsResult<TransferJobRecord> {
         let job = self.get_transfer(job_id)?;
-        if !matches!(job.state, TransferState::Failed | TransferState::Canceled) {
+        if !matches!(
+            job.state,
+            TransferState::Failed | TransferState::Canceled | TransferState::PartialSuccess
+        ) {
             return Err(FsError::common(format!(
-                "Only failed or canceled transfers can be retried; job {} is currently {}",
+                "Only failed, canceled, or partially successful transfers can be retried; job {} is currently {}",
                 job_id,
                 transfer_state_name(job.state)
             )));
@@ -278,15 +305,12 @@ where
         job_id: &str,
         page_size: Option<u32>,
         page_token: Option<String>,
-    ) -> FsResult<(
-        TransferJobRecord,
-        Vec<TransferTaskStatusProto>,
-        Option<String>,
-    )> {
+    ) -> FsResult<TransferStatusPage> {
         let job = self.get_transfer(job_id)?;
-        let (tasks, next_page_token) =
-            self.page_tasks(&job.job_id, job.run_id, page_size, page_token)?;
-        Ok((job, tasks, next_page_token))
+        let tasks = self.store.list_transfer_tasks(&job.job_id, job.run_id)?;
+        let counts = summarize_transfer_tasks(&tasks, now_ms()).counts;
+        let (tasks, next_page_token) = self.page_tasks(tasks, page_size, page_token)?;
+        Ok((job, counts, tasks, next_page_token))
     }
 
     pub fn list_transfers(&self, req: ListTransfersRequest) -> FsResult<ListTransfersResponse> {
@@ -337,6 +361,7 @@ where
                     failed: summary.failed,
                     canceled: summary.canceled,
                     total: summary.total,
+                    partial_success: summary.partial_success,
                 })
                 .collect(),
             next_page_token,
@@ -349,18 +374,13 @@ where
         since_updated_at: Option<u64>,
         page_size: Option<u32>,
         page_token: Option<String>,
-    ) -> FsResult<(
-        TransferJobRecord,
-        Vec<TransferTaskStatusProto>,
-        Option<String>,
-        bool,
-    )> {
-        let (job, tasks, next_page_token) =
+    ) -> FsResult<TransferWatchPage> {
+        let (job, counts, tasks, next_page_token) =
             self.get_transfer_status(job_id, page_size, page_token)?;
         let changed = since_updated_at
             .map(|since| job.updated_at as u64 > since)
             .unwrap_or(true);
-        Ok((job, tasks, next_page_token, changed))
+        Ok((job, counts, tasks, next_page_token, changed))
     }
 
     pub fn request_cancel(&self, job_id: &str, run_id: Option<u64>) -> FsResult<TransferState> {
@@ -394,12 +414,10 @@ where
 
     fn page_tasks(
         &self,
-        job_id: &str,
-        run_id: u64,
+        mut tasks: Vec<TransferTaskRecord>,
         page_size: Option<u32>,
         page_token: Option<String>,
     ) -> FsResult<(Vec<TransferTaskStatusProto>, Option<String>)> {
-        let mut tasks = self.store.list_transfer_tasks(job_id, run_id)?;
         tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
         let offset = parse_page_token(page_token)?;
         let page_size = page_size.unwrap_or(0) as usize;
@@ -727,6 +745,7 @@ fn transfer_state(state: i32) -> FsResult<TransferState> {
         6 => Ok(TransferState::Completed),
         7 => Ok(TransferState::Failed),
         8 => Ok(TransferState::Canceled),
+        9 => Ok(TransferState::PartialSuccess),
         _ => Err(FsError::common(format!("Unknown transfer state {}", state))),
     }
 }
@@ -741,6 +760,7 @@ fn transfer_state_name(state: TransferState) -> &'static str {
         TransferState::Completed => "Completed",
         TransferState::Failed => "Failed",
         TransferState::Canceled => "Canceled",
+        TransferState::PartialSuccess => "PartialSuccess",
     }
 }
 
@@ -823,6 +843,18 @@ pub fn progress_to_proto(value: TransferProgress) -> TransferProgressProto {
         total_size: value.total_size,
         update_time: value.update_time,
         message: value.message,
+    }
+}
+
+pub fn task_summary_to_proto(value: TransferTaskCounts) -> TransferTaskSummaryProto {
+    TransferTaskSummaryProto {
+        pending: value.pending,
+        running: value.running,
+        completed: value.completed,
+        failed: value.failed,
+        canceled: value.canceled,
+        stale: value.stale,
+        completed_size: value.completed_size,
     }
 }
 

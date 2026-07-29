@@ -100,12 +100,6 @@ impl TransferServer {
         if !conf.transfer.enabled {
             return Err(FsError::common("curvine-transfer requires transfer.enabled=true").into());
         }
-        if conf.transfer.endpoints.is_empty() {
-            return Err(FsError::common(
-                "curvine-transfer requires transfer.endpoints to route worker task reports",
-            )
-            .into());
-        }
         Logger::init(conf.master.log.clone());
         let _ = TransferMetrics::get()?;
         conf.print();
@@ -163,10 +157,6 @@ impl TransferServer {
         } else {
             conf.transfer.instance_id.clone()
         };
-        let report_target =
-            conf.transfer.endpoints.first().cloned().unwrap_or_else(|| {
-                format!("{}:{}", conf.transfer.hostname, conf.transfer.rpc_port)
-            });
         let planner = TransferPlanner::new(
             cv_metadata.clone(),
             factory.clone(),
@@ -175,13 +165,21 @@ impl TransferServer {
             conf.transfer.max_tasks_per_transfer,
             conf.transfer.ufs_max_concurrency_per_endpoint,
         );
+        let report_endpoints = if conf.transfer.endpoints.is_empty() {
+            vec![format!(
+                "{}:{}",
+                conf.transfer.hostname, conf.transfer.rpc_port
+            )]
+        } else {
+            conf.transfer.endpoints.clone()
+        };
         let scheduler = TransferScheduler::new(
             store.clone(),
             planner,
             cache.clone(),
             factory,
             owner,
-            report_target,
+            report_endpoints,
             conf.transfer.clone(),
         );
 

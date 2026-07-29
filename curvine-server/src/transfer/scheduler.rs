@@ -14,15 +14,15 @@
 
 use crate::common::UfsFactory;
 use crate::transfer::{
-    is_store_unavailable_error, job_mount_snapshot, transfer_failure_message, TransferPlanner,
-    TransferRequeueUpdate, TransferStore,
+    is_store_unavailable_error, job_mount_snapshot, transfer_failure_message, TransferPlannedTasks,
+    TransferPlanner, TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
 };
 use curvine_common::conf::TransferConf;
 use curvine_common::error::FsError;
 use curvine_common::state::{
-    summarize_transfer_tasks, LoadJobInfo, LoadTaskInfo, TaskAttemptStart, TransferCommand,
-    TransferJobRecord, TransferLease, TransferProgress, TransferState, TransferStateUpdate,
-    TransferTaskRecord, TransferTaskReport, TransferTaskReportInfo, TransferTaskState, WorkerInfo,
+    summarize_transfer_tasks, LoadJobInfo, LoadTaskInfo, TaskAttemptStart, TransferJobRecord,
+    TransferLease, TransferProgress, TransferState, TransferStateUpdate, TransferTaskRecord,
+    TransferTaskReport, TransferTaskReportInfo, TransferTaskState, WorkerInfo,
 };
 use curvine_common::FsResult;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -46,7 +46,7 @@ pub struct TransferScheduler<S> {
     cache: ClusterMetadataCache,
     factory: Arc<UfsFactory>,
     owner: String,
-    report_target: String,
+    report_endpoints: Vec<String>,
     conf: TransferConf,
     worker_cursor: Arc<AtomicUsize>,
     last_cleanup_ms: Arc<AtomicU64>,
@@ -60,7 +60,7 @@ impl<S> Clone for TransferScheduler<S> {
             cache: self.cache.clone(),
             factory: self.factory.clone(),
             owner: self.owner.clone(),
-            report_target: self.report_target.clone(),
+            report_endpoints: self.report_endpoints.clone(),
             conf: self.conf.clone(),
             worker_cursor: self.worker_cursor.clone(),
             last_cleanup_ms: self.last_cleanup_ms.clone(),
@@ -78,7 +78,7 @@ where
         cache: ClusterMetadataCache,
         factory: Arc<UfsFactory>,
         owner: String,
-        report_target: String,
+        report_endpoints: Vec<String>,
         conf: TransferConf,
     ) -> Self {
         Self {
@@ -87,7 +87,7 @@ where
             cache,
             factory,
             owner,
-            report_target,
+            report_endpoints,
             conf,
             worker_cursor: Arc::new(AtomicUsize::new(0)),
             last_cleanup_ms: Arc::new(AtomicU64::new(0)),
@@ -150,7 +150,10 @@ where
             TransferState::Canceling => {
                 self.cancel_transfer(&job, &lease).await?;
             }
-            TransferState::Completed | TransferState::Failed | TransferState::Canceled => {}
+            TransferState::Completed
+            | TransferState::Failed
+            | TransferState::Canceled
+            | TransferState::PartialSuccess => {}
         }
         Ok(())
     }
@@ -252,6 +255,8 @@ where
                 });
                 self.fail_transfer(
                     &job,
+                    &lease,
+                    &[TransferState::Planning],
                     transfer_failure_message(job.kind, &job.source_path, &job.target_path, &err),
                 )?;
                 return Err(err);
@@ -277,11 +282,12 @@ where
         }
 
         if planned.tasks.is_empty() {
-            self.set_transfer_state(
+            self.transition(
                 &job,
+                &lease,
+                &[TransferState::Planning],
                 TransferState::Completed,
                 "transfer has no file tasks",
-                now_ms(),
             )?;
             record_metric(|metrics| {
                 metrics.inc_planning(transfer_kind_label(job.kind), "empty");
@@ -292,16 +298,27 @@ where
         }
 
         let task_count = planned.tasks.len();
-        self.store.insert_tasks(planned.tasks)?;
-        self.set_transfer_state(
-            &job,
-            TransferState::Dispatching,
-            format!("planned total_size={}", planned.total_size),
-            now_ms(),
-        )?;
+        let total_size = planned.total_size;
+        let job_info = planned.job_info;
+        let persisted = self.store.persist_planned_tasks(TransferPlannedTasks {
+            job_id: job.job_id.clone(),
+            run_id: job.run_id,
+            owner: lease.owner.clone(),
+            lease_epoch: lease.lease_epoch,
+            tasks: planned.tasks,
+            message: format!("planned total_size={total_size}"),
+            now_ms: now_ms(),
+        })?;
+        if !persisted {
+            warn!(
+                "stop planning transfer {} because owner {} lease epoch {} is stale",
+                job.job_id, lease.owner, lease.lease_epoch
+            );
+            return Ok(());
+        }
         debug!(
             "transfer {} planned with job info source={}, target={}",
-            job.job_id, planned.job_info.source_path, planned.job_info.target_path
+            job.job_id, job_info.source_path, job_info.target_path
         );
         record_metric(|metrics| {
             metrics.inc_planning(transfer_kind_label(job.kind), "success");
@@ -343,6 +360,8 @@ where
                     }
                     self.fail_transfer(
                         &job,
+                        &lease,
+                        &[TransferState::Dispatching],
                         transfer_failure_message(
                             job.kind,
                             &job.source_path,
@@ -435,7 +454,7 @@ where
             let job_info = job_info.clone();
             let owner = lease.owner.clone();
             let lease_epoch = lease.lease_epoch;
-            let report_target = self.report_target.clone();
+            let report_endpoints = self.report_endpoints.clone();
             let task_stale_timeout_ms = duration_ms(self.conf.task_stale_timeout);
             async move {
                 dispatch_one(DispatchTaskRequest {
@@ -447,7 +466,7 @@ where
                     lease_epoch,
                     task,
                     worker,
-                    report_target,
+                    report_endpoints,
                     task_stale_timeout_ms,
                 })
                 .await
@@ -464,36 +483,7 @@ where
         job: &TransferJobRecord,
         mount: &curvine_common::state::MountInfo,
     ) -> curvine_common::state::LoadJobInfo {
-        let overwrite = transfer_command(job)
-            .map(|command| command.overwrite())
-            .unwrap_or(true);
-        curvine_common::state::LoadJobInfo {
-            job_id: job.job_id.clone(),
-            source_path: job.source_path.clone(),
-            target_path: job.target_path.clone(),
-            replicas: mount.replicas.unwrap_or(self.conf_default_replicas()),
-            block_size: mount.block_size.unwrap_or(self.conf_default_block_size()),
-            storage_type: mount
-                .storage_type
-                .unwrap_or(self.conf_default_storage_type()),
-            ttl_ms: mount.ttl_ms,
-            ttl_action: mount.ttl_action,
-            mount_info: mount.clone(),
-            create_time: job.created_at,
-            overwrite: Some(overwrite),
-        }
-    }
-
-    fn conf_default_replicas(&self) -> i32 {
-        curvine_common::conf::ClientConf::default().replicas
-    }
-
-    fn conf_default_block_size(&self) -> i64 {
-        curvine_common::conf::ClientConf::default().block_size
-    }
-
-    fn conf_default_storage_type(&self) -> curvine_common::state::StorageType {
-        curvine_common::conf::ClientConf::default().storage_type
+        self.planner.load_job_info(job, mount)
     }
 
     async fn check_running_transfer(
@@ -513,30 +503,42 @@ where
         )?;
         for attempt in stale {
             if attempt.task.retry_count as usize > self.conf.task_max_retries {
-                self.store.update_task_state(
-                    &attempt.task.job_id,
-                    attempt.task.run_id,
-                    &attempt.task.task_id,
-                    TransferTaskState::Failed,
-                    "transfer task did not report progress before the retry limit was reached; check Transfer worker health",
-                    now,
-                )?;
-                self.fail_transfer(
-                    &job,
-                    "transfer task did not report progress before the retry limit was reached; check Transfer worker health",
-                )?;
+                if !self.store.update_task_state(TransferTaskStateUpdate {
+                    job_id: attempt.task.job_id.clone(),
+                    run_id: attempt.task.run_id,
+                    owner: lease.owner.clone(),
+                    lease_epoch: lease.lease_epoch,
+                    task_id: attempt.task.task_id.clone(),
+                    from_states: vec![TransferTaskState::Stale],
+                    state: TransferTaskState::Failed,
+                    message: "transfer task did not report progress before the retry limit was reached; check Transfer worker health".to_string(),
+                    now_ms: now,
+                })? {
+                    return Ok(());
+                }
+                self.finish_failed_transfer(&job, &lease).await?;
                 record_metric(|metrics| metrics.inc_stale_retry("exhausted"));
                 return Ok(());
             }
-            self.store.update_task_state(
-                &attempt.task.job_id,
-                attempt.task.run_id,
-                &attempt.task.task_id,
-                TransferTaskState::Pending,
-                "retry stale task attempt",
-                now,
-            )?;
+            if !self.store.update_task_state(TransferTaskStateUpdate {
+                job_id: attempt.task.job_id.clone(),
+                run_id: attempt.task.run_id,
+                owner: lease.owner.clone(),
+                lease_epoch: lease.lease_epoch,
+                task_id: attempt.task.task_id.clone(),
+                from_states: vec![TransferTaskState::Stale],
+                state: TransferTaskState::Pending,
+                message: "retry stale task attempt".to_string(),
+                now_ms: now,
+            })? {
+                return Ok(());
+            }
             record_metric(|metrics| metrics.inc_stale_retry("scheduled"));
+        }
+
+        if self.store.has_failed_tasks(&job.job_id, job.run_id)? {
+            self.finish_failed_transfer(&job, &lease).await?;
+            return Ok(());
         }
 
         if !self
@@ -544,31 +546,18 @@ where
             .claim_pending_tasks(&job.job_id, job.run_id, 1)?
             .is_empty()
         {
-            self.set_transfer_state(
+            self.transition(
                 &job,
+                &lease,
+                &[TransferState::Running],
                 TransferState::Dispatching,
                 "redispatch stale tasks",
-                now,
             )?;
             self.dispatch_pending_tasks(job, lease).await?;
             return Ok(());
         }
 
-        let tasks = self.store.list_transfer_tasks(&job.job_id, job.run_id)?;
-        if tasks.is_empty() {
-            return Ok(());
-        }
-
-        let summary = summarize_transfer_tasks(&tasks, now);
-        if summary.has_failed {
-            self.fail_transfer(&job, summary.progress.message)?;
-            return Ok(());
-        }
-
-        if summary.all_completed {
-            self.set_transfer_state(&job, TransferState::Completed, "all tasks completed", now)?;
-            record_metric(|metrics| metrics.inc_terminal("completed", "all_tasks_completed"));
-        } else {
+        if self.store.has_recoverable_tasks(&job.job_id, job.run_id)? {
             let renewed = self.store.renew_lease(
                 &lease.job_id,
                 lease.run_id,
@@ -580,18 +569,28 @@ where
             record_metric(|metrics| {
                 metrics.inc_lease_renew(if renewed { "success" } else { "stale" })
             });
+        } else {
+            let _ = self.transition(
+                &job,
+                &lease,
+                &[TransferState::Running],
+                TransferState::Completed,
+                "all tasks completed",
+            )?;
+            record_metric(|metrics| metrics.inc_terminal("completed", "all_tasks_completed"));
         }
         Ok(())
     }
 
     async fn probe_stale_running_tasks(&self, job: &TransferJobRecord, now: i64) -> FsResult<()> {
-        let tasks = self.store.list_recoverable_tasks(&job.job_id, job.run_id)?;
+        let tasks = self.store.list_stale_running_tasks(
+            &job.job_id,
+            job.run_id,
+            now,
+            self.conf.task_probe_concurrency(),
+        )?;
         let workers = self.cache.live_workers().unwrap_or_default();
-        for task in tasks
-            .into_iter()
-            .filter(|task| task.state == TransferTaskState::Running && task.stale_deadline_at < now)
-            .take(self.conf.task_probe_concurrency())
-        {
+        for task in tasks {
             let Some(worker) = workers.iter().find(|worker| {
                 worker.worker_id() == task.worker_id
                     && worker.worker_session_id == task.worker_session_id
@@ -641,22 +640,89 @@ where
     async fn cancel_transfer(
         &self,
         job: &TransferJobRecord,
-        _lease: &TransferLease,
+        lease: &TransferLease,
+    ) -> FsResult<()> {
+        self.stop_recoverable_tasks(job, lease, "transfer canceled")
+            .await?;
+
+        let _ = self.transition(
+            job,
+            lease,
+            &[TransferState::Canceling],
+            TransferState::Canceled,
+            "transfer canceled",
+        )?;
+        record_metric(|metrics| metrics.inc_terminal("canceled", "cancel_requested"));
+        Ok(())
+    }
+
+    async fn finish_failed_transfer(
+        &self,
+        job: &TransferJobRecord,
+        lease: &TransferLease,
+    ) -> FsResult<()> {
+        self.stop_recoverable_tasks(job, lease, "transfer stopped after a task failed")
+            .await?;
+        let tasks = self.store.list_transfer_tasks(&job.job_id, job.run_id)?;
+        let summary = summarize_transfer_tasks(&tasks, now_ms());
+        let state = if summary.counts.completed > 0 {
+            TransferState::PartialSuccess
+        } else {
+            TransferState::Failed
+        };
+        let message = if state == TransferState::PartialSuccess {
+            format!(
+                "{}; {} file(s) completed and remain cached",
+                summary.progress.message, summary.counts.completed
+            )
+        } else {
+            summary.progress.message
+        };
+        let _ = self.transition(job, lease, &[TransferState::Running], state, message)?;
+        record_metric(|metrics| {
+            metrics.inc_terminal(
+                if state == TransferState::PartialSuccess {
+                    "partial_success"
+                } else {
+                    "failed"
+                },
+                "task_failed",
+            )
+        });
+        Ok(())
+    }
+
+    async fn stop_recoverable_tasks(
+        &self,
+        job: &TransferJobRecord,
+        lease: &TransferLease,
+        message: &str,
     ) -> FsResult<()> {
         let tasks = self.store.list_transfer_tasks(&job.job_id, job.run_id)?;
         let mut workers = HashSet::new();
         for task in tasks {
+            if !matches!(
+                task.state,
+                TransferTaskState::Pending | TransferTaskState::Running | TransferTaskState::Stale
+            ) {
+                continue;
+            }
             if task.worker_id != 0 {
                 workers.insert(task.worker_id);
             }
-            self.store.update_task_state(
-                &task.job_id,
-                task.run_id,
-                &task.task_id,
-                TransferTaskState::Canceled,
-                "transfer canceled",
-                now_ms(),
-            )?;
+            if !self.store.update_task_state(TransferTaskStateUpdate {
+                job_id: task.job_id.clone(),
+                run_id: task.run_id,
+                owner: lease.owner.clone(),
+                lease_epoch: lease.lease_epoch,
+                task_id: task.task_id,
+                from_states: vec![task.state],
+                state: TransferTaskState::Canceled,
+                message: message.to_string(),
+                now_ms: now_ms(),
+            })? {
+                continue;
+            }
         }
 
         let live_workers = match self.cache.live_workers() {
@@ -685,8 +751,6 @@ where
             }
         }
 
-        self.set_transfer_state(job, TransferState::Canceled, "transfer canceled", now_ms())?;
-        record_metric(|metrics| metrics.inc_terminal("canceled", "cancel_requested"));
         Ok(())
     }
 
@@ -731,42 +795,16 @@ where
         Ok(updated)
     }
 
-    fn set_transfer_state(
+    fn fail_transfer(
         &self,
         job: &TransferJobRecord,
-        to_state: TransferState,
+        lease: &TransferLease,
+        from_states: &[TransferState],
         message: impl Into<String>,
-        now_ms: i64,
-    ) -> FsResult<bool> {
-        let message = message.into();
-        let updated = self.store.set_transfer_state(
-            &job.job_id,
-            job.run_id,
-            to_state,
-            message.clone(),
-            now_ms,
-        )?;
-        if updated {
-            info!(
-                "transfer state set job_id={} run_id={} kind={:?} tenant={} owner={} lease_epoch={} from={:?} to={:?} message={}",
-                job.job_id,
-                job.run_id,
-                job.kind,
-                job.tenant,
-                job.owner,
-                job.lease_epoch,
-                job.state,
-                to_state,
-                message
-            );
-        }
-        Ok(updated)
-    }
-
-    fn fail_transfer(&self, job: &TransferJobRecord, message: impl Into<String>) -> FsResult<()> {
+    ) -> FsResult<()> {
         let message = message.into();
         error!("transfer {} failed: {}", job.job_id, message);
-        self.set_transfer_state(job, TransferState::Failed, message, now_ms())?;
+        let _ = self.transition(job, lease, from_states, TransferState::Failed, message)?;
         record_metric(|metrics| metrics.inc_terminal("failed", "error"));
         Ok(())
     }
@@ -781,7 +819,7 @@ struct DispatchTaskRequest<S> {
     lease_epoch: u64,
     task: TransferTaskRecord,
     worker: WorkerInfo,
-    report_target: String,
+    report_endpoints: Vec<String>,
     task_stale_timeout_ms: i64,
 }
 
@@ -798,7 +836,7 @@ where
         lease_epoch,
         task,
         worker,
-        report_target,
+        report_endpoints,
         task_stale_timeout_ms,
     } = request;
     let now = now_ms();
@@ -816,13 +854,14 @@ where
     let started = store.start_task_attempt(TaskAttemptStart {
         job_id: task.job_id.clone(),
         run_id: task.run_id,
-        owner,
+        owner: owner.clone(),
         lease_epoch,
         task_id: task.task_id.clone(),
         attempt_id,
         worker_id: worker.worker_id(),
         worker_session_id: worker.worker_session_id.clone(),
-        report_target_json: report_target.clone(),
+        report_target_json: serde_json::to_string(&report_endpoints)
+            .map_err(|_| FsError::common("Unable to prepare transfer report endpoints"))?,
         now_ms: now,
         stale_deadline_at: now.saturating_add(task_stale_timeout_ms),
     })?;
@@ -843,7 +882,8 @@ where
             attempt_id,
             worker_id: worker.worker_id(),
             worker_session_id: worker.worker_session_id.clone(),
-            report_target,
+            report_target: report_endpoints.first().cloned().unwrap_or_default(),
+            report_endpoints,
         }),
     };
 
@@ -855,14 +895,19 @@ where
                 "worker {} rejected transfer task {} attempt {} before accepting it: {}",
                 worker, task.task_id, attempt_id, reason
             );
-            store.update_task_state(
-                &task.job_id,
-                task.run_id,
-                &task.task_id,
-                TransferTaskState::Pending,
-                format!("worker rejected task before accept: {}", reason),
-                now_ms(),
-            )?;
+            if !store.update_task_state(TransferTaskStateUpdate {
+                job_id: task.job_id.clone(),
+                run_id: task.run_id,
+                owner,
+                lease_epoch,
+                task_id: task.task_id.clone(),
+                from_states: vec![TransferTaskState::Running],
+                state: TransferTaskState::Pending,
+                message: format!("worker rejected task before accept: {}", reason),
+                now_ms: now_ms(),
+            })? {
+                return Ok(false);
+            }
             if let Err(err) = cache.refresh().await {
                 warn!(
                     "refresh cluster metadata after worker rejection failed: {}",
@@ -888,15 +933,6 @@ fn now_ms() -> i64 {
 
 fn duration_ms(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
-}
-
-fn transfer_command(job: &TransferJobRecord) -> FsResult<TransferCommand> {
-    serde_json::from_str(&job.command_json).map_err(|_| {
-        FsError::common(format!(
-            "Stored transfer command for job {} is invalid",
-            job.job_id
-        ))
-    })
 }
 
 fn transfer_task_state(state: i32) -> TransferTaskState {

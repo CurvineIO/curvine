@@ -247,7 +247,10 @@ pub struct TransferTaskReportInfo {
     pub attempt_id: u64,
     pub worker_id: u32,
     pub worker_session_id: String,
+    #[serde(default)]
     pub report_target: String,
+    #[serde(default)]
+    pub report_endpoints: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

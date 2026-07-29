@@ -14,7 +14,7 @@
 
 use curvine_common::state::{
     StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease, TransferListFilter,
-    TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTaskState,
+    TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTaskState,
     TransferTenantSummary,
 };
 use curvine_common::FsResult;
@@ -84,15 +84,6 @@ pub trait TransferStore: Send + Sync + 'static {
 
     fn update_transfer_state(&self, update: TransferStateUpdate) -> FsResult<bool>;
 
-    fn set_transfer_state(
-        &self,
-        job_id: &str,
-        run_id: u64,
-        state: TransferState,
-        message: impl Into<String>,
-        now_ms: i64,
-    ) -> FsResult<bool>;
-
     fn requeue_transfer(&self, update: TransferRequeueUpdate) -> FsResult<bool>;
 
     fn set_transfer_cv_metadata_epoch(
@@ -107,15 +98,9 @@ pub trait TransferStore: Send + Sync + 'static {
 
     fn insert_tasks(&self, tasks: Vec<TransferTaskRecord>) -> FsResult<()>;
 
-    fn update_task_state(
-        &self,
-        job_id: &str,
-        run_id: u64,
-        task_id: &str,
-        state: TransferTaskState,
-        message: impl Into<String>,
-        now_ms: i64,
-    ) -> FsResult<bool>;
+    fn persist_planned_tasks(&self, update: TransferPlannedTasks) -> FsResult<bool>;
+
+    fn update_task_state(&self, update: TransferTaskStateUpdate) -> FsResult<bool>;
 
     fn claim_pending_tasks(
         &self,
@@ -134,11 +119,17 @@ pub trait TransferStore: Send + Sync + 'static {
         limit: usize,
     ) -> FsResult<Vec<StaleTaskAttempt>>;
 
-    fn list_recoverable_tasks(
+    fn list_stale_running_tasks(
         &self,
         job_id: &str,
         run_id: u64,
+        stale_before_ms: i64,
+        limit: usize,
     ) -> FsResult<Vec<TransferTaskRecord>>;
+
+    fn has_failed_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool>;
+
+    fn has_recoverable_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool>;
 
     fn start_task_attempt(&self, start: TaskAttemptStart) -> FsResult<bool>;
 
@@ -152,5 +143,27 @@ pub struct TransferRequeueUpdate {
     pub lease_epoch: u64,
     pub message: String,
     pub next_attempt_at_ms: i64,
+    pub now_ms: i64,
+}
+
+pub struct TransferPlannedTasks {
+    pub job_id: String,
+    pub run_id: u64,
+    pub owner: String,
+    pub lease_epoch: u64,
+    pub tasks: Vec<TransferTaskRecord>,
+    pub message: String,
+    pub now_ms: i64,
+}
+
+pub struct TransferTaskStateUpdate {
+    pub job_id: String,
+    pub run_id: u64,
+    pub owner: String,
+    pub lease_epoch: u64,
+    pub task_id: String,
+    pub from_states: Vec<TransferTaskState>,
+    pub state: TransferTaskState,
+    pub message: String,
     pub now_ms: i64,
 }

@@ -95,7 +95,7 @@ async fn readyz(
         );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "not ready: cluster metadata is unavailable\n".to_string(),
+            format!("not ready: {err}\n"),
         );
     }
 
