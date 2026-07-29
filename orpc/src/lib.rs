@@ -16,10 +16,14 @@ pub mod client;
 pub mod error {
     pub use orpc_error::*;
 }
-pub mod handler;
+pub mod handler {
+    pub use orpc_rpc::handler::*;
+}
 pub mod io;
 pub mod macros;
-pub mod message;
+pub mod message {
+    pub use orpc_rpc::message::*;
+}
 pub mod server;
 pub mod sys {
     pub use curvine_io::{CacheManager, DataSlice, ReadAheadTask};

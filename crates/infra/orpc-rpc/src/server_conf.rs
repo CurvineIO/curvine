@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::io::net::{InetAddr, NetUtils};
-use crate::runtime::Runtime;
-use crate::sys::pipe::PipePool;
+use curvine_sys::pipe::PipePool;
+use orpc_net::net::{InetAddr, NetUtils};
+use orpc_runtime::runtime::Runtime;
 use std::sync::Arc;
 use std::thread;
 

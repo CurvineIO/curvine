@@ -6367,6 +6367,7 @@ dependencies = [
  "once_cell",
  "orpc-error",
  "orpc-net",
+ "orpc-rpc",
  "orpc-runtime",
  "parking_lot",
  "pin-project-lite",
@@ -6413,6 +6414,19 @@ dependencies = [
 [[package]]
 name = "orpc-rpc"
 version = "0.2.0"
+dependencies = [
+ "bytes",
+ "curvine-io",
+ "curvine-sys",
+ "log",
+ "num_enum",
+ "orpc-error",
+ "orpc-net",
+ "orpc-runtime",
+ "prost 0.11.9",
+ "tokio",
+ "tokio-util",
+]
 
 [[package]]
 name = "orpc-runtime"
