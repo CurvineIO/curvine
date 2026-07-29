@@ -530,23 +530,6 @@ impl SpdkEnv {
                         self.qpair_pool
                             .register_limit(first.ctrlr, actual_io_queues);
                     }
-                    // Register per-controller qpair limit from SPDK's negotiated IO queue count.
-                    if let Some(first) = bdevs.first() {
-                        let actual_io_queues = unsafe {
-                            spdk_ffi::curvine_spdk_ctrlr_get_num_io_queues(
-                                first.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr,
-                            )
-                        };
-                        info!(
-                            "Target[{}] {}: requested io_queues={}, actual negotiated={}",
-                            i,
-                            target.endpoint(),
-                            target.io_queues,
-                            actual_io_queues
-                        );
-                        self.qpair_pool
-                            .register_limit(first.ctrlr, actual_io_queues);
-                    }
                     all_bdevs.extend(bdevs);
                 }
                 Err(e) => {
