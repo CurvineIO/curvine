@@ -18,26 +18,27 @@ pub type SysResult<T> = std::io::Result<T>;
 // failure has a category callers can branch on (unsupported platform, bad argument, EOF).
 macro_rules! sys_error {
     ($kind:path, $message:literal) => {
-        Err(std::io::Error::new($kind, $message))
+        Err(::std::io::Error::new($kind, $message))
     };
     ($kind:path, $format:literal, $($arg:expr),+ $(,)?) => {
-        Err(std::io::Error::new($kind, format!($format, $($arg),+)))
+        Err(::std::io::Error::new($kind, format!($format, $($arg),+)))
     };
     ($message:expr) => {
-        Err(std::io::Error::other($message))
+        Err(::std::io::Error::other($message))
     };
     ($format:expr, $($arg:expr),+ $(,)?) => {
-        Err(std::io::Error::other(format!($format, $($arg),+)))
+        Err(::std::io::Error::other(format!($format, $($arg),+)))
     };
 }
 
+// Fully qualified paths keep the expansion independent of what the call site imports.
 macro_rules! sys_call {
     ($expression:expr) => {{
         let result = $expression;
-        if result as CInt <= ERRNO_SENTINEL {
-            Err(std::io::Error::last_os_error())
+        if result as $crate::sys::CInt <= $crate::sys::ERRNO_SENTINEL {
+            Err(::std::io::Error::last_os_error())
         } else {
-            Ok(result as CInt)
+            Ok(result as $crate::sys::CInt)
         }
     }};
 }

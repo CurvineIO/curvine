@@ -224,6 +224,7 @@ pub fn pipe2(size: usize) -> SysResult<[RawIO; 2]> {
 
             if (set_buf_res as usize) < size {
                 return sys_error!(
+                    ErrorKind::InvalidInput,
                     "Failed to set pipe size, expected: {}, actual: {}",
                     size,
                     set_buf_res

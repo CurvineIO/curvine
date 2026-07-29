@@ -80,7 +80,15 @@ impl FsStats {
     pub fn check_dir(&self) -> SysResult<()> {
         let m = self.path.metadata()?;
 
-        if !m.is_dir() || m.permissions().readonly() {
+        if !m.is_dir() {
+            return sys_error!(
+                std::io::ErrorKind::NotADirectory,
+                "Not a directory: {:?}",
+                self.path()
+            );
+        }
+
+        if m.permissions().readonly() {
             return sys_error!(
                 std::io::ErrorKind::PermissionDenied,
                 "Directory is not writable: {:?}",
