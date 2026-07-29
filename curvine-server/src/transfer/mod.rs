@@ -18,3 +18,14 @@ pub use self::backend::TransferStoreBackend;
 
 mod cluster_cache;
 pub use self::cluster_cache::ClusterMetadataCache;
+
+mod cv_metadata_reader;
+pub use self::cv_metadata_reader::{
+    CvMetadataReader, DisabledCvMetadataReader, MasterCvMetadataReader, MetadataReplicaReader,
+};
+
+mod job_snapshot;
+pub use self::job_snapshot::job_mount_snapshot;
+
+mod planner;
+pub use self::planner::{PlannedTransfer, TransferPlanner};
