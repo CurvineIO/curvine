@@ -12,35 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::sys::pipe::{AsyncFd, BorrowedFd};
-use crate::sys::{RawIO, SysResult};
+use crate::pipe::{AsyncFd, BorrowedFd};
+use crate::{RawIO, SysResult};
 
-// Read data from the pipeline.
-pub struct PipeReader {
+// Write data into the pipeline.
+pub struct PipeWriter {
     pub(crate) fd: BorrowedFd,
     pub(crate) async_fd: Option<AsyncFd>,
 }
 
-impl PipeReader {
+impl PipeWriter {
     pub fn new(fd: BorrowedFd) -> SysResult<Self> {
         let async_fd = AsyncFd::create(fd)?;
         Ok(Self { fd, async_fd })
     }
 
-    pub async fn async_read<R>(&self, f: impl FnMut(&BorrowedFd) -> SysResult<R>) -> SysResult<R> {
-        if let Some(fd) = &self.async_fd {
-            fd.async_read(f).await
-        } else {
-            sys_error!(
-                std::io::ErrorKind::InvalidInput,
-                "fd is not asynchronous: {}",
-                self.raw_fd()
-            )
-        }
-    }
-
     pub fn raw_fd(&self) -> RawIO {
         self.fd.fd()
+    }
+
+    pub fn is_async(&self) -> bool {
+        self.async_fd.is_some()
     }
 
     pub fn async_fd(&self) -> Option<&AsyncFd> {
@@ -49,5 +41,17 @@ impl PipeReader {
 
     pub fn deregister(&mut self) -> Option<BorrowedFd> {
         self.async_fd.take().map(|x| x.deregister())
+    }
+
+    pub async fn async_write<R>(&self, f: impl FnMut(&BorrowedFd) -> SysResult<R>) -> SysResult<R> {
+        if let Some(fd) = &self.async_fd {
+            fd.async_write(f).await
+        } else {
+            sys_error!(
+                std::io::ErrorKind::InvalidInput,
+                "fd is not asynchronous: {}",
+                self.raw_fd()
+            )
+        }
     }
 }

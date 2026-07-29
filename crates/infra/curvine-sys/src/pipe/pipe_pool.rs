@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::sync::AtomicLen;
-use crate::sys::pipe::{Pipe2, PipeFd};
-use crate::sys::{SysResult, PIPE_BUF};
+use crate::pipe::{Pipe2, PipeFd};
+use crate::{SysResult, PIPE_BUF};
 use log::warn;
+use orpc_runtime::sync::AtomicLen;
 use std::collections::LinkedList;
 use std::sync::Mutex;
 

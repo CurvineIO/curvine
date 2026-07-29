@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::sys::pipe::{AsyncFd, PipeFd, PipePool, PipeReader, PipeWriter};
-use crate::sys::{self, CInt, RawIO, SysResult};
+use crate as sys;
+use crate::pipe::{AsyncFd, PipeFd, PipePool, PipeReader, PipeWriter};
+use crate::{CInt, RawIO, SysResult};
 use log::warn;
 use std::io::{ErrorKind, IoSlice};
 use std::sync::Arc;
@@ -252,7 +253,7 @@ impl Drop for Pipe2 {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::Pipe2;
-    use crate::sys::{CInt, SysResult};
+    use crate::{CInt, SysResult};
     use std::cell::Cell;
     use std::io;
 

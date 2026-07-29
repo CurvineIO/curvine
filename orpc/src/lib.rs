@@ -21,7 +21,9 @@ pub mod io;
 pub mod macros;
 pub mod message;
 pub mod server;
-pub mod sys;
+pub mod sys {
+    pub use curvine_sys::*;
+}
 pub mod test;
 
 pub use orpc_error::{CommonError, CommonResult, CommonResultExt};

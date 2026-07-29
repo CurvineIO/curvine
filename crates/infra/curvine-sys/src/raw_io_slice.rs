@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::sys::RawIO;
+use crate::RawIO;
 
 // The description of the underlying io object points to a certain fragment of the file or network.
 #[derive(Debug, Clone)]
