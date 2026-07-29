@@ -53,7 +53,7 @@ impl CurvineFileSystem {
             fs_client: Arc::new(fs_client),
         };
 
-        FsContext::start_clean_task(fs.clone(), fs.fs_context.block_pool.clone());
+        FsContext::start_clean_task(&fs.fs_context, fs.fs_context.block_pool.clone());
 
         let c = &fs.conf().client;
         info!(
@@ -193,10 +193,6 @@ impl CurvineFileSystem {
         self.fs_client.list_status(path).await
     }
 
-    pub async fn list_status_bytes(&self, path: &Path) -> FsResult<BytesMut> {
-        self.fs_client.list_status_bytes(path).await
-    }
-
     pub async fn get_cv_metadata_snapshot_page(
         &self,
         page_token: Option<String>,
@@ -217,6 +213,10 @@ impl CurvineFileSystem {
         self.fs_client
             .get_cv_metadata_delta_page(from_epoch, target_epoch, page_token, page_size)
             .await
+    }
+
+    pub async fn list_status_bytes(&self, path: &Path) -> FsResult<BytesMut> {
+        self.fs_client.list_status_bytes(path).await
     }
 
     pub async fn list_options(&self, path: &Path, opts: ListOptions) -> FsResult<Vec<FileStatus>> {

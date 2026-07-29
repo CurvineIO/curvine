@@ -457,13 +457,6 @@ impl FsClient {
         Ok(res)
     }
 
-    pub async fn get_master_info(&self) -> FsResult<MasterInfo> {
-        let header = GetMasterInfoRequest::default();
-        let rep: GetMasterInfoResponse = self.rpc(RpcCode::GetMasterInfo, header).await?;
-        let res = ProtoUtils::master_info_from_pb(rep);
-        Ok(res)
-    }
-
     pub async fn get_cv_metadata_snapshot_page(
         &self,
         page_token: Option<String>,
@@ -490,6 +483,13 @@ impl FsClient {
             page_size,
         };
         self.rpc(RpcCode::GetCvMetadataDeltaPage, header).await
+    }
+
+    pub async fn get_master_info(&self) -> FsResult<MasterInfo> {
+        let header = GetMasterInfoRequest::default();
+        let rep: GetMasterInfoResponse = self.rpc(RpcCode::GetMasterInfo, header).await?;
+        let res = ProtoUtils::master_info_from_pb(rep);
+        Ok(res)
     }
 
     pub async fn get_master_info_bytes(&self) -> FsResult<BytesMut> {
