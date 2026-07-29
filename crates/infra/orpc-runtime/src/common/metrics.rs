@@ -19,7 +19,7 @@ use prometheus::core::{
 use prometheus::{default_registry, Encoder, HistogramOpts, Opts, Registry, TextEncoder};
 
 use crate::sync::FastDashMap;
-use crate::{err_box, CommonResult};
+use crate::CommonResult;
 
 pub type Counter = GenericCounter<AtomicI64>;
 pub type CounterVec = GenericCounterVec<AtomicI64>;

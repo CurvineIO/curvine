@@ -319,6 +319,9 @@ impl Utils {
 #[cfg(test)]
 mod tests {
     use crate::common::Utils;
+    use std::sync::Mutex;
+
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     pub fn uuid() {
@@ -364,6 +367,7 @@ mod tests {
     fn test_file_creates_testing_directory() {
         use std::path::Path;
 
+        let _guard = CWD_LOCK.lock().unwrap();
         let path = Utils::test_file();
         let parent = Path::new(&path).parent().expect("test file has parent");
         assert!(
@@ -383,10 +387,7 @@ mod tests {
         use std::env;
         use std::fs;
         use std::path::Path;
-        use std::sync::Mutex;
-
         // Serialize CWD mutations across parallel tests in this crate.
-        static CWD_LOCK: Mutex<()> = Mutex::new(());
         let _guard = CWD_LOCK.lock().unwrap();
 
         let base = env::temp_dir().join(format!("orpc-test-file-{}", Utils::rand_id()));

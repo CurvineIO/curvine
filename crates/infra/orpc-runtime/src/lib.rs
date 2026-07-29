@@ -12,4 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Runtime primitives will migrate here from the compatibility facade.
+#[macro_use]
+mod macros;
+
+pub mod common;
+pub mod runtime;
+pub mod sync;
+
+pub use orpc_error::{CommonError, CommonResult};
+
+pub fn thread_name() -> String {
+    std::thread::current()
+        .name()
+        .unwrap_or("unknown")
+        .to_string()
+}

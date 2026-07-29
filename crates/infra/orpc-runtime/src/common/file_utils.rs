@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::io::IOResult;
-use crate::{err_box, CommonResult};
+use crate::CommonResult;
 use log::warn;
 use std::collections::{HashMap, LinkedList};
 use std::fs::Metadata;
@@ -40,12 +39,12 @@ impl FileUtils {
         Ok(())
     }
 
-    pub fn rename<P: AsRef<Path>>(src: P, dst: P) -> IOResult<()> {
+    pub fn rename<P: AsRef<Path>>(src: P, dst: P) -> CommonResult<()> {
         fs::rename(src, dst)?;
         Ok(())
     }
 
-    pub fn copy_dir<P: AsRef<Path>>(src: P, dst: P) -> IOResult<()> {
+    pub fn copy_dir<P: AsRef<Path>>(src: P, dst: P) -> CommonResult<()> {
         let src = src.as_ref();
         let dst = dst.as_ref();
         if !dst.exists() {
@@ -215,7 +214,7 @@ impl FileUtils {
         }
     }
 
-    pub fn absolute_path(path: impl AsRef<Path>) -> IOResult<PathBuf> {
+    pub fn absolute_path(path: impl AsRef<Path>) -> CommonResult<PathBuf> {
         let path = path.as_ref();
 
         let absolute_path = if path.is_absolute() {
@@ -227,7 +226,7 @@ impl FileUtils {
         Ok(absolute_path)
     }
 
-    pub fn absolute_path_string(path: impl AsRef<Path>) -> IOResult<String> {
+    pub fn absolute_path_string(path: impl AsRef<Path>) -> CommonResult<String> {
         let string = Self::absolute_path(path)?.to_string_lossy().to_string();
         Ok(string)
     }
@@ -267,7 +266,8 @@ mod tests {
 
     #[test]
     fn list_files_test() -> CommonResult<()> {
-        let list = FileUtils::list_files("../curvine-client/", false)?;
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../curvine-client");
+        let list = FileUtils::list_files(path, false)?;
         for item in list {
             println!("{}", item);
         }

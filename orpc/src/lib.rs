@@ -13,7 +13,6 @@
 // limitations under the License.
 
 pub mod client;
-pub mod common;
 pub mod error {
     pub use orpc_error::*;
 }
@@ -21,13 +20,12 @@ pub mod handler;
 pub mod io;
 pub mod macros;
 pub mod message;
-pub mod runtime;
 pub mod server;
-pub mod sync;
 pub mod sys;
 pub mod test;
 
 pub use orpc_error::{CommonError, CommonResult, CommonResultExt};
+pub use orpc_runtime::{common, runtime, sync};
 
 // Kept in `orpc` (not next to `CommonErrorExt` in `orpc-error`): orphan rules
 // require a local uncovered type argument (`IOError`) to implement `From` for

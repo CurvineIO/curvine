@@ -14,7 +14,7 @@
 
 #![allow(clippy::should_implement_trait)]
 
-use crate::{err_box, CommonResult};
+use crate::CommonResult;
 use serde::de::{Unexpected, Visitor};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
