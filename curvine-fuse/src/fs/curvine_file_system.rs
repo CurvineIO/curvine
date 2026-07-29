@@ -1682,26 +1682,12 @@ impl fs::FileSystem for CurvineFileSystem {
         );
 
         self.fs.link(&src_path, &des_path).await?;
-        // After a successful master link, prefer synthesizing the new dentry from the
-        // source inode already in dcache. Fresh fs_stat("nick") can race or miss when
-        // the source was a dangling symlink (LTP link01 case 2).
-        let attr = {
-            let src_status = {
-                let dir = self.state.dir_read();
-                dir.get_inode(oldnodeid, None).map(|inode| {
-                    let mut status = inode.clone_status();
-                    status.nlink = status.nlink.saturating_add(1);
-                    status
-                })
-            };
-            if let Some(status) = src_status {
-                let mut dir = self.state.dir_write();
-                let inode = dir.link(oldnodeid, parent_ino, name, status)?;
-                inode.to_attr(&self.conf)?
-            } else {
-                self.state.lookup_link(parent_ino, name, oldnodeid).await?
-            }
-        };
+        // Master is the source of truth for nlink after a successful link.
+        // Always refresh via lookup_link/fs_stat(parent, name) rather than
+        // synthesizing dcache_nlink+1 (concurrent hardlinks and stale dcache
+        // would otherwise under-count). Master FileType::Link hardlink support
+        // covers LTP link01 dangling-symlink targets.
+        let attr = self.state.lookup_link(parent_ino, name, oldnodeid).await?;
 
         let result = FuseUtils::create_entry_out(&self.conf, attr);
         Ok(result)
@@ -1759,12 +1745,14 @@ impl fs::FileSystem for CurvineFileSystem {
             return err_fuse!(libc::EIO, "not support name {}", linkname);
         }
 
-        let link_path = self.state.get_path_common(id, Some(linkname))?;
-        self.ensure_writable_path(&link_path, RpcCode::Symlink)
-            .await?;
         // Linux vfs_symlink requires MAY_WRITE|MAY_EXEC on the parent directory
         // (LTP link01: symlink into an unwritable/unsearchable parent must fail).
+        // Check parent ACL before mount read-only so denial prefers EACCES,
+        // matching link/unlink/rmdir ordering.
         self.check_permissions(op.header, (libc::W_OK | libc::X_OK) as u32)
+            .await?;
+        let link_path = self.state.get_path_common(id, Some(linkname))?;
+        self.ensure_writable_path(&link_path, RpcCode::Symlink)
             .await?;
         let owner = sys::get_username_by_uid(op.header.uid).unwrap_or(op.header.uid.to_string());
         let group = sys::get_groupname_by_gid(op.header.gid).unwrap_or(op.header.gid.to_string());
