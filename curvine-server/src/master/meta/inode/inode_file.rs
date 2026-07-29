@@ -440,13 +440,13 @@ impl InodeFile {
         if let Some(last_block) = self.blocks.last_mut() {
             let resize_len = block_size.min(expect_len - start);
             last_block.len = resize_len as u32;
-            // Blocks already placed on workers must not get a fresh alloc_opts:
-            // that flag forces the client to open+rewrite the whole block on every
-            // sparse seek+write extend (e.g. LTP sendfile09 setup), which amplifies
-            // a 1-byte hole write into a multi-MiB/128MiB rewrite.
-            // Unplaced blocks still need alloc_opts so the first worker open can size
-            // the backing store.
-            if last_block.locs.is_none() {
+            // Refresh sizing only while the tail still carries alloc_opts (unplaced /
+            // assigned-but-uncommitted). After BlockMeta::commit(), both locs and
+            // alloc_opts are cleared; locs.is_none() therefore does NOT mean "not yet
+            // placed". Re-attaching alloc_opts on a committed tail forces the client
+            // (LocatedBlock::should_resize) to open+rewrite the whole block on every
+            // sparse seek+write that crosses a block boundary (e.g. LTP sendfile09).
+            if last_block.alloc_opts.is_some() {
                 last_block
                     .alloc_opts
                     .replace(opts.clone_with_len(resize_len));
@@ -676,6 +676,37 @@ mod tests {
         assert!(
             file.blocks[0].alloc_opts.is_none(),
             "located tail must not get alloc_opts on sparse extend"
+        );
+
+        // Crossing into a new block still allocates the unplaced block with opts.
+        file.resize(FileAllocOpts::with_truncate(12)).unwrap();
+        assert_eq!(file.blocks.len(), 2);
+        assert!(file.blocks[0].alloc_opts.is_none());
+        assert_eq!(file.blocks[0].len, 8);
+        assert!(file.blocks[1].alloc_opts.is_some());
+        assert_eq!(file.blocks[1].len, 4);
+    }
+
+    #[test]
+    fn extend_does_not_force_alloc_opts_on_committed_tail_block() {
+        let mut file = test_file(8);
+        file.resize(FileAllocOpts::with_truncate(3)).unwrap();
+        assert!(file.blocks[0].alloc_opts.is_some());
+
+        // Shape produced by BlockMeta::commit(): locs and alloc_opts cleared after
+        // locations are persisted in the location store. Client resize() completes
+        // pending writers first, so the common sparse-extend path sees this state.
+        file.blocks[0].locs = None;
+        file.blocks[0].alloc_opts = None;
+        assert!(file.blocks[0].len > 0);
+
+        file.resize(FileAllocOpts::with_truncate(5)).unwrap();
+
+        assert_eq!(file.len, 5);
+        assert_eq!(file.blocks[0].len, 5);
+        assert!(
+            file.blocks[0].alloc_opts.is_none(),
+            "committed tail (locs=None, alloc_opts=None) must not regain alloc_opts"
         );
 
         // Crossing into a new block still allocates the unplaced block with opts.
