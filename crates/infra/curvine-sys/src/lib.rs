@@ -66,12 +66,6 @@ pub fn skip_iov_bytes<'a>(
 mod sys_libc;
 pub use self::sys_libc::*;
 
-mod cache_manager;
-pub use self::cache_manager::*;
-
-mod data_slice;
-pub use self::data_slice::DataSlice;
-
 pub mod pipe;
 
 mod fs_stats;

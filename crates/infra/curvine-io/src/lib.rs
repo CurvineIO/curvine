@@ -12,4 +12,41 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// DataSlice, LocalFile, and block I/O primitives will migrate here from the compatibility facade.
+mod block_io;
+pub use self::block_io::{BlockDevice, BlockIO};
+
+mod cache_manager;
+pub use self::cache_manager::{CacheManager, ReadAheadTask};
+
+mod data_slice;
+pub use self::data_slice::DataSlice;
+
+mod io_error;
+pub use self::io_error::IOError;
+
+mod local_file;
+pub use self::local_file::LocalFile;
+
+pub type IOResult<T> = Result<T, IOError>;
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BlockDevice, BlockIO, CacheManager, DataSlice, IOError, IOResult, LocalFile, ReadAheadTask,
+    };
+
+    #[test]
+    fn exports_generic_io_api() {
+        fn assert_send<T: Send>() {}
+
+        assert_send::<BlockDevice>();
+        assert_send::<CacheManager>();
+        assert_send::<DataSlice>();
+        assert_send::<IOError>();
+        assert_send::<LocalFile>();
+        assert_send::<ReadAheadTask>();
+
+        let _: Option<&dyn BlockIO> = None;
+        let _: IOResult<()> = Ok(());
+    }
+}

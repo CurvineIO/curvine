@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::io::io_error::IOError;
 use crate::io::net::InetAddr;
+use crate::io::IOError;
 use crate::sync::StateCtl;
 use num_enum::{FromPrimitive, IntoPrimitive};
 use std::sync::Mutex;

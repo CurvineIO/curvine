@@ -1,6 +1,4 @@
-use crate::io::IOResult;
-use crate::io::LocalFile;
-use crate::sys::DataSlice;
+use crate::{DataSlice, IOResult, LocalFile};
 use std::fmt::{Display, Formatter};
 
 // ---------------------------------------------------------------------------
@@ -51,6 +49,7 @@ pub trait BlockIO: Send {
 pub enum BlockDevice {
     Local(LocalFile),
 }
+
 /// Macro to delegate a method call to the inner variant.
 macro_rules! delegate {
     ($self:ident, $method:ident $(, $arg:expr)*) => {
@@ -59,34 +58,44 @@ macro_rules! delegate {
         }
     };
 }
+
 impl BlockIO for BlockDevice {
     fn read_region(&mut self, enable_send_file: bool, len: i32) -> IOResult<DataSlice> {
         delegate!(self, read_region, enable_send_file, len)
     }
+
     fn write_region(&mut self, region: &DataSlice) -> IOResult<()> {
         delegate!(self, write_region, region)
     }
+
     fn write_all(&mut self, buf: &[u8]) -> IOResult<()> {
         delegate!(self, write_all, buf)
     }
+
     fn read_all(&mut self, buf: &mut [u8]) -> IOResult<()> {
         delegate!(self, read_all, buf)
     }
+
     fn flush(&mut self) -> IOResult<()> {
         delegate!(self, flush)
     }
+
     fn seek(&mut self, pos: i64) -> IOResult<i64> {
         delegate!(self, seek, pos)
     }
+
     fn pos(&self) -> i64 {
         delegate!(self, pos)
     }
+
     fn len(&self) -> i64 {
         delegate!(self, len)
     }
+
     fn path(&self) -> &str {
         delegate!(self, path)
     }
+
     fn resize(&mut self, truncate: bool, off: i64, len: i64, mode: i32) -> IOResult<()> {
         delegate!(self, resize, truncate, off, len, mode)
     }
@@ -115,27 +124,32 @@ impl BlockIO for BlockDevice {
         BlockDevice::as_local_mut(self)
     }
 }
+
 impl BlockDevice {
     /// Whether this device supports OS page cache read-ahead.
     /// Only `LocalFile` supports this; SPDK bypasses kernel.
     pub fn supports_read_ahead(&self) -> bool {
         matches!(self, BlockDevice::Local(_))
     }
+
     /// Whether this device supports sendfile (zero-copy kernel=>socket).
     /// Only `LocalFile` supports this; SPDK uses userspace DMA buffers.
     pub fn supports_send_file(&self) -> bool {
         matches!(self, BlockDevice::Local(_))
     }
+
     /// Whether this device supports short-circuit local I/O (filesystem path).
     /// SPDK bdevs have no filesystem path.
     pub fn supports_short_circuit(&self) -> bool {
         matches!(self, BlockDevice::Local(_))
     }
+
     /// Whether this device supports resize (fallocate/truncate).
     /// SPDK blocks live in pre-allocated bdev extents; resize is meaningless.
     pub fn supports_resize(&self) -> bool {
         matches!(self, BlockDevice::Local(_))
     }
+
     /// Get the inner `LocalFile`, if this is a local device.
     #[allow(unreachable_patterns)]
     pub fn as_local(&self) -> Option<&LocalFile> {
@@ -144,6 +158,7 @@ impl BlockDevice {
             _ => None,
         }
     }
+
     /// Get the inner `LocalFile` mutably, if this is a local device.
     #[allow(unreachable_patterns)]
     pub fn as_local_mut(&mut self) -> Option<&mut LocalFile> {
@@ -153,6 +168,7 @@ impl BlockDevice {
         }
     }
 }
+
 impl Display for BlockDevice {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -160,37 +176,46 @@ impl Display for BlockDevice {
         }
     }
 }
+
 // Keep BlockIO impl for LocalFile for backward compatibility
 // (existing code that uses LocalFile directly as BlockIO).
-
 impl BlockIO for LocalFile {
     fn read_region(&mut self, enable_send_file: bool, len: i32) -> IOResult<DataSlice> {
         LocalFile::read_region(self, enable_send_file, len)
     }
+
     fn write_region(&mut self, region: &DataSlice) -> IOResult<()> {
         LocalFile::write_region(self, region)
     }
+
     fn write_all(&mut self, buf: &[u8]) -> IOResult<()> {
         LocalFile::write_all(self, buf)
     }
+
     fn read_all(&mut self, buf: &mut [u8]) -> IOResult<()> {
         LocalFile::read_all(self, buf)
     }
+
     fn flush(&mut self) -> IOResult<()> {
         LocalFile::flush(self)
     }
+
     fn seek(&mut self, pos: i64) -> IOResult<i64> {
         LocalFile::seek(self, pos)
     }
+
     fn pos(&self) -> i64 {
         LocalFile::pos(self)
     }
+
     fn len(&self) -> i64 {
         LocalFile::len(self)
     }
+
     fn path(&self) -> &str {
         LocalFile::path(self)
     }
+
     fn resize(&mut self, truncate: bool, off: i64, len: i64, mode: i32) -> IOResult<()> {
         LocalFile::resize(self, truncate, off, len, mode)
     }
@@ -223,8 +248,7 @@ impl BlockIO for LocalFile {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::common::Utils;
-    use crate::io::LocalFile;
+    use orpc_runtime::common::Utils;
     use std::fs::remove_file;
 
     #[test]
