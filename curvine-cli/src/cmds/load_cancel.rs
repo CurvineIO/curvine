@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use clap::Parser;
-use curvine_client::rpc::JobMasterClient;
+use curvine_client::rpc::{JobMasterClient, TransferClient};
+use curvine_common::state::TransferState;
 use orpc::CommonResult;
 
 use crate::util::*;
@@ -25,7 +26,6 @@ pub struct CancelLoadCommand {
 
 impl CancelLoadCommand {
     pub async fn execute(&self, client: JobMasterClient) -> CommonResult<()> {
-        // Verify the task ID
         if self.job_id.trim().is_empty() {
             eprintln!("Error: Job ID cannot be empty");
             std::process::exit(1);
@@ -34,10 +34,42 @@ impl CancelLoadCommand {
         println!("\nCancelling load job");
         println!("┌─────────────────────────────────");
         println!("│ Job ID: {}", self.job_id);
-
         handle_rpc_result(client.cancel_job(&self.job_id)).await;
-        println!("│ ✅ Job cancelled successfully");
+        println!("│ Job cancelled successfully");
         println!("└─────────────────────────────────");
         Ok(())
+    }
+
+    pub async fn execute_transfer_only(&self, transfer_client: TransferClient) -> CommonResult<()> {
+        if self.job_id.trim().is_empty() {
+            eprintln!("Error: Job ID cannot be empty");
+            std::process::exit(1);
+        }
+
+        println!("\nCancelling transfer job");
+        println!("┌─────────────────────────────────");
+        println!("│ Job ID: {}", self.job_id);
+        let response = handle_rpc_result(transfer_client.cancel(&self.job_id, None)).await;
+        print_transfer_cancel_result(response.state);
+        println!("└─────────────────────────────────");
+        Ok(())
+    }
+}
+
+fn print_transfer_cancel_result(state: i32) {
+    let state = TransferState::from(state);
+    match state {
+        TransferState::Canceling | TransferState::Canceled => {
+            println!("│ ✅ Job cancel request accepted");
+            println!("│ State: {:?}", state);
+        }
+        TransferState::Completed | TransferState::Failed | TransferState::PartialSuccess => {
+            println!("│ ℹ️ Job is already terminal");
+            println!("│ State: {:?}", state);
+        }
+        _ => {
+            println!("│ ✅ Job cancel request accepted");
+            println!("│ State: {:?}", state);
+        }
     }
 }

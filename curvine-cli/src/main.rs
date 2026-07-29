@@ -18,7 +18,7 @@ mod util;
 
 use clap::Parser;
 use commands::Commands;
-use curvine_client::rpc::JobMasterClient;
+use curvine_client::rpc::{JobMasterClient, TransferClient};
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::ClusterConf;
 use curvine_common::version;
@@ -33,12 +33,7 @@ use std::sync::Arc;
 #[command(author, version = version::VERSION, about, long_about = None)]
 pub struct CurvineArgs {
     /// Configuration file path (optional)
-    #[arg(
-        short,
-        long,
-        help = "Configuration file path (optional)",
-        global = true
-    )]
+    #[arg(long, help = "Configuration file path (optional)", global = true)]
     pub conf: Option<String>,
 
     /// Master address list (e.g., 'm1:8995,m2:8995')
@@ -173,16 +168,57 @@ fn main() -> CommonResult<()> {
     let curvine_fs = UnifiedFileSystem::with_rt(conf.clone(), rt.clone())?;
     let fs_client = curvine_fs.fs_client();
     let load_client = JobMasterClient::new(fs_client.clone());
+    let transfer_client = if conf.transfer.enabled {
+        Some(TransferClient::with_rt(&conf, rt.clone())?)
+    } else {
+        None
+    };
 
     rt.block_on(async move {
         let result = match args.command {
             Commands::Bench(cmd) => cmd.execute(curvine_fs, conf_source.clone()).await,
             Commands::Fs(cmd) => cmd.execute(curvine_fs).await,
             Commands::Report(cmd) => cmd.execute(curvine_fs).await,
-            Commands::Load(cmd) => cmd.execute(load_client).await,
-            Commands::Export(cmd) => cmd.execute(load_client).await,
-            Commands::LoadStatus(cmd) => cmd.execute(load_client).await,
-            Commands::CancelLoad(cmd) => cmd.execute(load_client).await,
+            Commands::Load(cmd) => match transfer_client.clone() {
+                Some(transfer_client) => cmd.execute_transfer(curvine_fs.clone(), transfer_client).await,
+                None => cmd.execute_legacy(load_client.clone()).await,
+            },
+            Commands::Export(cmd) => match transfer_client.clone() {
+                Some(transfer_client) => cmd.execute_transfer(curvine_fs.clone(), transfer_client).await,
+                None => cmd.execute_legacy(load_client.clone()).await,
+            },
+            Commands::LoadStatus(cmd) => match transfer_client.clone() {
+                Some(transfer_client) => cmd.execute_transfer_only(transfer_client).await,
+                None => cmd.execute(load_client.clone()).await,
+            },
+            Commands::TransferStatus(cmd) => {
+                let Some(transfer_client) = transfer_client.clone() else {
+                    return err_box!(
+                        "transfer-status requires transfer.enabled=true and a running transfer service"
+                    );
+                };
+                cmd.execute_transfer_only(transfer_client).await
+            }
+            Commands::CancelLoad(cmd) => match transfer_client.clone() {
+                Some(transfer_client) => cmd.execute_transfer_only(transfer_client).await,
+                None => cmd.execute(load_client.clone()).await,
+            },
+            Commands::CancelTransfer(cmd) => {
+                let Some(transfer_client) = transfer_client.clone() else {
+                    return err_box!(
+                        "cancel-transfer requires transfer.enabled=true and a running transfer service"
+                    );
+                };
+                cmd.execute_transfer_only(transfer_client).await
+            }
+            Commands::Transfer(cmd) => {
+                let Some(transfer_client) = transfer_client.clone() else {
+                    return err_box!(
+                        "transfer requires transfer.enabled=true and a running transfer service"
+                    );
+                };
+                cmd.execute(transfer_client).await
+            }
             Commands::Mount(cmd) => cmd.execute(curvine_fs).await,
             Commands::UnMount(cmd) => cmd.execute(fs_client).await,
             Commands::Node(cmd) => cmd.execute(fs_client, conf.clone()).await,
@@ -210,5 +246,22 @@ mod tests {
             .expect("export command should parse");
 
         assert!(matches!(args.command, Commands::Export(_)));
+    }
+
+    #[test]
+    fn mount_accepts_config_without_conf_short_option_collision() {
+        let args = CurvineArgs::try_parse_from([
+            "curvine",
+            "--conf",
+            "curvine-cluster.toml",
+            "mount",
+            "s3://bucket/path",
+            "/bucket/path",
+            "-c",
+            "s3.endpoint_url=http://127.0.0.1:9000",
+        ])
+        .expect("mount config should use -c while cluster config uses --conf");
+
+        assert!(matches!(args.command, Commands::Mount(_)));
     }
 }

@@ -15,9 +15,11 @@
 use crate::cmds::LoadStatusCommand;
 use crate::util::*;
 use clap::Parser;
-use curvine_client::rpc::JobMasterClient;
-use curvine_common::state::LoadJobCommand;
-use orpc::CommonResult;
+use curvine_client::rpc::{JobMasterClient, TransferClient};
+use curvine_client::unified::UnifiedFileSystem;
+use curvine_common::fs::Path;
+use curvine_common::state::{LoadJobCommand, TransferCommand, TransferKind};
+use orpc::{err_box, CommonResult};
 
 #[derive(Parser, Debug)]
 pub struct ExportCommand {
@@ -27,10 +29,14 @@ pub struct ExportCommand {
     /// Watch export job status after submission
     #[arg(long, short = 'w')]
     watch: bool,
+
+    /// Do not overwrite an existing target file
+    #[arg(long = "no-overwrite", default_value_t = true, action = clap::ArgAction::SetFalse)]
+    overwrite: bool,
 }
 
 impl ExportCommand {
-    pub async fn execute(&self, client: JobMasterClient) -> CommonResult<()> {
+    pub async fn execute_legacy(&self, client: JobMasterClient) -> CommonResult<()> {
         if self.path.trim().is_empty() {
             eprintln!("Error: Path cannot be empty");
             std::process::exit(1);
@@ -55,6 +61,60 @@ impl ExportCommand {
                 LoadStatusCommand::new(rep.job_id.clone(), false, "1s".to_string());
 
             status_command.execute(client).await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn execute_transfer(
+        &self,
+        fs: UnifiedFileSystem,
+        transfer_client: TransferClient,
+    ) -> CommonResult<()> {
+        if self.path.trim().is_empty() {
+            eprintln!("Error: Path cannot be empty");
+            std::process::exit(1);
+        }
+
+        println!("\nExporting Curvine file to UFS");
+        println!("Source path: {}", self.path);
+
+        let source = Path::from_str(&self.path)?;
+        if !source.is_cv() {
+            return err_box!("export source must be a Curvine path: {}", self.path);
+        }
+        let target = match fs.toggle_path(&source, true).await? {
+            Some(target) => target,
+            None => return err_box!("{} is not mounted", self.path),
+        };
+        if target.is_cv() {
+            return err_box!("export target must be a UFS path: {}", target.full_path());
+        }
+
+        let mut command = TransferCommand {
+            kind: TransferKind::Export,
+            source_path: source.clone_uri(),
+            target_path: target.clone_uri(),
+            client_request_id: TransferCommand::default_client_request_id(
+                TransferKind::Export,
+                source.clone_uri(),
+                target.clone_uri(),
+            ),
+            submitter: "curvine-cli".to_string(),
+            tenant: String::new(),
+            options: Default::default(),
+        };
+        command.set_overwrite(self.overwrite);
+        let rep = handle_rpc_result(transfer_client.submit(command)).await;
+        println!("Job ID: {}", rep.job_id);
+        println!("Target path: {}", target.full_path());
+        println!("State: {}", rep.state);
+
+        if self.watch {
+            let status_command = LoadStatusCommand::new(rep.job_id, false, "1s".to_string());
+            status_command
+                .execute_transfer_only(transfer_client)
+                .await?;
         }
 
         Ok(())

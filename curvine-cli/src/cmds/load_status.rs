@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use clap::Parser;
-use curvine_client::rpc::JobMasterClient;
-use curvine_common::state::JobTaskState;
+use curvine_client::rpc::{JobMasterClient, TransferClient};
+use curvine_common::state::{JobTaskState, TransferState};
 use orpc::CommonResult;
 
 use crate::util::*;
@@ -38,8 +38,9 @@ impl LoadStatusCommand {
             watch: Some(watch),
         }
     }
+
     pub async fn execute(&self, client: JobMasterClient) -> CommonResult<()> {
-        println!("\n Checking status for {}", self.job_id);
+        println!("\nChecking status for {}", self.job_id);
 
         if let Some(watch_interval) = &self.watch {
             self.watch_status(client, watch_interval).await
@@ -50,13 +51,44 @@ impl LoadStatusCommand {
         }
     }
 
-    /// keep watch job status
-    ///
-    /// # Arguments
-    /// * `client` - LoadClient Instance
-    /// * `interval_str` - Example：5s, 1m
     async fn watch_status(&self, client: JobMasterClient, interval_str: &str) -> CommonResult<()> {
-        // Resolution refresh interval
+        let duration = parse_duration(interval_str).unwrap_or_else(|_| {
+            eprintln!("Error: Invalid watch interval format: {}", interval_str);
+            std::process::exit(1);
+        });
+
+        loop {
+            let status = handle_rpc_result(client.get_job_status(&self.job_id)).await;
+            println!("{}", status);
+            if matches!(
+                status.state,
+                JobTaskState::Completed | JobTaskState::Failed | JobTaskState::Canceled
+            ) {
+                break;
+            }
+            tokio::time::sleep(duration).await;
+        }
+
+        Ok(())
+    }
+
+    pub async fn execute_transfer_only(&self, transfer_client: TransferClient) -> CommonResult<()> {
+        println!("\n Checking status for {}", self.job_id);
+
+        if let Some(watch_interval) = &self.watch {
+            self.watch_transfer_status(transfer_client, watch_interval)
+                .await
+        } else {
+            print_transfer_status(&transfer_client, &self.job_id).await?;
+            Ok(())
+        }
+    }
+
+    async fn watch_transfer_status(
+        &self,
+        transfer_client: TransferClient,
+        interval_str: &str,
+    ) -> CommonResult<()> {
         let duration = parse_duration(interval_str).unwrap_or_else(|_| {
             eprintln!("❌ Error: Invalid watch interval format: {}", interval_str);
             eprintln!("    Supported formats: <number>s (seconds), <number>m (minutes)");
@@ -65,7 +97,7 @@ impl LoadStatusCommand {
         });
 
         println!(
-            "Watching job status (refresh every {}). Press Ctrl+C to stop.",
+            "Watching transfer status (refresh every {}). Press Ctrl+C to stop.",
             format_duration(&duration)
         );
 
@@ -85,13 +117,8 @@ impl LoadStatusCommand {
             );
             println!("Press Ctrl+C to stop watching.");
 
-            let status = handle_rpc_result(client.get_job_status(&self.job_id)).await;
-            println!("{}", status);
-
-            if status.state == JobTaskState::Completed
-                || status.state == JobTaskState::Failed
-                || status.state == JobTaskState::Canceled
-            {
+            let state = print_transfer_status(&transfer_client, &self.job_id).await?;
+            if state.is_terminal() {
                 break;
             }
 
@@ -100,4 +127,32 @@ impl LoadStatusCommand {
 
         Ok(())
     }
+}
+
+async fn print_transfer_status(
+    client: &TransferClient,
+    job_id: &str,
+) -> CommonResult<TransferState> {
+    let status = handle_rpc_result(client.status(job_id)).await;
+    let state = TransferState::from(status.state);
+    println!("Job ID: {}", status.job_id);
+    println!("Run ID: {}", status.run_id);
+    println!("State: {:?}", state);
+    println!(
+        "Progress: {} / {}, message={}",
+        bytes_to_string(status.progress.loaded_size.max(0)),
+        bytes_to_string(status.progress.total_size.max(0)),
+        status.progress.message
+    );
+    if let Some(summary) = status.task_summary {
+        println!(
+            "Tasks: {} completed, {} failed, {} running, {} pending; {} cached",
+            summary.completed,
+            summary.failed,
+            summary.running,
+            summary.pending,
+            bytes_to_string(summary.completed_size.max(0)),
+        );
+    }
+    Ok(state)
 }
