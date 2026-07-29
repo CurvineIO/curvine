@@ -57,6 +57,8 @@ impl MessageHandler for WorkerHandler {
         match code {
             RpcCode::SubmitTask => self.task_submit(msg),
 
+            RpcCode::QueryTransferTask => self.query_transfer_task(msg),
+
             RpcCode::CancelJob => self.cancel_job(msg),
 
             RpcCode::SubmitBlockReplicationJob => self.replication_handler.handle(msg),
@@ -125,11 +127,11 @@ impl WorkerHandler {
         let task: LoadTaskInfo = SerdeUtils::deserialize(&req.task_command)?;
         let task_id = task.task_id.clone();
 
-        self.task_manager.submit_task(task)?;
+        let submit = self.task_manager.submit_task(task)?;
         let response = SubmitTaskResponse {
             task_id,
-            accepted: Some(true),
-            reject_reason: None,
+            accepted: Some(submit.accepted),
+            reject_reason: Some(submit.reject_reason),
         };
 
         Ok(Builder::success(msg).proto_header(response).build())
@@ -139,5 +141,61 @@ impl WorkerHandler {
         let req: CancelJobRequest = msg.parse_header()?;
         self.task_manager.cancel_job(req.job_id)?;
         Ok(msg.success())
+    }
+
+    pub fn query_transfer_task(&self, msg: &Message) -> FsResult<Message> {
+        let req: QueryTransferTaskRequest = msg.parse_header()?;
+        let progress = self.task_manager.query_transfer_task(
+            &req.job_id,
+            &req.task_id,
+            req.run_id,
+            req.attempt_id,
+            &req.worker_session_id,
+        )?;
+
+        let response = match progress {
+            Some(progress) => QueryTransferTaskResponse {
+                found: true,
+                state: transfer_task_state_code(progress.state),
+                progress: TransferProgressProto {
+                    loaded_size: progress.loaded_size,
+                    total_size: progress.total_size,
+                    update_time: progress.update_time,
+                    message: progress.message,
+                },
+            },
+            None => QueryTransferTaskResponse {
+                found: false,
+                state: TransferTaskStateProto::TransferTaskFailed.into(),
+                progress: TransferProgressProto {
+                    loaded_size: 0,
+                    total_size: 0,
+                    update_time: 0,
+                    message: String::new(),
+                },
+            },
+        };
+        Ok(Builder::success(msg).proto_header(response).build())
+    }
+}
+
+fn transfer_task_state_code(state: curvine_common::state::JobTaskState) -> i32 {
+    match state {
+        curvine_common::state::JobTaskState::Pending
+        | curvine_common::state::JobTaskState::UNKNOWN => {
+            TransferTaskStateProto::TransferTaskPending.into()
+        }
+        curvine_common::state::JobTaskState::Loading => {
+            TransferTaskStateProto::TransferTaskRunning.into()
+        }
+        curvine_common::state::JobTaskState::Completed => {
+            TransferTaskStateProto::TransferTaskCompleted.into()
+        }
+        curvine_common::state::JobTaskState::Failed => {
+            TransferTaskStateProto::TransferTaskFailed.into()
+        }
+        curvine_common::state::JobTaskState::Canceled => {
+            TransferTaskStateProto::TransferTaskCanceled.into()
+        }
     }
 }

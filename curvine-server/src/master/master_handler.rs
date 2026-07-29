@@ -559,6 +559,14 @@ impl MasterHandler {
             status,
             address,
             weight,
+            header.worker_session_id.unwrap_or_default(),
+            curvine_common::state::TransferWorkerCapabilities {
+                task_submit: header.transfer_task_submit.unwrap_or(false),
+                report_target: header.transfer_report_target.unwrap_or(false),
+                query_task: header.transfer_query_task.unwrap_or(false),
+                attempt_safe_output: header.transfer_attempt_safe_output.unwrap_or(false),
+                source_read_plan: header.transfer_source_read_plan.unwrap_or(false),
+            },
             ProtoUtils::storage_info_list_from_pb(header.storages),
         )?;
         Ok(cmds)
