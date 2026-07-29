@@ -14,7 +14,7 @@
 
 #![allow(unused)]
 
-use crate::sys::SysResult;
+use crate::SysResult;
 use futures::future::{select_all, BoxFuture};
 use futures::FutureExt;
 use std::future::Future;

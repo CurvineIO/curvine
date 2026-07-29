@@ -14,8 +14,9 @@
 
 #![allow(unused)]
 
-use crate::sys::pipe::BorrowedFd;
-use crate::sys::{self, CInt, RawIO, SysResult};
+use crate as sys;
+use crate::pipe::BorrowedFd;
+use crate::{CInt, RawIO, SysResult};
 use std::io::{ErrorKind, IoSlice};
 use tokio::io::Interest;
 

@@ -149,7 +149,7 @@ impl<T> Pointer for RawPtr<T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::sys::RawPtr;
+    use crate::RawPtr;
 
     struct Person {
         name: String,

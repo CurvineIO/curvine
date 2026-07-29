@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::sys::RawPtr;
+use crate::RawPtr;
 use bytes::BytesMut;
 use std::fmt::{Debug, Formatter};
 
@@ -124,7 +124,7 @@ impl Debug for RawVec {
 
 #[cfg(test)]
 mod tests {
-    use crate::sys::RawVec;
+    use crate::RawVec;
     use bytes::BytesMut;
 
     #[test]

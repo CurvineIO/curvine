@@ -14,8 +14,8 @@
 
 #![allow(unused, clippy::should_implement_trait)]
 
-use crate::sys::DataSlice::{Buffer, Bytes, Empty, IOSlice, MemSlice};
-use crate::sys::{RawIO, RawIOSlice, RawVec};
+use crate::DataSlice::{Buffer, Bytes, Empty, IOSlice, MemSlice};
+use crate::{RawIO, RawIOSlice, RawVec};
 use bytes::{Buf, Bytes as TBytes, BytesMut};
 
 /// A data fragment, which represents a portion of the data on top of an IO stream.
