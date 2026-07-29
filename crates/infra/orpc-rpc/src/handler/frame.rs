@@ -12,10 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use orpc_rpc::ServerConf;
+use crate::handler::{ReadFrame, WriteFrame};
+use std::future::Future;
 
-mod rpc_server;
-pub use self::rpc_server::RpcServer;
+use crate::message::{Message, RefMessage};
+use curvine_io::IOResult;
+use orpc_net::net::ConnState;
 
-mod server_monitor;
-pub use self::server_monitor::*;
+pub trait Frame {
+    fn send(&mut self, message: impl RefMessage) -> impl Future<Output = IOResult<()>>;
+
+    fn receive(&mut self) -> impl Future<Output = IOResult<Message>>;
+
+    fn new_conn_state(&self) -> ConnState;
+
+    fn split(self) -> (ReadFrame, WriteFrame);
+}

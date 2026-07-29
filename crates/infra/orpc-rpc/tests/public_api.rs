@@ -12,19 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::handler::{ReadFrame, WriteFrame};
-use std::future::Future;
+use orpc_rpc::{handler::RpcCodec, message::Message, ServerConf};
 
-use crate::io::net::ConnState;
-use crate::io::IOResult;
-use crate::message::{Message, RefMessage};
-
-pub trait Frame {
-    fn send(&mut self, message: impl RefMessage) -> impl Future<Output = IOResult<()>>;
-
-    fn receive(&mut self) -> impl Future<Output = IOResult<Message>>;
-
-    fn new_conn_state(&self) -> ConnState;
-
-    fn split(self) -> (ReadFrame, WriteFrame);
+#[test]
+fn exposes_rpc_infrastructure() {
+    let _ = std::any::TypeId::of::<RpcCodec>();
+    let _ = std::any::TypeId::of::<Message>();
+    let _ = ServerConf::with_hostname("127.0.0.1", 8995);
 }
