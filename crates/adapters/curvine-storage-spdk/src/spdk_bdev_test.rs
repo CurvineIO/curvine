@@ -285,6 +285,9 @@ fn spdk_full_lifecycle() {
         let (active, _) = p.controller_stats(ctrlr as usize);
         assert_eq!(active, 0);
 
+        // Clean up: free cached qpair before leaving scope
+        p.drain_all();
+
         println!("pass acquire_contention_active_count_correct");
     }
 
