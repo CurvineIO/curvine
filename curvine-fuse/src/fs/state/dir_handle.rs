@@ -31,6 +31,7 @@ const CACHE_BATCHES: usize = 4;
 
 struct InnerStream {
     stream: ListStream,
+    stream_path: String,
     cache: VecDeque<Arc<FileStatus>>,
     base_off: usize,
     next_off: usize,
@@ -38,9 +39,10 @@ struct InnerStream {
 }
 
 impl InnerStream {
-    pub fn new(stream: ListStream) -> Self {
+    pub fn new(stream: ListStream, stream_path: String) -> Self {
         Self {
             stream,
+            stream_path,
             cache: VecDeque::new(),
             base_off: 0,
             next_off: 0,
@@ -72,11 +74,12 @@ pub struct DirHandle {
 
 impl DirHandle {
     pub fn new(ino: u64, fh: u64, path: &Path, limit: usize, stream: ListStream) -> Self {
+        let path = path.clone_uri();
         Self {
             ino,
             fh,
-            path: path.clone_uri(),
-            stream: Some(Mutex::new(InnerStream::new(stream))),
+            stream: Some(Mutex::new(InnerStream::new(stream, path.clone()))),
+            path,
             limit,
         }
     }
@@ -95,6 +98,7 @@ impl DirHandle {
     pub async fn get_batch<F, Fut>(
         &self,
         off: usize,
+        current_path: &Path,
         new_stream: F,
     ) -> FuseResult<VecDeque<Arc<FileStatus>>>
     where
@@ -102,11 +106,12 @@ impl DirHandle {
         Fut: Future<Output = FuseResult<ListStream>>,
     {
         let mut guard = self.guard().await?;
+        let current_path = current_path.full_path();
 
-        // Cookies older than the bounded window remain seekable by replaying the
-        // backend stream. The common forward path stays within the window.
-        if off < guard.base_off {
-            *guard = InnerStream::new(new_stream().await?);
+        // Rename keeps an open directory fd valid, so a stream bound to an old
+        // path must be rebuilt even when the requested cookie is still cached.
+        if guard.stream_path != current_path || off < guard.base_off {
+            *guard = InnerStream::new(new_stream().await?, current_path.to_string());
         }
 
         let target = off.saturating_add(self.limit);
@@ -131,7 +136,8 @@ impl DirHandle {
     }
 
     pub fn set_stream(&mut self, stream: ListStream) {
-        self.stream.replace(Mutex::new(InnerStream::new(stream)));
+        self.stream
+            .replace(Mutex::new(InnerStream::new(stream, self.path.clone())));
     }
 }
 
@@ -177,19 +183,40 @@ mod tests {
                 async { Ok::<_, FuseError>(ListStream::from_vec(test_entries())) }
             };
 
-            assert_eq!(names(handle.get_batch(0, fresh).await.unwrap()), ["a", "b"]);
-            assert_eq!(names(handle.get_batch(2, fresh).await.unwrap()), ["c", "d"]);
-            assert_eq!(names(handle.get_batch(4, fresh).await.unwrap()), ["e", "f"]);
-            assert_eq!(names(handle.get_batch(6, fresh).await.unwrap()), ["g", "h"]);
-            assert_eq!(names(handle.get_batch(8, fresh).await.unwrap()), ["i", "j"]);
-            assert!(handle.get_batch(10, fresh).await.unwrap().is_empty());
+            assert_eq!(
+                names(handle.get_batch(0, &path, fresh).await.unwrap()),
+                ["a", "b"]
+            );
+            assert_eq!(
+                names(handle.get_batch(2, &path, fresh).await.unwrap()),
+                ["c", "d"]
+            );
+            assert_eq!(
+                names(handle.get_batch(4, &path, fresh).await.unwrap()),
+                ["e", "f"]
+            );
+            assert_eq!(
+                names(handle.get_batch(6, &path, fresh).await.unwrap()),
+                ["g", "h"]
+            );
+            assert_eq!(
+                names(handle.get_batch(8, &path, fresh).await.unwrap()),
+                ["i", "j"]
+            );
+            assert!(handle.get_batch(10, &path, fresh).await.unwrap().is_empty());
 
             // Offset 2 is still in the retained four-batch window.
-            assert_eq!(names(handle.get_batch(2, fresh).await.unwrap()), ["c", "d"]);
+            assert_eq!(
+                names(handle.get_batch(2, &path, fresh).await.unwrap()),
+                ["c", "d"]
+            );
             assert_eq!(resets.get(), 0);
 
             // Offset 0 has fallen out of the window and is recovered by replay.
-            assert_eq!(names(handle.get_batch(0, fresh).await.unwrap()), ["a", "b"]);
+            assert_eq!(
+                names(handle.get_batch(0, &path, fresh).await.unwrap()),
+                ["a", "b"]
+            );
             assert_eq!(resets.get(), 1);
 
             let guard = handle.guard().await.unwrap();
@@ -211,15 +238,54 @@ mod tests {
                 async { Ok::<_, FuseError>(ListStream::from_vec(test_entries())) }
             };
 
-            assert_eq!(names(handle.get_batch(9, fresh).await.unwrap()), ["j"]);
+            assert_eq!(
+                names(handle.get_batch(9, &path, fresh).await.unwrap()),
+                ["j"]
+            );
             assert_eq!(resets.get(), 0);
 
-            assert_eq!(names(handle.get_batch(1, fresh).await.unwrap()), ["b", "c"]);
+            assert_eq!(
+                names(handle.get_batch(1, &path, fresh).await.unwrap()),
+                ["b", "c"]
+            );
             assert_eq!(resets.get(), 1);
 
             let guard = handle.guard().await.unwrap();
             assert!(guard.cache.len() <= handle.cache_limit());
             assert_eq!(guard.base_off, 0);
+        });
+    }
+
+    #[test]
+    fn rename_then_rewind_rebuilds_from_current_path() {
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            let old_path = Path::from_str("/old/d").unwrap();
+            let new_path = Path::from_str("/new/d").unwrap();
+            let handle = DirHandle::new(1, 1, &old_path, 2, ListStream::from_vec(test_entries()));
+            let resets = Cell::new(0);
+
+            let fresh = || {
+                resets.set(resets.get() + 1);
+                async { Ok::<_, FuseError>(ListStream::from_vec(test_entries())) }
+            };
+
+            assert_eq!(
+                names(handle.get_batch(8, &old_path, fresh).await.unwrap()),
+                ["i", "j"]
+            );
+            assert_eq!(resets.get(), 0);
+
+            // The inode is now reachable through a different path. Rewinding the
+            // still-open handle must rebuild from that path, not DirHandle.path.
+            assert_eq!(
+                names(handle.get_batch(0, &new_path, fresh).await.unwrap()),
+                ["a", "b"]
+            );
+            assert_eq!(resets.get(), 1);
+
+            let guard = handle.guard().await.unwrap();
+            assert_eq!(guard.stream_path, new_path.full_path());
         });
     }
 }

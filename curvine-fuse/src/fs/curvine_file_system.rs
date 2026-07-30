@@ -376,12 +376,12 @@ impl CurvineFileSystem {
         plus: bool,
     ) -> FuseResult<(FuseDirentList, u64)> {
         let handle = self.state.find_dir_handle(header.nodeid, arg.fh)?;
-        let path = Path::from_str(&handle.path)?;
+        let path = self.state.get_path(header.nodeid)?;
 
         let mut res = FuseDirentList::new(arg);
         let mut index = arg.offset;
         let mut batch = handle
-            .get_batch(arg.offset as usize, || self.state.list_stream(&path))
+            .get_batch(arg.offset as usize, &path, || self.state.list_stream(&path))
             .await?;
         {
             let mut dir = self.state.dir_write();
@@ -2834,7 +2834,7 @@ mod tests {
                         ListStream::from_vec(entries(names)),
                     );
                     let batch = handle
-                        .get_batch(offset as usize, || async {
+                        .get_batch(offset as usize, &path, || async {
                             Ok(ListStream::from_vec(entries(names)))
                         })
                         .await
@@ -2908,7 +2908,7 @@ mod tests {
                     let handle =
                         DirHandle::new(1, 1, &path, 1000, ListStream::from_vec(entries(names)));
                     let batch = handle
-                        .get_batch(offset as usize, || async {
+                        .get_batch(offset as usize, &path, || async {
                             Ok(ListStream::from_vec(entries(names)))
                         })
                         .await
@@ -3008,7 +3008,7 @@ mod tests {
 
                 for _ in 0..max_rounds {
                     let mut batch = handle
-                        .get_batch(offset as usize, || async {
+                        .get_batch(offset as usize, &path, || async {
                             Ok(ListStream::from_vec(entries(names)))
                         })
                         .await
