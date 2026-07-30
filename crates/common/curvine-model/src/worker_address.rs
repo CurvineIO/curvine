@@ -31,6 +31,12 @@ impl WorkerAddress {
         self.hostname == hostname
     }
 
+    pub fn same_endpoint(&self, other: &Self) -> bool {
+        self.hostname == other.hostname
+            && self.ip_addr == other.ip_addr
+            && self.rpc_port == other.rpc_port
+    }
+
     pub fn connect_addr(&self) -> String {
         format!("{}:{}", self.ip_addr, self.rpc_port)
     }

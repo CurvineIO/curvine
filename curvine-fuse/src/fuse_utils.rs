@@ -15,7 +15,9 @@
 #![allow(unused_variables)]
 
 use crate::fs::operator::{Create, MkDir, MkNod};
-use crate::raw::fuse_abi::{fuse_attr, fuse_entry_out, fuse_setattr_in};
+use crate::raw::fuse_abi::{
+    fuse_attr, fuse_entry_out, fuse_ioctl_iovec, fuse_ioctl_out, fuse_setattr_in, FUSE_IOCTL_RETRY,
+};
 use crate::*;
 use bytes::BytesMut;
 use curvine_client::unified::UnifiedFileSystem;
@@ -226,7 +228,7 @@ impl FuseUtils {
             if let Err(ce) = sys::close(clone_fd) {
                 log::warn!("fuse_clone_fd: close leaked fd {} failed: {}", clone_fd, ce);
             }
-            return Err(e);
+            return Err(e.into());
         }
 
         Ok(clone_fd)
@@ -272,6 +274,31 @@ impl FuseUtils {
         if parent.mode & FUSE_S_ISGID != 0 {
             opts.group.clone_from(&parent.group);
         }
+    }
+
+    /// Sticky-directory hard-link rule: caller must own the source file or the
+    /// destination directory (Linux vfs_link / may_link semantics).
+    pub fn check_sticky_hardlink(
+        check_permission: bool,
+        caller_uid: u32,
+        dest_dir_uid: u32,
+        source_file_uid: u32,
+        dest_dir_mode: u32,
+    ) -> FuseResult<()> {
+        if !check_permission || caller_uid == 0 {
+            return Ok(());
+        }
+        if dest_dir_mode & libc::S_ISVTX as u32 == 0 {
+            return Ok(());
+        }
+        if caller_uid == dest_dir_uid || caller_uid == source_file_uid {
+            return Ok(());
+        }
+        err_fuse!(
+            libc::EPERM,
+            "sticky directory hard link denied for uid {}",
+            caller_uid
+        )
     }
 
     pub fn check_xattr(name: &str, op: XattrOp) -> FuseResult<()> {
@@ -359,22 +386,15 @@ impl FuseUtils {
     }
 
     pub fn decode_ioctl_file_flags(data: &[u8]) -> FuseResult<u32> {
-        let nbytes = Self::ioctl_flag_bytes();
-        if data.len() < nbytes {
-            return err_fuse!(libc::EINVAL, "ioctl in buffer too small");
+        // Prefer native long width, but accept 4-byte payloads used by
+        // FS_IOC32_* and by LTP helpers that store flags in an `int`.
+        if data.len() >= 8 {
+            Ok(i64::from_ne_bytes(data[..8].try_into().unwrap()) as u32)
+        } else if data.len() >= 4 {
+            Ok(u32::from_ne_bytes(data[..4].try_into().unwrap()))
+        } else {
+            err_fuse!(libc::EINVAL, "ioctl in buffer too small")
         }
-        let value = match nbytes {
-            8 => i64::from_ne_bytes(data[..8].try_into().unwrap()) as u32,
-            4 => u32::from_ne_bytes(data[..4].try_into().unwrap()),
-            _ => {
-                return err_fuse!(
-                    libc::EINVAL,
-                    "unsupported ioctl flag transfer size {}",
-                    nbytes
-                );
-            }
-        };
-        Ok(value)
     }
 
     pub fn append_ioctl_file_flags(buf: &mut BytesMut, flags: u32, out_size: u32) {
@@ -389,6 +409,35 @@ impl FuseUtils {
         if want > copy {
             buf.resize(buf.len() + (want - copy), 0);
         }
+    }
+
+    /// Build a `FUSE_IOCTL_RETRY` reply that asks the kernel to transfer
+    /// `in_len`/`out_len` bytes at the userspace pointer `arg_ptr`.
+    pub fn build_ioctl_retry(arg_ptr: u64, in_len: u64, out_len: u64) -> BytesMut {
+        let in_iovs = u32::from(in_len > 0);
+        let out_iovs = u32::from(out_len > 0);
+        let out = fuse_ioctl_out {
+            result: 0,
+            flags: FUSE_IOCTL_RETRY,
+            in_iovs,
+            out_iovs,
+        };
+        let mut buf = BytesMut::from(Self::struct_as_bytes(&out));
+        if in_len > 0 {
+            let iov = fuse_ioctl_iovec {
+                base: arg_ptr,
+                len: in_len,
+            };
+            buf.extend_from_slice(Self::struct_as_bytes(&iov));
+        }
+        if out_len > 0 {
+            let iov = fuse_ioctl_iovec {
+                base: arg_ptr,
+                len: out_len,
+            };
+            buf.extend_from_slice(Self::struct_as_bytes(&iov));
+        }
+        buf
     }
 
     pub fn file_open_flags(conf: &FuseConf, keep_cache: bool) -> u32 {
@@ -705,7 +754,9 @@ impl FuseUtils {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raw::fuse_abi::fuse_setattr_in;
+    use crate::raw::fuse_abi::{
+        fuse_ioctl_iovec, fuse_ioctl_out, fuse_setattr_in, FUSE_IOCTL_RETRY,
+    };
     use curvine_common::state::INTERNAL_CTIME_XATTR;
 
     #[test]
@@ -1102,6 +1153,17 @@ mod tests {
     }
 
     #[test]
+    fn check_sticky_hardlink_denies_cross_owner_link() {
+        let err = FuseUtils::check_sticky_hardlink(true, 1000, 0, 0, 0o1777).unwrap_err();
+        assert_eq!(err.errno(), libc::EPERM);
+
+        assert!(FuseUtils::check_sticky_hardlink(true, 0, 0, 1000, 0o1777).is_ok());
+        assert!(FuseUtils::check_sticky_hardlink(true, 1000, 1000, 0, 0o1777).is_ok());
+        assert!(FuseUtils::check_sticky_hardlink(true, 1000, 0, 1000, 0o1777).is_ok());
+        assert!(FuseUtils::check_sticky_hardlink(true, 1000, 0, 0, 0o755).is_ok());
+    }
+
+    #[test]
     fn special_file_type_from_mode_maps_chr_blk_fifo_sock() {
         assert_eq!(
             FuseUtils::special_file_type_from_mode(0o20777),
@@ -1138,6 +1200,50 @@ mod tests {
         FuseUtils::append_ioctl_file_flags(&mut buf, flags, FuseUtils::ioctl_flag_bytes() as u32);
         assert_eq!(buf.len(), FuseUtils::ioctl_flag_bytes());
         assert_eq!(FuseUtils::decode_ioctl_file_flags(&buf).unwrap(), flags);
+    }
+
+    #[test]
+    fn ioctl_file_flags_decode_accepts_four_byte_int_payload() {
+        let flags = FS_IMMUTABLE_FL | FS_APPEND_FL;
+        let bytes = flags.to_ne_bytes();
+        assert_eq!(FuseUtils::decode_ioctl_file_flags(&bytes).unwrap(), flags);
+    }
+
+    #[test]
+    fn ioctl_retry_reply_includes_out_iovec_for_getflags() {
+        let arg_ptr = 0xdead_beef_u64;
+        let nbytes = FuseUtils::ioctl_flag_bytes() as u64;
+        let buf = FuseUtils::build_ioctl_retry(arg_ptr, 0, nbytes);
+        let out_size = std::mem::size_of::<fuse_ioctl_out>();
+        let iov_size = std::mem::size_of::<fuse_ioctl_iovec>();
+        assert_eq!(buf.len(), out_size + iov_size);
+
+        let out: fuse_ioctl_out = unsafe { std::ptr::read(buf.as_ptr() as *const fuse_ioctl_out) };
+        assert_eq!(out.result, 0);
+        assert_eq!(out.flags, FUSE_IOCTL_RETRY);
+        assert_eq!(out.in_iovs, 0);
+        assert_eq!(out.out_iovs, 1);
+
+        let iov: fuse_ioctl_iovec =
+            unsafe { std::ptr::read(buf[out_size..].as_ptr() as *const fuse_ioctl_iovec) };
+        assert_eq!(iov.base, arg_ptr);
+        assert_eq!(iov.len, nbytes);
+    }
+
+    #[test]
+    fn ioctl_retry_reply_includes_in_iovec_for_setflags() {
+        let arg_ptr = 0x1234_5678_u64;
+        let nbytes = FuseUtils::ioctl_flag_bytes() as u64;
+        let buf = FuseUtils::build_ioctl_retry(arg_ptr, nbytes, 0);
+        let out_size = std::mem::size_of::<fuse_ioctl_out>();
+        let out: fuse_ioctl_out = unsafe { std::ptr::read(buf.as_ptr() as *const fuse_ioctl_out) };
+        assert_eq!(out.flags, FUSE_IOCTL_RETRY);
+        assert_eq!(out.in_iovs, 1);
+        assert_eq!(out.out_iovs, 0);
+        let iov: fuse_ioctl_iovec =
+            unsafe { std::ptr::read(buf[out_size..].as_ptr() as *const fuse_ioctl_iovec) };
+        assert_eq!(iov.base, arg_ptr);
+        assert_eq!(iov.len, nbytes);
     }
 
     #[test]

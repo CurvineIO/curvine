@@ -692,6 +692,8 @@ impl LoadJobRunner {
                     source_path: source_path.clone_uri(),
                     target_path: target_path.clone_uri(),
                     create_time: LocalTime::mills() as i64,
+                    source_read_plan_json: String::new(),
+                    transfer_report: None,
                 };
                 tasks.insert(task_id.clone(), TaskDetail::new(task));
 

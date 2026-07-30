@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::io::IOResult;
 use crate::sys;
 use crate::sys::pipe::OwnedFd;
+use crate::sys::SysResult;
 
 #[derive(Debug)]
 pub struct PipeFd {
@@ -24,7 +24,7 @@ pub struct PipeFd {
 }
 
 impl PipeFd {
-    pub fn new(buf_size: usize, read_blocking: bool, write_blocking: bool) -> IOResult<Self> {
+    pub fn new(buf_size: usize, read_blocking: bool, write_blocking: bool) -> SysResult<Self> {
         let [read_fd, write_fd] = sys::pipe2(buf_size)?;
         sys::set_pipe_blocking(read_fd, read_blocking)?;
         sys::set_pipe_blocking(write_fd, write_blocking)?;

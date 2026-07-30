@@ -15,6 +15,7 @@ curvine-config = { workspace = true }
 curvine-error = { workspace = true }
 curvine-fs-api = { workspace = true }
 curvine-model = { workspace = true }
+curvine-proto = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

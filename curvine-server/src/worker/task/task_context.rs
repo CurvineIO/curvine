@@ -37,7 +37,7 @@ impl TaskContext {
         self.state.state()
     }
 
-    fn progress(&self) -> MutexGuard<'_, JobTaskProgress> {
+    fn progress_lock(&self) -> MutexGuard<'_, JobTaskProgress> {
         match self.progress.lock() {
             Ok(progress) => progress,
             Err(e) => {
@@ -47,9 +47,35 @@ impl TaskContext {
         }
     }
 
+    pub fn progress(&self) -> JobTaskProgress {
+        let lock = self.progress_lock();
+        JobTaskProgress {
+            state: self.get_state(),
+            total_size: lock.total_size,
+            loaded_size: lock.loaded_size,
+            update_time: lock.update_time,
+            message: lock.message.clone(),
+        }
+    }
+
     pub fn set_failed(&self, message: impl Into<String>) -> JobTaskProgress {
-        let mut lock = self.progress();
+        let mut lock = self.progress_lock();
         self.state.set_state(JobTaskState::Failed);
+        lock.message = message.into();
+        lock.update_time = LocalTime::mills() as i64;
+
+        JobTaskProgress {
+            state: self.get_state(),
+            total_size: lock.total_size,
+            loaded_size: lock.loaded_size,
+            update_time: lock.update_time,
+            message: lock.message.clone(),
+        }
+    }
+
+    pub fn set_canceled(&self, message: impl Into<String>) -> JobTaskProgress {
+        let mut lock = self.progress_lock();
+        self.state.set_state(JobTaskState::Canceled);
         lock.message = message.into();
         lock.update_time = LocalTime::mills() as i64;
 
@@ -71,7 +97,7 @@ impl TaskContext {
     }
 
     pub fn update_state(&self, state: JobTaskState, message: impl Into<String>) {
-        let mut lock = self.progress();
+        let mut lock = self.progress_lock();
         if self.state.state::<JobTaskState>() == JobTaskState::Canceled
             && state != JobTaskState::Canceled
         {
@@ -88,7 +114,7 @@ impl TaskContext {
         total_size: i64,
         is_last: bool,
     ) -> JobTaskProgress {
-        let mut lock = self.progress();
+        let mut lock = self.progress_lock();
         if self.state.state::<JobTaskState>() == JobTaskState::Canceled {
             return JobTaskProgress {
                 state: JobTaskState::Canceled,

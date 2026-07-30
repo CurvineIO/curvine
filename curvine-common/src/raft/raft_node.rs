@@ -188,11 +188,23 @@ where
 
         match log_store.latest_snapshot()? {
             None => {
+                let fsm_state = app_store.get_fsm_state();
                 let mut snapshot = Snapshot::default();
                 snapshot.mut_metadata().mut_conf_state().voters = voters;
 
                 log_store.apply_snapshot(snapshot.clone())?;
-                app_store.apply_snapshot(SnapshotData::default()).await?;
+                // A leader that steps down before the first raft snapshot is
+                // persisted already has the correct local metadata. Installing
+                // an empty application snapshot would wipe populated state and
+                // is refused by journal_loader (#1207, #1268).
+                if fsm_state.applied.index == 0 {
+                    app_store.apply_snapshot(SnapshotData::default()).await?;
+                } else {
+                    info!(
+                        "skip empty snapshot install; preserving local state at applied index {}",
+                        fsm_state.applied.index
+                    );
+                }
             }
 
             Some(mut snapshot) => {

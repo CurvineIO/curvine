@@ -17,7 +17,9 @@ use crate::file::{FsClient, FsContext};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
-use curvine_model::{CommitBlock, FileAllocOpts, FileBlocks, FileStatus, WriteFileBlocks};
+use curvine_model::{
+    CommitBlock, FileAllocOpts, FileBlocks, FileStatus, SetAttrOpts, WriteFileBlocks,
+};
 use fxhash::FxHasher;
 use linked_hash_map::LinkedHashMap;
 use log::warn;
@@ -113,7 +115,11 @@ impl FsWriterBase {
             return Ok(());
         }
 
-        if self.pos > self.len {
+        // Sparse seek-past-EOF: only call master resize when the write target is
+        // outside existing block slots. Hole writes inside an already-allocated
+        // block are handled by seek+write on the worker (Linux sparse semantics)
+        // and must not force a full-block rewrite via resize/should_resize.
+        if self.pos > self.len && self.file_blocks.get_block(self.pos).is_none() {
             self.resize(FileAllocOpts::with_truncate(self.pos)).await?;
         }
 
@@ -142,7 +148,7 @@ impl FsWriterBase {
             return Ok(());
         }
 
-        if self.pos > self.len {
+        if self.pos > self.len && self.file_blocks.get_block(self.pos).is_none() {
             rt.block_on(self.resize(FileAllocOpts::with_truncate(self.pos)))?;
         }
 
@@ -165,7 +171,7 @@ impl FsWriterBase {
     }
 
     pub async fn flush(&mut self) -> FsResult<()> {
-        self.complete0(true).await?;
+        self.complete0(true, None).await?;
         Ok(())
     }
 
@@ -178,7 +184,12 @@ impl FsWriterBase {
     // Write is completed, perform the following operations
     // 1. Submit the last block.
     pub async fn complete(&mut self) -> FsResult<()> {
-        self.complete0(false).await?;
+        self.complete0(false, None).await?;
+        Ok(())
+    }
+
+    pub async fn complete_with_attr(&mut self, opts: Option<SetAttrOpts>) -> FsResult<()> {
+        self.complete0(false, opts).await?;
         Ok(())
     }
 
@@ -269,6 +280,7 @@ impl FsWriterBase {
                     committed_len,
                     commit_blocks.clone(),
                     true,
+                    None,
                 )
                 .await;
             if let Err(e) = result {
@@ -288,20 +300,27 @@ impl FsWriterBase {
         }
     }
 
-    async fn complete0(&mut self, only_flush: bool) -> FsResult<Option<FileBlocks>> {
+    async fn complete0(
+        &mut self,
+        only_flush: bool,
+        set_attr_opts: Option<SetAttrOpts>,
+    ) -> FsResult<Option<FileBlocks>> {
         if let Some(writer) = self.cur_writer.take() {
             self.cache_writers.insert(writer.block_id(), writer);
         };
 
         let mut writer_commits = Vec::with_capacity(self.cache_writers.len());
         for (_, writer) in self.cache_writers.iter_mut() {
-            let commit_block = if only_flush {
-                writer.flush().await?;
-                writer.to_commit_block()
-            } else {
-                writer.complete().await?
-            };
-
+            // Always finalize on the worker. `only_flush` only keeps the master
+            // write lease open; it must still publish block data.
+            //
+            // A prior resize/flush may already have finalized an older
+            // generation. Later writes reopen as a staging rewrite while
+            // `get_readable_block` prefers the committed generation. Calling
+            // `flush()` here without `complete()` leaves that rewrite
+            // unpublished, so FUSE dirty-read / LTP ftest/pwrite see EIO or
+            // stale holes after sparse write-then-read.
+            let commit_block = writer.complete().await?;
             writer_commits.push(commit_block);
         }
 
@@ -309,9 +328,9 @@ impl FsWriterBase {
             self.file_blocks.add_commit(commit)?;
         }
 
-        if !only_flush {
-            self.cache_writers.clear();
-        }
+        // `complete()` ends the worker write session; drop handles so the next
+        // write reopens against the newly published generation.
+        self.cache_writers.clear();
 
         let commit_blocks = self.file_blocks.take_commit_blocks();
         // From this point onward a request may have reached the master even if
@@ -329,12 +348,23 @@ impl FsWriterBase {
                 self.len,
                 commit_blocks.clone(),
                 only_flush,
+                set_attr_opts,
             )
             .await;
-        if result.is_err() {
-            self.restore_commit_blocks(&commit_blocks);
+        match result {
+            Ok(Some(blocks)) if only_flush => {
+                // Keep client block locs/alloc_opts in sync with master after
+                // publish so later sparse rewrites do not reuse stale opts.
+                self.file_blocks = WriteFileBlocks::new(blocks.clone());
+                self.len = self.len.max(self.file_blocks.len());
+                Ok(Some(blocks))
+            }
+            Ok(v) => Ok(v),
+            Err(e) => {
+                self.restore_commit_blocks(&commit_blocks);
+                Err(e)
+            }
         }
-        result
     }
 
     async fn get_writer(&mut self) -> FsResult<&mut BlockWriter> {

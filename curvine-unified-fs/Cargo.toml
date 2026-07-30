@@ -14,7 +14,9 @@ curvine-config = { workspace = true }
 curvine-error = { workspace = true }
 curvine-fs-api = { workspace = true }
 curvine-model = { workspace = true }
+curvine-proto = { workspace = true }
 bytes = { workspace = true }
+dashmap = { workspace = true }
 log = { workspace = true }
 once_cell = { workspace = true }
 orpc = { workspace = true }

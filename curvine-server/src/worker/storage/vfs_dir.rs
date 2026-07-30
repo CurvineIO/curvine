@@ -298,7 +298,7 @@ impl VfsDir {
         if self.storage_type == StorageType::SpdkDisk {
             return Ok(());
         }
-        self.stats.check_dir()
+        Ok(self.stats.check_dir()?)
     }
 
     pub(super) fn allocation_size(&self, requested_bytes: i64) -> Option<i64> {

@@ -113,6 +113,12 @@ impl FileHandle {
         }
     }
 
+    pub fn drain_plock_owners(&self) -> Vec<u64> {
+        match self {
+            FileHandle::Backend(h) => h.drain_plock_owners(),
+        }
+    }
+
     pub async fn resize(&self, opts: FileAllocOpts) -> FuseResult<()> {
         match self {
             FileHandle::Backend(h) => {

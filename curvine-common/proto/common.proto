@@ -170,6 +170,12 @@ message WorkerInfoProto {
     map<string, StorageInfoProto> storage_map = 7;
     required int64 reserved_bytes = 8 [default = 0];
     optional uint32 weight = 9 [default = 1];
+    optional string worker_session_id = 10 [default = ""];
+    optional bool transfer_task_submit = 11 [default = false];
+    optional bool transfer_report_target = 12 [default = false];
+    optional bool transfer_query_task = 13 [default = false];
+    optional bool transfer_attempt_safe_output = 14 [default = false];
+    optional bool transfer_source_read_plan = 15 [default = false];
 }
 
 message FileAllocOptsProto {

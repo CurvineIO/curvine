@@ -13,7 +13,8 @@
 // limitations under the License.
 
 pub use curvine_config::{
-    CliConf, ClientConf, ClientConfCliOverrides, FuseConf, JobConf, UfsConf, UfsConfBuilder,
+    CliConf, ClientConf, ClientConfCliOverrides, FuseConf, JobConf, TransferConf,
+    TransferCvMetadataReaderType, TransferStoreType, UfsConf, UfsConfBuilder,
 };
 
 pub use curvine_fault::FaultHttpConfig;

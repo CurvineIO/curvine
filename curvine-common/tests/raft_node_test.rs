@@ -19,7 +19,9 @@ use curvine_common::proto::raft::{FsmState, SnapshotData};
 use curvine_common::raft::storage::{
     AppStorage, HashAppStorage, LogStorage, MemLogStorage, RocksLogStorage,
 };
-use curvine_common::raft::{RaftClient, RaftCode, RaftError, RaftJournal, RaftResult, RoleMonitor};
+use curvine_common::raft::{
+    RaftClient, RaftCode, RaftError, RaftJournal, RaftNode, RaftResult, RoleMonitor,
+};
 use curvine_common::utils::SerdeUtils;
 use orpc::client::{ClientConf, RpcClient};
 use orpc::common::{FileUtils, Logger, Utils};
@@ -325,6 +327,81 @@ fn malformed_propose_request_does_not_stop_raft_node() -> CommonResult<()> {
     Utils::sleep(1000);
     assert_eq!(store.get("name"), Some("curvine".to_string()));
     FileUtils::delete_path(&conf.journal_dir, true)?;
+
+    Ok(())
+}
+
+/// AppStorage that already has local applied state and refuses empty snapshot installs.
+#[derive(Clone)]
+struct PopulatedRefuseEmptySnapshotAppStorage {
+    fsm_state: Arc<Mutex<FsmState>>,
+    apply_snapshot_calls: Arc<Mutex<u32>>,
+}
+
+impl PopulatedRefuseEmptySnapshotAppStorage {
+    fn with_applied_index(index: u64) -> Self {
+        let mut fsm = FsmState::default();
+        fsm.applied.index = index;
+        Self {
+            fsm_state: Arc::new(Mutex::new(fsm)),
+            apply_snapshot_calls: Arc::new(Mutex::new(0)),
+        }
+    }
+}
+
+impl AppStorage for PopulatedRefuseEmptySnapshotAppStorage {
+    async fn apply(&self, _: bool, msg: curvine_common::raft::storage::ApplyMsg) -> RaftResult<()> {
+        if let curvine_common::raft::storage::ApplyMsg::Scan(applied) = msg {
+            self.fsm_state.lock().unwrap().applied = applied;
+        }
+        Ok(())
+    }
+
+    fn get_fsm_state(&self) -> FsmState {
+        self.fsm_state.lock().unwrap().clone()
+    }
+
+    async fn role_change(&self, _: StateRole) -> RaftResult<()> {
+        Ok(())
+    }
+
+    async fn create_snapshot(&self) -> RaftResult<SnapshotData> {
+        Ok(SnapshotData::default())
+    }
+
+    async fn apply_snapshot(&self, _: SnapshotData) -> RaftResult<()> {
+        *self.apply_snapshot_calls.lock().unwrap() += 1;
+        Err(RaftError::other(
+            "populated app store must not install empty snapshot".into(),
+        ))
+    }
+
+    fn snapshot_dir(&self, _: u64) -> RaftResult<String> {
+        Ok(String::new())
+    }
+}
+
+#[test]
+fn install_snapshot_skips_empty_app_snapshot_when_applied_index_nonzero() -> CommonResult<()> {
+    // Focused coverage for the step-down path: LogStorage has no persisted
+    // snapshot, but AppStorage already has applied.index > 0. install_snapshot
+    // must skip app_store.apply_snapshot(empty) so local metadata is preserved.
+    let rt = JournalConf::with_test().create_runtime();
+    let app = PopulatedRefuseEmptySnapshotAppStorage::with_applied_index(7);
+
+    let index = rt.block_on(RaftNode::<NoSnapshotLogStorage, _>::install_snapshot(
+        &NoSnapshotLogStorage,
+        &app,
+        vec![1],
+    ))?;
+
+    assert_eq!(index, 7);
+    assert_eq!(
+        *app.apply_snapshot_calls.lock().unwrap(),
+        0,
+        "empty app snapshot must not be applied when applied.index > 0"
+    );
+    assert_eq!(app.get_fsm_state().applied.index, 7);
 
     Ok(())
 }

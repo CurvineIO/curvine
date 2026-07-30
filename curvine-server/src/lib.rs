@@ -15,6 +15,7 @@
 pub mod common;
 pub mod master;
 pub mod test;
+pub mod transfer;
 pub mod worker;
 
 #[cfg(feature = "fault-injection")]

@@ -16,7 +16,7 @@ use crate::file::FsWriterBase;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
-use curvine_model::{FileAllocOpts, FileBlocks, FileStatus};
+use curvine_model::{FileAllocOpts, FileBlocks, FileStatus, SetAttrOpts};
 use log::error;
 use orpc::io::IOError;
 use orpc::runtime::RpcRuntime;
@@ -28,7 +28,7 @@ use std::sync::Arc;
 // Control task type
 enum WriterTask {
     Flush(CallSender<i8>),
-    Complete((bool, CallSender<i8>)),
+    Complete((bool, Option<SetAttrOpts>, CallSender<i8>)),
     Cancel(CallSender<FsResult<()>>),
     Seek((i64, CallSender<i8>)),
     Resize((FileAllocOpts, CallSender<FileBlocks>)),
@@ -73,10 +73,14 @@ impl BufferChannel {
     }
 
     async fn complete(&mut self) -> FsResult<()> {
+        self.complete_with_attr(None).await
+    }
+
+    async fn complete_with_attr(&mut self, opts: Option<SetAttrOpts>) -> FsResult<()> {
         let fun = async {
             let (tx, rx) = CallChannel::channel();
             self.task_sender
-                .send(WriterTask::Complete((false, tx)))
+                .send(WriterTask::Complete((false, opts, tx)))
                 .await?;
             rx.receive().await?;
             Ok::<(), IOError>(())
@@ -210,6 +214,10 @@ impl FsWriterBuffer {
         self.writer.complete().await
     }
 
+    pub async fn complete_with_attr(&mut self, opts: Option<SetAttrOpts>) -> FsResult<()> {
+        self.writer.complete_with_attr(opts).await
+    }
+
     pub async fn flush(&mut self) -> FsResult<()> {
         self.writer.flush().await
     }
@@ -253,11 +261,11 @@ impl FsWriterBuffer {
                         cx.send(1)?;
                     }
 
-                    WriterTask::Complete((_, tx)) => {
+                    WriterTask::Complete((_, opts, tx)) => {
                         while let Some(chunk) = chunk_receiver.try_recv()? {
                             writer.write(chunk).await?;
                         }
-                        writer.complete().await?;
+                        writer.complete_with_attr(opts).await?;
                         tx.send(1)?;
                         return Ok(());
                     }

@@ -186,7 +186,7 @@ impl<T: FileSystem> FuseReceiver<T> {
                 // Recoverable (real errno): the loop may `continue` to the next
                 // frame, so drain the stale bytes that would otherwise poison it.
                 Self::drain_pipe(pipe2);
-                return Err(err);
+                return Err(err.into());
             }
         };
         if write_len != read_len {
@@ -208,7 +208,7 @@ impl<T: FileSystem> FuseReceiver<T> {
                 Ok(n) if n > 0 => continue,
                 Ok(_) => break,
                 Err(err) => {
-                    if err.raw_error().raw_os_error() == Some(EINTR) {
+                    if err.raw_os_error() == Some(EINTR) {
                         continue;
                     }
                     break;
@@ -721,8 +721,10 @@ fn receive_error_labels(os_errno: Option<i32>) -> (&'static str, &'static str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{receive_error_labels, PendingRequestGuard};
+    use super::{receive_error_labels, FuseReceiver, PendingRequestGuard};
+    use crate::fs::TestFileSystem;
     use crate::fuse_metrics::{RECEIVE_ACTION_CONTINUE, RECEIVE_ACTION_EXIT};
+    use bytes::BytesMut;
     use libc::{EAGAIN, ECONNABORTED, EINTR, EIO, ENODEV, ENOENT};
     use orpc::sync::FastDashMap;
     use std::sync::Arc;
@@ -774,6 +776,38 @@ mod tests {
         assert!(
             Arc::ptr_eq(current.value(), &replacement),
             "an older guard must not remove a same-unique replacement"
+        );
+    }
+
+    #[test]
+    fn prepare_receive_buf_does_not_return_stale_tail_bytes() {
+        let first = b"first-request-with-a-tail";
+        let mut buf = BytesMut::from(&first[..]);
+
+        let returned = buf.split_to(5);
+        assert_eq!(&returned[..], b"first");
+        assert!(!buf.is_empty(), "the first split leaves a stale tail");
+
+        FuseReceiver::<TestFileSystem>::prepare_receive_buf(&mut buf, 8);
+        assert_eq!(
+            buf.len(),
+            8,
+            "the next receive gets exactly its read window"
+        );
+
+        let read_len = 3;
+        buf[..read_len].copy_from_slice(b"new");
+        let returned = buf.split_to(read_len);
+        assert_eq!(&returned[..], b"new");
+        assert_eq!(
+            returned.len(),
+            read_len,
+            "only bytes reported by read are returned"
+        );
+        assert_eq!(
+            buf.len(),
+            8 - read_len,
+            "the unused read window remains internal to the reusable buffer"
         );
     }
 
@@ -1917,7 +1951,8 @@ mod tests {
             // surfaces as `-EBADF` — the enabled path's check, read off the raw frame.
             match &tasks[0] {
                 FuseTask::Reply(d) => assert_eq!(
-                    d.header.error, -ERRNO,
+                    d.header().error,
+                    -ERRNO,
                     "disabled path propagates the pre-dispatch errno on the wire"
                 ),
                 FuseTask::RequestReply { .. } => {

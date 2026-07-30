@@ -18,6 +18,36 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TransferWorkerCapabilities {
+    pub task_submit: bool,
+    pub report_target: bool,
+    pub query_task: bool,
+    pub attempt_safe_output: bool,
+    pub source_read_plan: bool,
+}
+
+impl TransferWorkerCapabilities {
+    pub fn current() -> Self {
+        Self {
+            task_submit: true,
+            report_target: true,
+            query_task: true,
+            attempt_safe_output: true,
+            source_read_plan: true,
+        }
+    }
+
+    pub fn supports_transfer(&self) -> bool {
+        self.task_submit
+            && self.report_target
+            && self.query_task
+            && self.attempt_safe_output
+            && self.source_read_plan
+    }
+}
+
 // Describes a worker, which is the basic unit of master management worker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -34,6 +64,8 @@ pub struct WorkerInfo {
     pub block_num: i64,
     pub storage_map: HashMap<String, StorageInfo>,
     pub status: WorkerStatus,
+    pub worker_session_id: String,
+    pub transfer_capabilities: TransferWorkerCapabilities,
 }
 
 impl WorkerInfo {
@@ -54,6 +86,8 @@ impl WorkerInfo {
             last_update: LocalTime::mills(),
             storage_map: Default::default(),
             status: WorkerStatus::Live,
+            worker_session_id: String::new(),
+            transfer_capabilities: TransferWorkerCapabilities::default(),
         }
     }
 
@@ -126,6 +160,8 @@ impl Default for WorkerInfo {
             block_num: 0,
             storage_map: Default::default(),
             status: WorkerStatus::Live,
+            worker_session_id: String::new(),
+            transfer_capabilities: TransferWorkerCapabilities::default(),
         }
     }
 }

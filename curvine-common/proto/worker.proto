@@ -80,6 +80,12 @@ message WorkerHeartbeatRequest {
     repeated StorageInfoProto storages = 8;
     repeated BlockReportInfoProto blocks = 9;
     optional uint32 weight = 10 [default = 1];
+    optional string worker_session_id = 11 [default = ""];
+    optional bool transfer_task_submit = 12 [default = false];
+    optional bool transfer_report_target = 13 [default = false];
+    optional bool transfer_query_task = 14 [default = false];
+    optional bool transfer_attempt_safe_output = 15 [default = false];
+    optional bool transfer_source_read_plan = 16 [default = false];
 }
 
 message WorkerHeartbeatResponse {

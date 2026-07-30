@@ -116,6 +116,8 @@ fn load_task(task_id: &str, job_id: &str) -> LoadTaskInfo {
         source_path: "file://source".to_string(),
         target_path: "/mnt/source".to_string(),
         create_time: 0,
+        source_read_plan_json: String::new(),
+        transfer_report: None,
     }
 }
 

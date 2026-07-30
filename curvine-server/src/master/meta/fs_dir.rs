@@ -585,6 +585,7 @@ impl FsDir {
         Ok(block)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn complete_file(
         &mut self,
         path: impl AsRef<str>,
@@ -593,11 +594,21 @@ impl FsDir {
         commit_block: Vec<CommitBlock>,
         client_name: impl AsRef<str>,
         only_flush: bool,
+        set_attr_opts: Option<SetAttrOpts>,
     ) -> FsResult<bool> {
         let file = inode.as_file_mut()?;
+        let id = file.id();
         file.complete(len, &commit_block, client_name, only_flush)?;
 
-        self.evictor.on_access(file.id());
+        // Only apply set_attr_opts on real complete/close, not on flush.
+        // Flush semantics should remain narrow (durability only).
+        if !only_flush {
+            if let Some(opts) = set_attr_opts {
+                inode.set_attr(opts)?;
+            }
+        }
+
+        self.evictor.on_access(id);
 
         self.store
             .apply_complete_file(inode.as_ref(), &commit_block)?;
@@ -997,8 +1008,12 @@ impl FsDir {
         let (original_inode_id, mut original_inode_ptr) = match src_path.get_last_inode() {
             Some(inode) => match inode.as_ref() {
                 File(file) => {
-                    // Check if it's a regular file (not a directory or symlink)
-                    if file.file_type != curvine_common::state::FileType::File {
+                    // Hard links to regular files and symlinks are valid; directories are not.
+                    if !matches!(
+                        file.file_type,
+                        curvine_common::state::FileType::File
+                            | curvine_common::state::FileType::Link
+                    ) {
                         return err_ext!(FsError::common("Cannot create link to non-regular file"));
                     }
                     (file.id, Some(inode.clone()))

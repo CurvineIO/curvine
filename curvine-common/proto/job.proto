@@ -74,6 +74,8 @@ message SubmitTaskRequest {
 
 message SubmitTaskResponse {
   required string task_id = 1;
+  optional bool accepted = 2 [default = true];
+  optional string reject_reason = 3 [default = ""];
 }
 
 message TaskReportRequest {

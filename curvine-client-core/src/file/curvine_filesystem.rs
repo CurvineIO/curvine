@@ -27,6 +27,7 @@ use curvine_model::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
     MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
 };
+use curvine_proto::{GetCvMetadataDeltaPageResponse, GetCvMetadataSnapshotPageResponse};
 use log::info;
 use log::warn;
 use orpc::client::ClientConf;
@@ -52,7 +53,7 @@ impl CurvineFileSystem {
             fs_client: Arc::new(fs_client),
         };
 
-        FsContext::start_clean_task(fs.clone(), fs.fs_context.block_pool.clone());
+        FsContext::start_clean_task(&fs.fs_context, fs.fs_context.block_pool.clone());
 
         let c = &fs.conf().client;
         info!(
@@ -190,6 +191,28 @@ impl CurvineFileSystem {
 
     pub async fn list_status(&self, path: &Path) -> FsResult<Vec<FileStatus>> {
         self.fs_client.list_status(path).await
+    }
+
+    pub async fn get_cv_metadata_snapshot_page(
+        &self,
+        page_token: Option<String>,
+        page_size: Option<u32>,
+    ) -> FsResult<GetCvMetadataSnapshotPageResponse> {
+        self.fs_client
+            .get_cv_metadata_snapshot_page(page_token, page_size)
+            .await
+    }
+
+    pub async fn get_cv_metadata_delta_page(
+        &self,
+        from_epoch: u64,
+        target_epoch: Option<u64>,
+        page_token: Option<String>,
+        page_size: Option<u32>,
+    ) -> FsResult<GetCvMetadataDeltaPageResponse> {
+        self.fs_client
+            .get_cv_metadata_delta_page(from_epoch, target_epoch, page_token, page_size)
+            .await
     }
 
     pub async fn list_status_bytes(&self, path: &Path) -> FsResult<BytesMut> {

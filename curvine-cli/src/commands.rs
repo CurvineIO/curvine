@@ -36,12 +36,24 @@ pub enum Commands {
     Export(ExportCommand),
 
     /// Query loading task status
-    #[command(name = "load-status")]
+    #[command(name = "load-status", hide = true)]
     LoadStatus(LoadStatusCommand),
 
+    /// Query transfer task status
+    #[command(name = "transfer-status", hide = true)]
+    TransferStatus(LoadStatusCommand),
+
     /// Cancel loading task
-    #[command(name = "cancel-load")]
+    #[command(name = "cancel-load", hide = true)]
     CancelLoad(CancelLoadCommand),
+
+    /// Cancel transfer task
+    #[command(name = "cancel-transfer", hide = true)]
+    CancelTransfer(CancelLoadCommand),
+
+    /// Manage transfer jobs
+    #[command(name = "transfer")]
+    Transfer(TransferCommand),
 
     /// mount ufs to curvine
     #[command(name = "mount")]

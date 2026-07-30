@@ -12,6 +12,57 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub type SysResult<T> = std::io::Result<T>;
+
+// `Other` is reserved for opaque failures; pass an explicit `ErrorKind` whenever the
+// failure has a category callers can branch on (unsupported platform, bad argument, EOF).
+macro_rules! sys_error {
+    ($kind:path, $message:literal) => {
+        Err(::std::io::Error::new($kind, $message))
+    };
+    ($kind:path, $format:literal, $($arg:expr),+ $(,)?) => {
+        Err(::std::io::Error::new($kind, format!($format, $($arg),+)))
+    };
+    ($message:expr) => {
+        Err(::std::io::Error::other($message))
+    };
+    ($format:expr, $($arg:expr),+ $(,)?) => {
+        Err(::std::io::Error::other(format!($format, $($arg),+)))
+    };
+}
+
+// Fully qualified paths keep the expansion independent of what the call site imports.
+macro_rules! sys_call {
+    ($expression:expr) => {{
+        let result = $expression;
+        if result as $crate::sys::CInt <= $crate::sys::ERRNO_SENTINEL {
+            Err(::std::io::Error::last_os_error())
+        } else {
+            Ok(result as $crate::sys::CInt)
+        }
+    }};
+}
+
+/// Build a new iovec that skips the first `offset` bytes of `iov`, so a partially
+/// completed vectored transfer can be resumed with the remaining bytes only.
+pub fn skip_iov_bytes<'a>(
+    iov: &'a [std::io::IoSlice<'a>],
+    mut offset: usize,
+) -> Vec<std::io::IoSlice<'a>> {
+    let mut result = Vec::with_capacity(iov.len());
+    for slice in iov {
+        if offset == 0 {
+            result.push(std::io::IoSlice::new(&slice[..]));
+        } else if slice.len() <= offset {
+            offset -= slice.len();
+        } else {
+            result.push(std::io::IoSlice::new(&slice[offset..]));
+            offset = 0;
+        }
+    }
+    result
+}
+
 mod sys_libc;
 pub use self::sys_libc::*;
 

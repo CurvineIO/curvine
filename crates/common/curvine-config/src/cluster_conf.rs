@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{CliConf, ClientConf, FuseConf, JobConf};
+use crate::{CliConf, ClientConf, FuseConf, JobConf, TransferConf};
 use log::info;
 use nix::ifaddrs::getifaddrs;
 use orpc::client::ClientConf as RpcConf;
@@ -94,6 +94,7 @@ pub struct ClusterConf {
     pub client: ClientConf,
     pub fuse: FuseConf,
     pub job: JobConf,
+    pub transfer: TransferConf,
     pub cli: CliConf,
 }
 
@@ -144,6 +145,7 @@ impl ClusterConf {
         conf.client.init()?;
         conf.fuse.init()?;
         conf.job.init()?;
+        conf.transfer.init()?;
 
         if conf.client.master_addrs.is_empty() {
             if conf.journal.journal_addrs.is_empty() {
@@ -243,6 +245,7 @@ impl Default for ClusterConf {
             client: Default::default(),
             fuse: Default::default(),
             job: Default::default(),
+            transfer: Default::default(),
             cli: Default::default(),
         }
     }

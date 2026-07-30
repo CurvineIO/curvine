@@ -49,6 +49,8 @@ pub enum RpcCode {
     CompleteFilesBatch = 25,
     Free = 26,
     ListOptions = 27,
+    GetCvMetadataSnapshotPage = 28,
+    GetCvMetadataDeltaPage = 29,
 
     // manager interface.
     Mount = 30,
@@ -62,6 +64,15 @@ pub enum RpcCode {
     CancelJob = 37,
     ReportTask = 38,
     SubmitTask = 39,
+    SubmitTransfer = 46,
+    GetTransferStatus = 47,
+    CancelTransfer = 48,
+    ReportTransferTask = 49,
+    QueryTransferTask = 50,
+    WatchTransfer = 51,
+    ListTransfers = 52,
+    ListTransferTenants = 53,
+    RetryTransfer = 54,
     WorkerHeartbeat = 40,
     WorkerBlockReport = 41,
 

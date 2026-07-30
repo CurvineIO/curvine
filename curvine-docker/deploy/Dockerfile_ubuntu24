@@ -116,7 +116,7 @@ RUN ARCH=$(uname -m) && \
 
 ENV JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
 
-# Runtime image only needs master/worker runtime binaries, CLI/FUSE helpers, and WebUI.
+# Runtime image contains master, worker and transfer service binaries, CLI/FUSE helpers, and WebUI.
 # Override with --build-arg BUILD_ARGS="..." when building SDKs, WebUI, tests, or alternate UFS sets.
 ARG BUILD_ARGS="-p server -p client -p cli -p fuse -p web --skip-java-sdk --skip-python-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs --ufs opendal-webhdfs --ufs oss-hdfs"
 
@@ -183,9 +183,13 @@ RUN echo "Building Curvine from source..." && \
     rm -rf /workspace/tmp
 
 # 10. Create output directory and copy build artifacts from build/dist
+ARG GIT_VERSION=unknown
 RUN mkdir -p /build-output && \
     echo "Copying build/dist contents to /build-output..." && \
     cp -r /workspace/build/dist/* /build-output/ && \
+    if [ -f "/build-output/build-version" ]; then \
+        sed -i "s/^commit=.*/commit=${GIT_VERSION}/" /build-output/build-version; \
+    fi && \
     # Verify critical files exist
     if [ ! -f "/build-output/bin/launch-process.sh" ]; then \
         echo "✗ ERROR: launch-process.sh not found in build/dist/bin" && \
@@ -277,7 +281,9 @@ WORKDIR $APP_HOME
 # 8997: Worker RPC
 # 9000: Master Web UI
 # 9001: Worker Web UI / Master Web1
-EXPOSE 8995 8996 8997 9000 9001
+# 9010: Transfer RPC
+# 9011: Transfer Web UI
+EXPOSE 8995 8996 8997 9000 9001 9010 9011
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["master", "start"]

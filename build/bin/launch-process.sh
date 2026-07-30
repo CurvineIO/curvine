@@ -52,7 +52,7 @@ start() {
     check
 
     name="unknown"
-    if [[ "$SERVICE_NAME" = "worker" ]] || [[ "$SERVICE_NAME" = "master" ]]; then
+    if [[ "$SERVICE_NAME" = "worker" ]] || [[ "$SERVICE_NAME" = "master" ]] || [[ "$SERVICE_NAME" = "transfer" ]]; then
       name="curvine-server"
       nohup ${CURVINE_HOME}/lib/curvine-server \
       --service ${SERVICE_NAME} \

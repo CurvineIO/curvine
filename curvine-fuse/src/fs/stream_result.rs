@@ -135,7 +135,7 @@ mod tests {
         let task = task_rx.recv().await.expect("a kernel reply was enqueued");
         match task {
             FuseTask::Reply(data) => assert_eq!(
-                data.header.error,
+                data.header().error,
                 -libc::EIO,
                 "reply=Some: kernel reply must carry the mapped errno (negated)"
             ),
@@ -164,7 +164,8 @@ mod tests {
         let task = task_rx.recv().await.expect("a kernel reply was enqueued");
         match task {
             FuseTask::Reply(data) => assert_eq!(
-                data.header.error, 0,
+                data.header().error,
+                0,
                 "reply=Some: a successful op replies error=0 to the kernel"
             ),
             _ => panic!("expected FuseTask::Reply"),

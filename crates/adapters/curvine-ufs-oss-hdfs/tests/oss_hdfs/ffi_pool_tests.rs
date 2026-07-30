@@ -14,8 +14,6 @@
 
 #[cfg(feature = "oss-hdfs-ffi-test")]
 mod tests {
-    use std::os::raw::c_longlong;
-
     #[repr(C)]
     #[derive(Clone, Copy)]
     enum JindoStatus {
@@ -28,7 +26,6 @@ mod tests {
     extern "C" {
         fn jindo_test_default_filesystem_store_shards() -> usize;
         fn jindo_test_max_filesystem_store_shards() -> usize;
-        fn jindo_test_filesystem_store_shard_wait_timeout_ms() -> c_longlong;
         fn jindo_test_is_reusable_operation_ctx(status: JindoStatus) -> bool;
     }
 
@@ -37,7 +34,6 @@ mod tests {
         unsafe {
             assert_eq!(jindo_test_default_filesystem_store_shards(), 16);
             assert_eq!(jindo_test_max_filesystem_store_shards(), 64);
-            assert_eq!(jindo_test_filesystem_store_shard_wait_timeout_ms(), 3_000);
         }
     }
 
