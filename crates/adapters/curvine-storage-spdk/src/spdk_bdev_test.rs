@@ -206,34 +206,25 @@ fn spdk_full_lifecycle() {
         };
         p.register_limit(ctrlr as usize, 4);
 
-        // Allocate real qpairs
-        let q1 = unsafe { spdk_ffi::curvine_spdk_alloc_io_qpair(ctrlr) };
-        assert!(!q1.is_null());
-        let q2 = unsafe { spdk_ffi::curvine_spdk_alloc_io_qpair(ctrlr) };
-        assert!(!q2.is_null());
-        let q3 = unsafe { spdk_ffi::curvine_spdk_alloc_io_qpair(ctrlr) };
-        assert!(!q3.is_null());
+        // Acquire 3 qpairs through the real API — each reserves + allocates via FFI
+        let q1 = p.acquire(ctrlr).expect("acquire q1"); // active 0→1
+        let q2 = p.acquire(ctrlr).expect("acquire q2"); // active 1→2
+        let q3 = p.acquire(ctrlr).expect("acquire q3"); // active 2→3
 
-        // Fill pool to capacity (max_per_ctrlr=2) via direct push
-        {
-            let mut pool = p.inner.lock().unwrap();
-            pool.entry(ctrlr as usize).or_default().push(q1);
-            pool.entry(ctrlr as usize).or_default().push(q2);
-        }
+        // Release 2 — pool accepts them (0 < max_per_ctrlr=2, then 1 < 2)
+        p.release(ctrlr, q1); // pushes q1, active 3→2
+        p.release(ctrlr, q2); // pushes q2, active 2→1
 
-        // Reserve a slot so release() has a balanced reservation to release
-        assert!(p.try_reserve(ctrlr as usize)); // active=1
+        // Release 3rd — pool full (2 >= max_per_ctrlr=2), frees via FFI
+        p.release(ctrlr, q3); // frees q3 via FFI, active 1→0
 
-        // release() with pool full (2 >= max_per_ctrlr=2) -> free q3 via FFI
-        p.release(ctrlr, q3); // release_reservation -> active 1->0
-
-        // Pool unchanged at 2 (q3 was freed, not pushed)
+        // Pool has 2 cached (q3 was freed, not pushed)
         let pool = p.inner.lock().unwrap();
         assert_eq!(pool.get(&(ctrlr as usize)).map_or(0, |s| s.len()), 2);
         drop(pool);
 
-        // Clean up: free cached q1, q2 before leaving scope
-        p.drain_all(); // frees q1, q2
+        // Clean up: free cached q1, q2
+        p.drain_all();
 
         println!("pass release_pool_full_frees_qpair");
     }
