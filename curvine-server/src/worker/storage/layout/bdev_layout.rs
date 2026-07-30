@@ -195,18 +195,27 @@ impl BlockLayout for BdevLayout {
         dir: &VfsDir,
         meta: &BlockMeta,
         off: i64,
-        _logical_len: i64,
+        logical_len: i64,
     ) -> IOResult<BlockReadContext> {
-        // Bdev blocks are fully allocated; do not synthesize a sparse logical tail.
-        validate_open_offset(meta, off)?;
+        let physical_len = meta.len;
+        let logical_len = logical_len.max(physical_len);
+        if off < 0 || off > logical_len {
+            return err_box!(
+                "Invalid block offset: {}, block length: {}",
+                off,
+                logical_len
+            );
+        }
         #[cfg(feature = "spdk")]
         {
             let bdev_name = Self::bdev_name(dir)?;
             let base_offset = meta.bdev_offset;
-            let abs_offset = base_offset.checked_add(off).ok_or_else(|| {
+            // Seek within physical bytes; sparse logical tail is synthesized.
+            let device_off = off.min(physical_len);
+            let abs_offset = base_offset.checked_add(device_off).ok_or_else(|| {
                 IOError::from(format!(
                     "Block read offset overflow: base={}, offset={}",
-                    base_offset, off
+                    base_offset, device_off
                 ))
             })?;
             let abs_offset = u64::try_from(abs_offset).map_err(|_| {
@@ -215,20 +224,17 @@ impl BlockLayout for BdevLayout {
                     abs_offset
                 ))
             })?;
-            let max_len = 0.max(meta.len - off);
+            let max_len = physical_len - device_off;
             info!(
-                "Opening SPDK bdev '{}' for reading at offset {} (block {} base={}, max_len={})",
-                bdev_name, abs_offset, meta.id, base_offset, max_len
+                "Opening SPDK bdev '{}' for reading at offset {} (block {} base={}, physical_len={}, logical_len={}, max_len={})",
+                bdev_name, abs_offset, meta.id, base_offset, physical_len, logical_len, max_len
             );
-            if max_len == 0 {
-                return err_box!("Cannot open SPDK reader: no space remaining");
-            }
             let bdev = SpdkBdev::open_read(bdev_name, abs_offset, max_len)?;
-            BlockReadContext::new(bdev, base_offset, meta.len, off)
+            BlockReadContext::with_physical(bdev, base_offset, logical_len, physical_len, off)
         }
         #[cfg(not(feature = "spdk"))]
         {
-            let _ = (dir, meta, off);
+            let _ = (dir, meta, off, logical_len, physical_len);
             err_box!("SPDK support not compiled in")
         }
     }

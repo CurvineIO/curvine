@@ -97,9 +97,13 @@ impl FileLayout {
         // Sparse seek-past-EOF resize can raise a committed block's logical
         // length on the master without rewriting worker bytes. A later partial
         // rewrite then completes with committed_len larger than the staging
-        // file size. Materialize that logical length (including holes) before
-        // the mismatch check so valid post-resize rewrites can finalize.
-        if committed_len >= 0 {
+        // file size. Only materialize that logical length for known rewrites;
+        // first writes must still match the staging file exactly.
+        let mut finalized_probe = meta.clone();
+        finalized_probe.state = BlockState::Finalized;
+        let active_path = Self::block_path(dir, &finalized_probe)?;
+        let is_rewrite = active_path.exists();
+        if is_rewrite && committed_len >= 0 {
             let current_len = staging_path.metadata()?.len() as i64;
             if committed_len > current_len {
                 OpenOptions::new()

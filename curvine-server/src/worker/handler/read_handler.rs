@@ -58,15 +58,29 @@ impl ReadHandler {
 
     pub fn open(&mut self, msg: &Message) -> FsResult<Message> {
         let context = ReadContext::from_req(msg)?;
+        let conf = Worker::get_conf()?;
+        let max_block_size = conf.master.max_block_size;
         let meta = self.store.get_block(context.block_id).map_err(|e| {
             FsError::block_not_found(context.block_id)
                 .ctx(format!("worker block store lookup failed: {}", e))
         })?;
 
         // Master sparse ResizeFile may raise logical block len above the
-        // worker's physical file size. Serve the logical length and synthesize
-        // zeros for the sparse tail instead of rejecting the open.
-        let logical_len = context.len.max(meta.len);
+        // worker's physical file size. Only synthesize a sparse tail when the
+        // client advertises a validated logical length above physical bytes.
+        let physical_len = meta.len;
+        let logical_len = if context.len > physical_len {
+            if context.len > max_block_size {
+                return err_box!(
+                    "Advertised block length {} exceeds max_block_size {}",
+                    context.len,
+                    max_block_size
+                );
+            }
+            context.len
+        } else {
+            physical_len
+        };
         if context.off < 0 {
             return err_box!(
                 "Invalid read offset: {}, block length: {}",
@@ -84,6 +98,14 @@ impl ReadHandler {
 
         if context.chunk_size <= 0 {
             return err_box!("chunk_size must be greater than 0");
+        }
+
+        if context.chunk_size as i64 > Self::MAX_READ_AHEAD {
+            return err_box!(
+                "chunk_size {} exceeds maximum allowed value {}",
+                context.chunk_size,
+                Self::MAX_READ_AHEAD
+            );
         }
 
         if context.enable_read_ahead && context.read_ahead_len > Self::MAX_READ_AHEAD {

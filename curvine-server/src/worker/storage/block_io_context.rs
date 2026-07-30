@@ -283,14 +283,23 @@ impl BlockReadContext {
             .device
             .read_region(enable_send_file, physical_chunk as i32)?;
         let got = region.len() as i64;
+        if got != physical_chunk {
+            return err_box!(
+                "short physical read: expected {}, got {}",
+                physical_chunk,
+                got
+            );
+        }
         self.block_pos += got;
-        if got == read_len {
+
+        let sparse_pad = read_len - physical_chunk;
+        if sparse_pad == 0 {
             return Ok(region);
         }
 
         let mut buf = Self::into_buffer(region)?;
         buf.resize(read_len as usize, 0);
-        self.block_pos += read_len - got;
+        self.block_pos += sparse_pad;
         Ok(DataSlice::buffer(buf))
     }
 
@@ -348,6 +357,22 @@ mod tests {
         assert_eq!(&bytes[..2], b"EF");
         assert_eq!(&bytes[2..], &[0u8; 4]);
         assert_eq!(ctx.block_pos(), 10);
+
+        let _ = remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn read_context_rejects_short_physical_read() -> Result<(), Box<dyn std::error::Error>> {
+        let path = Utils::test_file();
+        ensure_parent(&path)?;
+        LocalFile::write_string(&path, "ABC", true)?;
+
+        let device = shared_read_device(&path)?;
+        // Advertise more physical bytes than exist on disk.
+        let mut ctx = BlockReadContext::with_physical(device, 0, 10, 10, 0)?;
+        let err = ctx.read_region(false, 5).unwrap_err().to_string();
+        assert!(err.contains("short physical read"));
 
         let _ = remove_file(&path);
         Ok(())
