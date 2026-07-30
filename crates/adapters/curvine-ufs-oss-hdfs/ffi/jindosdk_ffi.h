@@ -142,7 +142,6 @@ void jindo_free(void* p);
 #ifdef CURVINE_OSS_HDFS_FFI_TEST
 size_t jindo_test_default_filesystem_store_shards(void);
 size_t jindo_test_max_filesystem_store_shards(void);
-int64_t jindo_test_filesystem_store_shard_wait_timeout_ms(void);
 bool jindo_test_is_reusable_operation_ctx(JindoStatus status);
 #endif
 

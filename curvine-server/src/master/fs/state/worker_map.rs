@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::state::{StorageInfo, WorkerAddress, WorkerInfo, WorkerStatus};
+use curvine_common::state::{
+    StorageInfo, TransferWorkerCapabilities, WorkerAddress, WorkerInfo, WorkerStatus,
+};
 use curvine_common::FsResult;
 use indexmap::IndexMap;
 use log::{error, info, warn};
@@ -43,6 +45,30 @@ impl WorkerMap {
         self.lost_workers.swap_remove(&addr.worker_id);
     }
 
+    pub fn remove_same_endpoint(&mut self, addr: &WorkerAddress) -> Vec<WorkerInfo> {
+        let stale_worker_ids: Vec<u32> = self
+            .workers
+            .iter()
+            .filter_map(|(worker_id, worker)| {
+                if *worker_id != addr.worker_id && worker.address.same_endpoint(addr) {
+                    Some(*worker_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut removed = Vec::with_capacity(stale_worker_ids.len());
+        for worker_id in stale_worker_ids {
+            if let Some(worker) = self.workers.swap_remove(&worker_id) {
+                self.lost_workers.swap_remove(&worker_id);
+                removed.push(worker);
+            }
+        }
+
+        removed
+    }
+
     pub fn ensure_worker_id_addr(&self, addr: &WorkerAddress) -> FsResult<()> {
         if let Some(v) = self.workers.get(&addr.worker_id) {
             if v.address != *addr {
@@ -60,13 +86,24 @@ impl WorkerMap {
         &mut self,
         addr: WorkerAddress,
         weight: u32,
+        worker_session_id: String,
+        transfer_capabilities: TransferWorkerCapabilities,
         storages: Vec<StorageInfo>,
     ) -> FsResult<()> {
         self.ensure_worker_id_addr(&addr)?;
+        for stale in self.remove_same_endpoint(&addr) {
+            warn!(
+                "Remove stale worker {} before registering {} on the same endpoint",
+                stale.simple_debug(),
+                addr
+            );
+        }
 
         // Register the worker and update the storage information.
         // @todo Heartbeat may be too simple and directly covers historical data.
         let mut info = WorkerInfo::new(addr, weight);
+        info.worker_session_id = worker_session_id;
+        info.transfer_capabilities = transfer_capabilities;
         let worker_id = info.worker_id();
         for item in storages {
             info.add_storage(item);
@@ -104,7 +141,18 @@ impl WorkerMap {
 
     // Delete blocks that have been offline
     pub fn remove_offline(&mut self, id: u32) -> Option<WorkerInfo> {
-        self.remove_expired(id)
+        let worker = match self.workers.swap_remove(&id) {
+            None => {
+                warn!("Not found worker {}", id);
+                return None;
+            }
+
+            Some(v) => v,
+        };
+
+        info!("remove offline worker {}", worker.address);
+        self.lost_workers.insert(id, worker.clone());
+        Some(worker)
     }
 
     pub fn workers(&self) -> &IndexMap<u32, WorkerInfo> {

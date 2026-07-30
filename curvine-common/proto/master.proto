@@ -188,6 +188,7 @@ message CompleteFileRequest {
     repeated CommitBlockProto commit_blocks = 4;
     required bool only_flush = 5 [default = false];
     optional int64 inode_id = 6;
+    optional SetAttrOptsProto set_attr_opts = 7;
 }
 
 message CompleteFileResponse {

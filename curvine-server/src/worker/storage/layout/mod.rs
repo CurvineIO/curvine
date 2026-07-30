@@ -16,6 +16,7 @@ mod bdev_layout;
 mod file_layout;
 
 pub use self::bdev_layout::BdevLayout;
+pub(crate) use self::file_layout::FileFinalizePlan;
 pub use self::file_layout::FileLayout;
 
 use crate::worker::block::BlockMeta;

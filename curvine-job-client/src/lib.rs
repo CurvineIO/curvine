@@ -33,6 +33,9 @@ use orpc::err_box;
 
 use curvine_client_core::file::{FsClient, FsContext};
 
+mod transfer_client;
+pub use transfer_client::TransferClient;
+
 /// Job master client
 #[derive(Clone)]
 pub struct JobMasterClient {

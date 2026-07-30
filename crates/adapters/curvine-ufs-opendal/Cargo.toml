@@ -11,6 +11,7 @@ curvine-fs-api = { workspace = true }
 curvine-model = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
+log = { workspace = true }
 opendal = { version = "0.55" }
 orpc = { workspace = true }
 

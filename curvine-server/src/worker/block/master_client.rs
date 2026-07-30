@@ -16,7 +16,9 @@ use crate::worker::block::{BlockMeta, BlockState};
 use curvine_client::file::{FsClient, FsContext};
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
-use curvine_common::state::{BlockReportInfo, HeartbeatStatus, StorageInfo, WorkerAddress};
+use curvine_common::state::{
+    BlockReportInfo, HeartbeatStatus, StorageInfo, TransferWorkerCapabilities, WorkerAddress,
+};
 use curvine_common::utils::ProtoUtils;
 use orpc::CommonResult;
 use std::sync::Arc;
@@ -31,6 +33,7 @@ pub struct MasterClient {
     pub(crate) worker_id: u32,
     pub(crate) worker_addr: WorkerAddress,
     pub(crate) worker_weight: u32,
+    pub(crate) worker_session_id: String,
 }
 
 impl MasterClient {
@@ -40,6 +43,7 @@ impl MasterClient {
         worker_id: u32,
         worker_addr: WorkerAddress,
         worker_weight: u32,
+        worker_session_id: impl Into<String>,
     ) -> Self {
         // Directly reused file system client service.
         let fs_client = FsClient::new(context);
@@ -49,6 +53,7 @@ impl MasterClient {
             worker_id,
             worker_addr,
             worker_weight,
+            worker_session_id: worker_session_id.into(),
         }
     }
 
@@ -58,12 +63,19 @@ impl MasterClient {
         status: HeartbeatStatus,
         storages: Vec<StorageInfo>,
     ) -> CommonResult<WorkerHeartbeatResponse> {
+        let transfer_capabilities = TransferWorkerCapabilities::current();
         let mut req = WorkerHeartbeatRequest {
             status: status.into(),
             cluster_id: self.cluster_id.clone(),
             worker_id: self.worker_id,
             address: ProtoUtils::worker_address_to_pb(&self.worker_addr),
             weight: Some(self.worker_weight),
+            worker_session_id: Some(self.worker_session_id.clone()),
+            transfer_task_submit: Some(transfer_capabilities.task_submit),
+            transfer_report_target: Some(transfer_capabilities.report_target),
+            transfer_query_task: Some(transfer_capabilities.query_task),
+            transfer_attempt_safe_output: Some(transfer_capabilities.attempt_safe_output),
+            transfer_source_read_plan: Some(transfer_capabilities.source_read_plan),
             ..Default::default()
         };
         for item in storages {
@@ -92,8 +104,10 @@ impl MasterClient {
         for block in blocks {
             let status = match block.state {
                 BlockState::Finalized => BlockReportStatusProto::Finalized,
-                BlockState::Writing => BlockReportStatusProto::Writing,
-                BlockState::Recovering => BlockReportStatusProto::Writing,
+                BlockState::Writing
+                | BlockState::Recovering
+                | BlockState::Allocating
+                | BlockState::Finalizing => BlockReportStatusProto::Writing,
             };
             let info = BlockReportInfoProto {
                 id: block.id,

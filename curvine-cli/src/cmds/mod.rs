@@ -21,6 +21,7 @@ mod load_status;
 mod mount;
 mod node;
 mod report;
+pub mod transfer;
 mod umount;
 
 pub use bench::BenchCommand;
@@ -32,4 +33,5 @@ pub use load_status::LoadStatusCommand;
 pub use mount::MountCommand;
 pub use node::NodeCommand;
 pub use report::ReportCommand;
+pub use transfer::TransferCommand;
 pub use umount::UnMountCommand;

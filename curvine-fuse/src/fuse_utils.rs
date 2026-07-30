@@ -228,7 +228,7 @@ impl FuseUtils {
             if let Err(ce) = sys::close(clone_fd) {
                 log::warn!("fuse_clone_fd: close leaked fd {} failed: {}", clone_fd, ce);
             }
-            return Err(e);
+            return Err(e.into());
         }
 
         Ok(clone_fd)

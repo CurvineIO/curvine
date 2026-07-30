@@ -27,6 +27,7 @@ use orpc::common::LocalTime;
 use orpc::err_box;
 use orpc::sync::channel::{BlockingChannel, BlockingReceiver, BlockingSender};
 use orpc::sync::AtomicCounter;
+use std::collections::VecDeque;
 use std::sync::Mutex;
 
 // Write metadata operation logs.
@@ -36,9 +37,17 @@ pub struct JournalWriter {
     sender: BlockingSender<JournalEntry>,
     metrics: &'static MasterMetrics,
     receiver: Option<Mutex<BlockingReceiver<JournalEntry>>>,
+    metadata_delta_log: Mutex<MetadataDeltaLog>,
 
     snapshot_entries: u64,
     entries_since_snapshot: AtomicCounter,
+}
+
+#[derive(Default)]
+struct MetadataDeltaLog {
+    capacity: usize,
+    low_watermark: u64,
+    changes: VecDeque<CvMetadataChange>,
 }
 
 impl JournalWriter {
@@ -62,6 +71,7 @@ impl JournalWriter {
             sender,
             metrics,
             receiver,
+            metadata_delta_log: Mutex::new(MetadataDeltaLog::new(conf.metadata_delta_log_capacity)),
             snapshot_entries: conf.snapshot_entries,
             entries_since_snapshot: AtomicCounter::new(0),
         })
@@ -76,10 +86,19 @@ impl JournalWriter {
 
     fn send(&self, fs_dir: &FsDir, entry: JournalEntry) -> FsResult<()> {
         if self.enable {
+            self.record_metadata_delta(&entry);
             self.send_inner(entry)?;
             self.maybe_emit_snapshot(fs_dir)?;
         }
         Ok(())
+    }
+
+    fn record_metadata_delta(&self, entry: &JournalEntry) {
+        let changes = entry.cv_metadata_changes();
+        if changes.is_empty() {
+            return;
+        }
+        self.metadata_delta_log.lock().unwrap().push(changes);
     }
 
     fn maybe_emit_snapshot(&self, fs_dir: &FsDir) -> FsResult<()> {
@@ -349,5 +368,50 @@ impl JournalWriter {
             entries.push(v);
         }
         entries
+    }
+
+    pub(crate) fn cv_metadata_changes_since(
+        &self,
+        from_epoch: u64,
+        to_epoch: u64,
+    ) -> Option<Vec<CvMetadataChange>> {
+        let log = self.metadata_delta_log.lock().unwrap();
+        if from_epoch < log.low_watermark {
+            return None;
+        }
+        Some(
+            log.changes
+                .iter()
+                .filter(|change| change.op_id > from_epoch && change.op_id <= to_epoch)
+                .cloned()
+                .collect(),
+        )
+    }
+}
+
+impl MetadataDeltaLog {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            low_watermark: 0,
+            changes: VecDeque::with_capacity(capacity.min(1024)),
+        }
+    }
+
+    fn push(&mut self, changes: Vec<CvMetadataChange>) {
+        if self.capacity == 0 {
+            if let Some(max_op_id) = changes.iter().map(|change| change.op_id).max() {
+                self.low_watermark = self.low_watermark.max(max_op_id);
+            }
+            return;
+        }
+        for change in changes {
+            self.changes.push_back(change);
+            while self.changes.len() > self.capacity {
+                if let Some(evicted) = self.changes.pop_front() {
+                    self.low_watermark = self.low_watermark.max(evicted.op_id);
+                }
+            }
+        }
     }
 }

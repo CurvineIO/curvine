@@ -14,7 +14,7 @@
 
 use crate::worker::block::BlockStore;
 use crate::worker::storage::Dataset;
-use orpc::common::{Counter, CounterVec, Gauge, Metrics as m, Metrics};
+use orpc::common::{Counter, CounterVec, Gauge, HistogramVec, Metrics as m, Metrics};
 use orpc::sys::SysUtils;
 use orpc::CommonResult;
 use std::fmt::{Debug, Formatter};
@@ -31,6 +31,11 @@ pub struct WorkerMetrics {
     pub(crate) read_time_us: Counter,
     pub(crate) read_count: Counter,
     pub(crate) read_blocks: CounterVec,
+
+    pub(crate) block_store_stripe_lock_wait_us: HistogramVec,
+    pub(crate) block_dataset_write_lock_wait_us: HistogramVec,
+    pub(crate) block_dataset_write_lock_hold_us: HistogramVec,
+    pub(crate) file_layout_operation_us: HistogramVec,
 
     pub(crate) capacity: Gauge,
     pub(crate) available: Gauge,
@@ -57,6 +62,27 @@ impl WorkerMetrics {
             read_time_us: m::new_counter("read_time_us", "Microseconds spent read")?,
             read_count: m::new_counter("read_count", "Number of reads")?,
             read_blocks: m::new_counter_vec("read_blocks", "read_blocks", &["type"])?,
+
+            block_store_stripe_lock_wait_us: m::new_histogram_vec(
+                "block_store_stripe_lock_wait_us",
+                "Microseconds waiting for a block-store stripe lock",
+                &["operation"],
+            )?,
+            block_dataset_write_lock_wait_us: m::new_histogram_vec(
+                "block_dataset_write_lock_wait_us",
+                "Microseconds waiting for the block-dataset write lock",
+                &["operation"],
+            )?,
+            block_dataset_write_lock_hold_us: m::new_histogram_vec(
+                "block_dataset_write_lock_hold_us",
+                "Microseconds holding the block-dataset write lock",
+                &["operation"],
+            )?,
+            file_layout_operation_us: m::new_histogram_vec(
+                "file_layout_operation_us",
+                "Microseconds spent in file-layout operations outside the dataset lock",
+                &["operation"],
+            )?,
 
             capacity: m::new_gauge("capacity", "Total storage capacity")?,
             available: m::new_gauge("available", "Total available space")?,

@@ -56,6 +56,47 @@ read_rpc_port() {
     ' "$conf_file"
 }
 
+read_bool() {
+    local section=$1
+    local key=$2
+    local default_value=$3
+    local conf_file="${CURVINE_CONF_FILE:-${BIN_DIR}/../conf/curvine-cluster.toml}"
+
+    if [ ! -f "$conf_file" ]; then
+        echo "$default_value"
+        return
+    fi
+
+    awk -v section="[$section]" -v key="$key" -v default_value="$default_value" '
+        /^[[:space:]]*\[/ {
+            line = $0
+            sub(/[[:space:]]*#.*/, "", line)
+            gsub(/[[:space:]]/, "", line)
+            in_section = (line == section)
+        }
+        in_section {
+            line = $0
+            sub(/[[:space:]]*#.*/, "", line)
+            gsub(/[[:space:]]/, "", line)
+            if (line ~ "^" key "=") {
+                sub(/^[^=]*=/, "", line)
+                print line
+                found = 1
+                exit
+            }
+        }
+        END {
+            if (!found) {
+                print default_value
+            }
+        }
+    ' "$conf_file"
+}
+
+transfer_enabled() {
+    [ "$(read_bool "transfer" "enabled" "false")" = "true" ]
+}
+
 # Function to wait for a process to start
 wait_for_process() {
     local service_name=$1
@@ -122,6 +163,7 @@ sleep 3
 
 MASTER_PORT=$(read_rpc_port "master" 8995)
 WORKER_PORT=$(read_rpc_port "worker" 8997)
+TRANSFER_PORT=$(read_rpc_port "transfer" 9010)
 
 # Start master and worker services
 ${BIN_DIR}/curvine-master.sh start
@@ -133,6 +175,12 @@ ${BIN_DIR}/curvine-worker.sh start
 # Wait for master and worker to start
 wait_for_process "worker" || exit 1
 wait_for_port "worker" "$WORKER_PORT" 60 || exit 1
+
+if transfer_enabled; then
+    ${BIN_DIR}/curvine-transfer.sh start
+    wait_for_process "transfer" || exit 1
+    wait_for_port "transfer" "$TRANSFER_PORT" 60 || exit 1
+fi
 
 # Start fuse service
 ${BIN_DIR}/curvine-fuse.sh start

@@ -31,6 +31,18 @@ pub struct FileLayout;
 const ACTIVE_DIR: &str = "active";
 const STAGING_DIR: &str = "staging";
 
+pub(crate) struct FileFinalizePlan {
+    final_meta: BlockMeta,
+    staging_path: PathBuf,
+    active_path: PathBuf,
+}
+
+impl FileFinalizePlan {
+    pub(crate) fn final_meta(&self) -> &BlockMeta {
+        &self.final_meta
+    }
+}
+
 impl FileLayout {
     fn active_dir(dir: &VfsDir) -> PathBuf {
         dir.base_path().join(ACTIVE_DIR)
@@ -56,7 +68,10 @@ impl FileLayout {
                     .join(format!("b{}", d1))
                     .join(format!("b{}", d2))
             }
-            BlockState::Writing | BlockState::Recovering => Self::staging_dir(dir),
+            BlockState::Writing
+            | BlockState::Recovering
+            | BlockState::Allocating
+            | BlockState::Finalizing => Self::staging_dir(dir),
         };
 
         if path.exists() {
@@ -71,6 +86,49 @@ impl FileLayout {
 
     pub(crate) fn block_path(dir: &VfsDir, meta: &BlockMeta) -> CommonResult<PathBuf> {
         Ok(Self::block_dir(dir, meta)?.join(meta.state().get_name(meta.id())))
+    }
+
+    pub(crate) fn prepare_finalize(
+        dir: &VfsDir,
+        meta: &BlockMeta,
+        committed_len: i64,
+    ) -> CommonResult<FileFinalizePlan> {
+        let staging_path = Self::block_path(dir, meta)?;
+        // Sparse seek-past-EOF resize can raise a committed block's logical
+        // length on the master without rewriting worker bytes. A later partial
+        // rewrite then completes with committed_len larger than the staging
+        // file size. Materialize that logical length (including holes) before
+        // the mismatch check so valid post-resize rewrites can finalize.
+        if committed_len >= 0 {
+            let current_len = staging_path.metadata()?.len() as i64;
+            if committed_len > current_len {
+                OpenOptions::new()
+                    .write(true)
+                    .open(&staging_path)?
+                    .set_len(committed_len as u64)?;
+            }
+        }
+        let final_meta = BlockMeta::with_final(meta, &staging_path)?;
+        if final_meta.len() != committed_len {
+            return err_box!(
+                "Block {} length mismatch, expected: {}, actual: {}",
+                meta.id(),
+                committed_len,
+                final_meta.len()
+            );
+        }
+
+        let active_path = Self::block_path(dir, &final_meta)?;
+        Ok(FileFinalizePlan {
+            final_meta,
+            staging_path,
+            active_path,
+        })
+    }
+
+    pub(crate) fn publish_finalize(plan: FileFinalizePlan) -> CommonResult<BlockMeta> {
+        FileUtils::rename(plan.staging_path, plan.active_path)?;
+        Ok(plan.final_meta)
     }
 
     fn block_file(dir: &VfsDir, meta: &BlockMeta) -> CommonResult<String> {
@@ -125,10 +183,9 @@ impl BlockLayout for FileLayout {
                 );
             }
 
-            // This copy is intentionally serialized by the dataset write lock so
-            // the committed-to-staging transition cannot race another writer.
-            // Existing open readers keep using active; new metadata operations
-            // wait for the copy to finish.
+            // BlockStore reserves this rewrite before the copy and serializes
+            // same-block mutations. Existing readers keep using active while
+            // the staging copy runs outside the dataset write lock.
             if let Err(e) = fs::copy(&committed_path, &staging_path) {
                 let _ = fs::remove_file(&staging_path);
                 return Err(e.into());
@@ -144,34 +201,8 @@ impl BlockLayout for FileLayout {
         meta: &BlockMeta,
         committed_len: i64,
     ) -> CommonResult<BlockMeta> {
-        let staging_path = Self::block_path(dir, meta)?;
-        // Sparse seek-past-EOF resize can raise a committed block's logical
-        // length on the master without rewriting worker bytes. A later partial
-        // rewrite then completes with committed_len larger than the staging
-        // file size. Materialize that logical length (including holes) before
-        // the mismatch check so valid post-resize rewrites can finalize.
-        if committed_len >= 0 {
-            let current_len = staging_path.metadata()?.len() as i64;
-            if committed_len > current_len {
-                OpenOptions::new()
-                    .write(true)
-                    .open(&staging_path)?
-                    .set_len(committed_len as u64)?;
-            }
-        }
-        let final_meta = BlockMeta::with_final(meta, &staging_path)?;
-        if final_meta.len() != committed_len {
-            return err_box!(
-                "Block {} length mismatch, expected: {}, actual: {}",
-                meta.id(),
-                committed_len,
-                final_meta.len()
-            );
-        }
-
-        let active_path = Self::block_path(dir, &final_meta)?;
-        FileUtils::rename(staging_path, active_path)?;
-        Ok(final_meta)
+        let plan = Self::prepare_finalize(dir, meta, committed_len)?;
+        Self::publish_finalize(plan)
     }
 
     fn scan(&self, dir: &VfsDir) -> CommonResult<Vec<BlockMeta>> {

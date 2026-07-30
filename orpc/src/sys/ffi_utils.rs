@@ -14,24 +14,27 @@
 
 #![allow(clippy::not_unsafe_ptr_arg_deref, unused)]
 
-use crate::io::IOResult;
-use crate::sys::{CChar, CStr, CString};
+use crate::sys::{CChar, CStr, CString, SysResult};
 use std::ffi::OsStr;
 
 pub struct FFIUtils;
 
 impl FFIUtils {
-    pub fn ptr_to_string(ptr: *const CChar) -> IOResult<String> {
+    pub fn ptr_to_string(ptr: *const CChar) -> SysResult<String> {
         if ptr.is_null() {
             return Ok("".to_string());
         }
 
-        let str = unsafe { CStr::from_ptr(ptr).to_str()? };
+        let str = unsafe {
+            CStr::from_ptr(ptr)
+                .to_str()
+                .map_err(std::io::Error::other)?
+        };
         Ok(str.to_string())
     }
 
     // iAfter into_raw, Rust will not recycle memory and needs to be manually released by itself
-    pub fn string_to_ptr(str: impl AsRef<str>) -> IOResult<*mut CChar> {
+    pub fn string_to_ptr(str: impl AsRef<str>) -> SysResult<*mut CChar> {
         let string = CString::new(str.as_ref())?;
         Ok(string.into_raw())
     }

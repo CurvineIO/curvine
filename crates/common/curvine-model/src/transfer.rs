@@ -67,13 +67,17 @@ pub enum TransferState {
     Completed = 6,
     Failed = 7,
     Canceled = 8,
+    PartialSuccess = 9,
 }
 
 impl TransferState {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            TransferState::Completed | TransferState::Failed | TransferState::Canceled
+            TransferState::Completed
+                | TransferState::Failed
+                | TransferState::Canceled
+                | TransferState::PartialSuccess
         )
     }
 
@@ -247,9 +251,21 @@ pub struct TransferTaskRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransferTaskSummary {
     pub progress: TransferProgress,
+    pub counts: TransferTaskCounts,
     pub has_task: bool,
     pub has_failed: bool,
     pub all_completed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TransferTaskCounts {
+    pub pending: u64,
+    pub running: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub canceled: u64,
+    pub stale: u64,
+    pub completed_size: i64,
 }
 
 pub fn summarize_transfer_tasks<'a>(
@@ -261,6 +277,7 @@ pub fn summarize_transfer_tasks<'a>(
             update_time,
             ..Default::default()
         },
+        counts: TransferTaskCounts::default(),
         has_task: false,
         has_failed: false,
         all_completed: true,
@@ -275,6 +292,18 @@ pub fn summarize_transfer_tasks<'a>(
         summary.all_completed &= task.state == TransferTaskState::Completed;
         summary.progress.loaded_size += task.progress.loaded_size;
         summary.progress.total_size += task.progress.total_size;
+
+        match task.state {
+            TransferTaskState::Pending => summary.counts.pending += 1,
+            TransferTaskState::Running => summary.counts.running += 1,
+            TransferTaskState::Completed => {
+                summary.counts.completed += 1;
+                summary.counts.completed_size += task.progress.loaded_size.max(0);
+            }
+            TransferTaskState::Failed => summary.counts.failed += 1,
+            TransferTaskState::Canceled => summary.counts.canceled += 1,
+            TransferTaskState::Stale => summary.counts.stale += 1,
+        }
 
         if !task.progress.message.is_empty() {
             last_message = task.progress.message.clone();
@@ -379,6 +408,7 @@ pub struct TransferTenantSummary {
     pub completed: u64,
     pub failed: u64,
     pub canceled: u64,
+    pub partial_success: u64,
     pub total: u64,
 }
 

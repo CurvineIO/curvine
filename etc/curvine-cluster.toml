@@ -82,6 +82,11 @@ subnqn = "nqn.2024-01.io.curvine:subsystem2"
 # Customer service configuration.
 [client]
 
+[transfer]
+# Set to true to start the standalone Transfer service. Local SQLite storage,
+# replica metadata reader and localhost:9010 are inferred by default.
+enabled = false
+
 # fuse configuration
 [fuse]
 # Kernel-side metadata cache timeouts (milliseconds).

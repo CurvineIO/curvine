@@ -14,12 +14,9 @@
 
 #![allow(unused)]
 
-use crate::err_box;
-use crate::io::IOResult;
 use crate::sys::pipe::BorrowedFd;
-use crate::sys::{CInt, RawIO};
-use crate::{io_loop_check, sys};
-use std::io::IoSlice;
+use crate::sys::{self, CInt, RawIO, SysResult};
+use std::io::{ErrorKind, IoSlice};
 use tokio::io::Interest;
 
 #[cfg(target_os = "linux")]
@@ -38,7 +35,7 @@ type AsyncInner = tokio::io::unix::AsyncFd<BorrowedFd>;
 pub struct AsyncFd(AsyncInner);
 
 impl AsyncFd {
-    pub fn new(fd: BorrowedFd) -> IOResult<AsyncFd> {
+    pub fn new(fd: BorrowedFd) -> SysResult<AsyncFd> {
         #[cfg(not(target_os = "linux"))]
         {
             Ok(AsyncFd(fd))
@@ -47,7 +44,10 @@ impl AsyncFd {
         #[cfg(target_os = "linux")]
         {
             if fd.is_blocking() {
-                err_box!("Blocking pipes cannot use async io")
+                sys_error!(
+                    ErrorKind::InvalidInput,
+                    "Blocking pipes cannot use async io"
+                )
             } else {
                 let async_fd = UnixAsyncFd::new(fd)?;
                 Ok(AsyncFd(async_fd))
@@ -55,7 +55,7 @@ impl AsyncFd {
         }
     }
 
-    pub fn create(fd: BorrowedFd) -> IOResult<Option<AsyncFd>> {
+    pub fn create(fd: BorrowedFd) -> SysResult<Option<AsyncFd>> {
         if fd.is_blocking() {
             Ok(None)
         } else {
@@ -76,10 +76,10 @@ impl AsyncFd {
         }
     }
 
-    pub async fn writable(&self) -> IOResult<()> {
+    pub async fn writable(&self) -> SysResult<()> {
         #[cfg(not(target_os = "linux"))]
         {
-            err_box!("unsupported operation")
+            sys_error!(ErrorKind::Unsupported, "unsupported operation")
         }
 
         #[cfg(target_os = "linux")]
@@ -89,10 +89,10 @@ impl AsyncFd {
         }
     }
 
-    pub async fn readable(&self) -> IOResult<()> {
+    pub async fn readable(&self) -> SysResult<()> {
         #[cfg(not(target_os = "linux"))]
         {
-            err_box!("unsupported operation")
+            sys_error!(ErrorKind::Unsupported, "unsupported operation")
         }
 
         #[cfg(target_os = "linux")]
@@ -105,31 +105,25 @@ impl AsyncFd {
     pub async fn async_io<R>(
         &self,
         interest: Interest,
-        mut f: impl FnMut(&BorrowedFd) -> IOResult<R>,
-    ) -> IOResult<R> {
+        mut f: impl FnMut(&BorrowedFd) -> SysResult<R>,
+    ) -> SysResult<R> {
         #[cfg(not(target_os = "linux"))]
         {
-            err_box!("unsupported operation")
+            sys_error!(ErrorKind::Unsupported, "unsupported operation")
         }
 
         #[cfg(target_os = "linux")]
         {
-            let res = self
-                .0
-                .async_io(interest, |inner| match f(inner) {
-                    Ok(res) => Ok(res),
-                    Err(e) => Err(e.into_raw()),
-                })
-                .await?;
+            let res = self.0.async_io(interest, |inner| f(inner)).await?;
             Ok(res)
         }
     }
 
-    pub async fn async_write<R>(&self, f: impl FnMut(&BorrowedFd) -> IOResult<R>) -> IOResult<R> {
+    pub async fn async_write<R>(&self, f: impl FnMut(&BorrowedFd) -> SysResult<R>) -> SysResult<R> {
         self.async_io(Interest::WRITABLE, f).await
     }
 
-    pub async fn async_read<R>(&self, f: impl FnMut(&BorrowedFd) -> IOResult<R>) -> IOResult<R> {
+    pub async fn async_read<R>(&self, f: impl FnMut(&BorrowedFd) -> SysResult<R>) -> SysResult<R> {
         self.async_io(Interest::READABLE, f).await
     }
 
@@ -146,13 +140,27 @@ impl AsyncFd {
         }
     }
 
-    // Write data into fd.
-    pub async fn write_iov(&self, len: usize, iov: &[IoSlice<'_>]) -> IOResult<()> {
-        let len = len as CInt;
-        loop {
-            let res = self.async_write(|fd| sys::writev(fd.fd(), iov)).await;
+    // Write data into fd. A short writev is normal on non-blocking fds, so the
+    // remaining iovec view is advanced and the write resumed until `len` bytes land.
+    pub async fn write_iov(&self, len: usize, iov: &[IoSlice<'_>]) -> SysResult<()> {
+        let mut written = 0usize;
+        while written < len {
+            let res = if written == 0 {
+                self.async_write(|fd| sys::writev(fd.fd(), iov)).await
+            } else {
+                let remaining = sys::skip_iov_bytes(iov, written);
+                self.async_write(|fd| sys::writev(fd.fd(), &remaining))
+                    .await
+            };
 
-            io_loop_check!(res, len)?;
+            match res {
+                Ok(0) => {
+                    return sys_error!(ErrorKind::WriteZero, "writev returned 0");
+                }
+                Ok(transferred) => written += transferred as usize,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => continue,
+                Err(error) => return Err(error),
+            }
         }
 
         Ok(())

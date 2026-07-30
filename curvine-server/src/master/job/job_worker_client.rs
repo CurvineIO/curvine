@@ -41,13 +41,29 @@ impl JobWorkerClient {
         RpcUtils::proto_rpc(&self.client, self.timeout, code, header).await
     }
 
-    pub async fn submit_load_task(&self, task: LoadTaskInfo) -> FsResult<()> {
+    pub async fn submit_load_task_response(
+        &self,
+        task: LoadTaskInfo,
+    ) -> FsResult<SubmitTaskResponse> {
         let request = SubmitTaskRequest {
             task_type: JobTaskType::Load.into(),
             task_command: SerdeUtils::serialize(&task)?,
         };
 
-        let _: SubmitTaskResponse = self.rpc(RpcCode::SubmitTask, request).await?;
+        self.rpc(RpcCode::SubmitTask, request).await
+    }
+
+    pub async fn submit_load_task(&self, task: LoadTaskInfo) -> FsResult<()> {
+        let response = self.submit_load_task_response(task).await?;
+        if !response.accepted.unwrap_or(true) {
+            return Err(curvine_common::error::FsError::common(format!(
+                "Worker rejected load task {}: {}",
+                response.task_id,
+                response
+                    .reject_reason
+                    .unwrap_or_else(|| "no reason provided".to_string())
+            )));
+        }
         Ok(())
     }
 
@@ -58,5 +74,24 @@ impl JobWorkerClient {
 
         let _: CancelJobResponse = self.rpc(RpcCode::CancelJob, request).await?;
         Ok(())
+    }
+
+    pub async fn query_transfer_task(
+        &self,
+        job_id: impl AsRef<str>,
+        run_id: u64,
+        task_id: impl AsRef<str>,
+        attempt_id: u64,
+        worker_session_id: impl AsRef<str>,
+    ) -> FsResult<QueryTransferTaskResponse> {
+        let request = QueryTransferTaskRequest {
+            job_id: job_id.as_ref().to_string(),
+            run_id,
+            task_id: task_id.as_ref().to_string(),
+            attempt_id,
+            worker_session_id: worker_session_id.as_ref().to_string(),
+        };
+
+        self.rpc(RpcCode::QueryTransferTask, request).await
     }
 }

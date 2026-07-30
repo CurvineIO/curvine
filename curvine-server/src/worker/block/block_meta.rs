@@ -26,6 +26,8 @@ pub enum BlockState {
     Finalized = 0,
     Writing = 1,
     Recovering = 2,
+    Allocating = 3,
+    Finalizing = 4,
 }
 
 impl BlockState {
@@ -161,6 +163,10 @@ impl BlockMeta {
 
     pub fn is_active(&self) -> bool {
         matches!(self.state, BlockState::Finalized | BlockState::Writing)
+    }
+
+    pub fn is_transitioning(&self) -> bool {
+        matches!(self.state, BlockState::Allocating | BlockState::Finalizing)
     }
 
     pub fn dir_id(&self) -> u32 {

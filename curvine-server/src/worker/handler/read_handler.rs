@@ -97,17 +97,19 @@ impl ReadHandler {
         // Short-circuit local reads cannot synthesize sparse tails; force the
         // remote path when logical length exceeds physical worker bytes.
         let sc_path = if context.short_circuit && logical_len <= meta.len {
-            self.store.short_circuit(&meta)?
+            self.store.short_circuit_by_id(context.block_id)?
         } else {
             None
         };
 
-        let (is_short_circuit, path, file) = if let Some(path) = sc_path {
-            (true, path, None)
+        let (meta, is_short_circuit, path, file) = if let Some((meta, path)) = sc_path {
+            (meta, true, path, None)
         } else {
-            let file = self.store.open_reader(&meta, context.off, logical_len)?;
+            let (meta, file) =
+                self.store
+                    .open_reader_by_id(context.block_id, context.off, logical_len)?;
             let path = file.path().to_string();
-            (false, path, Some(file))
+            (meta, false, path, Some(file))
         };
         let label = if is_short_circuit { "local" } else { "remote" };
 

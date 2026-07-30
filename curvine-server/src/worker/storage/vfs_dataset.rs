@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use crate::worker::block::{BlockMeta, BlockState};
+use crate::worker::storage::layout::FileFinalizePlan;
 use crate::worker::storage::{
-    BlockLayout, BlockLayoutKind, BlockLayouts, Dataset, DirList, SpdkMetaStore, StorageRequest,
-    StorageVersion, VfsDir, VfsMetaStore,
+    BlockLayout, BlockLayoutKind, BlockLayouts, Dataset, DirList, FileLayout, SpdkMetaStore,
+    StorageRequest, StorageVersion, VfsDir, VfsMetaStore,
 };
 use curvine_common::conf::{ClusterConf, WorkerDataDir};
 use curvine_common::state::{ExtendedBlock, StorageInfo, StorageType};
@@ -43,6 +44,33 @@ pub(crate) struct RemovedBlockState {
     committed: Option<BlockMeta>,
     pub(crate) layout: BlockLayoutKind,
     pub(crate) dir: Arc<VfsDir>,
+}
+
+pub(crate) struct FileOpenReservation {
+    pending: BlockMeta,
+    committed: Option<BlockMeta>,
+    dir: Arc<VfsDir>,
+}
+
+impl FileOpenReservation {
+    pub(crate) fn prepare(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
+        match self.committed.as_ref() {
+            Some(committed) => FileLayout.prepare_write(&self.dir, committed, block),
+            None => FileLayout.allocate(&self.dir, block),
+        }
+    }
+}
+
+pub(crate) struct FileFinalizeReservation {
+    writing: BlockMeta,
+    pending: BlockMeta,
+    dir: Arc<VfsDir>,
+}
+
+impl FileFinalizeReservation {
+    pub(crate) fn prepare(&self, committed_len: i64) -> CommonResult<FileFinalizePlan> {
+        FileLayout::prepare_finalize(&self.dir, &self.pending, committed_len)
+    }
 }
 
 impl RemovedBlockState {
@@ -207,19 +235,226 @@ impl VfsDataset {
         self.meta
             .all_blocks()
             .into_iter()
-            .map(|meta| {
+            .filter_map(|meta| {
                 self.committed_rewrites
                     .get(&meta.id())
                     .cloned()
-                    .unwrap_or(meta)
+                    .or_else(|| (meta.state() != &BlockState::Allocating).then_some(meta))
             })
             .collect()
     }
 
     pub(crate) fn get_readable_block(&self, id: i64) -> Option<&BlockMeta> {
-        self.committed_rewrites
-            .get(&id)
-            .or_else(|| self.meta.get(id))
+        if let Some(committed) = self.committed_rewrites.get(&id) {
+            return Some(committed);
+        }
+        let meta = self.meta.get(id)?;
+        (meta.state() != &BlockState::Allocating).then_some(meta)
+    }
+
+    pub(crate) fn reserve_file_open(
+        &mut self,
+        block: &ExtendedBlock,
+    ) -> CommonResult<Option<FileOpenReservation>> {
+        if block.len < 0 {
+            return err_box!("Invalid file block size: {}", block.len);
+        }
+
+        match self.meta.get(block.id).cloned() {
+            Some(meta) => {
+                if meta.storage_type() == StorageType::SpdkDisk || !meta.is_final() {
+                    return Ok(None);
+                }
+
+                let dir = self
+                    .dir_list
+                    .get_dir(meta.dir_id())
+                    .ok_or_else(|| {
+                        orpc::err_msg!(format!("No storage directory found: {:?}", meta.dir_id()))
+                    })?
+                    .clone();
+                let required_bytes = meta.physical_bytes().max(block.len);
+                if required_bytes > dir.available() {
+                    return err_box!(
+                        "Not enough space in storage dir {} for block {} rewrite: need {}, available {}",
+                        meta.dir_id(),
+                        meta.id(),
+                        required_bytes,
+                        dir.available()
+                    );
+                }
+
+                let mut pending = BlockMeta::new(meta.id(), block.len, &dir);
+                pending.state = BlockState::Allocating;
+                pending.actual_len = required_bytes;
+                dir.reserve_space(false, required_bytes);
+                self.committed_rewrites.insert(meta.id(), meta.clone());
+                self.meta.put(pending.clone());
+
+                Ok(Some(FileOpenReservation {
+                    pending,
+                    committed: Some(meta),
+                    dir,
+                }))
+            }
+            None => {
+                if block.storage_type == StorageType::SpdkDisk {
+                    return Ok(None);
+                }
+
+                let dir = self
+                    .dir_list
+                    .choose_dir(StorageRequest::new(block.storage_type, block.len)?)?;
+                let mut pending = BlockMeta::with_tmp(block, &dir);
+                pending.state = BlockState::Allocating;
+                dir.reserve_space(false, pending.physical_bytes());
+                self.meta.put(pending.clone());
+
+                Ok(Some(FileOpenReservation {
+                    pending,
+                    committed: None,
+                    dir,
+                }))
+            }
+        }
+    }
+
+    pub(crate) fn complete_file_open(
+        &mut self,
+        reservation: &FileOpenReservation,
+        meta: BlockMeta,
+    ) -> CommonResult<BlockMeta> {
+        let pending = self.get_block_check(reservation.pending.id())?;
+        if pending.state() != &BlockState::Allocating {
+            return err_box!(
+                "block {} open reservation lost while in state {:?}",
+                pending.id(),
+                pending.state()
+            );
+        }
+        if meta.id() != pending.id() || meta.dir_id() != pending.dir_id() {
+            return err_box!(
+                "block {} open reservation returned different metadata",
+                pending.id()
+            );
+        }
+
+        self.meta.put(meta.clone());
+        Ok(meta)
+    }
+
+    pub(crate) fn rollback_file_open(
+        &mut self,
+        reservation: &FileOpenReservation,
+    ) -> CommonResult<()> {
+        let pending = self.meta.remove(reservation.pending.id()).ok_or_else(|| {
+            orpc::err_msg!(format!(
+                "block {} open reservation missing during rollback",
+                reservation.pending.id()
+            ))
+        })?;
+        if pending.state() != &BlockState::Allocating {
+            return err_box!(
+                "block {} open reservation changed to {:?} before rollback",
+                pending.id(),
+                pending.state()
+            );
+        }
+
+        reservation
+            .dir
+            .release_space(false, pending.physical_bytes());
+        if let Some(committed) = reservation.committed.as_ref() {
+            self.committed_rewrites.remove(&pending.id());
+            self.meta.put(committed.clone());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reserve_file_finalize(
+        &mut self,
+        block: &ExtendedBlock,
+    ) -> CommonResult<Option<FileFinalizeReservation>> {
+        let writing = self.get_block_check(block.id)?.clone();
+        if writing.storage_type() == StorageType::SpdkDisk
+            || writing.state() != &BlockState::Writing
+        {
+            return Ok(None);
+        }
+
+        let dir = self
+            .dir_list
+            .get_dir(writing.dir_id())
+            .ok_or_else(|| {
+                orpc::err_msg!(format!(
+                    "No storage directory found: {:?}",
+                    writing.dir_id()
+                ))
+            })?
+            .clone();
+        let mut pending = writing.clone();
+        pending.state = BlockState::Finalizing;
+        self.meta.put(pending.clone());
+        Ok(Some(FileFinalizeReservation {
+            writing,
+            pending,
+            dir,
+        }))
+    }
+
+    pub(crate) fn publish_file_finalize(
+        &mut self,
+        reservation: &FileFinalizeReservation,
+        plan: FileFinalizePlan,
+    ) -> CommonResult<BlockMeta> {
+        let pending = self.get_block_check(reservation.pending.id())?.clone();
+        if pending.state() != &BlockState::Finalizing {
+            return err_box!(
+                "block {} finalize reservation lost while in state {:?}",
+                pending.id(),
+                pending.state()
+            );
+        }
+        let final_meta = plan.final_meta();
+        if final_meta.id() != pending.id() || final_meta.dir_id() != pending.dir_id() {
+            return err_box!(
+                "block {} finalize plan returned different metadata",
+                pending.id()
+            );
+        }
+
+        // The plan already performed stat and directory preparation. Hold this
+        // lock only while the rename becomes visible and metadata is published.
+        let final_meta = FileLayout::publish_finalize(plan)?;
+        if let Some(committed) = self.committed_rewrites.remove(&pending.id()) {
+            reservation
+                .dir
+                .release_space(committed.is_final(), committed.physical_bytes());
+        }
+        reservation
+            .dir
+            .release_space(false, pending.physical_bytes());
+        reservation
+            .dir
+            .reserve_space(true, final_meta.physical_bytes());
+        self.meta.put(final_meta.clone());
+        Ok(final_meta)
+    }
+
+    pub(crate) fn rollback_file_finalize(
+        &mut self,
+        reservation: &FileFinalizeReservation,
+    ) -> CommonResult<()> {
+        let pending = self.get_block_check(reservation.pending.id())?;
+        if pending.state() != &BlockState::Finalizing {
+            return err_box!(
+                "block {} finalize reservation changed to {:?} before rollback",
+                pending.id(),
+                pending.state()
+            );
+        }
+        self.meta.put(reservation.writing.clone());
+        Ok(())
     }
 
     #[cfg(test)]
@@ -580,6 +815,8 @@ mod test {
         drop(ds);
         let ds = create_data_set(false, "init");
         assert_eq!(ds.num_blocks(), 11);
+        assert_eq!(ds.all_blocks().len(), 11);
+        assert!(ds.get_readable_block(1).is_some());
         Ok(())
     }
     #[test]

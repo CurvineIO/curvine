@@ -287,7 +287,7 @@ impl MountCommand {
         if !configs.is_empty() {
             println!("Configuration:");
             for (key, value) in &configs {
-                println!("  {} = {}", key, value);
+                println!("  {} = {}", key, display_config_value(key, value));
             }
             println!("\n");
         }
@@ -297,7 +297,7 @@ impl MountCommand {
 
         if !self.update && self.check_path_consist && ufs_path.authority_path() != cv_path.path() {
             return err_box!(
-                "with --check-path, ufs path and cv path must be consistent. ufs: {}, cv: {}",
+                "with --check-path-consist, UFS and Curvine paths must match. UFS: {}, Curvine: {}",
                 ufs_path.authority_path(),
                 cv_path.path()
             );
@@ -312,11 +312,19 @@ impl MountCommand {
             &ufs_path,
             mnt_opts.add_properties.clone(),
             mnt_opts.provider,
-        )?;
-        if let Err(e) = ufs.list_status(&ufs_path).await {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
+        )
+        .map_err(|_| {
+            FsError::common(format!(
+                "Unable to initialize UFS {}. Verify the URI, mount configuration, and credentials.",
+                ufs_path.full_path()
+            ))
+        })?;
+        ufs.list_status(&ufs_path).await.map_err(|_| {
+            FsError::common(format!(
+                "Unable to access UFS {}. Verify the endpoint, credentials, and network connectivity.",
+                ufs_path.full_path()
+            ))
+        })?;
 
         handle_rpc_result(fs.mount(&ufs_path, &cv_path, mnt_opts)).await;
         println!("│ ✅️ mount success.");
@@ -557,4 +565,24 @@ impl MountCommand {
 
         Ok(opts.build())
     }
+}
+
+fn display_config_value<'a>(key: &str, value: &'a str) -> &'a str {
+    if is_sensitive_config_key(key) {
+        "******"
+    } else {
+        value
+    }
+}
+
+fn is_sensitive_config_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("credential")
+        || key.contains("secret")
+        || key.contains("token")
+        || key.contains("password")
+        || key.contains("access_key")
+        || key.ends_with(".access")
+        || key.ends_with(".ak")
+        || key.ends_with(".sk")
 }

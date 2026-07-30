@@ -120,7 +120,7 @@ impl WorkerReplicationManager {
             Ok(permit) => permit,
             Err(e) => return err_box!("replication semaphore closed: {}", e),
         };
-        let block_meta = self.block_store.get_block(job.block_id)?;
+        let (block_meta, mut reader) = self.block_store.open_reader_by_id(job.block_id, 0, 0)?;
         if block_meta.state != BlockState::Finalized {
             return err_box!("Block: {} is not finalized", job.block_id);
         }
@@ -145,9 +145,6 @@ impl WorkerReplicationManager {
             target_capacity,
         )
         .await?;
-        let mut reader = self
-            .block_store
-            .open_reader(&block_meta, 0, block_meta.len)?;
         let mut remaining = block_meta.len;
         while remaining > 0 {
             let size = remaining.min(self.replicate_chunk_size as i64);

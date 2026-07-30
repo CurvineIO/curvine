@@ -26,6 +26,7 @@ use curvine_storage_spdk::SpdkEnv;
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::info;
 use once_cell::sync::OnceCell;
+use orpc::common::Utils;
 use orpc::common::{LocalTime, Logger};
 use orpc::error::StringError;
 use orpc::handler::HandlerService;
@@ -52,12 +53,16 @@ pub struct WorkerService {
 }
 
 impl WorkerService {
-    pub fn with_conf(conf: &ClusterConf, rt: Arc<Runtime>) -> CommonResult<Self> {
+    pub fn with_conf(
+        conf: &ClusterConf,
+        rt: Arc<Runtime>,
+        worker_session_id: String,
+    ) -> CommonResult<Self> {
         let fault_http = FaultHttpControl::from_env(&conf.fault_injection)
             .map_err(|error| CommonError::from(error.to_string()))?;
         let store: BlockStore = BlockStore::new(&conf.cluster_id, conf)?;
 
-        let task_manager = TaskManager::with_rt(rt.clone(), conf)?;
+        let task_manager = TaskManager::with_rt(rt.clone(), conf, worker_session_id)?;
 
         let replication_manager =
             WorkerReplicationManager::new(&store, &rt, conf, &task_manager.get_fs_context());
@@ -185,7 +190,9 @@ impl Worker {
         }
 
         let rt = Arc::new(conf.worker_server_conf().create_runtime());
-        let service: WorkerService = WorkerService::with_conf(&conf, rt.clone())?;
+        let worker_session_id = Utils::uuid();
+        let service: WorkerService =
+            WorkerService::with_conf(&conf, rt.clone(), worker_session_id.clone())?;
         let worker_id = service.store.worker_id()?;
 
         CLUSTER_CONF.get_or_init(|| conf.clone());
@@ -209,6 +216,7 @@ impl Worker {
             rt.clone(),
             &conf,
             addr.clone(),
+            worker_session_id,
             block_store.clone(),
             rpc_server.new_state_ctl(),
         )?;

@@ -16,8 +16,9 @@ use crate::common::UfsFactory;
 use crate::worker::task::load_task_runner::LoadTaskRunner;
 use crate::worker::task::{TaskContext, TaskStore};
 use curvine_client::file::{CurvineFileSystem, FsContext};
+use curvine_client::rpc::TransferClient;
 use curvine_common::conf::ClusterConf;
-use curvine_common::state::{JobTaskState, LoadTaskInfo};
+use curvine_common::state::{JobTaskProgress, LoadTaskInfo, TransferTaskReportInfo};
 use curvine_common::FsResult;
 use dashmap::mapref::entry::Entry;
 use log::{debug, info, warn};
@@ -30,9 +31,32 @@ pub struct TaskManager {
     fs: CurvineFileSystem,
     tasks: TaskStore,
     factory: Arc<UfsFactory>,
+    transfer_client: Option<TransferClient>,
+    worker_session_id: String,
     progress_interval_ms: u64,
     task_timeout_ms: u64,
     worker_task_semaphore: Arc<Semaphore>,
+}
+
+pub struct TaskSubmitResult {
+    pub accepted: bool,
+    pub reject_reason: String,
+}
+
+impl TaskSubmitResult {
+    fn accepted() -> Self {
+        Self {
+            accepted: true,
+            reject_reason: String::new(),
+        }
+    }
+
+    fn rejected(reason: impl Into<String>) -> Self {
+        Self {
+            accepted: false,
+            reject_reason: reason.into(),
+        }
+    }
 }
 
 impl TaskManager {
@@ -69,18 +93,25 @@ impl TaskManager {
     /// # Limit concurrent load tasks to prevent resource exhaustion
     /// worker_max_concurrent_tasks = 10
     /// ```
-    pub fn with_rt(rt: Arc<Runtime>, conf: &ClusterConf) -> FsResult<Self> {
+    pub fn with_rt(
+        rt: Arc<Runtime>,
+        conf: &ClusterConf,
+        worker_session_id: impl Into<String>,
+    ) -> FsResult<Self> {
         let mut new_conf = conf.clone();
         new_conf.client.hostname = "localhost".to_string();
 
         let fs = CurvineFileSystem::with_rt(new_conf, rt.clone())?;
         let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
+        let transfer_client = TransferClient::with_context(&fs.fs_context()).ok();
         let worker_task_semaphore = Arc::new(Semaphore::new(conf.job.worker_max_concurrent_tasks));
         let mgr = Self {
             rt,
             fs,
             tasks: TaskStore::new(),
             factory,
+            transfer_client,
+            worker_session_id: worker_session_id.into(),
             progress_interval_ms: conf.job.task_report_interval.as_millis() as u64,
             task_timeout_ms: conf.job.task_timeout.as_millis() as u64,
             worker_task_semaphore,
@@ -128,14 +159,60 @@ impl TaskManager {
     ///    - Automatically releases the permit on completion
     ///    - Removes the map entry **only if it still points at its own
     ///      context** (a later `submit_task` may have superseded it)
-    pub fn submit_task(&self, task: LoadTaskInfo) -> FsResult<()> {
+    pub fn submit_task(&self, task: LoadTaskInfo) -> FsResult<TaskSubmitResult> {
+        if let Some(report) = &task.transfer_report {
+            if report.report_endpoints.is_empty()
+                && report.report_target.is_empty()
+                && self.transfer_client.is_none()
+            {
+                return Ok(TaskSubmitResult::rejected(format!(
+                    "Reject transfer task {} because no Transfer report endpoint is available",
+                    task.task_id
+                )));
+            }
+            if report.worker_session_id != self.worker_session_id {
+                return Ok(TaskSubmitResult::rejected(format!(
+                    "Reject transfer task {} for stale worker session {}, current session {}",
+                    task.task_id, report.worker_session_id, self.worker_session_id
+                )));
+            }
+        }
+
         let task_id = task.task_id.clone();
         let context = Arc::new(TaskContext::new(task));
 
         match self.tasks.entry(task_id.clone()) {
             Entry::Occupied(mut occ) => {
+                if let Some(new_report) = &context.info.transfer_report {
+                    let old_report = occ.get().info.transfer_report.as_ref();
+                    if let Some(old_report) = old_report {
+                        if old_report.run_id == new_report.run_id
+                            && old_report.attempt_id == new_report.attempt_id
+                        {
+                            debug!(
+                                "ignore duplicate transfer task submit {}, attempt {}",
+                                task_id, new_report.attempt_id
+                            );
+                            return Ok(TaskSubmitResult::accepted());
+                        }
+                        if old_report.run_id > new_report.run_id
+                            || (old_report.run_id == new_report.run_id
+                                && old_report.attempt_id > new_report.attempt_id)
+                        {
+                            return Ok(TaskSubmitResult::rejected(format!(
+                                "Reject stale transfer task {} run {} attempt {}, current run {} attempt {}",
+                                task_id,
+                                new_report.run_id,
+                                new_report.attempt_id,
+                                old_report.run_id,
+                                old_report.attempt_id
+                            )));
+                        }
+                    }
+                }
+
                 let old = occ.insert(context.clone());
-                old.update_state(JobTaskState::Canceled, "superseded by new submit");
+                old.set_canceled("superseded by new submit");
                 warn!(
                     "cancel duplicate task {} (source_path={})",
                     old.info.task_id, old.info.source_path
@@ -155,6 +232,7 @@ impl TaskManager {
             context.clone(),
             self.fs.clone(),
             self.factory.clone(),
+            self.transfer_client.clone(),
             self.progress_interval_ms,
             self.task_timeout_ms,
         );
@@ -165,9 +243,10 @@ impl TaskManager {
 
         // Spawn task with concurrency control
         self.rt.spawn(async move {
+            let mut remove_task = true;
             match semaphore.acquire().await {
                 Ok(permit) => {
-                    runner.run().await;
+                    remove_task = runner.run().await;
                     drop(permit);
                 }
                 Err(e) => {
@@ -175,10 +254,12 @@ impl TaskManager {
                 }
             }
 
-            let _ = tasks.remove_if(&task_id, |_, ctx| Arc::ptr_eq(ctx, &context_this));
+            if remove_task {
+                let _ = tasks.remove_if(&task_id, |_, ctx| Arc::ptr_eq(ctx, &context_this));
+            }
         });
 
-        Ok(())
+        Ok(TaskSubmitResult::accepted())
     }
 
     pub fn cancel_job(&self, job_id: impl AsRef<str>) -> FsResult<()> {
@@ -193,6 +274,31 @@ impl TaskManager {
         Ok(())
     }
 
+    pub fn query_transfer_task(
+        &self,
+        job_id: &str,
+        task_id: &str,
+        run_id: u64,
+        attempt_id: u64,
+        worker_session_id: &str,
+    ) -> FsResult<Option<JobTaskProgress>> {
+        let Some(task) = self.tasks.get(task_id) else {
+            return Ok(None);
+        };
+        if task.info.job.job_id != job_id {
+            return Ok(None);
+        }
+        if !transfer_report_matches(
+            task.info.transfer_report.as_ref(),
+            run_id,
+            attempt_id,
+            worker_session_id,
+        ) {
+            return Ok(None);
+        }
+        Ok(Some(task.progress()))
+    }
+
     pub fn get_fs_context(&self) -> Arc<FsContext> {
         self.fs.fs_context()
     }
@@ -200,4 +306,19 @@ impl TaskManager {
     pub fn available_worker_task_permits(&self) -> usize {
         self.worker_task_semaphore.available_permits()
     }
+}
+
+fn transfer_report_matches(
+    report: Option<&TransferTaskReportInfo>,
+    run_id: u64,
+    attempt_id: u64,
+    worker_session_id: &str,
+) -> bool {
+    matches!(
+        report,
+        Some(report)
+            if report.run_id == run_id
+                && report.attempt_id == attempt_id
+                && report.worker_session_id == worker_session_id
+    )
 }

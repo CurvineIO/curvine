@@ -17,7 +17,9 @@ use crate::file::{FsClient, FsContext};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
-use curvine_model::{CommitBlock, FileAllocOpts, FileBlocks, FileStatus, WriteFileBlocks};
+use curvine_model::{
+    CommitBlock, FileAllocOpts, FileBlocks, FileStatus, SetAttrOpts, WriteFileBlocks,
+};
 use fxhash::FxHasher;
 use linked_hash_map::LinkedHashMap;
 use log::warn;
@@ -169,7 +171,7 @@ impl FsWriterBase {
     }
 
     pub async fn flush(&mut self) -> FsResult<()> {
-        self.complete0(true).await?;
+        self.complete0(true, None).await?;
         Ok(())
     }
 
@@ -182,7 +184,12 @@ impl FsWriterBase {
     // Write is completed, perform the following operations
     // 1. Submit the last block.
     pub async fn complete(&mut self) -> FsResult<()> {
-        self.complete0(false).await?;
+        self.complete0(false, None).await?;
+        Ok(())
+    }
+
+    pub async fn complete_with_attr(&mut self, opts: Option<SetAttrOpts>) -> FsResult<()> {
+        self.complete0(false, opts).await?;
         Ok(())
     }
 
@@ -273,6 +280,7 @@ impl FsWriterBase {
                     committed_len,
                     commit_blocks.clone(),
                     true,
+                    None,
                 )
                 .await;
             if let Err(e) = result {
@@ -292,7 +300,11 @@ impl FsWriterBase {
         }
     }
 
-    async fn complete0(&mut self, only_flush: bool) -> FsResult<Option<FileBlocks>> {
+    async fn complete0(
+        &mut self,
+        only_flush: bool,
+        set_attr_opts: Option<SetAttrOpts>,
+    ) -> FsResult<Option<FileBlocks>> {
         if let Some(writer) = self.cur_writer.take() {
             self.cache_writers.insert(writer.block_id(), writer);
         };
@@ -336,6 +348,7 @@ impl FsWriterBase {
                 self.len,
                 commit_blocks.clone(),
                 only_flush,
+                set_attr_opts,
             )
             .await;
         match result {

@@ -100,7 +100,7 @@ impl<T: FileSystem> FuseSender<T> {
                     queue_guard,
                 } => {
                     mark_dequeued(queue_guard);
-                    let id = data.header.unique;
+                    let id = data.unique();
                     let response_bytes = data.len();
 
                     let write_start = mono_now();
@@ -158,7 +158,7 @@ impl<T: FileSystem> FuseSender<T> {
                 } => {
                     // Same dequeue-point dec as the request path.
                     mark_dequeued(queue_guard);
-                    let id = data.header.unique;
+                    let id = data.unique();
                     let metrics = FuseMetrics::get();
                     match self.send(data).await {
                         Ok(()) => {
@@ -178,7 +178,7 @@ impl<T: FileSystem> FuseSender<T> {
                 }
 
                 FuseTask::Reply(reply) => {
-                    let id = reply.header.unique;
+                    let id = reply.unique();
                     if let Err(e) = self.send(reply).await {
                         if e.raw_error().raw_os_error() != Some(libc::ENOENT) {
                             warn!("error send unique {}: {}", id, e);
@@ -192,10 +192,10 @@ impl<T: FileSystem> FuseSender<T> {
 
     pub async fn send(&mut self, rep: ResponseData) -> IOResult<()> {
         if self.debug {
-            info!("reply {:?}", rep.header);
+            info!("reply {:?}", rep.header());
         }
 
-        let len = rep.header.len as usize;
+        let len = rep.len() as usize;
         if self.pipe2.is_some() && len >= SPLICE_THRESHOLD {
             self.splice(rep).await
         } else {
@@ -224,12 +224,12 @@ impl<T: FileSystem> FuseSender<T> {
         let (len, iovec) = rep.as_iovec()?;
         if let Err(e) = pipe2.write_iov(len, &iovec).await {
             Self::drain_pipe(pipe2);
-            return Err(e);
+            return Err(e.into());
         }
 
         if let Err(e) = pipe2.read_io(&self.kernel_fd, len).await {
             Self::drain_pipe(pipe2);
-            return Err(e);
+            return Err(e.into());
         }
 
         Ok(())
@@ -246,7 +246,7 @@ impl<T: FileSystem> FuseSender<T> {
                 Ok(n) if n > 0 => continue,
                 Ok(_) => break, // EOF
                 Err(e) => {
-                    if e.raw_error().raw_os_error() == Some(libc::EINTR) {
+                    if e.raw_os_error() == Some(libc::EINTR) {
                         continue; // interrupted; retry
                     }
                     // EAGAIN/EWOULDBLOCK: pipe is empty; any other error: stop.
