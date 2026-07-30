@@ -82,12 +82,15 @@ impl WorkerMap {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert(
         &mut self,
         addr: WorkerAddress,
         weight: u32,
         worker_session_id: String,
         transfer_capabilities: TransferWorkerCapabilities,
+        software_version: String,
+        startup_time_ms: u64,
         storages: Vec<StorageInfo>,
     ) -> FsResult<()> {
         self.ensure_worker_id_addr(&addr)?;
@@ -104,6 +107,8 @@ impl WorkerMap {
         let mut info = WorkerInfo::new(addr, weight);
         info.worker_session_id = worker_session_id;
         info.transfer_capabilities = transfer_capabilities;
+        info.software_version = software_version;
+        info.startup_time_ms = startup_time_ms;
         let worker_id = info.worker_id();
         for item in storages {
             info.add_storage(item);

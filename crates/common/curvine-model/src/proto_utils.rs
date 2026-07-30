@@ -353,6 +353,8 @@ impl ProtoUtils {
             transfer_query_task: Some(src.transfer_capabilities.query_task),
             transfer_attempt_safe_output: Some(src.transfer_capabilities.attempt_safe_output),
             transfer_source_read_plan: Some(src.transfer_capabilities.source_read_plan),
+            software_version: Some(src.software_version),
+            startup_time_ms: Some(src.startup_time_ms),
             storage_map: Default::default(),
         };
 
@@ -402,6 +404,8 @@ impl ProtoUtils {
                     attempt_safe_output: info.transfer_attempt_safe_output.unwrap_or(false),
                     source_read_plan: info.transfer_source_read_plan.unwrap_or(false),
                 },
+                software_version: info.software_version.unwrap_or_default(),
+                startup_time_ms: info.startup_time_ms.unwrap_or_default(),
                 ..Default::default()
             };
             for (k, v) in info.storage_map {

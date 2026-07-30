@@ -55,6 +55,8 @@ pub struct WorkerInfo {
     pub address: WorkerAddress,
     #[serde(default = "WorkerInfo::default_weight")]
     pub weight: u32,
+    pub software_version: String,
+    pub startup_time_ms: u64,
     pub capacity: i64,
     pub available: i64,
     pub fs_used: i64,
@@ -77,6 +79,8 @@ impl WorkerInfo {
         Self {
             address: addr,
             weight,
+            software_version: String::new(),
+            startup_time_ms: 0,
             capacity: 0,
             available: 0,
             fs_used: 0,
@@ -151,6 +155,8 @@ impl Default for WorkerInfo {
         Self {
             address,
             weight: Self::default_weight(),
+            software_version: String::new(),
+            startup_time_ms: 0,
             capacity: 1 << 30,
             available: 1 << 30,
             fs_used: 0,

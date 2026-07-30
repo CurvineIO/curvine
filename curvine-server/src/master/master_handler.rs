@@ -574,6 +574,8 @@ impl MasterHandler {
                 attempt_safe_output: header.transfer_attempt_safe_output.unwrap_or(false),
                 source_read_plan: header.transfer_source_read_plan.unwrap_or(false),
             },
+            header.software_version,
+            u64::try_from(header.fs_ctime).unwrap_or_default(),
             ProtoUtils::storage_info_list_from_pb(header.storages),
         )?;
         Ok(cmds)

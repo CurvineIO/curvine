@@ -20,6 +20,7 @@ use curvine_common::state::{
     BlockReportInfo, HeartbeatStatus, StorageInfo, TransferWorkerCapabilities, WorkerAddress,
 };
 use curvine_common::utils::ProtoUtils;
+use curvine_common::version;
 use orpc::CommonResult;
 use std::sync::Arc;
 
@@ -34,6 +35,8 @@ pub struct MasterClient {
     pub(crate) worker_addr: WorkerAddress,
     pub(crate) worker_weight: u32,
     pub(crate) worker_session_id: String,
+    pub(crate) software_version: String,
+    pub(crate) startup_time_ms: u64,
 }
 
 impl MasterClient {
@@ -44,6 +47,7 @@ impl MasterClient {
         worker_addr: WorkerAddress,
         worker_weight: u32,
         worker_session_id: impl Into<String>,
+        startup_time_ms: u64,
     ) -> Self {
         // Directly reused file system client service.
         let fs_client = FsClient::new(context);
@@ -54,6 +58,8 @@ impl MasterClient {
             worker_addr,
             worker_weight,
             worker_session_id: worker_session_id.into(),
+            software_version: version::VERSION.to_string(),
+            startup_time_ms,
         }
     }
 
@@ -76,6 +82,8 @@ impl MasterClient {
             transfer_query_task: Some(transfer_capabilities.query_task),
             transfer_attempt_safe_output: Some(transfer_capabilities.attempt_safe_output),
             transfer_source_read_plan: Some(transfer_capabilities.source_read_plan),
+            software_version: self.software_version.clone(),
+            fs_ctime: self.startup_time_ms as i64,
             ..Default::default()
         };
         for item in storages {

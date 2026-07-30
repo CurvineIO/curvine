@@ -54,6 +54,7 @@ impl BlockActor {
         worker_session_id: String,
         store: BlockStore,
         worker_ctl: StateCtl,
+        startup_time_ms: u64,
     ) -> CommonResult<BlockActor> {
         let context = FsContext::with_rt(conf.clone(), rt)?;
         let context = Arc::new(context);
@@ -64,6 +65,7 @@ impl BlockActor {
             worker_addr,
             conf.worker.weight,
             worker_session_id,
+            startup_time_ms,
         );
         let executor = GroupExecutor::new(
             "worker-block-executor",

@@ -212,6 +212,7 @@ impl Worker {
             rpc_port: net_addr.port as u32,
             web_port: conf.worker.web_port as u32,
         };
+        let start_ms = LocalTime::mills();
         let block_actor = BlockActor::new(
             rt.clone(),
             &conf,
@@ -219,6 +220,7 @@ impl Worker {
             worker_session_id,
             block_store.clone(),
             rpc_server.new_state_ctl(),
+            start_ms,
         )?;
 
         let master_client = block_actor.client.clone();
@@ -239,7 +241,7 @@ impl Worker {
         });
 
         let worker = Self {
-            start_ms: LocalTime::mills(),
+            start_ms,
             worker_id,
             addr,
             rpc_server: Some(rpc_server),

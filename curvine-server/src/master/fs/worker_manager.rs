@@ -57,6 +57,8 @@ impl WorkerManager {
         weight: u32,
         worker_session_id: String,
         transfer_capabilities: TransferWorkerCapabilities,
+        software_version: String,
+        startup_time_ms: u64,
         storages: Vec<StorageInfo>,
     ) -> FsResult<Vec<WorkerCommand>> {
         // The cluster id must match to prevent misregistration.
@@ -101,6 +103,8 @@ impl WorkerManager {
             weight,
             worker_session_id,
             transfer_capabilities,
+            software_version,
+            startup_time_ms,
             storages,
         )?;
         Ok(cmds)

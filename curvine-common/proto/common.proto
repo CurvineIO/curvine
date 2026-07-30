@@ -176,6 +176,8 @@ message WorkerInfoProto {
     optional bool transfer_query_task = 13 [default = false];
     optional bool transfer_attempt_safe_output = 14 [default = false];
     optional bool transfer_source_read_plan = 15 [default = false];
+    optional string software_version = 16 [default = ""];
+    optional uint64 startup_time_ms = 17 [default = 0];
 }
 
 message FileAllocOptsProto {
