@@ -5,9 +5,9 @@ Rust SDK facade for Java (JNI), Python (PyO3), and Rust consumers. The public co
 | Path | Role |
 |------|------|
 | `Cargo.toml` | Compatibility facade and release-profile features |
-| `../curvine-sdk-core/` | FFI-neutral session, filesystem, reader/writer, master, and job helpers |
-| `../curvine-libsdk-java/` | Java JNI ABI and Java-specific conversion helpers |
-| `../curvine-libsdk-python/` | Python PyO3 ABI and wheel metadata |
+| `../crates/sdk/curvine-sdk-core/` | FFI-neutral session, filesystem, reader/writer, master, and job helpers |
+| `../crates/sdk/curvine-libsdk-java/` | Java JNI ABI and Java-specific conversion helpers |
+| `../crates/sdk/curvine-libsdk-python/` | Python PyO3 ABI and wheel metadata |
 | `java/` | Hadoop `FileSystem`, JUnit |
 | `python/` | `curvinefs`, package `curvine_libsdk` (re-exports PyO3 module `curvine_libsdk._native`), tests |
 
@@ -97,7 +97,7 @@ Then (no `PYTHONPATH` needed):
 from curvinefs.curvineFileSystem import CurvineFileSystem
 ```
 
-Runtime deps (**`protobuf`**, **`fsspec`**) come from **`curvine-libsdk-python/pyproject.toml`**.
+Runtime deps (**`protobuf`**, **`fsspec`**) come from **`crates/sdk/curvine-libsdk-python/pyproject.toml`**.
 
 **4. Smoke / integration tests** — cluster + default `etc/curvine-cluster.toml`; optional **`CURVINE_CONF_FILE`**, **`CURVINE_TEST_CV_PATH`**. Example after install:
 
@@ -117,4 +117,4 @@ JDK **8**, Maven **≥ 3.8.1**. From workspace root, **`make build`** (with **`j
 
 ## Local dev (without `make`)
 
-From **`curvine-libsdk-python/`**: own venv, **`pip install maturin`**, **`maturin develop --release --no-default-features --features extension-module`**, then run **`protoc`** into **`../curvine-libsdk/python/curvine_libsdk/_proto/`** and apply the same **`sed`** relative-import fix as **`build/build.sh`**, **`export PYTHONPATH=../curvine-libsdk/python`**.
+From **`crates/sdk/curvine-libsdk-python/`**: own venv, **`pip install maturin`**, **`maturin develop --release --no-default-features --features extension-module`**, then run **`protoc`** into **`../../curvine-libsdk/python/curvine_libsdk/_proto/`** and apply the same **`sed`** relative-import fix as **`build/build.sh`**, **`export PYTHONPATH=../../curvine-libsdk/python`**.
