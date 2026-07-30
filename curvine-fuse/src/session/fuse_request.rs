@@ -14,12 +14,13 @@
 
 use crate::fs::operator::*;
 use crate::raw::fuse_abi::{
-    fuse_batch_forget_in, fuse_forget_one, fuse_in_header, fuse_ioctl_in, fuse_write_in,
+    fuse_batch_forget_in, fuse_forget_one, fuse_in_header, fuse_init_in, fuse_init_in_ext_tail,
+    fuse_ioctl_in, fuse_write_in,
 };
 use crate::session::fuse_decoder::FuseDecoder;
 use crate::session::FuseOpCode::{self, *};
 use crate::FuseResult;
-use crate::FUSE_IN_HEADER_LEN;
+use crate::{FUSE_INIT_EXT, FUSE_IN_HEADER_LEN};
 use bytes::Bytes;
 use orpc::{err_box, CommonResult};
 use std::fmt::{Display, Formatter};
@@ -113,10 +114,29 @@ impl FuseRequest {
         let header: &fuse_in_header = decoder.get_struct()?;
 
         let op = match self.opcode {
-            FUSE_INIT => FuseOperator::Init(Init {
-                header,
-                arg: decoder.get_struct()?,
-            }),
+            FUSE_INIT => {
+                let arg: &fuse_init_in = decoder.get_struct()?;
+                match decoder.len() {
+                    0 if arg.flags & FUSE_INIT_EXT == 0 => {}
+                    0 => return err_box!("FUSE_INIT_EXT set without extended init payload"),
+                    len if len == size_of::<fuse_init_in_ext_tail>() => {
+                        if arg.flags & FUSE_INIT_EXT == 0 {
+                            return err_box!(
+                                "Extended FUSE init payload received without FUSE_INIT_EXT"
+                            );
+                        }
+                        let _: &fuse_init_in_ext_tail = decoder.get_struct()?;
+                    }
+                    len => {
+                        return err_box!(
+                            "Invalid FUSE init extension length {}, expected 0 or {}",
+                            len,
+                            size_of::<fuse_init_in_ext_tail>()
+                        )
+                    }
+                }
+                FuseOperator::Init(Init { header, arg })
+            }
 
             FUSE_LOOKUP => FuseOperator::Lookup(Lookup {
                 header,
@@ -359,7 +379,8 @@ impl Display for FuseRequest {
 mod tests {
     use super::*;
     use crate::raw::fuse_abi::{
-        fuse_batch_forget_in, fuse_getattr_in, fuse_setxattr_in, fuse_write_in,
+        fuse_batch_forget_in, fuse_getattr_in, fuse_init_in, fuse_init_in_ext_tail,
+        fuse_setxattr_in, fuse_write_in,
     };
     use crate::FuseUtils;
     use bytes::BytesMut;
@@ -408,6 +429,115 @@ mod tests {
         let request = FuseRequest::from_bytes(request_bytes(&header, &[0])).unwrap();
         let err = request.parse_operator().unwrap_err();
         assert!(err.to_string().contains("Unexpected trailing request data"));
+    }
+
+    fn init_request(arg: &fuse_init_in, tail: Option<&fuse_init_in_ext_tail>) -> FuseRequest {
+        let mut body = BytesMut::new();
+        body.extend_from_slice(FuseUtils::struct_as_bytes(arg));
+        if let Some(tail) = tail {
+            body.extend_from_slice(FuseUtils::struct_as_bytes(tail));
+        }
+        let header = header(FUSE_INIT, FUSE_IN_HEADER_LEN + body.len());
+        FuseRequest::from_bytes(request_bytes(&header, &body)).unwrap()
+    }
+
+    #[test]
+    fn init_accepts_legacy_16_byte_payload() {
+        assert_eq!(size_of::<fuse_init_in>(), 16);
+
+        let request = init_request(
+            &fuse_init_in {
+                major: 7,
+                minor: 31,
+                max_readahead: 4096,
+                flags: 0,
+            },
+            None,
+        );
+
+        match request.parse_operator().unwrap() {
+            FuseOperator::Init(op) => {
+                assert_eq!(op.arg.minor, 31);
+            }
+            other => panic!("expected Init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn init_accepts_extended_64_byte_payload() {
+        assert_eq!(size_of::<fuse_init_in_ext_tail>(), 48);
+
+        let request = init_request(
+            &fuse_init_in {
+                major: 7,
+                minor: 36,
+                max_readahead: 4096,
+                flags: FUSE_INIT_EXT,
+            },
+            Some(&fuse_init_in_ext_tail {
+                flags2: 0x12,
+                ..Default::default()
+            }),
+        );
+
+        match request.parse_operator().unwrap() {
+            FuseOperator::Init(op) => {
+                assert_eq!(op.arg.minor, 36);
+            }
+            other => panic!("expected Init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn init_rejects_extension_flag_without_tail() {
+        let request = init_request(
+            &fuse_init_in {
+                major: 7,
+                minor: 36,
+                max_readahead: 4096,
+                flags: FUSE_INIT_EXT,
+            },
+            None,
+        );
+
+        let err = request.parse_operator().unwrap_err();
+        assert!(err.to_string().contains("without extended init payload"));
+    }
+
+    #[test]
+    fn init_rejects_extended_tail_without_flag() {
+        let request = init_request(
+            &fuse_init_in {
+                major: 7,
+                minor: 36,
+                max_readahead: 4096,
+                flags: 0,
+            },
+            Some(&fuse_init_in_ext_tail::default()),
+        );
+
+        let err = request.parse_operator().unwrap_err();
+        assert!(err.to_string().contains("without FUSE_INIT_EXT"));
+    }
+
+    #[test]
+    fn init_rejects_invalid_extension_length() {
+        let arg = fuse_init_in {
+            major: 7,
+            minor: 36,
+            max_readahead: 4096,
+            flags: FUSE_INIT_EXT,
+        };
+        let mut body = BytesMut::new();
+        body.extend_from_slice(FuseUtils::struct_as_bytes(&arg));
+        body.extend_from_slice(&[0; 4]);
+        let header = header(FUSE_INIT, FUSE_IN_HEADER_LEN + body.len());
+        let request = FuseRequest::from_bytes(request_bytes(&header, &body)).unwrap();
+
+        let err = request.parse_operator().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Invalid FUSE init extension length"));
     }
 
     #[test]

@@ -76,6 +76,11 @@ pub const FUSE_PATH_MAX_DEPTH: usize = 4096;
 /// `fuse_init_out.max_pages` carries the per-request page count.
 pub const FUSE_MAX_PAGES: u32 = 1 << 22;
 
+/// Kernel sends the extended 64-byte `fuse_init_in` request introduced in ABI 7.36.
+/// Curvine negotiates ABI 7.31 and does not advertise this bit in the reply, but it must
+/// consume the extended request sent by newer kernels before negotiating down.
+pub const FUSE_INIT_EXT: u32 = 1 << 30;
+
 pub const FUSE_BIG_WRITES: u32 = 1 << 5;
 
 pub const FUSE_ASYNC_READ: u32 = 1 << 0;
@@ -170,6 +175,7 @@ pub fn fuse_init_flag_names(flags: u32) -> Vec<String> {
         (FUSE_WRITEBACK_CACHE, "WRITEBACK_CACHE"),
         (FUSE_POSIX_ACL, "POSIX_ACL"),
         (FUSE_MAX_PAGES, "MAX_PAGES"),
+        (FUSE_INIT_EXT, "INIT_EXT"),
     ];
     let mut names: Vec<String> = KNOWN
         .iter()

@@ -54,6 +54,14 @@ pub struct fuse_init_in {
     pub flags: u32,
 }
 
+/// Tail of the extended 64-byte `fuse_init_in` sent by kernels using ABI 7.36+.
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct fuse_init_in_ext_tail {
+    pub flags2: u32,
+    pub unused: [u32; 11],
+}
+
 #[repr(C)]
 #[derive(Debug, Default)]
 pub struct fuse_init_out {
