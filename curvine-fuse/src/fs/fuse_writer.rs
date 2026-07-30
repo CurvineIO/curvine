@@ -55,9 +55,14 @@ pub struct FuseWriter {
     len: Arc<AtomicLong>,
     mtime: Arc<AtomicLong>,
     write_ver: AtomicCounter,
-    /// Count of write/resize calls currently inside `send_queued_task`.
-    /// Dirty-read waits for this to be zero before trusting a stable `write_ver`.
-    enqueue_inflight: AtomicCounter,
+    /// Serializes write/resize enqueue with dirty-read snapshot flush.
+    ///
+    /// On a bounded stream channel, `send_queued_task` may wait for capacity.
+    /// Holding this gate across that wait ensures a dirty-read Flush cannot be
+    /// queued ahead of a Write that has already started enqueueing, without
+    /// requiring a global zero-inflight instant (which can starve under
+    /// continuous concurrent writers).
+    enqueue_gate: tokio::sync::Mutex<()>,
     metrics_enabled: bool,
 }
 
@@ -78,7 +83,6 @@ impl FuseWriter {
         let len = Arc::new(AtomicLong::new(status.len));
         let mtime = Arc::new(AtomicLong::new(status.mtime));
         let write_ver = AtomicCounter::new(0);
-        let enqueue_inflight = AtomicCounter::new(0);
         let path_type = writer.path_type();
         let metrics_enabled = conf.metrics_enabled;
 
@@ -107,17 +111,13 @@ impl FuseWriter {
             len,
             mtime,
             write_ver,
-            enqueue_inflight,
+            enqueue_gate: tokio::sync::Mutex::new(()),
             metrics_enabled,
         }
     }
 
     pub fn write_ver(&self) -> u64 {
         self.write_ver.get()
-    }
-
-    pub fn enqueue_inflight(&self) -> u64 {
-        self.enqueue_inflight.get()
     }
 
     pub fn path(&self) -> &Path {
@@ -152,10 +152,9 @@ impl FuseWriter {
     }
 
     pub async fn write(&self, off: i64, data: Bytes, reply: Option<FuseResponse>) -> FsResult<()> {
-        // Bump write_ver only after the Write is queued. Track inflight around
-        // enqueue so dirty-read cannot observe a stable write_ver across the
-        // old incr-before-enqueue preemption window.
-        self.enqueue_inflight.incr();
+        // Bump write_ver only after the Write is queued. Hold enqueue_gate across
+        // the send so dirty-read flush cannot overtake a mid-reserve Write.
+        let _gate = self.enqueue_gate.lock().await;
         let result = self
             .send_queued_task(WriteTask::Write(off, data, reply))
             .await
@@ -163,7 +162,6 @@ impl FuseWriter {
         if result.is_ok() {
             self.write_ver.incr();
         }
-        self.enqueue_inflight.decr();
         result
     }
 
@@ -174,6 +172,32 @@ impl FuseWriter {
             // Propagate backend flush failures even on reply=None paths.
             tx.receive().await??;
             Ok::<(), FsError>(())
+        };
+        fun.await.map_err(|e| self.check_error(e))
+    }
+
+    /// Flush a dirty-read snapshot covering every write queued at capture time.
+    ///
+    /// Acquires `enqueue_gate` so the Flush is ordered after in-flight enqueues
+    /// without waiting for a global zero-inflight instant. Continuous writers may
+    /// keep advancing `write_ver` after this returns; the caller pins `read_ver`
+    /// to the returned snapshot and republishes on a later read if needed.
+    ///
+    /// Returns `Ok(None)` when `read_ver` already matches the gated `write_ver`.
+    pub async fn publish_dirty_read_snapshot(&self, read_ver: u64) -> FsResult<Option<u64>> {
+        let fun = async {
+            let (rx, tx) = CallChannel::channel();
+            let target_ver;
+            {
+                let _gate = self.enqueue_gate.lock().await;
+                target_ver = self.write_ver.get();
+                if target_ver == read_ver {
+                    return Ok(None);
+                }
+                self.send_queued_task(WriteTask::Flush(rx, None)).await?;
+            }
+            tx.receive().await??;
+            Ok(Some(target_ver))
         };
         fun.await.map_err(|e| self.check_error(e))
     }
@@ -203,13 +227,14 @@ impl FuseWriter {
         let len = opts.len;
         let fun = async {
             let (rx, tx) = CallChannel::channel();
-            self.enqueue_inflight.incr();
-            let send = self.send_queued_task(WriteTask::Resize(rx, opts)).await;
-            if send.is_ok() {
-                self.write_ver.incr();
+            {
+                let _gate = self.enqueue_gate.lock().await;
+                let send = self.send_queued_task(WriteTask::Resize(rx, opts)).await;
+                if send.is_ok() {
+                    self.write_ver.incr();
+                }
+                send?;
             }
-            self.enqueue_inflight.decr();
-            send?;
             // Double `?`: unwrap the channel receive, then propagate the real
             // backend resize result.
             tx.receive().await??;
@@ -917,6 +942,75 @@ mod tests {
 
                 let _ = std::fs::remove_file(&path_buf);
             });
+        }
+
+        /// Continuous writers on a capacity-1 stream channel must not starve
+        /// dirty-read snapshot publication (former global zero-inflight wait).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn dirty_read_snapshot_completes_under_continuous_bounded_writers() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::time::Duration;
+
+            let path_buf = std::env::temp_dir().join(format!(
+                "fw_dirty_read_stress_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let path = curvine_common::fs::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+
+            let conf = FuseConf {
+                stream_channel_size: 1,
+                metrics_enabled: false,
+                ..Default::default()
+            };
+            let writer = UnifiedWriter::Local(LocalWriter::new(&path, 4096).unwrap());
+            let rt2 = Arc::new(AsyncRuntime::single());
+            let fuse_writer = Arc::new(FuseWriter::new(&conf, rt2.clone(), writer));
+            std::mem::forget(rt2);
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut writer_tasks = Vec::new();
+            for i in 0..4 {
+                let w = fuse_writer.clone();
+                let stop = stop.clone();
+                writer_tasks.push(tokio::spawn(async move {
+                    let mut off = (i as i64) * 1_000_000;
+                    while !stop.load(Ordering::Relaxed) {
+                        // Ignore individual write errors once complete() races shutdown.
+                        let _ = w.write(off, Bytes::from_static(b"x"), None).await;
+                        off += 1;
+                    }
+                }));
+            }
+
+            // Let writers fill the bounded queue and contend on enqueue_gate.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let published = tokio::time::timeout(
+                Duration::from_secs(5),
+                fuse_writer.publish_dirty_read_snapshot(0),
+            )
+            .await
+            .expect("dirty-read snapshot must complete under continuous bounded writers")
+            .expect("dirty-read snapshot flush must succeed");
+            let ver = published.expect("expected a snapshot while writers are active");
+            assert!(ver > 0, "expected a non-zero snapshot, got {ver}");
+
+            // Re-check must also complete under load (may flush a newer snapshot).
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                fuse_writer.publish_dirty_read_snapshot(ver),
+            )
+            .await
+            .expect("dirty-read re-publish must complete under continuous writers")
+            .expect("dirty-read re-publish flush must succeed");
+
+            stop.store(true, Ordering::Relaxed);
+            for task in writer_tasks {
+                let _ = task.await;
+            }
+            let _ = fuse_writer.complete(None).await;
+            let _ = std::fs::remove_file(&path_buf);
         }
     }
 }

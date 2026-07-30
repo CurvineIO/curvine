@@ -131,24 +131,20 @@ impl BackendHandle {
 
         if let Some(writer) = state.find_writer(self.ino).await {
             // `write_ver` advances only after a write/resize is successfully queued.
-            // `enqueue_inflight` covers the brief window around send_queued_task so
-            // dirty-read cannot observe a ver bump for a Write that is not yet queued.
+            // Dirty-read publishes through `publish_dirty_read_snapshot`, which
+            // serializes with enqueue on `enqueue_gate` so a Flush cannot overtake
+            // a mid-reserve Write on a bounded channel — without waiting for a
+            // global zero-inflight instant (which can starve under continuous
+            // concurrent writers and turn EAGAIN into a hang).
             //
             // One FuseWriter is shared per inode. LTP ftest04 forks several O_RDWR
             // children against that writer, so write_ver keeps moving under load.
-            // Requiring global quiescence (stable write_ver across flush rounds) and
-            // returning EAGAIN when a budget is exhausted breaks blocking read/readv
-            // (errno=11). Instead publish a snapshot taken when no enqueue is in
-            // flight: flush once, reopen, and pin read_ver to that sampled target.
-            // Later concurrent writes leave write_ver ahead of read_ver so the next
-            // read publishes again; we never claim a newer ver than we flushed.
-            while writer.enqueue_inflight() != 0 {
-                tokio::task::yield_now().await;
-            }
-            let target_ver = writer.write_ver();
-            if self.read_ver.get() != target_ver {
-                writer.flush(None).await?;
-
+            // Pin read_ver to the flushed snapshot; later writes leave write_ver
+            // ahead so the next read publishes again.
+            if let Some(target_ver) = writer
+                .publish_dirty_read_snapshot(self.read_ver.get())
+                .await?
+            {
                 let path = reader.path().clone();
                 let new_reader = state.new_reader(&path).await?;
                 // Refresh status from the reopened reader before installing it.
