@@ -484,6 +484,8 @@ impl JournalLoader {
 
         // Resolve restore path first. Always measure dir size for safety checks;
         // the logged checkpoint_size may still be 0 when info logging is disabled.
+        let is_empty_placeholder_snapshot =
+            snapshot.files_data.is_none() && snapshot.bytes_data.is_none();
         let restore_path = match &snapshot.files_data {
             Some(data) => data.dir.clone(),
             None => {
@@ -513,6 +515,13 @@ impl JournalLoader {
             let fs_dir = self.fs_dir.read();
             let (dir_count, file_count) = fs_dir.get_file_counts();
             if actual_size == 0 && file_count > 0 {
+                if is_empty_placeholder_snapshot {
+                    warn!(
+                        "skip empty placeholder snapshot at {} over filesystem with {} files and {} dirs",
+                        restore_path, file_count, dir_count
+                    );
+                    return Ok(());
+                }
                 return err_box!(
                     "refusing to apply empty snapshot at {} ({} bytes) over filesystem with {} files and {} dirs",
                     restore_path,

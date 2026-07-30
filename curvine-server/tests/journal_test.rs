@@ -544,6 +544,12 @@ fn test_apply_snapshot_refuses_empty_over_populated_files() -> CommonResult<()> 
     let (dir_count, file_count) = fs.get_file_counts();
     assert!(file_count > 0, "expected files after create");
 
+    rt.block_on(loader.apply_snapshot(SnapshotData::default()))?;
+    assert!(
+        fs.exists("/with-files/file.log")?,
+        "default empty placeholder snapshot must not wipe populated metadata"
+    );
+
     let empty_files = Utils::test_sub_dir(format!("empty-snap-files-{}", test_id));
     FileUtils::create_dir(&empty_files, true)?;
     assert_eq!(FileUtils::dir_size(&empty_files).unwrap_or(1), 0);
