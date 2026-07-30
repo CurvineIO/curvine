@@ -154,10 +154,40 @@ check_mixed_spdk_feature_risk() {
     -p curvine-server \
     --features curvine-server/spdk-rdma
 
+  local invert_output
+  invert_output="$(
+    cargo tree \
+      -p curvine-cli \
+      -p curvine-fuse \
+      -p curvine-server \
+      --features curvine-server/spdk-rdma \
+      --invert curvine-storage-spdk 2>/dev/null || true
+  )"
+  if grep -E '^(curvine-cli|curvine-fuse|curvine-client-core) ' <<<"$invert_output" >/dev/null; then
+    record_violation "mixed-cli-server-spdk-storage-leak" "curvine-storage-spdk leaked into CLI/FUSE/client crates"
+  else
+    record_ok "mixed-cli-server-spdk-storage-leak"
+  fi
+
+  invert_output="$(
+    cargo tree \
+      -p curvine-cli \
+      -p curvine-fuse \
+      -p curvine-server \
+      --features curvine-server/spdk-rdma \
+      --invert curvine-storage-local 2>/dev/null || true
+  )"
+  if grep -E '^(curvine-cli|curvine-fuse|curvine-client-core) ' <<<"$invert_output" >/dev/null; then
+    record_violation "mixed-cli-server-spdk-local-leak" "curvine-storage-local leaked into CLI/FUSE/client crates"
+  else
+    record_ok "mixed-cli-server-spdk-local-leak"
+  fi
+
   local output
   output="$(
     cargo tree \
       -p curvine-cli \
+      -p curvine-fuse \
       -p curvine-server \
       --features curvine-server/spdk-rdma \
       -e features \
@@ -166,30 +196,30 @@ check_mixed_spdk_feature_risk() {
   )"
 
   if awk '
-    $1 == "orpc-rpc" {
+    $1 == "curvine-cli" || $1 == "curvine-fuse" || $1 == "curvine-client-core" {
       features = $0
-      sub(/^orpc-rpc v[^ ]+ /, "", features)
+      sub(/^[^ ]+ v[^ ]+ /, "", features)
       sub(/^\([^)]*\) /, "", features)
       count = split(features, values, ",")
       for (i = 1; i <= count; i++) {
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", values[i])
-        if (values[i] == "spdk" || values[i] == "spdk-rdma" || values[i] == "rdma") {
+        if (values[i] ~ /^spdk/) {
           found = 1
         }
       }
     }
     END { exit found ? 0 : 1 }
   ' <<<"$output"; then
-    record_violation "mixed-spdk-feature-risk" "server spdk-rdma feature leaked native transport features onto shared orpc-rpc"
+    record_violation "mixed-spdk-feature-risk" "server spdk-rdma feature leaked spdk-related features onto CLI/FUSE/client crates"
   else
     record_ok "mixed-spdk-feature-risk"
   fi
 }
 
-common_client_forbidden="curvine-common,curvine-common-core,orpc,curvine-ufs,opendal,rocksdb,raft,curvine-storage-spdk,curvine-rocksdb,curvine-raft,curvine-ufs-oss-hdfs,curvine-hdfs-jni"
-client_core_forbidden="curvine-common,curvine-common-core,orpc,curvine-ufs,curvine-ufs-api,curvine-ufs-opendal,curvine-ufs-oss-hdfs,opendal,rocksdb,raft,curvine-storage-spdk,curvine-rocksdb,curvine-raft,curvine-hdfs-jni"
-libsdk_java_forbidden="curvine-common,curvine-common-core,orpc,curvine-ufs,opendal,rocksdb,raft,pyo3,curvine-storage-spdk,curvine-rocksdb,curvine-raft,curvine-ufs-oss-hdfs,curvine-hdfs-jni"
-libsdk_python_forbidden="curvine-common,curvine-common-core,orpc,curvine-ufs,opendal,rocksdb,raft,jni,curvine-storage-spdk,curvine-rocksdb,curvine-raft,curvine-ufs-oss-hdfs,curvine-hdfs-jni"
+common_client_forbidden="curvine-common,curvine-common-core,orpc,curvine-ufs,curvine-ufs-opendal,opendal,rocksdb,raft,curvine-storage-spdk,curvine-storage-local,curvine-rocksdb,curvine-raft,curvine-ufs-oss-hdfs,curvine-hdfs-jni"
+client_core_forbidden="curvine-common,curvine-common-core,orpc,curvine-ufs,curvine-ufs-api,curvine-ufs-opendal,curvine-ufs-oss-hdfs,opendal,rocksdb,raft,curvine-storage-spdk,curvine-storage-local,curvine-rocksdb,curvine-raft,curvine-hdfs-jni"
+libsdk_java_forbidden="curvine-common,curvine-common-core,orpc,curvine-ufs,curvine-ufs-opendal,opendal,rocksdb,raft,pyo3,curvine-storage-spdk,curvine-storage-local,curvine-rocksdb,curvine-raft,curvine-ufs-oss-hdfs,curvine-hdfs-jni"
+libsdk_python_forbidden="curvine-common,curvine-common-core,orpc,curvine-ufs,curvine-ufs-opendal,opendal,rocksdb,raft,jni,curvine-storage-spdk,curvine-storage-local,curvine-rocksdb,curvine-raft,curvine-ufs-oss-hdfs,curvine-hdfs-jni"
 
 echo "Dependency boundary check mode: $MODE"
 echo

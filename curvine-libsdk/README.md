@@ -117,4 +117,4 @@ JDK **8**, Maven **≥ 3.8.1**. From workspace root, **`make build`** (with **`j
 
 ## Local dev (without `make`)
 
-From **`crates/sdk/curvine-libsdk-python/`**: own venv, **`pip install maturin`**, **`maturin develop --release --no-default-features --features extension-module`**, then run **`protoc`** into **`../../curvine-libsdk/python/curvine_libsdk/_proto/`** and apply the same **`sed`** relative-import fix as **`build/build.sh`**, **`export PYTHONPATH=../../curvine-libsdk/python`**.
+From **`crates/sdk/curvine-libsdk-python/`**: own venv, **`pip install maturin`**, **`maturin develop --release --no-default-features --features extension-module`**, then run **`protoc`** into **`../../../curvine-libsdk/python/curvine_libsdk/_proto/`** and apply the same **`sed`** relative-import fix as **`build/build.sh`**, **`export PYTHONPATH=../../../curvine-libsdk/python`**.

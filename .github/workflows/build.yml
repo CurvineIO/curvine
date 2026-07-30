@@ -104,6 +104,11 @@ jobs:
           echo "After build, disk usage:"
           df -h
 
+      - name: Build minimal SDK artifacts
+        run: |
+          cargo build --jobs ${{ env.CARGO_BUILD_JOBS }} -p curvine-libsdk --no-default-features --features java-sdk
+          cargo build --jobs ${{ env.CARGO_BUILD_JOBS }} -p curvine-libsdk-python --no-default-features --features extension-module
+
       - name: Minimal artifact runtime dependency guardrails
         run: |
           scripts/check-minimal-artifact-deps.sh target/debug

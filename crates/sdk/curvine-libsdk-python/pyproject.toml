@@ -3,7 +3,7 @@ requires = ["maturin>=1,<2"]
 build-backend = "maturin"
 
 [tool.maturin]
-python-source = "../curvine-libsdk/python"
+python-source = "../../../curvine-libsdk/python"
 module-name = "curvine_libsdk._native"
 features = ["extension-module"]
 # include = [{ path = "src/python/**", format = "sdist"}]
