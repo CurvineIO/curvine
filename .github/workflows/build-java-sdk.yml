@@ -118,7 +118,7 @@ jobs:
               cargo --version
 
               echo "Building native library for ${{ matrix.os }} ${{ matrix.arch }}_64"
-              cargo build --release -p curvine-libsdk --jobs "${CARGO_BUILD_JOBS}"
+              cargo build --release -p curvine-libsdk --no-default-features --features java-sdk --jobs "${CARGO_BUILD_JOBS}"
 
               mkdir -p native-output
               cp target/release/libcurvine_libsdk.so \

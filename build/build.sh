@@ -502,15 +502,30 @@ append_ufs_feature() {
 
   case "$ufs" in
     oss-hdfs)
-      add_feature "curvine-client/oss-hdfs"
+      if [ "$scope" = "cli-minimal" ]; then
+        add_feature "curvine-cli/oss-hdfs"
+      elif [ "$scope" = "server-native" ] || [ "$scope" = "tests" ]; then
+        add_feature "curvine-server/oss-hdfs"
+      else
+        add_feature "curvine-client/oss-hdfs"
+      fi
       ;;
     opendal-hdfs)
-      add_feature "curvine-client/opendal-hdfs"
-      add_feature "curvine-server/jni"
+      if [ "$scope" = "cli-minimal" ]; then
+        add_feature "curvine-cli/opendal-hdfs"
+      elif [ "$scope" = "server-native" ] || [ "$scope" = "tests" ]; then
+        add_feature "curvine-server/opendal-hdfs"
+        add_feature "curvine-server/jni"
+      else
+        add_feature "curvine-client/opendal-hdfs"
+        add_feature "curvine-server/jni"
+      fi
       ;;
     opendal-webhdfs)
       if [ "$scope" = "cli-minimal" ]; then
         add_feature "curvine-cli/opendal-webhdfs"
+      elif [ "$scope" = "server-native" ] || [ "$scope" = "tests" ]; then
+        add_feature "curvine-server/opendal-webhdfs"
       else
         add_feature "curvine-client/opendal-webhdfs"
       fi
@@ -518,6 +533,8 @@ append_ufs_feature() {
     *)
       if [ "$scope" = "cli-minimal" ]; then
         add_feature "curvine-cli/$ufs"
+      elif [ "$scope" = "server-native" ] || [ "$scope" = "tests" ]; then
+        add_feature "curvine-server/$ufs"
       else
         add_feature "curvine-client/$ufs"
       fi
@@ -594,12 +611,12 @@ append_alloc_feature() {
       ;;
     client-safe)
       if [[ " ${CLIENT_RUST_BUILD_ARGS[@]} " =~ " -p curvine-fuse " ]]; then
-        add_feature "curvine-common/${ALLOC}"
+        add_feature "curvine-common-core/${ALLOC}"
       fi
       return 0
       ;;
     *)
-      add_feature "curvine-common/${ALLOC}"
+      add_feature "curvine-common-core/${ALLOC}"
       ;;
   esac
 }

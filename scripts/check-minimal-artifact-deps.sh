@@ -47,15 +47,15 @@ check_artifact() {
   local artifact="$2"
 
   if [ ! -e "$artifact" ]; then
-    echo "SKIP [$label] missing artifact: $artifact"
-    return 0
+    echo "FAIL [$label] missing artifact: $artifact"
+    return 1
   fi
 
   local inspector
   inspector="$(select_inspector "$artifact")"
   if [ -z "$inspector" ]; then
-    echo "SKIP [$label] no readelf/llvm-readelf/otool inspector for artifact: $artifact"
-    return 0
+    echo "FAIL [$label] no readelf/llvm-readelf/otool inspector for artifact: $artifact"
+    return 1
   fi
 
   local needed
@@ -90,7 +90,8 @@ do
 done
 
 if [ "$sdk_found" -eq 0 ]; then
-  echo "SKIP [libsdk] no SDK dynamic library found under $PROFILE_DIR"
+  echo "FAIL [libsdk] no SDK dynamic library found under $PROFILE_DIR"
+  failures=$((failures + 1))
 fi
 
 if [ "$failures" -gt 0 ]; then

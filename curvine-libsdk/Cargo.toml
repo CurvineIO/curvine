@@ -10,6 +10,9 @@ name = "curvine_libsdk"
 
 [features]
 default = ["java-sdk"]
+# Default features intentionally exclude UFS backends. Use
+# `--no-default-features --features java-sdk` (or python-sdk) for minimal SDK
+# artifacts, and append explicit UFS features such as `opendal-s3` when needed.
 rust-sdk = ["curvine-sdk-core/rust-sdk"]
 java-sdk = ["dep:curvine-libsdk-java"]
 python-sdk = ["dep:curvine-libsdk-python", "curvine-libsdk-python/extension-module"]

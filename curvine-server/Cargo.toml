@@ -11,6 +11,15 @@ default = []
 jni = ["curvine-master/jni", "curvine-worker/jni"]
 spdk = ["curvine-worker/spdk"]
 spdk-rdma = ["curvine-worker/spdk-rdma"]
+opendal-s3 = ["curvine-master/opendal-s3", "curvine-worker/opendal-s3"]
+opendal-oss = ["curvine-master/opendal-oss", "curvine-worker/opendal-oss"]
+opendal-gcs = ["curvine-master/opendal-gcs", "curvine-worker/opendal-gcs"]
+opendal-azblob = ["curvine-master/opendal-azblob", "curvine-worker/opendal-azblob"]
+opendal-cos = ["curvine-master/opendal-cos", "curvine-worker/opendal-cos"]
+opendal-hdfs = ["curvine-master/opendal-hdfs", "curvine-worker/opendal-hdfs"]
+opendal-webhdfs = ["curvine-master/opendal-webhdfs", "curvine-worker/opendal-webhdfs"]
+opendal-hdfs-native = ["curvine-master/opendal-hdfs-native", "curvine-worker/opendal-hdfs-native"]
+oss-hdfs = ["curvine-master/oss-hdfs", "curvine-worker/oss-hdfs"]
 fault-injection = [
     "curvine-master/fault-injection",
     "curvine-worker/fault-injection",
