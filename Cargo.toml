@@ -34,7 +34,7 @@ members = [
     "curvine-client-core",
     "curvine-job-client",
     "curvine-unified-fs",
-    "curvine-sdk-core",
+    "crates/sdk/curvine-sdk-core",
     "curvine-bench",
     "curvine-client",
     "curvine-libsdk",
@@ -70,7 +70,7 @@ default-members = [
     "curvine-client-core",
     "curvine-job-client",
     "curvine-unified-fs",
-    "curvine-sdk-core",
+    "crates/sdk/curvine-sdk-core",
     "curvine-bench",
     "curvine-client",
     "curvine-libsdk",
@@ -110,7 +110,7 @@ curvine-common-macros = { path = "curvine-common/macros" }
 curvine-client-core = { path = "curvine-client-core" }
 curvine-job-client = { path = "curvine-job-client" }
 curvine-unified-fs = { path = "curvine-unified-fs" }
-curvine-sdk-core = { path = "curvine-sdk-core" }
+curvine-sdk-core = { path = "crates/sdk/curvine-sdk-core" }
 curvine-bench = { path = "curvine-bench" }
 curvine-client = { path = "curvine-client", default-features = false }
 curvine-libsdk = { path = "curvine-libsdk" }
