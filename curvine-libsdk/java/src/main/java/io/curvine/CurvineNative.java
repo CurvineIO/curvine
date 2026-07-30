@@ -319,6 +319,10 @@ public class CurvineNative {
 
     public static native byte[] getFileStatus(long nativeHandle, String path) throws IOException;
 
+    /** Apply attribute updates and return serialized {@code GetFileStatusResponse} bytes. */
+    public static native byte[] setAttr(
+            long nativeHandle, String path, byte[] setAttrOptions) throws IOException;
+
     public static native byte[] listStatus(long nativeHandle, String path) throws IOException;
 
     public static native long rename(long nativeHandle, String src, String dst) throws IOException;

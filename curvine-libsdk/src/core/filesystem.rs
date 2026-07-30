@@ -17,7 +17,7 @@ use crate::{LibFsReader, LibFsWriter};
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::{FreeResult, MountInfo, MountOptions};
+use curvine_common::state::{FreeResult, MountInfo, MountOptions, SetAttrOpts};
 use curvine_common::FsResult;
 use orpc::runtime::RpcRuntime;
 
@@ -68,6 +68,14 @@ impl LibFilesystem {
         let path = Path::from_str(path)?;
         self.rt()
             .block_on(async { self.inner().get_status_bytes(&path).await })
+    }
+
+    pub fn set_attr(&self, path: impl AsRef<str>, opts: SetAttrOpts) -> FsResult<BytesMut> {
+        let path = Path::from_str(path)?;
+        self.rt().block_on(async {
+            self.inner().set_attr(&path, opts).await?;
+            self.inner().get_status_bytes(&path).await
+        })
     }
 
     pub fn list_status(&self, path: impl AsRef<str>) -> FsResult<BytesMut> {

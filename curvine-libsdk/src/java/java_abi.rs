@@ -221,6 +221,18 @@ pub unsafe extern "C" fn Java_io_curvine_CurvineNative_getFileStatus(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn Java_io_curvine_CurvineNative_setAttr(
+    mut env: JNIEnv,
+    _this: JObject,
+    fs_ptr: *mut JavaFilesystem,
+    path: JString,
+    options: JByteArray,
+) -> jarray {
+    let fs = &*fs_ptr;
+    java_err2!(env, fs.set_attr(&mut env, path, options))
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn Java_io_curvine_CurvineNative_listStatus(
     mut env: JNIEnv,
     _this: JObject,

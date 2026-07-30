@@ -363,17 +363,77 @@ public class CurvineFileSystem extends FileSystem {
         return statuses;
     }
 
+    /**
+     * Update file or directory attributes using the native {@code set_attr} RPC.
+     *
+     * @return updated Hadoop {@link FileStatus} for the target path
+     */
+    public FileStatus setAttr(Path path, SetAttrOpts opts) throws IOException {
+        return applySetAttr(path, opts, true);
+    }
+
+    private FileStatus applySetAttr(Path path, SetAttrOpts opts, boolean countWriteOp) throws IOException {
+        if (countWriteOp && statistics != null) {
+            statistics.incrementWriteOps(1);
+        }
+        byte[] bytes = libFs.setAttr(formatPath(path), opts);
+        GetFileStatusResponse proto = GetFileStatusResponse.parseFrom(bytes);
+        return toHadoop(proto.getStatus(), path);
+    }
+
+    @Override
+    public void setOwner(Path path, String username, String groupname) throws IOException {
+        if (statistics != null) {
+            statistics.incrementWriteOps(1);
+        }
+        SetAttrOpts.Builder builder = SetAttrOpts.builder();
+        if (username != null) {
+            builder.owner(username);
+        }
+        if (groupname != null) {
+            builder.group(groupname);
+        }
+        applySetAttr(path, builder.build(), false);
+    }
+
+    @Override
+    public void setPermission(Path path, FsPermission permission) throws IOException {
+        if (statistics != null) {
+            statistics.incrementWriteOps(1);
+        }
+        applySetAttr(
+                path,
+                SetAttrOpts.builder().mode(permission.toShort() & 0xFFFF).build(),
+                false);
+    }
+
+    @Override
+    public void setTimes(Path path, long mtime, long atime) throws IOException {
+        if (statistics != null) {
+            statistics.incrementWriteOps(1);
+        }
+        SetAttrOpts.Builder builder = SetAttrOpts.builder();
+        if (mtime >= 0) {
+            builder.mtime(mtime);
+        }
+        if (atime >= 0) {
+            builder.atime(atime);
+        }
+        applySetAttr(path, builder.build(), false);
+    }
+
     public FileStatus toHadoop(FileStatusProto proto, Path path) {
+        FsPermission permission = new FsPermission((short) proto.getMode());
         return new org.apache.hadoop.fs.FileStatus(
                 proto.getLen(),
                 proto.getIsDir(),
-                proto.getReplicas(),
+                (short) proto.getReplicas(),
                 proto.getBlockSize(),
                 proto.getMtime(),
                 proto.getAtime(),
-                FsPermission.getDefault(),
-                System.getProperty("user.name"),
-                System.getProperty("user.group"),
+                permission,
+                proto.getOwner(),
+                proto.getGroup(),
                 makeQualified(path)
         );
     }

@@ -15,6 +15,7 @@
 package io.curvine;
 
 import java.io.IOException;
+import java.util.Objects;
 import java.util.Optional;
 
 import io.curvine.exception.CurvineException;
@@ -110,6 +111,13 @@ public class CurvineFsMount {
 
     public byte[] getFileStatus(String path) throws IOException {
         byte[] bytes = CurvineNative.getFileStatus(nativeHandle, path);
+        checkError(bytes);
+        return bytes;
+    }
+
+    public byte[] setAttr(String path, SetAttrOpts opts) throws IOException {
+        Objects.requireNonNull(opts, "opts");
+        byte[] bytes = CurvineNative.setAttr(nativeHandle, path, opts.toByteArray());
         checkError(bytes);
         return bytes;
     }

@@ -16,7 +16,9 @@ package io.curvine;
 
 import io.curvine.bench.Utils;
 import io.curvine.proto.MountInfoProto;
+import io.curvine.proto.TtlActionProto;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.fs.*;
 import org.apache.hadoop.conf.Configuration;
 import org.junit.*;
@@ -53,6 +55,53 @@ public class CurvineFileSystemTest {
         Path path = new Path("s3://flink/xuen-test");
         Optional<MountInfoProto> mountPoint = ((CurvineFileSystem) fs).getMountInfo(path);
         System.out.println("mount point: " + mountPoint);
+    }
+
+    @Test
+    public void setAttr() throws Exception {
+        CurvineFileSystem cvFs = (CurvineFileSystem) fs;
+        Path root = new Path("/set-attr-test");
+        Path child = new Path(root, "child.txt");
+        fs.mkdirs(root);
+        fs.create(child, true).close();
+
+        long mtime = 1_700_000_000_000L;
+        FileStatus updated = cvFs.setAttr(
+                root,
+                SetAttrOpts.builder()
+                        .recursive(true)
+                        .owner("attr-owner")
+                        .group("attr-group")
+                        .mode(0755)
+                        .mtime(mtime)
+                        .ttlMs(60_000L)
+                        .ttlAction(TtlActionProto.TTL_ACTION_PROTO_DELETE)
+                        .replicas(2)
+                        .addXAttr("attr1", "value1")
+                        .build());
+        assert updated.getOwner().equals("attr-owner");
+        assert updated.getGroup().equals("attr-group");
+        assert updated.getPermission().equals(new FsPermission((short) 0755));
+
+        FileStatus childStatus = fs.getFileStatus(child);
+        assert childStatus.getOwner().equals("attr-owner");
+        assert childStatus.getGroup().equals("attr-group");
+
+        cvFs.setPermission(child, new FsPermission((short) 0600));
+        assert fs.getFileStatus(child).getPermission().equals(new FsPermission((short) 0600));
+
+        cvFs.setOwner(child, "child-owner", "child-group");
+        FileStatus ownerStatus = fs.getFileStatus(child);
+        assert ownerStatus.getOwner().equals("child-owner");
+        assert ownerStatus.getGroup().equals("child-group");
+
+        long newMtime = mtime + 5_000L;
+        cvFs.setTimes(child, newMtime, newMtime + 1_000L);
+        FileStatus timeStatus = fs.getFileStatus(child);
+        assert timeStatus.getModificationTime() == newMtime;
+        assert timeStatus.getAccessTime() == newMtime + 1_000L;
+
+        fs.delete(root, true);
     }
 
     @Test

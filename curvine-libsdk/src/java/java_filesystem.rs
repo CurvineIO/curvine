@@ -17,9 +17,11 @@ use crate::java::JavaUtils;
 use crate::{FilesystemConf, LibFilesystem, LibFsReader, LibFsWriter};
 use curvine_common::error::FsError;
 use curvine_common::proto::{
-    GetJobStatusResponse, GetMountTableResponse, MountOptionsProto, SubmitJobResponse,
+    GetJobStatusResponse, GetMountTableResponse, MountOptionsProto, SetAttrOptsProto,
+    SubmitJobResponse,
 };
 use curvine_common::state::LoadJobCommand;
+use curvine_common::state::SetAttrOpts;
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use jni::objects::{JByteArray, JString};
@@ -38,6 +40,14 @@ fn decode_mount_options(bytes: &[u8]) -> FsResult<curvine_common::state::MountOp
     }
     let options = try_err!(MountOptionsProto::decode(bytes));
     Ok(ProtoUtils::mount_options_from_pb(options))
+}
+
+fn decode_set_attr_options(bytes: &[u8]) -> FsResult<SetAttrOpts> {
+    if bytes.is_empty() {
+        return err_box!("set attr options cannot be empty");
+    }
+    let options = try_err!(SetAttrOptsProto::decode(bytes));
+    Ok(ProtoUtils::set_attr_opts_from_pb(options))
 }
 
 impl JavaFilesystem {
@@ -85,6 +95,23 @@ impl JavaFilesystem {
         let path = JavaUtils::jstring_to_string(env, &path)?;
         let status = self.inner.get_status(path)?;
 
+        let byte_arr = JavaUtils::new_jarray(env, &status)?;
+        Ok(byte_arr)
+    }
+
+    pub fn set_attr(
+        &self,
+        env: &mut JNIEnv,
+        path: JString,
+        options: JByteArray,
+    ) -> FsResult<jarray> {
+        let path = JavaUtils::jstring_to_string(env, &path)?;
+        let options = env
+            .convert_byte_array(&options)
+            .map_err(FsError::from_error)?;
+        let status = self
+            .inner
+            .set_attr(path, decode_set_attr_options(&options)?)?;
         let byte_arr = JavaUtils::new_jarray(env, &status)?;
         Ok(byte_arr)
     }
@@ -234,11 +261,19 @@ impl JavaFilesystem {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_mount_options;
+    use super::{decode_mount_options, decode_set_attr_options};
 
     #[test]
     fn rejects_empty_mount_options() {
         let error = decode_mount_options(&[]).unwrap_err();
         assert!(error.to_string().contains("mount options cannot be empty"));
+    }
+
+    #[test]
+    fn rejects_empty_set_attr_options() {
+        let error = decode_set_attr_options(&[]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("set attr options cannot be empty"));
     }
 }
