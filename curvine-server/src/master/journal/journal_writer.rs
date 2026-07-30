@@ -223,7 +223,9 @@ impl JournalWriter {
         dst: P,
         mtime: i64,
         flags: RenameFlags,
+        exchange_pre_swap_ids: Option<(i64, i64)>,
     ) -> FsResult<()> {
+        let (src_inode_id, dst_inode_id) = exchange_pre_swap_ids.unwrap_or((0, 0));
         let entry = RenameEntry {
             op_id: fs_dir.next_op_id(),
             rpc_id: 0,
@@ -231,6 +233,8 @@ impl JournalWriter {
             dst: dst.as_ref().to_string(),
             mtime,
             flags: flags.value(),
+            src_inode_id,
+            dst_inode_id,
         };
         self.send(fs_dir, JournalEntry::Rename(entry))
     }

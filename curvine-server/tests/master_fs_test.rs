@@ -986,6 +986,37 @@ fn rename_posix_semantics(fs: &MasterFilesystem) -> CommonResult<()> {
     assert_eq!(fs.file_status("/a/exchange_a")?.id, id_b);
     assert_eq!(fs.file_status("/a/exchange_b")?.id, id_a);
 
+    // EXCHANGE rejects src under dst (/a/b <-> /a would make /a its own descendant).
+    fs.mkdir("/a/ex_parent", true)?;
+    fs.mkdir("/a/ex_parent/child", true)?;
+    let err = fs
+        .rename("/a/ex_parent/child", "/a/ex_parent", RenameFlags::EXCHANGE)
+        .expect_err("exchange with src under dst must fail");
+    assert!(matches!(err, FsError::InvalidArgument(_)));
+    assert!(fs.exists("/a/ex_parent")?);
+    assert!(fs.exists("/a/ex_parent/child")?);
+
+    // Cross-parent EXCHANGE between directory and file adjusts parent nlink.
+    fs.mkdir("/a/ex_dir_parent", true)?;
+    fs.mkdir("/a/ex_file_parent", true)?;
+    fs.mkdir("/a/ex_dir_parent/dir_entry", true)?;
+    fs.create("/a/ex_file_parent/file_entry", true)?;
+    let dir_parent_nlink = fs.file_status("/a/ex_dir_parent")?.nlink;
+    let file_parent_nlink = fs.file_status("/a/ex_file_parent")?.nlink;
+    fs.rename(
+        "/a/ex_dir_parent/dir_entry",
+        "/a/ex_file_parent/file_entry",
+        RenameFlags::EXCHANGE,
+    )?;
+    assert_eq!(
+        fs.file_status("/a/ex_dir_parent")?.nlink,
+        dir_parent_nlink - 1
+    );
+    assert_eq!(
+        fs.file_status("/a/ex_file_parent")?.nlink,
+        file_parent_nlink + 1
+    );
+
     // src symlink, dst symlink -> overwrite existing symlink and keep dst deletable.
     fs.symlink("nobody", "/a/symbolic", false, 0o777)?;
     fs.rename("/a/symbolic", "/a/asymbolic", RenameFlags::empty())?;
@@ -1578,6 +1609,19 @@ fn test_idempotent_rename() -> CommonResult<()> {
     let (fs, js, loader, _js2, fs2) = setup_pair("rename");
     fs.mkdir("/src", false)?;
     fs.rename("/src", "/dst", RenameFlags::empty())?;
+    replay_all_then_duplicate_last(&js, &loader)?;
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
+    Ok(())
+}
+
+#[test]
+fn test_idempotent_exchange_rename() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, loader, _js2, fs2) = setup_pair("exchange-rename");
+    fs.mkdir("/a", true)?;
+    fs.create("/a/ex_a", true)?;
+    fs.create("/a/ex_b", true)?;
+    fs.rename("/a/ex_a", "/a/ex_b", RenameFlags::EXCHANGE)?;
     replay_all_then_duplicate_last(&js, &loader)?;
     assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
     Ok(())

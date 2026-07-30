@@ -234,7 +234,7 @@ impl CurvineFileSystem {
             return err_fuse!(libc::ENAMETOOLONG);
         }
 
-        self.check_rename_permissions(header, old_id, old_name, new_dir)
+        self.check_rename_permissions(header, old_id, old_name, new_dir, new_name, flags)
             .await?;
 
         let (old_path, new_path) = self.state.get_path2(old_id, old_name, new_dir, new_name)?;
@@ -457,6 +457,8 @@ impl CurvineFileSystem {
         old_parent: u64,
         old_name: &str,
         new_parent: u64,
+        new_name: &str,
+        flags: RenameFlags,
     ) -> FuseResult<()> {
         if header.uid == 0 || !self.conf.check_permission {
             return Ok(());
@@ -465,20 +467,41 @@ impl CurvineFileSystem {
         let dir_mask = (libc::W_OK | libc::X_OK) as u32;
         self.check_permissions_on_node(header, old_parent, dir_mask)
             .await?;
-        if new_parent != old_parent {
+        let new_parent_status = if new_parent != old_parent {
             self.check_permissions_on_node(header, new_parent, dir_mask)
                 .await?;
-        }
+            self.state.fs_stat(new_parent, None).await?
+        } else {
+            self.state.fs_stat(old_parent, None).await?
+        };
+        let old_parent_status = if new_parent == old_parent {
+            new_parent_status.clone()
+        } else {
+            self.state.fs_stat(old_parent, None).await?
+        };
 
-        let parent_status = self.state.fs_stat(old_parent, None).await?;
-        if parent_status.mode & libc::S_ISVTX as u32 != 0 {
+        if old_parent_status.mode & libc::S_ISVTX as u32 != 0 {
             let file_status = self.state.fs_stat(old_parent, Some(old_name)).await?;
-            let parent_uid = self.resolve_file_uid(&parent_status.owner);
+            let parent_uid = self.resolve_file_uid(&old_parent_status.owner);
             let file_uid = self.resolve_file_uid(&file_status.owner);
             if header.uid != parent_uid && header.uid != file_uid {
                 return err_fuse!(
                     libc::EPERM,
                     "sticky directory: cannot rename file owned by another user"
+                );
+            }
+        }
+
+        let dest_exists =
+            flags.exchange_mode() || self.state.fs_stat(new_parent, Some(new_name)).await.is_ok();
+        if dest_exists && new_parent_status.mode & libc::S_ISVTX as u32 != 0 {
+            let dest_status = self.state.fs_stat(new_parent, Some(new_name)).await?;
+            let parent_uid = self.resolve_file_uid(&new_parent_status.owner);
+            let dest_uid = self.resolve_file_uid(&dest_status.owner);
+            if header.uid != parent_uid && header.uid != dest_uid {
+                return err_fuse!(
+                    libc::EPERM,
+                    "sticky directory: cannot rename over file owned by another user"
                 );
             }
         }
@@ -2149,7 +2172,13 @@ impl fs::FileSystem for CurvineFileSystem {
                     }
                     return Ok(());
                 }
-                return err_fuse!(libc::EDEADLK);
+                let blocker2 = conflict2.as_ref().expect("conflict lock");
+                if wait_guard.register_blocked_by(LockOwner::new(
+                    blocker2.client_id.clone(),
+                    blocker2.owner_id,
+                )) {
+                    return err_fuse!(libc::EDEADLK);
+                }
             }
 
             ticks += 1;

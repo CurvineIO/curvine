@@ -326,13 +326,28 @@ impl FsDir {
         flags: RenameFlags,
     ) -> FsResult<Option<DeleteResult>> {
         let op_ms = LocalTime::mills();
-        let res = self.unprotected_rename(src_inp, dst_inp, op_ms as i64, flags)?;
+        let exchange_pre_swap_ids = if flags.exchange_mode() {
+            let src_id = src_inp
+                .get_last_inode()
+                .map(|inode| inode.id())
+                .unwrap_or(0);
+            let dst_id = dst_inp
+                .get_last_inode()
+                .map(|inode| inode.id())
+                .unwrap_or(0);
+            Some((src_id, dst_id))
+        } else {
+            None
+        };
+        let res =
+            self.unprotected_rename(src_inp, dst_inp, op_ms as i64, flags, exchange_pre_swap_ids)?;
         self.journal_writer.log_rename(
             self,
             src_inp.path(),
             dst_inp.path(),
             op_ms as i64,
             flags,
+            exchange_pre_swap_ids,
         )?;
         Ok(res)
     }
@@ -343,13 +358,14 @@ impl FsDir {
         dst_inp: &InodePath,
         mtime: i64,
         flags: RenameFlags,
+        exchange_pre_swap_ids: Option<(i64, i64)>,
     ) -> FsResult<Option<DeleteResult>> {
         let src_inode = match src_inp.get_last_inode() {
             None => return err_ext!(FsError::file_not_found(src_inp.path())),
             Some(v) => v,
         };
         if flags.exchange_mode() {
-            self.unprotected_exchange(src_inp, dst_inp, mtime)?;
+            self.unprotected_exchange(src_inp, dst_inp, mtime, exchange_pre_swap_ids)?;
             return Ok(None);
         }
 
@@ -420,6 +436,7 @@ impl FsDir {
         src_inp: &InodePath,
         dst_inp: &InodePath,
         mtime: i64,
+        pre_swap_ids: Option<(i64, i64)>,
     ) -> FsResult<()> {
         let src_inode = match src_inp.get_last_inode() {
             None => return err_ext!(FsError::file_not_found(src_inp.path())),
@@ -430,8 +447,31 @@ impl FsDir {
             Some(v) => v,
         };
 
-        if src_inode.id() == dst_inode.id() {
+        let src_id = src_inode.id();
+        let dst_id = dst_inode.id();
+
+        if src_id == dst_id {
             return Ok(());
+        }
+
+        if let Some((expected_src, expected_dst)) = pre_swap_ids {
+            if expected_src != 0 && expected_dst != 0 {
+                if src_id == expected_dst && dst_id == expected_src {
+                    return Ok(());
+                }
+                if src_id != expected_src || dst_id != expected_dst {
+                    warn!(
+                        "Exchange replay inode id mismatch at {} and {}: current ({}, {}), expected ({}, {})",
+                        src_inp.path(),
+                        dst_inp.path(),
+                        src_id,
+                        dst_id,
+                        expected_src,
+                        expected_dst
+                    );
+                    return Ok(());
+                }
+            }
         }
 
         let mut src_parent = match src_inp.get_inode(-2) {
@@ -456,6 +496,21 @@ impl FsDir {
 
         src_parent.update_mtime(mtime);
         dst_parent.update_mtime(mtime);
+
+        if src_parent.id() != dst_parent.id() {
+            let src_was_dir = src_inode.is_dir();
+            let dst_was_dir = dst_inode.is_dir();
+            if src_was_dir && !dst_was_dir {
+                src_parent.dec_nlink(mtime);
+            } else if !src_was_dir && dst_was_dir {
+                src_parent.incr_nlink(mtime);
+            }
+            if dst_was_dir && !src_was_dir {
+                dst_parent.dec_nlink(mtime);
+            } else if !dst_was_dir && src_was_dir {
+                dst_parent.incr_nlink(mtime);
+            }
+        }
 
         self.store.apply_exchange(
             src_parent.as_ref(),

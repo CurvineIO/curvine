@@ -85,6 +85,11 @@ pub struct RenameEntry {
     pub(crate) dst: String,
     pub(crate) mtime: i64,
     pub(crate) flags: u32,
+    /// Pre-exchange inode ids for idempotent EXCHANGE replay (0 when absent / legacy).
+    #[serde(default)]
+    pub(crate) src_inode_id: i64,
+    #[serde(default)]
+    pub(crate) dst_inode_id: i64,
 }
 
 // delete

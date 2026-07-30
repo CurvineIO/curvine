@@ -700,6 +700,14 @@ impl JournalLoader {
             &dst_inp,
             entry.mtime,
             RenameFlags::new(entry.flags),
+            if RenameFlags::new(entry.flags).exchange_mode()
+                && entry.src_inode_id != 0
+                && entry.dst_inode_id != 0
+            {
+                Some((entry.src_inode_id, entry.dst_inode_id))
+            } else {
+                None
+            },
         )?;
 
         Ok(())

@@ -302,6 +302,18 @@ impl MasterFilesystem {
             }
         }
 
+        // EXCHANGE also rejects src under dst (/a/b <-> /a would make /a its own descendant).
+        if flags.exchange_mode() {
+            if let Some(rest) = src.strip_prefix(dst) {
+                if rest.starts_with(PATH_SEPARATOR) {
+                    return err_ext!(FsError::invalid_argument(format!(
+                        "cannot exchange {} with {}: source is under destination",
+                        src, dst
+                    )));
+                }
+            }
+        }
+
         if let Some(del_res) = fs_dir.rename(&src_inp, &dst_inp, flags)? {
             let mut worker_manager = self.worker_manager.write();
             worker_manager.remove_blocks(&del_res);
