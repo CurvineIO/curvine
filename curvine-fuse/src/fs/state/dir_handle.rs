@@ -135,7 +135,8 @@ impl DirHandle {
             .collect())
     }
 
-    pub fn set_stream(&mut self, stream: ListStream) {
+    pub fn set_stream(&mut self, path: &Path, stream: ListStream) {
+        self.path = path.clone_uri();
         self.stream
             .replace(Mutex::new(InnerStream::new(stream, self.path.clone())));
     }

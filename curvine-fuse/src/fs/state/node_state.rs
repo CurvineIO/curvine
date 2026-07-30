@@ -1147,6 +1147,10 @@ impl NodeState {
         Ok(ListStream::new(dots.chain(inner)))
     }
 
+    fn restored_dir_handle_path(&self, handle: &DirHandle) -> FuseResult<Path> {
+        self.get_path(handle.ino)
+    }
+
     pub async fn restore(&self, reader: &mut StateReader) -> FuseResult<()> {
         let metrics_enabled = self.conf.metrics_enabled;
 
@@ -1224,9 +1228,11 @@ impl NodeState {
                 let dir_handles_count = reader.read_len()?;
                 for _ in 0..dir_handles_count {
                     let mut handle = reader.read_struct::<DirHandle>()?;
-                    let path = Path::from_str(&handle.path)?;
+                    // DirHandle.path may be the original open-time path. The
+                    // restored dcache is authoritative after a rename.
+                    let path = self.restored_dir_handle_path(&handle)?;
                     let stream = self.list_stream(&path).await?;
-                    handle.set_stream(stream);
+                    handle.set_stream(&path, stream);
 
                     self.dir_handles
                         .write()
@@ -1489,6 +1495,89 @@ mod test {
                 result.is_err(),
                 "a corrupt file-handle record must fail the whole state restore"
             );
+        });
+    }
+
+    #[test]
+    fn persisted_dir_handle_resolves_path_after_ancestor_rename() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let task_rt = rt.clone();
+
+        rt.block_on(async move {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), task_rt).unwrap();
+            let persisted_state = NodeState::new(fs.clone()).unwrap();
+            let restored_state = NodeState::new(fs).unwrap();
+
+            let dir_ino = {
+                let mut tree = persisted_state.dir_write();
+                let parent_ino = tree
+                    .lookup(
+                        FUSE_ROOT_ID,
+                        "old",
+                        FileStatus::with_name(10, "old".to_string(), true),
+                        false,
+                    )
+                    .unwrap()
+                    .ino;
+                tree.lookup(
+                    parent_ino,
+                    "d",
+                    FileStatus::with_name(11, "d".to_string(), true),
+                    false,
+                )
+                .unwrap()
+                .ino
+            };
+
+            let old_path = persisted_state.get_path(dir_ino).unwrap();
+            let handle = Arc::new(DirHandle::new(
+                dir_ino,
+                77,
+                &old_path,
+                16,
+                ListStream::new(futures::stream::empty()),
+            ));
+            persisted_state
+                .dir_handles
+                .write()
+                .entry(dir_ino)
+                .or_default()
+                .insert(handle.fh, handle);
+
+            persisted_state
+                .rename(FUSE_ROOT_ID, "old", FUSE_ROOT_ID, "new")
+                .unwrap();
+            assert_eq!(
+                persisted_state.get_path(dir_ino).unwrap().full_path(),
+                "/new/d"
+            );
+
+            let state_path = Utils::temp_file();
+            let _ = std::fs::remove_file(&state_path);
+            let mut writer = StateWriter::new(&state_path).unwrap();
+            persisted_state.persist(&mut writer).await.unwrap();
+            writer.flush().unwrap();
+            drop(writer);
+
+            let mut reader = StateReader::new(&state_path).unwrap();
+            let mut magic = [0u8; 4];
+            reader.read_exact(&mut magic).unwrap();
+            assert_eq!(&magic, crate::STATE_FILE_MAGIC);
+            assert_eq!(reader.read_len().unwrap(), crate::STATE_FILE_VERSION);
+            restored_state.dir_write().restore(&mut reader).unwrap();
+
+            assert_eq!(reader.read_len().unwrap(), 0, "no file handles persisted");
+            assert_eq!(reader.read_len().unwrap(), 1, "one dir handle persisted");
+            let persisted_handle = reader.read_struct::<DirHandle>().unwrap();
+            assert_eq!(persisted_handle.path, "/old/d");
+
+            let restored_path = restored_state
+                .restored_dir_handle_path(&persisted_handle)
+                .unwrap();
+            assert_eq!(restored_path.full_path(), "/new/d");
+            drop(reader);
+            let _ = std::fs::remove_file(&state_path);
         });
     }
 
