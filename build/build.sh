@@ -937,7 +937,7 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
   MATURIN_AUDIT="${CURVINE_MATURIN_AUDITWHEEL:-skip}"
 
   echo "Building Python wheel (maturin) into ${DIST_DIR}/lib ..."
-  cd "$FS_HOME/curvine-libsdk-python"
+  cd "$FS_HOME/crates/sdk/curvine-libsdk-python"
   PY_SDK_FEATURES="$(libsdk_features "extension-module")" || exit 1
   echo "maturin features: ${PY_SDK_FEATURES}"
   "${MATURIN_CMD[@]}" build --no-default-features \
