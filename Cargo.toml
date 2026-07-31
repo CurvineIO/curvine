@@ -69,6 +69,7 @@ default-members = [
     "crates/infra/orpc-rpc",
     "crates/infra/curvine-sys",
     "crates/infra/curvine-io",
+    "crates/metadata/curvine-raft",
     "curvine-common",
     "curvine-server",
     "crates/client/curvine-client-core",
