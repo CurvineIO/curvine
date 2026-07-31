@@ -2204,7 +2204,10 @@ impl fs::FileSystem for CurvineFileSystem {
 #[cfg(test)]
 mod tests {
     use crate::fs::dcache::Inode;
-    use crate::{FATTR_ATIME_NOW, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_UID};
+    use crate::{
+        FATTR_ATIME_NOW, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_UID,
+        FUSE_INIT_EXT,
+    };
     use curvine_common::state::{FileAllocMode, FileStatus, FileType, INTERNAL_CTIME_XATTR};
 
     #[test]
@@ -2890,11 +2893,15 @@ mod tests {
         assert!(names.contains(&"DO_READDIRPLUS".to_string()));
         // Empty flags => empty list.
         assert!(fuse_init_flag_names(0).is_empty());
-        // An unknown bit is surfaced as a hex token, not silently dropped.
-        let unknown = 1u32 << 30;
-        let names = fuse_init_flag_names(FUSE_BIG_WRITES | unknown);
+        // FUSE_INIT_EXT is a known input-format capability and renders by name.
+        let names = fuse_init_flag_names(FUSE_BIG_WRITES | FUSE_INIT_EXT);
         assert!(names.contains(&"BIG_WRITES".to_string()));
-        assert!(names.iter().any(|n| n == "0x40000000"));
+        assert!(names.contains(&"INIT_EXT".to_string()));
+        // A bit not registered in the name map is surfaced as hex, not silently dropped.
+        let unknown = 1u32 << 31;
+        assert!(fuse_init_flag_names(unknown)
+            .iter()
+            .any(|n| n == "0x80000000"));
         // Keep EXPORT_SUPPORT in logging so offered-but-dropped bits render by name.
         assert!(fuse_init_flag_names(FUSE_EXPORT_SUPPORT).contains(&"EXPORT_SUPPORT".to_string()));
     }
