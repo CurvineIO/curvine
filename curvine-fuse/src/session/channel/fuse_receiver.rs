@@ -733,9 +733,47 @@ mod tests {
     use crate::fuse_metrics::{RECEIVE_ACTION_CONTINUE, RECEIVE_ACTION_EXIT};
     use bytes::BytesMut;
     use libc::{EAGAIN, ECONNABORTED, EINTR, EIO, ENODEV, ENOENT};
+    use orpc::runtime::{AsyncRuntime, RpcRuntime};
+    use orpc::sync::channel::AsyncChannel;
     use orpc::sync::FastDashMap;
+    use orpc::sys;
+    use orpc::sys::pipe::{AsyncFd, OwnedFd};
     use std::sync::Arc;
-    use tokio::sync::Notify;
+    use std::time::Duration;
+    use tokio::sync::{watch, Notify};
+
+    #[test]
+    fn receiver_exits_when_shutdown_channel_closes() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.clone().block_on(async move {
+            let [read_fd, write_fd] = sys::pipe2(4096).unwrap();
+            let read_fd = OwnedFd::new(read_fd);
+            let _write_fd = OwnedFd::new(write_fd);
+            let kernel_fd = Arc::new(AsyncFd::new(read_fd.as_borrowed()).unwrap());
+            let (sender, _task_rx) = AsyncChannel::new(1).split();
+            let receiver = FuseReceiver::new(
+                Arc::new(TestFileSystem::new(Default::default())),
+                rt.clone(),
+                kernel_fd,
+                sender,
+                4096,
+                false,
+                false,
+                false,
+                Arc::new(FastDashMap::default()),
+                false,
+            )
+            .unwrap();
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            drop(shutdown_tx);
+
+            let result = tokio::time::timeout(Duration::from_secs(1), receiver.start(shutdown_rx))
+                .await
+                .expect("receiver must exit when the shutdown channel closes");
+
+            result.unwrap();
+        });
+    }
 
     #[test]
     fn receive_error_labels_classify_errno_and_action() {
