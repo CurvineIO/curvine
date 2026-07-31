@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
+use curvine_rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
 use orpc::common::{FileUtils, Utils};
 use orpc::CommonResult;
 

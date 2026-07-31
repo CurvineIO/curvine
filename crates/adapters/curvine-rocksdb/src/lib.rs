@@ -12,4 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use curvine_rocksdb::*;
+pub mod rocksdb;
+
+pub use self::rocksdb::*;
+pub use ::rocksdb::{
+    DBIteratorWithThreadMode, DBPinnableSlice, Error, WriteBatchWithTransaction, DB,
+};

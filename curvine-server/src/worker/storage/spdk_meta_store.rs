@@ -4,7 +4,7 @@ use crate::worker::storage::meta_store::BlockMetaStore;
 /// Key: block_id (8B). Value: dir_id(4B) | offset(8B) | size(8B) | len(8B) | finalized(1B) = 29B.
 /// O(1) per block
 use byteorder::{BigEndian, ByteOrder};
-use curvine_common::rocksdb::{DBConf, DBEngine};
+use curvine_rocksdb::{DBConf, DBEngine};
 use log::{info, warn};
 use orpc::{err_box, CommonResult};
 const CF_SPDK_BLOCKS: &str = "spdk_blocks";

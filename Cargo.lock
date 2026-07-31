@@ -2098,7 +2098,6 @@ dependencies = [
  "async-stream",
  "bincode",
  "bitflags 2.10.0",
- "byteorder",
  "bytes",
  "chrono",
  "clap",
@@ -2110,6 +2109,7 @@ dependencies = [
  "curvine-fs-api",
  "curvine-model",
  "curvine-proto",
+ "curvine-rocksdb",
  "curvine-storage-api",
  "dashmap 5.5.3",
  "flate2",
@@ -2129,7 +2129,6 @@ dependencies = [
  "prost-build 0.11.9",
  "raft",
  "regex",
- "rocksdb",
  "serde",
  "serde_json",
  "slog",
@@ -2386,6 +2385,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-rocksdb"
+version = "0.2.0"
+dependencies = [
+ "byteorder",
+ "log",
+ "orpc",
+ "prost 0.11.9",
+ "rocksdb",
+ "serde",
+]
+
+[[package]]
 name = "curvine-sdk-core"
 version = "0.2.0"
 dependencies = [
@@ -2415,6 +2426,7 @@ dependencies = [
  "curvine-common",
  "curvine-error",
  "curvine-fault",
+ "curvine-rocksdb",
  "curvine-storage-spdk",
  "curvine-ufs",
  "curvine-web",
@@ -2435,7 +2447,6 @@ dependencies = [
  "raft",
  "rand 0.8.5",
  "regex",
- "rocksdb",
  "rusqlite",
  "serde",
  "serde_json",

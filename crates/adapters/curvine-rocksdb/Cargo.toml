@@ -1,0 +1,14 @@
+[package]
+name = "curvine-rocksdb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Curvine RocksDB metadata adapter."
+
+[dependencies]
+byteorder = { workspace = true }
+log = { workspace = true }
+orpc = { workspace = true }
+prost = { workspace = true }
+rocksdb = { workspace = true }
+serde = { workspace = true }

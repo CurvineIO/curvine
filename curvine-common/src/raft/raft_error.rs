@@ -14,13 +14,13 @@
 
 use self::RaftError::*;
 use crate::raft::{NodeId, RaftGroup};
+use curvine_rocksdb::Error;
 use num_enum::{FromPrimitive, IntoPrimitive};
 use orpc::error::{ErrorDecoder, ErrorExt, ErrorImpl, StringError};
 use orpc::io::IOError;
 use orpc::CommonError;
 use prost::bytes::BytesMut;
 use prost::DecodeError;
-use rocksdb::Error;
 use std::io;
 use thiserror::Error;
 use tokio::sync::mpsc::error::SendError;
@@ -171,7 +171,7 @@ impl From<String> for RaftError {
     }
 }
 
-impl From<rocksdb::Error> for RaftError {
+impl From<Error> for RaftError {
     fn from(value: Error) -> Self {
         let io = io::Error::other(value);
         IO(ErrorImpl::with_source(io))

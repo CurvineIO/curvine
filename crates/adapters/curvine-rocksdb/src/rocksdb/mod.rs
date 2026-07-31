@@ -12,4 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use curvine_rocksdb::*;
+mod db_conf;
+pub use self::db_conf::DBConf;
+
+mod db_engine;
+pub use self::db_engine::*;
+
+mod rocks_utils;
+pub use self::rocks_utils::RocksUtils;
+
+mod write_batch;
+pub use self::write_batch::WriteBatch;

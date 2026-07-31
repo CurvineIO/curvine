@@ -18,6 +18,7 @@ fault-injection = [
 [dependencies]
 orpc = { workspace = true }
 curvine-common = { workspace = true }
+curvine-rocksdb = { workspace = true }
 curvine-error = { workspace = true, features = ["axum-response"] }
 curvine-fault = { workspace = true }
 curvine-storage-spdk = { workspace = true, optional = true }
@@ -27,7 +28,6 @@ curvine-web = { workspace = true }
 prost = { workspace = true }
 bincode = { workspace = true }
 serde = { workspace = true }
-rocksdb = { workspace = true }
 log = { workspace = true }
 raft = { workspace = true }
 once_cell = { workspace = true }
