@@ -364,7 +364,7 @@ impl<T: FileSystem> FuseSession<T> {
                 let mut shutdown_rx = shutdown_rx.clone();
                 let handle = rt.spawn(async move {
                     if let Err(err) = receiver.start(shutdown_rx).await {
-                        error!("failed to accept, cause = {:?}", err);
+                        error!("fuse receiver exited with error: {}", err);
                     }
                 });
                 handles.push(handle);
@@ -373,7 +373,7 @@ impl<T: FileSystem> FuseSession<T> {
             for sender in channel.senders {
                 let handle = rt.spawn(async move {
                     if let Err(err) = sender.start().await {
-                        error!("failed to send, cause = {:?}", err);
+                        error!("fuse sender exited with error: {}", err);
                     }
                 });
                 handles.push(handle);

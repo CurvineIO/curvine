@@ -498,10 +498,17 @@ impl<T: FileSystem> FuseReceiver<T> {
                     }
                 }
 
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        info!("receiver observed shutdown broadcast; exiting receive loop");
-                        break;
+                changed = shutdown_rx.changed() => {
+                    match changed {
+                        Ok(()) if *shutdown_rx.borrow() => {
+                            info!("receiver observed shutdown broadcast; exiting receive loop");
+                            break;
+                        }
+                        Ok(()) => {}
+                        Err(_) => {
+                            warn!("receiver shutdown channel closed; exiting receive loop");
+                            break;
+                        }
                     }
                 }
             }
