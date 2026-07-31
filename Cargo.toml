@@ -31,11 +31,11 @@ members = [
     "curvine-common",
     "curvine-common/macros",
     "curvine-server",
-    "curvine-client-core",
+    "crates/client/curvine-client-core",
     "crates/client/curvine-job-client",
     "crates/client/curvine-unified-fs",
     "crates/sdk/curvine-sdk-core",
-    "curvine-bench",
+    "crates/client/curvine-bench",
     "curvine-client",
     "curvine-libsdk",
     "crates/sdk/curvine-libsdk-java",
@@ -67,11 +67,11 @@ default-members = [
     "crates/infra/curvine-io",
     "curvine-common",
     "curvine-server",
-    "curvine-client-core",
+    "crates/client/curvine-client-core",
     "crates/client/curvine-job-client",
     "crates/client/curvine-unified-fs",
     "crates/sdk/curvine-sdk-core",
-    "curvine-bench",
+    "crates/client/curvine-bench",
     "curvine-client",
     "curvine-libsdk",
     "curvine-tests",
@@ -107,11 +107,11 @@ curvine-storage-api = { path = "crates/common/curvine-storage-api" }
 curvine-config = { path = "crates/common/curvine-config" }
 curvine-common = { path = "curvine-common" }
 curvine-common-macros = { path = "curvine-common/macros" }
-curvine-client-core = { path = "curvine-client-core" }
+curvine-client-core = { path = "crates/client/curvine-client-core" }
 curvine-job-client = { path = "crates/client/curvine-job-client" }
 curvine-unified-fs = { path = "crates/client/curvine-unified-fs" }
 curvine-sdk-core = { path = "crates/sdk/curvine-sdk-core" }
-curvine-bench = { path = "curvine-bench" }
+curvine-bench = { path = "crates/client/curvine-bench" }
 curvine-client = { path = "curvine-client", default-features = false }
 curvine-libsdk = { path = "curvine-libsdk" }
 curvine-libsdk-java = { path = "crates/sdk/curvine-libsdk-java" }
