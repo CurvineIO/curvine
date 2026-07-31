@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::block::BlockMeta;
+use crate::BlockMeta;
 use std::collections::HashMap;
 
 #[derive(Default)]

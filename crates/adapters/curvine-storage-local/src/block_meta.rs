@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::storage::VfsDir;
+use crate::VfsDir;
 use curvine_common::state::{ExtendedBlock, StorageType};
 use orpc::common::FileUtils;
 use orpc::{err_box, sys, CommonResult};
@@ -51,14 +51,14 @@ impl BlockState {
 /// 3. Worker restarts the loading block, len is the file length.
 #[derive(Debug, Clone)]
 pub struct BlockMeta {
-    pub(crate) id: i64,
-    pub(crate) len: i64,
-    pub(crate) state: BlockState,
-    pub(crate) dir_id: u32,
-    pub(crate) storage_type: StorageType,
-    pub(crate) actual_len: i64,
+    pub id: i64,
+    pub len: i64,
+    pub state: BlockState,
+    pub dir_id: u32,
+    pub storage_type: StorageType,
+    pub actual_len: i64,
     /// SPDK bdev byte offset
-    pub(crate) bdev_offset: i64,
+    pub bdev_offset: i64,
 }
 
 impl BlockMeta {

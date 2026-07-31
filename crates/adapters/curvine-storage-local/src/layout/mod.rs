@@ -19,8 +19,8 @@ pub use self::bdev_layout::BdevLayout;
 pub(crate) use self::file_layout::FileFinalizePlan;
 pub use self::file_layout::FileLayout;
 
-use crate::worker::block::BlockMeta;
-use crate::worker::storage::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};
+use crate::BlockMeta;
+use crate::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};
 use curvine_common::state::{ExtendedBlock, StorageType};
 use orpc::io::IOResult;
 use orpc::{err_box, CommonResult};

@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::block::{BlockMeta, BlockState};
-use crate::worker::storage::layout::FileFinalizePlan;
-use crate::worker::storage::{
+use crate::layout::FileFinalizePlan;
+use crate::{
     BlockLayout, BlockLayoutKind, BlockLayouts, Dataset, DirList, FileLayout, SpdkMetaStore,
     StorageRequest, StorageVersion, VfsDir, VfsMetaStore,
 };
+use crate::{BlockMeta, BlockState};
 use curvine_common::conf::{ClusterConf, WorkerDataDir};
 use curvine_common::state::{ExtendedBlock, StorageInfo, StorageType};
 use indexmap::map::Values;
@@ -39,21 +39,21 @@ pub struct VfsDataset {
     num_blocks_to_delete: AtomicUsize,
 }
 
-pub(crate) struct RemovedBlockState {
-    pub(crate) meta: BlockMeta,
+pub struct RemovedBlockState {
+    pub meta: BlockMeta,
     committed: Option<BlockMeta>,
     pub(crate) layout: BlockLayoutKind,
     pub(crate) dir: Arc<VfsDir>,
 }
 
-pub(crate) struct FileOpenReservation {
+pub struct FileOpenReservation {
     pending: BlockMeta,
     committed: Option<BlockMeta>,
     dir: Arc<VfsDir>,
 }
 
 impl FileOpenReservation {
-    pub(crate) fn prepare(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
+    pub fn prepare(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         match self.committed.as_ref() {
             Some(committed) => FileLayout.prepare_write(&self.dir, committed, block),
             None => FileLayout.allocate(&self.dir, block),
@@ -61,20 +61,20 @@ impl FileOpenReservation {
     }
 }
 
-pub(crate) struct FileFinalizeReservation {
+pub struct FileFinalizeReservation {
     writing: BlockMeta,
     pending: BlockMeta,
     dir: Arc<VfsDir>,
 }
 
 impl FileFinalizeReservation {
-    pub(crate) fn prepare(&self, committed_len: i64) -> CommonResult<FileFinalizePlan> {
+    pub fn prepare(&self, committed_len: i64) -> CommonResult<FileFinalizePlan> {
         FileLayout::prepare_finalize(&self.dir, &self.pending, committed_len)
     }
 }
 
 impl RemovedBlockState {
-    pub(crate) fn deallocate(&self) -> CommonResult<()> {
+    pub fn deallocate(&self) -> CommonResult<()> {
         self.layout.deallocate(&self.dir, &self.meta)?;
         if let Some(committed) = self.committed.as_ref() {
             self.layout.deallocate(&self.dir, committed)?;
@@ -82,7 +82,7 @@ impl RemovedBlockState {
         Ok(())
     }
 
-    pub(crate) fn release_space(&self) {
+    pub fn release_space(&self) {
         self.dir
             .release_space(self.meta.is_final(), self.meta.physical_bytes());
         if let Some(committed) = self.committed.as_ref() {
@@ -244,7 +244,7 @@ impl VfsDataset {
             .collect()
     }
 
-    pub(crate) fn get_readable_block(&self, id: i64) -> Option<&BlockMeta> {
+    pub fn get_readable_block(&self, id: i64) -> Option<&BlockMeta> {
         if let Some(committed) = self.committed_rewrites.get(&id) {
             return Some(committed);
         }
@@ -252,7 +252,7 @@ impl VfsDataset {
         (meta.state() != &BlockState::Allocating).then_some(meta)
     }
 
-    pub(crate) fn reserve_file_open(
+    pub fn reserve_file_open(
         &mut self,
         block: &ExtendedBlock,
     ) -> CommonResult<Option<FileOpenReservation>> {
@@ -319,7 +319,7 @@ impl VfsDataset {
         }
     }
 
-    pub(crate) fn complete_file_open(
+    pub fn complete_file_open(
         &mut self,
         reservation: &FileOpenReservation,
         meta: BlockMeta,
@@ -343,10 +343,7 @@ impl VfsDataset {
         Ok(meta)
     }
 
-    pub(crate) fn rollback_file_open(
-        &mut self,
-        reservation: &FileOpenReservation,
-    ) -> CommonResult<()> {
+    pub fn rollback_file_open(&mut self, reservation: &FileOpenReservation) -> CommonResult<()> {
         let pending = self.meta.remove(reservation.pending.id()).ok_or_else(|| {
             orpc::err_msg!(format!(
                 "block {} open reservation missing during rollback",
@@ -371,7 +368,7 @@ impl VfsDataset {
         Ok(())
     }
 
-    pub(crate) fn reserve_file_finalize(
+    pub fn reserve_file_finalize(
         &mut self,
         block: &ExtendedBlock,
     ) -> CommonResult<Option<FileFinalizeReservation>> {
@@ -402,7 +399,7 @@ impl VfsDataset {
         }))
     }
 
-    pub(crate) fn publish_file_finalize(
+    pub fn publish_file_finalize(
         &mut self,
         reservation: &FileFinalizeReservation,
         plan: FileFinalizePlan,
@@ -441,7 +438,7 @@ impl VfsDataset {
         Ok(final_meta)
     }
 
-    pub(crate) fn rollback_file_finalize(
+    pub fn rollback_file_finalize(
         &mut self,
         reservation: &FileFinalizeReservation,
     ) -> CommonResult<()> {
@@ -475,12 +472,11 @@ impl VfsDataset {
             .map(|d| &d.state.offset_alloc)
     }
 
-    #[cfg(test)]
-    pub(crate) fn put_test_meta(&mut self, meta: BlockMeta) {
+    pub fn put_test_meta(&mut self, meta: BlockMeta) {
         self.meta.put(meta);
     }
 
-    pub(crate) fn remove_block_state_by_id(&mut self, id: i64) -> CommonResult<RemovedBlockState> {
+    pub fn remove_block_state_by_id(&mut self, id: i64) -> CommonResult<RemovedBlockState> {
         let meta = match self.meta.remove(id) {
             None => return err_box!("Not found block {}", id),
             Some(meta) => meta,
@@ -716,8 +712,8 @@ impl Dataset for VfsDataset {
 
 #[cfg(test)]
 mod test {
-    use crate::worker::block::{BlockMeta, BlockState};
-    use crate::worker::storage::{
+    use crate::{BlockMeta, BlockState};
+    use crate::{
         Dataset, DirList, DirState, FileLayout, SpdkMetaStore, StorageVersion, VfsDataset, VfsDir,
     };
     use curvine_common::conf::{ClusterConf, WorkerConf};

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::storage::{DirState, StorageVersion, DEFAULT_BLOCK_ALIGN};
+use crate::{DirState, StorageVersion, DEFAULT_BLOCK_ALIGN};
 use curvine_common::conf::WorkerDataDir;
 use curvine_common::state::StorageType;
 #[cfg(feature = "spdk")]
@@ -357,11 +357,9 @@ impl Debug for VfsDir {
 #[cfg(all(test, feature = "spdk"))]
 mod test {
     use super::*;
-    use crate::worker::block::{BlockMeta, BlockState};
-    use crate::worker::storage::vfs_dir::VfsDir;
-    use crate::worker::storage::{
-        BdevLayout, BlockLayout, FileLayout, StorageVersion, DEFAULT_BLOCK_ALIGN,
-    };
+    use crate::vfs_dir::VfsDir;
+    use crate::{BdevLayout, BlockLayout, FileLayout, StorageVersion, DEFAULT_BLOCK_ALIGN};
+    use crate::{BlockMeta, BlockState};
     use curvine_common::conf::WorkerDataDir;
     use curvine_common::state::{ExtendedBlock, StorageType};
     use orpc::common::{ByteUnit, FileUtils};

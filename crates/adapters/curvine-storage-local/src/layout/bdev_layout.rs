@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::block::{BlockMeta, BlockState};
-use crate::worker::storage::layout::{validate_open_offset, BlockLayout};
-use crate::worker::storage::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};
+use crate::layout::{validate_open_offset, BlockLayout};
+use crate::{BlockMeta, BlockState};
+use crate::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};
 use curvine_common::state::ExtendedBlock;
 use log::{info, warn};
 use orpc::io::IOResult;

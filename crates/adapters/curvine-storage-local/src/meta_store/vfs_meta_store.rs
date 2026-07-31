@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::block::BlockMeta;
-use crate::worker::storage::meta_store::{BlockMetaStore, MemMetaStore};
-use crate::worker::storage::SpdkMetaStore;
+use crate::meta_store::{BlockMetaStore, MemMetaStore};
+use crate::BlockMeta;
+use crate::SpdkMetaStore;
 use curvine_common::state::StorageType;
 use log::warn;
 use std::sync::Arc;

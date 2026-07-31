@@ -18,7 +18,7 @@ mod vfs_meta_store;
 pub use self::mem_meta_store::MemMetaStore;
 pub use self::vfs_meta_store::VfsMetaStore;
 
-use crate::worker::block::BlockMeta;
+use crate::BlockMeta;
 use orpc::CommonResult;
 
 /// Persistent side-car store for block metadata records.

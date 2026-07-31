@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::storage::VfsDir;
+use crate::VfsDir;
 use curvine_common::state::StorageType;
 use indexmap::IndexMap;
 use orpc::{err_box, CommonResult};

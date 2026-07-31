@@ -1,6 +1,6 @@
 //! RocksDB-backed SPDK block metadata.
-use crate::worker::block::BlockMeta;
-use crate::worker::storage::meta_store::BlockMetaStore;
+use crate::meta_store::BlockMetaStore;
+use crate::BlockMeta;
 /// Key: block_id (8B). Value: dir_id(4B) | offset(8B) | size(8B) | len(8B) | finalized(1B) = 29B.
 /// O(1) per block
 use byteorder::{BigEndian, ByteOrder};

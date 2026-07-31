@@ -2452,6 +2452,7 @@ dependencies = [
  "curvine-error",
  "curvine-fault",
  "curvine-rocksdb",
+ "curvine-storage-local",
  "curvine-storage-spdk",
  "curvine-ufs-api",
  "curvine-web",
@@ -2487,6 +2488,21 @@ name = "curvine-storage-api"
 version = "0.2.0"
 dependencies = [
  "curvine-model",
+]
+
+[[package]]
+name = "curvine-storage-local"
+version = "0.2.0"
+dependencies = [
+ "byteorder",
+ "bytes",
+ "curvine-common",
+ "curvine-rocksdb",
+ "curvine-storage-spdk",
+ "indexmap 2.14.0",
+ "log",
+ "orpc",
+ "serde",
 ]
 
 [[package]]

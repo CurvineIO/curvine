@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod block_meta;
-pub use self::block_meta::*;
+pub use curvine_storage_local::{BlockMeta, BlockState};
 
 mod block_store;
 pub use self::block_store::BlockStore;

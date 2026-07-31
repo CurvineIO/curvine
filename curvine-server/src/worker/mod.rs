@@ -15,7 +15,7 @@
 pub mod worker_server;
 pub use self::worker_server::*;
 
-pub mod storage;
+pub use curvine_storage_local as storage;
 
 pub mod block;
 

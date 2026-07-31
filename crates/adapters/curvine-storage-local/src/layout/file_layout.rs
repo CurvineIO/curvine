@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::block::{BlockMeta, BlockState};
-use crate::worker::storage::layout::{validate_open_offset, BlockLayout};
-use crate::worker::storage::{BlockReadContext, BlockWriteContext, VfsDir};
+use crate::layout::{validate_open_offset, BlockLayout};
+use crate::{BlockMeta, BlockState};
+use crate::{BlockReadContext, BlockWriteContext, VfsDir};
 use curvine_common::state::ExtendedBlock;
 #[cfg(test)]
 use orpc::common::ByteUnit;
@@ -31,7 +31,7 @@ pub struct FileLayout;
 const ACTIVE_DIR: &str = "active";
 const STAGING_DIR: &str = "staging";
 
-pub(crate) struct FileFinalizePlan {
+pub struct FileFinalizePlan {
     final_meta: BlockMeta,
     staging_path: PathBuf,
     active_path: PathBuf,
@@ -84,7 +84,7 @@ impl FileLayout {
         Ok(path)
     }
 
-    pub(crate) fn block_path(dir: &VfsDir, meta: &BlockMeta) -> CommonResult<PathBuf> {
+    pub fn block_path(dir: &VfsDir, meta: &BlockMeta) -> CommonResult<PathBuf> {
         Ok(Self::block_dir(dir, meta)?.join(meta.state().get_name(meta.id())))
     }
 

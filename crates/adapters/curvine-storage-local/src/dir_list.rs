@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::storage::{ChoosingPolicy, RobinChoosingPolicy, VfsDir};
+use crate::{ChoosingPolicy, RobinChoosingPolicy, VfsDir};
 use curvine_common::state::{StorageInfo, StorageType};
 use indexmap::map::Values;
 use indexmap::IndexMap;
@@ -266,7 +266,7 @@ impl Index<usize> for DirList {
 
 #[cfg(test)]
 mod tests {
-    use crate::worker::storage::{DirList, StorageRequest, VfsDir};
+    use crate::{DirList, StorageRequest, VfsDir};
     use curvine_common::conf::WorkerDataDir;
     use curvine_common::state::StorageType;
     use orpc::common::{ByteUnit, FileUtils};
