@@ -50,7 +50,7 @@ Hosts normally forward their own feature:
 
 ```toml
 [dependencies]
-curvine-fault = { path = "../curvine-fault" }
+curvine-fault = { path = "../crates/infra/curvine-fault" }
 
 [features]
 fault-injection = ["curvine-fault/fault-injection"]

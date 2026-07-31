@@ -11,7 +11,7 @@ resolver = "2"
 
 members = [
     "orpc",
-    "curvine-fault",
+    "crates/infra/curvine-fault",
     "crates/common/curvine-error",
     "crates/common/curvine-proto",
     "crates/common/curvine-model",
@@ -33,7 +33,7 @@ members = [
     "curvine-server",
     "curvine-client-core",
     "crates/client/curvine-job-client",
-    "curvine-unified-fs",
+    "crates/client/curvine-unified-fs",
     "crates/sdk/curvine-sdk-core",
     "curvine-bench",
     "curvine-client",
@@ -52,7 +52,7 @@ members = [
 # curvine-lancedb stays opt-in because it pulls heavy Lance/Arrow dependencies.
 default-members = [
     "orpc",
-    "curvine-fault",
+    "crates/infra/curvine-fault",
     "crates/common/curvine-error",
     "crates/common/curvine-proto",
     "crates/common/curvine-model",
@@ -69,7 +69,7 @@ default-members = [
     "curvine-server",
     "curvine-client-core",
     "crates/client/curvine-job-client",
-    "curvine-unified-fs",
+    "crates/client/curvine-unified-fs",
     "crates/sdk/curvine-sdk-core",
     "curvine-bench",
     "curvine-client",
@@ -98,7 +98,7 @@ curvine-storage-spdk = { path = "crates/adapters/curvine-storage-spdk" }
 curvine-ufs-opendal = { path = "crates/adapters/curvine-ufs-opendal" }
 curvine-ufs-oss-hdfs = { path = "crates/adapters/curvine-ufs-oss-hdfs" }
 curvine-hdfs-jni = { path = "crates/adapters/curvine-hdfs-jni" }
-curvine-fault = { path = "curvine-fault" }
+curvine-fault = { path = "crates/infra/curvine-fault" }
 curvine-error = { path = "crates/common/curvine-error" }
 curvine-proto = { path = "crates/common/curvine-proto" }
 curvine-model = { path = "crates/common/curvine-model" }
@@ -109,7 +109,7 @@ curvine-common = { path = "curvine-common" }
 curvine-common-macros = { path = "curvine-common/macros" }
 curvine-client-core = { path = "curvine-client-core" }
 curvine-job-client = { path = "crates/client/curvine-job-client" }
-curvine-unified-fs = { path = "curvine-unified-fs" }
+curvine-unified-fs = { path = "crates/client/curvine-unified-fs" }
 curvine-sdk-core = { path = "crates/sdk/curvine-sdk-core" }
 curvine-bench = { path = "curvine-bench" }
 curvine-client = { path = "curvine-client", default-features = false }
