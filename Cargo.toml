@@ -39,7 +39,7 @@ members = [
     "curvine-client",
     "curvine-libsdk",
     "crates/sdk/curvine-libsdk-java",
-    "curvine-libsdk-python",
+    "crates/sdk/curvine-libsdk-python",
     "curvine-lancedb",
     'curvine-tests',
     "curvine-fuse",
@@ -115,7 +115,7 @@ curvine-bench = { path = "curvine-bench" }
 curvine-client = { path = "curvine-client", default-features = false }
 curvine-libsdk = { path = "curvine-libsdk" }
 curvine-libsdk-java = { path = "crates/sdk/curvine-libsdk-java" }
-curvine-libsdk-python = { path = "curvine-libsdk-python" }
+curvine-libsdk-python = { path = "crates/sdk/curvine-libsdk-python" }
 curvine-server = { path = "curvine-server" }
 curvine-lancedb = { path = "curvine-lancedb" }
 curvine-ufs = { path = "curvine-ufs" }
