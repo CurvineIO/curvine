@@ -21,12 +21,13 @@ spdk-rdma = [
 ]
 fault-injection = [
     "curvine-fault/http-server",
+    "curvine-master/fault-injection",
 ]
 
 [dependencies]
 orpc = { workspace = true }
 curvine-common = { workspace = true }
-curvine-rocksdb = { workspace = true }
+curvine-master = { workspace = true }
 curvine-error = { workspace = true, features = ["axum-response"] }
 curvine-fault = { workspace = true }
 curvine-storage-local = { workspace = true }
@@ -35,36 +36,24 @@ curvine-client = { workspace = true, features = ["job-client", "unified", "opend
 curvine-ufs-api = { workspace = true }
 curvine-web = { workspace = true }
 prost = { workspace = true }
-bincode = { workspace = true }
 serde = { workspace = true }
 log = { workspace = true }
-raft = { workspace = true }
 once_cell = { workspace = true }
 tokio = { workspace = true }
-glob = { workspace = true }
 futures = { workspace = true }
-toml = { workspace = true }
-num_enum = { workspace = true }
-indexmap = { workspace = true }
 clap = { workspace = true }
-mini-moka = { workspace = true }
-regex = { workspace = true }
-linked-hash-map = { workspace = true }
 crossbeam = { workspace = true }
 rusqlite = { workspace = true }
 mysql = { workspace = true }
 dashmap = { workspace = true }
 axum = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
-rand = { workspace = true }
-url = { workspace = true }
 parking_lot = { workspace = true }
-lru = { workspace = true }
-byteorder = { workspace = true }
 
 [dev-dependencies]
+curvine-rocksdb = { workspace = true }
 curvine-fault = { workspace = true, features = ["http-client"] }
+raft = { workspace = true }

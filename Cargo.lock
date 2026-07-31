@@ -2356,6 +2356,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-master"
+version = "0.2.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "curvine-client",
+ "curvine-common",
+ "curvine-error",
+ "curvine-fault",
+ "curvine-rocksdb",
+ "curvine-web",
+ "dashmap 5.5.3",
+ "futures",
+ "glob",
+ "indexmap 2.14.0",
+ "log",
+ "lru 0.16.1",
+ "mini-moka",
+ "num_enum",
+ "once_cell",
+ "orpc",
+ "parking_lot",
+ "prost 0.11.9",
+ "raft",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "curvine-model"
 version = "0.2.0"
 dependencies = [
@@ -2441,8 +2473,6 @@ name = "curvine-server"
 version = "0.2.0"
 dependencies = [
  "axum",
- "bincode",
- "byteorder",
  "bytes",
  "chrono",
  "clap",
@@ -2451,6 +2481,7 @@ dependencies = [
  "curvine-common",
  "curvine-error",
  "curvine-fault",
+ "curvine-master",
  "curvine-rocksdb",
  "curvine-storage-local",
  "curvine-storage-spdk",
@@ -2458,28 +2489,17 @@ dependencies = [
  "curvine-web",
  "dashmap 5.5.3",
  "futures",
- "glob",
- "indexmap 2.14.0",
- "linked-hash-map",
  "log",
- "lru 0.16.1",
- "mini-moka",
  "mysql",
- "num_enum",
  "once_cell",
  "orpc",
  "parking_lot",
  "prost 0.11.9",
  "raft",
- "rand 0.8.5",
- "regex",
  "rusqlite",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
  "tokio",
- "toml",
- "url",
  "uuid",
 ]
 

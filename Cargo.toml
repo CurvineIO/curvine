@@ -32,6 +32,7 @@ members = [
     "crates/adapters/curvine-ufs-opendal",
     "crates/adapters/curvine-ufs-oss-hdfs",
     "crates/adapters/curvine-hdfs-jni",
+    "curvine-master",
     "curvine-common",
     "curvine-common/macros",
     "curvine-server",
@@ -72,6 +73,7 @@ default-members = [
     "crates/infra/curvine-io",
     "crates/metadata/curvine-raft",
     "crates/adapters/curvine-storage-local",
+    "curvine-master",
     "curvine-common",
     "curvine-server",
     "crates/client/curvine-client-core",
@@ -118,6 +120,7 @@ curvine-ufs-api = { path = "crates/common/curvine-ufs-api" }
 curvine-config = { path = "crates/common/curvine-config" }
 curvine-common = { path = "curvine-common" }
 curvine-common-macros = { path = "curvine-common/macros" }
+curvine-master = { path = "curvine-master" }
 curvine-client-core = { path = "crates/client/curvine-client-core" }
 curvine-job-client = { path = "crates/client/curvine-job-client" }
 curvine-unified-fs = { path = "crates/client/curvine-unified-fs" }

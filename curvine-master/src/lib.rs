@@ -12,9 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod ufs_manager;
+pub mod common;
+pub mod master;
 
-pub mod ufs_client;
-pub use self::ufs_client::UfsClient;
+pub use common::UfsFactory;
+pub use master::*;
 
-pub use curvine_master::UfsFactory;
+#[cfg(feature = "fault-injection")]
+pub(crate) use curvine_fault::fault_point;
+
+#[cfg(not(feature = "fault-injection"))]
+pub(crate) use curvine_fault::__noop_fault_point as fault_point;

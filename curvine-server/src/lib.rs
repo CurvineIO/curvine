@@ -13,10 +13,11 @@
 // limitations under the License.
 
 pub mod common;
-pub mod master;
 pub mod test;
 pub mod transfer;
 pub mod worker;
+
+pub use curvine_master::master;
 
 #[cfg(feature = "fault-injection")]
 pub(crate) use curvine_fault::fault_point;
