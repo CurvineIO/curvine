@@ -447,3 +447,43 @@ fn fluid_bytes_to_string(size: i64) -> String {
 
     format!("{value:.2}{unit}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_model::WorkerAddress;
+
+    #[test]
+    fn simple_report_renders_worker_report_fields() {
+        let startup_time_ms = 123_456;
+        let worker = WorkerInfo {
+            address: WorkerAddress {
+                worker_id: 7,
+                hostname: "worker-host".to_string(),
+                ip_addr: "127.0.0.1".to_string(),
+                rpc_port: 1234,
+                web_port: 5678,
+            },
+            software_version: "0.1.0-test".to_string(),
+            startup_time_ms,
+            capacity: 1024,
+            available: 512,
+            ..Default::default()
+        };
+        let report = CurvineReport {
+            info: MasterInfo {
+                live_workers: vec![worker],
+                ..Default::default()
+            },
+        };
+
+        let output = report.simple(true);
+
+        assert!(output.contains("worker-host:1234"));
+        assert!(output.contains("version=0.1.0-test"));
+        assert!(output.contains(&format!(
+            "startup_time={}",
+            CurvineReport::format_epoch_ms(startup_time_ms)
+        )));
+    }
+}
