@@ -16,12 +16,12 @@ curvine-fs-api = { workspace = true }
 curvine-storage-api = { workspace = true }
 curvine-config = { workspace = true }
 curvine-rocksdb = { workspace = true }
+curvine-raft = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 async-stream =  { workspace = true }
 bytes = { workspace = true }
 log = { workspace = true }
-raft = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -64,8 +64,6 @@ jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
 system = []
 
-[build-dependencies]
-prost-build = { workspace = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::raft::snapshot::{FileReader, FileWriter};
+use curvine_raft::raft::snapshot::{FileReader, FileWriter};
 use orpc::common::{FileUtils, Utils};
 use orpc::io::LocalFile;
 use orpc::CommonResult;

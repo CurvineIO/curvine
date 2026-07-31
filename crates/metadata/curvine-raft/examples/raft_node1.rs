@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::conf::JournalConf;
-use curvine_common::raft::storage::{LogStorage, RocksAppStorage, RocksLogStorage};
-use curvine_common::raft::{RaftClient, RaftJournal, RaftPeer, RoleMonitor};
-use curvine_common::utils::SerdeUtils;
+use curvine_raft::conf::JournalConf;
+use curvine_raft::raft::storage::{LogStorage, RocksAppStorage, RocksLogStorage};
+use curvine_raft::raft::{RaftClient, RaftJournal, RaftPeer, RoleMonitor};
+use curvine_raft::utils::SerdeUtils;
 use log::info;
 use orpc::common::{Logger, Utils};
 use orpc::runtime::{RpcRuntime, Runtime};

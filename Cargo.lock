@@ -2109,6 +2109,7 @@ dependencies = [
  "curvine-fs-api",
  "curvine-model",
  "curvine-proto",
+ "curvine-raft",
  "curvine-rocksdb",
  "curvine-storage-api",
  "dashmap 5.5.3",
@@ -2126,8 +2127,6 @@ dependencies = [
  "orpc",
  "percent-encoding",
  "prost 0.11.9",
- "prost-build 0.11.9",
- "raft",
  "regex",
  "serde",
  "serde_json",
@@ -2382,6 +2381,32 @@ dependencies = [
  "prost 0.11.9",
  "prost-build 0.11.9",
  "serde",
+]
+
+[[package]]
+name = "curvine-raft"
+version = "0.2.0"
+dependencies = [
+ "bincode",
+ "bytes",
+ "crc32fast",
+ "curvine-config",
+ "curvine-error",
+ "curvine-rocksdb",
+ "flate2",
+ "log",
+ "mini-moka",
+ "num_enum",
+ "orpc",
+ "prost 0.11.9",
+ "prost-build 0.11.9",
+ "raft",
+ "serde",
+ "serde_json",
+ "slog",
+ "slog-stdlog",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

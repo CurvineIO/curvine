@@ -12,24 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod alloc;
-pub mod conf;
-pub mod error;
-pub mod executor;
-pub mod fs;
-pub use curvine_raft::raft;
-pub mod rocksdb;
-pub mod state;
-pub mod utils;
-pub mod version;
+mod journal_conf;
+pub use self::journal_conf::JournalConf;
 
-pub mod proto {
-    pub use curvine_proto::*;
+pub(crate) struct ClusterConf;
 
-    pub use curvine_raft::proto::raft;
+impl ClusterConf {
+    pub const DEFAULT_HOSTNAME: &'static str = curvine_config::ClusterConf::DEFAULT_HOSTNAME;
+    pub const DEFAULT_RAFT_PORT: u16 = curvine_config::ClusterConf::DEFAULT_RAFT_PORT;
 }
-
-pub use curvine_error::{FsError, FsResult, MAX_FILE_SIZE};
-pub use curvine_model::UFS_INODE_ID;
-
-pub const FILE_BUFFER_SIZE: usize = 128 * 1024;
