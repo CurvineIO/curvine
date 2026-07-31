@@ -12,6 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Compatibility facade for the split `curvine-ufs-api` crate.
+//! Shared UFS config, context, and transfer primitives for clients and adapters.
 
-pub use curvine_ufs_api::*;
+pub mod fs;
+
+mod ufs_utils;
+pub use self::ufs_utils::UfsUtils;
+
+mod conf;
+pub use self::conf::*;
+
+pub const FOLDER_SUFFIX: &str = "/";
+
+#[macro_export]
+macro_rules! err_ufs {
+    ($e:expr) => ({
+        Err(orpc::err_msg!($e).into())
+    });
+
+    ($f:tt, $($arg:expr),+) => ({
+        orpc::err_box!(format!($f, $($arg),+))
+    });
+}

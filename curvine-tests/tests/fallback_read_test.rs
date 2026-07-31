@@ -482,7 +482,7 @@ fn test_tc14_seek_after_ufs_fallback() {
 ///     -- --exact --nocapture
 /// ```
 ///
-/// Property keys map to `S3Conf` in curvine-ufs/src/conf.rs. `s3.endpoint_url`
+/// Property keys map to `S3Conf` in curvine-ufs-api/src/conf.rs. `s3.endpoint_url`
 /// MUST start with http:// or https://. `s3.region_name` is required by the
 /// OpenDAL S3 builder (omitting it fails with "region is missing"). If output
 /// shows "WARNING: UFS_TEST_PATH not set", the env vars did not take effect.

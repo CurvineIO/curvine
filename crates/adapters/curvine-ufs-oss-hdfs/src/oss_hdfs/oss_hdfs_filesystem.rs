@@ -18,7 +18,7 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, Path};
 use curvine_model::{FileStatus, FileType, SetAttrOpts};
-use curvine_ufs::{err_ufs, OssHdfsConf};
+use curvine_ufs_api::{err_ufs, OssHdfsConf};
 use orpc::common::LocalTime;
 use orpc::error::ErrorExt;
 use orpc::sys::DataSlice;

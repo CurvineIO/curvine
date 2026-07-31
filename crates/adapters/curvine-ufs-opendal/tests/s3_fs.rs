@@ -18,7 +18,7 @@ mod s3_tests {
 
     use curvine_common::fs::{FileSystem, Path, Reader, Writer};
     use curvine_common::state::FileStatus;
-    use curvine_ufs::opendal::OpendalFileSystem;
+    use curvine_ufs_opendal::OpendalFileSystem;
     use orpc::common::{FileUtils, Utils};
     use orpc::runtime::{AsyncRuntime, RpcRuntime};
     use orpc::CommonResult;

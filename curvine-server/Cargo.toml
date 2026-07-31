@@ -22,7 +22,7 @@ curvine-error = { workspace = true, features = ["axum-response"] }
 curvine-fault = { workspace = true }
 curvine-storage-spdk = { workspace = true, optional = true }
 curvine-client = { workspace = true, features = ["job-client", "unified", "opendal-s3"] }
-curvine-ufs = { workspace = true }
+curvine-ufs-api = { workspace = true }
 curvine-web = { workspace = true }
 prost = { workspace = true }
 bincode = { workspace = true }

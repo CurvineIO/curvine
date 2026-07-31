@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Compatibility facade for the split `curvine-ufs-api` crate.
+mod buffer_transfer;
+pub use crate::fs::buffer_transfer::*;
 
-pub use curvine_ufs_api::*;
+pub mod channel_transfer;
+
+pub mod ufs_context;
+pub use self::ufs_context::UFSContext;

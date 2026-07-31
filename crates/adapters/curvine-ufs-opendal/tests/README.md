@@ -51,18 +51,18 @@ The S3 test includes the following aspects:
 Run all S3 tests with the following command:
 
 ```bash
-cargo test -p curvine-ufs --test s3
+cargo test -p curvine-ufs-opendal --test s3
 ```
 
 Or run a specific test:
 
 ```bash
 # Run only basic operation tests
-cargo test -p curvine-ufs --test s3_tests
+cargo test -p curvine-ufs-opendal --test s3_tests
 
 # Run only zero copy tests
-cargo test -p curvine-ufs --test zero_copy_transfer_tests
+cargo test -p curvine-ufs-opendal --test zero_copy_transfer_tests
 
 # Run concurrent tests only
-cargo test -p curvine-ufs --test concurrent_s3_tests
+cargo test -p curvine-ufs-opendal --test concurrent_s3_tests
 ```

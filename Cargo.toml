@@ -17,6 +17,7 @@ members = [
     "crates/common/curvine-model",
     "crates/common/curvine-fs-api",
     "crates/common/curvine-storage-api",
+    "crates/common/curvine-ufs-api",
     "crates/common/curvine-config",
     "crates/infra/orpc-error",
     "crates/infra/orpc-runtime",
@@ -58,6 +59,7 @@ default-members = [
     "crates/common/curvine-model",
     "crates/common/curvine-fs-api",
     "crates/common/curvine-storage-api",
+    "crates/common/curvine-ufs-api",
     "crates/common/curvine-config",
     "crates/infra/orpc-error",
     "crates/infra/orpc-runtime",
@@ -104,6 +106,7 @@ curvine-proto = { path = "crates/common/curvine-proto" }
 curvine-model = { path = "crates/common/curvine-model" }
 curvine-fs-api = { path = "crates/common/curvine-fs-api" }
 curvine-storage-api = { path = "crates/common/curvine-storage-api" }
+curvine-ufs-api = { path = "crates/common/curvine-ufs-api" }
 curvine-config = { path = "crates/common/curvine-config" }
 curvine-common = { path = "curvine-common" }
 curvine-common-macros = { path = "curvine-common/macros" }

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 /*
-Complete HDFS integration tests for curvine-ufs
+Complete HDFS integration tests for curvine-ufs-opendal
 
 This file contains comprehensive HDFS tests:
 1. Native HDFS test with full read/write operations
@@ -24,21 +24,21 @@ This file contains comprehensive HDFS tests:
 ### Test WebHDFS only:
 ```bash
 export WEBHDFS_ENDPOINT=http://127.0.0.1:50070
-cargo test --features opendal-webhdfs -p curvine-ufs --test hdfs_integration_test -- --ignored
+cargo test --features opendal-webhdfs -p curvine-ufs-opendal --test hdfs_integration_test -- --ignored
 ```
 
 ### Test both HDFS and WebHDFS:
 ```bash
 export HDFS_NAMENODE=hdfs://test-hdfs
 export WEBHDFS_ENDPOINT=http://127.0.0.1:50070
-cargo test --features opendal-hdfs,opendal-webhdfs -p curvine-ufs --test hdfs_integration_test -- --ignored
+cargo test --features opendal-hdfs,opendal-webhdfs -p curvine-ufs-opendal --test hdfs_integration_test -- --ignored
 ```
 */
 
 #[cfg(any(feature = "opendal-hdfs", feature = "opendal-webhdfs"))]
 mod hdfs_tests {
     use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-    use curvine_ufs::opendal::OpendalFileSystem;
+    use curvine_ufs_opendal::OpendalFileSystem;
     use std::collections::HashMap;
     use std::env;
 

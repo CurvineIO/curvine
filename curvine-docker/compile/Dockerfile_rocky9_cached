@@ -134,7 +134,7 @@ COPY Cargo.toml ./
 COPY Cargo.lock ./
 
 # Create workspace member structure and generate minimal config files (merged into single RUN to reduce layers)
-RUN mkdir -p curvine-common/src curvine-server/src curvine-client/src curvine-libsdk/src curvine-tests/src curvine-fuse/src curvine-web/src curvine-ufs/src curvine-cli/src orpc/src && \
+RUN mkdir -p curvine-common/src curvine-server/src curvine-client/src curvine-libsdk/src curvine-tests/src curvine-fuse/src curvine-web/src curvine-ufs/src curvine-cli/src orpc/src crates/common/curvine-ufs-api/src && \
     echo '[package]\nname = "curvine-common"\nversion = "0.1.0"\nedition = "2021"' > curvine-common/Cargo.toml && \
     echo '[package]\nname = "curvine-server"\nversion = "0.1.0"\nedition = "2021"' > curvine-server/Cargo.toml && \
     echo '[package]\nname = "curvine-client"\nversion = "0.1.0"\nedition = "2021"' > curvine-client/Cargo.toml && \
@@ -143,6 +143,7 @@ RUN mkdir -p curvine-common/src curvine-server/src curvine-client/src curvine-li
     echo '[package]\nname = "curvine-fuse"\nversion = "0.1.0"\nedition = "2021"' > curvine-fuse/Cargo.toml && \
     echo '[package]\nname = "curvine-web"\nversion = "0.1.0"\nedition = "2021"' > curvine-web/Cargo.toml && \
     echo '[package]\nname = "curvine-ufs"\nversion = "0.1.0"\nedition = "2021"' > curvine-ufs/Cargo.toml && \
+    echo '[package]\nname = "curvine-ufs-api"\nversion = "0.1.0"\nedition = "2021"' > crates/common/curvine-ufs-api/Cargo.toml && \
     echo '[package]\nname = "curvine-cli"\nversion = "0.1.0"\nedition = "2021"' > curvine-cli/Cargo.toml && \
     echo '[package]\nname = "orpc"\nversion = "0.1.0"\nedition = "2021"' > orpc/Cargo.toml && \
     echo 'fn main() {}' > curvine-common/src/lib.rs && \
@@ -153,6 +154,7 @@ RUN mkdir -p curvine-common/src curvine-server/src curvine-client/src curvine-li
     echo 'fn main() {}' > curvine-fuse/src/main.rs && \
     echo 'fn main() {}' > curvine-web/src/lib.rs && \
     echo 'fn main() {}' > curvine-ufs/src/lib.rs && \
+    echo 'fn main() {}' > crates/common/curvine-ufs-api/src/lib.rs && \
     echo 'fn main() {}' > curvine-cli/src/main.rs && \
     echo 'fn main() {}' > orpc/src/lib.rs
 

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use curvine_common::fs::Path;
-use curvine_ufs::OssHdfsConf;
+use curvine_ufs_api::OssHdfsConf;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 

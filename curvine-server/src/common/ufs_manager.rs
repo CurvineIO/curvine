@@ -19,7 +19,7 @@ use curvine_common::fs::{CurvineURI, Path};
 use curvine_common::state::MountInfo;
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
-use curvine_ufs::fs::ufs_context::UFSContext;
+use curvine_ufs_api::fs::ufs_context::UFSContext;
 use log::info;
 use orpc::err_box;
 use std::collections::HashMap;

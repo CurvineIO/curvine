@@ -20,6 +20,7 @@ crates=(
   curvine-model
   curvine-fs-api
   curvine-storage-api
+  curvine-ufs-api
   curvine-config
 )
 

@@ -25,14 +25,14 @@
 //! ### Test HDFS mount integration:
 //! ```bash
 //! export HDFS_NAMENODE=hdfs://test-hdfs
-//! cargo test --features opendal-hdfs,jni -p curvine-ufs --test hdfs_mount_integration_test -- --ignored
+//! cargo test --features opendal-hdfs,jni -p curvine-ufs-opendal --test hdfs_mount_integration_test -- --ignored
 //! ```
 
 #[cfg(any(feature = "opendal-hdfs", feature = "opendal-webhdfs"))]
 mod mount_integration_tests {
     use curvine_common::fs::{FileSystem, Path, Reader, Writer};
     use curvine_common::state::{MountInfo, TtlAction};
-    use curvine_ufs::opendal::OpendalFileSystem;
+    use curvine_ufs_opendal::OpendalFileSystem;
     use std::collections::HashMap;
     use std::env;
 

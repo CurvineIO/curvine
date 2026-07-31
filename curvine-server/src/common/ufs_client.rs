@@ -19,7 +19,7 @@ use curvine_common::error::FsError;
 use curvine_common::fs::{CurvineURI, FileSystem, Path};
 use curvine_common::state::FileStatus;
 use curvine_common::FsResult;
-use curvine_ufs::fs::ufs_context::UFSContext;
+use curvine_ufs_api::fs::ufs_context::UFSContext;
 use std::sync::Arc;
 
 #[derive(Clone)]
