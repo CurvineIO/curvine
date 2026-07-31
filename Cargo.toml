@@ -26,6 +26,7 @@ members = [
     "crates/infra/curvine-sys",
     "crates/infra/curvine-io",
     "crates/adapters/curvine-rocksdb",
+    "crates/metadata/curvine-raft",
     "crates/adapters/curvine-storage-spdk",
     "crates/adapters/curvine-ufs-opendal",
     "crates/adapters/curvine-ufs-oss-hdfs",
@@ -98,6 +99,7 @@ orpc-rpc = { path = "crates/infra/orpc-rpc" }
 curvine-sys = { path = "crates/infra/curvine-sys" }
 curvine-io = { path = "crates/infra/curvine-io" }
 curvine-rocksdb = { path = "crates/adapters/curvine-rocksdb" }
+curvine-raft = { path = "crates/metadata/curvine-raft" }
 curvine-storage-spdk = { path = "crates/adapters/curvine-storage-spdk" }
 curvine-ufs-opendal = { path = "crates/adapters/curvine-ufs-opendal" }
 curvine-ufs-oss-hdfs = { path = "crates/adapters/curvine-ufs-oss-hdfs" }

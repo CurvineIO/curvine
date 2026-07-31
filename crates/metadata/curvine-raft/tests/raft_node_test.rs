@@ -14,15 +14,15 @@
 
 #![allow(unused)]
 
-use curvine_common::conf::JournalConf;
-use curvine_common::proto::raft::{FsmState, SnapshotData};
-use curvine_common::raft::storage::{
+use curvine_raft::conf::JournalConf;
+use curvine_raft::proto::raft::{FsmState, SnapshotData};
+use curvine_raft::raft::storage::{
     AppStorage, HashAppStorage, LogStorage, MemLogStorage, RocksLogStorage,
 };
-use curvine_common::raft::{
+use curvine_raft::raft::{
     RaftClient, RaftCode, RaftError, RaftJournal, RaftNode, RaftResult, RoleMonitor,
 };
-use curvine_common::utils::SerdeUtils;
+use curvine_raft::utils::SerdeUtils;
 use orpc::client::{ClientConf, RpcClient};
 use orpc::common::{FileUtils, Logger, Utils};
 use orpc::message::{Builder, ResponseStatus};
@@ -131,7 +131,7 @@ where
 struct FailingSnapshotAppStorage;
 
 impl AppStorage for FailingSnapshotAppStorage {
-    async fn apply(&self, _: bool, _: curvine_common::raft::storage::ApplyMsg) -> RaftResult<()> {
+    async fn apply(&self, _: bool, _: curvine_raft::raft::storage::ApplyMsg) -> RaftResult<()> {
         Ok(())
     }
 
@@ -169,20 +169,19 @@ impl TestKvAppStorage {
 }
 
 impl AppStorage for TestKvAppStorage {
-    async fn apply(&self, _: bool, msg: curvine_common::raft::storage::ApplyMsg) -> RaftResult<()> {
+    async fn apply(&self, _: bool, msg: curvine_raft::raft::storage::ApplyMsg) -> RaftResult<()> {
         match msg {
-            curvine_common::raft::storage::ApplyMsg::Entry(entry) => {
+            curvine_raft::raft::storage::ApplyMsg::Entry(entry) => {
                 let pair: (String, String) = SerdeUtils::deserialize(&entry.data)?;
                 self.map.write().unwrap().insert(pair.0, pair.1);
-                self.fsm_state.lock().unwrap().applied =
-                    curvine_common::proto::raft::AppliedIndex {
-                        term: entry.term,
-                        index: entry.index,
-                        op_id: 0,
-                        rpc_id: 0,
-                    };
+                self.fsm_state.lock().unwrap().applied = curvine_raft::proto::raft::AppliedIndex {
+                    term: entry.term,
+                    index: entry.index,
+                    op_id: 0,
+                    rpc_id: 0,
+                };
             }
-            curvine_common::raft::storage::ApplyMsg::Scan(applied) => {
+            curvine_raft::raft::storage::ApplyMsg::Scan(applied) => {
                 self.fsm_state.lock().unwrap().applied = applied;
             }
             _ => {}
@@ -350,8 +349,8 @@ impl PopulatedRefuseEmptySnapshotAppStorage {
 }
 
 impl AppStorage for PopulatedRefuseEmptySnapshotAppStorage {
-    async fn apply(&self, _: bool, msg: curvine_common::raft::storage::ApplyMsg) -> RaftResult<()> {
-        if let curvine_common::raft::storage::ApplyMsg::Scan(applied) = msg {
+    async fn apply(&self, _: bool, msg: curvine_raft::raft::storage::ApplyMsg) -> RaftResult<()> {
+        if let curvine_raft::raft::storage::ApplyMsg::Scan(applied) = msg {
             self.fsm_state.lock().unwrap().applied = applied;
         }
         Ok(())

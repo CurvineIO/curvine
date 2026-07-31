@@ -12,24 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod alloc;
-pub mod conf;
-pub mod error;
-pub mod executor;
-pub mod fs;
-pub use curvine_raft::raft;
-pub mod rocksdb;
-pub mod state;
-pub mod utils;
-pub mod version;
+use std::{env, fs};
 
-pub mod proto {
-    pub use curvine_proto::*;
+fn main() {
+    let proto_files = ["proto/raft.proto", "proto/eraftpb.proto"];
+    for path in &proto_files {
+        println!("cargo:rerun-if-changed={path}");
+    }
 
-    pub use curvine_raft::proto::raft;
+    let base = env::var("OUT_DIR").unwrap_or_else(|_| ".".to_string());
+    let output = format!("{}/protos", base);
+    fs::create_dir_all(&output).unwrap();
+
+    let src = vec!["raft.proto"];
+    let mut build = prost_build::Config::new();
+    build
+        .out_dir(&output)
+        .extern_path(".eraftpb", "::raft::eraftpb")
+        .compile_protos(&src, &["proto/", ""])
+        .unwrap();
 }
-
-pub use curvine_error::{FsError, FsResult, MAX_FILE_SIZE};
-pub use curvine_model::UFS_INODE_ID;
-
-pub const FILE_BUFFER_SIZE: usize = 128 * 1024;

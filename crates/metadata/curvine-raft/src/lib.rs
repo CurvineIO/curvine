@@ -12,24 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod alloc;
 pub mod conf;
-pub mod error;
-pub mod executor;
-pub mod fs;
-pub use curvine_raft::raft;
-pub mod rocksdb;
-pub mod state;
+pub mod raft;
 pub mod utils;
-pub mod version;
+
+pub mod rocksdb {
+    pub use curvine_rocksdb::*;
+}
 
 pub mod proto {
-    pub use curvine_proto::*;
-
-    pub use curvine_raft::proto::raft;
+    pub mod raft {
+        include!(concat!(env!("OUT_DIR"), "/protos/raft.rs"));
+    }
 }
 
 pub use curvine_error::{FsError, FsResult, MAX_FILE_SIZE};
-pub use curvine_model::UFS_INODE_ID;
 
-pub const FILE_BUFFER_SIZE: usize = 128 * 1024;
+impl From<crate::raft::RaftError> for FsError {
+    fn from(value: crate::raft::RaftError) -> Self {
+        Self::Raft(orpc::error::ErrorImpl::with_source(
+            value.to_string().into(),
+        ))
+    }
+}

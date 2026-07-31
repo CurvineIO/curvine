@@ -28,8 +28,7 @@ pub use self::worker_conf::*;
 mod cluster_conf;
 pub use self::cluster_conf::*;
 
-mod journal_conf;
-pub use self::journal_conf::JournalConf;
+pub use curvine_raft::conf::JournalConf;
 
 mod spdk_conf;
 #[cfg(test)]
