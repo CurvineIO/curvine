@@ -135,6 +135,12 @@ impl FuseWriter {
         self.err_monitor.take_error().unwrap_or(e)
     }
 
+    fn checked_write_end(off: i64, len: usize) -> FsResult<i64> {
+        let len = i64::try_from(len).map_err(|_| FsError::file_too_large(i64::MAX))?;
+        off.checked_add(len)
+            .ok_or_else(|| FsError::file_too_large(i64::MAX))
+    }
+
     async fn send_queued_task(&self, task: WriteTask) -> Result<(), FsError> {
         if self.sender.is_bounded() {
             // Reserve before creating the guard to avoid cancellation leaks.
@@ -152,6 +158,8 @@ impl FuseWriter {
     }
 
     pub async fn write(&self, off: i64, data: Bytes, reply: Option<FuseResponse>) -> FsResult<()> {
+        Self::checked_write_end(off, data.len())?;
+
         // Bump write_ver only after the Write is queued. Hold enqueue_gate across
         // the send so dirty-read flush cannot overtake a mid-reserve Write.
         let _gate = self.enqueue_gate.lock().await;
@@ -325,6 +333,7 @@ impl FuseWriter {
                     // New writes invalidate prior complete state before backend IO starts.
                     *completed = false;
                     let len = data.len();
+                    let write_end = Self::checked_write_end(off, len)?;
                     let io_start = if metrics_enabled {
                         Some(mono_now())
                     } else {
@@ -356,7 +365,7 @@ impl FuseWriter {
 
                     if res.is_ok() {
                         let cur_len = file_len.get();
-                        file_len.set(cur_len.max(off + len as i64));
+                        file_len.set(cur_len.max(write_end));
                         file_mtime.set(LocalTime::mills() as i64);
                     }
 
@@ -496,6 +505,28 @@ mod tests {
         async fn seek(&mut self, pos: i64) -> FsResult<()> {
             self.pos = pos;
             Ok(())
+        }
+    }
+
+    #[test]
+    fn checked_write_end_accepts_maximum_endpoint() {
+        assert_eq!(
+            FuseWriter::checked_write_end(i64::MAX, 0).unwrap(),
+            i64::MAX
+        );
+        assert_eq!(
+            FuseWriter::checked_write_end(i64::MAX - 1, 1).unwrap(),
+            i64::MAX
+        );
+    }
+
+    #[test]
+    fn checked_write_end_rejects_overflowing_endpoint() {
+        for (off, len) in [(i64::MAX, 1_usize), (i64::MAX - 1, 2_usize)] {
+            let err = FuseWriter::checked_write_end(off, len)
+                .expect_err("overflowing write endpoint must be rejected");
+            assert_eq!(crate::fuse_error::errno_of(&err), libc::EFBIG);
+            assert!(matches!(err, FsError::InvalidFileSize(_)));
         }
     }
 
@@ -755,6 +786,7 @@ mod tests {
         use bytes::Bytes;
         use curvine_client::unified::UnifiedWriter;
         use curvine_common::conf::FuseConf;
+        use curvine_common::error::FsError;
         use curvine_common::fs::local::LocalWriter;
         use orpc::common::Metrics as m;
         use orpc::runtime::{AsyncRuntime, RpcRuntime};
@@ -829,6 +861,48 @@ mod tests {
                     .expect("writer survives a flush reply-send failure");
 
                 assert_eq!(std::fs::read(&path_buf).unwrap(), b"firstsecond");
+                let _ = std::fs::remove_file(&path_buf);
+            });
+        }
+
+        #[test]
+        fn overflowing_write_endpoint_is_rejected_before_enqueue() {
+            let rt = AsyncRuntime::single();
+            rt.block_on(async {
+                let path_buf = std::env::temp_dir().join(format!(
+                    "fw_overflow_reject_{}_{:?}",
+                    std::process::id(),
+                    std::thread::current().id()
+                ));
+                let path = curvine_common::fs::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+
+                let conf = FuseConf {
+                    metrics_enabled: false,
+                    ..Default::default()
+                };
+                let writer = UnifiedWriter::Local(LocalWriter::new(&path, 4096).unwrap());
+                let rt2 = Arc::new(AsyncRuntime::single());
+                let fuse_writer = FuseWriter::new(&conf, rt2.clone(), writer);
+                std::mem::forget(rt2);
+
+                assert_eq!(fuse_writer.write_ver(), 0);
+                assert_eq!(fuse_writer.len(), 0);
+
+                let err = fuse_writer
+                    .write(i64::MAX, Bytes::from_static(b"x"), None)
+                    .await
+                    .expect_err("overflowing write endpoint must be rejected");
+                assert_eq!(crate::fuse_error::errno_of(&err), libc::EFBIG);
+                assert!(matches!(err, FsError::InvalidFileSize(_)));
+
+                assert_eq!(fuse_writer.write_ver(), 0);
+                assert_eq!(
+                    fuse_writer.len(),
+                    0,
+                    "rejected writes must not change cached file length"
+                );
+
+                fuse_writer.complete(None).await.unwrap();
                 let _ = std::fs::remove_file(&path_buf);
             });
         }
