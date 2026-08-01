@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::conf::{ClusterConf, JournalConf, MasterConf};
+use curvine_common::conf::{ClusterConf, MasterConf};
 use curvine_common::error::FsError;
 use curvine_common::fs::CurvineURI;
 use curvine_common::fs::RpcCode;
@@ -20,7 +20,6 @@ use curvine_common::proto::{
     CompleteFileRequest, CompleteFileResponse, CreateFileRequest, DeleteRequest,
     GetMasterInfoRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
 };
-use curvine_common::raft::storage::{AppStorage, ApplyMsg};
 use curvine_common::state::MountOptions;
 use curvine_common::state::{
     BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
@@ -29,6 +28,8 @@ use curvine_common::state::{
 };
 use curvine_common::state::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_common::utils::{ProtoUtils, SerdeUtils};
+use curvine_raft::conf::JournalConf;
+use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
 use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader, JournalSystem};
 use curvine_server::master::meta::inode::ttl::InodeTtlExecutor;

@@ -11,10 +11,12 @@ default = []
 jni = ["curvine-data-transfer/opendal-hdfs"]
 spdk = [
     "curvine-worker/spdk",
+    "curvine-storage-local/spdk",
 ]
 spdk-rdma = [
     "spdk",
     "curvine-worker/spdk-rdma",
+    "curvine-storage-local/spdk-rdma",
 ]
 fault-injection = [
     "curvine-fault/http-server",
@@ -31,6 +33,9 @@ curvine-error = { workspace = true, features = ["axum-response"] }
 curvine-fault = { workspace = true }
 curvine-client-core = { workspace = true }
 curvine-data-transfer = { workspace = true, features = ["opendal-s3", "transfer-server"] }
+curvine-storage-local = { workspace = true }
+curvine-rocksdb = { workspace = true }
+curvine-raft = { workspace = true }
 curvine-job-client = { workspace = true }
 curvine-ufs-api = { workspace = true }
 curvine-web = { workspace = true }
@@ -53,6 +58,5 @@ chrono = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
-curvine-rocksdb = { workspace = true }
 curvine-fault = { workspace = true, features = ["http-client"] }
 raft = { workspace = true }

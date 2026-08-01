@@ -1,5 +1,6 @@
-use curvine_common::conf::{ClusterConf, JournalConf, MasterConf};
+use curvine_common::conf::{ClusterConf, MasterConf};
 use curvine_common::state::{ClientAddress, FileAllocOpts, WorkerInfo};
+use curvine_raft::conf::JournalConf;
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::JournalSystem;
 use curvine_server::master::Master;

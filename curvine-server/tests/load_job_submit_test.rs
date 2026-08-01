@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::conf::{ClientConf, ClusterConf, JournalConf, MasterConf};
+use curvine_common::conf::{ClientConf, ClusterConf, MasterConf};
 use curvine_common::state::{
     JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobInfo, LoadTaskInfo, MountInfo,
     MountOptions, OpenFlags, StorageType, TtlAction, WorkerAddress, WorkerInfo, WriteType,
 };
 use curvine_common::utils::CommonUtils;
+use curvine_raft::conf::JournalConf;
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::JournalSystem;
 use curvine_server::master::{JobContext, JobManager, JobStore, Master};
