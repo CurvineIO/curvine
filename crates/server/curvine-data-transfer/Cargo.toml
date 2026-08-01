@@ -1,5 +1,5 @@
 [package]
-name = "curvine-data-mover"
+name = "curvine-data-transfer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

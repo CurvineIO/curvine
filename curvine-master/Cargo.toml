@@ -13,7 +13,7 @@ orpc = { workspace = true }
 curvine-common = { workspace = true }
 curvine-rocksdb = { workspace = true }
 curvine-error = { workspace = true, features = ["axum-response"] }
-curvine-data-mover = { workspace = true, features = ["opendal-s3"] }
+curvine-data-transfer = { workspace = true, features = ["opendal-s3"] }
 curvine-unified-fs = { workspace = true, features = ["opendal-s3"] }
 curvine-web = { workspace = true }
 curvine-fault = { workspace = true }

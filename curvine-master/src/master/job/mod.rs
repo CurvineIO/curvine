@@ -18,7 +18,7 @@ pub use crate::master::job::job_manager::JobManager;
 mod job_handler;
 pub use job_handler::JobHandler;
 
-pub use curvine_data_mover::JobWorkerClient;
+pub use curvine_data_transfer::JobWorkerClient;
 
 mod job_store;
 pub use job_store::JobStore;

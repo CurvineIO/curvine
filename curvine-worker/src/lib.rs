@@ -16,11 +16,11 @@ pub mod worker;
 pub use worker::*;
 
 pub mod common {
-    pub use curvine_data_mover::common::UfsFactory;
+    pub use curvine_data_transfer::common::UfsFactory;
 }
 
 pub mod master {
-    pub use curvine_data_mover::RpcContext;
+    pub use curvine_data_transfer::RpcContext;
 }
 
 pub mod transfer {

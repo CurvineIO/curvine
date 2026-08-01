@@ -24,7 +24,7 @@ fault-injection = [
 orpc = { workspace = true }
 curvine-common = { workspace = true }
 curvine-client-core = { workspace = true }
-curvine-data-mover = { workspace = true, features = ["opendal-s3"] }
+curvine-data-transfer = { workspace = true, features = ["opendal-s3"] }
 curvine-web = { workspace = true }
 curvine-fault = { workspace = true }
 curvine-storage-local = { workspace = true }
