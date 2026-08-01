@@ -14,7 +14,9 @@
 
 use crate::fs::dcache::{CleanerTask, Inode};
 use crate::fs::operator::*;
-use crate::fs::plock_wait_registry::{LockOwner, PlockWaitGuard, PlockWaitRegistry};
+use crate::fs::plock_wait_registry::{
+    LockOwner, LockWaitInfo, PlockWaitDecision, PlockWaitGuard, PlockWaitRegistry,
+};
 use crate::fs::state::{FileHandle, NodeState};
 use crate::fuse_metrics::{
     ReaddirTimer, INVAL_REASON_FLUSH, INVAL_REASON_FSYNC, INVAL_REASON_RELEASE, INVAL_REASON_RESIZE,
@@ -2107,6 +2109,7 @@ impl fs::FileSystem for CurvineFileSystem {
             } else {
                 handle.add_lock(flag, owner_id);
             }
+            self.plock_waits.notify_waiters();
             Ok(())
         } else {
             err_fuse!(libc::EAGAIN)
@@ -2137,6 +2140,14 @@ impl fs::FileSystem for CurvineFileSystem {
         let wait_guard = PlockWaitGuard::new(
             self.plock_waits.clone(),
             LockOwner::new(lock.client_id.clone(), lock.owner_id),
+            LockWaitInfo::new(
+                op.header.unique,
+                lock.pid,
+                op.header.nodeid,
+                path.to_string(),
+                lock.start,
+                lock.end,
+            ),
         );
         loop {
             let conflict = self.fs.set_lock(&path, lock.clone()).await?;
@@ -2149,13 +2160,29 @@ impl fs::FileSystem for CurvineFileSystem {
                 } else {
                     handle.add_lock(lock.lock_flags, lock.owner_id);
                 }
+                self.plock_waits.notify_waiters();
                 return Ok(());
             }
 
             let blocker = conflict.as_ref().expect("conflict lock");
-            if wait_guard
-                .register_blocked_by(LockOwner::new(blocker.client_id.clone(), blocker.owner_id))
-            {
+            let decision = wait_guard
+                .register_blocked_by(LockOwner::new(blocker.client_id.clone(), blocker.owner_id));
+            debug!(
+                "plock SETLKW wait decision unique={} pid={} owner_id={} nodeid={} path={} range=[{},{}] blocker_pid={} blocker_owner_id={} blocker_range=[{},{}] decision={:?}",
+                op.header.unique,
+                lock.pid,
+                lock.owner_id,
+                op.header.nodeid,
+                path,
+                lock.start,
+                lock.end,
+                blocker.pid,
+                blocker.owner_id,
+                blocker.start,
+                blocker.end,
+                decision
+            );
+            if decision.is_deadlock() {
                 // Cycle in the local wait graph. Re-sample Master once while
                 // keeping our edge published so a peer in a true multi-resource
                 // deadlock (LTP fcntl17) still observes the cycle. If the lock
@@ -2171,20 +2198,50 @@ impl fs::FileSystem for CurvineFileSystem {
                     } else {
                         handle.add_lock(lock.lock_flags, lock.owner_id);
                     }
+                    self.plock_waits.notify_waiters();
                     return Ok(());
                 }
                 let blocker2 = conflict2.as_ref().expect("conflict lock");
-                if wait_guard.register_blocked_by(LockOwner::new(
+                let decision2 = wait_guard.register_blocked_by(LockOwner::new(
                     blocker2.client_id.clone(),
                     blocker2.owner_id,
-                )) {
+                ));
+                debug!(
+                    "plock SETLKW deadlock recheck unique={} pid={} owner_id={} nodeid={} path={} range=[{},{}] blocker_pid={} blocker_owner_id={} blocker_range=[{},{}] decision={:?}",
+                    op.header.unique,
+                    lock.pid,
+                    lock.owner_id,
+                    op.header.nodeid,
+                    path,
+                    lock.start,
+                    lock.end,
+                    blocker2.pid,
+                    blocker2.owner_id,
+                    blocker2.start,
+                    blocker2.end,
+                    decision2
+                );
+                if let PlockWaitDecision::Deadlock { cycle, .. } = decision2 {
+                    debug!(
+                        "plock SETLKW returning EDEADLK unique={} pid={} owner_id={} nodeid={} path={} range=[{},{}] cycle={:?}",
+                        op.header.unique,
+                        lock.pid,
+                        lock.owner_id,
+                        op.header.nodeid,
+                        path,
+                        lock.start,
+                        lock.end,
+                        cycle
+                    );
                     return err_fuse!(libc::EDEADLK);
                 }
             }
 
             ticks += 1;
             let sleep_ms = check_interval_max_ms.min(check_interval_min_ms.saturating_mul(ticks));
-            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+            self.plock_waits
+                .wait_for_change(std::time::Duration::from_millis(sleep_ms))
+                .await;
 
             if ticks.is_multiple_of(log_ticks as u64) {
                 info!("waiting lock for {}, elapsed: {} ms", path, time.used_ms());
