@@ -1,0 +1,39 @@
+[package]
+name = "curvine-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+spdk = [
+    "dep:curvine-storage-spdk",
+    "curvine-storage-spdk/spdk",
+    "curvine-storage-local/spdk",
+]
+spdk-rdma = [
+    "spdk",
+    "curvine-storage-spdk/spdk-rdma",
+    "curvine-storage-local/spdk-rdma",
+]
+fault-injection = [
+    "curvine-fault/http-server",
+]
+
+[dependencies]
+orpc = { workspace = true }
+curvine-common = { workspace = true }
+curvine-master = { workspace = true }
+curvine-client = { workspace = true, features = ["job-client", "unified", "opendal-s3"] }
+curvine-web = { workspace = true }
+curvine-fault = { workspace = true }
+curvine-storage-local = { workspace = true }
+curvine-storage-spdk = { workspace = true, optional = true }
+log = { workspace = true }
+once_cell = { workspace = true }
+tokio = { workspace = true }
+dashmap = { workspace = true }
+axum = { workspace = true }
+parking_lot = { workspace = true }
+bytes = { workspace = true }
+serde_json = { workspace = true }

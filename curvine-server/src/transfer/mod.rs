@@ -16,6 +16,7 @@ pub use self::metrics::TransferMetrics;
 mod backend;
 pub(crate) use self::backend::is_store_unavailable_error;
 pub use self::backend::TransferStoreBackend;
+pub(crate) use curvine_common::transfer::transfer_failure_message;
 
 mod cluster_cache;
 pub use self::cluster_cache::ClusterMetadataCache;
@@ -63,43 +64,4 @@ pub(crate) fn apply_task_report_progress(
         .max(0);
     summary.update_time = now_ms;
     summary.message = current.message.clone();
-}
-
-pub(crate) fn transfer_failure_message(
-    kind: curvine_common::state::TransferKind,
-    source_path: &str,
-    target_path: &str,
-    err: &curvine_common::error::FsError,
-) -> String {
-    use curvine_common::error::ErrorKind;
-
-    let source_label = match kind {
-        curvine_common::state::TransferKind::Load => "source object",
-        curvine_common::state::TransferKind::Export => "source file",
-    };
-    match err.kind() {
-        ErrorKind::FileNotFound | ErrorKind::Expired => {
-            format!("{source_label} not found: {source_path}")
-        }
-        ErrorKind::FileAlreadyExists => format!("target already exists: {target_path}"),
-        ErrorKind::ParentNotDir | ErrorKind::NotADirectory => {
-            format!("target parent is not a directory: {target_path}")
-        }
-        ErrorKind::IsADirectory => format!("target is a directory: {target_path}"),
-        ErrorKind::ReadOnly => format!("target is read-only: {target_path}"),
-        ErrorKind::DiskOutOfSpace => {
-            format!("Not enough Curvine worker disk space to transfer {source_path}; free space and retry")
-        }
-        ErrorKind::Timeout => format!(
-            "Timed out while accessing {source_path}; verify storage connectivity and retry"
-        ),
-        ErrorKind::IO | ErrorKind::Ufs | ErrorKind::Pipeline => format!(
-            "Cannot access transfer storage for {source_path}; verify the mount, credentials, and network connectivity"
-        ),
-        ErrorKind::TransferStoreUnavailable => {
-            "Transfer metadata store is unavailable; retry after it recovers".to_string()
-        }
-        ErrorKind::TransferOverloaded => "Transfer service is busy; retry later".to_string(),
-        _ => format!("Transfer from {source_path} to {target_path} failed: {err}"),
-    }
 }

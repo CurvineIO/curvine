@@ -12,25 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod alloc;
-pub mod conf;
-pub mod error;
-pub mod executor;
-pub mod fs;
-pub use curvine_raft::raft;
-pub mod rocksdb;
-pub mod state;
-pub mod transfer;
-pub mod utils;
-pub mod version;
+pub mod worker;
+pub use worker::*;
 
-pub mod proto {
-    pub use curvine_proto::*;
-
-    pub use curvine_raft::proto::raft;
+pub mod common {
+    pub use curvine_master::UfsFactory;
 }
 
-pub use curvine_error::{FsError, FsResult, MAX_FILE_SIZE};
-pub use curvine_model::UFS_INODE_ID;
+pub mod master {
+    pub use curvine_master::master::RpcContext;
+}
 
-pub const FILE_BUFFER_SIZE: usize = 128 * 1024;
+pub mod transfer {
+    pub use curvine_common::transfer::transfer_failure_message;
+}
+
+#[cfg(feature = "fault-injection")]
+pub(crate) use curvine_fault::fault_point;
+
+#[cfg(not(feature = "fault-injection"))]
+pub(crate) use curvine_fault::__noop_fault_point as fault_point;

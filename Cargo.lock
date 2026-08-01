@@ -2483,10 +2483,9 @@ dependencies = [
  "curvine-fault",
  "curvine-master",
  "curvine-rocksdb",
- "curvine-storage-local",
- "curvine-storage-spdk",
  "curvine-ufs-api",
  "curvine-web",
+ "curvine-worker",
  "dashmap 5.5.3",
  "futures",
  "log",
@@ -2677,6 +2676,28 @@ dependencies = [
  "tokio",
  "tower 0.4.13",
  "tower-http 0.5.2",
+]
+
+[[package]]
+name = "curvine-worker"
+version = "0.2.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "curvine-client",
+ "curvine-common",
+ "curvine-fault",
+ "curvine-master",
+ "curvine-storage-local",
+ "curvine-storage-spdk",
+ "curvine-web",
+ "dashmap 5.5.3",
+ "log",
+ "once_cell",
+ "orpc",
+ "parking_lot",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
