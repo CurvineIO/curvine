@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::common::UfsClient;
-use curvine_client::file::FsClient;
+use curvine_client_core::file::FsClient;
 use curvine_common::conf::{UfsConf, UfsConfBuilder};
 use curvine_common::fs::{CurvineURI, Path};
 use curvine_common::state::MountInfo;

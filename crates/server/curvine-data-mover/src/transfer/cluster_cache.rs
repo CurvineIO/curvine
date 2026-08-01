@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_client::file::CurvineFileSystem;
+use curvine_client_core::file::CurvineFileSystem;
 use curvine_common::error::FsError;
 use curvine_common::fs::Path;
 use curvine_common::state::{MountInfo, TransferKind, WorkerInfo};

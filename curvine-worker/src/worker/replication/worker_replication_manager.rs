@@ -14,8 +14,8 @@
 
 use crate::worker::block::{BlockState, BlockStore, MasterClient};
 use crate::worker::replication::replication_job::ReplicationJob;
-use curvine_client::block::BlockWriterRemote;
-use curvine_client::file::FsContext;
+use curvine_client_core::block::BlockWriterRemote;
+use curvine_client_core::file::FsContext;
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{ReportBlockReplicationRequest, ReportBlockReplicationResponse};

@@ -8,7 +8,7 @@ license.workspace = true
 
 [features]
 default = []
-jni = ["curvine-client/opendal-hdfs"]
+jni = ["curvine-data-mover/opendal-hdfs"]
 spdk = [
     "curvine-worker/spdk",
 ]
@@ -29,7 +29,9 @@ curvine-master = { workspace = true }
 curvine-worker = { workspace = true }
 curvine-error = { workspace = true, features = ["axum-response"] }
 curvine-fault = { workspace = true }
-curvine-client = { workspace = true, features = ["job-client", "unified", "opendal-s3"] }
+curvine-client-core = { workspace = true }
+curvine-data-mover = { workspace = true, features = ["opendal-s3"] }
+curvine-job-client = { workspace = true }
 curvine-ufs-api = { workspace = true }
 curvine-web = { workspace = true }
 prost = { workspace = true }

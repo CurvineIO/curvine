@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::worker::block::{BlockStore, HeartbeatTask, MasterClient};
-use curvine_client::file::FsContext;
+use curvine_client_core::file::FsContext;
 use curvine_common::conf::ClusterConf;
 use curvine_common::executor::ScheduledExecutor;
 use curvine_common::state::{BlockReportInfo, HeartbeatStatus, WorkerAddress};

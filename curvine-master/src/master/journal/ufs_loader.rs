@@ -16,12 +16,12 @@ use crate::master::journal::{
     CompleteFileEntry, DeleteEntry, JournalEntry, MkdirEntry, RenameEntry,
 };
 use crate::master::JobManager;
-use curvine_client::unified::MountValue;
 use curvine_common::conf::JournalConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{JobTaskState, LoadJobCommand};
 use curvine_common::FsResult;
+use curvine_unified_fs::MountValue;
 use log::{info, warn};
 use orpc::common::DurationUnit;
 use orpc::{err_box, CommonResult};

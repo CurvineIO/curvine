@@ -2169,6 +2169,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-data-mover"
+version = "0.2.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "crossbeam",
+ "curvine-client-core",
+ "curvine-common",
+ "curvine-job-client",
+ "curvine-ufs-api",
+ "curvine-unified-fs",
+ "curvine-web",
+ "dashmap 5.5.3",
+ "futures",
+ "log",
+ "mysql",
+ "once_cell",
+ "orpc",
+ "parking_lot",
+ "prost 0.11.9",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "curvine-error"
 version = "0.2.0"
 dependencies = [
@@ -2361,11 +2389,12 @@ version = "0.2.0"
 dependencies = [
  "axum",
  "bytes",
- "curvine-client",
  "curvine-common",
+ "curvine-data-mover",
  "curvine-error",
  "curvine-fault",
  "curvine-rocksdb",
+ "curvine-unified-fs",
  "curvine-web",
  "dashmap 5.5.3",
  "futures",
@@ -2477,10 +2506,12 @@ dependencies = [
  "chrono",
  "clap",
  "crossbeam",
- "curvine-client",
+ "curvine-client-core",
  "curvine-common",
+ "curvine-data-mover",
  "curvine-error",
  "curvine-fault",
+ "curvine-job-client",
  "curvine-master",
  "curvine-rocksdb",
  "curvine-ufs-api",
@@ -2667,8 +2698,8 @@ name = "curvine-web"
 version = "0.2.0"
 dependencies = [
  "axum",
- "curvine-client",
  "curvine-common",
+ "curvine-job-client",
  "log",
  "orpc",
  "serde",
@@ -2684,10 +2715,10 @@ version = "0.2.0"
 dependencies = [
  "axum",
  "bytes",
- "curvine-client",
+ "curvine-client-core",
  "curvine-common",
+ "curvine-data-mover",
  "curvine-fault",
- "curvine-master",
  "curvine-storage-local",
  "curvine-storage-spdk",
  "curvine-web",

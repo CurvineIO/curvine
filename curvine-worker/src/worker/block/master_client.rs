@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::worker::block::{BlockMeta, BlockState};
-use curvine_client::file::{FsClient, FsContext};
+use curvine_client_core::file::{FsClient, FsContext};
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
 use curvine_common::state::{

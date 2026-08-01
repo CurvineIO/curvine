@@ -16,7 +16,7 @@ use crate::master::fs::MasterFilesystem;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::Master;
 use crate::worker::Worker;
-use curvine_client::file::CurvineFileSystem;
+use curvine_client_core::file::CurvineFileSystem;
 use curvine_common::conf::ClusterConf;
 use curvine_common::raft::{NodeId, RaftPeer};
 use curvine_common::FsResult;

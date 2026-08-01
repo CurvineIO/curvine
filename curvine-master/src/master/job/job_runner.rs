@@ -16,7 +16,6 @@ use crate::common::UfsFactory;
 use crate::master::fs::policy::ChooseContext;
 use crate::master::fs::MasterFilesystem;
 use crate::master::{JobContext, JobStore, TaskDetail};
-use curvine_client::unified::MountValue;
 use curvine_common::conf::ClientConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
@@ -26,6 +25,7 @@ use curvine_common::state::{
 };
 use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
+use curvine_unified_fs::MountValue;
 use dashmap::mapref::entry::Entry;
 use futures::future;
 use log::{debug, error, info, warn};

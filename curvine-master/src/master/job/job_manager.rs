@@ -16,7 +16,6 @@ use crate::common::UfsFactory;
 use crate::master::fs::MasterFilesystem;
 use crate::master::{JobStore, LoadJobRunner, MountManager};
 use core::time::Duration;
-use curvine_client::unified::MountValue;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::executor::ScheduledExecutor;
@@ -25,6 +24,7 @@ use curvine_common::state::{
     JobStatus, JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobResult,
 };
 use curvine_common::FsResult;
+use curvine_unified_fs::MountValue;
 use log::{debug, info, warn};
 use orpc::common::LocalTime;
 use orpc::runtime::{LoopTask, RpcRuntime, Runtime};

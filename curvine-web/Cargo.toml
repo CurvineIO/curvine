@@ -7,7 +7,7 @@ license.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-curvine-client = { workspace = true, features = ["job-client"] }
+curvine-job-client = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 curvine-common = { workspace = true }

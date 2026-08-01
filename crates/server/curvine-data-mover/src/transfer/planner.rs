@@ -14,7 +14,7 @@
 
 use crate::common::UfsFactory;
 use crate::transfer::{job_mount_snapshot, ClusterMetadataCache, TransferMetrics};
-use curvine_client::file::CurvineFileSystem;
+use curvine_client_core::file::CurvineFileSystem;
 use curvine_common::conf::ClientConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};

@@ -12,4 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use curvine_data_mover::common::UfsFactory;
+pub mod ufs_client;
+pub mod ufs_manager;
+
+mod ufs_factory;
+pub use self::ufs_client::UfsClient;
+pub use self::ufs_factory::UfsFactory;

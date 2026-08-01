@@ -15,10 +15,7 @@
 use crate::common::UfsFactory;
 use crate::transfer::transfer_failure_message;
 use crate::worker::task::TaskContext;
-use curvine_client::file::{CurvineFileSystem, FsReader};
-use curvine_client::rpc::JobMasterClient;
-use curvine_client::rpc::TransferClient;
-use curvine_client::unified::{UfsFileSystem, UnifiedReader, UnifiedWriter};
+use curvine_client_core::file::{CurvineFileSystem, FsReader};
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
 use curvine_common::state::{
@@ -26,6 +23,9 @@ use curvine_common::state::{
     SetAttrOptsBuilder, TRANSFER_TEMP_PATH_MARKER,
 };
 use curvine_common::FsResult;
+use curvine_job_client::JobMasterClient;
+use curvine_job_client::TransferClient;
+use curvine_unified_fs::{UfsFileSystem, UnifiedReader, UnifiedWriter};
 use log::{debug, error, info, warn};
 use orpc::common::{LocalTime, TimeSpent};
 use orpc::err_box;
@@ -805,8 +805,8 @@ fn xattr_equals(status: &FileStatus, key: &str, expected: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::rename_ufs_output;
-    use curvine_client::unified::UfsFileSystem;
     use curvine_common::fs::Path;
+    use curvine_unified_fs::UfsFileSystem;
     use orpc::runtime::{AsyncRuntime, RpcRuntime};
     use std::collections::HashMap;
     use std::fs;

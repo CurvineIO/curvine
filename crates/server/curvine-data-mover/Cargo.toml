@@ -1,0 +1,42 @@
+[package]
+name = "curvine-data-mover"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+opendal = ["curvine-unified-fs/opendal"]
+opendal-s3 = ["opendal", "curvine-unified-fs/opendal-s3"]
+opendal-oss = ["opendal", "curvine-unified-fs/opendal-oss"]
+opendal-gcs = ["opendal", "curvine-unified-fs/opendal-gcs"]
+opendal-azblob = ["opendal", "curvine-unified-fs/opendal-azblob"]
+opendal-cos = ["opendal", "curvine-unified-fs/opendal-cos"]
+opendal-hdfs = ["opendal", "curvine-unified-fs/opendal-hdfs"]
+opendal-webhdfs = ["opendal", "curvine-unified-fs/opendal-webhdfs"]
+opendal-hdfs-native = ["opendal", "curvine-unified-fs/opendal-hdfs-native"]
+oss-hdfs = ["curvine-unified-fs/oss-hdfs"]
+
+[dependencies]
+orpc = { workspace = true }
+curvine-common = { workspace = true }
+curvine-client-core = { workspace = true }
+curvine-job-client = { workspace = true }
+curvine-unified-fs = { workspace = true }
+curvine-ufs-api = { workspace = true }
+curvine-web = { workspace = true }
+prost = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+dashmap = { workspace = true }
+crossbeam = { workspace = true }
+parking_lot = { workspace = true }
+once_cell = { workspace = true }
+axum = { workspace = true }
+rusqlite = { workspace = true }
+mysql = { workspace = true }
+uuid = { workspace = true }

@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::JobWorkerClient;
-use curvine_client::unified::{MountValue, UfsFileSystem};
+use crate::JobWorkerClient;
 use curvine_common::conf::ClientConf;
 use curvine_common::state::{MountInfo, WorkerAddress};
 use curvine_common::FsResult;
+use curvine_unified_fs::{MountValue, UfsFileSystem};
 use orpc::client::ClientFactory;
 use orpc::io::net::InetAddr;
 use orpc::runtime::Runtime;

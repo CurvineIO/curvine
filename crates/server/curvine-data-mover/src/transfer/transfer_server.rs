@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::common::UfsFactory;
-use curvine_client::file::CurvineFileSystem;
+use curvine_client_core::file::CurvineFileSystem;
 use curvine_common::conf::{ClusterConf, TransferStoreType};
 use curvine_common::error::FsError;
 use curvine_web::server::{WebHandlerService, WebServer};

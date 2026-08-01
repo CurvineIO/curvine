@@ -45,8 +45,7 @@ pub use self::master_metrics::*;
 mod router_handler;
 pub use self::router_handler::*;
 
-mod rpc_context;
-pub use rpc_context::RpcContext;
+pub use curvine_data_mover::RpcContext;
 
 pub mod mount;
 

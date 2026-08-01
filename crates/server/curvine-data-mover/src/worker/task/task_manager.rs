@@ -15,11 +15,11 @@
 use crate::common::UfsFactory;
 use crate::worker::task::load_task_runner::LoadTaskRunner;
 use crate::worker::task::{TaskContext, TaskStore};
-use curvine_client::file::{CurvineFileSystem, FsContext};
-use curvine_client::rpc::TransferClient;
+use curvine_client_core::file::{CurvineFileSystem, FsContext};
 use curvine_common::conf::ClusterConf;
 use curvine_common::state::{JobTaskProgress, JobTaskState, LoadTaskInfo, TransferTaskReportInfo};
 use curvine_common::FsResult;
+use curvine_job_client::TransferClient;
 use dashmap::mapref::entry::Entry;
 use log::{debug, info, warn};
 use orpc::runtime::{RpcRuntime, Runtime};
