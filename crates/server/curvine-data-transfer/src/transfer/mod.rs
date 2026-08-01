@@ -4,10 +4,14 @@ pub use self::store::*;
 mod memory_store;
 pub use self::memory_store::MemoryTransferStore;
 
+#[cfg(feature = "transfer-store-sqlite")]
 mod sqlite_store;
+#[cfg(feature = "transfer-store-sqlite")]
 pub use self::sqlite_store::SqliteTransferStore;
 
+#[cfg(feature = "transfer-store-mysql")]
 mod mysql_store;
+#[cfg(feature = "transfer-store-mysql")]
 pub use self::mysql_store::MysqlTransferStore;
 
 mod metrics;
@@ -40,10 +44,14 @@ pub use self::scheduler::TransferScheduler;
 mod handler;
 pub use self::handler::TransferHandler;
 
+#[cfg(feature = "transfer-web")]
 mod router_handler;
+#[cfg(feature = "transfer-web")]
 pub use self::router_handler::TransferRouterHandler;
 
+#[cfg(feature = "transfer-server")]
 mod transfer_server;
+#[cfg(feature = "transfer-server")]
 pub use self::transfer_server::TransferServer;
 
 pub(crate) fn apply_task_report_progress(

@@ -6,6 +6,15 @@ license.workspace = true
 
 [features]
 default = []
+transfer = ["dep:uuid"]
+transfer-web = ["transfer", "dep:axum", "dep:curvine-web"]
+transfer-store-sqlite = ["transfer", "dep:rusqlite"]
+transfer-store-mysql = ["transfer", "dep:mysql"]
+transfer-server = [
+    "transfer-web",
+    "transfer-store-sqlite",
+    "transfer-store-mysql",
+]
 opendal = ["curvine-unified-fs/opendal"]
 opendal-s3 = ["opendal", "curvine-unified-fs/opendal-s3"]
 opendal-oss = ["opendal", "curvine-unified-fs/opendal-oss"]
@@ -24,7 +33,7 @@ curvine-client-core = { workspace = true }
 curvine-job-client = { workspace = true }
 curvine-unified-fs = { workspace = true }
 curvine-ufs-api = { workspace = true }
-curvine-web = { workspace = true }
+curvine-web = { workspace = true, optional = true }
 prost = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
@@ -36,7 +45,7 @@ dashmap = { workspace = true }
 crossbeam = { workspace = true }
 parking_lot = { workspace = true }
 once_cell = { workspace = true }
-axum = { workspace = true }
-rusqlite = { workspace = true }
-mysql = { workspace = true }
-uuid = { workspace = true }
+axum = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
+mysql = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }

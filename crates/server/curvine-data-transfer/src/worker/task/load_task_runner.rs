@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use crate::common::UfsFactory;
-use crate::transfer::transfer_failure_message;
 use crate::worker::task::TaskContext;
 use curvine_client_core::file::{CurvineFileSystem, FsReader};
 use curvine_common::error::FsError;
@@ -22,6 +21,7 @@ use curvine_common::state::{
     CreateFileOptsBuilder, FileBlocks, FileStatus, JobTaskProgress, JobTaskState,
     SetAttrOptsBuilder, TRANSFER_TEMP_PATH_MARKER,
 };
+use curvine_common::transfer::transfer_failure_message;
 use curvine_common::FsResult;
 use curvine_job_client::JobMasterClient;
 use curvine_job_client::TransferClient;

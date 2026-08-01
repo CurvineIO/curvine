@@ -20,14 +20,20 @@ use curvine_common::state::{
 use curvine_common::FsResult;
 use std::time::Instant;
 
+#[cfg(feature = "transfer-store-mysql")]
+use crate::transfer::MysqlTransferStore;
+#[cfg(feature = "transfer-store-sqlite")]
+use crate::transfer::SqliteTransferStore;
 use crate::transfer::{
-    MemoryTransferStore, MysqlTransferStore, SqliteTransferStore, TransferMetrics,
-    TransferPlannedTasks, TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
+    MemoryTransferStore, TransferMetrics, TransferPlannedTasks, TransferRequeueUpdate,
+    TransferStore, TransferTaskStateUpdate,
 };
 
 pub enum TransferStoreBackend {
     Memory(MemoryTransferStore),
+    #[cfg(feature = "transfer-store-sqlite")]
     Sqlite(SqliteTransferStore),
+    #[cfg(feature = "transfer-store-mysql")]
     Mysql(MysqlTransferStore),
 }
 
@@ -35,7 +41,9 @@ impl TransferStore for TransferStoreBackend {
     fn check_available(&self) -> FsResult<()> {
         self.record_store_operation("check_available", || match self {
             Self::Memory(store) => store.check_available(),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.check_available(),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.check_available(),
         })
     }
@@ -43,7 +51,9 @@ impl TransferStore for TransferStoreBackend {
     fn create_or_get_by_request_id(&self, job: TransferJobRecord) -> FsResult<TransferJobRecord> {
         self.record_store_operation("create_or_get_by_request_id", || match self {
             Self::Memory(store) => store.create_or_get_by_request_id(job),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.create_or_get_by_request_id(job),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.create_or_get_by_request_id(job),
         })
     }
@@ -54,7 +64,9 @@ impl TransferStore for TransferStoreBackend {
     ) -> FsResult<TransferJobRecord> {
         self.record_store_operation("create_or_get_by_request_id_checked", || match self {
             Self::Memory(store) => store.create_or_get_by_request_id_checked(job),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.create_or_get_by_request_id_checked(job),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.create_or_get_by_request_id_checked(job),
         })
     }
@@ -62,7 +74,9 @@ impl TransferStore for TransferStoreBackend {
     fn get_transfer(&self, job_id: &str) -> FsResult<Option<TransferJobRecord>> {
         self.record_store_operation("get_transfer", || match self {
             Self::Memory(store) => store.get_transfer(job_id),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.get_transfer(job_id),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.get_transfer(job_id),
         })
     }
@@ -74,7 +88,9 @@ impl TransferStore for TransferStoreBackend {
     ) -> FsResult<Option<TransferJobRecord>> {
         self.record_store_operation("get_transfer_by_request", || match self {
             Self::Memory(store) => store.get_transfer_by_request(submitter, client_request_id),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.get_transfer_by_request(submitter, client_request_id),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.get_transfer_by_request(submitter, client_request_id),
         })
     }
@@ -82,7 +98,9 @@ impl TransferStore for TransferStoreBackend {
     fn list_active_transfers(&self) -> FsResult<Vec<TransferJobRecord>> {
         self.record_store_operation("list_active_transfers", || match self {
             Self::Memory(store) => store.list_active_transfers(),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.list_active_transfers(),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.list_active_transfers(),
         })
     }
@@ -97,9 +115,11 @@ impl TransferStore for TransferStoreBackend {
             Self::Memory(store) => {
                 store.find_conflicting_active_transfer(target_path, submitter, client_request_id)
             }
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => {
                 store.find_conflicting_active_transfer(target_path, submitter, client_request_id)
             }
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => {
                 store.find_conflicting_active_transfer(target_path, submitter, client_request_id)
             }
@@ -109,7 +129,9 @@ impl TransferStore for TransferStoreBackend {
     fn count_active_transfers(&self) -> FsResult<u64> {
         self.record_store_operation("count_active_transfers", || match self {
             Self::Memory(store) => store.count_active_transfers(),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.count_active_transfers(),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.count_active_transfers(),
         })
     }
@@ -117,7 +139,9 @@ impl TransferStore for TransferStoreBackend {
     fn count_executing_transfers(&self) -> FsResult<u64> {
         self.record_store_operation("count_executing_transfers", || match self {
             Self::Memory(store) => store.count_executing_transfers(),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.count_executing_transfers(),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.count_executing_transfers(),
         })
     }
@@ -125,7 +149,9 @@ impl TransferStore for TransferStoreBackend {
     fn list_transfers(&self, filter: TransferListFilter) -> FsResult<Vec<TransferJobRecord>> {
         self.record_store_operation("list_transfers", || match self {
             Self::Memory(store) => store.list_transfers(filter),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.list_transfers(filter),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.list_transfers(filter),
         })
     }
@@ -137,7 +163,9 @@ impl TransferStore for TransferStoreBackend {
     ) -> FsResult<Vec<TransferTenantSummary>> {
         self.record_store_operation("list_tenant_summaries", || match self {
             Self::Memory(store) => store.list_tenant_summaries(limit, offset),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.list_tenant_summaries(limit, offset),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.list_tenant_summaries(limit, offset),
         })
     }
@@ -145,7 +173,9 @@ impl TransferStore for TransferStoreBackend {
     fn purge_terminal_transfers(&self, older_than_ms: i64, limit: usize) -> FsResult<usize> {
         self.record_store_operation("purge_terminal_transfers", || match self {
             Self::Memory(store) => store.purge_terminal_transfers(older_than_ms, limit),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.purge_terminal_transfers(older_than_ms, limit),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.purge_terminal_transfers(older_than_ms, limit),
         })
     }
@@ -153,7 +183,9 @@ impl TransferStore for TransferStoreBackend {
     fn list_transfer_tasks(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
         self.record_store_operation("list_transfer_tasks", || match self {
             Self::Memory(store) => store.list_transfer_tasks(job_id, run_id),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.list_transfer_tasks(job_id, run_id),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.list_transfer_tasks(job_id, run_id),
         })
     }
@@ -161,7 +193,9 @@ impl TransferStore for TransferStoreBackend {
     fn request_cancel(&self, job_id: &str, run_id: u64, now_ms: i64) -> FsResult<bool> {
         self.record_store_operation("request_cancel", || match self {
             Self::Memory(store) => store.request_cancel(job_id, run_id, now_ms),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.request_cancel(job_id, run_id, now_ms),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.request_cancel(job_id, run_id, now_ms),
         })
     }
@@ -177,9 +211,11 @@ impl TransferStore for TransferStoreBackend {
             Self::Memory(store) => {
                 store.acquire_runnable_transfer(owner, lease_ms, now_ms, max_executing_transfers)
             }
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => {
                 store.acquire_runnable_transfer(owner, lease_ms, now_ms, max_executing_transfers)
             }
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => {
                 store.acquire_runnable_transfer(owner, lease_ms, now_ms, max_executing_transfers)
             }
@@ -199,9 +235,11 @@ impl TransferStore for TransferStoreBackend {
             Self::Memory(store) => {
                 store.renew_lease(job_id, run_id, owner, lease_epoch, lease_ms, now_ms)
             }
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => {
                 store.renew_lease(job_id, run_id, owner, lease_epoch, lease_ms, now_ms)
             }
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => {
                 store.renew_lease(job_id, run_id, owner, lease_epoch, lease_ms, now_ms)
             }
@@ -211,7 +249,9 @@ impl TransferStore for TransferStoreBackend {
     fn update_transfer_state(&self, update: TransferStateUpdate) -> FsResult<bool> {
         self.record_store_operation("update_transfer_state", || match self {
             Self::Memory(store) => store.update_transfer_state(update),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.update_transfer_state(update),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.update_transfer_state(update),
         })
     }
@@ -219,7 +259,9 @@ impl TransferStore for TransferStoreBackend {
     fn requeue_transfer(&self, update: TransferRequeueUpdate) -> FsResult<bool> {
         self.record_store_operation("requeue_transfer", || match self {
             Self::Memory(store) => store.requeue_transfer(update),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.requeue_transfer(update),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.requeue_transfer(update),
         })
     }
@@ -242,6 +284,7 @@ impl TransferStore for TransferStoreBackend {
                 cv_metadata_epoch,
                 now_ms,
             ),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.set_transfer_cv_metadata_epoch(
                 job_id,
                 run_id,
@@ -250,6 +293,7 @@ impl TransferStore for TransferStoreBackend {
                 cv_metadata_epoch,
                 now_ms,
             ),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.set_transfer_cv_metadata_epoch(
                 job_id,
                 run_id,
@@ -264,7 +308,9 @@ impl TransferStore for TransferStoreBackend {
     fn insert_tasks(&self, tasks: Vec<TransferTaskRecord>) -> FsResult<()> {
         self.record_store_operation("insert_tasks", || match self {
             Self::Memory(store) => store.insert_tasks(tasks),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.insert_tasks(tasks),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.insert_tasks(tasks),
         })
     }
@@ -272,7 +318,9 @@ impl TransferStore for TransferStoreBackend {
     fn persist_planned_tasks(&self, update: TransferPlannedTasks) -> FsResult<bool> {
         self.record_store_operation("persist_planned_tasks", || match self {
             Self::Memory(store) => store.persist_planned_tasks(update),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.persist_planned_tasks(update),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.persist_planned_tasks(update),
         })
     }
@@ -280,7 +328,9 @@ impl TransferStore for TransferStoreBackend {
     fn update_task_state(&self, update: TransferTaskStateUpdate) -> FsResult<bool> {
         self.record_store_operation("update_task_state", || match self {
             Self::Memory(store) => store.update_task_state(update),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.update_task_state(update),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.update_task_state(update),
         })
     }
@@ -293,7 +343,9 @@ impl TransferStore for TransferStoreBackend {
     ) -> FsResult<Vec<TransferTaskRecord>> {
         self.record_store_operation("claim_pending_tasks", || match self {
             Self::Memory(store) => store.claim_pending_tasks(job_id, run_id, limit),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.claim_pending_tasks(job_id, run_id, limit),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.claim_pending_tasks(job_id, run_id, limit),
         })
     }
@@ -311,9 +363,11 @@ impl TransferStore for TransferStoreBackend {
             Self::Memory(store) => {
                 store.mark_stale_attempts(job_id, run_id, owner, lease_epoch, now_ms, limit)
             }
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => {
                 store.mark_stale_attempts(job_id, run_id, owner, lease_epoch, now_ms, limit)
             }
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => {
                 store.mark_stale_attempts(job_id, run_id, owner, lease_epoch, now_ms, limit)
             }
@@ -331,9 +385,11 @@ impl TransferStore for TransferStoreBackend {
             Self::Memory(store) => {
                 store.list_stale_running_tasks(job_id, run_id, stale_before_ms, limit)
             }
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => {
                 store.list_stale_running_tasks(job_id, run_id, stale_before_ms, limit)
             }
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => {
                 store.list_stale_running_tasks(job_id, run_id, stale_before_ms, limit)
             }
@@ -343,7 +399,9 @@ impl TransferStore for TransferStoreBackend {
     fn has_failed_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool> {
         self.record_store_operation("has_failed_tasks", || match self {
             Self::Memory(store) => store.has_failed_tasks(job_id, run_id),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.has_failed_tasks(job_id, run_id),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.has_failed_tasks(job_id, run_id),
         })
     }
@@ -351,7 +409,9 @@ impl TransferStore for TransferStoreBackend {
     fn has_recoverable_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool> {
         self.record_store_operation("has_recoverable_tasks", || match self {
             Self::Memory(store) => store.has_recoverable_tasks(job_id, run_id),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.has_recoverable_tasks(job_id, run_id),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.has_recoverable_tasks(job_id, run_id),
         })
     }
@@ -359,7 +419,9 @@ impl TransferStore for TransferStoreBackend {
     fn start_task_attempt(&self, start: TaskAttemptStart) -> FsResult<bool> {
         self.record_store_operation("start_task_attempt", || match self {
             Self::Memory(store) => store.start_task_attempt(start),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.start_task_attempt(start),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.start_task_attempt(start),
         })
     }
@@ -367,7 +429,9 @@ impl TransferStore for TransferStoreBackend {
     fn update_task_report(&self, report: TransferTaskReport) -> FsResult<bool> {
         self.record_store_operation("update_task_report", || match self {
             Self::Memory(store) => store.update_task_report(report),
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => store.update_task_report(report),
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.update_task_report(report),
         })
     }
@@ -377,7 +441,9 @@ impl TransferStoreBackend {
     pub fn backend_label(&self) -> &'static str {
         match self {
             Self::Memory(_) => "memory",
+            #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(_) => "sqlite",
+            #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(_) => "mysql",
         }
     }

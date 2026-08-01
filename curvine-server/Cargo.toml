@@ -30,7 +30,7 @@ curvine-worker = { workspace = true }
 curvine-error = { workspace = true, features = ["axum-response"] }
 curvine-fault = { workspace = true }
 curvine-client-core = { workspace = true }
-curvine-data-transfer = { workspace = true, features = ["opendal-s3"] }
+curvine-data-transfer = { workspace = true, features = ["opendal-s3", "transfer-server"] }
 curvine-job-client = { workspace = true }
 curvine-ufs-api = { workspace = true }
 curvine-web = { workspace = true }

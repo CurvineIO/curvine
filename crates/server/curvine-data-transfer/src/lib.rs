@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod common;
+#[cfg(feature = "transfer")]
 pub mod transfer;
 pub mod worker;
 
