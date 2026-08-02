@@ -345,21 +345,16 @@ async fn print_file_entry(
     } else {
         &file.replicas.to_string()
     };
-    let mut owner = file.owner.to_string(); // Default owner
-    let mut group = file.group.to_string(); // Default group
-    if owner.is_empty() || group.is_empty() {
-        // Fallback to default values if owner/group is empty
-        let uid = curvine_sys::get_uid();
-        let gid = curvine_sys::get_gid();
-        let default_owner = curvine_sys::get_username_by_uid(uid);
-        let default_group = curvine_sys::get_groupname_by_gid(gid);
-        if owner.is_empty() {
-            owner = default_owner.unwrap_or_else(|| "root".to_string());
-        }
-        if group.is_empty() {
-            group = default_group.unwrap_or_else(|| "root".to_string());
-        }
-    }
+    let owner = if file.owner.is_empty() {
+        "-"
+    } else {
+        file.owner.as_str()
+    };
+    let group = if file.group.is_empty() {
+        "-"
+    } else {
+        file.group.as_str()
+    };
 
     // Format file size
     let size = if file.is_dir {
