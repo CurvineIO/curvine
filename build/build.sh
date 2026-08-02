@@ -517,6 +517,8 @@ append_ufs_feature() {
     oss-hdfs)
       if [ "$scope" = "cli-minimal" ]; then
         add_feature "curvine-cli/oss-hdfs"
+      elif [ "$scope" = "server-native" ]; then
+        add_feature "curvine-data-transfer/oss-hdfs"
       else
         add_feature "curvine-client/oss-hdfs"
       fi
@@ -524,6 +526,8 @@ append_ufs_feature() {
     opendal-hdfs)
       if [ "$scope" = "cli-minimal" ]; then
         add_feature "curvine-cli/opendal-hdfs"
+      elif [ "$scope" = "server-native" ]; then
+        add_feature "curvine-data-transfer/opendal-hdfs"
       else
         add_feature "curvine-client/opendal-hdfs"
       fi
@@ -534,6 +538,8 @@ append_ufs_feature() {
     opendal-webhdfs)
       if [ "$scope" = "cli-minimal" ]; then
         add_feature "curvine-cli/opendal-webhdfs"
+      elif [ "$scope" = "server-native" ]; then
+        add_feature "curvine-data-transfer/opendal-webhdfs"
       else
         add_feature "curvine-client/opendal-webhdfs"
       fi
@@ -541,6 +547,8 @@ append_ufs_feature() {
     *)
       if [ "$scope" = "cli-minimal" ]; then
         add_feature "curvine-cli/$ufs"
+      elif [ "$scope" = "server-native" ]; then
+        add_feature "curvine-data-transfer/$ufs"
       else
         add_feature "curvine-client/$ufs"
       fi
