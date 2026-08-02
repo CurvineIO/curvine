@@ -16,11 +16,11 @@ use crate::file::{FsContext, FsWriterBase, FsWriterBuffer};
 use bytes::BytesMut;
 use curvine_error::FsResult;
 use curvine_fs_api::{Path, Writer};
+use curvine_io::DataSlice;
 use curvine_model::{FileAllocOpts, FileBlocks, FileStatus, SetAttrOpts};
 use log::debug;
-use orpc::common::{ByteUnit, TimeSpent};
-use orpc::sys::DataSlice;
-use orpc::{err_box, ternary};
+use orpc_error::{err_box, ternary};
+use orpc_runtime::common::{ByteUnit, TimeSpent};
 use std::sync::Arc;
 
 type Inner = FsWriterBuffer;

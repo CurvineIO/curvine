@@ -17,12 +17,13 @@ use crate::file::FsContext;
 use bytes::BytesMut;
 use curvine_error::FsError;
 use curvine_error::FsResult;
+use curvine_io::LocalFile;
+use curvine_io::{CacheManager, DataSlice, ReadAheadTask};
 use curvine_model::{ExtendedBlock, WorkerAddress};
-use orpc::common::Utils;
-use orpc::io::LocalFile;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sys::{CacheManager, DataSlice, RawPtr, ReadAheadTask};
-use orpc::{err_box, try_option};
+use curvine_sys::RawPtr;
+use orpc_error::{err_box, try_option};
+use orpc_runtime::common::Utils;
+use orpc_runtime::runtime::{RpcRuntime, Runtime};
 use std::sync::Arc;
 
 pub struct BlockReaderLocal {

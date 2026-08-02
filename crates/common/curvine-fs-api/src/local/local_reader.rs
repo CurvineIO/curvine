@@ -15,9 +15,9 @@
 use super::LocalStatusUtils;
 use crate::{Path, Reader};
 use curvine_error::FsResult;
+use curvine_io::DataSlice;
+use curvine_io::LocalFile;
 use curvine_model::FileStatus;
-use orpc::io::LocalFile;
-use orpc::sys::DataSlice;
 
 pub struct LocalReader {
     path: Path,

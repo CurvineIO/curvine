@@ -16,12 +16,13 @@ use crate::block::BlockClient;
 use crate::file::FsContext;
 use curvine_error::FsError;
 use curvine_error::FsResult;
+use curvine_io::DataSlice;
+use curvine_io::LocalFile;
 use curvine_model::{ExtendedBlock, WorkerAddress};
-use orpc::common::Utils;
-use orpc::err_box;
-use orpc::io::LocalFile;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sys::{DataSlice, RawPtr};
+use curvine_sys::RawPtr;
+use orpc_error::err_box;
+use orpc_runtime::common::Utils;
+use orpc_runtime::runtime::{RpcRuntime, Runtime};
 use std::sync::Arc;
 
 pub struct BlockWriterLocal {

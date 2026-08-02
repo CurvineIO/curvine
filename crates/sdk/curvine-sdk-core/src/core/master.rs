@@ -15,7 +15,7 @@
 use crate::core::Session;
 use curvine_error::FsResult;
 use curvine_model::MasterInfo;
-use orpc::runtime::RpcRuntime;
+use orpc_runtime::runtime::RpcRuntime;
 
 pub fn get_master_info(session: &Session) -> FsResult<MasterInfo> {
     session

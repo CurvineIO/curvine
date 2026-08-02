@@ -20,7 +20,7 @@ use curvine_error::FsResult;
 use curvine_fs_api::Path;
 use curvine_model::{CommitBlock, ExtendedBlock, LocatedBlock, WorkerAddress};
 use futures::future::try_join_all;
-use orpc::err_box;
+use orpc_error::err_box;
 use std::sync::Arc;
 
 enum BatchWriterAdapter {

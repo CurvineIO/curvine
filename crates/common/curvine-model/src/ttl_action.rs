@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use num_enum::{FromPrimitive, IntoPrimitive};
-use orpc::{err_box, CommonError};
+use orpc_error::{err_box, CommonError};
 use serde::{Deserialize, Serialize};
 
 #[repr(i32)]

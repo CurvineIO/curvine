@@ -3,11 +3,11 @@ use crate::file::FsContext;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
+use curvine_io::LocalFile;
 use curvine_model::{ExtendedBlock, WorkerAddress};
-use orpc::common::Utils;
-use orpc::io::LocalFile;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sys::RawPtr;
+use curvine_sys::RawPtr;
+use orpc_runtime::common::Utils;
+use orpc_runtime::runtime::{RpcRuntime, Runtime};
 use std::sync::Arc;
 
 pub struct BatchBlockWriterLocal {

@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use curvine_unified_fs::UnifiedFileSystem;
-use orpc::CommonResult;
+use orpc_error::CommonResult;
 use std::path::PathBuf;
 
 use crate::cmds::fs::{

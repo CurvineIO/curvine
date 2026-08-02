@@ -19,12 +19,12 @@ use crate::block::{BlockWriterLocal, BlockWriterRemote};
 use crate::file::FsContext;
 use curvine_error::FsError;
 use curvine_error::FsResult;
+use curvine_io::DataSlice;
 use curvine_model::{BlockLocation, CommitBlock, LocatedBlock, WorkerAddress};
 use futures::future::{join_all, try_join_all};
-use orpc::err_box;
-use orpc::error::ErrorExt;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sys::DataSlice;
+use orpc_error::err_box;
+use orpc_error::ErrorExt;
+use orpc_runtime::runtime::{RpcRuntime, Runtime};
 use std::sync::Arc;
 
 async fn finish_all_cancellations<I, F>(futures: I) -> FsResult<()>

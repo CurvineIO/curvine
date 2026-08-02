@@ -17,13 +17,13 @@ use crate::block::{BlockReaderHole, BlockReaderLocal, BlockReaderRemote};
 use crate::file::FsContext;
 use curvine_error::FsError;
 use curvine_error::FsResult;
+use curvine_io::DataSlice;
 use curvine_model::{ClientAddress, ExtendedBlock, LocatedBlock, WorkerAddress};
 use log::warn;
-use orpc::common::Utils;
-use orpc::error::ErrorExt;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sys::DataSlice;
-use orpc::CommonResult;
+use orpc_error::CommonResult;
+use orpc_error::ErrorExt;
+use orpc_runtime::common::Utils;
+use orpc_runtime::runtime::{RpcRuntime, Runtime};
 use std::sync::Arc;
 
 enum ReaderAdapter {

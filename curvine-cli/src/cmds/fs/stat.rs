@@ -1,8 +1,8 @@
 use clap::Subcommand;
 use curvine_fs_api::{CurvineURI, FileSystem};
 use curvine_unified_fs::UnifiedFileSystem;
-use orpc::common::{ByteUnit, DurationUnit};
-use orpc::CommonResult;
+use orpc_error::CommonResult;
+use orpc_runtime::common::{ByteUnit, DurationUnit};
 
 #[derive(Subcommand, Debug)]
 pub enum StatCommand {

@@ -17,8 +17,8 @@ use crate::{ClientConfDefaults, CurvinePath};
 use bincode::Options;
 use log::warn;
 use num_enum::{FromPrimitive, IntoPrimitive};
-use orpc::common::DurationUnit;
-use orpc::{err_box, CommonError, CommonResult};
+use orpc_error::{err_box, CommonError, CommonResult};
+use orpc_runtime::common::DurationUnit;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -540,7 +540,7 @@ mod tests {
             self.0.full_path()
         }
 
-        fn from_str(path: impl AsRef<str>) -> orpc::CommonResult<Self> {
+        fn from_str(path: impl AsRef<str>) -> orpc_error::CommonResult<Self> {
             Path::from_str(path).map(Self)
         }
     }

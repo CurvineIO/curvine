@@ -16,7 +16,7 @@ use crate::util::*;
 use clap::{Parser, Subcommand};
 use curvine_model::{MasterInfo, WorkerInfo};
 use curvine_unified_fs::UnifiedFileSystem;
-use orpc::CommonResult;
+use orpc_error::CommonResult;
 use serde::Serialize;
 
 #[derive(Parser, Debug)]

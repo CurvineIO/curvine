@@ -16,10 +16,10 @@
 
 use crate::java::{JavaFilesystem, SUCCESS};
 use crate::{java_err, java_err2, LibFsReader, LibFsWriter};
+use curvine_sys::FFIUtils;
 use jni::objects::{JByteArray, JLongArray, JObject, JString};
 use jni::sys::{jarray, jboolean, jint, jlong};
 use jni::JNIEnv;
-use orpc::sys::FFIUtils;
 
 // It's too troublesome to parse object members by jni. Here the configuration will be passed through the json string.
 #[no_mangle]

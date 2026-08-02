@@ -7,7 +7,10 @@ license.workspace = true
 [dependencies]
 curvine-error = { workspace = true }
 curvine-proto = { workspace = true }
-orpc = { workspace = true }
+curvine-sys = { workspace = true }
+orpc-error = { workspace = true }
+orpc-net = { workspace = true }
+orpc-runtime = { workspace = true }
 serde = { workspace = true }
 prost = { workspace = true }
 bincode = { workspace = true }

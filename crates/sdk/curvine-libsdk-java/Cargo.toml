@@ -21,6 +21,7 @@ internal-oss-hdfs-jindo = ["curvine-sdk-core/internal-oss-hdfs-jindo"]
 curvine-sdk-core = { workspace = true }
 curvine-error = { workspace = true }
 curvine-fs-api = { workspace = true }
+curvine-sys = { workspace = true }
 jni = "0.21.1"
-orpc = { workspace = true }
+orpc-error = { workspace = true }
 prost = { workspace = true }

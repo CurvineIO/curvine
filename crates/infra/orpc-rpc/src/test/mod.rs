@@ -12,27 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Shared UFS config, context, and transfer primitives for clients and adapters.
+mod simple_server;
 
-pub use orpc_error;
-
-pub mod fs;
-
-mod ufs_utils;
-pub use self::ufs_utils::UfsUtils;
-
-mod conf;
-pub use self::conf::*;
-
-pub const FOLDER_SUFFIX: &str = "/";
-
-#[macro_export]
-macro_rules! err_ufs {
-    ($e:expr) => ({
-        Err($crate::orpc_error::err_msg!($e).into())
-    });
-
-    ($f:tt, $($arg:expr),+) => ({
-        $crate::orpc_error::err_box!(format!($f, $($arg),+))
-    });
-}
+pub use self::simple_server::SimpleServer;

@@ -19,5 +19,6 @@ pub mod client;
 pub mod handler;
 pub mod message;
 pub mod server;
+pub mod test;
 
 pub use server::ServerConf;

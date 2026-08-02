@@ -20,8 +20,8 @@ use curvine_bench::{
     DEFAULT_BIG_FILE_COUNT, DEFAULT_DURATION_MS, DEFAULT_FILES_PER_DIR,
 };
 use curvine_unified_fs::UnifiedFileSystem;
-use orpc::common::ByteUnit;
-use orpc::{err_box, CommonResult};
+use orpc_error::{err_box, CommonResult};
+use orpc_runtime::common::ByteUnit;
 
 mod output;
 use output::{print_prefill_report, print_report, print_resource_hint, print_startup_config};

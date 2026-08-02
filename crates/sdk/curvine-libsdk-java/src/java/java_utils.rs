@@ -16,7 +16,7 @@ use curvine_error::FsError;
 use jni::objects::{JObject, JString, JThrowable, JValue};
 use jni::sys::{jarray, jboolean, jstring, JNI_TRUE};
 use jni::JNIEnv;
-use orpc::CommonResult;
+use orpc_error::CommonResult;
 
 pub struct JavaUtils;
 

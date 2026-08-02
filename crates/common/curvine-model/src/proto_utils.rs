@@ -15,7 +15,7 @@
 use crate::proto::*;
 use crate::state::*;
 use crate::worker_info::TransferWorkerCapabilities;
-use orpc::{try_err, CommonResult};
+use orpc_error::{try_err, CommonResult};
 use prost::bytes::BytesMut;
 use prost::Message;
 use std::fmt::Debug;

@@ -17,11 +17,11 @@ use curvine_client::unified::UnifiedWriter;
 use curvine_config::ClusterConf;
 use curvine_error::FsResult;
 use curvine_fs_api::{Path, Writer};
+use curvine_io::DataSlice;
 use curvine_model::FileStatus;
-use orpc::err_box;
-use orpc::handler::FrameBuf;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sys::DataSlice;
+use orpc_error::err_box;
+use orpc_rpc::handler::FrameBuf;
+use orpc_runtime::runtime::{RpcRuntime, Runtime};
 use std::sync::Arc;
 
 pub struct LibFsWriter {

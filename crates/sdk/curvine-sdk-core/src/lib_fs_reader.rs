@@ -15,8 +15,8 @@
 use curvine_client::unified::UnifiedReader;
 use curvine_error::FsResult;
 use curvine_fs_api::{Path, Reader};
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sys::DataSlice;
+use curvine_io::DataSlice;
+use orpc_runtime::runtime::{RpcRuntime, Runtime};
 use std::sync::Arc;
 
 pub struct LibFsReader {

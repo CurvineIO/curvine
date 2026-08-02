@@ -16,13 +16,15 @@ use crate::file::FsWriterBase;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
+use curvine_io::DataSlice;
+use curvine_io::IOError;
 use curvine_model::{FileAllocOpts, FileBlocks, FileStatus, SetAttrOpts};
 use log::error;
-use orpc::io::IOError;
-use orpc::runtime::RpcRuntime;
-use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
-use orpc::sync::ErrorMonitor;
-use orpc::sys::DataSlice;
+use orpc_runtime::runtime::RpcRuntime;
+use orpc_runtime::sync::channel::{
+    AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender,
+};
+use orpc_runtime::sync::ErrorMonitor;
 use std::sync::Arc;
 
 // Control task type
@@ -320,8 +322,8 @@ mod tests {
     use super::{recv_task, SelectTask, WriterTask};
     use bytes::Bytes;
     use curvine_error::FsResult;
-    use orpc::sync::channel::{AsyncChannel, CallChannel};
-    use orpc::sys::DataSlice;
+    use curvine_io::DataSlice;
+    use orpc_runtime::sync::channel::{AsyncChannel, CallChannel};
 
     #[tokio::test]
     async fn cancel_control_preempts_queued_data() {
