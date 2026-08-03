@@ -418,7 +418,7 @@ mod tests {
     use curvine_common::fs::{Path, Writer};
     use curvine_common::state::FileStatus;
     use curvine_common::FsResult;
-    use orpc::common::Metrics as m;
+    use curvine_metrics::Metrics as m;
     use orpc::sync::channel::{AsyncChannel, CallChannel};
     use orpc::sync::AtomicLong;
     use orpc::sys::DataSlice;
@@ -697,7 +697,7 @@ mod tests {
         assert_eq!(cancel_count.load(Ordering::SeqCst), 1);
     }
 
-    fn queued_task(gauge: &orpc::common::Gauge) -> QueuedWriteTask {
+    fn queued_task(gauge: &curvine_metrics::Gauge) -> QueuedWriteTask {
         let (rx, _tx) = CallChannel::channel::<FsResult<()>>();
         QueuedWriteTask {
             task: WriteTask::Flush(rx, None),
@@ -788,7 +788,7 @@ mod tests {
         use curvine_common::conf::FuseConf;
         use curvine_common::error::FsError;
         use curvine_common::fs::local::LocalWriter;
-        use orpc::common::Metrics as m;
+        use curvine_metrics::Metrics as m;
         use orpc::runtime::{AsyncRuntime, RpcRuntime};
         use orpc::sync::channel::AsyncChannel;
         use std::sync::Arc;

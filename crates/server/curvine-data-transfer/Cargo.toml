@@ -31,6 +31,7 @@ orpc = { workspace = true }
 curvine-common = { workspace = true }
 curvine-client-core = { workspace = true }
 curvine-job-client = { workspace = true }
+curvine-metrics = { workspace = true }
 curvine-unified-fs = { workspace = true }
 curvine-ufs-api = { workspace = true }
 curvine-web = { workspace = true, optional = true }

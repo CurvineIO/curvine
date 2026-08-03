@@ -18,9 +18,9 @@ use std::sync::Arc;
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::Router;
+use curvine_metrics::Metrics;
 use curvine_web::router::RouterHandler;
 use log::warn;
-use orpc::common::Metrics;
 
 use crate::transfer::{ClusterMetadataCache, TransferService, TransferStoreBackend};
 

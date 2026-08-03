@@ -19,7 +19,6 @@ rolling-file = { workspace = true }
 serde = { workspace = true }
 chrono = { workspace = true }
 once_cell = { workspace = true }
-prometheus = { workspace = true, features = ["process"] }
 uuid = { workspace = true }
 md-5 = { workspace = true }
 rand = { workspace = true }

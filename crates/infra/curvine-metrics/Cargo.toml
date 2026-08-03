@@ -1,0 +1,13 @@
+[package]
+name = "curvine-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Curvine Prometheus metrics primitives."
+
+[dependencies]
+orpc-error = { workspace = true }
+once_cell = { workspace = true }
+prometheus = { workspace = true, features = ["process"] }
+dashmap = { workspace = true }
+fxhash = { workspace = true }

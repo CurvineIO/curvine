@@ -20,7 +20,7 @@ use crate::FuseMetrics;
 use axum::extract::State;
 use axum::routing::get;
 use axum::Router;
-use orpc::common::Metrics;
+use curvine_metrics::Metrics;
 use serde::Serialize;
 use std::net::SocketAddr;
 use std::sync::Arc;

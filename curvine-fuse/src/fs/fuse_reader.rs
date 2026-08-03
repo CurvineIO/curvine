@@ -183,7 +183,7 @@ mod tests {
     use crate::session::{FuseResponse, FuseTask};
     use curvine_client::unified::UnifiedReader;
     use curvine_common::fs::local::LocalReader;
-    use orpc::common::Metrics as m;
+    use curvine_metrics::Metrics as m;
     use orpc::runtime::AsyncRuntime;
     use orpc::sync::channel::AsyncChannel;
     use std::io::Write as _;

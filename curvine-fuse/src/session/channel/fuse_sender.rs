@@ -19,8 +19,8 @@ use crate::fuse_metrics::{
 };
 use crate::session::{FuseTask, ResponseData};
 use crate::FuseResult;
+use curvine_metrics::Gauge;
 use log::{info, warn};
-use orpc::common::Gauge;
 use orpc::io::IOResult;
 use orpc::runtime::Runtime;
 use orpc::sync::channel::AsyncReceiver;
@@ -266,7 +266,7 @@ fn mark_dequeued(queue_guard: Option<ActiveGuard>) {
 mod tests {
     use super::mark_dequeued;
     use crate::fuse_metrics::ActiveGuard;
-    use orpc::common::Metrics as m;
+    use curvine_metrics::Metrics as m;
 
     // `mark_dequeued` decrements at the dequeue point.
     #[test]

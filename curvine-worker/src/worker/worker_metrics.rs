@@ -14,7 +14,7 @@
 
 use crate::worker::block::BlockStore;
 use crate::worker::storage::Dataset;
-use orpc::common::{Counter, CounterVec, Gauge, HistogramVec, Metrics as m, Metrics};
+use curvine_metrics::{Counter, CounterVec, Gauge, HistogramVec, Metrics, Metrics as m};
 use orpc::sys::SysUtils;
 use orpc::CommonResult;
 use std::fmt::{Debug, Formatter};

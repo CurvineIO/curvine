@@ -871,7 +871,7 @@ mod tests {
         use crate::FuseUtils;
         use bytes::{BufMut, BytesMut};
         use curvine_common::conf::FuseConf;
-        use orpc::common::Metrics as m;
+        use curvine_metrics::Metrics as m;
         use orpc::sync::channel::{AsyncChannel, AsyncReceiver};
         use orpc::sync::FastDashMap;
 
@@ -1566,7 +1566,7 @@ mod tests {
 
                 let opcode = req.opcode().as_str();
                 let ctx = if with_metrics_ctx {
-                    let gauge = orpc::common::Metrics::new_gauge(
+                    let gauge = curvine_metrics::Metrics::new_gauge(
                         format!("ss_dispatch_active_{}", req.unique()),
                         "test".to_string(),
                     )
@@ -1720,7 +1720,7 @@ mod tests {
                 let (tx, mut rx) = AsyncChannel::new(16).split();
                 let drainer = tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
-                let active_g = orpc::common::Metrics::new_gauge(
+                let active_g = curvine_metrics::Metrics::new_gauge(
                     "ss_malformed_active_7201".to_string(),
                     "test".to_string(),
                 )
@@ -1895,7 +1895,7 @@ mod tests {
                 let (tx, mut rx) = AsyncChannel::new(64).split();
                 let opcode = req.opcode().as_str();
                 let ctx = if with_metrics_ctx {
-                    let gauge = orpc::common::Metrics::new_gauge(
+                    let gauge = curvine_metrics::Metrics::new_gauge(
                         format!("sec_active_{}", req.unique()),
                         "test".to_string(),
                     )

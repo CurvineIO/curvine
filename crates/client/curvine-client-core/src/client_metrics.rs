@@ -15,10 +15,12 @@
 use crate::file::FsContext;
 use curvine_error::FsResult;
 use curvine_io::DataSlice;
+use curvine_metrics::{
+    Counter, CounterVec, Gauge, HistogramVec, MetricFamilyType, Metrics, Metrics as m,
+};
 use curvine_model::{MetricType, MetricValue};
 use orpc_error::CommonResult;
-use orpc_runtime::common::{Counter, CounterVec, HistogramVec, Metrics as m, TimeSpent};
-use orpc_runtime::common::{Gauge, Metrics};
+use orpc_runtime::common::TimeSpent;
 use orpc_runtime::sync::FastDashMap;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -114,8 +116,8 @@ impl ClientMetrics {
             }
 
             let metric_type = match mf.get_field_type() {
-                prometheus::proto::MetricType::COUNTER => MetricType::Counter,
-                prometheus::proto::MetricType::GAUGE => MetricType::Gauge,
+                MetricFamilyType::COUNTER => MetricType::Counter,
+                MetricFamilyType::GAUGE => MetricType::Gauge,
                 _ => MetricType::Gauge,
             };
 

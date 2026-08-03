@@ -34,4 +34,8 @@ pub mod sys {
 pub mod test;
 
 pub use orpc_error::{CommonError, CommonResult, CommonResultExt};
-pub use orpc_runtime::{common, runtime, sync};
+pub mod common {
+    pub use curvine_metrics::*;
+    pub use orpc_runtime::common::*;
+}
+pub use orpc_runtime::{runtime, sync};

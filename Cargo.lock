@@ -2071,6 +2071,7 @@ dependencies = [
  "curvine-error",
  "curvine-fs-api",
  "curvine-io",
+ "curvine-metrics",
  "curvine-model",
  "curvine-proto",
  "curvine-sys",
@@ -2087,7 +2088,6 @@ dependencies = [
  "orpc-rpc",
  "orpc-runtime",
  "pin-project-lite",
- "prometheus",
  "prost 0.11.9",
  "rand 0.8.5",
  "serde",
@@ -2190,6 +2190,7 @@ dependencies = [
  "curvine-client-core",
  "curvine-common",
  "curvine-job-client",
+ "curvine-metrics",
  "curvine-ufs-api",
  "curvine-unified-fs",
  "curvine-web",
@@ -2268,6 +2269,7 @@ dependencies = [
  "curvine-client",
  "curvine-common",
  "curvine-config",
+ "curvine-metrics",
  "dashmap 5.5.3",
  "futures",
  "fxhash",
@@ -2413,6 +2415,7 @@ dependencies = [
  "curvine-data-transfer",
  "curvine-error",
  "curvine-fault",
+ "curvine-metrics",
  "curvine-rocksdb",
  "curvine-unified-fs",
  "curvine-web",
@@ -2434,6 +2437,17 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "curvine-metrics"
+version = "0.2.0"
+dependencies = [
+ "dashmap 5.5.3",
+ "fxhash",
+ "once_cell",
+ "orpc-error",
+ "prometheus",
 ]
 
 [[package]]
@@ -2750,7 +2764,9 @@ dependencies = [
  "curvine-client-core",
  "curvine-common",
  "curvine-data-transfer",
+ "curvine-error",
  "curvine-fault",
+ "curvine-metrics",
  "curvine-storage-local",
  "curvine-storage-spdk",
  "curvine-web",
@@ -6888,6 +6904,7 @@ dependencies = [
  "crc32fast",
  "crossbeam",
  "curvine-io",
+ "curvine-metrics",
  "curvine-sys",
  "dashmap 5.5.3",
  "fs2",
@@ -6908,7 +6925,6 @@ dependencies = [
  "orpc-runtime",
  "parking_lot",
  "pin-project-lite",
- "prometheus",
  "prost 0.11.9",
  "rand 0.8.5",
  "rolling-file",
@@ -6984,7 +7000,6 @@ dependencies = [
  "once_cell",
  "orpc-error",
  "parking_lot",
- "prometheus",
  "rand 0.8.5",
  "rolling-file",
  "serde",

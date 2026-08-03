@@ -780,12 +780,12 @@ impl NodeState {
         });
     }
 
-    fn inc_gauges_lockstep(legacy: &orpc::common::Gauge, alias: &orpc::common::Gauge) {
+    fn inc_gauges_lockstep(legacy: &curvine_metrics::Gauge, alias: &curvine_metrics::Gauge) {
         legacy.inc();
         alias.inc();
     }
 
-    fn dec_gauges_lockstep(legacy: &orpc::common::Gauge, alias: &orpc::common::Gauge) {
+    fn dec_gauges_lockstep(legacy: &curvine_metrics::Gauge, alias: &curvine_metrics::Gauge) {
         legacy.dec();
         alias.dec();
     }
@@ -1445,12 +1445,12 @@ mod test {
 
     #[test]
     fn inc_dec_gauges_lockstep_move_both_together() {
-        let legacy = orpc::common::Metrics::new_gauge(
+        let legacy = curvine_metrics::Metrics::new_gauge(
             "test_lockstep_legacy_gauge_unique",
             "isolated legacy gauge",
         )
         .unwrap();
-        let alias = orpc::common::Metrics::new_gauge(
+        let alias = curvine_metrics::Metrics::new_gauge(
             "test_lockstep_alias_gauge_unique",
             "isolated alias gauge",
         )

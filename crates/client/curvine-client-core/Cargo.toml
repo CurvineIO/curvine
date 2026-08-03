@@ -16,6 +16,7 @@ curvine-proto = { workspace = true }
 curvine-model = { workspace = true }
 curvine-fs-api = { workspace = true }
 curvine-config = { workspace = true }
+curvine-metrics = { workspace = true }
 once_cell = { workspace = true }
 hyper = { workspace = true }
 prost = { workspace = true }
@@ -33,7 +34,6 @@ futures = { workspace = true }
 async-stream = { workspace = true }
 moka = { workspace = true }
 fxhash = { workspace = true }
-prometheus = { workspace = true }
 linked-hash-map = { workspace = true }
 rand = { workspace = true }
 

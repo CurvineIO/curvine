@@ -12,6 +12,7 @@ resolver = "2"
 members = [
     "orpc",
     "crates/infra/curvine-fault",
+    "crates/infra/curvine-metrics",
     "crates/common/curvine-error",
     "crates/common/curvine-proto",
     "crates/common/curvine-model",
@@ -60,6 +61,7 @@ members = [
 default-members = [
     "orpc",
     "crates/infra/curvine-fault",
+    "crates/infra/curvine-metrics",
     "crates/common/curvine-error",
     "crates/common/curvine-proto",
     "crates/common/curvine-model",
@@ -116,6 +118,7 @@ curvine-ufs-oss-hdfs = { path = "crates/adapters/curvine-ufs-oss-hdfs" }
 curvine-hdfs-jni = { path = "crates/adapters/curvine-hdfs-jni" }
 curvine-data-transfer = { path = "crates/server/curvine-data-transfer" }
 curvine-fault = { path = "crates/infra/curvine-fault" }
+curvine-metrics = { path = "crates/infra/curvine-metrics" }
 curvine-error = { path = "crates/common/curvine-error" }
 curvine-proto = { path = "crates/common/curvine-proto" }
 curvine-model = { path = "crates/common/curvine-model" }

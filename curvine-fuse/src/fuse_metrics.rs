@@ -17,9 +17,10 @@ use std::time::Instant;
 use log::warn;
 use once_cell::sync::OnceCell;
 
-use orpc::common::{
-    Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, LocalTime, Metrics as m,
+use curvine_metrics::{
+    Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, Metrics as m,
 };
+use orpc::common::LocalTime;
 use orpc::CommonResult;
 
 use crate::fuse_error::errno_label;
@@ -1256,7 +1257,7 @@ impl ShutdownOnce {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orpc::common::Metrics as m;
+    use curvine_metrics::Metrics as m;
 
     // Compile-time guarantee that the guards/timer are `Send`: they travel into
     // spawned/reply tasks, so a field change making them `!Send` fails here rather
@@ -2721,12 +2722,12 @@ mod tests {
     // the shape session call sites use to gate every emission on metrics_enabled.
     #[test]
     fn lifecycle_gate_suppresses_when_disabled() {
-        fn record_if(enabled: bool, counter: &orpc::common::Counter) {
+        fn record_if(enabled: bool, counter: &curvine_metrics::Counter) {
             if enabled {
                 counter.inc();
             }
         }
-        let counter = orpc::common::Metrics::new_counter(
+        let counter = curvine_metrics::Metrics::new_counter(
             "test_lifecycle_gate_isolated_counter_unique",
             "isolated lifecycle gate counter",
         )

@@ -12,14 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::hash::BuildHasherDefault;
+use std::sync::Arc;
+use std::time::Instant;
+
+use dashmap::DashMap;
+use fxhash::FxHasher;
 use once_cell::sync::Lazy;
+use orpc_error::CommonResult;
 use prometheus::core::{
     AtomicI64, Collector, GenericCounter, GenericCounterVec, GenericGauge, GenericGaugeVec,
 };
 use prometheus::{default_registry, Encoder, HistogramOpts, Opts, Registry, TextEncoder};
 
-use crate::sync::FastDashMap;
-use crate::CommonResult;
+pub use prometheus::proto::MetricType as MetricFamilyType;
 
 pub type Counter = GenericCounter<AtomicI64>;
 pub type CounterVec = GenericCounterVec<AtomicI64>;
@@ -28,7 +34,9 @@ pub type GaugeVec = GenericGaugeVec<AtomicI64>;
 pub type Histogram = prometheus::Histogram;
 pub type HistogramVec = prometheus::HistogramVec;
 
-static METRICS_MAP: Lazy<FastDashMap<String, Metrics>> = Lazy::new(FastDashMap::default);
+type MetricsMap = DashMap<String, Metrics, BuildHasherDefault<FxHasher>>;
+
+static METRICS_MAP: Lazy<MetricsMap> = Lazy::new(MetricsMap::default);
 
 #[derive(Clone)]
 pub enum Metrics {
@@ -72,7 +80,7 @@ impl Metrics {
 
         let res = METRICS_MAP.entry(name.clone()).or_insert(m);
 
-        // ignore already registered error as it can happen in concurrent test scenarios
+        // Ignore already registered errors as they can happen in concurrent test scenarios.
         match default_registry().register(res.boxed()) {
             Ok(_) => Ok(()),
             Err(e) => {
@@ -183,21 +191,67 @@ impl Metrics {
     pub fn try_into_counter_vec(self) -> CommonResult<CounterVec> {
         match self {
             Metrics::CounterVec(v) => Ok(v),
-            _ => err_box!("Not CounterVec"),
+            _ => orpc_error::err_box!("Not CounterVec"),
         }
     }
 
     pub fn try_into_histogram_vec(self) -> CommonResult<HistogramVec> {
         match self {
             Metrics::HistogramVec(v) => Ok(v),
-            _ => err_box!("Not HistogramVec"),
+            _ => orpc_error::err_box!("Not HistogramVec"),
         }
+    }
+}
+
+// RAII guard for Counter metrics.
+pub struct MetricTimer {
+    start: Instant,
+    metric: Arc<Counter>,
+}
+
+impl MetricTimer {
+    pub fn new(metric: Arc<Counter>) -> Self {
+        Self {
+            start: Instant::now(),
+            metric,
+        }
+    }
+}
+
+impl Drop for MetricTimer {
+    fn drop(&mut self) {
+        self.metric.inc_by(self.start.elapsed().as_micros() as i64);
+    }
+}
+
+pub struct MetricTimerVec {
+    start: Instant,
+    metric: Arc<HistogramVec>,
+    label_values: Vec<String>,
+}
+
+impl MetricTimerVec {
+    pub fn new(metric: Arc<HistogramVec>, label_values: Vec<String>) -> Self {
+        Self {
+            start: Instant::now(),
+            metric,
+            label_values,
+        }
+    }
+}
+
+impl Drop for MetricTimerVec {
+    fn drop(&mut self) {
+        let values: Vec<&str> = self.label_values.iter().map(|s| s.as_str()).collect();
+        self.metric
+            .with_label_values(&values)
+            .observe(self.start.elapsed().as_micros() as f64);
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::common::Metrics;
+    use crate::Metrics;
 
     #[test]
     fn sample() {

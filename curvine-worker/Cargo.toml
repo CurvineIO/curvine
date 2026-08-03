@@ -23,6 +23,8 @@ fault-injection = [
 [dependencies]
 orpc = { workspace = true }
 curvine-common = { workspace = true }
+curvine-error = { workspace = true, features = ["axum-response"] }
+curvine-metrics = { workspace = true }
 curvine-client-core = { workspace = true }
 curvine-data-transfer = { workspace = true, features = ["opendal-s3"] }
 curvine-web = { workspace = true }

@@ -641,7 +641,7 @@ mod tests {
         ENQUEUE_REASON_CHANNEL_CLOSED, NOTIFY_ENQUEUE_FAILED, REPLY_TYPE_NO_REPLY,
         REPLY_TYPE_REPLIED,
     };
-    use orpc::common::{Gauge, Metrics as m};
+    use curvine_metrics::{Gauge, Metrics as m};
     use orpc::sync::channel::{AsyncChannel, AsyncReceiver};
 
     #[test]

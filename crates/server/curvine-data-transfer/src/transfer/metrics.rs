@@ -14,8 +14,8 @@
 
 use curvine_common::error::FsError;
 use curvine_common::FsResult;
+use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics as m};
 use once_cell::sync::OnceCell;
-use orpc::common::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics as m};
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Mutex;
