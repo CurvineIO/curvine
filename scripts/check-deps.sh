@@ -101,7 +101,9 @@ check_facade_direct_deps() {
   local facade_deps
   facade_deps="$(
     awk -F '\t' '
-      ($2 == "curvine-common" || $2 == "orpc") && $1 != $2 {
+      # curvine-tests is an opt-in integration harness; protect production crates
+      # with check_testing_harness_reverse_deps instead.
+      ($2 == "curvine-common" || $2 == "orpc") && $1 != $2 && $1 != "curvine-tests" {
         print $1 " -> " $2
       }
     ' <<<"$direct_internal_deps"
@@ -112,6 +114,28 @@ check_facade_direct_deps() {
 $facade_deps"
   else
     record_ok "facade-direct-deps"
+  fi
+}
+
+check_testing_harness_reverse_deps() {
+  local testing_normal_deps
+  testing_normal_deps="$(
+    jq -r '
+      .packages[]
+      | select(.source == null) as $pkg
+      | $pkg.dependencies[]
+      | select(.path != null)
+      | select(.name == "curvine-tests" and (.kind == null))
+      | select($pkg.name != "curvine-tests")
+      | $pkg.name + " -> curvine-tests"
+    ' <<<"$metadata" | sort
+  )"
+
+  if [[ -n "$testing_normal_deps" ]]; then
+    record_violation "testing-harness-normal-deps" "production crates must not depend on curvine-tests:
+$testing_normal_deps"
+  else
+    record_ok "testing-harness-normal-deps"
   fi
 }
 
@@ -196,6 +220,7 @@ echo "Dependency boundary check mode: $MODE"
 echo
 
 check_facade_direct_deps
+check_testing_harness_reverse_deps
 check_tree_forbidden "curvine-cli-final-tree" "$common_client_forbidden" -p curvine-cli
 check_tree_forbidden "curvine-fuse-final-tree" "$common_client_forbidden" -p curvine-fuse
 check_tree_forbidden "curvine-libsdk-java-min-final-tree" "$libsdk_java_forbidden" -p curvine-libsdk --no-default-features --features java-sdk

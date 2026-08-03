@@ -1,7 +1,12 @@
 [package]
 name = "curvine-tests"
 version = "0.1.0"
+description = "Curvine integration and regression test harness"
 edition = "2021"
+publish = false
+
+# This package is an opt-in test harness, not a production crate. Its normal
+# dependencies may include server/client/FUSE paths used by integration tests.
 
 [features]
 # Enable OSS-HDFS backend specific tests / code paths (Jindo-based).

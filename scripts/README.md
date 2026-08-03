@@ -16,4 +16,8 @@ scripts/check-deps.sh --mode final
 
 `report` mode is useful during migration because known violations are printed as
 warnings. `final` mode is the P7 gate and fails if internal dependencies on
-`curvine-common` / `orpc` or forbidden heavy paths remain.
+`curvine-common` / `orpc` or forbidden heavy paths remain. The check also keeps
+`curvine-tests` as an opt-in test harness by rejecting normal production
+dependencies on that package. `curvine-tests` itself is excluded from production
+facade dependency checks because its server/client/FUSE dependencies are only
+allowed behind explicit test commands.

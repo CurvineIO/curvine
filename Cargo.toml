@@ -49,7 +49,10 @@ members = [
     "crates/sdk/curvine-libsdk-java",
     "crates/sdk/curvine-libsdk-python",
     "curvine-lancedb",
-    'curvine-tests',
+    # Top-level integration/regression harness. It remains a workspace member so
+    # explicit test commands keep working, but it is intentionally opt-in via
+    # default-members because it pulls server/client/FUSE/native test paths.
+    "curvine-tests",
     "curvine-fuse",
     "curvine-web",
     "curvine-ufs",
@@ -58,6 +61,8 @@ members = [
 
 # Mirror members here unless a crate is intentionally opt-in.
 # curvine-lancedb stays opt-in because it pulls heavy Lance/Arrow dependencies.
+# curvine-tests stays opt-in because it pulls whole-cluster integration,
+# FUSE, and optional external storage dependencies for explicit test runs.
 default-members = [
     "orpc",
     "crates/infra/curvine-fault",
@@ -89,7 +94,6 @@ default-members = [
     "crates/client/curvine-bench",
     "curvine-client",
     "curvine-libsdk",
-    "curvine-tests",
     "curvine-fuse",
     "curvine-web",
     "curvine-ufs",
@@ -142,6 +146,8 @@ curvine-libsdk-python = { path = "crates/sdk/curvine-libsdk-python" }
 curvine-server = { path = "curvine-server" }
 curvine-lancedb = { path = "curvine-lancedb" }
 curvine-ufs = { path = "curvine-ufs" }
+# Test harness dependency entry is for explicit test/dev tooling only.
+# Production crates must not add normal dependencies on curvine-tests.
 curvine-tests = { path = "curvine-tests" }
 curvine-fuse = { path = "curvine-fuse" }
 curvine-web = { path = "curvine-web" }

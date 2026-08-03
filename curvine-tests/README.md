@@ -2,6 +2,21 @@
 
 Regression test server and Portal for Curvine (build-server). Test results are written under `curvine-tests/regression_result/` (gitignored).
 
+## Layering Decision
+
+`curvine-tests` remains a top-level workspace member and is the canonical
+repository-wide integration/regression test harness. It owns the regression
+server, Docker image, whole-cluster test helpers, and cross-product test entry
+points, so moving it under a production crate layer such as `crates/client` or
+`crates/server` would make the layer boundary less clear.
+
+The package is intentionally excluded from workspace `default-members`. It may
+depend on server, client, FUSE, native storage, and optional external backend
+paths only for explicit commands such as `cargo test -p curvine-tests` or the
+`curvine-tests` regression image. Production crates must not add normal
+dependencies on `curvine-tests`; verify with `cargo tree -i curvine-tests
+--workspace` and `scripts/check-deps.sh --mode report`.
+
 ## Local Run
 
 From the **project root** (so that `curvine-tests/regression` and project code are visible):
