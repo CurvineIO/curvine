@@ -12,14 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::conf::ClusterConf;
-use crate::raft::{RaftGroup, RaftPeer};
-use crate::rocksdb::DBConf;
-use crate::FsResult;
-use orpc::client::ClientConf;
-use orpc::common::{ByteUnit, Utils};
-use orpc::io::net::{InetAddr, NetUtils};
-use orpc::runtime::Runtime;
+use crate::{ClusterConf, DBConf, RaftPeer};
+use curvine_net::net::{InetAddr, NetUtils};
+use curvine_rpc::client::ClientConf;
+use curvine_runtime::common::{ByteUnit, Utils};
+use curvine_runtime::runtime::Runtime;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::vec;
@@ -163,12 +160,6 @@ impl JournalConf {
         self.rocksdb.clone().set_dir(&self.journal_dir)
     }
 
-    pub fn node_id(&self) -> FsResult<u64> {
-        let group = RaftGroup::from_conf(self);
-        let id = group.get_node_id(&self.local_addr())?;
-        Ok(id)
-    }
-
     pub fn new_client_conf(&self) -> ClientConf {
         ClientConf {
             io_threads: self.io_threads,
@@ -192,26 +183,6 @@ impl JournalConf {
             conn_size: self.conn_size,
 
             use_libc: false,
-            ..Default::default()
-        }
-    }
-
-    pub fn new_raft_conf(&self, id: u64, applied: u64) -> raft::Config {
-        raft::Config {
-            id,
-            election_tick: self.raft_election_tick,
-            heartbeat_tick: self.raft_heartbeat_tick,
-            min_election_tick: self.raft_min_election_ticks,
-            max_election_tick: self.raft_max_election_ticks,
-            max_size_per_msg: self.raft_max_size_per_msg,
-            max_inflight_msgs: self.raft_max_inflight_msgs,
-            applied,
-            max_committed_size_per_ready: self.raft_max_committed_size_per_ready,
-
-            check_quorum: self.raft_check_quorum,
-            skip_bcast_commit: true,
-            pre_vote: true,
-            batch_append: true,
             ..Default::default()
         }
     }

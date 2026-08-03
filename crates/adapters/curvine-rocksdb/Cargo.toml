@@ -7,6 +7,7 @@ description = "Curvine RocksDB metadata adapter."
 
 [dependencies]
 byteorder = { workspace = true }
+curvine-config = { workspace = true }
 log = { workspace = true }
 orpc = { workspace = true }
 prost = { workspace = true }

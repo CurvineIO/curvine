@@ -17,8 +17,23 @@ pub use curvine_error::{FsError, FsResult};
 pub const DEFAULT_HOSTNAME: &str = "localhost";
 pub const DEFAULT_FUSE_WEB_PORT: u16 = 9002;
 
+mod db_conf;
+pub use self::db_conf::DBConf;
+
+mod raft_peer;
+pub use self::raft_peer::RaftPeer;
+
+mod journal_conf;
+pub use self::journal_conf::JournalConf;
+
+mod master_conf;
+pub use self::master_conf::MasterConf;
+
+mod worker_conf;
+pub use self::worker_conf::{WorkerConf, WorkerDataDir};
+
 mod cluster_conf;
-pub use self::cluster_conf::{ClusterConf, JournalConf, JournalPeer, MasterConf};
+pub use self::cluster_conf::ClusterConf;
 
 mod cli_conf;
 pub use self::cli_conf::CliConf;

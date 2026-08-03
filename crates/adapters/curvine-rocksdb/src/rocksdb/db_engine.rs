@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::rocksdb::{DBConf, RocksUtils};
+use crate::rocksdb::{DBConf, DBConfExt, RocksUtils};
 use log::{info, warn};
 use orpc::common::{FileUtils, Utils};
 use orpc::{err_box, try_err, CommonResult};

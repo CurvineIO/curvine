@@ -2168,7 +2168,9 @@ dependencies = [
  "curvine-common-macros",
  "curvine-core-error",
  "curvine-error",
+ "curvine-fault",
  "curvine-fs-api",
+ "curvine-io",
  "curvine-model",
  "curvine-net",
  "curvine-rpc",
@@ -2176,6 +2178,7 @@ dependencies = [
  "curvine-sys",
  "log",
  "nix",
+ "regex",
  "serde",
  "toml",
 ]
@@ -2535,6 +2538,7 @@ name = "curvine-rocksdb"
 version = "0.2.0"
 dependencies = [
  "byteorder",
+ "curvine-config",
  "log",
  "orpc",
  "prost 0.11.9",

@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::raft::NodeId;
-use orpc::common::Utils;
-use orpc::io::net::InetAddr;
+use curvine_net::net::InetAddr;
+use curvine_runtime::common::Utils;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
+
+pub type NodeId = u64;
 
 // Represents a raft address
 #[derive(Debug, Deserialize, Serialize, Clone)]

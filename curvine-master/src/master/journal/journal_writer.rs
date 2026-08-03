@@ -18,7 +18,7 @@ use crate::master::journal::*;
 use crate::master::meta::inode::{InodeDir, InodeFile, InodePath};
 use crate::master::meta::FsDir;
 use crate::master::{Master, MasterMetrics};
-use curvine_common::conf::JournalConf;
+use curvine_common::conf::{JournalConf, JournalConfExt};
 use curvine_common::raft::RaftClient;
 use curvine_common::state::{CommitBlock, FileLock, MountInfo, RenameFlags, SetAttrOpts};
 use curvine_common::FsResult;

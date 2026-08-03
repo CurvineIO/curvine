@@ -12,12 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod journal_conf;
-pub use self::journal_conf::JournalConf;
+pub use curvine_config::{JournalConf, RaftPeer};
 
-pub(crate) struct ClusterConf;
-
-impl ClusterConf {
-    pub const DEFAULT_HOSTNAME: &'static str = curvine_config::ClusterConf::DEFAULT_HOSTNAME;
-    pub const DEFAULT_RAFT_PORT: u16 = curvine_config::ClusterConf::DEFAULT_RAFT_PORT;
-}
+mod journal_ext;
+pub use self::journal_ext::JournalConfExt;
