@@ -14,8 +14,12 @@
 
 use crate::master::meta::inode::{InodeDir, InodeFile};
 use crate::master::meta::BlockMeta;
+use curvine_core_error::{err_box, CommonResult};
 use curvine_model::{CommitBlock, FileLock, MountInfo, SetAttrOpts};
+use curvine_runtime::common::SerdeUtils;
+use log::debug;
 use serde::{Deserialize, Serialize};
+use std::io::Cursor;
 
 #[derive(Debug, Clone)]
 pub(crate) struct CvMetadataChange {
@@ -86,9 +90,7 @@ pub struct RenameEntry {
     pub(crate) mtime: i64,
     pub(crate) flags: u32,
     /// Pre-exchange inode ids for idempotent EXCHANGE replay (0 when absent / legacy).
-    #[serde(default)]
     pub(crate) src_inode_id: i64,
-    #[serde(default)]
     pub(crate) dst_inode_id: i64,
 }
 
@@ -313,6 +315,26 @@ pub struct JournalBatch {
 }
 
 impl JournalBatch {
+    pub(crate) fn deserialize_compat(bytes: &[u8]) -> CommonResult<Self> {
+        match SerdeUtils::deserialize(bytes) {
+            Ok(batch) => Ok(batch),
+            Err(current_err) => match deserialize_legacy_batch(bytes) {
+                Ok(batch) => {
+                    debug!(
+                        "replaying legacy journal batch without rename exchange inode ids, seq_id={}",
+                        batch.seq_id
+                    );
+                    Ok(batch.into())
+                }
+                Err(legacy_err) => err_box!(
+                    "failed to deserialize journal batch with current or legacy rename schema: current={}, legacy={}",
+                    current_err,
+                    legacy_err
+                ),
+            },
+        }
+    }
+
     pub fn new(seq_id: u64) -> Self {
         Self {
             seq_id,
@@ -335,5 +357,96 @@ impl JournalBatch {
     pub fn next(&mut self) {
         self.seq_id += 1;
         self.batch.clear();
+    }
+}
+
+// bincode encodes struct fields positionally, so appending fields to RenameEntry
+// cannot be made backward compatible with serde(default). Keep this schema only
+// for replaying entries written before exchange inode ids were introduced.
+#[derive(Deserialize)]
+struct LegacyRenameEntry {
+    op_id: u64,
+    rpc_id: i64,
+    src: String,
+    dst: String,
+    mtime: i64,
+    flags: u32,
+}
+
+#[derive(Deserialize)]
+enum LegacyJournalEntry {
+    Mkdir(MkdirEntry),
+    CreateFile(CreateFileEntry),
+    ReopenFile(ReopenFileEntry),
+    OverWriteFile(OverWriteFileEntry),
+    AddBlock(AddBlockEntry),
+    CompleteFile(CompleteFileEntry),
+    Rename(LegacyRenameEntry),
+    Delete(DeleteEntry),
+    Mount(MountEntry),
+    UnMount(UnMountEntry),
+    SetAttr(SetAttrEntry),
+    Symlink(SymlinkEntry),
+    Link(LinkEntry),
+    SetLocks(SetLocksEntry),
+    Free(FreeEntry),
+    UfsApplied(UfsAppliedEntry),
+    Snapshot(SnapshotEntry),
+}
+
+#[derive(Deserialize)]
+struct LegacyJournalBatch {
+    seq_id: u64,
+    batch: Vec<LegacyJournalEntry>,
+}
+
+fn deserialize_legacy_batch(bytes: &[u8]) -> CommonResult<LegacyJournalBatch> {
+    let mut reader = Cursor::new(bytes);
+    let batch = SerdeUtils::deserialize_from(&mut reader)?;
+    if reader.position() != bytes.len() as u64 {
+        return err_box!("legacy journal batch has trailing bytes");
+    }
+    Ok(batch)
+}
+
+impl From<LegacyJournalBatch> for JournalBatch {
+    fn from(batch: LegacyJournalBatch) -> Self {
+        Self {
+            seq_id: batch.seq_id,
+            batch: batch.batch.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<LegacyJournalEntry> for JournalEntry {
+    fn from(entry: LegacyJournalEntry) -> Self {
+        match entry {
+            LegacyJournalEntry::Mkdir(entry) => Self::Mkdir(entry),
+            LegacyJournalEntry::CreateFile(entry) => Self::CreateFile(entry),
+            LegacyJournalEntry::ReopenFile(entry) => Self::ReopenFile(entry),
+            LegacyJournalEntry::OverWriteFile(entry) => Self::OverWriteFile(entry),
+            LegacyJournalEntry::AddBlock(entry) => Self::AddBlock(entry),
+            LegacyJournalEntry::CompleteFile(entry) => Self::CompleteFile(entry),
+            LegacyJournalEntry::Rename(entry) => Self::Rename(RenameEntry {
+                op_id: entry.op_id,
+                rpc_id: entry.rpc_id,
+                src: entry.src,
+                dst: entry.dst,
+                mtime: entry.mtime,
+                flags: entry.flags,
+                src_inode_id: 0,
+                dst_inode_id: 0,
+            }),
+            LegacyJournalEntry::Delete(entry) => Self::Delete(entry),
+            LegacyJournalEntry::Mount(entry) => Self::Mount(entry),
+            LegacyJournalEntry::UnMount(entry) => Self::UnMount(entry),
+            LegacyJournalEntry::SetAttr(entry) => Self::SetAttr(entry),
+            LegacyJournalEntry::Symlink(entry) => Self::Symlink(entry),
+            LegacyJournalEntry::Link(entry) => Self::Link(entry),
+            LegacyJournalEntry::SetLocks(entry) => Self::SetLocks(entry),
+            LegacyJournalEntry::Free(entry) => Self::Free(entry),
+            LegacyJournalEntry::UfsApplied(entry) => Self::UfsApplied(entry),
+            LegacyJournalEntry::Snapshot(entry) => Self::Snapshot(entry),
+        }
     }
 }

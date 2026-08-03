@@ -28,7 +28,6 @@ use curvine_raft::conf::JournalConfExt;
 use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData};
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg, LogStorage, RocksLogStorage};
 use curvine_raft::raft::{RaftClient, RaftResult, RaftUtils};
-use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::{FileUtils, LocalTime, TimeSpent};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel};
@@ -231,7 +230,7 @@ impl JournalLoader {
             return Ok(());
         }
 
-        let batch: JournalBatch = SerdeUtils::deserialize(&entry.data)?;
+        let batch = JournalBatch::deserialize_compat(&entry.data)?;
         let batch_len = batch.len();
         let mut snapshot = None;
         let mut applied = Self::build_applied(entry);
