@@ -14,7 +14,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use crate::conf::JournalConf;
+use crate::conf::{JournalConf, JournalConfExt};
 use crate::proto::raft::*;
 use crate::raft::raft_error::RaftError;
 use crate::raft::storage::{AppStorage, ApplyMsg, LogStorage, PeerStorage};

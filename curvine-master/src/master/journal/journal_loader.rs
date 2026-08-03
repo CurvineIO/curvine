@@ -20,7 +20,7 @@ use crate::master::meta::inode::InodeView::File;
 use crate::master::meta::inode::{InodePath, InodeView};
 use crate::master::meta::InodeId;
 use crate::master::{JobManager, Master, MasterMetrics, MountManager, SyncFsDir};
-use curvine_common::conf::JournalConf;
+use curvine_common::conf::{JournalConf, JournalConfExt};
 use curvine_common::error::FsError;
 use curvine_common::proto::raft::{AppliedIndex, FsmState, SnapshotData};
 use curvine_common::raft::storage::{AppStorage, ApplyMsg, LogStorage, RocksLogStorage};
