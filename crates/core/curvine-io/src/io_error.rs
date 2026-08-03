@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use bytes::BytesMut;
-use orpc_error::{CommonError, CommonErrorExt, ErrorExt, ErrorImpl};
+use curvine_core_error::{CommonError, CommonErrorExt, ErrorExt, ErrorImpl};
 use std::error::Error;
 use std::ffi::NulError;
 use std::io;

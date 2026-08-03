@@ -14,8 +14,8 @@
 
 use crate::state::{FileAllocOpts, FileStatus, FileType, StorageType, WorkerAddress};
 use crate::FsResult;
-use orpc_error::{err_box, CommonResult};
-use orpc_runtime::common::{ByteUnit, FastHashMap};
+use curvine_core_error::{err_box, CommonResult};
+use curvine_runtime::common::{ByteUnit, FastHashMap};
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, Range};
 

@@ -9,8 +9,8 @@ curvine-error = { workspace = true }
 curvine-model = { workspace = true }
 curvine-proto = { workspace = true }
 curvine-io = { workspace = true }
-orpc-error = { workspace = true }
-orpc-runtime = { workspace = true }
+curvine-core-error = { workspace = true }
+curvine-runtime = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 async-stream = { workspace = true }

@@ -19,7 +19,7 @@ use std::time::Instant;
 use dashmap::DashMap;
 use fxhash::FxHasher;
 use once_cell::sync::Lazy;
-use orpc_error::CommonResult;
+use curvine_core_error::CommonResult;
 use prometheus::core::{
     AtomicI64, Collector, GenericCounter, GenericCounterVec, GenericGauge, GenericGaugeVec,
 };
@@ -191,14 +191,14 @@ impl Metrics {
     pub fn try_into_counter_vec(self) -> CommonResult<CounterVec> {
         match self {
             Metrics::CounterVec(v) => Ok(v),
-            _ => orpc_error::err_box!("Not CounterVec"),
+            _ => curvine_core_error::err_box!("Not CounterVec"),
         }
     }
 
     pub fn try_into_histogram_vec(self) -> CommonResult<HistogramVec> {
         match self {
             Metrics::HistogramVec(v) => Ok(v),
-            _ => orpc_error::err_box!("Not HistogramVec"),
+            _ => curvine_core_error::err_box!("Not HistogramVec"),
         }
     }
 }

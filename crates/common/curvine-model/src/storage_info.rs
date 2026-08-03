@@ -16,7 +16,7 @@
 
 use clap::ValueEnum;
 use num_enum::{FromPrimitive, IntoPrimitive};
-use orpc_error::{err_box, CommonError};
+use curvine_core_error::{err_box, CommonError};
 use serde::{Deserialize, Serialize};
 
 #[repr(i32)]

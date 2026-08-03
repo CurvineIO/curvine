@@ -16,7 +16,7 @@ use crate::error::FsError;
 use crate::FsResult;
 use crate::MAX_FILE_SIZE;
 use bitflags::bitflags;
-use orpc_error::{err_box, err_ext};
+use curvine_core_error::{err_box, err_ext};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 bitflags! {

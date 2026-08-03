@@ -17,7 +17,7 @@
 use crate::fs::FsKind;
 use hyper::Uri;
 use once_cell::sync::Lazy;
-use orpc_error::CommonResult;
+use curvine_core_error::CommonResult;
 use regex::Regex;
 use std::fmt::{Display, Formatter};
 use std::path::MAIN_SEPARATOR;
@@ -330,7 +330,7 @@ impl From<&str> for Path {
 #[cfg(test)]
 mod tests {
     use crate::fs::Path;
-    use orpc_error::CommonResult;
+    use curvine_core_error::CommonResult;
 
     #[test]
     fn normalize_path() -> CommonResult<()> {

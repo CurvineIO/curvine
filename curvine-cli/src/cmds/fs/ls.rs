@@ -2,8 +2,8 @@ use clap::Subcommand;
 use curvine_fs_api::{CurvineURI, FileSystem};
 use curvine_model::FileStatus;
 use curvine_unified_fs::UnifiedFileSystem;
-use orpc_error::CommonResult;
-use orpc_runtime::common::{ByteUnit, DurationUnit};
+use curvine_core_error::CommonResult;
+use curvine_runtime::common::{ByteUnit, DurationUnit};
 
 /// Configuration for printing file entries
 #[derive(Debug)]

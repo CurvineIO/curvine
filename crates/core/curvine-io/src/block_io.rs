@@ -248,7 +248,7 @@ impl BlockIO for LocalFile {
 #[cfg(test)]
 mod test {
     use super::*;
-    use orpc_runtime::common::Utils;
+    use curvine_runtime::common::Utils;
     use std::fs::remove_file;
 
     #[test]

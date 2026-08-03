@@ -14,7 +14,7 @@
 
 use crate::state::{MountInfo, StorageType, TtlAction, WorkerAddress};
 use num_enum::{FromPrimitive, IntoPrimitive};
-use orpc_runtime::common::ByteUnit;
+use curvine_runtime::common::ByteUnit;
 use serde::{Deserialize, Serialize};
 
 #[derive(
@@ -329,7 +329,7 @@ impl JobTaskProgress {
 #[cfg(test)]
 mod tests {
     use super::JobTaskProgress;
-    use orpc_runtime::common::ByteUnit;
+    use curvine_runtime::common::ByteUnit;
 
     #[test]
     fn progress_string_caps_loaded_bytes_at_total() {

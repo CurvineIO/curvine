@@ -10,10 +10,10 @@ curvine-fs-api = { workspace = true }
 curvine-model = { workspace = true }
 curvine-common-macros = { workspace = true }
 curvine-sys = { workspace = true }
-orpc-error = { workspace = true }
-orpc-net = { workspace = true }
-orpc-rpc = { workspace = true }
-orpc-runtime = { workspace = true }
+curvine-core-error = { workspace = true }
+curvine-net = { workspace = true }
+curvine-rpc = { workspace = true }
+curvine-runtime = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 clap = { workspace = true }

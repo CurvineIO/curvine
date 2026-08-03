@@ -23,5 +23,5 @@ curvine-error = { workspace = true }
 curvine-fs-api = { workspace = true }
 curvine-sys = { workspace = true }
 jni = "0.21.1"
-orpc-error = { workspace = true }
+curvine-core-error = { workspace = true }
 prost = { workspace = true }

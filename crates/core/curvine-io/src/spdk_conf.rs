@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use orpc_error::CommonResult;
-use orpc_runtime::common::{ByteUnit, DurationUnit};
+use curvine_core_error::CommonResult;
+use curvine_runtime::common::{ByteUnit, DurationUnit};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 
 macro_rules! err_msg {
     ($error:expr) => {{
-        let thread = orpc_runtime::thread_name();
+        let thread = curvine_runtime::thread_name();
         format!("[{}] ERROR: {}({}:{})", thread, $error, file!(), line!())
     }};
     ($format:tt, $($argument:expr),+) => {{

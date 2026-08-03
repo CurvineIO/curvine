@@ -28,9 +28,9 @@ use curvine_proto::{
     SubmitTransferResponse, TransferProgressProto, TransferTaskReportRequest,
     TransferTaskReportResponse, WatchTransferRequest, WatchTransferResponse,
 };
-use orpc_net::net::NodeAddr;
-use orpc_rpc::client::ClusterConnector;
-use orpc_runtime::runtime::Runtime;
+use curvine_net::net::NodeAddr;
+use curvine_rpc::client::ClusterConnector;
+use curvine_runtime::runtime::Runtime;
 
 use curvine_client_core::file::FsContext;
 
@@ -74,7 +74,7 @@ impl TransferClient {
     }
 
     fn with_endpoints(
-        conf: orpc_rpc::client::ClientConf,
+        conf: curvine_rpc::client::ClientConf,
         rt: Arc<Runtime>,
         endpoints: Vec<String>,
     ) -> FsResult<Self> {

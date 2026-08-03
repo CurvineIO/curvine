@@ -290,7 +290,7 @@ macro_rules! impl_reader_for_enum {
                 }
             }
 
-            fn blocking_read(&mut self, rt: &::orpc_runtime::runtime::Runtime) -> ::curvine_error::FsResult<::curvine_io::DataSlice> {
+            fn blocking_read(&mut self, rt: &::curvine_runtime::runtime::Runtime) -> ::curvine_error::FsResult<::curvine_io::DataSlice> {
                 match self {
                     $(
                         $(#[$cfg])*

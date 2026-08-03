@@ -15,7 +15,7 @@
 use crate::pipe::{Pipe2, PipeFd};
 use crate::{SysResult, PIPE_BUF};
 use log::warn;
-use orpc_runtime::sync::AtomicLen;
+use curvine_runtime::sync::AtomicLen;
 use std::collections::LinkedList;
 use std::sync::Mutex;
 

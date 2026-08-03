@@ -20,8 +20,8 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use curvine_io::IOError;
 use num_enum::{FromPrimitive, IntoPrimitive};
-use orpc_error::CommonError;
-use orpc_error::{ErrorDecoder, ErrorExt, ErrorImpl, StringError};
+use curvine_core_error::CommonError;
+use curvine_core_error::{ErrorDecoder, ErrorExt, ErrorImpl, StringError};
 use prost::bytes::BytesMut;
 use prost::{DecodeError, EncodeError};
 #[cfg(feature = "axum-response")]
@@ -706,7 +706,7 @@ impl ErrorExt for FsError {
 mod tests {
     use super::ErrorKind;
     use crate::FsError;
-    use orpc_error::{ErrorExt, ErrorImpl};
+    use curvine_core_error::{ErrorExt, ErrorImpl};
 
     #[test]
     pub fn error_test() {

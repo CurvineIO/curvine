@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 curvine-io = { workspace = true }
-orpc-error = { workspace = true }
+curvine-core-error = { workspace = true }
 tokio = { workspace = true }
 prost = { workspace = true }
 num_enum = { workspace = true }

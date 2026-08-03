@@ -15,7 +15,7 @@
 use clap::Parser;
 use curvine_job_client::{JobMasterClient, TransferClient};
 use curvine_model::TransferState;
-use orpc_error::CommonResult;
+use curvine_core_error::CommonResult;
 
 use crate::util::*;
 

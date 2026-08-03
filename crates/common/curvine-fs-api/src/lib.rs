@@ -53,7 +53,7 @@ impl curvine_model::CurvinePath for Path {
         self.full_path()
     }
 
-    fn from_str(path: impl AsRef<str>) -> orpc_error::CommonResult<Self> {
+    fn from_str(path: impl AsRef<str>) -> curvine_core_error::CommonResult<Self> {
         Path::from_str(path)
     }
 }

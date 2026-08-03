@@ -16,7 +16,7 @@ use crate::core::transfer_compat;
 use crate::core::Session;
 use curvine_error::FsResult;
 use curvine_model::{JobStatus, LoadJobCommand, LoadJobResult};
-use orpc_runtime::runtime::RpcRuntime;
+use curvine_runtime::runtime::RpcRuntime;
 
 pub fn submit_load(session: &Session, source: impl AsRef<str>) -> FsResult<LoadJobResult> {
     submit_load_job(session, LoadJobCommand::builder(source.as_ref()).build())

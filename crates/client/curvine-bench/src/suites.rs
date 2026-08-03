@@ -18,7 +18,7 @@ use super::runner::PathAction;
 use super::{
     BenchOp, BenchOpResult, BenchResultGroup, CurvineBenchRunner, LatencyMode, RENAMED_SUFFIX,
 };
-use orpc_error::CommonResult;
+use curvine_core_error::CommonResult;
 
 const UNITS_BIG_IO: BenchReportUnits = BenchReportUnits {
     latency: LatencyMode::AvgOnly,

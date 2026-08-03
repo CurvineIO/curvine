@@ -15,8 +15,8 @@
 use crate::util::*;
 use curvine_fs_api::Path;
 use curvine_unified_fs::UnifiedFileSystem;
-use orpc_error::CommonResult;
-use orpc_runtime::common::ByteUnit;
+use curvine_core_error::CommonResult;
+use curvine_runtime::common::ByteUnit;
 
 #[derive(Debug)]
 pub enum FreeCommand {

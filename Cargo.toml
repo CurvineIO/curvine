@@ -20,10 +20,10 @@ members = [
     "crates/common/curvine-storage-api",
     "crates/common/curvine-ufs-api",
     "crates/common/curvine-config",
-    "crates/core/orpc-error",
-    "crates/core/orpc-runtime",
-    "crates/core/orpc-net",
-    "crates/core/orpc-rpc",
+    "crates/core/error",
+    "crates/core/runtime",
+    "crates/core/net",
+    "crates/core/rpc",
     "crates/core/curvine-sys",
     "crates/core/curvine-io",
     "crates/adapters/curvine-rocksdb",
@@ -74,10 +74,10 @@ default-members = [
     "crates/common/curvine-storage-api",
     "crates/common/curvine-ufs-api",
     "crates/common/curvine-config",
-    "crates/core/orpc-error",
-    "crates/core/orpc-runtime",
-    "crates/core/orpc-net",
-    "crates/core/orpc-rpc",
+    "crates/core/error",
+    "crates/core/runtime",
+    "crates/core/net",
+    "crates/core/rpc",
     "crates/core/curvine-sys",
     "crates/core/curvine-io",
     "crates/metadata/curvine-raft",
@@ -107,10 +107,10 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 orpc = { path = "orpc" }
-orpc-error = { path = "crates/core/orpc-error" }
-orpc-runtime = { path = "crates/core/orpc-runtime" }
-orpc-net = { path = "crates/core/orpc-net" }
-orpc-rpc = { path = "crates/core/orpc-rpc" }
+curvine-core-error = { path = "crates/core/error" }
+curvine-runtime = { path = "crates/core/runtime" }
+curvine-net = { path = "crates/core/net" }
+curvine-rpc = { path = "crates/core/rpc" }
 curvine-sys = { path = "crates/core/curvine-sys" }
 curvine-io = { path = "crates/core/curvine-io" }
 curvine-rocksdb = { path = "crates/adapters/curvine-rocksdb" }

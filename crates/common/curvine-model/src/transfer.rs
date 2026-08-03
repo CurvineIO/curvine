@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use num_enum::{FromPrimitive, IntoPrimitive};
-use orpc_runtime::common::Utils;
+use curvine_runtime::common::Utils;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 

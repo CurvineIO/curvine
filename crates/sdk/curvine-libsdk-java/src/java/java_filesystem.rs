@@ -25,7 +25,7 @@ use curvine_sdk_core::blocking_job as job;
 use jni::objects::{JByteArray, JString};
 use jni::sys::{jarray, jboolean, jstring};
 use jni::JNIEnv;
-use orpc_error::{err_box, try_err};
+use curvine_core_error::{err_box, try_err};
 use prost::Message;
 
 pub struct JavaFilesystem {

@@ -30,7 +30,7 @@ pub trait CurvinePath: Sized + std::fmt::Display {
     fn is_cv(&self) -> bool;
     fn path(&self) -> &str;
     fn full_path(&self) -> &str;
-    fn from_str(path: impl AsRef<str>) -> orpc_error::CommonResult<Self>;
+    fn from_str(path: impl AsRef<str>) -> curvine_core_error::CommonResult<Self>;
 }
 
 mod storage_info;

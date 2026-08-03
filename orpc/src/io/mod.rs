@@ -33,9 +33,9 @@ pub mod spdk_conf {
 }
 
 pub mod net {
-    pub use orpc_net::net::*;
+    pub use curvine_net::net::*;
 }
 
 pub mod retry {
-    pub use orpc_net::retry::*;
+    pub use curvine_net::retry::*;
 }

@@ -19,8 +19,8 @@ use curvine_error::FsResult;
 use curvine_io::DataSlice;
 use curvine_io::LocalFile;
 use curvine_model::FileStatus;
-use orpc_error::err_ext;
-use orpc_runtime::common::FileUtils;
+use curvine_core_error::err_ext;
+use curvine_runtime::common::FileUtils;
 use prost::bytes::BytesMut;
 
 pub struct LocalWriter {

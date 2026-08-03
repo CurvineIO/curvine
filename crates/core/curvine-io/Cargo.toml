@@ -8,8 +8,8 @@ description = "Curvine I/O primitive migration boundary."
 [dependencies]
 bytes = { workspace = true }
 curvine-sys = { workspace = true }
-orpc-error = { workspace = true }
-orpc-runtime = { workspace = true }
+curvine-core-error = { workspace = true }
+curvine-runtime = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

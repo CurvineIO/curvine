@@ -1,0 +1,21 @@
+[package]
+name = "curvine-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Curvine RPC primitives."
+
+[dependencies]
+curvine-io = { workspace = true }
+curvine-sys = { workspace = true }
+curvine-core-error = { workspace = true }
+curvine-net = { workspace = true }
+curvine-runtime = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+prost = { workspace = true }
+num_enum = { workspace = true }
+log = { workspace = true }
+socket2 = { workspace = true }

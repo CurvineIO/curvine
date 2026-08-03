@@ -13,18 +13,18 @@
 // limitations under the License.
 
 pub mod client {
-    pub use orpc_rpc::client::*;
+    pub use curvine_rpc::client::*;
 }
 pub mod error {
-    pub use orpc_error::*;
+    pub use curvine_core_error::*;
 }
 pub mod handler {
-    pub use orpc_rpc::handler::*;
+    pub use curvine_rpc::handler::*;
 }
 pub mod io;
 pub mod macros;
 pub mod message {
-    pub use orpc_rpc::message::*;
+    pub use curvine_rpc::message::*;
 }
 pub mod server;
 pub mod sys {
@@ -33,9 +33,9 @@ pub mod sys {
 }
 pub mod test;
 
-pub use orpc_error::{CommonError, CommonResult, CommonResultExt};
+pub use curvine_core_error::{CommonError, CommonResult, CommonResultExt};
 pub mod common {
     pub use curvine_metrics::*;
-    pub use orpc_runtime::common::*;
+    pub use curvine_runtime::common::*;
 }
-pub use orpc_runtime::{runtime, sync};
+pub use curvine_runtime::{runtime, sync};

@@ -6,9 +6,9 @@ license.workspace = true
 
 [dependencies]
 curvine-sys = { workspace = true }
-orpc-error = { workspace = true }
-orpc-net = { workspace = true }
-orpc-runtime = { workspace = true }
+curvine-core-error = { workspace = true }
+curvine-net = { workspace = true }
+curvine-runtime = { workspace = true }
 curvine-client-core = { workspace = true }
 curvine-job-client = { workspace = true }
 curvine-unified-fs = { workspace = true }

@@ -14,7 +14,7 @@
 
 //! Shared UFS config, context, and transfer primitives for clients and adapters.
 
-pub use orpc_error;
+pub use curvine_core_error;
 
 pub mod fs;
 
@@ -29,10 +29,10 @@ pub const FOLDER_SUFFIX: &str = "/";
 #[macro_export]
 macro_rules! err_ufs {
     ($e:expr) => ({
-        Err($crate::orpc_error::err_msg!($e).into())
+        Err($crate::curvine_core_error::err_msg!($e).into())
     });
 
     ($f:tt, $($arg:expr),+) => ({
-        $crate::orpc_error::err_box!(format!($f, $($arg),+))
+        $crate::curvine_core_error::err_box!(format!($f, $($arg),+))
     });
 }

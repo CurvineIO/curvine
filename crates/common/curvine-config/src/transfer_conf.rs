@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::{FsError, FsResult};
-use orpc_rpc::server::ServerConf;
-use orpc_runtime::common::DurationUnit;
+use curvine_rpc::server::ServerConf;
+use curvine_runtime::common::DurationUnit;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
