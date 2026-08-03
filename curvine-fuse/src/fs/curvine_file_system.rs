@@ -17,7 +17,8 @@ use crate::fs::operator::*;
 use crate::fs::plock_wait_registry::{LockOwner, PlockWaitGuard, PlockWaitRegistry};
 use crate::fs::state::{FileHandle, NodeState};
 use crate::fuse_metrics::{
-    ReaddirTimer, INVAL_REASON_FLUSH, INVAL_REASON_FSYNC, INVAL_REASON_RELEASE, INVAL_REASON_RESIZE,
+    ReaddirTimer, INVAL_REASON_FLUSH, INVAL_REASON_FSYNC, INVAL_REASON_MKDIR, INVAL_REASON_RELEASE,
+    INVAL_REASON_RENAME, INVAL_REASON_RESIZE, INVAL_REASON_RMDIR,
 };
 use crate::raw::fuse_abi::*;
 use crate::raw::FuseDirentList;
@@ -245,7 +246,14 @@ impl CurvineFileSystem {
 
         self.state
             .fs_rename(old_id, old_name, new_dir, new_name, flags)
-            .await
+            .await?;
+
+        self.state.invalid_cache(old_id, None, INVAL_REASON_RENAME);
+        if new_dir != old_id {
+            self.state.invalid_cache(new_dir, None, INVAL_REASON_RENAME);
+        }
+
+        Ok(())
     }
 
     fn parse_rename2_flags(flags: u32) -> FuseResult<RenameFlags> {
@@ -1496,6 +1504,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let opts = FuseUtils::mkdir_opts(&op, &self.fs);
         let attr = self.state.fs_mkdir(ino, name, opts).await?;
+        self.state.invalid_cache(ino, None, INVAL_REASON_MKDIR);
         Ok(FuseUtils::create_entry_out(&self.conf, attr))
     }
 
@@ -1858,6 +1867,8 @@ impl fs::FileSystem for CurvineFileSystem {
 
         self.fs.delete(&path, false).await?;
         self.state.unlink(op.header.nodeid, name, false)?;
+        self.state
+            .invalid_cache(op.header.nodeid, None, INVAL_REASON_RMDIR);
 
         Ok(())
     }

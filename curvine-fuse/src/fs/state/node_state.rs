@@ -1414,6 +1414,41 @@ mod test {
     }
 
     #[test]
+    fn invalidating_parent_status_drops_stale_nlink() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.enable_meta_cache = true;
+        conf.fuse.metrics_enabled = false;
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+
+        state.cache_resolved_status(
+            FUSE_ROOT_ID,
+            None,
+            &FileStatus {
+                is_dir: true,
+                nlink: 3,
+                mode: 0o755,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            state
+                .get_cached_status(FUSE_ROOT_ID, None, false)
+                .unwrap()
+                .unwrap()
+                .nlink,
+            3
+        );
+
+        state.invalid_cache(FUSE_ROOT_ID, None, crate::fuse_metrics::INVAL_REASON_RMDIR);
+        assert!(state
+            .get_cached_status(FUSE_ROOT_ID, None, false)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn handle_chokepoints_inc_dec_their_own_gauge_only() {
         crate::FuseMetrics::ensure_init().unwrap();
         let mx = crate::FuseMetrics::get();
