@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 /// Identity of a POSIX advisory lock owner (FUSE client + kernel lock owner).
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -84,7 +84,18 @@ impl PlockDeadlockCycle {
 
         let mut victim_idx = 0;
         for (idx, edge) in edges.iter().enumerate().skip(1) {
-            if edge.info.request_unique >= edges[victim_idx].info.request_unique {
+            let current = &edges[victim_idx];
+            // Use a total order over (request_unique, client_id, owner_id) so
+            // the victim is a pure function of the cycle contents, independent
+            // of traversal order.  Strict > ensures that equal keys keep the
+            // first-encountered maximum, which is deterministic.
+            if edge.info.request_unique > current.info.request_unique
+                || (edge.info.request_unique == current.info.request_unique
+                    && edge.waiter.client_id > current.waiter.client_id)
+                || (edge.info.request_unique == current.info.request_unique
+                    && edge.waiter.client_id == current.waiter.client_id
+                    && edge.waiter.owner_id > current.waiter.owner_id)
+            {
                 victim_idx = idx;
             }
         }
@@ -122,16 +133,23 @@ struct WaitRecord {
 }
 
 /// Tracks in-flight F_SETLKW waiters so circular wait chains return EDEADLK.
+///
+/// Each registration is keyed by `(LockOwner, request_unique)` so that
+/// multiple concurrent `F_SETLKW` requests sharing the same owner do not
+/// overwrite each other's edges.
 pub(crate) struct PlockWaitRegistry {
-    waiters: Mutex<HashMap<LockOwner, WaitRecord>>,
-    change_notify: Notify,
+    waiters: Mutex<HashMap<(LockOwner, u64), WaitRecord>>,
+    change_tx: watch::Sender<u64>,
+    change_rx: watch::Receiver<u64>,
 }
 
 impl Default for PlockWaitRegistry {
     fn default() -> Self {
+        let (change_tx, change_rx) = watch::channel(0u64);
         Self {
             waiters: Mutex::default(),
-            change_notify: Notify::new(),
+            change_tx,
+            change_rx,
         }
     }
 }
@@ -142,12 +160,12 @@ impl PlockWaitRegistry {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn register(&self, waiter: LockOwner, blocked_by: LockOwner) {
+    pub fn register(&self, waiter: LockOwner, request_unique: u64, blocked_by: LockOwner) {
         self.waiters
             .lock()
             .expect("plock wait registry poisoned")
             .insert(
-                waiter,
+                (waiter, request_unique),
                 WaitRecord {
                     blocked_by,
                     info: Self::empty_wait_info(),
@@ -155,12 +173,12 @@ impl PlockWaitRegistry {
             );
     }
 
-    pub fn unregister(&self, waiter: &LockOwner) {
+    pub fn unregister(&self, waiter: &LockOwner, request_unique: u64) {
         let removed = self
             .waiters
             .lock()
             .expect("plock wait registry poisoned")
-            .remove(waiter)
+            .remove(&(waiter.clone(), request_unique))
             .is_some();
         if removed {
             self.notify_waiters();
@@ -168,16 +186,18 @@ impl PlockWaitRegistry {
     }
 
     pub fn notify_waiters(&self) {
-        // Store one permit for a waiter that has observed the conflict but has
-        // not yet registered its `notified()` future. `notify_waiters()` alone
-        // only wakes already registered futures, which can lose the only unlock
-        // event needed to advance an OFD lock convoy.
-        self.change_notify.notify_one();
-        self.change_notify.notify_waiters();
+        // Increment the generation counter so every waiter (including those
+        // that have not yet registered their `changed()` future) observes the
+        // change when they next call `wait_for_change`.
+        let _ = self.change_tx.send(self.change_tx.borrow().wrapping_add(1));
     }
 
     pub async fn wait_for_change(&self, timeout: Duration) {
-        let _ = tokio::time::timeout(timeout, self.change_notify.notified()).await;
+        // Clone the receiver so the cloned copy starts at the current
+        // generation. If `notify_waiters` incremented it between the caller's
+        // Master sample and this call, `changed()` returns immediately.
+        let mut rx = self.change_rx.clone();
+        let _ = tokio::time::timeout(timeout, rx.changed()).await;
     }
 
     /// Returns true when following blocked-by edges from `blocked_by` reaches `waiter`.
@@ -195,20 +215,31 @@ impl PlockWaitRegistry {
         .is_some()
     }
 
+    /// Find the first wait record whose owner matches `owner`, if any.
+    fn find_record(
+        map: &HashMap<(LockOwner, u64), WaitRecord>,
+        owner: &LockOwner,
+    ) -> Option<WaitRecord> {
+        map.iter()
+            .find(|((o, _), _)| o == owner)
+            .map(|(_, r)| r.clone())
+    }
+
     /// Atomically replace `waiter -> blocked_by` and detect a wait cycle. When a
     /// cycle is present, the waiter with the highest FUSE request order in that
     /// cycle is selected as the deterministic EDEADLK victim.
     pub fn register_blocked_by(
         &self,
         waiter: LockOwner,
+        request_unique: u64,
         blocked_by: LockOwner,
         info: LockWaitInfo,
     ) -> PlockWaitDecision {
         let mut map = self.waiters.lock().expect("plock wait registry poisoned");
-        // Drop any prior edge for this waiter before walking the graph so a
-        // stale self-edge cannot create a false cycle, and so the new blocker
-        // is published atomically with the deadlock check.
-        map.remove(&waiter);
+        // Drop any prior edge for this specific request before walking the
+        // graph so a stale self-edge cannot create a false cycle, and so the
+        // new blocker is published atomically with the deadlock check.
+        map.remove(&(waiter.clone(), request_unique));
 
         let edge = LockWaitEdge {
             waiter: waiter.clone(),
@@ -216,20 +247,30 @@ impl PlockWaitRegistry {
             info: info.clone(),
         };
         let cycle = Self::cycle_closed_by(&map, edge.clone());
-        map.insert(waiter.clone(), WaitRecord { blocked_by, info });
+        map.insert(
+            (waiter.clone(), request_unique),
+            WaitRecord { blocked_by, info },
+        );
+
+        drop(map);
 
         match cycle {
             Some(cycle) if cycle.victim == waiter => PlockWaitDecision::Deadlock { edge, cycle },
-            Some(cycle) => PlockWaitDecision::Wait {
-                edge,
-                cycle: Some(cycle),
-            },
+            Some(cycle) => {
+                // Wake the selected victim so it can return EDEADLK promptly
+                // instead of waiting for the next timed retry.
+                self.notify_waiters();
+                PlockWaitDecision::Wait {
+                    edge,
+                    cycle: Some(cycle),
+                }
+            }
             None => PlockWaitDecision::Wait { edge, cycle: None },
         }
     }
 
     fn cycle_closed_by(
-        map: &HashMap<LockOwner, WaitRecord>,
+        map: &HashMap<(LockOwner, u64), WaitRecord>,
         new_edge: LockWaitEdge,
     ) -> Option<PlockDeadlockCycle> {
         let cycle_start = new_edge.waiter.clone();
@@ -244,7 +285,7 @@ impl PlockWaitRegistry {
             if !visited.insert(current.clone()) {
                 return None;
             }
-            match map.get(&current) {
+            match Self::find_record(map, &current) {
                 Some(record) => {
                     edges.push(LockWaitEdge {
                         waiter: current.clone(),
@@ -266,12 +307,14 @@ impl PlockWaitRegistry {
 pub(crate) struct PlockWaitGuard {
     registry: Arc<PlockWaitRegistry>,
     owner: LockOwner,
+    request_unique: u64,
     info: LockWaitInfo,
 }
 
 impl PlockWaitGuard {
     pub fn new(registry: Arc<PlockWaitRegistry>, owner: LockOwner, info: LockWaitInfo) -> Self {
         Self {
+            request_unique: info.request_unique,
             registry,
             owner,
             info,
@@ -279,18 +322,22 @@ impl PlockWaitGuard {
     }
 
     pub fn register_blocked_by(&self, blocked_by: LockOwner) -> PlockWaitDecision {
-        self.registry
-            .register_blocked_by(self.owner.clone(), blocked_by, self.info.clone())
+        self.registry.register_blocked_by(
+            self.owner.clone(),
+            self.request_unique,
+            blocked_by,
+            self.info.clone(),
+        )
     }
 
     pub fn clear_blocked_by(&self) {
-        self.registry.unregister(&self.owner);
+        self.registry.unregister(&self.owner, self.request_unique);
     }
 }
 
 impl Drop for PlockWaitGuard {
     fn drop(&mut self) {
-        self.registry.unregister(&self.owner);
+        self.registry.unregister(&self.owner, self.request_unique);
     }
 }
 
@@ -308,7 +355,7 @@ mod tests {
         let a = LockOwner::new("c", 1);
         let b = LockOwner::new("c", 2);
 
-        reg.register(a.clone(), b.clone());
+        reg.register(a.clone(), 1, b.clone());
         assert!(reg.would_deadlock(&b, &a));
         assert!(!reg.would_deadlock(&a, &b));
     }
@@ -340,10 +387,10 @@ mod tests {
         let b = LockOwner::new("c", 2);
 
         assert!(!reg
-            .register_blocked_by(a.clone(), b.clone(), wait_info(1))
+            .register_blocked_by(a.clone(), 1, b.clone(), wait_info(1))
             .is_deadlock());
         assert!(reg
-            .register_blocked_by(b.clone(), a.clone(), wait_info(2))
+            .register_blocked_by(b.clone(), 2, a.clone(), wait_info(2))
             .is_deadlock());
     }
 
@@ -354,9 +401,9 @@ mod tests {
         let b = LockOwner::new("c", 2);
 
         assert!(!reg
-            .register_blocked_by(a.clone(), b.clone(), wait_info(1))
+            .register_blocked_by(a.clone(), 1, b.clone(), wait_info(1))
             .is_deadlock());
-        reg.unregister(&a);
+        reg.unregister(&a, 1);
         assert!(!reg.would_deadlock(&b, &a));
     }
 
@@ -383,16 +430,14 @@ mod tests {
         // first report child1 as child3's blocker, then child2 after child1
         // unlocks; collapsing child2 -> child3 to child1 hides the later cycle.
         assert!(!reg
-            .register_blocked_by(mid.clone(), holder.clone(), wait_info(1))
+            .register_blocked_by(mid.clone(), 1, holder.clone(), wait_info(1))
             .is_deadlock());
         assert!(!reg
-            .register_blocked_by(waiter.clone(), mid.clone(), wait_info(2))
+            .register_blocked_by(waiter.clone(), 2, mid.clone(), wait_info(2))
             .is_deadlock());
         let map = reg.waiters.lock().unwrap();
-        assert_eq!(
-            map.get(&waiter).map(|record| &record.blocked_by),
-            Some(&mid)
-        );
+        let record = PlockWaitRegistry::find_record(&map, &waiter);
+        assert_eq!(record.map(|r| r.blocked_by), Some(mid));
     }
 
     #[test]
@@ -405,10 +450,10 @@ mod tests {
         let b = LockOwner::new("c", 20);
 
         assert!(!reg
-            .register_blocked_by(a.clone(), b.clone(), wait_info(1))
+            .register_blocked_by(a.clone(), 1, b.clone(), wait_info(1))
             .is_deadlock());
         assert!(reg
-            .register_blocked_by(b.clone(), a.clone(), wait_info(2))
+            .register_blocked_by(b.clone(), 2, a.clone(), wait_info(2))
             .is_deadlock());
     }
 
@@ -423,9 +468,10 @@ mod tests {
         // earlier child2 request must not become the EDEADLK victim just because
         // it is the second registry mutation.
         assert!(!reg
-            .register_blocked_by(child3.clone(), child2.clone(), wait_info(3))
+            .register_blocked_by(child3.clone(), 3, child2.clone(), wait_info(3))
             .is_deadlock());
-        let child2_decision = reg.register_blocked_by(child2.clone(), child3.clone(), wait_info(2));
+        let child2_decision =
+            reg.register_blocked_by(child2.clone(), 2, child3.clone(), wait_info(2));
         match child2_decision {
             PlockWaitDecision::Wait {
                 cycle: Some(cycle), ..
@@ -437,7 +483,7 @@ mod tests {
         }
 
         assert!(reg
-            .register_blocked_by(child3.clone(), child2.clone(), wait_info(3))
+            .register_blocked_by(child3.clone(), 3, child2.clone(), wait_info(3))
             .is_deadlock());
     }
 
@@ -449,13 +495,14 @@ mod tests {
         let child3 = LockOwner::new("c", 3);
 
         assert!(!reg
-            .register_blocked_by(child3.clone(), child1.clone(), wait_info(3))
+            .register_blocked_by(child3.clone(), 3, child1.clone(), wait_info(3))
             .is_deadlock());
         assert!(!reg
-            .register_blocked_by(child2.clone(), child3.clone(), wait_info(2))
+            .register_blocked_by(child2.clone(), 2, child3.clone(), wait_info(2))
             .is_deadlock());
 
-        let child3_decision = reg.register_blocked_by(child3.clone(), child2.clone(), wait_info(3));
+        let child3_decision =
+            reg.register_blocked_by(child3.clone(), 3, child2.clone(), wait_info(3));
         match child3_decision {
             PlockWaitDecision::Deadlock { cycle, .. } => {
                 assert_eq!(cycle.victim, child3);
