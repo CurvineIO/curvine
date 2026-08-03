@@ -1,4 +1,4 @@
-.PHONY: help check-env check-api-crate-deps format format-csi build cargo docker-build docker-build-compile docker-compile docker-build-spdk-target docker-compose-spdk docker-compose-spdk-down all dist dist-only
+.PHONY: help check-env check-client-deps check-api-crate-deps check-minimal-artifact-deps format format-csi build cargo docker-build docker-build-compile docker-compile docker-build-spdk-target docker-compose-spdk docker-compose-spdk-down all dist dist-only
 
 # Default target when running 'make' without arguments
 .DEFAULT_GOAL := help
@@ -20,7 +20,9 @@ help:
 	@echo ""
 	@echo "Environment:"
 	@echo "  make check-env                   - Check build environment dependencies"
+	@echo "  make check-client-deps           - Enforce client-side dependency boundary guardrails"
 	@echo "  make check-api-crate-deps        - Enforce lightweight API/domain crate dependency boundaries"
+	@echo "  make check-minimal-artifact-deps - Enforce runtime deps on built minimal client artifacts"
 	@echo ""
 	@echo "Building:"
 	@echo "  make build ARGS='<args>'         - Build with specific arguments passed to build.sh"
@@ -78,9 +80,17 @@ help:
 check-env:
 	$(SHELL_CMD) build/check-env.sh $(filter --skip-java-sdk --skip-python-sdk,$(ARGS))
 
+# 1.1. Enforce current client dependency boundaries
+check-client-deps:
+	$(SHELL_CMD) scripts/check-deps.sh --mode ci
+
 # 1.1. Enforce lightweight API/domain crate dependency boundaries
 check-api-crate-deps:
 	$(SHELL_CMD) scripts/check-api-crate-deps.sh
+
+# 1.2. Enforce runtime dependency boundaries for built minimal artifacts
+check-minimal-artifact-deps:
+	$(SHELL_CMD) scripts/check-minimal-artifact-deps.sh
 
 # 2. Format the project
 format:

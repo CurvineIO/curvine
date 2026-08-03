@@ -727,6 +727,13 @@ check_minimal_artifact_deps() {
     exit 1
   fi
 
+  local native_storage_pattern='librocksdb'
+  if grep -E "$native_storage_pattern" <<<"$needed" >/dev/null; then
+    echo "Error: ${label} contains native storage runtime dependencies forbidden for client artifacts:" >&2
+    echo "$needed" >&2
+    exit 1
+  fi
+
   local native_ufs_pattern='libjindosdk|libhdfs|libjvm|libjli'
   if ! client_native_ufs_deps_allowed && grep -E "$native_ufs_pattern" <<<"$needed" >/dev/null; then
     echo "Error: ${label} contains native UFS runtime dependencies but no native --ufs/feature was requested:" >&2

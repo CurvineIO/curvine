@@ -11,14 +11,16 @@ MODE="report"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/check-deps.sh [--mode report|final]
+Usage: scripts/check-deps.sh [--mode report|ci|final]
 
 Modes:
-  report  Print current dependency boundary violations and exit 0.
-  final   Fail if final forbidden dependencies remain.
+  report  Print dependency boundary violations and exit 0.
+  ci      Enforce the current client-side dependency policy used by CI.
+  final   Fail if P7 final forbidden dependencies remain.
 
 Examples:
   scripts/check-deps.sh --mode report
+  scripts/check-deps.sh --mode ci
   scripts/check-deps.sh --mode final
 EOF
 }
@@ -47,7 +49,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$MODE" in
-  report|final) ;;
+  report|ci|final) ;;
   *)
     echo "Invalid mode: $MODE" >&2
     usage >&2
@@ -70,8 +72,9 @@ failures=0
 record_violation() {
   local label="$1"
   local detail="$2"
+  local gate="${3:-final}"
 
-  if [[ "$MODE" == "final" ]]; then
+  if [[ "$MODE" == "final" || ( "$MODE" == "$gate" && "$gate" != "final" ) ]]; then
     echo "FAIL [$label] $detail"
     failures=$((failures + 1))
   else
@@ -111,7 +114,7 @@ check_facade_direct_deps() {
 
   if [[ -n "$facade_deps" ]]; then
     record_violation "facade-direct-deps" "internal crates still depend on curvine-common/orpc:
-$facade_deps"
+$facade_deps" final
   else
     record_ok "facade-direct-deps"
   fi
@@ -133,7 +136,7 @@ check_testing_harness_reverse_deps() {
 
   if [[ -n "$testing_normal_deps" ]]; then
     record_violation "testing-harness-normal-deps" "production crates must not depend on curvine-tests:
-$testing_normal_deps"
+$testing_normal_deps" ci
   else
     record_ok "testing-harness-normal-deps"
   fi
@@ -149,7 +152,8 @@ tree_packages() {
 check_tree_forbidden() {
   local label="$1"
   local forbidden_csv="$2"
-  shift 2
+  local gate="$3"
+  shift 3
 
   local packages
   packages="$(tree_packages "$@")"
@@ -164,7 +168,7 @@ check_tree_forbidden() {
   done
 
   if ((${#found[@]} > 0)); then
-    record_violation "$label" "forbidden packages found: ${found[*]}"
+    record_violation "$label" "forbidden packages found: ${found[*]}" "$gate"
   else
     record_ok "$label"
   fi
@@ -200,7 +204,7 @@ check_mixed_spdk_feature_risk() {
       }
       END { exit found ? 0 : 1 }
     ' <<<"$output"; then
-      record_violation "mixed-spdk-feature-risk" "server spdk-rdma feature still enables SPDK features on shared orpc during a mixed CLI/server cargo tree"
+      record_violation "mixed-spdk-feature-risk" "server spdk-rdma feature still enables SPDK features on shared orpc during a mixed CLI/server cargo tree" ci
     else
       record_ok "mixed-spdk-feature-risk"
     fi
@@ -212,29 +216,35 @@ check_mixed_spdk_feature_risk() {
   rm -f "$err"
 }
 
-common_client_forbidden="curvine-common,orpc,curvine-ufs,opendal,rocksdb,raft,curvine-storage-spdk,curvine-rocksdb,curvine-raft,curvine-ufs-oss-hdfs,curvine-hdfs-jni"
-libsdk_java_forbidden="curvine-common,orpc,curvine-ufs,opendal,rocksdb,raft,pyo3,curvine-storage-spdk,curvine-rocksdb,curvine-raft,curvine-ufs-oss-hdfs,curvine-hdfs-jni"
-libsdk_python_forbidden="curvine-common,orpc,curvine-ufs,opendal,rocksdb,raft,jni,curvine-storage-spdk,curvine-rocksdb,curvine-raft,curvine-ufs-oss-hdfs,curvine-hdfs-jni"
+client_heavy_forbidden="curvine-ufs,curvine-ufs-opendal,curvine-ufs-oss-hdfs,curvine-hdfs-jni,curvine-storage-spdk,curvine-rocksdb,curvine-raft,opendal,rocksdb,librocksdb-sys,raft,raft-proto"
+common_client_forbidden="curvine-common,orpc,${client_heavy_forbidden}"
+libsdk_java_forbidden="curvine-common,orpc,${client_heavy_forbidden},pyo3"
+libsdk_python_forbidden="curvine-common,orpc,${client_heavy_forbidden},jni"
+fuse_current_forbidden="curvine-storage-spdk,curvine-ufs-oss-hdfs,curvine-hdfs-jni"
 
 echo "Dependency boundary check mode: $MODE"
 echo
 
 check_facade_direct_deps
 check_testing_harness_reverse_deps
-check_tree_forbidden "curvine-cli-final-tree" "$common_client_forbidden" -p curvine-cli
-check_tree_forbidden "curvine-fuse-final-tree" "$common_client_forbidden" -p curvine-fuse
-check_tree_forbidden "curvine-libsdk-java-min-final-tree" "$libsdk_java_forbidden" -p curvine-libsdk --no-default-features --features java-sdk
-check_tree_forbidden "curvine-libsdk-python-min-final-tree" "$libsdk_python_forbidden" -p curvine-libsdk --no-default-features --features python-sdk
+check_tree_forbidden "curvine-client-core-final-tree" "$common_client_forbidden" ci -p curvine-client-core
+check_tree_forbidden "curvine-cli-final-tree" "$common_client_forbidden" ci -p curvine-cli --no-default-features
+check_tree_forbidden "curvine-fuse-native-client-tree" "$fuse_current_forbidden" ci -p curvine-fuse --no-default-features
+check_tree_forbidden "curvine-fuse-final-tree" "$common_client_forbidden" final -p curvine-fuse
+check_tree_forbidden "curvine-libsdk-java-min-final-tree" "$libsdk_java_forbidden" ci -p curvine-libsdk --no-default-features --features java-sdk
+check_tree_forbidden "curvine-libsdk-python-min-final-tree" "$libsdk_python_forbidden" ci -p curvine-libsdk --no-default-features --features python-sdk
 check_mixed_spdk_feature_risk
 
 echo
-if [[ "$MODE" == "final" && "$failures" -gt 0 ]]; then
+if [[ "$failures" -gt 0 ]]; then
   echo "Dependency boundary check failed with $failures violation(s)."
   exit 1
 fi
 
 if [[ "$MODE" == "report" ]]; then
   echo "Report mode completed. Warnings are expected until the migration reaches the relevant DAG layer."
+elif [[ "$MODE" == "ci" ]]; then
+  echo "CI dependency boundary check passed. Final-mode warnings remain explicit migration exceptions."
 else
   echo "Final dependency boundary check passed."
 fi
