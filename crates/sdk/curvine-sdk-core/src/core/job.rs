@@ -12,38 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::core::transfer_compat;
 use crate::core::Session;
-use curvine_client::rpc::JobMasterClient;
 use curvine_error::FsResult;
 use curvine_model::{JobStatus, LoadJobCommand, LoadJobResult};
 use orpc_runtime::runtime::RpcRuntime;
 
 pub fn submit_load(session: &Session, source: impl AsRef<str>) -> FsResult<LoadJobResult> {
-    let client = JobMasterClient::new(session.fs_client());
-    session
-        .runtime()
-        .block_on(async { client.submit_load(source).await })
+    submit_load_job(session, LoadJobCommand::builder(source.as_ref()).build())
 }
 
 pub fn submit_load_job(session: &Session, command: LoadJobCommand) -> FsResult<LoadJobResult> {
-    let client = JobMasterClient::new(session.fs_client());
     session
         .runtime()
-        .block_on(async { client.submit_load_job(command).await })
+        .block_on(async { transfer_compat::submit_load_job(session, command).await })
 }
 
 pub fn get_job_status(session: &Session, job_id: impl AsRef<str>) -> FsResult<JobStatus> {
-    let client = JobMasterClient::new(session.fs_client());
     session
         .runtime()
-        .block_on(async { client.get_job_status(job_id).await })
+        .block_on(async { transfer_compat::get_job_status(session, job_id).await })
 }
 
 pub fn cancel_job(session: &Session, job_id: impl AsRef<str>) -> FsResult<()> {
-    let client = JobMasterClient::new(session.fs_client());
     session
         .runtime()
-        .block_on(async { client.cancel_job(job_id).await })
+        .block_on(async { transfer_compat::cancel_job(session, job_id).await })
 }
 
 pub fn wait_job_complete(
@@ -51,8 +45,7 @@ pub fn wait_job_complete(
     job_id: impl AsRef<str>,
     fail_if_not_found: bool,
 ) -> FsResult<()> {
-    let client = JobMasterClient::new(session.fs_client());
-    session
-        .runtime()
-        .block_on(async { client.wait_job_complete(job_id, fail_if_not_found).await })
+    session.runtime().block_on(async {
+        transfer_compat::wait_job_complete(session, job_id, fail_if_not_found).await
+    })
 }

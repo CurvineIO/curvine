@@ -32,6 +32,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <p>Mirrors Rust libsdk {@code JobClient}: submit / get status / cancel, plus a
  * Java-side wait helper with explicit timeout and poll interval.
  *
+ * <p>Backend routing follows cluster config {@code transfer.enabled}:
+ * when {@code true}, requests go to the standalone Transfer service and responses
+ * are mapped back to the existing {@link LoadJobResult} / {@link LoadJobStatus}
+ * surface; when {@code false} (default), requests use the legacy Master LoadJob API.
+ *
  * <pre>{@code
  * try (CurvineLoadClient client = CurvineLoadClient.from(conf)) {
  *     LoadJobResult result = client.submitLoad(

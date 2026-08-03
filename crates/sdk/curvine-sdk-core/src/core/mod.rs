@@ -18,6 +18,7 @@ pub(crate) mod job;
 #[allow(dead_code)]
 mod master;
 mod session;
+pub(crate) mod transfer_compat;
 
 pub use self::filesystem::LibFilesystem;
 pub use self::session::Session;

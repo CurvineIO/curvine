@@ -2530,11 +2530,14 @@ dependencies = [
  "curvine-fs-api",
  "curvine-io",
  "curvine-model",
+ "curvine-proto",
+ "log",
  "orpc-error",
  "orpc-net",
  "orpc-rpc",
  "orpc-runtime",
  "serde",
+ "tokio",
  "toml",
 ]
 
