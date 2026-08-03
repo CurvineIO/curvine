@@ -50,6 +50,8 @@ app_name = "curvine"
 hugepage = "10MB"
 reactor_mask = "0x30"  
 # iova_mode = "va"  # set on VM/container hosts if env_init fails with PA IOVA error
+# Max time to wait for an idle NVMe qpair under qpair exhaustion (default "30s").
+# qpair_acquire_timeout = "30s"
 # NVMe-oF targets  
 [[worker.spdk_disk.targets]]
 trtype = "tcp"  

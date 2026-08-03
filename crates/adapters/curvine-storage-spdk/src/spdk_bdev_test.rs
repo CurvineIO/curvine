@@ -203,9 +203,9 @@ fn spdk_full_lifecycle() {
             notify: Condvar::new(),
             max_per_ctrlr: 2,
             shutdown: AtomicBool::new(false),
+            qpair_acquire_timeout: Duration::from_secs(30),
         };
         p.register_limit(ctrlr as usize, 4);
-
         // Acquire 3 qpairs through the real API — each reserves + allocates via FFI
         let q1 = p.acquire(ctrlr).expect("acquire q1"); // active 0→1
         let q2 = p.acquire(ctrlr).expect("acquire q2"); // active 1→2
@@ -241,6 +241,7 @@ fn spdk_full_lifecycle() {
             notify: Condvar::new(),
             max_per_ctrlr: 16,
             shutdown: AtomicBool::new(false),
+            qpair_acquire_timeout: Duration::from_secs(30),
         });
         p.register_limit(ctrlr as usize, 1);
 

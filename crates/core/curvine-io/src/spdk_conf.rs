@@ -156,6 +156,10 @@ pub struct SpdkConf {
     pub keep_alive_timeout_str: String,
     #[serde(skip)]
     pub keep_alive_timeout_ms: u64,
+    #[serde(alias = "qpair_acquire_timeout")]
+    pub qpair_acquire_timeout_str: String,
+    #[serde(skip)]
+    pub qpair_acquire_timeout_ms: u64,
     #[serde(alias = "poll_interval")]
     pub poll_interval_ms: u64,
     pub spin_iter: u32,
@@ -178,6 +182,11 @@ impl SpdkConf {
         if !self.keep_alive_timeout_str.is_empty() {
             let keep_alive = DurationUnit::from_str(&self.keep_alive_timeout_str)?;
             self.keep_alive_timeout_ms = keep_alive.as_millis();
+        }
+
+        if !self.qpair_acquire_timeout_str.is_empty() {
+            let qpair_acquire = DurationUnit::from_str(&self.qpair_acquire_timeout_str)?;
+            self.qpair_acquire_timeout_ms = qpair_acquire.as_millis();
         }
 
         if !self.dma_buffer_size_str.is_empty() {
@@ -235,6 +244,13 @@ impl SpdkConf {
             return err_box!(
                 "SpdkConf: iova_mode must be 'va', 'pa', or empty (auto-detect), got '{}'",
                 self.iova_mode
+            );
+        }
+
+        if self.qpair_acquire_timeout_ms == 0 {
+            return err_box!(
+                "SpdkConf: qpair_acquire_timeout must be > 0 (got '{}')",
+                self.qpair_acquire_timeout_str
             );
         }
 
@@ -296,6 +312,8 @@ impl Default for SpdkConf {
             io_retry_count: 4,
             keep_alive_timeout_str: String::new(),
             keep_alive_timeout_ms: 10_000,
+            qpair_acquire_timeout_str: String::new(),
+            qpair_acquire_timeout_ms: 30_000,
             poll_interval_ms: 100,
             spin_iter: 1000,
             dma_buffer_size_str: String::new(),
