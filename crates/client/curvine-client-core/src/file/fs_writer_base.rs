@@ -50,6 +50,10 @@ pub struct FsWriterBase {
     durable_blocks: FastHashSet<i64>,
 }
 
+fn needs_append_block(file_blocks: &WriteFileBlocks, file_len: i64, pos: i64) -> bool {
+    pos > file_len || (pos == file_len && file_blocks.get_block(pos).is_none())
+}
+
 impl FsWriterBase {
     pub fn new(fs_context: Arc<FsContext>, path: Path, status: FileBlocks, pos: i64) -> Self {
         let fs_client = FsClient::new(fs_context.clone());
@@ -453,7 +457,7 @@ impl FsWriterBase {
             return err_box!("Cannot seek to negative position: {}", pos);
         } else if pos == self.pos() {
             return Ok(());
-        } else if pos > self.len {
+        } else if needs_append_block(&self.file_blocks, self.len, pos) {
             self.pos = pos;
             self.update_writer(None, true).await?;
             return Ok(());
@@ -562,5 +566,32 @@ impl FsWriterBase {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needs_append_block;
+    use curvine_model::{
+        ExtendedBlock, FileBlocks, FileStatus, FileType, LocatedBlock, StorageType, WriteFileBlocks,
+    };
+
+    #[test]
+    fn append_at_full_block_boundary_needs_a_new_block() {
+        let block_size = 128 * 1024 * 1024;
+        let blocks = WriteFileBlocks::new(FileBlocks::new(
+            FileStatus {
+                len: block_size,
+                block_size,
+                ..Default::default()
+            },
+            vec![LocatedBlock::new(
+                ExtendedBlock::new(1, block_size, StorageType::Disk, FileType::File),
+                Vec::new(),
+            )],
+        ));
+
+        assert!(needs_append_block(&blocks, block_size, block_size));
+        assert!(!needs_append_block(&blocks, block_size - 1, block_size - 1));
     }
 }
