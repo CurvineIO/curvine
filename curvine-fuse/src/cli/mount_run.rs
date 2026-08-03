@@ -33,6 +33,11 @@ pub fn run_mount(args: FuseRuntimeArgs) -> CommonResult<()> {
 
     let cluster_conf = args.get_conf()?;
     Logger::init(cluster_conf.fuse.log.clone());
+    info!(
+        "allocator: {}",
+        curvine_common::alloc::allocator_type_name()
+    );
+    info!("git version: {}", curvine_common::version::GIT_VERSION);
     cluster_conf.print();
 
     let rt = Arc::new(AsyncRuntime::new(
