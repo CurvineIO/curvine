@@ -1168,7 +1168,6 @@ mod test {
 
         p.register_limit(ctrlr as usize, 4);
 
-
         // Reserve a slot (simulating acquire path)
         assert!(p.try_reserve(ctrlr as usize)); // active = 1
         let (active, _) = p.controller_stats(ctrlr as usize);
