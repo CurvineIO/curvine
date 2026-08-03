@@ -37,6 +37,11 @@ fn main() -> CommonResult<()> {
         .build()?;
     testing.start_cluster()?;
     let conf = testing.get_active_cluster_conf().unwrap();
+    log::info!(
+        "allocator: {}",
+        curvine_common::alloc::allocator_type_name()
+    );
+    log::info!("git version: {}", curvine_common::version::GIT_VERSION);
     conf.print();
 
     let rt = AsyncRuntime::single();

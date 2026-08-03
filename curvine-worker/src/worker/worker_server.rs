@@ -197,6 +197,11 @@ impl Worker {
 
         CLUSTER_CONF.get_or_init(|| conf.clone());
         WORKER_METRICS.get_or_try_init(|| WorkerMetrics::new(service.store.clone()))?;
+        info!(
+            "allocator: {}",
+            curvine_common::alloc::allocator_type_name()
+        );
+        info!("git version: {}", curvine_common::version::GIT_VERSION);
         conf.print();
 
         let block_store = service.store.clone();

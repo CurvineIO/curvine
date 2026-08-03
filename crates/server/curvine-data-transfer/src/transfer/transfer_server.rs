@@ -96,6 +96,11 @@ impl TransferServer {
         }
         Logger::init(conf.master.log.clone());
         let _ = TransferMetrics::get()?;
+        info!(
+            "allocator: {}",
+            curvine_common::alloc::allocator_type_name()
+        );
+        info!("git version: {}", curvine_common::version::GIT_VERSION);
         conf.print();
 
         let rt = Arc::new(conf.transfer_server_conf().create_runtime());
