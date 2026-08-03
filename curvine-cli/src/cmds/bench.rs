@@ -19,9 +19,9 @@ use curvine_bench::{
     BenchTarget, CurvineBenchRunner, WorkloadKind, DEFAULT_BASIC_BIG_FILE_COUNT,
     DEFAULT_BIG_FILE_COUNT, DEFAULT_DURATION_MS, DEFAULT_FILES_PER_DIR,
 };
-use curvine_unified_fs::UnifiedFileSystem;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_runtime::common::ByteUnit;
+use curvine_unified_fs::UnifiedFileSystem;
 
 mod output;
 use output::{print_prefill_report, print_report, print_resource_hint, print_startup_config};

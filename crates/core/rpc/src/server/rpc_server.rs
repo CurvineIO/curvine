@@ -14,11 +14,11 @@
 
 use crate::handler::{HandlerService, MessageHandler, RpcFrame};
 use crate::server::{ServerConf, ServerMonitor, ServerStateListener};
-use log::*;
 use curvine_core_error::CommonResult;
 use curvine_net::net::{InetAddr, NetUtils};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::StateCtl;
+use log::*;
 use socket2::SockRef;
 use std::sync::{Arc, Mutex};
 use std::{env, thread};

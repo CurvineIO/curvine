@@ -16,10 +16,10 @@ use std::hash::BuildHasherDefault;
 use std::sync::Arc;
 use std::time::Instant;
 
+use curvine_core_error::CommonResult;
 use dashmap::DashMap;
 use fxhash::FxHasher;
 use once_cell::sync::Lazy;
-use curvine_core_error::CommonResult;
 use prometheus::core::{
     AtomicI64, Collector, GenericCounter, GenericCounterVec, GenericGauge, GenericGaugeVec,
 };

@@ -14,10 +14,10 @@
 
 use crate::message::{BoxMessage, Builder, RefMessage};
 use bytes::{Buf, BufMut, BytesMut};
-use curvine_io::{DataSlice, IOResult};
-use num_enum::{FromPrimitive, IntoPrimitive};
 use curvine_core_error::{CommonError, CommonResult, ErrorExt};
+use curvine_io::{DataSlice, IOResult};
 use curvine_runtime::common::Utils;
+use num_enum::{FromPrimitive, IntoPrimitive};
 use prost::Message as PMessage;
 use std::fmt::Debug;
 

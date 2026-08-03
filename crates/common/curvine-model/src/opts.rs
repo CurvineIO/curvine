@@ -14,8 +14,8 @@
 
 use crate::state::*;
 use crate::{ClientConfDefaults, DEFAULT_FILE_SYSTEM_MODE};
-use curvine_sys as sys;
 use curvine_runtime::common::ByteUnit;
+use curvine_sys as sys;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;

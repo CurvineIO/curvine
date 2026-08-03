@@ -15,8 +15,8 @@
 #![allow(clippy::should_implement_trait)]
 
 use curvine_config::{ClientConf, ClusterConf};
-use curvine_error::FsResult;
 use curvine_core_error::{err_box, try_err};
+use curvine_error::FsResult;
 use curvine_net::net::InetAddr;
 use curvine_runtime::common::LogConf;
 use serde::{Deserialize, Serialize};

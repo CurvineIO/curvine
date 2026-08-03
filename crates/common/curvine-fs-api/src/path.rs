@@ -15,9 +15,9 @@
 #![allow(clippy::should_implement_trait)]
 
 use crate::fs::FsKind;
+use curvine_core_error::CommonResult;
 use hyper::Uri;
 use once_cell::sync::Lazy;
-use curvine_core_error::CommonResult;
 use regex::Regex;
 use std::fmt::{Display, Formatter};
 use std::path::MAIN_SEPARATOR;

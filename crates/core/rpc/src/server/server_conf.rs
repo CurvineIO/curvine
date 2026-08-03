@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_sys::pipe::PipePool;
 use curvine_net::net::{InetAddr, NetUtils};
 use curvine_runtime::runtime::Runtime;
+use curvine_sys::pipe::PipePool;
 use std::sync::Arc;
 use std::thread;
 

@@ -18,8 +18,8 @@ use super::paths::{workset_dirs, workset_path};
 use super::report::{BenchPrefillReport, TaskMetric};
 use super::runner::{collect, PathAction, WorkloadExecution};
 use super::{BenchOp, BenchPrefillConfig, CurvineBenchRunner};
-use curvine_unified_fs::UnifiedFileSystem;
 use curvine_core_error::CommonResult;
+use curvine_unified_fs::UnifiedFileSystem;
 use std::sync::Arc;
 use std::time::Instant;
 

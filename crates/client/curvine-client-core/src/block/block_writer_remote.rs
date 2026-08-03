@@ -14,11 +14,11 @@
 
 use crate::block::block_client::BlockClient;
 use crate::file::FsContext;
+use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_io::DataSlice;
 use curvine_model::{ExtendedBlock, WorkerAddress};
 use curvine_proto::DataHeaderProto;
-use curvine_core_error::err_box;
 use curvine_runtime::common::Utils;
 
 pub struct BlockWriterRemote {

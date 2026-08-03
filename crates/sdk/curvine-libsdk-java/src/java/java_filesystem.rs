@@ -14,6 +14,7 @@
 
 use crate::java::JavaUtils;
 use crate::{FilesystemConf, LibFilesystem, LibFsReader, LibFsWriter};
+use curvine_core_error::{err_box, try_err};
 use curvine_error::{FsError, FsResult};
 use curvine_fs_api::proto::{
     GetJobStatusResponse, GetMountTableResponse, MountOptionsProto, SetAttrOptsProto,
@@ -25,7 +26,6 @@ use curvine_sdk_core::blocking_job as job;
 use jni::objects::{JByteArray, JString};
 use jni::sys::{jarray, jboolean, jstring};
 use jni::JNIEnv;
-use curvine_core_error::{err_box, try_err};
 use prost::Message;
 
 pub struct JavaFilesystem {

@@ -13,13 +13,13 @@
 // limitations under the License.
 
 use crate::{CliConf, ClientConf, FuseConf, JobConf, TransferConf};
-use log::info;
-use nix::ifaddrs::getifaddrs;
 use curvine_core_error::{err_box, try_err, CommonResult};
 use curvine_net::net::{InetAddr, NodeAddr};
 use curvine_net::retry::TimeBondedRetryBuilder;
 use curvine_rpc::client::ClientConf as RpcConf;
 use curvine_runtime::common::LogConf;
+use log::info;
+use nix::ifaddrs::getifaddrs;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fmt::{Display, Formatter};

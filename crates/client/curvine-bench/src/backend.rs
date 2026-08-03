@@ -14,9 +14,9 @@
 //
 
 use super::config::{BenchMode, BenchTarget};
+use curvine_core_error::{err_box, CommonResult};
 use curvine_fs_api::{FileSystem, Path, Reader, Writer};
 use curvine_unified_fs::UnifiedFileSystem;
-use curvine_core_error::{err_box, CommonResult};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

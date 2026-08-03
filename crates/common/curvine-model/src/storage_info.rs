@@ -15,8 +15,8 @@
 #![allow(clippy::derivable_impls)]
 
 use clap::ValueEnum;
-use num_enum::{FromPrimitive, IntoPrimitive};
 use curvine_core_error::{err_box, CommonError};
+use num_enum::{FromPrimitive, IntoPrimitive};
 use serde::{Deserialize, Serialize};
 
 #[repr(i32)]

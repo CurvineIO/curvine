@@ -19,12 +19,12 @@ use curvine_fs_api::Path;
 use curvine_io::DataSlice;
 use curvine_io::IOError;
 use curvine_model::{FileAllocOpts, FileBlocks, FileStatus, SetAttrOpts};
-use log::error;
 use curvine_runtime::runtime::RpcRuntime;
 use curvine_runtime::sync::channel::{
     AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender,
 };
 use curvine_runtime::sync::ErrorMonitor;
+use log::error;
 use std::sync::Arc;
 
 // Control task type

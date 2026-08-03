@@ -5,9 +5,9 @@ use curvine_error::FsResult;
 use curvine_fs_api::Path;
 use curvine_io::LocalFile;
 use curvine_model::{ExtendedBlock, WorkerAddress};
-use curvine_sys::RawPtr;
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use curvine_sys::RawPtr;
 use std::sync::Arc;
 
 pub struct BatchBlockWriterLocal {

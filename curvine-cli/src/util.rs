@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_ufs_api::S3Conf;
 use curvine_core_error::{err_box, CommonResult};
+use curvine_ufs_api::S3Conf;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;

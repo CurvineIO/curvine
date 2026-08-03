@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use num_enum::{FromPrimitive, IntoPrimitive};
 use curvine_runtime::common::Utils;
+use num_enum::{FromPrimitive, IntoPrimitive};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 

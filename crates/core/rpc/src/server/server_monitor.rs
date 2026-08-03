@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use num_enum::{FromPrimitive, IntoPrimitive};
 use curvine_core_error::CommonResult;
 use curvine_runtime::sync::{StateCtl, StateListener, StateMonitor};
+use num_enum::{FromPrimitive, IntoPrimitive};
 
 #[repr(i8)]
 #[derive(PartialEq, PartialOrd, Debug, Clone, Copy, IntoPrimitive, FromPrimitive)]

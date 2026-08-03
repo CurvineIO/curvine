@@ -61,7 +61,9 @@ impl LibCurvineBuilder {
         let has_conf = self.conf_path.is_some();
         let has_masters = !self.masters.is_empty();
         if has_conf && has_masters {
-            return curvine_core_error::err_box!("LibCurvineBuilder: set conf_file or masters, not both");
+            return curvine_core_error::err_box!(
+                "LibCurvineBuilder: set conf_file or masters, not both"
+            );
         }
         let opts = if let Some(path) = self.conf_path {
             ConnectOptions::ConfigFile(path)

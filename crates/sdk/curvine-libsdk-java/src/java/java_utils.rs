@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_core_error::CommonResult;
 use curvine_error::FsError;
 use jni::objects::{JObject, JString, JThrowable, JValue};
 use jni::sys::{jarray, jboolean, jstring, JNI_TRUE};
 use jni::JNIEnv;
-use curvine_core_error::CommonResult;
 
 pub struct JavaUtils;
 

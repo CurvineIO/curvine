@@ -14,12 +14,12 @@
 
 use super::LocalStatusUtils;
 use crate::{Path, Writer};
+use curvine_core_error::err_ext;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_io::DataSlice;
 use curvine_io::LocalFile;
 use curvine_model::FileStatus;
-use curvine_core_error::err_ext;
 use curvine_runtime::common::FileUtils;
 use prost::bytes::BytesMut;
 

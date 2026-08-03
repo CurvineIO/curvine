@@ -21,6 +21,7 @@ use curvine_model::{
     JobTaskProgress, JobTaskState, TransferCommand, TransferKind, TransferState,
     TransferTaskReportInfo,
 };
+use curvine_net::net::NodeAddr;
 use curvine_proto::{
     CancelTransferRequest, CancelTransferResponse, GetTransferStatusRequest,
     GetTransferStatusResponse, ListTransferTenantsRequest, ListTransferTenantsResponse,
@@ -28,7 +29,6 @@ use curvine_proto::{
     SubmitTransferResponse, TransferProgressProto, TransferTaskReportRequest,
     TransferTaskReportResponse, WatchTransferRequest, WatchTransferResponse,
 };
-use curvine_net::net::NodeAddr;
 use curvine_rpc::client::ClusterConnector;
 use curvine_runtime::runtime::Runtime;
 

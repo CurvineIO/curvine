@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use curvine_io::IOError;
-use num_enum::{FromPrimitive, IntoPrimitive};
 use curvine_net::net::InetAddr;
 use curvine_runtime::sync::StateCtl;
+use num_enum::{FromPrimitive, IntoPrimitive};
 use std::sync::Mutex;
 
 // Connection status

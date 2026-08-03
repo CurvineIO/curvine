@@ -21,8 +21,8 @@ use super::report::{
 };
 use super::workload::{BenchOp, WorkloadKind, WorkloadSpec};
 use super::{BenchConfig, CurvineBenchRunner, BENCH_DIR_PREFIX, DEFAULT_DURATION_MS};
-use curvine_unified_fs::UnifiedFileSystem;
 use curvine_core_error::{err_box, CommonResult};
+use curvine_unified_fs::UnifiedFileSystem;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;

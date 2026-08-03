@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use comfy_table::{presets::ASCII_MARKDOWN, Table};
+use curvine_core_error::{err_box, CommonResult};
 use curvine_job_client::TransferClient;
 use curvine_model::{TransferKind, TransferState};
 use curvine_proto::{
@@ -23,7 +24,6 @@ use curvine_proto::{
     ListTransfersResponse, SubmitTransferResponse, TransferJobStatusProto, TransferTaskStatusProto,
     TransferTaskSummaryProto, TransferTenantSummaryProto,
 };
-use curvine_core_error::{err_box, CommonResult};
 
 use crate::util::{bytes_to_string, handle_rpc_result, parse_duration};
 

@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use clap::Parser;
+use curvine_core_error::CommonResult;
 use curvine_job_client::{JobMasterClient, TransferClient};
 use curvine_model::TransferState;
-use curvine_core_error::CommonResult;
 
 use crate::util::*;
 

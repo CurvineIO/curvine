@@ -17,8 +17,8 @@ use crate::message::{
 };
 use bytes::BytesMut;
 use curvine_io::DataSlice;
-use log::error;
 use curvine_runtime::common::Utils;
+use log::error;
 use prost::Message as PMessage;
 use std::fmt::Debug;
 

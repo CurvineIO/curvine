@@ -15,12 +15,12 @@
 use crate::block::batch_block_writer::BatchWriterAdapter::{BatchLocal, BatchRemote};
 use crate::block::{BatchBlockWriterLocal, BatchBlockWriterRemote};
 use crate::file::FsContext;
+use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
 use curvine_model::{CommitBlock, ExtendedBlock, LocatedBlock, WorkerAddress};
 use futures::future::try_join_all;
-use curvine_core_error::err_box;
 use std::sync::Arc;
 
 enum BatchWriterAdapter {

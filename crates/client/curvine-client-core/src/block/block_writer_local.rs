@@ -14,15 +14,15 @@
 
 use crate::block::BlockClient;
 use crate::file::FsContext;
+use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_io::DataSlice;
 use curvine_io::LocalFile;
 use curvine_model::{ExtendedBlock, WorkerAddress};
-use curvine_sys::RawPtr;
-use curvine_core_error::err_box;
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use curvine_sys::RawPtr;
 use std::sync::Arc;
 
 pub struct BlockWriterLocal {
