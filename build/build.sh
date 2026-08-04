@@ -720,9 +720,9 @@ check_minimal_artifact_deps() {
 
   local needed
   needed="$(artifact_dynamic_entries "$inspector" "$artifact")"
-  local server_native_pattern='libibverbs\.so|librdmacm\.so|libspdk|librte_'
+  local server_native_pattern='libibverbs\.so|librdmacm\.so|libspdk|libdpdk|librte_'
   if grep -E "$server_native_pattern" <<<"$needed" >/dev/null; then
-    echo "Error: ${label} contains server-native RDMA/SPDK runtime dependencies forbidden for client artifacts:" >&2
+    echo "Error: ${label} contains server-native RDMA/SPDK runtime dependencies forbidden for minimal client artifacts:" >&2
     echo "$needed" >&2
     exit 1
   fi

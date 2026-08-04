@@ -191,32 +191,35 @@ check_tree_forbidden() {
 
 check_mixed_spdk_feature_risk() {
   # After orpc removal, SPDK lives on curvine-storage-spdk / curvine-worker.
-  # Enabling server SPDK in a workspace that also builds CLI must not pull
-  # curvine-storage-spdk into the CLI package tree via feature unification.
-  local packages
+  # In a mixed CLI + server feature resolution, server SPDK is legal, but it
+  # must not make the minimal CLI reverse-depend on curvine-storage-spdk.
+  local reverse_deps
   local err
   err="$(mktemp)"
 
-  if packages="$(
+  if reverse_deps="$(
     cargo tree \
       --no-default-features \
       --features curvine-server/spdk-rdma,curvine-alloc/system \
       -p curvine-cli \
+      -p curvine-server \
       -e normal \
+      -i curvine-storage-spdk \
       --prefix none \
       -f '{p}' 2>"$err" \
       | awk '{print $1}' \
       | sed '/^$/d' \
       | sort -u
   )"; then
-    if grep -qx 'curvine-storage-spdk' <<<"$packages"; then
-      record_violation "mixed-spdk-feature-risk" "server spdk-rdma feature pulls curvine-storage-spdk into the CLI dependency tree" ci
+    if grep -qx 'curvine-cli' <<<"$reverse_deps"; then
+      record_violation "mixed-spdk-feature-risk" "server spdk-rdma feature makes curvine-cli reverse-depend on curvine-storage-spdk:
+$reverse_deps" ci
     else
       record_ok "mixed-spdk-feature-risk"
     fi
   else
-    echo "SKIP [mixed-spdk-feature-risk] cargo tree command failed, likely because legacy features were removed:"
-    sed 's/^/  /' "$err"
+    record_violation "mixed-spdk-feature-risk" "cargo tree command failed while checking CLI/server SPDK isolation:
+$(sed 's/^/  /' "$err")" ci
   fi
 
   rm -f "$err"

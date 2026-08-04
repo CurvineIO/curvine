@@ -29,4 +29,9 @@ link RDMA/SPDK, Jindo/HDFS/JVM, or native storage libraries.
 ```bash
 scripts/check-minimal-artifact-deps.sh
 scripts/check-minimal-artifact-deps.sh --artifact curvine-cli=target/debug/curvine-cli
+scripts/check-minimal-artifact-deps.sh --allow-rdma-spdk --artifact curvine-fuse-rdma=target/release/curvine-fuse
 ```
+
+Use `--allow-rdma-spdk` only for explicitly RDMA/SPDK-enabled client or FUSE
+artifacts. The default mode remains the guard for minimal/non-RDMA client
+artifacts.

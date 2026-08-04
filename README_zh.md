@@ -64,17 +64,18 @@
 
 ### 🦀 Rust API (原生集成推荐)
 
-```
-use curvine_common::conf::ClusterConf;
-use curvine_common::fs::Path;
+```rust
+use curvine_config::ClusterConf;
+use curvine_fs_api::{FileSystem, Path};
+use curvine_unified_fs::UnifiedFileSystem;
 use std::sync::Arc;
 
-let conf = ClusterConf::from(conf_path);
+let conf = ClusterConf::from(conf_path)?;
 let rt = Arc::new(conf.client_rpc_conf().create_runtime());
-let fs = CurvineFileSystem::with_rt(conf, rt)?;
+let fs = UnifiedFileSystem::with_rt(conf, rt)?;
 
 let path = Path::from_str("/dir")?;
-fs.mkdir(&path).await?;
+fs.mkdir(&path, true).await?;
 ```
 
 ### 📌 FUSE (用户空间文件系统)
@@ -141,6 +142,10 @@ make build ARGS="-p core"
 
 # 编译fuse和核心模块
 make build ARGS="-p core -p fuse"
+
+# 编译 server-native SPDK/RDMA 支持。curvine-cli 和 curvine-fuse
+# 会按客户端安全 profile 单独构建，避免被 server-native feature 污染。
+make build ARGS="-p core -p fuse --spdk-rdma --spdk-dir /opt/spdk"
 ```
 
 
@@ -158,6 +163,9 @@ sh build/build.sh -p core
 
 # 编译fuse和核心模块
 sh build/build.sh -p core -p fuse
+
+# 只编译 server-native SPDK/RDMA artifact
+sh build/build.sh -p server --spdk-rdma --spdk-dir /opt/spdk
 ```
 
 构建镜像：

@@ -6,14 +6,19 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/check-minimal-artifact-deps.sh [--allow-missing] [--artifact LABEL=PATH] [PATH ...]
+Usage: scripts/check-minimal-artifact-deps.sh [--allow-missing] [--allow-rdma-spdk] [--artifact LABEL=PATH] [PATH ...]
 
-With no artifacts, the script checks known Curvine outputs in target/{debug,release}
-and build/dist/lib. Explicit artifacts must exist unless --allow-missing is set.
+By default this enforces minimal/non-RDMA client artifacts. With no artifacts,
+the script checks known Curvine outputs in target/{debug,release} and
+build/dist/lib. Explicit artifacts must exist unless --allow-missing is set.
+
+Use --allow-rdma-spdk only for explicitly RDMA/SPDK-enabled client or FUSE
+artifacts; native UFS and storage-library checks remain enforced.
 EOF
 }
 
 allow_missing=0
+allow_rdma_spdk=0
 declare -a artifact_specs=()
 using_defaults=0
 
@@ -21,6 +26,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --allow-missing)
       allow_missing=1
+      shift
+      ;;
+    --allow-rdma-spdk)
+      allow_rdma_spdk=1
       shift
       ;;
     --artifact)
@@ -105,7 +114,9 @@ artifact_inspector() {
   fi
 }
 
-forbidden_pattern='libibverbs\.so|librdmacm\.so|libspdk|libdpdk|librte_|libjindosdk|libhdfs|libjvm|libjli|librocksdb'
+rdma_spdk_pattern='libibverbs\.so|librdmacm\.so|libspdk|libdpdk|librte_'
+native_ufs_pattern='libjindosdk|libhdfs|libjvm|libjli'
+native_storage_pattern='librocksdb'
 checked=0
 failures=0
 
@@ -137,13 +148,28 @@ for spec in "${artifact_specs[@]}"; do
 
   checked=$((checked + 1))
   needed="$(artifact_dynamic_entries "$inspector" "$artifact")"
-  if grep -E "$forbidden_pattern" <<<"$needed" >/dev/null; then
-    echo "FAIL [$label] forbidden native runtime dependency found in $artifact" >&2
+  if [[ "$allow_rdma_spdk" -eq 0 ]] && grep -E "$rdma_spdk_pattern" <<<"$needed" >/dev/null; then
+    echo "FAIL [$label] RDMA/SPDK runtime dependency found in minimal/non-RDMA artifact: $artifact" >&2
     echo "$needed" | sed 's/^/  /' >&2
     failures=$((failures + 1))
-  else
-    echo "OK   [$label] runtime dependencies"
+    continue
   fi
+
+  if grep -E "$native_storage_pattern" <<<"$needed" >/dev/null; then
+    echo "FAIL [$label] native storage runtime dependency found in minimal client artifact: $artifact" >&2
+    echo "$needed" | sed 's/^/  /' >&2
+    failures=$((failures + 1))
+    continue
+  fi
+
+  if grep -E "$native_ufs_pattern" <<<"$needed" >/dev/null; then
+    echo "FAIL [$label] native UFS runtime dependency found in minimal client artifact: $artifact" >&2
+    echo "$needed" | sed 's/^/  /' >&2
+    failures=$((failures + 1))
+    continue
+  fi
+
+  echo "OK   [$label] runtime dependencies"
 done
 
 if ((failures > 0)); then
@@ -156,4 +182,8 @@ if ((checked == 0)); then
   exit 2
 fi
 
-echo "Minimal artifact runtime dependency check passed."
+if [[ "$allow_rdma_spdk" -eq 1 ]]; then
+  echo "Runtime dependency check passed with explicit RDMA/SPDK dependencies allowed."
+else
+  echo "Minimal/non-RDMA artifact runtime dependency check passed."
+fi
