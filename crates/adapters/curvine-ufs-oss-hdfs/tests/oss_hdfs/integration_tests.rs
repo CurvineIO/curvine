@@ -19,7 +19,7 @@ mod tests {
     use curvine_model::SetAttrOpts;
     use curvine_ufs_oss_hdfs::OssHdfsFileSystem;
     use curvine_ufs_api::OssHdfsConf;
-    use orpc::sys::DataSlice;
+    use curvine_io::DataSlice;
     use std::collections::HashMap;
     use std::sync::Arc;
 

@@ -19,8 +19,8 @@ use bytes::BytesMut;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{Path, Writer};
+use curvine_io::DataSlice;
 use curvine_model::FileStatus;
-use orpc::sys::DataSlice;
 use std::os::raw::c_void;
 use std::sync::Arc;
 

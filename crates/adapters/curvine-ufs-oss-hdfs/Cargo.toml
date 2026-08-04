@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+curvine-core-error = { workspace = true }
+curvine-runtime = { workspace = true }
+curvine-io = { workspace = true }
+curvine-sys = { workspace = true }
 curvine-ufs-api = { workspace = true }
 curvine-config = { workspace = true }
 curvine-error = { workspace = true }
@@ -14,7 +18,6 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
-orpc = { workspace = true }
 tokio = { workspace = true }
 
 [build-dependencies]

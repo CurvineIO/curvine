@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use crate::VfsDir;
+use curvine_core_error::{err_box, CommonResult};
 use curvine_model::{ExtendedBlock, StorageType};
-use orpc::common::FileUtils;
-use orpc::{err_box, sys, CommonResult};
+use curvine_runtime::common::FileUtils;
+use curvine_sys as sys;
 use std::fmt;
 use std::fmt::Formatter;
 use std::path::Path;
@@ -208,7 +209,7 @@ impl fmt::Display for BlockMeta {
 #[cfg(all(test, feature = "spdk"))]
 mod test {
     use super::*;
-    use orpc::io::LocalFile;
+    use curvine_io::LocalFile;
     use std::path::PathBuf;
 
     #[cfg(feature = "spdk")]

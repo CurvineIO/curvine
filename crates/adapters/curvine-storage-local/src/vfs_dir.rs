@@ -14,15 +14,15 @@
 
 use crate::{DirState, StorageVersion, DEFAULT_BLOCK_ALIGN};
 use curvine_config::WorkerDataDir;
+use curvine_core_error::CommonResult;
+use curvine_io::LocalFile;
 use curvine_model::StorageType;
+use curvine_runtime::common::{ByteUnit, FileUtils};
+use curvine_runtime::sync::AtomicLong;
 #[cfg(feature = "spdk")]
 use curvine_storage_spdk::SpdkEnv;
+use curvine_sys::FsStats;
 use log::*;
-use orpc::common::{ByteUnit, FileUtils};
-use orpc::io::LocalFile;
-use orpc::sync::AtomicLong;
-use orpc::sys::FsStats;
-use orpc::CommonResult;
 use std::fmt::{Debug, Formatter};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -72,14 +72,14 @@ impl VfsDir {
         let bdev_name: Option<(String, i64)> = if conf.storage_type == StorageType::SpdkDisk {
             use curvine_storage_spdk::SpdkEnv;
             let env = SpdkEnv::global().ok_or_else(|| {
-                orpc::err_msg!(
+                curvine_core_error::err_msg!(
                     "StorageType::SpdkDisk dir '{}' requires SPDK environment, but it is not initialized",
                     conf.path
                 )
             })?;
             let names = env.bdev_names();
             if names.is_empty() {
-                return orpc::err_box!(
+                return curvine_core_error::err_box!(
                     "StorageType::SpdkDisk dir '{}' but no bdevs discovered from SPDK targets",
                     conf.path
                 );
@@ -98,7 +98,7 @@ impl VfsDir {
         };
         #[cfg(not(feature = "spdk"))]
         let bdev_name: Option<(String, i64)> = if conf.storage_type == StorageType::SpdkDisk {
-            return orpc::err_box!(
+            return curvine_core_error::err_box!(
                 "StorageType::SpdkDisk is not available. Compile with --features spdk"
             );
         } else {
@@ -361,12 +361,12 @@ mod test {
     use crate::{BdevLayout, BlockLayout, FileLayout, StorageVersion, DEFAULT_BLOCK_ALIGN};
     use crate::{BlockMeta, BlockState};
     use curvine_config::WorkerDataDir;
+    use curvine_core_error::CommonResult;
+    use curvine_io::LocalFile;
     use curvine_model::{ExtendedBlock, StorageType};
-    use orpc::common::{ByteUnit, FileUtils};
-    use orpc::io::LocalFile;
-    use orpc::sync::AtomicLong;
-    use orpc::sys::FsStats;
-    use orpc::CommonResult;
+    use curvine_runtime::common::{ByteUnit, FileUtils};
+    use curvine_runtime::sync::AtomicLong;
+    use curvine_sys::FsStats;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 

@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::BlockMeta;
+use curvine_core_error::{err_box, CommonResult};
 use curvine_model::ExtendedBlock;
-use orpc::common::ByteUnit;
-use orpc::{err_box, CommonResult};
+use curvine_runtime::common::ByteUnit;
 
 // block data collection.
 pub trait Dataset {

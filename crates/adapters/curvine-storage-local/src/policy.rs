@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::VfsDir;
+use curvine_core_error::{err_box, CommonResult};
 use curvine_model::StorageType;
 use indexmap::IndexMap;
-use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
 use std::sync::Arc;
 

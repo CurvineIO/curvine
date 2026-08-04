@@ -16,12 +16,12 @@
 mod s3_tests {
     use bytes::BytesMut;
 
+    use curvine_core_error::CommonResult;
     use curvine_fs_api::{FileSystem, Path, Reader, Writer};
     use curvine_model::FileStatus;
+    use curvine_runtime::common::{FileUtils, Utils};
+    use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
     use curvine_ufs_opendal::OpendalFileSystem;
-    use orpc::common::{FileUtils, Utils};
-    use orpc::runtime::{AsyncRuntime, RpcRuntime};
-    use orpc::CommonResult;
     use std::collections::HashMap;
 
     const S3_CONF_PATH: &str = "testing/s3.toml";
