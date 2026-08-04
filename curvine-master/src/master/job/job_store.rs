@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::master::JobContext;
-use curvine_common::state::{JobTaskProgress, JobTaskState};
-use curvine_common::FsResult;
+use curvine_error::FsResult;
+use curvine_model::{JobTaskProgress, JobTaskState};
 use log::{debug, error};
 use orpc::err_box;
 use orpc::sync::FastDashMap;

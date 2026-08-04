@@ -870,7 +870,7 @@ mod tests {
         use crate::session::{FuseRequest, FuseResponse, FuseTask};
         use crate::FuseUtils;
         use bytes::{BufMut, BytesMut};
-        use curvine_common::conf::FuseConf;
+        use curvine_config::FuseConf;
         use curvine_metrics::Metrics as m;
         use orpc::sync::channel::{AsyncChannel, AsyncReceiver};
         use orpc::sync::FastDashMap;
@@ -1557,9 +1557,7 @@ mod tests {
             FuseMetrics::ensure_init().unwrap();
             let rt = AsyncRuntime::single();
             rt.block_on(async {
-                let fs = Arc::new(TestFileSystem::new(
-                    curvine_common::conf::FuseConf::default(),
-                ));
+                let fs = Arc::new(TestFileSystem::new(curvine_config::FuseConf::default()));
                 // Drainer so an enqueued error reply never blocks.
                 let (tx, mut rx) = AsyncChannel::new(64).split();
                 let drainer = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -1714,9 +1712,7 @@ mod tests {
 
             let rt = AsyncRuntime::single();
             rt.block_on(async {
-                let fs = Arc::new(TestFileSystem::new(
-                    curvine_common::conf::FuseConf::default(),
-                ));
+                let fs = Arc::new(TestFileSystem::new(curvine_config::FuseConf::default()));
                 let (tx, mut rx) = AsyncChannel::new(16).split();
                 let drainer = tokio::spawn(async move { while rx.recv().await.is_some() {} });
 

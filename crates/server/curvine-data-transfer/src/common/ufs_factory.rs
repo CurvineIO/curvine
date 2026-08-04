@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::JobWorkerClient;
-use curvine_common::conf::ClientConf;
-use curvine_common::state::{MountInfo, WorkerAddress};
-use curvine_common::FsResult;
+use curvine_config::ClientConf;
+use curvine_error::FsResult;
+use curvine_model::{MountInfo, WorkerAddress};
 use curvine_unified_fs::{MountValue, UfsFileSystem};
 use orpc::client::ClientFactory;
 use orpc::io::net::InetAddr;

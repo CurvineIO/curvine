@@ -16,21 +16,21 @@ use std::collections::HashMap;
 use std::sync::{mpsc, Arc};
 
 use crossbeam::channel;
-use curvine_common::error::FsError;
-use curvine_common::fs::Path;
-use curvine_common::proto::{
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_fs_api::Path;
+use curvine_model::{
+    summarize_transfer_tasks, TransferCommand, TransferJobRecord, TransferKind, TransferListFilter,
+    TransferProgress, TransferState, TransferTaskCounts, TransferTaskRecord, TransferTaskReport,
+    TransferTaskState,
+};
+use curvine_proto::{
     ListTransferTenantsRequest, ListTransferTenantsResponse, ListTransfersRequest,
     ListTransfersResponse, SubmitTransferRequest, TransferJobStatusProto, TransferKindProto,
     TransferProgressProto, TransferTaskReportRequest, TransferTaskStateProto,
     TransferTaskStatusProto, TransferTaskSummaryProto, TransferTenantSummaryProto,
 };
-use curvine_common::state::{
-    summarize_transfer_tasks, TransferCommand, TransferJobRecord, TransferKind, TransferListFilter,
-    TransferProgress, TransferState, TransferTaskCounts, TransferTaskRecord, TransferTaskReport,
-    TransferTaskState,
-};
-use curvine_common::utils::SerdeUtils;
-use curvine_common::FsResult;
+use curvine_runtime::common::SerdeUtils;
 use orpc::common::LocalTime;
 use std::time::Duration;
 use uuid::Uuid;

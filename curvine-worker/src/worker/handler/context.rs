@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::proto::{BlockReadRequest, BlockWriteRequest};
-use curvine_common::state::ExtendedBlock;
-use curvine_common::utils::ProtoUtils;
-use curvine_common::FsResult;
+use curvine_error::FsResult;
+use curvine_model::ExtendedBlock;
+use curvine_model::ProtoUtils;
+use curvine_proto::{BlockReadRequest, BlockWriteRequest};
 use orpc::message::Message;
 
 #[derive(Debug)]

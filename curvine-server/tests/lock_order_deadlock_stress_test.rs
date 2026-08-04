@@ -1,5 +1,5 @@
-use curvine_common::conf::{ClusterConf, MasterConf};
-use curvine_common::state::{
+use curvine_config::{ClusterConf, MasterConf};
+use curvine_model::{
     BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, StorageType, WorkerInfo,
 };
 use curvine_raft::conf::JournalConf;

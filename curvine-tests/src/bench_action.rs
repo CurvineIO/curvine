@@ -15,7 +15,7 @@
 use crate::ActionType::{FsRead, FsWrite, FuseRead, FuseWrite};
 use crate::BenchArgs;
 use curvine_client::file::CurvineFileSystem;
-use curvine_common::conf::ClusterConf;
+use curvine_config::ClusterConf;
 use orpc::common::{ByteUnit, Utils};
 use orpc::runtime::{AsyncRuntime, Runtime};
 use std::ops::Range;

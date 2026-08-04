@@ -15,12 +15,12 @@
 use crate::master::fs::policy::{ChooseContext, WorkerPolicyAdapter};
 use crate::master::fs::state::{BlockMap, WorkerMap};
 use crate::master::fs::DeleteResult;
-use curvine_common::conf::ClusterConf;
-use curvine_common::state::{
+use curvine_config::ClusterConf;
+use curvine_error::FsResult;
+use curvine_model::{
     BlockLocation, ExtendedBlock, HeartbeatStatus, LocatedBlock, StorageInfo, StorageType,
     TransferWorkerCapabilities, WorkerAddress, WorkerCommand, WorkerInfo, WorkerStatus,
 };
-use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::ByteUnit;
 use orpc::{err_box, CommonResult};

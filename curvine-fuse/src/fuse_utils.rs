@@ -21,9 +21,9 @@ use crate::raw::fuse_abi::{
 use crate::*;
 use bytes::BytesMut;
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::conf::FuseConf;
-use curvine_common::fs::Path;
-use curvine_common::state::{
+use curvine_config::FuseConf;
+use curvine_fs_api::Path;
+use curvine_model::{
     CreateFileOpts, CreateFileOptsBuilder, FileStatus, FileType, MkdirOpts, MkdirOptsBuilder,
     SetAttrOpts, FS_APPEND_FL, FS_IMMUTABLE_FL, IFLAGS_XATTR, MKNOD_RDEV_XATTR,
 };
@@ -757,7 +757,7 @@ mod tests {
     use crate::raw::fuse_abi::{
         fuse_ioctl_iovec, fuse_ioctl_out, fuse_setattr_in, FUSE_IOCTL_RETRY,
     };
-    use curvine_common::state::INTERNAL_CTIME_XATTR;
+    use curvine_model::INTERNAL_CTIME_XATTR;
 
     #[test]
     fn protected_xattr_errors_match_operation() {

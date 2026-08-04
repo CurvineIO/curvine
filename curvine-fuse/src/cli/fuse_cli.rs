@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use clap::{Parser, Subcommand, ValueEnum};
-use curvine_common::conf::ClientConfCliOverrides;
-use curvine_common::version;
+use curvine_config::ClientConfCliOverrides;
+use curvine_sys::version;
 
 use crate::cli::mount_args::{FuseMountArgs, FuseRuntimeArgs};
 
@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn metrics_enabled_defaults_to_true() {
-        use curvine_common::conf::FuseConf;
+        use curvine_config::FuseConf;
         assert!(FuseConf::default().metrics_enabled);
     }
 

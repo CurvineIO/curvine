@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::master::fs::policy::{ChooseContext, WorkerPolicy};
-use curvine_common::state::{WorkerAddress, WorkerInfo};
+use curvine_model::{WorkerAddress, WorkerInfo};
 use indexmap::IndexMap;
 use orpc::sync::AtomicLen;
 use orpc::{err_box, CommonResult};

@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use clap::Parser;
-use curvine_common::conf::{ClientConfCliOverrides, ClusterConf};
-use curvine_common::version;
+use curvine_config::{ClientConfCliOverrides, ClusterConf};
+use curvine_sys::version;
 use orpc::io::net::InetAddr;
 use orpc::{err_box, CommonResult};
 
@@ -347,7 +347,7 @@ impl FuseMountArgs {
 mod tests {
     use super::FuseMountArgs;
     use clap::Parser;
-    use curvine_common::conf::ClusterConf;
+    use curvine_config::ClusterConf;
     use orpc::common::Utils;
     use std::fs;
 

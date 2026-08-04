@@ -16,9 +16,9 @@ use crate::cli::FuseRuntimeArgs;
 use crate::fs::CurvineFileSystem;
 use crate::session::FuseSession;
 use crate::web_server::WebServer;
-use curvine_common::conf::FuseConf;
-use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, Path};
+use curvine_config::FuseConf;
+use curvine_error::FsError;
+use curvine_fs_api::{FileSystem, Path};
 use log::info;
 use orpc::common::Logger;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
@@ -33,11 +33,8 @@ pub fn run_mount(args: FuseRuntimeArgs) -> CommonResult<()> {
 
     let cluster_conf = args.get_conf()?;
     Logger::init(cluster_conf.fuse.log.clone());
-    info!(
-        "allocator: {}",
-        curvine_common::alloc::allocator_type_name()
-    );
-    info!("git version: {}", curvine_common::version::GIT_VERSION);
+    info!("allocator: {}", curvine_alloc::allocator_type_name());
+    info!("git version: {}", curvine_sys::version::GIT_VERSION);
     cluster_conf.print();
 
     let rt = Arc::new(AsyncRuntime::new(

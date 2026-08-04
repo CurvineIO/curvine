@@ -219,7 +219,7 @@ impl TtlBucketList {
 mod tests {
     use super::*;
     use crate::master::meta::inode::{InodeFile, InodeView};
-    use curvine_common::state::TtlAction;
+    use curvine_model::TtlAction;
 
     const INTERVAL_MS: i64 = 1000;
 

@@ -30,8 +30,8 @@
 
 #[cfg(any(feature = "opendal-hdfs", feature = "opendal-webhdfs"))]
 mod mount_integration_tests {
-    use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-    use curvine_common::state::{MountInfo, TtlAction};
+    use curvine_fs_api::{FileSystem, Path, Reader, Writer};
+    use curvine_model::{MountInfo, TtlAction};
     use curvine_ufs_opendal::OpendalFileSystem;
     use std::collections::HashMap;
     use std::env;
@@ -39,7 +39,7 @@ mod mount_integration_tests {
     /// Helper function to create OpendalFileSystem from MountInfo
     fn create_filesystem_from_mount(
         mount_info: &MountInfo,
-    ) -> Result<OpendalFileSystem, curvine_common::error::FsError> {
+    ) -> Result<OpendalFileSystem, curvine_error::FsError> {
         let ufs_path = Path::from_str(&mount_info.ufs_path)?;
         OpendalFileSystem::new(&ufs_path, mount_info.properties.clone())
     }
@@ -81,7 +81,7 @@ mod mount_integration_tests {
                 storage_type: None,
                 block_size: None,
                 replicas: None,
-                write_type: curvine_common::state::WriteType::CacheMode,
+                write_type: curvine_model::WriteType::CacheMode,
                 provider: None,
             };
 
@@ -269,7 +269,7 @@ mod mount_integration_tests {
                     storage_type: None,
                     block_size: None,
                     replicas: None,
-                    write_type: curvine_common::state::WriteType::CacheMode,
+                    write_type: curvine_model::WriteType::CacheMode,
                     provider: None,
                 };
 
@@ -409,7 +409,7 @@ mod mount_integration_tests {
                 storage_type: None,
                 block_size: None,
                 replicas: None,
-                write_type: curvine_common::state::WriteType::CacheMode,
+                write_type: curvine_model::WriteType::CacheMode,
                 provider: None,
             };
 
@@ -458,7 +458,7 @@ mod mount_integration_tests {
                 storage_type: None,
                 block_size: None,
                 replicas: None,
-                write_type: curvine_common::state::WriteType::CacheMode,
+                write_type: curvine_model::WriteType::CacheMode,
                 provider: None,
             };
 

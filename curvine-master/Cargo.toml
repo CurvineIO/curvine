@@ -9,8 +9,15 @@ default = []
 fault-injection = ["curvine-fault/http-server"]
 
 [dependencies]
+curvine-raft = { workspace = true }
+curvine-proto = { workspace = true }
+curvine-fs-api = { workspace = true }
+curvine-config = { workspace = true }
 orpc = { workspace = true }
-curvine-common = { workspace = true }
+curvine-sys = { workspace = true }
+curvine-alloc = { workspace = true }
+curvine-model = { workspace = true }
+curvine-runtime = { workspace = true }
 curvine-metrics = { workspace = true }
 curvine-rocksdb = { workspace = true }
 curvine-error = { workspace = true, features = ["axum-response"] }

@@ -16,10 +16,10 @@
 use crate::master::fs::MasterFilesystem;
 use crate::master::mount::MountTable;
 use crate::master::{self, SyncFsDir};
-use curvine_common::error::FsError;
-use curvine_common::fs::{self, CurvineURI, Path};
-use curvine_common::state::{MkdirOpts, MountInfo, MountOptions};
-use curvine_common::FsResult;
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_fs_api::{self, CurvineURI, Path};
+use curvine_model::{MkdirOpts, MountInfo, MountOptions};
 use curvine_ufs_api::S3Conf;
 use log::info;
 use orpc::err_box;

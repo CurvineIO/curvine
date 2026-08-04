@@ -182,7 +182,7 @@ check_mixed_spdk_feature_risk() {
   if output="$(
     cargo tree \
       --no-default-features \
-      --features curvine-server/spdk-rdma,curvine-common/system \
+      --features curvine-server/spdk-rdma,curvine-alloc/system \
       -p curvine-cli \
       -p curvine-server \
       -e features \

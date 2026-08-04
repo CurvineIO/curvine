@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::{DirState, StorageVersion, DEFAULT_BLOCK_ALIGN};
-use curvine_common::conf::WorkerDataDir;
-use curvine_common::state::StorageType;
+use curvine_config::WorkerDataDir;
+use curvine_model::StorageType;
 #[cfg(feature = "spdk")]
 use curvine_storage_spdk::SpdkEnv;
 use log::*;
@@ -360,8 +360,8 @@ mod test {
     use crate::vfs_dir::VfsDir;
     use crate::{BdevLayout, BlockLayout, FileLayout, StorageVersion, DEFAULT_BLOCK_ALIGN};
     use crate::{BlockMeta, BlockState};
-    use curvine_common::conf::WorkerDataDir;
-    use curvine_common::state::{ExtendedBlock, StorageType};
+    use curvine_config::WorkerDataDir;
+    use curvine_model::{ExtendedBlock, StorageType};
     use orpc::common::{ByteUnit, FileUtils};
     use orpc::io::LocalFile;
     use orpc::sync::AtomicLong;

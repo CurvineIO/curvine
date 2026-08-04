@@ -14,8 +14,8 @@
 
 use curvine_client::file::CurvineFileSystem;
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::conf::ClusterConf;
-use curvine_common::fs::Path;
+use curvine_config::ClusterConf;
+use curvine_fs_api::Path;
 use curvine_server::test::MiniCluster;
 use once_cell::sync::OnceCell;
 use orpc::common::{FileUtils, Logger, Utils};

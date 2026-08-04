@@ -21,12 +21,15 @@ name = "lancedb"
 path = "src/lib.rs"
 
 [dependencies]
+curvine-model = { workspace = true }
+curvine-fs-api = { workspace = true }
+curvine-error = { workspace = true }
+curvine-config = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 curvine-client = { workspace = true }
-curvine-common = { workspace = true }
 futures = { workspace = true }
 lance = { version = "4.0.0", default-features = false }
 lance-core = "4.0.0"

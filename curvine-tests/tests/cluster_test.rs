@@ -15,9 +15,9 @@
 #![allow(unused)]
 
 use curvine_client::file::CurvineFileSystem;
-use curvine_common::conf::ClusterConf;
-use curvine_common::fs::{Path, Writer};
-use curvine_common::state::FileBlocks;
+use curvine_config::ClusterConf;
+use curvine_fs_api::{Path, Writer};
+use curvine_model::FileBlocks;
 use curvine_server::test::MiniCluster;
 use curvine_tests::Testing;
 use orpc::common::Utils;

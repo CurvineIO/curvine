@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use bytes::BytesMut;
-use curvine_common::fs::RpcCode;
-use curvine_common::FsResult;
+use curvine_error::FsResult;
+use curvine_fs_api::RpcCode;
 use log::info;
 use orpc::common::TimeSpent;
 use orpc::io::net::ConnState;

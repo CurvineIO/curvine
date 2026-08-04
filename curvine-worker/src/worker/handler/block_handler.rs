@@ -15,8 +15,8 @@
 use crate::worker::block::BlockStore;
 use crate::worker::handler::BlockHandler::{BatchWriter, Reader, Writer};
 use crate::worker::handler::{BatchWriteHandler, ReadHandler, WriteHandler};
-use curvine_common::fs::RpcCode;
-use curvine_common::FsResult;
+use curvine_error::FsResult;
+use curvine_fs_api::RpcCode;
 use orpc::message::Message;
 use orpc::{err_box, CommonResult};
 

@@ -25,8 +25,14 @@ fault-injection = [
 ]
 
 [dependencies]
+curvine-proto = { workspace = true }
+curvine-fs-api = { workspace = true }
+curvine-config = { workspace = true }
 orpc = { workspace = true }
-curvine-common = { workspace = true }
+curvine-sys = { workspace = true }
+curvine-alloc = { workspace = true }
+curvine-model = { workspace = true }
+curvine-runtime = { workspace = true }
 curvine-master = { workspace = true }
 curvine-worker = { workspace = true }
 curvine-error = { workspace = true, features = ["axum-response"] }

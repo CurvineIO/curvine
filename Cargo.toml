@@ -20,11 +20,13 @@ members = [
     "crates/common/curvine-storage-api",
     "crates/common/curvine-ufs-api",
     "crates/common/curvine-config",
+    "crates/common/curvine-macros",
     "crates/core/error",
     "crates/core/runtime",
     "crates/core/net",
     "crates/core/rpc",
     "crates/core/curvine-sys",
+    "crates/core/curvine-alloc",
     "crates/core/curvine-io",
     "crates/adapters/curvine-rocksdb",
     "crates/metadata/curvine-raft",
@@ -37,7 +39,6 @@ members = [
     "curvine-master",
     "curvine-worker",
     "curvine-common",
-    "curvine-common/macros",
     "curvine-server",
     "crates/client/curvine-client-core",
     "crates/client/curvine-job-client",
@@ -74,11 +75,13 @@ default-members = [
     "crates/common/curvine-storage-api",
     "crates/common/curvine-ufs-api",
     "crates/common/curvine-config",
+    "crates/common/curvine-macros",
     "crates/core/error",
     "crates/core/runtime",
     "crates/core/net",
     "crates/core/rpc",
     "crates/core/curvine-sys",
+    "crates/core/curvine-alloc",
     "crates/core/curvine-io",
     "crates/metadata/curvine-raft",
     "crates/adapters/curvine-storage-local",
@@ -112,6 +115,7 @@ curvine-runtime = { path = "crates/core/runtime" }
 curvine-net = { path = "crates/core/net" }
 curvine-rpc = { path = "crates/core/rpc" }
 curvine-sys = { path = "crates/core/curvine-sys" }
+curvine-alloc = { path = "crates/core/curvine-alloc" }
 curvine-io = { path = "crates/core/curvine-io" }
 curvine-rocksdb = { path = "crates/adapters/curvine-rocksdb" }
 curvine-raft = { path = "crates/metadata/curvine-raft" }
@@ -131,7 +135,7 @@ curvine-storage-api = { path = "crates/common/curvine-storage-api" }
 curvine-ufs-api = { path = "crates/common/curvine-ufs-api" }
 curvine-config = { path = "crates/common/curvine-config" }
 curvine-common = { path = "curvine-common" }
-curvine-common-macros = { path = "curvine-common/macros" }
+curvine-common-macros = { path = "crates/common/curvine-macros" }
 curvine-master = { path = "curvine-master" }
 curvine-worker = { path = "curvine-worker" }
 curvine-client-core = { path = "crates/client/curvine-client-core" }

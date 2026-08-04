@@ -14,8 +14,8 @@
 
 use bytes::BytesMut;
 use curvine_client::unified::{UfsFileSystem, UnifiedFileSystem, UnifiedReader};
-use curvine_common::fs::{FileSystem, Path, Reader, RpcCode, Writer};
-use curvine_common::state::{AccessMode, MountOptionsBuilder, WriteType};
+use curvine_fs_api::{FileSystem, Path, Reader, RpcCode, Writer};
+use curvine_model::{AccessMode, MountOptionsBuilder, WriteType};
 use curvine_tests::Testing;
 use orpc::common::Utils;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};

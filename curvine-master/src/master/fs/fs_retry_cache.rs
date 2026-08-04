@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::conf::MasterConf;
-use curvine_common::error::FsError;
-use curvine_common::FsResult;
+use curvine_config::MasterConf;
+use curvine_error::FsError;
+use curvine_error::FsResult;
 use mini_moka::sync::{Cache, CacheBuilder};
 use num_enum::{FromPrimitive, IntoPrimitive};
 use orpc::common::DurationUnit;

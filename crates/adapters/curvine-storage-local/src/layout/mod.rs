@@ -21,7 +21,7 @@ pub use self::file_layout::FileLayout;
 
 use crate::BlockMeta;
 use crate::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};
-use curvine_common::state::{ExtendedBlock, StorageType};
+use curvine_model::{ExtendedBlock, StorageType};
 use orpc::io::IOResult;
 use orpc::{err_box, CommonResult};
 use std::sync::Arc;

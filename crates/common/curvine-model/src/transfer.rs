@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_error::{ErrorKind, FsError};
 use curvine_runtime::common::Utils;
 use num_enum::{FromPrimitive, IntoPrimitive};
 use serde::{Deserialize, Serialize};
@@ -459,4 +460,41 @@ mod tests {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StaleTaskAttempt {
     pub task: TransferTaskRecord,
+}
+
+pub fn transfer_failure_message(
+    kind: TransferKind,
+    source_path: &str,
+    target_path: &str,
+    err: &FsError,
+) -> String {
+    let source_label = match kind {
+        TransferKind::Load => "source object",
+        TransferKind::Export => "source file",
+    };
+    match err.kind() {
+        ErrorKind::FileNotFound | ErrorKind::Expired => {
+            format!("{source_label} not found: {source_path}")
+        }
+        ErrorKind::FileAlreadyExists => format!("target already exists: {target_path}"),
+        ErrorKind::ParentNotDir | ErrorKind::NotADirectory => {
+            format!("target parent is not a directory: {target_path}")
+        }
+        ErrorKind::IsADirectory => format!("target is a directory: {target_path}"),
+        ErrorKind::ReadOnly => format!("target is read-only: {target_path}"),
+        ErrorKind::DiskOutOfSpace => {
+            format!("Not enough Curvine worker disk space to transfer {source_path}; free space and retry")
+        }
+        ErrorKind::Timeout => format!(
+            "Timed out while accessing {source_path}; verify storage connectivity and retry"
+        ),
+        ErrorKind::IO | ErrorKind::Ufs | ErrorKind::Pipeline => format!(
+            "Cannot access transfer storage for {source_path}; verify the mount, credentials, and network connectivity"
+        ),
+        ErrorKind::TransferStoreUnavailable => {
+            "Transfer metadata store is unavailable; retry after it recovers".to_string()
+        }
+        ErrorKind::TransferOverloaded => "Transfer service is busy; retry later".to_string(),
+        _ => format!("Transfer from {source_path} to {target_path} failed: {err}"),
+    }
 }

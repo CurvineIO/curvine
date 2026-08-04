@@ -14,13 +14,13 @@
 
 use crate::master::fs::MasterFilesystem;
 use crate::master::{Master, MasterMetrics, SyncWorkerManager};
-use curvine_common::conf::ClusterConf;
-use curvine_common::fs::RpcCode;
-use curvine_common::proto::{
+use curvine_config::ClusterConf;
+use curvine_fs_api::RpcCode;
+use curvine_model::ProtoUtils;
+use curvine_model::{BlockLocation, WorkerAddress};
+use curvine_proto::{
     ReportBlockReplicationRequest, SubmitBlockReplicationRequest, SubmitBlockReplicationResponse,
 };
-use curvine_common::state::{BlockLocation, WorkerAddress};
-use curvine_common::utils::ProtoUtils;
 use log::{error, info, warn};
 use orpc::client::ClientFactory;
 use orpc::io::net::InetAddr;

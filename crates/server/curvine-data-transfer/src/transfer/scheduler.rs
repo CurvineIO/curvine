@@ -17,14 +17,14 @@ use crate::transfer::{
     is_store_unavailable_error, job_mount_snapshot, transfer_failure_message, TransferPlannedTasks,
     TransferPlanner, TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
 };
-use curvine_common::conf::TransferConf;
-use curvine_common::error::FsError;
-use curvine_common::state::{
+use curvine_config::TransferConf;
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_model::{
     summarize_transfer_tasks, LoadJobInfo, LoadTaskInfo, TaskAttemptStart, TransferJobRecord,
     TransferLease, TransferProgress, TransferState, TransferStateUpdate, TransferTaskRecord,
     TransferTaskReport, TransferTaskReportInfo, TransferTaskState, WorkerInfo,
 };
-use curvine_common::FsResult;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use log::{debug, error, info, warn};
 use orpc::common::LocalTime;
@@ -492,8 +492,8 @@ where
     fn planner_job_info(
         &self,
         job: &TransferJobRecord,
-        mount: &curvine_common::state::MountInfo,
-    ) -> curvine_common::state::LoadJobInfo {
+        mount: &curvine_model::MountInfo,
+    ) -> curvine_model::LoadJobInfo {
         self.planner.load_job_info(job, mount)
     }
 
@@ -1090,9 +1090,9 @@ fn record_metric(f: impl FnOnce(&TransferMetrics)) {
     }
 }
 
-fn transfer_kind_label(kind: curvine_common::state::TransferKind) -> &'static str {
+fn transfer_kind_label(kind: curvine_model::TransferKind) -> &'static str {
     match kind {
-        curvine_common::state::TransferKind::Load => "load",
-        curvine_common::state::TransferKind::Export => "export",
+        curvine_model::TransferKind::Load => "load",
+        curvine_model::TransferKind::Export => "export",
     }
 }

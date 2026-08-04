@@ -14,11 +14,11 @@
 
 #![cfg(feature = "fault-injection")]
 
-use curvine_common::conf::ClusterConf;
-use curvine_common::fs::Path;
-use curvine_common::state::{JobTaskState, LoadJobCommand, MountOptions};
+use curvine_config::ClusterConf;
 use curvine_fault::{FaultHttpController, FaultRuleBuilder, FaultRuntime, FaultTestSession};
+use curvine_fs_api::Path;
 use curvine_job_client::JobMasterClient;
+use curvine_model::{JobTaskState, LoadJobCommand, MountOptions};
 use curvine_server::test::MiniCluster;
 use orpc::common::Utils;
 use orpc::runtime::RpcRuntime;

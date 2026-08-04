@@ -15,7 +15,7 @@
 use crate::fs::FileSystem;
 use crate::session::FuseMnt;
 use crate::{FuseResult, FuseUtils, FUSE_BUFFER_HEADER_SIZE};
-use curvine_common::conf::FuseConf;
+use curvine_config::FuseConf;
 use orpc::runtime::Runtime;
 use orpc::sync::channel::AsyncChannel;
 use orpc::sync::FastDashMap;

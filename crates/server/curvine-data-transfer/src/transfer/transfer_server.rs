@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use crate::common::UfsFactory;
 use curvine_client_core::file::CurvineFileSystem;
-use curvine_common::conf::{ClusterConf, TransferStoreType};
-use curvine_common::error::FsError;
+use curvine_config::{ClusterConf, TransferStoreType};
+use curvine_error::FsError;
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::info;
 use orpc::common::Logger;
@@ -96,11 +96,8 @@ impl TransferServer {
         }
         Logger::init(conf.master.log.clone());
         let _ = TransferMetrics::get()?;
-        info!(
-            "allocator: {}",
-            curvine_common::alloc::allocator_type_name()
-        );
-        info!("git version: {}", curvine_common::version::GIT_VERSION);
+        info!("allocator: {}", curvine_alloc::allocator_type_name());
+        info!("git version: {}", curvine_sys::version::GIT_VERSION);
         conf.print();
 
         let rt = Arc::new(conf.transfer_server_conf().create_runtime());

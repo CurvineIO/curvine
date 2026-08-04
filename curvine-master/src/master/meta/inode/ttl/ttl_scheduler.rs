@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::master::meta::inode::ttl::ttl_manager::InodeTtlManager;
-use curvine_common::error::FsError;
+use curvine_error::FsError;
 use log::{error, info};
 use orpc::common::TimeSpent;
 use orpc::runtime::LoopTask;

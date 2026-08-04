@@ -1,0 +1,384 @@
+syntax="proto2";
+package proto;
+
+option java_package = "io.curvine.proto";
+option java_multiple_files = true;
+option java_outer_classname = "MasterProto";
+
+import "common.proto";
+
+message MkdirOptsProto {
+    required bool create_parent = 1;
+    required uint32 mode = 2;
+    map<string, bytes> x_attr = 3;
+    required StoragePolicyProto storage_policy = 4;
+    required string owner = 5;
+    required string group = 6;
+}
+
+// File system, master related requests
+// Create a directory request.
+message MkdirRequest {
+    required string path = 1;
+    required MkdirOptsProto opts = 2;
+}
+
+message MkdirResponse {
+    required bool flag = 1;
+    required FileStatusProto status = 2;
+}
+
+message CreateFileOptsProto {
+    required int32 create_flag = 1 [default = 1];
+    required bool create_parent = 2;
+
+    required FileTypeProto file_type = 3 [default = FILE_TYPE_PROTO_FILE];
+    required int32 replicas = 4 [default = 1];
+    required int64 block_size = 5 [default = 134217728];
+    map<string, bytes> x_attr = 6;
+    required StoragePolicyProto storage_policy = 7;
+    required string client_name = 8 [default = "localhost"];
+    required uint32 mode = 9;
+    required string owner = 10;
+    required string group = 11;
+    required bool sync_ufs_meta = 12 [default = false];
+    required int64 ufs_len = 13 [default = 0];
+}
+
+// Create a file.
+message CreateFileRequest {
+    required string path = 1;
+    required CreateFileOptsProto opts = 2;
+    required uint32 flags = 3;
+}
+
+message CreateFileResponse {
+    required FileStatusProto file_status = 1;
+}
+
+message CreateFilesBatchRequest {
+    repeated CreateFileRequest requests = 1;
+}
+
+message CreateFilesBatchResponse {
+    repeated FileStatusProto file_statuses = 1;
+}
+
+message CompleteFilesBatchRequest {
+    repeated CompleteFileRequest requests = 1;
+}
+
+message CompleteFilesBatchResponse {
+    repeated bool results = 1;
+}
+
+message OpenFileRequest {
+    required string path = 1;
+    required CreateFileOptsProto opts = 2;
+    required uint32 flags = 3;
+}
+
+message OpenFileResponse {
+    required FileBlocksProto file_blocks = 1;
+}
+
+
+// Delete directories or files.
+message DeleteRequest {
+    required string path = 1;
+    required bool recursive = 2;
+}
+
+message DeleteResponse {}
+
+message FreeRequest {
+    required string path = 1;
+    required bool recursive = 2;
+}
+
+message FreeResponse {
+    required FreeResultProto res = 1;
+}
+
+message GetFileStatusRequest {
+    required string path = 1;
+}
+
+message GetFileStatusResponse {
+    required FileStatusProto status = 1;
+}
+
+message ExistsRequest {
+    required string path = 1;
+}
+
+message ExistsResponse {
+    required bool exists = 1;
+}
+
+// Get the list.
+message ListStatusRequest {
+    required string path = 1;
+    required bool need_location = 2;
+}
+
+message ListStatusResponse {
+    repeated FileStatusProto statuses = 1;
+}
+
+// Rename.
+message RenameRequest {
+    required string src = 1;
+    required string dst = 2;
+    required uint32 flags = 3;
+}
+
+message RenameResponse {
+    required bool result = 1;
+}
+
+// Apply for allocation of blocks.
+message AddBlockRequest {
+    required string path = 1;
+    repeated CommitBlockProto commit_blocks = 2;
+    repeated uint32 exclude_workers = 3;
+    required bool located = 4 [default = true];
+    required ClientAddressProto client_address = 5;
+    required int64 file_len = 6;
+    optional ExtendedBlockProto last_block = 7;
+    optional int64 inode_id = 8;
+}
+
+message AddBlockResponse {
+    required LocatedBlockProto block = 1;
+}
+
+// apply for allocation of blocks batch
+message AddBlocksBatchRequest {
+    repeated AddBlockRequest requests = 1;
+}
+
+message AddBlocksBatchResponse {
+    repeated LocatedBlockProto blocks = 1;
+}
+
+message RequestReplacementWorkerRequest {
+    required int64 block_id = 1;
+    repeated uint32 exclude_workers = 2;
+}
+
+message RequestReplacementWorkerResponse {
+    required WorkerAddressProto worker = 1;
+}
+
+message ReportUnderReplicatedBlocksRequest {
+    repeated int64 block_ids = 1;
+}
+
+message ReportUnderReplicatedBlocksResponse {
+    required bool success = 1;
+    optional string message = 2;
+}
+
+// File writing is completed.
+message CompleteFileRequest {
+    required string path = 1;
+    required int64 len = 2;
+    required string client_name = 3;
+    repeated CommitBlockProto commit_blocks = 4;
+    required bool only_flush = 5 [default = false];
+    optional int64 inode_id = 6;
+    optional SetAttrOptsProto set_attr_opts = 7;
+    // Omitted by legacy clients to preserve the historical full snapshot response.
+    optional bool return_file_blocks = 8 [default = true];
+}
+
+message CompleteFileResponse {
+    required bool result = 1;
+    optional FileBlocksProto file_blocks = 2;
+}
+
+// Get the block of the file.
+message GetBlockLocationsRequest {
+    required string path = 1;
+}
+
+message GetBlockLocationsResponse {
+    required FileBlocksProto blocks = 1;
+}
+
+// Request master profile information.
+message GetMasterInfoRequest {
+
+}
+
+message GetMasterInfoResponse {
+    required string active_master = 1;
+    repeated string journal_nodes = 2;
+
+    required int64 inode_dir_num = 3;
+    required int64 inode_file_num = 4;
+    required int64 block_num = 5;
+    required int64 capacity = 6;
+    required int64 available = 7;
+    required int64 fs_used = 8;
+    required int64 non_fs_used = 9;
+    required int64 reserved_bytes = 10 [default = 0];
+
+    repeated WorkerInfoProto live_workers = 11;
+    repeated WorkerInfoProto blacklist_workers = 12;
+    repeated WorkerInfoProto decommission_workers = 13;
+    repeated WorkerInfoProto lost_workers = 14;
+}
+
+message SetAttrOptsProto {
+    required bool recursive = 1;
+    optional int32 replicas = 2;
+    optional string owner = 3;
+    optional string group = 4;
+    optional uint32 mode = 5;
+    optional int64 atime = 6;  // Access time in milliseconds
+    optional int64 mtime = 7;  // Modification time in milliseconds
+    optional int64 ttl_ms = 8;
+    optional TtlActionProto ttl_action = 9;
+    map<string, bytes> add_x_attr = 10;
+    repeated string remove_x_attr = 11;
+    optional int64 ufs_mtime = 12;
+}
+
+message SetAttrRequest {
+    required string path = 1;
+    required SetAttrOptsProto opts = 2;
+}
+
+message SetAttrResponse {
+    required FileStatusProto status = 1;
+}
+
+message SymlinkRequest {
+    required string target = 1;
+    required string link = 2;
+    required bool force = 3;
+    required uint32 mode = 4;
+    optional string owner = 5;
+    optional string group = 6;
+}
+
+message SymlinkResponse {
+}
+
+message LinkRequest {
+    required string src_path = 1;
+    required string dst_path = 2;
+}
+
+message LinkResponse {
+}
+
+enum MetricTypeProto {
+    GAUGE = 1;
+    COUNTER = 2;
+}
+
+message MetricValueProto {
+    required MetricTypeProto metric_type = 1;
+    required string name = 2;
+    required double value = 3;
+    map<string, string> tags = 4;
+}
+
+message MetricsReportRequest {
+    required string instance = 1;
+    required string source = 2;
+    repeated MetricValueProto metrics = 3;
+}
+
+message MetricsReportResponse {
+
+}
+
+message FileResizeRequest {
+    required string path = 1;
+    required FileAllocOptsProto opts = 2;
+}
+
+message FileResizeResponse {
+    required FileBlocksProto file_blocks = 1;
+}
+
+message AssignWorkerRequest {
+    required string path = 1;
+    required ExtendedBlockProto block = 2;
+    repeated uint32 exclude_workers = 3;
+    required ClientAddressProto client_address = 4;
+}
+
+message AssignWorkerResponse {
+    required LocatedBlockProto block = 1;
+}
+
+// GetLock request
+message GetLockRequest {
+    required string path = 1;
+    required FileLockProto lock = 2;
+}
+
+// GetLock response
+message GetLockResponse {
+    optional FileLockProto conflict = 1;
+}
+
+// SetLock request
+message SetLockRequest {
+    required string path = 1;
+    required FileLockProto lock = 2;
+}
+
+// SetLock response
+message SetLockResponse {
+    optional FileLockProto conflict = 1;
+}
+
+message ListOptionsRequest {
+    required string path = 1;
+    required ListOptionsProto options = 2;
+}
+
+message ListOptionsResponse {
+    repeated FileStatusProto statuses = 1;
+}
+message CvMetadataSnapshotEntryProto {
+    required FileStatusProto status = 1;
+    optional FileBlocksProto blocks = 2;
+}
+
+message GetCvMetadataSnapshotPageRequest {
+    optional string page_token = 1;
+    optional uint32 page_size = 2 [default = 10000];
+}
+
+message GetCvMetadataSnapshotPageResponse {
+    repeated CvMetadataSnapshotEntryProto entries = 1;
+    optional string next_page_token = 2;
+    required uint64 epoch = 3;
+}
+
+message CvMetadataDeltaEntryProto {
+    required string path = 1;
+    optional CvMetadataSnapshotEntryProto entry = 2;
+}
+
+message GetCvMetadataDeltaPageRequest {
+    required uint64 from_epoch = 1;
+    optional uint64 target_epoch = 2;
+    optional string page_token = 3;
+    optional uint32 page_size = 4 [default = 10000];
+}
+
+message GetCvMetadataDeltaPageResponse {
+    repeated CvMetadataDeltaEntryProto entries = 1;
+    optional string next_page_token = 2;
+    required uint64 from_epoch = 3;
+    required uint64 to_epoch = 4;
+    required bool full_snapshot_required = 5;
+}

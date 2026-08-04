@@ -22,7 +22,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use common::{row_count, start_minicluster, unique_ns};
-use curvine_common::conf::ClusterConf;
+use curvine_config::ClusterConf;
 use futures::{stream::FuturesUnordered, TryStreamExt};
 use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
 use lancedb::connect;

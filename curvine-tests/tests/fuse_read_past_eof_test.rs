@@ -1,6 +1,6 @@
-use curvine_common::fs::Path;
-use curvine_common::fs::Reader;
-use curvine_common::fs::Writer;
+use curvine_fs_api::Path;
+use curvine_fs_api::Reader;
+use curvine_fs_api::Writer;
 use curvine_tests::Testing;
 use orpc::runtime::RpcRuntime;
 use std::sync::Arc;

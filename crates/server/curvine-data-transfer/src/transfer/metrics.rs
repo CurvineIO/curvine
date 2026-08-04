@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::error::FsError;
-use curvine_common::FsResult;
+use curvine_error::FsError;
+use curvine_error::FsResult;
 use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics as m};
 use once_cell::sync::OnceCell;
 use std::collections::HashMap;

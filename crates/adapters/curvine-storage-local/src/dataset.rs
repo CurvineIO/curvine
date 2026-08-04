@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::BlockMeta;
-use curvine_common::state::ExtendedBlock;
+use curvine_model::ExtendedBlock;
 use orpc::common::ByteUnit;
 use orpc::{err_box, CommonResult};
 

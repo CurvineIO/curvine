@@ -21,4 +21,7 @@ pub mod message;
 pub mod server;
 pub mod test;
 
+mod rpc_utils;
+pub use self::rpc_utils::RpcUtils;
+
 pub use server::ServerConf;

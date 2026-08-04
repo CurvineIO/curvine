@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use curvine_client::file::{FsClient, FsContext, FsWriter};
-use curvine_common::conf::ClientConf;
-use curvine_common::fs::{Path, Writer};
-use curvine_common::state::{
+use curvine_config::ClientConf;
+use curvine_fs_api::{Path, Writer};
+use curvine_model::{
     CreateFileOptsBuilder, FileBlocks, MkdirOptsBuilder, SetAttrOptsBuilder, StoragePolicy,
     TtlAction,
 };

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use clap::Parser;
+use curvine_alloc as _;
 use curvine_fuse::cli::{
     run_list_config_flags, run_mount, run_validate_config, FuseCli, FuseSubcommand,
 };

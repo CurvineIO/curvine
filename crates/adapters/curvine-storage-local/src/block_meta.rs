@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::VfsDir;
-use curvine_common::state::{ExtendedBlock, StorageType};
+use curvine_model::{ExtendedBlock, StorageType};
 use orpc::common::FileUtils;
 use orpc::{err_box, sys, CommonResult};
 use std::fmt;

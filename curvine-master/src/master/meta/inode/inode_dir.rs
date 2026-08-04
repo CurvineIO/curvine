@@ -17,7 +17,7 @@ use crate::master::meta::inode::inodes_children::InodeChildren;
 use crate::master::meta::inode::{
     ChildrenIter, Inode, InodeFile, InodePtr, InodeView, EMPTY_PARENT_ID,
 };
-use curvine_common::state::{ListOptions, MkdirOpts, StoragePolicy, INTERNAL_CTIME_XATTR};
+use curvine_model::{ListOptions, MkdirOpts, StoragePolicy, INTERNAL_CTIME_XATTR};
 use glob::Pattern;
 use orpc::CommonResult;
 use serde::{Deserialize, Serialize};

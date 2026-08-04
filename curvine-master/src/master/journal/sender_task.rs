@@ -14,10 +14,10 @@
 
 use crate::master::journal::{JournalBatch, JournalEntry};
 use crate::master::{Master, MasterMetrics};
-use curvine_common::conf::JournalConf;
-use curvine_common::raft::RaftClient;
-use curvine_common::utils::SerdeUtils;
-use curvine_common::FsResult;
+use curvine_config::JournalConf;
+use curvine_error::FsResult;
+use curvine_raft::raft::RaftClient;
+use curvine_runtime::common::SerdeUtils;
 use orpc::common::{LocalTime, TimeSpent};
 use orpc::sync::channel::BlockingReceiver;
 use orpc::CommonResult;

@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::conf::ClientConf;
-use curvine_common::state::{
+use curvine_config::ClientConf;
+use curvine_error::FsResult;
+use curvine_model::{
     JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobInfo, LoadTaskInfo, MountInfo,
     WorkerAddress,
 };
-use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::{ByteUnit, FastHashMap, FastHashSet, LocalTime};
 use orpc::err_box;

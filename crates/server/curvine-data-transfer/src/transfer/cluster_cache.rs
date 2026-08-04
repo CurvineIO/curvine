@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use curvine_client_core::file::CurvineFileSystem;
-use curvine_common::error::FsError;
-use curvine_common::fs::Path;
-use curvine_common::state::{MountInfo, TransferKind, WorkerInfo};
-use curvine_common::FsResult;
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_fs_api::Path;
+use curvine_model::{MountInfo, TransferKind, WorkerInfo};
 use log::warn;
 use orpc::common::LocalTime;
 use orpc::runtime::RpcRuntime;

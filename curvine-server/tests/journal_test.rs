@@ -12,16 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::conf::ClusterConf;
-use curvine_common::fs::CurvineURI;
-use curvine_common::state::{
+use curvine_config::ClusterConf;
+use curvine_fs_api::CurvineURI;
+use curvine_model::{
     BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, MountOptions, OpenFlags,
     RenameFlags, WorkerInfo, WriteType,
 };
-use curvine_common::utils::SerdeUtils;
 use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData, SnapshotFileList};
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
 use curvine_raft::raft::{NodeId, RaftPeer};
+use curvine_runtime::common::SerdeUtils;
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::{
     JournalBatch, JournalEntry, JournalLoader, JournalSystem, UfsLoader,

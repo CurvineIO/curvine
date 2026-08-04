@@ -15,7 +15,7 @@
 use crate::master::meta::inode::ttl::ttl_bucket::TtlBucket;
 use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
 use crate::master::meta::inode::ttl::InodeTtlExecutor;
-use curvine_common::FsResult;
+use curvine_error::FsResult;
 use log::{debug, info, warn};
 use orpc::common::LocalTime;
 use std::sync::Arc;

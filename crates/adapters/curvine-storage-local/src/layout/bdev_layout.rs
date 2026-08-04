@@ -15,7 +15,7 @@
 use crate::layout::{validate_open_offset, BlockLayout};
 use crate::{BlockMeta, BlockState};
 use crate::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};
-use curvine_common::state::ExtendedBlock;
+use curvine_model::ExtendedBlock;
 use log::{info, warn};
 use orpc::io::IOResult;
 use orpc::{err_box, CommonResult};

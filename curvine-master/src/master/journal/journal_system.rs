@@ -23,11 +23,11 @@ use crate::master::{
     JobManager, MasterMonitor, MetaRaftJournal, MountManager, QuotaManager, SyncFsDir,
     SyncWorkerManager,
 };
-use curvine_common::conf::ClusterConf;
-use curvine_common::proto::raft::SnapshotData;
-use curvine_common::raft::storage::{AppStorage, LogStorage, RocksLogStorage};
-use curvine_common::raft::{RaftClient, RaftResult, RoleMonitor, RoleStateListener};
-use curvine_common::FsResult;
+use curvine_config::ClusterConf;
+use curvine_error::FsResult;
+use curvine_raft::proto::raft::SnapshotData;
+use curvine_raft::raft::storage::{AppStorage, LogStorage, RocksLogStorage};
+use curvine_raft::raft::{RaftClient, RaftResult, RoleMonitor, RoleStateListener};
 use orpc::common::FileUtils;
 use orpc::err_box;
 use orpc::runtime::{RpcRuntime, Runtime};
@@ -410,8 +410,8 @@ impl JournalSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use curvine_common::conf::{JournalConf, MasterConf};
-    use curvine_common::raft::RaftPeer;
+    use curvine_config::{JournalConf, MasterConf};
+    use curvine_raft::raft::RaftPeer;
     use orpc::common::Utils;
 
     fn non_format_master_conf(name: &str, multi_master: bool) -> ClusterConf {

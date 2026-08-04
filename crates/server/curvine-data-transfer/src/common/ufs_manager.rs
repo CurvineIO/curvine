@@ -14,11 +14,11 @@
 
 use crate::common::UfsClient;
 use curvine_client_core::file::FsClient;
-use curvine_common::conf::{UfsConf, UfsConfBuilder};
-use curvine_common::fs::{CurvineURI, Path};
-use curvine_common::state::MountInfo;
-use curvine_common::utils::ProtoUtils;
-use curvine_common::FsResult;
+use curvine_config::{UfsConf, UfsConfBuilder};
+use curvine_error::FsResult;
+use curvine_fs_api::{CurvineURI, Path};
+use curvine_model::MountInfo;
+use curvine_model::ProtoUtils;
 use curvine_ufs_api::fs::ufs_context::UFSContext;
 use log::info;
 use orpc::err_box;

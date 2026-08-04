@@ -37,7 +37,7 @@ cargo test --features opendal-hdfs,opendal-webhdfs -p curvine-ufs-opendal --test
 
 #[cfg(any(feature = "opendal-hdfs", feature = "opendal-webhdfs"))]
 mod hdfs_tests {
-    use curvine_common::fs::{FileSystem, Path, Reader, Writer};
+    use curvine_fs_api::{FileSystem, Path, Reader, Writer};
     use curvine_ufs_opendal::OpendalFileSystem;
     use std::collections::HashMap;
     use std::env;

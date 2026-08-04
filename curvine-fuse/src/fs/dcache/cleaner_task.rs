@@ -14,7 +14,7 @@
 
 use crate::fs::state::NodeState;
 use crate::{FuseError, FuseResult};
-use curvine_common::executor::ScheduledExecutor;
+use curvine_runtime::runtime::ScheduledExecutor;
 use orpc::runtime::LoopTask;
 use std::sync::{Arc, Weak};
 

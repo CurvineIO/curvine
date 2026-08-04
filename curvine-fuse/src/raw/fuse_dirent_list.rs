@@ -15,7 +15,7 @@
 use crate::raw::fuse_abi::{fuse_dirent, fuse_direntplus, fuse_entry_out, fuse_read_in};
 use crate::FuseUtils;
 use bytes::BytesMut;
-use curvine_common::state::FileStatus;
+use curvine_model::FileStatus;
 use orpc::sys::FFIUtils;
 use std::mem::size_of;
 

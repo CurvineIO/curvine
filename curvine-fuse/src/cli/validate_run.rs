@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::cli::FuseRuntimeArgs;
-use curvine_common::conf::FuseConf;
+use curvine_config::FuseConf;
 use orpc::CommonResult;
 use std::fs::read_to_string;
 

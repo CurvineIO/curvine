@@ -17,8 +17,8 @@ use crate::worker::storage::{
     BlockDataset, BlockLayout, BlockReadContext, BlockWriteContext, Dataset,
 };
 use crate::worker::Worker;
-use curvine_common::conf::ClusterConf;
-use curvine_common::state::{ExtendedBlock, StorageInfo};
+use curvine_config::ClusterConf;
+use curvine_model::{ExtendedBlock, StorageInfo};
 use orpc::CommonResult;
 use parking_lot::{Mutex, MutexGuard};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -325,7 +325,7 @@ mod tests {
     use super::*;
     use crate::worker::block::BlockState;
     use crate::worker::storage::{Dataset, FileLayout};
-    use curvine_common::conf::WorkerConf;
+    use curvine_config::WorkerConf;
     use orpc::common::FileUtils;
     use orpc::sys::DataSlice;
     use std::io::Write;

@@ -15,7 +15,7 @@
 use crate::{ActionType, BenchAction, BenchArgs};
 use bytes::BytesMut;
 use curvine_client::file::CurvineFileSystem;
-use curvine_common::fs::{Path, Reader, Writer};
+use curvine_fs_api::{Path, Reader, Writer};
 use orpc::common::{FileUtils, SpeedCounter, Utils};
 use orpc::io::LocalFile;
 use orpc::runtime::{JoinHandle, RpcRuntime, Runtime};

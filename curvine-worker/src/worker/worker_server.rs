@@ -18,9 +18,9 @@ use crate::worker::replication::worker_replication_handler::WorkerReplicationHan
 use crate::worker::replication::worker_replication_manager::WorkerReplicationManager;
 use crate::worker::task::TaskManager;
 use crate::worker::WorkerMetrics;
-use curvine_common::conf::ClusterConf;
-use curvine_common::state::{HeartbeatStatus, WorkerAddress};
+use curvine_config::ClusterConf;
 use curvine_fault::FaultHttpControl;
+use curvine_model::{HeartbeatStatus, WorkerAddress};
 #[cfg(feature = "spdk")]
 use curvine_storage_spdk::SpdkEnv;
 use curvine_web::server::{WebHandlerService, WebServer};
@@ -130,8 +130,8 @@ impl Worker {
         #[cfg(feature = "spdk")]
         if conf.worker.spdk_disk.enabled {
             conf.worker.spdk_disk.init()?;
-            use curvine_common::conf::WorkerDataDir;
-            use curvine_common::state::StorageType;
+            use curvine_config::WorkerDataDir;
+            use curvine_model::StorageType;
             use log::warn;
             info!("SPDK enabled — initializing global SPDK environment");
             match SpdkEnv::init_global(conf.worker.spdk_disk.clone()) {
@@ -197,11 +197,8 @@ impl Worker {
 
         CLUSTER_CONF.get_or_init(|| conf.clone());
         WORKER_METRICS.get_or_try_init(|| WorkerMetrics::new(service.store.clone()))?;
-        info!(
-            "allocator: {}",
-            curvine_common::alloc::allocator_type_name()
-        );
-        info!("git version: {}", curvine_common::version::GIT_VERSION);
+        info!("allocator: {}", curvine_alloc::allocator_type_name());
+        info!("git version: {}", curvine_sys::version::GIT_VERSION);
         conf.print();
 
         let block_store = service.store.clone();

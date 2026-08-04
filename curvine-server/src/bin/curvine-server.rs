@@ -13,10 +13,11 @@
 // limitations under the License.
 
 use clap::Parser;
-use curvine_common::conf::ClusterConf;
-use curvine_common::version;
+use curvine_alloc as _;
+use curvine_config::ClusterConf;
 use curvine_data_transfer::transfer::TransferServer;
 use curvine_master::master::Master;
+use curvine_sys::version;
 use curvine_worker::Worker;
 use orpc::common::{LocalTime, Utils};
 use orpc::{err_box, CommonResult};

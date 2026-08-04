@@ -3,67 +3,29 @@ name = "curvine-common"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "Thin compatibility facade re-exporting Curvine leaf crates (to be removed in Phase E)."
 
 [dependencies]
-orpc = { workspace = true }
+curvine-sys = { workspace = true }
+curvine-alloc = { workspace = true }
+curvine-rpc = { workspace = true }
+curvine-runtime = { workspace = true }
 curvine-fault = { workspace = true }
 curvine-error = { workspace = true }
 curvine-proto = { workspace = true }
 curvine-model = { workspace = true }
 curvine-fs-api = { workspace = true }
-curvine-storage-api = { workspace = true }
 curvine-config = { workspace = true }
 curvine-rocksdb = { workspace = true }
 curvine-raft = { workspace = true }
-tokio = { workspace = true }
-futures = { workspace = true }
-async-stream =  { workspace = true }
-bytes = { workspace = true }
-log = { workspace = true }
-prost = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+
+[dev-dependencies]
 clap = { workspace = true }
-toml = { workspace = true }
-once_cell = { workspace = true }
-regex = { workspace = true }
-indexmap = { workspace = true }
-num_enum = { workspace = true }
-hyper = { workspace = true }
-percent-encoding = "2.3"
+serde = { workspace = true }
+curvine-core-error = { workspace = true }
+prost = { workspace = true }
 bincode = { workspace = true }
-thiserror = { workspace = true }
-crc32fast = { workspace = true }
-flate2 = { workspace = true }
-dashmap = { workspace = true }
-linked-hash-map = { workspace = true }
-crossbeam = { workspace = true }
-mini-moka = { workspace = true }
-slog = { workspace = true }
-slog-stdlog  = { workspace = true }
-chrono = { workspace = true }
-trait-variant = { workspace = true }
-
-anyhow = { workspace = true }
-tracing = { workspace = true }
-bitflags = { workspace = true }
-
-# Enumerate network interface addresses (getifaddrs) to resolve the local IPv4
-# from a named interface such as `eth0`. `net` feature adds the ifaddrs API.
-nix = { workspace = true, features = ["net"] }
-
-mimalloc = { workspace = true, optional = true }
-
-[target.'cfg(unix)'.dependencies]
-tikv-jemallocator = { workspace = true, optional = true }
-
-[features]
-jemalloc = ["dep:tikv-jemallocator"]
-mimalloc = ["dep:mimalloc"]
-system = []
-
+toml = { workspace = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

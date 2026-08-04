@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use once_cell::sync::OnceCell;
 
-use curvine_common::conf::ClusterConf;
+use curvine_config::ClusterConf;
 use curvine_fault::FaultHttpControl;
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::{error, info};
@@ -172,11 +172,8 @@ impl Master {
         let fault_http = FaultHttpControl::from_env(&conf.fault_injection)
             .map_err(|error| CommonError::from(error.to_string()))?;
         let metrics = MASTER_METRICS.get_or_try_init(MasterMetrics::new)?;
-        info!(
-            "allocator: {}",
-            curvine_common::alloc::allocator_type_name()
-        );
-        info!("git version: {}", curvine_common::version::GIT_VERSION);
+        info!("allocator: {}", curvine_alloc::allocator_type_name());
+        info!("git version: {}", curvine_sys::version::GIT_VERSION);
         conf.print();
 
         // step1: Create a journal system, the journal system determines how to create a fs dir.

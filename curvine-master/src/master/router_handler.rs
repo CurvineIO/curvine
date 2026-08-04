@@ -20,10 +20,10 @@ use axum::routing::get;
 use axum::{Extension, Json, Router};
 use serde_json::{json, Value};
 
-use curvine_common::conf::ClusterConf;
-use curvine_common::state::{FileBlocks, FileStatus, WorkerInfo};
-use curvine_common::FsResult;
+use curvine_config::ClusterConf;
+use curvine_error::FsResult;
 use curvine_fault::FaultHttpControl;
+use curvine_model::{FileBlocks, FileStatus, WorkerInfo};
 use curvine_web::router::RouterHandler;
 use orpc::common::LocalTime;
 use orpc::err_box;

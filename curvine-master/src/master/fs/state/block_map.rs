@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::master::fs::DeleteResult;
-use curvine_common::state::{DeleteBlockCmd, WorkerCommand};
+use curvine_model::{DeleteBlockCmd, WorkerCommand};
 use std::collections::{HashMap, HashSet};
 
 // Manage all blocks in the cluster

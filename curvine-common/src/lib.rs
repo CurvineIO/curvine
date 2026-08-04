@@ -12,17 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod alloc;
+pub mod alloc {
+    pub use curvine_alloc::*;
+}
 pub mod conf;
 pub mod error;
-pub mod executor;
+pub mod executor {
+    pub use curvine_runtime::runtime::ScheduledExecutor;
+}
 pub mod fs;
 pub use curvine_raft::raft;
 pub mod rocksdb;
 pub mod state;
 pub mod transfer;
 pub mod utils;
-pub mod version;
+pub mod version {
+    pub use curvine_sys::version::*;
+}
 
 pub mod proto {
     pub use curvine_proto::*;
@@ -31,6 +37,5 @@ pub mod proto {
 }
 
 pub use curvine_error::{FsError, FsResult, MAX_FILE_SIZE};
+pub use curvine_fs_api::FILE_BUFFER_SIZE;
 pub use curvine_model::UFS_INODE_ID;
-
-pub const FILE_BUFFER_SIZE: usize = 128 * 1024;

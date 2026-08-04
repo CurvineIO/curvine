@@ -24,12 +24,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use curvine_client::file::CurvineFileSystem;
-use curvine_common::conf::ClusterConf;
-use curvine_common::error::FsError;
-use curvine_common::fs::{Path as CurvinePath, Reader, Writer};
-use curvine_common::state::{
-    FileLock, FileStatus, LockFlags, LockType, SetAttrOpts, SetAttrOptsBuilder,
-};
+use curvine_config::ClusterConf;
+use curvine_error::FsError;
+use curvine_fs_api::{Path as CurvinePath, Reader, Writer};
+use curvine_model::{FileLock, FileStatus, LockFlags, LockType, SetAttrOpts, SetAttrOptsBuilder};
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
 use lance_core::error::Result;

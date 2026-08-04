@@ -17,8 +17,8 @@ use crate::master::replication::master_replication_manager::MasterReplicationMan
 use crate::master::Master;
 use crate::worker::Worker;
 use curvine_client_core::file::CurvineFileSystem;
-use curvine_common::conf::ClusterConf;
-use curvine_common::FsResult;
+use curvine_config::ClusterConf;
+use curvine_error::FsResult;
 use curvine_raft::raft::{NodeId, RaftPeer};
 use dashmap::DashMap;
 use log::info;

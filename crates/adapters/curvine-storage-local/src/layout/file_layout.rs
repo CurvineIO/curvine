@@ -15,7 +15,7 @@
 use crate::layout::{validate_open_offset, BlockLayout};
 use crate::{BlockMeta, BlockState};
 use crate::{BlockReadContext, BlockWriteContext, VfsDir};
-use curvine_common::state::ExtendedBlock;
+use curvine_model::ExtendedBlock;
 #[cfg(test)]
 use orpc::common::ByteUnit;
 use orpc::common::FileUtils;

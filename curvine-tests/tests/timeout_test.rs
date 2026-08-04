@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use curvine_client::file::CurvineFileSystem;
-use curvine_common::fs::{Path, Writer};
+use curvine_fs_api::{Path, Writer};
 use curvine_tests::Testing;
 use log::info;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};

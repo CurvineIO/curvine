@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use curvine_client::file::{FsClient, FsContext};
-use curvine_common::fs::CurvineURI;
-use curvine_common::state::MountOptions;
+use curvine_fs_api::CurvineURI;
+use curvine_model::MountOptions;
 use curvine_server::common::ufs_manager::UfsManager;
 use curvine_tests::Testing;
 use log::info;

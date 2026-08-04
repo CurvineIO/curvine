@@ -19,10 +19,10 @@ use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::{
     Inode, InodeDir, InodeFile, InodePtr, PATH_SEPARATOR, ROOT_INODE_ID,
 };
-use curvine_common::state::{
+use curvine_model::{
     FileStatus, FileType, SetAttrOpts, StoragePolicy, TtlAction, INTERNAL_CTIME_XATTR,
 };
-use curvine_common::utils::SerdeUtils;
+use curvine_runtime::common::SerdeUtils;
 use orpc::common::{LocalTime, Utils};
 use orpc::{err_box, CommonResult};
 use serde::{Deserialize, Serialize};

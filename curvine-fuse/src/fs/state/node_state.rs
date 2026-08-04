@@ -27,14 +27,15 @@ use crate::{
     FUSE_ROOT_ID, STATE_FILE_MAGIC, STATE_FILE_VERSION,
 };
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::conf::{ClientConf, FuseConf};
-use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, ListStream, Path, StateReader, StateWriter};
-use curvine_common::state::{
+use curvine_config::ClusterConf;
+use curvine_config::{ClientConf, FuseConf};
+use curvine_error::FsError;
+use curvine_fs_api::{FileSystem, ListStream, Path};
+use curvine_fs_api::{StateReader, StateWriter};
+use curvine_model::{
     CreateFileOpts, FileAllocOpts, FileStatus, ListOptions, MkdirOpts, OpenFlags, RenameFlags,
     SetAttrOpts,
 };
-use curvine_config::ClusterConf;
 use futures::stream::{self, StreamExt};
 use log::{debug, error, info, warn};
 use orpc::common::FastHashMap;
@@ -1287,14 +1288,15 @@ mod test {
     use curvine_client::unified::UnifiedFileSystem;
     #[cfg(target_os = "linux")]
     use curvine_client::unified::UnifiedWriter;
-    use curvine_common::conf::ClusterConf;
-    use curvine_common::error::FsError;
+    use curvine_config::ClusterConf;
+    use curvine_error::FsError;
     #[cfg(target_os = "linux")]
-    use curvine_common::fs::local::LocalWriter;
+    use curvine_fs_api::local::LocalWriter;
     #[cfg(target_os = "linux")]
-    use curvine_common::fs::Writer;
-    use curvine_common::fs::{ListStream, Path, StateReader, StateWriter};
-    use curvine_common::state::FileStatus;
+    use curvine_fs_api::Writer;
+    use curvine_fs_api::{ListStream, Path};
+    use curvine_fs_api::{StateReader, StateWriter};
+    use curvine_model::FileStatus;
     use orpc::common::{FastHashMap, Utils};
     use orpc::runtime::{AsyncRuntime, RpcRuntime};
     use std::sync::Arc;

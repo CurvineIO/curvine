@@ -18,8 +18,8 @@ use crate::{
     StorageRequest, StorageVersion, VfsDir, VfsMetaStore,
 };
 use crate::{BlockMeta, BlockState};
-use curvine_common::conf::{ClusterConf, WorkerDataDir};
-use curvine_common::state::{ExtendedBlock, StorageInfo, StorageType};
+use curvine_config::{ClusterConf, WorkerDataDir};
+use curvine_model::{ExtendedBlock, StorageInfo, StorageType};
 use indexmap::map::Values;
 use log::info;
 use orpc::common::{ByteUnit, FileUtils, LocalTime, TimeSpent};
@@ -716,8 +716,8 @@ mod test {
     use crate::{
         Dataset, DirList, DirState, FileLayout, SpdkMetaStore, StorageVersion, VfsDataset, VfsDir,
     };
-    use curvine_common::conf::{ClusterConf, WorkerConf};
-    use curvine_common::state::{ExtendedBlock, FileType, StorageType};
+    use curvine_config::{ClusterConf, WorkerConf};
+    use curvine_model::{ExtendedBlock, FileType, StorageType};
     use orpc::common::FileUtils;
     use orpc::sync::AtomicLong;
     use orpc::sys::FsStats;

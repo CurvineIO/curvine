@@ -12,16 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::error::FsError;
-use curvine_common::fs::RpcCode;
-use curvine_common::proto::{
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_fs_api::RpcCode;
+use curvine_model::TransferState;
+use curvine_proto::{
     CancelTransferRequest, CancelTransferResponse, GetTransferStatusRequest,
     GetTransferStatusResponse, ListTransferTenantsRequest, ListTransfersRequest,
     RetryTransferRequest, SubmitTransferRequest, SubmitTransferResponse, TransferTaskReportRequest,
     TransferTaskReportResponse, WatchTransferRequest, WatchTransferResponse,
 };
-use curvine_common::state::TransferState;
-use curvine_common::FsResult;
 use orpc::handler::MessageHandler;
 use orpc::message::{Builder, Message};
 

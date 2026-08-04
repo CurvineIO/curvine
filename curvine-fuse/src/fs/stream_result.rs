@@ -14,7 +14,7 @@
 
 use crate::fuse_error::{errno_of, FuseError};
 use crate::session::FuseResponse;
-use curvine_common::FsResult;
+use curvine_error::FsResult;
 use log::warn;
 use orpc::sync::channel::CallSender;
 
@@ -70,8 +70,8 @@ pub(crate) async fn deliver_stream_result(
 #[cfg(test)]
 mod tests {
     use super::deliver_stream_result;
-    use curvine_common::error::FsError;
-    use curvine_common::FsResult;
+    use curvine_error::FsError;
+    use curvine_error::FsResult;
     use orpc::sync::channel::CallChannel;
 
     // reply=None uses tx as the only channel back, so preserve the backend result.

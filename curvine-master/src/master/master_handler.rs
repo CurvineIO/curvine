@@ -18,17 +18,17 @@ use crate::master::replication::master_replication_handler::MasterReplicationHan
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::MountManager;
 use crate::master::{Master, MasterMetrics, RpcContext};
-use curvine_common::conf::ClusterConf;
-use curvine_common::error::FsError;
-use curvine_common::fs::Path;
-use curvine_common::fs::RpcCode;
-use curvine_common::proto::*;
-use curvine_common::state::{
+use curvine_config::ClusterConf;
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_fs_api::Path;
+use curvine_fs_api::RpcCode;
+use curvine_model::ProtoUtils;
+use curvine_model::{
     CreateFileOpts, DeleteBlockCmd, FileBlocks, FileStatus, FreeResult, HeartbeatStatus,
     ListOptions, MasterInfo, OpenFlags, RenameFlags, WorkerCommand, WorkerInfo,
 };
-use curvine_common::utils::ProtoUtils;
-use curvine_common::FsResult;
+use curvine_proto::*;
 use orpc::err_box;
 use orpc::handler::MessageHandler;
 use orpc::io::net::ConnState;
@@ -567,7 +567,7 @@ impl MasterHandler {
             address,
             weight,
             header.worker_session_id.unwrap_or_default(),
-            curvine_common::state::TransferWorkerCapabilities {
+            curvine_model::TransferWorkerCapabilities {
                 task_submit: header.transfer_task_submit.unwrap_or(false),
                 report_target: header.transfer_report_target.unwrap_or(false),
                 query_task: header.transfer_query_task.unwrap_or(false),
@@ -998,7 +998,7 @@ impl MessageHandler for MasterHandler {
 mod tests {
     use super::*;
     use crate::master::journal::JournalSystem;
-    use curvine_common::state::WorkerAddress;
+    use curvine_model::WorkerAddress;
     use orpc::common::Utils;
 
     #[test]

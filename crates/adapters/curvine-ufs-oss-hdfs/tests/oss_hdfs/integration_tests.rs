@@ -15,8 +15,8 @@
 #[cfg(feature = "oss-hdfs")]
 mod tests {
     use super::super::test_utils::{create_test_conf, create_test_path, get_test_bucket};
-    use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-    use curvine_common::state::SetAttrOpts;
+    use curvine_fs_api::{FileSystem, Path, Reader, Writer};
+    use curvine_model::SetAttrOpts;
     use curvine_ufs_oss_hdfs::OssHdfsFileSystem;
     use curvine_ufs_api::OssHdfsConf;
     use orpc::sys::DataSlice;

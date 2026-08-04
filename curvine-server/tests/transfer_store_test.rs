@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::state::{TransferJobRecord, TransferKind, TransferProgress, TransferState};
+use curvine_model::{TransferJobRecord, TransferKind, TransferProgress, TransferState};
 use curvine_server::transfer::{SqliteTransferStore, TransferStore};
 
 fn transfer_job(id: &str, target_path: &str) -> TransferJobRecord {

@@ -16,6 +16,7 @@
 #![recursion_limit = "256"]
 
 use crate::raw::fuse_abi::{fuse_in_header, fuse_out_header};
+use curvine_alloc as _;
 use once_cell::sync::Lazy;
 
 pub mod cli;

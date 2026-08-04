@@ -14,10 +14,10 @@
 
 use crate::worker::block::{BlockStore, MasterClient};
 use crate::worker::storage::Dataset;
-use curvine_common::error::FsError;
-use curvine_common::state::{BlockReportInfo, HeartbeatStatus, WorkerCommand};
-use curvine_common::utils::ProtoUtils;
-use curvine_common::FsResult;
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_model::ProtoUtils;
+use curvine_model::{BlockReportInfo, HeartbeatStatus, WorkerCommand};
 use dashmap::DashMap;
 use log::{error, warn};
 use orpc::runtime::{GroupExecutor, LoopTask};

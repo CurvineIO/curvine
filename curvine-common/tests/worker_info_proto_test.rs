@@ -1,5 +1,5 @@
 use curvine_common::state::WorkerInfo;
-use curvine_common::utils::ProtoUtils;
+use curvine_model::ProtoUtils;
 
 #[test]
 fn worker_info_proto_preserves_weight() {

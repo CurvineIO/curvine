@@ -1,12 +1,10 @@
 #![cfg(feature = "spdk")]
 mod common;
-use curvine_common::conf::ClusterConf;
-use curvine_common::fs::RpcCode;
-use curvine_common::proto::{
-    BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,
-};
-use curvine_common::state::{ExtendedBlock, FileType, StorageType};
-use curvine_common::utils::ProtoUtils;
+use curvine_config::ClusterConf;
+use curvine_fs_api::RpcCode;
+use curvine_model::ProtoUtils;
+use curvine_model::{ExtendedBlock, FileType, StorageType};
+use curvine_proto::{BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse};
 use curvine_server::worker::Worker;
 use orpc::common::Utils;
 use orpc::io::net::NetUtils;

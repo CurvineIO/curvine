@@ -22,7 +22,7 @@ use crate::master::quota::eviction::types::EvictPlan;
 use crate::master::quota::eviction::EvictionConf;
 use crate::master::quota::eviction::EvictionMode;
 use crate::master::Master;
-use curvine_common::state::MasterInfo;
+use curvine_model::MasterInfo;
 use orpc::runtime::{RpcRuntime, Runtime};
 use parking_lot::RwLock;
 use tokio::sync::mpsc;

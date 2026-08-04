@@ -14,10 +14,10 @@
 
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::RpcContext;
-use curvine_common::error::FsError;
-use curvine_common::fs::RpcCode;
-use curvine_common::proto::{ReportBlockReplicationRequest, ReportBlockReplicationResponse};
-use curvine_common::FsResult;
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_fs_api::RpcCode;
+use curvine_proto::{ReportBlockReplicationRequest, ReportBlockReplicationResponse};
 use log::warn;
 use orpc::error::ErrorImpl;
 use orpc::handler::MessageHandler;

@@ -14,9 +14,9 @@
 
 use bytes::BytesMut;
 use curvine_client::file::CurvineFileSystem;
-use curvine_common::conf::ClusterConf;
-use curvine_common::fs::{Path, Reader, Writer};
-use curvine_common::state::{BlockLocation, CreateFileOptsBuilder, FileBlocks, WorkerAddress};
+use curvine_config::ClusterConf;
+use curvine_fs_api::{Path, Reader, Writer};
+use curvine_model::{BlockLocation, CreateFileOptsBuilder, FileBlocks, WorkerAddress};
 use curvine_tests::Testing;
 use log::info;
 use orpc::common::Utils;

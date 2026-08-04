@@ -14,8 +14,8 @@
 
 use crate::master::fs::MasterFilesystem;
 use crate::master::{Master, MasterMetrics};
-use curvine_common::error::FsError;
-use curvine_common::FsResult;
+use curvine_error::FsError;
+use curvine_error::FsResult;
 use log::{error, warn};
 use orpc::common::{LocalTime, TimeSpent};
 use orpc::runtime::LoopTask;
@@ -143,8 +143,8 @@ mod tests {
     use super::*;
     use crate::master::journal::JournalSystem;
     use crate::master::Master;
-    use curvine_common::conf::{ClusterConf, JournalConf, MasterConf};
-    use curvine_common::raft::RoleState;
+    use curvine_config::{ClusterConf, JournalConf, MasterConf};
+    use curvine_raft::raft::RoleState;
     use orpc::common::Utils;
 
     fn test_fs(name: &str) -> MasterFilesystem {

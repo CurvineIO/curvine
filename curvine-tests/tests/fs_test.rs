@@ -15,14 +15,14 @@
 use bytes::BytesMut;
 use curvine_client::file::{CurvineFileSystem, FsContext};
 use curvine_client::ClientMetrics;
-use curvine_common::conf::ClusterConf;
-use curvine_common::fs::{Path, Reader, Writer};
-use curvine_common::state::{
+use curvine_config::ClusterConf;
+use curvine_error::FsResult;
+use curvine_fs_api::{Path, Reader, Writer};
+use curvine_model::{
     CreateFileOptsBuilder, ListOptions, MkdirOptsBuilder, SetAttrOptsBuilder, StorageState,
     TtlAction,
 };
-use curvine_common::state::{FileLock, LockFlags, LockType};
-use curvine_common::FsResult;
+use curvine_model::{FileLock, LockFlags, LockType};
 use curvine_tests::Testing;
 use futures::stream::StreamExt;
 use log::info;
