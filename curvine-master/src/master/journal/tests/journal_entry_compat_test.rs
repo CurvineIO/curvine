@@ -27,6 +27,7 @@ struct LegacyRenameEntry {
 }
 
 #[derive(Serialize)]
+#[allow(dead_code)]
 enum LegacyJournalEntry {
     Mkdir(MkdirEntry),
     CreateFile(CreateFileEntry),
