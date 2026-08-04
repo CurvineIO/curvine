@@ -61,7 +61,7 @@ impl ReadOpenMode {
 }
 
 impl BlockReaderLocal {
-    pub(crate) async fn new(
+    pub(crate) async fn open(
         fs_context: Arc<FsContext>,
         block: ExtendedBlock,
         addr: WorkerAddress,

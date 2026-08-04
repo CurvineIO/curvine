@@ -184,7 +184,7 @@ impl BlockReader {
             let short_circuit = short_circuit && fs_context.is_local_worker(loc);
             let res: FsResult<ReaderAdapter> = {
                 if short_circuit {
-                    match BlockReaderLocal::new(
+                    match BlockReaderLocal::open(
                         fs_context.clone(),
                         block.clone(),
                         loc.clone(),
