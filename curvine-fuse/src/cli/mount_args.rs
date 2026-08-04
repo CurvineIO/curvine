@@ -335,7 +335,6 @@ impl FuseMountArgs {
             vec![
                 "allow_other".to_string(),
                 "async".to_string(),
-                "direct_io".to_string(),
                 "big_write".to_string(),
                 "max_write=131072".to_string(),
             ]
