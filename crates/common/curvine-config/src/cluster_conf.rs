@@ -150,9 +150,16 @@ impl ClusterConf {
         conf.transfer.init()?;
 
         if conf.client.master_addrs.is_empty() {
-            for peer in &mut conf.journal.journal_addrs {
-                let node = InetAddr::new(&peer.hostname, conf.master.rpc_port);
-                conf.client.master_addrs.push(node);
+            if conf.journal.journal_addrs.is_empty() {
+                conf.client
+                    .master_addrs
+                    .push(InetAddr::new(&conf.master.hostname, conf.master.rpc_port));
+            } else {
+                for peer in &conf.journal.journal_addrs {
+                    conf.client
+                        .master_addrs
+                        .push(InetAddr::new(&peer.hostname, conf.master.rpc_port));
+                }
             }
         }
 
@@ -179,8 +186,7 @@ impl ClusterConf {
                 return err_box!(
                     "net_interface '{}' resolved journal address to '{}', which is not found in \
                      journal_addrs [{}]. When using net_interface, each node's entry in \
-                     journal_addrs must use the exact IPv4 that the interface resolves to. \
-                     (underlying error: Not a master role, address {})",
+                     journal_addrs must use the exact IPv4 that the interface resolves to.",
                     self.net_interface,
                     local,
                     self.journal
@@ -188,8 +194,7 @@ impl ClusterConf {
                         .iter()
                         .map(|peer| format!("{}:{}", peer.hostname, peer.port))
                         .collect::<Vec<_>>()
-                        .join(", "),
-                    local
+                        .join(", ")
                 );
             }
             return Ok(());
@@ -357,7 +362,9 @@ impl ClusterConf {
     }
 
     pub fn print(&self) {
-        let conf = self.to_pretty_toml().unwrap();
+        let conf = self
+            .to_pretty_toml()
+            .unwrap_or_else(|_| "<invalid>".to_string());
         // Allocator / git version logging stays in server entrypoints so
         // curvine-config does not depend on curvine-common alloc/version helpers.
         info!("cluster conf start: \n{}\n", conf);
