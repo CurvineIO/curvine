@@ -22,7 +22,7 @@ use curvine_proto::{LoadState, LoadTaskRequest, LoadTasResponse, LoadTaskReportR
 use curvine_server::master::load::{LoadJob, LoadJobState, LoadManager, MasterFsInterface};
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::worker::load::{LoadTask, LoadTaskState, WorkerLoadHandler};
-use curvine_ufs::fs::curvine_uri::CurvineURI;
+use curvine_ufs_api::fs::curvine_uri::CurvineURI;
 
 // Simulate the Master file system interface
 struct MockMasterFsInterface;

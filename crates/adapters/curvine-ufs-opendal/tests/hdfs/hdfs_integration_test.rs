@@ -57,7 +57,7 @@ mod hdfs_tests {
         println!("Testing JVM initialization...");
         #[cfg(feature = "jni")]
         {
-            use curvine_common::jvm::{is_jvm_available, load_jvm_memory_stats, register_jvm, JVM};
+            use curvine_hdfs_jni::jni::{is_jvm_available, load_jvm_memory_stats, register_jvm, JVM};
 
             // Register JVM builder first - exactly like
             register_jvm();

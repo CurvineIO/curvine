@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use clap::Parser;
-use curvine_common::conf::{ClientConf, ClientConfCliOverrides};
+use curvine_config::{ClientConf, ClientConfCliOverrides};
 
 #[derive(Debug, Parser)]
 struct CliHarness {

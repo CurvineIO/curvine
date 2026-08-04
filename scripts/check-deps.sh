@@ -120,6 +120,21 @@ $facade_deps" final
   fi
 }
 
+check_facade_packages_absent() {
+  local present
+  present="$(
+    jq -r '.packages[] | select(.source == null) | .name' <<<"$metadata" \
+      | grep -E '^(orpc|curvine-common)$' || true
+  )"
+
+  if [[ -n "$present" ]]; then
+    record_violation "facade-packages-absent" "workspace still contains removed facade packages:
+$present" final
+  else
+    record_ok "facade-packages-absent"
+  fi
+}
+
 check_testing_harness_reverse_deps() {
   local testing_normal_deps
   testing_normal_deps="$(
@@ -175,36 +190,27 @@ check_tree_forbidden() {
 }
 
 check_mixed_spdk_feature_risk() {
-  local output
+  # After orpc removal, SPDK lives on curvine-storage-spdk / curvine-worker.
+  # Enabling server SPDK in a workspace that also builds CLI must not pull
+  # curvine-storage-spdk into the CLI package tree via feature unification.
+  local packages
   local err
   err="$(mktemp)"
 
-  if output="$(
+  if packages="$(
     cargo tree \
       --no-default-features \
       --features curvine-server/spdk-rdma,curvine-alloc/system \
       -p curvine-cli \
-      -p curvine-server \
-      -e features \
+      -e normal \
       --prefix none \
-      -f '{p} {f}' 2>"$err"
+      -f '{p}' 2>"$err" \
+      | awk '{print $1}' \
+      | sed '/^$/d' \
+      | sort -u
   )"; then
-    if awk '
-      $1 == "orpc" {
-        features = $0
-        sub(/^orpc v[^ ]+ /, "", features)
-        sub(/^\([^)]*\) /, "", features)
-        count = split(features, values, ",")
-        for (i = 1; i <= count; i++) {
-          gsub(/^[[:space:]]+|[[:space:]]+$/, "", values[i])
-          if (values[i] == "spdk" || values[i] == "spdk-rdma") {
-            found = 1
-          }
-        }
-      }
-      END { exit found ? 0 : 1 }
-    ' <<<"$output"; then
-      record_violation "mixed-spdk-feature-risk" "server spdk-rdma feature still enables SPDK features on shared orpc during a mixed CLI/server cargo tree" ci
+    if grep -qx 'curvine-storage-spdk' <<<"$packages"; then
+      record_violation "mixed-spdk-feature-risk" "server spdk-rdma feature pulls curvine-storage-spdk into the CLI dependency tree" ci
     else
       record_ok "mixed-spdk-feature-risk"
     fi
@@ -226,6 +232,7 @@ echo "Dependency boundary check mode: $MODE"
 echo
 
 check_facade_direct_deps
+check_facade_packages_absent
 check_testing_harness_reverse_deps
 check_tree_forbidden "curvine-client-core-final-tree" "$common_client_forbidden" ci -p curvine-client-core
 check_tree_forbidden "curvine-cli-final-tree" "$common_client_forbidden" ci -p curvine-cli --no-default-features

@@ -2107,30 +2107,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "curvine-common"
-version = "0.2.0"
-dependencies = [
- "bincode",
- "clap",
- "curvine-alloc",
- "curvine-config",
- "curvine-core-error",
- "curvine-error",
- "curvine-fault",
- "curvine-fs-api",
- "curvine-model",
- "curvine-proto",
- "curvine-raft",
- "curvine-rocksdb",
- "curvine-rpc",
- "curvine-runtime",
- "curvine-sys",
- "prost 0.11.9",
- "serde",
- "toml",
-]
-
-[[package]]
 name = "curvine-common-macros"
 version = "0.2.0"
 dependencies = [
@@ -7034,54 +7010,6 @@ checksum = "49203cdcae0030493bad186b28da2fa25645fa276a51b6fec8010d281e02ef79"
 dependencies = [
  "dlv-list",
  "hashbrown 0.14.5",
-]
-
-[[package]]
-name = "orpc"
-version = "0.2.0"
-dependencies = [
- "bincode",
- "bytes",
- "chrono",
- "crc32fast",
- "crossbeam",
- "curvine-core-error",
- "curvine-io",
- "curvine-metrics",
- "curvine-net",
- "curvine-rpc",
- "curvine-runtime",
- "curvine-sys",
- "dashmap 5.5.3",
- "fs2",
- "futures",
- "fxhash",
- "libc",
- "log",
- "md-5",
- "mini-moka",
- "moka",
- "murmur3",
- "nix",
- "num_enum",
- "once_cell",
- "parking_lot",
- "pin-project-lite",
- "prost 0.11.9",
- "rand 0.8.5",
- "rolling-file",
- "serde",
- "socket2 0.5.10",
- "sysinfo",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "toml",
- "tracing",
- "tracing-appender",
- "tracing-log",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

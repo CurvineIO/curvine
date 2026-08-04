@@ -57,7 +57,7 @@ mod mount_integration_tests {
         // Initialize JVM
         #[cfg(feature = "jni")]
         {
-            use curvine_common::jvm::{register_jvm, JVM};
+            use curvine_hdfs_jni::jni::{register_jvm, JVM};
             register_jvm();
             JVM.get_or_init().expect("Failed to initialize JVM");
             println!("JVM initialized for mount integration");
@@ -216,7 +216,7 @@ mod mount_integration_tests {
         // Initialize JVM
         #[cfg(feature = "jni")]
         {
-            use curvine_common::jvm::{register_jvm, JVM};
+            use curvine_hdfs_jni::jni::{register_jvm, JVM};
             register_jvm();
             JVM.get_or_init().expect("Failed to initialize JVM");
         }
@@ -384,7 +384,7 @@ mod mount_integration_tests {
         // Initialize JVM
         #[cfg(feature = "jni")]
         {
-            use curvine_common::jvm::{register_jvm, JVM};
+            use curvine_hdfs_jni::jni::{register_jvm, JVM};
             register_jvm();
             JVM.get_or_init().expect("Failed to initialize JVM");
         }

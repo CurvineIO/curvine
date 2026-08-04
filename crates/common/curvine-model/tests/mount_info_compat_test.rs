@@ -1,4 +1,4 @@
-use curvine_common::state::{AccessMode, MountInfo, Provider, StorageType, TtlAction, WriteType};
+use curvine_model::{AccessMode, MountInfo, Provider, StorageType, TtlAction, WriteType};
 use serde::Serialize;
 use std::collections::HashMap;
 

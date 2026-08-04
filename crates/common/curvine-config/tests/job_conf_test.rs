@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::conf::JobConf;
+use curvine_config::JobConf;
 
 #[test]
 fn default_master_load_job_runtime_conf_is_valid() {

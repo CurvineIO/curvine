@@ -17,3 +17,6 @@ serde_json = { workspace = true, optional = true }
 [features]
 default = []
 axum-response = ["dep:axum", "dep:serde_json"]
+
+[dev-dependencies]
+curvine-core-error = { workspace = true }

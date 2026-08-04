@@ -10,7 +10,6 @@ panic = "abort"
 resolver = "2"
 
 members = [
-    "orpc",
     "crates/core/curvine-fault",
     "crates/core/curvine-metrics",
     "crates/common/curvine-error",
@@ -38,7 +37,6 @@ members = [
     "crates/server/curvine-data-transfer",
     "curvine-master",
     "curvine-worker",
-    "curvine-common",
     "curvine-server",
     "crates/client/curvine-client-core",
     "crates/client/curvine-job-client",
@@ -65,7 +63,6 @@ members = [
 # curvine-tests stays opt-in because it pulls whole-cluster integration,
 # FUSE, and optional external storage dependencies for explicit test runs.
 default-members = [
-    "orpc",
     "crates/core/curvine-fault",
     "crates/core/curvine-metrics",
     "crates/common/curvine-error",
@@ -88,7 +85,6 @@ default-members = [
     "crates/server/curvine-data-transfer",
     "curvine-master",
     "curvine-worker",
-    "curvine-common",
     "curvine-server",
     "crates/client/curvine-client-core",
     "crates/client/curvine-job-client",
@@ -109,7 +105,6 @@ edition = "2021"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-orpc = { path = "orpc" }
 curvine-core-error = { path = "crates/core/error" }
 curvine-runtime = { path = "crates/core/runtime" }
 curvine-net = { path = "crates/core/net" }
@@ -134,7 +129,6 @@ curvine-fs-api = { path = "crates/common/curvine-fs-api" }
 curvine-storage-api = { path = "crates/common/curvine-storage-api" }
 curvine-ufs-api = { path = "crates/common/curvine-ufs-api" }
 curvine-config = { path = "crates/common/curvine-config" }
-curvine-common = { path = "curvine-common" }
 curvine-common-macros = { path = "crates/common/curvine-macros" }
 curvine-master = { path = "curvine-master" }
 curvine-worker = { path = "curvine-worker" }
