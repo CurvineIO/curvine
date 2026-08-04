@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_fs_api::{ListStream, Path};
 use curvine_model::FileStatus;
 use futures::StreamExt;
-use orpc::err_box;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::future::Future;
@@ -148,7 +148,7 @@ mod tests {
     use crate::FuseError;
     use curvine_fs_api::{ListStream, Path};
     use curvine_model::FileStatus;
-    use orpc::runtime::{AsyncRuntime, RpcRuntime};
+    use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
     use std::cell::Cell;
     use std::sync::Arc;
 

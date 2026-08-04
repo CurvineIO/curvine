@@ -15,10 +15,10 @@
 use crate::worker::block::BlockStore;
 use crate::worker::handler::BlockHandler::{BatchWriter, Reader, Writer};
 use crate::worker::handler::{BatchWriteHandler, ReadHandler, WriteHandler};
+use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsResult;
 use curvine_fs_api::RpcCode;
-use orpc::message::Message;
-use orpc::{err_box, CommonResult};
+use curvine_rpc::message::Message;
 
 pub enum BlockHandler {
     Writer(WriteHandler),

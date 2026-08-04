@@ -14,6 +14,7 @@
 
 use crate::worker::block::{BlockMeta, BlockState};
 use curvine_client_core::file::{FsClient, FsContext};
+use curvine_core_error::CommonResult;
 use curvine_fs_api::RpcCode;
 use curvine_model::ProtoUtils;
 use curvine_model::{
@@ -21,7 +22,6 @@ use curvine_model::{
 };
 use curvine_proto::*;
 use curvine_sys::version;
-use orpc::CommonResult;
 use std::sync::Arc;
 
 //Worker and master communicate with the customer client.

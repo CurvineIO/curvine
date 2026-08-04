@@ -16,9 +16,9 @@ use crate::fs::FileSystem;
 use crate::session::FuseMnt;
 use crate::{FuseResult, FuseUtils, FUSE_BUFFER_HEADER_SIZE};
 use curvine_config::FuseConf;
-use orpc::runtime::Runtime;
-use orpc::sync::channel::AsyncChannel;
-use orpc::sync::FastDashMap;
+use curvine_runtime::runtime::Runtime;
+use curvine_runtime::sync::channel::AsyncChannel;
+use curvine_runtime::sync::FastDashMap;
 use std::sync::Arc;
 
 mod fuse_receiver;

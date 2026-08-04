@@ -47,7 +47,7 @@ fn sqlite_target_conflict_treats_wildcards_as_path_characters() {
     let db_path = std::env::temp_dir().join(format!(
         "curvine-transfer-store-{}-{}.db",
         std::process::id(),
-        orpc::common::LocalTime::mills()
+        curvine_runtime::common::LocalTime::mills()
     ));
     let store = SqliteTransferStore::open(&db_path).unwrap();
 
@@ -70,7 +70,7 @@ fn sqlite_target_conflict_does_not_treat_candidate_parent_as_like_pattern() {
     let db_path = std::env::temp_dir().join(format!(
         "curvine-transfer-store-wildcard-parent-{}-{}.db",
         std::process::id(),
-        orpc::common::LocalTime::mills()
+        curvine_runtime::common::LocalTime::mills()
     ));
     let store = SqliteTransferStore::open(&db_path).unwrap();
 
@@ -90,7 +90,7 @@ fn sqlite_request_id_cannot_be_reused_for_a_different_command() {
     let db_path = std::env::temp_dir().join(format!(
         "curvine-transfer-store-request-id-{}-{}.db",
         std::process::id(),
-        orpc::common::LocalTime::mills()
+        curvine_runtime::common::LocalTime::mills()
     ));
     let store = SqliteTransferStore::open(&db_path).unwrap();
     let job = transfer_job("request-id", "/cache/first");

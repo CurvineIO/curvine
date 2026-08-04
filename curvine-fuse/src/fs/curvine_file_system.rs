@@ -30,6 +30,7 @@ use crate::{err_fuse, FuseResult, FuseUtils};
 use bytes::BytesMut;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_config::{ClusterConf, FuseConf};
+use curvine_core_error::try_option;
 use curvine_error::FsError;
 use curvine_error::MAX_FILE_SIZE;
 use curvine_fs_api::{FileSystem, Path, RpcCode};
@@ -38,11 +39,11 @@ use curvine_model::{
     is_special_file_type, FileAllocMode, FileAllocOpts, FileLock, FileStatus, FileType, LockFlags,
     LockType, OpenFlags, RenameFlags, SetAttrOpts,
 };
+use curvine_runtime::common::{ByteUnit, TimeSpent};
+use curvine_runtime::runtime::Runtime;
+use curvine_sys as sys;
+use curvine_sys::FFIUtils;
 use log::{debug, info, warn};
-use orpc::common::{ByteUnit, TimeSpent};
-use orpc::runtime::Runtime;
-use orpc::sys::FFIUtils;
-use orpc::{sys, try_option};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::Arc;
@@ -2993,7 +2994,7 @@ mod tests {
         use crate::fs::state::DirHandle;
         use curvine_fs_api::{ListStream, Path};
         use curvine_model::FileStatus;
-        use orpc::runtime::{AsyncRuntime, RpcRuntime};
+        use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 
         fn entries(names: &[&str]) -> Vec<FileStatus> {
             names

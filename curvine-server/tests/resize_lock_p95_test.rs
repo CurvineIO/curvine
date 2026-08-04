@@ -1,10 +1,10 @@
 use curvine_config::{ClusterConf, MasterConf};
 use curvine_model::{FileAllocOpts, WorkerInfo};
 use curvine_raft::conf::JournalConf;
+use curvine_runtime::common::Utils;
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::JournalSystem;
 use curvine_server::master::Master;
-use orpc::common::Utils;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};

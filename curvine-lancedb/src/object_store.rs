@@ -27,7 +27,9 @@ use curvine_client::file::CurvineFileSystem;
 use curvine_config::ClusterConf;
 use curvine_error::FsError;
 use curvine_fs_api::{Path as CurvinePath, Reader, Writer};
+use curvine_io::DataSlice;
 use curvine_model::{FileLock, FileStatus, LockFlags, LockType, SetAttrOpts, SetAttrOptsBuilder};
+use curvine_net::net::InetAddr;
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
 use lance_core::error::Result;
@@ -46,8 +48,6 @@ use object_store::{
     PutOptions, PutPayload, PutResult, Result as OsResult, UploadPart,
 };
 use once_cell::sync::Lazy;
-use orpc::io::net::InetAddr;
-use orpc::sys::DataSlice;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration, Instant};
 use url::Url;

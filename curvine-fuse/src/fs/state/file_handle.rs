@@ -18,10 +18,10 @@ use crate::fs::state::NodeState;
 use crate::fs::{FuseReader, FuseWriter};
 use crate::session::FuseResponse;
 use crate::{err_fuse, FuseResult};
+use curvine_core_error::err_box;
 use curvine_fs_api::{StateReader, StateWriter};
 use curvine_model::{FileAllocOpts, FileStatus, LockFlags};
-use orpc::err_box;
-use orpc::sys::RawPtr;
+use curvine_sys::RawPtr;
 use std::sync::Arc;
 
 pub enum FileHandle {

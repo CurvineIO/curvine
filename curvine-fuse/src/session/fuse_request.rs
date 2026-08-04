@@ -22,7 +22,7 @@ use crate::session::FuseOpCode::{self, *};
 use crate::FuseResult;
 use crate::{FUSE_INIT_EXT, FUSE_IN_HEADER_LEN};
 use bytes::Bytes;
-use orpc::{err_box, CommonResult};
+use curvine_core_error::{err_box, CommonResult};
 use std::fmt::{Display, Formatter};
 
 // fuse request data

@@ -21,10 +21,12 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{Path, Reader};
 use curvine_model::FileStatus;
+use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use curvine_runtime::sync::channel::{
+    AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender,
+};
+use curvine_runtime::sync::ErrorMonitor;
 use log::{error, warn};
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
-use orpc::sync::ErrorMonitor;
 use std::sync::Arc;
 
 enum ReadTask {
@@ -184,8 +186,8 @@ mod tests {
     use curvine_client::unified::UnifiedReader;
     use curvine_fs_api::local::LocalReader;
     use curvine_metrics::Metrics as m;
-    use orpc::runtime::AsyncRuntime;
-    use orpc::sync::channel::AsyncChannel;
+    use curvine_runtime::runtime::AsyncRuntime;
+    use curvine_runtime::sync::channel::AsyncChannel;
     use std::io::Write as _;
 
     fn metrics_reply(rt: &AsyncRuntime) -> FuseResponse {

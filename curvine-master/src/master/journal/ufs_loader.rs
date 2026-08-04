@@ -17,14 +17,14 @@ use crate::master::journal::{
 };
 use crate::master::JobManager;
 use curvine_config::JournalConf;
+use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::{JobTaskState, LoadJobCommand};
+use curvine_runtime::common::DurationUnit;
 use curvine_unified_fs::MountValue;
 use log::{info, warn};
-use orpc::common::DurationUnit;
-use orpc::{err_box, CommonResult};
 use std::sync::Arc;
 use std::time::Duration;
 

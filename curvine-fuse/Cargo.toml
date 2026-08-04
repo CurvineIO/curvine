@@ -7,9 +7,11 @@ license.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+curvine-core-error = { workspace = true }
+curvine-io = { workspace = true }
+curvine-net = { workspace = true }
 curvine-model = { workspace = true }
 curvine-error = { workspace = true }
-orpc = { workspace = true}
 curvine-sys = { workspace = true }
 curvine-alloc = { workspace = true }
 curvine-runtime = { workspace = true }

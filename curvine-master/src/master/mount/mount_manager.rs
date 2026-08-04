@@ -16,13 +16,13 @@
 use crate::master::fs::MasterFilesystem;
 use crate::master::mount::MountTable;
 use crate::master::{self, SyncFsDir};
+use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{self, CurvineURI, Path};
 use curvine_model::{MkdirOpts, MountInfo, MountOptions};
 use curvine_ufs_api::S3Conf;
 use log::info;
-use orpc::err_box;
 
 pub struct MountManager {
     master_fs: MasterFilesystem,

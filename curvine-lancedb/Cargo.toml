@@ -21,6 +21,8 @@ name = "lancedb"
 path = "src/lib.rs"
 
 [dependencies]
+curvine-io = { workspace = true }
+curvine-net = { workspace = true }
 curvine-model = { workspace = true }
 curvine-fs-api = { workspace = true }
 curvine-error = { workspace = true }
@@ -40,7 +42,6 @@ lancedb_upstream = { package = "lancedb", version = "0.27.2", default-features =
 md-5 = { workspace = true }
 once_cell = { workspace = true }
 object_store = "0.12.5"
-orpc = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }

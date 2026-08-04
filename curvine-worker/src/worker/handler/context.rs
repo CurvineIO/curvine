@@ -16,7 +16,7 @@ use curvine_error::FsResult;
 use curvine_model::ExtendedBlock;
 use curvine_model::ProtoUtils;
 use curvine_proto::{BlockReadRequest, BlockWriteRequest};
-use orpc::message::Message;
+use curvine_rpc::message::Message;
 
 #[derive(Debug)]
 pub struct WriteContext {

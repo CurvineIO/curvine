@@ -23,14 +23,14 @@ use bytes::BytesMut;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_config::FuseConf;
 use curvine_fs_api::Path;
+use curvine_io::IOResult;
 use curvine_model::{
     CreateFileOpts, CreateFileOptsBuilder, FileStatus, FileType, MkdirOpts, MkdirOptsBuilder,
     SetAttrOpts, FS_APPEND_FL, FS_IMMUTABLE_FL, IFLAGS_XATTR, MKNOD_RDEV_XATTR,
 };
-use orpc::common::LocalTime;
-use orpc::io::IOResult;
-use orpc::sys;
-use orpc::sys::{FFIUtils, RawIO};
+use curvine_runtime::common::LocalTime;
+use curvine_sys as sys;
+use curvine_sys::{FFIUtils, RawIO};
 use std::collections::HashMap;
 use std::process::Command;
 use std::slice;

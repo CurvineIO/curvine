@@ -19,11 +19,11 @@ use crate::raw::fuse_mount_pure;
 use crate::raw::fuse_umount_pure;
 use crate::{FuseUtils, FUSE_CLONE_FD_MIN_VERSION, UNIX_KERNEL_VERSION};
 use curvine_config::FuseConf;
+use curvine_io::IOResult;
+use curvine_sys as sys;
+use curvine_sys::pipe::{AsyncFd, BorrowedFd, OwnedFd};
+use curvine_sys::{CString, RawIO};
 use log::{debug, error, info};
-use orpc::io::IOResult;
-use orpc::sys;
-use orpc::sys::pipe::{AsyncFd, BorrowedFd, OwnedFd};
-use orpc::sys::{CString, RawIO};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 

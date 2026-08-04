@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::master::fs::policy::{ChooseContext, RobinWorkerPolicy, WorkerPolicy};
+use curvine_core_error::{err_box, CommonResult};
 use curvine_model::{WorkerAddress, WorkerInfo};
 use indexmap::IndexMap;
-use orpc::{err_box, CommonResult};
 
 /// Local workers are preferred, and polling policies are used if there are no local workers
 pub struct LocalWorkerPolicy {

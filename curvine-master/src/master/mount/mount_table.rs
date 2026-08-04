@@ -14,11 +14,11 @@
 
 use crate::master::SyncFsDir;
 use curvine_config::{UfsConf, UfsConfBuilder};
+use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
 use curvine_model::{MountInfo, MountOptions};
 use log::{info, warn};
-use orpc::err_box;
 use rand::Rng;
 use std::collections::HashMap;
 use std::convert::Into;

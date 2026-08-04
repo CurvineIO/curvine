@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use curvine_raft::raft::RoleState;
+use curvine_runtime::sync::StateCtl;
 use num_enum::{FromPrimitive, IntoPrimitive};
-use orpc::sync::StateCtl;
 
 // master state controller
 #[repr(i8)]

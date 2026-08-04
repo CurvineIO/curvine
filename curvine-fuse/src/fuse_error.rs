@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_core_error::CommonError;
 use curvine_error::FsError;
-use orpc::io::IOError;
-use orpc::CommonError;
+use curvine_io::IOError;
 use std::fmt;
 use std::fmt::Debug;
 use tokio::time::error::Elapsed;

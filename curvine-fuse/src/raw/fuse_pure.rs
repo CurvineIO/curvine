@@ -13,11 +13,10 @@
 // limitations under the License.
 
 use curvine_config::FuseConf;
+use curvine_io::{IOError, IOResult};
+use curvine_sys::RawIO;
 use log::{error, info};
 use nix::unistd::{getgid, getuid};
-use orpc::err_io;
-use orpc::io::IOResult;
-use orpc::sys::RawIO;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::ErrorKind;
@@ -27,7 +26,7 @@ use std::path::Path;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 
-use orpc::sys::open;
+use curvine_sys::open;
 
 const FUSERMOUNT_BIN: &str = "fusermount";
 const FUSERMOUNT3_BIN: &str = "fusermount3";
@@ -108,7 +107,10 @@ pub fn fuse_mount_pure(mnt: &Path, conf: &FuseConf) -> IOResult<RawIO> {
         Ok(fd) => Ok(fd),
         Err(e) => {
             error!("fuse mount sys failed; path {:?}, err {:?}", mnt, e);
-            err_io!(-1)
+            Err(IOError::with_ctx(
+                std::io::Error::last_os_error(),
+                format!("({}:{})", file!(), line!()),
+            ))
         }
     }
 }

@@ -23,14 +23,15 @@ use crate::raw::fuse_abi::fuse_out_header;
 use crate::session::{FuseOpCode, FuseRequest, FuseResponse, FuseTask};
 use crate::{err_fuse, FuseResult, FUSE_IN_HEADER_LEN};
 use bytes::BytesMut;
+use curvine_core_error::{err_box, try_option_ref};
+use curvine_io::IOResult;
+use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use curvine_runtime::sync::channel::AsyncSender;
+use curvine_runtime::sync::FastDashMap;
+use curvine_sys as sys;
+use curvine_sys::pipe::{AsyncFd, Pipe2, PipeFd};
 use libc::{EAGAIN, ECONNABORTED, EINTR, ENODEV, ENOENT};
 use log::{debug, error, info, warn};
-use orpc::io::IOResult;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sync::channel::AsyncSender;
-use orpc::sync::FastDashMap;
-use orpc::sys::pipe::{AsyncFd, Pipe2, PipeFd};
-use orpc::{err_box, sys, try_option_ref};
 use std::sync::Arc;
 use tokio::sync::{watch, Notify};
 
@@ -732,12 +733,12 @@ mod tests {
     use crate::fs::TestFileSystem;
     use crate::fuse_metrics::{RECEIVE_ACTION_CONTINUE, RECEIVE_ACTION_EXIT};
     use bytes::BytesMut;
+    use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+    use curvine_runtime::sync::channel::AsyncChannel;
+    use curvine_runtime::sync::FastDashMap;
+    use curvine_sys as sys;
+    use curvine_sys::pipe::{AsyncFd, OwnedFd};
     use libc::{EAGAIN, ECONNABORTED, EINTR, EIO, ENODEV, ENOENT};
-    use orpc::runtime::{AsyncRuntime, RpcRuntime};
-    use orpc::sync::channel::AsyncChannel;
-    use orpc::sync::FastDashMap;
-    use orpc::sys;
-    use orpc::sys::pipe::{AsyncFd, OwnedFd};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::{watch, Notify};
@@ -872,8 +873,8 @@ mod tests {
         use bytes::{BufMut, BytesMut};
         use curvine_config::FuseConf;
         use curvine_metrics::Metrics as m;
-        use orpc::sync::channel::{AsyncChannel, AsyncReceiver};
-        use orpc::sync::FastDashMap;
+        use curvine_runtime::sync::channel::{AsyncChannel, AsyncReceiver};
+        use curvine_runtime::sync::FastDashMap;
 
         // Each test uses a DISTINCT opcode: they run in parallel and assert deltas
         // on the shared process-global registry, so a shared opcode would make the
@@ -1484,8 +1485,8 @@ mod tests {
         use crate::session::{FuseRequest, FuseResponse};
         use crate::FuseUtils;
         use bytes::{BufMut, BytesMut};
-        use orpc::runtime::{AsyncRuntime, RpcRuntime};
-        use orpc::sync::channel::AsyncChannel;
+        use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+        use curvine_runtime::sync::channel::AsyncChannel;
         use std::sync::Arc;
 
         const OP_READ: u32 = 15;
@@ -1776,8 +1777,8 @@ mod tests {
         use crate::session::{FuseRequest, FuseResponse, FuseTask};
         use crate::{FuseResult, FuseUtils};
         use bytes::{BufMut, BytesMut};
-        use orpc::runtime::{AsyncRuntime, RpcRuntime};
-        use orpc::sync::channel::AsyncChannel;
+        use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+        use curvine_runtime::sync::channel::AsyncChannel;
         use std::sync::Arc;
 
         const OP_READ: u32 = 15;
