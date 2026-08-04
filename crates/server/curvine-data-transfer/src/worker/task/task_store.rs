@@ -16,7 +16,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use curvine_model::LoadTaskInfo;
-use orpc::sync::FastDashMap;
+use curvine_runtime::sync::FastDashMap;
 
 use crate::worker::task::TaskContext;
 

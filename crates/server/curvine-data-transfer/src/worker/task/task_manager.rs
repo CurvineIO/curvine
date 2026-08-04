@@ -20,9 +20,9 @@ use curvine_config::ClusterConf;
 use curvine_error::FsResult;
 use curvine_job_client::TransferClient;
 use curvine_model::{JobTaskProgress, JobTaskState, LoadTaskInfo, TransferTaskReportInfo};
+use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use dashmap::mapref::entry::Entry;
 use log::{debug, info, warn};
-use orpc::runtime::{RpcRuntime, Runtime};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 

@@ -18,9 +18,9 @@ use curvine_error::FsResult;
 use curvine_fs_api::RpcCode;
 use curvine_model::{JobTaskType, LoadTaskInfo};
 use curvine_proto::*;
+use curvine_rpc::client::RpcClient;
 use curvine_rpc::RpcUtils;
 use curvine_runtime::common::SerdeUtils;
-use orpc::client::RpcClient;
 use prost::Message as PMessage;
 
 #[derive(Clone)]

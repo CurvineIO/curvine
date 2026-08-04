@@ -22,8 +22,8 @@ use curvine_proto::{
     RetryTransferRequest, SubmitTransferRequest, SubmitTransferResponse, TransferTaskReportRequest,
     TransferTaskReportResponse, WatchTransferRequest, WatchTransferResponse,
 };
-use orpc::handler::MessageHandler;
-use orpc::message::{Builder, Message};
+use curvine_rpc::handler::MessageHandler;
+use curvine_rpc::message::{Builder, Message};
 
 use crate::transfer::{progress_to_proto, task_summary_to_proto, TransferService, TransferStore};
 

@@ -420,8 +420,8 @@ impl TransferMetrics {
             self.cluster_snapshot_version.set(version as i64);
         }
         if let Some(updated_at_ms) = updated_at_ms {
-            let staleness_ms =
-                orpc::common::LocalTime::mills().saturating_sub(updated_at_ms.max(0) as u64);
+            let staleness_ms = curvine_runtime::common::LocalTime::mills()
+                .saturating_sub(updated_at_ms.max(0) as u64);
             self.cluster_snapshot_staleness_ms.set(staleness_ms as i64);
         }
         if let Some(live_workers) = live_workers {

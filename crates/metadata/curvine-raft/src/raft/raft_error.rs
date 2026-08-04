@@ -14,11 +14,11 @@
 
 use self::RaftError::*;
 use crate::raft::{NodeId, RaftGroup};
+use curvine_core_error::CommonError;
+use curvine_core_error::{ErrorDecoder, ErrorExt, ErrorImpl, StringError};
+use curvine_io::IOError;
 use curvine_rocksdb::Error;
 use num_enum::{FromPrimitive, IntoPrimitive};
-use orpc::error::{ErrorDecoder, ErrorExt, ErrorImpl, StringError};
-use orpc::io::IOError;
-use orpc::CommonError;
 use prost::bytes::BytesMut;
 use prost::DecodeError;
 use std::io;

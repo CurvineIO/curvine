@@ -30,8 +30,8 @@ use curvine_proto::{
     TransferProgressProto, TransferTaskReportRequest, TransferTaskStateProto,
     TransferTaskStatusProto, TransferTaskSummaryProto, TransferTenantSummaryProto,
 };
+use curvine_runtime::common::LocalTime;
 use curvine_runtime::common::SerdeUtils;
-use orpc::common::LocalTime;
 use std::time::Duration;
 use uuid::Uuid;
 

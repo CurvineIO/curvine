@@ -865,7 +865,7 @@ fn init_schema(conn: &mut PooledConn) -> FsResult<()> {
         )",
     )
     .map_err(mysql_err)?;
-    let now_ms = orpc::common::LocalTime::mills();
+    let now_ms = curvine_runtime::common::LocalTime::mills();
     conn.exec_drop(
         "insert ignore into transfer_schema_version(id, version, updated_at)
          values (1, :version, :updated_at)",

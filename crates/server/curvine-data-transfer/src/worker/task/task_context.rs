@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use curvine_model::{JobTaskProgress, JobTaskState, LoadTaskInfo};
-use orpc::common::LocalTime;
-use orpc::sync::StateCtl;
+use curvine_runtime::common::LocalTime;
+use curvine_runtime::sync::StateCtl;
 
 pub struct TaskContext {
     pub info: LoadTaskInfo,

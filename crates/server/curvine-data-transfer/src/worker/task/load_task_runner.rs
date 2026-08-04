@@ -15,6 +15,7 @@
 use crate::common::UfsFactory;
 use crate::worker::task::TaskContext;
 use curvine_client_core::file::{CurvineFileSystem, FsReader};
+use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path, Reader, Writer};
@@ -25,10 +26,9 @@ use curvine_model::{
     CreateFileOptsBuilder, FileBlocks, FileStatus, JobTaskProgress, JobTaskState,
     SetAttrOptsBuilder, TRANSFER_TEMP_PATH_MARKER,
 };
+use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_unified_fs::{UfsFileSystem, UnifiedReader, UnifiedWriter};
 use log::{debug, error, info, warn};
-use orpc::common::{LocalTime, TimeSpent};
-use orpc::err_box;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -806,8 +806,8 @@ fn xattr_equals(status: &FileStatus, key: &str, expected: &[u8]) -> bool {
 mod tests {
     use super::rename_ufs_output;
     use curvine_fs_api::Path;
+    use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
     use curvine_unified_fs::UfsFileSystem;
-    use orpc::runtime::{AsyncRuntime, RpcRuntime};
     use std::collections::HashMap;
     use std::fs;
 
@@ -816,7 +816,7 @@ mod tests {
         let base_dir = std::env::temp_dir().join(format!(
             "transfer-ufs-commit-{}-{}",
             std::process::id(),
-            orpc::common::LocalTime::mills()
+            curvine_runtime::common::LocalTime::mills()
         ));
         fs::create_dir_all(&base_dir).unwrap();
         let target = Path::from_str(format!("file://{}/target.txt", base_dir.display())).unwrap();

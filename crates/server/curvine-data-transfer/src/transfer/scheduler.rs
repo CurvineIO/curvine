@@ -25,10 +25,10 @@ use curvine_model::{
     TransferLease, TransferProgress, TransferState, TransferStateUpdate, TransferTaskRecord,
     TransferTaskReport, TransferTaskReportInfo, TransferTaskState, WorkerInfo,
 };
+use curvine_runtime::common::LocalTime;
+use curvine_runtime::runtime::RpcRuntime;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use log::{debug, error, info, warn};
-use orpc::common::LocalTime;
-use orpc::runtime::RpcRuntime;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -94,7 +94,7 @@ where
         }
     }
 
-    pub fn start(self, rt: Arc<orpc::runtime::Runtime>, stop: Arc<AtomicBool>) {
+    pub fn start(self, rt: Arc<curvine_runtime::runtime::Runtime>, stop: Arc<AtomicBool>) {
         let workers = self.conf.scheduler_workers();
         for index in 0..workers {
             let scheduler = self.clone();
