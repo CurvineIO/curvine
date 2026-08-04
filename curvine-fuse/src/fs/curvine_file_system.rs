@@ -964,13 +964,17 @@ impl CurvineFileSystem {
     ///    `FUSE_WRITEBACK_CACHE` (when `write_back_cache`) and `FUSE_SPLICE_*` (when
     ///    `enable_splice` — splice drives the fuse fd directly, so it is advertised
     ///    on config alone).
-    fn negotiate_out_flags(kernel_flags: u32, write_back_cache: bool, enable_splice: bool) -> u32 {
+    fn negotiate_out_flags(kernel_flags: u32, conf: &FuseConf) -> u32 {
         let mut out = SUPPORTED_INIT_FLAGS & kernel_flags;
-        if write_back_cache {
+        if conf.write_back_cache {
             out |= FUSE_WRITEBACK_CACHE;
+        } else {
+            out &= !FUSE_WRITEBACK_CACHE;
         }
-        if enable_splice {
+        if conf.enable_splice {
             out |= FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE | FUSE_SPLICE_READ;
+        } else {
+            out &= !(FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE | FUSE_SPLICE_READ);
         }
         out
     }
@@ -1019,11 +1023,7 @@ impl fs::FileSystem for CurvineFileSystem {
         }
 
         // Negotiate only daemon-supported, kernel-offered, config-gated caps.
-        let out_flags = Self::negotiate_out_flags(
-            op.arg.flags,
-            self.conf.write_back_cache,
-            self.conf.enable_splice,
-        );
+        let out_flags = Self::negotiate_out_flags(op.arg.flags, &self.conf);
 
         let max_write = FuseUtils::get_fuse_buf_size() - FUSE_BUFFER_HEADER_SIZE;
         let page_size = sys::get_pagesize()?;
@@ -2278,6 +2278,7 @@ mod tests {
         FATTR_ATIME_NOW, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_UID,
         FUSE_INIT_EXT,
     };
+    use curvine_common::conf::FuseConf;
     use curvine_model::{FileAllocMode, FileStatus, FileType, INTERNAL_CTIME_XATTR};
 
     #[test]
@@ -2828,24 +2829,25 @@ mod tests {
         assert_eq!(encoded, b"user.visible\0");
     }
 
-    // The daemon must never advertise FUSE_ATOMIC_O_TRUNC (open does not truncate)
-    // or any other unsupported capability, even when the kernel offers it. The
-    // allowlist mask drops them.
-    //
-    // FUSE_EXPORT_SUPPORT is included here (dropped even when offered): its `.`/`..`
-    // reconstruction relies on root `.`/`..` lookups that currently return ENOENT,
-    // so the daemon must not advertise it. Not advertising it leaves the kernel's
-    // `fc->export_support` unset, so the kernel never issues the root `.`/`..` LOOKUP.
+    fn init_conf(write_back_cache: bool, enable_splice: bool) -> FuseConf {
+        let mut conf = FuseConf::default();
+        conf.write_back_cache = write_back_cache;
+        conf.enable_splice = enable_splice;
+        conf
+    }
+
     #[test]
     fn negotiate_out_flags_drops_unsupported_kernel_caps() {
         let unsupported = FUSE_ATOMIC_O_TRUNC
             | FUSE_POSIX_ACL
             | FUSE_HAS_IOCTL_DIR
             | FUSE_EXPORT_SUPPORT
-            | (1u32 << 30);
-        let out = CurvineFileSystem::negotiate_out_flags(unsupported, false, false);
+            | FUSE_INIT_EXT;
+        let conf = init_conf(false, false);
+        let out = CurvineFileSystem::negotiate_out_flags(unsupported, &conf);
         assert_eq!(
-            out, 0,
+            out & unsupported,
+            0,
             "no unsupported kernel-offered bit may be advertised"
         );
     }
@@ -2862,58 +2864,62 @@ mod tests {
 
     #[test]
     fn negotiate_out_flags_passes_through_supported_caps() {
-        let out = CurvineFileSystem::negotiate_out_flags(SUPPORTED_INIT_FLAGS, false, false);
+        let conf = init_conf(false, false);
+        let out = CurvineFileSystem::negotiate_out_flags(SUPPORTED_INIT_FLAGS, &conf);
+        let splice = FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE | FUSE_SPLICE_READ;
         assert_eq!(
-            out, SUPPORTED_INIT_FLAGS,
-            "all supported+offered caps survive"
+            out,
+            SUPPORTED_INIT_FLAGS & !splice,
+            "all supported caps survive; splice stays off without config"
         );
         assert_eq!(out & FUSE_POSIX_LOCKS, FUSE_POSIX_LOCKS);
         assert_eq!(out & FUSE_FLOCK_LOCKS, FUSE_FLOCK_LOCKS);
         assert_eq!(out & FUSE_DO_READDIRPLUS, FUSE_DO_READDIRPLUS);
     }
 
-    // A supported cap the kernel did NOT offer must not be advertised (no
-    // phantom capabilities).
     #[test]
     fn negotiate_out_flags_no_phantom_when_kernel_offers_nothing() {
-        let out = CurvineFileSystem::negotiate_out_flags(0, false, false);
-        assert_eq!(out, 0);
+        let conf = init_conf(false, false);
+        let out = CurvineFileSystem::negotiate_out_flags(0, &conf);
+        assert_eq!(out, 0, "no phantom cap when the kernel offers nothing");
         assert_eq!(out & FUSE_MAX_PAGES, 0);
         assert_eq!(out & FUSE_POSIX_LOCKS, 0);
     }
 
-    // WRITEBACK is a config-gated daemon-requested cap: present iff write_back,
-    // absent otherwise even when the kernel offers it.
     #[test]
     fn negotiate_out_flags_writeback_is_config_gated() {
-        let on = CurvineFileSystem::negotiate_out_flags(0, true, false);
+        let on = CurvineFileSystem::negotiate_out_flags(0, &init_conf(true, false));
         assert_eq!(on & FUSE_WRITEBACK_CACHE, FUSE_WRITEBACK_CACHE);
-        let off = CurvineFileSystem::negotiate_out_flags(FUSE_WRITEBACK_CACHE, false, false);
+        let off =
+            CurvineFileSystem::negotiate_out_flags(FUSE_WRITEBACK_CACHE, &init_conf(false, false));
         assert_eq!(off & FUSE_WRITEBACK_CACHE, 0);
     }
 
-    // SPLICE is config-gated and forced (not masked by the kernel offer, since
-    // the channel drives splice(2) directly).
     #[test]
     fn negotiate_out_flags_splice_is_config_gated() {
         let splice = FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE | FUSE_SPLICE_READ;
-        let on = CurvineFileSystem::negotiate_out_flags(0, false, true);
+        let on = CurvineFileSystem::negotiate_out_flags(0, &init_conf(false, true));
         assert_eq!(
             on & splice,
             splice,
             "splice advertised on config even if kernel omits it"
         );
-        let off = CurvineFileSystem::negotiate_out_flags(splice, false, false);
+        let off = CurvineFileSystem::negotiate_out_flags(splice, &init_conf(false, false));
         assert_eq!(off & splice, 0, "splice not advertised when disabled");
     }
 
-    // Containment: output never contains a bit outside the allowed universe,
-    // regardless of what the kernel offers.
     #[test]
     fn negotiate_out_flags_containment() {
         let splice = FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE | FUSE_SPLICE_READ;
-        let allowed = SUPPORTED_INIT_FLAGS | splice | FUSE_WRITEBACK_CACHE;
-        let out = CurvineFileSystem::negotiate_out_flags(0xFFFF_FFFF, true, true);
+        let unsafe_bits = FUSE_ATOMIC_O_TRUNC
+            | FUSE_POSIX_ACL
+            | FUSE_HAS_IOCTL_DIR
+            | FUSE_EXPORT_SUPPORT
+            | FUSE_INIT_EXT;
+        let allowed =
+            SUPPORTED_INIT_FLAGS | splice | FUSE_WRITEBACK_CACHE | (u32::MAX & !unsafe_bits);
+        let conf = init_conf(true, true);
+        let out = CurvineFileSystem::negotiate_out_flags(u32::MAX, &conf);
         assert_eq!(out & !allowed, 0, "no bit outside the allowed universe");
     }
 
