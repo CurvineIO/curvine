@@ -597,12 +597,17 @@ impl NodeState {
     }
 
     pub fn has_open_handles(&self, ino: u64) -> bool {
-        let lock = self.handles.read();
-        if let Some(map) = lock.get(&ino) {
-            !map.is_empty()
-        } else {
-            false
+        // Both OPEN and OPENDIR handles keep the inode addressable until their
+        // corresponding RELEASE/RELEASEDIR request.
+        {
+            let lock = self.handles.read();
+            if lock.get(&ino).is_some_and(|map| !map.is_empty()) {
+                return true;
+            }
         }
+
+        let lock = self.dir_handles.read();
+        lock.get(&ino).is_some_and(|map| !map.is_empty())
     }
 
     pub fn clear_mark_delete(&self, ino: u64) -> FuseResult<()> {
@@ -1382,6 +1387,49 @@ mod test {
         assert!(NodeState::map_remove_handle(&mut map, 2, 21).1);
         assert!(map.get(&2).is_none());
         assert!(!NodeState::map_remove_handle(&mut map, 2, 99).1);
+    }
+
+    #[test]
+    fn clear_keeps_expired_inode_until_directory_handle_is_released() {
+        crate::FuseMetrics::ensure_init().unwrap();
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.node_cache_ttl = std::time::Duration::from_secs(60);
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+        let ino = {
+            let mut tree = state.dir_write();
+            let ino = tree
+                .lookup(
+                    FUSE_ROOT_ID,
+                    "d",
+                    FileStatus::with_name(2, "d".to_string(), true),
+                    true,
+                )
+                .unwrap()
+                .ino;
+            tree.forget(ino, 1).unwrap();
+            tree.get_inode_mut(ino, None).unwrap().last_access = 0;
+            ino
+        };
+
+        {
+            let mut handles = state.dir_handles.write();
+            NodeState::insert_dir_handle_locked(&mut handles, ino, 20, dir_handle(ino, 20));
+        }
+
+        state.clear().unwrap();
+        assert!(
+            state.dir_read().get_inode(ino, None::<&str>).is_some(),
+            "an open directory handle must keep an expired inode addressable"
+        );
+
+        state.remove_dir_handle(ino, 20).unwrap();
+        state.clear().unwrap();
+        assert!(
+            state.dir_read().get_inode(ino, None::<&str>).is_none(),
+            "the expired inode should be evicted after its directory handle is released"
+        );
     }
 
     #[test]

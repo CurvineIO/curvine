@@ -1112,8 +1112,8 @@ mod test {
         assert!(t.get_inode(dst, None).is_none());
     }
 
-    /// `clear` evicts expired inodes but skips: open handles, not yet TTL-expired entries,
-    /// dirs with cached children, root.
+    /// `clear` evicts expired inodes only after the kernel lookup reference is released,
+    /// while still skipping open handles, fresh entries, directories with cached children, and root.
     #[test]
     fn clear_evicts_expired_inodes_and_respects_all_constraints() {
         use std::time::Duration;
@@ -1124,7 +1124,7 @@ mod test {
         };
         let mut t = DirTree::new(conf);
 
-        // Case 1: expired, ref_ctr=0, no handles → should be evicted
+        // Case 1: expired, ref_ctr=0, but n_lookup=1 → kept until FORGET
         // Simulates unlinked file (ref_ctr=0) while kernel still holds dentry (n_lookup=1):
         // should_unref() false, no FORGET yet, inode still in dcache.
         let f1 = t
@@ -1143,12 +1143,12 @@ mod test {
             .ino;
         // Do not zero last_access: clear() does not consult ref_ctr; expiry is last_access-based.
 
-        // Case 3: expired, ref_ctr=0, but open handle → not evicted
+        // Case 3: expired with n_lookup=0, but open handle → not evicted
         let f3 = t
             .lookup(FUSE_ROOT_ID, "f3", file_st("f3", 0), true)
             .unwrap()
             .ino;
-        t.unlink(FUSE_ROOT_ID, "f3", false).unwrap();
+        t.forget(f3, 1).unwrap();
         t.get_inode_mut(f3, None).unwrap().last_access = 0;
 
         // Case 4: ref_ctr=0 but not expired → not evicted
@@ -1159,7 +1159,7 @@ mod test {
         t.unlink(FUSE_ROOT_ID, "f4", false).unwrap();
         // last_access is fresh; within 60s TTL
 
-        // Case 5: expired empty dir, ref_ctr=0 → evicted
+        // Case 5: expired empty dir with n_lookup=1 → kept until FORGET
         let d1 = t
             .lookup(FUSE_ROOT_ID, "d1", dir_st("d1", 500), true)
             .unwrap()
@@ -1167,22 +1167,38 @@ mod test {
         t.unlink(FUSE_ROOT_ID, "d1", false).unwrap(); // like rmdir; DirEntry.children empty
         t.get_inode_mut(d1, None).unwrap().last_access = 0;
 
-        // Case 6: expired dir with ref_ctr=0 but cached children → not evicted
+        // Case 6: expired dir with n_lookup=0 but cached children → not evicted
         // Evicting would orphan cached children and break path reconstruction.
         let d2 = t
             .lookup(FUSE_ROOT_ID, "d2", dir_st("d2", 600), true)
             .unwrap()
             .ino;
         t.lookup(d2, "child", file_st("child", 0), true).unwrap(); // d2.children has "child"
-        t.get_inode_mut(d2, None).unwrap().ref_ctr = 0; // simulate unlinked dir inode
+        t.forget(d2, 1).unwrap();
         t.get_inode_mut(d2, None).unwrap().last_access = 0;
+
+        // Case 7: expired file after FORGET → evicted
+        let f5 = t
+            .lookup(FUSE_ROOT_ID, "f5", file_st("f5", 0), true)
+            .unwrap()
+            .ino;
+        t.forget(f5, 1).unwrap();
+        t.get_inode_mut(f5, None).unwrap().last_access = 0;
+
+        // Case 8: expired empty directory after FORGET → evicted
+        let d3 = t
+            .lookup(FUSE_ROOT_ID, "d3", dir_st("d3", 800), true)
+            .unwrap()
+            .ino;
+        t.forget(d3, 1).unwrap();
+        t.get_inode_mut(d3, None).unwrap().last_access = 0;
 
         // Run clear; treat f3 as having an open handle
         t.clear(|ino| ino == f3);
 
         assert!(
-            t.get_inode(f1, None::<&str>).is_none(),
-            "f1 should be evicted"
+            t.get_inode(f1, None::<&str>).is_some(),
+            "f1 should stay until the kernel sends FORGET"
         );
         assert!(
             t.get_inode(f2, None::<&str>).is_some(),
@@ -1197,12 +1213,20 @@ mod test {
             "f4 should stay (not expired)"
         );
         assert!(
-            t.get_inode(d1, None::<&str>).is_none(),
-            "d1 should be evicted (empty dir)"
+            t.get_inode(d1, None::<&str>).is_some(),
+            "d1 should stay until the kernel sends FORGET"
         );
         assert!(
             t.get_inode(d2, None::<&str>).is_some(),
             "d2 should stay (has cached children)"
+        );
+        assert!(
+            t.get_inode(f5, None::<&str>).is_none(),
+            "f5 should be evicted after FORGET"
+        );
+        assert!(
+            t.get_inode(d3, None::<&str>).is_none(),
+            "d3 should be evicted after FORGET"
         );
         assert!(
             t.get_inode(FUSE_ROOT_ID, None::<&str>).is_some(),
@@ -1215,12 +1239,31 @@ mod test {
             .lookup(FUSE_ROOT_ID, "fx", file_st("fx", 0), true)
             .unwrap()
             .ino;
-        t0.unlink(FUSE_ROOT_ID, "fx", false).unwrap();
+        t0.forget(fx, 1).unwrap();
         t0.get_inode_mut(fx, None).unwrap().last_access = 0;
         t0.clear(|_| false);
         assert!(
             t0.get_inode(fx, None::<&str>).is_none(),
             "cache_ttl=0 still evicts when last_access + ttl <= now"
+        );
+    }
+
+    /// The kernel may continue addressing an inode by nodeid until it sends FORGET.
+    /// TTL expiry alone must not discard that mapping.
+    #[test]
+    fn clear_keeps_expired_inode_with_kernel_lookup_reference() {
+        let mut tree = DirTree::default();
+        let ino = tree
+            .lookup(FUSE_ROOT_ID, "held", dir_st("held", 700), true)
+            .unwrap()
+            .ino;
+        tree.get_inode_mut(ino, None).unwrap().last_access = 0;
+
+        tree.clear(|_| false);
+
+        assert!(
+            tree.get_inode(ino, None::<&str>).is_some(),
+            "an inode with an outstanding kernel lookup reference must stay addressable"
         );
     }
 
