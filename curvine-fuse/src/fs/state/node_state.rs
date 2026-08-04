@@ -178,7 +178,7 @@ impl NodeState {
         self.fh_creator.get()
     }
 
-    pub fn next_ino(&self, status: &FileStatus) -> u64 {
+    pub fn next_ino(&self, status: &FileStatus) -> FuseResult<u64> {
         self.dir_read().next_id(status.id)
     }
 
@@ -391,7 +391,10 @@ impl NodeState {
         if mode == OpenFlags::RDONLY {
             let reader = self.new_reader(path).await?;
             let mut status = reader.status().clone();
-            let ino = ino.unwrap_or(self.next_ino(&status));
+            let ino = match ino {
+                Some(ino) => ino,
+                None => self.next_ino(&status)?,
+            };
             status.id = ino as i64;
             let handle = self
                 .insert_handle_with_writer(ino, Some(RawPtr::from_owned(reader)), None, status)
@@ -411,7 +414,7 @@ impl NodeState {
             }
             None => {
                 let writer = self.new_writer(path, flags, opts).await?;
-                let ino = self.next_ino(writer.status());
+                let ino = self.next_ino(writer.status())?;
                 let writer = self.writers.insert::<FuseError>(ino, writer).await?;
                 (ino, writer)
             }
@@ -978,7 +981,7 @@ impl NodeState {
             let mut status = writer.status().clone();
             writer.complete(None).await?;
 
-            let child_ino = self.next_ino(&status);
+            let child_ino = self.next_ino(&status)?;
             status.id = child_ino as i64;
             let _ = self.lookup_status(ino, name, &status)?;
             return self.new_handle(Some(child_ino), &path, flags, opts).await;
