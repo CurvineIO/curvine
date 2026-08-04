@@ -46,6 +46,8 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::Arc;
 
+const FUSE_TIME_GRANULARITY_NS: u32 = 1_000_000;
+
 pub struct CurvineFileSystem {
     fs: UnifiedFileSystem,
     state: Arc<NodeState>,
@@ -1054,7 +1056,7 @@ impl fs::FileSystem for CurvineFileSystem {
             congestion_threshold: self.conf.congestion_threshold,
             max_write: max_write as u32,
             #[cfg(feature = "fuse3")]
-            time_gran: 1,
+            time_gran: FUSE_TIME_GRANULARITY_NS,
             #[cfg(feature = "fuse3")]
             max_pages: max_pages as u16,
             #[cfg(feature = "fuse3")]
@@ -2931,6 +2933,11 @@ mod tests {
         assert!(!CurvineFileSystem::abi_supported(6, 40));
         assert!(!CurvineFileSystem::abi_supported(6, 0));
         assert!(!CurvineFileSystem::abi_supported(0, 0));
+    }
+
+    #[test]
+    fn advertised_timestamp_granularity_matches_millisecond_storage() {
+        assert_eq!(super::FUSE_TIME_GRANULARITY_NS, 1_000_000);
     }
 
     // Higher-major short reply (mirrors libfuse `_do_init`'s `arg->major > 7`

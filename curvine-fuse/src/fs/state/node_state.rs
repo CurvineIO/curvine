@@ -898,9 +898,11 @@ impl NodeState {
         }
 
         if let Some(mtime) = self.get_writer_mtime(attr.ino).await {
-            attr.mtime = (mtime.max(0) / 1000) as u64;
-            attr.mtimensec = ((mtime.max(0) % 1000) * 1_000_000) as u32;
-            if (attr.mtime, attr.mtimensec) > (attr.ctime, attr.ctimensec) {
+            (attr.mtime, attr.mtimensec) = FuseUtils::millis_to_fuse_timestamp(mtime);
+            if FuseUtils::fuse_timestamp_is_later(
+                (attr.mtime, attr.mtimensec),
+                (attr.ctime, attr.ctimensec),
+            ) {
                 attr.ctime = attr.mtime;
                 attr.ctimensec = attr.mtimensec;
             }
@@ -1011,10 +1013,37 @@ impl NodeState {
     }
 
     pub async fn fs_set_attr(&self, ino: u64, opts: SetAttrOpts) -> FuseResult<FileStatus> {
+        let mtime = opts.mtime;
         let path = self.get_path_common(ino, None)?;
-        let status = match self.fs.fuse_set_attr(&path, opts).await? {
-            Some(status) => status,
-            None => self.fs.get_status(&path).await?,
+        let status = if let Some(mtime) = mtime {
+            let fs = self.fs.clone();
+            let writer_path = path.clone();
+            let writer_opts = opts.clone();
+            match self
+                .writers
+                .with_resource_result(&ino, |writer| async move {
+                    // Serialize with RELEASE cleanup. Otherwise complete can
+                    // overwrite an mtime that a following utimensat just set.
+                    let status = match fs.fuse_set_attr(&writer_path, writer_opts).await? {
+                        Some(status) => status,
+                        None => fs.get_status(&writer_path).await?,
+                    };
+                    writer.set_times(mtime, status.ctime()).await?;
+                    Ok::<FileStatus, FuseError>(status)
+                })
+                .await?
+            {
+                Some(status) => status,
+                None => match self.fs.fuse_set_attr(&path, opts).await? {
+                    Some(status) => status,
+                    None => self.fs.get_status(&path).await?,
+                },
+            }
+        } else {
+            match self.fs.fuse_set_attr(&path, opts).await? {
+                Some(status) => status,
+                None => self.fs.get_status(&path).await?,
+            }
         };
         let _ = self.update_status(ino, None, &status);
 

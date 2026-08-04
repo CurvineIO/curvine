@@ -153,10 +153,19 @@ impl<K: Eq + Hash + Display + Clone, T> AsyncSharedMap<K, T> {
         F: FnOnce(Arc<T>) -> Fut,
         Fut: Future<Output = Result<(), E>>,
     {
+        Ok(self.with_resource_result(key, f).await?.is_some())
+    }
+
+    pub async fn with_resource_result<R, E, F, Fut>(&self, key: &K, f: F) -> Result<Option<R>, E>
+    where
+        E: Error,
+        F: FnOnce(Arc<T>) -> Fut,
+        Fut: Future<Output = Result<R, E>>,
+    {
         loop {
             let entry = match self.inner.get(key) {
                 Some(entry) => entry.clone(),
-                None => return Ok(false),
+                None => return Ok(None),
             };
 
             let state = entry.lock().await;
@@ -165,11 +174,10 @@ impl<K: Eq + Hash + Display + Clone, T> AsyncSharedMap<K, T> {
             }
 
             let Some(resource) = state.resource.clone() else {
-                return Ok(false);
+                return Ok(None);
             };
 
-            f(resource).await?;
-            return Ok(true);
+            return f(resource).await.map(Some);
         }
     }
 

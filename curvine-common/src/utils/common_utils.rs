@@ -16,12 +16,12 @@ use crate::fs::Path;
 use crate::state::{FileStatus, FileType};
 use crate::FsResult;
 use log::info;
-use orpc::common::Utils;
+use orpc::common::{LocalTime, Utils};
 use orpc::io::LocalFile;
 use orpc::{err_msg, ternary, CommonResult};
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 pub struct CommonUtils;
 
@@ -63,10 +63,7 @@ impl CommonUtils {
     }
 
     fn to_epoch_ms(ts: std::io::Result<SystemTime>) -> i64 {
-        ts.ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0)
+        ts.map(LocalTime::system_time_millis).unwrap_or(0)
     }
 
     pub fn metadata_to_file_status(path: &Path, meta: &std::fs::Metadata) -> FileStatus {
