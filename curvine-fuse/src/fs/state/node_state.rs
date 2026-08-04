@@ -1028,12 +1028,17 @@ impl NodeState {
                         Some(status) => status,
                         None => fs.get_status(&writer_path).await?,
                     };
-                    writer.set_times(mtime, status.ctime()).await?;
-                    Ok::<FileStatus, FuseError>(status)
+                    let receiver = writer.enqueue_mtime(mtime).await?;
+                    Ok::<_, FuseError>((status, writer, receiver))
                 })
                 .await?
             {
-                Some(status) => status,
+                Some((status, writer, receiver)) => {
+                    // Queue ordering is established while the writer entry is
+                    // locked; wait for older backend IO after releasing it.
+                    writer.wait_mtime(receiver).await?;
+                    status
+                }
                 None => match self.fs.fuse_set_attr(&path, opts).await? {
                     Some(status) => status,
                     None => self.fs.get_status(&path).await?,
