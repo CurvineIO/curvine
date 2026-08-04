@@ -29,19 +29,21 @@ use crate::*;
 use crate::{err_fuse, FuseResult, FuseUtils};
 use bytes::BytesMut;
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::conf::{ClusterConf, FuseConf};
-use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, Path, RpcCode, StateReader, StateWriter};
-use curvine_common::state::{
+use curvine_config::{ClusterConf, FuseConf};
+use curvine_core_error::try_option;
+use curvine_error::FsError;
+use curvine_error::MAX_FILE_SIZE;
+use curvine_fs_api::{FileSystem, Path, RpcCode};
+use curvine_fs_api::{StateReader, StateWriter};
+use curvine_model::{
     is_special_file_type, FileAllocMode, FileAllocOpts, FileLock, FileStatus, FileType, LockFlags,
     LockType, OpenFlags, RenameFlags, SetAttrOpts,
 };
-use curvine_common::MAX_FILE_SIZE;
+use curvine_runtime::common::{ByteUnit, TimeSpent};
+use curvine_runtime::runtime::Runtime;
+use curvine_sys as sys;
+use curvine_sys::FFIUtils;
 use log::{debug, info, warn};
-use orpc::common::{ByteUnit, TimeSpent};
-use orpc::runtime::Runtime;
-use orpc::sys::FFIUtils;
-use orpc::{sys, try_option};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::Arc;
@@ -359,12 +361,6 @@ impl CurvineFileSystem {
 
         if let Err(e) = self.fs.set_lock(&path, lock).await {
             return Err(e.into());
-        }
-
-        // Notify the wait registry so any waiter blocked on this owner can
-        // re-sample Master and either acquire the lock or re-register.
-        if flags == LockFlags::Plock {
-            self.plock_waits.notify_waiters();
         }
 
         Ok(())
@@ -2123,10 +2119,10 @@ impl fs::FileSystem for CurvineFileSystem {
                 if full_range_unlock && flag == LockFlags::Plock {
                     handle.take_plock_if_owner(owner_id);
                 }
-                self.plock_waits.notify_waiters();
             } else {
                 handle.add_lock(flag, owner_id);
             }
+            self.plock_waits.notify_waiters();
             Ok(())
         } else {
             err_fuse!(libc::EAGAIN)
@@ -2177,6 +2173,7 @@ impl fs::FileSystem for CurvineFileSystem {
                 } else {
                     handle.add_lock(lock.lock_flags, lock.owner_id);
                 }
+                self.plock_waits.notify_waiters();
                 return Ok(());
             }
 
@@ -2214,6 +2211,7 @@ impl fs::FileSystem for CurvineFileSystem {
                     } else {
                         handle.add_lock(lock.lock_flags, lock.owner_id);
                     }
+                    self.plock_waits.notify_waiters();
                     return Ok(());
                 }
                 let blocker2 = conflict2.as_ref().expect("conflict lock");
@@ -2280,12 +2278,12 @@ mod tests {
         FATTR_ATIME_NOW, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_UID,
         FUSE_INIT_EXT,
     };
-    use curvine_common::state::{FileAllocMode, FileStatus, FileType, INTERNAL_CTIME_XATTR};
+    use curvine_model::{FileAllocMode, FileStatus, FileType, INTERNAL_CTIME_XATTR};
 
     #[test]
     fn full_range_unlock_accepts_kernel_offset_max_and_u64_max() {
         use super::CurvineFileSystem;
-        use curvine_common::state::{FileLock, LockType};
+        use curvine_model::{FileLock, LockType};
 
         assert!(CurvineFileSystem::is_lock_to_eof(u64::MAX));
         assert!(CurvineFileSystem::is_lock_to_eof(i64::MAX as u64));
@@ -2416,7 +2414,7 @@ mod tests {
     #[test]
     fn root_access_checks_any_execute_bit_not_owner_class() {
         use super::CurvineFileSystem;
-        use curvine_common::state::{FileStatus, FileType};
+        use curvine_model::{FileStatus, FileType};
 
         let mut readonly = FileStatus::with_name(1, "readonly".to_string(), false);
         readonly.file_type = FileType::File;
@@ -2994,9 +2992,9 @@ mod tests {
 
     mod readdir_termination {
         use crate::fs::state::DirHandle;
-        use curvine_common::fs::{ListStream, Path};
-        use curvine_common::state::FileStatus;
-        use orpc::runtime::{AsyncRuntime, RpcRuntime};
+        use curvine_fs_api::{ListStream, Path};
+        use curvine_model::FileStatus;
+        use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 
         fn entries(names: &[&str]) -> Vec<FileStatus> {
             names

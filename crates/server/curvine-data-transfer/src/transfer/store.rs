@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::state::{
+use curvine_error::FsResult;
+use curvine_model::{
     StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease, TransferListFilter,
     TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTaskState,
     TransferTenantSummary,
 };
-use curvine_common::FsResult;
 
 pub trait TransferStore: Send + Sync + 'static {
     fn check_available(&self) -> FsResult<()>;

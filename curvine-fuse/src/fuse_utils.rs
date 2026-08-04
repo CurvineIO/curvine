@@ -21,16 +21,16 @@ use crate::raw::fuse_abi::{
 use crate::*;
 use bytes::BytesMut;
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::conf::FuseConf;
-use curvine_common::fs::Path;
-use curvine_common::state::{
+use curvine_config::FuseConf;
+use curvine_fs_api::Path;
+use curvine_io::IOResult;
+use curvine_model::{
     CreateFileOpts, CreateFileOptsBuilder, FileStatus, FileType, MkdirOpts, MkdirOptsBuilder,
     SetAttrOpts, FS_APPEND_FL, FS_IMMUTABLE_FL, IFLAGS_XATTR, MKNOD_RDEV_XATTR,
 };
-use orpc::common::LocalTime;
-use orpc::io::IOResult;
-use orpc::sys;
-use orpc::sys::{FFIUtils, RawIO};
+use curvine_runtime::common::LocalTime;
+use curvine_sys as sys;
+use curvine_sys::{FFIUtils, RawIO};
 use std::collections::HashMap;
 use std::process::Command;
 use std::slice;
@@ -564,21 +564,23 @@ impl FuseUtils {
 
     /// Kernel dentry/attribute cache lifetimes for FUSE replies.
     ///
-    /// When userspace permission checks are enabled, timeouts must be zero so the
-    /// kernel revalidates after parent mode changes (e.g. chmod removing search).
-    /// Otherwise cached LOOKUP/GETATTR can skip path-prefix X_OK and report success
-    /// where POSIX requires EACCES (LTP lstat02/stat03/readlink03).
+    /// Returns the configured `entry_ttl`/`attr_ttl` regardless of
+    /// `check_permission`, trading cache freshness for performance: inside the
+    /// TTL the kernel reuses cached dentries/attrs, so a parent mode change
+    /// (e.g. chmod removing search) is invisible until the cache expires, and
+    /// path traversal may skip the userspace X_OK check where POSIX requires
+    /// EACCES (LTP lstat02/stat03/readlink03).
+    ///
+    /// For strict/POSIX semantics (full LTP compliance), mount with
+    /// `entry_timeout_ms = 0` and `attr_timeout_ms = 0` so every lookup/getattr
+    /// revalidates against the metadata service.
     pub fn kernel_cache_timeouts(conf: &FuseConf) -> (u64, u32, u64, u32) {
-        if conf.check_permission {
-            (0, 0, 0, 0)
-        } else {
-            (
-                conf.entry_ttl.as_secs(),
-                conf.entry_ttl.subsec_nanos(),
-                conf.attr_ttl.as_secs(),
-                conf.attr_ttl.subsec_nanos(),
-            )
-        }
+        (
+            conf.entry_ttl.as_secs(),
+            conf.entry_ttl.subsec_nanos(),
+            conf.attr_ttl.as_secs(),
+            conf.attr_ttl.subsec_nanos(),
+        )
     }
 
     pub fn create_entry_out(conf: &FuseConf, attr: fuse_attr) -> fuse_entry_out {
@@ -757,7 +759,7 @@ mod tests {
     use crate::raw::fuse_abi::{
         fuse_ioctl_iovec, fuse_ioctl_out, fuse_setattr_in, FUSE_IOCTL_RETRY,
     };
-    use curvine_common::state::INTERNAL_CTIME_XATTR;
+    use curvine_model::INTERNAL_CTIME_XATTR;
 
     #[test]
     fn protected_xattr_errors_match_operation() {
@@ -833,6 +835,22 @@ mod tests {
                 libc::EOPNOTSUPP
             );
         }
+    }
+
+    #[test]
+    fn kernel_cache_timeouts_ignore_check_permission() {
+        let conf = FuseConf::default();
+        assert!(conf.check_permission);
+
+        assert_eq!(
+            FuseUtils::kernel_cache_timeouts(&conf),
+            (
+                conf.entry_ttl.as_secs(),
+                conf.entry_ttl.subsec_nanos(),
+                conf.attr_ttl.as_secs(),
+                conf.attr_ttl.subsec_nanos(),
+            )
+        );
     }
 
     #[test]

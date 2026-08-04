@@ -16,17 +16,17 @@ use crate::worker::block::BlockStore;
 use crate::worker::handler::BlockHandler;
 use crate::worker::replication::worker_replication_handler::WorkerReplicationHandler;
 use crate::worker::task::TaskManager;
-use curvine_common::error::FsError;
-use curvine_common::fs::RpcCode;
-use curvine_common::proto::*;
-use curvine_common::state::LoadTaskInfo;
-use curvine_common::utils::SerdeUtils;
-use curvine_common::FsResult;
-use orpc::err_box;
-use orpc::handler::MessageHandler;
-use orpc::message::{Builder, Message, RequestStatus, ResponseStatus};
-use orpc::runtime::Runtime;
-use orpc::sync::FastMutex;
+use curvine_core_error::err_box;
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_fs_api::RpcCode;
+use curvine_model::LoadTaskInfo;
+use curvine_proto::*;
+use curvine_rpc::handler::MessageHandler;
+use curvine_rpc::message::{Builder, Message, RequestStatus, ResponseStatus};
+use curvine_runtime::common::SerdeUtils;
+use curvine_runtime::runtime::Runtime;
+use curvine_runtime::sync::FastMutex;
 use std::sync::Arc;
 
 pub struct WorkerHandler {
@@ -179,22 +179,17 @@ impl WorkerHandler {
     }
 }
 
-fn transfer_task_state_code(state: curvine_common::state::JobTaskState) -> i32 {
+fn transfer_task_state_code(state: curvine_model::JobTaskState) -> i32 {
     match state {
-        curvine_common::state::JobTaskState::Pending
-        | curvine_common::state::JobTaskState::UNKNOWN => {
+        curvine_model::JobTaskState::Pending | curvine_model::JobTaskState::UNKNOWN => {
             TransferTaskStateProto::TransferTaskPending.into()
         }
-        curvine_common::state::JobTaskState::Loading => {
-            TransferTaskStateProto::TransferTaskRunning.into()
-        }
-        curvine_common::state::JobTaskState::Completed => {
+        curvine_model::JobTaskState::Loading => TransferTaskStateProto::TransferTaskRunning.into(),
+        curvine_model::JobTaskState::Completed => {
             TransferTaskStateProto::TransferTaskCompleted.into()
         }
-        curvine_common::state::JobTaskState::Failed => {
-            TransferTaskStateProto::TransferTaskFailed.into()
-        }
-        curvine_common::state::JobTaskState::Canceled => {
+        curvine_model::JobTaskState::Failed => TransferTaskStateProto::TransferTaskFailed.into(),
+        curvine_model::JobTaskState::Canceled => {
             TransferTaskStateProto::TransferTaskCanceled.into()
         }
     }

@@ -17,9 +17,9 @@ use crate::worker::storage::{
     BlockDataset, BlockLayout, BlockReadContext, BlockWriteContext, Dataset,
 };
 use crate::worker::Worker;
-use curvine_common::conf::ClusterConf;
-use curvine_common::state::{ExtendedBlock, StorageInfo};
-use orpc::CommonResult;
+use curvine_config::ClusterConf;
+use curvine_core_error::CommonResult;
+use curvine_model::{ExtendedBlock, StorageInfo};
 use parking_lot::{Mutex, MutexGuard};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
@@ -201,7 +201,7 @@ impl BlockStore {
         let state = self.read()?;
         let b = state
             .get_readable_block(id)
-            .ok_or_else(|| orpc::err_msg!(format!("block {} not exists", id)))?;
+            .ok_or_else(|| curvine_core_error::err_msg!(format!("block {} not exists", id)))?;
         Ok(b.clone())
     }
 
@@ -240,7 +240,7 @@ impl BlockStore {
         let state = self.read()?;
         let meta = state
             .get_readable_block(id)
-            .ok_or_else(|| orpc::err_msg!(format!("block {} not exists", id)))?
+            .ok_or_else(|| curvine_core_error::err_msg!(format!("block {} not exists", id)))?
             .clone();
         let (layout, dir) = state.layout_for(&meta)?;
         let reader = layout.open_reader(&dir, &meta, off, logical_len)?;
@@ -260,7 +260,7 @@ impl BlockStore {
         }
         let meta = state
             .get_readable_block(id)
-            .ok_or_else(|| orpc::err_msg!(format!("block {} not exists", id)))?
+            .ok_or_else(|| curvine_core_error::err_msg!(format!("block {} not exists", id)))?
             .clone();
         let (layout, dir) = state.layout_for(&meta)?;
         Ok(layout.short_circuit(&dir, &meta)?.map(|path| (meta, path)))
@@ -325,9 +325,9 @@ mod tests {
     use super::*;
     use crate::worker::block::BlockState;
     use crate::worker::storage::{Dataset, FileLayout};
-    use curvine_common::conf::WorkerConf;
-    use orpc::common::FileUtils;
-    use orpc::sys::DataSlice;
+    use curvine_config::WorkerConf;
+    use curvine_io::DataSlice;
+    use curvine_runtime::common::FileUtils;
     use std::io::Write;
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -407,7 +407,7 @@ mod tests {
         match slice {
             DataSlice::Bytes(bytes) => Ok(bytes.to_vec()),
             DataSlice::Buffer(bytes) => Ok(bytes.to_vec()),
-            other => orpc::err_box!("unexpected test read slice: {:?}", other),
+            other => curvine_core_error::err_box!("unexpected test read slice: {:?}", other),
         }
     }
 
@@ -585,7 +585,7 @@ mod tests {
                 if result.is_ok() {
                     store.abort_block(&block)?;
                 }
-                Ok::<_, orpc::CommonError>(elapsed)
+                Ok::<_, curvine_core_error::CommonError>(elapsed)
             }));
         }
 

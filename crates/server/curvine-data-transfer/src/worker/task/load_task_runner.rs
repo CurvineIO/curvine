@@ -15,20 +15,20 @@
 use crate::common::UfsFactory;
 use crate::worker::task::TaskContext;
 use curvine_client_core::file::{CurvineFileSystem, FsReader};
-use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-use curvine_common::state::{
+use curvine_core_error::err_box;
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_fs_api::{FileSystem, Path, Reader, Writer};
+use curvine_job_client::JobMasterClient;
+use curvine_job_client::TransferClient;
+use curvine_model::transfer_failure_message;
+use curvine_model::{
     CreateFileOptsBuilder, FileBlocks, FileStatus, JobTaskProgress, JobTaskState,
     SetAttrOptsBuilder, TRANSFER_TEMP_PATH_MARKER,
 };
-use curvine_common::transfer::transfer_failure_message;
-use curvine_common::FsResult;
-use curvine_job_client::JobMasterClient;
-use curvine_job_client::TransferClient;
+use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_unified_fs::{UfsFileSystem, UnifiedReader, UnifiedWriter};
 use log::{debug, error, info, warn};
-use orpc::common::{LocalTime, TimeSpent};
-use orpc::err_box;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -163,8 +163,8 @@ impl LoadTaskRunner {
                 error!("transfer task failed: {} err={}", self.log_context(), e);
                 let progress = self.task.set_failed(transfer_failure_message(
                     match Path::from_str(&self.task.info.source_path) {
-                        Ok(source) if source.is_cv() => curvine_common::state::TransferKind::Export,
-                        _ => curvine_common::state::TransferKind::Load,
+                        Ok(source) if source.is_cv() => curvine_model::TransferKind::Export,
+                        _ => curvine_model::TransferKind::Load,
                     },
                     &self.task.info.source_path,
                     &self.task.info.target_path,
@@ -805,9 +805,9 @@ fn xattr_equals(status: &FileStatus, key: &str, expected: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::rename_ufs_output;
-    use curvine_common::fs::Path;
+    use curvine_fs_api::Path;
+    use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
     use curvine_unified_fs::UfsFileSystem;
-    use orpc::runtime::{AsyncRuntime, RpcRuntime};
     use std::collections::HashMap;
     use std::fs;
 
@@ -816,7 +816,7 @@ mod tests {
         let base_dir = std::env::temp_dir().join(format!(
             "transfer-ufs-commit-{}-{}",
             std::process::id(),
-            orpc::common::LocalTime::mills()
+            curvine_runtime::common::LocalTime::mills()
         ));
         fs::create_dir_all(&base_dir).unwrap();
         let target = Path::from_str(format!("file://{}/target.txt", base_dir.display())).unwrap();

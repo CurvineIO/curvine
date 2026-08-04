@@ -12,11 +12,11 @@
 #![cfg(feature = "spdk")]
 
 use bytes::BytesMut;
+use curvine_core_error::err_box;
+use curvine_io::BlockIO;
+use curvine_io::DataSlice;
+use curvine_io::IOResult;
 use log::{debug, error, warn};
-use orpc::err_box;
-use orpc::io::BlockIO;
-use orpc::io::IOResult;
-use orpc::sys::DataSlice;
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicBool, Ordering};
 // ---------------------------------------------------------------------------
@@ -763,7 +763,7 @@ impl Drop for SpdkBdev {
 mod test {
     use super::*;
     use crate::spdk_env::SpdkEnv;
-    use orpc::io::SpdkConf;
+    use curvine_io::SpdkConf;
 
     fn ensure_spdk_init() {
         if SpdkEnv::global().is_some() {
@@ -783,7 +783,7 @@ mod test {
             .unwrap_or_else(|_| "nqn.2024-01.io.curvine:test".into());
         let trtype = std::env::var("SPDK_TRANSPORT_TYPE").unwrap_or_else(|_| "tcp".into());
         conf.iova_mode = std::env::var("SPDK_IOVA_MODE").unwrap_or_else(|_| "va".to_string());
-        conf.targets = vec![orpc::io::NvmeTarget {
+        conf.targets = vec![curvine_io::NvmeTarget {
             traddr,
             trsvcid,
             subnqn,

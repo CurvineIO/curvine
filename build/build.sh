@@ -629,12 +629,12 @@ append_alloc_feature() {
       ;;
     client-safe)
       if [[ " ${CLIENT_RUST_BUILD_ARGS[@]} " =~ " -p curvine-fuse " ]]; then
-        add_feature "curvine-common/${ALLOC}"
+        add_feature "curvine-alloc/${ALLOC}"
       fi
       return 0
       ;;
     *)
-      add_feature "curvine-common/${ALLOC}"
+      add_feature "curvine-alloc/${ALLOC}"
       ;;
   esac
 }
@@ -926,7 +926,7 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
 
   ensure_maturin_cmd || exit 1
 
-  PROTO_DIR="$FS_HOME/curvine-common/proto"
+  PROTO_DIR="$FS_HOME/crates/common/curvine-proto/proto"
   PY_SDK_PY="$FS_HOME/curvine-libsdk/python"
   PROTO_PKG="$PY_SDK_PY/curvine_libsdk/_proto"
   echo "Generating Python protobuf stubs into curvine_libsdk/python/curvine_libsdk/_proto/..."

@@ -28,7 +28,7 @@ use std::sync::Arc;
 pub struct WebServer;
 
 impl WebServer {
-    pub async fn start(port: u16, state: Arc<NodeState>) -> orpc::CommonResult<()> {
+    pub async fn start(port: u16, state: Arc<NodeState>) -> curvine_core_error::CommonResult<()> {
         let app = Router::new()
             .route("/metrics", get(metrics_handler))
             .route("/healthz", get(|| async { "ok" }))

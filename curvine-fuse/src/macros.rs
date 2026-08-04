@@ -19,17 +19,17 @@ macro_rules! err_fuse {
         // Single-arg form: synthesize a default message with the symbolic errno
         // label (e.g. "err_fuse ENOSYS").
         let errno = $crate::fuse_error::normalize_errno($errno);
-        let msg = orpc::err_msg!("err_fuse {}", $crate::fuse_error::errno_label(errno));
+        let msg = curvine_core_error::err_msg!("err_fuse {}", $crate::fuse_error::errno_label(errno));
         Err($crate::FuseError::from_errno_msg(errno, msg.into()))
     });
 
     ($errno:expr, $msg:expr) => ({
-        let msg = orpc::err_msg!("{}", $msg);
+        let msg = curvine_core_error::err_msg!("{}", $msg);
         Err($crate::FuseError::from_errno_msg($errno, msg.into()))
     });
 
     ($errno:expr, $f:tt, $($arg:expr),+) => ({
-        let msg = orpc::err_msg!($f, $($arg),+);
+        let msg = curvine_core_error::err_msg!($f, $($arg),+);
         Err($crate::FuseError::from_errno_msg($errno, msg.into()))
     });
 }

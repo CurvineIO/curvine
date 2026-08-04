@@ -20,18 +20,18 @@ use crate::master::meta::inode::*;
 use crate::master::meta::store::{InodeStore, RocksInodeStore};
 use crate::master::meta::{BlockMeta, InodeId};
 use crate::master::quota::eviction::evictor::Evictor;
-use curvine_common::conf::ClusterConf;
-use curvine_common::error::FsError;
-use curvine_common::state::{
+use curvine_config::ClusterConf;
+use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_model::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
     FreeResult, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, WorkerAddress,
     INTERNAL_CTIME_XATTR,
 };
-use curvine_common::FsResult;
+use curvine_runtime::common::{LocalTime, TimeSpent};
+use curvine_runtime::sync::AtomicCounter;
 use log::{debug, info, warn};
-use orpc::common::{LocalTime, TimeSpent};
-use orpc::sync::AtomicCounter;
-use orpc::{err_box, err_ext, try_option, CommonResult};
 use std::collections::{HashMap, LinkedList};
 use std::mem;
 use std::sync::Arc;
@@ -1126,8 +1126,7 @@ impl FsDir {
                     // Hard links to regular files and symlinks are valid; directories are not.
                     if !matches!(
                         file.file_type,
-                        curvine_common::state::FileType::File
-                            | curvine_common::state::FileType::Link
+                        curvine_model::FileType::File | curvine_model::FileType::Link
                     ) {
                         return err_ext!(FsError::common("Cannot create link to non-regular file"));
                     }

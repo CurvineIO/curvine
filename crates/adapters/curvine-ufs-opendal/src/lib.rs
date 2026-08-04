@@ -13,9 +13,12 @@
 // limitations under the License.
 
 use bytes::BytesMut;
+use curvine_core_error::ErrorExt;
+use curvine_core_error::{err_box, err_ext, try_option_mut};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, ListStream, Path, Reader, Writer};
+use curvine_io::DataSlice;
 use curvine_model::{FileStatus, FileType, ListOptions, SetAttrOpts};
 use curvine_ufs_api::OpendalConf;
 #[cfg(feature = "opendal-oss")]
@@ -29,9 +32,6 @@ use opendal::{
     layers::{LoggingLayer, RetryLayer, TimeoutLayer},
     ErrorKind, Metadata, Operator,
 };
-use orpc::error::ErrorExt;
-use orpc::sys::DataSlice;
-use orpc::{err_box, err_ext, try_option_mut};
 use std::collections::HashMap;
 use std::time::Duration;
 

@@ -15,7 +15,7 @@
 use crate::meta_store::{BlockMetaStore, MemMetaStore};
 use crate::BlockMeta;
 use crate::SpdkMetaStore;
-use curvine_common::state::StorageType;
+use curvine_model::StorageType;
 use log::warn;
 use std::sync::Arc;
 

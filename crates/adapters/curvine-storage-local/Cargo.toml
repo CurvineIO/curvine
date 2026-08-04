@@ -11,8 +11,12 @@ spdk = ["dep:curvine-storage-spdk", "curvine-storage-spdk/spdk"]
 spdk-rdma = ["spdk", "curvine-storage-spdk/spdk-rdma"]
 
 [dependencies]
-orpc = { workspace = true }
-curvine-common = { workspace = true }
+curvine-core-error = { workspace = true }
+curvine-runtime = { workspace = true }
+curvine-io = { workspace = true }
+curvine-sys = { workspace = true }
+curvine-model = { workspace = true }
+curvine-config = { workspace = true }
 curvine-rocksdb = { workspace = true }
 curvine-storage-spdk = { workspace = true, optional = true }
 bytes = { workspace = true }

@@ -16,9 +16,9 @@ use crate::master::fs::MasterFilesystem;
 use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::ttl::TtlResult;
 use crate::master::meta::inode::ttl::{InodeTtlChecker, InodeTtlExecutor};
-use curvine_common::FsResult;
+use curvine_error::FsResult;
+use curvine_runtime::common::TimeSpent;
 use log::{error, info};
-use orpc::common::TimeSpent;
 use std::sync::Arc;
 
 // TTL Manager Module

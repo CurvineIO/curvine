@@ -14,9 +14,9 @@
 
 use crate::master::meta::inode::InodeView;
 use crate::master::Master;
+use curvine_core_error::{err_box, CommonResult};
+use curvine_runtime::common::FastHashSet;
 use log::{debug, info, warn};
-use orpc::common::FastHashSet;
-use orpc::{err_box, CommonResult};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -219,7 +219,7 @@ impl TtlBucketList {
 mod tests {
     use super::*;
     use crate::master::meta::inode::{InodeFile, InodeView};
-    use curvine_common::state::TtlAction;
+    use curvine_model::TtlAction;
 
     const INTERVAL_MS: i64 = 1000;
 

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod version;
+
 pub type SysResult<T> = std::io::Result<T>;
 
 // `Other` is reserved for opaque failures; pass an explicit `ErrorKind` whenever the

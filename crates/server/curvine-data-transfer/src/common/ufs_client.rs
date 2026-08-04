@@ -14,10 +14,10 @@
 
 #![allow(unused)]
 
-use curvine_common::error::FsError;
-use curvine_common::fs::{CurvineURI, FileSystem, Path};
-use curvine_common::state::FileStatus;
-use curvine_common::FsResult;
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_fs_api::{CurvineURI, FileSystem, Path};
+use curvine_model::FileStatus;
 use curvine_ufs_api::fs::ufs_context::UFSContext;
 use curvine_unified_fs::{UfsFileSystem, UnifiedReader, UnifiedWriter};
 use std::sync::Arc;

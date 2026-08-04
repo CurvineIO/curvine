@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_alloc as _;
 pub mod common;
 pub mod master;
 

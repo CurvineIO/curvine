@@ -37,6 +37,12 @@ pub use self::list_stream::ListStream;
 
 pub mod local;
 
+mod state_file;
+pub use self::state_file::{StateReader, StateWriter};
+
+/// Default buffered I/O capacity for state file readers/writers.
+pub const FILE_BUFFER_SIZE: usize = 128 * 1024;
+
 // CurvineURI is used in the Curvine system to describe paths, including external storage.
 pub type CurvineURI = Path;
 
@@ -59,7 +65,10 @@ impl curvine_model::CurvinePath for Path {
 }
 
 pub mod fs {
-    pub use super::{CurvineURI, FileSystem, FsKind, ListStream, Path, Reader, RpcCode, Writer};
+    pub use super::{
+        CurvineURI, FileSystem, FsKind, ListStream, Path, Reader, RpcCode, StateReader,
+        StateWriter, Writer, FILE_BUFFER_SIZE,
+    };
 }
 
 pub mod proto {

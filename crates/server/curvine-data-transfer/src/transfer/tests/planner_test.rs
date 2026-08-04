@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::state::{FileStatus, StoragePolicy, StorageState};
+use curvine_model::{FileStatus, StoragePolicy, StorageState};
 
 use super::planner::{needs_source_status_refresh, unchanged_load_target};
 

@@ -6,9 +6,12 @@ license.workspace = true
 description = "Curvine RocksDB metadata adapter."
 
 [dependencies]
+curvine-core-error = { workspace = true }
+curvine-runtime = { workspace = true }
+curvine-io = { workspace = true }
 byteorder = { workspace = true }
+curvine-config = { workspace = true }
 log = { workspace = true }
-orpc = { workspace = true }
 prost = { workspace = true }
 rocksdb = { workspace = true }
 serde = { workspace = true }

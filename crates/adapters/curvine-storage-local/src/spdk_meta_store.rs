@@ -4,9 +4,9 @@ use crate::BlockMeta;
 /// Key: block_id (8B). Value: dir_id(4B) | offset(8B) | size(8B) | len(8B) | finalized(1B) = 29B.
 /// O(1) per block
 use byteorder::{BigEndian, ByteOrder};
+use curvine_core_error::{err_box, CommonResult};
 use curvine_rocksdb::{DBConf, DBEngine};
 use log::{info, warn};
-use orpc::{err_box, CommonResult};
 const CF_SPDK_BLOCKS: &str = "spdk_blocks";
 const VALUE_SIZE: usize = 29;
 pub struct SpdkMetaStore {

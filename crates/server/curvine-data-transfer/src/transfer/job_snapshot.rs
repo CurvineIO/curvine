@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use crate::transfer::ClusterMetadataCache;
-use curvine_common::error::FsError;
-use curvine_common::fs::Path;
-use curvine_common::state::{MountInfo, TransferJobRecord};
-use curvine_common::FsResult;
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_fs_api::Path;
+use curvine_model::{MountInfo, TransferJobRecord};
 
 pub fn job_mount_snapshot(
     job: &TransferJobRecord,

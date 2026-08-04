@@ -18,7 +18,7 @@ use crate::raw::FuseDirentList;
 use crate::session::FuseResponse;
 use crate::{err_fuse, FuseResult};
 use bytes::BytesMut;
-use curvine_common::fs::{StateReader, StateWriter};
+use curvine_fs_api::{StateReader, StateWriter};
 use std::future::Future;
 
 pub trait FileSystem: Send + Sync + 'static {

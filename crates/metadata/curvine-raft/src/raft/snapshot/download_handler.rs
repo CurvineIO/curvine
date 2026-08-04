@@ -15,10 +15,10 @@
 use crate::proto::raft::{SnapshotDownloadRequest, SnapshotDownloadResponse};
 use crate::raft::snapshot::FileReader;
 use crate::raft::{RaftResult, RaftUtils};
+use curvine_core_error::{err_box, try_option_mut};
+use curvine_io::DataSlice;
+use curvine_rpc::message::{Builder, Message, RequestStatus};
 use log::{debug, error};
-use orpc::message::{Builder, Message, RequestStatus};
-use orpc::sys::DataSlice;
-use orpc::{err_box, try_option_mut};
 
 // Snapshot read processor.
 pub struct SnapshotDownloadHandler {

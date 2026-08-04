@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_core_error::CommonResult;
 use curvine_rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
-use orpc::common::{FileUtils, Utils};
-use orpc::CommonResult;
+use curvine_runtime::common::{FileUtils, Utils};
 
 // Rocksdb database core function test
 #[test]
