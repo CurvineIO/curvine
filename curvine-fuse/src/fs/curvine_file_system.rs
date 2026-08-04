@@ -361,12 +361,6 @@ impl CurvineFileSystem {
             return Err(e.into());
         }
 
-        // Notify the wait registry so any waiter blocked on this owner can
-        // re-sample Master and either acquire the lock or re-register.
-        if flags == LockFlags::Plock {
-            self.plock_waits.notify_waiters();
-        }
-
         Ok(())
     }
 
@@ -2123,10 +2117,10 @@ impl fs::FileSystem for CurvineFileSystem {
                 if full_range_unlock && flag == LockFlags::Plock {
                     handle.take_plock_if_owner(owner_id);
                 }
-                self.plock_waits.notify_waiters();
             } else {
                 handle.add_lock(flag, owner_id);
             }
+            self.plock_waits.notify_waiters();
             Ok(())
         } else {
             err_fuse!(libc::EAGAIN)
@@ -2177,6 +2171,7 @@ impl fs::FileSystem for CurvineFileSystem {
                 } else {
                     handle.add_lock(lock.lock_flags, lock.owner_id);
                 }
+                self.plock_waits.notify_waiters();
                 return Ok(());
             }
 
@@ -2214,6 +2209,7 @@ impl fs::FileSystem for CurvineFileSystem {
                     } else {
                         handle.add_lock(lock.lock_flags, lock.owner_id);
                     }
+                    self.plock_waits.notify_waiters();
                     return Ok(());
                 }
                 let blocker2 = conflict2.as_ref().expect("conflict lock");
