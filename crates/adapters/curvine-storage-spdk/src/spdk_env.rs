@@ -1468,6 +1468,12 @@ mod test {
             let conf = SpdkConf {
                 enabled: true,
                 qpair_acquire_timeout_ms: 0,
+                targets: vec![NvmeTarget {
+                    traddr: "10.0.0.1".into(),
+                    trsvcid: 4420,
+                    subnqn: "nqn.test".into(),
+                    ..Default::default()
+                }],
                 ..Default::default()
             };
             let result = conf.validate();
