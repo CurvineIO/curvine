@@ -421,7 +421,7 @@ mod tests {
     use bytes::{Bytes, BytesMut};
     use curvine_common::error::FsError;
     use curvine_common::fs::{Path, Writer};
-    use curvine_common::state::{FileAllocOpts, FileStatus};
+    use curvine_common::state::{FileAllocOpts, FileStatus, INTERNAL_CTIME_XATTR};
     use curvine_common::FsResult;
     use curvine_metrics::Metrics as m;
     use orpc::sync::channel::{AsyncChannel, CallChannel};
@@ -515,6 +515,10 @@ mod tests {
         async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
             self.status.len = opts.len;
             self.status.mtime = 2_345;
+            self.status.x_attr.insert(
+                INTERNAL_CTIME_XATTR.to_string(),
+                2_346_i64.to_le_bytes().to_vec(),
+            );
             Ok(())
         }
     }
@@ -666,8 +670,99 @@ mod tests {
         let status = result_rx.receive().await.unwrap().unwrap();
         assert_eq!(status.len, 25);
         assert_eq!(status.mtime, 2_345);
+        assert_eq!(status.ctime(), 2_346);
         assert_eq!(file_len.get(), 25);
         assert_eq!(file_mtime.get(), 2_345);
+        assert_eq!(complete_count.load(Ordering::SeqCst), 1);
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn queued_write_then_resize_keeps_resize_snapshot() {
+        let cancel_count = Arc::new(AtomicUsize::new(0));
+        let complete_count = Arc::new(AtomicUsize::new(0));
+        let writer = TrackingWriter::new(cancel_count.clone(), complete_count.clone());
+        let file_len = Arc::new(AtomicLong::new(0));
+        let file_mtime = Arc::new(AtomicLong::new(0));
+        let (sender, receiver) = AsyncChannel::new(2).split();
+        let (result_tx, result_rx) = CallChannel::channel::<FsResult<FileStatus>>();
+        sender
+            .send(QueuedWriteTask {
+                task: WriteTask::Write(20, Bytes::from_static(b"x"), None),
+                queue_guard: None,
+            })
+            .await
+            .unwrap();
+        sender
+            .send(QueuedWriteTask {
+                task: WriteTask::Resize(result_tx, FileAllocOpts::with_truncate(9)),
+                queue_guard: None,
+            })
+            .await
+            .unwrap();
+        drop(sender);
+
+        FuseWriter::writer_future(
+            writer,
+            receiver,
+            file_len.clone(),
+            file_mtime.clone(),
+            "test",
+            false,
+        )
+        .await
+        .unwrap();
+
+        let status = result_rx.receive().await.unwrap().unwrap();
+        assert_eq!(status.len, 9);
+        assert_eq!(status.mtime, 2_345);
+        assert_eq!(file_len.get(), 9);
+        assert_eq!(file_mtime.get(), 2_345);
+        assert_eq!(complete_count.load(Ordering::SeqCst), 1);
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn queued_resize_then_write_keeps_write_snapshot() {
+        let cancel_count = Arc::new(AtomicUsize::new(0));
+        let complete_count = Arc::new(AtomicUsize::new(0));
+        let writer = TrackingWriter::new(cancel_count.clone(), complete_count.clone());
+        let file_len = Arc::new(AtomicLong::new(0));
+        let file_mtime = Arc::new(AtomicLong::new(0));
+        let (sender, receiver) = AsyncChannel::new(2).split();
+        let (result_tx, result_rx) = CallChannel::channel::<FsResult<FileStatus>>();
+        sender
+            .send(QueuedWriteTask {
+                task: WriteTask::Resize(result_tx, FileAllocOpts::with_truncate(9)),
+                queue_guard: None,
+            })
+            .await
+            .unwrap();
+        sender
+            .send(QueuedWriteTask {
+                task: WriteTask::Write(20, Bytes::from_static(b"x"), None),
+                queue_guard: None,
+            })
+            .await
+            .unwrap();
+        drop(sender);
+
+        FuseWriter::writer_future(
+            writer,
+            receiver,
+            file_len.clone(),
+            file_mtime.clone(),
+            "test",
+            false,
+        )
+        .await
+        .unwrap();
+
+        let status = result_rx.receive().await.unwrap().unwrap();
+        assert_eq!(status.len, 9);
+        assert_eq!(status.mtime, 2_345);
+        assert_eq!(file_len.get(), 21);
+        assert!(file_mtime.get() > status.mtime);
         assert_eq!(complete_count.load(Ordering::SeqCst), 1);
         assert_eq!(cancel_count.load(Ordering::SeqCst), 0);
     }
