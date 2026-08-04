@@ -1415,10 +1415,10 @@ impl fs::FileSystem for CurvineFileSystem {
             let writer_len = self.state.get_writer_len(op.header.nodeid).await;
             if Self::setattr_size_needs_resize(op.arg.size, status.len, writer_len) {
                 let resize_opts = FileAllocOpts::with_truncate(expect_len);
-                self.state
+                status = self
+                    .state
                     .fs_resize(op.header.nodeid, op.arg.fh, resize_opts)
                     .await?;
-                status.len = expect_len;
                 self.state
                     .invalid_cache(op.header.nodeid, None, INVAL_REASON_RESIZE);
             }

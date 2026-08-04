@@ -38,7 +38,7 @@ enum WriteTask {
         Option<FuseResponse>,
         Option<SetAttrOpts>,
     ),
-    Resize(CallSender<FsResult<()>>, FileAllocOpts),
+    Resize(CallSender<FsResult<FileStatus>>, FileAllocOpts),
 }
 
 struct QueuedWriteTask {
@@ -231,8 +231,7 @@ impl FuseWriter {
         fun.await.map_err(|e| self.check_error(e))
     }
 
-    pub async fn resize(&self, opts: FileAllocOpts) -> FsResult<()> {
-        let len = opts.len;
+    pub async fn resize(&self, opts: FileAllocOpts) -> FsResult<FileStatus> {
         let fun = async {
             let (rx, tx) = CallChannel::channel();
             {
@@ -245,12 +244,10 @@ impl FuseWriter {
             }
             // Double `?`: unwrap the channel receive, then propagate the real
             // backend resize result.
-            tx.receive().await??;
-            Ok::<(), FsError>(())
+            let status = tx.receive().await??;
+            Ok::<FileStatus, FsError>(status)
         };
-        fun.await.map_err(|e| self.check_error(e))?;
-        self.len.set(len);
-        Ok(())
+        fun.await.map_err(|e| self.check_error(e))
     }
 
     pub fn len(&self) -> i64 {
@@ -398,9 +395,17 @@ impl FuseWriter {
                 WriteTask::Resize(tx, opts) => {
                     *completed = false;
                     *preserve_on_exit = true;
-                    // Propagate resize failure via tx instead of killing the worker.
-                    let res = writer.resize(opts).await;
-                    crate::fs::deliver_stream_result(res, tx, None).await?;
+                    let res = writer.resize(opts).await.map(|_| writer.status().clone());
+                    if let Ok(status) = &res {
+                        // Update at the queue execution point so a later write cannot
+                        // be overwritten by an older resize result in the caller.
+                        file_len.set(status.len);
+                        file_mtime.set(status.mtime);
+                    }
+                    // Resize has no direct kernel reply; the caller is authoritative.
+                    if let Err(e) = tx.send(res) {
+                        warn!("failed to deliver resize result to internal caller: {}", e);
+                    }
                 }
             }
         }
@@ -416,7 +421,7 @@ mod tests {
     use bytes::{Bytes, BytesMut};
     use curvine_common::error::FsError;
     use curvine_common::fs::{Path, Writer};
-    use curvine_common::state::FileStatus;
+    use curvine_common::state::{FileAllocOpts, FileStatus};
     use curvine_common::FsResult;
     use curvine_metrics::Metrics as m;
     use orpc::sync::channel::{AsyncChannel, CallChannel};
@@ -504,6 +509,12 @@ mod tests {
 
         async fn seek(&mut self, pos: i64) -> FsResult<()> {
             self.pos = pos;
+            Ok(())
+        }
+
+        async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
+            self.status.len = opts.len;
+            self.status.mtime = 2_345;
             Ok(())
         }
     }
@@ -619,6 +630,46 @@ mod tests {
             0,
             "cancelling here could delete data published by the flush"
         );
+    }
+
+    #[tokio::test]
+    async fn resize_returns_authoritative_status_and_updates_writer_snapshot() {
+        let cancel_count = Arc::new(AtomicUsize::new(0));
+        let complete_count = Arc::new(AtomicUsize::new(0));
+        let mut writer = TrackingWriter::new(cancel_count.clone(), complete_count.clone());
+        writer.status.len = 100;
+        writer.status.mtime = 1_000;
+        let file_len = Arc::new(AtomicLong::new(writer.status.len));
+        let file_mtime = Arc::new(AtomicLong::new(writer.status.mtime));
+        let (sender, receiver) = AsyncChannel::new(1).split();
+        let (result_tx, result_rx) = CallChannel::channel::<FsResult<FileStatus>>();
+        sender
+            .send(QueuedWriteTask {
+                task: WriteTask::Resize(result_tx, FileAllocOpts::with_truncate(25)),
+                queue_guard: None,
+            })
+            .await
+            .unwrap();
+        drop(sender);
+
+        FuseWriter::writer_future(
+            writer,
+            receiver,
+            file_len.clone(),
+            file_mtime.clone(),
+            "test",
+            false,
+        )
+        .await
+        .unwrap();
+
+        let status = result_rx.receive().await.unwrap().unwrap();
+        assert_eq!(status.len, 25);
+        assert_eq!(status.mtime, 2_345);
+        assert_eq!(file_len.get(), 25);
+        assert_eq!(file_mtime.get(), 2_345);
+        assert_eq!(complete_count.load(Ordering::SeqCst), 1);
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -1021,25 +1021,30 @@ impl NodeState {
         Ok(status)
     }
 
-    pub async fn fs_resize(&self, ino: u64, fh: u64, opts: FileAllocOpts) -> FuseResult<()> {
+    pub async fn fs_resize(
+        &self,
+        ino: u64,
+        fh: u64,
+        opts: FileAllocOpts,
+    ) -> FuseResult<FileStatus> {
         opts.validate()?;
 
         let path = self.get_path(ino)?;
         // Keep fallocate/truncate ordered with the inode's active writer when
         // one exists, regardless of which file handle the syscall supplied.
         if let Some(writer) = self.find_writer(ino).await {
-            writer.resize(opts).await?;
-            return Ok(());
+            return Ok(writer.resize(opts).await?);
         }
 
         if fh != 0 {
             let handle = self.find_handle(ino, fh)?;
-            handle.resize(opts).await?;
-            return Ok(());
+            return handle.resize(opts).await;
         }
 
         self.fs.resize(&path, opts).await?;
-        Ok(())
+        // The filesystem resize API does not expose its returned FileBlocks, so
+        // fetch the authoritative timestamps when no active writer is available.
+        Ok(self.fs.get_status(&path).await?)
     }
 
     pub async fn fs_rename(
