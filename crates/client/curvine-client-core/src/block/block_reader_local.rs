@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::block::BlockClient;
+use crate::block::{BlockClient, BlockReaderRemote};
 use crate::file::FsContext;
 use bytes::BytesMut;
-use curvine_core_error::{err_box, try_option};
+use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_io::LocalFile;
@@ -41,14 +41,33 @@ pub struct BlockReaderLocal {
     chunk_size: usize,
 }
 
+pub(crate) enum LocalReaderOpen {
+    Local(BlockReaderLocal),
+    Remote(BlockReaderRemote),
+}
+
+enum ReadOpenMode {
+    Local(String),
+    Remote,
+}
+
+impl ReadOpenMode {
+    fn from_path(path: Option<String>) -> Self {
+        match path {
+            Some(path) => Self::Local(path),
+            None => Self::Remote,
+        }
+    }
+}
+
 impl BlockReaderLocal {
-    pub async fn new(
+    pub(crate) async fn new(
         fs_context: Arc<FsContext>,
         block: ExtendedBlock,
         addr: WorkerAddress,
         off: i64,
         len: i64,
-    ) -> FsResult<Self> {
+    ) -> FsResult<LocalReaderOpen> {
         let req_id = Utils::req_id();
         let seq_id = 0;
 
@@ -66,8 +85,25 @@ impl BlockReaderLocal {
             )
             .await?;
 
-        let path = try_option!(read_context.path);
-        let file = LocalFile::with_read(&path, off as u64)?;
+        let path = match ReadOpenMode::from_path(read_context.path) {
+            ReadOpenMode::Local(path) => path,
+            ReadOpenMode::Remote => {
+                // The worker can reject short-circuit mode when it must synthesize a
+                // sparse logical tail. Reuse the already-open remote read session.
+                return Ok(LocalReaderOpen::Remote(BlockReaderRemote::from_opened(
+                    client, block, addr, off, len, req_id, seq_id,
+                )));
+            }
+        };
+        let file = match LocalFile::with_read(&path, off as u64) {
+            Ok(file) => file,
+            Err(e) => {
+                // Do not return a connection with an active read session to the pool.
+                let mut client = client;
+                client.clear_pool();
+                return Err(e.into());
+            }
+        };
 
         let reader = Self {
             rt: fs_context.clone_runtime(),
@@ -84,7 +120,7 @@ impl BlockReaderLocal {
             chunk_size,
         };
 
-        Ok(reader)
+        Ok(LocalReaderOpen::Local(reader))
     }
 
     fn next_seq_id(&mut self) -> i32 {
@@ -169,5 +205,26 @@ impl BlockReaderLocal {
 
     pub fn worker_address(&self) -> &WorkerAddress {
         &self.worker_address
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReadOpenMode;
+
+    #[test]
+    fn missing_short_circuit_path_selects_remote_mode() {
+        assert!(matches!(
+            ReadOpenMode::from_path(None),
+            ReadOpenMode::Remote
+        ));
+    }
+
+    #[test]
+    fn returned_short_circuit_path_selects_local_mode() {
+        assert!(matches!(
+            ReadOpenMode::from_path(Some("/data/block".to_string())),
+            ReadOpenMode::Local(path) if path == "/data/block"
+        ));
     }
 }

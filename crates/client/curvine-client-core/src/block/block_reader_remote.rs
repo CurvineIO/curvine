@@ -56,7 +56,27 @@ impl BlockReaderRemote {
             )
             .await?;
 
-        let reader = Self {
+        Ok(Self::from_opened(
+            client,
+            block,
+            worker_address,
+            off,
+            len,
+            req_id,
+            seq_id,
+        ))
+    }
+
+    pub(crate) fn from_opened(
+        client: BlockClient,
+        block: ExtendedBlock,
+        worker_address: WorkerAddress,
+        off: i64,
+        len: i64,
+        req_id: i64,
+        seq_id: i32,
+    ) -> Self {
+        Self {
             client,
             block,
             worker_address,
@@ -65,9 +85,7 @@ impl BlockReaderRemote {
             req_id,
             seq_id,
             header: None,
-        };
-
-        Ok(reader)
+        }
     }
 
     fn next_seq_id(&mut self) -> i32 {
