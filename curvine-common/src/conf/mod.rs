@@ -20,7 +20,7 @@ pub use curvine_raft::conf::JournalConfExt;
 mod tests {
     use curvine_config::{ClusterConf, WorkerDataDir};
     use curvine_model::StorageType;
-    use curvine_runtime::common::ByteUnit;
+    use orpc::common::ByteUnit;
 
     #[test]
     fn cluster() {
