@@ -527,6 +527,16 @@ impl MountOptionsBuilder {
         self
     }
 
+    /// Reset optional toggle fields to `None` so a mount `--update` preserves
+    /// existing values (`merge_with` keeps `None` fields) unless they were
+    /// explicitly provided.
+    pub fn update_only_explicit(mut self) -> Self {
+        self.auto_cache = None;
+        self.access_mode = None;
+        self.write_cache = None;
+        self
+    }
+
     pub fn build(self) -> MountOptions {
         MountOptions {
             update: self.update,
@@ -667,6 +677,39 @@ mod tests {
         assert!(!updated.auto_cache);
         assert_eq!(updated.access_mode, AccessMode::ReadWrite);
         assert!(updated.write_cache);
+    }
+
+    #[test]
+    fn test_update_only_explicit_preserves_existing_toggles() {
+        let info = MountInfo {
+            cv_path: "/mnt".to_string(),
+            ufs_path: "s3://b".to_string(),
+            auto_cache: false,
+            access_mode: AccessMode::ReadWrite,
+            write_cache: true,
+            ..Default::default()
+        };
+
+        // An update that omits the toggles must keep the existing values.
+        let merged = info.clone().merge_with(
+            MountOptions::builder()
+                .update(true)
+                .update_only_explicit()
+                .build(),
+        );
+        assert!(!merged.auto_cache);
+        assert_eq!(merged.access_mode, AccessMode::ReadWrite);
+        assert!(merged.write_cache);
+
+        // Explicitly provided values still apply.
+        let merged = info.merge_with(
+            MountOptions::builder()
+                .update(true)
+                .update_only_explicit()
+                .write_cache(false)
+                .build(),
+        );
+        assert!(!merged.write_cache);
     }
 
     #[test]

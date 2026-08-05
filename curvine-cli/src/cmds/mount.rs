@@ -89,7 +89,7 @@ pub struct MountCommand {
 
     #[arg(
         long = "write-cache",
-        help = "Whether cache_mode read_write writes should also mirror sequential create/overwrite data to Curvine. Values: true, false. Default for new mounts: false."
+        help = "Whether cache_mode read_write writes should also mirror sequential create/overwrite data to Curvine. Values: true, false. Default for new mounts: false. Omitted when used with --update."
     )]
     write_cache: Option<bool>,
 
@@ -539,7 +539,14 @@ impl MountCommand {
             TtlAction::Delete
         };
 
-        let mut opts = MountOptions::builder()
+        let mut opts = MountOptions::builder();
+        if self.update {
+            // On update, only explicitly provided optional fields are sent so
+            // omitted toggles (auto_cache/access_mode/write_cache) keep their
+            // existing mount values instead of being reset to defaults.
+            opts = opts.update_only_explicit();
+        }
+        let mut opts = opts
             .update(self.update)
             .set_properties(conf_map)
             .write_type(write_type)

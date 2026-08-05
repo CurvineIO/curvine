@@ -176,8 +176,10 @@ public final class MountRequest {
                     .setWriteType(writeType)
                     .setAutoCache(autoCache == null || autoCache)
                     .setAccessMode(accessMode == null
-                            ? AccessModeProto.ACCESS_MODE_PROTO_READ_ONLY : accessMode)
-                    .setWriteCache(writeCache != null && writeCache);
+                            ? AccessModeProto.ACCESS_MODE_PROTO_READ_ONLY : accessMode);
+            if (writeCache != null) {
+                options.setWriteCache(writeCache);
+            }
             if (storageType != null) {
                 options.setStorageType(storageType);
             }
