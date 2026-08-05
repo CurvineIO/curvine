@@ -421,16 +421,12 @@ mod tests {
     use super::{mark_dequeued, FuseWriter, QueuedWriteTask, WriteTask};
     use crate::fuse_metrics::ActiveGuard;
     use bytes::{Bytes, BytesMut};
-    use curvine_common::error::FsError;
-    use curvine_common::fs::{Path, Writer};
-    use curvine_common::state::{FileAllocOpts, FileStatus, INTERNAL_CTIME_XATTR};
-    use curvine_common::FsResult;
     use curvine_error::FsError;
     use curvine_error::FsResult;
     use curvine_fs_api::{Path, Writer};
     use curvine_io::DataSlice;
     use curvine_metrics::Metrics as m;
-    use curvine_model::FileStatus;
+    use curvine_model::{FileAllocOpts, FileStatus, INTERNAL_CTIME_XATTR};
     use curvine_runtime::sync::channel::{AsyncChannel, CallChannel};
     use curvine_runtime::sync::AtomicLong;
     use std::sync::atomic::{AtomicUsize, Ordering};
