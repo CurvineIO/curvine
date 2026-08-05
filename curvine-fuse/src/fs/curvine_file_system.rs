@@ -2278,7 +2278,7 @@ mod tests {
         FATTR_ATIME_NOW, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_UID,
         FUSE_INIT_EXT,
     };
-    use curvine_common::conf::FuseConf;
+    use curvine_config::FuseConf;
     use curvine_model::{FileAllocMode, FileStatus, FileType, INTERNAL_CTIME_XATTR};
 
     #[test]
@@ -2830,10 +2830,11 @@ mod tests {
     }
 
     fn init_conf(write_back_cache: bool, enable_splice: bool) -> FuseConf {
-        let mut conf = FuseConf::default();
-        conf.write_back_cache = write_back_cache;
-        conf.enable_splice = enable_splice;
-        conf
+        FuseConf {
+            write_back_cache,
+            enable_splice,
+            ..FuseConf::default()
+        }
     }
 
     #[test]
@@ -2916,11 +2917,11 @@ mod tests {
             | FUSE_HAS_IOCTL_DIR
             | FUSE_EXPORT_SUPPORT
             | FUSE_INIT_EXT;
-        let allowed =
-            SUPPORTED_INIT_FLAGS | splice | FUSE_WRITEBACK_CACHE | (u32::MAX & !unsafe_bits);
+        let allowed = SUPPORTED_INIT_FLAGS | splice | FUSE_WRITEBACK_CACHE;
         let conf = init_conf(true, true);
         let out = CurvineFileSystem::negotiate_out_flags(u32::MAX, &conf);
         assert_eq!(out & !allowed, 0, "no bit outside the allowed universe");
+        assert_eq!(out & unsafe_bits, 0, "unsafe bits never advertised");
     }
 
     #[test]

@@ -205,6 +205,7 @@ pub const SUPPORTED_INIT_FLAGS: u32 = FUSE_ASYNC_READ
 pub fn fuse_init_flag_names(flags: u32) -> Vec<String> {
     const KNOWN: &[(u32, &str)] = &[
         (FUSE_ASYNC_READ, "ASYNC_READ"),
+        (FUSE_DONT_MASK, "DONT_MASK"),
         (FUSE_POSIX_LOCKS, "POSIX_LOCKS"),
         (FUSE_ATOMIC_O_TRUNC, "ATOMIC_O_TRUNC"),
         (FUSE_EXPORT_SUPPORT, "EXPORT_SUPPORT"),
@@ -221,6 +222,15 @@ pub fn fuse_init_flag_names(flags: u32) -> Vec<String> {
         (FUSE_WRITEBACK_CACHE, "WRITEBACK_CACHE"),
         (FUSE_POSIX_ACL, "POSIX_ACL"),
         (FUSE_MAX_PAGES, "MAX_PAGES"),
+        (FUSE_NO_OPEN_SUPPORT, "NO_OPEN_SUPPORT"),
+        (FUSE_PARALLEL_DIROPS, "PARALLEL_DIROPS"),
+        (FUSE_HANDLE_KILLPRIV, "HANDLE_KILLPRIV"),
+        (FUSE_ABORT_ERROR, "ABORT_ERROR"),
+        (FUSE_CACHE_SYMLINKS, "CACHE_SYMLINKS"),
+        (FUSE_NO_OPENDIR_SUPPORT, "NO_OPENDIR_SUPPORT"),
+        (FUSE_EXPLICIT_INVAL_DATA, "EXPLICIT_INVAL_DATA"),
+        (FUSE_HANDLE_KILLPRIV_V2, "HANDLE_KILLPRIV_V2"),
+        (FUSE_SETXATTR_EXT, "SETXATTR_EXT"),
         (FUSE_INIT_EXT, "INIT_EXT"),
     ];
     let mut names: Vec<String> = KNOWN
