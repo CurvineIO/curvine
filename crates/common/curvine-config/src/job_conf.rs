@@ -34,6 +34,12 @@ pub struct JobConf {
     #[serde(alias = "job_cleanup_ttl")]
     pub job_cleanup_ttl_str: String,
 
+    // How long terminal load jobs stay queryable in the legacy master JobStore.
+    #[serde(skip)]
+    pub terminal_retention: Duration,
+    #[serde(alias = "terminal_retention")]
+    pub terminal_retention_str: String,
+
     // Maximum number of files allowed to be loaded by a job
     pub job_max_files: usize,
 
@@ -77,6 +83,7 @@ pub struct JobConf {
 impl JobConf {
     pub const DEFAULT_JOB_LIFE_TTL: &'static str = "24h";
     pub const DEFAULT_JOB_CLEANUP_TTL_STR: &'static str = "10m";
+    pub const DEFAULT_TERMINAL_RETENTION: &'static str = "10m";
     pub const DEFAULT_JOB_MAX_FILES: usize = 100000;
     pub const DEFAULT_MASTER_MAX_CONCURRENT_LOAD_JOBS: usize = 16;
     pub const DEFAULT_MASTER_MAX_BACKGROUND_LOAD_JOBS: usize = 1024;
@@ -91,6 +98,8 @@ impl JobConf {
     pub fn init(&mut self) -> FsResult<()> {
         self.job_life_ttl = DurationUnit::from_str(&self.job_life_ttl_str)?.as_duration();
         self.job_cleanup_ttl = DurationUnit::from_str(&self.job_cleanup_ttl_str)?.as_duration();
+        self.terminal_retention =
+            DurationUnit::from_str(&self.terminal_retention_str)?.as_duration();
         self.task_timeout = DurationUnit::from_str(&self.task_timeout_str)?.as_duration();
         self.task_report_interval =
             DurationUnit::from_str(&self.task_report_interval_str)?.as_duration();
@@ -123,6 +132,9 @@ impl Default for JobConf {
 
             job_cleanup_ttl: Default::default(),
             job_cleanup_ttl_str: Self::DEFAULT_JOB_CLEANUP_TTL_STR.to_string(),
+
+            terminal_retention: Default::default(),
+            terminal_retention_str: Self::DEFAULT_TERMINAL_RETENTION.to_string(),
 
             job_max_files: Self::DEFAULT_JOB_MAX_FILES,
             master_max_concurrent_load_jobs: Self::DEFAULT_MASTER_MAX_CONCURRENT_LOAD_JOBS,

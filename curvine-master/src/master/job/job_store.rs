@@ -224,6 +224,14 @@ impl JobStore {
         callbacks.remove(job_id);
         Ok(())
     }
+
+    pub fn remove_job(&self, job_id: &str) -> FsResult<Option<(String, JobContext)>> {
+        let removed = self.jobs.remove(job_id);
+        if removed.is_some() {
+            self.remove_callbacks(job_id)?;
+        }
+        Ok(removed)
+    }
 }
 
 impl Deref for JobStore {

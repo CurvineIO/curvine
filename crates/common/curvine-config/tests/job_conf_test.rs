@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use curvine_config::JobConf;
+use std::time::Duration;
 
 #[test]
 fn default_master_load_job_runtime_conf_is_valid() {
@@ -36,6 +37,7 @@ fn default_master_load_job_runtime_conf_is_valid() {
         conf.master_failed_load_job_retry_interval_str,
         JobConf::DEFAULT_MASTER_FAILED_LOAD_JOB_RETRY_INTERVAL
     );
+    assert_eq!(conf.terminal_retention, Duration::from_secs(10 * 60));
 }
 
 #[test]
