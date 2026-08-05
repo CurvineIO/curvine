@@ -183,20 +183,36 @@ impl BlockReader {
             let short_circuit = short_circuit && fs_context.is_local_worker(loc);
             let res: FsResult<ReaderAdapter> = {
                 if short_circuit {
-                    let reader = BlockReaderLocal::new(
+                    let local = BlockReaderLocal::new(
                         fs_context.clone(),
                         block.clone(),
                         loc.clone(),
                         off,
                         len,
                     )
-                    .await?;
-                    Ok(Local(reader))
+                    .await;
+                    match local {
+                        Ok(reader) => Ok(Local(reader)),
+                        Err(e) => {
+                            warn!(
+                                "fail to create local block reader for {}, falling back to remote: {}",
+                                loc, e
+                            );
+                            BlockReaderRemote::new(
+                                &fs_context,
+                                block.clone(),
+                                loc.clone(),
+                                off,
+                                len,
+                            )
+                            .await
+                            .map(Remote)
+                        }
+                    }
                 } else {
-                    let reader =
-                        BlockReaderRemote::new(&fs_context, block.clone(), loc.clone(), off, len)
-                            .await?;
-                    Ok(Remote(reader))
+                    BlockReaderRemote::new(&fs_context, block.clone(), loc.clone(), off, len)
+                        .await
+                        .map(Remote)
                 }
             };
             match res {
