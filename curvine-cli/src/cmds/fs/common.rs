@@ -66,6 +66,52 @@ pub fn format_size(size: u64) -> String {
     }
 }
 
+/// Formats Unix permission bits to a rwx string.
+pub fn format_permission(mode: u32) -> String {
+    let mode = mode & 0o7777;
+
+    let user_read = if mode & 0o400 != 0 { 'r' } else { '-' };
+    let user_write = if mode & 0o200 != 0 { 'w' } else { '-' };
+    let user_exec = match (mode & 0o4000 != 0, mode & 0o100 != 0) {
+        (true, true) => 's',
+        (true, false) => 'S',
+        (false, true) => 'x',
+        (false, false) => '-',
+    };
+
+    let group_read = if mode & 0o040 != 0 { 'r' } else { '-' };
+    let group_write = if mode & 0o020 != 0 { 'w' } else { '-' };
+    let group_exec = match (mode & 0o2000 != 0, mode & 0o010 != 0) {
+        (true, true) => 's',
+        (true, false) => 'S',
+        (false, true) => 'x',
+        (false, false) => '-',
+    };
+
+    let other_read = if mode & 0o004 != 0 { 'r' } else { '-' };
+    let other_write = if mode & 0o002 != 0 { 'w' } else { '-' };
+    let other_exec = match (mode & 0o1000 != 0, mode & 0o001 != 0) {
+        (true, true) => 't',
+        (true, false) => 'T',
+        (false, true) => 'x',
+        (false, false) => '-',
+    };
+
+    [
+        user_read,
+        user_write,
+        user_exec,
+        group_read,
+        group_write,
+        group_exec,
+        other_read,
+        other_write,
+        other_exec,
+    ]
+    .iter()
+    .collect()
+}
+
 /// Formats a Unix epoch timestamp in milliseconds using the local timezone.
 pub fn format_epoch_ms_local(timestamp_ms: i64, fmt: &str) -> String {
     if timestamp_ms <= 0 {
@@ -80,4 +126,25 @@ pub fn format_epoch_ms_local(timestamp_ms: i64, fmt: &str) -> String {
         .with_timezone(&chrono::Local)
         .format(fmt)
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_permission;
+
+    #[test]
+    fn test_format_permission() {
+        assert_eq!(format_permission(0o755), "rwxr-xr-x");
+        assert_eq!(format_permission(0o777), "rwxrwxrwx");
+        assert_eq!(format_permission(0o644), "rw-r--r--");
+        assert_eq!(format_permission(0o600), "rw-------");
+        assert_eq!(format_permission(0o000), "---------");
+
+        assert_eq!(format_permission(0o4755), "rwsr-xr-x");
+        assert_eq!(format_permission(0o4644), "rwSr--r--");
+        assert_eq!(format_permission(0o2775), "rwxrwsr-x");
+        assert_eq!(format_permission(0o2664), "rw-rwSr--");
+        assert_eq!(format_permission(0o1755), "rwxr-xr-t");
+        assert_eq!(format_permission(0o1666), "rw-rw-rwT");
+    }
 }

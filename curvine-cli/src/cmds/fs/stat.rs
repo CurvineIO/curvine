@@ -66,8 +66,9 @@ impl StatCommand {
                         println!("Modification time: {}", formatted_mtime);
                         println!("Ufs Modification time: {}", formatted_ufs_mtime);
                         println!(
-                            "Permission: {}rwxr-xr-x",
-                            if status.is_dir { "d" } else { "-" }
+                            "Permission: {}{}",
+                            if status.is_dir { "d" } else { "-" },
+                            crate::cmds::fs::common::format_permission(status.mode as u32)
                         );
                         println!("Owner: {}", status.owner);
                         println!("Group: {}", status.group);
