@@ -44,6 +44,7 @@ public class MountRequestTest {
         Assert.assertTrue(request.getOptions().getAutoCache());
         Assert.assertEquals(
                 AccessModeProto.ACCESS_MODE_PROTO_READ_ONLY, request.getOptions().getAccessMode());
+        Assert.assertFalse(request.getOptions().getWriteCache());
         Assert.assertEquals(
                 "https://oss.example.com", request.getOptions().getAddPropertiesOrThrow("oss.endpoint"));
         Assert.assertFalse(request.getOptions().hasProvider());
@@ -66,6 +67,7 @@ public class MountRequestTest {
                 .provider(ProviderProto.PROVIDER_PROTO_OPENDAL)
                 .autoCache(false)
                 .accessMode(AccessModeProto.ACCESS_MODE_PROTO_READ_WRITE)
+                .writeCache(true)
                 .build();
 
         Assert.assertTrue(request.getOptions().getUpdate());
@@ -85,6 +87,7 @@ public class MountRequestTest {
         Assert.assertFalse(request.getOptions().getAutoCache());
         Assert.assertEquals(
                 AccessModeProto.ACCESS_MODE_PROTO_READ_WRITE, request.getOptions().getAccessMode());
+        Assert.assertTrue(request.getOptions().getWriteCache());
     }
 
     @Test

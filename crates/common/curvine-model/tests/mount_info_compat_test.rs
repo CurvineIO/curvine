@@ -18,6 +18,24 @@ struct LegacyMountInfo {
     provider: Option<Provider>,
 }
 
+#[derive(Debug, Serialize)]
+struct LegacyMountInfoWithAutoCacheAccessMode {
+    cv_path: String,
+    ufs_path: String,
+    mount_id: u32,
+    properties: HashMap<String, String>,
+    ttl_ms: i64,
+    ttl_action: TtlAction,
+    read_verify_ufs: bool,
+    storage_type: Option<StorageType>,
+    block_size: Option<i64>,
+    replicas: Option<i32>,
+    write_type: WriteType,
+    provider: Option<Provider>,
+    auto_cache: bool,
+    access_mode: AccessMode,
+}
+
 fn legacy_mount_info() -> LegacyMountInfo {
     let mut properties = HashMap::new();
     properties.insert("k".to_string(), "v".to_string());
@@ -38,6 +56,26 @@ fn legacy_mount_info() -> LegacyMountInfo {
     }
 }
 
+fn legacy_mount_info_with_auto_cache_access_mode() -> LegacyMountInfoWithAutoCacheAccessMode {
+    let info = legacy_mount_info();
+    LegacyMountInfoWithAutoCacheAccessMode {
+        cv_path: info.cv_path,
+        ufs_path: info.ufs_path,
+        mount_id: info.mount_id,
+        properties: info.properties,
+        ttl_ms: info.ttl_ms,
+        ttl_action: info.ttl_action,
+        read_verify_ufs: info.read_verify_ufs,
+        storage_type: info.storage_type,
+        block_size: info.block_size,
+        replicas: info.replicas,
+        write_type: info.write_type,
+        provider: info.provider,
+        auto_cache: false,
+        access_mode: AccessMode::ReadWrite,
+    }
+}
+
 fn current_mount_info() -> MountInfo {
     let info = legacy_mount_info();
     MountInfo {
@@ -55,6 +93,7 @@ fn current_mount_info() -> MountInfo {
         provider: info.provider,
         auto_cache: true,
         access_mode: AccessMode::ReadOnly,
+        write_cache: false,
     }
 }
 
@@ -77,6 +116,17 @@ fn decode_persisted_mount_info_accepts_legacy_bytes() {
     assert_eq!(decoded.provider, Some(Provider::OssHdfs));
     assert!(decoded.auto_cache);
     assert_eq!(decoded.access_mode, AccessMode::ReadOnly);
+    assert!(!decoded.write_cache);
+}
+
+#[test]
+fn decode_persisted_mount_info_accepts_previous_current_bytes() {
+    let bytes = bincode::serialize(&legacy_mount_info_with_auto_cache_access_mode()).unwrap();
+    let decoded = MountInfo::decode_persisted(&bytes).unwrap();
+
+    assert!(!decoded.auto_cache);
+    assert_eq!(decoded.access_mode, AccessMode::ReadWrite);
+    assert!(!decoded.write_cache);
 }
 
 #[test]
@@ -84,12 +134,14 @@ fn decode_persisted_mount_info_keeps_current_fields() {
     let mut current = current_mount_info();
     current.auto_cache = false;
     current.access_mode = AccessMode::ReadWrite;
+    current.write_cache = true;
 
     let bytes = bincode::serialize(&current).unwrap();
     let decoded = MountInfo::decode_persisted(&bytes).unwrap();
 
     assert!(!decoded.auto_cache);
     assert_eq!(decoded.access_mode, AccessMode::ReadWrite);
+    assert!(decoded.write_cache);
     assert_eq!(decoded.cv_path, current.cv_path);
     assert_eq!(decoded.ufs_path, current.ufs_path);
     assert_eq!(decoded.mount_id, current.mount_id);

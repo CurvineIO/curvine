@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{FallbackFsReader, MountCache, MountValue, UnifiedReader, UnifiedWriter};
+use crate::{
+    FallbackFsReader, MountCache, MountValue, UnifiedReader, UnifiedWriter, WriteCacheWriter,
+};
 use bytes::BytesMut;
 use curvine_client_core::file::{CurvineFileSystem, FsClient, FsContext, FsReader};
 use curvine_client_core::ClientMetrics;
@@ -55,6 +57,7 @@ pub struct UnifiedFileSystem {
     enable_read_ufs: bool,
     audit_logging_enabled: bool,
     async_cache_pending: Arc<DashSet<String>>,
+    write_cache_pending: Arc<DashSet<String>>,
     metrics: &'static ClientMetrics,
 }
 
@@ -74,6 +77,7 @@ impl UnifiedFileSystem {
             enable_read_ufs,
             audit_logging_enabled,
             async_cache_pending: Arc::new(DashSet::new()),
+            write_cache_pending: Arc::new(DashSet::new()),
             metrics: FsContext::get_metrics(),
         };
 
@@ -677,9 +681,35 @@ impl UnifiedFileSystem {
                     write_path = ufs_path.full_path().to_owned();
                     let ufs = mount.ufs()?;
                     if flags.append() {
-                        ufs.append(&ufs_path).await
+                        return ufs.append(&ufs_path).await;
+                    }
+
+                    let writer = ufs.create_ufs_writer(&ufs_path, flags.overwrite()).await?;
+
+                    if mount.info.write_cache_enabled() {
+                        let mirror_opts = mount.info.merge_create_opts(opts);
+                        match WriteCacheWriter::new(
+                            writer,
+                            self.cv.clone(),
+                            ufs,
+                            path.clone(),
+                            ufs_path.clone(),
+                            mirror_opts,
+                            self.write_cache_pending.clone(),
+                        )
+                        .await
+                        {
+                            Ok(writer) => Ok(UnifiedWriter::WriteCache(Box::new(writer))),
+                            Err((writer, e)) => {
+                                warn!(
+                                    "failed to open write cache mirror for cv_path={}, ufs_path={}: {}",
+                                    path, ufs_path, e
+                                );
+                                Ok(writer.into_unified())
+                            }
+                        }
                     } else {
-                        ufs.create(&ufs_path, flags.overwrite()).await
+                        Ok(writer.into_unified())
                     }
                 }
             }
@@ -988,7 +1018,15 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                     .inc();
 
                 if mount.info.auto_cache() {
-                    self.async_cache(&ufs_path)?;
+                    let ufs_key = ufs_path.clone_uri();
+                    if self.write_cache_pending.contains(&ufs_key) {
+                        debug!(
+                            "skip async cache for {} while write cache mirror is pending",
+                            ufs_path
+                        );
+                    } else {
+                        self.async_cache(&ufs_path)?;
+                    }
                 }
 
                 read_path = ufs_path.full_path().to_owned();

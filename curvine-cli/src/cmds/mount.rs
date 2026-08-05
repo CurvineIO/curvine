@@ -87,6 +87,12 @@ pub struct MountCommand {
     )]
     access_mode: Option<String>,
 
+    #[arg(
+        long = "write-cache",
+        help = "Whether cache_mode read_write writes should also mirror sequential create/overwrite data to Curvine. Values: true, false. Default for new mounts: false."
+    )]
+    write_cache: Option<bool>,
+
     #[arg(long, default_value_t = false)]
     check: bool,
 
@@ -563,6 +569,10 @@ impl MountCommand {
         if let Some(access_mode_str) = self.access_mode.as_ref() {
             let access_mode = AccessMode::try_from(access_mode_str.as_str())?;
             opts = opts.access_mode(access_mode);
+        }
+
+        if let Some(write_cache) = self.write_cache {
+            opts = opts.write_cache(write_cache);
         }
 
         Ok(opts.build())
