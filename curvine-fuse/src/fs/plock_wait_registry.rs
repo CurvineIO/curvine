@@ -95,6 +95,18 @@ impl PlockDeadlockCycle {
             edges,
         }
     }
+
+    /// POSIX deadlock detection is process based. A cycle whose waiters all
+    /// report the same pid can be formed by independent OFD owners in one
+    /// process and must not be surfaced as EDEADLK.
+    pub fn spans_multiple_processes(&self) -> bool {
+        let Some(first) = self.edges.first() else {
+            return false;
+        };
+        self.edges
+            .iter()
+            .any(|edge| edge.info.pid != first.info.pid)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,8 +122,16 @@ pub(crate) enum PlockWaitDecision {
 }
 
 impl PlockWaitDecision {
+    #[cfg(test)]
     pub fn is_deadlock(&self) -> bool {
         matches!(self, Self::Deadlock { .. })
+    }
+
+    pub fn is_process_deadlock(&self) -> bool {
+        matches!(
+            self,
+            Self::Deadlock { cycle, .. } if cycle.spans_multiple_processes()
+        )
     }
 }
 
@@ -345,6 +365,21 @@ mod tests {
         assert!(reg
             .register_blocked_by(b.clone(), a.clone(), wait_info(2))
             .is_deadlock());
+    }
+
+    #[test]
+    fn same_process_ofd_cycle_is_not_a_process_deadlock() {
+        let reg = PlockWaitRegistry::new();
+        let fd1 = LockOwner::new("c", 1);
+        let fd2 = LockOwner::new("c", 2);
+        let same_pid = |unique| LockWaitInfo::new(unique, 42, 1, "/locks", 0, 4);
+
+        assert!(!reg
+            .register_blocked_by(fd1.clone(), fd2.clone(), same_pid(1))
+            .is_process_deadlock());
+        let decision = reg.register_blocked_by(fd2, fd1, same_pid(2));
+        assert!(decision.is_deadlock());
+        assert!(!decision.is_process_deadlock());
     }
 
     #[test]

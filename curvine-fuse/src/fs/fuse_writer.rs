@@ -178,7 +178,10 @@ impl FuseWriter {
     pub async fn flush(&self, reply: Option<FuseResponse>) -> FsResult<()> {
         let fun = async {
             let (rx, tx) = CallChannel::channel();
-            self.send_queued_task(WriteTask::Flush(rx, reply)).await?;
+            {
+                let _gate = self.enqueue_gate.lock().await;
+                self.send_queued_task(WriteTask::Flush(rx, reply)).await?;
+            }
             // Propagate backend flush failures even on reply=None paths.
             tx.receive().await??;
             Ok::<(), FsError>(())
