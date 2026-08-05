@@ -2178,12 +2178,15 @@ impl fs::FileSystem for CurvineFileSystem {
             let blocker = conflict.as_ref().expect("conflict lock");
             // An OFD blocker (pid == 0) does not represent a process wait edge,
             // so a POSIX waiter blocked by it cannot close a POSIX deadlock cycle.
-            let decision = (detect_deadlock && !Self::is_ofd_lock_pid(blocker.pid)).then(|| {
-                wait_guard.register_blocked_by(LockOwner::new(
+            let decision = if detect_deadlock && !Self::is_ofd_lock_pid(blocker.pid) {
+                Some(wait_guard.register_blocked_by(LockOwner::new(
                     blocker.client_id.clone(),
                     blocker.owner_id,
-                ))
-            });
+                )))
+            } else {
+                wait_guard.clear_blocked_by();
+                None
+            };
             debug!(
                 "plock SETLKW wait decision unique={} pid={} owner_id={} nodeid={} path={} range=[{},{}] blocker_pid={} blocker_owner_id={} blocker_range=[{},{}] decision={:?}",
                 op.header.unique,

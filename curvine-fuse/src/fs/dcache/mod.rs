@@ -21,7 +21,7 @@ mod dir_entry;
 pub use self::dir_entry::DirEntry;
 
 mod dir_tree;
-pub use self::dir_tree::DirTree;
+pub use self::dir_tree::{DirTree, UnlinkRollback};
 
 mod cleaner_task;
 pub use self::cleaner_task::CleanerTask;

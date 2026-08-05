@@ -105,31 +105,7 @@ def prepare_curvine_cluster(project_path, test_path='/curvine-fuse'):
             
             # A mounted FUSE endpoint is not sufficient: probe real I/O until
             # the worker is registered and can serve the data path.
-            print("Waiting for cluster data path to be ready...")
-            deadline = time.time() + 120
-            probe_path = os.path.join(test_path, f".curvine-ready-{os.getpid()}")
-            last_error = "probe did not run"
-            while time.time() < deadline:
-                try:
-                    payload = b"curvine-ready" * 8192
-                    with open(probe_path, "wb") as probe:
-                        probe.write(payload)
-                        probe.flush()
-                        os.fsync(probe.fileno())
-                    with open(probe_path, "rb") as probe:
-                        if probe.read() != payload:
-                            raise OSError("read-back mismatch")
-                    os.unlink(probe_path)
-                    print("Cluster data path is ready")
-                    return True, ""
-                except OSError as exc:
-                    last_error = str(exc)
-                    try:
-                        os.unlink(probe_path)
-                    except OSError:
-                        pass
-                    time.sleep(2)
-            return False, f"Cluster mounted but data path was not ready: {last_error}"
+            return probe_data_path_ready(test_path)
         finally:
             os.chdir(original_cwd)
             
@@ -139,6 +115,43 @@ def prepare_curvine_cluster(project_path, test_path='/curvine-fuse'):
         import traceback
         traceback.print_exc()
         return False, error_msg
+
+
+def probe_data_path_ready(test_path, deadline_seconds=120):
+    """Probe the mounted FUSE path until read/write I/O succeeds.
+
+    Args:
+        test_path: Mount point path to probe
+        deadline_seconds: Maximum seconds to wait (default: 120)
+
+    Returns:
+        tuple: (success: bool, error_message: str)
+    """
+    print("Waiting for cluster data path to be ready...")
+    deadline = time.time() + deadline_seconds
+    probe_path = os.path.join(test_path, f".curvine-ready-{os.getpid()}")
+    last_error = "probe did not run"
+    while time.time() < deadline:
+        try:
+            payload = b"curvine-ready" * 8192
+            with open(probe_path, "wb") as probe:
+                probe.write(payload)
+                probe.flush()
+                os.fsync(probe.fileno())
+            with open(probe_path, "rb") as probe:
+                if probe.read() != payload:
+                    raise OSError("read-back mismatch")
+            os.unlink(probe_path)
+            print("Cluster data path is ready")
+            return True, ""
+        except OSError as exc:
+            last_error = str(exc)
+            try:
+                os.unlink(probe_path)
+            except OSError:
+                pass
+            time.sleep(2)
+    return False, f"Cluster mounted but data path was not ready: {last_error}"
 
 
 def ensure_cluster_ready(project_path, test_path='/curvine-fuse', max_wait_seconds=10):
@@ -158,8 +171,8 @@ def ensure_cluster_ready(project_path, test_path='/curvine-fuse', max_wait_secon
     # First check if mount point is already ready
     is_mounted, mount_error = check_mount_point(test_path, max_wait_seconds=max_wait_seconds)
     if is_mounted:
-        print(f"Mount point {test_path} is already mounted and ready")
-        return True, ""
+        print(f"Mount point {test_path} is already mounted, probing data path...")
+        return probe_data_path_ready(test_path, deadline_seconds=max(max_wait_seconds, 120))
     
     # If not mounted, prepare the cluster
     print(f"Mount point {test_path} is not ready, preparing cluster...")
@@ -171,7 +184,11 @@ def ensure_cluster_ready(project_path, test_path='/curvine-fuse', max_wait_secon
     is_mounted, mount_error = check_mount_point(test_path, max_wait_seconds=max_wait_seconds)
     if not is_mounted:
         return False, f"Cluster prepared but mount point check failed: {mount_error}"
-    
+
+    success, probe_error = probe_data_path_ready(test_path, deadline_seconds=max(max_wait_seconds, 120))
+    if not success:
+        return False, probe_error
+
     print(f"Cluster is ready, mount point {test_path} is mounted")
     return True, ""
 

@@ -24,7 +24,7 @@ use crate::fuse_metrics::{
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{
     err_fuse, FuseError, FuseMetrics, FuseResult, FuseUtils, FUSE_CURRENT_DIR, FUSE_PARENT_DIR,
-    FUSE_PATH_SEPARATOR, FUSE_ROOT_ID, STATE_FILE_MAGIC, STATE_FILE_VERSION,
+    FUSE_ROOT_ID, STATE_FILE_MAGIC, STATE_FILE_VERSION,
 };
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_config::ClusterConf;
@@ -279,7 +279,7 @@ impl NodeState {
     pub fn unlink(&self, ino: u64, name: &str, mark_delete: bool) -> FuseResult<bool> {
         let before = self.dir_read().inode_lens();
         let mut dir = self.dir_write();
-        let last_link = dir.unlink(ino, name, mark_delete)?;
+        let (last_link, _) = dir.unlink(ino, name, mark_delete)?;
         let after = dir.inode_lens();
         drop(dir);
         for _ in 0..before.saturating_sub(after) {
@@ -288,6 +288,51 @@ impl NodeState {
             });
         }
         Ok(last_link)
+    }
+
+    fn restore_unlink_state(&self, rollback: crate::fs::dcache::UnlinkRollback) -> FuseResult<()> {
+        self.dir_write().restore_unlink(rollback)
+    }
+
+    async fn repoint_canonical_from_master(
+        &self,
+        ino: u64,
+        removed_parent: u64,
+        removed_name: &str,
+    ) -> FuseResult<()> {
+        let (master_id, needs_repoint) = {
+            let dir = self.dir_read();
+            let Some(inode) = dir.get_inode(ino, None) else {
+                return Ok(());
+            };
+            let needs = dir.canonical_matches(ino, removed_parent, removed_name);
+            (inode.status.id, needs)
+        };
+        if !needs_repoint || master_id <= 0 {
+            return Ok(());
+        }
+
+        let dir_inos = self.dir_read().cached_dir_inos();
+        for dir_ino in dir_inos {
+            let path = match self.get_path_common(dir_ino, None) {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
+            let statuses = match self.fs.list_status(&path).await {
+                Ok(statuses) => statuses,
+                Err(_) => continue,
+            };
+            for status in statuses {
+                if status.id == master_id
+                    && !(dir_ino == removed_parent && status.name == removed_name)
+                {
+                    let name = status.name.clone();
+                    self.dir_write().repoint_canonical(ino, dir_ino, name)?;
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn forget(&self, ino: u64, n_lookup: u64) -> FuseResult<()> {
@@ -662,10 +707,10 @@ impl NodeState {
 
         // Always mark for deletion and remove the directory entry first, and check
         // has_open_handles inside the same dir_write critical section.
-        let (has_handles, last_link) = {
+        let (has_handles, last_link, rollback) = {
             let mut dir = self.dir_write();
-            let last_link = dir.unlink(parent, name, true)?;
-            (self.has_open_handles(ino), last_link)
+            let (last_link, rollback) = dir.unlink(parent, name, true)?;
+            (self.has_open_handles(ino), last_link, rollback)
         };
 
         // Removing one of several hard links must reach the master immediately:
@@ -673,10 +718,14 @@ impl NodeState {
         // directory entry. Open handles do not require deferral while another
         // link still keeps the inode alive.
         if !last_link {
+            if !rollback.repointed && self.dir_read().canonical_matches(ino, parent, name) {
+                self.repoint_canonical_from_master(ino, parent, name)
+                    .await?;
+            }
             match self.fs.delete(&path, false).await {
                 Ok(()) | Err(FsError::FileNotFound(_)) => (),
                 Err(e) => {
-                    self.clear_unlink_state(ino, parent, name)?;
+                    self.restore_unlink_state(rollback)?;
                     return Err(e.into());
                 }
             }
@@ -702,7 +751,7 @@ impl NodeState {
             Ok(()) => (),
             Err(FsError::FileNotFound(_)) => (),
             Err(e) => {
-                self.clear_unlink_state(ino, parent, name)?;
+                self.restore_unlink_state(rollback)?;
                 return Err(e.into());
             }
         }
@@ -868,26 +917,34 @@ impl NodeState {
     }
 
     pub async fn fs_lookup(&self, ino: u64, name: &str) -> FuseResult<fuse_attr> {
+        if name == FUSE_CURRENT_DIR || name == FUSE_PARENT_DIR {
+            let dir = self.dir_read();
+            let inode = dir.get_inode_check(ino, None)?;
+            let to_root = inode.is_root()
+                || (name == FUSE_PARENT_DIR && dir.get_inode_check(inode.parent, None)?.is_root());
+            if to_root {
+                let root = dir.get_inode_check(FUSE_ROOT_ID, None)?;
+                if self.conf.metrics_enabled {
+                    FuseMetrics::with(|m| m.record_node_cache_lookup(CACHE_RESULT_HIT));
+                }
+                let mut attr = root.to_attr(&self.conf)?;
+                attr.ino = FUSE_ROOT_ID;
+                return Ok(attr);
+            }
+        }
+
         let (ino, cow_name) = if name == FUSE_CURRENT_DIR {
             let dir = self.dir_read();
             let inode = dir.get_inode_check(ino, None)?;
-            if inode.is_root() {
-                (FUSE_ROOT_ID, Cow::Owned(FUSE_PATH_SEPARATOR.to_owned()))
-            } else {
-                (inode.parent, Cow::Owned(inode.name.to_owned()))
-            }
+            (inode.parent, Cow::Owned(inode.name.to_owned()))
         } else if name == FUSE_PARENT_DIR {
             let dir = self.dir_read();
             let inode = dir.get_inode_check(ino, None)?;
-            if inode.is_root() {
-                (FUSE_ROOT_ID, Cow::Owned(FUSE_PATH_SEPARATOR.to_owned()))
-            } else {
-                let parent_inode = dir.get_inode_check(inode.parent, None)?;
-                (
-                    parent_inode.parent,
-                    Cow::Owned(parent_inode.name.to_owned()),
-                )
-            }
+            let parent_inode = dir.get_inode_check(inode.parent, None)?;
+            (
+                parent_inode.parent,
+                Cow::Owned(parent_inode.name.to_owned()),
+            )
         } else {
             (ino, Cow::Borrowed(name))
         };
@@ -1723,6 +1780,53 @@ mod test {
             .complete_deferred_delete(ino, Err(FsError::file_not_found("/pending")))
             .unwrap();
         assert!(!state.dir_read().pending_delete(ino));
+    }
+
+    #[test]
+    fn fs_lookup_root_dot_and_dotdot_returns_root_attr() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.block_on(async {
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+
+            let dot = state
+                .fs_lookup(FUSE_ROOT_ID, crate::FUSE_CURRENT_DIR)
+                .await
+                .unwrap();
+            let dotdot = state
+                .fs_lookup(FUSE_ROOT_ID, crate::FUSE_PARENT_DIR)
+                .await
+                .unwrap();
+            assert_eq!(dot.ino, FUSE_ROOT_ID);
+            assert_eq!(dotdot.ino, FUSE_ROOT_ID);
+        });
+    }
+
+    #[test]
+    fn fs_lookup_child_of_root_dotdot_returns_root_attr() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.block_on(async {
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+
+            let child_ino = {
+                let mut dir = state.dir_write();
+                dir.lookup(
+                    FUSE_ROOT_ID,
+                    "child",
+                    FileStatus::with_name(42, "child".to_string(), false),
+                    true,
+                )
+                .unwrap()
+                .ino
+            };
+
+            let parent = state
+                .fs_lookup(child_ino, crate::FUSE_PARENT_DIR)
+                .await
+                .unwrap();
+            assert_eq!(parent.ino, FUSE_ROOT_ID);
+        });
     }
 
     #[cfg(target_os = "linux")]
