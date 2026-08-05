@@ -784,43 +784,48 @@ impl CurvineFileSystem {
         Self::permission_mask_allows(permission_bits, mask)
     }
 
+    /// POSIX permission model for SETATTR issued by a non-root caller.
+    ///
+    /// `target_uid`/`target_gid` are the *normalized* chown targets: the caller is expected
+    /// to have already dropped the `(uid_t)-1` / `(gid_t)-1` "keep current" sentinels to
+    /// `None` (see `CurvineFileSystem::set_attr`). Therefore a `Some(_)` here always denotes
+    /// a genuine ownership change request, and we no longer need to inspect the raw
+    /// FATTR_UID/FATTR_GID bits or special-case `u32::MAX`.
     fn check_setattr_permission(
         check_permission: bool,
-        caller_uid: u32,
-        caller_gid: u32,
-        caller_pid: u32,
+        header: &fuse_in_header,
         file_uid: u32,
+        file_gid: u32,
         valid: u32,
+        target_uid: Option<u32>,
         target_gid: Option<u32>,
     ) -> FuseResult<()> {
+        let caller_uid = header.uid;
+        let caller_gid = header.gid;
+        let caller_pid = header.pid;
         if !check_permission || caller_uid == 0 {
             return Ok(());
         }
 
-        if (valid & FATTR_UID) != 0 {
-            return err_fuse!(
-                libc::EPERM,
-                "setattr uid change requires privilege for uid {}",
-                caller_uid
-            );
-        }
-
-        if (valid & FATTR_GID) != 0 {
-            if caller_uid != file_uid {
+        // Changing the owner uid is privileged: non-root may only "change" it to the
+        // current value (a no-op), which after normalization is simply Some(file_uid).
+        if let Some(uid) = target_uid {
+            if uid != file_uid || caller_uid != file_uid {
                 return err_fuse!(
                     libc::EPERM,
-                    "setattr gid change denied for non-owner uid {}",
+                    "setattr uid change requires privilege for uid {}",
                     caller_uid
                 );
             }
-            if let Some(gid) = target_gid {
-                if !FuseUtils::caller_in_file_group(caller_gid, gid, caller_pid) {
-                    return err_fuse!(
-                        libc::EPERM,
-                        "setattr gid change denied for gid {} not in caller groups",
-                        gid
-                    );
-                }
+        }
+
+        if let Some(gid) = target_gid {
+            if gid != file_gid && !FuseUtils::caller_in_file_group(caller_gid, gid, caller_pid) {
+                return err_fuse!(
+                    libc::EPERM,
+                    "setattr gid change denied for gid {} not in caller groups",
+                    gid
+                );
             }
         }
 
@@ -920,17 +925,17 @@ impl CurvineFileSystem {
     }
 
     /// Linux utime(2): owner/root may always set times; NULL/`*_NOW` also allow W_OK.
-    #[allow(clippy::too_many_arguments)]
     fn check_utime_setattr_permission(
         check_permission: bool,
         valid: u32,
-        caller_uid: u32,
-        caller_gid: u32,
-        caller_pid: u32,
+        header: &fuse_in_header,
         file_uid: u32,
         file_gid: u32,
         mode: u32,
     ) -> FuseResult<()> {
+        let caller_uid = header.uid;
+        let caller_gid = header.gid;
+        let caller_pid = header.pid;
         if !check_permission || caller_uid == 0 || caller_uid == file_uid {
             return Ok(());
         }
@@ -1327,7 +1332,15 @@ impl fs::FileSystem for CurvineFileSystem {
         let cur_status = self.state.fs_stat(op.header.nodeid, None).await?;
         let file_uid = self.resolve_file_uid(&cur_status.owner);
         let file_gid = self.resolve_file_gid(&cur_status.group);
-        let target_gid = if (op.arg.valid & FATTR_GID) != 0 {
+        // Normalize the (uid_t)-1 sentinel from chown(2)/fchown/lchown here so downstream
+        // permission checks and SetAttrOpts persistence both see "attribute not present"
+        // rather than the literal 4294967295.
+        let target_uid = if (op.arg.valid & FATTR_UID) != 0 && op.arg.uid != u32::MAX {
+            Some(op.arg.uid)
+        } else {
+            None
+        };
+        let target_gid = if (op.arg.valid & FATTR_GID) != 0 && op.arg.gid != u32::MAX {
             Some(op.arg.gid)
         } else {
             None
@@ -1348,9 +1361,7 @@ impl fs::FileSystem for CurvineFileSystem {
             Self::check_utime_setattr_permission(
                 self.conf.check_permission,
                 op.arg.valid,
-                op.header.uid,
-                op.header.gid,
-                op.header.pid,
+                op.header,
                 file_uid,
                 file_gid,
                 cur_status.mode,
@@ -1358,11 +1369,11 @@ impl fs::FileSystem for CurvineFileSystem {
         } else {
             Self::check_setattr_permission(
                 self.conf.check_permission,
-                op.header.uid,
-                op.header.gid,
-                op.header.pid,
+                op.header,
                 file_uid,
+                file_gid,
                 op.arg.valid,
+                target_uid,
                 target_gid,
             )?;
         }
@@ -1387,9 +1398,12 @@ impl fs::FileSystem for CurvineFileSystem {
             }
         }
 
-        // Apply chown suid/sgid rules when owner or group changes on regular files.
-        // If kernel didn't provide FATTR_MODE, we still need to clear bits accordingly.
-        if (op.arg.valid & (FATTR_UID | FATTR_GID)) != 0 && cur_status.file_type == FileType::File {
+        // Apply chown suid/sgid rules only when owner or group actually changes on a
+        // regular file. Note we check the normalized opts here rather than op.arg.valid
+        // so that (uid_t)-1 sentinels — which appear on the wire as FATTR_UID/FATTR_GID
+        // but do not change ownership — don't trigger the side effect.
+        let chown_effective = opts.owner.is_some() || opts.group.is_some();
+        if chown_effective && cur_status.file_type == FileType::File {
             let mut new_mode = if let Some(mode) = opts.mode {
                 mode
             } else {
@@ -2274,11 +2288,27 @@ impl fs::FileSystem for CurvineFileSystem {
 #[cfg(test)]
 mod tests {
     use crate::fs::dcache::Inode;
+    use crate::raw::fuse_abi::fuse_in_header;
     use crate::{
         FATTR_ATIME_NOW, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_UID,
         FUSE_INIT_EXT,
     };
     use curvine_model::{FileAllocMode, FileStatus, FileType, INTERNAL_CTIME_XATTR};
+
+    /// Build a minimal `fuse_in_header` for permission-check tests. Only uid/gid/pid
+    /// matter for the checks under test; other fields are zeroed.
+    fn hdr(uid: u32, gid: u32, pid: u32) -> fuse_in_header {
+        fuse_in_header {
+            len: 0,
+            opcode: 0,
+            unique: 0,
+            nodeid: 0,
+            uid,
+            gid,
+            pid,
+            padding: 0,
+        }
+    }
 
     #[test]
     fn full_range_unlock_accepts_kernel_offset_max_and_u64_max() {
@@ -2543,8 +2573,15 @@ mod tests {
 
     #[test]
     fn setattr_permission_denies_non_owner_chown() {
+        // caller uid=1000 attempts to change owner to uid=2000 on a root-owned file.
         let err = super::CurvineFileSystem::check_setattr_permission(
-            true, 1000, 1000, 0, 0, FATTR_UID, None,
+            true,
+            &hdr(1000, 1000, 0),
+            0,
+            0,
+            FATTR_UID,
+            Some(2000),
+            None,
         )
         .unwrap_err();
         assert_eq!(err.errno(), libc::EPERM);
@@ -2552,8 +2589,15 @@ mod tests {
 
     #[test]
     fn setattr_permission_denies_owner_uid_change() {
+        // Owner (uid=1000) tries to hand ownership over to uid=2000 → EPERM.
         let err = super::CurvineFileSystem::check_setattr_permission(
-            true, 1000, 1000, 0, 1000, FATTR_UID, None,
+            true,
+            &hdr(1000, 1000, 0),
+            1000,
+            0,
+            FATTR_UID,
+            Some(2000),
+            None,
         )
         .unwrap_err();
         assert_eq!(err.errno(), libc::EPERM);
@@ -2561,14 +2605,28 @@ mod tests {
 
     #[test]
     fn setattr_permission_allows_root_chown() {
-        super::CurvineFileSystem::check_setattr_permission(true, 0, 0, 0, 1000, FATTR_UID, None)
-            .unwrap();
+        super::CurvineFileSystem::check_setattr_permission(
+            true,
+            &hdr(0, 0, 0),
+            1000,
+            0,
+            FATTR_UID,
+            Some(2000),
+            None,
+        )
+        .unwrap();
     }
 
     #[test]
     fn setattr_permission_allows_owner_mode_change() {
         super::CurvineFileSystem::check_setattr_permission(
-            true, 1000, 1000, 0, 1000, FATTR_MODE, None,
+            true,
+            &hdr(1000, 1000, 0),
+            1000,
+            0,
+            FATTR_MODE,
+            None,
+            None,
         )
         .unwrap();
     }
@@ -2577,11 +2635,11 @@ mod tests {
     fn setattr_permission_denies_owner_gid_to_foreign_group() {
         let err = super::CurvineFileSystem::check_setattr_permission(
             true,
+            &hdr(1000, 100, 0),
             1000,
             100,
-            0,
-            1000,
             FATTR_GID,
+            None,
             Some(200),
         )
         .unwrap_err();
@@ -2592,11 +2650,11 @@ mod tests {
     fn setattr_permission_allows_owner_gid_to_own_group() {
         super::CurvineFileSystem::check_setattr_permission(
             true,
+            &hdr(1000, 100, 0),
             1000,
-            100,
-            0,
-            1000,
+            50,
             FATTR_GID,
+            None,
             Some(100),
         )
         .unwrap();
@@ -2606,14 +2664,97 @@ mod tests {
     fn setattr_permission_ignores_mtime_only_changes() {
         super::CurvineFileSystem::check_setattr_permission(
             true,
-            1000,
-            1000,
+            &hdr(1000, 1000, 0),
             0,
             0,
             FATTR_MTIME,
             None,
+            None,
         )
         .unwrap();
+    }
+
+    /// pjdfstest chown/00.t regression: owner may keep uid unchanged and move gid to a
+    /// supplementary group in the same setattr call. Historically curvine returned EPERM
+    /// because FATTR_UID was rejected unconditionally.
+    #[test]
+    fn setattr_permission_allows_owner_uid_noop_with_gid_change_to_own_group() {
+        super::CurvineFileSystem::check_setattr_permission(
+            true,
+            &hdr(65534, 65532, 0),
+            65534,
+            65532,
+            FATTR_UID | FATTR_GID,
+            Some(65534),
+            Some(65532),
+        )
+        .unwrap();
+    }
+
+    /// Owner passing FATTR_UID with an unchanged uid must not fail even without FATTR_GID.
+    #[test]
+    fn setattr_permission_allows_owner_uid_noop() {
+        super::CurvineFileSystem::check_setattr_permission(
+            true,
+            &hdr(1000, 1000, 0),
+            1000,
+            1000,
+            FATTR_UID,
+            Some(1000),
+            None,
+        )
+        .unwrap();
+    }
+
+    /// Owner keeping the current gid must be allowed even if the gid is not in the
+    /// caller's supplementary group set (common when chown wraps chown(f, -1, -1)).
+    #[test]
+    fn setattr_permission_allows_owner_gid_noop_outside_supplementary() {
+        super::CurvineFileSystem::check_setattr_permission(
+            true,
+            &hdr(1000, 100, 0),
+            1000,
+            200,
+            FATTR_GID,
+            None,
+            Some(200),
+        )
+        .unwrap();
+    }
+
+    /// After upstream normalization in `set_attr`, `(uid_t)-1` / `(gid_t)-1` sentinels are
+    /// dropped to `None` before reaching this function, so a "keep current" chown looks
+    /// like a plain no-op with no ownership targets. Verify that shape is accepted.
+    #[test]
+    fn setattr_permission_accepts_normalized_keep_current_chown() {
+        super::CurvineFileSystem::check_setattr_permission(
+            true,
+            &hdr(1000, 100, 0),
+            1000,
+            100,
+            FATTR_MODE,
+            None,
+            None,
+        )
+        .unwrap();
+    }
+
+    /// Defense-in-depth: even if a raw u32::MAX sentinel somehow reached this function
+    /// unnormalized, it denotes "change owner to 4294967295", which for a non-root caller
+    /// that does not own uid 4294967295 must be rejected rather than silently accepted.
+    #[test]
+    fn setattr_permission_rejects_raw_uint_max_uid_from_non_owner() {
+        let err = super::CurvineFileSystem::check_setattr_permission(
+            true,
+            &hdr(1000, 100, 0),
+            1000,
+            100,
+            FATTR_UID,
+            Some(u32::MAX),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.errno(), libc::EPERM);
     }
 
     #[test]
@@ -2632,9 +2773,7 @@ mod tests {
         super::CurvineFileSystem::check_utime_setattr_permission(
             true,
             FATTR_ATIME_NOW | FATTR_MTIME_NOW,
-            1000,
-            100,
-            0,
+            &hdr(1000, 100, 0),
             0,
             100,
             0o660,
@@ -2647,9 +2786,7 @@ mod tests {
         let err = super::CurvineFileSystem::check_utime_setattr_permission(
             true,
             FATTR_MTIME,
-            1000,
-            100,
-            0,
+            &hdr(1000, 100, 0),
             0,
             100,
             0o666,
@@ -2663,9 +2800,7 @@ mod tests {
         let err = super::CurvineFileSystem::check_utime_setattr_permission(
             true,
             FATTR_ATIME_NOW | FATTR_MTIME_NOW,
-            1000,
-            100,
-            0,
+            &hdr(1000, 100, 0),
             0,
             100,
             0o555,

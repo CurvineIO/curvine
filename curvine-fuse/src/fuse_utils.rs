@@ -652,10 +652,16 @@ impl FuseUtils {
     }
 
     pub fn fuse_setattr_to_opts(setattr: &fuse_setattr_in) -> FuseResult<SetAttrOpts> {
-        // FATTR_SIZE is intentionally handled by CurvineFileSystem::set_attr because resizing
-        // requires the file handle and cache invalidation managed by the caller.
+        // FATTR_SIZE is intentionally handled by CurvineFileSystem::set_attr because
+        // resizing requires the file handle and cache invalidation managed by the caller.
 
-        let owner = if (setattr.valid & FATTR_UID) != 0 {
+        // POSIX chown(2) uses (uid_t)-1 as a "keep current" sentinel. libc and the
+        // kernel still set FATTR_UID/FATTR_GID in that case, so translate the sentinel
+        // back to "attribute not present" here — otherwise the numeric fallback below
+        // would persist "4294967295" as the literal owner/group, and
+        // CurvineFileSystem::set_attr would trigger the chown suid/sgid clearing side
+        // effect on a no-op update.
+        let owner = if (setattr.valid & FATTR_UID) != 0 && setattr.uid != u32::MAX {
             match sys::get_username_by_uid(setattr.uid) {
                 Some(username) => Some(username),
                 None => Some(setattr.uid.to_string()),
@@ -664,7 +670,7 @@ impl FuseUtils {
             None
         };
 
-        let group = if (setattr.valid & FATTR_GID) != 0 {
+        let group = if (setattr.valid & FATTR_GID) != 0 && setattr.gid != u32::MAX {
             match sys::get_groupname_by_gid(setattr.gid) {
                 Some(groupname) => Some(groupname),
                 None => Some(setattr.gid.to_string()),
@@ -1288,5 +1294,95 @@ mod tests {
         assert_eq!(attr.mode & 0o7777, 0o777);
         assert_eq!(attr.rdev, 42);
         assert_eq!(attr.size, 0);
+    }
+
+    /// chown(2)'s (uid_t)-1 sentinel must not be persisted as a literal owner. The kernel
+    /// still sets FATTR_UID when uid=u32::MAX; the conversion must drop the field so
+    /// SetAttrOpts.owner is None (i.e. "do not change") rather than "4294967295".
+    #[test]
+    fn setattr_uid_minus_one_sentinel_is_dropped() {
+        let setattr = fuse_setattr_in {
+            valid: FATTR_UID,
+            uid: u32::MAX,
+            ..Default::default()
+        };
+        let opts = FuseUtils::fuse_setattr_to_opts(&setattr).unwrap();
+        assert!(
+            opts.owner.is_none(),
+            "uid=-1 sentinel must be dropped, got owner={:?}",
+            opts.owner
+        );
+        assert!(opts.group.is_none());
+    }
+
+    /// Same guarantee for chown's second parameter (gid_t)-1.
+    #[test]
+    fn setattr_gid_minus_one_sentinel_is_dropped() {
+        let setattr = fuse_setattr_in {
+            valid: FATTR_GID,
+            gid: u32::MAX,
+            ..Default::default()
+        };
+        let opts = FuseUtils::fuse_setattr_to_opts(&setattr).unwrap();
+        assert!(
+            opts.group.is_none(),
+            "gid=-1 sentinel must be dropped, got group={:?}",
+            opts.group
+        );
+        assert!(opts.owner.is_none());
+    }
+
+    /// Sentinels must be dropped independently: `chown(f, real_uid, -1)` should still
+    /// update the owner but leave the group unchanged.
+    #[test]
+    fn setattr_mixed_uid_change_and_gid_sentinel() {
+        let setattr = fuse_setattr_in {
+            valid: FATTR_UID | FATTR_GID,
+            uid: 1000,
+            gid: u32::MAX,
+            ..Default::default()
+        };
+        let opts = FuseUtils::fuse_setattr_to_opts(&setattr).unwrap();
+        assert!(
+            opts.owner.is_some(),
+            "real uid=1000 must map to Some(owner)"
+        );
+        assert!(
+            opts.group.is_none(),
+            "gid=-1 must drop group, got {:?}",
+            opts.group
+        );
+    }
+
+    /// uid=0 (root) is a valid owner, not a sentinel. Regression guard against
+    /// misreading "no username entry for 0" as "drop the attribute".
+    #[test]
+    fn setattr_uid_zero_is_valid_owner() {
+        let setattr = fuse_setattr_in {
+            valid: FATTR_UID,
+            uid: 0,
+            ..Default::default()
+        };
+        let opts = FuseUtils::fuse_setattr_to_opts(&setattr).unwrap();
+        assert!(
+            opts.owner.is_some(),
+            "uid=0 must be treated as a real owner"
+        );
+    }
+
+    /// FATTR_UID/GID bits absent → nothing to persist.
+    #[test]
+    fn setattr_without_uid_gid_flags_leaves_owner_group_none() {
+        let setattr = fuse_setattr_in {
+            valid: FATTR_MODE,
+            mode: 0o644,
+            uid: 12345, // These values must be ignored because the FATTR bits are unset.
+            gid: 67890,
+            ..Default::default()
+        };
+        let opts = FuseUtils::fuse_setattr_to_opts(&setattr).unwrap();
+        assert!(opts.owner.is_none());
+        assert!(opts.group.is_none());
+        assert_eq!(opts.mode, Some(0o644));
     }
 }
