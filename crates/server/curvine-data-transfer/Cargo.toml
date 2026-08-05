@@ -15,6 +15,7 @@ transfer-server = [
     "transfer-store-sqlite",
     "transfer-store-mysql",
 ]
+fault-injection = ["curvine-fault/http-server"]
 opendal = ["curvine-unified-fs/opendal"]
 opendal-s3 = ["opendal", "curvine-unified-fs/opendal-s3"]
 opendal-oss = ["opendal", "curvine-unified-fs/opendal-oss"]
@@ -43,6 +44,7 @@ curvine-job-client = { workspace = true }
 curvine-metrics = { workspace = true }
 curvine-unified-fs = { workspace = true }
 curvine-ufs-api = { workspace = true }
+curvine-fault = { workspace = true }
 curvine-web = { workspace = true, optional = true }
 prost = { workspace = true }
 bytes = { workspace = true }

@@ -23,10 +23,11 @@ use curvine_job_client::JobMasterClient;
 use curvine_job_client::TransferClient;
 use curvine_model::transfer_failure_message;
 use curvine_model::{
-    CreateFileOptsBuilder, FileBlocks, FileStatus, JobTaskProgress, JobTaskState,
+    CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileStatus, JobTaskProgress, JobTaskState,
     SetAttrOptsBuilder, TRANSFER_TEMP_PATH_MARKER,
 };
 use curvine_runtime::common::{LocalTime, TimeSpent};
+use curvine_runtime::runtime::{JoinHandle, RpcRuntime};
 use curvine_unified_fs::{UfsFileSystem, UnifiedReader, UnifiedWriter};
 use log::{debug, error, info, warn};
 use std::sync::Arc;
@@ -141,7 +142,7 @@ impl LoadTaskRunner {
     }
 
     pub async fn run(&self) -> bool {
-        match self.run0().await {
+        let remove_task = match self.run0().await {
             Ok(remove_task) => remove_task,
             Err(e) => {
                 if self.task.is_cancel() {
@@ -182,7 +183,18 @@ impl LoadTaskRunner {
                 }
                 true
             }
+        };
+
+        crate::fault_point! {
+            async,
+            name: "worker.load_task.after_run",
+            description: "After a worker load task runner has fully exited",
+            context: {
+                "task_id" => self.task.info.task_id.clone(),
+            },
         }
+
+        remove_task
     }
 
     async fn run0(&self) -> FsResult<bool> {
@@ -196,6 +208,19 @@ impl LoadTaskRunner {
 
         self.task
             .update_state(JobTaskState::Loading, "Task started");
+
+        let source_path = Path::from_str(&self.task.info.source_path)?;
+        let target_path = Path::from_str(&self.task.info.target_path)?;
+        if self.task.info.transfer_report.is_none()
+            && !source_path.is_cv()
+            && target_path.is_cv()
+            && self.max_parallel_streams() > 1
+        {
+            let src_len = self.get_ufs()?.get_status(&source_path).await?.len;
+            if self.effective_streams(src_len) > 1 {
+                return self.run_parallel(&source_path, &target_path, src_len).await;
+            }
+        }
 
         let mut stream = self.create_stream().await?;
         if self.task.is_cancel() {
@@ -765,6 +790,239 @@ impl LoadTaskRunner {
             self.master_client
                 .report_task(&task.job.job_id, &task.task_id, progress)
                 .await
+        }
+    }
+
+    /// Upper bound on the number of independent reader+writer streams a large
+    /// UFS->CV load may fan out into.
+    fn max_parallel_streams(&self) -> usize {
+        self.task
+            .info
+            .job
+            .mount_info
+            .properties
+            .get("load_task.parallel_streams")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(8)
+            .max(1)
+    }
+
+    fn min_bytes_per_stream(&self) -> i64 {
+        self.task
+            .info
+            .job
+            .mount_info
+            .properties
+            .get("load_task.min_bytes_per_stream")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(256 * 1024 * 1024)
+            .max(1)
+    }
+
+    fn effective_streams(&self, src_len: i64) -> usize {
+        Self::stream_count(
+            src_len,
+            self.min_bytes_per_stream(),
+            self.max_parallel_streams(),
+        )
+    }
+
+    fn stream_count(src_len: i64, min_bytes: i64, cap: usize) -> usize {
+        let min_bytes = min_bytes.max(1);
+        let cap = cap.max(1);
+        let by_size = (src_len / min_bytes).max(0) as usize;
+        by_size.clamp(1, cap)
+    }
+
+    fn segment_len(src_len: i64, streams: usize, block_size: i64) -> i64 {
+        let streams = streams.max(1) as i64;
+        let block_size = block_size.max(1);
+        let raw = (src_len + streams - 1) / streams;
+        let aligned = ((raw + block_size - 1) / block_size) * block_size;
+        aligned.max(block_size)
+    }
+
+    const READ_CHUNK_BYTES: i64 = 16 * 1024 * 1024;
+
+    async fn run_parallel(
+        &self,
+        source_path: &Path,
+        target_path: &Path,
+        src_len: i64,
+    ) -> FsResult<bool> {
+        let streams = self.effective_streams(src_len);
+        let block_size = self.task.info.job.block_size.max(1);
+        let seg = Self::segment_len(src_len, streams, block_size);
+        let spend = TimeSpent::new();
+        let deadline_ms = LocalTime::mills() + self.task_timeout_ms;
+
+        {
+            let mut owner = self.create_unified(target_path).await?;
+            owner.resize(FileAllocOpts::with_truncate(src_len)).await?;
+            drop(owner);
+        }
+
+        let task_timeout_ms = self.task_timeout_ms;
+        let mut handles = Vec::with_capacity(streams);
+        for i in 0..streams {
+            let off = i as i64 * seg;
+            if off >= src_len {
+                break;
+            }
+            let len = seg.min(src_len - off);
+            let ufs = self.get_ufs()?;
+            let fs = self.fs.clone();
+            let src = source_path.clone();
+            let dst = target_path.clone();
+            let rt = self.fs.clone_runtime();
+            let task = self.task.clone();
+            handles.push(rt.spawn(async move {
+                let mut reader = ufs.open(&src).await?;
+                reader.seek(off).await?;
+                let mut writer = fs.open_for_write(&dst, false).await?;
+                writer.seek(off).await?;
+
+                crate::fault_point! {
+                    async,
+                    name: "worker.load_task.parallel.before_segment_copy",
+                    description: "After a parallel load segment opens its streams and before it copies data",
+                    context: {
+                        "task_id" => task.info.task_id.clone(),
+                        "stream_index" => i as i64,
+                        "segment_offset" => off,
+                        "segment_len" => len,
+                    },
+                }
+
+                let mut remaining = len;
+                while remaining > 0 {
+                    if task.is_cancel() {
+                        let _ = writer.cancel().await;
+                        return FsResult::Ok(0);
+                    }
+                    if LocalTime::mills() > deadline_ms {
+                        let _ = writer.cancel().await;
+                        return err_box!(
+                            "Task {} exceed timeout {} ms (segment [{}, {}))",
+                            task.info.task_id,
+                            task_timeout_ms,
+                            off,
+                            off + len
+                        );
+                    }
+                    let want = remaining.min(Self::READ_CHUNK_BYTES) as usize;
+                    let chunk = reader.async_read(Some(want)).await?;
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    remaining -= chunk.len() as i64;
+                    writer.async_write(chunk).await?;
+                }
+                if remaining != 0 {
+                    let _ = writer.cancel().await;
+                    return err_box!(
+                        "short read on segment [{}, {}): {} bytes missing (source shorter than stat len?)",
+                        off,
+                        off + len,
+                        remaining
+                    );
+                }
+                writer.complete().await?;
+                reader.complete().await?;
+                FsResult::Ok(len)
+            }));
+        }
+
+        let mut written: i64 = 0;
+        for idx in 0..handles.len() {
+            if self.task.is_cancel() {
+                info!(
+                    "transfer task canceled during parallel load: {}",
+                    self.log_context()
+                );
+                Self::abort_remaining(&handles, idx);
+                return self.finish_canceled().await;
+            }
+            crate::fault_point! {
+                async,
+                name: "worker.load_task.parallel.before_join_await",
+                description: "After the parent cancellation check and before awaiting a parallel load stream",
+                context: {
+                    "task_id" => self.task.info.task_id.clone(),
+                    "stream_index" => idx as i64,
+                },
+            }
+            match (&mut handles[idx]).await {
+                Ok(Ok(n)) => {
+                    written += n;
+                    self.update_progress(written, src_len, false).await;
+                }
+                Ok(Err(e)) => {
+                    Self::abort_remaining(&handles, idx + 1);
+                    return Err(e);
+                }
+                Err(e) => {
+                    Self::abort_remaining(&handles, idx + 1);
+                    return err_box!("parallel load join error: {}", e);
+                }
+            }
+            if spend.used_ms() > self.task_timeout_ms {
+                Self::abort_remaining(&handles, idx + 1);
+                return err_box!(
+                    "Task {} exceed timeout {} ms",
+                    self.task.info.task_id,
+                    self.task_timeout_ms
+                );
+            }
+        }
+
+        if self.task.is_cancel() {
+            info!(
+                "transfer task canceled after parallel load: {}",
+                self.log_context()
+            );
+            return self.finish_canceled().await;
+        }
+        if written != src_len {
+            return err_box!(
+                "Task {} parallel load incomplete: wrote {} of {} bytes; refusing to mark cache valid",
+                self.task.info.task_id,
+                written,
+                src_len
+            );
+        }
+
+        let ufs_mtime = self.get_ufs()?.get_status(source_path).await?.mtime;
+        let attr_opts = SetAttrOptsBuilder::new().ufs_mtime(ufs_mtime).build();
+        self.fs.set_attr(target_path, attr_opts).await?;
+
+        if let Err(err) = self.update_progress0(written, src_len, true).await {
+            if self.task.info.transfer_report.is_some() {
+                warn!(
+                    "final transfer task report failed, keep task for scheduler probe: {} err={}",
+                    self.log_context(),
+                    err
+                );
+                return Ok(false);
+            }
+            return Err(err);
+        }
+
+        info!(
+            "transfer task completed (parallel x{}): {} ufs_mtime={} copied_bytes={} task_cost_ms={}",
+            streams,
+            self.log_context(),
+            ufs_mtime,
+            written,
+            spend.used_ms(),
+        );
+
+        Ok(true)
+    }
+
+    fn abort_remaining(handles: &[JoinHandle<FsResult<i64>>], from: usize) {
+        for h in handles.iter().skip(from) {
+            h.abort();
         }
     }
 }
