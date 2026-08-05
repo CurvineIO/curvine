@@ -684,7 +684,7 @@ impl UnifiedFileSystem {
                         return ufs.append(&ufs_path).await;
                     }
 
-                    let writer = ufs.create_ufs_writer(&ufs_path, flags.overwrite()).await?;
+                    let writer = ufs.create(&ufs_path, flags.overwrite()).await?;
 
                     if mount.info.write_cache_enabled() {
                         let mirror_opts = mount.info.merge_create_opts(opts);
@@ -705,11 +705,11 @@ impl UnifiedFileSystem {
                                     "failed to open write cache mirror for cv_path={}, ufs_path={}: {}",
                                     path, ufs_path, e
                                 );
-                                Ok(writer.into_unified())
+                                Ok(writer)
                             }
                         }
                     } else {
-                        Ok(writer.into_unified())
+                        Ok(writer)
                     }
                 }
             }

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{UfsFileSystem, UfsWriter};
+use crate::{UfsFileSystem, UfsWriter, UnifiedWriter};
 use bytes::{Bytes, BytesMut};
 use curvine_client_core::file::{CurvineFileSystem, FsWriter};
 use curvine_error::{FsError, FsResult};
@@ -67,14 +67,23 @@ pub struct WriteCacheWriter {
 impl WriteCacheWriter {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
-        primary: UfsWriter,
+        primary: UnifiedWriter,
         cv: CurvineFileSystem,
         ufs: UfsFileSystem,
         cv_path: Path,
         ufs_path: Path,
         opts: CreateFileOpts,
         pending: Arc<DashSet<String>>,
-    ) -> Result<Self, (UfsWriter, FsError)> {
+    ) -> Result<Self, (UnifiedWriter, FsError)> {
+        let primary = match UfsWriter::try_from_unified(primary) {
+            Ok(primary) => primary,
+            Err(writer) => {
+                return Err((
+                    *writer,
+                    FsError::common("write cache requires a UFS writer primary"),
+                ))
+            }
+        };
         let chunk_size = primary.chunk_size();
         let pos = primary.pos();
         let path = primary.path().clone();
@@ -85,7 +94,7 @@ impl WriteCacheWriter {
             .set_overwrite(true);
         let cv_writer = match cv.open_with_opts(&cv_path, opts, cv_flags).await {
             Ok(writer) => writer,
-            Err(e) => return Err((primary, e)),
+            Err(e) => return Err((primary.into_unified(), e)),
         };
 
         let (tx, rx) = mpsc::channel(cv.conf().client.write_chunk_num.max(1));

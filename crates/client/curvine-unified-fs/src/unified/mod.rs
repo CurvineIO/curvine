@@ -121,6 +121,20 @@ impl_writer_for_enum! {
 }
 
 impl UfsWriter {
+    pub fn try_from_unified(writer: UnifiedWriter) -> Result<Self, Box<UnifiedWriter>> {
+        match writer {
+            #[cfg(feature = "opendal")]
+            UnifiedWriter::Opendal(writer) => Ok(UfsWriter::Opendal(writer)),
+
+            #[cfg(feature = "oss-hdfs")]
+            UnifiedWriter::OssHdfs(writer) => Ok(UfsWriter::OssHdfs(writer)),
+
+            UnifiedWriter::Local(writer) => Ok(UfsWriter::Local(writer)),
+
+            other => Err(Box::new(other)),
+        }
+    }
+
     pub fn into_unified(self) -> UnifiedWriter {
         match self {
             #[cfg(feature = "opendal")]
@@ -360,27 +374,6 @@ impl UfsFileSystem {
     pub fn with_mount(mnt: &MountInfo) -> FsResult<Self> {
         let path = Path::from_str(&mnt.ufs_path)?;
         Self::new(&path, mnt.properties.clone(), mnt.provider)
-    }
-
-    pub async fn create_ufs_writer(&self, path: &Path, overwrite: bool) -> FsResult<UfsWriter> {
-        match self {
-            #[cfg(feature = "opendal")]
-            UfsFileSystem::Opendal(inner) => {
-                let writer = inner.create(path, overwrite).await?;
-                Ok(UfsWriter::Opendal(writer))
-            }
-
-            #[cfg(feature = "oss-hdfs")]
-            UfsFileSystem::OssHdfs(inner) => {
-                let writer = inner.create(path, overwrite).await?;
-                Ok(UfsWriter::OssHdfs(writer))
-            }
-
-            UfsFileSystem::Local(inner) => {
-                let writer = inner.create(path, overwrite).await?;
-                Ok(UfsWriter::Local(writer))
-            }
-        }
     }
 
     /// Opens a UFS reader without wrapping it in UnifiedReader.
