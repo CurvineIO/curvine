@@ -103,11 +103,33 @@ def prepare_curvine_cluster(project_path, test_path='/curvine-fuse'):
             
             print("Curvine cluster started successfully")
             
-            # Wait a bit for cluster to be fully ready
-            print("Waiting for cluster to be ready...")
-            time.sleep(3)
-            
-            return True, ""
+            # A mounted FUSE endpoint is not sufficient: probe real I/O until
+            # the worker is registered and can serve the data path.
+            print("Waiting for cluster data path to be ready...")
+            deadline = time.time() + 120
+            probe_path = os.path.join(test_path, f".curvine-ready-{os.getpid()}")
+            last_error = "probe did not run"
+            while time.time() < deadline:
+                try:
+                    payload = b"curvine-ready" * 8192
+                    with open(probe_path, "wb") as probe:
+                        probe.write(payload)
+                        probe.flush()
+                        os.fsync(probe.fileno())
+                    with open(probe_path, "rb") as probe:
+                        if probe.read() != payload:
+                            raise OSError("read-back mismatch")
+                    os.unlink(probe_path)
+                    print("Cluster data path is ready")
+                    return True, ""
+                except OSError as exc:
+                    last_error = str(exc)
+                    try:
+                        os.unlink(probe_path)
+                    except OSError:
+                        pass
+                    time.sleep(2)
+            return False, f"Cluster mounted but data path was not ready: {last_error}"
         finally:
             os.chdir(original_cwd)
             
