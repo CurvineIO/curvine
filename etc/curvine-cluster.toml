@@ -63,6 +63,8 @@ log = { level = "info", log_dir = "stdout", file_name = "worker.log" }
 enabled = false  
 app_name = "curvine"  
 reactor_mask = "0x3"  
+# Max time to wait for an idle NVMe qpair under qpair exhaustion (default "30s").  
+# qpair_acquire_timeout = "30s"  
 
 
 # NVMe-oF targets  

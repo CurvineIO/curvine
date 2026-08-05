@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_core_error::CommonResult;
+use curvine_runtime::common::Logger;
+use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use curvine_tests::Testing;
-use orpc::common::Logger;
-use orpc::runtime::{AsyncRuntime, RpcRuntime};
-use orpc::CommonResult;
 
 // Start a test cluster and use it for local development and testing.
 fn main() -> CommonResult<()> {
@@ -37,6 +37,8 @@ fn main() -> CommonResult<()> {
         .build()?;
     testing.start_cluster()?;
     let conf = testing.get_active_cluster_conf().unwrap();
+    log::info!("allocator: {}", curvine_alloc::allocator_type_name());
+    log::info!("git version: {}", curvine_sys::version::GIT_VERSION);
     conf.print();
 
     let rt = AsyncRuntime::single();

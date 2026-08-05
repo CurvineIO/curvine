@@ -15,10 +15,10 @@
 use crate::fs::dcache::{DirEntry, Lifecycle};
 use crate::raw::fuse_abi::fuse_attr;
 use crate::{err_fuse, FuseResult, FuseUtils, FUSE_PATH_SEPARATOR, FUSE_ROOT_ID};
-use curvine_common::conf::FuseConf;
-use curvine_common::state::{FileStatus, LocatedBlock, SetAttrOpts, SetAttrOptsBuilder};
-use orpc::common::LocalTime;
-use orpc::try_option_mut;
+use curvine_config::FuseConf;
+use curvine_core_error::try_option_mut;
+use curvine_model::{FileStatus, LocatedBlock, SetAttrOpts, SetAttrOptsBuilder};
+use curvine_runtime::common::LocalTime;
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 
@@ -203,7 +203,13 @@ impl Inode {
     }
 
     pub fn can_evict(&self, ttl: u64) -> bool {
+        // The kernel may continue issuing requests by nodeid until it balances
+        // every LOOKUP/READDIRPLUS reference with FORGET.
         !self.is_root()
+            // A failed deferred delete must remain observable until cleanup
+            // succeeds or reports that the backend entry is already absent.
+            && !self.mark_delete
+            && self.n_lookup == 0
             && self.last_access + ttl < LocalTime::mills()
             && self.dir.as_ref().is_none_or(|d| d.children.is_empty())
     }

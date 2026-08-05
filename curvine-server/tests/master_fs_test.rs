@@ -12,38 +12,39 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::conf::{ClusterConf, MasterConf};
-use curvine_common::error::FsError;
-use curvine_common::fs::RpcCode;
-use curvine_common::fs::{CurvineURI, Path};
-use curvine_common::proto::{
-    CompleteFileRequest, CompleteFileResponse, CreateFileRequest, DeleteRequest,
-    GetMasterInfoRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
-};
-use curvine_common::state::MountOptions;
-use curvine_common::state::{
+use curvine_config::{ClusterConf, MasterConf};
+use curvine_core_error::CommonResult;
+use curvine_error::FsError;
+use curvine_fs_api::RpcCode;
+use curvine_fs_api::{CurvineURI, Path};
+use curvine_model::MountOptions;
+use curvine_model::ProtoUtils;
+use curvine_model::{
     BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, LocatedBlock, MkdirOptsBuilder,
     StorageType, TtlAction, WorkerAddress, WorkerInfo,
 };
-use curvine_common::state::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
-use curvine_common::utils::{ProtoUtils, SerdeUtils};
+use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
+use curvine_proto::{
+    CompleteFileRequest, CompleteFileResponse, CreateFileRequest, DeleteRequest,
+    GetMasterInfoRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
+};
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
+use curvine_rpc::handler::MessageHandler;
+use curvine_rpc::message::Builder;
+#[cfg(feature = "fault-injection")]
+use curvine_rpc::message::ResponseStatus;
+use curvine_runtime::common::LocalTime;
+use curvine_runtime::common::SerdeUtils;
+use curvine_runtime::common::Utils;
+use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
 use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader, JournalSystem};
 use curvine_server::master::meta::inode::ttl::InodeTtlExecutor;
 use curvine_server::master::meta::InodeId;
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
 use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
-use orpc::common::LocalTime;
-use orpc::common::Utils;
-use orpc::handler::MessageHandler;
-use orpc::message::Builder;
-#[cfg(feature = "fault-injection")]
-use orpc::message::ResponseStatus;
-use orpc::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
-use orpc::CommonResult;
 use prost::Message as ProtoMessage;
 use raft::eraftpb::Entry;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1329,8 +1330,8 @@ fn test_hardlink_to_dangling_symlink_inode() -> CommonResult<()> {
     assert_eq!(symlink.id, nick.id);
     assert_eq!(symlink.nlink, 2);
     assert_eq!(nick.nlink, 2);
-    assert_eq!(symlink.file_type, curvine_common::state::FileType::Link);
-    assert_eq!(nick.file_type, curvine_common::state::FileType::Link);
+    assert_eq!(symlink.file_type, curvine_model::FileType::Link);
+    assert_eq!(nick.file_type, curvine_model::FileType::Link);
     Ok(())
 }
 
@@ -2112,11 +2113,11 @@ fn test_idempotent_set_locks() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let (fs, js, loader, _js2, fs2) = setup_pair("set-locks");
     fs.create("/lockfile.log", true)?;
-    let lock = curvine_common::state::FileLock {
+    let lock = curvine_model::FileLock {
         client_id: "client1".to_string(),
         owner_id: 1,
-        lock_type: curvine_common::state::LockType::WriteLock,
-        lock_flags: curvine_common::state::LockFlags::Plock,
+        lock_type: curvine_model::LockType::WriteLock,
+        lock_flags: curvine_model::LockFlags::Plock,
         start: 0,
         end: 100,
         ..Default::default()

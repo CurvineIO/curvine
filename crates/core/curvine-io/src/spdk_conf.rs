@@ -156,6 +156,10 @@ pub struct SpdkConf {
     pub keep_alive_timeout_str: String,
     #[serde(skip)]
     pub keep_alive_timeout_ms: u64,
+    #[serde(alias = "qpair_acquire_timeout")]
+    pub qpair_acquire_timeout_str: String,
+    #[serde(skip)]
+    pub qpair_acquire_timeout_ms: u64,
     #[serde(alias = "poll_interval")]
     pub poll_interval_ms: u64,
     pub spin_iter: u32,
@@ -178,6 +182,11 @@ impl SpdkConf {
         if !self.keep_alive_timeout_str.is_empty() {
             let keep_alive = DurationUnit::from_str(&self.keep_alive_timeout_str)?;
             self.keep_alive_timeout_ms = keep_alive.as_millis();
+        }
+
+        if !self.qpair_acquire_timeout_str.is_empty() {
+            let qpair_acquire = DurationUnit::from_str(&self.qpair_acquire_timeout_str)?;
+            self.qpair_acquire_timeout_ms = qpair_acquire.as_millis();
         }
 
         if !self.dma_buffer_size_str.is_empty() {
@@ -235,6 +244,13 @@ impl SpdkConf {
             return err_box!(
                 "SpdkConf: iova_mode must be 'va', 'pa', or empty (auto-detect), got '{}'",
                 self.iova_mode
+            );
+        }
+
+        if self.qpair_acquire_timeout_ms == 0 {
+            return err_box!(
+                "SpdkConf: qpair_acquire_timeout must be > 0 (got '{}')",
+                self.qpair_acquire_timeout_str
             );
         }
 
@@ -296,6 +312,8 @@ impl Default for SpdkConf {
             io_retry_count: 4,
             keep_alive_timeout_str: String::new(),
             keep_alive_timeout_ms: 10_000,
+            qpair_acquire_timeout_str: String::new(),
+            qpair_acquire_timeout_ms: 30_000,
             poll_interval_ms: 100,
             spin_iter: 1000,
             dma_buffer_size_str: String::new(),
@@ -330,4 +348,54 @@ pub struct BdevInfo {
     pub block_size: u32,
     pub target_endpoint: String,
     pub io_timeout_ms: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SpdkConf;
+
+    #[test]
+    fn spdk_conf_toml_deserialization_with_targets() {
+        let toml_str = r#"
+            enabled = true
+            app_name = "curvine"
+            hugepage = "2048MB"
+            reactor_mask = "0x3"
+            io_queue_depth = 256
+            io_queue_requests = 512
+            io_timeout = "60s"
+            io_retry_count = 4
+            keep_alive_timeout = "10s"
+            dma_buffer_size = "1MB"
+            [[targets]]
+            trtype = "rdma"
+            traddr = "192.168.1.100"
+            trsvcid = 4420
+            subnqn = "nqn.2024-01.io.curvine:subsystem1"
+            [[targets]]
+            trtype = "rdma"
+            traddr = "192.168.1.101"
+            trsvcid = 4420
+            subnqn = "nqn.2024-01.io.curvine:subsystem2"
+        "#;
+
+        let conf: SpdkConf = toml::from_str(toml_str).unwrap();
+        assert!(conf.enabled);
+        assert_eq!(conf.app_name, "curvine");
+        assert_eq!(conf.hugepage_str, "2048MB");
+        assert_eq!(conf.reactor_mask, "0x3");
+        assert_eq!(conf.io_queue_depth, 256);
+        assert_eq!(conf.targets.len(), 2);
+        assert_eq!(conf.targets[0].traddr, "192.168.1.100");
+        assert_eq!(conf.targets[0].trtype, "rdma");
+        assert_eq!(conf.targets[1].traddr, "192.168.1.101");
+        assert_eq!(conf.targets[1].subnqn, "nqn.2024-01.io.curvine:subsystem2");
+    }
+
+    #[test]
+    fn minimal_toml_test() {
+        let toml_str = "enabled = true\n";
+        let conf: SpdkConf = toml::from_str(toml_str).unwrap();
+        println!("parsed: {:?}", conf.enabled);
+    }
 }

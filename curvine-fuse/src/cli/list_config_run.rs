@@ -14,7 +14,7 @@
 
 use crate::cli::fuse_cli::{FuseCli, ListConfigFlagsArgs, ListConfigFormat};
 use clap::{Arg, CommandFactory};
-use orpc::CommonResult;
+use curvine_core_error::CommonResult;
 use serde::Serialize;
 use std::collections::BTreeMap;
 

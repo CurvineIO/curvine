@@ -298,7 +298,7 @@
                 <extensions>true</extensions>
                 <configuration>
                     <protocArtifact>com.google.protobuf:protoc:${protobuf.version}:exe:${os.detected.classifier}</protocArtifact>
-                    <protoSourceRoot>${project.basedir}/../../curvine-common/proto</protoSourceRoot>
+                    <protoSourceRoot>${project.basedir}/../../crates/common/curvine-proto/proto</protoSourceRoot>
                     <includes>
                         <include>common.proto</include>
                         <include>master.proto</include>

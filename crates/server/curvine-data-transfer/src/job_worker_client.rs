@@ -14,12 +14,13 @@
 
 use std::time::Duration;
 
-use curvine_common::fs::RpcCode;
-use curvine_common::proto::*;
-use curvine_common::state::{JobTaskType, LoadTaskInfo};
-use curvine_common::utils::{RpcUtils, SerdeUtils};
-use curvine_common::FsResult;
-use orpc::client::RpcClient;
+use curvine_error::FsResult;
+use curvine_fs_api::RpcCode;
+use curvine_model::{JobTaskType, LoadTaskInfo};
+use curvine_proto::*;
+use curvine_rpc::client::RpcClient;
+use curvine_rpc::RpcUtils;
+use curvine_runtime::common::SerdeUtils;
 use prost::Message as PMessage;
 
 #[derive(Clone)]
@@ -56,7 +57,7 @@ impl JobWorkerClient {
     pub async fn submit_load_task(&self, task: LoadTaskInfo) -> FsResult<()> {
         let response = self.submit_load_task_response(task).await?;
         if !response.accepted.unwrap_or(true) {
-            return Err(curvine_common::error::FsError::common(format!(
+            return Err(curvine_error::FsError::common(format!(
                 "Worker rejected load task {}: {}",
                 response.task_id,
                 response

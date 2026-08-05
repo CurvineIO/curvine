@@ -20,7 +20,7 @@ pub use self::metrics::TransferMetrics;
 mod backend;
 pub(crate) use self::backend::is_store_unavailable_error;
 pub use self::backend::TransferStoreBackend;
-pub(crate) use curvine_common::transfer::transfer_failure_message;
+pub(crate) use curvine_model::transfer_failure_message;
 
 mod cluster_cache;
 pub use self::cluster_cache::ClusterMetadataCache;
@@ -55,9 +55,9 @@ mod transfer_server;
 pub use self::transfer_server::TransferServer;
 
 pub(crate) fn apply_task_report_progress(
-    summary: &mut curvine_common::state::TransferProgress,
-    previous: &curvine_common::state::TransferProgress,
-    current: &curvine_common::state::TransferProgress,
+    summary: &mut curvine_model::TransferProgress,
+    previous: &curvine_model::TransferProgress,
+    current: &curvine_model::TransferProgress,
     now_ms: i64,
 ) {
     summary.loaded_size = summary

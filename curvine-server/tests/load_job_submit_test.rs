@@ -12,20 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::conf::{ClientConf, ClusterConf, MasterConf};
-use curvine_common::state::{
+use curvine_config::{ClientConf, ClusterConf, MasterConf};
+use curvine_core_error::CommonResult;
+use curvine_model::{
     JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobInfo, LoadTaskInfo, MountInfo,
     MountOptions, OpenFlags, StorageType, TtlAction, WorkerAddress, WorkerInfo, WriteType,
 };
-use curvine_common::utils::CommonUtils;
 use curvine_raft::conf::JournalConf;
+use curvine_runtime::common::CommonUtils;
+use curvine_runtime::common::Utils;
+use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime, Runtime};
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::JournalSystem;
 use curvine_server::master::{JobContext, JobManager, JobStore, Master};
 use curvine_server::worker::task::{TaskContext, TaskStore};
-use orpc::common::Utils;
-use orpc::runtime::{AsyncRuntime, RpcRuntime, Runtime};
-use orpc::CommonResult;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -180,7 +180,7 @@ fn fs_mode_cv_path_load_uses_ufs_source_when_metadata_is_ufs_only() -> CommonRes
     std::fs::write(local_source, b"load-data")?;
 
     let cv_path = "/mnt/ufs-only-file";
-    let source_path = curvine_common::fs::Path::from_str(&source)?;
+    let source_path = curvine_fs_api::Path::from_str(&source)?;
     let (_, mount) = job_manager
         .get_mnt(&source_path)?
         .expect("test source should match mount");
@@ -219,7 +219,7 @@ fn cache_mode_mount_root_directory_load_uses_ufs_source() -> CommonResult<()> {
 
     let cv_path = "/mnt";
     let (expected_source, _) = job_manager
-        .get_mnt(&curvine_common::fs::Path::from_str(cv_path)?)?
+        .get_mnt(&curvine_fs_api::Path::from_str(cv_path)?)?
         .expect("test CV path should match mount");
     let expected_source = expected_source.clone_uri();
     let expected_job_id = CommonUtils::create_job_id(&expected_source);
@@ -255,7 +255,7 @@ fn fs_mode_mount_root_directory_load_uses_ufs_source() -> CommonResult<()> {
 
     let cv_path = "/mnt";
     let (expected_source, _) = job_manager
-        .get_mnt(&curvine_common::fs::Path::from_str(cv_path)?)?
+        .get_mnt(&curvine_fs_api::Path::from_str(cv_path)?)?
         .expect("test CV path should match mount");
     let expected_source = expected_source.clone_uri();
     let expected_job_id = CommonUtils::create_job_id(&expected_source);
@@ -326,7 +326,7 @@ fn cv_file_load_with_ufs_backed_cached_metadata_uses_ufs_source() -> CommonResul
     std::fs::write(local_source, b"load-data")?;
 
     let cv_path = "/mnt/ufs-backed-file";
-    let source_path = curvine_common::fs::Path::from_str(&source)?;
+    let source_path = curvine_fs_api::Path::from_str(&source)?;
     let (_, mount) = job_manager
         .get_mnt(&source_path)?
         .expect("test source should match mount");
@@ -334,7 +334,7 @@ fn cv_file_load_with_ufs_backed_cached_metadata_uses_ufs_source() -> CommonResul
     master_fs.create_with_opts(cv_path, sync_opts, OpenFlags::new_create())?;
     master_fs.set_attr(
         cv_path,
-        curvine_common::state::SetAttrOptsBuilder::new()
+        curvine_model::SetAttrOptsBuilder::new()
             .ufs_mtime(1)
             .build(),
     )?;
@@ -361,7 +361,7 @@ fn assert_cv_only_file_load_is_rejected(name: &str, write_type: WriteType) -> Co
     let (job_manager, rt, _missing_source, master_fs) =
         new_job_manager_with_write_type(name, write_type)?;
     let cv_path = "/mnt/native-file";
-    let create_opts = curvine_common::state::CreateFileOptsBuilder::new()
+    let create_opts = curvine_model::CreateFileOptsBuilder::new()
         .create_parent(true)
         .build();
     master_fs.create_with_opts(cv_path, create_opts, OpenFlags::new_create())?;
@@ -448,7 +448,7 @@ fn load_with_explicit_target_rejects_cv_source_to_prevent_export() -> CommonResu
     let (job_manager, rt, _missing_source, master_fs) =
         new_job_manager_with_fs("explicit-load-target-cv-source")?;
     let cv_path = "/mnt/native-export-file";
-    let create_opts = curvine_common::state::CreateFileOptsBuilder::new()
+    let create_opts = curvine_model::CreateFileOptsBuilder::new()
         .create_parent(true)
         .build();
     master_fs.create_with_opts(cv_path, create_opts, OpenFlags::new_create())?;
@@ -478,12 +478,12 @@ fn direct_export_task_keeps_cv_source_for_fs_mode_journal_sync() -> CommonResult
     let cv_path = "/mnt/export-dir";
     master_fs.mkdir(cv_path, true)?;
     let expected_target = job_manager
-        .get_mnt(&curvine_common::fs::Path::from_str(cv_path)?)?
+        .get_mnt(&curvine_fs_api::Path::from_str(cv_path)?)?
         .expect("test CV path should match mount")
         .0
         .clone_uri();
     let (_, mount) = job_manager
-        .get_mnt(&curvine_common::fs::Path::from_str(cv_path)?)?
+        .get_mnt(&curvine_fs_api::Path::from_str(cv_path)?)?
         .expect("test CV path should match mount");
 
     let command = LoadJobCommand::builder(cv_path).build();
@@ -508,7 +508,7 @@ fn submit_export_job_keeps_cv_source_for_user_export() -> CommonResult<()> {
     let cv_path = "/mnt/public-export-dir";
     master_fs.mkdir(cv_path, true)?;
     let expected_target = job_manager
-        .get_mnt(&curvine_common::fs::Path::from_str(cv_path)?)?
+        .get_mnt(&curvine_fs_api::Path::from_str(cv_path)?)?
         .expect("test CV path should match mount")
         .0
         .clone_uri();

@@ -113,6 +113,32 @@ JDK **8**, Maven **≥ 3.8.1**. From workspace root, **`make build`** (with **`j
 
 **`cannot allocate memory in static TLS block`** (large JNI `.so` + glibc): load from a real **`build/dist/lib`** path first (`CurvineNative` scans `java.library.path` entries); if it still fails, try preloading **`LD_PRELOAD`** with the same **`libcurvine_libsdk_<os>_<arch>_64.so`**, or use a host/OS image validated for Curvine JNI.
 
+### Transfer load routing
+
+When the cluster has Transfer enabled, configure the Java client with the same switch and the
+reachable Transfer service addresses. `CurvineLoadClient` then keeps its existing submit/status/
+cancel API while routing those requests to Transfer instead of the legacy Master Job API:
+
+```java
+Configuration conf = new Configuration();
+conf.set("fs.cv.master_addrs", "master-0:8995,master-1:8995");
+conf.set("fs.cv.transfer.enabled", "true");
+conf.set("fs.cv.transfer.endpoints", "transfer-0:9010,transfer-1:9010");
+
+try (CurvineLoadClient client = CurvineLoadClient.from(conf)) {
+    LoadJobResult job = client.submitLoad(LoadJobRequest.builder()
+            .sourcePath("s3://bucket/model/v1")
+            .targetPath("/bucket/model/v1")
+            .build());
+    LoadJobStatus status = client.getJobStatus(job.getJobId());
+}
+```
+
+`fs.cv.transfer.endpoints` is a comma-separated list and is independent from Master addresses.
+It must point to the externally reachable Transfer service endpoint; the client does not infer it
+from Master nodes. With `fs.cv.transfer.enabled=false` (the default), the same API remains
+compatible with the legacy Master LoadJob service.
+
 ---
 
 ## Local dev (without `make`)

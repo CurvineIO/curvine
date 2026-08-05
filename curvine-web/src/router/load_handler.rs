@@ -24,7 +24,7 @@ use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use curvine_common::fs::Path;
+use curvine_fs_api::Path;
 
 use crate::router::RouterHandler;
 

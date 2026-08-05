@@ -14,14 +14,14 @@
 
 use bytes::BytesMut;
 use curvine_config::UfsConf;
+use curvine_core_error::ErrorExt;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, Path};
+use curvine_io::DataSlice;
 use curvine_model::{FileStatus, FileType, SetAttrOpts};
+use curvine_runtime::common::LocalTime;
 use curvine_ufs_api::{err_ufs, OssHdfsConf};
-use orpc::common::LocalTime;
-use orpc::error::ErrorExt;
-use orpc::sys::DataSlice;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::raw::c_void;

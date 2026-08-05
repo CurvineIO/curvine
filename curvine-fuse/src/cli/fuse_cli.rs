@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use clap::{Parser, Subcommand, ValueEnum};
-use curvine_common::conf::ClientConfCliOverrides;
-use curvine_common::version;
+use curvine_config::ClientConfCliOverrides;
+use curvine_sys::version;
 
 use crate::cli::mount_args::{FuseMountArgs, FuseRuntimeArgs};
 
@@ -87,7 +87,7 @@ impl FuseCli {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orpc::common::Utils;
+    use curvine_runtime::common::Utils;
     use std::fs;
 
     fn with_valid_conf<T>(extra_args: &[&str], test: impl FnOnce(FuseRuntimeArgs) -> T) -> T {
@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn metrics_enabled_defaults_to_true() {
-        use curvine_common::conf::FuseConf;
+        use curvine_config::FuseConf;
         assert!(FuseConf::default().metrics_enabled);
     }
 

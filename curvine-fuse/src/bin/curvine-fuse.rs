@@ -13,10 +13,11 @@
 // limitations under the License.
 
 use clap::Parser;
+use curvine_alloc as _;
+use curvine_core_error::CommonResult;
 use curvine_fuse::cli::{
     run_list_config_flags, run_mount, run_validate_config, FuseCli, FuseSubcommand,
 };
-use orpc::CommonResult;
 
 // For local debugging, after starting the cluster, run the following to mount fuse:
 // umount -f /curvine-fuse; cargo run --bin curvine-fuse -- --conf /server/conf/curvine-cluster.toml

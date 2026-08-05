@@ -13,7 +13,7 @@
 // limitations under the License.
 
 mod db_conf;
-pub use self::db_conf::DBConf;
+pub use self::db_conf::{DBConf, DBConfExt};
 
 mod db_engine;
 pub use self::db_engine::*;

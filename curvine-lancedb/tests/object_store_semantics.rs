@@ -21,8 +21,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Duration;
 use curvine_client::file::CurvineFileSystem;
-use curvine_common::conf::ClusterConf;
-use curvine_common::fs::Path as CurvinePath;
+use curvine_config::ClusterConf;
+use curvine_fs_api::Path as CurvinePath;
 use futures::StreamExt;
 use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
 use lancedb::object_store::{CurvineObjectStoreProvider, CURVINE_CONF_FILE_KEY};

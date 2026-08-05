@@ -18,9 +18,9 @@ mod oss_hdfs_filesystem;
 mod oss_hdfs_reader;
 mod oss_hdfs_writer;
 
+use curvine_core_error::ErrorExt;
 use curvine_error::FsError;
 use curvine_error::FsResult;
-use orpc::error::ErrorExt;
 
 use self::ffi::{jindo_last_error, JindoStatus};
 

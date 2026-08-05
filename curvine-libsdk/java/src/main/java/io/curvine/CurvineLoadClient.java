@@ -36,6 +36,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * when {@code true}, requests go to the standalone Transfer service and responses
  * are mapped back to the existing {@link LoadJobResult} / {@link LoadJobStatus}
  * surface; when {@code false} (default), requests use the legacy Master LoadJob API.
+ * For a Hadoop {@link Configuration}, set {@code fs.cv.transfer.enabled=true} and
+ * {@code fs.cv.transfer.endpoints=transfer-0:9010,transfer-1:9010}. Transfer endpoints
+ * are independent from Master addresses and must be reachable from the Java process.
  *
  * <pre>{@code
  * try (CurvineLoadClient client = CurvineLoadClient.from(conf)) {

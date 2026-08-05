@@ -15,9 +15,9 @@
 use crate::master::fs::WorkerManager;
 use crate::master::journal::JournalLoader;
 use crate::master::meta::FsDir;
-use curvine_common::raft::storage::RocksLogStorage;
-use curvine_common::raft::RaftJournal;
-use orpc::sync::ArcRwLock;
+use curvine_raft::raft::storage::RocksLogStorage;
+use curvine_raft::raft::RaftJournal;
+use curvine_runtime::sync::ArcRwLock;
 
 pub mod meta;
 

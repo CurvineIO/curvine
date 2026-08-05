@@ -17,7 +17,7 @@ use std::env;
 use std::io::Write;
 use std::sync::Arc;
 
-use curvine_common::conf::ClusterConf;
+use curvine_config::ClusterConf;
 use lancedb::connect;
 use lancedb::connect_namespace;
 use lancedb::error::Error as LanceDbError;

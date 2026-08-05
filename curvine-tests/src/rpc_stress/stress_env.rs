@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use crate::rpc_stress::StressArgs;
-use orpc::client::{ClientFactory, RpcClient};
-use orpc::io::net::InetAddr;
-use orpc::io::IOResult;
-use orpc::runtime::AsyncRuntime;
+use curvine_io::IOResult;
+use curvine_net::net::InetAddr;
+use curvine_rpc::client::{ClientFactory, RpcClient};
+use curvine_runtime::runtime::AsyncRuntime;
 use std::sync::Arc;
 
 #[derive(Clone)]

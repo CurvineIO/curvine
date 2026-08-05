@@ -16,13 +16,13 @@
 use crate::master::fs::MasterFilesystem;
 use crate::master::mount::MountTable;
 use crate::master::{self, SyncFsDir};
-use curvine_common::error::FsError;
-use curvine_common::fs::{self, CurvineURI, Path};
-use curvine_common::state::{MkdirOpts, MountInfo, MountOptions};
-use curvine_common::FsResult;
+use curvine_core_error::err_box;
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_fs_api::{self, CurvineURI, Path};
+use curvine_model::{MkdirOpts, MountInfo, MountOptions};
 use curvine_ufs_api::S3Conf;
 use log::info;
-use orpc::err_box;
 
 pub struct MountManager {
     master_fs: MasterFilesystem,
@@ -59,6 +59,13 @@ impl MountManager {
     }
 
     fn normalize_mount_config(mount: &mut MountInfo) -> FsResult<()> {
+        if mount.write_cache && !mount.write_cache_enabled() {
+            return err_box!(
+                "write_cache requires cache_mode with read_write access_mode for mount {}",
+                mount.cv_path
+            );
+        }
+
         let path = Path::from_str(&mount.ufs_path)?;
         if !matches!(path.scheme(), Some("s3" | "s3a")) {
             return Ok(());
@@ -169,5 +176,54 @@ impl MountManager {
             entries.push(entry.clone());
         });
         Ok(entries)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MountManager;
+    use curvine_model::{AccessMode, MountInfo, MountOptions, WriteType};
+
+    fn mount_info(write_type: WriteType, access_mode: AccessMode, write_cache: bool) -> MountInfo {
+        MountOptions::builder()
+            .write_type(write_type)
+            .access_mode(access_mode)
+            .write_cache(write_cache)
+            .build()
+            .to_info(1, "/mnt", "file:///tmp/curvine-mount")
+    }
+
+    #[test]
+    fn normalize_mount_config_accepts_write_cache_for_cache_mode_read_write() {
+        let mut info = mount_info(WriteType::CacheMode, AccessMode::ReadWrite, true);
+
+        MountManager::normalize_mount_config(&mut info).unwrap();
+    }
+
+    #[test]
+    fn normalize_mount_config_rejects_write_cache_for_read_only_cache_mode() {
+        let mut info = mount_info(WriteType::CacheMode, AccessMode::ReadOnly, true);
+
+        let err = MountManager::normalize_mount_config(&mut info).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("write_cache requires cache_mode with read_write"));
+    }
+
+    #[test]
+    fn normalize_mount_config_rejects_write_cache_for_fs_mode() {
+        let mut info = mount_info(WriteType::FsMode, AccessMode::ReadWrite, true);
+
+        let err = MountManager::normalize_mount_config(&mut info).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("write_cache requires cache_mode with read_write"));
+    }
+
+    #[test]
+    fn normalize_mount_config_accepts_disabled_write_cache() {
+        let mut info = mount_info(WriteType::CacheMode, AccessMode::ReadOnly, false);
+
+        MountManager::normalize_mount_config(&mut info).unwrap();
     }
 }
