@@ -130,7 +130,10 @@ impl FsDir {
         let pos = inp.existing_len() - 1;
         let name = inp.get_component(pos + 1)?.to_string();
 
-        Self::apply_setgid_directory_inheritance(&inp, &mut opts)?;
+        if let Some(group) = Self::setgid_parent_group(&inp)? {
+            opts.group = group;
+            opts.mode |= MODE_SETGID;
+        }
 
         let dir = InodeDir::with_opts(self.next_inode_id()?, LocalTime::mills() as i64, opts);
 
@@ -142,21 +145,21 @@ impl FsDir {
         Ok(inp)
     }
 
-    fn apply_setgid_directory_inheritance(inp: &InodePath, opts: &mut MkdirOpts) -> FsResult<()> {
+    fn setgid_parent_group(inp: &InodePath) -> FsResult<Option<String>> {
         if inp.existing_len() == 0 {
-            return Ok(());
+            return Ok(None);
         }
         let parent_pos = inp.existing_len() as i32 - 1;
         let parent = match inp.get_inode(parent_pos) {
             Some(parent) => parent,
-            None => return Ok(()),
+            None => return Ok(None),
         };
         let acl = parent.as_ref().acl()?;
         if acl.mode & MODE_SETGID != 0 {
-            opts.group = acl.group.clone();
-            opts.mode |= MODE_SETGID;
+            Ok(Some(acl.group.clone()))
+        } else {
+            Ok(None)
         }
-        Ok(())
     }
 
     // Create all previous directories that may be missing on the path.
@@ -529,13 +532,22 @@ impl FsDir {
         Ok(())
     }
 
-    pub fn create_file(&mut self, mut inp: InodePath, opts: CreateFileOpts) -> FsResult<InodePath> {
+    pub fn create_file(
+        &mut self,
+        mut inp: InodePath,
+        mut opts: CreateFileOpts,
+    ) -> FsResult<InodePath> {
         if inp.get_last_inode().is_some() {
             return err_ext!(FsError::file_exists(inp.path()));
         }
 
         // Create a directory that does not exist.
         inp = self.create_parent_dir(inp, opts.dir_opts())?;
+
+        if let Some(group) = Self::setgid_parent_group(&inp)? {
+            opts.group = group;
+        }
+
         let name = inp.name().to_string();
 
         // Create an inode file node.
