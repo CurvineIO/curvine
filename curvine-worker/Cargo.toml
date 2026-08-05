@@ -18,6 +18,7 @@ spdk-rdma = [
 ]
 fault-injection = [
     "curvine-fault/http-server",
+    "curvine-data-transfer/fault-injection",
 ]
 
 [dependencies]
