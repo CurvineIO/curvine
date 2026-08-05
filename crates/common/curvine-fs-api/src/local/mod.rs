@@ -25,9 +25,7 @@ struct LocalStatusUtils;
 
 impl LocalStatusUtils {
     fn to_epoch_ms(ts: std::io::Result<std::time::SystemTime>) -> i64 {
-        ts.ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64)
+        ts.map(curvine_runtime::common::LocalTime::system_time_millis)
             .unwrap_or(0)
     }
 

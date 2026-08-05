@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{FallbackFsReader, MountCache, MountValue, UnifiedReader, UnifiedWriter};
+use crate::{
+    FallbackFsReader, MountCache, MountValue, UnifiedReader, UnifiedWriter, WriteCacheWriter,
+};
 use bytes::BytesMut;
 use curvine_client_core::file::{CurvineFileSystem, FsClient, FsContext, FsReader};
 use curvine_client_core::ClientMetrics;
@@ -677,9 +679,34 @@ impl UnifiedFileSystem {
                     write_path = ufs_path.full_path().to_owned();
                     let ufs = mount.ufs()?;
                     if flags.append() {
-                        ufs.append(&ufs_path).await
+                        return ufs.append(&ufs_path).await;
+                    }
+
+                    let writer = ufs.create(&ufs_path, flags.overwrite()).await?;
+
+                    if mount.info.write_cache_enabled() {
+                        let mirror_opts = mount.info.merge_create_opts(opts);
+                        match WriteCacheWriter::new(
+                            writer,
+                            self.cv.clone(),
+                            ufs,
+                            path.clone(),
+                            ufs_path.clone(),
+                            mirror_opts,
+                        )
+                        .await
+                        {
+                            Ok(writer) => Ok(UnifiedWriter::WriteCache(Box::new(writer))),
+                            Err((writer, e)) => {
+                                warn!(
+                                    "failed to open write cache mirror for cv_path={}, ufs_path={}: {}",
+                                    path, ufs_path, e
+                                );
+                                Ok(writer)
+                            }
+                        }
                     } else {
-                        ufs.create(&ufs_path, flags.overwrite()).await
+                        Ok(writer)
                     }
                 }
             }

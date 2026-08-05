@@ -203,6 +203,7 @@ fn spdk_full_lifecycle() {
             notify: Condvar::new(),
             max_per_ctrlr: 2,
             shutdown: AtomicBool::new(false),
+            qpair_acquire_timeout: Duration::from_secs(30),
         };
         p.register_limit(ctrlr as usize, 4);
 
@@ -241,6 +242,7 @@ fn spdk_full_lifecycle() {
             notify: Condvar::new(),
             max_per_ctrlr: 16,
             shutdown: AtomicBool::new(false),
+            qpair_acquire_timeout: Duration::from_secs(30),
         });
         p.register_limit(ctrlr as usize, 1);
 

@@ -364,6 +364,7 @@ mod tests {
             provider: Some(Provider::Opendal),
             auto_cache: true,
             access_mode: AccessMode::ReadOnly,
+            write_cache: false,
         }
     }
 

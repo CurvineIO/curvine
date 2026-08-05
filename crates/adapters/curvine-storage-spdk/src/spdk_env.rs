@@ -45,6 +45,8 @@ pub struct QpairPool {
     pub(crate) notify: Condvar,
     /// Set by drain_all() to reject new acquires during shutdown.
     pub(crate) shutdown: AtomicBool,
+    /// How long `acquire` blocks waiting for a free slot before timing out.
+    pub(crate) qpair_acquire_timeout: Duration,
 }
 // SAFETY: exclusive ownership
 unsafe impl Send for QpairPool {}
@@ -52,17 +54,23 @@ unsafe impl Sync for QpairPool {}
 impl QpairPool {
     /// Default max idle qpairs per controller (soft cache limit).
     const DEFAULT_MAX_PER_CTRLR: usize = 16;
-    /// Default acquire timeout
-    /// TODO: make ACQUIRE_TIMEOUT as a config
-    const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+    /// Default qpair acquire timeout, used when SpdkConf does not set `qpair_acquire_timeout`.
+    #[cfg(test)]
+    const DEFAULT_QPAIR_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::with_qpair_acquire_timeout(Self::DEFAULT_QPAIR_ACQUIRE_TIMEOUT)
+    }
+
+    pub(crate) fn with_qpair_acquire_timeout(qpair_acquire_timeout: Duration) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
             ctrl_state: Mutex::new(HashMap::new()),
             max_per_ctrlr: Self::DEFAULT_MAX_PER_CTRLR,
             notify: Condvar::new(),
             shutdown: AtomicBool::new(false),
+            qpair_acquire_timeout,
         }
     }
 
@@ -189,7 +197,7 @@ impl QpairPool {
         }
 
         // Slow path: block if at this controller's capacity, then allocate
-        let deadline = Instant::now() + Self::ACQUIRE_TIMEOUT;
+        let deadline = Instant::now() + self.qpair_acquire_timeout;
         let mut pool = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         loop {
             // CAS reserve before pool check — active must increment before returning cached qpair.
@@ -226,8 +234,8 @@ impl QpairPool {
                 return err_box!(
                     "QpairPool: timeout after {:?} waiting for qpair on ctrlr {:p} \
                      This indicates qpair exhaustion under high concurrency. \
-                     Check NvmeTarget.io_queues configuration.",
-                    Self::ACQUIRE_TIMEOUT,
+                     Check NvmeTarget.io_queues / SpdkConf.qpair_acquire_timeout configuration.",
+                    self.qpair_acquire_timeout,
                     ctrlr
                 );
             }
@@ -238,7 +246,7 @@ impl QpairPool {
                 .wait_timeout(pool, remaining)
                 .unwrap_or_else(|p| p.into_inner())
                 .0;
-            // TODO: check shutdown here to avoid 30s delay if notify_all() was missed
+            // TODO: check shutdown here to avoid a full qpair_acquire_timeout delay if notify_all() was missed
         }
 
         // Slot reserved (by fast path or slow path) - allocate the qpair
@@ -417,12 +425,16 @@ impl SpdkEnv {
 
         info!("SpdkEnv created: {}", conf);
 
+        let qpair_pool = QpairPool::with_qpair_acquire_timeout(Duration::from_millis(
+            conf.qpair_acquire_timeout_ms,
+        ));
+
         Ok(Self {
             conf,
             state: AtomicU8::new(SpdkEnvState::Created as u8),
             bdevs: Vec::new(),
             open_handles: AtomicUsize::new(0),
-            qpair_pool: QpairPool::new(),
+            qpair_pool,
             poller: Mutex::new(None),
         })
     }
@@ -1300,6 +1312,44 @@ mod test {
         assert_eq!(active, 0);
     }
 
+    #[test]
+    fn acquire_times_out_after_configured_timeout() {
+        let p = QpairPool::with_qpair_acquire_timeout(Duration::from_millis(200));
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+        p.register_limit(ctrlr as usize, 1);
+
+        // Fill capacity so acquire blocks on the slow path
+        assert!(p.try_reserve(ctrlr as usize)); // active = 1
+
+        // No one releases - acquire must return Err after the configured timeout.
+        let start = Instant::now();
+        let result = p.acquire(ctrlr);
+        let elapsed = start.elapsed();
+
+        let msg = result.expect_err("acquire should time out").to_string();
+        assert!(
+            msg.contains("timeout"),
+            "error should mention timeout: {}",
+            msg
+        );
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "acquire returned after {:?}, before the configured timeout",
+            elapsed
+        );
+
+        // The test's own reservation (try_reserve above) remains held - the
+        // timed-out acquire never reserved, so it must not over-release.
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 1);
+    }
+
+    #[test]
+    fn acquire_respects_default_timeout() {
+        let p = QpairPool::new();
+        assert_eq!(p.qpair_acquire_timeout, Duration::from_secs(30));
+    }
+
     mod config_tests {
         use super::*;
 
@@ -1308,20 +1358,23 @@ mod test {
             let mut conf = SpdkConf {
                 io_timeout_str: "15s".into(),
                 keep_alive_timeout_str: "300s".into(),
+                qpair_acquire_timeout_str: "45s".into(),
                 ..Default::default()
             };
             conf.init().unwrap();
             assert_eq!(conf.io_timeout_ms, 15_000);
             assert_eq!(conf.keep_alive_timeout_ms, 300_000);
+            assert_eq!(conf.qpair_acquire_timeout_ms, 45_000);
         }
 
         #[test]
         fn init_preserves_defaults_when_strings_empty() {
             let mut conf = SpdkConf::default();
-            // io_timeout_str and keep_alive_timeout_str are already ""
+            // io_timeout_str, keep_alive_timeout_str and qpair_acquire_timeout_str are already ""
             conf.init().unwrap();
             assert_eq!(conf.io_timeout_ms, 30_000);
             assert_eq!(conf.keep_alive_timeout_ms, 10_000);
+            assert_eq!(conf.qpair_acquire_timeout_ms, 30_000);
         }
 
         #[test]
@@ -1411,6 +1464,27 @@ mod test {
         }
 
         #[test]
+        fn validate_rejects_zero_qpair_acquire_timeout() {
+            let conf = SpdkConf {
+                enabled: true,
+                qpair_acquire_timeout_ms: 0,
+                targets: vec![NvmeTarget {
+                    traddr: "10.0.0.1".into(),
+                    trsvcid: 4420,
+                    subnqn: "nqn.test".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let result = conf.validate();
+            assert!(result.is_err());
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("qpair_acquire_timeout"));
+        }
+
+        #[test]
         fn toml_parsing_with_target_overrides() {
             let toml = r#"
                 enabled = true
@@ -1422,6 +1496,7 @@ mod test {
                 io_timeout = "60s"
                 io_retry_count = 4
                 keep_alive_timeout = "120s"
+                qpair_acquire_timeout = "45s"
                 poll_interval = 50
                 spin_iter = 2000
                 dma_buffer_size = "2MB"
@@ -1445,6 +1520,7 @@ mod test {
             assert_eq!(conf.hugepage_mb, 2048);
             assert_eq!(conf.io_timeout_ms, 60_000);
             assert_eq!(conf.keep_alive_timeout_ms, 120_000);
+            assert_eq!(conf.qpair_acquire_timeout_ms, 45_000);
             assert_eq!(conf.poll_interval_ms, 50);
             assert_eq!(conf.dma_buffer_bytes, 2 * 1024 * 1024);
 
@@ -1461,6 +1537,7 @@ mod test {
             conf.init().unwrap();
             assert_eq!(conf.io_timeout_ms, 30_000);
             assert_eq!(conf.keep_alive_timeout_ms, 10_000);
+            assert_eq!(conf.qpair_acquire_timeout_ms, 30_000);
             assert_eq!(conf.poll_interval_ms, 100);
             assert!(conf.hugepage_mb > 0);
             assert!(conf.iova_mode.is_empty());

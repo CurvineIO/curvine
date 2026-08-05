@@ -645,12 +645,17 @@ impl NodeState {
     }
 
     pub fn has_open_handles(&self, ino: u64) -> bool {
-        let lock = self.handles.read();
-        if let Some(map) = lock.get(&ino) {
-            !map.is_empty()
-        } else {
-            false
+        // Both OPEN and OPENDIR handles keep the inode addressable until their
+        // corresponding RELEASE/RELEASEDIR request.
+        {
+            let lock = self.handles.read();
+            if lock.get(&ino).is_some_and(|map| !map.is_empty()) {
+                return true;
+            }
         }
+
+        let lock = self.dir_handles.read();
+        lock.get(&ino).is_some_and(|map| !map.is_empty())
     }
 
     pub fn clear_mark_delete(&self, ino: u64) -> FuseResult<()> {
@@ -984,9 +989,11 @@ impl NodeState {
         }
 
         if let Some(mtime) = self.get_writer_mtime(attr.ino).await {
-            attr.mtime = (mtime.max(0) / 1000) as u64;
-            attr.mtimensec = ((mtime.max(0) % 1000) * 1_000_000) as u32;
-            if (attr.mtime, attr.mtimensec) > (attr.ctime, attr.ctimensec) {
+            (attr.mtime, attr.mtimensec) = FuseUtils::millis_to_fuse_timestamp(mtime);
+            if FuseUtils::fuse_timestamp_is_later(
+                (attr.mtime, attr.mtimensec),
+                (attr.ctime, attr.ctimensec),
+            ) {
                 attr.ctime = attr.mtime;
                 attr.ctimensec = attr.mtimensec;
             }
@@ -1097,35 +1104,72 @@ impl NodeState {
     }
 
     pub async fn fs_set_attr(&self, ino: u64, opts: SetAttrOpts) -> FuseResult<FileStatus> {
+        let mtime = opts.mtime;
         let path = self.get_path_common(ino, None)?;
-        let status = match self.fs.fuse_set_attr(&path, opts).await? {
-            Some(status) => status,
-            None => self.fs.get_status(&path).await?,
+        let status = if let Some(mtime) = mtime {
+            let fs = self.fs.clone();
+            let writer_path = path.clone();
+            let writer_opts = opts.clone();
+            match self
+                .writers
+                .with_resource_result(&ino, |writer| async move {
+                    // Serialize with RELEASE cleanup. Otherwise complete can
+                    // overwrite an mtime that a following utimensat just set.
+                    let status = match fs.fuse_set_attr(&writer_path, writer_opts).await? {
+                        Some(status) => status,
+                        None => fs.get_status(&writer_path).await?,
+                    };
+                    let receiver = writer.enqueue_mtime(mtime).await?;
+                    Ok::<_, FuseError>((status, writer, receiver))
+                })
+                .await?
+            {
+                Some((status, writer, receiver)) => {
+                    // Queue ordering is established while the writer entry is
+                    // locked; wait for older backend IO after releasing it.
+                    writer.wait_mtime(receiver).await?;
+                    status
+                }
+                None => match self.fs.fuse_set_attr(&path, opts).await? {
+                    Some(status) => status,
+                    None => self.fs.get_status(&path).await?,
+                },
+            }
+        } else {
+            match self.fs.fuse_set_attr(&path, opts).await? {
+                Some(status) => status,
+                None => self.fs.get_status(&path).await?,
+            }
         };
         let _ = self.update_status(ino, None, &status);
 
         Ok(status)
     }
 
-    pub async fn fs_resize(&self, ino: u64, fh: u64, opts: FileAllocOpts) -> FuseResult<()> {
+    pub async fn fs_resize(
+        &self,
+        ino: u64,
+        fh: u64,
+        opts: FileAllocOpts,
+    ) -> FuseResult<FileStatus> {
         opts.validate()?;
 
         let path = self.get_path(ino)?;
         // Keep fallocate/truncate ordered with the inode's active writer when
         // one exists, regardless of which file handle the syscall supplied.
         if let Some(writer) = self.find_writer(ino).await {
-            writer.resize(opts).await?;
-            return Ok(());
+            return Ok(writer.resize(opts).await?);
         }
 
         if fh != 0 {
             let handle = self.find_handle(ino, fh)?;
-            handle.resize(opts).await?;
-            return Ok(());
+            return handle.resize(opts).await;
         }
 
         self.fs.resize(&path, opts).await?;
-        Ok(())
+        // The filesystem resize API does not expose its returned FileBlocks, so
+        // fetch the authoritative timestamps when no active writer is available.
+        Ok(self.fs.get_status(&path).await?)
     }
 
     pub async fn fs_rename(
@@ -1467,6 +1511,49 @@ mod test {
         assert!(NodeState::map_remove_handle(&mut map, 2, 21).1);
         assert!(map.get(&2).is_none());
         assert!(!NodeState::map_remove_handle(&mut map, 2, 99).1);
+    }
+
+    #[test]
+    fn clear_keeps_expired_inode_until_directory_handle_is_released() {
+        crate::FuseMetrics::ensure_init().unwrap();
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.node_cache_ttl = std::time::Duration::from_secs(60);
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+        let ino = {
+            let mut tree = state.dir_write();
+            let ino = tree
+                .lookup(
+                    FUSE_ROOT_ID,
+                    "d",
+                    FileStatus::with_name(2, "d".to_string(), true),
+                    true,
+                )
+                .unwrap()
+                .ino;
+            tree.forget(ino, 1).unwrap();
+            tree.get_inode_mut(ino, None).unwrap().last_access = 0;
+            ino
+        };
+
+        {
+            let mut handles = state.dir_handles.write();
+            NodeState::insert_dir_handle_locked(&mut handles, ino, 20, dir_handle(ino, 20));
+        }
+
+        state.clear().unwrap();
+        assert!(
+            state.dir_read().get_inode(ino, None::<&str>).is_some(),
+            "an open directory handle must keep an expired inode addressable"
+        );
+
+        state.remove_dir_handle(ino, 20).unwrap();
+        state.clear().unwrap();
+        assert!(
+            state.dir_read().get_inode(ino, None::<&str>).is_none(),
+            "the expired inode should be evicted after its directory handle is released"
+        );
     }
 
     #[test]

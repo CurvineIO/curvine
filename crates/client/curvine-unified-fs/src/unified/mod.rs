@@ -39,9 +39,14 @@ pub use self::mount_cache::*;
 mod fallback_fs_reader;
 pub use self::fallback_fs_reader::FallbackFsReader;
 
+mod write_cache_writer;
+pub use self::write_cache_writer::WriteCacheWriter;
+
 #[allow(clippy::large_enum_variant)]
 pub enum UnifiedWriter {
     Cv(FsWriter),
+
+    WriteCache(Box<WriteCacheWriter>),
 
     #[cfg(feature = "opendal")]
     Opendal(OpendalWriter),
@@ -55,6 +60,8 @@ pub enum UnifiedWriter {
 impl_writer_for_enum! {
     enum UnifiedWriter {
         Cv(FsWriter),
+
+        WriteCache(Box<WriteCacheWriter>),
 
         #[cfg(feature = "opendal")]
         Opendal(OpendalWriter),
@@ -77,6 +84,8 @@ impl UnifiedWriter {
         match self {
             UnifiedWriter::Cv(_) => "curvine",
 
+            UnifiedWriter::WriteCache(_) => "ufs",
+
             #[cfg(feature = "opendal")]
             UnifiedWriter::Opendal(_) => "ufs",
 
@@ -84,6 +93,57 @@ impl UnifiedWriter {
             UnifiedWriter::OssHdfs(_) => "ufs",
 
             UnifiedWriter::Local(_) => "local",
+        }
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
+pub enum UfsWriter {
+    #[cfg(feature = "opendal")]
+    Opendal(OpendalWriter),
+
+    #[cfg(feature = "oss-hdfs")]
+    OssHdfs(OssHdfsWriter),
+
+    Local(LocalWriter),
+}
+
+impl_writer_for_enum! {
+    enum UfsWriter {
+        #[cfg(feature = "opendal")]
+        Opendal(OpendalWriter),
+
+        #[cfg(feature = "oss-hdfs")]
+        OssHdfs(OssHdfsWriter),
+
+        Local(LocalWriter),
+    }
+}
+
+impl UfsWriter {
+    pub fn try_from_unified(writer: UnifiedWriter) -> Result<Self, Box<UnifiedWriter>> {
+        match writer {
+            #[cfg(feature = "opendal")]
+            UnifiedWriter::Opendal(writer) => Ok(UfsWriter::Opendal(writer)),
+
+            #[cfg(feature = "oss-hdfs")]
+            UnifiedWriter::OssHdfs(writer) => Ok(UfsWriter::OssHdfs(writer)),
+
+            UnifiedWriter::Local(writer) => Ok(UfsWriter::Local(writer)),
+
+            other => Err(Box::new(other)),
+        }
+    }
+
+    pub fn into_unified(self) -> UnifiedWriter {
+        match self {
+            #[cfg(feature = "opendal")]
+            UfsWriter::Opendal(writer) => UnifiedWriter::Opendal(writer),
+
+            #[cfg(feature = "oss-hdfs")]
+            UfsWriter::OssHdfs(writer) => UnifiedWriter::OssHdfs(writer),
+
+            UfsWriter::Local(writer) => UnifiedWriter::Local(writer),
         }
     }
 }

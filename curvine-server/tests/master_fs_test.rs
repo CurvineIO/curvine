@@ -925,6 +925,31 @@ fn mkdir_inherits_setgid_parent_group_and_mode() -> CommonResult<()> {
     Ok(())
 }
 
+#[test]
+fn create_file_inherits_setgid_parent_group() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "create-file-setgid-inherit");
+
+    let parent_opts = MkdirOptsBuilder::new()
+        .owner("parent-owner".to_string())
+        .group("parent-group".to_string())
+        .mode(0o2775)
+        .build();
+    fs.mkdir_with_opts("/parent", parent_opts)?;
+
+    let file_opts = CreateFileOptsBuilder::new()
+        .owner("file-owner".to_string())
+        .group("file-group".to_string())
+        .build();
+    fs.create_with_opts("/parent/file", file_opts, OpenFlags::new_create())?;
+
+    let file = fs.file_status("/parent/file")?;
+    assert_eq!("parent-group", file.group);
+    assert_eq!(0, file.mode & 0o2000);
+
+    Ok(())
+}
+
 fn delete(fs: &MasterFilesystem) -> CommonResult<()> {
     let res1 = fs.delete("/a", false);
     assert!(res1.is_err());

@@ -590,6 +590,7 @@ impl ProtoUtils {
             provider: info.provider.map(|v| v.into()),
             auto_cache: Some(info.auto_cache),
             access_mode: Some(info.access_mode.into()),
+            write_cache: Some(info.write_cache),
         }
     }
 
@@ -609,6 +610,7 @@ impl ProtoUtils {
             provider: info.provider.map(|x| x.into()),
             auto_cache: info.auto_cache.unwrap_or(true),
             access_mode: info.access_mode.map(AccessMode::from).unwrap_or_default(),
+            write_cache: info.write_cache.unwrap_or(false),
         }
     }
 
@@ -627,6 +629,7 @@ impl ProtoUtils {
             provider: opts.provider.map(|v| v.into()),
             auto_cache: opts.auto_cache,
             access_mode: opts.access_mode.map(|v| v.into()),
+            write_cache: opts.write_cache,
         }
     }
 
@@ -645,6 +648,7 @@ impl ProtoUtils {
             provider: opts.provider.map(Provider::from),
             auto_cache: opts.auto_cache,
             access_mode: opts.access_mode.map(AccessMode::from),
+            write_cache: opts.write_cache,
         }
     }
 
@@ -766,6 +770,7 @@ mod tests {
             mount_id: 7,
             auto_cache: false,
             access_mode: AccessMode::ReadWrite,
+            write_cache: true,
             ..Default::default()
         };
 
@@ -774,6 +779,7 @@ mod tests {
 
         assert!(!round_trip.auto_cache);
         assert_eq!(round_trip.access_mode, AccessMode::ReadWrite);
+        assert!(round_trip.write_cache);
     }
 
     #[test]
@@ -781,6 +787,7 @@ mod tests {
         let opts = MountOptions::builder()
             .auto_cache(false)
             .access_mode(AccessMode::ReadWrite)
+            .write_cache(true)
             .build();
 
         let pb = ProtoUtils::mount_options_to_pb(opts);
@@ -788,6 +795,7 @@ mod tests {
 
         assert_eq!(round_trip.auto_cache, Some(false));
         assert_eq!(round_trip.access_mode, Some(AccessMode::ReadWrite));
+        assert_eq!(round_trip.write_cache, Some(true));
     }
 
     #[test]

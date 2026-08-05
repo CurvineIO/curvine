@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::block::BlockClient;
+use crate::block::{BlockClient, BlockReaderRemote};
 use crate::file::FsContext;
 use bytes::BytesMut;
-use curvine_core_error::{err_box, try_option};
+use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_io::LocalFile;
@@ -41,14 +41,78 @@ pub struct BlockReaderLocal {
     chunk_size: usize,
 }
 
+pub(crate) enum LocalReaderOpen {
+    Local(BlockReaderLocal),
+    Remote(BlockReaderRemote),
+}
+
+enum AdoptedRead<C, L, R> {
+    Local { client: C, file: L },
+    Remote(R),
+}
+
+trait ReadSessionCleanup {
+    async fn finish_read(
+        &mut self,
+        block: &ExtendedBlock,
+        req_id: i64,
+        seq_id: i32,
+    ) -> FsResult<()>;
+
+    fn prevent_pool_reuse(&mut self);
+}
+
+impl ReadSessionCleanup for BlockClient {
+    async fn finish_read(
+        &mut self,
+        block: &ExtendedBlock,
+        req_id: i64,
+        seq_id: i32,
+    ) -> FsResult<()> {
+        self.read_commit(block, req_id, seq_id).await
+    }
+
+    fn prevent_pool_reuse(&mut self) {
+        self.clear_pool();
+    }
+}
+
+async fn adopt_opened_session<C, L, R, E>(
+    mut client: C,
+    path: Option<String>,
+    block: &ExtendedBlock,
+    req_id: i64,
+    seq_id: i32,
+    open_local: impl FnOnce(&str) -> Result<L, E>,
+    open_remote: impl FnOnce(C) -> R,
+) -> Result<AdoptedRead<C, L, R>, E>
+where
+    C: ReadSessionCleanup,
+{
+    let Some(path) = path else {
+        return Ok(AdoptedRead::Remote(open_remote(client)));
+    };
+
+    match open_local(&path) {
+        Ok(file) => Ok(AdoptedRead::Local { client, file }),
+        Err(e) => {
+            // Release the Worker read context promptly, but never allow a failed
+            // local open to return an uncertain session to the connection pool.
+            let _ = client.finish_read(block, req_id, seq_id + 1).await;
+            client.prevent_pool_reuse();
+            Err(e)
+        }
+    }
+}
+
 impl BlockReaderLocal {
-    pub async fn new(
+    pub(crate) async fn open(
         fs_context: Arc<FsContext>,
         block: ExtendedBlock,
         addr: WorkerAddress,
         off: i64,
         len: i64,
-    ) -> FsResult<Self> {
+    ) -> FsResult<LocalReaderOpen> {
         let req_id = Utils::req_id();
         let seq_id = 0;
 
@@ -66,8 +130,33 @@ impl BlockReaderLocal {
             )
             .await?;
 
-        let path = try_option!(read_context.path);
-        let file = LocalFile::with_read(&path, off as u64)?;
+        let opened = adopt_opened_session(
+            client,
+            read_context.path,
+            &block,
+            req_id,
+            seq_id,
+            |path| LocalFile::with_read(path, off as u64),
+            |client| {
+                BlockReaderRemote::from_opened(
+                    client,
+                    block.clone(),
+                    addr.clone(),
+                    off,
+                    len,
+                    req_id,
+                    seq_id,
+                )
+            },
+        )
+        .await?;
+
+        let (client, file) = match opened {
+            AdoptedRead::Local { client, file } => (client, file),
+            // The worker can reject short-circuit mode when it must synthesize a
+            // sparse logical tail. Reuse the already-open remote read session.
+            AdoptedRead::Remote(reader) => return Ok(LocalReaderOpen::Remote(reader)),
+        };
 
         let reader = Self {
             rt: fs_context.clone_runtime(),
@@ -84,7 +173,7 @@ impl BlockReaderLocal {
             chunk_size,
         };
 
-        Ok(reader)
+        Ok(LocalReaderOpen::Local(reader))
     }
 
     fn next_seq_id(&mut self) -> i32 {
@@ -169,5 +258,104 @@ impl BlockReaderLocal {
 
     pub fn worker_address(&self) -> &WorkerAddress {
         &self.worker_address
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{adopt_opened_session, AdoptedRead, ReadSessionCleanup};
+    use curvine_error::{FsError, FsResult};
+    use curvine_model::{ExtendedBlock, FileType, StorageType};
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct FakeClient {
+        id: u64,
+        finish_called: Arc<AtomicBool>,
+        prevent_pool_reuse_called: Arc<AtomicBool>,
+        fail_finish: bool,
+    }
+
+    impl FakeClient {
+        fn new(id: u64) -> Self {
+            Self {
+                id,
+                finish_called: Arc::new(AtomicBool::new(false)),
+                prevent_pool_reuse_called: Arc::new(AtomicBool::new(false)),
+                fail_finish: false,
+            }
+        }
+    }
+
+    impl ReadSessionCleanup for FakeClient {
+        async fn finish_read(
+            &mut self,
+            _block: &ExtendedBlock,
+            _req_id: i64,
+            _seq_id: i32,
+        ) -> FsResult<()> {
+            self.finish_called.store(true, Ordering::SeqCst);
+            if self.fail_finish {
+                Err(FsError::common("injected read_commit failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn prevent_pool_reuse(&mut self) {
+            self.prevent_pool_reuse_called.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn test_block() -> ExtendedBlock {
+        ExtendedBlock::new(1, 4096, StorageType::Disk, FileType::File)
+    }
+
+    #[tokio::test]
+    async fn missing_short_circuit_path_adopts_the_opened_session() {
+        let opened = adopt_opened_session(
+            FakeClient::new(42),
+            None,
+            &test_block(),
+            100,
+            0,
+            |_| -> Result<(), &'static str> { panic!("local open must not be attempted") },
+            |client| client,
+        )
+        .await
+        .unwrap();
+
+        match opened {
+            AdoptedRead::Remote(client) => {
+                assert_eq!(client.id, 42);
+                assert!(!client.finish_called.load(Ordering::SeqCst));
+                assert!(!client.prevent_pool_reuse_called.load(Ordering::SeqCst));
+            }
+            AdoptedRead::Local { .. } => panic!("missing path must adopt remote mode"),
+        }
+    }
+
+    #[tokio::test]
+    async fn local_open_failure_finishes_session_and_prevents_pool_reuse() {
+        let mut client = FakeClient::new(42);
+        client.fail_finish = true;
+        let finish_called = client.finish_called.clone();
+        let prevent_pool_reuse_called = client.prevent_pool_reuse_called.clone();
+        let result = adopt_opened_session(
+            client,
+            Some("/missing/block".to_string()),
+            &test_block(),
+            100,
+            0,
+            |_| -> Result<(), &'static str> { Err("injected local open failure") },
+            |client| client,
+        )
+        .await;
+
+        assert!(matches!(result, Err("injected local open failure")));
+        assert!(finish_called.load(Ordering::SeqCst));
+        assert!(prevent_pool_reuse_called.load(Ordering::SeqCst));
     }
 }

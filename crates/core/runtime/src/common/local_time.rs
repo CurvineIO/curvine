@@ -22,7 +22,7 @@ const DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f";
 pub struct LocalTime;
 
 impl LocalTime {
-    pub const NANOSECONDS_PER_MILLISECOND: u128 = 1000000;
+    pub const NANOSECONDS_PER_MILLISECOND: u128 = 1_000_000;
 
     pub fn new() -> Self {
         Self
@@ -37,6 +37,23 @@ impl LocalTime {
 
     pub fn mills() -> u64 {
         (Self::nanos() / Self::NANOSECONDS_PER_MILLISECOND) as u64
+    }
+
+    pub fn system_time_millis(time: SystemTime) -> i64 {
+        match time.duration_since(UNIX_EPOCH) {
+            Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
+            Err(error) => {
+                // Millisecond timestamps use floor semantics, so any fractional
+                // millisecond before the epoch belongs to the preceding millisecond.
+                let nanos = error.duration().as_nanos();
+                let millis = nanos.div_ceil(Self::NANOSECONDS_PER_MILLISECOND);
+                if millis > i64::MAX as u128 {
+                    i64::MIN
+                } else {
+                    -(millis as i64)
+                }
+            }
+        }
     }
 
     pub fn now_datetime() -> String {
@@ -67,5 +84,35 @@ impl FormatTime for LocalTime {
             t.second(),
             t.nanosecond() / 1_000_000,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LocalTime;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn system_time_millis_preserves_pre_epoch_values() {
+        assert_eq!(
+            LocalTime::system_time_millis(UNIX_EPOCH - Duration::from_nanos(1)),
+            -1
+        );
+        assert_eq!(
+            LocalTime::system_time_millis(UNIX_EPOCH - Duration::from_millis(1)),
+            -1
+        );
+        assert_eq!(
+            LocalTime::system_time_millis(
+                UNIX_EPOCH - Duration::from_millis(1) - Duration::from_nanos(1)
+            ),
+            -2
+        );
+        assert_eq!(
+            LocalTime::system_time_millis(
+                UNIX_EPOCH + Duration::from_millis(1) + Duration::from_nanos(999_999)
+            ),
+            1
+        );
     }
 }

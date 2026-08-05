@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::block::block_reader::ReaderAdapter::{Hole, Local, Remote};
+use crate::block::block_reader_local::LocalReaderOpen;
 use crate::block::{BlockReaderHole, BlockReaderLocal, BlockReaderRemote};
 use crate::file::FsContext;
 use curvine_core_error::CommonResult;
@@ -183,16 +184,17 @@ impl BlockReader {
             let short_circuit = short_circuit && fs_context.is_local_worker(loc);
             let res: FsResult<ReaderAdapter> = {
                 if short_circuit {
-                    let local = BlockReaderLocal::new(
+                    match BlockReaderLocal::open(
                         fs_context.clone(),
                         block.clone(),
                         loc.clone(),
                         off,
                         len,
                     )
-                    .await;
-                    match local {
-                        Ok(reader) => Ok(Local(reader)),
+                    .await
+                    {
+                        Ok(LocalReaderOpen::Local(reader)) => Ok(Local(reader)),
+                        Ok(LocalReaderOpen::Remote(reader)) => Ok(Remote(reader)),
                         Err(e) => {
                             warn!(
                                 "fail to create local block reader for {}, falling back to remote: {}",

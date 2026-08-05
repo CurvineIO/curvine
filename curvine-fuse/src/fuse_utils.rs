@@ -269,13 +269,6 @@ impl FuseUtils {
             .build()
     }
 
-    /// When the parent directory has the setgid bit, new nodes inherit its group.
-    pub fn apply_setgid_parent_group(opts: &mut CreateFileOpts, parent: &FileStatus) {
-        if parent.mode & FUSE_S_ISGID != 0 {
-            opts.group.clone_from(&parent.group);
-        }
-    }
-
     /// Sticky-directory hard-link rule: caller must own the source file or the
     /// destination directory (Linux vfs_link / may_link semantics).
     pub fn check_sticky_hardlink(
@@ -469,22 +462,29 @@ impl FuseUtils {
         CreateFileOptsBuilder::with_conf(&fs.conf().client).build()
     }
 
+    pub(crate) fn millis_to_fuse_timestamp(millis: i64) -> (u64, u32) {
+        // FUSE carries seconds as u64. Negative Unix seconds use their two's
+        // complement representation, while nanoseconds must remain non-negative.
+        let seconds = millis.div_euclid(1000);
+        let nanoseconds = millis.rem_euclid(1000) * 1_000_000;
+        (seconds as u64, nanoseconds as u32)
+    }
+
+    pub(crate) fn fuse_timestamp_is_later(left: (u64, u32), right: (u64, u32)) -> bool {
+        (left.0 as i64, left.1) > (right.0 as i64, right.1)
+    }
+
     pub fn status_to_attr(conf: &FuseConf, status: &FileStatus) -> FuseResult<fuse_attr> {
         // Derive blocks from reported size so size and blocks stay consistent.
         let size = FuseUtils::fuse_st_size(status)?;
         let blocks = size.div_ceil(512);
 
-        let mtime_sec = (status.mtime.max(0) / 1000) as u64;
-        let mtime_nsec = ((status.mtime.max(0) % 1000) * 1_000_000) as u32;
-
-        let atime_sec = (status.atime.max(0) / 1000) as u64;
-        let atime_nsec = ((status.atime.max(0) % 1000) * 1_000_000) as u32;
+        let (mtime_sec, mtime_nsec) = Self::millis_to_fuse_timestamp(status.mtime);
+        let (atime_sec, atime_nsec) = Self::millis_to_fuse_timestamp(status.atime);
 
         // Legacy/object-store statuses may not provide ctime yet. Falling back to mtime
         // preserves the previous behavior without hiding a real independent ctime.
-        let ctime = status.ctime();
-        let ctime_sec = (ctime.max(0) / 1000) as u64;
-        let ctime_nsec = ((ctime.max(0) % 1000) * 1_000_000) as u32;
+        let (ctime_sec, ctime_nsec) = Self::millis_to_fuse_timestamp(status.ctime());
 
         let uid = if status.owner.is_empty() {
             conf.uid
@@ -724,15 +724,11 @@ impl FuseUtils {
         }
 
         // FUSE represents seconds as u64, including negative Unix timestamps encoded in two's
-        // complement. Reinterpret it as i64 before doing checked arithmetic.
-        let seconds = seconds as i64;
-        match seconds
-            .checked_mul(1000)
-            .and_then(|millis| millis.checked_add(i64::from(nanoseconds / 1_000_000)))
-        {
-            Some(millis) => Ok(millis),
-            None => err_fuse!(libc::EINVAL, "{} timestamp out of range", field),
-        }
+        // complement. Clamp values beyond Curvine's signed millisecond range like a filesystem
+        // timestamp limit instead of rejecting dates that the VFS can parse.
+        let seconds = i128::from(seconds as i64);
+        let millis = seconds * 1000 + i128::from(nanoseconds / 1_000_000);
+        Ok(millis.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64)
     }
 
     pub fn file_opts_to_status(path: &Path, opts: &CreateFileOpts) -> FileStatus {
@@ -989,6 +985,18 @@ mod tests {
     }
 
     #[test]
+    fn setattr_clamps_seconds_outside_millisecond_range() {
+        assert_eq!(
+            FuseUtils::timestamp_to_millis("mtime", i64::MAX as u64, 999_999_999).unwrap(),
+            i64::MAX
+        );
+        assert_eq!(
+            FuseUtils::timestamp_to_millis("mtime", i64::MIN as u64, 0).unwrap(),
+            i64::MIN
+        );
+    }
+
+    #[test]
     fn kernel_version_6_10_compares_greater_than_6_9() {
         let version = FuseUtils::parse_kernel_version("6.10.3").unwrap();
 
@@ -1073,6 +1081,51 @@ mod tests {
     }
 
     #[test]
+    fn status_to_attr_preserves_negative_timestamps() {
+        let conf = FuseConf::default();
+        let mut status = file_status(FileType::File, 0, 0o644);
+        status.atime = -315_593_940_000;
+        status.mtime = -1;
+        status.x_attr.insert(
+            INTERNAL_CTIME_XATTR.to_string(),
+            (-1_001_i64).to_le_bytes().to_vec(),
+        );
+
+        let attr = FuseUtils::status_to_attr(&conf, &status).unwrap();
+        assert_eq!((attr.atime as i64, attr.atimensec), (-315_593_940, 0));
+        assert_eq!((attr.mtime as i64, attr.mtimensec), (-1, 999_000_000));
+        assert_eq!((attr.ctime as i64, attr.ctimensec), (-2, 999_000_000));
+
+        assert_eq!(
+            FuseUtils::timestamp_to_millis("mtime", attr.mtime, attr.mtimensec).unwrap(),
+            status.mtime
+        );
+        assert_eq!(
+            FuseUtils::timestamp_to_millis("ctime", attr.ctime, attr.ctimensec).unwrap(),
+            status.ctime()
+        );
+        assert!(!FuseUtils::fuse_timestamp_is_later(
+            (attr.mtime, attr.mtimensec),
+            (1, 0)
+        ));
+        assert!(FuseUtils::fuse_timestamp_is_later(
+            (1, 0),
+            (attr.mtime, attr.mtimensec)
+        ));
+    }
+
+    #[test]
+    fn timestamp_conversion_round_trips_i64_boundaries() {
+        for millis in [i64::MIN, -1_001, -1, 0, 1, 1_001, i64::MAX] {
+            let (seconds, nanoseconds) = FuseUtils::millis_to_fuse_timestamp(millis);
+            assert_eq!(
+                FuseUtils::timestamp_to_millis("timestamp", seconds, nanoseconds).unwrap(),
+                millis
+            );
+        }
+    }
+
+    #[test]
     fn blocks_derived_from_fuse_size() {
         let conf = FuseConf::default();
 
@@ -1151,23 +1204,6 @@ mod tests {
         let mut three = file_status(FileType::File, 0, 0o644);
         three.nlink = 3;
         assert_eq!(FuseUtils::status_to_attr(&conf, &three).unwrap().nlink, 3);
-    }
-
-    #[test]
-    fn apply_setgid_parent_group_inherits_parent_group() {
-        let mut opts = CreateFileOpts::with_create(false);
-        opts.group = "nogroup".to_string();
-
-        let mut parent = file_status(FileType::Dir, 0, 0o2775);
-        parent.group = "project".to_string();
-
-        FuseUtils::apply_setgid_parent_group(&mut opts, &parent);
-        assert_eq!(opts.group, "project");
-
-        parent.mode = 0o755;
-        opts.group = "nogroup".to_string();
-        FuseUtils::apply_setgid_parent_group(&mut opts, &parent);
-        assert_eq!(opts.group, "nogroup");
     }
 
     #[test]

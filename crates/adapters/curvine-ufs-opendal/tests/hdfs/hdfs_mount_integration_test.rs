@@ -83,6 +83,9 @@ mod mount_integration_tests {
                 replicas: None,
                 write_type: curvine_model::WriteType::CacheMode,
                 provider: None,
+                auto_cache: true,
+                access_mode: curvine_model::AccessMode::ReadOnly,
+                write_cache: false,
             };
 
             println!("Creating filesystem with MountInfo...");
@@ -271,6 +274,9 @@ mod mount_integration_tests {
                     replicas: None,
                     write_type: curvine_model::WriteType::CacheMode,
                     provider: None,
+                    auto_cache: true,
+                    access_mode: curvine_model::AccessMode::ReadOnly,
+                    write_cache: false,
                 };
 
                 match create_filesystem_from_mount(&mount_info) {
@@ -411,6 +417,9 @@ mod mount_integration_tests {
                 replicas: None,
                 write_type: curvine_model::WriteType::CacheMode,
                 provider: None,
+                auto_cache: true,
+                access_mode: curvine_model::AccessMode::ReadOnly,
+                write_cache: false,
             };
 
             let fs_v1 = create_filesystem_from_mount(&mount_info_v1)
@@ -460,6 +469,9 @@ mod mount_integration_tests {
                 replicas: None,
                 write_type: curvine_model::WriteType::CacheMode,
                 provider: None,
+                auto_cache: true,
+                access_mode: curvine_model::AccessMode::ReadOnly,
+                write_cache: false,
             };
 
             let fs_v2 = create_filesystem_from_mount(&mount_info_v2)

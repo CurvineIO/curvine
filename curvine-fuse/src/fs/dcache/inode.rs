@@ -203,7 +203,13 @@ impl Inode {
     }
 
     pub fn can_evict(&self, ttl: u64) -> bool {
+        // The kernel may continue issuing requests by nodeid until it balances
+        // every LOOKUP/READDIRPLUS reference with FORGET.
         !self.is_root()
+            // A failed deferred delete must remain observable until cleanup
+            // succeeds or reports that the backend entry is already absent.
+            && !self.mark_delete
+            && self.n_lookup == 0
             && self.last_access + ttl < LocalTime::mills()
             && self.dir.as_ref().is_none_or(|d| d.children.is_empty())
     }
