@@ -13,22 +13,19 @@
 #  // See the License for the specific language governing permissions and
 #  // limitations under the License.
 
-"""
-user.* extended attributes not persisted on Curvine FUSE — reproducer for LTP failures.
+"""Regression checks for Curvine FUSE extended-attribute semantics seen in LTP.
 
-Root cause: setxattr(2)/lsetxattr(2)/fsetxattr(2) on user.* (and other) namespaces
-appear to succeed, but subsequent getxattr(2)/lgetxattr(2)/fgetxattr(2) return
-ENODATA as if the attribute was never stored.  removexattr(2) on a missing
-attribute incorrectly succeeds instead of returning ENODATA.
+These cases were originally added to reproduce xattr persistence and errno
+failures.  They now protect the fixed behavior against regressions.
 
 Covered LTP cases (each line is one minimal repro scenario):
-  getxattr01 — setxattr(user.testkey) then getxattr must return the stored value (TFAIL ENODATA)
-  getxattr01 — setxattr(user.testkey) then getxattr(buf=1) must return ERANGE (TFAIL ENODATA)
-  getxattr03 — setxattr(user.testkey) then getxattr(NULL,0) must return value size (TFAIL ENODATA)
-  lgetxattr01 — lsetxattr on symlink then lgetxattr must read symlink xattr (TFAIL ENODATA)
-  lgetxattr02 — lsetxattr on symlink then lgetxattr(buf=1) must return ERANGE (TFAIL ENODATA)
-  fgetxattr03 — fsetxattr(user.testkey) then fgetxattr(NULL,0) must return value size (TFAIL ENODATA)
-  removexattr02 — removexattr(user.test) on file without that xattr must fail ENODATA (TFAIL success)
+  getxattr01 — setxattr(user.testkey) then getxattr must return the stored value
+  getxattr01 — setxattr(user.testkey) then getxattr(buf=1) must return ERANGE
+  getxattr03 — setxattr(user.testkey) then getxattr(NULL,0) must return value size
+  lgetxattr01 — lsetxattr on symlink then lgetxattr must read symlink xattr
+  lgetxattr02 — lsetxattr on symlink then lgetxattr(buf=1) must return ERANGE
+  fgetxattr03 — fsetxattr(user.testkey) then fgetxattr(NULL,0) must return value size
+  removexattr02 — removexattr(user.test) on a missing xattr must fail ENODATA
 
 Usage:
     python3 curvine_ltp_user_xattr_persist_repro.py --dir /curvine-fuse/fuse-test
@@ -39,10 +36,9 @@ import argparse
 import ctypes
 import errno
 import os
-import platform
 import shutil
 import sys
-from typing import Callable
+from typing import Callable, Optional
 
 DEFAULT_DIR = "/curvine-fuse/fuse-test"
 
@@ -128,30 +124,65 @@ def case_dir(root: str, name: str) -> str:
     return path
 
 
-def _syscall_nr(name: str) -> int:
-    table = {
-        "setxattr": {"x86_64": 188, "aarch64": 5},
-        "lsetxattr": {"x86_64": 189, "aarch64": 6},
-        "fsetxattr": {"x86_64": 190, "aarch64": 7},
-        "getxattr": {"x86_64": 191, "aarch64": 8},
-        "lgetxattr": {"x86_64": 192, "aarch64": 9},
-        "fgetxattr": {"x86_64": 193, "aarch64": 10},
-        "removexattr": {"x86_64": 197, "aarch64": 14},
-    }
-    machine = platform.machine()
-    if name not in table or machine not in table[name]:
-        raise OSError(
-            errno.ENOSYS,
-            f"unsupported architecture for {name}: {machine}",
-        )
-    return table[name][machine]
+_LIBC: Optional[ctypes.CDLL] = None
 
 
-def _raw_syscall(nr: int, *args: int) -> int:
+def _get_libc() -> ctypes.CDLL:
+    """Load libc lazily and declare the exact Linux xattr function ABI."""
+    global _LIBC  # noqa: PLW0603
+    if _LIBC is not None:
+        return _LIBC
+
     libc = ctypes.CDLL(None, use_errno=True)
-    syscall_fn = libc.syscall
-    syscall_fn.restype = ctypes.c_long
-    ret = int(syscall_fn(nr, *args))
+    path_name_value_size_flags = [
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+    ]
+    fd_name_value_size_flags = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+    ]
+    path_name_value_size = [
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    ]
+    fd_name_value_size = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    ]
+
+    libc.setxattr.argtypes = path_name_value_size_flags
+    libc.lsetxattr.argtypes = path_name_value_size_flags
+    libc.fsetxattr.argtypes = fd_name_value_size_flags
+    libc.getxattr.argtypes = path_name_value_size
+    libc.lgetxattr.argtypes = path_name_value_size
+    libc.fgetxattr.argtypes = fd_name_value_size
+    libc.removexattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+
+    libc.setxattr.restype = ctypes.c_int
+    libc.lsetxattr.restype = ctypes.c_int
+    libc.fsetxattr.restype = ctypes.c_int
+    libc.getxattr.restype = ctypes.c_ssize_t
+    libc.lgetxattr.restype = ctypes.c_ssize_t
+    libc.fgetxattr.restype = ctypes.c_ssize_t
+    libc.removexattr.restype = ctypes.c_int
+
+    _LIBC = libc
+    return libc
+
+
+def _call_libc(fn: Callable[..., int], *args: object) -> int:
+    ret = int(fn(*args))
     if ret < 0:
         err = ctypes.get_errno()
         raise OSError(err, os.strerror(err))
@@ -159,80 +190,83 @@ def _raw_syscall(nr: int, *args: int) -> int:
 
 
 def sys_setxattr(path: str, name: str, value: bytes, flags: int = 0) -> None:
-    """setxattr(path, name, value, size, flags) via raw syscall."""
-    _raw_syscall(
-        _syscall_nr("setxattr"),
-        ctypes.c_char_p(path.encode()),
-        ctypes.c_char_p(name.encode()),
-        ctypes.c_char_p(value),
+    """Call Linux setxattr(2) through libc with an explicit ABI."""
+    value_buf = ctypes.create_string_buffer(value)
+    _call_libc(
+        _get_libc().setxattr,
+        os.fsencode(path),
+        name.encode(),
+        ctypes.cast(value_buf, ctypes.c_void_p),
         len(value),
         flags,
     )
 
 
 def sys_lsetxattr(path: str, name: str, value: bytes, flags: int = 0) -> None:
-    """lsetxattr(path, name, value, size, flags) via raw syscall."""
-    _raw_syscall(
-        _syscall_nr("lsetxattr"),
-        ctypes.c_char_p(path.encode()),
-        ctypes.c_char_p(name.encode()),
-        ctypes.c_char_p(value),
+    """Call Linux lsetxattr(2) through libc with an explicit ABI."""
+    value_buf = ctypes.create_string_buffer(value)
+    _call_libc(
+        _get_libc().lsetxattr,
+        os.fsencode(path),
+        name.encode(),
+        ctypes.cast(value_buf, ctypes.c_void_p),
         len(value),
         flags,
     )
 
 
 def sys_fsetxattr(fd: int, name: str, value: bytes, flags: int = 0) -> None:
-    """fsetxattr(fd, name, value, size, flags) via raw syscall."""
-    _raw_syscall(
-        _syscall_nr("fsetxattr"),
+    """Call Linux fsetxattr(2) through libc with an explicit ABI."""
+    value_buf = ctypes.create_string_buffer(value)
+    _call_libc(
+        _get_libc().fsetxattr,
         fd,
-        ctypes.c_char_p(name.encode()),
-        ctypes.c_char_p(value),
+        name.encode(),
+        ctypes.cast(value_buf, ctypes.c_void_p),
         len(value),
         flags,
     )
 
 
 def sys_getxattr(path: str, name: str, value: int, size: int) -> int:
-    """getxattr(path, name, value, size) via raw syscall."""
-    return _raw_syscall(
-        _syscall_nr("getxattr"),
-        ctypes.c_char_p(path.encode()),
-        ctypes.c_char_p(name.encode()),
-        value,
+    """Call Linux getxattr(2) through libc with an explicit ABI."""
+    return _call_libc(
+        _get_libc().getxattr,
+        os.fsencode(path),
+        name.encode(),
+        ctypes.c_void_p(value),
         size,
     )
 
 
 def sys_lgetxattr(path: str, name: str, value: int, size: int) -> int:
-    """lgetxattr(path, name, value, size) via raw syscall."""
-    return _raw_syscall(
-        _syscall_nr("lgetxattr"),
-        ctypes.c_char_p(path.encode()),
-        ctypes.c_char_p(name.encode()),
-        value,
+    """Call Linux lgetxattr(2) through libc with an explicit ABI."""
+    return _call_libc(
+        _get_libc().lgetxattr,
+        os.fsencode(path),
+        name.encode(),
+        ctypes.c_void_p(value),
         size,
     )
 
 
 def sys_fgetxattr(fd: int, name: str, value: int, size: int) -> int:
-    """fgetxattr(fd, name, value, size) via raw syscall."""
-    return _raw_syscall(
-        _syscall_nr("fgetxattr"),
+    """Call Linux fgetxattr(2) through libc with an explicit ABI."""
+    return _call_libc(
+        _get_libc().fgetxattr,
         fd,
-        ctypes.c_char_p(name.encode()),
-        value,
+        name.encode(),
+        ctypes.c_void_p(value),
         size,
     )
 
 
 def sys_removexattr(path: str, name: str) -> None:
-    """removexattr(path, name) via raw syscall."""
-    _raw_syscall(
-        _syscall_nr("removexattr"),
-        ctypes.c_char_p(path.encode()),
-        ctypes.c_char_p(name.encode()),
+    """Call Linux removexattr(2) through libc with an explicit ABI."""
+    _call_libc(
+        _get_libc().removexattr,
+        os.fsencode(path),
+        name.encode(),
     )
 
 
@@ -465,7 +499,7 @@ TESTS: list[tuple[str, str, Callable[..., int]]] = [
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="user.* xattr not persisted on Curvine FUSE — reproducer",
+        description="Curvine FUSE xattr regression checks derived from LTP failures",
     )
     parser.add_argument(
         "--dir",
@@ -495,7 +529,7 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    print(f"Running user-xattr-persist reproducer under {root}\n")
+    print(f"Running Curvine FUSE xattr regression checks under {root}\n")
 
     fail = 0
     for num, title, test_fn in TESTS:
