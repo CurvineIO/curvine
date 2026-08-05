@@ -1413,10 +1413,10 @@ impl fs::FileSystem for CurvineFileSystem {
             let writer_len = self.state.get_writer_len(op.header.nodeid).await;
             if Self::setattr_size_needs_resize(op.arg.size, status.len, writer_len) {
                 let resize_opts = FileAllocOpts::with_truncate(expect_len);
-                self.state
+                status = self
+                    .state
                     .fs_resize(op.header.nodeid, op.arg.fh, resize_opts)
                     .await?;
-                status.len = expect_len;
                 self.state
                     .invalid_cache(op.header.nodeid, None, INVAL_REASON_RESIZE);
             }
@@ -1633,10 +1633,7 @@ impl fs::FileSystem for CurvineFileSystem {
         self.ensure_writable_path(&path, RpcCode::CreateFile)
             .await?;
 
-        let mut opts = FuseUtils::create_opts(&op, &self.fs);
-        let parent_status = self.state.fs_stat(ino, None).await?;
-        FuseUtils::apply_setgid_parent_group(&mut opts, &parent_status);
-
+        let opts = FuseUtils::create_opts(&op, &self.fs);
         let handle = self.state.fs_create(ino, name, op.arg.flags, opts).await?;
         let attr = FuseUtils::status_to_attr(&self.conf, &handle.status())?;
 
@@ -2062,9 +2059,7 @@ impl fs::FileSystem for CurvineFileSystem {
             let path = self.state.get_path_name(op.header.nodeid, name)?;
             self.ensure_writable_path(&path, RpcCode::CreateFile)
                 .await?;
-            let mut opts = FuseUtils::mknod_opts(&op, &self.fs, file_type);
-            let parent_status = self.state.fs_stat(op.header.nodeid, None).await?;
-            FuseUtils::apply_setgid_parent_group(&mut opts, &parent_status);
+            let opts = FuseUtils::mknod_opts(&op, &self.fs, file_type);
             self.fs.create_special_node(&path, opts).await?;
             let attr = self.state.lookup_common(op.header.nodeid, name).await?;
             Ok(FuseUtils::create_entry_out(&self.conf, attr))

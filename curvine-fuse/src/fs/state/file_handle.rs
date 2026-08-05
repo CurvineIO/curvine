@@ -119,12 +119,11 @@ impl FileHandle {
         }
     }
 
-    pub async fn resize(&self, opts: FileAllocOpts) -> FuseResult<()> {
+    pub async fn resize(&self, opts: FileAllocOpts) -> FuseResult<FileStatus> {
         match self {
             FileHandle::Backend(h) => {
                 if let Some(writer) = &h.writer {
-                    writer.resize(opts).await?;
-                    Ok(())
+                    Ok(writer.resize(opts).await?)
                 } else {
                     err_fuse!(libc::EACCES)
                 }
