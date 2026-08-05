@@ -105,25 +105,55 @@ def run_fio(rw, directory, threads, size, block_size, iodepth, timeout, ioengine
 
 
 def extract_metrics(data, rw, block_size):
-    job = data["jobs"][0]
+    jobs = data["jobs"]
     section = "write" if rw in ("write", "randwrite") else "read"
-    metric = job.get(section, {})
-    if not metric:
+    total_io_bytes = 0
+    total_iops = 0.0
+    total_bw = 0
+    total_errors = 0
+    total_samples = 0
+    weighted_mean = 0.0
+    max_latency = 0.0
+    p50 = p95 = p99 = 0.0
+    found = False
+    for job in jobs:
+        metric = job.get(section, {})
+        if not metric:
+            continue
+        found = True
+        io_bytes = metric.get("io_bytes", 0)
+        total_io_bytes += io_bytes
+        total_iops += metric.get("iops", 0)
+        total_bw += metric.get("bw_bytes", 0)
+        total_errors += job.get("error", 0)
+        if block_size:
+            total_samples += io_bytes // block_size
+        clat = metric.get("clat_ns", {})
+        percentile = clat.get("percentile", {})
+        weighted_mean += clat.get("mean", 0) * io_bytes
+        max_latency = max(max_latency, clat.get("max", 0))
+        p50 += percentile.get("50.000000", 0) * io_bytes
+        p95 += percentile.get("95.000000", 0) * io_bytes
+        p99 += percentile.get("99.000000", 0) * io_bytes
+    if not found:
         return None
-    clat = metric.get("clat_ns", {})
-    percentile = clat.get("percentile", {})
+    if total_io_bytes > 0:
+        weighted_mean /= total_io_bytes
+        p50 /= total_io_bytes
+        p95 /= total_io_bytes
+        p99 /= total_io_bytes
     return {
         "rw": rw,
-        "io_bytes": metric.get("io_bytes", 0),
-        "iops": metric.get("iops", 0),
-        "bw_bytes": metric.get("bw_bytes", 0),
-        "avg_cost_ms": clat.get("mean", 0) / 1e6,
-        "p50_ms": percentile.get("50.000000", 0) / 1e6,
-        "p95_ms": percentile.get("95.000000", 0) / 1e6,
-        "p99_ms": percentile.get("99.000000", 0) / 1e6,
-        "max_ms": clat.get("max", 0) / 1e6,
-        "samples": metric.get("io_bytes", 0) // block_size if block_size else 0,
-        "errors": job.get("error", 0),
+        "io_bytes": total_io_bytes,
+        "iops": total_iops,
+        "bw_bytes": total_bw,
+        "avg_cost_ms": weighted_mean / 1e6,
+        "p50_ms": p50 / 1e6,
+        "p95_ms": p95 / 1e6,
+        "p99_ms": p99 / 1e6,
+        "max_ms": max_latency / 1e6,
+        "samples": total_samples,
+        "errors": total_errors,
     }
 
 
@@ -220,6 +250,8 @@ def main():
         sys.exit("--iodepth must be greater than 0")
     if args.timeout < 0:
         sys.exit("--timeout must be greater than or equal to 0")
+    if args.direct not in (0, 1):
+        sys.exit("--direct must be 0 or 1")
     block_sizes = parse_bs_list(args.bs_list)
     if not block_sizes or any(bs <= 0 for bs in block_sizes):
         sys.exit("--bs-list must contain at least one valid block size")
@@ -272,7 +304,6 @@ def main():
             print(f"    done in {time.time() - start:.1f}s, {progress_string(metric)}")
 
     print("\nBenchmark finished!")
-    print(f"Temp path: {args.directory} (removed)")
     if args.json:
         print(json_report(metrics))
     else:
@@ -280,6 +311,7 @@ def main():
             print_table(title, rows)
     print(f"Removing benchmark directory: {directory}")
     shutil.rmtree(directory)
+    print(f"Temp path: {directory} (removed)")
 
 
 if __name__ == "__main__":
