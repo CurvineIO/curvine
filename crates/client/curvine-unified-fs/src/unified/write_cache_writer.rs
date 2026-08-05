@@ -20,15 +20,14 @@ use curvine_fs_api::{FileSystem, Path, Writer};
 use curvine_io::DataSlice;
 use curvine_model::{CreateFileOpts, FileAllocOpts, FileStatus, OpenFlags, SetAttrOpts};
 use curvine_runtime::runtime::RpcRuntime;
-use dashmap::DashSet;
 use log::{debug, warn};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time;
 
-const WRITE_CACHE_COMPLETE_TIMEOUT: Duration = Duration::from_secs(30);
+const WRITE_CACHE_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(5);
+const WRITE_CACHE_COMPLETE_TIMEOUT: Duration = Duration::from_secs(5);
 
 enum MirrorTask {
     Write {
@@ -49,7 +48,6 @@ struct MirrorState {
 
 pub struct WriteCacheWriter {
     primary: UfsWriter,
-    cv: CurvineFileSystem,
     ufs: UfsFileSystem,
     cv_path: Path,
     ufs_path: Path,
@@ -60,12 +58,9 @@ pub struct WriteCacheWriter {
     chunk: BytesMut,
     chunk_size: usize,
     mirror: Option<MirrorState>,
-    pending: Arc<DashSet<String>>,
-    pending_key: String,
 }
 
 impl WriteCacheWriter {
-    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         primary: UnifiedWriter,
         cv: CurvineFileSystem,
@@ -73,7 +68,6 @@ impl WriteCacheWriter {
         cv_path: Path,
         ufs_path: Path,
         opts: CreateFileOpts,
-        pending: Arc<DashSet<String>>,
     ) -> Result<Self, (UnifiedWriter, FsError)> {
         let primary = match UfsWriter::try_from_unified(primary) {
             Ok(primary) => primary,
@@ -92,27 +86,25 @@ impl WriteCacheWriter {
         let cv_flags = OpenFlags::new_write_only()
             .set_create(true)
             .set_overwrite(true);
-        let cv_writer = match cv.open_with_opts(&cv_path, opts, cv_flags).await {
+        let cv_writer = match cv
+            .open_with_opts(&cv_path, mirror_create_opts(opts), cv_flags)
+            .await
+        {
             Ok(writer) => writer,
             Err(e) => return Err((primary.into_unified(), e)),
         };
 
         let (tx, rx) = mpsc::channel(cv.conf().client.write_chunk_num.max(1));
-        let pending_key = ufs_path.clone_uri();
-        pending.insert(pending_key.clone());
 
         let handle = cv.fs_context_ref().rt().spawn(mirror_worker(
             cv.clone(),
             cv_path.clone(),
-            pending.clone(),
-            pending_key.clone(),
             cv_writer,
             rx,
         ));
 
         Ok(Self {
             primary,
-            cv,
             ufs,
             cv_path,
             ufs_path,
@@ -123,8 +115,6 @@ impl WriteCacheWriter {
             chunk: BytesMut::with_capacity(chunk_size),
             chunk_size,
             mirror: Some(MirrorState { tx, handle }),
-            pending,
-            pending_key,
         })
     }
 
@@ -132,26 +122,18 @@ impl WriteCacheWriter {
         self.mirror.is_some()
     }
 
-    fn spawn_cleanup_cv(&self) {
-        let cv = self.cv.clone();
-        let cv_path = self.cv_path.clone();
-        self.cv
-            .fs_context_ref()
-            .rt()
-            .spawn(async move { cleanup_write_cache_file(cv, cv_path).await });
-    }
-
     fn abandon_mirror(&mut self, reason: impl AsRef<str>) {
-        if let Some(mirror) = self.mirror.take() {
+        if let Some(_mirror) = self.mirror.take() {
             warn!(
                 "disable write cache mirror for cv_path={}, ufs_path={}: {}",
                 self.cv_path,
                 self.ufs_path,
                 reason.as_ref()
             );
-            mirror.handle.abort();
-            self.pending.remove(&self.pending_key);
-            self.spawn_cleanup_cv();
+            // Drop the sender so the worker drains, cancels the Curvine writer,
+            // and cleans up the partial mirror file before exiting. Aborting the
+            // task would drop `FsWriter` without `cancel()` (its `Drop` only
+            // logs), leaking server-side resources.
         }
     }
 
@@ -167,15 +149,30 @@ impl WriteCacheWriter {
         };
 
         let (tx, rx) = oneshot::channel();
-        if let Err(e) = mirror.tx.try_send(MirrorTask::Complete { opts, tx }) {
-            warn!(
-                "failed to enqueue write cache complete for cv_path={}, ufs_path={}: {}",
-                self.cv_path, self.ufs_path, e
-            );
-            mirror.handle.abort();
-            self.pending.remove(&self.pending_key);
-            self.spawn_cleanup_cv();
-            return;
+        match time::timeout(
+            WRITE_CACHE_ENQUEUE_TIMEOUT,
+            mirror.tx.send(MirrorTask::Complete { opts, tx }),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!(
+                    "failed to enqueue write cache complete for cv_path={}, ufs_path={}: {}",
+                    self.cv_path, self.ufs_path, e
+                );
+                // Worker already exited and ran its cancel/cleanup path.
+                return;
+            }
+            Err(_) => {
+                warn!(
+                    "write cache complete enqueue timed out for cv_path={}, ufs_path={}",
+                    self.cv_path, self.ufs_path
+                );
+                // Cooperative shutdown: the worker finishes the current op,
+                // then cancels the writer and cleans up.
+                return;
+            }
         }
 
         match time::timeout(WRITE_CACHE_COMPLETE_TIMEOUT, rx).await {
@@ -197,17 +194,15 @@ impl WriteCacheWriter {
                     "write cache worker stopped before complete for cv_path={}, ufs_path={}: {}",
                     self.cv_path, self.ufs_path, e
                 );
-                self.pending.remove(&self.pending_key);
-                self.spawn_cleanup_cv();
             }
             Err(_) => {
                 warn!(
                     "write cache complete timeout after {:?}, cv_path={}, ufs_path={}",
                     WRITE_CACHE_COMPLETE_TIMEOUT, self.cv_path, self.ufs_path
                 );
-                mirror.handle.abort();
-                self.pending.remove(&self.pending_key);
-                self.spawn_cleanup_cv();
+                // Cooperative: the worker keeps draining queued writes and
+                // completes (or cancels + cleans up) on its own in the
+                // background, so the Curvine writer is never dropped unclosed.
             }
         }
     }
@@ -217,8 +212,15 @@ impl WriteCacheWriter {
             return;
         };
 
-        if let Err(e) = mirror.tx.try_send(MirrorTask::Write { pos, data }) {
-            self.abandon_mirror(format!("failed to enqueue mirror write: {}", e));
+        match time::timeout(
+            WRITE_CACHE_ENQUEUE_TIMEOUT,
+            mirror.tx.send(MirrorTask::Write { pos, data }),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => self.abandon_mirror(format!("mirror channel closed: {}", e)),
+            Err(_) => self.abandon_mirror("mirror enqueue timed out"),
         }
     }
 
@@ -227,10 +229,28 @@ impl WriteCacheWriter {
             return;
         };
 
-        if let Err(e) = mirror.tx.try_send(MirrorTask::Flush) {
-            self.abandon_mirror(format!("failed to enqueue mirror flush: {}", e));
+        match time::timeout(
+            WRITE_CACHE_ENQUEUE_TIMEOUT,
+            mirror.tx.send(MirrorTask::Flush),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => self.abandon_mirror(format!("mirror channel closed: {}", e)),
+            Err(_) => self.abandon_mirror("mirror enqueue timed out"),
         }
     }
+}
+
+/// Build the create opts used to open the Curvine mirror target.
+///
+/// The in-flight mirror file must never look valid: until `complete_mirror`
+/// publishes the final UFS mtime, force `storage_policy.ufs_mtime = 0` so
+/// `cv_valid` rejects the partially mirrored file, regardless of what the
+/// caller passed (e.g. sync-write opts that already carry a UFS mtime).
+fn mirror_create_opts(mut opts: CreateFileOpts) -> CreateFileOpts {
+    opts.storage_policy.ufs_mtime = 0;
+    opts
 }
 
 async fn cleanup_write_cache_file(cv: CurvineFileSystem, cv_path: Path) {
@@ -244,8 +264,6 @@ async fn cleanup_write_cache_file(cv: CurvineFileSystem, cv_path: Path) {
 async fn mirror_worker(
     cv: CurvineFileSystem,
     cv_path: Path,
-    pending: Arc<DashSet<String>>,
-    pending_key: String,
     mut writer: FsWriter,
     mut rx: mpsc::Receiver<MirrorTask>,
 ) {
@@ -278,8 +296,6 @@ async fn mirror_worker(
         let _ = writer.cancel().await;
         cleanup_write_cache_file(cv, cv_path).await;
     }
-
-    pending.remove(&pending_key);
 }
 
 impl Writer for WriteCacheWriter {
@@ -397,5 +413,35 @@ impl Writer for WriteCacheWriter {
         self.flush_chunk().await?;
         self.abandon_mirror("writer resized");
         self.primary.resize(opts).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mirror_create_opts;
+    use curvine_model::CreateFileOptsBuilder;
+
+    #[test]
+    fn mirror_create_opts_forces_zero_ufs_mtime() {
+        let opts = CreateFileOptsBuilder::new()
+            .ufs_mtime_len(12_345, 678)
+            .build();
+
+        let mirror = mirror_create_opts(opts);
+
+        assert_eq!(mirror.storage_policy.ufs_mtime, 0);
+    }
+
+    #[test]
+    fn mirror_create_opts_preserves_other_fields() {
+        let opts = CreateFileOptsBuilder::new()
+            .ufs_mtime_len(12_345, 678)
+            .build();
+
+        let mirror = mirror_create_opts(opts.clone());
+
+        assert_eq!(mirror.block_size, opts.block_size);
+        assert_eq!(mirror.replicas, opts.replicas);
+        assert_eq!(mirror.ufs_len, opts.ufs_len);
     }
 }

@@ -57,7 +57,6 @@ pub struct UnifiedFileSystem {
     enable_read_ufs: bool,
     audit_logging_enabled: bool,
     async_cache_pending: Arc<DashSet<String>>,
-    write_cache_pending: Arc<DashSet<String>>,
     metrics: &'static ClientMetrics,
 }
 
@@ -77,7 +76,6 @@ impl UnifiedFileSystem {
             enable_read_ufs,
             audit_logging_enabled,
             async_cache_pending: Arc::new(DashSet::new()),
-            write_cache_pending: Arc::new(DashSet::new()),
             metrics: FsContext::get_metrics(),
         };
 
@@ -695,7 +693,6 @@ impl UnifiedFileSystem {
                             path.clone(),
                             ufs_path.clone(),
                             mirror_opts,
-                            self.write_cache_pending.clone(),
                         )
                         .await
                         {
@@ -1018,15 +1015,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                     .inc();
 
                 if mount.info.auto_cache() {
-                    let ufs_key = ufs_path.clone_uri();
-                    if self.write_cache_pending.contains(&ufs_key) {
-                        debug!(
-                            "skip async cache for {} while write cache mirror is pending",
-                            ufs_path
-                        );
-                    } else {
-                        self.async_cache(&ufs_path)?;
-                    }
+                    self.async_cache(&ufs_path)?;
                 }
 
                 read_path = ufs_path.full_path().to_owned();
