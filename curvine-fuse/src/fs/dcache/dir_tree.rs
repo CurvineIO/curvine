@@ -1267,6 +1267,40 @@ mod test {
         );
     }
 
+    /// A failed deferred delete keeps `mark_delete` set for later retry or
+    /// persisted-state recovery. TTL cleanup must not silently discard it.
+    #[test]
+    fn clear_keeps_expired_pending_delete_until_completion() {
+        let mut tree = DirTree::default();
+        let ino = tree
+            .lookup(FUSE_ROOT_ID, "pending", file_st("pending", 900), true)
+            .unwrap()
+            .ino;
+        tree.forget(ino, 1).unwrap();
+        tree.unlink(FUSE_ROOT_ID, "pending", true).unwrap();
+        tree.get_inode_mut(ino, None).unwrap().last_access = 0;
+
+        tree.clear(|_| false);
+
+        assert!(
+            tree.pending_delete(ino),
+            "TTL cleanup must preserve pending deferred-delete state"
+        );
+        assert!(
+            tree.get_dir_check(FUSE_ROOT_ID)
+                .unwrap()
+                .is_deleted_child("pending"),
+            "the deleted-child marker must remain available for completion"
+        );
+
+        tree.clear_mark_delete(ino).unwrap();
+        tree.clear(|_| false);
+        assert!(
+            tree.get_inode(ino, None::<&str>).is_none(),
+            "completed deferred-delete state may be evicted after TTL expiry"
+        );
+    }
+
     /// Regression: unstable backend ids must not allocate fresh ids repeatedly.
     #[test]
     fn next_id_diverges_when_backend_id_unassigned() {
