@@ -12,6 +12,13 @@ DEFAULT_THREADS = 16
 DEFAULT_BLOCK_SIZE = "64K,256K,1M"
 AUTO_IO_PER_FILE = 65536
 MAX_FILE_SIZE = 1024 ** 3
+BENCH_DIR_NAME = "fio-bench"
+
+JSON_MODE = False
+
+
+def info(message=""):
+    print(message, file=sys.stderr if JSON_MODE else sys.stdout)
 
 TESTS = [
     ("write", "Sequential write", "Throughput"),
@@ -58,14 +65,19 @@ def format_bytes(value):
     return f"{v:.1f}TB"
 
 
-def ensure_dir(path):
+def ensure_dir(path, force=False):
     abs_path = os.path.abspath(path)
     if os.path.exists(abs_path):
         home = os.path.expanduser("~")
         cwd = os.getcwd()
         if abs_path == os.path.sep or abs_path == home or abs_path == cwd or os.path.dirname(abs_path) == abs_path:
             sys.exit(f"Refuse to remove unsafe directory: {abs_path}")
-        print(f"Removing existing directory: {abs_path}")
+        if not force and os.path.basename(abs_path) != BENCH_DIR_NAME:
+            sys.exit(
+                f"Refuse to remove non-benchmark directory: {abs_path} "
+                f"(directory must be named '{BENCH_DIR_NAME}' or pass --force)"
+            )
+        info(f"Removing existing directory: {abs_path}")
         shutil.rmtree(abs_path)
     os.makedirs(abs_path, exist_ok=True)
     return abs_path
@@ -230,6 +242,7 @@ def json_report(metrics):
 
 
 def main():
+    global JSON_MODE
     parser = argparse.ArgumentParser(description="Run fio sequential/random read-write benchmarks and print a curvine-cli bench style report.")
     parser.add_argument("--directory", default=DEFAULT_DIR, help=f"Benchmark directory, created or recreated (default: {DEFAULT_DIR})")
     parser.add_argument("-p", "--threads", type=int, default=DEFAULT_THREADS, help=f"Concurrency, number of fio jobs (default: {DEFAULT_THREADS})")
@@ -240,7 +253,10 @@ def main():
     parser.add_argument("--ioengine", default="libaio", help="fio ioengine (default: libaio)")
     parser.add_argument("--direct", type=int, default=1, help="O_DIRECT flag, 0 or 1 (default: 1)")
     parser.add_argument("--json", action="store_true", help="Print report as JSON")
+    parser.add_argument("--force", action="store_true", help="Allow removing a non-benchmark directory")
     args = parser.parse_args()
+
+    JSON_MODE = args.json
 
     if shutil.which("fio") is None:
         sys.exit("fio not found in PATH, please install fio first")
@@ -259,36 +275,36 @@ def main():
     if file_size is not None and file_size <= 0:
         sys.exit("--file-size must be greater than 0")
 
-    directory = ensure_dir(args.directory)
-    print()
-    print("Configuration: fio")
+    directory = ensure_dir(args.directory, args.force)
+    info()
+    info("Configuration: fio")
     if file_size is not None:
         file_size_desc = args.file_size
     else:
         file_size_desc = f"auto (bs x {AUTO_IO_PER_FILE} IO, cap {format_bytes(MAX_FILE_SIZE)})"
-    print(
+    info(
         f"Target: Fuse, Path: {args.directory}, Threads: {args.threads}, "
         f"FileSize: {file_size_desc}, BlockSizes: {args.bs_list}, Iodepth: {args.iodepth}, "
         f"IoEngine: {args.ioengine}, Direct: {args.direct}, Timeout: {args.timeout}s"
     )
     if file_size is not None:
-        print(f"Estimated total data per test: {format_bytes(file_size * args.threads)}")
+        info(f"Estimated total data per test: {format_bytes(file_size * args.threads)}")
     else:
-        print(f"Estimated total data per test: auto per block size, max {format_bytes(MAX_FILE_SIZE * args.threads)}")
-    print("Note: each block size uses its own file set (write -> read -> randwrite -> randread)")
+        info(f"Estimated total data per test: auto per block size, max {format_bytes(MAX_FILE_SIZE * args.threads)}")
+    info("Note: each block size uses its own file set (write -> read -> randwrite -> randread)")
 
     total_tests = len(block_sizes) * len(TESTS)
     metrics = []
     index = 0
     for block_size in block_sizes:
-        directory = ensure_dir(directory)
+        directory = ensure_dir(directory, args.force)
         if file_size is not None:
             size = file_size
         else:
             size = auto_file_size(block_size)
         for rw, item, _ in TESTS:
             index += 1
-            print(f"\n[{index}/{total_tests}] {item} ({format_bytes(block_size)}): running ...")
+            info(f"\n[{index}/{total_tests}] {item} ({format_bytes(block_size)}): running ...")
             start = time.time()
             if rw in ("read", "randread"):
                 actual = first_data_file_size(directory)
@@ -301,17 +317,17 @@ def main():
             metric["block_size"] = block_size
             metric["item"] = item
             metrics.append(metric)
-            print(f"    done in {time.time() - start:.1f}s, {progress_string(metric)}")
+            info(f"    done in {time.time() - start:.1f}s, {progress_string(metric)}")
 
-    print("\nBenchmark finished!")
+    info("\nBenchmark finished!")
     if args.json:
         print(json_report(metrics))
     else:
         for title, rows in build_report(metrics):
             print_table(title, rows)
-    print(f"Removing benchmark directory: {directory}")
+    info(f"Removing benchmark directory: {directory}")
     shutil.rmtree(directory)
-    print(f"Temp path: {directory} (removed)")
+    info(f"Temp path: {directory} (removed)")
 
 
 if __name__ == "__main__":
