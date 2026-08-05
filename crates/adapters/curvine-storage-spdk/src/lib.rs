@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use orpc::io::{NvmeTarget, SpdkConf};
+pub use curvine_io::{NvmeTarget, SpdkConf};
 
 #[cfg(feature = "spdk")]
 pub mod spdk_bdev;

@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use crate::raft::{RaftResult, RaftUtils};
+use curvine_io::LocalFile;
+use curvine_runtime::common::Utils;
 use flate2::read::ZlibDecoder;
 use log::warn;
-use orpc::common::Utils;
-use orpc::io::LocalFile;
 use prost::bytes::BytesMut;
 
 // Decompress the compressed data block and write it to the file.

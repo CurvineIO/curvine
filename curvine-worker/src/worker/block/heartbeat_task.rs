@@ -14,16 +14,15 @@
 
 use crate::worker::block::{BlockStore, MasterClient};
 use crate::worker::storage::Dataset;
-use curvine_common::error::FsError;
-use curvine_common::state::{BlockReportInfo, HeartbeatStatus, WorkerCommand};
-use curvine_common::utils::ProtoUtils;
-use curvine_common::FsResult;
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_model::ProtoUtils;
+use curvine_model::{BlockReportInfo, HeartbeatStatus, WorkerCommand};
+use curvine_rpc::server::ServerState;
+use curvine_runtime::runtime::{GroupExecutor, LoopTask};
+use curvine_runtime::sync::StateCtl;
 use dashmap::DashMap;
 use log::{error, warn};
-use orpc::runtime::{GroupExecutor, LoopTask};
-use orpc::server::ServerState;
-use orpc::sync::StateCtl;
-use orpc::try_log;
 use std::sync::Arc;
 
 pub struct HeartbeatTask {
@@ -72,7 +71,9 @@ impl HeartbeatTask {
                             };
                         });
 
-                        let _ = try_log!(res);
+                        if let Err(e) = &res {
+                            warn!("{}", e);
+                        }
                     }
                 }
             }

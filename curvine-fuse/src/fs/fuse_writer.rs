@@ -17,19 +17,19 @@ use crate::raw::fuse_abi::fuse_write_out;
 use crate::session::FuseResponse;
 use bytes::Bytes;
 use curvine_client::unified::UnifiedWriter;
-use curvine_common::conf::FuseConf;
-use curvine_common::error::FsError;
-use curvine_common::fs::{Path, Writer};
-use curvine_common::state::{FileAllocOpts, FileStatus, SetAttrOpts};
-use curvine_common::FsResult;
-use log::{error, warn};
-use orpc::common::LocalTime;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sync::channel::{
+use curvine_config::FuseConf;
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_fs_api::{Path, Writer};
+use curvine_io::DataSlice;
+use curvine_model::{FileAllocOpts, FileStatus, SetAttrOpts};
+use curvine_runtime::common::LocalTime;
+use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use curvine_runtime::sync::channel::{
     AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallReceiver, CallSender,
 };
-use orpc::sync::{AtomicCounter, AtomicLong, ErrorMonitor};
-use orpc::sys::DataSlice;
+use curvine_runtime::sync::{AtomicCounter, AtomicLong, ErrorMonitor};
+use log::{error, warn};
 use std::sync::Arc;
 
 enum WriteTask {
@@ -453,14 +453,14 @@ mod tests {
     use super::{mark_dequeued, FuseWriter, QueuedWriteTask, WriteTask};
     use crate::fuse_metrics::ActiveGuard;
     use bytes::{Bytes, BytesMut};
-    use curvine_common::error::FsError;
-    use curvine_common::fs::{Path, Writer};
-    use curvine_common::state::{FileAllocOpts, FileStatus, SetAttrOpts, INTERNAL_CTIME_XATTR};
-    use curvine_common::FsResult;
+    use curvine_error::FsError;
+    use curvine_error::FsResult;
+    use curvine_fs_api::{Path, Writer};
+    use curvine_io::DataSlice;
     use curvine_metrics::Metrics as m;
-    use orpc::sync::channel::{AsyncChannel, CallChannel};
-    use orpc::sync::AtomicLong;
-    use orpc::sys::DataSlice;
+    use curvine_model::{FileAllocOpts, FileStatus, SetAttrOpts, INTERNAL_CTIME_XATTR};
+    use curvine_runtime::sync::channel::{AsyncChannel, CallChannel};
+    use curvine_runtime::sync::AtomicLong;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1090,12 +1090,12 @@ mod tests {
         use crate::session::{FuseResponse, FuseTask};
         use bytes::Bytes;
         use curvine_client::unified::UnifiedWriter;
-        use curvine_common::conf::FuseConf;
-        use curvine_common::error::FsError;
-        use curvine_common::fs::local::LocalWriter;
+        use curvine_config::FuseConf;
+        use curvine_error::FsError;
+        use curvine_fs_api::local::LocalWriter;
         use curvine_metrics::Metrics as m;
-        use orpc::runtime::{AsyncRuntime, RpcRuntime};
-        use orpc::sync::channel::AsyncChannel;
+        use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+        use curvine_runtime::sync::channel::AsyncChannel;
         use std::sync::Arc;
 
         fn metrics_reply(rt: &AsyncRuntime) -> FuseResponse {
@@ -1130,7 +1130,7 @@ mod tests {
                     std::process::id(),
                     std::thread::current().id()
                 ));
-                let path = curvine_common::fs::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+                let path = curvine_fs_api::Path::from_str(path_buf.to_str().unwrap()).unwrap();
 
                 let conf = FuseConf {
                     metrics_enabled: false,
@@ -1179,7 +1179,7 @@ mod tests {
                     std::process::id(),
                     std::thread::current().id()
                 ));
-                let path = curvine_common::fs::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+                let path = curvine_fs_api::Path::from_str(path_buf.to_str().unwrap()).unwrap();
 
                 let conf = FuseConf {
                     metrics_enabled: false,
@@ -1244,7 +1244,7 @@ mod tests {
                     std::process::id(),
                     std::thread::current().id()
                 ));
-                let path = curvine_common::fs::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+                let path = curvine_fs_api::Path::from_str(path_buf.to_str().unwrap()).unwrap();
 
                 let conf = FuseConf::default();
                 let writer = UnifiedWriter::Local(LocalWriter::new(&path, 4096).unwrap());
@@ -1335,7 +1335,7 @@ mod tests {
                 std::process::id(),
                 std::thread::current().id()
             ));
-            let path = curvine_common::fs::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+            let path = curvine_fs_api::Path::from_str(path_buf.to_str().unwrap()).unwrap();
 
             let conf = FuseConf {
                 stream_channel_size: 1,

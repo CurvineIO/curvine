@@ -18,8 +18,8 @@ use prost::bytes::BytesMut;
 use prost::Message;
 use raft::eraftpb::Entry;
 use bytes::BufMut;
-use orpc::err_box;
-use orpc::os::LocalFile;
+use curvine_core_error::err_box;
+use curvine_io::LocalFile;
 use crate::raft::RaftResult;
 
 pub struct LogSegment {

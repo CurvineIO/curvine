@@ -71,6 +71,7 @@ public final class MountRequest {
         private ProviderProto provider;
         private Boolean autoCache;
         private AccessModeProto accessMode;
+        private Boolean writeCache;
 
         private Builder() {
         }
@@ -157,6 +158,11 @@ public final class MountRequest {
             return this;
         }
 
+        public Builder writeCache(boolean writeCache) {
+            this.writeCache = writeCache;
+            return this;
+        }
+
         public MountRequest build() {
             String checkedUfsPath = requireText(ufsPath, "ufsPath");
             String checkedCvPath = requireText(cvPath, "cvPath");
@@ -171,6 +177,9 @@ public final class MountRequest {
                     .setAutoCache(autoCache == null || autoCache)
                     .setAccessMode(accessMode == null
                             ? AccessModeProto.ACCESS_MODE_PROTO_READ_ONLY : accessMode);
+            if (writeCache != null) {
+                options.setWriteCache(writeCache);
+            }
             if (storageType != null) {
                 options.setStorageType(storageType);
             }

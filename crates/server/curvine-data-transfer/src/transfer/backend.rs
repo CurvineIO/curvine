@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::error::FsError;
-use curvine_common::state::{
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_model::{
     StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease, TransferListFilter,
     TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTenantSummary,
 };
-use curvine_common::FsResult;
 use std::time::Instant;
 
 #[cfg(feature = "transfer-store-mysql")]
@@ -483,8 +483,7 @@ fn is_store_unavailable_result<T>(result: &FsResult<T>) -> bool {
 pub(crate) fn is_store_unavailable_error(err: &FsError) -> bool {
     if matches!(
         err.kind(),
-        curvine_common::error::ErrorKind::IO
-            | curvine_common::error::ErrorKind::TransferStoreUnavailable
+        curvine_error::ErrorKind::IO | curvine_error::ErrorKind::TransferStoreUnavailable
     ) {
         return true;
     }

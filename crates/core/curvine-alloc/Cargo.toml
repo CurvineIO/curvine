@@ -1,0 +1,20 @@
+[package]
+name = "curvine-alloc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Global allocator selection for Curvine binaries (jemalloc / mimalloc / system)."
+
+[dependencies]
+mimalloc = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
+
+[features]
+jemalloc = ["dep:tikv-jemallocator"]
+mimalloc = ["dep:mimalloc"]
+system = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

@@ -29,6 +29,9 @@ pub use self::job_state::*;
 mod task_trait;
 pub use self::task_trait::*;
 
+mod scheduled_executor;
+pub use self::scheduled_executor::ScheduledExecutor;
+
 /// Use conditional compilation to use a different runtime.
 /// It cannot be fully implemented using generics and type alias.
 pub type JoinHandle<T> = tokio::task::JoinHandle<T>;

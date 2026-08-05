@@ -18,6 +18,7 @@ import io.curvine.proto.GetJobStatusResponse;
 import io.curvine.proto.JobTaskProgressProto;
 import io.curvine.proto.JobTaskStateProto;
 import io.curvine.proto.SubmitJobResponse;
+import org.apache.hadoop.conf.Configuration;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -118,5 +119,19 @@ public class LoadJobClientTest {
         long start = System.nanoTime();
         CurvineLoadClient.sleepNanos(500_000L); // 0.5ms
         Assert.assertTrue(System.nanoTime() - start >= 500_000L);
+    }
+
+    @Test
+    public void filesystemConfSerializesTransferRouting() throws IllegalAccessException {
+        Configuration conf = new Configuration(false);
+        conf.set("fs.cv.master_addrs", "master-0:8995");
+        conf.set("fs.cv.transfer.enabled", "true");
+        conf.set("fs.cv.transfer.endpoints", "transfer-0:9010, transfer-1:9010");
+
+        String toml = new FilesystemConf(conf).toToml();
+
+        Assert.assertTrue(toml.contains("[transfer]"));
+        Assert.assertTrue(toml.contains("enabled = true"));
+        Assert.assertTrue(toml.contains("endpoints = [\"transfer-0:9010\", \"transfer-1:9010\"]"));
     }
 }

@@ -14,6 +14,7 @@ mod test {
             io_timeout = "60s"
             io_retry_count = 4
             keep_alive_timeout = "10s"
+            qpair_acquire_timeout = "45s"
             dma_buffer_size = "1MB"
             [[targets]]
             trtype = "rdma"

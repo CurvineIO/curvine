@@ -57,3 +57,4 @@ curvine-tests/regression_result
 # Agent skills: only cv-* are tracked in repo; other local skills stay untracked
 .agents/skills/*
 !.agents/skills/cv-*/
+.codegraph/

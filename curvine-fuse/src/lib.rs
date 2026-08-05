@@ -16,6 +16,7 @@
 #![recursion_limit = "256"]
 
 use crate::raw::fuse_abi::{fuse_in_header, fuse_out_header};
+use curvine_alloc as _;
 use once_cell::sync::Lazy;
 
 pub mod cli;
@@ -103,6 +104,39 @@ pub const FUSE_POSIX_LOCKS: u32 = 1 << 1;
 /// FUSE init capability bit for remote BSD (flock) locking.
 pub const FUSE_FLOCK_LOCKS: u32 = 1 << 10;
 
+/// FUSE init capability bit: the daemon passes `mode` through unchanged on
+/// create/mkdir/mknod (kernel skips umask masking).
+pub const FUSE_DONT_MASK: u32 = 1 << 6;
+
+/// FUSE init capability bit: skip open notifications to the daemon.
+pub const FUSE_NO_OPEN_SUPPORT: u32 = 1 << 17;
+
+/// FUSE init capability bit: parallel directory operations with independent
+/// inode locks.
+pub const FUSE_PARALLEL_DIROPS: u32 = 1 << 18;
+
+/// FUSE init capability bit: the daemon handles suid/sgid clearing on write.
+pub const FUSE_HANDLE_KILLPRIV: u32 = 1 << 19;
+
+/// FUSE init capability bit: kernel aborts the connection on daemon errors.
+pub const FUSE_ABORT_ERROR: u32 = 1 << 21;
+
+/// FUSE init capability bit: kernel may cache symlink targets.
+pub const FUSE_CACHE_SYMLINKS: u32 = 1 << 23;
+
+/// FUSE init capability bit: skip opendir notifications to the daemon.
+pub const FUSE_NO_OPENDIR_SUPPORT: u32 = 1 << 24;
+
+/// FUSE init capability bit: kernel does not auto-invalidate page cache on
+/// write; the daemon sends explicit invalidation.
+pub const FUSE_EXPLICIT_INVAL_DATA: u32 = 1 << 25;
+
+/// FUSE init capability bit: enhanced killpriv semantics (ABI 7.37).
+pub const FUSE_HANDLE_KILLPRIV_V2: u32 = 1 << 28;
+
+/// FUSE init capability bit: extended xattr error reporting (ABI 7.37).
+pub const FUSE_SETXATTR_EXT: u32 = 1 << 29;
+
 pub const FUSE_WRITEBACK_CACHE: u32 = 1 << 16;
 
 pub const FUSE_POSIX_ACL: u32 = 1 << 20;
@@ -153,12 +187,25 @@ pub const SUPPORTED_INIT_FLAGS: u32 = FUSE_ASYNC_READ
     | FUSE_DO_READDIRPLUS
     | FUSE_POSIX_LOCKS
     | FUSE_FLOCK_LOCKS
-    | FUSE_MAX_PAGES;
+    | FUSE_MAX_PAGES
+    | FUSE_SPLICE_MOVE
+    | FUSE_SPLICE_WRITE
+    | FUSE_SPLICE_READ
+    | FUSE_DONT_MASK
+    | FUSE_PARALLEL_DIROPS
+    | FUSE_HANDLE_KILLPRIV
+    | FUSE_ABORT_ERROR
+    | FUSE_CACHE_SYMLINKS
+    | FUSE_NO_OPENDIR_SUPPORT
+    | FUSE_EXPLICIT_INVAL_DATA
+    | FUSE_HANDLE_KILLPRIV_V2
+    | FUSE_SETXATTR_EXT;
 
 /// Human-readable FUSE init-capability names; unknown bits are kept as hex.
 pub fn fuse_init_flag_names(flags: u32) -> Vec<String> {
     const KNOWN: &[(u32, &str)] = &[
         (FUSE_ASYNC_READ, "ASYNC_READ"),
+        (FUSE_DONT_MASK, "DONT_MASK"),
         (FUSE_POSIX_LOCKS, "POSIX_LOCKS"),
         (FUSE_ATOMIC_O_TRUNC, "ATOMIC_O_TRUNC"),
         (FUSE_EXPORT_SUPPORT, "EXPORT_SUPPORT"),
@@ -175,6 +222,15 @@ pub fn fuse_init_flag_names(flags: u32) -> Vec<String> {
         (FUSE_WRITEBACK_CACHE, "WRITEBACK_CACHE"),
         (FUSE_POSIX_ACL, "POSIX_ACL"),
         (FUSE_MAX_PAGES, "MAX_PAGES"),
+        (FUSE_NO_OPEN_SUPPORT, "NO_OPEN_SUPPORT"),
+        (FUSE_PARALLEL_DIROPS, "PARALLEL_DIROPS"),
+        (FUSE_HANDLE_KILLPRIV, "HANDLE_KILLPRIV"),
+        (FUSE_ABORT_ERROR, "ABORT_ERROR"),
+        (FUSE_CACHE_SYMLINKS, "CACHE_SYMLINKS"),
+        (FUSE_NO_OPENDIR_SUPPORT, "NO_OPENDIR_SUPPORT"),
+        (FUSE_EXPLICIT_INVAL_DATA, "EXPLICIT_INVAL_DATA"),
+        (FUSE_HANDLE_KILLPRIV_V2, "HANDLE_KILLPRIV_V2"),
+        (FUSE_SETXATTR_EXT, "SETXATTR_EXT"),
         (FUSE_INIT_EXT, "INIT_EXT"),
     ];
     let mut names: Vec<String> = KNOWN

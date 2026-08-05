@@ -14,18 +14,18 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use crate::conf::JournalConf;
+use crate::conf::{JournalConf, JournalConfExt};
 use crate::proto::raft::*;
 use crate::raft::raft_error::RaftError;
 use crate::raft::storage::{AppStorage, ApplyMsg, LogStorage, PeerStorage};
 use crate::raft::*;
 use crate::utils::SerdeUtils;
+use curvine_net::net::InetAddr;
+use curvine_rpc::client::dispatch::{Callback, Envelope};
+use curvine_rpc::message::{Builder, RefMessage, ResponseStatus};
+use curvine_runtime::common::{DurationUnit, LocalTime, TimeSpent};
+use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use log::{debug, error, info, warn};
-use orpc::client::dispatch::{Callback, Envelope};
-use orpc::common::{DurationUnit, LocalTime, TimeSpent};
-use orpc::io::net::InetAddr;
-use orpc::message::{Builder, RefMessage, ResponseStatus};
-use orpc::runtime::{RpcRuntime, Runtime};
 use prost::Message as PMessage;
 use raft::eraftpb::{ConfChange, Entry, EntryType, MessageType, Snapshot};
 use raft::prelude::ConfChangeType;

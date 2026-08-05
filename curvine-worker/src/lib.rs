@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_alloc as _;
 pub mod worker;
 pub use worker::*;
 
@@ -24,7 +25,7 @@ pub mod master {
 }
 
 pub mod transfer {
-    pub use curvine_common::transfer::transfer_failure_message;
+    pub use curvine_model::transfer_failure_message;
 }
 
 #[cfg(feature = "fault-injection")]

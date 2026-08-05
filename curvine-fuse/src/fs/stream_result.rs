@@ -14,9 +14,9 @@
 
 use crate::fuse_error::{errno_of, FuseError};
 use crate::session::FuseResponse;
-use curvine_common::FsResult;
+use curvine_error::FsResult;
+use curvine_runtime::sync::channel::CallSender;
 use log::warn;
-use orpc::sync::channel::CallSender;
 
 /// Deliver a backend stream-op result (`Flush`/`Complete`/`Resize`) to the one
 /// correct consumer, which differs by origin:
@@ -70,9 +70,9 @@ pub(crate) async fn deliver_stream_result(
 #[cfg(test)]
 mod tests {
     use super::deliver_stream_result;
-    use curvine_common::error::FsError;
-    use curvine_common::FsResult;
-    use orpc::sync::channel::CallChannel;
+    use curvine_error::FsError;
+    use curvine_error::FsResult;
+    use curvine_runtime::sync::channel::CallChannel;
 
     // reply=None uses tx as the only channel back, so preserve the backend result.
     #[tokio::test]
@@ -106,7 +106,7 @@ mod tests {
     #[tokio::test]
     async fn deliver_reply_some_reports_ok_to_caller_and_errno_to_kernel() {
         use crate::session::{FuseResponse, FuseTask};
-        use orpc::sync::channel::AsyncChannel;
+        use curvine_runtime::sync::channel::AsyncChannel;
 
         let (task_tx, mut task_rx) = AsyncChannel::<FuseTask>::new(16).split();
         // ctx=None -> disabled fast path -> a plain `FuseTask::Reply(ResponseData)`.
@@ -146,7 +146,7 @@ mod tests {
     #[tokio::test]
     async fn deliver_reply_some_reports_ok_to_kernel() {
         use crate::session::{FuseResponse, FuseTask};
-        use orpc::sync::channel::AsyncChannel;
+        use curvine_runtime::sync::channel::AsyncChannel;
 
         let (task_tx, mut task_rx) = AsyncChannel::<FuseTask>::new(16).split();
         let reply = FuseResponse::new_reply(1, task_tx, false, None);
@@ -175,7 +175,7 @@ mod tests {
     #[tokio::test]
     async fn closed_reply_channel_does_not_fail_internal_completion() {
         use crate::session::{FuseResponse, FuseTask};
-        use orpc::sync::channel::AsyncChannel;
+        use curvine_runtime::sync::channel::AsyncChannel;
 
         let (task_tx, task_rx) = AsyncChannel::<FuseTask>::new(1).split();
         drop(task_rx);

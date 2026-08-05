@@ -83,6 +83,10 @@ impl AccessMode {
     pub fn is_read_only(&self) -> bool {
         matches!(self, AccessMode::ReadOnly)
     }
+
+    pub fn is_read_write(&self) -> bool {
+        matches!(self, AccessMode::ReadWrite)
+    }
 }
 
 impl TryFrom<&str> for AccessMode {
@@ -116,6 +120,7 @@ pub struct MountInfo {
     pub provider: Option<Provider>,
     pub auto_cache: bool,
     pub access_mode: AccessMode,
+    pub write_cache: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -151,6 +156,47 @@ impl From<LegacyMountInfo> for MountInfo {
             provider: info.provider,
             auto_cache: true,
             access_mode: AccessMode::ReadOnly,
+            write_cache: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyMountInfoWithAutoCacheAccessMode {
+    cv_path: String,
+    ufs_path: String,
+    mount_id: u32,
+    properties: HashMap<String, String>,
+    ttl_ms: i64,
+    ttl_action: TtlAction,
+    read_verify_ufs: bool,
+    storage_type: Option<StorageType>,
+    block_size: Option<i64>,
+    replicas: Option<i32>,
+    write_type: WriteType,
+    provider: Option<Provider>,
+    auto_cache: bool,
+    access_mode: AccessMode,
+}
+
+impl From<LegacyMountInfoWithAutoCacheAccessMode> for MountInfo {
+    fn from(info: LegacyMountInfoWithAutoCacheAccessMode) -> Self {
+        Self {
+            cv_path: info.cv_path,
+            ufs_path: info.ufs_path,
+            mount_id: info.mount_id,
+            properties: info.properties,
+            ttl_ms: info.ttl_ms,
+            ttl_action: info.ttl_action,
+            read_verify_ufs: info.read_verify_ufs,
+            storage_type: info.storage_type,
+            block_size: info.block_size,
+            replicas: info.replicas,
+            write_type: info.write_type,
+            provider: info.provider,
+            auto_cache: info.auto_cache,
+            access_mode: info.access_mode,
+            write_cache: false,
         }
     }
 }
@@ -160,6 +206,14 @@ impl MountInfo {
         match bincode::deserialize::<Self>(bytes) {
             Ok(info) => Ok(info),
             Err(e) if Self::is_unexpected_eof(&e) => {
+                if let Ok(legacy) = bincode::DefaultOptions::new()
+                    .with_fixint_encoding()
+                    .reject_trailing_bytes()
+                    .deserialize::<LegacyMountInfoWithAutoCacheAccessMode>(bytes)
+                {
+                    return Ok(legacy.into());
+                }
+
                 let legacy: LegacyMountInfo = bincode::DefaultOptions::new()
                     .with_fixint_encoding()
                     .reject_trailing_bytes()
@@ -273,6 +327,10 @@ impl MountInfo {
         self.is_cache_mode() && self.access_mode.is_read_only()
     }
 
+    pub fn write_cache_enabled(&self) -> bool {
+        self.write_cache && self.is_cache_mode() && self.access_mode.is_read_write()
+    }
+
     pub fn merge_with(self, mnt_opt: MountOptions) -> MountInfo {
         let mut properties = self.properties;
 
@@ -299,6 +357,7 @@ impl MountInfo {
             provider: mnt_opt.provider.or(self.provider),
             auto_cache: mnt_opt.auto_cache.unwrap_or(self.auto_cache),
             access_mode: mnt_opt.access_mode.unwrap_or(self.access_mode),
+            write_cache: mnt_opt.write_cache.unwrap_or(self.write_cache),
         }
     }
 }
@@ -318,6 +377,7 @@ pub struct MountOptions {
     pub provider: Option<Provider>,
     pub auto_cache: Option<bool>,
     pub access_mode: Option<AccessMode>,
+    pub write_cache: Option<bool>,
 }
 
 impl MountOptions {
@@ -347,6 +407,7 @@ impl MountOptions {
             provider: self.provider,
             auto_cache: self.auto_cache.unwrap_or(true),
             access_mode: self.access_mode.unwrap_or_default(),
+            write_cache: self.write_cache.unwrap_or(false),
         }
     }
 }
@@ -366,6 +427,7 @@ pub struct MountOptionsBuilder {
     provider: Option<Provider>,
     auto_cache: Option<bool>,
     access_mode: Option<AccessMode>,
+    write_cache: Option<bool>,
 }
 
 impl MountOptionsBuilder {
@@ -376,6 +438,7 @@ impl MountOptionsBuilder {
             ttl_action: Some(TtlAction::Delete),
             auto_cache: Some(true),
             access_mode: Some(AccessMode::ReadOnly),
+            write_cache: Some(false),
             ..Default::default()
         }
     }
@@ -459,6 +522,21 @@ impl MountOptionsBuilder {
         self
     }
 
+    pub fn write_cache(mut self, write_cache: bool) -> Self {
+        self.write_cache = Some(write_cache);
+        self
+    }
+
+    /// Reset optional toggle fields to `None` so a mount `--update` preserves
+    /// existing values (`merge_with` keeps `None` fields) unless they were
+    /// explicitly provided.
+    pub fn update_only_explicit(mut self) -> Self {
+        self.auto_cache = None;
+        self.access_mode = None;
+        self.write_cache = None;
+        self
+    }
+
     pub fn build(self) -> MountOptions {
         MountOptions {
             update: self.update,
@@ -474,6 +552,7 @@ impl MountOptionsBuilder {
             provider: self.provider,
             auto_cache: self.auto_cache,
             access_mode: self.access_mode,
+            write_cache: self.write_cache,
         }
     }
 }
@@ -569,6 +648,7 @@ mod tests {
         let info = MountOptions::builder().build().to_info(1, "/mnt", "s3://b");
         assert!(info.auto_cache);
         assert_eq!(info.access_mode, AccessMode::ReadOnly);
+        assert!(!info.write_cache);
     }
 
     #[test]
@@ -578,21 +658,58 @@ mod tests {
             ufs_path: "s3://b".to_string(),
             auto_cache: true,
             access_mode: AccessMode::ReadOnly,
+            write_cache: false,
             ..Default::default()
         };
 
         let unchanged = info.clone().merge_with(MountOptions::builder().build());
         assert!(unchanged.auto_cache);
         assert_eq!(unchanged.access_mode, AccessMode::ReadOnly);
+        assert!(!unchanged.write_cache);
 
         let updated = info.merge_with(
             MountOptions::builder()
                 .auto_cache(false)
                 .access_mode(AccessMode::ReadWrite)
+                .write_cache(true)
                 .build(),
         );
         assert!(!updated.auto_cache);
         assert_eq!(updated.access_mode, AccessMode::ReadWrite);
+        assert!(updated.write_cache);
+    }
+
+    #[test]
+    fn test_update_only_explicit_preserves_existing_toggles() {
+        let info = MountInfo {
+            cv_path: "/mnt".to_string(),
+            ufs_path: "s3://b".to_string(),
+            auto_cache: false,
+            access_mode: AccessMode::ReadWrite,
+            write_cache: true,
+            ..Default::default()
+        };
+
+        // An update that omits the toggles must keep the existing values.
+        let merged = info.clone().merge_with(
+            MountOptions::builder()
+                .update(true)
+                .update_only_explicit()
+                .build(),
+        );
+        assert!(!merged.auto_cache);
+        assert_eq!(merged.access_mode, AccessMode::ReadWrite);
+        assert!(merged.write_cache);
+
+        // Explicitly provided values still apply.
+        let merged = info.merge_with(
+            MountOptions::builder()
+                .update(true)
+                .update_only_explicit()
+                .write_cache(false)
+                .build(),
+        );
+        assert!(!merged.write_cache);
     }
 
     #[test]

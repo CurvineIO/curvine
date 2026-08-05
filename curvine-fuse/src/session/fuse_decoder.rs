@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::FuseResult;
-use orpc::err_box;
-use orpc::sys::FFIUtils;
+use curvine_core_error::err_box;
+use curvine_sys::FFIUtils;
 use std::ffi::OsStr;
 use std::mem::size_of;
 
@@ -123,7 +123,7 @@ impl<'a> FuseDecoder<'a> {
 #[cfg(test)]
 pub mod tests {
     use crate::session::fuse_decoder::FuseDecoder;
-    use orpc::CommonResult;
+    use curvine_core_error::CommonResult;
 
     const DATA: [u8; 10] = [0x66, 0x6f, 0x6f, 0x00, 0x62, 0x61, 0x72, 0x00, 0x62, 0x61];
 

@@ -84,8 +84,8 @@ impl ServerStateListener {
 
     /// Wait until the server reaches Running, or fail fast if it shuts down before binding.
     pub async fn wait_startup(&mut self) -> CommonResult<()> {
-        let running = ServerState::Running.into();
-        let shutdown = ServerState::Shutdown.into();
+        let running: i8 = ServerState::Running.into();
+        let shutdown: i8 = ServerState::Shutdown.into();
 
         if self.0.current() == running {
             return Ok(());

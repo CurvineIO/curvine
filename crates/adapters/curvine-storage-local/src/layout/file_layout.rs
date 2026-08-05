@@ -15,12 +15,12 @@
 use crate::layout::{validate_open_offset, BlockLayout};
 use crate::{BlockMeta, BlockState};
 use crate::{BlockReadContext, BlockWriteContext, VfsDir};
-use curvine_common::state::ExtendedBlock;
+use curvine_core_error::{err_box, try_err, CommonResult};
+use curvine_io::{IOError, IOResult, LocalFile};
+use curvine_model::ExtendedBlock;
 #[cfg(test)]
-use orpc::common::ByteUnit;
-use orpc::common::FileUtils;
-use orpc::io::{IOError, IOResult, LocalFile};
-use orpc::{err_box, try_err, CommonResult};
+use curvine_runtime::common::ByteUnit;
+use curvine_runtime::common::FileUtils;
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::path::PathBuf;

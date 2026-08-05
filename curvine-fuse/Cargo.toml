@@ -7,9 +7,16 @@ license.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-orpc = { workspace = true}
-curvine-common = { workspace = true }
-curvine-client = { workspace = true, features = ["unified", "opendal-s3"] }
+curvine-core-error = { workspace = true }
+curvine-io = { workspace = true }
+curvine-net = { workspace = true }
+curvine-model = { workspace = true }
+curvine-error = { workspace = true }
+curvine-sys = { workspace = true }
+curvine-alloc = { workspace = true }
+curvine-runtime = { workspace = true }
+curvine-fs-api = { workspace = true }
+curvine-client = { workspace = true, features = ["unified"] }
 curvine-config = { workspace = true }
 curvine-metrics = { workspace = true }
 log = { workspace = true }
@@ -42,6 +49,17 @@ futures = { workspace = true }
 default = ["fuse3"]
 fuse2 = []
 fuse3 = []
+# Product builds enable UFS adapters via build.sh (`curvine-client/<ufs>`).
+# Keep them optional here so the default fuse tree stays client-light.
+opendal-s3 = ["curvine-client/opendal-s3"]
+opendal-oss = ["curvine-client/opendal-oss"]
+opendal-gcs = ["curvine-client/opendal-gcs"]
+opendal-azblob = ["curvine-client/opendal-azblob"]
+opendal-cos = ["curvine-client/opendal-cos"]
+opendal-hdfs = ["curvine-client/opendal-hdfs"]
+opendal-webhdfs = ["curvine-client/opendal-webhdfs"]
+opendal-hdfs-native = ["curvine-client/opendal-hdfs-native"]
+oss-hdfs = ["curvine-client/oss-hdfs"]
 
 [build-dependencies]
 pkg-config = "0.3.27"

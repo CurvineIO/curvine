@@ -30,8 +30,8 @@
 
 #[cfg(any(feature = "opendal-hdfs", feature = "opendal-webhdfs"))]
 mod mount_integration_tests {
-    use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-    use curvine_common::state::{MountInfo, TtlAction};
+    use curvine_fs_api::{FileSystem, Path, Reader, Writer};
+    use curvine_model::{MountInfo, TtlAction};
     use curvine_ufs_opendal::OpendalFileSystem;
     use std::collections::HashMap;
     use std::env;
@@ -39,7 +39,7 @@ mod mount_integration_tests {
     /// Helper function to create OpendalFileSystem from MountInfo
     fn create_filesystem_from_mount(
         mount_info: &MountInfo,
-    ) -> Result<OpendalFileSystem, curvine_common::error::FsError> {
+    ) -> Result<OpendalFileSystem, curvine_error::FsError> {
         let ufs_path = Path::from_str(&mount_info.ufs_path)?;
         OpendalFileSystem::new(&ufs_path, mount_info.properties.clone())
     }
@@ -57,7 +57,7 @@ mod mount_integration_tests {
         // Initialize JVM
         #[cfg(feature = "jni")]
         {
-            use curvine_common::jvm::{register_jvm, JVM};
+            use curvine_hdfs_jni::jni::{register_jvm, JVM};
             register_jvm();
             JVM.get_or_init().expect("Failed to initialize JVM");
             println!("JVM initialized for mount integration");
@@ -81,8 +81,11 @@ mod mount_integration_tests {
                 storage_type: None,
                 block_size: None,
                 replicas: None,
-                write_type: curvine_common::state::WriteType::CacheMode,
+                write_type: curvine_model::WriteType::CacheMode,
                 provider: None,
+                auto_cache: true,
+                access_mode: curvine_model::AccessMode::ReadOnly,
+                write_cache: false,
             };
 
             println!("Creating filesystem with MountInfo...");
@@ -216,7 +219,7 @@ mod mount_integration_tests {
         // Initialize JVM
         #[cfg(feature = "jni")]
         {
-            use curvine_common::jvm::{register_jvm, JVM};
+            use curvine_hdfs_jni::jni::{register_jvm, JVM};
             register_jvm();
             JVM.get_or_init().expect("Failed to initialize JVM");
         }
@@ -269,8 +272,11 @@ mod mount_integration_tests {
                     storage_type: None,
                     block_size: None,
                     replicas: None,
-                    write_type: curvine_common::state::WriteType::CacheMode,
+                    write_type: curvine_model::WriteType::CacheMode,
                     provider: None,
+                    auto_cache: true,
+                    access_mode: curvine_model::AccessMode::ReadOnly,
+                    write_cache: false,
                 };
 
                 match create_filesystem_from_mount(&mount_info) {
@@ -384,7 +390,7 @@ mod mount_integration_tests {
         // Initialize JVM
         #[cfg(feature = "jni")]
         {
-            use curvine_common::jvm::{register_jvm, JVM};
+            use curvine_hdfs_jni::jni::{register_jvm, JVM};
             register_jvm();
             JVM.get_or_init().expect("Failed to initialize JVM");
         }
@@ -409,8 +415,11 @@ mod mount_integration_tests {
                 storage_type: None,
                 block_size: None,
                 replicas: None,
-                write_type: curvine_common::state::WriteType::CacheMode,
+                write_type: curvine_model::WriteType::CacheMode,
                 provider: None,
+                auto_cache: true,
+                access_mode: curvine_model::AccessMode::ReadOnly,
+                write_cache: false,
             };
 
             let fs_v1 = create_filesystem_from_mount(&mount_info_v1)
@@ -458,8 +467,11 @@ mod mount_integration_tests {
                 storage_type: None,
                 block_size: None,
                 replicas: None,
-                write_type: curvine_common::state::WriteType::CacheMode,
+                write_type: curvine_model::WriteType::CacheMode,
                 provider: None,
+                auto_cache: true,
+                access_mode: curvine_model::AccessMode::ReadOnly,
+                write_cache: false,
             };
 
             let fs_v2 = create_filesystem_from_mount(&mount_info_v2)

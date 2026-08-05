@@ -27,20 +27,21 @@ use crate::{
     FUSE_ROOT_ID, STATE_FILE_MAGIC, STATE_FILE_VERSION,
 };
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::conf::{ClientConf, FuseConf};
-use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, ListStream, Path, StateReader, StateWriter};
-use curvine_common::state::{
+use curvine_config::ClusterConf;
+use curvine_config::{ClientConf, FuseConf};
+use curvine_core_error::err_box;
+use curvine_error::FsError;
+use curvine_fs_api::{FileSystem, ListStream, Path};
+use curvine_fs_api::{StateReader, StateWriter};
+use curvine_model::{
     CreateFileOpts, FileAllocOpts, FileStatus, ListOptions, MkdirOpts, OpenFlags, RenameFlags,
     SetAttrOpts,
 };
-use curvine_config::ClusterConf;
+use curvine_runtime::common::FastHashMap;
+use curvine_runtime::sync::{AsyncMutex, AsyncSharedMap, AtomicCounter, RwLockHashMap};
+use curvine_sys::RawPtr;
 use futures::stream::{self, StreamExt};
 use log::{debug, error, info, warn};
-use orpc::common::FastHashMap;
-use orpc::err_box;
-use orpc::sync::{AsyncMutex, AsyncSharedMap, AtomicCounter, RwLockHashMap};
-use orpc::sys::RawPtr;
 use std::borrow::Cow;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -177,7 +178,7 @@ impl NodeState {
         self.fh_creator.get()
     }
 
-    pub fn next_ino(&self, status: &FileStatus) -> u64 {
+    pub fn next_ino(&self, status: &FileStatus) -> FuseResult<u64> {
         self.dir_read().next_id(status.id)
     }
 
@@ -390,7 +391,10 @@ impl NodeState {
         if mode == OpenFlags::RDONLY {
             let reader = self.new_reader(path).await?;
             let mut status = reader.status().clone();
-            let ino = ino.unwrap_or(self.next_ino(&status));
+            let ino = match ino {
+                Some(ino) => ino,
+                None => self.next_ino(&status)?,
+            };
             status.id = ino as i64;
             let handle = self
                 .insert_handle_with_writer(ino, Some(RawPtr::from_owned(reader)), None, status)
@@ -410,7 +414,7 @@ impl NodeState {
             }
             None => {
                 let writer = self.new_writer(path, flags, opts).await?;
-                let ino = self.next_ino(writer.status());
+                let ino = self.next_ino(writer.status())?;
                 let writer = self.writers.insert::<FuseError>(ino, writer).await?;
                 (ino, writer)
             }
@@ -596,12 +600,17 @@ impl NodeState {
     }
 
     pub fn has_open_handles(&self, ino: u64) -> bool {
-        let lock = self.handles.read();
-        if let Some(map) = lock.get(&ino) {
-            !map.is_empty()
-        } else {
-            false
+        // Both OPEN and OPENDIR handles keep the inode addressable until their
+        // corresponding RELEASE/RELEASEDIR request.
+        {
+            let lock = self.handles.read();
+            if lock.get(&ino).is_some_and(|map| !map.is_empty()) {
+                return true;
+            }
         }
+
+        let lock = self.dir_handles.read();
+        lock.get(&ino).is_some_and(|map| !map.is_empty())
     }
 
     pub fn clear_mark_delete(&self, ino: u64) -> FuseResult<()> {
@@ -979,7 +988,7 @@ impl NodeState {
             let mut status = writer.status().clone();
             writer.complete(None).await?;
 
-            let child_ino = self.next_ino(&status);
+            let child_ino = self.next_ino(&status)?;
             status.id = child_ino as i64;
             let _ = self.lookup_status(ino, name, &status)?;
             return self.new_handle(Some(child_ino), &path, flags, opts).await;
@@ -1321,16 +1330,17 @@ mod test {
     use curvine_client::unified::UnifiedFileSystem;
     #[cfg(target_os = "linux")]
     use curvine_client::unified::UnifiedWriter;
-    use curvine_common::conf::ClusterConf;
-    use curvine_common::error::FsError;
+    use curvine_config::ClusterConf;
+    use curvine_error::FsError;
     #[cfg(target_os = "linux")]
-    use curvine_common::fs::local::LocalWriter;
+    use curvine_fs_api::local::LocalWriter;
     #[cfg(target_os = "linux")]
-    use curvine_common::fs::Writer;
-    use curvine_common::fs::{ListStream, Path, StateReader, StateWriter};
-    use curvine_common::state::FileStatus;
-    use orpc::common::{FastHashMap, Utils};
-    use orpc::runtime::{AsyncRuntime, RpcRuntime};
+    use curvine_fs_api::Writer;
+    use curvine_fs_api::{ListStream, Path};
+    use curvine_fs_api::{StateReader, StateWriter};
+    use curvine_model::FileStatus;
+    use curvine_runtime::common::{FastHashMap, Utils};
+    use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
     use std::sync::Arc;
 
     fn file_handle(ino: u64, fh: u64) -> Arc<FileHandle> {
@@ -1414,6 +1424,49 @@ mod test {
         assert!(NodeState::map_remove_handle(&mut map, 2, 21).1);
         assert!(map.get(&2).is_none());
         assert!(!NodeState::map_remove_handle(&mut map, 2, 99).1);
+    }
+
+    #[test]
+    fn clear_keeps_expired_inode_until_directory_handle_is_released() {
+        crate::FuseMetrics::ensure_init().unwrap();
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.node_cache_ttl = std::time::Duration::from_secs(60);
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+        let ino = {
+            let mut tree = state.dir_write();
+            let ino = tree
+                .lookup(
+                    FUSE_ROOT_ID,
+                    "d",
+                    FileStatus::with_name(2, "d".to_string(), true),
+                    true,
+                )
+                .unwrap()
+                .ino;
+            tree.forget(ino, 1).unwrap();
+            tree.get_inode_mut(ino, None).unwrap().last_access = 0;
+            ino
+        };
+
+        {
+            let mut handles = state.dir_handles.write();
+            NodeState::insert_dir_handle_locked(&mut handles, ino, 20, dir_handle(ino, 20));
+        }
+
+        state.clear().unwrap();
+        assert!(
+            state.dir_read().get_inode(ino, None::<&str>).is_some(),
+            "an open directory handle must keep an expired inode addressable"
+        );
+
+        state.remove_dir_handle(ino, 20).unwrap();
+        state.clear().unwrap();
+        assert!(
+            state.dir_read().get_inode(ino, None::<&str>).is_none(),
+            "the expired inode should be evicted after its directory handle is released"
+        );
     }
 
     #[test]

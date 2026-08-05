@@ -18,12 +18,12 @@ use crate::{
     StorageRequest, StorageVersion, VfsDir, VfsMetaStore,
 };
 use crate::{BlockMeta, BlockState};
-use curvine_common::conf::{ClusterConf, WorkerDataDir};
-use curvine_common::state::{ExtendedBlock, StorageInfo, StorageType};
+use curvine_config::{ClusterConf, WorkerDataDir};
+use curvine_core_error::{err_box, CommonResult};
+use curvine_model::{ExtendedBlock, StorageInfo, StorageType};
+use curvine_runtime::common::{ByteUnit, FileUtils, LocalTime, TimeSpent};
 use indexmap::map::Values;
 use log::info;
-use orpc::common::{ByteUnit, FileUtils, LocalTime, TimeSpent};
-use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -154,7 +154,7 @@ impl VfsDataset {
                 if dir.storage_type() == StorageType::SpdkDisk {
                     if let Some(bdev) = dir.state.bdev_name.as_ref() {
                         if let Some(prev_id) = seen.insert(bdev.clone(), dir.id()) {
-                            return orpc::err_box!(
+                            return curvine_core_error::err_box!(
                                 "SPDK dirs {} and {} both map to bdev '{}' (dir_id collision).",
                                 prev_id,
                                 dir.id(),
@@ -270,7 +270,10 @@ impl VfsDataset {
                     .dir_list
                     .get_dir(meta.dir_id())
                     .ok_or_else(|| {
-                        orpc::err_msg!(format!("No storage directory found: {:?}", meta.dir_id()))
+                        curvine_core_error::err_msg!(format!(
+                            "No storage directory found: {:?}",
+                            meta.dir_id()
+                        ))
                     })?
                     .clone();
                 let required_bytes = meta.physical_bytes().max(block.len);
@@ -345,7 +348,7 @@ impl VfsDataset {
 
     pub fn rollback_file_open(&mut self, reservation: &FileOpenReservation) -> CommonResult<()> {
         let pending = self.meta.remove(reservation.pending.id()).ok_or_else(|| {
-            orpc::err_msg!(format!(
+            curvine_core_error::err_msg!(format!(
                 "block {} open reservation missing during rollback",
                 reservation.pending.id()
             ))
@@ -383,7 +386,7 @@ impl VfsDataset {
             .dir_list
             .get_dir(writing.dir_id())
             .ok_or_else(|| {
-                orpc::err_msg!(format!(
+                curvine_core_error::err_msg!(format!(
                     "No storage directory found: {:?}",
                     writing.dir_id()
                 ))
@@ -716,12 +719,12 @@ mod test {
     use crate::{
         Dataset, DirList, DirState, FileLayout, SpdkMetaStore, StorageVersion, VfsDataset, VfsDir,
     };
-    use curvine_common::conf::{ClusterConf, WorkerConf};
-    use curvine_common::state::{ExtendedBlock, FileType, StorageType};
-    use orpc::common::FileUtils;
-    use orpc::sync::AtomicLong;
-    use orpc::sys::FsStats;
-    use orpc::CommonResult;
+    use curvine_config::{ClusterConf, WorkerConf};
+    use curvine_core_error::CommonResult;
+    use curvine_model::{ExtendedBlock, FileType, StorageType};
+    use curvine_runtime::common::FileUtils;
+    use curvine_runtime::sync::AtomicLong;
+    use curvine_sys::FsStats;
     use std::io::Write;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;

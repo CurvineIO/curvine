@@ -14,13 +14,13 @@
 
 use std::collections::HashMap;
 
-use curvine_common::error::FsError;
-use curvine_common::state::{
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_model::{
     StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease, TransferListFilter,
     TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTaskState,
     TransferTenantSummary,
 };
-use curvine_common::FsResult;
 use parking_lot::Mutex;
 
 use crate::transfer::{

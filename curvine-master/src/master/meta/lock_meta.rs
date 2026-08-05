@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::state::{FileLock, LockFlags, LockType};
-use orpc::common::LocalTime;
+use curvine_model::{FileLock, LockFlags, LockType};
+use curvine_runtime::common::LocalTime;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

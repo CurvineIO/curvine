@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::conf::ClusterConf;
+use curvine_config::ClusterConf;
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq)]

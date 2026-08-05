@@ -35,8 +35,7 @@ pub use self::raft_journal::RaftJournal;
 mod raft_group;
 pub use self::raft_group::RaftGroup;
 
-mod raft_peer;
-pub use self::raft_peer::RaftPeer;
+pub use curvine_config::RaftPeer;
 
 mod raft_error;
 pub use self::raft_error::RaftError;

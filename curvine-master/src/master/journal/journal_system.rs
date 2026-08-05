@@ -23,15 +23,15 @@ use crate::master::{
     JobManager, MasterMonitor, MetaRaftJournal, MountManager, QuotaManager, SyncFsDir,
     SyncWorkerManager,
 };
-use curvine_common::conf::ClusterConf;
-use curvine_common::proto::raft::SnapshotData;
-use curvine_common::raft::storage::{AppStorage, LogStorage, RocksLogStorage};
-use curvine_common::raft::{RaftClient, RaftResult, RoleMonitor, RoleStateListener};
-use curvine_common::FsResult;
-use orpc::common::FileUtils;
-use orpc::err_box;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sync::StateCtl;
+use curvine_config::ClusterConf;
+use curvine_core_error::err_box;
+use curvine_error::FsResult;
+use curvine_raft::proto::raft::SnapshotData;
+use curvine_raft::raft::storage::{AppStorage, LogStorage, RocksLogStorage};
+use curvine_raft::raft::{RaftClient, RaftResult, RoleMonitor, RoleStateListener};
+use curvine_runtime::common::FileUtils;
+use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use curvine_runtime::sync::StateCtl;
 use prost::Message;
 use raft::eraftpb::Entry;
 use raft::Storage;
@@ -410,9 +410,9 @@ impl JournalSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use curvine_common::conf::{JournalConf, MasterConf};
-    use curvine_common::raft::RaftPeer;
-    use orpc::common::Utils;
+    use curvine_config::{JournalConf, MasterConf};
+    use curvine_raft::raft::RaftPeer;
+    use curvine_runtime::common::Utils;
 
     fn non_format_master_conf(name: &str, multi_master: bool) -> ClusterConf {
         let mut journal = JournalConf::with_test();

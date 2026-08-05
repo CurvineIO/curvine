@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::error::FsError;
-use curvine_common::state::{
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_model::{
     StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease, TransferListFilter,
     TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTaskState,
     TransferTenantSummary,
 };
-use curvine_common::FsResult;
 use mysql::prelude::*;
 use mysql::{params, Params, Pool, PooledConn, TxOpts, Value as MysqlValue};
 
@@ -865,7 +865,7 @@ fn init_schema(conn: &mut PooledConn) -> FsResult<()> {
         )",
     )
     .map_err(mysql_err)?;
-    let now_ms = orpc::common::LocalTime::mills();
+    let now_ms = curvine_runtime::common::LocalTime::mills();
     conn.exec_drop(
         "insert ignore into transfer_schema_version(id, version, updated_at)
          values (1, :version, :updated_at)",

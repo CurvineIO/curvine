@@ -18,13 +18,14 @@ use crate::{
     err_fuse, FuseResult, FuseUtils, FUSE_CURRENT_DIR, FUSE_PARENT_DIR, FUSE_PATH_MAX_DEPTH,
     FUSE_PATH_SEPARATOR, FUSE_ROOT_ID, FUSE_UNKNOWN_INO,
 };
-use curvine_common::conf::FuseConf;
-use curvine_common::fs::{Path, StateReader, StateWriter};
-use curvine_common::state::{FileStatus, SetAttrOpts};
+use curvine_config::FuseConf;
+use curvine_core_error::try_option_ref;
+use curvine_fs_api::Path;
+use curvine_fs_api::{StateReader, StateWriter};
+use curvine_model::{FileStatus, SetAttrOpts};
+use curvine_runtime::common::{FastHashMap, LocalTime};
+use curvine_runtime::sync::AtomicCounter;
 use log::info;
-use orpc::common::{FastHashMap, LocalTime};
-use orpc::sync::AtomicCounter;
-use orpc::try_option_ref;
 use std::collections::hash_map::Iter;
 
 pub struct DirTree {
@@ -159,10 +160,18 @@ impl DirTree {
         self.inodes.remove(&ino);
     }
 
-    pub fn next_id(&self, cv_id: i64) -> u64 {
+    fn validate_backend_id(cv_id: i64) -> FuseResult<()> {
+        if cv_id < 0 {
+            return err_fuse!(libc::EIO, "backend returned a negative inode id: {}", cv_id);
+        }
+        Ok(())
+    }
+
+    pub fn next_id(&self, cv_id: i64) -> FuseResult<u64> {
+        Self::validate_backend_id(cv_id)?;
         let cv_id = cv_id as u64;
         if cv_id > FUSE_ROOT_ID && cv_id != FUSE_UNKNOWN_INO && !self.inodes.contains_key(&cv_id) {
-            return cv_id;
+            return Ok(cv_id);
         }
 
         loop {
@@ -170,7 +179,7 @@ impl DirTree {
             if id == FUSE_ROOT_ID || id == FUSE_UNKNOWN_INO || self.inodes.contains_key(&id) {
                 continue;
             } else {
-                return id;
+                return Ok(id);
             }
         }
     }
@@ -192,6 +201,8 @@ impl DirTree {
         status: FileStatus,
         bump_kref: bool,
     ) -> FuseResult<&mut Inode> {
+        Self::validate_backend_id(status.id)?;
+
         let ino = match self.get_inode_mut(parent, Some(name)) {
             Some(inode) => {
                 // Path A: same (parent, name) dentry already cached.
@@ -241,7 +252,7 @@ impl DirTree {
 
                     // Path C: brand-new inode.
                     None => {
-                        let ino = self.next_id(status.id);
+                        let ino = self.next_id(status.id)?;
                         // Real LOOKUP / READDIRPLUS take a kernel lookup ref
                         // (n_lookup=1); plain READDIR takes none (n_lookup=0).
                         let n_lookup = if bump_kref { 1 } else { 0 };
@@ -640,8 +651,8 @@ impl Default for DirTree {
 mod test {
     use crate::fs::dcache::DirTree;
     use crate::FUSE_ROOT_ID;
-    use curvine_common::conf::FuseConf;
-    use curvine_common::state::FileStatus;
+    use curvine_config::FuseConf;
+    use curvine_model::FileStatus;
 
     fn dir_st(name: &str, id: i64) -> FileStatus {
         FileStatus {
@@ -1111,8 +1122,8 @@ mod test {
         assert!(t.get_inode(dst, None).is_none());
     }
 
-    /// `clear` evicts expired inodes but skips: open handles, not yet TTL-expired entries,
-    /// dirs with cached children, root.
+    /// `clear` evicts expired inodes only after the kernel lookup reference is released,
+    /// while still skipping open handles, fresh entries, directories with cached children, and root.
     #[test]
     fn clear_evicts_expired_inodes_and_respects_all_constraints() {
         use std::time::Duration;
@@ -1123,7 +1134,7 @@ mod test {
         };
         let mut t = DirTree::new(conf);
 
-        // Case 1: expired, ref_ctr=0, no handles → should be evicted
+        // Case 1: expired, ref_ctr=0, but n_lookup=1 → kept until FORGET
         // Simulates unlinked file (ref_ctr=0) while kernel still holds dentry (n_lookup=1):
         // should_unref() false, no FORGET yet, inode still in dcache.
         let f1 = t
@@ -1142,12 +1153,12 @@ mod test {
             .ino;
         // Do not zero last_access: clear() does not consult ref_ctr; expiry is last_access-based.
 
-        // Case 3: expired, ref_ctr=0, but open handle → not evicted
+        // Case 3: expired with n_lookup=0, but open handle → not evicted
         let f3 = t
             .lookup(FUSE_ROOT_ID, "f3", file_st("f3", 0), true)
             .unwrap()
             .ino;
-        t.unlink(FUSE_ROOT_ID, "f3", false).unwrap();
+        t.forget(f3, 1).unwrap();
         t.get_inode_mut(f3, None).unwrap().last_access = 0;
 
         // Case 4: ref_ctr=0 but not expired → not evicted
@@ -1158,7 +1169,7 @@ mod test {
         t.unlink(FUSE_ROOT_ID, "f4", false).unwrap();
         // last_access is fresh; within 60s TTL
 
-        // Case 5: expired empty dir, ref_ctr=0 → evicted
+        // Case 5: expired empty dir with n_lookup=1 → kept until FORGET
         let d1 = t
             .lookup(FUSE_ROOT_ID, "d1", dir_st("d1", 500), true)
             .unwrap()
@@ -1166,22 +1177,38 @@ mod test {
         t.unlink(FUSE_ROOT_ID, "d1", false).unwrap(); // like rmdir; DirEntry.children empty
         t.get_inode_mut(d1, None).unwrap().last_access = 0;
 
-        // Case 6: expired dir with ref_ctr=0 but cached children → not evicted
+        // Case 6: expired dir with n_lookup=0 but cached children → not evicted
         // Evicting would orphan cached children and break path reconstruction.
         let d2 = t
             .lookup(FUSE_ROOT_ID, "d2", dir_st("d2", 600), true)
             .unwrap()
             .ino;
         t.lookup(d2, "child", file_st("child", 0), true).unwrap(); // d2.children has "child"
-        t.get_inode_mut(d2, None).unwrap().ref_ctr = 0; // simulate unlinked dir inode
+        t.forget(d2, 1).unwrap();
         t.get_inode_mut(d2, None).unwrap().last_access = 0;
+
+        // Case 7: expired file after FORGET → evicted
+        let f5 = t
+            .lookup(FUSE_ROOT_ID, "f5", file_st("f5", 0), true)
+            .unwrap()
+            .ino;
+        t.forget(f5, 1).unwrap();
+        t.get_inode_mut(f5, None).unwrap().last_access = 0;
+
+        // Case 8: expired empty directory after FORGET → evicted
+        let d3 = t
+            .lookup(FUSE_ROOT_ID, "d3", dir_st("d3", 800), true)
+            .unwrap()
+            .ino;
+        t.forget(d3, 1).unwrap();
+        t.get_inode_mut(d3, None).unwrap().last_access = 0;
 
         // Run clear; treat f3 as having an open handle
         t.clear(|ino| ino == f3);
 
         assert!(
-            t.get_inode(f1, None::<&str>).is_none(),
-            "f1 should be evicted"
+            t.get_inode(f1, None::<&str>).is_some(),
+            "f1 should stay until the kernel sends FORGET"
         );
         assert!(
             t.get_inode(f2, None::<&str>).is_some(),
@@ -1196,12 +1223,20 @@ mod test {
             "f4 should stay (not expired)"
         );
         assert!(
-            t.get_inode(d1, None::<&str>).is_none(),
-            "d1 should be evicted (empty dir)"
+            t.get_inode(d1, None::<&str>).is_some(),
+            "d1 should stay until the kernel sends FORGET"
         );
         assert!(
             t.get_inode(d2, None::<&str>).is_some(),
             "d2 should stay (has cached children)"
+        );
+        assert!(
+            t.get_inode(f5, None::<&str>).is_none(),
+            "f5 should be evicted after FORGET"
+        );
+        assert!(
+            t.get_inode(d3, None::<&str>).is_none(),
+            "d3 should be evicted after FORGET"
         );
         assert!(
             t.get_inode(FUSE_ROOT_ID, None::<&str>).is_some(),
@@ -1214,12 +1249,65 @@ mod test {
             .lookup(FUSE_ROOT_ID, "fx", file_st("fx", 0), true)
             .unwrap()
             .ino;
-        t0.unlink(FUSE_ROOT_ID, "fx", false).unwrap();
+        t0.forget(fx, 1).unwrap();
         t0.get_inode_mut(fx, None).unwrap().last_access = 0;
         t0.clear(|_| false);
         assert!(
             t0.get_inode(fx, None::<&str>).is_none(),
             "cache_ttl=0 still evicts when last_access + ttl <= now"
+        );
+    }
+
+    /// The kernel may continue addressing an inode by nodeid until it sends FORGET.
+    /// TTL expiry alone must not discard that mapping.
+    #[test]
+    fn clear_keeps_expired_inode_with_kernel_lookup_reference() {
+        let mut tree = DirTree::default();
+        let ino = tree
+            .lookup(FUSE_ROOT_ID, "held", dir_st("held", 700), true)
+            .unwrap()
+            .ino;
+        tree.get_inode_mut(ino, None).unwrap().last_access = 0;
+
+        tree.clear(|_| false);
+
+        assert!(
+            tree.get_inode(ino, None::<&str>).is_some(),
+            "an inode with an outstanding kernel lookup reference must stay addressable"
+        );
+    }
+
+    /// A failed deferred delete keeps `mark_delete` set for later retry or
+    /// persisted-state recovery. TTL cleanup must not silently discard it.
+    #[test]
+    fn clear_keeps_expired_pending_delete_until_completion() {
+        let mut tree = DirTree::default();
+        let ino = tree
+            .lookup(FUSE_ROOT_ID, "pending", file_st("pending", 900), true)
+            .unwrap()
+            .ino;
+        tree.forget(ino, 1).unwrap();
+        tree.unlink(FUSE_ROOT_ID, "pending", true).unwrap();
+        tree.get_inode_mut(ino, None).unwrap().last_access = 0;
+
+        tree.clear(|_| false);
+
+        assert!(
+            tree.pending_delete(ino),
+            "TTL cleanup must preserve pending deferred-delete state"
+        );
+        assert!(
+            tree.get_dir_check(FUSE_ROOT_ID)
+                .unwrap()
+                .is_deleted_child("pending"),
+            "the deleted-child marker must remain available for completion"
+        );
+
+        tree.clear_mark_delete(ino).unwrap();
+        tree.clear(|_| false);
+        assert!(
+            tree.get_inode(ino, None::<&str>).is_none(),
+            "completed deferred-delete state may be evicted after TTL expiry"
         );
     }
 
@@ -1230,16 +1318,16 @@ mod test {
         let t = DirTree::default();
 
         // id == 0 (<= FUSE_ROOT_ID): both calls allocate, and must differ.
-        let a = t.next_id(0);
-        let b = t.next_id(0);
+        let a = t.next_id(0).unwrap();
+        let b = t.next_id(0).unwrap();
         assert_ne!(
             a, b,
             "two next_id(0) calls must return distinct inos (this is why create must not call next_ino twice)"
         );
 
         // id == FUSE_UNKNOWN_INO: same divergence.
-        let c = t.next_id(FUSE_UNKNOWN_INO as i64);
-        let d = t.next_id(FUSE_UNKNOWN_INO as i64);
+        let c = t.next_id(FUSE_UNKNOWN_INO as i64).unwrap();
+        let d = t.next_id(FUSE_UNKNOWN_INO as i64).unwrap();
         assert_ne!(
             c, d,
             "two next_id(FUSE_UNKNOWN_INO) calls must return distinct inos"
@@ -1251,9 +1339,43 @@ mod test {
             assert_ne!(id, FUSE_UNKNOWN_INO);
         }
 
+        // Negative values are invalid backend metadata, not unassigned ids.
+        for id in [-1, i64::MIN] {
+            assert_eq!(t.next_id(id).unwrap_err().errno, libc::EIO);
+        }
+
         // Stable backend ids are returned verbatim and stable across calls.
         let stable = 12_345_u64;
-        assert_eq!(t.next_id(stable as i64), stable);
-        assert_eq!(t.next_id(stable as i64), stable);
+        assert_eq!(t.next_id(stable as i64).unwrap(), stable);
+        assert_eq!(t.next_id(stable as i64).unwrap(), stable);
+    }
+
+    #[test]
+    fn lookup_rejects_negative_backend_inode_ids() {
+        let mut t = DirTree::default();
+
+        for (name, id) in [("minus-one", -1), ("min", i64::MIN)] {
+            let result = t.lookup(FUSE_ROOT_ID, name, file_st(name, id), true);
+            match result {
+                Ok(_) => panic!("negative backend inode id {id} must be rejected"),
+                Err(error) => assert_eq!(error.errno, libc::EIO),
+            }
+            assert!(t.get_inode(FUSE_ROOT_ID, Some(name)).is_none());
+        }
+
+        t.lookup(FUSE_ROOT_ID, "cached", file_st("cached", 12_345), true)
+            .unwrap();
+        let result = t.lookup(FUSE_ROOT_ID, "cached", file_st("cached", -1), true);
+        match result {
+            Ok(_) => panic!("a negative refresh id must not update a cached dentry"),
+            Err(error) => assert_eq!(error.errno, libc::EIO),
+        }
+        assert_eq!(
+            t.get_inode(FUSE_ROOT_ID, Some("cached"))
+                .unwrap()
+                .clone_status()
+                .id,
+            12_345
+        );
     }
 }

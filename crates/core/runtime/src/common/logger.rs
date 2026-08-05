@@ -206,7 +206,7 @@ impl Logger {
 
     fn log_skip_existing_subscriber() {
         tracing::warn!(
-            target: "orpc::logger",
+            target: "curvine_runtime::logger",
             "global tracing subscriber already set; skipping Curvine logger initialization"
         );
     }

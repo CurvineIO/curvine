@@ -16,9 +16,9 @@ use std::path::PathBuf;
 use std::{env, fs};
 
 fn main() {
-    // Keep a single source of truth for non-raft protos under curvine-common/proto
+    // Keep a single source of truth for non-raft protos under curvine-proto/proto
     // so Rust, Java, and Python SDK generation stay in sync.
-    let proto_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../curvine-common/proto");
+    let proto_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("proto");
     let proto_files = [
         "common.proto",
         "master.proto",

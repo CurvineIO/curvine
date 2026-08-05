@@ -27,17 +27,18 @@ use crate::session::channel::{FuseChannel, FuseReceiver, FuseSender};
 use crate::session::FuseRequest;
 use crate::session::{FuseMnt, FuseResponse};
 use crate::{err_fuse, FuseResult};
-use curvine_common::conf::{ClusterConf, FuseConf};
-use curvine_common::fs::{StateReader, StateWriter};
-use curvine_common::utils::CommonUtils;
-use curvine_common::version::GIT_VERSION;
+use curvine_config::{ClusterConf, FuseConf};
+use curvine_core_error::{err_box, err_msg, CommonResult};
+use curvine_fs_api::{StateReader, StateWriter};
+use curvine_io::IOResult;
+use curvine_runtime::common::CommonUtils;
+use curvine_runtime::common::{ByteUnit, TimeSpent};
+use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use curvine_sys as sys;
+use curvine_sys::version::GIT_VERSION;
+use curvine_sys::{RawIO, SignalKind, SignalWatch};
 use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
 use log::{debug, error, info, warn};
-use orpc::common::{ByteUnit, TimeSpent};
-use orpc::io::IOResult;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sys::{RawIO, SignalKind, SignalWatch};
-use orpc::{err_box, err_msg, sys, CommonResult};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -291,7 +292,7 @@ impl<T: FileSystem> FuseSession<T> {
     #[cfg(target_os = "linux")]
     fn spawn_fd_watcher(
         &self,
-        watch_fds: &[orpc::sys::RawIO],
+        watch_fds: &[curvine_sys::RawIO],
         shutdown_once: ShutdownOnce,
         enabled: bool,
     ) -> tokio::task::JoinHandle<()> {
@@ -638,7 +639,8 @@ mod run_all_shutdown_result_tests {
 
     #[test]
     fn inner_run_all_error_is_preserved() {
-        let inner: orpc::CommonResult<()> = Err(std::io::Error::other("receiver failed").into());
+        let inner: curvine_core_error::CommonResult<()> =
+            Err(std::io::Error::other("receiver failed").into());
 
         let err = flatten_run_all_result(Ok(inner)).expect_err("inner error must be returned");
 
@@ -649,7 +651,7 @@ mod run_all_shutdown_result_tests {
     async fn join_error_is_preserved() {
         let handle = tokio::spawn(async {
             std::future::pending::<()>().await;
-            Ok::<(), orpc::CommonError>(())
+            Ok::<(), curvine_core_error::CommonError>(())
         });
         handle.abort();
 

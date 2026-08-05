@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::error::FsError;
-use curvine_common::state::{
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_model::{
     StaleTaskAttempt, TaskAttemptStart, TransferCommand, TransferJobRecord, TransferKind,
     TransferLease, TransferListFilter, TransferProgress, TransferState, TransferStateUpdate,
     TransferTaskRecord, TransferTaskReport, TransferTaskState, TransferTenantSummary,
 };
-use curvine_common::FsResult;
 use parking_lot::Mutex;
 use rusqlite::{
     params, params_from_iter, types::Value as SqliteValue, Connection, OptionalExtension, Row,

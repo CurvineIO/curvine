@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+curvine-core-error = { workspace = true }
+curvine-runtime = { workspace = true }
+curvine-io = { workspace = true }
 curvine-ufs-api = { workspace = true }
 curvine-error = { workspace = true }
 curvine-fs-api = { workspace = true }
@@ -13,8 +16,6 @@ bytes = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
 opendal = { version = "0.55" }
-orpc = { workspace = true }
-
 [dependencies.curvine-hdfs-jni]
 workspace = true
 optional = true

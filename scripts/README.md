@@ -15,14 +15,12 @@ scripts/check-deps.sh --mode ci
 scripts/check-deps.sh --mode final
 ```
 
-`report` mode is useful during migration because known violations are printed as
-warnings. `ci` mode is the current enforceable gate for already-migrated client
-paths: `curvine-client-core`, minimal `curvine-cli`, minimal Java/Python SDKs,
-the SPDK/RDMA feature-unification check, and production reverse dependencies on
-`curvine-tests`. Remaining `curvine-common` / `orpc` facade users and the
-current `curvine-fuse` final-tree debt stay visible as warnings until the P7
-cleanup removes them. `final` mode is the P7 gate and fails if internal
-dependencies on `curvine-common` / `orpc` or forbidden heavy paths remain.
+`report` mode prints known violations as warnings. `ci` mode enforces client-side
+gates: `curvine-client-core`, minimal `curvine-cli`, minimal Java/Python SDKs,
+the SPDK/RDMA feature-isolation check, and production reverse dependencies on
+`curvine-tests`. `final` mode additionally requires that the `orpc` and
+`curvine-common` facade packages are gone from the workspace and that the
+`curvine-fuse` default tree stays free of those facades and heavy UFS paths.
 
 `check-minimal-artifact-deps.sh` inspects built client artifacts with `readelf`,
 `llvm-readelf`, or `otool` and fails if minimal client artifacts dynamically
