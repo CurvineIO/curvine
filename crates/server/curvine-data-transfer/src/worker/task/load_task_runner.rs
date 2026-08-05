@@ -216,9 +216,11 @@ impl LoadTaskRunner {
             && target_path.is_cv()
             && self.max_parallel_streams() > 1
         {
-            let src_len = self.get_ufs()?.get_status(&source_path).await?.len;
-            if self.effective_streams(src_len) > 1 {
-                return self.run_parallel(&source_path, &target_path, src_len).await;
+            let initial_source = self.get_ufs()?.get_status(&source_path).await?;
+            if self.effective_streams(initial_source.len) > 1 {
+                return self
+                    .run_parallel(&source_path, &target_path, &initial_source)
+                    .await;
             }
         }
 
@@ -848,8 +850,9 @@ impl LoadTaskRunner {
         &self,
         source_path: &Path,
         target_path: &Path,
-        src_len: i64,
+        initial_source: &FileStatus,
     ) -> FsResult<bool> {
+        let src_len = initial_source.len;
         let streams = self.effective_streams(src_len);
         let block_size = self.task.info.job.block_size.max(1);
         let seg = Self::segment_len(src_len, streams, block_size);
@@ -992,7 +995,18 @@ impl LoadTaskRunner {
             );
         }
 
-        let ufs_mtime = self.get_ufs()?.get_status(source_path).await?.mtime;
+        let final_source = self.get_ufs()?.get_status(source_path).await?;
+        if final_source.len != initial_source.len || final_source.mtime != initial_source.mtime {
+            return err_box!(format!(
+                "Task {} parallel load source changed during transfer (initial len={}, initial mtime={}, final len={}, final mtime={}); refusing to mark cache valid",
+                self.task.info.task_id,
+                initial_source.len,
+                initial_source.mtime,
+                final_source.len,
+                final_source.mtime,
+            ));
+        }
+        let ufs_mtime = initial_source.mtime;
         let attr_opts = SetAttrOptsBuilder::new().ufs_mtime(ufs_mtime).build();
         self.fs.set_attr(target_path, attr_opts).await?;
 
@@ -1062,12 +1076,116 @@ fn xattr_equals(status: &FileStatus, key: &str, expected: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::rename_ufs_output;
+    use super::{rename_ufs_output, LoadTaskRunner};
     use curvine_fs_api::Path;
     use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
     use curvine_unified_fs::UfsFileSystem;
     use std::collections::HashMap;
     use std::fs;
+
+    const MB: i64 = 1024 * 1024;
+
+    // Reproduce the exact planning loop run_parallel uses, so tests exercise the
+    // real offset/len math (block alignment + last-segment clamp), which is the
+    // most error-prone part of the fan-out.
+    fn plan(src_len: i64, streams: usize, block_size: i64) -> Vec<(i64, i64)> {
+        let seg = LoadTaskRunner::segment_len(src_len, streams, block_size);
+        let mut ranges = Vec::new();
+        for i in 0..streams {
+            let off = i as i64 * seg;
+            if off >= src_len {
+                break;
+            }
+            let len = seg.min(src_len - off);
+            ranges.push((off, len));
+        }
+        ranges
+    }
+
+    #[test]
+    fn segment_len_is_block_aligned() {
+        let seg = LoadTaskRunner::segment_len(10 * 1024 * MB, 8, 4 * MB);
+        assert_eq!(
+            seg % (4 * MB),
+            0,
+            "segment must be a multiple of block_size"
+        );
+        assert!(seg >= 10 * 1024 * MB / 8);
+    }
+
+    #[test]
+    fn segment_len_rounds_up_to_block_multiple() {
+        let seg = LoadTaskRunner::segment_len(100 * MB, 3, 4 * MB);
+        assert_eq!(seg, 36 * MB);
+        assert_eq!(seg % (4 * MB), 0);
+    }
+
+    #[test]
+    fn segment_len_never_below_block_size() {
+        let seg = LoadTaskRunner::segment_len(1, 8, 4 * MB);
+        assert_eq!(seg, 4 * MB);
+    }
+
+    #[test]
+    fn segment_len_handles_zero_streams_and_block() {
+        assert_eq!(LoadTaskRunner::segment_len(1000, 0, 0), 1000);
+    }
+
+    #[test]
+    fn plan_ranges_are_contiguous_disjoint_and_cover_whole_file() {
+        for &(src_len, streams, block_size) in &[
+            (10 * 1024 * MB, 8, 4 * MB),
+            (100 * MB, 3, 4 * MB),
+            (7 * MB + 123, 4, 4 * MB),
+            (4 * MB, 8, 4 * MB),
+            (1, 8, 4 * MB),
+        ] {
+            let ranges = plan(src_len, streams, block_size);
+            assert!(!ranges.is_empty(), "must produce at least one range");
+            assert_eq!(ranges[0].0, 0);
+            let mut expected_off = 0;
+            for (off, len) in &ranges {
+                assert_eq!(*off, expected_off, "gap/overlap at {}", off);
+                assert!(*len > 0, "empty segment");
+                expected_off += len;
+            }
+            assert_eq!(
+                expected_off, src_len,
+                "ranges must cover exactly [0,{})",
+                src_len
+            );
+            for (off, _) in &ranges {
+                assert_eq!(*off % block_size, 0, "segment start not block-aligned");
+            }
+        }
+    }
+
+    #[test]
+    fn plan_does_not_over_allocate_streams_for_small_files() {
+        let ranges = plan(4 * MB, 8, 4 * MB);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], (0, 4 * MB));
+    }
+
+    #[test]
+    fn stream_count_grows_with_size_and_caps() {
+        let min = 256 * MB;
+        let cap = 8;
+        assert_eq!(LoadTaskRunner::stream_count(100 * MB, min, cap), 1);
+        assert_eq!(LoadTaskRunner::stream_count(min - 1, min, cap), 1);
+        assert_eq!(LoadTaskRunner::stream_count(512 * MB, min, cap), 2);
+        assert_eq!(LoadTaskRunner::stream_count(1024 * MB, min, cap), 4);
+        assert_eq!(LoadTaskRunner::stream_count(2048 * MB, min, cap), 8);
+        assert_eq!(LoadTaskRunner::stream_count(200 * 1024 * MB, min, cap), 8);
+    }
+
+    #[test]
+    fn stream_count_defensive_bounds() {
+        assert_eq!(LoadTaskRunner::stream_count(0, 256 * MB, 8), 1);
+        assert_eq!(LoadTaskRunner::stream_count(-5, 256 * MB, 8), 1);
+        assert_eq!(LoadTaskRunner::stream_count(1024 * MB, 0, 8), 8);
+        assert_eq!(LoadTaskRunner::stream_count(1024 * MB, 256 * MB, 0), 1);
+    }
 
     #[test]
     fn failed_ufs_rename_keeps_existing_target() {
