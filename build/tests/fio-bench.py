@@ -8,9 +8,10 @@ import sys
 import time
 
 DEFAULT_DIR = "/curvine-fuse/fio-bench"
-DEFAULT_THREADS = 32
-DEFAULT_FILE_SIZE = "1G"
-DEFAULT_BLOCK_SIZE = "256KB"
+DEFAULT_THREADS = 16
+DEFAULT_BLOCK_SIZE = "64K,256K,1M"
+AUTO_IO_PER_FILE = 65536
+MAX_FILE_SIZE = 1024 ** 3
 
 TESTS = [
     ("write", "Sequential write", "Throughput"),
@@ -34,15 +35,17 @@ def parse_size(value):
     return int(float(value))
 
 
-def parse_duration(value):
-    value = str(value).strip().lower()
-    if value.endswith("h"):
-        return int(float(value[:-1]) * 3600)
-    if value.endswith("m"):
-        return int(float(value[:-1]) * 60)
-    if value.endswith("s"):
-        return int(float(value[:-1]))
-    return int(float(value))
+def parse_bs_list(value):
+    sizes = []
+    for item in str(value).split(","):
+        item = item.strip()
+        if item:
+            sizes.append(parse_size(item))
+    return sizes
+
+
+def auto_file_size(block_size):
+    return min(block_size * AUTO_IO_PER_FILE, MAX_FILE_SIZE)
 
 
 def format_bytes(value):
@@ -76,7 +79,7 @@ def first_data_file_size(directory):
     return None
 
 
-def run_fio(rw, directory, threads, size, block_size, duration, ioengine, direct):
+def run_fio(rw, directory, threads, size, block_size, iodepth, timeout, ioengine, direct):
     cmd = [
         "fio",
         "--name=fio_data",
@@ -85,17 +88,19 @@ def run_fio(rw, directory, threads, size, block_size, duration, ioengine, direct
         "--bs=" + str(block_size),
         "--size=" + str(size),
         "--numjobs=" + str(threads),
+        "--iodepth=" + str(iodepth),
         "--ioengine=" + ioengine,
         "--direct=" + str(direct),
         "--group_reporting",
         "--output-format=json",
     ]
-    if duration:
-        cmd += ["--runtime=" + str(duration), "--time_based=1"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout if timeout > 0 else None)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"fio timed out after {timeout}s for rw={rw} bs={block_size}")
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
-        raise RuntimeError(f"fio failed for rw={rw}: {detail}")
+        raise RuntimeError(f"fio failed for rw={rw} bs={block_size}: {detail}")
     return json.loads(result.stdout)
 
 
@@ -136,9 +141,9 @@ def progress_string(metric):
 
 def build_report(metrics):
     rows = []
-    for (rw, item, _), metric in zip(TESTS, metrics):
+    for metric in metrics:
         rows.append([
-            item,
+            f"{metric['item']} ({format_bytes(metric['block_size'])})",
             speed_string(metric),
             iops_string(metric),
             f"{metric['avg_cost_ms']:.2f} ms/op",
@@ -176,10 +181,11 @@ def print_table(title, rows):
 
 def json_report(metrics):
     items = []
-    for (rw, item, _), metric in zip(TESTS, metrics):
+    for metric in metrics:
         items.append({
-            "item": item,
-            "rw": rw,
+            "item": metric["item"],
+            "rw": metric["rw"],
+            "block_size": metric["block_size"],
             "speed_gib_s": metric["bw_bytes"] / (1024 ** 3),
             "iops": metric["iops"],
             "avg_cost_ms": metric["avg_cost_ms"],
@@ -197,9 +203,10 @@ def main():
     parser = argparse.ArgumentParser(description="Run fio sequential/random read-write benchmarks and print a curvine-cli bench style report.")
     parser.add_argument("--directory", default=DEFAULT_DIR, help=f"Benchmark directory, created or recreated (default: {DEFAULT_DIR})")
     parser.add_argument("-p", "--threads", type=int, default=DEFAULT_THREADS, help=f"Concurrency, number of fio jobs (default: {DEFAULT_THREADS})")
-    parser.add_argument("--file-size", default=DEFAULT_FILE_SIZE, help=f"File size per job (default: {DEFAULT_FILE_SIZE})")
-    parser.add_argument("-b", "--block-size", default=DEFAULT_BLOCK_SIZE, help=f"Block size (default: {DEFAULT_BLOCK_SIZE})")
-    parser.add_argument("--duration", default=None, help="Run duration per test, e.g. 30s/1m (default: run to completion)")
+    parser.add_argument("--file-size", default=None, help="File size per job; default auto per block size: bs x 65536 IO capped at 1G")
+    parser.add_argument("-b", "--bs-list", default=DEFAULT_BLOCK_SIZE, help=f"Comma-separated block sizes, e.g. 4K,64K,1M (default: {DEFAULT_BLOCK_SIZE})")
+    parser.add_argument("--iodepth", type=int, default=16, help="Async IO queue depth (default: 16)")
+    parser.add_argument("--timeout", type=int, default=300, help="Per-test timeout in seconds, 0 disables (default: 300)")
     parser.add_argument("--ioengine", default="libaio", help="fio ioengine (default: libaio)")
     parser.add_argument("--direct", type=int, default=1, help="O_DIRECT flag, 0 or 1 (default: 1)")
     parser.add_argument("--json", action="store_true", help="Print report as JSON")
@@ -209,43 +216,60 @@ def main():
         sys.exit("fio not found in PATH, please install fio first")
     if args.threads <= 0:
         sys.exit("--threads must be greater than 0")
-    block_size = parse_size(args.block_size)
-    if block_size <= 0:
-        sys.exit("--block-size must be greater than 0")
-    file_size = parse_size(args.file_size)
-    if file_size <= 0:
+    if args.iodepth <= 0:
+        sys.exit("--iodepth must be greater than 0")
+    if args.timeout < 0:
+        sys.exit("--timeout must be greater than or equal to 0")
+    block_sizes = parse_bs_list(args.bs_list)
+    if not block_sizes or any(bs <= 0 for bs in block_sizes):
+        sys.exit("--bs-list must contain at least one valid block size")
+    file_size = parse_size(args.file_size) if args.file_size else None
+    if file_size is not None and file_size <= 0:
         sys.exit("--file-size must be greater than 0")
-    duration = parse_duration(args.duration) if args.duration else None
 
     directory = ensure_dir(args.directory)
     print()
     print("Configuration: fio")
+    if file_size is not None:
+        file_size_desc = args.file_size
+    else:
+        file_size_desc = f"auto (bs x {AUTO_IO_PER_FILE} IO, cap {format_bytes(MAX_FILE_SIZE)})"
     print(
         f"Target: Fuse, Path: {args.directory}, Threads: {args.threads}, "
-        f"FileSize: {args.file_size}, BlockSize: {args.block_size}, "
-        f"Duration: {args.duration or 'none'}, IoEngine: {args.ioengine}, Direct: {args.direct}"
+        f"FileSize: {file_size_desc}, BlockSizes: {args.bs_list}, Iodepth: {args.iodepth}, "
+        f"IoEngine: {args.ioengine}, Direct: {args.direct}, Timeout: {args.timeout}s"
     )
-    print(f"Estimated total data per test: {format_bytes(file_size * args.threads)}")
-    print("Note: tests share one file set (write -> read -> randwrite -> randread)")
+    if file_size is not None:
+        print(f"Estimated total data per test: {format_bytes(file_size * args.threads)}")
+    else:
+        print(f"Estimated total data per test: auto per block size, max {format_bytes(MAX_FILE_SIZE * args.threads)}")
+    print("Note: each block size uses its own file set (write -> read -> randwrite -> randread)")
 
+    total_tests = len(block_sizes) * len(TESTS)
     metrics = []
-    for index, (rw, item, _) in enumerate(TESTS, start=1):
-        print(f"\n[{index}/{len(TESTS)}] {item}: running ...")
-        start = time.time()
-        if rw in ("read", "randread"):
-            actual = first_data_file_size(directory)
-            if actual is not None and actual > 0:
-                size = actual
-            else:
-                size = file_size
-        else:
+    index = 0
+    for block_size in block_sizes:
+        directory = ensure_dir(directory)
+        if file_size is not None:
             size = file_size
-        data = run_fio(rw, directory, args.threads, size, block_size, duration, args.ioengine, args.direct)
-        metric = extract_metrics(data, rw, block_size)
-        if metric is None:
-            sys.exit(f"no {rw} metrics in fio output")
-        metrics.append(metric)
-        print(f"    done in {time.time() - start:.1f}s, {progress_string(metric)}")
+        else:
+            size = auto_file_size(block_size)
+        for rw, item, _ in TESTS:
+            index += 1
+            print(f"\n[{index}/{total_tests}] {item} ({format_bytes(block_size)}): running ...")
+            start = time.time()
+            if rw in ("read", "randread"):
+                actual = first_data_file_size(directory)
+                if actual is not None and actual > 0:
+                    size = actual
+            data = run_fio(rw, directory, args.threads, size, block_size, args.iodepth, args.timeout, args.ioengine, args.direct)
+            metric = extract_metrics(data, rw, block_size)
+            if metric is None:
+                sys.exit(f"no {rw} metrics in fio output")
+            metric["block_size"] = block_size
+            metric["item"] = item
+            metrics.append(metric)
+            print(f"    done in {time.time() - start:.1f}s, {progress_string(metric)}")
 
     print("\nBenchmark finished!")
     print(f"Temp path: {args.directory} (removed)")
