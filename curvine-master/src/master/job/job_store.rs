@@ -232,8 +232,15 @@ impl JobStore {
         Ok(())
     }
 
-    pub fn remove_job(&self, job_id: &str) -> FsResult<Option<(String, JobContext)>> {
-        let removed = self.jobs.remove(job_id);
+    pub fn remove_job_if<F>(
+        &self,
+        job_id: &str,
+        should_remove: F,
+    ) -> FsResult<Option<(String, JobContext)>>
+    where
+        F: FnOnce(&JobContext) -> bool,
+    {
+        let removed = self.jobs.remove_if(job_id, |_, job| should_remove(job));
         if removed.is_some() {
             self.remove_callbacks(job_id)?;
         }
