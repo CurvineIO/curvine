@@ -118,12 +118,11 @@ pub const FUSE_AUTO_INVAL_DATA: u32 = 1 << 12;
 /// Kernel exportfs support: enables `name_to_handle_at` / `open_by_handle_at` via
 /// `LOOKUP(nodeid, ".")` / `LOOKUP(nodeid, "..")` reconstruction.
 ///
-/// Deliberately NOT in `SUPPORTED_INIT_FLAGS` (see there): the reconstruction it
-/// promises relies on `NodeState::fs_lookup` handling `.`/`..` through the root,
-/// which today returns ENOENT wherever the resolution hits root's `0`-sentinel
-/// parent. Advertising the cap would expose a protocol path the daemon cannot
-/// satisfy. The constant is retained for `fuse_init_flag_names` (so an
-/// offered-but-not-enabled bit is logged).
+/// Advertised in `SUPPORTED_INIT_FLAGS` so that `name_to_handle_at` /
+/// `open_by_handle_at` remain usable after `drop_caches`. The kernel's
+/// `fuse_get_parent` / `fuse_get_dentry` short-circuit with `-ESTALE` when
+/// `fc->export_support` is unset, and `NodeState::fs_lookup` now handles root
+/// `.`/`..` correctly.
 pub const FUSE_EXPORT_SUPPORT: u32 = 1 << 4;
 
 /// Kernel init capability bit: the daemon handles O_TRUNC atomically inside
@@ -140,12 +139,7 @@ pub const FUSE_ATOMIC_O_TRUNC: u32 = 1 << 3;
 ///
 /// Deliberately EXCLUDED (never advertised): FUSE_ATOMIC_O_TRUNC (open does not
 /// truncate), FUSE_POSIX_ACL (no ACL handling), FUSE_HAS_IOCTL_DIR (no
-/// ioctl), FUSE_EXPORT_SUPPORT (its `.`/`..` reconstruction relies on root
-/// `.`/`..` lookups that currently return ENOENT — see `FUSE_EXPORT_SUPPORT`).
-/// Not advertising EXPORT_SUPPORT is sufficient to keep the broken root `.`/`..`
-/// path unreachable: the kernel's `fuse_get_parent` / `fuse_get_dentry` (the only
-/// sites that emit a `.`/`..` LOOKUP to the daemon) both short-circuit with
-/// `-ESTALE` when `fc->export_support` is unset.
+/// ioctl).
 pub const SUPPORTED_INIT_FLAGS: u32 = FUSE_ASYNC_READ
     | FUSE_BIG_WRITES
     | FUSE_ASYNC_DIO
@@ -154,7 +148,8 @@ pub const SUPPORTED_INIT_FLAGS: u32 = FUSE_ASYNC_READ
     | FUSE_DO_READDIRPLUS
     | FUSE_POSIX_LOCKS
     | FUSE_FLOCK_LOCKS
-    | FUSE_MAX_PAGES;
+    | FUSE_MAX_PAGES
+    | FUSE_EXPORT_SUPPORT;
 
 /// Human-readable FUSE init-capability names; unknown bits are kept as hex.
 pub fn fuse_init_flag_names(flags: u32) -> Vec<String> {

@@ -24,7 +24,7 @@ use crate::fuse_metrics::{
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{
     err_fuse, FuseError, FuseMetrics, FuseResult, FuseUtils, FUSE_CURRENT_DIR, FUSE_PARENT_DIR,
-    FUSE_ROOT_ID, STATE_FILE_MAGIC, STATE_FILE_VERSION,
+    FUSE_PATH_SEPARATOR, FUSE_ROOT_ID, STATE_FILE_MAGIC, STATE_FILE_VERSION,
 };
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_config::ClusterConf;
@@ -276,10 +276,10 @@ impl NodeState {
         dir.get_inode(ino, name).is_some()
     }
 
-    pub fn unlink(&self, ino: u64, name: &str, mark_delete: bool) -> FuseResult<()> {
+    pub fn unlink(&self, ino: u64, name: &str, mark_delete: bool) -> FuseResult<bool> {
         let before = self.dir_read().inode_lens();
         let mut dir = self.dir_write();
-        dir.unlink(ino, name, mark_delete)?;
+        let last_link = dir.unlink(ino, name, mark_delete)?;
         let after = dir.inode_lens();
         drop(dir);
         for _ in 0..before.saturating_sub(after) {
@@ -287,7 +287,7 @@ impl NodeState {
                 Self::dec_gauges_lockstep(&m.inode_num, &m.inode_count);
             });
         }
-        Ok(())
+        Ok(last_link)
     }
 
     pub fn forget(&self, ino: u64, n_lookup: u64) -> FuseResult<()> {
@@ -662,11 +662,27 @@ impl NodeState {
 
         // Always mark for deletion and remove the directory entry first, and check
         // has_open_handles inside the same dir_write critical section.
-        let has_handles = {
+        let (has_handles, last_link) = {
             let mut dir = self.dir_write();
-            dir.unlink(parent, name, true)?;
-            self.has_open_handles(ino)
+            let last_link = dir.unlink(parent, name, true)?;
+            (self.has_open_handles(ino), last_link)
         };
+
+        // Removing one of several hard links must reach the master immediately:
+        // the master owns the authoritative nlink count and removes only this
+        // directory entry. Open handles do not require deferral while another
+        // link still keeps the inode alive.
+        if !last_link {
+            match self.fs.delete(&path, false).await {
+                Ok(()) | Err(FsError::FileNotFound(_)) => (),
+                Err(e) => {
+                    self.clear_unlink_state(ino, parent, name)?;
+                    return Err(e.into());
+                }
+            }
+            self.clear_unlink_state(ino, parent, name)?;
+            return Ok(());
+        }
 
         if has_handles {
             debug!("unlink ino={}, path={}: open handles, deferring", ino, path);
@@ -852,17 +868,26 @@ impl NodeState {
     }
 
     pub async fn fs_lookup(&self, ino: u64, name: &str) -> FuseResult<fuse_attr> {
-        // NOTE: the `.`/`..` branches below are BROKEN wherever they resolve through the root, because
-        // root's `parent` is the `0` sentinel and inode 0 does not exist.
         let (ino, cow_name) = if name == FUSE_CURRENT_DIR {
             let dir = self.dir_read();
             let inode = dir.get_inode_check(ino, None)?;
-            (inode.parent, Cow::Owned(inode.name.to_owned()))
+            if inode.is_root() {
+                (FUSE_ROOT_ID, Cow::Owned(FUSE_PATH_SEPARATOR.to_owned()))
+            } else {
+                (inode.parent, Cow::Owned(inode.name.to_owned()))
+            }
         } else if name == FUSE_PARENT_DIR {
             let dir = self.dir_read();
-            let parent_inode = dir.get_inode_check(ino, None)?;
-            let inode = dir.get_inode_check(parent_inode.parent, None)?;
-            (inode.parent, Cow::Owned(inode.name.to_owned()))
+            let inode = dir.get_inode_check(ino, None)?;
+            if inode.is_root() {
+                (FUSE_ROOT_ID, Cow::Owned(FUSE_PATH_SEPARATOR.to_owned()))
+            } else {
+                let parent_inode = dir.get_inode_check(inode.parent, None)?;
+                (
+                    parent_inode.parent,
+                    Cow::Owned(parent_inode.name.to_owned()),
+                )
+            }
         } else {
             (ino, Cow::Borrowed(name))
         };
