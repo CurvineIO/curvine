@@ -138,10 +138,14 @@ impl FuseRequest {
                 FuseOperator::Init(Init { header, arg })
             }
 
-            FUSE_LOOKUP => FuseOperator::Lookup(Lookup {
-                header,
-                name: decoder.get_os_str()?,
-            }),
+            FUSE_LOOKUP => {
+                let name = decoder.get_os_str()?;
+                // A rename racing with dentry revalidation can leave bytes from the
+                // previous name after the first NUL. LOOKUP has exactly one name, so
+                // the first NUL remains its semantic boundary.
+                decoder.get_all()?;
+                FuseOperator::Lookup(Lookup { header, name })
+            }
 
             FUSE_ACCESS => FuseOperator::Access(Access {
                 header,
@@ -429,6 +433,27 @@ mod tests {
         let request = FuseRequest::from_bytes(request_bytes(&header, &[0])).unwrap();
         let err = request.parse_operator().unwrap_err();
         assert!(err.to_string().contains("Unexpected trailing request data"));
+    }
+
+    #[test]
+    fn lookup_uses_first_nul_terminated_name_when_rename_leaves_old_tail() {
+        let body = b"race-alt\0et\0";
+        let header = header(FUSE_LOOKUP, FUSE_IN_HEADER_LEN + body.len());
+        let request = FuseRequest::from_bytes(request_bytes(&header, body)).unwrap();
+
+        match request.parse_operator().unwrap() {
+            FuseOperator::Lookup(op) => assert_eq!(op.name, OsStr::new("race-alt")),
+            other => panic!("expected Lookup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lookup_still_requires_a_nul_terminated_name() {
+        let body = b"race-alt";
+        let header = header(FUSE_LOOKUP, FUSE_IN_HEADER_LEN + body.len());
+        let request = FuseRequest::from_bytes(request_bytes(&header, body)).unwrap();
+
+        assert!(request.parse_operator().is_err());
     }
 
     fn init_request(arg: &fuse_init_in, tail: Option<&fuse_init_in_ext_tail>) -> FuseRequest {
