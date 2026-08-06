@@ -320,7 +320,7 @@ async fn print_file_entry(
     config: &PrintConfig,
 ) -> CommonResult<()> {
     let file_type = if file.is_dir { "d" } else { "-" };
-    let permissions = crate::cmds::fs::common::format_permission(file.mode as u32);
+    let permissions = crate::cmds::fs::common::format_permission(file.mode);
     let replicas = if file.is_dir {
         "-"
     } else {

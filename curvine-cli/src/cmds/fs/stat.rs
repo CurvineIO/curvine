@@ -68,7 +68,7 @@ impl StatCommand {
                         println!(
                             "Permission: {}{}",
                             if status.is_dir { "d" } else { "-" },
-                            crate::cmds::fs::common::format_permission(status.mode as u32)
+                            crate::cmds::fs::common::format_permission(status.mode)
                         );
                         println!("Owner: {}", status.owner);
                         println!("Group: {}", status.group);
