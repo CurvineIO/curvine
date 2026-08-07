@@ -33,5 +33,6 @@ scripts/check-minimal-artifact-deps.sh --allow-rdma-spdk --artifact curvine-fuse
 ```
 
 Use `--allow-rdma-spdk` only for explicitly RDMA/SPDK-enabled client or FUSE
-artifacts. The default mode remains the guard for minimal/non-RDMA client
-artifacts.
+artifacts. It requires explicit `--artifact` arguments; the implicit default
+artifact set always stays strict. The default mode remains the guard for
+minimal/non-RDMA client artifacts.

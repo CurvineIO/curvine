@@ -13,7 +13,9 @@ the script checks known Curvine outputs in target/{debug,release} and
 build/dist/lib. Explicit artifacts must exist unless --allow-missing is set.
 
 Use --allow-rdma-spdk only for explicitly RDMA/SPDK-enabled client or FUSE
-artifacts; native UFS and storage-library checks remain enforced.
+artifacts, and only with explicit --artifact or PATH arguments. It is rejected
+for the implicit default artifact set; native UFS and storage-library checks
+remain enforced.
 EOF
 }
 
@@ -56,6 +58,12 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "$allow_rdma_spdk" -eq 1 && ${#artifact_specs[@]} -eq 0 ]]; then
+  echo "--allow-rdma-spdk requires explicit artifacts; refusing to relax the default minimal artifact set" >&2
+  usage >&2
+  exit 2
+fi
 
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
@@ -156,14 +164,14 @@ for spec in "${artifact_specs[@]}"; do
   fi
 
   if grep -E "$native_storage_pattern" <<<"$needed" >/dev/null; then
-    echo "FAIL [$label] native storage runtime dependency found in minimal client artifact: $artifact" >&2
+    echo "FAIL [$label] native storage runtime dependency found in client artifact: $artifact" >&2
     echo "$needed" | sed 's/^/  /' >&2
     failures=$((failures + 1))
     continue
   fi
 
   if grep -E "$native_ufs_pattern" <<<"$needed" >/dev/null; then
-    echo "FAIL [$label] native UFS runtime dependency found in minimal client artifact: $artifact" >&2
+    echo "FAIL [$label] native UFS runtime dependency found in client artifact: $artifact" >&2
     echo "$needed" | sed 's/^/  /' >&2
     failures=$((failures + 1))
     continue
