@@ -143,11 +143,16 @@ fn fuse_mount_sys(mnt: &Path, conf: &FuseConf) -> IOResult<RawIO> {
     conf.set_fuse_opts(&mut mount_options);
     // Set the FUSE subtype so /proc/mounts reports `type fuse.curvinefs` instead of the
     // generic `type fuse` (same mechanism sshfs uses for `fuse.sshfs`). `c_type` below
-    // stays "fuse" (the only registered kernel FUSE fs type); the kernel FUSE module
-    // parses `subtype=` from this mount data and sets sb->s_subtype, and the VFS then
-    // reports the type as `fuse.<subtype>`. Hardcoded to match the existing `curvinefs`
-    // source name above (c_source = "curvinefs").
-    mount_options.push_str(",subtype=curvinefs");
+    // stays "fuse" (the only registered kernel FUSE fs type); the Linux kernel FUSE
+    // module parses `subtype=` from this mount data and sets sb->s_subtype, and the VFS
+    // then reports the type as `fuse.<subtype>`. `subtype=` is a Linux-only FUSE
+    // mount-data option, so it is gated to Linux here to preserve the existing macOS
+    // mount data (macFUSE does not recognize this field). Hardcoded to match the
+    // existing `curvinefs` source name above (c_source = "curvinefs").
+    #[cfg(target_os = "linux")]
+    {
+        mount_options.push_str(",subtype=curvinefs");
+    }
     flags |= options_to_flag(mount_options.as_str());
     info!("sys-mount options: {}; flags: 0x{:x}", mount_options, flags);
 
