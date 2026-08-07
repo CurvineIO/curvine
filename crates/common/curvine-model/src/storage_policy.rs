@@ -77,6 +77,20 @@ impl StoragePolicy {
         self.ufs_mtime = 0;
     }
 
+    /// Drops an unusable Curvine cache copy while retaining the UFS source metadata.
+    ///
+    /// This is used when the master knows that every readable replica for a cache
+    /// block has been lost. Unlike `detach_ufs`, it deliberately preserves
+    /// `ufs_mtime` so the file can be re-admitted from its authoritative source.
+    pub fn invalidate_cache(&mut self) -> bool {
+        if !self.both_exists() {
+            return false;
+        }
+
+        self.state = StorageState::Ufs;
+        true
+    }
+
     pub fn free(&mut self) -> bool {
         match self.ttl_action {
             TtlAction::Free if self.both_exists() => {

@@ -202,6 +202,15 @@ impl InodeStore {
         Ok(())
     }
 
+    pub fn apply_cache_invalidations(&self, inodes: Vec<InodeView>) -> CommonResult<()> {
+        let mut batch = self.store.new_batch();
+        for inode in inodes {
+            batch.write_inode(&inode)?;
+        }
+        batch.commit()?;
+        Ok(())
+    }
+
     pub fn apply_rename(
         &self,
         src_parent: &InodeView,

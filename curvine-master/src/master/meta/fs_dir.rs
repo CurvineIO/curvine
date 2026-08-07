@@ -26,13 +26,13 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
-    FreeResult, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, WorkerAddress,
-    INTERNAL_CTIME_XATTR,
+    FreeResult, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, TtlAction,
+    WorkerAddress, INTERNAL_CTIME_XATTR,
 };
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::sync::AtomicCounter;
 use log::{debug, info, warn};
-use std::collections::{HashMap, LinkedList};
+use std::collections::{HashMap, HashSet, LinkedList};
 use std::mem;
 use std::sync::Arc;
 
@@ -46,6 +46,12 @@ pub struct FsDir {
     pub(crate) journal_writer: Arc<JournalWriter>,
     pub(crate) evictor: Arc<dyn Evictor>,
     pub(crate) op_id: AtomicCounter,
+}
+
+#[derive(Default)]
+pub(crate) struct CacheInvalidationResult {
+    pub delete_result: DeleteResult,
+    pub invalidated_block_ids: HashSet<i64>,
 }
 
 impl FsDir {
@@ -948,6 +954,63 @@ impl FsDir {
     pub fn delete_locations(&self, worker_id: u32) -> FsResult<Vec<i64>> {
         let block_ids = self.store.store.delete_locations(worker_id)?;
         Ok(block_ids)
+    }
+
+    /// Invalidate UFS-backed files whose cache is no longer readable after a
+    /// worker's locations are removed. A single missing block makes the whole
+    /// cache copy unusable, even when other blocks or replicas still exist.
+    ///
+    /// The returned locations belong to the discarded cache copies and should
+    /// be scheduled for deletion from any surviving workers.
+    pub(crate) fn invalidate_lost_cache_files(
+        &mut self,
+        block_ids: &[i64],
+    ) -> FsResult<CacheInvalidationResult> {
+        let inode_ids: HashSet<_> = block_ids.iter().map(|id| InodeId::get_id(*id)).collect();
+        let mut result = CacheInvalidationResult::default();
+        let mut changed_inodes = Vec::new();
+
+        for inode_id in inode_ids {
+            let Some(mut inode) = self.store.get_inode(inode_id, None)? else {
+                continue;
+            };
+            let File(file) = &mut inode else {
+                continue;
+            };
+
+            // Cache-mode load jobs use the Delete TTL action. Files in fs-mode
+            // use Free instead and retain their normal replica-recovery path.
+            if !file.storage_policy.both_exists()
+                || file.storage_policy.ttl_action != TtlAction::Delete
+            {
+                continue;
+            }
+
+            // `get_locs` purposefully omits empty location lists, so inspect
+            // each file block directly to find cache blocks with no replicas.
+            let mut cache_unreadable = false;
+            for block in &file.blocks {
+                if self.store.get_block_locations(block.id)?.is_empty() {
+                    cache_unreadable = true;
+                    break;
+                }
+            }
+            if !cache_unreadable {
+                continue;
+            }
+
+            let locations = file.get_locs(&self.store)?;
+            result
+                .invalidated_block_ids
+                .extend(file.blocks.iter().map(|block| block.id));
+            if file.invalidate_cache() {
+                result.delete_result.blocks.extend(locations);
+                changed_inodes.push(inode);
+            }
+        }
+
+        self.store.apply_cache_invalidations(changed_inodes)?;
+        Ok(result)
     }
 
     pub fn get_worker_block_ids(&self, worker_id: u32) -> FsResult<Vec<i64>> {

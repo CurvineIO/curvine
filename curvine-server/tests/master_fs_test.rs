@@ -565,6 +565,137 @@ fn full_block_report_reconcile_removes_stale_location_async() -> CommonResult<()
     );
 }
 
+fn create_ufs_backed_cache_file(
+    fs: &MasterFilesystem,
+    path: &str,
+    ttl_action: TtlAction,
+) -> CommonResult<(curvine_model::FileStatus, LocatedBlock)> {
+    let client = ClientAddress::default();
+    let status = fs.create_with_opts(
+        path,
+        CreateFileOptsBuilder::new().ttl_action(ttl_action).build(),
+        OpenFlags::new_create(),
+    )?;
+    let block = fs.add_block(path, None, client.clone(), vec![], vec![], 0, None)?;
+    fs.complete_file(
+        path,
+        None,
+        status.block_size,
+        vec![full_commit(&block, status.block_size)],
+        &client.client_name,
+        false,
+        None,
+    )?;
+    fs.set_attr(path, SetAttrOptsBuilder::new().ufs_mtime(12_345).build())?;
+
+    Ok((fs.file_status(path)?, block))
+}
+
+#[test]
+fn lost_worker_invalidates_unreadable_ufs_cache_but_preserves_source_metadata() -> CommonResult<()>
+{
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "lost-worker-cache-invalidation");
+    let path = "/cached-file";
+    let (before, block) = create_ufs_backed_cache_file(&fs, path, TtlAction::Delete)?;
+
+    assert!(before.cv_valid(None));
+    assert!(before.ufs_exists());
+
+    let cleanup = fs.delete_locations(block.locs[0].worker_id)?;
+
+    assert_eq!(cleanup.removed_block_ids, vec![block.block.id]);
+    assert!(cleanup.replication_block_ids.is_empty());
+
+    let after = fs.file_status(path)?;
+    assert!(!after.cv_exists());
+    assert!(after.ufs_exists());
+    assert!(!after.cv_valid(None));
+    assert_eq!(
+        after.storage_policy.ufs_mtime,
+        before.storage_policy.ufs_mtime
+    );
+    assert_eq!(after.len, before.len);
+
+    let blocks = fs.get_block_locations(path)?;
+    assert!(blocks.block_locs.is_empty());
+    Ok(())
+}
+
+#[test]
+fn lost_worker_keeps_cache_valid_when_a_replica_survives() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "lost-worker-cache-surviving-replica");
+    let path = "/cached-file";
+    let (_, block) = create_ufs_backed_cache_file(&fs, path, TtlAction::Delete)?;
+
+    let mut replica_worker = WorkerInfo::default();
+    replica_worker.address.worker_id = 101;
+    fs.add_test_worker(replica_worker);
+    fs.fs_dir
+        .read()
+        .add_block_location(block.block.id, BlockLocation::with_id(101))?;
+
+    let cleanup = fs.delete_locations(block.locs[0].worker_id)?;
+
+    assert_eq!(cleanup.removed_block_ids, vec![block.block.id]);
+    assert_eq!(cleanup.replication_block_ids, vec![block.block.id]);
+
+    let after = fs.file_status(path)?;
+    assert!(after.cv_valid(None));
+    let blocks = fs.get_block_locations(path)?;
+    assert_eq!(blocks.block_locs.len(), 1);
+    assert_eq!(blocks.block_locs[0].locs[0].worker_id, 101);
+    Ok(())
+}
+
+#[test]
+fn lost_worker_keeps_ufs_backed_fs_mode_file_for_replica_recovery() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "lost-worker-fs-mode-replica-recovery");
+    let path = "/ufs-backed-file";
+    let (before, block) = create_ufs_backed_cache_file(&fs, path, TtlAction::Free)?;
+
+    let cleanup = fs.delete_locations(block.locs[0].worker_id)?;
+
+    assert_eq!(cleanup.removed_block_ids, vec![block.block.id]);
+    assert_eq!(cleanup.replication_block_ids, vec![block.block.id]);
+
+    let after = fs.file_status(path)?;
+    assert_eq!(after.storage_policy.state, before.storage_policy.state);
+    assert!(after.cv_valid(None));
+    Ok(())
+}
+
+#[test]
+fn lost_worker_does_not_invalidate_curvine_only_file() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "lost-worker-curvine-only");
+    let path = "/curvine-only";
+    let client = ClientAddress::default();
+    let status = fs.create(path, false)?;
+    let block = fs.add_block(path, None, client.clone(), vec![], vec![], 0, None)?;
+    fs.complete_file(
+        path,
+        None,
+        status.block_size,
+        vec![full_commit(&block, status.block_size)],
+        &client.client_name,
+        false,
+        None,
+    )?;
+
+    let cleanup = fs.delete_locations(block.locs[0].worker_id)?;
+
+    assert_eq!(cleanup.removed_block_ids, vec![block.block.id]);
+    assert_eq!(cleanup.replication_block_ids, vec![block.block.id]);
+
+    let after = fs.file_status(path)?;
+    assert!(after.cv_exists());
+    assert!(!after.ufs_exists());
+    Ok(())
+}
+
 #[test]
 fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResult<()> {
     let _serial = master_fs_test_serial();

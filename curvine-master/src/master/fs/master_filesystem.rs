@@ -80,6 +80,12 @@ pub struct BlockReportResult {
     pub delete_blocks: Vec<i64>,
 }
 
+#[derive(Default)]
+pub struct LostWorkerLocationCleanup {
+    pub removed_block_ids: Vec<i64>,
+    pub replication_block_ids: Vec<i64>,
+}
+
 pub(crate) enum BlockInodeState {
     File,
     Missing,
@@ -1557,9 +1563,27 @@ impl MasterFilesystem {
             .unwrap_or(false)
     }
 
-    pub fn delete_locations(&self, worker_id: u32) -> FsResult<Vec<i64>> {
-        let fs_dir = self.fs_dir.write();
-        fs_dir.delete_locations(worker_id)
+    pub fn delete_locations(&self, worker_id: u32) -> FsResult<LostWorkerLocationCleanup> {
+        let mut fs_dir = self.fs_dir.write();
+        let removed_block_ids = fs_dir.delete_locations(worker_id)?;
+        let invalidated = fs_dir.invalidate_lost_cache_files(&removed_block_ids)?;
+        let replication_block_ids = removed_block_ids
+            .iter()
+            .copied()
+            .filter(|block_id| !invalidated.invalidated_block_ids.contains(block_id))
+            .collect();
+        drop(fs_dir);
+
+        if !invalidated.delete_result.blocks.is_empty() {
+            self.worker_manager
+                .write()
+                .remove_blocks(&invalidated.delete_result);
+        }
+
+        Ok(LostWorkerLocationCleanup {
+            removed_block_ids,
+            replication_block_ids,
+        })
     }
 
     pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {

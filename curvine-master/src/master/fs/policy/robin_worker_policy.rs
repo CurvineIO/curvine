@@ -50,7 +50,9 @@ impl WorkerPolicy for RobinWorkerPolicy {
             return err_box!("The number of replicas cannot be 0");
         }
 
-        let start_index = self.index.get();
+        // Worker membership can shrink between selections. Normalize the
+        // remembered cursor before indexing into the current worker set.
+        let start_index = self.index.get() % workers.len();
         let mut index = start_index;
         let mut res = vec![];
 
@@ -79,5 +81,41 @@ impl WorkerPolicy for RobinWorkerPolicy {
 
         self.index.set(index);
         Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn worker(id: u32) -> WorkerInfo {
+        let mut worker = WorkerInfo::default();
+        worker.address.worker_id = id;
+        worker
+    }
+
+    #[test]
+    fn choose_wraps_cursor_after_worker_removal() {
+        let policy = RobinWorkerPolicy::new();
+        let mut workers = IndexMap::new();
+        workers.insert(1, worker(1));
+        workers.insert(2, worker(2));
+
+        assert_eq!(
+            policy
+                .choose(&workers, ChooseContext::with_num(1, 0, vec![]))
+                .unwrap()[0]
+                .worker_id,
+            1
+        );
+
+        workers.shift_remove(&1);
+        assert_eq!(
+            policy
+                .choose(&workers, ChooseContext::with_num(1, 0, vec![]))
+                .unwrap()[0]
+                .worker_id,
+            2
+        );
     }
 }

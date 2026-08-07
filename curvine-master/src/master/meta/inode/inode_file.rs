@@ -366,6 +366,18 @@ impl InodeFile {
         }
     }
 
+    /// Invalidates the Curvine cache copy of a UFS-backed file without
+    /// detaching its source metadata. The next cache-mode read can then use
+    /// the normal UFS cache-miss path to load a replacement copy.
+    pub fn invalidate_cache(&mut self) -> bool {
+        if self.storage_policy.invalidate_cache() {
+            self.blocks.clear();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Search for block by file position
     /// Returns the block reference if found
     pub fn search_block_mut_by_pos(&mut self, file_pos: i64) -> Option<&mut BlockMeta> {

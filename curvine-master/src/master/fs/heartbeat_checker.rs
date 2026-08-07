@@ -104,15 +104,16 @@ impl LoopTask for HeartbeatChecker {
             let rm = self.replication_manager.clone();
             let res = self.executor.spawn(move || {
                 let spend = TimeSpent::new();
-                let block_ids = match fs.delete_locations(id) {
+                let cleanup = match fs.delete_locations(id) {
                     Err(e) => {
                         warn!("{}", curvine_core_error::err_msg!(e));
-                        vec![]
+                        Default::default()
                     }
                     Ok(res) => res,
                 };
-                let block_num = block_ids.len();
-                if let Err(e) = rm.report_under_replicated_blocks(id, block_ids) {
+                let block_num = cleanup.removed_block_ids.len();
+                if let Err(e) = rm.report_under_replicated_blocks(id, cleanup.replication_block_ids)
+                {
                     error!(
                         "Errors on reporting under-replicated {} blocks. err: {:?}",
                         block_num, e
