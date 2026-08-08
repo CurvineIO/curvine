@@ -1,10 +1,13 @@
 use clap::Subcommand;
 use curvine_core_error::CommonResult;
 use curvine_fs_api::{CurvineURI, FileSystem, Writer};
+use curvine_model::OpenFlags;
 use curvine_unified_fs::UnifiedFileSystem;
 use std::path::PathBuf;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, BufReader};
+
+use super::common::current_process_acl;
 
 #[derive(Subcommand, Debug)]
 pub enum PutCommand {
@@ -109,7 +112,17 @@ impl PutCommand {
                 };
 
                 // Create writer for streaming upload
-                match client.create(&remote_uri, true).await {
+                let (uid, gid, mode) = current_process_acl(&client);
+                let opts = client
+                    .cv()
+                    .create_opts_builder()
+                    .create_parent(true)
+                    .acl(uid, gid, mode)
+                    .build();
+                let flags = OpenFlags::new_write_only()
+                    .set_create(true)
+                    .set_overwrite(true);
+                match client.open_with_opts(&remote_uri, opts, flags).await {
                     Ok(mut writer) => {
                         let chunk_size = client.conf().client.write_chunk_size;
                         let mut buffer = vec![0; chunk_size];

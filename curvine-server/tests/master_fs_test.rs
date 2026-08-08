@@ -950,6 +950,55 @@ fn create_file_inherits_setgid_parent_group() -> CommonResult<()> {
     Ok(())
 }
 
+#[test]
+fn mkdir_recursive_parents_persist_owner_group() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "mkdir-recursive-owner-group");
+
+    let opts = MkdirOptsBuilder::new()
+        .create_parent(true)
+        .owner("cli-owner".to_string())
+        .group("cli-group".to_string())
+        .build();
+    fs.mkdir_with_opts("/owner/parent/child", opts)?;
+
+    for path in ["/owner", "/owner/parent", "/owner/parent/child"] {
+        let status = fs.file_status(path)?;
+        assert_eq!("cli-owner", status.owner);
+        assert_eq!("cli-group", status.group);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn create_file_recursive_parents_persist_owner_group() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "create-file-recursive-owner-group");
+
+    let opts = CreateFileOptsBuilder::new()
+        .create_parent(true)
+        .owner("cli-owner".to_string())
+        .group("cli-group".to_string())
+        .build();
+    fs.create_with_opts(
+        "/owner/parent/file",
+        opts,
+        OpenFlags::new_create().set_overwrite(true),
+    )?;
+
+    for path in ["/owner", "/owner/parent"] {
+        let status = fs.file_status(path)?;
+        assert_eq!("cli-owner", status.owner);
+        assert_eq!("cli-group", status.group);
+    }
+    let file_status = fs.file_status("/owner/parent/file")?;
+    assert_eq!("cli-owner", file_status.owner);
+    assert_eq!("cli-group", file_status.group);
+
+    Ok(())
+}
+
 fn delete(fs: &MasterFilesystem) -> CommonResult<()> {
     let res1 = fs.delete("/a", false);
     assert!(res1.is_err());
