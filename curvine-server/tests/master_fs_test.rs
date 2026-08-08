@@ -623,6 +623,40 @@ fn lost_worker_invalidates_unreadable_ufs_cache_but_preserves_source_metadata() 
 }
 
 #[test]
+fn lost_worker_cache_invalidation_replays_on_follower() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (leader, journal_system, loader, _follower_journal_system, follower) =
+        setup_pair("lost-worker-cache-invalidation");
+    let path = "/cached-file";
+    let (_, block) = create_ufs_backed_cache_file(&leader, path, TtlAction::Delete)?;
+
+    let cleanup = leader.delete_locations(block.locs[0].worker_id)?;
+    assert!(cleanup.replication_block_ids.is_empty());
+
+    let entries = journal_system.fs().fs_dir.read().take_entries();
+    assert!(entries
+        .iter()
+        .any(|entry| matches!(entry, JournalEntry::CacheInvalidation(_))));
+    apply_entries(&loader, &entries, 1)?;
+
+    let leader_status = leader.file_status(path)?;
+    let follower_status = follower.file_status(path)?;
+    assert_eq!(
+        follower_status.storage_policy.state,
+        leader_status.storage_policy.state
+    );
+    assert_eq!(
+        follower_status.storage_policy.ufs_mtime,
+        leader_status.storage_policy.ufs_mtime
+    );
+    assert_eq!(follower_status.len, leader_status.len);
+    assert!(!follower_status.cv_valid(None));
+    assert!(follower_status.ufs_exists());
+    assert!(follower.get_block_locations(path)?.block_locs.is_empty());
+    Ok(())
+}
+
+#[test]
 fn lost_worker_keeps_cache_valid_when_a_replica_survives() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let fs = new_fs(true, "lost-worker-cache-surviving-replica");

@@ -267,6 +267,23 @@ impl JournalWriter {
         self.send(fs_dir, JournalEntry::Free(entry))
     }
 
+    pub fn log_cache_invalidations(
+        &self,
+        fs_dir: &FsDir,
+        inodes: Vec<crate::master::meta::inode::InodeView>,
+    ) -> FsResult<()> {
+        if inodes.is_empty() {
+            return Ok(());
+        }
+
+        let entry = CacheInvalidationEntry {
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
+            inodes,
+        };
+        self.send(fs_dir, JournalEntry::CacheInvalidation(entry))
+    }
+
     pub fn log_mount(&self, fs_dir: &FsDir, info: MountInfo) -> FsResult<()> {
         let entry = MountEntry {
             op_id: fs_dir.next_op_id(),

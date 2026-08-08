@@ -249,7 +249,7 @@ impl JournalLoader {
                     continue;
                 }
 
-                JournalEntry::UfsApplied(_) => (),
+                JournalEntry::CacheInvalidation(_) | JournalEntry::UfsApplied(_) => (),
 
                 _ => has_ufs_affecting = true,
             }
@@ -565,6 +565,8 @@ impl JournalLoader {
 
             JournalEntry::Free(e) => self.free(e),
 
+            JournalEntry::CacheInvalidation(e) => self.cache_invalidation(e),
+
             JournalEntry::ReopenFile(e) => self.reopen_file(e),
 
             JournalEntry::Mount(e) => self.mount(e),
@@ -583,6 +585,11 @@ impl JournalLoader {
 
             _ => Ok(()),
         }
+    }
+
+    fn cache_invalidation(&self, entry: CacheInvalidationEntry) -> CommonResult<()> {
+        let fs_dir = self.fs_dir.write();
+        fs_dir.store.apply_cache_invalidations(entry.inodes)
     }
 
     fn mkdir(&self, entry: MkdirEntry) -> CommonResult<()> {

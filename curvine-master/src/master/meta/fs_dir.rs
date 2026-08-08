@@ -54,6 +54,21 @@ pub(crate) struct CacheInvalidationResult {
     pub invalidated_block_ids: HashSet<i64>,
 }
 
+impl CacheInvalidationResult {
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.delete_result.inodes += other.delete_result.inodes;
+        for (block_id, locations) in other.delete_result.blocks {
+            self.delete_result
+                .blocks
+                .entry(block_id)
+                .or_default()
+                .extend(locations);
+        }
+        self.invalidated_block_ids
+            .extend(other.invalidated_block_ids);
+    }
+}
+
 impl FsDir {
     pub fn new(
         conf: &ClusterConf,
@@ -1009,7 +1024,10 @@ impl FsDir {
             }
         }
 
+        let journal_inodes = changed_inodes.clone();
         self.store.apply_cache_invalidations(changed_inodes)?;
+        self.journal_writer
+            .log_cache_invalidations(self, journal_inodes)?;
         Ok(result)
     }
 

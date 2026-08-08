@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::meta::inode::{InodeDir, InodeFile};
+use crate::master::meta::inode::{InodeDir, InodeFile, InodeView};
 use crate::master::meta::BlockMeta;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::{CommitBlock, FileLock, MountInfo, SetAttrOpts};
@@ -166,6 +166,16 @@ pub struct FreeEntry {
     pub(crate) recursive: bool,
 }
 
+/// Clears an unusable Curvine cache copy while preserving the file's UFS
+/// metadata. The full inode metadata is recorded so followers can apply the
+/// same state transition without consulting their potentially stale locations.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct CacheInvalidationEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) inodes: Vec<InodeView>,
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct UfsAppliedEntry {
     pub(crate) op_id: u64,
@@ -201,6 +211,8 @@ pub enum JournalEntry {
     Free(FreeEntry),
     UfsApplied(UfsAppliedEntry),
     Snapshot(SnapshotEntry),
+    // Keep new variants appended so existing journal discriminants remain stable.
+    CacheInvalidation(CacheInvalidationEntry),
 }
 
 impl JournalEntry {
@@ -221,6 +233,7 @@ impl JournalEntry {
             JournalEntry::Link(e) => e.op_id,
             JournalEntry::SetLocks(e) => e.op_id,
             JournalEntry::Free(e) => e.op_id,
+            JournalEntry::CacheInvalidation(e) => e.op_id,
             JournalEntry::UfsApplied(e) => e.op_id,
             JournalEntry::Snapshot(e) => e.op_id,
         }
@@ -243,6 +256,7 @@ impl JournalEntry {
             JournalEntry::Link(e) => e.rpc_id,
             JournalEntry::SetLocks(e) => e.rpc_id,
             JournalEntry::Free(e) => e.rpc_id,
+            JournalEntry::CacheInvalidation(e) => e.rpc_id,
             JournalEntry::UfsApplied(e) => e.rpc_id,
             JournalEntry::Snapshot(e) => e.rpc_id,
         }
@@ -284,6 +298,7 @@ impl JournalEntry {
             JournalEntry::Mount(_)
             | JournalEntry::UnMount(_)
             | JournalEntry::SetLocks(_)
+            | JournalEntry::CacheInvalidation(_)
             | JournalEntry::UfsApplied(_)
             | JournalEntry::Snapshot(_) => Vec::new(),
         }

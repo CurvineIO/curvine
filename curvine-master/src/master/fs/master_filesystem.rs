@@ -16,7 +16,7 @@ use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
-use crate::master::meta::FsDir;
+use crate::master::meta::{CacheInvalidationResult, FsDir};
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
@@ -134,6 +134,8 @@ const FULL_BLOCK_RECONCILE_QUEUE_SIZE: usize = 128;
 impl MasterFilesystem {
     // Max block-report location updates applied under a single fs_dir write lock.
     const BLOCK_REPORT_WRITE_CHUNK: usize = 4096;
+    // Max lost-worker block ids inspected under a single fs_dir write lock.
+    const LOST_WORKER_INVALIDATION_CHUNK: usize = Self::BLOCK_REPORT_WRITE_CHUNK;
 
     fn validate_alloc_capacity(
         current_len: i64,
@@ -1564,15 +1566,34 @@ impl MasterFilesystem {
     }
 
     pub fn delete_locations(&self, worker_id: u32) -> FsResult<LostWorkerLocationCleanup> {
-        let mut fs_dir = self.fs_dir.write();
-        let removed_block_ids = fs_dir.delete_locations(worker_id)?;
-        let invalidated = fs_dir.invalidate_lost_cache_files(&removed_block_ids)?;
+        let removed_block_ids = {
+            let fs_dir = self.fs_dir.write();
+            fs_dir.delete_locations(worker_id)?
+        };
+        let mut invalidated = CacheInvalidationResult::default();
+
+        for chunk in removed_block_ids.chunks(Self::LOST_WORKER_INVALIDATION_CHUNK) {
+            let result = {
+                let mut fs_dir = self.fs_dir.write();
+                fs_dir.invalidate_lost_cache_files(chunk)
+            };
+            match result {
+                Ok(result) => invalidated.extend(result),
+                Err(e) => warn!(
+                    "failed to invalidate lost cache files for worker {} ({} block ids); \\
+                     continuing with normal replica recovery: {}",
+                    worker_id,
+                    chunk.len(),
+                    e
+                ),
+            }
+        }
+
         let replication_block_ids = removed_block_ids
             .iter()
             .copied()
             .filter(|block_id| !invalidated.invalidated_block_ids.contains(block_id))
             .collect();
-        drop(fs_dir);
 
         if !invalidated.delete_result.blocks.is_empty() {
             self.worker_manager
