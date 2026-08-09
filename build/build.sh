@@ -23,6 +23,9 @@ set -e
 # ./build release, release mode.
 FS_HOME="$(cd "`dirname "$0"`/.."; pwd)"
 
+# Shared version helpers used by build packaging and by version tests.
+source "$FS_HOME/build/version.sh"
+
 # Check if cargo is available
 if ! command -v cargo &> /dev/null; then
     echo "Error: cargo is not installed or not in PATH" >&2
@@ -136,6 +139,7 @@ print_help() {
   echo "  --skip-java-sdk        Skip Java SDK compilation (useful for Docker builds)"
   echo "  --skip-python-sdk      Skip Python SDK compilation (useful for Docker builds)"
   echo "  -h, --help            Show this help message"
+  echo "  BUILD_VERSION=<ver>   Override the package version used for artifacts and build-version"
   echo
   echo "Examples:"
   echo "  $0                                      # Build all packages in release mode with opendal-s3"
@@ -164,7 +168,7 @@ fi
 ARCH_NAME=$(get_arch_name)
 OS_VERSION=$(get_os_version)
 FUSE_VERSION=$(get_fuse_version)
-CURVINE_VERSION=$(grep '^version =' "$FS_HOME/Cargo.toml" | sed 's/^version = "\(.*\)"/\1/')
+CURVINE_VERSION=$(get_build_version "$FS_HOME/Cargo.toml")
 
 # Package Directory
 DIST_DIR="$FS_HOME/build/dist"

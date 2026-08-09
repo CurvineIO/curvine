@@ -14,3 +14,23 @@
 
 // Include the version constants generated at build time
 include!(concat!(env!("OUT_DIR"), "/version.rs"));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_constants_are_available() {
+        assert!(!PKG_VERSION.is_empty());
+        assert!(!GIT_VERSION.is_empty());
+        assert!(!VERSION.is_empty());
+    }
+
+    #[test]
+    fn build_version_override_is_honored_when_set() {
+        if let Ok(build_version) = std::env::var("BUILD_VERSION") {
+            assert_eq!(PKG_VERSION, build_version);
+            assert_eq!(VERSION, build_version);
+        }
+    }
+}

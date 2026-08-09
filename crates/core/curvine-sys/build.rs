@@ -18,11 +18,15 @@ use std::{env, fs, str};
 
 fn main() {
     emit_git_rerun_if_changed();
+    println!("cargo:rerun-if-env-changed=BUILD_VERSION");
 
     let base = env::var("OUT_DIR").unwrap_or_else(|_| ".".to_string());
     let ver_file = format!("{}/version.rs", base);
     let commit = get_git_head_commit();
-    let pkg_version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_string());
+    let build_version = env::var("BUILD_VERSION").ok().filter(|v| !v.is_empty());
+    let pkg_version = build_version
+        .clone()
+        .unwrap_or_else(|| env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_string()));
     let git_tag = get_git_tag();
     let git_branch = get_git_branch();
 
@@ -36,7 +40,9 @@ fn main() {
     };
 
     // Build full version string
-    let full_version = if !source_info.is_empty() {
+    let full_version = if let Some(build_version) = build_version {
+        build_version
+    } else if !source_info.is_empty() {
         format!("{} (commit: {}, {})", pkg_version, commit, source_info)
     } else {
         format!("{} (commit: {})", pkg_version, commit)
@@ -46,7 +52,7 @@ fn main() {
         r#"/// Git commit ID (short)
 pub static GIT_VERSION: &str = "{}";
 
-/// Package version from Cargo.toml
+/// Package version from Cargo.toml, or BUILD_VERSION when provided
 pub static PKG_VERSION: &str = "{}";
 
 /// Git tag (if built from a tag)
@@ -55,7 +61,7 @@ pub static GIT_TAG: &str = "{}";
 /// Git branch (if not built from a tag)
 pub static GIT_BRANCH: &str = "{}";
 
-/// Full version string: "version (commit: commit-id, tag/branch: name)"
+/// Full version string. BUILD_VERSION overrides the package-derived string.
 pub static VERSION: &str = "{}";
 "#,
         commit, pkg_version, git_tag, git_branch, full_version
