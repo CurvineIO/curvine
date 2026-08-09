@@ -111,12 +111,12 @@ impl LoopTask for HeartbeatChecker {
                     }
                     Ok(res) => res,
                 };
-                let block_num = cleanup.removed_block_ids.len();
+                let replication_block_num = cleanup.replication_block_ids.len();
                 if let Err(e) = rm.report_under_replicated_blocks(id, cleanup.replication_block_ids)
                 {
                     error!(
                         "Errors on reporting under-replicated {} blocks. err: {:?}",
-                        block_num, e
+                        replication_block_num, e
                     );
                 }
                 info!(
