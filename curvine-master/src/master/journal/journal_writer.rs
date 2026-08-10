@@ -24,10 +24,10 @@ use curvine_error::FsResult;
 use curvine_model::{CommitBlock, FileLock, MountInfo, RenameFlags, SetAttrOpts};
 use curvine_raft::conf::JournalConfExt;
 use curvine_raft::raft::RaftClient;
-use curvine_runtime::common::LocalTime;
+use curvine_runtime::common::{FileUtils, LocalTime};
 use curvine_runtime::sync::channel::{BlockingChannel, BlockingReceiver, BlockingSender};
 use curvine_runtime::sync::AtomicCounter;
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
@@ -129,12 +129,23 @@ impl JournalWriter {
             fs_dir.inode_id.current()
         );
 
-        self.send_inner(JournalEntry::Snapshot(SnapshotEntry {
+        let snapshot_entry = JournalEntry::Snapshot(SnapshotEntry {
             op_id: fs_dir.next_op_id(),
             rpc_id: 0,
             node_id: self.node_id,
-            dir,
-        }))?;
+            dir: dir.clone(),
+        });
+
+        if let Err(send_error) = self.send_inner(snapshot_entry) {
+            if let Err(cleanup_error) = FileUtils::delete_path(&dir, true) {
+                warn!(
+                    "failed to remove checkpoint {} after snapshot entry send failure: {}",
+                    dir, cleanup_error
+                );
+            }
+
+            return Err(send_error);
+        }
         Ok(())
     }
 
@@ -435,5 +446,128 @@ impl MetadataDeltaLog {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::master::meta::inode::ttl::TtlBucketList;
+    use crate::master::quota::eviction::evictor::{Evictor, LRUEvictor};
+    use crate::master::quota::eviction::EvictionConf;
+    use curvine_config::ClusterConf;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn test_conf(name: &str) -> ClusterConf {
+        let mut conf = ClusterConf {
+            testing: true,
+            format_master: true,
+            journal: JournalConf {
+                enable: true,
+                snapshot_entries: 1,
+                writer_channel_size: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        conf.change_test_meta_dir(name);
+        conf
+    }
+
+    fn build_writer(conf: &ClusterConf) -> FsResult<JournalWriter> {
+        Master::init_test_metrics();
+
+        let rt = conf.journal.create_runtime();
+        let client = RaftClient::from_conf(rt, &conf.journal);
+        JournalWriter::new(true, client, &conf.journal)
+    }
+
+    fn build_fs_dir(conf: &ClusterConf, writer: Arc<JournalWriter>) -> FsResult<FsDir> {
+        let ttl_bucket_list = Arc::new(TtlBucketList::new(
+            conf.master.ttl_bucket_interval_ms() as i64
+        )?);
+
+        let eviction_conf = EvictionConf::from_conf(conf);
+        let evictor: Arc<dyn Evictor> = Arc::new(LRUEvictor::new(eviction_conf));
+
+        FsDir::new(conf, writer, ttl_bucket_list, evictor)
+    }
+
+    fn checkpoint_dirs(conf: &ClusterConf) -> Vec<PathBuf> {
+        let db_conf = conf.db_conf();
+        let checkpoint_dir = Path::new(&db_conf.checkpoint_dir);
+
+        if !checkpoint_dir.exists() {
+            return Vec::new();
+        }
+
+        fs::read_dir(checkpoint_dir)
+            .expect("failed to read checkpoint directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect()
+    }
+
+    #[test]
+    fn removes_checkpoint_when_snapshot_enqueue_fails() -> FsResult<()> {
+        let conf = test_conf("snapshot_enqueue_failure");
+        let mut writer = build_writer(&conf)?;
+
+        // The testing writer retains the only receiver. Dropping it makes
+        // std::sync::mpsc::Sender::send return an error before handoff.
+        let receiver = writer
+            .receiver
+            .take()
+            .expect("testing writer should retain its receiver");
+        drop(receiver);
+
+        let writer = Arc::new(writer);
+        let fs_dir = build_fs_dir(&conf, writer.clone())?;
+
+        let result = writer.maybe_emit_snapshot(&fs_dir);
+        assert!(result.is_err(), "snapshot enqueue should fail");
+
+        let checkpoints = checkpoint_dirs(&conf);
+        assert!(
+            checkpoints.is_empty(),
+            "checkpoint should be removed after enqueue failure: {:?}",
+            checkpoints
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn keeps_checkpoint_when_snapshot_enqueue_succeeds() -> FsResult<()> {
+        let conf = test_conf("snapshot_enqueue_success");
+        let writer = Arc::new(build_writer(&conf)?);
+        let fs_dir = build_fs_dir(&conf, writer.clone())?;
+
+        writer.maybe_emit_snapshot(&fs_dir)?;
+
+        let entry = writer
+            .receiver
+            .as_ref()
+            .expect("testing writer should retain its receiver")
+            .lock()
+            .expect("testing receiver lock should not be poisoned")
+            .recv_timeout(Duration::from_secs(1))
+            .expect("snapshot entry should be enqueued");
+
+        match entry {
+            JournalEntry::Snapshot(entry) => {
+                assert!(
+                    Path::new(&entry.dir).exists(),
+                    "checkpoint should remain after successful handoff: {}",
+                    entry.dir
+                );
+            }
+            other => panic!("expected snapshot entry, got {:?}", other),
+        }
+
+        Ok(())
     }
 }
