@@ -12,6 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Linux-only pure FUSE mount/unmount implementation.
+//!
+//! This module talks to the kernel directly via `libc::mount` / `libc::umount2`
+//! (with a `fusermount` fallback for unmount). It has no macOS/BSD code path and
+//! is not designed to compile off Linux, so the whole module is gated to
+//! `target_os = "linux"` in `raw/mod.rs`. Because of that outer gate, the code
+//! below can use Linux-specific APIs unconditionally without per-item `#[cfg]`.
+
 use curvine_config::FuseConf;
 use curvine_io::{IOError, IOResult};
 use curvine_sys::RawIO;
@@ -20,6 +28,7 @@ use nix::unistd::{getgid, getuid};
 use std::ffi::CString;
 use std::fs::File;
 use std::io::ErrorKind;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::path::Path;
 
@@ -30,6 +39,23 @@ use curvine_sys::open;
 
 const FUSERMOUNT_BIN: &str = "fusermount";
 const FUSERMOUNT3_BIN: &str = "fusermount3";
+
+// Convert a filesystem path into a NUL-terminated C string without assuming the
+// path is valid UTF-8. Unix paths are arbitrary byte sequences, so we read the
+// raw bytes via `OsStrExt::as_bytes` instead of `Path::to_str().unwrap()`, which
+// would panic on non-UTF-8 paths. An embedded NUL byte is reported as a normal
+// error (via `NulError` -> `IOError`) rather than aborting the process.
+fn path_to_cstring(mnt: &Path) -> IOResult<CString> {
+    CString::new(mnt.as_os_str().as_bytes()).map_err(|e| {
+        IOError::with_ctx(
+            std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("mount path {:?} contains an embedded NUL byte: {}", mnt, e),
+            ),
+            format!("({}:{})", file!(), line!()),
+        )
+    })
+}
 
 // Check whether a mount option exists as a standalone key (not a substring).
 // For example, "ro" should match token "ro" but NOT "rootmode=...".
@@ -44,7 +70,6 @@ fn has_mount_opt(options: &str, key: &str) -> bool {
     })
 }
 
-#[cfg(target_os = "linux")]
 pub fn options_to_flag(mount_option: &str) -> libc::c_ulong {
     let mut flags = 0;
     if has_mount_opt(mount_option, "ro") {
@@ -72,32 +97,6 @@ pub fn options_to_flag(mount_option: &str) -> libc::c_ulong {
     flags
 }
 
-#[cfg(target_os = "macos")]
-pub fn options_to_flag(mount_option: &str) -> libc::c_long {
-    let mut flags: i32 = 0;
-    if has_mount_opt(mount_option, "ro") {
-        flags |= libc::MNT_RDONLY;
-    }
-    if has_mount_opt(mount_option, "nodev") {
-        flags |= libc::MNT_NODEV;
-    }
-    if has_mount_opt(mount_option, "nosuid") {
-        flags |= libc::MNT_NOSUID;
-    }
-    if has_mount_opt(mount_option, "noexec") {
-        flags |= libc::MNT_NOEXEC;
-    }
-    if has_mount_opt(mount_option, "noatime") {
-        flags |= libc::MNT_NOATIME;
-    }
-    // MNT_DIRSYNC is not available on macOS, skip it
-    if has_mount_opt(mount_option, "sync") {
-        flags |= libc::MNT_SYNCHRONOUS;
-    }
-
-    flags as libc::c_long
-}
-
 pub fn fuse_mount_pure(mnt: &Path, conf: &FuseConf) -> IOResult<RawIO> {
     if conf.auto_umount() {
         // TODO: handle auto umount
@@ -107,8 +106,13 @@ pub fn fuse_mount_pure(mnt: &Path, conf: &FuseConf) -> IOResult<RawIO> {
         Ok(fd) => Ok(fd),
         Err(e) => {
             error!("fuse mount sys failed; path {:?}, err {:?}", mnt, e);
+            // Preserve the original mount error captured by `fuse_mount_sys`
+            // (e.g. the real EACCES/ENOENT/EBUSY errno). Do NOT re-read
+            // `std::io::Error::last_os_error()` here: intervening operations
+            // such as logging can clobber `errno`, turning a specific mount
+            // failure into a generic error and losing useful diagnostics.
             Err(IOError::with_ctx(
-                std::io::Error::last_os_error(),
+                e.into_raw(),
                 format!("({}:{})", file!(), line!()),
             ))
         }
@@ -141,48 +145,30 @@ fn fuse_mount_sys(mnt: &Path, conf: &FuseConf) -> IOResult<RawIO> {
         getgid()
     );
     conf.set_fuse_opts(&mut mount_options);
-    // Set the FUSE subtype so /proc/mounts reports `type fuse.curvinefs` instead of the
-    // generic `type fuse` (same mechanism sshfs uses for `fuse.sshfs`). `c_type` below
-    // stays "fuse" (the only registered kernel FUSE fs type); the Linux kernel FUSE
-    // module parses `subtype=` from this mount data and sets sb->s_subtype, and the VFS
-    // then reports the type as `fuse.<subtype>`. `subtype=` is a Linux-only FUSE
-    // mount-data option, so it is gated to Linux here to preserve the existing macOS
-    // mount data (macFUSE does not recognize this field). Hardcoded to match the
-    // existing `curvinefs` source name above (c_source = "curvinefs").
-    #[cfg(target_os = "linux")]
-    {
-        mount_options.push_str(",subtype=curvinefs");
-    }
+    // Set the FUSE subtype so /proc/mounts reports `type fuse.curvinefs` instead of
+    // the generic `type fuse` (same mechanism sshfs uses for `fuse.sshfs`). `c_type`
+    // below stays "fuse" (the only registered kernel FUSE fs type); the Linux kernel
+    // FUSE module parses `subtype=` from this mount data and sets sb->s_subtype, and
+    // the VFS then reports the type as `fuse.<subtype>`. Hardcoded to match the source
+    // name above (c_source = "curvinefs").
+    mount_options.push_str(",subtype=curvinefs");
     flags |= options_to_flag(mount_options.as_str());
     info!("sys-mount options: {}; flags: 0x{:x}", mount_options, flags);
 
     // Default name is "/dev/fuse", then use the subtype, and lastly prefer the name
     let c_source = CString::new("curvinefs").unwrap();
-    let c_mountpoint = CString::new(mnt.to_str().unwrap()).unwrap();
+    let c_mountpoint = path_to_cstring(mnt)?;
 
     let result = unsafe {
-        #[cfg(target_os = "linux")]
-        {
-            let c_options = CString::new(mount_options.clone()).unwrap();
-            let c_type = CString::new("fuse").unwrap();
-            libc::mount(
-                c_source.as_ptr(),
-                c_mountpoint.as_ptr(),
-                c_type.as_ptr(),
-                flags,
-                c_options.as_ptr() as *const libc::c_void,
-            )
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let c_options = CString::new(mount_options).unwrap();
-            libc::mount(
-                c_source.as_ptr(),
-                c_mountpoint.as_ptr(),
-                flags as i32,
-                c_options.as_ptr() as *mut libc::c_void,
-            )
-        }
+        let c_options = CString::new(mount_options.clone()).unwrap();
+        let c_type = CString::new("fuse").unwrap();
+        libc::mount(
+            c_source.as_ptr(),
+            c_mountpoint.as_ptr(),
+            c_type.as_ptr(),
+            flags,
+            c_options.as_ptr() as *const libc::c_void,
+        )
     };
 
     complete_mount(fd, result, mnt)
@@ -219,41 +205,78 @@ fn detect_fusermount_bin() -> String {
     FUSERMOUNT3_BIN.to_string()
 }
 
-pub fn fuse_umount_pure(mnt: &Path) {
-    let c_mountpoint = CString::new(mnt.to_str().unwrap()).unwrap();
-    let result = {
-        #[cfg(target_os = "linux")]
-        {
-            unsafe { libc::umount2(c_mountpoint.as_ptr(), 0) }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            // macOS uses unmount instead of umount
-            extern "C" {
-                fn unmount(path: *const libc::c_char, flags: libc::c_int) -> libc::c_int;
-            }
-            unsafe { unmount(c_mountpoint.as_ptr(), 0) }
-        }
-    };
+pub fn fuse_umount_pure(mnt: &Path) -> IOResult<()> {
+    let c_mountpoint = path_to_cstring(mnt)?;
+    let result = unsafe { libc::umount2(c_mountpoint.as_ptr(), 0) };
 
     if result == 0 {
-        return;
+        return Ok(());
     }
+
+    // Capture the direct unmount errno immediately, before any other syscall
+    // (e.g. spawning fusermount) can clobber `errno`.
+    let direct_err = std::io::Error::last_os_error();
+    info!(
+        "direct umount2 failed for {:?}: {}; falling back to fusermount",
+        mnt, direct_err
+    );
+
     let mut builder = Command::new(detect_fusermount_bin());
     builder.stdout(Stdio::piped()).stderr(Stdio::piped());
     builder.arg("-u").arg("-q").arg("-z").arg("--").arg(mnt);
 
-    if let Ok(output) = builder.output() {
-        info!("fusermount: {}", String::from_utf8_lossy(&output.stdout));
+    let output = match builder.output() {
+        Ok(output) => output,
+        Err(spawn_err) => {
+            // Both the direct unmount and spawning the fallback failed; surface
+            // the original unmount error together with the spawn failure.
+            return Err(IOError::with_ctx(
+                std::io::Error::new(
+                    spawn_err.kind(),
+                    format!(
+                        "umount {:?} failed (direct: {}; fusermount spawn: {})",
+                        mnt, direct_err, spawn_err
+                    ),
+                ),
+                format!("({}:{})", file!(), line!()),
+            ));
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        error!(
+            "fusermount unmount failed for {:?}: status={}, stderr={}, stdout={}",
+            mnt, output.status, stderr, stdout
+        );
+        return Err(IOError::with_ctx(
+            std::io::Error::other(format!(
+                "umount {:?} failed (direct: {}; fusermount exit {}: {})",
+                mnt,
+                direct_err,
+                output.status,
+                stderr.trim()
+            )),
+            format!("({}:{})", file!(), line!()),
+        ));
     }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.trim().is_empty() {
+        info!("fusermount: {}", stdout);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::complete_mount;
+    use super::{complete_mount, path_to_cstring};
+    use std::ffi::OsStr;
     use std::fs::File;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::{AsRawFd, OwnedFd};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn failed_mount_closes_fuse_fd() {
@@ -281,5 +304,37 @@ mod tests {
         assert_eq!(returned_fd, raw_fd);
         assert_ne!(unsafe { libc::fcntl(returned_fd, libc::F_GETFD) }, -1);
         assert_eq!(unsafe { libc::close(returned_fd) }, 0);
+    }
+
+    #[test]
+    fn path_to_cstring_accepts_valid_utf8() {
+        let c = path_to_cstring(Path::new("/tmp/curvine")).expect("valid path");
+        assert_eq!(c.as_bytes(), b"/tmp/curvine");
+    }
+
+    // A valid Unix mount path may contain non-UTF-8 bytes. This must NOT panic;
+    // the raw bytes should be preserved via OsStrExt::as_bytes.
+    #[test]
+    fn path_to_cstring_accepts_non_utf8() {
+        // 0xFF is not valid UTF-8, but is a legal byte in a Unix path.
+        let raw = b"/tmp/\xff\xfemount";
+        let os = OsStr::from_bytes(raw);
+        let path = PathBuf::from(os);
+        // Precondition: to_str() would return None (i.e. the old unwrap() would panic).
+        assert!(path.to_str().is_none());
+
+        let c = path_to_cstring(&path).expect("non-utf8 path must not panic and must convert");
+        assert_eq!(c.as_bytes(), raw);
+    }
+
+    // An embedded NUL byte must be reported as a normal error, not a panic.
+    #[test]
+    fn path_to_cstring_rejects_embedded_nul() {
+        let raw = b"/tmp/bad\0path";
+        let os = OsStr::from_bytes(raw);
+        let path = PathBuf::from(os);
+
+        let err = path_to_cstring(&path).expect_err("embedded NUL must be an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

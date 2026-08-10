@@ -17,5 +17,11 @@ pub mod fuse_abi;
 mod fuse_dirent_list;
 pub use self::fuse_dirent_list::FuseDirentList;
 
+// The pure mount implementation (`libc::mount`/`umount2` + fusermount fallback)
+// is Linux-only: it has no macOS/BSD code path and would not compile off Linux.
+// Gate the module and its re-exports to Linux so the platform contract is
+// enforced at compile time rather than failing deep inside the module.
+#[cfg(target_os = "linux")]
 mod fuse_pure;
+#[cfg(target_os = "linux")]
 pub use self::fuse_pure::*;

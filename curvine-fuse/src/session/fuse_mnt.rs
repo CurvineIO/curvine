@@ -15,7 +15,13 @@
 #![allow(unused)]
 
 use crate::raw::fuse_abi::fuse_args;
+// `fuse_mount_pure` / `fuse_umount_pure` live in the Linux-only `raw::fuse_pure`
+// module (gated in `raw/mod.rs`). Import and use them only on Linux so this
+// caller shares the same platform contract instead of failing to resolve the
+// symbols off Linux.
+#[cfg(target_os = "linux")]
 use crate::raw::fuse_mount_pure;
+#[cfg(target_os = "linux")]
 use crate::raw::fuse_umount_pure;
 use crate::{FuseUtils, FUSE_CLONE_FD_MIN_VERSION, UNIX_KERNEL_VERSION};
 use curvine_config::FuseConf;
@@ -102,8 +108,14 @@ impl FuseMnt {
 impl Drop for FuseMnt {
     fn drop(&mut self) {
         if self.auto_unmount {
-            fuse_umount_pure(self.path.as_path());
-            info!("unmount path={:?}, fd={}", self.path, self.fd);
+            #[cfg(target_os = "linux")]
+            match fuse_umount_pure(self.path.as_path()) {
+                Ok(()) => info!("unmount path={:?}, fd={}", self.path, self.fd),
+                Err(e) => error!(
+                    "unmount failed path={:?}, fd={}, err={:?}",
+                    self.path, self.fd, e
+                ),
+            }
         }
     }
 }
