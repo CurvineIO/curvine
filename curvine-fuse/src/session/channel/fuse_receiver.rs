@@ -293,13 +293,15 @@ impl<T: FileSystem> FuseReceiver<T> {
         rep: FuseResponse,
     ) -> FuseResult<()> {
         let metrics_enabled = rep.metrics.is_some();
-        // Parse failure here is after the ctx exists: finish it early (no reply).
-        // No stable errno for a parse error, so tag the catch-all "other".
+        // The frame header is already trusted here, so complete a malformed payload
+        // with EPROTO instead of leaving the kernel waiting for this unique.
         let operator = match req.parse_operator() {
             Ok(op) => op,
             Err(err) => {
-                rep.finish_early(err.errno(), "other");
-                return Err(err);
+                return rep
+                    .send_parse_error("other", err.to_string())
+                    .await
+                    .map_err(Into::into);
             }
         };
 
@@ -561,10 +563,17 @@ impl<T: FileSystem> FuseReceiver<T> {
         req: &FuseRequest,
         reply: &FuseResponse,
     ) -> FuseResult<()> {
-        // Parse failure here is after the ctx exists: finish it early (no reply).
+        // The frame header is already trusted here, so complete a malformed payload
+        // with EPROTO instead of leaving the kernel waiting for this unique.
         let operator = match req.parse_operator() {
             Ok(op) => op,
             Err(err) => {
+                if req.expects_reply() {
+                    return reply
+                        .send_parse_error("other", err.to_string())
+                        .await
+                        .map_err(Into::into);
+                }
                 reply.finish_early(err.errno(), "other");
                 return Err(err);
             }
@@ -885,6 +894,7 @@ mod tests {
         const OP_STATFS: u32 = 17;
         const OP_ACCESS: u32 = 34;
         const OP_INTERRUPT: u32 = 36;
+        const OP_BATCH_FORGET: u32 = 42;
 
         fn make_request(opcode: u32, unique: u64, nodeid: u64, payload: &[u8]) -> FuseRequest {
             let header = fuse_in_header {
@@ -1035,6 +1045,65 @@ mod tests {
             );
         }
 
+        #[tokio::test]
+        async fn malformed_lookup_replies_eproto_once() {
+            let unique = 1012;
+            let pending = FastDashMap::default();
+            let request = make_request(OP_LOOKUP, unique, 1, b"missing-nul");
+            let (reply, mut rx) = metrics_reply(unique, "Lookup");
+
+            let result =
+                super::super::FuseReceiver::dispatch_meta(&pending, &fs(), &request, &reply).await;
+
+            assert!(
+                result.is_ok(),
+                "a trusted-header payload error is completed by its EPROTO reply"
+            );
+            match rx.try_recv().unwrap().expect("one EPROTO reply task") {
+                FuseTask::RequestReply {
+                    data,
+                    status,
+                    errno,
+                    ..
+                } => {
+                    assert_eq!(status, FuseReqStatus::Error);
+                    assert_eq!(errno, libc::EPROTO);
+                    assert_eq!(data.header().unique, unique);
+                    assert_eq!(data.header().error, -libc::EPROTO);
+                }
+                _ => panic!("expected RequestReply"),
+            }
+            assert!(
+                rx.try_recv().unwrap().is_none(),
+                "malformed LOOKUP must enqueue exactly one reply"
+            );
+        }
+
+        #[tokio::test]
+        async fn malformed_lookup_replies_eproto_when_metrics_are_disabled() {
+            let unique = 1013;
+            let pending = FastDashMap::default();
+            let request = make_request(OP_LOOKUP, unique, 1, b"missing-nul");
+            let (tx, mut rx) = AsyncChannel::new(16).split();
+            let reply = FuseResponse::new_reply(unique, tx, false, None);
+
+            let result =
+                super::super::FuseReceiver::dispatch_meta(&pending, &fs(), &request, &reply).await;
+
+            assert!(result.is_ok());
+            match rx.try_recv().unwrap().expect("one EPROTO reply task") {
+                FuseTask::Reply(data) => {
+                    assert_eq!(data.header().unique, unique);
+                    assert_eq!(data.header().error, -libc::EPROTO);
+                }
+                _ => panic!("metrics-disabled reply must use FuseTask::Reply"),
+            }
+            assert!(
+                rx.try_recv().unwrap().is_none(),
+                "metrics-disabled malformed LOOKUP must enqueue exactly one reply"
+            );
+        }
+
         // No-reply Forget still records an operation sample (status from
         // finish_no_reply) and enqueues no reply task.
         #[tokio::test]
@@ -1059,6 +1128,32 @@ mod tests {
                 rx.try_recv().unwrap().is_none(),
                 "Forget is no-reply: no task enqueued"
             );
+        }
+
+        #[tokio::test]
+        async fn malformed_no_reply_opcodes_still_enqueue_nothing() {
+            let pending = FastDashMap::default();
+            let cases = [
+                (OP_FORGET, 1013, "Forget"),
+                (OP_INTERRUPT, 1014, "Interrupt"),
+                (OP_BATCH_FORGET, 1015, "BatchForget"),
+            ];
+
+            for (opcode, unique, label) in cases {
+                let request = make_request(opcode, unique, 1, &[]);
+                let (reply, mut rx) = metrics_reply(unique, label);
+
+                let result =
+                    super::super::FuseReceiver::dispatch_meta(&pending, &fs(), &request, &reply)
+                        .await;
+
+                assert!(result.is_err(), "malformed {label} reports its parse error");
+                assert_eq!(reply.metrics_op_status(), Some(FuseReqStatus::Error));
+                assert!(
+                    rx.try_recv().unwrap().is_none(),
+                    "malformed {label} must remain protocol no-reply"
+                );
+            }
         }
 
         #[tokio::test]
@@ -1360,7 +1455,7 @@ mod tests {
             let pending: Arc<FastDashMap<u64, Arc<tokio::sync::Notify>>> =
                 Arc::new(FastDashMap::default());
             let pending2 = pending.clone();
-            let (reply, _rx) = metrics_reply(2002, "SetLkW");
+            let (reply, mut rx) = metrics_reply(2002, "SetLkW");
 
             // Opcode routes through dispatch_meta_interrupt (timer created), but the
             // empty payload makes parse_operator's get_struct::<fuse_lk_in> fail.
@@ -1369,7 +1464,22 @@ mod tests {
                 super::super::FuseReceiver::dispatch_meta_interrupt(fs, pending, malformed, reply)
                     .await;
 
-            assert!(res.is_err(), "malformed SETLKW returns the parse Err");
+            assert!(
+                res.is_ok(),
+                "malformed SETLKW is completed by its EPROTO reply"
+            );
+            match rx.try_recv().unwrap().expect("one EPROTO reply task") {
+                FuseTask::RequestReply { data, errno, .. } => {
+                    assert_eq!(errno, libc::EPROTO);
+                    assert_eq!(data.header().unique, 2002);
+                    assert_eq!(data.header().error, -libc::EPROTO);
+                }
+                _ => panic!("expected RequestReply"),
+            }
+            assert!(
+                rx.try_recv().ok().flatten().is_none(),
+                "malformed SETLKW must enqueue exactly one reply"
+            );
             assert!(
                 !polled.load(Ordering::SeqCst),
                 "set_lkw must NOT be called for a malformed SETLKW (parse failed first)"
@@ -1482,7 +1592,7 @@ mod tests {
             fuse_flush_in, fuse_fsync_in, fuse_in_header, fuse_read_in, fuse_release_in,
             fuse_write_in,
         };
-        use crate::session::{FuseRequest, FuseResponse};
+        use crate::session::{FuseRequest, FuseResponse, FuseTask};
         use crate::FuseUtils;
         use bytes::{BufMut, BytesMut};
         use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
@@ -1691,11 +1801,10 @@ mod tests {
             dispatch_one(false, write_request(7105));
         }
 
-        // A malformed stream request whose `parse_operator()` fails AFTER the ctx was
-        // built must finish the ctx early (drop guard, record decode error) and NOT enter
-        // the RAII scope. Pins that no early return/await sits between ctx and scope.
+        // A malformed stream request whose header is already trusted completes with
+        // exactly one EPROTO reply without entering the dispatch/lifecycle scopes.
         #[test]
-        fn malformed_stream_request_finishes_early_without_dispatch_or_lifecycle() {
+        fn malformed_stream_request_replies_eproto_without_dispatch_or_lifecycle() {
             use crate::fuse_metrics::{FuseReqCtx, FuseReqKind, FuseReqLabels, DECODE_PHASE_PARSE};
             FuseMetrics::ensure_init().unwrap();
             let mx = FuseMetrics::get();
@@ -1715,7 +1824,6 @@ mod tests {
             rt.block_on(async {
                 let fs = Arc::new(TestFileSystem::new(curvine_config::FuseConf::default()));
                 let (tx, mut rx) = AsyncChannel::new(16).split();
-                let drainer = tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
                 let active_g = curvine_metrics::Metrics::new_gauge(
                     "ss_malformed_active_7201".to_string(),
@@ -1735,21 +1843,38 @@ mod tests {
                 .await;
 
                 assert!(
-                    res.is_err(),
-                    "malformed stream request returns the parse Err"
+                    res.is_ok(),
+                    "malformed stream request is completed by its EPROTO reply"
                 );
-                // Active guard released by finish_early — no leak.
+                let task = rx.try_recv().unwrap().expect("one EPROTO reply task");
+                match &task {
+                    FuseTask::RequestReply { data, errno, .. } => {
+                        assert_eq!(*errno, libc::EPROTO);
+                        assert_eq!(data.header().unique, 7201);
+                        assert_eq!(data.header().error, -libc::EPROTO);
+                    }
+                    _ => panic!("expected RequestReply"),
+                }
+                assert_eq!(
+                    active_g.get(),
+                    1,
+                    "the active guard travels with the reply until Sender completion"
+                );
+                drop(task);
                 assert_eq!(
                     active_g.get(),
                     0,
-                    "parse failure finishes the ctx early and drops the active guard"
+                    "dropping the reply releases the active guard"
                 );
-                drainer.abort();
+                assert!(
+                    rx.try_recv().ok().flatten().is_none(),
+                    "malformed stream request enqueues exactly one reply"
+                );
             });
 
             // "No io_dispatch/lifecycle sample on parse failure" is STRUCTURAL: the RAII
             // scope exists only after `parse_operator()` succeeds, so an Err returns via
-            // `finish_early` first. Only the decode error shows here (shared → lower bound).
+            // the parse-reply path first. Only the decode error shows here (shared → lower bound).
             assert!(
                 mx.decode_errors_total
                     .with_label_values(&[DECODE_PHASE_PARSE, "other"])

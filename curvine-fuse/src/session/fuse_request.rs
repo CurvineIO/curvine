@@ -100,6 +100,13 @@ impl FuseRequest {
         )
     }
 
+    pub fn expects_reply(&self) -> bool {
+        !matches!(
+            self.opcode,
+            FUSE_FORGET | FUSE_BATCH_FORGET | FUSE_INTERRUPT
+        )
+    }
+
     pub fn should_audit(&self) -> bool {
         !matches!(self.opcode, FUSE_READ | FUSE_WRITE)
     }

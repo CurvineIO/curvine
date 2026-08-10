@@ -420,7 +420,7 @@ impl FuseResponse {
         }
     }
 
-    /// Finish a request that errored before any reply, using a parse reason instead of errno.
+    /// Finish a no-reply request whose opcode payload could not be decoded.
     pub(crate) fn finish_early(&self, errno: i32, reason: &'static str) {
         if let Some(slot) = &self.metrics {
             {
@@ -439,6 +439,27 @@ impl FuseResponse {
             // Parse failed after ctx creation: record decode error, not `requests_total`.
             FuseMetrics::get().record_parse_error(reason);
         }
+    }
+
+    /// Complete a request whose header was decoded but whose opcode payload was malformed.
+    pub(crate) async fn send_parse_error(
+        &self,
+        reason: &'static str,
+        message: String,
+    ) -> IOResult<()> {
+        if let Some(slot) = &self.metrics {
+            {
+                let mut m = slot.lock();
+                m.parse_reason = Some(reason);
+            }
+            FuseMetrics::get().record_parse_error(reason);
+        }
+
+        let error: FuseResult<()> = Err(FuseError::from_errno_msg(
+            libc::EPROTO,
+            format!("Malformed FUSE request payload: {message}").into(),
+        ));
+        self.send_rep(error).await
     }
 
     pub async fn send_rep<T: Debug, E: Into<FuseError> + Debug>(
@@ -957,9 +978,8 @@ mod tests {
         );
     }
 
-    // T8: parse-after-ctx early finish — `finish_early` (the API the receiver
-    // calls when `parse_operator()` fails after the ctx exists) drops the guard,
-    // marks finished, and enqueues NO task. No requests_total would be emitted.
+    // T8: malformed no-reply operator — `finish_early` drops the guard, marks
+    // the metrics slot finished, and enqueues NO task. No requests_total is emitted.
     #[tokio::test]
     async fn t8_finish_early_drops_guard_no_task() {
         init_metrics();
@@ -1523,7 +1543,7 @@ mod tests {
         );
     }
 
-    // B4 / test 8: parse-after-ctx early finish emits decode_errors_total
+    // B4 / test 8: malformed no-reply early finish emits decode_errors_total
     // {phase=parse,reason=other} once and NO requests_total.
     #[tokio::test]
     async fn finish_early_emits_decode_error_not_requests_total() {
