@@ -36,8 +36,7 @@ use std::sync::Arc;
     author,
     version = env!("CARGO_PKG_VERSION"),
     about,
-    long_about = None,
-    arg_required_else_help = true
+    long_about = None
 )]
 pub struct CurvineArgs {
     /// Print the component version in JSON format and exit
@@ -286,6 +285,14 @@ mod tests {
             .expect("version json should parse without subcommand");
 
         assert!(args.version_json);
+        assert!(args.command.is_none());
+    }
+
+    #[test]
+    fn bare_invocation_parses_so_custom_missing_subcommand_path_runs() {
+        let args = CurvineArgs::try_parse_from(["curvine"])
+            .expect("bare invocation should parse so main can emit MissingSubcommand");
+
         assert!(args.command.is_none());
     }
 

@@ -7,6 +7,9 @@ ARG GOPROXY
 # The compile image has ENTRYPOINT ["/bin/bash", "-c"] which can interfere with RUN
 ENTRYPOINT []
 
+# version.sh uses bash features such as local, so RUN steps must use bash.
+SHELL ["/bin/bash", "-c"]
+
 # Set GOPROXY environment variable (Go is already installed in compile image)
 ENV GOPROXY=${GOPROXY:-https://proxy.golang.org}
 
