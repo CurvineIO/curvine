@@ -3,10 +3,12 @@ use curvine_core_error::CommonResult;
 use curvine_fs_api::{CurvineURI, FileSystem};
 use curvine_unified_fs::UnifiedFileSystem;
 
-pub fn current_process_acl(client: &UnifiedFileSystem) -> (u32, u32, u32) {
+pub(super) fn current_process_acl(client: &UnifiedFileSystem) -> (String, String, u32) {
+    let uid = curvine_sys::get_uid();
+    let gid = curvine_sys::get_gid();
     (
-        curvine_sys::get_uid(),
-        curvine_sys::get_gid(),
+        curvine_sys::get_username_by_uid(uid).unwrap_or_else(|| uid.to_string()),
+        curvine_sys::get_groupname_by_gid(gid).unwrap_or_else(|| gid.to_string()),
         client.conf().client.get_mode(),
     )
 }

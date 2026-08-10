@@ -24,10 +24,12 @@ impl MkdirCommand {
             MkdirCommand::Mkdir { path, parents } => {
                 println!("Creating directory: {} (parents: {})", path, parents);
                 let path = CurvineURI::new(path)?;
-                let (uid, gid, mode) = current_process_acl(&client);
+                let (owner, group, mode) = current_process_acl(&client);
                 let opts = MkdirOptsBuilder::with_conf(&client.conf().client)
                     .create_parent(*parents)
-                    .acl(uid, gid, mode)
+                    .owner(owner)
+                    .group(group)
+                    .mode(mode)
                     .build();
                 let _ = client.mkdir_with_opts(&path, opts).await?;
 

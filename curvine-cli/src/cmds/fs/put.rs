@@ -112,12 +112,14 @@ impl PutCommand {
                 };
 
                 // Create writer for streaming upload
-                let (uid, gid, mode) = current_process_acl(&client);
+                let (owner, group, mode) = current_process_acl(&client);
                 let opts = client
                     .cv()
                     .create_opts_builder()
                     .create_parent(true)
-                    .acl(uid, gid, mode)
+                    .owner(owner)
+                    .group(group)
+                    .mode(mode)
                     .build();
                 let flags = OpenFlags::new_write_only()
                     .set_create(true)
