@@ -40,5 +40,29 @@ if [ "$actual" != "0.3.0-alpha" ]; then
   echo "expected BUILD_VERSION override 0.3.0-alpha, got $actual" >&2
   exit 1
 fi
+unset BUILD_VERSION
+
+BUILD_VERSION="" actual="$(get_build_version "$TMP_DIR/Cargo.toml")"
+if [ "$actual" != "0.2.0" ]; then
+  echo "expected empty BUILD_VERSION to fall back to 0.2.0, got $actual" >&2
+  exit 1
+fi
+unset BUILD_VERSION
+
+cat > "$TMP_DIR/missing-version.toml" <<'EOF'
+[workspace.package]
+name = "curvine"
+EOF
+
+if actual="$(get_build_version "$TMP_DIR/missing-version.toml" 2>"$TMP_DIR/missing-version.err")"; then
+  echo "expected missing workspace version to fail, got $actual" >&2
+  exit 1
+fi
+
+if ! grep -q "failed to resolve \\[workspace.package\\].version" "$TMP_DIR/missing-version.err"; then
+  echo "expected missing workspace version error, got:" >&2
+  cat "$TMP_DIR/missing-version.err" >&2
+  exit 1
+fi
 
 echo "workspace version resolution: ok"

@@ -41,6 +41,13 @@ get_build_version() {
     return 0
   fi
   local version
-  version="$(get_workspace_version "$cargo_toml")"
-  printf '%s\n' "${version:-unknown}"
+  if ! version="$(get_workspace_version "$cargo_toml")"; then
+    echo "failed to read workspace version from $cargo_toml" >&2
+    return 1
+  fi
+  if [ -z "$version" ]; then
+    echo "failed to resolve [workspace.package].version from $cargo_toml" >&2
+    return 1
+  fi
+  printf '%s\n' "$version"
 }

@@ -29,6 +29,9 @@ mod tests {
     #[test]
     fn build_version_override_is_honored_when_set() {
         if let Ok(build_version) = std::env::var("BUILD_VERSION") {
+            if build_version.is_empty() {
+                return;
+            }
             assert_eq!(PKG_VERSION, build_version);
             assert_eq!(VERSION, build_version);
         }
