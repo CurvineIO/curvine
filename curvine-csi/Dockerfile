@@ -65,7 +65,8 @@ RUN echo "Building Curvine from source..." && \
 
 # Build CSI binary with version info
 RUN cd /workspace/curvine-csi && \
-    VERSION=$(grep '^version =' /workspace/Cargo.toml | head -1 | sed 's/^version = "\(.*\)"/\1/') && \
+    . /workspace/build/version.sh && \
+    VERSION=$(get_build_version /workspace/Cargo.toml) && \
     GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown") && \
     GIT_TAG=$(git describe --tags --exact-match HEAD 2>/dev/null || echo "") && \
     GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "") && \

@@ -17,7 +17,9 @@ package csi
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -98,11 +100,12 @@ func TestStatusFromValidateConfigErrorMapsMissingBinaryToInternal(t *testing.T) 
 }
 
 func TestExecFuseValidateConfigMapsSubprocessKillToDeadlineExceeded(t *testing.T) {
-	if _, err := exec.LookPath("yes"); err != nil {
-		t.Skip("yes not available")
+	fuseBinaryPath := filepath.Join(t.TempDir(), "curvine-fuse-sleep")
+	if err := os.WriteFile(fuseBinaryPath, []byte("#!/bin/sh\nsleep 5\n"), 0755); err != nil {
+		t.Fatalf("write fake fuse binary: %v", err)
 	}
 
-	t.Setenv("FUSE_BINARY_PATH", "yes")
+	t.Setenv("FUSE_BINARY_PATH", fuseBinaryPath)
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 

@@ -36,7 +36,7 @@ func TestCollectPassthroughParams(t *testing.T) {
 	}
 	publishContext := map[string]string{
 		"entry-timeout": "1.0",
-		"io-threads":      "8",
+		"io-threads":    "8",
 	}
 
 	got := CollectPassthroughParams(volumeContext, publishContext)

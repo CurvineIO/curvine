@@ -2063,9 +2063,11 @@ dependencies = [
 name = "curvine-client"
 version = "0.2.0"
 dependencies = [
+ "clap",
  "curvine-bench",
  "curvine-client-core",
  "curvine-job-client",
+ "curvine-sys",
  "curvine-unified-fs",
 ]
 
@@ -2717,6 +2719,8 @@ dependencies = [
  "libc",
  "log",
  "nix",
+ "serde",
+ "serde_json",
  "sysinfo",
  "tokio",
 ]

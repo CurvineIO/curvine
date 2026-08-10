@@ -26,6 +26,12 @@ for arg in "$@"; do
         ${CURVINE_HOME}/lib/curvine-fuse --help
         exit 0
     fi
+
+    if [[ "$arg" == "--version-json" ]] || [[ "$arg" == "--version" ]] || [[ "$arg" == "-V" ]]; then
+        . "$(cd "`dirname "$0"`"; pwd)"/../conf/curvine-env.sh
+        ${CURVINE_HOME}/lib/curvine-fuse "$arg"
+        exit 0
+    fi
     
     # Extract mount path from arguments if specified
     if [[ "$arg" == --mnt-path=* ]]; then

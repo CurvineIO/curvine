@@ -29,29 +29,35 @@ var (
 	buildDate     = "unknown"
 )
 
-// VersionInfo struct
-type VersionInfo struct {
-	DriverVersion string `json:"DriverVersion"`
-	GitCommit     string `json:"GitCommit"`
-	GitTag        string `json:"GitTag,omitempty"`
-	GitBranch     string `json:"GitBranch,omitempty"`
-	BuildDate     string `json:"BuildDate"`
-	GoVersion     string `json:"GoVersion"`
-	Compiler      string `json:"Compiler"`
-	Platform      string `json:"Platform"`
+const (
+	componentName      = "csi"
+	protocolVersion    = 1
+	minProtocolVersion = 1
+)
+
+// ComponentVersion is the machine-readable version schema shared by Curvine components.
+type ComponentVersion struct {
+	Component          string   `json:"component"`
+	ReleaseVersion     string   `json:"release_version"`
+	GitCommit          string   `json:"git_commit"`
+	GitTag             string   `json:"git_tag"`
+	GitBranch          string   `json:"git_branch"`
+	ProtocolVersion    int      `json:"protocol_version"`
+	MinProtocolVersion int      `json:"min_protocol_version"`
+	Capabilities       []string `json:"capabilities"`
 }
 
-// GetVersion returns VersionInfo
-func GetVersion() VersionInfo {
-	return VersionInfo{
-		DriverVersion: driverVersion,
-		GitCommit:     gitCommit,
-		GitTag:        gitTag,
-		GitBranch:     gitBranch,
-		BuildDate:     buildDate,
-		GoVersion:     runtime.Version(),
-		Compiler:      runtime.Compiler,
-		Platform:      fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
+// GetVersion returns the shared ComponentVersion schema.
+func GetVersion() ComponentVersion {
+	return ComponentVersion{
+		Component:          componentName,
+		ReleaseVersion:     normalizedReleaseVersion(),
+		GitCommit:          normalizedGitCommit(),
+		GitTag:             gitTag,
+		GitBranch:          normalizedGitBranch(),
+		ProtocolVersion:    protocolVersion,
+		MinProtocolVersion: minProtocolVersion,
+		Capabilities:       []string{},
 	}
 }
 
@@ -68,22 +74,44 @@ func GetVersionJSON() (string, error) {
 // GetVersionString returns a simple version string: "version (commit: commit-id, tag/branch: name)"
 // This format matches other Curvine components for consistency
 func GetVersionString() string {
-	version := driverVersion
-	if version == "" || version == "unknown" {
-		version = "dev"
-	}
-	commit := gitCommit
-	if commit == "" || commit == "unknown" {
-		commit = "unknown"
-	}
+	version := GetVersion()
 
 	// Build source info: prefer tag over branch
 	sourceInfo := ""
-	if gitTag != "" && gitTag != "unknown" {
-		sourceInfo = fmt.Sprintf(", tag: %s", gitTag)
-	} else if gitBranch != "" && gitBranch != "unknown" && gitBranch != "HEAD" {
-		sourceInfo = fmt.Sprintf(", branch: %s", gitBranch)
+	if version.GitTag != "" && version.GitTag != "unknown" {
+		sourceInfo = fmt.Sprintf(", tag: %s", version.GitTag)
+	} else if version.GitBranch != "" && version.GitBranch != "unknown" && version.GitBranch != "HEAD" {
+		sourceInfo = fmt.Sprintf(", branch: %s", version.GitBranch)
 	}
 
-	return fmt.Sprintf("%s (commit: %s%s)", version, commit, sourceInfo)
+	return fmt.Sprintf("%s (commit: %s%s)", version.ReleaseVersion, version.GitCommit, sourceInfo)
+}
+
+func GetRuntimeVersionMetadata() map[string]string {
+	return map[string]string{
+		"go-version": runtime.Version(),
+		"compiler":   runtime.Compiler,
+		"platform":   fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
+	}
+}
+
+func normalizedReleaseVersion() string {
+	if driverVersion == "" || driverVersion == "unknown" {
+		return "dev"
+	}
+	return driverVersion
+}
+
+func normalizedGitCommit() string {
+	if gitCommit == "" {
+		return "unknown"
+	}
+	return gitCommit
+}
+
+func normalizedGitBranch() string {
+	if gitBranch == "HEAD" {
+		return ""
+	}
+	return gitBranch
 }

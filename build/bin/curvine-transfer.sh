@@ -16,4 +16,11 @@
 # limitations under the License.
 #
 
-"$(cd "`dirname "$0"`"; pwd)"/launch-process.sh transfer $1
+BIN_DIR="$(cd "`dirname "$0"`"; pwd)"
+if [[ "$1" == "--version-json" ]] || [[ "$1" == "--version" ]] || [[ "$1" == "-V" ]]; then
+  source "${BIN_DIR}/../conf/curvine-env.sh"
+  "${CURVINE_HOME}/lib/curvine-server" --service transfer "$1"
+  exit $?
+fi
+
+"${BIN_DIR}"/launch-process.sh transfer $1

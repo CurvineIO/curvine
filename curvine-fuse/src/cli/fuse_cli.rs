@@ -41,6 +41,10 @@ pub struct ListConfigFlagsArgs {
     args_conflicts_with_subcommands = true
 )]
 pub struct FuseCli {
+    /// Print the component version in JSON format and exit
+    #[arg(long, global = true)]
+    pub version_json: bool,
+
     #[command(subcommand)]
     pub cmd: Option<FuseSubcommand>,
 
@@ -206,6 +210,14 @@ mod tests {
         let err =
             FuseCli::try_parse_from(["curvine-fuse", "--io-threads", "4", "mount"]).unwrap_err();
         assert!(err.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn version_json_parses_without_mount_args() {
+        let cli = FuseCli::try_parse_from(["curvine-fuse", "--version-json"]).unwrap();
+
+        assert!(cli.version_json);
+        assert!(cli.cmd.is_none());
     }
 
     #[test]

@@ -17,7 +17,7 @@ mod cmds;
 mod commands;
 mod util;
 
-use clap::Parser;
+use clap::{error::ErrorKind, CommandFactory, Parser};
 use commands::Commands;
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
@@ -26,13 +26,24 @@ use curvine_job_client::TransferClient;
 use curvine_net::net::InetAddr;
 use curvine_runtime::common::{Logger, Utils};
 use curvine_runtime::runtime::RpcRuntime;
+use curvine_sys::version;
 use curvine_unified_fs::UnifiedFileSystem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
-#[command(author, version = env!("CARGO_PKG_VERSION"), about, long_about = None)]
+#[command(
+    author,
+    version = env!("CARGO_PKG_VERSION"),
+    about,
+    long_about = None,
+    arg_required_else_help = true
+)]
 pub struct CurvineArgs {
+    /// Print the component version in JSON format and exit
+    #[arg(long, global = true)]
+    pub version_json: bool,
+
     /// Configuration file path (optional)
     #[arg(long, help = "Configuration file path (optional)", global = true)]
     pub conf: Option<String>,
@@ -46,7 +57,7 @@ pub struct CurvineArgs {
     pub master_addrs: Option<String>,
 
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 pub struct ConfLoadResult {
@@ -157,14 +168,31 @@ impl CurvineArgs {
 
 fn main() -> CommonResult<()> {
     let args = CurvineArgs::parse();
+    if args.version_json {
+        let json = match version::component_version_json("cli") {
+            Ok(json) => json,
+            Err(e) => return err_box!("Failed to serialize component version: {}", e),
+        };
+        println!("{}", json);
+        return Ok(());
+    }
+    if args.command.is_none() {
+        CurvineArgs::command()
+            .error(
+                ErrorKind::MissingSubcommand,
+                "a subcommand is required unless --version-json is provided",
+            )
+            .exit();
+    }
+
     Utils::set_panic_exit_hook();
 
-    if matches!(args.command, Commands::Version) {
+    if matches!(args.command, Some(Commands::Version)) {
         println!("curvine-cli {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
-    let enable_default_discovery = matches!(args.command, Commands::Bench(_));
+    let enable_default_discovery = matches!(args.command, Some(Commands::Bench(_)));
     let conf_load = args.get_conf_with_source(enable_default_discovery)?;
     let conf = conf_load.conf;
     let conf_source = conf_load.source;
@@ -182,22 +210,22 @@ fn main() -> CommonResult<()> {
 
     rt.block_on(async move {
         let result = match args.command {
-            Commands::Bench(cmd) => cmd.execute(curvine_fs, conf_source.clone()).await,
-            Commands::Fs(cmd) => cmd.execute(curvine_fs).await,
-            Commands::Report(cmd) => cmd.execute(curvine_fs).await,
-            Commands::Load(cmd) => match transfer_client.clone() {
+            Some(Commands::Bench(cmd)) => cmd.execute(curvine_fs, conf_source.clone()).await,
+            Some(Commands::Fs(cmd)) => cmd.execute(curvine_fs).await,
+            Some(Commands::Report(cmd)) => cmd.execute(curvine_fs).await,
+            Some(Commands::Load(cmd)) => match transfer_client.clone() {
                 Some(transfer_client) => cmd.execute_transfer(curvine_fs.clone(), transfer_client).await,
                 None => cmd.execute_legacy(load_client.clone()).await,
             },
-            Commands::Export(cmd) => match transfer_client.clone() {
+            Some(Commands::Export(cmd)) => match transfer_client.clone() {
                 Some(transfer_client) => cmd.execute_transfer(curvine_fs.clone(), transfer_client).await,
                 None => cmd.execute_legacy(load_client.clone()).await,
             },
-            Commands::LoadStatus(cmd) => match transfer_client.clone() {
+            Some(Commands::LoadStatus(cmd)) => match transfer_client.clone() {
                 Some(transfer_client) => cmd.execute_transfer_only(transfer_client).await,
                 None => cmd.execute(load_client.clone()).await,
             },
-            Commands::TransferStatus(cmd) => {
+            Some(Commands::TransferStatus(cmd)) => {
                 let Some(transfer_client) = transfer_client.clone() else {
                     return err_box!(
                         "transfer-status requires transfer.enabled=true and a running transfer service"
@@ -205,11 +233,11 @@ fn main() -> CommonResult<()> {
                 };
                 cmd.execute_transfer_only(transfer_client).await
             }
-            Commands::CancelLoad(cmd) => match transfer_client.clone() {
+            Some(Commands::CancelLoad(cmd)) => match transfer_client.clone() {
                 Some(transfer_client) => cmd.execute_transfer_only(transfer_client).await,
                 None => cmd.execute(load_client.clone()).await,
             },
-            Commands::CancelTransfer(cmd) => {
+            Some(Commands::CancelTransfer(cmd)) => {
                 let Some(transfer_client) = transfer_client.clone() else {
                     return err_box!(
                         "cancel-transfer requires transfer.enabled=true and a running transfer service"
@@ -217,7 +245,7 @@ fn main() -> CommonResult<()> {
                 };
                 cmd.execute_transfer_only(transfer_client).await
             }
-            Commands::Transfer(cmd) => {
+            Some(Commands::Transfer(cmd)) => {
                 let Some(transfer_client) = transfer_client.clone() else {
                     return err_box!(
                         "transfer requires transfer.enabled=true and a running transfer service"
@@ -225,10 +253,10 @@ fn main() -> CommonResult<()> {
                 };
                 cmd.execute(transfer_client).await
             }
-            Commands::Mount(cmd) => cmd.execute(curvine_fs).await,
-            Commands::UnMount(cmd) => cmd.execute(fs_client).await,
-            Commands::Node(cmd) => cmd.execute(fs_client, conf.clone()).await,
-            Commands::Version => Ok(()),
+            Some(Commands::Mount(cmd)) => cmd.execute(curvine_fs).await,
+            Some(Commands::UnMount(cmd)) => cmd.execute(fs_client).await,
+            Some(Commands::Node(cmd)) => cmd.execute(fs_client, conf.clone()).await,
+            Some(Commands::Version) | None => Ok(()),
         };
 
         if let Err(e) = &result {
@@ -249,7 +277,16 @@ mod tests {
         let args = CurvineArgs::try_parse_from(["curvine", "export", "/mnt/file", "--watch"])
             .expect("export command should parse");
 
-        assert!(matches!(args.command, Commands::Export(_)));
+        assert!(matches!(args.command, Some(Commands::Export(_))));
+    }
+
+    #[test]
+    fn version_json_does_not_require_subcommand() {
+        let args = CurvineArgs::try_parse_from(["curvine", "--version-json"])
+            .expect("version json should parse without subcommand");
+
+        assert!(args.version_json);
+        assert!(args.command.is_none());
     }
 
     #[test]
@@ -267,6 +304,6 @@ mod tests {
         ])
         .expect("mount config should use -c while cluster config uses --conf");
 
-        assert!(matches!(args.command, Commands::Mount(_)));
+        assert!(matches!(args.command, Some(Commands::Mount(_))));
     }
 }

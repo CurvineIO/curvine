@@ -14,7 +14,7 @@
 
 use clap::Parser;
 use curvine_alloc as _;
-use curvine_core_error::CommonResult;
+use curvine_core_error::{err_box, CommonResult};
 use curvine_fuse::cli::{
     run_list_config_flags, run_mount, run_validate_config, FuseCli, FuseSubcommand,
 };
@@ -23,6 +23,15 @@ use curvine_fuse::cli::{
 // umount -f /curvine-fuse; cargo run --bin curvine-fuse -- --conf /server/conf/curvine-cluster.toml
 fn main() -> CommonResult<()> {
     let cli = FuseCli::parse();
+    if cli.version_json {
+        let json = match curvine_sys::version::component_version_json("fuse") {
+            Ok(json) => json,
+            Err(e) => return err_box!("Failed to serialize component version: {}", e),
+        };
+        println!("{}", json);
+        return Ok(());
+    }
+
     match &cli.cmd {
         None | Some(FuseSubcommand::Mount(_)) => run_mount(cli.resolve_runtime_args()),
         Some(FuseSubcommand::ValidateConfig(_)) => run_validate_config(cli.resolve_runtime_args()),

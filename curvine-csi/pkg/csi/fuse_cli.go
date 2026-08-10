@@ -44,10 +44,10 @@ var rejectedVolumeParameterKeys = map[string]struct{}{
 
 // volumeParameterDenylist blocks keys that are CSI-internal or not valid fuse flags.
 var volumeParameterDenylist = map[string]struct{}{
-	"csi.storage.k8s.io/ephemeral": {},
-	"csi.storage.k8s.io/pod.name":  {},
-	"csi.storage.k8s.io/pod.namespace": {},
-	"csi.storage.k8s.io/pod.uid":   {},
+	"csi.storage.k8s.io/ephemeral":           {},
+	"csi.storage.k8s.io/pod.name":            {},
+	"csi.storage.k8s.io/pod.namespace":       {},
+	"csi.storage.k8s.io/pod.uid":             {},
 	"csi.storage.k8s.io/serviceAccount.name": {},
 }
 
