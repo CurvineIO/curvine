@@ -103,7 +103,7 @@ impl FuseRequest {
     pub fn expects_reply(&self) -> bool {
         !matches!(
             self.opcode,
-            FUSE_FORGET | FUSE_BATCH_FORGET | FUSE_INTERRUPT
+            FUSE_FORGET | FUSE_BATCH_FORGET | FUSE_INTERRUPT | FUSE_NOTIFY_REPLY
         )
     }
 
@@ -432,6 +432,27 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("length mismatch"));
+    }
+
+    #[test]
+    fn expects_reply_classifies_every_protocol_no_reply_opcode() {
+        for opcode in [
+            FUSE_FORGET,
+            FUSE_BATCH_FORGET,
+            FUSE_INTERRUPT,
+            FUSE_NOTIFY_REPLY,
+        ] {
+            let header = header(opcode, FUSE_IN_HEADER_LEN);
+            let request = FuseRequest::from_bytes(request_bytes(&header, &[])).unwrap();
+            assert!(
+                !request.expects_reply(),
+                "{opcode:?} must not produce a response frame"
+            );
+        }
+
+        let header = header(FUSE_LOOKUP, FUSE_IN_HEADER_LEN);
+        let request = FuseRequest::from_bytes(request_bytes(&header, &[])).unwrap();
+        assert!(request.expects_reply(), "LOOKUP requires a response frame");
     }
 
     #[test]
