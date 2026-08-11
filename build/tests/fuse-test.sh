@@ -46,6 +46,39 @@ FAILED_CMD_LIST=()
 JSON_TEST_RESULTS=()
 CURRENT_TEST_GROUP=""
 
+# Require a non-empty option value (rejects missing or next-flag-looking args).
+require_arg() {
+    local opt="$1"
+    local val="$2"
+    if [ -z "$val" ] || [[ "$val" == -* ]]; then
+        echo "Error: $opt requires a value" >&2
+        print_help
+        exit 1
+    fi
+}
+
+# Require option value to be exactly 0 or 1.
+require_01() {
+    local opt="$1"
+    local val="$2"
+    require_arg "$opt" "$val"
+    if [ "$val" != "0" ] && [ "$val" != "1" ]; then
+        echo "Error: $opt must be 0 or 1, got: $val" >&2
+        print_help
+        exit 1
+    fi
+}
+
+# Record an explicit SKIP entry for JSON regression reports.
+record_json_skip() {
+    local test_group="$1"
+    local test_name="$2"
+    local reason="${3:-skipped}"
+    if [ -n "$JSON_OUTPUT" ]; then
+        JSON_TEST_RESULTS+=("SKIP|$test_group|$test_name||$reason")
+    fi
+}
+
 # Print functions
 print_help() {
     cat << EOF
@@ -809,7 +842,8 @@ generate_json_report() {
         echo "  \"timestamp\": \"$timestamp\","
         echo "  \"test_config\": {"
         echo "    \"test_dir\": \"$(json_escape "$TEST_DIR")\","
-        echo "    \"cleanup\": \"$CLEANUP\""
+        echo "    \"cleanup\": \"$CLEANUP\","
+        echo "    \"extended\": \"$RUN_EXTENDED\""
         echo "  },"
         echo "  \"summary\": {"
         echo "    \"total_tests\": $TOTAL_TESTS,"
@@ -840,6 +874,10 @@ generate_json_report() {
             
             if [ "$status" = "FAIL" ] && [ -n "$error_msg" ]; then
                 echo -n ",\"error\": \"$(json_escape "$error_msg")\""
+            fi
+
+            if [ "$status" = "SKIP" ] && [ -n "$error_msg" ]; then
+                echo -n ",\"reason\": \"$(json_escape "$error_msg")\""
             fi
             
             echo -n "}"
@@ -1519,18 +1557,22 @@ main() {
     while [[ $# -gt 0 ]]; do
         case $1 in
             -t|--test-dir)
+                require_arg "$1" "${2-}"
                 TEST_DIR="$2"
                 shift 2
                 ;;
             --cleanup)
+                require_01 "$1" "${2-}"
                 CLEANUP="$2"
                 shift 2
                 ;;
             -e|--extended)
+                require_01 "$1" "${2-}"
                 RUN_EXTENDED="$2"
                 shift 2
                 ;;
             --json-output)
+                require_arg "$1" "${2-}"
                 JSON_OUTPUT="$2"
                 shift 2
                 ;;
@@ -1575,6 +1617,13 @@ main() {
     test_file_locks
     test_delayed_delete
     test_python_high_frequency_write
+    if [ "$RUN_EXTENDED" = "1" ]; then
+        test_fuse_reload
+    else
+        print_info "Extended test skipped (FUSE hot reload). Use --extended 1 to enable"
+        record_json_skip "Test 15: FUSE Hot Reload" "Testing FUSE hot reload functionality" \
+            "skipped; use --extended 1"
+    fi
     test_mmap
     test_pwrite_visibility
     test_rename
@@ -1587,10 +1636,11 @@ main() {
     test_symlink_owner
 
     if [ "$RUN_EXTENDED" = "1" ]; then
-        test_fuse_reload
         test_git_clone
     else
-        print_info "Extended tests skipped (FUSE hot reload, git clone). Use --extended 1 to enable"
+        print_info "Extended test skipped (git clone). Use --extended 1 to enable"
+        record_json_skip "Test 16: Git Clone Operations" "Git clone operations" \
+            "skipped; use --extended 1"
     fi
 
     print_info "All test functions completed"
