@@ -822,7 +822,20 @@ impl CurvineFileSystem {
             }
         }
 
+        // Changing the group is also privileged for non-root: caller must own the
+        // file *and* belong to the target group (POSIX chown). Membership alone is
+        // not sufficient — #1500 dropped the owner gate and allowed non-owners who
+        // share the target group to chgrp (ACL bypass / setuid strip).
+        // See CurvineIO/curvine#1548 (originally gongxun0928/curvine#18).
         if let Some(gid) = target_gid {
+            if gid != file_gid && caller_uid != file_uid {
+                return err_fuse!(
+                    libc::EPERM,
+                    "setattr gid change denied: caller uid {} is not file owner (uid {})",
+                    caller_uid,
+                    file_uid
+                );
+            }
             if gid != file_gid && !FuseUtils::caller_in_file_group(caller_gid, gid, caller_pid) {
                 return err_fuse!(
                     libc::EPERM,
@@ -2682,6 +2695,23 @@ mod tests {
             Some(100),
         )
         .unwrap();
+    }
+
+    /// Issue #18 / gongxun0928#18: non-owner who is a member of the *target* group must
+    /// still get EPERM (owner gate ∧ group membership).
+    #[test]
+    fn setattr_permission_denies_non_owner_gid_change_even_if_in_target_group() {
+        let err = super::CurvineFileSystem::check_setattr_permission(
+            true,
+            &hdr(2000, 3000, 0),
+            1000, // file owned by another user
+            100,  // current file gid
+            FATTR_GID,
+            None,
+            Some(3000), // caller primary gid — membership OK, ownership not
+        )
+        .unwrap_err();
+        assert_eq!(err.errno(), libc::EPERM);
     }
 
     #[test]
