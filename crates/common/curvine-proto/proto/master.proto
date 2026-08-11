@@ -89,7 +89,9 @@ message DeleteRequest {
     required bool recursive = 2;
 }
 
-message DeleteResponse {}
+message DeleteResponse {
+    optional FreeResultProto res = 1;
+}
 
 message FreeRequest {
     required string path = 1;

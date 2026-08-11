@@ -176,6 +176,7 @@ impl InodeStore {
                 _ => {
                     deleted_files += 1;
                     let res = self.decrement_inode_nlink(inode.id(), ctime, &mut batch)?;
+                    del_res.bytes += res.bytes;
                     del_res.blocks.extend(res.blocks);
                 }
             }
@@ -486,7 +487,9 @@ impl InodeStore {
                         batch.delete_inode(inode_id)?;
 
                         // Collect block info
-                        del_res.blocks.extend(f.get_locs(self)?);
+                        let locs = f.get_locs(self)?;
+                        del_res.bytes = f.get_locs_bytes(&locs) as u64;
+                        del_res.blocks.extend(locs);
 
                         self.ttl_bucket_list.remove(&inode_view);
                     } else {

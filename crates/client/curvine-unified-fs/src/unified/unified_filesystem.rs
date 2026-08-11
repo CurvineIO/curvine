@@ -304,22 +304,27 @@ impl UnifiedFileSystem {
         mount: &MountInfo,
         recursive: bool,
     ) -> FsResult<FreeResult> {
-        let free_res = self.cv.free(path, recursive).await?;
+        let mut total = FreeResult::default();
 
         if path.path() == mount.cv_path && recursive {
             for status in self.cv.list_status(path).await? {
                 let child = Path::from_str(status.path)?;
-                if let Err(e) = self.cv.delete(&child, true).await {
-                    if !matches!(e, FsError::FileNotFound(_)) {
+                match self.cv.delete_with_stats(&child, true).await {
+                    Ok(res) => {
+                        total.inodes += res.inodes;
+                        total.bytes += res.bytes;
+                    }
+                    Err(FsError::FileNotFound(_)) => {}
+                    Err(e) => {
                         return Err(e);
                     }
                 }
             }
         } else {
-            self.cv.delete(path, recursive).await?;
+            total = self.cv.delete_with_stats(path, recursive).await?;
         }
 
-        Ok(free_res)
+        Ok(total)
     }
 
     pub async fn symlink(&self, target: &str, link: &Path, force: bool) -> FsResult<()> {

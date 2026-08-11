@@ -19,6 +19,8 @@ use std::collections::HashMap;
 pub struct DeleteResult {
     // Number of inodes removed
     pub(crate) inodes: u64,
+    // Bytes released by removed file inodes
+    pub(crate) bytes: u64,
     // Which blocks need to be deleted
     pub(crate) blocks: HashMap<i64, Vec<BlockLocation>>,
 }
@@ -33,6 +35,7 @@ impl DeleteResult {
     pub fn new() -> Self {
         Self {
             inodes: 0,
+            bytes: 0,
             blocks: Default::default(),
         }
     }

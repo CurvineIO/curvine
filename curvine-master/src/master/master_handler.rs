@@ -206,8 +206,12 @@ impl MasterHandler {
     }
 
     pub fn delete0(&self, req_id: i64, header: DeleteRequest) -> FsResult<bool> {
+        self.delete_with_stats0(req_id, header).map(|_| true)
+    }
+
+    pub fn delete_with_stats0(&self, req_id: i64, header: DeleteRequest) -> FsResult<FreeResult> {
         if self.check_is_retry(req_id)? {
-            return Ok(true);
+            return Ok(FreeResult::default());
         }
 
         let path = Path::from_str(&header.path)?;
@@ -217,7 +221,7 @@ impl MasterHandler {
             }
         }
 
-        let res = self.fs.delete(&header.path, header.recursive);
+        let res = self.fs.delete_with_stats(&header.path, header.recursive);
         self.set_req_cache(req_id, res)
     }
 
@@ -225,8 +229,10 @@ impl MasterHandler {
         let header: DeleteRequest = ctx.parse_header()?;
         ctx.set_audit(Some(header.path.to_string()), None);
 
-        self.delete0(ctx.msg.req_id(), header)?;
-        let rep_header = DeleteResponse::default();
+        let res = self.delete_with_stats0(ctx.msg.req_id(), header)?;
+        let rep_header = DeleteResponse {
+            res: Some(ProtoUtils::free_res_to_pb(res)),
+        };
         ctx.response(rep_header)
     }
 

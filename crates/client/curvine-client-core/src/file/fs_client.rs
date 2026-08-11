@@ -175,6 +175,19 @@ impl FsClient {
         Ok(())
     }
 
+    pub async fn delete_with_stats(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
+        let header = DeleteRequest {
+            path: path.encode(),
+            recursive,
+        };
+
+        let rep: DeleteResponse = self.rpc(RpcCode::Delete, header).await?;
+        match rep.res {
+            Some(res) => Ok(ProtoUtils::free_res_from_pb(res)),
+            None => err_box!("delete response missing free result"),
+        }
+    }
+
     pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
         let header = FreeRequest {
             path: path.encode(),
