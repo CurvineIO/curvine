@@ -309,7 +309,7 @@ impl UnifiedFileSystem {
         if path.path() == mount.cv_path && recursive {
             for status in self.cv.list_status(path).await? {
                 let child = Path::from_str(status.path)?;
-                match self.cv.delete_with_stats(&child, true).await {
+                match self.cv.delete(&child, true).await {
                     Ok(res) => {
                         total.inodes += res.inodes;
                         total.bytes += res.bytes;
@@ -321,7 +321,7 @@ impl UnifiedFileSystem {
                 }
             }
         } else {
-            total = self.cv.delete_with_stats(path, recursive).await?;
+            total = self.cv.delete(path, recursive).await?;
         }
 
         Ok(total)
@@ -1064,7 +1064,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         self.rename_with_flags(src, dst, RenameFlags::empty()).await
     }
 
-    async fn delete(&self, path: &Path, recursive: bool) -> FsResult<()> {
+    async fn delete(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
         let fut = async {
             match self.get_mount_checked(path, RpcCode::Delete).await? {
                 None => self.cv.delete(path, recursive).await,
@@ -1077,16 +1077,21 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                         );
                     }
 
-                    mount.ufs()?.delete(&ufs_path, recursive).await?;
+                    let mut free_res = mount.ufs()?.delete(&ufs_path, recursive).await?;
 
                     // delete cache
-                    if let Err(e) = self.cv.delete(path, recursive).await {
-                        if !matches!(e, FsError::FileNotFound(_)) {
+                    match self.cv.delete(path, recursive).await {
+                        Ok(res) => {
+                            free_res.inodes += res.inodes;
+                            free_res.bytes += res.bytes;
+                        }
+                        Err(FsError::FileNotFound(_)) => {}
+                        Err(e) => {
                             warn!("failed to delete cache for {}: {}", path, e);
                         }
-                    };
+                    }
 
-                    Ok(())
+                    Ok(free_res)
                 }
             }
         };

@@ -21,8 +21,8 @@ use curvine_model::MountOptions;
 use curvine_model::ProtoUtils;
 use curvine_model::{
     BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
-    CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, LocatedBlock, MkdirOptsBuilder,
-    StorageType, TtlAction, WorkerAddress, WorkerInfo,
+    CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FreeResult, LocatedBlock,
+    MkdirOptsBuilder, StorageType, TtlAction, WorkerAddress, WorkerInfo,
 };
 use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
@@ -1816,11 +1816,11 @@ fn delete_file_retry(handler: &mut MasterHandler) -> CommonResult<()> {
         recursive: false,
     };
 
-    let f1 = handler.delete0(id, req.clone())?;
-    assert!(f1);
+    let f1: FreeResult = handler.delete0(id, req.clone())?;
+    assert_eq!(f1.inodes, 1);
 
     let f2 = handler.delete0(id, req.clone())?;
-    assert!(f2);
+    assert_eq!(f2.inodes, 0);
 
     Ok(())
 }

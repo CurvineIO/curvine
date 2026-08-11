@@ -21,7 +21,7 @@ use async_stream::stream;
 use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
-use curvine_model::{FileStatus, ListOptions, SetAttrOpts};
+use curvine_model::{FileStatus, FreeResult, ListOptions, SetAttrOpts};
 use std::fs;
 
 #[derive(Clone)]
@@ -74,7 +74,7 @@ impl FileSystem<LocalWriter, LocalReader> for LocalFilesystem {
         Ok(true)
     }
 
-    async fn delete(&self, path: &Path, recursive: bool) -> FsResult<()> {
+    async fn delete(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
         if path.path() == Path::SEPARATOR {
             return err_box!("Cannot delete root directory.");
         }
@@ -89,7 +89,7 @@ impl FileSystem<LocalWriter, LocalReader> for LocalFilesystem {
         } else {
             fs::remove_file(path.path())?;
         }
-        Ok(())
+        Ok(FreeResult::default())
     }
 
     async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {

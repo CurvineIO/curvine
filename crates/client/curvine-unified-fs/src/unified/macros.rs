@@ -449,7 +449,7 @@ macro_rules! impl_filesystem_for_enum {
                 &self,
                 path: &::curvine_fs_api::Path,
                 recursive: bool,
-            ) -> ::curvine_error::FsResult<()> {
+            ) -> ::curvine_error::FsResult<::curvine_model::FreeResult> {
                 match self {
                     $(
                         $(#[$cfg])*

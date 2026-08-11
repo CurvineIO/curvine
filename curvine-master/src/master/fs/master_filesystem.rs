@@ -262,15 +262,7 @@ impl MasterFilesystem {
         self.mkdir_with_opts(path, opts)
     }
 
-    pub fn delete<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<bool> {
-        self.delete_with_stats(path, recursive).map(|_| true)
-    }
-
-    pub fn delete_with_stats<T: AsRef<str>>(
-        &self,
-        path: T,
-        recursive: bool,
-    ) -> FsResult<FreeResult> {
+    pub fn delete<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<FreeResult> {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
 

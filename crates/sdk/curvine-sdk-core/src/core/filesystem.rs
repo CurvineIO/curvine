@@ -58,7 +58,7 @@ impl LibFilesystem {
             .block_on(async { self.inner().rename(&src_path, &dst_path).await })
     }
 
-    pub fn delete(&self, path: impl AsRef<str>, recursive: bool) -> FsResult<()> {
+    pub fn delete(&self, path: impl AsRef<str>, recursive: bool) -> FsResult<FreeResult> {
         let path = Path::from_str(path)?;
         self.rt()
             .block_on(async { self.inner().delete(&path, recursive).await })

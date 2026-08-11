@@ -183,12 +183,8 @@ impl CurvineFileSystem {
         self.fs_client.rename(src, dst, flags).await
     }
 
-    pub async fn delete(&self, path: &Path, recursive: bool) -> FsResult<()> {
+    pub async fn delete(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
         self.fs_client.delete(path, recursive).await
-    }
-
-    pub async fn delete_with_stats(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
-        self.fs_client.delete_with_stats(path, recursive).await
     }
 
     pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
@@ -567,7 +563,7 @@ impl FileSystem<FsWriter, FsReader> for CurvineFileSystem {
         self.rename(src, dst).await
     }
 
-    async fn delete(&self, path: &Path, recursive: bool) -> FsResult<()> {
+    async fn delete(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
         self.delete(path, recursive).await
     }
 

@@ -45,7 +45,7 @@ impl FileSystemClient {
         self.unified().rename(&src_path, &dst_path).await
     }
 
-    pub async fn delete(&self, path: impl AsRef<str>, recursive: bool) -> FsResult<()> {
+    pub async fn delete(&self, path: impl AsRef<str>, recursive: bool) -> FsResult<FreeResult> {
         let path = Path::from_str(path)?;
         self.unified().delete(&path, recursive).await
     }

@@ -34,8 +34,8 @@ use curvine_error::FsError;
 use curvine_fs_api::{FileSystem, ListStream, Path};
 use curvine_fs_api::{StateReader, StateWriter};
 use curvine_model::{
-    CreateFileOpts, FileAllocOpts, FileStatus, ListOptions, MkdirOpts, OpenFlags, RenameFlags,
-    SetAttrOpts,
+    CreateFileOpts, FileAllocOpts, FileStatus, FreeResult, ListOptions, MkdirOpts, OpenFlags,
+    RenameFlags, SetAttrOpts,
 };
 use curvine_runtime::common::FastHashMap;
 use curvine_runtime::sync::{AsyncMutex, AsyncSharedMap, AtomicCounter, RwLockHashMap};
@@ -678,12 +678,12 @@ impl NodeState {
     pub fn complete_deferred_delete(
         &self,
         ino: u64,
-        delete_result: Result<(), FsError>,
+        delete_result: Result<FreeResult, FsError>,
     ) -> FuseResult<()> {
         // Keep the mark observable after failure; reclaiming it without another
         // FUSE request would need a background retry, which is not yet implemented.
         match delete_result {
-            Ok(()) | Err(FsError::FileNotFound(_)) => self.clear_mark_delete(ino),
+            Ok(_) | Err(FsError::FileNotFound(_)) => self.clear_mark_delete(ino),
             Err(e) => Err(e.into()),
         }
     }
@@ -705,7 +705,7 @@ impl NodeState {
         // not failed by ENOENT on a stale name.
         let Some(ino) = ino else {
             return match self.fs.delete(&path, false).await {
-                Ok(()) | Err(FsError::FileNotFound(_)) => Ok(()),
+                Ok(_) | Err(FsError::FileNotFound(_)) => Ok(()),
                 Err(e) => Err(e.into()),
             };
         };
@@ -728,7 +728,7 @@ impl NodeState {
                     .await?;
             }
             match self.fs.delete(&path, false).await {
-                Ok(()) | Err(FsError::FileNotFound(_)) => (),
+                Ok(_) | Err(FsError::FileNotFound(_)) => (),
                 Err(e) => {
                     self.restore_unlink_state(rollback)?;
                     return Err(e.into());
@@ -753,7 +753,7 @@ impl NodeState {
         }
 
         match self.fs.delete(&path, false).await {
-            Ok(()) => (),
+            Ok(_) => (),
             Err(FsError::FileNotFound(_)) => (),
             Err(e) => {
                 self.restore_unlink_state(rollback)?;

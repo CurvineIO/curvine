@@ -90,7 +90,7 @@ message DeleteRequest {
 }
 
 message DeleteResponse {
-    optional FreeResultProto res = 1;
+    required FreeResultProto res = 1;
 }
 
 message FreeRequest {
