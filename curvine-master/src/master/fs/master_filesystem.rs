@@ -612,14 +612,14 @@ impl MasterFilesystem {
         match inode_id {
             Some(v) if v > 0 => match fs_dir.store.get_inode(v, None)? {
                 Some(view) => Ok(InodePtr::from_owned(view)),
-                None => err_box!("File inode {} not exists", v),
+                None => err_ext!(FsError::file_not_found(path)),
             },
 
             _ => {
                 let inp = Self::resolve_path(fs_dir, path)?;
                 match inp.task_last() {
                     Some(ptr) => Ok(ptr),
-                    None => err_box!("File {} not exists", path),
+                    None => err_ext!(FsError::file_not_found(path)),
                 }
             }
         }
