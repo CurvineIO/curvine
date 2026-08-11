@@ -217,11 +217,6 @@ message FreeResultProto {
     required int64 bytes = 3;
 }
 
-message DeleteResultProto {
-    required int64 inodes = 1;
-    required int64 bytes = 2;
-}
-
 message ListOptionsProto {
     optional int32 limit = 1;
     optional string start_after = 2;

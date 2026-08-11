@@ -755,19 +755,12 @@ impl ProtoUtils {
         }
     }
 
-    pub fn delete_res_from_pb(res: DeleteResultProto) -> DeleteResult {
-        DeleteResult {
-            inodes: res.inodes as u64,
-            bytes: res.bytes as u64,
-            ..Default::default()
-        }
+    pub fn delete_res_from_pb(res: FreeResultProto) -> DeleteResult {
+        Self::free_res_from_pb(res).into()
     }
 
-    pub fn delete_res_to_pb(res: DeleteResult) -> DeleteResultProto {
-        DeleteResultProto {
-            inodes: res.inodes as i64,
-            bytes: res.bytes as i64,
-        }
+    pub fn delete_res_to_pb(res: DeleteResult) -> FreeResultProto {
+        Self::free_res_to_pb(res.into())
     }
 }
 
