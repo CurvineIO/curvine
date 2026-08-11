@@ -196,7 +196,7 @@ impl FuseResponse {
         if self.debug
             || !matches!(
                 e.errno,
-                libc::ENOENT | libc::ENODATA | libc::ENOSYS | libc::ENOTEMPTY
+                libc::ENOENT | libc::ENODATA | libc::ENOSYS | libc::ENOTEMPTY | libc::ENOTTY
             )
         {
             warn!("send_rep unique {}: {}", self.unique, e);
