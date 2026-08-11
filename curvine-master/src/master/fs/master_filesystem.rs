@@ -612,7 +612,7 @@ impl MasterFilesystem {
         match inode_id {
             Some(v) if v > 0 => match fs_dir.store.get_inode(v, None)? {
                 Some(view) => Ok(InodePtr::from_owned(view)),
-                None => err_ext!(FsError::file_not_found(path)),
+                None => err_ext!(FsError::file_not_found(path).ctx(format!("inode_id={}", v))),
             },
 
             _ => {
@@ -1733,6 +1733,46 @@ impl MasterFilesystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use curvine_core_error::ErrorExt;
+    use curvine_error::ErrorKind;
+    use curvine_runtime::common::Utils;
+
+    fn test_fs(name: &str) -> MasterFilesystem {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.meta_dir = Utils::test_sub_dir(format!(
+            "master-fs-resolve-test/meta-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        conf.journal.journal_dir = Utils::test_sub_dir(format!(
+            "master-fs-resolve-test/journal-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        JournalSystem::fs_only_for_test(&conf).unwrap()
+    }
+
+    fn assert_file_not_found_roundtrip(err: &FsError) {
+        assert!(
+            matches!(err.kind(), ErrorKind::FileNotFound),
+            "expected FileNotFound, got {:?}",
+            err.kind()
+        );
+        let decoded = FsError::decode(err.encode());
+        assert!(
+            matches!(decoded.kind(), ErrorKind::FileNotFound),
+            "expected FileNotFound after encode/decode, got {:?}",
+            decoded.kind()
+        );
+        assert!(
+            matches!(decoded, FsError::FileNotFound(_)),
+            "decoded error collapsed away from FileNotFound: {}",
+            decoded
+        );
+    }
 
     #[test]
     fn fallocate_rejects_growth_larger_than_available_capacity() {
@@ -1751,5 +1791,39 @@ mod tests {
     fn truncate_growth_does_not_require_physical_capacity() {
         let opts = FileAllocOpts::with_truncate(200);
         assert!(MasterFilesystem::validate_alloc_capacity(20, 2, &opts, 0).is_ok());
+    }
+
+    #[test]
+    fn resolve_file_inode_missing_inode_id_returns_file_not_found() {
+        let fs = test_fs("missing-inode-id");
+        let sync_fs_dir = fs.fs_dir();
+        let fs_dir = sync_fs_dir.read();
+        let missing_id = 9_999_999_i64;
+        let err = MasterFilesystem::resolve_file_inode(&fs_dir, "/missing", Some(missing_id))
+            .unwrap_err();
+
+        assert_file_not_found_roundtrip(&err);
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("inode_id={}", missing_id)),
+            "expected inode_id in error context, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn resolve_file_inode_unresolved_path_returns_file_not_found() {
+        let fs = test_fs("unresolved-path");
+        let sync_fs_dir = fs.fs_dir();
+        let fs_dir = sync_fs_dir.read();
+        let path = "/does/not/exist";
+        let err = MasterFilesystem::resolve_file_inode(&fs_dir, path, None).unwrap_err();
+
+        assert_file_not_found_roundtrip(&err);
+        assert!(
+            err.to_string().contains(path),
+            "expected path in error, got: {}",
+            err
+        );
     }
 }
