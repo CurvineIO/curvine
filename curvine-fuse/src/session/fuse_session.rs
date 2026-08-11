@@ -14,6 +14,7 @@
 
 #![allow(unused_variables, unused)]
 
+use super::fuse_mnt::describe_fuse_fd_error;
 use crate::fs::operator::FuseOperator;
 use crate::fs::FileSystem;
 use crate::fuse_metrics::{
@@ -26,9 +27,9 @@ use crate::raw::fuse_abi::*;
 use crate::session::channel::{FuseChannel, FuseReceiver, FuseSender};
 use crate::session::FuseRequest;
 use crate::session::{FuseMnt, FuseResponse};
-use crate::{err_fuse, FuseResult};
+use crate::{err_fuse, FuseError, FuseResult};
 use curvine_config::{ClusterConf, FuseConf};
-use curvine_core_error::{err_box, err_msg, CommonResult};
+use curvine_core_error::CommonResult;
 use curvine_fs_api::{StateReader, StateWriter};
 use curvine_io::IOResult;
 use curvine_runtime::common::CommonUtils;
@@ -389,14 +390,14 @@ impl<T: FileSystem> FuseSession<T> {
         Ok(())
     }
 
-    async fn setup_mnts(conf: &FuseConf, fs: &T) -> CommonResult<Vec<FuseMnt>> {
+    async fn setup_mnts(conf: &FuseConf, fs: &T) -> FuseResult<Vec<FuseMnt>> {
         if let Ok(state_file) = std::env::var(Self::STATE_PATH) {
             Self::restore(&state_file, conf, fs).await
         } else {
             let mut mnts = vec![];
             let all_mnt_paths = conf.get_all_mnt_path()?;
             for path in all_mnt_paths {
-                mnts.push(FuseMnt::new(path, conf)?);
+                mnts.push(FuseMnt::new(path, conf).map_err(FuseError::from_startup_io_error)?);
             }
             Ok(mnts)
         }
@@ -428,11 +429,23 @@ impl<T: FileSystem> FuseSession<T> {
             for mut mnt in mnts {
                 mnt.auto_unmount(false);
 
-                let flags = sys::fcntl_get(mnt.fd)?;
+                let flags = sys::fcntl_get(mnt.fd).map_err(|error| {
+                    describe_fuse_fd_error(
+                        "read FUSE fd flags for reload persistence",
+                        mnt.fd,
+                        error.into(),
+                    )
+                })?;
                 // Propagate the F_SETFD failure: if clearing FD_CLOEXEC fails the
                 // persisted fd cannot be inherited by the child, so the persist must
                 // fail rather than silently report success with an unusable state file.
-                sys::fcntl_set(mnt.fd, flags & !libc::FD_CLOEXEC)?;
+                sys::fcntl_set(mnt.fd, flags & !libc::FD_CLOEXEC).map_err(|error| {
+                    describe_fuse_fd_error(
+                        "clear FD_CLOEXEC for reload persistence",
+                        mnt.fd,
+                        error.into(),
+                    )
+                })?;
 
                 fds.insert(mnt.fd, mnt.path.to_string_lossy().to_string());
             }
@@ -465,7 +478,7 @@ impl<T: FileSystem> FuseSession<T> {
         Ok(())
     }
 
-    async fn restore(file: &str, conf: &FuseConf, fs: &T) -> CommonResult<Vec<FuseMnt>> {
+    async fn restore(file: &str, conf: &FuseConf, fs: &T) -> FuseResult<Vec<FuseMnt>> {
         let enabled = conf.metrics_enabled;
         let result = Self::restore_inner(file, conf, fs, enabled).await;
         if enabled {
@@ -484,27 +497,47 @@ impl<T: FileSystem> FuseSession<T> {
         conf: &FuseConf,
         fs: &T,
         enabled: bool,
-    ) -> CommonResult<Vec<FuseMnt>> {
+    ) -> FuseResult<Vec<FuseMnt>> {
         // If environment variable exists, restore state information from state file
         let mut mnts = vec![];
-        let mut reader = StateReader::new(file)?;
+        let mut reader = StateReader::new(file).map_err(FuseError::from_startup_io_error)?;
         let ts = TimeSpent::new();
         info!("restore: task started, path={}", reader.path());
 
         {
             let stage = StateStageTimer::start(enabled, false, STATE_STAGE_MOUNT_FDS);
             // Read and process mount point file descriptors
-            let fds: HashMap<RawIO, String> = reader.read_struct()?;
+            let fds: HashMap<RawIO, String> = reader
+                .read_struct()
+                .map_err(FuseError::from_startup_io_error)?;
             info!("restore: read mount fds {:?}", fds);
             if fds.is_empty() {
-                return err_box!("no fd found in state file {}", reader.path());
+                return Err(FuseError::from(format!(
+                    "no fd found in state file {}",
+                    reader.path()
+                )));
             }
             for (fd, path) in fds {
-                let flags = sys::fcntl_get(fd)?;
-                sys::fcntl_set(fd, flags | libc::FD_CLOEXEC)?;
+                let flags = sys::fcntl_get(fd).map_err(|error| {
+                    FuseError::from_startup_io_error(describe_fuse_fd_error(
+                        "read FUSE fd flags during reload restore",
+                        fd,
+                        error.into(),
+                    ))
+                })?;
+                sys::fcntl_set(fd, flags | libc::FD_CLOEXEC).map_err(|error| {
+                    FuseError::from_startup_io_error(describe_fuse_fd_error(
+                        "set FD_CLOEXEC during reload restore",
+                        fd,
+                        error.into(),
+                    ))
+                })?;
 
                 let path_buf = PathBuf::from(path);
-                mnts.push(FuseMnt::from_fd(path_buf, conf, fd)?);
+                mnts.push(
+                    FuseMnt::from_fd(path_buf, conf, fd)
+                        .map_err(FuseError::from_startup_io_error)?,
+                );
             }
             if let Some(stage) = stage {
                 stage.success();

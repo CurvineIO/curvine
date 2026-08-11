@@ -992,6 +992,15 @@ impl CurvineFileSystem {
         (major, minor) >= FUSE_MIN_ABI
     }
 
+    fn unsupported_abi_message(major: u32, minor: u32) -> String {
+        format!(
+            "The kernel FUSE protocol ABI {major}.{minor} is unsupported; Curvine requires >= {FUSE_KERNEL_VERSION}.{FUSE_KERNEL_MINOR_VERSION}. \
+             This ABI is supplied by the running kernel, not the userspace fuse/fuse3 package. \
+             Use a host kernel that reports FUSE ABI >= {FUSE_KERNEL_VERSION}.{FUSE_KERNEL_MINOR_VERSION}, \
+             or use the Curvine CLI/SDK without FUSE."
+        )
+    }
+
     /// The INIT reply for a kernel whose major ABI is newer than the daemon's: advertise only the
     /// daemon's own `(major, minor)` with no negotiated flags, and leave every other field zeroed.
     fn version_only_init_out() -> fuse_init_out {
@@ -1006,14 +1015,8 @@ impl CurvineFileSystem {
 impl fs::FileSystem for CurvineFileSystem {
     async fn init(&self, op: Init<'_>) -> FuseResult<fuse_init_out> {
         if !Self::abi_supported(op.arg.major, op.arg.minor) {
-            return err_fuse!(
-                libc::EPROTO,
-                "unsupported FUSE ABI {}.{}: curvine requires >= {}.{}",
-                op.arg.major,
-                op.arg.minor,
-                FUSE_KERNEL_VERSION,
-                FUSE_KERNEL_MINOR_VERSION
-            );
+            let message = Self::unsupported_abi_message(op.arg.major, op.arg.minor);
+            return err_fuse!(libc::EPROTO, "{}", message);
         }
 
         // Newer kernel major: reply with our version only and negotiate no flags.
@@ -3089,6 +3092,17 @@ mod tests {
     #[test]
     fn advertised_timestamp_granularity_matches_millisecond_storage() {
         assert_eq!(super::FUSE_TIME_GRANULARITY_NS, 1_000_000);
+    }
+
+    #[test]
+    fn unsupported_abi_message_explains_kernel_requirement() {
+        let message = CurvineFileSystem::unsupported_abi_message(7, 22);
+
+        assert!(message.contains("kernel FUSE protocol ABI 7.22"));
+        assert!(message.contains("requires >= 7.31"));
+        assert!(message.contains("userspace fuse/fuse3 package"));
+        assert!(message.contains("running kernel"));
+        assert!(message.contains("CLI/SDK without FUSE"));
     }
 
     // Higher-major short reply (mirrors libfuse `_do_init`'s `arg->major > 7`

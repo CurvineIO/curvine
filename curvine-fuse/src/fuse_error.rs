@@ -42,6 +42,13 @@ impl FuseError {
         Self::new(normalize_errno(errno), error)
     }
 
+    /// Preserve an OS errno for daemon startup failures without changing the
+    /// established EIO normalization used by runtime request paths.
+    pub(crate) fn from_startup_io_error(value: IOError) -> Self {
+        let errno = value.raw_error().raw_os_error().unwrap_or(libc::EIO);
+        Self::from_errno_msg(errno, value.into())
+    }
+
     pub(crate) fn errno(&self) -> i32 {
         self.errno
     }
@@ -198,6 +205,7 @@ pub(crate) fn splice_errno_label(errno: i32) -> &'static str {
 mod tests {
     use super::{errno_label, splice_errno_label, FuseError};
     use curvine_error::FsError;
+    use curvine_io::IOError;
 
     // Display prints the errno NUMBER first, then the message ("errno 2: ...").
     #[test]
@@ -238,6 +246,15 @@ mod tests {
         let err: FuseError = FsError::read_only("/mnt/ro").into();
         assert_eq!(err.errno, libc::EROFS);
         assert_eq!(errno_label(err.errno), "EROFS");
+    }
+
+    #[test]
+    fn startup_io_error_preserves_os_errno() {
+        let error = IOError::from(std::io::Error::from_raw_os_error(libc::EPERM));
+        let error = FuseError::from_startup_io_error(error);
+
+        assert_eq!(error.errno, libc::EPERM);
+        assert!(error.to_string().contains("Operation not permitted"));
     }
 
     #[test]

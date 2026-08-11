@@ -20,6 +20,7 @@ use crate::fuse_metrics::{
     FuseReqKind, FuseReqLabels, FuseReqStatus, RECEIVE_ACTION_CONTINUE, RECEIVE_ACTION_EXIT,
 };
 use crate::raw::fuse_abi::fuse_out_header;
+use crate::session::channel::{new_splice_pipe, SplicePipeSetupError};
 use crate::session::{FuseOpCode, FuseRequest, FuseResponse, FuseTask};
 use crate::{err_fuse, FuseResult, FUSE_IN_HEADER_LEN};
 use bytes::BytesMut;
@@ -29,7 +30,7 @@ use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::channel::AsyncSender;
 use curvine_runtime::sync::FastDashMap;
 use curvine_sys as sys;
-use curvine_sys::pipe::{AsyncFd, Pipe2, PipeFd};
+use curvine_sys::pipe::{AsyncFd, Pipe2};
 use libc::{EAGAIN, ECONNABORTED, EINTR, ENODEV, ENOENT};
 use log::{debug, error, info, warn};
 use std::sync::Arc;
@@ -98,7 +99,7 @@ pub struct FuseReceiver<T> {
 
 impl<T: FileSystem> FuseReceiver<T> {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub(super) fn new(
         fs: Arc<T>,
         rt: Arc<Runtime>,
         kernel_fd: Arc<AsyncFd>,
@@ -109,9 +110,9 @@ impl<T: FileSystem> FuseReceiver<T> {
         metrics_enabled: bool,
         pending_requests: Arc<FastDashMap<u64, Arc<Notify>>>,
         enable_splice: bool,
-    ) -> IOResult<Self> {
+    ) -> Result<Self, SplicePipeSetupError> {
         let pipe2 = if enable_splice {
-            Some(Pipe2::new(PipeFd::new(buf_size, false, false)?)?)
+            Some(new_splice_pipe(buf_size)?)
         } else {
             None
         };

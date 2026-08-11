@@ -20,12 +20,11 @@
 
 SERVICE_NAME=$1
 ACTION=$2
-PARAMS="${@:3}"
+PARAMS=("${@:3}")
 
 PID_FILE=${CURVINE_HOME}/${SERVICE_NAME}.pid
 GRACEFULLY_TIMEOUT=15
 RELOAD_LOCK_FILE=${CURVINE_HOME}/${SERVICE_NAME}.reload.lock
-
 LOG_DIR=${CURVINE_HOME}/logs
 OUT_FILE=${LOG_DIR}/${SERVICE_NAME}.out
 
@@ -34,17 +33,34 @@ if [ -z "$CURVINE_CONF_FILE" ]; then
   export CURVINE_CONF_FILE=$CURVINE_HOME/conf/curvine-cluster.toml
 fi
 
-mkdir -p ${LOG_DIR}
+if ! mkdir -p "${LOG_DIR}"; then
+  echo "Failed to create Curvine log directory: ${LOG_DIR}" >&2
+  exit 1
+fi
 
-cd ${CURVINE_HOME}
+cd "${CURVINE_HOME}"
+
+has_fuse_conf_arg() {
+  local arg
+  for arg in "${PARAMS[@]}"; do
+    case "${arg}" in
+      --conf|--conf=*|-c|-c=*|-c?*)
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
 
 check() {
   if [ -f "${PID_FILE}" ]; then
-    local PID=`cat ${PID_FILE}`
-    if kill -0 ${PID} > /dev/null 2>&1; then
+    local PID
+    PID=$(cat "${PID_FILE}")
+    if kill -0 "${PID}" > /dev/null 2>&1; then
       echo "${SERVICE_NAME} running, pid=${PID}. Please execute stop first"
       exit 1
     fi
+    rm -f "${PID_FILE}"
   fi
 }
 
@@ -54,16 +70,17 @@ start() {
     name="unknown"
     if [[ "$SERVICE_NAME" = "worker" ]] || [[ "$SERVICE_NAME" = "master" ]] || [[ "$SERVICE_NAME" = "transfer" ]]; then
       name="curvine-server"
-      nohup ${CURVINE_HOME}/lib/curvine-server \
+      nohup "${CURVINE_HOME}/lib/curvine-server" \
       --service ${SERVICE_NAME} \
-      --conf ${CURVINE_CONF_FILE} \
-      > ${OUT_FILE} 2>&1 < /dev/null  &
+      --conf "${CURVINE_CONF_FILE}" \
+      > "${OUT_FILE}" 2>&1 < /dev/null  &
     elif [[ "$SERVICE_NAME" = "fuse" ]]; then
        name="curvine-fuse"
-       nohup ${CURVINE_HOME}/lib/curvine-fuse \
-       $PARAMS \
-       --conf ${CURVINE_CONF_FILE} \
-       > ${OUT_FILE} 2>&1 < /dev/null  &
+       local fuse_args=("${CURVINE_HOME}/lib/curvine-fuse" "${PARAMS[@]}")
+       if ! has_fuse_conf_arg; then
+         fuse_args+=(--conf "${CURVINE_CONF_FILE}")
+       fi
+       nohup "${fuse_args[@]}" > "${OUT_FILE}" 2>&1 < /dev/null &
     else
        echo "Unknown service"
        exit
@@ -73,13 +90,15 @@ start() {
     sleep 3
 
     if [[ $(ps -p "${NEW_PID}" -o comm=) =~ $name ]]; then
-        echo ${NEW_PID} > ${PID_FILE}
+        echo "${NEW_PID}" > "${PID_FILE}"
         echo "${SERVICE_NAME} start success, pid=${NEW_PID}"
     else
-      echo "${SERVICE_NAME} start fail"
+      echo "${SERVICE_NAME} start failed; inspect ${OUT_FILE}" >&2
+      tail -n 80 "${OUT_FILE}" >&2 || true
+      return 1
     fi
 
-    head ${OUT_FILE}
+    head "${OUT_FILE}"
 }
 
 waitPid() {
@@ -99,16 +118,17 @@ waitPid() {
 
 stop() {
   if [ -f "${PID_FILE}" ]; then
-    local PID=`cat ${PID_FILE}`
-    if kill -0 $PID > /dev/null 2>&1; then
+    local PID
+    PID=$(cat "${PID_FILE}")
+    if kill -0 "$PID" > /dev/null 2>&1; then
       echo "stopping ${SERVICE_NAME}"
 
-      kill ${PID}
-      waitPid $PID;
+      kill "${PID}"
+      waitPid "$PID";
 
-      if kill -0 $PID > /dev/null 2>&1; then
-        echo "shuffle worker: ${SERVICE_NAME} did not stop gracefully after $GRACEFULLY_TIMEOUT seconds: killing with kill -9"
-        kill -9 $PID
+      if kill -0 "$PID" > /dev/null 2>&1; then
+        echo "${SERVICE_NAME} did not stop gracefully after ${GRACEFULLY_TIMEOUT} seconds; sending SIGKILL"
+        kill -9 "$PID"
       else
         echo "${SERVICE_NAME} stop gracefully"
       fi
@@ -133,13 +153,13 @@ reload() {
       exit 1
     else
       # Stale lock file, remove it
-      rm -f ${RELOAD_LOCK_FILE}
+      rm -f "${RELOAD_LOCK_FILE}"
     fi
   fi
   
   # Create lock file
-  echo $$ > ${RELOAD_LOCK_FILE}
-  trap "rm -f ${RELOAD_LOCK_FILE}" EXIT
+  echo $$ > "${RELOAD_LOCK_FILE}"
+  trap 'rm -f "${RELOAD_LOCK_FILE}"' EXIT
   
   if [ -f "${PID_FILE}" ]; then
     local OLD_PID=`cat ${PID_FILE}`
@@ -225,4 +245,4 @@ case $1 in
 esac
 }
 
-run ${ACTION}
+run "${ACTION}"
