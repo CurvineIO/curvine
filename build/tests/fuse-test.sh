@@ -33,6 +33,7 @@ source "$SCRIPT_DIR/colors.sh"
 TEST_DIR="/curvine-fuse/fuse-test"
 CLEANUP="1"  # Cleanup test files by default
 JSON_OUTPUT=""  # JSON output file path (empty = disabled)
+RUN_EXTENDED="0"  # Run extended tests (FUSE hot reload, git clone); 0=disabled by default
 
 # Test results tracking
 TOTAL_TESTS=0
@@ -68,12 +69,18 @@ This script tests basic filesystem operations including:
   - Files created in setgid directories inherit the parent group
   - Symlink owner and group metadata
 
+Extended tests (disabled by default, enable with --extended 1):
+  - FUSE hot reload: SIGUSR1 restart keeps open file handles and data intact
+  - Git clone: cloning a repository and running git status
+
 For FIO performance tests, use fio-test.sh instead.
 
 OPTIONS:
     -t, --test-dir PATH       Test directory path (default: /curvine-fuse/fuse-test)
         --cleanup <0|1>       Cleanup test files after completion (default: 1)
                               0=keep files, 1=cleanup files
+    -e, --extended <0|1>     Run extended tests (FUSE hot reload, git clone) (default: 0)
+                              0=skip extended tests, 1=run extended tests
         --json-output PATH    Output test results to JSON file (for regression testing)
     -h, --help                Show this help message
 
@@ -89,6 +96,9 @@ EXAMPLES:
     
     # Output results to JSON file for regression testing
     $0 --json-output /tmp/fuse-test-results.json
+
+    # Run extended tests (FUSE hot reload and git clone)
+    $0 --extended 1
 
 EOF
 }
@@ -1315,7 +1325,7 @@ PYTHON_SCRIPT
     rm -f "$test_file" 2>/dev/null || true
 }
 
-# Test 15: FUSE hot reload test
+# Test 15: FUSE hot reload (restart) test
 test_fuse_reload() {
     CURRENT_TEST_GROUP="Test 15: FUSE Hot Reload"
     print_header "$CURRENT_TEST_GROUP"
@@ -1440,16 +1450,20 @@ test_lookup_enametoolong() {
     run_python_script_test \
         "Testing lookup on overlong names returns ENAMETOOLONG" \
         "lookup_enametoolong_repro.py" --dir "$TEST_DIR"
+}
+
 # Test 25: files created in setgid directories inherit the parent group
 test_setgid_group_inherit() {
-    CURRENT_TEST_GROUP="Test 24: Setgid Group Inheritance"
+    CURRENT_TEST_GROUP="Test 25: Setgid Group Inheritance"
     print_header "$CURRENT_TEST_GROUP"
     run_python_script_test \
         "Testing file group inheritance in setgid directories" \
         "setgid_group_inherit_repro.py" --dir "$TEST_DIR"
+}
+
 # Test 26: symlink owner/group metadata
 test_symlink_owner() {
-    CURRENT_TEST_GROUP="Test 24: Symlink Owner"
+    CURRENT_TEST_GROUP="Test 26: Symlink Owner"
     print_header "$CURRENT_TEST_GROUP"
     run_python_script_test \
         "Testing symlink owner and group metadata" \
@@ -1512,6 +1526,10 @@ main() {
                 CLEANUP="$2"
                 shift 2
                 ;;
+            -e|--extended)
+                RUN_EXTENDED="$2"
+                shift 2
+                ;;
             --json-output)
                 JSON_OUTPUT="$2"
                 shift 2
@@ -1532,6 +1550,7 @@ main() {
     
     echo "Test Directory: $TEST_DIR"
     echo "Cleanup Files:  $([ "$CLEANUP" = "1" ] && echo "Enabled" || echo "Disabled")"
+    echo "Extended Tests: $([ "$RUN_EXTENDED" = "1" ] && echo "Enabled" || echo "Disabled")"
     if [ -n "$JSON_OUTPUT" ]; then
         echo "JSON Output:    $JSON_OUTPUT"
     fi
@@ -1556,7 +1575,6 @@ main() {
     test_file_locks
     test_delayed_delete
     test_python_high_frequency_write
-    test_fuse_reload
     test_mmap
     test_pwrite_visibility
     test_rename
@@ -1568,7 +1586,12 @@ main() {
     test_setgid_group_inherit
     test_symlink_owner
 
-    test_git_clone
+    if [ "$RUN_EXTENDED" = "1" ]; then
+        test_fuse_reload
+        test_git_clone
+    else
+        print_info "Extended tests skipped (FUSE hot reload, git clone). Use --extended 1 to enable"
+    fi
 
     print_info "All test functions completed"
 
