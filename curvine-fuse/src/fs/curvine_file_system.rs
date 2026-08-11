@@ -787,12 +787,24 @@ impl CurvineFileSystem {
         Self::permission_mask_allows(permission_bits, mask)
     }
 
+    /// True when normalized chown targets differ from the file's current uid/gid.
+    fn chown_effectively_changes(
+        target_uid: Option<u32>,
+        target_gid: Option<u32>,
+        file_uid: u32,
+        file_gid: u32,
+    ) -> bool {
+        target_uid.is_some_and(|u| u != file_uid) || target_gid.is_some_and(|g| g != file_gid)
+    }
+
     /// POSIX permission model for SETATTR issued by a non-root caller.
     ///
     /// `target_uid`/`target_gid` are the *normalized* chown targets: the caller is expected
     /// to have already dropped the `(uid_t)-1` / `(gid_t)-1` "keep current" sentinels to
-    /// `None` (see `CurvineFileSystem::set_attr`). Therefore a `Some(_)` here always denotes
-    /// a genuine ownership change request, and we no longer need to inspect the raw
+    /// `None` (see `CurvineFileSystem::set_attr`). Therefore a `Some(_)` here means the FATTR
+    /// bit is set and the value is not the (uid_t/gid_t)-1 sentinel; it may still equal the
+    /// current id and be a no-op for the suid/sgid side effect (see
+    /// `chown_effectively_changes`). We no longer need to inspect the raw
     /// FATTR_UID/FATTR_GID bits or special-case `u32::MAX`.
     fn check_setattr_permission(
         check_permission: bool,
@@ -1404,11 +1416,9 @@ impl fs::FileSystem for CurvineFileSystem {
             }
         }
 
-        // Apply chown suid/sgid rules only when owner or group actually changes on a
-        // regular file. Note we check the normalized opts here rather than op.arg.valid
-        // so that (uid_t)-1 sentinels — which appear on the wire as FATTR_UID/FATTR_GID
-        // but do not change ownership — don't trigger the side effect.
-        let chown_effective = opts.owner.is_some() || opts.group.is_some();
+        // Clear setuid/setgid only when uid/gid actually change (not same-id no-ops).
+        let chown_effective =
+            Self::chown_effectively_changes(target_uid, target_gid, file_uid, file_gid);
         if chown_effective && cur_status.file_type == FileType::File {
             let mut new_mode = if let Some(mode) = opts.mode {
                 mode
@@ -2696,6 +2706,29 @@ mod tests {
             None,
         )
         .unwrap();
+    }
+
+    /// Same-id chown targets must not count as an ownership change.
+    #[test]
+    fn chown_effectively_changes_ignores_same_uid_gid_and_absent_targets() {
+        use super::CurvineFileSystem as CFS;
+        assert!(!CFS::chown_effectively_changes(None, None, 1000, 100));
+        assert!(!CFS::chown_effectively_changes(Some(1000), None, 1000, 100));
+        assert!(!CFS::chown_effectively_changes(None, Some(100), 1000, 100));
+        assert!(!CFS::chown_effectively_changes(
+            Some(1000),
+            Some(100),
+            1000,
+            100
+        ));
+        assert!(CFS::chown_effectively_changes(Some(2000), None, 1000, 100));
+        assert!(CFS::chown_effectively_changes(None, Some(200), 1000, 100));
+        assert!(CFS::chown_effectively_changes(
+            Some(1000),
+            Some(200),
+            1000,
+            100
+        ));
     }
 
     /// pjdfstest chown/00.t regression: owner may keep uid unchanged and move gid to a
