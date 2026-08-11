@@ -269,7 +269,15 @@ fn test_cache_mode_free() {
             .unwrap();
         assert!(mnt.ufs().unwrap().exists(&ufs_path).await.unwrap());
 
-        fs.free(&path, false).await.unwrap();
+        let free_res = fs.free(&path, false).await.unwrap();
+        assert!(
+            free_res.inodes > 0,
+            "cache mode free should report deleted inodes"
+        );
+        assert!(
+            free_res.bytes > 0,
+            "cache mode free should report released bytes"
+        );
 
         assert!(
             !fs.cv().exists(&path).await.unwrap(),
@@ -309,7 +317,15 @@ fn test_cache_mode_free_child_with_unified_disabled() {
             .unwrap();
 
         fs.disable_unified();
-        fs.free(&parent, true).await.unwrap();
+        let free_res = fs.free(&parent, true).await.unwrap();
+        assert!(
+            free_res.inodes > 0,
+            "cache-only cache mode free should report deleted inodes"
+        );
+        assert!(
+            free_res.bytes > 0,
+            "cache-only cache mode free should report released bytes"
+        );
 
         assert!(!fs.cv().exists(&path).await.unwrap());
         assert!(mount.ufs().unwrap().exists(&ufs_path).await.unwrap());
