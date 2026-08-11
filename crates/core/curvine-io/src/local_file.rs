@@ -54,7 +54,6 @@ macro_rules! try_err {
 pub struct LocalFile {
     inner: fs::File,
     path: String,
-    is_tmpfs: bool,
     len: i64,
     pos: i64,
     buf: BytesMut,
@@ -62,14 +61,11 @@ pub struct LocalFile {
 
 impl LocalFile {
     pub fn new<T: AsRef<str>>(path: T, mut inner: fs::File) -> IOResult<Self> {
-        let is_tmpfs = curvine_sys::is_tmpfs(path.as_ref())?;
-
         let len = inner.metadata()?.len() as i64;
         let pos = inner.stream_position()? as i64;
         let file = Self {
             inner,
             path: path.as_ref().to_string(),
-            is_tmpfs,
             len,
             pos,
             buf: BytesMut::new(),
@@ -93,9 +89,10 @@ impl LocalFile {
         Self::new(path.as_ref(), file)
     }
 
-    // Open a file for writing.
+    // Open a file for writing (also requests read so the same handle can read back).
     pub fn with_write<T: AsRef<str>>(path: T, overwrite: bool) -> IOResult<Self> {
         let file = OpenOptions::new()
+            .read(true)
             .write(true)
             .create(true)
             .truncate(overwrite)
@@ -122,6 +119,13 @@ impl LocalFile {
 
     pub fn from_file(path: &str, inner: fs::File) -> IOResult<Self> {
         Self::new(path, inner)
+    }
+
+    fn advance_after_write(&mut self, n: i64) {
+        self.pos += n;
+        if self.pos > self.len {
+            self.len = self.pos;
+        }
     }
 
     pub fn read_region(&mut self, enable_send_file: bool, len: i32) -> IOResult<DataSlice> {
@@ -174,13 +178,13 @@ impl LocalFile {
             }
         };
 
-        self.pos += len as i64;
+        self.advance_after_write(len as i64);
         Ok(())
     }
 
     pub fn write_all(&mut self, buf: &[u8]) -> IOResult<()> {
         try_err!(self.inner.write_all(buf));
-        self.pos += buf.len() as i64;
+        self.advance_after_write(buf.len() as i64);
         Ok(())
     }
 
@@ -231,33 +235,25 @@ impl LocalFile {
         self.path.as_str()
     }
 
-    pub fn is_tmpfs(&self) -> bool {
-        self.is_tmpfs
-    }
-
     pub fn read_ahead(
         &mut self,
         os_cache: &CacheManager,
         last_task: Option<ReadAheadTask>,
     ) -> Option<ReadAheadTask> {
-        // Memory files do not use pre-reading.
-        if self.is_tmpfs {
-            None
-        } else {
-            os_cache.read_ahead(&self.inner, self.pos, self.len, last_task)
-        }
+        os_cache.read_ahead(&self.inner, self.pos, self.len, last_task)
     }
 
     pub fn read_full(&mut self, off: Option<i64>, len: usize) -> IOResult<BytesMut> {
         if let Some(v) = off {
-            self.inner.seek(SeekFrom::Start(v as u64))?;
+            self.seek(v)?;
         }
 
         self.buf.reserve(len);
         unsafe { self.buf.set_len(len) }
         let mut buf = self.buf.split();
 
-        self.inner.read_exact(&mut buf)?;
+        self.read_all(&mut buf)?;
+
         Ok(buf)
     }
 
@@ -333,7 +329,9 @@ impl Display for LocalFile {
 
 impl Write for LocalFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.inner.write(buf)
+        let len = self.inner.write(buf)?;
+        self.advance_after_write(len as i64);
+        Ok(len)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
