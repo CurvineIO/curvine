@@ -18,9 +18,10 @@
 </p>
 
 [![CNCF Landscape](https://img.shields.io/badge/CNCF%20Landscape-5699C6)](https://landscape.cncf.io/?item=runtime--cloud-native-storage--curvine)
-[![Join our Slack Community](https://img.shields.io/badge/Slack-Join%20our%20Community-4A154B?logo=slack&logoColor=white)](https://join.slack.com/t/curvineio/shared_invite/zt-4673r43cn-prajma_q5ZI3BUxuaY5kiQ)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Rust](https://img.shields.io/badge/Rust-1.86%2B-orange)](https://www.rust-lang.org)
+
+[![Join our Slack Community](https://img.shields.io/badge/Slack-Join%20our%20Community-4A154B?style=for-the-badge&logo=slack&logoColor=white)](https://join.slack.com/t/curvineio/shared_invite/zt-4673r43cn-prajma_q5ZI3BUxuaY5kiQ)
 
 > **Curvine: AI-Native & Cloud-Native File System** — A high-performance POSIX file semantic layer built on top of cloud object storage, with an integrated multi-tier distributed cache, designed from the ground up for large-scale AI workloads and AI Agent platforms.
 
