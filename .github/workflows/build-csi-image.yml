@@ -38,6 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
+      build_version: ${{ steps.meta.outputs.build_version }}
       push_image: ${{ steps.meta.outputs.push_image }}
       ghcr_image: ${{ steps.meta.outputs.ghcr_image }}
       docker_image: ${{ steps.meta.outputs.docker_image }}
@@ -64,6 +65,12 @@ jobs:
           
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
           echo "push_image=${PUSH_IMAGE}" >> $GITHUB_OUTPUT
+
+          BUILD_VERSION="$TAG"
+          if [[ "${TAG}" == v* ]]; then
+            BUILD_VERSION="${TAG#v}"
+          fi
+          echo "build_version=${BUILD_VERSION}" >> $GITHUB_OUTPUT
           
           # Generate image names for CSI
           GHCR_IMAGE="ghcr.io/curvineio/curvine-csi"
@@ -130,6 +137,7 @@ jobs:
             GOPROXY=https://goproxy.cn,direct
             TARGETARCH=${{ matrix.arch }}
             TARGETOS=linux
+            BUILD_VERSION=${{ needs.prepare.outputs.build_version }}
       
       - name: Build summary for ${{ matrix.arch }}
         run: |
@@ -257,4 +265,3 @@ jobs:
           else
             echo "**Note:** Image was built but not pushed (push_image=false)" >> $GITHUB_STEP_SUMMARY
           fi
-

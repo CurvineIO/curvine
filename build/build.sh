@@ -420,7 +420,8 @@ fi
 
 if should_build_package "client"; then
   CLIENT_RUST_BUILD_ARGS+=("-p" "curvine-client")
-  # COPY_TARGETS+=("curvine-client")
+  COPY_TARGETS+=("curvine-client")
+  CLIENT_ARTIFACT_CHECK_TARGETS+=("curvine-client")
 fi
 
 if should_build_package "cli"; then

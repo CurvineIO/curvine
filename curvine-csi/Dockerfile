@@ -2,6 +2,7 @@
 FROM ghcr.io/curvineio/curvine-compile:ubuntu24.04 AS builder
 
 ARG GOPROXY
+ARG BUILD_VERSION
 
 # Override ENTRYPOINT to ensure RUN commands execute correctly
 # The compile image has ENTRYPOINT ["/bin/bash", "-c"] which can interfere with RUN
