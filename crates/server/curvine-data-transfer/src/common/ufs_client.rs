@@ -17,7 +17,7 @@
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{CurvineURI, FileSystem, Path};
-use curvine_model::{FileStatus, FreeResult};
+use curvine_model::{DeleteResult, FileStatus};
 use curvine_ufs_api::fs::ufs_context::UFSContext;
 use curvine_unified_fs::{UfsFileSystem, UnifiedReader, UnifiedWriter};
 use std::sync::Arc;
@@ -87,7 +87,7 @@ impl UfsClient {
         self.fs.exists(path).await
     }
 
-    pub async fn delete(&self, path: &CurvineURI, recursive: bool) -> FsResult<FreeResult> {
+    pub async fn delete(&self, path: &CurvineURI, recursive: bool) -> FsResult<DeleteResult> {
         self.fs.delete(path, recursive).await
     }
 

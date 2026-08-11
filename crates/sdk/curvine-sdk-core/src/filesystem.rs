@@ -17,7 +17,7 @@ use bytes::BytesMut;
 use curvine_client::unified::{UnifiedReader, UnifiedWriter};
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
-use curvine_model::FreeResult;
+use curvine_model::{DeleteResult, FreeResult};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -45,7 +45,7 @@ impl FileSystemClient {
         self.unified().rename(&src_path, &dst_path).await
     }
 
-    pub async fn delete(&self, path: impl AsRef<str>, recursive: bool) -> FsResult<FreeResult> {
+    pub async fn delete(&self, path: impl AsRef<str>, recursive: bool) -> FsResult<DeleteResult> {
         let path = Path::from_str(path)?;
         self.unified().delete(&path, recursive).await
     }

@@ -23,7 +23,7 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, ListStream, Path, Reader, Writer};
 use curvine_model::ProtoUtils;
-use curvine_model::{CommitBlock, FreeResult, ListOptions};
+use curvine_model::{CommitBlock, DeleteResult, FreeResult, ListOptions};
 use curvine_model::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
     MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, RenameFlags,
@@ -183,7 +183,7 @@ impl CurvineFileSystem {
         self.fs_client.rename(src, dst, flags).await
     }
 
-    pub async fn delete(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
+    pub async fn delete(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
         self.fs_client.delete(path, recursive).await
     }
 
@@ -563,7 +563,7 @@ impl FileSystem<FsWriter, FsReader> for CurvineFileSystem {
         self.rename(src, dst).await
     }
 
-    async fn delete(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
+    async fn delete(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
         self.delete(path, recursive).await
     }
 

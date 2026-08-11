@@ -34,7 +34,7 @@ use curvine_error::FsError;
 use curvine_fs_api::{FileSystem, ListStream, Path};
 use curvine_fs_api::{StateReader, StateWriter};
 use curvine_model::{
-    CreateFileOpts, FileAllocOpts, FileStatus, FreeResult, ListOptions, MkdirOpts, OpenFlags,
+    CreateFileOpts, DeleteResult, FileAllocOpts, FileStatus, ListOptions, MkdirOpts, OpenFlags,
     RenameFlags, SetAttrOpts,
 };
 use curvine_runtime::common::FastHashMap;
@@ -678,7 +678,7 @@ impl NodeState {
     pub fn complete_deferred_delete(
         &self,
         ino: u64,
-        delete_result: Result<FreeResult, FsError>,
+        delete_result: Result<DeleteResult, FsError>,
     ) -> FuseResult<()> {
         // Keep the mark observable after failure; reclaiming it without another
         // FUSE request would need a background retry, which is not yet implemented.

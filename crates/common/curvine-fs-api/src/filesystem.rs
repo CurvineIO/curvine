@@ -14,7 +14,7 @@
 
 use crate::fs::{FsKind, ListStream, Path};
 use crate::proto::{GetFileStatusResponse, ListOptionsResponse, ListStatusResponse};
-use crate::state::{FileStatus, FreeResult, ListOptions, SetAttrOpts};
+use crate::state::{DeleteResult, FileStatus, ListOptions, SetAttrOpts};
 use crate::utils::ProtoUtils;
 use crate::FsResult;
 use curvine_core_error::err_box;
@@ -36,7 +36,7 @@ pub trait FileSystem<Writer, Reader> {
 
     fn rename(&self, src: &Path, dst: &Path) -> impl Future<Output = FsResult<bool>>;
 
-    fn delete(&self, path: &Path, recursive: bool) -> impl Future<Output = FsResult<FreeResult>>;
+    fn delete(&self, path: &Path, recursive: bool) -> impl Future<Output = FsResult<DeleteResult>>;
 
     fn get_status(&self, path: &Path) -> impl Future<Output = FsResult<FileStatus>>;
 

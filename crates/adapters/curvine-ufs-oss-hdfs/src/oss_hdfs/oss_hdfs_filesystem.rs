@@ -19,7 +19,7 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, Path};
 use curvine_io::DataSlice;
-use curvine_model::{FileStatus, FileType, FreeResult, SetAttrOpts};
+use curvine_model::{DeleteResult, FileStatus, FileType, SetAttrOpts};
 use curvine_runtime::common::LocalTime;
 use curvine_ufs_api::{err_ufs, OssHdfsConf};
 use std::collections::HashMap;
@@ -774,7 +774,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
         Ok(true)
     }
 
-    async fn delete(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
+    async fn delete(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
         let path_cstr = self.path_to_cstring(path)?;
         let ctx = Arc::new(CallbackCtx::<(JindoStatus, Option<String>)>::default());
         ctx.reset();
@@ -820,7 +820,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
         let (status, err) = ctx.wait().await?;
         Self::check_status_with_err(status, "Failed to delete", err)?;
 
-        Ok(FreeResult::default())
+        Ok(DeleteResult::default())
     }
 
     async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {

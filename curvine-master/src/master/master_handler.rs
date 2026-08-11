@@ -26,8 +26,8 @@ use curvine_fs_api::Path;
 use curvine_fs_api::RpcCode;
 use curvine_model::ProtoUtils;
 use curvine_model::{
-    CreateFileOpts, DeleteBlockCmd, FileBlocks, FileStatus, FreeResult, HeartbeatStatus,
-    ListOptions, MasterInfo, OpenFlags, RenameFlags, WorkerCommand, WorkerInfo,
+    CreateFileOpts, DeleteBlockCmd, DeleteResult, FileBlocks, FileStatus, FreeResult,
+    HeartbeatStatus, ListOptions, MasterInfo, OpenFlags, RenameFlags, WorkerCommand, WorkerInfo,
 };
 use curvine_net::net::ConnState;
 use curvine_proto::*;
@@ -205,9 +205,9 @@ impl MasterHandler {
         ctx.response(rep_header)
     }
 
-    pub fn delete0(&self, req_id: i64, header: DeleteRequest) -> FsResult<FreeResult> {
+    pub fn delete0(&self, req_id: i64, header: DeleteRequest) -> FsResult<DeleteResult> {
         if self.check_is_retry(req_id)? {
-            return Ok(FreeResult::default());
+            return Ok(DeleteResult::default());
         }
 
         let path = Path::from_str(&header.path)?;
@@ -227,7 +227,7 @@ impl MasterHandler {
 
         let res = self.delete0(ctx.msg.req_id(), header)?;
         let rep_header = DeleteResponse {
-            res: ProtoUtils::free_res_to_pb(res),
+            res: ProtoUtils::delete_res_to_pb(res),
         };
         ctx.response(rep_header)
     }

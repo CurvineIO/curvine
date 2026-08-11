@@ -12,31 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_model::BlockLocation;
-use std::collections::HashMap;
-
-#[derive(Debug)]
-pub struct DeleteResult {
-    // Number of inodes removed
-    pub(crate) inodes: u64,
-    // Bytes released by removed file inodes
-    pub(crate) bytes: u64,
-    // Which blocks need to be deleted
-    pub(crate) blocks: HashMap<i64, Vec<BlockLocation>>,
-}
-
-impl Default for DeleteResult {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl DeleteResult {
-    pub fn new() -> Self {
-        Self {
-            inodes: 0,
-            bytes: 0,
-            blocks: Default::default(),
-        }
-    }
-}
+pub use curvine_model::DeleteResult;

@@ -25,9 +25,9 @@ use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, ListStream, Path, Reader, RpcCode, Writer};
 use curvine_job_client::{JobMasterClient, TransferClient};
 use curvine_model::{
-    CreateFileOpts, FileAllocOpts, FileLock, FileStatus, FreeResult, JobStatus, ListOptions,
-    LoadJobCommand, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags,
-    RenameFlags, SetAttrOpts, TransferCommand, TransferKind, TransferState,
+    CreateFileOpts, DeleteResult, FileAllocOpts, FileLock, FileStatus, FreeResult, JobStatus,
+    ListOptions, LoadJobCommand, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions,
+    OpenFlags, RenameFlags, SetAttrOpts, TransferCommand, TransferKind, TransferState,
 };
 use curvine_runtime::common::TimeSpent;
 use curvine_runtime::common::Utils;
@@ -311,6 +311,7 @@ impl UnifiedFileSystem {
                 let child = Path::from_str(status.path)?;
                 match self.cv.delete(&child, true).await {
                     Ok(res) => {
+                        let res: FreeResult = res.into();
                         total.inodes += res.inodes;
                         total.bytes += res.bytes;
                     }
@@ -321,7 +322,7 @@ impl UnifiedFileSystem {
                 }
             }
         } else {
-            total = self.cv.delete(path, recursive).await?;
+            total = self.cv.delete(path, recursive).await?.into();
         }
 
         Ok(total)
@@ -1064,7 +1065,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         self.rename_with_flags(src, dst, RenameFlags::empty()).await
     }
 
-    async fn delete(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
+    async fn delete(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
         let fut = async {
             match self.get_mount_checked(path, RpcCode::Delete).await? {
                 None => self.cv.delete(path, recursive).await,
@@ -1077,13 +1078,13 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                         );
                     }
 
-                    let mut free_res = mount.ufs()?.delete(&ufs_path, recursive).await?;
+                    let mut delete_res = mount.ufs()?.delete(&ufs_path, recursive).await?;
 
                     // delete cache
                     match self.cv.delete(path, recursive).await {
                         Ok(res) => {
-                            free_res.inodes += res.inodes;
-                            free_res.bytes += res.bytes;
+                            delete_res.inodes += res.inodes;
+                            delete_res.bytes += res.bytes;
                         }
                         Err(FsError::FileNotFound(_)) => {}
                         Err(e) => {
@@ -1091,7 +1092,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                         }
                     }
 
-                    Ok(free_res)
+                    Ok(delete_res)
                 }
             }
         };

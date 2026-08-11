@@ -29,3 +29,40 @@ impl FreeResult {
         self.blocks.extend(blocks);
     }
 }
+
+#[derive(Debug, Default)]
+pub struct DeleteResult {
+    pub inodes: u64,
+    pub bytes: u64,
+    pub blocks: HashMap<i64, Vec<BlockLocation>>,
+}
+
+impl DeleteResult {
+    pub fn new() -> Self {
+        Self {
+            inodes: 0,
+            bytes: 0,
+            blocks: Default::default(),
+        }
+    }
+}
+
+impl From<DeleteResult> for FreeResult {
+    fn from(value: DeleteResult) -> Self {
+        Self {
+            inodes: value.inodes as i64,
+            bytes: value.bytes as i64,
+            blocks: value.blocks,
+        }
+    }
+}
+
+impl From<FreeResult> for DeleteResult {
+    fn from(value: FreeResult) -> Self {
+        Self {
+            inodes: value.inodes as u64,
+            bytes: value.bytes as u64,
+            blocks: value.blocks,
+        }
+    }
+}

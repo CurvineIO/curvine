@@ -19,7 +19,7 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, ListStream, Path, Reader, Writer};
 use curvine_io::DataSlice;
-use curvine_model::{FileStatus, FileType, FreeResult, ListOptions, SetAttrOpts};
+use curvine_model::{DeleteResult, FileStatus, FileType, ListOptions, SetAttrOpts};
 use curvine_ufs_api::OpendalConf;
 #[cfg(feature = "opendal-oss")]
 use curvine_ufs_api::OssHdfsConf;
@@ -896,7 +896,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
         Ok(true)
     }
 
-    async fn delete(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
+    async fn delete(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
         if path.is_root() {
             return err_box!("cannot delete root directory");
         }
@@ -944,7 +944,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
                 .map_err(|e| opendal_error("Failed to delete file", &object_path, e))?;
         }
 
-        Ok(FreeResult::default())
+        Ok(DeleteResult::default())
     }
 
     async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {

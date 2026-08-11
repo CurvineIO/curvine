@@ -18,7 +18,7 @@ use bytes::BytesMut;
 use curvine_config::ClusterConf;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
-use curvine_model::{FreeResult, MountInfo, MountOptions, SetAttrOpts};
+use curvine_model::{DeleteResult, FreeResult, MountInfo, MountOptions, SetAttrOpts};
 use curvine_runtime::runtime::RpcRuntime;
 
 pub struct LibFilesystem {
@@ -58,7 +58,7 @@ impl LibFilesystem {
             .block_on(async { self.inner().rename(&src_path, &dst_path).await })
     }
 
-    pub fn delete(&self, path: impl AsRef<str>, recursive: bool) -> FsResult<FreeResult> {
+    pub fn delete(&self, path: impl AsRef<str>, recursive: bool) -> FsResult<DeleteResult> {
         let path = Path::from_str(path)?;
         self.rt()
             .block_on(async { self.inner().delete(&path, recursive).await })
