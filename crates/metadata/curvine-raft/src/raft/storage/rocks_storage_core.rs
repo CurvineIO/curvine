@@ -15,7 +15,7 @@
 use crate::proto::raft::SnapshotData;
 use crate::raft::{RaftError, RaftResult, LOG_START_INDEX};
 use crate::rocksdb::{DBConf, DBEngine, RocksUtils, WriteBatch};
-use curvine_core_error::{err_box, err_ext, CommonResult};
+use curvine_core_error::{err_box, err_ext, CommonResult, ErrorExt};
 use log::warn;
 use prost::Message;
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot, SnapshotMetadata};
@@ -28,6 +28,7 @@ pub struct RocksStorageCore {
     db: DBEngine,
     first_index: Option<u64>,
     last_index: Option<u64>,
+    init_error: Option<String>,
 
     pub(crate) trigger_snap_unavailable: bool,
     pub(crate) trigger_log_unavailable: bool,
@@ -42,6 +43,7 @@ impl RocksStorageCore {
     // Save index range。
     pub const INDEX_KEY: &'static [u8] = &[0x02u8];
     pub const STATE_KEY: &'static [u8] = &[0x03u8];
+    pub const CONF_STATE_KEY: &'static [u8] = &[0x04u8];
 
     pub fn new(conf: DBConf, format: bool) -> Self {
         let conf = conf
@@ -56,25 +58,69 @@ impl RocksStorageCore {
             db,
             first_index: None,
             last_index: None,
+            init_error: None,
             trigger_snap_unavailable: false,
             trigger_log_unavailable: false,
             get_entries_context: None,
         };
 
-        if let Some((first, last)) = core.get_index_range().unwrap() {
-            core.first_index = Some(first);
-            core.last_index = Some(last);
-        }
-
-        if let Some(data) = core.db.get_cf(Self::CF_META, Self::STATE_KEY).unwrap() {
-            core.raft_state.hard_state = HardState::decode(data.as_ref()).unwrap_or_default();
+        if let Err(error) = core.load_persisted_state() {
+            core.init_error = Some(error.to_string());
         }
 
         core
     }
 
     pub fn init_state(&mut self) -> RaftResult<RaftState> {
+        if let Some(error) = &self.init_error {
+            return err_box!(
+                "invalid local raft storage: {}. Restore a consistent master meta+journal pair from a healthy voter; do not restart this voter from an empty, partial, or corrupted local directory.",
+                error
+            );
+        }
+        self.validate_hard_state_commit(self.raft_state.hard_state.commit)?;
         Ok(self.raft_state.clone())
+    }
+
+    fn load_persisted_state(&mut self) -> RaftResult<()> {
+        if let Some((first, last)) = self
+            .get_index_range()
+            .map_err(|error| error.ctx("failed to decode raft index range"))?
+        {
+            self.first_index = Some(first);
+            self.last_index = Some(last);
+        }
+
+        if let Some(data) = self
+            .db
+            .get_cf(Self::CF_META, Self::STATE_KEY)
+            .map_err(|error| RaftError::from(error).ctx("failed to read raft hard state"))?
+        {
+            self.raft_state.hard_state = HardState::decode(data.as_ref())
+                .map_err(|error| RaftError::from(error).ctx("failed to decode raft hard state"))?;
+        }
+
+        if let Some(data) = self
+            .db
+            .get_cf(Self::CF_META, Self::SNAP_KEY)
+            .map_err(|error| RaftError::from(error).ctx("failed to read raft snapshot"))?
+        {
+            let snapshot = Snapshot::decode(data.as_ref())
+                .map_err(|error| RaftError::from(error).ctx("failed to decode raft snapshot"))?;
+            self.snapshot_metadata = snapshot.get_metadata().clone();
+            self.raft_state.conf_state = snapshot.get_metadata().get_conf_state().clone();
+        }
+
+        if let Some(data) = self
+            .db
+            .get_cf(Self::CF_META, Self::CONF_STATE_KEY)
+            .map_err(|error| RaftError::from(error).ctx("failed to read raft conf state"))?
+        {
+            self.raft_state.conf_state = ConfState::decode(data.as_ref())
+                .map_err(|error| RaftError::from(error).ctx("failed to decode raft conf state"))?;
+        }
+
+        Ok(())
     }
 
     // Get the entry of the specified index
@@ -104,22 +150,45 @@ impl RocksStorageCore {
     }
 
     pub fn set_hard_state(&mut self, hs: HardState) -> RaftResult<()> {
-        self.raft_state.hard_state = hs.clone();
+        self.validate_hard_state_commit(hs.commit)?;
 
         let mut batch = StoreWriteBatch::new(&self.db);
         batch.set_state(&hs)?;
         batch.commit()?;
 
+        self.raft_state.hard_state = hs;
         Ok(())
     }
 
     pub fn set_hard_state_commit(&mut self, commit: u64) -> RaftResult<()> {
-        self.mut_hard_state().set_commit(commit);
+        self.validate_hard_state_commit(commit)?;
+
+        let mut hard_state = self.raft_state.hard_state.clone();
+        hard_state.set_commit(commit);
 
         let mut batch = StoreWriteBatch::new(&self.db);
-        batch.set_state(&self.raft_state.hard_state)?;
+        batch.set_state(&hard_state)?;
         batch.commit()?;
 
+        self.raft_state.hard_state = hard_state;
+        Ok(())
+    }
+
+    fn validate_hard_state_commit(&self, commit: u64) -> RaftResult<()> {
+        let snapshot_index = self.snapshot_metadata.index;
+        let first_index = self.first_index();
+        let lower_bound = first_index.saturating_sub(1);
+        let last_index = self.last_index();
+        if commit < lower_bound || commit > last_index {
+            return err_box!(
+                "invalid local raft storage: hard_state.commit={} is outside durable range [{}, {}], first_index={}, snapshot_index={}. Restore a consistent master meta+journal pair from a healthy voter; do not restart this voter from an empty or partial local directory.",
+                commit,
+                lower_bound,
+                last_index,
+                first_index,
+                snapshot_index
+            );
+        }
         Ok(())
     }
 
@@ -132,6 +201,10 @@ impl RocksStorageCore {
     }
 
     pub fn set_conf_state(&mut self, cs: ConfState) -> RaftResult<()> {
+        let mut batch = StoreWriteBatch::new(&self.db);
+        batch.set_conf_state(&cs)?;
+        batch.commit()?;
+
         self.raft_state.conf_state = cs;
         Ok(())
     }
@@ -154,7 +227,7 @@ impl RocksStorageCore {
         let meta = snapshot.get_metadata();
         let index = meta.index;
 
-        // Index is 0, indicating that there is no snapshot, but there may be log entry
+        // Index is 0, indicating that there is no snapshot, but there may be log entry.
         if index > LOG_START_INDEX && self.first_index() > index {
             warn!(
                 "snapshot out of date: snapshot_index={}, first_index={}, skip apply",
@@ -166,15 +239,35 @@ impl RocksStorageCore {
             )));
         }
 
+        let mut hard_state = self.raft_state.hard_state.clone();
+        hard_state.term = cmp::max(hard_state.term, meta.term);
+        hard_state.commit = cmp::max(hard_state.commit, index);
+
+        let mut batch = StoreWriteBatch::new(&self.db);
+        let mut new_range = None;
+
         // Non-initialized snapshots need to be saved.
         if index > LOG_START_INDEX {
-            self.db
-                .put_cf(Self::CF_META, Self::SNAP_KEY, snapshot.encode_to_vec())?;
-        }
+            let next_index = index.saturating_add(1);
+            let old_first = self.first_index();
+            let old_last = self.last_index();
+            let new_last = cmp::max(old_last, index);
 
+            batch.delete_entry(old_first, next_index)?;
+            batch.append_index_range(next_index, new_last)?;
+            batch.append_snapshot(&snapshot)?;
+            batch.set_state(&hard_state)?;
+            new_range = Some((next_index, new_last));
+        }
+        batch.set_conf_state(meta.get_conf_state())?;
+        batch.commit()?;
+
+        if let Some((first_index, last_index)) = new_range {
+            self.first_index = Some(first_index);
+            self.last_index = Some(last_index);
+        }
         self.snapshot_metadata = meta.clone();
-        self.raft_state.hard_state.term = cmp::max(self.raft_state.hard_state.term, meta.term);
-        self.raft_state.hard_state.commit = cmp::max(self.raft_state.hard_state.commit, index);
+        self.raft_state.hard_state = hard_state;
         self.raft_state.conf_state = meta.get_conf_state().clone();
 
         Ok(())
@@ -421,6 +514,15 @@ impl<'a> StoreWriteBatch<'a> {
             RocksStorageCore::CF_META,
             RocksStorageCore::SNAP_KEY,
             snapshot.encode_to_vec(),
+        )?;
+        Ok(())
+    }
+
+    fn set_conf_state(&mut self, state: &ConfState) -> CommonResult<()> {
+        self.0.put_cf(
+            RocksStorageCore::CF_META,
+            RocksStorageCore::CONF_STATE_KEY,
+            state.encode_to_vec(),
         )?;
         Ok(())
     }
