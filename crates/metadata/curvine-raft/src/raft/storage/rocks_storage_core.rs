@@ -150,8 +150,6 @@ impl RocksStorageCore {
     }
 
     pub fn set_hard_state(&mut self, hs: HardState) -> RaftResult<()> {
-        self.validate_hard_state_commit(hs.commit)?;
-
         let mut batch = StoreWriteBatch::new(&self.db);
         batch.set_state(&hs)?;
         batch.commit()?;
@@ -161,8 +159,6 @@ impl RocksStorageCore {
     }
 
     pub fn set_hard_state_commit(&mut self, commit: u64) -> RaftResult<()> {
-        self.validate_hard_state_commit(commit)?;
-
         let mut hard_state = self.raft_state.hard_state.clone();
         hard_state.set_commit(commit);
 

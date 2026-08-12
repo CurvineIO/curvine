@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_core_error::CommonResult;
 use curvine_raft::raft::storage::RocksStorageCore;
 use curvine_raft::rocksdb::{DBConf, DBEngine, RocksUtils};
 use curvine_runtime::common::{FileUtils, Utils};
@@ -43,17 +44,24 @@ fn assert_reseed_required(error: impl ToString, commit: u64, lower: u64, upper: 
 }
 
 #[test]
-fn hard_state_cannot_commit_past_the_durable_log_tail() {
-    let conf = test_conf("commit-tail");
-    let mut storage = RocksStorageCore::new(conf, true);
-    let error = storage
-        .set_hard_state(HardState {
-            term: 7,
-            vote: 1,
-            commit: 42,
-        })
-        .unwrap_err();
-    assert_reseed_required(error, 42, 0, 0);
+fn hard_state_can_precede_entries_within_one_ready() -> CommonResult<()> {
+    let conf = test_conf("commit-before-append");
+    let mut storage = RocksStorageCore::new(conf.clone(), true);
+    storage.set_hard_state(HardState {
+        term: 7,
+        vote: 1,
+        commit: 1,
+    })?;
+    storage.append(&[Entry {
+        term: 7,
+        index: 1,
+        ..Default::default()
+    }])?;
+    drop(storage);
+
+    let mut reopened = RocksStorageCore::new(conf, false);
+    assert_eq!(reopened.init_state()?.hard_state.commit, 1);
+    Ok(())
 }
 
 #[test]
