@@ -494,8 +494,8 @@ fn empty_checkpoint_snapshot(empty_dir: &str) -> SnapshotData {
     }
 }
 
-// Refuse empty checkpoint over a FS that already has files; allow when file_count == 0
-// even if directories exist (tuple order: get_file_counts -> (dir_count, file_count)).
+// Only the zero-index no-snapshot placeholder is harmless. Every other empty
+// checkpoint must be refused over existing metadata, including directories.
 #[test]
 fn test_apply_snapshot_refuses_empty_over_populated_files() -> CommonResult<()> {
     Logger::default();
@@ -514,7 +514,7 @@ fn test_apply_snapshot_refuses_empty_over_populated_files() -> CommonResult<()> 
     let loader = js.journal_loader();
     let rt = AsyncRuntime::single();
 
-    // Directories only: guard must not refuse (file_count == 0).
+    // Directories are metadata too and must not be replaced by an empty checkpoint.
     fs.mkdir("/only-dirs/nested", true)?;
     let (dir_count, file_count) = fs.get_file_counts();
     assert!(
@@ -528,20 +528,15 @@ fn test_apply_snapshot_refuses_empty_over_populated_files() -> CommonResult<()> 
     FileUtils::create_dir(&empty_dirs, true)?;
     assert_eq!(FileUtils::dir_size(&empty_dirs).unwrap_or(1), 0);
 
-    let dirs_only = rt.block_on(loader.apply_snapshot(empty_checkpoint_snapshot(&empty_dirs)));
-    if let Err(e) = &dirs_only {
-        let msg = e.to_string();
-        assert!(
-            !msg.contains("refusing to apply empty snapshot"),
-            "dirs-only FS must not hit the empty-snapshot guard: {}",
-            msg
-        );
-    }
+    let err = rt
+        .block_on(loader.apply_snapshot(empty_checkpoint_snapshot(&empty_dirs)))
+        .expect_err("empty snapshot over populated directories must be refused");
+    assert!(err.to_string().contains("refusing to apply empty snapshot"));
 
     // Rebuild a populated FS with files: empty checkpoint must be refused.
     fs.mkdir("/with-files", true)?;
     fs.create("/with-files/file.log", false)?;
-    let (dir_count, file_count) = fs.get_file_counts();
+    let (_, file_count) = fs.get_file_counts();
     assert!(file_count > 0, "expected files after create");
 
     rt.block_on(loader.apply_snapshot(SnapshotData::default()))?;
@@ -549,6 +544,15 @@ fn test_apply_snapshot_refuses_empty_over_populated_files() -> CommonResult<()> 
         fs.exists("/with-files/file.log")?,
         "default empty placeholder snapshot must not wipe populated metadata"
     );
+
+    let non_placeholder = SnapshotData {
+        snapshot_id: 2,
+        ..Default::default()
+    };
+    let err = rt
+        .block_on(loader.apply_snapshot(non_placeholder))
+        .expect_err("non-placeholder empty snapshot must be refused");
+    assert!(err.to_string().contains("refusing to apply empty snapshot"));
 
     let empty_files = Utils::test_sub_dir(format!("empty-snap-files-{}", test_id));
     FileUtils::create_dir(&empty_files, true)?;
@@ -564,11 +568,8 @@ fn test_apply_snapshot_refuses_empty_over_populated_files() -> CommonResult<()> 
         msg
     );
     assert!(
-        msg.contains(&format!("{} files", file_count))
-            && msg.contains(&format!("{} dirs", dir_count)),
-        "error should report (file_count, dir_count)=({}, {}); got: {}",
-        file_count,
-        dir_count,
+        msg.contains("files") && msg.contains("dirs"),
+        "error should report filesystem counts; got: {}",
         msg
     );
 

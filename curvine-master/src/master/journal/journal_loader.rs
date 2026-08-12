@@ -28,7 +28,7 @@ use curvine_raft::conf::JournalConfExt;
 use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData};
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg, LogStorage, RocksLogStorage};
 use curvine_raft::raft::{RaftClient, RaftResult, RaftUtils};
-use curvine_runtime::common::{FileUtils, LocalTime, TimeSpent};
+use curvine_runtime::common::{FileUtils, TimeSpent};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel};
 use log::{debug, error, info, warn};
@@ -482,16 +482,23 @@ impl JournalLoader {
     fn apply_snapshot0(&self, snapshot: SnapshotData) -> RaftResult<()> {
         let mut spend = TimeSpent::new();
 
-        // Resolve restore path first. Always measure dir size for safety checks;
-        // the logged checkpoint_size may still be 0 when info logging is disabled.
-        let is_empty_placeholder_snapshot =
-            snapshot.files_data.is_none() && snapshot.bytes_data.is_none();
+        // Raft uses the default value as a no-snapshot placeholder. It carries no
+        // filesystem state and must not create a restore directory or replace metadata.
+        let is_empty_placeholder_snapshot = snapshot.snapshot_id == 0
+            && snapshot.files_data.is_none()
+            && snapshot.bytes_data.is_none();
+        if is_empty_placeholder_snapshot {
+            warn!("skip zero-index empty placeholder snapshot");
+            return Ok(());
+        }
+
         let restore_path = match &snapshot.files_data {
             Some(data) => data.dir.clone(),
             None => {
-                let dir = self.fs_dir.read().get_checkpoint_path(LocalTime::mills());
-                FileUtils::create_dir(&dir, true)?;
-                dir
+                return err_box!(
+                    "refusing to apply empty snapshot {} without checkpoint files",
+                    snapshot.snapshot_id
+                )
             }
         };
         let actual_size = FileUtils::dir_size(&restore_path).unwrap_or_else(|e| {
@@ -507,23 +514,17 @@ impl JournalLoader {
             0
         };
 
-        // Never wipe a populated filesystem with an empty checkpoint. Harness
+        // Never wipe populated metadata with an empty checkpoint. Harness
         // daily failures showed FileNotFound after restore from checkpoint_size=0
         // following raft quorum loss (CurvineIO/curvine#1207).
         // get_file_counts() returns (dir_count, file_count).
         {
             let fs_dir = self.fs_dir.read();
             let (dir_count, file_count) = fs_dir.get_file_counts();
-            if actual_size == 0 && file_count > 0 {
-                if is_empty_placeholder_snapshot {
-                    warn!(
-                        "skip empty placeholder snapshot at {} over filesystem with {} files and {} dirs",
-                        restore_path, file_count, dir_count
-                    );
-                    return Ok(());
-                }
+            if actual_size == 0 && (dir_count > 0 || file_count > 0) {
                 return err_box!(
-                    "refusing to apply empty snapshot at {} ({} bytes) over filesystem with {} files and {} dirs",
+                    "refusing to apply empty snapshot {} at {} ({} bytes) over filesystem with {} files and {} dirs",
+                    snapshot.snapshot_id,
                     restore_path,
                     actual_size,
                     file_count,
