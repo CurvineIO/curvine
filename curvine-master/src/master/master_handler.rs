@@ -227,7 +227,7 @@ impl MasterHandler {
 
         let res = self.delete0(ctx.msg.req_id(), header)?;
         let rep_header = DeleteResponse {
-            res: ProtoUtils::delete_res_to_pb(res),
+            res: Some(ProtoUtils::delete_res_to_pb(res)),
         };
         ctx.response(rep_header)
     }

@@ -32,6 +32,8 @@ impl FreeResult {
 
 #[derive(Debug, Default)]
 pub struct DeleteResult {
+    // Number of file inodes removed. Directories are excluded so the value is
+    // comparable with FreeResult stats produced by cache-mode free.
     pub inodes: u64,
     pub bytes: u64,
     pub blocks: HashMap<i64, Vec<BlockLocation>>,
@@ -50,8 +52,8 @@ impl DeleteResult {
 impl From<DeleteResult> for FreeResult {
     fn from(value: DeleteResult) -> Self {
         Self {
-            inodes: value.inodes as i64,
-            bytes: value.bytes as i64,
+            inodes: i64::try_from(value.inodes).unwrap_or(i64::MAX),
+            bytes: i64::try_from(value.bytes).unwrap_or(i64::MAX),
             blocks: value.blocks,
         }
     }
@@ -60,9 +62,42 @@ impl From<DeleteResult> for FreeResult {
 impl From<FreeResult> for DeleteResult {
     fn from(value: FreeResult) -> Self {
         Self {
-            inodes: value.inodes as u64,
-            bytes: value.bytes as u64,
+            inodes: u64::try_from(value.inodes).unwrap_or(0),
+            bytes: u64::try_from(value.bytes).unwrap_or(0),
             blocks: value.blocks,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delete_result_to_free_result_clamps_large_counts() {
+        let delete_result = DeleteResult {
+            inodes: i64::MAX as u64 + 1,
+            bytes: u64::MAX,
+            blocks: HashMap::new(),
+        };
+
+        let free_result: FreeResult = delete_result.into();
+
+        assert_eq!(free_result.inodes, i64::MAX);
+        assert_eq!(free_result.bytes, i64::MAX);
+    }
+
+    #[test]
+    fn free_result_to_delete_result_ignores_negative_counts() {
+        let free_result = FreeResult {
+            inodes: -1,
+            bytes: -1,
+            blocks: HashMap::new(),
+        };
+
+        let delete_result: DeleteResult = free_result.into();
+
+        assert_eq!(delete_result.inodes, 0);
+        assert_eq!(delete_result.bytes, 0);
     }
 }

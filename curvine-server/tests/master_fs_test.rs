@@ -1810,10 +1810,22 @@ fn delete_file_retry(handler: &mut MasterHandler) -> CommonResult<()> {
     let mut ctx = RpcContext::new(&msg);
     handler.mkdir(&mut ctx)?;
 
+    let create_req = CreateFileRequest {
+        path: "/delete_file_retry/child.log".to_string(),
+        flags: OpenFlags::new_create().value(),
+        ..Default::default()
+    };
+    let create_msg = Builder::new_rpc(RpcCode::CreateFile)
+        .req_id(Utils::req_id())
+        .proto_header(create_req)
+        .build();
+    let mut create_ctx = RpcContext::new(&create_msg);
+    handler.retry_check_create_file(&mut create_ctx)?;
+
     let id = Utils::req_id();
     let req = DeleteRequest {
         path: "/delete_file_retry".to_string(),
-        recursive: false,
+        recursive: true,
     };
 
     let f1: DeleteResult = handler.delete0(id, req.clone())?;

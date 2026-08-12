@@ -286,9 +286,9 @@ impl UnifiedFileSystem {
                 None => err_box!(
                     "the current path is not mounted to ufs, so the `free` command cannot be executed."
                 ),
-                // Cache mode: drop Curvine metadata without touching UFS.
-                // cv.free computes the released inode/byte stats and clears blocks,
-                // while cv.delete then removes the remaining Curvine inode.
+                // Cache mode: drop Curvine metadata and blocks via cv.delete.
+                // UFS is untouched; the returned DeleteResult is converted to
+                // FreeResult so the CLI can report inode/byte stats.
                 Some(mount) if mount.is_cache_mode() => {
                     self.free_cache_mode(path, &mount, recursive).await
                 }
