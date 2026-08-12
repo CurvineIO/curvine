@@ -3003,8 +3003,9 @@ mod tests {
     use crate::{
         fuse_init_flag_names, FUSE_ATOMIC_O_TRUNC, FUSE_BIG_WRITES, FUSE_DO_READDIRPLUS,
         FUSE_EXPORT_SUPPORT, FUSE_FLOCK_LOCKS, FUSE_HAS_IOCTL_DIR, FUSE_KERNEL_MINOR_VERSION,
-        FUSE_KERNEL_VERSION, FUSE_MAX_PAGES, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_SPLICE_MOVE,
-        FUSE_SPLICE_READ, FUSE_SPLICE_WRITE, FUSE_WRITEBACK_CACHE, SUPPORTED_INIT_FLAGS,
+        FUSE_KERNEL_VERSION, FUSE_MAX_PAGES, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_SETXATTR_EXT,
+        FUSE_SPLICE_MOVE, FUSE_SPLICE_READ, FUSE_SPLICE_WRITE, FUSE_WRITEBACK_CACHE,
+        SUPPORTED_INIT_FLAGS,
     };
 
     #[test]
@@ -3060,13 +3061,34 @@ mod tests {
 
     #[test]
     fn negotiate_out_flags_drops_unsupported_kernel_caps() {
-        let unsupported = FUSE_ATOMIC_O_TRUNC | FUSE_POSIX_ACL | FUSE_HAS_IOCTL_DIR | FUSE_INIT_EXT;
+        let unsupported = FUSE_ATOMIC_O_TRUNC
+            | FUSE_POSIX_ACL
+            | FUSE_HAS_IOCTL_DIR
+            | FUSE_INIT_EXT
+            | FUSE_SETXATTR_EXT;
         let conf = init_conf(false, false);
         let out = CurvineFileSystem::negotiate_out_flags(unsupported, &conf);
         assert_eq!(
             out & unsupported,
             0,
             "no unsupported kernel-offered bit may be advertised"
+        );
+    }
+
+    #[test]
+    fn setxattr_ext_is_not_advertised() {
+        assert_eq!(
+            SUPPORTED_INIT_FLAGS & FUSE_SETXATTR_EXT,
+            0,
+            "the decoder only supports the legacy 8-byte SETXATTR request layout"
+        );
+
+        let out =
+            CurvineFileSystem::negotiate_out_flags(FUSE_SETXATTR_EXT, &init_conf(false, false));
+        assert_eq!(
+            out & FUSE_SETXATTR_EXT,
+            0,
+            "a kernel-offered SETXATTR_EXT capability must not be echoed"
         );
     }
 
@@ -3130,7 +3152,11 @@ mod tests {
     #[test]
     fn negotiate_out_flags_containment() {
         let splice = FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE | FUSE_SPLICE_READ;
-        let unsafe_bits = FUSE_ATOMIC_O_TRUNC | FUSE_POSIX_ACL | FUSE_HAS_IOCTL_DIR | FUSE_INIT_EXT;
+        let unsafe_bits = FUSE_ATOMIC_O_TRUNC
+            | FUSE_POSIX_ACL
+            | FUSE_HAS_IOCTL_DIR
+            | FUSE_INIT_EXT
+            | FUSE_SETXATTR_EXT;
         let allowed = SUPPORTED_INIT_FLAGS | splice | FUSE_WRITEBACK_CACHE;
         let conf = init_conf(true, true);
         let out = CurvineFileSystem::negotiate_out_flags(u32::MAX, &conf);

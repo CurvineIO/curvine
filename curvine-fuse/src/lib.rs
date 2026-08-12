@@ -134,7 +134,9 @@ pub const FUSE_EXPLICIT_INVAL_DATA: u32 = 1 << 25;
 /// FUSE init capability bit: enhanced killpriv semantics (ABI 7.37).
 pub const FUSE_HANDLE_KILLPRIV_V2: u32 = 1 << 28;
 
-/// FUSE init capability bit: extended xattr error reporting (ABI 7.37).
+/// FUSE init capability bit for the 16-byte SETXATTR request layout (ABI 7.33).
+/// The extended layout adds `setxattr_flags` and padding after the legacy
+/// `size`/`flags` fields.
 pub const FUSE_SETXATTR_EXT: u32 = 1 << 29;
 
 pub const FUSE_WRITEBACK_CACHE: u32 = 1 << 16;
@@ -171,8 +173,9 @@ pub const FUSE_ATOMIC_O_TRUNC: u32 = 1 << 3;
 /// every kernel-offered flag.
 ///
 /// Deliberately EXCLUDED (never advertised): FUSE_ATOMIC_O_TRUNC (open does not
-/// truncate), FUSE_POSIX_ACL (no ACL handling), FUSE_HAS_IOCTL_DIR (no
-/// ioctl).
+/// truncate), FUSE_POSIX_ACL (no ACL handling), FUSE_HAS_IOCTL_DIR (no ioctl),
+/// FUSE_SETXATTR_EXT (the decoder implements only the legacy 8-byte SETXATTR
+/// request layout).
 pub const SUPPORTED_INIT_FLAGS: u32 = FUSE_ASYNC_READ
     | FUSE_BIG_WRITES
     | FUSE_ASYNC_DIO
@@ -193,8 +196,7 @@ pub const SUPPORTED_INIT_FLAGS: u32 = FUSE_ASYNC_READ
     | FUSE_CACHE_SYMLINKS
     | FUSE_NO_OPENDIR_SUPPORT
     | FUSE_EXPLICIT_INVAL_DATA
-    | FUSE_HANDLE_KILLPRIV_V2
-    | FUSE_SETXATTR_EXT;
+    | FUSE_HANDLE_KILLPRIV_V2;
 
 /// Human-readable FUSE init-capability names; unknown bits are kept as hex.
 pub fn fuse_init_flag_names(flags: u32) -> Vec<String> {

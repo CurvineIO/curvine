@@ -894,6 +894,7 @@ mod tests {
         const OP_GETATTR: u32 = 3;
         const OP_STATFS: u32 = 17;
         const OP_ACCESS: u32 = 34;
+        const OP_SETXATTR: u32 = 21;
         const OP_INTERRUPT: u32 = 36;
         const OP_BATCH_FORGET: u32 = 42;
 
@@ -938,6 +939,20 @@ mod tests {
         fn forget_request(unique: u64) -> FuseRequest {
             let arg = fuse_forget_in { nlookup: 1 };
             make_request(OP_FORGET, unique, 2, FuseUtils::struct_as_bytes(&arg))
+        }
+
+        fn extended_setxattr_request(unique: u64) -> FuseRequest {
+            // ABI 7.33 layout: size, flags, setxattr_flags, padding, name, value.
+            // Without FUSE_SETXATTR_EXT negotiation, Curvine intentionally decodes
+            // only the first 8 bytes and must reject the remaining extended fields.
+            let mut payload = BytesMut::new();
+            payload.put_u32_ne(5); // value size
+            payload.put_u32_ne(0); // XATTR_CREATE / XATTR_REPLACE flags
+            payload.put_u32_ne(0); // extended setxattr_flags
+            payload.put_u32_ne(0); // padding
+            payload.put_slice(b"user.curvine_test\0");
+            payload.put_slice(b"value");
+            make_request(OP_SETXATTR, unique, 2, &payload)
         }
 
         fn interrupt_request(unique: u64, interrupted_unique: u64) -> FuseRequest {
@@ -1077,6 +1092,34 @@ mod tests {
             assert!(
                 rx.try_recv().unwrap().is_none(),
                 "malformed LOOKUP must enqueue exactly one reply"
+            );
+        }
+
+        #[tokio::test]
+        async fn unnegotiated_extended_setxattr_replies_eproto_once() {
+            let unique = 1014;
+            let pending = FastDashMap::default();
+            let request = extended_setxattr_request(unique);
+            let (tx, mut rx) = AsyncChannel::new(16).split();
+            let reply = FuseResponse::new_reply(unique, tx, false, None);
+
+            let result =
+                super::super::FuseReceiver::dispatch_meta(&pending, &fs(), &request, &reply).await;
+
+            assert!(
+                result.is_ok(),
+                "an unexpected extended SETXATTR payload is completed by its EPROTO reply"
+            );
+            match rx.try_recv().unwrap().expect("one EPROTO reply task") {
+                FuseTask::Reply(data) => {
+                    assert_eq!(data.header().unique, unique);
+                    assert_eq!(data.header().error, -libc::EPROTO);
+                }
+                _ => panic!("metrics-disabled reply must use FuseTask::Reply"),
+            }
+            assert!(
+                rx.try_recv().unwrap().is_none(),
+                "malformed SETXATTR must enqueue exactly one reply"
             );
         }
 
