@@ -153,28 +153,15 @@ fn fuse_mount_sys(mnt: &Path, conf: &FuseConf) -> IOResult<RawIO> {
     let c_mountpoint = path_to_cstring(mnt)?;
 
     let result = unsafe {
-        #[cfg(target_os = "linux")]
-        {
-            let c_options = CString::new(mount_options.clone()).unwrap();
-            let c_type = CString::new("fuse").unwrap();
-            libc::mount(
-                c_source.as_ptr(),
-                c_mountpoint.as_ptr(),
-                c_type.as_ptr(),
-                flags,
-                c_options.as_ptr() as *const libc::c_void,
-            )
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let c_options = CString::new(mount_options.as_str()).unwrap();
-            libc::mount(
-                c_source.as_ptr(),
-                c_mountpoint.as_ptr(),
-                flags as i32,
-                c_options.as_ptr() as *mut libc::c_void,
-            )
-        }
+        let c_options = CString::new(mount_options.clone()).unwrap();
+        let c_type = CString::new("fuse").unwrap();
+        libc::mount(
+            c_source.as_ptr(),
+            c_mountpoint.as_ptr(),
+            c_type.as_ptr(),
+            flags,
+            c_options.as_ptr() as *const libc::c_void,
+        )
     };
 
     complete_mount(fd, result, mnt, &mount_options)
