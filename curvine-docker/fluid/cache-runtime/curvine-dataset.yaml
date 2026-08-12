@@ -1,0 +1,87 @@
+---
+apiVersion: data.fluid.io/v1alpha1
+kind: Dataset
+metadata:
+  name: curvine-demo
+  namespace: default
+spec:
+  placement: Shared
+  accessModes:
+  - ReadWriteMany
+  mounts:
+  - name: curvine
+    mountPoint: "curvine:///data"
+---
+apiVersion: data.fluid.io/v1alpha1
+kind: CacheRuntime
+metadata:
+  name: curvine-demo
+  namespace: default
+spec:
+  runtimeClassName: curvine
+  # Demo/e2e default only: emptyDir is deleted with the pod.
+  # Use PVC/hostPath or another production volume for metadata, journal,
+  # logs, or cache data that must survive pod recreation.
+  volumes:
+  - name: curvine-logs
+    emptyDir: {}
+  - name: curvine-cache
+    emptyDir: {}
+  - name: curvine-master-data
+    emptyDir: {}
+  master:
+    replicas: 1
+    options:
+      format_master: "true"
+      rpc_port: "8995"
+      journal_port: "8996"
+      web_port: "9000"
+      meta_dir: "/app/curvine/data/meta"
+      journal_dir: "/app/curvine/data/journal"
+    volumeMounts:
+    - name: curvine-logs
+      mountPath: /app/curvine/logs
+    - name: curvine-master-data
+      mountPath: /app/curvine/data
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+  worker:
+    replicas: 1
+    options:
+      format_worker: "true"
+      rpc_port: "8997"
+      web_port: "9001"
+      dir_reserved: "0"
+    volumeMounts:
+    - name: curvine-logs
+      mountPath: /app/curvine/logs
+    - name: curvine-cache
+      mountPath: /app/curvine/data
+    tieredStore:
+      levels:
+      - low: "0.5"
+        high: "0.8"
+        emptyDir:
+          quota: 5Gi
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+  client:
+    options:
+      debug: "false"
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 200m
+        memory: 512Mi

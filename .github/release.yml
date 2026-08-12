@@ -1,0 +1,33 @@
+changelog:
+  exclude:
+    labels: []
+    authors: []
+  categories:
+    - title: 🎉 New Features
+      labels:
+        - enhancement
+        - feature
+    - title: '⚠️  Breaking Changes'
+      labels:
+        - 'breaking'
+    - title: '🐛 Bug Fixes'
+      labels:
+        - 'bug'
+    - title: '🚨 Deprecated'
+      labels:
+        - 'deprecated'
+    - title: '📦 Dependencies'
+      labels:
+        - dependencies
+    - title: '🔍 Tests'
+      labels:
+        - 'test'
+    - title: '🔧 Code Refactoring'
+      labels:
+        - 'refactor'
+    - title: '📝  Documentation'
+      labels:
+        - 'docs'
+    - title: '🔄 Other Changes'
+      labels:
+        - "*"

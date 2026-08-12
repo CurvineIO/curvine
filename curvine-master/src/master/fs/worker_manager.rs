@@ -1,0 +1,342 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::master::fs::policy::{ChooseContext, WorkerPolicyAdapter};
+use crate::master::fs::state::{BlockMap, WorkerMap};
+use crate::master::fs::DeleteResult;
+use curvine_config::ClusterConf;
+use curvine_core_error::{err_box, CommonResult};
+use curvine_error::FsResult;
+use curvine_model::{
+    BlockLocation, ExtendedBlock, HeartbeatStatus, LocatedBlock, StorageInfo, StorageType,
+    TransferWorkerCapabilities, WorkerAddress, WorkerCommand, WorkerInfo, WorkerStatus,
+};
+use curvine_runtime::common::ByteUnit;
+use log::{info, warn};
+use std::collections::HashSet;
+use std::fmt::{Display, Formatter};
+
+pub struct WorkerManager {
+    pub(crate) worker_map: WorkerMap,
+    pub(crate) block_map: BlockMap,
+    pub(crate) worker_policy: WorkerPolicyAdapter,
+    pub(crate) cluster_id: String,
+    pub(crate) conf: ClusterConf,
+}
+
+impl WorkerManager {
+    pub fn new(conf: &ClusterConf) -> FsResult<Self> {
+        let worker_policy = WorkerPolicyAdapter::from_conf(conf)?;
+
+        Ok(Self {
+            worker_map: WorkerMap::new(),
+            block_map: BlockMap::new(),
+            worker_policy,
+            cluster_id: conf.cluster_id.to_string(),
+            conf: conf.clone(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn heartbeat(
+        &mut self,
+        cluster_id: &str,
+        status: HeartbeatStatus,
+        addr: WorkerAddress,
+        weight: u32,
+        worker_session_id: String,
+        transfer_capabilities: TransferWorkerCapabilities,
+        software_version: String,
+        startup_time_ms: u64,
+        storages: Vec<StorageInfo>,
+    ) -> FsResult<Vec<WorkerCommand>> {
+        // The cluster id must match to prevent misregistration.
+        if cluster_id != self.cluster_id {
+            return err_box!(
+                "Registered cluster_id mismatch, expected {}, actual: {}",
+                self.cluster_id,
+                cluster_id
+            );
+        }
+
+        let cmds = match status {
+            HeartbeatStatus::Start => {
+                info!("Worker register: {}", addr);
+                // Enforce the same worker_id ↔ address rule as insert() before remove(): a Start
+                // from a conflicting address must not evict the live registration.
+                self.worker_map.ensure_worker_id_addr(&addr)?;
+                for stale in self.worker_map.remove_same_endpoint(&addr) {
+                    warn!(
+                        "Remove stale worker {} on restart endpoint {}",
+                        stale.simple_debug(),
+                        addr
+                    );
+                }
+                // Same node restarting: clear the slot so we do not treat it as ready or run
+                // Running heartbeat bookkeeping until insert() on the next Running beat.
+                self.worker_map.remove(&addr);
+                return Ok(vec![]);
+            }
+
+            HeartbeatStatus::Running => self.block_map.handle_heartbeat(addr.worker_id),
+
+            HeartbeatStatus::End => {
+                info!("Worker unregister: {}", addr);
+                let _ = self.worker_map.remove_offline(addr.worker_id);
+                return Ok(vec![]);
+            }
+        };
+
+        self.worker_map.insert(
+            addr,
+            weight,
+            worker_session_id,
+            transfer_capabilities,
+            software_version,
+            startup_time_ms,
+            storages,
+        )?;
+        Ok(cmds)
+    }
+
+    pub fn choose_worker(&self, ctx: ChooseContext) -> CommonResult<Vec<WorkerAddress>> {
+        let replicas = ctx.replicas;
+        let workers = self.worker_policy.choose(self.worker_map.workers(), ctx)?;
+
+        if workers.is_empty() {
+            err_box!("No available worker found")
+        } else if workers.len() > replicas as usize {
+            err_box!("The number of workers exceeds the number of replicas")
+        } else {
+            Ok(workers)
+        }
+    }
+
+    /// Select the specified number of workers, do not rely on block information
+    pub fn choose_workers(
+        &self,
+        count: usize,
+        exclude_workers: Vec<u32>,
+    ) -> CommonResult<Vec<WorkerAddress>> {
+        let workers =
+            self.worker_policy
+                .choose_workers(self.worker_map.workers(), count, exclude_workers)?;
+
+        if workers.is_empty() {
+            err_box!("No available worker found")
+        } else if workers.len() > count {
+            err_box!("The number of workers exceeds the requested count")
+        } else {
+            Ok(workers)
+        }
+    }
+
+    pub fn get_last_heartbeat(&self) -> Vec<(u32, u64)> {
+        let mut res = vec![];
+        for worker in self.worker_map.workers() {
+            res.push((*worker.0, worker.1.last_update));
+        }
+        res
+    }
+
+    pub fn available_bytes(&self) -> i64 {
+        self.worker_map
+            .workers()
+            .values()
+            .map(|worker| worker.available.max(0))
+            .fold(0, i64::saturating_add)
+    }
+
+    pub fn remove_expired_worker(&mut self, id: u32) -> Option<WorkerInfo> {
+        self.worker_map.remove_expired(id)
+    }
+
+    pub fn add_blacklist_worker(&mut self, id: u32) -> Option<WorkerInfo> {
+        match self.worker_map.workers.get_mut(&id) {
+            Some(v) if v.status != WorkerStatus::Blacklist => {
+                v.status = WorkerStatus::Blacklist;
+                Some(v.clone())
+            }
+
+            _ => None,
+        }
+    }
+
+    pub fn remove_block(&mut self, worker_id: u32, block_id: i64) {
+        self.block_map.remove_block(worker_id, block_id)
+    }
+
+    // Indicates the block that needs to be deleted.
+    pub fn remove_blocks(&mut self, del_res: &DeleteResult) {
+        self.block_map.remove_blocks(del_res)
+    }
+
+    pub fn deleted_block(&mut self, worker_id: u32, block_id: i64) {
+        self.block_map.deleted_block(worker_id, block_id)
+    }
+
+    pub fn get_worker(&self, id: u32) -> Option<&WorkerInfo> {
+        self.worker_map.workers.get(&id)
+    }
+
+    pub fn create_locate_block(
+        &self,
+        path: impl AsRef<str>,
+        block: ExtendedBlock,
+        locs: &[BlockLocation],
+    ) -> FsResult<LocatedBlock> {
+        let mut addrs = Vec::with_capacity(locs.len());
+        let mut live_storage_types = Vec::with_capacity(locs.len());
+        for loc in locs {
+            if let Some(info) = self.get_worker(loc.worker_id) {
+                addrs.push(info.address.clone());
+                live_storage_types.push(loc.storage_type);
+            } else {
+                warn!(
+                    "File {} block {}, worker {} replicas has been lost",
+                    path.as_ref(),
+                    block.id,
+                    loc.worker_id
+                );
+            }
+        }
+
+        if addrs.is_empty() && !locs.is_empty() {
+            return err_box!(
+                "File {} block {}, all replicas has been lost",
+                path.as_ref(),
+                block.id
+            );
+        }
+
+        let has_spdk = live_storage_types.contains(&StorageType::SpdkDisk);
+        let lb = LocatedBlock {
+            block,
+            locs: addrs,
+            has_spdk,
+        };
+
+        Ok(lb)
+    }
+
+    pub fn workers_have_spdk(&self, addrs: &[WorkerAddress]) -> bool {
+        for addr in addrs {
+            if let Some(info) = self.get_worker(addr.worker_id) {
+                if info
+                    .storage_map
+                    .values()
+                    .any(|s| s.storage_type == StorageType::SpdkDisk)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn add_test_worker(&mut self, worker: WorkerInfo) {
+        self.worker_map.workers.insert(worker.worker_id(), worker);
+    }
+
+    pub fn add_dcm(&mut self, list: Vec<String>) -> Vec<String> {
+        let mut set = HashSet::new();
+        for addr in list {
+            set.insert(addr);
+        }
+
+        let mut res = vec![];
+        for (_, worker) in self.worker_map.workers.iter_mut() {
+            if set.contains(&worker.address.hostname) {
+                worker.status = WorkerStatus::Decommission;
+                res.push(worker.simple_string());
+            }
+        }
+        res
+    }
+
+    pub fn get_dcm(&self) -> Vec<String> {
+        let mut res = vec![];
+        for (_, worker) in self.worker_map.workers.iter() {
+            if worker.status == WorkerStatus::Decommission {
+                res.push(worker.simple_string());
+            }
+        }
+        res
+    }
+
+    pub fn remove_dcm(&mut self, list: Vec<String>) -> Vec<String> {
+        let mut set = HashSet::new();
+        for addr in list {
+            set.insert(addr);
+        }
+
+        let mut res = vec![];
+        for (_, worker) in self.worker_map.workers.iter_mut() {
+            if set.contains(&worker.address.hostname) {
+                worker.status = WorkerStatus::Live;
+                res.push(worker.simple_string());
+            }
+        }
+        res
+    }
+
+    pub fn worker_list(&self) -> Vec<String> {
+        let mut res = vec![];
+        for (_, worker) in self.worker_map.workers.iter() {
+            res.push(worker.simple_string())
+        }
+        res
+    }
+}
+
+impl Display for WorkerManager {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut str = String::new();
+        for (_, item) in self.worker_map.workers() {
+            let s = format!(
+                "worker_id={}, address={}, capacity={}, available={}\n",
+                item.worker_id(),
+                item.address,
+                ByteUnit::byte_to_string(item.capacity as u64),
+                ByteUnit::byte_to_string(item.available as u64),
+            );
+            str.push_str(&s)
+        }
+
+        write!(f, "{}", str)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn worker_with_available(worker_id: u32, available: i64) -> WorkerInfo {
+        let mut worker = WorkerInfo::default();
+        worker.address.worker_id = worker_id;
+        worker.available = available;
+        worker
+    }
+
+    #[test]
+    fn available_bytes_clamps_negative_values_and_saturates() {
+        let mut manager = WorkerManager::new(&ClusterConf::default()).unwrap();
+        manager.add_test_worker(worker_with_available(1, -10));
+        manager.add_test_worker(worker_with_available(2, 20));
+        assert_eq!(manager.available_bytes(), 20);
+
+        manager.add_test_worker(worker_with_available(3, i64::MAX));
+        assert_eq!(manager.available_bytes(), i64::MAX);
+    }
+}

@@ -1,0 +1,44 @@
+# Static PersistentVolume example.
+#
+# Static PV volumeAttributes:
+#   curvine-path — required subpath bind-mounted into the pod
+#   fs-path      — optional; path passed to curvine-fuse (defaults to "/" if unset)
+# NodeStageVolume runs curvine-fuse validate-config before mounting.
+#
+# Reserved volume attribute keys:
+#   master-addrs, fs-path, curvine-path, path-type, author
+# Rejected keys: mnt-path (computed by CSI)
+# Passthrough: any other non-empty key → curvine-fuse CLI flag (see storage-class.yaml)
+#
+# FUSE process sharing:
+#   PVs share one FUSE pod when master-addrs, fs-path (defaults to "/"), and
+#   passthrough parameters match. curvine-path only selects the bind-mount subpath
+#   inside the pod unless fs-path is explicitly set to a different fuse root.
+#
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: curvine-pv
+  labels:
+    type: curvine
+spec:
+  storageClassName: curvine-sc
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: curvine
+    # Any unique string for static PVs
+    volumeHandle: "my-existing-volume"
+    volumeAttributes:
+      # Required
+      master-addrs: "m0:8995,m1:8995,m2:8995"
+      # Required: existing path in the Curvine filesystem
+      curvine-path: "/my-existing-data"
+      # Optional (default: Directory)
+      path-type: "Directory"
+      # Optional passthrough examples:
+      # io-threads: "4"
+      # client.umask: "022"

@@ -1,0 +1,195 @@
+# Use the official Ubuntu 24.04 image as a base
+FROM ubuntu:24.04
+
+# Add metadata labels
+ARG REPO_URL=https://github.com/curvineio/curvine
+LABEL org.opencontainers.image.source="${REPO_URL}"
+
+# Set non-interactive mode for apt to avoid prompts during install
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 1. Install the basic toolchain and dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    gcc \
+    g++ \
+    make \
+    pkg-config \
+    fuse3 \
+    libfuse3-dev \
+    clang \
+    llvm \
+    llvm-dev \
+    git \
+    wget \
+    curl \
+    zip \
+    unzip \
+    jq \
+    python3 \
+    python3-pip \
+    openjdk-8-jdk \
+    libssl-dev \
+    libstdc++-13-dev \
+    zlib1g-dev \
+    fio \
+    ca-certificates \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set JAVA_HOME for JNI support (required for opendal-hdfs feature)
+# Verify and set JAVA_HOME
+RUN if [ -d "/usr/lib/jvm/java-8-openjdk-amd64" ]; then \
+        JAVA_HOME="/usr/lib/jvm/java-8-openjdk-amd64"; \
+    elif [ -d "/usr/lib/jvm/java-8-openjdk" ]; then \
+        JAVA_HOME="/usr/lib/jvm/java-8-openjdk"; \
+    else \
+        JAVA_HOME=$(update-alternatives --list java 2>/dev/null | head -1 | sed 's|/bin/java||'); \
+    fi && \
+    if [ -z "$JAVA_HOME" ] || [ ! -d "$JAVA_HOME" ]; then \
+        echo "ERROR: Could not find Java installation"; \
+        ls -la /usr/lib/jvm/ || true; \
+        exit 1; \
+    fi && \
+    echo "JAVA_HOME=$JAVA_HOME" >> /etc/environment && \
+    echo "Using JAVA_HOME: $JAVA_HOME" && \
+    # Create symlink for hdfs-sys compatibility (it looks for jre/include)
+    if [ -d "$JAVA_HOME/include" ] && [ ! -d "$JAVA_HOME/jre/include" ]; then \
+        mkdir -p "$JAVA_HOME/jre" && \
+        ln -s ../include "$JAVA_HOME/jre/include"; \
+    fi
+
+ENV JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+
+# 1.1. Install Node.js 22 LTS from NodeSource repository (ensures npm >= 9.0.0 and compatibility)
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y nodejs && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# 2. Install the Rust toolchain
+# uncomment the following two lines if you met network problem
+#ENV RUSTUP_UPDATE_ROOT=https://mirrors.aliyun.com/rustup/rustup
+#ENV RUSTUP_DIST_SERVER=https://mirrors.aliyun.com/rustup
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.92.0 && \
+    . $HOME/.cargo/env && \
+    rustup default 1.92.0
+
+# 2.1. Install cargo-nextest for fast test runs (used by CI and regression script)
+RUN cargo install cargo-nextest --locked
+
+# 3. Install protoc with multi-arch support
+RUN PROTOC_VERSION=27.2 && \
+    ARCH=$(uname -m) && \
+    case "${ARCH}" in \
+        x86_64) PROTOC_ARCH="x86_64" ;; \
+        aarch64) PROTOC_ARCH="aarch_64" ;; \
+        *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    esac && \
+    echo "Installing protoc ${PROTOC_VERSION} for ${PROTOC_ARCH}..." && \
+    mkdir -p /app/protoc && cd /app/protoc && \
+    curl -LO "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip" && \
+    unzip "protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip" && \
+    chmod +x bin/protoc && \
+    rm -f *.zip && \
+    echo "✓ protoc installed successfully for ${ARCH}"
+ENV PATH="/app/protoc/bin:${PATH}"
+
+# 4. Install Maven
+RUN cd /app && \
+    MAVEN_VERSION=3.9.16 && \
+    MAVEN_PACKAGE=apache-maven-${MAVEN_VERSION}-bin.tar.gz && \
+    MAVEN_ARCHIVE_URL=https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/${MAVEN_PACKAGE} && \
+    curl -fL -o ${MAVEN_PACKAGE} ${MAVEN_ARCHIVE_URL} && \
+    tar -xzf ${MAVEN_PACKAGE} && \
+    mv apache-maven-${MAVEN_VERSION} maven && \
+    rm -f *.tar.gz && \
+    echo "✓ Maven ${MAVEN_VERSION} installed successfully"
+ENV PATH="/app/maven/bin:${PATH}"
+
+# 4.1. Install JindoSDK (Alibaba Cloud OSS-HDFS SDK) with multi-arch support
+RUN cd /opt && \
+    JINDOSDK_VERSION=6.10.3 && \
+    ARCH=$(uname -m) && \
+    echo "Installing JindoSDK ${JINDOSDK_VERSION} for ${ARCH}..." && \
+    case "${ARCH}" in \
+        x86_64) \
+            JINDOSDK_FILE="jindosdk-${JINDOSDK_VERSION}-linux.tar.gz" ;; \
+        aarch64) \
+            JINDOSDK_FILE="jindosdk-${JINDOSDK_VERSION}-linux-el7-aarch64.tar.gz" ;; \
+        *) \
+            echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    esac && \
+    echo "Downloading ${JINDOSDK_FILE}..." && \
+    curl -fL -o ${JINDOSDK_FILE} \
+        https://jindodata-binary.oss-cn-shanghai.aliyuncs.com/release/${JINDOSDK_VERSION}/${JINDOSDK_FILE} && \
+    tar -xzf ${JINDOSDK_FILE} && \
+    echo "Checking extracted directory..." && \
+    ls -la /opt/ && \
+    EXTRACTED_DIR=$(ls -d jindosdk* | head -n1) && \
+    echo "Found directory: ${EXTRACTED_DIR}" && \
+    if [ "$EXTRACTED_DIR" != "jindosdk" ]; then \
+        mv "$EXTRACTED_DIR" jindosdk; \
+    fi && \
+    rm -f ${JINDOSDK_FILE} && \
+    echo "✓ JindoSDK ${JINDOSDK_VERSION} installed successfully for ${ARCH}"
+ENV JINDOSDK_HOME=/opt/jindosdk
+ENV LD_LIBRARY_PATH="${JINDOSDK_HOME}/lib"
+
+# 5. Install Go toolchain with multi-arch support
+RUN ARCH=$(uname -m) && \
+    case "${ARCH}" in \
+        x86_64) GO_ARCH="amd64" ;; \
+        aarch64) GO_ARCH="arm64" ;; \
+        *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    esac && \
+    echo "Installing Go 1.23.4 for ${GO_ARCH}..." && \
+    wget -O go1.23.linux-${GO_ARCH}.tar.gz https://go.dev/dl/go1.23.4.linux-${GO_ARCH}.tar.gz && \
+    tar -C /usr/local -xzf go1.23.linux-${GO_ARCH}.tar.gz && \
+    rm go1.23.linux-${GO_ARCH}.tar.gz && \
+    echo "✓ Go installed successfully for ${ARCH}"
+ENV PATH="/usr/local/go/bin:${PATH}"
+ENV GOPATH=/go
+ENV GOROOT=/usr/local/go
+
+#6. Replace the configuration
+RUN mkdir -p /app/maven/conf
+COPY settings.xml /app/maven/conf/settings.xml
+
+RUN mkdir -p /root/.cargo
+COPY config /root/.cargo/config.toml
+
+# Add useful aliases and settings to .bashrc for interactive sessions
+RUN echo 'export PS1="\[\033[01;32m\]curvine\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "' >> /root/.bashrc && \
+    echo 'alias ll="ls -la"' >> /root/.bashrc && \
+    echo 'alias cb="cargo build"' >> /root/.bashrc && \
+    echo 'alias ct="cargo test"' >> /root/.bashrc && \
+    echo 'alias cr="cargo run"' >> /root/.bashrc
+
+# Add after all installation commands
+RUN rm -rf \
+    /var/cache/apt/* \
+    /tmp/* \
+    /var/tmp/*
+
+
+WORKDIR /workspace
+
+# Verify toolchains. Do not `npm install -g npm@latest`: it replaces distro npm and can leave broken deps (e.g. MODULE_NOT_FOUND promise-retry).
+RUN export JAVA_HOME=$(grep JAVA_HOME /etc/environment | cut -d= -f2 || echo "/usr/lib/jvm/java-8-openjdk-amd64") && \
+    export JAVA_HOME=${JAVA_HOME:-/usr/lib/jvm/java-8-openjdk-amd64} && \
+    if [ ! -d "$JAVA_HOME" ]; then \
+        JAVA_HOME=$(update-alternatives --list java 2>/dev/null | head -1 | sed 's|/bin/java||') || JAVA_HOME="/usr/lib/jvm/java-8-openjdk-amd64"; \
+    fi && \
+    echo "JAVA_HOME=$JAVA_HOME" && \
+    rustc --version && cargo --version && protoc --version && \
+    JAVA_HOME=$JAVA_HOME mvn --version && \
+    node --version && \
+    npm --version && \
+    go version
+
+# Use ENTRYPOINT to ensure environment is loaded
+ENTRYPOINT ["/bin/bash", "-c"]
+CMD ["bash"]
+

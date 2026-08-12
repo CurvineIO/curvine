@@ -1,0 +1,12 @@
+[package]
+name = "curvine-core-error"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Curvine core error primitives."
+
+[dependencies]
+bincode = { workspace = true }
+bytes = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }

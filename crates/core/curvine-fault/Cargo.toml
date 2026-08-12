@@ -1,0 +1,37 @@
+[package]
+name = "curvine-fault"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Compiles `fault_point!` into real evaluation code. Without this feature the
+# macro expands to nothing, so instrumented binaries carry no fault logic.
+fault-injection = []
+http-client = ["dep:reqwest", "dep:async-trait"]
+# Embeddable Axum router for hosts that own their HTTP listener, such as
+# Curvine Master and Worker.
+http-server = ["fault-injection", "dep:axum", "dep:serde_json"]
+
+[dependencies]
+serde = { workspace = true }
+parking_lot = { workspace = true }
+linkme = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+tokio = { workspace = true }
+axum = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[[example]]
+name = "in_process"
+required-features = ["fault-injection"]
+
+[[example]]
+name = "http_remote"
+required-features = ["http-server", "http-client"]

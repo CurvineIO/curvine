@@ -1,0 +1,23 @@
+[package]
+name = "curvine-ufs-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+curvine-config = { workspace = true }
+curvine-error = { workspace = true }
+curvine-fs-api = { workspace = true }
+curvine-core-error = { workspace = true }
+curvine-runtime = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+log = { workspace = true }
+fastrand = { workspace = true }
+url = { workspace = true }
+
+
+[features]
+default = []

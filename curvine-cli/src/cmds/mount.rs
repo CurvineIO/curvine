@@ -1,0 +1,607 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::util::*;
+use clap::Parser;
+use curvine_core_error::{err_box, CommonResult};
+use curvine_error::{ErrorKind, FsError};
+use curvine_fs_api::{FileSystem, Path};
+use curvine_model::ProtoUtils;
+use curvine_model::{AccessMode, MountOptions, Provider, StorageType, TtlAction, WriteType};
+use curvine_runtime::common::{ByteUnit, DurationUnit};
+use curvine_unified_fs::{UfsFileSystem, UnifiedFileSystem};
+use std::collections::{HashMap, VecDeque};
+use std::io::{self, Write};
+use std::time::{Duration, Instant};
+
+#[derive(Parser, Debug)]
+pub struct MountCommand {
+    /// UFS path to mount
+    #[arg(default_value = "")]
+    ufs_path: String,
+
+    /// Curvine path to mount to
+    #[arg(default_value = "")]
+    cv_path: String,
+
+    #[arg(short, long)]
+    config: Vec<String>,
+
+    /// Update the mount point config if it already exists
+    #[arg(long, default_value_t = false)]
+    update: bool,
+
+    /// Check that cv_path and ufs_path are consistent
+    #[arg(long = "check-path-consist", default_value_t = true, action = clap::ArgAction::Set)]
+    check_path_consist: bool,
+
+    /// When reading, verify cache against UFS (mtime and len)
+    #[arg(long = "read-verify-ufs", default_value_t = false)]
+    read_verify_ufs: bool,
+
+    #[arg(long, default_value = "7d")]
+    ttl_ms: String,
+
+    #[arg(long)]
+    replicas: Option<i32>,
+
+    #[arg(long)]
+    block_size: Option<String>,
+
+    #[arg(short, long)]
+    storage_type: Option<String>,
+
+    #[arg(
+        long,
+        default_value = "fs_mode",
+        help = "Write type: cache_mode, fs_mode"
+    )]
+    write_type: String,
+
+    #[arg(
+        long,
+        help = "UFS provider: auto, oss-hdfs, opendal. Controls which implementation to use for the given scheme."
+    )]
+    provider: Option<String>,
+
+    #[arg(
+        long,
+        help = "Whether to automatically submit a cache job on cache miss or invalid cache. Values: true, false. Default for new mounts: true."
+    )]
+    auto_cache: Option<bool>,
+
+    #[arg(
+        long,
+        help = "Access mode for cache_mode mounts: read_only, read_write. Default for new mounts: read_only."
+    )]
+    access_mode: Option<String>,
+
+    #[arg(
+        long = "write-cache",
+        help = "Whether cache_mode read_write writes should also mirror sequential create/overwrite data to Curvine. Values: true, false. Default for new mounts: false. Omitted when used with --update."
+    )]
+    write_cache: Option<bool>,
+
+    #[arg(long, default_value_t = false)]
+    check: bool,
+
+    /// Perform a dry run: scan and report differences without create/delete/set_attr changes.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+
+    #[arg(long, default_value_t = false)]
+    verbose: bool,
+}
+
+#[derive(Default)]
+struct ResyncStats {
+    scanned: usize,
+    skip_same_mtime: usize,
+    skip_ufs_time_zero: usize,
+    recreated: usize,
+    failed: usize,
+}
+
+struct ResyncProgress {
+    label: String,
+    start: Instant,
+    last_print: Instant,
+    interval: Duration,
+}
+
+impl ResyncProgress {
+    fn new(label: impl Into<String>) -> Self {
+        let now = Instant::now();
+        Self {
+            label: label.into(),
+            start: now,
+            last_print: now.checked_sub(Duration::from_millis(500)).unwrap_or(now),
+            interval: Duration::from_millis(500),
+        }
+    }
+
+    fn tick(&mut self, stats: &ResyncStats, pending_dirs: usize) {
+        let now = Instant::now();
+        if now.duration_since(self.last_print) < self.interval {
+            return;
+        }
+        self.last_print = now;
+        self.render(stats, pending_dirs, false);
+    }
+
+    fn finish(&mut self, stats: &ResyncStats) {
+        self.render(stats, 0, true);
+    }
+
+    fn render(&self, stats: &ResyncStats, pending_dirs: usize, done: bool) {
+        let elapsed = self.start.elapsed().as_secs_f32();
+        let status = if done { "done" } else { "running" };
+        eprint!(
+            "\r[resync:{}] status={} elapsed={:.1}s scanned={} recreated={} skipped={} failed={} pending_dirs={}",
+            self.label,
+            status,
+            elapsed,
+            stats.scanned,
+            stats.recreated,
+            stats.skip_same_mtime + stats.skip_ufs_time_zero,
+            stats.failed,
+            pending_dirs
+        );
+        let _ = io::stderr().flush();
+        if done {
+            eprintln!();
+        }
+    }
+}
+
+fn is_cv_dir_missing(err: &FsError) -> bool {
+    matches!(err.kind(), ErrorKind::FileNotFound | ErrorKind::Expired)
+}
+
+impl MountCommand {
+    pub async fn execute(&self, fs: UnifiedFileSystem) -> CommonResult<()> {
+        if self.ufs_path.trim() == "resync" {
+            return self.execute_resync(fs).await;
+        }
+
+        // If no path argument is given, all mount points are listed.
+        if self.ufs_path.trim().is_empty() && self.cv_path.trim().is_empty() {
+            let rep = handle_rpc_result(fs.fs_client().get_mount_table()).await;
+            if self.check {
+                if rep.mount_table.is_empty() {
+                    println!("Mount Table: (empty)");
+                    return Ok(());
+                }
+                let mut status = vec![];
+                let mut max_len = 8;
+                for mnt_proto in &rep.mount_table {
+                    let mnt = ProtoUtils::mount_info_from_pb(mnt_proto.clone());
+                    let ufs_path = Path::from_str(&mnt.ufs_path)?;
+                    max_len = max_len.max(ufs_path.to_string().len());
+                    max_len = max_len.max(mnt.cv_path.len());
+                    max_len = max_len.max(mnt.mount_id.to_string().len());
+                    let res = UfsFileSystem::new(&ufs_path, mnt.properties.clone(), mnt.provider);
+                    match res {
+                        Err(_) => status.push("Invalid"),
+                        Ok(ufs) => {
+                            if (ufs.list_status(&ufs_path).await).is_err() {
+                                status.push("Invalid");
+                            } else {
+                                status.push("Valid");
+                            }
+                        }
+                    }
+                }
+                max_len += 2;
+                let separator = format!("{:-<1$}", "", max_len * 4 + 9);
+                println!("Mount Table:");
+                println!("{}", separator);
+                println!(
+                    "| {:<width$}| {:<width$}| {:<width$}| {:<width$}|",
+                    "ID",
+                    "CV Path",
+                    "UFS Path",
+                    "Status",
+                    width = max_len
+                );
+                println!("{}", separator);
+                for mnt in &rep.mount_table {
+                    let ufs_path = Path::from_str(&mnt.ufs_path)?;
+                    println!(
+                        "| {:<width$}| {:<width$}| {:<width$}| {:<width$}|",
+                        mnt.mount_id.to_string(),
+                        mnt.cv_path,
+                        ufs_path.to_string(),
+                        status.remove(0),
+                        width = max_len
+                    );
+                    println!("{}", separator);
+                }
+                println!("Total mount points: {}", rep.mount_table.len());
+                return Ok(());
+            }
+            println!("{}", rep);
+            return Ok(());
+        }
+
+        if self.cv_path.trim().is_empty() {
+            eprintln!("Error: Curvine Path cannot be empty");
+            std::process::exit(1);
+        }
+
+        if self.ufs_path.trim().is_empty() {
+            eprintln!("Error: UFS Path cannot be empty");
+            std::process::exit(1);
+        }
+
+        println!("Ufs path: {}", self.ufs_path);
+        println!("Curvine path: {}", self.cv_path);
+
+        let mut configs = match self.get_config_map() {
+            Ok(configs) => configs,
+            Err(e) => {
+                eprintln!("Error: Invalid config format: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        if let Some(scheme) = extract_scheme(&self.ufs_path) {
+            if scheme == "s3" {
+                enrich_s3_configs(&self.ufs_path, &mut configs);
+            } else if scheme == "hdfs" {
+                enrich_hdfs_configs(&self.ufs_path, &mut configs);
+            }
+        }
+
+        // Check Kerberos configuration for HDFS
+        let kerberos_present = configs.keys().any(|k| k.starts_with("hdfs.kerberos."));
+        if kerberos_present {
+            let has_ccache = configs.contains_key("hdfs.kerberos.ccache");
+            let env_ccache = std::env::var("KRB5CCNAME").is_ok();
+
+            if !has_ccache && !env_ccache {
+                eprintln!(
+                    "Warning: Kerberos configuration detected but no ticket cache specified."
+                );
+                eprintln!(
+                    "  Please provide 'hdfs.kerberos.ccache' via --config or set KRB5CCNAME environment variable."
+                );
+                eprintln!(
+                    "  You can generate a ticket cache using: kinit -kt /path/to/keytab principal@REALM"
+                );
+                eprintln!();
+            }
+        }
+
+        let validation_result = validate_path_and_configs(&self.ufs_path, &configs);
+        if let Err(error_msg) = validation_result {
+            eprintln!("Error: {}", error_msg);
+            std::process::exit(1);
+        }
+
+        if !configs.is_empty() {
+            println!("Configuration:");
+            for (key, value) in &configs {
+                println!("  {} = {}", key, display_config_value(key, value));
+            }
+            println!("\n");
+        }
+
+        let ufs_path = Path::from_str(&self.ufs_path)?;
+        let cv_path = Path::from_str(&self.cv_path)?;
+
+        if !self.update && self.check_path_consist && ufs_path.authority_path() != cv_path.path() {
+            return err_box!(
+                "with --check-path-consist, UFS and Curvine paths must match. UFS: {}, Curvine: {}",
+                ufs_path.authority_path(),
+                cv_path.path()
+            );
+        }
+
+        let mnt_opts = self.to_mnt_opts()?;
+        let should_auto_resync = !self.update
+            && matches!(mnt_opts.write_type, WriteType::FsMode)
+            && fs.fs_client().get_mount_info(&cv_path).await?.is_none();
+
+        let ufs = UfsFileSystem::new(
+            &ufs_path,
+            mnt_opts.add_properties.clone(),
+            mnt_opts.provider,
+        )
+        .map_err(|err| {
+            FsError::common(format!(
+                "Unable to initialize UFS {}: {}. Verify the URI, mount configuration, and credentials.",
+                ufs_path.full_path(),
+                err
+            ))
+        })?;
+        ufs.list_status(&ufs_path).await.map_err(|err| {
+            FsError::common(format!(
+                "Unable to access UFS {}: {}. Verify the endpoint, credentials, and network connectivity.",
+                ufs_path.full_path(),
+                err
+            ))
+        })?;
+
+        handle_rpc_result(fs.mount(&ufs_path, &cv_path, mnt_opts)).await;
+        println!("│ ✅️ mount success.");
+        if should_auto_resync {
+            println!("│ 🔄 first mount detected, start resync...");
+            self.run_resync(&fs, &cv_path, "auto").await?;
+        }
+        Ok(())
+    }
+
+    async fn execute_resync(&self, fs: UnifiedFileSystem) -> CommonResult<()> {
+        let cv_path = Path::from_str(&self.cv_path)?;
+        if !cv_path.is_cv() {
+            return err_box!("resync requires a curvine path, got: {}", self.cv_path);
+        }
+        self.run_resync(&fs, &cv_path, "manual").await
+    }
+
+    async fn run_resync(
+        &self,
+        fs: &UnifiedFileSystem,
+        cv_path: &Path,
+        trigger: &str,
+    ) -> CommonResult<()> {
+        let client = fs.fs_client();
+
+        let mount = match client.get_mount_info(cv_path).await? {
+            Some(v) => v,
+            None => return err_box!("mount info not found for {}", cv_path),
+        };
+
+        if !mount.is_fs_mode() {
+            let write_type_str = match mount.write_type {
+                WriteType::CacheMode => "cache_mode",
+                WriteType::FsMode => "fs_mode",
+            };
+            return err_box!(
+                "resync is only allowed for fs_mode mount; mount point \"{}\" (requested path \"{}\") has write_type \"{}\". \
+                Create the mount with --write-type fs_mode to use resync.",
+                mount.cv_path,
+                cv_path,
+                write_type_str
+            );
+        }
+
+        let ufs_root = Path::from_str(&mount.ufs_path)?;
+        let ufs = UfsFileSystem::new(&ufs_root, mount.properties.clone(), mount.provider)?;
+
+        let mut stats = ResyncStats::default();
+        let mut queue = VecDeque::from([ufs_root.clone()]);
+        let mut progress = ResyncProgress::new(trigger);
+        progress.tick(&stats, queue.len());
+
+        while let Some(ufs_dir) = queue.pop_front() {
+            let ufs_entries = match ufs.list_status(&ufs_dir).await {
+                Ok(v) => v,
+                Err(e) => {
+                    stats.failed += 1;
+                    eprintln!("[resync] failed to list ufs dir {}: {}", ufs_dir, e);
+                    progress.tick(&stats, queue.len());
+                    continue;
+                }
+            };
+
+            let cv_dir = mount.get_cv_path(&ufs_dir)?;
+            if let Err(e) = fs.cv().mkdir(&cv_dir, true).await {
+                stats.failed += 1;
+                eprintln!("[resync] failed to create cv dir {}: {}", cv_dir, e);
+                progress.tick(&stats, queue.len());
+                continue;
+            }
+
+            let cv_entries = match fs.cv().list_status(&cv_dir).await {
+                Ok(v) => v,
+                Err(e) if is_cv_dir_missing(&e) => vec![],
+                Err(e) => {
+                    stats.failed += 1;
+                    eprintln!("[resync] failed to list cv dir {}: {}", cv_dir, e);
+                    progress.tick(&stats, queue.len());
+                    continue;
+                }
+            };
+
+            let mut cv_map = HashMap::new();
+            for entry in cv_entries {
+                cv_map.insert(entry.path.to_string(), entry);
+            }
+
+            for ufs_entry in ufs_entries {
+                let ufs_path = Path::from_str(ufs_entry.path)?;
+                if ufs_entry.is_dir {
+                    queue.push_back(ufs_path);
+                    progress.tick(&stats, queue.len());
+                    continue;
+                }
+
+                stats.scanned += 1;
+                let ufs_mtime = ufs_entry.mtime;
+                let ufs_len = ufs_entry.len;
+                let cv_path = mount.get_cv_path(&ufs_path)?;
+                let cv_key = cv_path.full_path().to_string();
+
+                if let Some(cv_status) = cv_map.get(&cv_key) {
+                    let cv_ufs_mtime = cv_status.storage_policy.ufs_mtime;
+
+                    if cv_ufs_mtime == 0 {
+                        stats.skip_ufs_time_zero += 1;
+                        if self.verbose {
+                            println!("[resync] skip (ufs_time=0): {}", cv_path);
+                        }
+                        progress.tick(&stats, queue.len());
+                        continue;
+                    }
+
+                    if cv_ufs_mtime == ufs_mtime {
+                        stats.skip_same_mtime += 1;
+                        if self.verbose {
+                            println!("[resync] skip (same mtime): {}", cv_path);
+                        }
+                        progress.tick(&stats, queue.len());
+                        continue;
+                    }
+
+                    if self.verbose || self.dry_run {
+                        println!(
+                            "[resync] recreate {} (cv_ufs_mtime={}, ufs_mtime={})",
+                            cv_path, cv_ufs_mtime, ufs_mtime
+                        );
+                    }
+
+                    if self.dry_run {
+                        stats.recreated += 1;
+                        progress.tick(&stats, queue.len());
+                        continue;
+                    }
+
+                    if let Err(e) = client.delete(&cv_path, false).await {
+                        stats.failed += 1;
+                        eprintln!("[resync] failed to delete {}: {}", cv_path, e);
+                        progress.tick(&stats, queue.len());
+                        continue;
+                    }
+                } else if self.verbose || self.dry_run {
+                    println!(
+                        "[resync] create metadata {} (ufs_mtime={})",
+                        cv_path, ufs_mtime
+                    );
+                }
+
+                if self.dry_run {
+                    stats.recreated += 1;
+                    progress.tick(&stats, queue.len());
+                    continue;
+                }
+
+                let create_opts = mount.get_sync_opts(&fs.conf().client, ufs_mtime, ufs_len);
+                if let Err(e) = client.create_with_opts(&cv_path, create_opts, false).await {
+                    stats.failed += 1;
+                    eprintln!("[resync] failed to create {}: {}", cv_path, e);
+                    progress.tick(&stats, queue.len());
+                    continue;
+                }
+
+                stats.recreated += 1;
+                progress.tick(&stats, queue.len());
+            }
+        }
+
+        progress.finish(&stats);
+        println!(
+            "resync summary: scanned={}, skip_same_mtime={}, skip_ufs_time_zero={}, recreated={}, failed={}",
+            stats.scanned,
+            stats.skip_same_mtime,
+            stats.skip_ufs_time_zero,
+            stats.recreated,
+            stats.failed
+        );
+
+        Ok(())
+    }
+
+    pub fn get_config_map(&self) -> CommonResult<HashMap<String, String>> {
+        let mut configs = HashMap::new();
+        for pair in &self.config {
+            let parts: Vec<&str> = pair.splitn(2, '=').collect();
+            if parts.len() == 2 {
+                configs.insert(parts[0].trim().to_string(), parts[1].trim().to_string());
+            } else {
+                return err_box!("Invalid config format: {}", pair);
+            }
+        }
+
+        Ok(configs)
+    }
+
+    pub fn to_mnt_opts(&self) -> CommonResult<MountOptions> {
+        let write_type = WriteType::try_from(self.write_type.as_str())?;
+        let ttl_ms = DurationUnit::from_str(self.ttl_ms.as_str())?.as_millis() as i64;
+        let conf_map = self.get_config_map()?;
+
+        let ttl_action = if matches!(write_type, WriteType::FsMode) {
+            TtlAction::Free
+        } else {
+            TtlAction::Delete
+        };
+
+        let mut opts = MountOptions::builder();
+        if self.update {
+            // On update, only explicitly provided optional fields are sent so
+            // omitted toggles (auto_cache/access_mode/write_cache) keep their
+            // existing mount values instead of being reset to defaults.
+            opts = opts.update_only_explicit();
+        }
+        let mut opts = opts
+            .update(self.update)
+            .set_properties(conf_map)
+            .write_type(write_type)
+            .read_verify_ufs(self.read_verify_ufs)
+            .ttl_ms(ttl_ms)
+            .ttl_action(ttl_action);
+
+        if let Some(replicas) = self.replicas {
+            opts = opts.replicas(replicas);
+        }
+        if let Some(block_size) = self.block_size.as_ref() {
+            opts = opts.block_size(ByteUnit::from_str(block_size.as_str())?.as_byte() as i64);
+        }
+        if let Some(storage_type) = self.storage_type.as_ref() {
+            opts = opts.storage_type(StorageType::try_from(storage_type.as_str())?);
+        }
+
+        if let Some(provider_str) = self.provider.as_ref() {
+            let provider = Provider::try_from(provider_str.as_str())?;
+            opts = opts.provider(provider);
+        }
+
+        if let Some(auto_cache) = self.auto_cache {
+            opts = opts.auto_cache(auto_cache);
+        }
+
+        if let Some(access_mode_str) = self.access_mode.as_ref() {
+            let access_mode = AccessMode::try_from(access_mode_str.as_str())?;
+            opts = opts.access_mode(access_mode);
+        }
+
+        if let Some(write_cache) = self.write_cache {
+            opts = opts.write_cache(write_cache);
+        }
+
+        Ok(opts.build())
+    }
+}
+
+fn display_config_value<'a>(key: &str, value: &'a str) -> &'a str {
+    if is_sensitive_config_key(key) {
+        "******"
+    } else {
+        value
+    }
+}
+
+fn is_sensitive_config_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("credential")
+        || key.contains("secret")
+        || key.contains("token")
+        || key.contains("password")
+        || key.contains("access_key")
+        || key.ends_with(".access")
+        || key.ends_with(".ak")
+        || key.ends_with(".sk")
+}

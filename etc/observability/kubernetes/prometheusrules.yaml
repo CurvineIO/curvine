@@ -1,0 +1,49 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: curvine-observability
+  namespace: curvine
+  labels:
+    app.kubernetes.io/name: curvine
+spec:
+  groups:
+    - name: curvine.targets
+      rules:
+        - alert: CurvineMasterMetricsUnavailable
+          expr: absent(up{component="master"} == 1)
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: Curvine master metrics are unavailable
+            description: No healthy Prometheus target with component=master has been observed for two minutes.
+            runbook_url: /operations
+        - alert: CurvineWorkerMetricsUnavailable
+          expr: up{component="worker"} == 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Curvine worker metrics target is unavailable
+            description: Worker {{ $labels.instance }} has not been scraped successfully for five minutes.
+            runbook_url: /operations
+        - alert: CurvineTransferMetricsUnavailable
+          expr: up{component="transfer"} == 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Curvine Transfer metrics target is unavailable
+            description: Transfer {{ $labels.instance }} has not been scraped successfully for five minutes.
+            runbook_url: /operations
+    - name: curvine.capacity
+      rules:
+        - alert: CurvineClusterCapacityHigh
+          expr: 100 * (1 - available{component="master"} / capacity{component="master"}) > 90
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Curvine cluster capacity exceeds 90 percent
+            description: Cluster capacity usage has remained above 90 percent for ten minutes.
+            runbook_url: /observability

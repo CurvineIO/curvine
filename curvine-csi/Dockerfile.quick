@@ -1,0 +1,16 @@
+# Quick iteration Dockerfile for CSI development
+# Replaces CSI, curvine-cli, and curvine-fuse with locally built binaries.
+# Prerequisites (built by make curvine-csi-quick):
+#   - curvine-csi/csi-binary
+#   - curvine-csi/quick-build/curvine-cli
+#   - curvine-csi/quick-build/curvine-fuse
+# Usage: make curvine-csi-quick
+
+FROM ghcr.io/curvineio/curvine-csi:latest
+
+COPY curvine-csi/csi-binary /opt/curvine/csi
+COPY curvine-csi/quick-build/curvine-cli /opt/curvine/curvine-cli
+COPY curvine-csi/quick-build/curvine-fuse /opt/curvine/curvine-fuse
+
+RUN chmod +x /opt/curvine/csi /opt/curvine/curvine-cli /opt/curvine/curvine-fuse
+

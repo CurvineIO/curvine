@@ -1,0 +1,338 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::state::{FileAllocOpts, FileStatus, FileType, StorageType, WorkerAddress};
+use crate::FsResult;
+use curvine_core_error::{err_box, CommonResult};
+use curvine_runtime::common::{ByteUnit, FastHashMap};
+use serde::{Deserialize, Serialize};
+use std::ops::{Deref, Range};
+
+// block location information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockLocation {
+    pub worker_id: u32,
+    pub storage_type: StorageType,
+}
+
+impl BlockLocation {
+    pub fn new(id: u32, storage_type: StorageType) -> Self {
+        Self {
+            worker_id: id,
+            storage_type,
+        }
+    }
+
+    pub fn with_id(id: u32) -> Self {
+        Self::new(id, StorageType::Disk)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitBlock {
+    pub block_id: i64,
+    pub block_len: i64,
+    pub locations: Vec<BlockLocation>,
+}
+
+impl From<&LocatedBlock> for CommitBlock {
+    fn from(located_block: &LocatedBlock) -> Self {
+        let locations: Vec<BlockLocation> = located_block
+            .locs
+            .iter()
+            .map(|x| BlockLocation::new(x.worker_id, located_block.storage_type))
+            .collect();
+
+        Self {
+            block_id: located_block.id,
+            block_len: located_block.block.len,
+            locations,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExtendedBlock {
+    pub id: i64,
+    pub len: i64,
+    pub storage_type: StorageType,
+    pub file_type: FileType,
+    pub alloc_opts: Option<FileAllocOpts>,
+}
+
+impl ExtendedBlock {
+    pub fn new(id: i64, len: i64, storage_type: StorageType, file_type: FileType) -> Self {
+        Self {
+            id,
+            len,
+            storage_type,
+            file_type,
+            alloc_opts: None,
+        }
+    }
+
+    pub fn with_alloc(
+        id: i64,
+        len: i64,
+        storage_type: StorageType,
+        file_type: FileType,
+        alloc_opts: Option<FileAllocOpts>,
+    ) -> Self {
+        Self {
+            id,
+            len,
+            storage_type,
+            file_type,
+            alloc_opts,
+        }
+    }
+
+    pub fn with_id(id: i64) -> Self {
+        Self::new(id, 0, StorageType::Disk, FileType::File)
+    }
+
+    pub fn with_size_str(id: i64, size: &str, stg_type: StorageType) -> CommonResult<Self> {
+        let bytes = ByteUnit::from_str(size)?.as_byte();
+        Ok(Self::new(id, bytes as i64, stg_type, FileType::File))
+    }
+
+    pub fn with_mem(id: i64, size: &str) -> CommonResult<Self> {
+        Self::with_size_str(id, size, StorageType::Mem)
+    }
+
+    pub fn with_ssd(id: i64, size: &str) -> CommonResult<Self> {
+        Self::with_size_str(id, size, StorageType::Ssd)
+    }
+
+    pub fn size_string(&self) -> String {
+        ByteUnit::byte_to_string(self.len as u64)
+    }
+
+    pub fn is_stream(&self) -> bool {
+        self.file_type != FileType::File && self.file_type != FileType::Dir
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LocatedBlock {
+    pub block: ExtendedBlock,
+    pub locs: Vec<WorkerAddress>,
+    pub has_spdk: bool,
+}
+
+impl LocatedBlock {
+    pub fn new(block: ExtendedBlock, locs: Vec<WorkerAddress>) -> Self {
+        Self {
+            block,
+            locs,
+            has_spdk: false,
+        }
+    }
+
+    pub fn should_resize(&self) -> bool {
+        !self.locs.is_empty() && self.block.alloc_opts.is_some()
+    }
+
+    pub fn should_assign(&self) -> bool {
+        self.locs.is_empty()
+    }
+}
+
+impl Deref for LocatedBlock {
+    type Target = ExtendedBlock;
+
+    fn deref(&self) -> &Self::Target {
+        &self.block
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FileBlocks {
+    pub status: FileStatus,
+    pub block_locs: Vec<LocatedBlock>,
+}
+
+impl FileBlocks {
+    pub fn new(status: FileStatus, block_locs: Vec<LocatedBlock>) -> Self {
+        Self { status, block_locs }
+    }
+
+    pub fn data_exists(&self) -> bool {
+        if self.len == 0 {
+            true
+        } else {
+            self.cv_exists() && !self.block_locs.is_empty()
+        }
+    }
+}
+
+impl Deref for FileBlocks {
+    type Target = FileStatus;
+
+    fn deref(&self) -> &Self::Target {
+        &self.status
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SearchFileBlocks {
+    pub status: FileStatus,
+    pub block_locs: Vec<LocatedBlock>,
+    search_off: Vec<Range<i64>>,
+}
+
+impl SearchFileBlocks {
+    pub fn new(file_blocks: FileBlocks) -> Self {
+        let mut search_off = Vec::new();
+        let mut off = 0;
+        for block in &file_blocks.block_locs {
+            let start = off;
+            let end = off + block.block.len;
+            search_off.push(Range { start, end });
+
+            off = end;
+        }
+
+        Self {
+            status: file_blocks.status,
+            block_locs: file_blocks.block_locs,
+            search_off,
+        }
+    }
+
+    pub fn get_read_block(&self, file_pos: i64) -> FsResult<(i64, LocatedBlock)> {
+        let index = self.search_off.partition_point(|x| x.end <= file_pos);
+        if let Some(lc) = self.block_locs.get(index) {
+            let block_off = file_pos - self.search_off[index].start;
+            Ok((block_off, lc.clone()))
+        } else {
+            err_box!("Not found block for pos {}", file_pos)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WriteFileBlocks {
+    pub status: FileStatus,
+    pub block_locs: Vec<LocatedBlock>,
+    search_off: Vec<Range<i64>>,
+    commit_blocks: FastHashMap<i64, CommitBlock>,
+}
+
+impl WriteFileBlocks {
+    pub fn new(file_blocks: FileBlocks) -> Self {
+        let mut search_off = Vec::new();
+        let mut off = 0;
+        for _ in &file_blocks.block_locs {
+            let start = off;
+            off += file_blocks.status.block_size;
+            search_off.push(Range { start, end: off });
+        }
+
+        Self {
+            status: file_blocks.status,
+            block_locs: file_blocks.block_locs,
+            search_off,
+            commit_blocks: FastHashMap::default(),
+        }
+    }
+
+    pub fn len(&self) -> i64 {
+        self.status.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.status.len == 0
+    }
+
+    pub fn has_commit_blocks(&self) -> bool {
+        !self.commit_blocks.is_empty()
+    }
+
+    pub fn get_block(&self, file_pos: i64) -> Option<(i64, LocatedBlock)> {
+        let index = self.search_off.partition_point(|x| x.end <= file_pos);
+        if let Some(lc) = self.block_locs.get(index) {
+            let block_off = file_pos - self.search_off[index].start;
+            Some((block_off, lc.clone()))
+        } else {
+            None
+        }
+    }
+
+    pub fn get_block_check(&self, file_pos: i64) -> FsResult<(i64, LocatedBlock)> {
+        match self.get_block(file_pos) {
+            Some(lb) => Ok(lb),
+            None => err_box!("Not found block for pos {}, blocks: {:#?}", file_pos, self),
+        }
+    }
+
+    pub fn add_commit(&mut self, commit: CommitBlock) -> FsResult<()> {
+        if let Some(lb) = self.search_block_mut(commit.block_id) {
+            lb.block.len = commit.block_len;
+            // Mirror master BlockMeta::commit: a published block must not keep
+            // stale resize alloc_opts. Otherwise the next rewrite reopen re-applies
+            // an old truncate and shrinks the staging copy (LTP ftest/pwrite).
+            lb.block.alloc_opts = None;
+        } else {
+            return err_box!("Not found block {}", commit.block_id);
+        }
+
+        self.commit_blocks.insert(commit.block_id, commit);
+        Ok(())
+    }
+
+    pub fn take_commit_blocks(&mut self) -> Vec<CommitBlock> {
+        self.commit_blocks.drain().map(|(_, v)| v).collect()
+    }
+
+    pub fn add_block(&mut self, lb: LocatedBlock) -> FsResult<()> {
+        if let Some(v) = self.block_locs.last() {
+            if v.id >= lb.id {
+                return err_box!(
+                    "Cannot add block: existing block id {} does not match new block id {}",
+                    v.id,
+                    lb.id
+                );
+            }
+        }
+
+        let start = self.search_off.last().map(|x| x.end).unwrap_or(0);
+        let end = start + self.status.block_size;
+        self.search_off.push(Range { start, end });
+
+        self.block_locs.push(lb);
+        Ok(())
+    }
+
+    fn search_block_mut(&mut self, block_id: i64) -> Option<&mut LocatedBlock> {
+        let idx = self
+            .block_locs
+            .binary_search_by_key(&block_id, |lb| lb.id)
+            .ok()?;
+        self.block_locs.get_mut(idx)
+    }
+
+    pub fn update_locate(&mut self, block: &LocatedBlock) -> FsResult<()> {
+        if let Some(v) = self.search_block_mut(block.id) {
+            *v = block.clone();
+            Ok(())
+        } else {
+            err_box!("Cannot update block: block id {} not found", block.id)
+        }
+    }
+
+    pub fn last_block(&self) -> Option<ExtendedBlock> {
+        self.block_locs.last().map(|x| x.block.clone())
+    }
+}

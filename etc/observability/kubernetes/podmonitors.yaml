@@ -1,0 +1,73 @@
+# Alternative to ServiceMonitor for deployments that scrape pods directly.
+# Do not deploy both examples unless duplicate series are intentionally desired.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: curvine-master
+  namespace: curvine
+  labels:
+    app.kubernetes.io/name: curvine
+spec:
+  namespaceSelector:
+    matchNames: [curvine]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: curvine
+      app.kubernetes.io/component: master
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      relabelings:
+        - action: replace
+          targetLabel: component
+          replacement: master
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: curvine-worker
+  namespace: curvine
+  labels:
+    app.kubernetes.io/name: curvine
+spec:
+  namespaceSelector:
+    matchNames: [curvine]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: curvine
+      app.kubernetes.io/component: worker
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      relabelings:
+        - action: replace
+          targetLabel: component
+          replacement: worker
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: curvine-transfer
+  namespace: curvine
+  labels:
+    app.kubernetes.io/name: curvine
+spec:
+  namespaceSelector:
+    matchNames: [curvine]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: curvine
+      app.kubernetes.io/component: transfer
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      relabelings:
+        - action: replace
+          targetLabel: component
+          replacement: transfer

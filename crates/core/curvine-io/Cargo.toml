@@ -1,0 +1,16 @@
+[package]
+name = "curvine-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Curvine I/O primitive migration boundary."
+
+[dependencies]
+bytes = { workspace = true }
+curvine-sys = { workspace = true }
+curvine-core-error = { workspace = true }
+curvine-runtime = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }

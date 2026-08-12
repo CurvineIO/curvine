@@ -1,0 +1,86 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: curvine-web-auth
+  namespace: default
+type: Opaque
+stringData:
+  username: admin
+  password: admin
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: curvine-web
+  namespace: default
+  labels:
+    app: curvine-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: curvine-web
+  template:
+    metadata:
+      labels:
+        app: curvine-web
+    spec:
+      containers:
+        - name: curvine-web
+          image: curvine:web-test
+          imagePullPolicy: IfNotPresent
+          # Alternatively: command: ["/entrypoint.sh", "web", "start"]
+          command: ["/app/curvine/lib/curvine-web"]
+          args:
+            - "start"
+            - "--conf"
+            - "/app/curvine/conf/curvine-cluster.toml"
+            - "--hostname"
+            - "0.0.0.0"
+            - "--port"
+            - "9000"
+          env:
+            - name: CURVINE_WEB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: curvine-web-auth
+                  key: username
+            - name: CURVINE_WEB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: curvine-web-auth
+                  key: password
+            - name: CURVINE_WEBUI_DIR
+              value: /app/curvine/webui
+          ports:
+            - name: web
+              containerPort: 9000
+          readinessProbe:
+            httpGet:
+              path: /api/v1/auth/session
+              port: web
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: curvine-conf
+              mountPath: /app/curvine/conf
+      volumes:
+        - name: curvine-conf
+          configMap:
+            name: curvine-web-conf
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: curvine-web
+  namespace: default
+  labels:
+    app: curvine-web
+spec:
+  selector:
+    app: curvine-web
+  ports:
+    - name: web
+      port: 9000
+      targetPort: web
+  type: ClusterIP

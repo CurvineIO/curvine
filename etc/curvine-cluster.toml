@@ -1,0 +1,162 @@
+
+# Whether to format it.
+# master formatting will delete rocksdb metadata
+# Worker formatting will delete the data directory.
+format_master = false
+format_worker = false
+
+# Network interface (e.g. "eth0") used to auto-resolve this node's local IPv4.
+# When set (non-empty), on startup the resolved IPv4 is applied to the
+# master/journal/worker/client hostnames, and the CURVINE_*_HOSTNAME env vars
+# are ignored. When empty (the default), hostnames come from the config below
+# and may be overridden by the CURVINE_*_HOSTNAME env vars.
+#
+# Multi-node note: this only fills THIS node's own hostname. The cluster
+# membership lists (journal.journal_addrs and client.master_addrs) must still
+# be written out explicitly, and each node's entry must use the exact IPv4 that
+# its interface resolves to -- otherwise the node cannot locate itself in the
+# raft group and startup fails with a clear error.
+# net_interface = "eth0"
+
+# Test-only remote fault control. Exposing the HTTP API requires BOTH:
+#   1) enabled = true below, and
+#   2) binaries built with `--features fault-injection`
+#      (e.g. curvine-server/fault-injection).
+# Enabling this without rebuilding fails server startup instead of silently
+# omitting the requested route.
+# Keep disabled in normal runs.
+[fault_injection]
+enabled = false
+auth_token_env = "CURVINE_FAULT_TOKEN"
+
+
+# master configuration
+[master]
+# Master process `/metrics` listener.
+web_port = 9010
+meta_dir = "testing/meta"
+# Worker selection policy: local, robin, random, load_based, or weighted.
+# worker_policy = "weighted"
+log = { level = "info", log_dir = "stdout", file_name = "master.log" }
+
+
+# Standalone curvine-web admin console.
+[web]
+port = 9000
+
+# Built-in observability is self-contained. To use Prometheus, change mode to
+# "prometheus" or "auto", set the URL below, and apply the target labels shown
+# in etc/prometheus-curvine.yml.
+[web.observability]
+enabled = true
+mode = "builtin"
+scrape_interval = "60s"
+scrape_timeout = "3s"
+retention = "24h"
+max_concurrent_scrapes = 32
+max_concurrent_dashboard_queries = 8
+max_series = 100000
+max_samples_per_series = 10000
+
+# FUSE metrics scraping is opt-in. When enabled with empty targets, the collector
+# defaults to 127.0.0.1:{fuse.web_port}. Set explicit host:port values when
+# curvine-web and curvine-fuse run on different hosts.
+[web.observability.fuse]
+enabled = false
+targets = []
+
+[web.observability.prometheus]
+url = ""
+query_timeout = "5s"
+fallback_builtin = true
+target_cache_ttl = "30s"
+
+
+# masta ha raft configuration.
+[journal]
+journal_addrs = [
+    {id = 1, hostname = "localhost", port = 8996}
+]
+journal_dir = "testing/journal"
+
+
+# Worker configuration
+[worker]
+# Relative allocation weight used when master.worker_policy = "weighted".
+# Set higher values on more capable nodes; 0 disables new allocations to this worker.
+# This is trusted administrator configuration and is not capped by the master.
+weight = 1
+dir_reserved = "0"
+data_dir = [
+    "[DISK]testing/data",
+]
+log = { level = "info", log_dir = "stdout", file_name = "worker.log" }
+enable_s3_gateway = false
+
+# SPDK over NVMe-oF/RDMA configuration  
+[worker.spdk_disk]  
+enabled = false  
+app_name = "curvine"  
+reactor_mask = "0x3"  
+# Max time to wait for an idle NVMe qpair under qpair exhaustion (default "30s").  
+# qpair_acquire_timeout = "30s"  
+
+
+# NVMe-oF targets  
+[[worker.spdk_disk.targets]]  
+trtype = "rdma"  
+adrfam = "ipv4"  
+traddr = "192.168.1.100"  
+trsvcid = 4420  
+subnqn = "nqn.2024-01.io.curvine:subsystem1"  
+[[worker.spdk_disk.targets]]  
+trtype = "rdma"  
+adrfam = "ipv4"  
+traddr = "192.168.1.101"  
+trsvcid = 4420  
+subnqn = "nqn.2024-01.io.curvine:subsystem2"
+
+# Customer service configuration.
+[client]
+
+[transfer]
+# Set to true to start the standalone Transfer service. Local SQLite storage,
+# replica metadata reader and localhost:9010 are inferred by default.
+enabled = false
+
+# fuse configuration
+[fuse]
+# Kernel-side metadata cache timeouts (milliseconds).
+# NOTE: renamed in a breaking change — the old second-based f64 keys
+# (attr_timeout / entry_timeout / negative_timeout) are no longer recognized
+# and are silently ignored. Migrate by switching to the *_ms keys below and
+# multiplying the old value by 1000.
+attr_timeout_ms = 1000       # kernel attribute cache; 0 disables it
+entry_timeout_ms = 1000      # kernel dentry (name lookup) cache; 0 disables it
+negative_timeout_ms = 0      # negative-lookup (ENOENT) cache; 0 = disabled
+
+# The log configuration of the customer service side, and the customer service side of rust, java, and fuse use this log file.
+[log]
+level = "info"
+log_dir = "stdout"
+file_name = "curvine.log"
+
+
+# S3 Object Gateway configuration
+[s3_gateway]
+# Listen address for S3 gateway (host:port)
+listen = "0.0.0.0:9900"
+region = "us-east-1"
+# Temporary directory for all PUT operations (multipart and regular)
+put_temp_dir = "/tmp/curvine-temp"
+# Memory buffer threshold for small files (bytes, default: 1MB)
+put_memory_buffer_threshold = 1048576
+# Maximum memory buffer size (bytes, default: 16MB)
+put_max_memory_buffer = 16777216
+
+# GET Performance Optimization Settings
+# GET read/write chunk size in MB (default: 1.0, options: 0.5/1/2)
+get_chunk_size_mb = 1.0
+
+[cli]
+log = { level = "warn", log_dir = "stdout", file_name = "cli.log" }

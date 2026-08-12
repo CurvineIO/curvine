@@ -1,0 +1,616 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use bytes::BytesMut;
+use curvine_client::unified::{UfsFileSystem, UnifiedFileSystem, UnifiedReader};
+use curvine_fs_api::{FileSystem, Path, Reader, RpcCode, Writer};
+use curvine_io::DataSlice;
+use curvine_model::{AccessMode, MountOptionsBuilder, WriteType};
+use curvine_runtime::common::Utils;
+use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+use curvine_tests::Testing;
+use std::env;
+use std::sync::Arc;
+use std::time::Duration;
+fn get_fs() -> UnifiedFileSystem {
+    let testing = Testing::builder().workers(1).build().unwrap();
+    // Check if UFS configuration is available, if not, skip the test
+    if env::var("UFS_TEST_PATH").is_err() {
+        env::set_var("UFS_TEST_PATH", testing.ufs_path.clone());
+    }
+
+    testing.start_cluster().unwrap();
+    let rt = Arc::new(AsyncRuntime::single());
+    testing.get_unified_fs_with_rt(rt.clone()).unwrap()
+}
+
+#[test]
+fn test_cache_mode() {
+    let fs = get_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::CacheMode).await;
+
+        let path = format!("/write_cache_{:?}/test.log", WriteType::CacheMode).into();
+
+        // Test 1: verify data write is correct
+        write(&fs, &path, false).await;
+
+        // Test 2: resubmit async task (skipped if data already synced); then check UFS mtime unchanged
+        let (ufs_path, mnt) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        let ufs = mnt.ufs().unwrap();
+        let ufs_reader_before = ufs.open(&ufs_path).await.unwrap();
+        let mtime_before = ufs_reader_before.status().mtime;
+        drop(ufs_reader_before);
+
+        fs.async_cache(&path).unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+
+        let ufs_reader_after = ufs.open(&ufs_path).await.unwrap();
+        let mtime_after = ufs_reader_after.status().mtime;
+        drop(ufs_reader_after);
+        assert_eq!(
+            mtime_before, mtime_after,
+            "resubmit should skip, UFS mtime should be unchanged ({} vs {})",
+            mtime_before, mtime_after
+        );
+
+        // Test 3: read cache test
+        let path = format!("/write_cache_{:?}/read_cache.log", WriteType::CacheMode).into();
+
+        // Write file to UFS, then test read
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write_string(Utils::rand_str(1024)).await.unwrap();
+        writer.complete().await.unwrap();
+        test_cache_read(&fs, &path).await;
+
+        // Delete curvine file to simulate expiry
+        fs.cv().delete(&path, false).await.unwrap();
+        test_cache_read(&fs, &path).await;
+    });
+}
+
+#[test]
+fn test_cache_mode_recaches_after_lost_worker_cleanup() {
+    let testing = Testing::builder()
+        .workers(2)
+        // The first worker remains alive in this in-process test, but the
+        // master treats it as lost. The next heartbeat leaves enough time for
+        // the cache reload while still allowing the mini-cluster to start.
+        .mutate_conf(|conf| {
+            conf.master.heartbeat_interval = "10s".to_string();
+            conf.master.worker_blacklist_interval = "20s".to_string();
+            conf.master.worker_lost_interval = "30s".to_string();
+        })
+        .build()
+        .unwrap();
+    let ufs_base = testing.ufs_path.clone();
+    let cluster = testing.start_cluster().unwrap();
+    let master = cluster.get_active_master_fs();
+    let rt = Arc::new(AsyncRuntime::single());
+    let fs = testing.get_unified_fs_with_rt(rt.clone()).unwrap();
+
+    rt.block_on(async move {
+        let mount_dir = "cache_mode_lost_worker_recache";
+        let cv_path = Path::from_str(format!("/{mount_dir}/data.log")).unwrap();
+        let ufs_path = Path::from_str(format!("{ufs_base}/{mount_dir}")).unwrap();
+        let opts = MountOptionsBuilder::new()
+            .write_type(WriteType::CacheMode)
+            .replicas(1)
+            .build();
+        let ufs = UfsFileSystem::new(&ufs_path, opts.add_properties.clone(), None).unwrap();
+        ufs.mkdir(&ufs_path, true).await.unwrap();
+        fs.mount(
+            &ufs_path,
+            &Path::from_str(format!("/{mount_dir}")).unwrap(),
+            opts,
+        )
+        .await
+        .unwrap();
+
+        let (source_path, mount) = fs
+            .get_mount(&cv_path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        let data = "cache data is re-admitted after the last replica is lost";
+        let mut writer = mount
+            .ufs()
+            .unwrap()
+            .create(&source_path, true)
+            .await
+            .unwrap();
+        writer.write_string(data.to_string()).await.unwrap();
+        writer.complete().await.unwrap();
+
+        // First read is from UFS and schedules a normal cache load job.
+        let mut miss = fs.open(&cv_path).await.unwrap();
+        assert!(!matches!(miss, UnifiedReader::Fallback(_)));
+        assert_eq!(miss.read_as_string().await.unwrap(), data);
+        fs.wait_job_complete(&cv_path, false).await.unwrap();
+
+        let cached = fs.cv().get_block_locations(&cv_path).await.unwrap();
+        assert_eq!(cached.block_locs.len(), 1);
+        assert_eq!(cached.block_locs[0].locs.len(), 1);
+        let lost_worker_id = cached.block_locs[0].locs[0].worker_id;
+
+        // Match HeartbeatChecker's lost-worker sequence: remove the worker
+        // from placement, then clear its block locations at the master.
+        assert!(master
+            .worker_manager
+            .write()
+            .remove_expired_worker(lost_worker_id)
+            .is_some());
+        let cleanup = master.delete_locations(lost_worker_id).unwrap();
+        assert!(cleanup.replication_block_ids.is_empty());
+
+        let invalidated = fs.cv().get_status(&cv_path).await.unwrap();
+        assert!(!invalidated.cv_valid(None));
+        assert!(invalidated.ufs_exists());
+
+        // The next open must be a cache miss: it reads UFS and schedules a
+        // replacement load job. Once that job finishes, Curvine serves the
+        // following read again.
+        let mut reload_miss = fs.open(&cv_path).await.unwrap();
+        assert!(!matches!(reload_miss, UnifiedReader::Fallback(_)));
+        assert_eq!(reload_miss.read_as_string().await.unwrap(), data);
+        fs.wait_job_complete(&cv_path, false).await.unwrap();
+
+        let mut reloaded_hit = fs.open(&cv_path).await.unwrap();
+        assert!(matches!(reloaded_hit, UnifiedReader::Fallback(_)));
+        assert_eq!(reloaded_hit.read_as_string().await.unwrap(), data);
+    });
+}
+
+async fn test_cache_read(fs: &UnifiedFileSystem, path: &Path) {
+    let mut reader1 = fs.open(path).await.unwrap();
+    assert!(
+        !matches!(reader1, UnifiedReader::Cv(_)),
+        "first read should be from ufs"
+    );
+
+    let str1 = reader1.read_as_string().await.unwrap();
+
+    fs.wait_job_complete(path, false).await.unwrap();
+
+    let mut reader2 = fs.open(path).await.unwrap();
+    assert!(
+        matches!(reader2, UnifiedReader::Fallback(_)),
+        "second read should be from curvine via FallbackFsReader"
+    );
+
+    let str2 = reader2.read_as_string().await.unwrap();
+    assert_eq!(str1, str2);
+}
+
+#[test]
+fn test_fs_mode() {
+    let fs = get_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::FsMode).await;
+        let path = format!("/write_cache_{:?}/test.log", WriteType::FsMode).into();
+        write(&fs, &path, false).await;
+
+        let (_, mnt) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Test rename
+        let path = format!("/write_cache_{:?}/meta.log", WriteType::FsMode).into();
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write_string(Utils::rand_str(1024)).await.unwrap();
+        writer.complete().await.unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+
+        let dst_path = format!("/write_cache_{:?}/meta_rename.log", WriteType::FsMode).into();
+        fs.rename(&path, &dst_path).await.unwrap();
+
+        // FsMode rename updates CV first; UFS rename follows journal apply (may lag one tick).
+        // Single-shot open fails with NotFound (see runtime: Rename ok then UFS stat NotFound).
+        wait_for_cv_ufs_consistency(&fs, &dst_path).await;
+
+        // Test delete
+        let ufs_path = mnt.get_ufs_path(&dst_path).unwrap();
+        fs.delete(&dst_path, false).await.unwrap();
+        let mut ufs_gone = awaitility::at_most(Duration::from_secs(60));
+        ufs_gone.poll_interval(Duration::from_millis(100));
+        ufs_gone
+            .until_async(|| async { !mnt.ufs().unwrap().exists(&ufs_path).await.unwrap_or(true) })
+            .await;
+        ufs_gone
+            .result()
+            .expect("UFS should not list deleted file after journal delete");
+    });
+}
+
+#[test]
+fn test_cache_mode_free() {
+    let fs = get_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::CacheMode).await;
+
+        let data = Utils::rand_str(1024);
+
+        let path = format!(
+            "/write_cache_{:?}/test_cache_mode_free.log",
+            WriteType::CacheMode
+        )
+        .into();
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write_string(&data).await.unwrap();
+        writer.complete().await.unwrap();
+
+        let _ = fs.open(&path).await.unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+
+        let (ufs_path, mnt) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(mnt.ufs().unwrap().exists(&ufs_path).await.unwrap());
+
+        fs.free(&path, false).await.unwrap();
+
+        assert!(
+            !fs.cv().exists(&path).await.unwrap(),
+            "cache mode free should remove Curvine file metadata"
+        );
+        assert!(
+            mnt.ufs().unwrap().exists(&ufs_path).await.unwrap(),
+            "cache mode free must not delete the UFS file"
+        );
+
+        let mut reader = fs.open(&path).await.unwrap();
+        assert!(!matches!(reader, UnifiedReader::Cv(_)));
+        assert_eq!(reader.read_as_string().await.unwrap(), data);
+    });
+}
+
+#[test]
+fn test_cache_mode_free_child_with_unified_disabled() {
+    let mut fs = get_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::CacheMode).await;
+
+        let parent = Path::from_str("/write_cache_CacheMode/cache_only_free").unwrap();
+        fs.mkdir(&parent, true).await.unwrap();
+        let path = Path::from_str("/write_cache_CacheMode/cache_only_free/child.log").unwrap();
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write_string("cache-only free").await.unwrap();
+        writer.complete().await.unwrap();
+        let _ = fs.open(&path).await.unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+
+        let (ufs_path, mount) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+
+        fs.disable_unified();
+        fs.free(&parent, true).await.unwrap();
+
+        assert!(!fs.cv().exists(&path).await.unwrap());
+        assert!(mount.ufs().unwrap().exists(&ufs_path).await.unwrap());
+        assert!(
+            fs.cv()
+                .exists(&Path::from_str("/write_cache_CacheMode").unwrap())
+                .await
+                .unwrap(),
+            "free must preserve the cache-mode mount point"
+        );
+    });
+}
+
+#[test]
+fn test_fs_mode_free() {
+    let fs = get_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::FsMode).await;
+
+        let data = Utils::rand_str(1024);
+
+        let path = format!("/write_cache_{:?}/test_fs_mode_free.log", WriteType::FsMode).into();
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write_string(&data).await.unwrap();
+        writer.complete().await.unwrap();
+
+        let _ = fs.open(&path).await.unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+
+        fs.free(&path, false).await.unwrap();
+
+        let file_blocks = fs.cv().get_block_locations(&path).await.unwrap();
+        println!("test_fs_mode_free status {:?}", file_blocks);
+        assert_eq!(file_blocks.len, data.len() as i64);
+        assert_eq!(file_blocks.block_locs.len(), 0);
+
+        let reader = fs.open(&path).await.unwrap();
+        assert!(!matches!(reader, UnifiedReader::Cv(_)));
+    });
+}
+
+async fn prepare_fs_mode_file_then_free(fs: &UnifiedFileSystem, path: &Path, data: &str) {
+    let mut writer = fs.create(path, true).await.unwrap();
+    writer.write_string(data).await.unwrap();
+    writer.complete().await.unwrap();
+    let _ = fs.open(path).await.unwrap();
+    fs.wait_job_complete(path, false).await.unwrap();
+    fs.free(path, false).await.unwrap();
+}
+
+#[test]
+fn test_fs_mode_ufs_write_overwrite() {
+    let fs = get_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::FsMode).await;
+        let base = format!("/write_cache_{:?}", WriteType::FsMode);
+        let path =
+            Path::from_str(format!("{}/test_fs_mode_ufs_write_overwrite.log", base)).unwrap();
+
+        let data_initial = Utils::rand_str(1024);
+        prepare_fs_mode_file_then_free(&fs, &path, &data_initial).await;
+
+        let data_overwrite = Utils::rand_str(2048);
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write_string(&data_overwrite).await.unwrap();
+        writer.complete().await.unwrap();
+
+        let reader = fs.open(&path).await.unwrap();
+        assert!(
+            matches!(reader, UnifiedReader::Fallback(_)),
+            "read should return Fallback reader after overwrite and sync"
+        );
+
+        verify_read_data(&fs, &path, data_overwrite.as_bytes()).await;
+
+        // Wait until CV and UFS are fully consistent instead of a fixed sleep,
+        // as UFS sync jobs may take longer under parallel test load.
+        wait_for_cv_ufs_consistency(&fs, &path).await;
+    });
+}
+
+#[test]
+fn test_fs_mode_ufs_write_append() {
+    let fs = get_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::FsMode).await;
+        let base = format!("/write_cache_{:?}", WriteType::FsMode);
+        let path = Path::from_str(format!("{}/test_fs_mode_ufs_write_append.log", base)).unwrap();
+
+        let data_initial = Utils::rand_str(1024);
+        prepare_fs_mode_file_then_free(&fs, &path, &data_initial).await;
+
+        let data_append_extra = Utils::rand_str(512);
+        let mut writer = fs.append(&path).await.unwrap();
+        writer.write_string(&data_append_extra).await.unwrap();
+        writer.complete().await.unwrap();
+
+        let reader = fs.open(&path).await.unwrap();
+        assert!(
+            matches!(reader, UnifiedReader::Fallback(_)),
+            "read should return Fallback reader after append and sync"
+        );
+        let expected_append = format!("{}{}", data_initial, data_append_extra);
+
+        verify_read_data(&fs, &path, expected_append.as_bytes()).await;
+
+        // Wait until CV and UFS are fully consistent instead of a fixed sleep,
+        // as UFS sync jobs may take longer under parallel test load.
+        wait_for_cv_ufs_consistency(&fs, &path).await;
+    });
+}
+
+#[test]
+fn test_fs_mode_ufs_write_random() {
+    let fs = get_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::FsMode).await;
+        let base = format!("/write_cache_{:?}", WriteType::FsMode);
+        let path = Path::from_str(format!("{}/test_fs_mode_ufs_write_random.log", base)).unwrap();
+
+        let data_initial = Utils::rand_str(1024);
+        prepare_fs_mode_file_then_free(&fs, &path, &data_initial).await;
+
+        let chunk_size = 64 * 1024;
+        let total_size = 256 * 1024;
+        let num_chunks = total_size / chunk_size;
+        let mut writer = fs.open_for_write(&path).await.unwrap();
+        let mut expected = vec![0u8; total_size];
+        for _ in 0..num_chunks {
+            let data_str = Utils::rand_str(chunk_size);
+            let data = DataSlice::from_str(data_str.clone()).freeze();
+            let write_pos = writer.pos() as usize;
+            writer.async_write(data.clone()).await.unwrap();
+            expected[write_pos..write_pos + chunk_size].copy_from_slice(data_str.as_bytes());
+        }
+        let random_pos = (num_chunks / 2 * chunk_size) as i64;
+        writer.seek(random_pos).await.unwrap();
+        let random_chunk = Utils::rand_str(chunk_size);
+        let random_data = DataSlice::from_str(random_chunk.clone()).freeze();
+        let write_pos = writer.pos() as usize;
+        writer.async_write(random_data).await.unwrap();
+        expected[write_pos..write_pos + chunk_size].copy_from_slice(random_chunk.as_bytes());
+        writer.complete().await.unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+        let reader = fs.open(&path).await.unwrap();
+        assert!(
+            matches!(reader, UnifiedReader::Fallback(_)),
+            "read should return Fallback reader after random write and sync"
+        );
+
+        verify_read_data(&fs, &path, &expected).await;
+
+        // Wait until CV and UFS are fully consistent instead of a fixed sleep,
+        // as UFS sync jobs may take longer under parallel test load.
+        wait_for_cv_ufs_consistency(&fs, &path).await;
+    });
+}
+
+async fn write(fs: &UnifiedFileSystem, path: &Path, random_write: bool) {
+    let chunk_size = 64 * 1024;
+    let total_size = 1024 * 1024;
+    let num_chunks = total_size / chunk_size;
+
+    let mut writer = fs.create(path, true).await.unwrap();
+    let mut written_data = vec![0u8; total_size];
+
+    // Sequential write all chunks
+    for _ in 0..num_chunks {
+        let data_str = Utils::rand_str(chunk_size);
+        let data = DataSlice::from_str(data_str.clone()).freeze();
+
+        let write_pos = writer.pos() as usize;
+        writer.async_write(data.clone()).await.unwrap();
+        written_data[write_pos..write_pos + chunk_size].copy_from_slice(data_str.as_bytes());
+    }
+
+    if random_write {
+        let random_chunk_data = Utils::rand_str(chunk_size);
+        let random_data = DataSlice::from_str(random_chunk_data.clone()).freeze();
+
+        let random_pos = (num_chunks / 2 * chunk_size) as i64;
+        writer.seek(random_pos).await.unwrap();
+
+        let write_pos = writer.pos() as usize;
+        writer.async_write(random_data.clone()).await.unwrap();
+        written_data[write_pos..write_pos + chunk_size]
+            .copy_from_slice(random_chunk_data.as_bytes());
+    }
+
+    writer.complete().await.unwrap();
+
+    verify_read_data(fs, path, &written_data).await;
+
+    fs.wait_job_complete(path, false).await.unwrap();
+
+    verify_cv_ufs_consistency(fs, path).await;
+}
+
+async fn verify_read_data(fs: &UnifiedFileSystem, path: &Path, expected_data: &[u8]) {
+    let mut reader = fs.open(path).await.unwrap();
+
+    let mut read_data = BytesMut::zeroed(reader.len() as usize);
+    reader.read_full(&mut read_data).await.unwrap();
+    reader.complete().await.unwrap();
+
+    assert_eq!(
+        Utils::crc32(&read_data),
+        Utils::crc32(expected_data),
+        "Read data does not match written data"
+    );
+}
+
+/// Returns true when UFS object exists and matches CV (mtime + full content).
+async fn try_verify_cv_ufs_consistency(fs: &UnifiedFileSystem, path: &Path) -> bool {
+    let (ufs_path, mnt) = match fs.get_mount(path, RpcCode::GetMountInfo).await {
+        Ok(Some(v)) => v,
+        _ => return false,
+    };
+    let mut ufs_reader = match mnt.ufs().unwrap().open(&ufs_path).await {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let mut cv_reader = match fs.cv().open(path).await {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    if !cv_reader.status().is_complete {
+        return false;
+    }
+    if cv_reader.status().storage_policy.ufs_mtime != ufs_reader.status().mtime {
+        return false;
+    }
+    let mut cv_data = BytesMut::zeroed(cv_reader.len() as usize);
+    if cv_reader.read_full(&mut cv_data).await.is_err() {
+        return false;
+    }
+    let mut ufs_data = BytesMut::zeroed(ufs_reader.len() as usize);
+    if ufs_reader.read_full(&mut ufs_data).await.is_err() {
+        return false;
+    }
+    Utils::crc32(&cv_data) == Utils::crc32(&ufs_data)
+}
+
+async fn verify_cv_ufs_consistency(fs: &UnifiedFileSystem, path: &Path) {
+    assert!(
+        try_verify_cv_ufs_consistency(fs, path).await,
+        "CV/UFS consistency check failed for {}",
+        path.path()
+    );
+}
+
+async fn wait_for_cv_ufs_consistency(fs: &UnifiedFileSystem, path: &Path) {
+    let mut w = awaitility::at_most(Duration::from_secs(60));
+    w.poll_interval(Duration::from_millis(100));
+    w.until_async(|| async { try_verify_cv_ufs_consistency(fs, path).await })
+        .await;
+    w.result()
+        .expect("timed out waiting for CV and UFS to match after journal/UFS apply");
+}
+
+async fn mount(fs: &UnifiedFileSystem, write_type: WriteType) {
+    let ufs_base = env::var("UFS_TEST_PATH").unwrap();
+
+    let dir = format!("write_cache_{:?}", write_type);
+    let ufs_path = Path::from_str(format!("{}/{}", ufs_base, dir)).unwrap();
+    let cv_path = Path::from_str(format!("/{}", dir)).unwrap();
+
+    if fs
+        .get_mount(&cv_path, RpcCode::GetMountInfo)
+        .await
+        .unwrap()
+        .is_some()
+    {
+        return;
+    }
+
+    let mut opts_builder = MountOptionsBuilder::new().write_type(write_type);
+    if write_type == WriteType::CacheMode {
+        opts_builder = opts_builder.access_mode(AccessMode::ReadWrite);
+    }
+
+    // Add properties from environment variable if set
+    if let Ok(props_str) = env::var("UFS_TEST_PROPERTIES") {
+        for pair in props_str.split(',') {
+            if let Some((key, value)) = pair.split_once('=') {
+                opts_builder = opts_builder.add_property(key.trim(), value.trim());
+            }
+        }
+    }
+
+    let opts = opts_builder.build();
+    let ufs = UfsFileSystem::new(&ufs_path, opts.add_properties.clone(), None).unwrap();
+    if ufs.exists(&ufs_path).await.unwrap() {
+        ufs.delete(&ufs_path, true).await.unwrap();
+    }
+
+    ufs.mkdir(&ufs_path, true).await.unwrap();
+
+    fs.mount(&ufs_path, &cv_path, opts.clone()).await.unwrap();
+}

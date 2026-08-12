@@ -1,0 +1,65 @@
+[package]
+name = "curvine-fuse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+curvine-core-error = { workspace = true }
+curvine-io = { workspace = true }
+curvine-net = { workspace = true }
+curvine-model = { workspace = true }
+curvine-error = { workspace = true }
+curvine-sys = { workspace = true }
+curvine-alloc = { workspace = true }
+curvine-runtime = { workspace = true }
+curvine-fs-api = { workspace = true }
+curvine-client = { workspace = true, features = ["unified"] }
+curvine-config = { workspace = true }
+curvine-metrics = { workspace = true }
+log = { workspace = true }
+clap = { workspace = true }
+pin-project-lite = { workspace = true }
+tokio  = { workspace = true }
+bytes = { workspace = true }
+num_enum = { workspace = true }
+libc = { workspace = true }
+memchr = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }
+trait-variant = { workspace = true }
+nix = { workspace = true }
+once_cell = { workspace = true }
+parking_lot = { workspace = true }
+mini-moka = { workspace = true }
+fxhash = { workspace = true }
+dashmap = { workspace = true }
+bitflags = { workspace = true }
+axum = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
+
+[features]
+default = ["fuse3"]
+fuse2 = []
+fuse3 = []
+# Product builds enable UFS adapters via build.sh (`curvine-client/<ufs>`).
+# Keep them optional here so the default fuse tree stays client-light.
+opendal-s3 = ["curvine-client/opendal-s3"]
+opendal-oss = ["curvine-client/opendal-oss"]
+opendal-gcs = ["curvine-client/opendal-gcs"]
+opendal-azblob = ["curvine-client/opendal-azblob"]
+opendal-cos = ["curvine-client/opendal-cos"]
+opendal-hdfs = ["curvine-client/opendal-hdfs"]
+opendal-webhdfs = ["curvine-client/opendal-webhdfs"]
+opendal-hdfs-native = ["curvine-client/opendal-hdfs-native"]
+oss-hdfs = ["curvine-client/oss-hdfs"]
+
+[build-dependencies]
+pkg-config = "0.3.27"

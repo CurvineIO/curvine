@@ -1,0 +1,188 @@
+# Use the official Rocky Linux 9 image as a base
+FROM rockylinux:9
+
+# Add metadata labels
+ARG REPO_URL=https://github.com/curvineio/curvine
+LABEL org.opencontainers.image.source="${REPO_URL}"
+
+# 1. Install the basic toolchain and dependencies
+# rockylinux:9 ships curl-minimal; installing package "curl" conflicts with it. curl-minimal is enough for HTTPS downloads below.
+RUN dnf install -y dnf-plugins-core && \
+    dnf config-manager --set-enabled crb && \
+    dnf install -y \
+    gcc \
+    gcc-c++ \
+    make \
+    pkg-config \
+    fuse3 \
+    fuse3-devel \
+    clang \
+    llvm \
+    llvm-devel \
+    git \
+    wget \
+    zip \
+    unzip \
+    jq \
+    python3 \
+    python3-pip \
+    java-1.8.0-openjdk-devel \
+    which \
+    openssl-devel \
+    libstdc++-devel \
+    libstdc++-static \
+    zlib-devel \
+    zlib-static \
+    fio \
+    && dnf clean all
+
+# 1.1. Install Node.js 22 LTS from NodeSource repository (ensures npm >= 9.0.0 and compatibility)
+RUN curl -sL https://rpm.nodesource.com/setup_22.x | bash - && \
+    dnf clean all && \
+    dnf module reset -y nodejs 2>/dev/null || true && \
+    dnf module disable -y nodejs 2>/dev/null || true && \
+    dnf install -y --nobest nodejs && \
+    dnf clean all
+
+# 2. Install the Rust toolchain
+# uncomment the following two lines if you met network problem
+#ENV RUSTUP_UPDATE_ROOT=https://mirrors.aliyun.com/rustup/rustup
+#ENV RUSTUP_DIST_SERVER=https://mirrors.aliyun.com/rustup
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.92.0 && \
+    source $HOME/.cargo/env && \
+    rustup default 1.92.0 && \
+    rustup component add clippy rustfmt rust-src rust-analyzer && \
+    rustup target add x86_64-unknown-linux-gnu && \
+    cargo install --force cargo-cache && \
+    cargo install cargo-nextest --locked && \
+    echo "Rust toolchain and components installed successfully"
+
+# 3. Install protoc with multi-arch support
+RUN PROTOC_VERSION=27.2 && \
+    ARCH=$(uname -m) && \
+    case "${ARCH}" in \
+        x86_64) PROTOC_ARCH="x86_64" ;; \
+        aarch64) PROTOC_ARCH="aarch_64" ;; \
+        *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    esac && \
+    echo "Installing protoc ${PROTOC_VERSION} for ${PROTOC_ARCH}..." && \
+    mkdir -p /app/protoc && cd /app/protoc && \
+    curl -LO "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip" && \
+    unzip "protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip" && \
+    chmod +x bin/protoc && \
+    rm -f *.zip && \
+    echo "✓ protoc installed successfully for ${ARCH}"
+ENV PATH="/app/protoc/bin:${PATH}"
+
+# 4. Install Maven
+RUN cd /app && \
+    MAVEN_VERSION=3.9.16 && \
+    MAVEN_PACKAGE=apache-maven-${MAVEN_VERSION}-bin.tar.gz && \
+    MAVEN_ARCHIVE_URL=https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/${MAVEN_PACKAGE} && \
+    curl -fL -o ${MAVEN_PACKAGE} ${MAVEN_ARCHIVE_URL} && \
+    tar -xzf ${MAVEN_PACKAGE} && \
+    mv apache-maven-${MAVEN_VERSION} maven && \
+    rm -f *.tar.gz && \
+    echo "✓ Maven ${MAVEN_VERSION} installed successfully"
+ENV PATH="/app/maven/bin:${PATH}"
+
+# 4.1. Install JindoSDK (Alibaba Cloud OSS-HDFS SDK) with multi-arch support
+RUN cd /opt && \
+    JINDOSDK_VERSION=6.10.3 && \
+    ARCH=$(uname -m) && \
+    echo "Installing JindoSDK ${JINDOSDK_VERSION} for ${ARCH}..." && \
+    case "${ARCH}" in \
+        x86_64) \
+            JINDOSDK_FILE="jindosdk-${JINDOSDK_VERSION}-linux.tar.gz" ;; \
+        aarch64) \
+            JINDOSDK_FILE="jindosdk-${JINDOSDK_VERSION}-linux-el7-aarch64.tar.gz" ;; \
+        *) \
+            echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    esac && \
+    echo "Downloading ${JINDOSDK_FILE}..." && \
+    curl -fL -o ${JINDOSDK_FILE} \
+        https://jindodata-binary.oss-cn-shanghai.aliyuncs.com/release/${JINDOSDK_VERSION}/${JINDOSDK_FILE} && \
+    tar -xzf ${JINDOSDK_FILE} && \
+    echo "Checking extracted directory..." && \
+    ls -la /opt/ && \
+    EXTRACTED_DIR=$(ls -d jindosdk* | head -n1) && \
+    echo "Found directory: ${EXTRACTED_DIR}" && \
+    if [ "$EXTRACTED_DIR" != "jindosdk" ]; then \
+        mv "$EXTRACTED_DIR" jindosdk; \
+    fi && \
+    rm -f ${JINDOSDK_FILE} && \
+    echo "✓ JindoSDK ${JINDOSDK_VERSION} installed successfully for ${ARCH}"
+ENV JINDOSDK_HOME=/opt/jindosdk
+ENV LD_LIBRARY_PATH="${JINDOSDK_HOME}/lib"
+
+#5. Replace the configuration
+RUN mkdir -p /app/maven/conf
+COPY curvine-docker/compile/settings.xml /app/maven/conf/settings.xml
+
+RUN mkdir -p /root/.cargo
+COPY curvine-docker/compile/config /root/.cargo/config.toml
+
+# ============ DEPENDENCY CACHING SECTION ============
+
+# 6. Cache Rust dependencies using original project config (most accurate method)
+RUN mkdir -p /tmp/rust-deps
+WORKDIR /tmp/rust-deps
+
+# Use original project configuration files directly
+COPY Cargo.toml ./
+COPY Cargo.lock ./
+
+# Create workspace member structure and generate minimal config files (merged into single RUN to reduce layers)
+RUN mkdir -p curvine-server/src curvine-client/src curvine-libsdk/src curvine-tests/src curvine-fuse/src curvine-web/src curvine-ufs/src curvine-cli/src crates/common/curvine-ufs-api/src && \
+    echo '[package]\nname = "curvine-server"\nversion = "0.1.0"\nedition = "2021"' > curvine-server/Cargo.toml && \
+    echo '[package]\nname = "curvine-client"\nversion = "0.1.0"\nedition = "2021"' > curvine-client/Cargo.toml && \
+    echo '[package]\nname = "curvine-libsdk"\nversion = "0.1.0"\nedition = "2021"' > curvine-libsdk/Cargo.toml && \
+    echo '[package]\nname = "curvine-tests"\nversion = "0.1.0"\nedition = "2021"' > curvine-tests/Cargo.toml && \
+    echo '[package]\nname = "curvine-fuse"\nversion = "0.1.0"\nedition = "2021"' > curvine-fuse/Cargo.toml && \
+    echo '[package]\nname = "curvine-web"\nversion = "0.1.0"\nedition = "2021"' > curvine-web/Cargo.toml && \
+    echo '[package]\nname = "curvine-ufs"\nversion = "0.1.0"\nedition = "2021"' > curvine-ufs/Cargo.toml && \
+    echo '[package]\nname = "curvine-ufs-api"\nversion = "0.1.0"\nedition = "2021"' > crates/common/curvine-ufs-api/Cargo.toml && \
+    echo '[package]\nname = "curvine-cli"\nversion = "0.1.0"\nedition = "2021"' > curvine-cli/Cargo.toml && \
+    echo 'fn main() {}' > curvine-server/src/main.rs && \
+    echo 'fn main() {}' > curvine-client/src/main.rs && \
+    echo 'fn main() {}' > curvine-libsdk/src/lib.rs && \
+    echo 'fn main() {}' > curvine-tests/src/lib.rs && \
+    echo 'fn main() {}' > curvine-fuse/src/main.rs && \
+    echo 'fn main() {}' > curvine-web/src/lib.rs && \
+    echo 'fn main() {}' > curvine-ufs/src/lib.rs && \
+    echo 'fn main() {}' > crates/common/curvine-ufs-api/src/lib.rs && \
+    echo 'fn main() {}' > curvine-cli/src/main.rs
+
+# Use original project config + Cargo.lock to cache exact dependencies
+RUN cargo build --release || echo "Release build failed, continuing..."
+RUN cargo build || echo "Debug build failed, continuing..."
+
+# Clean up temporary directories
+RUN rm -rf /tmp/rust-deps /tmp/node-deps /tmp/maven-deps
+
+# ============ END DEPENDENCY CACHING SECTION ============
+
+# Add useful aliases and settings to .bashrc for interactive sessions
+RUN echo 'export PS1="\[\033[01;32m\]curvine\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "' >> /root/.bashrc && \
+    echo 'alias ll="ls -la"' >> /root/.bashrc && \
+    echo 'alias cb="cargo build"' >> /root/.bashrc && \
+    echo 'alias ct="cargo test"' >> /root/.bashrc && \
+    echo 'alias cr="cargo run"' >> /root/.bashrc
+
+# Add after all installation commands
+RUN rm -rf \
+    /var/cache/yum/* \
+    /tmp/* \
+    /var/tmp/*
+
+
+WORKDIR /workspace
+
+# Verify toolchains. Do not `npm install -g npm@latest`: it replaces distro npm and can leave broken deps (e.g. MODULE_NOT_FOUND promise-retry).
+RUN rustc --version && cargo --version && protoc --version && mvn --version && node --version && \
+    npm --version
+
+# Use ENTRYPOINT to ensure environment is loaded
+ENTRYPOINT ["/bin/bash", "-c"]
+CMD ["bash"]

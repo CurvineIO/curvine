@@ -1,0 +1,38 @@
+{
+  "name": "curvine-dev",
+  "image": "ghcr.io/curvineio/curvine-compile:rocky9",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+  "workspaceFolder": "/workspace",
+  "remoteUser": "root",
+  "init": true,
+  "overrideCommand": true,
+  "updateRemoteUserUID": false,
+  "mounts": [
+    "source=curvine-cargo-cache,target=/root/.cargo,type=volume",
+    "source=curvine-m2-cache,target=/root/.m2,type=volume",
+    "source=curvine-npm-cache,target=/root/.npm,type=volume"
+  ],
+  "postCreateCommand": "git config --global --add safe.directory /workspace && cd /workspace/curvine-web/webui && npm install",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb",
+        "tamasfe.even-better-toml",
+        "ms-python.python",
+        "golang.go",
+        "dbaeumer.vscode-eslint",
+        "Vue.volar"
+      ],
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "editor.formatOnSave": true,
+        "rust-analyzer.check.command": "clippy",
+        "rust-analyzer.cargo.features": "all",
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rust-analyzer"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,502 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use clap::Parser;
+use curvine_config::{ClientConfCliOverrides, ClusterConf};
+use curvine_core_error::{err_box, CommonResult};
+use curvine_net::net::InetAddr;
+use curvine_runtime::common::{ByteUnit, DurationUnit};
+use curvine_sys::version;
+
+/// CLI arguments for the curvine-fuse mount command.
+#[derive(Debug, Parser, Clone)]
+#[command(version = version::VERSION)]
+pub struct FuseMountArgs {
+    #[arg(long, help = "Mount point path (default: /curvine-fuse)")]
+    pub mnt_path: Option<String>,
+
+    #[arg(long, help = "Remote filesystem path (default: /)")]
+    fs_path: Option<String>,
+
+    #[arg(long, help = "Number of mount points (default: 1)")]
+    pub mnt_number: Option<usize>,
+
+    #[arg(short, long, action = clap::ArgAction::SetTrue, help = "Enable debug mode")]
+    debug: bool,
+
+    #[arg(
+        short,
+        long,
+        help = "Configuration file path (optional)",
+        default_value = "conf/curvine-cluster.toml"
+    )]
+    conf: String,
+
+    #[arg(long, help = "IO threads (optional)")]
+    pub io_threads: Option<usize>,
+
+    #[arg(long, help = "Worker threads (optional)")]
+    pub worker_threads: Option<usize>,
+
+    // `mnt-per-task` alias kept so existing Fluid/mount scripts do not fail on upgrade.
+    #[arg(
+        long,
+        alias = "mnt-per-task",
+        help = "Tasks per mount point (optional)"
+    )]
+    pub tasks_per_mnt: Option<usize>,
+
+    #[arg(long, help = "Enable clone fd feature (optional)")]
+    pub clone_fd: Option<bool>,
+
+    #[arg(long, help = "FUSE channel size (optional)")]
+    pub fuse_channel_size: Option<usize>,
+
+    #[arg(long, help = "Stream channel size (optional)")]
+    pub stream_channel_size: Option<usize>,
+
+    #[arg(long, help = "Enable direct IO (optional)")]
+    pub direct_io: Option<bool>,
+
+    #[arg(long, help = "Cache readdir results (optional)")]
+    pub cache_readdir: Option<bool>,
+
+    // Timeout settings
+    #[arg(long, help = "Entry timeout in milliseconds (optional)")]
+    pub entry_timeout_ms: Option<u64>,
+
+    #[arg(long, help = "Attribute timeout in milliseconds (optional)")]
+    pub attr_timeout_ms: Option<u64>,
+
+    #[arg(long, help = "Negative timeout in milliseconds (optional)")]
+    pub negative_timeout_ms: Option<u64>,
+
+    // Performance settings
+    #[arg(long, help = "Max background operations; must be > 0 (optional)")]
+    pub max_background: Option<u16>,
+
+    #[arg(
+        long,
+        help = "Congestion threshold; must be > 0 and <= max_background (optional)"
+    )]
+    pub congestion_threshold: Option<u16>,
+
+    #[arg(long, help = "Node cache timeout (e.g., '1h', '30m') (optional)")]
+    pub node_cache_timeout: Option<String>,
+
+    #[arg(long, help = "Web server port (optional)")]
+    pub web_port: Option<u16>,
+
+    #[arg(long, help = "Master address (e.g., 'm1:8995,m2:8995')")]
+    pub master_addrs: Option<String>,
+
+    // FUSE options
+    #[arg(
+        short,
+        long,
+        help = "FUSE options; when provided, replace options from the config file"
+    )]
+    options: Vec<String>,
+
+    #[arg(
+        long,
+        action = clap::ArgAction::SetTrue,
+        help = "Mount the entire FUSE filesystem read-only"
+    )]
+    readonly: bool,
+
+    // Additional FuseConf fields
+    #[arg(long, help = "Fill inode number when reading directory (optional)")]
+    pub read_dir_fill_ino: Option<bool>,
+
+    #[arg(long, help = "Enable kernel write-back cache (optional)")]
+    pub write_back_cache: Option<bool>,
+
+    #[arg(long, help = "Enable userspace write-back page cache (optional)")]
+    pub enable_write_back: Option<bool>,
+
+    #[arg(long, help = "Write-back cache type: 'memory' or 'disk' (optional)")]
+    pub write_back_cache_type: Option<String>,
+
+    #[arg(
+        long,
+        help = "Write-back disk directory; repeatable when cache type is disk (optional)"
+    )]
+    pub write_back_disk_dirs: Vec<String>,
+
+    #[arg(
+        long,
+        help = "Write-back total cache capacity (e.g., '1gb', '512mb') (optional)"
+    )]
+    pub write_back_cache_size: Option<String>,
+
+    #[arg(long, help = "Write-back page size (e.g., '4mb', '128kb') (optional)")]
+    pub write_back_page_size: Option<String>,
+
+    #[arg(long, help = "Max concurrent write-back flushes to remote (optional)")]
+    pub write_back_max_concurrent: Option<usize>,
+
+    #[arg(
+        long,
+        help = "Dirty data min residency before auto flush (e.g., '3s', '0') (optional)"
+    )]
+    pub write_back_flush_delay: Option<String>,
+
+    #[arg(
+        long,
+        help = "Write-back worker tick interval (e.g., '200ms', '1s') (optional)"
+    )]
+    pub write_back_tick_interval: Option<String>,
+
+    #[arg(long, help = "Write-back dirty message channel capacity (optional)")]
+    pub write_back_channel_size: Option<usize>,
+
+    #[arg(
+        long,
+        help = "Write-back free-space ratio that triggers reclaim (e.g., '0.1') (optional)"
+    )]
+    pub write_back_free_ratio: Option<f64>,
+
+    #[arg(long, help = "Enable non-seekable mode (optional)")]
+    pub non_seekable: Option<bool>,
+
+    #[arg(long, help = "Enable permission checking (optional)")]
+    pub check_permission: Option<bool>,
+
+    #[arg(
+        long,
+        help = "Enable FUSE metrics; set false to disable, e.g. --metrics-enabled false (optional)"
+    )]
+    pub metrics_enabled: Option<bool>,
+
+    #[arg(long, help = "Enable in-kernel metadata cache (optional)")]
+    pub enable_meta_cache: Option<bool>,
+
+    #[arg(long, help = "Metadata cache TTL (e.g., '120s', '2m') (optional)")]
+    pub meta_cache_ttl: Option<String>,
+
+    #[arg(long, help = "Remember opened inodes across FUSE sessions (optional)")]
+    pub remember: Option<bool>,
+
+    #[arg(
+        long,
+        help = "Maximum number of entries returned per directory listing (optional)"
+    )]
+    pub list_limit: Option<usize>,
+}
+
+/// Mount CLI flags plus generated `ClientConf` overrides (`--client.*`).
+#[derive(Debug, Parser, Clone)]
+pub struct FuseRuntimeArgs {
+    #[command(flatten)]
+    pub mount: FuseMountArgs,
+
+    #[command(flatten)]
+    pub client: ClientConfCliOverrides,
+}
+
+impl FuseRuntimeArgs {
+    /// Loads cluster config from mount flags and applies `--client.*` overrides.
+    pub fn get_conf(&self) -> CommonResult<ClusterConf> {
+        let mut conf = self.mount.get_conf()?;
+        self.client.apply_to(&mut conf.client)?;
+        conf.client.init()?;
+        Ok(conf)
+    }
+
+    /// Path to the configuration file that `get_conf` loads from. Used by
+    /// `validate-config` to re-read the raw TOML for unknown-key detection.
+    pub fn conf_path(&self) -> &str {
+        &self.mount.conf
+    }
+}
+
+impl FuseMountArgs {
+    /// Parses the cluster configuration file and applies CLI overrides.
+    pub fn get_conf(&self) -> CommonResult<ClusterConf> {
+        let mut conf = ClusterConf::from(&self.conf)?;
+        println!("Loaded configuration from {}", self.conf);
+
+        // FUSE configuration - only override if command line values are specified
+        if let Some(mnt_path) = &self.mnt_path {
+            conf.fuse.mnt_path = mnt_path.clone();
+        }
+        if let Some(fs_path) = &self.fs_path {
+            conf.fuse.fs_path = fs_path.clone();
+        }
+        if let Some(mnt_number) = self.mnt_number {
+            conf.fuse.mnt_number = mnt_number;
+        }
+        if self.debug {
+            conf.fuse.debug = true;
+        }
+
+        // Optional FUSE parameters - only override if specified
+        if let Some(io_threads) = self.io_threads {
+            conf.fuse.io_threads = io_threads;
+        }
+
+        if let Some(worker_threads) = self.worker_threads {
+            conf.fuse.worker_threads = worker_threads;
+        }
+
+        if let Some(tasks_per_mnt) = self.tasks_per_mnt {
+            conf.fuse.tasks_per_mnt = tasks_per_mnt;
+        }
+
+        if let Some(clone_fd) = self.clone_fd {
+            conf.fuse.clone_fd = clone_fd;
+        }
+
+        if let Some(fuse_channel_size) = self.fuse_channel_size {
+            conf.fuse.fuse_channel_size = fuse_channel_size;
+        }
+
+        if let Some(stream_channel_size) = self.stream_channel_size {
+            conf.fuse.stream_channel_size = stream_channel_size;
+        }
+
+        if let Some(direct_io) = self.direct_io {
+            conf.fuse.direct_io = direct_io;
+        }
+
+        if let Some(cache_readdir) = self.cache_readdir {
+            conf.fuse.cache_readdir = cache_readdir;
+        }
+
+        if let Some(entry_timeout_ms) = self.entry_timeout_ms {
+            conf.fuse.entry_timeout_ms = entry_timeout_ms;
+        }
+
+        if let Some(attr_timeout_ms) = self.attr_timeout_ms {
+            conf.fuse.attr_timeout_ms = attr_timeout_ms;
+        }
+
+        if let Some(negative_timeout_ms) = self.negative_timeout_ms {
+            conf.fuse.negative_timeout_ms = negative_timeout_ms;
+        }
+
+        if let Some(max_background) = self.max_background {
+            conf.fuse.max_background = max_background;
+        }
+
+        if let Some(congestion_threshold) = self.congestion_threshold {
+            conf.fuse.congestion_threshold = congestion_threshold;
+        }
+
+        if let Some(node_cache_timeout) = &self.node_cache_timeout {
+            conf.fuse.node_cache_timeout = node_cache_timeout.clone();
+        }
+
+        if let Some(web_port) = self.web_port {
+            conf.fuse.web_port = web_port;
+        }
+
+        if let Some(read_dir_fill_ino) = self.read_dir_fill_ino {
+            conf.fuse.read_dir_fill_ino = read_dir_fill_ino;
+        }
+
+        if self.readonly {
+            conf.fuse.readonly = true;
+        }
+
+        if let Some(write_back_cache) = self.write_back_cache {
+            conf.fuse.write_back_cache = write_back_cache;
+        }
+
+        if let Some(enable_write_back) = self.enable_write_back {
+            conf.fuse.enable_write_back = enable_write_back;
+        }
+
+        if let Some(write_back_cache_type) = &self.write_back_cache_type {
+            conf.fuse.write_back_cache_type = write_back_cache_type.clone();
+        }
+
+        if !self.write_back_disk_dirs.is_empty() {
+            conf.fuse.write_back_disk_dirs = self.write_back_disk_dirs.clone();
+        }
+
+        if let Some(s) = &self.write_back_cache_size {
+            conf.fuse.write_back_cache_size = ByteUnit::from_str(s)?;
+        }
+
+        if let Some(s) = &self.write_back_page_size {
+            conf.fuse.write_back_page_size = ByteUnit::from_str(s)?;
+        }
+
+        if let Some(write_back_max_concurrent) = self.write_back_max_concurrent {
+            conf.fuse.write_back_max_concurrent = write_back_max_concurrent;
+        }
+
+        if let Some(s) = &self.write_back_flush_delay {
+            conf.fuse.write_back_flush_delay = DurationUnit::from_str(s)?;
+        }
+
+        if let Some(s) = &self.write_back_tick_interval {
+            conf.fuse.write_back_tick_interval = DurationUnit::from_str(s)?;
+        }
+
+        if let Some(write_back_channel_size) = self.write_back_channel_size {
+            conf.fuse.write_back_channel_size = write_back_channel_size;
+        }
+
+        if let Some(write_back_free_ratio) = self.write_back_free_ratio {
+            conf.fuse.write_back_free_ratio = write_back_free_ratio;
+        }
+
+        if let Some(non_seekable) = self.non_seekable {
+            conf.fuse.non_seekable = non_seekable;
+        }
+
+        if let Some(check_permission) = self.check_permission {
+            conf.fuse.check_permission = check_permission;
+        }
+
+        if let Some(metrics_enabled) = self.metrics_enabled {
+            conf.fuse.metrics_enabled = metrics_enabled;
+        }
+
+        if let Some(enable_meta_cache) = self.enable_meta_cache {
+            conf.fuse.enable_meta_cache = enable_meta_cache;
+        }
+
+        if let Some(meta_cache_ttl) = &self.meta_cache_ttl {
+            conf.fuse.meta_cache_timeout = meta_cache_ttl.clone();
+        }
+
+        if let Some(remember) = self.remember {
+            conf.fuse.remember = remember;
+        }
+
+        if let Some(list_limit) = self.list_limit {
+            conf.fuse.list_limit = list_limit;
+        }
+
+        if let Some(master_addrs) = &self.master_addrs {
+            let mut vec = vec![];
+            for node in master_addrs.split(",") {
+                let tmp: Vec<&str> = node.split(":").collect();
+                if tmp.len() != 2 {
+                    return err_box!("wrong format master_addrs {}", master_addrs);
+                }
+                let hostname = tmp[0].to_string();
+                let port: u16 = tmp[1].parse()?;
+                vec.push(InetAddr::new(hostname, port));
+            }
+            conf.client.master_addrs = vec;
+        }
+
+        // CLI options replace config-file options when provided. Otherwise preserve
+        // configured options and apply defaults only when neither source supplies any.
+        if !self.options.is_empty() {
+            conf.fuse.fuse_opts = self.options.clone()
+        } else if conf.fuse.fuse_opts.is_empty() {
+            conf.fuse.fuse_opts = Self::default_mnt_opts();
+        }
+
+        conf.fuse.init()?;
+
+        Ok(conf)
+    }
+
+    pub fn default_mnt_opts() -> Vec<String> {
+        if cfg!(feature = "fuse3") {
+            vec![
+                "allow_other".to_string(),
+                "async".to_string(),
+                "auto_unmount".to_string(),
+            ]
+        } else {
+            vec![
+                "allow_other".to_string(),
+                "async".to_string(),
+                "big_write".to_string(),
+                "max_write=131072".to_string(),
+            ]
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FuseMountArgs;
+    use clap::Parser;
+    use curvine_config::ClusterConf;
+    use curvine_runtime::common::Utils;
+    use std::fs;
+
+    fn get_conf(config: &str, extra_args: &[&str]) -> ClusterConf {
+        let conf_path = Utils::temp_file();
+        fs::write(&conf_path, config).expect("write test config");
+
+        let mut argv = vec!["curvine-fuse", "--conf", conf_path.as_str()];
+        argv.extend_from_slice(extra_args);
+        let args = FuseMountArgs::try_parse_from(argv).expect("parse mount arguments");
+        let result = args.get_conf();
+        let _ = fs::remove_file(&conf_path);
+
+        result.expect("load mount configuration")
+    }
+
+    #[test]
+    fn get_conf_preserves_config_fuse_opts_without_cli_override() {
+        let conf = get_conf(
+            "[fuse]\nio_threads = 1\nfuse_opts = [\"allow_root\", \"ro\"]\n",
+            &[],
+        );
+
+        assert_eq!(conf.fuse.fuse_opts, vec!["allow_root", "ro"]);
+    }
+
+    #[test]
+    fn get_conf_cli_fuse_opts_replace_config_fuse_opts() {
+        let conf = get_conf(
+            "[fuse]\nio_threads = 1\nfuse_opts = [\"allow_root\"]\n",
+            &["--options", "ro"],
+        );
+
+        assert_eq!(conf.fuse.fuse_opts, vec!["ro"]);
+    }
+
+    #[test]
+    fn get_conf_uses_default_fuse_opts_when_no_source_provides_any() {
+        let conf = get_conf("[fuse]\nio_threads = 1\n", &[]);
+
+        assert_eq!(conf.fuse.fuse_opts, FuseMountArgs::default_mnt_opts());
+    }
+
+    #[test]
+    fn get_conf_rejects_zero_io_threads_cli_override() {
+        let conf_path = Utils::temp_file();
+        fs::write(&conf_path, "[fuse]\nio_threads = 1\n").expect("write test config");
+
+        let args = FuseMountArgs::try_parse_from([
+            "curvine-fuse",
+            "--conf",
+            &conf_path,
+            "--io-threads",
+            "0",
+        ])
+        .expect("parse mount arguments");
+        let result = args.get_conf();
+        let _ = fs::remove_file(&conf_path);
+
+        let err = result.expect_err("zero io_threads override must be rejected");
+        assert!(
+            err.to_string().contains("fuse.io_threads must be > 0"),
+            "unexpected error: {}",
+            err
+        );
+    }
+}

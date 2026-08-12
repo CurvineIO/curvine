@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Build Rocky Linux 9 binary file
+  build:
+    name: Build for Rocky Linux 9
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/curvineio/curvine-compile:rocky9
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # hdfs-sys (opendal-hdfs) uses java-locator which shells out to `which`
+    - name: Ensure which is available for hdfs-sys build
+      run: |
+        if ! command -v which >/dev/null 2>&1; then
+          dnf install -y which
+        fi
+
+    - name: Cache cargo registry
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: rocky9-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Build and package
+      env:
+        RELEASE_VERSION: ${{ github.ref_name }}
+      run: |
+        BUILD_VERSION="${RELEASE_VERSION#v}"
+        export BUILD_VERSION
+        make dist ARGS='--ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs --ufs opendal-webhdfs --ufs oss-hdfs'
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: curvine-rocky9-x86_64
+        path: curvine-*.tar.gz
+
+  # Create GitHub Release
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: artifacts/*/*
+        generate_release_notes: true
+        draft: false
+        prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') || contains(github.ref, 'rc') }}
+        body: |
+          ## Binary Downloads
+          
+          ### Rocky Linux 9
+          - **x86_64**: Download the `.tar.gz` file from the assets below
+          
+          ### Installation
+          1. Download the binary package
+          2. Extract: `tar -xzf curvine-*.tar.gz`
+          3. Follow the [quick start](https://curvineio.github.io/docs/Deploy/quick-start/#download-release-binary-package) to deploy
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

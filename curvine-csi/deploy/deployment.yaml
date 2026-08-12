@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/name: curvine-csi-controller
+  name: curvine-csi-controller
+  namespace: curvine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: curvine-csi-controller
+  template:
+    metadata:
+      labels:
+        app: curvine-csi-controller
+    spec:
+      priorityClassName: system-cluster-critical
+      serviceAccountName: curvine-csi-controller-sa
+      tolerations:
+        - key: CriticalAddonsOnly
+          operator: Exists
+      containers:
+        - name: csi-plugin
+          image: ghcr.io/curvineio/curvine-csi:latest
+          imagePullPolicy: Always
+          command: ["/opt/curvine/csi"]
+          args:
+            - --endpoint=$(CSI_ENDPOINT)
+            - --nodeid=$(NODE_NAME)
+          env:
+            - name: CSI_ENDPOINT
+              value: unix:///csi/csi.sock
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: KUBERNETES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # Controller should not use standalone mode
+            - name: MOUNT_MODE
+              value: "embedded"
+          livenessProbe:
+            failureThreshold: 5
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+          ports:
+            - containerPort: 9909
+              name: healthz
+              protocol: TCP
+          securityContext:
+            capabilities:
+              add:
+                - SYS_ADMIN
+            privileged: true
+          volumeMounts:
+            - mountPath: /csi
+              name: socket-dir
+        - args:
+            - --csi-address=$(ADDRESS)
+            - --timeout=300s
+            - --v=5
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          image: quay.io/k8scsi/csi-provisioner:v1.6.0
+          name: csi-provisioner
+          volumeMounts:
+            - mountPath: /csi
+              name: socket-dir
+        - args:
+            - --csi-address=$(ADDRESS)
+            - --health-port=$(HEALTH_PORT)
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+            - name: HEALTH_PORT
+              value: "9909"
+          image: registry.k8s.io/sig-storage/livenessprobe:v2.11.0
+          name: liveness-probe
+          volumeMounts:
+            - mountPath: /csi
+              name: socket-dir
+        - name: csi-attacher
+          image: registry.k8s.io/sig-storage/csi-attacher:v4.5.0
+          args:
+            - --csi-address=$(ADDRESS)
+            - --v=5
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - mountPath: /csi
+              name: socket-dir
+      volumes:
+        - emptyDir: {}
+          name: socket-dir

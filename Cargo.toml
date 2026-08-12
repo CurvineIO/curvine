@@ -1,0 +1,246 @@
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[profile.release]
+panic = "abort"
+
+# [profile.dev]
+# panic = "abort"
+
+[workspace]
+resolver = "2"
+
+members = [
+    "crates/core/curvine-fault",
+    "crates/core/curvine-metrics",
+    "crates/common/curvine-error",
+    "crates/common/curvine-proto",
+    "crates/common/curvine-model",
+    "crates/common/curvine-fs-api",
+    "crates/common/curvine-storage-api",
+    "crates/common/curvine-ufs-api",
+    "crates/common/curvine-config",
+    "crates/common/curvine-macros",
+    "crates/core/error",
+    "crates/core/runtime",
+    "crates/core/net",
+    "crates/core/rpc",
+    "crates/core/curvine-sys",
+    "crates/core/curvine-alloc",
+    "crates/core/curvine-io",
+    "crates/adapters/curvine-rocksdb",
+    "crates/metadata/curvine-raft",
+    "crates/adapters/curvine-storage-local",
+    "crates/adapters/curvine-storage-spdk",
+    "crates/adapters/curvine-ufs-opendal",
+    "crates/adapters/curvine-ufs-oss-hdfs",
+    "crates/adapters/curvine-hdfs-jni",
+    "crates/server/curvine-data-transfer",
+    "curvine-master",
+    "curvine-worker",
+    "curvine-server",
+    "crates/client/curvine-client-core",
+    "crates/client/curvine-job-client",
+    "crates/client/curvine-unified-fs",
+    "crates/sdk/curvine-sdk-core",
+    "crates/client/curvine-bench",
+    "curvine-client",
+    "curvine-libsdk",
+    "crates/sdk/curvine-libsdk-java",
+    "crates/sdk/curvine-libsdk-python",
+    "curvine-lancedb",
+    # Top-level integration/regression harness. It remains a workspace member so
+    # explicit test commands keep working, but it is intentionally opt-in via
+    # default-members because it pulls server/client/FUSE/native test paths.
+    "curvine-tests",
+    "curvine-fuse",
+    "curvine-web",
+    "curvine-ufs",
+    "curvine-cli",
+    "curvine-s3-gateway",
+]
+
+# Mirror members here unless a crate is intentionally opt-in.
+# curvine-lancedb stays opt-in because it pulls heavy Lance/Arrow dependencies.
+# curvine-tests stays opt-in because it pulls whole-cluster integration,
+# FUSE, and optional external storage dependencies for explicit test runs.
+default-members = [
+    "crates/core/curvine-fault",
+    "crates/core/curvine-metrics",
+    "crates/common/curvine-error",
+    "crates/common/curvine-proto",
+    "crates/common/curvine-model",
+    "crates/common/curvine-fs-api",
+    "crates/common/curvine-storage-api",
+    "crates/common/curvine-ufs-api",
+    "crates/common/curvine-config",
+    "crates/common/curvine-macros",
+    "crates/core/error",
+    "crates/core/runtime",
+    "crates/core/net",
+    "crates/core/rpc",
+    "crates/core/curvine-sys",
+    "crates/core/curvine-alloc",
+    "crates/core/curvine-io",
+    "crates/metadata/curvine-raft",
+    "crates/adapters/curvine-storage-local",
+    "crates/server/curvine-data-transfer",
+    "curvine-master",
+    "curvine-worker",
+    "curvine-server",
+    "crates/client/curvine-client-core",
+    "crates/client/curvine-job-client",
+    "crates/client/curvine-unified-fs",
+    "crates/sdk/curvine-sdk-core",
+    "crates/client/curvine-bench",
+    "curvine-client",
+    "curvine-libsdk",
+    "curvine-fuse",
+    "curvine-web",
+    "curvine-ufs",
+    "curvine-cli"
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+curvine-core-error = { path = "crates/core/error" }
+curvine-runtime = { path = "crates/core/runtime" }
+curvine-net = { path = "crates/core/net" }
+curvine-rpc = { path = "crates/core/rpc" }
+curvine-sys = { path = "crates/core/curvine-sys" }
+curvine-alloc = { path = "crates/core/curvine-alloc" }
+curvine-io = { path = "crates/core/curvine-io" }
+curvine-rocksdb = { path = "crates/adapters/curvine-rocksdb" }
+curvine-raft = { path = "crates/metadata/curvine-raft" }
+curvine-storage-local = { path = "crates/adapters/curvine-storage-local" }
+curvine-storage-spdk = { path = "crates/adapters/curvine-storage-spdk" }
+curvine-ufs-opendal = { path = "crates/adapters/curvine-ufs-opendal" }
+curvine-ufs-oss-hdfs = { path = "crates/adapters/curvine-ufs-oss-hdfs" }
+curvine-hdfs-jni = { path = "crates/adapters/curvine-hdfs-jni" }
+curvine-data-transfer = { path = "crates/server/curvine-data-transfer" }
+curvine-fault = { path = "crates/core/curvine-fault" }
+curvine-metrics = { path = "crates/core/curvine-metrics" }
+curvine-error = { path = "crates/common/curvine-error" }
+curvine-proto = { path = "crates/common/curvine-proto" }
+curvine-model = { path = "crates/common/curvine-model" }
+curvine-fs-api = { path = "crates/common/curvine-fs-api" }
+curvine-storage-api = { path = "crates/common/curvine-storage-api" }
+curvine-ufs-api = { path = "crates/common/curvine-ufs-api" }
+curvine-config = { path = "crates/common/curvine-config" }
+curvine-common-macros = { path = "crates/common/curvine-macros" }
+curvine-master = { path = "curvine-master" }
+curvine-worker = { path = "curvine-worker" }
+curvine-client-core = { path = "crates/client/curvine-client-core" }
+curvine-job-client = { path = "crates/client/curvine-job-client" }
+curvine-unified-fs = { path = "crates/client/curvine-unified-fs" }
+curvine-sdk-core = { path = "crates/sdk/curvine-sdk-core" }
+curvine-bench = { path = "crates/client/curvine-bench" }
+curvine-client = { path = "curvine-client", default-features = false }
+curvine-libsdk = { path = "curvine-libsdk" }
+curvine-libsdk-java = { path = "crates/sdk/curvine-libsdk-java" }
+curvine-libsdk-python = { path = "crates/sdk/curvine-libsdk-python" }
+curvine-server = { path = "curvine-server" }
+curvine-lancedb = { path = "curvine-lancedb" }
+curvine-ufs = { path = "curvine-ufs" }
+# Test harness dependency entry is for explicit test/dev tooling only.
+# Production crates must not add normal dependencies on curvine-tests.
+curvine-tests = { path = "curvine-tests" }
+curvine-fuse = { path = "curvine-fuse" }
+curvine-web = { path = "curvine-web" }
+curvine-s3-gateway = { path = "curvine-s3-gateway" }
+
+# The most important library start
+
+libc = "0.2.167"
+tokio = { version = "1.42.0", features = ["full"] }
+futures = "0.3.31"
+async-stream = "0.3.6"
+tokio-util = { version = "0.7.12", features = ["codec"] }
+bytes = "1.9.0"
+serde = { version = "1.0.215", features = ["derive"] }
+rocksdb = { version = "0.22.0", default-features = false, features = ["lz4"] }
+raft = { version = "0.7.0", features = ["prost-codec"], default-features = false }
+trait-variant = "0.1.2"
+nix = { version = "0.30.1", features = ["ioctl", "user", "event"] }
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+mysql = "25.0.1"
+
+# The most important library end
+
+
+log = "0.4.22"
+tracing = "0.1.41"
+tracing-log = "0.2.0"
+tracing-subscriber = "0.3.19"
+tracing-appender = "0.2.3"
+rolling-file = "0.2"
+
+
+prost = "0.11.9"
+prost-build = "0.11.9"
+bincode = "1.3.3"
+serde_json = "1.0.125"
+
+
+once_cell = "1.18.0"
+clap = { version = "4.3.10", features = ["derive"] }
+toml = "0.8.11"
+indexmap = "2.0.2"
+regex = "1.9.4"
+num_enum = "0.7.5"
+hyper = "1.2.0"
+pin-project-lite = "0.2.15"
+uuid = { version = "1.11.0", features = ["v4", "fast-rng"] }
+rand = '0.8.5'
+murmur3 = "0.5.2"
+crc32fast = "1.4.2"
+socket2 = "0.5.8"
+chrono = { version = "0.4.31", default-features = false, features = ["clock"] }
+prometheus = { version = "0.13.4", features = ["process"] }
+sysinfo = "0.30.13"
+fs2 = "0.4.3"
+byteorder = "1.5.0"
+bindgen = "0.69.1"
+
+zerocopy = { version = "0.7.35", features = ["derive"] }
+memchr = "2.6.4"
+smallvec = "1.11.2"
+
+axum = "0.7.4"
+# Note: curvine-s3-gateway uses axum 0.8.4 independently for S3 compatibility
+tower = "0.4.13"
+tower-http = "0.5.2"
+
+thiserror = "1.0.58"
+mini-moka = "0.10.3"
+moka = { version = "0.12.10", features = ["sync"] }
+flate2 = { version = "1.0.29", features = ["zlib"], default-features = false }
+crossbeam = "0.8.4"
+dashmap = "5.5.3"
+linked-hash-map = "0.5.6"
+fxhash = "0.2.1"
+parking_lot = "0.12.3"
+linkme = "0.3.35"
+anyhow = "1.0.97"
+url = "2.2.2"
+async-trait = "0.1.76"
+fastrand = "1.9.0"
+num_cpus = "1.16.0"
+slog = "2.7.0"
+slog-stdlog = "4.1.0"
+bitvec = "1.0.1"
+config = "0.13.4"
+tempfile = "3.21.0"
+md-5 = "0.10.6"
+bitflags = { version = "2.10.0", features = ["serde"] }
+glob = "0.3"
+lru = "0.16.1"
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+
+mimalloc = "0.1.48"
+tikv-jemallocator = { version = "0.6.1", features = ["stats", "unprefixed_malloc_on_supported_platforms"] }
+tikv-jemalloc-ctl = { version = "0.6.1"}
+tikv-jemalloc-sys = { version = "0.6.1", features = ["stats"] }

@@ -1,0 +1,114 @@
+syntax="proto2";
+package raft;
+
+import "eraftpb.proto";
+
+
+// Represents a snapshot file.
+message SnapshotFileInfo {
+    required string path = 1;
+    required uint64 mtime = 2;
+    required uint64 ctime = 3;
+    required uint64 len = 4;
+}
+
+// List of snapshot files
+message SnapshotFileList {
+    // Snapshot root path
+    required string dir = 1;
+
+    // Snapshot all file list
+    repeated SnapshotFileInfo files = 2;
+}
+
+message AppliedIndex {
+    required uint64 term = 1;
+    required uint64 index = 2;
+    required uint64 op_id = 3;
+    required int64 rpc_id = 4;
+}
+
+message FsmState {
+    required AppliedIndex applied = 1;
+    required AppliedIndex ufs_applied = 2;
+}
+
+// Describe a snapshot.
+message SnapshotData {
+    // Snapshot id / applied index of the snapshot.
+    required uint64 snapshot_id = 1;
+
+    // Which node is the snapshot created.
+    required uint64 node_id = 2;
+
+    // Creation time
+    required uint64 create_time = 3;
+
+    optional bytes bytes_data = 4;
+
+    optional SnapshotFileList files_data = 5;
+
+    required FsmState fsm_state = 6;
+}
+
+
+message RaftPeerProto {
+    required uint64 node_id = 1;
+    required string hostname = 2;
+    required uint32 port = 3;
+}
+
+// Request this service to determine whether the current node is a leader.
+message PingRequest {
+
+}
+
+message PingResponse {
+    required uint64 leader_id = 1;
+    repeated RaftPeerProto group = 2;
+}
+
+//Cluster configuration changes.
+message ConfChangeRequest {
+    required eraftpb.ConfChange change = 1;
+}
+
+message ConfChangeResponse {
+}
+
+// User-defined log request.
+message ProposeRequest {
+    required bytes data = 1;
+}
+
+message ProposeResponse {
+}
+
+message RaftRequest {
+    required eraftpb.Message message = 1;
+}
+
+message RaftResponse {
+}
+
+message TransferLeaderRequest {
+    required uint64 target_id = 1;
+}
+
+message TransferLeaderResponse {
+    required uint64 previous_leader_id = 1;
+    required uint64 target_id = 2;
+}
+
+// Download snapshot request.
+message SnapshotDownloadRequest {
+    required string dir = 1;
+    required SnapshotFileInfo snapshot_file = 2;
+    required uint64 offset = 3;
+}
+
+// Snapshot read response, only returns after the end of a file reading.
+message SnapshotDownloadResponse {
+    required bool is_last = 1;
+    required uint64 checksum = 2;
+}

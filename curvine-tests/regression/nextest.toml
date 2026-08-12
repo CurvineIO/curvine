@@ -1,0 +1,25 @@
+# Nextest config for curvine regression tests.
+# Used by daily_regression_test.sh when cargo nextest is available.
+#
+# In GitHub CI (no MinIO/UFS): set NEXTEST_CI_NO_UFS=1 and use --profile ci-no-ufs
+#   to skip UFS-dependent tests. Other scenarios run without this profile and
+#   require UFS_TEST_PATH for those tests.
+
+nextest-version = "0.9"
+
+[profile.default]
+# JUnit output for conversion to build-server test_summary.json
+[profile.default.junit]
+path = "junit.xml"
+store-success-output = true
+store-failure-output = true
+
+# Skip UFS-dependent tests when no MinIO/UFS (e.g. GitHub CI)
+[profile.ci-no-ufs]
+inherits = "default"
+default-filter = 'not (binary(write_cache_test) | binary(ufs_test) | binary(fallback_read_test))'
+
+[profile.ci-no-ufs.junit]
+path = "junit.xml"
+store-success-output = true
+store-failure-output = true

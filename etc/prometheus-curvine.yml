@@ -1,0 +1,40 @@
+# Production scrape example for curvine-web Prometheus/auto mode.
+# Keep the component labels: the observability query provider uses them to
+# distinguish master, worker, Transfer and FUSE series and validates the master contract.
+global:
+  scrape_interval: 30s
+  scrape_timeout: 10s
+
+scrape_configs:
+  - job_name: curvine-master
+    static_configs:
+      - targets:
+          - curvine-master-0:9010
+        labels:
+          component: master
+
+  - job_name: curvine-worker
+    static_configs:
+      - targets:
+          - curvine-worker-0:9001
+          - curvine-worker-1:9001
+        labels:
+          component: worker
+
+  - job_name: curvine-transfer
+    static_configs:
+      - targets:
+          - curvine-transfer-0:9011
+        labels:
+          component: transfer
+
+  # FUSE metrics are opt-in. Replace hostnames with your deployment endpoints
+  # (Docker service names, K8s DNS, or host:port from web.observability.fuse.targets).
+  - job_name: curvine-fuse
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - curvine-fuse-0:9002
+          - curvine-fuse-1:9002
+        labels:
+          component: fuse

@@ -1,0 +1,17 @@
+<?xml version="1.0" standalone="no"?><!--
+  - Copyright 2025 OPPO.
+  -
+  - Licensed under the Apache License, Version 2.0 (the "License");
+  - you may not use this file except in compliance with the License.
+  - You may obtain a copy of the License at
+  -
+  -     http://www.apache.org/licenses/LICENSE-2.0
+  -
+  - Unless required by applicable law or agreed to in writing, software
+  - distributed under the License is distributed on an "AS IS" BASIS,
+  - WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  - See the License for the specific language governing permissions and
+  - limitations under the License.
+  -->
+
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg t="1719566072770" class="icon" viewBox="0 0 1024 1024" version="1.1" xmlns="http://www.w3.org/2000/svg" p-id="1538" xmlns:xlink="http://www.w3.org/1999/xlink" width="200" height="200"><path d="M864 64H576a447.66 447.66 0 0 0-448 448v64a383.71 383.71 0 0 0 384 384h352a32 32 0 0 0 32-32V672a32 32 0 0 0-32-32H512a64.07 64.07 0 0 1-64-64c0-105.87 86.13-192 192-192h224a32 32 0 0 0 32-32V96a32 32 0 0 0-32-32z m-288 64h256v64H512a382.86 382.86 0 0 0-237 81.8C345.41 185 454.17 128 576 128z m256 576v64H624a175.75 175.75 0 0 1-137.77-66.61A128.06 128.06 0 0 0 512 704zM384 576v16a240 240 0 0 0 240 240h208v64H608c-158.8 0-288-129.2-288-288 0-89.79 53.12-167.4 129.57-203.09A254.12 254.12 0 0 0 384 576z m160-256a288 288 0 0 0-288 288 350.95 350.95 0 0 0 103.1 248.9l0.34 0.33C259.78 803 192 697.24 192 576c0-176.45 143.55-320 320-320h320v64z" fill="#5C5C66" p-id="1539"></path></svg>

@@ -1,0 +1,73 @@
+# Example for Prometheus Operator installations that expose Curvine metrics
+# through named Service ports. Adjust namespace and release labels as needed.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: curvine-master
+  namespace: curvine
+  labels:
+    app.kubernetes.io/name: curvine
+spec:
+  namespaceSelector:
+    matchNames: [curvine]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: curvine
+      app.kubernetes.io/component: master
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      relabelings:
+        - action: replace
+          targetLabel: component
+          replacement: master
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: curvine-worker
+  namespace: curvine
+  labels:
+    app.kubernetes.io/name: curvine
+spec:
+  namespaceSelector:
+    matchNames: [curvine]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: curvine
+      app.kubernetes.io/component: worker
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      relabelings:
+        - action: replace
+          targetLabel: component
+          replacement: worker
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: curvine-transfer
+  namespace: curvine
+  labels:
+    app.kubernetes.io/name: curvine
+spec:
+  namespaceSelector:
+    matchNames: [curvine]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: curvine
+      app.kubernetes.io/component: transfer
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      relabelings:
+        - action: replace
+          targetLabel: component
+          replacement: transfer

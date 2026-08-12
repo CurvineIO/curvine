@@ -1,0 +1,25 @@
+[package]
+name = "curvine-job-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+curvine-client-core = { workspace = true }
+curvine-config = { workspace = true }
+curvine-error = { workspace = true }
+curvine-fs-api = { workspace = true }
+curvine-model = { workspace = true }
+curvine-proto = { workspace = true }
+curvine-core-error = { workspace = true }
+curvine-net = { workspace = true }
+curvine-rpc = { workspace = true }
+curvine-runtime = { workspace = true }
+tokio = { workspace = true }
+log = { workspace = true }
+bincode = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+default = []

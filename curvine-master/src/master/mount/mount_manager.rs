@@ -1,0 +1,229 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#![allow(unused)]
+use crate::master::fs::MasterFilesystem;
+use crate::master::mount::MountTable;
+use crate::master::{self, SyncFsDir};
+use curvine_core_error::err_box;
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_fs_api::{self, CurvineURI, Path};
+use curvine_model::{MkdirOpts, MountInfo, MountOptions};
+use curvine_ufs_api::S3Conf;
+use log::info;
+
+pub struct MountManager {
+    master_fs: MasterFilesystem,
+    mount_table: MountTable,
+}
+
+impl MountManager {
+    pub fn new(master_fs: MasterFilesystem) -> Self {
+        let fs_dir = master_fs.fs_dir.clone();
+        MountManager {
+            master_fs,
+            mount_table: MountTable::new(fs_dir),
+        }
+    }
+
+    /// recovery mount points from store
+    pub fn restore(&self) -> FsResult<()> {
+        self.mount_table.restore()
+    }
+
+    pub fn restore_best_effort(&self) {
+        self.mount_table.restore_best_effort()
+    }
+
+    fn create_mount_point(&self, mount_path: &str) -> FsResult<bool> {
+        let exist = self.master_fs.exists(mount_path)?;
+        if exist {
+            return Ok(true);
+        }
+
+        let opts = MkdirOpts::with_create(true);
+        self.master_fs.mkdir_with_opts(mount_path, opts)?;
+        Ok(true)
+    }
+
+    fn normalize_mount_config(mount: &mut MountInfo) -> FsResult<()> {
+        if mount.write_cache && !mount.write_cache_enabled() {
+            return err_box!(
+                "write_cache requires cache_mode with read_write access_mode for mount {}",
+                mount.cv_path
+            );
+        }
+
+        let path = Path::from_str(&mount.ufs_path)?;
+        if !matches!(path.scheme(), Some("s3" | "s3a")) {
+            return Ok(());
+        }
+
+        let properties = std::mem::take(&mut mount.properties);
+        mount.properties = S3Conf::canonicalize_properties(properties).map_err(|err| {
+            FsError::common(format!(
+                "Invalid mount configuration for {}: {}",
+                mount.ufs_path, err
+            ))
+        })?;
+        S3Conf::validate(&mount.properties).map_err(|err| {
+            FsError::common(format!(
+                "Invalid mount configuration for {}: {}",
+                mount.ufs_path, err
+            ))
+        })
+    }
+
+    /// same baseuri of ufs can only mount once
+    ///
+    /// ufs_uri maybe scheme://authority/xxxx/yyy,
+    /// base_uri is scheme://authority/
+    fn add_mount(
+        &self,
+        mnt_id: Option<u32>,
+        mount_path: &str,
+        ufs_path: &str,
+        mnt_opt: &MountOptions,
+    ) -> FsResult<()> {
+        let assign_id = match mnt_id {
+            Some(id) => id,
+            None => self.mount_table.assign_mount_id()?,
+        };
+        let mut mount = mnt_opt.clone().to_info(assign_id, mount_path, ufs_path);
+        Self::normalize_mount_config(&mut mount)?;
+        let _ = self.create_mount_point(mount_path)?;
+
+        let mut normalized_options = mnt_opt.clone();
+        normalized_options.add_properties = mount.properties;
+        self.mount_table
+            .add_mount(assign_id, mount_path, ufs_path, &normalized_options)
+    }
+
+    fn update_mount(&self, cv_path: &str, mnt_opt: &MountOptions) -> FsResult<()> {
+        let path = Path::from_str(cv_path)?;
+        let Some(existing) = self.get_mount_info(&path)? else {
+            return err_box!("mount point {} not found for update", cv_path);
+        };
+        let mut merged = existing.merge_with(mnt_opt.clone());
+        Self::normalize_mount_config(&mut merged)?;
+
+        self.mount_table.update_mount(merged)
+    }
+
+    /// same baseuri of ufs can only mount once
+    ///
+    /// ufs_uri maybe scheme://authority/xxxx/yyy,
+    /// base_uri is scheme://authority/
+    pub fn mount(
+        &self,
+        mnt_id: Option<u32>,
+        cv_path: &str,
+        ufs_path: &str,
+        mnt_opt: &MountOptions,
+    ) -> FsResult<()> {
+        if mnt_opt.update {
+            return self.update_mount(cv_path, mnt_opt);
+        }
+
+        self.add_mount(mnt_id, cv_path, ufs_path, mnt_opt)
+    }
+
+    pub fn unprotected_add_mount(&self, info: MountInfo) -> FsResult<()> {
+        self.mount_table.unprotected_add_mount(info)
+    }
+
+    pub fn umount(&self, cv_path: &str) -> FsResult<()> {
+        self.mount_table.umount(cv_path)
+    }
+
+    pub fn unmount_by_id(&self, id: u32) -> FsResult<()> {
+        let info = self.mount_table.get_mount_info_by_id(id)?;
+        self.umount(&info.cv_path)
+    }
+
+    pub fn unprotected_umount_by_id(&self, id: u32) -> FsResult<()> {
+        self.mount_table.unprotected_umount_by_id(id)
+    }
+
+    pub fn has_mounted(&self, id: u32) -> FsResult<bool> {
+        self.mount_table.has_mounted(id)
+    }
+
+    /**
+     * use ufs_uri to find mount entry
+     */
+    pub fn get_mount_info(&self, path: &Path) -> FsResult<Option<MountInfo>> {
+        self.mount_table.get_mount_info(path)
+    }
+
+    pub fn get_mount_table(&self) -> FsResult<Vec<MountInfo>> {
+        let table = self.mount_table.get_mount_table()?;
+
+        let mut entries = Vec::new();
+        table.iter().for_each(|entry| {
+            entries.push(entry.clone());
+        });
+        Ok(entries)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MountManager;
+    use curvine_model::{AccessMode, MountInfo, MountOptions, WriteType};
+
+    fn mount_info(write_type: WriteType, access_mode: AccessMode, write_cache: bool) -> MountInfo {
+        MountOptions::builder()
+            .write_type(write_type)
+            .access_mode(access_mode)
+            .write_cache(write_cache)
+            .build()
+            .to_info(1, "/mnt", "file:///tmp/curvine-mount")
+    }
+
+    #[test]
+    fn normalize_mount_config_accepts_write_cache_for_cache_mode_read_write() {
+        let mut info = mount_info(WriteType::CacheMode, AccessMode::ReadWrite, true);
+
+        MountManager::normalize_mount_config(&mut info).unwrap();
+    }
+
+    #[test]
+    fn normalize_mount_config_rejects_write_cache_for_read_only_cache_mode() {
+        let mut info = mount_info(WriteType::CacheMode, AccessMode::ReadOnly, true);
+
+        let err = MountManager::normalize_mount_config(&mut info).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("write_cache requires cache_mode with read_write"));
+    }
+
+    #[test]
+    fn normalize_mount_config_rejects_write_cache_for_fs_mode() {
+        let mut info = mount_info(WriteType::FsMode, AccessMode::ReadWrite, true);
+
+        let err = MountManager::normalize_mount_config(&mut info).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("write_cache requires cache_mode with read_write"));
+    }
+
+    #[test]
+    fn normalize_mount_config_accepts_disabled_write_cache() {
+        let mut info = mount_info(WriteType::CacheMode, AccessMode::ReadOnly, false);
+
+        MountManager::normalize_mount_config(&mut info).unwrap();
+    }
+}

@@ -1,0 +1,454 @@
+# Curvine metadata ceiling stress: StatefulSet + headless Service + ConfigMap.
+# Same FUSE/bootstrap model as deployment.yaml, but workload only creates dirs/files (no rm/rmdir).
+#
+# Remote layout: STRESS_REMOTE_ROOT (default /curvine-metadata-stress) / ${POD_NAME} / {mountIndex}
+# Workload root per mount: .../mount/.metadata-stress/
+# Each batch: .../batch-<n>/ with a tree controlled by META_* env vars.
+#
+# Tree model (per batch directory):
+#   META_DIR_DEPTH: how many levels of subdirectories to create below the batch root.
+#     0 = no subdirs; only META_FILES_PER_DIR files in the batch folder.
+#   META_FANOUT: when depth > 0, create this many child directories under each directory,
+#     then recurse with depth-1. Child dir names are dir-<globalCounter> for uniqueness.
+#   META_FILES_PER_DIR: after processing children (if any), create this many tiny files
+#     in the current directory (names f-<globalCounter>).
+#
+# Growth per batch (approximate, fanout F, depth D, files K per dir):
+#   Dir count ~= sum_{i=0..D} F^i = (F^(D+1)-1)/(F-1) for F>1; D+1 for F=1; 1 for D=0.
+#   File count ~= K * (that dir count). Use small defaults first; huge F^D can stall the pod.
+#
+# Env (worker / metadata):
+#   META_DIR_DEPTH (default 2), META_FANOUT (default 4), META_FILES_PER_DIR (default 20)
+#   META_BATCH_PAUSE_SEC (default 0) — sleep after each full batch tree
+#   META_BATCH_COUNT (default 0) — if >= 1, run exactly that many batches per worker (batch-0 .. batch-(N-1)) then exit;
+#     0 = unlimited batches. After all workers finish, entrypoint sleeps forever so the Pod stays up (delete pod to stop).
+#   META_OP_PAUSE_SEC (default 0) — sleep after each mkdir/file op (throttle master); fractional OK
+#   META_WRITE_FILE_DATA (default 0) — 0: empty files via touch; 1: write one byte via echo "m" > file
+#   META_STOP_ON_ERROR (default 0) — set to 1 to exit worker on first mkdir/file failure
+#
+# Shared with master-stress deployment:
+#   MASTER_ADDRS, POD_NAME, NUM_MOUNTS, MNT_ROOT, STRESS_REMOTE_ROOT, FUSE_WEB_PORT_BASE,
+#   SKIP_REMOTE_POD_CLEANUP, SKIP_REMOTE_MKDIR, FUSE_USE_DEFAULT_OPTS, CURVINE_CLI, INTERVAL_SEC
+#   (INTERVAL_SEC is kept for compatibility; metadata workload prefers META_* pauses.)
+#
+# All resources in namespace default (adjust if needed). kubectl apply -f deployment-metadata-stress.yaml
+#
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: curvine-stress-master
+  namespace: default
+type: Opaque
+stringData:
+  master-addrs: "cv-curvine-master-0.cv-curvine-master.default.svc.cluster.local:8995,cv-curvine-master-1.cv-curvine-master.default.svc.cluster.local:8995,cv-curvine-master-2.cv-curvine-master.default.svc.cluster.local:8995"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: curvine-metadata-stress-scripts
+  namespace: default
+data:
+  metadata-stress-entrypoint.sh: |
+    #!/usr/bin/env bash
+    #
+    # Metadata stress: monotonically create directories and files under FUSE mounts (no deletes).
+    #
+    set -u
+
+    : "${MASTER_ADDRS:?MASTER_ADDRS must be set (e.g. m1:8995,m2:8995)}"
+
+    POD_NAME="${POD_NAME:-$(hostname)}"
+    NUM_MOUNTS="${NUM_MOUNTS:-1}"
+    FUSE_WEB_PORT_BASE="${FUSE_WEB_PORT_BASE:-29000}"
+    MNT_ROOT="${MNT_ROOT:-/fuse-mnts}"
+    STRESS_REMOTE_ROOT="${STRESS_REMOTE_ROOT:-/curvine-metadata-stress}"
+    case "${STRESS_REMOTE_ROOT}" in
+      /*) ;;
+      *) STRESS_REMOTE_ROOT="/${STRESS_REMOTE_ROOT}" ;;
+    esac
+    if [ "${STRESS_REMOTE_ROOT}" = "/" ]; then
+      echo "ERROR: STRESS_REMOTE_ROOT must not be /" >&2
+      exit 1
+    fi
+    REMOTE_POD_PREFIX="${STRESS_REMOTE_ROOT}/${POD_NAME}"
+
+    META_DIR_DEPTH="${META_DIR_DEPTH:-2}"
+    META_FANOUT="${META_FANOUT:-4}"
+    META_FILES_PER_DIR="${META_FILES_PER_DIR:-20}"
+    META_BATCH_PAUSE_SEC="${META_BATCH_PAUSE_SEC:-0}"
+    META_BATCH_COUNT="${META_BATCH_COUNT:-0}"
+    META_OP_PAUSE_SEC="${META_OP_PAUSE_SEC:-0}"
+    META_STOP_ON_ERROR="${META_STOP_ON_ERROR:-0}"
+    META_WRITE_FILE_DATA="${META_WRITE_FILE_DATA:-0}"
+
+    if ! [[ "${NUM_MOUNTS}" =~ ^[0-9]+$ ]] || [ "${NUM_MOUNTS}" -lt 1 ]; then
+      echo "NUM_MOUNTS must be a positive integer" >&2
+      exit 1
+    fi
+    for v in META_DIR_DEPTH META_FANOUT META_FILES_PER_DIR META_BATCH_COUNT; do
+      val="${!v}"
+      if ! [[ "${val}" =~ ^[0-9]+$ ]]; then
+        echo "${v} must be a non-negative integer" >&2
+        exit 1
+      fi
+    done
+    if [ "${META_WRITE_FILE_DATA}" != "0" ] && [ "${META_WRITE_FILE_DATA}" != "1" ]; then
+      echo "META_WRITE_FILE_DATA must be 0 or 1" >&2
+      exit 1
+    fi
+
+    mkdir -p "${MNT_ROOT}" || {
+      echo "ERROR: cannot create writable MNT_ROOT=${MNT_ROOT}" >&2
+      exit 1
+    }
+    echo "[bootstrap] metadata-stress MNT_ROOT=${MNT_ROOT} REMOTE_POD_PREFIX=${REMOTE_POD_PREFIX} NUM_MOUNTS=${NUM_MOUNTS}"
+    echo "[bootstrap] META_DIR_DEPTH=${META_DIR_DEPTH} META_FANOUT=${META_FANOUT} META_FILES_PER_DIR=${META_FILES_PER_DIR} META_BATCH_COUNT=${META_BATCH_COUNT} META_WRITE_FILE_DATA=${META_WRITE_FILE_DATA}"
+
+    if [ ! -c /dev/fuse ]; then
+      echo "ERROR: /dev/fuse is missing or not a character device." >&2
+      exit 1
+    fi
+
+    CURVINE_FUSE_EXTRA=(--options async --options auto_unmount)
+    if [ "${FUSE_USE_DEFAULT_OPTS:-0}" = 1 ]; then
+      CURVINE_FUSE_EXTRA=()
+    fi
+    if [ "${FUSE_USE_DEFAULT_OPTS:-0}" = 1 ] && [ -f /etc/fuse.conf ] && ! grep -qE '^[[:space:]]*user_allow_other' /etc/fuse.conf 2>/dev/null; then
+      echo 'user_allow_other' >>/etc/fuse.conf
+    fi
+
+    resolve_curvine_cli() {
+      if [ -n "${CURVINE_CLI:-}" ] && [ -x "${CURVINE_CLI}" ]; then
+        echo "${CURVINE_CLI}"
+        return 0
+      fi
+      if command -v curvine-cli >/dev/null 2>&1; then
+        command -v curvine-cli
+        return 0
+      fi
+      if [ -x /opt/curvine/curvine-cli ]; then
+        echo /opt/curvine/curvine-cli
+        return 0
+      fi
+      return 1
+    }
+
+    REMOTE_CLI_NEEDED=0
+    if [ "${SKIP_REMOTE_POD_CLEANUP:-0}" != 1 ]; then
+      REMOTE_CLI_NEEDED=1
+    fi
+    if [ "${SKIP_REMOTE_MKDIR:-0}" != 1 ]; then
+      REMOTE_CLI_NEEDED=1
+    fi
+
+    CLI_BIN=""
+    if [ "${REMOTE_CLI_NEEDED}" = 1 ]; then
+      if ! CLI_BIN="$(resolve_curvine_cli)"; then
+        echo "ERROR: curvine-cli not found." >&2
+        exit 1
+      fi
+    fi
+
+    if [ "${SKIP_REMOTE_POD_CLEANUP:-0}" != 1 ] && [ -n "${CLI_BIN}" ]; then
+      echo "[bootstrap] remote cleanup (this pod only): fs rm --recursive ${REMOTE_POD_PREFIX}"
+      "${CLI_BIN}" --master-addrs "${MASTER_ADDRS}" fs rm "${REMOTE_POD_PREFIX}" --recursive || true
+    fi
+
+    if [ "${SKIP_REMOTE_MKDIR:-0}" != 1 ]; then
+      echo "[bootstrap] creating remote fs-path roots under ${REMOTE_POD_PREFIX}"
+      for i in $(seq 1 "${NUM_MOUNTS}"); do
+        fs_path="${REMOTE_POD_PREFIX}/${i}"
+        if ! "${CLI_BIN}" --master-addrs "${MASTER_ADDRS}" fs mkdir "${fs_path}" --parents; then
+          echo "ERROR: curvine-cli mkdir failed for ${fs_path}" >&2
+          exit 1
+        fi
+      done
+    else
+      echo "[bootstrap] SKIP_REMOTE_MKDIR=1 — ensure ${REMOTE_POD_PREFIX}/1..N exist"
+    fi
+
+    declare -a FUSE_PIDS=()
+    declare -a WORKER_PIDS=()
+
+    cleanup() {
+      echo "Stopping workers and fuse processes..."
+      for pid in "${WORKER_PIDS[@]:-}"; do
+        kill "${pid}" 2>/dev/null || true
+      done
+      for pid in "${FUSE_PIDS[@]:-}"; do
+        kill "${pid}" 2>/dev/null || true
+      done
+      wait 2>/dev/null || true
+    }
+
+    trap cleanup SIGTERM SIGINT EXIT
+
+    wait_mount_ready() {
+      local idx="$1"
+      local mnt_path="$2"
+      local logf="/tmp/fuse-md-${idx}.log"
+      local deadline=$((SECONDS + 180))
+      while [ "${SECONDS}" -lt "${deadline}" ]; do
+        if mountpoint -q "${mnt_path}" 2>/dev/null; then
+          echo "[fuse ${idx}] mount OK ${mnt_path}"
+          return 0
+        fi
+        if ! kill -0 "${FUSE_PIDS[$((idx - 1))]}" 2>/dev/null; then
+          echo "[fuse ${idx}] process exited before mount; log tail:" >&2
+          tail -n 120 "${logf}" >&2 || true
+          return 1
+        fi
+        sleep 0.5
+      done
+      echo "Timeout waiting for mount at ${mnt_path}" >&2
+      tail -n 120 "${logf}" >&2 || true
+      return 1
+    }
+
+    for i in $(seq 1 "${NUM_MOUNTS}"); do
+      mnt_path="${MNT_ROOT}/curvine-fuse${i}"
+      fs_path="${REMOTE_POD_PREFIX}/${i}"
+      web_port=$((FUSE_WEB_PORT_BASE + i))
+      mkdir -p "${mnt_path}" || exit 1
+      logf="/tmp/fuse-md-${i}.log"
+      echo "[fuse ${i}] start mnt_path=${mnt_path} fs_path=${fs_path} web_port=${web_port}"
+      curvine-fuse \
+        --mnt-path "${mnt_path}" \
+        --fs-path "${fs_path}" \
+        --master-addrs "${MASTER_ADDRS}" \
+        --web-port "${web_port}" \
+        "${CURVINE_FUSE_EXTRA[@]}" >>"${logf}" 2>&1 &
+      FUSE_PIDS+=($!)
+    done
+
+    sleep 5
+
+    for i in $(seq 1 "${NUM_MOUNTS}"); do
+      wait_mount_ready "${i}" "${MNT_ROOT}/curvine-fuse${i}" || exit 1
+    done
+
+    meta_op_pause() {
+      # sleep accepts fractional seconds; sleep 0 is a no-op
+      sleep "${META_OP_PAUSE_SEC}" 2>/dev/null || true
+    }
+
+    fail_or_warn() {
+      local msg="$1"
+      if [ "${META_STOP_ON_ERROR}" = 1 ]; then
+        echo "ERROR: ${msg}" >&2
+        exit 1
+      fi
+      echo "WARN: ${msg}" >&2
+    }
+
+    run_worker() {
+      local id="$1"
+      local base="${MNT_ROOT}/curvine-fuse${id}/.metadata-stress"
+      mkdir -p "${base}" || {
+        echo "[worker ${id}] ERROR mkdir ${base}" >&2
+        return 1
+      }
+
+      local GLOBAL_DIR_COUNTER=0
+      local GLOBAL_FILE_COUNTER=0
+      local batch=0
+
+      create_files_in_dir() {
+        local d="$1"
+        local wid="$2"
+        local n
+        n=1
+        while [ "${n}" -le "${META_FILES_PER_DIR}" ]; do
+          GLOBAL_FILE_COUNTER=$((GLOBAL_FILE_COUNTER + 1))
+          local fp="${d}/f-${GLOBAL_FILE_COUNTER}"
+          if [ "${META_WRITE_FILE_DATA}" = 1 ]; then
+            if ! echo "m" >"${fp}"; then
+              fail_or_warn "[worker ${wid}] write failed ${fp}"
+            fi
+          else
+            if ! touch "${fp}"; then
+              fail_or_warn "[worker ${wid}] touch failed ${fp}"
+            fi
+          fi
+          meta_op_pause
+          n=$((n + 1))
+        done
+      }
+
+      build_tree() {
+        local d="$1"
+        local depth="$2"
+        local wid="$3"
+        if [ "${depth}" -eq 0 ]; then
+          create_files_in_dir "${d}" "${wid}"
+          return 0
+        fi
+        local j=1
+        while [ "${j}" -le "${META_FANOUT}" ]; do
+          GLOBAL_DIR_COUNTER=$((GLOBAL_DIR_COUNTER + 1))
+          local child="${d}/dir-${GLOBAL_DIR_COUNTER}"
+          if ! mkdir -p "${child}"; then
+            fail_or_warn "[worker ${wid}] mkdir failed ${child}"
+          fi
+          meta_op_pause
+          build_tree "${child}" $((depth - 1)) "${wid}" || return 1
+          j=$((j + 1))
+        done
+        create_files_in_dir "${d}" "${wid}"
+      }
+
+      echo "[worker ${id}] metadata stress loop (no deletes); base=${base}"
+      while true; do
+        local root="${base}/batch-${batch}"
+        if ! mkdir -p "${root}"; then
+          fail_or_warn "[worker ${id}] mkdir failed ${root}"
+        fi
+        meta_op_pause
+        echo "[worker ${id}] batch ${batch} tree root=${root}"
+        build_tree "${root}" "${META_DIR_DEPTH}" "${id}" || true
+        batch=$((batch + 1))
+        sleep "${META_BATCH_PAUSE_SEC}" 2>/dev/null || true
+        if [ "${META_BATCH_COUNT}" -ge 1 ] && [ "${batch}" -ge "${META_BATCH_COUNT}" ]; then
+          echo "[worker ${id}] finished ${META_BATCH_COUNT} batch(es), exiting"
+          return 0
+        fi
+      done
+    }
+
+    echo "All mounts up; starting metadata workers"
+    for i in $(seq 1 "${NUM_MOUNTS}"); do
+      run_worker "${i}" &
+      WORKER_PIDS+=($!)
+    done
+
+    echo "Metadata stress running; SIGTERM to stop."
+    wait
+    echo "[entrypoint] all metadata workers exited"
+    if [ "${META_BATCH_COUNT}" -ge 1 ]; then
+      echo "[entrypoint] META_BATCH_COUNT=${META_BATCH_COUNT} done; holding pod (sleep infinity). Delete pod or send SIGTERM to stop."
+      sleep infinity
+    fi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: curvine-metadata-stress
+  namespace: default
+  labels:
+    app: curvine-metadata-stress
+spec:
+  clusterIP: None
+  selector:
+    app: curvine-metadata-stress
+  ports:
+    - port: 9999
+      name: noop
+      targetPort: 9999
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: curvine-metadata-stress
+  namespace: default
+  labels:
+    app: curvine-metadata-stress
+spec:
+  serviceName: curvine-metadata-stress
+  podManagementPolicy: Parallel
+  replicas: 1
+  selector:
+    matchLabels:
+      app: curvine-metadata-stress
+  template:
+    metadata:
+      labels:
+        app: curvine-metadata-stress
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - curvine-metadata-stress
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: stress
+          image: ghcr.io/curvineio/curvine-csi:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - SYS_ADMIN
+          command: ["/bin/bash", "/scripts/metadata-stress-entrypoint.sh"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: MASTER_ADDRS
+              valueFrom:
+                secretKeyRef:
+                  name: curvine-stress-master
+                  key: master-addrs
+            # Recommended: start with small tree; increase META_FANOUT / META_DIR_DEPTH gradually.
+            - name: NUM_MOUNTS
+              value: "1"
+            - name: META_DIR_DEPTH
+              value: "2"
+            - name: META_FANOUT
+              value: "4"
+            - name: META_FILES_PER_DIR
+              value: "20"
+            - name: META_OP_PAUSE_SEC
+              value: "0"
+            - name: META_BATCH_PAUSE_SEC
+              value: "0"
+            - name: META_BATCH_COUNT
+              value: "0"
+            - name: META_WRITE_FILE_DATA
+              value: "0"
+            # - name: META_STOP_ON_ERROR
+            #   value: "0"
+            # - name: FUSE_WEB_PORT_BASE
+            #   value: "29000"
+            # - name: STRESS_REMOTE_ROOT
+            #   value: "/curvine-metadata-stress"
+            # - name: SKIP_REMOTE_POD_CLEANUP
+            #   value: "1"
+            # - name: SKIP_REMOTE_MKDIR
+            #   value: "1"
+          volumeMounts:
+            - name: dev-fuse
+              mountPath: /dev/fuse
+            - name: metadata-stress-scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: fuse-mnt-root
+              mountPath: /fuse-mnts
+            - name: fuse-tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+      volumes:
+        - name: dev-fuse
+          hostPath:
+            path: /dev/fuse
+            type: CharDevice
+        - name: metadata-stress-scripts
+          configMap:
+            name: curvine-metadata-stress-scripts
+            defaultMode: 0755
+        - name: fuse-mnt-root
+          emptyDir: {}
+        - name: fuse-tmp
+          emptyDir: {}

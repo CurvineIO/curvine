@@ -1,0 +1,162 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package csi
+
+import (
+	"crypto/sha1"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"sort"
+	"strings"
+
+	"k8s.io/klog"
+)
+
+const (
+	// VolumeHandleSeparator separates components in VolumeHandle
+	VolumeHandleSeparator = "@"
+)
+
+// VolumeHandleComponents represents parsed components of a VolumeHandle
+type VolumeHandleComponents struct {
+	ClusterID string
+	FSPath    string
+	PVName    string
+}
+
+// GenerateClusterID generates a cluster ID from master-addrs using SHA256 hash
+// Returns first 8 hex characters of the hash
+func GenerateClusterID(masterAddrs string) string {
+	hash := sha256.Sum256([]byte(masterAddrs))
+	clusterID := hex.EncodeToString(hash[:])[:8]
+	klog.V(5).Infof("Generated cluster-id: %s from master-addrs: %s", clusterID, masterAddrs)
+	return clusterID
+}
+
+// mountKeyNamespace is a fixed namespace UUID for generating deterministic mount keys
+// Using UUID v5 algorithm ensures same input always produces same output
+var mountKeyNamespace = []byte("curvine-mount-key-namespace-v1")
+
+// GenerateMountKey generates a unique mount key from master-addrs and fs-path using UUID v5 algorithm
+// UUID v5 is deterministic: same input always produces same output
+// This ensures different StorageClasses with same master-addrs but different fs-path get different mount points
+// Returns 32 hex characters (128 bits, standard UUID length without dashes) for maximum collision resistance
+func GenerateMountKey(masterAddrs, fsPath string) string {
+	combined := fmt.Sprintf("%s|%s", masterAddrs, fsPath)
+
+	// UUID v5 uses SHA1 hash of namespace + name
+	hash := sha1.New()
+	hash.Write(mountKeyNamespace)
+	hash.Write([]byte(combined))
+	uuidBytes := hash.Sum(nil)
+
+	// Return first 32 hex chars (128 bits, standard UUID length)
+	// This provides 2^128 collision space, much larger than previous 2^64
+	mountKey := hex.EncodeToString(uuidBytes)[:32]
+	klog.V(5).Infof("Generated mount-key: %s from master-addrs: %s, fs-path: %s", mountKey, masterAddrs, fsPath)
+	return mountKey
+}
+
+// GenerateMountKeyWithFuseParams generates a unique mount key that incorporates FUSE parameters
+// in addition to master-addrs and fs-path. This ensures that two StorageClasses or PVs that
+// share the same cluster endpoint and fs-path but differ in FUSE parameters (e.g. entry-timeout,
+// attr-timeout) receive separate standalone FUSE pods rather than silently sharing one.
+//
+// When fuseParams is empty the function delegates to GenerateMountKey so that the key is
+// identical to the one produced before this feature was introduced, preserving upgrade
+// compatibility for existing mounts.
+//
+// The fuseParams map is serialised in sorted-key order for determinism.
+func GenerateMountKeyWithFuseParams(masterAddrs, fsPath string, fuseParams map[string]string) string {
+	// When no fuse params are present fall back to the original SHA-1-based key so that
+	// on-disk paths and standalone Pod names are unchanged for existing StorageClasses.
+	if len(fuseParams) == 0 {
+		return GenerateMountKey(masterAddrs, fsPath)
+	}
+
+	// Build a canonical, sorted representation of the fuse params so that the key
+	// is stable regardless of insertion order.
+	keys := make([]string, 0, len(fuseParams))
+	for k := range fuseParams {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var paramsBuilder strings.Builder
+	for _, k := range keys {
+		paramsBuilder.WriteString(k)
+		paramsBuilder.WriteByte('=')
+		paramsBuilder.WriteString(fuseParams[k])
+		paramsBuilder.WriteByte(';')
+	}
+
+	combined := fmt.Sprintf("%s|%s|%s", masterAddrs, fsPath, paramsBuilder.String())
+
+	h := sha256.New()
+	h.Write(mountKeyNamespace)
+	h.Write([]byte(combined))
+	uuidBytes := h.Sum(nil)
+
+	mountKey := hex.EncodeToString(uuidBytes)[:32]
+	klog.V(5).Infof("Generated mount-key (with fuse params): %s from master-addrs: %s, fs-path: %s, params: %s",
+		mountKey, masterAddrs, fsPath, paramsBuilder.String())
+	return mountKey
+}
+
+// GenerateVolumeHandle generates a VolumeHandle from components
+// Format: {cluster-id}@{fs-path}@{pv-name}
+func GenerateVolumeHandle(masterAddrs, fsPath, pvName string) string {
+	clusterID := GenerateClusterID(masterAddrs)
+	volumeHandle := fmt.Sprintf("%s%s%s%s%s", clusterID, VolumeHandleSeparator, fsPath, VolumeHandleSeparator, pvName)
+	klog.V(5).Infof("Generated VolumeHandle: %s (cluster-id: %s, fs-path: %s, pv-name: %s)",
+		volumeHandle, clusterID, fsPath, pvName)
+	return volumeHandle
+}
+
+// ParseVolumeHandle parses a VolumeHandle into its components
+// Returns cluster-id, fs-path, pv-name, and error
+func ParseVolumeHandle(volumeHandle string) (*VolumeHandleComponents, error) {
+	if volumeHandle == "" {
+		return nil, fmt.Errorf("volume handle is empty")
+	}
+
+	parts := strings.Split(volumeHandle, VolumeHandleSeparator)
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("invalid volume handle format: %s, expected format: {cluster-id}@{fs-path}@{pv-name}", volumeHandle)
+	}
+
+	components := &VolumeHandleComponents{
+		ClusterID: parts[0],
+		FSPath:    parts[1],
+		PVName:    parts[2],
+	}
+
+	klog.V(5).Infof("Parsed VolumeHandle: %s -> cluster-id: %s, fs-path: %s, pv-name: %s",
+		volumeHandle, components.ClusterID, components.FSPath, components.PVName)
+
+	return components, nil
+}
+
+// GetCurvinePath calculates the curvine filesystem path from VolumeHandle components
+// Returns fs-path + pv-name (e.g., "/" + "pvc-abc" = "/pvc-abc")
+func GetCurvinePath(fsPath, pvName string) string {
+	// Ensure fs-path ends with / if it's not root
+	curvinePath := fsPath
+	if curvinePath != "/" && !strings.HasSuffix(curvinePath, "/") {
+		curvinePath += "/"
+	}
+	curvinePath += pvName
+	return curvinePath
+}

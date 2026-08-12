@@ -1,0 +1,34 @@
+[package]
+name = "curvine-raft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Curvine Raft metadata adapter."
+
+[dependencies]
+curvine-core-error = { workspace = true }
+curvine-runtime = { workspace = true }
+curvine-rpc = { workspace = true }
+curvine-net = { workspace = true }
+curvine-io = { workspace = true }
+bincode = { workspace = true }
+bytes = { workspace = true }
+crc32fast = { workspace = true }
+curvine-config = { workspace = true }
+curvine-error = { workspace = true }
+curvine-rocksdb = { workspace = true }
+flate2 = { workspace = true }
+log = { workspace = true }
+mini-moka = { workspace = true }
+num_enum = { workspace = true }
+prost = { workspace = true }
+raft = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+slog = { workspace = true }
+slog-stdlog = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }

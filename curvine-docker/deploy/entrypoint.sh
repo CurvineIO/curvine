@@ -1,0 +1,392 @@
+#!/bin/bash
+
+#
+# Copyright 2025 OPPO.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+set -euo pipefail
+
+FLUID_RUNTIME_CONFIG_PATH="${FLUID_RUNTIME_CONFIG_PATH:-/etc/fluid/config/config.json}"
+FLUID_RUNTIME_TYPE="${FLUID_RUNTIME_TYPE:-}"
+FLUID_RUNTIME_COMPONENT_TYPE="${FLUID_RUNTIME_COMPONENT_TYPE:-}"
+
+is_fluid_mode() {
+  case "${1:-}" in
+    fluid-thin-runtime)
+      return 0
+      ;;
+  esac
+
+  if [[ -n "${FLUID_RUNTIME_TYPE}" || -n "${FLUID_RUNTIME_COMPONENT_TYPE}" ]]; then
+    return 0
+  fi
+
+  [[ -f "${FLUID_RUNTIME_CONFIG_PATH}" ]]
+}
+
+if is_fluid_mode "${1:-}"; then
+  if [[ ! -x /fluid-entrypoint.sh ]]; then
+    echo "Fluid runtime mode detected, but /fluid-entrypoint.sh is missing or not executable"
+    exit 1
+  fi
+
+  exec /fluid-entrypoint.sh "$@"
+fi
+
+# Start the curvine service process
+# Service type: master, worker, web, transfer
+SERVER_TYPE=${1:-master}
+
+# Operation type: start, stop, restart
+ACTION_TYPE=${2:-start}
+
+echo "SERVER_TYPE: $SERVER_TYPE, ACTION_TYPE: $ACTION_TYPE"
+
+set_hosts() {
+  # Print pod info for debugging (Kubernetes CoreDNS handles DNS resolution, no need to modify /etc/hosts)
+  echo "POD_IP: ${POD_IP:-}"
+  echo "POD_NAMESPACE: ${POD_NAMESPACE:-}"
+  echo "POD_CLUSTER_DOMAIN: ${POD_CLUSTER_DOMAIN:-}"
+}
+
+# Container-specific service management logic
+# This avoids modifying launch-process.sh which is used in non-container environments
+
+start_service() {
+  local SERVICE_NAME=$1
+
+  if [ -z "$CURVINE_CONF_FILE" ]; then
+    export CURVINE_CONF_FILE=${CURVINE_HOME}/conf/curvine-cluster.toml
+  fi
+
+  local LOG_DIR=${CURVINE_HOME}/logs
+  local OUT_FILE=${LOG_DIR}/${SERVICE_NAME}.out
+  mkdir -p "${LOG_DIR}"
+
+  cd "${CURVINE_HOME}"
+
+  echo "Starting ${SERVICE_NAME} service..."
+
+  # Start the service with tee to output to both stdout and file
+  "${CURVINE_HOME}/lib/curvine-server" \
+    --service "${SERVICE_NAME}" \
+    --conf "${CURVINE_CONF_FILE}" \
+    2>&1 | tee "${OUT_FILE}" &
+
+  local TEE_PID=$!
+  sleep 3
+
+  # First check if tee process is still running
+  # If tee exited, it means curvine-server failed quickly
+  if ! kill -0 "${TEE_PID}" 2>/dev/null; then
+    wait "${TEE_PID}" 2>/dev/null
+    local EXIT_CODE=$?
+    echo "${SERVICE_NAME} start fail - process exited during startup with code ${EXIT_CODE}"
+    exit 1
+  fi
+
+  # Verify curvine-server process is running
+  # Use full path and service name for precise matching
+  local ACTUAL_PID
+  ACTUAL_PID=$(pgrep -n -f "${CURVINE_HOME}/lib/curvine-server[[:space:]].*--service[[:space:]]${SERVICE_NAME}" || true)
+  if [[ -n "${ACTUAL_PID}" ]] && kill -0 "${ACTUAL_PID}" 2>/dev/null; then
+    echo "${SERVICE_NAME} start success, pid=${ACTUAL_PID} (tee_pid=${TEE_PID})"
+
+    # Wait for tee process to keep container alive
+    # When curvine-server exits, tee exits, and container terminates gracefully
+    wait "${TEE_PID}"
+    local EXIT_CODE=$?
+    echo "${SERVICE_NAME} process exited with code ${EXIT_CODE}"
+    exit "${EXIT_CODE}"
+  else
+    echo "${SERVICE_NAME} start fail - process not found after startup check"
+    # Kill tee if it's still running
+    kill "${TEE_PID}" 2>/dev/null || true
+    exit 1
+  fi
+}
+
+stop_service() {
+  local SERVICE_NAME=$1
+
+  echo "Stopping ${SERVICE_NAME} service gracefully..."
+
+  # Find all curvine-server processes for the given service
+  local PIDS
+  PIDS=$(pgrep -f "${CURVINE_HOME}/lib/curvine-server[[:space:]].*--service[[:space:]]${SERVICE_NAME}" || true)
+
+  if [[ -z "${PIDS}" ]]; then
+    echo "No running ${SERVICE_NAME} service to stop"
+    return 0
+  fi
+
+  echo "Found ${SERVICE_NAME} PIDs: ${PIDS}"
+
+  # Send SIGTERM first
+  read -r -a PID_ARRAY <<< "${PIDS}"
+  if [[ ${#PID_ARRAY[@]} -gt 0 ]]; then
+    kill "${PID_ARRAY[@]}" 2>/dev/null || true
+  fi
+
+  # Wait up to ~15s for graceful shutdown
+  local TIMEOUT=15
+  local INTERVAL=3
+  local ELAPSED=0
+
+  while [[ ${ELAPSED} -lt ${TIMEOUT} ]]; do
+    sleep "${INTERVAL}"
+    ELAPSED=$((ELAPSED + INTERVAL))
+
+    local ALIVE
+    ALIVE=$(pgrep -f "${CURVINE_HOME}/lib/curvine-server[[:space:]].*--service[[:space:]]${SERVICE_NAME}" || true)
+    if [[ -z "${ALIVE}" ]]; then
+      echo "${SERVICE_NAME} stopped gracefully"
+      return 0
+    fi
+
+    echo "Waiting for ${SERVICE_NAME} to stop gracefully (elapsed=${ELAPSED}s)"
+  done
+
+  # Force kill if still running
+  local STILL_ALIVE
+  STILL_ALIVE=$(pgrep -f "${CURVINE_HOME}/lib/curvine-server[[:space:]].*--service[[:space:]]${SERVICE_NAME}" || true)
+  if [[ -n "${STILL_ALIVE}" ]]; then
+    echo "${SERVICE_NAME} did not stop gracefully after ${TIMEOUT}s, killing with SIGKILL"
+    read -r -a STILL_ARRAY <<< "${STILL_ALIVE}"
+    kill -9 "${STILL_ARRAY[@]}" 2>/dev/null || true
+  fi
+}
+
+restart_service() {
+  local SERVICE_NAME=$1
+  stop_service "${SERVICE_NAME}"
+  start_service "${SERVICE_NAME}"
+}
+
+start_web_service() {
+  if [ -z "${CURVINE_CONF_FILE:-}" ]; then
+    export CURVINE_CONF_FILE=${CURVINE_HOME}/conf/curvine-cluster.toml
+  fi
+
+  local LOG_DIR=${CURVINE_HOME}/logs
+  local OUT_FILE=${LOG_DIR}/web.out
+  mkdir -p "${LOG_DIR}"
+
+  local WEB_HOSTNAME=${CURVINE_WEB_HOSTNAME:-0.0.0.0}
+  local WEB_PORT=${CURVINE_WEB_PORT:-9000}
+  local WEBUI_DIR=${CURVINE_WEBUI_DIR:-${CURVINE_HOME}/webui}
+
+  cd "${CURVINE_HOME}"
+
+  echo "Starting web service on ${WEB_HOSTNAME}:${WEB_PORT}..."
+  echo "CURVINE_WEBUI_DIR=${WEBUI_DIR}"
+
+  export CURVINE_WEBUI_DIR="${WEBUI_DIR}"
+
+  "${CURVINE_HOME}/lib/curvine-web" \
+    start \
+    --conf "${CURVINE_CONF_FILE}" \
+    --hostname "${WEB_HOSTNAME}" \
+    --port "${WEB_PORT}" \
+    2>&1 | tee "${OUT_FILE}" &
+
+  local TEE_PID=$!
+  sleep 3
+
+  if ! kill -0 "${TEE_PID}" 2>/dev/null; then
+    wait "${TEE_PID}" 2>/dev/null
+    local EXIT_CODE=$?
+    echo "web start fail - process exited during startup with code ${EXIT_CODE}"
+    exit 1
+  fi
+
+  local ACTUAL_PID
+  ACTUAL_PID=$(pgrep -n -f "${CURVINE_HOME}/lib/curvine-web[[:space:]]start" || true)
+  if [[ -n "${ACTUAL_PID}" ]] && kill -0 "${ACTUAL_PID}" 2>/dev/null; then
+    echo "web start success, pid=${ACTUAL_PID} (tee_pid=${TEE_PID})"
+    wait "${TEE_PID}"
+    local EXIT_CODE=$?
+    echo "web process exited with code ${EXIT_CODE}"
+    exit "${EXIT_CODE}"
+  else
+    echo "web start fail - process not found after startup check"
+    kill "${TEE_PID}" 2>/dev/null || true
+    exit 1
+  fi
+}
+
+web_process_pattern() {
+  echo "${CURVINE_HOME}/lib/curvine-web[[:space:]]start"
+}
+
+web_port_in_use() {
+  local PORT=$1
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn "sport = :${PORT}" 2>/dev/null | grep -qE ":${PORT}[[:space:]]"
+    return $?
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -ltn 2>/dev/null | grep -qE ":${PORT}[[:space:]]"
+    return $?
+  fi
+  return 1
+}
+
+wait_for_web_release() {
+  local PORT=${CURVINE_WEB_PORT:-9000}
+  local TIMEOUT=15
+  local INTERVAL=1
+  local ELAPSED=0
+  local PATTERN
+  PATTERN=$(web_process_pattern)
+
+  while [[ ${ELAPSED} -lt ${TIMEOUT} ]]; do
+    local ALIVE
+    ALIVE=$(pgrep -f "${PATTERN}" || true)
+    if [[ -z "${ALIVE}" ]] && ! web_port_in_use "${PORT}"; then
+      echo "web service and port ${PORT} are free"
+      return 0
+    fi
+
+    if [[ -n "${ALIVE}" ]]; then
+      echo "Waiting for web process to exit (elapsed=${ELAPSED}s)"
+    else
+      echo "Waiting for port ${PORT} to be released (elapsed=${ELAPSED}s)"
+    fi
+
+    sleep "${INTERVAL}"
+    ELAPSED=$((ELAPSED + INTERVAL))
+  done
+
+  local STILL_ALIVE
+  STILL_ALIVE=$(pgrep -f "${PATTERN}" || true)
+  if [[ -n "${STILL_ALIVE}" ]]; then
+    echo "web process still running after ${TIMEOUT}s: ${STILL_ALIVE}"
+    return 1
+  fi
+  if web_port_in_use "${PORT}"; then
+    echo "port ${PORT} is still in use after ${TIMEOUT}s"
+    return 1
+  fi
+  return 0
+}
+
+stop_web_service() {
+  echo "Stopping web service gracefully..."
+
+  local PATTERN
+  PATTERN=$(web_process_pattern)
+  local PIDS
+  PIDS=$(pgrep -f "${PATTERN}" || true)
+
+  if [[ -z "${PIDS}" ]]; then
+    echo "No running web service to stop"
+    wait_for_web_release || true
+    return 0
+  fi
+
+  echo "Found web PIDs: ${PIDS}"
+
+  read -r -a PID_ARRAY <<< "${PIDS}"
+  if [[ ${#PID_ARRAY[@]} -gt 0 ]]; then
+    kill "${PID_ARRAY[@]}" 2>/dev/null || true
+  fi
+
+  local TIMEOUT=15
+  local INTERVAL=3
+  local ELAPSED=0
+
+  while [[ ${ELAPSED} -lt ${TIMEOUT} ]]; do
+    sleep "${INTERVAL}"
+    ELAPSED=$((ELAPSED + INTERVAL))
+
+    local ALIVE
+    ALIVE=$(pgrep -f "${PATTERN}" || true)
+    if [[ -z "${ALIVE}" ]]; then
+      echo "web stopped gracefully"
+      wait_for_web_release || true
+      return 0
+    fi
+
+    echo "Waiting for web to stop gracefully (elapsed=${ELAPSED}s)"
+  done
+
+  local STILL_ALIVE
+  STILL_ALIVE=$(pgrep -f "${PATTERN}" || true)
+  if [[ -n "${STILL_ALIVE}" ]]; then
+    echo "web did not stop gracefully after ${TIMEOUT}s, killing with SIGKILL"
+    read -r -a STILL_ARRAY <<< "${STILL_ALIVE}"
+    kill -9 "${STILL_ARRAY[@]}" 2>/dev/null || true
+  fi
+
+  if ! wait_for_web_release; then
+    echo "web stop failed: process or port still occupied"
+    return 1
+  fi
+}
+
+restart_web_service() {
+  stop_web_service
+  start_web_service
+}
+
+set_hosts
+
+case "$SERVER_TYPE" in
+  (master|worker|transfer)
+    case "$ACTION_TYPE" in
+      start)
+        start_service "$SERVER_TYPE"
+        ;;
+      stop)
+        stop_service "$SERVER_TYPE"
+        ;;
+      restart)
+        restart_service "$SERVER_TYPE"
+        ;;
+      *)
+        echo "Unsupported action: $ACTION_TYPE (expected: start|stop|restart)"
+        exit 1
+        ;;
+    esac
+    ;;
+
+  (web)
+    case "$ACTION_TYPE" in
+      start)
+        start_web_service
+        ;;
+      stop)
+        stop_web_service
+        ;;
+      restart)
+        restart_web_service
+        ;;
+      *)
+        echo "Unsupported action: $ACTION_TYPE (expected: start|stop|restart)"
+        exit 1
+        ;;
+    esac
+    ;;
+
+  (all)
+    echo "Container does not support 'all' mode. Use separate master and worker containers."
+    exit 1
+    ;;
+
+  (*)
+    exec "$@"
+    ;;
+esac

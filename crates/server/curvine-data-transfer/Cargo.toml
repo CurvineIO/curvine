@@ -1,0 +1,63 @@
+[package]
+name = "curvine-data-transfer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+fault-injection = ["curvine-fault/http-server"]
+transfer = ["dep:uuid"]
+transfer-web = ["transfer", "dep:axum", "dep:curvine-web"]
+transfer-store-sqlite = ["transfer", "dep:rusqlite"]
+transfer-store-mysql = ["transfer", "dep:mysql"]
+transfer-server = [
+    "transfer-web",
+    "transfer-store-sqlite",
+    "transfer-store-mysql",
+]
+opendal = ["curvine-unified-fs/opendal"]
+opendal-s3 = ["opendal", "curvine-unified-fs/opendal-s3"]
+opendal-oss = ["opendal", "curvine-unified-fs/opendal-oss"]
+opendal-gcs = ["opendal", "curvine-unified-fs/opendal-gcs"]
+opendal-azblob = ["opendal", "curvine-unified-fs/opendal-azblob"]
+opendal-cos = ["opendal", "curvine-unified-fs/opendal-cos"]
+opendal-hdfs = ["opendal", "curvine-unified-fs/opendal-hdfs"]
+opendal-webhdfs = ["opendal", "curvine-unified-fs/opendal-webhdfs"]
+opendal-hdfs-native = ["opendal", "curvine-unified-fs/opendal-hdfs-native"]
+oss-hdfs = ["curvine-unified-fs/oss-hdfs"]
+
+[dependencies]
+curvine-core-error = { workspace = true }
+curvine-net = { workspace = true }
+curvine-proto = { workspace = true }
+curvine-fs-api = { workspace = true }
+curvine-error = { workspace = true }
+curvine-config = { workspace = true }
+curvine-sys = { workspace = true }
+curvine-alloc = { workspace = true }
+curvine-model = { workspace = true }
+curvine-rpc = { workspace = true }
+curvine-runtime = { workspace = true }
+curvine-client-core = { workspace = true }
+curvine-job-client = { workspace = true }
+curvine-metrics = { workspace = true }
+curvine-unified-fs = { workspace = true }
+curvine-ufs-api = { workspace = true }
+curvine-fault = { workspace = true }
+curvine-web = { workspace = true, optional = true }
+prost = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+dashmap = { workspace = true }
+crossbeam = { workspace = true }
+parking_lot = { workspace = true }
+once_cell = { workspace = true }
+axum = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
+mysql = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }

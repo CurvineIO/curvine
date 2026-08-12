@@ -1,0 +1,746 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::master::meta::feature::{AclFeature, FileFeature, WriteFeature};
+use crate::master::meta::inode::{Inode, EMPTY_PARENT_ID};
+use crate::master::meta::store::InodeStore;
+use crate::master::meta::{BlockMeta, InodeId};
+use curvine_core_error::{err_box, CommonResult};
+use curvine_error::FsResult;
+use curvine_model::{
+    is_special_file_type, BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts,
+    FileType, StoragePolicy, INTERNAL_CTIME_XATTR,
+};
+use curvine_runtime::common::LocalTime;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fmt::Debug;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InodeFile {
+    pub(crate) id: i64,
+    pub(crate) parent_id: i64,
+    pub(crate) file_type: FileType,
+    pub(crate) mtime: i64,
+    pub(crate) atime: i64,
+
+    pub(crate) len: i64,
+    pub(crate) block_size: u32,
+    pub(crate) replicas: u8,
+
+    pub(crate) storage_policy: StoragePolicy,
+
+    pub(crate) features: FileFeature,
+
+    pub(crate) blocks: Vec<BlockMeta>,
+
+    // Number of hard links to this file
+    pub(crate) nlink: u32,
+
+    // Next sequence number for block ID generation (auto-increment)
+    pub(crate) next_seq: u32,
+
+    pub(crate) target: Option<String>,
+}
+
+impl InodeFile {
+    pub fn new(id: i64, time: i64) -> Self {
+        Self {
+            id,
+            file_type: FileType::File,
+            mtime: time,
+            atime: time,
+            len: 0,
+            block_size: 0,
+            replicas: 0,
+
+            storage_policy: Default::default(),
+            features: FileFeature::new(),
+
+            blocks: vec![],
+            nlink: 1,
+            next_seq: 0,
+            target: None,
+            parent_id: EMPTY_PARENT_ID,
+        }
+    }
+
+    pub fn with_opts(id: i64, time: i64, opts: CreateFileOpts) -> InodeFile {
+        let (len, storage_policy) = if opts.sync_ufs_meta {
+            (opts.ufs_len, StoragePolicy::with_ufs(opts.storage_policy))
+        } else {
+            (0, StoragePolicy::with_cv(opts.storage_policy))
+        };
+
+        let mut file = Self {
+            id,
+            file_type: opts.file_type,
+            mtime: time,
+            atime: time,
+            len,
+            block_size: opts.block_size as u32,
+            replicas: opts.replicas as u8,
+
+            storage_policy,
+            features: FileFeature {
+                x_attr: Default::default(),
+                file_write: None,
+                acl: AclFeature {
+                    mode: opts.mode,
+                    owner: opts.owner,
+                    group: opts.group,
+                },
+            },
+
+            blocks: vec![],
+            nlink: 1,
+            next_seq: 0,
+            target: None,
+            parent_id: EMPTY_PARENT_ID,
+        };
+
+        if !opts.sync_ufs_meta && !is_special_file_type(opts.file_type) {
+            file.features.set_writing(opts.client_name);
+        }
+        if !opts.x_attr.is_empty() {
+            file.features.set_attrs(opts.x_attr);
+        }
+
+        file.features.set_mode(opts.mode);
+
+        file
+    }
+
+    pub fn with_link(
+        id: i64,
+        time: i64,
+        target: impl Into<String>,
+        mode: u32,
+        owner: Option<String>,
+        group: Option<String>,
+    ) -> Self {
+        Self {
+            id,
+            file_type: FileType::Link,
+            mtime: time,
+            atime: time,
+            len: 0,
+            block_size: 0,
+            replicas: 0,
+
+            storage_policy: Default::default(),
+            features: FileFeature {
+                x_attr: Default::default(),
+                file_write: None,
+                acl: AclFeature {
+                    mode,
+                    owner: owner.unwrap_or_default(),
+                    group: group.unwrap_or_default(),
+                },
+            },
+
+            blocks: vec![],
+            nlink: 1,
+            next_seq: 0,
+            target: Some(target.into()),
+            parent_id: EMPTY_PARENT_ID,
+        }
+    }
+
+    pub fn block_ids(&self) -> Vec<i64> {
+        self.blocks.iter().map(|x| x.id).collect()
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.features.file_write.is_none()
+    }
+
+    pub fn is_writing(&self) -> bool {
+        self.features.file_write.is_some()
+    }
+
+    pub fn write_feature(&self) -> Option<&WriteFeature> {
+        self.features.file_write.as_ref()
+    }
+
+    pub fn add_block(&mut self, id: BlockMeta) {
+        self.blocks.push(id)
+    }
+
+    pub fn compute_len(&self) -> i64 {
+        if self.data_exists() {
+            self.blocks.iter().map(|x| x.len as i64).sum()
+        } else {
+            self.len
+        }
+    }
+
+    pub fn commit_len(&self, last: Option<&CommitBlock>) -> i64 {
+        self.compute_len() + last.map(|x| x.block_len).unwrap_or(0)
+    }
+
+    fn calc_pos(&self, pos: i32) -> usize {
+        if pos < 0 {
+            (self.blocks.len() as i32 + pos) as usize
+        } else {
+            pos as usize
+        }
+    }
+
+    pub fn get_block(&self, pos: i32) -> Option<&BlockMeta> {
+        let pos = self.calc_pos(pos);
+        if pos < self.blocks.len() {
+            Some(&self.blocks[pos])
+        } else {
+            None
+        }
+    }
+
+    pub fn get_block_mut(&mut self, pos: i32) -> Option<&mut BlockMeta> {
+        let pos = self.calc_pos(pos);
+        if pos < self.blocks.len() {
+            Some(&mut self.blocks[pos])
+        } else {
+            None
+        }
+    }
+
+    pub fn get_block_check(&self, pos: i32) -> CommonResult<&BlockMeta> {
+        match self.get_block(pos) {
+            None => err_box!("Not found block, pos = {}", pos),
+            Some(v) => Ok(v),
+        }
+    }
+
+    pub fn reopen(&mut self, client_name: impl AsRef<str>) -> Option<ExtendedBlock> {
+        self.features.set_writing(client_name.as_ref().to_string());
+        self.storage_policy.detach_ufs();
+        if let Some(last_block) = self.get_block_mut(-1) {
+            let blk = ExtendedBlock {
+                id: last_block.id,
+                len: last_block.len as i64,
+                alloc_opts: last_block.alloc_opts.clone(),
+                storage_type: self.storage_policy.storage_type,
+                file_type: self.file_type,
+            };
+            Some(blk)
+        } else {
+            None
+        }
+    }
+
+    /// Create a new block id
+    /// It is composed of the inode id + block number of the file, starting from 1.
+    /// inode id + serial number 0, is the file id.
+    pub fn next_block_id(&mut self) -> CommonResult<i64> {
+        let seq = self.next_seq as i64;
+        self.next_seq += 1;
+        InodeId::create_block_id(self.id, seq)
+    }
+
+    pub fn simple_string(&self) -> String {
+        format!(
+            "id={}, pid={}, len={}, nlink={}, blocks={:?}",
+            self.id,
+            self.parent_id,
+            self.len,
+            self.nlink,
+            self.block_ids()
+        )
+    }
+
+    // Decrement link count
+    pub fn decrement_nlink(&mut self, ctime: i64) -> u32 {
+        if self.nlink > 0 {
+            self.nlink -= 1;
+            self.update_ctime(ctime);
+        }
+        self.nlink
+    }
+
+    // Get current link count
+    pub fn nlink(&self) -> u32 {
+        self.nlink
+    }
+
+    // Check if this is the last link
+    pub fn is_last_link(&self) -> bool {
+        self.nlink <= 1
+    }
+
+    /// Update file metadata for overwrite operation
+    pub fn overwrite(&mut self, opts: CreateFileOpts, mtime: i64) {
+        // Clear all blocks and reset file size
+        self.blocks.clear();
+        self.len = 0;
+
+        // Update file metadata with new options
+        self.replicas = opts.replicas as u8;
+        self.block_size = opts.block_size as u32;
+        self.storage_policy.overwrite(opts.storage_policy);
+        self.mtime = mtime;
+        self.update_ctime(mtime);
+
+        // Reset file writing state for new write operation
+        self.features.set_writing(opts.client_name);
+    }
+
+    pub fn search_block_mut(&mut self, block_id: i64) -> Option<&mut BlockMeta> {
+        let idx = self
+            .blocks
+            .binary_search_by_key(&block_id, |lb| lb.id)
+            .ok()?;
+        self.blocks.get_mut(idx)
+    }
+
+    pub fn search_block_mut_check(&mut self, block_id: i64) -> FsResult<&mut BlockMeta> {
+        match self.search_block_mut(block_id) {
+            Some(v) => Ok(v),
+            None => err_box!("Not found block, block_id = {}", block_id),
+        }
+    }
+
+    pub fn search_next_block(&self, previous: Option<i64>) -> Option<&BlockMeta> {
+        match previous {
+            None => self.blocks.first(),
+            Some(previous) => {
+                let idx = self
+                    .blocks
+                    .binary_search_by_key(&previous, |lb| lb.id)
+                    .ok()?;
+                self.blocks.get(idx + 1)
+            }
+        }
+    }
+
+    pub fn complete(
+        &mut self,
+        len: i64,
+        commit_blocks: &[CommitBlock],
+        client_name: impl AsRef<str>,
+        only_flush: bool,
+    ) -> FsResult<()> {
+        for block in commit_blocks {
+            let meta = self.search_block_mut_check(block.block_id)?;
+            meta.commit(block);
+        }
+
+        self.len = self.len.max(len);
+        let complete_len = self.compute_len();
+        if complete_len != self.len {
+            return err_box!(
+                "Complete len is not equal to file len, complete_len = {}, file_len = {}",
+                complete_len,
+                self.len
+            );
+        }
+
+        let mtime = LocalTime::mills() as i64;
+        self.mtime = mtime;
+        self.update_ctime(mtime);
+        if !only_flush {
+            self.features.complete_write(client_name);
+        }
+        Ok(())
+    }
+
+    pub fn free(&mut self, mtime: i64) -> bool {
+        if self.storage_policy.free() {
+            self.mtime = mtime;
+            self.update_ctime(mtime);
+            self.blocks.clear();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Invalidates the Curvine cache copy of a UFS-backed file without
+    /// detaching its source metadata. The next cache-mode read can then use
+    /// the normal UFS cache-miss path to load a replacement copy.
+    pub fn invalidate_cache(&mut self) -> bool {
+        if self.storage_policy.invalidate_cache() {
+            self.blocks.clear();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Search for block by file position
+    /// Returns the block reference if found
+    pub fn search_block_mut_by_pos(&mut self, file_pos: i64) -> Option<&mut BlockMeta> {
+        if file_pos < 0 {
+            return None;
+        }
+
+        let mut current = 0i64;
+        for block in &mut self.blocks {
+            let block_end = current + block.len as i64;
+            if file_pos >= current && file_pos < block_end {
+                return Some(block);
+            }
+            current = block_end;
+        }
+        None
+    }
+
+    pub fn last_block_start_off(&self) -> i64 {
+        if self.blocks.is_empty() {
+            return 0;
+        }
+        self.blocks[..self.blocks.len() - 1]
+            .iter()
+            .map(|block| block.len as i64)
+            .sum()
+    }
+
+    /// Resize the file to the specified length.
+    ///
+    /// This method handles three cases:
+    /// - If the new length equals the current length, no operation is needed
+    /// - If the new length is smaller, truncate the file (remove excess blocks)
+    /// - If the new length is larger, extend the file (allocate new blocks)
+    ///
+    /// # Arguments
+    /// * `opts` - File allocation options containing the target length
+    ///
+    /// # Returns
+    /// * `Vec<BlockMeta>` - Blocks that were removed during truncation (empty if extended or unchanged)
+    pub fn resize(&mut self, opts: FileAllocOpts) -> FsResult<Vec<BlockMeta>> {
+        opts.validate()?;
+
+        if self.len == opts.len {
+            Ok(vec![])
+        } else if opts.len < self.len {
+            let del_blocks = self.truncate(opts);
+            self.storage_policy.detach_ufs();
+            Ok(del_blocks)
+        } else {
+            self.extend(opts)?;
+            self.storage_policy.detach_ufs();
+            Ok(vec![])
+        }
+    }
+
+    /// Extend the file to the specified length by allocating new blocks or extending existing ones.
+    ///
+    /// This method processes blocks from the last block's start position to the target length.
+    /// For each block boundary:
+    /// - If a block exists at the position, extend its length
+    /// - If no block exists, create a new allocated block
+    ///
+    /// # Arguments
+    /// * `opts` - File allocation options containing the target length
+    fn extend(&mut self, opts: FileAllocOpts) -> FsResult<()> {
+        let expect_len = opts.len;
+        let block_size = self.block_size as i64;
+        let mut start = self.last_block_start_off();
+
+        // Only the existing tail block can overlap the extension boundary.
+        if let Some(last_block) = self.blocks.last_mut() {
+            let resize_len = block_size.min(expect_len - start);
+            last_block.len = resize_len as u32;
+            // Refresh sizing only while the tail still carries alloc_opts (unplaced /
+            // assigned-but-uncommitted). After BlockMeta::commit(), both locs and
+            // alloc_opts are cleared; locs.is_none() therefore does NOT mean "not yet
+            // placed". Re-attaching alloc_opts on a committed tail forces the client
+            // (LocatedBlock::should_resize) to open+rewrite the whole block on every
+            // sparse seek+write that crosses a block boundary (e.g. LTP sendfile09).
+            if last_block.alloc_opts.is_some() {
+                last_block
+                    .alloc_opts
+                    .replace(opts.clone_with_len(resize_len));
+            }
+            start += block_size;
+        }
+
+        // Append new blocks directly; searching the growing vector here makes large
+        // fallocate requests quadratic while the master metadata write lock is held.
+        while start < expect_len {
+            let resize_len = block_size.min(expect_len - start);
+            let block_opts = opts.clone_with_len(resize_len);
+            let new_block_id = self.next_block_id()?;
+            self.add_block(BlockMeta::with_alloc(new_block_id, block_opts));
+            start += block_size;
+        }
+
+        self.len = expect_len;
+        Ok(())
+    }
+
+    /// Truncate the file to the specified length by removing blocks beyond the target length.
+    ///
+    /// This method handles three cases:
+    /// - If a block starts beyond the target length, remove it and all subsequent blocks
+    /// - If a block spans the target length, truncate it and remove subsequent blocks
+    /// - If a block ends before the target length, keep it unchanged
+    ///
+    /// # Arguments
+    /// * `opts` - File allocation options containing the target length
+    ///
+    /// # Returns
+    /// * `Vec<BlockMeta>` - Blocks that were removed during truncation
+    fn truncate(&mut self, opts: FileAllocOpts) -> Vec<BlockMeta> {
+        let expect_len = opts.len;
+        let mut remove_start = None;
+
+        let mut start = 0i64;
+        for (idx, block) in self.blocks.iter_mut().enumerate() {
+            let end = start + block.len as i64;
+
+            if start >= expect_len {
+                // Current block's start position exceeds expect_len, delete all blocks starting from current block
+                remove_start.replace(idx);
+                break;
+            } else if end > expect_len {
+                // Current block spans expect_len, needs truncation
+                let new_len = expect_len - start;
+                if new_len > 0 {
+                    // Truncate current block, keep first new_len bytes
+                    block.len = new_len as u32;
+                    block.alloc_opts.replace(opts.clone_with_len(new_len));
+                    remove_start.replace(idx + 1); // Delete subsequent blocks
+                } else {
+                    // new_len == 0, delete current block and subsequent blocks
+                    remove_start.replace(idx);
+                }
+                break;
+            }
+            // end <= expect_len, keep current block, continue processing next
+
+            start = end;
+        }
+
+        let mut del_blocks = vec![];
+        if let Some(start_idx) = remove_start {
+            // start_idx may equal blocks.len(), drain won't panic, just returns empty iterator
+            for block in self.blocks.drain(start_idx..) {
+                del_blocks.push(block);
+            }
+        }
+
+        self.len = expect_len;
+        del_blocks
+    }
+
+    pub fn get_locs(&self, store: &InodeStore) -> CommonResult<HashMap<i64, Vec<BlockLocation>>> {
+        let mut res = HashMap::new();
+        for meta in &self.blocks {
+            if let Some(locs) = &meta.locs {
+                res.insert(meta.id, locs.clone());
+            } else {
+                let locs = store.get_locations(meta.id)?;
+                if !locs.is_empty() {
+                    res.insert(meta.id, locs);
+                }
+            }
+        }
+
+        Ok(res)
+    }
+
+    pub fn get_locs_bytes(&self, locs: &HashMap<i64, Vec<BlockLocation>>) -> i64 {
+        let mut bytes = 0;
+        for block in &self.blocks {
+            if let Some(locs) = locs.get(&block.id) {
+                bytes += (locs.len() as i64) * (block.len as i64);
+            }
+        }
+        bytes
+    }
+
+    pub fn ufs_exists(&self) -> bool {
+        self.storage_policy.ufs_exists()
+    }
+
+    pub fn ufs_only(&self) -> bool {
+        self.storage_policy.ufs_only()
+    }
+
+    pub fn cv_exists(&self) -> bool {
+        self.storage_policy.cv_exists()
+    }
+
+    pub fn data_exists(&self) -> bool {
+        if self.len == 0 {
+            true
+        } else {
+            self.cv_exists() && !self.blocks.is_empty()
+        }
+    }
+
+    pub fn update_mtime(&mut self, time: i64) {
+        if time > self.mtime {
+            self.mtime = time;
+            self.update_ctime(time);
+        }
+    }
+
+    pub fn update_ctime(&mut self, time: i64) {
+        if time > self.ctime() {
+            self.features.x_attr.insert(
+                INTERNAL_CTIME_XATTR.to_string(),
+                time.to_le_bytes().to_vec(),
+            );
+        }
+    }
+}
+
+impl Inode for InodeFile {
+    fn id(&self) -> i64 {
+        self.id
+    }
+
+    fn parent_id(&self) -> i64 {
+        self.parent_id
+    }
+
+    fn is_dir(&self) -> bool {
+        false
+    }
+
+    fn mtime(&self) -> i64 {
+        self.mtime
+    }
+
+    fn atime(&self) -> i64 {
+        self.atime
+    }
+
+    fn ctime(&self) -> i64 {
+        self.features
+            .x_attr
+            .get(INTERNAL_CTIME_XATTR)
+            .and_then(|bytes| bytes.as_slice().try_into().ok())
+            .map(i64::from_le_bytes)
+            .unwrap_or(self.mtime)
+    }
+
+    fn nlink(&self) -> u32 {
+        self.nlink
+    }
+}
+
+impl PartialEq for InodeFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_model::FileAllocMode;
+
+    fn test_file(block_size: i64) -> InodeFile {
+        let mut opts = CreateFileOpts::with_create(false);
+        opts.block_size = block_size;
+        InodeFile::with_opts(1, 0, opts)
+    }
+
+    #[test]
+    fn extend_updates_tail_once_and_appends_blocks_in_order() {
+        let mut file = test_file(4);
+        file.resize(FileAllocOpts::with_alloc(10, FileAllocMode::DEFAULT))
+            .unwrap();
+        let original_ids = file.block_ids();
+
+        file.resize(FileAllocOpts::with_alloc(15, FileAllocMode::DEFAULT))
+            .unwrap();
+
+        assert_eq!(file.len, 15);
+        assert_eq!(
+            file.blocks
+                .iter()
+                .map(|block| block.len)
+                .collect::<Vec<_>>(),
+            vec![4, 4, 4, 3]
+        );
+        assert_eq!(&file.block_ids()[..original_ids.len()], original_ids);
+    }
+
+    #[test]
+    fn extend_does_not_force_alloc_opts_on_located_tail_block() {
+        let mut file = test_file(8);
+        file.resize(FileAllocOpts::with_truncate(3)).unwrap();
+        assert!(file.blocks[0].alloc_opts.is_some());
+
+        // Simulate a block that has already been written to workers.
+        file.blocks[0].locs = Some(vec![BlockLocation::with_id(1)]);
+        file.blocks[0].alloc_opts = None;
+
+        file.resize(FileAllocOpts::with_truncate(5)).unwrap();
+
+        assert_eq!(file.len, 5);
+        assert_eq!(file.blocks[0].len, 5);
+        assert!(
+            file.blocks[0].alloc_opts.is_none(),
+            "located tail must not get alloc_opts on sparse extend"
+        );
+
+        // Crossing into a new block still allocates the unplaced block with opts.
+        file.resize(FileAllocOpts::with_truncate(12)).unwrap();
+        assert_eq!(file.blocks.len(), 2);
+        assert!(file.blocks[0].alloc_opts.is_none());
+        assert_eq!(file.blocks[0].len, 8);
+        assert!(file.blocks[1].alloc_opts.is_some());
+        assert_eq!(file.blocks[1].len, 4);
+    }
+
+    #[test]
+    fn extend_does_not_force_alloc_opts_on_committed_tail_block() {
+        let mut file = test_file(8);
+        file.resize(FileAllocOpts::with_truncate(3)).unwrap();
+        assert!(file.blocks[0].alloc_opts.is_some());
+
+        // Shape produced by BlockMeta::commit(): locs and alloc_opts cleared after
+        // locations are persisted in the location store. Client resize() completes
+        // pending writers first, so the common sparse-extend path sees this state.
+        file.blocks[0].locs = None;
+        file.blocks[0].alloc_opts = None;
+        assert!(file.blocks[0].len > 0);
+
+        file.resize(FileAllocOpts::with_truncate(5)).unwrap();
+
+        assert_eq!(file.len, 5);
+        assert_eq!(file.blocks[0].len, 5);
+        assert!(
+            file.blocks[0].alloc_opts.is_none(),
+            "committed tail (locs=None, alloc_opts=None) must not regain alloc_opts"
+        );
+
+        // Crossing into a new block still allocates the unplaced block with opts.
+        file.resize(FileAllocOpts::with_truncate(12)).unwrap();
+        assert_eq!(file.blocks.len(), 2);
+        assert!(file.blocks[0].alloc_opts.is_none());
+        assert_eq!(file.blocks[0].len, 8);
+        assert!(file.blocks[1].alloc_opts.is_some());
+        assert_eq!(file.blocks[1].len, 4);
+    }
+
+    #[test]
+    fn complete_advances_existing_independent_ctime_with_mtime() {
+        let mut file = InodeFile::new(1, 1);
+        file.features.x_attr.insert(
+            INTERNAL_CTIME_XATTR.to_string(),
+            2_i64.to_le_bytes().to_vec(),
+        );
+
+        file.complete(0, &[], "", true).unwrap();
+
+        assert!(file.mtime > 2);
+        assert_eq!(file.ctime(), file.mtime);
+    }
+}

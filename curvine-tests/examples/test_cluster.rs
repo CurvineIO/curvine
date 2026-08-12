@@ -1,0 +1,73 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use curvine_core_error::CommonResult;
+use curvine_runtime::common::Logger;
+use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+use curvine_tests::Testing;
+
+// Start a test cluster and use it for local development and testing.
+fn main() -> CommonResult<()> {
+    Logger::default();
+    let testing = Testing::builder()
+        .with_base_conf_path("etc/curvine-cluster.toml")
+        .masters(2)
+        .workers(3)
+        .mutate_conf(|conf| {
+            conf.format_master = true;
+            conf.format_worker = true;
+            conf.journal.snapshot_interval = "10s".to_owned();
+            conf.master.min_block_size = 1024 * 1024;
+            conf.master.ttl_bucket_interval = "1m".to_string();
+            conf.master.ttl_checker_interval = "1m".to_string();
+            conf.job.job_life_ttl_str = "1m".to_string();
+            conf.job.job_cleanup_ttl_str = "1m".to_string();
+        })
+        .build()?;
+    testing.start_cluster()?;
+    let conf = testing.get_active_cluster_conf().unwrap();
+    log::info!("allocator: {}", curvine_alloc::allocator_type_name());
+    log::info!("git version: {}", curvine_sys::version::GIT_VERSION);
+    conf.print();
+
+    let rt = AsyncRuntime::single();
+
+    // Wait for the program to exit
+    rt.block_on(async move {
+        let ctrl_c = tokio::signal::ctrl_c();
+
+        #[cfg(target_os = "linux")]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut unix_sig = signal(SignalKind::terminate()).unwrap();
+            tokio::select! {
+                _ = ctrl_c => {
+                    println!("Receive ctrl_c signal, test cluster");
+                }
+
+               _ = unix_sig.recv() => {
+                    println!("Received SIGTERM, shutting test cluster");
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            ctrl_c.await.unwrap();
+            println!("Receive ctrl_c signal, test cluster");
+        }
+    });
+
+    Ok(())
+}

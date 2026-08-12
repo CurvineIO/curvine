@@ -1,0 +1,396 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::fs::operator::Read;
+use crate::fuse_metrics::{mono_now, FuseMetrics, IO_TYPE_READ};
+use crate::session::FuseResponse;
+use curvine_client::unified::UnifiedReader;
+use curvine_config::FuseConf;
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_fs_api::{Path, Reader};
+use curvine_model::FileStatus;
+use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use curvine_runtime::sync::channel::{
+    AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender,
+};
+use curvine_runtime::sync::ErrorMonitor;
+use log::{error, warn};
+use std::sync::Arc;
+
+enum ReadTask {
+    Read(i64, usize, FuseResponse),
+    Complete(CallSender<FsResult<()>>, Option<FuseResponse>),
+}
+
+pub struct FuseReader {
+    path: Path,
+    len: i64,
+    sender: AsyncSender<ReadTask>,
+    err_monitor: Arc<ErrorMonitor<FsError>>,
+    status: FileStatus,
+}
+
+impl FuseReader {
+    pub fn new(conf: &FuseConf, rt: Arc<Runtime>, reader: UnifiedReader) -> Self {
+        let path = reader.path().clone();
+        let len = reader.len();
+        let err_monitor = Arc::new(ErrorMonitor::new());
+        let (sender, receiver) = AsyncChannel::new(conf.stream_channel_size).split();
+        let status = reader.status().clone();
+        let path_type = reader.path_type();
+        let metrics_enabled = conf.metrics_enabled;
+
+        let monitor = err_monitor.clone();
+        rt.spawn(async move {
+            let res = Self::read_future(reader, receiver, path_type, metrics_enabled).await;
+            match res {
+                Ok(_) => (),
+
+                Err(e) => {
+                    error!("fuse reader error: {}", e);
+                    monitor.set_error(e);
+                }
+            }
+        });
+
+        Self {
+            path,
+            len,
+            sender,
+            err_monitor,
+            status,
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn len(&self) -> i64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn status(&self) -> &FileStatus {
+        &self.status
+    }
+
+    fn check_error(&self, e: FsError) -> FsError {
+        self.err_monitor.take_error().unwrap_or(e)
+    }
+
+    pub async fn read(&self, op: Read<'_>, reply: FuseResponse) -> FsResult<()> {
+        let res = self
+            .sender
+            .send(ReadTask::Read(
+                op.arg.offset as i64,
+                op.arg.size as usize,
+                reply,
+            ))
+            .await
+            .map_err(|e| self.check_error(e.into()));
+        res
+    }
+
+    pub async fn complete(&self, reply: Option<FuseResponse>) -> FsResult<()> {
+        let fun = async {
+            let (rx, tx) = CallChannel::channel();
+            self.sender.send(ReadTask::Complete(rx, reply)).await?;
+            // Double `?`: unwrap the channel receive, then propagate the real
+            // backend complete result.
+            tx.receive().await??;
+            Ok::<(), FsError>(())
+        };
+        fun.await.map_err(|e| self.check_error(e))
+    }
+
+    async fn read_future(
+        mut reader: UnifiedReader,
+        mut req_receiver: AsyncReceiver<ReadTask>,
+        path_type: &'static str,
+        metrics_enabled: bool,
+    ) -> FsResult<()> {
+        while let Some(task) = req_receiver.recv().await {
+            match task {
+                ReadTask::Read(off, len, reply) => {
+                    let io_start = if metrics_enabled {
+                        Some(mono_now())
+                    } else {
+                        None
+                    };
+                    let inflight = FuseMetrics::stream_io_guard(metrics_enabled, IO_TYPE_READ);
+                    let data = reader.fuse_read(off, len).await;
+                    drop(inflight);
+
+                    if let Some(start) = io_start {
+                        let ok = data.is_ok();
+                        // Actual bytes read (short reads count actual); requested
+                        // size is `len` (the request-size distribution).
+                        let bytes = data
+                            .as_ref()
+                            .map(|v| v.iter().map(|s| s.len() as u64).sum())
+                            .unwrap_or(0);
+                        FuseMetrics::get().record_stream_io(
+                            IO_TYPE_READ,
+                            path_type,
+                            ok,
+                            bytes,
+                            len as u64,
+                            start.elapsed().as_micros() as u64,
+                        );
+                    }
+
+                    if let Err(e) = reply.send_data(data.map_err(|x| x.into())).await {
+                        // Losing this reply receiver must not kill the shared worker.
+                        warn!("failed to send FUSE read reply: {}", e);
+                    }
+                }
+
+                ReadTask::Complete(tx, reply) => {
+                    // Complete/release IO accounting lives at send_stream to avoid double-counting.
+                    let res = reader.complete().await;
+                    // Deliver the real backend result to the caller (tx) first,
+                    // then the kernel reply.
+                    crate::fs::deliver_stream_result(res, tx, reply).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fuse_metrics::{
+        ActiveGuard, FuseMetrics, FuseReqCtx, FuseReqKind, FuseReqLabels, IO_TYPE_READ,
+        STAGE_STREAM_IO,
+    };
+    use crate::raw::fuse_abi::{fuse_in_header, fuse_read_in};
+    use crate::session::{FuseResponse, FuseTask};
+    use curvine_client::unified::UnifiedReader;
+    use curvine_fs_api::local::LocalReader;
+    use curvine_metrics::Metrics as m;
+    use curvine_runtime::runtime::AsyncRuntime;
+    use curvine_runtime::sync::channel::AsyncChannel;
+    use std::io::Write as _;
+
+    fn metrics_reply(rt: &AsyncRuntime) -> FuseResponse {
+        FuseMetrics::ensure_init().unwrap();
+        let (tx, mut rx) = AsyncChannel::<FuseTask>::new(16).split();
+        rt.spawn(async move { while rx.recv().await.is_some() {} });
+        let gauge = m::new_gauge(
+            format!("fr_it_active_{}", std::process::id()),
+            "test".to_string(),
+        )
+        .unwrap();
+        let labels = FuseReqLabels::new("Read", FuseReqKind::Stream, 64);
+        let ctx = FuseReqCtx {
+            labels,
+            active: Some(ActiveGuard::new(gauge)),
+        };
+        FuseResponse::new_reply(1, tx, false, Some(ctx))
+    }
+
+    fn closed_reply(unique: u64) -> FuseResponse {
+        let (tx, rx) = AsyncChannel::<FuseTask>::new(1).split();
+        drop(rx);
+        FuseResponse::new_reply(unique, tx, false, None)
+    }
+
+    fn read_op_arg(offset: u64, size: u32) -> fuse_read_in {
+        fuse_read_in {
+            fh: 0,
+            offset,
+            size,
+            read_flags: 0,
+            lock_owner: 0,
+            flags: 0,
+            padding: 0,
+        }
+    }
+
+    #[test]
+    fn reply_send_error_does_not_kill_reader_worker() {
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            let path_buf = std::env::temp_dir().join(format!(
+                "fr_reply_failure_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            {
+                let mut file = std::fs::File::create(&path_buf).unwrap();
+                file.write_all(b"reader-worker-survives").unwrap();
+            }
+            let path = curvine_fs_api::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+
+            let conf = FuseConf {
+                metrics_enabled: false,
+                ..Default::default()
+            };
+            let reader = UnifiedReader::Local(LocalReader::new(&path, 4096).unwrap());
+            let rt2 = Arc::new(AsyncRuntime::single());
+            let fuse_reader = FuseReader::new(&conf, rt2.clone(), reader);
+            std::mem::forget(rt2);
+
+            let header = fuse_in_header::default();
+            let first_arg = read_op_arg(0, 6);
+            fuse_reader
+                .read(
+                    Read {
+                        header: &header,
+                        arg: &first_arg,
+                    },
+                    closed_reply(1),
+                )
+                .await
+                .unwrap();
+
+            // Submit a normal second read. Receiving its response proves that the
+            // worker survived the first request's closed reply channel.
+            let (reply_tx, mut reply_rx) = AsyncChannel::<FuseTask>::new(1).split();
+            let second_arg = read_op_arg(7, 6);
+            fuse_reader
+                .read(
+                    Read {
+                        header: &header,
+                        arg: &second_arg,
+                    },
+                    FuseResponse::new_reply(2, reply_tx, false, None),
+                )
+                .await
+                .unwrap();
+            fuse_reader.complete(None).await.unwrap();
+
+            assert!(matches!(reply_rx.recv().await, Some(FuseTask::Reply(_))));
+            let _ = std::fs::remove_file(&path_buf);
+        });
+    }
+
+    #[test]
+    fn local_reader_task_body_observes_io_with_local_path_type() {
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            FuseMetrics::ensure_init().unwrap();
+            let mx = FuseMetrics::get();
+            let dur_before = mx
+                .io_duration_us
+                .with_label_values(&[IO_TYPE_READ, "local", "success"])
+                .get_sample_count();
+            let req_before = mx
+                .io_requests_total
+                .with_label_values(&[IO_TYPE_READ, "local", "success"])
+                .get();
+            let bytes_before = mx
+                .io_bytes_total
+                .with_label_values(&[IO_TYPE_READ, "local", "success"])
+                .get();
+            let size_before = mx
+                .io_size_bytes
+                .with_label_values(&[IO_TYPE_READ, "local"])
+                .get_sample_count();
+            let stage_before = mx
+                .stage_duration_us
+                .with_label_values(&[STAGE_STREAM_IO, "stream", "success"])
+                .get_sample_count();
+
+            // A temp file with 4096 bytes of content to read back.
+            let path_buf = std::env::temp_dir().join(format!(
+                "fr_it_read_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            {
+                let mut f = std::fs::File::create(&path_buf).unwrap();
+                f.write_all(&vec![7u8; 4096]).unwrap();
+            }
+            let path = curvine_fs_api::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+
+            let conf = FuseConf::default(); // metrics_enabled=true, unbounded channel
+            let reader = UnifiedReader::Local(LocalReader::new(&path, 4096).unwrap());
+            assert_eq!(reader.path_type(), "local");
+            let rt2 = Arc::new(AsyncRuntime::single());
+            let fuse_reader = FuseReader::new(&conf, rt2.clone(), reader);
+            // Leak our Arc so this runtime is never the-last-Arc-dropped inside the
+            // outer async block (dropping a tokio runtime from an async context panics).
+            std::mem::forget(rt2);
+
+            // Request 8192 bytes; the file only has 4096 (a short read).
+            let reply = metrics_reply(&rt);
+            let header = fuse_in_header::default();
+            let arg = read_op_arg(0, 8192);
+            let op = Read {
+                header: &header,
+                arg: &arg,
+            };
+            fuse_reader.read(op, reply).await.unwrap();
+
+            let deadline = 50;
+            for _ in 0..deadline {
+                if mx
+                    .io_duration_us
+                    .with_label_values(&[IO_TYPE_READ, "local", "success"])
+                    .get_sample_count()
+                    > dur_before
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+
+            assert_eq!(
+                mx.io_duration_us
+                    .with_label_values(&[IO_TYPE_READ, "local", "success"])
+                    .get_sample_count(),
+                dur_before + 1,
+                "read task body observed io_duration_us{{read,local,success}} exactly once"
+            );
+            assert_eq!(
+                mx.io_requests_total
+                    .with_label_values(&[IO_TYPE_READ, "local", "success"])
+                    .get(),
+                req_before + 1,
+                "io_requests_total{{read,local,success}} +1"
+            );
+            assert_eq!(
+                mx.io_bytes_total
+                    .with_label_values(&[IO_TYPE_READ, "local", "success"])
+                    .get(),
+                bytes_before + 4096,
+                "io_bytes_total uses ACTUAL bytes read (4096, the short read), not requested 8192"
+            );
+            assert_eq!(
+                mx.io_size_bytes
+                    .with_label_values(&[IO_TYPE_READ, "local"])
+                    .get_sample_count(),
+                size_before + 1,
+                "io_size_bytes observed once (the requested-size distribution)"
+            );
+            assert!(
+                mx.stage_duration_us
+                    .with_label_values(&[STAGE_STREAM_IO, "stream", "success"])
+                    .get_sample_count()
+                    > stage_before,
+                "read backend call also emits stage=stream_io,kind=stream"
+            );
+
+            let _ = std::fs::remove_file(&path_buf);
+        });
+    }
+}

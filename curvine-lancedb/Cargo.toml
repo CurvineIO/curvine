@@ -1,0 +1,71 @@
+[package]
+name = "curvine-lancedb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Facade crate for LanceDB on Curvine"
+readme = "README.md"
+repository = "https://github.com/CurvineIO/curvine"
+homepage = "https://github.com/CurvineIO/curvine"
+documentation = "https://docs.rs/curvine-lancedb"
+keywords = ["curvine", "lancedb", "vector", "object-store"]
+categories = ["database", "filesystem"]
+include = [
+    "/Cargo.toml",
+    "/README.md",
+    "/src/**/*.rs",
+]
+
+[lib]
+name = "lancedb"
+path = "src/lib.rs"
+
+[dependencies]
+curvine-io = { workspace = true }
+curvine-net = { workspace = true }
+curvine-model = { workspace = true }
+curvine-fs-api = { workspace = true }
+curvine-error = { workspace = true }
+curvine-config = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+curvine-client = { workspace = true }
+futures = { workspace = true }
+lance = { version = "4.0.0", default-features = false }
+lance-core = "4.0.0"
+lance-io = { version = "4.0.0", default-features = false }
+lance-namespace = "4.0.0"
+lance-table = "4.0.0"
+lancedb_upstream = { package = "lancedb", version = "0.27.2", default-features = false }
+md-5 = { workspace = true }
+once_cell = { workspace = true }
+object_store = "0.12.5"
+tokio = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+arrow-array = "57.2"
+arrow-schema = "57.2"
+pyo3 = { version = "0.25.1", features = ["extension-module", "abi3-py38"], optional = true }
+pyo3-async-runtimes = { version = "0.25.0", features = ["tokio-runtime"], optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default = []
+python-sdk = ["dep:pyo3", "dep:pyo3-async-runtimes"]
+aws = ["lancedb_upstream/aws"]
+azure = ["lancedb_upstream/azure"]
+bedrock = ["lancedb_upstream/bedrock"]
+dynamodb = ["lancedb_upstream/dynamodb"]
+fp16kernels = ["lancedb_upstream/fp16kernels"]
+gcs = ["lancedb_upstream/gcs"]
+huggingface = ["lancedb_upstream/huggingface"]
+openai = ["lancedb_upstream/openai"]
+oss = ["lancedb_upstream/oss"]
+polars = ["lancedb_upstream/polars"]
+remote = ["lancedb_upstream/remote"]
+s3-test = ["lancedb_upstream/s3-test"]
+sentence-transformers = ["lancedb_upstream/sentence-transformers"]

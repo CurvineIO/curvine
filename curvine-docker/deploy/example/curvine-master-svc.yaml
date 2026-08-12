@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: cv-master
+  labels:
+    role: cv-master-svc
+  namespace: curvine
+spec:
+  ports:
+    - name: rpc
+      port: 8995
+      targetPort: 8995
+      protocol: TCP
+    - name: journal
+      port: 8996
+      targetPort: 8996
+      protocol: TCP
+    - name: web
+      port: 9000
+      targetPort: 9000
+      protocol: TCP
+    - name: web1
+      port: 9001
+      targetPort: 9001
+      protocol: TCP
+    - name: worker
+      port: 8997
+      targetPort: 8997
+      protocol: TCP
+  clusterIP: None 
+  selector:
+    role: cv-master

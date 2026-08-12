@@ -1,0 +1,42 @@
+[package]
+name = "curvine-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+curvine-core-error = { workspace = true }
+curvine-runtime = { workspace = true }
+curvine-rpc = { workspace = true }
+curvine-net = { workspace = true }
+curvine-config = { workspace = true }
+curvine-model = { workspace = true }
+curvine-raft = { workspace = true }
+curvine-sys = { workspace = true }
+curvine-fs-api = { workspace = true }
+curvine-job-client = { workspace = true }
+curvine-unified-fs = { workspace = true, features = ["opendal-s3"] }
+curvine-proto = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+# Next builds curvine-web in the client-safe cargo profile (without
+# curvine-server). Community #1290 gates FsError:IntoResponse behind
+# curvine-error/axum-response, which server enables; web must enable it
+# itself so Handler bounds resolve under the split build.
+curvine-error = { workspace = true, features = ["axum-response"] }
+log = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true, features = ["trace", "fs"] }
+serde_json = { workspace = true }
+serde = { version = "1.0.216", features = ["derive"] }
+clap = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+futures = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }

@@ -1,0 +1,30 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::handler::{ReadFrame, WriteFrame};
+use std::future::Future;
+
+use crate::message::{Message, RefMessage};
+use curvine_io::IOResult;
+use curvine_net::net::ConnState;
+
+pub trait Frame {
+    fn send(&mut self, message: impl RefMessage) -> impl Future<Output = IOResult<()>>;
+
+    fn receive(&mut self) -> impl Future<Output = IOResult<Message>>;
+
+    fn new_conn_state(&self) -> ConnState;
+
+    fn split(self) -> (ReadFrame, WriteFrame);
+}
