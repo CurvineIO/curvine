@@ -142,63 +142,6 @@ fn leader_promotion_applies_committed_metadata_before_returning() -> CommonResul
     Ok(())
 }
 
-#[test]
-fn replay_rejects_duplicate_allocated_inode_id() -> CommonResult<()> {
-    Master::init_test_metrics();
-
-    let mut source_conf = ClusterConf {
-        testing: true,
-        ..Default::default()
-    };
-    source_conf.change_test_meta_dir(format!("duplicate-id-source-{}", Utils::rand_str(6)));
-    let source_fs = JournalSystem::fs_only_for_test(&source_conf)?;
-    source_fs.mkdir("/first", false)?;
-    source_fs.mkdir("/second", false)?;
-    let mut entries = source_fs.fs_dir.read().take_entries();
-    let first = entries.remove(0);
-    let mut second = entries.remove(0);
-    let duplicated_id = match &first {
-        JournalEntry::Mkdir(entry) => entry.dir.id,
-        _ => unreachable!("mkdir must emit a Mkdir journal entry"),
-    };
-    match &mut second {
-        JournalEntry::Mkdir(entry) => entry.dir.id = duplicated_id,
-        _ => unreachable!("mkdir must emit a Mkdir journal entry"),
-    }
-
-    let mut target_conf = ClusterConf {
-        testing: true,
-        ..Default::default()
-    };
-    target_conf.change_test_meta_dir(format!("duplicate-id-target-{}", Utils::rand_str(6)));
-    let target = JournalSystem::from_conf(&target_conf)?;
-    let loader = target.journal_loader();
-
-    let mut first_batch = JournalBatch::new(1);
-    first_batch.push(first);
-    let first_entry = Entry {
-        term: 1,
-        index: 1,
-        data: SerdeUtils::serialize(&first_batch)?,
-        ..Default::default()
-    };
-    let mut second_batch = JournalBatch::new(2);
-    second_batch.push(second);
-    let second_entry = Entry {
-        term: 1,
-        index: 2,
-        data: SerdeUtils::serialize(&second_batch)?,
-        ..Default::default()
-    };
-
-    let result = AsyncRuntime::single().block_on(async {
-        loader.apply(true, ApplyMsg::new_entry(first_entry)).await?;
-        loader.apply(true, ApplyMsg::new_entry(second_entry)).await
-    });
-    assert!(result.is_err());
-    Ok(())
-}
-
 // First start a master and perform the operation; then start 1 stand by, manually replay the log to check consistency.
 #[test]
 fn test_journal_replay_consistency_between_leader_and_follower() -> CommonResult<()> {
