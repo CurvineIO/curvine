@@ -31,6 +31,9 @@ use log::{debug, info, warn};
 use std::collections::VecDeque;
 use std::sync::{mpsc, Mutex};
 
+// The legacy entry is the hot path. Keeping it inline avoids a heap allocation
+// for every normal journal write.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum JournalWriteRequest {
     Legacy(JournalEntry),
     Metadata(Vec<MetadataCommand>, mpsc::SyncSender<FsResult<()>>),
