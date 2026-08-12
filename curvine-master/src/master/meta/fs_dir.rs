@@ -185,6 +185,14 @@ impl FsDir {
         }
     }
 
+    fn apply_setgid_directory_inheritance(inp: &InodePath, opts: &mut MkdirOpts) -> FsResult<()> {
+        if let Some(group) = Self::setgid_parent_group(inp)? {
+            opts.group = group;
+            opts.mode |= MODE_SETGID;
+        }
+        Ok(())
+    }
+
     // Create all previous directories that may be missing on the path.
     fn create_parent_dir(&mut self, mut inp: InodePath, opts: MkdirOpts) -> FsResult<InodePath> {
         let mut index = inp.existing_len();
