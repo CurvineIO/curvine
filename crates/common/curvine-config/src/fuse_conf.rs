@@ -547,7 +547,7 @@ impl Default for FuseConf {
             negative_timeout_ms: FuseConf::DEFAULT_NEGATIVE_TIMEOUT_MS,
             attr_timeout_ms: FuseConf::DEFAULT_ATTR_TIMEOUT_MS,
             remember: false,
-            web_port: crate::DEFAULT_FUSE_WEB_PORT,
+            web_port: crate::ClusterConf::DEFAULT_FUSE_WEB_PORT,
 
             max_background: 256,
             congestion_threshold: 192,
