@@ -647,20 +647,13 @@ where
         req_id: i64,
         sender: Callback,
         response: ProposeResponse,
-        apply_done: Option<CallReceiver<RaftResult<()>>>,
+        apply_done: CallReceiver<RaftResult<()>>,
     ) {
         let response_msg = Builder::new_rpc(RaftCode::Propose)
             .response(ResponseStatus::Success)
             .proto_header(response)
             .req_id(req_id)
             .build();
-
-        let Some(apply_done) = apply_done else {
-            if sender.send(Ok(response_msg)).is_err() {
-                warn!("The client connection has been closed, req {}", req_id)
-            }
-            return;
-        };
 
         rt.spawn(async move {
             let result = match apply_done.receive().await {
@@ -731,6 +724,17 @@ where
                 let apply = self.apply_propose(entry, should_respond).await?;
                 if should_respond {
                     let Some(entry_context) = entry_context else {
+                        warn!(
+                            "leader committed entry has no response context, index {}, term {}",
+                            entry_index, entry_term
+                        );
+                        continue;
+                    };
+                    let Some(apply_done) = apply.apply_done else {
+                        warn!(
+                            "leader committed entry has no apply acknowledgement, index {}, term {}",
+                            entry_index, entry_term
+                        );
                         continue;
                     };
                     let req_id: i64 = match SerdeUtils::deserialize(&entry_context) {
@@ -749,7 +753,7 @@ where
                             req_id,
                             sender,
                             apply.response,
-                            apply.apply_done,
+                            apply_done,
                         ),
 
                         None => {

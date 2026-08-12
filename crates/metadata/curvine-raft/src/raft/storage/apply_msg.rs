@@ -41,19 +41,11 @@ impl ApplyMsg {
         ApplyMsg::Scan(applied_index)
     }
 
-    pub fn take_entry(self) -> Entry {
+    pub fn into_entry_with_ack(self) -> RaftResult<(Entry, Option<CallSender<RaftResult<()>>>)> {
         match self {
-            ApplyMsg::Entry(entry) => entry,
-            ApplyMsg::EntryWithAck((entry, _)) => entry,
-            _ => panic!("invalid entry"),
-        }
-    }
-
-    pub fn take_entry_with_ack(self) -> (Entry, Option<CallSender<RaftResult<()>>>) {
-        match self {
-            ApplyMsg::Entry(entry) => (entry, None),
-            ApplyMsg::EntryWithAck((entry, ack)) => (entry, Some(ack)),
-            _ => panic!("invalid entry"),
+            ApplyMsg::Entry(entry) => Ok((entry, None)),
+            ApplyMsg::EntryWithAck((entry, ack)) => Ok((entry, Some(ack))),
+            _ => Err("expected raft entry apply message".to_string().into()),
         }
     }
 }

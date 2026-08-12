@@ -142,6 +142,57 @@ fn leader_promotion_applies_committed_metadata_before_returning() -> CommonResul
     Ok(())
 }
 
+#[test]
+fn follower_replay_rejects_duplicate_allocated_inode_id() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let mut source_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    source_conf.change_test_meta_dir(format!("duplicate-id-source-{}", Utils::rand_str(6)));
+    let source_fs = JournalSystem::fs_only_for_test(&source_conf)?;
+    source_fs.mkdir("/source", false)?;
+    let source_entry = source_fs
+        .fs_dir
+        .read()
+        .take_entries()
+        .into_iter()
+        .next()
+        .expect("mkdir must emit a journal entry");
+    let inode_id = source_entry
+        .allocated_inode_id()
+        .expect("mkdir must allocate an inode id");
+
+    let mut target_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    target_conf.change_test_meta_dir(format!("duplicate-id-target-{}", Utils::rand_str(6)));
+    let target = JournalSystem::from_conf(&target_conf)?;
+    let target_fs = target.fs();
+    target_fs.mkdir("/occupied", false)?;
+    assert_eq!(target_fs.last_inode_id(), inode_id);
+
+    let mut batch = JournalBatch::new(1);
+    batch.push(source_entry);
+    let entry = Entry {
+        term: 1,
+        index: 1,
+        data: SerdeUtils::serialize(&batch)?,
+        ..Default::default()
+    };
+    target.append_committed_entry_for_test(entry.clone())?;
+
+    let err = AsyncRuntime::single()
+        .block_on(async { target.journal_loader().role_change(StateRole::Leader).await })
+        .expect_err("follower replay must reject a reused inode id");
+    assert!(err
+        .to_string()
+        .contains("refusing duplicate inode allocation during follower replay"));
+    Ok(())
+}
+
 // First start a master and perform the operation; then start 1 stand by, manually replay the log to check consistency.
 #[test]
 fn test_journal_replay_consistency_between_leader_and_follower() -> CommonResult<()> {

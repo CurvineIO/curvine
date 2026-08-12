@@ -86,7 +86,10 @@ where
     V: DeserializeOwned + Sized + Serialize + Clone + Send + Sync + 'static,
 {
     async fn apply(&self, _: bool, msg: ApplyMsg) -> RaftResult<()> {
-        let (entry, ack) = msg.take_entry_with_ack();
+        if matches!(msg, ApplyMsg::Scan(_)) {
+            return Ok(());
+        }
+        let (entry, ack) = msg.into_entry_with_ack()?;
         let result = (|| -> RaftResult<()> {
             let mut map = self.write()?;
             let pairs: (K, V) = SerdeUtils::deserialize(&entry.data)?;
@@ -197,7 +200,10 @@ where
     V: Serialize + DeserializeOwned + Clone + Sync + Send + 'static,
 {
     async fn apply(&self, _: bool, msg: ApplyMsg) -> RaftResult<()> {
-        let (entry, ack) = msg.take_entry_with_ack();
+        if matches!(msg, ApplyMsg::Scan(_)) {
+            return Ok(());
+        }
+        let (entry, ack) = msg.into_entry_with_ack()?;
         let result = (|| -> RaftResult<()> {
             let db = self.lock()?;
             let pairs: (K, V) = SerdeUtils::deserialize(&entry.data)?;

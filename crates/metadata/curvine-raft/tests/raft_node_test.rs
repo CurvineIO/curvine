@@ -18,7 +18,8 @@ use curvine_core_error::CommonResult;
 use curvine_raft::conf::JournalConf;
 use curvine_raft::proto::raft::{FsmState, SnapshotData};
 use curvine_raft::raft::storage::{
-    AppStorage, HashAppStorage, LogStorage, MemLogStorage, RocksLogStorage,
+    AppStorage, ApplyMsg, HashAppStorage, LogStorage, MemLogStorage, RocksAppStorage,
+    RocksLogStorage,
 };
 use curvine_raft::raft::{
     RaftClient, RaftCode, RaftError, RaftJournal, RaftNode, RaftResult, RoleMonitor,
@@ -27,7 +28,7 @@ use curvine_raft::utils::SerdeUtils;
 use curvine_rpc::client::{ClientConf, RpcClient};
 use curvine_rpc::message::{Builder, ResponseStatus};
 use curvine_runtime::common::{FileUtils, Logger, Utils};
-use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime, Runtime};
 use prost::bytes::BytesMut;
 use prost::Message;
 use raft::eraftpb::{ConfState, Entry, HardState, Message as RaftMessage, MessageType, Snapshot};
@@ -227,14 +228,27 @@ impl AppStorage for TestKvAppStorage {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct BlockingApplyAppStorage {
     map: Arc<RwLock<std::collections::HashMap<String, String>>>,
     fsm_state: Arc<Mutex<FsmState>>,
     started: Arc<AtomicBool>,
     started_notify: Arc<tokio::sync::Notify>,
-    release: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Semaphore>,
     completed: Arc<AtomicBool>,
+}
+
+impl Default for BlockingApplyAppStorage {
+    fn default() -> Self {
+        Self {
+            map: Arc::default(),
+            fsm_state: Arc::default(),
+            started: Arc::default(),
+            started_notify: Arc::default(),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+            completed: Arc::default(),
+        }
+    }
 }
 
 impl BlockingApplyAppStorage {
@@ -247,7 +261,11 @@ impl BlockingApplyAppStorage {
         self.started.store(true, Ordering::SeqCst);
         self.started_notify.notify_one();
         if wait {
-            self.release.notified().await;
+            self.release
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("test semaphore is never closed");
         }
         self.map.write().unwrap().insert(pair.0, pair.1);
         self.fsm_state.lock().unwrap().applied = curvine_raft::proto::raft::AppliedIndex {
@@ -267,7 +285,7 @@ impl BlockingApplyAppStorage {
     }
 
     fn release_apply(&self) {
-        self.release.notify_waiters();
+        self.release.add_permits(1);
     }
 
     fn proposal_completed(&self) -> bool {
@@ -560,6 +578,28 @@ fn propose_response_waits_until_committed_entry_is_applied() -> CommonResult<()>
     assert!(response.applied_index.unwrap_or_default() > 0);
     assert_eq!(store.get("name"), Some("curvine".to_string()));
     FileUtils::delete_path(&conf.journal_dir, true)?;
+
+    Ok(())
+}
+
+#[test]
+fn kv_app_storages_accept_scan_control_messages() -> CommonResult<()> {
+    let rt = AsyncRuntime::single();
+    let applied = curvine_raft::proto::raft::AppliedIndex {
+        term: 1,
+        index: 1,
+        ..Default::default()
+    };
+
+    let hash: HashAppStorage<String, String> = HashAppStorage::new();
+    rt.block_on(hash.apply(true, ApplyMsg::new_scan(applied.clone())))?;
+
+    let dir = Utils::test_sub_dir(format!("rocks-app-storage-scan-{}", Utils::rand_id()));
+    FileUtils::delete_path(&dir, true)?;
+    let rocks: RocksAppStorage<String, String> = RocksAppStorage::new(&dir);
+    rt.block_on(rocks.apply(true, ApplyMsg::new_scan(applied)))?;
+    drop(rocks);
+    FileUtils::delete_path(&dir, true)?;
 
     Ok(())
 }

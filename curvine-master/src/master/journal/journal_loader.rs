@@ -256,6 +256,19 @@ impl JournalLoader {
 
             {
                 let fs_dir = self.fs_dir.read();
+                if !is_leader {
+                    if let Some(inode_id) = op_entry.allocated_inode_id() {
+                        let last_inode_id = fs_dir.last_inode_id();
+                        if inode_id <= last_inode_id {
+                            return err_box!(
+                                "refusing duplicate inode allocation during follower replay: inode_id={}, last_inode_id={}, journal={:?}",
+                                inode_id,
+                                last_inode_id,
+                                op_entry
+                            );
+                        }
+                    }
+                }
                 fs_dir.update_op_id(op_entry.op_id());
                 if let Some(inode_id) = op_entry.inode_id() {
                     fs_dir.update_last_inode_id(inode_id)?;
@@ -359,12 +372,12 @@ impl JournalLoader {
     }
 
     async fn catch_up_committed_metadata(&self) -> RaftResult<()> {
+        let committed = self.log_store.hard_state().commit;
         let applied = self.fsm_state_snapshot()?.applied;
         self.apply_msg(false, &ApplyMsg::new_scan(applied), false)
             .await?;
 
         let metadata_applied = self.fsm_state_snapshot()?.applied.index;
-        let committed = self.log_store.hard_state().commit;
         if metadata_applied < committed {
             return err_box!(
                 "metadata catch-up stopped before committed raft index: applied={}, commit={}",
