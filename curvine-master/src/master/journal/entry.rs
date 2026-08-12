@@ -675,6 +675,12 @@ impl MetadataCommand {
                 CvMetadataChange::subtree(entry.op_id, &entry.src),
                 CvMetadataChange::subtree(entry.op_id, &entry.dst),
             ],
+            MetadataCommand::SetAttr(entry) => {
+                vec![CvMetadataChange::single(entry.op_id, &entry.path)]
+            }
+            MetadataCommand::Delete(entry) => {
+                vec![CvMetadataChange::subtree(entry.op_id, &entry.path)]
+            }
         }
     }
 

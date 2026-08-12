@@ -688,6 +688,8 @@ impl JournalLoader {
             }
             MetadataCommand::CreateFile(entry) => self.create_file(entry.clone()),
             MetadataCommand::Rename(entry) => self.rename(entry.clone()),
+            MetadataCommand::SetAttr(entry) => self.set_attr(entry.clone()),
+            MetadataCommand::Delete(entry) => self.delete(entry.clone()),
         }
     }
 
@@ -708,17 +710,8 @@ impl JournalLoader {
                     .apply_entry(&JournalEntry::Rename(entry.clone()))
                     .await
             }
-            MetadataCommand::SetAttr(entry) => self.set_attr(entry),
-            MetadataCommand::Delete(entry) => {
-                self.delete(entry.clone())?;
-                if is_leader {
-                    self.ufs_loader
-                        .apply_entry(&JournalEntry::Delete(entry))
-                        .await
-                } else {
-                    Ok(())
-                }
-            }
+            MetadataCommand::SetAttr(_) => Ok(()),
+            MetadataCommand::Delete(entry) => self.ufs_loader.delete(entry).await,
         }
     }
 
