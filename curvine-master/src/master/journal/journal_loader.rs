@@ -231,13 +231,11 @@ impl JournalLoader {
         }
 
         let batch = JournalEnvelope::decode(&entry.data)?;
-        if batch.contains_metadata_commands() {
-            return err_box!("unsupported committed metadata command batch");
-        }
         let batch_len = batch.len();
         let mut snapshot = None;
         let mut applied = Self::build_applied(entry);
         let mut has_ufs_affecting = false;
+        let mut applied_metadata_commands = Vec::new();
 
         for (seq, command) in batch.into_commands().enumerate() {
             applied.op_id = command.op_id();
@@ -302,30 +300,40 @@ impl JournalLoader {
                 }
 
                 JournalCommand::Metadata(command) => {
-                    let res = self
-                        .apply_metadata_command(is_leader, command.clone())
-                        .await;
-
-                    if let Err(e) = res {
-                        if is_leader && skip_ufs_error {
+                    self.apply_metadata_namespace(&command)?;
+                    match self.apply_metadata_ufs(is_leader, &command).await {
+                        Ok(()) => {
+                            if is_leader {
+                                applied_metadata_commands.push(command);
+                            }
+                        }
+                        Err(e) if is_leader && skip_ufs_error => {
                             error!(
                                 "skip failed committed metadata command after retries, entry index={}, term={}, command={:?}, error={}",
                                 entry.index, entry.term, command, e
                             );
+                            applied_metadata_commands.push(command);
                             continue;
                         }
-
-                        return err_box!(
-                            "failed to apply committed metadata command: {:?}: {}",
-                            command,
-                            e
-                        );
+                        Err(e) => {
+                            return err_box!(
+                                "failed to apply committed metadata command: {:?}: {}",
+                                command,
+                                e
+                            );
+                        }
                     }
                 }
             }
         }
 
         self.set_applied(is_leader, applied, has_ufs_affecting)?;
+        if is_leader && !applied_metadata_commands.is_empty() {
+            let fs_dir = self.fs_dir.read();
+            fs_dir
+                .journal_writer
+                .on_metadata_commands_applied(&fs_dir, &applied_metadata_commands);
+        }
 
         if let Some(e) = snapshot {
             let snap_data = self.create_snapshot0(Some(e.dir.to_string()))?;
@@ -672,21 +680,28 @@ impl JournalLoader {
         fs_dir.store.apply_cache_invalidations(entry.inodes)
     }
 
-    async fn apply_metadata_command(
-        &self,
-        is_leader: bool,
-        command: MetadataCommand,
-    ) -> CommonResult<()> {
+    fn apply_metadata_namespace(&self, command: &MetadataCommand) -> CommonResult<()> {
         match command {
             MetadataCommand::Mkdir(entry) => {
                 self.mkdir(entry.clone())?;
-                if is_leader {
-                    self.ufs_loader.mkdir(&entry).await
-                } else {
-                    Ok(())
-                }
+                Ok(())
             }
-            MetadataCommand::CreateFile(entry) => self.create_file(entry),
+            MetadataCommand::CreateFile(entry) => self.create_file(entry.clone()),
+        }
+    }
+
+    async fn apply_metadata_ufs(
+        &self,
+        is_leader: bool,
+        command: &MetadataCommand,
+    ) -> CommonResult<()> {
+        if !is_leader {
+            return Ok(());
+        }
+
+        match command {
+            MetadataCommand::Mkdir(entry) => self.ufs_loader.mkdir(entry).await,
+            MetadataCommand::CreateFile(_) => Ok(()),
         }
     }
 

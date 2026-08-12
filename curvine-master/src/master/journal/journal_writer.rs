@@ -121,25 +121,63 @@ impl JournalWriter {
     }
 
     fn record_metadata_delta(&self, entry: &JournalEntry) {
-        let changes = entry.cv_metadata_changes();
+        self.record_metadata_changes(entry.cv_metadata_changes());
+    }
+
+    fn record_metadata_changes(&self, changes: Vec<CvMetadataChange>) {
         if changes.is_empty() {
             return;
         }
         self.metadata_delta_log.lock().unwrap().push(changes);
     }
 
+    pub(crate) fn on_metadata_commands_applied(
+        &self,
+        fs_dir: &FsDir,
+        commands: &[MetadataCommand],
+    ) {
+        if !self.enable || commands.is_empty() {
+            return;
+        }
+
+        for command in commands {
+            self.record_metadata_changes(command.cv_metadata_changes());
+        }
+        if let Err(e) = self.maybe_emit_snapshot_after(fs_dir, commands.len() as u64) {
+            warn!(
+                "failed to emit snapshot after committed metadata batch: {}",
+                e
+            );
+        }
+    }
+
     fn maybe_emit_snapshot(&self, fs_dir: &FsDir) -> FsResult<()> {
+        self.maybe_emit_snapshot_after(fs_dir, 1)
+    }
+
+    fn maybe_emit_snapshot_after(&self, fs_dir: &FsDir, applied_entries: u64) -> FsResult<()> {
         if self.snapshot_entries == 0 {
             return Ok(());
         }
 
-        let entries = self.entries_since_snapshot.add_and_get(1);
+        let mut previous = self.entries_since_snapshot.get();
+        let entries = loop {
+            let current = previous.saturating_add(applied_entries);
+            let next = if current < self.snapshot_entries {
+                current
+            } else {
+                current % self.snapshot_entries
+            };
+            if self.entries_since_snapshot.compare_and_set(previous, next) {
+                break current;
+            }
+            previous = self.entries_since_snapshot.get();
+        };
         if entries < self.snapshot_entries {
             return Ok(());
         }
 
         let now = LocalTime::mills();
-        self.entries_since_snapshot.set(0);
         let dir = match fs_dir.store.create_checkpoint(now) {
             Ok(d) => d,
             Err(e) => {

@@ -262,7 +262,7 @@ impl FsDir {
     pub(crate) fn prepare_create_file_commands(
         &self,
         mut inp: InodePath,
-        opts: CreateFileOpts,
+        mut opts: CreateFileOpts,
     ) -> FsResult<Vec<MetadataCommand>> {
         if inp.get_last_inode().is_some() {
             return err_ext!(FsError::file_exists(inp.path()));
@@ -276,6 +276,10 @@ impl FsDir {
                     self.prepare_mkdir_command(&mut inp, dir_opts.clone())?,
                 ));
             }
+        }
+
+        if let Some(group) = Self::setgid_parent_group(&inp)? {
+            opts.group = group;
         }
 
         let name = inp.name().to_string();

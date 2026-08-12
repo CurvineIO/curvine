@@ -16,8 +16,8 @@ use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_fs_api::CurvineURI;
 use curvine_model::{
-    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, MountOptions, OpenFlags,
-    RenameFlags, WorkerInfo, WriteType,
+    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, CreateFileOptsBuilder,
+    MkdirOptsBuilder, MountOptions, OpenFlags, RenameFlags, WorkerInfo, WriteType,
 };
 use curvine_net::net::NetUtils;
 use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData, SnapshotFileList};
@@ -289,6 +289,30 @@ fn active_namespace_creation_replicates_without_legacy_writer_queue() -> CommonR
 
     active.mkdir("/committed-dir", false)?;
     active.create("/committed-file", false)?;
+    let parent_opts = MkdirOptsBuilder::new()
+        .group("parent-group".to_string())
+        .mode(0o2775)
+        .build();
+    active.mkdir_with_opts("/setgid-parent", parent_opts)?;
+    let file_opts = CreateFileOptsBuilder::new()
+        .group("file-group".to_string())
+        .build();
+    active.create_with_opts("/setgid-parent/child", file_opts, OpenFlags::new_create())?;
+
+    let delta = active.cv_metadata_delta_page(0, None, None, 32)?;
+    assert!(!delta.full_snapshot_required);
+    assert!(delta
+        .entries
+        .iter()
+        .any(|entry| entry.path == "/committed-dir"));
+    assert!(delta
+        .entries
+        .iter()
+        .any(|entry| entry.path == "/committed-file"));
+    assert_eq!(
+        active.file_status("/setgid-parent/child")?.group,
+        "parent-group"
+    );
     let legacy_entries = active.fs_dir.read().take_entries();
     assert!(
         !legacy_entries.iter().any(|entry| matches!(
@@ -302,7 +326,12 @@ fn active_namespace_creation_replicates_without_legacy_writer_queue() -> CommonR
     loop {
         if standby.file_status("/committed-dir").is_ok()
             && standby.file_status("/committed-file").is_ok()
+            && standby.file_status("/setgid-parent/child").is_ok()
         {
+            assert_eq!(
+                standby.file_status("/setgid-parent/child")?.group,
+                "parent-group"
+            );
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {

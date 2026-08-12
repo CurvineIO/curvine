@@ -432,7 +432,7 @@ impl MasterFilesystem {
         let last_inode = inp.get_last_inode();
         if let Some(inode) = &last_inode {
             if inode.is_dir() {
-                return err_box!("{}  already exists as a dir", inp.path());
+                return err_box!("{} already exists as a dir", inp.path());
             }
 
             if flags.exclusive() {
@@ -473,7 +473,7 @@ impl MasterFilesystem {
             let last_inode = inp.get_last_inode();
             if let Some(inode) = &last_inode {
                 if inode.is_dir() {
-                    return err_box!("{}  already exists as a dir", inp.path());
+                    return err_box!("{} already exists as a dir", inp.path());
                 }
 
                 if flags.exclusive() {
