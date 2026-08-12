@@ -374,7 +374,7 @@ impl JournalLoader {
             .into();
         }
         Ok(())
-}
+    }
     async fn next_apply_msg(
         &self,
         receiver: &mut AsyncReceiver<ApplyMsg>,
@@ -415,20 +415,25 @@ impl JournalLoader {
                     retry_num = 0;
                 }
 
-                ApplyMsg::RoleChange(role) => {
-                    is_leader = role == StateRole::Leader;
-                    if is_leader {
-                        let ufs_applied = match self.get_ufs_applied() {
-                            Ok(ufs_applied) => ufs_applied,
-                            Err(e) => {
-                                Self::abort_on_fatal_apply_error(format!(
-                                    "failed to read fsm_state after leader role change: {}",
-                                    e
-                                ));
-                            }
-                        };
-                        info!("role changed to leader, scheduling UFS replay scan from ufs_applied: {:?}", ufs_applied);
-                        retry_msg.replace(ApplyMsg::new_scan(ufs_applied));
+                ApplyMsg::RoleChange((role, tx)) => {
+                    let result = async {
+                        if role == StateRole::Leader {
+                            // Publish leadership only after committed namespace mutations
+                            // have advanced local metadata high-water marks.
+                            self.catch_up_committed_metadata().await?;
+                            is_leader = true;
+                            let ufs_applied = self.get_ufs_applied()?;
+                            info!("metadata caught up for leader promotion, scheduling UFS replay from {:?}", ufs_applied);
+                            retry_msg.replace(ApplyMsg::new_scan(ufs_applied));
+                        } else {
+                            is_leader = false;
+                        }
+                        Ok(())
+                    }
+                    .await;
+
+                    if tx.send(result).is_err() {
+                        warn!("leader role-change acknowledgement receiver dropped");
                     }
                 }
 
@@ -965,10 +970,14 @@ impl AppStorage for JournalLoader {
 
     async fn role_change(&self, role: StateRole) -> RaftResult<()> {
         if !self.has_apply_worker {
+            if role == StateRole::Leader {
+                self.catch_up_committed_metadata().await?;
+            }
             return Ok(());
         }
-        self.sender.send(ApplyMsg::RoleChange(role)).await?;
-        Ok(())
+        let (tx, rx) = CallChannel::channel();
+        self.sender.send(ApplyMsg::RoleChange((role, tx))).await?;
+        rx.receive().await?
     }
 
     async fn create_snapshot(&self) -> RaftResult<SnapshotData> {

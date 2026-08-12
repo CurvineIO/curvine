@@ -24,7 +24,7 @@ pub enum ApplyMsg {
     Scan(AppliedIndex),
     CreateSnapshot(CallSender<RaftResult<SnapshotData>>),
     ApplySnapshot((CallSender<RaftResult<()>>, SnapshotData)),
-    RoleChange(StateRole),
+    RoleChange((StateRole, CallSender<RaftResult<()>>)),
     Shutdown(CallSender<()>),
 }
 

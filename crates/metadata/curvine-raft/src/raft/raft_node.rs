@@ -463,22 +463,10 @@ where
         // Get the ready structure.
         let mut ready = self.raw.ready();
 
-        // If hard state changes, it needs to be saved.
-        if let Some(hs) = ready.hs() {
-            let store = self.raw.mut_store();
-            store.set_hard_state(hs)?;
-        }
-
         let soft_state = ready.ss().map(|ss| SoftState {
             leader_id: ss.leader_id,
             raft_state: ss.raft_state,
         });
-
-        // Get the message that needs to be sent to other nodes.
-        // Only the leader call returns true.
-        if !ready.messages().is_empty() {
-            self.send_messages(ready.take_messages()).await?;
-        }
 
         // Process snapshots.
         if *ready.snapshot() != Snapshot::default() {
@@ -486,11 +474,20 @@ where
                 .gen_apply_snapshot_job(ready.snapshot().clone())?;
         }
 
-        // Persist new log entries first so followers can be notified immediately
-        // via persisted_messages.  FSM apply of already-committed entries can
-        // happen afterwards without blocking the persistence pipeline.
+        // Persist entries before the HardState that may commit them. A crash may
+        // leave extra uncommitted entries, but must never leave commit past tail.
         if !ready.entries().is_empty() {
             self.storage.append(&ready.entries()[..])?;
+        }
+
+        if let Some(hs) = ready.hs() {
+            let store = self.raw.mut_store();
+            store.set_hard_state(hs)?;
+        }
+
+        // Raft messages may be sent only after their Ready state is durable.
+        if !ready.messages().is_empty() {
+            self.send_messages(ready.take_messages()).await?;
         }
 
         // Get the message that the leader has fallen into the disk and send these messages to other nodes.
