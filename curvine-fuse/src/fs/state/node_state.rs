@@ -39,7 +39,6 @@ use curvine_model::{
 };
 use curvine_runtime::common::FastHashMap;
 use curvine_runtime::sync::{AsyncMutex, AsyncSharedMap, AtomicCounter, RwLockHashMap};
-use curvine_sys::RawPtr;
 use futures::stream::{self, StreamExt};
 use log::{debug, error, info, warn};
 use std::borrow::Cow;
@@ -442,7 +441,7 @@ impl NodeState {
             };
             status.id = ino as i64;
             let handle = self
-                .insert_handle_with_writer(ino, Some(RawPtr::from_owned(reader)), None, status)
+                .insert_handle_with_writer(ino, Some(Arc::new(reader)), None, status)
                 .await;
             return Ok(handle);
         }
@@ -475,7 +474,7 @@ impl NodeState {
                 None
             } else {
                 let reader = self.new_reader(path).await?;
-                Some(RawPtr::from_owned(reader))
+                Some(Arc::new(reader))
             }
         } else {
             None
@@ -494,7 +493,7 @@ impl NodeState {
     async fn insert_handle_with_writer(
         &self,
         ino: u64,
-        reader: Option<RawPtr<FuseReader>>,
+        reader: Option<Arc<FuseReader>>,
         writer: Option<Arc<FuseWriter>>,
         status: FileStatus,
     ) -> Arc<FileHandle> {
