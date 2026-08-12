@@ -370,8 +370,7 @@ impl JournalLoader {
                 "metadata catch-up stopped before committed raft index: applied={}, commit={}",
                 metadata_applied,
                 committed
-            )
-            .into();
+            );
         }
         Ok(())
     }
