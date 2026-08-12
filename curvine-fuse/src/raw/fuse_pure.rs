@@ -153,7 +153,7 @@ fn fuse_mount_sys(mnt: &Path, conf: &FuseConf) -> IOResult<RawIO> {
     let c_mountpoint = path_to_cstring(mnt)?;
 
     let result = unsafe {
-        let c_options = CString::new(mount_options.clone()).unwrap();
+        let c_options = CString::new(mount_options.as_str()).unwrap();
         let c_type = CString::new("fuse").unwrap();
         libc::mount(
             c_source.as_ptr(),
