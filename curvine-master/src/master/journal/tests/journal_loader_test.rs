@@ -50,7 +50,7 @@ fn metadata_batch_is_applied_after_versioned_journal_upgrade() -> CommonResult<(
     AsyncRuntime::single().block_on(async {
         target
             .journal_loader()
-            .apply(false, ApplyMsg::new_entry(entry))
+            .apply(true, ApplyMsg::new_entry(entry))
             .await
     })?;
     let status = target_fs.file_status("/legacy");
