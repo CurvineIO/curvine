@@ -33,3 +33,7 @@ pub use self::ufs_loader::UfsLoader;
 #[cfg(test)]
 #[path = "tests/journal_entry_compat_test.rs"]
 mod journal_entry_compat_test;
+
+#[cfg(test)]
+#[path = "tests/journal_loader_test.rs"]
+mod journal_loader_test;

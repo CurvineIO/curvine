@@ -231,18 +231,17 @@ impl JournalLoader {
         }
 
         let batch = JournalEnvelope::decode(&entry.data)?;
+        if batch.contains_metadata_commands() {
+            return err_box!("unsupported committed metadata command batch");
+        }
         let batch_len = batch.len();
         let mut snapshot = None;
         let mut applied = Self::build_applied(entry);
         let mut has_ufs_affecting = false;
 
-        for (seq, command) in batch.into_commands().into_iter().enumerate() {
+        for (seq, command) in batch.into_commands().enumerate() {
             applied.op_id = command.op_id();
             applied.rpc_id = command.rpc_id();
-
-            if matches!(&command, JournalCommand::Metadata(_)) {
-                return err_box!("unsupported committed metadata command: {:?}", command);
-            }
 
             match &command {
                 JournalCommand::Legacy(JournalEntry::Snapshot(e))

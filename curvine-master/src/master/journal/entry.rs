@@ -28,7 +28,7 @@ pub(crate) struct CvMetadataChange {
     pub(crate) include_subtree: bool,
 }
 
-pub const JOURNAL_ENVELOPE_MAGIC: &[u8; 8] = b"CVJNL001";
+pub const JOURNAL_ENVELOPE_MAGIC: &[u8; 8] = b"CVJNLHDR";
 pub const JOURNAL_ENVELOPE_VERSION: u16 = 1;
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -548,14 +548,41 @@ impl DecodedJournalBatch {
         self.len() == 0
     }
 
-    pub fn into_commands(self) -> Vec<JournalCommand> {
+    pub fn contains_metadata_commands(&self) -> bool {
+        matches!(
+            self,
+            DecodedJournalBatch::Versioned(batch)
+                if batch
+                    .commands
+                    .iter()
+                    .any(|command| matches!(command, JournalCommand::Metadata(_)))
+        )
+    }
+
+    pub fn into_commands(self) -> JournalCommandIter {
         match self {
-            DecodedJournalBatch::Legacy(batch) => batch
-                .batch
-                .into_iter()
-                .map(JournalCommand::Legacy)
-                .collect(),
-            DecodedJournalBatch::Versioned(batch) => batch.commands,
+            DecodedJournalBatch::Legacy(batch) => {
+                JournalCommandIter::Legacy(batch.batch.into_iter())
+            }
+            DecodedJournalBatch::Versioned(batch) => {
+                JournalCommandIter::Versioned(batch.commands.into_iter())
+            }
+        }
+    }
+}
+
+pub enum JournalCommandIter {
+    Legacy(std::vec::IntoIter<JournalEntry>),
+    Versioned(std::vec::IntoIter<JournalCommand>),
+}
+
+impl Iterator for JournalCommandIter {
+    type Item = JournalCommand;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            JournalCommandIter::Legacy(entries) => entries.next().map(JournalCommand::Legacy),
+            JournalCommandIter::Versioned(commands) => commands.next(),
         }
     }
 }
