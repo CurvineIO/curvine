@@ -797,6 +797,22 @@ impl CurvineFileSystem {
         target_uid.is_some_and(|u| u != file_uid) || target_gid.is_some_and(|g| g != file_gid)
     }
 
+    /// Whether chown/fchown/lchown should clear setuid/setgid on a regular file.
+    ///
+    /// Linux clears these bits when ownership changes and also when both uid and gid are
+    /// explicitly specified (not `(uid_t)-1` / `(gid_t)-1` sentinels), even if the values
+    /// match the current owner (LTP chown02). Partial chown with a `-1` sentinel must not
+    /// clear when the specified id is unchanged (#1547).
+    fn chown_should_clear_setid_bits(
+        target_uid: Option<u32>,
+        target_gid: Option<u32>,
+        file_uid: u32,
+        file_gid: u32,
+    ) -> bool {
+        Self::chown_effectively_changes(target_uid, target_gid, file_uid, file_gid)
+            || (target_uid.is_some() && target_gid.is_some())
+    }
+
     /// POSIX permission model for SETATTR issued by a non-root caller.
     ///
     /// `target_uid`/`target_gid` are the *normalized* chown targets: the caller is expected
@@ -1429,9 +1445,9 @@ impl fs::FileSystem for CurvineFileSystem {
             }
         }
 
-        // Clear setuid/setgid only when uid/gid actually change (not same-id no-ops).
+        // Clear setuid/setgid on real ownership changes and on explicit dual-target chown.
         let chown_effective =
-            Self::chown_effectively_changes(target_uid, target_gid, file_uid, file_gid);
+            Self::chown_should_clear_setid_bits(target_uid, target_gid, file_uid, file_gid);
         if chown_effective && cur_status.file_type == FileType::File {
             let mut new_mode = if let Some(mode) = opts.mode {
                 mode
@@ -2755,6 +2771,47 @@ mod tests {
         assert!(CFS::chown_effectively_changes(None, Some(200), 1000, 100));
         assert!(CFS::chown_effectively_changes(
             Some(1000),
+            Some(200),
+            1000,
+            100
+        ));
+    }
+
+    #[test]
+    fn chown_should_clear_setid_bits_for_explicit_same_owner_chown02() {
+        use super::CurvineFileSystem as CFS;
+        assert!(CFS::chown_should_clear_setid_bits(Some(0), Some(0), 0, 0));
+    }
+
+    #[test]
+    fn chown_should_clear_setid_bits_preserves_sentinel_noops() {
+        use super::CurvineFileSystem as CFS;
+        assert!(!CFS::chown_should_clear_setid_bits(None, None, 1000, 100));
+        assert!(!CFS::chown_should_clear_setid_bits(
+            None,
+            Some(100),
+            1000,
+            100
+        ));
+        assert!(!CFS::chown_should_clear_setid_bits(
+            Some(1000),
+            None,
+            1000,
+            100
+        ));
+    }
+
+    #[test]
+    fn chown_should_clear_setid_bits_on_real_ownership_change() {
+        use super::CurvineFileSystem as CFS;
+        assert!(CFS::chown_should_clear_setid_bits(
+            Some(2000),
+            Some(200),
+            1000,
+            100
+        ));
+        assert!(CFS::chown_should_clear_setid_bits(
+            None,
             Some(200),
             1000,
             100
