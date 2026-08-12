@@ -334,7 +334,7 @@ impl MasterFilesystem {
         let src = src.as_ref();
         let dst = dst.as_ref();
 
-        if self.master_monitor.is_active() {
+        if self.master_monitor.is_active() && !flags.exchange_mode() {
             if let Some(result) = self.rename_committed(src, dst, flags)? {
                 return Ok(result);
             }

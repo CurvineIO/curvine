@@ -502,9 +502,9 @@ pub struct JournalEnvelope {
 }
 
 impl JournalEnvelope {
-    pub fn encode(batch: JournalCommandBatch) -> CommonResult<Vec<u8>> {
+    pub fn encode(batch: &JournalCommandBatch) -> CommonResult<Vec<u8>> {
         let mut bytes = JOURNAL_ENVELOPE_MAGIC.to_vec();
-        bytes.extend(SerdeUtils::serialize(&Self {
+        bytes.extend(SerdeUtils::serialize(&JournalEnvelopeRef {
             version: JOURNAL_ENVELOPE_VERSION,
             batch,
         })?);
@@ -529,6 +529,12 @@ impl JournalEnvelope {
         }
         Ok(DecodedJournalBatch::Versioned(envelope.batch))
     }
+}
+
+#[derive(Serialize)]
+struct JournalEnvelopeRef<'a> {
+    version: u16,
+    batch: &'a JournalCommandBatch,
 }
 
 pub enum DecodedJournalBatch {

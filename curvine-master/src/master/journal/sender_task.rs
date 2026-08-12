@@ -133,7 +133,7 @@ impl SenderTask {
 
         let spend = TimeSpent::new();
 
-        let bytes = crate::master::journal::JournalEnvelope::encode(self.batch.clone())?;
+        let bytes = crate::master::journal::JournalEnvelope::encode(&self.batch)?;
         self.client.block_on_send_propose(bytes)?;
 
         self.metrics.journal_flush_count.inc();

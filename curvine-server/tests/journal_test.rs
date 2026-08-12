@@ -227,7 +227,7 @@ fn replay_accepts_versioned_legacy_journal_batch() -> CommonResult<()> {
     let raft_entry = Entry {
         term: 1,
         index: 1,
-        data: JournalEnvelope::encode(batch)?,
+        data: JournalEnvelope::encode(&batch)?,
         ..Default::default()
     };
 
@@ -321,6 +321,23 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
             JournalEntry::Mkdir(_) | JournalEntry::CreateFile(_) | JournalEntry::Rename(_)
         )),
         "active namespace changes must not emit legacy local-first namespace journal entries: {legacy_entries:?}"
+    );
+
+    active.create("/exchange-a", false)?;
+    active.create("/exchange-b", false)?;
+    let exchange_a = active.file_status("/exchange-a")?.id;
+    let exchange_b = active.file_status("/exchange-b")?.id;
+    active.rename("/exchange-a", "/exchange-b", RenameFlags::EXCHANGE)?;
+    assert_eq!(active.file_status("/exchange-a")?.id, exchange_b);
+    assert_eq!(active.file_status("/exchange-b")?.id, exchange_a);
+    assert!(
+        active
+            .fs_dir
+            .read()
+            .take_entries()
+            .iter()
+            .any(|entry| matches!(entry, JournalEntry::Rename(_))),
+        "active EXCHANGE rename must fall back to the legacy journal path"
     );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(60);

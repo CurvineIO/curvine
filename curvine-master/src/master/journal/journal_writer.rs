@@ -136,12 +136,12 @@ impl JournalWriter {
                     self.metrics.journal_queue_len.dec();
                     batch.push_legacy(entry);
                     if force {
-                        self.propose_command_batch(batch)?;
+                        self.propose_command_batch(&batch)?;
                         self.metrics.journal_flush_count.inc();
                         self.metrics
                             .journal_flush_time
                             .inc_by(spend.used_us() as i64);
-                        batch = JournalCommandBatch::new(seq_id);
+                        batch.next();
                     }
                 }
                 JournalWriteRequest::Metadata(_, _) => {
@@ -152,7 +152,7 @@ impl JournalWriter {
         for command in commands {
             batch.push_metadata(command);
         }
-        self.propose_command_batch(batch)?;
+        self.propose_command_batch(&batch)?;
 
         self.metrics.journal_flush_count.inc();
         self.metrics
@@ -161,7 +161,7 @@ impl JournalWriter {
         Ok(())
     }
 
-    pub(crate) fn propose_command_batch(&self, batch: JournalCommandBatch) -> FsResult<()> {
+    pub(crate) fn propose_command_batch(&self, batch: &JournalCommandBatch) -> FsResult<()> {
         let bytes = JournalEnvelope::encode(batch)?;
         self.client.block_on_send_propose(bytes)?;
         Ok(())
