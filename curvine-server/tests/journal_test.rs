@@ -33,6 +33,7 @@ use curvine_server::master::journal::{
 use curvine_server::master::{Master, MountManager};
 use log::info;
 use raft::eraftpb::Entry;
+use raft::StateRole;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
@@ -96,6 +97,106 @@ fn new_test_ufs_uri(name: &str) -> CommonResult<CurvineURI> {
     ));
     std::fs::create_dir_all(&dir)?;
     CurvineURI::new(format!("file://{}/", dir.display()))
+}
+
+#[test]
+fn leader_promotion_applies_committed_metadata_before_returning() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let mut source_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    source_conf.change_test_meta_dir(format!("promotion-source-{}", Utils::rand_str(6)));
+    let source_fs = JournalSystem::fs_only_for_test(&source_conf)?;
+    source_fs.mkdir("/committed-before-promotion", false)?;
+    let entry = source_fs
+        .fs_dir
+        .read()
+        .take_entries()
+        .into_iter()
+        .next()
+        .expect("mkdir must emit a journal entry");
+
+    let mut target_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    target_conf.change_test_meta_dir(format!("promotion-target-{}", Utils::rand_str(6)));
+    let target = JournalSystem::from_conf(&target_conf)?;
+    let target_fs = target.fs();
+    let loader = target.journal_loader();
+
+    let mut batch = JournalBatch::new(1);
+    batch.push(entry);
+    target.append_committed_entry_for_test(Entry {
+        term: 1,
+        index: 1,
+        data: SerdeUtils::serialize(&batch)?,
+        ..Default::default()
+    })?;
+
+    AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Leader).await })?;
+
+    assert!(target_fs.file_status("/committed-before-promotion").is_ok());
+    Ok(())
+}
+
+#[test]
+fn replay_rejects_duplicate_allocated_inode_id() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let mut source_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    source_conf.change_test_meta_dir(format!("duplicate-id-source-{}", Utils::rand_str(6)));
+    let source_fs = JournalSystem::fs_only_for_test(&source_conf)?;
+    source_fs.mkdir("/first", false)?;
+    source_fs.mkdir("/second", false)?;
+    let mut entries = source_fs.fs_dir.read().take_entries();
+    let first = entries.remove(0);
+    let mut second = entries.remove(0);
+    let duplicated_id = match &first {
+        JournalEntry::Mkdir(entry) => entry.dir.id,
+        _ => unreachable!("mkdir must emit a Mkdir journal entry"),
+    };
+    match &mut second {
+        JournalEntry::Mkdir(entry) => entry.dir.id = duplicated_id,
+        _ => unreachable!("mkdir must emit a Mkdir journal entry"),
+    }
+
+    let mut target_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    target_conf.change_test_meta_dir(format!("duplicate-id-target-{}", Utils::rand_str(6)));
+    let target = JournalSystem::from_conf(&target_conf)?;
+    let loader = target.journal_loader();
+
+    let mut first_batch = JournalBatch::new(1);
+    first_batch.push(first);
+    let first_entry = Entry {
+        term: 1,
+        index: 1,
+        data: SerdeUtils::serialize(&first_batch)?,
+        ..Default::default()
+    };
+    let mut second_batch = JournalBatch::new(2);
+    second_batch.push(second);
+    let second_entry = Entry {
+        term: 1,
+        index: 2,
+        data: SerdeUtils::serialize(&second_batch)?,
+        ..Default::default()
+    };
+
+    let result = AsyncRuntime::single().block_on(async {
+        loader.apply(true, ApplyMsg::new_entry(first_entry)).await?;
+        loader.apply(true, ApplyMsg::new_entry(second_entry)).await
+    });
+    assert!(result.is_err());
+    Ok(())
 }
 
 // First start a master and perform the operation; then start 1 stand by, manually replay the log to check consistency.
