@@ -328,6 +328,100 @@ pub fn read_full(fd: RawIO, buf: &mut [u8]) -> SysResult<()> {
     Ok(())
 }
 
+/// pub unsafe extern "C" fn pread64(
+///     fd: c_int,
+///     buf: *mut c_void,
+///     count: size_t,
+///     offset: off64_t,
+/// ) -> ssize_t
+///
+/// May return a short read. Use [`pread_full`] when `buf.len()` bytes are required.
+pub fn pread(fd: RawIO, buf: &mut [u8], offset: u64) -> SysResult<CInt> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        sys_error!(ErrorKind::Unsupported, "unsupported operation")
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let res = unsafe {
+            libc::pread64(
+                fd,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len() as libc::size_t,
+                offset as libc::off64_t,
+            )
+        };
+        sys_call!(res)
+    }
+}
+
+/// Loop [`pread`] until `buf` is filled or EOF/error. Does not move the fd offset.
+pub fn pread_full(fd: RawIO, buf: &mut [u8], offset: u64) -> SysResult<()> {
+    let mut remaining = buf.len();
+    let mut buf_off = 0;
+    let mut file_off = offset;
+
+    while remaining > 0 {
+        let read_len = pread(fd, &mut buf[buf_off..], file_off)? as usize;
+        if read_len == 0 {
+            return sys_error!(ErrorKind::UnexpectedEof, "pread returned 0");
+        }
+        remaining -= read_len;
+        buf_off += read_len;
+        file_off += read_len as u64;
+    }
+
+    Ok(())
+}
+
+/// pub unsafe extern "C" fn pwrite64(
+///     fd: c_int,
+///     buf: *const c_void,
+///     count: size_t,
+///     offset: off64_t,
+/// ) -> ssize_t
+///
+/// May return a short write. Use [`pwrite_full`] when all bytes must be written.
+pub fn pwrite(fd: RawIO, buf: &[u8], offset: u64) -> SysResult<CInt> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        sys_error!(ErrorKind::Unsupported, "unsupported operation")
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let res = unsafe {
+            libc::pwrite64(
+                fd,
+                buf.as_ptr() as *const libc::c_void,
+                buf.len() as libc::size_t,
+                offset as libc::off64_t,
+            )
+        };
+        sys_call!(res)
+    }
+}
+
+/// Loop [`pwrite`] until `buf` is fully written. Does not move the fd offset.
+pub fn pwrite_full(fd: RawIO, buf: &[u8], offset: u64) -> SysResult<()> {
+    let mut remaining = buf.len();
+    let mut buf_off = 0;
+    let mut file_off = offset;
+
+    while remaining > 0 {
+        let write_len = pwrite(fd, &buf[buf_off..], file_off)? as usize;
+        if write_len == 0 {
+            return sys_error!(ErrorKind::WriteZero, "pwrite returned 0");
+        }
+        remaining -= write_len;
+        buf_off += write_len;
+        file_off += write_len as u64;
+    }
+
+    Ok(())
+}
+
 pub fn writev(fd: RawIO, bufs: &[IoSlice<'_>]) -> SysResult<CInt> {
     #[cfg(not(target_os = "linux"))]
     {
@@ -666,5 +760,104 @@ pub fn fcntl_set(fd: RawIO, flags: CInt) -> SysResult<CInt> {
     #[cfg(not(target_os = "linux"))]
     {
         sys_error!(ErrorKind::Unsupported, "unsupported operation")
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use curvine_runtime::common::Utils;
+    use std::fs::{remove_file, OpenOptions};
+    use std::io::Seek;
+    use std::os::unix::io::AsRawFd;
+
+    fn open_temp() -> (String, std::fs::File) {
+        let path = Utils::test_file();
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        (path, file)
+    }
+
+    #[test]
+    fn pread_pwrite_roundtrip_does_not_move_offset() {
+        let (path, mut file) = open_temp();
+        let fd = file.as_raw_fd();
+
+        pwrite_full(fd, b"hello world", 0).unwrap();
+        assert_eq!(file.stream_position().unwrap(), 0);
+
+        let mut buf = [0u8; 5];
+        assert_eq!(pread(fd, &mut buf, 6).unwrap(), 5);
+        assert_eq!(&buf, b"world");
+        assert_eq!(file.stream_position().unwrap(), 0);
+
+        pwrite_full(fd, b"RUST", 6).unwrap();
+        let mut got = [0u8; 11];
+        pread_full(fd, &mut got, 0).unwrap();
+        assert_eq!(&got, b"hello RUSTd");
+        assert_eq!(file.stream_position().unwrap(), 0);
+
+        remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn pread_may_return_short_at_eof() {
+        let (path, file) = open_temp();
+        let fd = file.as_raw_fd();
+        pwrite_full(fd, b"abc", 0).unwrap();
+
+        let mut buf = [0u8; 8];
+        assert_eq!(pread(fd, &mut buf, 0).unwrap(), 3);
+        assert_eq!(&buf[..3], b"abc");
+
+        remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn pread_full_reads_requested_length() {
+        let (path, file) = open_temp();
+        let fd = file.as_raw_fd();
+        pwrite_full(fd, &[1u8; 4096], 0).unwrap();
+        pwrite_full(fd, &[2u8; 100], 4096).unwrap();
+
+        let mut a = [0u8; 4096];
+        pread_full(fd, &mut a, 0).unwrap();
+        assert!(a.iter().all(|&x| x == 1));
+
+        let mut b = [0u8; 100];
+        pread_full(fd, &mut b, 4096).unwrap();
+        assert!(b.iter().all(|&x| x == 2));
+
+        remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn pread_full_eof_is_unexpected_eof() {
+        let (path, file) = open_temp();
+        let fd = file.as_raw_fd();
+        pwrite_full(fd, b"abc", 0).unwrap();
+
+        let mut buf = [0u8; 4];
+        let err = pread_full(fd, &mut buf, 0).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+
+        remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn pread_full_empty_buf_succeeds() {
+        let (path, file) = open_temp();
+        let fd = file.as_raw_fd();
+        pread_full(fd, &mut [], 0).unwrap();
+        pwrite_full(fd, &[], 0).unwrap();
+        remove_file(&path).unwrap();
     }
 }

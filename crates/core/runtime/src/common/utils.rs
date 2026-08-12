@@ -26,6 +26,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::{env, fs, panic, process, thread};
+use tokio_util::bytes::BytesMut;
 use uuid::Uuid;
 
 pub struct Utils;
@@ -68,6 +69,12 @@ impl Utils {
 
     pub fn murmur3(bytes: &[u8]) -> u32 {
         murmur3::murmur3_32(&mut Cursor::new(bytes), 104729).unwrap()
+    }
+
+    pub fn uninit_bytes_mut(len: usize) -> BytesMut {
+        let mut buf = BytesMut::with_capacity(len);
+        unsafe { buf.set_len(len) }
+        buf
     }
 
     pub fn crc32(buf: &[u8]) -> u32 {

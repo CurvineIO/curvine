@@ -14,6 +14,7 @@
 
 use parking_lot::{Mutex, RwLock};
 use std::ops::Deref;
+use std::sync::{Mutex as StdSyncMutex, RwLock as StdSyncRwLock};
 
 pub struct FastMutex<T>(Mutex<T>);
 
@@ -41,6 +42,46 @@ impl<T> FastRwLock<T> {
 
 impl<T> Deref for FastRwLock<T> {
     type Target = RwLock<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+pub struct StdMutex<T>(StdSyncMutex<T>);
+
+impl<T> StdMutex<T> {
+    pub fn new(t: T) -> Self {
+        StdMutex(StdSyncMutex::new(t))
+    }
+}
+
+impl<T> Deref for StdMutex<T> {
+    type Target = StdSyncMutex<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+pub struct StdRwLock<T>(StdSyncRwLock<T>);
+
+impl<T> StdRwLock<T> {
+    pub fn new(t: T) -> Self {
+        StdRwLock(StdSyncRwLock::new(t))
+    }
+
+    pub fn write(&self) -> std::sync::RwLockWriteGuard<'_, T> {
+        self.0.write().unwrap()
+    }
+
+    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, T> {
+        self.0.read().unwrap()
+    }
+}
+
+impl<T> Deref for StdRwLock<T> {
+    type Target = StdSyncRwLock<T>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
