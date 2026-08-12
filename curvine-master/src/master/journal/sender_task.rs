@@ -16,7 +16,7 @@ use super::journal_writer::JournalWriteRequest;
 use crate::master::journal::{JournalCommandBatch, JournalEntry};
 use crate::master::{Master, MasterMetrics};
 use curvine_config::JournalConf;
-use curvine_core_error::CommonResult;
+use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsResult;
 use curvine_raft::raft::RaftClient;
 use curvine_runtime::common::{LocalTime, TimeSpent};

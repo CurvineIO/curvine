@@ -683,14 +683,14 @@ mod tests {
             .expect("snapshot entry should be enqueued");
 
         match entry {
-            JournalEntry::Snapshot(entry) => {
+            JournalWriteRequest::Legacy(JournalEntry::Snapshot(entry)) => {
                 assert!(
                     Path::new(&entry.dir).exists(),
                     "checkpoint should remain after successful handoff: {}",
                     entry.dir
                 );
             }
-            other => panic!("expected snapshot entry, got {:?}", other),
+            _ => panic!("expected snapshot entry"),
         }
 
         Ok(())
