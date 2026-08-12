@@ -544,6 +544,10 @@ impl DecodedJournalBatch {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn into_commands(self) -> Vec<JournalCommand> {
         match self {
             DecodedJournalBatch::Legacy(batch) => batch
@@ -580,6 +584,10 @@ impl JournalCommandBatch {
 
     pub fn len(&self) -> usize {
         self.commands.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.commands.is_empty()
     }
 }
 
