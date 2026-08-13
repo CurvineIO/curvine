@@ -14,7 +14,7 @@
 
 use crate::master::fs::{BlockInodeState, DeleteResult};
 use crate::master::journal::{
-    CreateFileEntry, JournalEntry, JournalWriter, MetadataCommand, MkdirEntry,
+    CreateFileEntry, JournalEntry, JournalWriter, MetadataCommand, MkdirEntry, RenameEntry,
 };
 use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
@@ -473,6 +473,41 @@ impl FsDir {
             exchange_pre_swap_ids,
         )?;
         Ok(res)
+    }
+
+    pub(crate) fn prepare_rename_command(
+        &self,
+        src_inp: &InodePath,
+        dst_inp: &InodePath,
+        mtime: i64,
+        flags: RenameFlags,
+    ) -> FsResult<RenameEntry> {
+        if src_inp.get_last_inode().is_none() {
+            return err_ext!(FsError::file_not_found(src_inp.path()));
+        }
+        if dst_inp.get_last_inode().is_some() {
+            return err_box!(
+                "committed rename currently requires an absent destination: {}",
+                dst_inp.path()
+            );
+        }
+        if flags.exchange_mode() {
+            return err_box!("Rename failed, because exchange mode is not supported");
+        }
+        if dst_inp.get_inode(-2).is_none() {
+            return err_box!("Parent {} does not exist", dst_inp.get_parent_path());
+        }
+
+        Ok(RenameEntry {
+            op_id: self.next_op_id(),
+            rpc_id: 0,
+            src: src_inp.path().to_string(),
+            dst: dst_inp.path().to_string(),
+            mtime,
+            flags: flags.value(),
+            src_inode_id: 0,
+            dst_inode_id: 0,
+        })
     }
 
     pub(crate) fn unprotected_rename(

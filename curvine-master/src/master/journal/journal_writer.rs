@@ -29,16 +29,24 @@ use curvine_runtime::sync::channel::{BlockingChannel, BlockingReceiver, Blocking
 use curvine_runtime::sync::AtomicCounter;
 use log::{debug, info, warn};
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{mpsc, Mutex};
+
+// The legacy entry is the hot path. Keeping it inline avoids a heap allocation
+// for every normal journal write.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum JournalWriteRequest {
+    Legacy(JournalEntry),
+    Metadata(Vec<MetadataCommand>, mpsc::SyncSender<FsResult<()>>),
+}
 
 // Write metadata operation logs.
 pub struct JournalWriter {
     enable: bool,
     node_id: u64,
     client: RaftClient,
-    sender: BlockingSender<JournalEntry>,
+    sender: BlockingSender<JournalWriteRequest>,
     metrics: &'static MasterMetrics,
-    receiver: Option<Mutex<BlockingReceiver<JournalEntry>>>,
+    receiver: Option<Mutex<BlockingReceiver<JournalWriteRequest>>>,
     metadata_delta_log: Mutex<MetadataDeltaLog>,
 
     snapshot_entries: u64,
@@ -82,7 +90,7 @@ impl JournalWriter {
 
     fn send_inner(&self, entry: JournalEntry) -> FsResult<()> {
         debug!("send_entry {:?}", entry);
-        self.sender.send(entry)?;
+        self.sender.send(JournalWriteRequest::Legacy(entry))?;
         self.metrics.journal_queue_len.inc();
         Ok(())
     }
@@ -95,19 +103,67 @@ impl JournalWriter {
             return Ok(());
         }
 
+        if let Some(receiver) = self.receiver.as_ref() {
+            return self.commit_metadata_commands_for_test(receiver, commands);
+        }
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.sender
+            .send(JournalWriteRequest::Metadata(commands, tx))?;
+        self.metrics.journal_queue_len.inc();
+        match rx.recv() {
+            Ok(res) => res,
+            Err(e) => err_box!("metadata journal sender dropped response: {}", e),
+        }
+    }
+
+    fn commit_metadata_commands_for_test(
+        &self,
+        receiver: &Mutex<BlockingReceiver<JournalWriteRequest>>,
+        commands: Vec<MetadataCommand>,
+    ) -> FsResult<()> {
         let spend = TimeSpent::new();
         let seq_id = commands[0].op_id();
         let mut batch = JournalCommandBatch::new(seq_id);
+        let receiver = match receiver.lock() {
+            Ok(receiver) => receiver,
+            Err(e) => return err_box!("failed to lock journal test receiver: {}", e),
+        };
+        while let Ok(req) = receiver.try_recv() {
+            match req {
+                JournalWriteRequest::Legacy(entry) => {
+                    let force = matches!(entry, JournalEntry::Snapshot(_));
+                    self.metrics.journal_queue_len.dec();
+                    batch.push_legacy(entry);
+                    if force {
+                        self.propose_command_batch(&batch)?;
+                        self.metrics.journal_flush_count.inc();
+                        self.metrics
+                            .journal_flush_time
+                            .inc_by(spend.used_us() as i64);
+                        batch.next();
+                    }
+                }
+                JournalWriteRequest::Metadata(_, _) => {
+                    return err_box!("unexpected queued metadata command in test journal writer");
+                }
+            }
+        }
         for command in commands {
             batch.push_metadata(command);
         }
-        let bytes = JournalEnvelope::encode(batch)?;
-        self.client.block_on_send_propose(bytes)?;
+        self.propose_command_batch(&batch)?;
 
         self.metrics.journal_flush_count.inc();
         self.metrics
             .journal_flush_time
             .inc_by(spend.used_us() as i64);
+        Ok(())
+    }
+
+    pub(crate) fn propose_command_batch(&self, batch: &JournalCommandBatch) -> FsResult<()> {
+        let bytes = JournalEnvelope::encode(batch)?;
+        self.client.block_on_send_propose(bytes)?;
         Ok(())
     }
 
@@ -433,7 +489,8 @@ impl JournalWriter {
             index,
         };
         self.metrics.journal_queue_len.inc();
-        self.sender.send(JournalEntry::UfsApplied(entry))?;
+        self.sender
+            .send(JournalWriteRequest::Legacy(JournalEntry::UfsApplied(entry)))?;
 
         Ok(())
     }
@@ -462,7 +519,14 @@ impl JournalWriter {
             }
         };
         while let Ok(v) = receiver.try_recv() {
-            entries.push(v);
+            match v {
+                JournalWriteRequest::Legacy(entry) => entries.push(entry),
+                JournalWriteRequest::Metadata(_, ack) => {
+                    let _ = ack.send(err_box!(
+                        "unexpected queued metadata command while taking journal entries"
+                    ));
+                }
+            }
         }
         entries
     }
@@ -622,14 +686,14 @@ mod tests {
             .expect("snapshot entry should be enqueued");
 
         match entry {
-            JournalEntry::Snapshot(entry) => {
+            JournalWriteRequest::Legacy(JournalEntry::Snapshot(entry)) => {
                 assert!(
                     Path::new(&entry.dir).exists(),
                     "checkpoint should remain after successful handoff: {}",
                     entry.dir
                 );
             }
-            other => panic!("expected snapshot entry, got {:?}", other),
+            _ => panic!("expected snapshot entry"),
         }
 
         Ok(())

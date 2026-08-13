@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::journal::{JournalBatch, JournalEntry};
+use super::journal_writer::JournalWriteRequest;
+use crate::master::journal::{JournalCommandBatch, JournalEntry};
 use crate::master::{Master, MasterMetrics};
 use curvine_config::JournalConf;
-use curvine_core_error::CommonResult;
+use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsResult;
 use curvine_raft::raft::RaftClient;
-use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::sync::channel::BlockingReceiver;
 use std::sync::mpsc::RecvTimeoutError;
@@ -27,7 +27,7 @@ use std::time::Duration;
 
 pub struct SenderTask {
     pub(crate) client: RaftClient,
-    pub(crate) batch: JournalBatch,
+    pub(crate) batch: JournalCommandBatch,
     pub(crate) flush_batch_ms: u64,
     pub(crate) flush_batch_size: u64,
     pub(crate) last_flush_ms: u64,
@@ -38,7 +38,7 @@ impl SenderTask {
     pub fn new(client: RaftClient, conf: &JournalConf, batch_seq_id: u64) -> CommonResult<Self> {
         let sender = Self {
             client,
-            batch: JournalBatch::new(batch_seq_id),
+            batch: JournalCommandBatch::new(batch_seq_id),
             flush_batch_ms: conf.writer_flush_batch_ms,
             flush_batch_size: conf.writer_flush_batch_size,
             last_flush_ms: LocalTime::mills(),
@@ -49,7 +49,7 @@ impl SenderTask {
     }
 
     // Start a thread to execute sender task
-    pub fn spawn(self, receiver: BlockingReceiver<JournalEntry>) -> FsResult<()> {
+    pub(crate) fn spawn(self, receiver: BlockingReceiver<JournalWriteRequest>) -> FsResult<()> {
         let poll = Duration::from_millis(self.flush_batch_ms);
         let name = "journal-writer".to_string();
         let task = self;
@@ -63,7 +63,7 @@ impl SenderTask {
     }
 
     fn loop0(
-        receiver: BlockingReceiver<JournalEntry>,
+        receiver: BlockingReceiver<JournalWriteRequest>,
         poll: Duration,
         mut task: SenderTask,
     ) -> FsResult<()> {
@@ -81,12 +81,31 @@ impl SenderTask {
         }
     }
 
-    pub fn handle(&mut self, entry: Option<JournalEntry>) -> FsResult<()> {
-        let force = if let Some(v) = entry {
-            let force = matches!(v, JournalEntry::Snapshot(_));
-            self.batch.push(v);
-            self.metrics.journal_queue_len.dec();
-            force
+    pub(crate) fn handle(&mut self, req: Option<JournalWriteRequest>) -> FsResult<()> {
+        let force = if let Some(req) = req {
+            match req {
+                JournalWriteRequest::Legacy(entry) => {
+                    let force = matches!(entry, JournalEntry::Snapshot(_));
+                    self.batch.push_legacy(entry);
+                    self.metrics.journal_queue_len.dec();
+                    force
+                }
+                JournalWriteRequest::Metadata(commands, ack) => {
+                    for command in commands {
+                        self.batch.push_metadata(command);
+                    }
+                    self.metrics.journal_queue_len.dec();
+                    let res = self.flush_pending();
+                    let err = res.as_ref().err().map(ToString::to_string);
+                    if ack.send(res).is_err() {
+                        log::warn!("metadata journal receiver dropped response");
+                    }
+                    if let Some(err) = err {
+                        return err_box!("{}", err);
+                    }
+                    return Ok(());
+                }
+            }
         } else {
             false
         };
@@ -114,7 +133,7 @@ impl SenderTask {
 
         let spend = TimeSpent::new();
 
-        let bytes = SerdeUtils::serialize(&self.batch)?;
+        let bytes = crate::master::journal::JournalEnvelope::encode(&self.batch)?;
         self.client.block_on_send_propose(bytes)?;
 
         self.metrics.journal_flush_count.inc();

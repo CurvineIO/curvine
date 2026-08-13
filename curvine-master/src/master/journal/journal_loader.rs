@@ -687,6 +687,7 @@ impl JournalLoader {
                 Ok(())
             }
             MetadataCommand::CreateFile(entry) => self.create_file(entry.clone()),
+            MetadataCommand::Rename(entry) => self.rename(entry.clone()),
         }
     }
 
@@ -702,6 +703,11 @@ impl JournalLoader {
         match command {
             MetadataCommand::Mkdir(entry) => self.ufs_loader.mkdir(entry).await,
             MetadataCommand::CreateFile(_) => Ok(()),
+            MetadataCommand::Rename(entry) => {
+                self.ufs_loader
+                    .apply_entry(&JournalEntry::Rename(entry.clone()))
+                    .await
+            }
         }
     }
 

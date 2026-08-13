@@ -43,7 +43,7 @@ fn metadata_batch_is_applied_after_versioned_journal_upgrade() -> CommonResult<(
     let entry = Entry {
         term: 1,
         index: 1,
-        data: JournalEnvelope::encode(batch)?,
+        data: JournalEnvelope::encode(&batch)?,
         ..Default::default()
     };
 

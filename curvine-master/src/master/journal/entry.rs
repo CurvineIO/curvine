@@ -502,9 +502,9 @@ pub struct JournalEnvelope {
 }
 
 impl JournalEnvelope {
-    pub fn encode(batch: JournalCommandBatch) -> CommonResult<Vec<u8>> {
+    pub fn encode(batch: &JournalCommandBatch) -> CommonResult<Vec<u8>> {
         let mut bytes = JOURNAL_ENVELOPE_MAGIC.to_vec();
-        bytes.extend(SerdeUtils::serialize(&Self {
+        bytes.extend(SerdeUtils::serialize(&JournalEnvelopeRef {
             version: JOURNAL_ENVELOPE_VERSION,
             batch,
         })?);
@@ -529,6 +529,12 @@ impl JournalEnvelope {
         }
         Ok(DecodedJournalBatch::Versioned(envelope.batch))
     }
+}
+
+#[derive(Serialize)]
+struct JournalEnvelopeRef<'a> {
+    version: u16,
+    batch: &'a JournalCommandBatch,
 }
 
 pub enum DecodedJournalBatch {
@@ -605,6 +611,10 @@ impl JournalCommandBatch {
     pub fn is_empty(&self) -> bool {
         self.commands.is_empty()
     }
+    pub fn next(&mut self) {
+        self.seq_id += 1;
+        self.commands.clear();
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -647,6 +657,7 @@ impl JournalCommand {
 pub enum MetadataCommand {
     Mkdir(MkdirEntry),
     CreateFile(CreateFileEntry),
+    Rename(RenameEntry),
 }
 
 impl MetadataCommand {
@@ -658,6 +669,10 @@ impl MetadataCommand {
             MetadataCommand::CreateFile(entry) => {
                 vec![CvMetadataChange::single(entry.op_id, &entry.path)]
             }
+            MetadataCommand::Rename(entry) => vec![
+                CvMetadataChange::subtree(entry.op_id, &entry.src),
+                CvMetadataChange::subtree(entry.op_id, &entry.dst),
+            ],
         }
     }
 
@@ -665,6 +680,7 @@ impl MetadataCommand {
         match self {
             MetadataCommand::Mkdir(entry) => entry.op_id,
             MetadataCommand::CreateFile(entry) => entry.op_id,
+            MetadataCommand::Rename(entry) => entry.op_id,
         }
     }
 
@@ -672,6 +688,7 @@ impl MetadataCommand {
         match self {
             MetadataCommand::Mkdir(entry) => entry.rpc_id,
             MetadataCommand::CreateFile(entry) => entry.rpc_id,
+            MetadataCommand::Rename(entry) => entry.rpc_id,
         }
     }
 
@@ -679,6 +696,7 @@ impl MetadataCommand {
         match self {
             MetadataCommand::Mkdir(entry) => Some(entry.dir.id),
             MetadataCommand::CreateFile(entry) => Some(entry.file.id),
+            MetadataCommand::Rename(_) => None,
         }
     }
 
