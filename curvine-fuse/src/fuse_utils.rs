@@ -45,6 +45,8 @@ pub enum XattrOp {
 pub struct FuseUtils;
 
 impl FuseUtils {
+    const CAP_FSETID: u32 = 4;
+
     /// Reinterpret a value as its raw bytes for writing to the FUSE device.
     ///
     /// SAFETY / usage contract: `T` MUST be a FUSE C-ABI (`#[repr(C)]`) struct.
@@ -259,13 +261,9 @@ impl FuseUtils {
         name == FUSE_PARENT_DIR || name == FUSE_CURRENT_DIR
     }
 
-    pub fn create_opts(op: &Create<'_>, fs: &UnifiedFileSystem) -> CreateFileOpts {
+    pub fn create_opts(op: &Create<'_>, fs: &UnifiedFileSystem, mode: u32) -> CreateFileOpts {
         CreateFileOptsBuilder::with_conf(&fs.conf().client)
-            .acl(
-                op.header.uid,
-                op.header.gid,
-                op.arg.mode & 0o7777 & !op.arg.umask,
-            )
+            .acl(op.header.uid, op.header.gid, mode)
             .build()
     }
 
@@ -550,8 +548,8 @@ impl FuseUtils {
         op: &MkNod<'_>,
         fs: &UnifiedFileSystem,
         file_type: FileType,
+        mode: u32,
     ) -> CreateFileOpts {
-        let mode = op.arg.mode & 0o7777 & !op.arg.umask;
         CreateFileOptsBuilder::with_conf(&fs.conf().client)
             .file_type(file_type)
             .acl(op.header.uid, op.header.gid, mode)
@@ -634,6 +632,47 @@ impl FuseUtils {
         }
 
         Self::caller_supplementary_groups(pid).contains(&file_gid)
+    }
+
+    /// Whether the FUSE requester has an effective Linux capability.
+    pub fn caller_has_effective_capability(pid: u32, capability: u32) -> bool {
+        if pid == 0 || capability >= u64::BITS {
+            return false;
+        }
+
+        let status_path = format!("/proc/{pid}/status");
+        let Ok(content) = std::fs::read_to_string(status_path) else {
+            return false;
+        };
+
+        content
+            .lines()
+            .find_map(|line| line.strip_prefix("CapEff:"))
+            .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+            .is_some_and(|effective| effective & (1_u64 << capability) != 0)
+    }
+
+    /// Apply Linux file-creation ordering: decide whether setgid is authorized from
+    /// the requested mode, then apply the request umask to the persisted mode.
+    pub fn normalize_create_mode(
+        requested_mode: u32,
+        umask: u32,
+        caller_in_created_group: bool,
+        has_cap_fsetid: bool,
+    ) -> u32 {
+        let requested_mode = requested_mode & 0o7777;
+        let mut mode = requested_mode & !umask;
+        let requested_setgid_exec = requested_mode & (libc::S_ISGID as u32 | libc::S_IXGRP as u32)
+            == (libc::S_ISGID as u32 | libc::S_IXGRP as u32);
+
+        if requested_setgid_exec && !caller_in_created_group && !has_cap_fsetid {
+            mode &= !(libc::S_ISGID as u32);
+        }
+        mode
+    }
+
+    pub fn caller_has_cap_fsetid(pid: u32) -> bool {
+        Self::caller_has_effective_capability(pid, Self::CAP_FSETID)
     }
 
     /// Apply Linux chmod/fchmod security rules for special mode bits. For non-root
@@ -951,6 +990,42 @@ mod tests {
     fn normalize_chmod_mode_allows_special_bits_for_root() {
         let mode = FuseUtils::normalize_chmod_mode(0o4777, 0, false);
         assert_eq!(mode, 0o4777);
+    }
+
+    #[test]
+    fn normalize_create_mode_strips_setgid_for_unprivileged_non_member() {
+        assert_eq!(
+            FuseUtils::normalize_create_mode(0o2010, 0, false, false),
+            0o0010
+        );
+    }
+
+    #[test]
+    fn normalize_create_mode_checks_group_exec_before_applying_umask() {
+        assert_eq!(
+            FuseUtils::normalize_create_mode(0o2010, 0o0010, false, false),
+            0o0000
+        );
+    }
+
+    #[test]
+    fn normalize_create_mode_preserves_setgid_for_group_member_or_capability() {
+        assert_eq!(
+            FuseUtils::normalize_create_mode(0o2010, 0, true, false),
+            0o2010
+        );
+        assert_eq!(
+            FuseUtils::normalize_create_mode(0o2010, 0, false, true),
+            0o2010
+        );
+    }
+
+    #[test]
+    fn normalize_create_mode_preserves_non_executable_setgid() {
+        assert_eq!(
+            FuseUtils::normalize_create_mode(0o2000, 0, false, false),
+            0o2000
+        );
     }
 
     #[test]

@@ -58,6 +58,35 @@ pub struct CurvineFileSystem {
 }
 
 impl CurvineFileSystem {
+    async fn normalize_file_creation_mode(
+        &self,
+        header: &fuse_in_header,
+        requested_mode: u32,
+        umask: u32,
+    ) -> FuseResult<u32> {
+        let requested_setgid_exec = requested_mode & (libc::S_ISGID as u32 | libc::S_IXGRP as u32)
+            == (libc::S_ISGID as u32 | libc::S_IXGRP as u32);
+        if !requested_setgid_exec {
+            return Ok(requested_mode & 0o7777 & !umask);
+        }
+
+        let parent = self.state.fs_stat(header.nodeid, None).await?;
+        let created_gid = if parent.mode & libc::S_ISGID as u32 != 0 {
+            self.resolve_file_gid(&parent.group)
+        } else {
+            header.gid
+        };
+        let caller_in_created_group =
+            FuseUtils::caller_in_file_group(header.gid, created_gid, header.pid);
+
+        Ok(FuseUtils::normalize_create_mode(
+            requested_mode,
+            umask,
+            caller_in_created_group,
+            FuseUtils::caller_has_cap_fsetid(header.pid),
+        ))
+    }
+
     fn is_ofd_lock_pid(pid: u32) -> bool {
         // FUSE kernels have used both 0 and -1 for the pid of an OFD lock.
         pid == 0 || pid == u32::MAX
@@ -1674,7 +1703,10 @@ impl fs::FileSystem for CurvineFileSystem {
         self.ensure_writable_path(&path, RpcCode::CreateFile)
             .await?;
 
-        let opts = FuseUtils::create_opts(&op, &self.fs);
+        let mode = self
+            .normalize_file_creation_mode(op.header, op.arg.mode, op.arg.umask)
+            .await?;
+        let opts = FuseUtils::create_opts(&op, &self.fs, mode);
         let handle = self.state.fs_create(ino, name, op.arg.flags, opts).await?;
         let attr = FuseUtils::status_to_attr(&self.conf, &handle.status())?;
 
@@ -2100,7 +2132,10 @@ impl fs::FileSystem for CurvineFileSystem {
             let path = self.state.get_path_name(op.header.nodeid, name)?;
             self.ensure_writable_path(&path, RpcCode::CreateFile)
                 .await?;
-            let opts = FuseUtils::mknod_opts(&op, &self.fs, file_type);
+            let mode = self
+                .normalize_file_creation_mode(op.header, op.arg.mode, op.arg.umask)
+                .await?;
+            let opts = FuseUtils::mknod_opts(&op, &self.fs, file_type, mode);
             self.fs.create_special_node(&path, opts).await?;
             let attr = self.state.lookup_common(op.header.nodeid, name).await?;
             Ok(FuseUtils::create_entry_out(&self.conf, attr))
