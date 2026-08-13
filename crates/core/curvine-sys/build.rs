@@ -97,6 +97,42 @@ fn emit_git_rerun_if_changed() {
     if let Some(packed_refs) = git_path("packed-refs") {
         println!("cargo:rerun-if-changed={}", packed_refs.display());
     }
+
+    // `GIT_DESCRIBE` also depends on tags. Loose tags are not covered by the
+    // HEAD/packed-refs watches: creating, moving, or deleting a local tag
+    // changes `git describe` output without touching those files. Watch the
+    // `refs/tags` directory (mtime covers create/move/delete) and every
+    // currently loose tag file (covers `git tag -f` content rewrites).
+    if let Some(tags_dir) = git_path("refs/tags") {
+        println!("cargo:rerun-if-changed={}", tags_dir.display());
+    }
+    for tag in list_loose_tags() {
+        if let Some(tag_path) = git_path(&format!("refs/tags/{}", tag)) {
+            println!("cargo:rerun-if-changed={}", tag_path.display());
+        }
+    }
+}
+
+/// Names of the tags currently stored under `refs/tags`. Empty when git is
+/// unavailable or the command fails.
+fn list_loose_tags() -> Vec<String> {
+    let output = match Command::new("git")
+        .args(["for-each-ref", "--format=%(refname:short)", "refs/tags"])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+    let stdout = match str::from_utf8(&output.stdout) {
+        Ok(stdout) => stdout,
+        Err(_) => return Vec::new(),
+    };
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn git_path(path: &str) -> Option<PathBuf> {

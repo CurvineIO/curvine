@@ -421,6 +421,15 @@ fn parse_git_describe(input: &str) -> Result<ReleaseVersion, VersionParseError> 
         .or_else(|| raw.strip_prefix('V'))
         .unwrap_or(raw);
 
+    // `git describe --dirty` appends `-dirty` when the working tree has
+    // uncommitted changes. The suffix can follow any form: a tag, a
+    // tag+commit-count string, or a bare short commit when no tags are
+    // available (`26b5dc6b-dirty`), so strip it before any shape detection.
+    let (s, dirty) = match s.strip_suffix("-dirty") {
+        Some(stripped) => (stripped, true),
+        None => (s, false),
+    };
+
     // No tags: `dev-g<commit>` or a bare short commit (git describe --always).
     if let Some(commit) = s.strip_prefix("dev-") {
         if commit.is_empty() {
@@ -431,7 +440,7 @@ fn parse_git_describe(input: &str) -> Result<ReleaseVersion, VersionParseError> 
             0,
             0,
             vec![PreRelease::Alpha("dev".into())],
-            Some(commit.to_string()),
+            dirty_build(Some(commit.to_string()), dirty),
         ));
     }
     if is_short_commit(s) {
@@ -440,7 +449,7 @@ fn parse_git_describe(input: &str) -> Result<ReleaseVersion, VersionParseError> 
             0,
             0,
             vec![PreRelease::Alpha("dev".into())],
-            Some(format!("g{}", s)),
+            dirty_build(Some(format!("g{}", s)), dirty),
         ));
     }
 
@@ -448,13 +457,6 @@ fn parse_git_describe(input: &str) -> Result<ReleaseVersion, VersionParseError> 
         VersionParseError::new(input, "expected <major>.<minor>.<patch> at the start")
     })?;
     let (major, minor, patch) = core;
-
-    let mut rest = rest;
-    let mut dirty = false;
-    if let Some(stripped) = rest.strip_suffix("-dirty") {
-        rest = stripped;
-        dirty = true;
-    }
 
     if rest.is_empty() {
         return Ok(ReleaseVersion::new(
@@ -746,6 +748,17 @@ mod tests {
     }
 
     #[test]
+    fn git_describe_bare_commit_with_dirty_suffix() {
+        // `git describe --always --dirty` without tags returns a bare short
+        // commit with a `-dirty` suffix; it must still resolve to a version
+        // instead of silently falling back to 0.0.0-dev.
+        let v = ReleaseVersion::from_git_describe("26b5dc6b-dirty").unwrap();
+        assert_eq!(v.to_string(), "0.0.0-dev+g26b5dc6b.dirty");
+        let dev = ReleaseVersion::from_git_describe("dev-g26b5dc6b-dirty").unwrap();
+        assert_eq!(dev.to_string(), "0.0.0-dev+g26b5dc6b.dirty");
+    }
+
+    #[test]
     fn git_describe_versions_compare_like_semver() {
         let on_tag = ReleaseVersion::from_git_describe("v0.4.0-alpha").unwrap();
         let after = ReleaseVersion::from_git_describe("v0.4.0-alpha-121-g26b5dc6b").unwrap();
@@ -762,9 +775,15 @@ mod tests {
     #[test]
     fn git_describe_captured_at_build_time_is_parseable() {
         let raw = git_describe();
-        // Built inside a git checkout: the value must be non-empty and
-        // parseable (either a tagged form or a bare commit).
-        assert!(!raw.is_empty(), "GIT_DESCRIBE should be captured");
+        // Outside a git checkout (or when git is unavailable) build.rs falls
+        // back to the literal "unknown"; the runtime helper must then fall
+        // back to 0.0.0-dev instead of failing.
+        if raw.is_empty() || raw == "unknown" {
+            assert_eq!(git_describe_version().to_string(), "0.0.0-dev");
+            return;
+        }
+        // Built inside a git checkout: the value must be parseable (a tagged
+        // form, a bare commit, or any of those with a `-dirty` suffix).
         assert!(parse_git_describe(&raw).is_ok(), "unparseable: {}", raw);
     }
 
