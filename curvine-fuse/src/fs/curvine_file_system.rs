@@ -1743,7 +1743,13 @@ impl fs::FileSystem for CurvineFileSystem {
         // lock_owner on almost every FUSE_FLUSH/close; unconditional unlock
         // caused a Master SetLock+journal storm for Spark local-dirs (#1227).
         if op.arg.lock_owner != 0 && handle.take_plock_if_owner(op.arg.lock_owner).is_some() {
-            let path = Path::from_str(&handle.status().path)?;
+            let path = match Path::from_str(&handle.status().path) {
+                Ok(path) => path,
+                Err(e) => {
+                    handle.add_lock(LockFlags::Plock, op.arg.lock_owner);
+                    return Err(e.into());
+                }
+            };
             let _guard = self.state.lock_path(&path).await;
             if let Err(e) = self
                 .fs_unlock_owner(&handle, LockFlags::Plock, op.arg.lock_owner)
