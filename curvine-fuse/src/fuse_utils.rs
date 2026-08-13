@@ -44,6 +44,22 @@ pub enum XattrOp {
 
 pub struct FuseUtils;
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct CallerProcessStatus {
+    supplementary_groups: Vec<u32>,
+    effective_capabilities: u64,
+}
+
+impl CallerProcessStatus {
+    pub(crate) fn in_group(&self, effective_gid: u32, file_gid: u32) -> bool {
+        effective_gid == file_gid || self.supplementary_groups.contains(&file_gid)
+    }
+
+    pub(crate) fn has_effective_capability(&self, capability: u32) -> bool {
+        capability < u64::BITS && self.effective_capabilities & (1_u64 << capability) != 0
+    }
+}
+
 impl FuseUtils {
     const CAP_FSETID: u32 = 4;
 
@@ -634,22 +650,42 @@ impl FuseUtils {
         Self::caller_supplementary_groups(pid).contains(&file_gid)
     }
 
-    /// Whether the FUSE requester has an effective Linux capability.
-    pub fn caller_has_effective_capability(pid: u32, capability: u32) -> bool {
-        if pid == 0 || capability >= u64::BITS {
-            return false;
+    fn parse_caller_process_status(content: &str) -> CallerProcessStatus {
+        let mut status = CallerProcessStatus::default();
+        for line in content.lines() {
+            if let Some(groups) = line.strip_prefix("Groups:") {
+                status.supplementary_groups = groups
+                    .split_whitespace()
+                    .filter_map(|gid| gid.parse::<u32>().ok())
+                    .collect();
+            } else if let Some(capabilities) = line.strip_prefix("CapEff:") {
+                status.effective_capabilities =
+                    u64::from_str_radix(capabilities.trim(), 16).unwrap_or_default();
+            }
+        }
+        status
+    }
+
+    /// Read all process credentials needed by create authorization without blocking
+    /// an async FUSE executor thread. Missing or malformed fields fail closed.
+    pub(crate) async fn caller_process_status(pid: u32) -> CallerProcessStatus {
+        if pid == 0 {
+            return CallerProcessStatus::default();
         }
 
         let status_path = format!("/proc/{pid}/status");
-        let Ok(content) = std::fs::read_to_string(status_path) else {
-            return false;
-        };
+        match tokio::fs::read_to_string(status_path).await {
+            Ok(content) => Self::parse_caller_process_status(&content),
+            Err(_) => CallerProcessStatus::default(),
+        }
+    }
 
-        content
-            .lines()
-            .find_map(|line| line.strip_prefix("CapEff:"))
-            .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
-            .is_some_and(|effective| effective & (1_u64 << capability) != 0)
+    /// Resolve a stored numeric GID or group name without a configuration fallback.
+    pub fn resolve_group_gid(group: &str) -> Option<u32> {
+        group
+            .parse::<u32>()
+            .ok()
+            .or_else(|| sys::get_gid_by_name(group))
     }
 
     /// Apply Linux file-creation ordering: decide whether setgid is authorized from
@@ -671,8 +707,8 @@ impl FuseUtils {
         mode
     }
 
-    pub fn caller_has_cap_fsetid(pid: u32) -> bool {
-        Self::caller_has_effective_capability(pid, Self::CAP_FSETID)
+    pub(crate) fn caller_has_cap_fsetid(status: &CallerProcessStatus) -> bool {
+        status.has_effective_capability(Self::CAP_FSETID)
     }
 
     /// Apply Linux chmod/fchmod security rules for special mode bits. For non-root
@@ -966,6 +1002,34 @@ mod tests {
         if let Some(&gid) = groups.first() {
             assert!(FuseUtils::caller_in_file_group(0, gid, pid));
         }
+    }
+
+    #[test]
+    fn parse_caller_process_status_reads_groups_and_capabilities_once() {
+        let status = FuseUtils::parse_caller_process_status(
+            "Name:\ttest\nGroups:\t10 20 30\nCapEff:\t0000000000000010\n",
+        );
+
+        assert!(status.in_group(1, 20));
+        assert!(!status.in_group(1, 40));
+        assert!(FuseUtils::caller_has_cap_fsetid(&status));
+    }
+
+    #[test]
+    fn parse_caller_process_status_fails_closed_for_missing_fields() {
+        let status = FuseUtils::parse_caller_process_status("Name:\ttest\n");
+
+        assert!(!status.in_group(1, 20));
+        assert!(!FuseUtils::caller_has_cap_fsetid(&status));
+    }
+
+    #[test]
+    fn resolve_group_gid_has_no_configuration_fallback() {
+        assert_eq!(FuseUtils::resolve_group_gid("12345"), Some(12345));
+        assert_eq!(
+            FuseUtils::resolve_group_gid("curvine-review-group-that-does-not-exist"),
+            None
+        );
     }
 
     #[test]

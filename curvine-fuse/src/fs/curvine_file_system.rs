@@ -72,18 +72,19 @@ impl CurvineFileSystem {
 
         let parent = self.state.fs_stat(header.nodeid, None).await?;
         let created_gid = if parent.mode & libc::S_ISGID as u32 != 0 {
-            self.resolve_file_gid(&parent.group)
+            FuseUtils::resolve_group_gid(&parent.group)
         } else {
-            header.gid
+            Some(header.gid)
         };
+        let caller_status = FuseUtils::caller_process_status(header.pid).await;
         let caller_in_created_group =
-            FuseUtils::caller_in_file_group(header.gid, created_gid, header.pid);
+            created_gid.is_some_and(|gid| caller_status.in_group(header.gid, gid));
 
         Ok(FuseUtils::normalize_create_mode(
             requested_mode,
             umask,
             caller_in_created_group,
-            FuseUtils::caller_has_cap_fsetid(header.pid),
+            FuseUtils::caller_has_cap_fsetid(&caller_status),
         ))
     }
 
