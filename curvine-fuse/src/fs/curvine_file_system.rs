@@ -799,7 +799,9 @@ impl CurvineFileSystem {
         Self::permission_mask_allows(permission_bits, mask)
     }
 
-    /// True when normalized chown targets differ from the file's current uid/gid.
+    /// True when a normalized chown target actually changes uid and/or gid.
+    /// Kept for unit tests documenting value-inequality vs FATTR presence (#1547 leftover).
+    #[cfg(test)]
     fn chown_effectively_changes(
         target_uid: Option<u32>,
         target_gid: Option<u32>,
@@ -809,15 +811,27 @@ impl CurvineFileSystem {
         target_uid.is_some_and(|u| u != file_uid) || target_gid.is_some_and(|g| g != file_gid)
     }
 
+    /// Whether chown/fchown/lchown should clear setuid/setgid on a regular file.
+    ///
+    /// Per Linux `chown(2)`, any chown clears SUID (and SGID when group-executable),
+    /// including same-id (LTP chown02) and `-1` sentinels. Gate on raw FUSE `valid` bits.
+    ///
+    /// `valid == 0` covers `chown(-1,-1)` under `FUSE_HANDLE_KILLPRIV`: kernel strips
+    /// ATTR_KILL_* without setting FATTR_UID/GID, so userspace sees empty valid.
+    ///
+    /// SGID without group-exec (mandatory lock) is preserved by the caller.
+    fn chown_should_clear_setid_bits(valid: u32) -> bool {
+        (valid & (FATTR_UID | FATTR_GID)) != 0 || valid == 0
+    }
+
     /// POSIX permission model for SETATTR issued by a non-root caller.
     ///
     /// `target_uid`/`target_gid` are the *normalized* chown targets: the caller is expected
     /// to have already dropped the `(uid_t)-1` / `(gid_t)-1` "keep current" sentinels to
     /// `None` (see `CurvineFileSystem::set_attr`). Therefore a `Some(_)` here means the FATTR
     /// bit is set and the value is not the (uid_t/gid_t)-1 sentinel; it may still equal the
-    /// current id and be a no-op for the suid/sgid side effect (see
-    /// `chown_effectively_changes`). We no longer need to inspect the raw
-    /// FATTR_UID/FATTR_GID bits or special-case `u32::MAX`.
+    /// current id and be a no-op ownership change (see `chown_effectively_changes`).
+    /// Setuid/setgid clearing uses `chown_should_clear_setid_bits` on raw `valid`.
     fn check_setattr_permission(
         check_permission: bool,
         header: &fuse_in_header,
@@ -1441,9 +1455,8 @@ impl fs::FileSystem for CurvineFileSystem {
             }
         }
 
-        // Clear setuid/setgid only when uid/gid actually change (not same-id no-ops).
-        let chown_effective =
-            Self::chown_effectively_changes(target_uid, target_gid, file_uid, file_gid);
+        // Clear setuid/setgid on chown (FATTR_UID/GID, or valid==0 for chown(-1,-1)).
+        let chown_effective = Self::chown_should_clear_setid_bits(op.arg.valid);
         if chown_effective && cur_status.file_type == FileType::File {
             let mut new_mode = if let Some(mode) = opts.mode {
                 mode
@@ -2779,6 +2792,27 @@ mod tests {
             1000,
             100
         ));
+    }
+
+    /// LTP chown02 / #1567: dual-target same-owner still presents both FATTR bits.
+    #[test]
+    fn chown_should_clear_setid_bits_for_explicit_same_owner_chown02() {
+        use super::CurvineFileSystem as CFS;
+        assert!(CFS::chown_should_clear_setid_bits(FATTR_UID | FATTR_GID));
+    }
+
+    /// Linux matrix under HANDLE_KILLPRIV: UID/GID FATTR clear; empty valid is chown(-1,-1).
+    #[test]
+    fn chown_should_clear_setid_bits_on_any_fattr_uid_or_gid() {
+        use super::CurvineFileSystem as CFS;
+        assert!(CFS::chown_should_clear_setid_bits(FATTR_GID));
+        assert!(CFS::chown_should_clear_setid_bits(FATTR_UID));
+        assert!(CFS::chown_should_clear_setid_bits(FATTR_UID | FATTR_GID));
+        // chown(-1,-1) under killpriv → valid==0
+        assert!(CFS::chown_should_clear_setid_bits(0));
+        // mode-only / time-only setattr is not a chown
+        assert!(!CFS::chown_should_clear_setid_bits(FATTR_MODE));
+        assert!(!CFS::chown_should_clear_setid_bits(FATTR_MTIME));
     }
 
     /// pjdfstest chown/00.t regression: owner may keep uid unchanged and move gid to a

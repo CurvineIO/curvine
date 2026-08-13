@@ -190,6 +190,7 @@ pub const SUPPORTED_INIT_FLAGS: u32 = FUSE_ASYNC_READ
     | FUSE_SPLICE_READ
     | FUSE_DONT_MASK
     | FUSE_PARALLEL_DIROPS
+    // Keep KILLPRIV: chown(-1,-1) arrives as valid==0; set_attr clears set-id there.
     | FUSE_HANDLE_KILLPRIV
     | FUSE_ABORT_ERROR
     | FUSE_CACHE_SYMLINKS
