@@ -819,8 +819,10 @@ impl CurvineFileSystem {
     /// to have already dropped the `(uid_t)-1` / `(gid_t)-1` "keep current" sentinels to
     /// `None` (see `CurvineFileSystem::set_attr`). Therefore a `Some(_)` here means the FATTR
     /// bit is set and the value is not the (uid_t/gid_t)-1 sentinel; it may still equal the
-    /// current id and be a no-op for the suid/sgid side effect (see
-    /// `chown_effectively_changes`). We no longer need to inspect the raw
+    /// current id and be a no-op ownership change (see `chown_effectively_changes`).
+    /// Setuid/setgid clearing is governed separately: explicit dual-target chown clears even
+    /// when ids are unchanged, while partial single-target chown does not (see
+    /// `chown_should_clear_setid_bits`). We no longer need to inspect the raw
     /// FATTR_UID/FATTR_GID bits or special-case `u32::MAX`.
     fn check_setattr_permission(
         check_permission: bool,
