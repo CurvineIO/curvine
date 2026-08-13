@@ -28,7 +28,8 @@ use curvine_runtime::common::{FileUtils, Logger, TimeSpent, Utils};
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::{
-    JournalBatch, JournalEntry, JournalLoader, JournalSystem, UfsLoader,
+    JournalBatch, JournalCommandBatch, JournalEntry, JournalEnvelope, JournalLoader, JournalSystem,
+    UfsLoader,
 };
 use curvine_server::master::{Master, MountManager};
 use log::info;
@@ -190,6 +191,50 @@ fn follower_replay_rejects_duplicate_allocated_inode_id() -> CommonResult<()> {
     assert!(err
         .to_string()
         .contains("refusing duplicate inode allocation during follower replay"));
+    Ok(())
+}
+
+#[test]
+fn replay_accepts_versioned_legacy_journal_batch() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let mut source_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    source_conf.change_test_meta_dir(format!("versioned-source-{}", Utils::rand_str(6)));
+    let source_fs = JournalSystem::fs_only_for_test(&source_conf)?;
+    source_fs.mkdir("/versioned-legacy", false)?;
+    let entry = source_fs
+        .fs_dir
+        .read()
+        .take_entries()
+        .into_iter()
+        .next()
+        .expect("mkdir must emit a journal entry");
+
+    let mut target_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    target_conf.change_test_meta_dir(format!("versioned-target-{}", Utils::rand_str(6)));
+    let target = JournalSystem::from_conf(&target_conf)?;
+    let target_fs = target.fs();
+    let loader = target.journal_loader();
+
+    let mut batch = JournalCommandBatch::new(1);
+    batch.push_legacy(entry);
+    let raft_entry = Entry {
+        term: 1,
+        index: 1,
+        data: JournalEnvelope::encode(batch)?,
+        ..Default::default()
+    };
+
+    AsyncRuntime::single()
+        .block_on(async { loader.apply(true, ApplyMsg::new_entry(raft_entry)).await })?;
+
+    assert!(target_fs.file_status("/versioned-legacy").is_ok());
     Ok(())
 }
 
