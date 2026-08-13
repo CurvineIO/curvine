@@ -256,6 +256,19 @@ impl JournalLoader {
 
             {
                 let fs_dir = self.fs_dir.read();
+                if !is_leader {
+                    if let Some(inode_id) = op_entry.allocated_inode_id() {
+                        let last_inode_id = fs_dir.last_inode_id();
+                        if inode_id <= last_inode_id {
+                            return err_box!(
+                                "refusing duplicate inode allocation during follower replay: inode_id={}, last_inode_id={}, journal={:?}",
+                                inode_id,
+                                last_inode_id,
+                                op_entry
+                            );
+                        }
+                    }
+                }
                 fs_dir.update_op_id(op_entry.op_id());
                 if let Some(inode_id) = op_entry.inode_id() {
                     fs_dir.update_last_inode_id(inode_id)?;
@@ -305,7 +318,7 @@ impl JournalLoader {
         skip_ufs_error: bool,
     ) -> CommonResult<()> {
         match msg {
-            ApplyMsg::Entry(entry) => {
+            ApplyMsg::Entry(entry) | ApplyMsg::EntryWithAck((entry, _)) => {
                 self.apply0(is_leader, entry, skip_ufs_error).await?;
                 Ok(())
             }
@@ -350,6 +363,30 @@ impl JournalLoader {
         }
     }
 
+    fn complete_entry_ack(msg: ApplyMsg, result: RaftResult<()>) {
+        if let ApplyMsg::EntryWithAck((_, tx)) = msg {
+            if let Err(e) = tx.send(result) {
+                warn!("send journal entry apply acknowledgement failed: {}", e);
+            }
+        }
+    }
+
+    async fn catch_up_committed_metadata(&self) -> RaftResult<()> {
+        let committed = self.log_store.hard_state().commit;
+        let applied = self.fsm_state_snapshot()?.applied;
+        self.apply_msg(false, &ApplyMsg::new_scan(applied), false)
+            .await?;
+
+        let metadata_applied = self.fsm_state_snapshot()?.applied.index;
+        if metadata_applied < committed {
+            return err_box!(
+                "metadata catch-up stopped before committed raft index: applied={}, commit={}",
+                metadata_applied,
+                committed
+            );
+        }
+        Ok(())
+    }
     async fn next_apply_msg(
         &self,
         receiver: &mut AsyncReceiver<ApplyMsg>,
@@ -390,20 +427,25 @@ impl JournalLoader {
                     retry_num = 0;
                 }
 
-                ApplyMsg::RoleChange(role) => {
-                    is_leader = role == StateRole::Leader;
-                    if is_leader {
-                        let ufs_applied = match self.get_ufs_applied() {
-                            Ok(ufs_applied) => ufs_applied,
-                            Err(e) => {
-                                Self::abort_on_fatal_apply_error(format!(
-                                    "failed to read fsm_state after leader role change: {}",
-                                    e
-                                ));
-                            }
-                        };
-                        info!("role changed to leader, scheduling UFS replay scan from ufs_applied: {:?}", ufs_applied);
-                        retry_msg.replace(ApplyMsg::new_scan(ufs_applied));
+                ApplyMsg::RoleChange((role, tx)) => {
+                    let result = async {
+                        if role == StateRole::Leader {
+                            // Publish leadership only after committed namespace mutations
+                            // have advanced local metadata high-water marks.
+                            self.catch_up_committed_metadata().await?;
+                            is_leader = true;
+                            let ufs_applied = self.get_ufs_applied()?;
+                            info!("metadata caught up for leader promotion, scheduling UFS replay from {:?}", ufs_applied);
+                            retry_msg.replace(ApplyMsg::new_scan(ufs_applied));
+                        } else {
+                            is_leader = false;
+                        }
+                        Ok(())
+                    }
+                    .await;
+
+                    if tx.send(result).is_err() {
+                        warn!("leader role-change acknowledgement receiver dropped");
                     }
                 }
 
@@ -413,11 +455,15 @@ impl JournalLoader {
                 }
 
                 msg => match self.apply_msg(is_leader, &msg, false).await {
-                    Ok(_) => retry_num = 0,
+                    Ok(_) => {
+                        retry_num = 0;
+                        Self::complete_entry_ack(msg, Ok(()));
+                    }
 
                     Err(error) => {
                         if self.ignore_reply_error {
                             error!("apply entry failed(skip): {}", error);
+                            Self::complete_entry_ack(msg, Ok(()));
                         } else if is_leader {
                             retry_num += 1;
 
@@ -427,7 +473,7 @@ impl JournalLoader {
                                         "apply entry failed(retry_num={}), skipping failed UFS replay to keep master alive: {}",
                                         retry_num, error
                                     );
-                                    let continue_scan = matches!(msg, ApplyMsg::Scan(_));
+                                    let continue_scan = matches!(&msg, ApplyMsg::Scan(_));
                                     if let Err(skip_error) =
                                         self.apply_msg(is_leader, &msg, true).await
                                     {
@@ -439,6 +485,8 @@ impl JournalLoader {
                                     retry_num = 0;
                                     if continue_scan {
                                         retry_msg.replace(msg);
+                                    } else {
+                                        Self::complete_entry_ack(msg, Ok(()));
                                     }
                                 } else {
                                     Self::abort_on_fatal_apply_error(format!(
@@ -891,25 +939,45 @@ impl JournalLoader {
         rx.receive().await?;
         Ok(())
     }
+
+    async fn apply_direct(&self, msg: ApplyMsg) -> RaftResult<()> {
+        let result = if let Err(e) = self.apply_msg(false, &msg, false).await {
+            if self.ignore_reply_error {
+                error!("apply entry failed: {}", e);
+                Ok(())
+            } else {
+                Err(e.into())
+            }
+        } else {
+            Ok(())
+        };
+
+        if matches!(&msg, ApplyMsg::EntryWithAck(_)) {
+            Self::complete_entry_ack(msg, result);
+            Ok(())
+        } else {
+            result
+        }
+    }
 }
 
 impl AppStorage for JournalLoader {
     async fn apply(&self, wait: bool, msg: ApplyMsg) -> RaftResult<()> {
-        if wait || !self.has_apply_worker {
-            if let Err(e) = self.apply_msg(false, &msg, false).await {
-                if self.ignore_reply_error {
-                    error!("apply entry failed: {}", e);
-                    Ok(())
-                } else {
-                    Err(e.into())
-                }
-            } else {
-                Ok(())
-            }
-        } else {
-            self.sender.send(msg).await?;
-            Ok(())
+        if !self.has_apply_worker {
+            return self.apply_direct(msg).await;
         }
+
+        if matches!(&msg, ApplyMsg::EntryWithAck(_)) {
+            self.sender.send(msg).await?;
+            return Ok(());
+        }
+
+        if wait {
+            return self.apply_direct(msg).await;
+        }
+
+        self.sender.send(msg).await?;
+        Ok(())
     }
 
     fn get_fsm_state(&self) -> FsmState {
@@ -924,10 +992,14 @@ impl AppStorage for JournalLoader {
 
     async fn role_change(&self, role: StateRole) -> RaftResult<()> {
         if !self.has_apply_worker {
+            if role == StateRole::Leader {
+                self.catch_up_committed_metadata().await?;
+            }
             return Ok(());
         }
-        self.sender.send(ApplyMsg::RoleChange(role)).await?;
-        Ok(())
+        let (tx, rx) = CallChannel::channel();
+        self.sender.send(ApplyMsg::RoleChange((role, tx))).await?;
+        rx.receive().await?
     }
 
     async fn create_snapshot(&self) -> RaftResult<SnapshotData> {

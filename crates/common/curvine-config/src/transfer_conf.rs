@@ -14,7 +14,7 @@
 
 use crate::{FsError, FsResult};
 use curvine_rpc::server::ServerConf;
-use curvine_runtime::common::DurationUnit;
+use curvine_runtime::common::{DurationUnit, LogConf};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -39,6 +39,7 @@ pub struct TransferConf {
     pub hostname: String,
     pub rpc_port: u16,
     pub web_port: u16,
+    pub log: LogConf,
     #[serde(skip, default = "TransferConf::default_io_threads")]
     pub io_threads: usize,
     #[serde(skip, default = "TransferConf::default_worker_threads")]
@@ -325,6 +326,10 @@ impl Default for TransferConf {
             hostname: "localhost".to_string(),
             rpc_port: Self::DEFAULT_RPC_PORT,
             web_port: Self::DEFAULT_WEB_PORT,
+            log: LogConf {
+                file_name: "transfer.log".to_string(),
+                ..Default::default()
+            },
             io_threads: Self::DEFAULT_IO_THREADS,
             worker_threads: Self::DEFAULT_WORKER_THREADS,
             instance_id: String::new(),
@@ -367,6 +372,21 @@ mod tests {
         assert_eq!(conf.effective_store_type(), TransferStoreType::Sqlite);
         assert_eq!(conf.store_url, "sqlite://data/transfer/transfer.db");
         assert_eq!(conf.endpoints, vec!["localhost:9010"]);
+        assert_eq!(conf.rpc_port, TransferConf::DEFAULT_RPC_PORT);
+        assert_eq!(conf.web_port, TransferConf::DEFAULT_WEB_PORT);
+        assert_eq!(conf.log.file_name, "transfer.log");
+    }
+
+    #[test]
+    fn parses_dedicated_log_configuration() {
+        let conf: TransferConf = toml::from_str(
+            r#"
+                log = { level = "debug", log_dir = "stdout", file_name = "transfer-test.log" }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(conf.log.file_name, "transfer-test.log");
     }
 
     #[test]

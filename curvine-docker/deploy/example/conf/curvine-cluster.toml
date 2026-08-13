@@ -49,6 +49,14 @@ master_addrs = [
     { hostname = "cv-master-2.svc.cluster.local", port = 8995 }
 ]
 
+[transfer]
+# Run `curvine-server transfer` as an independent service. These ports and this
+# log file belong to Transfer; they are intentionally separate from Master.
+enabled = false
+rpc_port = 9010
+web_port = 9011
+log = { level = "info", log_dir = "./logs", file_name = "transfer.log" }
+
 [fuse]
 debug = false
 # Kernel-side metadata cache timeouts (milliseconds).

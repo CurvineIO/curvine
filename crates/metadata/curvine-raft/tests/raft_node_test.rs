@@ -18,7 +18,8 @@ use curvine_core_error::CommonResult;
 use curvine_raft::conf::JournalConf;
 use curvine_raft::proto::raft::{FsmState, SnapshotData};
 use curvine_raft::raft::storage::{
-    AppStorage, HashAppStorage, LogStorage, MemLogStorage, RocksLogStorage,
+    AppStorage, ApplyMsg, HashAppStorage, LogStorage, MemLogStorage, RocksAppStorage,
+    RocksLogStorage,
 };
 use curvine_raft::raft::{
     RaftClient, RaftCode, RaftError, RaftJournal, RaftNode, RaftResult, RoleMonitor,
@@ -27,12 +28,13 @@ use curvine_raft::utils::SerdeUtils;
 use curvine_rpc::client::{ClientConf, RpcClient};
 use curvine_rpc::message::{Builder, ResponseStatus};
 use curvine_runtime::common::{FileUtils, Logger, Utils};
-use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime, Runtime};
 use prost::bytes::BytesMut;
 use prost::Message;
 use raft::eraftpb::{ConfState, Entry, HardState, Message as RaftMessage, MessageType, Snapshot};
 use raft::{Config, RawNode};
 use raft::{GetEntriesContext, RaftState, StateRole, Storage, StorageError};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::{Mutex, RwLock};
 
@@ -166,20 +168,144 @@ impl TestKvAppStorage {
     fn get(&self, key: &str) -> Option<String> {
         self.map.read().unwrap().get(key).cloned()
     }
+
+    fn apply_entry(&self, entry: Entry) -> RaftResult<()> {
+        let pair: (String, String) = SerdeUtils::deserialize(&entry.data)?;
+        self.map.write().unwrap().insert(pair.0, pair.1);
+        self.fsm_state.lock().unwrap().applied = curvine_raft::proto::raft::AppliedIndex {
+            term: entry.term,
+            index: entry.index,
+            op_id: 0,
+            rpc_id: 0,
+        };
+        Ok(())
+    }
 }
 
 impl AppStorage for TestKvAppStorage {
     async fn apply(&self, _: bool, msg: curvine_raft::raft::storage::ApplyMsg) -> RaftResult<()> {
         match msg {
             curvine_raft::raft::storage::ApplyMsg::Entry(entry) => {
-                let pair: (String, String) = SerdeUtils::deserialize(&entry.data)?;
-                self.map.write().unwrap().insert(pair.0, pair.1);
-                self.fsm_state.lock().unwrap().applied = curvine_raft::proto::raft::AppliedIndex {
-                    term: entry.term,
-                    index: entry.index,
-                    op_id: 0,
-                    rpc_id: 0,
-                };
+                self.apply_entry(entry)?;
+            }
+            curvine_raft::raft::storage::ApplyMsg::EntryWithAck((entry, tx)) => {
+                let result = self.apply_entry(entry);
+                let _ = tx.send(result);
+            }
+            curvine_raft::raft::storage::ApplyMsg::Scan(applied) => {
+                self.fsm_state.lock().unwrap().applied = applied;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn get_fsm_state(&self) -> FsmState {
+        self.fsm_state.lock().unwrap().clone()
+    }
+
+    async fn role_change(&self, _: StateRole) -> RaftResult<()> {
+        Ok(())
+    }
+
+    async fn create_snapshot(&self) -> RaftResult<SnapshotData> {
+        Ok(SnapshotData {
+            snapshot_id: self.get_fsm_state().applied.index,
+            node_id: 0,
+            create_time: 0,
+            bytes_data: Some(Vec::new()),
+            files_data: None,
+            fsm_state: self.get_fsm_state(),
+        })
+    }
+
+    async fn apply_snapshot(&self, _: SnapshotData) -> RaftResult<()> {
+        Ok(())
+    }
+
+    fn snapshot_dir(&self, _: u64) -> RaftResult<String> {
+        Ok(String::new())
+    }
+}
+
+#[derive(Clone)]
+struct BlockingApplyAppStorage {
+    map: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    fsm_state: Arc<Mutex<FsmState>>,
+    started: Arc<AtomicBool>,
+    started_notify: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Semaphore>,
+    completed: Arc<AtomicBool>,
+}
+
+impl Default for BlockingApplyAppStorage {
+    fn default() -> Self {
+        Self {
+            map: Arc::default(),
+            fsm_state: Arc::default(),
+            started: Arc::default(),
+            started_notify: Arc::default(),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+            completed: Arc::default(),
+        }
+    }
+}
+
+impl BlockingApplyAppStorage {
+    fn get(&self, key: &str) -> Option<String> {
+        self.map.read().unwrap().get(key).cloned()
+    }
+
+    async fn apply_entry(&self, entry: Entry, wait: bool) -> RaftResult<()> {
+        let pair: (String, String) = SerdeUtils::deserialize(&entry.data)?;
+        self.started.store(true, Ordering::SeqCst);
+        self.started_notify.notify_one();
+        if wait {
+            self.release
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("test semaphore is never closed");
+        }
+        self.map.write().unwrap().insert(pair.0, pair.1);
+        self.fsm_state.lock().unwrap().applied = curvine_raft::proto::raft::AppliedIndex {
+            term: entry.term,
+            index: entry.index,
+            op_id: 0,
+            rpc_id: 0,
+        };
+        Ok(())
+    }
+
+    async fn wait_started(&self) {
+        if self.started.load(Ordering::SeqCst) {
+            return;
+        }
+        self.started_notify.notified().await;
+    }
+
+    fn release_apply(&self) {
+        self.release.add_permits(1);
+    }
+
+    fn proposal_completed(&self) -> bool {
+        self.completed.load(Ordering::SeqCst)
+    }
+}
+
+impl AppStorage for BlockingApplyAppStorage {
+    async fn apply(
+        &self,
+        wait: bool,
+        msg: curvine_raft::raft::storage::ApplyMsg,
+    ) -> RaftResult<()> {
+        match msg {
+            curvine_raft::raft::storage::ApplyMsg::Entry(entry) => {
+                self.apply_entry(entry, wait).await?;
+            }
+            curvine_raft::raft::storage::ApplyMsg::EntryWithAck((entry, tx)) => {
+                let result = self.apply_entry(entry, true).await;
+                let _ = tx.send(result);
             }
             curvine_raft::raft::storage::ApplyMsg::Scan(applied) => {
                 self.fsm_state.lock().unwrap().applied = applied;
@@ -401,6 +527,79 @@ fn install_snapshot_skips_empty_app_snapshot_when_applied_index_nonzero() -> Com
         "empty app snapshot must not be applied when applied.index > 0"
     );
     assert_eq!(app.get_fsm_state().applied.index, 7);
+
+    Ok(())
+}
+
+#[test]
+fn propose_response_waits_until_committed_entry_is_applied() -> CommonResult<()> {
+    Logger::default();
+
+    let mut conf = JournalConf::with_test();
+    conf.journal_dir = format!("../testing/propose-apply-{}", Utils::rand_id());
+    FileUtils::delete_path(&conf.journal_dir, true)?;
+
+    let rt = conf.create_runtime();
+    let store = BlockingApplyAppStorage::default();
+    let raft = RaftJournal::new(
+        rt.clone(),
+        RocksLogStorage::from_conf(&conf, true),
+        store.clone(),
+        conf.clone(),
+        RoleMonitor::new(),
+    );
+    let mut listener = rt.block_on(raft.run())?;
+    rt.block_on(listener.wait_leader())?;
+
+    let client = RaftClient::from_conf(rt.clone(), &conf);
+    let msg = SerdeUtils::serialize(&("name".to_string(), "curvine".to_string()))?;
+    let completed = store.completed.clone();
+    let handle = rt.spawn(async move {
+        let result = client.send_propose_response(msg).await;
+        completed.store(true, Ordering::SeqCst);
+        result
+    });
+
+    rt.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(3), store.wait_started())
+            .await
+            .expect("committed entry should reach app storage apply");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    });
+
+    assert!(
+        !store.proposal_completed(),
+        "propose RPC returned before the committed entry finished app storage apply"
+    );
+    assert_eq!(store.get("name"), None);
+
+    store.release_apply();
+    let response = rt.block_on(handle).unwrap()?;
+    assert!(response.applied_index.unwrap_or_default() > 0);
+    assert_eq!(store.get("name"), Some("curvine".to_string()));
+    FileUtils::delete_path(&conf.journal_dir, true)?;
+
+    Ok(())
+}
+
+#[test]
+fn kv_app_storages_accept_scan_control_messages() -> CommonResult<()> {
+    let rt = AsyncRuntime::single();
+    let applied = curvine_raft::proto::raft::AppliedIndex {
+        term: 1,
+        index: 1,
+        ..Default::default()
+    };
+
+    let hash: HashAppStorage<String, String> = HashAppStorage::new();
+    rt.block_on(hash.apply(true, ApplyMsg::new_scan(applied.clone())))?;
+
+    let dir = Utils::test_sub_dir(format!("rocks-app-storage-scan-{}", Utils::rand_id()));
+    FileUtils::delete_path(&dir, true)?;
+    let rocks: RocksAppStorage<String, String> = RocksAppStorage::new(&dir);
+    rt.block_on(rocks.apply(true, ApplyMsg::new_scan(applied)))?;
+    drop(rocks);
+    FileUtils::delete_path(&dir, true)?;
 
     Ok(())
 }

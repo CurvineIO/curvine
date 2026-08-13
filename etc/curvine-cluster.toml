@@ -86,8 +86,12 @@ subnqn = "nqn.2024-01.io.curvine:subsystem2"
 
 [transfer]
 # Set to true to start the standalone Transfer service. Local SQLite storage,
-# replica metadata reader and localhost:9010 are inferred by default.
+# replica metadata reader and localhost:9010 are inferred by default. Transfer
+# uses its own RPC/Web ports and log file; it does not reuse Master settings.
 enabled = false
+rpc_port = 9010
+web_port = 9011
+log = { level = "info", log_dir = "stdout", file_name = "transfer.log" }
 
 # fuse configuration
 [fuse]

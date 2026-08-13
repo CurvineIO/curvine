@@ -94,11 +94,10 @@ impl TransferServer {
         if !conf.transfer.enabled {
             return Err(FsError::common("curvine-transfer requires transfer.enabled=true").into());
         }
-        Logger::init(conf.master.log.clone());
+        Logger::init(conf.transfer.log.clone());
         let _ = TransferMetrics::get()?;
         info!("allocator: {}", curvine_alloc::allocator_type_name());
         info!("git version: {}", curvine_sys::version::GIT_VERSION);
-        conf.print();
 
         let rt = Arc::new(conf.transfer_server_conf().create_runtime());
         let stop = Arc::new(AtomicBool::new(false));
@@ -113,6 +112,26 @@ impl TransferServer {
             )?),
         });
         let store_backend = store.backend_label();
+        let report_endpoints = if conf.transfer.endpoints.is_empty() {
+            vec![format!(
+                "{}:{}",
+                conf.transfer.hostname, conf.transfer.rpc_port
+            )]
+        } else {
+            conf.transfer.endpoints.clone()
+        };
+        info!(
+            "configured curvine-transfer store_backend={} rpc_addr={}:{} web_addr={}:{} report_endpoints={:?} max_running={} max_tasks={} task_stale_timeout_ms={}",
+            store_backend,
+            conf.transfer.hostname,
+            conf.transfer.rpc_port,
+            conf.transfer.hostname,
+            conf.transfer.web_port,
+            report_endpoints,
+            conf.transfer.max_running_transfers,
+            conf.transfer.max_tasks_per_transfer,
+            conf.transfer.task_stale_timeout.as_millis(),
+        );
         let fs = CurvineFileSystem::with_rt(conf.clone(), rt.clone())?;
         let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
         let cache = ClusterMetadataCache::with_snapshot_policy(
@@ -136,26 +155,6 @@ impl TransferServer {
             conf.client.clone(),
             conf.transfer.max_tasks_per_transfer,
             conf.transfer.ufs_max_concurrency_per_endpoint,
-        );
-        let report_endpoints = if conf.transfer.endpoints.is_empty() {
-            vec![format!(
-                "{}:{}",
-                conf.transfer.hostname, conf.transfer.rpc_port
-            )]
-        } else {
-            conf.transfer.endpoints.clone()
-        };
-        info!(
-            "configured curvine-transfer store_backend={} rpc_addr={}:{} web_addr={}:{} report_endpoints={:?} max_running={} max_tasks={} task_stale_timeout_ms={}",
-            store_backend,
-            conf.transfer.hostname,
-            conf.transfer.rpc_port,
-            conf.transfer.hostname,
-            conf.transfer.web_port,
-            report_endpoints,
-            conf.transfer.max_running_transfers,
-            conf.transfer.max_tasks_per_transfer,
-            conf.transfer.task_stale_timeout.as_millis(),
         );
         let scheduler = TransferScheduler::new(
             store.clone(),

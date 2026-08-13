@@ -88,18 +88,43 @@ impl ClusterConf {
     pub const ENV_MASTER_HOSTNAME: &'static str = "CURVINE_MASTER_HOSTNAME";
     pub const ENV_WORKER_HOSTNAME: &'static str = "CURVINE_WORKER_HOSTNAME";
     pub const ENV_CLIENT_HOSTNAME: &'static str = "CURVINE_CLIENT_HOSTNAME";
+    pub const ENV_TRANSFER_HOSTNAME: &'static str = "CURVINE_TRANSFER_HOSTNAME";
     pub const ENV_CONF_FILE: &'static str = "CURVINE_CONF_FILE";
 
     pub fn from<T: AsRef<str>>(path: T) -> CommonResult<Self> {
-        let str = try_err!(read_to_string(path.as_ref()));
-        let mut conf = try_err!(toml::from_str::<Self>(&str));
+        let mut conf = Self::read(path)?;
+        conf.apply_hostname_overrides()?;
+        conf.master.init()?;
+        conf.client.init()?;
+        conf.fuse.init()?;
+        conf.job.init()?;
+        conf.transfer.init()?;
+        conf.resolve_master_addrs();
+        Ok(conf)
+    }
 
+    /// Load only the configuration needed by the standalone Transfer service.
+    pub fn from_transfer<T: AsRef<str>>(path: T) -> CommonResult<Self> {
+        let mut conf = Self::read(path)?;
+        conf.apply_transfer_hostname_overrides()?;
+        conf.client.init()?;
+        conf.transfer.init()?;
+        conf.resolve_master_addrs();
+        Ok(conf)
+    }
+
+    fn read<T: AsRef<str>>(path: T) -> CommonResult<Self> {
+        let str = try_err!(read_to_string(path.as_ref()));
+        Ok(try_err!(toml::from_str::<Self>(&str)))
+    }
+
+    fn apply_hostname_overrides(&mut self) -> CommonResult<()> {
         // Hostname resolution is either/or. A configured network interface
         // (non-empty, e.g. `eth0`) wins: resolve its local IPv4 and apply it to
         // every role hostname, ignoring the hostname env vars. An empty
         // interface honors the per-role hostname env-var overrides instead.
-        if !conf.net_interface.is_empty() {
-            let ip = Self::interface_ipv4(&conf.net_interface)?;
+        if !self.net_interface.is_empty() {
+            let ip = Self::interface_ipv4(&self.net_interface)?;
 
             // net_interface takes precedence over the CURVINE_*_HOSTNAME env
             // vars. Warn (rather than silently ignore) when any of them is also
@@ -111,59 +136,85 @@ impl ClusterConf {
                 Self::ENV_MASTER_HOSTNAME,
                 Self::ENV_WORKER_HOSTNAME,
                 Self::ENV_CLIENT_HOSTNAME,
+                Self::ENV_TRANSFER_HOSTNAME,
             ] {
                 if let Ok(v) = env::var(env_key) {
                     eprintln!(
                         "[WARN] net_interface '{}' is set (resolved to {}); ignoring {}='{}'. \
                          net_interface overrides the CURVINE_*_HOSTNAME env vars.",
-                        conf.net_interface, ip, env_key, v
+                        self.net_interface, ip, env_key, v
                     );
                 }
             }
 
-            conf.master.hostname = ip.clone();
-            conf.journal.hostname = ip.clone();
-            conf.worker.hostname = ip.clone();
-            conf.client.hostname = ip.clone();
-            conf.transfer.hostname = ip;
+            self.master.hostname = ip.clone();
+            self.journal.hostname = ip.clone();
+            self.worker.hostname = ip.clone();
+            self.client.hostname = ip.clone();
+            self.transfer.hostname = ip;
         } else {
             if let Ok(v) = env::var(Self::ENV_MASTER_HOSTNAME) {
-                conf.master.hostname = v.to_owned();
-                conf.journal.hostname = v;
+                self.master.hostname = v.to_owned();
+                self.journal.hostname = v;
             }
 
             // Apply worker hostname from environment variable (used by worker process)
             if let Ok(v) = env::var(Self::ENV_WORKER_HOSTNAME) {
-                conf.worker.hostname = v;
+                self.worker.hostname = v;
             }
 
             // Apply client hostname from environment variable
             if let Ok(v) = env::var(Self::ENV_CLIENT_HOSTNAME) {
-                conf.client.hostname = v;
+                self.client.hostname = v;
+            }
+
+            if let Ok(v) = env::var(Self::ENV_TRANSFER_HOSTNAME) {
+                self.transfer.hostname = v;
             }
         }
 
-        conf.master.init()?;
-        conf.client.init()?;
-        conf.fuse.init()?;
-        conf.job.init()?;
-        conf.transfer.init()?;
+        Ok(())
+    }
 
-        if conf.client.master_addrs.is_empty() {
-            if conf.journal.journal_addrs.is_empty() {
-                conf.client
+    fn apply_transfer_hostname_overrides(&mut self) -> CommonResult<()> {
+        if !self.net_interface.is_empty() {
+            let ip = Self::interface_ipv4(&self.net_interface)?;
+            for env_key in [Self::ENV_CLIENT_HOSTNAME, Self::ENV_TRANSFER_HOSTNAME] {
+                if let Ok(v) = env::var(env_key) {
+                    eprintln!(
+                        "[WARN] net_interface '{}' is set (resolved to {}); ignoring {}='{}'. \\
+                         net_interface overrides the CURVINE_*_HOSTNAME env vars.",
+                        self.net_interface, ip, env_key, v
+                    );
+                }
+            }
+            self.client.hostname = ip.clone();
+            self.transfer.hostname = ip;
+        } else {
+            if let Ok(v) = env::var(Self::ENV_CLIENT_HOSTNAME) {
+                self.client.hostname = v;
+            }
+            if let Ok(v) = env::var(Self::ENV_TRANSFER_HOSTNAME) {
+                self.transfer.hostname = v;
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_master_addrs(&mut self) {
+        if self.client.master_addrs.is_empty() {
+            if self.journal.journal_addrs.is_empty() {
+                self.client
                     .master_addrs
-                    .push(InetAddr::new(&conf.master.hostname, conf.master.rpc_port));
+                    .push(InetAddr::new(&self.master.hostname, self.master.rpc_port));
             } else {
-                for peer in &conf.journal.journal_addrs {
-                    conf.client
+                for peer in &self.journal.journal_addrs {
+                    self.client
                         .master_addrs
-                        .push(InetAddr::new(&peer.hostname, conf.master.rpc_port));
+                        .push(InetAddr::new(&peer.hostname, self.master.rpc_port));
                 }
             }
         }
-
-        Ok(conf)
     }
 
     pub fn check_master_hostname(&mut self) -> CommonResult<()> {
@@ -432,6 +483,7 @@ impl Display for ClusterConf {
 mod tests {
     use super::ClusterConf;
     use crate::RaftPeer;
+    use curvine_runtime::common::Utils;
 
     // The loopback interface is present on every supported host and always
     // carries 127.0.0.1, so it is a stable target for the happy path.
@@ -502,5 +554,51 @@ mod tests {
 
         assert_eq!(conf.master.rpc_port, ClusterConf::DEFAULT_MASTER_PORT);
         assert!(!conf.client.master_addrs.is_empty());
+    }
+
+    #[test]
+    fn transfer_init_skips_unused_master_validation() {
+        let path = std::env::temp_dir().join(format!(
+            "curvine-transfer-conf-{}-{}.toml",
+            std::process::id(),
+            Utils::rand_str(6)
+        ));
+        std::fs::write(
+            &path,
+            r#"
+                [master]
+                conn_limit = 0
+
+                [transfer]
+                enabled = true
+            "#,
+        )
+        .unwrap();
+
+        let conf = ClusterConf::from_transfer(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(!conf.client.master_addrs.is_empty());
+    }
+
+    #[test]
+    fn transfer_net_interface_keeps_master_address() {
+        #[cfg(target_os = "macos")]
+        let loopback = "lo0";
+        #[cfg(not(target_os = "macos"))]
+        let loopback = "lo";
+
+        let mut conf = ClusterConf {
+            net_interface: loopback.to_string(),
+            ..Default::default()
+        };
+        conf.master.hostname = "cv-master".to_string();
+        conf.journal.journal_addrs.clear();
+
+        conf.apply_transfer_hostname_overrides().unwrap();
+        conf.resolve_master_addrs();
+
+        assert_eq!(conf.master.hostname, "cv-master");
+        assert_eq!(conf.client.master_addrs[0].hostname, "cv-master");
     }
 }

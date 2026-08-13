@@ -22,8 +22,7 @@ use curvine_core_error::err_box;
 use curvine_fs_api::Path;
 use curvine_fs_api::{StateReader, StateWriter};
 use curvine_model::{CreateFileOptsBuilder, FileStatus, LockFlags, OpenFlags};
-use curvine_runtime::sync::AtomicCounter;
-use curvine_sys::RawPtr;
+use curvine_runtime::sync::AsyncMutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -56,33 +55,44 @@ pub struct BackendHandle {
     pub ino: u64,
     pub fh: u64,
 
-    pub reader: Option<RawPtr<FuseReader>>,
+    reader: Option<AsyncMutex<ReaderState>>,
     pub writer: Option<Arc<FuseWriter>>, // Writer uses Arc for global sharing
     /// Open-time file status snapshot. Guarded by a lock because the read path
     /// refreshes it in place after a dirty-read reopen (`read()` takes `&self`).
     status: std::sync::RwLock<FileStatus>,
 
     fh_locks: std::sync::Mutex<HandleLock>,
+}
 
-    read_ver: AtomicCounter,
+struct ReaderState {
+    reader: Arc<FuseReader>,
+    read_ver: u64,
+}
+
+impl ReaderState {
+    fn new(reader: Arc<FuseReader>) -> Self {
+        Self {
+            reader,
+            read_ver: 0,
+        }
+    }
 }
 
 impl BackendHandle {
     pub fn new(
         ino: u64,
         fh: u64,
-        reader: Option<RawPtr<FuseReader>>,
+        reader: Option<Arc<FuseReader>>,
         writer: Option<Arc<FuseWriter>>,
         status: FileStatus,
     ) -> Self {
         Self {
             ino,
             fh,
-            reader,
+            reader: reader.map(|reader| AsyncMutex::new(ReaderState::new(reader))),
             writer,
             status: std::sync::RwLock::new(status),
             fh_locks: std::sync::Mutex::new(HandleLock::default()),
-            read_ver: AtomicCounter::new(0),
         }
     }
 
@@ -125,10 +135,18 @@ impl BackendHandle {
             );
         }
 
-        let reader = match &self.reader {
-            Some(v) => v,
+        let reader_state = match &self.reader {
+            Some(reader) => reader,
             None => return err_fuse!(libc::EIO),
         };
+
+        // Serialize refresh state per file handle. The Arc cloned below keeps the
+        // selected reader alive until this request has entered its channel, even
+        // if a later request replaces the handle's current reader.
+        // Keep this lock across snapshot publication and reader reopen/install;
+        // releasing it between those awaits lets concurrent refreshes install
+        // readers for different snapshots and reintroduces the lifetime race.
+        let mut reader_state = reader_state.lock().await;
 
         if let Some(writer) = state.find_writer(self.ino).await {
             // `write_ver` advances only after a write/resize is successfully queued.
@@ -143,18 +161,20 @@ impl BackendHandle {
             // Pin read_ver to the flushed snapshot; later writes leave write_ver
             // ahead so the next read publishes again.
             if let Some(target_ver) = writer
-                .publish_dirty_read_snapshot(self.read_ver.get())
+                .publish_dirty_read_snapshot(reader_state.read_ver)
                 .await?
             {
-                let path = reader.path().clone();
+                let path = reader_state.reader.path().clone();
                 let new_reader = state.new_reader(&path).await?;
                 // Refresh status from the reopened reader before installing it.
                 self.refresh_status(new_reader.status().clone());
-                reader.replace(new_reader);
-                self.read_ver.set(target_ver);
+                reader_state.reader = Arc::new(new_reader);
+                reader_state.read_ver = target_ver;
             }
         }
 
+        let reader = reader_state.reader.clone();
+        drop(reader_state);
         reader.read(op, reply).await?;
         Ok(())
     }
@@ -312,7 +332,7 @@ impl BackendHandle {
 
         let reader = if has_reader {
             let reader = state.new_reader(&path).await?;
-            Some(RawPtr::from_owned(reader))
+            Some(Arc::new(reader))
         } else {
             None
         };
@@ -320,12 +340,11 @@ impl BackendHandle {
         let handle = Self {
             ino,
             fh,
-            reader,
+            reader: reader.map(|reader| AsyncMutex::new(ReaderState::new(reader))),
             writer,
             status: std::sync::RwLock::new(status),
 
             fh_locks: std::sync::Mutex::new(locks),
-            read_ver: AtomicCounter::new(0),
         };
         Ok(handle)
     }
@@ -334,6 +353,71 @@ impl BackendHandle {
 #[cfg(test)]
 mod tests {
     use super::BackendHandle;
+
+    #[test]
+    fn replaced_reader_stays_alive_while_request_holds_arc() {
+        use crate::fs::FuseReader;
+        use curvine_client::unified::UnifiedReader;
+        use curvine_config::FuseConf;
+        use curvine_fs_api::local::LocalReader;
+        use curvine_fs_api::Path;
+        use curvine_model::FileStatus;
+        use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+        use std::io::Write as _;
+        use std::sync::Arc;
+
+        let path_buf = std::env::temp_dir().join(format!(
+            "backend_handle_reader_arc_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        {
+            let mut file = std::fs::File::create(&path_buf).unwrap();
+            file.write_all(b"reader lifetime").unwrap();
+        }
+        let path = Path::from_str(path_buf.to_str().unwrap()).unwrap();
+        let runtime = Arc::new(AsyncRuntime::single());
+        let make_reader = || {
+            Arc::new(FuseReader::new(
+                &FuseConf::default(),
+                runtime.clone(),
+                UnifiedReader::Local(LocalReader::new(&path, 4096).unwrap()),
+            ))
+        };
+
+        let original = make_reader();
+        let original_weak = Arc::downgrade(&original);
+        let handle = BackendHandle::new(
+            1,
+            10,
+            Some(original.clone()),
+            None,
+            FileStatus::with_name(1, "f".into(), false),
+        );
+        drop(original);
+
+        runtime.block_on(async {
+            let mut state = handle.reader.as_ref().unwrap().lock().await;
+            let in_flight = state.reader.clone();
+            state.reader = make_reader();
+            drop(state);
+
+            assert!(
+                original_weak.upgrade().is_some(),
+                "an in-flight request must retain the reader replaced on the handle"
+            );
+            drop(in_flight);
+            assert!(
+                original_weak.upgrade().is_none(),
+                "the replaced reader is released after the in-flight request drops its Arc"
+            );
+        });
+
+        // FuseReader workers retain the runtime handle; avoid dropping a Tokio
+        // runtime from a test async context while those tasks wind down.
+        std::mem::forget(runtime);
+        let _ = std::fs::remove_file(path_buf);
+    }
 
     // Reject offsets that would wrap negative when cast to i64.
     #[test]
