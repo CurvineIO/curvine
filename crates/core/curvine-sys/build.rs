@@ -29,6 +29,7 @@ fn main() {
         .unwrap_or_else(|| env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_string()));
     let git_tag = get_git_tag();
     let git_branch = get_git_branch();
+    let git_describe = get_git_describe();
 
     // Build the source info: prefer tag over branch
     let source_info = if !git_tag.is_empty() && git_tag != "unknown" {
@@ -63,8 +64,11 @@ pub static GIT_BRANCH: &str = "{}";
 
 /// Full version string. BUILD_VERSION overrides the package-derived string.
 pub static VERSION: &str = "{}";
+
+/// Raw `git describe --tags --always --dirty` output captured at build time.
+pub static GIT_DESCRIBE: &str = "{}";
 "#,
-        commit, pkg_version, git_tag, git_branch, full_version
+        commit, pkg_version, git_tag, git_branch, full_version, git_describe
     );
 
     fs::write(ver_file, version_content).unwrap();
@@ -138,6 +142,12 @@ fn get_git_branch() -> String {
         return String::new();
     }
     branch
+}
+
+fn get_git_describe() -> String {
+    // Prefer annotated tags, fall back to the short commit when no tag exists,
+    // and append `-dirty` when the working tree has uncommitted changes.
+    run_git_command(&["describe", "--tags", "--always", "--dirty"])
 }
 
 fn run_git_command(args: &[&str]) -> String {
