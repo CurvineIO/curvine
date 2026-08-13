@@ -369,6 +369,18 @@ impl CurvineFileSystem {
         Ok(())
     }
 
+    /// Serialize one Master lock-state operation with close-time lock cleanup.
+    /// Blocking SETLKW retries acquire this guard per attempt, never while waiting.
+    async fn get_lock_ordered(&self, path: &Path, lock: FileLock) -> FuseResult<Option<FileLock>> {
+        let _guard = self.state.lock_path(path).await;
+        Ok(self.fs.get_lock(path, lock).await?)
+    }
+
+    async fn set_lock_ordered(&self, path: &Path, lock: FileLock) -> FuseResult<Option<FileLock>> {
+        let _guard = self.state.lock_path(path).await;
+        Ok(self.fs.set_lock(path, lock).await?)
+    }
+
     fn record_negative_entry(&self) {
         if self.conf.metrics_enabled {
             FuseMetrics::with(|m| m.record_negative_entry());
@@ -1731,6 +1743,8 @@ impl fs::FileSystem for CurvineFileSystem {
         // lock_owner on almost every FUSE_FLUSH/close; unconditional unlock
         // caused a Master SetLock+journal storm for Spark local-dirs (#1227).
         if op.arg.lock_owner != 0 && handle.take_plock_if_owner(op.arg.lock_owner).is_some() {
+            let path = Path::from_str(&handle.status().path)?;
+            let _guard = self.state.lock_path(&path).await;
             if let Err(e) = self
                 .fs_unlock_owner(&handle, LockFlags::Plock, op.arg.lock_owner)
                 .await
@@ -2115,7 +2129,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
         self.state.fs_fsync(op.header.nodeid, None).await?;
 
-        let conflict = self.fs.get_lock(&path, lock).await?;
+        let conflict = self.get_lock_ordered(&path, lock).await?;
         let lk = match conflict {
             Some(lk) => fuse_file_lock {
                 start: lk.start,
@@ -2149,7 +2163,7 @@ impl fs::FileSystem for CurvineFileSystem {
             lock.end = u64::MAX;
         }
 
-        let conflict = self.fs.set_lock(&path, lock).await?;
+        let conflict = self.set_lock_ordered(&path, lock).await?;
         if conflict.is_none() {
             if is_unlock {
                 // Full-range unlock drops this owner from handle bookkeeping so a
@@ -2204,7 +2218,7 @@ impl fs::FileSystem for CurvineFileSystem {
             ),
         );
         loop {
-            let conflict = self.fs.set_lock(&path, lock.clone()).await?;
+            let conflict = self.set_lock_ordered(&path, lock.clone()).await?;
             if conflict.is_none() {
                 wait_guard.clear_blocked_by();
                 if is_unlock {
@@ -2254,7 +2268,7 @@ impl fs::FileSystem for CurvineFileSystem {
                 // deadlock (LTP fcntl17) still observes the cycle. If the lock
                 // is free now (OFD unlock/re-lock race, LTP fcntl34), acquire
                 // instead of returning a false EDEADLK.
-                let conflict2 = self.fs.set_lock(&path, lock.clone()).await?;
+                let conflict2 = self.set_lock_ordered(&path, lock.clone()).await?;
                 if conflict2.is_none() {
                     wait_guard.clear_blocked_by();
                     if is_unlock {
