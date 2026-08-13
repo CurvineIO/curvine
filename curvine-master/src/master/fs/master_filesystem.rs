@@ -222,8 +222,13 @@ impl MasterFilesystem {
     }
 
     pub fn mkdir_with_opts<T: AsRef<str>>(&self, path: T, opts: MkdirOpts) -> FsResult<FileStatus> {
+        let path = path.as_ref();
+        if self.master_monitor.is_active() {
+            return self.mkdir_with_opts_committed(path, opts);
+        }
+
         let mut fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+        let inp = Self::resolve_path(&fs_dir, path)?;
 
         // Creation of root directory is not allowed
         if inp.is_root() {
@@ -255,6 +260,41 @@ impl MasterFilesystem {
         );
         let status = last.to_file_status(inp.path())?;
         Ok(status)
+    }
+
+    fn mkdir_with_opts_committed(&self, path: &str, opts: MkdirOpts) -> FsResult<FileStatus> {
+        let (commands, writer) = {
+            let fs_dir = self.fs_dir.write();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+
+            if inp.is_root() {
+                return err_box!("Not allowed to create existing root path: {}", inp.path());
+            }
+
+            if inp.is_full() {
+                if opts.create_parent {
+                    if let Some(last_inode) = inp.get_last_inode() {
+                        if last_inode.is_dir() {
+                            let status = last_inode.to_file_status(inp.path())?;
+                            return Ok(status);
+                        }
+                    }
+                }
+                return err_ext!(FsError::file_exists(inp.path()));
+            }
+
+            if !opts.create_parent {
+                Self::check_parent(&inp)?;
+            }
+
+            (
+                fs_dir.prepare_mkdir_commands(inp, opts)?,
+                fs_dir.journal_writer.clone(),
+            )
+        };
+
+        writer.commit_metadata_commands(commands)?;
+        self.file_status(path)
     }
 
     pub fn mkdir<T: AsRef<str>>(&self, path: T, create_parent: bool) -> FsResult<FileStatus> {
@@ -382,13 +422,17 @@ impl MasterFilesystem {
             );
         }
 
+        if self.master_monitor.is_active() {
+            return self.create_with_opts_committed(path, opts, flags);
+        }
+
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
 
         let last_inode = inp.get_last_inode();
         if let Some(inode) = &last_inode {
             if inode.is_dir() {
-                return err_box!("{}  already exists as a dir", inp.path());
+                return err_box!("{} already exists as a dir", inp.path());
             }
 
             if flags.exclusive() {
@@ -414,6 +458,50 @@ impl MasterFilesystem {
         let status = fs_dir.file_status(&inp)?;
 
         Ok(status)
+    }
+
+    fn create_with_opts_committed(
+        &self,
+        path: &str,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+    ) -> FsResult<FileStatus> {
+        let (commands, writer) = {
+            let mut fs_dir = self.fs_dir.write();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+
+            let last_inode = inp.get_last_inode();
+            if let Some(inode) = &last_inode {
+                if inode.is_dir() {
+                    return err_box!("{} already exists as a dir", inp.path());
+                }
+
+                if flags.exclusive() {
+                    return err_ext!(FsError::file_exists(inp.path()));
+                }
+            }
+
+            if !opts.create_parent {
+                Self::check_parent(&inp)?;
+            }
+
+            if last_inode.is_some() {
+                if flags.overwrite() {
+                    self.truncate(&mut fs_dir, &inp, opts)?;
+                } else {
+                    return err_ext!(FsError::file_exists(inp.path()));
+                }
+                return fs_dir.file_status(&inp);
+            }
+
+            (
+                fs_dir.prepare_create_file_commands(inp, opts)?,
+                fs_dir.journal_writer.clone(),
+            )
+        };
+
+        writer.commit_metadata_commands(commands)?;
+        self.file_status(path)
     }
 
     pub fn open_file<T: AsRef<str>>(

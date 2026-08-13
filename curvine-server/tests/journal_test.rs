@@ -16,8 +16,8 @@ use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_fs_api::CurvineURI;
 use curvine_model::{
-    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, MountOptions, OpenFlags,
-    RenameFlags, WorkerInfo, WriteType,
+    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, CreateFileOptsBuilder,
+    MkdirOptsBuilder, MountOptions, OpenFlags, RenameFlags, WorkerInfo, WriteType,
 };
 use curvine_net::net::NetUtils;
 use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData, SnapshotFileList};
@@ -236,6 +236,109 @@ fn replay_accepts_versioned_legacy_journal_batch() -> CommonResult<()> {
 
     assert!(target_fs.file_status("/versioned-legacy").is_ok());
     Ok(())
+}
+
+#[test]
+fn active_namespace_creation_replicates_without_legacy_writer_queue() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let port1 = NetUtils::hold_available_port();
+    let port2 = NetUtils::hold_available_port();
+
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.journal.writer_flush_batch_size = 1;
+    conf.journal.writer_flush_batch_ms = 10;
+    conf.journal.raft_tick_interval_ms = 100;
+    conf.journal.raft_check_quorum = false;
+    conf.journal.journal_addrs = vec![
+        RaftPeer::new(port1 as NodeId, &conf.master.hostname, port1),
+        RaftPeer::new(port2 as NodeId, &conf.master.hostname, port2),
+    ];
+
+    conf.change_test_meta_dir("active-committed-namespace-1");
+    conf.journal.rpc_port = port1;
+    let js1 = JournalSystem::from_conf(&conf)?;
+    let fs1 = MasterFilesystem::with_js(&conf, &js1);
+    let monitor1 = js1.master_monitor();
+
+    conf.change_test_meta_dir("active-committed-namespace-2");
+    conf.journal.rpc_port = port2;
+    let js2 = JournalSystem::from_conf(&conf)?;
+    let fs2 = MasterFilesystem::with_js(&conf, &js2);
+    let monitor2 = js2.master_monitor();
+
+    js1.start_blocking()?;
+    js2.start_blocking()?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let (active, standby) = loop {
+        if monitor1.is_active() {
+            break (fs1.clone(), fs2.clone());
+        }
+        if monitor2.is_active() {
+            break (fs2.clone(), fs1.clone());
+        }
+        if std::time::Instant::now() >= deadline {
+            return err_box!("Not found active master");
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+
+    active.mkdir("/committed-dir", false)?;
+    active.create("/committed-file", false)?;
+    let parent_opts = MkdirOptsBuilder::new()
+        .group("parent-group".to_string())
+        .mode(0o2775)
+        .build();
+    active.mkdir_with_opts("/setgid-parent", parent_opts)?;
+    let file_opts = CreateFileOptsBuilder::new()
+        .group("file-group".to_string())
+        .build();
+    active.create_with_opts("/setgid-parent/child", file_opts, OpenFlags::new_create())?;
+
+    let delta = active.cv_metadata_delta_page(0, None, None, 32)?;
+    assert!(!delta.full_snapshot_required);
+    assert!(delta
+        .entries
+        .iter()
+        .any(|entry| entry.path == "/committed-dir"));
+    assert!(delta
+        .entries
+        .iter()
+        .any(|entry| entry.path == "/committed-file"));
+    assert_eq!(
+        active.file_status("/setgid-parent/child")?.group,
+        "parent-group"
+    );
+    let legacy_entries = active.fs_dir.read().take_entries();
+    assert!(
+        !legacy_entries.iter().any(|entry| matches!(
+            entry,
+            JournalEntry::Mkdir(_) | JournalEntry::CreateFile(_)
+        )),
+        "active namespace creation must not emit legacy local-first namespace journal entries: {legacy_entries:?}"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if standby.file_status("/committed-dir").is_ok()
+            && standby.file_status("/committed-file").is_ok()
+            && standby.file_status("/setgid-parent/child").is_ok()
+        {
+            assert_eq!(
+                standby.file_status("/setgid-parent/child")?.group,
+                "parent-group"
+            );
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return err_box!("standby did not apply committed namespace creation");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 // First start a master and perform the operation; then start 1 stand by, manually replay the log to check consistency.

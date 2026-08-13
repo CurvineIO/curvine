@@ -548,17 +548,6 @@ impl DecodedJournalBatch {
         self.len() == 0
     }
 
-    pub fn contains_metadata_commands(&self) -> bool {
-        matches!(
-            self,
-            DecodedJournalBatch::Versioned(batch)
-                if batch
-                    .commands
-                    .iter()
-                    .any(|command| matches!(command, JournalCommand::Metadata(_)))
-        )
-    }
-
     pub fn into_commands(self) -> JournalCommandIter {
         match self {
             DecodedJournalBatch::Legacy(batch) => {
@@ -661,6 +650,17 @@ pub enum MetadataCommand {
 }
 
 impl MetadataCommand {
+    pub(crate) fn cv_metadata_changes(&self) -> Vec<CvMetadataChange> {
+        match self {
+            MetadataCommand::Mkdir(entry) => {
+                vec![CvMetadataChange::single(entry.op_id, &entry.path)]
+            }
+            MetadataCommand::CreateFile(entry) => {
+                vec![CvMetadataChange::single(entry.op_id, &entry.path)]
+            }
+        }
+    }
+
     pub fn op_id(&self) -> u64 {
         match self {
             MetadataCommand::Mkdir(entry) => entry.op_id,
