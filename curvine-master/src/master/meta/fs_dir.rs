@@ -14,7 +14,8 @@
 
 use crate::master::fs::{BlockInodeState, DeleteResult};
 use crate::master::journal::{
-    CreateFileEntry, JournalEntry, JournalWriter, MetadataCommand, MkdirEntry, RenameEntry,
+    CreateFileEntry, DeleteEntry, JournalEntry, JournalWriter, MetadataCommand, MkdirEntry,
+    RenameEntry, SetAttrEntry,
 };
 use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
@@ -320,6 +321,31 @@ impl FsDir {
             .log_delete(self, inp.path(), op_ms as i64)?;
 
         Ok(del_res)
+    }
+
+    pub(crate) fn prepare_empty_dir_delete_command(
+        &self,
+        inp: &InodePath,
+        mtime: i64,
+    ) -> FsResult<Option<DeleteEntry>> {
+        if inp.is_root() {
+            return err_box!("The root is not allowed to be deleted");
+        }
+
+        if inp.is_empty() || inp.get_last_inode().is_none() {
+            return err_ext!(FsError::file_not_found(inp.path()));
+        }
+
+        if !inp.is_empty_dir() {
+            return Ok(None);
+        }
+
+        Ok(Some(DeleteEntry {
+            op_id: self.next_op_id(),
+            rpc_id: 0,
+            path: inp.path().to_string(),
+            mtime,
+        }))
     }
 
     pub(crate) fn unprotected_delete(
@@ -1214,6 +1240,36 @@ impl FsDir {
             None => return err_ext!(FsError::file_not_found(inp.path())),
         };
 
+        opts = Self::normalize_set_attr_opts(opts);
+        self.unprotected_set_attr(inode.clone(), opts.clone())?;
+        self.journal_writer.log_set_attr(self, &inp, opts)?;
+        Ok(inode.to_file_status(inp.path())?)
+    }
+
+    pub(crate) fn prepare_set_attr_command(
+        &self,
+        inp: &InodePath,
+        mut opts: SetAttrOpts,
+    ) -> FsResult<SetAttrEntry> {
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_ext!(FsError::file_not_found(inp.path())),
+        };
+        if inode.is_file_entry() {
+            return err_box!("set_attr is not supported on unresolved FileEntry inodes; resolve/load the full inode before calling set_attr");
+        }
+
+        opts = Self::normalize_set_attr_opts(opts);
+
+        Ok(SetAttrEntry {
+            op_id: self.next_op_id(),
+            rpc_id: 0,
+            path: inp.path().to_string(),
+            opts,
+        })
+    }
+
+    fn normalize_set_attr_opts(mut opts: SetAttrOpts) -> SetAttrOpts {
         // Internal metadata is master-owned. Persist the operation timestamp in the
         // journal so replay restores it without changing the bincode inode layout.
         opts.add_x_attr.remove(INTERNAL_CTIME_XATTR);
@@ -1223,9 +1279,7 @@ impl FsDir {
             INTERNAL_CTIME_XATTR.to_string(),
             ctime.to_le_bytes().to_vec(),
         );
-        self.unprotected_set_attr(inode.clone(), opts.clone())?;
-        self.journal_writer.log_set_attr(self, &inp, opts)?;
-        Ok(inode.to_file_status(inp.path())?)
+        opts
     }
 
     pub fn unprotected_set_attr(&mut self, inode: InodePtr, opts: SetAttrOpts) -> FsResult<()> {

@@ -658,6 +658,8 @@ pub enum MetadataCommand {
     Mkdir(MkdirEntry),
     CreateFile(CreateFileEntry),
     Rename(RenameEntry),
+    SetAttr(SetAttrEntry),
+    Delete(DeleteEntry),
 }
 
 impl MetadataCommand {
@@ -673,6 +675,12 @@ impl MetadataCommand {
                 CvMetadataChange::subtree(entry.op_id, &entry.src),
                 CvMetadataChange::subtree(entry.op_id, &entry.dst),
             ],
+            MetadataCommand::SetAttr(entry) => {
+                vec![CvMetadataChange::single(entry.op_id, &entry.path)]
+            }
+            MetadataCommand::Delete(entry) => {
+                vec![CvMetadataChange::subtree(entry.op_id, &entry.path)]
+            }
         }
     }
 
@@ -681,6 +689,8 @@ impl MetadataCommand {
             MetadataCommand::Mkdir(entry) => entry.op_id,
             MetadataCommand::CreateFile(entry) => entry.op_id,
             MetadataCommand::Rename(entry) => entry.op_id,
+            MetadataCommand::SetAttr(entry) => entry.op_id,
+            MetadataCommand::Delete(entry) => entry.op_id,
         }
     }
 
@@ -689,6 +699,8 @@ impl MetadataCommand {
             MetadataCommand::Mkdir(entry) => entry.rpc_id,
             MetadataCommand::CreateFile(entry) => entry.rpc_id,
             MetadataCommand::Rename(entry) => entry.rpc_id,
+            MetadataCommand::SetAttr(entry) => entry.rpc_id,
+            MetadataCommand::Delete(entry) => entry.rpc_id,
         }
     }
 
@@ -697,6 +709,8 @@ impl MetadataCommand {
             MetadataCommand::Mkdir(entry) => Some(entry.dir.id),
             MetadataCommand::CreateFile(entry) => Some(entry.file.id),
             MetadataCommand::Rename(_) => None,
+            MetadataCommand::SetAttr(_) => None,
+            MetadataCommand::Delete(_) => None,
         }
     }
 

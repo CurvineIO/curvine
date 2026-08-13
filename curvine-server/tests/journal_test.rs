@@ -17,7 +17,8 @@ use curvine_core_error::{err_box, CommonResult};
 use curvine_fs_api::CurvineURI;
 use curvine_model::{
     BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, CreateFileOptsBuilder,
-    MkdirOptsBuilder, MountOptions, OpenFlags, RenameFlags, WorkerInfo, WriteType,
+    MkdirOptsBuilder, MountOptions, OpenFlags, RenameFlags, SetAttrOptsBuilder, WorkerInfo,
+    WriteType,
 };
 use curvine_net::net::NetUtils;
 use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData, SnapshotFileList};
@@ -36,7 +37,7 @@ use log::info;
 use raft::eraftpb::Entry;
 use raft::StateRole;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
@@ -287,7 +288,37 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
         thread::sleep(Duration::from_millis(100));
     };
 
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = vec![];
+    for _ in 0..2 {
+        let fs = active.clone();
+        let barrier = barrier.clone();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            fs.create_with_opts(
+                "/exclusive-race",
+                CreateFileOpts::with_create(false),
+                OpenFlags::new_create().set_exclusive(true),
+            )
+            .map(|_| ())
+        }));
+    }
+    let mut successes = 0;
+    let mut failures = 0;
+    for handle in handles {
+        match handle
+            .join()
+            .expect("exclusive create thread must not panic")
+        {
+            Ok(()) => successes += 1,
+            Err(_) => failures += 1,
+        }
+    }
+    assert_eq!(successes, 1);
+    assert_eq!(failures, 1);
+
     active.mkdir("/committed-dir", false)?;
+    active.mkdir("/deleted-dir", false)?;
     active.create("/committed-file", false)?;
     active.rename("/committed-file", "/renamed-file", RenameFlags::empty())?;
     let parent_opts = MkdirOptsBuilder::new()
@@ -300,25 +331,45 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
         .build();
     active.create_with_opts("/setgid-parent/child", file_opts, OpenFlags::new_create())?;
 
+    assert_eq!(
+        active.file_status("/setgid-parent/child")?.group,
+        "parent-group"
+    );
+    let status = active.set_attr(
+        "/renamed-file",
+        SetAttrOptsBuilder::new().owner("committed-owner").build(),
+    )?;
+    assert_eq!(status.owner, "committed-owner");
+    active.delete("/deleted-dir", false)?;
+
     let delta = active.cv_metadata_delta_page(0, None, None, 32)?;
     assert!(!delta.full_snapshot_required);
     assert!(delta
         .entries
         .iter()
         .any(|entry| entry.path == "/committed-dir"));
+    assert_eq!(
+        delta
+            .entries
+            .iter()
+            .find(|entry| entry.path == "/renamed-file")
+            .and_then(|entry| entry.entry.as_ref())
+            .map(|entry| entry.status.owner.as_str()),
+        Some("committed-owner")
+    );
     assert!(delta
         .entries
         .iter()
-        .any(|entry| entry.path == "/renamed-file"));
-    assert_eq!(
-        active.file_status("/setgid-parent/child")?.group,
-        "parent-group"
-    );
+        .any(|entry| entry.path == "/deleted-dir" && entry.entry.is_none()));
     let legacy_entries = active.fs_dir.read().take_entries();
     assert!(
         !legacy_entries.iter().any(|entry| matches!(
             entry,
-            JournalEntry::Mkdir(_) | JournalEntry::CreateFile(_) | JournalEntry::Rename(_)
+            JournalEntry::Mkdir(_)
+                | JournalEntry::CreateFile(_)
+                | JournalEntry::Rename(_)
+                | JournalEntry::SetAttr(_)
+                | JournalEntry::Delete(_)
         )),
         "active namespace changes must not emit legacy local-first namespace journal entries: {legacy_entries:?}"
     );
@@ -343,15 +394,20 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         if standby.file_status("/committed-dir").is_ok()
-            && standby.file_status("/renamed-file").is_ok()
             && standby.file_status("/committed-file").is_err()
+            && standby.file_status("/exclusive-race").is_ok()
             && standby.file_status("/setgid-parent/child").is_ok()
+            && standby.file_status("/deleted-dir").is_err()
         {
             assert_eq!(
                 standby.file_status("/setgid-parent/child")?.group,
                 "parent-group"
             );
-            return Ok(());
+            if let Ok(status) = standby.file_status("/renamed-file") {
+                if status.owner == "committed-owner" {
+                    return Ok(());
+                }
+            }
         }
         if std::time::Instant::now() >= deadline {
             return err_box!("standby did not apply committed namespace changes");
