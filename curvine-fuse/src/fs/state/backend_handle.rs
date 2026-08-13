@@ -143,6 +143,9 @@ impl BackendHandle {
         // Serialize refresh state per file handle. The Arc cloned below keeps the
         // selected reader alive until this request has entered its channel, even
         // if a later request replaces the handle's current reader.
+        // Keep this lock across snapshot publication and reader reopen/install;
+        // releasing it between those awaits lets concurrent refreshes install
+        // readers for different snapshots and reintroduces the lifetime race.
         let mut reader_state = reader_state.lock().await;
 
         if let Some(writer) = state.find_writer(self.ino).await {
@@ -364,9 +367,9 @@ mod tests {
         use std::sync::Arc;
 
         let path_buf = std::env::temp_dir().join(format!(
-            "backend_handle_reader_arc_{}_{}",
+            "backend_handle_reader_arc_{}_{:?}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            std::thread::current().id()
         ));
         {
             let mut file = std::fs::File::create(&path_buf).unwrap();
