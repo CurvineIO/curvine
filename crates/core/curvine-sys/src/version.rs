@@ -208,6 +208,7 @@ impl ReleaseVersion {
     /// - `v0.4.0` -> `0.4.0`
     /// - `v0.4.0-alpha` -> `0.4.0-alpha`
     /// - `v0.4.0-alpha-121-g26b5dc6b` -> `0.4.0-alpha.121+g26b5dc6b`
+    /// - `v0.4.1-19-g0ea9fdd6` -> `0.4.1+19.g0ea9fdd6` (compares equal to `0.4.1`)
     /// - `v0.4.0-alpha-121-g26b5dc6b-dirty` -> `0.4.0-alpha.121+g26b5dc6b.dirty`
     /// - `dev-g26b5dc6b` -> `0.0.0-dev+g26b5dc6b`
     pub fn from_git_describe(input: &str) -> Result<Self, VersionParseError> {
@@ -473,10 +474,11 @@ fn parse_git_describe(input: &str) -> Result<ReleaseVersion, VersionParseError> 
     let body = rest.strip_prefix('-').unwrap_or(rest);
 
     // The trailing `-g<commit>` (git describe commit suffix) becomes build
-    // metadata; the digits right before it are the commit count and become the
-    // last numeric pre-release identifier.
+    // metadata. Only treat it as a commit suffix when the remainder is a
+    // short hash, so pre-releases containing `-g` (e.g. `v1.0.0-rc-ga`) fall
+    // through to exact-tag parsing instead of being misparsed.
     if let Some(idx) = body.rfind("-g") {
-        if idx + 2 < body.len() {
+        if idx + 2 < body.len() && is_short_commit(&body[idx + 2..]) {
             let commit = &body[idx + 2..];
             let pre_str = &body[..idx];
 
@@ -488,14 +490,36 @@ fn parse_git_describe(input: &str) -> Result<ReleaseVersion, VersionParseError> 
                 {
                     (pre.to_string(), count.parse::<u64>().ok())
                 }
+                _ if !pre_str.is_empty() && pre_str.chars().all(|c| c.is_ascii_digit()) => {
+                    (String::new(), pre_str.parse::<u64>().ok())
+                }
                 _ => (pre_str.to_string(), None),
             };
 
-            let mut pre = if tag_pre.is_empty() {
-                Vec::new()
-            } else {
-                parse_pre_identifiers(&tag_pre, input)?
-            };
+            if tag_pre.is_empty() {
+                // Commits after a release tag (`v0.4.0-19-g0ea9fdd6`): keep
+                // the distance in build metadata (`0.4.0+19.g0ea9fdd6`) so
+                // the build compares equal to the tag. Putting it in the
+                // pre-release would sort the build *before* the release and
+                // break `min_*_version` checks.
+                let build = match count {
+                    Some(count) => format!("{}.g{}", count, commit),
+                    None => format!("g{}", commit),
+                };
+                return Ok(ReleaseVersion::new(
+                    major,
+                    minor,
+                    patch,
+                    Vec::new(),
+                    dirty_build(Some(build), dirty),
+                ));
+            }
+
+            // Commits after a pre-release tag (`v0.4.0-alpha-121-g…`): append
+            // the count as the last numeric pre-release identifier, which
+            // sorts after the tag's own pre-release and still before the
+            // release (`0.4.0-alpha.121`).
+            let mut pre = parse_pre_identifiers(&tag_pre, input)?;
             if let Some(count) = count {
                 pre.push(PreRelease::Numeric(count));
             }
@@ -728,7 +752,23 @@ mod tests {
     #[test]
     fn git_describe_commit_after_release_tag() {
         let v = ReleaseVersion::from_git_describe("v0.4.1-19-g0ea9fdd6").unwrap();
-        assert_eq!(v.to_string(), "0.4.1-19+g0ea9fdd6");
+        assert_eq!(v.to_string(), "0.4.1+19.g0ea9fdd6");
+    }
+
+    #[test]
+    fn git_describe_commit_after_release_tag_compares_equal_to_tag() {
+        // A build 19 commits after v0.4.0 must not sort before the release;
+        // the distance lives in build metadata, which is ignored for
+        // precedence, so min_*_version = 0.4.0 still accepts it.
+        let after = ReleaseVersion::from_git_describe("v0.4.0-19-g0ea9fdd6").unwrap();
+        let release = ReleaseVersion::from_git_describe("v0.4.0").unwrap();
+        assert!((after >= release), "{} should not be < {}", after, release);
+        assert!(after >= release, "{} should be >= {}", after, release);
+        assert_eq!(after, release);
+        assert_eq!(after, ReleaseVersion::parse("0.4.0+19.g0ea9fdd6").unwrap());
+        // A build after the pre-release tag still sorts before the release.
+        let alpha = ReleaseVersion::from_git_describe("v0.4.0-alpha-121-g26b5dc6b").unwrap();
+        assert!(alpha < release, "{} should be < {}", alpha, release);
     }
 
     #[test]
@@ -737,6 +777,20 @@ mod tests {
         assert_eq!(v.to_string(), "0.4.0-alpha.121+g26b5dc6b.dirty");
         let exact = ReleaseVersion::from_git_describe("v0.2.0-dirty").unwrap();
         assert_eq!(exact.to_string(), "0.2.0+dirty");
+        let release_after = ReleaseVersion::from_git_describe("v0.4.1-19-g0ea9fdd6-dirty").unwrap();
+        assert_eq!(release_after.to_string(), "0.4.1+19.g0ea9fdd6.dirty");
+    }
+
+    #[test]
+    fn git_describe_pre_release_containing_g_suffix_is_not_a_commit() {
+        // An exact tag whose pre-release contains `-g` must not be treated as
+        // a commit suffix (`v1.0.0-rc-ga` -> `1.0.0-rc-ga`, not `1.0.0-rc+ga`).
+        let v = ReleaseVersion::from_git_describe("v1.0.0-rc-ga").unwrap();
+        assert_eq!(v.to_string(), "1.0.0-rc-ga");
+        assert_eq!(v.build(), None);
+        // A real commit suffix is still recognized after such a pre-release.
+        let with_commit = ReleaseVersion::from_git_describe("v1.0.0-rc-ga-5-gabc1234").unwrap();
+        assert_eq!(with_commit.to_string(), "1.0.0-rc-ga.5+gabc1234");
     }
 
     #[test]
