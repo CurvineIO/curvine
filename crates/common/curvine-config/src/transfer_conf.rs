@@ -53,6 +53,8 @@ pub struct TransferConf {
     #[serde(skip)]
     pub allow_submit_with_stale_snapshot: bool,
     pub max_running_transfers: usize,
+    /// Maximum number of distinct auto-cache requests waiting for client-side submission.
+    pub client_pending_queue_size: usize,
     #[serde(skip, default = "TransferConf::default_max_tasks_per_transfer")]
     pub max_tasks_per_transfer: usize,
     #[serde(
@@ -150,6 +152,11 @@ impl TransferConf {
         if self.max_running_transfers == 0 {
             return Err(FsError::common(
                 "transfer.max_running_transfers must be greater than 0",
+            ));
+        }
+        if self.client_pending_queue_size == 0 {
+            return Err(FsError::common(
+                "transfer.client_pending_queue_size must be greater than 0",
             ));
         }
         if self.ufs_max_concurrency_per_endpoint == 0 {
@@ -289,7 +296,7 @@ impl TransferConf {
     }
 
     pub fn client_pending_queue_size(&self) -> usize {
-        Self::DEFAULT_CLIENT_PENDING_QUEUE_SIZE
+        self.client_pending_queue_size
     }
 
     pub fn cleanup_batch_size(&self) -> usize {
@@ -338,6 +345,7 @@ impl Default for TransferConf {
             mysql_url: String::new(),
             allow_submit_with_stale_snapshot: false,
             max_running_transfers: 64,
+            client_pending_queue_size: Self::DEFAULT_CLIENT_PENDING_QUEUE_SIZE,
             max_tasks_per_transfer: Self::DEFAULT_MAX_TASKS_PER_TRANSFER,
             ufs_max_concurrency_per_endpoint: Self::DEFAULT_UFS_MAX_CONCURRENCY_PER_ENDPOINT,
             task_max_retries: Self::DEFAULT_TASK_MAX_RETRIES,
@@ -387,6 +395,25 @@ mod tests {
         .unwrap();
 
         assert_eq!(conf.log.file_name, "transfer-test.log");
+    }
+
+    #[test]
+    fn parses_client_pending_queue_size() {
+        let mut conf: TransferConf = toml::from_str("client_pending_queue_size = 2048").unwrap();
+        conf.init().unwrap();
+
+        assert_eq!(conf.client_pending_queue_size(), 2048);
+    }
+
+    #[test]
+    fn rejects_zero_client_pending_queue_size() {
+        let mut conf = TransferConf {
+            client_pending_queue_size: 0,
+            ..Default::default()
+        };
+
+        let err = conf.init().unwrap_err().to_string();
+        assert!(err.contains("transfer.client_pending_queue_size must be greater than 0"));
     }
 
     #[test]

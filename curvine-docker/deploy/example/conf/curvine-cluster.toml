@@ -55,6 +55,7 @@ master_addrs = [
 enabled = false
 rpc_port = 9010
 web_port = 9011
+client_pending_queue_size = 1024
 log = { level = "info", log_dir = "./logs", file_name = "transfer.log" }
 
 [fuse]

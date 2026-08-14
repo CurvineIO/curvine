@@ -68,6 +68,7 @@ short_circuit = false
 enabled = true
 rpc_port = 9010
 web_port = 9011
+client_pending_queue_size = 1024
 log = { level = "debug", log_dir = "stdout", file_name = "transfer.log" }
 
 # fuse configuration  

@@ -122,11 +122,22 @@ pub struct FilesystemConf {
     pub transfer: TransferClientConf,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TransferClientConf {
     pub enabled: bool,
     pub endpoints: Vec<String>,
+    pub client_pending_queue_size: usize,
+}
+
+impl Default for TransferClientConf {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoints: vec![],
+            client_pending_queue_size: TransferConf::DEFAULT_CLIENT_PENDING_QUEUE_SIZE,
+        }
+    }
 }
 
 impl FilesystemConf {
@@ -286,6 +297,7 @@ impl FilesystemConf {
             transfer: TransferConf {
                 enabled: self.transfer.enabled,
                 endpoints: self.transfer.endpoints,
+                client_pending_queue_size: self.transfer.client_pending_queue_size,
                 ..Default::default()
             },
             ..Default::default()
@@ -306,6 +318,7 @@ mod tests {
         conf.transfer = TransferClientConf {
             enabled: true,
             endpoints: vec!["transfer-0:9010".to_string(), "transfer-1:9010".to_string()],
+            client_pending_queue_size: 2048,
         };
 
         let cluster = conf.into_cluster_conf().unwrap();
@@ -315,6 +328,7 @@ mod tests {
             cluster.transfer.endpoints,
             vec!["transfer-0:9010", "transfer-1:9010"]
         );
+        assert_eq!(cluster.transfer.client_pending_queue_size(), 2048);
     }
 
     #[test]
@@ -344,6 +358,7 @@ mod tests {
                 [transfer]
                 enabled = true
                 endpoints = ["transfer-0:9010", "transfer-1:9010"]
+                client_pending_queue_size = 4096
             "#,
         )
         .unwrap();
@@ -355,5 +370,6 @@ mod tests {
             cluster.transfer.endpoints,
             vec!["transfer-0:9010", "transfer-1:9010"]
         );
+        assert_eq!(cluster.transfer.client_pending_queue_size(), 4096);
     }
 }
