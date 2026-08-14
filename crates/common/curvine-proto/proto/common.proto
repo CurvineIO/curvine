@@ -221,3 +221,38 @@ message ListOptionsProto {
     optional int32 limit = 1;
     optional string start_after = 2;
 }
+
+// Structured version/protocol information reported by every Curvine component
+// (master, worker, client, fuse, cli, csi, sdk) on the wire.
+//
+// Internal fields are numbered consecutively from 1. Existing messages that
+// carry this message as cross-cutting protocol metadata use the reserved
+// 1000+ field range instead, so adding it never collides with business fields.
+message ComponentInfoProto {
+    optional string component = 1 [default = ""];
+    optional string release_version = 2 [default = ""];
+    optional string git_commit = 3 [default = ""];
+    optional string git_tag = 4 [default = ""];
+    optional string git_branch = 5 [default = ""];
+    optional uint32 protocol_version = 6 [default = 1];
+    optional uint32 min_protocol_version = 7 [default = 1];
+    repeated string capabilities = 8;
+}
+
+// Compatibility enforcement mode of a server when a peer version is outside
+// the supported range. diagnose records warnings and allows the request;
+// enforce rejects incompatible peers with an explicit error.
+enum CompatibilityModeProto {
+    COMPATIBILITY_MODE_PROTO_DIAGNOSE = 1;
+    COMPATIBILITY_MODE_PROTO_ENFORCE = 2;
+}
+
+// Server-side compatibility contract exchanged during handshake (e.g.
+// GetFilesystemInfo) and structured version reporting (e.g. worker heartbeat).
+message ServerCompatibilityInfoProto {
+    required ComponentInfoProto server = 1;
+    required string min_worker_version = 2 [default = ""];
+    required string min_client_version = 3 [default = ""];
+    required CompatibilityModeProto compatibility_mode = 4 [default = COMPATIBILITY_MODE_PROTO_DIAGNOSE];
+    repeated string blocked_versions = 5;
+}
