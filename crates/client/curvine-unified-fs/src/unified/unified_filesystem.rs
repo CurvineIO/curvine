@@ -204,12 +204,12 @@ impl UnifiedFileSystem {
 
     pub async fn get_master_info(&self) -> FsResult<MasterInfo> {
         let fut = async { self.cv.get_master_info().await };
-        self.track("GetMasterInfo", "", "", fut).await
+        self.track("GetFilesystemInfo", "", "", fut).await
     }
 
     pub async fn get_master_info_bytes(&self) -> FsResult<BytesMut> {
         let fut = async { self.cv.get_master_info_bytes().await };
-        self.track("GetMasterInfo", "", "", fut).await
+        self.track("GetFilesystemInfo", "", "", fut).await
     }
 
     pub async fn mount(&self, ufs_path: &Path, cv_path: &Path, opts: MountOptions) -> FsResult<()> {

@@ -209,12 +209,12 @@ message GetBlockLocationsResponse {
     required FileBlocksProto blocks = 1;
 }
 
-// Request master profile information.
-message GetMasterInfoRequest {
+// Request filesystem-wide information (statfs backend).
+message GetFilesystemInfoRequest {
 
 }
 
-message GetMasterInfoResponse {
+message GetFilesystemInfoResponse {
     required string active_master = 1;
     repeated string journal_nodes = 2;
 

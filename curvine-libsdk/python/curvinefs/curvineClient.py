@@ -9,7 +9,7 @@ import curvine_libsdk
 from curvine_libsdk._proto.common_pb2 import FileStatusProto
 from curvine_libsdk._proto.master_pb2 import (
     GetFileStatusResponse,
-    GetMasterInfoResponse,
+    GetFilesystemInfoResponse,
     ListStatusResponse,
 )
 
@@ -112,7 +112,7 @@ class CurvineClient:
             status_bytes = curvine_libsdk.python_io_curvine_curvine_native_get_master_info(self.file_system_ptr)
         except Exception as e:
             raise IOError(f"Native get master information failed: {e}")
-        status = GetMasterInfoResponse()
+        status = GetFilesystemInfoResponse()
         status.ParseFromString(status_bytes)
         status_dict = {
             "active_master": status.active_master,

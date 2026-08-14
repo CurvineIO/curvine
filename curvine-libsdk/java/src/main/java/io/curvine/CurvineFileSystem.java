@@ -41,7 +41,7 @@ import org.slf4j.LoggerFactory;
 import io.curvine.exception.CurvineException;
 import io.curvine.proto.FileStatusProto;
 import io.curvine.proto.GetFileStatusResponse;
-import io.curvine.proto.GetMasterInfoResponse;
+import io.curvine.proto.GetFilesystemInfoResponse;
 import io.curvine.proto.GetMountInfoResponse;
 import io.curvine.proto.ListStatusResponse;
 import io.curvine.proto.MountInfoProto;
@@ -450,7 +450,7 @@ public class CurvineFileSystem extends FileSystem {
         }
 
         byte[] bytes = libFs.getMasterInfo();
-        GetMasterInfoResponse info = GetMasterInfoResponse.parseFrom(bytes);
+        GetFilesystemInfoResponse info = GetFilesystemInfoResponse.parseFrom(bytes);
         return new CurvineFsStat(info);
     }
 
