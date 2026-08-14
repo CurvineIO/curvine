@@ -22,7 +22,7 @@ use curvine_error::FsError;
 use curvine_fs_api::{FileSystem, Path};
 use curvine_runtime::common::Logger;
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
-use log::info;
+use log::{info, warn};
 use std::sync::Arc;
 
 /// Runs the default mount command using the given CLI arguments.
@@ -48,6 +48,15 @@ pub fn run_mount(args: FuseRuntimeArgs) -> CommonResult<()> {
     rt.block_on(async move {
         let fs = CurvineFileSystem::new(cluster_conf, fuse_rt.clone())?;
         let conf = fs.conf().clone();
+
+        // Client-master version handshake: report this client's component_info
+        // and cache the master's advertised version / protocol / capabilities.
+        // A master without a compatibility contract is a legacy peer and is
+        // never rejected; a failed handshake degrades to legacy assumptions
+        // instead of blocking the mount.
+        if let Err(e) = fs.fs().handshake().await {
+            warn!("client-master handshake failed: {e}; continuing with legacy assumptions");
+        }
 
         ensure_fs_path_exists(&fs, &conf).await?;
 

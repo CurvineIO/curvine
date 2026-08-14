@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::block::{BlockClient, BlockClientPool};
-use crate::file::FsClient;
+use crate::file::{FsClient, MasterHandshake};
 use crate::ClientMetrics;
 use curvine_config::ClusterConf;
 use curvine_error::FsResult;
@@ -26,6 +26,7 @@ use curvine_proto::ClientAddressProto;
 use curvine_rpc::client::{ClientConf, ClusterConnector};
 use curvine_runtime::common::{TimeSpent, Utils};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use curvine_runtime::sync::FastRwLock;
 use fxhash::FxHasher;
 use log::warn;
 use moka::policy::EvictionPolicy;
@@ -49,6 +50,11 @@ pub struct FsContext {
     pub(crate) os_cache: CacheManager,
     pub(crate) failed_workers: Cache<u32, WorkerAddress, BuildHasherDefault<FxHasher>>,
     pub(crate) block_pool: Arc<BlockClientPool>,
+    // Client-master handshake result: the master's advertised version /
+    // protocol / capabilities (or a legacy marker when the master does not
+    // advertise a compatibility contract). Populated by the first
+    // GetFilesystemInfo call and shared by every FsClient clone.
+    master_handshake: Arc<FastRwLock<MasterHandshake>>,
 }
 
 impl FsContext {
@@ -102,12 +108,26 @@ impl FsContext {
             os_cache,
             failed_workers: exclude_workers,
             block_pool,
+            master_handshake: Arc::new(FastRwLock::new(MasterHandshake::default())),
         };
         Ok(context)
     }
 
     pub fn clone_client_name(&self) -> String {
         self.client_addr.client_name.clone()
+    }
+
+    /// Cache the master's advertised version / protocol / capabilities from
+    /// the client-master handshake. A master without a compatibility contract
+    /// is recorded as legacy and never rejected.
+    pub fn set_master_handshake(&self, handshake: MasterHandshake) {
+        *self.master_handshake.write() = handshake;
+    }
+
+    /// Cached master handshake. Defaults to a legacy peer before the first
+    /// successful handshake so no component is rejected by default.
+    pub fn master_handshake(&self) -> MasterHandshake {
+        self.master_handshake.read().clone()
     }
 
     pub fn conf(&self) -> &ClusterConf {

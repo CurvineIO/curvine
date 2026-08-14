@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::file::FsContext;
+use crate::file::{FsContext, MasterHandshake};
 use bytes::BytesMut;
 use curvine_config::{ClientConf, ClusterConf, UfsConf, UfsConfBuilder};
 use curvine_core_error::err_box;
@@ -532,10 +532,40 @@ impl FsClient {
     }
 
     pub async fn get_filesystem_info(&self) -> FsResult<FilesystemInfo> {
-        let header = GetFilesystemInfoRequest::default();
+        let header = GetFilesystemInfoRequest {
+            // Client-master handshake: report this client's structured version
+            // on the reserved 1000+ range. Legacy masters skip the unknown
+            // field and legacy clients omit it entirely.
+            component_info: Some(Self::handshake_request_component_info()),
+        };
         let rep: GetFilesystemInfoResponse = self.rpc(RpcCode::GetFilesystemInfo, header).await?;
-        let res = ProtoUtils::filesystem_info_from_pb(rep);
-        Ok(res)
+        // Cache the master's advertised version / protocol / capabilities; a
+        // master without a compatibility contract is recorded as legacy and
+        // never rejected.
+        self.context
+            .set_master_handshake(MasterHandshake::from_response(&rep));
+        Ok(ProtoUtils::filesystem_info_from_pb(rep))
+    }
+
+    /// Client-master version handshake: report this client's `component_info`
+    /// and cache the master's advertised version / protocol / capabilities.
+    /// Returns the cached handshake; a master without a compatibility
+    /// contract is reported as a legacy peer and is never rejected.
+    pub async fn handshake(&self) -> FsResult<MasterHandshake> {
+        let _ = self.get_filesystem_info().await?;
+        Ok(self.master_handshake())
+    }
+
+    /// Cached master handshake (version / protocol / capabilities). Before the
+    /// first handshake and against legacy masters this reports a legacy peer,
+    /// which is never rejected.
+    pub fn master_handshake(&self) -> MasterHandshake {
+        self.context.master_handshake()
+    }
+
+    /// Build the client's own `component_info` payload for the handshake.
+    fn handshake_request_component_info() -> ComponentInfoProto {
+        ProtoUtils::component_version_to_pb(&curvine_sys::version::component_version("client"))
     }
 
     pub async fn get_filesystem_info_bytes(&self) -> FsResult<BytesMut> {
@@ -750,5 +780,45 @@ impl FsClient {
 
     pub fn client_addr(&self) -> &ClientAddress {
         &self.context.client_addr
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_proto::GetFilesystemInfoRequest;
+
+    #[test]
+    fn handshake_request_carries_client_component_info() {
+        // A new client reports its own structured version during the
+        // handshake so the master can diagnose mixed-version clusters.
+        let info = FsClient::handshake_request_component_info();
+        let req = GetFilesystemInfoRequest {
+            component_info: Some(info),
+        };
+
+        let encoded = req.encode_to_vec();
+        let decoded = GetFilesystemInfoRequest::decode(encoded.as_slice()).unwrap();
+        let decoded_info = decoded.component_info.unwrap();
+        assert_eq!(decoded_info.component.as_deref(), Some("client"));
+        assert_eq!(decoded_info.protocol_version, Some(1));
+        assert_eq!(decoded_info.min_protocol_version, Some(1));
+    }
+
+    #[test]
+    fn handshake_request_is_backward_compatible() {
+        // The request only adds an optional field on the reserved 1000+ range:
+        // a legacy master's view of the message (no component_info) must
+        // decode the payload and ignore the unknown field.
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        struct LegacyGetFilesystemInfoRequest {}
+
+        let req = GetFilesystemInfoRequest {
+            component_info: Some(FsClient::handshake_request_component_info()),
+        };
+        let encoded = req.encode_to_vec();
+
+        let legacy = LegacyGetFilesystemInfoRequest::decode(encoded.as_slice()).unwrap();
+        assert_eq!(legacy, LegacyGetFilesystemInfoRequest {});
     }
 }

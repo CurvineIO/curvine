@@ -16,7 +16,9 @@ use crate::{
     FallbackFsReader, MountCache, MountValue, UnifiedReader, UnifiedWriter, WriteCacheWriter,
 };
 use bytes::BytesMut;
-use curvine_client_core::file::{CurvineFileSystem, FsClient, FsContext, FsReader};
+use curvine_client_core::file::{
+    CurvineFileSystem, FsClient, FsContext, FsReader, MasterHandshake,
+};
 use curvine_client_core::ClientMetrics;
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, err_ext};
@@ -262,6 +264,20 @@ impl UnifiedFileSystem {
     pub async fn get_filesystem_info(&self) -> FsResult<FilesystemInfo> {
         let fut = async { self.cv.get_filesystem_info().await };
         self.track("GetFilesystemInfo", "", "", fut).await
+    }
+
+    /// Client-master version handshake: report this client's `component_info`
+    /// and cache the master's advertised version / protocol / capabilities.
+    pub async fn handshake(&self) -> FsResult<MasterHandshake> {
+        let fut = async { self.cv.handshake().await };
+        self.track("GetFilesystemInfo", "", "", fut).await
+    }
+
+    /// Cached master handshake (version / protocol / capabilities). Before the
+    /// first handshake and against legacy masters this reports a legacy peer,
+    /// which is never rejected.
+    pub fn master_handshake(&self) -> MasterHandshake {
+        self.cv.master_handshake()
     }
 
     pub async fn get_filesystem_info_bytes(&self) -> FsResult<BytesMut> {

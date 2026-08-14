@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::block::BatchBlockWriter;
-use crate::file::{FsClient, FsContext, FsReader, FsWriter, FsWriterBase};
+use crate::file::{FsClient, FsContext, FsReader, FsWriter, FsWriterBase, MasterHandshake};
 use crate::ClientMetrics;
 use async_stream::stream;
 use bytes::BytesMut;
@@ -288,6 +288,19 @@ impl CurvineFileSystem {
 
     pub async fn get_filesystem_info(&self) -> FsResult<FilesystemInfo> {
         self.fs_client.get_filesystem_info().await
+    }
+
+    /// Client-master version handshake: report this client's `component_info`
+    /// and cache the master's advertised version / protocol / capabilities.
+    pub async fn handshake(&self) -> FsResult<MasterHandshake> {
+        self.fs_client.handshake().await
+    }
+
+    /// Cached master handshake (version / protocol / capabilities). Before the
+    /// first handshake and against legacy masters this reports a legacy peer,
+    /// which is never rejected.
+    pub fn master_handshake(&self) -> MasterHandshake {
+        self.fs_client.master_handshake()
     }
 
     pub async fn get_filesystem_info_bytes(&self) -> FsResult<BytesMut> {
