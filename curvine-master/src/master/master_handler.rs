@@ -602,6 +602,7 @@ impl MasterHandler {
             header.software_version,
             u64::try_from(header.fs_ctime).unwrap_or_default(),
             ProtoUtils::storage_info_list_from_pb(header.storages),
+            header.component_info,
         )?;
         Ok(cmds)
     }
@@ -1046,12 +1047,23 @@ mod tests {
             rpc_port: 1234,
             web_port: 5678,
         };
+        let component_info = curvine_proto::ComponentInfoProto {
+            component: Some("worker".to_string()),
+            release_version: Some("0.4.0-alpha".to_string()),
+            git_commit: Some("24c848719b5b4fea74519d91cbe462bb49761b36".to_string()),
+            git_tag: Some("v0.4.0-alpha".to_string()),
+            git_branch: Some("main".to_string()),
+            protocol_version: Some(1),
+            min_protocol_version: Some(1),
+            capabilities: vec!["transfer".to_string()],
+        };
         let header = WorkerHeartbeatRequest {
             status: HeartbeatStatus::Running.into(),
             cluster_id: conf.cluster_id.clone(),
             address: ProtoUtils::worker_address_to_pb(&address),
             software_version: "0.1.0-test".to_string(),
             fs_ctime: 123_456,
+            component_info: Some(component_info.clone()),
             ..Default::default()
         };
 
@@ -1065,6 +1077,9 @@ mod tests {
             .unwrap();
         assert_eq!(worker.software_version, "0.1.0-test");
         assert_eq!(worker.startup_time_ms, 123_456);
+        // Structured version metadata survives heartbeat -> WorkerInfo ->
+        // WorkerInfoProto (filesystem_info) -> WorkerInfo round trip.
+        assert_eq!(worker.component_info, Some(component_info));
     }
 
     #[test]

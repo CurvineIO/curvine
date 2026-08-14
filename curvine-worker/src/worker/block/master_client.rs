@@ -84,6 +84,9 @@ impl MasterClient {
             transfer_source_read_plan: Some(transfer_capabilities.source_read_plan),
             software_version: self.software_version.clone(),
             fs_ctime: self.startup_time_ms as i64,
+            component_info: Some(ProtoUtils::component_version_to_pb(
+                &version::component_version("worker"),
+            )),
             ..Default::default()
         };
         for item in storages {

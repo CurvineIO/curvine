@@ -86,6 +86,13 @@ message WorkerHeartbeatRequest {
     optional bool transfer_query_task = 14 [default = false];
     optional bool transfer_attempt_safe_output = 15 [default = false];
     optional bool transfer_source_read_plan = 16 [default = false];
+
+    // Structured version/protocol metadata reported by the worker on the
+    // reserved 1000+ cross-cutting range. Legacy workers omit this field and
+    // keep sending only `software_version`; newer masters treat absence as a
+    // legacy/unknown peer and ignore the field, so mixed-version clusters
+    // keep working untouched.
+    optional ComponentInfoProto component_info = 1000;
 }
 
 message WorkerHeartbeatResponse {

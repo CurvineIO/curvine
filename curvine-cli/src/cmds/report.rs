@@ -16,6 +16,7 @@ use crate::util::*;
 use clap::{Parser, Subcommand};
 use curvine_core_error::CommonResult;
 use curvine_model::{FilesystemInfo, WorkerInfo};
+use curvine_proto::ComponentInfoProto;
 use curvine_unified_fs::UnifiedFileSystem;
 use serde::Serialize;
 
@@ -391,8 +392,20 @@ impl CurvineReport {
 
     fn worker_detail_suffix(worker: &WorkerInfo) -> String {
         let mut details = vec![];
-        if !worker.software_version.is_empty() {
-            details.push(format!("version={}", worker.software_version));
+        // Prefer the structured component info reported on the reserved 1000+
+        // range; fall back to the legacy display string for older workers.
+        match &worker.component_info {
+            Some(info) => {
+                let display = Self::component_info_display(info);
+                if !display.is_empty() {
+                    details.push(display);
+                }
+            }
+            None => {
+                if !worker.software_version.is_empty() {
+                    details.push(format!("version={}", worker.software_version));
+                }
+            }
         }
         if worker.startup_time_ms > 0 {
             details.push(format!(
@@ -406,6 +419,25 @@ impl CurvineReport {
         } else {
             format!(", {}", details.join(", "))
         }
+    }
+
+    /// Render the structured worker version metadata as a compact string.
+    fn component_info_display(info: &ComponentInfoProto) -> String {
+        let mut parts = vec![];
+        if let Some(component) = info.component.as_deref().filter(|s| !s.is_empty()) {
+            parts.push(format!("component={}", component));
+        }
+        if let Some(version) = info.release_version.as_deref().filter(|s| !s.is_empty()) {
+            parts.push(format!("version={}", version));
+        }
+        if let Some(commit) = info.git_commit.as_deref().filter(|s| !s.is_empty()) {
+            parts.push(format!("commit={}", commit));
+        }
+        if let Some(protocol) = info.protocol_version {
+            parts.push(format!("protocol={}", protocol));
+        }
+
+        parts.join(", ")
     }
 
     fn format_epoch_ms(timestamp_ms: u64) -> String {
@@ -485,5 +517,44 @@ mod tests {
             "startup_time={}",
             CurvineReport::format_epoch_ms(startup_time_ms)
         )));
+    }
+
+    #[test]
+    fn simple_report_renders_structured_worker_version() {
+        let startup_time_ms = 123_456;
+        let worker = WorkerInfo {
+            address: WorkerAddress {
+                worker_id: 7,
+                hostname: "worker-host".to_string(),
+                ip_addr: "127.0.0.1".to_string(),
+                rpc_port: 1234,
+                web_port: 5678,
+            },
+            software_version: "0.1.0-test".to_string(),
+            startup_time_ms,
+            component_info: Some(curvine_proto::ComponentInfoProto {
+                component: Some("worker".to_string()),
+                release_version: Some("0.4.0-alpha".to_string()),
+                git_commit: Some("24c8487".to_string()),
+                protocol_version: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let report = CurvineReport {
+            info: FilesystemInfo {
+                live_workers: vec![worker],
+                ..Default::default()
+            },
+        };
+
+        let output = report.simple(true);
+
+        // Structured component info is preferred over the legacy display string.
+        assert!(output.contains("component=worker"));
+        assert!(output.contains("version=0.4.0-alpha"));
+        assert!(output.contains("commit=24c8487"));
+        assert!(output.contains("protocol=1"));
+        assert!(!output.contains("version=0.1.0-test"));
     }
 }

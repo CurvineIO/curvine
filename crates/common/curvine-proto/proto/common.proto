@@ -178,6 +178,11 @@ message WorkerInfoProto {
     optional bool transfer_source_read_plan = 15 [default = false];
     optional string software_version = 16 [default = ""];
     optional uint64 startup_time_ms = 17 [default = 0];
+
+    // Structured version/protocol metadata reported by the worker on the
+    // reserved 1000+ cross-cutting range. Legacy workers omit this field;
+    // consumers must treat absence as a legacy/unknown peer.
+    optional ComponentInfoProto component_info = 1000;
 }
 
 message FileAllocOptsProto {

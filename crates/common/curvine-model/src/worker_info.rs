@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::state::{StorageInfo, WorkerAddress, WorkerStatus};
+use curvine_proto::ComponentInfoProto;
 use curvine_runtime::common::LocalTime;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -68,6 +69,10 @@ pub struct WorkerInfo {
     pub status: WorkerStatus,
     pub worker_session_id: String,
     pub transfer_capabilities: TransferWorkerCapabilities,
+    /// Structured version/protocol metadata reported by the worker on its
+    /// heartbeat. `None` means a legacy worker that only sent the display
+    /// string `software_version`.
+    pub component_info: Option<ComponentInfoProto>,
 }
 
 impl WorkerInfo {
@@ -92,6 +97,7 @@ impl WorkerInfo {
             status: WorkerStatus::Live,
             worker_session_id: String::new(),
             transfer_capabilities: TransferWorkerCapabilities::default(),
+            component_info: None,
         }
     }
 
@@ -168,6 +174,7 @@ impl Default for WorkerInfo {
             status: WorkerStatus::Live,
             worker_session_id: String::new(),
             transfer_capabilities: TransferWorkerCapabilities::default(),
+            component_info: None,
         }
     }
 }
