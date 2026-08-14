@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 
 import curvinefs.curvineClient as curvine_client
 import os
+import warnings
 
 
 class CurvineFileSystem(AbstractFileSystem):
@@ -639,6 +640,15 @@ class CurvineFileSystem(AbstractFileSystem):
             Dictionary containing cluster information.
         """
         return self.client.get_filesystem_info()
+
+    def get_master_info(self) -> Dict[str, Any]:
+        """Deprecated alias of :meth:`get_filesystem_info`."""
+        warnings.warn(
+            "get_master_info() is deprecated, use get_filesystem_info()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.get_filesystem_info()
 
     def close(self) -> None:
         """Close the file system connection."""

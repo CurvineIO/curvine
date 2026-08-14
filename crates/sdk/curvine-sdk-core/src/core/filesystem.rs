@@ -121,6 +121,13 @@ impl LibFilesystem {
             .block_on(async { self.inner().get_filesystem_info_bytes().await })
     }
 
+    #[deprecated(
+        note = "renamed to get_filesystem_info; returns whole-filesystem stats, not master-process info"
+    )]
+    pub fn get_master_info(&self) -> FsResult<BytesMut> {
+        self.get_filesystem_info()
+    }
+
     pub fn get_mount_info(&self, path: impl AsRef<str>) -> FsResult<BytesMut> {
         let path = Path::from_str(path)?;
         self.rt()

@@ -4,6 +4,7 @@ This module provides the CurvineClient class which serves as the primary
 interface for interacting with the Curvine distributed file system.
 """
 from typing import Any, Dict, List, Optional, Union
+import warnings
 
 import curvine_libsdk
 from curvine_libsdk._proto.common_pb2 import FileStatusProto
@@ -131,6 +132,20 @@ class CurvineClient:
             "lost_workers": list(status.lost_workers),
         }
         return status_dict
+
+    def get_master_info(self) -> Dict[str, Any]:
+        """Deprecated alias of :meth:`get_filesystem_info`.
+
+        The RPC returns whole-filesystem statistics, not master-process
+        information. Kept for source compatibility; will be removed in a
+        future release.
+        """
+        warnings.warn(
+            "get_master_info() is deprecated, use get_filesystem_info()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.get_filesystem_info()
 
     def mkdir(self, path: str, create_parents: bool) -> None:
         """Create a directory.

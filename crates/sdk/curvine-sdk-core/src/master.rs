@@ -31,6 +31,13 @@ impl MasterClient {
         self.session.unified().get_filesystem_info().await
     }
 
+    #[deprecated(
+        note = "renamed to get_filesystem_info; returns whole-filesystem stats, not master-process info"
+    )]
+    pub async fn get_master_info(&self) -> FsResult<FilesystemInfo> {
+        self.get_filesystem_info().await
+    }
+
     /// Returns total and available capacity in a single RPC.
     pub async fn capacity_stats(&self) -> FsResult<(i64, i64)> {
         let info = self.get_filesystem_info().await?;

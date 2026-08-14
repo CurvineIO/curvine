@@ -22,3 +22,10 @@ pub fn get_filesystem_info(session: &Session) -> FsResult<FilesystemInfo> {
         .runtime()
         .block_on(async { session.unified().get_filesystem_info().await })
 }
+
+#[deprecated(
+    note = "renamed to get_filesystem_info; returns whole-filesystem stats, not master-process info"
+)]
+pub fn get_master_info(session: &Session) -> FsResult<FilesystemInfo> {
+    get_filesystem_info(session)
+}
