@@ -37,6 +37,10 @@ pub struct MasterClient {
     pub(crate) worker_session_id: String,
     pub(crate) software_version: String,
     pub(crate) startup_time_ms: u64,
+    /// Prebuilt structured component metadata reported on every heartbeat.
+    /// Constant for the lifetime of the worker process, so it is built once
+    /// and cloned into each request instead of re-allocated on the hot path.
+    pub(crate) component_info: ComponentInfoProto,
 }
 
 impl MasterClient {
@@ -51,6 +55,8 @@ impl MasterClient {
     ) -> Self {
         // Directly reused file system client service.
         let fs_client = FsClient::new(context);
+        let component_info =
+            ProtoUtils::component_version_to_pb(&version::component_version("worker"));
         Self {
             fs_client,
             cluster_id: cluster_id.into(),
@@ -60,6 +66,7 @@ impl MasterClient {
             worker_session_id: worker_session_id.into(),
             software_version: version::VERSION.to_string(),
             startup_time_ms,
+            component_info,
         }
     }
 
@@ -84,9 +91,7 @@ impl MasterClient {
             transfer_source_read_plan: Some(transfer_capabilities.source_read_plan),
             software_version: self.software_version.clone(),
             fs_ctime: self.startup_time_ms as i64,
-            component_info: Some(ProtoUtils::component_version_to_pb(
-                &version::component_version("worker"),
-            )),
+            component_info: Some(self.component_info.clone()),
             ..Default::default()
         };
         for item in storages {
