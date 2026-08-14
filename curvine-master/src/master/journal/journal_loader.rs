@@ -229,7 +229,14 @@ impl JournalLoader {
         // Raft appends an empty no-op entry when a leader is elected. It has no
         // metadata mutation, but still advances the committed apply high-water mark.
         if entry.data.is_empty() {
-            self.set_applied(is_leader, Self::build_applied(entry), false)?;
+            let mut applied = if is_leader {
+                cur.ufs_applied
+            } else {
+                cur.applied
+            };
+            applied.term = entry.term;
+            applied.index = entry.index;
+            self.set_applied(is_leader, applied, false)?;
             return Ok(());
         }
 
