@@ -532,13 +532,32 @@ impl FsClient {
     }
 
     pub async fn get_filesystem_info(&self) -> FsResult<FilesystemInfo> {
-        let header = GetFilesystemInfoRequest {
-            // Client-master handshake: report this client's structured version
-            // on the reserved 1000+ range. Legacy masters skip the unknown
-            // field and legacy clients omit it entirely.
-            component_info: Some(Self::handshake_request_component_info()),
+        // Attach this client's component_info only on the first
+        // GetFilesystemInfo per session (the handshake). GetFilesystemInfo
+        // backs FUSE statfs and may be called frequently by the kernel, so
+        // later calls omit the payload; the response is still parsed and
+        // cached on every call. Legacy masters skip the unknown field and
+        // legacy clients omit it entirely.
+        let report_component = self.context.claim_handshake_report();
+        let header = if report_component {
+            GetFilesystemInfoRequest {
+                component_info: Some(Self::handshake_request_component_info()),
+            }
+        } else {
+            GetFilesystemInfoRequest::default()
         };
-        let rep: GetFilesystemInfoResponse = self.rpc(RpcCode::GetFilesystemInfo, header).await?;
+        let rep: GetFilesystemInfoResponse =
+            match self.rpc(RpcCode::GetFilesystemInfo, header).await {
+                Ok(rep) => rep,
+                Err(e) => {
+                    // The reporting request never reached the master: allow a
+                    // later retry to report the handshake.
+                    if report_component {
+                        self.context.reset_handshake_report();
+                    }
+                    return Err(e);
+                }
+            };
         // Cache the master's advertised version / protocol / capabilities; a
         // master without a compatibility contract is recorded as legacy and
         // never rejected.

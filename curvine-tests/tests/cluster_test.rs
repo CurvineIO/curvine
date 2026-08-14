@@ -115,12 +115,11 @@ fn test_client_master_handshake_on_cluster() -> CommonResult<()> {
 
         let hs = fs.master_handshake();
         assert!(
-            !hs.legacy,
+            !hs.is_legacy(),
             "a new master must advertise a compatibility contract"
         );
         let compat = hs
-            .compatibility
-            .as_ref()
+            .compatibility()
             .expect("master compatibility must be cached after the handshake");
         assert_eq!(compat.server.component.as_deref(), Some("master"));
         assert_eq!(hs.protocol_version(), Some(1));
@@ -130,9 +129,11 @@ fn test_client_master_handshake_on_cluster() -> CommonResult<()> {
             curvine_model::proto::CompatibilityModeProto::Diagnose
         );
 
-        // A second handshake is idempotent and keeps the cached contract.
+        // A second handshake is idempotent and keeps the cached contract;
+        // component_info is reported only once per session (the flag is
+        // already claimed), which also keeps statfs queries lean.
         let hs2 = fs.handshake().await?;
-        assert_eq!(hs2.compatibility, hs.compatibility);
+        assert_eq!(hs2.compatibility(), hs.compatibility());
         Ok::<(), CommonError>(())
     })?;
 
@@ -158,8 +159,8 @@ fn test_client_handshake_accepts_legacy_master_response() -> CommonResult<()> {
     assert!(legacy_response.compatibility.is_none());
 
     let hs = MasterHandshake::from_response(&legacy_response);
-    assert!(hs.legacy);
-    assert!(hs.compatibility.is_none());
+    assert!(hs.is_legacy());
+    assert!(hs.compatibility().is_none());
     assert!(hs.master_version().is_none());
     assert_eq!(
         hs.compatibility_mode(),

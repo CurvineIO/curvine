@@ -27,14 +27,19 @@ use curvine_proto::{
 };
 
 /// Cached outcome of the client-master version handshake.
+///
+/// Fields are private: instances can only be built through [`Self::default`],
+/// [`Self::legacy`] or [`Self::from_response`], which guarantee that a legacy
+/// handshake never carries a compatibility contract (and vice versa), so
+/// external code cannot construct inconsistent states.
 #[derive(Clone, Debug)]
 pub struct MasterHandshake {
     /// Whether the peer master is a legacy component (it did not advertise a
     /// compatibility contract). Legacy peers are never rejected; the client
     /// degrades to the pre-handshake behavior for them.
-    pub legacy: bool,
+    legacy: bool,
     /// The compatibility contract advertised by the master, when present.
-    pub compatibility: Option<ServerCompatibilityInfoProto>,
+    compatibility: Option<ServerCompatibilityInfoProto>,
 }
 
 impl Default for MasterHandshake {
@@ -46,6 +51,17 @@ impl Default for MasterHandshake {
 }
 
 impl MasterHandshake {
+    /// Whether the peer master is a legacy component (no compatibility
+    /// contract advertised). Legacy peers are never rejected.
+    pub fn is_legacy(&self) -> bool {
+        self.legacy
+    }
+
+    /// The compatibility contract advertised by the master, when present.
+    pub fn compatibility(&self) -> Option<&ServerCompatibilityInfoProto> {
+        self.compatibility.as_ref()
+    }
+
     /// Handshake against a legacy master that did not advertise a
     /// compatibility contract.
     pub fn legacy() -> Self {
@@ -57,7 +73,8 @@ impl MasterHandshake {
 
     /// Parse the handshake from a `GetFilesystemInfo` response. Absence of the
     /// `compatibility` field means the master is a legacy peer and the client
-    /// must not reject it.
+    /// must not reject it. The returned handshake always satisfies the
+    /// invariant `is_legacy() == compatibility().is_none()`.
     pub fn from_response(rep: &GetFilesystemInfoResponse) -> Self {
         match &rep.compatibility {
             Some(compatibility) => Self {
@@ -152,8 +169,8 @@ mod tests {
         // Before any handshake the client must assume a legacy peer: nothing
         // is rejected by default.
         let hs = MasterHandshake::default();
-        assert!(hs.legacy);
-        assert!(hs.compatibility.is_none());
+        assert!(hs.is_legacy());
+        assert!(hs.compatibility().is_none());
         assert_eq!(hs.compatibility_mode(), CompatibilityModeProto::Diagnose);
     }
 
@@ -161,11 +178,8 @@ mod tests {
     fn new_master_response_is_cached_as_non_legacy() {
         let hs = MasterHandshake::from_response(&response_with_compatibility());
 
-        assert!(!hs.legacy);
-        let compat = hs
-            .compatibility
-            .as_ref()
-            .expect("compatibility must be cached");
+        assert!(!hs.is_legacy());
+        let compat = hs.compatibility().expect("compatibility must be cached");
         assert_eq!(compat.server.component.as_deref(), Some("master"));
         assert_eq!(hs.compatibility_mode(), CompatibilityModeProto::Diagnose);
     }
@@ -193,8 +207,8 @@ mod tests {
         // the client treats the peer as legacy and exposes no version data.
         let hs = MasterHandshake::from_response(&legacy_response());
 
-        assert!(hs.legacy);
-        assert!(hs.compatibility.is_none());
+        assert!(hs.is_legacy());
+        assert!(hs.compatibility().is_none());
         assert!(hs.master_version().is_none());
         assert_eq!(hs.protocol_version(), None);
         assert_eq!(hs.min_protocol_version(), None);
@@ -205,21 +219,19 @@ mod tests {
     #[test]
     fn unknown_compatibility_mode_is_treated_as_diagnose() {
         // An unset (0 / UNKNOWN) or invalid mode must stay lenient: the client
-        // never fails closed on a master it does not understand.
-        let mut compat = sample_compatibility();
-        compat.compatibility_mode = 0;
-        let hs = MasterHandshake {
-            legacy: false,
-            compatibility: Some(compat),
-        };
+        // never fails closed on a master it does not understand. Both cases
+        // are exercised through from_response so the constructed handshake
+        // keeps its invariants.
+        let mut rep = response_with_compatibility();
+        rep.compatibility.as_mut().unwrap().compatibility_mode = 0;
+        let hs = MasterHandshake::from_response(&rep);
+        assert!(!hs.is_legacy());
         assert_eq!(hs.compatibility_mode(), CompatibilityModeProto::Diagnose);
 
-        let mut compat = sample_compatibility();
-        compat.compatibility_mode = 99;
-        let hs = MasterHandshake {
-            legacy: false,
-            compatibility: Some(compat),
-        };
+        let mut rep = response_with_compatibility();
+        rep.compatibility.as_mut().unwrap().compatibility_mode = 99;
+        let hs = MasterHandshake::from_response(&rep);
+        assert!(!hs.is_legacy());
         assert_eq!(hs.compatibility_mode(), CompatibilityModeProto::Diagnose);
     }
 }

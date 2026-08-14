@@ -34,6 +34,7 @@ use moka::sync::{Cache, CacheBuilder};
 use once_cell::sync::OnceCell;
 use std::future::Future;
 use std::hash::BuildHasherDefault;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -55,6 +56,11 @@ pub struct FsContext {
     // advertise a compatibility contract). Populated by the first
     // GetFilesystemInfo call and shared by every FsClient clone.
     master_handshake: Arc<FastRwLock<MasterHandshake>>,
+    // Whether this session has already reported its component_info to the
+    // master. Handshake metadata is sent once per mount/session; the flag
+    // keeps GetFilesystemInfo (which backs FUSE statfs and may be called
+    // frequently) from carrying the payload on every request.
+    handshake_reported: Arc<AtomicBool>,
 }
 
 impl FsContext {
@@ -109,6 +115,7 @@ impl FsContext {
             failed_workers: exclude_workers,
             block_pool,
             master_handshake: Arc::new(FastRwLock::new(MasterHandshake::default())),
+            handshake_reported: Arc::new(AtomicBool::new(false)),
         };
         Ok(context)
     }
@@ -128,6 +135,23 @@ impl FsContext {
     /// successful handshake so no component is rejected by default.
     pub fn master_handshake(&self) -> MasterHandshake {
         self.master_handshake.read().clone()
+    }
+
+    /// Atomically claim the one-time right to attach this client's
+    /// `component_info` to a `GetFilesystemInfo` request. Returns `true` only
+    /// for the first caller per session, so handshake metadata is reported
+    /// once and frequent statfs queries stay lean. On a failed RPC the caller
+    /// should call [`Self::reset_handshake_report`] so a later retry can
+    /// still report.
+    pub(crate) fn claim_handshake_report(&self) -> bool {
+        !self.handshake_reported.swap(true, Ordering::Relaxed)
+    }
+
+    /// Allow a later `GetFilesystemInfo` call to report the handshake again
+    /// (used when the first reporting request failed before reaching the
+    /// master).
+    pub(crate) fn reset_handshake_report(&self) {
+        self.handshake_reported.store(false, Ordering::Relaxed);
     }
 
     pub fn conf(&self) -> &ClusterConf {
