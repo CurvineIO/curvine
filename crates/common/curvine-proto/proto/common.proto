@@ -242,8 +242,12 @@ message ComponentInfoProto {
 // Compatibility enforcement mode of a server when a peer version is outside
 // the supported range. diagnose records warnings and allows the request;
 // enforce rejects incompatible peers with an explicit error.
+//
 // UNKNOWN is the zero value so an unset field never maps to an invalid
-// variant on the wire.
+// variant on the wire. Consumers MUST treat UNKNOWN as DIAGNOSE (lenient):
+// the enum's Rust default is UNKNOWN (0) while the compatibility_mode field
+// default is DIAGNOSE (1), so producers must set the field explicitly and
+// consumers must not fail closed when they see UNKNOWN.
 enum CompatibilityModeProto {
     COMPATIBILITY_MODE_PROTO_UNKNOWN = 0;
     COMPATIBILITY_MODE_PROTO_DIAGNOSE = 1;

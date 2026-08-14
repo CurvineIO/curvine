@@ -49,11 +49,16 @@ fn push_varint(buf: &mut Vec<u8>, mut value: u64) {
     }
 }
 
-/// Append an unknown length-delimited field (wire type 2) to a wire buffer.
-fn push_unknown_len_delimited(buf: &mut Vec<u8>, field: u32, payload: &[u8]) {
+/// Append a length-delimited field (wire type 2) to a wire buffer.
+fn push_len_delimited(buf: &mut Vec<u8>, field: u32, payload: &[u8]) {
     push_varint(buf, ((field as u64) << 3) | 2);
     push_varint(buf, payload.len() as u64);
     buf.extend_from_slice(payload);
+}
+
+/// Append an unknown length-delimited field (wire type 2) to a wire buffer.
+fn push_unknown_len_delimited(buf: &mut Vec<u8>, field: u32, payload: &[u8]) {
+    push_len_delimited(buf, field, payload);
 }
 
 /// Append an unknown fixed32 field (wire type 5) to a wire buffer.
@@ -224,15 +229,28 @@ fn test_server_compatibility_info_partial_bounds_round_trip() {
 fn test_server_compatibility_info_unknown_fields_ignored() {
     // Emulate a future handshake response carrying extra high-range fields
     // both at the top level and nested inside the embedded component info.
-    let mut compat = sample_server_compatibility_info();
+    //
+    // Unknown fields must be spliced into the nested `server` buffer WITHOUT
+    // decoding it first (prost 0.11 drops unknown fields on decode), so the
+    // parent decode actually has to skip-through-parent, i.e. skip the unknown
+    // tags inside field 1 while merging the nested ComponentInfoProto. This is
+    // the shape T5/T7 hit: ComponentInfo inside ServerCompatibilityInfo inside
+    // an RPC payload.
+    let nested = sample_component_info().encode_to_vec();
+    let mut nested_with_unknown = nested;
+    push_varint(&mut nested_with_unknown, 1000 << 3);
+    push_varint(&mut nested_with_unknown, 7);
 
-    // Unknown fields inside the nested `server` message (field 1).
-    let mut nested_encoded = compat.server.encode_to_vec();
-    push_varint(&mut nested_encoded, 1000 << 3);
-    push_varint(&mut nested_encoded, 7);
-    compat.server = ComponentInfoProto::decode(nested_encoded.as_slice()).unwrap();
-
-    let mut encoded = compat.encode_to_vec();
+    let mut encoded = Vec::new();
+    // Field 1 (`server`), wire type 2 (length-delimited): the nested buffer
+    // carrying unknown fields, spliced in as-is without decoding first.
+    push_len_delimited(&mut encoded, 1, &nested_with_unknown);
+    // Known fields 2/3 (min_worker_version / min_client_version).
+    push_len_delimited(&mut encoded, 2, b"0.2.0");
+    push_len_delimited(&mut encoded, 3, b"0.2.0");
+    // Field 4 (compatibility_mode = DIAGNOSE), wire type 0.
+    push_varint(&mut encoded, 4 << 3);
+    push_varint(&mut encoded, 1);
     // Unknown top-level varint field 1000 and length-delimited field 1001.
     push_varint(&mut encoded, 1000 << 3);
     push_varint(&mut encoded, 1);
@@ -259,21 +277,34 @@ fn test_compatibility_mode_enum_values() {
     assert_eq!(CompatibilityModeProto::Unknown as i32, 0);
     assert_eq!(CompatibilityModeProto::Diagnose as i32, 1);
     assert_eq!(CompatibilityModeProto::Enforce as i32, 2);
+
+    // prost's enum Default is the zero variant (UNKNOWN), NOT the field
+    // default (DIAGNOSE). T5/T6 code must not assume the two defaults agree.
+    assert_eq!(CompatibilityModeProto::default() as i32, 0);
 }
 
 #[test]
 fn test_server_compatibility_info_default_mode_is_valid() {
     // Default::default() must never produce an invalid wire value for
-    // compatibility_mode (regression for the zero-variant footgun).
+    // compatibility_mode: the field default is DIAGNOSE (1).
     let default = ServerCompatibilityInfoProto::default();
     assert_eq!(
         default.compatibility_mode,
         CompatibilityModeProto::Diagnose as i32
     );
 
-    let decoded = ServerCompatibilityInfoProto::decode(&[] as &[u8]).unwrap();
+    // Round-trip encode(Default) instead of decoding an empty payload: prost
+    // always encodes required fields, so this writes an empty `server`
+    // (tag+len 0) plus compatibility_mode = DIAGNOSE — a payload that the
+    // Java SDK (protobuf-java 3.25) can also parse, unlike `decode(&[])`
+    // which would be missing the required `server` message.
+    let encoded = default.encode_to_vec();
+    assert!(!encoded.is_empty());
+    let decoded = ServerCompatibilityInfoProto::decode(encoded.as_slice()).unwrap();
     assert_eq!(
         decoded.compatibility_mode,
         CompatibilityModeProto::Diagnose as i32
     );
+    assert!(decoded.server.component.is_none());
+    assert!(decoded.server.protocol_version.is_none());
 }
