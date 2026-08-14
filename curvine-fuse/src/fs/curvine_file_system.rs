@@ -890,13 +890,11 @@ impl CurvineFileSystem {
             }
         }
 
-        // Changing the group is also privileged for non-root: caller must own the
-        // file *and* belong to the target group (POSIX chown). Membership alone is
-        // not sufficient — #1500 dropped the owner gate and allowed non-owners who
-        // share the target group to chgrp (ACL bypass / setuid strip).
+        // Non-root chown requires ownership whenever FATTR_GID is present (even same-gid).
+        // Membership is only checked when the gid value actually changes.
         // See CurvineIO/curvine#1548 (originally gongxun0928/curvine#18).
         if let Some(gid) = target_gid {
-            if gid != file_gid && caller_uid != file_uid {
+            if caller_uid != file_uid {
                 return err_fuse!(
                     libc::EPERM,
                     "setattr gid change denied: caller uid {} is not file owner (uid {})",
@@ -1488,6 +1486,20 @@ impl fs::FileSystem for CurvineFileSystem {
         // Clear setuid/setgid on chown (FATTR_UID/GID, or valid==0 for chown(-1,-1)).
         let chown_effective = Self::chown_should_clear_setid_bits(op.arg.valid);
         if chown_effective && cur_status.file_type == FileType::File {
+            // killpriv chown(-1,-1) → valid==0: Linux EPERM if setid present and non-owner;
+            // allow no-op when the file has no setid bits.
+            if op.arg.valid == 0
+                && self.conf.check_permission
+                && op.header.uid != 0
+                && op.header.uid != file_uid
+                && (cur_status.mode & (libc::S_ISUID as u32 | libc::S_ISGID as u32)) != 0
+            {
+                return err_fuse!(
+                    libc::EPERM,
+                    "chown(-1,-1) setid clear denied for non-owner uid {}",
+                    op.header.uid
+                );
+            }
             let mut new_mode = if let Some(mode) = opts.mode {
                 mode
             } else {
@@ -2788,6 +2800,22 @@ mod tests {
             FATTR_GID,
             None,
             Some(3000), // caller primary gid — membership OK, ownership not
+        )
+        .unwrap_err();
+        assert_eq!(err.errno(), libc::EPERM);
+    }
+
+    /// Linux: non-owner same-gid chown is still EPERM (FATTR_GID present).
+    #[test]
+    fn setattr_permission_denies_non_owner_same_gid_chown() {
+        let err = super::CurvineFileSystem::check_setattr_permission(
+            true,
+            &hdr(2000, 100, 0),
+            1000,
+            100,
+            FATTR_GID,
+            None,
+            Some(100),
         )
         .unwrap_err();
         assert_eq!(err.errno(), libc::EPERM);
