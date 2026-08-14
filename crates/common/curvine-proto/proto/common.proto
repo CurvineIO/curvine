@@ -242,17 +242,27 @@ message ComponentInfoProto {
 // Compatibility enforcement mode of a server when a peer version is outside
 // the supported range. diagnose records warnings and allows the request;
 // enforce rejects incompatible peers with an explicit error.
+// UNKNOWN is the zero value so an unset field never maps to an invalid
+// variant on the wire.
 enum CompatibilityModeProto {
+    COMPATIBILITY_MODE_PROTO_UNKNOWN = 0;
     COMPATIBILITY_MODE_PROTO_DIAGNOSE = 1;
     COMPATIBILITY_MODE_PROTO_ENFORCE = 2;
 }
 
 // Server-side compatibility contract exchanged during handshake (e.g.
 // GetFilesystemInfo) and structured version reporting (e.g. worker heartbeat).
+//
+// Only the `server` identity and `compatibility_mode` are required; the
+// version bounds are optional because this message may be produced by
+// different component types that do not all own every bound (e.g. a worker
+// does not dictate min_client_version). Optional bounds keep the contract
+// lenient by default and allow future restructuring without breaking
+// inter-version decoding.
 message ServerCompatibilityInfoProto {
     required ComponentInfoProto server = 1;
-    required string min_worker_version = 2 [default = ""];
-    required string min_client_version = 3 [default = ""];
+    optional string min_worker_version = 2 [default = ""];
+    optional string min_client_version = 3 [default = ""];
     required CompatibilityModeProto compatibility_mode = 4 [default = COMPATIBILITY_MODE_PROTO_DIAGNOSE];
     repeated string blocked_versions = 5;
 }

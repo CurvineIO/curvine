@@ -21,8 +21,8 @@ fn sample_component_info() -> ComponentInfoProto {
 fn sample_server_compatibility_info() -> ServerCompatibilityInfoProto {
     ServerCompatibilityInfoProto {
         server: sample_component_info(),
-        min_worker_version: "0.2.0".to_string(),
-        min_client_version: "0.2.0".to_string(),
+        min_worker_version: Some("0.2.0".to_string()),
+        min_client_version: Some("0.2.0".to_string()),
         compatibility_mode: CompatibilityModeProto::Diagnose as i32,
         blocked_versions: vec!["0.2.5".to_string(), "0.2.6".to_string()],
     }
@@ -149,8 +149,8 @@ fn test_server_compatibility_info_round_trip_full() {
     let encoded = compat.encode_to_vec();
     let decoded = ServerCompatibilityInfoProto::decode(encoded.as_slice()).unwrap();
 
-    assert_eq!(decoded.min_worker_version, "0.2.0".to_string());
-    assert_eq!(decoded.min_client_version, "0.2.0".to_string());
+    assert_eq!(decoded.min_worker_version, Some("0.2.0".to_string()));
+    assert_eq!(decoded.min_client_version, Some("0.2.0".to_string()));
     assert_eq!(
         decoded.compatibility_mode,
         CompatibilityModeProto::Enforce as i32
@@ -169,15 +169,15 @@ fn test_server_compatibility_info_round_trip_full() {
 
 #[test]
 fn test_server_compatibility_info_round_trip_defaults() {
-    // Default contract: diagnose mode, empty version bounds, no blocklist.
+    // Default contract: diagnose mode, unset version bounds, no blocklist.
     let compat = ServerCompatibilityInfoProto {
         server: ComponentInfoProto {
             component: Some("master".to_string()),
             release_version: Some("0.4.0-alpha".to_string()),
             ..Default::default()
         },
-        min_worker_version: String::new(),
-        min_client_version: String::new(),
+        min_worker_version: None,
+        min_client_version: None,
         compatibility_mode: CompatibilityModeProto::Diagnose as i32,
         blocked_versions: vec![],
     };
@@ -189,9 +189,35 @@ fn test_server_compatibility_info_round_trip_defaults() {
         decoded.compatibility_mode,
         CompatibilityModeProto::Diagnose as i32
     );
-    assert!(decoded.min_worker_version.is_empty());
+    assert!(decoded.min_worker_version.is_none());
+    assert!(decoded.min_client_version.is_none());
     assert!(decoded.blocked_versions.is_empty());
     assert_eq!(decoded.server.component, Some("master".to_string()));
+}
+
+#[test]
+fn test_server_compatibility_info_partial_bounds_round_trip() {
+    // A producer that does not own all bounds (e.g. a worker heartbeating
+    // without a min_client_version) may leave them unset; this must round-trip
+    // without forcing meaningless empty strings.
+    let compat = ServerCompatibilityInfoProto {
+        server: sample_component_info(),
+        min_worker_version: Some("0.2.0".to_string()),
+        min_client_version: None,
+        compatibility_mode: CompatibilityModeProto::Diagnose as i32,
+        blocked_versions: vec![],
+    };
+
+    let encoded = compat.encode_to_vec();
+    let decoded = ServerCompatibilityInfoProto::decode(encoded.as_slice()).unwrap();
+
+    assert_eq!(decoded.min_worker_version, Some("0.2.0".to_string()));
+    assert!(decoded.min_client_version.is_none());
+    assert!(decoded.blocked_versions.is_empty());
+    assert_eq!(
+        decoded.compatibility_mode,
+        CompatibilityModeProto::Diagnose as i32
+    );
 }
 
 #[test]
@@ -214,8 +240,8 @@ fn test_server_compatibility_info_unknown_fields_ignored() {
 
     let decoded = ServerCompatibilityInfoProto::decode(encoded.as_slice()).unwrap();
 
-    assert_eq!(decoded.min_worker_version, "0.2.0".to_string());
-    assert_eq!(decoded.min_client_version, "0.2.0".to_string());
+    assert_eq!(decoded.min_worker_version, Some("0.2.0".to_string()));
+    assert_eq!(decoded.min_client_version, Some("0.2.0".to_string()));
     assert_eq!(
         decoded.compatibility_mode,
         CompatibilityModeProto::Diagnose as i32
@@ -228,8 +254,26 @@ fn test_server_compatibility_info_unknown_fields_ignored() {
 
 #[test]
 fn test_compatibility_mode_enum_values() {
-    // Wire contract: DIAGNOSE = 1, ENFORCE = 2 (no zero value is used so the
-    // enum cannot be confused with an unset field).
+    // Wire contract: UNKNOWN = 0 (valid zero value so Default never maps to an
+    // invalid variant), DIAGNOSE = 1, ENFORCE = 2.
+    assert_eq!(CompatibilityModeProto::Unknown as i32, 0);
     assert_eq!(CompatibilityModeProto::Diagnose as i32, 1);
     assert_eq!(CompatibilityModeProto::Enforce as i32, 2);
+}
+
+#[test]
+fn test_server_compatibility_info_default_mode_is_valid() {
+    // Default::default() must never produce an invalid wire value for
+    // compatibility_mode (regression for the zero-variant footgun).
+    let default = ServerCompatibilityInfoProto::default();
+    assert_eq!(
+        default.compatibility_mode,
+        CompatibilityModeProto::Diagnose as i32
+    );
+
+    let decoded = ServerCompatibilityInfoProto::decode(&[] as &[u8]).unwrap();
+    assert_eq!(
+        decoded.compatibility_mode,
+        CompatibilityModeProto::Diagnose as i32
+    );
 }
