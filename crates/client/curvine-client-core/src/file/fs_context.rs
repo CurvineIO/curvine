@@ -54,13 +54,15 @@ pub struct FsContext {
     // Client-master handshake result: the master's advertised version /
     // protocol / capabilities (or a legacy marker when the master does not
     // advertise a compatibility contract). Populated by the first
-    // GetFilesystemInfo call and shared by every FsClient clone.
-    master_handshake: Arc<FastRwLock<MasterHandshake>>,
+    // GetFilesystemInfo call and shared by every FsClient clone. Stored
+    // inline: FsContext itself is only ever shared behind an `Arc`, so the
+    // interior-mutable FastRwLock needs no extra heap allocation.
+    master_handshake: FastRwLock<MasterHandshake>,
     // Whether this session has already reported its component_info to the
     // master. Handshake metadata is sent once per mount/session; the flag
     // keeps GetFilesystemInfo (which backs FUSE statfs and may be called
     // frequently) from carrying the payload on every request.
-    handshake_reported: Arc<AtomicBool>,
+    handshake_reported: AtomicBool,
 }
 
 impl FsContext {
@@ -114,8 +116,8 @@ impl FsContext {
             os_cache,
             failed_workers: exclude_workers,
             block_pool,
-            master_handshake: Arc::new(FastRwLock::new(MasterHandshake::default())),
-            handshake_reported: Arc::new(AtomicBool::new(false)),
+            master_handshake: FastRwLock::new(MasterHandshake::default()),
+            handshake_reported: AtomicBool::new(false),
         };
         Ok(context)
     }
