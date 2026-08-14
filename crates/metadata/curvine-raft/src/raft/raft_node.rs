@@ -704,12 +704,8 @@ where
         client_send: &mut HashMap<i64, Callback>,
     ) -> RaftResult<()> {
         for entry in entries {
-            if entry.get_data().is_empty() {
-                continue;
-            }
-
             let is_conf_change = matches!(entry.get_entry_type(), EntryType::EntryConfChange);
-            let should_respond = self.is_leader();
+            let should_respond = self.is_leader() && !entry.get_data().is_empty();
             let (entry_index, entry_term, entry_context) = if should_respond {
                 (entry.index, entry.term, Some(entry.get_context().to_vec()))
             } else {
@@ -717,6 +713,9 @@ where
             };
             let rep_msg = if is_conf_change {
                 let rep = self.apply_config_change(&entry)?;
+                self.storage
+                    .apply_propose(false, ApplyMsg::new_entry(entry))
+                    .await?;
                 Builder::new_rpc(RaftCode::ConfChange)
                     .response(ResponseStatus::Success)
                     .proto_header(rep)

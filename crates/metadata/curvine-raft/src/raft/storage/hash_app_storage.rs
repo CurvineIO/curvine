@@ -19,6 +19,7 @@ use crate::rocksdb::DBEngine;
 use crate::utils::SerdeUtils;
 use curvine_core_error::{try_err, try_option_ref, CommonResult};
 use curvine_runtime::common::LocalTime;
+use raft::eraftpb::EntryType;
 use raft::StateRole;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -91,9 +92,11 @@ where
         }
         let (entry, ack) = msg.into_entry_with_ack()?;
         let result = (|| -> RaftResult<()> {
-            let mut map = self.write()?;
-            let pairs: (K, V) = SerdeUtils::deserialize(&entry.data)?;
-            map.insert(pairs.0, pairs.1);
+            if entry.get_entry_type() == EntryType::EntryNormal && !entry.data.is_empty() {
+                let mut map = self.write()?;
+                let pairs: (K, V) = SerdeUtils::deserialize(&entry.data)?;
+                map.insert(pairs.0, pairs.1);
+            }
 
             self.fsm_state.lock().unwrap().applied = AppliedIndex {
                 term: entry.term,
@@ -205,11 +208,13 @@ where
         }
         let (entry, ack) = msg.into_entry_with_ack()?;
         let result = (|| -> RaftResult<()> {
-            let db = self.lock()?;
-            let pairs: (K, V) = SerdeUtils::deserialize(&entry.data)?;
-            let k = SerdeUtils::serialize(&pairs.0)?;
-            let v = SerdeUtils::serialize(&pairs.1)?;
-            db.put(k, v)?;
+            if entry.get_entry_type() == EntryType::EntryNormal && !entry.data.is_empty() {
+                let db = self.lock()?;
+                let pairs: (K, V) = SerdeUtils::deserialize(&entry.data)?;
+                let k = SerdeUtils::serialize(&pairs.0)?;
+                let v = SerdeUtils::serialize(&pairs.1)?;
+                db.put(k, v)?;
+            }
 
             self.fsm_state.lock().unwrap().applied = AppliedIndex {
                 term: entry.term,

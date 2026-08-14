@@ -32,7 +32,8 @@ use curvine_server::master::journal::{
 };
 use curvine_server::master::{Master, MountManager};
 use log::info;
-use raft::eraftpb::Entry;
+use prost::Message;
+use raft::eraftpb::{ConfChange, Entry, EntryType};
 use raft::StateRole;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -196,6 +197,35 @@ fn leader_promotion_advances_applied_index_over_committed_noop() -> CommonResult
     assert_eq!(state.ufs_applied.index, 2);
     assert_eq!(state.ufs_applied.op_id, expected_op_id);
     assert_eq!(state.ufs_applied.rpc_id, expected_rpc_id);
+    Ok(())
+}
+
+#[test]
+fn leader_promotion_advances_over_committed_configuration_entry() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!("promotion-conf-change-{}", Utils::rand_str(6)));
+    let journal_system = JournalSystem::from_conf(&conf)?;
+    let loader = journal_system.journal_loader();
+
+    journal_system.append_committed_entry_for_test(Entry {
+        term: 1,
+        index: 1,
+        entry_type: EntryType::EntryConfChange as i32,
+        data: ConfChange::default().encode_to_vec(),
+        ..Default::default()
+    })?;
+
+    AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Leader).await })?;
+    AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Follower).await })?;
+
+    let state = loader.get_fsm_state();
+    assert_eq!(state.applied.index, 1);
+    assert_eq!(state.ufs_applied.index, 1);
     Ok(())
 }
 

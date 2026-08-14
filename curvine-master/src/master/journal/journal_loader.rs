@@ -32,7 +32,7 @@ use curvine_runtime::common::{FileUtils, TimeSpent};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel};
 use log::{debug, error, info, warn};
-use raft::eraftpb::Entry;
+use raft::eraftpb::{Entry, EntryType};
 use raft::StateRole;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -226,9 +226,9 @@ impl JournalLoader {
             return Ok(());
         }
 
-        // Raft appends an empty no-op entry when a leader is elected. It has no
-        // metadata mutation, but still advances the committed apply high-water mark.
-        if entry.data.is_empty() {
+        // Empty leader no-ops and configuration entries have no metadata mutation,
+        // but still advance the committed apply high-water mark.
+        if entry.get_entry_type() != EntryType::EntryNormal || entry.data.is_empty() {
             let mut applied = if is_leader {
                 cur.ufs_applied
             } else {
