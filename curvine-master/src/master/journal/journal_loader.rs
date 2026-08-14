@@ -216,10 +216,6 @@ impl JournalLoader {
         entry: &Entry,
         skip_ufs_error: bool,
     ) -> CommonResult<()> {
-        if entry.data.is_empty() {
-            return Ok(());
-        }
-
         let cur = self.fsm_state_snapshot()?;
         let role_applied = ternary!(is_leader, cur.ufs_applied.index, cur.applied.index);
         if entry.index <= role_applied {
@@ -227,6 +223,13 @@ impl JournalLoader {
                 "skip entry index {}, term {}, fsm_state {:?}",
                 entry.index, entry.term, cur
             );
+            return Ok(());
+        }
+
+        // Raft appends an empty no-op entry when a leader is elected. It has no
+        // metadata mutation, but still advances the committed apply high-water mark.
+        if entry.data.is_empty() {
+            self.set_applied(is_leader, Self::build_applied(entry), false)?;
             return Ok(());
         }
 

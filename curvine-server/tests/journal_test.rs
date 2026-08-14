@@ -143,6 +143,30 @@ fn leader_promotion_applies_committed_metadata_before_returning() -> CommonResul
 }
 
 #[test]
+fn leader_promotion_advances_applied_index_over_committed_noop() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!("promotion-noop-{}", Utils::rand_str(6)));
+    let journal_system = JournalSystem::from_conf(&conf)?;
+    let loader = journal_system.journal_loader();
+
+    journal_system.append_committed_entry_for_test(Entry {
+        term: 1,
+        index: 1,
+        ..Default::default()
+    })?;
+
+    AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Leader).await })?;
+
+    assert_eq!(loader.get_fsm_state().applied.index, 1);
+    Ok(())
+}
+
+#[test]
 fn follower_replay_rejects_duplicate_allocated_inode_id() -> CommonResult<()> {
     Master::init_test_metrics();
 
