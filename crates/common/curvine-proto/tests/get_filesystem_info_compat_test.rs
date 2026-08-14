@@ -21,8 +21,10 @@ fn sample_component_info() -> ComponentInfoProto {
 #[derive(Clone, PartialEq, ::prost::Message)]
 struct LegacyGetFilesystemInfoRequest {}
 
-/// A legacy client's view of GetFilesystemInfoResponse: only business fields
-/// 1-14, no compatibility field on the reserved 1000+ range.
+/// A legacy client's view of GetFilesystemInfoResponse: business fields 1-10
+/// (the worker list fields 11-14 are omitted since the compatibility-skip
+/// behavior under test does not depend on them), no compatibility field on the
+/// reserved 1000+ range.
 #[derive(Clone, PartialEq, ::prost::Message)]
 struct LegacyGetFilesystemInfoResponse {
     #[prost(string, required, tag = "1")]
