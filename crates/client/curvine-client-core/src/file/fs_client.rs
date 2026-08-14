@@ -538,14 +538,7 @@ impl FsClient {
         // later calls omit the payload; the response is still parsed and
         // cached on every call. Legacy masters skip the unknown field and
         // legacy clients omit it entirely.
-        let report_component = self.context.claim_handshake_report();
-        let header = if report_component {
-            GetFilesystemInfoRequest {
-                component_info: Some(Self::handshake_request_component_info()),
-            }
-        } else {
-            GetFilesystemInfoRequest::default()
-        };
+        let (header, report_component) = self.get_filesystem_info_request();
         let rep: GetFilesystemInfoResponse =
             match self.rpc(RpcCode::GetFilesystemInfo, header).await {
                 Ok(rep) => rep,
@@ -587,9 +580,36 @@ impl FsClient {
         ProtoUtils::component_version_to_pb(&curvine_sys::version::component_version("client"))
     }
 
+    /// Build a `GetFilesystemInfo` request, attaching this client's
+    /// `component_info` only on the first call per session (the handshake).
+    /// Both the typed and the raw-bytes RPC paths share this so every
+    /// GetFilesystemInfo caller reports the client version exactly once;
+    /// frequent statfs queries stay lean. Returns the request plus whether
+    /// `component_info` was attached, so the caller can reset the flag when
+    /// the request fails before reaching the master.
+    fn get_filesystem_info_request(&self) -> (GetFilesystemInfoRequest, bool) {
+        let report_component = self.context.claim_handshake_report();
+        let header = if report_component {
+            GetFilesystemInfoRequest {
+                component_info: Some(Self::handshake_request_component_info()),
+            }
+        } else {
+            GetFilesystemInfoRequest::default()
+        };
+        (header, report_component)
+    }
+
     pub async fn get_filesystem_info_bytes(&self) -> FsResult<BytesMut> {
-        let header = GetFilesystemInfoRequest::default();
-        self.rpc_bytes(RpcCode::GetFilesystemInfo, header).await
+        let (header, report_component) = self.get_filesystem_info_request();
+        match self.rpc_bytes(RpcCode::GetFilesystemInfo, header).await {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => {
+                if report_component {
+                    self.context.reset_handshake_report();
+                }
+                Err(e)
+            }
+        }
     }
 
     pub async fn mount(
