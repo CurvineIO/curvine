@@ -475,8 +475,10 @@ fn parse_git_describe(input: &str) -> Result<ReleaseVersion, VersionParseError> 
 
     // The trailing `-g<commit>` (git describe commit suffix) becomes build
     // metadata. Only treat it as a commit suffix when the remainder is a
-    // short hash, so pre-releases containing `-g` (e.g. `v1.0.0-rc-ga`) fall
-    // through to exact-tag parsing instead of being misparsed.
+    // short hash AND a numeric commit count precedes it: `git describe` only
+    // emits `-g<hash>` in the form `<tag>-<n>-g<hash>`. Without the count the
+    // `-g...` suffix is part of the tag itself (e.g. `v1.0.0-rc-gabc1234`),
+    // so fall through to exact-tag parsing.
     if let Some(idx) = body.rfind("-g") {
         if idx + 2 < body.len() && is_short_commit(&body[idx + 2..]) {
             let commit = &body[idx + 2..];
@@ -496,42 +498,41 @@ fn parse_git_describe(input: &str) -> Result<ReleaseVersion, VersionParseError> 
                 _ => (pre_str.to_string(), None),
             };
 
-            if tag_pre.is_empty() {
-                // Commits after a release tag (`v0.4.0-19-g0ea9fdd6`): keep
-                // the distance in build metadata (`0.4.0+19.g0ea9fdd6`) so
-                // the build compares equal to the tag. Putting it in the
-                // pre-release would sort the build *before* the release and
-                // break `min_*_version` checks.
-                let build = match count {
-                    Some(count) => format!("{}.g{}", count, commit),
-                    None => format!("g{}", commit),
-                };
+            // Without a commit count this is not a git-describe suffix.
+            if let Some(count) = count {
+                if tag_pre.is_empty() {
+                    // Commits after a release tag (`v0.4.0-19-g0ea9fdd6`):
+                    // keep the distance in build metadata
+                    // (`0.4.0+19.g0ea9fdd6`) so the build compares equal to
+                    // the tag. Putting it in the pre-release would sort the
+                    // build *before* the release and break `min_*_version`
+                    // checks.
+                    let build = format!("{}.g{}", count, commit);
+                    return Ok(ReleaseVersion::new(
+                        major,
+                        minor,
+                        patch,
+                        Vec::new(),
+                        dirty_build(Some(build), dirty),
+                    ));
+                }
+
+                // Commits after a pre-release tag (`v0.4.0-alpha-121-g…`):
+                // append the count as the last numeric pre-release
+                // identifier, which sorts after the tag's own pre-release
+                // and still before the release (`0.4.0-alpha.121`).
+                let mut pre = parse_pre_identifiers(&tag_pre, input)?;
+                pre.push(PreRelease::Numeric(count));
+
+                let build = format!("g{}", commit);
                 return Ok(ReleaseVersion::new(
                     major,
                     minor,
                     patch,
-                    Vec::new(),
+                    pre,
                     dirty_build(Some(build), dirty),
                 ));
             }
-
-            // Commits after a pre-release tag (`v0.4.0-alpha-121-g…`): append
-            // the count as the last numeric pre-release identifier, which
-            // sorts after the tag's own pre-release and still before the
-            // release (`0.4.0-alpha.121`).
-            let mut pre = parse_pre_identifiers(&tag_pre, input)?;
-            if let Some(count) = count {
-                pre.push(PreRelease::Numeric(count));
-            }
-
-            let build = format!("g{}", commit);
-            return Ok(ReleaseVersion::new(
-                major,
-                minor,
-                patch,
-                pre,
-                dirty_build(Some(build), dirty),
-            ));
         }
     }
 
@@ -788,6 +789,12 @@ mod tests {
         let v = ReleaseVersion::from_git_describe("v1.0.0-rc-ga").unwrap();
         assert_eq!(v.to_string(), "1.0.0-rc-ga");
         assert_eq!(v.build(), None);
+        // Even a 7-hex-char suffix is not a commit unless a numeric count
+        // precedes it: `git describe` only emits `-g<hash>` as
+        // `<tag>-<n>-g<hash>`.
+        let hex = ReleaseVersion::from_git_describe("v1.0.0-rc-gabc1234").unwrap();
+        assert_eq!(hex.to_string(), "1.0.0-rc-gabc1234");
+        assert_eq!(hex.build(), None);
         // A real commit suffix is still recognized after such a pre-release.
         let with_commit = ReleaseVersion::from_git_describe("v1.0.0-rc-ga-5-gabc1234").unwrap();
         assert_eq!(with_commit.to_string(), "1.0.0-rc-ga.5+gabc1234");
