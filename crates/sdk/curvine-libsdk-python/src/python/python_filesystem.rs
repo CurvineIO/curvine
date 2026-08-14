@@ -62,8 +62,8 @@ impl PythonFilesystem {
     }
 
     //Get master information
-    pub fn get_master_info(&self) -> FsResult<BytesMut> {
-        let status = self.inner.get_master_info()?;
+    pub fn get_filesystem_info(&self) -> FsResult<BytesMut> {
+        let status = self.inner.get_filesystem_info()?;
         Ok(status)
     }
 }

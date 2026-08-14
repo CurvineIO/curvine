@@ -531,14 +531,14 @@ impl FsClient {
         self.rpc(RpcCode::GetCvMetadataDeltaPage, header).await
     }
 
-    pub async fn get_master_info(&self) -> FsResult<MasterInfo> {
+    pub async fn get_filesystem_info(&self) -> FsResult<FilesystemInfo> {
         let header = GetFilesystemInfoRequest::default();
         let rep: GetFilesystemInfoResponse = self.rpc(RpcCode::GetFilesystemInfo, header).await?;
-        let res = ProtoUtils::master_info_from_pb(rep);
+        let res = ProtoUtils::filesystem_info_from_pb(rep);
         Ok(res)
     }
 
-    pub async fn get_master_info_bytes(&self) -> FsResult<BytesMut> {
+    pub async fn get_filesystem_info_bytes(&self) -> FsResult<BytesMut> {
         let header = GetFilesystemInfoRequest::default();
         self.rpc_bytes(RpcCode::GetFilesystemInfo, header).await
     }

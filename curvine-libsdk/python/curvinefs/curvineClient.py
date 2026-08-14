@@ -85,7 +85,7 @@ class CurvineClient:
         }
         return file_status_dict
 
-    def get_master_info(self) -> Dict[str, Any]:
+    def get_filesystem_info(self) -> Dict[str, Any]:
         """Get information about the Curvine cluster.
 
         Returns:
@@ -109,7 +109,7 @@ class CurvineClient:
             IOError: If getting master info fails.
         """
         try:
-            status_bytes = curvine_libsdk.python_io_curvine_curvine_native_get_master_info(self.file_system_ptr)
+            status_bytes = curvine_libsdk.python_io_curvine_curvine_native_get_filesystem_info(self.file_system_ptr)
         except Exception as e:
             raise IOError(f"Native get master information failed: {e}")
         status = GetFilesystemInfoResponse()

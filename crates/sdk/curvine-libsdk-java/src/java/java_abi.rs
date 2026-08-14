@@ -270,13 +270,13 @@ pub unsafe extern "C" fn Java_io_curvine_CurvineNative_delete(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn Java_io_curvine_CurvineNative_getMasterInfo(
+pub unsafe extern "C" fn Java_io_curvine_CurvineNative_getFilesystemInfo(
     mut env: JNIEnv,
     _this: JObject,
     fs_ptr: *mut JavaFilesystem,
 ) -> jarray {
     let fs = &*fs_ptr;
-    java_err2!(env, fs.get_master_info(&mut env))
+    java_err2!(env, fs.get_filesystem_info(&mut env))
 }
 
 #[no_mangle]

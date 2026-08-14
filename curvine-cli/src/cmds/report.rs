@@ -15,7 +15,7 @@
 use crate::util::*;
 use clap::{Parser, Subcommand};
 use curvine_core_error::CommonResult;
-use curvine_model::{MasterInfo, WorkerInfo};
+use curvine_model::{FilesystemInfo, WorkerInfo};
 use curvine_unified_fs::UnifiedFileSystem;
 use serde::Serialize;
 
@@ -44,7 +44,7 @@ pub enum ReportSubCommand {
 
 impl ReportCommand {
     pub async fn execute(&self, fs: UnifiedFileSystem) -> CommonResult<()> {
-        let rep = handle_rpc_result(fs.get_master_info()).await;
+        let rep = handle_rpc_result(fs.get_filesystem_info()).await;
         let report = CurvineReport { info: rep };
         match &self.action {
             Some(action) => match action {
@@ -80,7 +80,7 @@ impl ReportCommand {
 }
 
 struct CurvineReport {
-    info: MasterInfo,
+    info: FilesystemInfo,
 }
 
 #[derive(Serialize)]
@@ -95,7 +95,7 @@ struct FluidReportSummary {
 }
 
 impl CurvineReport {
-    // Serialize the MasterInfo to JSON
+    // Serialize the FilesystemInfo to JSON
     pub fn to_json(&self) -> String {
         match serde_json::to_string_pretty(&self.info) {
             Ok(json) => json,
@@ -471,7 +471,7 @@ mod tests {
             ..Default::default()
         };
         let report = CurvineReport {
-            info: MasterInfo {
+            info: FilesystemInfo {
                 live_workers: vec![worker],
                 ..Default::default()
             },

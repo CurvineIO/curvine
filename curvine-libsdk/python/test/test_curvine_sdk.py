@@ -530,18 +530,18 @@ class TestCurvineFileSystem(unittest.TestCase):
         mock_client_instance.get_file_status.assert_called_once_with("/test/file.txt")
 
     @patch("curvinefs.curvineFileSystem.curvine_client")
-    def test_get_master_info(self, mock_curvine_client: MagicMock) -> None:
-        """Test get_master_info."""
+    def test_get_filesystem_info(self, mock_curvine_client: MagicMock) -> None:
+        """Test get_filesystem_info."""
         mock_client_instance = MagicMock()
         mock_curvine_client.CurvineClient.return_value = mock_client_instance
         mock_info = {"active_master": "node1", "capacity": 1000000}
-        mock_client_instance.get_master_info.return_value = mock_info
+        mock_client_instance.get_filesystem_info.return_value = mock_info
 
         fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
-        result = fs.get_master_info()
+        result = fs.get_filesystem_info()
 
         self.assertEqual(result, mock_info)
-        mock_client_instance.get_master_info.assert_called_once()
+        mock_client_instance.get_filesystem_info.assert_called_once()
 
     @patch("curvinefs.curvineFileSystem.curvine_client")
     def test_close(self, mock_curvine_client: MagicMock) -> None:

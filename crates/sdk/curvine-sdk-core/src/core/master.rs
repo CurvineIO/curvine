@@ -14,11 +14,11 @@
 
 use crate::core::Session;
 use curvine_error::FsResult;
-use curvine_model::MasterInfo;
+use curvine_model::FilesystemInfo;
 use curvine_runtime::runtime::RpcRuntime;
 
-pub fn get_master_info(session: &Session) -> FsResult<MasterInfo> {
+pub fn get_filesystem_info(session: &Session) -> FsResult<FilesystemInfo> {
     session
         .runtime()
-        .block_on(async { session.unified().get_master_info().await })
+        .block_on(async { session.unified().get_filesystem_info().await })
 }

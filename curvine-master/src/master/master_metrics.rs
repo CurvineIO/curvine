@@ -191,15 +191,15 @@ impl MasterMetrics {
     }
 
     pub fn text_output(&self, fs: MasterFilesystem) -> CommonResult<String> {
-        let master_info = fs.master_info()?;
-        self.capacity.set(master_info.capacity);
-        self.available.set(master_info.available);
-        self.fs_used.set(master_info.fs_used);
-        self.block_num.set(master_info.block_num);
+        let filesystem_info = fs.filesystem_info()?;
+        self.capacity.set(filesystem_info.capacity);
+        self.available.set(filesystem_info.available);
+        self.fs_used.set(filesystem_info.fs_used);
+        self.block_num.set(filesystem_info.block_num);
         self.used_memory_bytes.set(SysUtils::used_memory() as i64);
 
-        if master_info.block_num > 0 {
-            let avg_size = master_info.fs_used / master_info.block_num;
+        if filesystem_info.block_num > 0 {
+            let avg_size = filesystem_info.fs_used / filesystem_info.block_num;
             self.blocks_size_avg.set(avg_size);
         }
 
@@ -218,16 +218,16 @@ impl MasterMetrics {
 
         self.worker_num
             .with_label_values(&["live"])
-            .set(master_info.live_workers.len() as i64);
+            .set(filesystem_info.live_workers.len() as i64);
         self.worker_num
             .with_label_values(&["blacklist"])
-            .set(master_info.blacklist_workers.len() as i64);
+            .set(filesystem_info.blacklist_workers.len() as i64);
         self.worker_num
             .with_label_values(&["decommission"])
-            .set(master_info.decommission_workers.len() as i64);
+            .set(filesystem_info.decommission_workers.len() as i64);
         self.worker_num
             .with_label_values(&["lost"])
-            .set(master_info.lost_workers.len() as i64);
+            .set(filesystem_info.lost_workers.len() as i64);
 
         Metrics::text_output()
     }

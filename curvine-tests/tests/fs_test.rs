@@ -139,8 +139,8 @@ fn run_filesystem_end_to_end_operations_on_cluster(
         list_files(&fs).await?;
         println!("list_files done");
 
-        get_master_info(&fs).await?;
-        println!("get_master_info done");
+        get_filesystem_info(&fs).await?;
+        println!("get_filesystem_info done");
 
         add_block(&fs).await?;
         println!("add_block done");
@@ -556,8 +556,8 @@ async fn add_block(fs: &CurvineFileSystem) -> CommonResult<()> {
     Ok(())
 }
 
-async fn get_master_info(fs: &CurvineFileSystem) -> CommonResult<()> {
-    let res = fs.get_master_info().await?;
+async fn get_filesystem_info(fs: &CurvineFileSystem) -> CommonResult<()> {
+    let res = fs.get_filesystem_info().await?;
     info!("master info {:#?}", res);
     Ok(())
 }
@@ -653,11 +653,11 @@ async fn test_fs_used(fs: &CurvineFileSystem) -> CommonResult<()> {
     info!("=== Testing FS Used - Creating files with data ===");
 
     // Get initial state
-    let initial_master_info = fs.get_master_info().await?;
+    let initial_filesystem_info = fs.get_filesystem_info().await?;
     info!(
         "Initial FS Used: {} bytes ({:.2} MB)",
-        initial_master_info.fs_used,
-        initial_master_info.fs_used as f64 / 1024.0 / 1024.0
+        initial_filesystem_info.fs_used,
+        initial_filesystem_info.fs_used as f64 / 1024.0 / 1024.0
     );
 
     // Create files and write data, ensuring data is flushed to storage
@@ -678,7 +678,7 @@ async fn test_fs_used(fs: &CurvineFileSystem) -> CommonResult<()> {
         );
 
         // Check status after creating each file
-        let current_info = fs.get_master_info().await?;
+        let current_info = fs.get_filesystem_info().await?;
         info!("After file {}: FS Used = {} bytes", i, current_info.fs_used);
     }
 
@@ -686,7 +686,7 @@ async fn test_fs_used(fs: &CurvineFileSystem) -> CommonResult<()> {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // Get master info to check fs_used
-    let after_small_files_info = fs.get_master_info().await?;
+    let after_small_files_info = fs.get_filesystem_info().await?;
     info!(
         "After creating small files - FS Used: {} bytes ({:.2} MB)",
         after_small_files_info.fs_used,
@@ -714,34 +714,35 @@ async fn test_fs_used(fs: &CurvineFileSystem) -> CommonResult<()> {
     tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
     // Get master info again
-    let final_master_info = fs.get_master_info().await?;
+    let final_filesystem_info = fs.get_filesystem_info().await?;
     info!(
         "Final FS Used: {} bytes ({:.2} MB)",
-        final_master_info.fs_used,
-        final_master_info.fs_used as f64 / 1024.0 / 1024.0
+        final_filesystem_info.fs_used,
+        final_filesystem_info.fs_used as f64 / 1024.0 / 1024.0
     );
 
     // Output detailed capacity information
     info!("=== Final Capacity Information ===");
     info!(
         "Capacity: {} bytes ({:.2} GB)",
-        final_master_info.capacity,
-        final_master_info.capacity as f64 / 1024.0 / 1024.0 / 1024.0
+        final_filesystem_info.capacity,
+        final_filesystem_info.capacity as f64 / 1024.0 / 1024.0 / 1024.0
     );
     info!(
         "Available: {} bytes ({:.2} GB)",
-        final_master_info.available,
-        final_master_info.available as f64 / 1024.0 / 1024.0 / 1024.0
+        final_filesystem_info.available,
+        final_filesystem_info.available as f64 / 1024.0 / 1024.0 / 1024.0
     );
     info!(
         "FS Used: {} bytes ({:.2} MB)",
-        final_master_info.fs_used,
-        final_master_info.fs_used as f64 / 1024.0 / 1024.0
+        final_filesystem_info.fs_used,
+        final_filesystem_info.fs_used as f64 / 1024.0 / 1024.0
     );
 
     // Calculate non_fs_used
-    let non_fs_used =
-        final_master_info.capacity - final_master_info.available - final_master_info.fs_used;
+    let non_fs_used = final_filesystem_info.capacity
+        - final_filesystem_info.available
+        - final_filesystem_info.fs_used;
     info!(
         "Non-FS Used: {} bytes ({:.2} GB)",
         non_fs_used,
@@ -749,30 +750,34 @@ async fn test_fs_used(fs: &CurvineFileSystem) -> CommonResult<()> {
     );
 
     // Verify capacity consistency
-    let total_accounted = final_master_info.available + final_master_info.fs_used + non_fs_used;
+    let total_accounted =
+        final_filesystem_info.available + final_filesystem_info.fs_used + non_fs_used;
     info!(
         "Consistency check: {} + {} + {} = {}",
-        final_master_info.available, final_master_info.fs_used, non_fs_used, total_accounted
+        final_filesystem_info.available,
+        final_filesystem_info.fs_used,
+        non_fs_used,
+        total_accounted
     );
-    info!("Expected capacity: {}", final_master_info.capacity);
+    info!("Expected capacity: {}", final_filesystem_info.capacity);
 
-    if total_accounted == final_master_info.capacity {
+    if total_accounted == final_filesystem_info.capacity {
         info!("✅ Capacity consistency check PASSED");
     } else {
         info!(
             "❌ Capacity consistency check FAILED - difference: {}",
-            (total_accounted - final_master_info.capacity).abs()
+            (total_accounted - final_filesystem_info.capacity).abs()
         );
     }
 
     // Verify fs_used is not negative
     assert!(
-        final_master_info.fs_used >= 0,
+        final_filesystem_info.fs_used >= 0,
         "FS Used should not be negative"
     );
 
     // If fs_used is still 0, output debug information but don't fail the test
-    if final_master_info.fs_used == 0 {
+    if final_filesystem_info.fs_used == 0 {
         info!("⚠️  WARNING: FS Used is still 0. This might indicate:");
         info!("   1. Data is not yet committed to block storage");
         info!("   2. Test cluster might be using different storage mechanism");
@@ -780,7 +785,7 @@ async fn test_fs_used(fs: &CurvineFileSystem) -> CommonResult<()> {
     } else {
         info!(
             "✅ FS Used has non-zero value: {} bytes",
-            final_master_info.fs_used
+            final_filesystem_info.fs_used
         );
     }
 

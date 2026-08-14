@@ -329,7 +329,7 @@ public class CurvineNative {
 
     public static native long delete(long nativeHandle, String path, boolean recursive) throws IOException;
 
-    public static native byte[] getMasterInfo(long nativeHandle) throws IOException;
+    public static native byte[] getFilesystemInfo(long nativeHandle) throws IOException;
 
     public static native byte[] getMountInfo(long nativeHandle, String path) throws IOException;
 

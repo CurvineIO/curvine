@@ -136,8 +136,8 @@ public class CurvineFsMount {
         checkError(CurvineNative.delete(nativeHandle, path, recursive));
     }
 
-    public byte[] getMasterInfo() throws IOException {
-        byte[] bytes = CurvineNative.getMasterInfo(nativeHandle);
+    public byte[] getFilesystemInfo() throws IOException {
+        byte[] bytes = CurvineNative.getFilesystemInfo(nativeHandle);
         checkError(bytes);
         return bytes;
     }

@@ -632,13 +632,13 @@ class CurvineFileSystem(AbstractFileSystem):
         path = self._format_path(path)
         return self.client.get_file_status(path)
 
-    def get_master_info(self) -> Dict[str, Any]:
+    def get_filesystem_info(self) -> Dict[str, Any]:
         """Get information about the Curvine cluster.
 
         Returns:
             Dictionary containing cluster information.
         """
-        return self.client.get_master_info()
+        return self.client.get_filesystem_info()
 
     def close(self) -> None:
         """Close the file system connection."""

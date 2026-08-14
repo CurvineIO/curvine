@@ -303,7 +303,7 @@ impl ProtoUtils {
         }
     }
 
-    pub fn master_info_to_pb(src: MasterInfo) -> GetFilesystemInfoResponse {
+    pub fn filesystem_info_to_pb(src: FilesystemInfo) -> GetFilesystemInfoResponse {
         let mut pb = GetFilesystemInfoResponse {
             active_master: src.active_master,
             journal_nodes: src.journal_nodes,
@@ -366,8 +366,8 @@ impl ProtoUtils {
         pb
     }
 
-    pub fn master_info_from_pb(src: GetFilesystemInfoResponse) -> MasterInfo {
-        MasterInfo {
+    pub fn filesystem_info_from_pb(src: GetFilesystemInfoResponse) -> FilesystemInfo {
+        FilesystemInfo {
             active_master: src.active_master,
             journal_nodes: src.journal_nodes,
             inode_dir_num: src.inode_dir_num,

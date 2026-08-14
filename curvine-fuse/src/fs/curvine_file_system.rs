@@ -1571,7 +1571,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
     // Get file system profile information.
     async fn stat_fs(&self, _: StatFs<'_>) -> FuseResult<fuse_kstatfs> {
-        let info = self.fs.get_master_info().await?;
+        let info = self.fs.get_filesystem_info().await?;
 
         let block_size = 4 * ByteUnit::KB as u32;
         let total_blocks = (info.capacity / block_size as i64) as u64;

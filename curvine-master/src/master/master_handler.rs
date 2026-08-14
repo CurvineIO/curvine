@@ -26,8 +26,8 @@ use curvine_fs_api::Path;
 use curvine_fs_api::RpcCode;
 use curvine_model::ProtoUtils;
 use curvine_model::{
-    CreateFileOpts, DeleteBlockCmd, DeleteResult, FileBlocks, FileStatus, FreeResult,
-    HeartbeatStatus, ListOptions, MasterInfo, OpenFlags, RenameFlags, WorkerCommand, WorkerInfo,
+    CreateFileOpts, DeleteBlockCmd, DeleteResult, FileBlocks, FileStatus, FilesystemInfo,
+    FreeResult, HeartbeatStatus, ListOptions, OpenFlags, RenameFlags, WorkerCommand, WorkerInfo,
 };
 use curvine_net::net::ConnState;
 use curvine_proto::*;
@@ -467,7 +467,7 @@ impl MasterHandler {
             Self::process_get_filesystem_info(fs)
         })
         .await?;
-        let rep_header = ProtoUtils::master_info_to_pb(info);
+        let rep_header = ProtoUtils::filesystem_info_to_pb(info);
         ctx.response(rep_header)
     }
 
@@ -536,8 +536,8 @@ impl MasterHandler {
         ctx.response(response)
     }
 
-    fn process_get_filesystem_info(fs: MasterFilesystem) -> FsResult<MasterInfo> {
-        fs.master_info()
+    fn process_get_filesystem_info(fs: MasterFilesystem) -> FsResult<FilesystemInfo> {
+        fs.filesystem_info()
     }
 
     pub fn worker_heartbeat(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -1034,7 +1034,7 @@ mod tests {
 
         MasterHandler::process_worker_heartbeat(fs.clone(), header).unwrap();
 
-        let info = fs.master_info().unwrap();
+        let info = fs.filesystem_info().unwrap();
         let worker = info
             .live_workers
             .iter()

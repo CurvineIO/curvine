@@ -449,7 +449,7 @@ public class CurvineFileSystem extends FileSystem {
             statistics.incrementReadOps(1);
         }
 
-        byte[] bytes = libFs.getMasterInfo();
+        byte[] bytes = libFs.getFilesystemInfo();
         GetFilesystemInfoResponse info = GetFilesystemInfoResponse.parseFrom(bytes);
         return new CurvineFsStat(info);
     }

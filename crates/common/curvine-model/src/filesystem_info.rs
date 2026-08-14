@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct MasterInfo {
+pub struct FilesystemInfo {
     pub active_master: String,
     pub journal_nodes: Vec<String>,
 
@@ -36,7 +36,7 @@ pub struct MasterInfo {
     pub lost_workers: Vec<WorkerInfo>,
 }
 
-impl MasterInfo {
+impl FilesystemInfo {
     pub fn journal_nodes_count(&self) -> usize {
         self.journal_nodes.len()
     }

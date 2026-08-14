@@ -138,8 +138,8 @@ impl JavaFilesystem {
         self.inner.delete(path, JavaUtils::jbool_to_bool(recursive))
     }
 
-    pub fn get_master_info(&self, env: &mut JNIEnv) -> FsResult<jarray> {
-        let status = self.inner.get_master_info()?;
+    pub fn get_filesystem_info(&self, env: &mut JNIEnv) -> FsResult<jarray> {
+        let status = self.inner.get_filesystem_info()?;
         let byte_arr = JavaUtils::new_jarray(env, &status)?;
         Ok(byte_arr)
     }

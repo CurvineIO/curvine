@@ -28,7 +28,7 @@ class Test(unittest.TestCase):
         print("------------------------------------------------")
 
         
-        master_status = fs.get_master_info()
+        master_status = fs.get_filesystem_info()
         print("Master information:",master_status)
         print("------------------------------------------------")
 

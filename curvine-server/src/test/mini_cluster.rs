@@ -217,7 +217,7 @@ impl MiniCluster {
 
         while LocalTime::mills() <= wait_time {
             retry_count += 1;
-            let info = match fs.get_master_info().await {
+            let info = match fs.get_filesystem_info().await {
                 Ok(info) => info,
                 Err(e) => {
                     return Err(e);

@@ -186,7 +186,7 @@ fn _abort() -> CommonResult<()> {
     let path = Path::from_str("/file-abort.log")?;
 
     rt.block_on(async move {
-        let before = fs.get_master_info().await?.available;
+        let before = fs.get_filesystem_info().await?.available;
         let mut writer = fs.create(&path, true).await?;
         writer.write("123".as_bytes()).await?;
         writer.flush().await?;
@@ -195,7 +195,7 @@ fn _abort() -> CommonResult<()> {
         fs.delete(&path, false).await?;
 
         tokio::time::sleep(Duration::from_secs(10)).await;
-        let after = fs.get_master_info().await?.available;
+        let after = fs.get_filesystem_info().await?.available;
 
         println!("before {}, after {}", before, after);
         assert_eq!(before, after);

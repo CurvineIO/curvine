@@ -1106,9 +1106,9 @@ impl MasterFilesystem {
         Ok(inode.clone())
     }
 
-    pub fn master_info(&self) -> FsResult<MasterInfo> {
+    pub fn filesystem_info(&self) -> FsResult<FilesystemInfo> {
         let metrics = Master::get_metrics()?;
-        let mut info = MasterInfo {
+        let mut info = FilesystemInfo {
             inode_dir_num: metrics.inode_dir_num.get(),
             inode_file_num: metrics.inode_file_num.get(),
             ..Default::default()
