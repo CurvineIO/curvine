@@ -544,6 +544,21 @@ class TestCurvineFileSystem(unittest.TestCase):
         mock_client_instance.get_filesystem_info.assert_called_once()
 
     @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_get_master_info_deprecated_alias(self, mock_curvine_client: MagicMock) -> None:
+        """Deprecated get_master_info() forwards to get_filesystem_info() and warns."""
+        mock_client_instance = MagicMock()
+        mock_curvine_client.CurvineClient.return_value = mock_client_instance
+        mock_info = {"active_master": "node1", "capacity": 1000000}
+        mock_client_instance.get_filesystem_info.return_value = mock_info
+
+        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
+        with self.assertWarns(DeprecationWarning):
+            result = fs.get_master_info()
+
+        self.assertEqual(result, mock_info)
+        mock_client_instance.get_filesystem_info.assert_called_once()
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
     def test_close(self, mock_curvine_client: MagicMock) -> None:
         """Test close."""
         mock_client_instance = MagicMock()
