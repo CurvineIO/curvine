@@ -53,7 +53,8 @@ pub struct TransferConf {
     #[serde(skip)]
     pub allow_submit_with_stale_snapshot: bool,
     pub max_running_transfers: usize,
-    /// Maximum number of distinct auto-cache requests waiting for client-side submission.
+    /// Maximum number of distinct auto-cache requests waiting for or performing submission.
+    /// This includes requests waiting for a `client_submit_concurrency` permit.
     pub client_pending_queue_size: usize,
     /// Maximum number of client-side auto-cache submissions running concurrently.
     pub client_submit_concurrency: usize,

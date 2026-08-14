@@ -1347,14 +1347,30 @@ mod tests {
     }
 
     #[test]
-    fn async_cache_submit_slots_enforce_concurrency() {
-        let pending = AsyncCachePending::new(16, 2);
-        let first = pending.submit_slots.clone().try_acquire_owned().unwrap();
-        let second = pending.submit_slots.clone().try_acquire_owned().unwrap();
+    fn async_cache_pending_waiters_hold_admission_until_submission_finishes() {
+        let pending = AsyncCachePending::new(2, 1);
+        let first_pending = match pending.try_admit("ufs://bucket/a".to_string()) {
+            AsyncCacheAdmission::Accepted(permit) => permit,
+            _ => panic!("first path should be admitted"),
+        };
+        let second_pending = match pending.try_admit("ufs://bucket/b".to_string()) {
+            AsyncCacheAdmission::Accepted(permit) => permit,
+            _ => panic!("second path should wait within pending capacity"),
+        };
 
+        let first_submit = pending.submit_slots.clone().try_acquire_owned().unwrap();
         assert!(pending.submit_slots.clone().try_acquire_owned().is_err());
-        drop(first);
-        assert!(pending.submit_slots.clone().try_acquire_owned().is_ok());
-        drop(second);
+        assert_eq!(pending.paths.lock().len(), 2);
+
+        drop(first_submit);
+        let second_submit = pending.submit_slots.clone().try_acquire_owned().unwrap();
+        drop(second_submit);
+        assert_eq!(pending.paths.lock().len(), 2);
+
+        drop(first_pending);
+        assert!(!pending.paths.lock().contains("ufs://bucket/a"));
+        assert!(pending.paths.lock().contains("ufs://bucket/b"));
+        drop(second_pending);
+        assert!(pending.paths.lock().is_empty());
     }
 }
