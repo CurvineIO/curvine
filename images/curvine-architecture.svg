@@ -1,0 +1,117 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 760" width="1200" height="760">
+<style>text{font-family:'Helvetica Neue',Helvetica,Arial,'PingFang SC','Microsoft YaHei',sans-serif}.t{font-size:22px;font-weight:700;fill:#111827}.ll{font-size:13px;font-weight:700}.bt{font-size:14px;font-weight:600;fill:#111827}.bs{font-size:11px;fill:#6b7280}.al{font-size:11px;font-weight:600}.lg{font-size:11px;fill:#6b7280}</style>
+<defs>
+<marker id="ab" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0,10 3.5,0 7" fill="#2563eb"/></marker>
+<marker id="ag" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0,10 3.5,0 7" fill="#16a34a"/></marker>
+<marker id="ay" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0,10 3.5,0 7" fill="#6b7280"/></marker>
+<filter id="sh" x="-10%" y="-10%" width="120%" height="120%"><feDropShadow dx="0" dy="1" stdDeviation="1.5" flood-color="#000000" flood-opacity="0.08"/></filter>
+</defs>
+<rect width="1200" height="760" fill="#ffffff"/>
+<text x="600" y="38" text-anchor="middle" class="t">Curvine Architecture</text>
+<rect x="40" y="60" width="1120" height="100" rx="10" fill="#eff6ff" stroke="#bfdbfe" stroke-width="1.5" stroke-dasharray="6,4"/>
+<text x="58" y="82" class="ll" fill="#1e40af">Access Layer</text>
+<g filter="url(#sh)">
+<rect x="140" y="95" width="240" height="55" rx="8" fill="#ffffff" stroke="#93c5fd" stroke-width="1.5"/>
+<text x="260" y="120" text-anchor="middle" class="bt">AI Agent Pods</text>
+<text x="260" y="137" text-anchor="middle" class="bs">10,000+ stateful workloads</text>
+<rect x="480" y="95" width="240" height="55" rx="8" fill="#ffffff" stroke="#93c5fd" stroke-width="1.5"/>
+<text x="600" y="120" text-anchor="middle" class="bt">AI / Big Data Engines</text>
+<text x="600" y="137" text-anchor="middle" class="bs">Training, inference, OLAP</text>
+<rect x="820" y="95" width="240" height="55" rx="8" fill="#ffffff" stroke="#93c5fd" stroke-width="1.5"/>
+<text x="940" y="120" text-anchor="middle" class="bt">CLI Tools</text>
+<text x="940" y="137" text-anchor="middle" class="bs">cv fs / cv load / cv report</text>
+</g>
+<rect x="40" y="190" width="1120" height="100" rx="10" fill="#faf5ff" stroke="#ddd6fe" stroke-width="1.5" stroke-dasharray="6,4"/>
+<text x="58" y="212" class="ll" fill="#6b21a8">Protocol &amp; Interface Layer</text>
+<g filter="url(#sh)">
+<rect x="60" y="225" width="200" height="55" rx="8" fill="#ffffff" stroke="#c4b5fd" stroke-width="1.5"/>
+<text x="160" y="248" text-anchor="middle" class="bt">POSIX FUSE</text>
+<text x="160" y="265" text-anchor="middle" class="bs">curvine-fuse</text>
+<rect x="290" y="225" width="200" height="55" rx="8" fill="#ffffff" stroke="#c4b5fd" stroke-width="1.5"/>
+<text x="390" y="248" text-anchor="middle" class="bt">S3 Gateway</text>
+<text x="390" y="265" text-anchor="middle" class="bs">curvine-s3-gateway</text>
+<rect x="520" y="225" width="200" height="55" rx="8" fill="#ffffff" stroke="#c4b5fd" stroke-width="1.5"/>
+<text x="620" y="248" text-anchor="middle" class="bt">HDFS / UFS Adapter</text>
+<text x="620" y="265" text-anchor="middle" class="bs">curvine-ufs</text>
+<rect x="750" y="225" width="200" height="55" rx="8" fill="#ffffff" stroke="#c4b5fd" stroke-width="1.5"/>
+<text x="850" y="248" text-anchor="middle" class="bt">SDK &amp; Client</text>
+<text x="850" y="265" text-anchor="middle" class="bs">Java / Python / Rust</text>
+<rect x="980" y="225" width="160" height="55" rx="8" fill="#ffffff" stroke="#c4b5fd" stroke-width="1.5"/>
+<text x="1060" y="248" text-anchor="middle" class="bt">K8s CSI Driver</text>
+<text x="1060" y="265" text-anchor="middle" class="bs">curvine-csi</text>
+</g>
+<rect x="40" y="310" width="1120" height="250" rx="10" fill="#f0fdf4" stroke="#bbf7d0" stroke-width="1.5" stroke-dasharray="6,4"/>
+<text x="58" y="332" class="ll" fill="#166534">Curvine Cluster Core</text>
+<rect x="70" y="345" width="500" height="195" rx="8" fill="#ecfeff" stroke="#a5f3fc" stroke-width="1.5"/>
+<text x="90" y="367" class="ll" fill="#155e75">Control Plane</text>
+<g filter="url(#sh)">
+<rect x="100" y="380" width="210" height="145" rx="8" fill="#ffffff" stroke="#67e8f9" stroke-width="1.5"/>
+<text x="205" y="403" text-anchor="middle" class="bt">Master Node (Raft)</text>
+<text x="205" y="422" text-anchor="middle" class="bs">Metadata &amp; Namespace</text>
+<text x="205" y="438" text-anchor="middle" class="bs">Scheduling &amp; Load Balance</text>
+<text x="205" y="454" text-anchor="middle" class="bs">Cluster Coordination</text>
+<text x="205" y="470" text-anchor="middle" class="bs">HA via Raft Consensus</text>
+<rect x="330" y="380" width="220" height="145" rx="8" fill="#ffffff" stroke="#67e8f9" stroke-width="1.5"/>
+<text x="440" y="403" text-anchor="middle" class="bt">Web UI / API</text>
+<text x="440" y="422" text-anchor="middle" class="bs">Cluster Dashboard</text>
+<text x="440" y="438" text-anchor="middle" class="bs">Metrics &amp; Monitoring</text>
+<text x="440" y="454" text-anchor="middle" class="bs">Management API</text>
+</g>
+<rect x="600" y="345" width="530" height="195" rx="8" fill="#fff7ed" stroke="#fed7aa" stroke-width="1.5"/>
+<text x="620" y="367" class="ll" fill="#9a3412">Data Plane</text>
+<g filter="url(#sh)">
+<rect x="630" y="380" width="470" height="145" rx="8" fill="#ffffff" stroke="#fdba74" stroke-width="1.5"/>
+<text x="865" y="403" text-anchor="middle" class="bt">Worker Nodes (N)</text>
+<text x="865" y="422" text-anchor="middle" class="bs">Multi-tier Cache: Memory / SSD / HDD</text>
+<text x="865" y="438" text-anchor="middle" class="bs">Data Read / Write Service</text>
+<text x="865" y="454" text-anchor="middle" class="bs">Eviction / Replication</text>
+<text x="865" y="470" text-anchor="middle" class="bs">Metrics Export</text>
+</g>
+<rect x="40" y="585" width="1120" height="100" rx="10" fill="#fffbeb" stroke="#fde68a" stroke-width="1.5" stroke-dasharray="6,4"/>
+<text x="58" y="607" class="ll" fill="#92400e">Storage Layer (Durable Persistence)</text>
+<g filter="url(#sh)">
+<rect x="120" y="620" width="200" height="55" rx="8" fill="#ffffff" stroke="#fcd34d" stroke-width="1.5"/>
+<text x="220" y="643" text-anchor="middle" class="bt">AWS S3</text>
+<text x="220" y="660" text-anchor="middle" class="bs">object storage</text>
+<rect x="360" y="620" width="200" height="55" rx="8" fill="#ffffff" stroke="#fcd34d" stroke-width="1.5"/>
+<text x="460" y="643" text-anchor="middle" class="bt">Azure Blob</text>
+<text x="460" y="660" text-anchor="middle" class="bs">object storage</text>
+<rect x="600" y="620" width="200" height="55" rx="8" fill="#ffffff" stroke="#fcd34d" stroke-width="1.5"/>
+<text x="700" y="643" text-anchor="middle" class="bt">Google GCS</text>
+<text x="700" y="660" text-anchor="middle" class="bs">object storage</text>
+<rect x="840" y="620" width="240" height="55" rx="8" fill="#ffffff" stroke="#fcd34d" stroke-width="1.5"/>
+<text x="960" y="643" text-anchor="middle" class="bt">OSS / S3-compatible</text>
+<text x="960" y="660" text-anchor="middle" class="bs">MinIO, HDFS, etc.</text>
+</g>
+<line x1="260" y1="150" x2="260" y2="223" stroke="#2563eb" stroke-width="1.5" marker-end="url(#ab)"/>
+<line x1="600" y1="150" x2="600" y2="223" stroke="#2563eb" stroke-width="1.5" marker-end="url(#ab)"/>
+<line x1="940" y1="150" x2="940" y2="223" stroke="#2563eb" stroke-width="1.5" marker-end="url(#ab)"/>
+<path d="M 260,280 L 260,330 L 205,330 L 205,378" stroke="#2563eb" stroke-width="1.5" fill="none" marker-end="url(#ab)"/>
+<path d="M 390,280 L 390,335 L 250,335 L 250,378" stroke="#2563eb" stroke-width="1.5" fill="none" marker-end="url(#ab)"/>
+<path d="M 620,280 L 620,340 L 290,340 L 290,378" stroke="#2563eb" stroke-width="1.5" fill="none" marker-end="url(#ab)"/>
+<rect x="295" y="318" width="120" height="16" fill="#ffffff" opacity="0.95"/>
+<text x="355" y="330" text-anchor="middle" class="al" fill="#2563eb">Metadata RPC</text>
+<path d="M 850,280 L 850,340 L 760,340 L 760,378" stroke="#16a34a" stroke-width="1.5" fill="none" marker-end="url(#ag)"/>
+<path d="M 1060,280 L 1060,335 L 970,335 L 970,378" stroke="#16a34a" stroke-width="1.5" fill="none" marker-end="url(#ag)"/>
+<rect x="855" y="318" width="110" height="16" fill="#ffffff" opacity="0.95"/>
+<text x="910" y="330" text-anchor="middle" class="al" fill="#16a34a">Data I/O</text>
+<path d="M 310,452 L 628,452" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="5,3" fill="none" marker-end="url(#ab)"/>
+<rect x="430" y="444" width="80" height="16" fill="#ffffff" opacity="0.95"/>
+<text x="470" y="456" text-anchor="middle" class="al" fill="#2563eb">Coordination</text>
+<path d="M 865,525 L 865,565 L 700,565 L 700,618" stroke="#16a34a" stroke-width="1.5" stroke-dasharray="5,3" fill="none" marker-end="url(#ag)"/>
+<rect x="715" y="556" width="150" height="16" fill="#ffffff" opacity="0.95"/>
+<text x="790" y="568" text-anchor="middle" class="al" fill="#16a34a">Cache Miss / Persist</text>
+<path d="M 1060,223 L 1060,175 L 160,175 L 160,223" stroke="#6b7280" stroke-width="1.5" stroke-dasharray="4,2" fill="none" marker-end="url(#ay)"/>
+<rect x="540" y="167" width="120" height="16" fill="#ffffff" opacity="0.95"/>
+<text x="600" y="179" text-anchor="middle" class="al" fill="#6b7280">CSI mounts FUSE</text>
+<g transform="translate(60,705)">
+<line x1="0" y1="8" x2="30" y2="8" stroke="#2563eb" stroke-width="1.5" marker-end="url(#ab)"/>
+<text x="38" y="12" class="lg">Metadata / Control RPC</text>
+<line x1="220" y1="8" x2="250" y2="8" stroke="#16a34a" stroke-width="1.5" marker-end="url(#ag)"/>
+<text x="258" y="12" class="lg">Data I/O Flow</text>
+<line x1="400" y1="8" x2="430" y2="8" stroke="#16a34a" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#ag)"/>
+<text x="438" y="12" class="lg">Cache Miss / Persist</text>
+<line x1="620" y1="8" x2="650" y2="8" stroke="#6b7280" stroke-width="1.5" stroke-dasharray="4,2" marker-end="url(#ay)"/>
+<text x="658" y="12" class="lg">K8s Integration</text>
+</g>
+</svg>
