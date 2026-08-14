@@ -28,8 +28,8 @@ class Test(unittest.TestCase):
         print("------------------------------------------------")
 
         
-        master_status = fs.get_filesystem_info()
-        print("Master information:",master_status)
+        filesystem_status = fs.get_filesystem_info()
+        print("Filesystem information:",filesystem_status)
         print("------------------------------------------------")
 
         writer = fs.create(test_path+"/a.txt", True)

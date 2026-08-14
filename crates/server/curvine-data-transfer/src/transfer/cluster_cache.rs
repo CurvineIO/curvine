@@ -118,8 +118,8 @@ impl ClusterMetadataCache {
 
     async fn refresh_inner(&self) -> FsResult<()> {
         let mounts = self.fs.get_mount_table().await?;
-        let master = self.fs.get_filesystem_info().await?;
-        let mut workers = master.live_workers;
+        let fs_info = self.fs.get_filesystem_info().await?;
+        let mut workers = fs_info.live_workers;
         {
             let mut rejected = self.rejected_worker_sessions.write();
             rejected.retain(|(worker_id, worker_session_id)| {

@@ -558,7 +558,7 @@ async fn add_block(fs: &CurvineFileSystem) -> CommonResult<()> {
 
 async fn get_filesystem_info(fs: &CurvineFileSystem) -> CommonResult<()> {
     let res = fs.get_filesystem_info().await?;
-    info!("master info {:#?}", res);
+    info!("filesystem info {:#?}", res);
     Ok(())
 }
 
@@ -685,7 +685,7 @@ async fn test_fs_used(fs: &CurvineFileSystem) -> CommonResult<()> {
     // Wait for storage system to process
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    // Get master info to check fs_used
+    // Get filesystem info to check fs_used
     let after_small_files_info = fs.get_filesystem_info().await?;
     info!(
         "After creating small files - FS Used: {} bytes ({:.2} MB)",
@@ -713,7 +713,7 @@ async fn test_fs_used(fs: &CurvineFileSystem) -> CommonResult<()> {
     // Wait for storage system to update
     tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
-    // Get master info again
+    // Get filesystem info again
     let final_filesystem_info = fs.get_filesystem_info().await?;
     info!(
         "Final FS Used: {} bytes ({:.2} MB)",

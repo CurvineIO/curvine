@@ -107,12 +107,12 @@ class CurvineClient:
                 - lost_workers: List of lost workers
 
         Raises:
-            IOError: If getting master info fails.
+            IOError: If getting filesystem info fails.
         """
         try:
             status_bytes = curvine_libsdk.python_io_curvine_curvine_native_get_filesystem_info(self.file_system_ptr)
         except Exception as e:
-            raise IOError(f"Native get master information failed: {e}")
+            raise IOError(f"Native get filesystem information failed: {e}")
         status = GetFilesystemInfoResponse()
         status.ParseFromString(status_bytes)
         status_dict = {

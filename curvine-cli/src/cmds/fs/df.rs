@@ -17,7 +17,7 @@ impl DfCommand {
     pub async fn execute(&self, client: UnifiedFileSystem) -> CommonResult<()> {
         match self {
             DfCommand::Df { human_readable, .. } => {
-                // Get master info from the filesystem
+                // Get filesystem info from the filesystem
                 match client.get_filesystem_info().await {
                     Ok(filesystem_info) => {
                         // Format similar to HDFS df output
@@ -66,7 +66,7 @@ impl DfCommand {
                         Ok(())
                     }
                     Err(e) => {
-                        eprintln!("Error getting master info: {}", e);
+                        eprintln!("Error getting filesystem info: {}", e);
                         Err(e.into())
                     }
                 }
