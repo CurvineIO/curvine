@@ -520,11 +520,19 @@ impl UnifiedFileSystem {
         let pending_permit = match self.async_cache_pending.try_admit(source_path.clone()) {
             AsyncCacheAdmission::Accepted(pending) => pending,
             AsyncCacheAdmission::AlreadyPending => {
+                self.metrics
+                    .async_cache_admission_skipped
+                    .with_label_values(&["already_pending"])
+                    .inc();
                 debug!("async cache request already pending for {}", source_path);
                 return Ok(());
             }
             AsyncCacheAdmission::Overloaded => {
-                warn!(
+                self.metrics
+                    .async_cache_admission_skipped
+                    .with_label_values(&["overloaded"])
+                    .inc();
+                debug!(
                     "skip async cache request for {} because the client pending queue is full, capacity={}",
                     source_path, self.async_cache_pending.capacity
                 );

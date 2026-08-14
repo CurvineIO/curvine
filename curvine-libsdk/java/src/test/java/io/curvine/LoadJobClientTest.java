@@ -127,11 +127,13 @@ public class LoadJobClientTest {
         conf.set("fs.cv.master_addrs", "master-0:8995");
         conf.set("fs.cv.transfer.enabled", "true");
         conf.set("fs.cv.transfer.endpoints", "transfer-0:9010, transfer-1:9010");
+        conf.set("fs.cv.transfer.client_pending_queue_size", "2048");
 
         String toml = new FilesystemConf(conf).toToml();
 
         Assert.assertTrue(toml.contains("[transfer]"));
         Assert.assertTrue(toml.contains("enabled = true"));
         Assert.assertTrue(toml.contains("endpoints = [\"transfer-0:9010\", \"transfer-1:9010\"]"));
+        Assert.assertTrue(toml.contains("client_pending_queue_size = 2048"));
     }
 }
