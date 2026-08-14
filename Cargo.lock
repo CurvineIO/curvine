@@ -2844,7 +2844,6 @@ dependencies = [
  "curvine-runtime",
  "curvine-ufs-opendal",
  "curvine-ufs-oss-hdfs",
- "dashmap 5.5.3",
  "log",
  "once_cell",
  "tokio",

@@ -32,13 +32,13 @@ use curvine_model::{
 use curvine_runtime::common::TimeSpent;
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
-use dashmap::DashSet;
+use curvine_runtime::sync::FastMutex;
 use log::{debug, error, info, warn};
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time;
 
 const TRANSFER_SUBMIT_MAX_ATTEMPTS: usize = 3;
@@ -52,8 +52,7 @@ enum CacheValidity {
 
 #[derive(Clone)]
 struct AsyncCachePending {
-    paths: Arc<DashSet<String>>,
-    slots: Arc<Semaphore>,
+    paths: Arc<FastMutex<HashSet<String>>>,
     capacity: usize,
 }
 
@@ -65,43 +64,37 @@ enum AsyncCacheAdmission {
 
 struct AsyncCachePermit {
     path: String,
-    paths: Arc<DashSet<String>>,
-    _slot: OwnedSemaphorePermit,
+    paths: Arc<FastMutex<HashSet<String>>>,
 }
 
 impl AsyncCachePending {
     fn new(capacity: usize) -> Self {
         Self {
-            paths: Arc::new(DashSet::new()),
-            slots: Arc::new(Semaphore::new(capacity)),
+            paths: Arc::new(FastMutex::new(HashSet::new())),
             capacity,
         }
     }
 
     fn try_admit(&self, path: String) -> AsyncCacheAdmission {
-        if self.paths.contains(&path) {
+        let mut paths = self.paths.lock();
+        if paths.contains(&path) {
             return AsyncCacheAdmission::AlreadyPending;
         }
-
-        let slot = match self.slots.clone().try_acquire_owned() {
-            Ok(slot) => slot,
-            Err(_) => return AsyncCacheAdmission::Overloaded,
-        };
-        if !self.paths.insert(path.clone()) {
-            return AsyncCacheAdmission::AlreadyPending;
+        if paths.len() >= self.capacity {
+            return AsyncCacheAdmission::Overloaded;
         }
+        paths.insert(path.clone());
 
         AsyncCacheAdmission::Accepted(AsyncCachePermit {
             path,
             paths: self.paths.clone(),
-            _slot: slot,
         })
     }
 }
 
 impl Drop for AsyncCachePermit {
     fn drop(&mut self) {
-        self.paths.remove(&self.path);
+        self.paths.lock().remove(&self.path);
     }
 }
 
@@ -524,7 +517,7 @@ impl UnifiedFileSystem {
 
     pub fn async_cache(&self, source_path: &Path) -> FsResult<()> {
         let source_path = source_path.clone_uri();
-        let _pending = match self.async_cache_pending.try_admit(source_path.clone()) {
+        let pending_permit = match self.async_cache_pending.try_admit(source_path.clone()) {
             AsyncCacheAdmission::Accepted(pending) => pending,
             AsyncCacheAdmission::AlreadyPending => {
                 debug!("async cache request already pending for {}", source_path);
@@ -543,6 +536,7 @@ impl UnifiedFileSystem {
         let metrics = self.metrics;
 
         self.fs_context().rt().spawn(async move {
+            let _pending_permit = pending_permit;
             let time = TimeSpent::new();
             let res = fs.submit_async_cache(&source_path).await;
 
@@ -573,7 +567,6 @@ impl UnifiedFileSystem {
                     debug!("submitted async cache job {} for {}", job_id, source_path);
                 }
             }
-            drop(_pending);
         });
 
         Ok(())
@@ -1262,6 +1255,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
 #[cfg(test)]
 mod tests {
     use super::{AsyncCacheAdmission, AsyncCachePending};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -1292,16 +1286,26 @@ mod tests {
     fn async_cache_pending_deduplicates_concurrent_requests() {
         let pending = Arc::new(AsyncCachePending::new(32));
         let accepted = Arc::new(Mutex::new(Vec::new()));
+        let already_pending = Arc::new(AtomicUsize::new(0));
+        let overloaded = Arc::new(AtomicUsize::new(0));
         let mut threads = Vec::new();
 
         for _ in 0..32 {
             let pending = pending.clone();
             let accepted = accepted.clone();
+            let already_pending = already_pending.clone();
+            let overloaded = overloaded.clone();
             threads.push(std::thread::spawn(move || {
-                if let AsyncCacheAdmission::Accepted(permit) =
-                    pending.try_admit("ufs://bucket/same".to_string())
-                {
-                    accepted.lock().unwrap().push(permit);
+                match pending.try_admit("ufs://bucket/same".to_string()) {
+                    AsyncCacheAdmission::Accepted(permit) => {
+                        accepted.lock().unwrap().push(permit);
+                    }
+                    AsyncCacheAdmission::AlreadyPending => {
+                        already_pending.fetch_add(1, Ordering::Relaxed);
+                    }
+                    AsyncCacheAdmission::Overloaded => {
+                        overloaded.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }));
         }
@@ -1310,5 +1314,7 @@ mod tests {
         }
 
         assert_eq!(accepted.lock().unwrap().len(), 1);
+        assert_eq!(already_pending.load(Ordering::Relaxed), 31);
+        assert_eq!(overloaded.load(Ordering::Relaxed), 0);
     }
 }
