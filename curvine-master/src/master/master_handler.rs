@@ -467,8 +467,21 @@ impl MasterHandler {
             Self::process_get_filesystem_info(fs)
         })
         .await?;
-        let rep_header = ProtoUtils::filesystem_info_to_pb(info);
+        let rep_header = Self::build_filesystem_info_response(info);
         ctx.response(rep_header)
+    }
+
+    /// Build the GetFilesystemInfo response, attaching the master's own version
+    /// and the default (lenient) compatibility contract on the reserved 1000+
+    /// field range. Legacy clients that do not know the field simply skip it,
+    /// so this never breaks older peers.
+    fn build_filesystem_info_response(info: FilesystemInfo) -> GetFilesystemInfoResponse {
+        let mut rep_header = ProtoUtils::filesystem_info_to_pb(info);
+        let master_version = curvine_sys::version::component_version("master");
+        rep_header.compatibility = Some(ProtoUtils::default_master_compatibility_to_pb(
+            &master_version,
+        ));
+        rep_header
     }
 
     async fn async_get_cv_metadata_snapshot_page(
@@ -1042,5 +1055,39 @@ mod tests {
             .unwrap();
         assert_eq!(worker.software_version, "0.1.0-test");
         assert_eq!(worker.startup_time_ms, 123_456);
+    }
+
+    #[test]
+    fn build_filesystem_info_response_attaches_master_compatibility() {
+        let info = FilesystemInfo {
+            active_master: "master-0".to_string(),
+            inode_dir_num: 3,
+            inode_file_num: 5,
+            block_num: 7,
+            capacity: 1000,
+            available: 500,
+            fs_used: 300,
+            non_fs_used: 200,
+            ..Default::default()
+        };
+
+        let rep = MasterHandler::build_filesystem_info_response(info);
+
+        assert_eq!(rep.active_master, "master-0");
+        assert_eq!(rep.inode_file_num, 5);
+        let compat = rep
+            .compatibility
+            .expect("master must advertise compatibility");
+        assert_eq!(compat.server.component.as_deref(), Some("master"));
+        assert_eq!(
+            compat.server.release_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(compat.server.protocol_version, Some(1));
+        assert_eq!(
+            compat.compatibility_mode,
+            CompatibilityModeProto::Diagnose as i32
+        );
+        assert!(compat.blocked_versions.is_empty());
     }
 }

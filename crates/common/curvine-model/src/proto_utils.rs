@@ -16,6 +16,7 @@ use crate::proto::*;
 use crate::state::*;
 use crate::worker_info::TransferWorkerCapabilities;
 use curvine_core_error::{try_err, CommonResult};
+use curvine_sys::version::ComponentVersion;
 use prost::bytes::BytesMut;
 use prost::Message;
 use std::fmt::Debug;
@@ -382,6 +383,34 @@ impl ProtoUtils {
             blacklist_workers: Self::worker_info_from_pb(src.blacklist_workers),
             decommission_workers: Self::worker_info_from_pb(src.decommission_workers),
             lost_workers: Self::worker_info_from_pb(src.lost_workers),
+        }
+    }
+
+    /// Convert a structured component version into its wire representation for
+    /// handshake metadata (component_info / compatibility payloads).
+    pub fn component_version_to_pb(src: &ComponentVersion) -> ComponentInfoProto {
+        ComponentInfoProto {
+            component: Some(src.component.clone()),
+            release_version: Some(src.release_version.clone()),
+            git_commit: Some(src.git_commit.clone()),
+            git_tag: Some(src.git_tag.clone()),
+            git_branch: Some(src.git_branch.clone()),
+            protocol_version: Some(src.protocol_version),
+            min_protocol_version: Some(src.min_protocol_version),
+            capabilities: src.capabilities.clone(),
+        }
+    }
+
+    /// Build the default compatibility contract a master advertises during the
+    /// GetFilesystemInfo handshake: the master's own version plus a lenient
+    /// diagnose policy. Legacy peers without the field keep working untouched.
+    pub fn default_master_compatibility_to_pb(
+        src: &ComponentVersion,
+    ) -> ServerCompatibilityInfoProto {
+        ServerCompatibilityInfoProto {
+            server: Self::component_version_to_pb(src),
+            compatibility_mode: CompatibilityModeProto::Diagnose as i32,
+            ..Default::default()
         }
     }
 
@@ -766,8 +795,10 @@ impl ProtoUtils {
 
 #[cfg(test)]
 mod tests {
+    use crate::proto::CompatibilityModeProto;
     use crate::state::{AccessMode, FileStatus, MountInfo, MountOptions, INTERNAL_CTIME_XATTR};
     use crate::utils::ProtoUtils;
+    use curvine_sys::version::ComponentVersion;
     use std::collections::HashMap;
 
     #[test]
@@ -839,5 +870,62 @@ mod tests {
         let round_trip = ProtoUtils::file_status_from_pb(pb);
         assert_eq!(round_trip.ctime(), 1_000);
         assert!(!round_trip.x_attr.contains_key(INTERNAL_CTIME_XATTR));
+    }
+
+    #[test]
+    fn component_version_to_pb_maps_all_fields() {
+        let version = ComponentVersion {
+            component: "master".to_string(),
+            release_version: "0.4.0-alpha".to_string(),
+            git_commit: "359fce7d982a15f09c3b4e0b2e62fee4229609dd".to_string(),
+            git_tag: "v0.4.0-alpha".to_string(),
+            git_branch: "main".to_string(),
+            protocol_version: 1,
+            min_protocol_version: 1,
+            capabilities: vec!["transfer".to_string(), "batch-write".to_string()],
+        };
+
+        let pb = ProtoUtils::component_version_to_pb(&version);
+
+        assert_eq!(pb.component.as_deref(), Some("master"));
+        assert_eq!(pb.release_version.as_deref(), Some("0.4.0-alpha"));
+        assert_eq!(
+            pb.git_commit.as_deref(),
+            Some("359fce7d982a15f09c3b4e0b2e62fee4229609dd")
+        );
+        assert_eq!(pb.git_tag.as_deref(), Some("v0.4.0-alpha"));
+        assert_eq!(pb.git_branch.as_deref(), Some("main"));
+        assert_eq!(pb.protocol_version, Some(1));
+        assert_eq!(pb.min_protocol_version, Some(1));
+        assert_eq!(
+            pb.capabilities,
+            vec!["transfer".to_string(), "batch-write".to_string()]
+        );
+    }
+
+    #[test]
+    fn default_master_compatibility_embeds_server_and_is_diagnose() {
+        let version = ComponentVersion {
+            component: "master".to_string(),
+            release_version: "0.4.0-alpha".to_string(),
+            git_commit: "abc".to_string(),
+            git_tag: String::new(),
+            git_branch: "main".to_string(),
+            protocol_version: 1,
+            min_protocol_version: 1,
+            capabilities: vec![],
+        };
+
+        let pb = ProtoUtils::default_master_compatibility_to_pb(&version);
+
+        assert_eq!(pb.server.component.as_deref(), Some("master"));
+        assert_eq!(pb.server.release_version.as_deref(), Some("0.4.0-alpha"));
+        assert_eq!(
+            pb.compatibility_mode,
+            CompatibilityModeProto::Diagnose as i32
+        );
+        assert!(pb.min_worker_version.is_none());
+        assert!(pb.min_client_version.is_none());
+        assert!(pb.blocked_versions.is_empty());
     }
 }
