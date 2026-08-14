@@ -63,6 +63,13 @@ pub struct FsContext {
     // keeps GetFilesystemInfo (which backs FUSE statfs and may be called
     // frequently) from carrying the payload on every request.
     handshake_reported: AtomicBool,
+    // Guards the one-time lazy handshake: the first ordinary master RPC of a
+    // session runs the client-master handshake first (best-effort), so every
+    // client path (CLI, SDK, data-transfer, FUSE, direct
+    // CurvineFileSystem/UnifiedFileSystem users) reports component_info and
+    // caches the master's compatibility contract — not only FUSE mount.
+    handshake_lock: tokio::sync::Mutex<()>,
+    handshake_started: AtomicBool,
 }
 
 impl FsContext {
@@ -118,6 +125,8 @@ impl FsContext {
             block_pool,
             master_handshake: FastRwLock::new(MasterHandshake::default()),
             handshake_reported: AtomicBool::new(false),
+            handshake_lock: tokio::sync::Mutex::new(()),
+            handshake_started: AtomicBool::new(false),
         };
         Ok(context)
     }
@@ -154,6 +163,30 @@ impl FsContext {
     /// master).
     pub(crate) fn reset_handshake_report(&self) {
         self.handshake_reported.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether a `GetFilesystemInfo` request has already gone out this session
+    /// (component_info reported once). Lets the lazy handshake skip re-running
+    /// when the typed/bytes GetFilesystemInfo path already populated the
+    /// cache.
+    pub(crate) fn handshake_reported(&self) -> bool {
+        self.handshake_reported.load(Ordering::Relaxed)
+    }
+
+    /// Lock guarding the one-time lazy handshake execution.
+    pub(crate) fn handshake_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.handshake_lock
+    }
+
+    /// Whether the one-time lazy handshake has already been attempted.
+    pub(crate) fn handshake_started(&self) -> bool {
+        self.handshake_started.load(Ordering::Relaxed)
+    }
+
+    /// Mark the one-time lazy handshake as attempted (used by the explicit
+    /// `handshake()` so the first ordinary RPC does not re-run it).
+    pub(crate) fn mark_handshake_started(&self) {
+        self.handshake_started.store(true, Ordering::Relaxed);
     }
 
     pub fn conf(&self) -> &ClusterConf {

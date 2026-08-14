@@ -25,6 +25,7 @@ use curvine_proto::*;
 use curvine_rpc::client::ClusterConnector;
 use curvine_rpc::message::MessageBuilder;
 use curvine_runtime::runtime::RpcRuntime;
+use log::warn;
 use prost::Message as PMessage;
 use std::collections::LinkedList;
 use std::sync::Arc;
@@ -39,6 +40,30 @@ struct CompleteFileOptions {
     only_flush: bool,
     set_attr_opts: Option<SetAttrOpts>,
     return_file_blocks: bool,
+}
+
+/// RAII guard for a claimed one-time handshake report. Resets the claim when
+/// dropped without being committed, so a cancelled or failed in-flight
+/// `GetFilesystemInfo` future never permanently suppresses `component_info`
+/// reporting.
+struct HandshakeReportGuard<'a> {
+    context: &'a FsContext,
+    committed: bool,
+}
+
+impl HandshakeReportGuard<'_> {
+    /// Mark the report as delivered; the one-time claim stays set.
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for HandshakeReportGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.context.reset_handshake_report();
+        }
+    }
 }
 
 impl FsClient {
@@ -538,19 +563,12 @@ impl FsClient {
         // later calls omit the payload; the response is still parsed and
         // cached on every call. Legacy masters skip the unknown field and
         // legacy clients omit it entirely.
-        let (header, report_component) = self.get_filesystem_info_request();
+        let (header, mut guard) = self.get_filesystem_info_request();
         let rep: GetFilesystemInfoResponse =
-            match self.rpc(RpcCode::GetFilesystemInfo, header).await {
-                Ok(rep) => rep,
-                Err(e) => {
-                    // The reporting request never reached the master: allow a
-                    // later retry to report the handshake.
-                    if report_component {
-                        self.context.reset_handshake_report();
-                    }
-                    return Err(e);
-                }
-            };
+            self.raw_rpc(RpcCode::GetFilesystemInfo, header).await?;
+        // The report reached the master: keep the one-time claim. On error or
+        // cancellation the guard's drop resets it so a later call can report.
+        guard.commit();
         // Cache the master's advertised version / protocol / capabilities; a
         // master without a compatibility contract is recorded as legacy and
         // never rejected.
@@ -565,6 +583,9 @@ impl FsClient {
     /// contract is reported as a legacy peer and is never rejected.
     pub async fn handshake(&self) -> FsResult<MasterHandshake> {
         let _ = self.get_filesystem_info().await?;
+        // Mark the one-time lazy handshake as done so the first ordinary RPC
+        // does not re-run it (FUSE mount performs this eagerly at startup).
+        self.context.mark_handshake_started();
         Ok(self.master_handshake())
     }
 
@@ -584,10 +605,10 @@ impl FsClient {
     /// `component_info` only on the first call per session (the handshake).
     /// Both the typed and the raw-bytes RPC paths share this so every
     /// GetFilesystemInfo caller reports the client version exactly once;
-    /// frequent statfs queries stay lean. Returns the request plus whether
-    /// `component_info` was attached, so the caller can reset the flag when
-    /// the request fails before reaching the master.
-    fn get_filesystem_info_request(&self) -> (GetFilesystemInfoRequest, bool) {
+    /// frequent statfs queries stay lean. The returned guard holds the claim
+    /// and resets it on drop unless committed, so a cancelled or failed
+    /// in-flight request never permanently suppresses reporting.
+    fn get_filesystem_info_request(&self) -> (GetFilesystemInfoRequest, HandshakeReportGuard<'_>) {
         let report_component = self.context.claim_handshake_report();
         let header = if report_component {
             GetFilesystemInfoRequest {
@@ -596,20 +617,28 @@ impl FsClient {
         } else {
             GetFilesystemInfoRequest::default()
         };
-        (header, report_component)
+        let guard = HandshakeReportGuard {
+            context: &self.context,
+            committed: !report_component,
+        };
+        (header, guard)
     }
 
     pub async fn get_filesystem_info_bytes(&self) -> FsResult<BytesMut> {
-        let (header, report_component) = self.get_filesystem_info_request();
-        match self.rpc_bytes(RpcCode::GetFilesystemInfo, header).await {
-            Ok(bytes) => Ok(bytes),
-            Err(e) => {
-                if report_component {
-                    self.context.reset_handshake_report();
-                }
-                Err(e)
-            }
+        let (header, mut guard) = self.get_filesystem_info_request();
+        let bytes = self
+            .raw_rpc_bytes(RpcCode::GetFilesystemInfo, header)
+            .await?;
+        guard.commit();
+        // Decode the response so bytes-only callers (e.g. SDK paths) also
+        // cache the master's compatibility contract instead of staying at the
+        // default legacy handshake. Best-effort: the raw bytes are returned
+        // regardless.
+        if let Ok(rep) = GetFilesystemInfoResponse::decode(bytes.as_ref()) {
+            self.context
+                .set_master_handshake(MasterHandshake::from_response(&rep));
         }
+        Ok(bytes)
     }
 
     pub async fn mount(
@@ -794,18 +823,66 @@ impl FsClient {
         T: PMessage + Default,
         R: PMessage + Default,
     {
+        // Best-effort one-time handshake before the first ordinary master RPC
+        // so every client path (CLI, SDK, data-transfer, direct
+        // CurvineFileSystem/UnifiedFileSystem users) reports component_info
+        // and caches the master's compatibility contract, not only FUSE
+        // mount. GetFilesystemInfo is the handshake itself and must not
+        // recurse.
+        if code != RpcCode::GetFilesystemInfo {
+            self.ensure_handshake().await;
+        }
+        self.raw_rpc(code, header).await
+    }
+
+    pub async fn rpc_bytes(&self, code: RpcCode, header: impl PMessage) -> FsResult<BytesMut> {
+        if code != RpcCode::GetFilesystemInfo {
+            self.ensure_handshake().await;
+        }
+        self.raw_rpc_bytes(code, header).await
+    }
+
+    /// Raw typed master RPC without the lazy handshake guard; the handshake
+    /// itself (GetFilesystemInfo) uses this to avoid recursing into
+    /// [`Self::ensure_handshake`].
+    async fn raw_rpc<T, R>(&self, code: RpcCode, header: T) -> FsResult<R>
+    where
+        T: PMessage + Default,
+        R: PMessage + Default,
+    {
         self.connector
             .proto_rpc::<T, R, FsError>(code, header)
             .await
     }
 
-    pub async fn rpc_bytes(&self, code: RpcCode, header: impl PMessage) -> FsResult<BytesMut> {
+    /// Raw bytes master RPC without the lazy handshake guard; see
+    /// [`Self::raw_rpc`].
+    async fn raw_rpc_bytes(&self, code: RpcCode, header: impl PMessage) -> FsResult<BytesMut> {
         let msg = MessageBuilder::new_rpc(code).proto_header(header).build();
 
         let msg = self.connector.rpc::<FsError>(msg).await?;
         match msg.header {
             None => Ok(BytesMut::new()),
             Some(v) => Ok(v),
+        }
+    }
+
+    /// Run the client-master handshake once per session before the first
+    /// ordinary master RPC, best-effort: a failure only logs a warning and
+    /// the caller's RPC proceeds with legacy assumptions (nothing is ever
+    /// rejected by default). Skipped when a GetFilesystemInfo request already
+    /// went out (the typed/bytes paths populate the same cache).
+    async fn ensure_handshake(&self) {
+        if self.context.handshake_started() || self.context.handshake_reported() {
+            return;
+        }
+        let _guard = self.context.handshake_lock().lock().await;
+        if self.context.handshake_started() || self.context.handshake_reported() {
+            return;
+        }
+        self.context.mark_handshake_started();
+        if let Err(e) = self.handshake().await {
+            warn!("client-master handshake failed: {e}; continuing with legacy assumptions");
         }
     }
 

@@ -168,3 +168,61 @@ fn test_client_handshake_accepts_legacy_master_response() -> CommonResult<()> {
     );
     Ok(())
 }
+
+#[test]
+fn test_bytes_first_get_filesystem_info_caches_handshake() -> CommonResult<()> {
+    // Bytes-first regression: the raw-bytes GetFilesystemInfo path is the
+    // very first master RPC of the session and must still cache the master's
+    // compatibility contract (not stay at the default legacy handshake).
+    let testing = Testing::builder().default().build()?;
+    testing.start_cluster()?;
+    let conf = testing.get_active_cluster_conf()?;
+
+    let rt = Arc::new(AsyncRuntime::single());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+
+    rt.block_on(async move {
+        let bytes = fs.fs_client().get_filesystem_info_bytes().await?;
+        assert!(!bytes.is_empty());
+
+        let hs = fs.master_handshake();
+        assert!(
+            !hs.is_legacy(),
+            "bytes-first GetFilesystemInfo must cache the handshake"
+        );
+        assert!(hs.compatibility().is_some());
+        assert_eq!(hs.protocol_version(), Some(1));
+        Ok::<(), CommonError>(())
+    })?;
+
+    Ok(())
+}
+
+#[test]
+fn test_lazy_handshake_before_first_ordinary_rpc() -> CommonResult<()> {
+    // A session that goes straight to an ordinary master RPC (no explicit
+    // GetFilesystemInfo) must still run the handshake once before the first
+    // RPC and cache the master's compatibility contract.
+    let testing = Testing::builder().default().build()?;
+    testing.start_cluster()?;
+    let conf = testing.get_active_cluster_conf()?;
+
+    let rt = Arc::new(AsyncRuntime::single());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+
+    rt.block_on(async move {
+        let path = Path::from_str("/lazy_handshake_test")?;
+        fs.mkdir(&path, true).await.map_err(CommonError::from)?;
+
+        let hs = fs.master_handshake();
+        assert!(
+            !hs.is_legacy(),
+            "first ordinary master RPC must run the handshake"
+        );
+        assert!(hs.compatibility().is_some());
+        assert_eq!(hs.protocol_version(), Some(1));
+        Ok::<(), CommonError>(())
+    })?;
+
+    Ok(())
+}
