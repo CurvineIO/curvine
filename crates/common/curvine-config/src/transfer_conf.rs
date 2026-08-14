@@ -55,6 +55,8 @@ pub struct TransferConf {
     pub max_running_transfers: usize,
     /// Maximum number of distinct auto-cache requests waiting for client-side submission.
     pub client_pending_queue_size: usize,
+    /// Maximum number of client-side auto-cache submissions running concurrently.
+    pub client_submit_concurrency: usize,
     #[serde(skip, default = "TransferConf::default_max_tasks_per_transfer")]
     pub max_tasks_per_transfer: usize,
     #[serde(
@@ -106,6 +108,7 @@ impl TransferConf {
     pub const DEFAULT_TASK_REPORT_QUEUE_SIZE: usize = 10_000;
     pub const DEFAULT_TASK_PROBE_CONCURRENCY: usize = 64;
     pub const DEFAULT_CLIENT_PENDING_QUEUE_SIZE: usize = 1024;
+    pub const DEFAULT_CLIENT_SUBMIT_CONCURRENCY: usize = 64;
     pub const DEFAULT_CLEANUP_BATCH_SIZE: usize = 1000;
     pub const DEFAULT_RPC_PORT: u16 = 9010;
     pub const DEFAULT_WEB_PORT: u16 = 9011;
@@ -157,6 +160,11 @@ impl TransferConf {
         if self.client_pending_queue_size == 0 {
             return Err(FsError::common(
                 "transfer.client_pending_queue_size must be greater than 0",
+            ));
+        }
+        if self.client_submit_concurrency == 0 {
+            return Err(FsError::common(
+                "transfer.client_submit_concurrency must be greater than 0",
             ));
         }
         if self.ufs_max_concurrency_per_endpoint == 0 {
@@ -299,6 +307,10 @@ impl TransferConf {
         self.client_pending_queue_size
     }
 
+    pub fn client_submit_concurrency(&self) -> usize {
+        self.client_submit_concurrency
+    }
+
     pub fn cleanup_batch_size(&self) -> usize {
         Self::DEFAULT_CLEANUP_BATCH_SIZE
     }
@@ -346,6 +358,7 @@ impl Default for TransferConf {
             allow_submit_with_stale_snapshot: false,
             max_running_transfers: 64,
             client_pending_queue_size: Self::DEFAULT_CLIENT_PENDING_QUEUE_SIZE,
+            client_submit_concurrency: Self::DEFAULT_CLIENT_SUBMIT_CONCURRENCY,
             max_tasks_per_transfer: Self::DEFAULT_MAX_TASKS_PER_TRANSFER,
             ufs_max_concurrency_per_endpoint: Self::DEFAULT_UFS_MAX_CONCURRENCY_PER_ENDPOINT,
             task_max_retries: Self::DEFAULT_TASK_MAX_RETRIES,
@@ -399,10 +412,17 @@ mod tests {
 
     #[test]
     fn parses_client_pending_queue_size() {
-        let mut conf: TransferConf = toml::from_str("client_pending_queue_size = 2048").unwrap();
+        let mut conf: TransferConf = toml::from_str(
+            r#"
+                client_pending_queue_size = 2048
+                client_submit_concurrency = 128
+            "#,
+        )
+        .unwrap();
         conf.init().unwrap();
 
         assert_eq!(conf.client_pending_queue_size(), 2048);
+        assert_eq!(conf.client_submit_concurrency(), 128);
     }
 
     #[test]
@@ -414,6 +434,17 @@ mod tests {
 
         let err = conf.init().unwrap_err().to_string();
         assert!(err.contains("transfer.client_pending_queue_size must be greater than 0"));
+    }
+
+    #[test]
+    fn rejects_zero_client_submit_concurrency() {
+        let mut conf = TransferConf {
+            client_submit_concurrency: 0,
+            ..Default::default()
+        };
+
+        let err = conf.init().unwrap_err().to_string();
+        assert!(err.contains("transfer.client_submit_concurrency must be greater than 0"));
     }
 
     #[test]

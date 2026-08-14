@@ -39,6 +39,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tokio::time;
 
 const TRANSFER_SUBMIT_MAX_ATTEMPTS: usize = 3;
@@ -54,6 +55,7 @@ enum CacheValidity {
 struct AsyncCachePending {
     paths: Arc<FastMutex<HashSet<String>>>,
     capacity: usize,
+    submit_slots: Arc<Semaphore>,
 }
 
 enum AsyncCacheAdmission {
@@ -68,10 +70,11 @@ struct AsyncCachePermit {
 }
 
 impl AsyncCachePending {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, submit_concurrency: usize) -> Self {
         Self {
             paths: Arc::new(FastMutex::new(HashSet::new())),
             capacity,
+            submit_slots: Arc::new(Semaphore::new(submit_concurrency)),
         }
     }
 
@@ -117,6 +120,7 @@ impl UnifiedFileSystem {
         let enable_read_ufs = conf.client.enable_rust_read_ufs;
         let audit_logging_enabled = conf.client.audit_logging_enabled;
         let async_cache_pending_capacity = conf.transfer.client_pending_queue_size();
+        let async_cache_submit_concurrency = conf.transfer.client_submit_concurrency();
 
         let cv = CurvineFileSystem::with_rt(conf, rt.clone())?;
         let fs = UnifiedFileSystem {
@@ -125,7 +129,10 @@ impl UnifiedFileSystem {
             enable_unified,
             enable_read_ufs,
             audit_logging_enabled,
-            async_cache_pending: AsyncCachePending::new(async_cache_pending_capacity),
+            async_cache_pending: AsyncCachePending::new(
+                async_cache_pending_capacity,
+                async_cache_submit_concurrency,
+            ),
             metrics: FsContext::get_metrics(),
         };
 
@@ -545,6 +552,19 @@ impl UnifiedFileSystem {
 
         self.fs_context().rt().spawn(async move {
             let _pending_permit = pending_permit;
+            let _submit_permit = match fs
+                .async_cache_pending
+                .submit_slots
+                .clone()
+                .acquire_owned()
+                .await
+            {
+                Ok(permit) => permit,
+                Err(err) => {
+                    warn!("async cache submit limiter closed unexpectedly: {}", err);
+                    return;
+                }
+            };
             let time = TimeSpent::new();
             let res = fs.submit_async_cache(&source_path).await;
 
@@ -1268,7 +1288,7 @@ mod tests {
 
     #[test]
     fn async_cache_pending_enforces_capacity_and_releases_slots() {
-        let pending = AsyncCachePending::new(1);
+        let pending = AsyncCachePending::new(1, 1);
         let first = match pending.try_admit("ufs://bucket/a".to_string()) {
             AsyncCacheAdmission::Accepted(permit) => permit,
             _ => panic!("first request should be accepted"),
@@ -1292,7 +1312,7 @@ mod tests {
 
     #[test]
     fn async_cache_pending_deduplicates_concurrent_requests() {
-        let pending = Arc::new(AsyncCachePending::new(32));
+        let pending = Arc::new(AsyncCachePending::new(32, 4));
         let accepted = Arc::new(Mutex::new(Vec::new()));
         let already_pending = Arc::new(AtomicUsize::new(0));
         let overloaded = Arc::new(AtomicUsize::new(0));
@@ -1324,5 +1344,17 @@ mod tests {
         assert_eq!(accepted.lock().unwrap().len(), 1);
         assert_eq!(already_pending.load(Ordering::Relaxed), 31);
         assert_eq!(overloaded.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn async_cache_submit_slots_enforce_concurrency() {
+        let pending = AsyncCachePending::new(16, 2);
+        let first = pending.submit_slots.clone().try_acquire_owned().unwrap();
+        let second = pending.submit_slots.clone().try_acquire_owned().unwrap();
+
+        assert!(pending.submit_slots.clone().try_acquire_owned().is_err());
+        drop(first);
+        assert!(pending.submit_slots.clone().try_acquire_owned().is_ok());
+        drop(second);
     }
 }

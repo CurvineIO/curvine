@@ -95,6 +95,7 @@ public class FilesystemConf {
     public boolean transfer_enabled = false;
     public String transfer_endpoints = "";
     public int transfer_client_pending_queue_size = 1024;
+    public int transfer_client_submit_concurrency = 64;
 
     public boolean enable_block_conn_pool = true;
     public int block_conn_idle_size = 128;
@@ -178,6 +179,11 @@ public class FilesystemConf {
         if (transferClientPendingQueueSize != null) {
             transfer_client_pending_queue_size = Integer.parseInt(transferClientPendingQueueSize);
         }
+        String transferClientSubmitConcurrency =
+                conf.get(PREFIX + ".transfer.client_submit_concurrency");
+        if (transferClientSubmitConcurrency != null) {
+            transfer_client_submit_concurrency = Integer.parseInt(transferClientSubmitConcurrency);
+        }
     }
 
     public String toToml() throws IllegalAccessException {
@@ -226,6 +232,9 @@ public class FilesystemConf {
         builder.append("client_pending_queue_size = ")
                 .append(transfer_client_pending_queue_size)
                 .append("\n");
+        builder.append("client_submit_concurrency = ")
+                .append(transfer_client_submit_concurrency)
+                .append("\n");
 
         return builder.toString();
     }
@@ -233,7 +242,8 @@ public class FilesystemConf {
     private static boolean isTransferField(Field field) {
         return "transfer_enabled".equals(field.getName())
                 || "transfer_endpoints".equals(field.getName())
-                || "transfer_client_pending_queue_size".equals(field.getName());
+                || "transfer_client_pending_queue_size".equals(field.getName())
+                || "transfer_client_submit_concurrency".equals(field.getName());
     }
 
     private static String escapeTomlString(String value) {

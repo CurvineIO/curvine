@@ -128,6 +128,7 @@ pub struct TransferClientConf {
     pub enabled: bool,
     pub endpoints: Vec<String>,
     pub client_pending_queue_size: usize,
+    pub client_submit_concurrency: usize,
 }
 
 impl Default for TransferClientConf {
@@ -136,6 +137,7 @@ impl Default for TransferClientConf {
             enabled: false,
             endpoints: vec![],
             client_pending_queue_size: TransferConf::DEFAULT_CLIENT_PENDING_QUEUE_SIZE,
+            client_submit_concurrency: TransferConf::DEFAULT_CLIENT_SUBMIT_CONCURRENCY,
         }
     }
 }
@@ -298,6 +300,7 @@ impl FilesystemConf {
                 enabled: self.transfer.enabled,
                 endpoints: self.transfer.endpoints,
                 client_pending_queue_size: self.transfer.client_pending_queue_size,
+                client_submit_concurrency: self.transfer.client_submit_concurrency,
                 ..Default::default()
             },
             ..Default::default()
@@ -319,6 +322,7 @@ mod tests {
             enabled: true,
             endpoints: vec!["transfer-0:9010".to_string(), "transfer-1:9010".to_string()],
             client_pending_queue_size: 2048,
+            client_submit_concurrency: 128,
         };
 
         let cluster = conf.into_cluster_conf().unwrap();
@@ -329,6 +333,7 @@ mod tests {
             vec!["transfer-0:9010", "transfer-1:9010"]
         );
         assert_eq!(cluster.transfer.client_pending_queue_size(), 2048);
+        assert_eq!(cluster.transfer.client_submit_concurrency(), 128);
     }
 
     #[test]
@@ -359,6 +364,7 @@ mod tests {
                 enabled = true
                 endpoints = ["transfer-0:9010", "transfer-1:9010"]
                 client_pending_queue_size = 4096
+                client_submit_concurrency = 256
             "#,
         )
         .unwrap();
@@ -371,5 +377,6 @@ mod tests {
             vec!["transfer-0:9010", "transfer-1:9010"]
         );
         assert_eq!(cluster.transfer.client_pending_queue_size(), 4096);
+        assert_eq!(cluster.transfer.client_submit_concurrency(), 256);
     }
 }

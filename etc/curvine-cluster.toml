@@ -94,6 +94,7 @@ web_port = 9011
 # Maximum distinct auto-cache requests waiting for client-side submission.
 # When full, new cache requests are skipped and foreground reads continue from UFS.
 client_pending_queue_size = 1024
+client_submit_concurrency = 64
 log = { level = "info", log_dir = "stdout", file_name = "transfer.log" }
 
 # fuse configuration
