@@ -41,6 +41,12 @@ log = { level = "info", log_dir = "stdout", file_name = "master.log" }
 # mode: "diagnose" (default, allow with warnings) or "enforce" (reject
 # incompatible workers/clients). Bounds below are empty by default, meaning
 # old components are never rejected without explicit configuration.
+#
+# NOTE: enforce mode requires workers that report component_info on their
+# heartbeat (available since #1584). Workers built before #1584 do not send
+# component_info, so every heartbeat resolves to MissingInfo and enforce mode
+# rejects them - the cluster cannot form. Keep diagnose until the whole
+# worker fleet is upgraded.
 # [master.compatibility]
 # mode = "diagnose"
 # min_worker_version = "0.1.0"
@@ -67,11 +73,6 @@ data_dir = [
     "[DISK]testing/data",
 ]
 log = { level = "info", log_dir = "stdout", file_name = "worker.log" }
-
-# Version compatibility policy (used for client-worker data plane checks).
-# [worker.compatibility]
-# mode = "diagnose"
-# min_client_version = "0.1.0"
 
 # SPDK over NVMe-oF/RDMA configuration  
 [worker.spdk_disk]  

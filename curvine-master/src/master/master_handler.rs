@@ -35,6 +35,7 @@ use curvine_proto::*;
 use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::Message;
 use curvine_runtime::runtime::{GroupExecutor, Runtime};
+use dashmap::DashMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -58,6 +59,11 @@ pub struct MasterHandler {
     // evaluate worker heartbeats and client handshakes with diagnose/enforce
     // semantics (lenient diagnose by default).
     compatibility_policy: CompatibilityPolicy,
+    // Last compatibility verdict warned about per peer (worker id / client
+    // address). Diagnose-mode warnings are deduped so a persistently
+    // incompatible or legacy peer does not spam identical warnings on every
+    // heartbeat or statfs call.
+    compat_warned: DashMap<String, CompatibilityVerdict>,
 }
 
 impl MasterHandler {
@@ -97,6 +103,7 @@ impl MasterHandler {
             actor_rt,
             master_compatibility,
             compatibility_policy,
+            compat_warned: DashMap::new(),
         }
     }
 
@@ -493,6 +500,8 @@ impl MasterHandler {
         {
             Self::check_peer_compatibility(
                 "client",
+                &format!("client:{}", self.client_ip()),
+                &self.compat_warned,
                 self.compatibility_policy.mode,
                 self.compatibility_policy
                     .check_client(req.component_info.as_ref()),
@@ -602,6 +611,8 @@ impl MasterHandler {
         {
             Self::check_peer_compatibility(
                 "worker",
+                &format!("worker:{}", header.worker_id),
+                &self.compat_warned,
                 self.compatibility_policy.mode,
                 self.compatibility_policy
                     .check_worker(header.component_info.as_ref()),
@@ -621,14 +632,35 @@ impl MasterHandler {
     ///   explicit configuration.
     /// - `enforce`: reject with an explicit error describing the actual peer
     ///   version, the expected bound and the upgrade suggestion.
+    ///
+    /// Diagnose-mode warnings are deduped per peer: a persistently
+    /// incompatible or legacy peer (heartbeats run every few seconds, statfs
+    /// every call) warns on the first occurrence and again only when its
+    /// verdict changes, so repeated identical warnings do not flood
+    /// operational logs.
     fn check_peer_compatibility(
         peer: &str,
+        dedup_key: &str,
+        warned: &DashMap<String, CompatibilityVerdict>,
         mode: CompatibilityMode,
         verdict: CompatibilityVerdict,
     ) -> FsResult<()> {
         if !verdict.rejects(mode) {
             if !verdict.is_compatible() {
-                log::warn!("{} compatibility: {}", peer, verdict.describe());
+                // Warn on the first occurrence and whenever the verdict
+                // changes for this peer; suppress identical repeats.
+                let changed = warned
+                    .get(dedup_key)
+                    .map(|last| *last != verdict)
+                    .unwrap_or(true);
+                if changed {
+                    warned.insert(dedup_key.to_string(), verdict.clone());
+                    log::warn!("{} compatibility: {}", peer, verdict.describe());
+                }
+            } else {
+                // The peer is compatible again; forget the previous warning so
+                // a future incompatibility is surfaced.
+                warned.remove(dedup_key);
             }
             return Ok(());
         }
@@ -1193,6 +1225,64 @@ mod tests {
     }
 
     #[test]
+    fn diagnose_warnings_are_deduped_per_peer() {
+        // A persistently incompatible worker must not re-log the same warning
+        // on every heartbeat: only a verdict change emits a new warning.
+        let policy = CompatibilityPolicy {
+            mode: CompatibilityMode::Diagnose,
+            min_worker_version: Some("0.2.0".parse().unwrap()),
+            ..Default::default()
+        };
+        let warned = DashMap::new();
+        let verdict = policy.check_worker(Some(&ComponentInfoProto {
+            release_version: Some("0.1.0".to_string()),
+            protocol_version: Some(1),
+            ..sample_component_info()
+        }));
+
+        // First occurrence warns and records the verdict.
+        assert!(MasterHandler::check_peer_compatibility(
+            "worker",
+            "worker:7",
+            &warned,
+            policy.mode,
+            verdict.clone()
+        )
+        .is_ok());
+        assert!(warned.contains_key("worker:7"));
+
+        // Identical verdict on a later heartbeat does not warn again but is
+        // still allowed.
+        assert!(MasterHandler::check_peer_compatibility(
+            "worker",
+            "worker:7",
+            &warned,
+            policy.mode,
+            verdict.clone()
+        )
+        .is_ok());
+
+        // A different incompatible verdict for the same peer warns again.
+        let different = CompatibilityVerdict::ProtocolMismatch {
+            peer: 2,
+            min: 1,
+            max: 1,
+        };
+        assert!(MasterHandler::check_peer_compatibility(
+            "worker",
+            "worker:7",
+            &warned,
+            policy.mode,
+            different.clone()
+        )
+        .is_ok());
+        assert_eq!(warned.get("worker:7").as_deref(), Some(&different));
+
+        // A separate peer is tracked independently.
+        assert!(!warned.contains_key("worker:8"));
+    }
+
+    #[test]
     fn diagnose_mode_allows_incompatible_worker_heartbeat() {
         // Configure a minimum worker version so the peer is genuinely
         // incompatible (below the bound): diagnose mode must still allow the
@@ -1216,11 +1306,26 @@ mod tests {
                 min: "0.2.0".to_string()
             }
         );
-        assert!(MasterHandler::check_peer_compatibility("worker", policy.mode, verdict).is_ok());
+        let warned = DashMap::new();
+        assert!(MasterHandler::check_peer_compatibility(
+            "worker",
+            "worker:7",
+            &warned,
+            policy.mode,
+            verdict
+        )
+        .is_ok());
 
         // Legacy worker (no component_info): MissingInfo, allowed in diagnose.
         let verdict = policy.check_worker(None);
-        assert!(MasterHandler::check_peer_compatibility("worker", policy.mode, verdict).is_ok());
+        assert!(MasterHandler::check_peer_compatibility(
+            "worker",
+            "worker:7",
+            &warned,
+            policy.mode,
+            verdict
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1236,8 +1341,15 @@ mod tests {
             ..sample_component_info()
         };
         let verdict = policy.check_worker(Some(&incompatible));
-        let err =
-            MasterHandler::check_peer_compatibility("worker", policy.mode, verdict).unwrap_err();
+        let warned = DashMap::new();
+        let err = MasterHandler::check_peer_compatibility(
+            "worker",
+            "worker:7",
+            &warned,
+            policy.mode,
+            verdict,
+        )
+        .unwrap_err();
         let msg = format!("{}", err);
         assert!(msg.contains("rejected by compatibility policy"), "{msg}");
         assert!(msg.contains("0.1.0"), "{msg}");
@@ -1250,8 +1362,15 @@ mod tests {
             ..Default::default()
         };
         let verdict = policy.check_client(None);
-        let err =
-            MasterHandler::check_peer_compatibility("client", policy.mode, verdict).unwrap_err();
+        let warned = DashMap::new();
+        let err = MasterHandler::check_peer_compatibility(
+            "client",
+            "client:127.0.0.1",
+            &warned,
+            policy.mode,
+            verdict,
+        )
+        .unwrap_err();
         assert!(format!("{}", err).contains("client rejected"));
     }
 
