@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::worker::block::{BlockActor, BlockStore};
-use crate::worker::handler::{WorkerHandler, WorkerRouterHandler};
+use crate::worker::handler::{ConnectionPeer, WorkerHandler, WorkerRouterHandler};
 use crate::worker::replication::worker_replication_handler::WorkerReplicationHandler;
 use crate::worker::replication::worker_replication_manager::WorkerReplicationManager;
 use crate::worker::task::TaskManager;
@@ -94,7 +94,7 @@ impl HandlerService for WorkerService {
         WorkerHandler {
             store: self.store.clone(),
             handler: FastMutex::new(None),
-            peer_component_info: FastMutex::new(None),
+            connection_peer: FastMutex::new(ConnectionPeer::Unknown),
             task_manager: self.task_manager.clone(),
             rt: self.rt.clone(),
             replication_handler: WorkerReplicationHandler::new(&self.replication_manager),

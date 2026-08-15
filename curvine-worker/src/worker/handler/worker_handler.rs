@@ -27,8 +27,21 @@ use curvine_rpc::message::{Builder, Message, RequestStatus, ResponseStatus};
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::runtime::Runtime;
 use curvine_runtime::sync::FastMutex;
-use log::{info, warn};
+use log::info;
 use std::sync::Arc;
+
+/// Connection-level peer metadata for a data connection, resolved exactly once
+/// from the first data-plane open frame.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConnectionPeer {
+    /// No data-plane open frame inspected yet.
+    Unknown,
+    /// The client never reported component info (legacy/unknown peer).
+    Legacy,
+    /// The client's structured component info, recorded from the first
+    /// data-plane open frame that carried it.
+    Known(ComponentInfoProto),
+}
 
 pub struct WorkerHandler {
     pub store: BlockStore,
@@ -36,13 +49,14 @@ pub struct WorkerHandler {
     pub task_manager: Arc<TaskManager>,
     pub rt: Arc<Runtime>,
     pub replication_handler: WorkerReplicationHandler,
-    /// Connection-level peer metadata: the `component_info` the client on this
-    /// connection reported on the reserved 1000+ range of the first data-plane
-    /// request that carried it. `None` means a legacy client that never
-    /// reported component info. The worker only records the version here (T9);
+    /// Connection-level peer metadata, resolved once from the first data-plane
+    /// open frame on this connection. After resolution (Known or Legacy) the
+    /// worker stops parsing headers for peer metadata, so at most one frame
+    /// per connection pays the decode cost — the business handlers decode the
+    /// same headers anyway. The worker only records the version here (T9);
     /// protocol negotiation on top of it happens in the client-worker
     /// compatibility layer (T10).
-    pub peer_component_info: FastMutex<Option<ComponentInfoProto>>,
+    pub connection_peer: FastMutex<ConnectionPeer>,
 }
 
 impl MessageHandler for WorkerHandler {
@@ -98,37 +112,36 @@ impl MessageHandler for WorkerHandler {
     }
 }
 
-/// Outcome of feeding a peer's `component_info` into the connection cache.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PeerRecordEvent {
-    /// The first component info seen on this connection.
-    First,
-    /// A different component info than the cached one (mid-connection
-    /// peer change, unexpected with connection reuse).
-    Changed,
-    /// The cached info already matches; nothing to do.
-    Unchanged,
-}
-
 impl WorkerHandler {
-    /// Pure connection-cache update: store `info` into `peer` and report
-    /// whether a log-worthy event occurred. Kept separate from the logging so
-    /// the connection-level peer cache behavior can be unit-tested without a
-    /// full `WorkerHandler`.
-    fn record_peer_component_info_state(
-        peer: &mut Option<ComponentInfoProto>,
-        info: ComponentInfoProto,
-    ) -> PeerRecordEvent {
-        match peer.as_ref() {
-            None => {
-                *peer = Some(info);
-                PeerRecordEvent::First
-            }
-            Some(existing) if existing != &info => {
-                *peer = Some(info);
-                PeerRecordEvent::Changed
-            }
-            _ => PeerRecordEvent::Unchanged,
+    /// Whether the RPC code belongs to the block data plane (the only codes
+    /// whose open frames carry peer metadata). Transfer/task control RPCs are
+    /// excluded so they never resolve the connection peer.
+    fn is_data_plane_code(code: RpcCode) -> bool {
+        matches!(
+            code,
+            RpcCode::WriteBlock | RpcCode::ReadBlock | RpcCode::WriteBlocksBatch
+        )
+    }
+
+    /// Decide the connection peer state for a frame, without mutating
+    /// anything. Returns `None` when the frame does not participate in peer
+    /// resolution (running/commit frames, non-data-plane RPCs); otherwise the
+    /// resolved state — `Known` when the open frame carried `component_info`,
+    /// `Legacy` when it did not. Pure, so the one-time resolution behavior is
+    /// unit-testable without a full `WorkerHandler`.
+    fn resolve_connection_peer(msg: &Message) -> Option<ConnectionPeer> {
+        // Resolution happens on the data-plane open frame only: it is the
+        // first frame a data connection carries and the only one guaranteed to
+        // report peer metadata. Running frames carry payload data and commit
+        // frames repeat metadata already seen on open, so they never resolve.
+        if msg.request_status() != RequestStatus::Open
+            || !Self::is_data_plane_code(RpcCode::from(msg.code()))
+        {
+            return None;
+        }
+        match Self::extract_component_info(msg) {
+            Some(info) => Some(ConnectionPeer::Known(info)),
+            None => Some(ConnectionPeer::Legacy),
         }
     }
 
@@ -164,43 +177,45 @@ impl WorkerHandler {
         }
     }
 
-    /// Record the client's `component_info` for this connection. The worker
-    /// only records the version (per the T9 contract): the first request that
-    /// carries it is logged and cached, a change mid-connection is warned and
-    /// re-recorded, and legacy clients that omit the field leave the cache
-    /// empty (treated as a legacy/unknown peer, never rejected).
+    /// Resolve and record the client's `component_info` for this connection.
+    /// Resolution happens exactly once, from the first data-plane open frame:
+    /// a new client carries `component_info` on it (`Known`), a legacy client
+    /// does not (`Legacy`). After resolution the worker never parses another
+    /// header for peer metadata, so at most one frame per connection pays the
+    /// decode cost (the business handlers decode the same headers anyway).
+    /// Legacy/unknown peers are never rejected.
     fn record_peer_component_info(&self, msg: &Message) {
-        let Some(info) = Self::extract_component_info(msg) else {
+        let mut peer = self.connection_peer.lock();
+        if !matches!(*peer, ConnectionPeer::Unknown) {
+            return;
+        }
+        let Some(resolved) = Self::resolve_connection_peer(msg) else {
             return;
         };
-        let mut peer = self.peer_component_info.lock();
-        match Self::record_peer_component_info_state(&mut peer, info) {
-            PeerRecordEvent::First => {
-                let cached = peer.as_ref().expect("peer cache just recorded");
+        match resolved {
+            ConnectionPeer::Known(info) => {
                 info!(
                     "peer component info on data connection: component={}, release_version={}, protocol_version={:?}, min_protocol_version={:?}",
-                    cached.component.as_deref().unwrap_or("unknown"),
-                    cached.release_version.as_deref().unwrap_or("unknown"),
-                    cached.protocol_version,
-                    cached.min_protocol_version,
+                    info.component.as_deref().unwrap_or("unknown"),
+                    info.release_version.as_deref().unwrap_or("unknown"),
+                    info.protocol_version,
+                    info.min_protocol_version,
                 );
+                *peer = ConnectionPeer::Known(info);
             }
-            PeerRecordEvent::Changed => {
-                let cached = peer.as_ref().expect("peer cache just re-recorded");
-                warn!(
-                    "peer component info changed on data connection: component={}, release_version={}",
-                    cached.component.as_deref().unwrap_or("unknown"),
-                    cached.release_version.as_deref().unwrap_or("unknown"),
-                );
-            }
-            PeerRecordEvent::Unchanged => {}
+            ConnectionPeer::Legacy => *peer = ConnectionPeer::Legacy,
+            ConnectionPeer::Unknown => unreachable!("resolution always yields Known or Legacy"),
         }
     }
 
     /// The component info recorded for the peer on this connection. `None`
-    /// means a legacy client that never reported component info on any request.
+    /// means the peer is unresolved or a legacy client that never reported
+    /// component info on any request.
     pub fn peer_component_info(&self) -> Option<ComponentInfoProto> {
-        self.peer_component_info.lock().clone()
+        match &*self.connection_peer.lock() {
+            ConnectionPeer::Known(info) => Some(info.clone()),
+            ConnectionPeer::Unknown | ConnectionPeer::Legacy => None,
+        }
     }
 
     fn get_handler<'a>(
@@ -314,7 +329,7 @@ fn transfer_task_state_code(state: curvine_model::JobTaskState) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlockWriteRequest, PeerRecordEvent, WorkerHandler};
+    use super::{BlockWriteRequest, ConnectionPeer, WorkerHandler};
     use curvine_fs_api::RpcCode;
     use curvine_proto::{
         BlockReadRequest, BlocksBatchCommitRequest, BlocksBatchWriteRequest, ComponentInfoProto,
@@ -513,33 +528,126 @@ mod tests {
     }
 
     #[test]
-    fn peer_cache_records_first_change_and_keeps_unchanged() {
-        let mut peer = None;
-        let v1 = sample_component_info();
-
-        // First request on the connection records the peer version.
-        assert_eq!(
-            WorkerHandler::record_peer_component_info_state(&mut peer, v1.clone()),
-            PeerRecordEvent::First
-        );
-        assert_eq!(peer, Some(v1.clone()));
-
-        // Repeated requests with the same info are a no-op.
-        assert_eq!(
-            WorkerHandler::record_peer_component_info_state(&mut peer, v1.clone()),
-            PeerRecordEvent::Unchanged
-        );
-        assert_eq!(peer, Some(v1));
-
-        // A different peer version mid-connection is re-recorded.
-        let v2 = ComponentInfoProto {
-            release_version: Some("0.5.0".to_string()),
-            ..sample_component_info()
+    fn resolves_peer_from_data_plane_open_frames() {
+        // New client: the first write-block open frame carries component_info
+        // and resolves the connection peer to Known.
+        let header = BlockWriteRequest {
+            block: sample_block(),
+            off: 0,
+            block_size: 4 * 1024 * 1024,
+            short_circuit: true,
+            client_name: "client-1".to_string(),
+            chunk_size: 1 << 20,
+            pipeline_stream: vec![],
+            component_info: Some(sample_component_info()),
         };
+        let open = build_msg(RpcCode::WriteBlock, RequestStatus::Open, header);
         assert_eq!(
-            WorkerHandler::record_peer_component_info_state(&mut peer, v2.clone()),
-            PeerRecordEvent::Changed
+            WorkerHandler::resolve_connection_peer(&open),
+            Some(ConnectionPeer::Known(sample_component_info()))
         );
-        assert_eq!(peer, Some(v2));
+
+        // Batch open carries component_info too.
+        let batch_open = BlocksBatchWriteRequest {
+            blocks: vec![sample_block()],
+            off: 0,
+            block_size: 4 * 1024 * 1024,
+            req_id: 7,
+            seq_id: 1,
+            chunk_size: 1 << 20,
+            short_circuit: true,
+            client_name: "client-1".to_string(),
+            component_info: Some(sample_component_info()),
+        };
+        let open = build_msg(RpcCode::WriteBlocksBatch, RequestStatus::Open, batch_open);
+        assert_eq!(
+            WorkerHandler::resolve_connection_peer(&open),
+            Some(ConnectionPeer::Known(sample_component_info()))
+        );
+    }
+
+    #[test]
+    fn resolves_legacy_peer_from_open_frame_without_component_info() {
+        // Legacy client: the first write-block open frame has no component_info
+        // and resolves the connection peer to Legacy exactly once.
+        let header = BlockWriteRequest {
+            block: sample_block(),
+            off: 0,
+            block_size: 4 * 1024 * 1024,
+            short_circuit: true,
+            client_name: "legacy-client".to_string(),
+            chunk_size: 1 << 20,
+            pipeline_stream: vec![],
+            component_info: None,
+        };
+        let open = build_msg(RpcCode::WriteBlock, RequestStatus::Open, header);
+        assert_eq!(
+            WorkerHandler::resolve_connection_peer(&open),
+            Some(ConnectionPeer::Legacy)
+        );
+    }
+
+    #[test]
+    fn running_and_commit_frames_never_resolve_peer() {
+        // Running frames (DataHeaderProto / FilesBatchWriteRequest) and commit
+        // frames carry no peer metadata and must not resolve the connection,
+        // so the worker never decodes payload-bearing headers for peer info.
+        let running = build_msg(
+            RpcCode::WriteBlock,
+            RequestStatus::Running,
+            DataHeaderProto {
+                offset: 0,
+                flush: false,
+                is_last: false,
+            },
+        );
+        assert_eq!(WorkerHandler::resolve_connection_peer(&running), None);
+
+        let files_batch = FilesBatchWriteRequest {
+            files: vec![FileWriteData {
+                path: "/dir/a".to_string(),
+                content: b"hello".to_vec(),
+            }],
+            req_id: 7,
+            seq_id: 2,
+            component_info: None,
+        };
+        let running = build_msg(
+            RpcCode::WriteBlocksBatch,
+            RequestStatus::Running,
+            files_batch,
+        );
+        assert_eq!(WorkerHandler::resolve_connection_peer(&running), None);
+
+        let commit = build_msg(
+            RpcCode::WriteBlock,
+            RequestStatus::Complete,
+            BlockWriteRequest {
+                block: sample_block(),
+                off: 0,
+                block_size: 4 * 1024 * 1024,
+                short_circuit: false,
+                client_name: "client-1".to_string(),
+                chunk_size: 1 << 20,
+                pipeline_stream: vec![],
+                component_info: None,
+            },
+        );
+        assert_eq!(WorkerHandler::resolve_connection_peer(&commit), None);
+    }
+
+    #[test]
+    fn non_data_plane_rpcs_never_resolve_peer() {
+        // Task / transfer control RPCs are outside the data plane and must not
+        // touch the connection peer resolution.
+        let header = QueryTransferTaskRequest {
+            job_id: "job-1".to_string(),
+            task_id: "task-1".to_string(),
+            run_id: 0,
+            attempt_id: 0,
+            worker_session_id: String::new(),
+        };
+        let msg = build_msg(RpcCode::QueryTransferTask, RequestStatus::Open, header);
+        assert_eq!(WorkerHandler::resolve_connection_peer(&msg), None);
     }
 }

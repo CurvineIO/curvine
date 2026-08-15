@@ -13,7 +13,7 @@
 // limitations under the License.
 
 mod worker_handler;
-pub use self::worker_handler::WorkerHandler;
+pub use self::worker_handler::{ConnectionPeer, WorkerHandler};
 
 mod write_handler;
 pub use self::write_handler::WriteHandler;
