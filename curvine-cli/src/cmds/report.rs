@@ -393,12 +393,15 @@ impl CurvineReport {
     fn worker_detail_suffix(worker: &WorkerInfo) -> String {
         let mut details = vec![];
         // Prefer the structured component info reported on the reserved 1000+
-        // range; fall back to the legacy display string for older workers.
+        // range; fall back to the legacy display string for older workers and
+        // for partially-populated component info that renders nothing.
         match &worker.component_info {
             Some(info) => {
                 let display = Self::component_info_display(info);
                 if !display.is_empty() {
                     details.push(display);
+                } else if !worker.software_version.is_empty() {
+                    details.push(format!("version={}", worker.software_version));
                 }
             }
             None => {
@@ -556,5 +559,35 @@ mod tests {
         assert!(output.contains("commit=24c8487"));
         assert!(output.contains("protocol=1"));
         assert!(!output.contains("version=0.1.0-test"));
+    }
+
+    #[test]
+    fn simple_report_falls_back_to_software_version_for_empty_component_info() {
+        // A partially-populated/new-but-empty component_info renders nothing,
+        // so the display must fall back to the legacy software_version string
+        // instead of hiding version details.
+        let worker = WorkerInfo {
+            address: WorkerAddress {
+                worker_id: 8,
+                hostname: "worker-host".to_string(),
+                ip_addr: "127.0.0.1".to_string(),
+                rpc_port: 1234,
+                web_port: 5678,
+            },
+            software_version: "0.2.0-test".to_string(),
+            component_info: Some(curvine_proto::ComponentInfoProto::default()),
+            ..Default::default()
+        };
+        let report = CurvineReport {
+            info: FilesystemInfo {
+                live_workers: vec![worker],
+                ..Default::default()
+            },
+        };
+
+        let output = report.simple(true);
+
+        assert!(output.contains("worker-host:1234"));
+        assert!(output.contains("version=0.2.0-test"));
     }
 }
