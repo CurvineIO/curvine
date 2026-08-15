@@ -52,8 +52,9 @@ pub struct WorkerService {
     fault_http: FaultHttpControl,
     /// Compatibility policy applied to client peers on data-plane connections.
     /// Built once from `worker.compatibility` config (diagnose by default) and
-    /// shared by every per-connection `WorkerHandler`.
-    compatibility_policy: CompatibilityPolicy,
+    /// shared by every per-connection `WorkerHandler` through an `Arc`, so
+    /// handlers share the policy without deep-copying it per connection.
+    compatibility_policy: Arc<CompatibilityPolicy>,
 }
 
 impl WorkerService {
@@ -78,7 +79,7 @@ impl WorkerService {
             rt,
             replication_manager,
             fault_http,
-            compatibility_policy: conf.worker.compatibility.to_policy(),
+            compatibility_policy: Arc::new(conf.worker.compatibility.to_policy()),
         };
         Ok(ws)
     }

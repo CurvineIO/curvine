@@ -43,6 +43,17 @@ pub enum ConnectionPeer {
     Known(ComponentInfoProto),
 }
 
+impl ConnectionPeer {
+    /// Whether the peer declared the given capability. Allocation-free, so it
+    /// is safe on a hot path; `Unknown`/`Legacy` peers declare nothing.
+    pub fn declares_capability(&self, feature: &str) -> bool {
+        match self {
+            ConnectionPeer::Known(info) => info.capabilities.iter().any(|c| c == feature),
+            ConnectionPeer::Unknown | ConnectionPeer::Legacy => false,
+        }
+    }
+}
+
 pub struct WorkerHandler {
     pub store: BlockStore,
     pub handler: FastMutex<Option<BlockHandler>>,
@@ -58,10 +69,11 @@ pub struct WorkerHandler {
     /// compatibility layer (T10).
     pub connection_peer: FastMutex<ConnectionPeer>,
     /// Compatibility policy applied to client peers on this data connection.
-    /// Built once per worker from `worker.compatibility` config; diagnose by
-    /// default so old clients are never rejected without explicit
-    /// configuration.
-    pub compatibility_policy: CompatibilityPolicy,
+    /// Built once per worker from `worker.compatibility` config and shared
+    /// with every per-connection handler through an `Arc` (no per-connection
+    /// deep copy); diagnose by default so old clients are never rejected
+    /// without explicit configuration.
+    pub compatibility_policy: Arc<CompatibilityPolicy>,
 }
 
 impl MessageHandler for WorkerHandler {
@@ -282,6 +294,8 @@ impl WorkerHandler {
     /// Capabilities declared by the peer on this connection, empty for
     /// unresolved or legacy clients. Feature-level negotiation token: a
     /// feature is enabled only when both the worker and the peer declare it.
+    /// Returns a snapshot for observability; hot-path capability checks should
+    /// use [`Self::peer_declares_capability`], which avoids this allocation.
     pub fn peer_capabilities(&self) -> Vec<String> {
         match &*self.connection_peer.lock() {
             ConnectionPeer::Known(info) => info.capabilities.clone(),
@@ -290,8 +304,10 @@ impl WorkerHandler {
     }
 
     /// Whether the peer on this connection declared the given capability.
+    /// Allocation-free: inspects the locked connection peer directly instead
+    /// of cloning the capabilities vector, so it is safe on a hot path.
     pub fn peer_declares_capability(&self, feature: &str) -> bool {
-        self.peer_capabilities().iter().any(|c| c == feature)
+        self.connection_peer.lock().declares_capability(feature)
     }
 
     fn get_handler<'a>(
@@ -850,5 +866,16 @@ mod tests {
     fn unknown_peer_never_evaluates() {
         let policy = default_policy();
         assert!(WorkerHandler::evaluate_peer(&policy, &ConnectionPeer::Unknown).is_ok());
+    }
+
+    #[test]
+    fn peer_capability_check_is_allocation_free_and_accurate() {
+        // Capability negotiation: a feature is declared only when the peer
+        // actually lists it; legacy/unknown peers declare nothing.
+        let peer = ConnectionPeer::Known(client_info("0.4.0", 1));
+        assert!(peer.declares_capability("batch-write"));
+        assert!(!peer.declares_capability("short-circuit"));
+        assert!(!ConnectionPeer::Legacy.declares_capability("batch-write"));
+        assert!(!ConnectionPeer::Unknown.declares_capability("batch-write"));
     }
 }

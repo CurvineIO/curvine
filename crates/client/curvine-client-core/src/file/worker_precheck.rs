@@ -82,8 +82,11 @@ impl WorkerPrecheck {
     }
 
     /// Refresh the pre-check bounds from the latest client-master handshake.
-    /// A legacy master (no compatibility contract) resets the bounds to
-    /// none/empty so nothing is flagged without an explicit contract.
+    /// A legacy master (no compatibility contract) resets the version bounds
+    /// and blocklist to none/empty, so no worker is flagged on version grounds
+    /// without an explicit contract. The client's own protocol-range check
+    /// still runs for every worker that reports `component_info`, regardless
+    /// of the handshake.
     pub fn refresh(&mut self, handshake: &MasterHandshake) {
         let compat = handshake.compatibility();
         let min_worker_version = compat
