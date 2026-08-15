@@ -40,42 +40,7 @@ For more detailed information, please refer to:
 - [Best Practices](https://curvineio.github.io/docs/User-Manuals/best-practices)
 - [Curvine passes LTP Test 1129 cases](https://curvineio.github.io/blog/2026/08/11/curvine-ltp-compatibility)
 - [Tiered KV cache for large LLMs on Amazon SageMaker HyperPod with Curvine](https://aws.amazon.com/cn/blogs/machine-learning/tiered-kv-cache-for-large-llms-on-amazon-sagemaker-hyperpod-with-curvine/)
-
-
-
-## 🎯 Why Curvine
-
-The AI infrastructure landscape is undergoing a fundamental architectural shift: from a centralized model where a single large model instance serves all requests, to a distributed model where **tens of thousands of Agent instances run independently**. Each Agent is not a stateless HTTP handler — it is a stateful process with its own working directory, persistent context files, `node_modules`, `.git` history, and a need for an isolated POSIX workspace.
-
-This "massive small stateful instances" workload pattern is fundamentally different from traditional stateful applications, and it exposes the hard limits of existing storage options:
-
-| Storage Option | Limitation for Agent-at-Scale |
-|----------------|-------------------------------|
-| Block storage (e.g. EBS) | Per-node volume attach limit (e.g. 28 on most Nitro instances), single-AZ binding, slow cross-AZ failover |
-| Managed NFS (e.g. EFS) | Access Point creation is throttled by cloud API rate limits; large-scale parallel provisioning becomes a bottleneck |
-| Object storage (e.g. S3) | No POSIX semantics — no in-place mutation, no atomic rename, no consistent directory listing |
-
-**Curvine closes this gap.** It layers a distributed POSIX file system over cloud object storage, so that:
-
-- Provisioning a PVC is just `mkdir` on a distributed file system — **millisecond-level, no cloud control-plane API calls, no rate limits**.
-- Each Agent Pod gets an isolated file system view via the native CSI driver, with the same logical isolation as block storage but **without the per-node attach-count ceiling**.
-- Pods can be scheduled across nodes and AZs freely; data stays reachable because it lives in the shared Curvine namespace, not a node-bound volume.
-
-## 🤖 AI Agent Use Case
-
-Curvine is purpose-built to back large-scale AI Agent platforms on Kubernetes. In a production validation on **Amazon EKS**, Curvine sustained **10,000 independent stateful Pods** with reliable persistent storage:
-
-| Metric | Result |
-|--------|--------|
-| Provisioned PVCs | 10,000 — all `Bound`, zero `Pending`, zero `Failed` |
-| Running Pods | 10,000 — all `Running`, zero `CrashLoopBackOff` |
-| Storage cluster footprint | **1 Master + 3 Workers = 4 core Pods** serving 10,000 PVCs |
-| Pod density per node | ~100 Agent Pods per `r6g.4xlarge` node (vs. ~28 with EBS) |
-| Node resource utilization | CPU 88% / Memory 98% (compute, not storage, is the bound) |
-| Provisioning latency | Milliseconds (local `mkdir`, no cloud API) |
-| Durability | Data survives Pod restart and cross-node rescheduling |
-
-> Read the full story: **[AI Agent 存储选型：Curvine 如何在 EKS 上支撑万级 Agent 运行](https://aws.amazon.com/cn/blogs/china/ai-agent-storage-curvine-how-to-eks-agent/)**
+- [AI Agent Storage Selection: How Curvine Supports 10,000-Scale Agent Workloads on EKS](https://curvineio.github.io/blog/2026/07/07/ai-agent-storage-curvine-eks)
 
 
 ## 🚀 Core Features
