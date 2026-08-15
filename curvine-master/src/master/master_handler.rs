@@ -26,8 +26,9 @@ use curvine_fs_api::Path;
 use curvine_fs_api::RpcCode;
 use curvine_model::ProtoUtils;
 use curvine_model::{
-    CreateFileOpts, DeleteBlockCmd, DeleteResult, FileBlocks, FileStatus, FilesystemInfo,
-    FreeResult, HeartbeatStatus, ListOptions, OpenFlags, RenameFlags, WorkerCommand, WorkerInfo,
+    CompatibilityMode, CompatibilityPolicy, CompatibilityVerdict, CreateFileOpts, DeleteBlockCmd,
+    DeleteResult, FileBlocks, FileStatus, FilesystemInfo, FreeResult, HeartbeatStatus, ListOptions,
+    OpenFlags, RenameFlags, WorkerCommand, WorkerInfo,
 };
 use curvine_net::net::ConnState;
 use curvine_proto::*;
@@ -49,10 +50,14 @@ pub struct MasterHandler {
     pub(crate) control_rpc_executor: Arc<GroupExecutor>,
     pub(crate) replication_handler: Option<MasterReplicationHandler>,
     pub(crate) actor_rt: Arc<Runtime>,
-    // Master's own version + default compatibility contract, built once at
-    // startup. GetFilesystemInfo backs statfs and is called frequently, so we
-    // reuse this instead of recomputing component_version() on every call.
+    // Master's own version + compatibility contract, built once at startup.
+    // GetFilesystemInfo backs statfs and is called frequently, so we reuse
+    // this instead of recomputing component_version() on every call.
     master_compatibility: ServerCompatibilityInfoProto,
+    // Compatibility policy derived from the master configuration. Used to
+    // evaluate worker heartbeats and client handshakes with diagnose/enforce
+    // semantics (lenient diagnose by default).
+    compatibility_policy: CompatibilityPolicy,
 }
 
 impl MasterHandler {
@@ -73,7 +78,12 @@ impl MasterHandler {
         // Build the master's compatibility payload once; GetFilesystemInfo can
         // be hot (statfs) and the underlying version metadata is immutable.
         let master_version = curvine_sys::version::component_version("master");
-        let master_compatibility = ProtoUtils::default_master_compatibility_to_pb(&master_version);
+        // The advertised contract and the enforcement policy both come from
+        // the configured compatibility section; defaults are lenient diagnose
+        // with no bounds, so old components are never rejected by default.
+        let compatibility_policy = conf.master.compatibility.to_policy();
+        let master_compatibility =
+            ProtoUtils::compatibility_to_pb(&master_version, &compatibility_policy);
         Self {
             fs,
             retry_cache,
@@ -86,6 +96,7 @@ impl MasterHandler {
             replication_handler: Some(MasterReplicationHandler::new(replication_manager)),
             actor_rt,
             master_compatibility,
+            compatibility_policy,
         }
     }
 
@@ -470,7 +481,17 @@ impl MasterHandler {
     }
 
     async fn async_get_filesystem_info(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let _: GetFilesystemInfoRequest = ctx.parse_header()?;
+        let req: GetFilesystemInfoRequest = ctx.parse_header()?;
+        // Enforce the master compatibility policy against the client's
+        // structured version report (handshake). Legacy clients that do not
+        // send component_info produce a MissingInfo verdict: allowed in
+        // diagnose mode, rejected in enforce mode.
+        Self::check_peer_compatibility(
+            "client",
+            self.compatibility_policy.mode,
+            self.compatibility_policy
+                .check_client(req.component_info.as_ref()),
+        )?;
         let fs = self.fs.clone();
         let info = Self::run_master_rpc_task(self.control_rpc_executor.clone(), move || {
             Self::process_get_filesystem_info(fs)
@@ -565,11 +586,48 @@ impl MasterHandler {
 
     pub fn worker_heartbeat(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: WorkerHeartbeatRequest = ctx.parse_header()?;
+        // Enforce the master compatibility policy against the worker's
+        // structured version report. Diagnose mode records a warning and
+        // allows the heartbeat (legacy workers without component_info stay
+        // compatible); enforce mode rejects incompatible workers with an
+        // explicit error.
+        Self::check_peer_compatibility(
+            "worker",
+            self.compatibility_policy.mode,
+            self.compatibility_policy
+                .check_worker(header.component_info.as_ref()),
+        )?;
         let cmds = Self::process_worker_heartbeat(self.fs.clone(), header)?;
         let rep_header = WorkerHeartbeatResponse {
             cmds: ProtoUtils::worker_cmd_to_pb(cmds),
         };
         ctx.response(rep_header)
+    }
+
+    /// Evaluate a compatibility verdict against the configured mode.
+    ///
+    /// - `diagnose` (default): log a warning for non-compatible peers and
+    ///   allow the request, so old components are never rejected without
+    ///   explicit configuration.
+    /// - `enforce`: reject with an explicit error describing the actual peer
+    ///   version, the expected bound and the upgrade suggestion.
+    fn check_peer_compatibility(
+        peer: &str,
+        mode: CompatibilityMode,
+        verdict: CompatibilityVerdict,
+    ) -> FsResult<()> {
+        if !verdict.rejects(mode) {
+            if !verdict.is_compatible() {
+                log::warn!("{} compatibility: {}", peer, verdict.describe());
+            }
+            return Ok(());
+        }
+        err_box!(
+            "{} rejected by compatibility policy: {}; upgrade the {} or set master.compatibility.mode = \"diagnose\" to allow it",
+            peer,
+            verdict.describe(),
+            peer
+        )
     }
 
     fn process_worker_heartbeat(
@@ -1122,5 +1180,87 @@ mod tests {
             CompatibilityModeProto::Diagnose as i32
         );
         assert!(compat.blocked_versions.is_empty());
+    }
+
+    #[test]
+    fn diagnose_mode_allows_incompatible_worker_heartbeat() {
+        // Default policy is diagnose: an incompatible worker is warned about
+        // but not rejected, and a legacy worker without component_info is
+        // allowed.
+        let policy = CompatibilityPolicy::default();
+        let incompatible = ComponentInfoProto {
+            release_version: Some("0.1.0".to_string()),
+            protocol_version: Some(1),
+            ..sample_component_info()
+        };
+        let verdict = policy.check_worker(Some(&incompatible));
+        assert!(MasterHandler::check_peer_compatibility("worker", policy.mode, verdict).is_ok());
+
+        // Legacy worker (no component_info): MissingInfo, allowed in diagnose.
+        let verdict = policy.check_worker(None);
+        assert!(MasterHandler::check_peer_compatibility("worker", policy.mode, verdict).is_ok());
+    }
+
+    #[test]
+    fn enforce_mode_rejects_incompatible_worker_heartbeat() {
+        let policy = CompatibilityPolicy {
+            mode: CompatibilityMode::Enforce,
+            min_worker_version: Some("0.2.0".parse().unwrap()),
+            ..Default::default()
+        };
+        let incompatible = ComponentInfoProto {
+            release_version: Some("0.1.0".to_string()),
+            protocol_version: Some(1),
+            ..sample_component_info()
+        };
+        let verdict = policy.check_worker(Some(&incompatible));
+        let err =
+            MasterHandler::check_peer_compatibility("worker", policy.mode, verdict).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("rejected by compatibility policy"), "{msg}");
+        assert!(msg.contains("0.1.0"), "{msg}");
+    }
+
+    #[test]
+    fn enforce_mode_rejects_legacy_client_without_component_info() {
+        let policy = CompatibilityPolicy {
+            mode: CompatibilityMode::Enforce,
+            ..Default::default()
+        };
+        let verdict = policy.check_client(None);
+        let err =
+            MasterHandler::check_peer_compatibility("client", policy.mode, verdict).unwrap_err();
+        assert!(format!("{}", err).contains("client rejected"));
+    }
+
+    #[test]
+    fn compatibility_to_pb_reflects_policy() {
+        let policy = CompatibilityPolicy {
+            mode: CompatibilityMode::Enforce,
+            min_worker_version: Some("0.2.0".parse().unwrap()),
+            blocked_versions: vec!["0.2.5".parse().unwrap()],
+            ..Default::default()
+        };
+        let master_version = curvine_sys::version::component_version("master");
+        let pb = ProtoUtils::compatibility_to_pb(&master_version, &policy);
+        assert_eq!(
+            pb.compatibility_mode,
+            CompatibilityModeProto::Enforce as i32
+        );
+        assert_eq!(pb.min_worker_version.as_deref(), Some("0.2.0"));
+        assert_eq!(pb.blocked_versions, vec!["0.2.5".to_string()]);
+    }
+
+    fn sample_component_info() -> ComponentInfoProto {
+        ComponentInfoProto {
+            component: Some("worker".to_string()),
+            release_version: Some("0.4.0-alpha".to_string()),
+            git_commit: Some("24c848719b5b4fea74519d91cbe462bb49761b36".to_string()),
+            git_tag: Some("v0.4.0-alpha".to_string()),
+            git_branch: Some("main".to_string()),
+            protocol_version: Some(1),
+            min_protocol_version: Some(1),
+            capabilities: vec!["transfer".to_string()],
+        }
     }
 }

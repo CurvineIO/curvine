@@ -37,6 +37,16 @@ meta_dir = "testing/meta"
 # worker_policy = "weighted"
 log = { level = "info", log_dir = "stdout", file_name = "master.log" }
 
+# Version compatibility policy.
+# mode: "diagnose" (default, allow with warnings) or "enforce" (reject
+# incompatible workers/clients). Bounds below are empty by default, meaning
+# old components are never rejected without explicit configuration.
+# [master.compatibility]
+# mode = "diagnose"
+# min_worker_version = "0.1.0"
+# min_client_version = "0.1.0"
+# blocked_versions = ["0.2.5"]
+
 
 # masta ha raft configuration.
 [journal]
@@ -57,6 +67,11 @@ data_dir = [
     "[DISK]testing/data",
 ]
 log = { level = "info", log_dir = "stdout", file_name = "worker.log" }
+
+# Version compatibility policy (used for client-worker data plane checks).
+# [worker.compatibility]
+# mode = "diagnose"
+# min_client_version = "0.1.0"
 
 # SPDK over NVMe-oF/RDMA configuration  
 [worker.spdk_disk]  

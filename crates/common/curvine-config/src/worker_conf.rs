@@ -15,7 +15,7 @@
 #![allow(clippy::should_implement_trait)]
 
 use crate::state::StorageType;
-use crate::ClusterConf;
+use crate::{ClusterConf, CompatibilityConf};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_io::SpdkConf;
 use curvine_runtime::common::{ByteUnit, DurationUnit, FileUtils, LogConf, Utils};
@@ -163,6 +163,10 @@ pub struct WorkerConf {
     pub block_replication_concurrency_limit: usize,
     pub block_replication_chunk_size: usize,
 
+    /// Version compatibility policy (diagnose by default; enforce only when
+    /// explicitly configured).
+    pub compatibility: CompatibilityConf,
+
     // SPDK over NVMe-oF/RDMA configuration.
     pub spdk_disk: SpdkConf,
 }
@@ -209,6 +213,7 @@ impl Default for WorkerConf {
             pipe_pool_idle_time: 0,
             block_replication_concurrency_limit: 100,
             block_replication_chunk_size: 1024 * 1024,
+            compatibility: Default::default(),
             spdk_disk: SpdkConf::default(),
         }
     }

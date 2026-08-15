@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{ClusterConf, DBConf};
+use crate::{ClusterConf, CompatibilityConf, DBConf};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_runtime::common::{ByteUnit, DurationUnit, LogConf, Utils};
 use curvine_runtime::runtime::GroupExecutor;
@@ -135,6 +135,10 @@ pub struct MasterConf {
 
     pub conn_limit: usize,
     pub global_limit: usize,
+
+    /// Version compatibility policy (diagnose by default; enforce only when
+    /// explicitly configured).
+    pub compatibility: CompatibilityConf,
 
     #[serde(default = "MasterConf::rocksdb_default")]
     pub rocksdb: DBConf,
@@ -336,6 +340,8 @@ impl Default for MasterConf {
 
             conn_limit: 8,
             global_limit: 4096,
+
+            compatibility: Default::default(),
 
             rocksdb,
         };

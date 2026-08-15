@@ -415,6 +415,27 @@ impl ProtoUtils {
         }
     }
 
+    /// Build the compatibility contract a server advertises from its own
+    /// version and the configured compatibility policy. The advertised mode,
+    /// minimum bounds and blocked versions mirror the policy so peers learn
+    /// what the server accepts; the protocol version range stays a product
+    /// contract carried by the server's own version.
+    pub fn compatibility_to_pb(
+        src: &ComponentVersion,
+        policy: &crate::CompatibilityPolicy,
+    ) -> ServerCompatibilityInfoProto {
+        let mut pb = Self::default_master_compatibility_to_pb(src);
+        pb.compatibility_mode = policy.mode.to_proto() as i32;
+        pb.min_worker_version = policy.min_worker_version.as_ref().map(|v| v.to_string());
+        pb.min_client_version = policy.min_client_version.as_ref().map(|v| v.to_string());
+        pb.blocked_versions = policy
+            .blocked_versions
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        pb
+    }
+
     pub fn worker_info_from_pb(workers: Vec<WorkerInfoProto>) -> Vec<WorkerInfo> {
         let mut vec = vec![];
         for info in workers {
