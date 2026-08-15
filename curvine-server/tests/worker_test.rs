@@ -131,6 +131,7 @@ fn test_worker_complete_oversized_block_aborts_pending_block() -> CommonResult<(
         client_name: "test".to_string(),
         chunk_size: CHUNK_SIZE,
         pipeline_stream: Vec::new(),
+        component_info: None,
     };
     let req_id = Utils::req_id();
 
@@ -204,6 +205,7 @@ fn test_worker_batch_short_circuit_complete_uses_open_context_without_server_fil
         chunk_size: CHUNK_SIZE,
         short_circuit: true,
         client_name: "test".to_string(),
+        component_info: None,
     };
     let open_msg = Builder::new()
         .code(RpcCode::WriteBlocksBatch)
@@ -230,6 +232,7 @@ fn test_worker_batch_short_circuit_complete_uses_open_context_without_server_fil
         req_id: open_req_id,
         seq_id: 1,
         cancel: false,
+        component_info: None,
     };
     let complete_msg = Builder::new()
         .code(RpcCode::WriteBlocksBatch)
@@ -268,6 +271,7 @@ fn test_worker_batch_short_circuit_complete_requires_open_connection() -> Common
         chunk_size: CHUNK_SIZE,
         short_circuit: true,
         client_name: "test".to_string(),
+        component_info: None,
     };
     let open_msg = Builder::new()
         .code(RpcCode::WriteBlocksBatch)
@@ -289,6 +293,7 @@ fn test_worker_batch_short_circuit_complete_requires_open_connection() -> Common
         req_id,
         seq_id: 1,
         cancel: false,
+        component_info: None,
     };
     let complete_msg = Builder::new()
         .code(RpcCode::WriteBlocksBatch)
@@ -326,6 +331,7 @@ fn test_worker_batch_remote_write_complete_and_read_back() -> CommonResult<()> {
         chunk_size: CHUNK_SIZE,
         short_circuit: false,
         client_name: "test".to_string(),
+        component_info: None,
     };
     let open_msg = Builder::new()
         .code(RpcCode::WriteBlocksBatch)
@@ -347,6 +353,7 @@ fn test_worker_batch_remote_write_complete_and_read_back() -> CommonResult<()> {
             .collect(),
         req_id,
         seq_id: 1,
+        component_info: None,
     };
     let write_msg = Builder::new()
         .code(RpcCode::WriteBlocksBatch)
@@ -400,6 +407,7 @@ fn test_worker_batch_remote_write_complete_and_read_back() -> CommonResult<()> {
         req_id,
         seq_id: 4,
         cancel: false,
+        component_info: None,
     };
     let complete_msg = Builder::new()
         .code(RpcCode::WriteBlocksBatch)
@@ -497,6 +505,7 @@ fn test_worker_fault_http_control_plane_e2e() -> CommonResult<()> {
         client_name: "fault-http-test".to_string(),
         chunk_size: CHUNK_SIZE,
         pipeline_stream: Vec::new(),
+        component_info: None,
     };
     let open = Builder::new()
         .code(RpcCode::WriteBlock)
@@ -546,6 +555,7 @@ fn block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
         client_name: "test".to_string(),
         chunk_size: CHUNK_SIZE,
         pipeline_stream: Vec::new(),
+        component_info: None,
     };
 
     let req_id = Utils::req_id();
@@ -612,6 +622,7 @@ fn test_worker_short_circuit_open_resizes_block_file() -> CommonResult<()> {
         client_name: "test".to_string(),
         chunk_size: CHUNK_SIZE,
         pipeline_stream: Vec::new(),
+        component_info: None,
     };
 
     let req_id = Utils::req_id();
@@ -645,6 +656,7 @@ fn test_worker_short_circuit_open_resizes_block_file() -> CommonResult<()> {
         client_name: "test".to_string(),
         chunk_size: CHUNK_SIZE,
         pipeline_stream: Vec::new(),
+        component_info: None,
     };
     let complete_msg = Builder::new()
         .code(RpcCode::WriteBlock)

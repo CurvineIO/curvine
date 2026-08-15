@@ -92,6 +92,7 @@ fn write_block(
         client_name: "stress".into(),
         chunk_size,
         pipeline_stream: vec![],
+        component_info: None,
     };
 
     let client = conf.worker_sync_client()?;
@@ -137,6 +138,7 @@ fn write_block(
         client_name: "stress".into(),
         chunk_size,
         pipeline_stream: vec![],
+        component_info: None,
     };
 
     let msg = Builder::new()

@@ -30,8 +30,8 @@ use curvine_model::ProtoUtils;
 use curvine_model::{ExtendedBlock, StorageType, WorkerAddress};
 use curvine_proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,
-    BlocksBatchCommitRequest, BlocksBatchWriteRequest, BlocksBatchWriteResponse, DataHeaderProto,
-    FileWriteData, FilesBatchWriteRequest,
+    BlocksBatchCommitRequest, BlocksBatchWriteRequest, BlocksBatchWriteResponse,
+    ComponentInfoProto, DataHeaderProto, FileWriteData, FilesBatchWriteRequest,
 };
 use curvine_rpc::client::RpcClient;
 use curvine_rpc::message::{Builder, Message, RequestStatus};
@@ -46,6 +46,11 @@ pub struct BlockClient {
     pool: Option<Arc<BlockClientPool>>,
     worker_addr: WorkerAddress,
     uptime: u64,
+    /// This client's structured component version, attached to data-plane
+    /// requests on the reserved 1000+ range so workers can identify the peer
+    /// per connection. Constant for the process, built once per client and
+    /// cloned into each request. Legacy workers ignore the unknown field.
+    component_info: ComponentInfoProto,
 }
 
 impl BlockClient {
@@ -57,6 +62,9 @@ impl BlockClient {
             pool: None,
             worker_addr,
             uptime: LocalTime::mills(),
+            component_info: ProtoUtils::component_version_to_pb(
+                &curvine_sys::version::component_version("client"),
+            ),
         }
     }
 
@@ -129,6 +137,7 @@ impl BlockClient {
             client_name: self.client_name.to_string(),
             chunk_size,
             pipeline_stream,
+            component_info: Some(self.component_info.clone()),
         };
 
         let msg = Builder::new()
@@ -209,6 +218,7 @@ impl BlockClient {
             off,
             block_size,
             client_name: self.client_name.to_string(),
+            component_info: Some(self.component_info.clone()),
             ..Default::default()
         };
 
@@ -250,6 +260,7 @@ impl BlockClient {
             enable_read_ahead: conf.enable_read_ahead,
             read_ahead_len: conf.read_ahead_len,
             drop_cache_len: conf.drop_cache_len,
+            component_info: Some(self.component_info.clone()),
         };
 
         let msg = Builder::new()
@@ -274,6 +285,7 @@ impl BlockClient {
     ) -> FsResult<()> {
         let request = BlockReadRequest {
             id: block.id,
+            component_info: Some(self.component_info.clone()),
             ..Default::default()
         };
 
@@ -334,6 +346,7 @@ impl BlockClient {
             chunk_size,
             short_circuit,
             client_name: self.client_name.to_string(),
+            component_info: Some(self.component_info.clone()),
         };
 
         let msg = Builder::new()
@@ -384,6 +397,7 @@ impl BlockClient {
             req_id,
             seq_id,
             cancel,
+            component_info: Some(self.component_info.clone()),
         };
 
         let status = if cancel {
@@ -422,6 +436,7 @@ impl BlockClient {
             files: file_data,
             req_id,
             seq_id,
+            component_info: Some(self.component_info.clone()),
         };
 
         let msg = Builder::new()
@@ -448,6 +463,7 @@ impl Drop for BlockClient {
                     pool: Some(pool.clone()),
                     worker_addr: std::mem::take(&mut self.worker_addr),
                     uptime: self.uptime,
+                    component_info: std::mem::take(&mut self.component_info),
                 };
 
                 pool.release(client);

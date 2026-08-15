@@ -94,6 +94,7 @@ impl HandlerService for WorkerService {
         WorkerHandler {
             store: self.store.clone(),
             handler: FastMutex::new(None),
+            peer_component_info: FastMutex::new(None),
             task_manager: self.task_manager.clone(),
             rt: self.rt.clone(),
             replication_handler: WorkerReplicationHandler::new(&self.replication_manager),

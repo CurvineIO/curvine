@@ -2897,6 +2897,7 @@ dependencies = [
  "log",
  "once_cell",
  "parking_lot",
+ "prost 0.11.9",
  "serde_json",
  "tokio",
 ]

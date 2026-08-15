@@ -34,6 +34,7 @@ fn test_block_write_request_round_trip_without_pipeline_stream() {
         client_name: "test-client".to_string(),
         chunk_size: 1024 * 1024,
         pipeline_stream: vec![],
+        component_info: None,
     };
 
     let encoded = request.encode_to_vec();
@@ -60,6 +61,7 @@ fn test_block_write_request_round_trip_with_pipeline_stream() {
         client_name: "test-client".to_string(),
         chunk_size: 1024 * 1024,
         pipeline_stream: pipeline_stream.clone(),
+        component_info: None,
     };
 
     let encoded = request.encode_to_vec();
@@ -172,6 +174,7 @@ fn test_default_values() {
         client_name: String::new(),
         chunk_size: 0,
         pipeline_stream: vec![],
+        component_info: None,
     };
 
     let encoded = request.encode_to_vec();

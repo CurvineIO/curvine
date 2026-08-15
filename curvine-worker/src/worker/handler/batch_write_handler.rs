@@ -81,7 +81,9 @@ impl BatchWriteHandler {
 
         for (i, block_proto) in header.blocks.iter().cloned().enumerate() {
             let unique_req_id = msg.req_id() + i as i64;
-            // Create a single BlockWriteRequest from the block
+            // Create a single BlockWriteRequest from the block; propagate the
+            // client's component_info so the per-block open carries the same
+            // peer metadata as the outer batch frame.
             let header = BlockWriteRequest {
                 block: block_proto,
                 off: header.off,
@@ -90,6 +92,7 @@ impl BatchWriteHandler {
                 client_name: header.client_name.clone(),
                 chunk_size: header.chunk_size,
                 pipeline_stream: Vec::new(),
+                component_info: header.component_info.clone(),
             };
 
             // Create single request message for each block
