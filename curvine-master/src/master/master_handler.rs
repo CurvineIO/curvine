@@ -482,16 +482,22 @@ impl MasterHandler {
 
     async fn async_get_filesystem_info(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: GetFilesystemInfoRequest = ctx.parse_header()?;
-        // Enforce the master compatibility policy against the client's
-        // structured version report (handshake). Legacy clients that do not
-        // send component_info produce a MissingInfo verdict: allowed in
-        // diagnose mode, rejected in enforce mode.
-        Self::check_peer_compatibility(
-            "client",
-            self.compatibility_policy.mode,
-            self.compatibility_policy
-                .check_client(req.component_info.as_ref()),
-        )?;
+        // GetFilesystemInfo backs statfs and is called frequently. Only
+        // evaluate the compatibility policy when the result can actually be
+        // acted upon (enforce mode, configured bounds/blocklist, or the client
+        // reported component_info); otherwise a legacy client would hit a
+        // MissingInfo verdict and log a warning on every statfs call.
+        if self
+            .compatibility_policy
+            .should_evaluate(req.component_info.is_some())
+        {
+            Self::check_peer_compatibility(
+                "client",
+                self.compatibility_policy.mode,
+                self.compatibility_policy
+                    .check_client(req.component_info.as_ref()),
+            )?;
+        }
         let fs = self.fs.clone();
         let info = Self::run_master_rpc_task(self.control_rpc_executor.clone(), move || {
             Self::process_get_filesystem_info(fs)
@@ -586,17 +592,21 @@ impl MasterHandler {
 
     pub fn worker_heartbeat(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: WorkerHeartbeatRequest = ctx.parse_header()?;
-        // Enforce the master compatibility policy against the worker's
-        // structured version report. Diagnose mode records a warning and
-        // allows the heartbeat (legacy workers without component_info stay
-        // compatible); enforce mode rejects incompatible workers with an
-        // explicit error.
-        Self::check_peer_compatibility(
-            "worker",
-            self.compatibility_policy.mode,
-            self.compatibility_policy
-                .check_worker(header.component_info.as_ref()),
-        )?;
+        // Evaluate the compatibility policy only when the result can actually
+        // be acted upon (enforce mode, configured bounds/blocklist, or the
+        // worker reported component_info); otherwise a legacy worker would hit
+        // a MissingInfo verdict and log a warning on every heartbeat.
+        if self
+            .compatibility_policy
+            .should_evaluate(header.component_info.is_some())
+        {
+            Self::check_peer_compatibility(
+                "worker",
+                self.compatibility_policy.mode,
+                self.compatibility_policy
+                    .check_worker(header.component_info.as_ref()),
+            )?;
+        }
         let cmds = Self::process_worker_heartbeat(self.fs.clone(), header)?;
         let rep_header = WorkerHeartbeatResponse {
             cmds: ProtoUtils::worker_cmd_to_pb(cmds),
@@ -1184,16 +1194,28 @@ mod tests {
 
     #[test]
     fn diagnose_mode_allows_incompatible_worker_heartbeat() {
-        // Default policy is diagnose: an incompatible worker is warned about
-        // but not rejected, and a legacy worker without component_info is
-        // allowed.
-        let policy = CompatibilityPolicy::default();
+        // Configure a minimum worker version so the peer is genuinely
+        // incompatible (below the bound): diagnose mode must still allow the
+        // request (logging a warning) instead of rejecting it. A legacy worker
+        // without component_info is also allowed.
+        let policy = CompatibilityPolicy {
+            mode: CompatibilityMode::Diagnose,
+            min_worker_version: Some("0.2.0".parse().unwrap()),
+            ..Default::default()
+        };
         let incompatible = ComponentInfoProto {
             release_version: Some("0.1.0".to_string()),
             protocol_version: Some(1),
             ..sample_component_info()
         };
         let verdict = policy.check_worker(Some(&incompatible));
+        assert_eq!(
+            verdict,
+            CompatibilityVerdict::VersionTooOld {
+                peer: "0.1.0".to_string(),
+                min: "0.2.0".to_string()
+            }
+        );
         assert!(MasterHandler::check_peer_compatibility("worker", policy.mode, verdict).is_ok());
 
         // Legacy worker (no component_info): MissingInfo, allowed in diagnose.

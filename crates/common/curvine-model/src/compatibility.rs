@@ -97,6 +97,10 @@ pub enum CompatibilityVerdict {
     /// Peer's release version is older than the configured minimum for its
     /// role.
     VersionTooOld { peer: String, min: String },
+    /// Peer sent `component_info` but its release version is missing, empty or
+    /// unparseable, so it cannot be verified against a configured minimum.
+    /// Allowed in diagnose mode; rejected in enforce mode.
+    VersionUnknown { peer: String },
 }
 
 impl CompatibilityVerdict {
@@ -114,9 +118,10 @@ impl CompatibilityVerdict {
         match self {
             Self::Compatible => false,
             Self::Blocked(_) => true,
-            Self::MissingInfo | Self::ProtocolMismatch { .. } | Self::VersionTooOld { .. } => {
-                mode == CompatibilityMode::Enforce
-            }
+            Self::MissingInfo
+            | Self::ProtocolMismatch { .. }
+            | Self::VersionTooOld { .. }
+            | Self::VersionUnknown { .. } => mode == CompatibilityMode::Enforce,
         }
     }
 
@@ -133,6 +138,13 @@ impl CompatibilityVerdict {
             }
             Self::VersionTooOld { peer, min } => {
                 format!("release version {peer} is older than the minimum supported {min}")
+            }
+            Self::VersionUnknown { peer } => {
+                if peer.is_empty() {
+                    "peer release version is missing and cannot be verified".to_string()
+                } else {
+                    format!("release version {peer} cannot be parsed and verified")
+                }
             }
         }
     }
@@ -170,6 +182,28 @@ impl Default for CompatibilityPolicy {
 }
 
 impl CompatibilityPolicy {
+    /// Whether evaluating a peer that reported the given component info can
+    /// have any effect on this policy.
+    ///
+    /// Returns `false` only in diagnose mode with no configured version bounds
+    /// and no blocklist and no peer component info: every such peer is allowed
+    /// (Compatible, or MissingInfo that diagnose permits), so the evaluation
+    /// would only emit warnings. Hot-path callers (statfs-backed
+    /// GetFilesystemInfo, frequent heartbeats) use this to skip evaluation and
+    /// avoid log spam and avoidable overhead.
+    pub fn should_evaluate(&self, has_component_info: bool) -> bool {
+        if self.mode == CompatibilityMode::Enforce {
+            return true;
+        }
+        // Diagnose mode: the evaluation is actionable only when the operator
+        // configured version bounds / a blocklist, or the peer actually
+        // reported component info that could be incompatible.
+        has_component_info
+            || self.min_worker_version.is_some()
+            || self.min_client_version.is_some()
+            || !self.blocked_versions.is_empty()
+    }
+
     /// Check a worker peer (master side).
     pub fn check_worker(&self, peer: Option<&ComponentInfoProto>) -> CompatibilityVerdict {
         self.check(peer, self.min_worker_version.as_ref())
@@ -210,19 +244,32 @@ impl CompatibilityPolicy {
         }
 
         // 3. Version range: peer.release_version >= min (when configured).
-        //    Unparseable peer versions are treated as unknown and skipped, so
-        //    the check stays lenient by default.
+        //    A peer that sends component_info without a parseable release
+        //    version cannot be verified against a configured minimum, so it is
+        //    treated as unknown rather than Compatible: diagnose allows it
+        //    (with a warning), enforce rejects it. This prevents a peer from
+        //    bypassing minimum-version enforcement by omitting its version.
         if let Some(min) = min_version {
-            if let Some(version) = peer.release_version.as_deref() {
-                match ReleaseVersion::parse(version) {
+            match peer.release_version.as_deref() {
+                None | Some("") => {
+                    return CompatibilityVerdict::VersionUnknown {
+                        peer: String::new(),
+                    };
+                }
+                Some(version) => match ReleaseVersion::parse(version) {
                     Ok(parsed) if parsed < *min => {
                         return CompatibilityVerdict::VersionTooOld {
                             peer: version.to_string(),
                             min: min.to_string(),
                         };
                     }
-                    _ => {}
-                }
+                    Ok(_) => {}
+                    Err(_) => {
+                        return CompatibilityVerdict::VersionUnknown {
+                            peer: version.to_string(),
+                        };
+                    }
+                },
             }
         }
 
@@ -392,8 +439,12 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_peer_version_stays_lenient() {
-        let policy = policy();
+    fn unparseable_peer_version_is_unknown_when_min_configured() {
+        // With a minimum version configured, an unparseable release version
+        // cannot be verified and must not fall through to Compatible, or a
+        // peer could bypass minimum-version enforcement by sending a bogus
+        // version. diagnose allows it (warning); enforce rejects it.
+        let policy = policy(); // min_worker_version = 0.2.0
         let peer = ComponentInfoProto {
             release_version: Some("not-a-version".to_string()),
             protocol_version: Some(1),
@@ -401,7 +452,59 @@ mod tests {
         };
 
         let verdict = policy.check_worker(Some(&peer));
-        assert_eq!(verdict, CompatibilityVerdict::Compatible);
+        assert_eq!(
+            verdict,
+            CompatibilityVerdict::VersionUnknown {
+                peer: "not-a-version".to_string()
+            }
+        );
+        assert!(!verdict.rejects(CompatibilityMode::Diagnose));
+        assert!(verdict.rejects(CompatibilityMode::Enforce));
+    }
+
+    #[test]
+    fn missing_release_version_is_unknown_when_min_configured() {
+        // A peer that omits release_version entirely (None or empty) also
+        // cannot be verified against a configured minimum.
+        let policy = policy();
+        for release_version in [None, Some(String::new())] {
+            let peer = ComponentInfoProto {
+                release_version,
+                protocol_version: Some(1),
+                ..sample_worker_info()
+            };
+
+            let verdict = policy.check_worker(Some(&peer));
+            assert_eq!(
+                verdict,
+                CompatibilityVerdict::VersionUnknown {
+                    peer: String::new()
+                }
+            );
+            assert!(verdict.rejects(CompatibilityMode::Enforce));
+        }
+    }
+
+    #[test]
+    fn unknown_version_is_allowed_when_no_min_configured() {
+        // Without an explicit minimum, an unparseable/missing release version
+        // stays Compatible: old or unversioned components are never rejected
+        // by default.
+        let policy = CompatibilityPolicy {
+            min_worker_version: None,
+            ..Default::default()
+        };
+        for release_version in [Some("not-a-version".to_string()), None] {
+            let peer = ComponentInfoProto {
+                release_version,
+                protocol_version: Some(1),
+                ..sample_worker_info()
+            };
+            assert_eq!(
+                policy.check_worker(Some(&peer)),
+                CompatibilityVerdict::Compatible
+            );
+        }
     }
 
     #[test]
@@ -443,5 +546,38 @@ mod tests {
         assert!(!feature_enabled(&server, &peer, "short-circuit"));
         assert!(!feature_enabled(&server, &[], "transfer"));
         assert!(!feature_enabled(&[], &peer, "transfer"));
+    }
+
+    #[test]
+    fn should_evaluate_skips_only_unactionable_diagnose_peers() {
+        // Default diagnose policy with no bounds and no peer component info:
+        // evaluation is unactionable (Compatible or MissingInfo that diagnose
+        // allows), so hot paths skip it to avoid log spam.
+        let default_policy = CompatibilityPolicy::default();
+        assert!(!default_policy.should_evaluate(false));
+
+        // Enforce mode always evaluates.
+        let enforce = CompatibilityPolicy {
+            mode: CompatibilityMode::Enforce,
+            ..Default::default()
+        };
+        assert!(enforce.should_evaluate(false));
+
+        // Component info present -> actionable.
+        assert!(default_policy.should_evaluate(true));
+
+        // Configured bounds / blocklist -> actionable even without component
+        // info.
+        let bounded = CompatibilityPolicy {
+            min_worker_version: Some(version("0.2.0")),
+            ..Default::default()
+        };
+        assert!(bounded.should_evaluate(false));
+
+        let blocked = CompatibilityPolicy {
+            blocked_versions: vec![version("0.2.5")],
+            ..Default::default()
+        };
+        assert!(blocked.should_evaluate(false));
     }
 }
