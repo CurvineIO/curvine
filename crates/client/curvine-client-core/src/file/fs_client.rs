@@ -574,7 +574,11 @@ impl FsClient {
         // never rejected.
         self.context
             .set_master_handshake(MasterHandshake::from_response(&rep));
-        Ok(ProtoUtils::filesystem_info_from_pb(rep))
+        let info = ProtoUtils::filesystem_info_from_pb(rep);
+        // Cache the live-worker versions for the T10 client-side worker
+        // pre-check before data connections are opened.
+        self.context.set_live_workers(&info.live_workers);
+        Ok(info)
     }
 
     /// Client-master version handshake: report this client's `component_info`
@@ -637,6 +641,10 @@ impl FsClient {
         if let Ok(rep) = GetFilesystemInfoResponse::decode(bytes.as_ref()) {
             self.context
                 .set_master_handshake(MasterHandshake::from_response(&rep));
+            // Cache the live-worker versions for the T10 client-side worker
+            // pre-check before data connections are opened.
+            let info = ProtoUtils::filesystem_info_from_pb(rep);
+            self.context.set_live_workers(&info.live_workers);
         }
         Ok(bytes)
     }

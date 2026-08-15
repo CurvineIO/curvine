@@ -20,7 +20,7 @@ use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::RpcCode;
-use curvine_model::LoadTaskInfo;
+use curvine_model::{CompatibilityPolicy, LoadTaskInfo};
 use curvine_proto::*;
 use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::{Builder, Message, RequestStatus, ResponseStatus};
@@ -57,6 +57,11 @@ pub struct WorkerHandler {
     /// protocol negotiation on top of it happens in the client-worker
     /// compatibility layer (T10).
     pub connection_peer: FastMutex<ConnectionPeer>,
+    /// Compatibility policy applied to client peers on this data connection.
+    /// Built once per worker from `worker.compatibility` config; diagnose by
+    /// default so old clients are never rejected without explicit
+    /// configuration.
+    pub compatibility_policy: CompatibilityPolicy,
 }
 
 impl MessageHandler for WorkerHandler {
@@ -78,8 +83,9 @@ impl MessageHandler for WorkerHandler {
         let code = RpcCode::from(msg.code());
         // Record the client's component info on this connection (best-effort;
         // running data frames carry no version payload and legacy clients omit
-        // the field entirely).
-        self.record_peer_component_info(msg);
+        // the field entirely). In enforce mode an incompatible peer is
+        // rejected here, on the first data-plane open frame.
+        self.record_peer_component_info(msg)?;
 
         match code {
             RpcCode::SubmitTask => self.task_submit(msg),
@@ -177,35 +183,90 @@ impl WorkerHandler {
         }
     }
 
-    /// Resolve and record the client's `component_info` for this connection.
-    /// Resolution happens exactly once, from the first data-plane open frame:
-    /// a new client carries `component_info` on it (`Known`), a legacy client
-    /// does not (`Legacy`). After resolution the worker never parses another
-    /// header for peer metadata, so at most one frame per connection pays the
-    /// decode cost (the business handlers decode the same headers anyway).
-    /// Legacy/unknown peers are never rejected.
-    fn record_peer_component_info(&self, msg: &Message) {
+    /// Resolve and record the client's `component_info` for this connection,
+    /// then evaluate the resolved peer against this worker's compatibility
+    /// policy. Resolution happens exactly once, from the first data-plane open
+    /// frame: a new client carries `component_info` on it (`Known`), a legacy
+    /// client does not (`Legacy`). After resolution the worker never parses
+    /// another header for peer metadata, so at most one frame per connection
+    /// pays the decode cost (the business handlers decode the same headers
+    /// anyway).
+    ///
+    /// Compatibility handling (T10):
+    /// - `diagnose` (default): record a warning for incompatible peers and
+    ///   allow the request, so old clients are never rejected without explicit
+    ///   configuration;
+    /// - `enforce`: reject the first data-plane open frame with an explicit
+    ///   error. The evaluation is skipped entirely when the policy cannot be
+    ///   acted upon (default diagnose with no bounds/blocklist and a legacy
+    ///   peer that reported nothing), mirroring the master's hot-path
+    ///   avoidance.
+    fn record_peer_component_info(&self, msg: &Message) -> FsResult<()> {
         let mut peer = self.connection_peer.lock();
         if !matches!(*peer, ConnectionPeer::Unknown) {
-            return;
+            return Ok(());
         }
         let Some(resolved) = Self::resolve_connection_peer(msg) else {
-            return;
+            return Ok(());
         };
+        // Evaluate the resolved peer (Known or Legacy) against the policy
+        // BEFORE committing it to the connection. Diagnose mode logs a warning
+        // for incompatible peers and allows the request; enforce mode rejects
+        // the first open frame. Evaluating first keeps the rejection airtight:
+        // an enforce-rejected peer is never committed, so a retried frame is
+        // resolved and evaluated again and stays rejected. The evaluation is
+        // skipped when it could not change the outcome (default diagnose, no
+        // bounds/blocklist, legacy peer with no component info) to avoid log
+        // spam on every legacy connection.
+        let peer_is_known = matches!(&resolved, ConnectionPeer::Known(_));
+        if self.compatibility_policy.should_evaluate(peer_is_known) {
+            Self::evaluate_peer(&self.compatibility_policy, &resolved)?;
+        }
         match resolved {
             ConnectionPeer::Known(info) => {
                 info!(
-                    "peer component info on data connection: component={}, release_version={}, protocol_version={:?}, min_protocol_version={:?}",
+                    "peer component info on data connection: component={}, release_version={}, protocol_version={:?}, min_protocol_version={:?}, capabilities={:?}",
                     info.component.as_deref().unwrap_or("unknown"),
                     info.release_version.as_deref().unwrap_or("unknown"),
                     info.protocol_version,
                     info.min_protocol_version,
+                    info.capabilities,
                 );
                 *peer = ConnectionPeer::Known(info);
             }
             ConnectionPeer::Legacy => *peer = ConnectionPeer::Legacy,
             ConnectionPeer::Unknown => unreachable!("resolution always yields Known or Legacy"),
         }
+        Ok(())
+    }
+
+    /// Evaluate a resolved connection peer against the worker's compatibility
+    /// policy. `diagnose` (default) logs a warning and allows the request;
+    /// `enforce` rejects with an explicit error describing the actual peer
+    /// version, the expected bound and the upgrade suggestion. Pure, so the
+    /// diagnose/enforce decision is unit-testable without a full
+    /// `WorkerHandler`. `Unknown` peers never evaluate.
+    fn evaluate_peer(policy: &CompatibilityPolicy, peer: &ConnectionPeer) -> FsResult<()> {
+        let info = match peer {
+            ConnectionPeer::Known(info) => Some(info),
+            ConnectionPeer::Legacy => None,
+            ConnectionPeer::Unknown => return Ok(()),
+        };
+        let verdict = policy.check_client(info);
+        if verdict.is_compatible() {
+            return Ok(());
+        }
+        if verdict.rejects(policy.mode) {
+            return err_box!(
+                "client rejected by compatibility policy: {}; upgrade the client or set worker.compatibility.mode = \"diagnose\" to allow it",
+                verdict.describe()
+            );
+        }
+        log::warn!(
+            "client peer on data connection incompatible (diagnose): {}",
+            verdict.describe()
+        );
+        Ok(())
     }
 
     /// The component info recorded for the peer on this connection. `None`
@@ -216,6 +277,21 @@ impl WorkerHandler {
             ConnectionPeer::Known(info) => Some(info.clone()),
             ConnectionPeer::Unknown | ConnectionPeer::Legacy => None,
         }
+    }
+
+    /// Capabilities declared by the peer on this connection, empty for
+    /// unresolved or legacy clients. Feature-level negotiation token: a
+    /// feature is enabled only when both the worker and the peer declare it.
+    pub fn peer_capabilities(&self) -> Vec<String> {
+        match &*self.connection_peer.lock() {
+            ConnectionPeer::Known(info) => info.capabilities.clone(),
+            ConnectionPeer::Unknown | ConnectionPeer::Legacy => Vec::new(),
+        }
+    }
+
+    /// Whether the peer on this connection declared the given capability.
+    pub fn peer_declares_capability(&self, feature: &str) -> bool {
+        self.peer_capabilities().iter().any(|c| c == feature)
     }
 
     fn get_handler<'a>(
@@ -649,5 +725,130 @@ mod tests {
         };
         let msg = build_msg(RpcCode::QueryTransferTask, RequestStatus::Open, header);
         assert_eq!(WorkerHandler::resolve_connection_peer(&msg), None);
+    }
+
+    // ---- T10: per-connection peer compatibility evaluation ----
+
+    use curvine_model::{CompatibilityMode, CompatibilityPolicy};
+    use curvine_sys::version::ReleaseVersion;
+
+    fn version(v: &str) -> ReleaseVersion {
+        ReleaseVersion::parse(v).unwrap()
+    }
+
+    fn client_info(release_version: &str, protocol_version: u32) -> ComponentInfoProto {
+        ComponentInfoProto {
+            component: Some("client".to_string()),
+            release_version: Some(release_version.to_string()),
+            git_commit: Some("abc".to_string()),
+            git_tag: Some(String::new()),
+            git_branch: Some("main".to_string()),
+            protocol_version: Some(protocol_version),
+            min_protocol_version: Some(protocol_version),
+            capabilities: vec!["batch-write".to_string()],
+        }
+    }
+
+    fn default_policy() -> CompatibilityPolicy {
+        CompatibilityPolicy::default()
+    }
+
+    #[test]
+    fn compatible_peer_is_allowed_under_default_policy() {
+        // Default worker policy (diagnose, no bounds): a new client that
+        // reports a compatible protocol version is accepted in both modes.
+        let policy = default_policy();
+        let peer = ConnectionPeer::Known(client_info("0.4.0-alpha", 1));
+        assert!(WorkerHandler::evaluate_peer(&policy, &peer).is_ok());
+        // Even under enforce, the default policy carries no bounds, so nothing
+        // is rejected.
+        let enforce = CompatibilityPolicy {
+            mode: CompatibilityMode::Enforce,
+            ..default_policy()
+        };
+        assert!(WorkerHandler::evaluate_peer(&enforce, &peer).is_ok());
+    }
+
+    #[test]
+    fn protocol_mismatch_is_warned_in_diagnose_and_rejected_in_enforce() {
+        // 协议不匹配: a client speaking protocol 2 against a worker that only
+        // supports protocol 1.
+        let policy = default_policy();
+        let peer = ConnectionPeer::Known(client_info("0.4.0", 2));
+        // diagnose: allowed (only a warning is logged).
+        assert!(WorkerHandler::evaluate_peer(&policy, &peer).is_ok());
+        // enforce: rejected with an explicit error describing the mismatch.
+        let enforce = CompatibilityPolicy {
+            mode: CompatibilityMode::Enforce,
+            ..default_policy()
+        };
+        let err = WorkerHandler::evaluate_peer(&enforce, &peer).unwrap_err();
+        assert!(err.to_string().contains("protocol version 2"));
+        assert!(err.to_string().contains("diagnose"));
+    }
+
+    #[test]
+    fn old_client_version_is_warned_in_diagnose_and_rejected_in_enforce() {
+        // 旧 client: an explicitly configured min_client_version rejects an
+        // older client only in enforce mode; diagnose allows it with a
+        // warning.
+        let policy = CompatibilityPolicy {
+            mode: CompatibilityMode::Diagnose,
+            min_client_version: Some(version("0.2.0")),
+            ..default_policy()
+        };
+        let old_client = ConnectionPeer::Known(client_info("0.1.5", 1));
+        assert!(WorkerHandler::evaluate_peer(&policy, &old_client).is_ok());
+
+        let enforce = CompatibilityPolicy {
+            mode: CompatibilityMode::Enforce,
+            min_client_version: Some(version("0.2.0")),
+            ..default_policy()
+        };
+        let err = WorkerHandler::evaluate_peer(&enforce, &old_client).unwrap_err();
+        assert!(err.to_string().contains("0.1.5"));
+        assert!(err.to_string().contains("0.2.0"));
+    }
+
+    #[test]
+    fn legacy_peer_is_allowed_in_diagnose_and_rejected_in_enforce() {
+        // 新 worker + 旧 client: a legacy client that never reported
+        // component_info is allowed under diagnose (the default) and rejected
+        // only when the worker is explicitly configured to enforce.
+        let policy = default_policy();
+        assert!(WorkerHandler::evaluate_peer(&policy, &ConnectionPeer::Legacy).is_ok());
+
+        let enforce = CompatibilityPolicy {
+            mode: CompatibilityMode::Enforce,
+            ..default_policy()
+        };
+        let err = WorkerHandler::evaluate_peer(&enforce, &ConnectionPeer::Legacy).unwrap_err();
+        assert!(err.to_string().contains("no component version info"));
+    }
+
+    #[test]
+    fn blocked_version_is_always_rejected_regardless_of_mode() {
+        // Blocked versions are an explicit operator backstop: rejected even in
+        // diagnose mode.
+        let policy = CompatibilityPolicy {
+            blocked_versions: vec![version("0.2.5")],
+            ..default_policy()
+        };
+        let blocked = ConnectionPeer::Known(client_info("0.2.5", 1));
+        let err = WorkerHandler::evaluate_peer(&policy, &blocked).unwrap_err();
+        assert!(err.to_string().contains("blocked"));
+
+        let enforce = CompatibilityPolicy {
+            mode: CompatibilityMode::Enforce,
+            blocked_versions: vec![version("0.2.5")],
+            ..default_policy()
+        };
+        assert!(WorkerHandler::evaluate_peer(&enforce, &blocked).is_err());
+    }
+
+    #[test]
+    fn unknown_peer_never_evaluates() {
+        let policy = default_policy();
+        assert!(WorkerHandler::evaluate_peer(&policy, &ConnectionPeer::Unknown).is_ok());
     }
 }

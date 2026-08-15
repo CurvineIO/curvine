@@ -22,7 +22,7 @@ use curvine_config::ClusterConf;
 use curvine_core_error::StringError;
 use curvine_core_error::{CommonError, CommonResult};
 use curvine_fault::FaultHttpControl;
-use curvine_model::{HeartbeatStatus, WorkerAddress};
+use curvine_model::{CompatibilityPolicy, HeartbeatStatus, WorkerAddress};
 use curvine_net::net::ConnState;
 use curvine_rpc::handler::HandlerService;
 use curvine_rpc::server::{RpcServer, ServerStateListener};
@@ -50,6 +50,10 @@ pub struct WorkerService {
     rt: Arc<Runtime>,
     replication_manager: Arc<WorkerReplicationManager>,
     fault_http: FaultHttpControl,
+    /// Compatibility policy applied to client peers on data-plane connections.
+    /// Built once from `worker.compatibility` config (diagnose by default) and
+    /// shared by every per-connection `WorkerHandler`.
+    compatibility_policy: CompatibilityPolicy,
 }
 
 impl WorkerService {
@@ -74,6 +78,7 @@ impl WorkerService {
             rt,
             replication_manager,
             fault_http,
+            compatibility_policy: conf.worker.compatibility.to_policy(),
         };
         Ok(ws)
     }
@@ -98,6 +103,7 @@ impl HandlerService for WorkerService {
             task_manager: self.task_manager.clone(),
             rt: self.rt.clone(),
             replication_handler: WorkerReplicationHandler::new(&self.replication_manager),
+            compatibility_policy: self.compatibility_policy.clone(),
         }
     }
 }
