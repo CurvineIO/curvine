@@ -432,11 +432,14 @@ impl BlockClient {
             })
             .collect();
 
+        // Running frame: carries the file contents in the header, so it must
+        // stay lean — `component_info` is attached on the batch open/commit
+        // frames only, and the worker caches peer metadata from those.
         let header = FilesBatchWriteRequest {
             files: file_data,
             req_id,
             seq_id,
-            component_info: Some(self.component_info.clone()),
+            component_info: None,
         };
 
         let msg = Builder::new()

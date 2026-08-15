@@ -134,9 +134,11 @@ impl WorkerHandler {
 
     /// Extract the optional `component_info` a client attached to a data-plane
     /// request, based on the RPC code / request status pair that determines the
-    /// wire message type. Running (data-carrying) frames use `DataHeaderProto`
-    /// and carry no component info; the client reports it on the open and
-    /// commit frames, so the first request on a connection carries it.
+    /// wire message type. The client reports `component_info` on the open and
+    /// commit frames only; running (data-carrying) frames use `DataHeaderProto`
+    /// or `FilesBatchWriteRequest` (whose header can embed large file contents)
+    /// and are deliberately skipped, so the hot path never decodes a large
+    /// header just to read peer metadata.
     fn extract_component_info(msg: &Message) -> Option<ComponentInfoProto> {
         match (RpcCode::from(msg.code()), msg.request_status()) {
             (
@@ -152,10 +154,6 @@ impl WorkerHandler {
                 .and_then(|req| req.component_info),
             (RpcCode::WriteBlocksBatch, RequestStatus::Open) => msg
                 .parse_header::<BlocksBatchWriteRequest>()
-                .ok()
-                .and_then(|req| req.component_info),
-            (RpcCode::WriteBlocksBatch, RequestStatus::Running) => msg
-                .parse_header::<FilesBatchWriteRequest>()
                 .ok()
                 .and_then(|req| req.component_info),
             (RpcCode::WriteBlocksBatch, RequestStatus::Complete | RequestStatus::Cancel) => msg
@@ -427,6 +425,10 @@ mod tests {
             Some(sample_component_info())
         );
 
+        // Running frames carry file contents in the header and are never
+        // parsed for peer metadata (peer cache is filled by open/commit
+        // frames); the client omits component_info here, so extraction must
+        // be None.
         let files_batch = FilesBatchWriteRequest {
             files: vec![FileWriteData {
                 path: "/dir/a".to_string(),
@@ -434,17 +436,14 @@ mod tests {
             }],
             req_id: 7,
             seq_id: 2,
-            component_info: Some(sample_component_info()),
+            component_info: None,
         };
         let running = build_msg(
             RpcCode::WriteBlocksBatch,
             RequestStatus::Running,
             files_batch,
         );
-        assert_eq!(
-            WorkerHandler::extract_component_info(&running),
-            Some(sample_component_info())
-        );
+        assert_eq!(WorkerHandler::extract_component_info(&running), None);
 
         let batch_commit = BlocksBatchCommitRequest {
             blocks: vec![sample_block()],
