@@ -20,7 +20,7 @@ use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::RpcCode;
-use curvine_model::{CompatibilityPolicy, LoadTaskInfo};
+use curvine_model::{CompatibilityPolicy, CompatibilityVerdict, LoadTaskInfo};
 use curvine_proto::*;
 use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::{Builder, Message, RequestStatus, ResponseStatus};
@@ -270,8 +270,9 @@ impl WorkerHandler {
         }
         if verdict.rejects(policy.mode) {
             return err_box!(
-                "client rejected by compatibility policy: {}; upgrade the client or set worker.compatibility.mode = \"diagnose\" to allow it",
-                verdict.describe()
+                "client rejected by compatibility policy: {}; {}",
+                verdict.describe(),
+                Self::rejection_hint(&verdict)
             );
         }
         log::warn!(
@@ -279,6 +280,19 @@ impl WorkerHandler {
             verdict.describe()
         );
         Ok(())
+    }
+
+    /// Operator guidance appended to a rejection error. Most verdicts are
+    /// mode-dependent, so the hint points at the diagnose/enforce switch;
+    /// blocked versions reject regardless of mode, so the hint must point at
+    /// the blocklist instead of a mode change that would not help.
+    fn rejection_hint(verdict: &CompatibilityVerdict) -> &'static str {
+        match verdict {
+            CompatibilityVerdict::Blocked(_) => {
+                "remove the version from worker.compatibility.blocked_versions to allow it"
+            }
+            _ => "upgrade the client or set worker.compatibility.mode = \"diagnose\" to allow it",
+        }
     }
 
     /// The component info recorded for the peer on this connection. `None`
@@ -845,14 +859,24 @@ mod tests {
     #[test]
     fn blocked_version_is_always_rejected_regardless_of_mode() {
         // Blocked versions are an explicit operator backstop: rejected even in
-        // diagnose mode.
+        // diagnose mode. The rejection hint must point at the blocklist, not
+        // at the diagnose/enforce switch (which would not help for Blocked).
         let policy = CompatibilityPolicy {
             blocked_versions: vec![version("0.2.5")],
             ..default_policy()
         };
         let blocked = ConnectionPeer::Known(client_info("0.2.5", 1));
         let err = WorkerHandler::evaluate_peer(&policy, &blocked).unwrap_err();
-        assert!(err.to_string().contains("blocked"));
+        let msg = err.to_string();
+        assert!(msg.contains("blocked"));
+        assert!(
+            msg.contains("blocked_versions"),
+            "blocked rejection should point at the blocklist: {msg}"
+        );
+        assert!(
+            !msg.contains("diagnose"),
+            "blocked rejection must not suggest switching to diagnose: {msg}"
+        );
 
         let enforce = CompatibilityPolicy {
             mode: CompatibilityMode::Enforce,
