@@ -182,7 +182,7 @@ pub struct FuseConf {
 
     pub state_dir: String,
 
-    /// Override for the FUSE mount BDI `max_readahead_kb` (in KB).
+    /// Override for the FUSE mount BDI `read_ahead_kb` (in KB).
     ///
     /// Defaults to `None` for all construction paths, including TOML `[fuse]`
     /// tables that omit this field: keep the kernel default and do not write
@@ -191,7 +191,7 @@ pub struct FuseConf {
     /// faults one page at a time but readahead still pulls a wide window.
     ///
     /// When `Some(kb)` with `kb > 0`, curvine-fuse writes the value to
-    /// `/sys/class/bdi/<major>:<minor>/max_readahead_kb` after each successful
+    /// `/sys/class/bdi/<major>:<minor>/read_ahead_kb` after each successful
     /// mount and bumps FUSE init `max_readahead` to at least `kb * 1024` bytes
     /// so the kernel can issue larger sequential read requests. Use
     /// [`FuseConf::DEFAULT_MAX_READAHEAD_KB`] (1024 = 1 MiB) only when the
