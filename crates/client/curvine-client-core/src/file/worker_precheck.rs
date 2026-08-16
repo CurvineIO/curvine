@@ -134,7 +134,7 @@ impl WorkerPrecheck {
         let changed = self
             .warned
             .get(&worker.worker_id())
-            .map(|last| *last != verdict)
+            .map(|last| last.value() != &verdict)
             .unwrap_or(true);
         if changed {
             self.warned.insert(worker.worker_id(), verdict.clone());
