@@ -184,16 +184,20 @@ pub struct FuseConf {
 
     /// Override for the FUSE mount BDI `max_readahead_kb` (in KB).
     ///
-    /// Defaults to [`FuseConf::DEFAULT_MAX_READAHEAD_KB`] (1024 = 1 MiB) for
-    /// all construction paths, including TOML `[fuse]` tables that omit this
-    /// field. When `Some(kb)` with `kb > 0`, curvine-fuse writes the value to
+    /// Defaults to `None` for all construction paths, including TOML `[fuse]`
+    /// tables that omit this field: keep the kernel default and do not write
+    /// the BDI sysfs file. A large override (e.g. 1 MiB) inflates sequential
+    /// prefetch and causes read amplification under mmap, where the kernel
+    /// faults one page at a time but readahead still pulls a wide window.
+    ///
+    /// When `Some(kb)` with `kb > 0`, curvine-fuse writes the value to
     /// `/sys/class/bdi/<major>:<minor>/max_readahead_kb` after each successful
     /// mount and bumps FUSE init `max_readahead` to at least `kb * 1024` bytes
-    /// so the kernel can issue larger sequential read requests.
+    /// so the kernel can issue larger sequential read requests. Use
+    /// [`FuseConf::DEFAULT_MAX_READAHEAD_KB`] (1024 = 1 MiB) only when the
+    /// workload is sequential and mmap read amplification is acceptable.
     ///
-    /// Set to `None` programmatically to keep the kernel default (no BDI
-    /// override). Linux only; on other platforms the value is accepted but has
-    /// no effect.
+    /// Linux only; on other platforms the value is accepted but has no effect.
     pub max_readahead_kb: Option<u32>,
 
     /// The following are some time types, which are initialized only after init is called.
@@ -242,7 +246,8 @@ impl FuseConf {
     /// Default umask applied to file-system-generated permission bits (octal 022).
     pub const DEFAULT_UMASK: u32 = 0o22;
 
-    /// Default FUSE BDI readahead window: 1 MiB (`1024` KB).
+    /// Suggested FUSE BDI readahead override for sequential reads: 1 MiB
+    /// (`1024` KB). Not applied by default — see [`FuseConf::max_readahead_kb`].
     pub const DEFAULT_MAX_READAHEAD_KB: u32 = 1024;
 
     pub fn init(&mut self) -> CommonResult<()> {
@@ -565,7 +570,7 @@ impl Default for FuseConf {
 
             state_dir: std::env::temp_dir().to_string_lossy().to_string(),
 
-            max_readahead_kb: Some(Self::DEFAULT_MAX_READAHEAD_KB),
+            max_readahead_kb: None,
             attr_ttl: Default::default(),
             entry_ttl: Default::default(),
             negative_ttl: Default::default(),
@@ -590,12 +595,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_max_readahead_kb_is_one_mib() {
+    fn default_max_readahead_kb_is_none() {
         let conf = FuseConf::default();
-        assert_eq!(
-            conf.max_readahead_kb,
-            Some(FuseConf::DEFAULT_MAX_READAHEAD_KB)
-        );
+        assert_eq!(conf.max_readahead_kb, None);
     }
 
     #[test]
@@ -857,10 +859,7 @@ max_readahead_kb = 1024
     #[test]
     fn toml_omitted_max_readahead_kb_uses_default() {
         let conf: FuseConf = toml::from_str("io_threads = 16").expect("parse partial");
-        assert_eq!(
-            conf.max_readahead_kb,
-            Some(FuseConf::DEFAULT_MAX_READAHEAD_KB)
-        );
+        assert_eq!(conf.max_readahead_kb, None);
     }
 
     #[test]
@@ -961,10 +960,7 @@ io_threads = 16
 "#,
         )
         .expect("parse fuse wrapper");
-        assert_eq!(
-            conf.fuse.max_readahead_kb,
-            Some(FuseConf::DEFAULT_MAX_READAHEAD_KB)
-        );
+        assert_eq!(conf.fuse.max_readahead_kb, None);
     }
 
     #[test]
