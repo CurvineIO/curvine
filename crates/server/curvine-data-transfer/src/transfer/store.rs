@@ -127,6 +127,15 @@ pub trait TransferStore: Send + Sync + 'static {
         limit: usize,
     ) -> FsResult<Vec<TransferTaskRecord>>;
 
+    /// List tasks in the given state for a job run, oldest-updated first, capped by `limit`.
+    fn list_tasks_by_state(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        state: TransferTaskState,
+        limit: usize,
+    ) -> FsResult<Vec<TransferTaskRecord>>;
+
     fn has_failed_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool>;
 
     fn has_recoverable_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool>;

@@ -605,6 +605,28 @@ impl TransferStore for MemoryTransferStore {
             .collect())
     }
 
+    fn list_tasks_by_state(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        state: TransferTaskState,
+        limit: usize,
+    ) -> FsResult<Vec<TransferTaskRecord>> {
+        let mut tasks: Vec<_> = self
+            .inner
+            .lock()
+            .tasks
+            .values()
+            .filter(|task| {
+                task.job_id == job_id && task.run_id == run_id && task.state == state
+            })
+            .cloned()
+            .collect();
+        tasks.sort_by_key(|task| task.updated_at);
+        tasks.truncate(limit);
+        Ok(tasks)
+    }
+
     fn has_failed_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool> {
         Ok(self.inner.lock().tasks.values().any(|task| {
             task.job_id == job_id

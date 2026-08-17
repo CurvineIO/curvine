@@ -727,6 +727,16 @@ impl TransferStore for MysqlTransferStore {
             .collect()
     }
 
+    fn list_tasks_by_state(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        state: TransferTaskState,
+        limit: usize,
+    ) -> FsResult<Vec<TransferTaskRecord>> {
+        select_tasks(&mut self.conn()?, job_id, run_id, Some(state), Some(limit))
+    }
+
     fn has_failed_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool> {
         let result: Option<u8> = self
             .conn()?
