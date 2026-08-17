@@ -888,7 +888,12 @@ fi
 
 if [ $BUILD_JAVA_SDK -eq 1 ]; then
   # Native library was copied immediately after the java-sdk cargo build.
-  # Build java package
+  # Build java package. In release builds, inject the release version into the
+  # pom so the jar artifact matches the tag; local builds (no BUILD_VERSION)
+  # keep the source pom untouched.
+  if [ -n "${BUILD_VERSION:-}" ]; then
+    set_pom_version "$FS_HOME/curvine-libsdk/java/pom.xml" "$BUILD_VERSION"
+  fi
   cd "$FS_HOME"/curvine-libsdk/java
   mvn protobuf:compile package -DskipTests -P${TARGET_DIR}
   if [ $? -ne 0 ]; then
@@ -958,6 +963,13 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
 
   echo "Building Python wheel (maturin) into ${DIST_DIR}/lib ..."
   cd "$FS_HOME/crates/sdk/curvine-libsdk-python"
+  # In release builds, point the workspace version at the release version so
+  # the dynamic pyproject version (maturin) produces a wheel named after the
+  # tag. The patch only happens when BUILD_VERSION is set, so local builds are
+  # unaffected.
+  if [ -n "${BUILD_VERSION:-}" ]; then
+    set_workspace_version "$FS_HOME/Cargo.toml" "$BUILD_VERSION"
+  fi
   PY_SDK_FEATURES="$(libsdk_features "extension-module")" || exit 1
   echo "maturin features: ${PY_SDK_FEATURES}"
   "${MATURIN_CMD[@]}" build --no-default-features \
