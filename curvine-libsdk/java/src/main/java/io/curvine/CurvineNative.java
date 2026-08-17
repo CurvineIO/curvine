@@ -25,8 +25,6 @@ import java.io.*;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
-import java.nio.file.Files;
-import java.nio.file.StandardCopyOption;
 import java.util.regex.Pattern;
 
 public class CurvineNative {
@@ -258,11 +256,31 @@ public class CurvineNative {
         try (final InputStream is = CurvineNative.class.getClassLoader().getResourceAsStream(libraryName)) {
             if (is == null) {
                 throw new RuntimeException(libraryName + " was not found inside JAR.");
-            } else {
-                Files.copy(is, temp.toPath(), StandardCopyOption.REPLACE_EXISTING);
             }
+            copyUninterruptibly(is, temp);
         }
         return temp.getAbsolutePath();
+    }
+
+    /**
+     * Copy with {@code java.io} so {@link Thread#interrupt()} cannot abort the write via
+     * {@link java.nio.channels.ClosedByInterruptException} the way {@code Files.copy} /
+     * {@code FileChannel} can. Deletes {@code dest} if the copy fails so a truncated
+     * library is not later treated as valid.
+     */
+    private static void copyUninterruptibly(InputStream in, File dest) throws IOException {
+        try (FileOutputStream out = new FileOutputStream(dest)) {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) >= 0) {
+                out.write(buf, 0, n);
+            }
+        } catch (IOException e) {
+            if (!dest.delete()) {
+                dest.deleteOnExit();
+            }
+            throw e;
+        }
     }
 
     public static File getWorkerDir() {
