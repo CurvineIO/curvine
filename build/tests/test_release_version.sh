@@ -44,6 +44,11 @@ EOF
 set_workspace_version "$TMP_DIR/Cargo.toml" "0.4.0-alpha"
 actual="$(get_workspace_version "$TMP_DIR/Cargo.toml")"
 [ "$actual" = "0.4.0-alpha" ] || fail "set_workspace_version result, got $actual"
+# Idempotent: setting the same version again must not touch the file
+before_cksum="$(cksum "$TMP_DIR/Cargo.toml" | awk '{print $1 $2}')"
+set_workspace_version "$TMP_DIR/Cargo.toml" "0.4.0-alpha"
+after_cksum="$(cksum "$TMP_DIR/Cargo.toml" | awk '{print $1 $2}')"
+[ "$before_cksum" = "$after_cksum" ] || fail "set_workspace_version rewrote an unchanged Cargo.toml"
 # Empty version must be rejected (subshell: ${":?} terminates the shell)
 if ( set +e; set_workspace_version "$TMP_DIR/Cargo.toml" "" ) >/dev/null 2>&1; then
   fail "expected empty version to fail"
@@ -73,6 +78,11 @@ actual="$(get_pom_version "$TMP_DIR/pom.xml")"
 [ "$actual" = "0.3.1-rc1" ] || fail "set_pom_version result, got $actual"
 # Dependency version must be untouched
 grep -q "<version>1.7.25</version>" "$TMP_DIR/pom.xml" || fail "dependency version was modified"
+# Idempotent: setting the same version again must not touch the file
+before_cksum="$(cksum "$TMP_DIR/pom.xml" | awk '{print $1 $2}')"
+set_pom_version "$TMP_DIR/pom.xml" "0.3.1-rc1"
+after_cksum="$(cksum "$TMP_DIR/pom.xml" | awk '{print $1 $2}')"
+[ "$before_cksum" = "$after_cksum" ] || fail "set_pom_version rewrote an unchanged pom.xml"
 
 # --- get_python_version / set_python_version --------------------------------
 cat > "$TMP_DIR/pyproject-static.toml" <<'EOF'
@@ -87,6 +97,11 @@ actual="$(get_python_version "$TMP_DIR/pyproject-static.toml")"
 set_python_version "$TMP_DIR/pyproject-static.toml" "0.4.0-alpha"
 actual="$(get_python_version "$TMP_DIR/pyproject-static.toml")"
 [ "$actual" = "0.4.0-alpha" ] || fail "set_python_version result, got $actual"
+# Idempotent: setting the same version again must not touch the file
+before_cksum="$(cksum "$TMP_DIR/pyproject-static.toml" | awk '{print $1 $2}')"
+set_python_version "$TMP_DIR/pyproject-static.toml" "0.4.0-alpha"
+after_cksum="$(cksum "$TMP_DIR/pyproject-static.toml" | awk '{print $1 $2}')"
+[ "$before_cksum" = "$after_cksum" ] || fail "set_python_version rewrote an unchanged pyproject.toml"
 
 # Dynamic pyproject has no static version to report
 cat > "$TMP_DIR/pyproject-dynamic.toml" <<'EOF'

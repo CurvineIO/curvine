@@ -65,14 +65,31 @@ tag_to_release_version() {
 set_workspace_version() {
   local cargo_toml="${1:?Cargo.toml path required}"
   local version="${2:?version required}"
-  awk -v new_version="$version" '
+  local current
+  current="$(get_workspace_version "$cargo_toml")" || {
+    echo "failed to read workspace version from $cargo_toml" >&2
+    return 1
+  }
+  if [ -z "$current" ]; then
+    echo "failed to resolve [workspace.package].version from $cargo_toml" >&2
+    return 1
+  fi
+  if [ "$current" = "$version" ]; then
+    return 0
+  fi
+  if ! awk -v new_version="$version" '
     /^\[[^]]*\]/ { in_workspace = ($0 ~ /^\[workspace\.package\]/) ? 1 : 0 }
     in_workspace && /^[[:space:]]*version[[:space:]]*=/ {
       sub(/^[[:space:]]*version[[:space:]]*=[[:space:]]*".*"/, "version = \"" new_version "\"")
       in_workspace = 0
     }
     { print }
-  ' "$cargo_toml" > "${cargo_toml}.tmp" && mv "${cargo_toml}.tmp" "$cargo_toml"
+  ' "$cargo_toml" > "${cargo_toml}.tmp"; then
+    rm -f "${cargo_toml}.tmp"
+    echo "failed to update workspace version in $cargo_toml" >&2
+    return 1
+  fi
+  mv "${cargo_toml}.tmp" "$cargo_toml"
   local actual
   if ! actual="$(get_workspace_version "$cargo_toml")"; then
     echo "failed to verify workspace version after update in $cargo_toml" >&2
@@ -106,14 +123,31 @@ get_pom_version() {
 set_pom_version() {
   local pom="${1:?pom.xml path required}"
   local version="${2:?version required}"
-  awk -v new_version="$version" '
+  local current
+  current="$(get_pom_version "$pom")" || {
+    echo "failed to read pom version from $pom" >&2
+    return 1
+  }
+  if [ -z "$current" ]; then
+    echo "failed to resolve project version from $pom" >&2
+    return 1
+  fi
+  if [ "$current" = "$version" ]; then
+    return 0
+  fi
+  if ! awk -v new_version="$version" '
     /<artifactId>/ { if (!seen_artifact) { seen_artifact = 1; artifact_line = NR } }
     seen_artifact && !done && NR > artifact_line && /<version>[^<]*<\/version>/ {
       sub(/<version>[^<]*<\/version>/, "<version>" new_version "</version>")
       done = 1
     }
     { print }
-  ' "$pom" > "${pom}.tmp" && mv "${pom}.tmp" "$pom"
+  ' "$pom" > "${pom}.tmp"; then
+    rm -f "${pom}.tmp"
+    echo "failed to update pom version in $pom" >&2
+    return 1
+  fi
+  mv "${pom}.tmp" "$pom"
   local actual
   if ! actual="$(get_pom_version "$pom")"; then
     echo "failed to verify pom version after update in $pom" >&2
@@ -149,14 +183,27 @@ get_python_version() {
 set_python_version() {
   local pyproject="${1:?pyproject.toml path required}"
   local version="${2:?version required}"
-  awk -v new_version="$version" '
+  local current
+  current="$(get_python_version "$pyproject")" || {
+    echo "failed to read python version from $pyproject" >&2
+    return 1
+  }
+  if [ "$current" = "$version" ]; then
+    return 0
+  fi
+  if ! awk -v new_version="$version" '
     /^\[[^]]*\]/ { in_project = ($0 ~ /^\[project\]/) ? 1 : 0 }
     in_project && /^version[[:space:]]*=/ {
       sub(/^[[:space:]]*version[[:space:]]*=[[:space:]]*".*/, "version = \"" new_version "\"")
       in_project = 0
     }
     { print }
-  ' "$pyproject" > "${pyproject}.tmp" && mv "${pyproject}.tmp" "$pyproject"
+  ' "$pyproject" > "${pyproject}.tmp"; then
+    rm -f "${pyproject}.tmp"
+    echo "failed to update python version in $pyproject" >&2
+    return 1
+  fi
+  mv "${pyproject}.tmp" "$pyproject"
   local actual
   if ! actual="$(get_python_version "$pyproject")"; then
     echo "failed to verify python version after update in $pyproject" >&2

@@ -35,7 +35,8 @@
 #   --dry-run          print the injection plan (what the release CI would
 #                      apply) without modifying any file
 #
-# Exit codes: 0 = consistent, 1 = mismatch or invalid tag.
+# Exit codes: 0 = consistent, 1 = mismatch or invalid tag, 2 = usage/argument
+# error or missing input file.
 
 set -euo pipefail
 
