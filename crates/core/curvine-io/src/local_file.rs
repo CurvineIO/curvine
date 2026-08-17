@@ -143,16 +143,21 @@ impl LocalFile {
 
         #[cfg(target_os = "linux")]
         let region = if enable_send_file {
-            DataSlice::IOSlice(RawIOSlice::new(
+            let region = DataSlice::IOSlice(RawIOSlice::new(
                 curvine_sys::get_raw_io(self)?,
                 Some(self.pos),
                 chunk as usize,
-            ))
+            ));
+            // sendfile consumes the explicit RawIOSlice offset later, so keep
+            // the logical device position in sync here.
+            self.pos += chunk;
+            region
         } else {
             DataSlice::Buffer(self.read_full(Some(self.pos), chunk as usize)?)
         };
 
-        self.pos += chunk;
+        // Buffered reads advance through read_full/read_all. Advancing again
+        // here would skip one chunk on every subsequent read.
         Ok(region)
     }
 

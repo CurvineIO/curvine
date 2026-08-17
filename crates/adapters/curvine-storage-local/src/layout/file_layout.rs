@@ -16,7 +16,7 @@ use crate::layout::{validate_open_offset, BlockLayout};
 use crate::{BlockMeta, BlockState};
 use crate::{BlockReadContext, BlockWriteContext, VfsDir};
 use curvine_core_error::{err_box, try_err, CommonResult};
-use curvine_io::{IOError, IOResult, LocalFile};
+use curvine_io::{IOResult, LocalFile};
 use curvine_model::ExtendedBlock;
 #[cfg(test)]
 use curvine_runtime::common::ByteUnit;
@@ -261,7 +261,12 @@ impl BlockLayout for FileLayout {
         off: i64,
         logical_len: i64,
     ) -> IOResult<BlockReadContext> {
-        let physical_len = meta.len;
+        let file = Self::block_file(dir, meta)?;
+        // Block metadata can briefly retain the pre-resize length while a new
+        // active generation is already published. The opened file is the
+        // source of truth for bytes that can be read physically.
+        let device = LocalFile::with_read(file, 0)?;
+        let physical_len = device.len();
         let logical_len = logical_len.max(physical_len);
         if off < 0 || off > logical_len {
             return err_box!(
@@ -270,12 +275,6 @@ impl BlockLayout for FileLayout {
                 logical_len
             );
         }
-        // Seek within the physical file; sparse logical tail is synthesized.
-        let device_off = off.min(physical_len);
-        let read_off = u64::try_from(device_off)
-            .map_err(|_| IOError::from(format!("Invalid read offset: {}", device_off)))?;
-        let file = Self::block_file(dir, meta)?;
-        let device = LocalFile::with_read(file, read_off)?;
         BlockReadContext::with_physical(device, 0, logical_len, physical_len, off)
     }
 

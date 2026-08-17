@@ -284,10 +284,20 @@ impl BlockReadContext {
             .read_region(enable_send_file, physical_chunk as i32)?;
         let got = region.len() as i64;
         if got != physical_chunk {
+            let live_len = self
+                .device
+                .as_local()
+                .and_then(|file| file.metadata().ok())
+                .map(|meta| meta.len() as i64);
             return err_box!(
-                "short physical read: expected {}, got {}",
+                "short physical read: expected {}, got {}, block_pos {}, device_pos {}, physical_len {}, device_len {}, live_len {:?}",
                 physical_chunk,
-                got
+                got,
+                self.block_pos,
+                self.device.pos(),
+                self.physical_len,
+                self.device.len(),
+                live_len
             );
         }
         self.block_pos += got;
@@ -304,7 +314,10 @@ impl BlockReadContext {
     }
 
     pub fn supports_send_file(&self) -> bool {
-        self.device.supports_send_file()
+        // Keep sparse sessions buffered even when the requested region is
+        // currently inside physical bytes. A deferred sendfile can otherwise
+        // race with block-generation replacement and expose pre-truncate data.
+        self.physical_len == self.block_size && self.device.supports_send_file()
     }
 
     pub fn as_local_mut(&mut self) -> Option<&mut LocalFile> {
@@ -347,6 +360,7 @@ mod tests {
         let device = shared_read_device(&path)?;
         // Physical file is 6 bytes; logical open length is 10 (post-resize inflate).
         let mut ctx = BlockReadContext::with_physical(device, 0, 10, 6, 4)?;
+        assert!(!ctx.supports_send_file());
         let region = ctx.read_region(false, 8)?;
         let bytes = match &region {
             DataSlice::Bytes(b) => &b[..],

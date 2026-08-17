@@ -727,12 +727,14 @@ impl Dataset for VfsDataset {
 
 #[cfg(test)]
 mod test {
-    use crate::{BlockMeta, BlockState};
     use crate::{
-        Dataset, DirList, DirState, FileLayout, SpdkMetaStore, StorageVersion, VfsDataset, VfsDir,
+        BlockLayout, Dataset, DirList, DirState, FileLayout, SpdkMetaStore, StorageVersion,
+        VfsDataset, VfsDir,
     };
+    use crate::{BlockMeta, BlockState};
     use curvine_config::{ClusterConf, WorkerConf};
     use curvine_core_error::CommonResult;
+    use curvine_io::DataSlice;
     use curvine_model::{ExtendedBlock, FileType, StorageType};
     use curvine_runtime::common::FileUtils;
     use curvine_runtime::sync::AtomicLong;
@@ -1101,6 +1103,31 @@ mod test {
         assert!(!staging_path.exists());
         Ok(())
     }
+
+    #[test]
+    fn file_reader_uses_open_file_length_when_metadata_is_stale() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "reader-stale-physical-len");
+        let mut block = ExtendedBlock::with_mem(1, "50B")?;
+        let writing = ds.open_block(&block)?;
+        ds.write_test_data(&writing, "20B")?;
+        block.len = 20;
+        let finalized = ds.finalize_block(&block)?;
+
+        let mut stale = finalized.clone();
+        stale.len = 50;
+        let dir = ds.find_dir(stale.dir_id())?;
+        let mut reader = FileLayout.open_reader(dir, &stale, 0, 50)?;
+        let region = reader.read_region(false, 50)?;
+        let bytes = match region {
+            DataSlice::Buffer(bytes) => bytes,
+            other => panic!("expected buffered sparse read, got {other:?}"),
+        };
+
+        assert_eq!(&bytes[..20], b"A".repeat(20).as_slice());
+        assert!(bytes[20..].iter().all(|byte| *byte == 0));
+        Ok(())
+    }
+
     #[test]
     fn remove_block_during_rewrite_deletes_active_and_staging_files() -> CommonResult<()> {
         let mut ds = create_data_set(true, "remove-during-rewrite");
