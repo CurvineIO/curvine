@@ -303,6 +303,15 @@ impl JournalEntry {
             | JournalEntry::Snapshot(_) => Vec::new(),
         }
     }
+
+    pub fn allocated_inode_id(&self) -> Option<i64> {
+        match self {
+            JournalEntry::Mkdir(e) => Some(e.dir.id),
+            JournalEntry::CreateFile(e) => Some(e.file.id),
+            JournalEntry::Symlink(e) => Some(e.new_inode.id),
+            _ => None,
+        }
+    }
 }
 
 impl CvMetadataChange {

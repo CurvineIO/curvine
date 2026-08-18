@@ -86,19 +86,31 @@ where
     V: DeserializeOwned + Sized + Serialize + Clone + Send + Sync + 'static,
 {
     async fn apply(&self, _: bool, msg: ApplyMsg) -> RaftResult<()> {
-        let entry = msg.take_entry();
-        let mut map = self.write()?;
-        let pairs: (K, V) = SerdeUtils::deserialize(&entry.data)?;
-        map.insert(pairs.0, pairs.1);
+        if matches!(msg, ApplyMsg::Scan(_)) {
+            return Ok(());
+        }
+        let (entry, ack) = msg.into_entry_with_ack()?;
+        let result = (|| -> RaftResult<()> {
+            let mut map = self.write()?;
+            let pairs: (K, V) = SerdeUtils::deserialize(&entry.data)?;
+            map.insert(pairs.0, pairs.1);
 
-        self.fsm_state.lock().unwrap().applied = AppliedIndex {
-            term: entry.term,
-            index: entry.index,
-            op_id: 0,
-            rpc_id: 0,
-        };
+            self.fsm_state.lock().unwrap().applied = AppliedIndex {
+                term: entry.term,
+                index: entry.index,
+                op_id: 0,
+                rpc_id: 0,
+            };
 
-        Ok(())
+            Ok(())
+        })();
+
+        if let Some(tx) = ack {
+            let _ = tx.send(result);
+            Ok(())
+        } else {
+            result
+        }
     }
 
     fn get_fsm_state(&self) -> FsmState {
@@ -188,21 +200,33 @@ where
     V: Serialize + DeserializeOwned + Clone + Sync + Send + 'static,
 {
     async fn apply(&self, _: bool, msg: ApplyMsg) -> RaftResult<()> {
-        let entry = msg.take_entry();
-        let db = self.lock()?;
-        let pairs: (K, V) = SerdeUtils::deserialize(&entry.data)?;
-        let k = SerdeUtils::serialize(&pairs.0)?;
-        let v = SerdeUtils::serialize(&pairs.1)?;
-        db.put(k, v)?;
+        if matches!(msg, ApplyMsg::Scan(_)) {
+            return Ok(());
+        }
+        let (entry, ack) = msg.into_entry_with_ack()?;
+        let result = (|| -> RaftResult<()> {
+            let db = self.lock()?;
+            let pairs: (K, V) = SerdeUtils::deserialize(&entry.data)?;
+            let k = SerdeUtils::serialize(&pairs.0)?;
+            let v = SerdeUtils::serialize(&pairs.1)?;
+            db.put(k, v)?;
 
-        self.fsm_state.lock().unwrap().applied = AppliedIndex {
-            term: entry.term,
-            index: entry.index,
-            op_id: 0,
-            rpc_id: 0,
-        };
+            self.fsm_state.lock().unwrap().applied = AppliedIndex {
+                term: entry.term,
+                index: entry.index,
+                op_id: 0,
+                rpc_id: 0,
+            };
 
-        Ok(())
+            Ok(())
+        })();
+
+        if let Some(tx) = ack {
+            let _ = tx.send(result);
+            Ok(())
+        } else {
+            result
+        }
     }
 
     fn get_fsm_state(&self) -> FsmState {

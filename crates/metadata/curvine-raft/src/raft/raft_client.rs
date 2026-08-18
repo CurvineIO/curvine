@@ -76,9 +76,15 @@ impl RaftClient {
     }
 
     // Send application layer messages.
-    pub async fn send_propose(&self, data: Vec<u8>) -> RaftResult<()> {
+    pub async fn send_propose_response(&self, data: Vec<u8>) -> RaftResult<ProposeResponse> {
         let req = ProposeRequest { data };
-        let _: ProposeResponse = self.leader_rpc(RaftCode::Propose, req).await?;
+        let response: ProposeResponse = self.leader_rpc(RaftCode::Propose, req).await?;
+        Ok(response)
+    }
+
+    // Send application layer messages.
+    pub async fn send_propose(&self, data: Vec<u8>) -> RaftResult<()> {
+        self.send_propose_response(data).await?;
         Ok(())
     }
 

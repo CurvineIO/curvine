@@ -82,6 +82,7 @@ message ProposeRequest {
 }
 
 message ProposeResponse {
+    optional uint64 applied_index = 1;
 }
 
 message RaftRequest {
