@@ -16,7 +16,8 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
     StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease, TransferListFilter,
-    TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTenantSummary,
+    TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTaskState,
+    TransferTenantSummary,
 };
 use std::time::Instant;
 
@@ -393,6 +394,22 @@ impl TransferStore for TransferStoreBackend {
             Self::Mysql(store) => {
                 store.list_stale_running_tasks(job_id, run_id, stale_before_ms, limit)
             }
+        })
+    }
+
+    fn list_tasks_by_state(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        state: TransferTaskState,
+        limit: usize,
+    ) -> FsResult<Vec<TransferTaskRecord>> {
+        self.record_store_operation("list_tasks_by_state", || match self {
+            Self::Memory(store) => store.list_tasks_by_state(job_id, run_id, state, limit),
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => store.list_tasks_by_state(job_id, run_id, state, limit),
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => store.list_tasks_by_state(job_id, run_id, state, limit),
         })
     }
 
