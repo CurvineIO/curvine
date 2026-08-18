@@ -20,9 +20,8 @@ use curvine_unified_fs::UnifiedFileSystem;
 use tokio::time::timeout;
 
 use crate::util::addr::{
-    fuse_metrics_instance, fuse_metrics_scrape_url, is_ip_literal, master_host_short_name,
-    master_metrics_scrape_url, worker_metrics_display_hostname, worker_metrics_instance,
-    worker_metrics_scrape_url,
+    fuse_metrics_instance, fuse_metrics_scrape_url, master_metrics_scrape_url,
+    worker_metrics_display_hostname, worker_metrics_instance, worker_metrics_scrape_url,
 };
 
 use super::model::{MetricTarget, ACTIVE_MASTER_INSTANCE};
@@ -143,10 +142,8 @@ pub fn discover_transfer_targets(conf: &ClusterConf) -> Vec<MetricTarget> {
     let configured = conf.transfer.hostname.trim();
     let hostname = if configured.is_empty() {
         "127.0.0.1".to_string()
-    } else if is_ip_literal(configured) {
-        configured.to_string()
     } else {
-        master_host_short_name(configured).to_string()
+        configured.to_string()
     };
     let instance = format!("{hostname}:{}", conf.transfer.web_port);
     let url = format!("http://{instance}/metrics");
@@ -429,5 +426,20 @@ mod tests {
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].instance, "10.0.0.9:9011");
         assert_eq!(targets[0].url, "http://10.0.0.9:9011/metrics");
+    }
+
+    #[test]
+    fn discovers_transfer_target_preserves_fqdn_host() {
+        let mut conf = test_conf();
+        conf.transfer.enabled = true;
+        conf.transfer.hostname = "cv-transfer-0.svc.local".to_string();
+        conf.transfer.web_port = 9011;
+        let targets = discover_transfer_targets(&conf);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].instance, "cv-transfer-0.svc.local:9011");
+        assert_eq!(
+            targets[0].url,
+            "http://cv-transfer-0.svc.local:9011/metrics"
+        );
     }
 }
