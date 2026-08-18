@@ -32,7 +32,8 @@ use curvine_server::master::journal::{
 };
 use curvine_server::master::{Master, MountManager};
 use log::info;
-use raft::eraftpb::Entry;
+use prost::Message;
+use raft::eraftpb::{ConfChange, Entry, EntryType};
 use raft::StateRole;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -139,6 +140,92 @@ fn leader_promotion_applies_committed_metadata_before_returning() -> CommonResul
     AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Leader).await })?;
 
     assert!(target_fs.file_status("/committed-before-promotion").is_ok());
+    Ok(())
+}
+
+#[test]
+fn leader_promotion_advances_applied_index_over_committed_noop() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let mut source_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    source_conf.change_test_meta_dir(format!("promotion-noop-source-{}", Utils::rand_str(6)));
+    let source_fs = JournalSystem::fs_only_for_test(&source_conf)?;
+    source_fs.mkdir("/before-noop", false)?;
+    let metadata_entry = source_fs
+        .fs_dir
+        .read()
+        .take_entries()
+        .into_iter()
+        .next()
+        .expect("mkdir must emit a journal entry");
+    let expected_op_id = metadata_entry.op_id();
+    let expected_rpc_id = metadata_entry.rpc_id();
+
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!("promotion-noop-target-{}", Utils::rand_str(6)));
+    let journal_system = JournalSystem::from_conf(&conf)?;
+    let loader = journal_system.journal_loader();
+
+    let mut batch = JournalBatch::new(1);
+    batch.push(metadata_entry);
+    journal_system.append_committed_entry_for_test(Entry {
+        term: 1,
+        index: 1,
+        data: SerdeUtils::serialize(&batch)?,
+        ..Default::default()
+    })?;
+    journal_system.append_committed_entry_for_test(Entry {
+        term: 1,
+        index: 2,
+        ..Default::default()
+    })?;
+
+    AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Leader).await })?;
+    // Queue a role change behind the leader UFS replay scan and wait for it as a barrier.
+    AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Follower).await })?;
+
+    let state = loader.get_fsm_state();
+    assert_eq!(state.applied.index, 2);
+    assert_eq!(state.applied.op_id, expected_op_id);
+    assert_eq!(state.applied.rpc_id, expected_rpc_id);
+    assert_eq!(state.ufs_applied.index, 2);
+    assert_eq!(state.ufs_applied.op_id, expected_op_id);
+    assert_eq!(state.ufs_applied.rpc_id, expected_rpc_id);
+    Ok(())
+}
+
+#[test]
+fn leader_promotion_advances_over_committed_configuration_entry() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!("promotion-conf-change-{}", Utils::rand_str(6)));
+    let journal_system = JournalSystem::from_conf(&conf)?;
+    let loader = journal_system.journal_loader();
+
+    journal_system.append_committed_entry_for_test(Entry {
+        term: 1,
+        index: 1,
+        entry_type: EntryType::EntryConfChange as i32,
+        data: ConfChange::default().encode_to_vec(),
+        ..Default::default()
+    })?;
+
+    AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Leader).await })?;
+    AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Follower).await })?;
+
+    let state = loader.get_fsm_state();
+    assert_eq!(state.applied.index, 1);
+    assert_eq!(state.ufs_applied.index, 1);
     Ok(())
 }
 

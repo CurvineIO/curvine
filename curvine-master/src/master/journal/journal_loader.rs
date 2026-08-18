@@ -32,7 +32,7 @@ use curvine_runtime::common::{FileUtils, TimeSpent};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel};
 use log::{debug, error, info, warn};
-use raft::eraftpb::Entry;
+use raft::eraftpb::{Entry, EntryType};
 use raft::StateRole;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -216,10 +216,6 @@ impl JournalLoader {
         entry: &Entry,
         skip_ufs_error: bool,
     ) -> CommonResult<()> {
-        if entry.data.is_empty() {
-            return Ok(());
-        }
-
         let cur = self.fsm_state_snapshot()?;
         let role_applied = ternary!(is_leader, cur.ufs_applied.index, cur.applied.index);
         if entry.index <= role_applied {
@@ -227,6 +223,20 @@ impl JournalLoader {
                 "skip entry index {}, term {}, fsm_state {:?}",
                 entry.index, entry.term, cur
             );
+            return Ok(());
+        }
+
+        // Empty leader no-ops and configuration entries have no metadata mutation,
+        // but still advance the committed apply high-water mark.
+        if entry.get_entry_type() != EntryType::EntryNormal || entry.data.is_empty() {
+            let mut applied = if is_leader {
+                cur.ufs_applied
+            } else {
+                cur.applied
+            };
+            applied.term = entry.term;
+            applied.index = entry.index;
+            self.set_applied(is_leader, applied, false)?;
             return Ok(());
         }
 

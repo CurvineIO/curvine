@@ -31,7 +31,10 @@ use curvine_runtime::common::{FileUtils, Logger, Utils};
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime, Runtime};
 use prost::bytes::BytesMut;
 use prost::Message;
-use raft::eraftpb::{ConfState, Entry, HardState, Message as RaftMessage, MessageType, Snapshot};
+use raft::eraftpb::{
+    ConfChange, ConfState, Entry, EntryType, HardState, Message as RaftMessage, MessageType,
+    Snapshot,
+};
 use raft::{Config, RawNode};
 use raft::{GetEntriesContext, RaftState, StateRole, Storage, StorageError};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -170,8 +173,10 @@ impl TestKvAppStorage {
     }
 
     fn apply_entry(&self, entry: Entry) -> RaftResult<()> {
-        let pair: (String, String) = SerdeUtils::deserialize(&entry.data)?;
-        self.map.write().unwrap().insert(pair.0, pair.1);
+        if entry.get_entry_type() == EntryType::EntryNormal && !entry.data.is_empty() {
+            let pair: (String, String) = SerdeUtils::deserialize(&entry.data)?;
+            self.map.write().unwrap().insert(pair.0, pair.1);
+        }
         self.fsm_state.lock().unwrap().applied = curvine_raft::proto::raft::AppliedIndex {
             term: entry.term,
             index: entry.index,
@@ -257,6 +262,16 @@ impl BlockingApplyAppStorage {
     }
 
     async fn apply_entry(&self, entry: Entry, wait: bool) -> RaftResult<()> {
+        if entry.get_entry_type() != EntryType::EntryNormal || entry.data.is_empty() {
+            self.fsm_state.lock().unwrap().applied = curvine_raft::proto::raft::AppliedIndex {
+                term: entry.term,
+                index: entry.index,
+                op_id: 0,
+                rpc_id: 0,
+            };
+            return Ok(());
+        }
+
         let pair: (String, String) = SerdeUtils::deserialize(&entry.data)?;
         self.started.store(true, Ordering::SeqCst);
         self.started_notify.notify_one();
@@ -456,6 +471,40 @@ fn malformed_propose_request_does_not_stop_raft_node() -> CommonResult<()> {
     Ok(())
 }
 
+#[test]
+fn committed_leader_noop_advances_app_storage_applied_index() -> CommonResult<()> {
+    Logger::default();
+
+    let mut conf = JournalConf::with_test();
+    conf.journal_dir = format!("../testing/leader-noop-{}", Utils::rand_id());
+    FileUtils::delete_path(&conf.journal_dir, true)?;
+
+    let rt = conf.create_runtime();
+    let store = TestKvAppStorage::default();
+    let raft = RaftJournal::new(
+        rt.clone(),
+        RocksLogStorage::from_conf(&conf, true),
+        store.clone(),
+        conf.clone(),
+        RoleMonitor::new(),
+    );
+    let mut listener = rt.block_on(raft.run())?;
+    rt.block_on(listener.wait_leader())?;
+
+    rt.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while store.get_fsm_state().applied.index == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("committed leader no-op should reach app storage");
+    });
+
+    FileUtils::delete_path(&conf.journal_dir, true)?;
+    Ok(())
+}
+
 /// AppStorage that already has local applied state and refuses empty snapshot installs.
 #[derive(Clone)]
 struct PopulatedRefuseEmptySnapshotAppStorage {
@@ -583,7 +632,7 @@ fn propose_response_waits_until_committed_entry_is_applied() -> CommonResult<()>
 }
 
 #[test]
-fn kv_app_storages_accept_scan_control_messages() -> CommonResult<()> {
+fn kv_app_storages_accept_non_data_entries() -> CommonResult<()> {
     let rt = AsyncRuntime::single();
     let applied = curvine_raft::proto::raft::AppliedIndex {
         term: 1,
@@ -593,11 +642,49 @@ fn kv_app_storages_accept_scan_control_messages() -> CommonResult<()> {
 
     let hash: HashAppStorage<String, String> = HashAppStorage::new();
     rt.block_on(hash.apply(true, ApplyMsg::new_scan(applied.clone())))?;
+    rt.block_on(hash.apply(
+        true,
+        ApplyMsg::new_entry(Entry {
+            term: 1,
+            index: 2,
+            ..Default::default()
+        }),
+    ))?;
+    rt.block_on(hash.apply(
+        true,
+        ApplyMsg::new_entry(Entry {
+            term: 1,
+            index: 3,
+            entry_type: EntryType::EntryConfChange as i32,
+            data: ConfChange::default().encode_to_vec(),
+            ..Default::default()
+        }),
+    ))?;
+    assert_eq!(hash.get_fsm_state().applied.index, 3);
 
     let dir = Utils::test_sub_dir(format!("rocks-app-storage-scan-{}", Utils::rand_id()));
     FileUtils::delete_path(&dir, true)?;
     let rocks: RocksAppStorage<String, String> = RocksAppStorage::new(&dir);
     rt.block_on(rocks.apply(true, ApplyMsg::new_scan(applied)))?;
+    rt.block_on(rocks.apply(
+        true,
+        ApplyMsg::new_entry(Entry {
+            term: 1,
+            index: 2,
+            ..Default::default()
+        }),
+    ))?;
+    rt.block_on(rocks.apply(
+        true,
+        ApplyMsg::new_entry(Entry {
+            term: 1,
+            index: 3,
+            entry_type: EntryType::EntryConfChange as i32,
+            data: ConfChange::default().encode_to_vec(),
+            ..Default::default()
+        }),
+    ))?;
+    assert_eq!(rocks.get_fsm_state().applied.index, 3);
     drop(rocks);
     FileUtils::delete_path(&dir, true)?;
 
