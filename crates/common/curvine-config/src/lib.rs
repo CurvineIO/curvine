@@ -15,7 +15,6 @@
 pub use curvine_error::{FsError, FsResult};
 
 pub const DEFAULT_HOSTNAME: &str = "localhost";
-pub const DEFAULT_FUSE_WEB_PORT: u16 = 9002;
 
 mod db_conf;
 pub use self::db_conf::DBConf;
