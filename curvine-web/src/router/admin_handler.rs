@@ -45,8 +45,8 @@ use curvine_error::{ErrorKind, FsError};
 use curvine_fs_api::{FileSystem, Path as FsPath, Reader, RpcCode, Writer};
 use curvine_job_client::{JobListOptions, JobMasterClient, TransferClient};
 use curvine_model::{
-    AccessMode, FileBlocks, FileStatus, JobSourceType, JobStatus, JobTaskState, LoadJobCommand,
-    FilesystemInfo, MountInfo, MountOptions, Provider, StorageState, StorageType, TransferCommand,
+    AccessMode, FileBlocks, FileStatus, FilesystemInfo, JobSourceType, JobStatus, JobTaskState,
+    LoadJobCommand, MountInfo, MountOptions, Provider, StorageState, StorageType, TransferCommand,
     TransferKind, TransferState, TtlAction, WorkerInfo, WriteType,
 };
 use curvine_net::net::InetAddr;
