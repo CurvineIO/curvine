@@ -41,7 +41,7 @@ fn main() -> CommonResult<()> {
     );
 
     let service = args.get_service()?;
-    let mut conf = args.get_conf()?;
+    let mut conf = args.get_conf(&service)?;
 
     Utils::set_panic_exit_hook();
 
@@ -101,8 +101,11 @@ impl ServerArgs {
         }
     }
 
-    pub fn get_conf(&self) -> CommonResult<ClusterConf> {
-        ClusterConf::from(&self.conf)
+    pub fn get_conf(&self, service: &ServiceType) -> CommonResult<ClusterConf> {
+        match service {
+            ServiceType::Transfer => ClusterConf::from_transfer(&self.conf),
+            ServiceType::Master | ServiceType::Worker => ClusterConf::from(&self.conf),
+        }
     }
 }
 
