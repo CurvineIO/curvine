@@ -1395,7 +1395,7 @@ impl fs::FileSystem for CurvineFileSystem {
         self.check_traverse_permissions(op.header.nodeid, op.header)
             .await?;
 
-        let status = self.state.fs_stat(op.header.nodeid, None).await?;
+        let status = self.state.fs_stat_guarded(op.header.nodeid).await?;
 
         let mut fuse_attr = FuseUtils::status_to_attr(&self.conf, &status)?;
         fuse_attr.ino = op.header.nodeid;
@@ -1975,6 +1975,7 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
         self.ensure_writable_path(&path, RpcCode::Delete).await?;
 
+        let _guard = self.state.lock_path(&path).await;
         self.fs.delete(&path, false).await?;
         self.state.unlink(op.header.nodeid, name, false)?;
         self.state

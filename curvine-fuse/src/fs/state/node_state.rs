@@ -692,6 +692,7 @@ impl NodeState {
             let dir = self.dir_read();
             dir.get_path_name(parent, name)?
         };
+        let _guard = self.lock_path(&path).await;
 
         let ino = {
             let dir = self.dir_read();
@@ -1015,7 +1016,22 @@ impl NodeState {
         None
     }
 
+    fn unlinked_status(&self, ino: u64) -> Option<FileStatus> {
+        let dir = self.dir_read();
+        dir.get_inode(ino, None)
+            .filter(|inode| inode.is_unlinked())
+            .map(|inode| inode.clone_status())
+    }
+
     pub async fn fs_stat(&self, ino: u64, name: Option<&str>) -> FuseResult<FileStatus> {
+        // An unlinked inode can remain addressable by nodeid until the kernel
+        // releases its lookup/open references. Its former path no longer exists.
+        if name.is_none() {
+            if let Some(status) = self.unlinked_status(ino) {
+                return Ok(status);
+            }
+        }
+
         if let Some(status) = self.get_cached_status(ino, name, false)? {
             return Ok(status);
         }
@@ -1025,6 +1041,25 @@ impl NodeState {
 
         self.cache_resolved_status(ino, name, &status);
 
+        Ok(status)
+    }
+
+    pub async fn fs_stat_guarded(&self, ino: u64) -> FuseResult<FileStatus> {
+        if let Some(status) = self.unlinked_status(ino) {
+            return Ok(status);
+        }
+        if let Some(status) = self.get_cached_status(ino, None, false)? {
+            return Ok(status);
+        }
+
+        let path = self.get_path(ino)?;
+        let _guard = self.lock_path(&path).await;
+        if let Some(status) = self.unlinked_status(ino) {
+            return Ok(status);
+        }
+
+        let status = self.fs.get_status(&path).await?;
+        self.cache_resolved_status(ino, None, &status);
         Ok(status)
     }
 
@@ -1619,6 +1654,53 @@ mod test {
             .get_cached_status(FUSE_ROOT_ID, None, false)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn guarded_fs_stat_observes_concurrent_directory_unlink() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.block_on(async {
+            let mut conf = ClusterConf::default();
+            conf.fuse.enable_meta_cache = true;
+            conf.fuse.metrics_enabled = false;
+            let fs = UnifiedFileSystem::with_rt(conf, rt.clone()).unwrap();
+            let state = Arc::new(NodeState::new(fs).unwrap());
+
+            let ino = {
+                let mut dir = state.dir_write();
+                let mut status = FileStatus::with_name(42, "gone".to_string(), true);
+                status.mode = 0o755;
+                status.nlink = 2;
+                let ino = dir.lookup(FUSE_ROOT_ID, "gone", status, true).unwrap().ino;
+                dir.get_inode_mut_check(ino, None).unwrap().invalid_cache();
+                ino
+            };
+
+            let path = state.get_path(ino).unwrap();
+            let guard = state.lock_path(&path).await;
+            let task_state = state.clone();
+            let stat_task = tokio::spawn(async move { task_state.fs_stat_guarded(ino).await });
+            tokio::task::yield_now().await;
+
+            state
+                .dir_write()
+                .unlink(FUSE_ROOT_ID, "gone", false)
+                .unwrap();
+            drop(guard);
+
+            let status = stat_task.await.unwrap().unwrap();
+            assert!(status.is_dir);
+            assert_eq!(status.mode, 0o755);
+            assert_eq!(status.nlink, 1);
+            assert_eq!(
+                state
+                    .dir_read()
+                    .get_inode_check(ino, None)
+                    .unwrap()
+                    .n_lookup,
+                1
+            );
+        });
     }
 
     #[test]

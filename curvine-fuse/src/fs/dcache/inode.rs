@@ -177,6 +177,10 @@ impl Inode {
         self.n_lookup == 0 && self.ref_ctr == 0 && !self.is_root()
     }
 
+    pub fn is_unlinked(&self) -> bool {
+        self.ref_ctr == 0 && !self.is_root()
+    }
+
     pub fn sub_link(&mut self, v: u32) {
         self.nlink = self.nlink.saturating_sub(v);
     }
