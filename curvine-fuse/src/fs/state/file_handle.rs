@@ -23,7 +23,6 @@ use crate::{err_fuse, FuseResult};
 use curvine_core_error::err_box;
 use curvine_fs_api::{StateReader, StateWriter};
 use curvine_model::{CreateFileOpts, FileAllocOpts, FileStatus, LockFlags, OpenFlags};
-use curvine_sys::RawPtr;
 use std::sync::Arc;
 
 #[allow(clippy::large_enum_variant)]
@@ -39,7 +38,7 @@ impl FileHandle {
     pub fn new_backend(
         ino: u64,
         fh: u64,
-        reader: Option<RawPtr<FuseReader>>,
+        reader: Option<Arc<FuseReader>>,
         writer: Option<Arc<FuseWriter>>,
         status: FileStatus,
     ) -> Self {
