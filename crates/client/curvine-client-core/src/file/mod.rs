@@ -18,6 +18,9 @@ pub use self::curvine_filesystem::*;
 mod fs_client;
 pub use self::fs_client::FsClient;
 
+mod handshake;
+pub use self::handshake::MasterHandshake;
+
 mod fs_writer_base;
 pub use self::fs_writer_base::FsWriterBase;
 

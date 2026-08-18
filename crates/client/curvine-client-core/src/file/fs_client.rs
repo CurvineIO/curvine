@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::client_context::ClientContext;
-use crate::file::FsContext;
+use crate::file::{FsContext, MasterHandshake};
 use bytes::BytesMut;
 use curvine_config::{ClientConf, ClusterConf, UfsConf, UfsConfBuilder};
 use curvine_core_error::err_box;
@@ -26,6 +26,7 @@ use curvine_proto::*;
 use curvine_rpc::client::ClusterConnector;
 use curvine_rpc::message::{Message, MessageBuilder};
 use curvine_runtime::runtime::RpcRuntime;
+use log::warn;
 use prost::Message as PMessage;
 use std::collections::LinkedList;
 use std::sync::Arc;
@@ -114,6 +115,29 @@ impl_without_client_context!(
     WorkerHeartbeatRequest,
 );
 
+/// RAII guard for a claimed one-time handshake report. Resets the claim when
+/// dropped without being committed, so a cancelled or failed in-flight
+/// `GetFilesystemInfo` future never permanently suppresses `component_info`
+/// reporting.
+struct HandshakeReportGuard<'a> {
+    context: &'a FsContext,
+    committed: bool,
+}
+
+impl HandshakeReportGuard<'_> {
+    /// Mark the report as delivered; the one-time claim stays set.
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for HandshakeReportGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.context.reset_handshake_report();
+        }
+    }
+}
 impl FsClient {
     pub fn new(context: Arc<FsContext>) -> Self {
         let connector = context.connector.clone();
@@ -624,15 +648,88 @@ impl FsClient {
     }
 
     pub async fn get_filesystem_info(&self) -> FsResult<FilesystemInfo> {
-        let header = GetFilesystemInfoRequest::default();
-        let rep: GetFilesystemInfoResponse = self.rpc(RpcCode::GetFilesystemInfo, header).await?;
-        let res = ProtoUtils::filesystem_info_from_pb(rep);
-        Ok(res)
+        // Attach this client's component_info only on the first
+        // GetFilesystemInfo per session (the handshake). GetFilesystemInfo
+        // backs FUSE statfs and may be called frequently by the kernel, so
+        // later calls omit the payload; the response is still parsed and
+        // cached on every call. Legacy masters skip the unknown field and
+        // legacy clients omit it entirely.
+        let (header, mut guard) = self.get_filesystem_info_request();
+        let rep: GetFilesystemInfoResponse =
+            self.raw_rpc(RpcCode::GetFilesystemInfo, header).await?;
+        // The report reached the master: keep the one-time claim. On error or
+        // cancellation the guard's drop resets it so a later call can report.
+        guard.commit();
+        // Cache the master's advertised version / protocol / capabilities; a
+        // master without a compatibility contract is recorded as legacy and
+        // never rejected.
+        self.context
+            .set_master_handshake(MasterHandshake::from_response(&rep));
+        Ok(ProtoUtils::filesystem_info_from_pb(rep))
+    }
+
+    /// Client-master version handshake: report this client's `component_info`
+    /// and cache the master's advertised version / protocol / capabilities.
+    /// Returns the cached handshake; a master without a compatibility
+    /// contract is reported as a legacy peer and is never rejected.
+    pub async fn handshake(&self) -> FsResult<MasterHandshake> {
+        let _ = self.get_filesystem_info().await?;
+        // Mark the one-time lazy handshake as done so the first ordinary RPC
+        // does not re-run it (FUSE mount performs this eagerly at startup).
+        self.context.mark_handshake_started();
+        Ok(self.master_handshake())
+    }
+
+    /// Cached master handshake (version / protocol / capabilities). Before the
+    /// first handshake and against legacy masters this reports a legacy peer,
+    /// which is never rejected.
+    pub fn master_handshake(&self) -> MasterHandshake {
+        self.context.master_handshake()
+    }
+
+    /// Build the client's own `component_info` payload for the handshake.
+    fn handshake_request_component_info() -> ComponentInfoProto {
+        ProtoUtils::component_version_to_pb(&curvine_sys::version::component_version("client"))
+    }
+
+    /// Build a `GetFilesystemInfo` request, attaching this client's
+    /// `component_info` only on the first call per session (the handshake).
+    /// Both the typed and the raw-bytes RPC paths share this so every
+    /// GetFilesystemInfo caller reports the client version exactly once;
+    /// frequent statfs queries stay lean. The returned guard holds the claim
+    /// and resets it on drop unless committed, so a cancelled or failed
+    /// in-flight request never permanently suppresses reporting.
+    fn get_filesystem_info_request(&self) -> (GetFilesystemInfoRequest, HandshakeReportGuard<'_>) {
+        let report_component = self.context.claim_handshake_report();
+        let header = if report_component {
+            GetFilesystemInfoRequest {
+                component_info: Some(Self::handshake_request_component_info()),
+            }
+        } else {
+            GetFilesystemInfoRequest::default()
+        };
+        let guard = HandshakeReportGuard {
+            context: &self.context,
+            committed: !report_component,
+        };
+        (header, guard)
     }
 
     pub async fn get_filesystem_info_bytes(&self) -> FsResult<BytesMut> {
-        let header = GetFilesystemInfoRequest::default();
-        self.rpc_bytes(RpcCode::GetFilesystemInfo, header).await
+        let (header, mut guard) = self.get_filesystem_info_request();
+        let bytes = self
+            .raw_rpc_bytes(RpcCode::GetFilesystemInfo, header)
+            .await?;
+        guard.commit();
+        // Decode the response so bytes-only callers (e.g. SDK paths) also
+        // cache the master's compatibility contract instead of staying at the
+        // default legacy handshake. Best-effort: the raw bytes are returned
+        // regardless.
+        if let Ok(rep) = GetFilesystemInfoResponse::decode(bytes.as_ref()) {
+            self.context
+                .set_master_handshake(MasterHandshake::from_response(&rep));
+        }
+        Ok(bytes)
     }
 
     pub async fn set_worker_status(
@@ -840,6 +937,15 @@ impl FsClient {
         T: PMessage + WithClientContext,
         R: PMessage + Default,
     {
+        // Best-effort one-time handshake before the first ordinary master RPC
+        // so every client path (CLI, SDK, data-transfer, direct
+        // CurvineFileSystem/UnifiedFileSystem users) reports component_info
+        // and caches the master's compatibility contract, not only FUSE
+        // mount. GetFilesystemInfo is the handshake itself and must not
+        // recurse.
+        if code != RpcCode::GetFilesystemInfo {
+            self.ensure_handshake().await;
+        }
         let msg = Self::build_rpc_message(code, header);
         let rep = self.connector.rpc::<FsError>(msg).await?;
         rep.parse_header().map_err(Into::into)
@@ -850,12 +956,57 @@ impl FsClient {
         code: RpcCode,
         header: impl PMessage + WithClientContext,
     ) -> FsResult<BytesMut> {
+        if code != RpcCode::GetFilesystemInfo {
+            self.ensure_handshake().await;
+        }
         let msg = Self::build_rpc_message(code, header);
-
         let msg = self.connector.rpc::<FsError>(msg).await?;
         match msg.header {
             None => Ok(BytesMut::new()),
             Some(v) => Ok(v),
+        }
+    }
+
+    /// Raw typed master RPC without the lazy handshake guard; the handshake
+    /// itself (GetFilesystemInfo) uses this to avoid recursing into
+    /// [`Self::ensure_handshake`].
+    async fn raw_rpc<T, R>(&self, code: RpcCode, header: T) -> FsResult<R>
+    where
+        T: PMessage + Default,
+        R: PMessage + Default,
+    {
+        self.connector
+            .proto_rpc::<T, R, FsError>(code, header)
+            .await
+    }
+
+    /// Raw bytes master RPC without the lazy handshake guard; see
+    /// [`Self::raw_rpc`].
+    async fn raw_rpc_bytes(&self, code: RpcCode, header: impl PMessage) -> FsResult<BytesMut> {
+        let msg = MessageBuilder::new_rpc(code).proto_header(header).build();
+        let msg = self.connector.rpc::<FsError>(msg).await?;
+        match msg.header {
+            None => Ok(BytesMut::new()),
+            Some(v) => Ok(v),
+        }
+    }
+
+    /// Run the client-master handshake once per session before the first
+    /// ordinary master RPC, best-effort: a failure only logs a warning and
+    /// the caller's RPC proceeds with legacy assumptions (nothing is ever
+    /// rejected by default). Skipped when a GetFilesystemInfo request already
+    /// went out (the typed/bytes paths populate the same cache).
+    async fn ensure_handshake(&self) {
+        if self.context.handshake_started() || self.context.handshake_reported() {
+            return;
+        }
+        let _guard = self.context.handshake_lock().lock().await;
+        if self.context.handshake_started() || self.context.handshake_reported() {
+            return;
+        }
+        self.context.mark_handshake_started();
+        if let Err(e) = self.handshake().await {
+            warn!("client-master handshake failed: {e}; continuing with legacy assumptions");
         }
     }
 
@@ -941,5 +1092,41 @@ mod tests {
         assert!(!context.tags.contains_key("access_token"));
 
         ClientContext::clear_current();
+    }
+
+    use curvine_proto::GetFilesystemInfoRequest;
+
+    #[test]
+    fn handshake_request_carries_client_component_info() {
+        // A new client reports its own structured version during the
+        // handshake so the master can diagnose mixed-version clusters.
+        let info = FsClient::handshake_request_component_info();
+        let req = GetFilesystemInfoRequest {
+            component_info: Some(info),
+        };
+
+        let encoded = req.encode_to_vec();
+        let decoded = GetFilesystemInfoRequest::decode(encoded.as_slice()).unwrap();
+        let decoded_info = decoded.component_info.unwrap();
+        assert_eq!(decoded_info.component.as_deref(), Some("client"));
+        assert_eq!(decoded_info.protocol_version, Some(1));
+        assert_eq!(decoded_info.min_protocol_version, Some(1));
+    }
+
+    #[test]
+    fn handshake_request_is_backward_compatible() {
+        // The request only adds an optional field on the reserved 1000+ range:
+        // a legacy master's view of the message (no component_info) must
+        // decode the payload and ignore the unknown field.
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        struct LegacyGetFilesystemInfoRequest {}
+
+        let req = GetFilesystemInfoRequest {
+            component_info: Some(FsClient::handshake_request_component_info()),
+        };
+        let encoded = req.encode_to_vec();
+
+        let legacy = LegacyGetFilesystemInfoRequest::decode(encoded.as_slice()).unwrap();
+        assert_eq!(legacy, LegacyGetFilesystemInfoRequest {});
     }
 }

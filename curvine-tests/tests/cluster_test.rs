@@ -96,3 +96,133 @@ async fn write(fs: &CurvineFileSystem, path: &Path) -> CommonResult<FileBlocks> 
     let locs = fs.get_block_locations(path).await?;
     Ok(locs)
 }
+
+#[test]
+fn test_client_master_handshake_on_cluster() -> CommonResult<()> {
+    // New client handshake against a new master: the client reports its own
+    // component_info and caches the master's advertised version / protocol /
+    // capabilities from the GetFilesystemInfo compatibility contract.
+    let testing = Testing::builder().default().build()?;
+    testing.start_cluster()?;
+    let conf = testing.get_active_cluster_conf()?;
+
+    let rt = Arc::new(AsyncRuntime::single());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+
+    rt.block_on(async move {
+        let info = fs.get_filesystem_info().await?;
+        assert!(!info.active_master.is_empty());
+
+        let hs = fs.master_handshake();
+        assert!(
+            !hs.is_legacy(),
+            "a new master must advertise a compatibility contract"
+        );
+        let compat = hs
+            .compatibility()
+            .expect("master compatibility must be cached after the handshake");
+        assert_eq!(compat.server.component.as_deref(), Some("master"));
+        assert_eq!(hs.protocol_version(), Some(1));
+        assert_eq!(hs.min_protocol_version(), Some(1));
+        assert_eq!(
+            hs.compatibility_mode(),
+            curvine_model::proto::CompatibilityModeProto::Diagnose
+        );
+
+        // A second handshake is idempotent and keeps the cached contract;
+        // component_info is reported only once per session (the flag is
+        // already claimed), which also keeps statfs queries lean.
+        let hs2 = fs.handshake().await?;
+        assert_eq!(hs2.compatibility(), hs.compatibility());
+        Ok::<(), CommonError>(())
+    })?;
+
+    Ok(())
+}
+
+#[test]
+fn test_client_handshake_accepts_legacy_master_response() -> CommonResult<()> {
+    // Legacy master + new client: a response without a compatibility contract
+    // (a legacy master encodes only business fields and none of the reserved
+    // 1000+ handshake fields) must be treated as a legacy peer and never
+    // rejected. The client-side parsing the FsClient runs after every
+    // GetFilesystemInfo RPC is fed the same response shape a legacy master
+    // produces; wire-level decode of such a payload is covered by the proto
+    // compat tests in curvine-proto.
+    use curvine_client::file::MasterHandshake;
+    use curvine_model::proto::GetFilesystemInfoResponse;
+
+    let legacy_response = GetFilesystemInfoResponse {
+        active_master: "old-master".to_string(),
+        ..Default::default()
+    };
+    assert!(legacy_response.compatibility.is_none());
+
+    let hs = MasterHandshake::from_response(&legacy_response);
+    assert!(hs.is_legacy());
+    assert!(hs.compatibility().is_none());
+    assert!(hs.master_version().is_none());
+    assert_eq!(
+        hs.compatibility_mode(),
+        curvine_model::proto::CompatibilityModeProto::Diagnose
+    );
+    Ok(())
+}
+
+#[test]
+fn test_bytes_first_get_filesystem_info_caches_handshake() -> CommonResult<()> {
+    // Bytes-first regression: the raw-bytes GetFilesystemInfo path is the
+    // very first master RPC of the session and must still cache the master's
+    // compatibility contract (not stay at the default legacy handshake).
+    let testing = Testing::builder().default().build()?;
+    testing.start_cluster()?;
+    let conf = testing.get_active_cluster_conf()?;
+
+    let rt = Arc::new(AsyncRuntime::single());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+
+    rt.block_on(async move {
+        let bytes = fs.fs_client().get_filesystem_info_bytes().await?;
+        assert!(!bytes.is_empty());
+
+        let hs = fs.master_handshake();
+        assert!(
+            !hs.is_legacy(),
+            "bytes-first GetFilesystemInfo must cache the handshake"
+        );
+        assert!(hs.compatibility().is_some());
+        assert_eq!(hs.protocol_version(), Some(1));
+        Ok::<(), CommonError>(())
+    })?;
+
+    Ok(())
+}
+
+#[test]
+fn test_lazy_handshake_before_first_ordinary_rpc() -> CommonResult<()> {
+    // A session that goes straight to an ordinary master RPC (no explicit
+    // GetFilesystemInfo) must still run the handshake once before the first
+    // RPC and cache the master's compatibility contract.
+    let testing = Testing::builder().default().build()?;
+    testing.start_cluster()?;
+    let conf = testing.get_active_cluster_conf()?;
+
+    let rt = Arc::new(AsyncRuntime::single());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+
+    rt.block_on(async move {
+        let path = Path::from_str("/lazy_handshake_test")?;
+        fs.mkdir(&path, true).await.map_err(CommonError::from)?;
+
+        let hs = fs.master_handshake();
+        assert!(
+            !hs.is_legacy(),
+            "first ordinary master RPC must run the handshake"
+        );
+        assert!(hs.compatibility().is_some());
+        assert_eq!(hs.protocol_version(), Some(1));
+        Ok::<(), CommonError>(())
+    })?;
+
+    Ok(())
+}

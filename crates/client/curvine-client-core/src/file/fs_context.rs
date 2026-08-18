@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::block::{BlockClient, BlockClientPool};
-use crate::file::FsClient;
+use crate::file::{FsClient, MasterHandshake};
 use crate::ClientMetrics;
 use curvine_config::ClusterConf;
 use curvine_error::FsResult;
@@ -26,6 +26,7 @@ use curvine_proto::ClientAddressProto;
 use curvine_rpc::client::{ClientConf, ClusterConnector};
 use curvine_runtime::common::{TimeSpent, Utils};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use curvine_runtime::sync::FastRwLock;
 use fxhash::FxHasher;
 use log::warn;
 use moka::policy::EvictionPolicy;
@@ -33,6 +34,7 @@ use moka::sync::{Cache, CacheBuilder};
 use once_cell::sync::OnceCell;
 use std::future::Future;
 use std::hash::BuildHasherDefault;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -49,6 +51,25 @@ pub struct FsContext {
     pub(crate) os_cache: CacheManager,
     pub(crate) failed_workers: Cache<u32, WorkerAddress, BuildHasherDefault<FxHasher>>,
     pub(crate) block_pool: Arc<BlockClientPool>,
+    // Client-master handshake result: the master's advertised version /
+    // protocol / capabilities (or a legacy marker when the master does not
+    // advertise a compatibility contract). Populated by the first
+    // GetFilesystemInfo call and shared by every FsClient clone. Stored
+    // inline: FsContext itself is only ever shared behind an `Arc`, so the
+    // interior-mutable FastRwLock needs no extra heap allocation.
+    master_handshake: FastRwLock<MasterHandshake>,
+    // Whether this session has already reported its component_info to the
+    // master. Handshake metadata is sent once per mount/session; the flag
+    // keeps GetFilesystemInfo (which backs FUSE statfs and may be called
+    // frequently) from carrying the payload on every request.
+    handshake_reported: AtomicBool,
+    // Guards the one-time lazy handshake: the first ordinary master RPC of a
+    // session runs the client-master handshake first (best-effort), so every
+    // client path (CLI, SDK, data-transfer, FUSE, direct
+    // CurvineFileSystem/UnifiedFileSystem users) reports component_info and
+    // caches the master's compatibility contract — not only FUSE mount.
+    handshake_lock: tokio::sync::Mutex<()>,
+    handshake_started: AtomicBool,
 }
 
 impl FsContext {
@@ -102,12 +123,70 @@ impl FsContext {
             os_cache,
             failed_workers: exclude_workers,
             block_pool,
+            master_handshake: FastRwLock::new(MasterHandshake::default()),
+            handshake_reported: AtomicBool::new(false),
+            handshake_lock: tokio::sync::Mutex::new(()),
+            handshake_started: AtomicBool::new(false),
         };
         Ok(context)
     }
 
     pub fn clone_client_name(&self) -> String {
         self.client_addr.client_name.clone()
+    }
+
+    /// Cache the master's advertised version / protocol / capabilities from
+    /// the client-master handshake. A master without a compatibility contract
+    /// is recorded as legacy and never rejected.
+    pub fn set_master_handshake(&self, handshake: MasterHandshake) {
+        *self.master_handshake.write() = handshake;
+    }
+
+    /// Cached master handshake. Defaults to a legacy peer before the first
+    /// successful handshake so no component is rejected by default.
+    pub fn master_handshake(&self) -> MasterHandshake {
+        self.master_handshake.read().clone()
+    }
+
+    /// Atomically claim the one-time right to attach this client's
+    /// `component_info` to a `GetFilesystemInfo` request. Returns `true` only
+    /// for the first caller per session, so handshake metadata is reported
+    /// once and frequent statfs queries stay lean. On a failed RPC the caller
+    /// should call [`Self::reset_handshake_report`] so a later retry can
+    /// still report.
+    pub(crate) fn claim_handshake_report(&self) -> bool {
+        !self.handshake_reported.swap(true, Ordering::Relaxed)
+    }
+
+    /// Allow a later `GetFilesystemInfo` call to report the handshake again
+    /// (used when the first reporting request failed before reaching the
+    /// master).
+    pub(crate) fn reset_handshake_report(&self) {
+        self.handshake_reported.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether a `GetFilesystemInfo` request has already gone out this session
+    /// (component_info reported once). Lets the lazy handshake skip re-running
+    /// when the typed/bytes GetFilesystemInfo path already populated the
+    /// cache.
+    pub(crate) fn handshake_reported(&self) -> bool {
+        self.handshake_reported.load(Ordering::Relaxed)
+    }
+
+    /// Lock guarding the one-time lazy handshake execution.
+    pub(crate) fn handshake_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.handshake_lock
+    }
+
+    /// Whether the one-time lazy handshake has already been attempted.
+    pub(crate) fn handshake_started(&self) -> bool {
+        self.handshake_started.load(Ordering::Relaxed)
+    }
+
+    /// Mark the one-time lazy handshake as attempted (used by the explicit
+    /// `handshake()` so the first ordinary RPC does not re-run it).
+    pub(crate) fn mark_handshake_started(&self) {
+        self.handshake_started.store(true, Ordering::Relaxed);
     }
 
     pub fn conf(&self) -> &ClusterConf {
