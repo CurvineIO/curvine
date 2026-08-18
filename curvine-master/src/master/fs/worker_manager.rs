@@ -22,6 +22,7 @@ use curvine_model::{
     BlockLocation, ExtendedBlock, HeartbeatStatus, LocatedBlock, StorageInfo, StorageType,
     TransferWorkerCapabilities, WorkerAddress, WorkerCommand, WorkerInfo, WorkerStatus,
 };
+use curvine_proto::ComponentInfoProto;
 use curvine_runtime::common::ByteUnit;
 use log::{info, warn};
 use std::collections::HashSet;
@@ -60,6 +61,7 @@ impl WorkerManager {
         software_version: String,
         startup_time_ms: u64,
         storages: Vec<StorageInfo>,
+        component_info: Option<ComponentInfoProto>,
     ) -> FsResult<Vec<WorkerCommand>> {
         // The cluster id must match to prevent misregistration.
         if cluster_id != self.cluster_id {
@@ -106,6 +108,7 @@ impl WorkerManager {
             software_version,
             startup_time_ms,
             storages,
+            component_info,
         )?;
         Ok(cmds)
     }

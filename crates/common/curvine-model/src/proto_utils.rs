@@ -382,6 +382,7 @@ impl ProtoUtils {
             transfer_source_read_plan: Some(src.transfer_capabilities.source_read_plan),
             software_version: Some(src.software_version),
             startup_time_ms: Some(src.startup_time_ms),
+            component_info: src.component_info,
             storage_map: Default::default(),
         };
 
@@ -471,6 +472,7 @@ impl ProtoUtils {
                 storage_map,
                 software_version: info.software_version.unwrap_or_default(),
                 startup_time_ms: info.startup_time_ms.unwrap_or_default(),
+                component_info: info.component_info,
             };
             vec.push(worker_info);
         }
