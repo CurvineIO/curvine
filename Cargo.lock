@@ -2490,6 +2490,7 @@ dependencies = [
  "curvine-sys",
  "curvine-ufs-api",
  "curvine-unified-fs",
+ "curvine-web",
  "dashmap 5.5.3",
  "futures",
  "glob",
@@ -2504,6 +2505,7 @@ dependencies = [
  "raft",
  "rand 0.8.5",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
 ]
