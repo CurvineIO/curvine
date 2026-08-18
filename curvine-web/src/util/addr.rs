@@ -317,6 +317,24 @@ pub fn master_metrics_scrape_url(conf: &ClusterConf, active_master: &str) -> Str
     )
 }
 
+/// HTTP URL for master overview / lightweight runtime probes.
+pub fn master_overview_scrape_url(conf: &ClusterConf, master_addr: &str) -> String {
+    format!(
+        "http://{}:{}/api/overview",
+        resolve_master_scrape_hostname(conf, master_addr),
+        master_scrape_web_port(conf, master_addr)
+    )
+}
+
+/// HTTP URL for master `/api/v1/master/runtime` (version + start_time).
+pub fn master_runtime_scrape_url(conf: &ClusterConf, master_addr: &str) -> String {
+    format!(
+        "http://{}:{}/api/v1/master/runtime",
+        resolve_master_scrape_hostname(conf, master_addr),
+        master_scrape_web_port(conf, master_addr)
+    )
+}
+
 fn docker_container_ip(hostname: &str) -> Option<String> {
     let name = hostname.trim();
     if name.is_empty() {
@@ -614,6 +632,14 @@ mod tests {
         );
         let url = master_metrics_scrape_url(&conf, "cv-master-2:8995");
         assert_eq!(url, "http://cv-master-2:29000/metrics");
+        assert_eq!(
+            master_runtime_scrape_url(&conf, "cv-master-2:8995"),
+            "http://cv-master-2:29000/api/v1/master/runtime"
+        );
+        assert_eq!(
+            master_overview_scrape_url(&conf, "cv-master-2:8995"),
+            "http://cv-master-2:29000/api/overview"
+        );
         assert!(!url.contains(":9000/metrics"));
         assert!(!url.contains("127.0.0.1"));
     }

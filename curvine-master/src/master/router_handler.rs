@@ -142,11 +142,14 @@ async fn overview(
     }
 
     let master_state = format!("{:?}", fs.master_monitor.journal_state());
+    let master_version = curvine_sys::version::component_version("master");
 
     let res = Json(json!({
         "cluster_id": conf.cluster_id,
         "master_addr": conf.master_addr().to_string(),
         "start_time": start_time,
+        "version": master_version.release_version,
+        "version_commit": master_version.git_commit,
         "live_workers": filesystem_info.live_workers.len(),
         "lost_workers": filesystem_info.lost_workers.len(),
         "available": filesystem_info.available,
@@ -158,6 +161,18 @@ async fn overview(
         "master_state": master_state,
     }));
     Ok(res)
+}
+
+/// Lightweight runtime endpoint for web HA probes (version + process start_time).
+async fn master_runtime(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+) -> FsResult<Json<Value>> {
+    let master_version = curvine_sys::version::component_version("master");
+    Ok(Json(json!({
+        "version": master_version.release_version,
+        "version_commit": master_version.git_commit,
+        "start_time": instance.start_time,
+    })))
 }
 
 async fn browse(
@@ -259,6 +274,7 @@ impl RouterHandler for MasterRouterHandler {
             .route("/metrics", get(metrics))
             .route("/report", get(report))
             .route("/api/overview", get(overview))
+            .route("/api/v1/master/runtime", get(master_runtime))
             .route("/api/config", get(|| async { Json(conf) }))
             .route("/api/browse", get(browse))
             .route("/api/block_locations", get(block_locations))
@@ -270,5 +286,15 @@ impl RouterHandler for MasterRouterHandler {
             .layer(Extension(instance));
 
         self.fault_http.mount(router)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn master_version_fields_are_non_empty() {
+        let master_version = curvine_sys::version::component_version("master");
+        assert!(!master_version.release_version.is_empty());
+        assert!(!master_version.git_commit.is_empty());
     }
 }

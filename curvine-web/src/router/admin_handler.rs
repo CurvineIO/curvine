@@ -35,8 +35,8 @@ use crate::observability::{self, ObservabilityService};
 use crate::router::RouterHandler;
 use crate::util::addr::{
     configured_master_addrs, display_addr_text_for_cluster, display_inet_addr_with_hint,
-    display_master_endpoint, hosts_match_for_cluster_mapping, resolve_display_hostname,
-    resolve_display_ip,
+    display_master_endpoint, hosts_match_for_cluster_mapping, master_runtime_scrape_url,
+    resolve_display_hostname, resolve_display_ip,
 };
 use curvine_config::ClusterConf;
 use curvine_core_error::err_box;
@@ -323,6 +323,22 @@ fn worker_json(worker: WorkerInfo) -> Value {
     value
 }
 
+fn worker_version_fields(worker: &WorkerInfo) -> (Value, Value) {
+    let version = if worker.software_version.trim().is_empty() {
+        Value::Null
+    } else {
+        json!(worker.software_version)
+    };
+    let version_commit = worker
+        .component_info
+        .as_ref()
+        .and_then(|info| info.git_commit.clone())
+        .filter(|commit| !commit.trim().is_empty())
+        .map(|commit| json!(commit))
+        .unwrap_or(Value::Null);
+    (version, version_commit)
+}
+
 fn worker_payload(worker: WorkerInfo, state: &str) -> Value {
     let usage_percent = if worker.capacity > 0 {
         ((worker.capacity - worker.available) as f64 / worker.capacity as f64 * 100.0).round()
@@ -330,14 +346,130 @@ fn worker_payload(worker: WorkerInfo, state: &str) -> Value {
         0.0
     };
     let storage_count = worker.storage_map.len();
+    let (version, version_commit) = worker_version_fields(&worker);
     json!({
         "worker": worker_json(worker),
         "state": state,
         "usage_percent": usage_percent,
         "storage_count": storage_count,
-        "version": Value::Null,
+        "version": version,
+        "version_commit": version_commit,
         "file_count": Value::Null
     })
+}
+
+#[derive(Clone, Debug, Default)]
+struct MasterRuntimeInfo {
+    version: Option<String>,
+    version_commit: Option<String>,
+    start_time: Option<String>,
+}
+
+impl MasterRuntimeInfo {
+    fn from_json(value: &Value) -> Self {
+        let as_non_empty = |key: &str| {
+            value
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        };
+        Self {
+            version: as_non_empty("version"),
+            version_commit: as_non_empty("version_commit"),
+            start_time: as_non_empty("start_time"),
+        }
+    }
+
+    fn version_json(&self) -> Value {
+        self.version
+            .as_ref()
+            .map(|v| json!(v))
+            .unwrap_or(Value::Null)
+    }
+
+    fn version_commit_json(&self) -> Value {
+        self.version_commit
+            .as_ref()
+            .map(|v| json!(v))
+            .unwrap_or(Value::Null)
+    }
+
+    fn start_time_json(&self) -> Value {
+        self.start_time
+            .as_ref()
+            .map(|v| json!(v))
+            .unwrap_or(Value::Null)
+    }
+}
+
+async fn fetch_master_runtime_info(conf: &ClusterConf, master_addr: &str) -> MasterRuntimeInfo {
+    let master_addr = master_addr.trim();
+    if master_addr.is_empty() {
+        return MasterRuntimeInfo::default();
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(MASTER_HA_PING_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return MasterRuntimeInfo::default(),
+    };
+    fetch_master_runtime_info_with_client(&client, conf, master_addr).await
+}
+
+async fn fetch_master_runtime_info_with_client(
+    client: &reqwest::Client,
+    conf: &ClusterConf,
+    master_addr: &str,
+) -> MasterRuntimeInfo {
+    let master_addr = master_addr.trim();
+    if master_addr.is_empty() {
+        return MasterRuntimeInfo::default();
+    }
+    let url = master_runtime_scrape_url(conf, master_addr);
+    match timeout(
+        Duration::from_secs(MASTER_HA_PING_TIMEOUT_SECS),
+        client.get(&url).send(),
+    )
+    .await
+    {
+        Ok(Ok(response)) if response.status().is_success() => {
+            match response.json::<Value>().await {
+                Ok(body) => MasterRuntimeInfo::from_json(&body),
+                Err(err) => {
+                    log::debug!("master runtime parse failed for {url}: {err}");
+                    MasterRuntimeInfo::default()
+                }
+            }
+        }
+        Ok(Ok(response)) => {
+            log::debug!(
+                "master runtime probe HTTP {} for {}",
+                response.status(),
+                url
+            );
+            MasterRuntimeInfo::default()
+        }
+        Ok(Err(err)) => {
+            log::debug!("master runtime probe failed for {url}: {err}");
+            MasterRuntimeInfo::default()
+        }
+        Err(_) => {
+            log::debug!("master runtime probe timed out for {url}");
+            MasterRuntimeInfo::default()
+        }
+    }
+}
+
+fn master_runtime_http_client() -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(MASTER_HA_PING_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()
 }
 
 #[derive(Clone)]
@@ -588,23 +720,50 @@ async fn master_ha_payload(instance: &AdminRouterHandler, master_info: &Filesyst
     let master_addrs = configured_master_addrs(conf);
     let failover_supported = conf.journal.enable && master_addrs.len() > 1;
     let raft_client = RaftClient::from_conf(instance.rt.clone(), &instance.conf.journal);
-    let mut nodes = Vec::with_capacity(master_addrs.len());
+    let http_client = master_runtime_http_client();
 
-    for addr in &master_addrs {
+    // Probe raft reachability and runtime metadata in parallel per node.
+    let mut node_futures = Vec::with_capacity(master_addrs.len());
+    for addr in master_addrs {
         let addr_text = addr.to_string();
-        let display_addr = display_inet_addr_with_hint(addr, &display_hostname);
         let raft_id = target_master_node_id(conf, &addr_text);
+        let raft_client = raft_client.clone();
+        let conf = conf.clone();
+        let http_client = http_client.clone();
+        node_futures.push(async move {
+            let (reachable, leader_id, reachable_error) = match raft_id {
+                Some(id) => raft_ping_status(&raft_client, id).await,
+                None => (
+                    false,
+                    None,
+                    Some("master address cannot be mapped to a raft node".to_string()),
+                ),
+            };
+            let runtime = match http_client.as_ref() {
+                Some(client) => {
+                    fetch_master_runtime_info_with_client(client, &conf, &addr_text).await
+                }
+                None => MasterRuntimeInfo::default(),
+            };
+            (
+                addr,
+                addr_text,
+                raft_id,
+                reachable,
+                leader_id,
+                reachable_error,
+                runtime,
+            )
+        });
+    }
+    let probed = futures::future::join_all(node_futures).await;
+
+    let mut nodes = Vec::with_capacity(probed.len());
+    for (addr, addr_text, raft_id, reachable, leader_id, reachable_error, runtime) in probed {
+        let display_addr = display_inet_addr_with_hint(&addr, &display_hostname);
         let journal_addr = raft_id
             .and_then(|id| journal_addr_for_id(conf, id))
             .unwrap_or_default();
-        let (reachable, leader_id, reachable_error) = match raft_id {
-            Some(id) => raft_ping_status(&raft_client, id).await,
-            None => (
-                false,
-                None,
-                Some("master address cannot be mapped to a raft node".to_string()),
-            ),
-        };
         let is_current = match (active_raft_id, raft_id) {
             (Some(active_id), Some(node_id)) => active_id == node_id,
             _ if active_master.is_empty() => false,
@@ -628,7 +787,10 @@ async fn master_ha_payload(instance: &AdminRouterHandler, master_info: &Filesyst
             "reachable": reachable,
             "reachable_error": reachable_error,
             "current": is_current,
-            "switchable": failover_supported && !is_current && reachable
+            "switchable": failover_supported && !is_current && reachable,
+            "version": runtime.version_json(),
+            "version_commit": runtime.version_commit_json(),
+            "start_time": runtime.start_time_json(),
         }));
     }
 
@@ -1540,7 +1702,7 @@ async fn overview(
     Extension(instance): Extension<Arc<AdminRouterHandler>>,
 ) -> FsResult<Json<Value>> {
     let conf = &instance.conf;
-    let start_time = &instance.start_time;
+    let web_start_time = &instance.start_time;
     let master_info = current_master_info(&instance).await?;
 
     let expected_capacity = master_info.available + master_info.fs_used;
@@ -1560,6 +1722,12 @@ async fn overview(
     } else {
         "Active"
     };
+    let runtime = fetch_master_runtime_info(conf, &active_master).await;
+    let start_time_source = if runtime.start_time.is_some() {
+        "active_master"
+    } else {
+        "unavailable"
+    };
 
     let res = Json(json!({
         "cluster_id": conf.cluster_id,
@@ -1572,7 +1740,11 @@ async fn overview(
         },
         "local_hostname": resolve_display_hostname(conf, &active_master),
         "journal_nodes": master_info.journal_nodes.clone(),
-        "start_time": start_time,
+        "version": runtime.version_json(),
+        "version_commit": runtime.version_commit_json(),
+        "start_time": runtime.start_time_json(),
+        "start_time_source": start_time_source,
+        "web_start_time": web_start_time,
         "live_workers": master_info.live_workers.len(),
         "lost_workers": master_info.lost_workers.len(),
         "available": master_info.available,
@@ -4304,5 +4476,88 @@ mod transfer_tests {
         let name = transfer_display_name("alice", "/tmp/foo/bar", 1_719_763_852_000);
         assert!(name.starts_with("transfer_alice_"));
         assert!(name.ends_with("_foo-bar"));
+    }
+}
+
+#[cfg(test)]
+mod version_payload_tests {
+    use super::*;
+    use curvine_model::WorkerAddress;
+    use curvine_proto::ComponentInfoProto;
+
+    #[test]
+    fn worker_version_fields_use_software_version_and_commit() {
+        let mut worker = WorkerInfo::new(
+            WorkerAddress {
+                worker_id: 1,
+                hostname: "w1".to_string(),
+                ip_addr: "10.0.0.1".to_string(),
+                rpc_port: 8997,
+                ..Default::default()
+            },
+            1,
+        );
+        worker.software_version = "0.4.0-alpha".to_string();
+        worker.component_info = Some(ComponentInfoProto {
+            component: Some("worker".to_string()),
+            release_version: Some("0.4.0-alpha".to_string()),
+            git_commit: Some("abcdef0123456789".to_string()),
+            git_tag: None,
+            git_branch: None,
+            protocol_version: Some(1),
+            min_protocol_version: Some(1),
+            capabilities: vec![],
+        });
+
+        let (version, commit) = worker_version_fields(&worker);
+        assert_eq!(version, json!("0.4.0-alpha"));
+        assert_eq!(commit, json!("abcdef0123456789"));
+
+        let payload = worker_payload(worker, "Live");
+        assert_eq!(payload["version"], json!("0.4.0-alpha"));
+        assert_eq!(payload["version_commit"], json!("abcdef0123456789"));
+    }
+
+    #[test]
+    fn worker_version_fields_null_when_missing() {
+        let worker = WorkerInfo::new(
+            WorkerAddress {
+                worker_id: 2,
+                hostname: "w2".to_string(),
+                ip_addr: "10.0.0.2".to_string(),
+                rpc_port: 8997,
+                ..Default::default()
+            },
+            1,
+        );
+        let (version, commit) = worker_version_fields(&worker);
+        assert!(version.is_null());
+        assert!(commit.is_null());
+    }
+
+    #[test]
+    fn master_runtime_info_parses_overview_fields() {
+        let info = MasterRuntimeInfo::from_json(&json!({
+            "version": "0.4.0-alpha",
+            "version_commit": "deadbeef",
+            "start_time": "2026-08-18 11:00:00"
+        }));
+        assert_eq!(info.version.as_deref(), Some("0.4.0-alpha"));
+        assert_eq!(info.version_commit.as_deref(), Some("deadbeef"));
+        assert_eq!(info.start_time.as_deref(), Some("2026-08-18 11:00:00"));
+        assert_eq!(info.version_json(), json!("0.4.0-alpha"));
+    }
+
+    #[test]
+    fn master_runtime_info_treats_empty_as_missing() {
+        let info = MasterRuntimeInfo::from_json(&json!({
+            "version": "  ",
+            "version_commit": "",
+            "start_time": null
+        }));
+        assert!(info.version.is_none());
+        assert!(info.version_commit.is_none());
+        assert!(info.start_time.is_none());
+        assert!(info.start_time_json().is_null());
     }
 }
