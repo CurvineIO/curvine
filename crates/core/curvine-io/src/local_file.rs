@@ -26,6 +26,9 @@ use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::{AsRawFd, RawFd};
 
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+
 macro_rules! err_box {
     ($e:expr) => {{
         let message = format!(
@@ -217,6 +220,65 @@ impl LocalFile {
         self.len == 0
     }
 
+    pub fn pread(&self, buf: &mut [u8], offset: u64) -> IOResult<usize> {
+        #[cfg(unix)]
+        {
+            let n = try_err!(self.inner.read_at(buf, offset));
+            Ok(n)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (buf, offset);
+            err_box!("pread is not supported on this platform")
+        }
+    }
+
+    pub fn pread_exact(&self, buf: &mut [u8], offset: u64) -> IOResult<()> {
+        #[cfg(unix)]
+        {
+            try_err!(self.inner.read_exact_at(buf, offset));
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (buf, offset);
+            err_box!("pread is not supported on this platform")
+        }
+    }
+
+    pub fn pread_full(&self, offset: u64, len: usize) -> IOResult<BytesMut> {
+        let mut buf = BytesMut::with_capacity(len);
+        unsafe { buf.set_len(len) }
+        self.pread_exact(&mut buf, offset)?;
+        Ok(buf)
+    }
+
+    pub fn pwrite(&self, buf: &[u8], offset: u64) -> IOResult<usize> {
+        #[cfg(unix)]
+        {
+            let n = try_err!(self.inner.write_at(buf, offset));
+            Ok(n)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (buf, offset);
+            err_box!("pwrite is not supported on this platform")
+        }
+    }
+
+    pub fn pwrite_all(&self, buf: &[u8], offset: u64) -> IOResult<()> {
+        #[cfg(unix)]
+        {
+            try_err!(self.inner.write_all_at(buf, offset));
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (buf, offset);
+            err_box!("pwrite is not supported on this platform")
+        }
+    }
+
     pub fn seek(&mut self, pos: i64) -> IOResult<i64> {
         if pos == self.pos {
             return Ok(pos);
@@ -336,5 +398,94 @@ impl Write for LocalFile {
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::LocalFile;
+    use curvine_runtime::common::Utils;
+    use std::fs::remove_file;
+
+    fn test_path() -> String {
+        let path = Utils::test_file();
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn pread_pwrite_do_not_move_cursor() {
+        let path = test_path();
+        let file = LocalFile::with_write(&path, true).unwrap();
+
+        file.pwrite_all(b"hello world", 0).unwrap();
+        assert_eq!(file.pos(), 0);
+        assert_eq!(file.len(), 0, "pwrite must not update cached len");
+
+        let mut buf = [0u8; 5];
+        assert_eq!(file.pread(&mut buf, 6).unwrap(), 5);
+        assert_eq!(&buf, b"world");
+        assert_eq!(file.pos(), 0);
+
+        file.pwrite_all(b"RUST", 6).unwrap();
+        assert_eq!(file.pos(), 0);
+
+        let got = file.pread_full(0, 11).unwrap();
+        assert_eq!(&got[..], b"hello RUSTd");
+
+        remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn pwrite_does_not_update_cached_len() {
+        let path = test_path();
+        let mut file = LocalFile::with_write(&path, true).unwrap();
+        file.write_all(b"abc").unwrap();
+        assert_eq!(file.pos(), 3);
+        assert_eq!(file.len(), 3);
+
+        file.pwrite_all(b"xyz", 10).unwrap();
+        assert_eq!(file.pos(), 3, "pwrite must not move the cursor");
+        assert_eq!(file.len(), 3, "pwrite must not update cached len");
+
+        let got = file.pread_full(10, 3).unwrap();
+        assert_eq!(&got[..], b"xyz");
+
+        remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn pread_exact_fails_at_eof() {
+        let path = test_path();
+        let file = LocalFile::with_write(&path, true).unwrap();
+        file.pwrite_all(b"abc", 0).unwrap();
+
+        let mut buf = [0u8; 4];
+        assert!(file.pread_exact(&mut buf, 0).is_err());
+
+        remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn pread_pwrite_roundtrip_random_offsets() {
+        let path = test_path();
+        let file = LocalFile::with_write(&path, true).unwrap();
+
+        file.pwrite_all(&[1u8; 4096], 0).unwrap();
+        file.pwrite_all(&[2u8; 4096], 4096).unwrap();
+        file.pwrite_all(&[3u8; 100], 8192).unwrap();
+
+        let a = file.pread_full(0, 4096).unwrap();
+        let b = file.pread_full(4096, 4096).unwrap();
+        let c = file.pread_full(8192, 100).unwrap();
+        assert!(a.iter().all(|&x| x == 1));
+        assert!(b.iter().all(|&x| x == 2));
+        assert!(c.iter().all(|&x| x == 3));
+        assert_eq!(file.len(), 0, "pwrite must not update cached len");
+        assert_eq!(file.pos(), 0);
+
+        remove_file(&path).unwrap();
     }
 }
