@@ -13,14 +13,14 @@
 // limitations under the License.
 
 use crate::block::{BlockClient, BlockClientPool};
-use crate::file::{FsClient, MasterHandshake};
+use crate::file::{FsClient, MasterHandshake, WorkerPrecheck};
 use crate::ClientMetrics;
 use curvine_config::ClusterConf;
 use curvine_error::FsResult;
 use curvine_io::CacheManager;
 use curvine_io::IOResult;
 use curvine_model::ProtoUtils;
-use curvine_model::{ClientAddress, WorkerAddress};
+use curvine_model::{ClientAddress, WorkerAddress, WorkerInfo};
 use curvine_net::net::NetUtils;
 use curvine_proto::ClientAddressProto;
 use curvine_rpc::client::{ClientConf, ClusterConnector};
@@ -32,6 +32,7 @@ use log::warn;
 use moka::policy::EvictionPolicy;
 use moka::sync::{Cache, CacheBuilder};
 use once_cell::sync::OnceCell;
+use std::collections::HashMap;
 use std::future::Future;
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,6 +59,15 @@ pub struct FsContext {
     // inline: FsContext itself is only ever shared behind an `Arc`, so the
     // interior-mutable FastRwLock needs no extra heap allocation.
     master_handshake: FastRwLock<MasterHandshake>,
+    // Last-known live workers reported by the master on GetFilesystemInfo,
+    // keyed by worker_id. Used by the T10 client-side worker pre-check to
+    // evaluate a worker's structured version before opening a data connection.
+    live_workers: FastRwLock<HashMap<u32, WorkerInfo>>,
+    // Client-side worker pre-check (diagnose-only): evaluates a worker's
+    // version/protocol/capabilities against the client's own supported range
+    // plus the master-advertised bounds, and warns (never rejects) when a
+    // worker looks incompatible.
+    worker_precheck: FastRwLock<WorkerPrecheck>,
     // Whether this session has already reported its component_info to the
     // master. Handshake metadata is sent once per mount/session; the flag
     // keeps GetFilesystemInfo (which backs FUSE statfs and may be called
@@ -124,6 +134,8 @@ impl FsContext {
             failed_workers: exclude_workers,
             block_pool,
             master_handshake: FastRwLock::new(MasterHandshake::default()),
+            live_workers: FastRwLock::new(HashMap::new()),
+            worker_precheck: FastRwLock::new(WorkerPrecheck::default()),
             handshake_reported: AtomicBool::new(false),
             handshake_lock: tokio::sync::Mutex::new(()),
             handshake_started: AtomicBool::new(false),
@@ -137,8 +149,10 @@ impl FsContext {
 
     /// Cache the master's advertised version / protocol / capabilities from
     /// the client-master handshake. A master without a compatibility contract
-    /// is recorded as legacy and never rejected.
+    /// is recorded as legacy and never rejected. The worker pre-check bounds
+    /// are refreshed from the same contract.
     pub fn set_master_handshake(&self, handshake: MasterHandshake) {
+        self.worker_precheck.write().refresh(&handshake);
         *self.master_handshake.write() = handshake;
     }
 
@@ -205,7 +219,36 @@ impl FsContext {
         addr.is_local(&self.client_addr.hostname)
     }
 
+    /// Replace the cached live-worker view reported by the master. Called on
+    /// every successful GetFilesystemInfo so the T10 worker pre-check has the
+    /// freshest worker versions before opening data connections.
+    pub fn set_live_workers(&self, workers: &[WorkerInfo]) {
+        let mut map = self.live_workers.write();
+        map.clear();
+        for worker in workers {
+            map.insert(worker.worker_id(), worker.clone());
+        }
+    }
+
+    /// Run the diagnose-only worker pre-check for a worker the client is about
+    /// to open a data connection to. Uses the last-known version the master
+    /// reported; workers the master has not reported (or legacy workers
+    /// without `component_info`) are allowed silently and enforcement is left
+    /// to the worker side. Never rejects — T10 acceptance: default is log /
+    /// pre-check only. The worker is evaluated under the read guard so no
+    /// `WorkerInfo` clone is needed on the connection hot path.
+    fn precheck_worker(&self, addr: &WorkerAddress) {
+        let workers = self.live_workers.read();
+        let Some(worker) = workers.get(&addr.worker_id) else {
+            return;
+        };
+        self.worker_precheck.read().warn_if_incompatible(worker);
+    }
+
     pub async fn block_client(&self, addr: &WorkerAddress) -> IOResult<BlockClient> {
+        // T10: pre-check the worker's version/protocol before opening a data
+        // connection (diagnose-only; logs mismatches, never refuses).
+        self.precheck_worker(addr);
         let client = self
             .connector
             .create_client(&addr.inet_addr(), false)

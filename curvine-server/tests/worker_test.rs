@@ -21,8 +21,8 @@ use curvine_model::{ExtendedBlock, FileAllocOpts, FileType, StorageType};
 use curvine_net::net::NetUtils;
 use curvine_proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,
-    BlocksBatchCommitRequest, BlocksBatchWriteRequest, BlocksBatchWriteResponse, DataHeaderProto,
-    FileWriteData, FilesBatchWriteRequest,
+    BlocksBatchCommitRequest, BlocksBatchWriteRequest, BlocksBatchWriteResponse,
+    ComponentInfoProto, DataHeaderProto, FileWriteData, FilesBatchWriteRequest,
 };
 use curvine_rpc::message::{Builder, Message, RequestStatus};
 use curvine_runtime::common::Utils;
@@ -541,6 +541,124 @@ fn test_worker_fault_http_control_plane_e2e() -> CommonResult<()> {
     let write_ck = block_write(healthy_block, &conf)?;
     let read_ck = block_read(healthy_block, &conf)?;
     assert_eq!(write_ck, read_ck);
+    Ok(())
+}
+
+fn old_client_component_info() -> ComponentInfoProto {
+    ComponentInfoProto {
+        component: Some("client".to_string()),
+        release_version: Some("0.1.0".to_string()),
+        git_commit: Some("abc".to_string()),
+        git_tag: Some(String::new()),
+        git_branch: Some("main".to_string()),
+        protocol_version: Some(1),
+        min_protocol_version: Some(1),
+        capabilities: vec![],
+    }
+}
+
+fn start_worker_with_compatibility(mode: &str, min_client_version: &str) -> ClusterConf {
+    let mut conf = ClusterConf::default();
+    conf.worker.rpc_port = NetUtils::hold_available_port();
+    conf.worker.web_port = NetUtils::hold_available_port();
+    conf.worker.data_dir = vec![format!(
+        "[MEM:10MB]../testing/worker-compat-{}-{}",
+        mode,
+        Utils::req_id().abs()
+    )];
+    conf.worker.compatibility.mode = mode.to_string();
+    conf.worker.compatibility.min_client_version = min_client_version.to_string();
+    conf.client.init().unwrap();
+
+    let server = Worker::with_conf(conf.clone()).unwrap();
+    thread::spawn(move || server.start_standalone());
+    conf
+}
+
+#[test]
+fn test_worker_enforce_mode_rejects_old_client_on_first_open_frame() -> CommonResult<()> {
+    // 旧 client + 协议不匹配: a worker explicitly configured to enforce
+    // min_client_version rejects an older client on its first data-plane open
+    // frame with an explicit error carrying both versions.
+    let conf = start_worker_with_compatibility("enforce", "99.0.0");
+    let client = conf.worker_sync_client()?;
+
+    let block_id = Utils::req_id().abs();
+    let block = ExtendedBlock::new(
+        block_id,
+        CHUNK_SIZE as i64,
+        StorageType::Disk,
+        FileType::File,
+    );
+    let request = BlockWriteRequest {
+        block: ProtoUtils::extend_block_to_pb(block),
+        off: 0,
+        block_size: CHUNK_SIZE as i64,
+        short_circuit: false,
+        client_name: "old-client".to_string(),
+        chunk_size: CHUNK_SIZE,
+        pipeline_stream: Vec::new(),
+        component_info: Some(old_client_component_info()),
+    };
+    let open = Builder::new()
+        .code(RpcCode::WriteBlock)
+        .request(RequestStatus::Open)
+        .req_id(Utils::req_id())
+        .seq_id(0)
+        .proto_header(request)
+        .build();
+
+    let err = client.rpc_check(open).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("0.1.0"),
+        "error should name the peer version: {msg}"
+    );
+    assert!(
+        msg.contains("99.0.0"),
+        "error should name the minimum: {msg}"
+    );
+    assert!(
+        msg.contains("diagnose"),
+        "error should suggest diagnose mode: {msg}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_worker_diagnose_mode_allows_old_client_on_data_plane() -> CommonResult<()> {
+    // Acceptance: 默认不拒绝. Even with an explicit (low) min_client_version,
+    // a diagnose-mode worker warns but allows the old client's open frame.
+    let conf = start_worker_with_compatibility("diagnose", "99.0.0");
+    let client = conf.worker_sync_client()?;
+
+    let block_id = Utils::req_id().abs();
+    let block = ExtendedBlock::new(
+        block_id,
+        CHUNK_SIZE as i64,
+        StorageType::Disk,
+        FileType::File,
+    );
+    let request = BlockWriteRequest {
+        block: ProtoUtils::extend_block_to_pb(block),
+        off: 0,
+        block_size: CHUNK_SIZE as i64,
+        short_circuit: false,
+        client_name: "old-client".to_string(),
+        chunk_size: CHUNK_SIZE,
+        pipeline_stream: Vec::new(),
+        component_info: Some(old_client_component_info()),
+    };
+    let req_id = Utils::req_id();
+    let open = Builder::new()
+        .code(RpcCode::WriteBlock)
+        .request(RequestStatus::Open)
+        .req_id(req_id)
+        .seq_id(0)
+        .proto_header(request)
+        .build();
+    // The open frame must succeed: diagnose warns but never rejects.
+    let _: BlockWriteResponse = client.rpc_check(open)?.parse_header()?;
     Ok(())
 }
 
