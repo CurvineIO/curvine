@@ -157,7 +157,6 @@ impl InodeStore {
         while let Some((parent_id, edge_name, inode)) = stack.pop_front() {
             // Delete inode edges
             batch.delete_child(parent_id, &edge_name)?;
-            del_res.inodes += 1;
 
             match &inode {
                 InodeView::Dir(dir) => {
@@ -176,6 +175,8 @@ impl InodeStore {
                 _ => {
                     deleted_files += 1;
                     let res = self.decrement_inode_nlink(inode.id(), ctime, &mut batch)?;
+                    del_res.inodes += res.inodes;
+                    del_res.bytes += res.bytes;
                     del_res.blocks.extend(res.blocks);
                 }
             }
@@ -486,7 +487,10 @@ impl InodeStore {
                         batch.delete_inode(inode_id)?;
 
                         // Collect block info
-                        del_res.blocks.extend(f.get_locs(self)?);
+                        let locs = f.get_locs(self)?;
+                        del_res.inodes = 1;
+                        del_res.bytes = u64::try_from(f.get_locs_bytes(&locs)).unwrap_or(0);
+                        del_res.blocks.extend(locs);
 
                         self.ttl_bucket_list.remove(&inode_view);
                     } else {

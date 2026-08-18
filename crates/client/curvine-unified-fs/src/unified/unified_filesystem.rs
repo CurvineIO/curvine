@@ -25,9 +25,9 @@ use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, ListStream, Path, Reader, RpcCode, Writer};
 use curvine_job_client::{JobMasterClient, TransferClient};
 use curvine_model::{
-    CreateFileOpts, FileAllocOpts, FileLock, FileStatus, FreeResult, JobStatus, ListOptions,
-    LoadJobCommand, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags,
-    RenameFlags, SetAttrOpts, TransferCommand, TransferKind, TransferState,
+    CreateFileOpts, DeleteResult, FileAllocOpts, FileLock, FileStatus, FreeResult, JobStatus,
+    ListOptions, LoadJobCommand, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions,
+    OpenFlags, RenameFlags, SetAttrOpts, TransferCommand, TransferKind, TransferState,
 };
 use curvine_runtime::common::TimeSpent;
 use curvine_runtime::common::Utils;
@@ -286,10 +286,9 @@ impl UnifiedFileSystem {
                 None => err_box!(
                     "the current path is not mounted to ufs, so the `free` command cannot be executed."
                 ),
-                // Cache mode: drop Curvine metadata (and its blocks) via delete.
-                // Master delete already releases worker blocks; calling free first
-                // would only clear locs then delete the inode — redundant.
-                // Use cv.delete (not UnifiedFileSystem::delete) so UFS is untouched.
+                // Cache mode: drop Curvine metadata and blocks via cv.delete.
+                // UFS is untouched; the returned DeleteResult is converted to
+                // FreeResult so the CLI can report inode/byte stats.
                 Some(mount) if mount.is_cache_mode() => {
                     self.free_cache_mode(path, &mount, recursive).await
                 }
@@ -305,20 +304,28 @@ impl UnifiedFileSystem {
         mount: &MountInfo,
         recursive: bool,
     ) -> FsResult<FreeResult> {
+        let mut total = FreeResult::default();
+
         if path.path() == mount.cv_path && recursive {
             for status in self.cv.list_status(path).await? {
                 let child = Path::from_str(status.path)?;
-                if let Err(e) = self.cv.delete(&child, true).await {
-                    if !matches!(e, FsError::FileNotFound(_)) {
+                match self.cv.delete(&child, true).await {
+                    Ok(res) => {
+                        let res: FreeResult = res.into();
+                        total.inodes += res.inodes;
+                        total.bytes += res.bytes;
+                    }
+                    Err(FsError::FileNotFound(_)) => {}
+                    Err(e) => {
                         return Err(e);
                     }
                 }
             }
         } else {
-            self.cv.delete(path, recursive).await?;
+            total = self.cv.delete(path, recursive).await?.into();
         }
 
-        Ok(FreeResult::default())
+        Ok(total)
     }
 
     pub async fn symlink(&self, target: &str, link: &Path, force: bool) -> FsResult<()> {
@@ -1058,7 +1065,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         self.rename_with_flags(src, dst, RenameFlags::empty()).await
     }
 
-    async fn delete(&self, path: &Path, recursive: bool) -> FsResult<()> {
+    async fn delete(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
         let fut = async {
             match self.get_mount_checked(path, RpcCode::Delete).await? {
                 None => self.cv.delete(path, recursive).await,
@@ -1071,16 +1078,21 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                         );
                     }
 
-                    mount.ufs()?.delete(&ufs_path, recursive).await?;
+                    let mut delete_res = mount.ufs()?.delete(&ufs_path, recursive).await?;
 
                     // delete cache
-                    if let Err(e) = self.cv.delete(path, recursive).await {
-                        if !matches!(e, FsError::FileNotFound(_)) {
+                    match self.cv.delete(path, recursive).await {
+                        Ok(res) => {
+                            delete_res.inodes += res.inodes;
+                            delete_res.bytes += res.bytes;
+                        }
+                        Err(FsError::FileNotFound(_)) => {}
+                        Err(e) => {
                             warn!("failed to delete cache for {}: {}", path, e);
                         }
-                    };
+                    }
 
-                    Ok(())
+                    Ok(delete_res)
                 }
             }
         };

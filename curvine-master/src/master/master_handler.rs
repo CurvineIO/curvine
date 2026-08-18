@@ -26,8 +26,9 @@ use curvine_fs_api::Path;
 use curvine_fs_api::RpcCode;
 use curvine_model::ProtoUtils;
 use curvine_model::{
-    CreateFileOpts, DeleteBlockCmd, FileBlocks, FileStatus, FreeResult, HeartbeatStatus,
-    ListOptions, MasterInfo, OpenFlags, RenameFlags, WorkerCommand, WorkerInfo, WorkerStatus,
+    CreateFileOpts, DeleteBlockCmd, DeleteResult, FileBlocks, FileStatus, FreeResult,
+    HeartbeatStatus, ListOptions, MasterInfo, OpenFlags, RenameFlags, WorkerCommand, WorkerInfo,
+    WorkerStatus,
 };
 use curvine_net::net::ConnState;
 use curvine_proto::*;
@@ -205,9 +206,9 @@ impl MasterHandler {
         ctx.response(rep_header)
     }
 
-    pub fn delete0(&self, req_id: i64, header: DeleteRequest) -> FsResult<bool> {
+    pub fn delete0(&self, req_id: i64, header: DeleteRequest) -> FsResult<DeleteResult> {
         if self.check_is_retry(req_id)? {
-            return Ok(true);
+            return Ok(DeleteResult::default());
         }
 
         let path = Path::from_str(&header.path)?;
@@ -225,8 +226,10 @@ impl MasterHandler {
         let header: DeleteRequest = ctx.parse_header()?;
         ctx.set_audit(Some(header.path.to_string()), None);
 
-        self.delete0(ctx.msg.req_id(), header)?;
-        let rep_header = DeleteResponse::default();
+        let res = self.delete0(ctx.msg.req_id(), header)?;
+        let rep_header = DeleteResponse {
+            res: Some(ProtoUtils::delete_res_to_pb(res)),
+        };
         ctx.response(rep_header)
     }
 

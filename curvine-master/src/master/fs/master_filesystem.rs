@@ -263,16 +263,21 @@ impl MasterFilesystem {
         self.mkdir_with_opts(path, opts)
     }
 
-    pub fn delete<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<bool> {
+    pub fn delete<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<DeleteResult> {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
 
-        let delete_result = fs_dir.delete(&inp, recursive)?;
+        let mut delete_res = fs_dir.delete(&inp, recursive)?;
+        drop(fs_dir);
 
         let mut worker_manager = self.worker_manager.write();
-        worker_manager.remove_blocks(&delete_result);
+        worker_manager.remove_blocks(&DeleteResult {
+            inodes: 0,
+            bytes: 0,
+            blocks: std::mem::take(&mut delete_res.blocks),
+        });
 
-        Ok(true)
+        Ok(delete_res)
     }
 
     pub fn free<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<FreeResult> {
@@ -285,6 +290,7 @@ impl MasterFilesystem {
         let mut worker_manager = self.worker_manager.write();
         worker_manager.remove_blocks(&DeleteResult {
             inodes: 0,
+            bytes: 0,
             blocks: std::mem::take(&mut free_res.blocks),
         });
 

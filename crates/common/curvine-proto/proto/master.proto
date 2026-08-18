@@ -95,7 +95,9 @@ message DeleteRequest {
     optional ClientContextProto client_context = 100;
 }
 
-message DeleteResponse {}
+message DeleteResponse {
+    optional FreeResultProto res = 1;
+}
 
 message FreeRequest {
     required string path = 1;

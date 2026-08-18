@@ -420,13 +420,13 @@ impl LoadTaskRunner {
     async fn delete_temp_output(&self, temp_path: &Path) -> FsResult<()> {
         if temp_path.is_cv() {
             match self.fs.delete(temp_path, false).await {
-                Ok(()) | Err(FsError::FileNotFound(_)) => Ok(()),
+                Ok(_) | Err(FsError::FileNotFound(_)) => Ok(()),
                 Err(err) => Err(err),
             }
         } else {
             let ufs = self.get_ufs()?;
             match ufs.delete(temp_path, false).await {
-                Ok(()) | Err(FsError::FileNotFound(_)) => Ok(()),
+                Ok(_) | Err(FsError::FileNotFound(_)) => Ok(()),
                 Err(err) => Err(err),
             }
         }

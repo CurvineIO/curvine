@@ -480,7 +480,10 @@ impl crate::s3::s3_api::DeleteBucketHandler for S3Handlers {
 
         async move {
             let path = path.map_err(|e| e.to_string())?;
-            fs.delete(&path, false).await.map_err(|e| e.to_string())
+            fs.delete(&path, false)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         }
     }
 }

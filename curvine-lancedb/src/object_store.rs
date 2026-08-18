@@ -1354,7 +1354,7 @@ impl CurvineObjectStore {
         dirs.sort_by(|left, right| right.full_path().len().cmp(&left.full_path().len()));
         for dir in dirs {
             match self.context.fs.delete(&dir, false).await {
-                Ok(()) => {}
+                Ok(_) => {}
                 Err(FsError::DirNotEmpty(_)) => {}
                 Err(e) if is_not_found_error(&e) => {}
                 Err(e) => return Err(fs_error_to_object_store(location, e)),
@@ -1407,7 +1407,7 @@ impl CurvineObjectStore {
             }
 
             match self.context.fs.delete(&dir, false).await {
-                Ok(()) => {}
+                Ok(_) => {}
                 Err(FsError::DirNotEmpty(_)) => break,
                 Err(e) if is_not_found_error(&e) => break,
                 Err(e) => return Err(fs_error_to_object_store(location, e)),

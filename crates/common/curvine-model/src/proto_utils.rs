@@ -784,6 +784,14 @@ impl ProtoUtils {
             bytes: res.bytes,
         }
     }
+
+    pub fn delete_res_from_pb(res: FreeResultProto) -> DeleteResult {
+        Self::free_res_from_pb(res).into()
+    }
+
+    pub fn delete_res_to_pb(res: DeleteResult) -> FreeResultProto {
+        Self::free_res_to_pb(res.into())
+    }
 }
 
 #[cfg(test)]

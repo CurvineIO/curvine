@@ -348,7 +348,7 @@ mod hdfs_tests {
             println!("Cleaning up directories...");
             for dir in [&sub_dir2, &sub_dir1, &base_dir] {
                 match fs.delete(dir, true).await {
-                    Ok(()) => println!("Deleted directory: {}", dir.full_path()),
+                    Ok(_) => println!("Deleted directory: {}", dir.full_path()),
                     Err(e) => println!("Failed to delete {}: {}", dir.full_path(), e),
                 }
             }

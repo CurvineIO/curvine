@@ -58,7 +58,7 @@ impl PythonFilesystem {
 
     //Delete file
     pub fn delete(&self, path: String, recursive: bool) -> FsResult<()> {
-        self.inner.delete(path, recursive)
+        self.inner.delete(path, recursive).map(|_| ())
     }
 
     //Get master information
