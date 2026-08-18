@@ -17,6 +17,12 @@ message BlockWriteRequest {
     required string client_name = 5 [default = ""];
     required int32 chunk_size = 6;
     repeated WorkerAddressProto pipeline_stream = 7;
+
+    // Structured version/protocol metadata reported by the client on the
+    // reserved 1000+ cross-cutting range. Legacy clients omit this field;
+    // workers treat absence as a legacy/unknown peer and ignore it, so
+    // mixed-version clusters keep working untouched.
+    optional ComponentInfoProto component_info = 1000;
 }
 
 message PipelineStatus {
@@ -44,6 +50,12 @@ message BlockReadRequest {
     required bool enable_read_ahead = 8 [default = true];
     required int64 read_ahead_len = 9 [default = 4194304];
     required int64 drop_cache_len = 10 [default = 1048576];
+
+    // Structured version/protocol metadata reported by the client on the
+    // reserved 1000+ cross-cutting range. Legacy clients omit this field;
+    // workers treat absence as a legacy/unknown peer and ignore it, so
+    // mixed-version clusters keep working untouched.
+    optional ComponentInfoProto component_info = 1000;
 }
 
 message BlockReadResponse {
@@ -157,6 +169,12 @@ message BlocksBatchWriteRequest {
     required int32 chunk_size = 6;
     required bool short_circuit = 7;
     required string client_name = 8;
+
+    // Structured version/protocol metadata reported by the client on the
+    // reserved 1000+ cross-cutting range. Legacy clients omit this field;
+    // workers treat absence as a legacy/unknown peer and ignore it, so
+    // mixed-version clusters keep working untouched.
+    optional ComponentInfoProto component_info = 1000;
 }
 
 
@@ -172,6 +190,12 @@ message BlocksBatchCommitRequest {
     required int64 req_id = 4;
     required int32 seq_id = 5;
     required bool cancel = 6;
+
+    // Structured version/protocol metadata reported by the client on the
+    // reserved 1000+ cross-cutting range. Legacy clients omit this field;
+    // workers treat absence as a legacy/unknown peer and ignore it, so
+    // mixed-version clusters keep working untouched.
+    optional ComponentInfoProto component_info = 1000;
 }
 
 message BlocksBatchCommitResponse {
@@ -182,6 +206,12 @@ message FilesBatchWriteRequest {
     repeated FileWriteData files = 1;
     required int64 req_id = 2;
     required int32 seq_id = 3;
+
+    // Structured version/protocol metadata reported by the client on the
+    // reserved 1000+ cross-cutting range. Legacy clients omit this field;
+    // workers treat absence as a legacy/unknown peer and ignore it, so
+    // mixed-version clusters keep working untouched.
+    optional ComponentInfoProto component_info = 1000;
 }
 
 message FileWriteData {

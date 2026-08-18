@@ -74,6 +74,7 @@ fn spdk_block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
         client_name: "spdk-test".to_string(),
         chunk_size: CHUNK_SIZE,
         pipeline_stream: Vec::new(),
+        component_info: None,
     };
 
     let req_id = Utils::req_id();
@@ -124,6 +125,7 @@ fn spdk_block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
         client_name: "spdk-test".to_string(),
         chunk_size: CHUNK_SIZE,
         pipeline_stream: Vec::new(),
+        component_info: None,
     };
     let msg = Builder::new()
         .code(RpcCode::WriteBlock)

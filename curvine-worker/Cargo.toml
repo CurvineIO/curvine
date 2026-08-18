@@ -49,3 +49,6 @@ axum = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+prost = { workspace = true }
