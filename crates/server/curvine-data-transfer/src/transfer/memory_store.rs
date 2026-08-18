@@ -617,9 +617,7 @@ impl TransferStore for MemoryTransferStore {
             .lock()
             .tasks
             .values()
-            .filter(|task| {
-                task.job_id == job_id && task.run_id == run_id && task.state == state
-            })
+            .filter(|task| task.job_id == job_id && task.run_id == run_id && task.state == state)
             .cloned()
             .collect();
         tasks.sort_by_key(|task| task.updated_at);
