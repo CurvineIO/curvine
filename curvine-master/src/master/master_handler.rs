@@ -648,20 +648,26 @@ impl MasterHandler {
         verdict: CompatibilityVerdict,
         metrics: &MasterMetrics,
     ) -> FsResult<()> {
-        // Record the compatibility verdict as a metric.
+        // Record the compatibility verdict as a metric. Only one verdict
+        // label per peer is active at a time, so set the current label to 1
+        // and clear every other label for the peer; otherwise a peer whose
+        // verdict changes over time leaves stale series stuck at 1.
         let verdict_label = Self::verdict_label(&verdict);
         let is_worker = dedup_key.starts_with("worker:");
-        if is_worker {
-            let worker_id = &dedup_key["worker:".len()..];
-            metrics
-                .compat_worker_verdict
-                .with_label_values(&[worker_id, verdict_label])
-                .set(1);
-        } else {
-            metrics
-                .compat_client_verdict
-                .with_label_values(&[dedup_key, verdict_label])
-                .set(1);
+        for label in Self::VERDICT_LABELS {
+            let active = if label == verdict_label { 1 } else { 0 };
+            if is_worker {
+                let worker_id = &dedup_key["worker:".len()..];
+                metrics
+                    .compat_worker_verdict
+                    .with_label_values(&[worker_id, label])
+                    .set(active);
+            } else {
+                metrics
+                    .compat_client_verdict
+                    .with_label_values(&[dedup_key, label])
+                    .set(active);
+            }
         }
 
         if !verdict.rejects(mode) {
@@ -695,6 +701,19 @@ impl MasterHandler {
             peer
         )
     }
+
+    /// All verdict label values for the compat_*_verdict gauge vectors, kept
+    /// in sync with [`Self::verdict_label`]. Only one label per peer is active
+    /// at a time: recording a verdict sets the current label to 1 and clears
+    /// every other label for that peer.
+    const VERDICT_LABELS: [&str; 6] = [
+        "compatible",
+        "missing_info",
+        "blocked",
+        "protocol_mismatch",
+        "version_too_old",
+        "version_unknown",
+    ];
 
     /// Short human-readable label for a compatibility verdict, used as a
     /// Prometheus label value in compat_*_verdict and compat_enforce_rejected_total.
@@ -1437,10 +1456,12 @@ mod tests {
         let verdict = policy.check_worker(Some(&incompatible));
         let warned = DashMap::new();
 
-        // A compatible worker records the compatible verdict.
+        // A compatible worker records the compatible verdict. Unique peer ids
+        // keep this test isolated: metrics are process-global and other tests
+        // also exercise worker:7 / worker:8 concurrently.
         MasterHandler::check_peer_compatibility(
             "worker",
-            "worker:7",
+            "worker:700",
             &warned,
             CompatibilityMode::Diagnose,
             CompatibilityVerdict::Compatible,
@@ -1450,9 +1471,38 @@ mod tests {
         assert_eq!(
             metrics
                 .compat_worker_verdict
-                .with_label_values(&["7", "compatible"])
+                .with_label_values(&["700", "compatible"])
                 .get(),
             1
+        );
+
+        // When a peer's verdict changes, the previous label must be cleared:
+        // only one label per peer is active at a time.
+        MasterHandler::check_peer_compatibility(
+            "worker",
+            "worker:700",
+            &warned,
+            CompatibilityMode::Diagnose,
+            CompatibilityVerdict::VersionTooOld {
+                peer: "0.1.0".to_string(),
+                min: "0.2.0".to_string(),
+            },
+            metrics,
+        )
+        .unwrap();
+        assert_eq!(
+            metrics
+                .compat_worker_verdict
+                .with_label_values(&["700", "version_too_old"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .compat_worker_verdict
+                .with_label_values(&["700", "compatible"])
+                .get(),
+            0
         );
 
         // An enforce-mode rejection (too-old worker) bumps the counter and
@@ -1465,7 +1515,7 @@ mod tests {
             .get();
         let err = MasterHandler::check_peer_compatibility(
             "worker-test",
-            "worker:8",
+            "worker:701",
             &warned,
             policy.mode,
             verdict,
@@ -1483,7 +1533,7 @@ mod tests {
         assert_eq!(
             metrics
                 .compat_worker_verdict
-                .with_label_values(&["8", "version_too_old"])
+                .with_label_values(&["701", "version_too_old"])
                 .get(),
             1
         );
