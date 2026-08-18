@@ -265,9 +265,9 @@ impl BlockLayout for FileLayout {
         // Block metadata can briefly retain the pre-resize length while a new
         // active generation is already published. The opened file is the
         // source of truth for bytes that can be read physically.
-        let device = LocalFile::with_read(file, 0)?;
-        let physical_len = device.len();
-        let logical_len = logical_len.max(physical_len);
+        let inner = OpenOptions::new().read(true).open(&file)?;
+        let device = LocalFile::from_file(&file, inner)?;
+        let physical_len = device.len().min(logical_len);
         if off < 0 || off > logical_len {
             return err_box!(
                 "Invalid block offset: {}, block length: {}",

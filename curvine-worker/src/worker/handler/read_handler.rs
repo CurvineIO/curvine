@@ -41,6 +41,10 @@ pub struct ReadHandler {
 impl ReadHandler {
     pub const MAX_READ_AHEAD: i64 = 16 * 1024 * 1024;
 
+    fn can_short_circuit(logical_len: i64, physical_len: i64) -> bool {
+        physical_len >= logical_len
+    }
+
     pub fn new(store: BlockStore) -> CommonResult<Self> {
         let metrics = Worker::get_metrics()?;
         let conf = Worker::get_conf()?;
@@ -60,27 +64,21 @@ impl ReadHandler {
         let context = ReadContext::from_req(msg)?;
         let conf = Worker::get_conf()?;
         let max_block_size = conf.master.max_block_size;
-        let meta = self.store.get_block(context.block_id).map_err(|e| {
+        self.store.get_block(context.block_id).map_err(|e| {
             FsError::block_not_found(context.block_id)
                 .ctx(format!("worker block store lookup failed: {}", e))
         })?;
 
-        // Master sparse ResizeFile may raise logical block len above the
-        // worker's physical file size. Only synthesize a sparse tail when the
-        // client advertises a validated logical length above physical bytes.
-        let physical_len = meta.len;
-        let logical_len = if context.len > physical_len {
-            if context.len > max_block_size {
-                return err_box!(
-                    "Advertised block length {} exceeds max_block_size {}",
-                    context.len,
-                    max_block_size
-                );
-            }
-            context.len
-        } else {
-            physical_len
-        };
+        // The Master/client length is the logical boundary. Worker metadata
+        // may briefly describe an older physical generation.
+        let logical_len = context.len;
+        if logical_len < 0 || logical_len > max_block_size {
+            return err_box!(
+                "Advertised block length {} is outside 0..={}",
+                logical_len,
+                max_block_size
+            );
+        }
         if context.off < 0 {
             return err_box!(
                 "Invalid read offset: {}, block length: {}",
@@ -118,13 +116,15 @@ impl ReadHandler {
 
         // Short-circuit local reads cannot synthesize sparse tails; force the
         // remote path when logical length exceeds physical worker bytes.
-        let sc_path = if context.short_circuit && logical_len <= meta.len {
-            self.store.short_circuit_by_id(context.block_id)?
+        let sc_path = if context.short_circuit {
+            self.store
+                .short_circuit_by_id(context.block_id)?
+                .filter(|(_, _, physical_len)| Self::can_short_circuit(logical_len, *physical_len))
         } else {
             None
         };
 
-        let (meta, is_short_circuit, path, file) = if let Some((meta, path)) = sc_path {
+        let (meta, is_short_circuit, path, file) = if let Some((meta, path, _)) = sc_path {
             (meta, true, path, None)
         } else {
             let (meta, file) =
@@ -240,5 +240,16 @@ impl ReadHandler {
 
             _ => err_box!("Unsupported request type"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReadHandler;
+
+    #[test]
+    fn short_circuit_requires_live_physical_coverage() {
+        assert!(ReadHandler::can_short_circuit(20, 50));
+        assert!(!ReadHandler::can_short_circuit(50, 20));
     }
 }

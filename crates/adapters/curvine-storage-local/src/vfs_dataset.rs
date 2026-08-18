@@ -1129,6 +1129,28 @@ mod test {
     }
 
     #[test]
+    fn file_reader_clamps_physical_file_to_logical_length() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "reader-logical-length-boundary");
+        let mut block = ExtendedBlock::with_mem(1, "50B")?;
+        let writing = ds.open_block(&block)?;
+        ds.write_test_data(&writing, "50B")?;
+        block.len = 50;
+        let finalized = ds.finalize_block(&block)?;
+
+        let dir = ds.find_dir(finalized.dir_id())?;
+        let mut reader = FileLayout.open_reader(dir, &finalized, 0, 20)?;
+        let region = reader.read_region(false, 50)?;
+        let bytes = match region {
+            DataSlice::Buffer(bytes) => bytes,
+            other => panic!("expected bounded buffered read, got {other:?}"),
+        };
+
+        assert_eq!(bytes.len(), 20);
+        assert_eq!(&bytes[..], b"A".repeat(20).as_slice());
+        Ok(())
+    }
+
+    #[test]
     fn remove_block_during_rewrite_deletes_active_and_staging_files() -> CommonResult<()> {
         let mut ds = create_data_set(true, "remove-during-rewrite");
         let mut block = ExtendedBlock::with_mem(1, "100B")?;
