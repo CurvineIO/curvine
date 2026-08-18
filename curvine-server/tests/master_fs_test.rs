@@ -27,7 +27,7 @@ use curvine_model::{
 use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
     CompleteFileRequest, CompleteFileResponse, CreateFileRequest, DeleteRequest,
-    GetMasterInfoRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
+    GetFilesystemInfoRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
 };
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
@@ -307,7 +307,7 @@ fn control_plane_requests_use_the_async_handler() {
         RpcCode::GetJobStatus,
         RpcCode::CancelJob,
         RpcCode::ReportTask,
-        RpcCode::GetMasterInfo,
+        RpcCode::GetFilesystemInfo,
         RpcCode::GetCvMetadataSnapshotPage,
         RpcCode::GetCvMetadataDeltaPage,
     ] {
@@ -337,8 +337,8 @@ fn control_plane_requests_use_the_async_handler() {
 fn sync_rpc_to_standby_returns_rpc_error_response() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let handler = new_handler();
-    let msg = Builder::new_rpc(RpcCode::GetMasterInfo)
-        .proto_header(GetMasterInfoRequest::default())
+    let msg = Builder::new_rpc(RpcCode::GetFilesystemInfo)
+        .proto_header(GetFilesystemInfoRequest::default())
         .build();
 
     let response = handler.handle(&msg)?;

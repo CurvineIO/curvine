@@ -184,13 +184,13 @@ pub fn python_io_curvine_curvine_native_delete(
 }
 
 #[pyfunction]
-pub fn python_io_curvine_curvine_native_get_master_info<'py>(
+pub fn python_io_curvine_curvine_native_get_filesystem_info<'py>(
     ptr: usize,
     py: Python<'py>,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let fs_ptr = ptr as *mut PythonFilesystem;
     let fs = unsafe { &*fs_ptr };
-    let status = fs.get_master_info().map_err(|e| e.into_py_err())?;
+    let status = fs.get_filesystem_info().map_err(|e| e.into_py_err())?;
     let bytes_data = status.freeze().to_vec();
     Ok(PyBytes::new(py, &bytes_data))
 }
@@ -282,7 +282,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        python_io_curvine_curvine_native_get_master_info,
+        python_io_curvine_curvine_native_get_filesystem_info,
         m
     )?)?;
 

@@ -46,7 +46,7 @@ use curvine_fs_api::{FileSystem, Path as FsPath, Reader, RpcCode, Writer};
 use curvine_job_client::{JobListOptions, JobMasterClient, TransferClient};
 use curvine_model::{
     AccessMode, FileBlocks, FileStatus, JobSourceType, JobStatus, JobTaskState, LoadJobCommand,
-    MasterInfo, MountInfo, MountOptions, Provider, StorageState, StorageType, TransferCommand,
+    FilesystemInfo, MountInfo, MountOptions, Provider, StorageState, StorageType, TransferCommand,
     TransferKind, TransferState, TtlAction, WorkerInfo, WriteType,
 };
 use curvine_net::net::InetAddr;
@@ -574,7 +574,7 @@ async fn raft_ping_status(
     }
 }
 
-async fn master_ha_payload(instance: &AdminRouterHandler, master_info: &MasterInfo) -> Value {
+async fn master_ha_payload(instance: &AdminRouterHandler, master_info: &FilesystemInfo) -> Value {
     let conf = &instance.conf;
     let active_master = master_info.active_master.trim().to_string();
     let active_raft_id = master_info
@@ -1473,10 +1473,10 @@ impl AdminRouterHandler {
     }
 }
 
-async fn current_master_info(instance: &AdminRouterHandler) -> FsResult<MasterInfo> {
+async fn current_master_info(instance: &AdminRouterHandler) -> FsResult<FilesystemInfo> {
     match timeout(
         Duration::from_secs(MASTER_INFO_TIMEOUT_SECS),
-        instance.unified_fs.get_master_info(),
+        instance.unified_fs.get_filesystem_info(),
     )
     .await
     {

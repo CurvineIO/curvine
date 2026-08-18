@@ -26,7 +26,7 @@ use super::discovery::{discover_targets, DiscoveryResult};
 use super::model::{MetricSample, MetricTarget, TargetHealth, ACTIVE_MASTER_INSTANCE};
 use super::provider::TargetRegistry;
 use super::scraper::MetricsScraper;
-use curvine_model::MasterInfo;
+use curvine_model::FilesystemInfo;
 
 pub async fn run_collector(provider: Arc<BuiltinProvider>) {
     loop {
@@ -250,7 +250,7 @@ async fn scrape_one_target(
 const MASTER_INFO_FALLBACK_NOTE: &str =
     "master /metrics scrape failed; ingesting gauge metrics from GetMasterInfo";
 
-fn master_info_fallback_samples(info: &MasterInfo) -> Vec<MetricSample> {
+fn master_info_fallback_samples(info: &FilesystemInfo) -> Vec<MetricSample> {
     let mut samples = vec![
         gauge_sample("capacity", info.capacity),
         gauge_sample("available", info.available),
@@ -578,7 +578,7 @@ mod tests {
 
     #[test]
     fn master_info_fallback_samples_include_capacity_and_worker_counts() {
-        let info = MasterInfo {
+        let info = FilesystemInfo {
             capacity: 1_000,
             available: 400,
             fs_used: 600,

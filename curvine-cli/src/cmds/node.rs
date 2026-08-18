@@ -56,8 +56,8 @@ impl NodeCommand {
         path: &str,
     ) -> CommonResult<String> {
         // Get master address and web port
-        let master_info = client.get_master_info().await?;
-        let master_parts: Vec<&str> = master_info.active_master.split(':').collect();
+        let filesystem_info = client.get_filesystem_info().await?;
+        let master_parts: Vec<&str> = filesystem_info.active_master.split(':').collect();
         let master_host = master_parts[0];
         let web_port = conf.master.web_port;
 

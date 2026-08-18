@@ -130,7 +130,7 @@ impl LoopTask for HeartbeatChecker {
             }
         }
 
-        if let Ok(info) = self.fs.master_info() {
+        if let Ok(info) = self.fs.filesystem_info() {
             self.quota_manager.detector(Some(info));
         };
 

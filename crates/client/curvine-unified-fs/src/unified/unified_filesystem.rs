@@ -25,8 +25,8 @@ use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, ListStream, Path, Reader, RpcCode, Writer};
 use curvine_job_client::{JobMasterClient, TransferClient};
 use curvine_model::{
-    CreateFileOpts, DeleteResult, FileAllocOpts, FileLock, FileStatus, FreeResult, JobStatus,
-    ListOptions, LoadJobCommand, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions,
+    CreateFileOpts, DeleteResult, FileAllocOpts, FileLock, FileStatus, FilesystemInfo, FreeResult,
+    JobStatus, ListOptions, LoadJobCommand, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions,
     OpenFlags, RenameFlags, SetAttrOpts, TransferCommand, TransferKind, TransferState,
 };
 use curvine_runtime::common::TimeSpent;
@@ -202,14 +202,14 @@ impl UnifiedFileSystem {
         }
     }
 
-    pub async fn get_master_info(&self) -> FsResult<MasterInfo> {
-        let fut = async { self.cv.get_master_info().await };
-        self.track("GetMasterInfo", "", "", fut).await
+    pub async fn get_filesystem_info(&self) -> FsResult<FilesystemInfo> {
+        let fut = async { self.cv.get_filesystem_info().await };
+        self.track("GetFilesystemInfo", "", "", fut).await
     }
 
-    pub async fn get_master_info_bytes(&self) -> FsResult<BytesMut> {
-        let fut = async { self.cv.get_master_info_bytes().await };
-        self.track("GetMasterInfo", "", "", fut).await
+    pub async fn get_filesystem_info_bytes(&self) -> FsResult<BytesMut> {
+        let fut = async { self.cv.get_filesystem_info_bytes().await };
+        self.track("GetFilesystemInfo", "", "", fut).await
     }
 
     pub async fn mount(&self, ufs_path: &Path, cv_path: &Path, opts: MountOptions) -> FsResult<()> {

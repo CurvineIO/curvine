@@ -331,7 +331,18 @@ public class CurvineNative {
 
     public static native long delete(long nativeHandle, String path, boolean recursive) throws IOException;
 
-    public static native byte[] getMasterInfo(long nativeHandle) throws IOException;
+    public static native byte[] getFilesystemInfo(long nativeHandle) throws IOException;
+
+    /**
+     * @deprecated renamed to {@link #getFilesystemInfo(long)}; this RPC returns
+     * whole-filesystem statistics, not master-process information. Kept as a
+     * non-native forwarder for source compatibility; will be removed in a
+     * future release.
+     */
+    @Deprecated
+    public static byte[] getMasterInfo(long nativeHandle) throws IOException {
+        return getFilesystemInfo(nativeHandle);
+    }
 
     public static native byte[] getMountInfo(long nativeHandle, String path) throws IOException;
 

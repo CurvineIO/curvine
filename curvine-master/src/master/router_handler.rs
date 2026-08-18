@@ -116,28 +116,28 @@ async fn overview(
     let fs = &instance.fs;
     let conf = &instance.conf;
     let start_time = &instance.start_time;
-    let master_info = fs.master_info()?;
+    let filesystem_info = fs.filesystem_info()?;
 
     let (files_total, dir_total) = {
         let (f, d) = fs.get_file_counts();
         (f as usize, d as usize)
     };
 
-    let expected_capacity = master_info.available + master_info.fs_used;
-    if master_info.capacity != expected_capacity {
+    let expected_capacity = filesystem_info.available + filesystem_info.fs_used;
+    if filesystem_info.capacity != expected_capacity {
         log::warn!(
             "Capacity inconsistency detected: capacity={}, available={}, fs_used={}, expected_capacity={}",
-            master_info.capacity,
-            master_info.available,
-            master_info.fs_used,
+            filesystem_info.capacity,
+            filesystem_info.available,
+            filesystem_info.fs_used,
             expected_capacity
         );
     } else {
         log::debug!(
             "Capacity consistency verified: capacity={}, available={}, fs_used={}",
-            master_info.capacity,
-            master_info.available,
-            master_info.fs_used
+            filesystem_info.capacity,
+            filesystem_info.available,
+            filesystem_info.fs_used
         );
     }
 
@@ -147,12 +147,12 @@ async fn overview(
         "cluster_id": conf.cluster_id,
         "master_addr": conf.master_addr().to_string(),
         "start_time": start_time,
-        "live_workers": master_info.live_workers.len(),
-        "lost_workers": master_info.lost_workers.len(),
-        "available": master_info.available,
-        "capacity": master_info.capacity,
-        "fs_used": master_info.fs_used,
-        "reserved_bytes": master_info.reserved_bytes,
+        "live_workers": filesystem_info.live_workers.len(),
+        "lost_workers": filesystem_info.lost_workers.len(),
+        "available": filesystem_info.available,
+        "capacity": filesystem_info.capacity,
+        "fs_used": filesystem_info.fs_used,
+        "reserved_bytes": filesystem_info.reserved_bytes,
         "files_total": files_total,
         "dir_total": dir_total,
         "master_state": master_state,

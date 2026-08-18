@@ -15,20 +15,20 @@
 package io.curvine;
 
 import io.curvine.bench.Utils;
-import io.curvine.proto.GetMasterInfoResponse;
+import io.curvine.proto.GetFilesystemInfoResponse;
 import io.curvine.proto.WorkerInfoProto;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.fs.FsStatus;
 
 public class CurvineFsStat extends FsStatus {
-    private final GetMasterInfoResponse info;
+    private final GetFilesystemInfoResponse info;
 
-    public CurvineFsStat(GetMasterInfoResponse info) {
+    public CurvineFsStat(GetFilesystemInfoResponse info) {
         super(info.getCapacity(), info.getFsUsed(), info.getAvailable());
         this.info = info;
     }
 
-    public GetMasterInfoResponse getInfo() {
+    public GetFilesystemInfoResponse getInfo() {
         return info;
     }
 

@@ -35,7 +35,7 @@ pub enum RpcCode {
     AddBlock = 11,
     CompleteFile = 12,
     GetBlockLocations = 13,
-    GetMasterInfo = 14,
+    GetFilesystemInfo = 14,
     SetAttr = 15,
     Symlink = 16,
     Link = 17,

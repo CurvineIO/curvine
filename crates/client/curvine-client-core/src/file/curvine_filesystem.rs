@@ -26,7 +26,7 @@ use curvine_model::ProtoUtils;
 use curvine_model::{CommitBlock, DeleteResult, FreeResult, ListOptions};
 use curvine_model::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
-    MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, RenameFlags,
+    FilesystemInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, RenameFlags,
     SetAttrOpts,
 };
 use curvine_proto::{GetCvMetadataDeltaPageResponse, GetCvMetadataSnapshotPageResponse};
@@ -286,12 +286,12 @@ impl CurvineFileSystem {
         self.fs_client.get_block_locations(path).await
     }
 
-    pub async fn get_master_info(&self) -> FsResult<MasterInfo> {
-        self.fs_client.get_master_info().await
+    pub async fn get_filesystem_info(&self) -> FsResult<FilesystemInfo> {
+        self.fs_client.get_filesystem_info().await
     }
 
-    pub async fn get_master_info_bytes(&self) -> FsResult<BytesMut> {
-        self.fs_client.get_master_info_bytes().await
+    pub async fn get_filesystem_info_bytes(&self) -> FsResult<BytesMut> {
+        self.fs_client.get_filesystem_info_bytes().await
     }
 
     pub async fn get_mount_table(&self) -> FsResult<Vec<MountInfo>> {

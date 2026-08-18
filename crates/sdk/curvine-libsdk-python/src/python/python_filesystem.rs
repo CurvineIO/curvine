@@ -61,9 +61,9 @@ impl PythonFilesystem {
         self.inner.delete(path, recursive).map(|_| ())
     }
 
-    //Get master information
-    pub fn get_master_info(&self) -> FsResult<BytesMut> {
-        let status = self.inner.get_master_info()?;
+    //Get filesystem information
+    pub fn get_filesystem_info(&self) -> FsResult<BytesMut> {
+        let status = self.inner.get_filesystem_info()?;
         Ok(status)
     }
 }

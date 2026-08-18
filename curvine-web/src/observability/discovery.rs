@@ -15,7 +15,7 @@
 use std::time::Duration;
 
 use curvine_config::ClusterConf;
-use curvine_model::{MasterInfo, WorkerInfo};
+use curvine_model::{FilesystemInfo, WorkerInfo};
 use curvine_unified_fs::UnifiedFileSystem;
 use tokio::time::timeout;
 
@@ -46,7 +46,7 @@ pub struct DiscoveryResult {
     pub transfers: Vec<MetricTarget>,
     /// Populated when `get_master_info` succeeds; used to backfill master gauge
     /// metrics when the master `/metrics` HTTP scrape is unavailable.
-    pub master_info: Option<MasterInfo>,
+    pub master_info: Option<FilesystemInfo>,
 }
 
 pub fn build_master_metrics_target(conf: &ClusterConf, active_master: &str) -> MetricTarget {
@@ -101,7 +101,7 @@ fn discover_workers(
 }
 
 fn discover_workers_from_master_info(
-    info: &MasterInfo,
+    info: &FilesystemInfo,
     conf: &ClusterConf,
 ) -> Vec<WorkerDiscovery> {
     let mut workers = Vec::new();
@@ -159,7 +159,7 @@ pub async fn discover_targets(
 ) -> DiscoveryResult {
     match timeout(
         Duration::from_secs(MASTER_INFO_TIMEOUT_SECS),
-        unified_fs.get_master_info(),
+        unified_fs.get_filesystem_info(),
     )
     .await
     {
@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn discovers_all_worker_states_from_master_info() {
         let conf = test_conf();
-        let info = MasterInfo {
+        let info = FilesystemInfo {
             live_workers: vec![sample_worker(1, "w1", "10.0.0.1", 8996, 9001)],
             blacklist_workers: vec![sample_worker(2, "w2", "10.0.0.2", 8996, 9001)],
             decommission_workers: vec![sample_worker(3, "w3", "10.0.0.3", 8996, 9001)],

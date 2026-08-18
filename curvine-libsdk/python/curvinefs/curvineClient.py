@@ -4,12 +4,13 @@ This module provides the CurvineClient class which serves as the primary
 interface for interacting with the Curvine distributed file system.
 """
 from typing import Any, Dict, List, Optional, Union
+import warnings
 
 import curvine_libsdk
 from curvine_libsdk._proto.common_pb2 import FileStatusProto
 from curvine_libsdk._proto.master_pb2 import (
     GetFileStatusResponse,
-    GetMasterInfoResponse,
+    GetFilesystemInfoResponse,
     ListStatusResponse,
 )
 
@@ -85,7 +86,7 @@ class CurvineClient:
         }
         return file_status_dict
 
-    def get_master_info(self) -> Dict[str, Any]:
+    def get_filesystem_info(self) -> Dict[str, Any]:
         """Get information about the Curvine cluster.
 
         Returns:
@@ -106,13 +107,13 @@ class CurvineClient:
                 - lost_workers: List of lost workers
 
         Raises:
-            IOError: If getting master info fails.
+            IOError: If getting filesystem info fails.
         """
         try:
-            status_bytes = curvine_libsdk.python_io_curvine_curvine_native_get_master_info(self.file_system_ptr)
+            status_bytes = curvine_libsdk.python_io_curvine_curvine_native_get_filesystem_info(self.file_system_ptr)
         except Exception as e:
-            raise IOError(f"Native get master information failed: {e}")
-        status = GetMasterInfoResponse()
+            raise IOError(f"Native get filesystem information failed: {e}")
+        status = GetFilesystemInfoResponse()
         status.ParseFromString(status_bytes)
         status_dict = {
             "active_master": status.active_master,
@@ -131,6 +132,20 @@ class CurvineClient:
             "lost_workers": list(status.lost_workers),
         }
         return status_dict
+
+    def get_master_info(self) -> Dict[str, Any]:
+        """Deprecated alias of :meth:`get_filesystem_info`.
+
+        The RPC returns whole-filesystem statistics, not master-process
+        information. Kept for source compatibility; will be removed in a
+        future release.
+        """
+        warnings.warn(
+            "get_master_info() is deprecated, use get_filesystem_info()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.get_filesystem_info()
 
     def mkdir(self, path: str, create_parents: bool) -> None:
         """Create a directory.

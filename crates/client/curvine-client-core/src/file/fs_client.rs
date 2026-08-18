@@ -100,7 +100,7 @@ impl_without_client_context!(
     GetCvMetadataDeltaPageRequest,
     GetCvMetadataSnapshotPageRequest,
     GetJobStatusRequest,
-    GetMasterInfoRequest,
+    GetFilesystemInfoRequest,
     GetMountInfoRequest,
     GetMountTableRequest,
     ListJobStatusRequest,
@@ -623,16 +623,16 @@ impl FsClient {
         self.rpc(RpcCode::GetCvMetadataDeltaPage, header).await
     }
 
-    pub async fn get_master_info(&self) -> FsResult<MasterInfo> {
-        let header = GetMasterInfoRequest::default();
-        let rep: GetMasterInfoResponse = self.rpc(RpcCode::GetMasterInfo, header).await?;
-        let res = ProtoUtils::master_info_from_pb(rep);
+    pub async fn get_filesystem_info(&self) -> FsResult<FilesystemInfo> {
+        let header = GetFilesystemInfoRequest::default();
+        let rep: GetFilesystemInfoResponse = self.rpc(RpcCode::GetFilesystemInfo, header).await?;
+        let res = ProtoUtils::filesystem_info_from_pb(rep);
         Ok(res)
     }
 
-    pub async fn get_master_info_bytes(&self) -> FsResult<BytesMut> {
-        let header = GetMasterInfoRequest::default();
-        self.rpc_bytes(RpcCode::GetMasterInfo, header).await
+    pub async fn get_filesystem_info_bytes(&self) -> FsResult<BytesMut> {
+        let header = GetFilesystemInfoRequest::default();
+        self.rpc_bytes(RpcCode::GetFilesystemInfo, header).await
     }
 
     pub async fn set_worker_status(

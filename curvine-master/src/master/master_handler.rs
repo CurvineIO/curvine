@@ -26,8 +26,8 @@ use curvine_fs_api::Path;
 use curvine_fs_api::RpcCode;
 use curvine_model::ProtoUtils;
 use curvine_model::{
-    CreateFileOpts, DeleteBlockCmd, DeleteResult, FileBlocks, FileStatus, FreeResult,
-    HeartbeatStatus, ListOptions, MasterInfo, OpenFlags, RenameFlags, WorkerCommand, WorkerInfo,
+    CreateFileOpts, DeleteBlockCmd, DeleteResult, FileBlocks, FileStatus, FilesystemInfo,
+    FreeResult, HeartbeatStatus, ListOptions, OpenFlags, RenameFlags, WorkerCommand, WorkerInfo,
     WorkerStatus,
 };
 use curvine_net::net::ConnState;
@@ -461,14 +461,14 @@ impl MasterHandler {
         rx.await?
     }
 
-    async fn async_get_master_info(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let _: GetMasterInfoRequest = ctx.parse_header()?;
+    async fn async_get_filesystem_info(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let _: GetFilesystemInfoRequest = ctx.parse_header()?;
         let fs = self.fs.clone();
         let info = Self::run_master_rpc_task(self.control_rpc_executor.clone(), move || {
-            Self::process_get_master_info(fs)
+            Self::process_get_filesystem_info(fs)
         })
         .await?;
-        let rep_header = ProtoUtils::master_info_to_pb(info);
+        let rep_header = ProtoUtils::filesystem_info_to_pb(info);
         ctx.response(rep_header)
     }
 
@@ -575,8 +575,8 @@ impl MasterHandler {
         ctx.response(response)
     }
 
-    fn process_get_master_info(fs: MasterFilesystem) -> FsResult<MasterInfo> {
-        fs.master_info()
+    fn process_get_filesystem_info(fs: MasterFilesystem) -> FsResult<FilesystemInfo> {
+        fs.filesystem_info()
     }
 
     pub fn worker_heartbeat(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -896,7 +896,7 @@ impl MessageHandler for MasterHandler {
                 | RpcCode::ListJobStatus
                 | RpcCode::CancelJob
                 | RpcCode::ReportTask
-                | RpcCode::GetMasterInfo
+                | RpcCode::GetFilesystemInfo
                 | RpcCode::GetCvMetadataSnapshotPage
                 | RpcCode::GetCvMetadataDeltaPage
         )
@@ -1010,7 +1010,7 @@ impl MessageHandler for MasterHandler {
                 RpcCode::ListJobStatus => self.job_handler.list_load_status(ctx),
                 RpcCode::CancelJob => self.job_handler.cancel_job(ctx).await,
                 RpcCode::ReportTask => self.job_handler.task_report(ctx),
-                RpcCode::GetMasterInfo => self.async_get_master_info(ctx).await,
+                RpcCode::GetFilesystemInfo => self.async_get_filesystem_info(ctx).await,
                 RpcCode::GetCvMetadataSnapshotPage => {
                     self.async_get_cv_metadata_snapshot_page(ctx).await
                 }
@@ -1032,7 +1032,7 @@ impl MessageHandler for MasterHandler {
         let code = RpcCode::from(msg.code());
         if matches!(
             code,
-            RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport | RpcCode::GetMasterInfo
+            RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport | RpcCode::GetFilesystemInfo
         ) {
             Some(&self.actor_rt)
         } else {
@@ -1079,7 +1079,7 @@ mod tests {
 
         MasterHandler::process_worker_heartbeat(fs.clone(), header).unwrap();
 
-        let info = fs.master_info().unwrap();
+        let info = fs.filesystem_info().unwrap();
         let worker = info
             .live_workers
             .iter()

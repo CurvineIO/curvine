@@ -207,10 +207,20 @@ public class CurvineFsMount {
         checkError(CurvineNative.delete(nativeHandle, path, recursive));
     }
 
-    public byte[] getMasterInfo() throws IOException {
-        byte[] bytes = CurvineNative.getMasterInfo(nativeHandle);
+    public byte[] getFilesystemInfo() throws IOException {
+        byte[] bytes = CurvineNative.getFilesystemInfo(nativeHandle);
         checkError(bytes);
         return bytes;
+    }
+
+    /**
+     * @deprecated renamed to {@link #getFilesystemInfo()}; this RPC returns
+     * whole-filesystem statistics, not master-process information. Kept for
+     * source compatibility and will be removed in a future release.
+     */
+    @Deprecated
+    public byte[] getMasterInfo() throws IOException {
+        return getFilesystemInfo();
     }
 
     public byte[] getMountInfo(String path) throws IOException {
