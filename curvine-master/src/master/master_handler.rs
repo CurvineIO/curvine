@@ -26,15 +26,16 @@ use curvine_fs_api::Path;
 use curvine_fs_api::RpcCode;
 use curvine_model::ProtoUtils;
 use curvine_model::{
-    CreateFileOpts, DeleteBlockCmd, DeleteResult, FileBlocks, FileStatus, FilesystemInfo,
-    FreeResult, HeartbeatStatus, ListOptions, OpenFlags, RenameFlags, WorkerCommand, WorkerInfo,
-    WorkerStatus,
+    CompatibilityMode, CompatibilityPolicy, CompatibilityVerdict, CreateFileOpts, DeleteBlockCmd,
+    DeleteResult, FileBlocks, FileStatus, FilesystemInfo, FreeResult, HeartbeatStatus, ListOptions,
+    OpenFlags, RenameFlags, WorkerCommand, WorkerInfo, WorkerStatus,
 };
 use curvine_net::net::ConnState;
 use curvine_proto::*;
 use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::Message;
 use curvine_runtime::runtime::{GroupExecutor, Runtime};
+use dashmap::DashMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -50,10 +51,19 @@ pub struct MasterHandler {
     pub(crate) control_rpc_executor: Arc<GroupExecutor>,
     pub(crate) replication_handler: Option<MasterReplicationHandler>,
     pub(crate) actor_rt: Arc<Runtime>,
-    // Master's own version + default compatibility contract, built once at
-    // startup. GetFilesystemInfo backs statfs and is called frequently, so we
-    // reuse this instead of recomputing component_version() on every call.
+    // Master's own version + compatibility contract, built once at startup.
+    // GetFilesystemInfo backs statfs and is called frequently, so we reuse
+    // this instead of recomputing component_version() on every call.
     master_compatibility: ServerCompatibilityInfoProto,
+    // Compatibility policy derived from the master configuration. Used to
+    // evaluate worker heartbeats and client handshakes with diagnose/enforce
+    // semantics (lenient diagnose by default).
+    compatibility_policy: CompatibilityPolicy,
+    // Last compatibility verdict warned about per peer (worker id / client
+    // address). Diagnose-mode warnings are deduped so a persistently
+    // incompatible or legacy peer does not spam identical warnings on every
+    // heartbeat or statfs call.
+    compat_warned: DashMap<String, CompatibilityVerdict>,
 }
 
 impl MasterHandler {
@@ -74,7 +84,12 @@ impl MasterHandler {
         // Build the master's compatibility payload once; GetFilesystemInfo can
         // be hot (statfs) and the underlying version metadata is immutable.
         let master_version = curvine_sys::version::component_version("master");
-        let master_compatibility = ProtoUtils::default_master_compatibility_to_pb(&master_version);
+        // The advertised contract and the enforcement policy both come from
+        // the configured compatibility section; defaults are lenient diagnose
+        // with no bounds, so old components are never rejected by default.
+        let compatibility_policy = conf.master.compatibility.to_policy();
+        let master_compatibility =
+            ProtoUtils::compatibility_to_pb(&master_version, &compatibility_policy);
         Self {
             fs,
             retry_cache,
@@ -87,6 +102,8 @@ impl MasterHandler {
             replication_handler: Some(MasterReplicationHandler::new(replication_manager)),
             actor_rt,
             master_compatibility,
+            compatibility_policy,
+            compat_warned: DashMap::new(),
         }
     }
 
@@ -471,7 +488,25 @@ impl MasterHandler {
     }
 
     async fn async_get_filesystem_info(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let _: GetFilesystemInfoRequest = ctx.parse_header()?;
+        let req: GetFilesystemInfoRequest = ctx.parse_header()?;
+        // GetFilesystemInfo backs statfs and is called frequently. Only
+        // evaluate the compatibility policy when the result can actually be
+        // acted upon (enforce mode, configured bounds/blocklist, or the client
+        // reported component_info); otherwise a legacy client would hit a
+        // MissingInfo verdict and log a warning on every statfs call.
+        if self
+            .compatibility_policy
+            .should_evaluate(req.component_info.is_some())
+        {
+            Self::check_peer_compatibility(
+                "client",
+                &format!("client:{}", self.client_ip()),
+                &self.compat_warned,
+                self.compatibility_policy.mode,
+                self.compatibility_policy
+                    .check_client(req.component_info.as_ref()),
+            )?;
+        }
         let fs = self.fs.clone();
         let info = Self::run_master_rpc_task(self.control_rpc_executor.clone(), move || {
             Self::process_get_filesystem_info(fs)
@@ -604,11 +639,75 @@ impl MasterHandler {
 
     pub fn worker_heartbeat(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: WorkerHeartbeatRequest = ctx.parse_header()?;
+        // Evaluate the compatibility policy only when the result can actually
+        // be acted upon (enforce mode, configured bounds/blocklist, or the
+        // worker reported component_info); otherwise a legacy worker would hit
+        // a MissingInfo verdict and log a warning on every heartbeat.
+        if self
+            .compatibility_policy
+            .should_evaluate(header.component_info.is_some())
+        {
+            Self::check_peer_compatibility(
+                "worker",
+                &format!("worker:{}", header.worker_id),
+                &self.compat_warned,
+                self.compatibility_policy.mode,
+                self.compatibility_policy
+                    .check_worker(header.component_info.as_ref()),
+            )?;
+        }
         let cmds = Self::process_worker_heartbeat(self.fs.clone(), header)?;
         let rep_header = WorkerHeartbeatResponse {
             cmds: ProtoUtils::worker_cmd_to_pb(cmds),
         };
         ctx.response(rep_header)
+    }
+
+    /// Evaluate a compatibility verdict against the configured mode.
+    ///
+    /// - `diagnose` (default): log a warning for non-compatible peers and
+    ///   allow the request, so old components are never rejected without
+    ///   explicit configuration.
+    /// - `enforce`: reject with an explicit error describing the actual peer
+    ///   version, the expected bound and the upgrade suggestion.
+    ///
+    /// Diagnose-mode warnings are deduped per peer: a persistently
+    /// incompatible or legacy peer (heartbeats run every few seconds, statfs
+    /// every call) warns on the first occurrence and again only when its
+    /// verdict changes, so repeated identical warnings do not flood
+    /// operational logs.
+    fn check_peer_compatibility(
+        peer: &str,
+        dedup_key: &str,
+        warned: &DashMap<String, CompatibilityVerdict>,
+        mode: CompatibilityMode,
+        verdict: CompatibilityVerdict,
+    ) -> FsResult<()> {
+        if !verdict.rejects(mode) {
+            if !verdict.is_compatible() {
+                // Warn on the first occurrence and whenever the verdict
+                // changes for this peer; suppress identical repeats.
+                let changed = warned
+                    .get(dedup_key)
+                    .map(|last| *last != verdict)
+                    .unwrap_or(true);
+                if changed {
+                    warned.insert(dedup_key.to_string(), verdict.clone());
+                    log::warn!("{} compatibility: {}", peer, verdict.describe());
+                }
+            } else {
+                // The peer is compatible again; forget the previous warning so
+                // a future incompatibility is surfaced.
+                warned.remove(dedup_key);
+            }
+            return Ok(());
+        }
+        err_box!(
+            "{} rejected by compatibility policy: {}; upgrade the {} or set master.compatibility.mode = \"diagnose\" to allow it",
+            peer,
+            verdict.describe(),
+            peer
+        )
     }
 
     fn process_worker_heartbeat(
@@ -1167,5 +1266,186 @@ mod tests {
             CompatibilityModeProto::Diagnose as i32
         );
         assert!(compat.blocked_versions.is_empty());
+    }
+
+    #[test]
+    fn diagnose_warnings_are_deduped_per_peer() {
+        // A persistently incompatible worker must not re-log the same warning
+        // on every heartbeat: only a verdict change emits a new warning.
+        let policy = CompatibilityPolicy {
+            mode: CompatibilityMode::Diagnose,
+            min_worker_version: Some("0.2.0".parse().unwrap()),
+            ..Default::default()
+        };
+        let warned = DashMap::new();
+        let verdict = policy.check_worker(Some(&ComponentInfoProto {
+            release_version: Some("0.1.0".to_string()),
+            protocol_version: Some(1),
+            ..sample_component_info()
+        }));
+
+        // First occurrence warns and records the verdict.
+        assert!(MasterHandler::check_peer_compatibility(
+            "worker",
+            "worker:7",
+            &warned,
+            policy.mode,
+            verdict.clone()
+        )
+        .is_ok());
+        assert!(warned.contains_key("worker:7"));
+
+        // Identical verdict on a later heartbeat does not warn again but is
+        // still allowed.
+        assert!(MasterHandler::check_peer_compatibility(
+            "worker",
+            "worker:7",
+            &warned,
+            policy.mode,
+            verdict.clone()
+        )
+        .is_ok());
+
+        // A different incompatible verdict for the same peer warns again.
+        let different = CompatibilityVerdict::ProtocolMismatch {
+            peer: 2,
+            min: 1,
+            max: 1,
+        };
+        assert!(MasterHandler::check_peer_compatibility(
+            "worker",
+            "worker:7",
+            &warned,
+            policy.mode,
+            different.clone()
+        )
+        .is_ok());
+        assert_eq!(warned.get("worker:7").as_deref(), Some(&different));
+
+        // A separate peer is tracked independently.
+        assert!(!warned.contains_key("worker:8"));
+    }
+
+    #[test]
+    fn diagnose_mode_allows_incompatible_worker_heartbeat() {
+        // Configure a minimum worker version so the peer is genuinely
+        // incompatible (below the bound): diagnose mode must still allow the
+        // request (logging a warning) instead of rejecting it. A legacy worker
+        // without component_info is also allowed.
+        let policy = CompatibilityPolicy {
+            mode: CompatibilityMode::Diagnose,
+            min_worker_version: Some("0.2.0".parse().unwrap()),
+            ..Default::default()
+        };
+        let incompatible = ComponentInfoProto {
+            release_version: Some("0.1.0".to_string()),
+            protocol_version: Some(1),
+            ..sample_component_info()
+        };
+        let verdict = policy.check_worker(Some(&incompatible));
+        assert_eq!(
+            verdict,
+            CompatibilityVerdict::VersionTooOld {
+                peer: "0.1.0".to_string(),
+                min: "0.2.0".to_string()
+            }
+        );
+        let warned = DashMap::new();
+        assert!(MasterHandler::check_peer_compatibility(
+            "worker",
+            "worker:7",
+            &warned,
+            policy.mode,
+            verdict
+        )
+        .is_ok());
+
+        // Legacy worker (no component_info): MissingInfo, allowed in diagnose.
+        let verdict = policy.check_worker(None);
+        assert!(MasterHandler::check_peer_compatibility(
+            "worker",
+            "worker:7",
+            &warned,
+            policy.mode,
+            verdict
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn enforce_mode_rejects_incompatible_worker_heartbeat() {
+        let policy = CompatibilityPolicy {
+            mode: CompatibilityMode::Enforce,
+            min_worker_version: Some("0.2.0".parse().unwrap()),
+            ..Default::default()
+        };
+        let incompatible = ComponentInfoProto {
+            release_version: Some("0.1.0".to_string()),
+            protocol_version: Some(1),
+            ..sample_component_info()
+        };
+        let verdict = policy.check_worker(Some(&incompatible));
+        let warned = DashMap::new();
+        let err = MasterHandler::check_peer_compatibility(
+            "worker",
+            "worker:7",
+            &warned,
+            policy.mode,
+            verdict,
+        )
+        .unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("rejected by compatibility policy"), "{msg}");
+        assert!(msg.contains("0.1.0"), "{msg}");
+    }
+
+    #[test]
+    fn enforce_mode_rejects_legacy_client_without_component_info() {
+        let policy = CompatibilityPolicy {
+            mode: CompatibilityMode::Enforce,
+            ..Default::default()
+        };
+        let verdict = policy.check_client(None);
+        let warned = DashMap::new();
+        let err = MasterHandler::check_peer_compatibility(
+            "client",
+            "client:127.0.0.1",
+            &warned,
+            policy.mode,
+            verdict,
+        )
+        .unwrap_err();
+        assert!(format!("{}", err).contains("client rejected"));
+    }
+
+    #[test]
+    fn compatibility_to_pb_reflects_policy() {
+        let policy = CompatibilityPolicy {
+            mode: CompatibilityMode::Enforce,
+            min_worker_version: Some("0.2.0".parse().unwrap()),
+            blocked_versions: vec!["0.2.5".parse().unwrap()],
+            ..Default::default()
+        };
+        let master_version = curvine_sys::version::component_version("master");
+        let pb = ProtoUtils::compatibility_to_pb(&master_version, &policy);
+        assert_eq!(
+            pb.compatibility_mode,
+            CompatibilityModeProto::Enforce as i32
+        );
+        assert_eq!(pb.min_worker_version.as_deref(), Some("0.2.0"));
+        assert_eq!(pb.blocked_versions, vec!["0.2.5".to_string()]);
+    }
+
+    fn sample_component_info() -> ComponentInfoProto {
+        ComponentInfoProto {
+            component: Some("worker".to_string()),
+            release_version: Some("0.4.0-alpha".to_string()),
+            git_commit: Some("24c848719b5b4fea74519d91cbe462bb49761b36".to_string()),
+            git_tag: Some("v0.4.0-alpha".to_string()),
+            git_branch: Some("main".to_string()),
+            protocol_version: Some(1),
+            min_protocol_version: Some(1),
+            capabilities: vec!["transfer".to_string()],
+        }
     }
 }

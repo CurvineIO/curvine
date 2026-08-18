@@ -119,6 +119,11 @@ pub use self::result::*;
 mod proto_utils;
 pub use self::proto_utils::ProtoUtils;
 
+mod compatibility;
+pub use self::compatibility::{
+    feature_enabled, CompatibilityMode, CompatibilityPolicy, CompatibilityVerdict,
+};
+
 mod display;
 
 pub mod error {
