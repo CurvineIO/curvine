@@ -18,7 +18,6 @@ curvine-io = { workspace = true }
 curvine-core-error = { workspace = true }
 curvine-runtime = { workspace = true }
 bytes = { workspace = true }
-dashmap = { workspace = true }
 log = { workspace = true }
 once_cell = { workspace = true }
 tokio = { workspace = true }
