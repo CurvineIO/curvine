@@ -326,19 +326,18 @@ impl NodeCommand {
         let mut legacy_count: u32 = 0;
 
         for worker in workers {
-            // Prefer structured component_info
-            if let Some(component_info) = worker["component_info"].as_object() {
-                if let Some(version) = component_info
-                    .get("release_version")
-                    .and_then(|v| v.as_str())
-                {
-                    if !version.is_empty() {
-                        *version_counts.entry(version.to_string()).or_insert(0) += 1;
-                        continue;
-                    }
-                }
-                // component_info exists but empty -> treat as legacy
-                legacy_count += 1;
+            // Prefer structured component_info.release_version (T7+). When
+            // component_info is present but release_version is missing or
+            // empty (partially-upgraded / malformed payloads), fall back to
+            // the legacy software_version display string.
+            let release_version = worker["component_info"]
+                .as_object()
+                .and_then(|ci| ci.get("release_version"))
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty());
+
+            if let Some(version) = release_version {
+                *version_counts.entry(version.to_string()).or_insert(0) += 1;
             } else {
                 // Fall back to legacy software_version
                 let sv = worker["software_version"].as_str().unwrap_or("unknown");
@@ -384,8 +383,8 @@ impl NodeCommand {
 struct VersionCounts {
     /// Map of display version -> worker count. BTreeMap keeps output stable.
     versions: BTreeMap<String, u32>,
-    /// Workers with no usable version data (empty component_info or missing
-    /// release version).
+    /// Workers with no usable version data (no structured release_version and
+    /// no usable legacy software_version).
     legacy_count: u32,
 }
 
@@ -444,14 +443,39 @@ mod tests {
     }
 
     #[test]
-    fn count_worker_versions_treats_empty_component_info_as_legacy() {
-        // component_info present but without a release_version must not
-        // override the legacy software_version fallback; it counts as legacy.
+    fn count_worker_versions_falls_back_when_component_info_lacks_release_version() {
+        // component_info present but without a usable release_version must
+        // fall back to the legacy software_version display string instead of
+        // counting the worker as legacy.
+        let workers = vec![
+            serde_json::json!({
+                "address": {"hostname": "worker-host", "rpc_port": 1234},
+                "status": "Live",
+                "software_version": "0.2.0-test",
+                "component_info": {}
+            }),
+            serde_json::json!({
+                "address": {"hostname": "worker-host2", "rpc_port": 1235},
+                "status": "Live",
+                "software_version": "0.2.0-test",
+                "component_info": {"component": "worker", "release_version": ""}
+            }),
+        ];
+
+        let counts = NodeCommand::count_worker_versions(&workers);
+
+        assert_eq!(counts.versions.get("legacy (0.2.0-test)"), Some(&2));
+        assert_eq!(counts.legacy_count, 0);
+    }
+
+    #[test]
+    fn count_worker_versions_counts_legacy_when_no_version_data_at_all() {
+        // component_info present but release_version unusable, and no legacy
+        // software_version either -> legacy.
         let workers = vec![serde_json::json!({
             "address": {"hostname": "worker-host", "rpc_port": 1234},
             "status": "Live",
-            "software_version": "0.2.0-test",
-            "component_info": {}
+            "component_info": {"component": "worker", "release_version": ""}
         })];
 
         let counts = NodeCommand::count_worker_versions(&workers);
