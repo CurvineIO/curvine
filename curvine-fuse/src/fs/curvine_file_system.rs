@@ -49,6 +49,8 @@ use std::ffi::OsStr;
 use std::sync::Arc;
 
 const FUSE_TIME_GRANULARITY_NS: u32 = 1_000_000;
+/// Fragment size used by FUSE statfs block counters.
+const STATFS_FRAGMENT_SIZE: u32 = 4 * ByteUnit::KB as u32;
 
 pub struct CurvineFileSystem {
     fs: UnifiedFileSystem,
@@ -91,6 +93,15 @@ impl CurvineFileSystem {
     fn is_ofd_lock_pid(pid: u32) -> bool {
         // FUSE kernels have used both 0 and -1 for the pid of an OFD lock.
         pid == 0 || pid == u32::MAX
+    }
+
+    fn statfs_block_counts(capacity: i64, available: i64) -> (u64, u64) {
+        let capacity = u64::try_from(capacity).unwrap_or(0);
+        let available = u64::try_from(available).unwrap_or(0).min(capacity);
+        let fragment_size = u64::from(STATFS_FRAGMENT_SIZE);
+
+        // Report only complete fragments, preserving the existing rounding behavior.
+        (capacity / fragment_size, available / fragment_size)
     }
 
     pub fn new(conf: ClusterConf, rt: Arc<Runtime>) -> FuseResult<Self> {
@@ -1573,9 +1584,7 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn stat_fs(&self, _: StatFs<'_>) -> FuseResult<fuse_kstatfs> {
         let info = self.fs.get_filesystem_info().await?;
 
-        let block_size = 4 * ByteUnit::KB as u32;
-        let total_blocks = (info.capacity / block_size as i64) as u64;
-        let free_blocks = (info.available / block_size as i64) as u64;
+        let (total_blocks, free_blocks) = Self::statfs_block_counts(info.capacity, info.available);
 
         let res = fuse_kstatfs {
             blocks: total_blocks,
@@ -1583,9 +1592,9 @@ impl fs::FileSystem for CurvineFileSystem {
             bavail: free_blocks,
             files: FUSE_UNKNOWN_INODES,
             ffree: FUSE_UNKNOWN_INODES,
-            bsize: block_size,
+            bsize: STATFS_FRAGMENT_SIZE,
             namelen: FUSE_MAX_NAME_LENGTH as u32,
-            frsize: block_size,
+            frsize: STATFS_FRAGMENT_SIZE,
             padding: 0,
             spare: [0; 6],
         };
@@ -2425,6 +2434,60 @@ mod tests {
             pid,
             padding: 0,
         }
+    }
+
+    #[test]
+    fn statfs_block_counts_normalize_invalid_values() {
+        use super::CurvineFileSystem;
+
+        let cases = [
+            (-4096, 0, (0, 0)),
+            (8192, -4096, (2, 0)),
+            (-4096, 8192, (0, 0)),
+            (4096, 8192, (1, 1)),
+        ];
+
+        for (capacity, available, expected) in cases {
+            let actual = CurvineFileSystem::statfs_block_counts(capacity, available);
+            assert_eq!(
+                actual, expected,
+                "capacity={capacity}, available={available}"
+            );
+            assert!(actual.1 <= actual.0);
+        }
+    }
+
+    #[test]
+    fn statfs_block_counts_round_down_to_complete_fragments() {
+        use super::CurvineFileSystem;
+
+        let cases = [
+            (0, 0, (0, 0)),
+            (1, 1, (0, 0)),
+            (4095, 4095, (0, 0)),
+            (4096, 4096, (1, 1)),
+            (4097, 4097, (1, 1)),
+            (16384, 8192, (4, 2)),
+        ];
+
+        for (capacity, available, expected) in cases {
+            assert_eq!(
+                CurvineFileSystem::statfs_block_counts(capacity, available),
+                expected,
+                "capacity={capacity}, available={available}"
+            );
+        }
+    }
+
+    #[test]
+    fn statfs_block_counts_handle_i64_max_without_overflow() {
+        use super::{CurvineFileSystem, STATFS_FRAGMENT_SIZE};
+
+        let expected = u64::try_from(i64::MAX).unwrap() / u64::from(STATFS_FRAGMENT_SIZE);
+        let actual = CurvineFileSystem::statfs_block_counts(i64::MAX, i64::MAX);
+
+        assert_eq!(actual, (expected, expected));
+        assert!(actual.1 <= actual.0);
     }
 
     #[test]
