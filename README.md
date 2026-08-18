@@ -35,15 +35,12 @@ For more detailed information, please refer to:
 
 - [Official Documentation](https://curvineio.github.io/docs/Overview/instroduction)
 - [Quick Start](https://curvineio.github.io/docs/Deploy/quick-start)
-- [User Manuals](https://curvineio.github.io/docs/category/user-manuals)
-- [Detailed Usage Instructions](https://curvineio.github.io/blog/2025/09/28/user-guide/)
 - [Benchmark](https://curvineio.github.io/docs/category/benchmark)
 - [DeepWiki](https://deepwiki.com/CurvineIO/curvine)
-- [Commit convention](COMMIT_CONVENTION.md)
-- [Contribute guidelines](CONTRIBUTING.md)
 - [Best Practices](https://curvineio.github.io/docs/User-Manuals/best-practices)
 - [Curvine passes LTP Test 1129 cases](https://curvineio.github.io/blog/2026/08/11/curvine-ltp-compatibility)
 - [Tiered KV cache for large LLMs on Amazon SageMaker HyperPod with Curvine](https://aws.amazon.com/cn/blogs/machine-learning/tiered-kv-cache-for-large-llms-on-amazon-sagemaker-hyperpod-with-curvine/)
+
 
 
 ## 🎯 Why Curvine
