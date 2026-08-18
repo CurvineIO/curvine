@@ -42,9 +42,9 @@ For more detailed information, please refer to:
 - [Commit convention](COMMIT_CONVENTION.md)
 - [Contribute guidelines](CONTRIBUTING.md)
 - [Best Practices](https://curvineio.github.io/docs/User-Manuals/best-practices)
+- [Curvine passes LTP Test 1129 cases](https://curvineio.github.io/blog/2026/08/11/curvine-ltp-compatibility)
+- [Tiered KV cache for large LLMs on Amazon SageMaker HyperPod with Curvine](https://aws.amazon.com/cn/blogs/machine-learning/tiered-kv-cache-for-large-llms-on-amazon-sagemaker-hyperpod-with-curvine/)
 
-## Roadmap 2026
-![Evolution from Distributed Cache to AI Agent-Native Infrastructure ](https://github.com/CurvineIO/curvine/discussions/549)
 
 ## 🎯 Why Curvine
 
