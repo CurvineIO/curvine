@@ -21,6 +21,8 @@ pub mod spdk_env;
 #[cfg(feature = "spdk")]
 pub mod spdk_ffi;
 #[cfg(feature = "spdk")]
+mod spdk_metrics;
+#[cfg(feature = "spdk")]
 pub mod spdk_poller;
 
 #[cfg(all(test, feature = "spdk"))]

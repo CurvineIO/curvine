@@ -11,6 +11,7 @@ use std::sync::{atomic::AtomicBool, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 static INIT: Once = Once::new();
+use std::sync::atomic::AtomicUsize;
 
 /// Initialize SPDK env once for all tests.
 fn get_spdk_env() -> &'static SpdkEnv {
@@ -200,6 +201,9 @@ fn spdk_full_lifecycle() {
         let p = QpairPool {
             inner: Mutex::new(HashMap::new()),
             ctrl_state: Mutex::new(HashMap::new()),
+            total_active: AtomicUsize::new(0),
+            total_limit: AtomicUsize::new(0),
+            total_cached: AtomicUsize::new(0),
             notify: Condvar::new(),
             max_per_ctrlr: 2,
             shutdown: AtomicBool::new(false),
@@ -239,6 +243,9 @@ fn spdk_full_lifecycle() {
         let p = Arc::new(QpairPool {
             inner: Mutex::new(HashMap::new()),
             ctrl_state: Mutex::new(HashMap::new()),
+            total_active: AtomicUsize::new(0),
+            total_limit: AtomicUsize::new(0),
+            total_cached: AtomicUsize::new(0),
             notify: Condvar::new(),
             max_per_ctrlr: 16,
             shutdown: AtomicBool::new(false),
