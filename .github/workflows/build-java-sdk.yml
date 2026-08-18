@@ -156,6 +156,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Validate release tag vs Cargo version
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          bash build/validate-release-version.sh "${GITHUB_REF_NAME}"
+
       - name: Download all native library artifacts
         uses: actions/download-artifact@v4
         with:
@@ -189,13 +194,15 @@ jobs:
 
       - name: Build JAR with Maven
         run: |
-          cd curvine-libsdk/java
-          
-          # Update version in pom.xml if needed
+          # Inject the release/tag version into pom.xml before packaging. The
+          # Java package version is derived from the tag by CI, never maintained
+          # by hand, so the jar always matches the release.
+          . ./build/version.sh
           VERSION="${{ steps.version.outputs.version }}"
-          sed -i "s/<version>0.1.0<\/version>/<version>${VERSION}<\/version>/" pom.xml
+          set_pom_version curvine-libsdk/java/pom.xml "${VERSION}"
           
           # Generate protobuf code and package
+          cd curvine-libsdk/java
           mvn protobuf:compile package -DskipTests -B
           
           echo "Built JAR files:"
@@ -301,11 +308,13 @@ jobs:
           mkdir -p curvine-libsdk/java/native
           cp native-artifacts/*.so curvine-libsdk/java/native/
           
-          cd curvine-libsdk/java
-          
-          # Update version
+          # Inject the release version into pom.xml (same helper as the package
+          # step; set_pom_version is idempotent).
+          . ./build/version.sh
           VERSION="${{ needs.package-jar.outputs.version }}"
-          sed -i "s/<version>0.1.0<\/version>/<version>${VERSION}<\/version>/" pom.xml
+          set_pom_version curvine-libsdk/java/pom.xml "${VERSION}"
+          
+          cd curvine-libsdk/java
           
           # Add distribution management for GitHub Packages
           sed -i '/<\/project>/i \

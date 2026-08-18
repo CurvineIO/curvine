@@ -69,6 +69,14 @@ ARG REPO_URL=https://github.com/curvineio/curvine
 LABEL org.opencontainers.image.source="${REPO_URL}"
 LABEL org.opencontainers.image.description="Curvine Native Kubernetes Runtime Image"
 
+# BUILD_VERSION drives the version reported by binaries and the build-version
+# file inside the image. It is set by the release CI from the git tag (vX.Y.Z
+# -> X.Y.Z); local image builds leave it empty and fall back to the workspace
+# version / git describe.
+ARG BUILD_VERSION
+ENV BUILD_VERSION=${BUILD_VERSION}
+LABEL org.opencontainers.image.version="${BUILD_VERSION}"
+
 # Override ENTRYPOINT to ensure RUN commands execute correctly
 # The compile image has ENTRYPOINT ["/bin/bash", "-c"] which can interfere with RUN
 ENTRYPOINT []
@@ -150,6 +158,9 @@ RUN mkdir -p /build-output && \
 
 # Runtime stage
 FROM runtime-base AS runtime
+
+ARG BUILD_VERSION
+LABEL org.opencontainers.image.version="${BUILD_VERSION}"
 
 RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
     dnf install -y --allowerasing \

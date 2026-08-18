@@ -10,7 +10,10 @@ features = ["extension-module"]
 
 [project]
 name = "curvine_libsdk"
-version = "0.1.0"
+# Version is inherited from the Cargo workspace ([workspace.package].version)
+# via maturin's dynamic version support, so the wheel always matches the
+# component release version instead of drifting from it.
+dynamic = ["version"]
 requires-python = ">=3.6"
 dependencies = [
     "protobuf>=3.19,<6",

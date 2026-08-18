@@ -54,6 +54,17 @@ jobs:
           echo "Release tag: $TAG"
           echo "Source commit: $SHA"
 
+      - name: Validate release tag vs Cargo version
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
+          fetch-depth: 1
+
+      - name: Check release tag consistency
+        run: |
+          bash build/validate-release-version.sh "${{ steps.meta.outputs.tag }}"
+          echo "Release tag ${{ steps.meta.outputs.tag }} matches Cargo workspace version"
+
       - name: Wait for runtime and CSI image workflows
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

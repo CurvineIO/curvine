@@ -32,6 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
+      build_version: ${{ steps.meta.outputs.build_version }}
       push_image: ${{ steps.meta.outputs.push_image }}
       ghcr_image: ${{ steps.meta.outputs.ghcr_image }}
       docker_image: ${{ steps.meta.outputs.docker_image }}
@@ -58,6 +59,14 @@ jobs:
           
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
           echo "push_image=${PUSH_IMAGE}" >> $GITHUB_OUTPUT
+
+          # BUILD_VERSION is injected into the binaries and image labels so the
+          # runtime image reports the same release version as the tag.
+          BUILD_VERSION="$TAG"
+          if [[ "${TAG}" == v* ]]; then
+            BUILD_VERSION="${TAG#v}"
+          fi
+          echo "build_version=${BUILD_VERSION}" >> $GITHUB_OUTPUT
           
           # Generate image names
           GHCR_IMAGE="ghcr.io/curvineio/curvine"
@@ -122,6 +131,7 @@ jobs:
           shm-size: 2g
           build-args: |
             REPO_URL=https://github.com/${{ github.repository }}
+            BUILD_VERSION=${{ needs.prepare.outputs.build_version }}
       
       - name: Build summary for ${{ matrix.arch }}
         run: |

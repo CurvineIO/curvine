@@ -14,6 +14,11 @@ SHELL ["/bin/bash", "-c"]
 # Set GOPROXY environment variable (Go is already installed in compile image)
 ENV GOPROXY=${GOPROXY:-https://proxy.golang.org}
 
+# Make the release version visible to every RUN in this stage so build.sh
+# (get_build_version) and the CSI -ldflags injection produce tag-aligned
+# versions for the binaries packed into the image.
+ENV BUILD_VERSION=${BUILD_VERSION}
+
 # Ensure environment variables are set (from compile image)
 # Go toolchain is already included: PATH="/usr/local/go/bin:...", GOPATH=/go, GOROOT=/usr/local/go
 ENV PATH="/root/.cargo/bin:/app/protoc/bin:/app/maven/bin:/usr/local/go/bin:${PATH}"
@@ -94,6 +99,13 @@ RUN mkdir -p /build-output && \
     echo "  conf/: $(ls -1 /build-output/conf 2>/dev/null | wc -l) files"
 
 FROM ubuntu:24.04
+
+# BUILD_VERSION is passed from the release CI (tag without the v prefix, e.g.
+# 0.4.0-alpha) and is baked into the CSI binary via -ldflags in the builder
+# stage. Expose it again here for the image metadata label so the published
+# image records the same release version as the tag.
+ARG BUILD_VERSION
+LABEL org.opencontainers.image.version="${BUILD_VERSION}"
 
 # Set non-interactive mode for apt
 ENV DEBIAN_FRONTEND=noninteractive
