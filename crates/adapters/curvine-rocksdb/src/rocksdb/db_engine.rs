@@ -278,7 +278,13 @@ impl DBEngine {
     pub fn flush_mem(&self, sync: bool) -> CommonResult<()> {
         let mut opts = FlushOptions::default();
         opts.set_wait(sync);
-        self.db.flush_opt(&opts)?;
+        let cfs = self
+            .conf
+            .family_list
+            .iter()
+            .map(|cf| self.cf(cf))
+            .collect::<CommonResult<Vec<_>>>()?;
+        self.db.flush_cfs_opt(&cfs, &opts)?;
         Ok(())
     }
 
