@@ -45,7 +45,7 @@ AGENTS.md                           # skill registry (<available_skills>)
 | ---- | ------ |
 | Prefix | All versioned skills **must** start with `cv-` |
 | Location | Edit only `.agents/skills/cv-<name>/` |
-| Language | `description` and body in **English** |
+| Language | `description` and body in **English only**. No Chinese or other CJK. |
 | Git | Only `cv-*` dirs are tracked; other local skills are gitignored |
 | Registry | Every `cv-*` skill **must** appear in `AGENTS.md` |
 
@@ -138,7 +138,7 @@ ls -la .github/skills .cursor/skills .claude/skills
 - Add non-`cv-` skills to git (they belong in user global skills or local gitignored dirs)
 - Edit skills inside `.cursor/skills/` or `.claude/skills/` directly (symlinks)
 - Skip `AGENTS.md` registration
-- Use Chinese in `description` (body may reference Chinese project docs paths when needed)
+- Use Chinese or other CJK anywhere in a skill (`description`, body, templates, comments)
 - Create standalone setup scripts in the repo for skill management
 
 ## Current cv Skills (maintain this list when adding)

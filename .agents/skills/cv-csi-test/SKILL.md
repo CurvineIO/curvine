@@ -190,7 +190,7 @@ See `scripts/test-suite.sh` for automated test script template.
 - [ ] Multiple pods can share same volume
 - [ ] CSI restart doesn't affect mounted volumes (MountPod mode)
 
-## 注意事项
-如果遇到Pod Terminating，最多等待2min，就要停止等待，并仔细检查pod删除卡主的原因，如果无法修复，可以采用--force的方式确保安全删除。
-- 测试集群的master addr为10.119.43.210:8995, 且只有一个。 
-- 测试之前需要将gchr镜像替换为10.119.43.210:5000/curvine-csi,  测试完成后总是要恢复为原始镜像。
+## Notes
+If a Pod is stuck in Terminating, wait at most 2 minutes, then inspect why deletion is blocked. If it cannot be fixed, use `--force` to delete it safely.
+- The test cluster has a single master at `10.119.43.210:8995`.
+- Before testing, replace the ghcr image with `10.119.43.210:5000/curvine-csi`. Always restore the original image after the test.
