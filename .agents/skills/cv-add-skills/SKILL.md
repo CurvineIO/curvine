@@ -154,6 +154,7 @@ ls -la .github/skills .cursor/skills .claude/skills
 | `cv-address-pr-review` | PR |
 | `cv-run-workflow` | CI |
 | `cv-tasks-breakdown` | Planning |
+| `cv-test-report` | Testing — publish full-chain reports |
 
 ## Related
 

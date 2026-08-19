@@ -45,6 +45,7 @@ rm -rf .claude/skills && ln -sfn ../.agents/skills .claude/skills
 | `cv-address-pr-review` | Handle review comments |
 | `cv-run-workflow` | Dispatch GitHub Actions |
 | `cv-csi-test` | CSI driver integration testing |
+| `cv-test-report` | Publish full-chain daily reports to the Hextra GH Pages site |
 
 ## Rules
 

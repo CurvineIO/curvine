@@ -78,6 +78,12 @@ Usage notes:
 <location>project</location>
 </skill>
 
+<skill>
+<name>cv-test-report</name>
+<description>Publish Curvine full-chain daily test reports to the Hextra Hugo site at CurvineIO/test-reports, using a standard Markdown template with no environment or secret leakage. Use when the user asks to publish a test report, convert harness output to Markdown, or update CurvineIO/test-reports.</description>
+<location>project</location>
+</skill>
+
 </available_skills>
 <!-- SKILLS_TABLE_END -->
 
