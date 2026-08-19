@@ -63,7 +63,7 @@ public final class LoadJobStatus {
         return new LoadJobStatus(
                 response.getJobId(),
                 response.getState(),
-                response.getStateValue(),
+                response.getState().getNumber(),
                 response.getSourcePath(),
                 response.getTargetPath(),
                 response.getProgress());
