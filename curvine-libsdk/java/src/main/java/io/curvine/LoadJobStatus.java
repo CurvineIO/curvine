@@ -24,6 +24,7 @@ import io.curvine.proto.JobTaskStateProto;
 public final class LoadJobStatus {
     private final String jobId;
     private final JobTaskStateProto state;
+    private final int stateValue;
     private final String sourcePath;
     private final String targetPath;
     private final JobTaskProgressProto progress;
@@ -31,11 +32,13 @@ public final class LoadJobStatus {
     public LoadJobStatus(
             String jobId,
             JobTaskStateProto state,
+            int stateValue,
             String sourcePath,
             String targetPath,
             JobTaskProgressProto progress) {
         this.jobId = jobId;
         this.state = state;
+        this.stateValue = stateValue;
         this.sourcePath = sourcePath;
         this.targetPath = targetPath;
         this.progress = progress;
@@ -45,6 +48,7 @@ public final class LoadJobStatus {
         return new LoadJobStatus(
                 response.getJobId(),
                 response.getState(),
+                response.getStateValue(),
                 response.getSourcePath(),
                 response.getTargetPath(),
                 response.getProgress());
@@ -70,11 +74,19 @@ public final class LoadJobStatus {
         return progress;
     }
 
+    /**
+     * True when the job is no longer running (completed, failed, canceled, partial success,
+     * or any future terminal enum value / {@code UNRECOGNIZED} wire value).
+     */
     public boolean isFinished() {
-        return state == JobTaskStateProto.COMPLETED
-                || state == JobTaskStateProto.FAILED
-                || state == JobTaskStateProto.CANCELED
-                || state == JobTaskStateProto.PARTIAL_SUCCESS;
+        switch (state) {
+            case PENDING:
+            case LOADING:
+            case UNKNOWN:
+                return false;
+            default:
+                return true;
+        }
     }
 
     public boolean isSuccessful() {
@@ -86,7 +98,8 @@ public final class LoadJobStatus {
      * Callers should inspect progress message / retry failed items as needed.
      */
     public boolean isPartialSuccess() {
-        return state == JobTaskStateProto.PARTIAL_SUCCESS;
+        return state == JobTaskStateProto.PARTIAL_SUCCESS
+                || stateValue == JobTaskStateProto.PARTIAL_SUCCESS.getNumber();
     }
 
     @Override

@@ -40,6 +40,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * {@code fs.cv.transfer.endpoints=transfer-0:9010,transfer-1:9010}. Transfer endpoints
  * are independent from Master addresses and must be reachable from the Java process.
  *
+ * <p><b>Upgrade note:</b> the Java jar and bundled native lib must be upgraded together.
+ * A newer native library may return job states (for example {@code PARTIAL_SUCCESS})
+ * that an older jar cannot classify, which causes {@link #waitJobComplete} to poll
+ * until timeout instead of returning promptly.
+ *
  * <pre>{@code
  * try (CurvineLoadClient client = CurvineLoadClient.from(conf)) {
  *     LoadJobResult result = client.submitLoad(

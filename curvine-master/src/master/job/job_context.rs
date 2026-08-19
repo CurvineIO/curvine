@@ -164,6 +164,8 @@ impl JobContext {
                 | JobTaskState::Pending
                 | JobTaskState::Loading
                 | JobTaskState::Canceled
+                // Master update_progress still collapses mixed outcomes to Failed today;
+                // PartialSuccess is emitted only on the transfer path for now.
                 | JobTaskState::PartialSuccess => (),
             }
         }

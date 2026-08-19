@@ -124,6 +124,21 @@ public class LoadJobClientTest {
         Assert.assertTrue(partial.isFinished());
         Assert.assertFalse(partial.isSuccessful());
         Assert.assertTrue(partial.isPartialSuccess());
+
+        LoadJobStatus running = LoadJobStatus.fromProto(GetJobStatusResponse.newBuilder()
+                .setJobId("job-4")
+                .setState(JobTaskStateProto.LOADING)
+                .setSourcePath("s3://bucket/d")
+                .setTargetPath("/mnt/d")
+                .setProgress(JobTaskProgressProto.newBuilder()
+                        .setLoadedSize(1)
+                        .setTotalSize(10)
+                        .setUpdateTime(1)
+                        .setState(JobTaskStateProto.LOADING.getNumber())
+                        .setMessage("running")
+                        .build())
+                .build());
+        Assert.assertFalse(running.isFinished());
     }
 
     @Test
