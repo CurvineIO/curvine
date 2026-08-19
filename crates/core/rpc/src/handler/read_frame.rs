@@ -16,7 +16,6 @@ use std::io;
 use std::mem;
 
 use bytes::BytesMut;
-use log::debug;
 use tokio::io::{AsyncReadExt, ReadHalf};
 use tokio::net::TcpStream;
 
@@ -59,10 +58,7 @@ impl ReadFrame {
                         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                             return Ok(Message::empty());
                         }
-                        Err(e) => {
-                            debug!("ReadFrame head read error: {}", e);
-                            return Err(e);
-                        }
+                        Err(e) => return Err(e),
                     };
 
                     let (protocol, header_size, data_size) = Message::decode_protocol(&mut buf)?;
@@ -116,11 +112,13 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        // Connect and immediately drop the connection.
-        let stream = TcpStream::connect(addr).await.unwrap();
-        drop(stream);
-
+        // Accept first, then drop the peer side — matches the production
+        // "peer closed an already-accepted socket" path and avoids the
+        // reset/EOF race on some kernels.
+        let client = TcpStream::connect(addr).await.unwrap();
         let (server_stream, _) = listener.accept().await.unwrap();
+        drop(client);
+
         let (read_half, _) = tokio::io::split(server_stream);
         let mut read_frame = ReadFrame::new(read_half, FrameBuf::new(0));
 

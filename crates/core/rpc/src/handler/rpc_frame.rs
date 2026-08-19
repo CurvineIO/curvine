@@ -21,7 +21,6 @@ use curvine_io::{DataSlice, IOResult};
 use curvine_net::net::ConnState;
 use curvine_sys as sys;
 use curvine_sys::RawIOSlice;
-use log::debug;
 use std::io;
 use std::mem;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -250,10 +249,7 @@ impl Frame for RpcFrame {
                         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                             return Ok(Message::empty());
                         }
-                        Err(e) => {
-                            debug!("RpcFrame head read error: {}", e);
-                            return Err(e);
-                        }
+                        Err(e) => return Err(e),
                     };
 
                     let (protocol, header_size, data_size) = Message::decode_protocol(&mut buf)?;
