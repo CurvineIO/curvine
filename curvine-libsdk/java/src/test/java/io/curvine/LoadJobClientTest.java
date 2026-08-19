@@ -106,6 +106,24 @@ public class LoadJobClientTest {
                 .build());
         Assert.assertTrue(failed.isFinished());
         Assert.assertFalse(failed.isSuccessful());
+        Assert.assertFalse(failed.isPartialSuccess());
+
+        LoadJobStatus partial = LoadJobStatus.fromProto(GetJobStatusResponse.newBuilder()
+                .setJobId("job-3")
+                .setState(JobTaskStateProto.PARTIAL_SUCCESS)
+                .setSourcePath("s3://bucket/c")
+                .setTargetPath("/mnt/c")
+                .setProgress(JobTaskProgressProto.newBuilder()
+                        .setLoadedSize(5)
+                        .setTotalSize(10)
+                        .setUpdateTime(1)
+                        .setState(JobTaskStateProto.PARTIAL_SUCCESS.getNumber())
+                        .setMessage("partial")
+                        .build())
+                .build());
+        Assert.assertTrue(partial.isFinished());
+        Assert.assertFalse(partial.isSuccessful());
+        Assert.assertTrue(partial.isPartialSuccess());
     }
 
     @Test

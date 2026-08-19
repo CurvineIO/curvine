@@ -42,7 +42,8 @@ pub(crate) fn map_transfer_state(state: TransferState) -> JobTaskState {
         | TransferState::Running
         | TransferState::Canceling => JobTaskState::Loading,
         TransferState::Completed => JobTaskState::Completed,
-        TransferState::Failed | TransferState::PartialSuccess => JobTaskState::Failed,
+        TransferState::Failed => JobTaskState::Failed,
+        TransferState::PartialSuccess => JobTaskState::PartialSuccess,
         TransferState::Canceled => JobTaskState::Canceled,
     }
 }
@@ -305,7 +306,7 @@ mod tests {
         );
         assert_eq!(
             map_transfer_state(TransferState::PartialSuccess),
-            JobTaskState::Failed
+            JobTaskState::PartialSuccess
         );
     }
 

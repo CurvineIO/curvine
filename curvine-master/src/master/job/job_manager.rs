@@ -251,6 +251,7 @@ impl JobManager {
                 if state == JobTaskState::Completed
                     || state == JobTaskState::Failed
                     || state == JobTaskState::Canceled
+                    || state == JobTaskState::PartialSuccess
                 {
                     info!(
                         "job {} is already in final state {:?}, source_path: {}, target_path: {}",

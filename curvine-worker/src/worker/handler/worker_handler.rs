@@ -426,7 +426,10 @@ fn transfer_task_state_code(state: curvine_model::JobTaskState) -> i32 {
         curvine_model::JobTaskState::Completed => {
             TransferTaskStateProto::TransferTaskCompleted.into()
         }
-        curvine_model::JobTaskState::Failed => TransferTaskStateProto::TransferTaskFailed.into(),
+        // Job-level PartialSuccess has no task-level counterpart; report as failed.
+        curvine_model::JobTaskState::Failed | curvine_model::JobTaskState::PartialSuccess => {
+            TransferTaskStateProto::TransferTaskFailed.into()
+        }
         curvine_model::JobTaskState::Canceled => {
             TransferTaskStateProto::TransferTaskCanceled.into()
         }

@@ -73,11 +73,20 @@ public final class LoadJobStatus {
     public boolean isFinished() {
         return state == JobTaskStateProto.COMPLETED
                 || state == JobTaskStateProto.FAILED
-                || state == JobTaskStateProto.CANCELED;
+                || state == JobTaskStateProto.CANCELED
+                || state == JobTaskStateProto.PARTIAL_SUCCESS;
     }
 
     public boolean isSuccessful() {
         return state == JobTaskStateProto.COMPLETED;
+    }
+
+    /**
+     * True when some files/tasks succeeded and others failed.
+     * Callers should inspect progress message / retry failed items as needed.
+     */
+    public boolean isPartialSuccess() {
+        return state == JobTaskStateProto.PARTIAL_SUCCESS;
     }
 
     @Override

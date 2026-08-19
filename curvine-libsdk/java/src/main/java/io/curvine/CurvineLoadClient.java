@@ -128,10 +128,15 @@ public final class CurvineLoadClient implements Closeable {
     /**
      * Poll job status until finished or timeout.
      *
+     * <p>Returns the final status when the job reaches {@code COMPLETED} or
+     * {@code PARTIAL_SUCCESS}. {@code FAILED} and {@code CANCELED} throw
+     * {@link IOException}. Callers should check {@link LoadJobStatus#isPartialSuccess()}
+     * (or {@link LoadJobStatus#getState()}) to decide how to handle partial success.
+     *
      * @param jobId        job id from {@link #submitLoad}
      * @param timeout      max wait duration
      * @param pollInterval sleep between status queries
-     * @return final status when the job reaches a terminal state
+     * @return final status when the job reaches a terminal success / partial-success state
      * @throws TimeoutException if the job is still running after {@code timeout}
      * @throws IOException      if the job fails / is canceled, or RPC fails
      */
@@ -153,7 +158,7 @@ public final class CurvineLoadClient implements Closeable {
         while (true) {
             status = getJobStatus(jobId);
             if (status.isFinished()) {
-                if (status.isSuccessful()) {
+                if (status.isSuccessful() || status.isPartialSuccess()) {
                     return status;
                 }
                 throw new IOException(

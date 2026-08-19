@@ -170,7 +170,7 @@ impl JobMasterClient {
             match status.state {
                 JobTaskState::Completed => break,
 
-                JobTaskState::Failed | JobTaskState::Canceled => {
+                JobTaskState::Failed | JobTaskState::Canceled | JobTaskState::PartialSuccess => {
                     return err_box!(
                         "job {} {:?}: {}",
                         status.job_id,

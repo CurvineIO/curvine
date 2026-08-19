@@ -160,7 +160,11 @@ impl JobContext {
                         detail.task.task_id, detail.progress.message
                     )
                 }
-                _ => (),
+                JobTaskState::UNKNOWN
+                | JobTaskState::Pending
+                | JobTaskState::Loading
+                | JobTaskState::Canceled
+                | JobTaskState::PartialSuccess => (),
             }
         }
 

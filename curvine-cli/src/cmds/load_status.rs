@@ -62,7 +62,10 @@ impl LoadStatusCommand {
             println!("{}", status);
             if matches!(
                 status.state,
-                JobTaskState::Completed | JobTaskState::Failed | JobTaskState::Canceled
+                JobTaskState::Completed
+                    | JobTaskState::Failed
+                    | JobTaskState::Canceled
+                    | JobTaskState::PartialSuccess
             ) {
                 break;
             }
