@@ -101,7 +101,7 @@ pub(crate) fn record_qpair_acquire(result: &'static str) {
         "timeout" => m.qpair_acquire_timeout.inc(),
         "shutdown" => m.qpair_acquire_shutdown.inc(),
         "alloc_failed" => m.qpair_acquire_alloc_failed.inc(),
-        _ => {}
+        _ => warn!("unknown spdk qpair acquire result label: {}", result),
     });
 }
 
