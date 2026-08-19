@@ -32,6 +32,21 @@ public final class LoadJobStatus {
     public LoadJobStatus(
             String jobId,
             JobTaskStateProto state,
+            String sourcePath,
+            String targetPath,
+            JobTaskProgressProto progress) {
+        this(
+                jobId,
+                state,
+                state == null ? 0 : state.getNumber(),
+                sourcePath,
+                targetPath,
+                progress);
+    }
+
+    private LoadJobStatus(
+            String jobId,
+            JobTaskStateProto state,
             int stateValue,
             String sourcePath,
             String targetPath,

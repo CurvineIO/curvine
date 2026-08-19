@@ -139,6 +139,23 @@ public class LoadJobClientTest {
                         .build())
                 .build());
         Assert.assertFalse(running.isFinished());
+
+        LoadJobStatus unrecognized = LoadJobStatus.fromProto(GetJobStatusResponse.newBuilder()
+                .setJobId("job-5")
+                .setStateValue(99)
+                .setSourcePath("s3://bucket/e")
+                .setTargetPath("/mnt/e")
+                .setProgress(JobTaskProgressProto.newBuilder()
+                        .setLoadedSize(1)
+                        .setTotalSize(10)
+                        .setUpdateTime(1)
+                        .setState(99)
+                        .setMessage("unknown-terminal")
+                        .build())
+                .build());
+        Assert.assertTrue(unrecognized.isFinished());
+        Assert.assertFalse(unrecognized.isSuccessful());
+        Assert.assertFalse(unrecognized.isPartialSuccess());
     }
 
     @Test
