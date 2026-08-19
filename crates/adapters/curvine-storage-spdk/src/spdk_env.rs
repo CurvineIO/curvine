@@ -1492,13 +1492,12 @@ mod test {
         p.publish_metrics();
 
         let output = curvine_metrics::Metrics::text_output().unwrap();
-        assert!(output.contains("spdk_qpair_acquire_total"));
-        assert!(output.contains("result=\"timeout\""));
+        assert!(output.contains("spdk_qpair_acquire_total{result=\"timeout\"}"));
         assert!(output.contains("spdk_qpair_acquire_wait_us_bucket"));
         assert!(output.contains("spdk_qpair_contention_total"));
-        assert!(output.contains("spdk_qpair_active"));
-        assert!(output.contains("spdk_qpair_limit"));
-        assert!(output.contains("spdk_qpair_cached"));
+        assert!(output.contains("spdk_qpair_active 1"));
+        assert!(output.contains("spdk_qpair_limit 1"));
+        assert!(output.contains("spdk_qpair_cached 0"));
         assert!(output.contains("spdk_qpair_shutdown_total"));
     }
 
