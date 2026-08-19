@@ -56,7 +56,7 @@ Usage notes:
 
 <skill>
 <name>cv-submit-pr-review</name>
-<description>Perform a direct code review of a Curvine PR by reading the diff and changed files, analyzing correctness, safety, design, and performance impact on critical paths (data read/write, RPC message communication, metadata operations), and producing structured findings. Use when user asks to review a PR's code, do a code review, or check a PR before merge.</description>
+<description>Perform a direct code review of a Curvine PR against live base/head by mapping dirty crates, reading surrounding code, and checking correctness, safety, lifecycle, interface contracts, test strength, and performance on data I/O, RPC, and metadata paths. Use when user asks to review a PR's code, do a code review, or check a PR before merge.</description>
 <location>project</location>
 </skill>
 
