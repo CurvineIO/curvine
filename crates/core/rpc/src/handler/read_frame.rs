@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::io;
 use std::mem;
 
 use bytes::BytesMut;
+use log::debug;
 use tokio::io::{AsyncReadExt, ReadHalf};
 use tokio::net::TcpStream;
 
@@ -54,7 +56,13 @@ impl ReadFrame {
                 FrameSate::Head => {
                     let mut buf = match self.read_full(message::PROTOCOL_SIZE).await {
                         Ok(v) => v,
-                        Err(_) => return Ok(Message::empty()),
+                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                            return Ok(Message::empty());
+                        }
+                        Err(e) => {
+                            debug!("ReadFrame head read error: {}", e);
+                            return Err(e);
+                        }
                     };
 
                     let (protocol, header_size, data_size) = Message::decode_protocol(&mut buf)?;
@@ -95,5 +103,28 @@ impl ReadFrame {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn receive_returns_empty_on_peer_close_before_sending() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Connect and immediately drop the connection.
+        let stream = TcpStream::connect(addr).await.unwrap();
+        drop(stream);
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let (read_half, _) = tokio::io::split(server_stream);
+        let mut read_frame = ReadFrame::new(read_half, FrameBuf::new(0));
+
+        let msg = read_frame.receive().await.unwrap();
+        assert!(msg.is_empty(), "expected empty message on peer EOF");
     }
 }
