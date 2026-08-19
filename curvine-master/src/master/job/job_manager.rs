@@ -248,11 +248,7 @@ impl JobManager {
             if let Some(job) = self.jobs.get(job_id) {
                 let state: JobTaskState = job.state.state();
                 // Check whether it can be canceled
-                if state == JobTaskState::Completed
-                    || state == JobTaskState::Failed
-                    || state == JobTaskState::Canceled
-                    || state == JobTaskState::PartialSuccess
-                {
+                if state.is_finish() {
                     info!(
                         "job {} is already in final state {:?}, source_path: {}, target_path: {}",
                         job_id, state, job.info.source_path, job.info.target_path
