@@ -149,6 +149,22 @@ impl CurvineReport {
         );
         builder.push_str(&used);
 
+        // Allocatable view: only Live workers, i.e. what new writes can use.
+        builder.push_str(&format!(
+            "{:>20}: {}\n",
+            "allocatable_capacity",
+            bytes_to_string(self.info.allocatable_capacity)
+        ));
+        builder.push_str(&format!(
+            "{:>20}: {} ({:.2}%)\n",
+            "allocatable_available",
+            bytes_to_string(self.info.allocatable_available),
+            Self::get_percent(
+                self.info.allocatable_available,
+                self.info.allocatable_capacity
+            )
+        ));
+
         builder.push_str(&format!(
             "{:>20}: {}\n",
             "non_fs_used",
@@ -247,6 +263,18 @@ impl CurvineReport {
         builder.push_str(&format!(
             "Total Non-FS Used: {}\n",
             bytes_to_string(self.info.non_fs_used)
+        ));
+        builder.push_str(&format!(
+            "Allocatable Capacity (Live workers): {}\n",
+            bytes_to_string(self.info.allocatable_capacity)
+        ));
+        builder.push_str(&format!(
+            "Allocatable Available (Live workers): {} ({:.2}%)\n",
+            bytes_to_string(self.info.allocatable_available),
+            Self::get_percent(
+                self.info.allocatable_available,
+                self.info.allocatable_capacity
+            )
         ));
 
         builder

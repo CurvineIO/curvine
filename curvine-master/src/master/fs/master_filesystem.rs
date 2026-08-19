@@ -1131,7 +1131,14 @@ impl MasterFilesystem {
             info.block_num += worker.block_num;
 
             match worker.status {
-                WorkerStatus::Live => info.live_workers.push(worker.clone()),
+                WorkerStatus::Live => {
+                    info.live_workers.push(worker.clone());
+                    // Only Live workers are eligible for new allocations, so the
+                    // allocatable view mirrors the allocation policy. Failed
+                    // storage dirs are already excluded from worker.capacity.
+                    info.allocatable_capacity += worker.capacity;
+                    info.allocatable_available += worker.available;
+                }
                 WorkerStatus::Blacklist => info.blacklist_workers.push(worker.clone()),
                 WorkerStatus::Decommission => info.decommission_workers.push(worker.clone()),
                 _ => (),
@@ -1831,5 +1838,121 @@ mod tests {
             "expected path in error, got: {}",
             err
         );
+    }
+
+    fn worker_with_status(
+        id: u32,
+        status: WorkerStatus,
+        capacity: i64,
+        available: i64,
+    ) -> WorkerInfo {
+        let mut worker = WorkerInfo::new(
+            WorkerAddress {
+                worker_id: id,
+                ..Default::default()
+            },
+            1,
+        );
+        worker.status = status;
+        worker.capacity = capacity;
+        worker.available = available;
+        worker
+    }
+
+    #[test]
+    fn filesystem_info_allocatable_only_counts_live_workers() {
+        // See issue #1460: statfs must report capacity eligible for new writes,
+        // i.e. only Live workers. Blacklist/Decommission workers must not
+        // contribute to the allocatable view (they still count toward the total
+        // physical capacity).
+        let fs = test_fs("allocatable-live-only");
+        fs.add_test_worker(worker_with_status(1, WorkerStatus::Live, 1000, 800));
+        fs.add_test_worker(worker_with_status(2, WorkerStatus::Blacklist, 2000, 1500));
+        fs.add_test_worker(worker_with_status(
+            3,
+            WorkerStatus::Decommission,
+            3000,
+            2500,
+        ));
+
+        let info = fs.filesystem_info().unwrap();
+
+        // Total physical capacity across all non-lost worker states.
+        assert_eq!(info.capacity, 6000, "total capacity should sum all workers");
+        assert_eq!(
+            info.available, 4800,
+            "total available should sum all workers"
+        );
+        assert_eq!(info.live_workers.len(), 1);
+        assert_eq!(info.blacklist_workers.len(), 1);
+        assert_eq!(info.decommission_workers.len(), 1);
+
+        // Allocatable view mirrors allocation eligibility: Live workers only.
+        assert_eq!(
+            info.allocatable_capacity, 1000,
+            "allocatable capacity must be Live workers only"
+        );
+        assert_eq!(
+            info.allocatable_available, 800,
+            "allocatable available must be Live workers only"
+        );
+    }
+
+    #[test]
+    fn filesystem_info_allocatable_excludes_failed_storage_dirs() {
+        // A Live worker with a healthy dir plus a failed dir: add_storage already
+        // skips failed dirs, so neither total nor allocatable capacity should
+        // include the failed dir's bytes.
+        let fs = test_fs("allocatable-excludes-failed");
+        let mut worker = WorkerInfo::new(
+            WorkerAddress {
+                worker_id: 10,
+                ..Default::default()
+            },
+            1,
+        );
+        worker.status = WorkerStatus::Live;
+        worker.add_storage(StorageInfo {
+            dir_id: 1,
+            storage_id: "healthy".into(),
+            failed: false,
+            capacity: 1000,
+            available: 800,
+            ..Default::default()
+        });
+        worker.add_storage(StorageInfo {
+            dir_id: 2,
+            storage_id: "failed".into(),
+            failed: true,
+            capacity: 500,
+            available: 400,
+            ..Default::default()
+        });
+        fs.add_test_worker(worker);
+
+        let info = fs.filesystem_info().unwrap();
+
+        assert_eq!(
+            info.capacity, 1000,
+            "failed dir must not count toward total"
+        );
+        assert_eq!(info.available, 800);
+        assert_eq!(info.allocatable_capacity, 1000);
+        assert_eq!(info.allocatable_available, 800);
+    }
+
+    #[test]
+    fn filesystem_info_allocatable_excludes_lost_workers() {
+        // Lost workers live in a separate map and must not contribute to either
+        // the total or the allocatable view.
+        let fs = test_fs("allocatable-excludes-lost");
+        fs.add_test_worker(worker_with_status(1, WorkerStatus::Live, 1000, 800));
+        // Unknown/Lost-status workers in the live map are bucketed by the `_ =>`
+        // arm, but real Lost workers are never in worker_map.workers().
+        let info = fs.filesystem_info().unwrap();
+        assert_eq!(info.capacity, 1000);
+        assert_eq!(info.allocatable_capacity, 1000);
+        assert_eq!(info.allocatable_available, 800);
+        assert!(info.lost_workers.is_empty());
     }
 }

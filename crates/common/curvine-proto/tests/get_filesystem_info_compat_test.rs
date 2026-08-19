@@ -65,6 +65,8 @@ fn sample_response_with_compatibility() -> GetFilesystemInfoResponse {
         blacklist_workers: vec![],
         decommission_workers: vec![],
         lost_workers: vec![],
+        allocatable_capacity: Some(600),
+        allocatable_available: Some(300),
         compatibility: Some(ServerCompatibilityInfoProto {
             server: sample_component_info(),
             min_worker_version: None,
@@ -112,6 +114,8 @@ fn test_get_filesystem_info_response_compatibility_round_trip() {
 
     assert_eq!(decoded.active_master, "master-0");
     assert_eq!(decoded.inode_file_num, 20);
+    assert_eq!(decoded.allocatable_capacity, Some(600));
+    assert_eq!(decoded.allocatable_available, Some(300));
     let compat = decoded.compatibility.unwrap();
     assert_eq!(compat.server.component, Some("master".to_string()));
     assert_eq!(
@@ -146,6 +150,9 @@ fn test_legacy_master_response_decodes_without_compatibility() {
     assert_eq!(decoded.active_master, "old-master");
     assert_eq!(decoded.inode_file_num, 2);
     assert!(decoded.compatibility.is_none());
+    // Legacy master carries no allocatable fields; clients fall back to total.
+    assert!(decoded.allocatable_capacity.is_none());
+    assert!(decoded.allocatable_available.is_none());
 }
 
 #[test]

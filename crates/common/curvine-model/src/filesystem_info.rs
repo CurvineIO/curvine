@@ -30,6 +30,13 @@ pub struct FilesystemInfo {
     pub non_fs_used: i64,
     pub reserved_bytes: i64,
 
+    /// Capacity eligible for new writes. Only `Live` workers contribute, and
+    /// failed storage directories are excluded (see `WorkerInfo::add_storage`).
+    /// `statfs(2)` reports this so `df` matches what allocation can actually use.
+    pub allocatable_capacity: i64,
+    /// Available space eligible for new writes (Live workers only).
+    pub allocatable_available: i64,
+
     pub live_workers: Vec<WorkerInfo>,
     pub blacklist_workers: Vec<WorkerInfo>,
     pub decommission_workers: Vec<WorkerInfo>,

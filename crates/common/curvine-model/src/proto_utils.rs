@@ -316,6 +316,8 @@ impl ProtoUtils {
             fs_used: src.fs_used,
             non_fs_used: src.non_fs_used,
             reserved_bytes: src.reserved_bytes,
+            allocatable_capacity: Some(src.allocatable_capacity),
+            allocatable_available: Some(src.allocatable_available),
             ..Default::default()
         };
 
@@ -380,6 +382,11 @@ impl ProtoUtils {
             fs_used: src.fs_used,
             non_fs_used: src.non_fs_used,
             reserved_bytes: src.reserved_bytes,
+            // Legacy masters omit the allocatable fields; fall back to the
+            // aggregate capacity/available so statfs never regresses below the
+            // pre-fix behavior (which summed all non-lost workers).
+            allocatable_capacity: src.allocatable_capacity.unwrap_or(src.capacity),
+            allocatable_available: src.allocatable_available.unwrap_or(src.available),
             live_workers: Self::worker_info_from_pb(src.live_workers),
             blacklist_workers: Self::worker_info_from_pb(src.blacklist_workers),
             decommission_workers: Self::worker_info_from_pb(src.decommission_workers),

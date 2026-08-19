@@ -234,6 +234,11 @@ message GetFilesystemInfoResponse {
     repeated WorkerInfoProto decommission_workers = 13;
     repeated WorkerInfoProto lost_workers = 14;
 
+    // Capacity/available eligible for new writes (Live workers only). Absent
+    // on legacy masters; clients fall back to `capacity`/`available`.
+    optional int64 allocatable_capacity = 15 [default = 0];
+    optional int64 allocatable_available = 16 [default = 0];
+
     // Default compatibility contract offered by this master (handshake).
     // Cross-cutting protocol metadata on the reserved 1000+ range; legacy
     // masters omit it and clients treat the absence as a legacy peer.

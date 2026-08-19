@@ -1584,14 +1584,21 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn stat_fs(&self, _: StatFs<'_>) -> FuseResult<fuse_kstatfs> {
         let info = self.fs.get_filesystem_info().await?;
 
-        if info.capacity < 0 || info.available < 0 || info.available > info.capacity {
+        // Use the allocatable view (Live workers only) so df matches what new
+        // writes can actually use; capacity/available would also count
+        // Blacklist/Decommission workers and over-report free space.
+        if info.allocatable_capacity < 0
+            || info.allocatable_available < 0
+            || info.allocatable_available > info.allocatable_capacity
+        {
             debug!(
-                "Normalizing invalid filesystem info for statfs: capacity={}, available={}",
-                info.capacity, info.available
+                "Normalizing invalid filesystem info for statfs: allocatable_capacity={}, allocatable_available={}",
+                info.allocatable_capacity, info.allocatable_available
             );
         }
 
-        let (total_blocks, free_blocks) = Self::statfs_block_counts(info.capacity, info.available);
+        let (total_blocks, free_blocks) =
+            Self::statfs_block_counts(info.allocatable_capacity, info.allocatable_available);
 
         let res = fuse_kstatfs {
             blocks: total_blocks,
