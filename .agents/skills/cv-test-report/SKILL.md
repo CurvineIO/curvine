@@ -87,7 +87,7 @@ Do not publish until a local Hugo build proves the HTML is valid. Goldmark + GFM
 | Rule | Why |
 | ---- | --- |
 | No `#` heading in the body | Duplicates the Hextra H1 |
-| No backticks anywhere in the body | Inline code next to CJK or `\|` often stays literal or eats spaces |
+| No backticks in the published post body | Inline code next to CJK or `\|` often stays literal or eats spaces |
 | No CJK characters | Site and skills are English-only |
 | Tokens use **bold**: **NO-GO**, **failed**, **40** | Renders in lists and tables |
 | Tables: spaces around every `\|` | `\| ITEM \|` not `\|ITEM\|` |
@@ -180,7 +180,7 @@ Expect `200`. Posts older than 30 days are removed on the next deploy.
 
 - Publish environment, paths, accounts, IPs, usernames, run IDs, or evidence URLs
 - Write a Test scope and environment or Evidence index section
-- Put `#` title, backticks, or CJK in the Markdown body
+- Put `#` title, backticks, or CJK in the published post body
 - Publish a table whose column counts do not match
 - Attach raw JSON/logs
 - Commit reports into `curvine` or `curvineio.github.io`
@@ -199,7 +199,7 @@ Expect `200`. Posts older than 30 days are removed on the next deploy.
 - [ ] Front matter has `linkTitle` and `weight: -YYYYMMDD`
 - [ ] GO/NO-GO uses `> [!TIP]` or `> [!CAUTION]`
 - [ ] H2/H3 order matches the template; no body H1
-- [ ] English only; no CJK; no backticks; tokens are **bold**
+- [ ] English only; no CJK; no backticks in the published post body; tokens are **bold**
 - [ ] Every table column count matches; Hugo HTML has `<table>` and `hextra-toc`, not `\| ITEM \|`
 - [ ] Results only; no env / path / IP / account / username
 - [ ] `rg` leak scan clean

@@ -55,7 +55,7 @@ The page H1 comes from front matter `title` only. Body starts at H2. Hextra draw
 
 Do **not** create: Test scope and environment, Evidence index, Execution nodes, Cluster info.
 
-Do **not** use backticks. Do **not** write a body `#` heading. Do **not** use CJK. Tables must be GFM with matching column counts (see SKILL.md “Markdown must render”).
+Do **not** use backticks in the published post body (skill docs may still use them for literals). Do **not** write a body `#` heading. Do **not** use CJK. Tables must be GFM with matching column counts (see SKILL.md “Markdown must render”).
 
 ## Quality conclusion
 
