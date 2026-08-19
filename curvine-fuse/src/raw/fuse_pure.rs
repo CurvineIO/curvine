@@ -97,10 +97,40 @@ pub fn options_to_flag(mount_option: &str) -> libc::c_ulong {
     flags
 }
 
-pub fn fuse_mount_pure(mnt: &Path, conf: &FuseConf) -> IOResult<RawIO> {
-    if conf.auto_umount() {
-        // TODO: handle auto umount
+fn build_mount_options(
+    fd: RawIO,
+    mountpoint_mode: u32,
+    conf: &FuseConf,
+) -> IOResult<(String, libc::c_ulong)> {
+    let mut mount_options = format!(
+        "fd={},rootmode={:o},user_id={},group_id={}",
+        fd,
+        mountpoint_mode,
+        getuid(),
+        getgid()
+    );
+    conf.set_fuse_opts(&mut mount_options)?;
+
+    // Set the FUSE subtype so /proc/mounts reports `type fuse.curvinefs` instead of
+    // the generic `type fuse` (same mechanism sshfs uses for `fuse.sshfs`). `c_type`
+    // stays "fuse" (the only registered kernel FUSE fs type); the Linux kernel FUSE
+    // module parses `subtype=` from this mount data and sets sb->s_subtype.
+    mount_options.push_str(",subtype=curvinefs");
+
+    // VFS options belong in the mount(2) flag argument, not in FUSE mount data.
+    let mut vfs_options = conf.fuse_opts.join(",");
+    if conf.readonly {
+        if !vfs_options.is_empty() {
+            vfs_options.push(',');
+        }
+        vfs_options.push_str("ro");
     }
+    let flags = options_to_flag(&vfs_options);
+
+    Ok((mount_options, flags))
+}
+
+pub fn fuse_mount_pure(mnt: &Path, conf: &FuseConf) -> IOResult<RawIO> {
     let res = fuse_mount_sys(mnt, conf);
     match res {
         Ok(fd) => Ok(fd),
@@ -129,23 +159,7 @@ fn fuse_mount_sys(mnt: &Path, conf: &FuseConf) -> IOResult<RawIO> {
     // SAFETY: open returned a fresh descriptor whose ownership is transferred here.
     // Keep ownership until mount succeeds so every failure path closes /dev/fuse.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let mut flags = 0;
-    let mut mount_options = format!(
-        "fd={},rootmode={:o},user_id={},group_id={}",
-        fd.as_raw_fd(),
-        mountpoint_mode,
-        getuid(),
-        getgid()
-    );
-    conf.set_fuse_opts(&mut mount_options);
-    // Set the FUSE subtype so /proc/mounts reports `type fuse.curvinefs` instead of
-    // the generic `type fuse` (same mechanism sshfs uses for `fuse.sshfs`). `c_type`
-    // below stays "fuse" (the only registered kernel FUSE fs type); the Linux kernel
-    // FUSE module parses `subtype=` from this mount data and sets sb->s_subtype, and
-    // the VFS then reports the type as `fuse.<subtype>`. Hardcoded to match the source
-    // name above (c_source = "curvinefs").
-    mount_options.push_str(",subtype=curvinefs");
-    flags |= options_to_flag(mount_options.as_str());
+    let (mount_options, flags) = build_mount_options(fd.as_raw_fd(), mountpoint_mode, conf)?;
     info!("sys-mount options: {}; flags: 0x{:x}", mount_options, flags);
 
     // Default name is "/dev/fuse", then use the subtype, and lastly prefer the name
@@ -387,15 +401,83 @@ pub fn fuse_umount_pure(mnt: &Path) -> IOResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_mount, describe_fuse_device_error, describe_mount_error,
-        describe_mountpoint_error, describe_unmount_error, mountpoint_mode, path_to_cstring,
+        build_mount_options, complete_mount, describe_fuse_device_error, describe_mount_error,
+        describe_mountpoint_error, describe_unmount_error, mountpoint_mode, options_to_flag,
+        path_to_cstring,
     };
+    use curvine_config::FuseConf;
     use curvine_io::IOError;
     use std::ffi::OsStr;
     use std::fs::{self, File};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::{AsRawFd, OwnedFd};
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn mount_builder_maps_security_options_to_vfs_flags() {
+        let mut conf = FuseConf {
+            fuse_opts: vec!["nodev,nosuid,noexec".to_string()],
+            check_permission: false,
+            ..Default::default()
+        };
+        conf.init().expect("supported options must initialize");
+
+        let (mount_data, flags) =
+            build_mount_options(10, 0o40755, &conf).expect("build mount arguments");
+
+        assert_eq!(flags & libc::MS_NODEV, libc::MS_NODEV);
+        assert_eq!(flags & libc::MS_NOSUID, libc::MS_NOSUID);
+        assert_eq!(flags & libc::MS_NOEXEC, libc::MS_NOEXEC);
+        assert!(!mount_data
+            .split(',')
+            .any(|option| matches!(option, "nodev" | "nosuid" | "noexec")));
+    }
+
+    #[test]
+    fn mount_builder_keeps_fuse_parameters_in_mount_data() {
+        let mut conf = FuseConf {
+            fuse_opts: vec!["allow_other,async,big_write".to_string()],
+            check_permission: false,
+            ..Default::default()
+        };
+        conf.init().expect("supported options must initialize");
+
+        let (mount_data, flags) =
+            build_mount_options(10, 0o40755, &conf).expect("build mount arguments");
+
+        assert_eq!(flags, 0);
+        assert!(mount_data.split(',').any(|item| item == "allow_other"));
+        assert!(!mount_data
+            .split(',')
+            .any(|item| matches!(item, "async" | "big_write")));
+        assert!(mount_data
+            .split(',')
+            .any(|item| item == "subtype=curvinefs"));
+    }
+
+    #[test]
+    fn readonly_sets_vfs_flag_without_polluting_mount_data() {
+        let conf = FuseConf {
+            readonly: true,
+            check_permission: false,
+            ..Default::default()
+        };
+
+        let (mount_data, flags) =
+            build_mount_options(10, 0o40755, &conf).expect("build mount arguments");
+
+        assert_eq!(flags & libc::MS_RDONLY, libc::MS_RDONLY);
+        assert!(!mount_data.split(',').any(|item| item == "ro"));
+    }
+
+    #[test]
+    fn ro_flag_does_not_match_rootmode_parameter() {
+        assert_eq!(options_to_flag("fd=10,rootmode=40755"), 0);
+        assert_eq!(
+            options_to_flag("fd=10,rootmode=40755,ro") & libc::MS_RDONLY,
+            libc::MS_RDONLY
+        );
+    }
 
     #[test]
     fn failed_mount_closes_fuse_fd() {

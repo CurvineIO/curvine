@@ -326,17 +326,12 @@ impl FuseMountArgs {
 
     pub fn default_mnt_opts() -> Vec<String> {
         if cfg!(feature = "fuse3") {
-            vec![
-                "allow_other".to_string(),
-                "async".to_string(),
-                "auto_unmount".to_string(),
-            ]
+            vec!["allow_other".to_string(), "async".to_string()]
         } else {
             vec![
                 "allow_other".to_string(),
                 "async".to_string(),
                 "big_write".to_string(),
-                "max_write=131072".to_string(),
             ]
         }
     }
@@ -366,17 +361,17 @@ mod tests {
     #[test]
     fn get_conf_preserves_config_fuse_opts_without_cli_override() {
         let conf = get_conf(
-            "[fuse]\nio_threads = 1\nfuse_opts = [\"allow_root\", \"ro\"]\n",
+            "[fuse]\nio_threads = 1\nfuse_opts = [\"allow_other\", \"ro\"]\n",
             &[],
         );
 
-        assert_eq!(conf.fuse.fuse_opts, vec!["allow_root", "ro"]);
+        assert_eq!(conf.fuse.fuse_opts, vec!["allow_other", "ro"]);
     }
 
     #[test]
     fn get_conf_cli_fuse_opts_replace_config_fuse_opts() {
         let conf = get_conf(
-            "[fuse]\nio_threads = 1\nfuse_opts = [\"allow_root\"]\n",
+            "[fuse]\nio_threads = 1\nfuse_opts = [\"allow_other\"]\n",
             &["--options", "ro"],
         );
 
@@ -388,6 +383,25 @@ mod tests {
         let conf = get_conf("[fuse]\nio_threads = 1\n", &[]);
 
         assert_eq!(conf.fuse.fuse_opts, FuseMountArgs::default_mnt_opts());
+    }
+
+    #[test]
+    fn get_conf_normalizes_comma_separated_cli_fuse_opts() {
+        let conf = get_conf(
+            "[fuse]\nio_threads = 1\nfuse_opts = [\"allow_other\"]\n",
+            &["--options", "allow_other,nodev"],
+        );
+
+        assert_eq!(conf.fuse.fuse_opts, vec!["allow_other", "nodev"]);
+    }
+
+    #[test]
+    fn default_fuse3_options_do_not_include_auto_unmount() {
+        if cfg!(feature = "fuse3") {
+            assert!(!FuseMountArgs::default_mnt_opts()
+                .iter()
+                .any(|option| option == "auto_unmount"));
+        }
     }
 
     #[test]

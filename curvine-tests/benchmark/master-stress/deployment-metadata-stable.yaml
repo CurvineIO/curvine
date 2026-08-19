@@ -83,12 +83,8 @@ data:
     fi
     echo "[bootstrap] $(ls -l /dev/fuse)"
 
-    if ! command -v fusermount3 >/dev/null 2>&1 && ! command -v fusermount >/dev/null 2>&1; then
-      echo "WARN: neither fusermount3 nor fusermount found in PATH; auto_unmount may misbehave" >&2
-    fi
-
     # Drop allow_other for single-user container mounts; avoids fuse.conf edge cases.
-    CURVINE_FUSE_EXTRA=(--options async --options auto_unmount)
+    CURVINE_FUSE_EXTRA=(--options async)
     if [ "${FUSE_USE_DEFAULT_OPTS:-0}" = 1 ]; then
       CURVINE_FUSE_EXTRA=()
     fi
