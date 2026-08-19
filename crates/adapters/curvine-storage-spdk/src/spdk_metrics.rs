@@ -129,7 +129,7 @@ pub(crate) fn record_qpair_release(result: &'static str) {
     with_metrics(|m| match result {
         "cached" => m.qpair_release_cached.inc(),
         "freed_pool_full" => m.qpair_release_freed_pool_full.inc(),
-        _ => {}
+        _ => warn!("unknown spdk qpair release result label: {}", result),
     });
 }
 
