@@ -23,7 +23,7 @@ Use this skill when the user asks to:
 Review against these, not against generic taste:
 
 * [CONTRIBUTING.md](../../../CONTRIBUTING.md) — Rust style, tests, PR size
-* [.agents/rules/workflow.md](../../../rules/workflow.md) — issue / PR / review process
+* [.agents/rules/workflow.md](../../rules/workflow.md) — issue / PR / review process
 * Public crate contracts: `curvine-fs-api`, `curvine-ufs-api`, `curvine-storage-api`, `curvine-proto`
 * Existing patterns in the dirty crates (callers, lock order, error types)
 * CSI PRs: [cv-csi-test](../cv-csi-test/SKILL.md)
