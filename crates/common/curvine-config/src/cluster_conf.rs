@@ -93,6 +93,7 @@ impl ClusterConf {
 
     pub fn from<T: AsRef<str>>(path: T) -> CommonResult<Self> {
         let mut conf = Self::read(path)?;
+        conf.normalize_whitespace();
         conf.apply_hostname_overrides()?;
         conf.master.init()?;
         conf.client.init()?;
@@ -106,6 +107,7 @@ impl ClusterConf {
     /// Load only the configuration needed by the standalone Transfer service.
     pub fn from_transfer<T: AsRef<str>>(path: T) -> CommonResult<Self> {
         let mut conf = Self::read(path)?;
+        conf.normalize_whitespace();
         conf.apply_transfer_hostname_overrides()?;
         conf.client.init()?;
         conf.transfer.init()?;
@@ -116,6 +118,35 @@ impl ClusterConf {
     fn read<T: AsRef<str>>(path: T) -> CommonResult<Self> {
         let str = try_err!(read_to_string(path.as_ref()));
         Ok(try_err!(toml::from_str::<Self>(&str)))
+    }
+
+    fn normalize_whitespace(&mut self) {
+        self.net_interface = self.net_interface.trim().to_string();
+        self.master.hostname = self.master.hostname.trim().to_string();
+        self.journal.hostname = self.journal.hostname.trim().to_string();
+        self.worker.hostname = self.worker.hostname.trim().to_string();
+        self.client.hostname = self.client.hostname.trim().to_string();
+        self.transfer.hostname = self.transfer.hostname.trim().to_string();
+        for addr in &mut self.client.master_addrs {
+            addr.hostname = addr.hostname.trim().to_string();
+        }
+        for peer in &mut self.journal.journal_addrs {
+            peer.hostname = peer.hostname.trim().to_string();
+        }
+        self.worker.data_dir = self
+            .worker
+            .data_dir
+            .iter()
+            .map(|dir| dir.trim().to_string())
+            .filter(|dir| !dir.is_empty())
+            .collect();
+        self.transfer.endpoints = self
+            .transfer
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.trim().to_string())
+            .filter(|endpoint| !endpoint.is_empty())
+            .collect();
     }
 
     fn apply_hostname_overrides(&mut self) -> CommonResult<()> {
@@ -154,22 +185,23 @@ impl ClusterConf {
             self.transfer.hostname = ip;
         } else {
             if let Ok(v) = env::var(Self::ENV_MASTER_HOSTNAME) {
-                self.master.hostname = v.to_owned();
-                self.journal.hostname = v;
+                let hostname = v.trim().to_string();
+                self.master.hostname = hostname.clone();
+                self.journal.hostname = hostname;
             }
 
             // Apply worker hostname from environment variable (used by worker process)
             if let Ok(v) = env::var(Self::ENV_WORKER_HOSTNAME) {
-                self.worker.hostname = v;
+                self.worker.hostname = v.trim().to_string();
             }
 
             // Apply client hostname from environment variable
             if let Ok(v) = env::var(Self::ENV_CLIENT_HOSTNAME) {
-                self.client.hostname = v;
+                self.client.hostname = v.trim().to_string();
             }
 
             if let Ok(v) = env::var(Self::ENV_TRANSFER_HOSTNAME) {
-                self.transfer.hostname = v;
+                self.transfer.hostname = v.trim().to_string();
             }
         }
 
@@ -192,10 +224,10 @@ impl ClusterConf {
             self.transfer.hostname = ip;
         } else {
             if let Ok(v) = env::var(Self::ENV_CLIENT_HOSTNAME) {
-                self.client.hostname = v;
+                self.client.hostname = v.trim().to_string();
             }
             if let Ok(v) = env::var(Self::ENV_TRANSFER_HOSTNAME) {
-                self.transfer.hostname = v;
+                self.transfer.hostname = v.trim().to_string();
             }
         }
         Ok(())
@@ -541,6 +573,71 @@ mod tests {
         assert!(
             conf.check_master_hostname().is_err(),
             "local journal address absent from journal_addrs must error"
+        );
+    }
+
+    #[test]
+    fn trims_whitespace_in_hostname_config() {
+        let path = std::env::temp_dir().join(format!(
+            "curvine-trim-conf-{}-{}.toml",
+            std::process::id(),
+            Utils::rand_str(6)
+        ));
+        std::fs::write(
+            &path,
+            r#"
+                net_interface = " "
+
+                [master]
+                hostname = " master-01.example "
+
+                [journal]
+                hostname = " journal-01.example "
+                journal_addrs = [
+                    { id = 1, hostname = " journal-01.example ", port = 8996 },
+                    { id = 2, hostname = "journal-02.example", port = 8996 },
+                ]
+
+                [worker]
+                hostname = " worker-01.example "
+                data_dir = [" /data/curvine ", "/data/curvine2"]
+
+                [client]
+                hostname = " client-01.example "
+                master_addrs = [
+                    { hostname = " curvine-master-01.oppo.local", port = 8995 },
+                    { hostname = " curvine-master-02.oppo.local", port = 8995 },
+                    { hostname = "curvine-master-03.oppo.local", port = 8995 },
+                ]
+
+                [transfer]
+                hostname = " transfer-01.example "
+                endpoints = [" transfer-01.example:9010 ", "transfer-02.example:9010"]
+            "#,
+        )
+        .unwrap();
+
+        let conf = ClusterConf::from(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(conf.net_interface, "");
+        assert_eq!(conf.master.hostname, "master-01.example");
+        assert_eq!(conf.journal.hostname, "journal-01.example");
+        assert_eq!(conf.journal.journal_addrs[0].hostname, "journal-01.example");
+        assert_eq!(conf.worker.hostname, "worker-01.example");
+        assert_eq!(
+            conf.worker.data_dir,
+            vec!["/data/curvine", "/data/curvine2"]
+        );
+        assert_eq!(conf.client.hostname, "client-01.example");
+        assert_eq!(
+            conf.client.master_addrs[1].hostname,
+            "curvine-master-02.oppo.local"
+        );
+        assert_eq!(conf.transfer.hostname, "transfer-01.example");
+        assert_eq!(
+            conf.transfer.endpoints,
+            vec!["transfer-01.example:9010", "transfer-02.example:9010"]
         );
     }
 

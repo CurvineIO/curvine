@@ -212,7 +212,11 @@ async fn add_dcm(
     match params.get("workers") {
         None => err_box!("not params workers"),
         Some(v) => {
-            let list = v.split(",").map(|x| x.to_string()).collect();
+            let list = v
+                .split(",")
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect();
             let res = wm.add_dcm(list);
             Ok(Json(res))
         }
@@ -236,7 +240,11 @@ async fn remove_dcm(
     match params.get("workers") {
         None => err_box!("not params workers"),
         Some(v) => {
-            let list = v.split(",").map(|x| x.to_string()).collect();
+            let list = v
+                .split(",")
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect();
             let res = wm.remove_dcm(list);
             Ok(Json(res))
         }

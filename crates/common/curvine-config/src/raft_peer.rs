@@ -32,13 +32,14 @@ impl RaftPeer {
     pub fn new<T: AsRef<str>>(id: NodeId, hostname: T, port: u16) -> Self {
         Self {
             id,
-            hostname: hostname.as_ref().to_string(),
+            hostname: hostname.as_ref().trim().to_string(),
             port,
         }
     }
 
     pub fn from_addr<T: AsRef<str>>(hostname: T, port: u16) -> Self {
-        let id = Self::create_id(format!("{}{}", hostname.as_ref(), port));
+        let hostname = hostname.as_ref().trim();
+        let id = Self::create_id(format!("{}{}", hostname, port));
         Self::new(id, hostname, port)
     }
 

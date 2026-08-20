@@ -191,24 +191,18 @@ impl FilesystemConf {
     }
 
     pub fn into_cluster_conf(self) -> FsResult<ClusterConf> {
-        let mut master_addrs = vec![];
-        if self.master_addrs.is_empty() {
+        if self.master_addrs.trim().is_empty() {
             return err_box!("fs.cv.master_addrs can not be empty");
         }
 
-        for node in self.master_addrs.split(",") {
-            let vec: Vec<&str> = node.split(":").collect();
-            if vec.len() != 2 {
-                return err_box!("wrong format fs.cv.master_addrs {}", self.master_addrs);
-            }
-            let hostname = vec[0].to_string();
-            let port: u16 = vec[1].parse()?;
-            master_addrs.push(InetAddr::new(hostname, port));
-        }
+        let master_addrs = match InetAddr::parse_list(&self.master_addrs) {
+            Ok(addrs) => addrs,
+            Err(_) => return err_box!("wrong format fs.cv.master_addrs {}", self.master_addrs),
+        };
 
         let client = ClientConf {
             master_addrs,
-            hostname: self.client_hostname,
+            hostname: self.client_hostname.trim().to_string(),
             io_threads: self.io_threads,
             worker_threads: self.worker_threads,
             replicas: self.replicas,
@@ -314,6 +308,32 @@ impl FilesystemConf {
 #[cfg(test)]
 mod tests {
     use super::{FilesystemConf, TransferClientConf};
+
+    #[test]
+    fn trims_whitespace_in_comma_separated_master_addrs() {
+        let mut conf = FilesystemConf::with_master_addrs(["placeholder:8995"]).unwrap();
+        // Production Hadoop/XML often inserts a space after only some commas.
+        // Without trim, only the padded hostname fails DNS, so a leader on that
+        // node looks like "all masters unavailable".
+        conf.master_addrs = "curvine-master-01.oppo.local:8995, curvine-master-02.oppo.local:8995,curvine-master-03.oppo.local:8995"
+            .to_string();
+
+        let cluster = conf.into_cluster_conf().unwrap();
+        let hostnames: Vec<&str> = cluster
+            .client
+            .master_addrs
+            .iter()
+            .map(|addr| addr.hostname.as_str())
+            .collect();
+        assert_eq!(
+            hostnames,
+            [
+                "curvine-master-01.oppo.local",
+                "curvine-master-02.oppo.local",
+                "curvine-master-03.oppo.local"
+            ]
+        );
+    }
 
     #[test]
     fn keeps_transfer_routing_in_cluster_conf() {

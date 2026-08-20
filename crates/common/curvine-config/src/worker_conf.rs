@@ -57,6 +57,7 @@ impl WorkerDataDir {
     }
 
     pub fn from_str(str: &str) -> CommonResult<Self> {
+        let str = str.trim();
         let re = Regex::new(r"^\[([\w:]*)\](.+)$")?;
         let caps = match re.captures(str) {
             None => return Ok(Self::with_path(str)),
@@ -64,8 +65,8 @@ impl WorkerDataDir {
         };
 
         let prefix = caps.get(1).map_or("", |m| m.as_str());
-        let path = caps.get(2).map_or("", |m| m.as_str());
-        let arr = prefix.split(":").collect::<Vec<&str>>();
+        let path = caps.get(2).map_or("", |m| m.as_str()).trim();
+        let arr = prefix.split(':').map(str::trim).collect::<Vec<&str>>();
 
         if prefix.is_empty() || arr.is_empty() {
             // /dir
@@ -218,5 +219,17 @@ impl Default for WorkerConf {
             spdk_disk: SpdkConf::default(),
             compatibility: CompatibilityConf::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkerDataDir;
+
+    #[test]
+    fn from_str_trims_path_and_prefix() {
+        let dir = WorkerDataDir::from_str("  [SSD:100MB] /data/curvine  ").unwrap();
+        assert!(dir.path_str().ends_with("/data/curvine"));
+        assert_eq!(dir.capacity, 100 * 1024 * 1024);
     }
 }

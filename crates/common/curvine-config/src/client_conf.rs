@@ -279,6 +279,11 @@ impl ClientConf {
     pub const DEFAULT_MAX_READ_PARALLEL: i64 = 8;
 
     pub fn init(&mut self) -> CommonResult<()> {
+        self.hostname = self.hostname.trim().to_string();
+        for addr in &mut self.master_addrs {
+            addr.hostname = addr.hostname.trim().to_string();
+        }
+
         if self.read_parallel <= 0 {
             self.read_parallel = Self::DEFAULT_READ_PARALLEL;
         }

@@ -298,16 +298,10 @@ impl FuseMountArgs {
         }
 
         if let Some(master_addrs) = &self.master_addrs {
-            let mut vec = vec![];
-            for node in master_addrs.split(",") {
-                let tmp: Vec<&str> = node.split(":").collect();
-                if tmp.len() != 2 {
-                    return err_box!("wrong format master_addrs {}", master_addrs);
-                }
-                let hostname = tmp[0].to_string();
-                let port: u16 = tmp[1].parse()?;
-                vec.push(InetAddr::new(hostname, port));
-            }
+            let vec = match InetAddr::parse_list(master_addrs) {
+                Ok(vec) => vec,
+                Err(_) => return err_box!("wrong format master_addrs {}", master_addrs),
+            };
             conf.client.master_addrs = vec;
         }
 

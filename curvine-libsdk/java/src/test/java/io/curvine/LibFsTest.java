@@ -39,6 +39,18 @@ public class LibFsTest {
     }
 
     @Test
+    public void trimsMasterAddrsWhitespace() throws Exception {
+        Configuration conf = new Configuration();
+        conf.set("fs.cv.master_addrs", "localhost:9001, localhost:9002,localhost:9003");
+        conf.set("fs.cv.io_threads", " 16 ");
+
+        FilesystemConf filesystemConf = new FilesystemConf(conf);
+
+        assert filesystemConf.master_addrs.equals("localhost:9001,localhost:9002,localhost:9003");
+        assert filesystemConf.io_threads == 16;
+    }
+
+    @Test
     public void jni1() throws Exception {
         Configuration conf = new Configuration();
         conf.set("fs.cv.master_addrs", "localhost:6995");

@@ -121,6 +121,13 @@ impl TransferConf {
     pub const DEFAULT_TASK_MAX_RETRIES: usize = 3;
 
     pub fn init(&mut self) -> FsResult<()> {
+        self.hostname = self.hostname.trim().to_string();
+        self.endpoints = self
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.trim().to_string())
+            .filter(|endpoint| !endpoint.is_empty())
+            .collect();
         self.infer_store_url();
         if self.endpoints.is_empty() {
             self.endpoints

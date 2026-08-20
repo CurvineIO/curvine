@@ -147,10 +147,15 @@ public class FilesystemConf {
             }
 
             field.setAccessible(true);
+            value = value.trim();
             String fieldType = field.getType().getName();
             switch (fieldType) {
                 case "java.lang.String":
-                    field.set(this, value);
+                    if ("master_addrs".equals(field.getName())) {
+                        field.set(this, normalizeCsv(value));
+                    } else {
+                        field.set(this, value);
+                    }
                     break;
                 case "int":
                     field.setInt(this, Integer.parseInt(value));
@@ -168,21 +173,21 @@ public class FilesystemConf {
 
         String transferEnabled = conf.get(PREFIX + ".transfer.enabled");
         if (transferEnabled != null) {
-            transfer_enabled = Boolean.parseBoolean(transferEnabled);
+            transfer_enabled = Boolean.parseBoolean(transferEnabled.trim());
         }
         String transferEndpoints = conf.get(PREFIX + ".transfer.endpoints");
         if (transferEndpoints != null) {
-            transfer_endpoints = transferEndpoints;
+            transfer_endpoints = normalizeCsv(transferEndpoints);
         }
         String transferClientPendingQueueSize =
                 conf.get(PREFIX + ".transfer.client_pending_queue_size");
         if (transferClientPendingQueueSize != null) {
-            transfer_client_pending_queue_size = Integer.parseInt(transferClientPendingQueueSize);
+            transfer_client_pending_queue_size = Integer.parseInt(transferClientPendingQueueSize.trim());
         }
         String transferClientSubmitConcurrency =
                 conf.get(PREFIX + ".transfer.client_submit_concurrency");
         if (transferClientSubmitConcurrency != null) {
-            transfer_client_submit_concurrency = Integer.parseInt(transferClientSubmitConcurrency);
+            transfer_client_submit_concurrency = Integer.parseInt(transferClientSubmitConcurrency.trim());
         }
     }
 
@@ -236,6 +241,21 @@ public class FilesystemConf {
                 .append(transfer_client_submit_concurrency)
                 .append("\n");
 
+        return builder.toString();
+    }
+
+    private static String normalizeCsv(String value) {
+        StringBuilder builder = new StringBuilder();
+        for (String part : value.split(",")) {
+            String trimmed = part.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            if (builder.length() > 0) {
+                builder.append(',');
+            }
+            builder.append(trimmed);
+        }
         return builder.toString();
     }
 
