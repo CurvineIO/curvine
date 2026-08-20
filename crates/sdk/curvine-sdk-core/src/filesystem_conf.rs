@@ -197,7 +197,13 @@ impl FilesystemConf {
 
         let master_addrs = match InetAddr::parse_list(&self.master_addrs) {
             Ok(addrs) => addrs,
-            Err(_) => return err_box!("wrong format fs.cv.master_addrs {}", self.master_addrs),
+            Err(e) => {
+                return err_box!(
+                    "wrong format fs.cv.master_addrs {}: {}",
+                    self.master_addrs,
+                    e
+                );
+            }
         };
 
         let client = ClientConf {
@@ -332,6 +338,25 @@ mod tests {
                 "curvine-master-02.oppo.local",
                 "curvine-master-03.oppo.local"
             ]
+        );
+    }
+
+    #[test]
+    fn into_cluster_conf_includes_parse_error_for_invalid_master_addrs() {
+        let mut conf = FilesystemConf::with_master_addrs(["placeholder:8995"]).unwrap();
+        conf.master_addrs = "host-a:8995, host-b:not-a-port".to_string();
+
+        let err = conf
+            .into_cluster_conf()
+            .expect_err("invalid master_addrs must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("wrong format fs.cv.master_addrs host-a:8995, host-b:not-a-port"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("invalid digit found in string"),
+            "parse error should be included: {msg}"
         );
     }
 
