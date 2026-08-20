@@ -2814,6 +2814,7 @@ dependencies = [
  "crossbeam",
  "curvine-core-error",
  "curvine-io",
+ "curvine-metrics",
  "curvine-runtime",
  "libc",
  "log",

@@ -12,6 +12,7 @@ spdk-rdma = ["spdk"]
 
 [dependencies]
 curvine-core-error = { workspace = true }
+curvine-metrics = { workspace = true }
 curvine-runtime = { workspace = true }
 curvine-io = { workspace = true }
 bytes = { workspace = true }

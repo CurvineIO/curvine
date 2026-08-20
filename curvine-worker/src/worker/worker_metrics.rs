@@ -116,6 +116,11 @@ impl WorkerMetrics {
 
         self.store_total_disks.set(state.storage_count() as i64);
 
+        #[cfg(feature = "spdk")]
+        if let Some(env) = curvine_storage_spdk::SpdkEnv::global_including_shutdown() {
+            env.publish_metrics();
+        }
+
         Metrics::text_output()
     }
 }
