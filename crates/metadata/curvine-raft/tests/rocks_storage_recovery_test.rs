@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use curvine_core_error::CommonResult;
-use curvine_raft::raft::storage::RocksStorageCore;
+use curvine_raft::raft::{storage::RocksStorageCore, RaftError};
 use curvine_raft::rocksdb::{DBConf, DBEngine, RocksUtils};
 use curvine_runtime::common::{FileUtils, Utils};
 use prost::Message;
@@ -41,6 +41,25 @@ fn assert_reseed_required(error: impl ToString, commit: u64, lower: u64, upper: 
         message.contains("Restore a consistent master meta+journal pair from a healthy voter"),
         "missing operator hint in error: {message}"
     );
+}
+
+fn persist_snapshot(conf: &DBConf, index: u64) {
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = index;
+    snapshot.mut_metadata().term = 7;
+    let db = DBEngine::new(
+        conf.clone()
+            .add_cf(RocksStorageCore::CF_ENTRIES)
+            .add_cf(RocksStorageCore::CF_META),
+        false,
+    )
+    .unwrap();
+    db.put_cf(
+        RocksStorageCore::CF_META,
+        RocksStorageCore::SNAP_KEY,
+        snapshot.encode_to_vec(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -176,6 +195,60 @@ fn snapshot_install_compacts_the_durable_log_range() {
     assert_eq!(storage.init_state().unwrap().hard_state.commit, 3);
     assert_eq!(storage.first_index(), 4);
     assert_eq!(storage.last_index(), 3);
+}
+
+#[test]
+fn restart_accepts_snapshot_adjacent_to_first_retained_log() {
+    let conf = test_conf("snapshot-adjacent");
+    FileUtils::delete_path(&conf.base_dir, true).unwrap();
+
+    {
+        let mut storage = RocksStorageCore::new(conf.clone(), true);
+        let entries: Vec<_> = (1..=3)
+            .map(|index| Entry {
+                term: 7,
+                index,
+                ..Default::default()
+            })
+            .collect();
+        storage.append(&entries).unwrap();
+        storage.compact(3).unwrap();
+    }
+
+    persist_snapshot(&conf, 2);
+
+    let mut storage = RocksStorageCore::new(conf, false);
+    let persisted_snapshot = storage.last_snapshot().unwrap();
+    storage.apply_snapshot(persisted_snapshot).unwrap();
+    assert_eq!(storage.first_index(), 3);
+    assert_eq!(storage.last_index(), 3);
+}
+
+#[test]
+fn snapshot_with_gap_before_first_retained_log_is_rejected() {
+    let conf = test_conf("snapshot-gap");
+    FileUtils::delete_path(&conf.base_dir, true).unwrap();
+
+    {
+        let mut storage = RocksStorageCore::new(conf.clone(), true);
+        let entries: Vec<_> = (1..=4)
+            .map(|index| Entry {
+                term: 7,
+                index,
+                ..Default::default()
+            })
+            .collect();
+        storage.append(&entries).unwrap();
+        storage.compact(4).unwrap();
+    }
+
+    persist_snapshot(&conf, 2);
+
+    let mut storage = RocksStorageCore::new(conf, false);
+    let error: RaftError = storage
+        .apply_snapshot(storage.last_snapshot().unwrap())
+        .unwrap_err();
+    assert!(error.is_snapshot_out_of_date(), "unexpected error: {error}");
 }
 
 #[test]

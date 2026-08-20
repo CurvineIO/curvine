@@ -223,12 +223,14 @@ impl RocksStorageCore {
         let meta = snapshot.get_metadata();
         let index = meta.index;
 
-        // Index is 0, indicating that there is no snapshot, but there may be log entry.
-        if index > LOG_START_INDEX && self.first_index() > index {
+        // A snapshot at first_index - 1 is contiguous with the retained log and
+        // is the normal state after compacting through the snapshot index. Only
+        // reject snapshots that leave a gap before the first retained entry.
+        let first_index = self.first_index();
+        if index > LOG_START_INDEX && first_index > index.saturating_add(1) {
             warn!(
                 "snapshot out of date: snapshot_index={}, first_index={}, skip apply",
-                index,
-                self.first_index()
+                index, first_index
             );
             return err_ext!(RaftError::raft(raft::Error::Store(
                 raft::StorageError::SnapshotOutOfDate
