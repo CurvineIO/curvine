@@ -75,6 +75,15 @@ pub struct MasterMetrics {
     pub(crate) fs_dir_stalled: Gauge,
     pub(crate) fs_dir_stall_total: Counter,
     pub(crate) fs_dir_probe_acquire_us: Gauge,
+
+    // Compatibility metrics.
+    // Per-verdict gauge: 1 for the current verdict of each worker/client
+    // (compatible, missing_info, blocked, protocol_mismatch, version_too_old,
+    // version_unknown). Only one label per peer is active at a time.
+    pub(crate) compat_worker_verdict: GaugeVec,
+    pub(crate) compat_client_verdict: GaugeVec,
+    // Total number of enforce-mode rejections, labelled by component and verdict.
+    pub(crate) compat_enforce_rejected_total: CounterVec,
 }
 
 impl MasterMetrics {
@@ -184,6 +193,22 @@ impl MasterMetrics {
             fs_dir_probe_acquire_us: m::new_gauge(
                 "fs_dir_probe_acquire_us",
                 "Latency in microseconds of the last fs_dir watchdog read-lock probe",
+            )?,
+
+            compat_worker_verdict: m::new_gauge_vec(
+                "compat_worker_verdict",
+                "Current compatibility verdict per worker, labelled by worker_id and verdict",
+                &["worker_id", "verdict"],
+            )?,
+            compat_client_verdict: m::new_gauge_vec(
+                "compat_client_verdict",
+                "Current compatibility verdict per client, labelled by client_addr and verdict",
+                &["client_addr", "verdict"],
+            )?,
+            compat_enforce_rejected_total: m::new_counter_vec(
+                "compat_enforce_rejected_total",
+                "Total number of enforce-mode compatibility rejections, labelled by component and verdict",
+                &["component", "verdict"],
             )?,
         };
 

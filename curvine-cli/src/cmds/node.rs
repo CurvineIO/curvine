@@ -19,6 +19,7 @@ use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_runtime::common::ByteUnit;
 use reqwest::Client;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +30,10 @@ pub struct NodeCommand {
     /// list all nodes
     #[arg(long, short = 'l')]
     list: bool,
+
+    /// show version distribution across all workers
+    #[arg(long)]
+    versions: bool,
 
     /// add decommission node
     #[arg(long)]
@@ -274,7 +279,89 @@ impl NodeCommand {
         Ok(())
     }
 
+    // Handle showing version distribution across workers
+    async fn handle_versions(&self, client: Arc<FsClient>, conf: &ClusterConf) -> CommonResult<()> {
+        let url = "/api/workers";
+        let response = handle_rpc_result(self.http_get(client.clone(), conf, url)).await;
+
+        // Parse JSON response
+        let workers_map: HashMap<String, Vec<serde_json::Value>> = serde_json::from_str(&response)?;
+
+        let live_workers = workers_map.get("live_workers").cloned().unwrap_or_default();
+
+        let version_counts = Self::count_worker_versions(&live_workers);
+
+        println!("Version Distribution:");
+        println!("{}", "-".repeat(40));
+
+        let mut total: u32 = 0;
+        for (version, count) in &version_counts.versions {
+            println!("  {:<20}: {} worker(s)", version, count);
+            total += *count;
+        }
+
+        if version_counts.legacy_count > 0 {
+            println!(
+                "  {:<20}: {} worker(s)",
+                "legacy (no version)", version_counts.legacy_count
+            );
+            total += version_counts.legacy_count;
+        }
+
+        println!("{}", "-".repeat(40));
+        println!("  {:<20}: {} worker(s)", "total", total);
+
+        Ok(())
+    }
+
+    /// Count worker release-version distribution from the `/api/workers` JSON
+    /// payload.
+    ///
+    /// Prefers the structured `component_info.release_version` reported on
+    /// heartbeat (T7+); falls back to the legacy `software_version` display
+    /// string. Workers with no useful version data count as `legacy_count`.
+    fn count_worker_versions(workers: &[serde_json::Value]) -> VersionCounts {
+        // Count version distribution: release_version (from component_info) -> count
+        let mut version_counts: BTreeMap<String, u32> = BTreeMap::new();
+        let mut legacy_count: u32 = 0;
+
+        for worker in workers {
+            // Prefer structured component_info.release_version (T7+). When
+            // component_info is present but release_version is missing or
+            // empty (partially-upgraded / malformed payloads), fall back to
+            // the legacy software_version display string.
+            let release_version = worker["component_info"]
+                .as_object()
+                .and_then(|ci| ci.get("release_version"))
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty());
+
+            if let Some(version) = release_version {
+                *version_counts.entry(version.to_string()).or_insert(0) += 1;
+            } else {
+                // Fall back to legacy software_version
+                let sv = worker["software_version"].as_str().unwrap_or("unknown");
+                if sv.is_empty() || sv == "unknown" {
+                    legacy_count += 1;
+                } else {
+                    *version_counts
+                        .entry(format!("legacy ({})", sv))
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+
+        VersionCounts {
+            versions: version_counts,
+            legacy_count,
+        }
+    }
+
     pub async fn execute(&self, client: Arc<FsClient>, conf: ClusterConf) -> CommonResult<()> {
+        if self.versions {
+            return self.handle_versions(client, &conf).await;
+        }
+
         if self.list {
             return self.handle_list(client, &conf).await;
         }
@@ -288,5 +375,112 @@ impl NodeCommand {
         }
 
         Ok(())
+    }
+}
+
+/// Release-version distribution across live workers, as counted by
+/// [`NodeCommand::count_worker_versions`].
+struct VersionCounts {
+    /// Map of display version -> worker count. BTreeMap keeps output stable.
+    versions: BTreeMap<String, u32>,
+    /// Workers with no usable version data (no structured release_version and
+    /// no usable legacy software_version).
+    legacy_count: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn worker_with_component_info(version: &str) -> serde_json::Value {
+        serde_json::json!({
+            "address": {"hostname": "worker-host", "rpc_port": 1234},
+            "status": "Live",
+            "software_version": "0.0.0-old",
+            "component_info": {
+                "component": "worker",
+                "release_version": version,
+                "protocol_version": 1
+            }
+        })
+    }
+
+    fn worker_with_legacy_software_version(version: &str) -> serde_json::Value {
+        serde_json::json!({
+            "address": {"hostname": "worker-host", "rpc_port": 1234},
+            "status": "Live",
+            "software_version": version
+        })
+    }
+
+    #[test]
+    fn count_worker_versions_prefers_structured_component_info() {
+        let workers = vec![
+            worker_with_component_info("0.4.0-alpha"),
+            worker_with_component_info("0.4.0-alpha"),
+            worker_with_component_info("0.4.0-beta"),
+        ];
+
+        let counts = NodeCommand::count_worker_versions(&workers);
+
+        assert_eq!(counts.versions.get("0.4.0-alpha"), Some(&2));
+        assert_eq!(counts.versions.get("0.4.0-beta"), Some(&1));
+        assert_eq!(counts.legacy_count, 0);
+    }
+
+    #[test]
+    fn count_worker_versions_falls_back_to_legacy_software_version() {
+        let workers = vec![
+            worker_with_legacy_software_version("0.3.0-test"),
+            worker_with_legacy_software_version("0.3.0-test"),
+            worker_with_legacy_software_version("unknown"),
+        ];
+
+        let counts = NodeCommand::count_worker_versions(&workers);
+
+        assert_eq!(counts.versions.get("legacy (0.3.0-test)"), Some(&2));
+        assert_eq!(counts.legacy_count, 1);
+    }
+
+    #[test]
+    fn count_worker_versions_falls_back_when_component_info_lacks_release_version() {
+        // component_info present but without a usable release_version must
+        // fall back to the legacy software_version display string instead of
+        // counting the worker as legacy.
+        let workers = vec![
+            serde_json::json!({
+                "address": {"hostname": "worker-host", "rpc_port": 1234},
+                "status": "Live",
+                "software_version": "0.2.0-test",
+                "component_info": {}
+            }),
+            serde_json::json!({
+                "address": {"hostname": "worker-host2", "rpc_port": 1235},
+                "status": "Live",
+                "software_version": "0.2.0-test",
+                "component_info": {"component": "worker", "release_version": ""}
+            }),
+        ];
+
+        let counts = NodeCommand::count_worker_versions(&workers);
+
+        assert_eq!(counts.versions.get("legacy (0.2.0-test)"), Some(&2));
+        assert_eq!(counts.legacy_count, 0);
+    }
+
+    #[test]
+    fn count_worker_versions_counts_legacy_when_no_version_data_at_all() {
+        // component_info present but release_version unusable, and no legacy
+        // software_version either -> legacy.
+        let workers = vec![serde_json::json!({
+            "address": {"hostname": "worker-host", "rpc_port": 1234},
+            "status": "Live",
+            "component_info": {"component": "worker", "release_version": ""}
+        })];
+
+        let counts = NodeCommand::count_worker_versions(&workers);
+
+        assert!(counts.versions.is_empty());
+        assert_eq!(counts.legacy_count, 1);
     }
 }
