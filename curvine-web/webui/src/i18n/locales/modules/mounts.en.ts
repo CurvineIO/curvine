@@ -24,13 +24,16 @@ export default {
       provider: 'Provider',
       resync: 'Resync',
       cacheModeLabel: 'cache mode',
-      empty: 'No mounts in this mode.'
+      empty: 'No mounts in this mode.',
+      emptySearch: 'No mounts matched this Curvine path.'
     },
     filters: {
       all: 'All',
       fsMode: 'FS Mode',
       cacheMode: 'Cache Mode',
-      ariaLabel: 'Mount mode filter'
+      ariaLabel: 'Mount mode filter',
+      pathSearchPlaceholder: 'Fuzzy search by Curvine path, e.g. lake/raw',
+      pathSearchAria: 'Search mounts by Curvine path'
     },
     form: {
       addTitle: 'Add Mount',

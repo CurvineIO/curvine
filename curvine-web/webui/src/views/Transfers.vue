@@ -87,8 +87,18 @@
             <div class="transfer-meta transfer-meta-updated"><span>Updated</span><strong :title="formatTime(transfer.update_time_ms)">{{ relativeTime(transfer.update_time_ms) }}</strong></div>
             <div class="row-actions transfer-actions">
               <button class="link-button" @click="openDetails(transfer)">Details</button>
-              <button v-if="!isFinal(transfer)" class="link-button danger-link" :disabled="isTransferBusy(transfer)" @click="cancelTransferJob(transfer)">{{ busyLabel(transfer, 'cancel', 'Cancel') }}</button>
-              <button v-if="canRetry(transfer)" class="link-button" :disabled="isTransferBusy(transfer)" @click="retryTransferJob(transfer)">{{ busyLabel(transfer, 'retry', 'Retry') }}</button>
+              <button
+                v-if="canRetry(transfer)"
+                class="link-button"
+                :disabled="isTransferBusy(transfer)"
+                @click="retryTransferJob(transfer)"
+              >{{ busyLabel(transfer, 'retry', 'Retry') }}</button>
+              <button
+                v-if="!isFinal(transfer)"
+                class="link-button danger-link"
+                :disabled="isTransferBusy(transfer)"
+                @click="cancelTransferJob(transfer)"
+              >{{ busyLabel(transfer, 'cancel', 'Cancel') }}</button>
             </div>
           </article>
         </div>
@@ -109,7 +119,12 @@
           <span :class="['status-pill', transferClass(selectedTransfer)]">{{ stateLabel(selectedTransfer) }}</span>
           <span :class="['transfer-kind-badge', kindClass(selectedTransfer)]">{{ kindLabel(selectedTransfer) }}</span>
           <button class="link-button" @click="copyText(jobId(selectedTransfer), 'Transfer id copied')">Copy Job ID</button>
-          <button v-if="canRetry(selectedTransfer)" class="link-button" @click="retryTransferJob(selectedTransfer)">Retry</button>
+          <button
+            v-if="canRetry(selectedTransfer)"
+            class="link-button"
+            :disabled="isTransferBusy(selectedTransfer)"
+            @click="retryTransferJob(selectedTransfer)"
+          >{{ busyLabel(selectedTransfer, 'retry', 'Retry') }}</button>
         </div>
 
         <section class="detail-section">
@@ -336,8 +351,10 @@ export default {
       if (transfer && transfer.done === true) return true
       return ['completed', 'failed', 'canceled', 'partialsuccess'].includes(this.stateValue(transfer))
     },
+    // Align with transfer service retry_transfer: terminal jobs only
+    // (Completed / Failed / Canceled / PartialSuccess).
     canRetry(transfer) {
-      return ['failed', 'canceled', 'partialsuccess'].includes(this.stateValue(transfer))
+      return this.isFinal(transfer)
     },
     jobBucket(transfer) {
       const value = this.stateValue(transfer)
@@ -536,12 +553,24 @@ export default {
     async retryTransferJob(transfer) {
       const id = this.jobId(transfer)
       if (!id) return
-      if (!window.confirm(`Retry transfer job ${id}?`)) return
+      if (!this.canRetry(transfer)) {
+        this.setNotice(`Retry skipped: ${id} is ${this.stateLabel(transfer)} (only terminal jobs can retry)`)
+        return
+      }
+      if (!window.confirm(`Retry transfer job ${id}? This submits a new run with a fresh request id.`)) return
       this.setTransferBusy(id, 'retry')
       try {
         const next = await retryTransfer(id)
         this.upsertTransfer(next)
-        this.setNotice(`Retry submitted: ${this.jobId(next)}`)
+        const nextId = this.jobId(next)
+        this.selectedTransferId = nextId
+        this.showFailedTasksOnly = false
+        this.setNotice(`Retry submitted: ${nextId} (from ${id})`)
+        if (nextId) {
+          try {
+            this.upsertTransfer(await fetchTransferStatus(nextId))
+          } catch (_) {}
+        }
       } catch (error) {
         this.setNotice(`Retry failed: ${error}`)
         window.alert(`Retry failed: ${error}`)

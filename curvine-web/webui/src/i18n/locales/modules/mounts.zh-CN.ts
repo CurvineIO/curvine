@@ -24,13 +24,16 @@ export default {
       provider: 'Provider',
       resync: '重同步',
       cacheModeLabel: '缓存模式',
-      empty: '此模式下没有挂载。'
+      empty: '此模式下没有挂载。',
+      emptySearch: '没有匹配该 Curvine 路径的挂载。'
     },
     filters: {
       all: '全部',
       fsMode: 'FS 模式',
       cacheMode: '缓存模式',
-      ariaLabel: '挂载模式筛选'
+      ariaLabel: '挂载模式筛选',
+      pathSearchPlaceholder: '按 Curvine 路径模糊搜索，例如 lake/raw',
+      pathSearchAria: '按 Curvine 路径搜索挂载'
     },
     form: {
       addTitle: '添加挂载',

@@ -23,6 +23,16 @@
           <button :class="['mode-tab', { active: modeFilter === 'cache_mode' }]" @click="modeFilter = 'cache_mode'">{{ $t('mounts.filters.cacheMode') }} {{ cacheModeCount }}</button>
         </div>
 
+        <div class="toolbar mounts-toolbar">
+          <input
+            v-model="pathQuery"
+            class="admin-input mount-search-input"
+            type="search"
+            :placeholder="$t('mounts.filters.pathSearchPlaceholder')"
+            :aria-label="$t('mounts.filters.pathSearchAria')"
+          >
+        </div>
+
         <div class="mount-table-scroll">
           <table class="admin-table mount-table">
           <thead>
@@ -51,7 +61,7 @@
           </tbody>
           </table>
         </div>
-        <div v-if="filteredMounts.length === 0" class="empty-state">{{ $t('mounts.table.empty') }}</div>
+        <div v-if="filteredMounts.length === 0" class="empty-state">{{ emptyMountsMessage }}</div>
       </div>
     </section>
 
@@ -219,6 +229,7 @@ export default {
       formLoading: false,
       mounts: [],
       modeFilter: 'all',
+      pathQuery: '',
       form: emptyForm(),
       propertyRows: [],
       propertiesText: '',
@@ -237,8 +248,19 @@ export default {
     cacheModeCount() { return this.mounts.filter((m) => this.writeTypeLabel(m.write_type) === 'cache_mode').length },
     providerCount() { return new Set(this.mounts.map((m) => this.providerLabel(m.provider) || this.schemeOf(m.ufs_path)).filter(Boolean)).size },
     filteredMounts() {
-      if (this.modeFilter === 'all') return this.mounts
-      return this.mounts.filter((m) => this.writeTypeLabel(m.write_type) === this.modeFilter)
+      const query = String(this.pathQuery || '').trim()
+      return this.mounts.filter((m) => {
+        if (this.modeFilter !== 'all' && this.writeTypeLabel(m.write_type) !== this.modeFilter) {
+          return false
+        }
+        if (!query) return true
+        return this.matchesCvPath(m.cv_path, query)
+      })
+    },
+    emptyMountsMessage() {
+      if (!this.mounts.length) return this.$t('mounts.table.empty')
+      if (String(this.pathQuery || '').trim()) return this.$t('mounts.table.emptySearch')
+      return this.$t('mounts.table.empty')
     },
     modalStyle() {
       if (!this.modalPosition.x && !this.modalPosition.y) return {}
@@ -622,6 +644,16 @@ export default {
       return value.startsWith('/') ? `file://${value}` : value
     },
     isFsMode(mount) { return this.writeTypeLabel(mount.write_type) === 'fs_mode' },
+    // Case-insensitive substring on cv_path; multi-token queries (space or /) require every token.
+    matchesCvPath(cvPath, query) {
+      const path = String(cvPath || '').toLowerCase()
+      const normalized = String(query || '').trim().toLowerCase().replace(/\\/g, '/')
+      if (!normalized) return true
+      if (path.includes(normalized)) return true
+      const tokens = normalized.split(/[\s/]+/).filter(Boolean)
+      if (tokens.length <= 1) return false
+      return tokens.every((token) => path.includes(token))
+    },
     writeTypeLabel(value) {
       if (value === 1 || value === 'FsMode') return 'fs_mode'
       if (value === 0 || value === 'CacheMode') return 'cache_mode'
@@ -688,7 +720,20 @@ export default {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.mounts-toolbar {
+  display: flex;
+  gap: 10px;
+  align-items: center;
   margin-bottom: 16px;
+}
+
+.mount-search-input {
+  flex: 1;
+  min-width: 220px;
+  max-width: 480px;
 }
 
 .mode-tab {
