@@ -529,6 +529,21 @@ impl FuseConf {
                     _ => return err_box!("Unknown FUSE mount option '{}'", raw_opt),
                 };
 
+                let conflicting_option = match option.as_str() {
+                    "sync" => Some("async"),
+                    "async" => Some("sync"),
+                    _ => None,
+                };
+                if let Some(conflicting_option) = conflicting_option {
+                    if normalized.iter().any(|item| item == conflicting_option) {
+                        return err_box!(
+                            "FUSE mount options '{}' and '{}' conflict; specify only one",
+                            conflicting_option,
+                            raw_opt
+                        );
+                    }
+                }
+
                 if !normalized.contains(&option) {
                     normalized.push(option);
                 }
@@ -939,6 +954,31 @@ max_readahead_kb = 1024
         conf.init().expect("supported options must be accepted");
 
         assert_eq!(conf.fuse_opts, vec!["allow_other", "nodev"]);
+    }
+
+    #[test]
+    fn init_rejects_conflicting_sync_and_async_options() {
+        let cases: &[&[&str]] = &[
+            &["sync,async"],
+            &["async,sync"],
+            &["sync", "async"],
+            &["async", "sync"],
+        ];
+
+        for options in cases {
+            let mut conf = FuseConf {
+                fuse_opts: options.iter().map(|option| option.to_string()).collect(),
+                ..Default::default()
+            };
+
+            let err = conf
+                .init()
+                .expect_err("sync and async must not be accepted together");
+            let message = err.to_string();
+            assert!(message.contains("sync"), "unexpected error: {}", err);
+            assert!(message.contains("async"), "unexpected error: {}", err);
+            assert!(message.contains("conflict"), "unexpected error: {}", err);
+        }
     }
 
     #[test]
