@@ -53,7 +53,7 @@ Curvine is a high-performance distributed cache file system built in Rust. It la
 - **Curvine Cluster Core** — The heart of the system, split into a **Control Plane** and a **Data Plane**:
   - *Control Plane*: the **Master node** (Raft-replicated) manages metadata, namespace, scheduling, load balancing, and cluster coordination, alongside a **Web UI / API** for dashboarding, metrics, and management.
   - *Data Plane*: a fleet of **Worker nodes** serving data from a multi-tier cache (Memory → SSD → HDD) with automatic hot-data promotion, eviction, and replication.
-- **Storage Layer** — The durable underbelly: multi-cloud object storage (AWS S3, Azure Blob, Google GCS, OSS, and any S3-compatible store such as MinIO or HDFS). Workers transparently persist on cache miss and read back on demand.
+- **Storage Layer** — The durable underbelly: multi-cloud object storage (AWS S3, Azure Blob, Google GCS, OSS, and any S3-compatible store such as MinIO or HDFS). Workers fetch from object storage on cache miss, and persist writes back to object storage for durability.
 
 **Data flow at a glance:** applications reach Curvine through any interface in the Protocol layer; metadata operations are routed to the Master via RPC, while data I/O is served directly by the Workers. On a cache miss, Workers fetch from — and persist back to — the underlying object storage. For Kubernetes workloads, the CSI driver mounts the FUSE file system directly as a PVC, so provisioning is just a `mkdir` on the shared namespace — millisecond-level, with no cloud control-plane API calls.
 
