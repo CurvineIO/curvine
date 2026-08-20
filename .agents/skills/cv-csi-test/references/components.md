@@ -8,10 +8,10 @@
 ├─────────────────────────────────────────────────────────────┤
 │  ┌──────────────────┐    ┌──────────────────────────────┐  │
 │  │  CSI Node Pod    │    │      MountPod                │  │
-│  │  (可重启)         │    │  (独立运行，持久化FUSE)       │  │
+│  │  (restartable)   │    │  (independent, persistent FUSE) │
 │  │                  │    │                              │  │
-│  │  - NodeService   │    │  - curvine-fuse 进程         │  │
-│  │  - MountPodMgr   │───▶│  - 挂载点: /mnt/curvine      │  │
+│  │  - NodeService   │    │  - curvine-fuse process      │  │
+│  │  - MountPodMgr   │───▶│  - mount: /mnt/curvine       │  │
 │  │                  │    │  - HostPath: Bidirectional   │  │
 │  └──────────────────┘    └──────────────────────────────┘  │
 │           │                         │                       │
@@ -118,8 +118,8 @@ parameters:
 
 **Path Generation:**
 ```
-实际挂载路径 = fs-path + "/" + pv-name
-示例: "/test-data/pvc-1234-5678-abcd"
+actual mount path = fs-path + "/" + pv-name
+example: "/test-data/pvc-1234-5678-abcd"
 ```
 
 ## MountPod Details
