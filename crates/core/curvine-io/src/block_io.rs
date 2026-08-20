@@ -277,6 +277,7 @@ mod test {
         assert_eq!(reader.len(), data.len() as i64);
         let region = reader.read_region(false, data.len() as i32)?;
         assert_eq!(region.len(), data.len());
+        assert_eq!(reader.pos(), data.len() as i64);
 
         // Verify data integrity
         let mut buf = vec![0u8; data.len()];

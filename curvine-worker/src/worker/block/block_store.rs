@@ -250,7 +250,7 @@ impl BlockStore {
     /// Returns a local path only while no finalize publication is in progress.
     /// A finalizing file can be atomically renamed before a co-located client
     /// opens the returned path, so callers must use `open_reader_by_id` then.
-    pub fn short_circuit_by_id(&self, id: i64) -> CommonResult<Option<(BlockMeta, String)>> {
+    pub fn short_circuit_by_id(&self, id: i64) -> CommonResult<Option<(BlockMeta, String, i64)>> {
         let state = self.read()?;
         if matches!(
             state.get_block(id).map(BlockMeta::state),
@@ -263,7 +263,11 @@ impl BlockStore {
             .ok_or_else(|| curvine_core_error::err_msg!(format!("block {} not exists", id)))?
             .clone();
         let (layout, dir) = state.layout_for(&meta)?;
-        Ok(layout.short_circuit(&dir, &meta)?.map(|path| (meta, path)))
+        let Some(path) = layout.short_circuit(&dir, &meta)? else {
+            return Ok(None);
+        };
+        let physical_len = std::fs::metadata(&path)?.len() as i64;
+        Ok(Some((meta, path, physical_len)))
     }
 
     pub fn short_circuit(&self, meta: &BlockMeta) -> CommonResult<Option<String>> {
@@ -559,6 +563,27 @@ mod tests {
     }
 
     #[test]
+    fn short_circuit_reports_live_file_length() -> CommonResult<()> {
+        let store = create_store_with_capacity("short-circuit-live-length", "16MB")?;
+        let block = ExtendedBlock::with_mem(1, "50B")?;
+        let finalized = finalize_block(&store, &block)?;
+        let path = store
+            .short_circuit(&finalized)?
+            .expect("file layout must expose a local path");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)?
+            .set_len(20)?;
+
+        let (meta, _, physical_len) = store
+            .short_circuit_by_id(block.id)?
+            .expect("finalized file must support short-circuit reads");
+        assert_eq!(meta.len(), 50);
+        assert_eq!(physical_len, 20);
+        Ok(())
+    }
+
+    #[test]
     fn reader_opened_before_publish_keeps_committed_generation() -> CommonResult<()> {
         let store = create_store_with_capacity("finalize-reader-generation", "16MB")?;
         let block = ExtendedBlock::with_mem(1, "4B")?;
@@ -580,11 +605,11 @@ mod tests {
             .expect("rewrite finalize must reserve");
         let plan = reservation.prepare(block.len)?;
 
-        let (_, mut committed_reader) = store.open_reader_by_id(block.id, 0, 0)?;
+        let (_, mut committed_reader) = store.open_reader_by_id(block.id, 0, block.len)?;
         store.write()?.publish_file_finalize(&reservation, plan)?;
         assert_eq!(read_bytes(&mut committed_reader, 4)?, b"old!");
 
-        let (_, mut published_reader) = store.open_reader_by_id(block.id, 0, 0)?;
+        let (_, mut published_reader) = store.open_reader_by_id(block.id, 0, block.len)?;
         assert_eq!(read_bytes(&mut published_reader, 4)?, b"new!");
         Ok(())
     }

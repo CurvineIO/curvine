@@ -173,8 +173,9 @@ pub const FUSE_ATOMIC_O_TRUNC: u32 = 1 << 3;
 ///
 /// Deliberately EXCLUDED (never advertised): FUSE_ATOMIC_O_TRUNC (open does not
 /// truncate), FUSE_POSIX_ACL (no ACL handling), FUSE_HAS_IOCTL_DIR (no ioctl),
-/// FUSE_SETXATTR_EXT (the decoder currently accepts only the 8-byte compatible
-/// request layout).
+/// FUSE_EXPLICIT_INVAL_DATA (writes and resize do not issue explicit page-cache
+/// invalidations), FUSE_SETXATTR_EXT (the decoder currently accepts only the
+/// 8-byte compatible request layout).
 pub const SUPPORTED_INIT_FLAGS: u32 = FUSE_ASYNC_READ
     | FUSE_BIG_WRITES
     | FUSE_ASYNC_DIO
@@ -195,7 +196,6 @@ pub const SUPPORTED_INIT_FLAGS: u32 = FUSE_ASYNC_READ
     | FUSE_ABORT_ERROR
     | FUSE_CACHE_SYMLINKS
     | FUSE_NO_OPENDIR_SUPPORT
-    | FUSE_EXPLICIT_INVAL_DATA
     | FUSE_HANDLE_KILLPRIV_V2;
 
 /// Human-readable FUSE init-capability names; unknown bits are kept as hex.
