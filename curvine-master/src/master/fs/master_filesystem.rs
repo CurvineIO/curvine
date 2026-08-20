@@ -1944,15 +1944,30 @@ mod tests {
     #[test]
     fn filesystem_info_allocatable_excludes_lost_workers() {
         // Lost workers live in a separate map and must not contribute to either
-        // the total or the allocatable view.
+        // the total or the allocatable view. Insert a lost worker directly into
+        // the lost map (add_test_worker only touches the live map) and assert its
+        // capacity never leaks into aggregation.
         let fs = test_fs("allocatable-excludes-lost");
         fs.add_test_worker(worker_with_status(1, WorkerStatus::Live, 1000, 800));
-        // Unknown/Lost-status workers in the live map are bucketed by the `_ =>`
-        // arm, but real Lost workers are never in worker_map.workers().
+        fs.worker_manager
+            .write()
+            .worker_map
+            .lost_workers
+            .insert(99, worker_with_status(99, WorkerStatus::Lost, 9999, 9999));
+
         let info = fs.filesystem_info().unwrap();
-        assert_eq!(info.capacity, 1000);
-        assert_eq!(info.allocatable_capacity, 1000);
+
+        // The lost worker is reported but its bytes stay out of both views.
+        assert_eq!(info.lost_workers.len(), 1);
+        assert_eq!(
+            info.capacity, 1000,
+            "lost worker capacity must not leak into total"
+        );
+        assert_eq!(info.available, 800);
+        assert_eq!(
+            info.allocatable_capacity, 1000,
+            "lost worker capacity must not leak into allocatable"
+        );
         assert_eq!(info.allocatable_available, 800);
-        assert!(info.lost_workers.is_empty());
     }
 }
