@@ -10,7 +10,7 @@
           <span>{{ item.icon }}</span>{{ $t(item.labelKey) }}
         </router-link>
       </nav>
-      <div class="admin-sidebar-status"><span></span><div><strong>{{ $t('layout.masterReady') }}</strong><small>{{ $t('layout.masterReadyHint') }}</small></div></div>
+      <div class="admin-sidebar-status"><span></span><div><strong>{{ $t('layout.masterReady') }}</strong><small>{{ masterReadyHintText }}</small></div></div>
     </aside>
     <main class="admin-main">
       <header class="admin-topbar">
@@ -36,6 +36,8 @@
 import eventBus from '@/utils/eventBus'
 import { logout } from '@/api/client'
 import { i18n, localeOptions, setLocale } from '@/i18n'
+import { useAppStore } from '@/stores/app'
+import { getUptimeParts } from '@/utils/format'
 
 export default {
   name: 'AdminLayout',
@@ -43,6 +45,7 @@ export default {
     return {
       autoRefresh: false,
       timer: null,
+      uptimeTick: Date.now(),
       localeOptions,
       navItems: [
         { path: '/overview', labelKey: 'nav.overview', subtitleKey: 'nav.overviewSubtitle', icon: 'O' },
@@ -61,6 +64,9 @@ export default {
     locale() {
       return i18n.global.locale.value
     },
+    appStore() {
+      return useAppStore()
+    },
     currentItem() {
       return this.navItems.find((item) => this.$route.path.startsWith(item.path)) || this.navItems[0]
     },
@@ -69,6 +75,21 @@ export default {
     },
     currentSubtitle() {
       return this.$t(this.currentItem.subtitleKey)
+    },
+    masterReadyHintText() {
+      void this.uptimeTick
+      const parts = getUptimeParts(
+        this.appStore.masterStartTime,
+        Date.now(),
+        this.appStore.masterStartTimeMs
+      )
+      if (!parts) return this.$t('layout.masterReadyHint')
+      let uptime = ''
+      if (parts.kind === 'min') uptime = this.$t('common.uptime.min', { count: parts.count })
+      else if (parts.kind === 'hours') uptime = this.$t('common.uptime.hours', { count: parts.count })
+      else if (parts.kind === 'days') uptime = this.$t('common.uptime.days', { count: parts.count })
+      else uptime = this.$t('common.uptime.daysHours', { days: parts.days, hours: parts.hours })
+      return this.$t('layout.masterReadyHintRunning', { uptime })
     }
   },
   watch: {
@@ -77,8 +98,22 @@ export default {
       else this.stopAutoRefresh()
     }
   },
-  beforeUnmount() { this.stopAutoRefresh() },
+  created() {
+    this.appStore.refreshMasterRuntime()
+  },
+  mounted() {
+    eventBus.on('admin-refresh', this.onAdminRefresh)
+  },
+  beforeUnmount() {
+    this.stopAutoRefresh()
+    eventBus.off('admin-refresh', this.onAdminRefresh)
+  },
   methods: {
+    onAdminRefresh() {
+      this.uptimeTick = Date.now()
+      if (this.$route.path.startsWith('/overview')) return
+      this.appStore.refreshMasterRuntime()
+    },
     onLocaleChange(event) {
       setLocale(event.target.value)
     },

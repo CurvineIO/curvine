@@ -72,3 +72,64 @@ export function formatCompactNumber(value) {
   const number = normalizeCount(value)
   return new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 }).format(number)
 }
+
+/** Parse Master/Web start_time strings such as "2026-08-18 11:00:00" or ISO-8601. */
+export function parseDateTime(value: string | null | undefined): Date | null {
+  if (!value || typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(trimmed)
+    ? trimmed.replace(' ', 'T')
+    : trimmed
+  const date = new Date(normalized)
+  if (Number.isNaN(date.getTime())) return null
+  return date
+}
+
+export type UptimeParts =
+  | { kind: 'min'; count: number }
+  | { kind: 'hours'; count: number }
+  | { kind: 'days'; count: number }
+  | { kind: 'daysHours'; days: number; hours: number }
+
+/** Q12: <1h → min; <1d → hours; else days (optionally with hours). */
+export function getUptimeParts(
+  startTime: string | null | undefined,
+  nowMs: number = Date.now(),
+  startTimeMs?: number | null
+): UptimeParts | null {
+  let startMs: number | null = null
+  if (startTimeMs != null && Number.isFinite(startTimeMs) && startTimeMs > 0) {
+    startMs = startTimeMs
+  } else {
+    const start = parseDateTime(startTime)
+    if (!start) return null
+    startMs = start.getTime()
+  }
+  const elapsedMs = Math.max(0, nowMs - startMs)
+  const totalMinutes = Math.floor(elapsedMs / 60_000)
+  if (totalMinutes < 60) {
+    return { kind: 'min', count: Math.max(0, totalMinutes) }
+  }
+  const totalHours = Math.floor(elapsedMs / 3_600_000)
+  if (totalHours < 24) {
+    return { kind: 'hours', count: totalHours }
+  }
+  const days = Math.floor(totalHours / 24)
+  const hours = totalHours % 24
+  if (hours === 0) return { kind: 'days', count: days }
+  return { kind: 'daysHours', days, hours }
+}
+
+export function workerShortVersion(worker: Record<string, unknown> | null | undefined): string {
+  if (!worker) return ''
+  const version = worker.software_version ?? worker.version
+  if (typeof version !== 'string') return ''
+  return version.trim()
+}
+
+export function versionsMismatch(left: string | null | undefined, right: string | null | undefined): boolean {
+  const a = String(left || '').trim()
+  const b = String(right || '').trim()
+  return Boolean(a && b && a !== b)
+}

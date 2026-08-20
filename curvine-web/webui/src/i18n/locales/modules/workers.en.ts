@@ -60,9 +60,11 @@ export default {
         ip: 'IP',
         heartbeat: 'Heartbeat',
         version: 'Version',
+        versionCommit: 'Commit',
         files: 'Files',
         blocks: 'Blocks',
-        notReported: 'Not reported'
+        notReported: 'Not reported',
+        versionMismatch: 'Differs from Active Master version'
       },
       storage: {
         title: 'Storage',

@@ -60,9 +60,11 @@ export default {
         ip: 'IP',
         heartbeat: '心跳',
         version: '版本',
+        versionCommit: 'Commit',
         files: '文件',
         blocks: '块',
-        notReported: '未上报'
+        notReported: '未上报',
+        versionMismatch: '与 Active Master 版本不一致'
       },
       storage: {
         title: '存储',

@@ -36,6 +36,7 @@ pub struct MasterRouterHandler {
     fs: MasterFilesystem,
     conf: ClusterConf,
     start_time: String,
+    start_time_ms: u64,
     metrics: &'static MasterMetrics,
     fault_http: FaultHttpControl,
 }
@@ -51,6 +52,7 @@ impl MasterRouterHandler {
             fs,
             conf,
             start_time: LocalTime::now_datetime(),
+            start_time_ms: LocalTime::mills(),
             metrics,
             fault_http,
         }
@@ -172,6 +174,7 @@ async fn master_runtime(
         "version": master_version.release_version,
         "version_commit": master_version.git_commit,
         "start_time": instance.start_time,
+        "start_time_ms": instance.start_time_ms,
     })))
 }
 

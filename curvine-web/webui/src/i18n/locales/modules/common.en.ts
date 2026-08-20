@@ -110,12 +110,20 @@ export default {
     scrape: {
       up: 'Up',
       down: 'Down'
-    }
+    },
+    uptime: {
+      min: '{count} min',
+      hours: '{count} h',
+      days: '{count} d',
+      daysHours: '{days} d {hours} h'
+    },
+    notReported: 'Not reported'
   },
   layout: {
     brandSubtitle: 'Admin Console',
     masterReady: 'Master Service',
-    masterReadyHint: 'Ready for refresh'
+    masterReadyHint: 'Ready for refresh',
+    masterReadyHintRunning: 'Running {uptime}, ready for refresh'
   },
   nav: {
     overview: 'Overview',

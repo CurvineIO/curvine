@@ -27,7 +27,14 @@
           <div><dt>{{ $t('overview.masterDetails.clusterId') }}</dt><dd>{{ overview.cluster_id || '-' }}</dd></div>
           <div><dt>{{ $t('overview.masterDetails.configuredMaster') }}</dt><dd>{{ configuredMasterDisplay }}</dd></div>
           <div><dt>{{ $t('overview.masterDetails.activeMaster') }}</dt><dd>{{ activeMasterDisplayDetail || '-' }}</dd></div>
-          <div><dt>{{ $t('overview.masterDetails.startTime') }}</dt><dd>{{ overview.start_time || '-' }}</dd></div>
+          <div>
+            <dt>{{ $t('overview.masterDetails.version') }}</dt>
+            <dd>
+              <span>{{ masterVersionLabel }}</span>
+              <small v-if="overview.version_commit" class="version-commit">{{ overview.version_commit }}</small>
+            </dd>
+          </div>
+          <div><dt>{{ $t('overview.masterDetails.startTime') }}</dt><dd>{{ masterStartTimeLabel }}</dd></div>
           <div><dt>{{ $t('overview.masterDetails.blockTotal') }}</dt><dd>{{ formatNumber(overview.block_total) }}</dd></div>
         </dl>
       </div>
@@ -40,13 +47,24 @@
       </div>
       <table v-if="masterNodes.length" class="admin-table master-ha-table">
         <thead>
-          <tr><th>{{ $t('overview.ha.master') }}</th><th>{{ $t('overview.ha.journal') }}</th><th>{{ $t('overview.ha.role') }}</th><th>{{ $t('overview.ha.reachable') }}</th><th>{{ $t('overview.ha.current') }}</th><th>{{ $t('overview.ha.action') }}</th></tr>
+          <tr>
+            <th>{{ $t('overview.ha.master') }}</th>
+            <th>{{ $t('overview.ha.journal') }}</th>
+            <th>{{ $t('overview.ha.role') }}</th>
+            <th>{{ $t('overview.ha.version') }}</th>
+            <th>{{ $t('overview.ha.startTime') }}</th>
+            <th>{{ $t('overview.ha.reachable') }}</th>
+            <th>{{ $t('overview.ha.current') }}</th>
+            <th>{{ $t('overview.ha.action') }}</th>
+          </tr>
         </thead>
         <tbody>
           <tr v-for="node in masterNodes" :key="node.addr">
             <td><strong>{{ node.display_addr || node.addr }}</strong></td>
             <td><span>{{ node.journal_addr || '-' }}</span></td>
             <td><span :class="['status-pill', roleTone(node.role)]">{{ roleLabel(node.role) }}</span></td>
+            <td><span>{{ nodeVersionLabel(node) }}</span></td>
+            <td><span>{{ nodeStartTimeLabel(node) }}</span></td>
             <td>
               <span
                 :class="['status-pill', node.reachable ? 'healthy' : 'failed']"
@@ -83,6 +101,7 @@ import MetricCard from '@/components/admin/MetricCard.vue'
 import { fetchOverviewData, fetchMasterHa, requestMasterFailover } from '@/api/client'
 import { displayMasterAddr, formatBytes, formatNumber, formatCompactNumber, isLoopbackHost, normalizeCount } from '@/utils/format'
 import { translateDelta, translateRole } from '@/utils/i18nLabels'
+import { useAppStore } from '@/stores/app'
 import eventBus from '@/utils/eventBus'
 
 export default {
@@ -90,6 +109,7 @@ export default {
   components: { MetricCard },
   data() { return { loading: false, haLoading: false, switchingMaster: '', overview: {}, masterHa: {} } },
   computed: {
+    appStore() { return useAppStore() },
     masterNodes() { return Array.isArray(this.masterHa.nodes) ? this.masterHa.nodes : [] },
     activeMaster() {
       return this.masterHa.active_master_configured
@@ -127,6 +147,12 @@ export default {
     masterStateLabel() {
       if (this.masterState === 'Unknown') return this.$t('common.unknown')
       return translateRole(this.$t, this.masterState)
+    },
+    masterVersionLabel() {
+      return this.overview.version || this.$t('common.notReported')
+    },
+    masterStartTimeLabel() {
+      return this.overview.start_time || this.$t('common.notReported')
     },
     standbyLabel() {
       const standby = this.masterNodes.filter((node) => node.role === 'Standby').length
@@ -166,6 +192,12 @@ export default {
     formatBytes, formatNumber, formatCompactNumber,
     deltaLabel(value) { return translateDelta(this.$t, value) },
     roleLabel(role) { return translateRole(this.$t, role) },
+    nodeVersionLabel(node) {
+      return (node && node.version) || this.$t('common.notReported')
+    },
+    nodeStartTimeLabel(node) {
+      return (node && node.start_time) || this.$t('common.notReported')
+    },
     hostnameFromAddr(addr) {
       const match = String(addr || '').match(/^([^:]+):/)
       return match ? match[1] : ''
@@ -208,7 +240,10 @@ export default {
       this.loading = true
       try {
         const [overviewResult, haResult] = await Promise.allSettled([fetchOverviewData(), fetchMasterHa()])
-        if (overviewResult.status === 'fulfilled') this.overview = overviewResult.value || {}
+        if (overviewResult.status === 'fulfilled') {
+          this.overview = overviewResult.value || {}
+          this.appStore.setMasterRuntime(this.overview)
+        }
         if (haResult.status === 'fulfilled') this.masterHa = haResult.value || {}
       } finally { this.loading = false }
     },
@@ -259,12 +294,21 @@ export default {
 </script>
 
 <style scoped>
-.master-ha-table th:nth-child(1) { width: 28%; }
-.master-ha-table th:nth-child(2) { width: 24%; }
+.master-ha-table th:nth-child(1) { width: 18%; }
+.master-ha-table th:nth-child(2) { width: 16%; }
 .master-ha-table th:nth-child(3),
 .master-ha-table th:nth-child(4),
+.master-ha-table th:nth-child(6),
+.master-ha-table th:nth-child(7) { width: 10%; }
 .master-ha-table th:nth-child(5) { width: 14%; }
-.master-ha-table th:nth-child(6) { width: 10%; }
+.master-ha-table th:nth-child(8) { width: 8%; }
+.version-commit {
+  display: block;
+  margin-top: 2px;
+  color: var(--admin-muted);
+  font-size: 12px;
+  font-weight: 500;
+}
 .ha-note { display: flex; gap: 8px; align-items: center; margin-top: 12px; color: var(--admin-muted); font-size: 13px; }
 .ha-note strong { color: var(--admin-text); }
 @media (max-width: 760px) { .ha-note { display: grid; } }

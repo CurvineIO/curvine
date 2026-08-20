@@ -28,6 +28,7 @@ export default {
       clusterId: 'Cluster ID',
       configuredMaster: 'Configured Master',
       activeMaster: 'Active Master',
+      version: 'Version',
       startTime: 'Start Time',
       blockTotal: 'Block Total'
     },
@@ -37,6 +38,8 @@ export default {
       master: 'Master',
       journal: 'Journal',
       role: 'Role',
+      version: 'Version',
+      startTime: 'Start Time',
       reachable: 'Reachable',
       current: 'Current',
       action: 'Action',

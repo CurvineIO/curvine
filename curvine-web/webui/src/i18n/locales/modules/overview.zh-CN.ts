@@ -28,6 +28,7 @@ export default {
       clusterId: '集群 ID',
       configuredMaster: '配置的 Master',
       activeMaster: '当前 Master',
+      version: '版本',
       startTime: '启动时间',
       blockTotal: '块总数'
     },
@@ -37,6 +38,8 @@ export default {
       master: 'Master',
       journal: 'Journal',
       role: '角色',
+      version: '版本',
+      startTime: '启动时间',
       reachable: '可达性',
       current: '当前',
       action: '操作',

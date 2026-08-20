@@ -363,6 +363,7 @@ struct MasterRuntimeInfo {
     version: Option<String>,
     version_commit: Option<String>,
     start_time: Option<String>,
+    start_time_ms: Option<u64>,
 }
 
 impl MasterRuntimeInfo {
@@ -375,10 +376,15 @@ impl MasterRuntimeInfo {
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
         };
+        let start_time_ms = value
+            .get("start_time_ms")
+            .and_then(|v| v.as_u64())
+            .filter(|ms| *ms > 0);
         Self {
             version: as_non_empty("version"),
             version_commit: as_non_empty("version_commit"),
             start_time: as_non_empty("start_time"),
+            start_time_ms,
         }
     }
 
@@ -400,6 +406,12 @@ impl MasterRuntimeInfo {
         self.start_time
             .as_ref()
             .map(|v| json!(v))
+            .unwrap_or(Value::Null)
+    }
+
+    fn start_time_ms_json(&self) -> Value {
+        self.start_time_ms
+            .map(|ms| json!(ms))
             .unwrap_or(Value::Null)
     }
 }
@@ -791,6 +803,7 @@ async fn master_ha_payload(instance: &AdminRouterHandler, master_info: &Filesyst
             "version": runtime.version_json(),
             "version_commit": runtime.version_commit_json(),
             "start_time": runtime.start_time_json(),
+            "start_time_ms": runtime.start_time_ms_json(),
         }));
     }
 
@@ -1744,6 +1757,7 @@ async fn overview(
         "version": runtime.version_json(),
         "version_commit": runtime.version_commit_json(),
         "start_time": runtime.start_time_json(),
+        "start_time_ms": runtime.start_time_ms_json(),
         "start_time_source": start_time_source,
         "web_start_time": web_start_time,
         "live_workers": master_info.live_workers.len(),
@@ -4541,12 +4555,15 @@ mod version_payload_tests {
         let info = MasterRuntimeInfo::from_json(&json!({
             "version": "0.4.0-alpha",
             "version_commit": "deadbeef",
-            "start_time": "2026-08-18 11:00:00"
+            "start_time": "2026-08-18 11:00:00",
+            "start_time_ms": 1_725_000_000_000_u64
         }));
         assert_eq!(info.version.as_deref(), Some("0.4.0-alpha"));
         assert_eq!(info.version_commit.as_deref(), Some("deadbeef"));
         assert_eq!(info.start_time.as_deref(), Some("2026-08-18 11:00:00"));
+        assert_eq!(info.start_time_ms, Some(1_725_000_000_000));
         assert_eq!(info.version_json(), json!("0.4.0-alpha"));
+        assert_eq!(info.start_time_ms_json(), json!(1_725_000_000_000_u64));
     }
 
     #[test]
@@ -4554,11 +4571,14 @@ mod version_payload_tests {
         let info = MasterRuntimeInfo::from_json(&json!({
             "version": "  ",
             "version_commit": "",
-            "start_time": null
+            "start_time": null,
+            "start_time_ms": 0
         }));
         assert!(info.version.is_none());
         assert!(info.version_commit.is_none());
         assert!(info.start_time.is_none());
+        assert!(info.start_time_ms.is_none());
         assert!(info.start_time_json().is_null());
+        assert!(info.start_time_ms_json().is_null());
     }
 }

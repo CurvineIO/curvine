@@ -110,12 +110,20 @@ export default {
     scrape: {
       up: '正常',
       down: '异常'
-    }
+    },
+    uptime: {
+      min: '{count} min',
+      hours: '{count} h',
+      days: '{count} d',
+      daysHours: '{days} d {hours} h'
+    },
+    notReported: '未上报'
   },
   layout: {
     brandSubtitle: '管理控制台',
     masterReady: 'Master 服务',
-    masterReadyHint: '可手动刷新'
+    masterReadyHint: '可手动刷新',
+    masterReadyHintRunning: '运行 {uptime}，可手动刷新'
   },
   nav: {
     overview: '概览',

@@ -16,7 +16,11 @@
         <article v-for="worker in filteredWorkers" :key="workerSelector(worker)" class="worker-row">
           <div class="worker-main file-name-cell" @click="openDetail(worker)">
             <strong>{{ workerHostname(worker) }}</strong>
-            <small>{{ $t('workers.list.rpc', 'RPC') }} {{ rpcPort(worker) }}<template v-if="displayIp(worker)"> · {{ $t('workers.detail.runtime.ip') }} {{ displayIp(worker) }}</template></small>
+            <small>
+              {{ $t('workers.list.rpc', 'RPC') }} {{ rpcPort(worker) }}
+              <template v-if="displayIp(worker)"> · {{ $t('workers.detail.runtime.ip') }} {{ displayIp(worker) }}</template>
+              · <span :class="versionClass(worker)" :title="versionTitle(worker)">{{ versionLabel(worker) }}</span>
+            </small>
           </div>
           <div class="worker-state"><span :class="['status-pill', worker._status]">{{ statusLabel(worker._status) }}</span></div>
           <div class="worker-usage">
@@ -37,8 +41,9 @@
 <script>
 import MetricCard from '@/components/admin/MetricCard.vue'
 import { fetchWorkersData, updateWorkerAction } from '@/api/client'
-import { formatBytes, formatTime, workerAddress, workerHostname, workerId } from '@/utils/format'
+import { formatBytes, formatTime, versionsMismatch, workerAddress, workerHostname, workerId, workerShortVersion } from '@/utils/format'
 import { translateDelta, translateStatus, translateWorkerAction } from '@/utils/i18nLabels'
+import { useAppStore } from '@/stores/app'
 import eventBus from '@/utils/eventBus'
 
 export default {
@@ -46,13 +51,18 @@ export default {
   components: { MetricCard },
   data() { return { loading: false, data: {}, statusFilter: 'all', query: '' } },
   computed: {
+    appStore() { return useAppStore() },
     liveWorkers() { return (this.data.live_workers || []).map((w) => ({ ...w, _status: 'live' })) },
     blacklistWorkers() { return (this.data.blacklist_workers || []).map((w) => ({ ...w, _status: 'blacklist' })) },
     decommissionWorkers() { return (this.data.decommission_workers || []).map((w) => ({ ...w, _status: 'decommission' })) },
     lostWorkers() { return (this.data.lost_workers || []).map((w) => ({ ...w, _status: 'lost' })) },
     managedWorkers() { return [...this.blacklistWorkers, ...this.decommissionWorkers] },
     workers() { return [...this.liveWorkers, ...this.blacklistWorkers, ...this.decommissionWorkers, ...this.lostWorkers] },
-    filteredWorkers() { const q = this.query.toLowerCase(); return this.workers.filter((w) => (this.statusFilter === 'all' || w._status === this.statusFilter) && `${workerHostname(w)} ${workerId(w)} ${workerAddress(w)} ${this.ipAddress(w)}`.toLowerCase().includes(q)) },
+    filteredWorkers() {
+      const q = this.query.toLowerCase()
+      return this.workers.filter((w) => (this.statusFilter === 'all' || w._status === this.statusFilter)
+        && `${workerHostname(w)} ${workerId(w)} ${workerAddress(w)} ${this.ipAddress(w)} ${workerShortVersion(w)}`.toLowerCase().includes(q))
+    },
     activeWorkers() { return [...this.liveWorkers, ...this.blacklistWorkers, ...this.decommissionWorkers] },
     totalCapacity() { return this.activeWorkers.reduce((sum, w) => sum + Number(w.capacity || 0), 0) },
     totalAvailable() { return this.activeWorkers.reduce((sum, w) => sum + Number(w.available || 0), 0) },
@@ -71,6 +81,19 @@ export default {
     workerHost(worker) { return (worker.address && worker.address.hostname) || worker.hostname || '-' },
     rpcPort(worker) { return (worker.address && worker.address.rpc_port) || worker.rpc_port || '-' },
     displayIp(worker) { const ip = this.ipAddress(worker); return ip && ip !== '-' ? ip : '' },
+    versionLabel(worker) {
+      const version = workerShortVersion(worker)
+      return version || this.$t('workers.detail.runtime.notReported')
+    },
+    versionMismatch(worker) {
+      return versionsMismatch(workerShortVersion(worker), this.appStore.masterVersion)
+    },
+    versionClass(worker) {
+      return this.versionMismatch(worker) ? 'warn' : ''
+    },
+    versionTitle(worker) {
+      return this.versionMismatch(worker) ? this.$t('workers.detail.runtime.versionMismatch') : ''
+    },
     usedBytes(worker) { return Math.max(0, Number(worker.capacity || 0) - Number(worker.available || 0)) },
     workerUsage(worker) { const cap = Number(worker.capacity || 0); return cap ? Math.max(0, Math.min(100, Math.round((this.usedBytes(worker) / cap) * 100))) : 0 },
     formatHeartbeat(worker) { return formatTime(worker.last_update_ms || worker.last_update) },

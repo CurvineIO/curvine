@@ -20,7 +20,13 @@
           <div><dt>{{ $t('workers.detail.runtime.webPort') }}</dt><dd>{{ address.web_port || '-' }}</dd></div>
           <div><dt>{{ $t('workers.detail.runtime.ip') }}</dt><dd>{{ displayIp }}</dd></div>
           <div><dt>{{ $t('workers.detail.runtime.heartbeat') }}</dt><dd>{{ formatTime(worker.last_update) }}</dd></div>
-          <div><dt>{{ $t('workers.detail.runtime.version') }}</dt><dd>{{ detail.version || $t('workers.detail.runtime.notReported') }}</dd></div>
+          <div>
+            <dt>{{ $t('workers.detail.runtime.version') }}</dt>
+            <dd>
+              <span :class="versionClass" :title="versionTitle">{{ versionLabel }}</span>
+            </dd>
+          </div>
+          <div><dt>{{ $t('workers.detail.runtime.versionCommit') }}</dt><dd>{{ commitLabel }}</dd></div>
           <div><dt>{{ $t('workers.detail.runtime.files') }}</dt><dd>{{ detail.file_count ?? $t('workers.detail.runtime.notReported') }}</dd></div>
           <div><dt>{{ $t('workers.detail.runtime.blocks') }}</dt><dd>{{ worker.block_num || 0 }}</dd></div>
         </dl>
@@ -55,17 +61,38 @@
 
 <script>
 import { fetchWorkerDetail, updateWorkerAction } from '@/api/client'
-import { formatBytes, formatTime, workerAddress, workerHostname, workerId } from '@/utils/format'
+import { formatBytes, formatTime, versionsMismatch, workerAddress, workerHostname, workerId, workerShortVersion } from '@/utils/format'
 import { translateStatus, translateWorkerAction } from '@/utils/i18nLabels'
+import { useAppStore } from '@/stores/app'
 
 export default {
   name: 'WorkerDetailPage',
   data() { return { loading: false, detail: {}, worker: {} } },
   computed: {
+    appStore() { return useAppStore() },
     address() { return this.worker.address || {} },
     rawStatusName() { return this.detail.state || this.worker.status || '' },
     workerStatusLabel() { return this.rawStatusName ? translateStatus(this.$t, this.rawStatusName) : '' },
     statusClass() { return String(this.rawStatusName || 'unknown').toLowerCase() },
+    shortVersion() {
+      return String(this.detail.version || workerShortVersion(this.worker) || '').trim()
+    },
+    versionLabel() {
+      return this.shortVersion || this.$t('workers.detail.runtime.notReported')
+    },
+    commitLabel() {
+      const commit = String(this.detail.version_commit || '').trim()
+      return commit || this.$t('workers.detail.runtime.notReported')
+    },
+    versionMismatch() {
+      return versionsMismatch(this.shortVersion, this.appStore.masterVersion)
+    },
+    versionClass() {
+      return this.versionMismatch ? 'warn' : ''
+    },
+    versionTitle() {
+      return this.versionMismatch ? this.$t('workers.detail.runtime.versionMismatch') : ''
+    },
     title() {
       if (this.workerHostname(this.worker) === '-') {
         return this.$t('workers.detail.subtitle')
