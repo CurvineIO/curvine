@@ -14,20 +14,14 @@
 
 package io.curvine;
 
-import com.google.protobuf.CodedInputStream;
-import com.google.protobuf.WireFormat;
 import io.curvine.proto.GetJobStatusResponse;
 import io.curvine.proto.JobTaskProgressProto;
 import io.curvine.proto.JobTaskStateProto;
-
-import java.io.IOException;
 
 /**
  * Load job status snapshot. Mirrors Rust {@code JobStatus}.
  */
 public final class LoadJobStatus {
-    private static final int STATE_FIELD_NUMBER = 2;
-
     private final String jobId;
     private final JobTaskStateProto state;
     private final int stateValue;
@@ -70,40 +64,10 @@ public final class LoadJobStatus {
         return new LoadJobStatus(
                 response.getJobId(),
                 state,
-                rawStateValue(response, state),
+                state.getNumber(),
                 response.getSourcePath(),
                 response.getTargetPath(),
                 response.getProgress());
-    }
-
-    /**
-     * Returns the raw enum wire value for {@code state}. Known enum constants use the mapped
-     * number directly; when proto2 maps an unknown wire value to {@code UNKNOWN}, recover the
-     * original value from the serialized payload so forward-compat helpers stay accurate.
-     */
-    private static int rawStateValue(GetJobStatusResponse response, JobTaskStateProto state) {
-        if (state != JobTaskStateProto.UNKNOWN) {
-            return state.getNumber();
-        }
-        return extractEnumWireValue(response, STATE_FIELD_NUMBER, state.getNumber());
-    }
-
-    private static int extractEnumWireValue(
-            GetJobStatusResponse response, int fieldNumber, int defaultValue) {
-        try {
-            CodedInputStream input = CodedInputStream.newInstance(response.toByteArray());
-            while (!input.isAtEnd()) {
-                int tag = input.readTag();
-                if (WireFormat.getTagFieldNumber(tag) == fieldNumber
-                        && WireFormat.getTagWireType(tag) == WireFormat.WIRETYPE_VARINT) {
-                    return input.readEnum();
-                }
-                input.skipField(tag);
-            }
-        } catch (IOException ignored) {
-            // Keep the mapped enum number when the payload cannot be re-scanned.
-        }
-        return defaultValue;
     }
 
     public String getJobId() {
@@ -127,8 +91,10 @@ public final class LoadJobStatus {
     }
 
     /**
-     * True when the job is no longer running (completed, failed, canceled, partial success,
-     * or any future terminal enum value / {@code UNRECOGNIZED} wire value).
+     * True when the job is no longer running (completed, failed, canceled, or partial success).
+     * Under proto2, unknown wire enum values decode to {@code UNKNOWN} and are treated as
+     * non-terminal; full forward-compat for future terminal states requires a preserved raw
+     * state field on the wire (for example {@code state_value} in {@code job.proto}).
      */
     public boolean isFinished() {
         switch (state) {

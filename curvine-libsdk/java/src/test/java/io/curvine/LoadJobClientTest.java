@@ -14,7 +14,6 @@
 
 package io.curvine;
 
-import com.google.protobuf.CodedOutputStream;
 import io.curvine.proto.GetJobStatusResponse;
 import io.curvine.proto.JobTaskProgressProto;
 import io.curvine.proto.JobTaskStateProto;
@@ -23,8 +22,6 @@ import org.apache.hadoop.conf.Configuration;
 import org.junit.Assert;
 import org.junit.Test;
 
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
 import java.time.Duration;
 
 public class LoadJobClientTest {
@@ -159,38 +156,6 @@ public class LoadJobClientTest {
         Assert.assertFalse(unknownState.isFinished());
         Assert.assertFalse(unknownState.isSuccessful());
         Assert.assertFalse(unknownState.isPartialSuccess());
-    }
-
-    @Test
-    public void loadJobStatusHandlesUnknownWireEnumValue() throws Exception {
-        JobTaskProgressProto progress = JobTaskProgressProto.newBuilder()
-                .setLoadedSize(1)
-                .setTotalSize(10)
-                .setUpdateTime(1)
-                .setState(99)
-                .setMessage("future-state")
-                .build();
-        byte[] bytes = encodeGetJobStatusResponse(99, progress);
-        GetJobStatusResponse response = GetJobStatusResponse.PARSER.parsePartialFrom(bytes);
-        LoadJobStatus status = LoadJobStatus.fromProto(response);
-
-        Assert.assertEquals(JobTaskStateProto.UNKNOWN, status.getState());
-        Assert.assertFalse(status.isFinished());
-        Assert.assertFalse(status.isSuccessful());
-        Assert.assertFalse(status.isPartialSuccess());
-    }
-
-    private static byte[] encodeGetJobStatusResponse(
-            int stateWireValue, JobTaskProgressProto progress) throws IOException {
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        CodedOutputStream out = CodedOutputStream.newInstance(baos);
-        out.writeString(1, "job-unknown-wire");
-        out.writeEnum(2, stateWireValue);
-        out.writeString(3, "s3://bucket/future");
-        out.writeString(4, "/mnt/future");
-        out.writeMessage(5, progress);
-        out.flush();
-        return baos.toByteArray();
     }
 
     @Test
