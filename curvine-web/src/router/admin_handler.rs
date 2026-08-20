@@ -927,6 +927,7 @@ fn job_state_name(state: JobTaskState) -> &'static str {
         JobTaskState::Completed => "Completed",
         JobTaskState::Failed => "Failed",
         JobTaskState::Canceled => "Canceled",
+        JobTaskState::PartialSuccess => "PartialSuccess",
         JobTaskState::UNKNOWN => "Unknown",
     }
 }

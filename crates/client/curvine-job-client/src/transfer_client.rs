@@ -259,7 +259,8 @@ fn transfer_task_state_code(state: JobTaskState) -> i32 {
         JobTaskState::Pending | JobTaskState::UNKNOWN => 1,
         JobTaskState::Loading => 2,
         JobTaskState::Completed => 3,
-        JobTaskState::Failed => 4,
+        // Job-level PartialSuccess has no task-level counterpart; report as failed.
+        JobTaskState::Failed | JobTaskState::PartialSuccess => 4,
         JobTaskState::Canceled => 5,
     }
 }

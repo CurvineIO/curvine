@@ -90,6 +90,7 @@ impl Display for JobStatus {
             JobTaskState::Completed => "🟢",
             JobTaskState::Failed => "🔴",
             JobTaskState::Canceled => "⚫",
+            JobTaskState::PartialSuccess => "🟡",
             JobTaskState::UNKNOWN => "Unknown",
         };
 

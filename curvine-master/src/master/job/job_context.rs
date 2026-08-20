@@ -172,7 +172,12 @@ impl JobContext {
                         detail.task.task_id, detail.progress.message
                     )
                 }
-                _ => (),
+                JobTaskState::UNKNOWN
+                | JobTaskState::Pending
+                | JobTaskState::Loading
+                // Master update_progress still collapses mixed outcomes to Failed today;
+                // PartialSuccess is emitted only on the transfer path for now.
+                | JobTaskState::PartialSuccess => (),
             }
         }
 

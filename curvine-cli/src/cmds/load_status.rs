@@ -138,10 +138,7 @@ impl LoadStatusCommand {
             let status = self.fetch_status(&client).await;
             print_job_status(&status, self.verbose, self.failed_only);
 
-            if matches!(
-                status.state,
-                JobTaskState::Completed | JobTaskState::Failed | JobTaskState::Canceled
-            ) {
+            if status.state.is_finish() {
                 break;
             }
 

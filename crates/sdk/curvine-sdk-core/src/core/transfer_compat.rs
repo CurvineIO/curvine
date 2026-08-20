@@ -52,7 +52,8 @@ pub(crate) fn map_transfer_state(state: TransferState) -> JobTaskState {
         | TransferState::Running
         | TransferState::Canceling => JobTaskState::Loading,
         TransferState::Completed => JobTaskState::Completed,
-        TransferState::Failed | TransferState::PartialSuccess => JobTaskState::Failed,
+        TransferState::Failed => JobTaskState::Failed,
+        TransferState::PartialSuccess => JobTaskState::PartialSuccess,
         TransferState::Canceled => JobTaskState::Canceled,
     }
 }
@@ -113,6 +114,8 @@ fn transfer_file_counts(
     match state {
         JobTaskState::Completed => counts.completed_files = 1,
         JobTaskState::Failed => counts.failed_files = 1,
+        // Job-level PartialSuccess has no file-count counterpart; report as failed.
+        JobTaskState::PartialSuccess => counts.failed_files = 1,
         JobTaskState::Pending => {
             counts.pending_files = 1;
             counts.running_files = 1;
@@ -371,7 +374,7 @@ mod tests {
         );
         assert_eq!(
             map_transfer_state(TransferState::PartialSuccess),
-            JobTaskState::Failed
+            JobTaskState::PartialSuccess
         );
     }
 

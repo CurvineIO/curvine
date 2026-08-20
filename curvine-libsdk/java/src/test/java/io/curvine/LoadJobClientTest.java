@@ -106,6 +106,56 @@ public class LoadJobClientTest {
                 .build());
         Assert.assertTrue(failed.isFinished());
         Assert.assertFalse(failed.isSuccessful());
+        Assert.assertFalse(failed.isPartialSuccess());
+
+        LoadJobStatus partial = LoadJobStatus.fromProto(GetJobStatusResponse.newBuilder()
+                .setJobId("job-3")
+                .setState(JobTaskStateProto.PARTIAL_SUCCESS)
+                .setSourcePath("s3://bucket/c")
+                .setTargetPath("/mnt/c")
+                .setProgress(JobTaskProgressProto.newBuilder()
+                        .setLoadedSize(5)
+                        .setTotalSize(10)
+                        .setUpdateTime(1)
+                        .setState(JobTaskStateProto.PARTIAL_SUCCESS.getNumber())
+                        .setMessage("partial")
+                        .build())
+                .build());
+        Assert.assertTrue(partial.isFinished());
+        Assert.assertFalse(partial.isSuccessful());
+        Assert.assertTrue(partial.isPartialSuccess());
+
+        LoadJobStatus running = LoadJobStatus.fromProto(GetJobStatusResponse.newBuilder()
+                .setJobId("job-4")
+                .setState(JobTaskStateProto.LOADING)
+                .setSourcePath("s3://bucket/d")
+                .setTargetPath("/mnt/d")
+                .setProgress(JobTaskProgressProto.newBuilder()
+                        .setLoadedSize(1)
+                        .setTotalSize(10)
+                        .setUpdateTime(1)
+                        .setState(JobTaskStateProto.LOADING.getNumber())
+                        .setMessage("running")
+                        .build())
+                .build());
+        Assert.assertFalse(running.isFinished());
+
+        LoadJobStatus unknownState = LoadJobStatus.fromProto(GetJobStatusResponse.newBuilder()
+                .setJobId("job-5")
+                .setState(JobTaskStateProto.UNKNOWN)
+                .setSourcePath("s3://bucket/e")
+                .setTargetPath("/mnt/e")
+                .setProgress(JobTaskProgressProto.newBuilder()
+                        .setLoadedSize(1)
+                        .setTotalSize(10)
+                        .setUpdateTime(1)
+                        .setState(JobTaskStateProto.UNKNOWN.getNumber())
+                        .setMessage("unknown-state")
+                        .build())
+                .build());
+        Assert.assertFalse(unknownState.isFinished());
+        Assert.assertFalse(unknownState.isSuccessful());
+        Assert.assertFalse(unknownState.isPartialSuccess());
     }
 
     @Test

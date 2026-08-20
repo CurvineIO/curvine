@@ -41,13 +41,18 @@ pub enum JobTaskState {
     Completed = 3,
     Failed = 4,
     Canceled = 5,
+    /// Some sub-tasks succeeded and some failed (transfer load jobs).
+    PartialSuccess = 6,
 }
 
 impl JobTaskState {
     pub fn is_finish(&self) -> bool {
         matches!(
             self,
-            JobTaskState::Completed | JobTaskState::Failed | JobTaskState::Canceled
+            JobTaskState::Completed
+                | JobTaskState::Failed
+                | JobTaskState::Canceled
+                | JobTaskState::PartialSuccess
         )
     }
 
