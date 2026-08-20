@@ -320,6 +320,7 @@ impl FuseMountArgs {
         }
 
         conf.fuse.init()?;
+        conf.fuse.normalize_fuse_opts()?;
 
         Ok(conf)
     }
@@ -342,10 +343,11 @@ mod tests {
     use super::FuseMountArgs;
     use clap::Parser;
     use curvine_config::ClusterConf;
+    use curvine_core_error::CommonResult;
     use curvine_runtime::common::Utils;
     use std::fs;
 
-    fn get_conf(config: &str, extra_args: &[&str]) -> ClusterConf {
+    fn try_get_conf(config: &str, extra_args: &[&str]) -> CommonResult<ClusterConf> {
         let conf_path = Utils::temp_file();
         fs::write(&conf_path, config).expect("write test config");
 
@@ -355,7 +357,11 @@ mod tests {
         let result = args.get_conf();
         let _ = fs::remove_file(&conf_path);
 
-        result.expect("load mount configuration")
+        result
+    }
+
+    fn get_conf(config: &str, extra_args: &[&str]) -> ClusterConf {
+        try_get_conf(config, extra_args).expect("load mount configuration")
     }
 
     #[test]
@@ -376,6 +382,64 @@ mod tests {
         );
 
         assert_eq!(conf.fuse.fuse_opts, vec!["ro"]);
+    }
+
+    #[test]
+    fn get_conf_cli_fuse_opts_replace_unsupported_config_fuse_opts() {
+        let conf = get_conf(
+            "[fuse]\nio_threads = 1\nfuse_opts = [\"auto_unmount\"]\n",
+            &["--options", "allow_other"],
+        );
+
+        assert_eq!(conf.fuse.fuse_opts, vec!["allow_other"]);
+    }
+
+    #[test]
+    fn get_conf_rejects_unsupported_config_fuse_opts_without_cli_override() {
+        let err = try_get_conf(
+            "[fuse]\nio_threads = 1\nfuse_opts = [\"auto_unmount\"]\n",
+            &[],
+        )
+        .expect_err("unsupported config option must fail at the FUSE boundary");
+
+        assert!(err.to_string().contains("auto_unmount"));
+    }
+
+    #[test]
+    fn get_conf_accepts_positive_vfs_options() {
+        let conf = get_conf(
+            "[fuse]\nio_threads = 1\n",
+            &["--options", "rw,dev,suid,exec,atime"],
+        );
+
+        assert_eq!(
+            conf.fuse.fuse_opts,
+            vec!["rw", "dev", "suid", "exec", "atime"]
+        );
+    }
+
+    #[test]
+    fn get_conf_rejects_conflicting_vfs_option_pairs() {
+        for options in [
+            "ro,rw",
+            "rw,ro",
+            "nodev,dev",
+            "dev,nodev",
+            "nosuid,suid",
+            "suid,nosuid",
+            "noexec,exec",
+            "exec,noexec",
+            "noatime,atime",
+            "atime,noatime",
+        ] {
+            let err = try_get_conf("[fuse]\nio_threads = 1\n", &["--options", options])
+                .expect_err("opposite VFS options must conflict");
+            let message = err.to_string();
+            for option in options.split(',') {
+                assert!(message.contains(option), "unexpected error: {message}");
+            }
+            assert!(message.contains("conflict"), "unexpected error: {message}");
+        }
     }
 
     #[test]

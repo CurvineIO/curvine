@@ -105,7 +105,13 @@ pub struct FuseConf {
     // Read and write file request queue size, default is 0
     pub stream_channel_size: usize,
 
-    // Mount the configuration, needs to be passed to the linux kernel.
+    // Mount options for Curvine's direct Linux FUSE backend. Supported VFS
+    // pairs are `ro`/`rw`, `nodev`/`dev`, `nosuid`/`suid`, `noexec`/`exec`,
+    // `noatime`/`atime`, and `sync`/`async`; `dirsync` is also supported.
+    // Supported FUSE-side options are `allow_other`, `default_permissions`, and
+    // `big_write` (negotiated through FUSE_INIT). Opposite options conflict.
+    // Legacy libfuse options `auto_unmount`, `allow_root`, and `max_write` are
+    // not supported in this field by the direct mount backend.
     pub fuse_opts: Vec<String>,
 
     // Mount the whole FUSE filesystem read-only at the kernel level.
@@ -287,8 +293,6 @@ impl FuseConf {
                 self.max_background
             );
         }
-
-        self.fuse_opts = Self::normalize_fuse_opts(&self.fuse_opts)?;
 
         self.attr_ttl = Duration::from_millis(self.attr_timeout_ms);
         self.entry_ttl = Duration::from_millis(self.entry_timeout_ms);
@@ -480,7 +484,7 @@ impl FuseConf {
         args
     }
 
-    fn normalize_fuse_opts(opts: &[String]) -> CommonResult<Vec<String>> {
+    fn normalized_fuse_opts(opts: &[String]) -> CommonResult<Vec<String>> {
         let mut normalized = Vec::new();
 
         for entry in opts {
@@ -500,10 +504,15 @@ impl FuseConf {
 
                 let option = match name {
                     "ro"
+                    | "rw"
                     | "nodev"
+                    | "dev"
                     | "nosuid"
+                    | "suid"
                     | "noexec"
+                    | "exec"
                     | "noatime"
+                    | "atime"
                     | "dirsync"
                     | "sync"
                     | "allow_other"
@@ -530,6 +539,16 @@ impl FuseConf {
                 };
 
                 let conflicting_option = match option.as_str() {
+                    "ro" => Some("rw"),
+                    "rw" => Some("ro"),
+                    "nodev" => Some("dev"),
+                    "dev" => Some("nodev"),
+                    "nosuid" => Some("suid"),
+                    "suid" => Some("nosuid"),
+                    "noexec" => Some("exec"),
+                    "exec" => Some("noexec"),
+                    "noatime" => Some("atime"),
+                    "atime" => Some("noatime"),
                     "sync" => Some("async"),
                     "async" => Some("sync"),
                     _ => None,
@@ -553,11 +572,21 @@ impl FuseConf {
         Ok(normalized)
     }
 
+    /// Normalize and validate mount options after config-file values, CLI
+    /// overrides, and defaults have been merged for the FUSE process. Generic
+    /// cluster loading deliberately does not call this method because master and
+    /// worker processes do not consume FUSE mount options.
+    pub fn normalize_fuse_opts(&mut self) -> CommonResult<()> {
+        self.fuse_opts = Self::normalized_fuse_opts(&self.fuse_opts)?;
+        Ok(())
+    }
+
     /// Appends options that belong in the FUSE mount data string. Linux VFS
-    /// options (`ro`, `nodev`, `nosuid`, `noexec`, `noatime`, `dirsync`, and
-    /// `sync`) are deliberately handled as `mount(2)` flags by the raw backend.
+    /// options (`ro`/`rw`, `nodev`/`dev`, `nosuid`/`suid`, `noexec`/`exec`,
+    /// `noatime`/`atime`, `dirsync`, and `sync`/`async`) are deliberately handled
+    /// as `mount(2)` flags, or as the absence of a flag, by the raw backend.
     pub fn set_fuse_opts(&self, mount_options: &mut String) -> CommonResult<()> {
-        let opts = Self::normalize_fuse_opts(&self.fuse_opts)?;
+        let opts = Self::normalized_fuse_opts(&self.fuse_opts)?;
         let mut default_permissions_added = false;
 
         // The kernel can distinguish an executable load from a normal read while
@@ -570,12 +599,13 @@ impl FuseConf {
 
         for opt in opts {
             match opt.as_str() {
-                // VFS options are converted to mount(2) flags in fuse_pure.rs.
-                // `async` is the default absence of MS_SYNCHRONOUS. `big_write`
-                // is negotiated through FUSE_INIT and is already in
-                // SUPPORTED_INIT_FLAGS, so neither belongs in kernel mount data.
-                "ro" | "nodev" | "nosuid" | "noexec" | "noatime" | "dirsync" | "sync" | "async"
-                | "big_write" => {}
+                // VFS options are converted to mount(2) flags in fuse_pure.rs;
+                // positive/default forms such as `rw` and `async` mean the
+                // corresponding restrictive flag is absent. `big_write` is
+                // negotiated through FUSE_INIT and is already in
+                // SUPPORTED_INIT_FLAGS. None belongs in kernel mount data.
+                "ro" | "rw" | "nodev" | "dev" | "nosuid" | "suid" | "noexec" | "exec"
+                | "noatime" | "atime" | "dirsync" | "sync" | "async" | "big_write" => {}
                 "default_permissions" => {
                     if !default_permissions_added {
                         mount_options.push_str(",default_permissions");
@@ -586,7 +616,7 @@ impl FuseConf {
                     mount_options.push(',');
                     mount_options.push_str(&opt);
                 }
-                // normalize_fuse_opts rejects unsupported and unknown options.
+                // normalized_fuse_opts rejects unsupported and unknown options.
                 _ => unreachable!("validated FUSE mount option: {}", opt),
             }
         }
@@ -933,31 +963,33 @@ max_readahead_kb = 1024
     }
 
     #[test]
-    fn init_normalizes_comma_separated_fuse_options() {
+    fn normalize_fuse_opts_splits_comma_separated_options() {
         let mut conf = FuseConf {
             fuse_opts: vec![" allow_other , nodev ".to_string()],
             ..Default::default()
         };
 
-        conf.init().expect("supported options must be accepted");
+        conf.normalize_fuse_opts()
+            .expect("supported options must be accepted");
 
         assert_eq!(conf.fuse_opts, vec!["allow_other", "nodev"]);
     }
 
     #[test]
-    fn init_deduplicates_normalized_fuse_options() {
+    fn normalize_fuse_opts_deduplicates_options() {
         let mut conf = FuseConf {
             fuse_opts: vec!["allow_other,nodev".to_string(), "nodev".to_string()],
             ..Default::default()
         };
 
-        conf.init().expect("supported options must be accepted");
+        conf.normalize_fuse_opts()
+            .expect("supported options must be accepted");
 
         assert_eq!(conf.fuse_opts, vec!["allow_other", "nodev"]);
     }
 
     #[test]
-    fn init_rejects_conflicting_sync_and_async_options() {
+    fn normalize_fuse_opts_rejects_conflicting_sync_and_async_options() {
         let cases: &[&[&str]] = &[
             &["sync,async"],
             &["async,sync"],
@@ -972,7 +1004,7 @@ max_readahead_kb = 1024
             };
 
             let err = conf
-                .init()
+                .normalize_fuse_opts()
                 .expect_err("sync and async must not be accepted together");
             let message = err.to_string();
             assert!(message.contains("sync"), "unexpected error: {}", err);
@@ -982,13 +1014,15 @@ max_readahead_kb = 1024
     }
 
     #[test]
-    fn init_rejects_unknown_fuse_option_with_name() {
+    fn normalize_fuse_opts_rejects_unknown_option_with_name() {
         let mut conf = FuseConf {
             fuse_opts: vec!["allow_other,unknown_option".to_string()],
             ..Default::default()
         };
 
-        let err = conf.init().expect_err("unknown option must be rejected");
+        let err = conf
+            .normalize_fuse_opts()
+            .expect_err("unknown option must be rejected");
         assert!(
             err.to_string().contains("unknown_option"),
             "unexpected error: {}",
@@ -997,14 +1031,14 @@ max_readahead_kb = 1024
     }
 
     #[test]
-    fn init_rejects_auto_unmount_as_unsupported() {
+    fn normalize_fuse_opts_rejects_auto_unmount_as_unsupported() {
         let mut conf = FuseConf {
             fuse_opts: vec!["auto_unmount".to_string()],
             ..Default::default()
         };
 
         let err = conf
-            .init()
+            .normalize_fuse_opts()
             .expect_err("auto_unmount is not implemented by the direct backend");
         let message = err.to_string();
         assert!(
@@ -1020,7 +1054,7 @@ max_readahead_kb = 1024
     }
 
     #[test]
-    fn init_rejects_unimplemented_fuse_options_with_name() {
+    fn normalize_fuse_opts_rejects_unimplemented_options_with_name() {
         for option in ["allow_root", "max_write=131072"] {
             let mut conf = FuseConf {
                 fuse_opts: vec![option.to_string()],
@@ -1028,7 +1062,7 @@ max_readahead_kb = 1024
             };
 
             let err = conf
-                .init()
+                .normalize_fuse_opts()
                 .expect_err("unimplemented option must be rejected");
             let message = err.to_string();
             assert!(

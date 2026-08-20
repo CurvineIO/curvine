@@ -414,9 +414,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     #[test]
-    fn mount_builder_maps_security_options_to_vfs_flags() {
+    fn mount_builder_maps_all_supported_vfs_options_to_flags() {
         let mut conf = FuseConf {
-            fuse_opts: vec!["nodev,nosuid,noexec".to_string()],
+            fuse_opts: vec!["ro,nodev,nosuid,noexec,noatime,dirsync,sync".to_string()],
             check_permission: false,
             ..Default::default()
         };
@@ -425,12 +425,36 @@ mod tests {
         let (mount_data, flags) =
             build_mount_options(10, 0o40755, &conf).expect("build mount arguments");
 
+        assert_eq!(flags & libc::MS_RDONLY, libc::MS_RDONLY);
         assert_eq!(flags & libc::MS_NODEV, libc::MS_NODEV);
         assert_eq!(flags & libc::MS_NOSUID, libc::MS_NOSUID);
         assert_eq!(flags & libc::MS_NOEXEC, libc::MS_NOEXEC);
-        assert!(!mount_data
-            .split(',')
-            .any(|option| matches!(option, "nodev" | "nosuid" | "noexec")));
+        assert_eq!(flags & libc::MS_NOATIME, libc::MS_NOATIME);
+        assert_eq!(flags & libc::MS_DIRSYNC, libc::MS_DIRSYNC);
+        assert_eq!(flags & libc::MS_SYNCHRONOUS, libc::MS_SYNCHRONOUS);
+        assert!(!mount_data.split(',').any(|option| {
+            matches!(
+                option,
+                "ro" | "nodev" | "nosuid" | "noexec" | "noatime" | "dirsync" | "sync"
+            )
+        }));
+    }
+
+    #[test]
+    fn mount_builder_treats_positive_vfs_options_as_noops() {
+        let conf = FuseConf {
+            fuse_opts: vec!["rw,dev,suid,exec,atime,async".to_string()],
+            check_permission: false,
+            ..Default::default()
+        };
+
+        let (mount_data, flags) =
+            build_mount_options(10, 0o40755, &conf).expect("build mount arguments");
+
+        assert_eq!(flags, 0);
+        assert!(!mount_data.split(',').any(|option| {
+            matches!(option, "rw" | "dev" | "suid" | "exec" | "atime" | "async")
+        }));
     }
 
     #[test]
