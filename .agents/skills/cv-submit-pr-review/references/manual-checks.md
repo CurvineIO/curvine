@@ -67,3 +67,39 @@ Assertions must fail on the intended regression and verify external state (file 
 ## Compatibility and versioning
 
 Heartbeat / handshake version fields, proto evolution, Java/Python SDK parity, and legacy fallback belong in the same review as the server change. A server that understands a new field while old clients break (or the reverse) is a blocker unless the PR documents a rollout.
+
+## Backward-compatible evolution
+
+Curvine ships a versioned wire format (proto2) and versioned Rust APIs (`curvine-fs-api`, `curvine-ufs-api`, `curvine-storage-api`, JNI/Python SDK). Mixed-version rolling upgrades are the norm, so every change to an existing function signature, struct, or proto message **must** remain consumable by code built against the previous version. Treat the rules below as blockers, not suggestions.
+
+### Function and struct parameters
+
+* **Append-only positional parameters.** When adding a parameter to an existing public function or method, place it **last** in the parameter list. Inserting a parameter in the middle reorders every call site and breaks any external caller that passes arguments positionally.
+* **Prefer a default / `Option` / builder.** A new trailing parameter should default to the previous behavior (e.g. `Option<T>` with `None`, a `Default`, or a builder method) so existing callers compiled against the old signature keep working without edits.
+* **Do not change parameter order or types of existing parameters.** Rename + reorder is a breaking change even if the names match; re-typing `&str` to `String` (or vice versa) on a public trait method is breaking.
+* **Trait methods.** Adding a method to a public trait without a default impl breaks all out-of-tree implementors. Provide a default body, or split a new trait.
+* **Struct fields.** New public struct fields are appended at the end; do not insert, reorder, or retag existing fields. If the struct is constructed by external code via struct literal, prefer a builder or `..Default::default()` and document it.
+
+### Proto messages (`curvine-proto`, `curvine-raft`)
+
+* **New fields must be `optional` (proto2) or non-`required` (proto3).** Never add a new `required` field to an existing message. An old peer that does not know the field will fail to deserialize a message that includes it, and a new peer will reject a message from an old peer that omits it — both break rolling upgrades. Use `optional` (proto2) or plain scalar / `optional` (proto3) so absence is valid.
+* **Append new field numbers at the end.** Pick the next unused tag number for the message; do not fill gaps left by deleted fields (see "never reuse" below). Appending keeps old readers tolerant of new fields they do not recognize.
+* **Never reuse, renumber, or retag a field.** A tag is a permanent contract. Renaming the field is fine; reusing its number for a different type/name is a wire break. Deleted fields must be reserved (`reserved 7;` / `reserved "old_name";`) and never reissued.
+* **Never change a field's type or label.** Promoting `optional` to `required`, changing `int32` to `int64`, or `string` to `bytes` changes the wire encoding and breaks both sides.
+* **Never change a field's default value** in a way that changes wire behavior: existing readers that omit the field still see the old default. If the semantic default must move, add a new field rather than editing the existing one.
+* **Enums.** New enum values must be appended with new numbers; do not renumber or reuse existing values. For proto2 closed enums, recognize that old readers will map unknown values to the default — prefer adding a sentinel `UNKNOWN_* = 0` if not already present.
+* **`map<K,V>` fields.** Treat a `map` like a `repeated` message pair: append at the end, never retag. Changing key or value type is breaking.
+* **Oneofs.** Adding a new oneof field is fine; moving an existing field into or out of a oneof changes its wire semantics and is breaking.
+
+### RPC and SDK parity
+
+* **Both sides of every changed RPC.** A request/response change must update master, worker, client, JNI, and Python SDK in the same PR, or document a staged rollout. A server that accepts a new `optional` field while the old client still omits it is the safe direction; the reverse (server requires, client omits) is a blocker.
+* **Heartbeat / handshake version.** If the PR bumps a heartbeat or handshake version field, verify the server still accepts the old version during the rollout window, and that the version is monotonic.
+* **Java / Python SDK parity.** A new proto field surfaced to users must be exposed in both SDKs with the same name and semantics, or the SDK gap must be tracked.
+
+### How to verify during review
+
+1. Diff the `.proto` file and confirm every added line is `optional`/`repeated` with a tag greater than the previous max in that message.
+2. Diff public Rust signatures in `*-api` crates and confirm new parameters are trailing and defaultable.
+3. Grep for `reserved` near deleted fields; flag any tag that was previously used and is now reused.
+4. Trace the changed RPC end-to-end and confirm both peers tolerate the field's absence.

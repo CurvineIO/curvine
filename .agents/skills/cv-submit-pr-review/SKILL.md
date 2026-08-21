@@ -39,7 +39,7 @@ Focus **exclusively on code content**:
 | Correctness | Logic errors, edge cases, off-by-one, None/null handling, error propagation |
 | Safety | Concurrency races, panics / unwrap in hot paths, unsafe blocks, resource leaks, lock ordering |
 | Lifecycle | Master/worker/fuse/CSI startup, heartbeat, failover, unmount, detach cleanup, cancellation during awaits |
-| Contracts | Both sides of changed proto/RPC, fs-api, ufs-api, storage-api, JNI/Python SDK; errors, ownership, compatibility |
+| Contracts | Both sides of changed proto/RPC, fs-api, ufs-api, storage-api, JNI/Python SDK; errors, ownership, **backward compatibility** (function/struct parameters appended at the end; new proto fields must be `optional`/`repeated` and appended with new field numbers; never reorder, reuse, or retag existing fields) |
 | Design | Naming, module boundaries, abstractions, consistency with existing patterns; challenge speculative generality |
 | Tests | Assertions fail on the intended regression; real entry path (client/fuse/CSI/CLI) where the bug lives |
 | Performance | Potential performance impact on critical paths: **data read/write** (block I/O patterns, extra buffer copies, sync/fsync frequency, read amplification), **message communication** (RPC payload size, serialization/deserialization overhead, extra network round trips, connection churn), and **metadata operations** (inode lookup cost, lock granularity and hold time, journal/rocksdb write amplification). Trace hot-path call chains to judge whether the change adds work per request/block/message. Any change likely to cause a significant performance regression **must** generate a comment with concrete improvement suggestions (e.g., batching, caching, avoiding copies, narrowing locks, async-ifying blocking calls). |
@@ -56,6 +56,7 @@ Detailed Curvine-specific probes: [references/manual-checks.md](references/manua
 4. **Tests would catch the bug.** New behavior or a regression fix has an assertion that fails on the intended defect. Coverage is necessary but not evidence that the scenario is correct.
 5. **Safety on hot paths.** `unwrap` / panic, `unsafe`, lock-order inversion, leaked FDs/block handles, and incomplete detach cleanup are blockers.
 6. **Wire compatibility.** Breaking proto/RPC/SDK changes are called out with a migration path or an explicit compatibility decision.
+7. **Backward-compatible evolution of functions and proto messages.** New parameters on Rust functions, struct fields, and proto messages **must** be appended at the end (highest field number); new proto fields **must** be `optional` (proto2) or `optional`/without `required`-style semantics (proto3), never `required`. Reordering, renumbering, reusing, or retagging existing proto fields, and inserting new `required` fields into an existing message, are blockers. See [references/manual-checks.md](references/manual-checks.md#backward-compatible-evolution).
 
 ## Communication Rules
 
@@ -157,6 +158,7 @@ Inspect the actual code changes using [references/manual-checks.md](references/m
 * correctness issues and regressions
 * lifecycle / concurrency defects (races, cancellation, incomplete cleanup)
 * interface-contract mismatches (proto, fs-api, SDK both sides)
+* backward-compatibility violations: new function/struct/proto parameters not appended at the end; new proto fields marked `required` instead of `optional`; reordered/renumbered/reused field numbers
 * performance regressions in critical paths — if the impact is significant, drafting a comment with improvement suggestions is mandatory
 * missing validation or edge-case handling
 * unsafe or brittle logic (`unwrap` on hot paths, `unsafe`, lock order)
@@ -286,6 +288,7 @@ Post only the comments the user approved.
 - [ ] Callers / definitions of changed symbols checked
 - [ ] Module conventions verified (sources of truth / existing patterns)
 - [ ] Manual checks applied for contracts, lifecycle, consumer fit, test strength
+- [ ] Backward compatibility verified: new function/struct/proto parameters appended at the end; new proto fields are `optional`/`repeated` with new field numbers; no reordered/renumbered/reused fields
 - [ ] Performance impact assessed for data read/write, RPC, and metadata paths; significant regressions have mandatory comments with suggestions
 - [ ] Findings table produced with severity (`blocker` / `must-fix` / `suggestion`)
 - [ ] User decided on next action (fix / post / discuss)
