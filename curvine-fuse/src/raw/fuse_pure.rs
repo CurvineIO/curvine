@@ -458,6 +458,23 @@ mod tests {
     }
 
     #[test]
+    fn mount_builder_rejects_rw_when_readonly_is_enabled() {
+        let conf = FuseConf {
+            readonly: true,
+            fuse_opts: vec!["rw".to_string()],
+            check_permission: false,
+            ..Default::default()
+        };
+
+        let err = build_mount_options(10, 0o40755, &conf)
+            .expect_err("rw must conflict with fuse.readonly=true");
+        let message = err.to_string();
+        assert!(message.contains("rw"), "unexpected error: {message}");
+        assert!(message.contains("readonly"), "unexpected error: {message}");
+        assert!(message.contains("conflict"), "unexpected error: {message}");
+    }
+
+    #[test]
     fn mount_builder_keeps_fuse_parameters_in_mount_data() {
         let mut conf = FuseConf {
             fuse_opts: vec!["allow_other,async,big_write".to_string()],
@@ -483,6 +500,7 @@ mod tests {
     fn readonly_sets_vfs_flag_without_polluting_mount_data() {
         let conf = FuseConf {
             readonly: true,
+            fuse_opts: vec!["ro".to_string()],
             check_permission: false,
             ..Default::default()
         };

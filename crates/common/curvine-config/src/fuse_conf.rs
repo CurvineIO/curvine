@@ -109,7 +109,8 @@ pub struct FuseConf {
     // pairs are `ro`/`rw`, `nodev`/`dev`, `nosuid`/`suid`, `noexec`/`exec`,
     // `noatime`/`atime`, and `sync`/`async`; `dirsync` is also supported.
     // Supported FUSE-side options are `allow_other`, `default_permissions`, and
-    // `big_write` (negotiated through FUSE_INIT). Opposite options conflict.
+    // `big_write` (negotiated through FUSE_INIT). Opposite options conflict, and
+    // explicit `rw` also conflicts with `readonly = true`.
     // Legacy libfuse options `auto_unmount`, `allow_root`, and `max_write` are
     // not supported in this field by the direct mount backend.
     pub fuse_opts: Vec<String>,
@@ -572,12 +573,24 @@ impl FuseConf {
         Ok(normalized)
     }
 
+    fn validate_fuse_opts_against_config(&self, opts: &[String]) -> CommonResult<()> {
+        if self.readonly && opts.iter().any(|option| option == "rw") {
+            return err_box!(
+                "FUSE mount option 'rw' conflicts with fuse.readonly=true; remove 'rw' or disable fuse.readonly"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Normalize and validate mount options after config-file values, CLI
     /// overrides, and defaults have been merged for the FUSE process. Generic
     /// cluster loading deliberately does not call this method because master and
     /// worker processes do not consume FUSE mount options.
     pub fn normalize_fuse_opts(&mut self) -> CommonResult<()> {
-        self.fuse_opts = Self::normalized_fuse_opts(&self.fuse_opts)?;
+        let opts = Self::normalized_fuse_opts(&self.fuse_opts)?;
+        self.validate_fuse_opts_against_config(&opts)?;
+        self.fuse_opts = opts;
         Ok(())
     }
 
@@ -587,6 +600,7 @@ impl FuseConf {
     /// as `mount(2)` flags, or as the absence of a flag, by the raw backend.
     pub fn set_fuse_opts(&self, mount_options: &mut String) -> CommonResult<()> {
         let opts = Self::normalized_fuse_opts(&self.fuse_opts)?;
+        self.validate_fuse_opts_against_config(&opts)?;
         let mut default_permissions_added = false;
 
         // The kernel can distinguish an executable load from a normal read while
@@ -1011,6 +1025,23 @@ max_readahead_kb = 1024
             assert!(message.contains("async"), "unexpected error: {}", err);
             assert!(message.contains("conflict"), "unexpected error: {}", err);
         }
+    }
+
+    #[test]
+    fn normalize_fuse_opts_rejects_rw_when_readonly_is_enabled() {
+        let mut conf = FuseConf {
+            readonly: true,
+            fuse_opts: vec!["rw".to_string()],
+            ..Default::default()
+        };
+
+        let err = conf
+            .normalize_fuse_opts()
+            .expect_err("rw must conflict with fuse.readonly=true");
+        let message = err.to_string();
+        assert!(message.contains("rw"), "unexpected error: {message}");
+        assert!(message.contains("readonly"), "unexpected error: {message}");
+        assert!(message.contains("conflict"), "unexpected error: {message}");
     }
 
     #[test]

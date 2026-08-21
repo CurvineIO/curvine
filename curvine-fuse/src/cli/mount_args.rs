@@ -419,6 +419,20 @@ mod tests {
     }
 
     #[test]
+    fn get_conf_rejects_rw_when_readonly_is_enabled() {
+        let err = try_get_conf(
+            "[fuse]\nio_threads = 1\n",
+            &["--readonly", "--options", "rw"],
+        )
+        .expect_err("rw must conflict with --readonly");
+
+        let message = err.to_string();
+        assert!(message.contains("rw"), "unexpected error: {message}");
+        assert!(message.contains("readonly"), "unexpected error: {message}");
+        assert!(message.contains("conflict"), "unexpected error: {message}");
+    }
+
+    #[test]
     fn get_conf_rejects_conflicting_vfs_option_pairs() {
         for options in [
             "ro,rw",
