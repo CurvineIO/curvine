@@ -56,7 +56,7 @@ Detailed Curvine-specific probes: [references/manual-checks.md](references/manua
 4. **Tests would catch the bug.** New behavior or a regression fix has an assertion that fails on the intended defect. Coverage is necessary but not evidence that the scenario is correct.
 5. **Safety on hot paths.** `unwrap` / panic, `unsafe`, lock-order inversion, leaked FDs/block handles, and incomplete detach cleanup are blockers.
 6. **Wire compatibility.** Breaking proto/RPC/SDK changes are called out with a migration path or an explicit compatibility decision.
-7. **Backward-compatible evolution of functions and proto messages.** New parameters on Rust functions, struct fields, and proto messages **must** be appended at the end (highest field number); new proto fields **must** be `optional` (proto2) or `optional`/without `required`-style semantics (proto3), never `required`. Reordering, renumbering, reusing, or retagging existing proto fields, and inserting new `required` fields into an existing message, are blockers. See [references/manual-checks.md](references/manual-checks.md#backward-compatible-evolution).
+7. **Backward-compatible evolution of functions and proto messages.** New parameters on Rust functions and public struct fields **must** be appended at the end and be defaultable. New proto fields **must** use the next unused (highest) field number and be `optional` (proto2) or `optional`/without `required`-style semantics (proto3), never `required`. Reordering, renumbering, reusing, or retagging existing proto fields, and inserting new `required` fields into an existing message, are blockers. See [references/manual-checks.md](references/manual-checks.md#backward-compatible-evolution).
 
 ## Communication Rules
 
