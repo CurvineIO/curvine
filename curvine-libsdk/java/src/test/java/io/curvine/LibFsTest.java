@@ -51,11 +51,15 @@ public class LibFsTest {
     }
 
     @Test
-    public void namespacedMasterAddrsAreNormalized() {
-        // CurvineFileSystem.initialize overwrites constructor master_addrs with
-        // fs.cv.{ns}.master_addrs; that path must use the same CSV trim.
-        assert FilesystemConf.normalizeCsv("h1:8995, h2:8995,h3:8995")
-                .equals("h1:8995,h2:8995,h3:8995");
+    public void namespacedMasterAddrsAreNormalized() throws Exception {
+        // initialize() overwrites constructor master_addrs via getMasterAddrs(authority).
+        // Exercise that helper directly so a revert of normalizeCsv there fails the test.
+        CurvineFileSystem fs = new CurvineFileSystem();
+        Configuration conf = new Configuration();
+        conf.set("fs.cv.ns1.master_addrs", "h1:8995, h2:8995,h3:8995");
+        fs.setConf(conf);
+
+        assert fs.getMasterAddrs("ns1").equals("h1:8995,h2:8995,h3:8995");
     }
 
     @Test
