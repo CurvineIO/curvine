@@ -122,6 +122,7 @@ impl TransferConf {
 
     pub fn init(&mut self) -> FsResult<()> {
         self.hostname = self.hostname.trim().to_string();
+        let had_configured_endpoints = !self.endpoints.is_empty();
         self.endpoints = self
             .endpoints
             .iter()
@@ -130,6 +131,11 @@ impl TransferConf {
             .collect();
         self.infer_store_url();
         if self.endpoints.is_empty() {
+            if had_configured_endpoints {
+                return Err(FsError::common(
+                    "transfer.endpoints must contain host:port values; whitespace-only entries are invalid",
+                ));
+            }
             self.endpoints
                 .push(format!("{}:{}", self.hostname, self.rpc_port));
         }
@@ -424,6 +430,20 @@ mod tests {
         assert_eq!(conf.rpc_port, TransferConf::DEFAULT_RPC_PORT);
         assert_eq!(conf.web_port, TransferConf::DEFAULT_WEB_PORT);
         assert_eq!(conf.log.file_name, "transfer.log");
+    }
+
+    #[test]
+    fn rejects_whitespace_only_endpoints() {
+        let mut conf = TransferConf {
+            endpoints: vec![" ".to_string()],
+            ..Default::default()
+        };
+
+        let err = conf.init().unwrap_err().to_string();
+        assert!(
+            err.contains("transfer.endpoints must contain host:port values"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

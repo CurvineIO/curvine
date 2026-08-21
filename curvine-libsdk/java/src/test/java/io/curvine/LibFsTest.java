@@ -51,6 +51,21 @@ public class LibFsTest {
     }
 
     @Test
+    public void namespacedMasterAddrsAreNormalized() {
+        // CurvineFileSystem.initialize overwrites constructor master_addrs with
+        // fs.cv.{ns}.master_addrs; that path must use the same CSV trim.
+        assert FilesystemConf.normalizeCsv("h1:8995, h2:8995,h3:8995")
+                .equals("h1:8995,h2:8995,h3:8995");
+    }
+
+    @Test
+    public void clientHostnameEnvValuesAreTrimmed() {
+        assert FilesystemConf.trimEnvHostname(" 10.0.0.8 \n").equals("10.0.0.8");
+        assert FilesystemConf.trimEnvHostname("  ") == null;
+        assert FilesystemConf.trimEnvHostname(null) == null;
+    }
+
+    @Test
     public void jni1() throws Exception {
         Configuration conf = new Configuration();
         conf.set("fs.cv.master_addrs", "localhost:6995");

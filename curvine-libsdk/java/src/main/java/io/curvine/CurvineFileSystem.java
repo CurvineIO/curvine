@@ -124,7 +124,7 @@ public class CurvineFileSystem extends FileSystem {
         if (StringUtils.isEmpty(addrs)) {
             throw new IOException(key + " not set");
         } else {
-            return addrs;
+            return FilesystemConf.normalizeCsv(addrs);
         }
     }
     @Override

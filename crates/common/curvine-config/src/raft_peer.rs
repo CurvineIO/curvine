@@ -14,16 +14,25 @@
 
 use curvine_net::net::InetAddr;
 use curvine_runtime::common::Utils;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt::{Display, Formatter};
 
 pub type NodeId = u64;
+
+fn deserialize_trimmed_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    Ok(value.trim().to_string())
+}
 
 // Represents a raft address
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct RaftPeer {
     pub id: NodeId,
+    #[serde(default, deserialize_with = "deserialize_trimmed_string")]
     pub hostname: String,
     pub port: u16,
 }
@@ -65,5 +74,27 @@ impl Default for RaftPeer {
             hostname: "".to_string(),
             port: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RaftPeer;
+    use curvine_net::net::InetAddr;
+
+    #[test]
+    fn serde_trims_hostname() {
+        let peer: RaftPeer = toml::from_str(
+            r#"
+                id = 1
+                hostname = " master1 "
+                port = 8996
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(peer.hostname, "master1");
+        assert_eq!(peer.to_addr().hostname, "master1");
+        assert_eq!(peer.to_addr(), InetAddr::new(" master1 ", 8996));
     }
 }

@@ -14,7 +14,6 @@
 
 package io.curvine;
 
-import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.conf.Configuration;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
@@ -244,21 +243,6 @@ public class FilesystemConf {
         return builder.toString();
     }
 
-    private static String normalizeCsv(String value) {
-        StringBuilder builder = new StringBuilder();
-        for (String part : value.split(",")) {
-            String trimmed = part.trim();
-            if (trimmed.isEmpty()) {
-                continue;
-            }
-            if (builder.length() > 0) {
-                builder.append(',');
-            }
-            builder.append(trimmed);
-        }
-        return builder.toString();
-    }
-
     private static boolean isTransferField(Field field) {
         return "transfer_enabled".equals(field.getName())
                 || "transfer_endpoints".equals(field.getName())
@@ -274,15 +258,38 @@ public class FilesystemConf {
                 .replace("\t", "\\t");
     }
 
+    static String normalizeCsv(String value) {
+        StringBuilder builder = new StringBuilder();
+        for (String part : value.split(",")) {
+            String trimmed = part.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            if (builder.length() > 0) {
+                builder.append(',');
+            }
+            builder.append(trimmed);
+        }
+        return builder.toString();
+    }
+
+    static String trimEnvHostname(String hostname) {
+        if (hostname == null) {
+            return null;
+        }
+        String trimmed = hostname.trim();
+        return trimmed.isEmpty() ? null : trimmed;
+    }
+
     private String getClientHostname() {
         // In the k8s environment, POD_IP is used by default as client hostname
-        String hostname = System.getenv("POD_IP");
-        if (StringUtils.isEmpty(hostname)) {
+        String hostname = trimEnvHostname(System.getenv("POD_IP"));
+        if (hostname == null) {
             // Use CURVINE_CLIENT_HOSTNAME environment variable.
-            hostname = System.getenv(HOSTNAME_KEY);
+            hostname = trimEnvHostname(System.getenv(HOSTNAME_KEY));
         }
 
-        if (StringUtils.isNotEmpty(hostname)) {
+        if (hostname != null) {
             return hostname;
         } else {
             try {

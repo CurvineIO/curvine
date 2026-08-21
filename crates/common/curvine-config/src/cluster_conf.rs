@@ -140,12 +140,14 @@ impl ClusterConf {
             .map(|dir| dir.trim().to_string())
             .filter(|dir| !dir.is_empty())
             .collect();
+        // Trim only. Dropping empty tokens here would hide whitespace-only
+        // `transfer.endpoints` from TransferConf::init, which must reject them
+        // instead of silently defaulting to localhost.
         self.transfer.endpoints = self
             .transfer
             .endpoints
             .iter()
             .map(|endpoint| endpoint.trim().to_string())
-            .filter(|endpoint| !endpoint.is_empty())
             .collect();
     }
 
@@ -638,6 +640,33 @@ mod tests {
         assert_eq!(
             conf.transfer.endpoints,
             vec!["transfer-01.example:9010", "transfer-02.example:9010"]
+        );
+    }
+
+    #[test]
+    fn rejects_whitespace_only_transfer_endpoints() {
+        let path = std::env::temp_dir().join(format!(
+            "curvine-trim-endpoints-{}-{}.toml",
+            std::process::id(),
+            Utils::rand_str(6)
+        ));
+        std::fs::write(
+            &path,
+            r#"
+                [transfer]
+                endpoints = [" "]
+            "#,
+        )
+        .unwrap();
+
+        let err = ClusterConf::from_transfer(path.to_str().unwrap())
+            .expect_err("whitespace-only transfer endpoints must fail")
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            err.contains("transfer.endpoints must contain host:port values"),
+            "unexpected error: {err}"
         );
     }
 
