@@ -24,23 +24,10 @@ public class CurvineFsStat extends FsStatus {
     private final GetFilesystemInfoResponse info;
 
     public CurvineFsStat(GetFilesystemInfoResponse info) {
-        // Report the allocatable (writable) view so Hadoop/Spark remaining-space
-        // checks only see Live workers. Legacy masters omit tags 15/16; protobuf
-        // returns 0 for an absent optional int64 with default=0, so we must guard
-        // with hasAllocatableCapacity()/hasAllocatableAvailable() and fall back to
-        // the aggregate totals — otherwise a new client against an old master
-        // would report zero free space.
-        //
-        // Used is derived as Capacity - Remaining rather than info.getFsUsed()
-        // (which sums every non-lost worker, including Blacklist/Decommission).
-        // Capacity/Remaining are Live-only, so deriving Used keeps the FsStatus
-        // triple self-consistent (Used == Capacity - Remaining) even when
-        // non-writable workers still hold data — otherwise getUsed() could
-        // exceed getCapacity() - getRemaining() and report a misleading ratio.
-        // The master-reported total fs_used is still surfaced in simple().
-        long capacity = info.hasAllocatableCapacity() ? info.getAllocatableCapacity() : info.getCapacity();
-        long remaining = info.hasAllocatableAvailable() ? info.getAllocatableAvailable() : info.getAvailable();
-        super(capacity, Math.max(0, capacity - remaining), remaining);
+        // super(...) must be the first statement, so the allocatable fallback
+        // and used derivation live in static helpers below. See the comment on
+        // allocatableCapacity/allocatableAvailable for the rationale.
+        super(allocatableCapacity(info), allocatableUsed(info), allocatableRemaining(info));
         this.info = info;
     }
 
@@ -204,5 +191,34 @@ public class CurvineFsStat extends FsStatus {
         }
 
         return builder.toString();
+    }
+
+    // The allocatable (writable) view: capacity/available eligible for new
+    // writes (Live workers only). Legacy masters omit tags 15/16; protobuf
+    // returns 0 for an absent optional int64 with default=0, so we must guard
+    // with hasAllocatableCapacity()/hasAllocatableAvailable() and fall back to
+    // the aggregate totals — otherwise a new client against an old master
+    // would report zero free space.
+    //
+    // Used is derived as Capacity - Remaining rather than info.getFsUsed()
+    // (which sums every non-lost worker, including Blacklist/Decommission).
+    // Capacity/Remaining are Live-only, so deriving Used keeps the FsStatus
+    // triple self-consistent (Used == Capacity - Remaining) even when
+    // non-writable workers still hold data — otherwise getUsed() could
+    // exceed getCapacity() - getRemaining() and report a misleading ratio.
+    // The master-reported total fs_used is still surfaced in simple().
+    // These are static so they can run before super(...) completes.
+    private static long allocatableCapacity(GetFilesystemInfoResponse info) {
+        return info.hasAllocatableCapacity() ? info.getAllocatableCapacity() : info.getCapacity();
+    }
+
+    private static long allocatableRemaining(GetFilesystemInfoResponse info) {
+        return info.hasAllocatableAvailable() ? info.getAllocatableAvailable() : info.getAvailable();
+    }
+
+    private static long allocatableUsed(GetFilesystemInfoResponse info) {
+        long capacity = allocatableCapacity(info);
+        long remaining = allocatableRemaining(info);
+        return Math.max(0, capacity - remaining);
     }
 }
