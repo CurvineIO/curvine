@@ -30,11 +30,17 @@ public class CurvineFsStat extends FsStatus {
         // with hasAllocatableCapacity()/hasAllocatableAvailable() and fall back to
         // the aggregate totals — otherwise a new client against an old master
         // would report zero free space.
-        super(
-                info.hasAllocatableCapacity() ? info.getAllocatableCapacity() : info.getCapacity(),
-                info.getFsUsed(),
-                info.hasAllocatableAvailable() ? info.getAllocatableAvailable() : info.getAvailable()
-        );
+        //
+        // Used is derived as Capacity - Remaining rather than info.getFsUsed()
+        // (which sums every non-lost worker, including Blacklist/Decommission).
+        // Capacity/Remaining are Live-only, so deriving Used keeps the FsStatus
+        // triple self-consistent (Used == Capacity - Remaining) even when
+        // non-writable workers still hold data — otherwise getUsed() could
+        // exceed getCapacity() - getRemaining() and report a misleading ratio.
+        // The master-reported total fs_used is still surfaced in simple().
+        long capacity = info.hasAllocatableCapacity() ? info.getAllocatableCapacity() : info.getCapacity();
+        long remaining = info.hasAllocatableAvailable() ? info.getAllocatableAvailable() : info.getAvailable();
+        super(capacity, Math.max(0, capacity - remaining), remaining);
         this.info = info;
     }
 
