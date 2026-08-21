@@ -82,7 +82,7 @@ Curvine ships a versioned wire format (proto2) and versioned Rust APIs (`curvine
 
 ### Proto messages (`curvine-proto`, `curvine-raft`)
 
-* **New fields must be `optional` (proto2) or non-`required` (proto3).** Never add a new `required` field to an existing message. An old peer that does not know the field will fail to deserialize a message that includes it, and a new peer will reject a message from an old peer that omits it — both break rolling upgrades. Use `optional` (proto2) or plain scalar / `optional` (proto3) so absence is valid.
+* **New fields must be `optional` (proto2) or non-`required` (proto3).** Never add a new `required` field to an existing message. An old peer will ignore an unknown field (and will never populate it), while a new peer will reject a message from an old peer that omits the required field — either way rolling upgrades break. Use `optional` (proto2) or plain scalar / `optional` (proto3) so absence is valid.
 * **Append new field numbers at the end.** Pick the next unused tag number for the message; do not fill gaps left by deleted fields (see "never reuse" below). Appending keeps old readers tolerant of new fields they do not recognize.
 * **Never reuse, renumber, or retag a field.** A tag is a permanent contract. Renaming the field is fine; reusing its number for a different type/name is a wire break. Deleted fields must be reserved (`reserved 7;` / `reserved "old_name";`) and never reissued.
 * **Never change a field's type or label.** Promoting `optional` to `required`, changing `int32` to `int64`, or `string` to `bytes` changes the wire encoding and breaks both sides.
