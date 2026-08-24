@@ -1,0 +1,26 @@
+[package]
+name = "curvine-service-discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Curvine service discovery abstractions and providers."
+
+[features]
+default = []
+etcd = ["dep:etcd-client", "dep:curvine-config", "dep:curvine-runtime", "dep:log"]
+
+[dependencies]
+async-trait = { workspace = true }
+curvine-core-error = { workspace = true }
+curvine-error = { workspace = true }
+curvine-config = { workspace = true, optional = true }
+curvine-proto = { workspace = true }
+curvine-runtime = { workspace = true, optional = true }
+etcd-client = { workspace = true, optional = true }
+log = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]

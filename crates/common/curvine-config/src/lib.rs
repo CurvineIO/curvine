@@ -31,6 +31,9 @@ pub use self::master_conf::MasterConf;
 mod compatibility_conf;
 pub use self::compatibility_conf::CompatibilityConf;
 
+mod discovery_conf;
+pub use self::discovery_conf::DiscoveryConf;
+
 mod worker_conf;
 pub use self::worker_conf::{WorkerConf, WorkerDataDir};
 

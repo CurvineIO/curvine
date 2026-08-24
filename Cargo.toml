@@ -28,6 +28,7 @@ members = [
     "crates/core/curvine-alloc",
     "crates/core/curvine-io",
     "crates/adapters/curvine-rocksdb",
+    "crates/adapters/curvine-service-discovery",
     "crates/metadata/curvine-raft",
     "crates/adapters/curvine-storage-local",
     "crates/adapters/curvine-storage-spdk",
@@ -80,6 +81,7 @@ default-members = [
     "crates/core/curvine-sys",
     "crates/core/curvine-alloc",
     "crates/core/curvine-io",
+    "crates/adapters/curvine-service-discovery",
     "crates/metadata/curvine-raft",
     "crates/adapters/curvine-storage-local",
     "crates/server/curvine-data-transfer",
@@ -113,6 +115,7 @@ curvine-sys = { path = "crates/core/curvine-sys" }
 curvine-alloc = { path = "crates/core/curvine-alloc" }
 curvine-io = { path = "crates/core/curvine-io" }
 curvine-rocksdb = { path = "crates/adapters/curvine-rocksdb" }
+curvine-service-discovery = { path = "crates/adapters/curvine-service-discovery" }
 curvine-raft = { path = "crates/metadata/curvine-raft" }
 curvine-storage-local = { path = "crates/adapters/curvine-storage-local" }
 curvine-storage-spdk = { path = "crates/adapters/curvine-storage-spdk" }
@@ -230,6 +233,7 @@ anyhow = "1.0.97"
 percent-encoding = "2.3.1"
 url = "2.2.2"
 async-trait = "0.1.76"
+etcd-client = { version = "0.19", default-features = false }
 fastrand = "1.9.0"
 num_cpus = "1.16.0"
 slog = "2.7.0"

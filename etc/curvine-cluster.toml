@@ -29,6 +29,25 @@ format_worker = false
 enabled = false
 auth_token_env = "CURVINE_FAULT_TOKEN"
 
+# Service discovery is disabled by default. When enabled, the first provider is
+# etcd over internal cluster networking; auth/TLS settings are intentionally not
+# part of the first phase.
+[discovery]
+enabled = false
+provider = "etcd"
+# Set when enabled, for example: ["http://etcd-0:2379", "http://etcd-1:2379"]
+endpoints = []
+# Etcd key prefix. Effective keys are {prefix}/{cluster_id}/services/{kind}/{service_id}.
+prefix = "/curvine"
+connect_timeout_ms = 3000
+request_timeout_ms = 3000
+# Watch reconnect uses exponential backoff between min/max with this jitter ratio.
+watch_reconnect_min_ms = 1000
+watch_reconnect_max_ms = 30000
+watch_reconnect_jitter_ratio = 0.2
+# If false, resolver snapshot() returns StaleCache while watch is disconnected.
+allow_stale_cache = true
+
 
 # master configuration
 [master]
