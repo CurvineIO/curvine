@@ -25,12 +25,16 @@ impl ServiceRegistry for FakeDiscovery {
         endpoint.validate()?;
         let kind = endpoint.kind.clone();
         let service_id = endpoint.id.clone();
-        self.store
-            .write()
-            .await
-            .entry(kind.clone())
-            .or_default()
-            .insert(service_id.clone(), endpoint);
+        let mut store = self.store.write().await;
+        let services = store.entry(kind.clone()).or_default();
+        if services.contains_key(&service_id) {
+            return Err(DiscoveryError::RegistrationAlreadyExists(format!(
+                "{}/{}",
+                kind, service_id
+            )));
+        }
+        services.insert(service_id.clone(), endpoint);
+        drop(store);
         let (status_tx, status_rx) = watch::channel(RegistrationStatus::Registered);
         Ok(RegistrationGuard::new(
             kind.clone(),
@@ -87,6 +91,12 @@ struct FakeRegistrationControl {
 #[async_trait]
 impl RegistrationControl for FakeRegistrationControl {
     async fn update_endpoint(&self, endpoint: ServiceEndpoint) -> DiscoveryResult<()> {
+        if endpoint.kind != self.kind || endpoint.id != self.service_id {
+            return Err(DiscoveryError::InvalidEndpointValue(format!(
+                "endpoint kind/id must match fake registration: expected {}/{}, got {}/{}",
+                self.kind, self.service_id, endpoint.kind, endpoint.id
+            )));
+        }
         self.store
             .write()
             .await
@@ -158,6 +168,24 @@ async fn fake_registry_and_resolver_exercise_traits() {
     guard.shutdown().await.unwrap();
     let snapshot = discovery.list(kind).await.unwrap();
     assert!(snapshot.endpoints.is_empty());
+}
+
+#[tokio::test]
+async fn fake_registry_rejects_duplicate_registration() {
+    let discovery = FakeDiscovery::default();
+    discovery
+        .register(endpoint("mds", "mds-1"), RegistrationOptions::default())
+        .await
+        .unwrap();
+
+    let err = match discovery
+        .register(endpoint("mds", "mds-1"), RegistrationOptions::default())
+        .await
+    {
+        Ok(_) => panic!("duplicate fake registration should fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(err, DiscoveryError::RegistrationAlreadyExists(_)));
 }
 
 #[tokio::test]

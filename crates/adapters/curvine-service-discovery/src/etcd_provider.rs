@@ -176,12 +176,12 @@ impl RegistrationControl for EtcdRegistrationControl {
         let _ = self.status_tx.send(RegistrationStatus::Revoking);
         let _ = self.shutdown_tx.send(true);
         let mut client = self.client.lock().await;
-        client
+        let result = client
             .lease_revoke(self.lease_id)
             .await
-            .map_err(DiscoveryError::from)?;
+            .map_err(DiscoveryError::from);
         let _ = self.status_tx.send(RegistrationStatus::Revoked);
-        Ok(())
+        result.map(|_| ())
     }
 }
 
@@ -248,7 +248,17 @@ impl EtcdDiscoveryConfig {
             &self.prefix,
             &self.cluster_id,
             &ServiceKind::try_new("probe")?,
-        )?;
+        )
+        .map_err(|error| DiscoveryError::InvalidDiscoveryConfig(error.to_string()))?;
+        if self
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.trim() != endpoint)
+        {
+            return Err(DiscoveryError::InvalidDiscoveryConfig(
+                "etcd endpoints must not contain leading or trailing whitespace".to_string(),
+            ));
+        }
         if self.connect_timeout_ms == 0 {
             return Err(DiscoveryError::InvalidDiscoveryConfig(
                 "connect_timeout_ms must be > 0".to_string(),
@@ -351,6 +361,7 @@ impl EtcdServiceResolver {
                 }
             }
         }
+        sort_endpoints(&mut endpoints);
         Ok(ServiceSnapshot {
             kind,
             revision,
@@ -765,6 +776,14 @@ async fn watch_once(
         }
 
         let events = response.events();
+        if response.created() && events.is_empty() {
+            snapshot.stale = false;
+            snapshot.last_update_ms = now_millis();
+            reader.replace_snapshot(snapshot.clone()).await;
+            watch_confirmed = true;
+            continue;
+        }
+
         if let Some(header) = response.header() {
             snapshot.revision = header.revision();
         }
@@ -830,7 +849,9 @@ async fn watch_once(
                     if parsed_key.kind != kind {
                         continue;
                     }
-                    remove_endpoint(&mut snapshot.endpoints, &parsed_key.service_id);
+                    if !remove_endpoint(&mut snapshot.endpoints, &parsed_key.service_id) {
+                        continue;
+                    }
                     snapshot.stale = false;
                     snapshot.last_update_ms = now_millis();
                     reader.replace_snapshot(snapshot.clone()).await;
@@ -870,12 +891,19 @@ fn upsert_endpoint(endpoints: &mut Vec<ServiceEndpoint>, endpoint: ServiceEndpoi
         true
     } else {
         endpoints.push(endpoint);
+        sort_endpoints(endpoints);
         false
     }
 }
 
-fn remove_endpoint(endpoints: &mut Vec<ServiceEndpoint>, service_id: &str) {
+fn sort_endpoints(endpoints: &mut [ServiceEndpoint]) {
+    endpoints.sort_by(|left, right| left.id.cmp(&right.id));
+}
+
+fn remove_endpoint(endpoints: &mut Vec<ServiceEndpoint>, service_id: &str) -> bool {
+    let original_len = endpoints.len();
     endpoints.retain(|endpoint| endpoint.id != service_id);
+    endpoints.len() != original_len
 }
 
 fn now_millis() -> u64 {
@@ -916,17 +944,22 @@ mod tests {
     #[test]
     fn upsert_endpoint_reports_added_then_updated() {
         let mut endpoints = Vec::new();
+        assert!(!upsert_endpoint(&mut endpoints, endpoint("mds-2")));
         assert!(!upsert_endpoint(&mut endpoints, endpoint("mds-1")));
+        assert_eq!(endpoints[0].id, "mds-1");
+        assert_eq!(endpoints[1].id, "mds-2");
         assert!(upsert_endpoint(&mut endpoints, endpoint("mds-1")));
-        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints.len(), 2);
     }
 
     #[test]
     fn remove_endpoint_drops_matching_id() {
         let mut endpoints = vec![endpoint("mds-1"), endpoint("mds-2")];
-        remove_endpoint(&mut endpoints, "mds-1");
+        assert!(remove_endpoint(&mut endpoints, "mds-1"));
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].id, "mds-2");
+        assert!(!remove_endpoint(&mut endpoints, "missing"));
+        assert_eq!(endpoints.len(), 1);
     }
 
     #[test]
@@ -990,5 +1023,25 @@ mod tests {
         );
         config.watch_reconnect_jitter_ratio = f64::NAN;
         assert!(config.validate().is_err());
+
+        let config = EtcdDiscoveryConfig::new(
+            vec![" http://127.0.0.1:2379".to_string()],
+            "/curvine",
+            "test-cluster",
+        );
+        assert!(matches!(
+            config.validate(),
+            Err(DiscoveryError::InvalidDiscoveryConfig(_))
+        ));
+
+        let config = EtcdDiscoveryConfig::new(
+            vec!["http://127.0.0.1:2379".to_string()],
+            "curvine",
+            "test-cluster",
+        );
+        assert!(matches!(
+            config.validate(),
+            Err(DiscoveryError::InvalidDiscoveryConfig(_))
+        ));
     }
 }

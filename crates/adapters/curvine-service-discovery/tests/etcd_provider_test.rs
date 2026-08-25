@@ -280,7 +280,15 @@ fn etcd_resolver_watch_skips_malformed_key_and_continues() {
         let mut bad_key = format!("{prefix}/test-cluster/services/mds/").into_bytes();
         bad_key.push(0xff);
         client
-            .put(bad_key, b"not-json".to_vec(), Some(PutOptions::new()))
+            .put(
+                bad_key.clone(),
+                b"not-json".to_vec(),
+                Some(PutOptions::new()),
+            )
+            .await
+            .unwrap();
+        client
+            .delete(bad_key, Some(DeleteOptions::new()))
             .await
             .unwrap();
         client

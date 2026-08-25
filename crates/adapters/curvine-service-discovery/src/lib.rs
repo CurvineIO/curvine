@@ -17,7 +17,8 @@ pub use self::error::{DiscoveryError, DiscoveryResult};
 pub use self::etcd_provider::{EtcdDiscoveryConfig, EtcdServiceRegistry, EtcdServiceResolver};
 pub use self::key::{normalize_prefix, validate_cluster_id, ServiceKey};
 pub use self::registry::{
-    RegistrationGuard, RegistrationOptions, RegistrationStatus, ServiceRegistry,
+    RegistrationControl, RegistrationGuard, RegistrationOptions, RegistrationStatus,
+    ServiceRegistry,
 };
 pub use self::resolver::{
     ServiceResolver, ServiceResolverHandle, ServiceWatch, ServiceWatchEvent, SnapshotReader,
