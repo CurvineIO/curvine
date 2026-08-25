@@ -60,7 +60,7 @@ pub struct EnvOverride {
 }
 
 /// Hostname-related env allowlist. Applied only when `net_interface` is unset
-/// (see [`apply_env_layer`]); values are trimmed before use, matching the
+/// (see [`apply_env_layer_with`]); values are trimmed before use, matching the
 /// historical behavior.
 pub const ENV_HOSTNAME_OVERRIDES: &[EnvOverride] = &[
     EnvOverride {
@@ -98,8 +98,10 @@ pub fn read_file_text<T: AsRef<str>>(path: T) -> CommonResult<String> {
 /// Builds the effective pre-deserialization document:
 /// file TOML → deep-merge overlays → environment layer.
 ///
-/// `overlays` are applied in order, each on top of the previous result
-/// (reserved for future formats / runtime overlay layers).
+/// `overlays` are applied in order, each on top of the previous result.
+/// Reserved for alternative file formats or other sources that rank BELOW
+/// the environment layer; the future admin/runtime overlay ranks ABOVE it
+/// and will be merged between [`apply_env_layer_with`] and deserialization.
 pub fn build_document(file_text: &str, overlays: &[toml::Value]) -> CommonResult<toml::Value> {
     build_document_with(file_text, overlays, &real_env_lookup)
 }
@@ -180,7 +182,14 @@ pub fn apply_env_layer_with(
     // Persist the trim decision into the document: after deserialization,
     // `ClusterConf.net_interface` must agree with what this layer decided,
     // instead of relying on a later normalize step to reconcile " " vs "".
-    if doc.get(NET_INTERFACE_KEY).is_some() {
+    // Only string values are rewritten; a non-string `net_interface` (config
+    // typo) is left untouched so deserialization fails with the native type
+    // error instead of being silently coerced into an empty value here.
+    let is_raw_string = doc
+        .get(NET_INTERFACE_KEY)
+        .map(toml::Value::is_str)
+        .unwrap_or(false);
+    if is_raw_string {
         set_dotted(
             doc,
             NET_INTERFACE_KEY,
@@ -521,6 +530,27 @@ mod tests {
         assert_eq!(doc_string(&doc, &[NET_INTERFACE_KEY]), Some(String::new()));
         let conf: ClusterConf = doc.try_into().unwrap();
         assert_eq!(conf.net_interface, "");
+    }
+
+    // A non-string net_interface (config typo) must keep failing with the
+    // native serde type error — the trim-persist step must not silently
+    // coerce it into an empty value.
+    #[test]
+    fn nonstring_net_interface_is_not_silently_coerced() {
+        let mut doc: toml::Value = toml::from_str("net_interface = 5").unwrap();
+        apply_env_layer_with(&mut doc, LoadProfile::Full, &|_| None).unwrap();
+
+        assert_eq!(doc.get(NET_INTERFACE_KEY).unwrap().as_integer(), Some(5));
+        let res: Result<ClusterConf, _> = doc.try_into();
+        let err = match res {
+            Ok(_) => panic!("non-string net_interface must fail deserialization"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{}", err).contains("net_interface"),
+            "type error should name the field: {}",
+            err
+        );
     }
 
     // The NIC-precedence path from #1619's test plan: a set net_interface wins
