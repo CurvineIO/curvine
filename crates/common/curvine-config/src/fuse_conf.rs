@@ -105,7 +105,14 @@ pub struct FuseConf {
     // Read and write file request queue size, default is 0
     pub stream_channel_size: usize,
 
-    // Mount the configuration, needs to be passed to the linux kernel.
+    // Mount options for Curvine's direct Linux FUSE backend. Supported VFS
+    // pairs are `ro`/`rw`, `nodev`/`dev`, `nosuid`/`suid`, `noexec`/`exec`,
+    // `noatime`/`atime`, and `sync`/`async`; `dirsync` is also supported.
+    // Supported FUSE-side options are `allow_other`, `default_permissions`, and
+    // `big_write` (negotiated through FUSE_INIT). Opposite options conflict, and
+    // explicit `rw` also conflicts with `readonly = true`.
+    // Legacy libfuse options `auto_unmount`, `allow_root`, and `max_write` are
+    // not supported in this field by the direct mount backend.
     pub fuse_opts: Vec<String>,
 
     // Mount the whole FUSE filesystem read-only at the kernel level.
@@ -517,13 +524,123 @@ impl FuseConf {
         args
     }
 
-    pub fn set_fuse_opts(&self, mount_options: &mut String) {
-        let mut ro_added = false;
-        let mut default_permissions_added = false;
-        if self.readonly {
-            mount_options.push_str(",ro");
-            ro_added = true;
+    fn normalized_fuse_opts(opts: &[String]) -> CommonResult<Vec<String>> {
+        let mut normalized = Vec::new();
+
+        for entry in opts {
+            for raw_opt in entry.split(',') {
+                let raw_opt = raw_opt.trim();
+                if raw_opt.is_empty() {
+                    return err_box!(
+                        "FUSE mount option is empty in '{}'; remove empty comma-separated entries",
+                        entry
+                    );
+                }
+
+                let (name, value) = match raw_opt.split_once('=') {
+                    Some((name, value)) => (name.trim(), Some(value.trim())),
+                    None => (raw_opt, None),
+                };
+
+                let option = match name {
+                    "ro"
+                    | "rw"
+                    | "nodev"
+                    | "dev"
+                    | "nosuid"
+                    | "suid"
+                    | "noexec"
+                    | "exec"
+                    | "noatime"
+                    | "atime"
+                    | "dirsync"
+                    | "sync"
+                    | "allow_other"
+                    | "default_permissions"
+                    | "async"
+                    | "big_write" => {
+                        if value.is_some() {
+                            return err_box!(
+                                "FUSE mount option '{}' does not accept a value",
+                                raw_opt
+                            );
+                        }
+                        name.to_string()
+                    }
+                    // These names are known FUSE/libfuse options, but the direct
+                    // mount backend cannot implement their required semantics.
+                    "allow_root" | "max_write" | "auto_unmount" => {
+                        return err_box!(
+                            "FUSE mount option '{}' is recognized but not supported by the direct mount backend",
+                            raw_opt
+                        );
+                    }
+                    _ => return err_box!("Unknown FUSE mount option '{}'", raw_opt),
+                };
+
+                let conflicting_option = match option.as_str() {
+                    "ro" => Some("rw"),
+                    "rw" => Some("ro"),
+                    "nodev" => Some("dev"),
+                    "dev" => Some("nodev"),
+                    "nosuid" => Some("suid"),
+                    "suid" => Some("nosuid"),
+                    "noexec" => Some("exec"),
+                    "exec" => Some("noexec"),
+                    "noatime" => Some("atime"),
+                    "atime" => Some("noatime"),
+                    "sync" => Some("async"),
+                    "async" => Some("sync"),
+                    _ => None,
+                };
+                if let Some(conflicting_option) = conflicting_option {
+                    if normalized.iter().any(|item| item == conflicting_option) {
+                        return err_box!(
+                            "FUSE mount options '{}' and '{}' conflict; specify only one",
+                            conflicting_option,
+                            raw_opt
+                        );
+                    }
+                }
+
+                if !normalized.contains(&option) {
+                    normalized.push(option);
+                }
+            }
         }
+
+        Ok(normalized)
+    }
+
+    fn validate_fuse_opts_against_config(&self, opts: &[String]) -> CommonResult<()> {
+        if self.readonly && opts.iter().any(|option| option == "rw") {
+            return err_box!(
+                "FUSE mount option 'rw' conflicts with fuse.readonly=true; remove 'rw' or disable fuse.readonly"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Normalize and validate mount options after config-file values, CLI
+    /// overrides, and defaults have been merged for the FUSE process. Generic
+    /// cluster loading deliberately does not call this method because master and
+    /// worker processes do not consume FUSE mount options.
+    pub fn normalize_fuse_opts(&mut self) -> CommonResult<()> {
+        let opts = Self::normalized_fuse_opts(&self.fuse_opts)?;
+        self.validate_fuse_opts_against_config(&opts)?;
+        self.fuse_opts = opts;
+        Ok(())
+    }
+
+    /// Appends options that belong in the FUSE mount data string. Linux VFS
+    /// options (`ro`/`rw`, `nodev`/`dev`, `nosuid`/`suid`, `noexec`/`exec`,
+    /// `noatime`/`atime`, `dirsync`, and `sync`/`async`) are deliberately handled
+    /// as `mount(2)` flags, or as the absence of a flag, by the raw backend.
+    pub fn set_fuse_opts(&self, mount_options: &mut String) -> CommonResult<()> {
+        let opts = Self::normalized_fuse_opts(&self.fuse_opts)?;
+        self.validate_fuse_opts_against_config(&opts)?;
+        let mut default_permissions_added = false;
 
         // The kernel can distinguish an executable load from a normal read while
         // FUSE_OPEN only exposes O_RDONLY for both. Keep permission enforcement in
@@ -533,34 +650,31 @@ impl FuseConf {
             default_permissions_added = true;
         }
 
-        self.fuse_opts.iter().for_each(|opt| match opt.as_str() {
-            "ro" => {
-                if !ro_added {
-                    mount_options.push_str(",ro");
-                    ro_added = true;
+        for opt in opts {
+            match opt.as_str() {
+                // VFS options are converted to mount(2) flags in fuse_pure.rs;
+                // positive/default forms such as `rw` and `async` mean the
+                // corresponding restrictive flag is absent. `big_write` is
+                // negotiated through FUSE_INIT and is already in
+                // SUPPORTED_INIT_FLAGS. None belongs in kernel mount data.
+                "ro" | "rw" | "nodev" | "dev" | "nosuid" | "suid" | "noexec" | "exec"
+                | "noatime" | "atime" | "dirsync" | "sync" | "async" | "big_write" => {}
+                "default_permissions" => {
+                    if !default_permissions_added {
+                        mount_options.push_str(",default_permissions");
+                        default_permissions_added = true;
+                    }
                 }
-            }
-            "default_permissions" => {
-                if !default_permissions_added {
-                    mount_options.push_str(",default_permissions");
-                    default_permissions_added = true;
+                "allow_other" => {
+                    mount_options.push(',');
+                    mount_options.push_str(&opt);
                 }
+                // normalized_fuse_opts rejects unsupported and unknown options.
+                _ => unreachable!("validated FUSE mount option: {}", opt),
             }
-            "allow_other" => {
-                mount_options.push_str(",allow_other");
-            }
-            "allow_root" => {
-                mount_options.push_str(",allow_root");
-            }
-            "async" => {
-                mount_options.push_str(",async");
-            }
-            _ => {}
-        });
-    }
+        }
 
-    pub fn auto_umount(&self) -> bool {
-        self.fuse_opts.iter().any(|s| s == "auto_unmount")
+        Ok(())
     }
 }
 
@@ -913,30 +1027,174 @@ max_readahead_kb = 1024
     }
 
     #[test]
-    fn readonly_adds_ro_mount_option() {
-        let conf = FuseConf {
-            readonly: true,
+    fn normalize_fuse_opts_splits_comma_separated_options() {
+        let mut conf = FuseConf {
+            fuse_opts: vec![" allow_other , nodev ".to_string()],
             ..Default::default()
         };
-        let mut mount_options = String::new();
-        conf.set_fuse_opts(&mut mount_options);
-        assert!(mount_options.split(',').any(|opt| opt == "ro"));
+
+        conf.normalize_fuse_opts()
+            .expect("supported options must be accepted");
+
+        assert_eq!(conf.fuse_opts, vec!["allow_other", "nodev"]);
     }
 
     #[test]
-    fn readonly_does_not_duplicate_ro_mount_option() {
-        let conf = FuseConf {
-            readonly: true,
-            fuse_opts: vec!["ro".to_string()],
+    fn normalize_fuse_opts_deduplicates_options() {
+        let mut conf = FuseConf {
+            fuse_opts: vec!["allow_other,nodev".to_string(), "nodev".to_string()],
             ..Default::default()
         };
-        let mut mount_options = String::new();
-        conf.set_fuse_opts(&mut mount_options);
 
-        assert_eq!(
-            mount_options.split(',').filter(|opt| *opt == "ro").count(),
-            1
+        conf.normalize_fuse_opts()
+            .expect("supported options must be accepted");
+
+        assert_eq!(conf.fuse_opts, vec!["allow_other", "nodev"]);
+    }
+
+    #[test]
+    fn normalize_fuse_opts_rejects_conflicting_sync_and_async_options() {
+        let cases: &[&[&str]] = &[
+            &["sync,async"],
+            &["async,sync"],
+            &["sync", "async"],
+            &["async", "sync"],
+        ];
+
+        for options in cases {
+            let mut conf = FuseConf {
+                fuse_opts: options.iter().map(|option| option.to_string()).collect(),
+                ..Default::default()
+            };
+
+            let err = conf
+                .normalize_fuse_opts()
+                .expect_err("sync and async must not be accepted together");
+            let message = err.to_string();
+            assert!(message.contains("sync"), "unexpected error: {}", err);
+            assert!(message.contains("async"), "unexpected error: {}", err);
+            assert!(message.contains("conflict"), "unexpected error: {}", err);
+        }
+    }
+
+    #[test]
+    fn normalize_fuse_opts_rejects_rw_when_readonly_is_enabled() {
+        let mut conf = FuseConf {
+            readonly: true,
+            fuse_opts: vec!["rw".to_string()],
+            ..Default::default()
+        };
+
+        let err = conf
+            .normalize_fuse_opts()
+            .expect_err("rw must conflict with fuse.readonly=true");
+        let message = err.to_string();
+        assert!(message.contains("rw"), "unexpected error: {message}");
+        assert!(message.contains("readonly"), "unexpected error: {message}");
+        assert!(message.contains("conflict"), "unexpected error: {message}");
+    }
+
+    #[test]
+    fn normalize_fuse_opts_rejects_unknown_option_with_name() {
+        let mut conf = FuseConf {
+            fuse_opts: vec!["allow_other,unknown_option".to_string()],
+            ..Default::default()
+        };
+
+        let err = conf
+            .normalize_fuse_opts()
+            .expect_err("unknown option must be rejected");
+        assert!(
+            err.to_string().contains("unknown_option"),
+            "unexpected error: {}",
+            err
         );
+    }
+
+    #[test]
+    fn normalize_fuse_opts_rejects_auto_unmount_as_unsupported() {
+        let mut conf = FuseConf {
+            fuse_opts: vec!["auto_unmount".to_string()],
+            ..Default::default()
+        };
+
+        let err = conf
+            .normalize_fuse_opts()
+            .expect_err("auto_unmount is not implemented by the direct backend");
+        let message = err.to_string();
+        assert!(
+            message.contains("auto_unmount"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            message.contains("direct mount backend"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn normalize_fuse_opts_rejects_unimplemented_options_with_name() {
+        for option in ["allow_root", "max_write=131072"] {
+            let mut conf = FuseConf {
+                fuse_opts: vec![option.to_string()],
+                ..Default::default()
+            };
+
+            let err = conf
+                .normalize_fuse_opts()
+                .expect_err("unimplemented option must be rejected");
+            let message = err.to_string();
+            assert!(
+                message.contains(option),
+                "error must include '{}': {}",
+                option,
+                err
+            );
+            assert!(
+                message.contains("direct mount backend"),
+                "unexpected error: {}",
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn vfs_options_do_not_enter_fuse_mount_data() {
+        let mut conf = FuseConf {
+            readonly: true,
+            fuse_opts: vec!["ro,nodev,nosuid,noexec,noatime,dirsync,sync".to_string()],
+            check_permission: false,
+            ..Default::default()
+        };
+        conf.init().expect("supported VFS options must be accepted");
+        let mut mount_options = String::new();
+
+        conf.set_fuse_opts(&mut mount_options)
+            .expect("validated options must build mount data");
+
+        assert!(mount_options.is_empty());
+    }
+
+    #[test]
+    fn supported_fuse_parameters_enter_mount_data() {
+        let mut conf = FuseConf {
+            fuse_opts: vec!["allow_other,async,big_write".to_string()],
+            check_permission: false,
+            ..Default::default()
+        };
+        conf.init()
+            .expect("supported FUSE parameters must be accepted");
+        let mut mount_options = String::new();
+
+        conf.set_fuse_opts(&mut mount_options)
+            .expect("validated options must build mount data");
+
+        assert!(mount_options.split(',').any(|item| item == "allow_other"));
+        assert!(!mount_options
+            .split(',')
+            .any(|item| matches!(item, "async" | "big_write")));
     }
 
     #[test]
@@ -946,7 +1204,8 @@ max_readahead_kb = 1024
             ..Default::default()
         };
         let mut mount_options = String::new();
-        conf.set_fuse_opts(&mut mount_options);
+        conf.set_fuse_opts(&mut mount_options)
+            .expect("default config must build mount data");
 
         assert_eq!(
             mount_options
@@ -965,7 +1224,8 @@ max_readahead_kb = 1024
             ..Default::default()
         };
         let mut mount_options = String::new();
-        conf.set_fuse_opts(&mut mount_options);
+        conf.set_fuse_opts(&mut mount_options)
+            .expect("supported option must build mount data");
 
         assert_eq!(
             mount_options
@@ -983,7 +1243,8 @@ max_readahead_kb = 1024
             ..Default::default()
         };
         let mut mount_options = String::new();
-        conf.set_fuse_opts(&mut mount_options);
+        conf.set_fuse_opts(&mut mount_options)
+            .expect("default config must build mount data");
 
         assert!(!mount_options
             .split(',')

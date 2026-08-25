@@ -110,7 +110,7 @@ data:
       exit 1
     fi
 
-    CURVINE_FUSE_EXTRA=(--options async --options auto_unmount)
+    CURVINE_FUSE_EXTRA=(--options async)
     if [ "${FUSE_USE_DEFAULT_OPTS:-0}" = 1 ]; then
       CURVINE_FUSE_EXTRA=()
     fi
