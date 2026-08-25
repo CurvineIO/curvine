@@ -475,6 +475,15 @@ fn etcd_registry_reports_keepalive_lost_after_external_revoke() {
         let mut client = Client::connect([etcd_addr.clone()], None).await.unwrap();
 
         client.lease_revoke(guard.lease_id()).await.unwrap();
+        let error = guard
+            .update_status(ServiceStatus::Draining)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            curvine_service_discovery::DiscoveryError::RegistrationLost(_)
+        ));
+
         timeout(Duration::from_secs(5), async {
             loop {
                 status_rx.changed().await.unwrap();
@@ -489,14 +498,6 @@ fn etcd_registry_reports_keepalive_lost_after_external_revoke() {
         .await
         .expect("keepalive lost status timed out");
 
-        let error = guard
-            .update_status(ServiceStatus::Draining)
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            curvine_service_discovery::DiscoveryError::RegistrationLost(_)
-        ));
         client_delete_prefix(etcd_addr, prefix).await;
     });
 }

@@ -9,14 +9,37 @@ pub trait ServiceResolver: Send + Sync {
     async fn watch(&self, kind: ServiceKind) -> DiscoveryResult<ServiceResolverHandle>;
 }
 
-pub type ServiceWatch = mpsc::Receiver<DiscoveryResult<ServiceWatchEvent>>;
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServiceWatchEvent {
     Added(ServiceEndpoint),
     Updated(ServiceEndpoint),
     Removed { kind: ServiceKind, id: String },
     Reset(ServiceSnapshot),
+}
+
+pub struct ServiceWatch {
+    events: mpsc::Receiver<DiscoveryResult<ServiceWatchEvent>>,
+    _lifecycle_owner: Option<Arc<dyn Send + Sync>>,
+}
+
+impl ServiceWatch {
+    pub fn new(events: mpsc::Receiver<DiscoveryResult<ServiceWatchEvent>>) -> Self {
+        Self::with_lifecycle_owner(events, None)
+    }
+
+    pub fn with_lifecycle_owner(
+        events: mpsc::Receiver<DiscoveryResult<ServiceWatchEvent>>,
+        lifecycle_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Self {
+        Self {
+            events,
+            _lifecycle_owner: lifecycle_owner,
+        }
+    }
+
+    pub async fn recv(&mut self) -> Option<DiscoveryResult<ServiceWatchEvent>> {
+        self.events.recv().await
+    }
 }
 
 pub struct ServiceResolverHandle {
@@ -27,20 +50,24 @@ pub struct ServiceResolverHandle {
 }
 
 impl ServiceResolverHandle {
-    pub fn new(kind: ServiceKind, reader: SnapshotReader, events: ServiceWatch) -> Self {
+    pub fn new(
+        kind: ServiceKind,
+        reader: SnapshotReader,
+        events: mpsc::Receiver<DiscoveryResult<ServiceWatchEvent>>,
+    ) -> Self {
         Self::with_lifecycle_owner(kind, reader, events, None)
     }
 
     pub fn with_lifecycle_owner(
         kind: ServiceKind,
         reader: SnapshotReader,
-        events: ServiceWatch,
+        events: mpsc::Receiver<DiscoveryResult<ServiceWatchEvent>>,
         lifecycle_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Self {
         Self {
             kind,
             reader,
-            events,
+            events: ServiceWatch::with_lifecycle_owner(events, lifecycle_owner.clone()),
             _lifecycle_owner: lifecycle_owner,
         }
     }
@@ -180,5 +207,26 @@ mod tests {
             handle.next_event().await,
             Some(Ok(ServiceWatchEvent::Removed { .. }))
         ));
+    }
+
+    #[tokio::test]
+    async fn resolver_events_keep_lifecycle_owner_after_split() {
+        let (_tx, rx) = mpsc::channel(1);
+        let owner = Arc::new(());
+        let reader = SnapshotReader::new(snapshot(false), true);
+        let handle = ServiceResolverHandle::with_lifecycle_owner(
+            ServiceKind::try_new("mds").unwrap(),
+            reader,
+            rx,
+            Some(owner.clone()),
+        );
+
+        assert_eq!(Arc::strong_count(&owner), 3);
+        let (reader, events) = handle.into_parts();
+        drop(reader);
+
+        assert_eq!(Arc::strong_count(&owner), 2);
+        drop(events);
+        assert_eq!(Arc::strong_count(&owner), 1);
     }
 }

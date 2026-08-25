@@ -110,13 +110,14 @@ impl ServiceRegistry for EtcdServiceResolver {
         let service_id = endpoint.id.clone();
         let (status_tx, status_rx) = watch::channel(RegistrationStatus::Registered);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let client = Arc::new(Mutex::new(client));
         let control = Arc::new(EtcdRegistrationControl {
             key,
             lease_id,
-            client: Mutex::new(client),
+            client: client.clone(),
             endpoint: Mutex::new(endpoint),
             status_tx: status_tx.clone(),
-            shutdown_tx,
+            shutdown_tx: shutdown_tx.clone(),
         });
 
         self.rt.spawn(keepalive_loop(
@@ -124,9 +125,12 @@ impl ServiceRegistry for EtcdServiceResolver {
             service_id.clone(),
             options.keep_alive_interval_secs,
             self.config.request_timeout_ms,
+            lease_id,
+            client,
             keeper,
             stream,
             status_tx,
+            shutdown_tx,
             shutdown_rx,
         ));
 
@@ -144,7 +148,7 @@ impl ServiceRegistry for EtcdServiceResolver {
 struct EtcdRegistrationControl {
     key: String,
     lease_id: i64,
-    client: Mutex<Client>,
+    client: Arc<Mutex<Client>>,
     endpoint: Mutex<ServiceEndpoint>,
     status_tx: watch::Sender<RegistrationStatus>,
     shutdown_tx: watch::Sender<bool>,
@@ -153,10 +157,22 @@ struct EtcdRegistrationControl {
 #[async_trait]
 impl RegistrationControl for EtcdRegistrationControl {
     async fn update_endpoint(&self, endpoint: ServiceEndpoint) -> DiscoveryResult<()> {
-        let value = encode_endpoint_value(&endpoint)?;
         let mut current = self.endpoint.lock().await;
+        if endpoint.kind != current.kind || endpoint.id != current.id {
+            return Err(DiscoveryError::InvalidEndpointValue(format!(
+                "endpoint kind/id must match existing registration: expected {}/{}, got {}/{}",
+                current.kind, current.id, endpoint.kind, endpoint.id
+            )));
+        }
+        let value = encode_endpoint_value(&endpoint)?;
         let mut client = self.client.lock().await;
-        put_endpoint_if_owned(&mut client, &self.key, value, self.lease_id).await?;
+        if let Err(error) =
+            put_endpoint_if_owned(&mut client, &self.key, value, self.lease_id).await
+        {
+            drop(client);
+            self.mark_registration_lost(&error).await;
+            return Err(error);
+        }
         *current = endpoint;
         Ok(())
     }
@@ -167,7 +183,13 @@ impl RegistrationControl for EtcdRegistrationControl {
         updated.status = status;
         let value = encode_endpoint_value(&updated)?;
         let mut client = self.client.lock().await;
-        put_endpoint_if_owned(&mut client, &self.key, value, self.lease_id).await?;
+        if let Err(error) =
+            put_endpoint_if_owned(&mut client, &self.key, value, self.lease_id).await
+        {
+            drop(client);
+            self.mark_registration_lost(&error).await;
+            return Err(error);
+        }
         *endpoint = updated;
         Ok(())
     }
@@ -180,8 +202,26 @@ impl RegistrationControl for EtcdRegistrationControl {
             .lease_revoke(self.lease_id)
             .await
             .map_err(DiscoveryError::from);
-        let _ = self.status_tx.send(RegistrationStatus::Revoked);
-        result.map(|_| ())
+        match result {
+            Ok(_) => {
+                let _ = self.status_tx.send(RegistrationStatus::Revoked);
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl EtcdRegistrationControl {
+    async fn mark_registration_lost(&self, error: &DiscoveryError) {
+        if matches!(error, DiscoveryError::RegistrationLost(_)) {
+            let _ = self.shutdown_tx.send(true);
+            let _ = self.status_tx.send(RegistrationStatus::KeepAliveLost {
+                message: error.to_string(),
+            });
+            let mut client = self.client.lock().await;
+            revoke_lease_best_effort(&mut client, self.lease_id).await;
+        }
     }
 }
 
@@ -438,7 +478,7 @@ where
 
 async fn revoke_lease_best_effort(client: &mut Client, lease_id: i64) {
     if let Err(error) = client.lease_revoke(lease_id).await {
-        log::warn!("failed to revoke discovery lease after register failure: lease_id={lease_id}, error={error}");
+        log::warn!("failed to revoke discovery lease: lease_id={lease_id}, error={error}");
     }
 }
 
@@ -448,9 +488,12 @@ async fn keepalive_loop(
     service_id: String,
     keep_alive_interval_secs: u64,
     request_timeout_ms: u64,
+    lease_id: i64,
+    client: Arc<Mutex<Client>>,
     mut keeper: LeaseKeeper,
     mut stream: LeaseKeepAliveStream,
     status_tx: watch::Sender<RegistrationStatus>,
+    shutdown_tx: watch::Sender<bool>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(keep_alive_interval_secs));
@@ -473,13 +516,29 @@ async fn keepalive_loop(
                     }
                     result = keeper.keep_alive() => {
                         if let Err(error) = result {
-                            if record_keepalive_failure(
-                                &status_tx,
+                            if !recover_keepalive_session(
+                                &client,
+                                lease_id,
+                                request_timeout,
+                                &mut keeper,
+                                &mut stream,
                                 &kind,
                                 &service_id,
                                 &mut consecutive_failures,
                                 error.to_string(),
-                            ) {
+                            )
+                            .await
+                            {
+                                mark_keepalive_lost_and_revoke(
+                                    &client,
+                                    lease_id,
+                                    &status_tx,
+                                    &shutdown_tx,
+                                    &kind,
+                                    &service_id,
+                                    "lease keepalive request failed and recovery exhausted".to_string(),
+                                )
+                                .await;
                                 return;
                             }
                             continue;
@@ -500,42 +559,96 @@ async fn keepalive_loop(
                         consecutive_failures = 0;
                     }
                     Ok(Ok(Some(response))) => {
-                        mark_keepalive_lost(
+                        mark_keepalive_lost_and_revoke(
+                            &client,
+                            lease_id,
                             &status_tx,
+                            &shutdown_tx,
                             &kind,
                             &service_id,
                             format!("lease keepalive returned non-positive ttl: {}", response.ttl()),
-                        );
+                        )
+                        .await;
                         return;
                     }
                     Ok(Ok(None)) => {
-                        mark_keepalive_lost(
-                            &status_tx,
+                        if !recover_keepalive_session(
+                            &client,
+                            lease_id,
+                            request_timeout,
+                            &mut keeper,
+                            &mut stream,
                             &kind,
                             &service_id,
+                            &mut consecutive_failures,
                             "lease keepalive stream closed".to_string(),
-                        );
-                        return;
+                        )
+                        .await
+                        {
+                            mark_keepalive_lost_and_revoke(
+                                &client,
+                                lease_id,
+                                &status_tx,
+                                &shutdown_tx,
+                                &kind,
+                                &service_id,
+                                "lease keepalive stream closed and recovery exhausted".to_string(),
+                            )
+                            .await;
+                            return;
+                        }
                     }
                     Ok(Err(error)) => {
-                        if record_keepalive_failure(
-                            &status_tx,
+                        if !recover_keepalive_session(
+                            &client,
+                            lease_id,
+                            request_timeout,
+                            &mut keeper,
+                            &mut stream,
                             &kind,
                             &service_id,
                             &mut consecutive_failures,
                             error.to_string(),
-                        ) {
+                        )
+                        .await
+                        {
+                            mark_keepalive_lost_and_revoke(
+                                &client,
+                                lease_id,
+                                &status_tx,
+                                &shutdown_tx,
+                                &kind,
+                                &service_id,
+                                "lease keepalive stream failed and recovery exhausted".to_string(),
+                            )
+                            .await;
                             return;
                         }
                     }
                     Err(_) => {
-                        if record_keepalive_failure(
-                            &status_tx,
+                        if !recover_keepalive_session(
+                            &client,
+                            lease_id,
+                            request_timeout,
+                            &mut keeper,
+                            &mut stream,
                             &kind,
                             &service_id,
                             &mut consecutive_failures,
                             "lease keepalive response timed out".to_string(),
-                        ) {
+                        )
+                        .await
+                        {
+                            mark_keepalive_lost_and_revoke(
+                                &client,
+                                lease_id,
+                                &status_tx,
+                                &shutdown_tx,
+                                &kind,
+                                &service_id,
+                                "lease keepalive timed out and recovery exhausted".to_string(),
+                            )
+                            .await;
                             return;
                         }
                     }
@@ -545,8 +658,49 @@ async fn keepalive_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn recover_keepalive_session(
+    client: &Arc<Mutex<Client>>,
+    lease_id: i64,
+    request_timeout: Duration,
+    keeper: &mut LeaseKeeper,
+    stream: &mut LeaseKeepAliveStream,
+    kind: &ServiceKind,
+    service_id: &str,
+    consecutive_failures: &mut u32,
+    message: String,
+) -> bool {
+    log::warn!(
+        "etcd discovery registration keepalive failure; recreating session: kind={}, service_id={}, error={}",
+        kind,
+        service_id,
+        message
+    );
+
+    let mut client = client.lock().await;
+    match timeout(request_timeout, client.lease_keep_alive(lease_id)).await {
+        Ok(Ok((new_keeper, new_stream))) => {
+            *keeper = new_keeper;
+            *stream = new_stream;
+            *consecutive_failures = 0;
+            true
+        }
+        Ok(Err(error)) => !record_keepalive_failure(
+            kind,
+            service_id,
+            consecutive_failures,
+            format!("failed to recreate lease keepalive session: {error}"),
+        ),
+        Err(_) => !record_keepalive_failure(
+            kind,
+            service_id,
+            consecutive_failures,
+            "timed out recreating lease keepalive session".to_string(),
+        ),
+    }
+}
+
 fn record_keepalive_failure(
-    status_tx: &watch::Sender<RegistrationStatus>,
     kind: &ServiceKind,
     service_id: &str,
     consecutive_failures: &mut u32,
@@ -563,13 +717,15 @@ fn record_keepalive_failure(
     if *consecutive_failures < KEEPALIVE_FAILURE_THRESHOLD {
         false
     } else {
-        mark_keepalive_lost(status_tx, kind, service_id, message);
         true
     }
 }
 
-fn mark_keepalive_lost(
+async fn mark_keepalive_lost_and_revoke(
+    client: &Arc<Mutex<Client>>,
+    lease_id: i64,
     status_tx: &watch::Sender<RegistrationStatus>,
+    shutdown_tx: &watch::Sender<bool>,
     kind: &ServiceKind,
     service_id: &str,
     message: String,
@@ -581,6 +737,9 @@ fn mark_keepalive_lost(
         message
     );
     let _ = status_tx.send(RegistrationStatus::KeepAliveLost { message });
+    let _ = shutdown_tx.send(true);
+    let mut client = client.lock().await;
+    revoke_lease_best_effort(&mut client, lease_id).await;
 }
 
 async fn watch_loop(
@@ -775,6 +934,10 @@ async fn watch_once(
             )));
         }
 
+        if let Some(header) = response.header() {
+            snapshot.revision = header.revision();
+        }
+
         let events = response.events();
         if response.created() && events.is_empty() {
             snapshot.stale = false;
@@ -784,9 +947,7 @@ async fn watch_once(
             continue;
         }
 
-        if let Some(header) = response.header() {
-            snapshot.revision = header.revision();
-        }
+        let mut snapshot_published = false;
         for event in events {
             match event.event_type() {
                 EventType::Put => {
@@ -822,6 +983,7 @@ async fn watch_once(
                     snapshot.stale = false;
                     snapshot.last_update_ms = now_millis();
                     reader.replace_snapshot(snapshot.clone()).await;
+                    snapshot_published = true;
                     if tx.send(Ok(watch_event)).await.is_err() {
                         return Ok(());
                     }
@@ -855,6 +1017,7 @@ async fn watch_once(
                     snapshot.stale = false;
                     snapshot.last_update_ms = now_millis();
                     reader.replace_snapshot(snapshot.clone()).await;
+                    snapshot_published = true;
                     if tx
                         .send(Ok(ServiceWatchEvent::Removed {
                             kind: parsed_key.kind,
@@ -868,10 +1031,12 @@ async fn watch_once(
                 }
             }
         }
-        if !watch_confirmed {
+        if !snapshot_published {
             snapshot.stale = false;
             snapshot.last_update_ms = now_millis();
             reader.replace_snapshot(snapshot.clone()).await;
+        }
+        if !watch_confirmed {
             watch_confirmed = true;
         }
     }
