@@ -149,7 +149,10 @@ impl RegistrationGuard {
         self.control.update_status(status).await
     }
 
-    pub async fn shutdown(self) -> DiscoveryResult<()> {
+    pub async fn shutdown(&self) -> DiscoveryResult<()> {
+        if matches!(&*self.status_rx.borrow(), RegistrationStatus::Revoked) {
+            return Ok(());
+        }
         self.control.shutdown().await
     }
 
@@ -183,6 +186,7 @@ impl RegistrationGuard {
 mod tests {
     use super::*;
     use curvine_proto::ComponentInfoProto;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct NoopControl;
 
@@ -197,6 +201,26 @@ mod tests {
         }
 
         async fn shutdown(&self) -> DiscoveryResult<()> {
+            Ok(())
+        }
+    }
+
+    struct CountingControl {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl RegistrationControl for CountingControl {
+        async fn update_endpoint(&self, _endpoint: ServiceEndpoint) -> DiscoveryResult<()> {
+            Ok(())
+        }
+
+        async fn update_status(&self, _status: ServiceStatus) -> DiscoveryResult<()> {
+            Ok(())
+        }
+
+        async fn shutdown(&self) -> DiscoveryResult<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -296,5 +320,28 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, DiscoveryError::RegistrationLost(_)));
+    }
+
+    #[tokio::test]
+    async fn registration_guard_shutdown_is_retryable_and_revoked_is_idempotent() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (status_tx, rx) = watch::channel(RegistrationStatus::Registered);
+        let guard = RegistrationGuard::new(
+            ServiceKind::try_new("mds").unwrap(),
+            "mds-1",
+            10,
+            rx,
+            Arc::new(CountingControl {
+                calls: calls.clone(),
+            }),
+        );
+
+        guard.shutdown().await.unwrap();
+        guard.shutdown().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let _ = status_tx.send(RegistrationStatus::Revoked);
+        guard.shutdown().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

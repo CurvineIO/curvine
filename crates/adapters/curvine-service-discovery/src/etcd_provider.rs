@@ -216,11 +216,9 @@ impl EtcdRegistrationControl {
     async fn mark_registration_lost(&self, error: &DiscoveryError) {
         if matches!(error, DiscoveryError::RegistrationLost(_)) {
             let _ = self.shutdown_tx.send(true);
-            let _ = self.status_tx.send(RegistrationStatus::KeepAliveLost {
-                message: error.to_string(),
-            });
             let mut client = self.client.lock().await;
             revoke_lease_best_effort(&mut client, self.lease_id).await;
+            publish_keepalive_lost_if_active(&self.status_tx, error.to_string());
         }
     }
 }
@@ -514,8 +512,13 @@ async fn keepalive_loop(
                             return;
                         }
                     }
-                    result = keeper.keep_alive() => {
-                        if let Err(error) = result {
+                    result = timeout(request_timeout, keeper.keep_alive()) => {
+                        let keepalive_error = match result {
+                            Ok(Ok(_)) => None,
+                            Ok(Err(error)) => Some(error.to_string()),
+                            Err(_) => Some("lease keepalive request timed out".to_string()),
+                        };
+                        if let Some(error) = keepalive_error {
                             if !recover_keepalive_session(
                                 &client,
                                 lease_id,
@@ -525,7 +528,7 @@ async fn keepalive_loop(
                                 &kind,
                                 &service_id,
                                 &mut consecutive_failures,
-                                error.to_string(),
+                                error,
                             )
                             .await
                             {
@@ -714,11 +717,7 @@ fn record_keepalive_failure(
         *consecutive_failures,
         message
     );
-    if *consecutive_failures < KEEPALIVE_FAILURE_THRESHOLD {
-        false
-    } else {
-        true
-    }
+    *consecutive_failures >= KEEPALIVE_FAILURE_THRESHOLD
 }
 
 async fn mark_keepalive_lost_and_revoke(
@@ -736,10 +735,30 @@ async fn mark_keepalive_lost_and_revoke(
         service_id,
         message
     );
-    let _ = status_tx.send(RegistrationStatus::KeepAliveLost { message });
     let _ = shutdown_tx.send(true);
     let mut client = client.lock().await;
     revoke_lease_best_effort(&mut client, lease_id).await;
+    publish_keepalive_lost_if_active(status_tx, message);
+}
+
+fn publish_keepalive_lost_if_active(
+    status_tx: &watch::Sender<RegistrationStatus>,
+    message: String,
+) {
+    let mut message = Some(message);
+    status_tx.send_if_modified(|status| {
+        if matches!(
+            status,
+            RegistrationStatus::Revoking | RegistrationStatus::Revoked
+        ) {
+            false
+        } else {
+            *status = RegistrationStatus::KeepAliveLost {
+                message: message.take().unwrap_or_default(),
+            };
+            true
+        }
+    });
 }
 
 async fn watch_loop(
@@ -1157,6 +1176,24 @@ mod tests {
         config.watch_reconnect_jitter_ratio = 1.0;
 
         assert_eq!(reconnect_delay_ms(&config, 1, 0), u64::MAX);
+    }
+
+    #[test]
+    fn keepalive_lost_publish_does_not_override_shutdown_states() {
+        let (status_tx, status_rx) = watch::channel(RegistrationStatus::Registered);
+        publish_keepalive_lost_if_active(&status_tx, "lost".to_string());
+        assert!(matches!(
+            &*status_rx.borrow(),
+            RegistrationStatus::KeepAliveLost { .. }
+        ));
+
+        let (status_tx, status_rx) = watch::channel(RegistrationStatus::Revoking);
+        publish_keepalive_lost_if_active(&status_tx, "lost".to_string());
+        assert_eq!(*status_rx.borrow(), RegistrationStatus::Revoking);
+
+        let (status_tx, status_rx) = watch::channel(RegistrationStatus::Revoked);
+        publish_keepalive_lost_if_active(&status_tx, "lost".to_string());
+        assert_eq!(*status_rx.borrow(), RegistrationStatus::Revoked);
     }
 
     #[test]

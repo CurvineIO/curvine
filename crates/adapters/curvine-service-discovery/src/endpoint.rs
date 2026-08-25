@@ -111,6 +111,11 @@ impl ServiceEndpoint {
                 "host must not be empty".to_string(),
             ));
         }
+        if self.host.trim() != self.host || self.host.chars().any(char::is_whitespace) {
+            return Err(DiscoveryError::InvalidEndpointValue(
+                "host must not contain whitespace".to_string(),
+            ));
+        }
         if self.rpc_port == 0 {
             return Err(DiscoveryError::InvalidEndpointValue(
                 "rpc_port must be > 0".to_string(),
@@ -271,6 +276,13 @@ mod tests {
 
         endpoint.rpc_port = 9100;
         endpoint.web_port = Some(0);
+        assert!(endpoint.validate().is_err());
+
+        endpoint.web_port = None;
+        endpoint.host = " mds.default.svc".to_string();
+        assert!(endpoint.validate().is_err());
+
+        endpoint.host = "mds.default svc".to_string();
         assert!(endpoint.validate().is_err());
     }
 

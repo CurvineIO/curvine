@@ -287,6 +287,7 @@ pub struct ServiceResolverHandle {
     kind: ServiceKind,
     reader: SnapshotReader,
     events: ServiceWatch,
+    _lifecycle_owner: Option<std::sync::Arc<dyn Send + Sync>>,
 }
 
 #[derive(Clone)]
@@ -301,6 +302,7 @@ impl ServiceResolverHandle {
     }
 
     pub fn into_parts(self) -> (SnapshotReader, ServiceWatch) {
+        // Both returned parts keep the provider runtime alive independently.
         (self.reader, self.events)
     }
 
@@ -317,7 +319,16 @@ impl SnapshotReader {
     }
 }
 
-pub type ServiceWatch = tokio::sync::mpsc::Receiver<DiscoveryResult<ServiceWatchEvent>>;
+pub struct ServiceWatch {
+    events: tokio::sync::mpsc::Receiver<DiscoveryResult<ServiceWatchEvent>>,
+    _lifecycle_owner: Option<std::sync::Arc<dyn Send + Sync>>,
+}
+
+impl ServiceWatch {
+    pub async fn recv(&mut self) -> Option<DiscoveryResult<ServiceWatchEvent>> {
+        self.events.recv().await
+    }
+}
 
 pub enum ServiceWatchEvent {
     Added(ServiceEndpoint),
@@ -331,7 +342,7 @@ pub enum ServiceWatchEvent {
 
 `watch(kind)` 必须在内部先执行一次 `list(kind)`，然后从 snapshot revision + 1 开始 watch，并把初始列表作为第一条 `Reset(ServiceSnapshot)` 事件发给调用方。当前实现中，`watch()` 在初始 list 成功、内部 cache 初始化且初始 `Reset` 已入队后返回 `ServiceResolverHandle`；真实 etcd watch stream 由后台任务从 `revision + 1` 建立，因此即使 watch stream 创建稍晚，也能通过 etcd revision 语义避免 list/watch 间隙丢事件。`Reset` 用于初始快照和 compact revision 后的全量刷新；普通 transient 断线恢复时优先从最后成功处理的 revision + 1 续接，不强制发送 `Reset`。服务发现组件负责维护 handle 内部 cache，调用方可以通过 `snapshot()` 获取当前 endpoint 集合。
 
-`ServiceWatch` 第一阶段使用 `mpsc::Receiver`，语义是单消费者事件流。`ServiceResolverHandle::reader()` 可返回 clone 的 `SnapshotReader`，用于多个任务并发读取 snapshot；事件流仍只有一个消费者。多个模块需要各自消费事件时，应各自创建独立的 `ServiceResolverHandle`；这意味着第一阶段不做进程内 watch 复用，每个 handle 可以对应独立的 etcd watch。后续如果需要进程内 fan-out，再引入 broadcast/watch channel 封装。
+`ServiceWatch` 第一阶段是 `mpsc::Receiver` 的轻量 wrapper，语义是单消费者事件流，并持有 provider runtime 生命周期 owner。`ServiceResolverHandle::reader()` 可返回 clone 的 `SnapshotReader`，用于多个任务并发读取 snapshot；事件流仍只有一个消费者。多个模块需要各自消费事件时，应各自创建独立的 `ServiceResolverHandle`；这意味着第一阶段不做进程内 watch 复用，每个 handle 可以对应独立的 etcd watch。后续如果需要进程内 fan-out，再引入 broadcast/watch channel 封装。
 
 `SnapshotReader::snapshot()` 返回 clone 后的不可变快照，不能向调用方暴露内部锁或可变引用。由于内部 cache 使用 `tokio::sync::RwLock`，`snapshot()` 是 async 方法，并且在 `allow_stale_cache = false` 且 cache stale 时返回 `DiscoveryError::StaleCache`。`ServiceSnapshot::stale` 表示当前 cache 是否来自断开的 watch 或无法确认最新 revision 的状态；`last_update_ms` 表示最近一次成功 list/watch 更新本地 cache 状态的时间。provider 内部可使用 `cached_snapshot()` 读取缓存而不受 `allow_stale_cache` 门控影响，用于断线重连时保留旧 endpoint。
 
@@ -432,8 +443,9 @@ impl RegistrationGuard {
         // Update only the endpoint status on the existing key with the same lease.
     }
 
-    pub async fn shutdown(self) -> DiscoveryResult<()> {
+    pub async fn shutdown(&self) -> DiscoveryResult<()> {
         // Stop keepalive and revoke lease.
+        // Retryable when revoke fails; idempotent after Revoked.
     }
 }
 ```
@@ -442,9 +454,9 @@ guard 负责：
 
 - 持有 lease 信息。
 - 运行 keepalive 后台任务。
-- 显式 `shutdown().await` 时尽力 revoke lease / delete key。
+- 显式 `shutdown().await` 时尽力 revoke lease / delete key；只有 revoke 成功后才能发布 `Revoked`，失败时保持 `Revoking` 并返回错误，调用方可使用同一个 guard 重试。
 - `Drop` 中只能触发后台停止信号，不能依赖异步 revoke 一定完成；异常退出依赖 lease TTL 清理 key。
-- keepalive 失败时更新 `RegistrationStatus::KeepAliveLost` 并记录错误。
+- keepalive 失败达到终态时先停止 keepalive，并在发布 `RegistrationStatus::KeepAliveLost` 前 best-effort revoke lease；如果 etcd 不可用导致 revoke 失败，调用方立即重新 `register()` 仍可能在 TTL 过期前遇到 `RegistrationAlreadyExists`。
 - 服务进程可通过 `status_rx` 感知 lease 丢失，并按自身策略停止 serving、重试注册或主动退出。
 - 服务进程需要切换 `Starting` / `Serving` / `Draining` 或更新 metadata 时，通过 `update_status()` / `update_endpoint()` 更新同一个 etcd key，并继续复用原 lease。
 - `update_endpoint()` 禁止修改 `kind` 和 `id`；如果传入 endpoint 的 `kind` / `id` 与 guard 不一致，必须返回错误，避免更新到错误的 key。
