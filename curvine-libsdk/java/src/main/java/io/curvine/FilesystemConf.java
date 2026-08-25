@@ -14,7 +14,6 @@
 
 package io.curvine;
 
-import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.conf.Configuration;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
@@ -147,10 +146,15 @@ public class FilesystemConf {
             }
 
             field.setAccessible(true);
+            value = value.trim();
             String fieldType = field.getType().getName();
             switch (fieldType) {
                 case "java.lang.String":
-                    field.set(this, value);
+                    if ("master_addrs".equals(field.getName())) {
+                        field.set(this, normalizeCsv(value));
+                    } else {
+                        field.set(this, value);
+                    }
                     break;
                 case "int":
                     field.setInt(this, Integer.parseInt(value));
@@ -168,21 +172,21 @@ public class FilesystemConf {
 
         String transferEnabled = conf.get(PREFIX + ".transfer.enabled");
         if (transferEnabled != null) {
-            transfer_enabled = Boolean.parseBoolean(transferEnabled);
+            transfer_enabled = Boolean.parseBoolean(transferEnabled.trim());
         }
         String transferEndpoints = conf.get(PREFIX + ".transfer.endpoints");
         if (transferEndpoints != null) {
-            transfer_endpoints = transferEndpoints;
+            transfer_endpoints = normalizeCsv(transferEndpoints);
         }
         String transferClientPendingQueueSize =
                 conf.get(PREFIX + ".transfer.client_pending_queue_size");
         if (transferClientPendingQueueSize != null) {
-            transfer_client_pending_queue_size = Integer.parseInt(transferClientPendingQueueSize);
+            transfer_client_pending_queue_size = Integer.parseInt(transferClientPendingQueueSize.trim());
         }
         String transferClientSubmitConcurrency =
                 conf.get(PREFIX + ".transfer.client_submit_concurrency");
         if (transferClientSubmitConcurrency != null) {
-            transfer_client_submit_concurrency = Integer.parseInt(transferClientSubmitConcurrency);
+            transfer_client_submit_concurrency = Integer.parseInt(transferClientSubmitConcurrency.trim());
         }
     }
 
@@ -254,15 +258,38 @@ public class FilesystemConf {
                 .replace("\t", "\\t");
     }
 
+    static String normalizeCsv(String value) {
+        StringBuilder builder = new StringBuilder();
+        for (String part : value.split(",")) {
+            String trimmed = part.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            if (builder.length() > 0) {
+                builder.append(',');
+            }
+            builder.append(trimmed);
+        }
+        return builder.toString();
+    }
+
+    static String trimEnvHostname(String hostname) {
+        if (hostname == null) {
+            return null;
+        }
+        String trimmed = hostname.trim();
+        return trimmed.isEmpty() ? null : trimmed;
+    }
+
     private String getClientHostname() {
         // In the k8s environment, POD_IP is used by default as client hostname
-        String hostname = System.getenv("POD_IP");
-        if (StringUtils.isEmpty(hostname)) {
+        String hostname = trimEnvHostname(System.getenv("POD_IP"));
+        if (hostname == null) {
             // Use CURVINE_CLIENT_HOSTNAME environment variable.
-            hostname = System.getenv(HOSTNAME_KEY);
+            hostname = trimEnvHostname(System.getenv(HOSTNAME_KEY));
         }
 
-        if (StringUtils.isNotEmpty(hostname)) {
+        if (hostname != null) {
             return hostname;
         } else {
             try {

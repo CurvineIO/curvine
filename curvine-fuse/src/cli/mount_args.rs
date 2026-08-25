@@ -384,16 +384,12 @@ impl FuseMountArgs {
         }
 
         if let Some(master_addrs) = &self.master_addrs {
-            let mut vec = vec![];
-            for node in master_addrs.split(",") {
-                let tmp: Vec<&str> = node.split(":").collect();
-                if tmp.len() != 2 {
-                    return err_box!("wrong format master_addrs {}", master_addrs);
+            let vec = match InetAddr::parse_list(master_addrs) {
+                Ok(vec) => vec,
+                Err(e) => {
+                    return err_box!("wrong format master_addrs {}: {}", master_addrs, e);
                 }
-                let hostname = tmp[0].to_string();
-                let port: u16 = tmp[1].parse()?;
-                vec.push(InetAddr::new(hostname, port));
-            }
+            };
             conf.client.master_addrs = vec;
         }
 
@@ -589,6 +585,34 @@ mod tests {
             err.to_string().contains("fuse.io_threads must be > 0"),
             "unexpected error: {}",
             err
+        );
+    }
+
+    #[test]
+    fn get_conf_includes_parse_error_for_invalid_master_addrs() {
+        let conf_path = Utils::temp_file();
+        fs::write(&conf_path, "[fuse]\nio_threads = 1\n").expect("write test config");
+
+        let args = FuseMountArgs::try_parse_from([
+            "curvine-fuse",
+            "--conf",
+            &conf_path,
+            "--master-addrs",
+            "host-a:8995, host-b:not-a-port",
+        ])
+        .expect("parse mount arguments");
+        let result = args.get_conf();
+        let _ = fs::remove_file(&conf_path);
+
+        let err = result.expect_err("invalid master_addrs must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("wrong format master_addrs host-a:8995, host-b:not-a-port"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("invalid digit found in string"),
+            "parse error should be included: {msg}"
         );
     }
 }

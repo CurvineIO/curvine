@@ -39,6 +39,37 @@ public class LibFsTest {
     }
 
     @Test
+    public void trimsMasterAddrsWhitespace() throws Exception {
+        Configuration conf = new Configuration();
+        conf.set("fs.cv.master_addrs", "localhost:9001, localhost:9002,localhost:9003");
+        conf.set("fs.cv.io_threads", " 16 ");
+
+        FilesystemConf filesystemConf = new FilesystemConf(conf);
+
+        assert filesystemConf.master_addrs.equals("localhost:9001,localhost:9002,localhost:9003");
+        assert filesystemConf.io_threads == 16;
+    }
+
+    @Test
+    public void namespacedMasterAddrsAreNormalized() throws Exception {
+        // initialize() overwrites constructor master_addrs via getMasterAddrs(authority).
+        // Exercise that helper directly so a revert of normalizeCsv there fails the test.
+        CurvineFileSystem fs = new CurvineFileSystem();
+        Configuration conf = new Configuration();
+        conf.set("fs.cv.ns1.master_addrs", "h1:8995, h2:8995,h3:8995");
+        fs.setConf(conf);
+
+        assert fs.getMasterAddrs("ns1").equals("h1:8995,h2:8995,h3:8995");
+    }
+
+    @Test
+    public void clientHostnameEnvValuesAreTrimmed() {
+        assert FilesystemConf.trimEnvHostname(" 10.0.0.8 \n").equals("10.0.0.8");
+        assert FilesystemConf.trimEnvHostname("  ") == null;
+        assert FilesystemConf.trimEnvHostname(null) == null;
+    }
+
+    @Test
     public void jni1() throws Exception {
         Configuration conf = new Configuration();
         conf.set("fs.cv.master_addrs", "localhost:6995");

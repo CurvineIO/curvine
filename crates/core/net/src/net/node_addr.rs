@@ -41,7 +41,7 @@ impl NodeAddr {
         Self::new(id, addr.hostname, addr.port)
     }
 
-    pub fn from_str(addr: impl Into<String>) -> IOResult<Self> {
+    pub fn from_str(addr: impl AsRef<str>) -> IOResult<Self> {
         let addr = InetAddr::from_str(addr)?;
         let id = Self::create_id(&addr.hostname, addr.port);
 

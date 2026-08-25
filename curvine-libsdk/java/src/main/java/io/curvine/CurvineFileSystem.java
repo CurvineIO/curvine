@@ -131,6 +131,15 @@ public class CurvineFileSystem extends FileSystem {
         return CurvineFsMount.getClientContext();
     }
 
+    String getMasterAddrs(String name) throws IOException {
+        String key = String.format("%s.%s.master_addrs", FilesystemConf.PREFIX, name);
+        String addrs = getConf().get(key);
+        if (StringUtils.isEmpty(addrs)) {
+            throw new IOException(key + " not set");
+        }
+        return FilesystemConf.normalizeCsv(addrs);
+    }
+
     /**
      * Resolve master addresses for native client:
      * <ol>
@@ -143,7 +152,7 @@ public class CurvineFileSystem extends FileSystem {
             String authorityKey = String.format("%s.%s.master_addrs", FilesystemConf.PREFIX, authority);
             String authorityAddrs = getConf().get(authorityKey);
             if (StringUtils.isNotEmpty(authorityAddrs)) {
-                filesystemConf.master_addrs = authorityAddrs;
+                filesystemConf.master_addrs = FilesystemConf.normalizeCsv(authorityAddrs);
                 return;
             }
             if (StringUtils.isNotEmpty(filesystemConf.master_addrs)) {

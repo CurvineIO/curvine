@@ -261,6 +261,8 @@ exec {fuse_cmd}
         parsed_endpoints = []
         for endpoint in self._split_master_endpoints(endpoints):
             hostname, separator, port = endpoint.rpartition(':')
+            hostname = hostname.strip()
+            port = port.strip()
             if not separator or not hostname or not port:
                 raise ValueError(
                     f"Invalid master endpoint: {endpoint}, "

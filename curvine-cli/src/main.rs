@@ -97,18 +97,16 @@ impl CurvineArgs {
 
         // Priority 2: Override with CLI master_addrs if provided
         if let Some(master_addrs) = &self.master_addrs {
-            let mut vec = vec![];
-            for node in master_addrs.split(',') {
-                let tmp: Vec<&str> = node.split(':').collect();
-                if tmp.len() != 2 {
-                    return err_box!("Invalid master_addrs format: '{}'. Expected format: 'host1:port1,host2:port2'", master_addrs);
+            let vec = match InetAddr::parse_list(master_addrs) {
+                Ok(vec) => vec,
+                Err(e) => {
+                    return err_box!(
+                        "Invalid master_addrs format: '{}'. Expected format: 'host1:port1,host2:port2': {}",
+                        master_addrs,
+                        e
+                    );
                 }
-                let hostname = tmp[0].to_string();
-                let port: u16 = tmp[1]
-                    .parse()
-                    .map_err(|_| format!("Invalid port number in master_addrs: '{}'", tmp[1]))?;
-                vec.push(InetAddr::new(hostname, port));
-            }
+            };
             conf.client.master_addrs = vec;
             source = format!("{} + --master_addrs override", source);
         }

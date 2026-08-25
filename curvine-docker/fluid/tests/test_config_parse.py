@@ -64,6 +64,17 @@ class ConfigParseTest(unittest.TestCase):
         self.assertIn('hostname = "master-2"', rendered)
         self.assertIn('fs_path = "/starrocks/datacache"', rendered)
 
+    def test_master_endpoints_trim_mixed_comma_spacing(self):
+        parser = config_parse.ConfigParser()
+        parser.mount_options = {
+            "master-endpoints": "master-0:8995, master-1:8995,master-2:8995",
+        }
+        endpoints = parser.parse_master_endpoints()
+        self.assertEqual(
+            endpoints,
+            [("master-0", "8995"), ("master-1", "8995"), ("master-2", "8995")],
+        )
+
     def test_advanced_client_and_fuse_toml_options_are_rendered(self):
         rendered, script = self.run_parser({
             "mounts": [{
