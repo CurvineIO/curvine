@@ -83,6 +83,11 @@ pub trait RegistrationControl: Send + Sync {
     async fn shutdown(&self) -> DiscoveryResult<()>;
 }
 
+/// Owns a live service registration.
+///
+/// Dropping the guard only stops local keepalive work. Call [`RegistrationGuard::shutdown`]
+/// when a service needs to revoke its lease immediately; otherwise the endpoint may remain
+/// visible until the lease TTL expires.
 pub struct RegistrationGuard {
     pub(crate) kind: ServiceKind,
     pub(crate) service_id: String,

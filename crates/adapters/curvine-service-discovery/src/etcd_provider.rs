@@ -195,8 +195,16 @@ impl RegistrationControl for EtcdRegistrationControl {
     }
 
     async fn shutdown(&self) -> DiscoveryResult<()> {
+        if matches!(
+            &*self.status_tx.borrow(),
+            RegistrationStatus::KeepAliveLost { .. } | RegistrationStatus::Revoked
+        ) {
+            let _ = self.shutdown_tx.send(true);
+            let _ = self.status_tx.send(RegistrationStatus::Revoked);
+            return Ok(());
+        }
+
         let _ = self.status_tx.send(RegistrationStatus::Revoking);
-        let _ = self.shutdown_tx.send(true);
         let mut client = self.client.lock().await;
         let result = client
             .lease_revoke(self.lease_id)
@@ -204,12 +212,25 @@ impl RegistrationControl for EtcdRegistrationControl {
             .map_err(DiscoveryError::from);
         match result {
             Ok(_) => {
+                let _ = self.shutdown_tx.send(true);
+                let _ = self.status_tx.send(RegistrationStatus::Revoked);
+                Ok(())
+            }
+            Err(error) if is_lease_not_found_error(&error) => {
+                let _ = self.shutdown_tx.send(true);
                 let _ = self.status_tx.send(RegistrationStatus::Revoked);
                 Ok(())
             }
             Err(error) => Err(error),
         }
     }
+}
+
+fn is_lease_not_found_error(error: &DiscoveryError) -> bool {
+    matches!(error, DiscoveryError::EtcdUnavailable(message) if {
+        let message = message.to_ascii_lowercase();
+        message.contains("lease not found")
+    })
 }
 
 impl EtcdRegistrationControl {
@@ -437,7 +458,7 @@ impl ServiceResolver for EtcdServiceResolver {
             watch_loop(
                 config,
                 watch_kind,
-                snapshot.revision + 1,
+                snapshot.revision.saturating_add(1),
                 reader_for_task,
                 tx,
                 jitter_seed,
@@ -797,7 +818,7 @@ async fn watch_loop(
                     .await
                 {
                     Ok(revision) => {
-                        start_revision = revision + 1;
+                        start_revision = revision.saturating_add(1);
                         reconnect_attempt = 0;
                     }
                     Err(error) => {
@@ -886,9 +907,6 @@ fn reconnect_delay_ms(config: &EtcdDiscoveryConfig, attempt: u32, jitter_seed: u
         base
     } else {
         let jitter_denominator = jitter_bound.saturating_add(1);
-        if jitter_denominator == 0 {
-            return config.watch_reconnect_max_ms;
-        }
         let jitter = now_millis()
             .wrapping_add(jitter_seed)
             .wrapping_add(u64::from(attempt))
@@ -919,7 +937,6 @@ async fn watch_once(
         )
         .await?;
     let mut snapshot = reader.cached_snapshot().await;
-    let mut watch_confirmed = false;
 
     loop {
         let response = tokio::select! {
@@ -962,7 +979,6 @@ async fn watch_once(
             snapshot.stale = false;
             snapshot.last_update_ms = now_millis();
             reader.replace_snapshot(snapshot.clone()).await;
-            watch_confirmed = true;
             continue;
         }
 
@@ -1054,9 +1070,6 @@ async fn watch_once(
             snapshot.stale = false;
             snapshot.last_update_ms = now_millis();
             reader.replace_snapshot(snapshot.clone()).await;
-        }
-        if !watch_confirmed {
-            watch_confirmed = true;
         }
     }
 
@@ -1194,6 +1207,20 @@ mod tests {
         let (status_tx, status_rx) = watch::channel(RegistrationStatus::Revoked);
         publish_keepalive_lost_if_active(&status_tx, "lost".to_string());
         assert_eq!(*status_rx.borrow(), RegistrationStatus::Revoked);
+    }
+
+    #[test]
+    fn lease_not_found_error_is_treated_as_shutdown_success() {
+        assert!(is_lease_not_found_error(&DiscoveryError::EtcdUnavailable(
+            "grpc request error: status: NotFound, message: etcdserver: requested lease not found"
+                .to_string(),
+        )));
+        assert!(is_lease_not_found_error(&DiscoveryError::EtcdUnavailable(
+            "lease keep alive error: lease not found".to_string(),
+        )));
+        assert!(!is_lease_not_found_error(&DiscoveryError::EtcdUnavailable(
+            "transport error: connection refused".to_string(),
+        )));
     }
 
     #[test]

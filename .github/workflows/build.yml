@@ -86,6 +86,9 @@ jobs:
           echo "Running clippy (static code analysis)"
           # Run clippy in debug mode to match build
           cargo clippy --all-targets --jobs ${{ env.CARGO_BUILD_JOBS }} -- --${CLIPPY_LEVEL}=warnings --allow clippy::uninlined-format-args
+
+          echo "Running etcd service discovery clippy"
+          cargo clippy -p curvine-service-discovery --features etcd --tests --jobs ${{ env.CARGO_BUILD_JOBS }} -- --${CLIPPY_LEVEL}=warnings --allow clippy::uninlined-format-args
           
           echo "After clippy, disk usage:"
           df -h
@@ -104,6 +107,7 @@ jobs:
           df -h
           
           cargo build --verbose --jobs ${{ env.CARGO_BUILD_JOBS }}
+          cargo build -p curvine-service-discovery --features etcd --tests --verbose --jobs ${{ env.CARGO_BUILD_JOBS }}
           
           echo "After build, disk usage:"
           df -h

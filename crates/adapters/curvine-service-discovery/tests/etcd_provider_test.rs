@@ -12,10 +12,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::timeout;
 
-fn etcd_endpoint() -> Option<String> {
+fn etcd_endpoint() -> String {
     std::env::var("CURVINE_ETCD_ADDR")
         .ok()
         .filter(|value| !value.trim().is_empty())
+        .expect("CURVINE_ETCD_ADDR must be set to run ignored etcd integration tests")
 }
 
 fn unique_prefix(test_name: &str) -> String {
@@ -70,11 +71,9 @@ async fn next_watch_event(handle: &mut ServiceResolverHandle) -> ServiceWatchEve
 }
 
 #[test]
+#[ignore = "requires CURVINE_ETCD_ADDR and a running etcd cluster"]
 fn etcd_resolver_lists_registered_endpoint() {
-    let Some(etcd_addr) = etcd_endpoint() else {
-        eprintln!("skip etcd integration test: CURVINE_ETCD_ADDR is not set");
-        return;
-    };
+    let etcd_addr = etcd_endpoint();
 
     let rt = Arc::new(AsyncRuntime::single());
     let resolver_rt = rt.clone();
@@ -106,11 +105,9 @@ fn etcd_resolver_lists_registered_endpoint() {
 }
 
 #[test]
+#[ignore = "requires CURVINE_ETCD_ADDR and a running etcd cluster"]
 fn etcd_resolver_list_skips_malformed_key() {
-    let Some(etcd_addr) = etcd_endpoint() else {
-        eprintln!("skip etcd integration test: CURVINE_ETCD_ADDR is not set");
-        return;
-    };
+    let etcd_addr = etcd_endpoint();
 
     let rt = Arc::new(AsyncRuntime::single());
     let resolver_rt = rt.clone();
@@ -138,11 +135,9 @@ fn etcd_resolver_list_skips_malformed_key() {
 }
 
 #[test]
+#[ignore = "requires CURVINE_ETCD_ADDR and a running etcd cluster"]
 fn etcd_resolver_watch_emits_initial_reset() {
-    let Some(etcd_addr) = etcd_endpoint() else {
-        eprintln!("skip etcd integration test: CURVINE_ETCD_ADDR is not set");
-        return;
-    };
+    let etcd_addr = etcd_endpoint();
 
     let rt = Arc::new(AsyncRuntime::single());
     let resolver_rt = rt.clone();
@@ -178,11 +173,9 @@ fn etcd_resolver_watch_emits_initial_reset() {
 }
 
 #[test]
+#[ignore = "requires CURVINE_ETCD_ADDR and a running etcd cluster"]
 fn etcd_resolver_watch_emits_incremental_changes() {
-    let Some(etcd_addr) = etcd_endpoint() else {
-        eprintln!("skip etcd integration test: CURVINE_ETCD_ADDR is not set");
-        return;
-    };
+    let etcd_addr = etcd_endpoint();
 
     let rt = Arc::new(AsyncRuntime::single());
     let resolver_rt = rt.clone();
@@ -251,11 +244,9 @@ fn etcd_resolver_watch_emits_incremental_changes() {
 }
 
 #[test]
+#[ignore = "requires CURVINE_ETCD_ADDR and a running etcd cluster"]
 fn etcd_resolver_watch_skips_malformed_key_and_continues() {
-    let Some(etcd_addr) = etcd_endpoint() else {
-        eprintln!("skip etcd integration test: CURVINE_ETCD_ADDR is not set");
-        return;
-    };
+    let etcd_addr = etcd_endpoint();
 
     let rt = Arc::new(AsyncRuntime::single());
     let resolver_rt = rt.clone();
@@ -310,11 +301,9 @@ fn etcd_resolver_watch_skips_malformed_key_and_continues() {
 }
 
 #[test]
+#[ignore = "requires CURVINE_ETCD_ADDR and a running etcd cluster"]
 fn etcd_registry_registers_and_shutdown_revokes_endpoint() {
-    let Some(etcd_addr) = etcd_endpoint() else {
-        eprintln!("skip etcd integration test: CURVINE_ETCD_ADDR is not set");
-        return;
-    };
+    let etcd_addr = etcd_endpoint();
 
     let rt = Arc::new(AsyncRuntime::single());
     let resolver_rt = rt.clone();
@@ -360,11 +349,9 @@ fn etcd_registry_registers_and_shutdown_revokes_endpoint() {
 }
 
 #[test]
+#[ignore = "requires CURVINE_ETCD_ADDR and a running etcd cluster"]
 fn etcd_registry_update_preserves_lease_and_emits_updated() {
-    let Some(etcd_addr) = etcd_endpoint() else {
-        eprintln!("skip etcd integration test: CURVINE_ETCD_ADDR is not set");
-        return;
-    };
+    let etcd_addr = etcd_endpoint();
 
     let rt = Arc::new(AsyncRuntime::single());
     let resolver_rt = rt.clone();
@@ -416,11 +403,9 @@ fn etcd_registry_update_preserves_lease_and_emits_updated() {
 }
 
 #[test]
+#[ignore = "requires CURVINE_ETCD_ADDR and a running etcd cluster"]
 fn etcd_registry_rejects_duplicate_service_id() {
-    let Some(etcd_addr) = etcd_endpoint() else {
-        eprintln!("skip etcd integration test: CURVINE_ETCD_ADDR is not set");
-        return;
-    };
+    let etcd_addr = etcd_endpoint();
 
     let rt = Arc::new(AsyncRuntime::single());
     let resolver_rt = rt.clone();
@@ -452,11 +437,9 @@ fn etcd_registry_rejects_duplicate_service_id() {
 }
 
 #[test]
+#[ignore = "requires CURVINE_ETCD_ADDR and a running etcd cluster"]
 fn etcd_registry_reports_keepalive_lost_after_external_revoke() {
-    let Some(etcd_addr) = etcd_endpoint() else {
-        eprintln!("skip etcd integration test: CURVINE_ETCD_ADDR is not set");
-        return;
-    };
+    let etcd_addr = etcd_endpoint();
 
     let rt = Arc::new(AsyncRuntime::single());
     let resolver_rt = rt.clone();
