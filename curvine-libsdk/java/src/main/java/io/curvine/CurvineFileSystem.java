@@ -131,15 +131,32 @@ public class CurvineFileSystem extends FileSystem {
         return CurvineFsMount.getClientContext();
     }
 
-    private String getMasterAddrs(String name) throws IOException {
-        String key = String.format("%s.%s.master_addrs", FilesystemConf.PREFIX, name);
-        String addrs = getConf().get(key);
-        if (StringUtils.isEmpty(addrs)) {
-            throw new IOException(key + " not set");
-        } else {
-            return addrs;
+    /**
+     * Resolve master addresses for native client:
+     * <ol>
+     *   <li>{@code fs.cv.<authority>.master_addrs} when URI has authority</li>
+     *   <li>otherwise {@code fs.cv.master_addrs} already loaded by {@link FilesystemConf}</li>
+     * </ol>
+     */
+    private void resolveMasterAddrs(String authority) throws IOException {
+        if (StringUtils.isNotEmpty(authority)) {
+            String authorityKey = String.format("%s.%s.master_addrs", FilesystemConf.PREFIX, authority);
+            String authorityAddrs = getConf().get(authorityKey);
+            if (StringUtils.isNotEmpty(authorityAddrs)) {
+                filesystemConf.master_addrs = authorityAddrs;
+                return;
+            }
+            if (StringUtils.isNotEmpty(filesystemConf.master_addrs)) {
+                return;
+            }
+            throw new IOException(authorityKey + " not set, and "
+                    + FilesystemConf.PREFIX + ".master_addrs not set");
+        }
+        if (StringUtils.isEmpty(filesystemConf.master_addrs)) {
+            throw new IOException(FilesystemConf.PREFIX + ".master_addrs not set");
         }
     }
+
     @Override
     public void initialize(URI name, Configuration conf) throws IOException {
         super.initialize(name, conf);
@@ -147,18 +164,19 @@ public class CurvineFileSystem extends FileSystem {
         String authority = name.getAuthority();
         try {
             filesystemConf = new FilesystemConf(conf);
-            if (StringUtils.isNotEmpty(authority)) {
-                filesystemConf.master_addrs = getMasterAddrs(authority);
-            } else {
+            resolveMasterAddrs(authority);
+            if (StringUtils.isEmpty(authority)) {
                 authority = "/";
             }
+        } catch (IOException e) {
+            throw e;
         } catch (Exception e) {
             throw new IOException(e);
         }
 
         this.uri = URI.create(name.getScheme() + "://" + authority);
         this.workingDir = getHomeDirectory();
-        
+
         this.cacheKey = filesystemConf.master_addrs;
         this.libFs = getOrCreateMount(filesystemConf);
     }
