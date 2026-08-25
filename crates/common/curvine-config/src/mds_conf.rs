@@ -1,4 +1,5 @@
 use curvine_core_error::{err_box, CommonResult};
+use curvine_runtime::common::LogConf;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -10,8 +11,7 @@ pub struct MdsConf {
     pub web_port: u16,
     pub io_threads: usize,
     pub worker_threads: usize,
-    pub conn_limit: usize,
-    pub global_limit: usize,
+    pub log: LogConf,
 }
 
 impl MdsConf {
@@ -38,12 +38,6 @@ impl MdsConf {
         if self.worker_threads == 0 {
             return err_box!("mds.worker_threads must be greater than zero");
         }
-        if self.conn_limit == 0 {
-            return err_box!("mds.conn_limit must be greater than zero");
-        }
-        if self.global_limit == 0 {
-            return err_box!("mds.global_limit must be greater than zero");
-        }
         Ok(())
     }
 }
@@ -57,8 +51,7 @@ impl Default for MdsConf {
             web_port: Self::DEFAULT_WEB_PORT,
             io_threads: 4,
             worker_threads: 8,
-            conn_limit: 10_000,
-            global_limit: 100_000,
+            log: Default::default(),
         }
     }
 }

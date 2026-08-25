@@ -1,5 +1,6 @@
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
+use curvine_runtime::common::Logger;
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime, Runtime};
 use log::info;
 use std::sync::Arc;
@@ -13,10 +14,12 @@ pub struct Mds {
 }
 
 impl Mds {
-    pub fn with_conf(conf: ClusterConf) -> CommonResult<Self> {
+    pub fn with_conf(mut conf: ClusterConf) -> CommonResult<Self> {
         if !conf.mds.enabled {
             return err_box!("mds service is disabled; set mds.enabled=true to start it");
         }
+        conf.mds.init()?;
+        Logger::init(conf.mds.log.clone());
 
         let rt = Arc::new(AsyncRuntime::new(
             "mds",
@@ -37,14 +40,7 @@ impl Mds {
     }
 
     pub async fn start(&mut self) -> CommonResult<()> {
-        info!(
-            "curvine-mds started: cluster_id={}, rpc_addr={}:{}, web_addr={}:{}",
-            self.conf.cluster_id,
-            self.conf.mds.hostname,
-            self.conf.mds.rpc_port,
-            self.conf.mds.hostname,
-            self.conf.mds.web_port
-        );
+        info!("curvine-mds started: cluster_id={}", self.conf.cluster_id);
         Ok(())
     }
 
