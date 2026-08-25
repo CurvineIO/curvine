@@ -55,6 +55,10 @@ pub use self::transfer_conf::*;
 mod ufs_conf;
 pub use self::ufs_conf::{UfsConf, UfsConfBuilder};
 
+/// Unified layered config-loading pipeline (file → env → cli).
+pub mod pipeline;
+pub use pipeline::{ConfigLoader, DiscoveredPath};
+
 impl curvine_model::ClientConfDefaults for ClientConf {
     fn replicas(&self) -> i32 {
         self.replicas
