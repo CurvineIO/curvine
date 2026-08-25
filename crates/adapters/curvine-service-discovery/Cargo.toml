@@ -12,7 +12,6 @@ etcd = ["dep:etcd-client", "dep:curvine-config", "dep:curvine-runtime", "dep:log
 [dependencies]
 async-trait = { workspace = true }
 curvine-core-error = { workspace = true }
-curvine-error = { workspace = true }
 curvine-config = { workspace = true, optional = true }
 curvine-proto = { workspace = true }
 curvine-runtime = { workspace = true, optional = true }

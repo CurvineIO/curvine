@@ -2760,7 +2760,6 @@ dependencies = [
  "async-trait",
  "curvine-config",
  "curvine-core-error",
- "curvine-error",
  "curvine-proto",
  "curvine-runtime",
  "etcd-client",

@@ -32,18 +32,18 @@ impl ServiceRegistry for FakeDiscovery {
             .or_default()
             .insert(service_id.clone(), endpoint);
         let (status_tx, status_rx) = watch::channel(RegistrationStatus::Registered);
-        Ok(RegistrationGuard {
-            kind: kind.clone(),
-            service_id: service_id.clone(),
-            lease_id: 1,
+        Ok(RegistrationGuard::new(
+            kind.clone(),
+            service_id.clone(),
+            1,
             status_rx,
-            control: Arc::new(FakeRegistrationControl {
+            Arc::new(FakeRegistrationControl {
                 store: self.store.clone(),
                 kind,
                 service_id,
                 status_tx,
             }),
-        })
+        ))
     }
 }
 

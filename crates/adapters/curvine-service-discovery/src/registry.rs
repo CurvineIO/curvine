@@ -77,7 +77,7 @@ pub enum RegistrationStatus {
 }
 
 #[async_trait]
-pub(crate) trait RegistrationControl: Send + Sync {
+pub trait RegistrationControl: Send + Sync {
     async fn update_endpoint(&self, endpoint: ServiceEndpoint) -> DiscoveryResult<()>;
     async fn update_status(&self, status: ServiceStatus) -> DiscoveryResult<()>;
     async fn shutdown(&self) -> DiscoveryResult<()>;
@@ -89,9 +89,38 @@ pub struct RegistrationGuard {
     pub(crate) lease_id: i64,
     pub(crate) status_rx: watch::Receiver<RegistrationStatus>,
     pub(crate) control: Arc<dyn RegistrationControl>,
+    pub(crate) _lifecycle_owner: Option<Arc<dyn Send + Sync>>,
 }
 
 impl RegistrationGuard {
+    pub fn new(
+        kind: ServiceKind,
+        service_id: impl Into<String>,
+        lease_id: i64,
+        status_rx: watch::Receiver<RegistrationStatus>,
+        control: Arc<dyn RegistrationControl>,
+    ) -> Self {
+        Self::with_lifecycle_owner(kind, service_id, lease_id, status_rx, control, None)
+    }
+
+    pub fn with_lifecycle_owner(
+        kind: ServiceKind,
+        service_id: impl Into<String>,
+        lease_id: i64,
+        status_rx: watch::Receiver<RegistrationStatus>,
+        control: Arc<dyn RegistrationControl>,
+        lifecycle_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Self {
+        Self {
+            kind,
+            service_id: service_id.into(),
+            lease_id,
+            status_rx,
+            control,
+            _lifecycle_owner: lifecycle_owner,
+        }
+    }
+
     pub fn kind(&self) -> &ServiceKind {
         &self.kind
     }
@@ -203,6 +232,7 @@ mod tests {
             lease_id: 10,
             status_rx: rx,
             control: Arc::new(NoopControl),
+            _lifecycle_owner: None,
         }
     }
 

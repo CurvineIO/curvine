@@ -56,8 +56,6 @@ pub struct ClusterConf {
 
     pub worker: WorkerConf,
 
-    pub discovery: DiscoveryConf,
-
     /// Test-only fault HTTP control plane.
     ///
     /// Fault point instrumentation is controlled by Cargo features. This
@@ -76,6 +74,8 @@ pub struct ClusterConf {
     pub transfer: TransferConf,
 
     pub cli: CliConf,
+
+    pub discovery: DiscoveryConf,
 }
 
 impl ClusterConf {
@@ -501,7 +501,6 @@ impl Default for ClusterConf {
             master: Default::default(),
             journal: Default::default(),
             worker: Default::default(),
-            discovery: Default::default(),
             fault_injection: Default::default(),
             log: Default::default(),
             client: Default::default(),
@@ -509,6 +508,7 @@ impl Default for ClusterConf {
             job: Default::default(),
             transfer: Default::default(),
             cli: Default::default(),
+            discovery: Default::default(),
         }
     }
 }

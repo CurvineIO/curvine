@@ -1,5 +1,3 @@
-use curvine_error::FsError;
-
 pub type DiscoveryResult<T> = Result<T, DiscoveryError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -20,6 +18,10 @@ pub enum DiscoveryError {
     },
     #[error("invalid registration options: {0}")]
     InvalidRegistrationOptions(String),
+    #[error("invalid discovery config: {0}")]
+    InvalidDiscoveryConfig(String),
+    #[error("service registration already exists: {0}")]
+    RegistrationAlreadyExists(String),
     #[error("etcd unavailable: {0}")]
     EtcdUnavailable(String),
     #[error("watch revision has been compacted: {revision}")]
@@ -34,11 +36,5 @@ pub enum DiscoveryError {
 impl From<etcd_client::Error> for DiscoveryError {
     fn from(value: etcd_client::Error) -> Self {
         DiscoveryError::EtcdUnavailable(value.to_string())
-    }
-}
-
-impl From<DiscoveryError> for FsError {
-    fn from(value: DiscoveryError) -> Self {
-        FsError::from(curvine_core_error::CommonError::from(value))
     }
 }

@@ -8,8 +8,8 @@ use crate::{
 use async_trait::async_trait;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use etcd_client::{
-    Client, ConnectOptions, EventType, GetOptions, LeaseKeepAliveStream, LeaseKeeper, PutOptions,
-    WatchOptions,
+    Client, Compare, CompareOp, ConnectOptions, EventType, GetOptions, LeaseKeepAliveStream,
+    LeaseKeeper, PutOptions, Txn, TxnOp, WatchOptions,
 };
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,6 +19,7 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::timeout;
 
 static WATCH_JITTER_SEED: AtomicU64 = AtomicU64::new(1);
+const KEEPALIVE_FAILURE_THRESHOLD: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct EtcdDiscoveryConfig {
@@ -66,19 +67,29 @@ impl ServiceRegistry for EtcdServiceResolver {
         .await?;
         let lease_id = lease.id();
 
-        if let Err(error) = with_registration_timeout(
-            timeout_duration,
-            client.put(
+        let txn = Txn::new()
+            .when(vec![Compare::version(key.clone(), CompareOp::Equal, 0)])
+            .and_then(vec![TxnOp::put(
                 key.clone(),
                 value,
                 Some(PutOptions::new().with_lease(lease_id)),
-            ),
+            )]);
+        let txn_response = match with_registration_timeout(
+            timeout_duration,
+            client.txn(txn),
             "put registration endpoint",
         )
         .await
         {
+            Ok(response) => response,
+            Err(error) => {
+                revoke_lease_best_effort(&mut client, lease_id).await;
+                return Err(error);
+            }
+        };
+        if !txn_response.succeeded() {
             revoke_lease_best_effort(&mut client, lease_id).await;
-            return Err(error);
+            return Err(DiscoveryError::RegistrationAlreadyExists(key.clone()));
         }
 
         let (keeper, stream) = match with_registration_timeout(
@@ -125,6 +136,7 @@ impl ServiceRegistry for EtcdServiceResolver {
             lease_id,
             status_rx,
             control,
+            _lifecycle_owner: Some(self.rt.clone()),
         })
     }
 }
@@ -144,14 +156,7 @@ impl RegistrationControl for EtcdRegistrationControl {
         let value = encode_endpoint_value(&endpoint)?;
         let mut current = self.endpoint.lock().await;
         let mut client = self.client.lock().await;
-        client
-            .put(
-                self.key.clone(),
-                value,
-                Some(PutOptions::new().with_lease(self.lease_id)),
-            )
-            .await
-            .map_err(DiscoveryError::from)?;
+        put_endpoint_if_owned(&mut client, &self.key, value, self.lease_id).await?;
         *current = endpoint;
         Ok(())
     }
@@ -162,14 +167,7 @@ impl RegistrationControl for EtcdRegistrationControl {
         updated.status = status;
         let value = encode_endpoint_value(&updated)?;
         let mut client = self.client.lock().await;
-        client
-            .put(
-                self.key.clone(),
-                value,
-                Some(PutOptions::new().with_lease(self.lease_id)),
-            )
-            .await
-            .map_err(DiscoveryError::from)?;
+        put_endpoint_if_owned(&mut client, &self.key, value, self.lease_id).await?;
         *endpoint = updated;
         Ok(())
     }
@@ -184,6 +182,29 @@ impl RegistrationControl for EtcdRegistrationControl {
             .map_err(DiscoveryError::from)?;
         let _ = self.status_tx.send(RegistrationStatus::Revoked);
         Ok(())
+    }
+}
+
+async fn put_endpoint_if_owned(
+    client: &mut Client,
+    key: &str,
+    value: String,
+    lease_id: i64,
+) -> DiscoveryResult<()> {
+    let txn = Txn::new()
+        .when(vec![Compare::lease(key, CompareOp::Equal, lease_id)])
+        .and_then(vec![TxnOp::put(
+            key,
+            value,
+            Some(PutOptions::new().with_lease(lease_id)),
+        )]);
+    let response = client.txn(txn).await.map_err(DiscoveryError::from)?;
+    if response.succeeded() {
+        Ok(())
+    } else {
+        Err(DiscoveryError::RegistrationLost(format!(
+            "registration no longer owns etcd key {key} with lease {lease_id}"
+        )))
     }
 }
 
@@ -219,7 +240,7 @@ impl EtcdDiscoveryConfig {
                 .iter()
                 .any(|endpoint| endpoint.trim().is_empty())
         {
-            return Err(DiscoveryError::EtcdUnavailable(
+            return Err(DiscoveryError::InvalidDiscoveryConfig(
                 "etcd endpoints must not be empty".to_string(),
             ));
         }
@@ -229,27 +250,27 @@ impl EtcdDiscoveryConfig {
             &ServiceKind::try_new("probe")?,
         )?;
         if self.connect_timeout_ms == 0 {
-            return Err(DiscoveryError::EtcdUnavailable(
+            return Err(DiscoveryError::InvalidDiscoveryConfig(
                 "connect_timeout_ms must be > 0".to_string(),
             ));
         }
         if self.request_timeout_ms == 0 {
-            return Err(DiscoveryError::EtcdUnavailable(
+            return Err(DiscoveryError::InvalidDiscoveryConfig(
                 "request_timeout_ms must be > 0".to_string(),
             ));
         }
         if self.watch_reconnect_min_ms == 0 {
-            return Err(DiscoveryError::EtcdUnavailable(
+            return Err(DiscoveryError::InvalidDiscoveryConfig(
                 "watch_reconnect_min_ms must be > 0".to_string(),
             ));
         }
         if self.watch_reconnect_max_ms < self.watch_reconnect_min_ms {
-            return Err(DiscoveryError::EtcdUnavailable(
+            return Err(DiscoveryError::InvalidDiscoveryConfig(
                 "watch_reconnect_max_ms must be >= watch_reconnect_min_ms".to_string(),
             ));
         }
         if !(0.0..=1.0).contains(&self.watch_reconnect_jitter_ratio) {
-            return Err(DiscoveryError::EtcdUnavailable(
+            return Err(DiscoveryError::InvalidDiscoveryConfig(
                 "watch_reconnect_jitter_ratio must be between 0.0 and 1.0".to_string(),
             ));
         }
@@ -313,9 +334,13 @@ impl EtcdServiceResolver {
             .unwrap_or(0);
         let mut endpoints = Vec::new();
         for kv in response.kvs() {
-            let key = kv
-                .key_str()
-                .map_err(|error| DiscoveryError::InvalidEndpointValue(error.to_string()))?;
+            let key = match kv.key_str() {
+                Ok(key) => key,
+                Err(error) => {
+                    log::warn!("drop discovery endpoint with invalid utf-8 key: error={error}");
+                    continue;
+                }
+            };
             match decode_endpoint_value_for_key(&config.prefix, key, kv.value()) {
                 Ok(endpoint) if endpoint.kind == kind => endpoints.push(endpoint),
                 Ok(_) => {}
@@ -345,7 +370,11 @@ impl ServiceResolver for EtcdServiceResolver {
 
     async fn watch(&self, kind: ServiceKind) -> DiscoveryResult<ServiceResolverHandle> {
         let snapshot = self.list(kind.clone()).await?;
-        let reader = SnapshotReader::new(snapshot.clone(), self.config.allow_stale_cache);
+        let reader = SnapshotReader::with_lifecycle_owner(
+            snapshot.clone(),
+            self.config.allow_stale_cache,
+            Some(self.rt.clone()),
+        );
         let (tx, rx) = mpsc::channel(128);
         tx.send(Ok(ServiceWatchEvent::Reset(snapshot.clone())))
             .await
@@ -367,7 +396,12 @@ impl ServiceResolver for EtcdServiceResolver {
             .await;
         });
 
-        Ok(ServiceResolverHandle::new(kind, reader, rx))
+        Ok(ServiceResolverHandle::with_lifecycle_owner(
+            kind,
+            reader,
+            rx,
+            Some(self.rt.clone()),
+        ))
     }
 }
 
@@ -410,6 +444,7 @@ async fn keepalive_loop(
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(keep_alive_interval_secs));
     let request_timeout = Duration::from_millis(request_timeout_ms);
+    let mut consecutive_failures = 0_u32;
 
     loop {
         tokio::select! {
@@ -427,8 +462,16 @@ async fn keepalive_loop(
                     }
                     result = keeper.keep_alive() => {
                         if let Err(error) = result {
-                            mark_keepalive_lost(&status_tx, &kind, &service_id, error.to_string());
-                            return;
+                            if record_keepalive_failure(
+                                &status_tx,
+                                &kind,
+                                &service_id,
+                                &mut consecutive_failures,
+                                error.to_string(),
+                            ) {
+                                return;
+                            }
+                            continue;
                         }
                     }
                 }
@@ -442,7 +485,9 @@ async fn keepalive_loop(
                     result = timeout(request_timeout, stream.message()) => result,
                 };
                 match keepalive_response {
-                    Ok(Ok(Some(response))) if response.ttl() > 0 => {}
+                    Ok(Ok(Some(response))) if response.ttl() > 0 => {
+                        consecutive_failures = 0;
+                    }
                     Ok(Ok(Some(response))) => {
                         mark_keepalive_lost(
                             &status_tx,
@@ -462,21 +507,53 @@ async fn keepalive_loop(
                         return;
                     }
                     Ok(Err(error)) => {
-                        mark_keepalive_lost(&status_tx, &kind, &service_id, error.to_string());
-                        return;
-                    }
-                    Err(_) => {
-                        mark_keepalive_lost(
+                        if record_keepalive_failure(
                             &status_tx,
                             &kind,
                             &service_id,
+                            &mut consecutive_failures,
+                            error.to_string(),
+                        ) {
+                            return;
+                        }
+                    }
+                    Err(_) => {
+                        if record_keepalive_failure(
+                            &status_tx,
+                            &kind,
+                            &service_id,
+                            &mut consecutive_failures,
                             "lease keepalive response timed out".to_string(),
-                        );
-                        return;
+                        ) {
+                            return;
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+fn record_keepalive_failure(
+    status_tx: &watch::Sender<RegistrationStatus>,
+    kind: &ServiceKind,
+    service_id: &str,
+    consecutive_failures: &mut u32,
+    message: String,
+) -> bool {
+    *consecutive_failures = consecutive_failures.saturating_add(1);
+    log::warn!(
+        "etcd discovery registration keepalive failure: kind={}, service_id={}, failures={}, error={}",
+        kind,
+        service_id,
+        *consecutive_failures,
+        message
+    );
+    if *consecutive_failures < KEEPALIVE_FAILURE_THRESHOLD {
+        false
+    } else {
+        mark_keepalive_lost(status_tx, kind, service_id, message);
+        true
     }
 }
 
@@ -521,7 +598,7 @@ async fn watch_loop(
         {
             Ok(()) => return,
             Err(DiscoveryError::WatchCompacted { revision }) => {
-                reader.mark_stale(now_millis()).await;
+                reader.mark_stale().await;
                 log::warn!(
                     "etcd discovery watch compacted; refreshing snapshot: kind={}, revision={}",
                     kind,
@@ -545,7 +622,11 @@ async fn watch_loop(
                             reconnect_attempt,
                             error
                         );
-                        sleep_reconnect_delay(&config, reconnect_attempt, jitter_seed).await;
+                        if !sleep_reconnect_delay(&config, reconnect_attempt, jitter_seed, &tx)
+                            .await
+                        {
+                            return;
+                        }
                     }
                 }
             }
@@ -553,7 +634,7 @@ async fn watch_loop(
                 if tx.is_closed() {
                     return;
                 }
-                reader.mark_stale(now_millis()).await;
+                reader.mark_stale().await;
                 let snapshot = reader.cached_snapshot().await;
                 start_revision = snapshot.revision.saturating_add(1);
                 reconnect_attempt = reconnect_attempt.saturating_add(1);
@@ -564,7 +645,9 @@ async fn watch_loop(
                     reconnect_attempt,
                     error
                 );
-                sleep_reconnect_delay(&config, reconnect_attempt, jitter_seed).await;
+                if !sleep_reconnect_delay(&config, reconnect_attempt, jitter_seed, &tx).await {
+                    return;
+                }
             }
         }
     }
@@ -586,13 +669,20 @@ async fn refresh_watch_snapshot(
     Ok(revision)
 }
 
-async fn sleep_reconnect_delay(config: &EtcdDiscoveryConfig, attempt: u32, jitter_seed: u64) {
-    tokio::time::sleep(Duration::from_millis(reconnect_delay_ms(
-        config,
-        attempt,
-        jitter_seed,
-    )))
-    .await;
+async fn sleep_reconnect_delay(
+    config: &EtcdDiscoveryConfig,
+    attempt: u32,
+    jitter_seed: u64,
+    tx: &mpsc::Sender<DiscoveryResult<ServiceWatchEvent>>,
+) -> bool {
+    tokio::select! {
+        _ = tx.closed() => false,
+        _ = tokio::time::sleep(Duration::from_millis(reconnect_delay_ms(
+            config,
+            attempt,
+            jitter_seed,
+        ))) => true,
+    }
 }
 
 fn reconnect_delay_ms(config: &EtcdDiscoveryConfig, attempt: u32, jitter_seed: u64) -> u64 {
@@ -606,10 +696,14 @@ fn reconnect_delay_ms(config: &EtcdDiscoveryConfig, attempt: u32, jitter_seed: u
     if jitter_bound == 0 {
         base
     } else {
+        let jitter_denominator = jitter_bound.saturating_add(1);
+        if jitter_denominator == 0 {
+            return config.watch_reconnect_max_ms;
+        }
         let jitter = now_millis()
             .wrapping_add(jitter_seed)
             .wrapping_add(u64::from(attempt))
-            % (jitter_bound + 1);
+            % jitter_denominator;
         base.saturating_add(jitter)
             .min(config.watch_reconnect_max_ms)
     }
@@ -638,7 +732,15 @@ async fn watch_once(
     let mut snapshot = reader.cached_snapshot().await;
     let mut watch_confirmed = false;
 
-    while let Some(response) = stream.message().await? {
+    loop {
+        let response = tokio::select! {
+            _ = tx.closed() => return Ok(()),
+            message = stream.message() => message?,
+        };
+        let Some(response) = response else {
+            break;
+        };
+
         if response.canceled() {
             let compact_revision = response.compact_revision();
             if compact_revision > 0 {
@@ -662,12 +764,7 @@ async fn watch_once(
             )));
         }
 
-        let is_create_response = response.created();
         let events = response.events();
-        if is_create_response && events.is_empty() {
-            continue;
-        }
-
         if let Some(header) = response.header() {
             snapshot.revision = header.revision();
         }
@@ -677,9 +774,13 @@ async fn watch_once(
                     let Some(kv) = event.kv() else {
                         continue;
                     };
-                    let key = kv
-                        .key_str()
-                        .map_err(|error| DiscoveryError::InvalidEndpointValue(error.to_string()))?;
+                    let key = match kv.key_str() {
+                        Ok(key) => key,
+                        Err(error) => {
+                            log::warn!("drop discovery watch put event with invalid utf-8 key: error={error}");
+                            continue;
+                        }
+                    };
                     let endpoint = match decode_endpoint_value_for_key(
                         &config.prefix,
                         key,
@@ -710,9 +811,13 @@ async fn watch_once(
                     let Some(kv) = event.kv() else {
                         continue;
                     };
-                    let key = kv
-                        .key_str()
-                        .map_err(|error| DiscoveryError::InvalidEndpointValue(error.to_string()))?;
+                    let key = match kv.key_str() {
+                        Ok(key) => key,
+                        Err(error) => {
+                            log::warn!("drop discovery watch delete event with invalid utf-8 key: error={error}");
+                            continue;
+                        }
+                    };
                     let parsed_key = match ServiceKey::parse(&config.prefix, key) {
                         Ok(parsed_key) => parsed_key,
                         Err(error) => {
@@ -843,6 +948,20 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_delay_handles_max_jitter_without_overflow() {
+        let mut config = EtcdDiscoveryConfig::new(
+            vec!["http://127.0.0.1:2379".to_string()],
+            "/curvine",
+            "test-cluster",
+        );
+        config.watch_reconnect_min_ms = u64::MAX;
+        config.watch_reconnect_max_ms = u64::MAX;
+        config.watch_reconnect_jitter_ratio = 1.0;
+
+        assert_eq!(reconnect_delay_ms(&config, 1, 0), u64::MAX);
+    }
+
+    #[test]
     fn config_rejects_invalid_reconnect_values() {
         let mut config = EtcdDiscoveryConfig::new(
             vec!["http://127.0.0.1:2379".to_string()],
@@ -850,7 +969,10 @@ mod tests {
             "test-cluster",
         );
         config.watch_reconnect_min_ms = 0;
-        assert!(config.validate().is_err());
+        assert!(matches!(
+            config.validate(),
+            Err(DiscoveryError::InvalidDiscoveryConfig(_))
+        ));
 
         let mut config = EtcdDiscoveryConfig::new(
             vec!["http://127.0.0.1:2379".to_string()],

@@ -2,9 +2,10 @@
 
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use curvine_service_discovery::{
-    decode_endpoint_value, encode_endpoint_value, EtcdDiscoveryConfig, EtcdServiceResolver,
-    RegistrationOptions, RegistrationStatus, ServiceEndpoint, ServiceKey, ServiceKind,
-    ServiceRegistry, ServiceResolver, ServiceResolverHandle, ServiceStatus, ServiceWatchEvent,
+    decode_endpoint_value, encode_endpoint_value, DiscoveryError, EtcdDiscoveryConfig,
+    EtcdServiceResolver, RegistrationOptions, RegistrationStatus, ServiceEndpoint, ServiceKey,
+    ServiceKind, ServiceRegistry, ServiceResolver, ServiceResolverHandle, ServiceStatus,
+    ServiceWatchEvent,
 };
 use etcd_client::{Client, DeleteOptions, PutOptions};
 use std::sync::Arc;
@@ -101,6 +102,38 @@ fn etcd_resolver_lists_registered_endpoint() {
             .delete(prefix, Some(DeleteOptions::new().with_prefix()))
             .await
             .unwrap();
+    });
+}
+
+#[test]
+fn etcd_resolver_list_skips_malformed_key() {
+    let Some(etcd_addr) = etcd_endpoint() else {
+        eprintln!("skip etcd integration test: CURVINE_ETCD_ADDR is not set");
+        return;
+    };
+
+    let rt = Arc::new(AsyncRuntime::single());
+    let resolver_rt = rt.clone();
+    rt.block_on(async move {
+        let prefix = unique_prefix("list-malformed-key");
+        let config =
+            EtcdDiscoveryConfig::new(vec![etcd_addr.clone()], prefix.clone(), "test-cluster");
+        let resolver = EtcdServiceResolver::connect(config, resolver_rt)
+            .await
+            .unwrap();
+        let kind = ServiceKind::try_new("mds").unwrap();
+        let mut bad_key = format!("{prefix}/test-cluster/services/mds/").into_bytes();
+        bad_key.push(0xff);
+        let mut client = Client::connect([etcd_addr.clone()], None).await.unwrap();
+
+        client
+            .put(bad_key, b"not-json".to_vec(), Some(PutOptions::new()))
+            .await
+            .unwrap();
+        let snapshot = resolver.list(kind).await.unwrap();
+        assert!(snapshot.endpoints.is_empty());
+
+        client_delete_prefix(etcd_addr, prefix).await;
     });
 }
 
@@ -218,6 +251,57 @@ fn etcd_resolver_watch_emits_incremental_changes() {
 }
 
 #[test]
+fn etcd_resolver_watch_skips_malformed_key_and_continues() {
+    let Some(etcd_addr) = etcd_endpoint() else {
+        eprintln!("skip etcd integration test: CURVINE_ETCD_ADDR is not set");
+        return;
+    };
+
+    let rt = Arc::new(AsyncRuntime::single());
+    let resolver_rt = rt.clone();
+    rt.block_on(async move {
+        let prefix = unique_prefix("watch-malformed-key");
+        let config =
+            EtcdDiscoveryConfig::new(vec![etcd_addr.clone()], prefix.clone(), "test-cluster");
+        let resolver = EtcdServiceResolver::connect(config, resolver_rt)
+            .await
+            .unwrap();
+        let kind = ServiceKind::try_new("mds").unwrap();
+        let service_key = ServiceKey::new(&prefix, "test-cluster", kind.clone(), "mds-1").unwrap();
+        let endpoint = endpoint("mds-1");
+        let mut client = Client::connect([etcd_addr.clone()], None).await.unwrap();
+        let mut handle = resolver.watch(kind).await.unwrap();
+
+        match next_watch_event(&mut handle).await {
+            ServiceWatchEvent::Reset(snapshot) => assert!(snapshot.endpoints.is_empty()),
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let mut bad_key = format!("{prefix}/test-cluster/services/mds/").into_bytes();
+        bad_key.push(0xff);
+        client
+            .put(bad_key, b"not-json".to_vec(), Some(PutOptions::new()))
+            .await
+            .unwrap();
+        client
+            .put(
+                service_key.as_string(),
+                encode_endpoint_value(&endpoint).unwrap(),
+                Some(PutOptions::new()),
+            )
+            .await
+            .unwrap();
+
+        match next_watch_event(&mut handle).await {
+            ServiceWatchEvent::Added(added) => assert_eq!(added, endpoint),
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        client_delete_prefix(etcd_addr, prefix).await;
+    });
+}
+
+#[test]
 fn etcd_registry_registers_and_shutdown_revokes_endpoint() {
     let Some(etcd_addr) = etcd_endpoint() else {
         eprintln!("skip etcd integration test: CURVINE_ETCD_ADDR is not set");
@@ -318,6 +402,42 @@ fn etcd_registry_update_preserves_lease_and_emits_updated() {
             other => panic!("unexpected event: {other:?}"),
         }
 
+        guard.shutdown().await.unwrap();
+        client_delete_prefix(etcd_addr, prefix).await;
+    });
+}
+
+#[test]
+fn etcd_registry_rejects_duplicate_service_id() {
+    let Some(etcd_addr) = etcd_endpoint() else {
+        eprintln!("skip etcd integration test: CURVINE_ETCD_ADDR is not set");
+        return;
+    };
+
+    let rt = Arc::new(AsyncRuntime::single());
+    let resolver_rt = rt.clone();
+    rt.block_on(async move {
+        let prefix = unique_prefix("duplicate-register");
+        let config =
+            EtcdDiscoveryConfig::new(vec![etcd_addr.clone()], prefix.clone(), "test-cluster");
+        let discovery = EtcdServiceResolver::connect(config, resolver_rt)
+            .await
+            .unwrap();
+        let guard = discovery
+            .register(endpoint("mds-1"), registration_options())
+            .await
+            .unwrap();
+
+        let err = match discovery
+            .register(endpoint("mds-1"), registration_options())
+            .await
+        {
+            Ok(_) => panic!("duplicate registration should fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(err, DiscoveryError::RegistrationAlreadyExists(_)));
+
+        guard.update_status(ServiceStatus::Draining).await.unwrap();
         guard.shutdown().await.unwrap();
         client_delete_prefix(etcd_addr, prefix).await;
     });

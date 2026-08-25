@@ -23,14 +23,25 @@ pub struct ServiceResolverHandle {
     kind: ServiceKind,
     reader: SnapshotReader,
     events: ServiceWatch,
+    _lifecycle_owner: Option<Arc<dyn Send + Sync>>,
 }
 
 impl ServiceResolverHandle {
     pub fn new(kind: ServiceKind, reader: SnapshotReader, events: ServiceWatch) -> Self {
+        Self::with_lifecycle_owner(kind, reader, events, None)
+    }
+
+    pub fn with_lifecycle_owner(
+        kind: ServiceKind,
+        reader: SnapshotReader,
+        events: ServiceWatch,
+        lifecycle_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Self {
         Self {
             kind,
             reader,
             events,
+            _lifecycle_owner: lifecycle_owner,
         }
     }
 
@@ -55,13 +66,23 @@ impl ServiceResolverHandle {
 pub struct SnapshotReader {
     cache: Arc<RwLock<ServiceSnapshot>>,
     allow_stale_cache: bool,
+    _lifecycle_owner: Option<Arc<dyn Send + Sync>>,
 }
 
 impl SnapshotReader {
     pub fn new(snapshot: ServiceSnapshot, allow_stale_cache: bool) -> Self {
+        Self::with_lifecycle_owner(snapshot, allow_stale_cache, None)
+    }
+
+    pub fn with_lifecycle_owner(
+        snapshot: ServiceSnapshot,
+        allow_stale_cache: bool,
+        lifecycle_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Self {
         Self {
             cache: Arc::new(RwLock::new(snapshot)),
             allow_stale_cache,
+            _lifecycle_owner: lifecycle_owner,
         }
     }
 
@@ -85,10 +106,9 @@ impl SnapshotReader {
     }
 
     #[allow(dead_code)]
-    pub(crate) async fn mark_stale(&self, last_update_ms: u64) {
+    pub(crate) async fn mark_stale(&self) {
         let mut snapshot = self.cache.write().await;
         snapshot.stale = true;
-        snapshot.last_update_ms = last_update_ms;
     }
 }
 
@@ -136,11 +156,11 @@ mod tests {
     async fn snapshot_reader_mark_stale_updates_cache() {
         let reader = SnapshotReader::new(snapshot(false), true);
 
-        reader.mark_stale(42).await;
+        reader.mark_stale().await;
         let snapshot = reader.snapshot().await.unwrap();
 
         assert!(snapshot.stale);
-        assert_eq!(snapshot.last_update_ms, 42);
+        assert_eq!(snapshot.last_update_ms, 1);
     }
 
     #[tokio::test]

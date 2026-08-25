@@ -110,6 +110,7 @@ feature / 构建策略：
 运行时约束：
 
 - `EtcdServiceRegistry` 和 `EtcdServiceResolver` 构造时必须接收 Curvine 注入的 `Arc<curvine_runtime::runtime::Runtime>`，后台 keepalive、watch、重连任务都通过该 runtime spawn。
+- `RegistrationGuard` / `ServiceResolverHandle` 必须持有必要的 runtime 生命周期 owner，避免 registry/resolver 被 drop 后后台 keepalive/watch 任务静默停止。
 - discovery crate 内禁止新建独立 Tokio runtime，避免与 Curvine 统一 runtime、shutdown 和测试模型冲突。
 - trait 可以保持 async API；provider 内部持有 runtime 仅用于管理后台任务生命周期。
 
@@ -264,6 +265,8 @@ impl RegistrationOptions {
 
 注销通过 `RegistrationGuard` 完成，不在 registry 上暴露裸 `unregister(service_id)`。这样可以避免调用方只传 `service_id` 时缺失 `cluster_id` / `service_kind` 导致删错 key。
 
+注册同一个 `{kind, service_id}` 必须是原子 create-if-absent 语义。已有 live registration 时，新的 `register()` 返回 `RegistrationAlreadyExists`，不能覆盖旧 key 的 lease；旧 guard 也不能在新实例注册后继续用旧 lease 覆盖新值。
+
 `RegistrationOptions::validate()` 规则：
 
 - `lease_ttl_secs > 0`。
@@ -334,10 +337,10 @@ pub enum ServiceWatchEvent {
 
 错误模型约定：
 
-- 参数校验失败返回 `InvalidServiceKind`、`InvalidServiceId` 或 `InvalidRegistrationOptions`。
+- 参数校验失败返回 `InvalidServiceKind`、`InvalidServiceId`、`InvalidRegistrationOptions` 或 `InvalidDiscoveryConfig`。
 - `DiscoveryError` 使用 `thiserror::Error` 派生；`etcd_client::Error` 通过 `From` 转换为 `EtcdUnavailable` 或更具体的 provider 错误，避免业务侧直接依赖 etcd error 类型。
 - 对外接入已有模块时，在模块边界再把 `DiscoveryError` 映射为 `curvine_core_error::CommonError` 或 `curvine_error::FsError`，不要在 discovery crate 内混入业务 RPC 错误语义。
-- endpoint JSON 解码失败返回或记录 `InvalidEndpointValue`；watch 路径忽略该 endpoint 并继续处理后续事件。
+- endpoint JSON 解码失败返回或记录 `InvalidEndpointValue`；list/watch 路径必须忽略 malformed key/value 并继续处理后续 endpoint，避免单条脏数据毒化整个服务发现。
 - key/value 的 kind 或 id 不一致时使用 `KeyValueMismatch`，resolver 丢弃该 endpoint。
 - etcd 连接、请求或 watch stream 创建失败返回 `EtcdUnavailable`。
 - watch revision 被 compact 时使用 `WatchCompacted`，provider 随后重新 list 并发送 `Reset(ServiceSnapshot)`。
@@ -637,7 +640,7 @@ watch 断开期间，`next_event()` 不持续向调用方刷错误；provider �
 - 读路径不能阻塞 watch 更新路径。
 - watch 断开时，如果 `allow_stale_cache = true`，`ServiceResolverHandle::snapshot()` 可继续返回旧 endpoint，但必须通过指标和日志暴露 cache stale 状态。
 - watch 断开时，如果 `allow_stale_cache = false`，`ServiceResolverHandle::snapshot()` 必须返回 `DiscoveryError::StaleCache`，不能返回空集合，避免调用方误判为当前没有服务实例。
-- watch 恢复时必须将 `stale` 置回 `false`，并更新 `last_update_ms`。如果是 compact 或本地状态不可信导致的恢复，必须先完成全量 refresh，并向 `ServiceResolverHandle` 发送 `Reset(ServiceSnapshot)`；如果是普通 transient 断线且能从最后处理 revision + 1 续接，可不发送 `Reset`。
+- watch 恢复或收到 progress/create 确认时必须将 `stale` 置回 `false`，并在成功确认 cache 对应 revision 后更新 `last_update_ms`；仅标记 stale 时不能覆盖 `last_update_ms`。如果是 compact 或本地状态不可信导致的恢复，必须先完成全量 refresh，并向 `ServiceResolverHandle` 发送 `Reset(ServiceSnapshot)`；如果是普通 transient 断线且能从最后处理 revision + 1 续接，可不发送 `Reset`。
 - stale 状态第一阶段通过 `ServiceSnapshot::stale`、指标和日志暴露，不新增专门的 watch event。
 
 ## Endpoint 使用边界
@@ -784,11 +787,13 @@ log = { workspace = true, optional = true }
 - `RegistrationOptions::validate()` 拒绝 0 值以及 `lease_ttl_secs < keep_alive_interval_secs * 3`。
 - `ServiceResolverHandle::snapshot()` 在 stale cache 且 `allow_stale_cache = false` 时返回 `DiscoveryError::StaleCache`。
 - `RegistrationGuard::update_endpoint()` 拒绝修改 `kind` / `id`，并拒绝 `component_info.component` 与 kind 不一致的 endpoint。
+- 重复注册相同 `{kind, service_id}` 必须失败，并且失败路径要回收新建 lease。
 - `KeepAliveLost` 后 `update_status()` / `update_endpoint()` 返回错误。
 - `update_status()` / `update_endpoint()` 必须保留原 lease；更新后 key 的 lease id 不变且 TTL 仍会自动过期。
 - `update_status()` / `update_endpoint()` 成功后 watch 侧收到 `Updated(ServiceEndpoint)`。
 - watch 事件到 cache 的 upsert/delete 逻辑。
 - `ServiceSnapshot::stale` 和 `last_update_ms` 状态更新逻辑。
+- malformed etcd key/value 只影响对应事件或记录，不能导致 list/watch 整体不可用。
 - `ServiceStatus::Draining` 只透传给调用方，discovery 不主动删除 endpoint。
 
 ### 集成测试
@@ -796,6 +801,8 @@ log = { workspace = true, optional = true }
 真实 etcd 集成测试默认不进入普通 `cargo test` 路径：测试应标记 `#[ignore]`，或在未设置 `CURVINE_ETCD_ADDR` 时主动 skip。CI 可新增可选 job，通过 etcd sidecar 启用 `--features etcd` 并运行这些测试。
 
 - 启动本地 etcd，注册一个测试服务实例，调用方能 list 到 endpoint。
+- 重复注册相同 `{kind, service_id}` 返回错误，并且不会覆盖已有 registration 的 lease/value。
+- malformed key/value 不会导致 list/watch 整体失败，后续合法 endpoint 仍能被处理。
 - 服务实例 revoke lease 后，调用方 watch 收到 DELETE。
 - 服务进程模拟崩溃后，lease TTL 到期，endpoint 自动消失。
 - list 完成后、watch 建立前插入或删除 endpoint，不丢事件。
