@@ -101,11 +101,21 @@ pub fn read_file_text<T: AsRef<str>>(path: T) -> CommonResult<String> {
 /// `overlays` are applied in order, each on top of the previous result
 /// (reserved for future formats / runtime overlay layers).
 pub fn build_document(file_text: &str, overlays: &[toml::Value]) -> CommonResult<toml::Value> {
+    build_document_with(file_text, overlays, &real_env_lookup)
+}
+
+/// [`build_document`] with an injected environment lookup (tests pass a map;
+/// production passes the real process environment).
+pub fn build_document_with(
+    file_text: &str,
+    overlays: &[toml::Value],
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> CommonResult<toml::Value> {
     let mut doc: toml::Value = try_err!(toml::from_str(file_text));
     for overlay in overlays {
         deep_merge(&mut doc, overlay);
     }
-    apply_env_layer_with(&mut doc, LoadProfile::Full, &real_env_lookup)?;
+    apply_env_layer_with(&mut doc, LoadProfile::Full, lookup)?;
     Ok(doc)
 }
 
@@ -114,11 +124,20 @@ pub fn build_transfer_document(
     file_text: &str,
     overlays: &[toml::Value],
 ) -> CommonResult<toml::Value> {
+    build_transfer_document_with(file_text, overlays, &real_env_lookup)
+}
+
+/// [`build_transfer_document`] with an injected environment lookup.
+pub fn build_transfer_document_with(
+    file_text: &str,
+    overlays: &[toml::Value],
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> CommonResult<toml::Value> {
     let mut doc: toml::Value = try_err!(toml::from_str(file_text));
     for overlay in overlays {
         deep_merge(&mut doc, overlay);
     }
-    apply_env_layer_with(&mut doc, LoadProfile::Transfer, &real_env_lookup)?;
+    apply_env_layer_with(&mut doc, LoadProfile::Transfer, lookup)?;
     Ok(doc)
 }
 
@@ -154,11 +173,23 @@ pub fn apply_env_layer_with(
         })
         .collect();
 
-    if net_interface_set(doc) {
-        let interface = doc_string(doc, &[NET_INTERFACE_KEY])
-            .unwrap_or_default()
-            .trim()
-            .to_string();
+    let trimmed_interface = doc_string(doc, &[NET_INTERFACE_KEY])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    // Persist the trim decision into the document: after deserialization,
+    // `ClusterConf.net_interface` must agree with what this layer decided,
+    // instead of relying on a later normalize step to reconcile " " vs "".
+    if doc.get(NET_INTERFACE_KEY).is_some() {
+        set_dotted(
+            doc,
+            NET_INTERFACE_KEY,
+            toml::Value::String(trimmed_interface.clone()),
+        )?;
+    }
+
+    if !trimmed_interface.is_empty() {
+        let interface = trimmed_interface;
         let ip = ClusterConf::interface_ipv4(&interface)?;
 
         // net_interface takes precedence over the CURVINE_*_HOSTNAME env vars.
@@ -167,10 +198,10 @@ pub fn apply_env_layer_with(
         // effect can tell why. Runs before Logger::init — use eprintln!.
         let mut touched = Vec::new();
         for entry in &scoped {
-            if lookup(entry.var).is_some() {
+            if let Some(value) = lookup(entry.var) {
                 eprintln!(
-                    "[WARN] net_interface '{}' is set (resolved to {}); ignoring {}.",
-                    interface, ip, entry.var
+                    "[WARN] net_interface '{}' is set (resolved to {}); ignoring {}='{}'.",
+                    interface, ip, entry.var, value
                 );
             }
             // The NIC-resolved IP replaces every path the profile's allowlist
@@ -197,12 +228,6 @@ pub fn apply_env_layer_with(
     Ok(())
 }
 
-fn net_interface_set(doc: &toml::Value) -> bool {
-    doc_string(doc, &[NET_INTERFACE_KEY])
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false)
-}
-
 // ---------------------------------------------------------------------------
 // toml::Value navigation helpers
 // ---------------------------------------------------------------------------
@@ -224,18 +249,22 @@ pub fn set_dotted(doc: &mut toml::Value, path: &str, value: toml::Value) -> Comm
         return err_box!("empty config path");
     }
     let mut cur = doc;
+    let mut collision_at = "";
     for seg in &segments[..segments.len() - 1] {
         if !cur.is_table() {
             return err_box!(
                 "config path '{}' collides with a non-table value at '{}'",
                 path,
-                seg
+                collision_at
             );
         }
         let table = cur.as_table_mut().expect("checked is_table");
         cur = table
             .entry(seg.to_string())
             .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
+        // The value we just descended into is where a non-table collision
+        // would be detected on the NEXT iteration — name it, not `seg`.
+        collision_at = seg;
     }
     let last = segments[segments.len() - 1];
     if !cur.is_table() {
@@ -479,7 +508,7 @@ mod tests {
 
     #[test]
     fn whitespace_only_net_interface_falls_back_to_env() {
-        let mut doc: toml::Value = toml::from_str("net_interface = \" \"").unwrap();
+        let mut doc: toml::Value = toml::from_str("net_interface = \"   \"").unwrap();
         let env = lookup(&[(ClusterConf::ENV_WORKER_HOSTNAME, "worker-01")]);
         apply_env_layer_with(&mut doc, LoadProfile::Full, &env).unwrap();
 
@@ -487,10 +516,105 @@ mod tests {
             doc_string(&doc, &["worker", "hostname"]),
             Some("worker-01".into())
         );
+        // The trim decision is persisted: the deserialized config must agree
+        // with the layer (no split-brain between "" and " ").
+        assert_eq!(doc_string(&doc, &[NET_INTERFACE_KEY]), Some(String::new()));
+        let conf: ClusterConf = doc.try_into().unwrap();
+        assert_eq!(conf.net_interface, "");
+    }
+
+    // The NIC-precedence path from #1619's test plan: a set net_interface wins
+    // over every CURVINE_*_HOSTNAME var for the Full profile. Assert on the
+    // deserialized ClusterConf so a regression that re-applies env on top of a
+    // set NIC — or forgets journal.hostname — cannot stay green.
+    #[test]
+    fn net_interface_wins_over_env_on_typed_config() {
+        #[cfg(target_os = "macos")]
+        let loopback = "lo0";
+        #[cfg(not(target_os = "macos"))]
+        let loopback = "lo";
+
+        // net_interface is part of the file layer, exactly as an operator
+        // would write it; the env vars are set alongside it.
+        let text = format!(
+            r#"
+            net_interface = "{loopback}"
+
+            [master]
+            hostname = "file-master"
+
+            [journal]
+            journal_addrs = []
+
+            [worker]
+            hostname = "file-worker"
+
+            [client]
+            hostname = "file-client"
+
+            [transfer]
+            hostname = "file-transfer"
+        "#
+        );
+        let env_map = lookup(&[
+            (ClusterConf::ENV_MASTER_HOSTNAME, "env-master"),
+            (ClusterConf::ENV_WORKER_HOSTNAME, "env-worker"),
+            (ClusterConf::ENV_CLIENT_HOSTNAME, "env-client"),
+            (ClusterConf::ENV_TRANSFER_HOSTNAME, "env-transfer"),
+        ]);
+        let doc = build_document_with(&text, &[], &env_map).unwrap();
+
+        let conf: ClusterConf = doc.try_into().unwrap();
+        assert_eq!(conf.net_interface, loopback);
+        assert_eq!(conf.master.hostname, "127.0.0.1");
+        assert_eq!(conf.journal.hostname, "127.0.0.1");
+        assert_eq!(conf.worker.hostname, "127.0.0.1");
+        assert_eq!(conf.client.hostname, "127.0.0.1");
+        assert_eq!(conf.transfer.hostname, "127.0.0.1");
+        // Env values are ignored entirely when the NIC wins.
+        assert_ne!(conf.master.hostname, "env-master");
+        assert_ne!(conf.worker.hostname, "env-worker");
+    }
+
+    // Discovery order without mutating process env: cwd file > conf/ >
+    // $HOME/.curvine/ > $CURVINE_HOME/conf/, with the HOME/CURVINE_HOME
+    // entries present only when those variables are set.
+    #[test]
+    fn default_candidates_follow_documented_order() {
+        let candidates = ConfigLoader::default_candidates();
+        let names: Vec<String> = candidates
+            .iter()
+            .map(|(p, _)| p.to_string_lossy().to_string())
+            .collect();
+
+        assert_eq!(names[0], ConfigLoader::DEFAULT_FILE_NAME);
+        assert_eq!(
+            names[1],
+            format!("conf/{}", ConfigLoader::DEFAULT_FILE_NAME)
+        );
+
+        let mut expected_len = 2;
+        if std::env::var_os("HOME").is_some() {
+            assert!(
+                names[expected_len].contains(".curvine"),
+                "third candidate must be $HOME/.curvine/: {names:?}"
+            );
+            expected_len += 1;
+        }
+        if std::env::var("CURVINE_HOME").is_ok() {
+            assert!(
+                !names[expected_len].contains(".curvine")
+                    && names[expected_len]
+                        .ends_with(&format!("conf/{}", ConfigLoader::DEFAULT_FILE_NAME)),
+                "next candidate must be $CURVINE_HOME/conf/: {names:?}"
+            );
+            expected_len += 1;
+        }
+        assert_eq!(names.len(), expected_len);
     }
 
     #[test]
-    fn build_document_parses_file_and_applies_env() {
+    fn build_document_with_parses_file_and_applies_env() {
         let text = r#"
             [master]
             hostname = "file-master"
@@ -498,10 +622,10 @@ mod tests {
             [client]
             hostname = "file-client"
         "#;
-        let env_map = lookup(&[(ClusterConf::ENV_MASTER_HOSTNAME, "env-master")]);
-        // build_document uses real env; emulate by calling the stages directly.
-        let mut doc: toml::Value = toml::from_str(text).unwrap();
-        apply_env_layer_with(&mut doc, LoadProfile::Full, &env_map).unwrap();
+        let env_map = lookup(&[(ClusterConf::ENV_MASTER_HOSTNAME, " env-master ")]);
+        // Exercise the public entry point with an injected lookup so the real
+        // stage wiring is covered, not a re-implementation of it.
+        let doc = build_document_with(text, &[], &env_map).unwrap();
 
         assert_eq!(
             doc_string(&doc, &["master", "hostname"]),
