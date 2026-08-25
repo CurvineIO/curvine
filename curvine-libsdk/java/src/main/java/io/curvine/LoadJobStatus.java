@@ -60,10 +60,11 @@ public final class LoadJobStatus {
     }
 
     public static LoadJobStatus fromProto(GetJobStatusResponse response) {
+        JobTaskStateProto state = response.getState();
         return new LoadJobStatus(
                 response.getJobId(),
-                response.getState(),
-                response.getState().getNumber(),
+                state,
+                state.getNumber(),
                 response.getSourcePath(),
                 response.getTargetPath(),
                 response.getProgress());
@@ -90,8 +91,10 @@ public final class LoadJobStatus {
     }
 
     /**
-     * True when the job is no longer running (completed, failed, canceled, partial success,
-     * or any future terminal enum value / {@code UNRECOGNIZED} wire value).
+     * True when the job is no longer running (completed, failed, canceled, or partial success).
+     * Under proto2, unknown wire enum values decode to {@code UNKNOWN} and are treated as
+     * non-terminal; full forward-compat for future terminal states requires a preserved raw
+     * state field on the wire (for example {@code state_value} in {@code job.proto}).
      */
     public boolean isFinished() {
         switch (state) {
