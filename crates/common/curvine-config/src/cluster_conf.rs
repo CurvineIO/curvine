@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::{
-    CliConf, ClientConf, DBConf, FuseConf, JobConf, JournalConf, MasterConf, TransferConf,
+    CliConf, ClientConf, DBConf, FuseConf, JobConf, JournalConf, MasterConf, MdsConf, TransferConf,
     WorkerConf,
 };
 use curvine_core_error::{err_box, try_err, CommonResult};
@@ -50,6 +50,8 @@ pub struct ClusterConf {
     pub net_interface: String,
 
     pub master: MasterConf,
+
+    pub mds: MdsConf,
 
     // Log synchronization configuration.
     pub journal: JournalConf,
@@ -96,6 +98,7 @@ impl ClusterConf {
         conf.normalize_whitespace();
         conf.apply_hostname_overrides()?;
         conf.master.init()?;
+        conf.mds.init()?;
         conf.client.init()?;
         conf.fuse.init()?;
         conf.job.init()?;
@@ -328,6 +331,22 @@ impl ClusterConf {
         web_conf
     }
 
+    pub fn mds_server_conf(&self) -> ServerConf {
+        let mut conf = ServerConf::with_hostname(&self.mds.hostname, self.mds.rpc_port);
+        conf.name = format!("{}-mds", self.cluster_id);
+        conf.io_threads = self.mds.io_threads;
+        conf.worker_threads = self.mds.worker_threads;
+        conf
+    }
+
+    pub fn mds_web_conf(&self) -> ServerConf {
+        let mut conf = ServerConf::with_hostname(&self.mds.hostname, self.mds.web_port);
+        conf.name = format!("{}-mds", self.cluster_id);
+        conf.io_threads = self.mds.io_threads;
+        conf.worker_threads = self.mds.worker_threads;
+        conf
+    }
+
     pub fn worker_addr(&self) -> InetAddr {
         InetAddr::new(self.worker.hostname.clone(), self.worker.rpc_port)
     }
@@ -494,6 +513,7 @@ impl Default for ClusterConf {
             cluster_id: "curvine".to_string(),
             net_interface: String::new(),
             master: Default::default(),
+            mds: Default::default(),
             journal: Default::default(),
             worker: Default::default(),
             fault_injection: Default::default(),
@@ -679,7 +699,24 @@ mod tests {
         let conf = ClusterConf::from(path).unwrap();
 
         assert_eq!(conf.master.rpc_port, ClusterConf::DEFAULT_MASTER_PORT);
+        assert!(!conf.mds.enabled);
         assert!(!conf.client.master_addrs.is_empty());
+    }
+
+    #[test]
+    fn legacy_config_without_mds_uses_disabled_defaults() {
+        let conf: ClusterConf = toml::from_str(
+            r#"
+                cluster_id = "legacy"
+
+                [master]
+            "#,
+        )
+        .unwrap();
+
+        assert!(!conf.mds.enabled);
+        assert_eq!(conf.mds.rpc_port, crate::MdsConf::DEFAULT_RPC_PORT);
+        assert_eq!(conf.mds.web_port, crate::MdsConf::DEFAULT_WEB_PORT);
     }
 
     #[test]

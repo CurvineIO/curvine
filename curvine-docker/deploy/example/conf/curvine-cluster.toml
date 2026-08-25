@@ -23,6 +23,14 @@ meta_dir = "./data/meta"
 audit_logging_enabled = true
 log = { level = "info", log_dir = "./logs", file_name = "master.log" }
 
+# Optional standalone stateless metadata service. It is disabled by default;
+# start it with `curvine-server --service mds` only after enabling this flag.
+[mds]
+enabled = false
+hostname = "0.0.0.0"
+rpc_port = 8998
+web_port = 9004
+
 [journal]
 rpc_port = 8996
 journal_addrs = [

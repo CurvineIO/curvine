@@ -53,6 +53,14 @@ log = { level = "info", log_dir = "stdout", file_name = "master.log" }
 # min_client_version = "0.1.0"
 # blocked_versions = ["0.2.5"]
 
+# Optional standalone stateless metadata service. Disabled by default; start it
+# with `curvine-server --service mds` after enabling this flag.
+[mds]
+enabled = false
+hostname = "localhost"
+rpc_port = 8998
+web_port = 9004
+
 
 # masta ha raft configuration.
 [journal]

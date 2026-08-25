@@ -27,4 +27,5 @@ pub mod storage {
 
 pub use curvine_data_transfer as data_transfer;
 pub use curvine_master::master;
+pub use curvine_mds as mds;
 pub use curvine_worker as worker;
