@@ -35,6 +35,8 @@ pub struct MasterMetrics {
     pub(crate) fs_used: Gauge,
     pub(crate) block_num: Gauge,
     pub(crate) blocks_size_avg: Gauge,
+    pub(crate) allocatable_capacity: Gauge,
+    pub(crate) allocatable_available: Gauge,
 
     pub(crate) worker_num: GaugeVec,
 
@@ -110,6 +112,14 @@ impl MasterMetrics {
             fs_used: m::new_gauge("fs_used", "Space used by the file system")?,
             block_num: m::new_gauge("num_blocks", "Total block number")?,
             blocks_size_avg: m::new_gauge("blocks_size_avg", "Average block size")?,
+            allocatable_capacity: m::new_gauge(
+                "allocatable_capacity",
+                "Storage capacity eligible for new writes (Live workers only)",
+            )?,
+            allocatable_available: m::new_gauge(
+                "allocatable_available",
+                "Available space eligible for new writes (Live workers only)",
+            )?,
             worker_num: m::new_gauge_vec("worker_num", "The number of lived workers", &["tag"])?,
 
             journal_queue_len: m::new_gauge("journal_queue_len", "Journal queue length")?,
@@ -221,6 +231,10 @@ impl MasterMetrics {
         self.available.set(filesystem_info.available);
         self.fs_used.set(filesystem_info.fs_used);
         self.block_num.set(filesystem_info.block_num);
+        self.allocatable_capacity
+            .set(filesystem_info.allocatable_capacity);
+        self.allocatable_available
+            .set(filesystem_info.allocatable_available);
         self.used_memory_bytes.set(SysUtils::used_memory() as i64);
 
         if filesystem_info.block_num > 0 {

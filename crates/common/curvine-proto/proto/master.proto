@@ -260,6 +260,11 @@ message GetFilesystemInfoResponse {
     repeated WorkerInfoProto lost_workers = 14;
 
     optional uint64 active_raft_id = 15;
+    // Capacity/available eligible for new writes (Live workers only). Absent
+    // on legacy masters; clients fall back to `capacity`/`available`.
+    // Numbered 16/17 so next's existing `active_raft_id` (15) is preserved.
+    optional int64 allocatable_capacity = 16 [default = 0];
+    optional int64 allocatable_available = 17 [default = 0];
 
     // Default compatibility contract offered by this master (handshake).
     // Cross-cutting protocol metadata on the reserved 1000+ range; legacy
