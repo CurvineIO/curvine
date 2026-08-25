@@ -167,6 +167,11 @@ trait-variant = "0.1.2"
 nix = { version = "0.30.1", features = ["ioctl", "user", "event"] }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 mysql = "25.0.1"
+native-tls = "0.2.18"
+postgres = "0.19.13"
+postgres-native-tls = "0.5.3"
+r2d2 = "0.8.10"
+r2d2_postgres = "0.18.2"
 
 # The most important library end
 
@@ -225,6 +230,7 @@ fxhash = "0.2.1"
 parking_lot = "0.12.3"
 linkme = "0.3.35"
 anyhow = "1.0.97"
+percent-encoding = "2.3.1"
 url = "2.2.2"
 async-trait = "0.1.76"
 fastrand = "1.9.0"

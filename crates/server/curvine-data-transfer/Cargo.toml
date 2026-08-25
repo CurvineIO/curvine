@@ -11,10 +11,21 @@ transfer = ["dep:uuid"]
 transfer-web = ["transfer", "dep:axum", "dep:curvine-web"]
 transfer-store-sqlite = ["transfer", "dep:rusqlite"]
 transfer-store-mysql = ["transfer", "dep:mysql"]
+transfer-store-postgres = [
+    "transfer",
+    "dep:native-tls",
+    "dep:postgres",
+    "dep:postgres-native-tls",
+    "dep:percent-encoding",
+    "dep:r2d2",
+    "dep:r2d2_postgres",
+    "dep:url",
+]
 transfer-server = [
     "transfer-web",
     "transfer-store-sqlite",
     "transfer-store-mysql",
+    "transfer-store-postgres",
 ]
 opendal = ["curvine-unified-fs/opendal"]
 opendal-s3 = ["opendal", "curvine-unified-fs/opendal-s3"]
@@ -60,4 +71,15 @@ once_cell = { workspace = true }
 axum = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 mysql = { workspace = true, optional = true }
+native-tls = { workspace = true, optional = true }
+postgres = { workspace = true, optional = true }
+postgres-native-tls = { workspace = true, optional = true }
+percent-encoding = { workspace = true, optional = true }
+r2d2 = { workspace = true, optional = true }
+r2d2_postgres = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+
+[[test]]
+name = "postgres_store_test"
+required-features = ["transfer-store-postgres"]

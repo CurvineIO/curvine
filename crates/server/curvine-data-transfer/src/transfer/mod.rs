@@ -14,6 +14,11 @@ mod mysql_store;
 #[cfg(feature = "transfer-store-mysql")]
 pub use self::mysql_store::MysqlTransferStore;
 
+#[cfg(feature = "transfer-store-postgres")]
+mod postgres_store;
+#[cfg(feature = "transfer-store-postgres")]
+pub use self::postgres_store::PostgresTransferStore;
+
 mod metrics;
 pub use self::metrics::TransferMetrics;
 

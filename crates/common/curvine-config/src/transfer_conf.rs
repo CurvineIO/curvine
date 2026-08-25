@@ -25,6 +25,7 @@ pub enum TransferStoreType {
     Memory,
     Sqlite,
     Mysql,
+    Postgres,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,7 +135,7 @@ impl TransferConf {
             DurationUnit::from_str(&self.terminal_retention_str)?.as_duration();
         if !self.store_url.is_empty() && self.effective_store_type() == TransferStoreType::Auto {
             return Err(FsError::common(
-                "transfer.store_url must use memory://, sqlite://, or mysql://",
+                "transfer.store_url must use memory://, sqlite://, mysql://, postgres://, or postgresql://",
             ));
         }
         match self.effective_store_type() {
@@ -148,10 +149,20 @@ impl TransferConf {
                     "transfer.store_url=mysql:// requires a database URL",
                 ));
             }
+            TransferStoreType::Postgres if self.postgres_store_url().is_empty() => {
+                return Err(FsError::common(
+                    "transfer.store_url=postgres:// requires a database URL",
+                ));
+            }
             _ => {}
         }
-        if self.enabled && self.effective_store_type() == TransferStoreType::Mysql {
-            self.validate_mysql_store()?;
+        if self.enabled
+            && matches!(
+                self.effective_store_type(),
+                TransferStoreType::Mysql | TransferStoreType::Postgres
+            )
+        {
+            self.validate_production_store()?;
         }
         if self.max_running_transfers == 0 {
             return Err(FsError::common(
@@ -200,6 +211,7 @@ impl TransferConf {
             TransferStoreType::Memory => "memory://".to_string(),
             TransferStoreType::Sqlite => format!("sqlite://{}", self.sqlite_path),
             TransferStoreType::Mysql => self.mysql_url.clone(),
+            TransferStoreType::Postgres => String::new(),
             TransferStoreType::Auto => String::new(),
         };
     }
@@ -212,6 +224,10 @@ impl TransferConf {
                 TransferStoreType::Sqlite
             } else if self.store_url.starts_with("mysql://") {
                 TransferStoreType::Mysql
+            } else if self.store_url.starts_with("postgres://")
+                || self.store_url.starts_with("postgresql://")
+            {
+                TransferStoreType::Postgres
             } else {
                 TransferStoreType::Auto
             };
@@ -237,7 +253,11 @@ impl TransferConf {
         }
     }
 
-    fn validate_mysql_store(&self) -> FsResult<()> {
+    pub fn postgres_store_url(&self) -> &str {
+        &self.store_url
+    }
+
+    fn validate_production_store(&self) -> FsResult<()> {
         if self.allow_submit_with_stale_snapshot {
             return Err(FsError::common(
                 "production transfer forbids transfer.allow_submit_with_stale_snapshot=true",
@@ -479,7 +499,7 @@ mod tests {
 
         let mut invalid = TransferConf {
             enabled: true,
-            store_url: "postgres://transfer".to_string(),
+            store_url: "unsupported://transfer".to_string(),
             ..Default::default()
         };
         let err = invalid.init().unwrap_err().to_string();

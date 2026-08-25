@@ -139,6 +139,10 @@ subnqn = "nqn.2024-01.io.curvine:subsystem2"
 # Set to true to start the standalone Transfer service. Local SQLite storage,
 # replica metadata reader and localhost:9010 are inferred by default. Transfer
 # uses its own RPC/Web ports and log file; it does not reuse Master settings.
+# Production stores use store_url. TLS validates the system trust store; add
+# sslrootcert for a PostgreSQL server signed by a private CA:
+# store_url = "postgresql://user:password@postgres-host:5432/curvine_transfer?sslmode=require"
+# store_url = "postgresql://user:password@postgres-host:5432/curvine_transfer?sslmode=require&sslrootcert=/etc/curvine/postgres-ca.pem"
 enabled = false
 rpc_port = 9010
 web_port = 9011

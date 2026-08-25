@@ -30,9 +30,9 @@ use log::info;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::transfer::{
-    ClusterMetadataCache, MemoryTransferStore, MysqlTransferStore, SqliteTransferStore,
-    TransferHandler, TransferMetrics, TransferPlanner, TransferRouterHandler, TransferScheduler,
-    TransferService, TransferStoreBackend,
+    ClusterMetadataCache, MemoryTransferStore, MysqlTransferStore, PostgresTransferStore,
+    SqliteTransferStore, TransferHandler, TransferMetrics, TransferPlanner, TransferRouterHandler,
+    TransferScheduler, TransferService, TransferStoreBackend,
 };
 
 #[derive(Clone)]
@@ -110,6 +110,9 @@ impl TransferServer {
             TransferStoreType::Mysql => TransferStoreBackend::Mysql(MysqlTransferStore::open(
                 conf.transfer.mysql_store_url(),
             )?),
+            TransferStoreType::Postgres => TransferStoreBackend::Postgres(
+                PostgresTransferStore::open(conf.transfer.postgres_store_url())?,
+            ),
         });
         let store_backend = store.backend_label();
         let report_endpoints = if conf.transfer.endpoints.is_empty() {
