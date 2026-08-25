@@ -2772,6 +2772,7 @@ dependencies = [
  "curvine-rpc",
  "curvine-runtime",
  "log",
+ "once_cell",
  "serde",
  "tokio",
  "toml",

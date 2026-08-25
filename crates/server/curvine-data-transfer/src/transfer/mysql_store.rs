@@ -21,10 +21,13 @@ use curvine_model::{
 };
 use mysql::prelude::*;
 use mysql::{params, Params, Pool, PooledConn, TxOpts, Value as MysqlValue};
+use std::collections::BTreeSet;
+use std::thread;
+use std::time::Duration;
 
 use crate::transfer::{
-    apply_task_report_progress, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
-    TransferTaskStateUpdate,
+    apply_task_report_progress, TransferMountSnapshotUpdate, TransferPlannedTasks,
+    TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
 };
 
 const TRANSFER_SCHEMA_VERSION: u64 = 4;
@@ -71,46 +74,45 @@ impl TransferStore for MysqlTransferStore {
         &self,
         job: TransferJobRecord,
     ) -> FsResult<TransferJobRecord> {
-        let mut conn = self.conn()?;
-        let mut tx = conn
-            .start_transaction(TxOpts::default())
-            .map_err(mysql_err)?;
-        if let Some(existing) =
-            select_job_by_request(&mut tx, &job.submitter, &job.client_request_id)?
-        {
-            if existing.command_json != job.command_json {
-                return Err(FsError::common(format!(
-                    "Transfer request ID {} submitted by {} is already bound to job {} with a different command",
-                    job.client_request_id, job.submitter, existing.job_id
-                )));
+        const MAX_PERSIST_RETRIES: usize = 3;
+
+        for attempt in 0..MAX_PERSIST_RETRIES {
+            let mut conn = self.conn()?;
+            match insert_job_raw(&mut conn, job_params(&job)?) {
+                Ok(()) => return Ok(job),
+                Err(err) if mysql_error_code(&err) == Some(1062) => {
+                    let existing =
+                        select_job_by_request(&mut conn, &job.submitter, &job.client_request_id)?
+                            .ok_or_else(|| {
+                            FsError::transfer_store_unavailable(
+                                "Transfer request duplicate was committed but could not be read",
+                            )
+                        })?;
+                    if existing.command_json != job.command_json {
+                        return Err(FsError::common(format!(
+                            "Transfer request ID {} submitted by {} is already bound to job {} with a different command",
+                            job.client_request_id, job.submitter, existing.job_id
+                        )));
+                    }
+                    return Ok(existing);
+                }
+                Err(err)
+                    if matches!(mysql_error_code(&err), Some(1205 | 1213))
+                        && attempt + 1 < MAX_PERSIST_RETRIES =>
+                {
+                    log::warn!(
+                        "retrying transfer submit persistence after MySQL transient error code={} attempt={}/{}",
+                        mysql_error_code(&err).unwrap_or_default(),
+                        attempt + 1,
+                        MAX_PERSIST_RETRIES
+                    );
+                    thread::sleep(Duration::from_millis(2_u64.saturating_pow(attempt as u32)));
+                }
+                Err(err) => return Err(mysql_err(err)),
             }
-            tx.commit().map_err(mysql_err)?;
-            return Ok(existing);
         }
-        if let Some(existing) = select_non_terminal_job_by_key(&mut tx, &job.job_key)? {
-            if existing.command_json == job.command_json {
-                tx.commit().map_err(mysql_err)?;
-                return Ok(existing);
-            }
-            return Err(FsError::transfer_already_running(format!(
-                "job_key {} has running job {} with different command",
-                existing.job_key, existing.job_id
-            )));
-        }
-        if let Some(existing) = select_conflicting_active_transfer(
-            &mut tx,
-            &job.target_path,
-            &job.submitter,
-            &job.client_request_id,
-        )? {
-            return Err(FsError::transfer_target_conflict(format!(
-                "target {} conflicts with active transfer {} target {}",
-                job.target_path, existing.job_id, existing.target_path
-            )));
-        }
-        insert_job(&mut tx, &job)?;
-        tx.commit().map_err(mysql_err)?;
-        Ok(job)
+
+        unreachable!("transfer submit persistence retry loop must return")
     }
 
     fn get_transfer(&self, job_id: &str) -> FsResult<Option<TransferJobRecord>> {
@@ -340,21 +342,8 @@ impl TransferStore for MysqlTransferStore {
                 .map_err(mysql_err)?;
         }
         if job.is_none() && executing < max_executing_transfers {
-            job = tx
-                .exec_first(
-                    "select pending.job_id, pending.run_id, pending.lease_epoch, pending.state
-                     from transfer_jobs pending
-                     where pending.state = 1 and pending.lease_expire_at <= :now_ms
-                     order by case when exists (
-                         select 1 from transfer_jobs executing
-                         where executing.tenant = pending.tenant and executing.state in (2, 3, 4, 5)
-                         limit 1
-                     ) then 1 else 0 end asc,
-                     pending.updated_at asc, pending.job_id asc
-                     limit 1",
-                    params! { "now_ms" => now_ms },
-                )
-                .map_err(mysql_err)?;
+            let active_targets = select_executing_targets(&mut tx)?;
+            job = select_pending_transfer(&mut tx, now_ms, &active_targets)?;
         }
         let Some((job_id, run_id, lease_epoch, state)) = job else {
             tx.commit().map_err(mysql_err)?;
@@ -362,6 +351,30 @@ impl TransferStore for MysqlTransferStore {
         };
         let mut record =
             select_job_by_id(&mut tx, &job_id)?.ok_or_else(|| FsError::job_not_found(&job_id))?;
+        let conflict = if state != TransferState::Pending as i32 {
+            select_conflicting_active_transfer(
+                &mut tx,
+                &record.target_path,
+                &record.submitter,
+                &record.client_request_id,
+            )?
+        } else {
+            None
+        };
+        if let Some(existing) = conflict {
+            record.state = TransferState::Failed;
+            record.owner.clear();
+            record.lease_expire_at = 0;
+            record.summary.message = format!(
+                "target {} conflicts with active transfer {} target {}",
+                record.target_path, existing.job_id, existing.target_path
+            );
+            record.summary.update_time = now_ms;
+            record.updated_at = now_ms;
+            exec_update_job(&mut tx, &record)?;
+            tx.commit().map_err(mysql_err)?;
+            return Ok(None);
+        }
         if state == TransferState::Pending as i32 {
             record.state = TransferState::Planning;
             record.summary.message = "acquired for planning".to_string();
@@ -488,6 +501,9 @@ impl TransferStore for MysqlTransferStore {
         job.state = TransferState::Pending;
         job.owner.clear();
         job.lease_expire_at = update.next_attempt_at_ms;
+        if let Some(mount_snapshot_attempts) = update.mount_snapshot_attempts {
+            job.mount_snapshot_attempts = mount_snapshot_attempts;
+        }
         job.summary.message = update.message;
         job.summary.update_time = update.now_ms;
         job.updated_at = update.now_ms;
@@ -530,6 +546,52 @@ impl TransferStore for MysqlTransferStore {
         job.cv_metadata_epoch = Some(cv_metadata_epoch);
         job.updated_at = now_ms;
         let updated = exec_update_job(&mut tx, &job)?;
+        tx.commit().map_err(mysql_err)?;
+        Ok(updated)
+    }
+
+    fn set_transfer_mount_snapshot(&self, update: TransferMountSnapshotUpdate) -> FsResult<bool> {
+        let mut conn = self.conn()?;
+        let mut tx = conn
+            .start_transaction(TxOpts::default())
+            .map_err(mysql_err)?;
+        let Some(mut job) = select_job_by_id_for_update(&mut tx, &update.job_id)? else {
+            tx.commit().map_err(mysql_err)?;
+            return Ok(false);
+        };
+        if job.run_id != update.run_id
+            || job.owner != update.owner
+            || job.lease_epoch != update.lease_epoch
+            || job.lease_expire_at <= update.now_ms
+            || job.state.is_terminal()
+        {
+            tx.commit().map_err(mysql_err)?;
+            return Ok(false);
+        }
+        if !job.mount_snapshot_json.trim().is_empty() && job.mount_snapshot_json != "{}" {
+            let matches = job.mount_snapshot_json == update.mount_snapshot_json;
+            tx.commit().map_err(mysql_err)?;
+            return Ok(matches);
+        }
+        job.mount_snapshot_json = update.mount_snapshot_json;
+        job.cluster_snapshot_version = update.cluster_snapshot_version;
+        job.updated_at = update.now_ms;
+        let updated = exec_affected(
+            &mut tx,
+            "update transfer_jobs
+             set record_json = :record_json, updated_at = :updated_at
+             where job_id = :job_id and run_id = :run_id and owner = :owner
+               and lease_epoch = :lease_epoch and lease_expire_at > :updated_at
+               and state not in (6, 7, 8, 9)",
+            params! {
+                "record_json" => json(&job)?,
+                "updated_at" => job.updated_at,
+                "job_id" => &job.job_id,
+                "run_id" => job.run_id,
+                "owner" => &job.owner,
+                "lease_epoch" => job.lease_epoch,
+            },
+        )? > 0;
         tx.commit().map_err(mysql_err)?;
         Ok(updated)
     }
@@ -1077,9 +1139,8 @@ fn mysql_column_exists(conn: &mut PooledConn, table: &str, column: &str) -> FsRe
     .map_err(mysql_err)
 }
 
-fn insert_job(conn: &mut impl Queryable, job: &TransferJobRecord) -> FsResult<()> {
-    let _ = exec_affected(
-        conn,
+fn insert_job_raw(conn: &mut impl Queryable, params: mysql::Params) -> Result<(), mysql::Error> {
+    conn.exec_drop(
         "insert into transfer_jobs (
             job_id, submitter, tenant, client_request_id, job_key, target_path, run_id, kind, state, owner, lease_epoch,
             lease_expire_at, cancel_requested, record_json, created_at, updated_at
@@ -1087,9 +1148,8 @@ fn insert_job(conn: &mut impl Queryable, job: &TransferJobRecord) -> FsResult<()
             :job_id, :submitter, :tenant, :client_request_id, :job_key, :target_path, :run_id, :kind, :state, :owner,
             :lease_epoch, :lease_expire_at, :cancel_requested, :record_json, :created_at, :updated_at
         )",
-        job_params(job)?,
-    )?;
-    Ok(())
+        params,
+    )
 }
 
 fn insert_task(conn: &mut impl Queryable, task: &TransferTaskRecord) -> FsResult<()> {
@@ -1142,19 +1202,6 @@ fn select_job_by_request(
     )
 }
 
-fn select_non_terminal_job_by_key(
-    conn: &mut impl Queryable,
-    job_key: &str,
-) -> FsResult<Option<TransferJobRecord>> {
-    select_job(
-        conn,
-        "select record_json from transfer_jobs
-         where job_key = :job_key and state not in (6, 7, 8, 9)
-         limit 1",
-        params! { "job_key" => job_key },
-    )
-}
-
 fn select_conflicting_active_transfer(
     conn: &mut impl Queryable,
     target_path: &str,
@@ -1165,7 +1212,7 @@ fn select_conflicting_active_transfer(
     let exact_or_child = select_job(
         conn,
         "select record_json from transfer_jobs
-         where state not in (6, 7, 8, 9)
+         where state in (2, 3, 4, 5)
            and not (submitter = :submitter and client_request_id = :client_request_id)
            and (
                target_path = :target_path
@@ -1189,7 +1236,7 @@ fn select_conflicting_active_transfer(
         let ancestor_conflict = select_job(
             conn,
             "select record_json from transfer_jobs
-             where state not in (6, 7, 8, 9)
+             where state in (2, 3, 4, 5)
                and not (submitter = :submitter and client_request_id = :client_request_id)
                and target_path = :target_path
              limit 1
@@ -1205,6 +1252,77 @@ fn select_conflicting_active_transfer(
         }
     }
     Ok(None)
+}
+
+fn select_executing_targets(conn: &mut impl Queryable) -> FsResult<Vec<(String, String)>> {
+    conn.exec(
+        "select target_path, tenant from transfer_jobs where state in (2, 3, 4, 5)",
+        Params::Empty,
+    )
+    .map_err(mysql_err)
+}
+
+fn select_pending_transfer(
+    conn: &mut impl Queryable,
+    now_ms: i64,
+    active_targets: &[(String, String)],
+) -> FsResult<Option<(String, u64, u64, i32)>> {
+    let mut values = vec![MysqlValue::from(now_ms)];
+    let mut exclusions = Vec::with_capacity(active_targets.len());
+    let mut active_tenants = BTreeSet::new();
+
+    for (target_path, tenant) in active_targets {
+        let target_path = normalize_target_path(target_path);
+        if target_path == "/" {
+            return Ok(None);
+        }
+        active_tenants.insert(tenant.as_str());
+
+        let (child_lower, child_upper) = child_path_bounds(&target_path);
+        let mut conflicts = vec![
+            "target_path = ?".to_string(),
+            "(target_path >= ? and target_path < ?)".to_string(),
+        ];
+        values.push(MysqlValue::from(target_path.clone()));
+        values.push(MysqlValue::from(child_lower));
+        values.push(MysqlValue::from(child_upper));
+
+        let ancestors = ancestor_paths(&target_path);
+        if !ancestors.is_empty() {
+            conflicts.push(format!(
+                "target_path in ({})",
+                std::iter::repeat_n("?", ancestors.len())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            values.extend(ancestors.into_iter().map(MysqlValue::from));
+        }
+        exclusions.push(format!("not ({})", conflicts.join(" or ")));
+    }
+
+    let mut sql = "select job_id, run_id, lease_epoch, state
+                   from transfer_jobs
+                   where state = 1 and lease_expire_at <= ?"
+        .to_string();
+    if !exclusions.is_empty() {
+        sql.push_str(" and ");
+        sql.push_str(&exclusions.join(" and "));
+    }
+    if active_tenants.is_empty() {
+        sql.push_str(" order by updated_at asc, job_id asc limit 1");
+    } else {
+        sql.push_str(" order by case when tenant in (");
+        sql.push_str(
+            &std::iter::repeat_n("?", active_tenants.len())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        sql.push_str(") then 1 else 0 end asc, updated_at asc, job_id asc limit 1");
+        values.extend(active_tenants.into_iter().map(MysqlValue::from));
+    }
+
+    conn.exec_first(sql, Params::Positional(values))
+        .map_err(mysql_err)
 }
 
 fn select_job(
@@ -1235,6 +1353,15 @@ fn ancestor_paths(target_path: &str) -> Vec<String> {
         ancestors.push(current.clone());
     }
     ancestors
+}
+
+fn normalize_target_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn child_path_bounds(target_path: &str) -> (String, String) {

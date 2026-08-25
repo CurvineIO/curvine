@@ -24,6 +24,7 @@ use postgres::{error::SqlState, GenericClient, Row, Transaction};
 use postgres_native_tls::MakeTlsConnector;
 use r2d2::{Pool, PooledConnection};
 use r2d2_postgres::PostgresConnectionManager;
+use std::collections::BTreeSet;
 use std::error::Error as _;
 use std::fs;
 use std::path::PathBuf;
@@ -31,8 +32,8 @@ use std::str::FromStr;
 use url::Url;
 
 use crate::transfer::{
-    apply_task_report_progress, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
-    TransferTaskStateUpdate,
+    apply_task_report_progress, TransferMountSnapshotUpdate, TransferPlannedTasks,
+    TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
 };
 
 const TRANSFER_SCHEMA_VERSION: i64 = 1;
@@ -288,22 +289,95 @@ fn select_expired_runnable(
 fn select_pending_runnable(
     conn: &mut impl GenericClient,
     now_ms: i64,
+    active_targets: &[(String, String)],
 ) -> FsResult<Option<(String, u64, u64, i32)>> {
-    select_lease_candidate(
-        conn,
-        "select pending.job_id, pending.run_id, pending.lease_epoch, pending.state
-         from transfer_jobs pending
-         where pending.state = 1 and pending.lease_expire_at <= $1
-         order by case when exists (
-             select 1 from transfer_jobs executing
-             where executing.tenant = pending.tenant and executing.state in (2, 3, 4, 5)
-             limit 1
-         ) then 1 else 0 end asc,
-         pending.updated_at asc, pending.job_id asc
-         limit 1
-         for update",
-        &[&now_ms],
+    let mut values: Vec<Box<dyn postgres::types::ToSql + Sync>> = vec![Box::new(now_ms)];
+    let mut exclusions = Vec::with_capacity(active_targets.len());
+    let mut active_tenants = BTreeSet::new();
+
+    for (target_path, tenant) in active_targets {
+        let target_path = normalize_target_path(target_path);
+        if target_path == "/" {
+            return Ok(None);
+        }
+        active_tenants.insert(tenant.clone());
+
+        let (child_lower, child_upper) = child_path_bounds(&target_path);
+        let exact = values.len() + 1;
+        values.push(Box::new(target_path.clone()));
+        let child_lower_index = values.len() + 1;
+        values.push(Box::new(child_lower));
+        let child_upper_index = values.len() + 1;
+        values.push(Box::new(child_upper));
+        let mut conflicts = vec![
+            format!("target_path = ${exact}::text"),
+            format!(
+                "(target_path >= ${child_lower_index}::text and target_path < ${child_upper_index}::text)"
+            ),
+        ];
+
+        let ancestors = ancestor_paths(&target_path);
+        if !ancestors.is_empty() {
+            let mut indexes = Vec::with_capacity(ancestors.len());
+            for ancestor in ancestors {
+                indexes.push((values.len() + 1).to_string());
+                values.push(Box::new(ancestor));
+            }
+            conflicts.push(format!(
+                "target_path in ({})",
+                indexes
+                    .into_iter()
+                    .map(|index| format!("${index}::text"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        exclusions.push(format!("not ({})", conflicts.join(" or ")));
+    }
+
+    let mut sql = "select job_id, run_id, lease_epoch, state
+                   from transfer_jobs
+                   where state = 1 and lease_expire_at <= $1::bigint"
+        .to_string();
+    if !exclusions.is_empty() {
+        sql.push_str(" and ");
+        sql.push_str(&exclusions.join(" and "));
+    }
+    if active_tenants.is_empty() {
+        sql.push_str(" order by updated_at asc, job_id asc limit 1 for update");
+    } else {
+        let mut indexes = Vec::with_capacity(active_tenants.len());
+        for tenant in active_tenants {
+            indexes.push((values.len() + 1).to_string());
+            values.push(Box::new(tenant));
+        }
+        sql.push_str(&format!(
+            " order by case when tenant in ({}) then 1 else 0 end asc, updated_at asc, job_id asc limit 1 for update",
+            indexes
+                .into_iter()
+                .map(|index| format!("${index}::text"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let params = values
+        .iter()
+        .map(|value| value.as_ref() as &(dyn postgres::types::ToSql + Sync))
+        .collect::<Vec<_>>();
+    select_lease_candidate(conn, &sql, &params)
+}
+
+fn select_executing_targets(conn: &mut impl GenericClient) -> FsResult<Vec<(String, String)>> {
+    conn.query(
+        "select target_path, tenant from transfer_jobs where state in (2, 3, 4, 5)",
+        &[],
     )
+    .map_err(postgres_err)
+    .map(|rows| {
+        rows.into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect()
+    })
 }
 
 fn select_lease_candidate(
@@ -324,7 +398,7 @@ fn select_lease_candidate(
         .transpose()
 }
 
-fn insert_job(conn: &mut impl GenericClient, job: &TransferJobRecord) -> FsResult<()> {
+fn insert_job(conn: &mut impl GenericClient, job: &TransferJobRecord) -> FsResult<bool> {
     let run_id = db_u64(job.run_id)?;
     let lease_epoch = db_u64(job.lease_epoch)?;
     let record_json = json(job)?;
@@ -334,7 +408,7 @@ fn insert_job(conn: &mut impl GenericClient, job: &TransferJobRecord) -> FsResul
             lease_epoch, lease_expire_at, cancel_requested, record_json, created_at, updated_at
         ) values (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
-        )",
+        ) on conflict (submitter, client_request_id) do nothing",
         &[
             &job.job_id,
             &job.submitter,
@@ -354,8 +428,8 @@ fn insert_job(conn: &mut impl GenericClient, job: &TransferJobRecord) -> FsResul
             &job.updated_at,
         ],
     )
-    .map_err(postgres_err)?;
-    Ok(())
+    .map(|affected| affected > 0)
+    .map_err(postgres_err)
 }
 
 fn insert_task(conn: &mut impl GenericClient, task: &TransferTaskRecord) -> FsResult<()> {
@@ -475,20 +549,6 @@ fn select_job_by_request(
         "select record_json from transfer_jobs
          where submitter = $1 and client_request_id = $2",
         &[&submitter, &client_request_id],
-    )
-}
-
-fn select_non_terminal_job_by_key(
-    conn: &mut impl GenericClient,
-    job_key: &str,
-) -> FsResult<Option<TransferJobRecord>> {
-    select_job(
-        conn,
-        "select record_json from transfer_jobs
-         where left(job_key, 255) = left($1, 255)
-           and job_key = $1 and state not in (6, 7, 8, 9)
-         limit 1",
-        &[&job_key],
     )
 }
 
@@ -689,6 +749,15 @@ fn ancestor_paths(target_path: &str) -> Vec<String> {
     ancestors
 }
 
+fn normalize_target_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn child_path_bounds(target_path: &str) -> (String, String) {
     let lower = if target_path == "/" {
         "/".to_string()
@@ -788,10 +857,6 @@ impl TransferStore for PostgresTransferStore {
         job: TransferJobRecord,
     ) -> FsResult<TransferJobRecord> {
         self.transaction(|tx| {
-            // PostgreSQL does not take MySQL-style next-key locks for an absent path range.
-            // This stable row serializes only submissions, so overlapping targets cannot pass
-            // their conflict checks concurrently.
-            lock_submission_gate(tx)?;
             if let Some(existing) =
                 select_job_by_request(tx, &job.submitter, &job.client_request_id)?
             {
@@ -803,28 +868,22 @@ impl TransferStore for PostgresTransferStore {
                 }
                 return Ok(existing);
             }
-            if let Some(existing) = select_non_terminal_job_by_key(tx, &job.job_key)? {
-                if existing.command_json == job.command_json {
-                    return Ok(existing);
-                }
-                return Err(FsError::transfer_already_running(format!(
-                    "job_key {} has running job {} with different command",
-                    existing.job_key, existing.job_id
+            if insert_job(tx, &job)? {
+                return Ok(job);
+            }
+            let existing = select_job_by_request(tx, &job.submitter, &job.client_request_id)?
+                .ok_or_else(|| {
+                    FsError::transfer_store_unavailable(
+                        "Transfer request duplicate was committed but could not be read",
+                    )
+                })?;
+            if existing.command_json != job.command_json {
+                return Err(FsError::common(format!(
+                    "Transfer request ID {} submitted by {} is already bound to job {} with a different command",
+                    job.client_request_id, job.submitter, existing.job_id
                 )));
             }
-            if let Some(existing) = select_conflicting_active_transfer(
-                tx,
-                &job.target_path,
-                &job.submitter,
-                &job.client_request_id,
-            )? {
-                return Err(FsError::transfer_target_conflict(format!(
-                    "target {} conflicts with active transfer {} target {}",
-                    job.target_path, existing.job_id, existing.target_path
-                )));
-            }
-            insert_job(tx, &job)?;
-            Ok(job)
+            Ok(existing)
         })
     }
 
@@ -1027,7 +1086,8 @@ impl TransferStore for PostgresTransferStore {
                 candidate = select_expired_runnable(tx, now_ms)?;
             }
             if candidate.is_none() && executing < max_executing_transfers {
-                candidate = select_pending_runnable(tx, now_ms)?;
+                let active_targets = select_executing_targets(tx)?;
+                candidate = select_pending_runnable(tx, now_ms, &active_targets)?;
             }
             let Some((job_id, run_id, lease_epoch, state)) = candidate else {
                 return Ok(None);
@@ -1141,6 +1201,9 @@ impl TransferStore for PostgresTransferStore {
             job.state = TransferState::Pending;
             job.owner.clear();
             job.lease_expire_at = update.next_attempt_at_ms;
+            if let Some(mount_snapshot_attempts) = update.mount_snapshot_attempts {
+                job.mount_snapshot_attempts = mount_snapshot_attempts;
+            }
             job.summary.message = update.message;
             job.summary.update_time = update.now_ms;
             job.updated_at = update.now_ms;
@@ -1175,6 +1238,30 @@ impl TransferStore for PostgresTransferStore {
             };
             job.cv_metadata_epoch = Some(cv_metadata_epoch);
             job.updated_at = now_ms;
+            update_job(tx, &job)
+        })
+    }
+
+    fn set_transfer_mount_snapshot(&self, update: TransferMountSnapshotUpdate) -> FsResult<bool> {
+        self.transaction(|tx| {
+            let mut job = match select_job_by_id_for_update(tx, &update.job_id)? {
+                Some(job)
+                    if job.run_id == update.run_id
+                        && job.owner == update.owner
+                        && job.lease_epoch == update.lease_epoch
+                        && job.lease_expire_at > update.now_ms
+                        && !job.state.is_terminal() =>
+                {
+                    job
+                }
+                _ => return Ok(false),
+            };
+            if !job.mount_snapshot_json.trim().is_empty() && job.mount_snapshot_json != "{}" {
+                return Ok(job.mount_snapshot_json == update.mount_snapshot_json);
+            }
+            job.mount_snapshot_json = update.mount_snapshot_json;
+            job.cluster_snapshot_version = update.cluster_snapshot_version;
+            job.updated_at = update.now_ms;
             update_job(tx, &job)
         })
     }

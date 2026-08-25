@@ -28,8 +28,8 @@ use crate::transfer::PostgresTransferStore;
 #[cfg(feature = "transfer-store-sqlite")]
 use crate::transfer::SqliteTransferStore;
 use crate::transfer::{
-    MemoryTransferStore, TransferMetrics, TransferPlannedTasks, TransferRequeueUpdate,
-    TransferStore, TransferTaskStateUpdate,
+    MemoryTransferStore, TransferMetrics, TransferMountSnapshotUpdate, TransferPlannedTasks,
+    TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
 };
 
 pub enum TransferStoreBackend {
@@ -358,6 +358,18 @@ impl TransferStore for TransferStoreBackend {
                 cv_metadata_epoch,
                 now_ms,
             ),
+        })
+    }
+
+    fn set_transfer_mount_snapshot(&self, update: TransferMountSnapshotUpdate) -> FsResult<bool> {
+        self.record_store_operation("set_transfer_mount_snapshot", || match self {
+            Self::Memory(store) => store.set_transfer_mount_snapshot(update),
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => store.set_transfer_mount_snapshot(update),
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => store.set_transfer_mount_snapshot(update),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.set_transfer_mount_snapshot(update),
         })
     }
 

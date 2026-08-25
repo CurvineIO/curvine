@@ -22,8 +22,14 @@ use curvine_model::{
 pub trait TransferStore: Send + Sync + 'static {
     fn check_available(&self) -> FsResult<()>;
 
-    fn create_or_get_by_request_id(&self, job: TransferJobRecord) -> FsResult<TransferJobRecord>;
+    /// Durably persist a request, preserving request-id idempotency. Target
+    /// conflicts are checked by the scheduler after a request enters an
+    /// executing state, so pending requests do not block submit.
+    fn create_or_get_by_request_id(&self, job: TransferJobRecord) -> FsResult<TransferJobRecord> {
+        self.create_or_get_by_request_id_checked(job)
+    }
 
+    /// Compatibility alias for callers that still use the former method name.
     fn create_or_get_by_request_id_checked(
         &self,
         job: TransferJobRecord,
@@ -96,6 +102,11 @@ pub trait TransferStore: Send + Sync + 'static {
         now_ms: i64,
     ) -> FsResult<bool>;
 
+    /// Persist the immutable mount snapshot after a lease is acquired. The
+    /// lease guard makes the first writer authoritative across scheduler
+    /// instances and keeps retries idempotent.
+    fn set_transfer_mount_snapshot(&self, update: TransferMountSnapshotUpdate) -> FsResult<bool>;
+
     fn insert_tasks(&self, tasks: Vec<TransferTaskRecord>) -> FsResult<()>;
 
     fn persist_planned_tasks(&self, update: TransferPlannedTasks) -> FsResult<bool>;
@@ -152,6 +163,19 @@ pub struct TransferRequeueUpdate {
     pub lease_epoch: u64,
     pub message: String,
     pub next_attempt_at_ms: i64,
+    /// Replaces the persisted mount snapshot retry count when this requeue is
+    /// caused by a retryable metadata refresh failure.
+    pub mount_snapshot_attempts: Option<u32>,
+    pub now_ms: i64,
+}
+
+pub struct TransferMountSnapshotUpdate {
+    pub job_id: String,
+    pub run_id: u64,
+    pub owner: String,
+    pub lease_epoch: u64,
+    pub mount_snapshot_json: String,
+    pub cluster_snapshot_version: u64,
     pub now_ms: i64,
 }
 

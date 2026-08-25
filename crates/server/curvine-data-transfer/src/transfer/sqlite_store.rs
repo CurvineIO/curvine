@@ -23,15 +23,16 @@ use parking_lot::Mutex;
 use rusqlite::{
     params, params_from_iter, types::Value as SqliteValue, Connection, OptionalExtension, Row,
 };
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
 use crate::transfer::{
-    apply_task_report_progress, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
-    TransferTaskStateUpdate,
+    apply_task_report_progress, TransferMountSnapshotUpdate, TransferPlannedTasks,
+    TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
 };
 
-const TRANSFER_SCHEMA_VERSION: i64 = 2;
+const TRANSFER_SCHEMA_VERSION: i64 = 3;
 
 pub struct SqliteTransferStore {
     conn: Mutex<Connection>,
@@ -84,29 +85,6 @@ impl TransferStore for SqliteTransferStore {
             }
             tx.commit().map_err(sqlite_err)?;
             return Ok(existing);
-        }
-
-        if let Some(existing) = select_non_terminal_job_by_key(&tx, &job.job_key)? {
-            if existing.command_json == job.command_json {
-                tx.commit().map_err(sqlite_err)?;
-                return Ok(existing);
-            }
-            return Err(FsError::transfer_already_running(format!(
-                "job_key {} has running job {} with different command",
-                existing.job_key, existing.job_id
-            )));
-        }
-
-        if let Some(existing) = select_conflicting_active_transfer(
-            &tx,
-            &job.target_path,
-            &job.submitter,
-            &job.client_request_id,
-        )? {
-            return Err(FsError::transfer_target_conflict(format!(
-                "target {} conflicts with active transfer {} target {}",
-                job.target_path, existing.job_id, existing.target_path
-            )));
         }
 
         insert_job(&tx, &job)?;
@@ -361,28 +339,56 @@ impl TransferStore for SqliteTransferStore {
                 .map_err(sqlite_err)?;
         }
         if candidate.is_none() && executing < max_executing_transfers {
-            candidate = tx
-                .query_row(
-                    "select pending.job_id, pending.run_id, pending.lease_epoch, pending.state
-                     from transfer_jobs pending
-                     where pending.state = 1 and pending.lease_expire_at <= ?1
-                     order by case when exists (
-                         select 1 from transfer_jobs executing
-                         where executing.tenant = pending.tenant and executing.state in (2, 3, 4, 5)
-                         limit 1
-                     ) then 1 else 0 end asc,
-                     pending.updated_at asc, pending.job_id asc
-                     limit 1",
-                    params![now_ms],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .optional()
-                .map_err(sqlite_err)?;
+            let active_targets = select_executing_targets(&tx)?;
+            candidate = select_pending_transfer(&tx, now_ms, &active_targets)?;
         }
         let Some((job_id, run_id, lease_epoch, state)) = candidate else {
             tx.commit().map_err(sqlite_err)?;
             return Ok(None);
         };
+
+        let record = tx
+            .query_row(
+                job_select_sql("where job_id = ?1").as_str(),
+                params![&job_id],
+                sqlite_job_row,
+            )
+            .map_err(sqlite_err)?;
+        let conflict = if state != TransferState::Pending as i64 {
+            select_conflicting_active_transfer(
+                &tx,
+                &record.target_path,
+                &record.submitter,
+                &record.client_request_id,
+            )?
+        } else {
+            None
+        };
+        if let Some(existing) = conflict {
+            let mut summary = record.summary;
+            summary.message = format!(
+                "target {} conflicts with active transfer {} target {}",
+                record.target_path, existing.job_id, existing.target_path
+            );
+            summary.update_time = now_ms;
+            tx.execute(
+                "update transfer_jobs
+                 set state = ?1, owner = '', lease_expire_at = 0,
+                     summary_json = ?2, updated_at = ?3
+                 where job_id = ?4 and run_id = ?5 and lease_epoch = ?6",
+                params![
+                    TransferState::Failed as i32,
+                    transfer_progress_json(&summary)?,
+                    now_ms,
+                    job_id,
+                    run_id,
+                    lease_epoch
+                ],
+            )
+            .map_err(sqlite_err)?;
+            tx.commit().map_err(sqlite_err)?;
+            return Ok(None);
+        }
 
         let new_epoch = lease_epoch.saturating_add(1);
         let new_state = if state == TransferState::Pending as i64 {
@@ -520,13 +526,15 @@ impl TransferStore for SqliteTransferStore {
             .lock()
             .execute(
                 "update transfer_jobs
-                 set state = ?1, owner = '', lease_expire_at = ?2, summary_json = ?3, updated_at = ?4
-                 where job_id = ?5 and run_id = ?6 and owner = ?7 and lease_epoch = ?8
-                   and lease_expire_at > ?4 and state = ?9",
+                 set state = ?1, owner = '', lease_expire_at = ?2, summary_json = ?3,
+                     mount_snapshot_attempts = coalesce(?4, mount_snapshot_attempts), updated_at = ?5
+                 where job_id = ?6 and run_id = ?7 and owner = ?8 and lease_epoch = ?9
+                   and lease_expire_at > ?5 and state = ?10",
                 params![
                     TransferState::Pending as i32,
                     update.next_attempt_at_ms,
                     summary,
+                    update.mount_snapshot_attempts.map(i64::from),
                     update.now_ms,
                     update.job_id,
                     update.run_id as i64,
@@ -567,6 +575,60 @@ impl TransferStore for SqliteTransferStore {
                 ],
             )
             .map_err(sqlite_err)?;
+        Ok(affected > 0)
+    }
+
+    fn set_transfer_mount_snapshot(&self, update: TransferMountSnapshotUpdate) -> FsResult<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(sqlite_err)?;
+        let Some(mut job) = tx
+            .query_row(
+                job_select_sql("where job_id = ?1").as_str(),
+                params![&update.job_id],
+                sqlite_job_row,
+            )
+            .optional()
+            .map_err(sqlite_err)?
+        else {
+            tx.commit().map_err(sqlite_err)?;
+            return Ok(false);
+        };
+        if job.run_id != update.run_id
+            || job.owner != update.owner
+            || job.lease_epoch != update.lease_epoch
+            || job.lease_expire_at <= update.now_ms
+            || job.state.is_terminal()
+        {
+            tx.commit().map_err(sqlite_err)?;
+            return Ok(false);
+        }
+        if !job.mount_snapshot_json.trim().is_empty() && job.mount_snapshot_json != "{}" {
+            let matches = job.mount_snapshot_json == update.mount_snapshot_json;
+            tx.commit().map_err(sqlite_err)?;
+            return Ok(matches);
+        }
+        job.mount_snapshot_json = update.mount_snapshot_json;
+        job.cluster_snapshot_version = update.cluster_snapshot_version;
+        job.updated_at = update.now_ms;
+        let affected = tx
+            .execute(
+                "update transfer_jobs
+                 set mount_snapshot_json = ?1, cluster_snapshot_version = ?2,
+                     updated_at = ?3
+                 where job_id = ?4 and run_id = ?5 and owner = ?6 and lease_epoch = ?7
+                   and lease_expire_at > ?3 and state not in (6, 7, 8, 9)",
+                params![
+                    job.mount_snapshot_json,
+                    job.cluster_snapshot_version as i64,
+                    job.updated_at,
+                    job.job_id,
+                    job.run_id as i64,
+                    job.owner,
+                    job.lease_epoch as i64
+                ],
+            )
+            .map_err(sqlite_err)?;
+        tx.commit().map_err(sqlite_err)?;
         Ok(affected > 0)
     }
 
@@ -1005,9 +1067,13 @@ fn init_schema(conn: &Connection) -> FsResult<()> {
             version integer not null,
             updated_at integer not null
         );
-        insert or ignore into transfer_schema_version(id, version, updated_at)
-            values (1, 2, strftime('%s', 'now') * 1000);
         ",
+    )
+    .map_err(sqlite_err)?;
+    conn.execute(
+        "insert or ignore into transfer_schema_version(id, version, updated_at)
+         values (1, ?1, strftime('%s', 'now') * 1000)",
+        params![TRANSFER_SCHEMA_VERSION],
     )
     .map_err(sqlite_err)?;
     let version = conn
@@ -1037,6 +1103,7 @@ fn create_base_tables(conn: &Connection) -> FsResult<()> {
             mount_snapshot_json text not null,
             secret_ref_json text not null,
             cluster_snapshot_version integer not null,
+            mount_snapshot_attempts integer not null default 0,
             cv_metadata_epoch integer,
             state integer not null,
             owner text not null,
@@ -1106,8 +1173,20 @@ fn create_indexes(conn: &Connection) -> FsResult<()> {
 }
 
 fn migrate_schema(conn: &Connection, version: i64) -> FsResult<()> {
-    if version == 1 {
-        migrate_sqlite_schema_v1_to_v2(conn)?;
+    match version {
+        1 => migrate_sqlite_schema_v1_to_v2(conn)?,
+        2 | 3 => {}
+        _ => {
+            return Err(FsError::common(format!(
+                "Unsupported sqlite transfer schema version {}, expected {}",
+                version, TRANSFER_SCHEMA_VERSION
+            )));
+        }
+    }
+    if version < 3 {
+        migrate_sqlite_schema_v2_to_v3(conn)?;
+    }
+    if version != TRANSFER_SCHEMA_VERSION {
         conn.execute(
             "update transfer_schema_version
              set version = ?1, updated_at = strftime('%s', 'now') * 1000
@@ -1115,15 +1194,21 @@ fn migrate_schema(conn: &Connection, version: i64) -> FsResult<()> {
             params![TRANSFER_SCHEMA_VERSION],
         )
         .map_err(sqlite_err)?;
-        return Ok(());
-    }
-    if version != TRANSFER_SCHEMA_VERSION {
-        return Err(FsError::common(format!(
-            "Unsupported sqlite transfer schema version {}, expected {}",
-            version, TRANSFER_SCHEMA_VERSION
-        )));
     }
     Ok(())
+}
+
+fn migrate_sqlite_schema_v2_to_v3(conn: &Connection) -> FsResult<()> {
+    if sqlite_column_exists(conn, "transfer_jobs", "mount_snapshot_attempts")? {
+        return Ok(());
+    }
+    conn.execute(
+        "alter table transfer_jobs
+         add column mount_snapshot_attempts integer not null default 0",
+        [],
+    )
+    .map(|_| ())
+    .map_err(sqlite_err)
 }
 
 fn migrate_sqlite_schema_v1_to_v2(conn: &Connection) -> FsResult<()> {
@@ -1173,11 +1258,11 @@ fn insert_job(conn: &Connection, job: &TransferJobRecord) -> FsResult<()> {
     conn.execute(
         "insert into transfer_jobs (
             job_id, job_key, run_id, kind, source_path, target_path, command_json,
-            mount_snapshot_json, secret_ref_json, cluster_snapshot_version, cv_metadata_epoch,
-            state, owner, lease_epoch, lease_expire_at, cancel_requested, summary_json,
+            mount_snapshot_json, secret_ref_json, cluster_snapshot_version, mount_snapshot_attempts,
+            cv_metadata_epoch, state, owner, lease_epoch, lease_expire_at, cancel_requested, summary_json,
             client_request_id, submitter, tenant, created_at, updated_at
         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                  ?17, ?18, ?19, ?20, ?21, ?22)",
+                  ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
         params![
             job.job_id,
             job.job_key,
@@ -1189,6 +1274,7 @@ fn insert_job(conn: &Connection, job: &TransferJobRecord) -> FsResult<()> {
             job.mount_snapshot_json,
             job.secret_ref_json,
             job.cluster_snapshot_version as i64,
+            job.mount_snapshot_attempts as i64,
             job.cv_metadata_epoch.map(|v| v as i64),
             job.state as i32,
             job.owner,
@@ -1262,19 +1348,6 @@ fn select_job_by_request(
     .map_err(sqlite_err)
 }
 
-fn select_non_terminal_job_by_key(
-    conn: &Connection,
-    job_key: &str,
-) -> FsResult<Option<TransferJobRecord>> {
-    conn.query_row(
-        job_select_sql("where job_key = ?1 and state not in (6, 7, 8, 9) limit 1").as_str(),
-        params![job_key],
-        sqlite_job_row,
-    )
-    .optional()
-    .map_err(sqlite_err)
-}
-
 fn select_conflicting_active_transfer(
     conn: &Connection,
     target_path: &str,
@@ -1285,7 +1358,7 @@ fn select_conflicting_active_transfer(
     let exact_or_child = conn
         .query_row(
             job_select_sql(
-                "where state not in (6, 7, 8, 9)
+                "where state in (2, 3, 4, 5)
                and not (submitter = ?2 and client_request_id = ?3)
                and (
                    target_path = ?1
@@ -1307,7 +1380,7 @@ fn select_conflicting_active_transfer(
         let ancestor_conflict = conn
             .query_row(
                 job_select_sql(
-                    "where state not in (6, 7, 8, 9)
+                    "where state in (2, 3, 4, 5)
                        and not (submitter = ?2 and client_request_id = ?3)
                        and target_path = ?1
                      limit 1",
@@ -1325,6 +1398,86 @@ fn select_conflicting_active_transfer(
     Ok(None)
 }
 
+fn select_executing_targets(conn: &Connection) -> FsResult<Vec<(String, String)>> {
+    let mut stmt = conn
+        .prepare("select target_path, tenant from transfer_jobs where state in (2, 3, 4, 5)")
+        .map_err(sqlite_err)?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(sqlite_err)?;
+    collect_sqlite_rows(rows)
+}
+
+fn select_pending_transfer(
+    conn: &Connection,
+    now_ms: i64,
+    active_targets: &[(String, String)],
+) -> FsResult<Option<(String, i64, i64, i64)>> {
+    let mut values = vec![SqliteValue::Integer(now_ms)];
+    let mut exclusions = Vec::with_capacity(active_targets.len());
+    let mut active_tenants = BTreeSet::new();
+
+    for (target_path, tenant) in active_targets {
+        let target_path = normalize_target_path(target_path);
+        if target_path == "/" {
+            return Ok(None);
+        }
+        active_tenants.insert(tenant.as_str());
+
+        let (child_lower, child_upper) = child_path_bounds(&target_path);
+        let mut conflicts = vec![
+            "target_path = ?".to_string(),
+            "(target_path >= ? and target_path < ?)".to_string(),
+        ];
+        values.push(SqliteValue::Text(target_path.clone()));
+        values.push(SqliteValue::Text(child_lower));
+        values.push(SqliteValue::Text(child_upper));
+
+        let ancestors = ancestor_paths(&target_path);
+        if !ancestors.is_empty() {
+            conflicts.push(format!(
+                "target_path in ({})",
+                std::iter::repeat_n("?", ancestors.len())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            values.extend(ancestors.into_iter().map(SqliteValue::Text));
+        }
+        exclusions.push(format!("not ({})", conflicts.join(" or ")));
+    }
+
+    let mut sql = "select job_id, run_id, lease_epoch, state
+                   from transfer_jobs
+                   where state = 1 and lease_expire_at <= ?"
+        .to_string();
+    if !exclusions.is_empty() {
+        sql.push_str(" and ");
+        sql.push_str(&exclusions.join(" and "));
+    }
+    if active_tenants.is_empty() {
+        sql.push_str(" order by updated_at asc, job_id asc limit 1");
+    } else {
+        sql.push_str(" order by case when tenant in (");
+        sql.push_str(
+            &std::iter::repeat_n("?", active_tenants.len())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        sql.push_str(") then 1 else 0 end asc, updated_at asc, job_id asc limit 1");
+        values.extend(
+            active_tenants
+                .into_iter()
+                .map(|tenant| SqliteValue::Text(tenant.to_string())),
+        );
+    }
+
+    conn.query_row(sql.as_str(), params_from_iter(values), |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    })
+    .optional()
+    .map_err(sqlite_err)
+}
+
 fn sqlite_like_prefix(path: &str) -> String {
     let path = path
         .trim_end_matches('/')
@@ -1337,9 +1490,9 @@ fn sqlite_like_prefix(path: &str) -> String {
 fn job_select_sql(where_sql: &str) -> String {
     format!(
         "select job_id, job_key, run_id, kind, source_path, target_path, command_json,
-                mount_snapshot_json, secret_ref_json, cluster_snapshot_version, cv_metadata_epoch,
-                state, owner, lease_epoch, lease_expire_at, cancel_requested, summary_json,
-                client_request_id, submitter, tenant, created_at, updated_at
+                mount_snapshot_json, secret_ref_json, cluster_snapshot_version, mount_snapshot_attempts,
+                cv_metadata_epoch, state, owner, lease_epoch, lease_expire_at, cancel_requested,
+                summary_json, client_request_id, submitter, tenant, created_at, updated_at
          from transfer_jobs {where_sql}"
     )
 }
@@ -1363,8 +1516,35 @@ fn ancestor_paths(target_path: &str) -> Vec<String> {
     ancestors
 }
 
+fn normalize_target_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn child_path_bounds(target_path: &str) -> (String, String) {
+    let lower = format!("{}/", target_path.trim_end_matches('/'));
+    let upper = lexicographic_successor(&lower).unwrap_or_else(|| "\u{10ffff}".to_string());
+    (lower, upper)
+}
+
+fn lexicographic_successor(value: &str) -> Option<String> {
+    let mut bytes = value.as_bytes().to_vec();
+    for index in (0..bytes.len()).rev() {
+        if bytes[index] < u8::MAX {
+            bytes[index] += 1;
+            bytes.truncate(index + 1);
+            return String::from_utf8(bytes).ok();
+        }
+    }
+    None
+}
+
 fn sqlite_job_row(row: &Row<'_>) -> rusqlite::Result<TransferJobRecord> {
-    let summary_json: String = row.get(16)?;
+    let summary_json: String = row.get(17)?;
     Ok(TransferJobRecord {
         job_id: row.get(0)?,
         job_key: row.get(1)?,
@@ -1376,18 +1556,19 @@ fn sqlite_job_row(row: &Row<'_>) -> rusqlite::Result<TransferJobRecord> {
         mount_snapshot_json: row.get(7)?,
         secret_ref_json: row.get(8)?,
         cluster_snapshot_version: row.get::<_, i64>(9)? as u64,
-        cv_metadata_epoch: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
-        state: TransferState::from(row.get::<_, i32>(11)?),
-        owner: row.get(12)?,
-        lease_epoch: row.get::<_, i64>(13)? as u64,
-        lease_expire_at: row.get(14)?,
-        cancel_requested: row.get::<_, i64>(15)? != 0,
+        mount_snapshot_attempts: row.get::<_, i64>(10)? as u32,
+        cv_metadata_epoch: row.get::<_, Option<i64>>(11)?.map(|v| v as u64),
+        state: TransferState::from(row.get::<_, i32>(12)?),
+        owner: row.get(13)?,
+        lease_epoch: row.get::<_, i64>(14)? as u64,
+        lease_expire_at: row.get(15)?,
+        cancel_requested: row.get::<_, i64>(16)? != 0,
         summary: serde_json::from_str(&summary_json).unwrap_or_default(),
-        client_request_id: row.get(17)?,
-        submitter: row.get(18)?,
-        tenant: row.get(19)?,
-        created_at: row.get(20)?,
-        updated_at: row.get(21)?,
+        client_request_id: row.get(18)?,
+        submitter: row.get(19)?,
+        tenant: row.get(20)?,
+        created_at: row.get(21)?,
+        updated_at: row.get(22)?,
     })
 }
 

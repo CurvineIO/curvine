@@ -229,6 +229,8 @@ pub struct TransferJobRecord {
     pub mount_snapshot_json: String,
     pub secret_ref_json: String,
     pub cluster_snapshot_version: u64,
+    #[serde(default)]
+    pub mount_snapshot_attempts: u32,
     pub cv_metadata_epoch: Option<u64>,
     pub state: TransferState,
     pub owner: String,

@@ -59,7 +59,6 @@ type TransferWatchPage = (
 
 pub struct TransferService<S> {
     store: Arc<S>,
-    cache: Option<ClusterMetadataCache>,
     task_stale_timeout_ms: i64,
     report_dispatcher: Option<TransferReportDispatcher<S>>,
 }
@@ -68,7 +67,6 @@ impl<S> Clone for TransferService<S> {
     fn clone(&self) -> Self {
         Self {
             store: self.store.clone(),
-            cache: self.cache.clone(),
             task_stale_timeout_ms: self.task_stale_timeout_ms,
             report_dispatcher: self.report_dispatcher.clone(),
         }
@@ -82,7 +80,6 @@ where
     pub fn new(store: Arc<S>) -> Self {
         Self {
             store,
-            cache: None,
             task_stale_timeout_ms: 60_000,
             report_dispatcher: None,
         }
@@ -91,7 +88,6 @@ where
     pub fn with_task_stale_timeout(store: Arc<S>, task_stale_timeout: Duration) -> Self {
         Self {
             store,
-            cache: None,
             task_stale_timeout_ms: i64::try_from(task_stale_timeout.as_millis())
                 .unwrap_or(i64::MAX),
             report_dispatcher: None,
@@ -108,7 +104,6 @@ where
             i64::try_from(task_stale_timeout.as_millis()).unwrap_or(i64::MAX);
         Ok(Self {
             store: store.clone(),
-            cache: None,
             task_stale_timeout_ms,
             report_dispatcher: Some(TransferReportDispatcher::new(
                 store,
@@ -121,12 +116,11 @@ where
 
     pub fn with_cache(
         store: Arc<S>,
-        cache: ClusterMetadataCache,
+        _cache: ClusterMetadataCache,
         task_stale_timeout: Duration,
     ) -> Self {
         Self {
             store,
-            cache: Some(cache),
             task_stale_timeout_ms: i64::try_from(task_stale_timeout.as_millis())
                 .unwrap_or(i64::MAX),
             report_dispatcher: None,
@@ -135,7 +129,7 @@ where
 
     pub fn with_cache_and_report_queue(
         store: Arc<S>,
-        cache: ClusterMetadataCache,
+        _cache: ClusterMetadataCache,
         task_stale_timeout: Duration,
         task_report_queue_size: usize,
         task_report_workers: usize,
@@ -144,7 +138,6 @@ where
             i64::try_from(task_stale_timeout.as_millis()).unwrap_or(i64::MAX);
         Ok(Self {
             store: store.clone(),
-            cache: Some(cache),
             task_stale_timeout_ms,
             report_dispatcher: Some(TransferReportDispatcher::new(
                 store,
@@ -200,7 +193,6 @@ where
         }
         validate_transfer_paths(command.kind, &command.source_path, &command.target_path)?;
         command.target_path = normalized_transfer_path(&Path::from_str(&command.target_path)?);
-        let snapshot = self.transfer_snapshot(&command)?;
         let now_ms = now_ms();
         let command_json = String::from_utf8(encode_transfer_command(&command)?)
             .map_err(|_| FsError::common("Unable to prepare the transfer command"))?;
@@ -212,9 +204,10 @@ where
             source_path: command.source_path.clone(),
             target_path: command.target_path.clone(),
             command_json,
-            mount_snapshot_json: snapshot.mount_snapshot_json,
+            mount_snapshot_json: "{}".to_string(),
             secret_ref_json: "{}".to_string(),
-            cluster_snapshot_version: snapshot.cluster_snapshot_version,
+            cluster_snapshot_version: 0,
+            mount_snapshot_attempts: 0,
             cv_metadata_epoch: None,
             state: TransferState::Pending,
             owner: String::new(),
@@ -228,7 +221,7 @@ where
             created_at: now_ms,
             updated_at: now_ms,
         };
-        let job = self.store.create_or_get_by_request_id_checked(job)?;
+        let job = self.store.create_or_get_by_request_id(job)?;
         record_submit_metric(kind, "accepted");
         log::info!(
             "transfer submit accepted job_id={} run_id={} kind={:?} tenant={} submitter={} source={} target={} state={:?}",
@@ -246,25 +239,6 @@ where
 
     pub fn check_store_available(&self) -> FsResult<()> {
         self.store.check_available()
-    }
-
-    fn transfer_snapshot(&self, command: &TransferCommand) -> FsResult<TransferSubmitSnapshot> {
-        let Some(cache) = &self.cache else {
-            return Ok(TransferSubmitSnapshot::default());
-        };
-        let source = Path::from_str(&command.source_path)?;
-        let target = Path::from_str(&command.target_path)?;
-        let snapshot = cache.find_mount_with_refresh(command.kind, &source, &target)?;
-        let mount_snapshot_json = serde_json::to_string(&snapshot.mount).map_err(|_| {
-            FsError::common(format!(
-                "Unable to save the transfer mount snapshot for {} -> {}",
-                command.source_path, command.target_path
-            ))
-        })?;
-        Ok(TransferSubmitSnapshot {
-            mount_snapshot_json,
-            cluster_snapshot_version: snapshot.version,
-        })
     }
 
     pub fn get_transfer(&self, job_id: &str) -> FsResult<TransferJobRecord> {
@@ -699,20 +673,6 @@ fn record_submit_metric(kind: TransferKind, result: &str) {
 fn record_report_metric(result: &str) {
     if let Ok(metrics) = TransferMetrics::get() {
         metrics.inc_report(result);
-    }
-}
-
-struct TransferSubmitSnapshot {
-    mount_snapshot_json: String,
-    cluster_snapshot_version: u64,
-}
-
-impl Default for TransferSubmitSnapshot {
-    fn default() -> Self {
-        Self {
-            mount_snapshot_json: "{}".to_string(),
-            cluster_snapshot_version: 0,
-        }
     }
 }
 

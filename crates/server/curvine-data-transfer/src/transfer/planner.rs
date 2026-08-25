@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::common::UfsFactory;
-use crate::transfer::{job_mount_snapshot, ClusterMetadataCache, TransferMetrics};
+use crate::transfer::{job_mount_snapshot_async, ClusterMetadataCache, TransferMetrics};
 use curvine_client_core::file::CurvineFileSystem;
 use curvine_config::ClientConf;
 use curvine_core_error::err_box;
@@ -73,7 +73,7 @@ impl TransferPlanner {
     }
 
     pub async fn plan(&self, job: &TransferJobRecord) -> FsResult<PlannedTransfer> {
-        let mount = job_mount_snapshot(job, &self.cache)?;
+        let mount = job_mount_snapshot_async(job, &self.cache).await?;
         self.plan_once(job, mount).await
     }
 

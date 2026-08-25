@@ -12,16 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_data_transfer::transfer::{PostgresTransferStore, TransferPlannedTasks, TransferStore};
+use curvine_data_transfer::transfer::{
+    PostgresTransferStore, TransferMountSnapshotUpdate, TransferPlannedTasks,
+    TransferRequeueUpdate, TransferStore,
+};
 use curvine_model::{
     TaskAttemptStart, TransferJobRecord, TransferKind, TransferProgress, TransferState,
-    TransferTaskRecord, TransferTaskReport, TransferTaskState,
+    TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTaskState,
 };
 use native_tls::TlsConnector;
 use postgres::{Client, Config};
 use postgres_native_tls::MakeTlsConnector;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+static TEST_SCHEMA_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct TestSchema {
     url: String,
@@ -45,9 +51,10 @@ fn admin_client(url: &str) -> Result<Client, Box<dyn std::error::Error>> {
 fn test_store_url() -> Option<(String, TestSchema)> {
     let url = std::env::var("CURVINE_TRANSFER_POSTGRES_URL").ok()?;
     let name = format!(
-        "curvine_transfer_test_{}_{}",
+        "curvine_transfer_test_{}_{}_{}",
         std::process::id(),
-        curvine_runtime::common::LocalTime::mills()
+        curvine_runtime::common::LocalTime::mills(),
+        TEST_SCHEMA_SEQUENCE.fetch_add(1, Ordering::Relaxed),
     );
     let mut client = admin_client(&url).unwrap();
     client
@@ -122,6 +129,7 @@ fn transfer_job(id: &str, target_path: &str) -> TransferJobRecord {
         mount_snapshot_json: "{}".to_string(),
         secret_ref_json: "{}".to_string(),
         cluster_snapshot_version: 1,
+        mount_snapshot_attempts: 0,
         cv_metadata_epoch: None,
         state: TransferState::Pending,
         owner: String::new(),
@@ -191,7 +199,13 @@ fn postgres_store_persists_transfer_lifecycle() {
             .job_id,
         job.job_id
     );
-    assert!(store.create_or_get_by_request_id_checked(child).is_err());
+    assert_eq!(
+        store
+            .create_or_get_by_request_id_checked(child.clone())
+            .unwrap()
+            .job_id,
+        child.job_id
+    );
     let wildcard = transfer_job(&format!("{suffix}-wildcard"), "/cache/a_b%");
     let unrelated = transfer_job(&format!("{suffix}-unrelated"), "/cache/aXbZ/child");
     let wildcard_child = transfer_job(&format!("{suffix}-wildcard-child"), "/cache/a_b%/child");
@@ -199,9 +213,9 @@ fn postgres_store_persists_transfer_lifecycle() {
     store
         .create_or_get_by_request_id_checked(unrelated)
         .unwrap();
-    assert!(store
+    store
         .create_or_get_by_request_id_checked(wildcard_child)
-        .is_err());
+        .unwrap();
 
     let lease = store
         .acquire_runnable_transfer("postgres-store-test", 60_000, 2, 1)
@@ -281,6 +295,162 @@ fn postgres_store_persists_transfer_lifecycle() {
             .into_iter()
             .map(|handle| handle.join().unwrap() as usize)
             .sum::<usize>(),
-        1
+        4
+    );
+}
+
+#[test]
+fn postgres_store_keeps_conflicting_requests_pending_and_persists_snapshot_retries() {
+    let Some((url, _schema)) = test_store_url() else {
+        eprintln!("CURVINE_TRANSFER_POSTGRES_URL is not set; skipping PostgreSQL store test");
+        return;
+    };
+    let store = PostgresTransferStore::open(&url).unwrap();
+
+    let mut parent = transfer_job("overlap-parent", "/parent");
+    parent.updated_at = 1;
+    let mut child = transfer_job("overlap-child", "/parent/child");
+    child.updated_at = 2;
+    let mut adjacent = transfer_job("overlap-adjacent", "/parent-other");
+    adjacent.updated_at = 3;
+    for job in [&parent, &child, &adjacent] {
+        assert_eq!(
+            store
+                .create_or_get_by_request_id_checked(job.clone())
+                .unwrap()
+                .job_id,
+            job.job_id
+        );
+    }
+
+    let parent_lease = store
+        .acquire_runnable_transfer("owner-parent", 60_000, 10, 10)
+        .unwrap()
+        .unwrap();
+    assert_eq!(parent_lease.job_id, parent.job_id);
+    let adjacent_lease = store
+        .acquire_runnable_transfer("owner-adjacent", 60_000, 11, 10)
+        .unwrap()
+        .unwrap();
+    assert_eq!(adjacent_lease.job_id, adjacent.job_id);
+    assert_eq!(
+        store.get_transfer(&child.job_id).unwrap().unwrap().state,
+        TransferState::Pending
+    );
+
+    assert!(store
+        .update_transfer_state(TransferStateUpdate {
+            job_id: parent.job_id.clone(),
+            run_id: parent.run_id,
+            owner: parent_lease.owner.clone(),
+            lease_epoch: parent_lease.lease_epoch,
+            from_states: vec![TransferState::Planning],
+            to_state: TransferState::Completed,
+            message: "parent complete".to_string(),
+            now_ms: 12,
+        })
+        .unwrap());
+    let child_lease = store
+        .acquire_runnable_transfer("owner-child", 60_000, 13, 10)
+        .unwrap()
+        .unwrap();
+    assert_eq!(child_lease.job_id, child.job_id);
+
+    for (job, lease, now_ms) in [(&adjacent, &adjacent_lease, 14), (&child, &child_lease, 15)] {
+        assert!(store
+            .update_transfer_state(TransferStateUpdate {
+                job_id: job.job_id.clone(),
+                run_id: job.run_id,
+                owner: lease.owner.clone(),
+                lease_epoch: lease.lease_epoch,
+                from_states: vec![TransferState::Planning],
+                to_state: TransferState::Completed,
+                message: "complete".to_string(),
+                now_ms,
+            })
+            .unwrap());
+    }
+
+    let mut root = transfer_job("overlap-root", "/");
+    root.updated_at = 16;
+    let mut root_child = transfer_job("overlap-root-child", "/root-child");
+    root_child.updated_at = 17;
+    for job in [&root, &root_child] {
+        store
+            .create_or_get_by_request_id_checked(job.clone())
+            .unwrap();
+    }
+    let root_lease = store
+        .acquire_runnable_transfer("owner-root", 60_000, 18, 10)
+        .unwrap()
+        .unwrap();
+    assert_eq!(root_lease.job_id, root.job_id);
+    assert!(store
+        .acquire_runnable_transfer("owner-root-child", 60_000, 19, 10)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .update_transfer_state(TransferStateUpdate {
+            job_id: root.job_id.clone(),
+            run_id: root.run_id,
+            owner: root_lease.owner.clone(),
+            lease_epoch: root_lease.lease_epoch,
+            from_states: vec![TransferState::Planning],
+            to_state: TransferState::Completed,
+            message: "root complete".to_string(),
+            now_ms: 20,
+        })
+        .unwrap());
+    assert_eq!(
+        store
+            .acquire_runnable_transfer("owner-root-child", 60_000, 21, 10)
+            .unwrap()
+            .unwrap()
+            .job_id,
+        root_child.job_id
+    );
+
+    let mut snapshot = transfer_job("snapshot", "/snapshot");
+    snapshot.updated_at = 22;
+    store
+        .create_or_get_by_request_id_checked(snapshot.clone())
+        .unwrap();
+    let snapshot_lease = store
+        .acquire_runnable_transfer("owner-snapshot", 60_000, 23, 10)
+        .unwrap()
+        .unwrap();
+    assert!(store
+        .set_transfer_mount_snapshot(TransferMountSnapshotUpdate {
+            job_id: snapshot.job_id.clone(),
+            run_id: snapshot.run_id,
+            owner: snapshot_lease.owner.clone(),
+            lease_epoch: snapshot_lease.lease_epoch,
+            mount_snapshot_json: "{\"mount\":\"snapshot\"}".to_string(),
+            cluster_snapshot_version: 2,
+            now_ms: 24,
+        })
+        .unwrap());
+    assert!(store
+        .requeue_transfer(TransferRequeueUpdate {
+            job_id: snapshot.job_id.clone(),
+            run_id: snapshot.run_id,
+            owner: snapshot_lease.owner,
+            lease_epoch: snapshot_lease.lease_epoch,
+            message: "mount snapshot refresh delayed".to_string(),
+            next_attempt_at_ms: 30,
+            mount_snapshot_attempts: Some(1),
+            now_ms: 25,
+        })
+        .unwrap());
+    let persisted = store.get_transfer(&snapshot.job_id).unwrap().unwrap();
+    assert_eq!(persisted.state, TransferState::Pending);
+    assert_eq!(persisted.mount_snapshot_attempts, 1);
+    assert_eq!(persisted.mount_snapshot_json, "{\"mount\":\"snapshot\"}");
+    assert_eq!(
+        store
+            .create_or_get_by_request_id_checked(snapshot.clone())
+            .unwrap()
+            .job_id,
+        snapshot.job_id
     );
 }

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use curvine_error::FsError;
 use curvine_error::FsResult;
@@ -24,8 +24,8 @@ use curvine_model::{
 use parking_lot::Mutex;
 
 use crate::transfer::{
-    apply_task_report_progress, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
-    TransferTaskStateUpdate,
+    apply_task_report_progress, TransferMountSnapshotUpdate, TransferPlannedTasks,
+    TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
 };
 
 #[derive(Default)]
@@ -77,32 +77,6 @@ impl TransferStore for MemoryTransferStore {
             return Ok(existing);
         }
 
-        if let Some(existing) = inner
-            .jobs
-            .values()
-            .find(|existing| existing.job_key == job.job_key && !existing.state.is_terminal())
-        {
-            if existing.command_json == job.command_json {
-                return Ok(existing.clone());
-            }
-            return Err(FsError::transfer_already_running(format!(
-                "job_key {} has running job {} with different command",
-                existing.job_key, existing.job_id
-            )));
-        }
-
-        if let Some(existing) = inner.jobs.values().find(|existing| {
-            !(existing.state.is_terminal()
-                || (existing.submitter == job.submitter
-                    && existing.client_request_id == job.client_request_id))
-                && target_paths_conflict(&existing.target_path, &job.target_path)
-        }) {
-            return Err(FsError::transfer_target_conflict(format!(
-                "target {} conflicts with active transfer {} target {}",
-                job.target_path, existing.job_id, existing.target_path
-            )));
-        }
-
         inner.request_index.insert(request_key, job.job_id.clone());
         inner.jobs.insert(job.job_id.clone(), job.clone());
         Ok(job)
@@ -150,8 +124,8 @@ impl TransferStore for MemoryTransferStore {
             .jobs
             .values()
             .find(|job| {
-                !(job.state.is_terminal()
-                    || (job.submitter == submitter && job.client_request_id == client_request_id))
+                job.state.is_executing()
+                    && !(job.submitter == submitter && job.client_request_id == client_request_id)
                     && target_paths_conflict(target_path, &job.target_path)
             })
             .cloned())
@@ -285,11 +259,19 @@ impl TransferStore for MemoryTransferStore {
         max_executing_transfers: u64,
     ) -> FsResult<Option<TransferLease>> {
         let mut inner = self.inner.lock();
-        let executing = inner
+        let executing_targets = inner
             .jobs
             .values()
             .filter(|job| job.state.is_executing())
-            .count() as u64;
+            .map(|job| job.target_path.as_str())
+            .collect::<Vec<_>>();
+        let executing = executing_targets.len() as u64;
+        let executing_tenants = inner
+            .jobs
+            .values()
+            .filter(|job| job.state.is_executing())
+            .map(|job| job.tenant.as_str())
+            .collect::<HashSet<_>>();
         let candidate_id = inner
             .jobs
             .values()
@@ -321,11 +303,15 @@ impl TransferStore for MemoryTransferStore {
                     .jobs
                     .values()
                     .filter(|job| {
-                        job.state == TransferState::Pending && job.lease_expire_at <= now_ms
+                        job.state == TransferState::Pending
+                            && job.lease_expire_at <= now_ms
+                            && !executing_targets.iter().any(|target_path| {
+                                target_paths_conflict(&job.target_path, target_path)
+                            })
                     })
                     .min_by_key(|job| {
-                        let executing_for_tenant = executing_for_tenant(&inner, &job.tenant);
-                        let tenant_pressure = u64::from(executing_for_tenant > 0);
+                        let tenant_pressure =
+                            u64::from(executing_tenants.contains(job.tenant.as_str()));
                         (tenant_pressure, job.updated_at, job.job_id.clone())
                     })
                     .map(|job| job.job_id.clone())
@@ -333,6 +319,37 @@ impl TransferStore for MemoryTransferStore {
         let Some(candidate_id) = candidate_id else {
             return Ok(None);
         };
+
+        let conflict = inner
+            .jobs
+            .get(&candidate_id)
+            .filter(|candidate| candidate.state != TransferState::Pending)
+            .and_then(|candidate| {
+                inner
+                    .jobs
+                    .values()
+                    .find(|existing| {
+                        existing.job_id != candidate.job_id
+                            && existing.state.is_executing()
+                            && target_paths_conflict(&candidate.target_path, &existing.target_path)
+                    })
+                    .cloned()
+            });
+        if let Some(existing) = conflict {
+            let job = inner
+                .jobs
+                .get_mut(&candidate_id)
+                .ok_or_else(|| FsError::job_not_found(&candidate_id))?;
+            job.state = TransferState::Failed;
+            job.summary.message = format!(
+                "target {} conflicts with active transfer {} target {}",
+                job.target_path, existing.job_id, existing.target_path
+            );
+            job.summary.update_time = now_ms;
+            job.updated_at = now_ms;
+            return Ok(None);
+        }
+
         let Some(job) = inner.jobs.get_mut(&candidate_id) else {
             return Ok(None);
         };
@@ -418,6 +435,9 @@ impl TransferStore for MemoryTransferStore {
         job.state = TransferState::Pending;
         job.owner.clear();
         job.lease_expire_at = update.next_attempt_at_ms;
+        if let Some(mount_snapshot_attempts) = update.mount_snapshot_attempts {
+            job.mount_snapshot_attempts = mount_snapshot_attempts;
+        }
         job.summary.message = update.message;
         job.summary.update_time = update.now_ms;
         job.updated_at = update.now_ms;
@@ -454,6 +474,28 @@ impl TransferStore for MemoryTransferStore {
 
         job.cv_metadata_epoch = Some(cv_metadata_epoch);
         job.updated_at = now_ms;
+        Ok(true)
+    }
+
+    fn set_transfer_mount_snapshot(&self, update: TransferMountSnapshotUpdate) -> FsResult<bool> {
+        let mut inner = self.inner.lock();
+        let Some(job) = inner.jobs.get_mut(&update.job_id) else {
+            return Ok(false);
+        };
+        if job.run_id != update.run_id
+            || job.owner != update.owner
+            || job.lease_epoch != update.lease_epoch
+            || job.lease_expire_at <= update.now_ms
+            || job.state.is_terminal()
+        {
+            return Ok(false);
+        }
+        if !job.mount_snapshot_json.trim().is_empty() && job.mount_snapshot_json != "{}" {
+            return Ok(job.mount_snapshot_json == update.mount_snapshot_json);
+        }
+        job.mount_snapshot_json = update.mount_snapshot_json;
+        job.cluster_snapshot_version = update.cluster_snapshot_version;
+        job.updated_at = update.now_ms;
         Ok(true)
     }
 
@@ -720,14 +762,6 @@ impl TransferStore for MemoryTransferStore {
     }
 }
 
-fn executing_for_tenant(inner: &MemoryTransferState, tenant: &str) -> u64 {
-    inner
-        .jobs
-        .values()
-        .filter(|job| job.tenant == tenant && job.state.is_executing())
-        .count() as u64
-}
-
 fn add_job_to_tenant_summary(
     summaries: &mut HashMap<String, TransferTenantSummary>,
     job: &TransferJobRecord,
@@ -771,25 +805,25 @@ fn sorted_tenant_summaries(
 }
 
 fn target_paths_conflict(left: &str, right: &str) -> bool {
-    let left = normalize_target_path(left);
-    let right = normalize_target_path(right);
+    let left = normalized_target_path(left);
+    let right = normalized_target_path(right);
     if left == "/" || right == "/" {
         return true;
     }
     left == right
         || left
-            .strip_prefix(&right)
+            .strip_prefix(right)
             .is_some_and(|suffix| suffix.starts_with('/'))
         || right
-            .strip_prefix(&left)
+            .strip_prefix(left)
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-fn normalize_target_path(path: &str) -> String {
+fn normalized_target_path(path: &str) -> &str {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
-        "/".to_string()
+        "/"
     } else {
-        trimmed.to_string()
+        trimmed
     }
 }

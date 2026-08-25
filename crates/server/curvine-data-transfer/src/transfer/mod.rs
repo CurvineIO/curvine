@@ -29,9 +29,11 @@ pub(crate) use curvine_model::transfer_failure_message;
 
 mod cluster_cache;
 pub use self::cluster_cache::ClusterMetadataCache;
+pub(crate) use self::cluster_cache::MountSnapshotError;
 
 mod job_snapshot;
-pub use self::job_snapshot::job_mount_snapshot;
+pub(crate) use self::job_snapshot::job_mount_snapshot_with_version_async;
+pub use self::job_snapshot::{job_mount_snapshot, job_mount_snapshot_async};
 
 mod planner;
 pub use self::planner::{PlannedTransfer, TransferPlanner};

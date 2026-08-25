@@ -14,8 +14,10 @@
 
 use crate::common::UfsFactory;
 use crate::transfer::{
-    is_store_unavailable_error, job_mount_snapshot, transfer_failure_message, TransferPlannedTasks,
-    TransferPlanner, TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
+    is_store_unavailable_error, job_mount_snapshot_async, job_mount_snapshot_with_version_async,
+    transfer_failure_message, MountSnapshotError, TransferMountSnapshotUpdate,
+    TransferPlannedTasks, TransferPlanner, TransferRequeueUpdate, TransferStore,
+    TransferTaskStateUpdate,
 };
 use curvine_config::TransferConf;
 use curvine_error::FsError;
@@ -35,6 +37,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const PLANNING_REQUEUE_DELAY_MS: i64 = 1_000;
+const MOUNT_SNAPSHOT_MAX_RETRIES: u32 = 3;
+
+#[derive(Debug, PartialEq, Eq)]
+enum MountSnapshotFailureAction {
+    Requeue { retry_count: u32, delay_ms: i64 },
+    Fail,
+}
+
+fn mount_snapshot_failure_action(attempts: u32) -> MountSnapshotFailureAction {
+    if attempts >= MOUNT_SNAPSHOT_MAX_RETRIES {
+        return MountSnapshotFailureAction::Fail;
+    }
+    MountSnapshotFailureAction::Requeue {
+        retry_count: attempts.saturating_add(1),
+        delay_ms: PLANNING_REQUEUE_DELAY_MS.saturating_mul(2_i64.saturating_pow(attempts)),
+    }
+}
 
 use crate::transfer::{ClusterMetadataCache, TransferMetrics};
 
@@ -205,7 +224,11 @@ where
         Ok(())
     }
 
-    async fn plan_transfer(&self, job: TransferJobRecord, lease: TransferLease) -> FsResult<()> {
+    async fn plan_transfer(
+        &self,
+        mut job: TransferJobRecord,
+        lease: TransferLease,
+    ) -> FsResult<()> {
         if !self.transition(
             &job,
             &lease,
@@ -215,6 +238,116 @@ where
         )? {
             record_metric(|metrics| metrics.inc_planning(transfer_kind_label(job.kind), "stale"));
             return Ok(());
+        }
+
+        if job.mount_snapshot_json.trim().is_empty() || job.mount_snapshot_json == "{}" {
+            let snapshot = match job_mount_snapshot_with_version_async(&job, &self.cache).await {
+                Ok(snapshot) => Ok(snapshot),
+                Err(MountSnapshotError::Retryable(err)) => {
+                    match mount_snapshot_failure_action(job.mount_snapshot_attempts) {
+                        MountSnapshotFailureAction::Requeue {
+                            retry_count,
+                            delay_ms,
+                        } => {
+                            let now = now_ms();
+                            let requeued = self.store.requeue_transfer(TransferRequeueUpdate {
+                                job_id: job.job_id.clone(),
+                                run_id: job.run_id,
+                                owner: lease.owner.clone(),
+                                lease_epoch: lease.lease_epoch,
+                                message: format!("mount snapshot refresh delayed: {}", err),
+                                next_attempt_at_ms: now.saturating_add(delay_ms),
+                                mount_snapshot_attempts: Some(retry_count),
+                                now_ms: now,
+                            })?;
+                            if requeued {
+                                record_metric(|metrics| {
+                                    metrics.inc_planning(transfer_kind_label(job.kind), "retry")
+                                });
+                                info!(
+                                    "transfer mount snapshot requeued job_id={} run_id={} kind={:?} tenant={} owner={} lease_epoch={} retry_count={} next_attempt_at_ms={} reason={}",
+                                    job.job_id,
+                                    job.run_id,
+                                    job.kind,
+                                    job.tenant,
+                                    lease.owner,
+                                    lease.lease_epoch,
+                                    retry_count,
+                                    now.saturating_add(delay_ms),
+                                    err
+                                );
+                            }
+                            return Ok(());
+                        }
+                        MountSnapshotFailureAction::Fail => Err(err),
+                    }
+                }
+                Err(MountSnapshotError::Terminal(err)) => Err(err),
+            };
+            let (mount, version) = match snapshot {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    record_metric(|metrics| {
+                        metrics.inc_planning(transfer_kind_label(job.kind), "failure")
+                    });
+                    self.fail_transfer(
+                        &job,
+                        &lease,
+                        &[TransferState::Planning],
+                        transfer_failure_message(
+                            job.kind,
+                            &job.source_path,
+                            &job.target_path,
+                            &err,
+                        ),
+                    )?;
+                    return Err(err);
+                }
+            };
+            let snapshot_json = match serde_json::to_string(&mount) {
+                Ok(json) => json,
+                Err(err) => {
+                    let err = FsError::common(format!(
+                        "Unable to serialize transfer mount snapshot: {}",
+                        err
+                    ));
+                    record_metric(|metrics| {
+                        metrics.inc_planning(transfer_kind_label(job.kind), "failure")
+                    });
+                    self.fail_transfer(
+                        &job,
+                        &lease,
+                        &[TransferState::Planning],
+                        transfer_failure_message(
+                            job.kind,
+                            &job.source_path,
+                            &job.target_path,
+                            &err,
+                        ),
+                    )?;
+                    return Err(err);
+                }
+            };
+            if !self
+                .store
+                .set_transfer_mount_snapshot(TransferMountSnapshotUpdate {
+                    job_id: job.job_id.clone(),
+                    run_id: job.run_id,
+                    owner: lease.owner.clone(),
+                    lease_epoch: lease.lease_epoch,
+                    mount_snapshot_json: snapshot_json.clone(),
+                    cluster_snapshot_version: version,
+                    now_ms: now_ms(),
+                })?
+            {
+                warn!(
+                    "stop planning transfer {} because mount snapshot could not be persisted",
+                    job.job_id
+                );
+                return Ok(());
+            }
+            job.mount_snapshot_json = snapshot_json;
+            job.cluster_snapshot_version = version;
         }
 
         let planned = match self.planner.plan(&job).await {
@@ -231,6 +364,7 @@ where
                     lease_epoch: lease.lease_epoch,
                     message: format!("planning delayed: {}", err),
                     next_attempt_at_ms: now.saturating_add(PLANNING_REQUEUE_DELAY_MS),
+                    mount_snapshot_attempts: None,
                     now_ms: now,
                 })?;
                 if requeued {
@@ -453,7 +587,7 @@ where
                 return Ok(0);
             }
         };
-        let mount = job_mount_snapshot(job, &self.cache)?;
+        let mount = job_mount_snapshot_async(job, &self.cache).await?;
         let job_info = self.planner_job_info(job, &mount);
         let limit = self.conf.worker_dispatch_concurrency();
 
@@ -1119,5 +1253,34 @@ fn transfer_kind_label(kind: curvine_model::TransferKind) -> &'static str {
     match kind {
         curvine_model::TransferKind::Load => "load",
         curvine_model::TransferKind::Export => "export",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        mount_snapshot_failure_action, MountSnapshotFailureAction, MOUNT_SNAPSHOT_MAX_RETRIES,
+    };
+
+    #[test]
+    fn retryable_mount_snapshot_failures_use_bounded_backoff() {
+        assert_eq!(
+            mount_snapshot_failure_action(0),
+            MountSnapshotFailureAction::Requeue {
+                retry_count: 1,
+                delay_ms: 1_000,
+            }
+        );
+        assert_eq!(
+            mount_snapshot_failure_action(1),
+            MountSnapshotFailureAction::Requeue {
+                retry_count: 2,
+                delay_ms: 2_000,
+            }
+        );
+        assert_eq!(
+            mount_snapshot_failure_action(MOUNT_SNAPSHOT_MAX_RETRIES),
+            MountSnapshotFailureAction::Fail
+        );
     }
 }

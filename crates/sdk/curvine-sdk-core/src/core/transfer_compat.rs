@@ -211,7 +211,7 @@ fn build_transfer_command(
 }
 
 fn transfer_client(session: &Session) -> FsResult<TransferClient> {
-    TransferClient::with_context(session.unified().fs_context())
+    session.transfer_client()
 }
 
 pub(crate) async fn submit_load_job(

@@ -36,6 +36,20 @@ pub struct ClusterSnapshot {
     pub updated_at: i64,
 }
 
+#[derive(Debug)]
+pub(crate) enum MountSnapshotError {
+    Retryable(FsError),
+    Terminal(FsError),
+}
+
+impl MountSnapshotError {
+    pub(crate) fn into_fs_error(self) -> FsError {
+        match self {
+            Self::Retryable(err) | Self::Terminal(err) => err,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ClusterMetadataCache {
     fs: CurvineFileSystem,
@@ -172,12 +186,12 @@ impl ClusterMetadataCache {
             })
     }
 
-    pub fn find_mount_with_refresh(
+    pub(crate) fn find_mount_with_refresh(
         &self,
         kind: TransferKind,
         source: &Path,
         target: &Path,
-    ) -> FsResult<MountSnapshot> {
+    ) -> Result<MountSnapshot, MountSnapshotError> {
         let snapshot = self.snapshot();
         if self.check_snapshot_fresh(&snapshot).is_ok() {
             if let Some(snapshot) = self.matching_mount_snapshot(kind, source, target, &snapshot) {
@@ -193,9 +207,20 @@ impl ClusterMetadataCache {
             }
         }
 
-        // SubmitTransfer is synchronous and may run within a Tokio task.
-        self.refresh_blocking()?;
-        self.find_mount_with_version(kind, source, target)
+        // Refresh is blocking; callers should use it during scheduling, never
+        // on the durable submit path.
+        self.refresh_blocking()
+            .map_err(MountSnapshotError::Retryable)?;
+        let snapshot = self.snapshot();
+        self.matching_mount_snapshot(kind, source, target, &snapshot)
+            .ok_or_else(|| {
+                MountSnapshotError::Terminal(FsError::common(format!(
+                    "No mount found for {:?}: {} -> {}",
+                    kind,
+                    source.full_path(),
+                    target.full_path()
+                )))
+            })
     }
 
     fn matching_mount_snapshot(

@@ -14,17 +14,20 @@
 
 use crate::FilesystemConf;
 use curvine_client::file::FsClient;
+use curvine_client::rpc::TransferClient;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_config::ClusterConf;
 use curvine_error::FsResult;
 use curvine_runtime::common::Logger;
 use curvine_runtime::runtime::Runtime;
+use once_cell::sync::OnceCell;
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct Session {
     rt: Arc<Runtime>,
     unified: UnifiedFileSystem,
+    transfer_client: OnceCell<TransferClient>,
 }
 
 impl Session {
@@ -34,7 +37,11 @@ impl Session {
         let rpc_conf = conf.client_rpc_conf();
         let rt = Arc::new(rpc_conf.create_runtime());
         let unified = UnifiedFileSystem::with_rt(conf, rt.clone())?;
-        Ok(Self { rt, unified })
+        Ok(Self {
+            rt,
+            unified,
+            transfer_client: OnceCell::new(),
+        })
     }
 
     pub fn from_conf_path(path: impl AsRef<str>) -> FsResult<Self> {
@@ -56,5 +63,11 @@ impl Session {
 
     pub fn fs_client(&self) -> Arc<FsClient> {
         self.unified.fs_client()
+    }
+
+    pub fn transfer_client(&self) -> FsResult<TransferClient> {
+        self.transfer_client
+            .get_or_try_init(|| TransferClient::with_context(self.unified.fs_context()))
+            .cloned()
     }
 }
