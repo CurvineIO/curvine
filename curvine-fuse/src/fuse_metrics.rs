@@ -228,6 +228,16 @@ impl FuseMetrics {
             .expect("FuseMetrics not initialized; call ensure_init from CurvineFileSystem::new")
     }
 
+    /// Create lifecycle counter children before the metrics endpoint starts.
+    /// This exposes a zero baseline so Prometheus can observe a later init result.
+    pub(crate) fn init_session_metrics() {
+        Self::with(|m| {
+            for result in [SESSION_INIT_SUCCESS, SESSION_INIT_ERROR] {
+                let _ = m.session_init_total.with_label_values(&[result]);
+            }
+        });
+    }
+
     pub(crate) fn with<F: FnOnce(&Self)>(f: F) {
         if let Some(m) = FUSE_METRICS.get() {
             f(m);
@@ -2716,6 +2726,26 @@ mod tests {
         // the gauge must be in {0,1}.
         let v = mx.kernel_fd_health.get();
         assert!(v == 0 || v == 1, "health gauge is binary");
+    }
+
+    #[test]
+    fn init_session_metrics_exports_zero_baselines_without_incrementing() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+        let success = mx
+            .session_init_total
+            .with_label_values(&[SESSION_INIT_SUCCESS]);
+        let error = mx
+            .session_init_total
+            .with_label_values(&[SESSION_INIT_ERROR]);
+        let before = (success.get(), error.get());
+
+        FuseMetrics::init_session_metrics();
+
+        assert_eq!((success.get(), error.get()), before);
+        let output = m::text_output().unwrap();
+        assert!(output.contains("curvine_fuse_session_init_total{result=\"success\"}"));
+        assert!(output.contains("curvine_fuse_session_init_total{result=\"error\"}"));
     }
 
     // The `if enabled { emit }` gate is deterministic against an isolated counter —

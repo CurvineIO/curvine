@@ -28,7 +28,17 @@ use std::sync::Arc;
 pub struct WebServer;
 
 impl WebServer {
-    pub async fn start(port: u16, state: Arc<NodeState>) -> curvine_core_error::CommonResult<()> {
+    pub async fn bind(port: u16) -> curvine_core_error::CommonResult<tokio::net::TcpListener> {
+        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        log::info!("FUSE metrics server listening on {}", addr);
+        Ok(listener)
+    }
+
+    pub async fn serve(
+        listener: tokio::net::TcpListener,
+        state: Arc<NodeState>,
+    ) -> curvine_core_error::CommonResult<()> {
         let app = Router::new()
             .route("/metrics", get(metrics_handler))
             .route("/healthz", get(|| async { "ok" }))
@@ -36,12 +46,13 @@ impl WebServer {
             .route("/details", get(details_handler))
             .with_state(state);
 
-        let addr = SocketAddr::from(([0, 0, 0, 0], port));
-        log::info!("FUSE metrics server listening on {}", addr);
-
-        let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, app).await?;
         Ok(())
+    }
+
+    pub async fn start(port: u16, state: Arc<NodeState>) -> curvine_core_error::CommonResult<()> {
+        let listener = Self::bind(port).await?;
+        Self::serve(listener, state).await
     }
 }
 

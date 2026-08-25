@@ -14,6 +14,7 @@
 
 use crate::cli::FuseRuntimeArgs;
 use crate::fs::CurvineFileSystem;
+use crate::fuse_metrics::FuseMetrics;
 use crate::session::FuseSession;
 use crate::web_server::WebServer;
 use curvine_config::FuseConf;
@@ -62,13 +63,21 @@ pub fn run_mount(args: FuseRuntimeArgs) -> CommonResult<()> {
 
         let node_state = fs.state().clone();
         let web_port = conf.web_port;
-        let mut session = FuseSession::new(fuse_rt.clone(), fs, conf).await?;
-
-        fuse_rt.spawn(async move {
-            if let Err(e) = WebServer::start(web_port, node_state).await {
-                log::error!("Failed to start metrics server: {}", e);
+        // Start metrics before session construction so Prometheus can observe
+        // the lifecycle counter's zero baseline during startup.
+        FuseMetrics::init_session_metrics();
+        match WebServer::bind(web_port).await {
+            Ok(listener) => {
+                fuse_rt.spawn(async move {
+                    if let Err(e) = WebServer::serve(listener, node_state).await {
+                        log::error!("Failed to start metrics server: {}", e);
+                    }
+                });
             }
-        });
+            Err(e) => log::error!("Failed to start metrics server: {}", e),
+        }
+
+        let mut session = FuseSession::new(fuse_rt.clone(), fs, conf).await?;
 
         session.run().await
     })?;

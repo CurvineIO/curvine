@@ -5052,7 +5052,7 @@
         {
           "id": 78,
           "type": "stat",
-          "title": "Session init/shutdown (range)",
+          "title": "Current session init / shutdowns (range)",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -5069,7 +5069,7 @@
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "sum by(result)(increase(curvine_fuse_session_init_total{instance=~\"$instance\"}[$__range]))",
+              "expr": "sum by(result)(curvine_fuse_session_init_total{instance=~\"$instance\"})",
               "refId": "A",
               "legendFormat": "init {{result}}"
             },
@@ -5104,7 +5104,7 @@
             "textMode": "auto",
             "orientation": "auto"
           },
-          "description": "Low-freq lifecycle events, increase over range. No status-grouped zero-fill (would inject a label-less 0); No data means no init/shutdown events in the selected range."
+          "description": "Init shows the current process' recorded initialization result (the success/error child is pre-created at zero before session construction). Shutdown shows low-frequency shutdown events as an increase over the selected range; a shutdown may be missed if the process exits before the next scrape."
         },
         {
           "id": 79,
