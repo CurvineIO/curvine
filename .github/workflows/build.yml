@@ -112,6 +112,14 @@ jobs:
           echo "After build, disk usage:"
           df -h
 
+      - name: Run etcd service discovery tests
+        run: |
+          echo "Running feature-gated etcd service discovery unit tests"
+          cargo test -p curvine-service-discovery --features etcd --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+          echo "After etcd service discovery tests, disk usage:"
+          df -h
+
       - name: Minimal client artifact dependency guardrails
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
