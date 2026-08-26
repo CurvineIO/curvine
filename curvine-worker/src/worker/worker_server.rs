@@ -96,7 +96,14 @@ impl WorkerService {
 impl HandlerService for WorkerService {
     type Item = WorkerHandler;
 
-    fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
+    fn has_conn_state(&self) -> bool {
+        true
+    }
+
+    fn get_message_handler(&self, conn_info: Option<ConnState>) -> Self::Item {
+        let client_addr = conn_info
+            .map(|state| state.remote_addr.to_string())
+            .unwrap_or_default();
         WorkerHandler {
             store: self.store.clone(),
             handler: FastMutex::new(None),
@@ -105,6 +112,7 @@ impl HandlerService for WorkerService {
             rt: self.rt.clone(),
             replication_handler: WorkerReplicationHandler::new(&self.replication_manager),
             compatibility_policy: self.compatibility_policy.clone(),
+            client_addr,
         }
     }
 }
