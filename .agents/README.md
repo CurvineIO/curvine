@@ -41,7 +41,7 @@ rm -rf .claude/skills && ln -sfn ../.agents/skills .claude/skills
 | `cv-create-issue` | File GitHub issue |
 | `cv-handle-issue` | Fix issue (plan first, then code) |
 | `cv-create-pr` | Create / update PR |
-| `cv-submit-pr-review` | Review PR code: contracts, lifecycle, tests, performance |
+| `cv-submit-pr-review` | Review PR code: intent, tests-first, contracts, lifecycle, performance |
 | `cv-address-pr-review` | Handle review comments |
 | `cv-run-workflow` | Dispatch GitHub Actions |
 | `cv-csi-test` | CSI driver integration testing |
