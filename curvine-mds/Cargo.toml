@@ -1,0 +1,12 @@
+[package]
+name = "curvine-mds"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+curvine-config = { workspace = true }
+curvine-core-error = { workspace = true }
+curvine-runtime = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true }

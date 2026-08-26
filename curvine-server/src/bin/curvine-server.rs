@@ -18,6 +18,7 @@ use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_data_transfer::transfer::TransferServer;
 use curvine_master::master::Master;
+use curvine_mds::Mds;
 use curvine_runtime::common::{LocalTime, Utils};
 use curvine_sys::version;
 use curvine_worker::Worker;
@@ -57,6 +58,11 @@ fn main() -> CommonResult<()> {
             worker.block_on_start()?;
         }
 
+        ServiceType::Mds => {
+            let mds = Mds::with_conf(conf)?;
+            mds.block_on_start()?;
+        }
+
         ServiceType::Transfer => {
             let transfer = TransferServer::with_conf(conf)?;
             transfer.block_on_start()?;
@@ -86,6 +92,7 @@ impl ServerArgs {
         match self.service.to_lowercase().as_str() {
             "master" => "master",
             "worker" => "worker",
+            "mds" => "mds",
             "transfer" => "data-transfer",
             _ => "server",
         }
@@ -96,6 +103,7 @@ impl ServerArgs {
         match service.as_str() {
             "master" => Ok(ServiceType::Master),
             "worker" => Ok(ServiceType::Worker),
+            "mds" => Ok(ServiceType::Mds),
             "transfer" => Ok(ServiceType::Transfer),
             v => err_box!("Unsupported service type: {}", v),
         }
@@ -104,7 +112,9 @@ impl ServerArgs {
     pub fn get_conf(&self, service: &ServiceType) -> CommonResult<ClusterConf> {
         match service {
             ServiceType::Transfer => ClusterConf::from_transfer(&self.conf),
-            ServiceType::Master | ServiceType::Worker => ClusterConf::from(&self.conf),
+            ServiceType::Master | ServiceType::Worker | ServiceType::Mds => {
+                ClusterConf::from(&self.conf)
+            }
         }
     }
 }
@@ -112,6 +122,7 @@ impl ServerArgs {
 pub enum ServiceType {
     Master,
     Worker,
+    Mds,
     Transfer,
 }
 
@@ -136,5 +147,14 @@ mod tests {
 
         assert!(args.version_json);
         assert_eq!(args.component_name(), "server");
+    }
+
+    #[test]
+    fn accepts_mds_service() {
+        let args = ServerArgs::try_parse_from(["curvine-server", "--service", "mds"])
+            .expect("mds service should parse");
+
+        assert!(matches!(args.get_service().unwrap(), ServiceType::Mds));
+        assert_eq!(args.component_name(), "mds");
     }
 }

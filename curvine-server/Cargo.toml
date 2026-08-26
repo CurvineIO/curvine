@@ -38,6 +38,7 @@ curvine-alloc = { workspace = true }
 curvine-model = { workspace = true }
 curvine-runtime = { workspace = true }
 curvine-master = { workspace = true }
+curvine-mds = { workspace = true }
 curvine-worker = { workspace = true }
 curvine-error = { workspace = true, features = ["axum-response"] }
 curvine-fault = { workspace = true }

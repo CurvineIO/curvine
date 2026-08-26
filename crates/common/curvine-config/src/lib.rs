@@ -28,6 +28,9 @@ pub use self::journal_conf::JournalConf;
 mod master_conf;
 pub use self::master_conf::MasterConf;
 
+mod mds_conf;
+pub use self::mds_conf::MdsConf;
+
 mod compatibility_conf;
 pub use self::compatibility_conf::CompatibilityConf;
 
