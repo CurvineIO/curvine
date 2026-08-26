@@ -34,7 +34,7 @@ auth_token_env = "CURVINE_FAULT_TOKEN"
 [master]
 meta_dir = "testing/meta"
 # Worker selection policy: local, robin, random, load_based, or weighted.
-# local prefers a local worker for the first replica and assigns the rest by weight.
+# local prefers a local worker for the first replica and assigns the rest via the weighted policy.
 # worker_policy = "weighted"
 log = { level = "info", log_dir = "stdout", file_name = "master.log" }
 
