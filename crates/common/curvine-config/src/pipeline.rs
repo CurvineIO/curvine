@@ -732,6 +732,26 @@ mod tests {
         );
     }
 
+    // The server passes ServerArgs.conf, which defaults to "" — the
+    // empty-explicit contract is what makes bare local starts work. If the
+    // trim/empty filter regressed, discover(Some("")) would win with a
+    // nonexistent "--conf" path instead of falling through.
+    #[test]
+    fn empty_or_blank_explicit_path_does_not_win() {
+        for explicit in ["", "   "] {
+            let found = ConfigLoader::discover(Some(explicit));
+            assert!(
+                found.map(|f| f.source != "--conf").unwrap_or(true),
+                "empty explicit path must not be treated as --conf"
+            );
+            let configured = ConfigLoader::discover_configured(Some(explicit));
+            assert!(
+                configured.map(|f| f.source != "--conf").unwrap_or(true),
+                "empty explicit path must not be treated as --conf"
+            );
+        }
+    }
+
     #[test]
     fn discovery_prefers_explicit_over_env_var() {
         // Explicit path wins even when CURVINE_CONF_FILE is set; both are taken
