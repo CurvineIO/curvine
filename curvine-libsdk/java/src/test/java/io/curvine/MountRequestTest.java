@@ -18,6 +18,7 @@ import io.curvine.proto.AccessModeProto;
 import io.curvine.proto.ProviderProto;
 import io.curvine.proto.StorageTypeProto;
 import io.curvine.proto.TtlActionProto;
+import io.curvine.proto.TtlTypeProto;
 import io.curvine.proto.WriteTypeProto;
 import org.junit.Assert;
 import org.junit.Test;
@@ -68,6 +69,7 @@ public class MountRequestTest {
                 .autoCache(false)
                 .accessMode(AccessModeProto.ACCESS_MODE_PROTO_READ_WRITE)
                 .writeCache(true)
+                .ttlType(TtlTypeProto.TTL_TYPE_PROTO_ATIME)
                 .build();
 
         Assert.assertTrue(request.getOptions().getUpdate());
@@ -88,6 +90,8 @@ public class MountRequestTest {
         Assert.assertEquals(
                 AccessModeProto.ACCESS_MODE_PROTO_READ_WRITE, request.getOptions().getAccessMode());
         Assert.assertTrue(request.getOptions().getWriteCache());
+        Assert.assertEquals(
+                TtlTypeProto.TTL_TYPE_PROTO_ATIME, request.getOptions().getTtlType());
     }
 
     @Test

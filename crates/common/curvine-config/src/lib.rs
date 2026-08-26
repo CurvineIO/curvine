@@ -82,6 +82,10 @@ impl curvine_model::ClientConfDefaults for ClientConf {
         self.ttl_action
     }
 
+    fn ttl_type(&self) -> curvine_model::TtlType {
+        self.ttl_type
+    }
+
     fn mode(&self) -> u32 {
         self.get_mode()
     }

@@ -315,7 +315,14 @@ impl InodeStore {
     pub fn apply_overwrite_file(&self, file: &InodeView) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
         batch.write_inode(file)?;
-        batch.commit()
+        batch.commit()?;
+
+        // Overwrite can change ttl_ms/ttl_action and the TTL-base marker;
+        // refresh the index so the inode moves to the bucket matching its
+        // new expiration instead of waiting for the stale one to fire.
+        self.ttl_bucket_list.add(file);
+
+        Ok(())
     }
 
     pub fn apply_reopen_file(&self, file: &InodeView) -> CommonResult<()> {

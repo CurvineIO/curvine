@@ -23,6 +23,11 @@ use std::collections::HashMap;
 // collide with a user-visible extended attribute.
 pub const INTERNAL_CTIME_XATTR: &str = "\0curvine.ctime";
 
+/// Marks that a file's TTL expires based on access time instead of mtime.
+/// Stored as an internal xattr so the bincode inode layout stays unchanged;
+/// absence of the key means the legacy mtime-based TTL.
+pub const INTERNAL_TTL_TYPE_XATTR: &str = "\0curvine.ttl_type";
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FileStatus {
     pub id: i64,

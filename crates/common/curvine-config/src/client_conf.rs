@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::state::{StorageType, TtlAction};
+use crate::state::{StorageType, TtlAction, TtlType};
 use curvine_common_macros::ClientCliArgs;
 use curvine_core_error::CommonResult;
 use curvine_net::net::InetAddr;
@@ -107,6 +107,19 @@ pub struct ClientConf {
     #[serde(alias = "ttl_action")]
     #[client_cli]
     pub ttl_action_str: String,
+
+    /// Base time for TTL expiration of files created under this config:
+    /// `mtime` (default) or `atime`. With `atime`, re-opening a file for
+    /// read refreshes the access time (throttled to once per `ttl_ms / 2`)
+    /// so actively-read files are not reclaimed by TTL cleanup. Refreshes
+    /// happen on read opens only: a single long-lived open/read handle does
+    /// not extend the file's lifetime by itself. Directories always keep
+    /// mtime-based TTL (their activity is reflected by child changes).
+    #[serde(skip)]
+    pub ttl_type: TtlType,
+    #[serde(alias = "ttl_type")]
+    #[client_cli]
+    pub ttl_type_str: String,
 
     /// Whether to enable automatic caching function
     /// When enabled, when the client reads files from external file systems (such as S3, OSS, etc.),
@@ -326,6 +339,12 @@ impl ClientConf {
         self.ttl_ms = DurationUnit::from_str(&self.ttl_ms_str)?.as_millis() as i64;
         self.ttl_action = TtlAction::try_from(self.ttl_action_str.as_str())?;
         self.storage_type = StorageType::try_from(self.storage_type_str.as_str())?;
+        // Older configs (and Java-side toml snippets) may omit ttl_type.
+        self.ttl_type = if self.ttl_type_str.trim().is_empty() {
+            TtlType::Mtime
+        } else {
+            TtlType::try_from(self.ttl_type_str.as_str())?
+        };
 
         // Process smart prefetch configuration
         self.large_file_size = ByteUnit::from_str(&self.large_file_size_str)?.as_byte() as i64;
@@ -398,6 +417,8 @@ impl Default for ClientConf {
             ttl_ms_str: "0".to_string(),
             ttl_action: TtlAction::None,
             ttl_action_str: "none".to_string(),
+            ttl_type: TtlType::Mtime,
+            ttl_type_str: "mtime".to_string(),
 
             auto_cache_enabled: false,
             auto_cache_ttl: "7d".to_string(),

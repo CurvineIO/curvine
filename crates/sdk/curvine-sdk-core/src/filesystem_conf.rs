@@ -45,6 +45,7 @@ pub struct FilesystemConf {
     pub storage_type: String,
     pub ttl_ms: String,
     pub ttl_action: String,
+    pub ttl_type: String,
 
     pub auto_cache_enabled: bool,
     pub auto_cache_ttl: String,
@@ -174,6 +175,7 @@ impl FilesystemConf {
             drop_cache_len: "64MB".to_string(),
             ttl_ms: "0".to_string(),
             ttl_action: "none".to_string(),
+            ttl_type: "mtime".to_string(),
             storage_type: "disk".to_string(),
             failed_worker_ttl_ms: 30_000,
             mount_update_ttl_ms: 5 * 60_000,
@@ -253,6 +255,7 @@ impl FilesystemConf {
             storage_type_str: self.storage_type,
             ttl_ms_str: self.ttl_ms,
             ttl_action_str: self.ttl_action,
+            ttl_type_str: self.ttl_type,
 
             auto_cache_enabled: self.auto_cache_enabled,
             auto_cache_ttl: self.auto_cache_ttl,

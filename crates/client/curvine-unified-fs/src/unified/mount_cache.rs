@@ -345,7 +345,7 @@ impl MountCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use curvine_model::{AccessMode, MountInfo, Provider, TtlAction, WriteType};
+    use curvine_model::{AccessMode, MountInfo, Provider, TtlAction, TtlType, WriteType};
     use std::collections::HashMap;
 
     fn opendal_oss_mount() -> MountInfo {
@@ -365,6 +365,7 @@ mod tests {
             auto_cache: true,
             access_mode: AccessMode::ReadOnly,
             write_cache: false,
+            ttl_type: TtlType::Mtime,
         }
     }
 

@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::state::{CreateFileOpts, CreateFileOptsBuilder, StoragePolicy, StorageType, TtlAction};
+use crate::state::{
+    CreateFileOpts, CreateFileOptsBuilder, StoragePolicy, StorageType, TtlAction, TtlType,
+};
 use crate::{ClientConfDefaults, CurvinePath};
 use bincode::Options;
 use curvine_core_error::{err_box, CommonError, CommonResult};
@@ -121,6 +123,9 @@ pub struct MountInfo {
     pub auto_cache: bool,
     pub access_mode: AccessMode,
     pub write_cache: bool,
+    /// TTL expiration base time. Must stay the LAST field for bincode
+    /// compatibility with payloads persisted before this field existed.
+    pub ttl_type: TtlType,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -157,6 +162,7 @@ impl From<LegacyMountInfo> for MountInfo {
             auto_cache: true,
             access_mode: AccessMode::ReadOnly,
             write_cache: false,
+            ttl_type: TtlType::Mtime,
         }
     }
 }
@@ -197,6 +203,51 @@ impl From<LegacyMountInfoWithAutoCacheAccessMode> for MountInfo {
             auto_cache: info.auto_cache,
             access_mode: info.access_mode,
             write_cache: false,
+            ttl_type: TtlType::Mtime,
+        }
+    }
+}
+
+/// Layout persisted between the `write_cache` and the `ttl_type` additions:
+/// it ends at `write_cache` (the previous last field) and has no `ttl_type`.
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyMountInfoWithWriteCache {
+    cv_path: String,
+    ufs_path: String,
+    mount_id: u32,
+    properties: HashMap<String, String>,
+    ttl_ms: i64,
+    ttl_action: TtlAction,
+    read_verify_ufs: bool,
+    storage_type: Option<StorageType>,
+    block_size: Option<i64>,
+    replicas: Option<i32>,
+    write_type: WriteType,
+    provider: Option<Provider>,
+    auto_cache: bool,
+    access_mode: AccessMode,
+    write_cache: bool,
+}
+
+impl From<LegacyMountInfoWithWriteCache> for MountInfo {
+    fn from(info: LegacyMountInfoWithWriteCache) -> Self {
+        Self {
+            cv_path: info.cv_path,
+            ufs_path: info.ufs_path,
+            mount_id: info.mount_id,
+            properties: info.properties,
+            ttl_ms: info.ttl_ms,
+            ttl_action: info.ttl_action,
+            read_verify_ufs: info.read_verify_ufs,
+            storage_type: info.storage_type,
+            block_size: info.block_size,
+            replicas: info.replicas,
+            write_type: info.write_type,
+            provider: info.provider,
+            auto_cache: info.auto_cache,
+            access_mode: info.access_mode,
+            write_cache: info.write_cache,
+            ttl_type: TtlType::Mtime,
         }
     }
 }
@@ -206,6 +257,14 @@ impl MountInfo {
         match bincode::deserialize::<Self>(bytes) {
             Ok(info) => Ok(info),
             Err(e) if Self::is_unexpected_eof(&e) => {
+                if let Ok(legacy) = bincode::DefaultOptions::new()
+                    .with_fixint_encoding()
+                    .reject_trailing_bytes()
+                    .deserialize::<LegacyMountInfoWithWriteCache>(bytes)
+                {
+                    return Ok(legacy.into());
+                }
+
                 if let Ok(legacy) = bincode::DefaultOptions::new()
                     .with_fixint_encoding()
                     .reject_trailing_bytes()
@@ -291,12 +350,16 @@ impl MountInfo {
     }
 
     pub fn merge_create_opts(&self, opts: CreateFileOpts) -> CreateFileOpts {
+        let mut x_attr = opts.x_attr;
+        // Atime-based TTL is recorded as an internal inode attribute so the
+        // persisted bincode layout of StoragePolicy stays unchanged.
+        self.ttl_type.apply_to_xattrs(&mut x_attr);
         CreateFileOpts {
             create_parent: true,
             replicas: self.replicas.unwrap_or(opts.replicas as i32) as u16,
             block_size: self.block_size.unwrap_or(opts.block_size),
             file_type: opts.file_type,
-            x_attr: opts.x_attr,
+            x_attr,
             storage_policy: StoragePolicy {
                 ttl_ms: self.ttl_ms,
                 ttl_action: self.ttl_action,
@@ -358,6 +421,7 @@ impl MountInfo {
             auto_cache: mnt_opt.auto_cache.unwrap_or(self.auto_cache),
             access_mode: mnt_opt.access_mode.unwrap_or(self.access_mode),
             write_cache: mnt_opt.write_cache.unwrap_or(self.write_cache),
+            ttl_type: mnt_opt.ttl_type.unwrap_or(self.ttl_type),
         }
     }
 }
@@ -378,6 +442,7 @@ pub struct MountOptions {
     pub auto_cache: Option<bool>,
     pub access_mode: Option<AccessMode>,
     pub write_cache: Option<bool>,
+    pub ttl_type: Option<TtlType>,
 }
 
 impl MountOptions {
@@ -408,6 +473,7 @@ impl MountOptions {
             auto_cache: self.auto_cache.unwrap_or(true),
             access_mode: self.access_mode.unwrap_or_default(),
             write_cache: self.write_cache.unwrap_or(false),
+            ttl_type: self.ttl_type.unwrap_or_default(),
         }
     }
 }
@@ -428,6 +494,7 @@ pub struct MountOptionsBuilder {
     auto_cache: Option<bool>,
     access_mode: Option<AccessMode>,
     write_cache: Option<bool>,
+    ttl_type: Option<TtlType>,
 }
 
 impl MountOptionsBuilder {
@@ -449,7 +516,10 @@ impl MountOptionsBuilder {
             return builder;
         }
 
-        builder.ttl_ms(conf.ttl_ms()).ttl_action(conf.ttl_action())
+        builder
+            .ttl_ms(conf.ttl_ms())
+            .ttl_action(conf.ttl_action())
+            .ttl_type(conf.ttl_type())
     }
 
     pub fn update(mut self, update: bool) -> Self {
@@ -474,6 +544,11 @@ impl MountOptionsBuilder {
 
     pub fn ttl_action(mut self, ttl_action: TtlAction) -> Self {
         self.ttl_action = Some(ttl_action);
+        self
+    }
+
+    pub fn ttl_type(mut self, ttl_type: TtlType) -> Self {
+        self.ttl_type = Some(ttl_type);
         self
     }
 
@@ -534,6 +609,7 @@ impl MountOptionsBuilder {
         self.auto_cache = None;
         self.access_mode = None;
         self.write_cache = None;
+        self.ttl_type = None;
         self
     }
 
@@ -553,6 +629,7 @@ impl MountOptionsBuilder {
             auto_cache: self.auto_cache,
             access_mode: self.access_mode,
             write_cache: self.write_cache,
+            ttl_type: self.ttl_type,
         }
     }
 }
@@ -597,7 +674,8 @@ impl TryFrom<&str> for WriteType {
 #[cfg(test)]
 mod tests {
     use crate::state::{AccessMode, MountInfo, MountOptions, WriteType};
-    use crate::CurvinePath;
+    use crate::ttl_type::TtlType;
+    use crate::{CreateFileOpts, CurvinePath, INTERNAL_TTL_TYPE_XATTR};
     use curvine_fs_api::Path;
     use std::fmt;
 
@@ -873,5 +951,35 @@ mod tests {
         let to_ufs = info.get_ufs_path(&original_cv).unwrap();
         let back_to_cv = info.get_cv_path(&to_ufs).unwrap();
         assert_eq!(original_cv.full_path(), back_to_cv.full_path());
+    }
+
+    #[test]
+    fn test_merge_create_opts_ttl_type_wins_over_stale_marker() {
+        let key = INTERNAL_TTL_TYPE_XATTR.to_string();
+
+        // Mount policy is the default mtime: a pre-existing atime marker
+        // (e.g. stamped from an atime client conf before the merge) must be
+        // stripped so the mount policy wins.
+        let mtime_mount = MountInfo::default();
+        assert_eq!(mtime_mount.ttl_type, TtlType::Mtime);
+        let mut opts = CreateFileOpts::with_create(true);
+        opts.x_attr
+            .insert(key.clone(), TtlType::Atime.to_xattr_value());
+        let merged = mtime_mount.merge_create_opts(opts);
+        assert!(
+            !merged.x_attr.contains_key(&key),
+            "mtime mount must strip a pre-existing atime marker"
+        );
+
+        // Atime mount inserts/keeps the marker.
+        let atime_mount = MountInfo {
+            ttl_type: TtlType::Atime,
+            ..Default::default()
+        };
+        let merged = atime_mount.merge_create_opts(CreateFileOpts::with_create(true));
+        assert_eq!(
+            merged.x_attr.get(&key).map(|v| v.as_slice()),
+            Some(&[1u8][..])
+        );
     }
 }

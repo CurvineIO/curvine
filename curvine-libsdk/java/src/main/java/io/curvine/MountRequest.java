@@ -19,6 +19,7 @@ import io.curvine.proto.MountOptionsProto;
 import io.curvine.proto.ProviderProto;
 import io.curvine.proto.StorageTypeProto;
 import io.curvine.proto.TtlActionProto;
+import io.curvine.proto.TtlTypeProto;
 import io.curvine.proto.WriteTypeProto;
 
 import java.util.LinkedHashMap;
@@ -72,6 +73,7 @@ public final class MountRequest {
         private Boolean autoCache;
         private AccessModeProto accessMode;
         private Boolean writeCache;
+        private TtlTypeProto ttlType;
 
         private Builder() {
         }
@@ -163,6 +165,16 @@ public final class MountRequest {
             return this;
         }
 
+        /**
+         * Select the timestamp base used for TTL expiration on files created
+         * under this mount. Defaults to the master-side mtime behaviour when
+         * not set.
+         */
+        public Builder ttlType(TtlTypeProto ttlType) {
+            this.ttlType = Objects.requireNonNull(ttlType, "ttlType");
+            return this;
+        }
+
         public MountRequest build() {
             String checkedUfsPath = requireText(ufsPath, "ufsPath");
             String checkedCvPath = requireText(cvPath, "cvPath");
@@ -191,6 +203,9 @@ public final class MountRequest {
             }
             if (provider != null) {
                 options.setProvider(provider);
+            }
+            if (ttlType != null) {
+                options.setTtlType(ttlType);
             }
             return new MountRequest(checkedUfsPath, checkedCvPath, options.build());
         }

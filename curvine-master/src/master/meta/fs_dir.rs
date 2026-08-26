@@ -26,8 +26,8 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
-    FreeResult, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, TtlAction,
-    WorkerAddress, INTERNAL_CTIME_XATTR,
+    FreeResult, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, TtlAction, TtlType,
+    WorkerAddress, INTERNAL_CTIME_XATTR, INTERNAL_TTL_TYPE_XATTR,
 };
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::sync::AtomicCounter;
@@ -1074,6 +1074,52 @@ impl FsDir {
         self.store.get_mount_point(id)
     }
 
+    /// Refresh a file's atime for atime-based TTL expiration.
+    ///
+    /// Called on the read-open path. To bound journal writes, the update is
+    /// throttled: it fires only when `now - atime >= ttl_ms / 2` (relatime
+    /// style). Returns whether the atime was updated.
+    pub fn touch_atime_for_ttl(&mut self, inp: &InodePath) -> FsResult<bool> {
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return Ok(false),
+        };
+
+        if !inode.is_file() {
+            return Ok(false);
+        }
+
+        // Only files with an active atime-based TTL policy need refreshes.
+        let sp = &inode.as_file_ref()?.storage_policy;
+        if sp.ttl_ms <= 0 || sp.ttl_action == TtlAction::None {
+            return Ok(false);
+        }
+
+        let ttl_type = TtlType::from_xattr_value(
+            inode
+                .x_attr()?
+                .get(INTERNAL_TTL_TYPE_XATTR)
+                .map(|v| v.as_slice()),
+        );
+        if ttl_type != TtlType::Atime {
+            return Ok(false);
+        }
+
+        let now = LocalTime::mills() as i64;
+        if now.saturating_sub(inode.atime()) < sp.ttl_ms / 2 {
+            return Ok(false);
+        }
+
+        let opts = SetAttrOpts {
+            recursive: false,
+            atime: Some(now),
+            ..Default::default()
+        };
+        self.unprotected_set_attr(inode, opts.clone())?;
+        self.journal_writer.log_set_attr(self, inp, opts)?;
+        Ok(true)
+    }
+
     pub fn set_attr(&mut self, inp: InodePath, mut opts: SetAttrOpts) -> FsResult<FileStatus> {
         let inode = match inp.get_last_inode() {
             Some(v) => v,
@@ -1082,8 +1128,12 @@ impl FsDir {
 
         // Internal metadata is master-owned. Persist the operation timestamp in the
         // journal so replay restores it without changing the bincode inode layout.
+        // The TTL-type marker is likewise master-owned (create/mount path); user
+        // SetAttr requests must not flip a file between atime and mtime TTL.
         opts.add_x_attr.remove(INTERNAL_CTIME_XATTR);
-        opts.remove_x_attr.retain(|key| key != INTERNAL_CTIME_XATTR);
+        opts.add_x_attr.remove(INTERNAL_TTL_TYPE_XATTR);
+        opts.remove_x_attr
+            .retain(|key| key != INTERNAL_CTIME_XATTR && key != INTERNAL_TTL_TYPE_XATTR);
         let ctime = LocalTime::mills() as i64;
         opts.add_x_attr.insert(
             INTERNAL_CTIME_XATTR.to_string(),

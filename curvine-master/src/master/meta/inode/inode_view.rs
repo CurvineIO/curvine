@@ -21,7 +21,8 @@ use crate::master::meta::inode::{
 };
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::{
-    FileStatus, FileType, SetAttrOpts, StoragePolicy, TtlAction, INTERNAL_CTIME_XATTR,
+    FileStatus, FileType, SetAttrOpts, StoragePolicy, TtlAction, TtlType, INTERNAL_CTIME_XATTR,
+    INTERNAL_TTL_TYPE_XATTR,
 };
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::{LocalTime, Utils};
@@ -387,10 +388,24 @@ impl InodeView {
         }
     }
 
+    /// Base time used for TTL expiration: atime when the internal atime marker
+    /// is set (atime-based mount policy), otherwise mtime (legacy behavior).
+    pub fn ttl_base_ms(&self) -> CommonResult<i64> {
+        let typ = TtlType::from_xattr_value(
+            self.x_attr()?
+                .get(INTERNAL_TTL_TYPE_XATTR)
+                .map(|v| v.as_slice()),
+        );
+        Ok(match typ {
+            TtlType::Atime => self.atime(),
+            TtlType::Mtime => self.mtime(),
+        })
+    }
+
     pub fn expiration_ms(&self) -> CommonResult<Option<i64>> {
         let sp = self.storage_policy()?;
         if sp.ttl_ms > 0 && sp.ttl_action != TtlAction::None {
-            Ok(Some(self.mtime().saturating_add(sp.ttl_ms)))
+            Ok(Some(self.ttl_base_ms()?.saturating_add(sp.ttl_ms)))
         } else {
             Ok(None)
         }
@@ -399,7 +414,7 @@ impl InodeView {
     pub fn is_expired(&self) -> CommonResult<bool> {
         let sp = self.storage_policy()?;
         if sp.ttl_action != TtlAction::None && sp.ttl_ms > 0 {
-            Ok(LocalTime::mills() as i64 > self.mtime().saturating_add(sp.ttl_ms))
+            Ok(LocalTime::mills() as i64 > self.ttl_base_ms()?.saturating_add(sp.ttl_ms))
         } else {
             Ok(false)
         }
@@ -475,11 +490,17 @@ impl InodeView {
         }
 
         for attr in opts.add_x_attr {
-            self.x_attr_mut()?.insert(attr.0, attr.1);
+            // The TTL-type marker is master-owned (set by the create/mount
+            // merge path). Unlike ctime it is never re-injected here, so
+            // filtering it cannot break journal replay, while it still blocks
+            // client-side flips of the TTL base via complete/close opts.
+            if attr.0 != INTERNAL_TTL_TYPE_XATTR {
+                self.x_attr_mut()?.insert(attr.0, attr.1);
+            }
         }
 
         for key in opts.remove_x_attr {
-            if key != INTERNAL_CTIME_XATTR {
+            if key != INTERNAL_CTIME_XATTR && key != INTERNAL_TTL_TYPE_XATTR {
                 let _ = self.x_attr_mut()?.remove(&key);
             }
         }
@@ -638,6 +659,84 @@ impl PartialEq for InodeView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ttl_expires_on_mtime_by_default() {
+        let mut inode = InodeView::new_file("file".to_string(), InodeFile::new(1, 1));
+        inode
+            .set_attr(SetAttrOpts {
+                atime: Some(100),
+                mtime: Some(1_000),
+                ..Default::default()
+            })
+            .unwrap();
+        inode
+            .set_attr(SetAttrOpts {
+                ttl_ms: Some(500),
+                ttl_action: Some(TtlAction::Delete),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Base is mtime: 1_000 + 500.
+        assert_eq!(inode.expiration_ms().unwrap(), Some(1_500));
+    }
+
+    #[test]
+    fn ttl_expires_on_atime_when_marked() {
+        let mut inode = InodeView::new_file("file".to_string(), InodeFile::new(1, 1));
+        // The marker is master-owned and set by the create/mount merge path;
+        // stamp it directly the same way (SetAttr must not be able to add it).
+        inode.x_attr_mut().unwrap().insert(
+            INTERNAL_TTL_TYPE_XATTR.to_string(),
+            TtlType::Atime.to_xattr_value(),
+        );
+        inode
+            .set_attr(SetAttrOpts {
+                atime: Some(100),
+                mtime: Some(1_000),
+                ..Default::default()
+            })
+            .unwrap();
+        inode
+            .set_attr(SetAttrOpts {
+                ttl_ms: Some(500),
+                ttl_action: Some(TtlAction::Delete),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Base switches to atime once the internal marker is present:
+        // 100 + 500. A read that refreshes atime pushes expiration out.
+        assert_eq!(inode.expiration_ms().unwrap(), Some(600));
+
+        inode
+            .set_attr(SetAttrOpts {
+                atime: Some(10_000),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(inode.expiration_ms().unwrap(), Some(10_500));
+    }
+
+    #[test]
+    fn ttl_without_policy_has_no_expiration() {
+        let mut inode = InodeView::new_file("file".to_string(), InodeFile::new(1, 1));
+        inode.x_attr_mut().unwrap().insert(
+            INTERNAL_TTL_TYPE_XATTR.to_string(),
+            TtlType::Atime.to_xattr_value(),
+        );
+        inode
+            .set_attr(SetAttrOpts {
+                atime: Some(100),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Marker without an active TTL policy must not expire anything.
+        assert_eq!(inode.expiration_ms().unwrap(), None);
+        assert!(!inode.is_expired().unwrap());
+    }
 
     #[test]
     fn setattr_updates_ctime_when_mtime_is_omitted() {

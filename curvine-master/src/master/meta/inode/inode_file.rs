@@ -20,7 +20,7 @@ use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsResult;
 use curvine_model::{
     is_special_file_type, BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts,
-    FileType, StoragePolicy, INTERNAL_CTIME_XATTR,
+    FileType, StoragePolicy, INTERNAL_CTIME_XATTR, INTERNAL_TTL_TYPE_XATTR,
 };
 use curvine_runtime::common::LocalTime;
 use serde::{Deserialize, Serialize};
@@ -289,7 +289,20 @@ impl InodeFile {
         self.replicas = opts.replicas as u8;
         self.block_size = opts.block_size as u32;
         self.storage_policy.overwrite(opts.storage_policy);
+        // The new ttl_ms/ttl_action apply above, so the master-owned TTL-base
+        // marker must be synced too (merge_create_opts already normalized it
+        // into opts.x_attr); otherwise an overwrite under a changed mount
+        // policy leaves a mixed policy: fresh ttl_ms on a stale base.
+        match opts.x_attr.get(INTERNAL_TTL_TYPE_XATTR) {
+            Some(v) => self.features.add_attr(INTERNAL_TTL_TYPE_XATTR, v),
+            None => self.features.remove_attr(INTERNAL_TTL_TYPE_XATTR),
+        }
         self.mtime = mtime;
+        // Overwrite regenerates the contents, so both TTL clocks restart.
+        // Keeping the previous generation's atime could leave an atime-based
+        // file already expired (old_atime + ttl_ms in the past) the moment
+        // overwrite returns, letting the checker Free/Delete fresh data.
+        self.atime = mtime;
         self.update_ctime(mtime);
 
         // Reset file writing state for new write operation
@@ -348,6 +361,12 @@ impl InodeFile {
 
         let mtime = LocalTime::mills() as i64;
         self.mtime = mtime;
+        // Completing a write is an activity signal just like a read open:
+        // a file whose write outlasted ttl_ms must not be born expired, or
+        // the checker would delete the just-finished contents. Journal
+        // replay is unaffected: CompleteFileEntry carries the full inode
+        // snapshot including both clocks.
+        self.atime = mtime;
         self.update_ctime(mtime);
         if !only_flush {
             self.features.complete_write(client_name);

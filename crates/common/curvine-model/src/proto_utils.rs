@@ -222,7 +222,10 @@ impl ProtoUtils {
     pub fn file_status_to_pb(mut status: FileStatus) -> FileStatusProto {
         let has_ctime = status.x_attr.contains_key(INTERNAL_CTIME_XATTR);
         let ctime = status.ctime();
+        // Internal master-owned markers (ctime, ttl-type) stay on the master;
+        // clients only see the ctime value via its dedicated proto field.
         status.x_attr.remove(INTERNAL_CTIME_XATTR);
+        status.x_attr.remove(INTERNAL_TTL_TYPE_XATTR);
         FileStatusProto {
             id: status.id,
             path: status.path,
@@ -680,6 +683,7 @@ impl ProtoUtils {
             auto_cache: Some(info.auto_cache),
             access_mode: Some(info.access_mode.into()),
             write_cache: Some(info.write_cache),
+            ttl_type: Some(info.ttl_type.into()),
         }
     }
 
@@ -700,6 +704,7 @@ impl ProtoUtils {
             auto_cache: info.auto_cache.unwrap_or(true),
             access_mode: info.access_mode.map(AccessMode::from).unwrap_or_default(),
             write_cache: info.write_cache.unwrap_or(false),
+            ttl_type: info.ttl_type.map(TtlType::from).unwrap_or_default(),
         }
     }
 
@@ -719,6 +724,7 @@ impl ProtoUtils {
             auto_cache: opts.auto_cache,
             access_mode: opts.access_mode.map(|v| v.into()),
             write_cache: opts.write_cache,
+            ttl_type: opts.ttl_type.map(|v| v.into()),
         }
     }
 
@@ -738,6 +744,7 @@ impl ProtoUtils {
             auto_cache: opts.auto_cache,
             access_mode: opts.access_mode.map(AccessMode::from),
             write_cache: opts.write_cache,
+            ttl_type: opts.ttl_type.map(TtlType::from),
         }
     }
 
@@ -856,7 +863,10 @@ impl ProtoUtils {
 #[cfg(test)]
 mod tests {
     use crate::proto::CompatibilityModeProto;
-    use crate::state::{AccessMode, FileStatus, MountInfo, MountOptions, INTERNAL_CTIME_XATTR};
+    use crate::state::{
+        AccessMode, FileStatus, MountInfo, MountOptions, INTERNAL_CTIME_XATTR,
+        INTERNAL_TTL_TYPE_XATTR,
+    };
     use crate::utils::ProtoUtils;
     use curvine_sys::version::ComponentVersion;
     use std::collections::HashMap;
@@ -930,6 +940,28 @@ mod tests {
         let round_trip = ProtoUtils::file_status_from_pb(pb);
         assert_eq!(round_trip.ctime(), 1_000);
         assert!(!round_trip.x_attr.contains_key(INTERNAL_CTIME_XATTR));
+    }
+
+    #[test]
+    fn file_status_proto_strips_internal_ttl_type_marker() {
+        // The ttl-type marker is master-owned (like ctime) and must not leak
+        // to clients on list/stat/open.
+        let status = FileStatus {
+            mtime: 1_000,
+            x_attr: HashMap::from([
+                (
+                    INTERNAL_CTIME_XATTR.to_string(),
+                    2_000_i64.to_le_bytes().to_vec(),
+                ),
+                (INTERNAL_TTL_TYPE_XATTR.to_string(), vec![1u8]),
+            ]),
+            ..Default::default()
+        };
+
+        let pb = ProtoUtils::file_status_to_pb(status);
+        assert_eq!(pb.ctime, Some(2_000));
+        assert!(!pb.x_attr.contains_key(INTERNAL_TTL_TYPE_XATTR));
+        assert!(!pb.x_attr.contains_key(INTERNAL_CTIME_XATTR));
     }
 
     #[test]

@@ -37,7 +37,7 @@ pub enum StorageState {
     Both = 3,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoragePolicy {
     pub storage_type: StorageType,
     pub ttl_ms: i64,

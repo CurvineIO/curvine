@@ -824,6 +824,12 @@ impl MasterFilesystem {
             Some(v) => v,
             None => return err_ext!(FsError::file_not_found(path)),
         };
+
+        // Refresh atime on the read path so files under an atime-based TTL
+        // policy stay alive while actively read. Done after locating blocks;
+        // the write lock is only taken when a refresh is actually due.
+        let needs_touch = inode.is_file() && Self::atime_refresh_due(&inode);
+
         let file = inode.as_file_ref()?;
         let block_locs = self.get_block_locs(path, &fs_dir, file)?;
         let locate_blocks = FileBlocks {
@@ -831,7 +837,44 @@ impl MasterFilesystem {
             block_locs,
         };
 
+        if needs_touch {
+            drop(fs_dir);
+            // Best-effort refresh: a concurrent delete (or any re-resolve
+            // failure) between the read and write locks must not turn an
+            // already-successful locate into an error, so both failures are
+            // ignored and the located blocks are still returned.
+            let mut fs_dir = self.fs_dir.write();
+            if let Ok(inp) = Self::resolve_path(&fs_dir, path) {
+                let _ = fs_dir.touch_atime_for_ttl(&inp);
+            }
+        }
+
         Ok(locate_blocks)
+    }
+
+    /// Whether this file's atime should be refreshed on this open: it has an
+    /// active TTL policy based on access time and the throttle window
+    /// (`ttl_ms / 2`) has elapsed since the last refresh.
+    fn atime_refresh_due(inode: &InodeView) -> bool {
+        let Ok(sp) = inode.storage_policy() else {
+            return false;
+        };
+        if sp.ttl_ms <= 0 || sp.ttl_action == TtlAction::None {
+            return false;
+        }
+
+        let ttl_type = match inode.x_attr() {
+            Ok(x_attr) => {
+                TtlType::from_xattr_value(x_attr.get(INTERNAL_TTL_TYPE_XATTR).map(|v| v.as_slice()))
+            }
+            Err(_) => return false,
+        };
+        if ttl_type != TtlType::Atime {
+            return false;
+        }
+
+        let now = LocalTime::mills() as i64;
+        now.saturating_sub(inode.atime()) >= sp.ttl_ms / 2
     }
 
     pub fn cv_metadata_snapshot_page(
@@ -1975,5 +2018,324 @@ mod tests {
             "lost worker capacity must not leak into allocatable"
         );
         assert_eq!(info.allocatable_available, 800);
+    }
+
+    /// Creates an empty file with an atime-based TTL policy and backdates its
+    /// atime so the refresh throttle window (`ttl_ms / 2`) has elapsed.
+    fn atime_ttl_file_due(fs: &MasterFilesystem, name: &str) {
+        let path = format!("/{}", name);
+        let mut opts = CreateFileOpts::with_create(true);
+        opts.storage_policy = StoragePolicy {
+            ttl_ms: 100, // throttle window = 50 ms
+            ttl_action: TtlAction::Free,
+            ..Default::default()
+        };
+        opts.x_attr.insert(
+            INTERNAL_TTL_TYPE_XATTR.to_string(),
+            TtlType::Atime.to_xattr_value(),
+        );
+        fs.create_with_opts(&path, opts, OpenFlags::new_create().set_overwrite(true))
+            .unwrap();
+
+        // Backdate the atime well past the throttle window.
+        fs.set_attr(
+            &path,
+            SetAttrOpts {
+                atime: Some((LocalTime::mills() - 3_600_000) as i64),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    fn file_atime(fs: &MasterFilesystem, path: &str) -> i64 {
+        fs.file_status(path).unwrap().atime
+    }
+
+    fn file_ttl_type(fs: &MasterFilesystem, path: &str) -> TtlType {
+        let sync_fs_dir = fs.fs_dir();
+        let fs_dir = sync_fs_dir.read();
+        let inp = MasterFilesystem::resolve_path(&fs_dir, path).unwrap();
+        let inode = inp.get_last_inode().unwrap();
+        TtlType::from_xattr_value(
+            inode
+                .x_attr()
+                .unwrap()
+                .get(INTERNAL_TTL_TYPE_XATTR)
+                .map(|v| v.as_slice()),
+        )
+    }
+
+    #[test]
+    fn get_block_locations_refreshes_atime_when_due() {
+        let fs = test_fs("atime-refresh-due");
+        let path = "/atime-refresh-due-file";
+        atime_ttl_file_due(&fs, "atime-refresh-due-file");
+        let before = file_atime(&fs, path);
+
+        let blocks = fs.get_block_locations(path).unwrap();
+        assert!(blocks.block_locs.is_empty(), "empty file has no blocks");
+
+        let after = file_atime(&fs, path);
+        assert!(
+            after > before,
+            "get_block_locations must refresh a due atime (before={}, after={})",
+            before,
+            after
+        );
+    }
+
+    #[test]
+    fn get_block_locations_throttles_fresh_atime() {
+        let fs = test_fs("atime-refresh-throttled");
+        let path = "/atime-fresh-file";
+        atime_ttl_file_due(&fs, "atime-fresh-file");
+
+        // First locate refreshes the due atime; the second call inside the
+        // throttle window must not move it again.
+        fs.get_block_locations(path).unwrap();
+        let after_first = file_atime(&fs, path);
+        fs.get_block_locations(path).unwrap();
+        let after_second = file_atime(&fs, path);
+
+        assert_eq!(
+            after_first, after_second,
+            "throttle window must suppress redundant atime writes"
+        );
+    }
+
+    #[test]
+    fn get_block_locations_does_not_touch_mtime_policy_files() {
+        let fs = test_fs("atime-refresh-mtime-policy");
+        let path = "/mtime-policy-file";
+        let mut opts = CreateFileOpts::with_create(true);
+        opts.storage_policy = StoragePolicy {
+            ttl_ms: 100,
+            ttl_action: TtlAction::Free,
+            ..Default::default()
+        };
+        // No internal atime marker: the legacy mtime policy must not be
+        // touched by reads.
+        fs.create_with_opts(path, opts, OpenFlags::new_create().set_overwrite(true))
+            .unwrap();
+        fs.set_attr(
+            path,
+            SetAttrOpts {
+                atime: Some((LocalTime::mills() - 3_600_000) as i64),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let before = file_atime(&fs, path);
+
+        fs.get_block_locations(path).unwrap();
+
+        assert_eq!(
+            file_atime(&fs, path),
+            before,
+            "mtime-based TTL files must keep their atime on read"
+        );
+    }
+
+    #[test]
+    fn set_attr_cannot_override_internal_ttl_type_marker() {
+        let fs = test_fs("set-attr-ttl-type-guard");
+        let path = "/guarded-file";
+
+        // Create a file carrying the atime marker (as the mount merge path
+        // would), then try to flip it to mtime via a client-side SetAttr RPC:
+        // both removal and overwrite of the master-owned key must be ignored.
+        let mut opts = CreateFileOpts::with_create(true);
+        opts.storage_policy = StoragePolicy {
+            ttl_ms: 100,
+            ttl_action: TtlAction::Free,
+            ..Default::default()
+        };
+        opts.x_attr.insert(
+            INTERNAL_TTL_TYPE_XATTR.to_string(),
+            TtlType::Atime.to_xattr_value(),
+        );
+        fs.create_with_opts(path, opts, OpenFlags::new_create().set_overwrite(true))
+            .unwrap();
+
+        fs.set_attr(
+            path,
+            SetAttrOpts {
+                remove_x_attr: vec![INTERNAL_TTL_TYPE_XATTR.to_string()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fs.set_attr(
+            path,
+            SetAttrOpts {
+                add_x_attr: HashMap::from([(
+                    INTERNAL_TTL_TYPE_XATTR.to_string(),
+                    TtlType::Mtime.to_xattr_value(),
+                )]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let marker = file_ttl_type(&fs, path);
+        assert_eq!(
+            marker,
+            TtlType::Atime,
+            "SetAttr must not flip the master-owned TTL-type marker"
+        );
+    }
+
+    #[test]
+    fn overwrite_syncs_ttl_type_marker_both_ways() {
+        let fs = test_fs("overwrite-ttl-type-sync");
+        let path = "/overwritten-file";
+
+        // Created under an mtime policy (no marker).
+        let mut mtime_opts = CreateFileOpts::with_create(true);
+        mtime_opts.storage_policy = StoragePolicy {
+            ttl_ms: 100,
+            ttl_action: TtlAction::Free,
+            ..Default::default()
+        };
+        fs.create_with_opts(
+            path,
+            mtime_opts,
+            OpenFlags::new_create().set_overwrite(true),
+        )
+        .unwrap();
+        assert_eq!(file_ttl_type(&fs, path), TtlType::Mtime);
+
+        // Let the first generation's atime go stale: if the overwrite kept
+        // it, the file would already be past old_atime + ttl_ms here.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // Overwritten under an atime mount: the merged opts carry the marker.
+        let mut atime_opts = CreateFileOpts::with_create(true);
+        atime_opts.storage_policy = StoragePolicy {
+            ttl_ms: 60,
+            ttl_action: TtlAction::Free,
+            ..Default::default()
+        };
+        atime_opts.x_attr.insert(
+            INTERNAL_TTL_TYPE_XATTR.to_string(),
+            TtlType::Atime.to_xattr_value(),
+        );
+        fs.create_with_opts(
+            path,
+            atime_opts,
+            OpenFlags::new_create().set_overwrite(true),
+        )
+        .unwrap();
+        assert_eq!(
+            file_ttl_type(&fs, path),
+            TtlType::Atime,
+            "overwrite under an atime policy must flip the marker to atime"
+        );
+
+        // The overwrite must start a fresh TTL window: expiration hangs off
+        // the new clock (mtime == atime == now), not the pre-overwrite read
+        // time, or the checker would Free/Delete the new contents at once.
+        // All inode access stays inside the fs_dir guard scope: InodePtr is a
+        // non-owning raw handle into the in-memory tree.
+        {
+            let sync_fs_dir = fs.fs_dir();
+            let fs_dir = sync_fs_dir.read();
+            // Bind the InodePath first: chained temporaries drop the owned
+            // backing store before the non-owning InodePtr is used.
+            let inp = MasterFilesystem::resolve_path(&fs_dir, path).unwrap();
+            let view = inp.get_last_inode().unwrap();
+            let expiration = view.expiration_ms().unwrap().unwrap();
+            let mtime = view.as_file_ref().unwrap().mtime;
+            assert_eq!(
+                expiration,
+                mtime + 60,
+                "expiration must use the overwrite-time clock, not the old atime"
+            );
+            let now = curvine_runtime::common::LocalTime::mills() as i64;
+            assert!(
+                now < expiration,
+                "overwritten file must not be expired right after overwrite \
+                 (expiration {expiration}, now {now})"
+            );
+            assert!(!view.is_expired().unwrap());
+        }
+
+        // Overwritten again under an mtime policy (no marker): it clears.
+        let cleared_opts = CreateFileOpts::with_create(true);
+        fs.create_with_opts(
+            path,
+            cleared_opts,
+            OpenFlags::new_create().set_overwrite(true),
+        )
+        .unwrap();
+        assert_eq!(
+            file_ttl_type(&fs, path),
+            TtlType::Mtime,
+            "overwrite under an mtime policy must clear the atime marker"
+        );
+    }
+
+    #[test]
+    fn ttl_skips_in_use_files_and_complete_reopens_the_window() {
+        let fs = test_fs("ttl-writing-protection");
+        let path = "/in-use-file";
+
+        let mut opts = CreateFileOpts::with_create(true);
+        opts.storage_policy = StoragePolicy {
+            ttl_ms: 60,
+            ttl_action: TtlAction::Delete,
+            ..Default::default()
+        };
+        opts.x_attr.insert(
+            INTERNAL_TTL_TYPE_XATTR.to_string(),
+            TtlType::Atime.to_xattr_value(),
+        );
+        fs.create_with_opts(path, opts, OpenFlags::new_create())
+            .unwrap();
+
+        // Outlive the ttl while the write is still open.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let executor = crate::master::meta::inode::ttl::InodeTtlExecutor::with_managers(fs.clone());
+        let inode_id = {
+            let sync_fs_dir = fs.fs_dir();
+            let fs_dir = sync_fs_dir.read();
+            let inp = MasterFilesystem::resolve_path(&fs_dir, path).unwrap();
+            inp.get_last_inode().unwrap().id()
+        };
+
+        // 1) An expired but still-writing file must not be touched.
+        let (executed, _) = executor.execute_by_id(inode_id).unwrap();
+        assert!(
+            !executed,
+            "TTL must not touch a file that is still being written"
+        );
+        assert!(
+            fs.file_status(path).is_ok(),
+            "writing file must survive its ttl"
+        );
+
+        // 2) Completing the write refreshes both clocks, so the file is born
+        //    with a fresh window instead of already-expired.
+        // client_name must match the one used at create time for the write
+        // session to be closed.
+        fs.complete_file(path, Some(inode_id), 0, vec![], "", false, None)
+            .unwrap();
+        let (executed, _) = executor.execute_by_id(inode_id).unwrap();
+        assert!(
+            !executed,
+            "a just-completed file must have a fresh TTL window, not be born expired"
+        );
+        assert!(fs.file_status(path).is_ok());
+
+        // 3) Once that window lapses, the checker deletes it normally.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let (executed, _) = executor.execute_by_id(inode_id).unwrap();
+        assert!(executed, "expired completed file must be reclaimed");
+        assert!(
+            fs.file_status(path).is_err(),
+            "file must be gone after ttl delete"
+        );
     }
 }

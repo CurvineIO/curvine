@@ -107,12 +107,14 @@ impl CreateFileOptsBuilder {
     }
 
     pub fn with_conf(conf: &impl ClientConfDefaults) -> Self {
+        let mut x_attr = HashMap::new();
+        conf.ttl_type().apply_to_xattrs(&mut x_attr);
         Self {
             create_parent: false,
             replicas: conf.replicas(),
             block_size: conf.block_size(),
             file_type: FileType::File,
-            x_attr: Default::default(),
+            x_attr,
             storage_policy: StoragePolicy {
                 storage_type: conf.storage_type(),
                 ttl_ms: conf.ttl_ms(),
@@ -165,6 +167,11 @@ impl CreateFileOptsBuilder {
 
     pub fn ttl_action(mut self, action: TtlAction) -> Self {
         self.storage_policy.ttl_action = action;
+        self
+    }
+
+    pub fn ttl_type(mut self, typ: TtlType) -> Self {
+        typ.apply_to_xattrs(&mut self.x_attr);
         self
     }
 
@@ -282,6 +289,10 @@ impl MkdirOptsBuilder {
     }
 
     pub fn with_conf(conf: &impl ClientConfDefaults) -> Self {
+        // Directories always keep mtime-based TTL: no read path refreshes a
+        // directory's atime, so an atime marker would let active trees
+        // (children being created/written underneath) expire anyway. The
+        // client/mount `ttl_type` therefore only applies to files.
         Self {
             create_parent: false,
             x_attr: HashMap::new(),
@@ -546,5 +557,59 @@ impl fmt::Display for ListOptions {
             (None, Some(s)) => write!(f, "none-{}", s),
             (None, None) => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ttl_type::TtlType;
+    use crate::{ClientConfDefaults, StorageType, TtlAction, INTERNAL_TTL_TYPE_XATTR};
+
+    struct AtimeConf;
+
+    impl ClientConfDefaults for AtimeConf {
+        fn replicas(&self) -> i32 {
+            1
+        }
+        fn block_size(&self) -> i64 {
+            1024
+        }
+        fn storage_type(&self) -> StorageType {
+            StorageType::Disk
+        }
+        fn ttl_ms(&self) -> i64 {
+            1000
+        }
+        fn ttl_action(&self) -> TtlAction {
+            TtlAction::Free
+        }
+        fn ttl_type(&self) -> TtlType {
+            TtlType::Atime
+        }
+        fn mode(&self) -> u32 {
+            0o755
+        }
+    }
+
+    #[test]
+    fn mkdir_with_conf_does_not_stamp_atime_marker() {
+        // Directories keep mtime-based TTL: no read path refreshes a
+        // directory's atime, so an atime marker would let active trees expire
+        // anyway. The client/mount ttl_type only applies to files.
+        let opts = MkdirOptsBuilder::with_conf(&AtimeConf).build();
+        assert!(!opts.x_attr.contains_key(INTERNAL_TTL_TYPE_XATTR));
+    }
+
+    #[test]
+    fn create_with_conf_stamps_atime_marker() {
+        // The file creation path still picks up the conf ttl_type.
+        let opts = CreateFileOptsBuilder::with_conf(&AtimeConf).build();
+        assert_eq!(
+            opts.x_attr
+                .get(INTERNAL_TTL_TYPE_XATTR)
+                .map(|v| v.as_slice()),
+            Some(&[1u8][..])
+        );
     }
 }

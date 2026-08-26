@@ -23,6 +23,10 @@ pub trait ClientConfDefaults {
     fn storage_type(&self) -> StorageType;
     fn ttl_ms(&self) -> i64;
     fn ttl_action(&self) -> TtlAction;
+    /// Base timestamp for TTL expiration; defaults to mtime (legacy behaviour).
+    fn ttl_type(&self) -> TtlType {
+        TtlType::Mtime
+    }
     fn mode(&self) -> u32;
 }
 
@@ -56,6 +60,9 @@ pub use self::file_type::{
 mod ttl_action;
 pub use self::ttl_action::TtlAction;
 
+mod ttl_type;
+pub use self::ttl_type::TtlType;
+
 mod client_address;
 pub use self::client_address::ClientAddress;
 
@@ -69,7 +76,7 @@ mod block_info;
 pub use self::block_info::*;
 
 mod file_status;
-pub use self::file_status::{FileStatus, INTERNAL_CTIME_XATTR};
+pub use self::file_status::{FileStatus, INTERNAL_CTIME_XATTR, INTERNAL_TTL_TYPE_XATTR};
 
 mod filesystem_info;
 pub use self::filesystem_info::FilesystemInfo;

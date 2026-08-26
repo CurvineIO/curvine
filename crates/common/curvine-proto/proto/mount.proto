@@ -23,6 +23,7 @@ message MountInfoProto {
     optional bool auto_cache = 13 [default = true];
     optional AccessModeProto access_mode = 14 [default = ACCESS_MODE_PROTO_READ_ONLY];
     optional bool write_cache = 15 [default = false];
+    optional TtlTypeProto ttl_type = 16 [default = TTL_TYPE_PROTO_MTIME];
 }
 
 message MountOptionsProto {
@@ -40,6 +41,7 @@ message MountOptionsProto {
     optional bool auto_cache = 13;
     optional AccessModeProto access_mode = 14;
     optional bool write_cache = 15;
+    optional TtlTypeProto ttl_type = 16;
 }
 
 enum ProviderProto {

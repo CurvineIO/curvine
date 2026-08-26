@@ -18,7 +18,9 @@ use curvine_core_error::{err_box, CommonResult};
 use curvine_error::{ErrorKind, FsError};
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::ProtoUtils;
-use curvine_model::{AccessMode, MountOptions, Provider, StorageType, TtlAction, WriteType};
+use curvine_model::{
+    AccessMode, MountOptions, Provider, StorageType, TtlAction, TtlType, WriteType,
+};
 use curvine_runtime::common::{ByteUnit, DurationUnit};
 use curvine_unified_fs::{UfsFileSystem, UnifiedFileSystem};
 use std::collections::{HashMap, VecDeque};
@@ -52,6 +54,12 @@ pub struct MountCommand {
 
     #[arg(long, default_value = "7d")]
     ttl_ms: String,
+
+    #[arg(
+        long,
+        help = "TTL base time: mtime (default) or atime. Files mounted with atime expire based on last access. The access time is refreshed when the file is re-opened for read (throttled to once per ttl_ms/2); a single long-lived open/read handle is not kept alive across its lifetime. Directories always use mtime (their activity is reflected by children changes)."
+    )]
+    ttl_type: Option<String>,
 
     #[arg(long)]
     replicas: Option<i32>,
@@ -580,6 +588,11 @@ impl MountCommand {
 
         if let Some(write_cache) = self.write_cache {
             opts = opts.write_cache(write_cache);
+        }
+
+        if let Some(ttl_type_str) = self.ttl_type.as_ref() {
+            let ttl_type = TtlType::try_from(ttl_type_str.as_str())?;
+            opts = opts.ttl_type(ttl_type);
         }
 
         Ok(opts.build())

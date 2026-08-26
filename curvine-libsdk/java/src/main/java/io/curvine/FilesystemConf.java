@@ -44,6 +44,12 @@ public class FilesystemConf {
     public String ttl_ms = "0";
     public String ttl_action = "none";
 
+    /**
+     * TTL base time: mtime (default) or atime. With atime, reads refresh the
+     * access time so actively-read files are not reclaimed by TTL cleanup.
+     */
+    public String ttl_type = "mtime";
+
     // Set up the customer service retry policy
     public long conn_retry_max_duration_ms = 60 * 1000;
     public long conn_retry_min_sleep_ms = 100;
@@ -321,6 +327,7 @@ public class FilesystemConf {
                 ", storage_type='" + storage_type + '\'' +
                 ", ttl_ms=" + ttl_ms +
                 ", ttl_action='" + ttl_action + '\'' +
+                ", ttl_type='" + ttl_type + '\'' +
                 ", conn_retry_max_duration_ms=" + conn_retry_max_duration_ms +
                 ", conn_retry_min_sleep_ms=" + conn_retry_min_sleep_ms +
                 ", conn_retry_max_sleep_ms=" + conn_retry_max_sleep_ms +

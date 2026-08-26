@@ -22,6 +22,12 @@ enum TtlActionProto {
     TTL_ACTION_PROTO_FREE = 2;
 }
 
+// Base timestamp used with ttl_ms to compute expiration.
+enum TtlTypeProto {
+    TTL_TYPE_PROTO_MTIME = 0;
+    TTL_TYPE_PROTO_ATIME = 1;
+}
+
 enum WriteTypeProto {
     WRITE_TYPE_PROTO_CACHE_MODE = 0;
     WRITE_TYPE_PROTO_FS_MODE = 1;
