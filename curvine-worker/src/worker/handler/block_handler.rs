@@ -27,13 +27,13 @@ pub enum BlockHandler {
 }
 
 impl BlockHandler {
-    pub fn new(code: RpcCode, store: BlockStore) -> CommonResult<Self> {
+    pub fn new(code: RpcCode, store: BlockStore, client_addr: String) -> CommonResult<Self> {
         let handler = match code {
-            RpcCode::WriteBlock => Writer(WriteHandler::new(store)?),
+            RpcCode::WriteBlock => Writer(WriteHandler::new(store, client_addr)?),
 
             RpcCode::ReadBlock => Reader(ReadHandler::new(store)?),
 
-            RpcCode::WriteBlocksBatch => BatchWriter(BatchWriteHandler::new(store)?),
+            RpcCode::WriteBlocksBatch => BatchWriter(BatchWriteHandler::new(store, client_addr)?),
 
             code => return err_box!("Unsupported request type: {:?}", code),
         };

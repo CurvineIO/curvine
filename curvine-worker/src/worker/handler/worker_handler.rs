@@ -74,6 +74,7 @@ pub struct WorkerHandler {
     /// deep copy); diagnose by default so old clients are never rejected
     /// without explicit configuration.
     pub compatibility_policy: Arc<CompatibilityPolicy>,
+    pub client_addr: String,
 }
 
 impl MessageHandler for WorkerHandler {
@@ -337,7 +338,11 @@ impl WorkerHandler {
         };
 
         if need_new_handler {
-            let _ = handler.replace(BlockHandler::new(code, self.store.clone())?);
+            let _ = handler.replace(BlockHandler::new(
+                code,
+                self.store.clone(),
+                self.client_addr.clone(),
+            )?);
         }
 
         match handler.as_mut() {

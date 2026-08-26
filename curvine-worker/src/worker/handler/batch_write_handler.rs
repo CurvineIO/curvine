@@ -38,14 +38,14 @@ pub struct BatchWriteHandler {
 }
 
 impl BatchWriteHandler {
-    pub fn new(store: BlockStore) -> CommonResult<Self> {
+    pub fn new(store: BlockStore, client_addr: String) -> CommonResult<Self> {
         let store_clone = store.clone();
         Ok(Self {
             store,
             context: None,
             file: None,
             is_commit: false,
-            write_handler: WriteHandler::new(store_clone)?,
+            write_handler: WriteHandler::new(store_clone, client_addr)?,
         })
     }
 

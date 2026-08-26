@@ -32,10 +32,11 @@ pub struct WriteHandler {
     pub(crate) is_commit: bool,
     pub(crate) io_slow_us: u64,
     pub(crate) metrics: &'static WorkerMetrics,
+    pub(crate) client_addr: String,
 }
 
 impl WriteHandler {
-    pub fn new(store: BlockStore) -> CommonResult<Self> {
+    pub fn new(store: BlockStore, client_addr: String) -> CommonResult<Self> {
         let conf = Worker::get_conf()?;
         let metrics = Worker::get_metrics()?;
         Ok(Self {
@@ -45,6 +46,7 @@ impl WriteHandler {
             is_commit: false,
             io_slow_us: conf.worker.io_slow_us(),
             metrics,
+            client_addr,
         })
     }
 
@@ -153,13 +155,14 @@ impl WriteHandler {
         };
 
         let log_msg = format!(
-            "Write {}-block start req_id: {}, path: {:?}, chunk_size: {}, off: {}, block_size: {}",
+            "Write {}-block start req_id: {}, path: {:?}, chunk_size: {}, off: {}, block_size: {}, client: {}",
             label,
             context.req_id,
             path,
             context.chunk_size,
             context.off,
-            ByteUnit::byte_to_string(context.block_size as u64)
+            ByteUnit::byte_to_string(context.block_size as u64),
+            self.client_addr
         );
 
         let response = BlockWriteResponse {
@@ -290,11 +293,12 @@ impl WriteHandler {
         self.is_commit = true;
 
         info!(
-            "write block end for req_id {}, is commit: {}, off: {}, len: {}",
+            "write block end for req_id {}, is commit: {}, off: {}, len: {}, client: {}",
             msg.req_id(),
             commit,
             context.off,
-            context.block.len
+            context.block.len,
+            self.client_addr
         );
 
         Ok(msg.success())
