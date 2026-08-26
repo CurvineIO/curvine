@@ -1,4 +1,25 @@
 
+# ---------------------------------------------------------------------------
+# Configuration loading priority (unified pipeline, all components):
+#
+#   CLI flags  >  CURVINE_* environment variables  >  this file  >  built-in defaults
+#
+# Exception: a non-empty `net_interface` below outranks the four hostname
+# env vars — when it is set, the NIC-resolved IPv4 replaces every role
+# hostname and CURVINE_*_HOSTNAME is ignored (with a warning).
+#
+# Recognized environment variables:
+#   CURVINE_CONF_FILE          config file path used when --conf is omitted
+#   CURVINE_MASTER_HOSTNAME    overrides [master].hostname (and seeds journal.hostname)
+#   CURVINE_WORKER_HOSTNAME    overrides [worker].hostname
+#   CURVINE_CLIENT_HOSTNAME    overrides [client].hostname
+#   CURVINE_TRANSFER_HOSTNAME  overrides [transfer].hostname
+#
+# Keys in this file that no component recognizes are reported as warnings at
+# load time (possible typos or settings removed by upgrades); they never abort
+# startup.
+# ---------------------------------------------------------------------------
+
 # Whether to format it.
 # master formatting will delete rocksdb metadata
 # Worker formatting will delete the data directory.
