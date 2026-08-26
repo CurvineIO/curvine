@@ -103,3 +103,47 @@ Curvine ships a versioned wire format (proto2) and versioned Rust APIs (`curvine
 2. Diff public Rust signatures in `*-api` crates and confirm new parameters are trailing and defaultable.
 3. Grep for `reserved` near deleted fields; flag any tag that was previously used and is now reused.
 4. Trace the changed RPC end-to-end and confirm both peers tolerate the field's absence.
+
+## Author verification story
+
+Read the PR body (and any **Test verified** table) before trusting CI:
+
+* Which commands ran, and on which dirty crates?
+* Is there a manual check for FUSE / CSI / failover when those layers changed?
+* Does a green compile job stand in for a missing crate test? If yes, that gap is `must-fix`.
+
+A passing gate proves the tree built. It does not prove the new scenario is correct.
+
+## Dead code hygiene
+
+After mapping callers of changed symbols:
+
+1. List functions, modules, proto fields, metrics, and compat shims that are now unreachable
+2. Put the list in the local draft
+3. **Ask before recommending deletion** — do not silently delete, and do not leave confirmed dead code without a comment or a tracked follow-up
+
+```text
+DEAD CODE IDENTIFIED:
+- format_legacy_path() in curvine-common — replaced by format_path()
+- leftover metric `replica_legacy_sync` — no remaining writers
+→ Safe to remove these?
+```
+
+## Cargo.toml and lockfile
+
+When `Cargo.toml` or `Cargo.lock` changes, review them like production code:
+
+1. Does the existing workspace already provide this capability?
+2. Read the lockfile diff, not only the manifest; a single direct bump can pull many transitives
+3. For a version bump, read the changelog; semver is a promise the crate may not have kept
+4. Prefer one crate (or a small related group) per change so a break is revertible
+5. Never accept a hand-edited lockfile. Commit it, review it, and let Cargo generate it
+6. Flag bulk "bump deps" PRs that skip changelog review
+
+A new dependency is a liability. Prefer the standard library and existing workspace crates.
+
+## Complexity relocation
+
+A refactor that moves the same branches into a new type or module without reducing the number of concepts a reader must hold is not simpler. Count modes, flags, and call-graph hops before and after. If the count is unchanged, ask for the version where a whole branch, mode, or layer disappears — or treat the reshuffle as optional noise.
+
+When the finding is structural, name the remedy (dispatcher, collapse branches, move feature logic out of `*-api`, delete a pass-through wrapper). "This is complex" is not a review comment.
