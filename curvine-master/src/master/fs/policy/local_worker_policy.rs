@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::policy::{ChooseContext, RobinWorkerPolicy, WorkerPolicy};
+use crate::master::fs::policy::{ChooseContext, WeightedWorkerPolicy, WorkerPolicy};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::{WorkerAddress, WorkerInfo};
 use indexmap::IndexMap;
 
-/// Local workers are preferred, and polling policies are used if there are no local workers
+/// Local workers are preferred, and weighted policies are used if there are no local workers
 pub struct LocalWorkerPolicy {
-    inner: RobinWorkerPolicy,
+    inner: WeightedWorkerPolicy,
 }
 
 impl Default for LocalWorkerPolicy {
@@ -31,7 +31,7 @@ impl Default for LocalWorkerPolicy {
 impl LocalWorkerPolicy {
     pub fn new() -> Self {
         Self {
-            inner: RobinWorkerPolicy::new(),
+            inner: WeightedWorkerPolicy::new(),
         }
     }
 }
@@ -84,7 +84,8 @@ impl WorkerPolicy for LocalWorkerPolicy {
         count: Option<usize>,
         exclude_workers: Vec<u32>,
     ) -> CommonResult<Vec<WorkerAddress>> {
-        // Since you do not rely on block information, you cannot judge the local worker, and use the polling strategy directly
+        // Since you do not rely on block information, you cannot judge the local worker,
+        // and use the weighted strategy directly
         self.inner.choose_workers(workers, count, exclude_workers)
     }
 }
