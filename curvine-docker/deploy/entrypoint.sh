@@ -178,7 +178,7 @@ restart_service() {
 set_hosts
 
 case "$SERVER_TYPE" in
-  (master|worker|transfer)
+  (master|worker|mds|transfer)
     case "$ACTION_TYPE" in
       start)
         start_service "$SERVER_TYPE"
