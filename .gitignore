@@ -58,3 +58,9 @@ curvine-tests/regression_result
 .agents/skills/*
 !.agents/skills/cv-*/
 .codegraph/
+
+# Local agent tooling & planning artifacts
+.kiro/
+.plans/
+plans/
+.mcp.json

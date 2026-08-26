@@ -59,6 +59,9 @@ pub use self::ufs_conf::{UfsConf, UfsConfBuilder};
 pub mod pipeline;
 pub use pipeline::{ConfigLoader, DiscoveredPath};
 
+/// Unified validation framework (per-section validate + unknown-key audit).
+pub mod validation;
+
 impl curvine_model::ClientConfDefaults for ClientConf {
     fn replicas(&self) -> i32 {
         self.replicas
