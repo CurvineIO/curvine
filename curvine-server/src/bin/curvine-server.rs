@@ -14,7 +14,7 @@
 
 use clap::Parser;
 use curvine_alloc as _;
-use curvine_config::ClusterConf;
+use curvine_config::{ConfigLoader, ClusterConf};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_data_transfer::transfer::TransferServer;
 use curvine_master::master::Master;
@@ -110,12 +110,25 @@ impl ServerArgs {
     }
 
     pub fn get_conf(&self, service: &ServiceType) -> CommonResult<ClusterConf> {
-        match service {
-            ServiceType::Transfer => ClusterConf::from_transfer(&self.conf),
-            ServiceType::Master | ServiceType::Worker | ServiceType::Mds => {
-                ClusterConf::from(&self.conf)
-            }
-        }
+        // Unified discovery: `--conf` > CURVINE_CONF_FILE > well-known
+        // locations (launch scripts export the env var; bare local runs fall
+        // back to ./conf/curvine-cluster.toml).
+        let found = ConfigLoader::discover(Some(&self.conf))
+            .ok_or_else(|| -> curvine_core_error::CommonError {
+                format!(
+                    "no configuration file found: pass --conf or set {}, or place \
+                     curvine-cluster.toml in a well-known location",
+                    ClusterConf::ENV_CONF_FILE
+                )
+                .into()
+            })?;
+        println!("Loading config from {} ({})", found.as_str(), found.source);
+
+        let load = match service {
+            ServiceType::Transfer => ClusterConf::from_transfer,
+            ServiceType::Master | ServiceType::Worker | ServiceType::Mds => ClusterConf::from,
+        };
+        load(found.as_str())
     }
 }
 
