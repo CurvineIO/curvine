@@ -58,8 +58,9 @@ impl CurvineFileSystem {
 
         let c = &fs.conf().client;
         info!(
-            "Create new filesystem, version: {}, masters: {}, threads: {}-{}, \
+            "Create new filesystem, commit: {}, version: {}, masters: {}, threads: {}-{}, \
             buffer(rw): {}-{}, conn timeout(ms): {}-{}, rpc timeout(ms): {}-{}, data timeout(ms): {}",
+            curvine_sys::version::GIT_VERSION,
             env!("CARGO_PKG_VERSION"),
             fs.conf().masters_string(),
             rt.io_threads(),
