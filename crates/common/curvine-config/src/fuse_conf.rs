@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::fs::Path;
+use curvine_common_macros::ClientCliArgs;
 use curvine_core_error::{err_box, try_err, CommonResult};
 use curvine_runtime::common::{DurationUnit, FileUtils, LogConf, Utils};
 use curvine_sys as sys;
@@ -52,7 +53,12 @@ use std::time::Duration;
 // Rule of thumb: layer 1 tunes how stale the *kernel* may be, layer 2 tunes the
 // process-local metadata caches, and layer 3 decides whether file *data* flows
 // through the page cache at all.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ClientCliArgs)]
+// `opt_in` keeps the generated `FuseConfCliOverrides` surface limited to the
+// fields explicitly annotated below — exactly the flags `curvine-fuse mount`
+// has historically exposed. New tunable-by-CLI fields opt in with one
+// `#[client_cli]` attribute instead of a new hand-written override branch.
+#[client_cli(opt_in)]
 #[serde(default)]
 pub struct FuseConf {
     // Whether to output the request response log.
@@ -71,18 +77,24 @@ pub struct FuseConf {
     // scrape as zero-valued series — this keeps a stable scrape schema and lets
     // the switch flip back on without re-registration. "Disabled" means "no
     // emission", not "no registration".
+    #[client_cli]
     pub metrics_enabled: bool,
 
+    #[client_cli]
     pub io_threads: usize,
 
+    #[client_cli]
     pub worker_threads: usize,
     // Mounting path
+    #[client_cli]
     pub mnt_path: String,
 
     // Specify the root path of the mount point to access the file system, default "/"
+    #[client_cli]
     pub fs_path: String,
 
     // Number of mount points
+    #[client_cli]
     pub mnt_number: usize,
 
     // How many tasks can be read and write data at each mount point.
@@ -94,15 +106,20 @@ pub struct FuseConf {
     // this directly — use `FuseConf::effective_tasks_per_mnt()` so the `0`
     // fallback is applied against the (possibly CLI-overridden) io_threads.
     #[serde(alias = "mnt_per_task")]
+    // Alias kept so existing Fluid/mount scripts do not fail on upgrade.
+    #[client_cli(long = "tasks-per-mnt", alias = "mnt-per-task")]
     pub tasks_per_mnt: usize,
 
     // Whether to enable the clone fd feature
+    #[client_cli]
     pub clone_fd: bool,
 
     // Fuse request queue size, default is 0
+    #[client_cli]
     pub fuse_channel_size: usize,
 
     // Read and write file request queue size, default is 0
+    #[client_cli]
     pub stream_channel_size: usize,
 
     // Mount options for Curvine's direct Linux FUSE backend. Supported VFS
@@ -128,6 +145,7 @@ pub struct FuseConf {
 
     pub gid: u32,
 
+    #[client_cli]
     pub web_port: u16,
 
     // Whether to fill the fuse node id when traversing the directory.
@@ -135,42 +153,53 @@ pub struct FuseConf {
     // file attr has cache time. During the cache time, look up will not be executed. If you access this file, an error will be reported (node ​​does not exist)
     // Setting will be true, which is equivalent to executing a lookup for each node before returning data to the kernel, and there will be no node.
     // The default value is true
+    #[client_cli]
     pub read_dir_fill_ino: bool,
 
     // Name search cache time, in milliseconds.
     // After performing a name search, if the same name is requested again, the kernel will check the cache first.
     // If the buffer record is still valid, the cache result will be returned directly, unlike user space for requests.
     // Default 1000ms (1 second). Sub-second granularity is supported (e.g. 500 = 0.5s).
+    #[client_cli]
     pub entry_timeout_ms: u64,
 
     // The timeout (in milliseconds) of cache negative lookups. This means that if the file does not exist (find returns ENOENT)
     // Then the search will only be redone after the timeout, and the file/directory will be assumed to not exist before this.
     // The default value is 0ms, which means cache negative lookup is disabled.
+    #[client_cli]
     pub negative_timeout_ms: u64,
 
     // Cache time for file and directory attributes, in milliseconds.
     // This means that after a file or directory attribute search, if the same attribute is requested again, the kernel will first check the cache.
     // If the record in the cache is still valid (i.e. the timeout time has not exceeded), the cached result will be returned directly without making a request to the user space again
     // Default is 1000ms (1 second). Sub-second granularity is supported (e.g. 500 = 0.5s).
+    #[client_cli]
     pub attr_timeout_ms: u64,
 
     // Parameters are used to specify whether the file system should remember the opened files and directories.
     // By default, the FUSE file system clears the cache when a file or directory is closed.
+    #[client_cli]
     pub remember: bool,
 
     // The maximum number of concurrent execution of backend tasks in the file system.It directly affects the performance and stability of the file system, and is important especially when dealing with high load or asynchronous I/O scenarios.
+    #[client_cli]
     pub max_background: u16,
 
+    #[client_cli]
     pub congestion_threshold: u16,
 
     // Whether to enable metadata cache
+    #[client_cli]
     pub enable_meta_cache: bool,
 
     // Metadata cache TTL string (parsed into `meta_cache_ttl` by `init()`)
+    #[client_cli(long = "meta-cache-ttl")]
     pub meta_cache_timeout: String,
+    #[client_cli]
     pub node_cache_timeout: String,
 
     // File and directory related options
+    #[client_cli]
     pub direct_io: bool,
 
     // When the file is opened and the local metadata (mtime/len) differs from the server,
@@ -179,12 +208,16 @@ pub struct FuseConf {
     // the page cache entirely for the affected file descriptor.  Default: false.
     pub open_direct_on_stale: bool,
 
+    #[client_cli]
     pub write_back_cache: bool,
 
+    #[client_cli]
     pub cache_readdir: bool,
 
+    #[client_cli]
     pub non_seekable: bool,
 
+    #[client_cli]
     pub check_permission: bool,
 
     pub state_dir: String,
@@ -223,6 +256,7 @@ pub struct FuseConf {
     #[serde(skip_serializing, skip_deserializing)]
     pub meta_cache_ttl: Duration,
 
+    #[client_cli]
     pub list_limit: usize,
 
     /// Whether to use splice (zero-copy) for FUSE data transfer.
@@ -382,48 +416,17 @@ impl FuseConf {
         }
     }
 
-    /// Canonical TOML key names for `FuseConf` fields, derived by serializing the
-    /// default so it cannot drift from the struct definition. `#[serde(skip_*)]`
-    /// runtime-only fields (the `*_ttl` durations) are excluded automatically.
-    fn known_field_names() -> Vec<String> {
-        match toml::Value::try_from(FuseConf::default()) {
-            Ok(toml::Value::Table(t)) => t.keys().cloned().collect(),
-            _ => vec![],
-        }
-    }
-
-    /// Returns keys in a raw `[fuse]` TOML table that do not match any current
-    /// `FuseConf` field. These are surfaced as warnings by `validate-config`:
-    /// they are silently dropped on load (FuseConf is `#[serde(default)]` with
-    /// no `deny_unknown_fields`), so a typo would otherwise never take effect
-    /// and never be noticed. Result is sorted for stable output.
-    ///
-    /// Note: a renamed field kept alive by `#[serde(alias)]` (e.g. the old
-    /// `mnt_per_task`) is reported here too — its canonical name is what
-    /// `FuseConf` exposes — so the value DOES still take effect via the alias.
-    /// The warning is intentionally phrased to cover both cases (typo vs.
-    /// deprecated/renamed) rather than claiming the setting was ignored.
-    pub fn unrecognized_fuse_keys(fuse_table: &toml::value::Table) -> Vec<String> {
-        let known: std::collections::HashSet<String> =
-            Self::known_field_names().into_iter().collect();
-
-        let mut unknown: Vec<String> = fuse_table
-            .keys()
-            .filter(|k| !known.contains(k.as_str()))
-            .cloned()
-            .collect();
-        unknown.sort();
-        unknown
-    }
-
     /// Parses raw cluster TOML text and returns the unrecognized keys found
     /// under the `[fuse]` table. Missing `[fuse]` table yields an empty list.
+    ///
+    /// Delegates to the workspace-wide [`crate::validation`] audit and filters
+    /// to this section, so semantics stay in lockstep with full-document
+    /// auditing (same skip-field and alias treatment).
     pub fn unrecognized_fuse_keys_from_toml(raw: &str) -> CommonResult<Vec<String>> {
-        let value: toml::Value = try_err!(toml::from_str(raw));
-        match value.get("fuse").and_then(|v| v.as_table()) {
-            Some(t) => Ok(Self::unrecognized_fuse_keys(t)),
-            None => Ok(vec![]),
-        }
+        Ok(crate::validation::audit_unknown_keys(raw)?
+            .into_iter()
+            .filter_map(|key| key.strip_prefix("fuse.").map(str::to_string))
+            .collect())
     }
 
     pub fn parse_fuse_opts(&self) -> Vec<CString> {
@@ -1304,10 +1307,11 @@ mnt_per_task = 7
 
     #[test]
     fn unrecognized_fuse_keys_flags_typo_and_legacy() {
-        // Every key not matching a current FuseConf field is flagged so the user
-        // can investigate: the typo (direct_iox), the dropped legacy param
-        // (node_cache_size), and the renamed key still alive via #[serde(alias)]
-        // (mnt_per_task). A current field (io_threads) is NOT flagged.
+        // Keys no FuseConf field consumes are flagged so the user can
+        // investigate: the typo (direct_iox) and the dropped legacy param
+        // (node_cache_size). The renamed-but-aliased key (mnt_per_task) is
+        // still consumed via #[serde(alias)], and a current field (io_threads)
+        // likewise — neither is flagged.
         let raw = r#"
 [fuse]
 io_threads = 16
@@ -1318,11 +1322,7 @@ direct_iox = true
         let unknown = FuseConf::unrecognized_fuse_keys_from_toml(raw).unwrap();
         assert_eq!(
             unknown,
-            vec![
-                "direct_iox".to_string(),
-                "mnt_per_task".to_string(),
-                "node_cache_size".to_string(),
-            ]
+            vec!["direct_iox".to_string(), "node_cache_size".to_string()]
         );
     }
 

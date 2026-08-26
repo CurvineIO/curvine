@@ -29,6 +29,7 @@ use proc_macro::TokenStream;
 /// - `#[client_cli]` or `#[client_cli()]` — include field when `opt_in` is set
 /// - `#[client_cli(skip)]` — omit from generated overrides
 /// - `#[client_cli(long = "...")]` — explicit clap long name
+/// - `#[client_cli(alias = "...")]` — extra clap alias for a deprecated flag name
 ///
 /// Fields marked `#[serde(skip)]` are skipped automatically.
 #[proc_macro_derive(ClientCliArgs, attributes(client_cli))]

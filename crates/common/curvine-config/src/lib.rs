@@ -44,7 +44,7 @@ mod client_conf;
 pub use self::client_conf::{ClientConf, ClientConfCliOverrides};
 
 mod fuse_conf;
-pub use self::fuse_conf::FuseConf;
+pub use self::fuse_conf::{FuseConf, FuseConfCliOverrides};
 
 mod job_conf;
 pub use self::job_conf::JobConf;
