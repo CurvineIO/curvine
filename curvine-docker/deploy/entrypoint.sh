@@ -46,7 +46,7 @@ if is_fluid_mode "${1:-}"; then
 fi
 
 # Start the curvine service process
-# Service type: master, worker, transfer
+# Service type: master, worker, mds, transfer
 SERVER_TYPE=${1:-master}
 
 # Operation type: start, stop, restart

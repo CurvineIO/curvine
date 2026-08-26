@@ -7,7 +7,7 @@ format_worker = false
 
 # Network interface (e.g. "eth0") used to auto-resolve this node's local IPv4.
 # When set (non-empty), on startup the resolved IPv4 is applied to the
-# master/journal/worker/client hostnames, and the CURVINE_*_HOSTNAME env vars
+# master/mds/journal/worker/client hostnames, and the CURVINE_*_HOSTNAME env vars
 # are ignored. When empty (the default), hostnames come from the config below
 # and may be overridden by the CURVINE_*_HOSTNAME env vars.
 #
@@ -57,9 +57,9 @@ log = { level = "info", log_dir = "stdout", file_name = "master.log" }
 # with `curvine-server --service mds` after enabling this flag.
 [mds]
 enabled = false
-hostname = "localhost"
 rpc_port = 8998
 web_port = 9004
+log = { level = "info", log_dir = "stdout", file_name = "mds.log" }
 
 
 # masta ha raft configuration.

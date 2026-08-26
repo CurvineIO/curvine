@@ -51,7 +51,10 @@ impl Default for MdsConf {
             web_port: Self::DEFAULT_WEB_PORT,
             io_threads: 4,
             worker_threads: 8,
-            log: Default::default(),
+            log: LogConf {
+                file_name: "mds.log".to_string(),
+                ..Default::default()
+            },
         }
     }
 }
@@ -68,6 +71,7 @@ mod tests {
         assert!(!conf.enabled);
         assert_eq!(conf.rpc_port, MdsConf::DEFAULT_RPC_PORT);
         assert_eq!(conf.web_port, MdsConf::DEFAULT_WEB_PORT);
+        assert_eq!(conf.log.file_name, "mds.log");
     }
 
     #[test]
