@@ -232,10 +232,14 @@ impl FuseMetrics {
     /// This exposes a zero baseline so Prometheus can observe a later init result.
     pub(crate) fn init_session_metrics() {
         Self::with(|m| {
-            for result in [SESSION_INIT_SUCCESS, SESSION_INIT_ERROR] {
-                let _ = m.session_init_total.with_label_values(&[result]);
-            }
+            Self::init_session_metric_children(&m.session_init_total);
         });
+    }
+
+    fn init_session_metric_children(counter: &CounterVec) {
+        for result in [SESSION_INIT_SUCCESS, SESSION_INIT_ERROR] {
+            let _ = counter.with_label_values(&[result]);
+        }
     }
 
     pub(crate) fn with<F: FnOnce(&Self)>(f: F) {
@@ -2729,7 +2733,24 @@ mod tests {
     }
 
     #[test]
-    fn init_session_metrics_exports_zero_baselines_without_incrementing() {
+    fn init_session_metric_children_exports_zero_baselines() {
+        let metric_name = "test_fuse_session_init_zero_baselines_unique";
+        let counter = m::new_counter_vec(metric_name, "test counter", &["result"]).unwrap();
+        let before = m::text_output().unwrap();
+        assert!(
+            !before.contains(metric_name),
+            "CounterVec has no exported children before label initialization"
+        );
+
+        FuseMetrics::init_session_metric_children(&counter);
+
+        let output = m::text_output().unwrap();
+        assert!(output.contains(&format!("{metric_name}{{result=\"success\"}} 0")));
+        assert!(output.contains(&format!("{metric_name}{{result=\"error\"}} 0")));
+    }
+
+    #[test]
+    fn init_session_metrics_does_not_increment_existing_children() {
         FuseMetrics::ensure_init().unwrap();
         let mx = FuseMetrics::get();
         let success = mx
@@ -2743,9 +2764,6 @@ mod tests {
         FuseMetrics::init_session_metrics();
 
         assert_eq!((success.get(), error.get()), before);
-        let output = m::text_output().unwrap();
-        assert!(output.contains("curvine_fuse_session_init_total{result=\"success\"}"));
-        assert!(output.contains("curvine_fuse_session_init_total{result=\"error\"}"));
     }
 
     // The `if enabled { emit }` gate is deterministic against an isolated counter —

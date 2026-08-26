@@ -65,7 +65,9 @@ pub fn run_mount(args: FuseRuntimeArgs) -> CommonResult<()> {
         let web_port = conf.web_port;
         // Start metrics before session construction so Prometheus can observe
         // the lifecycle counter's zero baseline during startup.
-        FuseMetrics::init_session_metrics();
+        if conf.metrics_enabled {
+            FuseMetrics::init_session_metrics();
+        }
         match WebServer::bind(web_port).await {
             Ok(listener) => {
                 fuse_rt.spawn(async move {
