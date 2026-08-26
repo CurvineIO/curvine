@@ -28,6 +28,9 @@ pub use self::journal_conf::JournalConf;
 mod master_conf;
 pub use self::master_conf::MasterConf;
 
+mod mds_conf;
+pub use self::mds_conf::MdsConf;
+
 mod compatibility_conf;
 pub use self::compatibility_conf::CompatibilityConf;
 
@@ -57,6 +60,10 @@ pub use self::transfer_conf::*;
 
 mod ufs_conf;
 pub use self::ufs_conf::{UfsConf, UfsConfBuilder};
+
+/// Unified layered config-loading pipeline (file → env → cli).
+pub mod pipeline;
+pub use pipeline::{ConfigLoader, DiscoveredPath};
 
 impl curvine_model::ClientConfDefaults for ClientConf {
     fn replicas(&self) -> i32 {

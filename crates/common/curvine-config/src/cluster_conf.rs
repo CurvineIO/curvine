@@ -14,7 +14,7 @@
 
 use crate::{
     CliConf, ClientConf, DBConf, DiscoveryConf, FuseConf, JobConf, JournalConf, MasterConf,
-    TransferConf, WorkerConf,
+    MdsConf, TransferConf, WorkerConf,
 };
 use curvine_core_error::{err_box, try_err, CommonResult};
 use curvine_fault::FaultHttpConfig;
@@ -50,6 +50,8 @@ pub struct ClusterConf {
     pub net_interface: String,
 
     pub master: MasterConf,
+
+    pub mds: MdsConf,
 
     // Log synchronization configuration.
     pub journal: JournalConf,
@@ -88,6 +90,7 @@ impl ClusterConf {
     pub const DEFAULT_FUSE_WEB_PORT: u16 = 9003;
 
     pub const ENV_MASTER_HOSTNAME: &'static str = "CURVINE_MASTER_HOSTNAME";
+    pub const ENV_MDS_HOSTNAME: &'static str = "CURVINE_MDS_HOSTNAME";
     pub const ENV_WORKER_HOSTNAME: &'static str = "CURVINE_WORKER_HOSTNAME";
     pub const ENV_CLIENT_HOSTNAME: &'static str = "CURVINE_CLIENT_HOSTNAME";
     pub const ENV_TRANSFER_HOSTNAME: &'static str = "CURVINE_TRANSFER_HOSTNAME";
@@ -98,6 +101,9 @@ impl ClusterConf {
         conf.normalize_whitespace();
         conf.apply_hostname_overrides()?;
         conf.master.init()?;
+        if conf.mds.enabled {
+            conf.mds.init()?;
+        }
         conf.client.init()?;
         conf.fuse.init()?;
         conf.job.init()?;
@@ -128,6 +134,7 @@ impl ClusterConf {
         self.cluster_id = self.cluster_id.trim().to_string();
         self.net_interface = self.net_interface.trim().to_string();
         self.master.hostname = self.master.hostname.trim().to_string();
+        self.mds.hostname = self.mds.hostname.trim().to_string();
         self.journal.hostname = self.journal.hostname.trim().to_string();
         self.worker.hostname = self.worker.hostname.trim().to_string();
         self.client.hostname = self.client.hostname.trim().to_string();
@@ -172,6 +179,7 @@ impl ClusterConf {
             // eprintln! to make the warning visible on stderr.
             for env_key in [
                 Self::ENV_MASTER_HOSTNAME,
+                Self::ENV_MDS_HOSTNAME,
                 Self::ENV_WORKER_HOSTNAME,
                 Self::ENV_CLIENT_HOSTNAME,
                 Self::ENV_TRANSFER_HOSTNAME,
@@ -186,6 +194,7 @@ impl ClusterConf {
             }
 
             self.master.hostname = ip.clone();
+            self.mds.hostname = ip.clone();
             self.journal.hostname = ip.clone();
             self.worker.hostname = ip.clone();
             self.client.hostname = ip.clone();
@@ -200,6 +209,10 @@ impl ClusterConf {
             // Apply worker hostname from environment variable (used by worker process)
             if let Ok(v) = env::var(Self::ENV_WORKER_HOSTNAME) {
                 self.worker.hostname = v.trim().to_string();
+            }
+
+            if let Ok(v) = env::var(Self::ENV_MDS_HOSTNAME) {
+                self.mds.hostname = v.trim().to_string();
             }
 
             // Apply client hostname from environment variable
@@ -499,6 +512,7 @@ impl Default for ClusterConf {
             cluster_id: "curvine".to_string(),
             net_interface: String::new(),
             master: Default::default(),
+            mds: Default::default(),
             journal: Default::default(),
             worker: Default::default(),
             fault_injection: Default::default(),
@@ -697,7 +711,79 @@ mod tests {
         let conf = ClusterConf::from(path).unwrap();
 
         assert_eq!(conf.master.rpc_port, ClusterConf::DEFAULT_MASTER_PORT);
+        assert!(!conf.mds.enabled);
         assert!(!conf.client.master_addrs.is_empty());
+    }
+
+    #[test]
+    fn legacy_config_without_mds_uses_disabled_defaults() {
+        let path = std::env::temp_dir().join(format!(
+            "curvine-legacy-conf-{}-{}.toml",
+            std::process::id(),
+            Utils::rand_str(6)
+        ));
+        std::fs::write(
+            &path,
+            r#"
+                cluster_id = "legacy"
+
+                [master]
+            "#,
+        )
+        .unwrap();
+        let conf = ClusterConf::from(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(!conf.mds.enabled);
+        assert_eq!(conf.mds.rpc_port, crate::MdsConf::DEFAULT_RPC_PORT);
+        assert_eq!(conf.mds.web_port, crate::MdsConf::DEFAULT_WEB_PORT);
+    }
+
+    #[test]
+    fn disabled_mds_skips_validation() {
+        let path = std::env::temp_dir().join(format!(
+            "curvine-disabled-mds-conf-{}-{}.toml",
+            std::process::id(),
+            Utils::rand_str(6)
+        ));
+        std::fs::write(
+            &path,
+            r#"
+                [mds]
+                enabled = false
+                hostname = " "
+                rpc_port = 0
+            "#,
+        )
+        .unwrap();
+        let conf = ClusterConf::from(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(!conf.mds.enabled);
+    }
+
+    #[test]
+    fn enabled_mds_is_validated() {
+        let path = std::env::temp_dir().join(format!(
+            "curvine-enabled-mds-conf-{}-{}.toml",
+            std::process::id(),
+            Utils::rand_str(6)
+        ));
+        std::fs::write(
+            &path,
+            r#"
+                [mds]
+                enabled = true
+                rpc_port = 0
+            "#,
+        )
+        .unwrap();
+        let err = ClusterConf::from(path.to_str().unwrap())
+            .expect_err("enabled MDS must validate its configuration")
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(err.contains("mds.rpc_port must be greater than zero"));
     }
 
     #[test]

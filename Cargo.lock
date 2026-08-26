@@ -2535,6 +2535,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-mds"
+version = "0.2.0"
+dependencies = [
+ "curvine-config",
+ "curvine-core-error",
+ "curvine-runtime",
+ "log",
+ "tokio",
+]
+
+[[package]]
 name = "curvine-metrics"
 version = "0.2.0"
 dependencies = [
@@ -2726,6 +2737,7 @@ dependencies = [
  "curvine-io",
  "curvine-job-client",
  "curvine-master",
+ "curvine-mds",
  "curvine-model",
  "curvine-net",
  "curvine-proto",

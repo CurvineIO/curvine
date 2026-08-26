@@ -36,6 +36,7 @@ members = [
     "crates/adapters/curvine-ufs-oss-hdfs",
     "crates/adapters/curvine-hdfs-jni",
     "crates/server/curvine-data-transfer",
+    "curvine-mds",
     "curvine-master",
     "curvine-worker",
     "curvine-server",
@@ -85,6 +86,7 @@ default-members = [
     "crates/metadata/curvine-raft",
     "crates/adapters/curvine-storage-local",
     "crates/server/curvine-data-transfer",
+    "curvine-mds",
     "curvine-master",
     "curvine-worker",
     "curvine-server",
@@ -123,6 +125,7 @@ curvine-ufs-opendal = { path = "crates/adapters/curvine-ufs-opendal" }
 curvine-ufs-oss-hdfs = { path = "crates/adapters/curvine-ufs-oss-hdfs" }
 curvine-hdfs-jni = { path = "crates/adapters/curvine-hdfs-jni" }
 curvine-data-transfer = { path = "crates/server/curvine-data-transfer" }
+curvine-mds = { path = "curvine-mds" }
 curvine-fault = { path = "crates/core/curvine-fault" }
 curvine-metrics = { path = "crates/core/curvine-metrics" }
 curvine-error = { path = "crates/common/curvine-error" }
