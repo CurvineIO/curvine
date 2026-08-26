@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::env;
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::result::Result as StdResult;
 use std::sync::Arc;
@@ -24,7 +23,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use curvine_client::file::CurvineFileSystem;
-use curvine_config::ClusterConf;
+use curvine_config::{ClusterConf, ConfigLoader};
 use curvine_error::FsError;
 use curvine_fs_api::{Path as CurvinePath, Reader, Writer};
 use curvine_io::DataSlice;
@@ -185,11 +184,14 @@ fn resolve_curvine_conf(params: &ObjectStoreParams) -> Result<ClusterConf> {
         return cluster_conf_from_master_addrs(&master_addrs);
     }
 
-    if let Ok(conf_path) = env::var(ClusterConf::ENV_CONF_FILE) {
-        return ClusterConf::from(&conf_path).map_err(|e| {
+    // Same unified discovery as the other entrypoints, restricted to
+    // explicitly configured sources: the storage option (checked above) or the
+    // CURVINE_CONF_FILE environment variable.
+    if let Some(found) = ConfigLoader::discover_configured(None) {
+        return ClusterConf::from(found.as_str()).map_err(|e| {
             LanceError::invalid_input(format!(
                 "Failed to load Curvine configuration from '{}': {e}",
-                conf_path
+                found.as_str()
             ))
         });
     }
@@ -268,8 +270,8 @@ fn curvine_store_identity(
         ));
     }
 
-    if let Ok(conf_path) = env::var(ClusterConf::ENV_CONF_FILE) {
-        return curvine_conf_identity(&conf_path);
+    if let Some(found) = ConfigLoader::discover_configured(None) {
+        return curvine_conf_identity(found.as_str().as_ref());
     }
 
     curvine_absolute_path_str_from_uri(url)
