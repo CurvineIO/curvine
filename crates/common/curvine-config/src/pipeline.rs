@@ -229,6 +229,11 @@ pub fn apply_env_layer_with(
     for entry in scoped {
         if let Some(value) = lookup(entry.var) {
             let value = value.trim().to_string();
+            // A whitespace-only env var carries no usable hostname; skipping
+            // it keeps the file value instead of blanking it with "".
+            if value.is_empty() {
+                continue;
+            }
             for path in entry.paths {
                 set_dotted(doc, path, toml::Value::String(value.clone()))?;
             }
@@ -494,6 +499,62 @@ mod tests {
         );
         // Unset vars leave file values untouched.
         assert!(doc.get("client").is_none());
+    }
+
+    // A whitespace-only hostname env var carries no value: the file hostname
+    // must survive instead of being overwritten with an empty string.
+    #[test]
+    fn whitespace_only_env_value_keeps_file_hostname() {
+        let mut doc: toml::Value =
+            toml::from_str("[master]\nhostname = \"file-master\"\n").unwrap();
+        let env = lookup(&[(ClusterConf::ENV_MASTER_HOSTNAME, "   ")]);
+        apply_env_layer_with(&mut doc, LoadProfile::Full, &env).unwrap();
+
+        assert_eq!(
+            doc_string(&doc, &["master", "hostname"]),
+            Some("file-master".into())
+        );
+        // The skipped write also skips the journal seeding — nothing to write.
+        assert_eq!(doc_string(&doc, &["journal", "hostname"]), None);
+    }
+
+    // Transfer profile through its real entry point: a set net_interface
+    // rewrites only client/transfer hostnames from the NIC and leaves the
+    // master/journal file values (and thus resolve_master_addrs) untouched.
+    #[test]
+    fn transfer_nic_rewrites_only_client_and_transfer() {
+        #[cfg(target_os = "macos")]
+        let loopback = "lo0";
+        #[cfg(not(target_os = "macos"))]
+        let loopback = "lo";
+
+        let text = format!(
+            r#"
+            net_interface = "{loopback}"
+
+            [master]
+            hostname = "cv-master"
+
+            [journal]
+            journal_addrs = []
+        "#
+        );
+        let env_map = lookup(&[
+            (ClusterConf::ENV_CLIENT_HOSTNAME, "env-client"),
+            (ClusterConf::ENV_TRANSFER_HOSTNAME, "env-transfer"),
+        ]);
+        let doc = build_transfer_document_with(&text, &[], &env_map).unwrap();
+
+        let conf: ClusterConf = doc.try_into().unwrap();
+        assert_eq!(conf.master.hostname, "cv-master");
+        assert_eq!(conf.client.hostname, "127.0.0.1");
+        assert_eq!(conf.transfer.hostname, "127.0.0.1");
+        // Derived client.master_addrs still point at the master's file value.
+        assert!(conf
+            .client
+            .master_addrs
+            .iter()
+            .all(|a| a.hostname == "cv-master"));
     }
 
     #[test]
