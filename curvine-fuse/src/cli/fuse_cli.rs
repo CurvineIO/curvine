@@ -114,7 +114,7 @@ mod tests {
         let cli = FuseCli::try_parse_from(["curvine-fuse", "--io-threads", "4"]).unwrap();
         assert!(cli.cmd.is_none());
         let args = cli.resolve_runtime_args();
-        assert_eq!(args.mount.io_threads, Some(4));
+        assert_eq!(args.mount.fuse.io_threads, Some(4));
     }
 
     #[test]
@@ -174,7 +174,7 @@ mod tests {
     fn mount_subcommand_preserves_flags() {
         let cli = FuseCli::try_parse_from(["curvine-fuse", "mount", "--io-threads", "8"]).unwrap();
         let args = cli.resolve_runtime_args();
-        assert_eq!(args.mount.io_threads, Some(8));
+        assert_eq!(args.mount.fuse.io_threads, Some(8));
     }
 
     #[test]
@@ -186,7 +186,7 @@ mod tests {
     #[test]
     fn metrics_enabled_cli_override_disables() {
         with_valid_conf(&["--metrics-enabled", "false"], |args| {
-            assert_eq!(args.mount.metrics_enabled, Some(false));
+            assert_eq!(args.mount.fuse.metrics_enabled, Some(false));
             let conf = args.get_conf().unwrap();
             assert!(
                 !conf.fuse.metrics_enabled,
@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn metrics_enabled_absent_keeps_default() {
         with_valid_conf(&["--io-threads", "4"], |args| {
-            assert_eq!(args.mount.metrics_enabled, None);
+            assert_eq!(args.mount.fuse.metrics_enabled, None);
             let conf = args.get_conf().unwrap();
             assert!(conf.fuse.metrics_enabled, "absent flag keeps default true");
         });
