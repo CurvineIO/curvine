@@ -382,48 +382,16 @@ impl FuseConf {
         }
     }
 
-    /// Canonical TOML key names for `FuseConf` fields, derived by serializing the
-    /// default so it cannot drift from the struct definition. `#[serde(skip_*)]`
-    /// runtime-only fields (the `*_ttl` durations) are excluded automatically.
-    fn known_field_names() -> Vec<String> {
-        match toml::Value::try_from(FuseConf::default()) {
-            Ok(toml::Value::Table(t)) => t.keys().cloned().collect(),
-            _ => vec![],
-        }
-    }
-
-    /// Returns keys in a raw `[fuse]` TOML table that do not match any current
-    /// `FuseConf` field. These are surfaced as warnings by `validate-config`:
-    /// they are silently dropped on load (FuseConf is `#[serde(default)]` with
-    /// no `deny_unknown_fields`), so a typo would otherwise never take effect
-    /// and never be noticed. Result is sorted for stable output.
-    ///
-    /// Note: a renamed field kept alive by `#[serde(alias)]` (e.g. the old
-    /// `mnt_per_task`) is reported here too — its canonical name is what
-    /// `FuseConf` exposes — so the value DOES still take effect via the alias.
-    /// The warning is intentionally phrased to cover both cases (typo vs.
-    /// deprecated/renamed) rather than claiming the setting was ignored.
-    pub fn unrecognized_fuse_keys(fuse_table: &toml::value::Table) -> Vec<String> {
-        let known: std::collections::HashSet<String> =
-            Self::known_field_names().into_iter().collect();
-
-        let mut unknown: Vec<String> = fuse_table
-            .keys()
-            .filter(|k| !known.contains(k.as_str()))
-            .cloned()
-            .collect();
-        unknown.sort();
-        unknown
-    }
-
     /// Parses raw cluster TOML text and returns the unrecognized keys found
     /// under the `[fuse]` table. Missing `[fuse]` table yields an empty list.
+    /// Parses raw cluster TOML text and returns the unrecognized keys found
+    /// under the `[fuse]` table. Delegates to the workspace-wide
+    /// [`crate::validation`] audit and filters to this section.
     pub fn unrecognized_fuse_keys_from_toml(raw: &str) -> CommonResult<Vec<String>> {
-        let value: toml::Value = try_err!(toml::from_str(raw));
-        match value.get("fuse").and_then(|v| v.as_table()) {
-            Some(t) => Ok(Self::unrecognized_fuse_keys(t)),
-            None => Ok(vec![]),
-        }
+        Ok(crate::validation::audit_unknown_keys(raw)?
+            .into_iter()
+            .filter_map(|key| key.strip_prefix("fuse.").map(str::to_string))
+            .collect())
     }
 
     pub fn parse_fuse_opts(&self) -> Vec<CString> {
@@ -1304,25 +1272,24 @@ mnt_per_task = 7
 
     #[test]
     fn unrecognized_fuse_keys_flags_typo_and_legacy() {
-        // Every key not matching a current FuseConf field is flagged so the user
-        // can investigate: the typo (direct_iox), the dropped legacy param
-        // (node_cache_size), and the renamed key still alive via #[serde(alias)]
-        // (mnt_per_task). A current field (io_threads) is NOT flagged.
+        // Keys no FuseConf field consumes are flagged so the user can
+        // investigate: the typo (direct_iox) and the dropped legacy param
+        // (node_cache_size). The renamed-but-aliased key (mnt_per_task) is
+        // still consumed via #[serde(alias)], and a current field (io_threads)
+        // likewise — neither is flagged. max_readahead_kb (Option<u32>, None
+        // default) is also consumed and must not be flagged.
         let raw = r#"
 [fuse]
 io_threads = 16
 node_cache_size = 200000
 mnt_per_task = 7
+max_readahead_kb = 1024
 direct_iox = true
 "#;
         let unknown = FuseConf::unrecognized_fuse_keys_from_toml(raw).unwrap();
         assert_eq!(
             unknown,
-            vec![
-                "direct_iox".to_string(),
-                "mnt_per_task".to_string(),
-                "node_cache_size".to_string(),
-            ]
+            vec!["direct_iox".to_string(), "node_cache_size".to_string()]
         );
     }
 
