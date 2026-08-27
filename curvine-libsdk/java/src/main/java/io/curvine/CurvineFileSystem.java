@@ -74,18 +74,15 @@ public class CurvineFileSystem extends FileSystem {
          * Close the underlying mount exactly once; later calls are no-ops.
          * The lock makes it idempotent against concurrent closes from multiple
          * CurvineFileSystem instances sharing the mount, so the native handle
-         * is never released twice (double free).
+         * is never released twice (double free). Failures are propagated to
+         * the caller so an explicit close can never silently leak the mount.
          */
-        synchronized void closeOnce() {
+        synchronized void closeOnce() throws IOException {
             if (closed) {
                 return;
             }
             closed = true;
-            try {
-                mount.close();
-            } catch (IOException e) {
-                LOGGER.warn("Error closing cached mount", e);
-            }
+            mount.close();
         }
     }
 
@@ -329,10 +326,15 @@ public class CurvineFileSystem extends FileSystem {
                     MOUNT_CACHE.remove(cacheKey);
                 }
             }
-            if (last) {
-                cached.closeOnce();
+            try {
+                if (last) {
+                    cached.closeOnce();
+                }
+            } finally {
+                // Idempotent per instance even if the native close fails: the
+                // cache entry is already removed, so a retry is a no-op.
+                libFs = null;
             }
-            libFs = null;
         }
         super.close();
     }
