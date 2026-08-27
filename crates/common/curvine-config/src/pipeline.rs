@@ -76,6 +76,10 @@ pub const ENV_HOSTNAME_OVERRIDES: &[EnvOverride] = &[
         paths: &["client.hostname"],
     },
     EnvOverride {
+        var: ClusterConf::ENV_MDS_HOSTNAME,
+        paths: &["mds.hostname"],
+    },
+    EnvOverride {
         var: ClusterConf::ENV_TRANSFER_HOSTNAME,
         paths: &["transfer.hostname"],
     },
