@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::{
-    CliConf, ClientConf, DBConf, FuseConf, JobConf, JournalConf, MasterConf, MdsConf, TransferConf,
-    WebConf, WorkerConf,
+    CliConf, ClientConf, DBConf, DiscoveryConf, FuseConf, JobConf, JournalConf, MasterConf,
+    MdsConf, TransferConf, WebConf, WorkerConf,
 };
 use curvine_core_error::{err_box, try_err, CommonResult};
 use curvine_fault::FaultHttpConfig;
@@ -79,6 +79,8 @@ pub struct ClusterConf {
 
     pub cli: CliConf,
     pub web: WebConf,
+
+    pub discovery: DiscoveryConf,
 }
 
 impl ClusterConf {
@@ -111,6 +113,7 @@ impl ClusterConf {
         conf.job.init()?;
         conf.normalize_split_web_ports();
         conf.transfer.init()?;
+        conf.discovery.init(&conf.cluster_id)?;
         conf.resolve_master_addrs();
         Ok(conf)
     }
@@ -122,6 +125,7 @@ impl ClusterConf {
         conf.apply_transfer_hostname_overrides()?;
         conf.client.init()?;
         conf.transfer.init()?;
+        conf.discovery.init(&conf.cluster_id)?;
         conf.resolve_master_addrs();
         Ok(conf)
     }
@@ -132,6 +136,7 @@ impl ClusterConf {
     }
 
     fn normalize_whitespace(&mut self) {
+        self.cluster_id = self.cluster_id.trim().to_string();
         self.net_interface = self.net_interface.trim().to_string();
         self.master.hostname = self.master.hostname.trim().to_string();
         self.mds.hostname = self.mds.hostname.trim().to_string();
@@ -561,6 +566,7 @@ impl Default for ClusterConf {
             transfer: Default::default(),
             cli: Default::default(),
             web: Default::default(),
+            discovery: Default::default(),
         }
     }
 }
@@ -672,6 +678,18 @@ mod tests {
     use super::ClusterConf;
     use crate::RaftPeer;
     use curvine_runtime::common::Utils;
+
+    #[test]
+    fn normalize_whitespace_trims_cluster_id() {
+        let mut conf = ClusterConf {
+            cluster_id: " curvine ".to_string(),
+            ..Default::default()
+        };
+
+        conf.normalize_whitespace();
+
+        assert_eq!(conf.cluster_id, "curvine");
+    }
 
     // The loopback interface is present on every supported host and always
     // carries 127.0.0.1, so it is a stable target for the happy path.
