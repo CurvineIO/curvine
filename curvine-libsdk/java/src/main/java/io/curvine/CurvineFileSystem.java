@@ -55,7 +55,8 @@ public class CurvineFileSystem extends FileSystem {
 
     /**
      * Global cache for CurvineFsMount instances to avoid creating too many Tokio runtimes.
-     * Key: master_addrs (e.g., "master-0:8995")
+     * Key: master_addrs plus client mode (enable_unified_fs / enable_rust_read_ufs).
+     * Native conf is frozen at mount construction, so different modes cannot share a handle.
      * Value: CachedMount containing the shared CurvineFsMount and reference count
      */
     private static final ConcurrentHashMap<String, CachedMount> MOUNT_CACHE = new ConcurrentHashMap<>();
@@ -145,19 +146,30 @@ public class CurvineFileSystem extends FileSystem {
 
         this.uri = URI.create(name.getScheme() + "://" + authority);
         this.workingDir = getHomeDirectory();
-        
-        this.cacheKey = filesystemConf.master_addrs;
+
+        this.cacheKey = mountCacheKey(filesystemConf);
         this.libFs = getOrCreateMount(filesystemConf);
     }
-    
+
+    /**
+     * Isolate native mounts by Master address and client mode.
+     * Same master_addrs with different enable_unified_fs / enable_rust_read_ufs
+     * must not reuse a CurvineFsMount whose conf was already frozen into native.
+     */
+    static String mountCacheKey(FilesystemConf conf) {
+        return conf.master_addrs
+                + "|unified=" + conf.enable_unified_fs
+                + "|rust_ufs=" + conf.enable_rust_read_ufs;
+    }
+
     /**
      * Get or create a cached CurvineFsMount instance.
      * Lookup and refcount update both happen under the cache lock: an entry that is
      * still in the cache is always open, so no caller can ever observe a closed
-     * mount (no use-after-free) and exactly one instance is created per master_addrs.
+     * mount (no use-after-free). One instance is created per cache key (Master + client mode).
      */
     private CurvineFsMount getOrCreateMount(FilesystemConf conf) throws IOException {
-        String key = conf.master_addrs;
+        String key = mountCacheKey(conf);
 
         synchronized (MOUNT_CACHE) {
             CachedMount cached = MOUNT_CACHE.get(key);
