@@ -422,6 +422,9 @@ impl FuseConf {
     /// Delegates to the workspace-wide [`crate::validation`] audit and filters
     /// to this section, so semantics stay in lockstep with full-document
     /// auditing (same skip-field and alias treatment).
+    /// Parses raw cluster TOML text and returns the unrecognized keys found
+    /// under the `[fuse]` table. Delegates to the workspace-wide
+    /// [`crate::validation`] audit and filters to this section.
     pub fn unrecognized_fuse_keys_from_toml(raw: &str) -> CommonResult<Vec<String>> {
         Ok(crate::validation::audit_unknown_keys(raw)?
             .into_iter()
