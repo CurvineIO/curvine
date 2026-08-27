@@ -20,7 +20,6 @@ import java.net.URI;
 import java.nio.file.DirectoryNotEmptyException;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.classification.InterfaceAudience;
@@ -60,30 +59,34 @@ public class CurvineFileSystem extends FileSystem {
      * Value: CachedMount containing the shared CurvineFsMount and reference count
      */
     private static final ConcurrentHashMap<String, CachedMount> MOUNT_CACHE = new ConcurrentHashMap<>();
-    
+
     private static class CachedMount {
         final CurvineFsMount mount;
-        final AtomicInteger refCount;
-        
+        int refCount;
+        private boolean closed;
+
         CachedMount(CurvineFsMount mount) {
             this.mount = mount;
-            this.refCount = new AtomicInteger(1);
+            this.refCount = 1;
         }
-    }
-    
-    static {
-        // Register shutdown hook to clean up all cached mounts
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            LOGGER.info("Shutting down CurvineFileSystem, closing {} cached mounts", MOUNT_CACHE.size());
-            for (CachedMount cached : MOUNT_CACHE.values()) {
-                try {
-                    cached.mount.close();
-                } catch (IOException e) {
-                    LOGGER.warn("Error closing cached mount", e);
-                }
+
+        /**
+         * Close the underlying mount exactly once; later calls are no-ops.
+         * The lock makes it idempotent against concurrent closes from multiple
+         * CurvineFileSystem instances sharing the mount, so the native handle
+         * is never released twice (double free).
+         */
+        synchronized void closeOnce() {
+            if (closed) {
+                return;
             }
-            MOUNT_CACHE.clear();
-        }));
+            closed = true;
+            try {
+                mount.close();
+            } catch (IOException e) {
+                LOGGER.warn("Error closing cached mount", e);
+            }
+        }
     }
 
     private CurvineFsMount libFs;
@@ -152,26 +155,21 @@ public class CurvineFileSystem extends FileSystem {
     
     /**
      * Get or create a cached CurvineFsMount instance.
-     * This method is thread-safe and ensures only one mount is created per master_addrs.
+     * Lookup and refcount update both happen under the cache lock: an entry that is
+     * still in the cache is always open, so no caller can ever observe a closed
+     * mount (no use-after-free) and exactly one instance is created per master_addrs.
      */
     private CurvineFsMount getOrCreateMount(FilesystemConf conf) throws IOException {
         String key = conf.master_addrs;
-        
-        CachedMount cached = MOUNT_CACHE.get(key);
-        if (cached != null) {
-            cached.refCount.incrementAndGet();
-            LOGGER.debug("Reusing cached CurvineFsMount for {}, refCount={}", key, cached.refCount.get());
-            return cached.mount;
-        }
-        
+
         synchronized (MOUNT_CACHE) {
-            cached = MOUNT_CACHE.get(key);
+            CachedMount cached = MOUNT_CACHE.get(key);
             if (cached != null) {
-                cached.refCount.incrementAndGet();
-                LOGGER.debug("Reusing cached CurvineFsMount for {} (after lock), refCount={}", key, cached.refCount.get());
+                cached.refCount++;
+                LOGGER.debug("Reusing cached CurvineFsMount for {}, refCount={}", key, cached.refCount);
                 return cached.mount;
             }
-            
+
             LOGGER.info("Creating new cached CurvineFsMount for {}", key);
             CurvineFsMount newMount = new CurvineFsMount(conf);
             MOUNT_CACHE.put(key, new CachedMount(newMount));
@@ -321,15 +319,18 @@ public class CurvineFileSystem extends FileSystem {
 
     @Override
     public void close() throws IOException {
-        // Don't close the shared mount, just decrement reference count
         if (libFs != null && cacheKey != null) {
-            CachedMount cached = MOUNT_CACHE.get(cacheKey);
-            if (cached != null) {
-                int remaining = cached.refCount.decrementAndGet();
-                LOGGER.debug("Closing CurvineFileSystem for {}, remaining refCount={}", cacheKey, remaining);
-                // Note: We don't remove from cache even when refCount reaches 0
-                // because new FileSystem instances may be created later.
-                // The mount will be cleaned up by the shutdown hook.
+            CachedMount cached;
+            boolean last;
+            synchronized (MOUNT_CACHE) {
+                cached = MOUNT_CACHE.get(cacheKey);
+                last = cached != null && --cached.refCount <= 0;
+                if (last) {
+                    MOUNT_CACHE.remove(cacheKey);
+                }
+            }
+            if (last) {
+                cached.closeOnce();
             }
             libFs = null;
         }
