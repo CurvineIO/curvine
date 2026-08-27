@@ -66,6 +66,8 @@ public class CurvineInputStream extends FSInputStream {
 
     @Override
     public int read(@Nonnull byte[] buf, int offset, int length) throws IOException {
+        checkClosed();
+
         if (length == 0) {
             return 0;
         } else if (pos < 0) {
@@ -73,8 +75,6 @@ public class CurvineInputStream extends FSInputStream {
         } else if (pos >= fileSize) {
             return -1;
         }
-
-        checkClosed();
 
         if (buf.length - offset < length) {
             throw new IndexOutOfBoundsException(
