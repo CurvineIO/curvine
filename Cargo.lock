@@ -2538,10 +2538,15 @@ dependencies = [
 name = "curvine-mds"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
  "curvine-config",
  "curvine-core-error",
+ "curvine-metrics",
  "curvine-runtime",
+ "fastrand 1.9.0",
  "log",
+ "once_cell",
+ "thiserror 1.0.69",
  "tokio",
 ]
 
