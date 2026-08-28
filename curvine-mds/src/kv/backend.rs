@@ -285,11 +285,12 @@ where
     }
 }
 
-/// Exponential backoff capped at ~100ms. Attempt 0 does not sleep.
+/// Exponential backoff capped at 100ms. Attempt 0 does not sleep.
 async fn backoff(attempt: u32) {
     if attempt == 0 {
         return;
     }
-    let millis = (1u64 << attempt.min(6)).min(100);
+    // 1<<7 = 128 lets the 100ms cap actually take effect (1<<6 = 64 never would).
+    let millis = (1u64 << attempt.min(7)).min(100);
     tokio::time::sleep(Duration::from_millis(millis)).await;
 }
