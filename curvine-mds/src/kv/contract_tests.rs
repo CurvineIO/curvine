@@ -239,12 +239,73 @@ async fn snapshot_read_does_not_conflict(be: Arc<dyn KvBackend>) {
     assert!(matches!(txn.commit().await, Err(KvError::Conflict)));
 }
 
+/// A concurrent delete of a read key must conflict, exactly like an overwrite
+/// (a delete is a write; the reader depended on the key's existence).
+async fn concurrent_delete_of_read_key_conflicts(be: Arc<dyn KvBackend>) {
+    be.put(&b("d"), &b("live")).await.unwrap();
+
+    // T1 reads d (adds it to the conflict set) but has not committed yet.
+    let mut txn = be.begin().await.unwrap();
+    assert_eq!(txn.get(&b("d")).await.unwrap(), Some(b("live")));
+
+    // T2 concurrently deletes d and commits.
+    be.delete(&b("d")).await.unwrap();
+
+    // T1 writes an unrelated key and must conflict: d was changed concurrently.
+    txn.put(&b("other"), &b("x"));
+    let err = txn.commit().await.unwrap_err();
+    assert!(matches!(err, KvError::Conflict));
+
+    assert_eq!(be.get(&b("d")).await.unwrap(), None);
+    assert_eq!(be.get(&b("other")).await.unwrap(), None);
+}
+
+/// Two blind writers (no reads) to the same key BOTH succeed: last-writer-wins.
+/// This matches FDB, where a conflict requires a write range to intersect
+/// another txn's *read* range; validating write sets here would make the memory
+/// backend stricter than FDB.
+async fn blind_write_write_does_not_conflict(be: Arc<dyn KvBackend>) {
+    let mut t1 = be.begin().await.unwrap();
+    let mut t2 = be.begin().await.unwrap();
+
+    t1.put(&b("k"), &b("t1"));
+    t2.put(&b("k"), &b("t2"));
+
+    // Both commits succeed (no read-write conflict); the later commit wins.
+    t1.commit().await.unwrap();
+    t2.commit().await.unwrap();
+
+    assert_eq!(be.get(&b("k")).await.unwrap(), Some(b("t2")));
+}
+
+/// Reads observe the begin snapshot: keys written by another txn after begin
+/// are invisible to `get` / `snapshot_get` in the older txn.
+async fn reads_observe_begin_snapshot(be: Arc<dyn KvBackend>) {
+    be.put(&b("v"), &b("v0")).await.unwrap();
+
+    let mut txn = be.begin().await.unwrap();
+
+    // A concurrent writer changes v and creates a new key AFTER begin.
+    be.put(&b("v"), &b("v1")).await.unwrap();
+    be.put(&b("absent_key"), &b("now_here")).await.unwrap();
+
+    // T1 still sees the begin-time snapshot.
+    assert_eq!(txn.snapshot_get(&b("v")).await.unwrap(), Some(b("v0")));
+    assert_eq!(txn.snapshot_get(&b("absent_key")).await.unwrap(), None);
+
+    // Snapshot reads carry no conflict, so an unrelated write commits fine.
+    txn.put(&b("unrelated"), &b("ok"));
+    txn.commit().await.unwrap();
+    assert_eq!(be.get(&b("unrelated")).await.unwrap(), Some(b("ok")));
+}
+
 // ----- error semantics / classification -----
 
 fn error_classification() {
     assert!(KvError::Conflict.is_retryable());
-    assert!(KvError::MaybeCommitted.is_retryable());
     assert!(KvError::Timeout.is_retryable());
+    // MaybeCommitted is NOT retryable: the write may already have applied.
+    assert!(!KvError::MaybeCommitted.is_retryable());
     assert!(!KvError::Aborted("a".into()).is_retryable());
     assert!(!KvError::Backend("b".into()).is_retryable());
 }
@@ -266,6 +327,9 @@ where
     compare_and_set_semantics(factory()).await;
     concurrent_write_conflict(factory()).await;
     snapshot_read_does_not_conflict(factory()).await;
+    concurrent_delete_of_read_key_conflicts(factory()).await;
+    blind_write_write_does_not_conflict(factory()).await;
+    reads_observe_begin_snapshot(factory()).await;
     error_classification();
 }
 
@@ -327,6 +391,81 @@ async fn memory_terminal_error_is_not_retried() {
     })
     .await;
     assert!(matches!(out, Err(KvError::Backend(_))));
-    // Exactly one terminal error consumed; the second remains queued.
-    faults.fail_next(crate::kv::metrics::op::GET, KvError::Timeout);
+
+    // The second terminal error is still queued, so a second run_txn also
+    // fails immediately — proving run_txn consumed exactly one, not retried.
+    let out2: Result<(), KvError> = run_txn(&be, DEFAULT_MAX_RETRIES, move |txn| {
+        Box::pin(async move {
+            txn.put(b"k".as_ref(), b"v".as_ref());
+            Ok(())
+        })
+    })
+    .await;
+    assert!(matches!(out2, Err(KvError::Backend(_))));
+
+    // Both drained; the next commit succeeds.
+    be.put(&b("k"), &b("v")).await.unwrap();
+    assert_eq!(be.get(&b("k")).await.unwrap(), Some(b("v")));
+}
+
+#[tokio::test]
+async fn memory_maybe_committed_is_not_auto_retried() {
+    // MaybeCommitted must propagate, not be silently retried (the write may
+    // already have applied).
+    let be = MemoryBackend::new();
+    let faults = be.faults();
+    faults.fail_next(crate::kv::metrics::op::COMMIT, KvError::MaybeCommitted);
+
+    let out: Result<(), KvError> = run_txn(&be, DEFAULT_MAX_RETRIES, move |txn| {
+        Box::pin(async move {
+            txn.put(b"k".as_ref(), b"v".as_ref());
+            Ok(())
+        })
+    })
+    .await;
+    assert!(matches!(out, Err(KvError::MaybeCommitted)));
+}
+
+#[tokio::test]
+async fn memory_apply_then_unknown_does_not_double_increment() {
+    // FDB commit_unknown_result where the write landed: a run_txn increment
+    // must not be retried, or the counter advances twice.
+    let be = MemoryBackend::new();
+    let faults = be.faults();
+    be.put(&b("ctr"), &b("0")).await.unwrap();
+    faults.apply_then_unknown_next(1);
+
+    let key = b("ctr");
+    let out: Result<i64, KvError> = run_txn(&be, DEFAULT_MAX_RETRIES, move |txn| {
+        let key = key.clone();
+        Box::pin(async move {
+            let cur: i64 = txn
+                .get(&key)
+                .await?
+                .map(|v| String::from_utf8(v).unwrap().parse().unwrap())
+                .unwrap_or(0);
+            txn.put(&key, (cur + 1).to_string().as_bytes());
+            Ok(cur + 1)
+        })
+    })
+    .await;
+
+    // Unknown result surfaced, write applied exactly once (ctr == 1, not 2).
+    assert!(matches!(out, Err(KvError::MaybeCommitted)));
+    assert_eq!(be.get(&b("ctr")).await.unwrap(), Some(b("1")));
+}
+
+#[tokio::test]
+async fn memory_apply_then_unknown_does_not_flip_successful_cas() {
+    // A create-if-absent CAS whose commit lands but returns MaybeCommitted must
+    // surface the unknown result, not be retried into a false `Ok(false)`.
+    let be = MemoryBackend::new();
+    let faults = be.faults();
+    faults.apply_then_unknown_next(1);
+
+    let out = be.compare_and_set(&b("cas"), None, Some(&b("v1"))).await;
+
+    // Unknown result surfaced, value written exactly once.
+    assert!(matches!(out, Err(KvError::MaybeCommitted)));
+    assert_eq!(be.get(&b("cas")).await.unwrap(), Some(b("v1")));
 }

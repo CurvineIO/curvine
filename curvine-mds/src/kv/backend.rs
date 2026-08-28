@@ -94,43 +94,55 @@ pub trait KvBackend: Send + Sync {
     /// Starts a new transaction.
     async fn begin(&self) -> KvResult<Box<dyn KvTransaction>>;
 
-    /// Point read of a single key.
+    /// Point read of a single key. Tracks the key in the read-conflict set and
+    /// is wrapped in [`run_txn`], so a concurrent change during the read is
+    /// retried; `Conflict` surfaces only if it persists past
+    /// `DEFAULT_MAX_RETRIES` (a pathological write hotspot).
+    /// Use [`snapshot_get`](KvBackend::snapshot_get) for a conflict-free read.
     async fn get(&self, key: &[u8]) -> KvResult<Option<Vec<u8>>> {
-        let mut txn = self.begin().await?;
-        let value = txn.get(key).await?;
-        txn.commit().await?;
-        Ok(value)
+        let key = key.to_vec();
+        run_txn(self, DEFAULT_MAX_RETRIES, |txn| {
+            let key = key.clone();
+            Box::pin(async move { txn.get(&key).await })
+        })
+        .await
     }
 
-    /// Point snapshot read of a single key (no read-conflict tracking).
-    ///
-    /// See [`KvTransaction::snapshot_get`]. In a standalone transaction the
-    /// conflict set is irrelevant so this matches [`get`](KvBackend::get); it
-    /// exists so callers can express intent that carries through when the read
-    /// later moves inside a larger transaction.
+    /// Point snapshot read of a single key: reads the begin snapshot WITHOUT
+    /// read-conflict tracking, then rolls back. Never conflicts and never
+    /// retries. See [`KvTransaction::snapshot_get`].
     async fn snapshot_get(&self, key: &[u8]) -> KvResult<Option<Vec<u8>>> {
         let mut txn = self.begin().await?;
-        let value = txn.snapshot_get(key).await?;
-        txn.commit().await?;
-        Ok(value)
+        let out = txn.snapshot_get(key).await;
+        txn.rollback();
+        out
     }
 
-    /// Batch read of many keys in a single transaction.
+    /// Batch read of many keys. Like [`get`](KvBackend::get), tracks the keys
+    /// and is wrapped in [`run_txn`] so concurrent changes are retried.
     async fn multi_get(&self, keys: &[Vec<u8>]) -> KvResult<Vec<Option<Vec<u8>>>> {
-        let mut txn = self.begin().await?;
-        let values = txn.multi_get(keys).await?;
-        txn.commit().await?;
-        Ok(values)
+        let keys = keys.to_vec();
+        run_txn(self, DEFAULT_MAX_RETRIES, |txn| {
+            let keys = keys.clone();
+            Box::pin(async move { txn.multi_get(&keys).await })
+        })
+        .await
     }
 
-    /// Point write of a single key.
+    /// Point write of a single key. Wrapped in [`run_txn`] so a transient
+    /// conflict is retried instead of surfaced.
     async fn put(&self, key: &[u8], value: &[u8]) -> KvResult<()> {
+        let key = key.to_vec();
+        let value = value.to_vec();
         let start = std::time::Instant::now();
-        let result = async {
-            let mut txn = self.begin().await?;
-            txn.put(key, value);
-            txn.commit().await
-        }
+        let result = run_txn(self, DEFAULT_MAX_RETRIES, |txn| {
+            let key = key.clone();
+            let value = value.clone();
+            Box::pin(async move {
+                txn.put(&key, &value);
+                Ok(())
+            })
+        })
         .await;
         metrics::metrics().observe(self.name(), metrics::op::PUT, start, &result);
         result
@@ -138,12 +150,15 @@ pub trait KvBackend: Send + Sync {
 
     /// Point delete of a single key.
     async fn delete(&self, key: &[u8]) -> KvResult<()> {
+        let key = key.to_vec();
         let start = std::time::Instant::now();
-        let result = async {
-            let mut txn = self.begin().await?;
-            txn.delete(key);
-            txn.commit().await
-        }
+        let result = run_txn(self, DEFAULT_MAX_RETRIES, |txn| {
+            let key = key.clone();
+            Box::pin(async move {
+                txn.delete(&key);
+                Ok(())
+            })
+        })
         .await;
         metrics::metrics().observe(self.name(), metrics::op::DELETE, start, &result);
         result
@@ -151,14 +166,17 @@ pub trait KvBackend: Send + Sync {
 
     /// Batch delete of many keys in a single transaction.
     async fn batch_delete(&self, keys: &[Vec<u8>]) -> KvResult<()> {
+        let keys = keys.to_vec();
         let start = std::time::Instant::now();
-        let result = async {
-            let mut txn = self.begin().await?;
-            for key in keys {
-                txn.delete(key);
-            }
-            txn.commit().await
-        }
+        let result = run_txn(self, DEFAULT_MAX_RETRIES, |txn| {
+            let keys = keys.clone();
+            Box::pin(async move {
+                for key in &keys {
+                    txn.delete(key);
+                }
+                Ok(())
+            })
+        })
         .await;
         metrics::metrics().observe(self.name(), metrics::op::BATCH_DELETE, start, &result);
         result
@@ -188,10 +206,9 @@ pub trait KvBackend: Send + Sync {
             Box::pin(async move {
                 let current = txn.get(&key).await?;
                 if current.as_deref() != expected.as_deref() {
-                    // Precondition failed; nothing to write. Add the key to the
-                    // conflict set so a concurrent change still forces a retry
-                    // rather than a stale `false`.
-                    txn.add_read_conflict(&key);
+                    // `txn.get` already added `key` to the read-conflict set,
+                    // so a concurrent change still forces a retry, not a stale
+                    // `false`.
                     return Ok(false);
                 }
                 match &new {
@@ -217,16 +234,15 @@ pub const DEFAULT_MAX_RETRIES: u32 = 16;
 
 /// Runs a transaction closure with automatic retry on retryable errors.
 ///
-/// The closure receives a fresh, mutable transaction on each attempt and must
-/// perform all of its reads and buffered writes on it, returning the value to
-/// hand back on success. `run_txn` commits the transaction; if either the
-/// closure or the commit returns a retryable error ([`KvError::is_retryable`])
-/// it re-runs the closure on a brand-new transaction, up to `max_retries`
-/// times, with a short exponential backoff. Terminal errors propagate
-/// immediately.
+/// The closure gets a fresh transaction on each attempt and returns the value
+/// to hand back on success. `run_txn` commits it; if `begin`, the closure, or
+/// the commit returns an [`KvError::is_retryable`] error it re-runs on a
+/// new transaction, up to `max_retries` times with exponential backoff.
 ///
-/// The closure is `Fn` (not `FnMut`) because it may be invoked multiple times;
-/// keep it free of external mutable state that must not be repeated.
+/// Retry excludes [`KvError::MaybeCommitted`] (the write may already have
+/// applied); it and all terminal errors propagate unchanged. The closure is
+/// `Fn` because it may run multiple times — keep it free of external mutable
+/// state that must not be repeated.
 pub async fn run_txn<B, F, T>(backend: &B, max_retries: u32, f: F) -> KvResult<T>
 where
     B: KvBackend + ?Sized,
@@ -236,18 +252,22 @@ where
 {
     let mut attempt: u32 = 0;
     loop {
-        let mut txn: Box<dyn KvTransaction> = backend.begin().await?;
-        let result = {
-            let txn_ref = txn.as_mut();
-            f(txn_ref).await
-        };
-
-        let outcome = match result {
-            Ok(value) => txn.commit().await.map(|_| value),
-            Err(error) => {
-                txn.rollback();
-                Err(error)
+        // begin() failures are folded into the same retry budget.
+        let outcome = match backend.begin().await {
+            Ok(mut txn) => {
+                let result = {
+                    let txn_ref = txn.as_mut();
+                    f(txn_ref).await
+                };
+                match result {
+                    Ok(value) => txn.commit().await.map(|_| value),
+                    Err(error) => {
+                        txn.rollback();
+                        Err(error)
+                    }
+                }
             }
+            Err(error) => Err(error),
         };
 
         match outcome {

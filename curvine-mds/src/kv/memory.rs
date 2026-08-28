@@ -38,13 +38,18 @@ const BACKEND_NAME: &str = "memory";
 
 #[derive(Clone)]
 struct Entry {
-    value: Vec<u8>,
+    /// `Some` = live value, `None` = tombstone. Deletes keep a version-bumped
+    /// tombstone (never remove the key) so a concurrent delete of a read key
+    /// is detected as a conflict, matching FDB.
+    value: Option<Vec<u8>>,
     version: u64,
 }
 
 #[derive(Default)]
 struct Store {
-    data: BTreeMap<Vec<u8>, Entry>,
+    /// Behind an `Arc` so `begin` captures a cheap immutable read snapshot;
+    /// `commit` copy-on-writes via `Arc::make_mut`.
+    data: Arc<BTreeMap<Vec<u8>, Entry>>,
     /// Global version clock; the seq of the most recent commit.
     seq: u64,
 }
@@ -66,6 +71,9 @@ struct FaultState {
     queued: HashMap<&'static str, VecDeque<KvError>>,
     /// Probability in `[0.0, 1.0]` that any given commit returns a conflict.
     commit_conflict_prob: f64,
+    /// Number of upcoming commits that must APPLY and THEN return
+    /// [`KvError::MaybeCommitted`] (FDB `commit_unknown_result`).
+    commit_apply_then_unknown: u32,
 }
 
 impl FaultInjector {
@@ -92,11 +100,20 @@ impl FaultInjector {
         self.inner.lock().unwrap().commit_conflict_prob = prob.clamp(0.0, 1.0);
     }
 
+    /// Arms the next `count` commits to APPLY their writes and then return
+    /// [`KvError::MaybeCommitted`] (FDB `commit_unknown_result`). Unlike
+    /// `fail_next(COMMIT, MaybeCommitted)`, which fails before applying, this
+    /// exercises the "write landed but result unknown" path.
+    pub fn apply_then_unknown_next(&self, count: u32) {
+        self.inner.lock().unwrap().commit_apply_then_unknown = count;
+    }
+
     /// Clears all queued faults and resets the conflict probability.
     pub fn reset(&self) {
         let mut state = self.inner.lock().unwrap();
         state.queued.clear();
         state.commit_conflict_prob = 0.0;
+        state.commit_apply_then_unknown = 0;
     }
 
     fn take(&self, op: &'static str) -> Option<KvError> {
@@ -107,6 +124,17 @@ impl FaultInjector {
     fn maybe_commit_conflict(&self) -> bool {
         let prob = self.inner.lock().unwrap().commit_conflict_prob;
         prob > 0.0 && fastrand::f64() < prob
+    }
+
+    /// Consumes one armed apply-then-unknown token.
+    fn take_apply_then_unknown(&self) -> bool {
+        let mut state = self.inner.lock().unwrap();
+        if state.commit_apply_then_unknown > 0 {
+            state.commit_apply_then_unknown -= 1;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -146,9 +174,15 @@ impl MemoryBackend {
         self.faults.clone()
     }
 
-    /// Number of keys currently stored (test/debug helper).
+    /// Number of live keys (test/debug helper); tombstones are not counted.
     pub fn len(&self) -> usize {
-        self.store.lock().unwrap().data.len()
+        self.store
+            .lock()
+            .unwrap()
+            .data
+            .values()
+            .filter(|e| e.value.is_some())
+            .count()
     }
 
     /// Returns `true` when the store is empty.
@@ -174,13 +208,17 @@ impl KvBackend for MemoryBackend {
             );
             return Err(error);
         }
-        let read_version = self.store.lock().unwrap().seq;
+        let (read_version, snapshot) = {
+            let store = self.store.lock().unwrap();
+            (store.seq, store.data.clone())
+        };
         metrics::metrics().observe(BACKEND_NAME, metrics::op::BEGIN, start, &Ok(()));
         metrics::metrics().txn_in_flight.inc();
         Ok(Box::new(MemTxn {
             store: self.store.clone(),
             faults: self.faults.clone(),
             read_version,
+            snapshot,
             reads: HashMap::new(),
             writes: BTreeMap::new(),
             finished: false,
@@ -196,6 +234,9 @@ struct MemTxn {
     faults: FaultInjector,
     /// Snapshot version captured at begin.
     read_version: u64,
+    /// Immutable committed-store snapshot captured at begin; all reads observe
+    /// this, so concurrent writes after begin are invisible (snapshot isolation).
+    snapshot: Arc<BTreeMap<Vec<u8>, Entry>>,
     /// Keys read (point) whose version must not have advanced by commit.
     reads: HashMap<Vec<u8>, ()>,
     /// Buffered writes applied atomically at commit.
@@ -204,18 +245,13 @@ struct MemTxn {
 }
 
 impl MemTxn {
-    /// Reads a key honoring the transaction's own buffered writes first, then
-    /// the committed snapshot.
+    /// Reads buffered writes first, then the begin-time snapshot. A tombstone
+    /// reads back as absent.
     fn read_key(&self, key: &[u8]) -> Option<Vec<u8>> {
         if let Some(pending) = self.writes.get(key) {
             return pending.clone();
         }
-        self.store
-            .lock()
-            .unwrap()
-            .data
-            .get(key)
-            .map(|e| e.value.clone())
+        self.snapshot.get(key).and_then(|e| e.value.clone())
     }
 }
 
@@ -310,7 +346,9 @@ impl KvTransaction for MemTxn {
 
         let mut store = self.store.lock().unwrap();
 
-        // Conflict check: any read key advanced past our snapshot?
+        // Conflict check: any read key advanced past our snapshot? Tombstones
+        // keep a bumped version, so a concurrent delete is caught like an
+        // overwrite.
         for key in self.reads.keys() {
             if let Some(entry) = store.data.get(key) {
                 if entry.version > self.read_version {
@@ -326,23 +364,38 @@ impl KvTransaction for MemTxn {
                 }
             }
         }
-        // No conflict: bump the version clock and apply the write set atomically.
+        // No conflict: bump the version clock and apply the write set. Deletes
+        // write a tombstone rather than removing the key.
         if !self.writes.is_empty() {
             store.seq += 1;
             let version = store.seq;
             let writes = std::mem::take(&mut self.writes);
+            let data = Arc::make_mut(&mut store.data);
             for (key, pending) in writes {
-                match pending {
-                    Some(value) => {
-                        store.data.insert(key, Entry { value, version });
-                    }
-                    None => {
-                        store.data.remove(&key);
-                    }
-                }
+                data.insert(
+                    key,
+                    Entry {
+                        value: pending,
+                        version,
+                    },
+                );
             }
         }
         drop(store);
+
+        // Apply-then-unknown fault: writes have landed, but report
+        // MaybeCommitted (FDB commit_unknown_result). run_txn must NOT retry.
+        if self.faults.take_apply_then_unknown() {
+            let error = KvError::MaybeCommitted;
+            metrics::metrics().observe(
+                BACKEND_NAME,
+                metrics::op::COMMIT,
+                start,
+                &Err(error.clone()),
+            );
+            return Err(error);
+        }
+
         metrics::metrics().observe(BACKEND_NAME, metrics::op::COMMIT, start, &Ok(()));
         Ok(())
     }

@@ -24,9 +24,8 @@ pub enum KvError {
     Conflict,
 
     /// The commit result is unknown: the mutation may or may not have been
-    /// applied (maps to FDB `commit_unknown_result`). Only safe to retry when
-    /// the transaction body is idempotent; `run_txn` retries it because the
-    /// closure is re-run from a fresh read snapshot.
+    /// applied (maps to FDB `commit_unknown_result`). NOT retryable —
+    /// `run_txn` surfaces it to the caller, who owns the idempotency decision.
     #[error("commit result unknown, transaction may or may not have applied")]
     MaybeCommitted,
 
@@ -55,19 +54,15 @@ pub enum KvError {
 }
 
 impl KvError {
-    /// Returns `true` when re-running the transaction closure may succeed.
-    ///
-    /// This is the contract `run_txn` relies on. Terminal variants
-    /// (`Aborted`, `Backend`) return `false` so a genuine application or
-    /// storage error propagates immediately instead of spinning in a retry
-    /// loop.
+    /// Classifies whether `run_txn` may transparently re-run the closure.
+    /// Excludes `MaybeCommitted`: the mutation may already have applied, so
+    /// retrying a non-idempotent body would double-apply or flip a successful
+    /// CAS to `false`. Only commits that provably did not apply (`Conflict`) or
+    /// never decided (`Timeout`, `Unavailable`) are retryable.
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            KvError::Conflict
-                | KvError::MaybeCommitted
-                | KvError::Timeout
-                | KvError::Unavailable(_)
+            KvError::Conflict | KvError::Timeout | KvError::Unavailable(_)
         )
     }
 
@@ -94,11 +89,13 @@ mod tests {
 
     #[test]
     fn retryable_classification() {
+        // Auto-retryable: the commit provably did not apply or never decided.
         assert!(KvError::Conflict.is_retryable());
-        assert!(KvError::MaybeCommitted.is_retryable());
         assert!(KvError::Timeout.is_retryable());
         assert!(KvError::Unavailable("down".into()).is_retryable());
 
+        // Not retryable: the write may already have applied, or is terminal.
+        assert!(!KvError::MaybeCommitted.is_retryable());
         assert!(!KvError::Aborted("app".into()).is_retryable());
         assert!(!KvError::Backend("boom".into()).is_retryable());
     }
