@@ -194,6 +194,18 @@ mod tests {
     }
 
     #[test]
+    fn get_conf_splits_comma_separated_cli_options() {
+        // Wiring check: get_conf must route CLI --options through
+        // FuseConf::normalize_fuse_opts, which splits comma-separated values.
+        let conf = get_conf(
+            "[fuse]\nio_threads = 1\nfuse_opts = [\"allow_other\"]\n",
+            &["--options", "allow_other,nodev"],
+        );
+
+        assert_eq!(conf.fuse.fuse_opts, vec!["allow_other", "nodev"]);
+    }
+
+    #[test]
     fn generated_overrides_apply_io_threads() {
         let conf = get_conf("[fuse]\nio_threads = 1\n", &["--io-threads", "4"]);
         assert_eq!(conf.fuse.io_threads, 4);
