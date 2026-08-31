@@ -128,7 +128,10 @@ impl VfsDataset {
         let free_ratio = {
             let raw = conf.worker.free_ratio;
             if raw < 0.0 {
-                warn!("worker.free_ratio={} is negative; clamping to 0.0 (disabled)", raw);
+                warn!(
+                    "worker.free_ratio={} is negative; clamping to 0.0 (disabled)",
+                    raw
+                );
                 0.0
             } else if raw >= 1.0 {
                 warn!("worker.free_ratio={} >= 1.0; clamping to 0.99", raw);
@@ -866,7 +869,11 @@ mod test {
         let used = cap - cap / 20;
         let dir = spdk_dir_with(1, 0.0, used, cap);
 
-        assert_eq!(dir.available(), cap - used, "guard disabled -> normal accounting");
+        assert_eq!(
+            dir.available(),
+            cap - used,
+            "guard disabled -> normal accounting"
+        );
         assert!(dir.can_allocate(StorageType::SpdkDisk, 4096));
         Ok(())
     }
@@ -905,12 +912,12 @@ mod test {
             WorkerDataDir::from_str("[SSD:100MB]../testing/fs-free-ratio")?,
         )?;
         let r = dir.raw_free_ratio();
-        assert!(
-            r > 0.0 && r <= 1.0,
-            "raw_free_ratio {r} must be in (0, 1]"
-        );
+        assert!(r > 0.0 && r <= 1.0, "raw_free_ratio {r} must be in (0, 1]");
         // free_ratio defaults to 0.0 -> guard inactive, available positive.
-        assert!(dir.available() > 0, "available should be positive on fresh dir");
+        assert!(
+            dir.available() > 0,
+            "available should be positive on fresh dir"
+        );
         Ok(())
     }
 
