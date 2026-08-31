@@ -15,7 +15,7 @@
 use crate::worker::block::BlockStore;
 use crate::worker::storage::Dataset;
 use curvine_core_error::CommonResult;
-use curvine_metrics::{Counter, CounterVec, Gauge, HistogramVec, Metrics, Metrics as m};
+use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics, Metrics as m};
 use curvine_sys::SysUtils;
 use std::fmt::{Debug, Formatter};
 
@@ -44,6 +44,11 @@ pub struct WorkerMetrics {
     pub(crate) num_blocks: Gauge,
     pub(crate) store_total_disks: Gauge,
     pub(crate) num_blocks_to_delete: Gauge,
+
+    /// Per-directory free-space ratio (0.1 = 10%). Pre-reserved, pre-guard.
+    pub(crate) disk_free_ratio: GaugeVec,
+    /// Writes rejected because a data dir dropped below `free_ratio`.
+    pub(crate) disk_full_rejected_writes: Counter,
 
     pub(crate) used_memory_bytes: Gauge,
 }
@@ -95,6 +100,16 @@ impl WorkerMetrics {
                 "Number of blocks pending deletion on the worker",
             )?,
 
+            disk_free_ratio: m::new_gauge_vec(
+                "disk_free_ratio",
+                "Per-disk free-space ratio in basis points (10000 = 100%, 1000 = 10%); pre-reserved, pre-guard",
+                &["dir_id", "dir_path", "storage_type"],
+            )?,
+            disk_full_rejected_writes: m::new_counter(
+                "disk_full_rejected_writes",
+                "Writes rejected because a data dir dropped below free_ratio",
+            )?,
+
             used_memory_bytes: m::new_gauge("used_memory_bytes", "Total memory used")?,
         };
 
@@ -115,6 +130,14 @@ impl WorkerMetrics {
         self.used_memory_bytes.set(SysUtils::used_memory() as i64);
 
         self.store_total_disks.set(state.storage_count() as i64);
+
+        for d in state.dir_free_ratios() {
+            let dir_id = d.dir_id.to_string();
+            // Gauge is i64-only; report the ratio in basis points (ratio * 10000).
+            self.disk_free_ratio
+                .with_label_values(&[&dir_id, &d.dir_path, d.storage_type.as_str_name()])
+                .set((d.free_ratio * 10000.0) as i64);
+        }
 
         #[cfg(feature = "spdk")]
         if let Some(env) = curvine_storage_spdk::SpdkEnv::global_including_shutdown() {

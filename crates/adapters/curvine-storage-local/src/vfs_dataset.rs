@@ -14,8 +14,8 @@
 
 use crate::layout::FileFinalizePlan;
 use crate::{
-    BlockLayout, BlockLayoutKind, BlockLayouts, Dataset, DirList, FileLayout, SpdkMetaStore,
-    StorageRequest, StorageVersion, VfsDir, VfsMetaStore,
+    BlockLayout, BlockLayoutKind, BlockLayouts, Dataset, DirFreeRatio, DirList, FileLayout,
+    SpdkMetaStore, StorageRequest, StorageVersion, VfsDir, VfsMetaStore,
 };
 use crate::{BlockMeta, BlockState};
 use curvine_config::{ClusterConf, WorkerDataDir};
@@ -23,7 +23,7 @@ use curvine_core_error::{err_box, CommonResult};
 use curvine_model::{ExtendedBlock, StorageInfo, StorageType};
 use curvine_runtime::common::{ByteUnit, FileUtils, LocalTime, TimeSpent};
 use indexmap::map::Values;
-use log::info;
+use log::{info, warn};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -125,6 +125,18 @@ impl VfsDataset {
     pub fn from_conf(cluster_id: &str, conf: &ClusterConf) -> CommonResult<Self> {
         let mut dir_list = DirList::new(vec![])?;
         let dir_reserved = ByteUnit::from_str(&conf.worker.dir_reserved)?.as_byte();
+        let free_ratio = {
+            let raw = conf.worker.free_ratio;
+            if raw < 0.0 {
+                warn!("worker.free_ratio={} is negative; clamping to 0.0 (disabled)", raw);
+                0.0
+            } else if raw >= 1.0 {
+                warn!("worker.free_ratio={} >= 1.0; clamping to 0.99", raw);
+                0.99
+            } else {
+                raw
+            }
+        };
 
         let mut worker_id: Option<u32> = None;
         let mut has_spdk = false;
@@ -149,7 +161,7 @@ impl VfsDataset {
                 Some(v) => version.worker_id = v,
             }
 
-            let vfs_dir = VfsDir::new(version, data_dir, dir_reserved)?;
+            let vfs_dir = VfsDir::new(version, data_dir, dir_reserved, free_ratio)?;
             dir_list.add_dir(vfs_dir);
         }
 
@@ -558,6 +570,18 @@ impl Dataset for VfsDataset {
         self.dir_list.fs_used()
     }
 
+    fn dir_free_ratios(&self) -> Vec<DirFreeRatio> {
+        self.dir_list
+            .dir_iter()
+            .map(|dir| DirFreeRatio {
+                dir_id: dir.id(),
+                dir_path: dir.path_str().to_string(),
+                storage_type: dir.storage_type(),
+                free_ratio: dir.raw_free_ratio(),
+            })
+            .collect()
+    }
+
     fn num_blocks(&self) -> usize {
         self.meta.block_count()
     }
@@ -778,6 +802,7 @@ mod test {
             storage_type: StorageType::SpdkDisk,
             conf_capacity: 1 << 30,
             reserved_bytes: 0,
+            free_ratio: 0.0,
             final_bytes: AtomicLong::new(0),
             tmp_bytes: AtomicLong::new(0),
             state,
@@ -788,6 +813,105 @@ mod test {
     fn spdk_dataset() -> CommonResult<VfsDataset> {
         let st = spdk_state();
         VfsDataset::new("t", DirList::new(vec![spdk_dir(1, st)])?, None)
+    }
+
+    /// SPDK dir with controllable capacity, used bytes, and free_ratio, so the
+    /// guard can be exercised deterministically without a real bdev.
+    fn spdk_dir_with(dir_id: u32, free_ratio: f64, used_bytes: i64, capacity: i64) -> VfsDir {
+        let mut version = StorageVersion::with_cluster("t");
+        version.dir_id = dir_id;
+        let state = Arc::new(DirState {
+            bdev_name: Some("nvme0".into()),
+            bdev_capacity: capacity,
+            offset_alloc: DirState::new_offset_alloc(StorageType::SpdkDisk, capacity, 4096),
+        });
+        VfsDir {
+            version,
+            stats: FsStats::new("/tmp"),
+            storage_type: StorageType::SpdkDisk,
+            conf_capacity: capacity,
+            reserved_bytes: 0,
+            free_ratio,
+            final_bytes: AtomicLong::new(used_bytes),
+            tmp_bytes: AtomicLong::new(0),
+            state,
+            check_failed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[test]
+    fn spdk_free_ratio_gate_blocks_when_below_threshold() -> CommonResult<()> {
+        // 1 GiB device, 95% used -> free ratio 0.05 < 0.1 floor.
+        let cap = 1 << 30;
+        let used = cap - cap / 20;
+        let dir = spdk_dir_with(1, 0.1, used, cap);
+
+        assert!(dir.raw_free_ratio() < 0.1, "ratio should be below floor");
+        assert_eq!(
+            dir.available(),
+            0,
+            "available must be 0 when free ratio is below floor"
+        );
+        assert!(
+            !dir.can_allocate(StorageType::SpdkDisk, 4096),
+            "can_allocate must reject when gate is active"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn spdk_free_ratio_disabled_by_default() -> CommonResult<()> {
+        // Same 95% used, but free_ratio=0.0 disables the guard.
+        let cap = 1 << 30;
+        let used = cap - cap / 20;
+        let dir = spdk_dir_with(1, 0.0, used, cap);
+
+        assert_eq!(dir.available(), cap - used, "guard disabled -> normal accounting");
+        assert!(dir.can_allocate(StorageType::SpdkDisk, 4096));
+        Ok(())
+    }
+
+    #[test]
+    fn spdk_raw_free_ratio_value() -> CommonResult<()> {
+        let cap = 1 << 30;
+        let used = cap / 2; // 50% used
+        let dir = spdk_dir_with(1, 0.0, used, cap);
+        let r = dir.raw_free_ratio();
+        assert!((r - 0.5).abs() < 1e-9, "expected 0.5, got {r}");
+        Ok(())
+    }
+
+    #[test]
+    fn dir_free_ratios_reports_per_dir() -> CommonResult<()> {
+        let ds = spdk_dataset()?;
+        let ratios = ds.dir_free_ratios();
+        assert_eq!(ratios.len(), 1, "one spdk dir");
+        assert_eq!(ratios[0].dir_id, 1);
+        assert_eq!(ratios[0].storage_type, StorageType::SpdkDisk);
+        assert!(
+            ratios[0].free_ratio > 0.0 && ratios[0].free_ratio <= 1.0,
+            "free_ratio {} out of range",
+            ratios[0].free_ratio
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fs_raw_free_ratio_sane_and_default_disabled() -> CommonResult<()> {
+        use curvine_config::WorkerDataDir;
+        FileUtils::delete_path("../testing/fs-free-ratio", true)?;
+        let dir = VfsDir::from_dir(
+            "",
+            WorkerDataDir::from_str("[SSD:100MB]../testing/fs-free-ratio")?,
+        )?;
+        let r = dir.raw_free_ratio();
+        assert!(
+            r > 0.0 && r <= 1.0,
+            "raw_free_ratio {r} must be in (0, 1]"
+        );
+        // free_ratio defaults to 0.0 -> guard inactive, available positive.
+        assert!(dir.available() > 0, "available should be positive on fresh dir");
+        Ok(())
     }
 
     #[test]

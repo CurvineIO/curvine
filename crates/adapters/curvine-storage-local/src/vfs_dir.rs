@@ -39,6 +39,9 @@ pub struct VfsDir {
     pub(crate) storage_type: StorageType,
     pub(crate) conf_capacity: i64,
     pub(crate) reserved_bytes: i64,
+    /// Free-space ratio floor for write admission. `0.0` disables. See
+    /// `available()` guard and `raw_free_ratio()`.
+    pub(crate) free_ratio: f64,
     pub(crate) final_bytes: AtomicLong,
     pub(crate) tmp_bytes: AtomicLong,
     pub(crate) state: Arc<DirState>,
@@ -50,6 +53,7 @@ impl VfsDir {
         version: StorageVersion,
         conf: WorkerDataDir,
         reserved_bytes: u64,
+        free_ratio: f64,
     ) -> CommonResult<Self> {
         let stg_dir = if version.cluster_id.is_empty() {
             conf.path.clone()
@@ -133,6 +137,7 @@ impl VfsDir {
             storage_type: conf.storage_type,
             conf_capacity: conf.capacity as i64,
             reserved_bytes: reserved_bytes as i64,
+            free_ratio,
             final_bytes: AtomicLong::new(0),
             tmp_bytes: AtomicLong::new(0),
             state: Arc::new(state),
@@ -145,12 +150,12 @@ impl VfsDir {
     pub fn from_str<T: AsRef<str>>(id: T, conf: T) -> CommonResult<Self> {
         let dir = WorkerDataDir::from_str(conf.as_ref())?;
         let version = StorageVersion::with_cluster(id);
-        Self::new(version, dir, 0)
+        Self::new(version, dir, 0, 0.0)
     }
 
     pub fn from_dir<T: AsRef<str>>(id: T, dir: WorkerDataDir) -> CommonResult<Self> {
         let version = StorageVersion::with_cluster(id);
-        Self::new(version, dir, 0)
+        Self::new(version, dir, 0, 0.0)
     }
 
     pub fn id(&self) -> u32 {
@@ -182,6 +187,14 @@ impl VfsDir {
     }
 
     pub fn available(&self) -> i64 {
+        // free_ratio guard: when the directory's raw free ratio drops below the
+        // configured floor, treat it as unavailable so writes are rejected and
+        // the master stops allocating to this worker (via heartbeat available).
+        // `0.0` disables the guard. Applies to both FS and SPDK paths.
+        if self.free_ratio > 0.0 && self.raw_free_ratio() < self.free_ratio {
+            return 0;
+        }
+
         // SPDK: available = capacity - used - reserved (fs returns 0)
         if self.storage_type == StorageType::SpdkDisk {
             let capacity = self.capacity();
@@ -198,6 +211,35 @@ impl VfsDir {
         let calculated_available = capacity - fs_used - reserved_bytes;
 
         0.max(calculated_available.min(disk_available))
+    }
+
+    /// Raw free-space ratio of the underlying device, ignoring `reserved_bytes`
+    /// and the `free_ratio` guard. This is what the guard compares against and
+    /// what the `disk_free_ratio` metric reports.
+    ///
+    /// - Filesystem dirs: `available_space / total_space` (OS statvfs; reflects
+    ///   other applications consuming the shared device).
+    /// - SPDK raw-device dirs: `(capacity - used) / capacity`, where `capacity`
+    ///   is `min(conf_capacity, bdev_capacity)` and `used` is curvine's own
+    ///   `fs_used()` accounting.
+    pub fn raw_free_ratio(&self) -> f64 {
+        if self.storage_type == StorageType::SpdkDisk {
+            // No OS statvfs; ratio = (bdev capacity - curvine used) / bdev capacity.
+            let total = self.capacity();
+            if total <= 0 {
+                return 0.0;
+            }
+            let free = (total - self.fs_used()).max(0);
+            free as f64 / total as f64
+        } else {
+            // OS statvfs: reflects other applications consuming the shared device.
+            let total = self.stats.total_space();
+            if total == 0 {
+                return 0.0;
+            }
+            let free = self.stats.available_space();
+            (free as f64 / total as f64).min(1.0)
+        }
     }
 
     pub fn non_fs_used(&self) -> i64 {
@@ -422,7 +464,7 @@ mod test {
         let stg_dir = conf.storage_path("vfs-test");
         FileUtils::delete_path(stg_dir, true)?;
 
-        let dir = VfsDir::new(version, conf, 0)?;
+        let dir = VfsDir::new(version, conf, 0, 0.0)?;
         println!("dir.path_str() = {}", dir.path_str());
         assert_eq!(dir.available(), 100 * ByteUnit::MB as i64);
 

@@ -14,8 +14,20 @@
 
 use crate::BlockMeta;
 use curvine_core_error::{err_box, CommonResult};
-use curvine_model::ExtendedBlock;
+use curvine_model::{ExtendedBlock, StorageType};
 use curvine_runtime::common::ByteUnit;
+
+/// Snapshot of a single data directory's free-space ratio, for the
+/// `disk_free_ratio` worker metric.
+#[derive(Debug, Clone)]
+pub struct DirFreeRatio {
+    pub dir_id: u32,
+    pub dir_path: String,
+    pub storage_type: StorageType,
+    /// `available_space / total_space` (FS) or `(capacity - used) / capacity`
+    /// (SPDK), in `[0.0, 1.0]`. Pre-reserved, pre-guard.
+    pub free_ratio: f64,
+}
 
 // block data collection.
 pub trait Dataset {
@@ -40,6 +52,9 @@ pub trait Dataset {
     fn available_str(&self) -> String {
         ByteUnit::byte_to_string(self.available() as u64)
     }
+
+    /// Per-directory raw free-space ratios for the `disk_free_ratio` metric.
+    fn dir_free_ratios(&self) -> Vec<DirFreeRatio>;
 
     fn get_block(&self, id: i64) -> Option<&BlockMeta>;
 
