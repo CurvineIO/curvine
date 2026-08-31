@@ -53,9 +53,6 @@ pub trait Dataset {
         ByteUnit::byte_to_string(self.available() as u64)
     }
 
-    /// Per-directory raw free-space ratios for the `disk_free_ratio` metric.
-    fn dir_free_ratios(&self) -> Vec<DirFreeRatio>;
-
     fn get_block(&self, id: i64) -> Option<&BlockMeta>;
 
     // Create a new block.

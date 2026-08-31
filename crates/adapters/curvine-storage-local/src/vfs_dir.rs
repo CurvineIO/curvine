@@ -167,22 +167,20 @@ impl VfsDir {
     }
 
     pub fn capacity(&self) -> i64 {
-        // SPDK: use bdev capacity (fs returns 0 for non-existent path)
-        if self.storage_type == StorageType::SpdkDisk {
-            let bdev_cap = self.state.bdev_capacity;
-            return if self.conf_capacity <= 0 {
-                bdev_cap
-            } else {
-                self.conf_capacity.min(bdev_cap)
-            };
-        }
-
-        let disk_space = self.stats.total_space() as i64;
-
-        if self.conf_capacity <= 0 {
-            disk_space
+        // SPDK: use bdev capacity (fs returns 0 for non-existent path).
+        let physical_capacity = if self.storage_type == StorageType::SpdkDisk {
+            self.state.bdev_capacity
         } else {
-            self.conf_capacity.min(disk_space)
+            self.stats.total_space() as i64
+        };
+        self.capacity_from_physical(physical_capacity)
+    }
+
+    fn capacity_from_physical(&self, physical_capacity: i64) -> i64 {
+        if self.conf_capacity <= 0 {
+            physical_capacity
+        } else {
+            self.conf_capacity.min(physical_capacity)
         }
     }
 
@@ -190,27 +188,42 @@ impl VfsDir {
         // free_ratio guard: when the directory's raw free ratio drops below the
         // configured floor, treat it as unavailable so writes are rejected and
         // the master stops allocating to this worker (via heartbeat available).
-        // `0.0` disables the guard. Applies to both FS and SPDK paths.
-        if self.free_ratio > 0.0 && self.raw_free_ratio() < self.free_ratio {
-            return 0;
-        }
-
-        // SPDK: available = capacity - used - reserved (fs returns 0)
+        // `0.0` disables the guard. Compute each backend's capacity/free values
+        // once so the filesystem path performs only one total-space and one
+        // available-space query per call.
         if self.storage_type == StorageType::SpdkDisk {
             let capacity = self.capacity();
             let fs_used = self.fs_used();
-            let reserved_bytes = self.reserved_bytes;
-            return 0.max(capacity - fs_used - reserved_bytes);
+            let free = capacity.saturating_sub(fs_used).max(0);
+            if self.free_ratio > 0.0 && Self::calculate_free_ratio(free, capacity) < self.free_ratio
+            {
+                return 0;
+            }
+
+            return 0.max(free - self.reserved_bytes);
         }
 
+        let disk_total = self.stats.total_space() as i64;
         let disk_available = self.stats.available_space() as i64;
+        if self.free_ratio > 0.0
+            && Self::calculate_free_ratio(disk_available, disk_total) < self.free_ratio
+        {
+            return 0;
+        }
 
-        let capacity = self.capacity();
+        let capacity = self.capacity_from_physical(disk_total);
         let fs_used = self.fs_used();
-        let reserved_bytes = self.reserved_bytes;
-        let calculated_available = capacity - fs_used - reserved_bytes;
+        let calculated_available = capacity - fs_used - self.reserved_bytes;
 
         0.max(calculated_available.min(disk_available))
+    }
+
+    fn calculate_free_ratio(free: i64, total: i64) -> f64 {
+        if total <= 0 {
+            return 0.0;
+        }
+
+        (free.max(0) as f64 / total as f64).min(1.0)
     }
 
     /// Raw free-space ratio of the underlying device, ignoring `reserved_bytes`
@@ -226,19 +239,13 @@ impl VfsDir {
         if self.storage_type == StorageType::SpdkDisk {
             // No OS statvfs; ratio = (bdev capacity - curvine used) / bdev capacity.
             let total = self.capacity();
-            if total <= 0 {
-                return 0.0;
-            }
-            let free = (total - self.fs_used()).max(0);
-            free as f64 / total as f64
+            let free = total.saturating_sub(self.fs_used());
+            Self::calculate_free_ratio(free, total)
         } else {
             // OS statvfs: reflects other applications consuming the shared device.
-            let total = self.stats.total_space();
-            if total == 0 {
-                return 0.0;
-            }
-            let free = self.stats.available_space();
-            (free as f64 / total as f64).min(1.0)
+            let total = self.stats.total_space() as i64;
+            let free = self.stats.available_space() as i64;
+            Self::calculate_free_ratio(free, total)
         }
     }
 
@@ -427,6 +434,7 @@ mod test {
             storage_type: StorageType::SpdkDisk,
             conf_capacity: conf,
             reserved_bytes: 0,
+            free_ratio: 0.0,
             final_bytes: AtomicLong::new(0),
             tmp_bytes: AtomicLong::new(0),
             state: st,
@@ -449,6 +457,7 @@ mod test {
             storage_type: StorageType::Ssd,
             conf_capacity: 1 << 30,
             reserved_bytes: 0,
+            free_ratio: 0.0,
             final_bytes: AtomicLong::new(0),
             tmp_bytes: AtomicLong::new(0),
             state: st,

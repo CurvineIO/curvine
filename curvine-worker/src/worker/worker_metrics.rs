@@ -47,7 +47,7 @@ pub struct WorkerMetrics {
 
     /// Per-directory free-space ratio (0.1 = 10%). Pre-reserved, pre-guard.
     pub(crate) disk_free_ratio: GaugeVec,
-    /// Writes rejected because a data dir dropped below `free_ratio`.
+    /// Writes rejected because storage admission reported insufficient capacity.
     pub(crate) disk_full_rejected_writes: Counter,
 
     pub(crate) used_memory_bytes: Gauge,
@@ -107,7 +107,7 @@ impl WorkerMetrics {
             )?,
             disk_full_rejected_writes: m::new_counter(
                 "disk_full_rejected_writes",
-                "Writes rejected because a data dir dropped below free_ratio",
+                "Writes rejected because the storage layer reported insufficient capacity",
             )?,
 
             used_memory_bytes: m::new_gauge("used_memory_bytes", "Total memory used")?,

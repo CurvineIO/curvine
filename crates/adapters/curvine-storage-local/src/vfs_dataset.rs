@@ -28,6 +28,32 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+const MAX_FREE_RATIO: f64 = 1.0_f64.next_down();
+
+fn normalize_free_ratio(raw: f64) -> f64 {
+    if !raw.is_finite() {
+        warn!(
+            "worker.free_ratio={} is not finite; using 0.0 (disabled)",
+            raw
+        );
+        0.0
+    } else if raw < 0.0 {
+        warn!(
+            "worker.free_ratio={} is negative; using 0.0 (disabled)",
+            raw
+        );
+        0.0
+    } else if raw >= 1.0 {
+        warn!(
+            "worker.free_ratio={} >= 1.0; clamping to {}",
+            raw, MAX_FREE_RATIO
+        );
+        MAX_FREE_RATIO
+    } else {
+        raw
+    }
+}
+
 pub struct VfsDataset {
     cluster_id: String,
     worker_id: u32,
@@ -125,21 +151,7 @@ impl VfsDataset {
     pub fn from_conf(cluster_id: &str, conf: &ClusterConf) -> CommonResult<Self> {
         let mut dir_list = DirList::new(vec![])?;
         let dir_reserved = ByteUnit::from_str(&conf.worker.dir_reserved)?.as_byte();
-        let free_ratio = {
-            let raw = conf.worker.free_ratio;
-            if raw < 0.0 {
-                warn!(
-                    "worker.free_ratio={} is negative; clamping to 0.0 (disabled)",
-                    raw
-                );
-                0.0
-            } else if raw >= 1.0 {
-                warn!("worker.free_ratio={} >= 1.0; clamping to 0.99", raw);
-                0.99
-            } else {
-                raw
-            }
-        };
+        let free_ratio = normalize_free_ratio(conf.worker.free_ratio);
 
         let mut worker_id: Option<u32> = None;
         let mut has_spdk = false;
@@ -558,6 +570,19 @@ impl VfsDataset {
     pub fn storage_count(&self) -> usize {
         self.dir_list.len()
     }
+
+    /// Per-directory raw free-space ratios for the `disk_free_ratio` metric.
+    pub fn dir_free_ratios(&self) -> Vec<DirFreeRatio> {
+        self.dir_list
+            .dir_iter()
+            .map(|dir| DirFreeRatio {
+                dir_id: dir.id(),
+                dir_path: dir.path_str().to_string(),
+                storage_type: dir.storage_type(),
+                free_ratio: dir.raw_free_ratio(),
+            })
+            .collect()
+    }
 }
 
 impl Dataset for VfsDataset {
@@ -571,18 +596,6 @@ impl Dataset for VfsDataset {
 
     fn fs_used(&self) -> i64 {
         self.dir_list.fs_used()
-    }
-
-    fn dir_free_ratios(&self) -> Vec<DirFreeRatio> {
-        self.dir_list
-            .dir_iter()
-            .map(|dir| DirFreeRatio {
-                dir_id: dir.id(),
-                dir_path: dir.path_str().to_string(),
-                storage_type: dir.storage_type(),
-                free_ratio: dir.raw_free_ratio(),
-            })
-            .collect()
     }
 
     fn num_blocks(&self) -> usize {
@@ -754,6 +767,7 @@ impl Dataset for VfsDataset {
 
 #[cfg(test)]
 mod test {
+    use super::{normalize_free_ratio, MAX_FREE_RATIO};
     use crate::{
         BlockLayout, Dataset, DirList, DirState, FileLayout, SpdkMetaStore, StorageVersion,
         VfsDataset, VfsDir,
@@ -786,6 +800,27 @@ mod test {
             ..Default::default()
         };
         VfsDataset::from_conf("test", &conf).unwrap()
+    }
+
+    #[test]
+    fn normalize_free_ratio_preserves_valid_values() {
+        assert_eq!(normalize_free_ratio(0.0), 0.0);
+        assert_eq!(normalize_free_ratio(0.1), 0.1);
+        assert_eq!(normalize_free_ratio(0.5), 0.5);
+    }
+
+    #[test]
+    fn normalize_free_ratio_clamps_out_of_range_values() {
+        assert_eq!(normalize_free_ratio(-0.1), 0.0);
+        assert_eq!(normalize_free_ratio(1.0), MAX_FREE_RATIO);
+        assert_eq!(normalize_free_ratio(2.0), MAX_FREE_RATIO);
+    }
+
+    #[test]
+    fn normalize_free_ratio_disables_non_finite_values() {
+        assert_eq!(normalize_free_ratio(f64::NAN), 0.0);
+        assert_eq!(normalize_free_ratio(f64::INFINITY), 0.0);
+        assert_eq!(normalize_free_ratio(f64::NEG_INFINITY), 0.0);
     }
 
     fn spdk_state() -> Arc<DirState> {
