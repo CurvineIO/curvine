@@ -17,16 +17,19 @@ package io.curvine;
 /**
  * Request to submit a UFS-to-Curvine load job.
  *
- * <p>Aligned with CLI {@code cv load} / Rust {@code LoadJobCommand} minimal fields.
+ * <p>Aligned with Rust {@code LoadJobCommand}. When {@code replicas} is not set, the
+ * server-side mount/default configuration is used.
  */
 public final class LoadJobRequest {
     private final String sourcePath;
     private final String targetPath;
+    private final Integer replicas;
     private final boolean overwrite;
 
     private LoadJobRequest(Builder builder) {
         this.sourcePath = builder.sourcePath;
         this.targetPath = builder.targetPath;
+        this.replicas = builder.replicas;
         this.overwrite = builder.overwrite;
     }
 
@@ -37,6 +40,11 @@ public final class LoadJobRequest {
     /** Optional explicit CV target path; may be {@code null}. */
     public String getTargetPath() {
         return targetPath;
+    }
+
+    /** Optional per-job target replica count; {@code null} uses server defaults. */
+    public Integer getReplicas() {
+        return replicas;
     }
 
     public boolean isOverwrite() {
@@ -50,6 +58,7 @@ public final class LoadJobRequest {
     public static final class Builder {
         private String sourcePath;
         private String targetPath;
+        private Integer replicas;
         private boolean overwrite = true;
 
         private Builder() {
@@ -65,6 +74,11 @@ public final class LoadJobRequest {
             return this;
         }
 
+        public Builder replicas(int replicas) {
+            this.replicas = replicas;
+            return this;
+        }
+
         public Builder overwrite(boolean overwrite) {
             this.overwrite = overwrite;
             return this;
@@ -76,6 +90,9 @@ public final class LoadJobRequest {
             }
             if (targetPath != null && targetPath.trim().isEmpty()) {
                 throw new IllegalArgumentException("targetPath cannot be empty when set");
+            }
+            if (replicas != null && replicas <= 0) {
+                throw new IllegalArgumentException("replicas must be positive");
             }
             return new LoadJobRequest(this);
         }

@@ -84,7 +84,7 @@ impl TransferPlanner {
     ) -> FsResult<PlannedTransfer> {
         let source = Path::from_str(&job.source_path)?;
         let target = Path::from_str(&job.target_path)?;
-        let job_info = self.load_job_info(job, &mount);
+        let job_info = self.load_job_info(job, &mount)?;
         let source_status = self.get_status(&source, &mount).await?;
         let incremental_load = job.kind == TransferKind::Load && !source.is_cv() && target.is_cv();
         let target_status = if incremental_load {
@@ -209,7 +209,11 @@ impl TransferPlanner {
         }
     }
 
-    pub(crate) fn load_job_info(&self, job: &TransferJobRecord, mount: &MountInfo) -> LoadJobInfo {
+    pub(crate) fn load_job_info(
+        &self,
+        job: &TransferJobRecord,
+        mount: &MountInfo,
+    ) -> FsResult<LoadJobInfo> {
         load_job_info(job, mount, &self.client_conf)
     }
 
@@ -347,15 +351,22 @@ pub(crate) fn load_job_info(
     job: &TransferJobRecord,
     mount: &MountInfo,
     client_conf: &ClientConf,
-) -> LoadJobInfo {
-    let overwrite = transfer_command(job)
-        .map(|command| command.overwrite())
-        .unwrap_or(true);
-    LoadJobInfo {
+) -> FsResult<LoadJobInfo> {
+    let default_replicas = mount.replicas.unwrap_or(client_conf.replicas);
+    let (replicas, overwrite) = match transfer_command(job) {
+        Ok(command) => (
+            command.replicas()?.unwrap_or(default_replicas),
+            command.overwrite(),
+        ),
+        // Keep the pre-options behavior for old/corrupt records: they used the
+        // default overwrite and replica settings while planning.
+        Err(_) => (default_replicas, true),
+    };
+    Ok(LoadJobInfo {
         job_id: job.job_id.clone(),
         source_path: job.source_path.clone(),
         target_path: job.target_path.clone(),
-        replicas: mount.replicas.unwrap_or(client_conf.replicas),
+        replicas,
         block_size: mount.block_size.unwrap_or(client_conf.block_size),
         storage_type: mount.storage_type.unwrap_or(client_conf.storage_type),
         ttl_ms: mount.ttl_ms,
@@ -364,7 +375,7 @@ pub(crate) fn load_job_info(
         create_time: job.created_at,
         overwrite: Some(overwrite),
         source_type: Default::default(),
-    }
+    })
 }
 
 struct UfsEndpointLimiter {
@@ -465,5 +476,80 @@ fn normalized_path_text(path: &Path) -> String {
         path.path().trim_end_matches('/').to_string()
     } else {
         path.full_path().trim_end_matches('/').to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_job_info;
+    use curvine_config::ClientConf;
+    use curvine_model::{
+        MountInfo, TransferCommand, TransferJobRecord, TransferKind, TransferState,
+    };
+
+    fn job(command: TransferCommand) -> TransferJobRecord {
+        TransferJobRecord {
+            job_key: command.job_key(),
+            job_id: "job-1".to_string(),
+            run_id: 1,
+            kind: TransferKind::Load,
+            source_path: command.source_path.clone(),
+            target_path: command.target_path.clone(),
+            command_json: serde_json::to_string(&command).unwrap(),
+            mount_snapshot_json: "{}".to_string(),
+            secret_ref_json: "{}".to_string(),
+            cluster_snapshot_version: 0,
+            mount_snapshot_attempts: 0,
+            cv_metadata_epoch: None,
+            state: TransferState::Pending,
+            owner: String::new(),
+            lease_epoch: 0,
+            lease_expire_at: 0,
+            cancel_requested: false,
+            summary: Default::default(),
+            client_request_id: command.client_request_id.clone(),
+            submitter: String::new(),
+            tenant: String::new(),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn load_job_info_uses_explicit_replicas_over_mount_default() {
+        let mut command = TransferCommand {
+            kind: TransferKind::Load,
+            source_path: "s3://bucket/a".to_string(),
+            target_path: "/mnt/a".to_string(),
+            ..Default::default()
+        };
+        command.set_replicas(3);
+        let mount = MountInfo {
+            replicas: Some(2),
+            ..Default::default()
+        };
+        let client_conf = ClientConf {
+            replicas: 1,
+            ..Default::default()
+        };
+
+        let info = load_job_info(&job(command), &mount, &client_conf).unwrap();
+        assert_eq!(info.replicas, 3);
+    }
+
+    #[test]
+    fn load_job_info_keeps_mount_default_without_replica_option() {
+        let command = TransferCommand {
+            kind: TransferKind::Load,
+            source_path: "s3://bucket/a".to_string(),
+            target_path: "/mnt/a".to_string(),
+            ..Default::default()
+        };
+        let mount = MountInfo {
+            replicas: Some(2),
+            ..Default::default()
+        };
+        let info = load_job_info(&job(command), &mount, &ClientConf::default()).unwrap();
+        assert_eq!(info.replicas, 2);
     }
 }

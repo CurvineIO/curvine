@@ -98,11 +98,21 @@ public final class CurvineLoadClient implements Closeable {
     public LoadJobResult submitLoad(LoadJobRequest request) throws IOException {
         ensureOpen();
         Objects.requireNonNull(request, "request");
-        byte[] bytes = CurvineNative.submitLoadJob(
-                nativeHandle,
-                request.getSourcePath(),
-                request.getTargetPath(),
-                request.isOverwrite());
+        byte[] bytes;
+        if (request.getReplicas() == null) {
+            bytes = CurvineNative.submitLoadJob(
+                    nativeHandle,
+                    request.getSourcePath(),
+                    request.getTargetPath(),
+                    request.isOverwrite());
+        } else {
+            bytes = CurvineNative.submitLoadJobWithReplicas(
+                    nativeHandle,
+                    request.getSourcePath(),
+                    request.getTargetPath(),
+                    request.isOverwrite(),
+                    request.getReplicas());
+        }
         checkBytes(bytes);
         return LoadJobResult.fromProto(SubmitJobResponse.parseFrom(bytes));
     }

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_error::{ErrorKind, FsError};
+use curvine_error::{ErrorKind, FsError, FsResult};
 use curvine_runtime::common::Utils;
 use num_enum::{FromPrimitive, IntoPrimitive};
 use serde::{Deserialize, Serialize};
@@ -157,6 +157,7 @@ pub struct TransferCommand {
 
 impl TransferCommand {
     pub const OVERWRITE_OPTION: &'static str = "overwrite";
+    pub const REPLICAS_OPTION: &'static str = "replicas";
 
     pub fn job_key(&self) -> String {
         format!("{:?}:{}:{}", self.kind, self.source_path, self.target_path)
@@ -196,6 +197,35 @@ impl TransferCommand {
         )
     }
 
+    pub fn default_client_request_id_with_overwrite_and_replicas(
+        kind: TransferKind,
+        source_path: impl AsRef<str>,
+        target_path: impl AsRef<str>,
+        overwrite: bool,
+        replicas: Option<i32>,
+    ) -> String {
+        if replicas.is_none() {
+            return Self::default_client_request_id_with_overwrite(
+                kind,
+                source_path,
+                target_path,
+                overwrite,
+            );
+        }
+
+        format!(
+            "job_{}",
+            Utils::md5(format!(
+                "{:?}:{}:{}:overwrite={}:replicas={}",
+                kind,
+                source_path.as_ref(),
+                target_path.as_ref(),
+                overwrite,
+                replicas.unwrap_or_default(),
+            ))
+        )
+    }
+
     pub fn overwrite(&self) -> bool {
         self.options
             .get(Self::OVERWRITE_OPTION)
@@ -206,6 +236,24 @@ impl TransferCommand {
     pub fn set_overwrite(&mut self, overwrite: bool) {
         self.options
             .insert(Self::OVERWRITE_OPTION.to_string(), overwrite.to_string());
+    }
+
+    pub fn replicas(&self) -> FsResult<Option<i32>> {
+        let Some(value) = self.options.get(Self::REPLICAS_OPTION) else {
+            return Ok(None);
+        };
+        let replicas = value
+            .parse::<i32>()
+            .map_err(|_| FsError::common(format!("Invalid transfer replicas option: {}", value)))?;
+        if replicas <= 0 {
+            return Err(FsError::common("Transfer replicas option must be positive"));
+        }
+        Ok(Some(replicas))
+    }
+
+    pub fn set_replicas(&mut self, replicas: i32) {
+        self.options
+            .insert(Self::REPLICAS_OPTION.to_string(), replicas.to_string());
     }
 }
 
@@ -456,6 +504,19 @@ mod tests {
         );
 
         assert_ne!(overwrite, no_overwrite);
+    }
+
+    #[test]
+    fn replicas_option_round_trips_and_rejects_invalid_values() {
+        let mut command = TransferCommand::default();
+        command.set_replicas(3);
+        assert_eq!(command.replicas().unwrap(), Some(3));
+
+        command.options.insert(
+            TransferCommand::REPLICAS_OPTION.to_string(),
+            "0".to_string(),
+        );
+        assert!(command.replicas().is_err());
     }
 }
 

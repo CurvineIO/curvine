@@ -24,7 +24,7 @@ use curvine_fs_api::state::{DeleteResult, LoadJobCommand, LoadTaskStatus, SetAtt
 use curvine_fs_api::utils::ProtoUtils;
 use curvine_sdk_core::blocking_job as job;
 use jni::objects::{JByteArray, JString};
-use jni::sys::{jarray, jboolean, jstring};
+use jni::sys::{jarray, jboolean, jint, jstring};
 use jni::JNIEnv;
 use prost::Message;
 
@@ -46,6 +46,26 @@ fn decode_set_attr_options(bytes: &[u8]) -> FsResult<SetAttrOpts> {
     }
     let options = try_err!(SetAttrOptsProto::decode(bytes));
     Ok(ProtoUtils::set_attr_opts_from_pb(options))
+}
+
+fn build_load_job_command(
+    source: String,
+    target: Option<String>,
+    overwrite: bool,
+    replicas: Option<i32>,
+) -> FsResult<LoadJobCommand> {
+    if replicas.is_some_and(|value| value <= 0) {
+        return err_box!("replicas must be positive");
+    }
+
+    let mut builder = LoadJobCommand::builder(source).overwrite(overwrite);
+    if let Some(target) = target {
+        builder = builder.target_path(target);
+    }
+    if let Some(replicas) = replicas {
+        builder = builder.replicas(replicas);
+    }
+    Ok(builder.build())
 }
 
 impl JavaFilesystem {
@@ -207,6 +227,28 @@ impl JavaFilesystem {
         target_path: JString,
         overwrite: jboolean,
     ) -> FsResult<jarray> {
+        self.submit_load_job0(env, source_path, target_path, overwrite, None)
+    }
+
+    pub fn submit_load_job_with_replicas(
+        &self,
+        env: &mut JNIEnv,
+        source_path: JString,
+        target_path: JString,
+        overwrite: jboolean,
+        replicas: jint,
+    ) -> FsResult<jarray> {
+        self.submit_load_job0(env, source_path, target_path, overwrite, Some(replicas))
+    }
+
+    fn submit_load_job0(
+        &self,
+        env: &mut JNIEnv,
+        source_path: JString,
+        target_path: JString,
+        overwrite: jboolean,
+        replicas: Option<i32>,
+    ) -> FsResult<jarray> {
         let source = JavaUtils::jstring_to_string(env, &source_path)?;
         let target = if target_path.is_null() {
             None
@@ -219,12 +261,13 @@ impl JavaFilesystem {
             }
         };
 
-        let mut builder =
-            LoadJobCommand::builder(source).overwrite(JavaUtils::jbool_to_bool(overwrite));
-        if let Some(target) = target {
-            builder = builder.target_path(target);
-        }
-        let result = job::submit_load_job(self.inner.session(), builder.build())?;
+        let command = build_load_job_command(
+            source,
+            target,
+            JavaUtils::jbool_to_bool(overwrite),
+            replicas,
+        )?;
+        let result = job::submit_load_job(self.inner.session(), command)?;
         let response = SubmitJobResponse {
             job_id: result.job_id,
             target_path: result.target_path,
@@ -290,7 +333,7 @@ impl JavaFilesystem {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_mount_options, decode_set_attr_options};
+    use super::{build_load_job_command, decode_mount_options, decode_set_attr_options};
 
     #[test]
     fn rejects_empty_mount_options() {
@@ -304,5 +347,24 @@ mod tests {
         assert!(error
             .to_string()
             .contains("set attr options cannot be empty"));
+    }
+
+    #[test]
+    fn load_job_command_preserves_requested_replicas() {
+        let command = build_load_job_command(
+            "s3://bucket/a".to_string(),
+            Some("/mnt/a".to_string()),
+            true,
+            Some(3),
+        )
+        .unwrap();
+        assert_eq!(command.replicas, Some(3));
+    }
+
+    #[test]
+    fn load_job_command_rejects_non_positive_replicas() {
+        let error =
+            build_load_job_command("s3://bucket/a".to_string(), None, true, Some(0)).unwrap_err();
+        assert!(error.to_string().contains("replicas"));
     }
 }

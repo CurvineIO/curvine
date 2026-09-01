@@ -57,7 +57,34 @@ public class LoadJobClientTest {
                 .build();
         Assert.assertEquals("s3://bucket/a", request.getSourcePath());
         Assert.assertEquals("/mnt/a", request.getTargetPath());
+        Assert.assertNull(request.getReplicas());
         Assert.assertTrue(request.isOverwrite());
+    }
+
+    @Test
+    public void requestBuilderCarriesOptionalReplicas() {
+        LoadJobRequest request = LoadJobRequest.builder()
+                .sourcePath("s3://bucket/a")
+                .targetPath("/mnt/a")
+                .replicas(3)
+                .build();
+
+        Assert.assertEquals(Integer.valueOf(3), request.getReplicas());
+    }
+
+    @Test
+    public void requestBuilderRejectsNonPositiveReplicas() {
+        for (int replicas : new int[] {0, -1}) {
+            try {
+                LoadJobRequest.builder()
+                        .sourcePath("s3://bucket/a")
+                        .replicas(replicas)
+                        .build();
+                Assert.fail("expected IllegalArgumentException for replicas=" + replicas);
+            } catch (IllegalArgumentException expected) {
+                Assert.assertTrue(expected.getMessage().contains("replicas"));
+            }
+        }
     }
 
     @Test

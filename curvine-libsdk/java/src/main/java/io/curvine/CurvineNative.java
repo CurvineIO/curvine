@@ -407,6 +407,20 @@ public class CurvineNative {
             throws IOException;
 
     /**
+     * Submit a load job with an explicit per-job target replica count.
+     *
+     * <p>This is a separate native entry point so callers that leave replicas unset retain
+     * compatibility with the original JNI ABI.
+     */
+    public static native byte[] submitLoadJobWithReplicas(
+            long nativeHandle,
+            String sourcePath,
+            String targetPath,
+            boolean overwrite,
+            int replicas)
+            throws IOException;
+
+    /**
      * Query load job status by job id.
      *
      * @return serialized {@code GetJobStatusResponse} protobuf bytes

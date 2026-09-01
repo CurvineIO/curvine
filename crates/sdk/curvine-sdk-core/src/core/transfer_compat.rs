@@ -59,15 +59,17 @@ pub(crate) fn map_transfer_state(state: TransferState) -> JobTaskState {
 }
 
 pub(crate) fn validate_transfer_load_command(command: &LoadJobCommand) -> FsResult<()> {
-    if command.replicas.is_some()
-        || command.block_size.is_some()
+    if command.replicas.is_some_and(|replicas| replicas <= 0) {
+        return err_box!("transfer load replicas must be positive");
+    }
+    if command.block_size.is_some()
         || command.storage_type.is_some()
         || command.ttl_ms.is_some()
         || command.ttl_action.is_some()
     {
         return err_box!(
-            "transfer path does not support LoadJob options replicas/block_size/storage_type/ttl; \
-             use source_path, target_path, and overwrite only"
+            "transfer path does not support LoadJob options block_size/storage_type/ttl; \
+             use source_path, target_path, replicas, and overwrite"
         );
     }
     Ok(())
@@ -191,22 +193,27 @@ fn build_transfer_command(
     source_path: String,
     target_path: String,
     overwrite: bool,
+    replicas: Option<i32>,
 ) -> TransferCommand {
     let mut command = TransferCommand {
         kind: TransferKind::Load,
         source_path: source_path.clone(),
         target_path: target_path.clone(),
-        client_request_id: TransferCommand::default_client_request_id_with_overwrite(
+        client_request_id: TransferCommand::default_client_request_id_with_overwrite_and_replicas(
             TransferKind::Load,
             &source_path,
             &target_path,
             overwrite,
+            replicas,
         ),
         submitter: SUBMITTER.to_string(),
         tenant: String::new(),
         options: Default::default(),
     };
     command.set_overwrite(overwrite);
+    if let Some(replicas) = replicas {
+        command.set_replicas(replicas);
+    }
     command
 }
 
@@ -226,8 +233,10 @@ pub(crate) async fn submit_load_job(
 
     validate_transfer_load_command(&command)?;
     let overwrite = command.overwrite.unwrap_or(true);
+    let replicas = command.replicas;
     let (source_path, target_path) = resolve_load_paths(session.unified(), &command).await?;
-    let transfer_command = build_transfer_command(source_path, target_path.clone(), overwrite);
+    let transfer_command =
+        build_transfer_command(source_path, target_path.clone(), overwrite, replicas);
     let response = transfer_client(session)?.submit(transfer_command).await?;
     Ok(load_job_result_from_submit(&response, target_path))
 }
@@ -379,10 +388,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_transfer_load_options() {
+    fn accepts_replicas_and_rejects_other_unsupported_transfer_load_options() {
         let command = LoadJobCommand::builder("s3://bucket/a").replicas(2).build();
+        assert!(validate_transfer_load_command(&command).is_ok());
+
+        let command = LoadJobCommand::builder("s3://bucket/a").replicas(0).build();
         let err = validate_transfer_load_command(&command).unwrap_err();
-        assert!(err.to_string().contains("does not support"));
+        assert!(err.to_string().contains("replicas"));
 
         let command = LoadJobCommand::builder("s3://bucket/a")
             .block_size(1024)
@@ -405,6 +417,19 @@ mod tests {
             .overwrite(false)
             .build();
         assert!(validate_transfer_load_command(&command).is_ok());
+    }
+
+    #[test]
+    fn transfer_load_command_carries_requested_replicas() {
+        let command = build_transfer_command(
+            "s3://bucket/a".to_string(),
+            "/mnt/a".to_string(),
+            true,
+            Some(3),
+        );
+
+        assert_eq!(command.replicas().unwrap(), Some(3));
+        assert!(command.client_request_id.contains("job_"));
     }
 
     #[test]
