@@ -63,6 +63,18 @@ impl CacheManager {
         if !conf.enable_write_back {
             return Ok(());
         }
+        match conf.write_back_cache_type.as_str() {
+            "memory" | "disk" => {}
+            other => {
+                return err_box!(
+                    "unsupported write_back_cache_type '{}', expected 'memory' or 'disk'",
+                    other
+                );
+            }
+        }
+        if conf.write_back_page_size.as_byte() == 0 {
+            return err_box!("write_back_page_size must be > 0");
+        }
         let flush_delay = conf.write_back_flush_delay.as_millis() as u128;
         let meta_cache_ttl = conf.meta_cache_ttl.as_millis();
         if flush_delay > meta_cache_ttl / 2 {

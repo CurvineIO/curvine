@@ -172,6 +172,7 @@ impl PageStore for PageStoreVariant {
 mod tests {
     use super::*;
     use crate::fs::pcache::{DiskPageStore, MemoryPageStore};
+    use curvine_runtime::common::ByteUnit;
     use curvine_sys::FsStats;
     use std::path::{Path, PathBuf};
 
@@ -458,6 +459,7 @@ mod tests {
         let conf = FuseConf {
             write_back_cache_type: "disk".to_string(),
             write_back_disk_dirs: vec![dir.path().to_str().unwrap().to_string()],
+            write_back_page_size: ByteUnit::mb(4),
             ..Default::default()
         };
         let store = PageStoreVariant::from_conf(&conf).unwrap();
@@ -483,6 +485,7 @@ mod tests {
         let conf = FuseConf {
             write_back_cache_type: "disk".to_string(),
             write_back_disk_dirs: vec![dir.path().to_str().unwrap().to_string()],
+            write_back_page_size: ByteUnit::mb(4),
             ..Default::default()
         };
         PageStoreVariant::from_conf(&conf).unwrap();

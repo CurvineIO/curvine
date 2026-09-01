@@ -192,6 +192,7 @@ impl PageStore for DiskPageStore {
 mod tests {
     use super::DiskPageStore;
     use curvine_config::FuseConf;
+    use curvine_runtime::common::ByteUnit;
     use std::fs::File;
     use std::path::{Path, PathBuf};
 
@@ -248,6 +249,7 @@ mod tests {
         FuseConf {
             write_back_cache_type: "disk".to_string(),
             write_back_disk_dirs: vec![dir.path().to_str().unwrap().to_string()],
+            write_back_page_size: ByteUnit::mb(4),
             ..Default::default()
         }
     }
@@ -320,6 +322,7 @@ mod tests {
                 dir0.path().to_str().unwrap().to_string(),
                 dir1.path().to_str().unwrap().to_string(),
             ],
+            write_back_page_size: ByteUnit::mb(4),
             ..Default::default()
         };
         let err = match DiskPageStore::from_conf(&conf) {

@@ -201,7 +201,9 @@ pub struct FuseConf {
     /// all configured directories must not exceed this limit. Default: 1 GiB.
     pub write_back_cache_size: ByteUnit,
 
-    /// Write-back page size. Default: 4 MiB.
+    /// Write-back page size. Default config value: 0 (auto-select by
+    /// `write_back_cache_type`); the effective default is 128 KiB for memory
+    /// cache and 4 MiB for disk cache.
     pub write_back_page_size: ByteUnit,
 
     /// Max concurrent flushes from write-back cache to the remote backend.
@@ -385,6 +387,24 @@ impl FuseConf {
 
         if self.enable_write_back {
             self.enable_meta_cache = true;
+        }
+        // Validate the cache type unconditionally so typos fail fast even when
+        // the page size is set explicitly; the page-size default below also
+        // depends on the resolved type.
+        match self.write_back_cache_type.as_str() {
+            "memory" | "disk" => {}
+            _ => {
+                return err_box!(
+                    "fuse.write_back_cache_type must be 'memory' or 'disk', got '{}'",
+                    self.write_back_cache_type
+                );
+            }
+        }
+        if self.write_back_page_size.as_byte() == 0 {
+            self.write_back_page_size = match self.write_back_cache_type.as_str() {
+                "memory" => ByteUnit::kb(128),
+                _ => ByteUnit::mb(4),
+            };
         }
 
         if let Some(0) = self.max_readahead_kb {
@@ -720,7 +740,7 @@ impl Default for FuseConf {
             write_back_cache_type: "memory".to_string(),
             write_back_disk_dirs: vec![],
             write_back_cache_size: ByteUnit::gb(1),
-            write_back_page_size: ByteUnit::mb(4),
+            write_back_page_size: ByteUnit::new(0),
             write_back_max_concurrent: 32,
             write_back_flush_delay: DurationUnit::new(0),
             write_back_tick_interval: DurationUnit::new(1000),
@@ -791,6 +811,52 @@ mod tests {
             ..Default::default()
         };
         conf.init().expect("positive io_threads must be accepted");
+    }
+
+    #[test]
+    fn init_auto_selects_page_size_by_cache_type() {
+        let mut memory = FuseConf {
+            write_back_page_size: ByteUnit::new(0),
+            ..Default::default()
+        };
+        memory.init().expect("memory default must be accepted");
+        assert_eq!(memory.write_back_page_size, ByteUnit::kb(128));
+
+        let mut disk = FuseConf {
+            write_back_cache_type: "disk".to_string(),
+            write_back_page_size: ByteUnit::new(0),
+            ..Default::default()
+        };
+        disk.init().expect("disk default must be accepted");
+        assert_eq!(disk.write_back_page_size, ByteUnit::mb(4));
+    }
+
+    #[test]
+    fn init_preserves_explicit_page_size() {
+        let mut conf = FuseConf {
+            write_back_page_size: ByteUnit::mb(2),
+            ..Default::default()
+        };
+        conf.init().expect("explicit page size must be accepted");
+        assert_eq!(conf.write_back_page_size, ByteUnit::mb(2));
+    }
+
+    #[test]
+    fn init_rejects_unknown_cache_type_even_with_explicit_page_size() {
+        let mut conf = FuseConf {
+            write_back_cache_type: "memroy".to_string(),
+            write_back_page_size: ByteUnit::mb(4),
+            ..Default::default()
+        };
+        let err = conf
+            .init()
+            .expect_err("unknown cache type must be rejected");
+        assert!(
+            err.to_string()
+                .contains("fuse.write_back_cache_type must be 'memory' or 'disk'"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
