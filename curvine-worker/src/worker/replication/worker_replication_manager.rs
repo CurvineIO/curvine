@@ -18,15 +18,41 @@ use curvine_client_core::block::BlockWriterRemote;
 use curvine_client_core::file::FsContext;
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
+use curvine_error::FsResult;
 use curvine_fs_api::RpcCode;
 use curvine_model::{ExtendedBlock, FileType};
 use curvine_proto::{ReportBlockReplicationRequest, ReportBlockReplicationResponse};
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
-use log::{error, info};
+use log::{error, info, warn};
 use once_cell::sync::OnceCell;
+use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Semaphore;
+
+async fn finish_replication_with_cleanup<C, F>(
+    result: CommonResult<()>,
+    cancel: C,
+    block_id: i64,
+    target_worker_id: u32,
+) -> CommonResult<()>
+where
+    C: FnOnce() -> F,
+    F: Future<Output = FsResult<()>>,
+{
+    match result {
+        Ok(()) => Ok(()),
+        Err(replication_error) => {
+            if let Err(cancel_error) = cancel().await {
+                warn!(
+                    "Failed to cancel remote writer for block {} on worker {} after replication error '{}': {}",
+                    block_id, target_worker_id, replication_error, cancel_error
+                );
+            }
+            Err(replication_error)
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct WorkerReplicationManager {
@@ -147,17 +173,28 @@ impl WorkerReplicationManager {
             target_capacity,
         )
         .await?;
-        let mut remaining = block_meta.len;
-        while remaining > 0 {
-            let size = remaining.min(self.replicate_chunk_size as i64);
-            let slice = reader.read_region(true, size as i32)?;
-            let read_len = slice.len() as i64;
-            writer.write(slice).await?;
-            remaining -= read_len;
+        let replication_result: CommonResult<()> = async {
+            let mut remaining = block_meta.len;
+            while remaining > 0 {
+                let size = remaining.min(self.replicate_chunk_size as i64);
+                let slice = reader.read_region(true, size as i32)?;
+                let read_len = slice.len() as i64;
+                writer.write(slice).await?;
+                remaining -= read_len;
+            }
+            writer.flush().await?;
+            writer.complete().await?;
+            Ok(())
         }
-        writer.flush().await?;
-        writer.complete().await?;
-        Ok(())
+        .await;
+
+        finish_replication_with_cleanup(
+            replication_result,
+            || writer.cancel(),
+            job.block_id,
+            job.target_worker_addr.worker_id,
+        )
+        .await
     }
 
     pub fn accept_job(&self, job: ReplicationJob) -> CommonResult<()> {
@@ -169,5 +206,79 @@ impl WorkerReplicationManager {
 
     pub fn with_master_client(&self, master_client: MasterClient) {
         let _ = self.master_client.set(master_client);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::finish_replication_with_cleanup;
+    use curvine_core_error::{err_box, CommonResult};
+    use curvine_error::FsError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn successful_replication_skips_cancel() -> CommonResult<()> {
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
+        let calls = cancel_calls.clone();
+
+        finish_replication_with_cleanup(
+            Ok(()),
+            move || async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), FsError>(())
+            },
+            1,
+            2,
+        )
+        .await?;
+
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_replication_cancels_writer_and_preserves_error() {
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
+        let calls = cancel_calls.clone();
+        let replication_result: CommonResult<()> = err_box!("source read failed");
+
+        let error = finish_replication_with_cleanup(
+            replication_result,
+            move || async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), FsError>(())
+            },
+            1,
+            2,
+        )
+        .await
+        .expect_err("replication failure must be returned");
+
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+        assert!(error.to_string().contains("source read failed"));
+    }
+
+    #[tokio::test]
+    async fn cancel_failure_does_not_replace_replication_error() {
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
+        let calls = cancel_calls.clone();
+        let replication_result: CommonResult<()> = err_box!("remote write failed");
+
+        let error = finish_replication_with_cleanup(
+            replication_result,
+            move || async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(FsError::common("cancel failed"))
+            },
+            1,
+            2,
+        )
+        .await
+        .expect_err("replication failure must remain primary");
+
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+        assert!(error.to_string().contains("remote write failed"));
+        assert!(!error.to_string().contains("cancel failed"));
     }
 }
