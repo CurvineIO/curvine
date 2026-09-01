@@ -219,7 +219,7 @@ impl CacheManager {
 
         if link == 0 {
             if let Some(cache) = self.caches.get(&ino).await {
-                cache.free_pages(true).await;
+                cache.free_pages(true);
             }
             self.caches.remove(ino);
         }
@@ -320,7 +320,7 @@ impl CacheManager {
             };
 
             let file_len = cache.len();
-            let page_len = cache.page_len().await;
+            let page_len = cache.page_len();
             res.push(EvictInode::new(ino, page_len, file_len));
         }
 
@@ -536,7 +536,8 @@ mod tests {
     #[tokio::test]
     async fn ensure_flush_errors_without_bound_state() {
         let cm = test_cm(&test_conf(PAGE_SIZE, PAGE_SIZE * 16, 0.1));
-        create_cache(&cm, 1).await;
+        let cache = create_cache(&cm, 1).await;
+        write_bytes(&cache, b"hello").await;
         assert!(cm.ensure_flush(1).await.is_err());
     }
 

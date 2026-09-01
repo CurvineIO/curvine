@@ -154,6 +154,7 @@ pub struct FuseMetrics {
     pub fuse_used_memory_bytes: Gauge,
 
     pub write_back_cache_inode_num: Gauge,
+    pub write_back_cache_page_num: Gauge,
     pub write_back_dirty_inode_num: Gauge,
     pub write_back_cache_usage: Gauge,
     pub write_back_cache_limit: Gauge,
@@ -262,6 +263,10 @@ impl FuseMetrics {
             write_back_cache_inode_num: m::new_gauge(
                 "write_back_cache_inode_num",
                 "FUSE write-back cache inode count",
+            )?,
+            write_back_cache_page_num: m::new_gauge(
+                "write_back_cache_page_num",
+                "FUSE write-back page count in page cache",
             )?,
             write_back_dirty_inode_num: m::new_gauge(
                 "write_back_dirty_inode_num",

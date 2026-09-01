@@ -48,18 +48,8 @@ impl WriteBackWork {
     }
 
     async fn flush(cache: &Arc<InodeCache>) -> FuseResult<u64> {
-        let pages = cache.take_dirty_pages().await?;
-        if pages.is_empty() {
-            return Ok(0);
-        }
-
-        let writer = cache.get_writer().await?;
-        let mut len = 0;
-        for mut page in pages {
-            len += page.flush_to(&writer).await?;
-        }
-
-        cache.free_pages(false).await;
+        let (_, len) = cache.flush_dirty(false).await?;
+        cache.free_pages(false);
 
         Ok(len)
     }
@@ -71,40 +61,36 @@ impl WriteBackWork {
 
         let res = Self::flush(&cache).await;
 
-        if res.is_err() {
-            cm.remove_cache(ino, true).await?;
-        } else {
-            for _ in 0..complete_num {
-                if let Err(e) = cm.release_cache(&cache).await {
-                    FuseMetrics::with(|m| {
-                        m.write_back_error_count
-                            .with_label_values(&["release"])
-                            .inc();
-                    });
-                    if e.errno == libc::ENOENT {
-                        debug!("write_back release_cache ino={} error: {}", ino, e);
-                    } else {
-                        warn!("write_back release_cache ino={} error: {}", ino, e);
-                    }
-                    cm.remove_cache(ino, true).await?;
-                    break;
+        for _ in 0..complete_num {
+            if let Err(e) = cm.release_cache(&cache).await {
+                FuseMetrics::with(|m| {
+                    m.write_back_error_count
+                        .with_label_values(&["release"])
+                        .inc();
+                });
+                if e.errno == libc::ENOENT {
+                    debug!("write_back release_cache ino={} error: {}", ino, e);
+                } else {
+                    warn!("write_back release_cache ino={} error: {}", ino, e);
                 }
             }
         }
+
         res
     }
 
-    pub async fn flush_inodes(cm: &CacheManager, list: VecDeque<DirtyEntry>) {
+    pub async fn flush_inodes(cm: &Arc<CacheManager>, list: VecDeque<DirtyEntry>) {
         let len = list.len();
         if len == 0 {
             return;
         }
 
         let spend = TimeSpent::new();
-        let futs = list.iter().map(|entry| {
+        let handles = list.iter().map(|entry| {
+            let cm = cm.clone();
             let (ino, complete_num) = (entry.ino, entry.complete_num);
-            async move {
-                match Self::execute(cm, ino, complete_num).await {
+            tokio::spawn(async move {
+                match Self::execute(&cm, ino, complete_num).await {
                     Ok(bytes) => bytes,
                     Err(e) => {
                         FuseMetrics::with(|m| {
@@ -129,10 +115,22 @@ impl WriteBackWork {
                         0
                     }
                 }
-            }
+            })
         });
 
-        let flushed: u64 = join_all(futs).await.into_iter().sum();
+        let flushed: u64 = join_all(handles)
+            .await
+            .into_iter()
+            .map(|res| {
+                res.unwrap_or_else(|e| {
+                    warn!("write_back flush task panicked: {}", e);
+                    FuseMetrics::with(|m| {
+                        m.write_back_error_count.with_label_values(&["flush"]).inc();
+                    });
+                    0
+                })
+            })
+            .sum();
 
         FuseMetrics::with(|m| {
             m.write_back_io_us
@@ -152,7 +150,7 @@ impl WriteBackWork {
     }
 
     async fn evict(cache: &Arc<InodeCache>) -> u64 {
-        let force = match cache.flush_pages(false).await {
+        let force = match cache.flush_dirty(false).await {
             Ok(_) => false,
             Err(e) => {
                 warn!("write_back flush_pages ino={} error: {}", cache.ino, e);
@@ -166,10 +164,10 @@ impl WriteBackWork {
             }
         };
 
-        cache.free_pages(force).await
+        cache.free_pages(force)
     }
 
-    pub async fn evict_inodes(cm: &CacheManager) {
+    pub async fn evict_inodes(cm: &Arc<CacheManager>) {
         let before = cm.used();
         let target = cm.free_target();
         let spend = TimeSpent::new();
@@ -186,27 +184,42 @@ impl WriteBackWork {
         }
 
         let evict_len = selected.len();
-        let futs = selected.into_iter().map(|inode| async move {
-            let Some(cache) = cm.get_cache(inode.ino).await else {
-                return 0;
-            };
+        let handles = selected.into_iter().map(|inode| {
+            let cm = cm.clone();
+            tokio::spawn(async move {
+                let Some(cache) = cm.get_cache(inode.ino).await else {
+                    return 0;
+                };
 
-            let bytes = Self::evict(&cache).await;
-            debug!(
-                "write_back evict ino={}, file_len={} freed={}",
-                inode.ino, inode.file_len, bytes
-            );
-            bytes
+                let bytes = Self::evict(&cache).await;
+                debug!(
+                    "write_back evict ino={}, file_len={} freed={}",
+                    inode.ino, inode.file_len, bytes
+                );
+                bytes
+            })
         });
 
-        let freed: u64 = join_all(futs).await.into_iter().sum();
+        let freed: u64 = join_all(handles)
+            .await
+            .into_iter()
+            .map(|res| {
+                res.unwrap_or_else(|e| {
+                    warn!("write_back evict task panicked: {}", e);
+                    FuseMetrics::with(|m| {
+                        m.write_back_error_count.with_label_values(&["evict"]).inc();
+                    });
+                    0
+                })
+            })
+            .sum();
 
         FuseMetrics::with(|m| {
             m.write_back_io_us
                 .with_label_values(&["evict"])
                 .observe(spend.used_us() as f64);
             m.write_back_io_bytes
-                .with_label_values(&["freed"])
+                .with_label_values(&["evict"])
                 .inc_by(freed as i64);
         });
 
@@ -338,11 +351,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_with_partial_page_without_state_is_ok() {
+    async fn execute_with_partial_page_without_state_returns_err() {
         let conf = test_conf(4096);
         let (cm, _receiver) = test_cm(&conf);
         write_cache(&cm, 100, b"partial").await;
-        assert!(WriteBackWork::execute(&cm, 100, 0).await.is_ok());
+        assert!(WriteBackWork::execute(&cm, 100, 0).await.is_err());
     }
 
     #[tokio::test]

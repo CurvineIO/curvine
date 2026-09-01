@@ -89,19 +89,20 @@ impl CacheHandle {
             }
         }
 
-        let writer_ver = self.cache.write_ver();
+        let flush_ver = self.cache.ensure_flushed().await?;
         let mut lock = self.reader.lock().await;
+        let read_ver = self.read_ver.get();
         let reader = match lock.as_mut() {
-            Some(r) if writer_ver == self.read_ver.get() => r,
+            Some(r) if read_ver >= flush_ver => r,
 
             _ => {
-                let result = self.cache.flush().await;
-                state.invalidate_file_blocks(self.ino);
-                result?;
+                if read_ver < flush_ver {
+                    state.invalidate_file_blocks(self.ino);
+                }
 
                 let path = state.get_path(self.ino)?;
                 let reader = state.open_reader(Some(self.ino), &path).await?;
-                self.read_ver.set(writer_ver);
+                self.read_ver.set(flush_ver);
                 lock.insert(reader)
             }
         };

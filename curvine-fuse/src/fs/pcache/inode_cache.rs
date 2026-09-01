@@ -16,10 +16,11 @@ use bytes::Bytes;
 use curvine_io::DataSlice;
 use curvine_model::{CreateFileOpts, FileAllocOpts, FileStatus, OpenFlags, SetAttrOpts};
 use curvine_runtime::common::TimeSpent;
-use curvine_runtime::sync::{AsyncMutex, AtomicCounter, ErrorMonitor};
+use curvine_runtime::sync::{AsyncMutex, AtomicCounter, ErrorMonitor, StdRwLock};
+use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
-use std::ops::Deref;
 use std::sync::Arc;
+use tokio::task::spawn_blocking;
 
 use crate::fs::pcache::{CacheManager, DirtyMessage, Page};
 use crate::fs::FuseWriter;
@@ -44,46 +45,51 @@ impl PageState {
         }
     }
 
-    fn get_or_create_page(&mut self, cache: &InodeCache, page_id: u64) -> FuseResult<&mut Page> {
-        if self.pages.get_mut(&page_id).is_none() {
-            let page = cache.cm.allocate_page(cache.ino, page_id)?;
-            self.pages.insert(page_id, page);
-        }
-        Ok(self.pages.get_mut(&page_id).unwrap())
-    }
-
-    pub fn write(&mut self, cache: &InodeCache, off: u64, data: &Bytes) -> FuseResult<(u64, bool)> {
+    pub fn write(
+        &mut self,
+        cache: &InodeCache,
+        off: u64,
+        data: Bytes,
+    ) -> FuseResult<(Vec<(u64, Bytes)>, bool)> {
         if data.is_empty() {
-            return Ok((0, false));
+            return Ok((Vec::new(), false));
         }
 
-        let len = data.len() as u64;
-        let mut file_off = off;
-        let mut src = 0;
+        let mut src = 0usize;
+        let mut unwritten = Vec::new();
         let mut notify_full_page = false;
 
-        while src < len {
+        while src < data.len() {
+            let file_off = off + src as u64;
             let page_id = cache.cm.page_id(file_off);
             let page_off = cache.cm.page_off(file_off);
-            let take = (len - src).min(cache.cm.page_size - page_off);
+            let take = (data.len() - src).min((cache.cm.page_size - page_off) as usize);
 
-            let page = self.get_or_create_page(cache, page_id)?;
-            page.write(page_off, &data[src as usize..(src + take) as usize])?;
-            page.mark_dirty(page_off, page_off + take);
+            let page = match self.pages.entry(page_id) {
+                Entry::Occupied(entry) => Some(entry.into_mut()),
+                Entry::Vacant(entry) => match cache.cm.allocate_page(cache.ino, page_id) {
+                    Ok(page) => Some(entry.insert(page)),
+                    Err(e) if e.errno == libc::ENOSPC => None,
+                    Err(e) => return Err(e),
+                },
+            };
 
-            if page.len() >= cache.cm.page_size {
-                notify_full_page = true;
+            match page {
+                Some(page) => {
+                    page.write(page_off, &data[src..src + take])?;
+                    notify_full_page |= page.is_full(cache.cm.page_size);
+                }
+                None => unwritten.push((file_off, data.slice(src..src + take))),
             }
 
             src += take;
-            file_off += take;
         }
 
-        Ok((len, notify_full_page))
+        Ok((unwritten, notify_full_page))
     }
 
     pub fn read(
-        &mut self,
+        &self,
         cache: &InodeCache,
         off: u64,
         len: usize,
@@ -91,7 +97,7 @@ impl PageState {
         if len == 0 {
             return Ok(Some(vec![DataSlice::empty()]));
         }
-        if off >= cache.len.get() {
+        if off >= cache.len() {
             return Ok(Some(vec![DataSlice::empty()]));
         }
 
@@ -105,17 +111,14 @@ impl PageState {
             let page_off = cache.cm.page_off(cur);
 
             // Missing page: hole in this page; contiguous prefix ends here.
-            let Some(page) = self.pages.get_mut(&page_id) else {
+            let Some(page) = self.pages.get(&page_id) else {
                 break;
             };
 
-            // In prefix or suffix hole of chunk: chunks need not cover the whole page; stop here.
-            if page_off < page.start() || page_off >= page.end() {
+            let Some(avail) = page.readable_len(page_off) else {
                 break;
-            }
-
-            let avail = (page.end() - page_off) as usize;
-            let take = avail.min((end - cur) as usize);
+            };
+            let take = (avail as usize).min((end - cur) as usize);
 
             let bytes = page.read(page_off, take)?;
             out.push(DataSlice::bytes(bytes));
@@ -134,7 +137,7 @@ impl PageState {
         self.pages.is_empty()
     }
 
-    pub fn cache_len(&self) -> u64 {
+    pub fn page_len(&self) -> u64 {
         self.pages.values().map(|c| c.len()).sum()
     }
 }
@@ -143,12 +146,13 @@ pub struct InodeCache {
     pub cm: Arc<CacheManager>,
     pub ino: u64,
     pub page_size: u64,
-    pub state: AsyncMutex<PageState>,
+    pub state: StdRwLock<PageState>,
     pub flags: OpenFlags,
     pub create_opts: CreateFileOpts,
     pub writer: AsyncMutex<Option<Arc<FuseWriter>>>,
     pub error: ErrorMonitor<FuseError>,
     writer_ver: AtomicCounter,
+    flush_gate: AsyncMutex<u64>,
     len: AtomicCounter,
 }
 
@@ -167,10 +171,11 @@ impl InodeCache {
             page_size,
             flags,
             create_opts,
-            state: AsyncMutex::new(PageState::new()),
+            state: StdRwLock::new(PageState::new()),
             writer: AsyncMutex::new(None),
             error: ErrorMonitor::new(),
             writer_ver: AtomicCounter::new(0),
+            flush_gate: AsyncMutex::new(0),
             len: AtomicCounter::new(file_len),
         }
     }
@@ -191,8 +196,12 @@ impl InodeCache {
                 let state = self.cm.state()?;
                 let path = state.get_path(self.ino)?;
 
+                // Page-cache flushes and write-through use explicit file
+                // offsets. The backend writer must therefore honor seek even
+                // when the original FUSE handle was opened with O_APPEND.
+                let flags = self.flags.set_append(false);
                 let writer = state
-                    .new_writer(&path, self.flags, self.create_opts.clone())
+                    .new_writer(&path, flags, self.create_opts.clone())
                     .await?;
                 let _ = lock.insert(writer.clone());
                 Ok(writer)
@@ -200,21 +209,38 @@ impl InodeCache {
         }
     }
 
-    pub async fn flush_pages(self: &Arc<Self>, sync: bool) -> FuseResult<Arc<FuseWriter>> {
+    pub async fn write_through(self: &Arc<Self>, fragments: Vec<(u64, Bytes)>) -> FuseResult<()> {
         let writer = self.get_writer().await?;
-
-        // Snapshot dirty pages under the lock (including partial pages for
-        // complete/evict). Tick worker still uses take_dirty_pages (full only).
-        let mut pages = self.take_all_dirty_pages().await?;
-        for page in &mut pages {
-            page.flush_to(&writer).await?;
+        for (off, data) in fragments {
+            writer.write(off as i64, data, None).await?;
         }
+        Ok(())
+    }
 
-        if sync {
-            writer.flush(None).await?;
+    async fn writer_inner(
+        self: &Arc<Self>,
+        off: u64,
+        data: Bytes,
+    ) -> FuseResult<(Vec<(u64, Bytes)>, bool)> {
+        let cache = self.clone();
+        let f = move || {
+            let mut lock = cache.state.write();
+            lock.write(&cache, off, data)
+        };
+
+        let res = if self.cm.store.is_mem() {
+            f()
+        } else {
+            spawn_blocking(f).await?
+        };
+        if res.is_err() {
+            FuseMetrics::with(|m| {
+                m.write_back_error_count
+                    .with_label_values(&["write_cache"])
+                    .inc()
+            });
         }
-
-        Ok(writer)
+        res
     }
 
     pub async fn write(self: &Arc<Self>, off: u64, data: Bytes) -> FuseResult<usize> {
@@ -223,40 +249,26 @@ impl InodeCache {
         let data_len = data.len();
         let spent = TimeSpent::new();
 
-        let label = if self.cm.is_full() {
-            let writer = self.get_writer().await?;
-            writer.write(off as i64, data, None).await?;
-            "through"
-        } else {
-            let notify = {
-                let mut state = self.lock().await;
-                match state.write(self, off, &data) {
-                    Err(e) if e.errno == libc::ENOSPC => None,
-                    Err(e) => {
-                        FuseMetrics::with(|m| {
-                            m.write_back_error_count.with_label_values(&["write"]).inc();
-                        });
-                        return Err(e);
-                    }
-                    Ok((_, notify)) => Some(notify),
+        let (unwritten, notify) = self.writer_inner(off, data).await?;
+        let label = {
+            if unwritten.is_empty() {
+                "write_cache"
+            } else {
+                let miss: usize = unwritten.iter().map(|(_, data)| data.len()).sum();
+                self.write_through(unwritten).await?;
+                if miss == data_len {
+                    "write_enospc"
+                } else {
+                    "write_partial"
                 }
-            };
-
-            match notify {
-                None => {
-                    let writer = self.get_writer().await?;
-                    writer.write(off as i64, data, None).await?;
-                    "enospc"
-                }
-                Some(true) => {
-                    self.cm.send(DirtyMessage::Write(self.ino)).await?;
-                    "cache"
-                }
-                Some(false) => "cache",
             }
         };
         self.writer_ver.incr();
         self.max_len(off + data_len as u64);
+
+        if notify {
+            self.cm.send(DirtyMessage::Write(self.ino)).await?;
+        }
 
         FuseMetrics::with(|m| {
             m.write_back_io_bytes
@@ -264,11 +276,38 @@ impl InodeCache {
                 .inc_by(data_len as i64);
 
             m.write_back_io_us
-                .with_label_values(&["write"])
+                .with_label_values(&[label])
                 .observe(spent.used_us() as f64)
         });
 
         Ok(data_len)
+    }
+
+    async fn read_inner(
+        self: &Arc<Self>,
+        off: u64,
+        len: usize,
+    ) -> FuseResult<Option<Vec<DataSlice>>> {
+        let cache = self.clone();
+        let f = move || {
+            let lock = cache.state.read();
+            lock.read(&cache, off, len)
+        };
+
+        let res = if self.cm.store.is_mem() {
+            f()
+        } else {
+            spawn_blocking(f).await?
+        };
+
+        if res.is_err() {
+            FuseMetrics::with(|m| {
+                m.write_back_error_count
+                    .with_label_values(&["read_cache"])
+                    .inc()
+            });
+        }
+        res
     }
 
     pub async fn read(
@@ -279,25 +318,97 @@ impl InodeCache {
         self.check_error()?;
         let spent = TimeSpent::new();
 
-        let mut state = self.lock().await;
-        let data = state.read(self, off, len)?;
+        let res = self.read_inner(off, len).await;
+        if res.is_ok() {
+            FuseMetrics::with(|m| {
+                m.write_back_io_us
+                    .with_label_values(&["read_cache"])
+                    .observe(spent.used_us() as f64)
+            });
+        }
+        res
+    }
 
-        FuseMetrics::with(|m| {
-            m.write_back_io_us
-                .with_label_values(&["read"])
-                .observe(spent.used_us() as f64)
-        });
+    async fn read_dirty(self: &Arc<Self>, mut page: Page) -> FuseResult<Vec<(u64, Bytes)>> {
+        let mut f = move || page.read_dirty();
+        let res = if self.cm.store.is_mem() {
+            f()
+        } else {
+            spawn_blocking(f).await?
+        };
+        if res.is_err() {
+            FuseMetrics::with(|m| {
+                m.write_back_error_count
+                    .with_label_values(&["read_dirty"])
+                    .inc()
+            });
+        }
 
-        Ok(data)
+        res
+    }
+
+    fn finish_flush_all(self: &Arc<Self>, page_ids: &[u64]) {
+        if page_ids.is_empty() {
+            return;
+        }
+        let mut state = self.state.write();
+        for &page_id in page_ids {
+            if let Some(page) = state.pages.get_mut(&page_id) {
+                page.finish_flush();
+            }
+        }
+    }
+
+    async fn flush_inner(
+        self: &Arc<InodeCache>,
+        pages: Vec<Page>,
+        sync: bool,
+    ) -> FuseResult<(Arc<FuseWriter>, u64)> {
+        let writer = self.get_writer().await?;
+
+        let mut total = 0;
+        let mut flushed = Vec::with_capacity(pages.len());
+        for page in pages {
+            let page_id = page.page_id;
+            let dirty = self.read_dirty(page).await?;
+
+            for (off, data) in dirty {
+                total += data.len() as u64;
+                writer.write(off as i64, data, None).await?;
+            }
+            flushed.push(page_id);
+        }
+
+        if sync {
+            writer.flush(None).await?;
+        }
+        self.finish_flush_all(&flushed);
+
+        Ok((writer, total))
+    }
+
+    pub async fn flush_dirty(
+        self: &Arc<InodeCache>,
+        sync: bool,
+    ) -> FuseResult<(Arc<FuseWriter>, u64)> {
+        let pages = self.take_dirty_pages()?;
+        self.flush_inner(pages, sync).await
+    }
+
+    pub async fn flush_all(
+        self: &Arc<InodeCache>,
+        sync: bool,
+    ) -> FuseResult<(Arc<FuseWriter>, u64)> {
+        let pages = self.take_all_dirty_pages()?;
+        self.flush_inner(pages, sync).await
     }
 
     pub fn len(&self) -> u64 {
         self.len.get()
     }
 
-    pub async fn page_len(&self) -> u64 {
-        let state = self.state.lock().await;
-        state.pages.values().map(|c| c.len()).sum()
+    pub fn page_len(&self) -> u64 {
+        self.state.read().page_len()
     }
 
     pub fn reached_eof(&self, off: u64, got: usize) -> bool {
@@ -323,7 +434,7 @@ impl InodeCache {
     pub async fn resize(self: &Arc<Self>, opts: FileAllocOpts) -> FuseResult<FileStatus> {
         self.check_error()?;
 
-        let writer = self.flush_pages(false).await?;
+        let (writer, _) = self.flush_all(false).await?;
         let status = writer.resize(opts).await?;
 
         self.writer_ver.incr();
@@ -343,8 +454,21 @@ impl InodeCache {
     }
 
     pub async fn flush(self: &Arc<Self>) -> FuseResult<()> {
-        self.flush_pages(true).await?;
+        self.ensure_flushed().await?;
         Ok(())
+    }
+
+    pub async fn ensure_flushed(self: &Arc<Self>) -> FuseResult<u64> {
+        self.check_error()?;
+
+        let mut flushed_ver = self.flush_gate.lock().await;
+        let target = self.writer_ver.get();
+        if target > *flushed_ver {
+            self.flush_all(true).await?;
+            *flushed_ver = target;
+        }
+
+        Ok(*flushed_ver)
     }
 
     pub async fn queue_complete(self: &Arc<Self>) -> FuseResult<()> {
@@ -354,13 +478,13 @@ impl InodeCache {
 
     pub async fn complete(self: &Arc<Self>, opts: Option<SetAttrOpts>) -> FuseResult<()> {
         let res: FuseResult<()> = async {
-            let writer = self.flush_pages(false).await?;
+            let (writer, _) = self.flush_all(false).await?;
             writer.complete_with_attr(None, opts).await?;
             Ok(())
         }
         .await;
 
-        let _ = self.free_pages(true).await;
+        let _ = self.free_pages(true);
         res
     }
 
@@ -369,19 +493,19 @@ impl InodeCache {
     }
 
     pub async fn truncate(self: &Arc<Self>) -> FuseResult<()> {
-        let _ = self.free_pages(true).await;
+        let _ = self.free_pages(true);
         self.len.set(0);
         self.writer_ver.incr();
 
         Ok(())
     }
 
-    pub async fn free_pages(self: &Arc<Self>, force: bool) -> u64 {
-        let mut state = self.lock().await;
+    pub fn free_pages(self: &Arc<Self>, force: bool) -> u64 {
+        let mut state = self.state.write();
         let mut freed = 0;
 
         state.pages.retain(|_, page| {
-            if !force && page.is_dirty() {
+            if !force && (page.is_dirty() || page.flushing) {
                 return true;
             }
 
@@ -391,22 +515,24 @@ impl InodeCache {
 
             false
         });
+
         if freed > 0 {
             self.cm.refresh_full();
         }
+
         freed
     }
 
-    pub async fn take_dirty_pages(self: &Arc<Self>) -> FuseResult<Vec<Page>> {
-        self.take_dirty_pages_inner(true).await
+    pub fn take_dirty_pages(self: &Arc<Self>) -> FuseResult<Vec<Page>> {
+        self.take_dirty_pages_inner(true)
     }
 
-    async fn take_all_dirty_pages(self: &Arc<Self>) -> FuseResult<Vec<Page>> {
-        self.take_dirty_pages_inner(false).await
+    fn take_all_dirty_pages(self: &Arc<Self>) -> FuseResult<Vec<Page>> {
+        self.take_dirty_pages_inner(false)
     }
 
-    async fn take_dirty_pages_inner(self: &Arc<Self>, full_only: bool) -> FuseResult<Vec<Page>> {
-        let mut state = self.state.lock().await;
+    fn take_dirty_pages_inner(self: &Arc<Self>, full_only: bool) -> FuseResult<Vec<Page>> {
+        let mut state = self.state.write();
         let mut result = Vec::new();
 
         for page in state.pages.values_mut() {
@@ -422,24 +548,11 @@ impl InodeCache {
 
         Ok(result)
     }
-
-    pub async fn cache_len(&self) -> u64 {
-        let state = self.lock().await;
-        state.cache_len()
-    }
-}
-
-impl Deref for InodeCache {
-    type Target = AsyncMutex<PageState>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.state
-    }
 }
 
 impl Drop for InodeCache {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.state.try_lock() {
+        if let Ok(mut state) = self.state.try_write() {
             for page in state.pages.values_mut() {
                 page.clear();
                 self.cm.release_usage(self.page_size);
@@ -447,6 +560,7 @@ impl Drop for InodeCache {
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,7 +622,7 @@ mod tests {
         let cache = test_cache(&test_conf(4096));
         assert_eq!(cache.write(0, Bytes::new()).await.unwrap(), 0);
         assert_eq!(cache.len(), 0);
-        assert_eq!(cache.cache_len().await, 0);
+        assert_eq!(cache.page_len(), 0);
     }
 
     #[tokio::test]
@@ -517,7 +631,7 @@ mod tests {
         cache.write(0, bytes(&vec![1u8; 4096])).await.unwrap();
         cache.write(4096, bytes(&vec![2u8; 4096])).await.unwrap();
         assert_eq!(cache.len(), 8192);
-        assert_eq!(cache.cache_len().await, 8192);
+        assert_eq!(cache.page_len(), 8192);
 
         let got = read_all(&cache, 4000, 200).await;
         assert_eq!(&got[..96], &[1u8; 96]);
@@ -530,7 +644,7 @@ mod tests {
         cache.write(100, bytes(b"abc")).await.unwrap();
         assert_eq!(cache.len(), 103);
         assert_eq!(read_all(&cache, 100, 3).await, b"abc");
-        assert_eq!(cache.cache_len().await, 3);
+        assert_eq!(cache.page_len(), 3);
     }
 
     #[tokio::test]
@@ -564,7 +678,7 @@ mod tests {
         cache.write(5000, bytes(b"tail")).await.unwrap();
         cache.truncate().await.unwrap();
         assert_eq!(cache.len(), 0);
-        assert_eq!(cache.cache_len().await, 0);
+        assert_eq!(cache.page_len(), 0);
         assert!(cache.is_empty());
         assert_eq!(cache.cm.used(), 0);
     }
@@ -575,12 +689,13 @@ mod tests {
         cache.write(0, bytes(&vec![1u8; 4096])).await.unwrap();
         cache.write(5000, bytes(b"tail")).await.unwrap();
 
-        assert_eq!(cache.free_pages(false).await, 0);
-        assert_eq!(cache.cache_len().await, 4100);
+        assert_eq!(cache.free_pages(false), 0);
+        assert_eq!(cache.page_len(), 4100);
 
-        assert_eq!(cache.take_dirty_pages().await.unwrap().len(), 1);
-        assert_eq!(cache.free_pages(false).await, 4096);
-        assert_eq!(cache.cache_len().await, 4);
+        assert_eq!(cache.take_dirty_pages().unwrap().len(), 1);
+        cache.finish_flush_all(&[0]);
+        assert_eq!(cache.free_pages(false), 4096);
+        assert_eq!(cache.page_len(), 4);
         assert_eq!(cache.cm.used(), 4096);
     }
 
@@ -589,8 +704,8 @@ mod tests {
         let cache = test_cache(&test_conf(4096));
         cache.write(0, bytes(b"hello")).await.unwrap();
         cache.write(5000, bytes(b"tail")).await.unwrap();
-        assert_eq!(cache.free_pages(true).await, 8192);
-        assert_eq!(cache.cache_len().await, 0);
+        assert_eq!(cache.free_pages(true), 8192);
+        assert_eq!(cache.page_len(), 0);
         assert_eq!(cache.cm.used(), 0);
     }
 
@@ -598,9 +713,9 @@ mod tests {
     async fn take_dirty_pages_copies_data() {
         let cache = test_cache(&test_conf(4096));
         cache.write(0, bytes(&vec![1u8; 4096])).await.unwrap();
-        let pages = cache.take_dirty_pages().await.unwrap();
+        let pages = cache.take_dirty_pages().unwrap();
         assert_eq!(pages.len(), 1);
-        let mut page = pages.into_iter().next().unwrap();
+        let page = pages.into_iter().next().unwrap();
         assert_eq!(page.page_id, 0);
         assert_eq!(page.start(), 0);
         assert_eq!(&page.read(0, 4).unwrap()[..], &[1u8; 4]);
@@ -634,11 +749,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn usage_tracks_write_len() {
+    async fn ensure_flushed_skips_when_nothing_written() {
+        let cache = test_cache(&test_conf(4096));
+        assert_eq!(cache.ensure_flushed().await.unwrap(), 0);
+        cache.flush().await.unwrap();
+        assert_eq!(cache.ensure_flushed().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn usage_reserves_full_page() {
         let cache = test_cache(&test_conf(4096));
         cache.write(0, bytes(b"hello")).await.unwrap();
         assert_eq!(cache.cm.used(), 4096);
-        assert_eq!(cache.cache_len().await, 5);
+        assert_eq!(cache.page_len(), 5);
+    }
+
+    #[tokio::test]
+    async fn allocate_enospc_when_capacity_below_page_size() {
+        let conf = FuseConf {
+            write_back_cache_type: "memory".to_string(),
+            write_back_page_size: ByteUnit::new(4096),
+            write_back_cache_size: ByteUnit::new(16),
+            ..Default::default()
+        };
+        let cache = test_cache(&conf);
+        let (unwritten, notify) = cache
+            .state
+            .write()
+            .write(&cache, 0, bytes(b"hello"))
+            .unwrap();
+        assert_eq!(unwritten.len(), 1);
+        assert_eq!(unwritten[0].0, 0);
+        assert_eq!(&unwritten[0].1[..], b"hello");
+        assert!(!notify);
+        assert_eq!(cache.cm.used(), 0);
     }
 
     #[tokio::test]
@@ -667,7 +811,7 @@ mod tests {
         let data: Vec<u8> = (0..5000u64).map(|i| (i % 251) as u8).collect();
         assert_eq!(cache.write(3000, bytes(&data)).await.unwrap(), 5000);
         assert_eq!(cache.len(), 8000);
-        assert_eq!(cache.cache_len().await, 5000);
+        assert_eq!(cache.page_len(), 5000);
         let got = read_all(&cache, 3000, 5000).await;
         assert_eq!(got, data);
     }

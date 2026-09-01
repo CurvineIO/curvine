@@ -1480,11 +1480,10 @@ impl NodeState {
         flags: RenameFlags,
     ) -> FuseResult<()> {
         if self.enable_write_back {
-            self.dir_read()
-                .check_rename_conflict(old_id, old_name, new_id, new_name)?;
-
             let ino = {
                 let dir = self.dir_read();
+                dir.check_rename_conflict(old_id, old_name, new_id, new_name)?;
+
                 let inode = dir.get_inode_check(old_id, Some(old_name))?;
                 if inode.is_dir {
                     None

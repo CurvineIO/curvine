@@ -120,12 +120,11 @@ impl NodeState {
         let mut infos = Vec::with_capacity(inos.len());
         for ino in inos {
             if let Some(entry) = cache.get_cache(ino).await {
-                let page = entry.lock().await;
                 infos.push(CacheInfo {
                     ino,
                     path: String::new(),
                     has_write: entry.writer.lock().await.is_some(),
-                    cache_usage: page.cache_len() as usize,
+                    cache_usage: entry.page_len() as usize,
                     len: entry.len(),
                 });
             }

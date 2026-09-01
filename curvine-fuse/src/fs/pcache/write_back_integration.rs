@@ -968,3 +968,67 @@ fn write_back_backend_error_propagates() {
         assert!(cache.flush().await.is_err());
     });
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn write_back_flush_failure_drops_dirty_state() {
+    let rt = Arc::new(AsyncRuntime::single());
+    let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
+    rt.block_on(async move {
+        let handle = ctx.create_file("fail_drop.bin").await;
+        let cache = ctx.cm.get_cache(handle.ino()).await.unwrap();
+
+        // A writer that always fails: /dev/full.
+        let fail_path = Path::from_str("/dev/full").unwrap();
+        let page_size = ctx.conf.write_back_page_size.as_byte() as usize;
+        let fail_writer = Arc::new(FuseWriter::new(
+            &ctx.conf,
+            ctx.rt.clone(),
+            UnifiedWriter::Local(LocalWriter::new(&fail_path, page_size).unwrap()),
+        ));
+        *cache.writer.lock().await = Some(fail_writer.clone());
+
+        ctx.write_via_fuse(&handle, 0, &pattern_data(1024)).await;
+
+        assert!(cache.flush().await.is_err(), "flush must fail on /dev/full");
+
+        // The failed flush drops the drained dirty ranges instead of
+        // restoring them: nothing may be taken for a retry.
+        assert!(
+            cache.take_dirty_pages().unwrap().is_empty(),
+            "failed flush must not leave dirty ranges for retry"
+        );
+    });
+}
+
+#[test]
+fn write_back_ensure_flushed_single_flight() {
+    let rt = Arc::new(AsyncRuntime::single());
+    let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
+    rt.block_on(async move {
+        let handle = ctx.create_file("single_flight.bin").await;
+        let (_writer, backend) = ctx
+            .inject_backend(handle.ino(), "backend_single_flight.bin")
+            .await;
+
+        let data = pattern_data(1024);
+        ctx.write_via_fuse(&handle, 0, &data).await;
+
+        let cache = ctx.cm.get_cache(handle.ino()).await.unwrap();
+        let first = futures::future::join_all((0..8).map(|_| cache.ensure_flushed())).await;
+        for result in first {
+            assert_eq!(result.unwrap(), 1);
+        }
+        assert_backend_eq(&backend, &data);
+
+        let again = futures::future::join_all((0..8).map(|_| cache.ensure_flushed())).await;
+        for result in again {
+            assert_eq!(result.unwrap(), 1);
+        }
+
+        ctx.write_via_fuse(&handle, 0, &data).await;
+        assert_eq!(cache.ensure_flushed().await.unwrap(), 2);
+        cache.flush().await.unwrap();
+        assert_eq!(cache.ensure_flushed().await.unwrap(), 2);
+    });
+}

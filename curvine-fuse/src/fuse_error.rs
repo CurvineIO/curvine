@@ -17,6 +17,7 @@ use curvine_error::FsError;
 use curvine_io::IOError;
 use std::fmt;
 use std::fmt::Debug;
+use tokio::task::JoinError;
 use tokio::time::error::Elapsed;
 
 #[derive(Debug)]
@@ -149,6 +150,12 @@ impl From<Elapsed> for FuseError {
         // A tokio timeout is a timeout, same as FsError::Timeout -> ETIMEDOUT;
         // keep both conversion paths consistent instead of degrading to EIO.
         Self::new(libc::ETIMEDOUT, value.into())
+    }
+}
+
+impl From<JoinError> for FuseError {
+    fn from(value: JoinError) -> Self {
+        Self::from(value.to_string())
     }
 }
 
