@@ -462,6 +462,36 @@ mod tests {
         };
         let store = PageStoreVariant::from_conf(&conf).unwrap();
         assert!(matches!(store, PageStoreVariant::Disk(_)));
+        let cache_name = DiskPageStore::cache_dir_name("/curvine-fuse").unwrap();
+        let expected = dir.path().join("curvine-cache").join(cache_name);
+        assert!(
+            expected.is_dir(),
+            "expected stable cache dir {}, got missing",
+            expected.display()
+        );
+    }
+
+    #[test]
+    fn from_conf_disk_wipes_leftover_pages() {
+        let dir = TempDir::new("from_conf_disk_wipe");
+        let cache_name = DiskPageStore::cache_dir_name("/curvine-fuse").unwrap();
+        let cache_dir = dir.path().join("curvine-cache").join(cache_name);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let stale = cache_dir.join("1_0");
+        std::fs::write(&stale, b"stale").unwrap();
+
+        let conf = FuseConf {
+            write_back_cache_type: "disk".to_string(),
+            write_back_disk_dirs: vec![dir.path().to_str().unwrap().to_string()],
+            ..Default::default()
+        };
+        PageStoreVariant::from_conf(&conf).unwrap();
+
+        assert!(cache_dir.is_dir());
+        assert!(
+            !stale.exists(),
+            "stale page file must be removed on startup"
+        );
     }
 
     #[test]
