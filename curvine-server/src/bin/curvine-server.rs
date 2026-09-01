@@ -14,7 +14,7 @@
 
 use clap::Parser;
 use curvine_alloc as _;
-use curvine_config::ClusterConf;
+use curvine_config::{ClusterConf, ConfigLoader};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_data_transfer::transfer::TransferServer;
 use curvine_master::master::Master;
@@ -110,12 +110,27 @@ impl ServerArgs {
     }
 
     pub fn get_conf(&self, service: &ServiceType) -> CommonResult<ClusterConf> {
-        match service {
-            ServiceType::Transfer => ClusterConf::from_transfer(&self.conf),
-            ServiceType::Master | ServiceType::Worker | ServiceType::Mds => {
-                ClusterConf::from(&self.conf)
-            }
-        }
+        // Unified discovery: `--conf` > CURVINE_CONF_FILE > well-known
+        // locations (launch scripts export the env var; bare local runs fall
+        // back to ./conf/curvine-cluster.toml).
+        let found = ConfigLoader::discover(Some(&self.conf)).ok_or_else(
+            || -> curvine_core_error::CommonError {
+                format!(
+                    "no configuration file found: pass --conf or set {}, or place \
+                     {} in {{./, ./conf/, ~/.curvine/, $CURVINE_HOME/conf/}}",
+                    ClusterConf::ENV_CONF_FILE,
+                    ConfigLoader::DEFAULT_FILE_NAME
+                )
+                .into()
+            },
+        )?;
+        println!("Loading config from {} ({})", found.as_str(), found.source);
+
+        let load = match service {
+            ServiceType::Transfer => ClusterConf::from_transfer,
+            ServiceType::Master | ServiceType::Worker | ServiceType::Mds => ClusterConf::from,
+        };
+        load(found.as_str())
     }
 }
 
@@ -147,6 +162,27 @@ mod tests {
 
         assert!(args.version_json);
         assert_eq!(args.component_name(), "server");
+    }
+
+    #[test]
+    fn get_conf_loads_from_discovered_config() {
+        let tmpdir = std::env::temp_dir().join(format!("cv-test-srv-conf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmpdir);
+        std::fs::create_dir_all(tmpdir.join("conf")).unwrap();
+        let conf_path = tmpdir.join("conf").join(ConfigLoader::DEFAULT_FILE_NAME);
+        std::fs::write(&conf_path, "[master]\nhostname = \"test-master\"\n").unwrap();
+
+        let args = ServerArgs::try_parse_from([
+            "curvine-server",
+            "--conf",
+            conf_path.to_str().unwrap(),
+            "--service",
+            "master",
+        ])
+        .expect("parse server args");
+        let conf = args.get_conf(&ServiceType::Master).unwrap();
+        assert_eq!(conf.master.hostname, "test-master");
+        let _ = std::fs::remove_dir_all(&tmpdir);
     }
 
     #[test]
