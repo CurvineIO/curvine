@@ -237,11 +237,32 @@ impl BlockStore {
         off: i64,
         logical_len: i64,
     ) -> CommonResult<(BlockMeta, BlockReadContext)> {
+        self.open_reader_by_id_inner(id, off, Some(logical_len))
+    }
+
+    /// Opens the currently readable generation using its stored metadata length
+    /// as the logical read boundary. This is intended for internal block copies
+    /// that do not have a client-provided logical length.
+    pub fn open_reader_by_id_at_stored_len(
+        &self,
+        id: i64,
+        off: i64,
+    ) -> CommonResult<(BlockMeta, BlockReadContext)> {
+        self.open_reader_by_id_inner(id, off, None)
+    }
+
+    fn open_reader_by_id_inner(
+        &self,
+        id: i64,
+        off: i64,
+        logical_len: Option<i64>,
+    ) -> CommonResult<(BlockMeta, BlockReadContext)> {
         let state = self.read()?;
         let meta = state
             .get_readable_block(id)
             .ok_or_else(|| curvine_core_error::err_msg!(format!("block {} not exists", id)))?
             .clone();
+        let logical_len = logical_len.unwrap_or_else(|| meta.len());
         let (layout, dir) = state.layout_for(&meta)?;
         let reader = layout.open_reader(&dir, &meta, off, logical_len)?;
         Ok((meta, reader))
@@ -605,12 +626,24 @@ mod tests {
             .expect("rewrite finalize must reserve");
         let plan = reservation.prepare(block.len)?;
 
-        let (_, mut committed_reader) = store.open_reader_by_id(block.id, 0, block.len)?;
+        let (_, mut committed_reader) = store.open_reader_by_id_at_stored_len(block.id, 0)?;
         store.write()?.publish_file_finalize(&reservation, plan)?;
         assert_eq!(read_bytes(&mut committed_reader, 4)?, b"old!");
 
-        let (_, mut published_reader) = store.open_reader_by_id(block.id, 0, block.len)?;
+        let (_, mut published_reader) = store.open_reader_by_id_at_stored_len(block.id, 0)?;
         assert_eq!(read_bytes(&mut published_reader, 4)?, b"new!");
+        Ok(())
+    }
+
+    #[test]
+    fn stored_len_reader_reads_finalized_block() -> CommonResult<()> {
+        let store = create_store_with_capacity("stored-len-reader", "16MB")?;
+        let block = ExtendedBlock::with_mem(1, "4B")?;
+        finalize_block(&store, &block)?;
+
+        let (meta, mut reader) = store.open_reader_by_id_at_stored_len(block.id, 0)?;
+        assert_eq!(meta.len(), block.len);
+        assert_eq!(read_bytes(&mut reader, block.len as i32)?, vec![0; 4]);
         Ok(())
     }
 

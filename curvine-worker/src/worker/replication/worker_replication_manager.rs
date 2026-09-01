@@ -120,7 +120,9 @@ impl WorkerReplicationManager {
             Ok(permit) => permit,
             Err(e) => return err_box!("replication semaphore closed: {}", e),
         };
-        let (block_meta, mut reader) = self.block_store.open_reader_by_id(job.block_id, 0, 0)?;
+        let (block_meta, mut reader) = self
+            .block_store
+            .open_reader_by_id_at_stored_len(job.block_id, 0)?;
         if block_meta.state != BlockState::Finalized {
             return err_box!("Block: {} is not finalized", job.block_id);
         }
