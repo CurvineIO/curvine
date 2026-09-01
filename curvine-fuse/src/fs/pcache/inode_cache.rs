@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use crate::fs::pcache::{CacheManager, DirtyMessage, Page, PageStore};
+use crate::fs::pcache::{CacheManager, DirtyMessage, Page};
 use crate::fs::FuseWriter;
 use crate::{FuseError, FuseMetrics, FuseResult};
 
@@ -46,7 +46,7 @@ impl PageState {
 
     fn get_or_create_page(&mut self, cache: &InodeCache, page_id: u64) -> FuseResult<&mut Page> {
         if self.pages.get_mut(&page_id).is_none() {
-            let page = cache.cm.store.allocate(cache.ino, page_id)?;
+            let page = cache.cm.allocate_page(cache.ino, page_id)?;
             self.pages.insert(page_id, page);
         }
         Ok(self.pages.get_mut(&page_id).unwrap())
@@ -68,13 +68,10 @@ impl PageState {
             let take = (len - src).min(cache.cm.page_size - page_off);
 
             let page = self.get_or_create_page(cache, page_id)?;
-            let old_len = page.len();
             page.write(page_off, &data[src as usize..(src + take) as usize])?;
             page.mark_dirty(page_off, page_off + take);
 
-            let new_len = page.len();
-            cache.cm.add_usage(new_len - old_len);
-            if new_len >= cache.cm.page_size {
+            if page.len() >= cache.cm.page_size {
                 notify_full_page = true;
             }
 
@@ -388,12 +385,15 @@ impl InodeCache {
                 return true;
             }
 
-            let len = page.clear();
-            self.cm.release_usage(len);
-            freed += len;
+            page.clear();
+            self.cm.release_usage(self.page_size);
+            freed += self.page_size;
 
             false
         });
+        if freed > 0 {
+            self.cm.refresh_full();
+        }
         freed
     }
 
@@ -441,8 +441,8 @@ impl Drop for InodeCache {
     fn drop(&mut self) {
         if let Ok(mut state) = self.state.try_lock() {
             for page in state.pages.values_mut() {
-                let len = page.clear();
-                self.cm.release_usage(len);
+                page.clear();
+                self.cm.release_usage(self.page_size);
             }
         }
     }
@@ -566,7 +566,7 @@ mod tests {
         assert_eq!(cache.len(), 0);
         assert_eq!(cache.cache_len().await, 0);
         assert!(cache.is_empty());
-        assert_eq!(cache.cm.store.used(), 0);
+        assert_eq!(cache.cm.used(), 0);
     }
 
     #[tokio::test]
@@ -581,7 +581,7 @@ mod tests {
         assert_eq!(cache.take_dirty_pages().await.unwrap().len(), 1);
         assert_eq!(cache.free_pages(false).await, 4096);
         assert_eq!(cache.cache_len().await, 4);
-        assert_eq!(cache.cm.store.used(), 4);
+        assert_eq!(cache.cm.used(), 4096);
     }
 
     #[tokio::test]
@@ -589,9 +589,9 @@ mod tests {
         let cache = test_cache(&test_conf(4096));
         cache.write(0, bytes(b"hello")).await.unwrap();
         cache.write(5000, bytes(b"tail")).await.unwrap();
-        assert_eq!(cache.free_pages(true).await, 9);
+        assert_eq!(cache.free_pages(true).await, 8192);
         assert_eq!(cache.cache_len().await, 0);
-        assert_eq!(cache.cm.store.used(), 0);
+        assert_eq!(cache.cm.used(), 0);
     }
 
     #[tokio::test]
@@ -637,7 +637,7 @@ mod tests {
     async fn usage_tracks_write_len() {
         let cache = test_cache(&test_conf(4096));
         cache.write(0, bytes(b"hello")).await.unwrap();
-        assert_eq!(cache.cm.store.used(), 5);
+        assert_eq!(cache.cm.used(), 4096);
         assert_eq!(cache.cache_len().await, 5);
     }
 

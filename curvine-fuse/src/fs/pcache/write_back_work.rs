@@ -371,7 +371,7 @@ mod tests {
         let mut conf = test_conf(4096);
         conf.write_back_free_ratio = 0.5;
         let (cm, _receiver) = test_cm(&conf);
-        cm.store.add_usage(cm.store.capacity());
+        cm.store.add_usage(cm.store.capacity()).unwrap();
         assert!(cm.need_evict());
         WriteBackWork::evict_inodes(&cm).await;
         assert!(cm.is_full());

@@ -234,7 +234,7 @@ fn write_back_small_file_roundtrip() {
         let data = pattern_data(100);
         ctx.write_via_fuse(&handle, 0, &data).await;
 
-        assert_eq!(ctx.cm.used(), 100);
+        assert_eq!(ctx.cm.used(), PAGE_SIZE);
         assert_eq!(ctx.cm.get_cache(ino).await.unwrap().len(), 100);
         assert_eq!(
             std::fs::metadata(&backend).unwrap().len(),
@@ -255,7 +255,7 @@ fn write_back_small_file_roundtrip() {
         assert_backend_eq(&backend, &data);
         assert_eq!(
             ctx.cm.used(),
-            100,
+            PAGE_SIZE,
             "partial page must be retained after flush"
         );
     });
@@ -647,6 +647,7 @@ fn write_back_direct_write_when_cache_full() {
             off += CHUNK;
         }
 
+        assert!(ctx.cm.need_evict());
         assert!(ctx.cm.is_full());
 
         let extra = vec![0xee; 1024];
@@ -718,7 +719,7 @@ fn write_back_truncate_clears_cache() {
 
         let old = pattern_data(2048);
         ctx.write_via_fuse(&handle, 0, &old).await;
-        assert_eq!(ctx.cm.used(), 2048);
+        assert_eq!(ctx.cm.used(), PAGE_SIZE);
 
         let cache = ctx
             .cm
@@ -798,7 +799,11 @@ fn write_back_evict_preserves_partial_pages() {
         WriteBackWork::evict_inodes(&ctx.cm).await;
         writer.flush(None).await.unwrap();
 
-        assert_eq!(ctx.cm.used(), 1024, "partial page must survive eviction");
+        assert_eq!(
+            ctx.cm.used(),
+            PAGE_SIZE,
+            "partial page must survive eviction"
+        );
         let cache = ctx.cm.get_cache(handle.ino()).await.unwrap();
         assert_bytes_eq(
             &ctx.read_cache(&cache, TOTAL as u64, 1024).await,
@@ -860,7 +865,7 @@ fn write_back_commit_all_flushes_only_full_pages() {
         writer.flush(None).await.unwrap();
 
         assert_backend_eq(&backend, &full);
-        assert_eq!(ctx.cm.used(), 1024, "partial page must stay cached");
+        assert_eq!(ctx.cm.used(), PAGE_SIZE, "partial page must stay cached");
 
         let cache = ctx.cm.get_cache(handle.ino()).await.unwrap();
         assert_bytes_eq(

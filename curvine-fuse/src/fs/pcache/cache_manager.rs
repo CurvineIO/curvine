@@ -13,16 +13,17 @@
 //  limitations under the License.
 
 use crate::fs::pcache::{
-    DirtyMessage, DiskPageStore, EvictInode, InodeCache, MemoryPageStore, PageStore,
+    DirtyMessage, DiskPageStore, EvictInode, InodeCache, MemoryPageStore, Page, PageStore,
     PageStoreVariant,
 };
 use crate::fs::state::NodeState;
+use crate::macros::err_fuse;
 use crate::{FuseError, FuseResult};
 use curvine_config::FuseConf;
 use curvine_core_error::err_box;
 use curvine_model::{CreateFileOpts, OpenFlags};
 use curvine_runtime::sync::channel::{AsyncSender, CallChannel};
-use curvine_runtime::sync::AsyncSharedMap;
+use curvine_runtime::sync::{AsyncSharedMap, AtomicBool};
 use std::sync::{Arc, OnceLock, Weak};
 
 pub struct CacheManager {
@@ -32,6 +33,7 @@ pub struct CacheManager {
     pub(crate) state: OnceLock<Weak<NodeState>>,
     pub(crate) sender: AsyncSender<DirtyMessage>,
     pub(crate) free_ratio: f64,
+    is_full: AtomicBool,
 }
 
 impl CacheManager {
@@ -44,6 +46,7 @@ impl CacheManager {
         };
 
         let page_size = store.page_size();
+        let is_full = store.free_ratio() < conf.write_back_free_ratio / 2f64;
         let cm = CacheManager {
             caches: AsyncSharedMap::default(),
             store: Arc::new(store),
@@ -51,6 +54,7 @@ impl CacheManager {
             state: OnceLock::new(),
             sender,
             free_ratio: conf.write_back_free_ratio,
+            is_full: AtomicBool::new(is_full),
         };
         Ok(cm)
     }
@@ -98,6 +102,16 @@ impl CacheManager {
         off % self.page_size as u64
     }
 
+    pub fn allocate_page(&self, ino: u64, page_id: u64) -> FuseResult<Page> {
+        if self.is_full() {
+            return err_fuse!(
+                libc::ENOSPC,
+                "write-back cache is full (water level); eviction or flush required"
+            );
+        }
+        self.store.allocate(ino, page_id)
+    }
+
     pub fn bind_state(&self, state: &Arc<NodeState>) {
         let _ = self.state.set(Arc::downgrade(state));
     }
@@ -133,23 +147,32 @@ impl CacheManager {
     }
 
     pub fn need_evict(&self) -> bool {
-        self.store.free_ratio() < self.free_ratio
+        let ratio = self.store.free_ratio();
+        self.is_full.set(ratio < self.free_ratio / 2f64);
+        ratio < self.free_ratio
+    }
+
+    /// Recompute the cached water-level flag from the current free ratio.
+    /// Sets `is_full` to true or false; it does not unconditionally mark the cache full.
+    pub fn refresh_full(&self) {
+        let ratio = self.store.free_ratio();
+        self.is_full.set(ratio < self.free_ratio / 2f64);
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.is_full.get()
     }
 
     pub fn free_target(&self) -> u64 {
         (self.store.capacity() as f64 * self.free_ratio) as u64
     }
 
-    pub fn add_usage(&self, len: u64) {
-        self.store.add_usage(len);
+    pub fn add_usage(&self, len: u64) -> FuseResult<()> {
+        self.store.add_usage(len)
     }
 
     pub fn release_usage(&self, len: u64) {
         self.store.release_usage(len);
-    }
-
-    pub fn is_full(&self) -> bool {
-        self.store.free_ratio() < self.free_ratio / 2f64
     }
 
     pub async fn get_or_create(
@@ -378,8 +401,8 @@ mod tests {
         let cm = test_cm(&test_conf(PAGE_SIZE, PAGE_SIZE * 16, 0.1));
         assert_eq!(cm.capacity(), PAGE_SIZE * 16);
         assert_eq!(cm.used(), 0);
-        cm.store.add_usage(100);
-        cm.store.add_usage(50);
+        cm.store.add_usage(100).unwrap();
+        cm.store.add_usage(50).unwrap();
         assert_eq!(cm.used(), 150);
     }
 
@@ -387,9 +410,9 @@ mod tests {
     async fn free_ratio_reflects_usage() {
         let cm = test_cm(&test_conf(PAGE_SIZE, 1000, 0.1));
         assert_eq!(cm.free_ratio(), 1.0);
-        cm.store.add_usage(250);
+        cm.store.add_usage(250).unwrap();
         assert!((cm.free_ratio() - 0.75).abs() < f64::EPSILON);
-        cm.store.add_usage(750);
+        cm.store.add_usage(750).unwrap();
         assert_eq!(cm.free_ratio(), 0.0);
     }
 
@@ -397,9 +420,9 @@ mod tests {
     async fn need_evict_triggers_below_free_ratio() {
         let cm = test_cm(&test_conf(PAGE_SIZE, 1000, 0.1));
         assert!(!cm.need_evict());
-        cm.store.add_usage(899);
+        cm.store.add_usage(899).unwrap();
         assert!(!cm.need_evict());
-        cm.store.add_usage(2);
+        cm.store.add_usage(2).unwrap();
         assert!(cm.need_evict());
     }
 
@@ -407,9 +430,11 @@ mod tests {
     async fn is_full_when_free_ratio_below_half_threshold() {
         let cm = test_cm(&test_conf(PAGE_SIZE, 1000, 0.1));
         assert!(!cm.is_full());
-        cm.store.add_usage(940);
+        cm.store.add_usage(940).unwrap();
+        cm.refresh_full();
         assert!(!cm.is_full());
-        cm.store.add_usage(20);
+        cm.store.add_usage(20).unwrap();
+        cm.refresh_full();
         assert!(cm.is_full());
     }
 

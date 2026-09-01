@@ -13,18 +13,110 @@
 //  limitations under the License.
 
 use crate::fs::pcache::{DiskPageStore, MemoryPageStore, Page};
+use crate::macros::err_fuse;
 use crate::FuseResult;
 use curvine_config::FuseConf;
 use curvine_core_error::err_box;
+use curvine_runtime::sync::AtomicCounter;
+use log::warn;
+
+pub struct PageStoreQuota {
+    page_size: u64,
+    capacity: u64,
+    used: AtomicCounter,
+}
+
+impl PageStoreQuota {
+    pub fn new(page_size: u64, capacity: u64) -> Self {
+        Self {
+            page_size,
+            capacity,
+            used: AtomicCounter::new(0),
+        }
+    }
+
+    pub fn page_size(&self) -> u64 {
+        self.page_size
+    }
+
+    pub fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    pub fn used(&self) -> u64 {
+        self.used.get()
+    }
+
+    pub fn add_usage(&self, len: u64) -> FuseResult<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        loop {
+            let current = self.used.get();
+            let Some(new) = current.checked_add(len) else {
+                return err_fuse!(libc::ENOSPC, "page store reservation overflow");
+            };
+            if new > self.capacity {
+                return err_fuse!(libc::ENOSPC, "page store is full");
+            }
+            if self.used.compare_and_set(current, new) {
+                return Ok(());
+            }
+        }
+    }
+
+    pub fn release_usage(&self, len: u64) {
+        loop {
+            let current = self.used.get();
+            let new = current.saturating_sub(len);
+            if self.used.compare_and_set(current, new) {
+                if current < len {
+                    warn!(
+                        "page store release underflow: used={}, release={}, clamp to 0",
+                        current, len
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    pub fn free_ratio(&self) -> f64 {
+        if self.capacity == 0 {
+            return 0.0;
+        }
+        (self.capacity.saturating_sub(self.used()) as f64 / self.capacity as f64).min(1.0)
+    }
+}
 
 pub trait PageStore: Send + Sync {
-    fn page_size(&self) -> u64;
+    fn quota(&self) -> &PageStoreQuota;
+
     fn allocate(&self, ino: u64, page_id: u64) -> FuseResult<Page>;
-    fn add_usage(&self, len: u64);
-    fn release_usage(&self, len: u64);
-    fn capacity(&self) -> u64;
-    fn used(&self) -> u64;
-    fn free_ratio(&self) -> f64;
+
+    fn page_size(&self) -> u64 {
+        self.quota().page_size()
+    }
+
+    fn add_usage(&self, len: u64) -> FuseResult<()> {
+        self.quota().add_usage(len)
+    }
+
+    fn release_usage(&self, len: u64) {
+        self.quota().release_usage(len)
+    }
+
+    fn capacity(&self) -> u64 {
+        self.quota().capacity()
+    }
+
+    fn used(&self) -> u64 {
+        self.quota().used()
+    }
+
+    fn free_ratio(&self) -> f64 {
+        self.quota().free_ratio()
+    }
 }
 
 pub enum PageStoreVariant {
@@ -47,13 +139,17 @@ impl PageStoreVariant {
 
         Ok(store)
     }
+
+    pub fn is_mem(&self) -> bool {
+        matches!(self, PageStoreVariant::Memory(_))
+    }
 }
 
 impl PageStore for PageStoreVariant {
-    fn page_size(&self) -> u64 {
+    fn quota(&self) -> &PageStoreQuota {
         match self {
-            PageStoreVariant::Disk(s) => s.page_size(),
-            PageStoreVariant::Memory(s) => s.page_size(),
+            PageStoreVariant::Disk(s) => s.quota(),
+            PageStoreVariant::Memory(s) => s.quota(),
         }
     }
 
@@ -64,37 +160,9 @@ impl PageStore for PageStoreVariant {
         }
     }
 
-    fn add_usage(&self, len: u64) {
-        match self {
-            PageStoreVariant::Disk(s) => DiskPageStore::add_usage(s, len),
-            PageStoreVariant::Memory(s) => s.add_usage(len),
-        }
-    }
-
-    fn release_usage(&self, len: u64) {
-        match self {
-            PageStoreVariant::Disk(s) => DiskPageStore::release_usage(s, len),
-            PageStoreVariant::Memory(s) => s.release_usage(len),
-        }
-    }
-
-    fn capacity(&self) -> u64 {
-        match self {
-            PageStoreVariant::Disk(s) => s.capacity(),
-            PageStoreVariant::Memory(s) => s.capacity(),
-        }
-    }
-
-    fn used(&self) -> u64 {
-        match self {
-            PageStoreVariant::Disk(s) => s.used(),
-            PageStoreVariant::Memory(s) => s.used(),
-        }
-    }
-
     fn free_ratio(&self) -> f64 {
         match self {
-            PageStoreVariant::Disk(s) => DiskPageStore::free_ratio(s),
+            PageStoreVariant::Disk(s) => s.free_ratio(),
             PageStoreVariant::Memory(s) => s.free_ratio(),
         }
     }
@@ -177,27 +245,27 @@ mod tests {
     #[test]
     fn add_usage_accumulates() {
         let mem = memory_store(PAGE_SIZE, CAPACITY);
-        mem.add_usage(100);
-        mem.add_usage(50);
+        mem.add_usage(100).unwrap();
+        mem.add_usage(50).unwrap();
         assert_eq!(mem.used(), 150);
 
         let dir = TempDir::new("add_usage");
         let disk = disk_store(PAGE_SIZE, CAPACITY, &dir);
-        disk.add_usage(100);
-        disk.add_usage(50);
+        disk.add_usage(100).unwrap();
+        disk.add_usage(50).unwrap();
         assert_eq!(disk.used(), 150);
     }
 
     #[test]
     fn release_usage_decrements() {
         let mem = memory_store(PAGE_SIZE, CAPACITY);
-        mem.add_usage(100);
+        mem.add_usage(100).unwrap();
         mem.release_usage(40);
         assert_eq!(mem.used(), 60);
 
         let dir = TempDir::new("release_usage");
         let disk = disk_store(PAGE_SIZE, CAPACITY, &dir);
-        disk.add_usage(100);
+        disk.add_usage(100).unwrap();
         disk.release_usage(40);
         assert_eq!(disk.used(), 60);
     }
@@ -205,13 +273,13 @@ mod tests {
     #[test]
     fn release_usage_saturates_at_zero() {
         let mem = memory_store(PAGE_SIZE, CAPACITY);
-        mem.add_usage(10);
+        mem.add_usage(10).unwrap();
         mem.release_usage(100);
         assert_eq!(mem.used(), 0);
 
         let dir = TempDir::new("release_saturate");
         let disk = disk_store(PAGE_SIZE, CAPACITY, &dir);
-        disk.add_usage(10);
+        disk.add_usage(10).unwrap();
         disk.release_usage(100);
         assert_eq!(disk.used(), 0);
     }
@@ -252,15 +320,16 @@ mod tests {
     #[test]
     fn memory_allocate_exceeds_capacity_fails() {
         let store = memory_store(PAGE_SIZE, PAGE_SIZE);
-        store.add_usage(PAGE_SIZE);
+        store.add_usage(PAGE_SIZE).unwrap();
         let err = store.allocate(1, 0).err().unwrap();
         assert_eq!(err.errno, libc::ENOSPC);
+        assert_eq!(store.used(), PAGE_SIZE);
     }
 
     #[test]
     fn memory_allocate_at_capacity_boundary_succeeds() {
         let store = memory_store(PAGE_SIZE, PAGE_SIZE * 2);
-        store.add_usage(PAGE_SIZE);
+        store.add_usage(PAGE_SIZE).unwrap();
         let page = store.allocate(1, 0).unwrap();
         assert_eq!(page.page_id, 0);
         assert_eq!(page.start(), 0);
@@ -276,7 +345,7 @@ mod tests {
     #[test]
     fn memory_free_ratio_after_usage() {
         let store = memory_store(100, 1000);
-        store.add_usage(250);
+        store.add_usage(250).unwrap();
         assert!((store.free_ratio() - 0.75).abs() < f64::EPSILON);
     }
 
@@ -287,10 +356,13 @@ mod tests {
     }
 
     #[test]
-    fn memory_free_ratio_used_exceeds_capacity() {
+    fn add_usage_rejects_over_capacity() {
         let store = memory_store(100, 1000);
-        store.add_usage(2000);
+        store.add_usage(1000).unwrap();
         assert_eq!(store.free_ratio(), 0.0);
+        let err = store.add_usage(1).err().unwrap();
+        assert_eq!(err.errno, libc::ENOSPC);
+        assert_eq!(store.used(), 1000);
     }
 
     #[test]
