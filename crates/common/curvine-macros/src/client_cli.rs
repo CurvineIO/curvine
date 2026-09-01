@@ -69,6 +69,7 @@ fn derive_client_cli_args_impl(input: &DeriveInput) -> syn::Result<TokenStream2>
         let field_attr = client_cli_attr(field)?;
         let octal = field_attr.as_ref().is_some_and(|a| a.octal);
         let long = cli_long_name(field, &container)?;
+        let alias = client_cli_alias(field)?;
         let arg_id = cli_arg_id(ident, &container);
         let field_is_option = unwrap_option_type(&field.ty).is_some();
         let inner_ty = unwrap_option_type(&field.ty).unwrap_or(&field.ty);
@@ -78,8 +79,17 @@ fn derive_client_cli_args_impl(input: &DeriveInput) -> syn::Result<TokenStream2>
             quote! { Option<#inner_ty> }
         };
 
+        let arg_attr = match &alias {
+            Some(alias) => quote! {
+                #[arg(long = #long, alias = #alias, id = #arg_id)]
+            },
+            None => quote! {
+                #[arg(long = #long, id = #arg_id)]
+            },
+        };
+
         override_fields.push(quote! {
-            #[arg(long = #long, id = #arg_id)]
+            #arg_attr
             pub #ident: #ty,
         });
         apply_stmts.push(if octal {
@@ -249,6 +259,7 @@ struct ClientCliAttr {
     skip: bool,
     long: Option<String>,
     octal: bool,
+    alias: Option<String>,
 }
 
 impl syn::parse::Parse for ClientCliAttr {
@@ -258,11 +269,13 @@ impl syn::parse::Parse for ClientCliAttr {
                 skip: false,
                 long: None,
                 octal: false,
+                alias: None,
             });
         }
         let mut skip = false;
         let mut long = None;
         let mut octal = false;
+        let mut alias = None;
         while !input.is_empty() {
             let ident: syn::Ident = input.parse()?;
             if ident == "skip" {
@@ -277,6 +290,14 @@ impl syn::parse::Parse for ClientCliAttr {
                 } else {
                     return Err(input.error("long must be a string literal"));
                 }
+            } else if ident == "alias" {
+                input.parse::<syn::Token![=]>()?;
+                let lit: Lit = input.parse()?;
+                if let Lit::Str(s) = lit {
+                    alias = Some(s.value());
+                } else {
+                    return Err(input.error("alias must be a string literal"));
+                }
             } else {
                 return Err(input.error("unknown client_cli attribute"));
             }
@@ -284,7 +305,12 @@ impl syn::parse::Parse for ClientCliAttr {
                 input.parse::<syn::Token![,]>()?;
             }
         }
-        Ok(ClientCliAttr { skip, long, octal })
+        Ok(ClientCliAttr {
+            skip,
+            long,
+            octal,
+            alias,
+        })
     }
 }
 
@@ -303,6 +329,7 @@ fn client_cli_attr(field: &Field) -> syn::Result<Option<ClientCliAttr>> {
                     skip: false,
                     long: None,
                     octal: false,
+                    alias: None,
                 },
                 Meta::List(list) => syn::parse2::<ClientCliAttr>(list.tokens.clone())?,
                 Meta::NameValue(nv) => {
@@ -316,6 +343,12 @@ fn client_cli_attr(field: &Field) -> syn::Result<Option<ClientCliAttr>> {
         }
     }
     Ok(found)
+}
+
+/// Extra clap `alias` declared via `#[client_cli(alias = "...")]`, keeping
+/// deprecated flag names working when a struct's CLI surface is generated.
+fn client_cli_alias(field: &Field) -> syn::Result<Option<String>> {
+    Ok(client_cli_attr(field)?.and_then(|attr| attr.alias))
 }
 
 fn cli_long_name(field: &Field, container: &ContainerConfig) -> syn::Result<String> {
