@@ -95,7 +95,7 @@ make build ARGS='--package java --ufs oss-hdfs'
 make build ARGS='--package python --ufs opendal-oss'
 ```
 
-`oss-hdfs` requires JindoSDK at build/link time (`JINDOSDK_HOME`, default `/opt/jindosdk`). Do not enable it for default public artifacts unless that native SDK is available on the build host.
+`oss-hdfs` requires JindoSDK at build/link time (`JINDOSDK_HOME`, default `/opt/jindosdk`). For a Java SDK build with `--ufs oss-hdfs`, the build packages the architecture-matched Jindo runtime in the JAR as `libjindosdk_c_linux_{x86,aarch}_64.so.6`. The Java loader extracts it as `libjindosdk_c.so.6` and calls `System.load` before loading Curvine JNI. Default Java artifacts do not package Jindo; missing Jindo resources are intentionally ignored at runtime.
 
 ---
 

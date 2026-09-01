@@ -16,6 +16,7 @@ package io.curvine;
 
 import java.nio.Buffer;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import org.apache.commons.io.FilenameUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
@@ -88,31 +89,33 @@ public class CurvineNative {
     }
 
     public static String getLibraryName() {
-        String sysOs = System.getProperty("os.name").toLowerCase();
-        String sysArch = System.getProperty("os.arch").toLowerCase();
+        return getLibraryNames().get(0);
+    }
 
-        // Determine platform type
-        String arch;
-        if (sysArch.contains("arm") || sysArch.contains("aarch")) {
-            arch = "aarch";
-        } else if (sysArch.contains("x86") || sysArch.contains("amd")) {
-            arch = "x86";
-        } else {
-            throw new RuntimeException("Unsupported CPU architecture: " + sysArch);
+    private static boolean prepareNativeDependencies(String libraryName) throws IOException {
+        if (!libraryName.startsWith("libcurvine_libsdk_") || !libraryName.endsWith(".so")) {
+            return false;
         }
 
-        if (!sysArch.contains("64")) {
-            throw new RuntimeException("Currently only supports 64-bit systems");
-        }
+        String dependencyResource = CurvineNativeLibraryNames.getDependencyLibraryName(libraryName);
+        String dependencyTarget = CurvineNativeLibraryNames.getDependencySoname(libraryName);
+        return NativeDependencyLoader.loadFromJar(
+                CurvineNative.class.getClassLoader(),
+                WORKDIR,
+                dependencyResource,
+                dependencyTarget,
+                System::load);
+    }
 
-        if (sysOs.contains("win")) {
-            return "curvine_libsdk.dll";
-        } else if (sysOs.contains("linux")) {
-            String osVersion = getOsVersion();
-            return String.format("libcurvine_libsdk_%s_%s_64.so", osVersion, arch);
-        } else {
-            throw new RuntimeException("Unsupported operating systems: " + sysOs);
-        }
+    static List<String> getLibraryNames(String sysOs, String sysArch, String osVersion) {
+        return CurvineNativeLibraryNames.getLibraryNames(sysOs, sysArch, osVersion);
+    }
+
+    public static List<String> getLibraryNames() {
+        return CurvineNativeLibraryNames.getLibraryNames(
+                System.getProperty("os.name").toLowerCase(),
+                System.getProperty("os.arch").toLowerCase(),
+                getOsVersion());
     }
 
     public static String getOsVersion() {
@@ -195,38 +198,52 @@ public class CurvineNative {
      * loading from a real filesystem path before copying to tmp (helps some TLS / dlopen cases).
      */
     public static void load() {
-        String libraryName = getLibraryName();
         Throwable lastFailure = null;
+        List<String> libraryNames = getLibraryNames();
 
         try {
-            System.loadLibrary(loadLibraryLookupName(libraryName));
-            LOGGER.info("Loaded native library {} via System.loadLibrary", libraryName);
-            return;
-        } catch (UnsatisfiedLinkError e) {
-            LOGGER.debug("System.loadLibrary failed for {}: {}", libraryName, e.toString());
-        }
-
-        try {
-            if (loadFromLibraryPathDirectories(libraryName)) {
-                return;
+            if (prepareNativeDependencies(libraryNames.get(0))) {
+                LOGGER.info("Loaded native dependency for {}", libraryNames.get(0));
+            } else {
+                LOGGER.debug("Optional native dependency is not packaged for {}", libraryNames.get(0));
             }
         } catch (Throwable e) {
             lastFailure = e;
-            LOGGER.warn("java.library.path directory scan failed for {}", libraryName, e);
+            LOGGER.warn("Failed to prepare native dependencies for {}", libraryNames.get(0), e);
         }
 
-        try {
-            String extracted = loadLibraryFromJar(libraryName);
-            System.load(extracted);
-            LOGGER.info("Loaded native library {} from jar extract {}", libraryName, extracted);
-            return;
-        } catch (Throwable e) {
-            lastFailure = e;
-            LOGGER.warn("Failed to load {} from jar", libraryName, e);
+        for (String libraryName : libraryNames) {
+            try {
+                System.loadLibrary(loadLibraryLookupName(libraryName));
+                LOGGER.info("Loaded native library {} via System.loadLibrary", libraryName);
+                return;
+            } catch (UnsatisfiedLinkError e) {
+                lastFailure = e;
+                LOGGER.debug("System.loadLibrary failed for {}: {}", libraryName, e.toString());
+            }
+
+            try {
+                if (loadFromLibraryPathDirectories(libraryName)) {
+                    return;
+                }
+            } catch (Throwable e) {
+                lastFailure = e;
+                LOGGER.warn("java.library.path directory scan failed for {}", libraryName, e);
+            }
+
+            try {
+                String extracted = loadLibraryFromJar(libraryName);
+                System.load(extracted);
+                LOGGER.info("Loaded native library {} from jar extract {}", libraryName, extracted);
+                return;
+            } catch (Throwable e) {
+                lastFailure = e;
+                LOGGER.warn("Failed to load {} from jar", libraryName, e);
+            }
         }
 
         RuntimeException rte = new RuntimeException(
-                "Could not load native library " + libraryName, lastFailure);
+                "Could not load native library candidates " + libraryNames, lastFailure);
         LOGGER.error(rte.getMessage(), lastFailure);
         throw rte;
     }

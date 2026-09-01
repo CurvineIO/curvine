@@ -140,6 +140,9 @@
         </resources>
         <testResources>
             <testResource>
+                <directory>${project.basedir}/src/test/resources</directory>
+            </testResource>
+            <testResource>
                 <directory>conf</directory>
             </testResource>
         </testResources>

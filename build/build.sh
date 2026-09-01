@@ -794,6 +794,137 @@ build_curvine_libsdk() {
   "${sdk_cmd[@]}"
 }
 
+verify_jindo_soname() {
+  local library="$1"
+  local inspector
+  local soname
+
+  if command -v readelf >/dev/null 2>&1 && readelf -h "$library" >/dev/null 2>&1; then
+    inspector="readelf"
+  elif command -v llvm-readelf >/dev/null 2>&1 && llvm-readelf -h "$library" >/dev/null 2>&1; then
+    inspector="llvm-readelf"
+  else
+    echo "Error: could not inspect JindoSDK SONAME: $library" >&2
+    exit 1
+  fi
+
+  soname="$($inspector -d "$library" 2>/dev/null | sed -n 's/.*SONAME.*\[\(.*\)\].*/\1/p')"
+
+  if [ "$soname" != "libjindosdk_c.so.6" ]; then
+    echo "Error: JindoSDK SONAME must be libjindosdk_c.so.6, got ${soname:-missing}: $library" >&2
+    exit 1
+  fi
+}
+
+prepare_java_native_dependencies() {
+  local native_dir="$FS_HOME/curvine-libsdk/java/native"
+  local jindo_home="${JINDOSDK_HOME:-/opt/jindosdk}"
+  local resource_name=""
+  local candidate
+  local has_oss_hdfs=0
+  local -a candidates=()
+
+  mkdir -p "$native_dir"
+  rm -f "$native_dir/libjindosdk_c_linux_x86_64.so.6" \
+    "$native_dir/libjindosdk_c_linux_aarch_64.so.6"
+  rm -f "$FS_HOME/curvine-libsdk/java/target/classes/libjindosdk_c_linux_x86_64.so.6" \
+    "$FS_HOME/curvine-libsdk/java/target/classes/libjindosdk_c_linux_aarch_64.so.6"
+
+  for candidate in "${SDK_UFS_TYPES[@]}"; do
+    if [ "$candidate" = "oss-hdfs" ]; then
+      has_oss_hdfs=1
+      break
+    fi
+  done
+  if [ "$has_oss_hdfs" -eq 0 ]; then
+    return 0
+  fi
+
+  case "$ARCH_NAME" in
+    x86_64)
+      resource_name="libjindosdk_c_linux_x86_64.so.6"
+      ;;
+    aarch_64)
+      resource_name="libjindosdk_c_linux_aarch_64.so.6"
+      ;;
+    *)
+      echo "Error: unsupported architecture for OSS-HDFS Java SDK: ${ARCH_NAME}" >&2
+      exit 1
+      ;;
+  esac
+
+  candidates=(
+    "$jindo_home/lib/native/libjindosdk_c.so.6"
+    "$jindo_home/lib/native/libjindosdk_c.so"
+    "$jindo_home/lib/libjindosdk_c.so.6"
+    "$jindo_home/lib/libjindosdk_c.so"
+  )
+  for candidate in "${candidates[@]}"; do
+    if [ -f "$candidate" ]; then
+      verify_jindo_soname "$candidate"
+      cp -Lf "$candidate" "$native_dir/$resource_name"
+      echo "Packaged OSS-HDFS runtime dependency: $resource_name"
+      return 0
+    fi
+  done
+
+  echo "Error: could not find libjindosdk_c.so under JINDOSDK_HOME=${jindo_home}" >&2
+  exit 1
+}
+
+verify_java_native_dependencies() {
+  local java_version="$1"
+  local expected_resource=""
+  local candidate
+  local has_oss_hdfs=0
+  local jar_file
+  local found_jar=0
+
+  for candidate in "${SDK_UFS_TYPES[@]}"; do
+    if [ "$candidate" = "oss-hdfs" ]; then
+      has_oss_hdfs=1
+      break
+    fi
+  done
+
+  if [ "$has_oss_hdfs" -eq 1 ]; then
+    case "$ARCH_NAME" in
+      x86_64)
+        expected_resource="libjindosdk_c_linux_x86_64.so.6"
+        ;;
+      aarch_64)
+        expected_resource="libjindosdk_c_linux_aarch_64.so.6"
+        ;;
+      *)
+        echo "Error: unsupported architecture for OSS-HDFS Java SDK: ${ARCH_NAME}" >&2
+        exit 1
+        ;;
+    esac
+  fi
+
+  for jar_file in "$FS_HOME"/curvine-libsdk/java/target/curvine-hadoop-"$java_version"*.jar; do
+    if [ ! -f "$jar_file" ]; then
+      continue
+    fi
+    found_jar=1
+
+    if [ "$has_oss_hdfs" -eq 1 ]; then
+      if ! jar tf "$jar_file" | grep -Fxq "$expected_resource"; then
+        echo "Error: OSS-HDFS Java SDK artifact is missing $expected_resource: $jar_file" >&2
+        exit 1
+      fi
+    elif jar tf "$jar_file" | grep -Eq '^libjindosdk_c_linux_(x86|aarch)_64\.so\.6$'; then
+      echo "Error: default Java SDK artifact unexpectedly contains Jindo: $jar_file" >&2
+      exit 1
+    fi
+  done
+
+  if [ "$found_jar" -eq 0 ]; then
+    echo "Error: Java SDK packaging produced no JAR for version $java_version" >&2
+    exit 1
+  fi
+}
+
 # Check FUSE availability if needed
 if should_build_package "fuse" || [[ " ${PACKAGES[@]} " =~ " all " ]]; then
   if [ -z "$FUSE_VERSION" ]; then
@@ -876,6 +1007,7 @@ if [ $BUILD_JAVA_SDK -eq 1 ]; then
   elif [ -e "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" ]; then
     cp -f "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" "$FS_HOME/curvine-libsdk/java/native/libcurvine_libsdk_${OS_VERSION}_$ARCH_NAME.so"
   fi
+  prepare_java_native_dependencies
 fi
 
 if [ $BUILD_RUST_SDK -eq 1 ]; then
@@ -899,20 +1031,21 @@ if should_build_package "web"; then
 fi
 
 if [ $BUILD_JAVA_SDK -eq 1 ]; then
-  # Native library was copied immediately after the java-sdk cargo build.
-  # Build java package. In release builds, inject the release version into the
-  # pom so the jar artifact matches the tag; local builds (no BUILD_VERSION)
-  # keep the source pom untouched.
-  if [ -n "${BUILD_VERSION:-}" ]; then
-    set_pom_version "$FS_HOME/curvine-libsdk/java/pom.xml" "$BUILD_VERSION"
-  fi
+  # Re-align the POM with the workspace/release build version before packaging.
+  # This also repairs a POM changed by an earlier BUILD_VERSION invocation.
+  JAVA_ARTIFACT_VERSION="$CURVINE_VERSION"
+  set_pom_version "$FS_HOME/curvine-libsdk/java/pom.xml" "$JAVA_ARTIFACT_VERSION"
+  rm -f "$FS_HOME"/curvine-libsdk/java/target/curvine-hadoop-*.jar
   cd "$FS_HOME"/curvine-libsdk/java
   mvn protobuf:compile package -DskipTests -P${TARGET_DIR}
   if [ $? -ne 0 ]; then
     echo "Java build failed. Exiting..."
     exit 1
   fi
-  cp "$FS_HOME"/curvine-libsdk/java/target/curvine-hadoop-*.jar "$DIST_DIR"/lib
+  verify_java_native_dependencies "$JAVA_ARTIFACT_VERSION"
+  for java_jar in "$FS_HOME"/curvine-libsdk/java/target/curvine-hadoop-"$JAVA_ARTIFACT_VERSION"*.jar; do
+    cp "$java_jar" "$DIST_DIR"/lib
+  done
 fi
 
 if [ $BUILD_PYTHON_SDK -eq 1 ]; then
