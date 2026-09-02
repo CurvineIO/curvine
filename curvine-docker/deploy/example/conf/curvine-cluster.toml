@@ -70,6 +70,18 @@ journal_dir = "./data/journal"
 rpc_port = 8997
 web_port = 9000
 dir_reserved = "10GB"
+# Strict physical free-space floor for Curvine write admission. The worker
+# reports only bytes above this floor, so both new blocks and FileLayout rewrite
+# staging copies are rejected if their full reservation would cross it. Existing
+# committed data remains readable, but files on a low-space worker may be
+# temporarily non-writable. This protects shared-device space for other apps.
+#
+# Rewrites do not bypass the floor: FileLayout keeps committed + staging copies
+# concurrently, and an expanding rewrite reserves the full target block size
+# (for example, rewriting a 10GB block with a 20GB target may need about 30GB at
+# peak). 0.0 disables (default). Range [0.0, 1.0); 0.1 protects 10%.
+# Another app can still consume space after the worker samples the device.
+# free_ratio = 0.1
 data_dir = [
     "[SSD]/data/data1",
 ]
