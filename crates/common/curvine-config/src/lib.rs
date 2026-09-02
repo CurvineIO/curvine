@@ -68,6 +68,9 @@ pub use pipeline::{ConfigLoader, DiscoveredPath};
 /// Unified validation framework (per-section validate + unknown-key audit).
 pub mod validation;
 
+/// Hot-reload extension points (no watcher/RPC wired yet — see module docs).
+pub mod reload;
+
 impl curvine_model::ClientConfDefaults for ClientConf {
     fn replicas(&self) -> i32 {
         self.replicas
