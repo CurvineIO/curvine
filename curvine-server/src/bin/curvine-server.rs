@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn get_conf_loads_from_discovered_config() {
-        let _master_hostname = EnvVarGuard::unset("CURVINE_MASTER_HOSTNAME");
+        let _master_hostname = EnvVarGuard::unset(ClusterConf::ENV_MASTER_HOSTNAME);
         let tmpdir = std::env::temp_dir().join(format!("cv-test-srv-conf-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmpdir);
         std::fs::create_dir_all(tmpdir.join("conf")).unwrap();
