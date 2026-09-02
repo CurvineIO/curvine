@@ -315,13 +315,39 @@ impl BlockStore {
     }
 
     pub fn remove_block(&self, id: i64) -> CommonResult<()> {
+        self.remove_block_with(id, || Ok(()))
+    }
+
+    fn remove_block_with(
+        &self,
+        id: i64,
+        deallocation_gate: impl FnOnce() -> CommonResult<()>,
+    ) -> CommonResult<()> {
         let _block_lock = self.block_lock(id, "remove");
-        let block = ExtendedBlock::with_id(id);
-        self.with_dataset_write("remove", |state| state.remove_block(&block))
+        self.with_dataset_write("remove", |state| {
+            if state.get_block(id).is_none() {
+                return Ok(());
+            }
+            let removed = state.remove_block_state_by_id(id)?;
+            if let Err(error) = deallocation_gate().and_then(|_| removed.deallocate()) {
+                state.restore_removed_block(removed);
+                return Err(error);
+            }
+            removed.release();
+            Ok(())
+        })
     }
 
     // Asynchronously delete block.
     pub fn async_remove_block(&self, id: i64) -> CommonResult<Option<BlockMeta>> {
+        self.async_remove_block_with(id, || Ok(()))
+    }
+
+    fn async_remove_block_with(
+        &self,
+        id: i64,
+        deallocation_gate: impl FnOnce() -> CommonResult<()>,
+    ) -> CommonResult<Option<BlockMeta>> {
         let _block_lock = self.block_lock(id, "remove");
         let removed = self.with_dataset_write("remove", |state| {
             let remove_result = match state.get_block(id) {
@@ -338,7 +364,7 @@ impl BlockStore {
             return Ok(None);
         };
 
-        if let Err(e) = removed.deallocate() {
+        if let Err(e) = deallocation_gate().and_then(|_| removed.deallocate()) {
             self.with_dataset_write("restore", |state| {
                 state.restore_removed_block(removed);
                 Ok(())
@@ -368,8 +394,6 @@ mod tests {
     use curvine_io::DataSlice;
     use curvine_runtime::common::FileUtils;
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Instant;
@@ -406,31 +430,15 @@ mod tests {
         Ok(())
     }
 
-    struct DeleteDenied {
-        parent: PathBuf,
-        permissions: std::fs::Permissions,
-    }
-
-    impl Drop for DeleteDenied {
-        fn drop(&mut self) {
-            let _ = std::fs::set_permissions(&self.parent, self.permissions.clone());
-        }
-    }
-
-    fn deny_block_delete(store: &BlockStore) -> CommonResult<DeleteDenied> {
+    fn finalized_block(store: &BlockStore) -> CommonResult<()> {
         let mut block = ExtendedBlock::with_id(1);
         block.len = 100;
-        let meta = finalize_block(store, &block)?;
-        let path = store.short_circuit(&meta)?.unwrap();
-        let parent = PathBuf::from(path).parent().unwrap().to_path_buf();
-        let permissions = std::fs::metadata(&parent)?.permissions();
-        let mut readonly = permissions.clone();
-        readonly.set_mode(0o500);
-        std::fs::set_permissions(&parent, readonly)?;
-        Ok(DeleteDenied {
-            parent,
-            permissions,
-        })
+        finalize_block(store, &block)?;
+        Ok(())
+    }
+
+    fn injected_deallocate_error() -> CommonResult<()> {
+        curvine_core_error::err_box!("injected block deallocate failure")
     }
 
     #[test]
@@ -464,10 +472,10 @@ mod tests {
     #[test]
     fn async_remove_deallocate_error_keeps_block_for_retry() -> CommonResult<()> {
         let store = create_store("deallocate-error")?;
-        let _delete_denied = deny_block_delete(&store)?;
+        finalized_block(&store)?;
         store.read()?.increment_blocks_to_delete();
 
-        let result = store.async_remove_block(1);
+        let result = store.async_remove_block_with(1, injected_deallocate_error);
         assert!(result.is_err());
         let state = store.read()?;
         assert!(state.get_block(1).is_some());
@@ -478,9 +486,9 @@ mod tests {
     #[test]
     fn remove_deallocate_error_keeps_block_for_retry() -> CommonResult<()> {
         let store = create_store("remove-deallocate-error")?;
-        let _delete_denied = deny_block_delete(&store)?;
+        finalized_block(&store)?;
 
-        let result = store.remove_block(1);
+        let result = store.remove_block_with(1, injected_deallocate_error);
         assert!(result.is_err());
         assert!(store.read()?.get_block(1).is_some());
         Ok(())

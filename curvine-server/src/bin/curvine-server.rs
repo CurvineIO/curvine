@@ -145,6 +145,28 @@ pub enum ServiceType {
 mod tests {
     use super::*;
 
+    struct EnvVarGuard {
+        key: &'static str,
+        value: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(key: &'static str) -> Self {
+            let value = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, value }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.value.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     #[test]
     fn version_json_accepts_service_component() {
         let args =
@@ -166,6 +188,7 @@ mod tests {
 
     #[test]
     fn get_conf_loads_from_discovered_config() {
+        let _master_hostname = EnvVarGuard::unset("CURVINE_MASTER_HOSTNAME");
         let tmpdir = std::env::temp_dir().join(format!("cv-test-srv-conf-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmpdir);
         std::fs::create_dir_all(tmpdir.join("conf")).unwrap();
