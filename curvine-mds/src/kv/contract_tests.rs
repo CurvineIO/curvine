@@ -82,9 +82,20 @@ async fn arbitrary_bytes_round_trip(be: Arc<dyn KvBackend>, p: &[u8]) {
 }
 
 async fn distinct_invalid_utf8_keys_remain_distinct(be: Arc<dyn KvBackend>, p: &[u8]) {
-    let key_1 = k(p, &[b'f', b'o', 0x80]);
-    let key_2 = k(p, &[b'f', b'o', 0x81]);
+    // Two distinct invalid-UTF8 byte suffixes that collapse to the SAME lossy
+    // string (0x80 and 0x81 both render as the replacement char U+FFFD). The
+    // backend must key on raw bytes, so they must stay distinct despite the
+    // lossy collision.
+    let suffix_1 = [b'f', b'o', 0x80];
+    let suffix_2 = [b'f', b'o', 0x81];
+    assert_eq!(
+        String::from_utf8_lossy(&suffix_1),
+        String::from_utf8_lossy(&suffix_2),
+        "test premise: the two keys must share a lossy string representation"
+    );
 
+    let key_1 = k(p, &suffix_1);
+    let key_2 = k(p, &suffix_2);
     assert_ne!(key_1, key_2);
 
     be.put(&key_1, b"value-1").await.unwrap();

@@ -61,8 +61,12 @@ jobs:
           # only the client library is required here.
           set -euo pipefail
           FDB_VERSION=7.3.77
+          # Pinned SHA256 of the official release asset (supply-chain safety):
+          # verify the download before installing.
+          FDB_CLIENTS_SHA256=9255a4730655ac1a8461d8da5148a9d87c8978944188477f5b745318bb6d40ba
           curl -fsSL -o /tmp/foundationdb-clients.rpm \
             "https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/foundationdb-clients-${FDB_VERSION}-1.el7.x86_64.rpm"
+          echo "${FDB_CLIENTS_SHA256}  /tmp/foundationdb-clients.rpm" | sha256sum -c -
           rpm -i --nodeps /tmp/foundationdb-clients.rpm
           # The rpm installs libfdb_c.so under /usr/lib; also expose it under
           # /usr/lib64 (Rocky's default 64-bit lib dir) so the linker finds it

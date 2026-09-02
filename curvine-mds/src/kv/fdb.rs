@@ -293,7 +293,9 @@ impl KvTransaction for FdbTxn {
     async fn commit(&mut self) -> KvResult<()> {
         let start = Instant::now();
         self.finished = true;
-        metrics::metrics().txn_in_flight.dec();
+        // Take the transaction BEFORE touching the in-flight gauge: a repeat
+        // commit (trx already None) is a no-op error and must not decrement the
+        // gauge, or it would drive txn_in_flight negative.
         let trx = match self.trx.take() {
             Some(trx) => trx,
             None => {
@@ -307,6 +309,7 @@ impl KvTransaction for FdbTxn {
                 return Err(error);
             }
         };
+        metrics::metrics().txn_in_flight.dec();
         let result = match trx.commit().await {
             Ok(_) => Ok(()),
             // `commit` consumes the txn; on error the `TransactionCommitError`
