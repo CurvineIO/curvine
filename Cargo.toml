@@ -237,6 +237,7 @@ percent-encoding = "2.3.1"
 url = "2.2.2"
 async-trait = "0.1.76"
 etcd-client = { version = "0.19", default-features = false }
+foundationdb = { version = "0.9", default-features = false }
 fastrand = "1.9.0"
 num_cpus = "1.16.0"
 slog = "2.7.0"

@@ -29,7 +29,7 @@ mod master_conf;
 pub use self::master_conf::MasterConf;
 
 mod mds_conf;
-pub use self::mds_conf::MdsConf;
+pub use self::mds_conf::{KvBackendType, MdsConf};
 
 mod compatibility_conf;
 pub use self::compatibility_conf::CompatibilityConf;
@@ -50,7 +50,7 @@ mod client_conf;
 pub use self::client_conf::{ClientConf, ClientConfCliOverrides};
 
 mod fuse_conf;
-pub use self::fuse_conf::{FuseConf, FuseConfCliOverrides};
+pub use self::fuse_conf::FuseConf;
 
 mod job_conf;
 pub use self::job_conf::JobConf;
@@ -67,9 +67,6 @@ pub use pipeline::{ConfigLoader, DiscoveredPath};
 
 /// Unified validation framework (per-section validate + unknown-key audit).
 pub mod validation;
-
-/// Hot-reload extension points (no watcher/RPC wired yet — see module docs).
-pub mod reload;
 
 impl curvine_model::ClientConfDefaults for ClientConf {
     fn replicas(&self) -> i32 {
