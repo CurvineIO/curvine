@@ -309,13 +309,14 @@ impl VfsDataset {
                     })?
                     .clone();
                 let required_bytes = meta.physical_bytes().max(block.len);
-                if required_bytes > dir.available() {
+                let available = dir.available();
+                if required_bytes > available {
                     return err_box!(
                         "Not enough space in storage dir {} for block {} rewrite: need {}, available {}",
                         meta.dir_id(),
                         meta.id(),
                         required_bytes,
-                        dir.available()
+                        available
                     );
                 }
 
@@ -628,13 +629,14 @@ impl Dataset for VfsDataset {
                         meta.is_final() && layout.preserves_committed_on_write();
                     if preserves_committed {
                         let required_bytes = meta.physical_bytes().max(block.len);
-                        if required_bytes > dir.available() {
+                        let available = dir.available();
+                        if required_bytes > available {
                             return err_box!(
                                 "Not enough space in storage dir {} for block {} rewrite: need {}, available {}",
                                 meta.dir_id(),
                                 meta.id(),
                                 required_bytes,
-                                dir.available()
+                                available
                             );
                         }
                     }
@@ -785,10 +787,15 @@ mod test {
     use std::sync::Arc;
 
     fn create_data_set(format: bool, dir: &str) -> VfsDataset {
+        create_data_set_with_free_ratio(format, dir, 0.0)
+    }
+
+    fn create_data_set_with_free_ratio(format: bool, dir: &str, free_ratio: f64) -> VfsDataset {
         let conf = ClusterConf {
             format_worker: format,
             worker: WorkerConf {
                 dir_reserved: "0".to_string(),
+                free_ratio,
                 data_dir: vec![
                     format!("[MEM:100B]../testing/dataset-{}/d1", dir),
                     format!("[SSD:200B]../testing/dataset-{}/d2", dir),
@@ -894,6 +901,28 @@ mod test {
             !dir.can_allocate(StorageType::SpdkDisk, 4096),
             "can_allocate must reject when gate is active"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn spdk_free_ratio_exposes_only_headroom_above_floor() -> CommonResult<()> {
+        let capacity = 100 * 4096;
+        let used = 85 * 4096;
+        let dir = spdk_dir_with(1, 0.1, used, capacity);
+
+        // Raw free is 15 blocks, but 10 blocks are protected by the 10% floor.
+        assert_eq!(dir.available(), 5 * 4096);
+        assert!(dir.can_allocate(StorageType::SpdkDisk, 5 * 4096));
+        assert!(!dir.can_allocate(StorageType::SpdkDisk, 5 * 4096 + 1));
+
+        // Reservations immediately consume protected headroom, so a following
+        // admission cannot reuse bytes that have not reached the device yet.
+        dir.reserve_space(false, 4 * 4096);
+        assert_eq!(dir.available(), 4096);
+        assert!(dir.can_allocate(StorageType::SpdkDisk, 4096));
+        assert!(!dir.can_allocate(StorageType::SpdkDisk, 4097));
+        dir.release_space(false, 4 * 4096);
+        assert_eq!(dir.available(), 5 * 4096);
         Ok(())
     }
 
@@ -1109,6 +1138,51 @@ mod test {
         assert!(ds.get_block(block.id).unwrap().is_final());
         Ok(())
     }
+    #[test]
+    fn free_ratio_rejects_expanding_file_layout_rewrite_and_preserves_committed() -> CommonResult<()>
+    {
+        let dataset_name = "free-ratio-rewrite-rejection";
+        let mut ds = create_data_set(true, dataset_name);
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let writing = ds.open_block(&block)?;
+        ds.write_test_data(&writing, "40B")?;
+        block.len = 40;
+        let finalized = ds.finalize_block(&block)?;
+        let active_path = {
+            let dir = ds.find_dir(finalized.dir_id())?;
+            FileLayout::block_path(dir, &finalized)?
+        };
+        let committed_bytes = std::fs::read(&active_path)?;
+        drop(ds);
+
+        // Restart with a floor above the device's current raw free ratio. This
+        // models an existing committed block becoming non-writable after other
+        // applications consume the shared filesystem.
+        let mut gated = create_data_set_with_free_ratio(false, dataset_name, MAX_FREE_RATIO);
+        let committed = gated.get_block(block.id).unwrap().clone();
+        let dir = gated.find_dir(committed.dir_id())?;
+        assert!(dir.raw_free_ratio() < MAX_FREE_RATIO);
+        assert_eq!(dir.available(), 0);
+
+        let mut staging_probe = committed.clone();
+        staging_probe.state = BlockState::Writing;
+        let staging_path = FileLayout::block_path(dir, &staging_probe)?;
+        let available_before = gated.available();
+        block.len = 80;
+        let error = gated.open_block(&block).unwrap_err();
+
+        assert!(error.to_string().contains("Not enough space"));
+        assert!(error.to_string().contains("rewrite"));
+        assert!(error.to_string().contains("need 80"));
+        assert_eq!(std::fs::read(&active_path)?, committed_bytes);
+        assert!(!staging_path.exists());
+        assert!(gated.get_block(block.id).unwrap().is_final());
+        assert!(gated.get_readable_block(block.id).unwrap().is_final());
+        assert!(gated.committed_rewrites.is_empty());
+        assert_eq!(gated.available(), available_before);
+        Ok(())
+    }
+
     #[test]
     fn abort_rewrite_preserves_finalized_file() -> CommonResult<()> {
         let mut ds = create_data_set(true, "abort-rewrite-preserves-finalized");

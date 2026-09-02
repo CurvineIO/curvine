@@ -242,6 +242,13 @@ mod tests {
     }
 
     #[test]
+    fn disk_out_of_space_maps_to_enospc() {
+        let err: FuseError = FsError::disk_out_of_space("strict free_ratio floor").into();
+        assert_eq!(err.errno, libc::ENOSPC);
+        assert_eq!(errno_label(err.errno), "ENOSPC");
+    }
+
+    #[test]
     fn read_only_maps_to_erofs() {
         let err: FuseError = FsError::read_only("/mnt/ro").into();
         assert_eq!(err.errno, libc::EROFS);

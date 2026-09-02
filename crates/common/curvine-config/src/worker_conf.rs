@@ -126,15 +126,25 @@ pub struct WorkerConf {
 
     pub dir_reserved: String,
 
-    /// Disk free-space ratio floor. When a data directory's free ratio drops
-    /// below this value, the directory stops accepting new writes (its reported
-    /// `available` becomes 0), so the worker rejects new blocks and the master
-    /// stops allocating to it. `0.0` disables the guard (default). Range
-    /// `[0.0, 1.0)`. Example: `0.1` = stop writing when free < 10%.
+    /// Strict physical free-space floor for Curvine write admission. The worker
+    /// reports only allocatable bytes above this floor, so both new blocks and
+    /// FileLayout rewrite staging copies are rejected if their full reservation
+    /// would cross it. Existing committed data remains intact and readable when
+    /// a rewrite is rejected. `0.0` disables the floor (default). Range
+    /// `[0.0, 1.0)`. Example: `0.1` protects 10% of the underlying device.
+    ///
+    /// This favors shared-device safety over write availability: an existing
+    /// file on a low-space worker can become temporarily non-writable. Rewrites
+    /// are not exempt because FileLayout keeps the committed copy and a staging
+    /// copy concurrently, and an expanding rewrite reserves the full target
+    /// block size rather than only the growth delta. Allowing such rewrites to
+    /// bypass the floor could consume space reserved for other applications.
     ///
     /// Unlike `dir_reserved` (a fixed byte reservation), this scales with disk
     /// size and reacts to other applications consuming the shared device. Both
-    /// filesystem-backed and SPDK raw-device directories apply the guard.
+    /// filesystem-backed and SPDK raw-device directories apply it. The floor is
+    /// enforced against Curvine admissions; another application can still
+    /// consume space after the worker samples the device.
     pub free_ratio: f64,
 
     pub data_dir: Vec<String>,

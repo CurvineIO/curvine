@@ -185,37 +185,48 @@ impl VfsDir {
     }
 
     pub fn available(&self) -> i64 {
-        // free_ratio guard: when the directory's raw free ratio drops below the
-        // configured floor, treat it as unavailable so writes are rejected and
-        // the master stops allocating to this worker (via heartbeat available).
-        // `0.0` disables the guard. Compute each backend's capacity/free values
-        // once so the filesystem path performs only one total-space and one
-        // available-space query per call.
+        // `free_ratio` is a strict Curvine write-admission floor: report only
+        // bytes that may be reserved without knowingly crossing the protected
+        // physical-space boundary. `0.0` disables the floor.
+        //
+        // The filesystem path samples total/available only once per call. Its
+        // raw physical headroom also subtracts current temporary reservations,
+        // because those bytes may not have reached statvfs yet; this prevents
+        // concurrent opens from reusing the same headroom. Once temporary data
+        // is materialized this is conservative (it can double-count it until
+        // finalize/abort), which intentionally favors protection over write
+        // availability.
         if self.storage_type == StorageType::SpdkDisk {
             let capacity = self.capacity();
-            let fs_used = self.fs_used();
-            let free = capacity.saturating_sub(fs_used).max(0);
-            if self.free_ratio > 0.0 && Self::calculate_free_ratio(free, capacity) < self.free_ratio
-            {
-                return 0;
-            }
-
-            return 0.max(free - self.reserved_bytes);
+            let free = capacity.saturating_sub(self.fs_used()).max(0);
+            let accounting_available = free.saturating_sub(self.reserved_bytes);
+            let floor_available = free.saturating_sub(self.free_ratio_floor(capacity));
+            return accounting_available.min(floor_available).max(0);
         }
 
         let disk_total = self.stats.total_space() as i64;
         let disk_available = self.stats.available_space() as i64;
-        if self.free_ratio > 0.0
-            && Self::calculate_free_ratio(disk_available, disk_total) < self.free_ratio
-        {
+        let capacity = self.capacity_from_physical(disk_total);
+        let accounting_available = capacity
+            .saturating_sub(self.fs_used())
+            .saturating_sub(self.reserved_bytes);
+        let floor_available = if self.free_ratio > 0.0 {
+            disk_available
+                .saturating_sub(self.free_ratio_floor(disk_total))
+                .saturating_sub(self.tmp_bytes.get())
+        } else {
+            disk_available
+        };
+
+        accounting_available.min(floor_available).max(0)
+    }
+
+    fn free_ratio_floor(&self, total: i64) -> i64 {
+        if total <= 0 || self.free_ratio <= 0.0 || !self.free_ratio.is_finite() {
             return 0;
         }
 
-        let capacity = self.capacity_from_physical(disk_total);
-        let fs_used = self.fs_used();
-        let calculated_available = capacity - fs_used - self.reserved_bytes;
-
-        0.max(calculated_available.min(disk_available))
+        ((total as f64 * self.free_ratio.min(1.0)).ceil() as i64).min(total)
     }
 
     fn calculate_free_ratio(free: i64, total: i64) -> f64 {
