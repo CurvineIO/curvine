@@ -548,11 +548,10 @@ mod tests {
     #[test]
     fn trims_whitespace_in_hostname_config() {
         const HOSTNAME_ENV_KEYS: &[&str] = &[
-            "CURVINE_MASTER_HOSTNAME",
-            "CURVINE_JOURNAL_HOSTNAME",
-            "CURVINE_WORKER_HOSTNAME",
-            "CURVINE_CLIENT_HOSTNAME",
-            "CURVINE_TRANSFER_HOSTNAME",
+            ClusterConf::ENV_MASTER_HOSTNAME,
+            ClusterConf::ENV_WORKER_HOSTNAME,
+            ClusterConf::ENV_CLIENT_HOSTNAME,
+            ClusterConf::ENV_TRANSFER_HOSTNAME,
         ];
         let _hostname_env = EnvVarsGuard::unset(HOSTNAME_ENV_KEYS);
         let path = std::env::temp_dir().join(format!(
