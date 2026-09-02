@@ -146,6 +146,7 @@ ls -la .github/skills .cursor/skills .claude/skills
 | Skill | Stage |
 | ----- | ----- |
 | `cv-add-skills` | Meta — add/update skills |
+| `cv-codegraph` | Code exploration — CodeGraph setup and usage |
 | `cv-create-issue` | Issue |
 | `cv-create-pr` | PR |
 | `cv-csi-test` | Testing |

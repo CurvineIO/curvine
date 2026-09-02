@@ -14,6 +14,7 @@ How to use skills:
 
 Usage notes:
 - For Curvine project workflow tasks, prefer the cv-* skills listed in <available_skills> below
+- **Before grep, find, or reading files to explore code**, read and follow [cv-codegraph](.agents/skills/cv-codegraph/SKILL.md) — prefer CodeGraph (`codegraph_explore` MCP or `codegraph explore` CLI) when `.codegraph/` exists or the MCP tool is available
 - User-installed global skills (e.g. ~/.cursor/skills/, ~/.claude/skills/) remain available when the agent tool exposes them
 - Do not invent or invoke project skills that are not listed in <available_skills>
 - Do not invoke a skill that is already loaded in your context
@@ -27,6 +28,12 @@ Usage notes:
 <skill>
 <name>cv-add-skills</name>
 <description>Add or update Curvine cv-* project skills under .agents/skills/, following naming and layout conventions, and sync the AGENTS.md registry. Use when creating a new cv skill, updating an existing cv skill structure, or registering skills after changes.</description>
+<location>project</location>
+</skill>
+
+<skill>
+<name>cv-codegraph</name>
+<description>Install, initialize, and use CodeGraph for Curvine code exploration. Prefer CodeGraph before grep, find, or manual file reads when locating or understanding code. Use when exploring the codebase, tracing call paths, finding symbols, or when CodeGraph MCP or CLI is available.</description>
 <location>project</location>
 </skill>
 
@@ -88,40 +95,3 @@ Usage notes:
 <!-- SKILLS_TABLE_END -->
 
 </skills_system>
-
-<!-- CODEGRAPH_START -->
-## CodeGraph
-
-[CodeGraph](https://github.com/colbymchenry/codegraph) indexes the repository into a local knowledge graph (`.codegraph/` at repo root). Agents should reach for it **before** grep/find or reading files when exploring or locating code.
-
-### Setup
-
-Install CodeGraph if the `codegraph` CLI is not available:
-
-```bash
-# macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh
-```
-
-```powershell
-# Windows (PowerShell)
-irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | iex
-```
-
-Initialize indexing for this repository (run once at repo root):
-
-```bash
-codegraph init
-```
-
-The `.codegraph/` directory is gitignored and stays local to each developer machine.
-
-### Usage
-
-When `.codegraph/` exists, prefer CodeGraph over manual file search:
-
-- **MCP tool** (when available): `codegraph_explore` answers most code questions in one call — the relevant symbols' verbatim source plus the call paths between them, including dynamic-dispatch hops grep can't follow. Name a file or symbol in the query to read its current line-numbered source. If it's listed but deferred, load it by name via tool search.
-- **Shell** (always works): `codegraph explore "<symbol names or question>"` prints the same output.
-
-If there is no `.codegraph/` directory, skip CodeGraph and fall back to grep/read as usual.
-<!-- CODEGRAPH_END -->
