@@ -26,9 +26,9 @@ use curvine_runtime::sync::channel::{
     AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender,
 };
 use curvine_runtime::sync::ErrorMonitor;
+use log::debug;
 use log::{error, warn};
 use std::sync::Arc;
-use log::debug;
 
 enum ReadTask {
     Read(i64, usize, FuseResponse),
