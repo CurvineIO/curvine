@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# FoundationDB KV backend. Enabled by default; disable (--no-default-features
+# or via the parent crate) to drop the libfdb_c link-time dependency and the
+# bindgen build-time dependency entirely.
+default = ["fdb"]
+fdb = ["dep:foundationdb"]
+
 [dependencies]
 curvine-config = { workspace = true }
 curvine-core-error = { workspace = true }
@@ -11,7 +18,7 @@ curvine-metrics = { workspace = true }
 curvine-runtime = { workspace = true }
 async-trait = { workspace = true }
 fastrand = { workspace = true }
-foundationdb = { workspace = true, features = ["fdb-7_3", "embedded-fdb-include"] }
+foundationdb = { workspace = true, optional = true, features = ["fdb-7_3", "embedded-fdb-include"] }
 log = { workspace = true }
 once_cell = { workspace = true }
 thiserror = { workspace = true }

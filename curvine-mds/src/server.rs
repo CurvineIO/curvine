@@ -6,8 +6,9 @@ use log::info;
 use std::sync::Arc;
 use tokio::sync::watch;
 
-use crate::{FdbBackend, KvBackend, MemoryBackend};
-
+#[cfg(feature = "fdb")]
+use crate::FdbBackend;
+use crate::{KvBackend, MemoryBackend};
 pub struct Mds {
     conf: ClusterConf,
     backend: Arc<dyn KvBackend>,
@@ -26,10 +27,18 @@ impl Mds {
 
         let backend: Arc<dyn KvBackend> = match conf.mds.kv_backend {
             KvBackendType::Memory => Arc::new(MemoryBackend::new()),
+            #[cfg(feature = "fdb")]
             KvBackendType::Fdb => Arc::new(
                 FdbBackend::open(&conf.mds.fdb_cluster_file, conf.mds.fdb_txn_timeout_ms)
                     .map_err(|error| curvine_core_error::CommonError::from(error.to_string()))?,
             ),
+            #[cfg(not(feature = "fdb"))]
+            KvBackendType::Fdb => {
+                return err_box!(
+                    "mds.kv_backend=fdb requires the \"fdb\" feature \
+                     (build with --features fdb or without --no-fdb)"
+                );
+            }
         };
         let rt = Arc::new(AsyncRuntime::new(
             "mds",
