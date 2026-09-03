@@ -315,39 +315,13 @@ impl BlockStore {
     }
 
     pub fn remove_block(&self, id: i64) -> CommonResult<()> {
-        self.remove_block_with(id, || Ok(()))
-    }
-
-    fn remove_block_with(
-        &self,
-        id: i64,
-        deallocation_gate: impl FnOnce() -> CommonResult<()>,
-    ) -> CommonResult<()> {
         let _block_lock = self.block_lock(id, "remove");
-        self.with_dataset_write("remove", |state| {
-            if state.get_block(id).is_none() {
-                return Ok(());
-            }
-            let removed = state.remove_block_state_by_id(id)?;
-            if let Err(error) = deallocation_gate().and_then(|_| removed.deallocate()) {
-                state.restore_removed_block(removed);
-                return Err(error);
-            }
-            removed.release();
-            Ok(())
-        })
+        let block = ExtendedBlock::with_id(id);
+        self.with_dataset_write("remove", |state| state.remove_block(&block))
     }
 
     // Asynchronously delete block.
     pub fn async_remove_block(&self, id: i64) -> CommonResult<Option<BlockMeta>> {
-        self.async_remove_block_with(id, || Ok(()))
-    }
-
-    fn async_remove_block_with(
-        &self,
-        id: i64,
-        deallocation_gate: impl FnOnce() -> CommonResult<()>,
-    ) -> CommonResult<Option<BlockMeta>> {
         let _block_lock = self.block_lock(id, "remove");
         let removed = self.with_dataset_write("remove", |state| {
             let remove_result = match state.get_block(id) {
@@ -364,7 +338,7 @@ impl BlockStore {
             return Ok(None);
         };
 
-        if let Err(e) = deallocation_gate().and_then(|_| removed.deallocate()) {
+        if let Err(e) = removed.deallocate() {
             self.with_dataset_write("restore", |state| {
                 state.restore_removed_block(removed);
                 Ok(())
@@ -437,8 +411,15 @@ mod tests {
         Ok(())
     }
 
-    fn injected_deallocate_error() -> CommonResult<()> {
-        curvine_core_error::err_box!("injected block deallocate failure")
+    fn replace_block_file_with_non_empty_dir(store: &BlockStore) -> CommonResult<String> {
+        let meta = store.get_block(1)?;
+        let path = store
+            .short_circuit(&meta)?
+            .expect("file layout must expose a local path");
+        FileUtils::delete_path(&path, false)?;
+        std::fs::create_dir(&path)?;
+        std::fs::write(std::path::Path::new(&path).join("child"), b"data")?;
+        Ok(path)
     }
 
     #[test]
@@ -473,13 +454,21 @@ mod tests {
     fn async_remove_deallocate_error_keeps_block_for_retry() -> CommonResult<()> {
         let store = create_store("deallocate-error")?;
         finalized_block(&store)?;
+        let path = replace_block_file_with_non_empty_dir(&store)?;
         store.read()?.increment_blocks_to_delete();
 
-        let result = store.async_remove_block_with(1, injected_deallocate_error);
+        let result = store.async_remove_block(1);
         assert!(result.is_err());
-        let state = store.read()?;
-        assert!(state.get_block(1).is_some());
-        assert_eq!(state.num_blocks_to_delete(), 0);
+        {
+            let state = store.read()?;
+            assert!(state.get_block(1).is_some());
+            assert_eq!(state.num_blocks_to_delete(), 0);
+        }
+
+        FileUtils::delete_path(path, true)?;
+        store.read()?.increment_blocks_to_delete();
+        assert!(store.async_remove_block(1)?.is_some());
+        assert!(store.read()?.get_block(1).is_none());
         Ok(())
     }
 
@@ -487,10 +476,15 @@ mod tests {
     fn remove_deallocate_error_keeps_block_for_retry() -> CommonResult<()> {
         let store = create_store("remove-deallocate-error")?;
         finalized_block(&store)?;
+        let path = replace_block_file_with_non_empty_dir(&store)?;
 
-        let result = store.remove_block_with(1, injected_deallocate_error);
+        let result = store.remove_block(1);
         assert!(result.is_err());
         assert!(store.read()?.get_block(1).is_some());
+
+        FileUtils::delete_path(path, true)?;
+        store.remove_block(1)?;
+        assert!(store.read()?.get_block(1).is_none());
         Ok(())
     }
 
