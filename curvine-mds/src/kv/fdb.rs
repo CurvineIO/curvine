@@ -18,8 +18,8 @@
 //!
 //! Every transaction is created with a `Timeout` (see
 //! [`FdbBackend::txn_timeout_ms`]) so an unreachable cluster surfaces a
-//! `Timeout`/`Unavailable` [`KvError`] within a bounded window instead of
-//! blocking forever.
+//! `DeadlineExceeded`/`TransientUnavailable` [`KvError`] within a bounded window
+//! instead of blocking forever.
 //!
 //! ## Concurrency contract
 //!
@@ -58,56 +58,132 @@ fn ensure_network_started() {
     });
 }
 
-/// Maps a native [`FdbError`] to the abstraction's [`KvError`].
+/// FoundationDB error codes the mapper branches on explicitly, from
+/// flow/error_definitions.h:
+/// https://github.com/apple/foundationdb/blob/main/flow/include/flow/error_definitions.h
 ///
-/// The classification, not the message, is what callers depend on:
-/// - `commit_unknown_result` → [`KvError::MaybeCommitted`] (NOT retryable — the
-///   write may already have applied).
-/// - `not_committed` (1020) → [`KvError::Conflict`], the ONLY code mapped to
-///   Conflict so the conflict metric counts real read/write-set clashes.
-/// - `transaction_timed_out` (1031) → [`KvError::Timeout`].
-/// - any other retryable code (connection loss, coordinator change, stale read
-///   version, …) → [`KvError::Unavailable`]: same retry semantics as Conflict
-///   but kept distinct so availability problems don't pollute conflict metrics.
-/// - everything else → terminal [`KvError::Backend`].
-fn map_fdb_error(err: FdbError) -> KvError {
-    // FDB error codes from flow/error_definitions.h:
-    // https://github.com/apple/foundationdb/blob/main/flow/include/flow/error_definitions.h
-    //   1020 not_committed          — optimistic-concurrency conflict
-    //   1031 transaction_timed_out  — deadline exceeded
-    const NOT_COMMITTED: i32 = 1020;
-    const TRANSACTION_TIMED_OUT: i32 = 1031;
+/// Only codes whose classification the mapper depends on live here; every other
+/// code is handled through FDB's `is_retryable` / `is_maybe_committed` /
+/// `is_retryable_not_committed` predicates rather than by matching a number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+enum FdbErrorCode {
+    /// 1020 `not_committed`: transaction rejected due to a read/write-set
+    /// conflict. Provably NOT committed — the only code mapped to
+    /// [`KvError::Conflict`] so `mds_kv_txn_conflicts_total` counts real clashes.
+    NotCommitted = 1020,
+    /// 1031 `transaction_timed_out`: per-transaction deadline exceeded. FDB
+    /// treats it as terminal (neither predicate-retryable nor maybe-committed).
+    /// Neither path retries it (the deadline is the caller's wait budget), but
+    /// the mapper keeps the write status distinct: [`KvError::DeadlineExceeded`]
+    /// on a read (provably wrote nothing) vs [`KvError::MaybeCommitted`] on a
+    /// commit (may already have applied).
+    TransactionTimedOut = 1031,
+}
 
-    // Timeout first, for semantic precision. 1031 is itself retryable, so this
-    // branch is not needed for correctness (it would otherwise fall through to
-    // the retryable arm), but surfacing Timeout distinguishes "deadline hit"
-    // from conflict/unavailability in errors and metrics.
-    if err.code() == TRANSACTION_TIMED_OUT {
-        return KvError::Timeout;
+impl FdbErrorCode {
+    /// The raw FDB error code, for comparison against [`FdbError::code`].
+    const fn code(self) -> i32 {
+        self as i32
     }
-    // maybe-committed MUST be classified before the retryable checks below: it
-    // is a SUBSET of retryable, but must NOT be auto-retried (the write may
-    // already have applied — retrying would double-apply).
-    if err.is_maybe_committed() {
-        return KvError::MaybeCommitted;
+}
+
+/// Maps a native [`FdbError`] from a READ/begin operation (`begin`, `get`,
+/// `snapshot_get`, `multi_get`) to the abstraction's [`KvError`].
+///
+/// `transaction_timed_out` (1031) maps to [`KvError::DeadlineExceeded`] — a read
+/// that hit the per-transaction deadline provably wrote nothing, so it is
+/// surfaced (NOT auto-retried: the deadline is the caller's wait budget). This
+/// is the mirror of the commit path, where the same 1031 becomes
+/// [`KvError::MaybeCommitted`] because a commit that timed out may already have
+/// applied. Keeping the two distinct preserves that write-status information
+/// and keeps errors/metrics precise, even though neither is retried.
+fn map_fdb_read_error(err: FdbError) -> KvError {
+    if err.code() == FdbErrorCode::TransactionTimedOut.code() {
+        return KvError::DeadlineExceeded;
     }
-    // Only the genuine optimistic-concurrency conflict (not_committed) maps to
-    // Conflict, so `mds_kv_txn_conflicts_total` counts real read/write-set
-    // clashes and nothing else. Network/cluster availability errors are ALSO
-    // retryable, but lumping them into Conflict would pollute that metric and
-    // mislead operators into diagnosing contention when the cluster is simply
-    // unreachable.
-    if err.code() == NOT_COMMITTED {
+    if err.code() == FdbErrorCode::NotCommitted.code() {
+        // Genuine optimistic-concurrency conflict: the ONLY code mapped to
+        // Conflict so `mds_kv_txn_conflicts_total` counts real clashes.
         return KvError::Conflict;
     }
-    // Every other retryable error — connection_failed (1026), coordinators
-    // changed (1027), transaction_too_old (1007), future_version (1009),
-    // cluster_version_changed (1039), etc. — is a backend availability /
-    // transient condition, not a concurrency conflict. Same retry semantics as
-    // Conflict, but classified as Unavailable so metrics stay meaningful.
+    // Every other retryable code — connection_failed, coordinators_changed,
+    // transaction_too_old, future_version, throttling, etc. — is a transient
+    // condition worth retrying, but NOT a concurrency conflict. Collapsed into
+    // one variant (no consumer distinguishes the sub-causes; the raw code stays
+    // in the payload for logs) and named TransientUnavailable so it does not
+    // imply "cluster unreachable" when the cluster is merely throttling or the
+    // txn ran too long.
     if err.is_retryable() {
-        return KvError::Unavailable(format!("fdb error_code {}: {}", err.code(), err.message()));
+        return KvError::TransientUnavailable(format!(
+            "fdb error_code {}: {}",
+            err.code(),
+            err.message()
+        ));
     }
+    KvError::Backend(format!("fdb error_code {}: {}", err.code(), err.message()))
+}
+
+/// Maps a native [`FdbError`] from a COMMIT to the abstraction's [`KvError`].
+///
+/// A commit that fails may already have applied. The invariant `run_txn` relies
+/// on: NEVER auto-retry a commit unless FDB can PROVE it did not apply. FDB's
+/// `is_retryable_not_committed()` predicate (fdb_c.cpp `RETRYABLE_NOT_COMMITTED`
+/// set: not_committed 1020, transaction_too_old, future_version, database_locked,
+/// throttled codes, …) is exactly "retryable AND provably not committed". So:
+///
+/// - provably-not-committed → [`KvError::Conflict`] (1020) / [`KvError::TransientUnavailable`]
+///   (the rest) — safe to re-run;
+/// - everything else that is not a terminal error — `commit_unknown_result`
+///   (1021), `commit_unknown_result_fatal` (1022), `request_maybe_delivered`
+///   (1030), `transaction_timed_out` (1031), `cluster_version_changed`, … — is
+///   treated as [`KvError::MaybeCommitted`] (NOT retryable; the write may
+///   already have applied, so re-running a non-idempotent body would
+///   double-apply or flip a successful CAS to `false`).
+///
+/// This is why the mapper is split by operation: on a read, 1031 is a
+/// [`KvError::DeadlineExceeded`]; on a commit, 1031 is [`KvError::MaybeCommitted`].
+fn map_fdb_commit_error(err: FdbError) -> KvError {
+    // Provably-not-committed (incl. the 1020 conflict) is the ONLY class safe to
+    // re-run after a commit.
+    if err.is_retryable_not_committed() {
+        if err.code() == FdbErrorCode::NotCommitted.code() {
+            // Genuine optimistic-concurrency conflict — the only code mapped to
+            // Conflict so `mds_kv_txn_conflicts_total` counts real clashes.
+            return KvError::Conflict;
+        }
+        // The rest of the retryable-not-committed set (transaction_too_old,
+        // future_version, throttled codes, …): provably not committed and worth
+        // retrying, but not a conflict — so TransientUnavailable, not Conflict.
+        return KvError::TransientUnavailable(format!(
+            "fdb error_code {}: {}",
+            err.code(),
+            err.message()
+        ));
+    }
+    // Could have committed — the write may already have applied, so this MUST
+    // NOT be auto-retried (re-running a non-idempotent body would double-apply
+    // or flip a successful CAS to `false`). Two sources, because FDB's own
+    // maybe-committed predicate is INCOMPLETE for the commit path:
+    //   - `is_maybe_committed()`: commit_unknown_result (1021),
+    //     cluster_version_changed — FDB itself labels these maybe-committed.
+    //     (Internally FDB folds request_maybe_delivered / never_reply into 1021;
+    //     see NativeAPI.actor.cpp tryCommit catch block.)
+    //   - transaction_timed_out (1031): NOT covered by is_maybe_committed().
+    //     1031 is the *outer* per-txn deadline (a Timeout option timer), not a
+    //     commit-RPC status, so it can fire at ANY point — including while a
+    //     commit request is in flight. Once the commit RPC is sent, the client
+    //     cannot know whether it applied (FDB's own tryCommit comment: the
+    //     commit "might even still be in flight"). So a 1031 on the commit path
+    //     means the commit status is genuinely unknown → MaybeCommitted. This is
+    //     exactly why the mapper is split by operation: on a read 1031 provably
+    //     wrote nothing (DeadlineExceeded); on a commit it may have applied.
+    if err.is_maybe_committed() || err.code() == FdbErrorCode::TransactionTimedOut.code() {
+        return KvError::MaybeCommitted;
+    }
+    // Everything else is a terminal, permanent error (e.g. internal_error,
+    // transaction_too_large): the commit provably did not apply and retrying
+    // would not help.
     KvError::Backend(format!("fdb error_code {}: {}", err.code(), err.message()))
 }
 
@@ -129,7 +205,17 @@ impl FdbBackend {
         if cluster_file.is_empty() {
             return Err(KvError::Backend("fdb cluster file path is empty".into()));
         }
-        let db = Database::from_path(cluster_file).map_err(map_fdb_error)?;
+        // Enforce the fail-fast contract at the layer that applies the option:
+        // FDB TransactionOption::Timeout(0) means "no timeout" (wait forever),
+        // which would let begin/commit hang on an unreachable cluster. MdsConf
+        // rejects <= 0, but open() is public, so guard here too — a direct
+        // caller must not be able to construct a backend that never times out.
+        if txn_timeout_ms <= 0 {
+            return Err(KvError::Backend(format!(
+                "fdb txn_timeout_ms must be greater than zero, got {txn_timeout_ms}"
+            )));
+        }
+        let db = Database::from_path(cluster_file).map_err(map_fdb_read_error)?;
         Ok(Self {
             db: Arc::new(db),
             txn_timeout_ms,
@@ -146,10 +232,10 @@ impl KvBackend for FdbBackend {
     async fn begin(&self) -> KvResult<Box<dyn KvTransaction>> {
         let start = Instant::now();
         let result: KvResult<Transaction> = (|| {
-            let trx = self.db.create_trx().map_err(map_fdb_error)?;
+            let trx = self.db.create_trx().map_err(map_fdb_read_error)?;
             // Bound how long any operation on this txn waits on a stuck cluster.
             trx.set_option(TransactionOption::Timeout(self.txn_timeout_ms))
-                .map_err(map_fdb_error)?;
+                .map_err(map_fdb_read_error)?;
             Ok(trx)
         })();
         let trx = match result {
@@ -171,7 +257,7 @@ impl KvBackend for FdbBackend {
         // "reads observe a snapshot taken when the transaction began" contract
         // (and the memory backend's begin-snapshot behavior).
         if let Err(err) = trx.get_read_version().await {
-            let error = map_fdb_error(err);
+            let error = map_fdb_read_error(err);
             metrics::metrics().observe(
                 BACKEND_NAME,
                 metrics::op::BEGIN,
@@ -223,7 +309,7 @@ impl KvTransaction for FdbTxn {
             .trx()?
             .get(key, false)
             .await
-            .map_err(map_fdb_error)
+            .map_err(map_fdb_read_error)
             .map(|opt| opt.map(|slice| slice.to_vec()));
         observe_read(metrics::op::GET, start, &result);
         result
@@ -237,7 +323,7 @@ impl KvTransaction for FdbTxn {
             .trx()?
             .get(key, true)
             .await
-            .map_err(map_fdb_error)
+            .map_err(map_fdb_read_error)
             .map(|opt| opt.map(|slice| slice.to_vec()));
         observe_read(metrics::op::SNAPSHOT_GET, start, &result);
         result
@@ -255,7 +341,7 @@ impl KvTransaction for FdbTxn {
             match fut.await {
                 Ok(slice) => out.push(slice.map(|s| s.to_vec())),
                 Err(err) => {
-                    error = Some(map_fdb_error(err));
+                    error = Some(map_fdb_read_error(err));
                     break;
                 }
             }
@@ -314,7 +400,7 @@ impl KvTransaction for FdbTxn {
             Ok(_) => Ok(()),
             // `commit` consumes the txn; on error the `TransactionCommitError`
             // derefs to the underlying `FdbError`, which carries the code.
-            Err(commit_err) => Err(map_fdb_error(commit_err.into())),
+            Err(commit_err) => Err(map_fdb_commit_error(commit_err.into())),
         };
         metrics::metrics().observe(
             BACKEND_NAME,
@@ -354,4 +440,90 @@ fn observe_read<T>(op: &'static str, start: Instant, result: &KvResult<T>) {
         start,
         &result.as_ref().map(|_| ()).map_err(|e| e.clone()),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Codes the mapper does NOT branch on individually (handled via FDB
+    // predicates); kept local to the test to exercise those predicate paths.
+    // The branched-on codes come from `FdbErrorCode` so the test and the mapper
+    // cannot drift.
+    const COMMIT_UNKNOWN_RESULT: i32 = 1021; // may or may not have committed
+    const INTERNAL_ERROR: i32 = 4100; // terminal, non-retryable
+
+    /// The whole point of splitting the mapper by operation: the SAME FDB code
+    /// classifies differently on a read (replay-safe) vs a commit (may already
+    /// have applied). If someone swaps an arm, one of these rows fails.
+    ///
+    /// | code | read path            | commit path      |
+    /// |------|----------------------|------------------|
+    /// | 1020 | Conflict             | Conflict         | provably not committed
+    /// | 1021 | TransientUnavailable | MaybeCommitted   | commit_unknown_result
+    /// | 1031 | DeadlineExceeded     | MaybeCommitted   | timed out; state unknown
+    /// | 4100 | Backend              | Backend          | terminal
+    #[test]
+    fn error_mapping_is_split_by_operation() {
+        // (code, read classification, commit classification)
+        // We compare on `kind()` labels to avoid matching the message payload
+        // that TransientUnavailable/Backend carry.
+        let cases: &[(i32, &str, &str)] = &[
+            (FdbErrorCode::NotCommitted.code(), "conflict", "conflict"),
+            (
+                COMMIT_UNKNOWN_RESULT,
+                "transient_unavailable",
+                "maybe_committed",
+            ),
+            (
+                FdbErrorCode::TransactionTimedOut.code(),
+                "deadline_exceeded",
+                "maybe_committed",
+            ),
+            (INTERNAL_ERROR, "backend", "backend"),
+        ];
+
+        for &(code, want_read, want_commit) in cases {
+            let read = map_fdb_read_error(FdbError::from_code(code));
+            assert_eq!(
+                read.kind(),
+                want_read,
+                "read path: code {code} expected {want_read}, got {read:?}"
+            );
+
+            let commit = map_fdb_commit_error(FdbError::from_code(code));
+            assert_eq!(
+                commit.kind(),
+                want_commit,
+                "commit path: code {code} expected {want_commit}, got {commit:?}"
+            );
+        }
+    }
+
+    /// A transaction that hit the per-txn deadline (1031) must NOT be
+    /// retryable on either path: on a commit `run_txn` could re-run a
+    /// possibly-applied write (double-apply); on a read it would defeat
+    /// fail-fast by multiplying the caller's wait budget. The two still map to
+    /// distinct errors so write status is preserved: MaybeCommitted (commit)
+    /// vs DeadlineExceeded (read).
+    #[test]
+    fn deadline_exceeded_is_not_retryable_on_either_path() {
+        let commit = map_fdb_commit_error(FdbError::from_code(
+            FdbErrorCode::TransactionTimedOut.code(),
+        ));
+        assert!(
+            !commit.is_retryable(),
+            "commit-path 1031 must not be retryable (may already have applied), got {commit:?}"
+        );
+        assert!(matches!(commit, KvError::MaybeCommitted));
+
+        let read = map_fdb_read_error(FdbError::from_code(
+            FdbErrorCode::TransactionTimedOut.code(),
+        ));
+        assert!(
+            !read.is_retryable(),
+            "read-path 1031 must not be retryable (deadline budget exhausted), got {read:?}"
+        );
+        assert!(matches!(read, KvError::DeadlineExceeded));
+    }
 }

@@ -325,7 +325,10 @@ async fn reads_observe_begin_snapshot(be: Arc<dyn KvBackend>, p: &[u8]) {
 
 fn error_classification() {
     assert!(KvError::Conflict.is_retryable());
-    assert!(KvError::Timeout.is_retryable());
+    assert!(KvError::TransientUnavailable("down".into()).is_retryable());
+    // DeadlineExceeded is NOT retryable: the per-txn deadline (the caller's wait
+    // budget) is exhausted, so it must surface rather than re-run.
+    assert!(!KvError::DeadlineExceeded.is_retryable());
     // MaybeCommitted is NOT retryable: the write may already have applied.
     assert!(!KvError::MaybeCommitted.is_retryable());
     assert!(!KvError::Aborted("a".into()).is_retryable());
@@ -576,12 +579,15 @@ async fn fdb_unreachable_cluster_does_not_hang() {
         Err(_elapsed) => panic!("begin() hung on an unreachable cluster (blocked >30s)"),
         Ok(Ok(_txn)) => panic!("begin() unexpectedly succeeded against an unreachable cluster"),
         Ok(Err(err)) => {
-            // Fail-fast surfaced as a retryable error (Timeout, or another
-            // transient class). It must NOT be a silent hang, which is all this
-            // criterion requires.
+            // Fail-fast surfaced as a bounded error instead of a silent hang —
+            // which is all this criterion requires. The exact class depends on
+            // how FDB reports the unreachable cluster: `DeadlineExceeded` if the
+            // per-txn deadline is hit, or `TransientUnavailable` for a
+            // connection-level failure. Both are acceptable; a hang (handled
+            // above) is not.
             assert!(
-                err.is_retryable(),
-                "expected a fail-fast retryable error, got {err:?}"
+                matches!(err, KvError::DeadlineExceeded | KvError::TransientUnavailable(_)),
+                "expected a bounded fail-fast error (DeadlineExceeded/TransientUnavailable), got {err:?}"
             );
         }
     }
