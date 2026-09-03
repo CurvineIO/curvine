@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::sync::AtomicBool;
 use std::error::Error;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 // Used to set errors in asynchronous environments.
 pub struct ErrorMonitor<E: Error> {
-    has_error: AtomicBool,
-    error: Mutex<Option<E>>,
+    pub has_error: AtomicBool,
+    pub error: Mutex<Option<E>>,
 }
 
 impl<E: Error> ErrorMonitor<E> {
@@ -31,7 +31,11 @@ impl<E: Error> ErrorMonitor<E> {
     }
 
     pub fn has_error(&self) -> bool {
-        self.has_error.load(Ordering::SeqCst)
+        self.has_error.get()
+    }
+
+    pub fn error(&self) -> &Mutex<Option<E>> {
+        &self.error
     }
 
     // If this error has been set, it will be returned directly.
@@ -40,7 +44,7 @@ impl<E: Error> ErrorMonitor<E> {
             return;
         }
         let mut e = self.error.lock().unwrap();
-        self.has_error.store(true, Ordering::SeqCst);
+        self.has_error.set(true);
         let _ = (*e).replace(error);
     }
 

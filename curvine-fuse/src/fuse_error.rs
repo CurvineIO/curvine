@@ -52,6 +52,10 @@ impl FuseError {
     pub(crate) fn errno(&self) -> i32 {
         self.errno
     }
+
+    pub fn is_enoent(&self) -> bool {
+        self.errno == libc::ENOENT
+    }
 }
 
 /// Normalize arbitrary errno input into a positive POSIX errno, falling back to `EIO`.

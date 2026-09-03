@@ -17,8 +17,8 @@ use crate::fuse_metrics::{mono_now, FuseMetrics, IO_TYPE_READ};
 use crate::session::FuseResponse;
 use curvine_client::unified::UnifiedReader;
 use curvine_config::FuseConf;
-use curvine_error::FsError;
 use curvine_error::FsResult;
+use curvine_error::{ErrorKind, FsError};
 use curvine_fs_api::{Path, Reader};
 use curvine_model::FileStatus;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
@@ -28,6 +28,7 @@ use curvine_runtime::sync::channel::{
 use curvine_runtime::sync::ErrorMonitor;
 use log::{error, warn};
 use std::sync::Arc;
+use log::debug;
 
 enum ReadTask {
     Read(i64, usize, FuseResponse),
@@ -59,7 +60,11 @@ impl FuseReader {
                 Ok(_) => (),
 
                 Err(e) => {
-                    error!("fuse reader error: {}", e);
+                    if matches!(e.kind(), ErrorKind::FileNotFound) {
+                        debug!("fuse reader error: {}", e);
+                    } else {
+                        error!("fuse reader error: {}", e);
+                    }
                     monitor.set_error(e);
                 }
             }
