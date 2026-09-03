@@ -38,14 +38,17 @@ impl<E: Error> ErrorMonitor<E> {
         &self.error
     }
 
-    // If this error has been set, it will be returned directly.
+    // Keep the first error; later callers return without overwriting.
     pub fn set_error(&self, error: E) {
         if self.has_error() {
             return;
         }
         let mut e = self.error.lock().unwrap();
+        if e.is_some() {
+            return;
+        }
         self.has_error.set(true);
-        let _ = (*e).replace(error);
+        *e = Some(error);
     }
 
     pub fn take_error(&self) -> Option<E> {
