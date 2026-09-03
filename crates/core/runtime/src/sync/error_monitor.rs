@@ -72,3 +72,52 @@ impl<E: Error> Default for ErrorMonitor<E> {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::thread;
+    use std::thread::Barrier;
+
+    use crate::sync::ErrorMonitor;
+
+    /// A later set_error must not overwrite the first stored error.
+    #[test]
+    fn first_error_wins() {
+        let monitor = ErrorMonitor::<String>::new();
+        monitor.set_error("first".to_string());
+        monitor.set_error("second".to_string());
+
+        assert!(monitor.has_error());
+        assert_eq!(monitor.take_error().as_deref(), Some("first"));
+        assert_eq!(monitor.take_error(), None);
+    }
+
+    /// Concurrent set_error callers race, but exactly one error is stored
+    /// and it is one of the attempted values (first-wins invariant).
+    #[test]
+    fn concurrent_set_error_stores_single_error() {
+        let monitor = Arc::new(ErrorMonitor::<String>::new());
+        let barrier = Arc::new(Barrier::new(2));
+
+        let m1 = monitor.clone();
+        let b1 = barrier.clone();
+        let t1 = thread::spawn(move || {
+            b1.wait();
+            m1.set_error("first".to_string());
+        });
+
+        let b2 = barrier.clone();
+        let t2 = thread::spawn(move || {
+            b2.wait();
+            monitor.set_error("second".to_string());
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        assert!(monitor.has_error());
+        let e = monitor.take_error();
+        assert!(e.as_deref() == Some("first") || e.as_deref() == Some("second"));
+    }
+}
