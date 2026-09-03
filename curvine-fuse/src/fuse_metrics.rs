@@ -151,7 +151,6 @@ pub struct FuseMetrics {
     pub inode_num: Gauge,
     pub file_handle_num: Gauge,
     pub dir_handle_num: Gauge,
-    pub fuse_used_memory_bytes: Gauge,
 
     pub write_back_active_inode_num: Gauge,
     pub write_back_mem_usage: Gauge,
@@ -253,7 +252,6 @@ impl FuseMetrics {
             inode_num: m::new_gauge("inode_num", "FUSE inode count in dcache")?,
             file_handle_num: m::new_gauge("file_handle_num", "FUSE open file handle count")?,
             dir_handle_num: m::new_gauge("dir_handle_num", "FUSE open directory handle count")?,
-            fuse_used_memory_bytes: m::new_gauge("fuse_used_memory_bytes", "Total memory used")?,
             write_back_active_inode_num: m::new_gauge(
                 "write_back_active_inode_num",
                 "FUSE write-back active inode count",
