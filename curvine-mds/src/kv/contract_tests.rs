@@ -500,7 +500,8 @@ async fn memory_apply_then_unknown_does_not_flip_successful_cas() {
 
 // ===== fdb backend bindings =====
 //
-// Gated behind the `fdb` cargo feature (off with --no-fdb) and the
+// Gated behind the `fdb` cargo feature (off by default; enable with
+// --features fdb) and the
 // `CURVINE_MDS_FDB_CLUSTER` env var. Point it at a cluster
 // file (the same one `fdbcli -C <file>` accepts). Runs the identical contract
 // suite against real FoundationDB, e.g.:

@@ -12,10 +12,10 @@ publish = false
 # Enable OSS-HDFS backend specific tests / code paths (Jindo-based).
 # This is used by `#[cfg(feature = "oss-hdfs")]` in integration tests.
 oss-hdfs = ["curvine-client/oss-hdfs"]
-# FoundationDB backend (via curvine-server). On by default to preserve today's
-# behavior; disable with --no-fdb / --no-default-features to build the test
-# harness without the libfdb_c link-time dependency.
-default = ["fdb"]
+# FoundationDB backend (via curvine-server). Off by default; enable with
+# --fdb / --features fdb to build the test harness with the libfdb_c
+# link-time dependency.
+default = []
 fdb = ["curvine-server/fdb"]
 lancedb = [
     "dep:curvine-lancedb",

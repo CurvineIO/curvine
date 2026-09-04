@@ -36,7 +36,7 @@ impl Mds {
             KvBackendType::Fdb => {
                 return err_box!(
                     "mds.kv_backend=fdb requires the \"fdb\" feature \
-                     (build with --features fdb or without --no-fdb)"
+                     (build with --features fdb)"
                 );
             }
         };

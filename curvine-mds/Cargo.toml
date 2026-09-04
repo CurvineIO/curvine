@@ -5,10 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-# FoundationDB KV backend. Enabled by default; disable (--no-default-features
-# or via the parent crate) to drop the libfdb_c link-time dependency and the
-# bindgen build-time dependency entirely.
-default = ["fdb"]
+# FoundationDB KV backend. Off by default (like the SPDK features): it pulls
+# in the libfdb_c link-time dependency and the bindgen build-time dependency.
+# Enable explicitly with `--features fdb` / `--fdb` when the MDS must run
+# against a real FoundationDB cluster.
+default = []
 fdb = ["dep:foundationdb"]
 
 [dependencies]
