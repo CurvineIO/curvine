@@ -75,21 +75,32 @@ impl<E: Error> Default for ErrorMonitor<E> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::fmt;
+    use std::sync::{Arc, Barrier};
     use std::thread;
-    use std::thread::Barrier;
 
     use crate::sync::ErrorMonitor;
+
+    #[derive(Debug, PartialEq)]
+    struct TestError(&'static str);
+
+    impl fmt::Display for TestError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}", self.0)
+        }
+    }
+
+    impl std::error::Error for TestError {}
 
     /// A later set_error must not overwrite the first stored error.
     #[test]
     fn first_error_wins() {
-        let monitor = ErrorMonitor::<String>::new();
-        monitor.set_error("first".to_string());
-        monitor.set_error("second".to_string());
+        let monitor = ErrorMonitor::<TestError>::new();
+        monitor.set_error(TestError("first"));
+        monitor.set_error(TestError("second"));
 
         assert!(monitor.has_error());
-        assert_eq!(monitor.take_error().as_deref(), Some("first"));
+        assert_eq!(monitor.take_error().as_ref().map(|e| e.0), Some("first"));
         assert_eq!(monitor.take_error(), None);
     }
 
@@ -97,20 +108,20 @@ mod tests {
     /// and it is one of the attempted values (first-wins invariant).
     #[test]
     fn concurrent_set_error_stores_single_error() {
-        let monitor = Arc::new(ErrorMonitor::<String>::new());
+        let monitor = Arc::new(ErrorMonitor::<TestError>::new());
         let barrier = Arc::new(Barrier::new(2));
 
         let m1 = monitor.clone();
         let b1 = barrier.clone();
         let t1 = thread::spawn(move || {
             b1.wait();
-            m1.set_error("first".to_string());
+            m1.set_error(TestError("first"));
         });
 
         let b2 = barrier.clone();
         let t2 = thread::spawn(move || {
             b2.wait();
-            monitor.set_error("second".to_string());
+            monitor.set_error(TestError("second"));
         });
 
         t1.join().unwrap();
@@ -118,6 +129,7 @@ mod tests {
 
         assert!(monitor.has_error());
         let e = monitor.take_error();
-        assert!(e.as_deref() == Some("first") || e.as_deref() == Some("second"));
+        let msg = e.as_ref().map(|e| e.0);
+        assert!(msg == Some("first") || msg == Some("second"));
     }
 }
