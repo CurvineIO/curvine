@@ -119,9 +119,10 @@ mod tests {
         });
 
         let b2 = barrier.clone();
+        let m2 = monitor.clone();
         let t2 = thread::spawn(move || {
             b2.wait();
-            monitor.set_error(TestError("second"));
+            m2.set_error(TestError("second"));
         });
 
         t1.join().unwrap();
