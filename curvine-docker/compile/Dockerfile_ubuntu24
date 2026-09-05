@@ -33,6 +33,7 @@ RUN apt-get update && apt-get install -y \
     libstdc++-13-dev \
     zlib1g-dev \
     fio \
+    adduser \
     ca-certificates \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
@@ -66,6 +67,37 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y nodejs && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
+
+# 1.2. Install FoundationDB client library (multi-arch)
+# Required to link libfdb_c when building curvine-mds/curvine-server
+# (foundationdb crate, fdb-7_3). The official release ships .deb packages
+# for amd64 and arm64; SHA256-pinned for supply-chain safety (same pins as
+# the CI workflow used previously). The library installs to /usr/lib; a
+# symlink into the multiarch lib dir guarantees the linker finds it without
+# extra flags (adduser is a postinst dependency of the deb).
+RUN ARCH=$(uname -m) && \
+    FDB_VERSION=7.3.77 && \
+    case "${ARCH}" in \
+        x86_64) \
+            FDB_PACKAGE="foundationdb-clients_${FDB_VERSION}-1_amd64.deb" && \
+            FDB_SHA256="b6c263723009bddbc30b6ae8cf9854340bd35cef14152abb0da8fb5af2b91254" && \
+            MULTIARCH_DIR="x86_64-linux-gnu" ;; \
+        aarch64) \
+            FDB_PACKAGE="foundationdb-clients_${FDB_VERSION}-1_aarch64.deb" && \
+            FDB_SHA256="b3a5dd972ffd37c1d5dc0c29ffa00e2169bcac62c0186571acced8b006af7cc2" && \
+            MULTIARCH_DIR="aarch64-linux-gnu" ;; \
+        *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    esac && \
+    echo "Installing FoundationDB client ${FDB_VERSION} for ${ARCH}..." && \
+    curl -fsSL -o /tmp/${FDB_PACKAGE} \
+        "https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/${FDB_PACKAGE}" && \
+    echo "${FDB_SHA256}  /tmp/${FDB_PACKAGE}" | sha256sum -c - && \
+    dpkg -i /tmp/${FDB_PACKAGE} && \
+    rm -f /tmp/${FDB_PACKAGE} && \
+    ln -sf /usr/lib/libfdb_c.so /usr/lib/${MULTIARCH_DIR}/libfdb_c.so && \
+    ldconfig && \
+    ls -l /usr/lib/libfdb_c.so && \
+    echo "✓ FoundationDB client installed successfully for ${ARCH}"
 
 # 2. Install the Rust toolchain
 # uncomment the following two lines if you met network problem
