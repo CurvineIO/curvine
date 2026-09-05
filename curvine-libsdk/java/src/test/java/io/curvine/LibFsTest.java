@@ -16,9 +16,12 @@ package io.curvine;
 
 import org.apache.commons.io.FileUtils;
 import org.apache.hadoop.conf.Configuration;
+import org.junit.Assert;
 import org.junit.Test;
 
 import java.io.File;
+import java.util.Arrays;
+import java.util.List;
 
 public class LibFsTest {
     @Test
@@ -87,7 +90,22 @@ public class LibFsTest {
 
     @Test
     public void osVersion() throws Exception {
-        String ver = CurvineNative.getOsVersion("src/test/resources/os-version");
+        String ver = CurvineNativeLibraryResolver.getOsVersion("src/test/resources/os-version");
         System.out.println(ver);
+    }
+
+    @Test
+    public void linuxLibraryNamesFallBackToGenericLinux() {
+        List<String> x86 = Arrays.asList(CurvineNativeLibraryResolver.getLibraryNames("linux", "ubuntu20", "x86"));
+        Assert.assertEquals("libcurvine_libsdk_ubuntu20_x86_64.so", x86.get(0));
+        Assert.assertTrue(x86.contains("libcurvine_libsdk_linux_x86_64.so"));
+        Assert.assertTrue(x86.contains("libcurvine_libsdk_centos7_x86_64.so"));
+        Assert.assertTrue(x86.contains("libcurvine_libsdk.so"));
+
+        List<String> arm = Arrays.asList(CurvineNativeLibraryResolver.getLibraryNames("linux", "ubuntu20", "aarch"));
+        Assert.assertEquals("libcurvine_libsdk_ubuntu20_aarch_64.so", arm.get(0));
+        Assert.assertTrue(arm.contains("libcurvine_libsdk_linux_aarch_64.so"));
+        Assert.assertTrue(arm.contains("libcurvine_libsdk_centos7_aarch_64.so"));
+        Assert.assertFalse(arm.contains("libcurvine_libsdk.so"));
     }
 }

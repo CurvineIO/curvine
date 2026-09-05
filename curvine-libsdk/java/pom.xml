@@ -23,7 +23,7 @@
     <groupId>io.curvine</groupId>
     <description>Hadoop FileSystem implementation for Curvine</description>
     <artifactId>curvine-hadoop</artifactId>
-    <version>0.2.0</version>
+    <version>0.2.2</version>
     <packaging>jar</packaging>
 
     <properties>
@@ -35,9 +35,9 @@
         <scala.version>2.12.18</scala.version>
         <scala.compat.version>2.12</scala.compat.version>
         <dependency.scope>compile</dependency.scope>
-        <hadoop.version>3.4.0</hadoop.version>
         <protobuf.version>3.25.7</protobuf.version>
         <hadoop.version>3.3.4</hadoop.version>
+        <shade.prefix>curvine_shaded</shade.prefix>
     </properties>
 
     <dependencies>
@@ -73,13 +73,48 @@
             <groupId>org.apache.hadoop</groupId>
             <artifactId>hadoop-common</artifactId>
             <version>${hadoop.version}</version>
-            <scope>${dependency.scope}</scope>
+            <scope>provided</scope>
         </dependency>
 
         <dependency>
             <groupId>org.apache.hadoop</groupId>
             <artifactId>hadoop-hdfs-client</artifactId>
             <version>${hadoop.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>commons-cli</groupId>
+            <artifactId>commons-cli</artifactId>
+            <version>1.5.0</version>
+            <scope>${dependency.scope}</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>commons-io</groupId>
+            <artifactId>commons-io</artifactId>
+            <version>2.16.1</version>
+            <scope>${dependency.scope}</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-lang3</artifactId>
+            <version>3.14.0</version>
+            <scope>${dependency.scope}</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>commons-logging</groupId>
+            <artifactId>commons-logging</artifactId>
+            <version>1.3.1</version>
+            <scope>${dependency.scope}</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.curator</groupId>
+            <artifactId>curator-recipes</artifactId>
+            <version>4.2.0</version>
             <scope>${dependency.scope}</scope>
         </dependency>
 
@@ -132,6 +167,9 @@
         <resources>
             <resource>
                 <directory>${project.basedir}/src/main/resources</directory>
+                <excludes>
+                    <exclude>log4j.properties</exclude>
+                </excludes>
             </resource>
             <resource>
                 <!--native is not included in the code. After compiling curvine on the corresponding platform, put the libsdk package in the native directory and recompile java -->
@@ -153,6 +191,16 @@
         </extensions>
 
         <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.4.2</version>
+                <configuration>
+                    <excludes>
+                        <exclude>io/curvine/bench/**</exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
@@ -247,10 +295,18 @@
                                 <exclude>META-INF/*.SF</exclude>
                                 <exclude>META-INF/*.DSA</exclude>
                                 <exclude>META-INF/*.RSA</exclude>
+                                <exclude>META-INF/versions/**</exclude>
                                 <exclude>META-INF/maven/**</exclude>
+                                <exclude>module-info.class</exclude>
+                                <exclude>log4j.properties</exclude>
+                                <exclude>javax/**</exclude>
+                                <exclude>jakarta/**</exclude>
                             </excludes>
                         </filter>
                     </filters>
+                    <transformers>
+                        <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                    </transformers>
                 </configuration>
                 <executions>
                     <execution>
@@ -262,6 +318,11 @@
                         <configuration>
                             <shadedArtifactAttached>true</shadedArtifactAttached>
                             <shadedClassifierName>shade</shadedClassifierName>
+                            <artifactSet>
+                                <excludes>
+                                    <exclude>org.scala-lang:scala-library</exclude>
+                                </excludes>
+                            </artifactSet>
                         </configuration>
                     </execution>
 
@@ -275,16 +336,123 @@
                         <configuration>
                             <shadedArtifactAttached>true</shadedArtifactAttached>
                             <shadedClassifierName>client</shadedClassifierName>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                        <exclude>META-INF/versions/**</exclude>
+                                        <exclude>META-INF/maven/**</exclude>
+                                        <exclude>module-info.class</exclude>
+                                        <exclude>log4j.properties</exclude>
+                                        <exclude>org/slf4j/impl/**</exclude>
+                                        <exclude>org/apache/log4j/**</exclude>
+                                        <exclude>org/apache/hadoop/**</exclude>
+                                        <exclude>io/curvine/S3aProxyFileSystem.class</exclude>
+                                        <exclude>scala/**</exclude>
+                                        <exclude>io/curvine/bench/**</exclude>
+                                        <exclude>javax/**</exclude>
+                                        <exclude>jakarta/**</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
                             <artifactSet>
-                                <includes>
-                                    <include>com.google.protobuf:protobuf-java</include>
-                                    <include>com.google.protobuf:protobuf-java-util</include>
-                                </includes>
+                                <excludes>
+                                    <exclude>org.scala-lang:scala-library</exclude>
+                                    <exclude>org.apache.hadoop:*</exclude>
+                                    <exclude>org.apache.hadoop.thirdparty:*</exclude>
+                                    <exclude>org.slf4j:slf4j-api</exclude>
+                                    <exclude>org.slf4j:slf4j-log4j12</exclude>
+                                    <exclude>org.slf4j:slf4j-reload4j</exclude>
+                                    <exclude>org.apache.hadoop:hadoop-aws</exclude>
+                                    <exclude>com.amazonaws:aws-java-sdk-bundle</exclude>
+                                    <exclude>javax.activation:activation</exclude>
+                                    <exclude>jakarta.activation:jakarta.activation-api</exclude>
+                                    <exclude>javax.servlet:javax.servlet-api</exclude>
+                                    <exclude>javax.servlet.jsp:jsp-api</exclude>
+                                    <exclude>javax.ws.rs:jsr311-api</exclude>
+                                    <exclude>javax.xml.bind:jaxb-api</exclude>
+                                    <exclude>javax.xml.stream:stax-api</exclude>
+                                    <exclude>javax.el:javax.el-api</exclude>
+                                    <exclude>org.glassfish:javax.el</exclude>
+                                    <exclude>log4j:log4j</exclude>
+                                    <exclude>ch.qos.reload4j:reload4j</exclude>
+                                </excludes>
                             </artifactSet>
                             <relocations>
                                 <relocation>
                                     <pattern>com.google.protobuf</pattern>
-                                    <shadedPattern>curvine_shaded.com.google.protobuf</shadedPattern>
+                                    <shadedPattern>${shade.prefix}.com.google.protobuf</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>com.google.gson</pattern>
+                                    <shadedPattern>${shade.prefix}.com.google.gson</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>org.apache.commons</pattern>
+                                    <shadedPattern>${shade.prefix}.org.apache.commons</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>commons-logging</pattern>
+                                    <shadedPattern>${shade.prefix}.commons.logging</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>com.google.common</pattern>
+                                    <shadedPattern>${shade.prefix}.com.google.common</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>com.google.thirdparty</pattern>
+                                    <shadedPattern>${shade.prefix}.com.google.thirdparty</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>com.google.re2j</pattern>
+                                    <shadedPattern>${shade.prefix}.com.google.re2j</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>com.google.errorprone</pattern>
+                                    <shadedPattern>${shade.prefix}.com.google.errorprone</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>com.google.j2objc</pattern>
+                                    <shadedPattern>${shade.prefix}.com.google.j2objc</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>com.fasterxml</pattern>
+                                    <shadedPattern>${shade.prefix}.com.fasterxml</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>org.codehaus.jackson</pattern>
+                                    <shadedPattern>${shade.prefix}.org.codehaus.jackson</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>org.codehaus.stax2</pattern>
+                                    <shadedPattern>${shade.prefix}.org.codehaus.stax2</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>org.codehaus.jettison</pattern>
+                                    <shadedPattern>${shade.prefix}.org.codehaus.jettison</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>org.apache.curator</pattern>
+                                    <shadedPattern>${shade.prefix}.org.apache.curator</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>org.apache.zookeeper</pattern>
+                                    <shadedPattern>${shade.prefix}.org.apache.zookeeper</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>org.apache.http</pattern>
+                                    <shadedPattern>${shade.prefix}.org.apache.http</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>org.checkerframework</pattern>
+                                    <shadedPattern>${shade.prefix}.org.checkerframework</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>org.codehaus.mojo</pattern>
+                                    <shadedPattern>${shade.prefix}.org.codehaus.mojo</shadedPattern>
                                 </relocation>
                             </relocations>
                         </configuration>

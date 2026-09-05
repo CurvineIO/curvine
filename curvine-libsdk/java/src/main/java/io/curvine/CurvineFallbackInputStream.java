@@ -17,7 +17,6 @@ package io.curvine;
 import java.io.EOFException;
 import java.io.IOException;
 import java.util.function.Supplier;
-import javax.annotation.Nonnull;
 import org.apache.hadoop.fs.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -56,13 +55,13 @@ public class CurvineFallbackInputStream extends FSInputStream {
     }
 
     @Override
-    public int read(@Nonnull byte[] buf) throws IOException {
+    public int read(byte[] buf) throws IOException {
         checkClosed();
         return read(buf, 0, buf.length);
     }
 
     @Override
-    public int read(@Nonnull byte[] buf, int offset, int length) throws IOException {
+    public int read(byte[] buf, int offset, int length) throws IOException {
         if (ufsInputStream != null) {
             return ufsInputStream.read(buf, offset, length);
         }
