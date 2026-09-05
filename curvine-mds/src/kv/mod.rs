@@ -9,12 +9,14 @@
 
 mod backend;
 mod error;
+#[cfg(feature = "fdb")]
 mod fdb;
 mod memory;
 pub mod metrics;
 
 pub use backend::{run_txn, KvBackend, KvTransaction, DEFAULT_MAX_RETRIES};
 pub use error::{KvError, KvResult};
+#[cfg(feature = "fdb")]
 pub use fdb::FdbBackend;
 pub use memory::{FaultInjector, MemoryBackend};
 

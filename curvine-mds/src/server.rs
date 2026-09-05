@@ -6,8 +6,9 @@ use log::info;
 use std::sync::Arc;
 use tokio::sync::watch;
 
-use crate::{FdbBackend, KvBackend, MemoryBackend};
-
+#[cfg(feature = "fdb")]
+use crate::FdbBackend;
+use crate::{KvBackend, MemoryBackend};
 pub struct Mds {
     conf: ClusterConf,
     backend: Arc<dyn KvBackend>,
@@ -21,15 +22,34 @@ impl Mds {
         if !conf.mds.enabled {
             return err_box!("mds service is disabled; set mds.enabled=true to start it");
         }
+        // Reject kv_backend=fdb before config init() so users get the
+        // actionable "rebuild with fdb" message even when other config fields
+        // (e.g. an empty fdb_cluster_file) would otherwise fail validation
+        // first with a less helpful error.
+        #[cfg(not(feature = "fdb"))]
+        if conf.mds.kv_backend == KvBackendType::Fdb {
+            return err_box!(
+                "mds.kv_backend=fdb requires the \"fdb\" feature \
+                 (build with --features fdb)"
+            );
+        }
         conf.mds.init()?;
         Logger::init(conf.mds.log.clone());
 
         let backend: Arc<dyn KvBackend> = match conf.mds.kv_backend {
             KvBackendType::Memory => Arc::new(MemoryBackend::new()),
+            #[cfg(feature = "fdb")]
             KvBackendType::Fdb => Arc::new(
                 FdbBackend::open(&conf.mds.fdb_cluster_file, conf.mds.fdb_txn_timeout_ms)
                     .map_err(|error| curvine_core_error::CommonError::from(error.to_string()))?,
             ),
+            #[cfg(not(feature = "fdb"))]
+            KvBackendType::Fdb => {
+                return err_box!(
+                    "mds.kv_backend=fdb requires the \"fdb\" feature \
+                     (build with --features fdb)"
+                );
+            }
         };
         let rt = Arc::new(AsyncRuntime::new(
             "mds",
@@ -164,5 +184,38 @@ mod tests {
 
         let mds = Mds::with_conf(conf).unwrap();
         assert_eq!(mds.backend().name(), "memory");
+    }
+
+    #[cfg(not(feature = "fdb"))]
+    #[test]
+    fn rejects_fdb_backend_when_feature_disabled() {
+        // Default config: kv_backend=Fdb with non-empty fdb_cluster_file.
+        // The feature-required error should fire before init() validation.
+        let mut conf = ClusterConf::default();
+        conf.mds.enabled = true;
+        let err = match Mds::with_conf(conf) {
+            Ok(_) => panic!("expected fdb feature error when fdb feature is disabled"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("\"fdb\" feature"),
+            "expected error mentioning the 'fdb' feature, got: {msg}"
+        );
+
+        // Empty fdb_cluster_file: init() would normally reject it, but the
+        // early feature check should fire first with the same actionable error.
+        let mut conf2 = ClusterConf::default();
+        conf2.mds.enabled = true;
+        conf2.mds.fdb_cluster_file.clear();
+        let err2 = match Mds::with_conf(conf2) {
+            Ok(_) => panic!("expected fdb feature error even with empty cluster file"),
+            Err(e) => e,
+        };
+        let msg2 = format!("{err2}");
+        assert!(
+            msg2.contains("\"fdb\" feature"),
+            "expected error mentioning the 'fdb' feature with empty cluster file, got: {msg2}"
+        );
     }
 }

@@ -125,7 +125,7 @@ curvine-ufs-opendal = { path = "crates/adapters/curvine-ufs-opendal" }
 curvine-ufs-oss-hdfs = { path = "crates/adapters/curvine-ufs-oss-hdfs" }
 curvine-hdfs-jni = { path = "crates/adapters/curvine-hdfs-jni" }
 curvine-data-transfer = { path = "crates/server/curvine-data-transfer" }
-curvine-mds = { path = "curvine-mds" }
+curvine-mds = { path = "curvine-mds", default-features = false }
 curvine-fault = { path = "crates/core/curvine-fault" }
 curvine-metrics = { path = "crates/core/curvine-metrics" }
 curvine-error = { path = "crates/common/curvine-error" }
@@ -147,7 +147,7 @@ curvine-client = { path = "curvine-client", default-features = false }
 curvine-libsdk = { path = "curvine-libsdk" }
 curvine-libsdk-java = { path = "crates/sdk/curvine-libsdk-java" }
 curvine-libsdk-python = { path = "crates/sdk/curvine-libsdk-python" }
-curvine-server = { path = "curvine-server" }
+curvine-server = { path = "curvine-server", default-features = false }
 curvine-lancedb = { path = "curvine-lancedb" }
 curvine-ufs = { path = "curvine-ufs" }
 # Test harness dependency entry is for explicit test/dev tooling only.

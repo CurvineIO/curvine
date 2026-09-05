@@ -136,6 +136,7 @@ print_help() {
   echo "  --spdk                Enable SPDK NVMe-oF initiator support for the server-native build (TCP transport)"
   echo "  --spdk-rdma           Enable SPDK NVMe-oF initiator support for the server-native build (TCP + RDMA transport)"
   echo "  --spdk-dir PATH       Path to pre-built SPDK installation (default: /opt/spdk or \$SPDK_DIR)"
+  echo "  --fdb                 Enable the FoundationDB KV backend (links libfdb_c; requires the FoundationDB client library)"
   echo "  --skip-java-sdk        Skip Java SDK compilation (useful for Docker builds)"
   echo "  --skip-python-sdk      Skip Python SDK compilation (useful for Docker builds)"
   echo "  -h, --help            Show this help message"
@@ -155,6 +156,7 @@ print_help() {
   echo "                                          # Build server-native SPDK/RDMA separately from client/CLI artifacts"
   echo "  $0 --skip-java-sdk                      # Build all packages except Java SDK"
   echo "  $0 --skip-python-sdk                    # Build all packages except Python SDK"
+  echo "  $0 -p server --fdb                      # Build server with the FoundationDB KV backend"
   echo "  $0 -p java -p python                    # Build both Java and Python SDKs"
 }
 
@@ -186,6 +188,7 @@ SKIP_JAVA_SDK=0    # Flag to skip Java SDK compilation
 SKIP_PYTHON_SDK=0  # Flag to skip Python SDK compilation
 ENABLE_SPDK=0      # Flag to enable SPDK TCP initiator support
 ENABLE_SPDK_RDMA=0 # Flag to enable SPDK RDMA initiator support
+ENABLE_FDB=0       # Flag to enable the FoundationDB KV backend (default off)
 SPDK_DIR="${SPDK_DIR:-}"  # Path to pre-built SPDK installation
 
 # Parse command line arguments. Avoid external getopt: BSD getopt silently
@@ -283,6 +286,10 @@ while [ $# -gt 0 ]; do
     --spdk-dir=*)
       require_option_value "--spdk-dir" "${1#*=}"
       SPDK_DIR="${1#*=}"
+      shift
+      ;;
+    --fdb)
+      ENABLE_FDB=1
       shift
       ;;
     --skip-java-sdk)
@@ -793,6 +800,9 @@ FEATURES=()
 append_ufs_features "server-native"
 append_extra_features "server-native"
 append_alloc_feature "server-native"
+if [ $ENABLE_FDB -eq 1 ]; then
+  add_feature "curvine-server/fdb"
+fi
 if [ $ENABLE_SPDK -eq 1 ]; then
   add_feature "curvine-server/spdk"
   echo "Enabling SPDK NVMe-oF initiator support (TCP transport)"
@@ -824,6 +834,9 @@ FEATURES=()
 append_ufs_features "tests"
 append_extra_features "tests"
 append_alloc_feature "tests"
+if [ $ENABLE_FDB -eq 1 ]; then
+  add_feature "curvine-server/fdb"
+fi
 if [ $ENABLE_SPDK -eq 1 ]; then
   add_feature "curvine-server/spdk"
 fi
