@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::file::FsWriterBase;
-use curvine_error::FsError;
 use curvine_error::FsResult;
+use curvine_error::{ErrorKind, FsError};
 use curvine_fs_api::Path;
 use curvine_io::DataSlice;
 use curvine_io::IOError;
@@ -24,7 +24,7 @@ use curvine_runtime::sync::channel::{
     AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender,
 };
 use curvine_runtime::sync::ErrorMonitor;
-use log::error;
+use log::{debug, error};
 use std::sync::Arc;
 
 // Control task type
@@ -158,7 +158,12 @@ impl FsWriterBuffer {
             match res {
                 Ok(_) => {}
                 Err(e) => {
-                    error!("buffer writer error: {:?}", e);
+                    if matches!(e.kind(), ErrorKind::FileNotFound) {
+                        debug!("buffer writer error: {:?}", e);
+                    } else {
+                        error!("buffer writer error: {:?}", e);
+                    }
+
                     monitor.set_error(e);
                 }
             }
