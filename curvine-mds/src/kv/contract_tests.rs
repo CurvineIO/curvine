@@ -507,7 +507,7 @@ async fn memory_apply_then_unknown_does_not_flip_successful_cas() {
 // suite against real FoundationDB, e.g.:
 //
 //   CURVINE_MDS_FDB_CLUSTER=/path/to/fdb.cluster \
-//     cargo test -p curvine-mds fdb_backend_satisfies_contract
+//     cargo test -p curvine-mds --features fdb fdb_backend_satisfies_contract
 //
 // A unique per-run key prefix isolates this run's keyspace on the shared
 // cluster, so leftover keys from earlier runs never fail a fresh assertion.

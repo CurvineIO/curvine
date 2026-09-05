@@ -22,6 +22,17 @@ impl Mds {
         if !conf.mds.enabled {
             return err_box!("mds service is disabled; set mds.enabled=true to start it");
         }
+        // Reject kv_backend=fdb before config init() so users get the
+        // actionable "rebuild with fdb" message even when other config fields
+        // (e.g. an empty fdb_cluster_file) would otherwise fail validation
+        // first with a less helpful error.
+        #[cfg(not(feature = "fdb"))]
+        if conf.mds.kv_backend == KvBackendType::Fdb {
+            return err_box!(
+                "mds.kv_backend=fdb requires the \"fdb\" feature \
+                 (build with --features fdb)"
+            );
+        }
         conf.mds.init()?;
         Logger::init(conf.mds.log.clone());
 
@@ -178,11 +189,10 @@ mod tests {
     #[cfg(not(feature = "fdb"))]
     #[test]
     fn rejects_fdb_backend_when_feature_disabled() {
+        // Default config: kv_backend=Fdb with non-empty fdb_cluster_file.
+        // The feature-required error should fire before init() validation.
         let mut conf = ClusterConf::default();
         conf.mds.enabled = true;
-        // KvBackendType::Fdb is the default; fdb_cluster_file is non-empty in
-        // the default so init() passes. The cfg(not(feature = "fdb")) arm in
-        // Mds::with_conf should then produce the feature-required error.
         let err = match Mds::with_conf(conf) {
             Ok(_) => panic!("expected fdb feature error when fdb feature is disabled"),
             Err(e) => e,
@@ -191,6 +201,21 @@ mod tests {
         assert!(
             msg.contains("\"fdb\" feature"),
             "expected error mentioning the 'fdb' feature, got: {msg}"
+        );
+
+        // Empty fdb_cluster_file: init() would normally reject it, but the
+        // early feature check should fire first with the same actionable error.
+        let mut conf2 = ClusterConf::default();
+        conf2.mds.enabled = true;
+        conf2.mds.fdb_cluster_file.clear();
+        let err2 = match Mds::with_conf(conf2) {
+            Ok(_) => panic!("expected fdb feature error even with empty cluster file"),
+            Err(e) => e,
+        };
+        let msg2 = format!("{err2}");
+        assert!(
+            msg2.contains("\"fdb\" feature"),
+            "expected error mentioning the 'fdb' feature with empty cluster file, got: {msg2}"
         );
     }
 }
