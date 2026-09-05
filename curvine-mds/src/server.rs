@@ -174,4 +174,23 @@ mod tests {
         let mds = Mds::with_conf(conf).unwrap();
         assert_eq!(mds.backend().name(), "memory");
     }
+
+    #[cfg(not(feature = "fdb"))]
+    #[test]
+    fn rejects_fdb_backend_when_feature_disabled() {
+        let mut conf = ClusterConf::default();
+        conf.mds.enabled = true;
+        // KvBackendType::Fdb is the default; fdb_cluster_file is non-empty in
+        // the default so init() passes. The cfg(not(feature = "fdb")) arm in
+        // Mds::with_conf should then produce the feature-required error.
+        let err = match Mds::with_conf(conf) {
+            Ok(_) => panic!("expected fdb feature error when fdb feature is disabled"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("\"fdb\" feature"),
+            "expected error mentioning the 'fdb' feature, got: {msg}"
+        );
+    }
 }
