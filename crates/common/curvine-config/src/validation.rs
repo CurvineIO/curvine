@@ -27,10 +27,11 @@
 //!    key is silently dropped at load time.
 //!
 //!    The audit is EMPIRICAL: each candidate key path is individually probed
-//!    by replacing its value with one of the opposite type and attempting a
-//!    real deserialization of the mutated document. A consumed key (canonical,
-//!    aliased, `Option`, or `skip_serializing`-only) makes the probe fail with
-//!    a type error; an ignored key lets it succeed and is reported as unknown.
+//!    by replacing its scalar value with an empty TOML table and attempting a
+//!    real deserialization of the mutated document. A consumed scalar key
+//!    (canonical, aliased, `Option`, or `skip_serializing`-only) makes the probe
+//!    fail with a type error; an ignored key lets it succeed and is reported as
+//!    unknown.
 //!    This derives acceptance from actual serde behavior, so it cannot produce
 //!    the false positives a serialized-default schema would (it cannot see
 //!    aliases or `skip_serializing`-only fields).
@@ -135,7 +136,7 @@ pub fn audit_unknown_keys_in(doc: &toml::Value) -> Vec<String> {
     let mut unknown = Vec::new();
     for path in candidates {
         let mut mutated = doc.clone();
-        if !replace_with_opposite_type(&mut mutated, &path) {
+        if !replace_scalar_with_table(&mut mutated, &path) {
             // Unsupported leaf shape — leave it alone rather than risk a false
             // report (the audit is advisory).
             continue;
@@ -180,10 +181,14 @@ fn collect_leaf_paths(value: &toml::Value, prefix: String, out: &mut Vec<String>
     }
 }
 
-/// Replaces the value at a dotted path with one of the opposite type, so a
-/// consumed field fails its type check during the probe:
-/// string leaves become an integer, everything else becomes a string.
-fn replace_with_opposite_type(doc: &mut toml::Value, path: &str) -> bool {
+/// Replaces the scalar value at a dotted path with an empty table, so a
+/// consumed scalar field fails its type check during the probe.
+///
+/// A simple string/integer swap is insufficient because flexible scalar
+/// deserializers such as `ByteUnit` intentionally accept both representations.
+/// A table is outside the accepted representation of the scalar leaves audited
+/// here, while serde still ignores it when the key itself is unknown.
+fn replace_scalar_with_table(doc: &mut toml::Value, path: &str) -> bool {
     let segments: Vec<&str> = path.split('.').collect();
     let mut node = doc;
     for seg in segments.iter().take(segments.len() - 1) {
@@ -193,14 +198,10 @@ fn replace_with_opposite_type(doc: &mut toml::Value, path: &str) -> bool {
         };
     }
     let last = *segments.last().expect("non-empty path");
-    let leaf = match node.get(last) {
-        Some(v) => v,
-        None => return false,
-    };
-    let replacement = match leaf {
-        toml::Value::String(_) => toml::Value::Integer(0),
-        _ => toml::Value::String("__curvine_audit_probe__".to_string()),
-    };
+    if node.get(last).is_none() {
+        return false;
+    }
+    let replacement = toml::Value::Table(Default::default());
     crate::pipeline::set_dotted(node, last, replacement).is_ok()
 }
 
@@ -307,6 +308,22 @@ mod tests {
         assert!(
             unknown.is_empty(),
             "Option/skip_serializing keys must be recognized: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn flexible_byte_unit_fields_are_not_false_positives() {
+        // ByteUnit accepts both TOML strings (human-readable sizes) and
+        // integers (raw bytes). The unknown-key probe must use a representation
+        // outside both accepted forms.
+        let raw = r#"
+            [master.rocksdb]
+            block_cache_size = "64MB"
+        "#;
+        let unknown = audit_unknown_keys(raw).unwrap();
+        assert!(
+            unknown.is_empty(),
+            "ByteUnit keys must be recognized: {unknown:?}"
         );
     }
 
