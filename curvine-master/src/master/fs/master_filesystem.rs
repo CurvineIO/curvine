@@ -1680,25 +1680,29 @@ impl MasterFilesystem {
             self.worker_manager.read().available_bytes()
         };
 
-        let mut fs_dir = self.fs_dir.write();
-        let (del_res, inode) = {
+        let (del_res, inode_id) = {
+            let mut fs_dir = self.fs_dir.write();
             let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
             let file = inode.as_file_ref()?;
             Self::validate_alloc_capacity(file.len, file.replicas, &opts, available)?;
+            let inode_id = inode.id();
             let del_res = fs_dir.resize_inode(path, &mut inode, opts)?;
-            (del_res, inode)
+            (del_res, inode_id)
         };
 
         if !del_res.blocks.is_empty() {
             self.worker_manager.write().remove_blocks(&del_res);
         }
 
-        let blocks = {
-            let file = inode.as_file_ref()?;
-            let locs = self.get_block_locs(path, &fs_dir, file)?;
-            let status = inode.to_file_status(path)?;
-            FileBlocks::new(status, locs)
-        };
+        let blocks = self.get_block_locations(path)?;
+        if blocks.status.id != inode_id {
+            return err_box!(
+                "Path {} resolved to different inode after resize, expected {}, got {}",
+                path,
+                inode_id,
+                blocks.status.id
+            );
+        }
 
         Ok(blocks)
     }
