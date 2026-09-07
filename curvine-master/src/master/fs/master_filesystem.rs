@@ -1679,8 +1679,9 @@ impl MasterFilesystem {
         } else {
             self.worker_manager.read().available_bytes()
         };
+
+        let mut fs_dir = self.fs_dir.write();
         let (del_res, inode) = {
-            let mut fs_dir = self.fs_dir.write();
             let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
             let file = inode.as_file_ref()?;
             Self::validate_alloc_capacity(file.len, file.replicas, &opts, available)?;
@@ -1693,7 +1694,6 @@ impl MasterFilesystem {
         }
 
         let blocks = {
-            let fs_dir = self.fs_dir.read();
             let file = inode.as_file_ref()?;
             let locs = self.get_block_locs(path, &fs_dir, file)?;
             let status = inode.to_file_status(path)?;

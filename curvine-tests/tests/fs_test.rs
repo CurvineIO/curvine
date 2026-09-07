@@ -607,8 +607,8 @@ async fn open_file_rename_sparse_write(fs: &CurvineFileSystem) -> CommonResult<(
     const PREFIX: &[u8] = b"prefix";
     const SUFFIX: &[u8] = b"suffix";
 
-    // Flushing this buffered write during the following seek triggers the
-    // rename-sensitive sparse resize and block assignment paths.
+    // The write below lands at an offset past EOF, so FsWriterBase::write
+    // triggers the rename-sensitive sparse resize and block assignment paths.
     writer.seek(HOLE_END).await?;
     writer.write(SUFFIX).await?;
     writer.seek(0).await?;
