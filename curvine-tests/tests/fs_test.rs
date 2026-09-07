@@ -225,6 +225,9 @@ fn run_filesystem_end_to_end_operations_on_cluster(
         open_file_rename_read_write(&fs).await?;
         println!("open_file_rename_read_write done");
 
+        open_file_rename_sparse_write(&fs).await?;
+        println!("open_file_rename_sparse_write done");
+
         set_attr_non_recursive(&fs).await?;
         println!("set_attr_non_recursive done");
 
@@ -583,6 +586,50 @@ async fn open_file_rename_read_write(fs: &CurvineFileSystem) -> CommonResult<()>
     buffer.truncate(bytes_read);
     assert_eq!(String::from_utf8(buffer.to_vec())?, "read-before-rename");
     assert_eq!(fs.read_string(&read_dst).await?, "read-before-rename");
+
+    Ok(())
+}
+
+/// Regression: an open writer retains its original path, while rename moves
+/// the directory entry. A later seek-past-EOF write invokes ResizeFile (and may
+/// assign a sparse block), so those operations must resolve the file by inode
+/// ID instead of the now-stale open-time path.
+async fn open_file_rename_sparse_write(fs: &CurvineFileSystem) -> CommonResult<()> {
+    let src = Path::from_str("/fs_test/open_rename_sparse/temp_shuffle")?;
+    let dst = Path::from_str("/fs_test/open_rename_sparse/shuffle_1_1_0.data")?;
+    let mut writer = fs.create(&src, true).await?;
+
+    fs.rename(&src, &dst).await?;
+    assert!(!fs.exists(&src).await?);
+    assert!(fs.exists(&dst).await?);
+
+    const HOLE_END: i64 = 4096;
+    const PREFIX: &[u8] = b"prefix";
+    const SUFFIX: &[u8] = b"suffix";
+
+    // Flushing this buffered write during the following seek triggers the
+    // rename-sensitive sparse resize and block assignment paths.
+    writer.seek(HOLE_END).await?;
+    writer.write(SUFFIX).await?;
+    writer.seek(0).await?;
+    writer.write(PREFIX).await?;
+    writer.complete().await?;
+
+    let expected_len = HOLE_END as usize + SUFFIX.len();
+    let status = fs.get_status(&dst).await?;
+    assert_eq!(status.len, expected_len as i64);
+
+    let mut reader = fs.open(&dst).await?;
+    let mut actual = vec![0u8; expected_len];
+    let read = reader.read_full(&mut actual).await?;
+    reader.complete().await?;
+
+    assert_eq!(read, expected_len);
+    assert_eq!(&actual[..PREFIX.len()], PREFIX);
+    assert!(actual[PREFIX.len()..HOLE_END as usize]
+        .iter()
+        .all(|&byte| byte == 0));
+    assert_eq!(&actual[HOLE_END as usize..], SUFFIX);
 
     Ok(())
 }

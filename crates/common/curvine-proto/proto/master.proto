@@ -314,6 +314,7 @@ message MetricsReportResponse {
 message FileResizeRequest {
     required string path = 1;
     required FileAllocOptsProto opts = 2;
+    optional int64 inode_id = 3;
 }
 
 message FileResizeResponse {
@@ -325,6 +326,7 @@ message AssignWorkerRequest {
     required ExtendedBlockProto block = 2;
     repeated uint32 exclude_workers = 3;
     required ClientAddressProto client_address = 4;
+    optional int64 inode_id = 5;
 }
 
 message AssignWorkerResponse {

@@ -385,7 +385,11 @@ impl FsWriterBase {
                                 let lb = if lb.should_assign() {
                                     let assign_lb = self
                                         .fs_client
-                                        .assign_worker(&self.path, lb.block.clone())
+                                        .assign_worker_by_id(
+                                            &self.path,
+                                            self.file_blocks.status.id,
+                                            lb.block.clone(),
+                                        )
                                         .await?;
 
                                     self.file_blocks.update_locate(&assign_lb)?;
@@ -520,11 +524,14 @@ impl FsWriterBase {
         // writes; forcing complete() whenever len > 0 can surface EIO from a
         // redundant metadata complete on an already-consistent file.
         if self.has_pending_blocks() {
-            self.complete().await?;
+            self.flush().await?;
         }
 
         // Step 2: Execute resize operation
-        let file_blocks = self.fs_client.resize(&self.path, opts).await?;
+        let file_blocks = self
+            .fs_client
+            .resize_by_id(&self.path, self.file_blocks.status.id, opts)
+            .await?;
         let mut file_blocks = WriteFileBlocks::new(file_blocks);
         let block_size = file_blocks.status.block_size;
         if file_blocks.len() != len {

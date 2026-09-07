@@ -1312,13 +1312,22 @@ impl FsDir {
             Some(v) => v,
             None => return err_ext!(FsError::file_not_found(inp.path())),
         };
+        self.resize_inode(inp.path(), &mut inode, opts)
+    }
+
+    pub fn resize_inode(
+        &mut self,
+        audit_path: &str,
+        inode: &mut InodePtr,
+        opts: FileAllocOpts,
+    ) -> FsResult<DeleteResult> {
         let file = inode.as_file_mut()?;
 
         if file.len == opts.len {
             return Ok(DeleteResult::new());
         }
         let del_blocks = file.resize(opts.clone())?;
-        debug!("resize file {} success, opts: {:?}", inp.path(), opts);
+        debug!("resize file {} success, opts: {:?}", audit_path, opts);
 
         file.complete(file.len, &[], "", true)?;
         let mut del_res = DeleteResult::new();
@@ -1331,7 +1340,7 @@ impl FsDir {
 
         self.store.apply_complete_file(inode.as_ref(), &[])?;
         self.journal_writer
-            .log_complete_file(self, inp.path(), inode.as_file_ref()?, vec![])?;
+            .log_complete_file(self, audit_path, inode.as_file_ref()?, vec![])?;
 
         Ok(del_res)
     }
@@ -1343,6 +1352,16 @@ impl FsDir {
         workers: &[WorkerAddress],
     ) -> FsResult<ExtendedBlock> {
         let mut inode = try_option!(inp.get_last_inode(), "File {} not exists", inp.path());
+        self.assign_worker_inode(inp.path(), &mut inode, block_id, workers)
+    }
+
+    pub fn assign_worker_inode(
+        &mut self,
+        audit_path: &str,
+        inode: &mut InodePtr,
+        block_id: i64,
+        workers: &[WorkerAddress],
+    ) -> FsResult<ExtendedBlock> {
         let file = inode.as_file_mut()?;
 
         let block = file.search_block_mut_check(block_id)?;
@@ -1358,7 +1377,7 @@ impl FsDir {
         if res {
             self.store.apply_new_block(inode.as_ref(), &[])?;
             self.journal_writer
-                .log_add_block(self, inp.path(), inode.as_file_ref()?, vec![])?;
+                .log_add_block(self, audit_path, inode.as_file_ref()?, vec![])?;
         }
 
         Ok(block)

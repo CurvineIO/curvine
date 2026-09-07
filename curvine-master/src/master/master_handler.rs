@@ -917,8 +917,9 @@ impl MasterHandler {
         let header: FileResizeRequest = ctx.parse_header()?;
         ctx.set_audit(Some(header.path.to_string()), None);
 
-        let file_blocks = self.fs.resize(
+        let file_blocks = self.fs.resize_by_id(
             &header.path,
+            header.inode_id,
             ProtoUtils::file_alloc_opts_from_pb(header.opts),
         )?;
         let rep_header = FileResizeResponse {
@@ -931,8 +932,9 @@ impl MasterHandler {
         let header: AssignWorkerRequest = ctx.parse_header()?;
         ctx.set_audit(Some(header.path.to_string()), None);
 
-        let block = self.fs.assign_worker(
+        let block = self.fs.assign_worker_by_id(
             &header.path,
+            header.inode_id,
             ProtoUtils::extend_block_from_pb(header.block),
             ProtoUtils::client_address_from_pb(header.client_address),
             header.exclude_workers,
