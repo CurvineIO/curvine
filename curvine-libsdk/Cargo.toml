@@ -38,3 +38,4 @@ oss-hdfs = ["internal-oss-hdfs-jindo"]
 curvine-sdk-core = { workspace = true }
 curvine-libsdk-java = { workspace = true, optional = true }
 curvine-libsdk-python = { workspace = true, optional = true }
+libc = { workspace = true }

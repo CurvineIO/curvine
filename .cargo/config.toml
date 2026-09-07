@@ -9,6 +9,11 @@
 # args: `-Wl,-Bstatic` `-lstdc++` `-Wl,-Bdynamic`.
 linker = "build/static-link-wrapper.sh"
 
+[target.aarch64-unknown-linux-gnu]
+# Same wrapper is required on Linux ARM; otherwise the JNI so can keep dynamic
+# DT_NEEDED entries for libstdc++, libgcc_s, and zlib.
+linker = "build/static-link-wrapper.sh"
+
 [target.x86_64-apple-darwin]
 rustflags = [
     "-C", "link-arg=-undefined",

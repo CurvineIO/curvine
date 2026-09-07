@@ -14,7 +14,6 @@
 
 package io.curvine;
 
-import io.curvine.bench.Utils;
 import io.curvine.proto.GetFilesystemInfoResponse;
 import io.curvine.proto.WorkerInfoProto;
 import org.apache.commons.lang3.StringUtils;
@@ -60,12 +59,12 @@ public class CurvineFsStat extends FsStatus {
             builder.append("\n");
         }
 
-        builder.append(String.format("%20s: %s\n", "capacity", Utils.bytesToString(info.getCapacity())));
+        builder.append(String.format("%20s: %s\n", "capacity", CurvineJavaUtils.bytesToString(info.getCapacity())));
 
         String available = String.format(
                 "%20s: %s (%.2f%%)\n",
                 "available",
-                Utils.bytesToString(info.getAvailable()),
+                CurvineJavaUtils.bytesToString(info.getAvailable()),
                 getPercent(info.getAvailable(), info.getCapacity())
         );
         builder.append(available);
@@ -73,7 +72,7 @@ public class CurvineFsStat extends FsStatus {
         String used = String.format(
                 "%20s: %s (%.2f%%)\n",
                 "fs_used",
-                Utils.bytesToString(info.getFsUsed()),
+                CurvineJavaUtils.bytesToString(info.getFsUsed()),
                 getPercent(info.getFsUsed(), info.getCapacity())
         );
         builder.append(used);
@@ -82,16 +81,16 @@ public class CurvineFsStat extends FsStatus {
         // writes (Live workers only). Absent on legacy masters, so guard with
         // hasAllocatableCapacity() to avoid printing a misleading 0.
         if (info.hasAllocatableCapacity()) {
-            builder.append(String.format("%20s: %s\n", "allocatable_capacity", Utils.bytesToString(info.getAllocatableCapacity())));
+            builder.append(String.format("%20s: %s\n", "allocatable_capacity", CurvineJavaUtils.bytesToString(info.getAllocatableCapacity())));
             builder.append(String.format(
                     "%20s: %s (%.2f%%)\n",
                     "allocatable_available",
-                    Utils.bytesToString(info.getAllocatableAvailable()),
+                    CurvineJavaUtils.bytesToString(info.getAllocatableAvailable()),
                     getPercent(info.getAllocatableAvailable(), info.getAllocatableCapacity())
             ));
         }
 
-        builder.append(String.format("%20s: %s\n", "non_fs_used", Utils.bytesToString(info.getNonFsUsed())));
+        builder.append(String.format("%20s: %s\n", "non_fs_used", CurvineJavaUtils.bytesToString(info.getNonFsUsed())));
         builder.append(String.format("%20s: %s\n", "live_worker_num", info.getLiveWorkersCount()));
         builder.append(String.format("%20s: %s\n", "lost_worker_num", info.getLostWorkersCount()));
         builder.append(String.format("%20s: %s\n", "inode_dir_num", info.getInodeDirNum()));
@@ -110,8 +109,8 @@ public class CurvineFsStat extends FsStatus {
                     "%s:%s,%s/%s (%.2f%%)",
                     worker.getAddress().getHostname(),
                     worker.getAddress().getRpcPort(),
-                    Utils.bytesToString(worker.getAvailable()),
-                    Utils.bytesToString(worker.getCapacity()),
+                    CurvineJavaUtils.bytesToString(worker.getAvailable()),
+                    CurvineJavaUtils.bytesToString(worker.getCapacity()),
                     getPercent(worker.getAvailable(), worker.getCapacity())
             );
 
@@ -153,7 +152,7 @@ public class CurvineFsStat extends FsStatus {
                     "%s:%s  %s",
                     worker.getAddress().getHostname(),
                     worker.getAddress().getRpcPort(),
-                    Utils.bytesToString(worker.getCapacity())
+                    CurvineJavaUtils.bytesToString(worker.getCapacity())
             );
             builder.append(String.format("%s\n", str));
         }
@@ -169,7 +168,7 @@ public class CurvineFsStat extends FsStatus {
                     "%s:%s  %s",
                     worker.getAddress().getHostname(),
                     worker.getAddress().getRpcPort(),
-                    Utils.bytesToString(worker.getFsUsed())
+                    CurvineJavaUtils.bytesToString(worker.getFsUsed())
             );
             builder.append(String.format("%s\n", str));
         }
@@ -185,7 +184,7 @@ public class CurvineFsStat extends FsStatus {
                     "%s:%s  %s",
                     worker.getAddress().getHostname(),
                     worker.getAddress().getRpcPort(),
-                    Utils.bytesToString(worker.getAvailable())
+                    CurvineJavaUtils.bytesToString(worker.getAvailable())
             );
             builder.append(String.format("%s\n", str));
         }

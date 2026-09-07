@@ -15,7 +15,6 @@
 package io.curvine;
 
 import java.nio.Buffer;
-import java.nio.charset.StandardCharsets;
 import org.apache.commons.io.FilenameUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
@@ -25,6 +24,9 @@ import java.io.*;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.regex.Pattern;
 
 public class CurvineNative {
@@ -36,9 +38,10 @@ public class CurvineNative {
     public static final String LIBRARY_PATH = "java.library.path";
     public static final String NATIVE_WORKDIR = "curvine.native.workdir";
 
-    public static String OS_RELEASE_FILE = "/etc/os-release";
-    public static final String LINUX_ID_PREFIX = "ID=";
-    public static final String LINUX_VERSION_PREFIX = "VERSION_ID=";
+    public static String OS_RELEASE_FILE = CurvineNativeLibraryResolver.OS_RELEASE_FILE;
+    public static final String LINUX_ID_PREFIX = CurvineNativeLibraryResolver.LINUX_ID_PREFIX;
+    public static final String LINUX_VERSION_PREFIX = CurvineNativeLibraryResolver.LINUX_VERSION_PREFIX;
+    private static final String JINDOSDK_SONAME = "libjindosdk_c.so.6";
 
     // Split java.version on non-digit chars:
     private static final int majorVersion =
@@ -88,31 +91,35 @@ public class CurvineNative {
     }
 
     public static String getLibraryName() {
+        return getLibraryNames()[0];
+    }
+
+    public static String[] getLibraryNames() {
         String sysOs = System.getProperty("os.name").toLowerCase();
-        String sysArch = System.getProperty("os.arch").toLowerCase();
+        String arch = getNativeArch();
+        String osVersion = isLinux() ? getOsVersion() : null;
 
-        // Determine platform type
-        String arch;
-        if (sysArch.contains("arm") || sysArch.contains("aarch")) {
-            arch = "aarch";
-        } else if (sysArch.contains("x86") || sysArch.contains("amd")) {
-            arch = "x86";
-        } else {
-            throw new RuntimeException("Unsupported CPU architecture: " + sysArch);
-        }
+        return getLibraryNames(sysOs, osVersion, arch);
+    }
 
-        if (!sysArch.contains("64")) {
-            throw new RuntimeException("Currently only supports 64-bit systems");
-        }
+    static String[] getLibraryNames(String sysOs, String osVersion, String arch) {
+        return CurvineNativeLibraryResolver.getLibraryNames(sysOs, osVersion, arch);
+    }
 
-        if (sysOs.contains("win")) {
-            return "curvine_libsdk.dll";
-        } else if (sysOs.contains("linux")) {
-            String osVersion = getOsVersion();
-            return String.format("libcurvine_libsdk_%s_%s_64.so", osVersion, arch);
-        } else {
-            throw new RuntimeException("Unsupported operating systems: " + sysOs);
+    private static String getNativeArch() {
+        return CurvineNativeLibraryResolver.getNativeArch(
+                System.getProperty("os.arch").toLowerCase());
+    }
+
+    private static boolean isLinux() {
+        return CurvineNativeLibraryResolver.isLinux(System.getProperty("os.name").toLowerCase());
+    }
+
+    private static String getJindoLibraryResourceName() {
+        if (!isLinux()) {
+            return null;
         }
+        return String.format("libjindosdk_c_linux_%s_64.so.6", getNativeArch());
     }
 
     public static String getOsVersion() {
@@ -120,37 +127,7 @@ public class CurvineNative {
     }
 
     public static String getOsVersion(String path) {
-        File file = new File(path);
-        if (!file.exists()) {
-            return "unknown";
-        }
-
-        // Use try-with-resources to ensure BufferedReader is properly closed
-        try (BufferedReader reader = new BufferedReader(
-                new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8))) {
-            String line;
-            String id = null;
-            String version = null;
-            while ((line = reader.readLine()) != null) {
-                if (line.startsWith(LINUX_ID_PREFIX)) {
-                    id = normalizeOsReleaseVariableValue(line.substring(LINUX_ID_PREFIX.length()));
-                } else if (line.startsWith(LINUX_VERSION_PREFIX)) {
-                    version = normalizeOsReleaseVariableValue(line.substring(LINUX_VERSION_PREFIX.length()));
-                    String[] split = version.split("\\.");
-                    if (split.length > 0) {
-                        version = split[0];
-                    }
-                }
-            }
-
-            if (id == null || version == null) {
-                throw new RuntimeException("No os version was parsed");
-            }
-            return id.toLowerCase() + version;
-        } catch (Exception e) {
-            LOGGER.warn("Failed to parse the os version", e);
-            return "unknown";
-        }
+        return CurvineNativeLibraryResolver.getOsVersion(path);
     }
 
     /**
@@ -195,71 +172,138 @@ public class CurvineNative {
      * loading from a real filesystem path before copying to tmp (helps some TLS / dlopen cases).
      */
     public static void load() {
-        String libraryName = getLibraryName();
+        String[] libraryNames = getLibraryNames();
         Throwable lastFailure = null;
+        List<String> failures = new ArrayList<>();
 
-        try {
-            System.loadLibrary(loadLibraryLookupName(libraryName));
-            LOGGER.info("Loaded native library {} via System.loadLibrary", libraryName);
-            return;
-        } catch (UnsatisfiedLinkError e) {
-            LOGGER.debug("System.loadLibrary failed for {}: {}", libraryName, e.toString());
+        for (String libraryName : libraryNames) {
+            try {
+                System.loadLibrary(loadLibraryLookupName(libraryName));
+                LOGGER.info("Loaded native library {} via System.loadLibrary", libraryName);
+                return;
+            } catch (UnsatisfiedLinkError e) {
+                lastFailure = e;
+                failures.add("System.loadLibrary(" + libraryName + "): " + e);
+                LOGGER.debug("System.loadLibrary failed for {}: {}", libraryName, e.toString());
+            }
+        }
+
+        for (String libraryName : libraryNames) {
+            try {
+                if (loadFromLibraryPathDirectories(libraryName)) {
+                    return;
+                }
+            } catch (Throwable e) {
+                lastFailure = e;
+                failures.add("java.library.path(" + libraryName + "): " + e);
+                LOGGER.warn("java.library.path directory scan failed for {}", libraryName, e);
+            }
         }
 
         try {
-            if (loadFromLibraryPathDirectories(libraryName)) {
-                return;
+            File extractionDir = createNativeExtractionDir();
+            String jindoPath = loadJindoLibraryFromJar(extractionDir);
+            if (jindoPath != null) {
+                System.load(jindoPath);
+                LOGGER.info("Loaded JindoSDK native dependency from jar extract {}", jindoPath);
+            }
+
+            for (String libraryName : libraryNames) {
+                if (!hasJarResource(libraryName)) {
+                    LOGGER.debug("Native library {} was not found inside JAR", libraryName);
+                    continue;
+                }
+                try {
+                    File extracted = extractLibraryFromJar(libraryName, new File(extractionDir, libraryName));
+                    System.load(extracted.getAbsolutePath());
+                    LOGGER.info("Loaded native library {} from jar extract {}", libraryName,
+                            extracted.getAbsolutePath());
+                    return;
+                } catch (Throwable e) {
+                    lastFailure = e;
+                    failures.add("jar(" + libraryName + "): " + e);
+                    LOGGER.warn("Failed to load {} from jar", libraryName, e);
+                }
             }
         } catch (Throwable e) {
             lastFailure = e;
-            LOGGER.warn("java.library.path directory scan failed for {}", libraryName, e);
-        }
-
-        try {
-            String extracted = loadLibraryFromJar(libraryName);
-            System.load(extracted);
-            LOGGER.info("Loaded native library {} from jar extract {}", libraryName, extracted);
-            return;
-        } catch (Throwable e) {
-            lastFailure = e;
-            LOGGER.warn("Failed to load {} from jar", libraryName, e);
+            failures.add("jar extraction setup: " + e);
+            LOGGER.warn("Failed to load native libraries from jar", e);
         }
 
         RuntimeException rte = new RuntimeException(
-                "Could not load native library " + libraryName, lastFailure);
+                "Could not load native library. Tried [" + StringUtils.join(libraryNames, ", ")
+                        + "]. Failures: " + failures, lastFailure);
         LOGGER.error(rte.getMessage(), lastFailure);
         throw rte;
     }
 
     public static String loadLibraryFromJar(String libraryName) throws IOException {
+        return extractLibraryFromJar(
+                libraryName,
+                new File(createNativeExtractionDir(), libraryName)
+        ).getAbsolutePath();
+    }
+
+    private static File createNativeExtractionDir() throws IOException {
+        File dir = Files.createTempDirectory(WORKDIR.toPath(), "curvine-native-").toFile();
+        dir.deleteOnExit();
+        return dir;
+    }
+
+    private static String loadJindoLibraryFromJar(File extractionDir) throws IOException {
+        String resourceName = getJindoLibraryResourceName();
+        if (resourceName == null) {
+            return null;
+        }
+
+        if (!hasJarResource(resourceName)) {
+            LOGGER.debug("JindoSDK native dependency {} was not found inside JAR", resourceName);
+            return null;
+        }
+
+        return extractLibraryFromJar(resourceName, new File(extractionDir, JINDOSDK_SONAME))
+                .getAbsolutePath();
+    }
+
+    private static boolean hasJarResource(String resourceName) {
+        return CurvineNative.class.getClassLoader().getResource(resourceName) != null;
+    }
+
+    private static File extractLibraryFromJar(String libraryName, File outputFile) throws IOException {
         // Load from jar package.
-        final File temp = File.createTempFile(
-                FilenameUtils.getBaseName(libraryName),
-                "." + FilenameUtils.getExtension(libraryName),
-                WORKDIR
-        );
-        if (temp.exists() && !temp.delete()) {
-            throw new RuntimeException("File: " + temp.getAbsolutePath()
-                    + " already exists and cannot be removed.");
-        }
-        if (!temp.createNewFile()) {
-            throw new RuntimeException("File: " + temp.getAbsolutePath()
-                    + " could not be created.");
+        final File parent = outputFile.getParentFile();
+        if (parent != null && !parent.exists() && !parent.mkdirs()) {
+            throw new IOException("Native extraction directory could not be created: "
+                    + parent.getAbsolutePath());
         }
 
-        if (!temp.exists()) {
-            throw new RuntimeException("File " + temp.getAbsolutePath() + " does not exist.");
-        } else {
-            temp.deleteOnExit();
-        }
-
+        File temp = File.createTempFile(outputFile.getName(), ".tmp", parent);
+        temp.deleteOnExit();
         try (final InputStream is = CurvineNative.class.getClassLoader().getResourceAsStream(libraryName)) {
             if (is == null) {
                 throw new RuntimeException(libraryName + " was not found inside JAR.");
             }
             copyUninterruptibly(is, temp);
+            if (outputFile.exists() && !outputFile.delete()) {
+                throw new IOException("Native output file could not be replaced: "
+                        + outputFile.getAbsolutePath());
+            }
+            if (!temp.renameTo(outputFile)) {
+                try (FileInputStream in = new FileInputStream(temp)) {
+                    copyUninterruptibly(in, outputFile);
+                }
+            }
+        } finally {
+            if (temp.exists() && !temp.delete()) {
+                LOGGER.debug("Failed to delete temporary native extraction file {}", temp.getAbsolutePath());
+            }
         }
-        return temp.getAbsolutePath();
+
+        outputFile.setReadable(true);
+        outputFile.setExecutable(true);
+        outputFile.deleteOnExit();
+        return outputFile;
     }
 
     /**
@@ -305,8 +349,7 @@ public class CurvineNative {
     }
 
     public static String normalizeOsReleaseVariableValue(String value) {
-        // Variable assignment values may be enclosed in double or single quotes.
-        return value.trim().replaceAll("[\"']", "");
+        return CurvineNativeLibraryResolver.normalizeOsReleaseVariableValue(value);
     }
 
     public static native long newFilesystem(String conf) throws IOException;
