@@ -1659,6 +1659,15 @@ impl MasterFilesystem {
     }
 
     pub fn resize<T: AsRef<str>>(&self, path: T, opts: FileAllocOpts) -> FsResult<FileBlocks> {
+        self.resize_by_id(path, None, opts)
+    }
+
+    pub fn resize_by_id<T: AsRef<str>>(
+        &self,
+        path: T,
+        inode_id: Option<i64>,
+        opts: FileAllocOpts,
+    ) -> FsResult<FileBlocks> {
         opts.validate()?;
 
         let path = path.as_ref();
@@ -1670,30 +1679,26 @@ impl MasterFilesystem {
         } else {
             self.worker_manager.read().available_bytes()
         };
-        let (del_res, inode_id) = {
-            let mut fs_dir = self.fs_dir.write();
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            let inode = try_option!(inp.get_last_inode(), "File {} not exists", path);
+
+        let mut fs_dir = self.fs_dir.write();
+        let (del_res, inode) = {
+            let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
             let file = inode.as_file_ref()?;
             Self::validate_alloc_capacity(file.len, file.replicas, &opts, available)?;
-            let inode_id = inode.id();
-            let del_res = fs_dir.resize(&inp, opts)?;
-            (del_res, inode_id)
+            let del_res = fs_dir.resize_inode(path, &mut inode, opts)?;
+            (del_res, inode)
         };
 
         if !del_res.blocks.is_empty() {
             self.worker_manager.write().remove_blocks(&del_res);
         }
 
-        let blocks = self.get_block_locations(path)?;
-        if blocks.status.id != inode_id {
-            return err_box!(
-                "Path {} resolved to different inode after resize, expected {}, got {}",
-                path,
-                inode_id,
-                blocks.status.id
-            );
-        }
+        let blocks = {
+            let file = inode.as_file_ref()?;
+            let locs = self.get_block_locs(path, &fs_dir, file)?;
+            let status = inode.to_file_status(path)?;
+            FileBlocks::new(status, locs)
+        };
 
         Ok(blocks)
     }
@@ -1705,16 +1710,28 @@ impl MasterFilesystem {
         client_addr: ClientAddress,
         exclude_workers: Vec<u32>,
     ) -> FsResult<LocatedBlock> {
+        self.assign_worker_by_id(path, None, block, client_addr, exclude_workers)
+    }
+
+    pub fn assign_worker_by_id<T: AsRef<str>>(
+        &self,
+        path: T,
+        inode_id: Option<i64>,
+        block: ExtendedBlock,
+        client_addr: ClientAddress,
+        exclude_workers: Vec<u32>,
+    ) -> FsResult<LocatedBlock> {
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path)?;
+        let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
 
-        let choose_workers = self.choose_worker(&inp, client_addr, exclude_workers)?;
+        let choose_workers =
+            self.choose_worker_for_file(inode.as_file_ref()?, client_addr, exclude_workers)?;
         let has_spdk = {
             let wm = self.worker_manager.read();
             wm.workers_have_spdk(&choose_workers)
         };
-        let block = fs_dir.assign_worker(inp, block.id, &choose_workers)?;
+        let block = fs_dir.assign_worker_inode(path, &mut inode, block.id, &choose_workers)?;
 
         Ok(LocatedBlock {
             block,
