@@ -53,31 +53,6 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Install FoundationDB client library
-        run: |
-          # curvine-mds links libfdb_c unconditionally (foundationdb crate,
-          # fdb-7_3). The client rpm ships libfdb_c.so needed at link time;
-          # embedded-fdb-include already provides the headers at build time, so
-          # only the client library is required here.
-          set -euo pipefail
-          FDB_VERSION=7.3.77
-          # Pinned SHA256 of the official release asset (supply-chain safety):
-          # verify the download before installing.
-          FDB_CLIENTS_SHA256=9255a4730655ac1a8461d8da5148a9d87c8978944188477f5b745318bb6d40ba
-          curl -fsSL -o /tmp/foundationdb-clients.rpm \
-            "https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/foundationdb-clients-${FDB_VERSION}-1.el7.x86_64.rpm"
-          echo "${FDB_CLIENTS_SHA256}  /tmp/foundationdb-clients.rpm" | sha256sum -c -
-          rpm -i --nodeps /tmp/foundationdb-clients.rpm
-          # The rpm installs libfdb_c.so under /usr/lib; also expose it under
-          # /usr/lib64 (Rocky's default 64-bit lib dir) so the linker finds it
-          # regardless of its default search paths.
-          if [ -f /usr/lib/libfdb_c.so ] && [ ! -e /usr/lib64/libfdb_c.so ]; then
-            ln -s /usr/lib/libfdb_c.so /usr/lib64/libfdb_c.so
-          fi
-          echo "/usr/lib" > /etc/ld.so.conf.d/foundationdb.conf
-          ldconfig
-          ldconfig -p | grep libfdb_c || (echo "libfdb_c not registered" && exit 1)
-      
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:

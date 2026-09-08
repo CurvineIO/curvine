@@ -36,6 +36,32 @@ RUN yum install -y \
     fio \
     && yum clean all
 
+# 1.2. Install FoundationDB client library (x86_64)
+# Required to link libfdb_c when building curvine-mds/curvine-server
+# (foundationdb crate, fdb-7_3). The official release ships an el7 rpm for
+# x86_64 only (no aarch64 build), which is compatible with Amazon Linux 2's
+# glibc 2.26. SHA256-pinned for supply-chain safety (same pin as the CI
+# workflow used previously). shadow-utils provides groupadd/useradd needed
+# by the rpm preinstall scriptlet.
+RUN ARCH=$(uname -m) && \
+    FDB_VERSION=7.3.77 && \
+    case "${ARCH}" in \
+        x86_64) \
+            FDB_PACKAGE="foundationdb-clients-${FDB_VERSION}-1.el7.x86_64.rpm" && \
+            FDB_SHA256="9255a4730655ac1a8461d8da5148a9d87c8978944188477f5b745318bb6d40ba" ;; \
+        *) echo "No FoundationDB client package for ${ARCH}; skipping" && exit 0 ;; \
+    esac && \
+    yum install -y shadow-utils && \
+    echo "Installing FoundationDB client ${FDB_VERSION} for ${ARCH}..." && \
+    curl -fsSL -o /tmp/${FDB_PACKAGE} \
+        "https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/${FDB_PACKAGE}" && \
+    echo "${FDB_SHA256}  /tmp/${FDB_PACKAGE}" | sha256sum -c - && \
+    rpm -i --nodeps /tmp/${FDB_PACKAGE} && \
+    rm -f /tmp/${FDB_PACKAGE} && \
+    ldconfig && \
+    ls -l /usr/lib64/libfdb_c.so && \
+    echo "✓ FoundationDB client installed successfully for ${ARCH}"
+
 # 2. Install the Rust toolchain
 # uncomment the following two lines if you met network problem
 #ENV RUSTUP_UPDATE_ROOT=https://mirrors.aliyun.com/rustup/rustup

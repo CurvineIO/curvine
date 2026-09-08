@@ -172,6 +172,11 @@ COPY --from=builder /opt/spdk/isa-l/.libs/libisal* /usr/lib64/
 COPY --from=builder /opt/spdk/isa-l-crypto/.libs/libisal* /usr/lib64/
 RUN ldconfig
 
+# Copy FoundationDB client library (curvine-server links libfdb_c for the
+# FDB KV backend; installed in the compile image's /usr/lib64)
+COPY --from=builder /usr/lib64/libfdb_c.so /usr/lib64/
+RUN ldconfig
+
 # Copy JindoSDK from builder stage for OSS-HDFS support
 COPY --from=builder /opt/jindosdk /opt/jindosdk
 
