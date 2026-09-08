@@ -14,7 +14,7 @@
 
 use crate::common::UfsFactory;
 use crate::worker::task::task_progress_reporter::TaskProgressReporter;
-use crate::worker::task::TaskContext;
+use crate::worker::task::{record_report_result, record_task_outcome, TaskContext};
 use curvine_client_core::file::{CurvineFileSystem, FsReader};
 use curvine_core_error::err_box;
 use curvine_error::FsError;
@@ -32,6 +32,7 @@ use curvine_runtime::runtime::{JoinHandle, RpcRuntime};
 use curvine_unified_fs::{UfsFileSystem, UnifiedReader, UnifiedWriter};
 use log::{debug, error, info, warn};
 use std::sync::Arc;
+use std::time::Instant;
 
 const TRANSFER_COMMIT_JOB_ID_XATTR: &str = "curvine.transfer.job_id";
 const TRANSFER_COMMIT_RUN_ID_XATTR: &str = "curvine.transfer.run_id";
@@ -160,6 +161,8 @@ impl LoadTaskRunner {
     }
 
     pub async fn run(&self) -> bool {
+        let started = Instant::now();
+        let source_path = self.task.info.source_path.clone();
         let remove_task = match self.run0().await {
             Ok(remove_task) => remove_task,
             Err(e) => {
@@ -169,7 +172,7 @@ impl LoadTaskRunner {
                         self.log_context(),
                         e
                     );
-                    return self.finish_canceled().await.unwrap_or_else(|err| {
+                    let remove_task = self.finish_canceled().await.unwrap_or_else(|err| {
                         error!(
                             "transfer task cancellation finalization failed: {} err={}",
                             self.log_context(),
@@ -177,9 +180,16 @@ impl LoadTaskRunner {
                         );
                         true
                     });
+                    self.record_outcome(&source_path, started, None);
+                    return remove_task;
                 }
                 // The data replication process fails, set the status and report to the master
                 error!("transfer task failed: {} err={}", self.log_context(), e);
+                let failed_reason = if e.to_string().contains("exceed timeout") {
+                    "timeout"
+                } else {
+                    "copy_error"
+                };
                 let progress = self.task.set_failed(transfer_failure_message(
                     match Path::from_str(&self.task.info.source_path) {
                         Ok(source) if source.is_cv() => curvine_model::TransferKind::Export,
@@ -197,9 +207,11 @@ impl LoadTaskRunner {
                         self.log_context(),
                         e
                     );
+                    self.record_outcome(&source_path, started, Some(failed_reason));
                     return self.task.info.transfer_report.is_none();
                 }
-                true
+                self.record_outcome(&source_path, started, Some(failed_reason));
+                return true;
             }
         };
 
@@ -212,7 +224,23 @@ impl LoadTaskRunner {
             },
         }
 
+        self.record_outcome(
+            &source_path,
+            started,
+            outcome_failed_reason(&self.task, remove_task),
+        );
         remove_task
+    }
+
+    fn record_outcome(&self, source_path: &str, started: Instant, failed_reason: Option<&str>) {
+        let progress = self.task.progress();
+        record_task_outcome(
+            source_path,
+            progress.state,
+            started.elapsed().as_micros(),
+            progress.loaded_size,
+            failed_reason,
+        );
     }
 
     async fn run0(&self) -> FsResult<bool> {
@@ -785,15 +813,20 @@ impl LoadTaskRunner {
                 );
             };
             if progress.state.is_finish() {
-                return reporter.report_terminal(progress).await;
+                let result = reporter.report_terminal(progress).await;
+                record_report_result(&result);
+                return result;
             }
             reporter.enqueue_progress(progress);
-            Ok(())
-        } else {
-            self.master_client
-                .report_task(&task.job.job_id, &task.task_id, progress)
-                .await
+            return Ok(());
         }
+
+        let result = self
+            .master_client
+            .report_task(&task.job.job_id, &task.task_id, progress)
+            .await;
+        record_report_result(&result);
+        result
     }
 
     /// Upper bound on the number of independent reader+writer streams a large
@@ -1075,16 +1108,79 @@ fn xattr_equals(status: &FileStatus, key: &str, expected: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+fn outcome_failed_reason(task: &TaskContext, _remove_task: bool) -> Option<&'static str> {
+    let progress = task.progress();
+    if progress.state == JobTaskState::Failed {
+        if progress.message.contains("exceed timeout") {
+            return Some("timeout");
+        }
+        return Some("copy_error");
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{rename_ufs_output, LoadTaskRunner};
+    use super::{outcome_failed_reason, rename_ufs_output, LoadTaskRunner, TaskContext};
     use curvine_fs_api::Path;
+    use curvine_model::{
+        JobSourceType, JobTaskState, LoadJobInfo, LoadTaskInfo, MountInfo, StorageType, TtlAction,
+        WorkerAddress,
+    };
     use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
     use curvine_unified_fs::UfsFileSystem;
     use std::collections::HashMap;
     use std::fs;
 
     const MB: i64 = 1024 * 1024;
+
+    fn test_task_context() -> TaskContext {
+        let job = LoadJobInfo {
+            job_id: "job_a".to_string(),
+            source_path: "ufs://bucket/file".to_string(),
+            target_path: "/cv/file".to_string(),
+            block_size: 4096,
+            replicas: 1,
+            storage_type: StorageType::default(),
+            ttl_ms: 0,
+            ttl_action: TtlAction::default(),
+            mount_info: MountInfo::default(),
+            create_time: 0,
+            overwrite: None,
+            source_type: JobSourceType::default(),
+        };
+        TaskContext::new(LoadTaskInfo {
+            job,
+            task_id: "task_a".to_string(),
+            worker: WorkerAddress::default(),
+            source_path: "ufs://bucket/file".to_string(),
+            target_path: "/cv/file".to_string(),
+            create_time: 0,
+            source_read_plan_json: String::new(),
+            transfer_report: None,
+        })
+    }
+
+    #[test]
+    fn outcome_failed_reason_keeps_inflight_loading_unlabeled() {
+        let task = test_task_context();
+        task.update_state(JobTaskState::Loading, "copying");
+
+        assert_eq!(outcome_failed_reason(&task, false), None);
+    }
+
+    #[test]
+    fn outcome_failed_reason_classifies_copy_failures() {
+        let task = test_task_context();
+        task.set_failed("Task task_a exceed timeout 1000 ms");
+
+        assert_eq!(outcome_failed_reason(&task, true), Some("timeout"));
+
+        let task = test_task_context();
+        task.set_failed("copy failed");
+
+        assert_eq!(outcome_failed_reason(&task, true), Some("copy_error"));
+    }
 
     // Reproduce the exact planning loop run_parallel uses, so tests exercise the
     // real offset/len math (block alignment + last-segment clamp), which is the

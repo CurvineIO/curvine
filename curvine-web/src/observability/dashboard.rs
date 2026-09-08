@@ -741,6 +741,64 @@ fn build_transfer_panel_tasks(
                 )
             },
         ),
+        panel_task(
+            ctx.clone(),
+            "transfer-job-summary-water",
+            "Transfer Job Summary Queue",
+            "transfer_job_summary_dirty_len waiting for progress summary flush",
+            PanelKind::Timeseries,
+            Some("status"),
+            |ctx| {
+                timeseries_panel(
+                    ctx,
+                    "transfer-job-summary-water",
+                    "Transfer Job Summary Queue",
+                    "transfer_job_summary_dirty_len waiting for progress summary flush",
+                    &["transfer_job_summary_dirty_len"],
+                    TRANSFER,
+                    false,
+                )
+            },
+        ),
+        panel_task(
+            ctx.clone(),
+            "transfer-job-summary-flush-rate",
+            "Transfer Job Summary Flush",
+            "transfer_job_summary_flush_total rate by result",
+            PanelKind::Timeseries,
+            Some("flow"),
+            |ctx| {
+                counter_rate_panel(
+                    ctx,
+                    "transfer-job-summary-flush-rate",
+                    "Transfer Job Summary Flush",
+                    "transfer_job_summary_flush_total rate by result",
+                    "transfer_job_summary_flush_total",
+                    TRANSFER,
+                )
+            },
+        ),
+        panel_task(
+            ctx.clone(),
+            "transfer-job-summary-flush-p99",
+            "Transfer Job Summary Flush P99",
+            "transfer_job_summary_flush_duration_us P99 by result",
+            PanelKind::Timeseries,
+            Some("flow"),
+            |ctx| {
+                histogram_quantile_panel(
+                    ctx,
+                    "transfer-job-summary-flush-p99",
+                    "Transfer Job Summary Flush P99",
+                    "transfer_job_summary_flush_duration_us P99 by result",
+                    "transfer_job_summary_flush_duration_us_bucket",
+                    TRANSFER,
+                    0.99,
+                    "transfer_job_summary_flush_p99_us",
+                    1.0,
+                )
+            },
+        ),
         // --- Process ---
         panel_task(
             ctx.clone(),
@@ -1801,6 +1859,180 @@ fn build_worker_panel_tasks(
                     "read_blocks open rate by local/remote path",
                     "read_blocks",
                     "worker",
+                )
+            },
+        ),
+        panel_task(
+            ctx.clone(),
+            "worker-transfer-task-water",
+            "Transfer Task Water",
+            "active, queued and running transfer tasks on each worker",
+            PanelKind::Timeseries,
+            Some("transfer-tasks"),
+            |ctx| {
+                timeseries_panel(
+                    ctx,
+                    "worker-transfer-task-water",
+                    "Transfer Task Water",
+                    "active, queued and running transfer tasks on each worker",
+                    &[
+                        "worker_transfer_tasks_active",
+                        "worker_transfer_tasks_queued",
+                        "worker_transfer_tasks_running",
+                    ],
+                    "worker",
+                    false,
+                )
+            },
+        ),
+        panel_task(
+            ctx.clone(),
+            "worker-transfer-concurrency",
+            "Transfer Task Concurrency",
+            "available and max transfer task permits per worker",
+            PanelKind::Timeseries,
+            Some("transfer-tasks"),
+            |ctx| {
+                timeseries_panel(
+                    ctx,
+                    "worker-transfer-concurrency",
+                    "Transfer Task Concurrency",
+                    "available and max transfer task permits per worker",
+                    &[
+                        "worker_transfer_task_permits_available",
+                        "worker_transfer_task_permits_max",
+                    ],
+                    "worker",
+                    false,
+                )
+            },
+        ),
+        panel_task(
+            ctx.clone(),
+            "worker-transfer-submit-rate",
+            "Transfer Task Submit",
+            "worker_transfer_task_submit_total rate by result",
+            PanelKind::Timeseries,
+            Some("transfer-tasks"),
+            |ctx| {
+                counter_rate_panel(
+                    ctx,
+                    "worker-transfer-submit-rate",
+                    "Transfer Task Submit",
+                    "worker_transfer_task_submit_total rate by result",
+                    "worker_transfer_task_submit_total",
+                    "worker",
+                )
+            },
+        ),
+        panel_task(
+            ctx.clone(),
+            "worker-transfer-submit-rejected-rate",
+            "Transfer Task Submit Rejected",
+            "worker_transfer_task_submit_rejected_total rate by reason",
+            PanelKind::Timeseries,
+            Some("transfer-tasks"),
+            |ctx| {
+                counter_rate_panel(
+                    ctx,
+                    "worker-transfer-submit-rejected-rate",
+                    "Transfer Task Submit Rejected",
+                    "worker_transfer_task_submit_rejected_total rate by reason",
+                    "worker_transfer_task_submit_rejected_total",
+                    "worker",
+                )
+            },
+        ),
+        panel_task(
+            ctx.clone(),
+            "worker-transfer-terminal-rate",
+            "Transfer Task Terminal",
+            "worker_transfer_task_terminal_total rate by state and kind",
+            PanelKind::Timeseries,
+            Some("transfer-tasks"),
+            |ctx| {
+                counter_rate_panel(
+                    ctx,
+                    "worker-transfer-terminal-rate",
+                    "Transfer Task Terminal",
+                    "worker_transfer_task_terminal_total rate by state and kind",
+                    "worker_transfer_task_terminal_total",
+                    "worker",
+                )
+            },
+        ),
+        panel_task(
+            ctx.clone(),
+            "worker-transfer-failed-rate",
+            "Transfer Task Failures",
+            "worker_transfer_task_failed_total rate by reason",
+            PanelKind::Timeseries,
+            Some("transfer-tasks"),
+            |ctx| {
+                counter_rate_panel(
+                    ctx,
+                    "worker-transfer-failed-rate",
+                    "Transfer Task Failures",
+                    "worker_transfer_task_failed_total rate by reason",
+                    "worker_transfer_task_failed_total",
+                    "worker",
+                )
+            },
+        ),
+        panel_task(
+            ctx.clone(),
+            "worker-transfer-report-rate",
+            "Transfer Task Progress Reports",
+            "worker_transfer_task_report_total rate by result",
+            PanelKind::Timeseries,
+            Some("transfer-tasks"),
+            |ctx| {
+                counter_rate_panel(
+                    ctx,
+                    "worker-transfer-report-rate",
+                    "Transfer Task Progress Reports",
+                    "worker_transfer_task_report_total rate by result",
+                    "worker_transfer_task_report_total",
+                    "worker",
+                )
+            },
+        ),
+        panel_task(
+            ctx.clone(),
+            "worker-transfer-copy-bytes-rate",
+            "Transfer Task Copy Bytes",
+            "worker_transfer_task_copy_bytes_total rate by state",
+            PanelKind::Timeseries,
+            Some("transfer-tasks"),
+            |ctx| {
+                counter_rate_panel(
+                    ctx,
+                    "worker-transfer-copy-bytes-rate",
+                    "Transfer Task Copy Bytes",
+                    "worker_transfer_task_copy_bytes_total rate by state",
+                    "worker_transfer_task_copy_bytes_total",
+                    "worker",
+                )
+            },
+        ),
+        panel_task(
+            ctx.clone(),
+            "worker-transfer-execution-p99",
+            "Transfer Task Execution P99",
+            "worker_transfer_task_execution_duration_us P99 by state",
+            PanelKind::Timeseries,
+            Some("transfer-tasks"),
+            |ctx| {
+                histogram_quantile_panel(
+                    ctx,
+                    "worker-transfer-execution-p99",
+                    "Transfer Task Execution P99",
+                    "worker_transfer_task_execution_duration_us P99 by state",
+                    "worker_transfer_task_execution_duration_us_bucket",
+                    "worker",
+                    0.99,
+                    "worker_transfer_execution_p99_us",
+                    1.0,
                 )
             },
         ),
@@ -4901,6 +5133,21 @@ mod tests {
             .iter()
             .any(|panel| panel.id == "transfer-completed-bytes-rate"
                 && panel.section.as_deref() == Some("flow")));
+        assert!(transfer
+            .panels
+            .iter()
+            .any(|panel| panel.id == "transfer-job-summary-water"
+                && panel.section.as_deref() == Some("status")));
+        assert!(workers
+            .panels
+            .iter()
+            .any(|panel| panel.id == "worker-transfer-task-water"
+                && panel.section.as_deref() == Some("transfer-tasks")));
+        assert!(workers
+            .panels
+            .iter()
+            .any(|panel| panel.id == "worker-transfer-terminal-rate"
+                && panel.section.as_deref() == Some("transfer-tasks")));
     }
 
     #[test]

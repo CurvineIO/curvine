@@ -111,7 +111,9 @@ const WORKER_MULTI_METRIC_PANELS = new Set([
   'worker-blocks',
   'worker-disks',
   'worker-read-block-rate',
-  'worker-write-block-rate'
+  'worker-write-block-rate',
+  'worker-transfer-task-water',
+  'worker-transfer-concurrency'
 ])
 
 const OPERATION_LABELED_PANELS = new Set(['operation-rate', 'operation-latency', 'operation-latency-p99'])
@@ -135,6 +137,19 @@ const FUSE_SERIES_LABEL_KEYS = [
   'code',
   'metric'
 ] as const
+
+const WORKER_TRANSFER_SERIES_LABEL_KEYS = [
+  'result',
+  'reason',
+  'state',
+  'kind'
+] as const
+
+export function workerTransferLabelDetailParts(labels: Record<string, string> = {}): string[] {
+  return WORKER_TRANSFER_SERIES_LABEL_KEYS
+    .map((key) => labels[key])
+    .filter(Boolean)
+}
 
 /** Ordered Transfer label keys for legend/tooltip disambiguation. */
 const TRANSFER_SERIES_LABEL_KEYS = [
@@ -204,6 +219,7 @@ const TRANSFER_LABELED_PANELS = new Set([
   'transfer-report-rate',
   'transfer-completed-bytes-rate',
   'transfer-anomaly-rate',
+  'transfer-job-summary-flush-rate',
   'transfer-store-latency-p99',
   'transfer-store-op-rate',
   'transfer-store-unavailable',
@@ -213,7 +229,18 @@ const TRANSFER_LABELED_PANELS = new Set([
   'transfer-metadata-op-rate',
   'transfer-snapshot-refresh-rate',
   'transfer-snapshot-refresh-p99',
+  'transfer-job-summary-flush-p99',
   'transfer-process-cpu'
+])
+
+const WORKER_TRANSFER_LABELED_PANELS = new Set([
+  'worker-transfer-submit-rate',
+  'worker-transfer-submit-rejected-rate',
+  'worker-transfer-terminal-rate',
+  'worker-transfer-failed-rate',
+  'worker-transfer-report-rate',
+  'worker-transfer-copy-bytes-rate',
+  'worker-transfer-execution-p99'
 ])
 
 const TRANSFER_PANEL_IDS = new Set([
@@ -221,8 +248,15 @@ const TRANSFER_PANEL_IDS = new Set([
   'transfer-job-water',
   'transfer-report-queue',
   'transfer-snapshot-health',
+  'transfer-job-summary-water',
   'transfer-process-memory',
   'transfer-process-fd'
+])
+
+const WORKER_TRANSFER_PANEL_IDS = new Set([
+  ...Array.from(WORKER_TRANSFER_LABELED_PANELS),
+  'worker-transfer-task-water',
+  'worker-transfer-concurrency'
 ])
 
 /** Prefer scrape hostname; fall back to opaque worker id. */
@@ -308,7 +342,14 @@ const METRIC_SERIES_PANELS = new Set([
   'transfer-store-unavailable-rate',
   'transfer-store-unavailable-duration-rate',
   'transfer-metadata-op-rate',
-  'transfer-snapshot-refresh-rate'
+  'transfer-snapshot-refresh-rate',
+  'transfer-job-summary-flush-rate',
+  'worker-transfer-submit-rate',
+  'worker-transfer-submit-rejected-rate',
+  'worker-transfer-terminal-rate',
+  'worker-transfer-failed-rate',
+  'worker-transfer-report-rate',
+  'worker-transfer-copy-bytes-rate'
 ])
 
 const METRIC_DISPLAY_OVERRIDES: Record<string, string> = {
@@ -337,6 +378,13 @@ const METRIC_DISPLAY_OVERRIDES: Record<string, string> = {
   transfer_store_unavailable_duration_us_total: 'Unavailable duration',
   transfer_metadata_operation_total: 'Metadata ops',
   transfer_cluster_snapshot_refresh_total: 'Snapshot refresh',
+  transfer_job_summary_flush_total: 'Summary flush',
+  worker_transfer_task_submit_total: 'Submit',
+  worker_transfer_task_submit_rejected_total: 'Submit rejected',
+  worker_transfer_task_terminal_total: 'Terminal',
+  worker_transfer_task_failed_total: 'Failed',
+  worker_transfer_task_report_total: 'Progress reports',
+  worker_transfer_task_copy_bytes_total: 'Copy bytes',
   process_cpu_seconds_total: 'CPU cores',
   process_resident_memory_bytes: 'Resident memory'
 }
@@ -415,9 +463,21 @@ export const ALWAYS_VISIBLE_PANELS = new Set([
   'transfer-store-unavailable-duration-rate',
   'transfer-snapshot-refresh-rate',
   'transfer-snapshot-refresh-p99',
+  'transfer-job-summary-water',
+  'transfer-job-summary-flush-rate',
+  'transfer-job-summary-flush-p99',
   'transfer-process-cpu',
   'transfer-process-memory',
   'transfer-process-fd',
+  'worker-transfer-task-water',
+  'worker-transfer-concurrency',
+  'worker-transfer-submit-rate',
+  'worker-transfer-submit-rejected-rate',
+  'worker-transfer-terminal-rate',
+  'worker-transfer-failed-rate',
+  'worker-transfer-report-rate',
+  'worker-transfer-copy-bytes-rate',
+  'worker-transfer-execution-p99',
   'fuse-runtime-handles',
   'fuse-memory',
   'fuse-process-cpu',
@@ -463,7 +523,8 @@ export const DASHBOARD_SECTION_DEFS: Record<string, Array<{ id: string; titleKey
     { id: 'trends', titleKey: 'observability.sections.trends' },
     { id: 'process', titleKey: 'observability.sections.process' },
     { id: 'capacity', titleKey: 'observability.sections.capacity' },
-    { id: 'performance', titleKey: 'observability.sections.performance' }
+    { id: 'performance', titleKey: 'observability.sections.performance' },
+    { id: 'transfer-tasks', titleKey: 'observability.sections.transferTasks' }
   ],
   transfer: [
     { id: 'status', titleKey: 'observability.sections.status' },
@@ -513,6 +574,10 @@ export function seriesDisplayName(series: SeriesLike, panelId = ''): string {
       const detail = transferLabelDetailParts(labels).join(' · ')
       return [base, detail, inst].filter(Boolean).join(' · ')
     }
+    if (component === 'worker' && panelId.startsWith('worker-transfer-')) {
+      const detail = workerTransferLabelDetailParts(labels).join(' · ')
+      return [base, detail, inst].filter(Boolean).join(' · ')
+    }
     return inst ? `${base} · ${inst}` : base
   }
 
@@ -536,6 +601,17 @@ export function seriesDisplayName(series: SeriesLike, panelId = ''): string {
     if (metric && inst) return `${metric} · ${inst}`
     if (metric) return metric
     if (inst) return inst
+  }
+
+  if (WORKER_TRANSFER_PANEL_IDS.has(panelId) || (component === 'worker' && panelId.startsWith('worker-transfer-'))) {
+    const worker = workerSeriesLabel(labels)
+    const detail = workerTransferLabelDetailParts(labels).join(' · ')
+    const metric = labels.metric ? formatMetricLabel(labels.metric) : seriesMetricName(series)
+    if (detail && worker) return `${detail} · ${worker}`
+    if (detail) return detail
+    if (metric && worker) return `${metric} · ${worker}`
+    if (worker) return worker
+    if (metric) return metric
   }
 
   if (TAG_LABELED_MASTER_PANELS.has(panelId) && labels.tag) {
@@ -857,6 +933,8 @@ const TRANSFER_LATENCY_PANELS = new Set([
   'transfer-store-latency-p99',
   'transfer-metadata-latency-p99',
   'transfer-snapshot-refresh-p99',
+  'transfer-job-summary-flush-p99',
+  'worker-transfer-execution-p99',
   'fs-dir-probe-acquire'
 ])
 
@@ -896,7 +974,14 @@ const COUNTER_RATE_PANELS = new Set([
   'transfer-store-unavailable-duration-rate',
   'transfer-metadata-op-rate',
   'transfer-snapshot-refresh-rate',
+  'transfer-job-summary-flush-rate',
   'transfer-process-cpu',
+  'worker-transfer-submit-rate',
+  'worker-transfer-submit-rejected-rate',
+  'worker-transfer-terminal-rate',
+  'worker-transfer-failed-rate',
+  'worker-transfer-report-rate',
+  'worker-transfer-copy-bytes-rate',
   'master-process-cpu',
   'worker-process-cpu',
   'fuse-process-cpu',

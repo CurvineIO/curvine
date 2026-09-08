@@ -85,6 +85,7 @@ export default {
       flow: 'Flow',
       store: 'Store',
       snapshot: 'Snapshot',
+      transferTasks: 'Transfer Tasks',
       other: 'Other'
     },
     timeRanges: {

@@ -28,3 +28,9 @@ pub use self::task_store::TaskStore;
 
 mod task_context;
 pub use self::task_context::TaskContext;
+
+mod metrics;
+pub use self::metrics::{
+    record_metric, record_report_result, record_task_outcome, transfer_kind_label,
+    WorkerTransferMetrics,
+};

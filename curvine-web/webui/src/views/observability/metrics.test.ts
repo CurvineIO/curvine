@@ -19,6 +19,7 @@ import {
   transferFilterOptionLabel,
   transferLabelDetailParts,
   transferSeriesLabel,
+  workerTransferLabelDetailParts,
   workerFilterOptionLabel,
   workerSeriesLabel
 } from './metrics'
@@ -307,6 +308,36 @@ describe('transferSeriesLabel', () => {
   })
 })
 
+describe('workerTransferSeriesLabel', () => {
+  it('labels worker transfer terminal panels with state, kind and worker', () => {
+    const name = seriesDisplayName(
+      {
+        name: 'worker_transfer_task_terminal_total',
+        labels: {
+          component: 'worker',
+          metric: 'worker_transfer_task_terminal_total',
+          state: 'completed',
+          kind: 'load',
+          instance: 'cv-worker-0:9002'
+        }
+      },
+      'worker-transfer-terminal-rate'
+    )
+    expect(name).toBe('Terminal · completed · load · cv-worker-0')
+  })
+
+  it('collects worker transfer label detail parts in stable order', () => {
+    expect(
+      workerTransferLabelDetailParts({
+        reason: 'timeout',
+        state: 'failed',
+        kind: 'load',
+        result: 'rejected'
+      })
+    ).toEqual(['rejected', 'timeout', 'failed', 'load'])
+  })
+})
+
 describe('matchesTargetFilter fuse', () => {
   it('respects fuse filter when target filter is fuse', () => {
     expect(
@@ -358,6 +389,9 @@ describe('panelValueFormatter', () => {
     expect(panelValueFormatter('transfer-store-latency-p99')(982)).toBe('982 us')
     expect(panelValueFormatter('transfer-completed-bytes-rate')(3.5)).toBe('3.5 B/s')
     expect(panelValueFormatter('transfer-report-rate')(1.4)).toBe('1.4/s')
+    expect(panelValueFormatter('transfer-job-summary-flush-p99')(1200)).toBe('1,200 us')
+    expect(panelValueFormatter('worker-transfer-execution-p99')(2500)).toBe('2,500 us')
+    expect(panelValueFormatter('worker-transfer-copy-bytes-rate')(3.5)).toBe('3.5 B/s')
   })
 })
 

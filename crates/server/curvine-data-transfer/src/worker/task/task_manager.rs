@@ -14,7 +14,9 @@
 
 use crate::common::UfsFactory;
 use crate::worker::task::load_task_runner::LoadTaskRunner;
-use crate::worker::task::{TaskContext, TaskStore};
+use crate::worker::task::{
+    record_metric, record_task_outcome, TaskContext, TaskStore, WorkerTransferMetrics,
+};
 use curvine_client_core::file::{CurvineFileSystem, FsContext};
 use curvine_config::ClusterConf;
 use curvine_error::FsResult;
@@ -24,6 +26,7 @@ use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use dashmap::mapref::entry::Entry;
 use log::{debug, info, warn};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Semaphore;
 
 pub struct TaskManager {
@@ -105,6 +108,11 @@ impl TaskManager {
         let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
         let transfer_client = TransferClient::with_context(&fs.fs_context()).ok();
         let worker_task_semaphore = Arc::new(Semaphore::new(conf.job.worker_max_concurrent_tasks));
+        let _ = WorkerTransferMetrics::get()?;
+        record_metric(|metrics| {
+            metrics.set_permits_max(conf.job.worker_max_concurrent_tasks);
+            metrics.set_permits_available(conf.job.worker_max_concurrent_tasks);
+        });
         let mgr = Self {
             rt,
             fs,
@@ -165,12 +173,14 @@ impl TaskManager {
                 && report.report_target.is_empty()
                 && self.transfer_client.is_none()
             {
+                record_metric(|metrics| metrics.inc_submit_rejected("no_report_endpoint"));
                 return Ok(TaskSubmitResult::rejected(format!(
                     "Reject transfer task {} because no Transfer report endpoint is available",
                     task.task_id
                 )));
             }
             if report.worker_session_id != self.worker_session_id {
+                record_metric(|metrics| metrics.inc_submit_rejected("stale_session"));
                 return Ok(TaskSubmitResult::rejected(format!(
                     "Reject transfer task {} for stale worker session {}, current session {}",
                     task.task_id, report.worker_session_id, self.worker_session_id
@@ -179,7 +189,9 @@ impl TaskManager {
         }
 
         let task_id = task.task_id.clone();
+        let source_path = task.source_path.clone();
         let context = Arc::new(TaskContext::new(task));
+        let mut track_active = false;
 
         match self.tasks.entry(task_id.clone()) {
             Entry::Occupied(mut occ) => {
@@ -198,12 +210,14 @@ impl TaskManager {
                                 context.info.source_path,
                                 context.info.target_path,
                             );
+                            record_metric(|metrics| metrics.inc_submit_duplicate());
                             return Ok(TaskSubmitResult::accepted());
                         }
                         if old_report.run_id > new_report.run_id
                             || (old_report.run_id == new_report.run_id
                                 && old_report.attempt_id > new_report.attempt_id)
                         {
+                            record_metric(|metrics| metrics.inc_submit_rejected("stale_attempt"));
                             return Ok(TaskSubmitResult::rejected(format!(
                                 "Reject stale transfer task {} run {} attempt {}, current run {} attempt {}",
                                 task_id,
@@ -226,7 +240,12 @@ impl TaskManager {
 
             Entry::Vacant(vac) => {
                 vac.insert(context.clone());
+                track_active = true;
             }
+        }
+        record_metric(|metrics| metrics.inc_submit_accepted());
+        if track_active {
+            record_metric(|metrics| metrics.inc_active());
         }
         if let Some(report) = &context.info.transfer_report {
             info!(
@@ -264,19 +283,45 @@ impl TaskManager {
 
         // Spawn task with concurrency control
         self.rt.spawn(async move {
+            let started = Instant::now();
             let mut remove_task = true;
+            record_metric(|metrics| metrics.inc_queued());
             match semaphore.acquire().await {
                 Ok(permit) => {
+                    record_metric(|metrics| {
+                        metrics.dec_queued();
+                        metrics.inc_running();
+                        metrics.set_permits_available(semaphore.available_permits());
+                    });
                     remove_task = runner.run().await;
                     drop(permit);
+                    record_metric(|metrics| {
+                        metrics.dec_running();
+                        metrics.set_permits_available(semaphore.available_permits());
+                    });
                 }
                 Err(e) => {
+                    record_task_outcome(
+                        &source_path,
+                        JobTaskState::Failed,
+                        started.elapsed().as_micros(),
+                        0,
+                        Some("permit_acquire_failed"),
+                    );
+                    record_metric(|metrics| {
+                        metrics.dec_queued();
+                        metrics.set_permits_available(semaphore.available_permits());
+                    });
                     log::error!("task {} failed to acquire permit: {}", task_id, e);
                 }
             }
 
-            if remove_task {
-                let _ = tasks.remove_if(&task_id, |_, ctx| Arc::ptr_eq(ctx, &context_this));
+            if remove_task
+                && tasks
+                    .remove_if(&task_id, |_, ctx| Arc::ptr_eq(ctx, &context_this))
+                    .is_some()
+            {
+                record_metric(|metrics| metrics.dec_active());
             }
         });
 
