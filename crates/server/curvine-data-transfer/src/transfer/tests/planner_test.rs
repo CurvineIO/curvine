@@ -121,8 +121,10 @@ fn load_replicas_override_mount_and_service_defaults() {
         replicas: Some(2),
         ..Default::default()
     };
-    let mut client_conf = ClientConf::default();
-    client_conf.replicas = 1;
+    let client_conf = ClientConf {
+        replicas: 1,
+        ..Default::default()
+    };
 
     assert_eq!(load_job_info(&job, &mount, &client_conf).replicas, 3);
 }

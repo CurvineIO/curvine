@@ -241,6 +241,7 @@ impl TransferCommand {
         self.options
             .get(Self::REPLICAS_OPTION)
             .and_then(|value| value.parse::<i32>().ok())
+            .filter(|replicas| *replicas > 0)
     }
 
     pub fn set_replicas(&mut self, replicas: i32) {

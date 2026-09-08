@@ -47,3 +47,17 @@ fn replicas_change_only_explicit_load_request_ids() {
     assert_eq!(unspecified, legacy);
     assert_ne!(replicas_one, replicas_three);
 }
+
+#[test]
+fn replicas_ignore_non_positive_values() {
+    let mut command = TransferCommand::default();
+
+    command.set_replicas(0);
+    assert_eq!(command.replicas(), None);
+
+    command.set_replicas(-1);
+    assert_eq!(command.replicas(), None);
+
+    command.set_replicas(3);
+    assert_eq!(command.replicas(), Some(3));
+}
