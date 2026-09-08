@@ -19,7 +19,7 @@ mod util;
 
 use clap::{error::ErrorKind, CommandFactory, Parser};
 use commands::Commands;
-use curvine_config::ClusterConf;
+use curvine_config::{ClusterConf, ConfigLoader};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_job_client::JobMasterClient;
 use curvine_job_client::TransferClient;
@@ -28,7 +28,6 @@ use curvine_runtime::common::{Logger, Utils};
 use curvine_runtime::runtime::RpcRuntime;
 use curvine_sys::version;
 use curvine_unified_fs::UnifiedFileSystem;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
@@ -122,44 +121,19 @@ impl CurvineArgs {
     }
 
     fn resolve_conf_path(&self, enable_default_discovery: bool) -> Option<(String, String)> {
-        if let Some(path) = &self.conf {
-            return Some((path.clone(), "--conf".to_string()));
-        }
+        // Unified discovery shared with the server/fuse/sdk entrypoints:
+        // `--conf` > CURVINE_CONF_FILE > well-known locations. When default
+        // discovery is disabled, only explicitly configured sources apply.
+        let discovered = if enable_default_discovery {
+            ConfigLoader::discover(self.conf.as_deref())
+        } else {
+            ConfigLoader::discover_configured(self.conf.as_deref())
+        }?;
 
-        if let Ok(path) = std::env::var(ClusterConf::ENV_CONF_FILE) {
-            return Some((path, ClusterConf::ENV_CONF_FILE.to_string()));
-        }
-
-        if !enable_default_discovery {
-            return None;
-        }
-
-        let mut candidates = vec![
-            (PathBuf::from("curvine-cluster.toml"), "current directory"),
-            (
-                PathBuf::from("conf/curvine-cluster.toml"),
-                "current conf directory",
-            ),
-        ];
-
-        if let Some(home) = std::env::var_os("HOME") {
-            candidates.push((
-                PathBuf::from(home).join(".curvine/curvine-cluster.toml"),
-                "user config directory",
-            ));
-        }
-
-        if let Ok(curvine_home) = std::env::var("CURVINE_HOME") {
-            candidates.push((
-                Path::new(&curvine_home).join("conf/curvine-cluster.toml"),
-                "CURVINE_HOME",
-            ));
-        }
-
-        candidates
-            .into_iter()
-            .find(|(path, _)| path.exists())
-            .map(|(path, source)| (path.to_string_lossy().to_string(), source.to_string()))
+        Some((
+            discovered.path.to_string_lossy().to_string(),
+            discovered.source,
+        ))
     }
 }
 
