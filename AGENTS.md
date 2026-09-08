@@ -14,6 +14,7 @@ How to use skills:
 
 Usage notes:
 - For Curvine project workflow tasks, prefer the cv-* skills listed in <available_skills> below
+- When exploring or locating code, read and follow [cv-codegraph](.agents/skills/cv-codegraph/SKILL.md) — prefer CodeGraph (`codegraph_explore` MCP or `codegraph explore` CLI) when `.codegraph/` exists or the MCP tool is available; **Read source files directly** after local edits or when explore reports stale index sync
 - User-installed global skills (e.g. ~/.cursor/skills/, ~/.claude/skills/) remain available when the agent tool exposes them
 - Do not invent or invoke project skills that are not listed in <available_skills>
 - Do not invoke a skill that is already loaded in your context
@@ -27,6 +28,12 @@ Usage notes:
 <skill>
 <name>cv-add-skills</name>
 <description>Add or update Curvine cv-* project skills under .agents/skills/, following naming and layout conventions, and sync the AGENTS.md registry. Use when creating a new cv skill, updating an existing cv skill structure, or registering skills after changes.</description>
+<location>project</location>
+</skill>
+
+<skill>
+<name>cv-codegraph</name>
+<description>Use CodeGraph for Curvine code exploration when the MCP tool or local index is already available; prefer it over repo-wide grep when locating or understanding code. Human one-time setup covers CLI install, MCP wiring, and indexing. Use when exploring the codebase, tracing call paths, or finding symbols.</description>
 <location>project</location>
 </skill>
 

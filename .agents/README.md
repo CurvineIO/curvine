@@ -37,6 +37,7 @@ rm -rf .claude/skills && ln -sfn ../.agents/skills .claude/skills
 | Skill | Stage |
 | ----- | ----- |
 | `cv-add-skills` | Meta — add/update cv skills |
+| `cv-codegraph` | Code exploration — install/init CodeGraph, prefer before grep |
 | `cv-tasks-breakdown` | Plan → small tasks + sub-issues |
 | `cv-create-issue` | File GitHub issue |
 | `cv-handle-issue` | Fix issue (plan first, then code) |
