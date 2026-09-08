@@ -157,6 +157,7 @@ pub struct TransferCommand {
 
 impl TransferCommand {
     pub const OVERWRITE_OPTION: &'static str = "overwrite";
+    pub const REPLICAS_OPTION: &'static str = "replicas";
 
     pub fn job_key(&self) -> String {
         format!("{:?}:{}:{}", self.kind, self.source_path, self.target_path)
@@ -196,6 +197,34 @@ impl TransferCommand {
         )
     }
 
+    pub fn default_client_request_id_with_overwrite_and_replicas(
+        kind: TransferKind,
+        source_path: impl AsRef<str>,
+        target_path: impl AsRef<str>,
+        overwrite: bool,
+        replicas: Option<i32>,
+    ) -> String {
+        let Some(replicas) = replicas else {
+            return Self::default_client_request_id_with_overwrite(
+                kind,
+                source_path,
+                target_path,
+                overwrite,
+            );
+        };
+        format!(
+            "job_{}",
+            Utils::md5(format!(
+                "{:?}:{}:{}:overwrite={}:replicas={}",
+                kind,
+                source_path.as_ref(),
+                target_path.as_ref(),
+                overwrite,
+                replicas
+            ))
+        )
+    }
+
     pub fn overwrite(&self) -> bool {
         self.options
             .get(Self::OVERWRITE_OPTION)
@@ -206,6 +235,17 @@ impl TransferCommand {
     pub fn set_overwrite(&mut self, overwrite: bool) {
         self.options
             .insert(Self::OVERWRITE_OPTION.to_string(), overwrite.to_string());
+    }
+
+    pub fn replicas(&self) -> Option<i32> {
+        self.options
+            .get(Self::REPLICAS_OPTION)
+            .and_then(|value| value.parse::<i32>().ok())
+    }
+
+    pub fn set_replicas(&mut self, replicas: i32) {
+        self.options
+            .insert(Self::REPLICAS_OPTION.to_string(), replicas.to_string());
     }
 }
 
