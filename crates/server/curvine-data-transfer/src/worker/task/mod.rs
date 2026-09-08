@@ -18,6 +18,8 @@
 mod load_task_runner;
 pub use self::load_task_runner::LoadTaskRunner;
 
+mod task_progress_reporter;
+
 mod task_manager;
 pub use self::task_manager::TaskManager;
 
