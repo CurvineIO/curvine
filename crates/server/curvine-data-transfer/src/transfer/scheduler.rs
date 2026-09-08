@@ -822,7 +822,11 @@ where
                 now_ms: now,
                 stale_deadline_at: now.saturating_add(duration_ms(self.conf.task_stale_timeout)),
             };
-            let _ = self.store.update_task_report(report)?;
+            let job_id = report.job_id.clone();
+            let run_id = report.run_id;
+            if self.store.update_task_report(report)? {
+                self.flush_job_summary_best_effort(&job_id, run_id);
+            }
         }
         Ok(())
     }
@@ -839,6 +843,8 @@ where
             "worker status is temporarily unavailable; preserving the current attempt before retry"
                 .to_string();
         progress.update_time = now;
+        let job_id = task.job_id.clone();
+        let run_id = task.run_id;
         let deferred = self.store.update_task_report(TransferTaskReport {
             job_id: task.job_id.clone(),
             run_id: task.run_id,
@@ -852,6 +858,7 @@ where
             stale_deadline_at: now.saturating_add(duration_ms(self.conf.task_stale_timeout)),
         })?;
         if deferred {
+            self.flush_job_summary_best_effort(&job_id, run_id);
             debug!(
                 "defer stale transfer task retry because {}: job={} run={} task={} attempt={} worker_id={} worker_session={} err={}",
                 reason,
@@ -865,6 +872,15 @@ where
             );
         }
         Ok(())
+    }
+
+    fn flush_job_summary_best_effort(&self, job_id: &str, run_id: u64) {
+        if let Err(err) = self.store.flush_job_progress_summary(job_id, run_id) {
+            warn!(
+                "flush transfer job progress summary failed after scheduler report: job={} run={} err={}",
+                job_id, run_id, err
+            );
+        }
     }
 
     async fn cancel_transfer(

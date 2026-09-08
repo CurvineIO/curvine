@@ -404,10 +404,20 @@ where
             stale_deadline_at: now_ms.saturating_add(self.task_stale_timeout_ms),
         };
         let accepted = self.store.update_task_report(report)?;
-        if accepted && !state.is_terminal() {
+        if accepted {
             // Sync path has no background flusher; keep job.summary up to date.
-            self.store
-                .flush_job_progress_summary(&req.job_id, req.run_id)?;
+            // Flush failure must not fail the accepted task persist (retry would be rejected).
+            if let Err(err) = self
+                .store
+                .flush_job_progress_summary(&req.job_id, req.run_id)
+            {
+                log::warn!(
+                    "flush transfer job progress summary failed after sync report: job={} run={} err={}",
+                    req.job_id,
+                    req.run_id,
+                    err
+                );
+            }
         }
         Ok(accepted)
     }
@@ -467,17 +477,6 @@ impl JobSummaryDirtySet {
     fn mark(&self, job_id: String, run_id: u64) {
         let mut dirty = self.dirty.lock().unwrap_or_else(|err| err.into_inner());
         dirty.insert(DirtyJobKey { job_id, run_id });
-        if let Ok(metrics) = TransferMetrics::get() {
-            metrics.set_job_summary_dirty_len(dirty.len());
-        }
-    }
-
-    fn clear(&self, job_id: &str, run_id: u64) {
-        let mut dirty = self.dirty.lock().unwrap_or_else(|err| err.into_inner());
-        dirty.remove(&DirtyJobKey {
-            job_id: job_id.to_string(),
-            run_id,
-        });
         if let Ok(metrics) = TransferMetrics::get() {
             metrics.set_job_summary_dirty_len(dirty.len());
         }
@@ -701,12 +700,7 @@ where
         };
         let result = store.update_task_report(report);
         if matches!(&result, Ok(true)) {
-            if state.is_terminal() {
-                // Terminal reports flush summary inside the store; drop pending dirty entry.
-                dirty_jobs.clear(&job_id, run_id);
-            } else {
-                dirty_jobs.mark(job_id, run_id);
-            }
+            dirty_jobs.mark(job_id, run_id);
         }
         match envelope.reply {
             Some(reply) => {
@@ -1023,6 +1017,25 @@ fn parse_page_token(page_token: Option<String>) -> FsResult<usize> {
 
 fn now_ms() -> i64 {
     i64::try_from(LocalTime::mills()).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JobSummaryDirtySet;
+
+    #[test]
+    fn dirty_set_keeps_job_when_progress_is_followed_by_terminal_mark() {
+        let dirty = JobSummaryDirtySet::new();
+        dirty.mark("job-a".to_string(), 1);
+        dirty.mark("job-a".to_string(), 1);
+        dirty.mark("job-b".to_string(), 1);
+        let mut jobs = dirty.take_all();
+        jobs.sort_by(|left, right| left.job_id.cmp(&right.job_id));
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].job_id, "job-a");
+        assert_eq!(jobs[1].job_id, "job-b");
+        assert!(dirty.take_all().is_empty());
+    }
 }
 
 pub fn encode_transfer_command(command: &TransferCommand) -> FsResult<Vec<u8>> {

@@ -727,7 +727,7 @@ impl TransferStore for MemoryTransferStore {
 
     fn update_task_report(&self, report: TransferTaskReport) -> FsResult<bool> {
         let mut inner = self.inner.lock();
-        let key = (report.job_id.clone(), report.run_id, report.task_id.clone());
+        let key = (report.job_id, report.run_id, report.task_id);
         let Some(task) = inner.tasks.get_mut(&key) else {
             return Ok(false);
         };
@@ -744,11 +744,6 @@ impl TransferStore for MemoryTransferStore {
         task.last_report_at = report.now_ms;
         task.stale_deadline_at = report.stale_deadline_at;
         task.updated_at = report.now_ms;
-        drop(inner);
-
-        if report.state.is_terminal() {
-            self.flush_job_progress_summary(&report.job_id, report.run_id)?;
-        }
         Ok(true)
     }
 
@@ -1038,6 +1033,19 @@ mod tests {
                 stale_deadline_at: 4_000,
             })
             .unwrap());
+        assert_eq!(
+            store
+                .get_transfer(&job.job_id)
+                .unwrap()
+                .unwrap()
+                .summary
+                .loaded_size,
+            30,
+            "terminal reports must not update job.summary until flush"
+        );
+        store
+            .flush_job_progress_summary(&job.job_id, job.run_id)
+            .unwrap();
         assert_eq!(
             store
                 .get_transfer(&job.job_id)

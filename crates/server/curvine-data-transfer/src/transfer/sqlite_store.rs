@@ -998,10 +998,6 @@ impl TransferStore for SqliteTransferStore {
         if affected == 0 {
             return Ok(false);
         }
-        if report.state.is_terminal() {
-            drop(conn);
-            self.flush_job_progress_summary(&report.job_id, report.run_id)?;
-        }
         Ok(true)
     }
 

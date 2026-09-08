@@ -490,6 +490,19 @@ fn update_job(conn: &mut impl GenericClient, job: &TransferJobRecord) -> FsResul
     .map_err(postgres_err)
 }
 
+fn update_job_summary(conn: &mut impl GenericClient, job: &TransferJobRecord) -> FsResult<bool> {
+    let run_id = db_u64(job.run_id)?;
+    let record_json = json(job)?;
+    conn.execute(
+        "update transfer_jobs
+         set record_json = $1, updated_at = $2
+         where job_id = $3 and run_id = $4",
+        &[&record_json, &job.updated_at, &job.job_id, &run_id],
+    )
+    .map(|affected| affected > 0)
+    .map_err(postgres_err)
+}
+
 fn update_task(conn: &mut impl GenericClient, task: &TransferTaskRecord) -> FsResult<bool> {
     let run_id = db_u64(task.run_id)?;
     let attempt_id = db_u64(task.attempt_id)?;
@@ -1515,9 +1528,6 @@ impl TransferStore for PostgresTransferStore {
             update_task(tx, &task)?;
             Ok(true)
         })?;
-        if accepted && report.state.is_terminal() {
-            self.flush_job_progress_summary(&report.job_id, report.run_id)?;
-        }
         Ok(accepted)
     }
 
@@ -1531,7 +1541,7 @@ impl TransferStore for PostgresTransferStore {
             let now_ms = curvine_runtime::common::LocalTime::mills() as i64;
             job.summary = summarize_transfer_tasks(&tasks, now_ms).progress;
             job.updated_at = now_ms;
-            update_job(tx, &job)?;
+            update_job_summary(tx, &job)?;
             Ok(())
         })
     }

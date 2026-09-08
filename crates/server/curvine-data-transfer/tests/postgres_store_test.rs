@@ -318,9 +318,24 @@ fn postgres_store_persists_transfer_lifecycle() {
         .unwrap()
         .pop()
         .unwrap();
-    assert_eq!(stored_job.summary.loaded_size, 42);
     assert_eq!(stored_task.state, TransferTaskState::Completed);
     assert_eq!(stored_task.progress.loaded_size, 42);
+    assert_eq!(
+        stored_job.summary.loaded_size, 21,
+        "terminal reports must not update job.summary until flush"
+    );
+    reopened
+        .flush_job_progress_summary(&job.job_id, job.run_id)
+        .unwrap();
+    assert_eq!(
+        reopened
+            .get_transfer(&job.job_id)
+            .unwrap()
+            .unwrap()
+            .summary
+            .loaded_size,
+        42
+    );
 
     let concurrent_target = format!("/postgres-store-concurrent/{suffix}");
     let concurrent_store = Arc::new(PostgresTransferStore::open(&url).unwrap());

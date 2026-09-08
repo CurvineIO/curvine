@@ -908,9 +908,6 @@ impl TransferStore for MysqlTransferStore {
         task.updated_at = report.now_ms;
         exec_update_task(&mut tx, &task)?;
         tx.commit().map_err(mysql_err)?;
-        if report.state.is_terminal() {
-            self.flush_job_progress_summary(&report.job_id, report.run_id)?;
-        }
         Ok(true)
     }
 
@@ -930,7 +927,7 @@ impl TransferStore for MysqlTransferStore {
         let now_ms = curvine_runtime::common::LocalTime::mills() as i64;
         job.summary = summarize_transfer_tasks(&tasks, now_ms).progress;
         job.updated_at = now_ms;
-        exec_update_job(&mut tx, &job)?;
+        exec_update_job_summary(&mut tx, &job)?;
         tx.commit().map_err(mysql_err)?;
         Ok(())
     }
@@ -1493,6 +1490,22 @@ fn exec_update_job(conn: &mut impl Queryable, job: &TransferJobRecord) -> FsResu
              record_json = :record_json, created_at = :created_at, updated_at = :updated_at
          where job_id = :job_id and run_id = :run_id",
         job_params(job)?,
+    )?;
+    Ok(affected > 0)
+}
+
+fn exec_update_job_summary(conn: &mut impl Queryable, job: &TransferJobRecord) -> FsResult<bool> {
+    let affected = exec_affected(
+        conn,
+        "update transfer_jobs
+         set record_json = :record_json, updated_at = :updated_at
+         where job_id = :job_id and run_id = :run_id",
+        params! {
+            "record_json" => json(job)?,
+            "updated_at" => job.updated_at,
+            "job_id" => &job.job_id,
+            "run_id" => job.run_id,
+        },
     )?;
     Ok(affected > 0)
 }
