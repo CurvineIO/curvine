@@ -1019,6 +1019,14 @@ fn now_ms() -> i64 {
     i64::try_from(LocalTime::mills()).unwrap_or(i64::MAX)
 }
 
+pub fn encode_transfer_command(command: &TransferCommand) -> FsResult<Vec<u8>> {
+    Ok(SerdeUtils::serialize_json(command)?)
+}
+
+fn decode_transfer_command(bytes: &[u8]) -> FsResult<TransferCommand> {
+    serde_json::from_slice(bytes).map_err(|_| FsError::common("Invalid transfer command payload"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::JobSummaryDirtySet;
@@ -1036,12 +1044,4 @@ mod tests {
         assert_eq!(jobs[1].job_id, "job-b");
         assert!(dirty.take_all().is_empty());
     }
-}
-
-pub fn encode_transfer_command(command: &TransferCommand) -> FsResult<Vec<u8>> {
-    Ok(SerdeUtils::serialize_json(command)?)
-}
-
-fn decode_transfer_command(bytes: &[u8]) -> FsResult<TransferCommand> {
-    serde_json::from_slice(bytes).map_err(|_| FsError::common("Invalid transfer command payload"))
 }
