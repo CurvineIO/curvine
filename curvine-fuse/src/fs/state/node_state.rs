@@ -1366,7 +1366,7 @@ impl NodeState {
                 let dir = self.dir_read();
                 let inode = dir.get_inode_check(ino, None)?;
 
-                if inode.is_local() {
+                if inode.is_dirty() {
                     Some(inode.clone_status())
                 } else {
                     None
@@ -1514,7 +1514,7 @@ impl NodeState {
         };
 
         if self.enable_write_back {
-            self.cm.ensure_flush(ino).await?;
+            self.cm.ensure_flushed(ino).await?;
         }
         self.flush_writer(ino).await?;
 

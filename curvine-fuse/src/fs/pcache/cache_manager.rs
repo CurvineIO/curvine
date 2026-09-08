@@ -231,6 +231,7 @@ impl CacheManager {
 
         if link == 0 {
             if let Some(cache) = self.caches.get(&ino).await {
+                cache.mark_deleted();
                 cache.free_pages(true);
             }
             self.caches.remove(ino);
@@ -248,10 +249,10 @@ impl CacheManager {
         Ok(())
     }
 
-    pub async fn ensure_flush(&self, ino: u64) -> FuseResult<()> {
-        self.caches
-            .with_resource(&ino, |cache| async move { cache.flush().await })
-            .await?;
+    pub async fn ensure_flushed(&self, ino: u64) -> FuseResult<()> {
+        if let Some(cache) = self.get_cache(ino).await {
+            cache.ensure_flushed().await?;
+        }
         Ok(())
     }
 
@@ -259,16 +260,8 @@ impl CacheManager {
         self.caches.get(&ino).await
     }
 
-    pub async fn get_cache_opt_check(&self, ino: u64) -> FuseResult<Option<Arc<InodeCache>>> {
-        let Some(cache) = self.get_cache(ino).await else {
-            return Ok(None);
-        };
-        cache.check_error()?;
-        Ok(Some(cache))
-    }
-
     pub async fn get_cache_check(&self, ino: u64) -> FuseResult<Arc<InodeCache>> {
-        match self.get_cache_opt_check(ino).await? {
+        match self.get_cache(ino).await {
             Some(cache) => Ok(cache),
             None => {
                 let path = self.state()?.get_path(ino);
@@ -474,15 +467,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_cache_opt_check_surfaces_cached_error() {
-        let cm = test_cm(&test_conf(PAGE_SIZE, PAGE_SIZE * 16, 0.1));
-        let cache = create_cache(&cm, 1).await;
-        assert!(cm.get_cache_opt_check(1).await.unwrap().is_some());
-        cache.set_error(FuseError::from("injected"));
-        assert!(cm.get_cache_opt_check(1).await.is_err());
-    }
-
-    #[tokio::test]
     async fn get_cache_check_missing_errors_without_state() {
         let cm = test_cm(&test_conf(PAGE_SIZE, PAGE_SIZE * 16, 0.1));
         assert!(cm.get_cache_check(1).await.is_err());
@@ -550,7 +534,7 @@ mod tests {
         let cm = test_cm(&test_conf(PAGE_SIZE, PAGE_SIZE * 16, 0.1));
         let cache = create_cache(&cm, 1).await;
         write_bytes(&cache, b"hello").await;
-        assert!(cm.ensure_flush(1).await.is_err());
+        assert!(cm.ensure_flushed(1).await.is_err());
     }
 
     #[tokio::test]
@@ -558,5 +542,17 @@ mod tests {
         let cm = test_cm(&test_conf(PAGE_SIZE, PAGE_SIZE * 16, 0.1));
         create_cache(&cm, 1).await;
         assert!(cm.remove_cache(1, false).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn remove_cache_force_marks_deleted_and_drops() {
+        let cm = test_cm(&test_conf(PAGE_SIZE, PAGE_SIZE * 16, 0.1));
+        let cache = create_cache(&cm, 1).await;
+        write_bytes(&cache, b"hello").await;
+
+        // force=true => link treated as 0, no bound state required.
+        cm.remove_cache(1, true).await.unwrap();
+        assert!(cache.is_deleted());
+        assert!(cm.get_cache(1).await.is_none());
     }
 }

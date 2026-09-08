@@ -13,10 +13,11 @@
 //  limitations under the License.
 
 use bytes::Bytes;
+use curvine_core_error::err_box;
 use curvine_io::DataSlice;
 use curvine_model::{CreateFileOpts, FileAllocOpts, FileStatus, OpenFlags, SetAttrOpts};
 use curvine_runtime::common::TimeSpent;
-use curvine_runtime::sync::{AsyncMutex, AtomicCounter, ErrorMonitor, StdRwLock};
+use curvine_runtime::sync::{AsyncMutex, AtomicBool, AtomicCounter, ErrorMonitor, StdRwLock};
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -24,7 +25,7 @@ use tokio::task::spawn_blocking;
 
 use crate::fs::pcache::{CacheManager, DirtyMessage, Page};
 use crate::fs::FuseWriter;
-use crate::{FuseError, FuseMetrics, FuseResult};
+use crate::{err_fuse, FuseError, FuseMetrics, FuseResult};
 
 pub struct PageState {
     pages: BTreeMap<u64, Page>,
@@ -154,6 +155,7 @@ pub struct InodeCache {
     writer_ver: AtomicCounter,
     flush_gate: AsyncMutex<u64>,
     len: AtomicCounter,
+    deleted: AtomicBool,
 }
 
 impl InodeCache {
@@ -177,7 +179,16 @@ impl InodeCache {
             writer_ver: AtomicCounter::new(0),
             flush_gate: AsyncMutex::new(0),
             len: AtomicCounter::new(file_len),
+            deleted: AtomicBool::new(false),
         }
+    }
+
+    pub fn mark_deleted(&self) {
+        self.deleted.set(true)
+    }
+
+    pub fn is_deleted(&self) -> bool {
+        self.deleted.get()
     }
 
     pub fn set_error(&self, e: FuseError) {
@@ -185,7 +196,22 @@ impl InodeCache {
     }
 
     pub fn check_error(self: &Arc<Self>) -> FuseResult<()> {
-        self.error.check_error()
+        if self.is_deleted() {
+            return err_fuse!(
+                libc::ENOENT,
+                "inode {} deleted, stop write-back write",
+                self.ino
+            );
+        }
+        if !self.error.has_error() {
+            return Ok(());
+        }
+        let error = self.error.error();
+        let lock = error.lock().unwrap();
+        match lock.as_ref() {
+            Some(e) => Err(FuseError::new(e.errno, e.to_string().into())),
+            None => err_box!("no error set"),
+        }
     }
 
     pub async fn get_writer(&self) -> FuseResult<Arc<FuseWriter>> {
@@ -364,6 +390,10 @@ impl InodeCache {
         pages: Vec<Page>,
         sync: bool,
     ) -> FuseResult<(Arc<FuseWriter>, u64)> {
+        if self.is_deleted() {
+            return err_fuse!(libc::ENOENT, "inode {} deleted", self.ino);
+        }
+
         let writer = self.get_writer().await?;
 
         let mut total = 0;
@@ -391,16 +421,35 @@ impl InodeCache {
         self: &Arc<InodeCache>,
         sync: bool,
     ) -> FuseResult<(Arc<FuseWriter>, u64)> {
+        let _lock = self.flush_gate.lock().await;
         let pages = self.take_dirty_pages()?;
         self.flush_inner(pages, sync).await
     }
 
-    pub async fn flush_all(
-        self: &Arc<InodeCache>,
-        sync: bool,
-    ) -> FuseResult<(Arc<FuseWriter>, u64)> {
-        let pages = self.take_all_dirty_pages()?;
-        self.flush_inner(pages, sync).await
+    pub async fn flush_range(self: &Arc<InodeCache>, off: u64, len: usize) -> FuseResult<bool> {
+        self.check_error()?;
+
+        let _lock = self.flush_gate.lock().await;
+
+        let pages = self.take_dirty_pages_range(off, len)?;
+        if pages.is_empty() {
+            return Ok(false);
+        }
+
+        let spent = TimeSpent::new();
+        let (_, len) = self.flush_inner(pages, true).await?;
+
+        FuseMetrics::with(|m| {
+            m.write_back_io_us
+                .with_label_values(&["flush_range"])
+                .observe(spent.used_us() as f64);
+
+            m.write_back_io_bytes
+                .with_label_values(&["flush_range"])
+                .inc_by(len as i64);
+        });
+
+        Ok(true)
     }
 
     pub fn len(&self) -> u64 {
@@ -434,7 +483,7 @@ impl InodeCache {
     pub async fn resize(self: &Arc<Self>, opts: FileAllocOpts) -> FuseResult<FileStatus> {
         self.check_error()?;
 
-        let (writer, _) = self.flush_all(false).await?;
+        let (writer, _) = self.flush_all().await?;
         let status = writer.resize(opts).await?;
 
         self.writer_ver.incr();
@@ -453,36 +502,46 @@ impl InodeCache {
         Ok(())
     }
 
+    async fn flush_all(self: &Arc<Self>) -> FuseResult<(Arc<FuseWriter>, u64)> {
+        let mut flushed_ver = self.flush_gate.lock().await;
+        let target = self.writer_ver.get();
+
+        let writer = if target > *flushed_ver {
+            let pages = self.take_all_dirty_pages()?;
+            let (writer, _) = self.flush_inner(pages, true).await?;
+
+            *flushed_ver = target;
+            writer
+        } else {
+            self.get_writer().await?
+        };
+
+        Ok((writer, *flushed_ver))
+    }
+
     pub async fn flush(self: &Arc<Self>) -> FuseResult<()> {
-        self.ensure_flushed().await?;
+        self.flush_all().await?;
         Ok(())
     }
 
     pub async fn ensure_flushed(self: &Arc<Self>) -> FuseResult<u64> {
         self.check_error()?;
-
-        let mut flushed_ver = self.flush_gate.lock().await;
-        let target = self.writer_ver.get();
-        if target > *flushed_ver {
-            self.flush_all(true).await?;
-            *flushed_ver = target;
-        }
-
-        Ok(*flushed_ver)
+        self.flush_all().await.map(|(_, len)| len)
     }
 
     pub async fn queue_complete(self: &Arc<Self>) -> FuseResult<()> {
+        self.check_error()?;
         self.cm.send(DirtyMessage::new_complete(self.ino)).await?;
         Ok(())
     }
 
     pub async fn complete(self: &Arc<Self>, opts: Option<SetAttrOpts>) -> FuseResult<()> {
-        let res: FuseResult<()> = async {
-            let (writer, _) = self.flush_all(false).await?;
+        let fut = async {
+            let (writer, _) = self.flush_all().await?;
             writer.complete_with_attr(None, opts).await?;
             Ok(())
-        }
-        .await;
+        };
+        let res = fut.await;
 
         let _ = self.free_pages(true);
         res
@@ -544,6 +603,29 @@ impl InodeCache {
             if let Some(dirty) = taken {
                 result.push(dirty);
             }
+        }
+
+        Ok(result)
+    }
+
+    fn take_dirty_pages_range(self: &Arc<Self>, off: u64, len: usize) -> FuseResult<Vec<Page>> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut state = self.state.write();
+        let mut result = Vec::new();
+
+        let end = off.saturating_add(len as u64).saturating_sub(1);
+        let last = self.cm.page_id(end);
+        let mut page_id = self.cm.page_id(off);
+        while page_id <= last {
+            if let Some(page) = state.pages.get_mut(&page_id) {
+                if let Some(taken) = page.take_all_dirty(self.page_size)? {
+                    result.push(taken);
+                }
+            }
+            page_id += self.page_size;
         }
 
         Ok(result)
@@ -847,5 +929,35 @@ mod tests {
         let cache = test_cache(&test_conf(4096));
         cache.write(5000, bytes(b"tail")).await.unwrap();
         assert!(cache.read(4096, 100).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn mark_deleted_toggles_flag() {
+        let cache = test_cache(&test_conf(4096));
+        assert!(!cache.is_deleted());
+        cache.mark_deleted();
+        assert!(cache.is_deleted());
+    }
+
+    #[tokio::test]
+    async fn write_after_delete_returns_enoent() {
+        let cache = test_cache(&test_conf(4096));
+        cache.mark_deleted();
+        let err = cache.write(0, bytes(b"x")).await.unwrap_err();
+        assert_eq!(err.errno, libc::ENOENT);
+    }
+
+    #[tokio::test]
+    async fn complete_after_delete_frees_pages_without_backend() {
+        let cache = test_cache(&test_conf(4096));
+        cache.write(0, bytes(&vec![1u8; 4096])).await.unwrap();
+        assert_eq!(cache.page_len(), 4096);
+
+        cache.mark_deleted();
+        // No bound state: complete must short-circuit before get_writer/flush,
+        // otherwise it would error trying to reach the master.
+        cache.complete(None).await.unwrap();
+        assert_eq!(cache.page_len(), 0);
+        assert_eq!(cache.cm.used(), 0);
     }
 }

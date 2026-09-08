@@ -112,6 +112,7 @@ impl Inode {
         if self.is_dirty() && !self.is_dir {
             self.len = len;
             self.mtime = LocalTime::mills() as i64;
+            self.locs.take();
             Ok(())
         } else {
             Ok(())
@@ -155,7 +156,7 @@ impl Inode {
     }
 
     pub fn get_file_blocks(&self, ttl: u64) -> Option<FileBlocks> {
-        if self.cache_valid(ttl) {
+        if self.blocks_valid(ttl) {
             self.locs
                 .as_ref()
                 .map(|locs| FileBlocks::new(self.clone_status(), (**locs).clone()))
@@ -165,9 +166,9 @@ impl Inode {
     }
 
     pub fn put_file_blocks(&mut self, blocks: &FileBlocks) {
-        self.locs = Some(Box::new(blocks.block_locs.clone()));
-
         if !self.is_dirty() {
+            self.locs = Some(Box::new(blocks.block_locs.clone()));
+
             self.status = blocks.status.clone();
             self.status.id = self.ino as i64;
 
@@ -259,14 +260,18 @@ impl Inode {
         matches!(self.lifecycle, Lifecycle::Dirty)
     }
 
-    pub fn is_local(&self) -> bool {
-        matches!(self.lifecycle, Lifecycle::Dirty | Lifecycle::Local)
-    }
-
     pub fn cache_valid(&self, ttl: u64) -> bool {
         match self.lifecycle {
-            Lifecycle::Cached | Lifecycle::Local => self.last_access + ttl >= LocalTime::mills(),
+            Lifecycle::Cached => self.last_access + ttl >= LocalTime::mills(),
             Lifecycle::Dirty => true,
+            Lifecycle::Invalid => false,
+        }
+    }
+
+    pub fn blocks_valid(&self, ttl: u64) -> bool {
+        match self.lifecycle {
+            Lifecycle::Cached => self.last_access + ttl >= LocalTime::mills(),
+            Lifecycle::Dirty => false,
             Lifecycle::Invalid => false,
         }
     }

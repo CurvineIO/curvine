@@ -631,7 +631,7 @@ impl DirTree {
 
         if matches!(inode.lifecycle, Lifecycle::Dirty) {
             inode.last_access = LocalTime::mills();
-            inode.lifecycle = Lifecycle::Local;
+            inode.lifecycle = Lifecycle::Cached;
         }
     }
 

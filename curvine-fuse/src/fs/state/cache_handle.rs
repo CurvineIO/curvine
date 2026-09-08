@@ -96,9 +96,7 @@ impl CacheHandle {
             Some(r) if read_ver >= flush_ver => r,
 
             _ => {
-                if read_ver < flush_ver {
-                    state.invalidate_file_blocks(self.ino);
-                }
+                state.invalidate_file_blocks(self.ino);
 
                 let path = state.get_path(self.ino)?;
                 let reader = state.open_reader(Some(self.ino), &path).await?;
@@ -138,9 +136,8 @@ impl CacheHandle {
     }
 
     pub async fn flush(&self, reply: Option<FuseResponse>) -> FuseResult<()> {
-        if self.flags.write() {
-            self.cache.queue_flush()?;
-        }
+        self.cache.queue_flush()?;
+
         if let Some(reply) = reply {
             reply.send_rep(Ok::<(), FuseError>(())).await?;
         }

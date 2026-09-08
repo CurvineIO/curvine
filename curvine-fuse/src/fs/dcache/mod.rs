@@ -32,5 +32,4 @@ pub enum Lifecycle {
     Cached,
     Invalid,
     Dirty,
-    Local,
 }
