@@ -53,6 +53,17 @@ fn test_filesystem_end_to_end_operations_on_cluster() -> FsResult<()> {
     override_conf.client.short_circuit = true;
     test_file_block_size_override(&testing, &rt, override_conf)?;
 
+    // Regression: append must commit blocks parked in cache_writers, else the
+    // master's compute_len() != self.len check fails with EIO. block_size = 1KB
+    // makes a hole + append cross block boundaries quickly.
+    let mut append_conf = conf.clone();
+    append_conf.client.block_size = 1024;
+    append_conf.client.block_size_str = "1024B".to_string();
+    append_conf.client.max_cache_block_handles = 4;
+    append_conf.client.short_circuit = false;
+    append_conf.client.replicas = 1;
+    test_append_commits_cached_blocks(&testing, &rt, append_conf)?;
+
     // Test short_circuit = false
     conf.client.short_circuit = false;
     run_filesystem_end_to_end_operations_on_cluster(&testing, &rt, conf.clone())?;
@@ -98,6 +109,69 @@ fn test_file_block_size_override(
 
         assert_eq!(read, data.len());
         assert_eq!(actual.as_ref(), data.as_slice());
+        Ok(())
+    })
+}
+
+/// Regression: appending a new block must first commit blocks parked in
+/// `cache_writers`; otherwise their bytes count toward the client's `self.len`
+/// but stay out of `commit_blocks`, and the master's `compute_len() != self.len`
+/// check fails with EIO ("Complete len is not equal to file len").
+fn test_append_commits_cached_blocks(
+    testing: &Testing,
+    rt: &Arc<AsyncRuntime>,
+    conf: ClusterConf,
+) -> FsResult<()> {
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+
+    rt.block_on(async move {
+        let path = Path::from_str("/fs_test/append_omit_uncommitted_cache_block.log")?;
+        let bs = 1024i64;
+        let mut writer = fs.create(&path, true).await?;
+
+        // Write 1K at offset 1K: creates a [0,1K) hole (block0, with_alloc) and
+        // block1 (with_pre, uncommitted). seek(0) drains the writes and parks
+        // block1 into cache_writers.
+        writer.seek(bs).await?;
+        writer.write(&vec![0xAAu8; bs as usize]).await?;
+        writer.seek(0).await?;
+
+        // Seek to EOF (2K): cur_writer becomes None, cache_writers keeps block1.
+        writer.seek(2 * bs).await?;
+
+        // Append at EOF and complete: the append path requests block2 and must
+        // commit block1 first, otherwise the master rejects the length.
+        writer.write(&vec![0xBBu8; 16]).await?;
+        writer.complete().await?;
+
+        // [0,1K)=hole, [1K,2K)=0xAA, [2K,+16)=0xBB.
+        let total = (2 * bs + 16) as usize;
+        let hole = bs as usize;
+        let body = (2 * bs) as usize;
+        let mut reader = fs.open(&path).await?;
+        reader.seek(0).await?;
+        let mut buf = vec![0u8; total];
+        let n = reader.read_full(&mut buf).await?;
+        reader.complete().await?;
+
+        assert_eq!(n, total, "short read: expected {} got {}", total, n);
+        assert!(
+            buf[..hole].iter().all(|&b| b == 0),
+            "hole [0,{}) must be zeros",
+            hole
+        );
+        assert!(
+            buf[hole..body].iter().all(|&b| b == 0xAA),
+            "block1 [{},{}) should be 0xAA",
+            hole,
+            body
+        );
+        assert!(
+            buf[body..].iter().all(|&b| b == 0xBB),
+            "appended block2 [{},{}) should be 0xBB",
+            body,
+            total
+        );
         Ok(())
     })
 }

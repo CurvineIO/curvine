@@ -302,37 +302,32 @@ impl FsWriterBase {
         }
     }
 
-    async fn complete0(
-        &mut self,
-        only_flush: bool,
-        set_attr_opts: Option<SetAttrOpts>,
-    ) -> FsResult<Option<FileBlocks>> {
+    async fn commit_all_pending_writers(&mut self) -> FsResult<()> {
         if let Some(writer) = self.cur_writer.take() {
             self.cache_writers.insert(writer.block_id(), writer);
         };
 
         let mut writer_commits = Vec::with_capacity(self.cache_writers.len());
         for (_, writer) in self.cache_writers.iter_mut() {
-            // Always finalize on the worker. `only_flush` only keeps the master
-            // write lease open; it must still publish block data.
-            //
-            // A prior resize/flush may already have finalized an older
-            // generation. Later writes reopen as a staging rewrite while
-            // `get_readable_block` prefers the committed generation. Calling
-            // `flush()` here without `complete()` leaves that rewrite
-            // unpublished, so FUSE dirty-read / LTP ftest/pwrite see EIO or
-            // stale holes after sparse write-then-read.
             let commit_block = writer.complete().await?;
             writer_commits.push(commit_block);
         }
 
+        self.cache_writers.clear();
+
         for commit in writer_commits {
-            self.file_blocks.add_commit(commit)?;
+            self.add_durable_commit(commit)?;
         }
 
-        // `complete()` ends the worker write session; drop handles so the next
-        // write reopens against the newly published generation.
-        self.cache_writers.clear();
+        Ok(())
+    }
+
+    async fn complete0(
+        &mut self,
+        only_flush: bool,
+        set_attr_opts: Option<SetAttrOpts>,
+    ) -> FsResult<Option<FileBlocks>> {
+        self.commit_all_pending_writers().await?;
 
         let commit_blocks = self.file_blocks.take_commit_blocks();
         // From this point onward a request may have reached the master even if
@@ -412,7 +407,7 @@ impl FsWriterBase {
                     }
 
                     None => {
-                        self.update_writer(None, false).await?;
+                        self.commit_all_pending_writers().await?;
 
                         let commit_blocks = self.file_blocks.take_commit_blocks();
                         let last_block = self.file_blocks.last_block();
