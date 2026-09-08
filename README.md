@@ -38,6 +38,7 @@ For more detailed information, please refer to:
 - [Benchmark](https://curvineio.github.io/docs/category/benchmark)
 - [DeepWiki](https://deepwiki.com/CurvineIO/curvine)
 - [Best Practices](https://curvineio.github.io/docs/User-Manuals/best-practices)
+- [Curvine defeated the commercial version of Alluxio in the MLPerf benchmark tests](https://curvineio.github.io/blog/2026/09/07/mlperf-storage-curvine-vs-alluxio)
 - [Curvine passes LTP Test 1129 cases](https://curvineio.github.io/blog/2026/08/11/curvine-ltp-compatibility)
 - [Tiered KV cache for large LLMs on Amazon SageMaker HyperPod with Curvine](https://aws.amazon.com/cn/blogs/machine-learning/tiered-kv-cache-for-large-llms-on-amazon-sagemaker-hyperpod-with-curvine/)
 - [AI Agent Storage Selection: How Curvine Supports 10,000-Scale Agent Workloads on EKS](https://curvineio.github.io/blog/2026/07/07/ai-agent-storage-curvine-eks)
