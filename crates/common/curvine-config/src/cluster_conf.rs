@@ -648,6 +648,33 @@ mod tests {
     use crate::RaftPeer;
     use curvine_runtime::common::Utils;
 
+    struct EnvVarsGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvVarsGuard {
+        fn unset(keys: &'static [&'static str]) -> Self {
+            let saved = keys
+                .iter()
+                .map(|key| {
+                    let value = std::env::var_os(key);
+                    std::env::remove_var(key);
+                    (*key, value)
+                })
+                .collect();
+            Self(saved)
+        }
+    }
+
+    impl Drop for EnvVarsGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     #[test]
     fn normalize_whitespace_trims_cluster_id() {
         let mut conf = ClusterConf {
@@ -721,6 +748,13 @@ mod tests {
 
     #[test]
     fn trims_whitespace_in_hostname_config() {
+        const HOSTNAME_ENV_KEYS: &[&str] = &[
+            ClusterConf::ENV_MASTER_HOSTNAME,
+            ClusterConf::ENV_WORKER_HOSTNAME,
+            ClusterConf::ENV_CLIENT_HOSTNAME,
+            ClusterConf::ENV_TRANSFER_HOSTNAME,
+        ];
+        let _hostname_env = EnvVarsGuard::unset(HOSTNAME_ENV_KEYS);
         let path = std::env::temp_dir().join(format!(
             "curvine-trim-conf-{}-{}.toml",
             std::process::id(),

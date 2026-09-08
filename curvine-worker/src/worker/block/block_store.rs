@@ -368,8 +368,6 @@ mod tests {
     use curvine_io::DataSlice;
     use curvine_runtime::common::FileUtils;
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Instant;
@@ -406,31 +404,22 @@ mod tests {
         Ok(())
     }
 
-    struct DeleteDenied {
-        parent: PathBuf,
-        permissions: std::fs::Permissions,
-    }
-
-    impl Drop for DeleteDenied {
-        fn drop(&mut self) {
-            let _ = std::fs::set_permissions(&self.parent, self.permissions.clone());
-        }
-    }
-
-    fn deny_block_delete(store: &BlockStore) -> CommonResult<DeleteDenied> {
+    fn finalized_block(store: &BlockStore) -> CommonResult<()> {
         let mut block = ExtendedBlock::with_id(1);
         block.len = 100;
-        let meta = finalize_block(store, &block)?;
-        let path = store.short_circuit(&meta)?.unwrap();
-        let parent = PathBuf::from(path).parent().unwrap().to_path_buf();
-        let permissions = std::fs::metadata(&parent)?.permissions();
-        let mut readonly = permissions.clone();
-        readonly.set_mode(0o500);
-        std::fs::set_permissions(&parent, readonly)?;
-        Ok(DeleteDenied {
-            parent,
-            permissions,
-        })
+        finalize_block(store, &block)?;
+        Ok(())
+    }
+
+    fn replace_block_file_with_non_empty_dir(store: &BlockStore) -> CommonResult<String> {
+        let meta = store.get_block(1)?;
+        let path = store
+            .short_circuit(&meta)?
+            .expect("file layout must expose a local path");
+        FileUtils::delete_path(&path, false)?;
+        std::fs::create_dir(&path)?;
+        std::fs::write(std::path::Path::new(&path).join("child"), b"data")?;
+        Ok(path)
     }
 
     #[test]
@@ -464,25 +453,38 @@ mod tests {
     #[test]
     fn async_remove_deallocate_error_keeps_block_for_retry() -> CommonResult<()> {
         let store = create_store("deallocate-error")?;
-        let _delete_denied = deny_block_delete(&store)?;
+        finalized_block(&store)?;
+        let path = replace_block_file_with_non_empty_dir(&store)?;
         store.read()?.increment_blocks_to_delete();
 
         let result = store.async_remove_block(1);
         assert!(result.is_err());
-        let state = store.read()?;
-        assert!(state.get_block(1).is_some());
-        assert_eq!(state.num_blocks_to_delete(), 0);
+        {
+            let state = store.read()?;
+            assert!(state.get_block(1).is_some());
+            assert_eq!(state.num_blocks_to_delete(), 0);
+        }
+
+        FileUtils::delete_path(path, true)?;
+        store.read()?.increment_blocks_to_delete();
+        assert!(store.async_remove_block(1)?.is_some());
+        assert!(store.read()?.get_block(1).is_none());
         Ok(())
     }
 
     #[test]
     fn remove_deallocate_error_keeps_block_for_retry() -> CommonResult<()> {
         let store = create_store("remove-deallocate-error")?;
-        let _delete_denied = deny_block_delete(&store)?;
+        finalized_block(&store)?;
+        let path = replace_block_file_with_non_empty_dir(&store)?;
 
         let result = store.remove_block(1);
         assert!(result.is_err());
         assert!(store.read()?.get_block(1).is_some());
+
+        FileUtils::delete_path(path, true)?;
+        store.remove_block(1)?;
+        assert!(store.read()?.get_block(1).is_none());
         Ok(())
     }
 
