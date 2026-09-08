@@ -142,3 +142,13 @@ Please read Curvine [Contribute guidelines](CONTRIBUTING.md)
 
 ## 📜 License
 Curvine is licensed under the ​**​[Apache License 2.0](LICENSE)​**.
+
+## Contributors
+
+Thanks to all contributors who help make Curvine better.
+
+<a href="https://github.com/CurvineIO/curvine/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=CurvineIO/curvine" alt="Contributors" />
+</a>
+
+Made with [contrib.rocks](https://contrib.rocks).
