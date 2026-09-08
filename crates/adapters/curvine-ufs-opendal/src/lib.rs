@@ -48,6 +48,56 @@ fn storage_error(
     }
 }
 
+#[cfg(all(test, any(feature = "opendal-hdfs", feature = "opendal-hdfs-native")))]
+mod tests {
+    use super::OpendalFileSystem;
+    use std::collections::HashMap;
+
+    fn config(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn hdfs_provider_selects_native_backend() {
+        assert!(!OpendalFileSystem::use_hdfs_native(&config(&[])));
+        assert!(OpendalFileSystem::use_hdfs_native(&config(&[(
+            "hdfs.provider",
+            "native"
+        )])));
+        assert!(OpendalFileSystem::use_hdfs_native(&config(&[(
+            "hdfs.provider",
+            "HDFS-NATIVE"
+        )])));
+        assert!(!OpendalFileSystem::use_hdfs_native(&config(&[(
+            "hdfs.provider",
+            "jvm"
+        )])));
+        assert!(!OpendalFileSystem::use_hdfs_native(&config(&[(
+            "hdfs.provider",
+            "unknown"
+        )])));
+    }
+
+    #[test]
+    fn legacy_hdfs_native_flag_is_used_only_without_provider() {
+        assert!(OpendalFileSystem::use_hdfs_native(&config(&[(
+            "hdfs.native",
+            "true"
+        )])));
+        assert!(!OpendalFileSystem::use_hdfs_native(&config(&[(
+            "hdfs.native",
+            "false"
+        )])));
+        assert!(!OpendalFileSystem::use_hdfs_native(&config(&[
+            ("hdfs.provider", "jvm"),
+            ("hdfs.native", "true"),
+        ])));
+    }
+}
+
 fn opendal_error(operation: impl AsRef<str>, path: impl AsRef<str>, e: opendal::Error) -> FsError {
     let not_found = e.kind() == ErrorKind::NotFound;
     storage_error(operation, path, e, not_found)
@@ -354,64 +404,8 @@ impl OpendalFileSystem {
                 Self::add_stability_layers(base_op, &conf)?
             }
 
-            #[cfg(feature = "opendal-hdfs")]
-            "hdfs" => {
-                use curvine_hdfs_jni::jni::{register_jvm, JVM};
-
-                register_jvm();
-
-                let _ = JVM.get_or_init().map_err(|e| {
-                    FsError::common(format!("Failed to initialize JVM for HDFS: {}", e))
-                })?;
-
-                let mut builder = Hdfs::default();
-
-                let namenode = if let Some(namenode_config) = conf.get("hdfs.namenode") {
-                    namenode_config.clone()
-                } else {
-                    format!("hdfs://{}", bucket_or_container)
-                };
-
-                builder = builder.name_node(&namenode);
-
-                let root_path = conf.get("hdfs.root").map(|s| s.as_str()).unwrap_or("/");
-                builder = builder.root(root_path);
-
-                let hdfs_user = conf
-                    .get("hdfs.user")
-                    .cloned()
-                    .or_else(|| std::env::var("HADOOP_USER_NAME").ok())
-                    .or_else(|| std::env::var("USER").ok());
-
-                if let Some(user) = hdfs_user {
-                    builder = builder.user(&user);
-                }
-
-                if let Some(ccache) = conf.get("hdfs.kerberos.ccache") {
-                    builder = builder.kerberos_ticket_cache_path(ccache);
-                } else if let Ok(ccache) = std::env::var("KRB5CCNAME") {
-                    builder = builder.kerberos_ticket_cache_path(&ccache);
-                }
-
-                if let Some(krb5_conf) = conf.get("hdfs.kerberos.krb5_conf") {
-                    std::env::set_var("KRB5_CONFIG", krb5_conf);
-                }
-
-                if conf
-                    .get("hdfs.atomic_write_dir")
-                    .map(|s| s == "true")
-                    .unwrap_or(false)
-                {
-                    let atomic_dir = format!("{}/atomic_write_dir", root_path);
-                    builder = builder.atomic_write_dir(&atomic_dir);
-                }
-
-                let base_op = Operator::new(builder)
-                    .map_err(|e| FsError::common(format!("Failed to create HDFS operator: {}", e)))?
-                    .finish();
-
-                Self::add_stability_layers(base_op, &conf)?
-            }
+            #[cfg(any(feature = "opendal-hdfs", feature = "opendal-hdfs-native"))]
+            "hdfs" => Self::create_hdfs_operator(&bucket_or_container, &conf)?,
 
             #[cfg(feature = "opendal-webhdfs")]
             "webhdfs" => {
@@ -553,9 +547,6 @@ impl OpendalFileSystem {
                 Self::add_stability_layers(base_op, &conf)?
             }
 
-            #[cfg(all(feature = "opendal-hdfs-native", not(feature = "opendal-hdfs")))]
-            "hdfs" => Self::create_hdfs_native_operator(&bucket_or_container, &conf)?,
-
             _ => {
                 return Err(FsError::unsupported(format!(
                     "Unsupported scheme: {}",
@@ -576,10 +567,119 @@ impl OpendalFileSystem {
         })
     }
 
+    #[cfg(any(feature = "opendal-hdfs", feature = "opendal-hdfs-native"))]
+    fn create_hdfs_operator(
+        bucket_or_container: &str,
+        conf: &HashMap<String, String>,
+    ) -> FsResult<Operator> {
+        if Self::use_hdfs_native(conf) {
+            #[cfg(feature = "opendal-hdfs-native")]
+            {
+                return Self::create_hdfs_native_operator(bucket_or_container, conf);
+            }
+
+            #[cfg(not(feature = "opendal-hdfs-native"))]
+            {
+                return err_box!("opendal hdfs-native provider is not enabled");
+            }
+        }
+
+        #[cfg(feature = "opendal-hdfs")]
+        {
+            return Self::create_hdfs_jvm_operator(bucket_or_container, conf);
+        }
+
+        #[cfg(all(not(feature = "opendal-hdfs"), feature = "opendal-hdfs-native"))]
+        {
+            Self::create_hdfs_native_operator(bucket_or_container, conf)
+        }
+    }
+
+    #[cfg(any(feature = "opendal-hdfs", feature = "opendal-hdfs-native"))]
+    fn use_hdfs_native(conf: &HashMap<String, String>) -> bool {
+        if let Some(value) = conf.get("hdfs.provider") {
+            return value.eq_ignore_ascii_case("native")
+                || value.eq_ignore_ascii_case("hdfs-native");
+        }
+
+        conf.get("hdfs.native")
+            .map(|v| {
+                v.eq_ignore_ascii_case("true")
+                    || v.eq_ignore_ascii_case("1")
+                    || v.eq_ignore_ascii_case("yes")
+                    || v.eq_ignore_ascii_case("on")
+            })
+            .unwrap_or(false)
+    }
+
+    #[cfg(feature = "opendal-hdfs")]
+    fn create_hdfs_jvm_operator(
+        bucket_or_container: &str,
+        conf: &HashMap<String, String>,
+    ) -> FsResult<Operator> {
+        use curvine_hdfs_jni::jni::{register_jvm, JVM};
+
+        register_jvm();
+
+        let _ = JVM
+            .get_or_init()
+            .map_err(|e| FsError::common(format!("Failed to initialize JVM for HDFS: {}", e)))?;
+
+        let mut builder = Hdfs::default();
+
+        let namenode = if let Some(namenode_config) = conf.get("hdfs.namenode") {
+            namenode_config.clone()
+        } else {
+            format!("hdfs://{}", bucket_or_container)
+        };
+
+        builder = builder.name_node(&namenode);
+
+        let root_path = conf.get("hdfs.root").map(|s| s.as_str()).unwrap_or("/");
+        builder = builder.root(root_path);
+
+        let hdfs_user = conf
+            .get("hdfs.user")
+            .cloned()
+            .or_else(|| std::env::var("HADOOP_USER_NAME").ok())
+            .or_else(|| std::env::var("USER").ok());
+
+        if let Some(user) = hdfs_user {
+            builder = builder.user(&user);
+        }
+
+        if let Some(ccache) = conf.get("hdfs.kerberos.ccache") {
+            builder = builder.kerberos_ticket_cache_path(ccache);
+        } else if let Ok(ccache) = std::env::var("KRB5CCNAME") {
+            builder = builder.kerberos_ticket_cache_path(&ccache);
+        }
+
+        if let Some(krb5_conf) = conf.get("hdfs.kerberos.krb5_conf") {
+            std::env::set_var("KRB5_CONFIG", krb5_conf);
+        }
+
+        if conf
+            .get("hdfs.atomic_write_dir")
+            .map(|s| s == "true")
+            .unwrap_or(false)
+        {
+            let atomic_dir = format!("{}/atomic_write_dir", root_path);
+            builder = builder.atomic_write_dir(&atomic_dir);
+        }
+
+        let base_op = Operator::new(builder)
+            .map_err(|e| FsError::common(format!("Failed to create HDFS operator: {}", e)))?
+            .finish();
+
+        Self::add_stability_layers(base_op, conf)
+    }
+
     /// Create HDFS Native operator (Rust native implementation, no JVM required)
     ///
     /// Note: HdfsNative uses system-level Kerberos configuration via environment variables.
     /// Supported configurations:
+    /// - hdfs.provider: Set to "native" to select this backend when both JVM
+    ///   and native HDFS providers are compiled in
     /// - hdfs.namenode: NameNode address (required)
     /// - hdfs.root: Root path (default: "/")
     /// - hdfs.kerberos.krb5_conf: Path to krb5.conf file

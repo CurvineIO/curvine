@@ -2206,7 +2206,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-alloc"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "mimalloc",
  "tikv-jemallocator",
@@ -2214,7 +2214,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-bench"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "curvine-core-error",
  "curvine-fs-api",
@@ -2227,7 +2227,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-cli"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "chrono",
@@ -2257,7 +2257,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-client"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "clap",
  "curvine-bench",
@@ -2269,7 +2269,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-client-core"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "async-stream",
  "bytes",
@@ -2306,7 +2306,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-common-macros"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "clap",
  "curvine-core-error",
@@ -2318,7 +2318,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-config"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "clap",
  "curvine-common-macros",
@@ -2341,7 +2341,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-core-error"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "bincode",
  "bytes",
@@ -2351,7 +2351,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-data-transfer"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "axum 0.7.9",
  "bytes",
@@ -2397,7 +2397,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-error"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "axum 0.7.9",
  "curvine-core-error",
@@ -2411,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-fault"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
@@ -2426,7 +2426,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-fs-api"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "async-stream",
  "bytes",
@@ -2448,7 +2448,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-fuse"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "axum 0.7.9",
  "bitflags 2.13.1",
@@ -2492,7 +2492,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-hdfs-jni"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "jni",
@@ -2501,7 +2501,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-io"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "curvine-core-error",
@@ -2515,7 +2515,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-job-client"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "bincode",
  "curvine-client-core",
@@ -2536,7 +2536,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-lancedb"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -2571,16 +2571,17 @@ dependencies = [
 
 [[package]]
 name = "curvine-libsdk"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "curvine-libsdk-java",
  "curvine-libsdk-python",
  "curvine-sdk-core",
+ "libc",
 ]
 
 [[package]]
 name = "curvine-libsdk-java"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "curvine-core-error",
  "curvine-error",
@@ -2594,7 +2595,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-libsdk-python"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "curvine-config",
@@ -2607,7 +2608,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-master"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "axum 0.7.9",
  "bytes",
@@ -2651,7 +2652,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-mds"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "curvine-config",
@@ -2668,7 +2669,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-metrics"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "curvine-core-error",
  "dashmap 5.5.3",
@@ -2679,7 +2680,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-model"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "bincode",
  "bitflags 2.13.1",
@@ -2701,7 +2702,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-net"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "curvine-core-error",
  "curvine-io",
@@ -2713,7 +2714,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-proto"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "prost 0.11.9",
  "prost-build 0.11.9",
@@ -2722,7 +2723,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-raft"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "bincode",
  "bytes",
@@ -2752,7 +2753,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-rocksdb"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "byteorder",
  "curvine-config",
@@ -2767,7 +2768,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-rpc"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "curvine-core-error",
@@ -2788,7 +2789,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-runtime"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "bincode",
  "chrono",
@@ -2867,7 +2868,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-sdk-core"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "curvine-client",
@@ -2890,7 +2891,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-server"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "axum 0.7.9",
  "bytes",
@@ -2939,7 +2940,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-service-discovery"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "curvine-config",
@@ -2956,14 +2957,14 @@ dependencies = [
 
 [[package]]
 name = "curvine-storage-api"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "curvine-model",
 ]
 
 [[package]]
 name = "curvine-storage-local"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "byteorder",
  "bytes",
@@ -2982,7 +2983,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-storage-spdk"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "cc",
@@ -3001,7 +3002,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-sys"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "curvine-runtime",
@@ -3056,14 +3057,14 @@ dependencies = [
 
 [[package]]
 name = "curvine-ufs"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "curvine-ufs-api",
 ]
 
 [[package]]
 name = "curvine-ufs-api"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3081,7 +3082,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-ufs-opendal"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "curvine-core-error",
@@ -3099,7 +3100,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-ufs-oss-hdfs"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3120,7 +3121,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-unified-fs"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "curvine-client-core",
@@ -3142,7 +3143,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-web"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "axum 0.7.9",
  "bytes",
@@ -3174,7 +3175,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-worker"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "axum 0.7.9",
  "bytes",

@@ -14,7 +14,6 @@
 
 package io.curvine;
 
-import io.curvine.bench.Utils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.FsShell;
@@ -52,7 +51,7 @@ public class CurvineShell {
     }
 
     public static void runFsShell(String[] args) throws Exception {
-        Configuration conf = Utils.getCurvineConf();
+        Configuration conf = CurvineJavaUtils.getCurvineConf();
         conf.setQuietMode(false);
 
         FsShell shell = new FsShell(conf);
@@ -66,7 +65,7 @@ public class CurvineShell {
     }
 
     public static void runReport(String[] args) throws Exception {
-        Configuration conf = Utils.getCurvineConf();
+        Configuration conf = CurvineJavaUtils.getCurvineConf();
         conf.setQuietMode(false);
 
         try (FileSystem fs = FileSystem.get(conf)) {

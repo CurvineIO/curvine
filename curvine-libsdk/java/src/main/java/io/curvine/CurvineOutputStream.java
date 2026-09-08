@@ -18,8 +18,6 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
 
-import javax.annotation.Nonnull;
-
 import org.apache.hadoop.fs.Syncable;
 
 public class CurvineOutputStream extends OutputStream implements Syncable {
@@ -55,13 +53,13 @@ public class CurvineOutputStream extends OutputStream implements Syncable {
     }
 
     @Override
-    public void write(@Nonnull byte[] buf) throws IOException {
+    public void write(byte[] buf) throws IOException {
         checkClosed();
         write(buf, 0, buf.length);
     }
 
     @Override
-    public void write(@Nonnull byte[] buf, int offset, int length) throws IOException {
+    public void write(byte[] buf, int offset, int length) throws IOException {
         checkClosed();
         if (length == 0) {
             return;
