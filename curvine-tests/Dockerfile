@@ -28,14 +28,29 @@ RUN dnf install -y dnf-plugins-core epel-release && \
 
 # Preinstall pinned LTP into /opt/ltp (runltp era; do not bump to >=20260529
 # without kirk migration). Version is intentionally inlined here so the image
-# does not depend on the still-evolving cvtest repo at build time. Align with
-# cvtest's LTP_VERSION when promoting a new pin.
+# does not depend on cvtest at build time. Align with cvtest's LTP_VERSION
+# when promoting a new pin. Curated runtest files (fs-cv-smoke, …) are NOT
+# copied in — Portal uses stock suites; CI uses `cvtest run` to install them.
+#
+# make -k: same as cvtest tools/ltp/install-ltp.sh — a few unrelated
+# testcases may fail to compile on this base image; -k continues so the
+# install tree still completes. We still require runltp + runtest to exist.
+# listmount04 is dropped up front on uapi >= 6.17 (compile break; irrelevant
+# to FUSE POSIX validation), matching the cvtest installer.
 ARG LTP_VERSION=20250930
 RUN curl -fL --retry 8 --retry-all-errors --retry-delay 5 \
       -o /tmp/ltp-full-${LTP_VERSION}.tar.bz2 \
       "https://github.com/linux-test-project/ltp/releases/download/${LTP_VERSION}/ltp-full-${LTP_VERSION}.tar.bz2" \
  && tar -xjf /tmp/ltp-full-${LTP_VERSION}.tar.bz2 -C /tmp \
  && cd /tmp/ltp-full-${LTP_VERSION} \
+ && if echo '#include <linux/mount.h>
+int main(void){struct mnt_id_req r;return r.spare;}' \
+       | gcc -x c - -o /dev/null 2>/dev/null; then \
+     :; \
+   else \
+     echo "kernel uapi incompatible with listmount04; dropping it"; \
+     rm -f testcases/kernel/syscalls/listmount/listmount04.c; \
+   fi \
  && ./configure --prefix=/opt/ltp \
  && make -j"$(nproc)" -k \
  && make install -k \
