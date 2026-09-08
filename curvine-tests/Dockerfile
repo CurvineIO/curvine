@@ -45,7 +45,7 @@ RUN curl -fL --retry 8 --retry-all-errors --retry-delay 5 \
  && echo "${LTP_SHA256}  /tmp/ltp-full-${LTP_VERSION}.tar.bz2" | sha256sum -c - \
  && tar -xjf /tmp/ltp-full-${LTP_VERSION}.tar.bz2 -C /tmp \
  && cd /tmp/ltp-full-${LTP_VERSION} \
- && if echo '#include <linux/mount.h>
+ && if echo '#include <linux/mount.h>\
 int main(void){struct mnt_id_req r;return r.spare;}' \
        | gcc -x c - -o /dev/null 2>/dev/null; then \
      :; \
