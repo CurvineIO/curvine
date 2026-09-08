@@ -14,9 +14,9 @@
 
 use curvine_error::{FsError, FsResult};
 use curvine_model::{
-    StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease, TransferListFilter,
-    TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTaskState,
-    TransferTenantSummary,
+    summarize_transfer_tasks, StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease,
+    TransferListFilter, TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport,
+    TransferTaskState, TransferTenantSummary,
 };
 use native_tls::{Certificate, TlsConnector};
 use percent_encoding::percent_decode_str;
@@ -32,8 +32,8 @@ use std::str::FromStr;
 use url::Url;
 
 use crate::transfer::{
-    apply_task_report_progress, TransferMountSnapshotUpdate, TransferPlannedTasks,
-    TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
+    TransferMountSnapshotUpdate, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
+    TransferTaskStateUpdate,
 };
 
 const TRANSFER_SCHEMA_VERSION: i64 = 1;
@@ -1494,11 +1494,7 @@ impl TransferStore for PostgresTransferStore {
     }
 
     fn update_task_report(&self, report: TransferTaskReport) -> FsResult<bool> {
-        self.transaction(|tx| {
-            let mut job = match select_job_by_id_for_update(tx, &report.job_id)? {
-                Some(job) if job.run_id == report.run_id => job,
-                _ => return Ok(false),
-            };
+        let accepted = self.transaction(|tx| {
             let mut task =
                 match select_task_for_update(tx, &report.job_id, report.run_id, &report.task_id)? {
                     Some(task)
@@ -1511,22 +1507,32 @@ impl TransferStore for PostgresTransferStore {
                     }
                     _ => return Ok(false),
                 };
-            let previous_progress = task.progress.clone();
             task.state = report.state;
             task.progress = report.progress.clone();
             task.last_report_at = report.now_ms;
             task.stale_deadline_at = report.stale_deadline_at;
             task.updated_at = report.now_ms;
             update_task(tx, &task)?;
-            apply_task_report_progress(
-                &mut job.summary,
-                &previous_progress,
-                &report.progress,
-                report.now_ms,
-            );
-            job.updated_at = report.now_ms;
-            update_job(tx, &job)?;
             Ok(true)
+        })?;
+        if accepted && report.state.is_terminal() {
+            self.flush_job_progress_summary(&report.job_id, report.run_id)?;
+        }
+        Ok(accepted)
+    }
+
+    fn flush_job_progress_summary(&self, job_id: &str, run_id: u64) -> FsResult<()> {
+        self.transaction(|tx| {
+            let mut job = match select_job_by_id_for_update(tx, job_id)? {
+                Some(job) if job.run_id == run_id => job,
+                _ => return Ok(()),
+            };
+            let tasks = select_tasks(tx, job_id, run_id, None, None)?;
+            let now_ms = curvine_runtime::common::LocalTime::mills() as i64;
+            job.summary = summarize_transfer_tasks(&tasks, now_ms).progress;
+            job.updated_at = now_ms;
+            update_job(tx, &job)?;
+            Ok(())
         })
     }
 }

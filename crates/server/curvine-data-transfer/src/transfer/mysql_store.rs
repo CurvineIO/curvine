@@ -15,9 +15,9 @@
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
-    StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease, TransferListFilter,
-    TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTaskState,
-    TransferTenantSummary,
+    summarize_transfer_tasks, StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease,
+    TransferListFilter, TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport,
+    TransferTaskState, TransferTenantSummary,
 };
 use mysql::prelude::*;
 use mysql::{params, Params, Pool, PooledConn, TxOpts, Value as MysqlValue};
@@ -26,8 +26,8 @@ use std::thread;
 use std::time::Duration;
 
 use crate::transfer::{
-    apply_task_report_progress, TransferMountSnapshotUpdate, TransferPlannedTasks,
-    TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
+    TransferMountSnapshotUpdate, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
+    TransferTaskStateUpdate,
 };
 
 const TRANSFER_SCHEMA_VERSION: u64 = 4;
@@ -882,13 +882,6 @@ impl TransferStore for MysqlTransferStore {
         let mut tx = conn
             .start_transaction(TxOpts::default())
             .map_err(mysql_err)?;
-        let mut job = match select_job_by_id_for_update(&mut tx, &report.job_id)? {
-            Some(job) if job.run_id == report.run_id => job,
-            _ => {
-                tx.commit().map_err(mysql_err)?;
-                return Ok(false);
-            }
-        };
         let mut task = match select_task_for_update(
             &mut tx,
             &report.job_id,
@@ -908,23 +901,38 @@ impl TransferStore for MysqlTransferStore {
                 return Ok(false);
             }
         };
-        let previous_progress = task.progress.clone();
         task.state = report.state;
         task.progress = report.progress.clone();
         task.last_report_at = report.now_ms;
         task.stale_deadline_at = report.stale_deadline_at;
         task.updated_at = report.now_ms;
         exec_update_task(&mut tx, &task)?;
-        apply_task_report_progress(
-            &mut job.summary,
-            &previous_progress,
-            &report.progress,
-            report.now_ms,
-        );
-        job.updated_at = report.now_ms;
+        tx.commit().map_err(mysql_err)?;
+        if report.state.is_terminal() {
+            self.flush_job_progress_summary(&report.job_id, report.run_id)?;
+        }
+        Ok(true)
+    }
+
+    fn flush_job_progress_summary(&self, job_id: &str, run_id: u64) -> FsResult<()> {
+        let mut conn = self.conn()?;
+        let mut tx = conn
+            .start_transaction(TxOpts::default())
+            .map_err(mysql_err)?;
+        let mut job = match select_job_by_id_for_update(&mut tx, job_id)? {
+            Some(job) if job.run_id == run_id => job,
+            _ => {
+                tx.commit().map_err(mysql_err)?;
+                return Ok(());
+            }
+        };
+        let tasks = select_tasks(&mut tx, job_id, run_id, None, None)?;
+        let now_ms = curvine_runtime::common::LocalTime::mills() as i64;
+        job.summary = summarize_transfer_tasks(&tasks, now_ms).progress;
+        job.updated_at = now_ms;
         exec_update_job(&mut tx, &job)?;
         tx.commit().map_err(mysql_err)?;
-        Ok(true)
+        Ok(())
     }
 }
 

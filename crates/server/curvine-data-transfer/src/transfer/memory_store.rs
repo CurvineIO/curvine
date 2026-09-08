@@ -17,15 +17,15 @@ use std::collections::{HashMap, HashSet};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
-    StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease, TransferListFilter,
-    TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTaskState,
-    TransferTenantSummary,
+    summarize_transfer_tasks, StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease,
+    TransferListFilter, TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport,
+    TransferTaskState, TransferTenantSummary,
 };
 use parking_lot::Mutex;
 
 use crate::transfer::{
-    apply_task_report_progress, TransferMountSnapshotUpdate, TransferPlannedTasks,
-    TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
+    TransferMountSnapshotUpdate, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
+    TransferTaskStateUpdate,
 };
 
 #[derive(Default)]
@@ -727,38 +727,50 @@ impl TransferStore for MemoryTransferStore {
 
     fn update_task_report(&self, report: TransferTaskReport) -> FsResult<bool> {
         let mut inner = self.inner.lock();
-        let key = (report.job_id, report.run_id, report.task_id);
-        let (task_job_id, previous_progress) = {
-            let Some(task) = inner.tasks.get_mut(&key) else {
-                return Ok(false);
-            };
-            if task.attempt_id != report.attempt_id
-                || task.worker_id != report.worker_id
-                || task.worker_session_id != report.worker_session_id
-                || !task.state.is_running()
-            {
-                return Ok(false);
-            }
-
-            let previous_progress = task.progress.clone();
-            task.state = report.state;
-            task.progress = report.progress.clone();
-            task.last_report_at = report.now_ms;
-            task.stale_deadline_at = report.stale_deadline_at;
-            task.updated_at = report.now_ms;
-            (task.job_id.clone(), previous_progress)
+        let key = (report.job_id.clone(), report.run_id, report.task_id.clone());
+        let Some(task) = inner.tasks.get_mut(&key) else {
+            return Ok(false);
         };
+        if task.attempt_id != report.attempt_id
+            || task.worker_id != report.worker_id
+            || task.worker_session_id != report.worker_session_id
+            || !task.state.is_running()
+        {
+            return Ok(false);
+        }
 
-        if let Some(job) = inner.jobs.get_mut(&task_job_id) {
-            apply_task_report_progress(
-                &mut job.summary,
-                &previous_progress,
-                &report.progress,
-                report.now_ms,
-            );
-            job.updated_at = report.now_ms;
+        task.state = report.state;
+        task.progress = report.progress.clone();
+        task.last_report_at = report.now_ms;
+        task.stale_deadline_at = report.stale_deadline_at;
+        task.updated_at = report.now_ms;
+        drop(inner);
+
+        if report.state.is_terminal() {
+            self.flush_job_progress_summary(&report.job_id, report.run_id)?;
         }
         Ok(true)
+    }
+
+    fn flush_job_progress_summary(&self, job_id: &str, run_id: u64) -> FsResult<()> {
+        let mut inner = self.inner.lock();
+        let tasks = inner
+            .tasks
+            .values()
+            .filter(|task| task.job_id == job_id && task.run_id == run_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let now_ms = curvine_runtime::common::LocalTime::mills() as i64;
+        let summary = summarize_transfer_tasks(&tasks, now_ms).progress;
+        let Some(job) = inner.jobs.get_mut(job_id) else {
+            return Ok(());
+        };
+        if job.run_id != run_id {
+            return Ok(());
+        }
+        job.summary = summary;
+        job.updated_at = now_ms;
+        Ok(())
     }
 }
 
@@ -825,5 +837,215 @@ fn normalized_target_path(path: &str) -> &str {
         "/"
     } else {
         trimmed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transfer::{TransferPlannedTasks, TransferStore};
+    use curvine_model::{
+        TaskAttemptStart, TransferKind, TransferProgress, TransferState, TransferTaskReport,
+        TransferTaskState,
+    };
+
+    fn sample_job(job_id: &str) -> TransferJobRecord {
+        TransferJobRecord {
+            job_key: format!("key-{job_id}"),
+            job_id: job_id.to_string(),
+            run_id: 1,
+            kind: TransferKind::Load,
+            source_path: "file:///src".to_string(),
+            target_path: format!("/dst/{job_id}"),
+            command_json: "{}".to_string(),
+            mount_snapshot_json: "{}".to_string(),
+            secret_ref_json: "{}".to_string(),
+            cluster_snapshot_version: 1,
+            mount_snapshot_attempts: 0,
+            cv_metadata_epoch: None,
+            state: TransferState::Pending,
+            owner: String::new(),
+            lease_epoch: 0,
+            lease_expire_at: 0,
+            cancel_requested: false,
+            summary: TransferProgress::default(),
+            client_request_id: format!("req-{job_id}"),
+            submitter: "test".to_string(),
+            tenant: "test".to_string(),
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    fn sample_task(job: &TransferJobRecord, task_id: &str) -> TransferTaskRecord {
+        TransferTaskRecord {
+            job_id: job.job_id.clone(),
+            run_id: job.run_id,
+            task_id: task_id.to_string(),
+            attempt_id: 0,
+            source_path: job.source_path.clone(),
+            target_path: job.target_path.clone(),
+            worker_id: 0,
+            worker_session_id: String::new(),
+            source_read_plan_json: "{}".to_string(),
+            report_target_json: "{}".to_string(),
+            state: TransferTaskState::Pending,
+            progress: TransferProgress::default(),
+            retry_count: 0,
+            attempt_started_at: 0,
+            last_report_at: 0,
+            stale_deadline_at: 0,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn progress_report_updates_task_without_job_summary_until_flush() {
+        let store = MemoryTransferStore::new();
+        let job = sample_job("progress-decouple");
+        store
+            .create_or_get_by_request_id_checked(job.clone())
+            .unwrap();
+        let lease = store
+            .acquire_runnable_transfer("owner", 60_000, 2, 10)
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .persist_planned_tasks(TransferPlannedTasks {
+                job_id: job.job_id.clone(),
+                run_id: job.run_id,
+                owner: lease.owner.clone(),
+                lease_epoch: lease.lease_epoch,
+                tasks: vec![sample_task(&job, "t1"), sample_task(&job, "t2")],
+                message: "planned".to_string(),
+                now_ms: 3,
+            })
+            .unwrap());
+        for task_id in ["t1", "t2"] {
+            assert!(store
+                .start_task_attempt(TaskAttemptStart {
+                    job_id: job.job_id.clone(),
+                    run_id: job.run_id,
+                    owner: lease.owner.clone(),
+                    lease_epoch: lease.lease_epoch,
+                    task_id: task_id.to_string(),
+                    attempt_id: 1,
+                    worker_id: 7,
+                    worker_session_id: "session".to_string(),
+                    report_target_json: "{}".to_string(),
+                    now_ms: 4,
+                    stale_deadline_at: 1_000,
+                })
+                .unwrap());
+        }
+
+        assert!(store
+            .update_task_report(TransferTaskReport {
+                job_id: job.job_id.clone(),
+                run_id: job.run_id,
+                task_id: "t1".to_string(),
+                attempt_id: 1,
+                worker_id: 7,
+                worker_session_id: "session".to_string(),
+                state: TransferTaskState::Running,
+                progress: TransferProgress {
+                    loaded_size: 10,
+                    total_size: 100,
+                    update_time: 5,
+                    message: "t1".to_string(),
+                },
+                now_ms: 5,
+                stale_deadline_at: 2_000,
+            })
+            .unwrap());
+        assert!(store
+            .update_task_report(TransferTaskReport {
+                job_id: job.job_id.clone(),
+                run_id: job.run_id,
+                task_id: "t2".to_string(),
+                attempt_id: 1,
+                worker_id: 7,
+                worker_session_id: "session".to_string(),
+                state: TransferTaskState::Running,
+                progress: TransferProgress {
+                    loaded_size: 20,
+                    total_size: 100,
+                    update_time: 6,
+                    message: "t2".to_string(),
+                },
+                now_ms: 6,
+                stale_deadline_at: 3_000,
+            })
+            .unwrap());
+
+        let tasks = store.list_transfer_tasks(&job.job_id, job.run_id).unwrap();
+        assert_eq!(
+            tasks
+                .iter()
+                .find(|task| task.task_id == "t1")
+                .unwrap()
+                .stale_deadline_at,
+            2_000
+        );
+        assert_eq!(
+            tasks
+                .iter()
+                .find(|task| task.task_id == "t2")
+                .unwrap()
+                .progress
+                .loaded_size,
+            20
+        );
+        assert_eq!(
+            store
+                .get_transfer(&job.job_id)
+                .unwrap()
+                .unwrap()
+                .summary
+                .loaded_size,
+            0
+        );
+
+        store
+            .flush_job_progress_summary(&job.job_id, job.run_id)
+            .unwrap();
+        assert_eq!(
+            store
+                .get_transfer(&job.job_id)
+                .unwrap()
+                .unwrap()
+                .summary
+                .loaded_size,
+            30
+        );
+
+        assert!(store
+            .update_task_report(TransferTaskReport {
+                job_id: job.job_id.clone(),
+                run_id: job.run_id,
+                task_id: "t1".to_string(),
+                attempt_id: 1,
+                worker_id: 7,
+                worker_session_id: "session".to_string(),
+                state: TransferTaskState::Completed,
+                progress: TransferProgress {
+                    loaded_size: 100,
+                    total_size: 100,
+                    update_time: 7,
+                    message: "done".to_string(),
+                },
+                now_ms: 7,
+                stale_deadline_at: 4_000,
+            })
+            .unwrap());
+        assert_eq!(
+            store
+                .get_transfer(&job.job_id)
+                .unwrap()
+                .unwrap()
+                .summary
+                .loaded_size,
+            120
+        );
     }
 }

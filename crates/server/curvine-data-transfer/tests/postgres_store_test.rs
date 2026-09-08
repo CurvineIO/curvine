@@ -257,6 +257,47 @@ fn postgres_store_persists_transfer_lifecycle() {
             attempt_id: 1,
             worker_id: 7,
             worker_session_id: "session-1".to_string(),
+            state: TransferTaskState::Running,
+            progress: TransferProgress {
+                loaded_size: 21,
+                total_size: 42,
+                update_time: 4,
+                message: "running".to_string(),
+            },
+            now_ms: 4,
+            stale_deadline_at: 90,
+        })
+        .unwrap());
+    assert_eq!(
+        store
+            .get_transfer(&job.job_id)
+            .unwrap()
+            .unwrap()
+            .summary
+            .loaded_size,
+        0,
+        "progress reports must not update job.summary until flush"
+    );
+    store
+        .flush_job_progress_summary(&job.job_id, job.run_id)
+        .unwrap();
+    assert_eq!(
+        store
+            .get_transfer(&job.job_id)
+            .unwrap()
+            .unwrap()
+            .summary
+            .loaded_size,
+        21
+    );
+    assert!(store
+        .update_task_report(TransferTaskReport {
+            job_id: job.job_id.clone(),
+            run_id: job.run_id,
+            task_id: "task-1".to_string(),
+            attempt_id: 1,
+            worker_id: 7,
+            worker_session_id: "session-1".to_string(),
             state: TransferTaskState::Completed,
             progress: TransferProgress {
                 loaded_size: 42,

@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
-use std::sync::{mpsc, Arc};
+use std::collections::{HashMap, HashSet};
+use std::sync::{mpsc, Arc, Mutex};
 
 use crossbeam::channel;
 use curvine_error::FsError;
@@ -32,12 +32,13 @@ use curvine_proto::{
 };
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::common::SerdeUtils;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::transfer::{ClusterMetadataCache, TransferMetrics, TransferStore};
 
 const PROGRESS_REPORT_COALESCE_BATCH: usize = 256;
+const JOB_SUMMARY_FLUSH_INTERVAL: Duration = Duration::from_millis(1000);
 
 const TRANSFER_PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_LIST_PAGE_SIZE: usize = 20;
@@ -391,7 +392,7 @@ where
         }
         let now_ms = now_ms();
         let report = TransferTaskReport {
-            job_id: req.job_id,
+            job_id: req.job_id.clone(),
             run_id: req.run_id,
             task_id: req.task_id,
             attempt_id: req.attempt_id,
@@ -402,7 +403,13 @@ where
             now_ms,
             stale_deadline_at: now_ms.saturating_add(self.task_stale_timeout_ms),
         };
-        self.store.update_task_report(report)
+        let accepted = self.store.update_task_report(report)?;
+        if accepted && !state.is_terminal() {
+            // Sync path has no background flusher; keep job.summary up to date.
+            self.store
+                .flush_job_progress_summary(&req.job_id, req.run_id)?;
+        }
+        Ok(accepted)
     }
 
     fn page_tasks(
@@ -438,6 +445,60 @@ struct TransferReportEnvelope {
     req: TransferTaskReportRequest,
     state: TransferTaskState,
     reply: Option<mpsc::Sender<FsResult<bool>>>,
+}
+
+#[derive(Clone, Hash, Eq, PartialEq)]
+struct DirtyJobKey {
+    job_id: String,
+    run_id: u64,
+}
+
+struct JobSummaryDirtySet {
+    dirty: Mutex<HashSet<DirtyJobKey>>,
+}
+
+impl JobSummaryDirtySet {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            dirty: Mutex::new(HashSet::new()),
+        })
+    }
+
+    fn mark(&self, job_id: String, run_id: u64) {
+        let mut dirty = self.dirty.lock().unwrap_or_else(|err| err.into_inner());
+        dirty.insert(DirtyJobKey { job_id, run_id });
+        if let Ok(metrics) = TransferMetrics::get() {
+            metrics.set_job_summary_dirty_len(dirty.len());
+        }
+    }
+
+    fn clear(&self, job_id: &str, run_id: u64) {
+        let mut dirty = self.dirty.lock().unwrap_or_else(|err| err.into_inner());
+        dirty.remove(&DirtyJobKey {
+            job_id: job_id.to_string(),
+            run_id,
+        });
+        if let Ok(metrics) = TransferMetrics::get() {
+            metrics.set_job_summary_dirty_len(dirty.len());
+        }
+    }
+
+    fn take_all(&self) -> Vec<DirtyJobKey> {
+        let mut dirty = self.dirty.lock().unwrap_or_else(|err| err.into_inner());
+        let jobs = dirty.drain().collect::<Vec<_>>();
+        if let Ok(metrics) = TransferMetrics::get() {
+            metrics.set_job_summary_dirty_len(0);
+        }
+        jobs
+    }
+
+    fn requeue(&self, jobs: impl IntoIterator<Item = DirtyJobKey>) {
+        let mut dirty = self.dirty.lock().unwrap_or_else(|err| err.into_inner());
+        dirty.extend(jobs);
+        if let Ok(metrics) = TransferMetrics::get() {
+            metrics.set_job_summary_dirty_len(dirty.len());
+        }
+    }
 }
 
 #[derive(Hash, Eq, PartialEq)]
@@ -492,10 +553,12 @@ where
         let (terminal_sender, terminal_receiver) =
             channel::bounded::<TransferReportEnvelope>(queue_size.max(1));
         let worker_count = workers.max(1);
+        let dirty_jobs = JobSummaryDirtySet::new();
         Self::spawn_report_workers(
             "progress",
             progress_receiver,
             store.clone(),
+            dirty_jobs.clone(),
             task_stale_timeout_ms,
             worker_count,
         )?;
@@ -503,11 +566,14 @@ where
             "terminal",
             terminal_receiver,
             store.clone(),
+            dirty_jobs.clone(),
             task_stale_timeout_ms,
             worker_count,
         )?;
+        Self::spawn_summary_flusher(store.clone(), dirty_jobs.clone())?;
         if let Ok(metrics) = TransferMetrics::get() {
             metrics.set_report_queue_len_by_lane(0, 0);
+            metrics.set_job_summary_dirty_len(0);
         }
         Ok(Self {
             progress_sender,
@@ -516,16 +582,62 @@ where
         })
     }
 
+    fn spawn_summary_flusher(store: Arc<S>, dirty_jobs: Arc<JobSummaryDirtySet>) -> FsResult<()> {
+        std::thread::Builder::new()
+            .name("transfer-job-summary-flush".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(JOB_SUMMARY_FLUSH_INTERVAL);
+                let jobs = dirty_jobs.take_all();
+                if jobs.is_empty() {
+                    continue;
+                }
+                let mut failed = Vec::new();
+                for job in jobs {
+                    let started = Instant::now();
+                    match store.flush_job_progress_summary(&job.job_id, job.run_id) {
+                        Ok(()) => {
+                            if let Ok(metrics) = TransferMetrics::get() {
+                                metrics
+                                    .observe_job_summary_flush("ok", started.elapsed().as_micros());
+                            }
+                        }
+                        Err(err) => {
+                            if let Ok(metrics) = TransferMetrics::get() {
+                                metrics.observe_job_summary_flush(
+                                    "error",
+                                    started.elapsed().as_micros(),
+                                );
+                            }
+                            log::warn!(
+                                "flush transfer job progress summary failed: job={} run={} err={}",
+                                job.job_id,
+                                job.run_id,
+                                err
+                            );
+                            failed.push(job);
+                        }
+                    }
+                }
+                if !failed.is_empty() {
+                    dirty_jobs.requeue(failed);
+                }
+            })
+            .map_err(|_| FsError::common("Unable to start the transfer job summary flusher"))?;
+        Ok(())
+    }
+
     fn spawn_report_workers(
         lane: &'static str,
         receiver: channel::Receiver<TransferReportEnvelope>,
         store: Arc<S>,
+        dirty_jobs: Arc<JobSummaryDirtySet>,
         task_stale_timeout_ms: i64,
         worker_count: usize,
     ) -> FsResult<()> {
         for index in 0..worker_count {
             let receiver = receiver.clone();
             let store = store.clone();
+            let dirty_jobs = dirty_jobs.clone();
             std::thread::Builder::new()
                 .name(format!("transfer-report-{lane}-{index}"))
                 .spawn(move || {
@@ -545,12 +657,18 @@ where
                             for envelope in reports.into_values() {
                                 Self::handle_report_envelope(
                                     &store,
+                                    &dirty_jobs,
                                     task_stale_timeout_ms,
                                     envelope,
                                 );
                             }
                         } else {
-                            Self::handle_report_envelope(&store, task_stale_timeout_ms, envelope);
+                            Self::handle_report_envelope(
+                                &store,
+                                &dirty_jobs,
+                                task_stale_timeout_ms,
+                                envelope,
+                            );
                         }
                     }
                 })
@@ -561,11 +679,14 @@ where
 
     fn handle_report_envelope(
         store: &S,
+        dirty_jobs: &JobSummaryDirtySet,
         task_stale_timeout_ms: i64,
         envelope: TransferReportEnvelope,
     ) {
         let now_ms = now_ms();
         let state = envelope.state;
+        let job_id = envelope.req.job_id.clone();
+        let run_id = envelope.req.run_id;
         let report = TransferTaskReport {
             job_id: envelope.req.job_id,
             run_id: envelope.req.run_id,
@@ -579,6 +700,14 @@ where
             stale_deadline_at: now_ms.saturating_add(task_stale_timeout_ms),
         };
         let result = store.update_task_report(report);
+        if matches!(&result, Ok(true)) {
+            if state.is_terminal() {
+                // Terminal reports flush summary inside the store; drop pending dirty entry.
+                dirty_jobs.clear(&job_id, run_id);
+            } else {
+                dirty_jobs.mark(job_id, run_id);
+            }
+        }
         match envelope.reply {
             Some(reply) => {
                 let _ = reply.send(result);

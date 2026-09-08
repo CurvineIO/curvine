@@ -153,7 +153,16 @@ pub trait TransferStore: Send + Sync + 'static {
 
     fn start_task_attempt(&self, start: TaskAttemptStart) -> FsResult<bool>;
 
+    /// Persist a task progress/terminal report.
+    ///
+    /// Progress reports update only the task row (including `stale_deadline_at`).
+    /// Job-level `summary` is refreshed by [`Self::flush_job_progress_summary`],
+    /// except terminal reports which flush the job summary immediately.
     fn update_task_report(&self, report: TransferTaskReport) -> FsResult<bool>;
+
+    /// Recompute `job.summary` from all tasks for `(job_id, run_id)` and persist it.
+    /// No-ops when the job is missing or `run_id` does not match.
+    fn flush_job_progress_summary(&self, job_id: &str, run_id: u64) -> FsResult<()>;
 }
 
 pub struct TransferRequeueUpdate {

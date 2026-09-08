@@ -545,6 +545,18 @@ impl TransferStore for TransferStoreBackend {
             Self::Postgres(store) => store.update_task_report(report),
         })
     }
+
+    fn flush_job_progress_summary(&self, job_id: &str, run_id: u64) -> FsResult<()> {
+        self.record_store_operation("flush_job_progress_summary", || match self {
+            Self::Memory(store) => store.flush_job_progress_summary(job_id, run_id),
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => store.flush_job_progress_summary(job_id, run_id),
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => store.flush_job_progress_summary(job_id, run_id),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.flush_job_progress_summary(job_id, run_id),
+        })
+    }
 }
 
 impl TransferStoreBackend {

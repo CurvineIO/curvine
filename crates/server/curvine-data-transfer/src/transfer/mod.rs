@@ -60,23 +60,3 @@ pub use self::router_handler::TransferRouterHandler;
 mod transfer_server;
 #[cfg(feature = "transfer-server")]
 pub use self::transfer_server::TransferServer;
-
-pub(crate) fn apply_task_report_progress(
-    summary: &mut curvine_model::TransferProgress,
-    previous: &curvine_model::TransferProgress,
-    current: &curvine_model::TransferProgress,
-    now_ms: i64,
-) {
-    summary.loaded_size = summary
-        .loaded_size
-        .saturating_sub(previous.loaded_size)
-        .saturating_add(current.loaded_size)
-        .max(0);
-    summary.total_size = summary
-        .total_size
-        .saturating_sub(previous.total_size)
-        .saturating_add(current.total_size)
-        .max(0);
-    summary.update_time = now_ms;
-    summary.message = current.message.clone();
-}

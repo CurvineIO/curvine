@@ -15,9 +15,10 @@
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
-    StaleTaskAttempt, TaskAttemptStart, TransferCommand, TransferJobRecord, TransferKind,
-    TransferLease, TransferListFilter, TransferProgress, TransferState, TransferStateUpdate,
-    TransferTaskRecord, TransferTaskReport, TransferTaskState, TransferTenantSummary,
+    summarize_transfer_tasks, StaleTaskAttempt, TaskAttemptStart, TransferCommand,
+    TransferJobRecord, TransferKind, TransferLease, TransferListFilter, TransferProgress,
+    TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTaskState,
+    TransferTenantSummary,
 };
 use parking_lot::Mutex;
 use rusqlite::{
@@ -28,8 +29,8 @@ use std::fs;
 use std::path::Path;
 
 use crate::transfer::{
-    apply_task_report_progress, TransferMountSnapshotUpdate, TransferPlannedTasks,
-    TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
+    TransferMountSnapshotUpdate, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
+    TransferTaskStateUpdate,
 };
 
 const TRANSFER_SCHEMA_VERSION: i64 = 3;
@@ -993,38 +994,68 @@ impl TransferStore for SqliteTransferStore {
                 ],
             )
             .map_err(sqlite_err)?;
+        tx.commit().map_err(sqlite_err)?;
         if affected == 0 {
-            tx.commit().map_err(sqlite_err)?;
             return Ok(false);
         }
-        let mut job = tx
+        if report.state.is_terminal() {
+            drop(conn);
+            self.flush_job_progress_summary(&report.job_id, report.run_id)?;
+        }
+        Ok(true)
+    }
+
+    fn flush_job_progress_summary(&self, job_id: &str, run_id: u64) -> FsResult<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(sqlite_err)?;
+        let Some(mut job) = tx
             .query_row(
                 job_select_sql("where job_id = ?1").as_str(),
-                params![report.job_id],
+                params![job_id],
                 sqlite_job_row,
             )
             .optional()
             .map_err(sqlite_err)?
-            .ok_or_else(|| FsError::job_not_found(&report.job_id))?;
-        apply_task_report_progress(
-            &mut job.summary,
-            &previous.progress,
-            &report.progress,
-            report.now_ms,
-        );
+        else {
+            tx.commit().map_err(sqlite_err)?;
+            return Ok(());
+        };
+        if job.run_id != run_id {
+            tx.commit().map_err(sqlite_err)?;
+            return Ok(());
+        }
+        let tasks = {
+            let mut stmt = tx
+                .prepare(
+                    "select job_id, run_id, task_id, attempt_id, source_path, target_path,
+                            worker_id, worker_session_id, source_read_plan_json, report_target_json,
+                            state, progress_json, retry_count, attempt_started_at, last_report_at,
+                            stale_deadline_at, updated_at
+                     from transfer_tasks
+                     where job_id = ?1 and run_id = ?2",
+                )
+                .map_err(sqlite_err)?;
+            let rows = stmt
+                .query_map(params![job_id, run_id as i64], sqlite_task_row)
+                .map_err(sqlite_err)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)?
+        };
+        let now_ms = curvine_runtime::common::LocalTime::mills() as i64;
+        job.summary = summarize_transfer_tasks(&tasks, now_ms).progress;
+        job.updated_at = now_ms;
         tx.execute(
             "update transfer_jobs set summary_json = ?1, updated_at = ?2
              where job_id = ?3 and run_id = ?4",
             params![
                 transfer_progress_json(&job.summary)?,
-                report.now_ms,
-                report.job_id,
-                report.run_id as i64,
+                now_ms,
+                job_id,
+                run_id as i64,
             ],
         )
         .map_err(sqlite_err)?;
         tx.commit().map_err(sqlite_err)?;
-        Ok(true)
+        Ok(())
     }
 }
 

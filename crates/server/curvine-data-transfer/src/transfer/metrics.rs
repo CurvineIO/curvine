@@ -28,6 +28,9 @@ pub struct TransferMetrics {
     report_total: CounterVec,
     report_queue_len: Gauge,
     report_queue_len_by_lane: GaugeVec,
+    job_summary_dirty_len: Gauge,
+    job_summary_flush_total: CounterVec,
+    job_summary_flush_duration_us: HistogramVec,
     active_jobs: Gauge,
     executing_jobs: Gauge,
     pending_jobs: Gauge,
@@ -83,6 +86,34 @@ impl TransferMetrics {
                 "transfer_task_report_queue_len_by_lane",
                 "Current transfer task report queue length by lane",
                 &["lane"],
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            job_summary_dirty_len: m::new_gauge(
+                "transfer_job_summary_dirty_len",
+                "Current number of jobs waiting for progress summary flush",
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            job_summary_flush_total: m::new_counter_vec(
+                "transfer_job_summary_flush_total",
+                "Transfer job progress summary flush attempts by result",
+                &["result"],
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            job_summary_flush_duration_us: m::new_histogram_vec_with_buckets(
+                "transfer_job_summary_flush_duration_us",
+                "Transfer job progress summary flush latency in microseconds",
+                &["result"],
+                &[
+                    100.0,
+                    500.0,
+                    1_000.0,
+                    5_000.0,
+                    10_000.0,
+                    50_000.0,
+                    100_000.0,
+                    500_000.0,
+                    1_000_000.0,
+                ],
             )
             .map_err(|err| FsError::common(err.to_string()))?,
             active_jobs: m::new_gauge(
@@ -290,6 +321,19 @@ impl TransferMetrics {
         self.report_queue_len_by_lane
             .with_label_values(&["terminal"])
             .set(terminal as i64);
+    }
+
+    pub fn set_job_summary_dirty_len(&self, value: usize) {
+        self.job_summary_dirty_len.set(value as i64);
+    }
+
+    pub fn observe_job_summary_flush(&self, result: &str, elapsed_us: u128) {
+        self.job_summary_flush_total
+            .with_label_values(&[result])
+            .inc();
+        self.job_summary_flush_duration_us
+            .with_label_values(&[result])
+            .observe(elapsed_us as f64);
     }
 
     pub fn set_job_counts(&self, active: u64, executing: u64) {
