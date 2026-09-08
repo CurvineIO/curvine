@@ -1694,15 +1694,13 @@ impl MasterFilesystem {
             self.worker_manager.write().remove_blocks(&del_res);
         }
 
-        let blocks = self.get_block_locations(path)?;
-        if blocks.status.id != inode_id {
-            return err_box!(
-                "Path {} resolved to different inode after resize, expected {}, got {}",
-                path,
-                inode_id,
-                blocks.status.id
-            );
-        }
+        let blocks = {
+            let fs_dir = self.fs_dir.read();
+            let inode = Self::resolve_file_inode(&fs_dir, path, Some(inode_id))?;
+            let file = inode.as_file_ref()?;
+            let locs = self.get_block_locs(path, &fs_dir, file)?;
+            FileBlocks::new(inode.to_file_status(path)?, locs)
+        };
 
         Ok(blocks)
     }
