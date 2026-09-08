@@ -5,6 +5,7 @@
 FROM ghcr.io/curvineio/curvine-compile:rocky9
 
 # Python + Flask + Werkzeug (build-server) and regression helpers; no runtime pip installs in CI.
+# bison/flex are required to build LTP from the release tarball.
 RUN dnf install -y dnf-plugins-core epel-release && \
     dnf config-manager --set-enabled crb && \
     dnf install -y \
@@ -18,7 +19,30 @@ RUN dnf install -y dnf-plugins-core epel-release && \
         zlib-static \
         jq \
         fio \
+        bison \
+        flex \
+        bzip2 \
+        fuse \
+        fuse-libs \
     && dnf clean all
+
+# Preinstall pinned LTP into /opt/ltp (runltp era; do not bump to >=20260529
+# without kirk migration). Version is intentionally inlined here so the image
+# does not depend on the still-evolving cvtest repo at build time. Align with
+# cvtest's LTP_VERSION when promoting a new pin.
+ARG LTP_VERSION=20250930
+RUN curl -fL --retry 8 --retry-all-errors --retry-delay 5 \
+      -o /tmp/ltp-full-${LTP_VERSION}.tar.bz2 \
+      "https://github.com/linux-test-project/ltp/releases/download/${LTP_VERSION}/ltp-full-${LTP_VERSION}.tar.bz2" \
+ && tar -xjf /tmp/ltp-full-${LTP_VERSION}.tar.bz2 -C /tmp \
+ && cd /tmp/ltp-full-${LTP_VERSION} \
+ && ./configure --prefix=/opt/ltp \
+ && make -j"$(nproc)" -k \
+ && make install -k \
+ && test -x /opt/ltp/runltp \
+ && test -d /opt/ltp/runtest \
+ && rm -rf /tmp/ltp-full-${LTP_VERSION}* \
+ && echo "LTP ${LTP_VERSION} installed at /opt/ltp"
 
 # Rust proxy (rsproxy.cn) for rustup updates and cargo crate downloads
 ENV RUSTUP_DIST_SERVER="https://rsproxy.cn"
