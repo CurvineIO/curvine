@@ -18,8 +18,8 @@ use crate::session::FuseResponse;
 use bytes::Bytes;
 use curvine_client::unified::UnifiedWriter;
 use curvine_config::FuseConf;
-use curvine_error::FsError;
 use curvine_error::FsResult;
+use curvine_error::{ErrorKind, FsError};
 use curvine_fs_api::{Path, Writer};
 use curvine_io::DataSlice;
 use curvine_model::{FileAllocOpts, FileStatus, SetAttrOpts};
@@ -29,7 +29,7 @@ use curvine_runtime::sync::channel::{
     AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallReceiver, CallSender,
 };
 use curvine_runtime::sync::{AtomicCounter, AtomicLong, ErrorMonitor};
-use log::{error, warn};
+use log::{debug, error, warn};
 use std::sync::Arc;
 
 enum WriteTask {
@@ -99,7 +99,11 @@ impl FuseWriter {
                 Ok(_) => (),
 
                 Err(e) => {
-                    error!("fuse writer error: {}", e);
+                    if matches!(e.kind(), ErrorKind::FileNotFound) {
+                        debug!("fuse writer error: {}", e);
+                    } else {
+                        error!("fuse writer error: {}", e);
+                    }
                     monitor.set_error(e);
                 }
             }

@@ -15,8 +15,8 @@
 use crate::file::{FsContext, FsReaderBase, FsReaderParallel, ReadDetector};
 use crate::{FileChunk, FileSlice};
 use curvine_core_error::err_box;
-use curvine_error::FsError;
 use curvine_error::FsResult;
+use curvine_error::{ErrorKind, FsError};
 use curvine_fs_api::Path;
 use curvine_io::DataSlice;
 use curvine_model::FileBlocks;
@@ -25,7 +25,7 @@ use curvine_runtime::sync::channel::{
     AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender,
 };
 use curvine_runtime::sync::ErrorMonitor;
-use log::error;
+use log::{debug, error};
 use std::sync::Arc;
 use tokio::sync::mpsc::Permit;
 
@@ -78,7 +78,11 @@ impl BufferChannel {
             match res {
                 Ok(_) => {}
                 Err(e) => {
-                    error!("buffer read(parallel id {}) error: {:?}", parallel_id, e);
+                    if matches!(e.kind(), ErrorKind::FileNotFound) {
+                        debug!("buffer read(parallel id {}) error: {:?}", parallel_id, e);
+                    } else {
+                        error!("buffer read(parallel id {}) error: {:?}", parallel_id, e);
+                    }
                     monitor.set_error(e);
                 }
             }

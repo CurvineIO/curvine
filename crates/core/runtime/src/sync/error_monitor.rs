@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::sync::AtomicBool;
 use std::error::Error;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 // Used to set errors in asynchronous environments.
 pub struct ErrorMonitor<E: Error> {
-    has_error: AtomicBool,
-    error: Mutex<Option<E>>,
+    pub has_error: AtomicBool,
+    pub error: Mutex<Option<E>>,
 }
 
 impl<E: Error> ErrorMonitor<E> {
@@ -31,17 +31,24 @@ impl<E: Error> ErrorMonitor<E> {
     }
 
     pub fn has_error(&self) -> bool {
-        self.has_error.load(Ordering::SeqCst)
+        self.has_error.get()
     }
 
-    // If this error has been set, it will be returned directly.
+    pub fn error(&self) -> &Mutex<Option<E>> {
+        &self.error
+    }
+
+    // Keep the first error; later callers return without overwriting.
     pub fn set_error(&self, error: E) {
         if self.has_error() {
             return;
         }
         let mut e = self.error.lock().unwrap();
-        self.has_error.store(true, Ordering::SeqCst);
-        let _ = (*e).replace(error);
+        if e.is_some() {
+            return;
+        }
+        self.has_error.set(true);
+        *e = Some(error);
     }
 
     pub fn take_error(&self) -> Option<E> {
@@ -63,5 +70,67 @@ impl<E: Error> ErrorMonitor<E> {
 impl<E: Error> Default for ErrorMonitor<E> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fmt;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    use crate::sync::ErrorMonitor;
+
+    #[derive(Debug, PartialEq)]
+    struct TestError(&'static str);
+
+    impl fmt::Display for TestError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}", self.0)
+        }
+    }
+
+    impl std::error::Error for TestError {}
+
+    /// A later set_error must not overwrite the first stored error.
+    #[test]
+    fn first_error_wins() {
+        let monitor = ErrorMonitor::<TestError>::new();
+        monitor.set_error(TestError("first"));
+        monitor.set_error(TestError("second"));
+
+        assert!(monitor.has_error());
+        assert_eq!(monitor.take_error().as_ref().map(|e| e.0), Some("first"));
+        assert_eq!(monitor.take_error(), None);
+    }
+
+    /// Concurrent set_error callers race, but exactly one error is stored
+    /// and it is one of the attempted values (first-wins invariant).
+    #[test]
+    fn concurrent_set_error_stores_single_error() {
+        let monitor = Arc::new(ErrorMonitor::<TestError>::new());
+        let barrier = Arc::new(Barrier::new(2));
+
+        let m1 = monitor.clone();
+        let b1 = barrier.clone();
+        let t1 = thread::spawn(move || {
+            b1.wait();
+            m1.set_error(TestError("first"));
+        });
+
+        let b2 = barrier.clone();
+        let m2 = monitor.clone();
+        let t2 = thread::spawn(move || {
+            b2.wait();
+            m2.set_error(TestError("second"));
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        assert!(monitor.has_error());
+        let e = monitor.take_error();
+        let msg = e.as_ref().map(|e| e.0);
+        assert!(msg == Some("first") || msg == Some("second"));
     }
 }

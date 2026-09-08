@@ -20,7 +20,7 @@ use crate::message::{BoxMessage, Message, RefMessage};
 use curvine_io::{IOError, IOResult};
 use curvine_net::net::InetAddr;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -149,8 +149,8 @@ impl BufferClient {
                             e
                         );
                         if let Err(e) = cb.send(error) {
-                            info!(
-                                "Request({},{}) callback execute fail: {:?}",
+                            debug!(
+                                "Request({},{}) caller cancelled the request, drop send-failure notice: {:?}",
                                 req_id,
                                 client_state.conn_info(),
                                 e
@@ -218,8 +218,8 @@ impl BufferClient {
                 Some(cb) => {
                     // The callback notification failed, which may be because the caller has been destroyed, and the response_future only prints the log and the task does not end.
                     if let Err(e) = cb.send(Ok(msg)) {
-                        info!(
-                            "Request({},{}) callback execute fail: {:?}",
+                        debug!(
+                            "Request({},{}) caller cancelled the request, drop response: {:?}",
                             req_id,
                             client_state.conn_info(),
                             e
@@ -245,8 +245,8 @@ impl BufferClient {
         for (id, cb) in inflight {
             let error: IOResult<Message> = Err(err_msg.clone().into());
             if let Err(e) = cb.send(error) {
-                info!(
-                    "Request({},{}) callback execute fail: {:?}",
+                debug!(
+                    "Request({},{}) caller cancelled the request, drop connection-close notice: {:?}",
                     id,
                     client_state.conn_info(),
                     e
