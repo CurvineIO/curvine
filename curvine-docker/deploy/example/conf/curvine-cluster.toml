@@ -52,6 +52,13 @@ port = 9000
 enabled = false
 rpc_port = 8998
 web_port = 9004
+# KV storage backend. Supported values: "fdb" and "memory".
+# Use "fdb" for production deployments; "memory" is only intended for tests
+# and loses all metadata when the MDS process exits.
+kv_backend = "fdb"
+# Path to the FoundationDB cluster file (the same file `fdbcli -C <path>`
+# accepts). Required when kv_backend = "fdb".
+fdb_cluster_file = "/etc/foundationdb/fdb.cluster"
 log = { level = "info", log_dir = "./logs", file_name = "mds.log" }
 
 [journal]

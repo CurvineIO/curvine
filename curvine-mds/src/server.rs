@@ -1,4 +1,4 @@
-use curvine_config::ClusterConf;
+use curvine_config::{ClusterConf, KvBackendType};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_runtime::common::Logger;
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime, Runtime};
@@ -6,8 +6,11 @@ use log::info;
 use std::sync::Arc;
 use tokio::sync::watch;
 
+use crate::{FdbBackend, KvBackend, MemoryBackend};
+
 pub struct Mds {
     conf: ClusterConf,
+    backend: Arc<dyn KvBackend>,
     rt: Arc<Runtime>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
@@ -21,6 +24,13 @@ impl Mds {
         conf.mds.init()?;
         Logger::init(conf.mds.log.clone());
 
+        let backend: Arc<dyn KvBackend> = match conf.mds.kv_backend {
+            KvBackendType::Memory => Arc::new(MemoryBackend::new()),
+            KvBackendType::Fdb => Arc::new(
+                FdbBackend::open(&conf.mds.fdb_cluster_file, conf.mds.fdb_txn_timeout_ms)
+                    .map_err(|error| curvine_core_error::CommonError::from(error.to_string()))?,
+            ),
+        };
         let rt = Arc::new(AsyncRuntime::new(
             "mds",
             conf.mds.io_threads,
@@ -29,6 +39,7 @@ impl Mds {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Ok(Self {
             conf,
+            backend,
             rt,
             shutdown_tx,
             shutdown_rx,
@@ -39,8 +50,16 @@ impl Mds {
         &self.conf
     }
 
+    pub fn backend(&self) -> &Arc<dyn KvBackend> {
+        &self.backend
+    }
+
     pub async fn start(&mut self) -> CommonResult<()> {
-        info!("curvine-mds started: cluster_id={}", self.conf.cluster_id);
+        info!(
+            "curvine-mds started: cluster_id={}, backend={}",
+            self.conf.cluster_id,
+            self.backend.name()
+        );
         Ok(())
     }
 
@@ -92,6 +111,28 @@ impl Mds {
 mod tests {
     use super::*;
 
+    fn mds_with_backend(mut conf: ClusterConf, backend: Arc<dyn KvBackend>) -> CommonResult<Mds> {
+        if !conf.mds.enabled {
+            return err_box!("mds service is disabled; set mds.enabled=true to start it");
+        }
+        conf.mds.init()?;
+        Logger::init(conf.mds.log.clone());
+
+        let rt = Arc::new(AsyncRuntime::new(
+            "mds",
+            conf.mds.io_threads,
+            conf.mds.worker_threads,
+        ));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        Ok(Mds {
+            conf,
+            backend,
+            rt,
+            shutdown_tx,
+            shutdown_rx,
+        })
+    }
+
     #[test]
     fn refuses_to_start_when_disabled() {
         let conf = ClusterConf::default();
@@ -102,7 +143,10 @@ mod tests {
     fn starts_and_stops_with_explicit_shutdown() {
         let mut conf = ClusterConf::default();
         conf.mds.enabled = true;
-        let mut mds = Mds::with_conf(conf).unwrap();
+        // Use the memory backend so init() does not require an FDB connection
+        // string (this test exercises the lifecycle, not the backend).
+        conf.mds.kv_backend = KvBackendType::Memory;
+        let mut mds = mds_with_backend(conf, Arc::new(MemoryBackend::new())).unwrap();
         mds.shutdown();
 
         let rt = mds.rt.clone();
@@ -110,5 +154,15 @@ mod tests {
             mds.start().await.unwrap();
             mds.wait_for_shutdown().await.unwrap();
         });
+    }
+
+    #[test]
+    fn selects_memory_backend_from_config() {
+        let mut conf = ClusterConf::default();
+        conf.mds.enabled = true;
+        conf.mds.kv_backend = KvBackendType::Memory;
+
+        let mds = Mds::with_conf(conf).unwrap();
+        assert_eq!(mds.backend().name(), "memory");
     }
 }

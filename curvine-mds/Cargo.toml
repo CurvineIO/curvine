@@ -11,6 +11,7 @@ curvine-metrics = { workspace = true }
 curvine-runtime = { workspace = true }
 async-trait = { workspace = true }
 fastrand = { workspace = true }
+foundationdb = { workspace = true, features = ["fdb-7_3", "embedded-fdb-include"] }
 log = { workspace = true }
 once_cell = { workspace = true }
 thiserror = { workspace = true }

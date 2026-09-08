@@ -34,6 +34,12 @@ const LATENCY_BUCKETS_US: &[f64] = &[
     250_000.0,
 ];
 
+/// KV size buckets in bytes. Centred on the ~128B target single-KV budget so the
+/// P50/P95/P99 around it are visible, with headroom for oversized records.
+const KV_SIZE_BUCKETS_BYTES: &[f64] = &[
+    16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1_024.0, 2_048.0, 4_096.0, 16_384.0, 65_536.0,
+];
+
 /// Process-wide KV metric handles. Registered once on first access.
 pub struct KvMetrics {
     /// Total operations attempted, by backend + op.
@@ -50,6 +56,10 @@ pub struct KvMetrics {
     pub txn_retries_total: CounterVec,
     /// Currently in-flight transactions.
     pub txn_in_flight: Gauge,
+    /// Distribution of key sizes written to the backend, in bytes, by backend.
+    pub kv_key_size_bytes: HistogramVec,
+    /// Distribution of value sizes written to the backend, in bytes, by backend.
+    pub kv_value_size_bytes: HistogramVec,
 }
 
 impl KvMetrics {
@@ -90,6 +100,18 @@ impl KvMetrics {
                 "mds_kv_txn_in_flight",
                 "Currently in-flight KV transactions",
             )?,
+            kv_key_size_bytes: Metrics::new_histogram_vec_with_buckets(
+                "mds_kv_key_size_bytes",
+                "Distribution of KV key sizes in bytes",
+                &["backend"],
+                KV_SIZE_BUCKETS_BYTES,
+            )?,
+            kv_value_size_bytes: Metrics::new_histogram_vec_with_buckets(
+                "mds_kv_value_size_bytes",
+                "Distribution of KV value sizes in bytes",
+                &["backend"],
+                KV_SIZE_BUCKETS_BYTES,
+            )?,
         })
     }
 
@@ -115,6 +137,17 @@ impl KvMetrics {
     /// Records a retry of a transaction closure.
     pub fn record_retry(&self, backend: &str) {
         self.txn_retries_total.with_label_values(&[backend]).inc();
+    }
+
+    /// Records the byte size of a key/value pair buffered for write, so the
+    /// KV-size distribution (P50/P95/P99 vs the ~128B budget) is observable.
+    pub fn observe_kv_size(&self, backend: &str, key_len: usize, value_len: usize) {
+        self.kv_key_size_bytes
+            .with_label_values(&[backend])
+            .observe(key_len as f64);
+        self.kv_value_size_bytes
+            .with_label_values(&[backend])
+            .observe(value_len as f64);
     }
 }
 

@@ -9,11 +9,13 @@
 
 mod backend;
 mod error;
+mod fdb;
 mod memory;
 pub mod metrics;
 
 pub use backend::{run_txn, KvBackend, KvTransaction, DEFAULT_MAX_RETRIES};
 pub use error::{KvError, KvResult};
+pub use fdb::FdbBackend;
 pub use memory::{FaultInjector, MemoryBackend};
 
 #[cfg(test)]
