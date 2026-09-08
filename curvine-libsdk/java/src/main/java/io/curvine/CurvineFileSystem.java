@@ -509,6 +509,14 @@ public class CurvineFileSystem extends FileSystem {
         return new CurvineFsStat(info);
     }
 
+    /** Release Curvine metadata and blocks for a path and return the released totals. */
+    public FreeResult free(Path path, boolean recursive) throws IOException {
+        if (statistics != null) {
+            statistics.incrementWriteOps(1);
+        }
+        return libFs.free(formatPath(path), recursive);
+    }
+
     public Optional<MountInfoProto> getMountInfo(Path path) throws IOException {
         if (statistics != null) {
             statistics.incrementReadOps(1);

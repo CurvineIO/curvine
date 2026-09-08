@@ -154,8 +154,9 @@ JDK **8**, Maven **≥ 3.8.1**. From workspace root, **`make build`** (with **`j
 ### Transfer load routing
 
 When the cluster has Transfer enabled, configure the Java client with the same switch and the
-reachable Transfer service addresses. `CurvineLoadClient` then keeps its existing submit/status/
-cancel API while routing those requests to Transfer instead of the legacy Master Job API:
+reachable Transfer service addresses. `CurvineTransferClient` provides load/export submission,
+status, cancellation, retry, and wait operations while routing requests to Transfer instead of
+the legacy Master Job API:
 
 ```java
 Configuration conf = new Configuration();
@@ -163,14 +164,21 @@ conf.set("fs.cv.master_addrs", "master-0:8995,master-1:8995");
 conf.set("fs.cv.transfer.enabled", "true");
 conf.set("fs.cv.transfer.endpoints", "transfer-0:9010,transfer-1:9010");
 
-try (CurvineLoadClient client = CurvineLoadClient.from(conf)) {
+try (CurvineTransferClient client = CurvineTransferClient.from(conf)) {
     LoadJobResult job = client.submitLoad(LoadJobRequest.builder()
             .sourcePath("s3://bucket/model/v1")
             .targetPath("/bucket/model/v1")
             .build());
     LoadJobStatus status = client.getJobStatus(job.getJobId());
+    LoadJobResult export = client.submitExport(ExportJobRequest.builder()
+            .sourcePath("/bucket/model/v1")
+            .build());
 }
 ```
+
+`submitLoad(request, true)` implements the CLI `cv load --force` behavior. Export targets are
+derived from the existing mount mapping; export source paths must be Curvine paths. The existing
+`CurvineLoadClient` remains a compatibility facade for load-only callers.
 
 `fs.cv.transfer.endpoints` is a comma-separated list and is independent from Master addresses.
 It must point to the externally reachable Transfer service endpoint; the client does not infer it

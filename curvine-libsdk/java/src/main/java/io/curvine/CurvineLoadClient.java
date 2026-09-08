@@ -14,182 +14,60 @@
 
 package io.curvine;
 
-import io.curvine.exception.CurvineException;
-import io.curvine.proto.GetJobStatusResponse;
-import io.curvine.proto.SubmitJobResponse;
 import org.apache.hadoop.conf.Configuration;
 
 import java.io.Closeable;
 import java.io.IOException;
 import java.time.Duration;
-import java.util.Objects;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Independent Java client for Curvine load jobs.
+ * Compatibility facade for the load-only name of {@link CurvineTransferClient}.
  *
- * <p>Mirrors Rust libsdk {@code JobClient}: submit / get status / cancel, plus a
- * Java-side wait helper with explicit timeout and poll interval.
- *
- * <p>Backend routing follows cluster config {@code transfer.enabled}:
- * when {@code true}, requests go to the standalone Transfer service and responses
- * are mapped back to the existing {@link LoadJobResult} / {@link LoadJobStatus}
- * surface; when {@code false} (default), requests use the legacy Master LoadJob API.
- * For a Hadoop {@link Configuration}, set {@code fs.cv.transfer.enabled=true} and
- * {@code fs.cv.transfer.endpoints=transfer-0:9010,transfer-1:9010}. Transfer endpoints
- * are independent from Master addresses and must be reachable from the Java process.
- *
- * <p><b>Upgrade note:</b> the Java jar and bundled native lib must be upgraded together.
- * A newer native library may return job states (for example {@code PARTIAL_SUCCESS})
- * that an older jar cannot classify, which causes {@link #waitJobComplete} to poll
- * until timeout instead of returning promptly.
- *
- * <pre>{@code
- * try (CurvineLoadClient client = CurvineLoadClient.from(conf)) {
- *     LoadJobResult result = client.submitLoad(
- *             LoadJobRequest.builder()
- *                     .sourcePath("oss://bucket/path/file")
- *                     .targetPath("/mnt/path/file")
- *                     .overwrite(true)
- *                     .build());
- *     LoadJobStatus status = client.waitJobComplete(
- *             result.getJobId(), Duration.ofMinutes(10), Duration.ofSeconds(1));
- * }
- * }</pre>
- *
- * <p>Load remains UFS-to-Curvine and must stay inside an existing mount mapping;
- * this client does not implement arbitrary URI copy.
+ * <p>Backend routing follows {@code transfer.enabled}. With transfer routing enabled, this
+ * client uses the standalone Transfer service; otherwise it uses the legacy Master job API.
+ * Use {@link CurvineTransferClient} when export or retry operations are needed.
  */
 public final class CurvineLoadClient implements Closeable {
-    private static final long SUCCESS = 0;
+    private final CurvineTransferClient delegate;
 
-    private final long nativeHandle;
-    private final AtomicBoolean closed = new AtomicBoolean(false);
-
-    private CurvineLoadClient(long nativeHandle) {
-        this.nativeHandle = nativeHandle;
+    private CurvineLoadClient(CurvineTransferClient delegate) {
+        this.delegate = delegate;
     }
 
     public static CurvineLoadClient from(FilesystemConf conf) throws IOException {
-        Objects.requireNonNull(conf, "conf");
-        try {
-            long handle = CurvineNative.newFilesystem(conf.toToml());
-            if (handle < SUCCESS) {
-                throw CurvineException.create((int) handle, "failed to create CurvineLoadClient");
-            }
-            return new CurvineLoadClient(handle);
-        } catch (IllegalAccessException e) {
-            throw new IOException("failed to serialize FilesystemConf", e);
-        }
+        return new CurvineLoadClient(CurvineTransferClient.from(conf));
     }
 
     public static CurvineLoadClient from(Configuration conf) throws IOException {
-        try {
-            return from(new FilesystemConf(conf));
-        } catch (IllegalAccessException e) {
-            throw new IOException("failed to build FilesystemConf", e);
-        }
+        return new CurvineLoadClient(CurvineTransferClient.from(conf));
     }
 
     /**
      * Submit a load job. Equivalent to Rust {@code JobClient::submit_load_job}.
      */
     public LoadJobResult submitLoad(LoadJobRequest request) throws IOException {
-        ensureOpen();
-        Objects.requireNonNull(request, "request");
-        byte[] bytes;
-        if (request.getReplicas() == null) {
-            bytes = CurvineNative.submitLoadJob(
-                    nativeHandle,
-                    request.getSourcePath(),
-                    request.getTargetPath(),
-                    request.isOverwrite());
-        } else {
-            bytes = CurvineNative.submitLoadJobWithReplicas(
-                    nativeHandle,
-                    request.getSourcePath(),
-                    request.getTargetPath(),
-                    request.isOverwrite(),
-                    request.getReplicas());
-        }
-        checkBytes(bytes);
-        return LoadJobResult.fromProto(SubmitJobResponse.parseFrom(bytes));
+        return delegate.submitLoad(request);
     }
 
-    /**
-     * Query job status by id. Equivalent to Rust {@code JobClient::get_status}.
-     */
+    public LoadJobResult submitLoad(LoadJobRequest request, boolean force) throws IOException {
+        return delegate.submitLoad(request, force);
+    }
+
+    /** Query a load job by id. */
     public LoadJobStatus getJobStatus(String jobId) throws IOException {
-        ensureOpen();
-        requireJobId(jobId);
-        byte[] bytes = CurvineNative.getJobStatus(nativeHandle, jobId);
-        checkBytes(bytes);
-        return LoadJobStatus.fromProto(GetJobStatusResponse.parseFrom(bytes));
+        return delegate.getJobStatus(jobId);
     }
 
-    /**
-     * Cancel a job by id. Equivalent to Rust {@code JobClient::cancel}.
-     */
+    /** Cancel a load job by id. */
     public void cancelJob(String jobId) throws IOException {
-        ensureOpen();
-        requireJobId(jobId);
-        long errno = CurvineNative.cancelJob(nativeHandle, jobId);
-        if (errno < SUCCESS) {
-            throw CurvineException.create((int) errno, "cancelJob failed: " + jobId);
-        }
+        delegate.cancelJob(jobId);
     }
 
-    /**
-     * Poll job status until finished or timeout.
-     *
-     * <p>Returns the final status when the job reaches {@code COMPLETED} or
-     * {@code PARTIAL_SUCCESS}. {@code FAILED} and {@code CANCELED} throw
-     * {@link IOException}. Callers should check {@link LoadJobStatus#isPartialSuccess()}
-     * (or {@link LoadJobStatus#getState()}) to decide how to handle partial success.
-     *
-     * @param jobId        job id from {@link #submitLoad}
-     * @param timeout      max wait duration
-     * @param pollInterval sleep between status queries
-     * @return final status when the job reaches a terminal success / partial-success state
-     * @throws TimeoutException if the job is still running after {@code timeout}
-     * @throws IOException      if the job fails / is canceled, or RPC fails
-     */
+    /** Poll a load job until it reaches a terminal state or the timeout expires. */
     public LoadJobStatus waitJobComplete(String jobId, Duration timeout, Duration pollInterval)
             throws IOException, TimeoutException, InterruptedException {
-        ensureOpen();
-        requireJobId(jobId);
-        Objects.requireNonNull(timeout, "timeout");
-        Objects.requireNonNull(pollInterval, "pollInterval");
-        if (timeout.isNegative() || timeout.isZero()) {
-            throw new IllegalArgumentException("timeout must be positive");
-        }
-        if (pollInterval.isNegative() || pollInterval.isZero()) {
-            throw new IllegalArgumentException("pollInterval must be positive");
-        }
-
-        long deadlineNanos = saturatingDeadlineNanos(timeout);
-        LoadJobStatus status;
-        while (true) {
-            status = getJobStatus(jobId);
-            if (status.isFinished()) {
-                if (status.isSuccessful() || status.isPartialSuccess()) {
-                    return status;
-                }
-                throw new IOException(
-                        "load job " + jobId + " ended with state " + status.getState()
-                                + (status.getProgress() != null
-                                ? ": " + status.getProgress().getMessage()
-                                : ""));
-            }
-            long remainingNanos = deadlineNanos - System.nanoTime();
-            if (remainingNanos <= 0L) {
-                throw new TimeoutException(
-                        "load job " + jobId + " not complete after " + timeout
-                                + ", last state=" + status.getState());
-            }
-            sleepNanos(Math.min(pollInterval.toNanos(), remainingNanos));
-        }
+        return delegate.waitJobComplete(jobId, timeout, pollInterval);
     }
 
     /**
@@ -197,54 +75,21 @@ public final class CurvineLoadClient implements Closeable {
      */
     public LoadJobStatus waitJobComplete(String jobId, Duration timeout)
             throws IOException, TimeoutException, InterruptedException {
-        return waitJobComplete(jobId, timeout, Duration.ofSeconds(1));
+        return delegate.waitJobComplete(jobId, timeout);
     }
 
     @Override
     public void close() throws IOException {
-        if (!closed.compareAndSet(false, true)) {
-            return;
-        }
-        long errno = CurvineNative.closeFilesystem(nativeHandle);
-        if (errno < SUCCESS) {
-            throw CurvineException.create((int) errno, "close CurvineLoadClient failed");
-        }
-    }
-
-    private void ensureOpen() throws IOException {
-        if (closed.get()) {
-            throw new IOException("CurvineLoadClient is closed");
-        }
+        delegate.close();
     }
 
     /** Compute {@code nanoTime + timeout} without wrapping on overflow. */
     static long saturatingDeadlineNanos(Duration timeout) {
-        long now = System.nanoTime();
-        long timeoutNanos = timeout.toNanos();
-        try {
-            return Math.addExact(now, timeoutNanos);
-        } catch (ArithmeticException overflow) {
-            return Long.MAX_VALUE;
-        }
+        return CurvineTransferClient.saturatingDeadlineNanos(timeout);
     }
 
     /** Sleep at least 1ns to avoid busy-looping when the interval truncates to 0ms. */
     static void sleepNanos(long nanos) throws InterruptedException {
-        long sleepNanos = Math.max(1L, nanos);
-        long sleepMs = sleepNanos / 1_000_000L;
-        int nanoPart = (int) (sleepNanos % 1_000_000L);
-        Thread.sleep(sleepMs, nanoPart);
-    }
-
-    private static void requireJobId(String jobId) {
-        if (jobId == null || jobId.trim().isEmpty()) {
-            throw new IllegalArgumentException("jobId cannot be empty");
-        }
-    }
-
-    private static void checkBytes(byte[] bytes) throws IOException {
-        if (bytes == null) {
-            throw new CurvineException("native load job call returned null");
-        }
+        CurvineTransferClient.sleepNanos(nanos);
     }
 }

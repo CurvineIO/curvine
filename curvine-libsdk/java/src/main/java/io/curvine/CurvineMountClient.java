@@ -25,7 +25,6 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Explicit Java client for Curvine UFS mount lifecycle operations.
@@ -36,11 +35,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class CurvineMountClient implements Closeable {
     private static final long SUCCESS = 0;
 
-    private final long nativeHandle;
-    private final AtomicBoolean closed = new AtomicBoolean(false);
+    private final NativeFilesystemHandle filesystem;
 
     private CurvineMountClient(long nativeHandle) {
-        this.nativeHandle = nativeHandle;
+        this.filesystem = new NativeFilesystemHandle(nativeHandle);
     }
 
     public static CurvineMountClient from(FilesystemConf conf) throws IOException {
@@ -66,46 +64,50 @@ public final class CurvineMountClient implements Closeable {
 
     /** Create or update a UFS mount. */
     public void mount(MountRequest request) throws IOException {
-        ensureOpen();
         Objects.requireNonNull(request, "request");
-        long errno = CurvineNative.mount(
-                nativeHandle,
-                request.getUfsPath(),
-                request.getCvPath(),
-                request.getOptions().toByteArray());
-        checkError(errno, "mount failed: " + request.getCvPath());
+        filesystem.withOpen(nativeHandle -> {
+            long errno = CurvineNative.mount(
+                    nativeHandle,
+                    request.getUfsPath(),
+                    request.getCvPath(),
+                    request.getOptions().toByteArray());
+            checkError(errno, "mount failed: " + request.getCvPath());
+            return null;
+        });
     }
 
     /** Remove the UFS mount at {@code cvPath}. */
     public void unmount(String cvPath) throws IOException {
-        ensureOpen();
         String path = requirePath(cvPath, "cvPath");
-        long errno = CurvineNative.unmount(nativeHandle, path);
-        checkError(errno, "unmount failed: " + path);
+        filesystem.withOpen(nativeHandle -> {
+            long errno = CurvineNative.unmount(nativeHandle, path);
+            checkError(errno, "unmount failed: " + path);
+            return null;
+        });
     }
 
     /** Find the mount that contains either a Curvine or UFS path. */
     public Optional<MountInfoProto> getMountInfo(String path) throws IOException {
-        ensureOpen();
-        byte[] bytes = CurvineNative.getMountInfo(nativeHandle, requirePath(path, "path"));
-        checkBytes(bytes, "getMountInfo");
-        return parseMountInfo(bytes);
+        String checkedPath = requirePath(path, "path");
+        return filesystem.withOpen(nativeHandle -> {
+            byte[] bytes = CurvineNative.getMountInfo(nativeHandle, checkedPath);
+            checkBytes(bytes, "getMountInfo");
+            return parseMountInfo(bytes);
+        });
     }
 
     /** List every mount in the server's mount-table order. */
     public List<MountInfoProto> listMounts() throws IOException {
-        ensureOpen();
-        byte[] bytes = CurvineNative.getMountTable(nativeHandle);
-        checkBytes(bytes, "getMountTable");
-        return parseMountTable(bytes);
+        return filesystem.withOpen(nativeHandle -> {
+            byte[] bytes = CurvineNative.getMountTable(nativeHandle);
+            checkBytes(bytes, "getMountTable");
+            return parseMountTable(bytes);
+        });
     }
 
     @Override
     public void close() throws IOException {
-        if (!closed.compareAndSet(false, true)) {
-            return;
-        }
-        checkError(CurvineNative.closeFilesystem(nativeHandle), "close CurvineMountClient failed");
+        filesystem.close("close CurvineMountClient failed");
     }
 
     static Optional<MountInfoProto> parseMountInfo(byte[] bytes) throws IOException {
@@ -115,12 +117,6 @@ public final class CurvineMountClient implements Closeable {
 
     static List<MountInfoProto> parseMountTable(byte[] bytes) throws IOException {
         return GetMountTableResponse.parseFrom(bytes).getMountTableList();
-    }
-
-    private void ensureOpen() throws IOException {
-        if (closed.get()) {
-            throw new IOException("CurvineMountClient is closed");
-        }
     }
 
     private static void checkError(long errno, String message) throws IOException {

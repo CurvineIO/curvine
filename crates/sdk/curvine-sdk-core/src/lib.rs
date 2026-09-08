@@ -29,7 +29,9 @@ mod lib_fs_reader;
 pub use self::lib_fs_reader::LibFsReader;
 
 pub mod blocking_job {
-    pub use crate::core::job::{cancel_job, get_job_status, submit_load_job};
+    pub use crate::core::job::{
+        cancel_job, get_job_status, retry_job, submit_export_job, submit_load_job,
+    };
 }
 
 #[cfg(feature = "rust-sdk")]

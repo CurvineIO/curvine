@@ -366,6 +366,9 @@ public class CurvineNative {
 
     public static native long delete(long nativeHandle, String path, boolean recursive) throws IOException;
 
+    /** Release Curvine blocks and metadata for a path and return the released totals. */
+    public static native byte[] free(long nativeHandle, String path, boolean recursive) throws IOException;
+
     public static native byte[] getFilesystemInfo(long nativeHandle) throws IOException;
 
     /**
@@ -406,6 +409,10 @@ public class CurvineNative {
             long nativeHandle, String sourcePath, String targetPath, boolean overwrite)
             throws IOException;
 
+    /** Submit a Curvine-to-UFS export job. */
+    public static native byte[] submitExportJob(
+            long nativeHandle, String sourcePath, boolean overwrite) throws IOException;
+
     /**
      * Submit a load job with an explicit per-job target replica count.
      *
@@ -429,4 +436,7 @@ public class CurvineNative {
 
     /** Cancel a load job by job id. */
     public static native long cancelJob(long nativeHandle, String jobId) throws IOException;
+
+    /** Retry a failed, partial-success, or canceled transfer job. */
+    public static native String retryJob(long nativeHandle, String jobId) throws IOException;
 }

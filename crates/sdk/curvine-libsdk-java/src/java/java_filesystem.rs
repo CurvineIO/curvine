@@ -17,7 +17,7 @@ use crate::{FilesystemConf, LibFilesystem, LibFsReader, LibFsWriter};
 use curvine_core_error::{err_box, try_err};
 use curvine_error::{FsError, FsResult};
 use curvine_fs_api::proto::{
-    GetJobStatusResponse, GetMountTableResponse, LoadTaskStatusProto, MountOptionsProto,
+    FreeResponse, GetJobStatusResponse, GetMountTableResponse, LoadTaskStatusProto, MountOptionsProto,
     SetAttrOptsProto, SubmitJobResponse,
 };
 use curvine_fs_api::state::{DeleteResult, LoadJobCommand, LoadTaskStatus, SetAttrOpts};
@@ -158,6 +158,16 @@ impl JavaFilesystem {
         self.inner.delete(path, JavaUtils::jbool_to_bool(recursive))
     }
 
+    pub fn free(&self, env: &mut JNIEnv, path: JString, recursive: jboolean) -> FsResult<jarray> {
+        let path = JavaUtils::jstring_to_string(env, &path)?;
+        let result = self.inner.free(path, JavaUtils::jbool_to_bool(recursive))?;
+        let response = FreeResponse {
+            res: ProtoUtils::free_res_to_pb(result),
+        };
+        let bytes = ProtoUtils::encode(response)?;
+        Ok(JavaUtils::new_jarray(env, &bytes)?)
+    }
+
     pub fn get_filesystem_info(&self, env: &mut JNIEnv) -> FsResult<jarray> {
         let status = self.inner.get_filesystem_info()?;
         let byte_arr = JavaUtils::new_jarray(env, &status)?;
@@ -278,6 +288,26 @@ impl JavaFilesystem {
         Ok(byte_arr)
     }
 
+    /// Submit a Curvine-to-UFS export job. Mirrors Rust `JobClient::submit_export_job`.
+    pub fn submit_export_job(
+        &self,
+        env: &mut JNIEnv,
+        source_path: JString,
+        overwrite: jboolean,
+    ) -> FsResult<jarray> {
+        let source = JavaUtils::jstring_to_string(env, &source_path)?;
+        let command =
+            LoadJobCommand::builder(source).overwrite(JavaUtils::jbool_to_bool(overwrite));
+        let result = job::submit_export_job(self.inner.session(), command.build())?;
+        let response = SubmitJobResponse {
+            job_id: result.job_id,
+            target_path: result.target_path,
+            state: i32::from(result.state as i8),
+        };
+        let bytes = ProtoUtils::encode(response)?;
+        Ok(JavaUtils::new_jarray(env, &bytes)?)
+    }
+
     /// Query load job status by id. Mirrors Rust `JobClient::get_status`.
     /// Adapted for next: populate extended GetJobStatusResponse fields.
     pub fn get_job_status(&self, env: &mut JNIEnv, job_id: JString) -> FsResult<jarray> {
@@ -324,6 +354,12 @@ impl JavaFilesystem {
     pub fn cancel_job(&self, env: &mut JNIEnv, job_id: JString) -> FsResult<()> {
         let job_id = JavaUtils::jstring_to_string(env, &job_id)?;
         job::cancel_job(self.inner.session(), job_id)
+    }
+
+    pub fn retry_job(&self, env: &mut JNIEnv, job_id: JString) -> FsResult<jstring> {
+        let job_id = JavaUtils::jstring_to_string(env, &job_id)?;
+        let retry_job_id = job::retry_job(self.inner.session(), job_id)?;
+        JavaUtils::new_jstring(env, Some(retry_job_id)).map_err(|e| FsError::common(e.to_string()))
     }
 
     pub fn cleanup(&self) {

@@ -37,12 +37,20 @@ impl JobClient {
         transfer_compat::submit_load_job(&self.session, command).await
     }
 
+    pub async fn submit_export_job(&self, command: LoadJobCommand) -> FsResult<LoadJobResult> {
+        transfer_compat::submit_export_job(&self.session, command).await
+    }
+
     pub async fn get_status(&self, job_id: impl AsRef<str>) -> FsResult<JobStatus> {
         transfer_compat::get_job_status(&self.session, job_id).await
     }
 
     pub async fn cancel(&self, job_id: impl AsRef<str>) -> FsResult<()> {
         transfer_compat::cancel_job(&self.session, job_id).await
+    }
+
+    pub async fn retry(&self, job_id: impl AsRef<str>) -> FsResult<String> {
+        transfer_compat::retry_job(&self.session, job_id).await
     }
 
     pub async fn wait_complete(

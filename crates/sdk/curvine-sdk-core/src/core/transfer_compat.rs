@@ -161,9 +161,17 @@ pub(crate) fn job_status_from_transfer(status: GetTransferStatusResponse) -> Job
     }
 }
 
-async fn resolve_load_paths(
+fn infer_transfer_paths(input: Path, peer: Path, kind: TransferKind) -> (Path, Path) {
+    match kind {
+        TransferKind::Load if input.is_cv() => (peer, input),
+        TransferKind::Load | TransferKind::Export => (input, peer),
+    }
+}
+
+async fn resolve_transfer_paths(
     fs: &UnifiedFileSystem,
     command: &LoadJobCommand,
+    kind: TransferKind,
 ) -> FsResult<(String, String)> {
     let input = Path::from_str(&command.source_path)?;
     let (source, target) = if let Some(target_path) = &command.target_path {
@@ -173,34 +181,42 @@ async fn resolve_load_paths(
             Some(peer) => peer,
             None => return err_box!("{} is not mounted", command.source_path),
         };
-        if input.is_cv() {
-            (peer, input)
-        } else {
-            (input, peer)
-        }
+        infer_transfer_paths(input, peer, kind)
     };
-    if source.is_cv() || !target.is_cv() {
-        return err_box!(
-            "load requires a UFS source and Curvine target: {} -> {}",
-            source.full_path(),
-            target.full_path()
-        );
+    match kind {
+        TransferKind::Load if !source.is_cv() && target.is_cv() => {}
+        TransferKind::Export if source.is_cv() && !target.is_cv() => {}
+        TransferKind::Load => {
+            return err_box!(
+                "load requires a UFS source and Curvine target: {} -> {}",
+                source.full_path(),
+                target.full_path()
+            )
+        }
+        TransferKind::Export => {
+            return err_box!(
+                "export requires a Curvine source and UFS target: {} -> {}",
+                source.full_path(),
+                target.full_path()
+            )
+        }
     }
     Ok((source.clone_uri(), target.clone_uri()))
 }
 
 fn build_transfer_command(
+    kind: TransferKind,
     source_path: String,
     target_path: String,
     overwrite: bool,
     replicas: Option<i32>,
 ) -> TransferCommand {
     let mut command = TransferCommand {
-        kind: TransferKind::Load,
+        kind,
         source_path: source_path.clone(),
         target_path: target_path.clone(),
         client_request_id: TransferCommand::default_client_request_id_with_overwrite_and_replicas(
-            TransferKind::Load,
+            kind,
             &source_path,
             &target_path,
             overwrite,
@@ -234,9 +250,43 @@ pub(crate) async fn submit_load_job(
     validate_transfer_load_command(&command)?;
     let overwrite = command.overwrite.unwrap_or(true);
     let replicas = command.replicas;
-    let (source_path, target_path) = resolve_load_paths(session.unified(), &command).await?;
-    let transfer_command =
-        build_transfer_command(source_path, target_path.clone(), overwrite, replicas);
+    let (source_path, target_path) =
+        resolve_transfer_paths(session.unified(), &command, TransferKind::Load).await?;
+    let transfer_command = build_transfer_command(
+        TransferKind::Load,
+        source_path,
+        target_path.clone(),
+        overwrite,
+        replicas,
+    );
+    let response = transfer_client(session)?.submit(transfer_command).await?;
+    Ok(load_job_result_from_submit(&response, target_path))
+}
+
+pub(crate) async fn submit_export_job(
+    session: &Session,
+    command: LoadJobCommand,
+) -> FsResult<LoadJobResult> {
+    if !transfer_enabled(session) {
+        return JobMasterClient::new(session.fs_client())
+            .submit_export_job(command)
+            .await;
+    }
+
+    validate_transfer_load_command(&command)?;
+    if command.target_path.is_some() {
+        return err_box!("export does not support an explicit target path");
+    }
+    let overwrite = command.overwrite.unwrap_or(true);
+    let (source_path, target_path) =
+        resolve_transfer_paths(session.unified(), &command, TransferKind::Export).await?;
+    let transfer_command = build_transfer_command(
+        TransferKind::Export,
+        source_path,
+        target_path.clone(),
+        overwrite,
+        None,
+    );
     let response = transfer_client(session)?.submit(transfer_command).await?;
     Ok(load_job_result_from_submit(&response, target_path))
 }
@@ -262,6 +312,13 @@ pub(crate) async fn cancel_job(session: &Session, job_id: impl AsRef<str>) -> Fs
     }
     let _ = transfer_client(session)?.cancel(job_id, None).await?;
     Ok(())
+}
+
+pub(crate) async fn retry_job(session: &Session, job_id: impl AsRef<str>) -> FsResult<String> {
+    if !transfer_enabled(session) {
+        return err_box!("retry requires transfer.enabled=true");
+    }
+    Ok(transfer_client(session)?.retry(job_id).await?.job_id)
 }
 
 pub(crate) async fn wait_job_complete(
@@ -417,11 +474,33 @@ mod tests {
             .overwrite(false)
             .build();
         assert!(validate_transfer_load_command(&command).is_ok());
+
+        let command = LoadJobCommand::builder("/mnt/a").build();
+        assert!(validate_transfer_load_command(&command).is_ok());
+    }
+
+    #[test]
+    fn infers_export_paths_without_reversing_the_cv_source() {
+        let cv_path = Path::from_str("/models/v1").unwrap();
+        let ufs_path = Path::from_str("s3://bucket/models/v1").unwrap();
+
+        let (load_source, load_target) =
+            infer_transfer_paths(cv_path.clone(), ufs_path.clone(), TransferKind::Load);
+        assert_eq!(load_source.clone_uri(), ufs_path.clone_uri());
+        assert_eq!(load_target.clone_uri(), cv_path.clone_uri());
+
+        let (export_source, export_target) =
+            infer_transfer_paths(cv_path.clone(), ufs_path.clone(), TransferKind::Export);
+        assert!(export_source.is_cv());
+        assert!(!export_target.is_cv());
+        assert_eq!(export_source.clone_uri(), cv_path.clone_uri());
+        assert_eq!(export_target.clone_uri(), ufs_path.clone_uri());
     }
 
     #[test]
     fn transfer_load_command_carries_requested_replicas() {
         let command = build_transfer_command(
+            TransferKind::Load,
             "s3://bucket/a".to_string(),
             "/mnt/a".to_string(),
             true,

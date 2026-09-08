@@ -28,6 +28,12 @@ pub fn submit_load_job(session: &Session, command: LoadJobCommand) -> FsResult<L
         .block_on(async { transfer_compat::submit_load_job(session, command).await })
 }
 
+pub fn submit_export_job(session: &Session, command: LoadJobCommand) -> FsResult<LoadJobResult> {
+    session
+        .runtime()
+        .block_on(async { transfer_compat::submit_export_job(session, command).await })
+}
+
 pub fn get_job_status(session: &Session, job_id: impl AsRef<str>) -> FsResult<JobStatus> {
     session
         .runtime()
@@ -38,6 +44,12 @@ pub fn cancel_job(session: &Session, job_id: impl AsRef<str>) -> FsResult<()> {
     session
         .runtime()
         .block_on(async { transfer_compat::cancel_job(session, job_id).await })
+}
+
+pub fn retry_job(session: &Session, job_id: impl AsRef<str>) -> FsResult<String> {
+    session
+        .runtime()
+        .block_on(async { transfer_compat::retry_job(session, job_id).await })
 }
 
 pub fn wait_job_complete(
