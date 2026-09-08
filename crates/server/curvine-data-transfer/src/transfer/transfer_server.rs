@@ -115,14 +115,17 @@ impl TransferServer {
             ),
         });
         let store_backend = store.backend_label();
-        let report_endpoints = if conf.transfer.endpoints.is_empty() {
-            vec![format!(
-                "{}:{}",
-                conf.transfer.hostname, conf.transfer.rpc_port
-            )]
-        } else {
-            conf.transfer.endpoints.clone()
-        };
+        // TransferConf::init always materializes endpoints (explicit config or
+        // hostname:rpc_port). These are advertised to workers as progress report
+        // targets — never substitute a fresh localhost default here.
+        let report_endpoints = conf.transfer.endpoints.clone();
+        if report_endpoints.is_empty() {
+            return Err(FsError::common(
+                "transfer.endpoints is empty after config init; set transfer.hostname / \
+                 transfer.endpoints to a worker-reachable host:port",
+            )
+            .into());
+        }
         info!(
             "configured curvine-transfer store_backend={} rpc_addr={}:{} web_addr={}:{} report_endpoints={:?} max_running={} max_tasks={} task_stale_timeout_ms={}",
             store_backend,

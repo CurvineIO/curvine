@@ -190,6 +190,13 @@ subnqn = "nqn.2024-01.io.curvine:subsystem2"
 # sslrootcert for a PostgreSQL server signed by a private CA:
 # store_url = "postgresql://user:password@postgres-host:5432/curvine_transfer?sslmode=require"
 # store_url = "postgresql://user:password@postgres-host:5432/curvine_transfer?sslmode=require&sslrootcert=/etc/curvine/postgres-ca.pem"
+#
+# Multi-node / hostNetwork workers: do NOT leave hostname/endpoints on localhost.
+# Transfer advertises endpoints to workers as progress report targets. With
+# mysql/postgres store_url, loopback advertise addresses are rejected at startup.
+# hostname = "curvine-transfer-0"
+# endpoints = ["curvine-transfer-0:9010", "curvine-transfer-1:9010"]
+# Or export CURVINE_TRANSFER_HOSTNAME / set hostname=0.0.0.0 with reachable endpoints.
 enabled = false
 rpc_port = 9010
 web_port = 9011

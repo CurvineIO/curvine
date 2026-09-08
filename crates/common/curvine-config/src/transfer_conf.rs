@@ -276,7 +276,69 @@ impl TransferConf {
                 "production transfer forbids transfer.allow_submit_with_stale_snapshot=true",
             ));
         }
+        self.validate_report_endpoints_for_workers()?;
         Ok(())
+    }
+
+    /// Shared mysql/postgres Transfer serves remote workers. Advertising
+    /// loopback (`localhost` / `127.0.0.1` / `::1` / `0.0.0.0`) makes hostNetwork
+    /// or cross-node workers report progress to themselves and fail-fast the job.
+    fn validate_report_endpoints_for_workers(&self) -> FsResult<()> {
+        let loopback_endpoints: Vec<&String> = self
+            .endpoints
+            .iter()
+            .filter(|endpoint| Self::endpoint_is_loopback(endpoint))
+            .collect();
+        if !loopback_endpoints.is_empty() {
+            return Err(FsError::common(format!(
+                "transfer.endpoints must not advertise loopback addresses {:?} to workers; \
+                 set transfer.hostname / transfer.endpoints or CURVINE_TRANSFER_HOSTNAME to a \
+                 worker-reachable host:port (for example the Transfer Service DNS name)",
+                loopback_endpoints
+                    .iter()
+                    .map(|endpoint| endpoint.as_str())
+                    .collect::<Vec<_>>()
+            )));
+        }
+
+        // hostname also controls the RPC bind address. Loopback bind is unreachable
+        // from remote workers even when endpoints look correct; allow 0.0.0.0 so
+        // operators can listen on all interfaces while advertising a real endpoint.
+        if Self::is_loopback_hostname(&self.hostname) {
+            return Err(FsError::common(format!(
+                "transfer.hostname='{}' is loopback and cannot be reached by remote workers; \
+                 set transfer.hostname / CURVINE_TRANSFER_HOSTNAME to a worker-reachable host, \
+                 or bind with hostname=0.0.0.0 and set transfer.endpoints to reachable host:port values",
+                self.hostname
+            )));
+        }
+        Ok(())
+    }
+
+    fn endpoint_is_loopback(endpoint: &str) -> bool {
+        let host = match endpoint.rsplit_once(':') {
+            Some((host, port)) if !host.is_empty() && !port.is_empty() && !port.contains(':') => {
+                host
+            }
+            // IPv6 literals like [::1]:9010
+            _ if endpoint.starts_with('[') => match endpoint.find(']') {
+                Some(end) => &endpoint[1..end],
+                None => endpoint,
+            },
+            _ => endpoint,
+        };
+        Self::is_loopback_hostname(host) || host == "0.0.0.0"
+    }
+
+    fn is_loopback_hostname(hostname: &str) -> bool {
+        let host = hostname
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        matches!(
+            host.to_ascii_lowercase().as_str(),
+            "localhost" | "127.0.0.1" | "::1"
+        )
     }
 
     pub fn max_executing_transfers(&self) -> u64 {
@@ -500,6 +562,7 @@ mod tests {
         let mut conf: TransferConf = toml::from_str(
             r#"
                 enabled = true
+                hostname = "transfer-01.example"
                 store_url = "mysql://root:curvine@127.0.0.1:3306/curvine_transfer"
             "#,
         )
@@ -511,6 +574,62 @@ mod tests {
         assert_eq!(
             conf.store_url,
             "mysql://root:curvine@127.0.0.1:3306/curvine_transfer"
+        );
+        assert_eq!(conf.endpoints, vec!["transfer-01.example:9010"]);
+    }
+
+    #[test]
+    fn production_store_rejects_loopback_report_endpoints() {
+        let mut conf = TransferConf {
+            enabled: true,
+            store_url: "mysql://root:curvine@db.example:3306/curvine_transfer".to_string(),
+            ..Default::default()
+        };
+
+        let err = conf.init().unwrap_err().to_string();
+        assert!(
+            err.contains("must not advertise loopback"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn production_store_rejects_loopback_hostname_even_with_explicit_endpoints() {
+        let mut conf = TransferConf {
+            enabled: true,
+            hostname: "localhost".to_string(),
+            endpoints: vec!["transfer-01.example:9010".to_string()],
+            store_url: "mysql://root:curvine@db.example:3306/curvine_transfer".to_string(),
+            ..Default::default()
+        };
+
+        let err = conf.init().unwrap_err().to_string();
+        assert!(
+            err.contains("transfer.hostname='localhost' is loopback"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn production_store_allows_bind_all_with_reachable_endpoints() {
+        let mut conf = TransferConf {
+            enabled: true,
+            hostname: "0.0.0.0".to_string(),
+            endpoints: vec![
+                "transfer-01.example:9010".to_string(),
+                "transfer-02.example:9010".to_string(),
+            ],
+            store_url: "postgresql://transfer:secret@db.example:5432/curvine_transfer".to_string(),
+            ..Default::default()
+        };
+
+        conf.init().unwrap();
+        assert_eq!(
+            conf.endpoints,
+            vec![
+                "transfer-01.example:9010".to_string(),
+                "transfer-02.example:9010".to_string(),
+            ]
         );
     }
 

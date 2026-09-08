@@ -22,6 +22,7 @@ fn postgres_store_urls_select_the_postgres_backend() {
     ] {
         let mut conf = TransferConf {
             enabled: true,
+            hostname: "transfer-01.example".to_string(),
             store_url: store_url.to_string(),
             ..Default::default()
         };
