@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# FoundationDB KV backend. Off by default (like the SPDK features): it pulls
+# in the libfdb_c link-time dependency and the bindgen build-time dependency.
+# Enable explicitly with `--features fdb` / `--fdb` when the MDS must run
+# against a real FoundationDB cluster.
+default = []
+fdb = ["dep:foundationdb"]
+
 [dependencies]
 curvine-config = { workspace = true }
 curvine-core-error = { workspace = true }
@@ -11,7 +19,7 @@ curvine-metrics = { workspace = true }
 curvine-runtime = { workspace = true }
 async-trait = { workspace = true }
 fastrand = { workspace = true }
-foundationdb = { workspace = true, features = ["fdb-7_3", "embedded-fdb-include"] }
+foundationdb = { workspace = true, optional = true, features = ["fdb-7_3", "embedded-fdb-include"] }
 log = { workspace = true }
 once_cell = { workspace = true }
 thiserror = { workspace = true }

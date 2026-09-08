@@ -500,15 +500,18 @@ async fn memory_apply_then_unknown_does_not_flip_successful_cas() {
 
 // ===== fdb backend bindings =====
 //
-// Gated behind the `CURVINE_MDS_FDB_CLUSTER` env var. Point it at a cluster
+// Gated behind the `fdb` cargo feature (off by default; enable with
+// --features fdb) and the
+// `CURVINE_MDS_FDB_CLUSTER` env var. Point it at a cluster
 // file (the same one `fdbcli -C <file>` accepts). Runs the identical contract
 // suite against real FoundationDB, e.g.:
 //
 //   CURVINE_MDS_FDB_CLUSTER=/path/to/fdb.cluster \
-//     cargo test -p curvine-mds fdb_backend_satisfies_contract
+//     cargo test -p curvine-mds --features fdb fdb_backend_satisfies_contract
 //
 // A unique per-run key prefix isolates this run's keyspace on the shared
 // cluster, so leftover keys from earlier runs never fail a fresh assertion.
+#[cfg(feature = "fdb")]
 #[tokio::test]
 async fn fdb_backend_satisfies_contract() {
     use crate::kv::fdb::FdbBackend;
@@ -546,6 +549,7 @@ async fn fdb_backend_satisfies_contract() {
 //
 // Needs no real cluster (it boots the FDB network and targets a dead address),
 // so it runs wherever libfdb_c links; it is not gated on CURVINE_MDS_FDB_CLUSTER.
+#[cfg(feature = "fdb")]
 #[tokio::test]
 async fn fdb_unreachable_cluster_does_not_hang() {
     use crate::kv::fdb::FdbBackend;

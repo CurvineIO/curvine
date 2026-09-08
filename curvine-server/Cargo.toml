@@ -7,7 +7,11 @@ license.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
+# fdb is off by default (like the SPDK features). Enable it with
+# --features fdb / --fdb to build the FoundationDB KV backend; the MDS then
+# rejects `kv_backend = "fdb"` at startup when compiled without it.
 default = []
+fdb = ["curvine-mds/fdb"]
 jni = ["curvine-data-transfer/opendal-hdfs"]
 spdk = [
     "curvine-worker/spdk",
@@ -38,7 +42,7 @@ curvine-alloc = { workspace = true }
 curvine-model = { workspace = true }
 curvine-runtime = { workspace = true }
 curvine-master = { workspace = true }
-curvine-mds = { workspace = true }
+curvine-mds = { workspace = true, default-features = false }
 curvine-worker = { workspace = true }
 curvine-error = { workspace = true, features = ["axum-response"] }
 curvine-fault = { workspace = true }
