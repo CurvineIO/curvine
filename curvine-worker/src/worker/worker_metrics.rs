@@ -16,7 +16,6 @@ use crate::worker::block::BlockStore;
 use crate::worker::storage::Dataset;
 use curvine_core_error::CommonResult;
 use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics, Metrics as m};
-use curvine_sys::SysUtils;
 use std::fmt::{Debug, Formatter};
 
 pub struct WorkerMetrics {
@@ -49,8 +48,6 @@ pub struct WorkerMetrics {
     pub(crate) disk_free_ratio: GaugeVec,
     /// Writes rejected because storage admission reported insufficient capacity.
     pub(crate) disk_full_rejected_writes: Counter,
-
-    pub(crate) used_memory_bytes: Gauge,
 }
 
 impl WorkerMetrics {
@@ -109,8 +106,6 @@ impl WorkerMetrics {
                 "disk_full_rejected_writes",
                 "Writes rejected because the storage layer reported insufficient capacity",
             )?,
-
-            used_memory_bytes: m::new_gauge("used_memory_bytes", "Total memory used")?,
         };
 
         Ok(wm)
@@ -127,7 +122,6 @@ impl WorkerMetrics {
             .set(state.num_blocks_to_delete() as i64);
 
         self.storage_failed.set(state.failed_storage_count() as i64);
-        self.used_memory_bytes.set(SysUtils::used_memory() as i64);
 
         self.store_total_disks.set(state.storage_count() as i64);
 

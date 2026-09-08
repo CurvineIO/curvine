@@ -21,7 +21,6 @@ use curvine_core_error::CommonResult;
 use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics, Metrics as m};
 use curvine_model::MetricValue;
 use curvine_runtime::sync::FastDashMap;
-use curvine_sys::SysUtils;
 use log::{debug, info, warn};
 use std::fmt::{Debug, Formatter};
 
@@ -48,7 +47,6 @@ pub struct MasterMetrics {
     pub(crate) journal_applied: Gauge,
     pub(crate) journal_ufs_applied: Gauge,
 
-    pub(crate) used_memory_bytes: Gauge,
     pub(crate) rocksdb_metrics: GaugeVec,
 
     pub(crate) inode_dir_num: Gauge,
@@ -142,7 +140,6 @@ impl MasterMetrics {
                 "Last UFS-applied index of the journal state machine",
             )?,
 
-            used_memory_bytes: m::new_gauge("used_memory_bytes", "Total memory used")?,
             rocksdb_metrics: m::new_gauge_vec("rocksdb_metrics", "RocksDB metrics", &["tag"])?,
 
             inode_dir_num: m::new_gauge("inode_dir_num", "Total dir")?,
@@ -235,7 +232,6 @@ impl MasterMetrics {
             .set(filesystem_info.allocatable_capacity);
         self.allocatable_available
             .set(filesystem_info.allocatable_available);
-        self.used_memory_bytes.set(SysUtils::used_memory() as i64);
 
         if filesystem_info.block_num > 0 {
             let avg_size = filesystem_info.fs_used / filesystem_info.block_num;
