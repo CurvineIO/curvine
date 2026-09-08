@@ -39,6 +39,9 @@ pub struct VfsDir {
     pub(crate) storage_type: StorageType,
     pub(crate) conf_capacity: i64,
     pub(crate) reserved_bytes: i64,
+    /// Free-space ratio floor for write admission. `0.0` disables. See
+    /// `available()` guard and `raw_free_ratio()`.
+    pub(crate) free_ratio: f64,
     pub(crate) final_bytes: AtomicLong,
     pub(crate) tmp_bytes: AtomicLong,
     pub(crate) state: Arc<DirState>,
@@ -50,6 +53,7 @@ impl VfsDir {
         version: StorageVersion,
         conf: WorkerDataDir,
         reserved_bytes: u64,
+        free_ratio: f64,
     ) -> CommonResult<Self> {
         let stg_dir = if version.cluster_id.is_empty() {
             conf.path.clone()
@@ -133,6 +137,7 @@ impl VfsDir {
             storage_type: conf.storage_type,
             conf_capacity: conf.capacity as i64,
             reserved_bytes: reserved_bytes as i64,
+            free_ratio,
             final_bytes: AtomicLong::new(0),
             tmp_bytes: AtomicLong::new(0),
             state: Arc::new(state),
@@ -145,12 +150,12 @@ impl VfsDir {
     pub fn from_str<T: AsRef<str>>(id: T, conf: T) -> CommonResult<Self> {
         let dir = WorkerDataDir::from_str(conf.as_ref())?;
         let version = StorageVersion::with_cluster(id);
-        Self::new(version, dir, 0)
+        Self::new(version, dir, 0, 0.0)
     }
 
     pub fn from_dir<T: AsRef<str>>(id: T, dir: WorkerDataDir) -> CommonResult<Self> {
         let version = StorageVersion::with_cluster(id);
-        Self::new(version, dir, 0)
+        Self::new(version, dir, 0, 0.0)
     }
 
     pub fn id(&self) -> u32 {
@@ -162,42 +167,97 @@ impl VfsDir {
     }
 
     pub fn capacity(&self) -> i64 {
-        // SPDK: use bdev capacity (fs returns 0 for non-existent path)
-        if self.storage_type == StorageType::SpdkDisk {
-            let bdev_cap = self.state.bdev_capacity;
-            return if self.conf_capacity <= 0 {
-                bdev_cap
-            } else {
-                self.conf_capacity.min(bdev_cap)
-            };
-        }
-
-        let disk_space = self.stats.total_space() as i64;
-
-        if self.conf_capacity <= 0 {
-            disk_space
+        // SPDK: use bdev capacity (fs returns 0 for non-existent path).
+        let physical_capacity = if self.storage_type == StorageType::SpdkDisk {
+            self.state.bdev_capacity
         } else {
-            self.conf_capacity.min(disk_space)
+            self.stats.total_space() as i64
+        };
+        self.capacity_from_physical(physical_capacity)
+    }
+
+    fn capacity_from_physical(&self, physical_capacity: i64) -> i64 {
+        if self.conf_capacity <= 0 {
+            physical_capacity
+        } else {
+            self.conf_capacity.min(physical_capacity)
         }
     }
 
     pub fn available(&self) -> i64 {
-        // SPDK: available = capacity - used - reserved (fs returns 0)
+        // `free_ratio` is a strict Curvine write-admission floor: report only
+        // bytes that may be reserved without knowingly crossing the protected
+        // physical-space boundary. `0.0` disables the floor.
+        //
+        // The filesystem path samples total/available only once per call. Its
+        // raw physical headroom also subtracts current temporary reservations,
+        // because those bytes may not have reached statvfs yet; this prevents
+        // concurrent opens from reusing the same headroom. Once temporary data
+        // is materialized this is conservative (it can double-count it until
+        // finalize/abort), which intentionally favors protection over write
+        // availability.
         if self.storage_type == StorageType::SpdkDisk {
             let capacity = self.capacity();
-            let fs_used = self.fs_used();
-            let reserved_bytes = self.reserved_bytes;
-            return 0.max(capacity - fs_used - reserved_bytes);
+            let free = capacity.saturating_sub(self.fs_used()).max(0);
+            let accounting_available = free.saturating_sub(self.reserved_bytes);
+            let floor_available = free.saturating_sub(self.free_ratio_floor(capacity));
+            return accounting_available.min(floor_available).max(0);
         }
 
+        let disk_total = self.stats.total_space() as i64;
         let disk_available = self.stats.available_space() as i64;
+        let capacity = self.capacity_from_physical(disk_total);
+        let accounting_available = capacity
+            .saturating_sub(self.fs_used())
+            .saturating_sub(self.reserved_bytes);
+        let floor_available = if self.free_ratio > 0.0 {
+            disk_available
+                .saturating_sub(self.free_ratio_floor(disk_total))
+                .saturating_sub(self.tmp_bytes.get())
+        } else {
+            disk_available
+        };
 
-        let capacity = self.capacity();
-        let fs_used = self.fs_used();
-        let reserved_bytes = self.reserved_bytes;
-        let calculated_available = capacity - fs_used - reserved_bytes;
+        accounting_available.min(floor_available).max(0)
+    }
 
-        0.max(calculated_available.min(disk_available))
+    fn free_ratio_floor(&self, total: i64) -> i64 {
+        if total <= 0 || self.free_ratio <= 0.0 || !self.free_ratio.is_finite() {
+            return 0;
+        }
+
+        ((total as f64 * self.free_ratio.min(1.0)).ceil() as i64).min(total)
+    }
+
+    fn calculate_free_ratio(free: i64, total: i64) -> f64 {
+        if total <= 0 {
+            return 0.0;
+        }
+
+        (free.max(0) as f64 / total as f64).min(1.0)
+    }
+
+    /// Raw free-space ratio of the underlying device, ignoring `reserved_bytes`
+    /// and the `free_ratio` guard. This is what the guard compares against and
+    /// what the `disk_free_ratio` metric reports.
+    ///
+    /// - Filesystem dirs: `available_space / total_space` (OS statvfs; reflects
+    ///   other applications consuming the shared device).
+    /// - SPDK raw-device dirs: `(capacity - used) / capacity`, where `capacity`
+    ///   is `min(conf_capacity, bdev_capacity)` and `used` is curvine's own
+    ///   `fs_used()` accounting.
+    pub fn raw_free_ratio(&self) -> f64 {
+        if self.storage_type == StorageType::SpdkDisk {
+            // No OS statvfs; ratio = (bdev capacity - curvine used) / bdev capacity.
+            let total = self.capacity();
+            let free = total.saturating_sub(self.fs_used());
+            Self::calculate_free_ratio(free, total)
+        } else {
+            // OS statvfs: reflects other applications consuming the shared device.
+            let total = self.stats.total_space() as i64;
+            let free = self.stats.available_space() as i64;
+            Self::calculate_free_ratio(free, total)
+        }
     }
 
     pub fn non_fs_used(&self) -> i64 {
@@ -385,6 +445,7 @@ mod test {
             storage_type: StorageType::SpdkDisk,
             conf_capacity: conf,
             reserved_bytes: 0,
+            free_ratio: 0.0,
             final_bytes: AtomicLong::new(0),
             tmp_bytes: AtomicLong::new(0),
             state: st,
@@ -407,6 +468,7 @@ mod test {
             storage_type: StorageType::Ssd,
             conf_capacity: 1 << 30,
             reserved_bytes: 0,
+            free_ratio: 0.0,
             final_bytes: AtomicLong::new(0),
             tmp_bytes: AtomicLong::new(0),
             state: st,
@@ -422,7 +484,7 @@ mod test {
         let stg_dir = conf.storage_path("vfs-test");
         FileUtils::delete_path(stg_dir, true)?;
 
-        let dir = VfsDir::new(version, conf, 0)?;
+        let dir = VfsDir::new(version, conf, 0, 0.0)?;
         println!("dir.path_str() = {}", dir.path_str());
         assert_eq!(dir.available(), 100 * ByteUnit::MB as i64);
 

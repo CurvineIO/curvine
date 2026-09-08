@@ -17,13 +17,34 @@ use crate::worker::handler::WriteContext;
 use crate::worker::storage::BlockWriteContext;
 use crate::worker::{Worker, WorkerMetrics};
 use curvine_core_error::{err_box, ternary, try_option_mut, CommonResult};
-use curvine_error::FsResult;
+use curvine_error::{FsError, FsResult};
 use curvine_model::{ExtendedBlock, FileAllocMode};
 use curvine_proto::{BlockWriteResponse, DataHeaderProto};
 use curvine_rpc::message::{Builder, Message, RequestStatus};
 use curvine_runtime::common::{ByteUnit, TimeSpent};
 use log::{info, warn};
 use std::mem;
+
+/// Returns true if `e` is a "no storage space" admission rejection from the
+/// worker storage layer. `CommonError` is a type-erased `Box<dyn Error>` whose
+/// payload is a formatted string (see `curvine_core_error::err_box!`), so we
+/// match on the stable substrings emitted by `VfsDataset`/`DirList`/
+/// `RobinChoosingPolicy`:
+///   - "Not enough space in storage dir ..." (VfsDataset / DirList)
+///   - "Not enough {:?} storage capacity for ... bytes" (RobinChoosingPolicy)
+pub(crate) fn is_no_storage_space(e: &curvine_core_error::CommonError) -> bool {
+    let msg = e.to_string();
+    msg.contains("Not enough space")
+        || (msg.contains("Not enough") && msg.contains("storage capacity"))
+}
+
+fn map_storage_open_error(e: curvine_core_error::CommonError) -> FsError {
+    if is_no_storage_space(&e) {
+        FsError::disk_out_of_space(e.to_string())
+    } else {
+        e.into()
+    }
+}
 
 pub struct WriteHandler {
     pub(crate) store: BlockStore,
@@ -101,7 +122,18 @@ impl WriteHandler {
             ..context.block.clone()
         };
 
-        let meta = self.store.open_block(&open_block)?;
+        let meta = match self.store.open_block(&open_block) {
+            Ok(m) => m,
+            Err(e) => {
+                // `CommonError` is a type-erased string error (see
+                // curvine_core_error::err_box!), so match on the stable
+                // rejection messages emitted by the storage layer.
+                if is_no_storage_space(&e) {
+                    self.metrics.disk_full_rejected_writes.inc();
+                }
+                return Err(map_storage_open_error(e));
+            }
+        };
         let mut file = match self.store.open_writer(&meta, context.off) {
             Ok(file) => file,
             Err(e) => {
@@ -318,5 +350,33 @@ impl WriteHandler {
 
             _ => err_box!("Unsupported request type"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_storage_open_error;
+    use curvine_error::FsError;
+
+    #[test]
+    fn storage_capacity_rejection_maps_to_disk_out_of_space() {
+        let error = curvine_core_error::err_msg!(
+            "Not enough space in storage dir 1 for block 2 rewrite: need 20, available 10"
+        );
+
+        assert!(matches!(
+            map_storage_open_error(error.into()),
+            FsError::DiskOutOfSpace(_)
+        ));
+    }
+
+    #[test]
+    fn unrelated_storage_error_remains_common() {
+        let error = curvine_core_error::err_msg!("failed to open staging file");
+
+        assert!(matches!(
+            map_storage_open_error(error.into()),
+            FsError::Common(_)
+        ));
     }
 }

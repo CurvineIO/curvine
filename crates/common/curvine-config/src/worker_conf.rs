@@ -126,6 +126,27 @@ pub struct WorkerConf {
 
     pub dir_reserved: String,
 
+    /// Strict physical free-space floor for Curvine write admission. The worker
+    /// reports only allocatable bytes above this floor, so both new blocks and
+    /// FileLayout rewrite staging copies are rejected if their full reservation
+    /// would cross it. Existing committed data remains intact and readable when
+    /// a rewrite is rejected. `0.0` disables the floor (default). Range
+    /// `[0.0, 1.0)`. Example: `0.1` protects 10% of the underlying device.
+    ///
+    /// This favors shared-device safety over write availability: an existing
+    /// file on a low-space worker can become temporarily non-writable. Rewrites
+    /// are not exempt because FileLayout keeps the committed copy and a staging
+    /// copy concurrently, and an expanding rewrite reserves the full target
+    /// block size rather than only the growth delta. Allowing such rewrites to
+    /// bypass the floor could consume space reserved for other applications.
+    ///
+    /// Unlike `dir_reserved` (a fixed byte reservation), this scales with disk
+    /// size and reacts to other applications consuming the shared device. Both
+    /// filesystem-backed and SPDK raw-device directories apply it. The floor is
+    /// enforced against Curvine admissions; another application can still
+    /// consume space after the worker samples the device.
+    pub free_ratio: f64,
+
     pub data_dir: Vec<String>,
 
     pub io_slow_threshold: String,
@@ -197,6 +218,7 @@ impl Default for WorkerConf {
             rpc_port: ClusterConf::DEFAULT_WORKER_PORT,
             web_port: ClusterConf::DEFAULT_WORKER_WEB_PORT,
             dir_reserved: "0".to_string(),
+            free_ratio: 0.0,
             data_dir: vec![],
             io_slow_threshold: "300ms".to_string(),
             io_threads: 32,
@@ -228,12 +250,39 @@ impl Default for WorkerConf {
 
 #[cfg(test)]
 mod tests {
-    use super::WorkerDataDir;
+    use super::{WorkerConf, WorkerDataDir};
 
     #[test]
     fn from_str_trims_path_and_prefix() {
         let dir = WorkerDataDir::from_str("  [SSD:100MB] /data/curvine  ").unwrap();
         assert!(dir.path_str().ends_with("/data/curvine"));
         assert_eq!(dir.capacity, 100 * 1024 * 1024);
+    }
+
+    #[test]
+    fn free_ratio_defaults_to_zero() {
+        assert_eq!(WorkerConf::default().free_ratio, 0.0);
+    }
+
+    #[test]
+    fn free_ratio_parses_from_toml() {
+        let toml = r#"
+dir_reserved = "0"
+free_ratio = 0.1
+data_dir = ["[SSD]/data/data1"]
+"#;
+        let conf: WorkerConf = toml::from_str(toml).unwrap();
+        assert_eq!(conf.free_ratio, 0.1);
+    }
+
+    #[test]
+    fn free_ratio_absent_defaults_to_zero() {
+        // Backward compat: old configs without free_ratio must still parse.
+        let toml = r#"
+dir_reserved = "10GB"
+data_dir = ["[SSD]/data/data1"]
+"#;
+        let conf: WorkerConf = toml::from_str(toml).unwrap();
+        assert_eq!(conf.free_ratio, 0.0);
     }
 }
