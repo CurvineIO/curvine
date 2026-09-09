@@ -26,9 +26,9 @@ use curvine_rpc::client::{ClientConf as RpcConf, ClientFactory, SyncClient};
 use curvine_rpc::ServerConf;
 use curvine_runtime::common::{LogConf, Utils};
 use log::info;
-use nix::ifaddrs::getifaddrs;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
+use std::net::IpAddr;
 use std::time::Duration;
 
 // Cluster configuration files.
@@ -385,26 +385,19 @@ impl ClusterConf {
         Ok(toml::to_string_pretty(self)?)
     }
 
-    /// Resolve the local IPv4 address bound to the named network interface
-    /// (e.g. `eth0`).
+    /// Resolve the local IPv4 address bound to the named network interface.
     ///
-    /// Enumerates the host's interface addresses via `getifaddrs(3)` and returns
-    /// the first IPv4 address whose interface name matches `interface`. Returns
-    /// an error if the interface does not exist or has no IPv4 address assigned
-    /// (an IPv6-only interface yields no match).
+    /// Returns the first IPv4 address of the named interface (`eth0`-style name on Unix,
+    /// adapter friendly name on Windows), or an error if it has none.
     pub fn interface_ipv4<T: AsRef<str>>(interface: T) -> CommonResult<String> {
         let interface = interface.as_ref();
-        let addrs = try_err!(getifaddrs());
+        let addrs = try_err!(if_addrs::get_if_addrs());
         for ifaddr in addrs {
-            if ifaddr.interface_name != interface {
+            if ifaddr.name != interface {
                 continue;
             }
-            // Only entries carrying an address are relevant; an interface can
-            // also surface broadcast/netmask-only rows we must skip.
-            if let Some(address) = ifaddr.address {
-                if let Some(sin) = address.as_sockaddr_in() {
-                    return Ok(sin.ip().to_string());
-                }
+            if let IpAddr::V4(v4) = ifaddr.ip() {
+                return Ok(v4.to_string());
             }
         }
         err_box!("no IPv4 address found on network interface '{}'", interface)
@@ -486,16 +479,23 @@ mod tests {
         assert_eq!(conf.cluster_id, "curvine");
     }
 
-    // The loopback interface is present on every supported host and always
-    // carries 127.0.0.1, so it is a stable target for the happy path.
+    // Discover the loopback interface by its 127.0.0.1 address instead of
+    // hard-coding `lo`: on Windows if-addrs reports the adapter friendly name
+    // (locale-dependent), so the interface name differs across platforms.
+    fn loopback_name() -> String {
+        if_addrs::get_if_addrs()
+            .expect("failed to enumerate network interfaces")
+            .into_iter()
+            .find(|ifaddr| ifaddr.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+            .expect("a loopback interface carrying 127.0.0.1 must exist")
+            .name
+    }
+
     #[test]
     fn interface_ipv4_resolves_loopback() {
-        #[cfg(target_os = "macos")]
-        let loopback = "lo0";
-        #[cfg(not(target_os = "macos"))]
-        let loopback = "lo";
+        let loopback = loopback_name();
 
-        let ip = ClusterConf::interface_ipv4(loopback)
+        let ip = ClusterConf::interface_ipv4(&loopback)
             .expect("loopback interface must resolve to an IPv4 address");
         assert_eq!(ip, "127.0.0.1");
     }
@@ -759,10 +759,7 @@ mod tests {
     // file-configured hostnames.
     #[test]
     fn from_resolves_all_hostnames_via_net_interface() {
-        #[cfg(target_os = "macos")]
-        let loopback = "lo0";
-        #[cfg(not(target_os = "macos"))]
-        let loopback = "lo";
+        let loopback = loopback_name();
 
         let path = std::env::temp_dir().join(format!(
             "curvine-full-nic-{}-{}.toml",
@@ -805,10 +802,7 @@ mod tests {
 
     #[test]
     fn transfer_net_interface_keeps_master_address() {
-        #[cfg(target_os = "macos")]
-        let loopback = "lo0";
-        #[cfg(not(target_os = "macos"))]
-        let loopback = "lo";
+        let loopback = loopback_name();
 
         // Transfer-scoped env layer resolves only client/transfer hostnames
         // from the NIC; master/journal entries keep their file values, so the
