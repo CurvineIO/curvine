@@ -4264,7 +4264,7 @@ version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3bae14dba30b8dcc4905a9189ebb18bc9db9744ef0ad8f2b94ef00d21e176964"
 dependencies = [
- "bindgen 0.69.5",
+ "bindgen 0.70.1",
  "libc",
 ]
 
@@ -6957,7 +6957,6 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
- "memoffset",
 ]
 
 [[package]]
