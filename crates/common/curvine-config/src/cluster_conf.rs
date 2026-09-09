@@ -26,9 +26,9 @@ use curvine_rpc::client::{ClientConf as RpcConf, ClientFactory, SyncClient};
 use curvine_rpc::ServerConf;
 use curvine_runtime::common::{LogConf, Utils};
 use log::info;
-use nix::ifaddrs::getifaddrs;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
+use std::net::IpAddr;
 use std::time::Duration;
 
 // Cluster configuration files.
@@ -386,25 +386,22 @@ impl ClusterConf {
     }
 
     /// Resolve the local IPv4 address bound to the named network interface
-    /// (e.g. `eth0`).
+    /// (e.g. `eth0` on Unix, the adapter friendly name on Windows).
     ///
-    /// Enumerates the host's interface addresses via `getifaddrs(3)` and returns
-    /// the first IPv4 address whose interface name matches `interface`. Returns
-    /// an error if the interface does not exist or has no IPv4 address assigned
-    /// (an IPv6-only interface yields no match).
+    /// Enumerates the host's interface addresses (via `getifaddrs(3)` on Unix,
+    /// `GetAdaptersAddresses` on Windows) and returns the first IPv4 address
+    /// whose interface name matches `interface`. Returns an error if the
+    /// interface does not exist or has no IPv4 address assigned (an IPv6-only
+    /// interface yields no match).
     pub fn interface_ipv4<T: AsRef<str>>(interface: T) -> CommonResult<String> {
         let interface = interface.as_ref();
-        let addrs = try_err!(getifaddrs());
+        let addrs = try_err!(if_addrs::get_if_addrs());
         for ifaddr in addrs {
-            if ifaddr.interface_name != interface {
+            if ifaddr.name != interface {
                 continue;
             }
-            // Only entries carrying an address are relevant; an interface can
-            // also surface broadcast/netmask-only rows we must skip.
-            if let Some(address) = ifaddr.address {
-                if let Some(sin) = address.as_sockaddr_in() {
-                    return Ok(sin.ip().to_string());
-                }
+            if let IpAddr::V4(v4) = ifaddr.ip() {
+                return Ok(v4.to_string());
             }
         }
         err_box!("no IPv4 address found on network interface '{}'", interface)
