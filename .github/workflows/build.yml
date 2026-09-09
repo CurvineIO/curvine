@@ -14,6 +14,9 @@ env:
   CARGO_TERM_COLOR: always
   # Tune build parallelism: 4 uses more CPU on standard 4-vCPU runner; set to 2 if OOM
   CARGO_BUILD_JOBS: 4
+  CVTEST_REPO: CurvineIO/cvtest
+  CVTEST_REF: 5d7ea3052e7a812289d1a8e57aeddda0cb7af425
+  MOUNT_PATH: /curvine-fuse
 
 jobs:
   # Speed note: slowness is from runner CPU/RAM (standard = 4 vCPU, ~16GB), not container size.
@@ -37,9 +40,12 @@ jobs:
   build:
     runs-on: ubuntu-latest
     needs: cleanup
-    # curvine-tests image extends curvine-compile:rocky9 and pre-installs Flask, werkzeug, pip, jq, fio (see curvine-tests/Dockerfile)
+    timeout-minutes: 90
+    # curvine-tests extends curvine-compile:rocky9 and includes the build tools,
+    # FUSE userspace packages, and pinned LTP used by the PR POSIX smoke test.
     container:
       image: ghcr.io/curvineio/curvine-tests:rocky9
+      options: --privileged --device /dev/fuse
     
     steps:
       - uses: actions/checkout@v4
@@ -125,6 +131,88 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           make check-minimal-artifact-deps
 
+      - name: Checkout cvtest for POSIX smoke
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CVTEST_REPO }}
+          ref: ${{ env.CVTEST_REF }}
+          path: cvtest
+
+      - name: Assemble POSIX smoke distribution from existing build
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          test -x target/debug/curvine-server
+          test -x target/debug/curvine-fuse
+          test -x /opt/ltp/runltp
+
+          rm -rf build/dist
+          mkdir -p build/dist/bin build/dist/conf build/dist/lib
+          cp -a build/bin/. build/dist/bin/
+          cp -a etc/. build/dist/conf/
+          install -m 0755 target/debug/curvine-server build/dist/lib/curvine-server
+          install -m 0755 target/debug/curvine-fuse build/dist/lib/curvine-fuse
+          chmod +x build/dist/bin/*
+
+      - name: Start cluster and mount FUSE for POSIX smoke
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          mkdir -p "$MOUNT_PATH"
+          cd build/dist
+          ./bin/curvine-master.sh restart
+          sleep 5
+          ./bin/curvine-worker.sh restart
+          sleep 5
+          ./bin/curvine-fuse.sh restart -d
+          python3 - <<'EOF'
+          import os, time, sys
+          p = os.path.join(os.environ["MOUNT_PATH"], ".ci-ready")
+          payload = b"ci" * 8192
+          deadline = time.time() + 120
+          while time.time() < deadline:
+              try:
+                  with open(p, "wb") as f:
+                      f.write(payload)
+                  with open(p, "rb") as f:
+                      assert f.read() == payload
+                  os.unlink(p)
+                  sys.exit(0)
+              except OSError:
+                  time.sleep(2)
+          print("data path not ready after 120s", file=sys.stderr)
+          sys.exit(1)
+          EOF
+
+      - name: Run focused POSIX smoke
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          mkdir -p ltp-results
+
+          suite="$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' \
+            cvtest/suites/ci-fast.txt)"
+          if [ "$suite" != "ltp:posix-cv-smoke" ]; then
+            echo "Expected ci-fast.txt to contain only ltp:posix-cv-smoke, found:" >&2
+            printf '%s\n' "$suite" >&2
+            exit 1
+          fi
+
+          ./cvtest/cvtest run --suite "$suite" --mount "$MOUNT_PATH" \
+            --json "$GITHUB_WORKSPACE/ltp-results/ltp-posix-cv-smoke.json" \
+            --log "$GITHUB_WORKSPACE/ltp-results/ltp-posix-cv-smoke.log"
+
+      - name: Print LTP diagnostics
+        if: ${{ failure() && github.event_name == 'pull_request' }}
+        run: |
+          for log_file in build/dist/logs/*.out ltp-results/*.log; do
+            if [ -f "$log_file" ]; then
+              echo "===== ${log_file} ====="
+              tail -n 200 "$log_file"
+            fi
+          done
+
       # - name: Run unit tests (skip UFS-dependent tests in CI)
       #   env:
       #     NEXTEST_CI_NO_UFS: "1"
@@ -141,6 +229,7 @@ jobs:
         # On failure, summary is written to GitHub Step Summary; step exits non-zero so pipeline fails.
 
       - name: Final cleanup before cache save
+        if: always()
         run: |
           echo "Final cleanup before cache save"
           
