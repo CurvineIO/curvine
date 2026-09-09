@@ -486,9 +486,7 @@ mod tests {
         if_addrs::get_if_addrs()
             .expect("failed to enumerate network interfaces")
             .into_iter()
-            .find(|ifaddr| {
-                ifaddr.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-            })
+            .find(|ifaddr| ifaddr.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
             .expect("a loopback interface carrying 127.0.0.1 must exist")
             .name
     }
