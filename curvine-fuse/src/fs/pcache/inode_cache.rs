@@ -31,18 +31,6 @@ pub struct PageState {
     pages: BTreeMap<u64, Page>,
 }
 
-#[derive(Default)]
-struct FlushState {
-    all_ver: u64,
-    synced_writer_ver: u64,
-}
-
-impl FlushState {
-    fn refresh_ver(&self, read_ver: u64) -> Option<u64> {
-        (read_ver < self.synced_writer_ver).then_some(self.synced_writer_ver)
-    }
-}
-
 impl Default for PageState {
     fn default() -> Self {
         Self::new()
@@ -165,7 +153,9 @@ pub struct InodeCache {
     pub writer: AsyncMutex<Option<Arc<FuseWriter>>>,
     pub error: ErrorMonitor<FuseError>,
     writer_ver: AtomicCounter,
-    flush_gate: AsyncMutex<FlushState>,
+    flush_gate: AsyncMutex<()>,
+    all_ver: AtomicCounter,
+    synced_writer_ver: AtomicCounter,
     len: AtomicCounter,
     deleted: AtomicBool,
 }
@@ -189,7 +179,9 @@ impl InodeCache {
             writer: AsyncMutex::new(None),
             error: ErrorMonitor::new(),
             writer_ver: AtomicCounter::new(0),
-            flush_gate: AsyncMutex::new(FlushState::default()),
+            flush_gate: AsyncMutex::new(()),
+            all_ver: AtomicCounter::new(0),
+            synced_writer_ver: AtomicCounter::new(0),
             len: AtomicCounter::new(file_len),
             deleted: AtomicBool::new(false),
         }
@@ -433,15 +425,17 @@ impl InodeCache {
         res
     }
 
-    async fn publish_writer(
-        writer: &Arc<FuseWriter>,
-        flush_state: &mut FlushState,
-    ) -> FuseResult<()> {
+    fn refresh_ver(&self, read_ver: u64) -> Option<u64> {
+        let synced = self.synced_writer_ver.get();
+        (read_ver < synced).then_some(synced)
+    }
+
+    async fn publish_writer(&self, writer: &Arc<FuseWriter>) -> FuseResult<()> {
         if let Some(target_ver) = writer
-            .publish_dirty_read_snapshot(flush_state.synced_writer_ver)
+            .publish_dirty_read_snapshot(self.synced_writer_ver.get())
             .await?
         {
-            flush_state.synced_writer_ver = target_ver;
+            self.synced_writer_ver.set(target_ver);
         }
         Ok(())
     }
@@ -450,13 +444,11 @@ impl InodeCache {
         self: &Arc<InodeCache>,
         sync: bool,
     ) -> FuseResult<(Arc<FuseWriter>, u64)> {
-        let mut flush_state = self.flush_gate.lock().await;
+        let _gate = self.flush_gate.lock().await;
         let pages = self.take_dirty_pages()?;
-        // The snapshot publish below is the single backend flush; do not
-        // double-flush here on the sync path.
-        let (writer, total) = self.flush_inner(pages, false).await?;
+        let (writer, total) = self.flush_inner(pages, sync).await?;
         if sync {
-            Self::publish_writer(&writer, &mut flush_state).await?;
+            self.publish_writer(&writer).await?;
         }
         Ok((writer, total))
     }
@@ -469,26 +461,30 @@ impl InodeCache {
     ) -> FuseResult<Option<u64>> {
         self.check_error()?;
 
-        let spent = TimeSpent::new();
-        let mut flush_state = self.flush_gate.lock().await;
         let target = self.writer_ver.get();
-        if target <= flush_state.all_ver {
-            return Ok(flush_state.refresh_ver(read_ver));
+        if target <= self.all_ver.get() {
+            return Ok(self.refresh_ver(read_ver));
+        }
+
+        let spent = TimeSpent::new();
+        let _gate = self.flush_gate.lock().await;
+        if target <= self.all_ver.get() {
+            return Ok(self.refresh_ver(read_ver));
         }
 
         let pages = self.take_dirty_pages_range(off, len)?;
         if pages.is_empty() {
             let writer = self.writer.lock().await.clone();
             if let Some(writer) = writer {
-                Self::publish_writer(&writer, &mut flush_state).await?;
+                self.publish_writer(&writer).await?;
             }
-            return Ok(flush_state.refresh_ver(read_ver));
+            return Ok(self.refresh_ver(read_ver));
         }
 
-        // publish_writer issues the backend flush covering the writes just
-        // enqueued; a direct writer.flush here would flush the backend twice.
+        // publish_writer flushes everything enqueued below; a direct
+        // writer.flush here would flush the backend twice.
         let (writer, len) = self.flush_inner(pages, false).await?;
-        Self::publish_writer(&writer, &mut flush_state).await?;
+        self.publish_writer(&writer).await?;
 
         FuseMetrics::with(|m| {
             m.write_back_io_us
@@ -500,7 +496,7 @@ impl InodeCache {
                 .inc_by(len as i64);
         });
 
-        Ok(flush_state.refresh_ver(read_ver))
+        Ok(self.refresh_ver(read_ver))
     }
 
     pub fn len(&self) -> u64 {
@@ -554,23 +550,23 @@ impl InodeCache {
     }
 
     async fn flush_all(self: &Arc<Self>) -> FuseResult<(Arc<FuseWriter>, u64)> {
-        let mut flush_state = self.flush_gate.lock().await;
+        let _gate = self.flush_gate.lock().await;
         let target = self.writer_ver.get();
 
-        let writer = if target > flush_state.all_ver {
+        let writer = if target > self.all_ver.get() {
             let pages = self.take_all_dirty_pages()?;
             // publish_writer flushes everything enqueued below; a direct
             // writer.flush here would flush the backend twice.
             let (writer, _) = self.flush_inner(pages, false).await?;
 
-            Self::publish_writer(&writer, &mut flush_state).await?;
-            flush_state.all_ver = target;
+            self.publish_writer(&writer).await?;
+            self.all_ver.set(target);
             writer
         } else {
             self.get_writer().await?
         };
 
-        Ok((writer, flush_state.all_ver))
+        Ok((writer, self.all_ver.get()))
     }
 
     pub async fn flush(self: &Arc<Self>) -> FuseResult<()> {
@@ -866,15 +862,26 @@ mod tests {
     }
 
     #[test]
-    fn flush_state_only_refreshes_older_readers() {
-        let state = FlushState {
-            all_ver: 3,
-            synced_writer_ver: 7,
-        };
+    fn refresh_ver_only_refreshes_older_readers() {
+        let cache = test_cache(&test_conf(4096));
+        cache.synced_writer_ver.set(7);
 
-        assert_eq!(state.refresh_ver(6), Some(7));
-        assert_eq!(state.refresh_ver(7), None);
-        assert_eq!(state.refresh_ver(8), None);
+        assert_eq!(cache.refresh_ver(6), Some(7));
+        assert_eq!(cache.refresh_ver(7), None);
+        assert_eq!(cache.refresh_ver(8), None);
+    }
+
+    #[tokio::test]
+    async fn publish_read_range_fast_path_when_all_flushed() {
+        let cache = test_cache(&test_conf(4096));
+
+        cache.writer_ver.set(5);
+        cache.all_ver.set(5);
+        cache.synced_writer_ver.set(5);
+
+        assert_eq!(cache.publish_read_range(0, 4096, 5).await.unwrap(), None);
+        assert_eq!(cache.publish_read_range(0, 4096, 3).await.unwrap(), Some(5));
+        assert_eq!(cache.publish_read_range(0, 4096, 9).await.unwrap(), None);
     }
 
     fn injected_error() -> FuseError {

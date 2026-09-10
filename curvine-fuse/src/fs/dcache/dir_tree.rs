@@ -629,9 +629,10 @@ impl DirTree {
             return;
         };
 
+        // Keep the Dirty lifecycle on touch: resetting it to Cached would
+        // drop the inode from write-back candidates before the worker flush.
         if matches!(inode.lifecycle, Lifecycle::Dirty) {
             inode.last_access = LocalTime::mills();
-            inode.lifecycle = Lifecycle::Cached;
         }
     }
 

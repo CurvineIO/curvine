@@ -88,6 +88,7 @@ impl WriteBackWork {
             }
         }
 
+        cache.free_pages(false);
         flushed
     }
 

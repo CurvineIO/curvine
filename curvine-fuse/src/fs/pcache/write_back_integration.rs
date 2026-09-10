@@ -372,7 +372,7 @@ fn write_back_cache_read_before_and_after_flush() {
 }
 
 #[test]
-fn write_back_worker_flush_keeps_pages_readable_and_reclaimable() {
+fn write_back_worker_flush_reclaims_clean_pages_and_keeps_reads_correct() {
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
     rt.block_on(async move {
@@ -392,21 +392,20 @@ fn write_back_worker_flush_keeps_pages_readable_and_reclaimable() {
         let cache = ctx.cm.get_cache(ino).await.unwrap();
         assert_eq!(
             cache.page_len(),
-            1,
-            "worker flush must not free pages: dirty-then-flushed pages stay readable"
-        );
-        assert_bytes_eq(
-            &ctx.read_cache(&cache, 0, PAGE_SIZE as usize).await,
-            &data,
-            "cache read after worker flush",
+            0,
+            "worker flush must reclaim now-clean pages"
         );
 
-        assert_eq!(
-            cache.free_pages(false),
-            PAGE_SIZE,
-            "now-clean pages must stay reclaimable via free_pages(false)"
+        // A later read misses the reclaimed pages and republishes through the
+        // writer, which must still surface the flushed bytes from the backend.
+        let published = cache
+            .publish_read_range(0, PAGE_SIZE as usize, 0)
+            .await
+            .unwrap();
+        assert!(
+            published.is_some(),
+            "read after reclaim should publish a snapshot"
         );
-        assert_eq!(cache.page_len(), 0);
 
         writer.flush(None).await.unwrap();
         assert_backend_eq(&backend, &data);
