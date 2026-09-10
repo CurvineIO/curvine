@@ -89,18 +89,23 @@ impl CacheHandle {
             }
         }
 
-        let flush_ver = self.cache.ensure_flushed().await?;
         let mut lock = self.reader.lock().await;
         let read_ver = self.read_ver.get();
+        let published_ver = self
+            .cache
+            .publish_read_range(op.arg.offset, op.arg.size as usize, read_ver)
+            .await?;
         let reader = match lock.as_mut() {
-            Some(r) if read_ver >= flush_ver => r,
+            Some(r) if published_ver.is_none() => r,
 
             _ => {
                 state.invalidate_file_blocks(self.ino);
 
                 let path = state.get_path(self.ino)?;
                 let reader = state.open_reader(Some(self.ino), &path).await?;
-                self.read_ver.set(flush_ver);
+                if let Some(snapshot_ver) = published_ver {
+                    self.read_ver.set(snapshot_ver);
+                }
                 lock.insert(reader)
             }
         };

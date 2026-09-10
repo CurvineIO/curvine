@@ -372,6 +372,88 @@ fn write_back_cache_read_before_and_after_flush() {
 }
 
 #[test]
+fn write_back_worker_flush_keeps_pages_readable_and_reclaimable() {
+    let rt = Arc::new(AsyncRuntime::single());
+    let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
+    rt.block_on(async move {
+        let handle = ctx.create_file("worker_flush.bin").await;
+        let ino = handle.ino();
+        let (writer, backend) = ctx.inject_backend(ino, "backend_worker_flush.bin").await;
+
+        let data = pattern_data(PAGE_SIZE as usize);
+        ctx.write_via_fuse(&handle, 0, &data).await;
+
+        let flushed = WriteBackWork::execute(&ctx.cm, ino, 0).await;
+        assert_eq!(
+            flushed, PAGE_SIZE,
+            "worker flush should report the full page"
+        );
+
+        let cache = ctx.cm.get_cache(ino).await.unwrap();
+        assert_eq!(
+            cache.page_len(),
+            1,
+            "worker flush must not free pages: dirty-then-flushed pages stay readable"
+        );
+        assert_bytes_eq(
+            &ctx.read_cache(&cache, 0, PAGE_SIZE as usize).await,
+            &data,
+            "cache read after worker flush",
+        );
+
+        assert_eq!(
+            cache.free_pages(false),
+            PAGE_SIZE,
+            "now-clean pages must stay reclaimable via free_pages(false)"
+        );
+        assert_eq!(cache.page_len(), 0);
+
+        writer.flush(None).await.unwrap();
+        assert_backend_eq(&backend, &data);
+    });
+}
+
+#[test]
+fn write_back_dirty_read_range_snapshot_tracks_backend_versions() {
+    let rt = Arc::new(AsyncRuntime::single());
+    let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
+    rt.block_on(async move {
+        let handle = ctx.create_file("flush_range.bin").await;
+        let (_writer, backend) = ctx
+            .inject_backend(handle.ino(), "backend_flush_range.bin")
+            .await;
+
+        ctx.write_via_fuse(&handle, 0, b"head").await;
+        ctx.write_via_fuse(&handle, PAGE_SIZE, b"tail").await;
+
+        let cache = ctx.cm.get_cache(handle.ino()).await.unwrap();
+        let first_ver = cache
+            .publish_read_range(0, 4, 0)
+            .await
+            .unwrap()
+            .expect("first range flush should publish");
+
+        let unchanged_ver = cache.publish_read_range(0, 4, first_ver).await.unwrap();
+        assert_eq!(unchanged_ver, None);
+
+        let second_ver = cache
+            .publish_read_range(PAGE_SIZE, 4, first_ver)
+            .await
+            .unwrap()
+            .expect("second range flush should publish");
+
+        cache.flush().await.unwrap();
+        let after_global_ver = cache.publish_read_range(0, 4, second_ver).await.unwrap();
+        assert_eq!(after_global_ver, None);
+
+        let mut expected = vec![0; PAGE_SIZE as usize + 4];
+        expected[..4].copy_from_slice(b"head");
+        expected[PAGE_SIZE as usize..].copy_from_slice(b"tail");
+        assert_backend_eq(&backend, &expected);
+    });
+}
+
+#[test]
 fn write_back_complete_finalizes_backend() {
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
@@ -740,6 +822,34 @@ fn write_back_truncate_clears_cache() {
         cache.flush().await.unwrap();
 
         assert_backend_eq(&backend, &fresh);
+    });
+}
+
+#[test]
+fn write_back_dirty_read_range_snapshot_publishes_enospc_write_through() {
+    let rt = Arc::new(AsyncRuntime::single());
+    let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, 16);
+    rt.block_on(async move {
+        let handle = ctx.create_file("flush_range_enospc.bin").await;
+        let (_writer, backend) = ctx
+            .inject_backend(handle.ino(), "backend_flush_range_enospc.bin")
+            .await;
+
+        ctx.write_via_fuse(&handle, 0, b"direct").await;
+        let cache = ctx.cm.get_cache(handle.ino()).await.unwrap();
+        assert_eq!(cache.page_len(), 0);
+
+        let flush_ver = cache
+            .publish_read_range(0, 6, 0)
+            .await
+            .unwrap()
+            .expect("write-through should publish");
+        assert_backend_eq(&backend, b"direct");
+
+        assert_eq!(
+            cache.publish_read_range(0, 6, flush_ver).await.unwrap(),
+            None
+        );
     });
 }
 
