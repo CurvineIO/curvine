@@ -20,7 +20,7 @@ serde = { workspace = true }
 toml = { workspace = true }
 clap = { workspace = true }
 log = { workspace = true }
-nix = { workspace = true, features = ["net"] }
+if-addrs = { workspace = true }
 regex = { workspace = true }
 
 [features]
