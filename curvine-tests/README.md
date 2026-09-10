@@ -68,8 +68,22 @@ The dashboard shows all modules with **Run / Cancel** buttons.
 | **FIO** | FIO performance tests (needs a running cluster) |
 | **LTP** | POSIX compliance tests via LTP (needs `/opt/ltp` and cluster) |
 
-> **Dailytest** does not include LTP by default. Trigger LTP separately via the Portal or `/ltp/run` API.  
+> **Dailytest** does not include LTP by default. Trigger LTP separately via the Portal or `/ltp/run` API.
 > LTP requires LTP installed at `/opt/ltp` on the host or in the container.
+>
+> **cvtest (external, preferred for CI)**: the [cvtest repo](https://github.com/CurvineIO/cvtest)
+> maintains the pinned LTP installer (version pinned there — single source
+> of truth), curated suites (`posix-cv-smoke` / `fs-cv` / `syscalls-cv`, …),
+> and the `cvtest run` entrypoint whose JSON matches this Portal's
+> `ltp_test` schema. This repo only invokes it; bumping the LTP version
+> happens in cvtest, not here. PR CI reads the pinned cvtest `ci-fast.txt`
+> manifest, which currently contains only the 53-case `ltp:posix-cv-smoke`
+> suite. It runs in the existing build job and reuses the binaries that job
+> already compiled. Generic `smoketest`, `fs-cv-smoke`, full `syscalls-cv`,
+> and pressure suites are intentionally excluded. The Portal path above stays
+> for local/interactive use with **stock** LTP suites only (`smoketest`,
+> `fs_perms_simple`, `fcntl-locktests`, `fs_bind`). Curated suites such as
+> `posix-cv-smoke` require `cvtest run` — they are not in the stock LTP tree.
 
 Test results are saved under `curvine-tests/regression_result/<timestamp>/`.
 
