@@ -18,7 +18,7 @@ use crate::worker::storage::{
 };
 use crate::worker::Worker;
 use curvine_config::ClusterConf;
-use curvine_core_error::CommonResult;
+use curvine_core_error::{CommonError, CommonResult};
 use curvine_model::{ExtendedBlock, StorageInfo};
 use parking_lot::{Mutex, MutexGuard};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -168,27 +168,64 @@ impl BlockStore {
         let started = Instant::now();
         let plan = reservation.prepare(block.len);
         self.observe_file_layout_operation("finalize", started.elapsed());
-        let result = match plan {
-            Ok(plan) => self.with_dataset_write("finalize", |state| {
-                state.publish_file_finalize(&reservation, plan)
-            }),
-            Err(error) => Err(error),
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(error) => {
+                if error.to_string().contains("length mismatch") {
+                    // Deterministic mismatch: retrying can never succeed, so
+                    // abort the block instead of looping forever.
+                    if let Err(abort) =
+                        self.with_dataset_write("finalize", |state| state.abort_block(block))
+                    {
+                        log::error!(
+                            "failed to abort block {} after prepare error {}: {}; rollback to Writing",
+                            block.id,
+                            error,
+                            abort
+                        );
+                        self.rollback_finalize_reservation(block.id, &abort, |state| {
+                            state.rollback_file_finalize(&reservation)
+                        });
+                    }
+                } else {
+                    // Transient failure: release the reservation so the block
+                    // returns to Writing and finalize can be retried.
+                    self.rollback_finalize_reservation(block.id, &error, |state| {
+                        state.rollback_file_finalize(&reservation)
+                    });
+                }
+                return Err(error);
+            }
         };
-        match result {
+
+        match self.with_dataset_write("finalize", |state| {
+            state.publish_file_finalize(&reservation, plan)
+        }) {
             Ok(meta) => Ok(meta),
             Err(error) => {
-                if let Err(rollback) = self.with_dataset_write("finalize", |state| {
+                self.rollback_finalize_reservation(block.id, &error, |state| {
                     state.rollback_file_finalize(&reservation)
-                }) {
-                    log::error!(
-                        "failed to roll back block {} finalization after {}: {}",
-                        block.id,
-                        error,
-                        rollback
-                    );
-                }
+                });
                 Err(error)
             }
+        }
+    }
+
+    /// Roll back a finalize reservation after a failed prepare or publish.
+    /// Failures are logged while the caller keeps the original error.
+    fn rollback_finalize_reservation(
+        &self,
+        block_id: i64,
+        reason: &CommonError,
+        rollback: impl FnOnce(&mut BlockDataset) -> CommonResult<()>,
+    ) {
+        if let Err(failed) = self.with_dataset_write("finalize", rollback) {
+            log::error!(
+                "failed to roll back block {} finalization after {}: {}",
+                block_id,
+                reason,
+                failed
+            );
         }
     }
 
@@ -562,6 +599,65 @@ mod tests {
 
         FileUtils::delete_path(&active_path, true)?;
         assert!(store.finalize_block(&block)?.is_final());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_rewrite_finalize_with_shorter_length_restores_committed_block() -> CommonResult<()> {
+        let store = create_store_with_capacity("rewrite-shrink-abort", "16MB")?;
+        let mut block = ExtendedBlock::with_mem(1, "50B")?;
+        let finalized = finalize_block(&store, &block)?;
+        assert!(finalized.is_final());
+        let available = store.read()?.available();
+
+        let rewriting = store.open_block(&block)?;
+        assert_eq!(rewriting.state(), &BlockState::Writing);
+
+        block.len = 20;
+        let error = store.finalize_block(&block).unwrap_err();
+        assert!(
+            error.to_string().contains("length mismatch"),
+            "expected a length mismatch prepare failure, got: {error}"
+        );
+
+        let restored = store.get_block(block.id)?;
+        assert!(restored.is_final());
+        assert_eq!(restored.len(), 50);
+        let active_path = store
+            .short_circuit(&restored)?
+            .expect("file layout must expose a local path");
+        assert_eq!(std::fs::metadata(&active_path)?.len(), 50);
+
+        let (_, dir) = store.read()?.layout_for(&restored)?;
+        let staging = BlockMeta::new(block.id, block.len, &dir);
+        let staging_path = FileLayout::block_path(&dir, &staging)?;
+        assert!(!staging_path.exists());
+        assert_eq!(store.read()?.available(), available);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_first_write_finalize_with_length_mismatch_aborts_block() -> CommonResult<()> {
+        let store = create_store_with_capacity("first-write-abort", "16MB")?;
+        let available = store.read()?.available();
+
+        let block = ExtendedBlock::with_mem(1, "50B")?;
+        let writing = store.open_block(&block)?;
+        assert_eq!(writing.state(), &BlockState::Writing);
+        let staging_path = store
+            .short_circuit(&writing)?
+            .expect("file layout must expose a local path");
+        write_block(&staging_path, 30)?;
+
+        let error = store.finalize_block(&block).unwrap_err();
+        assert!(
+            error.to_string().contains("length mismatch"),
+            "expected a length mismatch prepare failure, got: {error}"
+        );
+
+        assert!(store.get_block(block.id).is_err());
+        assert!(!std::path::Path::new(&staging_path).exists());
+        assert_eq!(store.read()?.available(), available);
         Ok(())
     }
 
