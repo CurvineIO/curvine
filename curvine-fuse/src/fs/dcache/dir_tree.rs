@@ -635,6 +635,21 @@ impl DirTree {
         }
     }
 
+    pub fn get_dirty_status(&self, ino: u64, name: Option<&str>) -> (bool, Option<FileStatus>) {
+        match self.get_inode(ino, name) {
+            Some(inode) => {
+                if inode.is_dirty() {
+                    let mut status = inode.status.clone();
+                    status.id = inode.ino as i64;
+                    (true, Some(status))
+                } else {
+                    (false, None)
+                }
+            }
+            _ => (true, None),
+        }
+    }
+
     pub fn pending_delete(&self, ino: u64) -> bool {
         let inode = self.get_inode(ino, None);
         match inode {

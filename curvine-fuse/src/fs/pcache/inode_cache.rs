@@ -236,6 +236,7 @@ impl InodeCache {
     }
 
     pub async fn write_through(self: &Arc<Self>, fragments: Vec<(u64, Bytes)>) -> FuseResult<()> {
+        let _gate = self.flush_gate.lock().await;
         let writer = self.get_writer().await?;
         for (off, data) in fragments {
             writer.write(off as i64, data, None).await?;

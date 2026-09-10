@@ -1329,11 +1329,18 @@ impl NodeState {
         let _guard = self.lock_path(&path).await;
 
         if self.enable_write_back {
-            let status =
-                self.lookup_dirty(ino, name, FuseUtils::file_opts_to_status(&path, &opts))?;
-            return self
-                .new_cache_handle(status.id as u64, status, flags, opts)
-                .await;
+            let (dirty, status) = self.dir_read().get_dirty_status(ino, Some(name));
+
+            if dirty {
+                let status = self.lookup_dirty(
+                    ino,
+                    name,
+                    status.unwrap_or(FuseUtils::file_opts_to_status(&path, &opts)),
+                )?;
+                return self
+                    .new_cache_handle(status.id as u64, status, flags, opts)
+                    .await;
+            }
         }
 
         let handle = if flags.read_only() {

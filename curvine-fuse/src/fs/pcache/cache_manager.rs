@@ -281,23 +281,21 @@ impl CacheManager {
                 .map(|x| x.to_set_opts())
         };
 
-        let (released, res) = self
+        let (_, res) = self
             .caches
             .release_with_cleanup(ino, move |last| async move {
                 if last {
-                    cache.complete(opts).await
+                    let res = cache.complete(opts).await;
+                    if res.is_ok() {
+                        state.mark_dirty_commit(ino);
+                    }
+                    res
                 } else {
                     cache.flush().await
                 }
             })
             .await;
-
-        if released {
-            res?;
-            state.mark_dirty_commit(ino);
-        }
-
-        Ok(())
+        res
     }
 
     pub async fn send(&self, msg: DirtyMessage) -> FuseResult<()> {
