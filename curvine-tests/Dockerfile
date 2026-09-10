@@ -5,6 +5,7 @@
 FROM ghcr.io/curvineio/curvine-compile:rocky9
 
 # Python + Flask + Werkzeug (build-server) and regression helpers; no runtime pip installs in CI.
+# bison/flex are required to build LTP from the release tarball.
 RUN dnf install -y dnf-plugins-core epel-release && \
     dnf config-manager --set-enabled crb && \
     dnf install -y \
@@ -18,7 +19,47 @@ RUN dnf install -y dnf-plugins-core epel-release && \
         zlib-static \
         jq \
         fio \
+        bison \
+        flex \
+        bzip2 \
+        fuse \
+        fuse-libs \
     && dnf clean all
+
+# Preinstall pinned LTP into /opt/ltp (runltp era; do not bump to >=20260529
+# without kirk migration). Version and checksum are intentionally inlined here
+# so the image does not depend on cvtest at build time. Align both values when
+# promoting a new pin. Curated runtest files (fs-cv-smoke, …) are NOT copied in
+# — Portal uses stock suites; CI uses `cvtest run` to install them.
+#
+# A few unrelated testcases may fail to compile on this base image. Build and
+# install with -k to complete as many targets as possible, tolerate make's
+# aggregate failure status, then require runltp + runtest to exist.
+# listmount04 is dropped up front on uapi >= 6.17 (compile break; irrelevant
+# to FUSE POSIX validation), matching the cvtest installer.
+ARG LTP_VERSION=20250930
+ARG LTP_SHA256=fd20d451ff95fb2e1857a55132382bcd4246221d8cea3808cb32742ac513f245
+RUN curl -fL --retry 8 --retry-all-errors --retry-delay 5 \
+      -o /tmp/ltp-full-${LTP_VERSION}.tar.bz2 \
+      "https://github.com/linux-test-project/ltp/releases/download/${LTP_VERSION}/ltp-full-${LTP_VERSION}.tar.bz2" \
+ && echo "${LTP_SHA256}  /tmp/ltp-full-${LTP_VERSION}.tar.bz2" | sha256sum -c - \
+ && tar -xjf /tmp/ltp-full-${LTP_VERSION}.tar.bz2 -C /tmp \
+ && cd /tmp/ltp-full-${LTP_VERSION} \
+ && if echo '#include <linux/mount.h>
+int main(void){struct mnt_id_req r;return r.spare;}' \
+       | gcc -x c - -o /dev/null 2>/dev/null; then \
+     :; \
+   else \
+     echo "kernel uapi incompatible with listmount04; dropping it"; \
+     rm -f testcases/kernel/syscalls/listmount/listmount04.c; \
+   fi \
+ && ./configure --prefix=/opt/ltp \
+ && (make -j"$(nproc)" -k || echo "WARNING: some LTP targets failed to build; validating required artifacts") \
+ && (make install -k || echo "WARNING: some LTP targets failed to install; validating required artifacts") \
+ && test -x /opt/ltp/runltp \
+ && test -d /opt/ltp/runtest \
+ && rm -rf /tmp/ltp-full-${LTP_VERSION}* \
+ && echo "LTP ${LTP_VERSION} installed at /opt/ltp"
 
 # Rust proxy (rsproxy.cn) for rustup updates and cargo crate downloads
 ENV RUSTUP_DIST_SERVER="https://rsproxy.cn"
