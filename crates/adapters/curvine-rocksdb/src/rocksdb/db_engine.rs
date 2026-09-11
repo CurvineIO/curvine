@@ -493,11 +493,10 @@ impl DBEngine {
             info.insert("db_rocksdb_block_cache_hit_count".to_string(), hit);
             info.insert("db_rocksdb_block_cache_miss_count".to_string(), miss);
             let denom = hit.saturating_add(miss);
-            let ppm = if denom == 0 {
-                0
-            } else {
-                hit.saturating_mul(1_000_000) / denom
-            };
+            let ppm = hit
+                .saturating_mul(1_000_000)
+                .checked_div(denom)
+                .unwrap_or(0);
             info.insert("db_rocksdb_block_cache_hit_rate_ppm".to_string(), ppm);
         }
 
