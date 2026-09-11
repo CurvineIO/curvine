@@ -117,6 +117,60 @@ impl FsDir {
         self.op_id.next()
     }
 
+    /// Rebuild the absolute path of an inode by walking parent_id links.
+    ///
+    /// Used when an RPC addresses a file by inode id: the caller-supplied path may be
+    /// stale after rename, but journal / FileStatus / UFS export still need the current path.
+    pub fn get_inode_path(&self, inode_id: i64) -> FsResult<String> {
+        if inode_id == ROOT_INODE_ID {
+            return Ok("/".to_string());
+        }
+
+        let mut current_id = inode_id;
+        let mut components = Vec::new();
+        let mut visited = Vec::new();
+
+        while current_id != ROOT_INODE_ID {
+            if visited.contains(&current_id) {
+                return err_box!("Cycle detected while resolving inode path {}", inode_id);
+            }
+            visited.push(current_id);
+
+            let inode_view = match self.store.get_inode(current_id, None)? {
+                Some(inode_view) => inode_view,
+                None => {
+                    return err_ext!(FsError::file_not_found(format!(
+                        "inode_id={} (missing ancestor {})",
+                        inode_id, current_id
+                    )));
+                }
+            };
+
+            match &inode_view {
+                File(f) => {
+                    components.push(f.name.clone());
+                    current_id = f.parent_id();
+                }
+                Dir(d) => {
+                    components.push(d.name.clone());
+                    current_id = d.parent_id();
+                }
+                FileEntry(e) => {
+                    // Top-level inode CF should not store FileEntry rows; a truncated
+                    // name-only path would be unsafe for UFS mount selection.
+                    return err_box!(
+                        "Cannot resolve path for inode {}: unexpected FileEntry '{}'",
+                        inode_id,
+                        e.name
+                    );
+                }
+            }
+        }
+
+        components.reverse();
+        Ok(format!("/{}", components.join("/")))
+    }
+
     pub fn update_op_id(&self, op_id: u64) {
         if op_id > self.op_id.get() {
             self.op_id.set(op_id);

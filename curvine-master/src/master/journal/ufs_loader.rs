@@ -15,7 +15,7 @@
 use crate::master::journal::{
     CompleteFileEntry, DeleteEntry, JournalEntry, MkdirEntry, RenameEntry,
 };
-use crate::master::JobManager;
+use crate::master::{JobManager, SyncFsDir};
 use curvine_config::JournalConf;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsError;
@@ -31,11 +31,12 @@ use std::time::Duration;
 #[derive(Clone)]
 pub struct UfsLoader {
     job_manager: Arc<JobManager>,
+    fs_dir: SyncFsDir,
     copy_timeout: Duration,
 }
 
 impl UfsLoader {
-    pub fn new(job_manager: Arc<JobManager>, conf: &JournalConf) -> Self {
+    pub fn new(job_manager: Arc<JobManager>, fs_dir: SyncFsDir, conf: &JournalConf) -> Self {
         let copy_timeout = match DurationUnit::from_str(&conf.ufs_copy_timeout) {
             Ok(unit) => unit.as_duration(),
             Err(e) => {
@@ -49,8 +50,14 @@ impl UfsLoader {
 
         Self {
             job_manager,
+            fs_dir,
             copy_timeout,
         }
+    }
+
+    pub fn get_real_path(&self, inode_id: i64) -> FsResult<Path> {
+        let path = self.fs_dir.read().get_inode_path(inode_id)?;
+        Ok(Path::from_str(path)?)
     }
 
     fn get_mnt(&self, path: &Path) -> FsResult<Option<(Path, Arc<MountValue>)>> {
@@ -139,7 +146,19 @@ impl UfsLoader {
             return Ok(());
         }
 
-        let path = Path::from_str(&e.path)?;
+        // Rebuild via inode id so rename-after-open still exports to the live path.
+        // Only fall back to e.path on typed not-found; store / corruption errors propagate.
+        let path = match self.get_real_path(e.file.id) {
+            Ok(path) => path,
+            Err(FsError::FileNotFound(_)) => {
+                warn!(
+                    "complete_file: inode {} not found, fallback to entry.path={}",
+                    e.file.id, e.path
+                );
+                Path::from_str(&e.path)?
+            }
+            Err(err) => return Err(err.into()),
+        };
         if let Some((_, mnt)) = self.get_mnt(&path)? {
             self.submit_export_task(&path, &mnt).await?;
             Ok(())

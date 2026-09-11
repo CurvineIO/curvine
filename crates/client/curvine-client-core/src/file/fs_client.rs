@@ -165,8 +165,17 @@ impl FsClient {
     }
 
     pub async fn file_status(&self, path: &Path) -> FsResult<FileStatus> {
+        self.file_status0(path, None).await
+    }
+
+    pub async fn file_status_by_id(&self, path: &Path, inode_id: i64) -> FsResult<FileStatus> {
+        self.file_status0(path, Some(inode_id)).await
+    }
+
+    async fn file_status0(&self, path: &Path, inode_id: Option<i64>) -> FsResult<FileStatus> {
         let header = GetFileStatusRequest {
             path: path.encode(),
+            inode_id,
         };
 
         let rep_header: GetFileStatusResponse = self.rpc(RpcCode::FileStatus, header).await?;
@@ -177,6 +186,7 @@ impl FsClient {
     pub async fn file_status_bytes(&self, path: &Path) -> FsResult<BytesMut> {
         let header = GetFileStatusRequest {
             path: path.encode(),
+            inode_id: None,
         };
         self.rpc_bytes(RpcCode::FileStatus, header).await
     }
