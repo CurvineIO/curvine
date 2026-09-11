@@ -153,7 +153,7 @@ impl MasterReplicationManager {
         let target_worker_addr = self.assign(locations.iter().map(|x| x.worker_id).collect())?;
         info!(
             "block_id: {}. locations: {:?}, target: {}",
-            block_id, &locations, &target_worker_addr
+            block_id, locations, target_worker_addr
         );
 
         // step3: call the corresponding worker to do replication
@@ -260,7 +260,7 @@ impl MasterReplicationManager {
                 } else {
                     error!(
                         "Errors on block replication for block_id: {} to worker: {}. error: {:?}",
-                        block_id, &entry.1.target_worker, message
+                        block_id, entry.1.target_worker, message
                     );
                     self.metrics.replication_failure_count.inc();
                 }

@@ -264,17 +264,13 @@ impl PlockWaitRegistry {
             if !visited.insert(current.clone()) {
                 return None;
             }
-            match map.get(&current) {
-                Some(record) => {
-                    edges.push(LockWaitEdge {
-                        waiter: current.clone(),
-                        blocker: record.blocked_by.clone(),
-                        info: record.info.clone(),
-                    });
-                    current = record.blocked_by.clone();
-                }
-                None => return None,
-            }
+            let record = map.get(&current)?;
+            edges.push(LockWaitEdge {
+                waiter: current.clone(),
+                blocker: record.blocked_by.clone(),
+                info: record.info.clone(),
+            });
+            current = record.blocked_by.clone();
         }
     }
 

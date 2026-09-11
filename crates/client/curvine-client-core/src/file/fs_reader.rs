@@ -44,7 +44,7 @@ impl FsReader {
 
         debug!(
             "Create reader, path={}, len={}, blocks={}, chunk_size={}, chunk_number={}, read_parallel={}, slice_size={}, read_ahead={}-{}",
-            &file_blocks.status.path,
+            file_blocks.status.path,
             ByteUnit::byte_to_string(len as u64),
             file_blocks.block_locs.len(),
             chunk_size,

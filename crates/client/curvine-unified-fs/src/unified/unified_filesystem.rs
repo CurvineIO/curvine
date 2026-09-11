@@ -1014,7 +1014,7 @@ async fn wait_transfer_complete0(
     loop {
         let status = match client.status(job_id).await {
             Ok(status) => status,
-            Err(err @ FsError::JobNotFound(_)) if !fail_if_not_found => {
+            Err(FsError::JobNotFound(_)) if !fail_if_not_found => {
                 time::sleep(Duration::from_millis(
                     client_conf.sync_check_interval_min_ms,
                 ))

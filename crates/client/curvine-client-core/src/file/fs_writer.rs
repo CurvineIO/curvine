@@ -42,7 +42,7 @@ impl FsWriter {
 
         debug!(
             "Create writer, path={}, pos={}, len = {}, block_size={}, chunk_size={}, chunk_number={}, replicas={}",
-            &status.path,
+            status.path,
             pos,
             status.len,
             ByteUnit::byte_to_string(status.block_size as u64),
