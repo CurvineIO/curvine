@@ -139,11 +139,10 @@ impl FsDir {
             let inode_view = match self.store.get_inode(current_id, None)? {
                 Some(inode_view) => inode_view,
                 None => {
-                    return err_box!(
-                        "Cannot resolve path for inode {} (missing ancestor {})",
-                        inode_id,
-                        current_id
-                    );
+                    return err_ext!(FsError::file_not_found(format!(
+                        "inode_id={} (missing ancestor {})",
+                        inode_id, current_id
+                    )));
                 }
             };
 
@@ -157,9 +156,13 @@ impl FsDir {
                     current_id = d.parent_id();
                 }
                 FileEntry(e) => {
-                    // FileEntry does not carry parent_id, so preserve the previous fallback.
-                    components.push(e.name.clone());
-                    break;
+                    // Top-level inode CF should not store FileEntry rows; a truncated
+                    // name-only path would be unsafe for UFS mount selection.
+                    return err_box!(
+                        "Cannot resolve path for inode {}: unexpected FileEntry '{}'",
+                        inode_id,
+                        e.name
+                    );
                 }
             }
         }

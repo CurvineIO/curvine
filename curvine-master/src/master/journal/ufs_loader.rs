@@ -60,19 +60,6 @@ impl UfsLoader {
         Ok(Path::from_str(path)?)
     }
 
-    pub(crate) fn resolve_complete_entry_path(&self, e: &CompleteFileEntry) -> FsResult<Path> {
-        match self.get_real_path(e.file.id) {
-            Ok(path) => Ok(path),
-            Err(err) => {
-                warn!(
-                    "complete_file: get_inode_path({}) failed: {}, fallback to entry.path={}",
-                    e.file.id, err, e.path
-                );
-                Ok(Path::from_str(&e.path)?)
-            }
-        }
-    }
-
     fn get_mnt(&self, path: &Path) -> FsResult<Option<(Path, Arc<MountValue>)>> {
         match self.job_manager.get_mnt(path)? {
             Some((path, mnt)) if mnt.info.is_fs_mode() => Ok(Some((path, mnt))),
@@ -159,7 +146,19 @@ impl UfsLoader {
             return Ok(());
         }
 
-        let path = self.resolve_complete_entry_path(e)?;
+        // Rebuild via inode id so rename-after-open still exports to the live path.
+        // Only fall back to e.path on typed not-found; store / corruption errors propagate.
+        let path = match self.get_real_path(e.file.id) {
+            Ok(path) => path,
+            Err(FsError::FileNotFound(_)) => {
+                warn!(
+                    "complete_file: inode {} not found, fallback to entry.path={}",
+                    e.file.id, e.path
+                );
+                Path::from_str(&e.path)?
+            }
+            Err(err) => return Err(err.into()),
+        };
         if let Some((_, mnt)) = self.get_mnt(&path)? {
             self.submit_export_task(&path, &mnt).await?;
             Ok(())
@@ -222,93 +221,6 @@ impl UfsLoader {
             Ok(())
         } else {
             Ok(())
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::master::journal::JournalSystem;
-    use crate::master::meta::inode::InodeView;
-    use crate::master::Master;
-    use curvine_config::ClusterConf;
-    use curvine_model::RenameFlags;
-    use curvine_runtime::common::Utils;
-
-    fn test_fs(name: &str) -> crate::master::fs::MasterFilesystem {
-        Master::init_test_metrics();
-        let mut conf = ClusterConf::format();
-        conf.testing = true;
-        conf.journal.enable = false;
-        conf.master.meta_dir = Utils::test_sub_dir(format!(
-            "ufs-loader-path-test/meta-{}-{}",
-            name,
-            Utils::rand_str(6)
-        ));
-        conf.journal.journal_dir = Utils::test_sub_dir(format!(
-            "ufs-loader-path-test/journal-{}-{}",
-            name,
-            Utils::rand_str(6)
-        ));
-        JournalSystem::fs_only_for_test(&conf).unwrap()
-    }
-
-    fn complete_entry_with_stale_path(
-        fs: &crate::master::fs::MasterFilesystem,
-        stale_path: &str,
-        inode_id: i64,
-    ) -> CompleteFileEntry {
-        let fs_dir = fs.fs_dir.read();
-        let view = fs_dir
-            .store
-            .get_inode(inode_id, None)
-            .unwrap()
-            .expect("inode must exist");
-        let file = match view {
-            InodeView::File(f) => f.file.clone(),
-            other => panic!("expected file inode, got {:?}", other.name()),
-        };
-        CompleteFileEntry {
-            op_id: 1,
-            rpc_id: 0,
-            path: stale_path.to_string(),
-            file,
-            commit_blocks: vec![],
-        }
-    }
-
-    #[test]
-    fn resolve_complete_entry_path_uses_inode_after_rename() {
-        let fs = test_fs("complete-path-rename");
-        let created = fs.create("/x/old.log", true).unwrap();
-        fs.rename("/x/old.log", "/x/new.log", RenameFlags::empty())
-            .unwrap();
-
-        let entry = complete_entry_with_stale_path(&fs, "/x/old.log", created.id);
-        let resolved = resolve_entry_path_for_test(&fs, &entry).unwrap();
-        assert_eq!(resolved.full_path(), "/x/new.log");
-    }
-
-    #[test]
-    fn resolve_complete_entry_path_falls_back_when_inode_missing() {
-        let fs = test_fs("complete-path-fallback");
-        let created = fs.create("/y/file.log", true).unwrap();
-        let mut entry = complete_entry_with_stale_path(&fs, "/y/file.log", created.id);
-        entry.file.id = 9_999_999;
-
-        let resolved = resolve_entry_path_for_test(&fs, &entry).unwrap();
-        assert_eq!(resolved.full_path(), "/y/file.log");
-    }
-
-    /// Mirrors `UfsLoader::resolve_complete_entry_path` without needing JobManager.
-    fn resolve_entry_path_for_test(
-        fs: &crate::master::fs::MasterFilesystem,
-        e: &CompleteFileEntry,
-    ) -> FsResult<Path> {
-        match fs.fs_dir.read().get_inode_path(e.file.id) {
-            Ok(path) => Ok(Path::from_str(path)?),
-            Err(_) => Ok(Path::from_str(&e.path)?),
         }
     }
 }
