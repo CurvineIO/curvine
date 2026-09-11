@@ -479,10 +479,18 @@ impl MasterFilesystem {
     }
 
     pub fn file_status<T: AsRef<str>>(&self, path: T) -> FsResult<FileStatus> {
+        self.file_status_by_id(path, None)
+    }
+
+    pub fn file_status_by_id<T: AsRef<str>>(
+        &self,
+        path: T,
+        inode_id: Option<i64>,
+    ) -> FsResult<FileStatus> {
+        let path = path.as_ref();
         let fs_dir = self.fs_dir.read();
-        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
-        let status = fs_dir.file_status(&inp)?;
-        Ok(status)
+        let inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
+        Ok(inode.to_file_status(path)?)
     }
 
     pub fn exists<T: AsRef<str>>(&self, path: T) -> FsResult<bool> {
@@ -1857,6 +1865,102 @@ mod tests {
             "expected path in error, got: {}",
             err
         );
+    }
+
+    #[test]
+    fn get_inode_path_follows_parent_links() {
+        let fs = test_fs("get-inode-path");
+        let status = fs.create("/dir/file.log", true).unwrap();
+        let sync_fs_dir = fs.fs_dir();
+        let fs_dir = sync_fs_dir.read();
+        assert_eq!(fs_dir.get_inode_path(status.id).unwrap(), "/dir/file.log");
+    }
+
+    #[test]
+    fn get_inode_path_after_rename_returns_new_path() {
+        let fs = test_fs("get-inode-path-rename");
+        let status = fs.create("/dir/old.log", true).unwrap();
+        fs.rename("/dir/old.log", "/dir/new.log", RenameFlags::empty())
+            .unwrap();
+
+        let sync_fs_dir = fs.fs_dir();
+        let fs_dir = sync_fs_dir.read();
+        assert_eq!(fs_dir.get_inode_path(status.id).unwrap(), "/dir/new.log");
+    }
+
+    #[test]
+    fn file_status_by_id_after_rename_resolves_inode_keeps_request_path() {
+        // By-id status resolves the inode (id/name) but keeps the request path.
+        let fs = test_fs("file-status-by-id-stale-path");
+        let created = fs.create("/a/old.log", true).unwrap();
+        fs.rename("/a/old.log", "/a/new.log", RenameFlags::empty())
+            .unwrap();
+
+        let status = fs
+            .file_status_by_id("/a/old.log", Some(created.id))
+            .unwrap();
+        assert_eq!(status.id, created.id);
+        assert_eq!(status.path, "/a/old.log");
+        assert_eq!(status.name, "new.log");
+
+        // Path-based status still requires the live path.
+        let by_path = fs.file_status("/a/new.log").unwrap();
+        assert_eq!(by_path.id, created.id);
+        assert_eq!(by_path.path, "/a/new.log");
+
+        // Write path still journals/returns the request path (no hot-path rebuild).
+        let blocks = fs
+            .resize_by_id(
+                "/a/old.log",
+                Some(created.id),
+                FileAllocOpts::with_truncate(128),
+            )
+            .unwrap();
+        assert_eq!(blocks.status.id, created.id);
+        assert_eq!(blocks.status.path, "/a/old.log");
+        assert_eq!(blocks.status.name, "new.log");
+        assert_eq!(blocks.status.len, 128);
+    }
+
+    #[test]
+    fn file_status_by_id_missing_inode_returns_file_not_found() {
+        let fs = test_fs("file-status-missing-inode");
+        let missing_id = 9_999_999_i64;
+        let err = fs
+            .file_status_by_id("/missing.log", Some(missing_id))
+            .unwrap_err();
+        assert_file_not_found_roundtrip(&err);
+        assert!(
+            err.to_string()
+                .contains(&format!("inode_id={}", missing_id)),
+            "expected inode_id in error context, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn complete_file_by_id_keeps_request_path() {
+        let fs = test_fs("complete-by-id-stale-path");
+        let created = fs.create("/b/old.log", true).unwrap();
+        fs.rename("/b/old.log", "/b/new.log", RenameFlags::empty())
+            .unwrap();
+
+        let blocks = fs
+            .complete_file(
+                "/b/old.log",
+                Some(created.id),
+                64,
+                vec![],
+                "test-client",
+                true,
+                None,
+            )
+            .unwrap()
+            .expect("only_flush should return FileBlocks");
+
+        assert_eq!(blocks.status.id, created.id);
+        assert_eq!(blocks.status.path, "/b/old.log");
+        assert_eq!(blocks.status.name, "new.log");
     }
 
     fn worker_with_status(
