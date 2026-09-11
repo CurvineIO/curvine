@@ -921,6 +921,7 @@ fn ttl_executor_deletes_expired_directory_after_child_file() -> CommonResult<()>
     )?;
 
     std::thread::sleep(Duration::from_millis(10));
+    let dir_mtime_before_child_delete = fs.file_status("/ttl/expired-dir")?.mtime;
     let executor = InodeTtlExecutor::with_managers(fs.clone());
 
     let (file_processed, _) = executor.execute_by_id(file.id)?;
@@ -931,6 +932,11 @@ fn ttl_executor_deletes_expired_directory_after_child_file() -> CommonResult<()>
     assert!(
         fs.file_status("/ttl/expired-dir/file.log").is_err(),
         "TTL delete should remove the child file"
+    );
+    assert_eq!(
+        fs.file_status("/ttl/expired-dir")?.mtime,
+        dir_mtime_before_child_delete,
+        "TTL child delete must not refresh an already-expired parent directory mtime"
     );
 
     let (dir_processed, inode) = executor.execute_by_id(dir.id)?;
