@@ -231,6 +231,7 @@ impl WriteHandler {
         let context = try_option_mut!(self.context);
         Self::check_context(context, msg)?;
 
+        let mut need_flush = false;
         if msg.header_len() > 0 {
             let header: DataHeaderProto = msg.parse_header()?;
             if !header.flush {
@@ -242,6 +243,8 @@ impl WriteHandler {
                     );
                 }
                 file.seek_to(header.offset)?;
+            } else {
+                need_flush = true;
             }
         }
 
@@ -262,6 +265,10 @@ impl WriteHandler {
             self.metrics.write_bytes.inc_by(msg.data_len() as i64);
             self.metrics.write_time_us.inc_by(used as i64);
             self.metrics.write_count.inc();
+        }
+
+        if need_flush {
+            file.flush()?;
         }
 
         Ok(msg.success())
