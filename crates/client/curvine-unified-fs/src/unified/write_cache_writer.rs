@@ -61,6 +61,7 @@ pub struct WriteCacheWriter {
 }
 
 impl WriteCacheWriter {
+    #[allow(clippy::result_large_err)]
     pub async fn new(
         primary: UnifiedWriter,
         cv: CurvineFileSystem,

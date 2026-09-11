@@ -13,6 +13,8 @@
 // limitations under the License.
 //
 
+#![recursion_limit = "256"]
+
 use curvine_unified_fs::UnifiedFileSystem;
 use std::sync::Arc;
 

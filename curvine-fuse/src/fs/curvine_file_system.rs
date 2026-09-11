@@ -3475,12 +3475,10 @@ mod tests {
 
                     // The kernel consumes the batch and remembers the LAST entry's
                     // cookie as the offset for its next request.
-                    let mut index = offset;
                     let mut last_cookie = offset;
-                    for st in batch {
+                    for (index, st) in (offset..).zip(batch) {
                         seen.push(st.name.clone());
                         last_cookie = cookie(index);
-                        index += 1;
                     }
                     offset = last_cookie;
                 }
@@ -3548,12 +3546,10 @@ mod tests {
                     }
 
                     // Mirror response cutoff; advance `index` only for emitted entries.
-                    let mut index = offset;
                     let mut last_cookie = offset;
-                    for st in batch.into_iter().take(max_emit_per_round) {
+                    for (index, st) in (offset..).zip(batch.into_iter().take(max_emit_per_round)) {
                         seen.push(st.name.clone());
                         last_cookie = cookie(index);
-                        index += 1;
                     }
                     offset = last_cookie;
                 }
