@@ -647,7 +647,7 @@ impl DirTree {
     pub fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {
         writer.write_len(self.id_creator.get())?;
         writer.write_len(self.inodes.len() as u64)?;
-        for (_, inode) in self.inodes.iter() {
+        for inode in self.inodes.values() {
             writer.write_struct(inode)?;
         }
         writer.flush()?;
