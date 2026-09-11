@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// cmds::bench::execute monomorphizes deep UnifiedFileSystem async types.
 #![recursion_limit = "256"]
 
 mod alloc;

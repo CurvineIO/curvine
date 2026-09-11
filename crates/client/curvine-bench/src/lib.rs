@@ -13,6 +13,7 @@
 // limitations under the License.
 //
 
+// BenchIo async calls over UnifiedFileSystem exceed the default query depth.
 #![recursion_limit = "256"]
 
 use curvine_unified_fs::UnifiedFileSystem;

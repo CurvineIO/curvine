@@ -158,12 +158,12 @@ curvine-web = { path = "curvine-web" }
 
 # The most important library start
 
-libc = "0.2.189"
-tokio = { version = "1.53.1", features = ["full"] }
+libc = "0.2.167"
+tokio = { version = "1.42.0", features = ["full"] }
 futures = "0.3.31"
 async-stream = "0.3.6"
-tokio-util = { version = "0.7.19", features = ["codec"] }
-bytes = "1.12.0"
+tokio-util = { version = "0.7.12", features = ["codec"] }
+bytes = "1.9.0"
 serde = { version = "1.0.215", features = ["derive"] }
 rocksdb = { version = "0.22.0", default-features = false, features = ["lz4"] }
 raft = { version = "0.7.0", features = ["prost-codec"], default-features = false }
