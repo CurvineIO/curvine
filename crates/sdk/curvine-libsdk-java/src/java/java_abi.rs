@@ -362,7 +362,30 @@ pub unsafe extern "C" fn Java_io_curvine_CurvineNative_submitLoadJob(
     let fs = &*fs_ptr;
     java_err2!(
         env,
-        fs.submit_load_job(&mut env, source_path, target_path, overwrite)
+        fs.submit_load_job(&mut env, source_path, target_path, overwrite, None)
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn Java_io_curvine_CurvineNative_submitLoadJobWithReplicas(
+    mut env: JNIEnv,
+    _this: JObject,
+    fs_ptr: *mut JavaFilesystem,
+    source_path: JString,
+    target_path: JString,
+    overwrite: jboolean,
+    replicas: jint,
+) -> jarray {
+    let fs = &*fs_ptr;
+    java_err2!(
+        env,
+        fs.submit_load_job(
+            &mut env,
+            source_path,
+            target_path,
+            overwrite,
+            Some(replicas),
+        )
     )
 }
 

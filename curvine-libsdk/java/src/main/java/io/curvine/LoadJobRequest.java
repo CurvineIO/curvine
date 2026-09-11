@@ -23,11 +23,13 @@ public final class LoadJobRequest {
     private final String sourcePath;
     private final String targetPath;
     private final boolean overwrite;
+    private final Integer replicas;
 
     private LoadJobRequest(Builder builder) {
         this.sourcePath = builder.sourcePath;
         this.targetPath = builder.targetPath;
         this.overwrite = builder.overwrite;
+        this.replicas = builder.replicas;
     }
 
     public String getSourcePath() {
@@ -43,6 +45,11 @@ public final class LoadJobRequest {
         return overwrite;
     }
 
+    /** Optional replica count for this load job. */
+    public Integer getReplicas() {
+        return replicas;
+    }
+
     public static Builder builder() {
         return new Builder();
     }
@@ -51,6 +58,7 @@ public final class LoadJobRequest {
         private String sourcePath;
         private String targetPath;
         private boolean overwrite = true;
+        private Integer replicas;
 
         private Builder() {
         }
@@ -70,12 +78,20 @@ public final class LoadJobRequest {
             return this;
         }
 
+        public Builder replicas(int replicas) {
+            this.replicas = replicas;
+            return this;
+        }
+
         public LoadJobRequest build() {
             if (sourcePath == null || sourcePath.trim().isEmpty()) {
                 throw new IllegalArgumentException("sourcePath cannot be empty");
             }
             if (targetPath != null && targetPath.trim().isEmpty()) {
                 throw new IllegalArgumentException("targetPath cannot be empty when set");
+            }
+            if (replicas != null && replicas <= 0) {
+                throw new IllegalArgumentException("replicas must be greater than zero");
             }
             return new LoadJobRequest(this);
         }

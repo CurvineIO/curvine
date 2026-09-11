@@ -61,11 +61,21 @@ public final class CurvineTransferClient implements Closeable {
     /** Submit a UFS-to-Curvine load job. */
     public LoadJobResult submitLoad(LoadJobRequest request) throws IOException {
         Objects.requireNonNull(request, "request");
-        return filesystem.withOpen(nativeHandle -> parseSubmitResponse(CurvineNative.submitLoadJob(
-                nativeHandle,
-                request.getSourcePath(),
-                request.getTargetPath(),
-                request.isOverwrite())));
+        return filesystem.withOpen(nativeHandle -> {
+            byte[] response = request.getReplicas() == null
+                    ? CurvineNative.submitLoadJob(
+                            nativeHandle,
+                            request.getSourcePath(),
+                            request.getTargetPath(),
+                            request.isOverwrite())
+                    : CurvineNative.submitLoadJobWithReplicas(
+                            nativeHandle,
+                            request.getSourcePath(),
+                            request.getTargetPath(),
+                            request.isOverwrite(),
+                            request.getReplicas());
+            return parseSubmitResponse(response);
+        });
     }
 
     /**
