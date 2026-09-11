@@ -61,7 +61,10 @@ pub struct WriteCacheWriter {
 }
 
 impl WriteCacheWriter {
-    #[allow(clippy::result_large_err)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "returns UnifiedWriter on error so the caller can fall back to uncached write"
+    )]
     pub async fn new(
         primary: UnifiedWriter,
         cv: CurvineFileSystem,
