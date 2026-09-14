@@ -427,6 +427,138 @@ fn test_worker_batch_remote_write_complete_and_read_back() -> CommonResult<()> {
     Ok(())
 }
 
+#[test]
+fn test_worker_running_flush_only_no_complete() -> CommonResult<()> {
+    // Regression test for GH#1673.
+    // A flush-only Running frame (header.flush=true, no data) must call
+    // file.flush()? so that data written by earlier Running frames is persisted
+    // to disk. Without the fix, the data would remain only in the device buffer
+    // and be lost if no Complete frame follows.
+    //
+    // Strategy:
+    //   1. Start worker with file-backed storage (temp dir) so that flush()
+    //      actually persists data to disk.
+    //   2. Open a block.
+    //   3. Write data using a normal Running frame (data + flush: false).
+    //   4. Send a flush-only Running frame with DataHeaderProto { flush: true }
+    //      and no data. This is the scenario the bug affects.
+    //   5. Do NOT send a Complete frame.
+    //   6. Verify the data is still readable — this proves flush() was called.
+    let conf = start_worker_with_tempdir();
+    let client = conf.worker_sync_client()?;
+    let block_size = CHUNK_SIZE as i64;
+    let req_id = Utils::req_id();
+
+    // --- Open a block ---
+    let block = ExtendedBlock::new(req_id, block_size, StorageType::Disk, FileType::File);
+    let open = BlockWriteRequest {
+        block: ProtoUtils::extend_block_to_pb(block),
+        off: 0,
+        block_size,
+        short_circuit: false,
+        client_name: "test".to_string(),
+        chunk_size: CHUNK_SIZE,
+        pipeline_stream: Vec::new(),
+        component_info: None,
+    };
+    let open_msg = Builder::new()
+        .code(RpcCode::WriteBlock)
+        .request(RequestStatus::Open)
+        .req_id(req_id)
+        .seq_id(0)
+        .proto_header(open)
+        .build();
+    let _: BlockWriteResponse = client.rpc_check(open_msg)?.parse_header()?;
+
+    // --- Write data with a normal Running frame ---
+    let write_data = b"hello-worker-flush-test";
+    let write_msg = Builder::new()
+        .code(RpcCode::WriteBlock)
+        .request(RequestStatus::Running)
+        .req_id(req_id)
+        .seq_id(1)
+        .data(curvine_io::DataSlice::Buffer(
+            BytesMut::from(&write_data[..]),
+        ))
+        .build();
+    let _: Message = client.rpc_check(write_msg)?;
+
+    // --- Send flush-only Running frame (the bug scenario) ---
+    let flush_header = DataHeaderProto {
+        offset: 0,
+        flush: true,
+        is_last: false,
+    };
+    let flush_msg = Builder::new()
+        .code(RpcCode::WriteBlock)
+        .request(RequestStatus::Running)
+        .req_id(req_id)
+        .seq_id(2)
+        .proto_header(flush_header)
+        .build();
+    // This must succeed; the fix calls file.flush()? here.
+    let _: Message = client.rpc_check(flush_msg)?;
+
+    // --- Verify data persists without a Complete frame ---
+    // Read the block back via RPC; if flush() was called the data is on disk.
+    let read_req = BlockReadRequest {
+        id: req_id,
+        off: 0,
+        len: block_size,
+        chunk_size: CHUNK_SIZE,
+        short_circuit: false,
+        ..Default::default()
+    };
+    let read_req_msg = Builder::new()
+        .code(RpcCode::ReadBlock)
+        .req_id(req_id)
+        .seq_id(0)
+        .request(RequestStatus::Open)
+        .proto_header(read_req)
+        .build();
+    let _: BlockReadResponse = client.rpc_check(read_req_msg)?.parse_header()?;
+
+    let read_data_msg = Builder::new()
+        .code(RpcCode::ReadBlock)
+        .req_id(req_id)
+        .seq_id(1)
+        .request(RequestStatus::Running)
+        .build();
+    let response = client.rpc_check(read_data_msg)?;
+    let data = response.data.as_slice();
+
+    // The data written in step 3 must be present even without a Complete frame.
+    // If the fix is absent, this assertion will fail because flush() was never
+    // called for the flush-only frame, and the in-buffer data may not be
+    // persisted to the on-disk store.
+    assert!(
+        !data.is_empty(),
+        "flush-only Running frame did not persist data; data likely lost because file.flush() was not called"
+    );
+    assert_eq!(&data[..write_data.len()],write_data,"flushed data content mismatch");
+
+    Ok(())
+}
+
+fn start_worker_with_tempdir() -> ClusterConf {
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "curvine-test-worker-{}-{}",
+        std::process::id(),
+        Utils::req_id().abs()
+    ));
+    let _ = std::fs::create_dir_all(&tmp_dir);
+
+    let mut conf = ClusterConf::default();
+    conf.worker.rpc_port = NetUtils::hold_available_port();
+    conf.worker.web_port = NetUtils::hold_available_port();
+    conf.worker.data_dir = vec![tmp_dir.to_string_lossy().to_string()];
+    conf.client.init().unwrap();
+
+    let server = Worker::with_conf(conf.clone()).unwrap();
+    thread::spawn(move || server.start_standalone());
+    conf
+}
+
 #[cfg(feature = "fault-injection")]
 #[test]
 // Host-integration coverage: the generic crate tests cannot prove that a

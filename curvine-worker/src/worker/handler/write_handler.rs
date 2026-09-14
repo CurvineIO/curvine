@@ -226,6 +226,27 @@ impl WriteHandler {
         Ok(())
     }
 
+    fn handle_data_header(
+        file: &mut BlockWriteContext,
+        context: &WriteContext,
+        header: DataHeaderProto,
+    ) -> FsResult<()> {
+        if !header.flush {
+            if header.offset < 0 || header.offset >= context.block_size {
+                return err_box!(
+                    "Invalid seek offset: {}, block length: {}",
+                    header.offset,
+                    context.block_size
+                );
+            }
+            file.seek_to(header.offset)?;
+        } else {
+            file.flush()?;
+        }
+
+        Ok(())
+    }
+
     pub fn write(&mut self, msg: &Message) -> FsResult<Message> {
         let file = try_option_mut!(self.file);
         let context = try_option_mut!(self.context);
@@ -233,16 +254,7 @@ impl WriteHandler {
 
         if msg.header_len() > 0 {
             let header: DataHeaderProto = msg.parse_header()?;
-            if !header.flush {
-                if header.offset < 0 || header.offset >= context.block_size {
-                    return err_box!(
-                        "Invalid seek offset: {}, block length: {}",
-                        header.offset,
-                        context.block_size
-                    );
-                }
-                file.seek_to(header.offset)?;
-            }
+            Self::handle_data_header(file, context, header)?;
         }
 
         let data_len = msg.data_len() as i64;
@@ -355,8 +367,13 @@ impl WriteHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::map_storage_open_error;
-    use curvine_error::FsError;
+    use super::{map_storage_open_error, WriteHandler};
+    use crate::worker::handler::WriteContext;
+    use crate::worker::storage::BlockWriteContext;
+    use curvine_error::{FsError, FsResult};
+    use curvine_io::{BlockIO, DataSlice};
+    use curvine_model::{ExtendedBlock, FileType, StorageType};
+    use curvine_proto::DataHeaderProto;
 
     #[test]
     fn storage_capacity_rejection_maps_to_disk_out_of_space() {
@@ -378,5 +395,101 @@ mod tests {
             map_storage_open_error(error.into()),
             FsError::Common(_)
         ));
+    }
+
+    struct FailingFlushBlockIO;
+
+    impl BlockIO for FailingFlushBlockIO {
+        fn read_region(
+            &mut self,
+            _enable_send_file: bool,
+            _len: i32,
+        ) -> curvine_io::IOResult<DataSlice> {
+            Err(curvine_io::IOError::new(std::io::Error::other("read not supported")))
+        }
+
+        fn write_region(&mut self, _region: &DataSlice) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other("write not supported")))
+        }
+
+        fn write_all(&mut self, _buf: &[u8]) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other("write not supported")))
+        }
+
+        fn read_all(&mut self, _buf: &mut [u8]) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other("read not supported")))
+        }
+
+        fn flush(&mut self) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other("flush failed")))
+        }
+
+        fn seek(&mut self, pos: i64) -> curvine_io::IOResult<i64> {
+            Ok(pos)
+        }
+
+        fn pos(&self) -> i64 {
+            0
+        }
+
+        fn len(&self) -> i64 {
+            0
+        }
+
+        fn path(&self) -> &str {
+            "failing-flush"
+        }
+
+        fn resize(
+            &mut self,
+            _truncate: bool,
+            _off: i64,
+            _len: i64,
+            _mode: i32,
+        ) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other("resize not supported")))
+        }
+    }
+
+    #[test]
+    fn flush_header_propagates_flush_error() -> FsResult<()> {
+        let block_size = 1024_i64;
+
+        let mut file =
+            BlockWriteContext::new(FailingFlushBlockIO, 0, block_size, 0)?;
+
+        let context = WriteContext {
+            block: ExtendedBlock::new(
+                1,
+                0,
+                StorageType::Disk,
+                FileType::File,
+            ),
+            req_id: 1,
+            chunk_size: 1024,
+            short_circuit: false,
+            off: 0,
+            block_size,
+        };
+
+        let header = DataHeaderProto {
+            offset: block_size,
+            flush: true,
+            is_last: false,
+        };
+
+        let err = WriteHandler::handle_data_header(
+            &mut file,
+            &context,
+            header,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("flush failed"),
+            "unexpected error: {err}"
+        );
+
+        Ok(())
     }
 }
