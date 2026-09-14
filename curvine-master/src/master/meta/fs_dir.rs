@@ -1531,9 +1531,10 @@ mod tests {
     use crate::master::journal::JournalSystem;
     use crate::master::Master;
     use curvine_model::{
-        ClientAddress, CreateFileOptsBuilder, OpenFlags, SetAttrOptsBuilder, StorageType,
-        WorkerInfo,
+        BlockReportList, ClientAddress, CreateFileOptsBuilder, OpenFlags, SetAttrOptsBuilder,
+        StorageType, WorkerInfo,
     };
+    use curvine_rocksdb::RocksUtils;
     use curvine_runtime::common::Utils;
 
     fn report_test_fs(name: &str) -> MasterFilesystem {
@@ -1552,6 +1553,177 @@ mod tests {
         let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
         fs.add_test_worker(WorkerInfo::default());
         fs
+    }
+
+    fn create_file_blocks(
+        fs: &MasterFilesystem,
+        path: &str,
+        count: usize,
+    ) -> CommonResult<Vec<i64>> {
+        let status = fs.create(path, false)?;
+        let fs_dir = fs.fs_dir.write();
+        let mut inode = fs_dir.store.get_inode(status.id, None)?.unwrap();
+        let file = inode.as_file_mut()?;
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            let id = file.next_block_id()?;
+            file.add_block(BlockMeta::new(id, 128));
+            ids.push(id);
+        }
+
+        // Persist once to keep the multi-chunk fixture inexpensive.
+        let mut batch = fs_dir.store.new_batch();
+        batch.write_inode(&inode)?;
+        for &id in &ids {
+            batch.add_location(id, &BlockLocation::with_id(100))?;
+        }
+        batch.commit()?;
+        Ok(ids)
+    }
+
+    fn replace_inode_record(
+        fs: &MasterFilesystem,
+        inode_id: i64,
+        bytes: &[u8],
+    ) -> CommonResult<Vec<u8>> {
+        let fs_dir = fs.fs_dir.write();
+        let db = &fs_dir.store.store.db;
+        let key = RocksUtils::i64_to_bytes(inode_id);
+        let previous = db.get_cf(RocksInodeStore::CF_INODES, key)?.unwrap();
+        db.put_cf(RocksInodeStore::CF_INODES, key, bytes)?;
+        Ok(previous)
+    }
+
+    fn block_location_worker_ids(fs: &MasterFilesystem, id: i64) -> CommonResult<Vec<u32>> {
+        let mut ids: Vec<_> = fs
+            .fs_dir
+            .read()
+            .get_block_locations(id)?
+            .iter()
+            .map(|location| location.worker_id)
+            .collect();
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
+    #[test]
+    fn block_report_recovers_after_inode_error_without_applying_failed_chunk() -> CommonResult<()> {
+        for full_report in [false, true] {
+            let fs = report_test_fs("inode-error");
+            let mut worker = WorkerInfo::default();
+            worker.address.worker_id = 101;
+            fs.add_test_worker(worker);
+            let mut ids = create_file_blocks(&fs, "/healthy", 1)?;
+            ids.extend(create_file_blocks(&fs, "/unreadable", 1)?);
+            let inode_id = InodeId::get_id(ids[1]);
+            let report = || BlockReportList {
+                cluster_id: "curvine".into(),
+                worker_id: 101,
+                full_report,
+                total_len: ids.len() as u64,
+                blocks: ids
+                    .iter()
+                    .map(|&id| {
+                        BlockReportInfo::new(
+                            id,
+                            BlockReportStatus::Finalized,
+                            StorageType::Disk,
+                            128,
+                        )
+                    })
+                    .collect(),
+            };
+
+            let inode_bytes = replace_inode_record(&fs, inode_id, &[0xff])?;
+            assert!(fs.block_report(report(), None).is_err());
+            for &id in &ids {
+                assert_eq!(block_location_worker_ids(&fs, id)?, vec![100]);
+            }
+            assert!(fs
+                .worker_manager
+                .write()
+                .block_map
+                .handle_heartbeat(101)
+                .is_empty());
+            fs.file_status("/healthy")?;
+
+            replace_inode_record(&fs, inode_id, &inode_bytes)?;
+            for _ in 0..2 {
+                assert!(fs.block_report(report(), None)?.delete_blocks.is_empty());
+                for &id in &ids {
+                    assert_eq!(block_location_worker_ids(&fs, id)?, vec![100, 101]);
+                }
+                assert!(fs
+                    .worker_manager
+                    .write()
+                    .block_map
+                    .handle_heartbeat(101)
+                    .is_empty());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn block_report_recovers_after_inode_error_in_later_chunk() -> CommonResult<()> {
+        // Match the production boundary so one healthy update is staged in the failing chunk.
+        const CHUNK_SIZE: usize = 4096;
+        for full_report in [false, true] {
+            let fs = report_test_fs("later-inode-error");
+            let mut worker = WorkerInfo::default();
+            worker.address.worker_id = 101;
+            fs.add_test_worker(worker);
+            let mut ids = create_file_blocks(&fs, "/healthy", CHUNK_SIZE + 1)?;
+            ids.extend(create_file_blocks(&fs, "/unreadable", 1)?);
+            let inode_id = InodeId::get_id(*ids.last().unwrap());
+            let report = || BlockReportList {
+                cluster_id: "curvine".into(),
+                worker_id: 101,
+                full_report,
+                total_len: ids.len() as u64,
+                blocks: ids
+                    .iter()
+                    .map(|&id| {
+                        BlockReportInfo::new(
+                            id,
+                            BlockReportStatus::Finalized,
+                            StorageType::Disk,
+                            128,
+                        )
+                    })
+                    .collect(),
+            };
+
+            let inode_bytes = replace_inode_record(&fs, inode_id, &[0xff])?;
+            assert!(fs.block_report(report(), None).is_err());
+            for &id in &ids[..CHUNK_SIZE] {
+                assert_eq!(block_location_worker_ids(&fs, id)?, vec![100, 101]);
+            }
+            for &id in &ids[CHUNK_SIZE..] {
+                assert_eq!(block_location_worker_ids(&fs, id)?, vec![100]);
+            }
+            assert!(fs
+                .worker_manager
+                .write()
+                .block_map
+                .handle_heartbeat(101)
+                .is_empty());
+
+            replace_inode_record(&fs, inode_id, &inode_bytes)?;
+            for _ in 0..2 {
+                assert!(fs.block_report(report(), None)?.delete_blocks.is_empty());
+                for &id in &ids {
+                    assert_eq!(block_location_worker_ids(&fs, id)?, vec![100, 101]);
+                }
+                assert!(fs
+                    .worker_manager
+                    .write()
+                    .block_map
+                    .handle_heartbeat(101)
+                    .is_empty());
+            }
+        }
+        Ok(())
     }
 
     #[test]
