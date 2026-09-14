@@ -86,12 +86,6 @@ pub struct LostWorkerLocationCleanup {
     pub replication_block_ids: Vec<i64>,
 }
 
-pub(crate) enum BlockInodeState {
-    File,
-    Missing,
-    NotFile,
-}
-
 fn child_snapshot_path(parent: &str, child_name: &str) -> String {
     if parent == "/" {
         format!("/{child_name}")
@@ -1198,11 +1192,6 @@ impl MasterFilesystem {
         fs_dir.restore_from_rocksdb()
     }
 
-    fn block_inode_state(&self, id: i64) -> FsResult<BlockInodeState> {
-        let fs_dir = self.fs_dir.read();
-        fs_dir.block_inode_state(id)
-    }
-
     fn collect_full_block_report(&self, list: &BlockReportList) -> Option<HashSet<i64>> {
         if !list.full_report {
             return None;
@@ -1318,97 +1307,39 @@ impl MasterFilesystem {
             });
         }
 
-        //(Whether to increase, block id, block location)
-        let mut checked = Vec::with_capacity(list.blocks.len());
         let mut delete_blocks = Vec::new();
-        let mut missing_blocks = 0usize;
-        let mut not_file_blocks = 0usize;
-        for item in list.blocks {
-            match item.status {
-                BlockReportStatus::Finalized | BlockReportStatus::Writing => {
-                    let defer_writing_delete =
-                        item.status == BlockReportStatus::Writing && !list.full_report;
-                    let state = match self.block_inode_state(item.id) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            warn!("block_report {item:?}: {e}");
-                            continue;
-                        }
-                    };
-                    match state {
-                        BlockInodeState::File => checked.push((item, Some(BlockInodeState::File))),
-                        BlockInodeState::Missing if defer_writing_delete => {
-                            warn!(
-                                "block_report deferred deletion for writing block {} on worker {} because its inode is missing",
-                                item.id, list.worker_id
-                            );
-                        }
-                        BlockInodeState::NotFile if defer_writing_delete => {
-                            warn!(
-                                "block_report deferred deletion for writing block {} on worker {} because its inode is not a file",
-                                item.id, list.worker_id
-                            );
-                        }
-                        BlockInodeState::Missing => {
-                            missing_blocks += 1;
-                            delete_blocks.push(item.id);
-                            checked.push((item, Some(BlockInodeState::Missing)));
-                        }
-                        BlockInodeState::NotFile => {
-                            not_file_blocks += 1;
-                            delete_blocks.push(item.id);
-                            checked.push((item, Some(BlockInodeState::NotFile)));
-                        }
-                    }
-                }
-                BlockReportStatus::Deleted => checked.push((item, None)),
+        let mut blocks = list.blocks.into_iter();
+        loop {
+            let chunk: Vec<_> = blocks
+                .by_ref()
+                .take(Self::BLOCK_REPORT_WRITE_CHUNK)
+                .collect();
+            if chunk.is_empty() {
+                break;
             }
-        }
-        if missing_blocks > 0 || not_file_blocks > 0 {
-            warn!(
-                "block_report found {} missing-inode and {} non-file-inode blocks for worker {}; scheduling worker deletion",
-                missing_blocks, not_file_blocks, list.worker_id
-            );
-        }
-
-        let mut batch: Vec<(bool, i64, BlockLocation)> = vec![];
-        let mut wm = self.worker_manager.write();
-        for (item, exists) in checked {
-            let loc = BlockLocation::new(list.worker_id, item.storage_type);
-            match item.status {
-                BlockReportStatus::Finalized | BlockReportStatus::Writing => {
-                    let state = match exists {
-                        Some(v) => v,
-                        None => {
-                            warn!(
-                                "block_report invariant violated: missing inode state for block {}",
-                                item.id
-                            );
-                            continue;
-                        }
-                    };
-
-                    match state {
-                        BlockInodeState::File => batch.push((true, item.id, loc)),
-                        BlockInodeState::Missing | BlockInodeState::NotFile => {
-                            batch.push((false, item.id, loc));
-                            wm.remove_block(list.worker_id, item.id);
-                        }
-                    }
-                }
-                BlockReportStatus::Deleted => {
-                    batch.push((false, item.id, loc));
-                    wm.deleted_block(list.worker_id, item.id);
-                }
+            let deleted: Vec<_> = chunk
+                .iter()
+                .filter(|block| block.status == BlockReportStatus::Deleted)
+                .map(|block| block.id)
+                .collect();
+            let obsolete = self.fs_dir.write().apply_reported_blocks(
+                list.worker_id,
+                list.full_report,
+                chunk,
+            )?;
+            let mut wm = self.worker_manager.write();
+            for &id in &obsolete {
+                wm.remove_block(list.worker_id, id);
             }
+            for id in deleted {
+                wm.deleted_block(list.worker_id, id);
+            }
+            delete_blocks.extend(obsolete);
         }
-        drop(wm);
 
         if let Some(reported_blocks) = full_reported_blocks {
             self.submit_full_block_reconcile(list.worker_id, reported_blocks, replication_handler)?;
         }
-
-        self.apply_block_report_batch(batch)?;
 
         Ok(BlockReportResult { delete_blocks })
     }
