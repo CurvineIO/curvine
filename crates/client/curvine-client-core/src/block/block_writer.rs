@@ -22,7 +22,7 @@ use curvine_core_error::ErrorExt;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_io::DataSlice;
-use curvine_model::{BlockLocation, CommitBlock, LocatedBlock, WorkerAddress};
+use curvine_model::{BlockLocation, CommitBlock, LocatedBlock, StorageType, WorkerAddress};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use futures::future::{join_all, try_join_all};
 use std::sync::Arc;
@@ -47,6 +47,10 @@ where
     }
 }
 
+fn to_block_location(worker: &WorkerAddress, actual_storage_type: StorageType) -> BlockLocation {
+    BlockLocation::new(worker.worker_id, actual_storage_type)
+}
+
 enum WriterAdapter {
     Local(BlockWriterLocal),
     Remote(BlockWriterRemote),
@@ -57,6 +61,13 @@ impl WriterAdapter {
         match self {
             Local(f) => f.worker_address(),
             Remote(f) => f.worker_address(),
+        }
+    }
+
+    fn actual_storage_type(&self) -> StorageType {
+        match self {
+            Local(f) => f.actual_storage_type(),
+            Remote(f) => f.actual_storage_type(),
         }
     }
 
@@ -322,13 +333,9 @@ impl BlockWriter {
 
     pub fn to_commit_block(&self) -> CommitBlock {
         let locs = self
-            .locate
-            .locs
+            .inners
             .iter()
-            .map(|x| BlockLocation {
-                worker_id: x.worker_id,
-                storage_type: self.locate.block.storage_type,
-            })
+            .map(|writer| to_block_location(writer.worker_address(), writer.actual_storage_type()))
             .collect();
 
         CommitBlock {
@@ -341,10 +348,25 @@ impl BlockWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::finish_all_cancellations;
+    use super::{finish_all_cancellations, to_block_location};
     use curvine_error::FsError;
+    use curvine_model::{StorageType, WorkerAddress};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn commit_location_preserves_worker_selected_storage_type() {
+        let worker = WorkerAddress {
+            worker_id: 7,
+            ..Default::default()
+        };
+        let actual_storage_type = StorageType::Disk;
+        let location = to_block_location(&worker, actual_storage_type);
+
+        assert_eq!(location.worker_id, 7);
+        assert_eq!(location.storage_type, StorageType::Disk);
+        assert_ne!(location.storage_type, StorageType::Mem);
+    }
 
     #[tokio::test]
     async fn cancellation_attempts_all_futures_and_returns_an_error() {

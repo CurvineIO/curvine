@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type ConfMutator = Arc<dyn Fn(&mut ClusterConf) + Send + Sync>;
+type WorkerConfMutator = Arc<dyn Fn(usize, &mut ClusterConf) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Testing {
@@ -38,6 +39,7 @@ pub struct Testing {
     cluster_conf: ClusterConf,
     #[allow(clippy::type_complexity)]
     options: Option<ConfMutator>,
+    worker_options: Option<WorkerConfMutator>,
 }
 
 impl Testing {
@@ -89,7 +91,12 @@ impl Testing {
             let _ = FileUtils::delete_path(&data_dir, true);
         }
 
-        let cluster = MiniCluster::with_num(&conf, self.master_num, self.worker_num);
+        let mut cluster = MiniCluster::with_num(&conf, self.master_num, self.worker_num);
+        if let Some(f) = &self.worker_options {
+            for (index, worker_conf) in cluster.worker_conf.iter_mut().enumerate() {
+                (f)(index, worker_conf);
+            }
+        }
 
         // Save configuration file to active path
         let mut file = LocalFile::with_write(&self.active_cluster_conf_path, true)?;
@@ -166,6 +173,7 @@ pub struct TestingBuilder {
     base_conf_path: Option<String>,
     #[allow(clippy::type_complexity)]
     options: Option<ConfMutator>,
+    worker_options: Option<WorkerConfMutator>,
 }
 
 impl Default for TestingBuilder {
@@ -182,6 +190,7 @@ impl TestingBuilder {
             base_conf: None,
             base_conf_path: None,
             options: None,
+            worker_options: None,
         }
     }
 
@@ -214,6 +223,14 @@ impl TestingBuilder {
         self
     }
 
+    pub fn mutate_worker_conf<F>(mut self, f: F) -> Self
+    where
+        F: Fn(usize, &mut ClusterConf) + Send + Sync + 'static,
+    {
+        self.worker_options = Some(Arc::new(f));
+        self
+    }
+
     pub fn build(self) -> CommonResult<Testing> {
         let mut conf = if let Some(c) = self.base_conf {
             c
@@ -241,6 +258,7 @@ impl TestingBuilder {
             active_cluster_conf_path,
             cluster_conf: conf,
             options: self.options,
+            worker_options: self.worker_options,
         })
     }
 }

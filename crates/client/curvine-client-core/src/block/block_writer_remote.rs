@@ -17,7 +17,7 @@ use crate::file::FsContext;
 use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_io::DataSlice;
-use curvine_model::{ExtendedBlock, WorkerAddress};
+use curvine_model::{ExtendedBlock, StorageType, WorkerAddress};
 use curvine_proto::DataHeaderProto;
 use curvine_runtime::common::Utils;
 
@@ -30,6 +30,7 @@ pub struct BlockWriterRemote {
     req_id: i64,
     pending_header: Option<DataHeaderProto>,
     block_size: i64,
+    actual_storage_type: StorageType,
 }
 
 impl BlockWriterRemote {
@@ -74,6 +75,7 @@ impl BlockWriterRemote {
             worker_address,
             pending_header: None,
             block_size,
+            actual_storage_type: write_context.storage_type,
         };
 
         Ok(writer)
@@ -153,6 +155,10 @@ impl BlockWriterRemote {
 
     pub fn worker_address(&self) -> &WorkerAddress {
         &self.worker_address
+    }
+
+    pub fn actual_storage_type(&self) -> StorageType {
+        self.actual_storage_type
     }
 
     pub fn len(&self) -> i64 {
