@@ -5,7 +5,7 @@ use curvine_model::StorageType;
 use curvine_runtime::runtime::RpcRuntime;
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_tests::Testing;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[test]
@@ -33,17 +33,18 @@ fn replicas_on_different_workers_persist_each_actual_storage_type() -> CommonRes
     let testing = Testing::builder()
         .workers(2)
         .mutate_worker_conf(|index, conf| {
-            if index == 0 {
-                conf.worker.data_dir = conf
-                    .worker
-                    .data_dir
-                    .iter()
-                    .map(|path| format!("[MEM:256MB]{path}"))
-                    .collect();
-            }
+            let storage_type = if index == 0 { "MEM" } else { "DISK" };
+            conf.worker.data_dir = conf
+                .worker
+                .data_dir
+                .iter()
+                .map(|path| format!("[{storage_type}:256MB]{path}"))
+                .collect();
         })
         .build()?;
     let cluster = testing.start_cluster()?;
+    let mem_worker_port = cluster.worker_conf[0].worker.rpc_port as u32;
+    let disk_worker_port = cluster.worker_conf[1].worker.rpc_port as u32;
     let mut conf = testing.get_active_cluster_conf()?;
     conf.client.replicas = 2;
     conf.client.short_circuit = false;
@@ -77,20 +78,22 @@ fn replicas_on_different_workers_persist_each_actual_storage_type() -> CommonRes
             .iter()
             .map(|location| (location.worker_id, location.storage_type))
             .collect::<HashMap<_, _>>();
-        let addressed_workers = blocks.block_locs[0]
+        let expected_types = blocks.block_locs[0]
             .locs
             .iter()
-            .map(|address| address.worker_id)
-            .collect::<HashSet<_>>();
+            .map(|address| {
+                let storage_type = if address.rpc_port == mem_worker_port {
+                    StorageType::Mem
+                } else if address.rpc_port == disk_worker_port {
+                    StorageType::Disk
+                } else {
+                    panic!("unexpected worker RPC port: {}", address.rpc_port);
+                };
+                (address.worker_id, storage_type)
+            })
+            .collect::<HashMap<_, _>>();
 
-        assert_eq!(
-            actual_types.keys().copied().collect::<HashSet<_>>(),
-            addressed_workers
-        );
-        assert_eq!(
-            actual_types.values().copied().collect::<HashSet<_>>(),
-            HashSet::from([StorageType::Mem, StorageType::Disk])
-        );
+        assert_eq!(actual_types, expected_types);
         Ok(())
     })
 }
