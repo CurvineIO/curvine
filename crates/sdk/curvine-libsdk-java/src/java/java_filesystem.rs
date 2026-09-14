@@ -24,7 +24,7 @@ use curvine_fs_api::state::{DeleteResult, LoadJobCommand, SetAttrOpts};
 use curvine_fs_api::utils::ProtoUtils;
 use curvine_sdk_core::blocking_job as job;
 use jni::objects::{JByteArray, JString};
-use jni::sys::{jarray, jboolean, jstring};
+use jni::sys::{jarray, jboolean, jint, jstring};
 use jni::JNIEnv;
 use prost::Message;
 
@@ -53,6 +53,7 @@ fn decode_load_job_command(
     source_path: JString,
     target_path: JString,
     overwrite: jboolean,
+    replicas: Option<jint>,
 ) -> FsResult<LoadJobCommand> {
     let source = JavaUtils::jstring_to_string(env, &source_path)?;
     let target = if target_path.is_null() {
@@ -70,6 +71,12 @@ fn decode_load_job_command(
         LoadJobCommand::builder(source).overwrite(JavaUtils::jbool_to_bool(overwrite));
     if let Some(target) = target {
         builder = builder.target_path(target);
+    }
+    if let Some(replicas) = replicas {
+        if replicas <= 0 {
+            return err_box!("load replicas must be greater than zero");
+        }
+        builder = builder.replicas(replicas);
     }
     Ok(builder.build())
 }
@@ -242,8 +249,9 @@ impl JavaFilesystem {
         source_path: JString,
         target_path: JString,
         overwrite: jboolean,
+        replicas: Option<jint>,
     ) -> FsResult<jarray> {
-        let command = decode_load_job_command(env, source_path, target_path, overwrite)?;
+        let command = decode_load_job_command(env, source_path, target_path, overwrite, replicas)?;
         let result = job::submit_load_job(self.inner.session(), command)?;
         let response = SubmitJobResponse {
             job_id: result.job_id,

@@ -198,6 +198,7 @@ where
                 )));
             }
         }
+        validate_transfer_options(&command)?;
         validate_transfer_paths(command.kind, &command.source_path, &command.target_path)?;
         command.target_path = normalized_transfer_path(&Path::from_str(&command.target_path)?);
         let snapshot = self.transfer_snapshot(&command)?;
@@ -752,6 +753,26 @@ fn transfer_kind(kind: i32) -> FsResult<TransferKind> {
         Some(TransferKindProto::TransferExport) => Ok(TransferKind::Export),
         None => Err(FsError::common(format!("Invalid transfer kind {}", kind))),
     }
+}
+
+fn validate_transfer_options(command: &TransferCommand) -> FsResult<()> {
+    let Some(value) = command.options.get(TransferCommand::REPLICAS_OPTION) else {
+        return Ok(());
+    };
+    if command.kind != TransferKind::Load {
+        return Err(FsError::common(
+            "replicas is supported only for load transfers",
+        ));
+    }
+    let replicas = value
+        .parse::<i32>()
+        .map_err(|_| FsError::common("transfer replicas must be a positive integer"))?;
+    if replicas <= 0 {
+        return Err(FsError::common(
+            "transfer replicas must be a positive integer",
+        ));
+    }
+    Ok(())
 }
 
 fn transfer_state(state: i32) -> FsResult<TransferState> {

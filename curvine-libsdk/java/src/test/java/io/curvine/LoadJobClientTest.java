@@ -62,6 +62,22 @@ public class LoadJobClientTest {
     }
 
     @Test
+    public void requestBuilderSupportsPositiveReplicas() {
+        LoadJobRequest request = LoadJobRequest.builder()
+                .sourcePath("s3://bucket/a")
+                .replicas(3)
+                .build();
+        Assert.assertEquals(Integer.valueOf(3), request.getReplicas());
+
+        try {
+            LoadJobRequest.builder().sourcePath("s3://bucket/a").replicas(0).build();
+            Assert.fail("expected IllegalArgumentException");
+        } catch (IllegalArgumentException expected) {
+            Assert.assertTrue(expected.getMessage().contains("replicas"));
+        }
+    }
+
+    @Test
     public void terminalStateDetectionMatchesForceRetrySemantics() {
         Assert.assertFalse(CurvineTransferClient.isTerminal(JobTaskStateProto.PENDING));
         Assert.assertFalse(CurvineTransferClient.isTerminal(JobTaskStateProto.LOADING));

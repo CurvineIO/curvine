@@ -348,14 +348,20 @@ pub(crate) fn load_job_info(
     mount: &MountInfo,
     client_conf: &ClientConf,
 ) -> LoadJobInfo {
-    let overwrite = transfer_command(job)
+    let command = transfer_command(job).ok();
+    let overwrite = command
+        .as_ref()
         .map(|command| command.overwrite())
         .unwrap_or(true);
     LoadJobInfo {
         job_id: job.job_id.clone(),
         source_path: job.source_path.clone(),
         target_path: job.target_path.clone(),
-        replicas: mount.replicas.unwrap_or(client_conf.replicas),
+        replicas: command
+            .as_ref()
+            .and_then(|command| command.replicas())
+            .or(mount.replicas)
+            .unwrap_or(client_conf.replicas),
         block_size: mount.block_size.unwrap_or(client_conf.block_size),
         storage_type: mount.storage_type.unwrap_or(client_conf.storage_type),
         ttl_ms: mount.ttl_ms,

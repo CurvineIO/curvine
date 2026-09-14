@@ -433,6 +433,16 @@ public class CurvineNative {
             long nativeHandle, String sourcePath, String targetPath, boolean overwrite)
             throws IOException;
 
+    /**
+     * Submit a UFS-to-Curvine load job with an explicit replica count.
+     *
+     * @param replicas replica count for this job
+     * @return serialized {@code SubmitJobResponse} protobuf bytes
+     */
+    public static native byte[] submitLoadJobWithReplicas(
+            long nativeHandle, String sourcePath, String targetPath, boolean overwrite, int replicas)
+            throws IOException;
+
     /** Submit a Curvine-to-UFS export job. */
     public static native byte[] submitExportJob(
             long nativeHandle, String sourcePath, boolean overwrite) throws IOException;
