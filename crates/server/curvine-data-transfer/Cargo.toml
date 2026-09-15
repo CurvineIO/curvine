@@ -83,7 +83,3 @@ url = { workspace = true, optional = true }
 [[test]]
 name = "postgres_store_test"
 required-features = ["transfer-store-postgres"]
-
-[[test]]
-name = "mysql_store_test"
-required-features = ["transfer-store-mysql"]
