@@ -30,10 +30,12 @@ use std::time::Duration;
 //
 // 1. Kernel-side caching (the kernel caches on our behalf, controlled via the
 //    FUSE reply `entry_valid` / `attr_valid` fields):
-//    - `entry_timeout_ms`   -> how long the kernel trusts a name->inode lookup.
-//    - `negative_timeout_ms`-> how long the kernel caches a negative lookup (ENOENT).
-//    - `attr_timeout_ms`    -> how long the kernel trusts cached file/dir attributes.
-//    These trade metadata freshness for fewer upcalls into user space.
+//    - `entry_timeout`    -> how long the kernel trusts a name->inode lookup.
+//    - `negative_timeout` -> how long the kernel caches a negative lookup (ENOENT).
+//    - `attr_timeout`     -> how long the kernel trusts cached file/dir attributes.
+//    These are `DurationUnit` values (bare integers = milliseconds, or strings
+//    such as `"1s"` / `"500ms"`). They trade metadata freshness for fewer
+//    upcalls into user space. The `*_ms` TOML/CLI names remain aliases.
 //
 // 2. User-side caching (maintained inside curvine-fuse itself):
 //    - `enable_meta_cache` / `meta_cache_timeout` -> the userspace metadata
@@ -41,6 +43,7 @@ use std::time::Duration;
 //    - `meta_cache_ttl` (derived from `meta_cache_timeout` in `init()`) -> TTL
 //      for metadata cache entries.
 //    - `node_cache_timeout` -> TTL-based eviction of the inode/node map.
+//    Cache timeouts are also `DurationUnit` (e.g. `"60s"`, `"1h"`).
 //
 // 3. IO caching / data-path switches (control how file *data* is cached by the
 //    page cache, mutually interacting per open):
@@ -156,25 +159,30 @@ pub struct FuseConf {
     #[client_cli]
     pub read_dir_fill_ino: bool,
 
-    // Name search cache time, in milliseconds.
+    // Name search cache time (`DurationUnit`: integer milliseconds or `"1s"` / `"500ms"`).
     // After performing a name search, if the same name is requested again, the kernel will check the cache first.
     // If the buffer record is still valid, the cache result will be returned directly, unlike user space for requests.
     // Default 1000ms (1 second). Sub-second granularity is supported (e.g. 500 = 0.5s).
-    #[client_cli]
-    pub entry_timeout_ms: u64,
+    // `entry_timeout_ms` / `--entry-timeout-ms` kept so existing TOML and mount
+    // scripts do not silently fall back to the default.
+    #[serde(alias = "entry_timeout_ms")]
+    #[client_cli(long = "entry-timeout", alias = "entry-timeout-ms")]
+    pub entry_timeout: DurationUnit,
 
-    // The timeout (in milliseconds) of cache negative lookups. This means that if the file does not exist (find returns ENOENT)
-    // Then the search will only be redone after the timeout, and the file/directory will be assumed to not exist before this.
-    // The default value is 0ms, which means cache negative lookup is disabled.
-    #[client_cli]
-    pub negative_timeout_ms: u64,
+    // Timeout of cached negative lookups (`DurationUnit`). If the file does not exist
+    // (lookup returns ENOENT), the search is only redone after this timeout.
+    // Default 0ms disables negative-lookup caching.
+    #[serde(alias = "negative_timeout_ms")]
+    #[client_cli(long = "negative-timeout", alias = "negative-timeout-ms")]
+    pub negative_timeout: DurationUnit,
 
-    // Cache time for file and directory attributes, in milliseconds.
-    // This means that after a file or directory attribute search, if the same attribute is requested again, the kernel will first check the cache.
-    // If the record in the cache is still valid (i.e. the timeout time has not exceeded), the cached result will be returned directly without making a request to the user space again
+    // Cache time for file and directory attributes (`DurationUnit`).
+    // After a getattr, if the same attribute is requested again, the kernel will first check the cache.
+    // If the record is still valid, the cached result is returned without a userspace request.
     // Default is 1000ms (1 second). Sub-second granularity is supported (e.g. 500 = 0.5s).
-    #[client_cli]
-    pub attr_timeout_ms: u64,
+    #[serde(alias = "attr_timeout_ms")]
+    #[client_cli(long = "attr-timeout", alias = "attr-timeout-ms")]
+    pub attr_timeout: DurationUnit,
 
     // Parameters are used to specify whether the file system should remember the opened files and directories.
     // By default, the FUSE file system clears the cache when a file or directory is closed.
@@ -192,11 +200,12 @@ pub struct FuseConf {
     #[client_cli]
     pub enable_meta_cache: bool,
 
-    // Metadata cache TTL string (parsed into `meta_cache_ttl` by `init()`)
+    // Userspace metadata cache TTL (`DurationUnit`, e.g. `"60s"`). Copied into
+    // `meta_cache_ttl` by `init()`.
     #[client_cli(long = "meta-cache-ttl")]
-    pub meta_cache_timeout: String,
+    pub meta_cache_timeout: DurationUnit,
     #[client_cli]
-    pub node_cache_timeout: String,
+    pub node_cache_timeout: DurationUnit,
 
     // File and directory related options
     #[client_cli]
@@ -329,11 +338,11 @@ impl FuseConf {
             );
         }
 
-        self.attr_ttl = Duration::from_millis(self.attr_timeout_ms);
-        self.entry_ttl = Duration::from_millis(self.entry_timeout_ms);
-        self.negative_ttl = Duration::from_millis(self.negative_timeout_ms);
-        self.node_cache_ttl = DurationUnit::from_str(&self.node_cache_timeout)?.as_duration();
-        self.meta_cache_ttl = DurationUnit::from_str(&self.meta_cache_timeout)?.as_duration();
+        self.attr_ttl = self.attr_timeout.as_duration();
+        self.entry_ttl = self.entry_timeout.as_duration();
+        self.negative_ttl = self.negative_timeout.as_duration();
+        self.node_cache_ttl = self.node_cache_timeout.as_duration();
+        self.meta_cache_ttl = self.meta_cache_timeout.as_duration();
 
         // NOTE: `tasks_per_mnt == 0` means "follow io_threads". This is resolved
         // at the consumption point (FuseChannel::new via `effective_tasks_per_mnt`),
@@ -665,9 +674,9 @@ impl Default for FuseConf {
             uid: sys::get_uid(),
             gid: sys::get_gid(),
             read_dir_fill_ino: true,
-            entry_timeout_ms: FuseConf::DEFAULT_ENTRY_TIMEOUT_MS,
-            negative_timeout_ms: FuseConf::DEFAULT_NEGATIVE_TIMEOUT_MS,
-            attr_timeout_ms: FuseConf::DEFAULT_ATTR_TIMEOUT_MS,
+            entry_timeout: DurationUnit::new(FuseConf::DEFAULT_ENTRY_TIMEOUT_MS),
+            negative_timeout: DurationUnit::new(FuseConf::DEFAULT_NEGATIVE_TIMEOUT_MS),
+            attr_timeout: DurationUnit::new(FuseConf::DEFAULT_ATTR_TIMEOUT_MS),
             remember: false,
             web_port: crate::ClusterConf::DEFAULT_FUSE_WEB_PORT,
 
@@ -675,8 +684,8 @@ impl Default for FuseConf {
             congestion_threshold: 192,
 
             enable_meta_cache: false,
-            meta_cache_timeout: "60s".to_string(),
-            node_cache_timeout: "1h".to_string(),
+            meta_cache_timeout: DurationUnit::new(60 * DurationUnit::SECONDS),
+            node_cache_timeout: DurationUnit::new(DurationUnit::HOUR),
 
             direct_io: false,
             open_direct_on_stale: false,
@@ -1243,6 +1252,46 @@ node_cache_size = 200000
     }
 
     #[test]
+    fn toml_duration_unit_accepts_millis_and_strings() {
+        let toml = r#"
+attr_timeout = 500
+entry_timeout = "2s"
+negative_timeout = 0
+meta_cache_timeout = "90s"
+node_cache_timeout = "1h"
+"#;
+        let mut conf: FuseConf = toml::from_str(toml).expect("duration fields must deserialize");
+        conf.init().expect("init must accept DurationUnit timeouts");
+
+        assert_eq!(conf.attr_timeout.as_millis(), 500);
+        assert_eq!(conf.entry_timeout.as_millis(), 2000);
+        assert_eq!(conf.negative_timeout.as_millis(), 0);
+        assert_eq!(conf.meta_cache_timeout.as_millis(), 90_000);
+        assert_eq!(conf.node_cache_timeout.as_millis(), DurationUnit::HOUR);
+        assert_eq!(conf.attr_ttl, Duration::from_millis(500));
+        assert_eq!(conf.entry_ttl, Duration::from_secs(2));
+        assert_eq!(conf.meta_cache_ttl, Duration::from_secs(90));
+        assert_eq!(conf.node_cache_ttl, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn toml_legacy_timeout_ms_alias_preserved() {
+        let toml = r#"
+attr_timeout_ms = 500
+entry_timeout_ms = "2s"
+negative_timeout_ms = 0
+"#;
+        let mut conf: FuseConf =
+            toml::from_str(toml).expect("legacy *_ms timeout keys must deserialize via alias");
+        conf.init()
+            .expect("init must accept aliased DurationUnit timeouts");
+
+        assert_eq!(conf.attr_timeout.as_millis(), 500);
+        assert_eq!(conf.entry_timeout.as_millis(), 2000);
+        assert_eq!(conf.negative_timeout.as_millis(), 0);
+    }
+
+    #[test]
     fn toml_legacy_mnt_per_task_alias_preserved() {
         // mnt_per_task was renamed to tasks_per_mnt (issue #1023 §2). FuseConf is
         // #[serde(default)] without deny_unknown_fields, so without a serde alias the
@@ -1312,12 +1361,14 @@ mnt_per_task = 7
         // (node_cache_size). The renamed-but-aliased key (mnt_per_task) is
         // still consumed via #[serde(alias)], and a current field (io_threads)
         // likewise — neither is flagged. max_readahead_kb (Option<u32>, None
-        // default) is also consumed and must not be flagged.
+        // default) is also consumed and must not be flagged. The renamed timeout
+        // keys (`attr_timeout_ms`) stay consumed via alias.
         let raw = r#"
 [fuse]
 io_threads = 16
 node_cache_size = 200000
 mnt_per_task = 7
+attr_timeout_ms = 1000
 max_readahead_kb = 1024
 direct_iox = true
 "#;

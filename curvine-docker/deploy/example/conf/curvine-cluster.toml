@@ -107,12 +107,12 @@ log = { level = "info", log_dir = "./logs", file_name = "transfer.log" }
 
 [fuse]
 debug = false
-# Kernel-side metadata cache timeouts (milliseconds).
-# BREAKING: the old second-based keys attr_timeout / entry_timeout /
-# negative_timeout were renamed to *_ms (value x1000) and are now ignored.
-attr_timeout_ms = 1000
-entry_timeout_ms = 1000
-negative_timeout_ms = 0
+# Kernel-side metadata cache timeouts (`DurationUnit`: integer milliseconds
+# or strings such as "1s" / "500ms"). The previous `*_ms` keys are still
+# accepted as aliases. Bare integers are milliseconds, not seconds.
+attr_timeout = 1000
+entry_timeout = 1000
+negative_timeout = 0
 
 [log]
 level = "info"

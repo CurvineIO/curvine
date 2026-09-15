@@ -96,19 +96,19 @@ class ConfigParseTest(unittest.TestCase):
 
         self.assertIn("[client]\nenable_unified_fs = false", rendered)
         self.assertIn("write_back_cache = true", rendered)
-        self.assertIn("entry_timeout_ms = 300000", rendered)
-        self.assertIn("attr_timeout_ms = 300000", rendered)
+        self.assertIn("entry_timeout = 300000", rendered)
+        self.assertIn("attr_timeout = 300000", rendered)
         self.assertIn('meta_cache_timeout = "12h"', rendered)
         self.assertIn('node_cache_timeout = "24h"', rendered)
-        self.assertIn("--entry-timeout-ms 300000", script)
-        self.assertNotIn("--entry-timeout 300000", script)
+        self.assertIn("--entry-timeout 300000", script)
+        self.assertNotIn("--entry-timeout-ms 300000", script)
 
         if tomllib is not None:
             parsed = tomllib.loads(rendered)
             self.assertFalse(parsed["client"]["enable_unified_fs"])
             self.assertTrue(parsed["fuse"]["write_back_cache"])
-            self.assertEqual(parsed["fuse"]["entry_timeout_ms"], 300000)
-            self.assertEqual(parsed["fuse"]["attr_timeout_ms"], 300000)
+            self.assertEqual(parsed["fuse"]["entry_timeout"], 300000)
+            self.assertEqual(parsed["fuse"]["attr_timeout"], 300000)
             self.assertEqual(parsed["fuse"]["meta_cache_timeout"], "12h")
             self.assertEqual(parsed["fuse"]["node_cache_timeout"], "24h")
 

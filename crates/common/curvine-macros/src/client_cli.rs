@@ -441,7 +441,7 @@ fn validate_cli_field_type(field: &Field) -> syn::Result<()> {
     } else {
         Err(syn::Error::new_spanned(
             &field.ty,
-            "ClientCliArgs supports String, bool, integer, and f64 types only",
+            "ClientCliArgs supports String, bool, integer, f64, and DurationUnit types only",
         ))
     }
 }
@@ -468,22 +468,22 @@ fn is_copy_type(ty: &Type) -> bool {
         return false;
     };
     let name = seg.ident.to_string();
-    name != "String"
-        && matches!(
-            name.as_str(),
-            "bool"
-                | "usize"
-                | "isize"
-                | "u8"
-                | "u16"
-                | "u32"
-                | "u64"
-                | "i8"
-                | "i16"
-                | "i32"
-                | "i64"
-                | "f64"
-        )
+    matches!(
+        name.as_str(),
+        "bool"
+            | "usize"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "f64"
+            | "DurationUnit"
+    )
 }
 
 fn is_octal_cli_type(ty: &Type) -> bool {
@@ -519,5 +519,6 @@ fn is_supported_cli_type(ty: &Type) -> bool {
             | "i32"
             | "i64"
             | "f64"
+            | "DurationUnit"
     )
 }

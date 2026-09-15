@@ -153,7 +153,7 @@ mod tests {
     use clap::Parser;
     use curvine_config::ClusterConf;
     use curvine_core_error::CommonResult;
-    use curvine_runtime::common::Utils;
+    use curvine_runtime::common::{DurationUnit, Utils};
     use std::fs;
 
     fn try_get_conf(config: &str, extra_args: &[&str]) -> CommonResult<ClusterConf> {
@@ -212,7 +212,10 @@ mod tests {
     #[test]
     fn meta_cache_ttl_flag_maps_to_timeout_field() {
         let conf = get_conf("[fuse]\n", &["--meta-cache-ttl", "90s"]);
-        assert_eq!(conf.fuse.meta_cache_timeout, "90s");
+        assert_eq!(
+            conf.fuse.meta_cache_timeout,
+            DurationUnit::new(90 * DurationUnit::SECONDS)
+        );
     }
 
     #[test]

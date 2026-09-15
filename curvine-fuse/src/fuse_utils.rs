@@ -586,7 +586,7 @@ impl FuseUtils {
     /// EACCES (LTP lstat02/stat03/readlink03).
     ///
     /// For strict/POSIX semantics (full LTP compliance), mount with
-    /// `entry_timeout_ms = 0` and `attr_timeout_ms = 0` so every lookup/getattr
+    /// `entry_timeout = 0` and `attr_timeout = 0` so every lookup/getattr
     /// revalidates against the metadata service.
     pub fn kernel_cache_timeouts(conf: &FuseConf) -> (u64, u32, u64, u32) {
         (
