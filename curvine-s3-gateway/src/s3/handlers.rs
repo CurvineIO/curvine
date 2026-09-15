@@ -115,6 +115,7 @@ impl S3Handlers {
     }
 
     #[inline]
+    #[allow(clippy::result_unit_err)]
     pub async fn handle_get_bucket_location(
         &self,
         _loc: Option<&str>,

@@ -1122,9 +1122,8 @@ impl LoadTaskRunner {
 
     async fn report_progress(&self, progress: JobTaskProgress) -> FsResult<()> {
         let task = &self.task.info;
-        if task.transfer_report.is_some() {
+        if let Some(report_info) = &task.transfer_report {
             let Some(reporter) = &self.progress_reporter else {
-                let report_info = task.transfer_report.as_ref().unwrap();
                 let report_endpoints = if report_info.report_endpoints.is_empty() {
                     vec![report_info.report_target.clone()]
                 } else {
