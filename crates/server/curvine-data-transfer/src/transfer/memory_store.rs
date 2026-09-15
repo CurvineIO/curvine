@@ -334,7 +334,7 @@ impl TransferStore for MemoryTransferStore {
         let running_event_lease_before_ms =
             now_ms.saturating_add(lease_ms.saturating_sub(running_check_interval_ms));
         let running_renew_lease_before_ms = now_ms.saturating_add(lease_ms / 2);
-        let candidate_id =
+        let candidate_id = if !prefer_pending {
             inner
                 .jobs
                 .values()
@@ -349,6 +349,11 @@ impl TransferStore for MemoryTransferStore {
                 })
                 .min_by_key(|job| job.updated_at)
                 .map(|job| job.job_id.clone())
+        } else {
+            None
+        };
+        let candidate_id =
+            candidate_id
                 .or_else(|| {
                     inner
                         .jobs

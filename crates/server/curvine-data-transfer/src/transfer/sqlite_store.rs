@@ -271,13 +271,13 @@ impl TransferStore for SqliteTransferStore {
             .map_err(sqlite_err)?;
         for row in rows {
             let (state, n) = row.map_err(sqlite_err)?;
-            match TransferTaskState::from(state) {
-                TransferTaskState::Pending => counts.pending += n as u64,
-                TransferTaskState::Running => counts.running += n as u64,
-                TransferTaskState::Completed => counts.completed += n as u64,
-                TransferTaskState::Failed => counts.failed += n as u64,
-                TransferTaskState::Canceled => counts.canceled += n as u64,
-                TransferTaskState::Stale => counts.stale += n as u64,
+            match state {
+                1 => counts.pending += n as u64,
+                2 => counts.running += n as u64,
+                3 => counts.completed += n as u64,
+                4 => counts.failed += n as u64,
+                5 => counts.canceled += n as u64,
+                6 => counts.stale += n as u64,
                 _ => {}
             }
         }

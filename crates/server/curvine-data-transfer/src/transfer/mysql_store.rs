@@ -330,13 +330,13 @@ impl TransferStore for MysqlTransferStore {
             )
             .map_err(mysql_err)?
         {
-            match TransferTaskState::from(row.0) {
-                TransferTaskState::Pending => counts.pending += row.1,
-                TransferTaskState::Running => counts.running += row.1,
-                TransferTaskState::Completed => counts.completed += row.1,
-                TransferTaskState::Failed => counts.failed += row.1,
-                TransferTaskState::Canceled => counts.canceled += row.1,
-                TransferTaskState::Stale => counts.stale += row.1,
+            match row.0 {
+                1 => counts.pending += row.1,
+                2 => counts.running += row.1,
+                3 => counts.completed += row.1,
+                4 => counts.failed += row.1,
+                5 => counts.canceled += row.1,
+                6 => counts.stale += row.1,
                 _ => {}
             }
         }

@@ -277,6 +277,7 @@ impl TransferPlanner {
     /// instead of silently copying only one file of the batch. Manifest
     /// entries carry paths relative to the source root; a batch may span
     /// subdirectories.
+    #[allow(clippy::too_many_arguments)]
     async fn push_segment_tasks(
         &self,
         job: &TransferJobRecord,

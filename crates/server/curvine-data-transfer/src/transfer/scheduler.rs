@@ -319,7 +319,7 @@ where
         // them forever and a new Pending job starves (observed: a Pending job
         // waited 34 minutes while 19 existing jobs were dispatched).
         let tick = self.acquire_tick.fetch_add(1, Ordering::Relaxed);
-        let prefer_pending = tick % ACQUIRE_PENDING_EVERY_N_TICKS == 0;
+        let prefer_pending = tick.is_multiple_of(ACQUIRE_PENDING_EVERY_N_TICKS);
         let Some(lease) = self.store.acquire_runnable_transfer(
             &self.owner,
             duration_ms(self.conf.lease_timeout),
@@ -1805,7 +1805,7 @@ fn transfer_task_state(state: i32) -> TransferTaskState {
 pub(super) fn stale_retry_backoff_ms(retry_count: u32) -> i64 {
     const BASE_MS: i64 = 10_000;
     const CAP_MS: i64 = 120_000;
-    let shift = retry_count.min(4) as u32; // 2^4 = 16x -> 160s, capped to 120s
+    let shift = retry_count.min(4); // 2^4 = 16x -> 160s, capped to 120s
     let backoff = BASE_MS.saturating_mul(1i64 << shift);
     backoff.min(CAP_MS)
 }
