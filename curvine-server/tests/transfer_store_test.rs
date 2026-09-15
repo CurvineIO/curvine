@@ -57,7 +57,7 @@ where
         .create_or_get_by_request_id(transfer_job("snapshot", "/cache/snapshot"))
         .unwrap();
     let lease = store
-        .acquire_runnable_transfer("owner-1", 60_000, 10, 10)
+        .acquire_runnable_transfer("owner-1", 60_000, 10, 10, false)
         .unwrap()
         .unwrap();
 
@@ -205,7 +205,7 @@ fn assert_acquire_skips_pending_target_conflicts<S>(
     store.create_or_get_by_request_id(unrelated).unwrap();
 
     let first_lease = store
-        .acquire_runnable_transfer("owner-1", 60_000, 10, 10)
+        .acquire_runnable_transfer("owner-1", 60_000, 10, 10, false)
         .unwrap()
         .unwrap();
     assert_eq!(first_lease.job_id, "job-first");
@@ -229,7 +229,7 @@ fn assert_acquire_skips_pending_target_conflicts<S>(
         "{\"mount\":true}"
     );
     let unrelated_lease = store
-        .acquire_runnable_transfer("owner-2", 60_000, 20, 10)
+        .acquire_runnable_transfer("owner-2", 60_000, 20, 10, false)
         .unwrap()
         .unwrap();
     assert_eq!(unrelated_lease.job_id, "job-unrelated");
@@ -252,7 +252,7 @@ fn assert_acquire_skips_pending_target_conflicts<S>(
         .unwrap());
 
     let second_lease = store
-        .acquire_runnable_transfer("owner-3", 60_000, 40, 10)
+        .acquire_runnable_transfer("owner-3", 60_000, 40, 10, false)
         .unwrap()
         .unwrap();
     assert_eq!(second_lease.job_id, "job-second");
@@ -276,7 +276,7 @@ where
 
     assert_eq!(
         store
-            .acquire_runnable_transfer("owner-1", 60_000, 10, 10)
+            .acquire_runnable_transfer("owner-1", 60_000, 10, 10, false)
             .unwrap()
             .unwrap()
             .job_id,
@@ -284,7 +284,7 @@ where
     );
     assert_eq!(
         store
-            .acquire_runnable_transfer("owner-2", 60_000, 20, 10)
+            .acquire_runnable_transfer("owner-2", 60_000, 20, 10, false)
             .unwrap()
             .unwrap()
             .job_id,
@@ -304,12 +304,12 @@ where
     store.create_or_get_by_request_id(child).unwrap();
 
     let root_lease = store
-        .acquire_runnable_transfer("owner-1", 60_000, 10, 10)
+        .acquire_runnable_transfer("owner-1", 60_000, 10, 10, false)
         .unwrap()
         .unwrap();
     assert_eq!(root_lease.job_id, "job-root");
     assert!(store
-        .acquire_runnable_transfer("owner-2", 60_000, 20, 10)
+        .acquire_runnable_transfer("owner-2", 60_000, 20, 10, false)
         .unwrap()
         .is_none());
     assert_eq!(
@@ -331,7 +331,7 @@ where
         .unwrap());
     assert_eq!(
         store
-            .acquire_runnable_transfer("owner-3", 60_000, 40, 10)
+            .acquire_runnable_transfer("owner-3", 60_000, 40, 10, false)
             .unwrap()
             .unwrap()
             .job_id,
