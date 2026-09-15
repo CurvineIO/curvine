@@ -295,10 +295,22 @@ pub struct TransferJobRecord {
 
 /// Multi-file batch manifest carried in a batch task's `source_read_plan_json`
 /// (design §7). The `{"batch": ...}` wrapper distinguishes it from a per-file
-/// CV block-read plan (a bare JSON array).
+/// CV block-read plan (a bare JSON array) and from a file segment
+/// (`{"segment": ...}`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BatchManifest {
     pub batch: Vec<BatchManifestEntry>,
+}
+
+/// A single-file segment plan carried in a segment task's `source_read_plan_json`
+/// (design §14): one task copies one byte range of one file, aligned to the CV
+/// target block size so each segment writes exactly one block on one worker.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SegmentPlan {
+    /// Byte offset in the source file (aligned to CV block size).
+    pub offset: i64,
+    /// Bytes in this segment (<= one CV block).
+    pub length: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
