@@ -112,6 +112,17 @@ fn opendal_io_error(
     storage_error(operation, path, e, not_found)
 }
 
+pub enum ReadPolicy {
+    Sequential,
+    Random,
+}
+
+impl ReadPolicy {
+    pub fn is_random(&self) -> bool {
+        matches!(self, ReadPolicy::Random)
+    }
+}
+
 /// OpenDAL Reader implementation
 pub struct OpendalReader {
     operator: Operator,
@@ -121,10 +132,10 @@ pub struct OpendalReader {
     pos: i64,
     chunk: DataSlice,
     chunk_size: usize,
-    /// Number of concurrent range requests OpenDAL prefetches for this object.
     concurrent: usize,
     byte_stream: Option<opendal::FuturesBytesStream>,
     status: FileStatus,
+    read_policy: ReadPolicy,
 }
 
 impl Reader for OpendalReader {
@@ -158,10 +169,39 @@ impl Reader for OpendalReader {
 
     async fn read_chunk0(&mut self) -> FsResult<DataSlice> {
         if !self.has_remaining() {
+            self.byte_stream = None;
             return Ok(DataSlice::Empty);
         }
 
-        // Initialize stream if needed
+        if self.read_policy.is_random() {
+            self.byte_stream = None;
+
+            let start = self.pos as u64;
+            let end = start
+                .saturating_add(self.chunk_size as u64)
+                .min(self.length as u64);
+
+            let data = self
+                .operator
+                .read_with(&self.object_path)
+                .range(start..end)
+                .await
+                .map_err(|e| opendal_error("Failed to read random range", &self.object_path, e))?
+                .to_bytes();
+            let expected = (end - start) as usize;
+            if data.len() != expected {
+                return err_box!(format!(
+                    "short random range read at {}: expected {} bytes, got {}",
+                    self.pos,
+                    expected,
+                    data.len()
+                ));
+            }
+
+            self.read_policy = ReadPolicy::Sequential;
+            return Ok(DataSlice::Bytes(data));
+        }
+
         if self.byte_stream.is_none() {
             let reader = self
                 .operator
@@ -179,21 +219,27 @@ impl Reader for OpendalReader {
             );
         }
 
-        if let Some(stream) = &mut self.byte_stream {
-            if let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(chunk) => Ok(DataSlice::Bytes(chunk)),
-                    Err(e) => Err(opendal_io_error(
-                        "Failed to read chunk",
-                        &self.object_path,
-                        e,
-                    )),
-                }
-            } else {
-                Ok(DataSlice::Empty)
+        let next = match self.byte_stream.as_mut() {
+            Some(stream) => stream.next().await,
+            None => return err_box!("byte stream is not initialized"),
+        };
+        match next {
+            Some(Ok(chunk)) => Ok(DataSlice::Bytes(chunk)),
+            Some(Err(e)) => {
+                self.byte_stream = None;
+                Err(opendal_io_error(
+                    "Failed to read chunk",
+                    &self.object_path,
+                    e,
+                ))
             }
-        } else {
-            Ok(DataSlice::Empty)
+            None => {
+                self.byte_stream = None;
+                err_box!(format!(
+                    "stream ended before EOF at {} (file length {})",
+                    self.pos, self.length
+                ))
+            }
         }
     }
 
@@ -212,6 +258,7 @@ impl Reader for OpendalReader {
         } else {
             self.chunk.clear();
             self.byte_stream = None;
+            self.read_policy = ReadPolicy::Random;
         }
 
         self.pos = pos;
@@ -322,9 +369,9 @@ pub struct OpendalFileSystem {
     operator: Operator,
     scheme: String,
     bucket_or_container: String,
-    /// Per-object read buffer size (bytes); internal constant, see OpendalConf.
+    /// Per-object Range size (bytes), configured through OpendalConf.
     read_chunk_size: usize,
-    /// Concurrent range requests per object; internal constant, see OpendalConf.
+    /// Concurrent sequential Range requests per object, configured through OpendalConf.
     read_concurrent: usize,
 }
 
@@ -948,6 +995,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
             concurrent: self.read_concurrent,
             byte_stream: None,
             status,
+            read_policy: ReadPolicy::Sequential,
         })
     }
 
@@ -1129,5 +1177,105 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
             });
 
         Ok(ListStream::new(stream))
+    }
+}
+
+#[cfg(test)]
+mod range_read_tests {
+    use super::*;
+    use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+
+    #[test]
+    fn random_read_recovers_to_sequential_stream() {
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            let chunk_size = OpendalConf::DEFAULT_READ_CHUNK_SIZE;
+            let dir = std::env::temp_dir().join(format!(
+                "cv-opendal-random-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+
+            let data: Vec<u8> = (0..3 * chunk_size + 17).map(|i| (i % 251) as u8).collect();
+            std::fs::write(dir.join("range.bin"), &data).unwrap();
+
+            let operator = Operator::new(Fs::default().root(&dir.to_string_lossy()))
+                .unwrap()
+                .finish();
+            let path = Path::new("file:///range.bin").unwrap();
+            for scheme in ["oss", "s3"] {
+                let fs = OpendalFileSystem {
+                    operator: operator.clone(),
+                    scheme: scheme.to_string(),
+                    bucket_or_container: String::new(),
+                    read_chunk_size: chunk_size,
+                    read_concurrent: OpendalConf::DEFAULT_READ_CONCURRENT,
+                };
+                let mut reader = fs.open(&path).await.unwrap();
+
+                let start = chunk_size / 2;
+                let first = reader.fuse_read(start as i64, 64).await.unwrap();
+                assert_eq!(first[0].as_slice(), &data[start..start + 64]);
+                assert_eq!(reader.chunk.len() + 64, chunk_size);
+                assert!(reader.byte_stream.is_none());
+
+                let next = start + 64;
+                let chunks = reader.fuse_read(next as i64, chunk_size).await.unwrap();
+                let got: Vec<u8> = chunks
+                    .iter()
+                    .flat_map(|chunk| chunk.as_slice().iter().copied())
+                    .collect();
+                assert_eq!(got, &data[next..next + chunk_size]);
+                assert!(reader.byte_stream.is_some());
+
+                reader.complete().await.unwrap();
+
+                let mut reader = fs.open(&path).await.unwrap();
+                reader.fuse_read(0, 64).await.unwrap();
+                assert!(reader.byte_stream.is_some());
+                reader.seek(128).await.unwrap();
+                assert!(
+                    !reader.read_policy.is_random(),
+                    "seek within the buffered chunk must preserve sequential mode"
+                );
+                assert!(reader.byte_stream.is_some());
+                let got = reader.fuse_read(128, 64).await.unwrap();
+                assert_eq!(got[0].as_slice(), &data[128..192]);
+
+                let tail = data.len() - 8;
+                let got = reader.fuse_read(tail as i64, 8).await.unwrap();
+                assert_eq!(got[0].as_slice(), &data[tail..]);
+                assert!(reader
+                    .fuse_read(data.len() as i64, 1)
+                    .await
+                    .unwrap()
+                    .is_empty());
+
+                let mut short_reader = fs.open(&path).await.unwrap();
+                short_reader.length += 1;
+                let mut output = vec![0; data.len() + 1];
+                assert!(
+                    short_reader.read_full(&mut output).await.is_err(),
+                    "a stream ending before the advertised length must not be treated as EOF"
+                );
+                assert!(short_reader.byte_stream.is_none());
+
+                let mut short_random_reader = fs.open(&path).await.unwrap();
+                short_random_reader.length += 1;
+                assert!(
+                    short_random_reader
+                        .fuse_read(data.len() as i64, 1)
+                        .await
+                        .is_err(),
+                    "a short random Range must not be treated as EOF"
+                );
+                assert!(short_random_reader.read_policy.is_random());
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        });
     }
 }
