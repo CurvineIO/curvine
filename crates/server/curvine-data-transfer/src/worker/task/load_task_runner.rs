@@ -753,7 +753,11 @@ impl LoadTaskRunner {
     async fn ensure_segment_target(&self, target_path: &Path, total_len: i64) -> FsResult<()> {
         if target_path.is_cv() {
             match self.fs.open_existing_for_write(target_path).await {
-                Ok(_writer) => Ok(()),
+                // The file may have been created by a concurrent segment
+                // whose resize has not landed yet (create+resize are not
+                // atomic). Verify the pre-allocation before treating the
+                // target as ready instead of trusting open success alone.
+                Ok(_) => self.ensure_segment_size(target_path, total_len).await,
                 Err(FsError::FileNotFound(_)) => {
                     let opts = CreateFileOptsBuilder::new()
                         .create_parent(true)
@@ -764,6 +768,8 @@ impl LoadTaskRunner {
                         .ttl_action(self.task.info.job.ttl_action)
                         .build();
                     match self.fs.create_with_opts(target_path, opts, false).await {
+                        // Freshly created and synchronously resized above: the
+                        // layout is ready, no verification needed.
                         Ok(mut writer) => {
                             if total_len > 0 {
                                 writer
@@ -778,20 +784,7 @@ impl LoadTaskRunner {
                         // resize actually landed before treating the target as
                         // ready; otherwise re-apply it (review Required).
                         Err(FsError::FileAlreadyExists(_)) => {
-                            let status = self.fs.get_status(target_path).await?;
-                            if status.len >= total_len {
-                                Ok(())
-                            } else {
-                                let mut writer =
-                                    self.fs.open_existing_for_write(target_path).await?;
-                                if total_len > 0 {
-                                    writer
-                                        .resize(FileAllocOpts::with_truncate(total_len))
-                                        .await?;
-                                }
-                                writer.flush().await?;
-                                Ok(())
-                            }
+                            self.ensure_segment_size(target_path, total_len).await
                         }
                         Err(err) => Err(err),
                     }
@@ -802,6 +795,27 @@ impl LoadTaskRunner {
             // Non-CV target (unusual for segment tasks, but keep parity).
             self.create_unified(target_path).await.map(|_| ())
         }
+    }
+
+    /// Verify the target pre-allocation landed and re-apply the resize when
+    /// it has not. Both length and block layout must be ready: a leftover
+    /// or concurrently-created target can have the right length but an
+    /// empty layout (staged blocks discarded on cancel, or the creator's
+    /// resize not yet visible). Truncate-to-length is idempotent, so
+    /// concurrent segments racing here converge safely.
+    async fn ensure_segment_size(&self, target_path: &Path, total_len: i64) -> FsResult<()> {
+        let blocks = self.fs.get_block_locations(target_path).await?;
+        if blocks.status.len >= total_len && !blocks.block_locs.is_empty() {
+            return Ok(());
+        }
+        let mut writer = self.fs.open_existing_for_write(target_path).await?;
+        if total_len > 0 {
+            writer
+                .resize(FileAllocOpts::with_truncate(total_len))
+                .await?;
+        }
+        writer.flush().await?;
+        Ok(())
     }
 
     /// Stamp commit markers on the committed target (idempotent retry relies
