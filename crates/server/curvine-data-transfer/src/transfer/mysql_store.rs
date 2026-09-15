@@ -20,7 +20,7 @@ use curvine_model::{
     TransferTaskState, TransferTenantSummary,
 };
 use mysql::prelude::*;
-use mysql::{params, Params, Pool, PooledConn, TxOpts, Value as MysqlValue};
+use mysql::{params, IsolationLevel, Params, Pool, PooledConn, TxOpts, Value as MysqlValue};
 use std::collections::BTreeSet;
 use std::thread;
 use std::time::Duration;
@@ -301,8 +301,11 @@ impl TransferStore for MysqlTransferStore {
         max_executing_transfers: u64,
     ) -> FsResult<Option<TransferLease>> {
         let mut conn = self.conn()?;
+        // Conflict reads below are non-locking, so they need fresh committed state.
         let mut tx = conn
-            .start_transaction(TxOpts::default())
+            .start_transaction(
+                TxOpts::default().set_isolation_level(Some(IsolationLevel::ReadCommitted)),
+            )
             .map_err(mysql_err)?;
 
         tx.exec_first::<u64, _, _>(
@@ -1213,6 +1216,9 @@ fn select_conflicting_active_transfer(
     submitter: &str,
     client_request_id: &str,
 ) -> FsResult<Option<TransferJobRecord>> {
+    // Acquires are serialized by the schema gate and claim only the selected job
+    // with an epoch-guarded update. Locking unrelated active jobs here creates a
+    // reverse lock order with their lease/state updates and can deadlock MySQL.
     let (child_lower, child_upper) = child_path_bounds(target_path);
     let exact_or_child = select_job(
         conn,
@@ -1223,8 +1229,7 @@ fn select_conflicting_active_transfer(
                target_path = :target_path
                or (target_path >= :child_lower and target_path < :child_upper)
            )
-         limit 1
-         for update",
+         limit 1",
         params! {
             "target_path" => target_path,
             "submitter" => submitter,
@@ -1244,8 +1249,7 @@ fn select_conflicting_active_transfer(
              where state in (2, 3, 4, 5)
                and not (submitter = :submitter and client_request_id = :client_request_id)
                and target_path = :target_path
-             limit 1
-             for update",
+             limit 1",
             params! {
                 "target_path" => ancestor,
                 "submitter" => submitter,
