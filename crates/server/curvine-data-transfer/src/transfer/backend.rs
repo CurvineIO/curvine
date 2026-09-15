@@ -16,8 +16,8 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
     StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease, TransferListFilter,
-    TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTaskState,
-    TransferTenantSummary,
+    TransferProgress, TransferStateUpdate, TransferTaskRecord, TransferTaskReport,
+    TransferTaskState, TransferTaskStatus, TransferTaskSummary, TransferTenantSummary,
 };
 use std::time::Instant;
 
@@ -31,6 +31,7 @@ use crate::transfer::{
     MemoryTransferStore, TransferMetrics, TransferMountSnapshotUpdate, TransferPlannedTasks,
     TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
 };
+use curvine_model::WorkerInflight;
 
 pub enum TransferStoreBackend {
     Memory(MemoryTransferStore),
@@ -220,6 +221,49 @@ impl TransferStore for TransferStoreBackend {
             Self::Mysql(store) => store.list_transfer_tasks(job_id, run_id),
             #[cfg(feature = "transfer-store-postgres")]
             Self::Postgres(store) => store.list_transfer_tasks(job_id, run_id),
+        })
+    }
+
+    fn get_transfer_task_summary(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        now_ms: i64,
+    ) -> FsResult<TransferTaskSummary> {
+        self.record_store_operation("get_transfer_task_summary", || match self {
+            Self::Memory(store) => store.get_transfer_task_summary(job_id, run_id, now_ms),
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => store.get_transfer_task_summary(job_id, run_id, now_ms),
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => store.get_transfer_task_summary(job_id, run_id, now_ms),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.get_transfer_task_summary(job_id, run_id, now_ms),
+        })
+    }
+
+    fn list_transfer_task_status_page(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        offset: usize,
+        limit: usize,
+    ) -> FsResult<(Vec<TransferTaskStatus>, bool)> {
+        self.record_store_operation("list_transfer_task_status_page", || match self {
+            Self::Memory(store) => {
+                store.list_transfer_task_status_page(job_id, run_id, offset, limit)
+            }
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => {
+                store.list_transfer_task_status_page(job_id, run_id, offset, limit)
+            }
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => {
+                store.list_transfer_task_status_page(job_id, run_id, offset, limit)
+            }
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => {
+                store.list_transfer_task_status_page(job_id, run_id, offset, limit)
+            }
         })
     }
 
@@ -426,6 +470,18 @@ impl TransferStore for TransferStoreBackend {
         })
     }
 
+    fn select_inflight_by_worker(&self) -> FsResult<Vec<WorkerInflight>> {
+        self.record_store_operation("select_inflight_by_worker", || match self {
+            Self::Memory(store) => store.select_inflight_by_worker(),
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => store.select_inflight_by_worker(),
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => store.select_inflight_by_worker(),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.select_inflight_by_worker(),
+        })
+    }
+
     fn mark_stale_attempts(
         &self,
         job_id: &str,
@@ -433,23 +489,23 @@ impl TransferStore for TransferStoreBackend {
         owner: &str,
         lease_epoch: u64,
         now_ms: i64,
-        limit: usize,
+        candidates: Vec<TransferTaskRecord>,
     ) -> FsResult<Vec<StaleTaskAttempt>> {
         self.record_store_operation("mark_stale_attempts", || match self {
             Self::Memory(store) => {
-                store.mark_stale_attempts(job_id, run_id, owner, lease_epoch, now_ms, limit)
+                store.mark_stale_attempts(job_id, run_id, owner, lease_epoch, now_ms, candidates)
             }
             #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => {
-                store.mark_stale_attempts(job_id, run_id, owner, lease_epoch, now_ms, limit)
+                store.mark_stale_attempts(job_id, run_id, owner, lease_epoch, now_ms, candidates)
             }
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => {
-                store.mark_stale_attempts(job_id, run_id, owner, lease_epoch, now_ms, limit)
+                store.mark_stale_attempts(job_id, run_id, owner, lease_epoch, now_ms, candidates)
             }
             #[cfg(feature = "transfer-store-postgres")]
             Self::Postgres(store) => {
-                store.mark_stale_attempts(job_id, run_id, owner, lease_epoch, now_ms, limit)
+                store.mark_stale_attempts(job_id, run_id, owner, lease_epoch, now_ms, candidates)
             }
         })
     }
@@ -546,15 +602,29 @@ impl TransferStore for TransferStoreBackend {
         })
     }
 
-    fn flush_job_progress_summary(&self, job_id: &str, run_id: u64) -> FsResult<()> {
-        self.record_store_operation("flush_job_progress_summary", || match self {
-            Self::Memory(store) => store.flush_job_progress_summary(job_id, run_id),
+    fn update_job_progress_summary(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        summary: TransferProgress,
+        now_ms: i64,
+    ) -> FsResult<()> {
+        self.record_store_operation("update_job_progress_summary", || match self {
+            Self::Memory(store) => {
+                store.update_job_progress_summary(job_id, run_id, summary, now_ms)
+            }
             #[cfg(feature = "transfer-store-sqlite")]
-            Self::Sqlite(store) => store.flush_job_progress_summary(job_id, run_id),
+            Self::Sqlite(store) => {
+                store.update_job_progress_summary(job_id, run_id, summary, now_ms)
+            }
             #[cfg(feature = "transfer-store-mysql")]
-            Self::Mysql(store) => store.flush_job_progress_summary(job_id, run_id),
+            Self::Mysql(store) => {
+                store.update_job_progress_summary(job_id, run_id, summary, now_ms)
+            }
             #[cfg(feature = "transfer-store-postgres")]
-            Self::Postgres(store) => store.flush_job_progress_summary(job_id, run_id),
+            Self::Postgres(store) => {
+                store.update_job_progress_summary(job_id, run_id, summary, now_ms)
+            }
         })
     }
 }

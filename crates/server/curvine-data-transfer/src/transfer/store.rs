@@ -14,9 +14,10 @@
 
 use curvine_error::FsResult;
 use curvine_model::{
-    StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease, TransferListFilter,
-    TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTaskState,
-    TransferTenantSummary,
+    summarize_transfer_tasks, StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease,
+    TransferListFilter, TransferProgress, TransferStateUpdate, TransferTaskRecord,
+    TransferTaskReport, TransferTaskState, TransferTaskStatus, TransferTaskSummary,
+    TransferTenantSummary, WorkerInflight,
 };
 
 pub trait TransferStore: Send + Sync + 'static {
@@ -67,6 +68,38 @@ pub trait TransferStore: Send + Sync + 'static {
     fn purge_terminal_transfers(&self, older_than_ms: i64, limit: usize) -> FsResult<usize>;
 
     fn list_transfer_tasks(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>>;
+
+    /// Return progress/counts without requiring the caller to deserialize task definitions.
+    fn get_transfer_task_summary(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        now_ms: i64,
+    ) -> FsResult<TransferTaskSummary> {
+        let tasks = self.list_transfer_tasks(job_id, run_id)?;
+        Ok(summarize_transfer_tasks(&tasks, now_ms))
+    }
+
+    /// Return only the requested status page. Backends override this with a
+    /// narrow, ordered query so source read plans never enter status polling.
+    fn list_transfer_task_status_page(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        offset: usize,
+        limit: usize,
+    ) -> FsResult<(Vec<TransferTaskStatus>, bool)> {
+        let mut tasks = self.list_transfer_tasks(job_id, run_id)?;
+        tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+        let mut page = tasks
+            .into_iter()
+            .skip(offset)
+            .take(limit.saturating_add(1))
+            .collect::<Vec<_>>();
+        let has_next = page.len() > limit;
+        page.truncate(limit);
+        Ok((page.into_iter().map(Into::into).collect(), has_next))
+    }
 
     fn request_cancel(&self, job_id: &str, run_id: u64, now_ms: i64) -> FsResult<bool>;
 
@@ -120,6 +153,15 @@ pub trait TransferStore: Send + Sync + 'static {
         limit: usize,
     ) -> FsResult<Vec<TransferTaskRecord>>;
 
+    /// Per-worker aggregation of in-flight (Running) tasks, used by the
+    /// scheduler's least-loaded worker choice. Must count only state = 2 rows.
+    fn select_inflight_by_worker(&self) -> FsResult<Vec<WorkerInflight>> {
+        Ok(Vec::new())
+    }
+
+    /// Mark only attempts that a preceding worker probe confirmed as missing.
+    /// Backends must fence the update with the candidate's attempt identity and
+    /// original stale deadline so a concurrent report wins.
     fn mark_stale_attempts(
         &self,
         job_id: &str,
@@ -127,7 +169,7 @@ pub trait TransferStore: Send + Sync + 'static {
         owner: &str,
         lease_epoch: u64,
         now_ms: i64,
-        limit: usize,
+        candidates: Vec<TransferTaskRecord>,
     ) -> FsResult<Vec<StaleTaskAttempt>>;
 
     fn list_stale_running_tasks(
@@ -159,9 +201,21 @@ pub trait TransferStore: Send + Sync + 'static {
     /// `summary` is refreshed separately by [`Self::flush_job_progress_summary`].
     fn update_task_report(&self, report: TransferTaskReport) -> FsResult<bool>;
 
-    /// Recompute `job.summary` from all tasks for `(job_id, run_id)` and persist it.
-    /// No-ops when the job is missing or `run_id` does not match.
-    fn flush_job_progress_summary(&self, job_id: &str, run_id: u64) -> FsResult<()>;
+    /// Persist a previously computed summary. The task aggregation and the job
+    /// write are separate so job locks never cover task scans.
+    fn update_job_progress_summary(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        summary: TransferProgress,
+        now_ms: i64,
+    ) -> FsResult<()>;
+
+    fn flush_job_progress_summary(&self, job_id: &str, run_id: u64) -> FsResult<()> {
+        let now_ms = curvine_runtime::common::LocalTime::mills() as i64;
+        let summary = self.get_transfer_task_summary(job_id, run_id, now_ms)?;
+        self.update_job_progress_summary(job_id, run_id, summary.progress, now_ms)
+    }
 }
 
 pub struct TransferRequeueUpdate {

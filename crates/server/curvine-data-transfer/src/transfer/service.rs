@@ -20,15 +20,15 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
 use curvine_model::{
-    summarize_transfer_tasks, TransferCommand, TransferJobRecord, TransferKind, TransferListFilter,
-    TransferProgress, TransferState, TransferTaskCounts, TransferTaskRecord, TransferTaskReport,
-    TransferTaskState,
+    TransferCommand, TransferJobRecord, TransferKind, TransferListFilter, TransferProgress,
+    TransferState, TransferTaskCounts, TransferTaskReport, TransferTaskState, TransferTaskStatus,
 };
 use curvine_proto::{
     ListTransferTenantsRequest, ListTransferTenantsResponse, ListTransfersRequest,
     ListTransfersResponse, SubmitTransferRequest, TransferJobStatusProto, TransferKindProto,
-    TransferProgressProto, TransferTaskReportRequest, TransferTaskStateProto,
-    TransferTaskStatusProto, TransferTaskSummaryProto, TransferTenantSummaryProto,
+    TransferProgressProto, TransferTaskReportBatchRequest, TransferTaskReportRequest,
+    TransferTaskStateProto, TransferTaskStatusProto, TransferTaskSummaryProto,
+    TransferTenantSummaryProto,
 };
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::common::SerdeUtils;
@@ -38,6 +38,7 @@ use uuid::Uuid;
 use crate::transfer::{ClusterMetadataCache, TransferMetrics, TransferStore};
 
 const PROGRESS_REPORT_COALESCE_BATCH: usize = 256;
+const MAX_BATCH_TASK_REPORTS: usize = PROGRESS_REPORT_COALESCE_BATCH;
 const JOB_SUMMARY_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 const TRANSFER_PROTOCOL_VERSION: u32 = 1;
@@ -284,11 +285,29 @@ where
         page_size: Option<u32>,
         page_token: Option<String>,
     ) -> FsResult<TransferStatusPage> {
-        let job = self.get_transfer(job_id)?;
-        let tasks = self.store.list_transfer_tasks(&job.job_id, job.run_id)?;
-        let counts = summarize_transfer_tasks(&tasks, now_ms()).counts;
-        let (tasks, next_page_token) = self.page_tasks(tasks, page_size, page_token)?;
-        Ok((job, counts, tasks, next_page_token))
+        let mut job = self.get_transfer(job_id)?;
+        let summary = self
+            .store
+            .get_transfer_task_summary(&job.job_id, job.run_id, now_ms())?;
+        job.summary = summary.progress;
+        let page_size = page_size.unwrap_or(0) as usize;
+        let offset = parse_page_token(page_token)?;
+        if page_size == 0 {
+            return Ok((job, summary.counts, Vec::new(), None));
+        }
+        let (tasks, has_next) = self.store.list_transfer_task_status_page(
+            &job.job_id,
+            job.run_id,
+            offset,
+            page_size,
+        )?;
+        let next_page_token = has_next.then(|| offset.saturating_add(tasks.len()).to_string());
+        Ok((
+            job,
+            summary.counts,
+            tasks.into_iter().map(task_status_to_proto).collect(),
+            next_page_token,
+        ))
     }
 
     pub fn list_transfers(&self, req: ListTransfersRequest) -> FsResult<ListTransfersResponse> {
@@ -387,6 +406,46 @@ where
     pub fn report_task(&self, req: TransferTaskReportRequest) -> FsResult<bool> {
         validate_protocol_version(req.protocol_version)?;
         let state = transfer_task_state(req.state)?;
+        self.report_task_with_state(req, state)
+    }
+
+    pub fn report_tasks(&self, req: TransferTaskReportBatchRequest) -> FsResult<Vec<bool>> {
+        validate_protocol_version(req.protocol_version)?;
+        if req.reports.len() > MAX_BATCH_TASK_REPORTS {
+            return Err(FsError::invalid_argument(format!(
+                "Transfer task report batch exceeds maximum size {}",
+                MAX_BATCH_TASK_REPORTS
+            )));
+        }
+
+        req.reports
+            .into_iter()
+            .map(|report| self.report_batch_member(report))
+            .collect()
+    }
+
+    fn report_batch_member(&self, report: TransferTaskReportRequest) -> FsResult<bool> {
+        if validate_protocol_version(report.protocol_version).is_err() {
+            return Ok(false);
+        }
+        let Ok(state) = transfer_task_state(report.state) else {
+            return Ok(false);
+        };
+        if state != TransferTaskState::Running {
+            return Ok(false);
+        }
+        match self.report_task_with_state(report, state) {
+            Ok(accepted) => Ok(accepted),
+            Err(FsError::TransferOverloaded(_)) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn report_task_with_state(
+        &self,
+        req: TransferTaskReportRequest,
+        state: TransferTaskState,
+    ) -> FsResult<bool> {
         if let Some(dispatcher) = &self.report_dispatcher {
             return dispatcher.report_task(req, state);
         }
@@ -420,34 +479,6 @@ where
             }
         }
         Ok(accepted)
-    }
-
-    fn page_tasks(
-        &self,
-        mut tasks: Vec<TransferTaskRecord>,
-        page_size: Option<u32>,
-        page_token: Option<String>,
-    ) -> FsResult<(Vec<TransferTaskStatusProto>, Option<String>)> {
-        tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
-        let offset = parse_page_token(page_token)?;
-        let page_size = page_size.unwrap_or(0) as usize;
-        if page_size == 0 {
-            return Ok((Vec::new(), None));
-        }
-        let page = tasks
-            .iter()
-            .skip(offset)
-            .take(page_size)
-            .cloned()
-            .map(task_to_proto)
-            .collect::<Vec<_>>();
-        let next = offset.saturating_add(page.len());
-        let next_page_token = if next < tasks.len() {
-            Some(next.to_string())
-        } else {
-            None
-        };
-        Ok((page, next_page_token))
     }
 }
 
@@ -960,7 +991,7 @@ pub fn task_summary_to_proto(value: TransferTaskCounts) -> TransferTaskSummaryPr
     }
 }
 
-pub fn task_to_proto(task: TransferTaskRecord) -> TransferTaskStatusProto {
+pub fn task_status_to_proto(task: TransferTaskStatus) -> TransferTaskStatusProto {
     TransferTaskStatusProto {
         task_id: task.task_id,
         attempt_id: task.attempt_id,

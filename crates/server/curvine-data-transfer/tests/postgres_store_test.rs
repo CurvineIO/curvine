@@ -14,7 +14,7 @@
 
 use curvine_data_transfer::transfer::{
     PostgresTransferStore, TransferMountSnapshotUpdate, TransferPlannedTasks,
-    TransferRequeueUpdate, TransferStore,
+    TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
 };
 use curvine_model::{
     TaskAttemptStart, TransferJobRecord, TransferKind, TransferProgress, TransferState,
@@ -159,6 +159,7 @@ fn transfer_task(job: &TransferJobRecord) -> TransferTaskRecord {
         report_target_json: "{}".to_string(),
         state: TransferTaskState::Pending,
         progress: TransferProgress::default(),
+        estimated_size: 0,
         retry_count: 0,
         attempt_started_at: 0,
         last_report_at: 0,
@@ -356,6 +357,158 @@ fn postgres_store_persists_transfer_lifecycle() {
 }
 
 #[test]
+fn postgres_store_marks_only_probed_missing_attempts() {
+    let Some((url, _schema)) = test_store_url() else {
+        eprintln!("CURVINE_TRANSFER_POSTGRES_URL is not set; skipping PostgreSQL store test");
+        return;
+    };
+    let store = PostgresTransferStore::open(&url).unwrap();
+    let job = transfer_job("stale-attempt", "/postgres-stale-attempt");
+    store
+        .create_or_get_by_request_id_checked(job.clone())
+        .unwrap();
+    let lease = store
+        .acquire_runnable_transfer("owner", 60_000, 1, 1)
+        .unwrap()
+        .unwrap();
+    let task_1 = transfer_task(&job);
+    let mut task_2 = task_1.clone();
+    task_2.task_id = "task-2".to_string();
+    task_2.target_path.push_str("-2");
+    assert!(store
+        .persist_planned_tasks(TransferPlannedTasks {
+            job_id: job.job_id.clone(),
+            run_id: job.run_id,
+            owner: lease.owner.clone(),
+            lease_epoch: lease.lease_epoch,
+            tasks: vec![task_1, task_2],
+            message: "planned".to_string(),
+            now_ms: 2,
+        })
+        .unwrap());
+    for task_id in ["task-1", "task-2"] {
+        assert!(store
+            .start_task_attempt(TaskAttemptStart {
+                job_id: job.job_id.clone(),
+                run_id: job.run_id,
+                owner: lease.owner.clone(),
+                lease_epoch: lease.lease_epoch,
+                task_id: task_id.to_string(),
+                attempt_id: 1,
+                worker_id: 7,
+                worker_session_id: "session".to_string(),
+                report_target_json: "{}".to_string(),
+                now_ms: 3,
+                stale_deadline_at: 1_000,
+            })
+            .unwrap());
+    }
+    let tasks = store.list_transfer_tasks(&job.job_id, job.run_id).unwrap();
+    let mut task_1 = tasks
+        .iter()
+        .find(|task| task.task_id == "task-1")
+        .unwrap()
+        .clone();
+    task_1.progress.message = "assigned Worker does not have this task attempt".to_string();
+    let task_2 = tasks
+        .iter()
+        .find(|task| task.task_id == "task-2")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        store
+            .mark_stale_attempts(
+                &job.job_id,
+                job.run_id,
+                &lease.owner,
+                lease.lease_epoch,
+                1_001,
+                vec![task_1],
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .list_transfer_tasks(&job.job_id, job.run_id)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.task_id == "task-1")
+            .unwrap()
+            .progress
+            .message,
+        "assigned Worker does not have this task attempt"
+    );
+    assert_eq!(
+        store
+            .list_transfer_tasks(&job.job_id, job.run_id)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.task_id == "task-2")
+            .unwrap()
+            .state,
+        TransferTaskState::Running
+    );
+    assert!(store
+        .update_task_report(TransferTaskReport {
+            job_id: job.job_id.clone(),
+            run_id: job.run_id,
+            task_id: task_2.task_id.clone(),
+            attempt_id: task_2.attempt_id,
+            worker_id: task_2.worker_id,
+            worker_session_id: task_2.worker_session_id.clone(),
+            state: TransferTaskState::Running,
+            progress: TransferProgress {
+                loaded_size: 10,
+                total_size: 100,
+                update_time: 1_001,
+                message: "worker still owns task".to_string(),
+            },
+            now_ms: 1_001,
+            stale_deadline_at: 2_000,
+        })
+        .unwrap());
+    assert!(store
+        .mark_stale_attempts(
+            &job.job_id,
+            job.run_id,
+            &lease.owner,
+            lease.lease_epoch,
+            1_001,
+            vec![task_2],
+        )
+        .unwrap()
+        .is_empty());
+    for (task_id, from_state, now_ms, message) in [
+        ("task-1", TransferTaskState::Stale, 1_002, "first failure"),
+        ("task-2", TransferTaskState::Running, 1_003, "later failure"),
+    ] {
+        assert!(store
+            .update_task_state(TransferTaskStateUpdate {
+                job_id: job.job_id.clone(),
+                run_id: job.run_id,
+                owner: lease.owner.clone(),
+                lease_epoch: lease.lease_epoch,
+                task_id: task_id.to_string(),
+                from_states: vec![from_state],
+                state: TransferTaskState::Failed,
+                message: message.to_string(),
+                now_ms,
+            })
+            .unwrap());
+    }
+    assert_eq!(
+        store
+            .get_transfer_task_summary(&job.job_id, job.run_id, 1_004)
+            .unwrap()
+            .progress
+            .message,
+        "2 transfer task(s) failed: first failure"
+    );
+}
+
+#[test]
 fn postgres_store_keeps_conflicting_requests_pending_and_persists_snapshot_retries() {
     let Some((url, _schema)) = test_store_url() else {
         eprintln!("CURVINE_TRANSFER_POSTGRES_URL is not set; skipping PostgreSQL store test");
@@ -509,4 +662,192 @@ fn postgres_store_keeps_conflicting_requests_pending_and_persists_snapshot_retri
             .job_id,
         snapshot.job_id
     );
+}
+
+#[test]
+fn postgres_store_does_not_backfill_historical_task_projections() {
+    let Some((url, _schema)) = test_store_url() else {
+        eprintln!("CURVINE_TRANSFER_POSTGRES_URL is not set; skipping PostgreSQL store test");
+        return;
+    };
+    let initial = PostgresTransferStore::open(&url).unwrap();
+    drop(initial);
+
+    let mut client = admin_client(&url).unwrap();
+    client
+        .batch_execute(
+            "drop trigger if exists transfer_tasks_record_json_sync on transfer_tasks;
+             drop trigger if exists transfer_tasks_record_json_insert_sync on transfer_tasks;
+             alter table transfer_tasks
+                 drop column source_path,
+                 drop column target_path,
+                 drop column report_target_json,
+                 drop column retry_count,
+                 drop column attempt_started_at,
+                 drop column last_report_at,
+                 drop column progress_loaded_size,
+                 drop column progress_total_size,
+                 drop column progress_updated_at,
+                 drop column progress_message;",
+        )
+        .unwrap();
+
+    let job = transfer_job("task-json-compat", "/task-json-compat");
+    let mut task = transfer_task(&job);
+    task.attempt_id = 1;
+    task.worker_id = 7;
+    task.worker_session_id = "legacy-session".to_string();
+    task.report_target_json = "{\"target\":\"legacy\"}".to_string();
+    task.state = TransferTaskState::Running;
+    task.progress = TransferProgress {
+        loaded_size: 11,
+        total_size: 42,
+        update_time: 10,
+        message: "legacy insert".to_string(),
+    };
+    task.attempt_started_at = 9;
+    task.last_report_at = 10;
+    task.stale_deadline_at = 100;
+    task.updated_at = 10;
+    let legacy_json = serde_json::to_string(&task).unwrap();
+    let run_id = i64::try_from(task.run_id).unwrap();
+    client
+        .execute(
+            "insert into transfer_tasks (
+                job_id, run_id, task_id, state, attempt_id, worker_id, worker_session_id,
+                stale_deadline_at, record_json, updated_at
+             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            &[
+                &task.job_id,
+                &run_id,
+                &task.task_id,
+                &(task.state as i32),
+                &i64::try_from(task.attempt_id).unwrap(),
+                &i64::from(task.worker_id),
+                &task.worker_session_id,
+                &task.stale_deadline_at,
+                &legacy_json,
+                &task.updated_at,
+            ],
+        )
+        .unwrap();
+
+    let store = PostgresTransferStore::open(&url).unwrap();
+    let row = client
+        .query_one(
+            "select source_path, target_path, report_target_json, progress_loaded_size,
+                    progress_total_size, progress_updated_at, progress_message
+             from transfer_tasks where job_id = $1 and run_id = $2 and task_id = $3",
+            &[&task.job_id, &run_id, &task.task_id],
+        )
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), "");
+    assert_eq!(row.get::<_, String>(1), "");
+    assert_eq!(row.get::<_, String>(2), "");
+    assert_eq!(row.get::<_, i64>(3), 0);
+    assert_eq!(row.get::<_, i64>(4), 0);
+    assert_eq!(row.get::<_, i64>(5), 0);
+    assert_eq!(row.get::<_, String>(6), "");
+    let actual = store
+        .list_transfer_tasks(&task.job_id, task.run_id)
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(actual.source_path, task.source_path);
+    assert_eq!(actual.target_path, task.target_path);
+    assert_eq!(actual.progress, task.progress);
+    let summary = store
+        .get_transfer_task_summary(&task.job_id, task.run_id, 10)
+        .unwrap();
+    assert_eq!(summary.counts.running, 1);
+    assert_eq!(summary.progress, task.progress);
+    let (page, has_next) = store
+        .list_transfer_task_status_page(&task.job_id, task.run_id, 0, 1)
+        .unwrap();
+    assert!(!has_next);
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].source_path, task.source_path);
+    assert_eq!(page[0].progress, task.progress);
+
+    task.progress = TransferProgress {
+        loaded_size: 21,
+        total_size: 42,
+        update_time: 20,
+        message: "legacy update".to_string(),
+    };
+    task.last_report_at = 20;
+    task.stale_deadline_at = 90;
+    task.updated_at = 20;
+    let legacy_json = serde_json::to_string(&task).unwrap();
+    client
+        .execute(
+            "update transfer_tasks
+             set state = $1, attempt_id = $2, worker_id = $3, worker_session_id = $4,
+                 stale_deadline_at = $5, record_json = $6, updated_at = $7
+             where job_id = $8 and run_id = $9 and task_id = $10",
+            &[
+                &(task.state as i32),
+                &i64::try_from(task.attempt_id).unwrap(),
+                &i64::from(task.worker_id),
+                &task.worker_session_id,
+                &task.stale_deadline_at,
+                &legacy_json,
+                &task.updated_at,
+                &task.job_id,
+                &run_id,
+                &task.task_id,
+            ],
+        )
+        .unwrap();
+
+    assert!(store
+        .update_task_report(TransferTaskReport {
+            job_id: task.job_id.clone(),
+            run_id: task.run_id,
+            task_id: task.task_id.clone(),
+            attempt_id: task.attempt_id,
+            worker_id: task.worker_id,
+            worker_session_id: task.worker_session_id.clone(),
+            state: TransferTaskState::Completed,
+            progress: TransferProgress {
+                loaded_size: 42,
+                total_size: 42,
+                update_time: 30,
+                message: "completed".to_string(),
+            },
+            now_ms: 30,
+            stale_deadline_at: 80,
+        })
+        .unwrap());
+    assert!(!store
+        .update_task_report(TransferTaskReport {
+            job_id: task.job_id.clone(),
+            run_id: task.run_id,
+            task_id: task.task_id.clone(),
+            attempt_id: task.attempt_id,
+            worker_id: task.worker_id,
+            worker_session_id: task.worker_session_id.clone(),
+            state: TransferTaskState::Running,
+            progress: TransferProgress::default(),
+            now_ms: 31,
+            stale_deadline_at: 70,
+        })
+        .unwrap());
+
+    let row = client
+        .query_one(
+            "select state, progress_loaded_size, progress_total_size, progress_updated_at,
+                    progress_message, record_json::jsonb ->> 'state',
+                    record_json::jsonb #>> '{progress,loaded_size}'
+             from transfer_tasks where job_id = $1 and run_id = $2 and task_id = $3",
+            &[&task.job_id, &run_id, &task.task_id],
+        )
+        .unwrap();
+    assert_eq!(row.get::<_, i32>(0), TransferTaskState::Completed as i32);
+    assert_eq!(row.get::<_, i64>(1), 42);
+    assert_eq!(row.get::<_, i64>(2), 42);
+    assert_eq!(row.get::<_, i64>(3), 30);
+    assert_eq!(row.get::<_, String>(4), "completed");
+    assert_eq!(row.get::<_, String>(5), "Completed");
+    assert_eq!(row.get::<_, String>(6), "42");
 }

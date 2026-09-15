@@ -15,10 +15,11 @@
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
-    summarize_transfer_tasks, StaleTaskAttempt, TaskAttemptStart, TransferCommand,
+    transfer_task_summary_from_aggregate, StaleTaskAttempt, TaskAttemptStart, TransferCommand,
     TransferJobRecord, TransferKind, TransferLease, TransferListFilter, TransferProgress,
-    TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTaskState,
-    TransferTenantSummary,
+    TransferState, TransferStateUpdate, TransferTaskCounts, TransferTaskRecord, TransferTaskReport,
+    TransferTaskState, TransferTaskStatus, TransferTaskSummary, TransferTenantSummary,
+    WorkerInflight,
 };
 use parking_lot::Mutex;
 use rusqlite::{
@@ -249,13 +250,73 @@ impl TransferStore for SqliteTransferStore {
                         worker_id, worker_session_id, source_read_plan_json, report_target_json,
                         state, progress_json, retry_count, attempt_started_at, last_report_at,
                         stale_deadline_at, updated_at
-                 from transfer_tasks where job_id = ?1 and run_id = ?2",
+                 from transfer_tasks where job_id = ?1 and run_id = ?2
+                 order by task_id asc",
             )
             .map_err(sqlite_err)?;
         let rows = stmt
             .query_map(params![job_id, run_id as i64], sqlite_task_row)
             .map_err(sqlite_err)?;
         collect_sqlite_rows(rows)
+    }
+
+    fn get_transfer_task_summary(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        now_ms: i64,
+    ) -> FsResult<TransferTaskSummary> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "select state, progress_json from transfer_tasks
+                 where job_id = ?1 and run_id = ?2
+                 order by updated_at asc, task_id asc",
+            )
+            .map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![job_id, run_id as i64], |row| {
+                Ok((
+                    TransferTaskState::from(row.get::<_, i32>(0)?),
+                    serde_json::from_str::<TransferProgress>(&row.get::<_, String>(1)?)
+                        .unwrap_or_default(),
+                ))
+            })
+            .map_err(sqlite_err)?;
+        summarize_task_progress(rows, now_ms)
+    }
+
+    fn list_transfer_task_status_page(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        offset: usize,
+        limit: usize,
+    ) -> FsResult<(Vec<TransferTaskStatus>, bool)> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "select task_id, attempt_id, source_path, target_path, worker_id, worker_session_id,
+                        state, progress_json, retry_count, updated_at
+                 from transfer_tasks where job_id = ?1 and run_id = ?2
+                 order by task_id asc limit ?3 offset ?4",
+            )
+            .map_err(sqlite_err)?;
+        let mut page = collect_sqlite_rows(
+            stmt.query_map(
+                params![
+                    job_id,
+                    run_id as i64,
+                    limit.saturating_add(1) as i64,
+                    offset as i64
+                ],
+                sqlite_task_status_row,
+            )
+            .map_err(sqlite_err)?,
+        )?;
+        let has_next = page.len() > limit;
+        page.truncate(limit);
+        Ok((page, has_next))
     }
 
     fn request_cancel(&self, job_id: &str, run_id: u64, now_ms: i64) -> FsResult<bool> {
@@ -789,7 +850,7 @@ impl TransferStore for SqliteTransferStore {
                         stale_deadline_at, updated_at
                  from transfer_tasks
                  where job_id = ?1 and run_id = ?2 and state = 1
-                 order by updated_at asc
+                 order by task_id asc
                  limit ?3",
             )
             .map_err(sqlite_err)?;
@@ -802,6 +863,39 @@ impl TransferStore for SqliteTransferStore {
         collect_sqlite_rows(rows)
     }
 
+    fn select_inflight_by_worker(&self) -> FsResult<Vec<WorkerInflight>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "select worker_id, count(*), coalesce(sum(json_extract(progress_json, '$.total_size')), 0),
+                        count(*) filter (where coalesce(json_extract(progress_json, '$.total_size'), 0) > 0)
+                 from transfer_tasks where state = 2
+                 group by worker_id",
+            )
+            .map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(sqlite_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (worker_id, task_count, bytes, nonzero) = row.map_err(sqlite_err)?;
+            out.push(WorkerInflight {
+                worker_id: u32::try_from(worker_id).unwrap_or(0),
+                task_count: u64::try_from(task_count).unwrap_or(u64::MAX),
+                estimated_bytes: bytes,
+                unknown_bytes_count: u64::try_from(task_count.saturating_sub(nonzero)).unwrap_or(0),
+            });
+        }
+        Ok(out)
+    }
+
     fn mark_stale_attempts(
         &self,
         job_id: &str,
@@ -809,8 +903,11 @@ impl TransferStore for SqliteTransferStore {
         owner: &str,
         lease_epoch: u64,
         now_ms: i64,
-        limit: usize,
+        candidates: Vec<TransferTaskRecord>,
     ) -> FsResult<Vec<StaleTaskAttempt>> {
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(sqlite_err)?;
         let valid_owner: Option<i64> = tx
@@ -828,37 +925,52 @@ impl TransferStore for SqliteTransferStore {
             return Ok(Vec::new());
         }
 
-        let tasks = {
-            let mut stmt = tx
-                .prepare(
-                    "select job_id, run_id, task_id, attempt_id, source_path, target_path,
-                            worker_id, worker_session_id, source_read_plan_json, report_target_json,
-                            state, progress_json, retry_count, attempt_started_at, last_report_at,
-                            stale_deadline_at, updated_at
-                     from transfer_tasks
-                     where job_id = ?1 and run_id = ?2 and state = 2 and stale_deadline_at < ?3
-                     order by stale_deadline_at asc
-                     limit ?4",
-                )
-                .map_err(sqlite_err)?;
-            let rows = stmt
-                .query_map(
-                    params![job_id, run_id as i64, now_ms, limit as i64],
-                    sqlite_task_row,
-                )
-                .map_err(sqlite_err)?;
-            collect_sqlite_rows(rows)?
-        };
-
-        let mut stale = Vec::with_capacity(tasks.len());
-        for mut task in tasks {
+        let mut stale = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if candidate.job_id != job_id
+                || candidate.run_id != run_id
+                || candidate.state != TransferTaskState::Running
+                || candidate.stale_deadline_at >= now_ms
+            {
+                continue;
+            }
+            let mut task = candidate.clone();
             task.state = TransferTaskState::Stale;
             task.retry_count = task.retry_count.saturating_add(1);
-            task.progress.message = "task stale timeout".to_string();
             task.progress.update_time = now_ms;
             task.updated_at = now_ms;
-            update_task_record(&tx, &task)?;
-            stale.push(StaleTaskAttempt { task });
+            let affected = tx
+                .execute(
+                    "update transfer_tasks
+                     set state = ?1, progress_json = ?2, retry_count = ?3, updated_at = ?4
+                     where job_id = ?5 and run_id = ?6 and task_id = ?7 and state = 2
+                       and attempt_id = ?8 and worker_id = ?9 and worker_session_id = ?10
+                       and stale_deadline_at = ?11 and stale_deadline_at < ?4
+                       and exists (
+                           select 1 from transfer_jobs
+                           where job_id = ?5 and run_id = ?6 and owner = ?12
+                             and lease_epoch = ?13 and lease_expire_at > ?4
+                       )",
+                    params![
+                        task.state as i32,
+                        transfer_progress_json(&task.progress)?,
+                        task.retry_count as i64,
+                        now_ms,
+                        job_id,
+                        run_id as i64,
+                        &task.task_id,
+                        candidate.attempt_id as i64,
+                        candidate.worker_id as i64,
+                        &candidate.worker_session_id,
+                        candidate.stale_deadline_at,
+                        owner,
+                        lease_epoch as i64,
+                    ],
+                )
+                .map_err(sqlite_err)?;
+            if affected > 0 {
+                stale.push(StaleTaskAttempt { task });
+            }
         }
         tx.commit().map_err(sqlite_err)?;
         Ok(stale)
@@ -909,7 +1021,7 @@ impl TransferStore for SqliteTransferStore {
                         stale_deadline_at, updated_at
                  from transfer_tasks
                  where job_id = ?1 and run_id = ?2 and state = ?3
-                 order by updated_at asc
+                 order by task_id asc
                  limit ?4",
             )
             .map_err(sqlite_err)?;
@@ -1040,49 +1152,20 @@ impl TransferStore for SqliteTransferStore {
         Ok(true)
     }
 
-    fn flush_job_progress_summary(&self, job_id: &str, run_id: u64) -> FsResult<()> {
+    fn update_job_progress_summary(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        summary: TransferProgress,
+        now_ms: i64,
+    ) -> FsResult<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(sqlite_err)?;
-        let Some(mut job) = tx
-            .query_row(
-                job_select_sql("where job_id = ?1").as_str(),
-                params![job_id],
-                sqlite_job_row,
-            )
-            .optional()
-            .map_err(sqlite_err)?
-        else {
-            tx.commit().map_err(sqlite_err)?;
-            return Ok(());
-        };
-        if job.run_id != run_id {
-            tx.commit().map_err(sqlite_err)?;
-            return Ok(());
-        }
-        let tasks = {
-            let mut stmt = tx
-                .prepare(
-                    "select job_id, run_id, task_id, attempt_id, source_path, target_path,
-                            worker_id, worker_session_id, source_read_plan_json, report_target_json,
-                            state, progress_json, retry_count, attempt_started_at, last_report_at,
-                            stale_deadline_at, updated_at
-                     from transfer_tasks
-                     where job_id = ?1 and run_id = ?2",
-                )
-                .map_err(sqlite_err)?;
-            let rows = stmt
-                .query_map(params![job_id, run_id as i64], sqlite_task_row)
-                .map_err(sqlite_err)?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)?
-        };
-        let now_ms = curvine_runtime::common::LocalTime::mills() as i64;
-        job.summary = summarize_transfer_tasks(&tasks, now_ms).progress;
-        job.updated_at = now_ms;
         tx.execute(
             "update transfer_jobs set summary_json = ?1, updated_at = ?2
              where job_id = ?3 and run_id = ?4",
             params![
-                transfer_progress_json(&job.summary)?,
+                transfer_progress_json(&summary)?,
                 now_ms,
                 job_id,
                 run_id as i64,
@@ -1690,12 +1773,72 @@ fn sqlite_task_row(row: &Row<'_>) -> rusqlite::Result<TransferTaskRecord> {
         report_target_json: row.get(9)?,
         state: TransferTaskState::from(row.get::<_, i32>(10)?),
         progress: serde_json::from_str(&progress_json).unwrap_or_default(),
+        estimated_size: 0,
         retry_count: row.get::<_, i64>(12)? as u32,
         attempt_started_at: row.get(13)?,
         last_report_at: row.get(14)?,
         stale_deadline_at: row.get(15)?,
         updated_at: row.get(16)?,
     })
+}
+
+fn sqlite_task_status_row(row: &Row<'_>) -> rusqlite::Result<TransferTaskStatus> {
+    let progress_json: String = row.get(7)?;
+    Ok(TransferTaskStatus {
+        task_id: row.get(0)?,
+        attempt_id: row.get::<_, i64>(1)? as u64,
+        source_path: row.get(2)?,
+        target_path: row.get(3)?,
+        worker_id: row.get::<_, i64>(4)? as u32,
+        worker_session_id: row.get(5)?,
+        state: TransferTaskState::from(row.get::<_, i32>(6)?),
+        progress: serde_json::from_str(&progress_json).unwrap_or_default(),
+        retry_count: row.get::<_, i64>(8)? as u32,
+        updated_at: row.get(9)?,
+    })
+}
+
+fn summarize_task_progress(
+    rows: impl Iterator<Item = rusqlite::Result<(TransferTaskState, TransferProgress)>>,
+    now_ms: i64,
+) -> FsResult<TransferTaskSummary> {
+    let mut counts = TransferTaskCounts::default();
+    let mut loaded_size = 0;
+    let mut total_size = 0;
+    let mut first_error = None;
+    let mut last_message = None;
+    for row in rows {
+        let (state, progress) = row.map_err(sqlite_err)?;
+        loaded_size += progress.loaded_size;
+        total_size += progress.total_size;
+        match state {
+            TransferTaskState::Pending => counts.pending += 1,
+            TransferTaskState::Running => counts.running += 1,
+            TransferTaskState::Completed => {
+                counts.completed += 1;
+                counts.completed_size += progress.loaded_size.max(0);
+            }
+            TransferTaskState::Failed => {
+                counts.failed += 1;
+                if first_error.is_none() && !progress.message.is_empty() {
+                    first_error = Some(progress.message.clone());
+                }
+            }
+            TransferTaskState::Canceled => counts.canceled += 1,
+            TransferTaskState::Stale => counts.stale += 1,
+        }
+        if !progress.message.is_empty() {
+            last_message = Some(progress.message);
+        }
+    }
+    Ok(transfer_task_summary_from_aggregate(
+        counts,
+        loaded_size,
+        total_size,
+        first_error.as_deref(),
+        last_message.as_deref(),
+        now_ms,
+    ))
 }
 
 fn sqlite_tenant_summary_row(row: &Row<'_>) -> rusqlite::Result<TransferTenantSummary> {

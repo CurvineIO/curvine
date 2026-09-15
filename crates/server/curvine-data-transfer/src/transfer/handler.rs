@@ -19,13 +19,16 @@ use curvine_model::TransferState;
 use curvine_proto::{
     CancelTransferRequest, CancelTransferResponse, GetTransferStatusRequest,
     GetTransferStatusResponse, ListTransferTenantsRequest, ListTransfersRequest,
-    RetryTransferRequest, SubmitTransferRequest, SubmitTransferResponse, TransferTaskReportRequest,
+    RetryTransferRequest, SubmitTransferRequest, SubmitTransferResponse,
+    TransferTaskReportBatchRequest, TransferTaskReportBatchResponse, TransferTaskReportRequest,
     TransferTaskReportResponse, WatchTransferRequest, WatchTransferResponse,
 };
 use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::{Builder, Message};
 
-use crate::transfer::{progress_to_proto, task_summary_to_proto, TransferService, TransferStore};
+use crate::transfer::{
+    progress_to_proto, task_summary_to_proto, TransferMetrics, TransferService, TransferStore,
+};
 
 pub struct TransferHandler<S> {
     service: TransferService<S>,
@@ -141,9 +144,23 @@ where
     }
 
     fn report_task(&self, msg: &Message) -> FsResult<Message> {
+        if let Ok(metrics) = TransferMetrics::get() {
+            metrics.inc_report_rpc("single");
+        }
         let req: TransferTaskReportRequest = msg.parse_header()?;
         let accepted = self.service.report_task(req)?;
         let response = TransferTaskReportResponse { accepted };
+        Ok(Builder::success(msg).proto_header(response).build())
+    }
+
+    fn report_task_batch(&self, msg: &Message) -> FsResult<Message> {
+        let req: TransferTaskReportBatchRequest = msg.parse_header()?;
+        if let Ok(metrics) = TransferMetrics::get() {
+            metrics.inc_report_rpc("batch");
+            metrics.inc_report_batch_tasks(req.reports.len());
+        }
+        let accepted = self.service.report_tasks(req)?;
+        let response = TransferTaskReportBatchResponse { accepted };
         Ok(Builder::success(msg).proto_header(response).build())
     }
 }
@@ -163,6 +180,7 @@ where
             RpcCode::WatchTransfer => self.watch_transfer(msg),
             RpcCode::CancelTransfer => self.cancel_transfer(msg),
             RpcCode::ReportTransferTask => self.report_task(msg),
+            RpcCode::ReportTransferTaskBatch => self.report_task_batch(msg),
             RpcCode::ListTransferTenants => self.list_transfer_tenants(msg),
             code => Err(FsError::common(format!(
                 "Unsupported transfer rpc code {}",

@@ -15,8 +15,9 @@
 use curvine_error::{FsError, FsResult};
 use curvine_model::{
     summarize_transfer_tasks, StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease,
-    TransferListFilter, TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport,
-    TransferTaskState, TransferTenantSummary,
+    TransferListFilter, TransferProgress, TransferState, TransferStateUpdate, TransferTaskRecord,
+    TransferTaskReport, TransferTaskState, TransferTaskStatus, TransferTaskSummary,
+    TransferTenantSummary, WorkerInflight,
 };
 use native_tls::{Certificate, TlsConnector};
 use percent_encoding::percent_decode_str;
@@ -53,7 +54,9 @@ impl PostgresTransferStore {
         let manager = PostgresConnectionManager::new(config, MakeTlsConnector::new(tls));
         let pool = Pool::builder().build(manager).map_err(postgres_pool_err)?;
         let mut conn = pool.get().map_err(postgres_pool_err)?;
-        init_schema(&mut conn)?;
+        if !postgres_schema_ready(&mut conn)? {
+            init_schema(&mut conn)?;
+        }
         Ok(Self { pool })
     }
 
@@ -154,10 +157,50 @@ fn postgres_tls_connector(root_cert_path: Option<PathBuf>) -> FsResult<TlsConnec
         .map_err(|_| FsError::common("Unable to initialize PostgreSQL TLS support"))
 }
 
+fn postgres_schema_ready(conn: &mut PgConnection) -> FsResult<bool> {
+    let version = match conn.query_opt(
+        "select version from transfer_schema_version where id = 1",
+        &[],
+    ) {
+        Ok(version) => version.map(|row| row.get::<_, i64>(0)),
+        Err(err) if err.code() == Some(&SqlState::UNDEFINED_TABLE) => return Ok(false),
+        Err(err) => return Err(postgres_err(err)),
+    };
+    if version != Some(TRANSFER_SCHEMA_VERSION) {
+        return Ok(false);
+    }
+    let runtime_column_count: i64 = conn
+        .query_one(
+            "select count(*)::bigint from information_schema.columns
+             where table_schema = current_schema() and table_name = 'transfer_tasks'
+               and column_name in (
+                   'source_path', 'target_path', 'report_target_json', 'retry_count',
+                   'attempt_started_at', 'last_report_at', 'progress_loaded_size',
+                   'progress_total_size', 'progress_updated_at', 'progress_message'
+               )",
+            &[],
+        )
+        .map_err(postgres_err)?
+        .get(0);
+    // Projection triggers only maintain an optional cache. JSON-authoritative
+    // readers must not start DDL merely because a legacy trigger is absent.
+    Ok(runtime_column_count == 10)
+}
+
 fn init_schema(conn: &mut PgConnection) -> FsResult<()> {
     let mut tx = conn.transaction().map_err(postgres_err)?;
+    tx.batch_execute("set local lock_timeout = '60s'; set local statement_timeout = '90s';")
+        .map_err(postgres_err)?;
     tx.query_one("select pg_advisory_xact_lock($1)", &[&TRANSFER_SCHEMA_LOCK])
         .map_err(postgres_err)?;
+    // Index creation is a performance concern only. Building indexes on an
+    // existing multi-million-row table would block serving writes, so they are
+    // created only when this call bootstraps fresh tables; existing databases
+    // get missing indexes through maintenance-plane `create index concurrently`.
+    let fresh_tables: bool = tx
+        .query_one("select to_regclass('transfer_tasks') is null", &[])
+        .map_err(postgres_err)?
+        .get(0);
     tx.batch_execute(
         "create table if not exists transfer_schema_version (
             id smallint primary key,
@@ -192,11 +235,25 @@ fn init_schema(conn: &mut PgConnection) -> FsResult<()> {
             worker_id bigint not null,
             worker_session_id text not null,
             stale_deadline_at bigint not null,
+            source_path text not null default '',
+            target_path text not null default '',
+            report_target_json text not null default '',
+            retry_count integer not null default 0,
+            attempt_started_at bigint not null default 0,
+            last_report_at bigint not null default 0,
+            progress_loaded_size bigint not null default 0,
+            progress_total_size bigint not null default 0,
+            progress_updated_at bigint not null default 0,
+            progress_message text not null default '',
             record_json text not null,
             updated_at bigint not null,
             primary key(job_id, run_id, task_id)
-        );
-        create index if not exists transfer_jobs_job_key_state_idx
+        );",
+    )
+    .map_err(postgres_err)?;
+    if fresh_tables {
+        tx.batch_execute(
+            "create index if not exists transfer_jobs_job_key_state_idx
             on transfer_jobs(left(job_key, 255), state);
         create index if not exists transfer_jobs_target_state_idx
             on transfer_jobs(target_path, state);
@@ -210,12 +267,15 @@ fn init_schema(conn: &mut PgConnection) -> FsResult<()> {
             on transfer_jobs(submitter, state, updated_at);
         create index if not exists transfer_tasks_job_state_idx
             on transfer_tasks(job_id, run_id, state);
+        create index if not exists transfer_tasks_job_updated_idx
+            on transfer_tasks(job_id, run_id, updated_at);
         create index if not exists transfer_tasks_worker_idx
             on transfer_tasks(worker_id, worker_session_id, state);
         create index if not exists transfer_tasks_stale_idx
             on transfer_tasks(state, stale_deadline_at);",
-    )
-    .map_err(postgres_err)?;
+        )
+        .map_err(postgres_err)?;
+    }
     let now_ms = db_u64(curvine_runtime::common::LocalTime::mills())?;
     tx.execute(
         "insert into transfer_schema_version(id, version, updated_at)
@@ -238,8 +298,88 @@ fn init_schema(conn: &mut PgConnection) -> FsResult<()> {
             version, TRANSFER_SCHEMA_VERSION
         )));
     }
+    migrate_postgres_task_runtime_columns(&mut tx)?;
+    ensure_postgres_legacy_task_json_sync_trigger(&mut tx)?;
     tx.commit().map_err(postgres_err)?;
     Ok(())
+}
+
+// Additive schema only: `record_json` remains authoritative; never rewrite history
+// merely to populate runtime projection columns.
+fn migrate_postgres_task_runtime_columns(conn: &mut impl GenericClient) -> FsResult<()> {
+    conn.batch_execute(
+        "alter table transfer_tasks
+             add column if not exists source_path text not null default '',
+             add column if not exists target_path text not null default '',
+             add column if not exists report_target_json text not null default '',
+             add column if not exists retry_count integer not null default 0,
+             add column if not exists attempt_started_at bigint not null default 0,
+             add column if not exists last_report_at bigint not null default 0,
+             add column if not exists progress_loaded_size bigint not null default 0,
+             add column if not exists progress_total_size bigint not null default 0,
+             add column if not exists progress_updated_at bigint not null default 0,
+             add column if not exists progress_message text not null default '';",
+    )
+    .map_err(postgres_err)
+}
+
+fn ensure_postgres_legacy_task_json_sync_trigger(conn: &mut impl GenericClient) -> FsResult<()> {
+    conn.batch_execute(
+        "create or replace function curvine_sync_transfer_task_record_json()
+         returns trigger language plpgsql as $$
+         begin
+             new.state := coalesce(case new.record_json::jsonb ->> 'state'
+                 when 'Pending' then 1 when '1' then 1
+                 when 'Running' then 2 when '2' then 2
+                 when 'Completed' then 3 when '3' then 3
+                 when 'Failed' then 4 when '4' then 4
+                 when 'Canceled' then 5 when '5' then 5
+                 when 'Stale' then 6 when '6' then 6
+             end, new.state);
+             new.attempt_id := coalesce((new.record_json::jsonb ->> 'attempt_id')::bigint, new.attempt_id);
+             new.worker_id := coalesce((new.record_json::jsonb ->> 'worker_id')::bigint, new.worker_id);
+             new.worker_session_id := coalesce(new.record_json::jsonb ->> 'worker_session_id', new.worker_session_id);
+             new.stale_deadline_at := coalesce((new.record_json::jsonb ->> 'stale_deadline_at')::bigint, new.stale_deadline_at);
+             new.source_path := coalesce(new.record_json::jsonb ->> 'source_path', new.source_path);
+             new.target_path := coalesce(new.record_json::jsonb ->> 'target_path', new.target_path);
+             new.report_target_json := coalesce(new.record_json::jsonb ->> 'report_target_json', new.report_target_json);
+             new.retry_count := coalesce((new.record_json::jsonb ->> 'retry_count')::integer, new.retry_count);
+             new.attempt_started_at := coalesce((new.record_json::jsonb ->> 'attempt_started_at')::bigint, new.attempt_started_at);
+             new.last_report_at := coalesce((new.record_json::jsonb ->> 'last_report_at')::bigint, new.last_report_at);
+             new.progress_loaded_size := coalesce((new.record_json::jsonb #>> '{progress,loaded_size}')::bigint, new.progress_loaded_size);
+             new.progress_total_size := coalesce((new.record_json::jsonb #>> '{progress,total_size}')::bigint, new.progress_total_size);
+             new.progress_updated_at := coalesce((new.record_json::jsonb #>> '{progress,update_time}')::bigint, new.progress_updated_at);
+             new.progress_message := coalesce(new.record_json::jsonb #>> '{progress,message}', new.progress_message);
+             new.updated_at := coalesce((new.record_json::jsonb ->> 'updated_at')::bigint, new.updated_at);
+             return new;
+         end;
+         $$;
+         do $$
+         begin
+             if not exists (
+                 select 1 from pg_trigger
+                 where tgrelid = 'transfer_tasks'::regclass
+                   and tgname = 'transfer_tasks_record_json_sync'
+                   and not tgisinternal
+             ) then
+                 create trigger transfer_tasks_record_json_sync
+                 before update on transfer_tasks
+                 for each row execute function curvine_sync_transfer_task_record_json();
+             end if;
+             if not exists (
+                 select 1 from pg_trigger
+                 where tgrelid = 'transfer_tasks'::regclass
+                   and tgname = 'transfer_tasks_record_json_insert_sync'
+                   and not tgisinternal
+             ) then
+                 create trigger transfer_tasks_record_json_insert_sync
+                 before insert on transfer_tasks
+                 for each row execute function curvine_sync_transfer_task_record_json();
+             end if;
+         end;
+         $$;",
+    )
+    .map_err(postgres_err)
 }
 
 fn lock_submission_gate(conn: &mut impl GenericClient) -> FsResult<()> {
@@ -485,8 +625,10 @@ fn insert_task(conn: &mut impl GenericClient, task: &TransferTaskRecord) -> FsRe
     conn.execute(
         "insert into transfer_tasks (
             job_id, run_id, task_id, state, attempt_id, worker_id, worker_session_id,
-            stale_deadline_at, record_json, updated_at
-        ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            stale_deadline_at, source_path, target_path, report_target_json, retry_count,
+            attempt_started_at, last_report_at, progress_loaded_size, progress_total_size,
+            progress_updated_at, progress_message, record_json, updated_at
+        ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
         on conflict (job_id, run_id, task_id) do nothing",
         &[
             &task.job_id,
@@ -497,6 +639,16 @@ fn insert_task(conn: &mut impl GenericClient, task: &TransferTaskRecord) -> FsRe
             &worker_id,
             &task.worker_session_id,
             &task.stale_deadline_at,
+            &task.source_path,
+            &task.target_path,
+            &task.report_target_json,
+            &(task.retry_count as i32),
+            &task.attempt_started_at,
+            &task.last_report_at,
+            &task.progress.loaded_size,
+            &task.progress.total_size,
+            &task.progress.update_time,
+            &task.progress.message,
             &record_json,
             &task.updated_at,
         ],
@@ -535,35 +687,35 @@ fn update_job(conn: &mut impl GenericClient, job: &TransferJobRecord) -> FsResul
     .map_err(postgres_err)
 }
 
-fn update_job_summary(conn: &mut impl GenericClient, job: &TransferJobRecord) -> FsResult<bool> {
-    let run_id = db_u64(job.run_id)?;
-    let record_json = json(job)?;
-    conn.execute(
-        "update transfer_jobs
-         set record_json = $1, updated_at = $2
-         where job_id = $3 and run_id = $4",
-        &[&record_json, &job.updated_at, &job.job_id, &run_id],
-    )
-    .map(|affected| affected > 0)
-    .map_err(postgres_err)
-}
-
 fn update_task(conn: &mut impl GenericClient, task: &TransferTaskRecord) -> FsResult<bool> {
     let run_id = db_u64(task.run_id)?;
     let attempt_id = db_u64(task.attempt_id)?;
     let worker_id = i64::from(task.worker_id);
+    let state = task.state as i32;
+    let retry_count = task.retry_count as i32;
     let record_json = json(task)?;
     conn.execute(
         "update transfer_tasks
          set state = $1, attempt_id = $2, worker_id = $3, worker_session_id = $4,
-             stale_deadline_at = $5, record_json = $6, updated_at = $7
-         where job_id = $8 and run_id = $9 and task_id = $10",
+             stale_deadline_at = $5, report_target_json = $6, retry_count = $7,
+             attempt_started_at = $8, last_report_at = $9, progress_loaded_size = $10,
+             progress_total_size = $11, progress_updated_at = $12, progress_message = $13,
+             record_json = $14, updated_at = $15
+         where job_id = $16 and run_id = $17 and task_id = $18",
         &[
-            &(task.state as i32),
+            &state,
             &attempt_id,
             &worker_id,
             &task.worker_session_id,
             &task.stale_deadline_at,
+            &task.report_target_json,
+            &retry_count,
+            &task.attempt_started_at,
+            &task.last_report_at,
+            &task.progress.loaded_size,
+            &task.progress.total_size,
+            &task.progress.update_time,
+            &task.progress.message,
             &record_json,
             &task.updated_at,
             &task.job_id,
@@ -686,7 +838,11 @@ fn select_task_for_update(
 ) -> FsResult<Option<TransferTaskRecord>> {
     let run_id = db_u64(run_id)?;
     conn.query_opt(
-        "select record_json from transfer_tasks
+        "select record_json, state, attempt_id, worker_id, worker_session_id,
+                stale_deadline_at, report_target_json, retry_count, attempt_started_at,
+                last_report_at, progress_loaded_size, progress_total_size,
+                progress_updated_at, progress_message, updated_at
+         from transfer_tasks
          where job_id = $1 and run_id = $2 and task_id = $3
          for update",
         &[&job_id, &run_id, &task_id],
@@ -708,34 +864,82 @@ fn select_tasks(
     let limit = limit.map(db_limit).transpose()?;
     let rows = match (state.as_ref(), limit.as_ref()) {
         (Some(state), Some(limit)) => conn.query(
-            "select record_json from transfer_tasks
+            "select record_json, state, attempt_id, worker_id, worker_session_id,
+                    stale_deadline_at, report_target_json, retry_count, attempt_started_at,
+                    last_report_at, progress_loaded_size, progress_total_size,
+                    progress_updated_at, progress_message, updated_at
+             from transfer_tasks
              where job_id = $1 and run_id = $2 and state = $3
-             order by updated_at asc
+             order by task_id asc
              limit $4",
             &[&job_id, &run_id, state, limit],
         ),
         (Some(state), None) => conn.query(
-            "select record_json from transfer_tasks
+            "select record_json, state, attempt_id, worker_id, worker_session_id,
+                    stale_deadline_at, report_target_json, retry_count, attempt_started_at,
+                    last_report_at, progress_loaded_size, progress_total_size,
+                    progress_updated_at, progress_message, updated_at
+             from transfer_tasks
              where job_id = $1 and run_id = $2 and state = $3
-             order by updated_at asc",
+             order by task_id asc",
             &[&job_id, &run_id, state],
         ),
         (None, Some(limit)) => conn.query(
-            "select record_json from transfer_tasks
+            "select record_json, state, attempt_id, worker_id, worker_session_id,
+                    stale_deadline_at, report_target_json, retry_count, attempt_started_at,
+                    last_report_at, progress_loaded_size, progress_total_size,
+                    progress_updated_at, progress_message, updated_at
+             from transfer_tasks
              where job_id = $1 and run_id = $2
-             order by updated_at asc
+             order by task_id asc
              limit $3",
             &[&job_id, &run_id, limit],
         ),
         (None, None) => conn.query(
-            "select record_json from transfer_tasks
+            "select record_json, state, attempt_id, worker_id, worker_session_id,
+                    stale_deadline_at, report_target_json, retry_count, attempt_started_at,
+                    last_report_at, progress_loaded_size, progress_total_size,
+                    progress_updated_at, progress_message, updated_at
+             from transfer_tasks
              where job_id = $1 and run_id = $2
-             order by updated_at asc",
+             order by task_id asc",
             &[&job_id, &run_id],
         ),
     }
     .map_err(postgres_err)?;
     rows.iter().map(task_from_row).collect()
+}
+
+fn select_task_status_page(
+    conn: &mut impl GenericClient,
+    job_id: &str,
+    run_id: u64,
+    offset: usize,
+    limit: usize,
+) -> FsResult<(Vec<TransferTaskStatus>, bool)> {
+    let mut tasks = select_tasks(conn, job_id, run_id, None, None)?;
+    tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+    let mut page = tasks
+        .into_iter()
+        .skip(offset)
+        .take(limit.saturating_add(1))
+        .map(TransferTaskStatus::from)
+        .collect::<Vec<_>>();
+    let has_next = page.len() > limit;
+    page.truncate(limit);
+    Ok((page, has_next))
+}
+
+fn select_task_summary(
+    conn: &mut impl GenericClient,
+    job_id: &str,
+    run_id: u64,
+    now_ms: i64,
+) -> FsResult<TransferTaskSummary> {
+    Ok(summarize_transfer_tasks(
+        &select_tasks(conn, job_id, run_id, None, None)?,
+        now_ms,
+    ))
 }
 
 fn count_rows(
@@ -754,6 +958,7 @@ fn job_from_row(row: &Row) -> FsResult<TransferJobRecord> {
 }
 
 fn task_from_row(row: &Row) -> FsResult<TransferTaskRecord> {
+    // Runtime columns are a cache. Historical rows remain JSON-authoritative.
     let value: String = row.get(0);
     serde_json::from_str(&value).map_err(json_err)
 }
@@ -1108,6 +1313,27 @@ impl TransferStore for PostgresTransferStore {
         select_tasks(&mut *conn, job_id, run_id, None, None)
     }
 
+    fn get_transfer_task_summary(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        now_ms: i64,
+    ) -> FsResult<TransferTaskSummary> {
+        let mut conn = self.conn()?;
+        select_task_summary(&mut *conn, job_id, run_id, now_ms)
+    }
+
+    fn list_transfer_task_status_page(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        offset: usize,
+        limit: usize,
+    ) -> FsResult<(Vec<TransferTaskStatus>, bool)> {
+        let mut conn = self.conn()?;
+        select_task_status_page(&mut *conn, job_id, run_id, offset, limit)
+    }
+
     fn request_cancel(&self, job_id: &str, run_id: u64, now_ms: i64) -> FsResult<bool> {
         self.transaction(|tx| {
             let mut job = match select_job_by_id_for_update(tx, job_id)? {
@@ -1402,6 +1628,31 @@ impl TransferStore for PostgresTransferStore {
         )
     }
 
+    fn select_inflight_by_worker(&self) -> FsResult<Vec<WorkerInflight>> {
+        let mut conn = self.conn()?;
+        let rows = conn
+            .query(
+                "select worker_id, count(*), coalesce(sum(progress_total_size), 0),
+                        count(*) filter (where progress_total_size > 0)
+             from transfer_tasks where state = 2
+             group by worker_id",
+                &[],
+            )
+            .map_err(postgres_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| WorkerInflight {
+                worker_id: u32::try_from(row.get::<_, i64>(0)).unwrap_or(0),
+                task_count: u64::try_from(row.get::<_, i64>(1)).unwrap_or(u64::MAX),
+                estimated_bytes: row.get::<_, i64>(2),
+                unknown_bytes_count: u64::try_from(
+                    row.get::<_, i64>(1).saturating_sub(row.get::<_, i64>(3)),
+                )
+                .unwrap_or(0),
+            })
+            .collect())
+    }
+
     fn mark_stale_attempts(
         &self,
         job_id: &str,
@@ -1409,11 +1660,13 @@ impl TransferStore for PostgresTransferStore {
         owner: &str,
         lease_epoch: u64,
         now_ms: i64,
-        limit: usize,
+        candidates: Vec<TransferTaskRecord>,
     ) -> FsResult<Vec<StaleTaskAttempt>> {
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
         let run_id_value = db_u64(run_id)?;
         let lease_epoch_value = db_u64(lease_epoch)?;
-        let limit = db_limit(limit)?;
         self.transaction(|tx| {
             let owner_valid = tx
                 .query_opt(
@@ -1427,27 +1680,59 @@ impl TransferStore for PostgresTransferStore {
             if !owner_valid {
                 return Ok(Vec::new());
             }
-            let rows = tx
-                .query(
-                    "select record_json from transfer_tasks
-                     where job_id = $1 and run_id = $2 and state = 2
-                       and stale_deadline_at < $3
-                     order by stale_deadline_at asc
-                     limit $4
-                     for update",
-                    &[&job_id, &run_id_value, &now_ms, &limit],
-                )
-                .map_err(postgres_err)?;
-            let mut stale = Vec::with_capacity(rows.len());
-            for row in rows {
-                let mut task = task_from_row(&row)?;
+            let mut stale = Vec::with_capacity(candidates.len());
+            for candidate in candidates {
+                if candidate.job_id != job_id
+                    || candidate.run_id != run_id
+                    || candidate.state != TransferTaskState::Running
+                    || candidate.stale_deadline_at >= now_ms
+                {
+                    continue;
+                }
+                let mut task = candidate.clone();
                 task.state = TransferTaskState::Stale;
                 task.retry_count = task.retry_count.saturating_add(1);
-                task.progress.message = "task stale timeout".to_string();
                 task.progress.update_time = now_ms;
                 task.updated_at = now_ms;
-                update_task(tx, &task)?;
-                stale.push(StaleTaskAttempt { task });
+                let attempt_id = db_u64(candidate.attempt_id)?;
+                let retry_count = task.retry_count as i32;
+                let record_json = json(&task)?;
+                let updated = tx
+                    .execute(
+                        "update transfer_tasks
+                         set state = $1, retry_count = $2, progress_updated_at = $3,
+                             progress_message = $4, record_json = $5, updated_at = $6
+                         where job_id = $7 and run_id = $8 and task_id = $9 and state = 2
+                           and attempt_id = $10 and worker_id = $11 and worker_session_id = $12
+                           and stale_deadline_at = $13 and stale_deadline_at < $6
+                           and exists (
+                               select 1 from transfer_jobs
+                               where job_id = $7 and run_id = $8 and owner = $14
+                                 and lease_epoch = $15 and lease_expire_at > $6
+                           )",
+                        &[
+                            &(task.state as i32),
+                            &retry_count,
+                            &task.progress.update_time,
+                            &task.progress.message,
+                            &record_json,
+                            &task.updated_at,
+                            &job_id,
+                            &run_id_value,
+                            &task.task_id,
+                            &attempt_id,
+                            &i64::from(candidate.worker_id),
+                            &candidate.worker_session_id,
+                            &candidate.stale_deadline_at,
+                            &owner,
+                            &lease_epoch_value,
+                        ],
+                    )
+                    .map_err(postgres_err)?
+                    > 0;
+                if updated {
+                    stale.push(StaleTaskAttempt { task });
+                }
             }
             Ok(stale)
         })
@@ -1465,7 +1750,11 @@ impl TransferStore for PostgresTransferStore {
         let rows = self
             .conn()?
             .query(
-                "select record_json from transfer_tasks
+                "select record_json, state, attempt_id, worker_id, worker_session_id,
+                        stale_deadline_at, report_target_json, retry_count, attempt_started_at,
+                        last_report_at, progress_loaded_size, progress_total_size,
+                        progress_updated_at, progress_message, updated_at
+                 from transfer_tasks
                  where job_id = $1 and run_id = $2 and state = 2
                    and stale_deadline_at < $3
                  order by stale_deadline_at asc
@@ -1553,42 +1842,82 @@ impl TransferStore for PostgresTransferStore {
     }
 
     fn update_task_report(&self, report: TransferTaskReport) -> FsResult<bool> {
-        let accepted = self.transaction(|tx| {
-            let mut task =
-                match select_task_for_update(tx, &report.job_id, report.run_id, &report.task_id)? {
-                    Some(task)
-                        if task.attempt_id == report.attempt_id
-                            && task.worker_id == report.worker_id
-                            && task.worker_session_id == report.worker_session_id
-                            && task.state.is_running() =>
-                    {
-                        task
-                    }
-                    _ => return Ok(false),
-                };
-            task.state = report.state;
-            task.progress = report.progress.clone();
-            task.last_report_at = report.now_ms;
-            task.stale_deadline_at = report.stale_deadline_at;
-            task.updated_at = report.now_ms;
-            update_task(tx, &task)?;
-            Ok(true)
-        })?;
-        Ok(accepted)
+        let run_id = db_u64(report.run_id)?;
+        let attempt_id = db_u64(report.attempt_id)?;
+        let sql = "update transfer_tasks
+             set state = $1, progress_loaded_size = $2, progress_total_size = $3,
+                 progress_updated_at = $4, progress_message = $5, last_report_at = $6,
+                 stale_deadline_at = $7,
+                 record_json = jsonb_set(
+                        jsonb_set(
+                            jsonb_set(
+                                jsonb_set(
+                                    jsonb_set(
+                                        jsonb_set(
+                                            jsonb_set(
+                                                jsonb_set(record_json::jsonb, '{state}', to_jsonb(case $1::integer
+                                                    when 1 then 'Pending'::text
+                                                    when 2 then 'Running'::text
+                                                    when 3 then 'Completed'::text
+                                                    when 4 then 'Failed'::text
+                                                    when 5 then 'Canceled'::text
+                                                    when 6 then 'Stale'::text
+                                                    else null::text
+                                                end)),
+                                                '{progress,loaded_size}', to_jsonb($2::bigint)),
+                                            '{progress,total_size}', to_jsonb($3::bigint)),
+                                        '{progress,update_time}', to_jsonb($4::bigint)),
+                                    '{progress,message}', to_jsonb($5::text)),
+                                '{last_report_at}', to_jsonb($6::bigint)),
+                            '{stale_deadline_at}', to_jsonb($7::bigint)),
+                        '{updated_at}', to_jsonb($8::bigint))::text,
+                 updated_at = $8
+             where job_id = $9 and run_id = $10 and task_id = $11 and attempt_id = $12
+               and worker_id = $13 and worker_session_id = $14 and state in (1, 2)";
+        self.conn()?
+            .execute(
+                sql,
+                &[
+                    &(report.state as i32),
+                    &report.progress.loaded_size,
+                    &report.progress.total_size,
+                    &report.progress.update_time,
+                    &report.progress.message,
+                    &report.now_ms,
+                    &report.stale_deadline_at,
+                    &report.now_ms,
+                    &report.job_id,
+                    &run_id,
+                    &report.task_id,
+                    &attempt_id,
+                    &i64::from(report.worker_id),
+                    &report.worker_session_id,
+                ],
+            )
+            .map(|affected| affected > 0)
+            .map_err(postgres_err)
     }
 
-    fn flush_job_progress_summary(&self, job_id: &str, run_id: u64) -> FsResult<()> {
-        self.transaction(|tx| {
-            let mut job = match select_job_by_id_for_update(tx, job_id)? {
-                Some(job) if job.run_id == run_id => job,
-                _ => return Ok(()),
-            };
-            let tasks = select_tasks(tx, job_id, run_id, None, None)?;
-            let now_ms = curvine_runtime::common::LocalTime::mills() as i64;
-            job.summary = summarize_transfer_tasks(&tasks, now_ms).progress;
-            job.updated_at = now_ms;
-            update_job_summary(tx, &job)?;
-            Ok(())
-        })
+    fn update_job_progress_summary(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        summary: TransferProgress,
+        now_ms: i64,
+    ) -> FsResult<()> {
+        let run_id = db_u64(run_id)?;
+        let summary_json = json(&summary)?;
+        self.conn()?
+            .execute(
+                "update transfer_jobs
+                 set record_json = jsonb_set(
+                        jsonb_set(record_json::jsonb, '{summary}', $1::text::jsonb),
+                        '{updated_at}', to_jsonb($2::bigint)
+                     )::text,
+                     updated_at = $2 where job_id = $3 and run_id = $4",
+                &[&summary_json, &now_ms, &job_id, &run_id],
+            )
+            .map(|_| ())
+            .map_err(postgres_err)
     }
 }

@@ -18,8 +18,9 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
     summarize_transfer_tasks, StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease,
-    TransferListFilter, TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport,
-    TransferTaskState, TransferTenantSummary,
+    TransferListFilter, TransferProgress, TransferState, TransferStateUpdate, TransferTaskRecord,
+    TransferTaskReport, TransferTaskState, TransferTaskStatus, TransferTenantSummary,
+    WorkerInflight,
 };
 use parking_lot::Mutex;
 
@@ -260,6 +261,47 @@ impl TransferStore for MemoryTransferStore {
             .filter(|task| task.job_id == job_id && task.run_id == run_id)
             .cloned()
             .collect())
+    }
+
+    fn get_transfer_task_summary(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        now_ms: i64,
+    ) -> FsResult<curvine_model::TransferTaskSummary> {
+        let inner = self.inner.lock();
+        Ok(summarize_transfer_tasks(
+            inner
+                .tasks
+                .values()
+                .filter(|task| task.job_id == job_id && task.run_id == run_id),
+            now_ms,
+        ))
+    }
+
+    fn list_transfer_task_status_page(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        offset: usize,
+        limit: usize,
+    ) -> FsResult<(Vec<TransferTaskStatus>, bool)> {
+        let inner = self.inner.lock();
+        let mut tasks = inner
+            .tasks
+            .values()
+            .filter(|task| task.job_id == job_id && task.run_id == run_id)
+            .collect::<Vec<_>>();
+        tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+        let mut page = tasks
+            .into_iter()
+            .skip(offset)
+            .take(limit.saturating_add(1))
+            .map(TransferTaskStatus::from)
+            .collect::<Vec<_>>();
+        let has_next = page.len() > limit;
+        page.truncate(limit);
+        Ok((page, has_next))
     }
 
     fn request_cancel(&self, job_id: &str, run_id: u64, now_ms: i64) -> FsResult<bool> {
@@ -623,6 +665,35 @@ impl TransferStore for MemoryTransferStore {
             .collect())
     }
 
+    fn select_inflight_by_worker(&self) -> FsResult<Vec<WorkerInflight>> {
+        let inner = self.inner.lock();
+        let mut by_worker: std::collections::BTreeMap<u32, WorkerInflight> = Default::default();
+        for task in inner.tasks.values() {
+            if task.state != TransferTaskState::Running {
+                continue;
+            }
+            let entry = by_worker
+                .entry(task.worker_id)
+                .or_insert_with(|| WorkerInflight {
+                    worker_id: task.worker_id,
+                    task_count: 0,
+                    estimated_bytes: 0,
+                    unknown_bytes_count: 0,
+                });
+            entry.task_count += 1;
+            let bytes = if task.estimated_size > 0 {
+                task.estimated_size
+            } else {
+                task.progress.total_size
+            };
+            if bytes <= 0 {
+                entry.unknown_bytes_count += 1;
+            }
+            entry.estimated_bytes += bytes;
+        }
+        Ok(by_worker.into_values().collect())
+    }
+
     fn mark_stale_attempts(
         &self,
         job_id: &str,
@@ -630,36 +701,49 @@ impl TransferStore for MemoryTransferStore {
         owner: &str,
         lease_epoch: u64,
         now_ms: i64,
-        limit: usize,
+        candidates: Vec<TransferTaskRecord>,
     ) -> FsResult<Vec<StaleTaskAttempt>> {
-        let mut inner = self.inner.lock();
-        let Some(job) = inner.jobs.get(job_id) else {
+        if candidates.is_empty() {
             return Ok(Vec::new());
-        };
-        if job.run_id != run_id
-            || job.owner != owner
-            || job.lease_epoch != lease_epoch
-            || job.lease_expire_at <= now_ms
-        {
+        }
+        let mut inner = self.inner.lock();
+        let owner_valid = inner.jobs.get(job_id).is_some_and(|job| {
+            job.run_id == run_id
+                && job.owner == owner
+                && job.lease_epoch == lease_epoch
+                && job.lease_expire_at > now_ms
+        });
+        if !owner_valid {
             return Ok(Vec::new());
         }
 
         let mut stale = Vec::new();
-        for task in inner.tasks.values_mut().filter(|task| {
-            task.job_id == job_id
-                && task.run_id == run_id
-                && task.state == TransferTaskState::Running
-                && task.stale_deadline_at < now_ms
-        }) {
+        for candidate in candidates {
+            if candidate.job_id != job_id
+                || candidate.run_id != run_id
+                || candidate.state != TransferTaskState::Running
+                || candidate.stale_deadline_at >= now_ms
+            {
+                continue;
+            }
+            let key = (job_id.to_string(), run_id, candidate.task_id.clone());
+            let Some(task) = inner.tasks.get_mut(&key) else {
+                continue;
+            };
+            if task.state != TransferTaskState::Running
+                || task.attempt_id != candidate.attempt_id
+                || task.worker_id != candidate.worker_id
+                || task.worker_session_id != candidate.worker_session_id
+                || task.stale_deadline_at != candidate.stale_deadline_at
+            {
+                continue;
+            }
             task.state = TransferTaskState::Stale;
             task.retry_count = task.retry_count.saturating_add(1);
-            task.progress.message = "task stale timeout".to_string();
+            task.progress.message = candidate.progress.message.clone();
             task.progress.update_time = now_ms;
             task.updated_at = now_ms;
             stale.push(StaleTaskAttempt { task: task.clone() });
-            if stale.len() >= limit {
-                break;
-            }
         }
         Ok(stale)
     }
@@ -787,16 +871,14 @@ impl TransferStore for MemoryTransferStore {
         Ok(true)
     }
 
-    fn flush_job_progress_summary(&self, job_id: &str, run_id: u64) -> FsResult<()> {
+    fn update_job_progress_summary(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        summary: TransferProgress,
+        now_ms: i64,
+    ) -> FsResult<()> {
         let mut inner = self.inner.lock();
-        let tasks = inner
-            .tasks
-            .values()
-            .filter(|task| task.job_id == job_id && task.run_id == run_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        let now_ms = curvine_runtime::common::LocalTime::mills() as i64;
-        let summary = summarize_transfer_tasks(&tasks, now_ms).progress;
         let Some(job) = inner.jobs.get_mut(job_id) else {
             return Ok(());
         };
@@ -926,6 +1008,7 @@ mod tests {
             report_target_json: "{}".to_string(),
             state: TransferTaskState::Pending,
             progress: TransferProgress::default(),
+            estimated_size: 0,
             retry_count: 0,
             attempt_started_at: 0,
             last_report_at: 0,
