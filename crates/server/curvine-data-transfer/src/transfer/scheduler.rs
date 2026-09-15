@@ -58,6 +58,10 @@ fn mount_snapshot_failure_action(attempts: u32) -> MountSnapshotFailureAction {
 use crate::transfer::{ClusterMetadataCache, TransferMetrics};
 
 const TRANSFER_CLEANUP_INTERVAL_MS: u64 = 60_000;
+const TRANSFER_METRICS_INTERVAL_MS: u64 = 1_000;
+const SCHEDULER_ACTIVE_INTERVAL: Duration = Duration::from_millis(200);
+const SCHEDULER_IDLE_INTERVAL: Duration = Duration::from_secs(1);
+const SCHEDULER_MIN_IDLE_INTERVAL: Duration = Duration::from_millis(1);
 
 pub struct TransferScheduler<S> {
     store: Arc<S>,
@@ -69,6 +73,7 @@ pub struct TransferScheduler<S> {
     conf: TransferConf,
     worker_cursor: Arc<AtomicUsize>,
     last_cleanup_ms: Arc<AtomicU64>,
+    last_metrics_ms: Arc<AtomicU64>,
 }
 
 impl<S> Clone for TransferScheduler<S> {
@@ -83,6 +88,7 @@ impl<S> Clone for TransferScheduler<S> {
             conf: self.conf.clone(),
             worker_cursor: self.worker_cursor.clone(),
             last_cleanup_ms: self.last_cleanup_ms.clone(),
+            last_metrics_ms: self.last_metrics_ms.clone(),
         }
     }
 }
@@ -110,6 +116,7 @@ where
             conf,
             worker_cursor: Arc::new(AtomicUsize::new(0)),
             last_cleanup_ms: Arc::new(AtomicU64::new(0)),
+            last_metrics_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -120,20 +127,24 @@ where
             let stop = stop.clone();
             rt.spawn(async move {
                 while !stop.load(Ordering::Relaxed) {
-                    if let Err(err) = scheduler.run_once().await {
-                        warn!("transfer scheduler worker {} tick failed: {}", index, err);
-                    }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let delay = match scheduler.run_once().await {
+                        Ok(true) => SCHEDULER_ACTIVE_INTERVAL,
+                        Ok(false) => scheduler.idle_interval(),
+                        Err(err) => {
+                            warn!("transfer scheduler worker {} tick failed: {}", index, err);
+                            SCHEDULER_ACTIVE_INTERVAL
+                        }
+                    };
+                    tokio::time::sleep(delay).await;
                 }
             });
         }
     }
 
-    async fn run_once(&self) -> FsResult<()> {
+    async fn run_once(&self) -> FsResult<bool> {
         let now_ms = now_ms();
         self.cleanup_terminal_transfers(now_ms)?;
-        let (active, executing) = self.transfer_counts()?;
-        self.record_job_counts(active, executing);
+        self.record_job_counts_if_due(now_ms)?;
         let Some(lease) = self.store.acquire_runnable_transfer(
             &self.owner,
             duration_ms(self.conf.lease_timeout),
@@ -142,18 +153,18 @@ where
         )?
         else {
             record_metric(|metrics| metrics.inc_acquire("empty"));
-            return Ok(());
+            return Ok(false);
         };
         record_metric(|metrics| metrics.inc_acquire("ok"));
 
         let Some(job) = self.store.get_transfer(&lease.job_id)? else {
             record_metric(|metrics| metrics.inc_acquire("missing_job"));
-            return Ok(());
+            return Ok(true);
         };
 
         if job.cancel_requested {
             self.cancel_transfer(&job, &lease).await?;
-            return Ok(());
+            return Ok(true);
         }
 
         match job.state {
@@ -174,7 +185,11 @@ where
             | TransferState::Canceled
             | TransferState::PartialSuccess => {}
         }
-        Ok(())
+        Ok(true)
+    }
+
+    fn idle_interval(&self) -> Duration {
+        scheduler_idle_interval(self.conf.lease_timeout)
     }
 
     fn transfer_counts(&self) -> FsResult<(u64, u64)> {
@@ -188,6 +203,28 @@ where
         if let Ok(metrics) = TransferMetrics::get() {
             metrics.set_job_counts(active, executing);
         }
+    }
+
+    fn record_job_counts_if_due(&self, now_ms: i64) -> FsResult<()> {
+        let now = now_ms.max(0) as u64;
+        let last = self.last_metrics_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < TRANSFER_METRICS_INTERVAL_MS
+            || self
+                .last_metrics_ms
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return Ok(());
+        }
+        let (active, executing) = match self.transfer_counts() {
+            Ok(counts) => counts,
+            Err(err) => {
+                self.last_metrics_ms.store(0, Ordering::Relaxed);
+                return Err(err);
+            }
+        };
+        self.record_job_counts(active, executing);
+        Ok(())
     }
 
     fn cleanup_terminal_transfers(&self, now_ms: i64) -> FsResult<()> {
@@ -710,37 +747,27 @@ where
         }
 
         if self.store.has_recoverable_tasks(&job.job_id, job.run_id)? {
-            let renewed = self.store.renew_lease(
-                &lease.job_id,
-                lease.run_id,
-                &lease.owner,
-                lease.lease_epoch,
-                duration_ms(self.conf.lease_timeout),
-                now,
-            )?;
-            record_metric(|metrics| {
-                metrics.inc_lease_renew(if renewed { "success" } else { "stale" })
-            });
-        } else {
-            let _ = self.transition(
-                &job,
-                &lease,
-                &[TransferState::Running],
-                TransferState::Completed,
-                "all tasks completed",
-            )?;
-            record_metric(|metrics| metrics.inc_terminal("completed", "all_tasks_completed"));
-            let completed_size = self
-                .store
-                .list_transfer_tasks(&job.job_id, job.run_id)
-                .map(|tasks| {
-                    summarize_transfer_tasks(&tasks, now_ms())
-                        .counts
-                        .completed_size
-                })
-                .unwrap_or(0);
-            record_metric(|metrics| metrics.inc_completed_bytes("completed", completed_size));
+            // acquire_runnable_transfer already refreshed this lease for the current tick.
+            return Ok(());
         }
+        let _ = self.transition(
+            &job,
+            &lease,
+            &[TransferState::Running],
+            TransferState::Completed,
+            "all tasks completed",
+        )?;
+        record_metric(|metrics| metrics.inc_terminal("completed", "all_tasks_completed"));
+        let completed_size = self
+            .store
+            .list_transfer_tasks(&job.job_id, job.run_id)
+            .map(|tasks| {
+                summarize_transfer_tasks(&tasks, now_ms())
+                    .counts
+                    .completed_size
+            })
+            .unwrap_or(0);
+        record_metric(|metrics| metrics.inc_completed_bytes("completed", completed_size));
         Ok(())
     }
 
@@ -1247,6 +1274,12 @@ fn duration_ms(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
+fn scheduler_idle_interval(lease_timeout: Duration) -> Duration {
+    SCHEDULER_IDLE_INTERVAL
+        .min(lease_timeout / 2)
+        .max(SCHEDULER_MIN_IDLE_INTERVAL)
+}
+
 fn transfer_task_state(state: i32) -> TransferTaskState {
     match state {
         1 => TransferTaskState::Pending,
@@ -1275,8 +1308,10 @@ fn transfer_kind_label(kind: curvine_model::TransferKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        mount_snapshot_failure_action, MountSnapshotFailureAction, MOUNT_SNAPSHOT_MAX_RETRIES,
+        mount_snapshot_failure_action, scheduler_idle_interval, MountSnapshotFailureAction,
+        MOUNT_SNAPSHOT_MAX_RETRIES,
     };
+    use std::time::Duration;
 
     #[test]
     fn retryable_mount_snapshot_failures_use_bounded_backoff() {
@@ -1297,6 +1332,18 @@ mod tests {
         assert_eq!(
             mount_snapshot_failure_action(MOUNT_SNAPSHOT_MAX_RETRIES),
             MountSnapshotFailureAction::Fail
+        );
+    }
+
+    #[test]
+    fn idle_backoff_renews_short_leases_before_they_expire() {
+        assert_eq!(
+            scheduler_idle_interval(Duration::from_secs(120)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            scheduler_idle_interval(Duration::from_millis(100)),
+            Duration::from_millis(50)
         );
     }
 }

@@ -306,21 +306,51 @@ impl TransferStore for SqliteTransferStore {
     ) -> FsResult<Option<TransferLease>> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(sqlite_err)?;
-        let executing = tx
-            .query_row(
-                "select count(*) from transfer_jobs where state in (2, 3, 4, 5)",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(sqlite_err)? as u64;
+        let running_check_interval_ms =
+            crate::transfer::running_transfer_check_interval_ms(lease_ms);
+        let running_event_lease_before_ms =
+            now_ms.saturating_add(lease_ms.saturating_sub(running_check_interval_ms));
+        let running_renew_lease_before_ms = now_ms.saturating_add(lease_ms / 2);
         let mut candidate: Option<(String, i64, i64, i64)> = tx
             .query_row(
                 "select job_id, run_id, lease_epoch, state
-                 from transfer_jobs
-                 where owner = ?1 and state in (4, 5) and lease_expire_at > ?2 and updated_at < ?2
-                 order by updated_at asc
+                 from transfer_jobs as job
+                 where job.owner = ?1 and job.lease_expire_at > ?2
+                   and (
+                        (job.state = 5 and job.updated_at < ?2)
+                        or (
+                            job.state = 4 and (
+                                job.lease_expire_at <= ?4
+                                or (
+                                    job.lease_expire_at <= ?3 and (
+                                        exists (
+                                            select 1 from transfer_tasks as task
+                                            where task.job_id = job.job_id and task.run_id = job.run_id
+                                              and task.state in (1, 4, 6)
+                                        )
+                                        or exists (
+                                            select 1 from transfer_tasks as task
+                                            where task.job_id = job.job_id and task.run_id = job.run_id
+                                              and task.state = 2 and task.stale_deadline_at < ?2
+                                        )
+                                        or not exists (
+                                            select 1 from transfer_tasks as task
+                                            where task.job_id = job.job_id and task.run_id = job.run_id
+                                              and task.state in (1, 2, 6)
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                   )
+                 order by job.updated_at asc
                  limit 1",
-                params![owner, now_ms],
+                params![
+                    owner,
+                    now_ms,
+                    running_event_lease_before_ms,
+                    running_renew_lease_before_ms,
+                ],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
@@ -339,9 +369,18 @@ impl TransferStore for SqliteTransferStore {
                 .optional()
                 .map_err(sqlite_err)?;
         }
-        if candidate.is_none() && executing < max_executing_transfers {
-            let active_targets = select_executing_targets(&tx)?;
-            candidate = select_pending_transfer(&tx, now_ms, &active_targets)?;
+        if candidate.is_none() && has_pending_transfer(&tx, now_ms)? {
+            let executing = tx
+                .query_row(
+                    "select count(*) from transfer_jobs where state in (2, 3, 4, 5)",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(sqlite_err)? as u64;
+            if executing < max_executing_transfers {
+                let active_targets = select_executing_targets(&tx)?;
+                candidate = select_pending_transfer(&tx, now_ms, &active_targets)?;
+            }
         }
         let Some((job_id, run_id, lease_epoch, state)) = candidate else {
             tx.commit().map_err(sqlite_err)?;
@@ -1433,6 +1472,17 @@ fn select_executing_targets(conn: &Connection) -> FsResult<Vec<(String, String)>
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .map_err(sqlite_err)?;
     collect_sqlite_rows(rows)
+}
+
+fn has_pending_transfer(conn: &Connection, now_ms: i64) -> FsResult<bool> {
+    conn.query_row(
+        "select exists(
+             select 1 from transfer_jobs where state = 1 and lease_expire_at <= ?1
+         )",
+        params![now_ms],
+        |row| row.get(0),
+    )
+    .map_err(sqlite_err)
 }
 
 fn select_pending_transfer(

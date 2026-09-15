@@ -301,6 +301,11 @@ impl TransferStore for MysqlTransferStore {
         max_executing_transfers: u64,
     ) -> FsResult<Option<TransferLease>> {
         let mut conn = self.conn()?;
+        let running_check_interval_ms =
+            crate::transfer::running_transfer_check_interval_ms(lease_ms);
+        let running_event_lease_before_ms =
+            now_ms.saturating_add(lease_ms.saturating_sub(running_check_interval_ms));
+        let running_renew_lease_before_ms = now_ms.saturating_add(lease_ms / 2);
         // Conflict reads below are non-locking, so they need fresh committed state.
         let mut tx = conn
             .start_transaction(
@@ -314,22 +319,46 @@ impl TransferStore for MysqlTransferStore {
         )
         .map_err(mysql_err)?
         .ok_or_else(|| FsError::common("Missing mysql transfer schema version"))?;
-        let executing = tx
-            .exec_first::<u64, _, _>(
-                "select count(*) from transfer_jobs where state in (2, 3, 4, 5)",
-                Params::Empty,
-            )
-            .map_err(mysql_err)?
-            .ok_or_else(|| FsError::common("Failed to count executing transfer jobs"))?;
         let mut job: Option<(String, u64, u64, i32)> = tx
             .exec_first(
                 "select job_id, run_id, lease_epoch, state
-                 from transfer_jobs
-                 where owner = :owner and state in (4, 5) and lease_expire_at > :now_ms
-                   and updated_at < :now_ms
-                 order by updated_at asc
+                 from transfer_jobs as job
+                 where job.owner = :owner and job.lease_expire_at > :now_ms
+                   and (
+                        (job.state = 5 and job.updated_at < :now_ms)
+                        or (
+                            job.state = 4 and (
+                                job.lease_expire_at <= :running_renew_lease_before_ms
+                                or (
+                                    job.lease_expire_at <= :running_event_lease_before_ms and (
+                                        exists (
+                                            select 1 from transfer_tasks as task
+                                            where task.job_id = job.job_id and task.run_id = job.run_id
+                                              and task.state in (1, 4, 6)
+                                        )
+                                        or exists (
+                                            select 1 from transfer_tasks as task
+                                            where task.job_id = job.job_id and task.run_id = job.run_id
+                                              and task.state = 2 and task.stale_deadline_at < :now_ms
+                                        )
+                                        or not exists (
+                                            select 1 from transfer_tasks as task
+                                            where task.job_id = job.job_id and task.run_id = job.run_id
+                                              and task.state in (1, 2, 6)
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                   )
+                 order by job.updated_at asc
                  limit 1",
-                params! { "owner" => owner, "now_ms" => now_ms },
+                params! {
+                    "owner" => owner,
+                    "now_ms" => now_ms,
+                    "running_event_lease_before_ms" => running_event_lease_before_ms,
+                    "running_renew_lease_before_ms" => running_renew_lease_before_ms,
+                },
             )
             .map_err(mysql_err)?;
         if job.is_none() {
@@ -344,9 +373,18 @@ impl TransferStore for MysqlTransferStore {
                 )
                 .map_err(mysql_err)?;
         }
-        if job.is_none() && executing < max_executing_transfers {
-            let active_targets = select_executing_targets(&mut tx)?;
-            job = select_pending_transfer(&mut tx, now_ms, &active_targets)?;
+        if job.is_none() && has_pending_transfer(&mut tx, now_ms)? {
+            let executing = tx
+                .exec_first::<u64, _, _>(
+                    "select count(*) from transfer_jobs where state in (2, 3, 4, 5)",
+                    Params::Empty,
+                )
+                .map_err(mysql_err)?
+                .ok_or_else(|| FsError::common("Failed to count executing transfer jobs"))?;
+            if executing < max_executing_transfers {
+                let active_targets = select_executing_targets(&mut tx)?;
+                job = select_pending_transfer(&mut tx, now_ms, &active_targets)?;
+            }
         }
         let Some((job_id, run_id, lease_epoch, state)) = job else {
             tx.commit().map_err(mysql_err)?;
@@ -1268,6 +1306,15 @@ fn select_executing_targets(conn: &mut impl Queryable) -> FsResult<Vec<(String, 
         "select target_path, tenant from transfer_jobs where state in (2, 3, 4, 5)",
         Params::Empty,
     )
+    .map_err(mysql_err)
+}
+
+fn has_pending_transfer(conn: &mut impl Queryable, now_ms: i64) -> FsResult<bool> {
+    conn.exec_first::<u8, _, _>(
+        "select 1 from transfer_jobs where state = 1 and lease_expire_at <= :now_ms limit 1",
+        params! { "now_ms" => now_ms },
+    )
+    .map(|value| value.is_some())
     .map_err(mysql_err)
 }
 

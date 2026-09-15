@@ -38,7 +38,7 @@ use uuid::Uuid;
 use crate::transfer::{ClusterMetadataCache, TransferMetrics, TransferStore};
 
 const PROGRESS_REPORT_COALESCE_BATCH: usize = 256;
-const JOB_SUMMARY_FLUSH_INTERVAL: Duration = Duration::from_millis(1000);
+const JOB_SUMMARY_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 const TRANSFER_PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_LIST_PAGE_SIZE: usize = 20;

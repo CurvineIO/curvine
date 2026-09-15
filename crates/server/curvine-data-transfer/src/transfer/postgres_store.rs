@@ -256,17 +256,53 @@ fn select_runnable_owned(
     conn: &mut impl GenericClient,
     owner: &str,
     now_ms: i64,
+    lease_ms: i64,
 ) -> FsResult<Option<(String, u64, u64, i32)>> {
+    let running_check_interval_ms = crate::transfer::running_transfer_check_interval_ms(lease_ms);
+    let running_event_lease_before_ms =
+        now_ms.saturating_add(lease_ms.saturating_sub(running_check_interval_ms));
+    let running_renew_lease_before_ms = now_ms.saturating_add(lease_ms / 2);
     select_lease_candidate(
         conn,
         "select job_id, run_id, lease_epoch, state
-         from transfer_jobs
-         where owner = $1 and state in (4, 5) and lease_expire_at > $2
-           and updated_at < $2
-         order by updated_at asc
+         from transfer_jobs as job
+         where job.owner = $1 and job.lease_expire_at > $2
+           and (
+                (job.state = 5 and job.updated_at < $2)
+                or (
+                    job.state = 4 and (
+                        job.lease_expire_at <= $4
+                        or (
+                            job.lease_expire_at <= $3 and (
+                                exists (
+                                    select 1 from transfer_tasks as task
+                                    where task.job_id = job.job_id and task.run_id = job.run_id
+                                      and task.state in (1, 4, 6)
+                                )
+                                or exists (
+                                    select 1 from transfer_tasks as task
+                                    where task.job_id = job.job_id and task.run_id = job.run_id
+                                      and task.state = 2 and task.stale_deadline_at < $2
+                                )
+                                or not exists (
+                                    select 1 from transfer_tasks as task
+                                    where task.job_id = job.job_id and task.run_id = job.run_id
+                                      and task.state in (1, 2, 6)
+                                )
+                            )
+                        )
+                    )
+                )
+           )
+         order by job.updated_at asc
          limit 1
          for update",
-        &[&owner, &now_ms],
+        &[
+            &owner,
+            &now_ms,
+            &running_event_lease_before_ms,
+            &running_renew_lease_before_ms,
+        ],
     )
 }
 
@@ -284,6 +320,15 @@ fn select_expired_runnable(
          for update",
         &[&now_ms],
     )
+}
+
+fn has_pending_runnable(conn: &mut impl GenericClient, now_ms: i64) -> FsResult<bool> {
+    conn.query_opt(
+        "select 1 from transfer_jobs where state = 1 and lease_expire_at <= $1 limit 1",
+        &[&now_ms],
+    )
+    .map(|value| value.is_some())
+    .map_err(postgres_err)
 }
 
 fn select_pending_runnable(
@@ -1088,19 +1133,20 @@ impl TransferStore for PostgresTransferStore {
         let max_executing_transfers = db_u64(max_executing_transfers)?;
         self.transaction(|tx| {
             lock_submission_gate(tx)?;
-            let executing = count_rows(
-                tx,
-                "select count(*) from transfer_jobs where state in (2, 3, 4, 5)",
-                &[],
-            )?;
-            let executing = db_u64(executing)?;
-            let mut candidate = select_runnable_owned(tx, owner, now_ms)?;
+            let mut candidate = select_runnable_owned(tx, owner, now_ms, lease_ms)?;
             if candidate.is_none() {
                 candidate = select_expired_runnable(tx, now_ms)?;
             }
-            if candidate.is_none() && executing < max_executing_transfers {
-                let active_targets = select_executing_targets(tx)?;
-                candidate = select_pending_runnable(tx, now_ms, &active_targets)?;
+            if candidate.is_none() && has_pending_runnable(tx, now_ms)? {
+                let executing = count_rows(
+                    tx,
+                    "select count(*) from transfer_jobs where state in (2, 3, 4, 5)",
+                    &[],
+                )?;
+                if db_u64(executing)? < max_executing_transfers {
+                    let active_targets = select_executing_targets(tx)?;
+                    candidate = select_pending_runnable(tx, now_ms, &active_targets)?;
+                }
             }
             let Some((job_id, run_id, lease_epoch, state)) = candidate else {
                 return Ok(None);

@@ -28,6 +28,33 @@ use crate::transfer::{
     TransferTaskStateUpdate,
 };
 
+fn running_job_needs_scheduler(
+    state: &MemoryTransferState,
+    job: &TransferJobRecord,
+    now_ms: i64,
+) -> bool {
+    let mut has_running = false;
+    for task in state
+        .tasks
+        .values()
+        .filter(|task| task.job_id == job.job_id && task.run_id == job.run_id)
+    {
+        match task.state {
+            TransferTaskState::Pending | TransferTaskState::Stale | TransferTaskState::Failed => {
+                return true;
+            }
+            TransferTaskState::Running => {
+                if task.stale_deadline_at < now_ms {
+                    return true;
+                }
+                has_running = true;
+            }
+            TransferTaskState::Completed | TransferTaskState::Canceled => {}
+        }
+    }
+    !has_running
+}
+
 #[derive(Default)]
 pub struct MemoryTransferStore {
     inner: Mutex<MemoryTransferState>,
@@ -259,63 +286,76 @@ impl TransferStore for MemoryTransferStore {
         max_executing_transfers: u64,
     ) -> FsResult<Option<TransferLease>> {
         let mut inner = self.inner.lock();
-        let executing_targets = inner
-            .jobs
-            .values()
-            .filter(|job| job.state.is_executing())
-            .map(|job| job.target_path.as_str())
-            .collect::<Vec<_>>();
-        let executing = executing_targets.len() as u64;
-        let executing_tenants = inner
-            .jobs
-            .values()
-            .filter(|job| job.state.is_executing())
-            .map(|job| job.tenant.as_str())
-            .collect::<HashSet<_>>();
-        let candidate_id = inner
-            .jobs
-            .values()
-            .filter(|job| {
-                job.owner == owner
-                    && matches!(job.state, TransferState::Running | TransferState::Canceling)
-                    && job.lease_expire_at > now_ms
-                    && job.updated_at < now_ms
-            })
-            .min_by_key(|job| job.updated_at)
-            .map(|job| job.job_id.clone())
-            .or_else(|| {
-                inner
-                    .jobs
-                    .values()
-                    .filter(|job| {
-                        job.state.is_runnable()
-                            && job.state != TransferState::Pending
-                            && job.lease_expire_at <= now_ms
-                    })
-                    .min_by_key(|job| job.updated_at)
-                    .map(|job| job.job_id.clone())
-            })
-            .or_else(|| {
-                if executing >= max_executing_transfers {
-                    return None;
-                }
-                inner
-                    .jobs
-                    .values()
-                    .filter(|job| {
-                        job.state == TransferState::Pending
-                            && job.lease_expire_at <= now_ms
-                            && !executing_targets.iter().any(|target_path| {
-                                target_paths_conflict(&job.target_path, target_path)
-                            })
-                    })
-                    .min_by_key(|job| {
-                        let tenant_pressure =
-                            u64::from(executing_tenants.contains(job.tenant.as_str()));
-                        (tenant_pressure, job.updated_at, job.job_id.clone())
-                    })
-                    .map(|job| job.job_id.clone())
-            });
+        let running_check_interval_ms =
+            crate::transfer::running_transfer_check_interval_ms(lease_ms);
+        let running_event_lease_before_ms =
+            now_ms.saturating_add(lease_ms.saturating_sub(running_check_interval_ms));
+        let running_renew_lease_before_ms = now_ms.saturating_add(lease_ms / 2);
+        let candidate_id =
+            inner
+                .jobs
+                .values()
+                .filter(|job| {
+                    job.owner == owner
+                        && job.lease_expire_at > now_ms
+                        && ((job.state == TransferState::Canceling && job.updated_at < now_ms)
+                            || (job.state == TransferState::Running
+                                && (job.lease_expire_at <= running_renew_lease_before_ms
+                                    || (job.lease_expire_at <= running_event_lease_before_ms
+                                        && running_job_needs_scheduler(&inner, job, now_ms)))))
+                })
+                .min_by_key(|job| job.updated_at)
+                .map(|job| job.job_id.clone())
+                .or_else(|| {
+                    inner
+                        .jobs
+                        .values()
+                        .filter(|job| {
+                            job.state.is_runnable()
+                                && job.state != TransferState::Pending
+                                && job.lease_expire_at <= now_ms
+                        })
+                        .min_by_key(|job| job.updated_at)
+                        .map(|job| job.job_id.clone())
+                })
+                .or_else(|| {
+                    if !inner.jobs.values().any(|job| {
+                        job.state == TransferState::Pending && job.lease_expire_at <= now_ms
+                    }) {
+                        return None;
+                    }
+                    let executing_targets = inner
+                        .jobs
+                        .values()
+                        .filter(|job| job.state.is_executing())
+                        .map(|job| job.target_path.as_str())
+                        .collect::<Vec<_>>();
+                    if executing_targets.len() as u64 >= max_executing_transfers {
+                        return None;
+                    }
+                    let executing_tenants = inner
+                        .jobs
+                        .values()
+                        .filter(|job| job.state.is_executing())
+                        .map(|job| job.tenant.as_str())
+                        .collect::<HashSet<_>>();
+                    inner
+                        .jobs
+                        .values()
+                        .filter(|job| {
+                            job.state == TransferState::Pending
+                                && job.lease_expire_at <= now_ms
+                                && !executing_targets.iter().any(|target_path| {
+                                    target_paths_conflict(&job.target_path, target_path)
+                                })
+                        })
+                        .min_by_key(|job| {
+                            let tenant_pressure =
+                                u64::from(executing_tenants.contains(job.tenant.as_str()));
+                            (tenant_pressure, job.updated_at, job.job_id.clone())
+                        })
+                        .map(|job| job.job_id.clone())
+                });
         let Some(candidate_id) = candidate_id else {
             return Ok(None);
         };
@@ -892,6 +932,58 @@ mod tests {
             stale_deadline_at: 0,
             updated_at: 1,
         }
+    }
+
+    fn running_store(task_state: TransferTaskState) -> (MemoryTransferStore, TransferJobRecord) {
+        let store = MemoryTransferStore::new();
+        let job = sample_job("running-check");
+        store
+            .create_or_get_by_request_id_checked(job.clone())
+            .unwrap();
+        let mut task = sample_task(&job, "t1");
+        task.state = task_state;
+        task.stale_deadline_at = 60_001;
+
+        let mut inner = store.inner.lock();
+        let record = inner.jobs.get_mut(&job.job_id).unwrap();
+        record.state = TransferState::Running;
+        record.owner = "owner".to_string();
+        record.lease_epoch = 1;
+        record.lease_expire_at = 60_000;
+        inner
+            .tasks
+            .insert((job.job_id.clone(), job.run_id, task.task_id.clone()), task);
+        drop(inner);
+        (store, job)
+    }
+
+    #[test]
+    fn healthy_running_task_is_reacquired_only_for_lease_renewal() {
+        let (store, _) = running_store(TransferTaskState::Running);
+
+        assert!(store
+            .acquire_runnable_transfer("owner", 60_000, 29_999, 10)
+            .unwrap()
+            .is_none());
+        let lease = store
+            .acquire_runnable_transfer("owner", 60_000, 30_000, 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.lease_epoch, 2);
+    }
+
+    #[test]
+    fn completed_running_job_is_reacquired_after_check_interval() {
+        let (store, _) = running_store(TransferTaskState::Completed);
+
+        assert!(store
+            .acquire_runnable_transfer("owner", 60_000, 4_999, 10)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .acquire_runnable_transfer("owner", 60_000, 5_000, 10)
+            .unwrap()
+            .is_some());
     }
 
     #[test]

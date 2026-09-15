@@ -48,6 +48,13 @@ pub use self::service::{progress_to_proto, task_summary_to_proto, TransferServic
 mod scheduler;
 pub use self::scheduler::TransferScheduler;
 
+// Running jobs only need scheduler attention for task state changes or lease renewal.
+pub(crate) const RUNNING_TRANSFER_CHECK_INTERVAL_MS: i64 = 5_000;
+
+pub(crate) fn running_transfer_check_interval_ms(lease_ms: i64) -> i64 {
+    RUNNING_TRANSFER_CHECK_INTERVAL_MS.min((lease_ms / 2).max(1))
+}
+
 mod handler;
 pub use self::handler::TransferHandler;
 
