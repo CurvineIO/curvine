@@ -219,7 +219,7 @@ fn postgres_store_persists_transfer_lifecycle() {
         .unwrap();
 
     let lease = store
-        .acquire_runnable_transfer("postgres-store-test", 60_000, 2, 1)
+        .acquire_runnable_transfer("postgres-store-test", 60_000, 2, 1, false)
         .unwrap()
         .unwrap();
     assert_eq!(lease.job_id, job.job_id);
@@ -368,7 +368,7 @@ fn postgres_store_marks_only_probed_missing_attempts() {
         .create_or_get_by_request_id_checked(job.clone())
         .unwrap();
     let lease = store
-        .acquire_runnable_transfer("owner", 60_000, 1, 1)
+        .acquire_runnable_transfer("owner", 60_000, 1, 1, false)
         .unwrap()
         .unwrap();
     let task_1 = transfer_task(&job);
@@ -495,6 +495,7 @@ fn postgres_store_marks_only_probed_missing_attempts() {
                 state: TransferTaskState::Failed,
                 message: message.to_string(),
                 now_ms,
+                bump_retry: false,
             })
             .unwrap());
     }
@@ -533,12 +534,12 @@ fn postgres_store_keeps_conflicting_requests_pending_and_persists_snapshot_retri
     }
 
     let parent_lease = store
-        .acquire_runnable_transfer("owner-parent", 60_000, 10, 10)
+        .acquire_runnable_transfer("owner-parent", 60_000, 10, 10, false)
         .unwrap()
         .unwrap();
     assert_eq!(parent_lease.job_id, parent.job_id);
     let adjacent_lease = store
-        .acquire_runnable_transfer("owner-adjacent", 60_000, 11, 10)
+        .acquire_runnable_transfer("owner-adjacent", 60_000, 11, 10, false)
         .unwrap()
         .unwrap();
     assert_eq!(adjacent_lease.job_id, adjacent.job_id);
@@ -560,7 +561,7 @@ fn postgres_store_keeps_conflicting_requests_pending_and_persists_snapshot_retri
         })
         .unwrap());
     let child_lease = store
-        .acquire_runnable_transfer("owner-child", 60_000, 13, 10)
+        .acquire_runnable_transfer("owner-child", 60_000, 13, 10, false)
         .unwrap()
         .unwrap();
     assert_eq!(child_lease.job_id, child.job_id);
@@ -590,12 +591,12 @@ fn postgres_store_keeps_conflicting_requests_pending_and_persists_snapshot_retri
             .unwrap();
     }
     let root_lease = store
-        .acquire_runnable_transfer("owner-root", 60_000, 18, 10)
+        .acquire_runnable_transfer("owner-root", 60_000, 18, 10, false)
         .unwrap()
         .unwrap();
     assert_eq!(root_lease.job_id, root.job_id);
     assert!(store
-        .acquire_runnable_transfer("owner-root-child", 60_000, 19, 10)
+        .acquire_runnable_transfer("owner-root-child", 60_000, 19, 10, false)
         .unwrap()
         .is_none());
     assert!(store
@@ -612,7 +613,7 @@ fn postgres_store_keeps_conflicting_requests_pending_and_persists_snapshot_retri
         .unwrap());
     assert_eq!(
         store
-            .acquire_runnable_transfer("owner-root-child", 60_000, 21, 10)
+            .acquire_runnable_transfer("owner-root-child", 60_000, 21, 10, false)
             .unwrap()
             .unwrap()
             .job_id,
@@ -625,7 +626,7 @@ fn postgres_store_keeps_conflicting_requests_pending_and_persists_snapshot_retri
         .create_or_get_by_request_id_checked(snapshot.clone())
         .unwrap();
     let snapshot_lease = store
-        .acquire_runnable_transfer("owner-snapshot", 60_000, 23, 10)
+        .acquire_runnable_transfer("owner-snapshot", 60_000, 23, 10, false)
         .unwrap()
         .unwrap();
     assert!(store
