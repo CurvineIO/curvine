@@ -17,7 +17,7 @@ jobs:
   # Build Rocky Linux 9 binary file
   build:
     name: Build for Rocky Linux 9
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     container:
       image: ghcr.io/curvineio/curvine-compile:rocky9
 
@@ -77,7 +77,7 @@ jobs:
   release:
     name: Create Release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
     - uses: actions/checkout@v4
 

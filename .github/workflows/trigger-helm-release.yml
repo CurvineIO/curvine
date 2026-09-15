@@ -27,7 +27,7 @@ concurrency:
 jobs:
   trigger-helm-release:
     name: Wait for images and dispatch helm release
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 120
     steps:
       - name: Resolve release metadata
