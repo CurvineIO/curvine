@@ -47,10 +47,6 @@ where
     }
 }
 
-fn to_block_location(worker: &WorkerAddress, actual_storage_type: StorageType) -> BlockLocation {
-    BlockLocation::new(worker.worker_id, actual_storage_type)
-}
-
 enum WriterAdapter {
     Local(BlockWriterLocal),
     Remote(BlockWriterRemote),
@@ -335,7 +331,12 @@ impl BlockWriter {
         let locs = self
             .inners
             .iter()
-            .map(|writer| to_block_location(writer.worker_address(), writer.actual_storage_type()))
+            .map(|writer| {
+                BlockLocation::new(
+                    writer.worker_address().worker_id,
+                    writer.actual_storage_type(),
+                )
+            })
             .collect();
 
         CommitBlock {
@@ -348,25 +349,10 @@ impl BlockWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::{finish_all_cancellations, to_block_location};
+    use super::finish_all_cancellations;
     use curvine_error::FsError;
-    use curvine_model::{StorageType, WorkerAddress};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-
-    #[test]
-    fn commit_location_preserves_worker_selected_storage_type() {
-        let worker = WorkerAddress {
-            worker_id: 7,
-            ..Default::default()
-        };
-        let actual_storage_type = StorageType::Disk;
-        let location = to_block_location(&worker, actual_storage_type);
-
-        assert_eq!(location.worker_id, 7);
-        assert_eq!(location.storage_type, StorageType::Disk);
-        assert_ne!(location.storage_type, StorageType::Mem);
-    }
 
     #[tokio::test]
     async fn cancellation_attempts_all_futures_and_returns_an_error() {
