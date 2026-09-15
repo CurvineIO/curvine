@@ -146,8 +146,52 @@ pub fn configured_master_for_active(conf: &ClusterConf, active_master: &str) -> 
         .into_iter()
         .find(|configured| {
             configured.to_string() == active
-                || hosts_match_for_cluster_mapping(&configured.hostname, &active_addr.hostname)
+                || master_host_matches_reported(&configured.hostname, &active_addr.hostname)
         })
+}
+
+/// Resolve a host to all of its addresses. IP literals resolve to themselves.
+fn resolve_host_ips(host: &str) -> Vec<IpAddr> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Vec::new();
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return vec![ip];
+    }
+    (host, 0)
+        .to_socket_addrs()
+        .map(|addrs| addrs.map(|addr| addr.ip()).collect())
+        .unwrap_or_default()
+}
+
+/// Whether a configured master host refers to the same node as the master
+/// address an active master reported for itself.
+///
+/// Masters report their own `host:port`, and that host may be an IP literal even
+/// though the cluster is configured with DNS names (or the reverse).
+/// `hosts_match_for_cluster_mapping` refuses to guess across an IP/hostname pair,
+/// which used to drop an explicit `client.master_web_addrs` mapping and scrape the
+/// reported IP with the fallback port. Resolve the hostname side so the configured
+/// web/metrics host and port stay authoritative.
+fn master_host_matches_reported(configured: &str, reported: &str) -> bool {
+    if hosts_match_for_cluster_mapping(configured, reported) {
+        return true;
+    }
+
+    let configured = configured.trim();
+    let reported = reported.trim();
+    let (name, literal) = match (is_ip_literal(configured), is_ip_literal(reported)) {
+        (false, true) => (configured, reported),
+        (true, false) => (reported, configured),
+        // Both sides are names (already compared above) or both are literals
+        // (which must match exactly).
+        _ => return false,
+    };
+    let Ok(literal) = literal.parse::<IpAddr>() else {
+        return false;
+    };
+    resolve_host_ips(name).contains(&literal)
 }
 
 pub fn configured_master_web_addrs(conf: &ClusterConf) -> &[InetAddr] {
@@ -170,7 +214,7 @@ pub fn configured_master_web_for_active(
     };
     if let Some(matched) = conf.client.master_web_addrs.iter().find(|configured| {
         configured.to_string() == active
-            || hosts_match_for_cluster_mapping(&configured.hostname, &active_addr.hostname)
+            || master_host_matches_reported(&configured.hostname, &active_addr.hostname)
     }) {
         return Some(matched.clone());
     }
@@ -178,7 +222,7 @@ pub fn configured_master_web_for_active(
     let master_addrs = configured_master_addrs(conf);
     let idx = master_addrs.iter().position(|configured| {
         configured.to_string() == active
-            || hosts_match_for_cluster_mapping(&configured.hostname, &active_addr.hostname)
+            || master_host_matches_reported(&configured.hostname, &active_addr.hostname)
     })?;
     conf.client.master_web_addrs.get(idx).cloned()
 }
@@ -668,6 +712,30 @@ mod tests {
         let url = master_metrics_scrape_url(&conf, "cv-master-2:8995");
         assert!(url.contains(":29000/metrics"));
         assert!(!url.contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn master_web_mapping_matches_active_master_reported_as_ip() {
+        // A master reports its own `host:port`, which can be an IP literal while the
+        // cluster is configured with DNS names. The configured web mapping must still
+        // apply, otherwise the scrape falls back to the reported IP and `master.web_port`.
+        let mut conf = ClusterConf::default();
+        conf.master.web_port = 9000;
+        conf.client.master_addrs = vec![InetAddr::new("localhost", 18995)];
+        conf.client.master_web_addrs = vec![InetAddr::new("localhost", 19010)];
+        assert!(configured_master_web_for_active(&conf, "127.0.0.1:18995").is_some());
+        assert_eq!(master_scrape_web_port(&conf, "127.0.0.1:18995"), 19010);
+    }
+
+    #[test]
+    fn master_web_mapping_ignores_unresolvable_host_for_ip_active_master() {
+        let mut conf = ClusterConf::default();
+        conf.master.web_port = 9000;
+        conf.client.master_addrs = vec![InetAddr::new("cv-master-does-not-resolve.invalid", 8995)];
+        conf.client.master_web_addrs =
+            vec![InetAddr::new("cv-master-does-not-resolve.invalid", 19010)];
+        assert!(configured_master_web_for_active(&conf, "10.41.54.240:8995").is_none());
+        assert_eq!(master_scrape_web_port(&conf, "10.41.54.240:8995"), 9000);
     }
 
     #[test]
