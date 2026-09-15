@@ -12,6 +12,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Self-hosted runners on older glibc hosts cannot run the runner-bundled Node 24.
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
   # Tune build parallelism: 4 uses more CPU on standard 4-vCPU runner; set to 2 if OOM
   CARGO_BUILD_JOBS: 4
   CVTEST_REPO: CurvineIO/cvtest
