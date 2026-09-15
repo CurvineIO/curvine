@@ -15,6 +15,7 @@
 use crate::common::UfsFactory;
 use crate::worker::task::task_progress_reporter::TaskProgressReporter;
 use crate::worker::task::{record_report_result, record_task_outcome, TaskContext};
+use curvine_client_core::block::BlockWriterRemote;
 use curvine_client_core::file::{CurvineFileSystem, FsReader};
 use curvine_core_error::err_box;
 use curvine_error::FsError;
@@ -573,7 +574,11 @@ impl LoadTaskRunner {
     /// directly to the shared target file and the job's convergence protocol
     /// completes it once all segments are done (design §14, T4).
     async fn run_segment(&self) -> FsResult<bool> {
+        // plan is wrapped as {"segment": {offset, length, total_len}} by the planner.
         let plan: SegmentPlan = serde_json::from_str(&self.task.info.source_read_plan_json)
+            .and_then(|value: serde_json::Value| {
+                serde_json::from_value(value.get("segment").cloned().unwrap_or_default())
+            })
             .map_err(|err| {
                 FsError::common(format!(
                     "Invalid segment plan for task {}: {}",
@@ -583,25 +588,56 @@ impl LoadTaskRunner {
         let source_path = Path::from_str(&self.task.info.source_path)?;
         let target_path = Path::from_str(&self.task.info.target_path)?;
 
+        // Ensure the target exists with the full block layout (first segment
+        // creates and pre-allocates; concurrent segments reuse it).
+        self.ensure_segment_target(&target_path, plan.total_len).await?;
+
+        // Locate this segment's block in the target layout.
+        let blocks = self.fs.get_block_locations(&target_path).await?;
+        let block_size = blocks.status.block_size.max(1);
+        let block_index = plan.offset / block_size;
+        let located = blocks.block_locs.get(block_index as usize).ok_or_else(|| {
+            FsError::common(format!(
+                "segment task {} block {} not found in target layout (blocks={})",
+                self.task.info.task_id,
+                block_index,
+                blocks.block_locs.len()
+            ))
+        })?;
+        // The block may not have a worker assigned yet (resize pre-allocates
+        // the layout but does not assign). Assign it so we can write directly.
+        let located = if located.locs.is_empty() {
+            let assigned = self
+                .fs
+                .fs_client()
+                .assign_worker_by_id(&target_path, blocks.status.id, located.block.clone())
+                .await?;
+            assigned
+        } else {
+            located.clone()
+        };
+        let worker = located.locs.first().ok_or_else(|| {
+            FsError::common(format!(
+                "segment task {} block {} has no assigned worker",
+                self.task.info.task_id, block_index
+            ))
+        })?;
+
         // Open source and seek to the segment start.
         let mut reader = self.open_unified(&source_path).await?;
         reader.seek(plan.offset).await?;
 
-        // Open the target for positional write: existing segments created the
-        // file; create it on the first (offset 0) segment. Concurrent creates
-        // race, so a FileExists on create is treated as already-open.
-        let mut writer = match self.open_or_create_target(&target_path).await {
-            Ok(w) => w,
-            Err(err) => {
-                return err_box!(
-                    "segment task {} file {}: {}",
-                    self.task.info.task_id,
-                    self.task.info.target_path,
-                    err
-                );
-            }
-        };
-        writer.seek(plan.offset).await?;
+        // Write this segment's bytes directly to its block via
+        // BlockWriterRemote (bypasses FsWriter, whose complete/flush validates
+        // the whole file - impossible for a partial segment write).
+        let mut writer = BlockWriterRemote::new(
+            self.fs.fs_context().as_ref(),
+            located.block.clone(),
+            worker.clone(),
+            0,
+            block_size,
+        )
+        .await?;
 
         // Copy exactly `length` bytes.
         let mut remaining = plan.length;
@@ -609,7 +645,7 @@ impl LoadTaskRunner {
         while remaining > 0 {
             if self.task.is_cancel() {
                 info!("segment transfer task canceled: {}", self.log_context());
-                let _ = writer.complete().await;
+                let _ = writer.cancel().await;
                 return self.finish_canceled().await;
             }
             let want = remaining.min(Self::READ_CHUNK_BYTES) as usize;
@@ -618,7 +654,7 @@ impl LoadTaskRunner {
                 break;
             }
             let chunk_len = chunk.len() as i64;
-            writer.async_write(chunk).await?;
+            writer.write(chunk).await?;
             remaining -= chunk_len;
             written += chunk_len;
             if LocalTime::mills() % 10_000 < 100 {
@@ -626,13 +662,14 @@ impl LoadTaskRunner {
             }
         }
         if remaining != 0 {
-            let _ = writer.complete().await;
+            let _ = writer.cancel().await;
             return err_box!(
                 "segment task {} short read: {} bytes missing",
                 self.task.info.task_id,
                 remaining
             );
         }
+        writer.flush().await?;
         writer.complete().await?;
         reader.complete().await?;
 
@@ -658,12 +695,15 @@ impl LoadTaskRunner {
     }
 
     /// Open an existing CV/UFS target for positional write, or create it on
-    /// the first segment (offset 0). Concurrency-safe: create races resolve
-    /// as FileExists -> reopen existing.
-    async fn open_or_create_target(&self, target_path: &Path) -> FsResult<UnifiedWriter> {
+    /// Ensure the segment target exists with the full block layout: the
+    /// first segment creates and pre-allocates the whole file (resize), so
+    /// every concurrent segment finds each block's layout (and its assigned
+    /// worker) via get_block_locations. Concurrent creates race; a
+    /// FileAlreadyExists on create means another segment already created it.
+    async fn ensure_segment_target(&self, target_path: &Path, total_len: i64) -> FsResult<()> {
         if target_path.is_cv() {
             match self.fs.open_existing_for_write(target_path).await {
-                Ok(writer) => Ok(UnifiedWriter::Cv(writer)),
+                Ok(_writer) => Ok(()),
                 Err(FsError::FileNotFound(_)) => {
                     let opts = CreateFileOptsBuilder::new()
                         .create_parent(true)
@@ -674,11 +714,15 @@ impl LoadTaskRunner {
                         .ttl_action(self.task.info.job.ttl_action)
                         .build();
                     match self.fs.create_with_opts(target_path, opts, false).await {
-                        Ok(writer) => Ok(UnifiedWriter::Cv(writer)),
+                        Ok(mut writer) => {
+                            if total_len > 0 {
+                                writer.resize(FileAllocOpts::with_truncate(total_len)).await?;
+                            }
+                            writer.flush().await?;
+                            Ok(())
+                        }
                         // Concurrent create race: another segment created it.
-                        Err(FsError::FileAlreadyExists(_)) => Ok(UnifiedWriter::Cv(
-                            self.fs.open_existing_for_write(target_path).await?,
-                        )),
+                        Err(FsError::FileAlreadyExists(_)) => Ok(()),
                         Err(err) => Err(err),
                     }
                 }
@@ -686,7 +730,7 @@ impl LoadTaskRunner {
             }
         } else {
             // Non-CV target (unusual for segment tasks, but keep parity).
-            self.create_unified(target_path).await
+            self.create_unified(target_path).await.map(|_| ())
         }
     }
 

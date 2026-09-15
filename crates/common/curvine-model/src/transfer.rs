@@ -311,6 +311,9 @@ pub struct SegmentPlan {
     pub offset: i64,
     /// Bytes in this segment (<= one CV block).
     pub length: i64,
+    /// Total file length; the first segment pre-allocates the whole target
+    /// (resize) so concurrent segments find every block's layout ready.
+    pub total_len: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

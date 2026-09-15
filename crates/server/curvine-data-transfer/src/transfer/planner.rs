@@ -297,9 +297,17 @@ impl TransferPlanner {
             }
         }
         for (offset, length) in segment_offsets(status.len) {
-            let plan = SegmentPlan { offset, length };
-            let segment_json = serde_json::to_string(&plan)
-                .map_err(|_| FsError::common("Unable to serialize segment plan"))?;
+            let plan = SegmentPlan {
+                offset,
+                length,
+                total_len: status.len,
+            };
+            // Wrap so the runner can distinguish a segment task from a batch
+            // manifest or a CV block plan: {"segment": {offset, length}}.
+            let segment_json = serde_json::to_string(&serde_json::json!({
+                "segment": plan
+            }))
+            .map_err(|_| FsError::common("Unable to serialize segment plan"))?;
             let task_id = format!("{}_task_{}", job.job_id, tasks.len());
             tasks.push(TransferTaskRecord {
                 job_id: job.job_id.clone(),
