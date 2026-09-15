@@ -3,6 +3,7 @@ use clap::Subcommand;
 use curvine_core_error::CommonResult;
 use curvine_fs_api::{CurvineURI, FileSystem, Reader};
 use curvine_unified_fs::UnifiedFileSystem;
+use std::io::Write;
 
 #[derive(Subcommand, Debug)]
 pub enum CatCommand {
@@ -46,8 +47,17 @@ impl CatCommand {
                                         return Err(e.into());
                                     }
 
-                                    // Convert bytes to string and print
-                                    print!("{}", String::from_utf8_lossy(buf_slice));
+                                    // Write raw bytes; the data is binary and
+                                    // must not go through UTF-8 lossy string
+                                    // conversion (it corrupts content and
+                                    // inflates size via U+FFFD replacements).
+                                    let stdout = std::io::stdout();
+                                    let mut handle = stdout.lock();
+                                    if let Err(e) = handle.write_all(buf_slice) {
+                                        eprintln!("Error writing to stdout: {}", e);
+                                        return Err(e.into());
+                                    }
+                                    let _ = handle.flush();
 
                                     bytes_read += to_read as i64;
                                 }
