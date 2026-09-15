@@ -66,7 +66,7 @@ fn running_store_for<S: TransferStore>(store: Arc<S>) -> (Arc<S>, TransferJobRec
         .create_or_get_by_request_id_checked(job.clone())
         .unwrap();
     let lease = store
-        .acquire_runnable_transfer("owner", 60_000, 1, 2)
+        .acquire_runnable_transfer("owner", 60_000, 1, 2, false)
         .unwrap()
         .unwrap();
     let task = |task_id: &str| TransferTaskRecord {
