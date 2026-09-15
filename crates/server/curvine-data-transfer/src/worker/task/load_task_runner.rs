@@ -24,7 +24,7 @@ use curvine_job_client::JobMasterClient;
 use curvine_model::transfer_failure_message;
 use curvine_model::{
     BatchManifest, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileStatus, JobTaskProgress,
-    JobTaskState, SetAttrOptsBuilder, TRANSFER_TEMP_PATH_MARKER,
+    JobTaskState, SegmentPlan, SetAttrOptsBuilder, TRANSFER_TEMP_PATH_MARKER,
 };
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::runtime::{JoinHandle, RpcRuntime};
@@ -224,6 +224,18 @@ impl LoadTaskRunner {
             .starts_with("{\"batch\"")
         {
             return self.run_batch().await;
+        }
+
+        // Single-file segment task (design §14): copy one byte range of one
+        // file, written at an explicit target offset (one CV block).
+        if self
+            .task
+            .info
+            .source_read_plan_json
+            .trim_start()
+            .starts_with("{\"segment\"")
+        {
+            return self.run_segment().await;
         }
 
         let source_path = Path::from_str(&self.task.info.source_path)?;
@@ -551,6 +563,131 @@ impl LoadTaskRunner {
             self.task.info.task_id,
             report.attempt_id
         ))?)
+    }
+
+    /// Execute a single-file segment task (design §14): copy the byte range
+    /// [offset, offset+length) of the source to the same byte range of the
+    /// target. The source is read via a seeked range read; the target is
+    /// opened for positional write (created on first segment) and seeked to
+    /// the segment offset. No temp+rename commit here - segments write
+    /// directly to the shared target file and the job's convergence protocol
+    /// completes it once all segments are done (design §14, T4).
+    async fn run_segment(&self) -> FsResult<bool> {
+        let plan: SegmentPlan = serde_json::from_str(&self.task.info.source_read_plan_json)
+            .map_err(|err| {
+                FsError::common(format!(
+                    "Invalid segment plan for task {}: {}",
+                    self.task.info.task_id, err
+                ))
+            })?;
+        let source_path = Path::from_str(&self.task.info.source_path)?;
+        let target_path = Path::from_str(&self.task.info.target_path)?;
+
+        // Open source and seek to the segment start.
+        let mut reader = self.open_unified(&source_path).await?;
+        reader.seek(plan.offset).await?;
+
+        // Open the target for positional write: existing segments created the
+        // file; create it on the first (offset 0) segment. Concurrent creates
+        // race, so a FileExists on create is treated as already-open.
+        let mut writer = match self.open_or_create_target(&target_path).await {
+            Ok(w) => w,
+            Err(err) => {
+                return err_box!(
+                    "segment task {} file {}: {}",
+                    self.task.info.task_id,
+                    self.task.info.target_path,
+                    err
+                );
+            }
+        };
+        writer.seek(plan.offset).await?;
+
+        // Copy exactly `length` bytes.
+        let mut remaining = plan.length;
+        let mut written: i64 = 0;
+        while remaining > 0 {
+            if self.task.is_cancel() {
+                info!("segment transfer task canceled: {}", self.log_context());
+                let _ = writer.complete().await;
+                return self.finish_canceled().await;
+            }
+            let want = remaining.min(Self::READ_CHUNK_BYTES) as usize;
+            let chunk = reader.async_read(Some(want)).await?;
+            if chunk.is_empty() {
+                break;
+            }
+            let chunk_len = chunk.len() as i64;
+            writer.async_write(chunk).await?;
+            remaining -= chunk_len;
+            written += chunk_len;
+            if LocalTime::mills() % 10_000 < 100 {
+                self.update_progress(written, plan.length, false).await;
+            }
+        }
+        if remaining != 0 {
+            let _ = writer.complete().await;
+            return err_box!(
+                "segment task {} short read: {} bytes missing",
+                self.task.info.task_id,
+                remaining
+            );
+        }
+        writer.complete().await?;
+        reader.complete().await?;
+
+        let progress = self.task.update_progress(written, plan.length, true);
+        if let Err(err) = self.report_progress(progress).await {
+            if self.task.info.transfer_report.is_some() {
+                warn!(
+                    "final segment transfer task report failed, keep task for scheduler probe: {} err={}",
+                    self.log_context(),
+                    err
+                );
+                return Ok(false);
+            }
+            return Err(err);
+        }
+        info!(
+            "segment transfer task completed: {} offset={} length={}",
+            self.log_context(),
+            plan.offset,
+            plan.length
+        );
+        Ok(true)
+    }
+
+    /// Open an existing CV/UFS target for positional write, or create it on
+    /// the first segment (offset 0). Concurrency-safe: create races resolve
+    /// as FileExists -> reopen existing.
+    async fn open_or_create_target(&self, target_path: &Path) -> FsResult<UnifiedWriter> {
+        if target_path.is_cv() {
+            match self.fs.open_existing_for_write(target_path).await {
+                Ok(writer) => Ok(UnifiedWriter::Cv(writer)),
+                Err(FsError::FileNotFound(_)) => {
+                    let opts = CreateFileOptsBuilder::new()
+                        .create_parent(true)
+                        .replicas(self.task.info.job.replicas)
+                        .block_size(self.task.info.job.block_size)
+                        .storage_type(self.task.info.job.storage_type)
+                        .ttl_ms(self.task.info.job.ttl_ms)
+                        .ttl_action(self.task.info.job.ttl_action)
+                        .build();
+                    match self.fs.create_with_opts(target_path, opts, false).await {
+                        Ok(writer) => Ok(UnifiedWriter::Cv(writer)),
+                        // Concurrent create race: another segment created it.
+                        Err(FsError::FileAlreadyExists(_)) => Ok(UnifiedWriter::Cv(
+                            self.fs.open_existing_for_write(target_path).await?,
+                        )),
+                        Err(err) => Err(err),
+                    }
+                }
+                Err(err) => Err(err),
+            }
+        } else {
+            // Non-CV target (unusual for segment tasks, but keep parity).
+            self.create_unified(target_path).await
+        }
     }
 
     /// Stamp commit markers on the committed target (idempotent retry relies
