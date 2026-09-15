@@ -268,4 +268,35 @@ pub struct TransferTaskStateUpdate {
     pub state: TransferTaskState,
     pub message: String,
     pub now_ms: i64,
+    /// When true, the store bumps retry_count on this transition so the
+    /// task_max_retries ceiling actually bounds repeated stale/reject retry
+    /// storms (previously retry_count never incremented and stale tasks
+    /// redelivered forever, starving newer Pending jobs).
+    pub bump_retry: bool,
+}
+
+impl TransferTaskStateUpdate {
+    pub fn new(
+        job_id: String,
+        run_id: u64,
+        owner: String,
+        lease_epoch: u64,
+        task_id: String,
+        state: TransferTaskState,
+        message: String,
+        now_ms: i64,
+    ) -> Self {
+        Self {
+            job_id,
+            run_id,
+            owner,
+            lease_epoch,
+            task_id,
+            from_states: Vec::new(),
+            state,
+            message,
+            now_ms,
+            bump_retry: false,
+        }
+    }
 }

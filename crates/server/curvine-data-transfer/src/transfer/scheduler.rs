@@ -906,12 +906,25 @@ where
                     state: TransferTaskState::Failed,
                     message: stale_retry_exhausted_message(&task),
                     now_ms: now,
+                    bump_retry: false,
                 })? {
                     return Ok(());
                 }
                 self.finish_failed_transfer(&job, &lease).await?;
                 record_metric(|metrics| metrics.inc_stale_retry("exhausted"));
                 return Ok(());
+            }
+            // Backoff: do not redeliver a stale task immediately. The task was
+            // stale because its worker did not report in time; hammering it
+            // every scheduler tick (200ms) turns one bad worker into a
+            // redispatch storm that starves other jobs (observed: 121
+            // redispatch cycles in 35min blocked a new Pending job for 34min).
+            // Delay grows exponentially with retry_count, capped.
+            let backoff_ms = stale_retry_backoff_ms(task.retry_count);
+            let last_attempt_ms = task.progress.update_time.max(task.updated_at);
+            if now.saturating_sub(last_attempt_ms) < backoff_ms {
+                record_metric(|metrics| metrics.inc_stale_retry("backoff"));
+                continue;
             }
             if !self.store.update_task_state(TransferTaskStateUpdate {
                 job_id: task.job_id.clone(),
@@ -923,6 +936,7 @@ where
                 state: TransferTaskState::Pending,
                 message: format!("retrying after stale attempt: {}", task.progress.message),
                 now_ms: now,
+                bump_retry: true,
             })? {
                 return Ok(());
             }
@@ -1357,6 +1371,7 @@ where
                     state: TransferTaskState::Canceled,
                     message: message.to_string(),
                     now_ms: now,
+                    bump_retry: false,
                 })?;
             } else if task.worker_id != 0 {
                 workers.insert((task.worker_id, task.worker_session_id));
@@ -1605,6 +1620,7 @@ where
                 state: TransferTaskState::Pending,
                 message: format!("worker rejected task before accept: {}", reason),
                 now_ms: now_ms(),
+                bump_retry: true,
             })? {
                 return Ok(false);
             }
@@ -1714,10 +1730,20 @@ fn transfer_task_state(state: i32) -> TransferTaskState {
     }
 }
 
+/// Exponential backoff (ms) before redelivering a stale task, based on its
+/// retry count. Base 10s, doubling per retry, capped at 120s. This converts a
+/// per-tick redispatch storm into a bounded retry cadence.
+pub(super) fn stale_retry_backoff_ms(retry_count: u32) -> i64 {
+    const BASE_MS: i64 = 10_000;
+    const CAP_MS: i64 = 120_000;
+    let shift = retry_count.min(4) as u32; // 2^4 = 16x -> 160s, capped to 120s
+    let backoff = BASE_MS.saturating_mul(1i64 << shift);
+    backoff.min(CAP_MS)
+}
+
 pub(super) fn stale_retry_exhausted_message(task: &TransferTaskRecord) -> String {
     let reason = match task.progress.message.as_str() {
-        "" | "task stale timeout" | "retry stale task attempt" => {
-            "no worker diagnosis was recorded for this stale attempt; inspect the assigned Worker logs"
+        "" | "task stale timeout" | "retry stale task attempt" => {            "no worker diagnosis was recorded for this stale attempt; inspect the assigned Worker logs"
         }
         message => message,
     };

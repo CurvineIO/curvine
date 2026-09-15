@@ -851,6 +851,9 @@ impl TransferStore for SqliteTransferStore {
         }
 
         task.state = update.state;
+        if update.bump_retry {
+            task.retry_count = task.retry_count.saturating_add(1);
+        }
         task.progress.message = update.message;
         task.progress.update_time = update.now_ms;
         task.updated_at = update.now_ms;
