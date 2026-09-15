@@ -532,6 +532,7 @@ where
                         &[TransferState::Planning],
                         transfer_failure_message(
                             job.kind,
+                            "mount snapshot",
                             &job.source_path,
                             &job.target_path,
                             &err,
@@ -556,6 +557,7 @@ where
                         &[TransferState::Planning],
                         transfer_failure_message(
                             job.kind,
+                            "mount snapshot",
                             &job.source_path,
                             &job.target_path,
                             &err,
@@ -627,7 +629,13 @@ where
                     &job,
                     &lease,
                     &[TransferState::Planning],
-                    transfer_failure_message(job.kind, &job.source_path, &job.target_path, &err),
+                    transfer_failure_message(
+                        job.kind,
+                        "planning",
+                        &job.source_path,
+                        &job.target_path,
+                        &err,
+                    ),
                 )?;
                 return Err(err);
             }
@@ -759,6 +767,7 @@ where
                         &[TransferState::Dispatching],
                         transfer_failure_message(
                             job.kind,
+                            "dispatch",
                             &job.source_path,
                             &job.target_path,
                             &err,

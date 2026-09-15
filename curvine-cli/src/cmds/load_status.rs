@@ -288,8 +288,8 @@ pub(crate) fn print_task_table(tasks: &[LoadTaskStatus], failed_only: bool) {
             task.task_id,
             format!("{:?}", task.state),
             truncate(&task.worker, 24),
-            truncate(&task.source_path, 36),
-            truncate(&task.target_path, 36),
+            task.source_path,
+            task.target_path,
             task.progress.message
         );
     }

@@ -505,7 +505,7 @@ fn postgres_store_marks_only_probed_missing_attempts() {
             .unwrap()
             .progress
             .message,
-        "2 transfer task(s) failed: first failure"
+        "2 transfer task(s) failed; first failure: first failure"
     );
 }
 

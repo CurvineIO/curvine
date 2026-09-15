@@ -470,7 +470,7 @@ fn assert_failure_summary_uses_stable_task_order<S: TransferStore>(
             .unwrap()
             .progress
             .message,
-        "2 transfer task(s) failed: first failure"
+        "2 transfer task(s) failed; first failure: first failure"
     );
 }
 

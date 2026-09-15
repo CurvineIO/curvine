@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_error::{ErrorKind, FsError, FsResult};
+use curvine_error::{FsError, FsResult};
 use curvine_runtime::common::Utils;
 use num_enum::{FromPrimitive, IntoPrimitive};
 use serde::{Deserialize, Serialize};
@@ -504,7 +504,7 @@ pub fn summarize_transfer_tasks<'a>(
             .map(|(_, _, message)| message)
             .unwrap_or_else(|| "transfer task failed".to_string());
         summary.progress.message = format!(
-            "{} transfer task(s) failed: {}",
+            "{} transfer task(s) failed; first failure: {}",
             failed_count,
             normalize_summary_message(&first_error)
         );
@@ -539,7 +539,7 @@ pub fn transfer_task_summary_from_aggregate(
             .filter(|message| !message.is_empty())
             .unwrap_or("transfer task failed");
         format!(
-            "{} transfer task(s) failed: {}",
+            "{} transfer task(s) failed; first failure: {}",
             counts.failed,
             normalize_summary_message(first_error)
         )
@@ -694,39 +694,23 @@ pub struct StaleTaskAttempt {
     pub task: TransferTaskRecord,
 }
 
+/// Formats a terminal transfer failure without guessing whether the underlying
+/// error belongs to the source or target. `FsError` carries the concrete path;
+/// preserving it avoids misreporting a missing target as a missing source.
 pub fn transfer_failure_message(
     kind: TransferKind,
+    phase: &str,
     source_path: &str,
     target_path: &str,
     err: &FsError,
 ) -> String {
-    let source_label = match kind {
-        TransferKind::Load => "source object",
-        TransferKind::Export => "source file",
+    let direction = match kind {
+        TransferKind::Load => "Load (UFS -> Curvine)",
+        TransferKind::Export => "Export (Curvine -> UFS)",
     };
-    match err.kind() {
-        ErrorKind::FileNotFound | ErrorKind::Expired => {
-            format!("{source_label} not found: {source_path}")
-        }
-        ErrorKind::FileAlreadyExists => format!("target already exists: {target_path}"),
-        ErrorKind::ParentNotDir | ErrorKind::NotADirectory => {
-            format!("target parent is not a directory: {target_path}")
-        }
-        ErrorKind::IsADirectory => format!("target is a directory: {target_path}"),
-        ErrorKind::ReadOnly => format!("target is read-only: {target_path}"),
-        ErrorKind::DiskOutOfSpace => {
-            format!("Not enough Curvine worker disk space to transfer {source_path}; free space and retry")
-        }
-        ErrorKind::Timeout => format!(
-            "Timed out while accessing {source_path}; verify storage connectivity and retry"
-        ),
-        ErrorKind::IO | ErrorKind::Ufs | ErrorKind::Pipeline => format!(
-            "Cannot access transfer storage for {source_path}; verify the mount, credentials, and network connectivity"
-        ),
-        ErrorKind::TransferStoreUnavailable => {
-            "Transfer metadata store is unavailable; retry after it recovers".to_string()
-        }
-        ErrorKind::TransferOverloaded => "Transfer service is busy; retry later".to_string(),
-        _ => format!("Transfer from {source_path} to {target_path} failed: {err}"),
-    }
+    let cause = err.to_string();
+    let cause = cause.strip_suffix(": ").unwrap_or(&cause);
+    format!(
+        "{direction} failed during {phase}: source={source_path}; target={target_path}; cause={cause}"
+    )
 }

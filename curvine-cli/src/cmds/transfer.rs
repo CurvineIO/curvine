@@ -558,17 +558,19 @@ fn print_jobs_table(jobs: &[TransferJobStatusProto], full_id: bool, verbose: boo
                     .unwrap_or_else(|| "-".to_string()),
             );
         }
-        row.push(truncate_middle(
-            &job.source_path,
-            if verbose { 36 } else { 28 },
-        ));
-        row.push(truncate_middle(
-            &job.target_path,
-            if verbose { 36 } else { 28 },
-        ));
+        row.push(if verbose {
+            job.source_path.clone()
+        } else {
+            truncate_middle(&job.source_path, 28)
+        });
+        row.push(if verbose {
+            job.target_path.clone()
+        } else {
+            truncate_middle(&job.target_path, 28)
+        });
         row.push(format_timestamp(job.updated_at));
         if verbose {
-            row.push(truncate_middle(&job.progress.message, 32));
+            row.push(job.progress.message.clone());
         }
         table.add_row(row);
     }
@@ -654,16 +656,18 @@ fn print_tasks_table(tasks: &[TransferTaskStatusProto], full_id: bool, verbose: 
         if verbose {
             row.insert(1, task.attempt_id.to_string());
             row.insert(5, display_id(&task.worker_session_id, full_id));
-            row.push(truncate_middle(&task.progress.message, 28));
+            row.push(task.progress.message.clone());
         }
-        row.push(truncate_middle(
-            &task.source_path,
-            if verbose { 36 } else { 28 },
-        ));
-        row.push(truncate_middle(
-            &task.target_path,
-            if verbose { 36 } else { 28 },
-        ));
+        row.push(if verbose {
+            task.source_path.clone()
+        } else {
+            truncate_middle(&task.source_path, 28)
+        });
+        row.push(if verbose {
+            task.target_path.clone()
+        } else {
+            truncate_middle(&task.target_path, 28)
+        });
         table.add_row(row);
     }
     println!("{table}");

@@ -75,6 +75,16 @@ fn join_path(dir: &Path, name: &str) -> FsResult<Path> {
     Path::from_str(&joined).map_err(|err| FsError::common(format!("invalid joined path: {}", err)))
 }
 
+/// A missing target is normal for a first batch attempt; only an existing
+/// target can carry the idempotency marker checked by `run_batch`.
+fn optional_batch_target_status(status: FsResult<FileStatus>) -> FsResult<Option<FileStatus>> {
+    match status {
+        Ok(status) => Ok(Some(status)),
+        Err(FsError::FileNotFound(_)) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 impl LoadTaskRunner {
     pub fn new(
         task: Arc<TaskContext>,
@@ -154,6 +164,7 @@ impl LoadTaskRunner {
                         Ok(source) if source.is_cv() => curvine_model::TransferKind::Export,
                         _ => curvine_model::TransferKind::Load,
                     },
+                    "execution",
                     &self.task.info.source_path,
                     &self.task.info.target_path,
                     &e,
@@ -469,12 +480,15 @@ impl LoadTaskRunner {
             // of this batch must not be copied again (review Required).
             // Commit markers live on CV targets only; UFS targets always copy.
             if target.is_cv() {
-                let source_status = self.open_unified(&source).await?.status().clone();
-                let target_status = self.fs.get_status(&target).await?;
-                if self.is_committed_transfer_output(&target_status, &source_status) {
-                    committed += entry.size;
-                    copied_count += 1;
-                    continue;
+                if let Some(target_status) =
+                    optional_batch_target_status(self.fs.get_status(&target).await)?
+                {
+                    let source_status = self.open_unified(&source).await?.status().clone();
+                    if self.is_committed_transfer_output(&target_status, &source_status) {
+                        committed += entry.size;
+                        copied_count += 1;
+                        continue;
+                    }
                 }
             }
             let mut stream = match self.create_stream_for(&source, &target).await {
@@ -1637,25 +1651,5 @@ mod tests {
 }
 
 #[cfg(test)]
-mod batch_tests {
-    use super::join_path;
-    use curvine_fs_api::Path;
-
-    #[test]
-    fn join_path_handles_trailing_separator_and_scheme_prefix() {
-        let dir = Path::from_str("file:///data/source/").unwrap();
-        let joined = join_path(&dir, "part-0001.parquet").unwrap();
-        assert_eq!(joined.full_path(), "file:///data/source/part-0001.parquet");
-
-        let dir = Path::from_str("file:///data/source").unwrap();
-        let joined = join_path(&dir, "a.bin").unwrap();
-        assert_eq!(joined.full_path(), "file:///data/source/a.bin");
-    }
-
-    #[test]
-    fn join_path_preserves_nested_relative_name() {
-        let dir = Path::from_str("hdfs://ns/data").unwrap();
-        let joined = join_path(&dir, "sub/part-0").unwrap();
-        assert_eq!(joined.full_path(), "hdfs://ns/data/sub/part-0");
-    }
-}
+#[path = "tests/load_task_runner_test.rs"]
+mod load_task_runner_test;

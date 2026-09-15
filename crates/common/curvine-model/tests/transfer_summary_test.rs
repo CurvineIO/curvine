@@ -1,5 +1,7 @@
+use curvine_error::FsError;
 use curvine_model::{
-    summarize_transfer_tasks, TransferProgress, TransferTaskRecord, TransferTaskState,
+    summarize_transfer_tasks, transfer_failure_message, TransferKind, TransferProgress,
+    TransferTaskRecord, TransferTaskState,
 };
 
 fn task(
@@ -40,11 +42,27 @@ fn task_summary_uses_timestamp_and_task_id_not_input_order_for_messages() {
     let summary = summarize_transfer_tasks([&newer, &older], 30);
     assert_eq!(
         summary.progress.message,
-        "2 transfer task(s) failed: older failure"
+        "2 transfer task(s) failed; first failure: older failure"
     );
 
     let same_time_later = task("task-2", TransferTaskState::Running, 40, "later message");
     let same_time_first = task("task-1", TransferTaskState::Running, 40, "first message");
     let summary = summarize_transfer_tasks([&same_time_later, &same_time_first], 50);
     assert_eq!(summary.progress.message, "later message");
+}
+
+#[test]
+fn transfer_failure_preserves_the_concrete_error_path() {
+    let message = transfer_failure_message(
+        TransferKind::Load,
+        "execution",
+        "oss://bucket/source-dir",
+        "/curvine/target-dir",
+        &FsError::file_not_found("/curvine/target-dir/file.lance"),
+    );
+
+    assert_eq!(
+        message,
+        "Load (UFS -> Curvine) failed during execution: source=oss://bucket/source-dir; target=/curvine/target-dir; cause=File /curvine/target-dir/file.lance not found"
+    );
 }
