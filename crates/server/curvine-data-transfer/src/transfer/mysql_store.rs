@@ -406,6 +406,7 @@ impl TransferStore for MysqlTransferStore {
         lease_ms: i64,
         now_ms: i64,
         max_executing_transfers: u64,
+        prefer_pending: bool,
     ) -> FsResult<Option<TransferLease>> {
         let mut conn = self.conn()?;
         let running_check_interval_ms =
@@ -426,8 +427,8 @@ impl TransferStore for MysqlTransferStore {
         )
         .map_err(mysql_err)?
         .ok_or_else(|| FsError::common("Missing mysql transfer schema version"))?;
-        let mut job: Option<(String, u64, u64, i32)> = tx
-            .exec_first(
+        let mut job: Option<(String, u64, u64, i32)> = if !prefer_pending {
+            tx.exec_first(
                 "select job_id, run_id, lease_epoch, state
                  from transfer_jobs as job
                  where job.owner = :owner and job.lease_expire_at > :now_ms
@@ -467,7 +468,10 @@ impl TransferStore for MysqlTransferStore {
                     "running_renew_lease_before_ms" => running_renew_lease_before_ms,
                 },
             )
-            .map_err(mysql_err)?;
+            .map_err(mysql_err)?
+        } else {
+            None
+        };
         if job.is_none() {
             job = tx
                 .exec_first(

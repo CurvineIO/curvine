@@ -184,6 +184,9 @@ const TRANSFER_TASK_COUNTS_INTERVAL_MS: u64 = 60_000;
 const SCHEDULER_ACTIVE_INTERVAL: Duration = Duration::from_millis(200);
 const SCHEDULER_IDLE_INTERVAL: Duration = Duration::from_secs(1);
 const SCHEDULER_MIN_IDLE_INTERVAL: Duration = Duration::from_millis(1);
+/// Every N scheduler ticks, prefer acquiring a new Pending job over
+/// continuing to service already-held jobs (anti-starvation fairness).
+const ACQUIRE_PENDING_EVERY_N_TICKS: u64 = 4;
 
 pub struct TransferScheduler<S> {
     store: Arc<S>,
@@ -198,6 +201,7 @@ pub struct TransferScheduler<S> {
     report_endpoints: Vec<String>,
     conf: TransferConf,
     worker_cursor: Arc<AtomicUsize>,
+    acquire_tick: Arc<AtomicU64>,
     last_cleanup_ms: Arc<AtomicU64>,
     last_metrics_ms: Arc<AtomicU64>,
     last_task_counts_ms: Arc<AtomicU64>,
@@ -216,6 +220,7 @@ impl<S> Clone for TransferScheduler<S> {
             report_endpoints: self.report_endpoints.clone(),
             conf: self.conf.clone(),
             worker_cursor: self.worker_cursor.clone(),
+            acquire_tick: self.acquire_tick.clone(),
             last_cleanup_ms: self.last_cleanup_ms.clone(),
             last_metrics_ms: self.last_metrics_ms.clone(),
             last_task_counts_ms: self.last_task_counts_ms.clone(),
@@ -251,6 +256,7 @@ where
             report_endpoints,
             conf,
             worker_cursor: Arc::new(AtomicUsize::new(0)),
+            acquire_tick: Arc::new(AtomicU64::new(0)),
             last_cleanup_ms: Arc::new(AtomicU64::new(0)),
             last_metrics_ms: Arc::new(AtomicU64::new(0)),
             last_task_counts_ms: Arc::new(AtomicU64::new(0)),
@@ -283,11 +289,19 @@ where
         let now_ms = now_ms();
         self.cleanup_terminal_transfers(now_ms)?;
         self.record_job_counts_if_due(now_ms)?;
+        // Fairness: every N ticks, prefer acquiring a brand-new Pending job
+        // over continuing to service this scheduler's already-held jobs.
+        // Without this, a scheduler holding many long-running jobs services
+        // them forever and a new Pending job starves (observed: a Pending job
+        // waited 34 minutes while 19 existing jobs were dispatched).
+        let tick = self.acquire_tick.fetch_add(1, Ordering::Relaxed);
+        let prefer_pending = tick % ACQUIRE_PENDING_EVERY_N_TICKS == 0;
         let Some(lease) = self.store.acquire_runnable_transfer(
             &self.owner,
             duration_ms(self.conf.lease_timeout),
             now_ms,
             self.conf.max_executing_transfers(),
+            prefer_pending,
         )?
         else {
             record_metric(|metrics| metrics.inc_acquire("empty"));
@@ -1620,7 +1634,11 @@ where
                 state: TransferTaskState::Pending,
                 message: format!("worker rejected task before accept: {}", reason),
                 now_ms: now_ms(),
-                bump_retry: true,
+                // Capacity rejections (worker busy, temporary) must not count
+                // against the retry ceiling: the worker is healthy and will
+                // accept the task once load drops. Only session/capability
+                // rejections indicate a real problem worth bounding.
+                bump_retry: is_session_rejection(&reason),
             })? {
                 return Ok(false);
             }

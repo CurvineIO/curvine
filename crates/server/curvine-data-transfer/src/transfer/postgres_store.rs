@@ -1377,11 +1377,16 @@ impl TransferStore for PostgresTransferStore {
         lease_ms: i64,
         now_ms: i64,
         max_executing_transfers: u64,
+        prefer_pending: bool,
     ) -> FsResult<Option<TransferLease>> {
         let max_executing_transfers = db_u64(max_executing_transfers)?;
         self.transaction(|tx| {
             lock_submission_gate(tx)?;
-            let mut candidate = select_runnable_owned(tx, owner, now_ms, lease_ms)?;
+            let mut candidate = if !prefer_pending {
+                select_runnable_owned(tx, owner, now_ms, lease_ms)?
+            } else {
+                None
+            };
             if candidate.is_none() {
                 candidate = select_expired_runnable(tx, now_ms)?;
             }

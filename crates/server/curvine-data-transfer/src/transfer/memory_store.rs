@@ -326,6 +326,7 @@ impl TransferStore for MemoryTransferStore {
         lease_ms: i64,
         now_ms: i64,
         max_executing_transfers: u64,
+        prefer_pending: bool,
     ) -> FsResult<Option<TransferLease>> {
         let mut inner = self.inner.lock();
         let running_check_interval_ms =

@@ -116,6 +116,7 @@ pub trait TransferStore: Send + Sync + 'static {
         lease_ms: i64,
         now_ms: i64,
         max_executing_transfers: u64,
+        prefer_pending: bool,
     ) -> FsResult<Option<TransferLease>>;
 
     fn renew_lease(

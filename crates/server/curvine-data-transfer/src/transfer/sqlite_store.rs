@@ -388,6 +388,7 @@ impl TransferStore for SqliteTransferStore {
         lease_ms: i64,
         now_ms: i64,
         max_executing_transfers: u64,
+        prefer_pending: bool,
     ) -> FsResult<Option<TransferLease>> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(sqlite_err)?;
@@ -396,8 +397,8 @@ impl TransferStore for SqliteTransferStore {
         let running_event_lease_before_ms =
             now_ms.saturating_add(lease_ms.saturating_sub(running_check_interval_ms));
         let running_renew_lease_before_ms = now_ms.saturating_add(lease_ms / 2);
-        let mut candidate: Option<(String, i64, i64, i64)> = tx
-            .query_row(
+        let mut candidate: Option<(String, i64, i64, i64)> = if !prefer_pending {
+            tx.query_row(
                 "select job_id, run_id, lease_epoch, state
                  from transfer_jobs as job
                  where job.owner = ?1 and job.lease_expire_at > ?2
@@ -439,7 +440,10 @@ impl TransferStore for SqliteTransferStore {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
-            .map_err(sqlite_err)?;
+            .map_err(sqlite_err)?
+        } else {
+            None
+        };
         if candidate.is_none() {
             candidate = tx
                 .query_row(
