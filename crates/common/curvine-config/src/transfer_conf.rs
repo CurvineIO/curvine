@@ -69,6 +69,8 @@ pub struct TransferConf {
     #[serde(skip, default = "TransferConf::default_task_max_retries")]
     pub task_max_retries: usize,
 
+    #[serde(default = "TransferConf::default_worker_max_inflight_tasks")]
+    pub worker_max_inflight_tasks: usize,
     #[serde(skip)]
     pub task_report_interval: Duration,
     #[serde(skip, default = "TransferConf::default_task_report_interval_str")]
@@ -111,6 +113,16 @@ impl TransferConf {
     pub const DEFAULT_TASK_PROBE_CONCURRENCY: usize = 64;
     pub const DEFAULT_CLIENT_PENDING_QUEUE_SIZE: usize = 1024;
     pub const DEFAULT_CLIENT_SUBMIT_CONCURRENCY: usize = 64;
+    /// Default per-worker in-flight byte budget (10 GiB): scheduler-side and
+    /// worker-side byte gates are on by default; large enough for a few
+    /// 2 GiB-class tasks per worker while capping overshoot.
+    pub const DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES: i64 = 10 * 1024 * 1024 * 1024;
+    /// Estimated size for tasks whose size is unknown (legacy rows / plans).
+    pub const DEFAULT_TASK_ESTIMATED_BYTES: i64 = 256 * 1024 * 1024;
+    /// Scheduler in-flight ledger cache refresh interval.
+    pub const DEFAULT_SCHEDULER_INFLIGHT_CACHE_TTL_MS: u64 = 15_000;
+    /// Per-worker in-flight task count gate (matches worker semaphore default).
+    pub const DEFAULT_WORKER_MAX_INFLIGHT_TASKS: usize = 100;
     pub const DEFAULT_CLEANUP_BATCH_SIZE: usize = 1000;
     pub const DEFAULT_RPC_PORT: u16 = 9010;
     pub const DEFAULT_WEB_PORT: u16 = 9011;
@@ -365,6 +377,10 @@ impl TransferConf {
         Self::DEFAULT_TASK_MAX_RETRIES
     }
 
+    fn default_worker_max_inflight_tasks() -> usize {
+        Self::DEFAULT_WORKER_MAX_INFLIGHT_TASKS
+    }
+
     fn default_task_report_interval_str() -> String {
         Self::DEFAULT_TASK_REPORT_INTERVAL.to_string()
     }
@@ -458,6 +474,7 @@ impl Default for TransferConf {
             max_tasks_per_transfer: Self::DEFAULT_MAX_TASKS_PER_TRANSFER,
             ufs_max_concurrency_per_endpoint: Self::DEFAULT_UFS_MAX_CONCURRENCY_PER_ENDPOINT,
             task_max_retries: Self::DEFAULT_TASK_MAX_RETRIES,
+            worker_max_inflight_tasks: Self::DEFAULT_WORKER_MAX_INFLIGHT_TASKS,
             task_report_interval: Duration::default(),
             task_report_interval_str: Self::DEFAULT_TASK_REPORT_INTERVAL.to_string(),
             task_stale_timeout: Duration::default(),

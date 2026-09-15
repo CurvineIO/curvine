@@ -26,6 +26,8 @@ static TRANSFER_METRICS: OnceCell<TransferMetrics> = OnceCell::new();
 pub struct TransferMetrics {
     submit_total: CounterVec,
     report_total: CounterVec,
+    report_rpc_total: CounterVec,
+    report_batch_tasks_total: Counter,
     report_queue_len: Gauge,
     report_queue_len_by_lane: GaugeVec,
     job_summary_dirty_len: Gauge,
@@ -41,6 +43,10 @@ pub struct TransferMetrics {
     lease_renew_total: CounterVec,
     stale_retry_total: CounterVec,
     terminal_total: CounterVec,
+    worker_inflight_count: GaugeVec,
+    worker_inflight_bytes: GaugeVec,
+    reject_total: CounterVec,
+    requeue_total: CounterVec,
     completed_bytes_total: CounterVec,
     store_operation_duration_us: HistogramVec,
     store_operation_total: CounterVec,
@@ -75,6 +81,17 @@ impl TransferMetrics {
                 "transfer_task_report_total",
                 "Transfer task report requests by result",
                 &["result"],
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            report_rpc_total: m::new_counter_vec(
+                "transfer_task_report_rpc_total",
+                "Transfer task report RPCs by envelope type",
+                &["type"],
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            report_batch_tasks_total: m::new_counter(
+                "transfer_task_report_batch_tasks_total",
+                "Total task progress reports received in batch RPC envelopes",
             )
             .map_err(|err| FsError::common(err.to_string()))?,
             report_queue_len: m::new_gauge(
@@ -170,6 +187,30 @@ impl TransferMetrics {
                 "transfer_terminal_total",
                 "Transfer terminal state transitions by state and reason",
                 &["state", "reason"],
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            worker_inflight_count: m::new_gauge_vec(
+                "transfer_worker_inflight_count",
+                "Per-worker in-flight task count (state=2, scheduler ledger)",
+                &["worker_id"],
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            worker_inflight_bytes: m::new_gauge_vec(
+                "transfer_worker_inflight_bytes",
+                "Per-worker in-flight estimated bytes (state=2, scheduler ledger)",
+                &["worker_id"],
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            reject_total: m::new_counter_vec(
+                "transfer_worker_reject_total",
+                "Worker submit rejections by class (capacity/session)",
+                &["class"],
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            requeue_total: m::new_counter_vec(
+                "transfer_requeue_total",
+                "Transfer task requeues by reason (reject/stale)",
+                &["reason"],
             )
             .map_err(|err| FsError::common(err.to_string()))?,
             completed_bytes_total: m::new_counter_vec(
@@ -310,6 +351,18 @@ impl TransferMetrics {
         self.report_total.with_label_values(&[result]).inc();
     }
 
+    pub fn inc_report_rpc(&self, report_type: &str) {
+        self.report_rpc_total
+            .with_label_values(&[report_type])
+            .inc();
+    }
+
+    pub fn inc_report_batch_tasks(&self, count: usize) {
+        if count > 0 {
+            self.report_batch_tasks_total.inc_by(count as i64);
+        }
+    }
+
     pub fn set_report_queue_len(&self, value: usize) {
         self.report_queue_len.set(value as i64);
     }
@@ -377,6 +430,27 @@ impl TransferMetrics {
         self.terminal_total
             .with_label_values(&[state, reason])
             .inc();
+    }
+
+    /// Per-worker in-flight ledger snapshot (design §10 invariant 8).
+    pub fn set_worker_inflight(&self, worker_id: u32, count: u64, bytes: i64) {
+        let label = worker_id.to_string();
+        self.worker_inflight_count
+            .with_label_values(&[&label])
+            .set(i64::try_from(count).unwrap_or(i64::MAX));
+        self.worker_inflight_bytes
+            .with_label_values(&[&label])
+            .set(bytes);
+    }
+
+    /// Worker submit rejections by class (capacity / session / unknown).
+    pub fn inc_reject(&self, class: &str) {
+        self.reject_total.with_label_values(&[class]).inc();
+    }
+
+    /// Task requeues to Pending by reason (capacity / stale / other).
+    pub fn inc_requeue(&self, reason: &str) {
+        self.requeue_total.with_label_values(&[reason]).inc();
     }
 
     pub fn inc_completed_bytes(&self, state: &str, bytes: i64) {

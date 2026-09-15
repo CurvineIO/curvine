@@ -23,18 +23,103 @@ use curvine_config::TransferConf;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
-    summarize_transfer_tasks, LoadJobInfo, LoadTaskInfo, TaskAttemptStart, TransferJobRecord,
-    TransferLease, TransferProgress, TransferState, TransferStateUpdate, TransferTaskRecord,
-    TransferTaskReport, TransferTaskReportInfo, TransferTaskState, WorkerInfo,
+    LoadJobInfo, LoadTaskInfo, TaskAttemptStart, TransferJobRecord, TransferLease,
+    TransferProgress, TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport,
+    TransferTaskReportInfo, TransferTaskState, WorkerInflight, WorkerInfo,
 };
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::RpcRuntime;
+use dashmap::DashMap;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use log::{debug, error, info, warn};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Scheduler-side per-worker in-flight ledger (design doc §4.1).
+///
+/// Lazy TTL refresh: consumed only by dispatch decisions, so the store
+/// aggregation runs when the TTL expires, not on a timer. Within one refresh
+/// window the ledger only grows (dispatch-time atomic increments) — overcount
+/// means under-dispatch, which is the conservative direction. Correction
+/// happens wholesale on the next refresh; no report-path bookkeeping.
+/// Estimated in-flight bytes for a worker aggregation: unknown-size rows
+/// (count minus non-zero rows) count at the configured default estimate so
+/// they cannot bypass the byte budget (design §3.1 invariant 3).
+fn inflight_bytes_with_default(estimated_bytes: i64, unknown_count: u64, default_est: i64) -> i64 {
+    estimated_bytes.saturating_add(
+        i64::try_from(unknown_count)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(default_est),
+    )
+}
+
+struct InflightLedger {
+    ttl_ms: u64,
+    refreshed_at_ms: AtomicU64,
+    entries: DashMap<u32, (u64, i64)>, // worker_id -> (task_count, estimated_bytes)
+}
+
+impl InflightLedger {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl_ms: ttl.as_millis() as u64,
+            refreshed_at_ms: AtomicU64::new(0),
+            entries: DashMap::new(),
+        }
+    }
+
+    /// Returns true when the cached snapshot is usable for decisions.
+    fn ensure_fresh(
+        &self,
+        store: &dyn TransferStore,
+        now_ms: u64,
+        default_est: i64,
+    ) -> FsResult<()> {
+        let refreshed_at = self.refreshed_at_ms.load(Ordering::Relaxed);
+        if refreshed_at != 0 && now_ms.saturating_sub(refreshed_at) < self.ttl_ms {
+            return Ok(());
+        }
+        let inflight = store.select_inflight_by_worker()?;
+        self.entries.clear();
+        for WorkerInflight {
+            worker_id,
+            task_count,
+            estimated_bytes,
+            unknown_bytes_count,
+        } in inflight
+        {
+            // Unknown-size rows count at the configured default so they cannot
+            // bypass the byte budget (design §3.1 invariant 3).
+            self.entries.insert(
+                worker_id,
+                (
+                    task_count,
+                    inflight_bytes_with_default(estimated_bytes, unknown_bytes_count, default_est),
+                ),
+            );
+            record_metric(|metrics| {
+                metrics.set_worker_inflight(worker_id, task_count, estimated_bytes)
+            });
+        }
+        self.refreshed_at_ms.store(now_ms, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn account(&self, worker_id: u32, count: u64, bytes: i64) {
+        let mut entry = self.entries.entry(worker_id).or_insert((0u64, 0i64));
+        entry.0 += count;
+        entry.1 += bytes;
+    }
+
+    fn get(&self, worker_id: u32) -> (u64, i64) {
+        self.entries
+            .get(&worker_id)
+            .map(|entry| *entry)
+            .unwrap_or((0, 0))
+    }
+}
 
 const PLANNING_REQUEUE_DELAY_MS: i64 = 1_000;
 const MOUNT_SNAPSHOT_MAX_RETRIES: u32 = 3;
@@ -43,6 +128,40 @@ const MOUNT_SNAPSHOT_MAX_RETRIES: u32 = 3;
 enum MountSnapshotFailureAction {
     Requeue { retry_count: u32, delay_ms: i64 },
     Fail,
+}
+
+enum StaleTaskProbeOutcome {
+    Found(TransferTaskReport),
+    Retry {
+        task: TransferTaskRecord,
+        reason: &'static str,
+        error: String,
+    },
+    Missing {
+        task: TransferTaskRecord,
+        reason: StaleTaskMissingReason,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum StaleTaskMissingReason {
+    WorkerSessionGone,
+    TaskAttemptMissing,
+}
+
+impl StaleTaskMissingReason {
+    fn message(self) -> &'static str {
+        match self {
+            Self::WorkerSessionGone => "assigned Worker session is no longer live",
+            Self::TaskAttemptMissing => "assigned Worker does not have this task attempt",
+        }
+    }
+}
+
+#[derive(Default)]
+struct StaleTaskMissingCandidates {
+    worker_session_gone: Vec<TransferTaskRecord>,
+    task_attempt_missing: Vec<TransferTaskRecord>,
 }
 
 fn mount_snapshot_failure_action(attempts: u32) -> MountSnapshotFailureAction {
@@ -74,6 +193,7 @@ pub struct TransferScheduler<S> {
     worker_cursor: Arc<AtomicUsize>,
     last_cleanup_ms: Arc<AtomicU64>,
     last_metrics_ms: Arc<AtomicU64>,
+    inflight: Arc<InflightLedger>,
 }
 
 impl<S> Clone for TransferScheduler<S> {
@@ -89,6 +209,7 @@ impl<S> Clone for TransferScheduler<S> {
             worker_cursor: self.worker_cursor.clone(),
             last_cleanup_ms: self.last_cleanup_ms.clone(),
             last_metrics_ms: self.last_metrics_ms.clone(),
+            inflight: self.inflight.clone(),
         }
     }
 }
@@ -106,6 +227,8 @@ where
         report_endpoints: Vec<String>,
         conf: TransferConf,
     ) -> Self {
+        let inflight_ttl =
+            Duration::from_millis(TransferConf::DEFAULT_SCHEDULER_INFLIGHT_CACHE_TTL_MS);
         Self {
             store,
             planner,
@@ -117,6 +240,7 @@ where
             worker_cursor: Arc::new(AtomicUsize::new(0)),
             last_cleanup_ms: Arc::new(AtomicU64::new(0)),
             last_metrics_ms: Arc::new(AtomicU64::new(0)),
+            inflight: Arc::new(InflightLedger::new(inflight_ttl)),
         }
     }
 
@@ -516,6 +640,20 @@ where
         lease: TransferLease,
     ) -> FsResult<()> {
         let mut dispatched = 0usize;
+        // Lazy ledger refresh (design §4.1): only on dispatch; a failed
+        // aggregation skips dispatch this tick (fail-safe, no blind dispatch).
+        if let Err(err) = self.inflight.ensure_fresh(
+            self.store.as_ref(),
+            now_ms() as u64,
+            TransferConf::DEFAULT_TASK_ESTIMATED_BYTES,
+        ) {
+            record_metric(|metrics| metrics.inc_dispatch("failure", 1));
+            warn!(
+                "skip dispatching transfer {} because inflight aggregation failed: {}",
+                job.job_id, err
+            );
+            return Ok(());
+        }
         loop {
             if self.cancel_requested(&job, &lease).await? {
                 return Ok(());
@@ -628,8 +766,15 @@ where
         let job_info = self.planner_job_info(job, &mount)?;
         let limit = self.conf.worker_dispatch_concurrency();
 
-        let started = stream::iter(tasks.into_iter().map(|task| {
-            let worker = self.choose_worker(&workers);
+        let started = stream::iter(tasks.into_iter().filter_map(|task| {
+            let estimated_bytes = self.task_estimated_bytes(&task);
+            // Batch-manifest tasks only dispatch to workers that advertised the
+            // capability (design §7.4); choose_worker enforces it per worker.
+            // Without a capable worker the task stays Pending and is retried on
+            // a later tick once capable workers appear.
+            // No worker has room (design §4.2): drop the task from this batch
+            // (stays Pending in store) so remaining tasks still get placed.
+            let worker = self.choose_worker(&workers, estimated_bytes)?;
             let store = self.store.clone();
             let factory = self.factory.clone();
             let cache = self.cache.clone();
@@ -638,7 +783,7 @@ where
             let lease_epoch = lease.lease_epoch;
             let report_endpoints = self.report_endpoints.clone();
             let task_stale_timeout_ms = duration_ms(self.conf.task_stale_timeout);
-            async move {
+            Some(async move {
                 dispatch_one(DispatchTaskRequest {
                     store,
                     factory,
@@ -652,7 +797,7 @@ where
                     task_stale_timeout_ms,
                 })
                 .await
-            }
+            })
         }))
         .buffer_unordered(limit)
         .try_collect::<Vec<_>>()
@@ -674,15 +819,29 @@ where
         lease: TransferLease,
     ) -> FsResult<()> {
         let now = now_ms();
-        self.probe_stale_running_tasks(&job, now).await?;
-        let _ = self.store.mark_stale_attempts(
-            &job.job_id,
-            job.run_id,
-            &lease.owner,
-            lease.lease_epoch,
-            now,
-            self.conf.task_probe_concurrency(),
-        )?;
+        let missing_tasks = self.probe_stale_running_tasks(&job, now).await?;
+        for (mut candidates, message) in [
+            (
+                missing_tasks.worker_session_gone,
+                StaleTaskMissingReason::WorkerSessionGone.message(),
+            ),
+            (
+                missing_tasks.task_attempt_missing,
+                StaleTaskMissingReason::TaskAttemptMissing.message(),
+            ),
+        ] {
+            for candidate in &mut candidates {
+                candidate.progress.message = message.to_string();
+            }
+            let _ = self.store.mark_stale_attempts(
+                &job.job_id,
+                job.run_id,
+                &lease.owner,
+                lease.lease_epoch,
+                now,
+                candidates,
+            )?;
+        }
         // Recover all Stale tasks (newly marked + orphan leftovers from CAS races).
         let stale_tasks = self.store.list_tasks_by_state(
             &job.job_id,
@@ -700,7 +859,7 @@ where
                     task_id: task.task_id.clone(),
                     from_states: vec![TransferTaskState::Stale],
                     state: TransferTaskState::Failed,
-                    message: "transfer task did not report progress before the retry limit was reached; check Transfer worker health".to_string(),
+                    message: stale_retry_exhausted_message(&task),
                     now_ms: now,
                 })? {
                     return Ok(());
@@ -717,12 +876,15 @@ where
                 task_id: task.task_id.clone(),
                 from_states: vec![TransferTaskState::Stale],
                 state: TransferTaskState::Pending,
-                message: "retry stale task attempt".to_string(),
+                message: format!("retrying after stale attempt: {}", task.progress.message),
                 now_ms: now,
             })? {
                 return Ok(());
             }
-            record_metric(|metrics| metrics.inc_stale_retry("scheduled"));
+            record_metric(|metrics| {
+                metrics.inc_stale_retry("scheduled");
+                metrics.inc_requeue("stale");
+            });
         }
 
         if self.store.has_failed_tasks(&job.job_id, job.run_id)? {
@@ -760,102 +922,162 @@ where
         record_metric(|metrics| metrics.inc_terminal("completed", "all_tasks_completed"));
         let completed_size = self
             .store
-            .list_transfer_tasks(&job.job_id, job.run_id)
-            .map(|tasks| {
-                summarize_transfer_tasks(&tasks, now_ms())
-                    .counts
-                    .completed_size
-            })
+            .get_transfer_task_summary(&job.job_id, job.run_id, now_ms())
+            .map(|summary| summary.counts.completed_size)
             .unwrap_or(0);
         record_metric(|metrics| metrics.inc_completed_bytes("completed", completed_size));
         Ok(())
     }
 
-    async fn probe_stale_running_tasks(&self, job: &TransferJobRecord, now: i64) -> FsResult<()> {
+    async fn probe_stale_running_tasks(
+        &self,
+        job: &TransferJobRecord,
+        now: i64,
+    ) -> FsResult<StaleTaskMissingCandidates> {
         let tasks = self.store.list_stale_running_tasks(
             &job.job_id,
             job.run_id,
             now,
             self.conf.task_probe_concurrency(),
         )?;
-        let workers = self.cache.live_workers();
-        for task in tasks {
-            let worker = match &workers {
-                Ok(workers) => workers
-                    .iter()
-                    .find(|worker| {
-                        worker.worker_id() == task.worker_id
-                            && worker.worker_session_id == task.worker_session_id
-                    })
-                    .cloned(),
-                Err(err) => {
-                    self.defer_stale_task_retry(
+        if tasks.is_empty() {
+            return Ok(StaleTaskMissingCandidates::default());
+        }
+        let workers = match self.cache.live_workers() {
+            Ok(workers) => Arc::new(workers),
+            Err(err) => {
+                let mut summary_dirty = false;
+                for task in tasks {
+                    summary_dirty |= self.defer_stale_task_retry(
                         &task,
                         now,
                         "cluster worker snapshot unavailable",
-                        err,
-                    )?;
-                    continue;
-                }
-            };
-            let Some(worker) = worker else {
-                continue;
-            };
-            let client = match self.factory.get_worker_client(&worker.address).await {
-                Ok(client) => client,
-                Err(err) => {
-                    self.defer_stale_task_retry(&task, now, "cannot connect to worker", &err)?;
-                    continue;
-                }
-            };
-            let response = match client
-                .query_transfer_task(
-                    &task.job_id,
-                    task.run_id,
-                    &task.task_id,
-                    task.attempt_id,
-                    &task.worker_session_id,
-                )
-                .await
-            {
-                Ok(response) => response,
-                Err(err) => {
-                    self.defer_stale_task_retry(
-                        &task,
-                        now,
-                        "worker did not answer task probe",
                         &err,
                     )?;
+                }
+                if summary_dirty {
+                    self.flush_job_summary_best_effort(&job.job_id, job.run_id);
+                }
+                return Ok(StaleTaskMissingCandidates::default());
+            }
+        };
+        let outcomes = stream::iter(tasks.into_iter().map(|task| {
+            let scheduler = self.clone();
+            let workers = workers.clone();
+            async move { scheduler.probe_stale_task(task, workers, now).await }
+        }))
+        .buffer_unordered(self.conf.task_probe_concurrency())
+        .collect::<Vec<_>>()
+        .await;
+        let mut summary_dirty = false;
+        let mut missing_tasks = StaleTaskMissingCandidates::default();
+        for outcome in outcomes {
+            let updated = match outcome {
+                StaleTaskProbeOutcome::Found(report) => self.store.update_task_report(report),
+                StaleTaskProbeOutcome::Retry {
+                    task,
+                    reason,
+                    error,
+                } => self.defer_stale_task_retry(&task, now, reason, &error),
+                StaleTaskProbeOutcome::Missing { task, reason } => {
+                    match reason {
+                        StaleTaskMissingReason::WorkerSessionGone => {
+                            missing_tasks.worker_session_gone.push(task)
+                        }
+                        StaleTaskMissingReason::TaskAttemptMissing => {
+                            missing_tasks.task_attempt_missing.push(task)
+                        }
+                    }
                     continue;
                 }
             };
-            if !response.found {
-                continue;
-            }
-            let report = TransferTaskReport {
-                job_id: task.job_id,
-                run_id: task.run_id,
-                task_id: task.task_id,
-                attempt_id: task.attempt_id,
-                worker_id: task.worker_id,
-                worker_session_id: task.worker_session_id,
-                state: transfer_task_state(response.state),
-                progress: TransferProgress {
-                    loaded_size: response.progress.loaded_size,
-                    total_size: response.progress.total_size,
-                    update_time: response.progress.update_time,
-                    message: response.progress.message,
-                },
-                now_ms: now,
-                stale_deadline_at: now.saturating_add(duration_ms(self.conf.task_stale_timeout)),
-            };
-            let job_id = report.job_id.clone();
-            let run_id = report.run_id;
-            if self.store.update_task_report(report)? {
-                self.flush_job_summary_best_effort(&job_id, run_id);
+            match updated {
+                Ok(updated) => summary_dirty |= updated,
+                Err(err) => {
+                    if summary_dirty {
+                        self.flush_job_summary_best_effort(&job.job_id, job.run_id);
+                    }
+                    return Err(err);
+                }
             }
         }
-        Ok(())
+        if summary_dirty {
+            self.flush_job_summary_best_effort(&job.job_id, job.run_id);
+        }
+        Ok(missing_tasks)
+    }
+
+    async fn probe_stale_task(
+        &self,
+        task: TransferTaskRecord,
+        workers: Arc<Vec<WorkerInfo>>,
+        now: i64,
+    ) -> StaleTaskProbeOutcome {
+        let Some(worker) = workers
+            .iter()
+            .find(|worker| {
+                worker.worker_id() == task.worker_id
+                    && worker.worker_session_id == task.worker_session_id
+            })
+            .cloned()
+        else {
+            return StaleTaskProbeOutcome::Missing {
+                task,
+                reason: StaleTaskMissingReason::WorkerSessionGone,
+            };
+        };
+        let client = match self.factory.get_worker_client(&worker.address).await {
+            Ok(client) => client,
+            Err(err) => {
+                return StaleTaskProbeOutcome::Retry {
+                    task,
+                    reason: "cannot connect to worker",
+                    error: err.to_string(),
+                };
+            }
+        };
+        let response = match client
+            .query_transfer_task(
+                &task.job_id,
+                task.run_id,
+                &task.task_id,
+                task.attempt_id,
+                &task.worker_session_id,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                return StaleTaskProbeOutcome::Retry {
+                    task,
+                    reason: "worker did not answer task probe",
+                    error: err.to_string(),
+                };
+            }
+        };
+        if !response.found {
+            return StaleTaskProbeOutcome::Missing {
+                task,
+                reason: StaleTaskMissingReason::TaskAttemptMissing,
+            };
+        }
+        StaleTaskProbeOutcome::Found(TransferTaskReport {
+            job_id: task.job_id,
+            run_id: task.run_id,
+            task_id: task.task_id,
+            attempt_id: task.attempt_id,
+            worker_id: task.worker_id,
+            worker_session_id: task.worker_session_id,
+            state: transfer_task_state(response.state),
+            progress: TransferProgress {
+                loaded_size: response.progress.loaded_size,
+                total_size: response.progress.total_size,
+                update_time: response.progress.update_time,
+                message: response.progress.message,
+            },
+            now_ms: now,
+            stale_deadline_at: now.saturating_add(duration_ms(self.conf.task_stale_timeout)),
+        })
     }
 
     fn defer_stale_task_retry(
@@ -864,14 +1086,12 @@ where
         now: i64,
         reason: &str,
         err: &impl std::fmt::Display,
-    ) -> FsResult<()> {
+    ) -> FsResult<bool> {
         let mut progress = task.progress.clone();
         progress.message =
             "worker status is temporarily unavailable; preserving the current attempt before retry"
                 .to_string();
         progress.update_time = now;
-        let job_id = task.job_id.clone();
-        let run_id = task.run_id;
         let deferred = self.store.update_task_report(TransferTaskReport {
             job_id: task.job_id.clone(),
             run_id: task.run_id,
@@ -885,7 +1105,6 @@ where
             stale_deadline_at: now.saturating_add(duration_ms(self.conf.task_stale_timeout)),
         })?;
         if deferred {
-            self.flush_job_summary_best_effort(&job_id, run_id);
             debug!(
                 "defer stale transfer task retry because {}: job={} run={} task={} attempt={} worker_id={} worker_session={} err={}",
                 reason,
@@ -898,7 +1117,7 @@ where
                 err,
             );
         }
-        Ok(())
+        Ok(deferred)
     }
 
     fn flush_job_summary_best_effort(&self, job_id: &str, run_id: u64) {
@@ -966,8 +1185,9 @@ where
             });
             return Ok(());
         }
-        let tasks = self.store.list_transfer_tasks(&job.job_id, job.run_id)?;
-        let summary = summarize_transfer_tasks(&tasks, now_ms());
+        let summary = self
+            .store
+            .get_transfer_task_summary(&job.job_id, job.run_id, now_ms())?;
         let state = if summary.counts.completed > 0 {
             TransferState::PartialSuccess
         } else {
@@ -1069,9 +1289,54 @@ where
         Ok(())
     }
 
-    fn choose_worker(&self, workers: &[WorkerInfo]) -> WorkerInfo {
-        let index = self.worker_cursor.fetch_add(1, Ordering::Relaxed) % workers.len();
-        workers[index].clone()
+    /// Effective estimated size used by scheduler-side gating. Unknown (0)
+    /// sizes fall back to the configured default so they cannot bypass the
+    /// byte budget (design §3.1).
+    fn task_estimated_bytes(&self, task: &TransferTaskRecord) -> i64 {
+        let size = if task.estimated_size > 0 {
+            task.estimated_size
+        } else {
+            task.progress.total_size
+        };
+        if size > 0 {
+            size
+        } else {
+            TransferConf::DEFAULT_TASK_ESTIMATED_BYTES
+        }
+    }
+
+    /// Least-loaded worker choice under count/byte gates (design §4.2).
+    /// Returns None when no worker has room: callers leave the task Pending.
+    /// The winning worker's ledger is debited synchronously so concurrent
+    /// decisions observe updated accounts instead of stampeding one worker;
+    /// exact ties are broken by the polling cursor.
+    fn choose_worker(&self, workers: &[WorkerInfo], estimated_bytes: i64) -> Option<WorkerInfo> {
+        let admitted = choose_worker_admitted(
+            workers,
+            estimated_bytes,
+            self.conf.worker_max_inflight_tasks,
+            TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES,
+            |worker_id| self.inflight.get(worker_id),
+        );
+        if admitted.is_empty() {
+            return None;
+        }
+        // Tie-break among equally loaded workers via the polling cursor.
+        let min_bytes = admitted.iter().map(|(bytes, _)| *bytes).min().unwrap_or(0);
+        let mut ties: Vec<usize> = admitted
+            .into_iter()
+            .filter(|(bytes, _)| *bytes == min_bytes)
+            .map(|(_, index)| index)
+            .collect();
+        let pick = if ties.len() == 1 {
+            ties.remove(0)
+        } else {
+            ties[self.worker_cursor.fetch_add(1, Ordering::Relaxed) % ties.len()]
+        };
+        let worker = workers[pick].clone();
+        self.inflight
+            .account(worker.worker_id(), 1, estimated_bytes);
+        Some(worker)
     }
 
     fn transition(
@@ -1200,6 +1465,7 @@ where
         target_path: task.target_path.clone(),
         create_time: now,
         source_read_plan_json: task.source_read_plan_json.clone(),
+        estimated_size: task.estimated_size.max(task.progress.total_size),
         transfer_report: Some(TransferTaskReportInfo {
             run_id: task.run_id,
             attempt_id,
@@ -1239,13 +1505,28 @@ where
             })? {
                 return Ok(false);
             }
-            if let Err(err) = cache.refresh().await {
-                warn!(
-                    "refresh cluster metadata after worker rejection failed: {}",
-                    err
-                );
+            // Capacity rejections must NOT remove the worker session: the worker
+            // is healthy and other tasks on it would be misdiagnosed as
+            // WorkerSessionGone by later probes (design §5.2). Only session/
+            // capability-class rejections evict the cached session.
+            let rejection_class = if is_session_rejection(&reason) {
+                "session"
+            } else {
+                "capacity"
+            };
+            record_metric(|metrics| {
+                metrics.inc_reject(rejection_class);
+                metrics.inc_requeue("reject");
+            });
+            if is_session_rejection(&reason) {
+                if let Err(err) = cache.refresh().await {
+                    warn!(
+                        "refresh cluster metadata after worker rejection failed: {}",
+                        err
+                    );
+                }
+                cache.remove_worker_session(worker.worker_id(), &worker.worker_session_id);
             }
-            cache.remove_worker_session(worker.worker_id(), &worker.worker_session_id);
             Ok(false)
         }
         Err(err) => {
@@ -1280,6 +1561,44 @@ fn scheduler_idle_interval(lease_timeout: Duration) -> Duration {
         .max(SCHEDULER_MIN_IDLE_INTERVAL)
 }
 
+/// Candidates for [`TransferScheduler::choose_worker`]: workers that pass the
+/// batch-capability gate, the count gate, and the byte gate (oversize tasks
+/// only on idle workers, design §4.2). Pure - the ledger lookup is injected so
+/// the gating rules can be unit-tested without a full scheduler.
+fn choose_worker_admitted(
+    workers: &[WorkerInfo],
+    estimated_bytes: i64,
+    count_limit: usize,
+    byte_limit: i64,
+    inflight: impl Fn(u32) -> (u64, i64),
+) -> Vec<(i64, usize)> {
+    let oversize = byte_limit > 0 && estimated_bytes > byte_limit;
+    let mut admitted: Vec<(i64, usize)> = Vec::with_capacity(workers.len());
+    for (index, worker) in workers.iter().enumerate() {
+        let (count, bytes) = inflight(worker.worker_id());
+        if count_limit > 0 && count >= count_limit as u64 {
+            continue;
+        }
+        // Oversize tasks only run on an idle worker to avoid starvation.
+        let fits = byte_limit <= 0 || bytes + estimated_bytes <= byte_limit;
+        let take = if oversize { bytes == 0 } else { fits };
+        if take {
+            admitted.push((bytes, index));
+        }
+    }
+    admitted
+}
+
+/// Session/capability-class worker rejections invalidate the cached session;
+/// capacity-class rejections do not (design §5.2/§5.3). Classification is an
+/// explicit prefix match on the worker's reject_reason. Unknown reasons are
+/// treated as session-class (conservative: evict) because the only known
+/// capacity reason is `worker_at_capacity`; future capacity reasons must add
+/// their prefix here.
+fn is_session_rejection(reason: &str) -> bool {
+    !reason.starts_with(crate::worker::task::WORKER_AT_CAPACITY_REJECT_PREFIX)
+}
+
 fn transfer_task_state(state: i32) -> TransferTaskState {
     match state {
         1 => TransferTaskState::Pending,
@@ -1290,6 +1609,19 @@ fn transfer_task_state(state: i32) -> TransferTaskState {
         6 => TransferTaskState::Stale,
         _ => TransferTaskState::Failed,
     }
+}
+
+pub(super) fn stale_retry_exhausted_message(task: &TransferTaskRecord) -> String {
+    let reason = match task.progress.message.as_str() {
+        "" | "task stale timeout" | "retry stale task attempt" => {
+            "no worker diagnosis was recorded for this stale attempt; inspect the assigned Worker logs"
+        }
+        message => message,
+    };
+    format!(
+        "transfer task recovery retries exhausted after {} stale attempt(s): {reason}",
+        task.retry_count
+    )
 }
 
 fn record_metric(f: impl FnOnce(&TransferMetrics)) {
@@ -1307,11 +1639,112 @@ fn transfer_kind_label(kind: curvine_model::TransferKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        mount_snapshot_failure_action, scheduler_idle_interval, MountSnapshotFailureAction,
-        MOUNT_SNAPSHOT_MAX_RETRIES,
-    };
+    use super::mount_snapshot_failure_action;
+    use super::scheduler_idle_interval;
+    use super::InflightLedger;
+    use super::MountSnapshotFailureAction;
+    use super::MOUNT_SNAPSHOT_MAX_RETRIES;
+    use curvine_model::WorkerInfo;
     use std::time::Duration;
+
+    #[test]
+    fn ledger_increment_only_grows_within_ttl_window() {
+        let ledger = InflightLedger::new(Duration::from_secs(15));
+        ledger.account(1, 1, 1024);
+        ledger.account(1, 1, 1024);
+        assert_eq!(ledger.get(1), (2, 2048));
+        assert_eq!(ledger.get(2), (0, 0));
+    }
+
+    #[test]
+    fn choose_worker_enforces_byte_budget_and_oversize_idle_only() {
+        use super::choose_worker_admitted;
+        use curvine_model::WorkerAddress;
+        let w1 = WorkerInfo::new(
+            WorkerAddress {
+                worker_id: 1,
+                ..Default::default()
+            },
+            1,
+        );
+        let w2 = WorkerInfo::new(
+            WorkerAddress {
+                worker_id: 2,
+                ..Default::default()
+            },
+            1,
+        );
+        let workers = [w1, w2];
+        // 100-byte budget, 80 already used on w1: only w2 fits a 30-byte task.
+        let admitted =
+            choose_worker_admitted(
+                &workers,
+                30,
+                0,
+                100,
+                |id| {
+                    if id == 1 {
+                        (1, 80)
+                    } else {
+                        (0, 0)
+                    }
+                },
+            );
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].1, 1); // w2 (index 1) is the only fit
+                                      // Oversize task (150 > 100) only admitted when the worker is idle.
+        let admitted = choose_worker_admitted(&workers, 150, 0, 100, |_| (0, 0));
+        assert_eq!(admitted.len(), 2); // both idle
+        let admitted = choose_worker_admitted(&workers, 150, 0, 100, |_| (0, 5));
+        assert_eq!(admitted.len(), 0); // neither idle
+                                       // Zero byte_limit disables byte gating entirely.
+        let admitted = choose_worker_admitted(&workers, 150, 0, 0, |_| (0, 1000));
+        assert_eq!(admitted.len(), 2);
+    }
+
+    #[test]
+    fn choose_worker_enforces_count_gate() {
+        use super::choose_worker_admitted;
+        let w1 = WorkerInfo::new(Default::default(), 1);
+        // count_limit=2, w1 already at 2: excluded.
+        let admitted = choose_worker_admitted(std::slice::from_ref(&w1), 10, 2, 0, |_| (2, 0));
+        assert!(admitted.is_empty());
+        // count_limit=0 disables the count gate.
+        let admitted = choose_worker_admitted(&[w1], 10, 0, 0, |_| (2, 0));
+        assert_eq!(admitted.len(), 1);
+    }
+
+    #[test]
+    fn unknown_size_rows_count_at_default_estimate() {
+        use super::inflight_bytes_with_default;
+        // 2 unknown rows at 256MiB default each add 512MiB to known bytes.
+        assert_eq!(
+            inflight_bytes_with_default(100, 2, 256 * 1024 * 1024),
+            100 + 2 * 256 * 1024 * 1024
+        );
+        // No unknown rows: no addition.
+        assert_eq!(inflight_bytes_with_default(100, 0, 256 * 1024 * 1024), 100);
+        // Unknown rows with default 0 (disabled batching estimate) add nothing.
+        assert_eq!(inflight_bytes_with_default(100, 2, 0), 100);
+        // Saturation: enormous unknown counts do not overflow.
+        assert_eq!(
+            inflight_bytes_with_default(i64::MAX - 1, 1, 256 * 1024 * 1024),
+            i64::MAX
+        );
+    }
+
+    #[test]
+    fn ledger_refresh_replaces_snapshot_wholesale() {
+        let ledger = InflightLedger::new(Duration::from_secs(15));
+        ledger.account(1, 5, 5000);
+        // Simulate a store snapshot where worker 1 has less in flight.
+        ledger.entries.clear();
+        ledger.entries.insert(1, (1, 1000));
+        ledger
+            .refreshed_at_ms
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(ledger.get(1), (1, 1000));
+    }
 
     #[test]
     fn retryable_mount_snapshot_failures_use_bounded_backoff() {
