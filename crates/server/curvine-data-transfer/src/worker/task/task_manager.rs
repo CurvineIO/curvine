@@ -14,6 +14,7 @@
 
 use crate::common::UfsFactory;
 use crate::worker::task::load_task_runner::LoadTaskRunner;
+use crate::worker::task::task_progress_reporter::{TaskProgressReporter, TransferProgressBatcher};
 use crate::worker::task::{
     record_metric, record_task_outcome, TaskContext, TaskStore, WorkerTransferMetrics,
 };
@@ -25,8 +26,11 @@ use curvine_model::{JobTaskProgress, JobTaskState, LoadTaskInfo, TransferTaskRep
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use dashmap::mapref::entry::Entry;
 use log::{debug, info, warn};
-use std::sync::Arc;
-use std::time::Instant;
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 pub struct TaskManager {
@@ -35,15 +39,42 @@ pub struct TaskManager {
     tasks: TaskStore,
     factory: Arc<UfsFactory>,
     transfer_client: Option<TransferClient>,
+    transfer_reporters: Mutex<HashMap<Vec<String>, Weak<TransferProgressBatcher>>>,
     worker_session_id: String,
     progress_interval_ms: u64,
+    transfer_progress_interval_ms: u64,
     task_timeout_ms: u64,
+    worker_task_concurrency: usize,
     worker_task_semaphore: Arc<Semaphore>,
+    /// In-flight byte budget (design §3): admit rejects tasks that would push
+    /// aggregate estimated bytes over
+    /// `TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES` (10 GiB, on by
+    /// default).
+    inflight_budget_bytes: i64,
+    inflight_bytes: Arc<AtomicI64>,
 }
 
 pub struct TaskSubmitResult {
     pub accepted: bool,
     pub reject_reason: String,
+}
+
+/// Prefix marking a capacity-class rejection (design §5.2): the scheduler must
+/// NOT evict the worker session on these; only session/capability-class
+/// rejections do.
+pub const WORKER_AT_CAPACITY_REJECT_PREFIX: &str = "worker_at_capacity";
+
+/// RAII release of the in-flight byte budget (design §3.2): dropping the guard
+/// releases the admitted bytes exactly once, even when the runner panics.
+struct InflightByteGuard {
+    inflight_bytes: Arc<AtomicI64>,
+    bytes: i64,
+}
+
+impl Drop for InflightByteGuard {
+    fn drop(&mut self) {
+        self.inflight_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
 }
 
 impl TaskSubmitResult {
@@ -113,16 +144,29 @@ impl TaskManager {
             metrics.set_permits_max(conf.job.worker_max_concurrent_tasks);
             metrics.set_permits_available(conf.job.worker_max_concurrent_tasks);
         });
+        let transfer_progress_interval = if conf.transfer.task_report_interval.is_zero() {
+            conf.job.task_report_interval
+        } else {
+            conf.job
+                .task_report_interval
+                .min(conf.transfer.task_report_interval)
+        };
         let mgr = Self {
             rt,
             fs,
             tasks: TaskStore::new(),
             factory,
             transfer_client,
+            transfer_reporters: Mutex::new(HashMap::new()),
             worker_session_id: worker_session_id.into(),
             progress_interval_ms: conf.job.task_report_interval.as_millis() as u64,
+            transfer_progress_interval_ms: transfer_progress_interval.as_millis() as u64,
             task_timeout_ms: conf.job.task_timeout.as_millis() as u64,
+            worker_task_concurrency: conf.job.worker_max_concurrent_tasks,
             worker_task_semaphore,
+            inflight_budget_bytes:
+                curvine_config::TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES,
+            inflight_bytes: Arc::new(AtomicI64::new(0)),
         };
 
         Ok(mgr)
@@ -268,20 +312,54 @@ impl TaskManager {
         // this worker's local concurrency permit.
         context.update_state(JobTaskState::Loading, "task accepted and queued");
 
+        let progress_reporter = self.task_progress_reporter(&context);
+        let progress_interval_ms = if context.info.transfer_report.is_some() {
+            self.transfer_progress_interval_ms
+        } else {
+            self.progress_interval_ms
+        };
         let runner = LoadTaskRunner::new(
             context.clone(),
             self.fs.clone(),
             self.factory.clone(),
-            self.transfer_client.clone(),
-            self.progress_interval_ms,
+            progress_reporter,
+            progress_interval_ms,
             self.task_timeout_ms,
         );
+
+        // Byte-budget admit (design §3.2): reject synchronously before the task
+        // enters the local queue, so a saturated worker never silently queues
+        // (the incident's "queued 112s" failure mode). Unknown sizes count at
+        // zero here; the scheduler-side default estimate already gates them.
+        let estimated_bytes = context.info.estimated_size.max(0);
+        let byte_guard = if self.inflight_budget_bytes > 0 {
+            let current = self.inflight_bytes.load(Ordering::Relaxed);
+            if current + estimated_bytes > self.inflight_budget_bytes {
+                return Ok(TaskSubmitResult::rejected(format!(
+                    "{}: inflight bytes {} + task {} would exceed budget {}",
+                    WORKER_AT_CAPACITY_REJECT_PREFIX,
+                    current,
+                    estimated_bytes,
+                    self.inflight_budget_bytes
+                )));
+            }
+            self.inflight_bytes
+                .fetch_add(estimated_bytes, Ordering::Relaxed);
+            Some(InflightByteGuard {
+                inflight_bytes: self.inflight_bytes.clone(),
+                bytes: estimated_bytes,
+            })
+        } else {
+            None
+        };
 
         let tasks = self.tasks.clone();
         let semaphore = self.worker_task_semaphore.clone();
         let context_this = context.clone();
 
-        // Spawn task with concurrency control
+        // Spawn task with concurrency control. The byte admission is released
+        // together with the semaphore permit when the runner exits (success,
+        // failure, or cancellation) - a RAII-style balance at task end.
         self.rt.spawn(async move {
             let started = Instant::now();
             let mut remove_task = true;
@@ -315,6 +393,9 @@ impl TaskManager {
                     log::error!("task {} failed to acquire permit: {}", task_id, e);
                 }
             }
+            // `byte_guard` drops here (RAII), releasing the admitted bytes even
+            // if `runner.run()` panicked above.
+            drop(byte_guard);
 
             if remove_task
                 && tasks
@@ -369,6 +450,74 @@ impl TaskManager {
         self.fs.fs_context()
     }
 
+    fn task_progress_reporter(&self, task: &TaskContext) -> Option<TaskProgressReporter> {
+        let report_info = task.info.transfer_report.as_ref()?;
+        let report_endpoints = if report_info.report_endpoints.is_empty() {
+            if report_info.report_target.is_empty() {
+                Vec::new()
+            } else {
+                vec![report_info.report_target.clone()]
+            }
+        } else {
+            report_info.report_endpoints.clone()
+        };
+        let mut reporters = self.transfer_reporters.lock();
+        let batcher = if let Some(batcher) =
+            reporters.get(&report_endpoints).and_then(Weak::upgrade)
+        {
+            batcher
+        } else {
+            reporters.retain(|_, batcher| batcher.strong_count() > 0);
+            let transfer_client = if report_endpoints.is_empty() {
+                self.transfer_client.clone()
+            } else {
+                match TransferClient::with_report_endpoints(
+                    &self.fs.fs_context(),
+                    report_endpoints.clone(),
+                ) {
+                    Ok(client) => Some(client),
+                    Err(err) => {
+                        warn!(
+                            "transfer task has invalid report endpoints {:?}: job={} run={} task={} attempt={} source={} target={} err={}",
+                            report_endpoints,
+                            task.info.job.job_id,
+                            report_info.run_id,
+                            task.info.task_id,
+                            report_info.attempt_id,
+                            task.info.source_path,
+                            task.info.target_path,
+                            err,
+                        );
+                        None
+                    }
+                }
+            }?;
+            let batcher = Arc::new(TransferProgressBatcher::new(
+                self.rt.clone(),
+                transfer_client,
+                self.worker_task_concurrency,
+                Duration::from_millis(self.transfer_progress_interval_ms),
+            ));
+            reporters.insert(report_endpoints, Arc::downgrade(&batcher));
+            batcher
+        };
+        Some(TaskProgressReporter::new(
+            batcher,
+            task.info.job.job_id.clone(),
+            task.info.task_id.clone(),
+            report_info.clone(),
+            format!(
+                "job={} run={} task={} attempt={} source={} target={}",
+                task.info.job.job_id,
+                report_info.run_id,
+                task.info.task_id,
+                report_info.attempt_id,
+                task.info.source_path,
+                task.info.target_path,
+            ),
+        ))
+    }
+
     pub fn available_worker_task_permits(&self) -> usize {
         self.worker_task_semaphore.available_permits()
     }
@@ -387,4 +536,62 @@ fn transfer_report_matches(
                 && report.attempt_id == attempt_id
                 && report.worker_session_id == worker_session_id
     )
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::{InflightByteGuard, WORKER_AT_CAPACITY_REJECT_PREFIX};
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn capacity_reject_prefix_is_exact_and_stable() {
+        // The scheduler classifies rejections by this prefix (design §5.2);
+        // the classification test lives here so the contract stays adjacent
+        // to the worker that emits it.
+        let reason = format!(
+            "{}: inflight bytes 100 + task 50 would exceed budget 128",
+            WORKER_AT_CAPACITY_REJECT_PREFIX
+        );
+        assert!(reason.starts_with(WORKER_AT_CAPACITY_REJECT_PREFIX));
+        assert!(!reason.starts_with("worker_session"));
+        // Unrelated session-class rejections must NOT match the prefix.
+        assert!(!"Reject transfer task x for stale worker session y"
+            .starts_with(WORKER_AT_CAPACITY_REJECT_PREFIX));
+    }
+
+    #[test]
+    fn byte_guard_releases_exactly_once_even_across_panic_path() {
+        let bytes = Arc::new(AtomicI64::new(0));
+        bytes.fetch_add(200, Ordering::Relaxed);
+        // Two admissions; the first "runs" normally, the second panics while
+        // holding its guard. Both guards must release exactly once, leaving
+        // the ledger back at zero regardless of the unwind path.
+        {
+            let _guard = InflightByteGuard {
+                inflight_bytes: bytes.clone(),
+                bytes: 100,
+            };
+            assert_eq!(bytes.load(Ordering::Relaxed), 200);
+            let result = std::panic::catch_unwind(|| {
+                let _inner = InflightByteGuard {
+                    inflight_bytes: bytes.clone(),
+                    bytes: 100,
+                };
+                panic!("runner panicked");
+            });
+            assert!(result.is_err());
+        }
+        assert_eq!(bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn byte_guard_releases_zero_bytes_is_a_noop() {
+        let bytes = Arc::new(AtomicI64::new(42));
+        drop(InflightByteGuard {
+            inflight_bytes: bytes.clone(),
+            bytes: 0,
+        });
+        assert_eq!(bytes.load(Ordering::Relaxed), 42);
+    }
 }

@@ -21,11 +21,10 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path, Reader, Writer};
 use curvine_job_client::JobMasterClient;
-use curvine_job_client::TransferClient;
 use curvine_model::transfer_failure_message;
 use curvine_model::{
-    CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileStatus, JobTaskProgress, JobTaskState,
-    SetAttrOptsBuilder, TRANSFER_TEMP_PATH_MARKER,
+    BatchManifest, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileStatus, JobTaskProgress,
+    JobTaskState, SetAttrOptsBuilder, TRANSFER_TEMP_PATH_MARKER,
 };
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::runtime::{JoinHandle, RpcRuntime};
@@ -62,70 +61,29 @@ enum CommitTarget {
     AlreadyCommitted,
 }
 
+/// Join a file name onto a directory URI. The directory may or may not carry
+/// a trailing separator; the scheme prefix (`scheme://`) is preserved.
+fn join_path(dir: &Path, name: &str) -> FsResult<Path> {
+    let full = dir.full_path();
+    let sep = Path::SEPARATOR;
+    let joined = if full.ends_with(sep) {
+        format!("{}{}", full, name)
+    } else {
+        format!("{}{}{}", full, sep, name)
+    };
+    Path::from_str(&joined).map_err(|err| FsError::common(format!("invalid joined path: {}", err)))
+}
+
 impl LoadTaskRunner {
     pub fn new(
         task: Arc<TaskContext>,
         fs: CurvineFileSystem,
         factory: Arc<UfsFactory>,
-        transfer_client: Option<TransferClient>,
+        progress_reporter: Option<TaskProgressReporter>,
         progress_interval_ms: u64,
         task_timeout_ms: u64,
     ) -> Self {
         let master_client = JobMasterClient::new(fs.fs_client());
-        let transfer_client = match task.info.transfer_report.as_ref() {
-            Some(report)
-                if report.report_endpoints.is_empty() && report.report_target.is_empty() =>
-            {
-                transfer_client
-            }
-            Some(report) => {
-                let report_endpoints = if report.report_endpoints.is_empty() {
-                    vec![report.report_target.clone()]
-                } else {
-                    report.report_endpoints.clone()
-                };
-                match TransferClient::with_report_endpoints(
-                    &fs.fs_context(),
-                    report_endpoints.clone(),
-                ) {
-                    Ok(client) => Some(client),
-                    Err(err) => {
-                        warn!(
-                            "transfer task has invalid report endpoints {:?}: job={} run={} task={} attempt={} source={} target={} err={}",
-                            report_endpoints,
-                            task.info.job.job_id,
-                            report.run_id,
-                            task.info.task_id,
-                            report.attempt_id,
-                            task.info.source_path,
-                            task.info.target_path,
-                            err,
-                        );
-                        None
-                    }
-                }
-            }
-            None => transfer_client,
-        };
-        let progress_reporter = match (&transfer_client, task.info.transfer_report.as_ref()) {
-            (Some(client), Some(report_info)) => Some(TaskProgressReporter::new(
-                fs.clone_runtime(),
-                client.clone(),
-                task.info.job.job_id.clone(),
-                task.info.task_id.clone(),
-                report_info.clone(),
-                format!(
-                    "job={} run={} task={} attempt={} source={} target={}",
-                    task.info.job.job_id,
-                    report_info.run_id,
-                    task.info.task_id,
-                    report_info.attempt_id,
-                    task.info.source_path,
-                    task.info.target_path,
-                ),
-            )),
-            _ => None,
-        };
         Self {
             task,
             fs,
@@ -255,6 +213,19 @@ impl LoadTaskRunner {
         self.task
             .update_state(JobTaskState::Loading, "Task started");
 
+        // Batch-manifest task (design §7.2): one task copies many small files.
+        // A batch manifest serializes as {"batch":[...]}; a single-file CV read
+        // plan is a bare array, so the leading object key disambiguates.
+        if self
+            .task
+            .info
+            .source_read_plan_json
+            .trim_start()
+            .starts_with("{\"batch\"")
+        {
+            return self.run_batch().await;
+        }
+
         let source_path = Path::from_str(&self.task.info.source_path)?;
         let target_path = Path::from_str(&self.task.info.target_path)?;
         if self.task.info.transfer_report.is_none()
@@ -287,43 +258,7 @@ impl LoadTaskRunner {
             return Ok(true);
         };
 
-        let (cv_path, ufs_mtime) = if stream.final_path.is_cv() {
-            // ufs -> cv
-            (&stream.final_path, stream.reader.status().mtime)
-        } else {
-            // cv -> ufs
-            let ufs_status = self.get_ufs()?.get_status(&stream.final_path).await?;
-            (stream.reader.path(), ufs_status.mtime)
-        };
-
-        let mut attr_builder = SetAttrOptsBuilder::new().ufs_mtime(ufs_mtime);
-        if stream.final_path.is_cv() {
-            if let Some(report) = &self.task.info.transfer_report {
-                attr_builder = attr_builder
-                    .add_x_attr(
-                        TRANSFER_COMMIT_JOB_ID_XATTR,
-                        self.task.info.job.job_id.as_bytes().to_vec(),
-                    )
-                    .add_x_attr(
-                        TRANSFER_COMMIT_RUN_ID_XATTR,
-                        report.run_id.to_string().into_bytes(),
-                    )
-                    .add_x_attr(
-                        TRANSFER_COMMIT_TASK_ID_XATTR,
-                        self.task.info.task_id.as_bytes().to_vec(),
-                    )
-                    .add_x_attr(
-                        TRANSFER_COMMIT_SOURCE_PATH_XATTR,
-                        self.task.info.source_path.as_bytes().to_vec(),
-                    )
-                    .add_x_attr(
-                        TRANSFER_COMMIT_TARGET_PATH_XATTR,
-                        self.task.info.target_path.as_bytes().to_vec(),
-                    );
-            }
-        }
-        let attr_opts = attr_builder.build();
-        self.fs.set_attr(cv_path, attr_opts).await?;
+        let ufs_mtime = self.mark_committed_output(&stream).await?;
 
         if let Err(err) = self.update_progress0(copied_bytes, reader_len, true).await {
             if self.task.info.transfer_report.is_some() {
@@ -478,13 +413,119 @@ impl LoadTaskRunner {
         }
     }
 
+    /// Execute a multi-file batch task (design §7.2): iterate manifest entries,
+    /// copy each file with the normal single-file path (idempotent commit),
+    /// aggregate progress as loaded/total over the whole batch, and fail the
+    /// task with the offending file named in the error message.
+    async fn run_batch(&self) -> FsResult<bool> {
+        let manifest: BatchManifest = serde_json::from_str(&self.task.info.source_read_plan_json)
+            .map_err(|err| {
+            FsError::common(format!(
+                "Invalid batch manifest for task {}: {}",
+                self.task.info.task_id, err
+            ))
+        })?;
+        let source_dir = Path::from_str(&self.task.info.source_path)?;
+        let target_dir = Path::from_str(&self.task.info.target_path)?;
+        let total: i64 = manifest.batch.iter().map(|entry| entry.size).sum();
+        let mut committed = 0i64;
+        let mut copied_count = 0usize;
+
+        for entry in &manifest.batch {
+            if self.task.is_cancel() {
+                info!("batch transfer task canceled: {}", self.log_context());
+                return self.finish_canceled().await;
+            }
+            let source = join_path(&source_dir, &entry.rel_path)?;
+            let target = join_path(&target_dir, &entry.rel_path)?;
+            let mut stream = match self.create_stream_for(&source, &target).await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    return err_box!(
+                        "batch task {} file {}: {}",
+                        self.task.info.task_id,
+                        entry.rel_path,
+                        err
+                    );
+                }
+            };
+            if self.task.is_cancel() {
+                info!("batch transfer task canceled: {}", self.log_context());
+                return self.cancel_stream(&mut stream).await;
+            }
+            let Some((copied_bytes, reader_len, _, _)) =
+                (match self.copy_and_commit_stream(&mut stream).await {
+                    Ok(result) => result,
+                    Err(err) => {
+                        self.cleanup_failed_stream(&stream).await;
+                        return err_box!(
+                            "batch task {} file {}: {}",
+                            self.task.info.task_id,
+                            entry.rel_path,
+                            err
+                        );
+                    }
+                })
+            else {
+                return Ok(true);
+            };
+            // Commit markers are per-task (idempotent retry of the batch relies
+            // on them, design §7.2). Mark before aggregating progress so a
+            // marker failure fails this batch attempt like a copy failure.
+            if let Err(err) = self.mark_committed_output(&stream).await {
+                self.cleanup_failed_stream(&stream).await;
+                return err_box!(
+                    "batch task {} file {}: {}",
+                    self.task.info.task_id,
+                    entry.rel_path,
+                    err
+                );
+            }
+            committed += copied_bytes.max(reader_len).max(entry.size);
+            copied_count += 1;
+            // Report progress after each file so the batch keeps renewing its
+            // stale deadline even when individual files are slow.
+            self.update_progress(committed, total, false).await;
+        }
+
+        let progress = self.task.update_progress(committed, total, true);
+        if let Err(err) = self.report_progress(progress).await {
+            if self.task.info.transfer_report.is_some() {
+                warn!(
+                    "final batch transfer task report failed, keep task for scheduler probe: {} err={}",
+                    self.log_context(),
+                    err
+                );
+                return Ok(false);
+            }
+            return Err(err);
+        }
+        info!(
+            "batch transfer task completed: {} files={} bytes={}",
+            self.log_context(),
+            copied_count,
+            committed
+        );
+        Ok(true)
+    }
+
     async fn create_stream(&self) -> FsResult<CopyStream> {
         let source_path = Path::from_str(&self.task.info.source_path)?;
         let target_path = Path::from_str(&self.task.info.target_path)?;
-        let write_path = self.transfer_temp_path(&target_path)?;
+        self.create_stream_for(&source_path, &target_path).await
+    }
+
+    /// Open source/target for an explicit pair (single-file task uses task
+    /// fields; batch tasks override per manifest entry).
+    async fn create_stream_for(
+        &self,
+        source_path: &Path,
+        target_path: &Path,
+    ) -> FsResult<CopyStream> {
+        let write_path = self.transfer_temp_path(target_path)?;
 
         // Create reader (automatically selects filesystem based on scheme)
-        let reader = self.open_unified(&source_path).await?;
+        let reader = self.open_unified(source_path).await?;
 
         // Create writer (automatically selects filesystem based on scheme)
         let writer = self.create_unified(&write_path).await?;
@@ -492,7 +533,7 @@ impl LoadTaskRunner {
         Ok(CopyStream {
             reader,
             writer,
-            final_path: target_path,
+            final_path: target_path.clone(),
             temp_path: self.task.info.transfer_report.as_ref().map(|_| write_path),
         })
     }
@@ -510,6 +551,52 @@ impl LoadTaskRunner {
             self.task.info.task_id,
             report.attempt_id
         ))?)
+    }
+
+    /// Stamp commit markers on the committed target (idempotent retry relies
+    /// on these xattrs, design §7.2). Returns the target's UFS mtime. For
+    /// batch tasks the markers are per-task (task_id/source_path are the
+    /// batch-level values), which stays self-consistent across retries of the
+    /// same batch.
+    async fn mark_committed_output(&self, stream: &CopyStream) -> FsResult<i64> {
+        let (cv_path, ufs_mtime) = if stream.final_path.is_cv() {
+            // ufs -> cv
+            (&stream.final_path, stream.reader.status().mtime)
+        } else {
+            // cv -> ufs
+            let ufs_status = self.get_ufs()?.get_status(&stream.final_path).await?;
+            (stream.reader.path(), ufs_status.mtime)
+        };
+
+        let mut attr_builder = SetAttrOptsBuilder::new().ufs_mtime(ufs_mtime);
+        if stream.final_path.is_cv() {
+            if let Some(report) = &self.task.info.transfer_report {
+                attr_builder = attr_builder
+                    .add_x_attr(
+                        TRANSFER_COMMIT_JOB_ID_XATTR,
+                        self.task.info.job.job_id.as_bytes().to_vec(),
+                    )
+                    .add_x_attr(
+                        TRANSFER_COMMIT_RUN_ID_XATTR,
+                        report.run_id.to_string().into_bytes(),
+                    )
+                    .add_x_attr(
+                        TRANSFER_COMMIT_TASK_ID_XATTR,
+                        self.task.info.task_id.as_bytes().to_vec(),
+                    )
+                    .add_x_attr(
+                        TRANSFER_COMMIT_SOURCE_PATH_XATTR,
+                        self.task.info.source_path.as_bytes().to_vec(),
+                    )
+                    .add_x_attr(
+                        TRANSFER_COMMIT_TARGET_PATH_XATTR,
+                        self.task.info.target_path.as_bytes().to_vec(),
+                    );
+            }
+        }
+        let attr_opts = attr_builder.build();
+        self.fs.set_attr(cv_path, attr_opts).await?;
+        Ok(ufs_mtime)
     }
 
     async fn commit_output(&self, stream: &CopyStream) -> FsResult<()> {
@@ -1157,6 +1244,7 @@ mod tests {
             target_path: "/cv/file".to_string(),
             create_time: 0,
             source_read_plan_json: String::new(),
+            estimated_size: 0,
             transfer_report: None,
         })
     }
@@ -1309,5 +1397,29 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(base_dir);
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::join_path;
+    use curvine_fs_api::Path;
+
+    #[test]
+    fn join_path_handles_trailing_separator_and_scheme_prefix() {
+        let dir = Path::from_str("file:///data/source/").unwrap();
+        let joined = join_path(&dir, "part-0001.parquet").unwrap();
+        assert_eq!(joined.full_path(), "file:///data/source/part-0001.parquet");
+
+        let dir = Path::from_str("file:///data/source").unwrap();
+        let joined = join_path(&dir, "a.bin").unwrap();
+        assert_eq!(joined.full_path(), "file:///data/source/a.bin");
+    }
+
+    #[test]
+    fn join_path_preserves_nested_relative_name() {
+        let dir = Path::from_str("hdfs://ns/data").unwrap();
+        let joined = join_path(&dir, "sub/part-0").unwrap();
+        assert_eq!(joined.full_path(), "hdfs://ns/data/sub/part-0");
     }
 }

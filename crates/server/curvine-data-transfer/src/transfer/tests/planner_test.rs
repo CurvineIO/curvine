@@ -79,3 +79,25 @@ fn equal_size_timestamp_mismatch_refreshes_source_status_before_planning() {
         Some(&target)
     ));
 }
+
+#[test]
+fn batch_flush_triggers_on_file_count_threshold() {
+    use super::planner::{batch_should_flush, BATCH_MAX_FILES};
+    // Flush exactly at the file-count boundary, not before.
+    assert!(!batch_should_flush(BATCH_MAX_FILES - 1, 0));
+    assert!(batch_should_flush(BATCH_MAX_FILES, 0));
+}
+
+#[test]
+fn batch_flush_triggers_on_byte_threshold() {
+    use super::planner::{batch_should_flush, BATCH_TARGET_BYTES};
+    assert!(!batch_should_flush(1, BATCH_TARGET_BYTES - 1));
+    assert!(batch_should_flush(1, BATCH_TARGET_BYTES));
+}
+
+#[test]
+fn batch_flush_disabled_for_zero_bytes_with_few_files() {
+    use super::planner::batch_should_flush;
+    assert!(!batch_should_flush(0, 0));
+    assert!(!batch_should_flush(1, 1));
+}

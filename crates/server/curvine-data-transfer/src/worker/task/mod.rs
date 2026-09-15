@@ -20,8 +20,12 @@ pub use self::load_task_runner::LoadTaskRunner;
 
 mod task_progress_reporter;
 
+#[cfg(test)]
+#[path = "tests/task_progress_reporter_test.rs"]
+mod task_progress_reporter_test;
+
 mod task_manager;
-pub use self::task_manager::TaskManager;
+pub use self::task_manager::{TaskManager, WORKER_AT_CAPACITY_REJECT_PREFIX};
 
 mod task_store;
 pub use self::task_store::TaskStore;

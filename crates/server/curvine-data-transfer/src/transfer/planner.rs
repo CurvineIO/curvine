@@ -22,8 +22,8 @@ use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::ListOptions;
 use curvine_model::{
-    FileStatus, LoadJobInfo, MountInfo, TransferCommand, TransferJobRecord, TransferKind,
-    TransferTaskRecord, TransferTaskState,
+    BatchManifest, BatchManifestEntry, FileStatus, LoadJobInfo, MountInfo, TransferCommand,
+    TransferJobRecord, TransferKind, TransferProgress, TransferTaskRecord, TransferTaskState,
 };
 use curvine_runtime::common::LocalTime;
 use parking_lot::Mutex;
@@ -41,6 +41,18 @@ pub struct PlannedTransfer {
     pub skipped_files: usize,
     pub skipped_size: i64,
     pub cv_metadata_epoch: Option<u64>,
+}
+
+/// Small-file batching thresholds (design §7.1): a UFS directory-source task
+/// carries at most this many files or this many bytes before splitting.
+/// Batching is default-on; no configuration toggle (M/W/T ship together).
+pub const BATCH_MAX_FILES: usize = 512;
+pub const BATCH_TARGET_BYTES: i64 = 256 * 1024 * 1024;
+
+/// Pure batch split decision (design §7.1): flush when the file count or
+/// accumulated bytes reach the thresholds.
+pub fn batch_should_flush(file_count: usize, accumulated_bytes: i64) -> bool {
+    file_count >= BATCH_MAX_FILES || accumulated_bytes >= BATCH_TARGET_BYTES
 }
 
 #[derive(Clone)]
@@ -97,6 +109,17 @@ impl TransferPlanner {
             self.validate_directory_target(job, &target, &mount).await?;
         }
 
+        // Small-file batching state (design §7): files accumulate here and are
+        // flushed as one batch task when the byte/file threshold is hit.
+        // CV sources never batch - their per-file block-read plan occupies
+        // `source_read_plan_json` and is the cheaper read path already.
+        // Batching applies to directory sources on the non-CV (UFS) side only:
+        // CV sources keep per-file block-read plans, and single-file transfers
+        // keep their existing shape (design §7.1).
+        let batching = source_status.is_dir && !source.is_cv();
+        let mut batch: Vec<FileStatus> = Vec::new();
+        let mut batch_bytes = 0i64;
+
         let mut tasks = Vec::new();
         let mut total_size = 0;
         let mut skipped_files = 0;
@@ -142,36 +165,37 @@ impl TransferPlanner {
                 skipped_size += status.len;
                 continue;
             }
-            let task_id = format!("{}_task_{}", job.job_id, tasks.len());
-            let source_read_plan_json = self.source_read_plan_json(&path).await?;
             total_size += status.len;
-            tasks.push(TransferTaskRecord {
-                job_id: job.job_id.clone(),
-                run_id: job.run_id,
-                task_id,
-                attempt_id: 0,
-                source_path: path.clone_uri(),
-                target_path: task_target.clone_uri(),
-                worker_id: 0,
-                worker_session_id: String::new(),
-                source_read_plan_json,
-                report_target_json: String::new(),
-                state: TransferTaskState::Pending,
-                progress: Default::default(),
-                retry_count: 0,
-                attempt_started_at: 0,
-                last_report_at: 0,
-                stale_deadline_at: 0,
-                updated_at: LocalTime::mills() as i64,
-            });
 
-            if tasks.len() > self.max_tasks_per_transfer {
-                return err_box!(
-                    "Transfer {} files exceeds {}",
-                    job.job_id,
-                    self.max_tasks_per_transfer
-                );
+            if batching {
+                // Large files (>= batch target) stay a single task: flush the
+                // pending small-file batch first, then push the large file
+                // alone (design §7.1 - large files keep their own task).
+                if status.len >= BATCH_TARGET_BYTES {
+                    if !batch.is_empty() {
+                        let files = std::mem::take(&mut batch);
+                        batch_bytes = 0;
+                        self.push_batch_task(job, &source, &target, files, &mut tasks)?;
+                    }
+                    self.push_single_task(job, &path, &task_target, &status, &mut tasks)
+                        .await?;
+                    continue;
+                }
+                batch_bytes += status.len;
+                batch.push(status);
+                if batch_should_flush(batch.len(), batch_bytes) {
+                    let files = std::mem::take(&mut batch);
+                    self.push_batch_task(job, &source, &target, files, &mut tasks)?;
+                }
+                continue;
             }
+
+            self.push_single_task(job, &path, &task_target, &status, &mut tasks)
+                .await?;
+        }
+        if !batch.is_empty() {
+            let files = std::mem::take(&mut batch);
+            self.push_batch_task(job, &source, &target, files, &mut tasks)?;
         }
 
         Ok(PlannedTransfer {
@@ -182,6 +206,118 @@ impl TransferPlanner {
             skipped_size,
             cv_metadata_epoch: None,
         })
+    }
+
+    /// Flush one batch of files as a single task (design §7.1). The task's
+    /// `source_path` is the job source root (a directory URI) so a legacy
+    /// worker that receives it by mistake fails loudly (open on a directory)
+    /// instead of silently copying only one file of the batch. Manifest
+    /// entries carry paths relative to the source root; a batch may span
+    /// subdirectories.
+    /// Push one file as its own task (non-batching path, or a large file that
+    /// exceeds the batch target; design §7.1 keeps large files single-task).
+    async fn push_single_task(
+        &self,
+        job: &TransferJobRecord,
+        path: &Path,
+        task_target: &Path,
+        status: &FileStatus,
+        tasks: &mut Vec<TransferTaskRecord>,
+    ) -> FsResult<()> {
+        let task_id = format!("{}_task_{}", job.job_id, tasks.len());
+        let source_read_plan_json = self.source_read_plan_json(path).await?;
+        tasks.push(TransferTaskRecord {
+            job_id: job.job_id.clone(),
+            run_id: job.run_id,
+            task_id,
+            attempt_id: 0,
+            source_path: path.clone_uri(),
+            target_path: task_target.clone_uri(),
+            worker_id: 0,
+            worker_session_id: String::new(),
+            source_read_plan_json,
+            report_target_json: String::new(),
+            state: TransferTaskState::Pending,
+            // Carries estimated bytes into record_json AND progress_total_size
+            // (task_params maps progress into columns) so scheduler-side
+            // in-flight aggregation has a non-zero baseline before first report.
+            progress: TransferProgress {
+                total_size: status.len,
+                ..Default::default()
+            },
+            estimated_size: status.len,
+            retry_count: 0,
+            attempt_started_at: 0,
+            last_report_at: 0,
+            stale_deadline_at: 0,
+            updated_at: LocalTime::mills() as i64,
+        });
+        if tasks.len() > self.max_tasks_per_transfer {
+            return err_box!(
+                "Transfer {} files exceeds {}",
+                job.job_id,
+                self.max_tasks_per_transfer
+            );
+        }
+        Ok(())
+    }
+
+    fn push_batch_task(
+        &self,
+        job: &TransferJobRecord,
+        source_root: &Path,
+        target_root: &Path,
+        files: Vec<FileStatus>,
+        tasks: &mut Vec<TransferTaskRecord>,
+    ) -> FsResult<()> {
+        let entries: Vec<BatchManifestEntry> = files
+            .iter()
+            .map(|file| {
+                let file_path = Path::from_str(&file.path)?;
+                // Relative path from the source root to the file.
+                Ok(BatchManifestEntry {
+                    rel_path: relative_path_from(source_root, &file_path)?,
+                    size: file.len,
+                })
+            })
+            .collect::<FsResult<Vec<_>>>()?;
+        let manifest = BatchManifest { batch: entries };
+        let total: i64 = files.iter().map(|file| file.len).sum();
+        let batch_source = source_root.clone();
+        let batch_target = append_relative_path(source_root, target_root, &batch_source)?;
+        let task_id = format!("{}_task_{}", job.job_id, tasks.len());
+        tasks.push(TransferTaskRecord {
+            job_id: job.job_id.clone(),
+            run_id: job.run_id,
+            task_id,
+            attempt_id: 0,
+            source_path: batch_source.clone_uri(),
+            target_path: batch_target.clone_uri(),
+            worker_id: 0,
+            worker_session_id: String::new(),
+            source_read_plan_json: serde_json::to_string(&manifest)
+                .map_err(|_| FsError::common("Unable to serialize batch manifest"))?,
+            report_target_json: String::new(),
+            state: TransferTaskState::Pending,
+            progress: TransferProgress {
+                total_size: total,
+                ..Default::default()
+            },
+            estimated_size: total,
+            retry_count: 0,
+            attempt_started_at: 0,
+            last_report_at: 0,
+            stale_deadline_at: 0,
+            updated_at: LocalTime::mills() as i64,
+        });
+        if tasks.len() > self.max_tasks_per_transfer {
+            return err_box!(
+                "Transfer {} files exceeds {}",
+                job.job_id,
+                self.max_tasks_per_transfer
+            );
+        }
+        Ok(())
     }
 
     async fn validate_directory_target(
@@ -434,25 +570,30 @@ fn record_metadata_operation(
     }
 }
 
-fn append_relative_path(source_root: &Path, target_root: &Path, source: &Path) -> FsResult<Path> {
+/// Relative path of `source` under `source_root` ("" when equal). Shared by
+/// batch manifests and target derivation (design §7.1).
+fn relative_path_from(source_root: &Path, source: &Path) -> FsResult<String> {
     let source_root_text = normalized_path_text(source_root);
     let source_text = normalized_path_text(source);
-    let target_root_text = normalized_path_text(target_root);
+    if source_text == source_root_text {
+        return Ok(String::new());
+    }
+    Ok(source_text
+        .strip_prefix(source_root_text.as_str())
+        .ok_or_else(|| {
+            FsError::common(format!(
+                "Source path {} is not under transfer root {}",
+                source.full_path(),
+                source_root.full_path()
+            ))
+        })?
+        .trim_start_matches('/')
+        .to_string())
+}
 
-    let relative = if source_text == source_root_text {
-        ""
-    } else {
-        source_text
-            .strip_prefix(source_root_text.as_str())
-            .ok_or_else(|| {
-                FsError::common(format!(
-                    "Source path {} is not under transfer root {}",
-                    source.full_path(),
-                    source_root.full_path()
-                ))
-            })?
-            .trim_start_matches('/')
-    };
+fn append_relative_path(source_root: &Path, target_root: &Path, source: &Path) -> FsResult<Path> {
+    let relative = relative_path_from(source_root, source)?;
+    let target_root_text = normalized_path_text(target_root);
 
     let target = if relative.is_empty() {
         target_root_text

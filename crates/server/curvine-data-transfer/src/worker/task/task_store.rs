@@ -113,6 +113,7 @@ mod supersede_tests {
             target_path: "t".to_string(),
             create_time: 0,
             source_read_plan_json: String::new(),
+            estimated_size: 0,
             transfer_report: None,
         }
     }
@@ -160,7 +161,7 @@ mod supersede_tests {
     }
 
     #[test]
-    fn cancel_marks_context_canceled_before_removing_from_store() {
+    fn cancel_requests_context_without_removing_running_task() {
         let store = TaskStore::new();
         let context = store.insert(load_task("task_1", "job_a"));
 
@@ -168,7 +169,8 @@ mod supersede_tests {
 
         assert_eq!(canceled.len(), 1);
         assert!(Arc::ptr_eq(&canceled[0], &context));
-        assert_eq!(context.get_state(), JobTaskState::Canceled);
-        assert!(!store.contains("task_1"));
+        assert!(context.is_cancel());
+        assert_eq!(context.get_state(), JobTaskState::Pending);
+        assert!(store.contains("task_1"));
     }
 }
