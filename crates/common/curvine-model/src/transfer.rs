@@ -349,6 +349,8 @@ pub struct TransferTaskRecord {
     pub progress: TransferProgress,
     /// Planner-estimated source bytes. JSON-only (record_json authoritative);
     /// 0 means unknown (legacy rows) — consumers substitute a default estimate.
+    #[serde(default)]
+    pub estimated_size: i64,
     pub retry_count: u32,
     pub attempt_started_at: i64,
     pub last_report_at: i64,
