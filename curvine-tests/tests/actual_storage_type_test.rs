@@ -10,7 +10,17 @@ use std::sync::Arc;
 
 #[test]
 fn single_file_writers_persist_actual_storage_type() -> CommonResult<()> {
-    let testing = Testing::builder().workers(1).build()?;
+    let testing = Testing::builder()
+        .workers(1)
+        .mutate_worker_conf(|_, conf| {
+            conf.worker.data_dir = conf
+                .worker
+                .data_dir
+                .iter()
+                .map(|path| format!("[DISK:256MB]{path}"))
+                .collect();
+        })
+        .build()?;
     let cluster = testing.start_cluster()?;
     let conf = testing.get_active_cluster_conf()?;
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
