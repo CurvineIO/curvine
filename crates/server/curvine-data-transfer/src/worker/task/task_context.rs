@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use curvine_model::{JobTaskProgress, JobTaskState, LoadTaskInfo};
@@ -24,6 +24,10 @@ pub struct TaskContext {
     state: StateCtl,
     cancel_requested: AtomicBool,
     progress: Mutex<JobTaskProgress>,
+    // Per-phase copy timing (microseconds), recorded by the runner and read
+    // at task completion for read-vs-write bottleneck attribution.
+    read_cost_us: AtomicU64,
+    write_cost_us: AtomicU64,
 }
 
 impl TaskContext {
@@ -33,6 +37,8 @@ impl TaskContext {
             state: StateCtl::new(JobTaskState::Pending.into()),
             cancel_requested: AtomicBool::new(false),
             progress: Mutex::new(JobTaskProgress::default()),
+            read_cost_us: AtomicU64::new(0),
+            write_cost_us: AtomicU64::new(0),
         }
     }
 
@@ -141,6 +147,24 @@ impl TaskContext {
 
     pub fn is_cancel(&self) -> bool {
         self.cancel_requested.load(Ordering::Acquire) || self.get_state() == JobTaskState::Canceled
+    }
+
+    /// Record microsecond cost of the source-read phase of this task.
+    pub fn add_read_cost(&self, us: u64) {
+        self.read_cost_us.fetch_add(us, Ordering::Relaxed);
+    }
+
+    /// Record microsecond cost of the target-write phase of this task.
+    pub fn add_write_cost(&self, us: u64) {
+        self.write_cost_us.fetch_add(us, Ordering::Relaxed);
+    }
+
+    /// (read_us, write_us) accumulated copy-phase costs for metrics attribution.
+    pub fn copy_costs(&self) -> (u64, u64) {
+        (
+            self.read_cost_us.load(Ordering::Relaxed),
+            self.write_cost_us.load(Ordering::Relaxed),
+        )
     }
 
     pub fn update_state(&self, state: JobTaskState, message: impl Into<String>) {

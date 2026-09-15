@@ -193,10 +193,13 @@ impl LoadTaskRunner {
 
     fn record_outcome(&self, source_path: &str, started: Instant, failed_reason: Option<&str>) {
         let progress = self.task.progress();
+        let (read_us, write_us) = self.task.copy_costs();
         record_task_outcome(
             source_path,
             progress.state,
             started.elapsed().as_micros(),
+            read_us as u128,
+            write_us as u128,
             progress.loaded_size,
             failed_reason,
         );
@@ -303,6 +306,7 @@ impl LoadTaskRunner {
     ) -> FsResult<Option<(i64, i64, u64, u64)>> {
         let mut last_progress_time = LocalTime::mills();
         let mut read_cost_ms = 0;
+        let mut write_cost_ms = 0;
         let mut total_cost_ms = 0;
 
         loop {
@@ -315,16 +319,21 @@ impl LoadTaskRunner {
                 return Ok(None);
             }
 
-            let spend = TimeSpent::new();
+            // Measure read and write phases separately so metrics can answer
+            // "is the bottleneck the source read or the target write?".
+            let read_spend = TimeSpent::new();
             let chunk = stream.reader.async_read(None).await?;
-            read_cost_ms += spend.used_ms();
+            read_cost_ms += read_spend.used_ms();
 
             if chunk.is_empty() {
                 break;
             }
 
+            let write_spend = TimeSpent::new();
             stream.writer.async_write(chunk).await?;
-            total_cost_ms += spend.used_ms();
+            let chunk_write_ms = write_spend.used_ms();
+            write_cost_ms += chunk_write_ms;
+            total_cost_ms += chunk_write_ms;
 
             if LocalTime::mills() > last_progress_time + self.progress_interval_ms {
                 last_progress_time = LocalTime::mills();
@@ -340,6 +349,11 @@ impl LoadTaskRunner {
                 );
             }
         }
+
+        // Attribute accumulated read/write phases to the task context for
+        // per-task metrics attribution at completion.
+        self.task.add_read_cost(read_cost_ms.saturating_mul(1000));
+        self.task.add_write_cost(write_cost_ms.saturating_mul(1000));
 
         stream.writer.complete().await?;
         stream.reader.complete().await?;

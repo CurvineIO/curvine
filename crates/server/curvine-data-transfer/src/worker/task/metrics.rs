@@ -30,11 +30,14 @@ pub struct WorkerTransferMetrics {
     report_total: CounterVec,
     copy_bytes_total: CounterVec,
     execution_duration_us: HistogramVec,
+    read_duration_us: HistogramVec,
+    write_duration_us: HistogramVec,
     tasks_active: Gauge,
     tasks_running: Gauge,
     tasks_queued: Gauge,
     permits_available: Gauge,
     permits_max: Gauge,
+    queue_duration_us: HistogramVec,
 }
 
 impl WorkerTransferMetrics {
@@ -98,6 +101,42 @@ impl WorkerTransferMetrics {
                 ],
             )
             .map_err(|err| FsError::common(err.to_string()))?,
+            read_duration_us: m::new_histogram_vec_with_buckets(
+                "worker_transfer_task_read_duration_us",
+                "Source-read phase latency per transfer task in microseconds",
+                &["state"],
+                &[
+                    1_000.0,
+                    10_000.0,
+                    100_000.0,
+                    500_000.0,
+                    1_000_000.0,
+                    5_000_000.0,
+                    10_000_000.0,
+                    30_000_000.0,
+                    60_000_000.0,
+                    300_000_000.0,
+                ],
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            write_duration_us: m::new_histogram_vec_with_buckets(
+                "worker_transfer_task_write_duration_us",
+                "Target-write phase latency per transfer task in microseconds",
+                &["state"],
+                &[
+                    1_000.0,
+                    10_000.0,
+                    100_000.0,
+                    500_000.0,
+                    1_000_000.0,
+                    5_000_000.0,
+                    10_000_000.0,
+                    30_000_000.0,
+                    60_000_000.0,
+                    300_000_000.0,
+                ],
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
             tasks_active: m::new_gauge(
                 "worker_transfer_tasks_active",
                 "Transfer tasks tracked in this worker task store",
@@ -121,6 +160,24 @@ impl WorkerTransferMetrics {
             permits_max: m::new_gauge(
                 "worker_transfer_task_permits_max",
                 "Configured maximum concurrent transfer tasks on this worker",
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            queue_duration_us: m::new_histogram_vec_with_buckets(
+                "worker_transfer_task_queue_duration_us",
+                "Time a transfer task waits for a concurrency permit before running, in microseconds",
+                &["result"],
+                &[
+                    1_000.0,
+                    10_000.0,
+                    100_000.0,
+                    500_000.0,
+                    1_000_000.0,
+                    5_000_000.0,
+                    10_000_000.0,
+                    30_000_000.0,
+                    60_000_000.0,
+                    300_000_000.0,
+                ],
             )
             .map_err(|err| FsError::common(err.to_string()))?,
         })
@@ -169,15 +226,35 @@ impl WorkerTransferMetrics {
         self.tasks_queued.inc();
     }
 
+    pub fn observe_queued(&self, result: &str, duration_us: u128) {
+        self.queue_duration_us
+            .with_label_values(&[result])
+            .observe(duration_us as f64);
+    }
+
     pub fn dec_queued(&self) {
         self.tasks_queued.dec();
     }
 
-    pub fn observe_terminal(&self, state: &str, kind: &str, duration_us: u128, copied_bytes: i64) {
+    pub fn observe_terminal(
+        &self,
+        state: &str,
+        kind: &str,
+        duration_us: u128,
+        read_us: u128,
+        write_us: u128,
+        copied_bytes: i64,
+    ) {
         self.terminal_total.with_label_values(&[state, kind]).inc();
         self.execution_duration_us
             .with_label_values(&[state])
             .observe(duration_us as f64);
+        self.read_duration_us
+            .with_label_values(&[state])
+            .observe(read_us as f64);
+        self.write_duration_us
+            .with_label_values(&[state])
+            .observe(write_us as f64);
         if copied_bytes > 0 {
             self.copy_bytes_total
                 .with_label_values(&[state])
@@ -223,6 +300,8 @@ pub fn record_task_outcome(
     source_path: &str,
     state: JobTaskState,
     duration_us: u128,
+    read_us: u128,
+    write_us: u128,
     copied_bytes: i64,
     failed_reason: Option<&str>,
 ) {
@@ -232,7 +311,7 @@ pub fn record_task_outcome(
     let kind = transfer_kind_label(source_path);
     let state = job_task_state_name(state);
     record_metric(|metrics| {
-        metrics.observe_terminal(state, kind, duration_us, copied_bytes);
+        metrics.observe_terminal(state, kind, duration_us, read_us, write_us, copied_bytes);
         if let Some(reason) = failed_reason {
             metrics.inc_failed_reason(reason);
         }
@@ -317,6 +396,8 @@ mod tests {
             "ufs://bucket/file",
             JobTaskState::Loading,
             1_000,
+            600,
+            400,
             1024,
             Some("report_failed"),
         );
@@ -335,6 +416,8 @@ mod tests {
             "ufs://bucket/file",
             JobTaskState::Failed,
             2_000,
+            1_200,
+            800,
             2048,
             Some("timeout"),
         );

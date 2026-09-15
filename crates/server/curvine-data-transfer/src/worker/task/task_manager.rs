@@ -395,6 +395,7 @@ impl TaskManager {
                     record_metric(|metrics| {
                         metrics.dec_queued();
                         metrics.inc_running();
+                        metrics.observe_queued("started", started.elapsed().as_micros());
                         metrics.set_permits_available(semaphore.available_permits());
                     });
                     remove_task = runner.run().await;
@@ -405,10 +406,17 @@ impl TaskManager {
                     });
                 }
                 Err(e) => {
+                    record_metric(|metrics| {
+                        metrics.dec_queued();
+                        metrics.observe_queued("failed", started.elapsed().as_micros());
+                        metrics.set_permits_available(semaphore.available_permits());
+                    });
                     record_task_outcome(
                         &source_path,
                         JobTaskState::Failed,
                         started.elapsed().as_micros(),
+                        0,
+                        0,
                         0,
                         Some("permit_acquire_failed"),
                     );
