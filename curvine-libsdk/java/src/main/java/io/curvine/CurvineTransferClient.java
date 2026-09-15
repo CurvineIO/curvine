@@ -141,7 +141,13 @@ public final class CurvineTransferClient implements Closeable {
         });
     }
 
-    /** Poll a job until it reaches a terminal state or the timeout expires. */
+    /**
+     * Poll a job until it reaches a terminal state or the timeout expires.
+     * <p>On timeout the job may still be running server-side and finish later;
+     * call {@link #getJobStatus(String)} with the returned jobId to re-check
+     * the final outcome (the timeout is client-side only, it never cancels the
+     * job).
+     */
     public LoadJobStatus waitJobComplete(String jobId, Duration timeout, Duration pollInterval)
             throws IOException, TimeoutException, InterruptedException {
         requireJobId(jobId);
@@ -172,7 +178,9 @@ public final class CurvineTransferClient implements Closeable {
             if (remainingNanos <= 0L) {
                 throw new TimeoutException(
                         "job " + jobId + " not complete after " + timeout
-                                + ", last state=" + status.getState());
+                                + ", last state=" + status.getState()
+                                + "; the job may still be running server-side - "
+                                + "call getJobStatus(\"" + jobId + "\") to re-check the final outcome");
             }
             sleepNanos(Math.min(saturatingDurationNanos(pollInterval), remainingNanos));
         }
