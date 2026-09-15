@@ -429,22 +429,9 @@ fn test_worker_batch_remote_write_complete_and_read_back() -> CommonResult<()> {
 
 #[test]
 fn test_worker_running_flush_only_no_complete() -> CommonResult<()> {
-    // Regression test for GH#1673.
-    // A flush-only Running frame (header.flush=true, no data) must call
-    // file.flush()? so that data written by earlier Running frames is persisted
-    // to disk. Without the fix, the data would remain only in the device buffer
-    // and be lost if no Complete frame follows.
-    //
-    // Strategy:
-    //   1. Start worker with file-backed storage (temp dir) so that flush()
-    //      actually persists data to disk.
-    //   2. Open a block.
-    //   3. Write data using a normal Running frame (data + flush: false).
-    //   4. Send a flush-only Running frame with DataHeaderProto { flush: true }
-    //      and no data. This is the scenario the bug affects.
-    //   5. Do NOT send a Complete frame.
-    //   6. Verify the data is still readable — this proves flush() was called.
-    let conf = start_worker_with_tempdir();
+    // Regression test for GH#1673: a flush-only Running frame must
+    // reach file.flush() even when no Complete frame follows.
+    let (conf, tmp_dir) = start_worker_with_tempdir();
     let client = conf.worker_sync_client()?;
     let block_size = CHUNK_SIZE as i64;
     let req_id = Utils::req_id();
@@ -477,9 +464,9 @@ fn test_worker_running_flush_only_no_complete() -> CommonResult<()> {
         .request(RequestStatus::Running)
         .req_id(req_id)
         .seq_id(1)
-        .data(curvine_io::DataSlice::Buffer(
-            BytesMut::from(&write_data[..]),
-        ))
+        .data(curvine_io::DataSlice::Buffer(BytesMut::from(
+            &write_data[..],
+        )))
         .build();
     let _: Message = client.rpc_check(write_msg)?;
 
@@ -535,18 +522,22 @@ fn test_worker_running_flush_only_no_complete() -> CommonResult<()> {
         !data.is_empty(),
         "flush-only Running frame did not persist data; data likely lost because file.flush() was not called"
     );
-    assert_eq!(&data[..write_data.len()],write_data,"flushed data content mismatch");
-
+    assert_eq!(
+        data.get(..write_data.len()),
+        Some(write_data.as_slice()),
+        "flushed data content mismatch"
+    );
+    std::fs::remove_dir_all(&tmp_dir).expect("failed to clean up worker test temp directory");
     Ok(())
 }
 
-fn start_worker_with_tempdir() -> ClusterConf {
+fn start_worker_with_tempdir() -> (ClusterConf, std::path::PathBuf) {
     let tmp_dir = std::env::temp_dir().join(format!(
         "curvine-test-worker-{}-{}",
         std::process::id(),
         Utils::req_id().abs()
     ));
-    let _ = std::fs::create_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).expect("failed to create worker test temp directory");
 
     let mut conf = ClusterConf::default();
     conf.worker.rpc_port = NetUtils::hold_available_port();
@@ -556,7 +547,7 @@ fn start_worker_with_tempdir() -> ClusterConf {
 
     let server = Worker::with_conf(conf.clone()).unwrap();
     thread::spawn(move || server.start_standalone());
-    conf
+    (conf, tmp_dir)
 }
 
 #[cfg(feature = "fault-injection")]

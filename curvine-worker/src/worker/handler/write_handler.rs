@@ -230,21 +230,21 @@ impl WriteHandler {
         file: &mut BlockWriteContext,
         context: &WriteContext,
         header: DataHeaderProto,
-    ) -> FsResult<()> {
-        if !header.flush {
-            if header.offset < 0 || header.offset >= context.block_size {
-                return err_box!(
-                    "Invalid seek offset: {}, block length: {}",
-                    header.offset,
-                    context.block_size
-                );
-            }
-            file.seek_to(header.offset)?;
-        } else {
-            file.flush()?;
+    ) -> FsResult<bool> {
+        if header.flush {
+            return Ok(true);
         }
 
-        Ok(())
+        if header.offset < 0 || header.offset >= context.block_size {
+            return err_box!(
+                "Invalid seek offset: {}, block length: {}",
+                header.offset,
+                context.block_size
+            );
+        }
+
+        file.seek_to(header.offset)?;
+        Ok(false)
     }
 
     pub fn write(&mut self, msg: &Message) -> FsResult<Message> {
@@ -252,9 +252,10 @@ impl WriteHandler {
         let context = try_option_mut!(self.context);
         Self::check_context(context, msg)?;
 
+        let mut need_flush = false;
         if msg.header_len() > 0 {
             let header: DataHeaderProto = msg.parse_header()?;
-            Self::handle_data_header(file, context, header)?;
+            need_flush = Self::handle_data_header(file, context, header)?;
         }
 
         let data_len = msg.data_len() as i64;
@@ -274,6 +275,10 @@ impl WriteHandler {
             self.metrics.write_bytes.inc_by(msg.data_len() as i64);
             self.metrics.write_time_us.inc_by(used as i64);
             self.metrics.write_count.inc();
+        }
+
+        if need_flush {
+            file.flush()?;
         }
 
         Ok(msg.success())
@@ -368,12 +373,17 @@ impl WriteHandler {
 #[cfg(test)]
 mod tests {
     use super::{map_storage_open_error, WriteHandler};
+    use crate::worker::block::BlockStore;
     use crate::worker::handler::WriteContext;
     use crate::worker::storage::BlockWriteContext;
+    use crate::worker::Worker;
+    use curvine_config::{ClusterConf, WorkerConf};
     use curvine_error::{FsError, FsResult};
     use curvine_io::{BlockIO, DataSlice};
     use curvine_model::{ExtendedBlock, FileType, StorageType};
     use curvine_proto::DataHeaderProto;
+    use curvine_rpc::message::{Builder, Message, RequestStatus};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn storage_capacity_rejection_maps_to_disk_out_of_space() {
@@ -397,6 +407,89 @@ mod tests {
         ));
     }
 
+    // Same construction pattern already used by
+    // curvine-worker/src/worker/block/block_store.rs (`create_store_with_capacity`)
+    // and curvine-worker/src/worker/block/tests/heartbeat_task_test.rs
+    // (`create_store`): a real BlockStore backed by an in-memory test data dir.
+    fn create_test_store(name: &str) -> FsResult<BlockStore> {
+        let conf = ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                dir_reserved: "0".to_string(),
+                data_dir: vec![format!("[MEM:1KB]../testing/write-handler-{name}")],
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        };
+        BlockStore::new("test", &conf).map_err(FsError::from)
+    }
+
+    struct RecordingBlockIO {
+        operations: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl BlockIO for RecordingBlockIO {
+        fn read_region(
+            &mut self,
+            _enable_send_file: bool,
+            _len: i32,
+        ) -> curvine_io::IOResult<DataSlice> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read not supported",
+            )))
+        }
+
+        fn write_region(&mut self, _region: &DataSlice) -> curvine_io::IOResult<()> {
+            self.operations.lock().unwrap().push("write");
+            Ok(())
+        }
+
+        fn write_all(&mut self, _buf: &[u8]) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "write_all not supported",
+            )))
+        }
+
+        fn read_all(&mut self, _buf: &mut [u8]) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read_all not supported",
+            )))
+        }
+
+        fn flush(&mut self) -> curvine_io::IOResult<()> {
+            self.operations.lock().unwrap().push("flush");
+            Ok(())
+        }
+
+        fn seek(&mut self, pos: i64) -> curvine_io::IOResult<i64> {
+            Ok(pos)
+        }
+
+        fn pos(&self) -> i64 {
+            0
+        }
+
+        fn len(&self) -> i64 {
+            0
+        }
+
+        fn path(&self) -> &str {
+            "recording"
+        }
+
+        fn resize(
+            &mut self,
+            _truncate: bool,
+            _off: i64,
+            _len: i64,
+            _mode: i32,
+        ) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "resize not supported",
+            )))
+        }
+    }
+
     struct FailingFlushBlockIO;
 
     impl BlockIO for FailingFlushBlockIO {
@@ -405,23 +498,31 @@ mod tests {
             _enable_send_file: bool,
             _len: i32,
         ) -> curvine_io::IOResult<DataSlice> {
-            Err(curvine_io::IOError::new(std::io::Error::other("read not supported")))
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read not supported",
+            )))
         }
 
         fn write_region(&mut self, _region: &DataSlice) -> curvine_io::IOResult<()> {
-            Err(curvine_io::IOError::new(std::io::Error::other("write not supported")))
+            Ok(())
         }
 
         fn write_all(&mut self, _buf: &[u8]) -> curvine_io::IOResult<()> {
-            Err(curvine_io::IOError::new(std::io::Error::other("write not supported")))
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "write_all not supported",
+            )))
         }
 
         fn read_all(&mut self, _buf: &mut [u8]) -> curvine_io::IOResult<()> {
-            Err(curvine_io::IOError::new(std::io::Error::other("read not supported")))
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read_all not supported",
+            )))
         }
 
         fn flush(&mut self) -> curvine_io::IOResult<()> {
-            Err(curvine_io::IOError::new(std::io::Error::other("flush failed")))
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "flush failed",
+            )))
         }
 
         fn seek(&mut self, pos: i64) -> curvine_io::IOResult<i64> {
@@ -447,29 +548,47 @@ mod tests {
             _len: i64,
             _mode: i32,
         ) -> curvine_io::IOResult<()> {
-            Err(curvine_io::IOError::new(std::io::Error::other("resize not supported")))
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "resize not supported",
+            )))
         }
     }
 
+    // Regression test for GH#1673: a data-bearing Running frame with flush=true
+    // must write the payload before calling file.flush().
     #[test]
-    fn flush_header_propagates_flush_error() -> FsResult<()> {
+    fn flush_header_is_applied_after_payload_write() -> FsResult<()> {
         let block_size = 1024_i64;
+        let operations = Arc::new(Mutex::new(Vec::new()));
 
-        let mut file =
-            BlockWriteContext::new(FailingFlushBlockIO, 0, block_size, 0)?;
+        let file = BlockWriteContext::new(
+            RecordingBlockIO {
+                operations: operations.clone(),
+            },
+            0,
+            block_size,
+            0,
+        )?;
 
         let context = WriteContext {
-            block: ExtendedBlock::new(
-                1,
-                0,
-                StorageType::Disk,
-                FileType::File,
-            ),
+            block: ExtendedBlock::new(1, 0, StorageType::Disk, FileType::File),
             req_id: 1,
             chunk_size: 1024,
             short_circuit: false,
             off: 0,
             block_size,
+        };
+
+        let store = create_test_store("flush-order")?;
+
+        let mut handler = WriteHandler {
+            store,
+            context: Some(context),
+            file: Some(file),
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
         };
 
         let header = DataHeaderProto {
@@ -478,12 +597,75 @@ mod tests {
             is_last: false,
         };
 
-        let err = WriteHandler::handle_data_header(
-            &mut file,
-            &context,
-            header,
-        )
-        .unwrap_err();
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Running)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(header)
+            .data(DataSlice::Buffer(prost::bytes::BytesMut::from(
+                &b"flush-test"[..],
+            )))
+            .build();
+
+        let _: Message = handler.write(&msg)?;
+
+        assert_eq!(
+            operations.lock().unwrap().as_slice(),
+            ["write", "flush"],
+            "a data-bearing flush frame must write the payload before flushing"
+        );
+
+        Ok(())
+    }
+
+    // Regression test for GH#1673: a flush error surfaced by the underlying
+    // BlockIO must propagate out of WriteHandler::write(), not be swallowed.
+    #[test]
+    fn flush_header_propagates_flush_error() -> FsResult<()> {
+        let block_size = 1024_i64;
+
+        let file = BlockWriteContext::new(FailingFlushBlockIO, 0, block_size, 0)?;
+
+        let context = WriteContext {
+            block: ExtendedBlock::new(1, 0, StorageType::Disk, FileType::File),
+            req_id: 1,
+            chunk_size: 1024,
+            short_circuit: false,
+            off: 0,
+            block_size,
+        };
+
+        let store = create_test_store("flush-error")?;
+
+        let mut handler = WriteHandler {
+            store,
+            context: Some(context),
+            file: Some(file),
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+        };
+
+        let header = DataHeaderProto {
+            offset: block_size,
+            flush: true,
+            is_last: false,
+        };
+
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Running)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(header)
+            .data(DataSlice::Buffer(prost::bytes::BytesMut::from(
+                &b"flush-test"[..],
+            )))
+            .build();
+
+        let err = handler.write(&msg).unwrap_err();
 
         assert!(
             err.to_string().contains("flush failed"),
