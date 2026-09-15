@@ -19,9 +19,11 @@ use crate::transfer::{
     TransferPlannedTasks, TransferPlanner, TransferRequeueUpdate, TransferStore,
     TransferTaskStateUpdate,
 };
+use curvine_client_core::file::CurvineFileSystem;
 use curvine_config::TransferConf;
 use curvine_error::FsError;
 use curvine_error::FsResult;
+use curvine_fs_api::Path;
 use curvine_model::{
     LoadJobInfo, LoadTaskInfo, TaskAttemptStart, TransferJobRecord, TransferLease,
     TransferProgress, TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport,
@@ -187,6 +189,10 @@ pub struct TransferScheduler<S> {
     planner: TransferPlanner,
     cache: ClusterMetadataCache,
     factory: Arc<UfsFactory>,
+    /// CV client used to finalize segmented target files (design §14 T4):
+    /// after all segment tasks complete, the scheduler queries each
+    /// segmented file's block layout and issues complete_file_by_id.
+    fs: CurvineFileSystem,
     owner: String,
     report_endpoints: Vec<String>,
     conf: TransferConf,
@@ -203,6 +209,7 @@ impl<S> Clone for TransferScheduler<S> {
             planner: self.planner.clone(),
             cache: self.cache.clone(),
             factory: self.factory.clone(),
+            fs: self.fs.clone(),
             owner: self.owner.clone(),
             report_endpoints: self.report_endpoints.clone(),
             conf: self.conf.clone(),
@@ -218,11 +225,13 @@ impl<S> TransferScheduler<S>
 where
     S: TransferStore,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<S>,
         planner: TransferPlanner,
         cache: ClusterMetadataCache,
         factory: Arc<UfsFactory>,
+        fs: CurvineFileSystem,
         owner: String,
         report_endpoints: Vec<String>,
         conf: TransferConf,
@@ -234,6 +243,7 @@ where
             planner,
             cache,
             factory,
+            fs,
             owner,
             report_endpoints,
             conf,
@@ -920,12 +930,70 @@ where
             "all tasks completed",
         )?;
         record_metric(|metrics| metrics.inc_terminal("completed", "all_tasks_completed"));
+        // Finalize segmented target files (design §14 T4): segment tasks write
+        // directly to the shared target, so the file is only complete once
+        // every segment has landed. Query the master layout and issue
+        // complete_file_by_id for each segmented target.
+        if let Err(err) = self.finalize_segment_files(&job).await {
+            warn!(
+                "finalize segment files for transfer {} failed: {}",
+                job.job_id, err
+            );
+        }
         let completed_size = self
             .store
             .get_transfer_task_summary(&job.job_id, job.run_id, now_ms())
             .map(|summary| summary.counts.completed_size)
             .unwrap_or(0);
         record_metric(|metrics| metrics.inc_completed_bytes("completed", completed_size));
+        Ok(())
+    }
+
+    /// Finalize every CV target file written by segment tasks (design §14 T4):
+    /// collect distinct targets whose tasks carry a `{"segment": ...}` plan,
+    /// query the master block layout for each, and issue complete_file_by_id
+    /// so the file becomes visible with its full block list.
+    async fn finalize_segment_files(&self, job: &TransferJobRecord) -> FsResult<()> {
+        let tasks = self.store.list_transfer_tasks(&job.job_id, job.run_id)?;
+        let mut targets: std::collections::BTreeSet<String> = Default::default();
+        for task in &tasks {
+            if task
+                .source_read_plan_json
+                .trim_start()
+                .starts_with("{\"segment\"")
+            {
+                targets.insert(task.target_path.clone());
+            }
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+        for target in targets {
+            let path = Path::from_str(&target)?;
+            let blocks = self.fs.get_block_locations(&path).await?;
+            let commit_blocks: Vec<_> = blocks
+                .block_locs
+                .iter()
+                .map(curvine_model::CommitBlock::from)
+                .collect();
+            let block_count = commit_blocks.len();
+            let file_len = blocks.status.len;
+            self.fs
+                .fs_client()
+                .complete_file_by_id(
+                    &path,
+                    blocks.status.id,
+                    file_len,
+                    commit_blocks,
+                    false,
+                    None,
+                )
+                .await?;
+            info!(
+                "finalized segmented target file {} blocks={} len={}",
+                target, block_count, file_len
+            );
+        }
         Ok(())
     }
 

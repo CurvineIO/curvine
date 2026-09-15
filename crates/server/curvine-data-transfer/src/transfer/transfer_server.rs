@@ -155,7 +155,7 @@ impl TransferServer {
             conf.transfer.instance_id.clone()
         };
         let planner = TransferPlanner::new(
-            fs,
+            fs.clone(),
             factory.clone(),
             cache.clone(),
             conf.client.clone(),
@@ -167,6 +167,7 @@ impl TransferServer {
             planner,
             cache.clone(),
             factory,
+            fs,
             owner,
             report_endpoints,
             conf.transfer.clone(),
