@@ -459,6 +459,7 @@ fn assert_failure_summary_uses_stable_task_order<S: TransferStore>(
                 state: TransferTaskState::Failed,
                 message: message.to_string(),
                 now_ms,
+                bump_retry: false,
             })
             .unwrap());
     }

@@ -1046,11 +1046,11 @@ mod tests {
         let (store, _) = running_store(TransferTaskState::Running);
 
         assert!(store
-            .acquire_runnable_transfer("owner", 60_000, 29_999, 10)
+            .acquire_runnable_transfer("owner", 60_000, 29_999, 10, false)
             .unwrap()
             .is_none());
         let lease = store
-            .acquire_runnable_transfer("owner", 60_000, 30_000, 10)
+            .acquire_runnable_transfer("owner", 60_000, 30_000, 10, false)
             .unwrap()
             .unwrap();
         assert_eq!(lease.lease_epoch, 2);
@@ -1061,11 +1061,11 @@ mod tests {
         let (store, _) = running_store(TransferTaskState::Completed);
 
         assert!(store
-            .acquire_runnable_transfer("owner", 60_000, 4_999, 10)
+            .acquire_runnable_transfer("owner", 60_000, 4_999, 10, false)
             .unwrap()
             .is_none());
         assert!(store
-            .acquire_runnable_transfer("owner", 60_000, 5_000, 10)
+            .acquire_runnable_transfer("owner", 60_000, 5_000, 10, false)
             .unwrap()
             .is_some());
     }
@@ -1078,7 +1078,7 @@ mod tests {
             .create_or_get_by_request_id_checked(job.clone())
             .unwrap();
         let lease = store
-            .acquire_runnable_transfer("owner", 60_000, 2, 10)
+            .acquire_runnable_transfer("owner", 60_000, 2, 10, false)
             .unwrap()
             .unwrap();
         assert!(store
