@@ -105,8 +105,8 @@ fn batch_flush_disabled_for_zero_bytes_with_few_files() {
 #[test]
 fn segment_offsets_cover_exact_block_multiple() {
     use super::planner::{segment_offsets, SEGMENT_BYTES};
-    // 2.5 blocks -> 3 segments, last is the remainder.
-    let ranges = segment_offsets(SEGMENT_BYTES * 2 + SEGMENT_BYTES / 2);
+    // 2.5 blocks -> 3 segments, last is the remainder (default block = SEGMENT_BYTES).
+    let ranges = segment_offsets(SEGMENT_BYTES * 2 + SEGMENT_BYTES / 2, SEGMENT_BYTES);
     assert_eq!(ranges.len(), 3);
     assert_eq!(ranges[0], (0, SEGMENT_BYTES));
     assert_eq!(ranges[1], (SEGMENT_BYTES, SEGMENT_BYTES));
@@ -114,10 +114,26 @@ fn segment_offsets_cover_exact_block_multiple() {
 }
 
 #[test]
+fn segment_offsets_align_to_smaller_block_size() {
+    use super::planner::{segment_offsets, SEGMENT_BYTES};
+    // A job with a 64 MiB block size must split at 64 MiB boundaries, not
+    // the 128 MiB default, so each segment maps to exactly one CV block
+    // (review: run_segment assumed block_size == SEGMENT_BYTES).
+    let block = SEGMENT_BYTES / 2;
+    let len = block * 3 + block / 2;
+    let ranges = segment_offsets(len, block);
+    assert_eq!(ranges.len(), 4);
+    assert_eq!(ranges[0], (0, block));
+    assert_eq!(ranges[1], (block, block));
+    assert_eq!(ranges[2], (block * 2, block));
+    assert_eq!(ranges[3], (block * 3, block / 2));
+}
+
+#[test]
 fn segment_offsets_contiguous_and_cover_whole_file() {
     use super::planner::{segment_offsets, SEGMENT_BYTES};
     let len = SEGMENT_BYTES * 3 + 12345;
-    let ranges = segment_offsets(len);
+    let ranges = segment_offsets(len, SEGMENT_BYTES);
     // Contiguous and total == file length.
     let mut next = 0i64;
     let mut total = 0i64;
@@ -135,11 +151,14 @@ fn segment_offsets_contiguous_and_cover_whole_file() {
 fn segment_offsets_small_file_is_single_segment() {
     use super::planner::{segment_offsets, SEGMENT_BYTES};
     assert_eq!(
-        segment_offsets(SEGMENT_BYTES - 1),
+        segment_offsets(SEGMENT_BYTES - 1, SEGMENT_BYTES),
         vec![(0, SEGMENT_BYTES - 1)]
     );
-    assert_eq!(segment_offsets(SEGMENT_BYTES), vec![(0, SEGMENT_BYTES)]);
-    assert!(segment_offsets(0).is_empty());
+    assert_eq!(
+        segment_offsets(SEGMENT_BYTES, SEGMENT_BYTES),
+        vec![(0, SEGMENT_BYTES)]
+    );
+    assert!(segment_offsets(0, SEGMENT_BYTES).is_empty());
 }
 
 #[test]

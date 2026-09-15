@@ -465,6 +465,18 @@ impl LoadTaskRunner {
             }
             let source = join_path(&source_dir, &entry.rel_path)?;
             let target = join_path(&target_dir, &entry.rel_path)?;
+            // Idempotent retry: a file already committed by a previous attempt
+            // of this batch must not be copied again (review Required).
+            // Commit markers live on CV targets only; UFS targets always copy.
+            if target.is_cv() {
+                let source_status = self.open_unified(&source).await?.status().clone();
+                let target_status = self.fs.get_status(&target).await?;
+                if self.is_committed_transfer_output(&target_status, &source_status) {
+                    committed += entry.size;
+                    copied_count += 1;
+                    continue;
+                }
+            }
             let mut stream = match self.create_stream_for(&source, &target).await {
                 Ok(stream) => stream,
                 Err(err) => {
@@ -610,7 +622,11 @@ impl LoadTaskRunner {
         // Locate this segment's block in the target layout.
         let blocks = self.fs.get_block_locations(&target_path).await?;
         let block_size = blocks.status.block_size.max(1);
-        let block_index = plan.offset / block_size;
+        // Use the planner-computed block index (aligned to the job's block
+        // size), not offset/block_size here: the live layout may report a
+        // different block_size than the planner assumed during a rolling
+        // upgrade or a non-default block size.
+        let block_index = plan.block_index;
         let located = blocks.block_locs.get(block_index as usize).ok_or_else(|| {
             FsError::common(format!(
                 "segment task {} block {} not found in target layout (blocks={})",
@@ -738,8 +754,26 @@ impl LoadTaskRunner {
                             writer.flush().await?;
                             Ok(())
                         }
-                        // Concurrent create race: another segment created it.
-                        Err(FsError::FileAlreadyExists(_)) => Ok(()),
+                        // Concurrent create race: another segment created the
+                        // file. create+resize are not atomic, so verify the
+                        // resize actually landed before treating the target as
+                        // ready; otherwise re-apply it (review Required).
+                        Err(FsError::FileAlreadyExists(_)) => {
+                            let status = self.fs.get_status(target_path).await?;
+                            if status.len >= total_len {
+                                Ok(())
+                            } else {
+                                let mut writer =
+                                    self.fs.open_existing_for_write(target_path).await?;
+                                if total_len > 0 {
+                                    writer
+                                        .resize(FileAllocOpts::with_truncate(total_len))
+                                        .await?;
+                                }
+                                writer.flush().await?;
+                                Ok(())
+                            }
+                        }
                         Err(err) => Err(err),
                     }
                 }

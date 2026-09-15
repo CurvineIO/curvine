@@ -61,6 +61,9 @@ struct InflightLedger {
     ttl_ms: u64,
     refreshed_at_ms: AtomicU64,
     entries: DashMap<u32, (u64, i64)>, // worker_id -> (task_count, estimated_bytes)
+    // Serializes refresh (clear+rebuild) against concurrent account()/get()
+    // so a refresh never wipes a just-accounted dispatch (review Required).
+    refresh_lock: std::sync::Mutex<()>,
 }
 
 impl InflightLedger {
@@ -69,6 +72,7 @@ impl InflightLedger {
             ttl_ms: ttl.as_millis() as u64,
             refreshed_at_ms: AtomicU64::new(0),
             entries: DashMap::new(),
+            refresh_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -83,7 +87,22 @@ impl InflightLedger {
         if refreshed_at != 0 && now_ms.saturating_sub(refreshed_at) < self.ttl_ms {
             return Ok(());
         }
+        // Serialize refresh against concurrent account() so a dispatch that
+        // landed between clear() and insert() is not lost (review Required).
+        let _guard = self.refresh_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // Re-check under the lock: another refresh may have just completed.
+        let refreshed_at = self.refreshed_at_ms.load(Ordering::Relaxed);
+        if refreshed_at != 0 && now_ms.saturating_sub(refreshed_at) < self.ttl_ms {
+            return Ok(());
+        }
         let inflight = store.select_inflight_by_worker()?;
+        // Remember previously-reported worker ids so workers that now have no
+        // in-flight tasks get their gauges reset (review Required); otherwise
+        // per-worker gauges report stale non-zero values forever.
+        let mut previous: std::collections::HashSet<u32> = Default::default();
+        for entry in self.entries.iter() {
+            previous.insert(*entry.key());
+        }
         self.entries.clear();
         for WorkerInflight {
             worker_id,
@@ -94,6 +113,7 @@ impl InflightLedger {
         {
             // Unknown-size rows count at the configured default so they cannot
             // bypass the byte budget (design §3.1 invariant 3).
+            previous.remove(&worker_id);
             self.entries.insert(
                 worker_id,
                 (
@@ -104,6 +124,10 @@ impl InflightLedger {
             record_metric(|metrics| {
                 metrics.set_worker_inflight(worker_id, task_count, estimated_bytes)
             });
+        }
+        // Zero out gauges for workers that no longer have in-flight tasks.
+        for gone in previous {
+            record_metric(|metrics| metrics.set_worker_inflight(gone, 0, 0));
         }
         self.refreshed_at_ms.store(now_ms, Ordering::Relaxed);
         Ok(())
@@ -985,6 +1009,24 @@ where
             // acquire_runnable_transfer already refreshed this lease for the current tick.
             return Ok(());
         }
+        // Finalize segmented targets BEFORE marking the job Completed: the file
+        // only becomes readable once every segment's blocks are committed via
+        // complete_file_by_id. If finalize fails, the data is not fully
+        // converged, so the job must not report success (review Critical).
+        if let Err(err) = self.finalize_segment_files(&job).await {
+            warn!(
+                "finalize segment files for transfer {} failed: {}",
+                job.job_id, err
+            );
+            record_metric(|metrics| metrics.inc_terminal("failed", "finalize_segment_failed"));
+            self.fail_transfer(
+                &job,
+                &lease,
+                &[TransferState::Running],
+                format!("finalize segment files failed: {}", err),
+            )?;
+            return Ok(());
+        }
         let _ = self.transition(
             &job,
             &lease,
@@ -993,16 +1035,6 @@ where
             "all tasks completed",
         )?;
         record_metric(|metrics| metrics.inc_terminal("completed", "all_tasks_completed"));
-        // Finalize segmented target files (design §14 T4): segment tasks write
-        // directly to the shared target, so the file is only complete once
-        // every segment has landed. Query the master layout and issue
-        // complete_file_by_id for each segmented target.
-        if let Err(err) = self.finalize_segment_files(&job).await {
-            warn!(
-                "finalize segment files for transfer {} failed: {}",
-                job.job_id, err
-            );
-        }
         let completed_size = self
             .store
             .get_transfer_task_summary(&job.job_id, job.run_id, now_ms())
@@ -1732,8 +1764,27 @@ fn choose_worker_admitted(
 /// treated as session-class (conservative: evict) because the only known
 /// capacity reason is `worker_at_capacity`; future capacity reasons must add
 /// their prefix here.
+/// A reject reason that indicates the worker's session is genuinely stale
+/// (worker restarted or session rotated) and warrants evicting the cached
+/// worker session. Capacity rejections (worker busy, temporary) and stale
+/// attempt rejections (an outdated run/attempt of an already-retried task)
+/// are NOT session failures: evicting on them would misdiagnose a healthy
+/// worker and force its other tasks to be re-probed (review Required).
 fn is_session_rejection(reason: &str) -> bool {
-    !reason.starts_with(crate::worker::task::WORKER_AT_CAPACITY_REJECT_PREFIX)
+    if reason.starts_with(crate::worker::task::WORKER_AT_CAPACITY_REJECT_PREFIX) {
+        return false;
+    }
+    // "Reject stale transfer task ..." is an outdated attempt, not a session
+    // failure; "stale worker session" is a real session rotation.
+    if reason.starts_with("Reject stale transfer task") {
+        return false;
+    }
+    if reason.contains("stale worker session") {
+        return true;
+    }
+    // Conservative default: an unrecognized reason may indicate a real
+    // problem, so treat it as session-class (matches prior behavior).
+    true
 }
 
 fn transfer_task_state(state: i32) -> TransferTaskState {

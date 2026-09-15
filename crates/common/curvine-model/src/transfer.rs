@@ -314,6 +314,11 @@ pub struct SegmentPlan {
     /// Total file length; the first segment pre-allocates the whole target
     /// (resize) so concurrent segments find every block's layout ready.
     pub total_len: i64,
+    /// Target block index this segment writes. Planner computes it from the
+    /// job's configured block size (offset / block_size) so the runner does
+    /// not re-derive it from the live layout (which may differ during rolling
+    /// upgrades or when block_size != SEGMENT_BYTES).
+    pub block_index: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -75,13 +75,22 @@ pub fn batch_should_flush(file_count: usize, accumulated_bytes: i64) -> bool {
 }
 
 /// Pure segment split (design §14): returns (offset, length) ranges covering
-/// the whole file, each at most SEGMENT_BYTES (one CV block). Testable without
+/// the whole file, each at most SEGMENT_BYTES and aligned to the target's
+/// CV block size so each segment maps to exactly one block. Testable without
 /// a planner instance.
-pub fn segment_offsets(file_len: i64) -> Vec<(i64, i64)> {
+pub fn segment_offsets(file_len: i64, block_size: i64) -> Vec<(i64, i64)> {
+    // One segment per CV block: never exceed SEGMENT_BYTES, but also align to
+    // the job's block size so offset/block_size maps to an exact block index
+    // (a larger configured block_size would otherwise misalign offsets).
+    let seg = if block_size > 0 {
+        SEGMENT_BYTES.min(block_size)
+    } else {
+        SEGMENT_BYTES
+    };
     let mut ranges = Vec::new();
     let mut offset = 0i64;
     while offset < file_len {
-        let length = SEGMENT_BYTES.min(file_len - offset);
+        let length = seg.min(file_len - offset);
         ranges.push((offset, length));
         offset += length;
     }
@@ -217,6 +226,7 @@ impl TransferPlanner {
                         &task_target,
                         &status,
                         overwrite,
+                        job_info.block_size,
                         &mut tasks,
                     )
                     .await?;
@@ -274,8 +284,17 @@ impl TransferPlanner {
         task_target: &Path,
         status: &FileStatus,
         overwrite: bool,
+        block_size: i64,
         tasks: &mut Vec<TransferTaskRecord>,
     ) -> FsResult<()> {
+        // Segmentation writes each segment as one CV block on one worker. It
+        // only applies to CV targets: a UFS target has no block layout to
+        // write into, so fall back to a single whole-file task (design §14).
+        if !task_target.is_cv() {
+            return self
+                .push_single_task(job, path, task_target, status, tasks)
+                .await;
+        }
         // Segment tasks write the target as a fresh full file (design §14). A
         // pre-existing target must be cleared before any segment lands,
         // otherwise a retry or an incremental re-copy mixes new segments with
@@ -296,11 +315,17 @@ impl TransferPlanner {
                 Err(err) => return Err(err),
             }
         }
-        for (offset, length) in segment_offsets(status.len) {
+        let seg_block = if block_size > 0 {
+            block_size
+        } else {
+            SEGMENT_BYTES
+        };
+        for (offset, length) in segment_offsets(status.len, block_size) {
             let plan = SegmentPlan {
                 offset,
                 length,
                 total_len: status.len,
+                block_index: offset / seg_block.max(1),
             };
             // Wrap so the runner can distinguish a segment task from a batch
             // manifest or a CV block plan: {"segment": {offset, length}}.
