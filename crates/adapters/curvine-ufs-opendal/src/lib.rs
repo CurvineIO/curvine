@@ -842,12 +842,26 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
     async fn mkdir(&self, path: &Path, _create_parent: bool) -> FsResult<bool> {
         let object_path = self.get_dir_path(path)?;
 
-        self.operator
-            .create_dir(&object_path)
-            .await
-            .map_err(|e| opendal_error("Failed to create directory", &object_path, e))?;
-
-        Ok(true)
+        match self.operator.create_dir(&object_path).await {
+            Ok(_) => Ok(true),
+            // MinIO treats a bucket root mkdir as an already-exists error
+            // (BucketAlreadyOwnedByYou / HTTP 409, surfaced by OpenDAL as
+            // ConditionNotMatch). An existing dir/bucket is a successful
+            // mkdir, so swallow both error kinds here.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch
+                ) =>
+            {
+                Ok(true)
+            }
+            Err(e) => Err(opendal_error(
+                "Failed to create directory",
+                &object_path,
+                e,
+            )),
+        }
     }
 
     /// Create a new file or open for overwrite. When overwrite is false and the path exists, returns file_exists.
