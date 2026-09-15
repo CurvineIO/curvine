@@ -26,8 +26,9 @@ use curvine_proto::{
     CancelTransferRequest, CancelTransferResponse, GetTransferStatusRequest,
     GetTransferStatusResponse, ListTransferTenantsRequest, ListTransferTenantsResponse,
     ListTransfersRequest, ListTransfersResponse, RetryTransferRequest, SubmitTransferRequest,
-    SubmitTransferResponse, TransferProgressProto, TransferTaskReportRequest,
-    TransferTaskReportResponse, WatchTransferRequest, WatchTransferResponse,
+    SubmitTransferResponse, TransferProgressProto, TransferTaskReportBatchRequest,
+    TransferTaskReportBatchResponse, TransferTaskReportRequest, TransferTaskReportResponse,
+    WatchTransferRequest, WatchTransferResponse,
 };
 use curvine_rpc::client::ClusterConnector;
 use curvine_runtime::runtime::Runtime;
@@ -39,6 +40,14 @@ const TRANSFER_PROTOCOL_VERSION: u32 = 1;
 #[derive(Clone)]
 pub struct TransferClient {
     connector: Arc<ClusterConnector>,
+}
+
+#[derive(Clone)]
+pub struct TransferTaskProgressReport {
+    pub job_id: String,
+    pub task_id: String,
+    pub info: TransferTaskReportInfo,
+    pub progress: JobTaskProgress,
 }
 
 impl TransferClient {
@@ -207,27 +216,65 @@ impl TransferClient {
         info: &TransferTaskReportInfo,
         progress: JobTaskProgress,
     ) -> FsResult<bool> {
-        let req = TransferTaskReportRequest {
+        let req = task_report_request(TransferTaskProgressReport {
             job_id: job_id.as_ref().to_string(),
-            run_id: info.run_id,
             task_id: task_id.as_ref().to_string(),
-            attempt_id: info.attempt_id,
-            worker_id: info.worker_id,
-            worker_session_id: info.worker_session_id.clone(),
-            state: transfer_task_state_code(progress.state),
-            progress: TransferProgressProto {
-                loaded_size: progress.loaded_size,
-                total_size: progress.total_size,
-                update_time: progress.update_time,
-                message: progress.message,
-            },
-            protocol_version: Some(TRANSFER_PROTOCOL_VERSION),
-        };
+            info: info.clone(),
+            progress,
+        });
         let response = self
             .connector
             .proto_rpc::<_, TransferTaskReportResponse, FsError>(RpcCode::ReportTransferTask, req)
             .await?;
         Ok(response.accepted)
+    }
+
+    pub async fn report_task_batch(
+        &self,
+        reports: Vec<TransferTaskProgressReport>,
+    ) -> FsResult<Vec<bool>> {
+        if reports.is_empty() {
+            return Ok(Vec::new());
+        }
+        let report_count = reports.len();
+        let req = TransferTaskReportBatchRequest {
+            reports: reports.into_iter().map(task_report_request).collect(),
+            protocol_version: Some(TRANSFER_PROTOCOL_VERSION),
+        };
+        let response = self
+            .connector
+            .proto_rpc::<_, TransferTaskReportBatchResponse, FsError>(
+                RpcCode::ReportTransferTaskBatch,
+                req,
+            )
+            .await?;
+        if response.accepted.len() != report_count {
+            return Err(FsError::common(format!(
+                "Transfer task report batch response count {} does not match request count {}",
+                response.accepted.len(),
+                report_count
+            )));
+        }
+        Ok(response.accepted)
+    }
+}
+
+fn task_report_request(report: TransferTaskProgressReport) -> TransferTaskReportRequest {
+    TransferTaskReportRequest {
+        job_id: report.job_id,
+        run_id: report.info.run_id,
+        task_id: report.task_id,
+        attempt_id: report.info.attempt_id,
+        worker_id: report.info.worker_id,
+        worker_session_id: report.info.worker_session_id,
+        state: transfer_task_state_code(report.progress.state),
+        progress: TransferProgressProto {
+            loaded_size: report.progress.loaded_size,
+            total_size: report.progress.total_size,
+            update_time: report.progress.update_time,
+            message: report.progress.message,
+        },
+        protocol_version: Some(TRANSFER_PROTOCOL_VERSION),
     }
 }
 
