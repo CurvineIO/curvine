@@ -896,6 +896,63 @@ fn ttl_executor_deletes_nested_expired_inode() -> CommonResult<()> {
     Ok(())
 }
 
+// TTL delete must not refresh the parent directory mtime, otherwise a
+// directory with its own TTL is renewed after its child file is cleaned.
+#[test]
+fn ttl_executor_deletes_expired_directory_after_child_file() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "ttl-executor-dir-after-file");
+
+    let dir_opts = MkdirOptsBuilder::new()
+        .create_parent(true)
+        .ttl_ms(1)
+        .ttl_action(TtlAction::Delete)
+        .build();
+    let dir = fs.mkdir_with_opts("/ttl/expired-dir", dir_opts)?;
+
+    let file_opts = CreateFileOptsBuilder::new()
+        .ttl_ms(1)
+        .ttl_action(TtlAction::Delete)
+        .build();
+    let file = fs.create_with_opts(
+        "/ttl/expired-dir/file.log",
+        file_opts,
+        OpenFlags::new_create().set_overwrite(true),
+    )?;
+
+    std::thread::sleep(Duration::from_millis(10));
+    let dir_mtime_before_child_delete = fs.file_status("/ttl/expired-dir")?.mtime;
+    let executor = InodeTtlExecutor::with_managers(fs.clone());
+
+    let (file_processed, _) = executor.execute_by_id(file.id)?;
+    assert!(
+        file_processed,
+        "expired child file should be processed by TTL executor"
+    );
+    assert!(
+        fs.file_status("/ttl/expired-dir/file.log").is_err(),
+        "TTL delete should remove the child file"
+    );
+    assert_eq!(
+        fs.file_status("/ttl/expired-dir")?.mtime,
+        dir_mtime_before_child_delete,
+        "TTL child delete must not refresh an already-expired parent directory mtime"
+    );
+
+    let (dir_processed, inode) = executor.execute_by_id(dir.id)?;
+    assert!(
+        dir_processed,
+        "expired directory should still be processed after its child file is deleted"
+    );
+    assert_eq!(inode.id(), dir.id);
+    assert!(
+        fs.file_status("/ttl/expired-dir").is_err(),
+        "TTL delete should remove the expired directory, not only its child file"
+    );
+
+    Ok(())
+}
+
 // Regression: TTL path resolution must not re-acquire the fs_dir read lock while
 // already holding it. std::sync::RwLock is writer-preferring, so a reentrant read
 // deadlocks once a writer is queued. This reproduces the 2026-07-08 freeze shape:

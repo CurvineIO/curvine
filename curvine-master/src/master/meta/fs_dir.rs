@@ -294,8 +294,16 @@ impl FsDir {
         let child = target.as_ref();
         let child_name = inp.name();
 
-        // Handle different types of nodes
-        parent.update_mtime(mtime);
+        // Handle different types of nodes.
+        // An already-expired parent TTL must keep its mtime: the checker can
+        // delete child files first, and bumping mtime would un-expire the
+        // directory for the rest of the same cleanup pass.
+        // Evaluate expiry at this delete's `mtime` so journal replay matches the
+        // leader. `expiration_ms` can fail (e.g. FileEntry); never fail the delete.
+        match parent.as_ref().expiration_ms() {
+            Ok(Some(exp)) if mtime > exp => {}
+            _ => parent.update_mtime(mtime),
+        }
 
         let del_res = match child {
             File(f) => {
