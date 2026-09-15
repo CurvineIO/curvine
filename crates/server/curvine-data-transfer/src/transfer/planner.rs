@@ -237,6 +237,7 @@ impl TransferPlanner {
                 batch.push(status);
                 if batch_should_flush(batch.len(), batch_bytes) {
                     let files = std::mem::take(&mut batch);
+                    batch_bytes = 0;
                     self.push_batch_task(job, &source, &target, files, &mut tasks)?;
                 }
                 continue;

@@ -333,18 +333,44 @@ impl TaskManager {
         // zero here; the scheduler-side default estimate already gates them.
         let estimated_bytes = context.info.estimated_size.max(0);
         let byte_guard = if self.inflight_budget_bytes > 0 {
-            let current = self.inflight_bytes.load(Ordering::Relaxed);
-            if current + estimated_bytes > self.inflight_budget_bytes {
-                return Ok(TaskSubmitResult::rejected(format!(
-                    "{}: inflight bytes {} + task {} would exceed budget {}",
-                    WORKER_AT_CAPACITY_REJECT_PREFIX,
+            let oversize = estimated_bytes > self.inflight_budget_bytes;
+            // Atomic admit: CAS loop so concurrent submits cannot all observe
+            // the same current value and collectively exceed the budget
+            // (review P1). Oversized tasks (> budget) admit only when the
+            // worker is fully idle, matching the scheduler's idle-only rule;
+            // otherwise a 10GiB+ file would deadlock in a dispatch/reject loop.
+            let admitted = loop {
+                let current = self.inflight_bytes.load(Ordering::Acquire);
+                if oversize {
+                    if current != 0 {
+                        return Ok(TaskSubmitResult::rejected(format!(
+                            "{}: inflight bytes {} + oversized task {} would exceed budget {}",
+                            WORKER_AT_CAPACITY_REJECT_PREFIX,
+                            current,
+                            estimated_bytes,
+                            self.inflight_budget_bytes
+                        )));
+                    }
+                } else if current + estimated_bytes > self.inflight_budget_bytes {
+                    return Ok(TaskSubmitResult::rejected(format!(
+                        "{}: inflight bytes {} + task {} would exceed budget {}",
+                        WORKER_AT_CAPACITY_REJECT_PREFIX,
+                        current,
+                        estimated_bytes,
+                        self.inflight_budget_bytes
+                    )));
+                }
+                match self.inflight_bytes.compare_exchange_weak(
                     current,
-                    estimated_bytes,
-                    self.inflight_budget_bytes
-                )));
-            }
-            self.inflight_bytes
-                .fetch_add(estimated_bytes, Ordering::Relaxed);
+                    current + estimated_bytes,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break true,
+                    Err(_) => continue,
+                }
+            };
+            let _ = admitted;
             Some(InflightByteGuard {
                 inflight_bytes: self.inflight_bytes.clone(),
                 bytes: estimated_bytes,

@@ -778,10 +778,6 @@ where
 
         let started = stream::iter(tasks.into_iter().filter_map(|task| {
             let estimated_bytes = self.task_estimated_bytes(&task);
-            // Batch-manifest tasks only dispatch to workers that advertised the
-            // capability (design §7.4); choose_worker enforces it per worker.
-            // Without a capable worker the task stays Pending and is retried on
-            // a later tick once capable workers appear.
             // No worker has room (design §4.2): drop the task from this batch
             // (stays Pending in store) so remaining tasks still get placed.
             let worker = self.choose_worker(&workers, estimated_bytes)?;
