@@ -293,6 +293,34 @@ pub struct TransferJobRecord {
     pub updated_at: i64,
 }
 
+/// Multi-file batch manifest carried in a batch task's `source_read_plan_json`
+/// (design §7). The `{"batch": ...}` wrapper distinguishes it from a per-file
+/// CV block-read plan (a bare JSON array).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BatchManifest {
+    pub batch: Vec<BatchManifestEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BatchManifestEntry {
+    /// Source path relative to the job's source root (design §7.1): a batch
+    /// may span subdirectories, so the runner resolves target as
+    /// target_root + rel_path.
+    pub rel_path: String,
+    pub size: i64,
+}
+
+/// Scheduler-side per-worker in-flight aggregation (state = Running only).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkerInflight {
+    pub worker_id: u32,
+    pub task_count: u64,
+    pub estimated_bytes: i64,
+    /// How many of `task_count` have unknown (0) size; the scheduler adds the
+    /// configured default estimate per such row (design §3.1).
+    pub unknown_bytes_count: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferTaskRecord {
     pub job_id: String,
@@ -307,11 +335,52 @@ pub struct TransferTaskRecord {
     pub report_target_json: String,
     pub state: TransferTaskState,
     pub progress: TransferProgress,
+    /// Planner-estimated source bytes. JSON-only (record_json authoritative);
+    /// 0 means unknown (legacy rows) — consumers substitute a default estimate.
     pub retry_count: u32,
     pub attempt_started_at: i64,
     pub last_report_at: i64,
     pub stale_deadline_at: i64,
     pub updated_at: i64,
+}
+
+/// Status-query projection. Task planning data stays in `TransferTaskRecord`;
+/// polling callers never need `source_read_plan_json` or report endpoints.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransferTaskStatus {
+    pub task_id: String,
+    pub attempt_id: u64,
+    pub source_path: String,
+    pub target_path: String,
+    pub worker_id: u32,
+    pub worker_session_id: String,
+    pub state: TransferTaskState,
+    pub progress: TransferProgress,
+    pub retry_count: u32,
+    pub updated_at: i64,
+}
+
+impl From<TransferTaskRecord> for TransferTaskStatus {
+    fn from(task: TransferTaskRecord) -> Self {
+        Self::from(&task)
+    }
+}
+
+impl From<&TransferTaskRecord> for TransferTaskStatus {
+    fn from(task: &TransferTaskRecord) -> Self {
+        Self {
+            task_id: task.task_id.clone(),
+            attempt_id: task.attempt_id,
+            source_path: task.source_path.clone(),
+            target_path: task.target_path.clone(),
+            worker_id: task.worker_id,
+            worker_session_id: task.worker_session_id.clone(),
+            state: task.state,
+            progress: task.progress.clone(),
+            retry_count: task.retry_count,
+            updated_at: task.updated_at,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -349,8 +418,8 @@ pub fn summarize_transfer_tasks<'a>(
         all_completed: true,
     };
     let mut failed_count = 0;
-    let mut first_error = String::new();
-    let mut last_message = String::new();
+    let mut first_error: Option<(i64, String, String)> = None;
+    let mut last_message: Option<(i64, String, String)> = None;
 
     for task in tasks {
         summary.has_task = true;
@@ -371,30 +440,108 @@ pub fn summarize_transfer_tasks<'a>(
             TransferTaskState::Stale => summary.counts.stale += 1,
         }
 
-        if !task.progress.message.is_empty() {
-            last_message = task.progress.message.clone();
+        if !task.progress.message.is_empty()
+            && match &last_message {
+                None => true,
+                Some((updated_at, task_id, _)) => {
+                    task.updated_at > *updated_at
+                        || (task.updated_at == *updated_at
+                            && task.task_id.as_str() > task_id.as_str())
+                }
+            }
+        {
+            last_message = Some((
+                task.updated_at,
+                task.task_id.clone(),
+                task.progress.message.clone(),
+            ));
         }
         if task.state == TransferTaskState::Failed {
             failed_count += 1;
-            if first_error.is_empty() && !task.progress.message.is_empty() {
-                first_error = task.progress.message.clone();
+            if !task.progress.message.is_empty()
+                && match &first_error {
+                    None => true,
+                    Some((updated_at, task_id, _)) => {
+                        task.updated_at < *updated_at
+                            || (task.updated_at == *updated_at
+                                && task.task_id.as_str() < task_id.as_str())
+                    }
+                }
+            {
+                first_error = Some((
+                    task.updated_at,
+                    task.task_id.clone(),
+                    task.progress.message.clone(),
+                ));
             }
         }
     }
 
     if failed_count > 0 {
-        if first_error.is_empty() {
-            first_error = "transfer task failed".to_string();
-        }
+        let first_error = first_error
+            .map(|(_, _, message)| message)
+            .unwrap_or_else(|| "transfer task failed".to_string());
         summary.progress.message = format!(
             "{} transfer task(s) failed: {}",
             failed_count,
             normalize_summary_message(&first_error)
         );
     } else {
-        summary.progress.message = last_message;
+        summary.progress.message = last_message
+            .map(|(_, _, message)| message)
+            .unwrap_or_default();
     }
     summary
+}
+
+/// Builds a task summary from Store-side aggregates. SQL backends use this to
+/// avoid loading immutable task definitions just to update progress counters.
+pub fn transfer_task_summary_from_aggregate(
+    counts: TransferTaskCounts,
+    loaded_size: i64,
+    total_size: i64,
+    first_error: Option<&str>,
+    last_message: Option<&str>,
+    update_time: i64,
+) -> TransferTaskSummary {
+    let has_task = counts.pending
+        + counts.running
+        + counts.completed
+        + counts.failed
+        + counts.canceled
+        + counts.stale
+        > 0;
+    let has_failed = counts.failed > 0;
+    let message = if has_failed {
+        let first_error = first_error
+            .filter(|message| !message.is_empty())
+            .unwrap_or("transfer task failed");
+        format!(
+            "{} transfer task(s) failed: {}",
+            counts.failed,
+            normalize_summary_message(first_error)
+        )
+    } else {
+        last_message.unwrap_or_default().to_string()
+    };
+    TransferTaskSummary {
+        progress: TransferProgress {
+            loaded_size,
+            total_size,
+            update_time,
+            message,
+        },
+        counts,
+        has_task,
+        has_failed,
+        all_completed: counts.completed
+            == counts.pending
+                + counts.running
+                + counts.completed
+                + counts.failed
+                + counts.canceled
+                + counts.stale,
+    }
 }
 
 fn normalize_summary_message(message: &str) -> String {

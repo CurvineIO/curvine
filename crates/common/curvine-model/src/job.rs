@@ -310,6 +310,8 @@ pub struct LoadTaskInfo {
     pub create_time: i64,
     #[serde(default)]
     pub source_read_plan_json: String,
+    /// Planner-estimated source bytes for this task (batch = sum of files).
+    /// 0 = unknown; the worker admits unknown sizes at a default estimate.
     #[serde(default)]
     pub transfer_report: Option<TransferTaskReportInfo>,
 }

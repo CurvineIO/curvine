@@ -214,6 +214,17 @@ message TransferTaskReportResponse {
   required bool accepted = 1;
 }
 
+// Carries only running progress reports. Terminal task state changes use
+// TransferTaskReportRequest so the Worker receives their synchronous result.
+message TransferTaskReportBatchRequest {
+  repeated TransferTaskReportRequest reports = 1;
+  optional uint32 protocol_version = 2 [default = 1];
+}
+
+message TransferTaskReportBatchResponse {
+  repeated bool accepted = 1;
+}
+
 message QueryTransferTaskRequest {
   required string job_id = 1;
   required uint64 run_id = 2;
