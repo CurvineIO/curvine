@@ -71,6 +71,24 @@ impl FsWriter {
         Self::new(fs_context, path, file_blocks, true)
     }
 
+    /// Open an existing file for positional write starting at `pos` (design §14):
+    /// the caller has opened the file (create or existing) and writes a segment
+    /// at an explicit byte offset (aligned to block boundary). Unlike `append`,
+    /// which always writes at the current end, `at` keeps `pos` as given so the
+    /// caller can `seek` to a segment offset on an already-created file.
+    pub fn at(fs_context: Arc<FsContext>, path: Path, file_blocks: FileBlocks, pos: i64) -> Self {
+        let writer = FsWriterBase::new(fs_context.clone(), path, file_blocks, pos);
+        let inner = FsWriterBuffer::new(writer, fs_context.write_chunk_num());
+        let chunk_size = fs_context.write_chunk_size();
+        Self {
+            inner,
+            buf: BytesMut::with_capacity(chunk_size),
+            chunk_size,
+            pos,
+            append: false,
+        }
+    }
+
     pub fn file_blocks(&self) -> &FileBlocks {
         self.inner.file_blocks()
     }

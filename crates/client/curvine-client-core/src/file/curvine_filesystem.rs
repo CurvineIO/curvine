@@ -155,6 +155,26 @@ impl CurvineFileSystem {
         self.open_with_opts(path, create_opts, flags).await
     }
 
+    /// Open an existing file for positional write without truncating (design §14):
+    /// WRONLY with no CREAT/TRUNC - the master reopens the file and returns its
+    /// current block layout, so the caller can `seek` to a segment offset and
+    /// write one block. Errors with FileNotFound when the file does not exist
+    /// (the creating segment task creates it first).
+    pub async fn open_existing_for_write(&self, path: &Path) -> FsResult<FsWriter> {
+        let create_opts = self.create_opts_builder().create_parent(true).build();
+        let flags = OpenFlags::new_write_only();
+        let file_block = self
+            .fs_client
+            .open_with_opts(path, create_opts, flags)
+            .await?;
+        Ok(FsWriter::at(
+            self.fs_context.clone(),
+            path.clone(),
+            file_block,
+            0,
+        ))
+    }
+
     pub async fn open_with_opts(
         &self,
         path: &Path,
