@@ -32,6 +32,8 @@ fn task(
         last_report_at: updated_at,
         stale_deadline_at: updated_at,
         updated_at,
+        accepted_at_ms: 0,
+        first_byte_at_ms: 0,
     }
 }
 

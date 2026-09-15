@@ -310,6 +310,7 @@ impl TaskManager {
 
         // The scheduler treats an accepted task as running while it waits for
         // this worker's local concurrency permit.
+        context.note_accepted();
         context.update_state(JobTaskState::Loading, "task accepted and queued");
 
         let progress_reporter = self.task_progress_reporter(&context);

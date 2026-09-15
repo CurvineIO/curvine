@@ -364,6 +364,13 @@ pub struct TransferTaskRecord {
     pub last_report_at: i64,
     pub stale_deadline_at: i64,
     pub updated_at: i64,
+    /// Worker accept time (ms, 0 = unknown). JSON-only; terminal reports
+    /// carry it for phase breakdown.
+    #[serde(default)]
+    pub accepted_at_ms: i64,
+    /// First source byte time (ms, 0 = unknown).
+    #[serde(default)]
+    pub first_byte_at_ms: i64,
 }
 
 /// Status-query projection. Task planning data stays in `TransferTaskRecord`;
@@ -623,6 +630,10 @@ pub struct TransferTaskReport {
     pub progress: TransferProgress,
     pub now_ms: i64,
     pub stale_deadline_at: i64,
+    /// Worker accept time (ms, 0 = unknown, older workers omit it).
+    pub accepted_at_ms: i64,
+    /// First source byte time (ms, 0 = unknown).
+    pub first_byte_at_ms: i64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

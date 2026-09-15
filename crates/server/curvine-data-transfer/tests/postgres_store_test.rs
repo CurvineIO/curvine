@@ -164,6 +164,8 @@ fn transfer_task(job: &TransferJobRecord) -> TransferTaskRecord {
         attempt_started_at: 0,
         last_report_at: 0,
         stale_deadline_at: 0,
+        accepted_at_ms: 0,
+        first_byte_at_ms: 0,
         updated_at: 1,
     }
 }
@@ -267,6 +269,8 @@ fn postgres_store_persists_transfer_lifecycle() {
             },
             now_ms: 4,
             stale_deadline_at: 90,
+            accepted_at_ms: 0,
+            first_byte_at_ms: 0,
         })
         .unwrap());
     assert_eq!(
@@ -308,6 +312,8 @@ fn postgres_store_persists_transfer_lifecycle() {
             },
             now_ms: 5,
             stale_deadline_at: 100,
+            accepted_at_ms: 0,
+            first_byte_at_ms: 0,
         })
         .unwrap());
 
@@ -467,6 +473,8 @@ fn postgres_store_marks_only_probed_missing_attempts() {
             },
             now_ms: 1_001,
             stale_deadline_at: 2_000,
+            accepted_at_ms: 0,
+            first_byte_at_ms: 0,
         })
         .unwrap());
     assert!(store
@@ -818,6 +826,8 @@ fn postgres_store_does_not_backfill_historical_task_projections() {
             },
             now_ms: 30,
             stale_deadline_at: 80,
+            accepted_at_ms: 0,
+            first_byte_at_ms: 0,
         })
         .unwrap());
     assert!(!store
@@ -832,6 +842,8 @@ fn postgres_store_does_not_backfill_historical_task_projections() {
             progress: TransferProgress::default(),
             now_ms: 31,
             stale_deadline_at: 70,
+            accepted_at_ms: 0,
+            first_byte_at_ms: 0,
         })
         .unwrap());
 

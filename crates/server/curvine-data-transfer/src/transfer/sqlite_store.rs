@@ -1810,6 +1810,9 @@ fn sqlite_task_row(row: &Row<'_>) -> rusqlite::Result<TransferTaskRecord> {
         last_report_at: row.get(14)?,
         stale_deadline_at: row.get(15)?,
         updated_at: row.get(16)?,
+        // Columnar tasks table carries no phase markers; observability skips them.
+        accepted_at_ms: 0,
+        first_byte_at_ms: 0,
     })
 }
 

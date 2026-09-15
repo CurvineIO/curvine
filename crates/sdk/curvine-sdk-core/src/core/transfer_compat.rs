@@ -157,6 +157,8 @@ pub(crate) fn job_status_from_transfer(status: GetTransferStatusResponse) -> Job
             total_size: status.progress.total_size,
             update_time: status.progress.update_time,
             message: status.progress.message,
+            accepted_at_ms: 0,
+            first_byte_at_ms: 0,
         },
         total_files: counts.total_files,
         completed_files: counts.completed_files,

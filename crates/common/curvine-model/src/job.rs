@@ -339,6 +339,13 @@ pub struct JobTaskProgress {
     pub total_size: i64,
     pub update_time: i64,
     pub message: String,
+    /// Worker accept time (ms since epoch, 0 = unknown). Terminal reports
+    /// carry it for queue/start/transfer phase breakdown.
+    #[serde(default)]
+    pub accepted_at_ms: i64,
+    /// First source byte time (ms since epoch, 0 = unknown).
+    #[serde(default)]
+    pub first_byte_at_ms: i64,
 }
 
 impl Default for JobTaskProgress {
@@ -349,6 +356,8 @@ impl Default for JobTaskProgress {
             loaded_size: 0,
             update_time: 0,
             message: String::new(),
+            accepted_at_ms: 0,
+            first_byte_at_ms: 0,
         }
     }
 }

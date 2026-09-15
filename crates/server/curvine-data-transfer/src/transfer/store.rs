@@ -69,6 +69,17 @@ pub trait TransferStore: Send + Sync + 'static {
 
     fn list_transfer_tasks(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>>;
 
+    /// Attempt start time for phase breakdown. Backends override with a
+    /// narrow point query; default is unknown (phase metrics skip it).
+    fn get_task_attempt_started_at(
+        &self,
+        _job_id: &str,
+        _run_id: u64,
+        _task_id: &str,
+    ) -> FsResult<Option<i64>> {
+        Ok(None)
+    }
+
     /// Return progress/counts without requiring the caller to deserialize task definitions.
     fn get_transfer_task_summary(
         &self,

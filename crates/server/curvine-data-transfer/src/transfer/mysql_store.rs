@@ -1129,6 +1129,24 @@ impl TransferStore for MysqlTransferStore {
         Ok(updated)
     }
 
+    fn get_task_attempt_started_at(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        task_id: &str,
+    ) -> FsResult<Option<i64>> {
+        self.conn()?
+            .exec_first::<i64, _, _>(
+                "select attempt_started_at from transfer_tasks where job_id = :job_id and run_id = :run_id and task_id = :task_id",
+                params! {
+                    "job_id" => job_id,
+                    "run_id" => run_id,
+                    "task_id" => task_id,
+                },
+            )
+            .map_err(mysql_err)
+    }
+
     fn update_task_report(&self, report: TransferTaskReport) -> FsResult<bool> {
         let mut conn = self.conn()?;
         let sql = "update transfer_tasks
@@ -1152,7 +1170,9 @@ impl TransferStore for MysqlTransferStore {
                      '$.progress.message', :progress_message,
                      '$.last_report_at', :last_report_at,
                      '$.stale_deadline_at', :stale_deadline_at,
-                     '$.updated_at', :updated_at),
+                     '$.updated_at', :updated_at,
+                     '$.accepted_at_ms', :accepted_at_ms,
+                     '$.first_byte_at_ms', :first_byte_at_ms),
                  updated_at = :updated_at
              where job_id = :job_id and run_id = :run_id and task_id = :task_id
                and attempt_id = :attempt_id and worker_id = :worker_id
@@ -1169,6 +1189,8 @@ impl TransferStore for MysqlTransferStore {
                 "last_report_at" => report.now_ms,
                 "stale_deadline_at" => report.stale_deadline_at,
                 "updated_at" => report.now_ms,
+                "accepted_at_ms" => report.accepted_at_ms,
+                "first_byte_at_ms" => report.first_byte_at_ms,
                 "job_id" => &report.job_id,
                 "run_id" => report.run_id,
                 "task_id" => &report.task_id,

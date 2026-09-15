@@ -1249,6 +1249,8 @@ where
             },
             now_ms: now,
             stale_deadline_at: now.saturating_add(duration_ms(self.conf.task_stale_timeout)),
+            accepted_at_ms: 0,
+            first_byte_at_ms: 0,
         })
     }
 
@@ -1275,6 +1277,8 @@ where
             progress,
             now_ms: now,
             stale_deadline_at: now.saturating_add(duration_ms(self.conf.task_stale_timeout)),
+            accepted_at_ms: 0,
+            first_byte_at_ms: 0,
         })?;
         if deferred {
             debug!(

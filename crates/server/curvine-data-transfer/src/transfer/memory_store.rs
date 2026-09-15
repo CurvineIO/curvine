@@ -1020,6 +1020,8 @@ mod tests {
             last_report_at: 0,
             stale_deadline_at: 0,
             updated_at: 1,
+            accepted_at_ms: 0,
+            first_byte_at_ms: 0,
         }
     }
 
@@ -1132,6 +1134,8 @@ mod tests {
                 },
                 now_ms: 5,
                 stale_deadline_at: 2_000,
+                accepted_at_ms: 0,
+                first_byte_at_ms: 0,
             })
             .unwrap());
         assert!(store
@@ -1151,6 +1155,8 @@ mod tests {
                 },
                 now_ms: 6,
                 stale_deadline_at: 3_000,
+                accepted_at_ms: 0,
+                first_byte_at_ms: 0,
             })
             .unwrap());
 
@@ -1212,6 +1218,8 @@ mod tests {
                 },
                 now_ms: 7,
                 stale_deadline_at: 4_000,
+                accepted_at_ms: 0,
+                first_byte_at_ms: 0,
             })
             .unwrap());
         assert_eq!(

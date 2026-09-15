@@ -87,6 +87,8 @@ fn running_store_for<S: TransferStore>(store: Arc<S>) -> (Arc<S>, TransferJobRec
         attempt_started_at: 0,
         last_report_at: 0,
         stale_deadline_at: 0,
+        accepted_at_ms: 0,
+        first_byte_at_ms: 0,
         updated_at: 1,
     };
     assert!(store
@@ -140,6 +142,8 @@ fn progress_report(
             message: task_id.to_string(),
         },
         protocol_version: Some(1),
+        accepted_at_ms: None,
+        first_byte_at_ms: None,
     }
 }
 
@@ -316,6 +320,8 @@ fn assert_status_uses_task_summary_and_store_pagination<S: TransferStore>(
                 },
                 now_ms: 10,
                 stale_deadline_at: 1_000,
+                accepted_at_ms: 0,
+                first_byte_at_ms: 0,
             })
             .unwrap());
     }
@@ -414,6 +420,8 @@ fn assert_stale_marking_does_not_overwrite_fresh_report<S: TransferStore>(
             },
             now_ms: 1_001,
             stale_deadline_at: 2_000,
+            accepted_at_ms: 0,
+            first_byte_at_ms: 0,
         })
         .unwrap());
 

@@ -339,6 +339,7 @@ impl LoadTaskRunner {
             if chunk.is_empty() {
                 break;
             }
+            self.task.note_first_byte();
 
             let write_spend = TimeSpent::new();
             stream.writer.async_write(chunk).await?;
@@ -702,6 +703,7 @@ impl LoadTaskRunner {
             if chunk.is_empty() {
                 break;
             }
+            self.task.note_first_byte();
             let chunk_len = chunk.len() as i64;
             writer.write(chunk).await?;
             remaining -= chunk_len;
@@ -1303,6 +1305,7 @@ impl LoadTaskRunner {
                     if chunk.is_empty() {
                         break;
                     }
+                    task.note_first_byte();
                     remaining -= chunk.len() as i64;
                     writer.async_write(chunk).await?;
                 }

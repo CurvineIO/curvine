@@ -208,6 +208,11 @@ message TransferTaskReportRequest {
   required TransferTaskStateProto state = 7;
   required TransferProgressProto progress = 8;
   optional uint32 protocol_version = 9 [default = 1];
+  // Worker-side phase markers (ms since epoch, 0 = unknown): task accept
+  // time and first source byte time. Used for queue/start/transfer phase
+  // breakdown; old workers omit them.
+  optional int64 accepted_at_ms = 10;
+  optional int64 first_byte_at_ms = 11;
 }
 
 message TransferTaskReportResponse {

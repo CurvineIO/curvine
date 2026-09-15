@@ -610,6 +610,8 @@ fn late_task_report_does_not_change_terminal_job_state() -> CommonResult<()> {
             total_size: 1,
             update_time: 1,
             message: "late completed report".to_string(),
+            accepted_at_ms: 0,
+            first_byte_at_ms: 0,
         },
     )?;
 
@@ -649,6 +651,8 @@ fn stale_task_report_for_running_job_is_ignored() -> CommonResult<()> {
             total_size: 1,
             update_time: 1,
             message: "stale completed report".to_string(),
+            accepted_at_ms: 0,
+            first_byte_at_ms: 0,
         },
     )?;
 

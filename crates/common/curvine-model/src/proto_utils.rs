@@ -765,6 +765,8 @@ impl ProtoUtils {
             update_time: report.update_time,
             state: JobTaskState::from(report.state as i8),
             message: report.message,
+            accepted_at_ms: 0,
+            first_byte_at_ms: 0,
         }
     }
 

@@ -451,6 +451,7 @@ where
             return dispatcher.report_task(req, state);
         }
         let now_ms = now_ms();
+        let (job_id, run_id, task_id) = (req.job_id.clone(), req.run_id, req.task_id.clone());
         let report = TransferTaskReport {
             job_id: req.job_id.clone(),
             run_id: req.run_id,
@@ -459,11 +460,24 @@ where
             worker_id: req.worker_id,
             worker_session_id: req.worker_session_id,
             state,
-            progress: progress_from_proto(req.progress),
+            progress: progress_from_proto(req.progress.clone()),
             now_ms,
             stale_deadline_at: now_ms.saturating_add(self.task_stale_timeout_ms),
+            accepted_at_ms: req.accepted_at_ms.unwrap_or(0),
+            first_byte_at_ms: req.first_byte_at_ms.unwrap_or(0),
         };
         let accepted = self.store.update_task_report(report)?;
+        if accepted && state.is_terminal() {
+            let terminal_ms = req.progress.update_time;
+            self.observe_task_phases(
+                &job_id,
+                run_id,
+                &task_id,
+                req.accepted_at_ms.unwrap_or(0),
+                req.first_byte_at_ms.unwrap_or(0),
+                terminal_ms,
+            );
+        }
         if accepted {
             // Sync path has no background flusher; keep job.summary up to date.
             // Flush failure must not fail the accepted task persist (retry would be rejected).
@@ -480,6 +494,37 @@ where
             }
         }
         Ok(accepted)
+    }
+
+    /// Record queue/start/transfer phase latencies for a terminal report.
+    /// Skips silently when the worker omitted markers (old version) or the
+    /// task row is gone; observability must never fail task persist.
+    fn observe_task_phases(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        task_id: &str,
+        accepted_at_ms: i64,
+        first_byte_at_ms: i64,
+        terminal_ms: i64,
+    ) {
+        if accepted_at_ms <= 0 || first_byte_at_ms <= 0 {
+            return;
+        }
+        let Ok(Some(started)) = self
+            .store
+            .get_task_attempt_started_at(job_id, run_id, task_id)
+        else {
+            return;
+        };
+        if let Ok(metrics) = TransferMetrics::get() {
+            metrics.observe_task_phase("dispatch_wait", accepted_at_ms.saturating_sub(started));
+            metrics.observe_task_phase(
+                "start_wait",
+                first_byte_at_ms.saturating_sub(accepted_at_ms),
+            );
+            metrics.observe_task_phase("transfer", terminal_ms.saturating_sub(first_byte_at_ms));
+        }
     }
 }
 
@@ -729,6 +774,8 @@ where
             progress: progress_from_proto(envelope.req.progress),
             now_ms,
             stale_deadline_at: now_ms.saturating_add(task_stale_timeout_ms),
+            accepted_at_ms: 0,
+            first_byte_at_ms: 0,
         };
         let result = store.update_task_report(report);
         if matches!(&result, Ok(true)) {

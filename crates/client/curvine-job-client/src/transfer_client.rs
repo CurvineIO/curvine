@@ -274,6 +274,8 @@ fn task_report_request(report: TransferTaskProgressReport) -> TransferTaskReport
             update_time: report.progress.update_time,
             message: report.progress.message,
         },
+        accepted_at_ms: Some(report.progress.accepted_at_ms),
+        first_byte_at_ms: Some(report.progress.first_byte_at_ms),
         protocol_version: Some(TRANSFER_PROTOCOL_VERSION),
     }
 }

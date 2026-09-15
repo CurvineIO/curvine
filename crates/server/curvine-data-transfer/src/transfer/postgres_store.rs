@@ -1874,6 +1874,24 @@ impl TransferStore for PostgresTransferStore {
         })
     }
 
+    fn get_task_attempt_started_at(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        task_id: &str,
+    ) -> FsResult<Option<i64>> {
+        let run_id = db_u64(run_id)?;
+        let row: Option<i64> = self
+            .conn()?
+            .query_opt(
+                "select attempt_started_at from transfer_tasks where job_id = $1 and run_id = $2 and task_id = $3",
+                &[&job_id, &run_id, &task_id],
+            )
+            .map_err(postgres_err)?
+            .map(|row| row.get(0));
+        Ok(row)
+    }
+
     fn update_task_report(&self, report: TransferTaskReport) -> FsResult<bool> {
         let run_id = db_u64(report.run_id)?;
         let attempt_id = db_u64(report.attempt_id)?;
@@ -1888,7 +1906,8 @@ impl TransferStore for PostgresTransferStore {
                                     jsonb_set(
                                         jsonb_set(
                                             jsonb_set(
-                                                jsonb_set(record_json::jsonb, '{state}', to_jsonb(case $1::integer
+                                                jsonb_set(
+                                                    jsonb_set(record_json::jsonb, '{state}', to_jsonb(case $1::integer
                                                     when 1 then 'Pending'::text
                                                     when 2 then 'Running'::text
                                                     when 3 then 'Completed'::text
@@ -1903,7 +1922,9 @@ impl TransferStore for PostgresTransferStore {
                                     '{progress,message}', to_jsonb($5::text)),
                                 '{last_report_at}', to_jsonb($6::bigint)),
                             '{stale_deadline_at}', to_jsonb($7::bigint)),
-                        '{updated_at}', to_jsonb($8::bigint))::text,
+                        '{updated_at}', to_jsonb($8::bigint)),
+                    '{accepted_at_ms}', to_jsonb($15::bigint)),
+                '{first_byte_at_ms}', to_jsonb($16::bigint))::text,
                  updated_at = $8
              where job_id = $9 and run_id = $10 and task_id = $11 and attempt_id = $12
                and worker_id = $13 and worker_session_id = $14 and state in (1, 2)";
@@ -1925,6 +1946,8 @@ impl TransferStore for PostgresTransferStore {
                     &attempt_id,
                     &i64::from(report.worker_id),
                     &report.worker_session_id,
+                    &report.accepted_at_ms,
+                    &report.first_byte_at_ms,
                 ],
             )
             .map(|affected| affected > 0)

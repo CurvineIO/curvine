@@ -34,6 +34,7 @@ pub struct TransferMetrics {
     job_summary_dirty_len: Gauge,
     job_summary_flush_total: CounterVec,
     job_summary_flush_duration_us: HistogramVec,
+    task_phase_duration_ms: HistogramVec,
     active_jobs: Gauge,
     executing_jobs: Gauge,
     pending_jobs: Gauge,
@@ -136,6 +137,16 @@ impl TransferMetrics {
                     100_000.0,
                     500_000.0,
                     1_000_000.0,
+                ],
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            task_phase_duration_ms: m::new_histogram_vec_with_buckets(
+                "transfer_task_phase_duration_ms",
+                "Transfer task lifecycle phase latency in milliseconds (dispatch_wait/scheduling delay, start_wait/worker local queue, transfer/copy)",
+                &["phase"],
+                &[
+                    10.0, 50.0, 100.0, 500.0, 1_000.0, 5_000.0, 10_000.0, 30_000.0,
+                    60_000.0, 300_000.0,
                 ],
             )
             .map_err(|err| FsError::common(err.to_string()))?,
@@ -418,6 +429,14 @@ impl TransferMetrics {
         self.job_summary_flush_duration_us
             .with_label_values(&[result])
             .observe(elapsed_us as f64);
+    }
+
+    pub fn observe_task_phase(&self, phase: &str, elapsed_ms: i64) {
+        if elapsed_ms >= 0 {
+            self.task_phase_duration_ms
+                .with_label_values(&[phase])
+                .observe(elapsed_ms as f64);
+        }
     }
 
     pub fn set_job_counts(&self, active: u64, executing: u64) {

@@ -42,6 +42,8 @@ fn progress_report(task_id: &str, loaded_size: i64) -> ProgressReport {
                 total_size: 100,
                 update_time: loaded_size,
                 message: String::new(),
+                accepted_at_ms: 0,
+                first_byte_at_ms: 0,
             },
         },
         log_context: task_id.to_string(),

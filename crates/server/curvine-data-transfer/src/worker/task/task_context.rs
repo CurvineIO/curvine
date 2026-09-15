@@ -64,6 +64,8 @@ impl TaskContext {
             loaded_size: lock.loaded_size,
             update_time: lock.update_time,
             message: lock.message.clone(),
+            accepted_at_ms: lock.accepted_at_ms,
+            first_byte_at_ms: lock.first_byte_at_ms,
         }
     }
 
@@ -76,6 +78,8 @@ impl TaskContext {
                 loaded_size: lock.loaded_size,
                 update_time: lock.update_time,
                 message: lock.message.clone(),
+                accepted_at_ms: lock.accepted_at_ms,
+                first_byte_at_ms: lock.first_byte_at_ms,
             };
         }
 
@@ -89,6 +93,8 @@ impl TaskContext {
             loaded_size: lock.loaded_size,
             update_time: lock.update_time,
             message: lock.message.clone(),
+            accepted_at_ms: lock.accepted_at_ms,
+            first_byte_at_ms: lock.first_byte_at_ms,
         }
     }
 
@@ -105,6 +111,8 @@ impl TaskContext {
             loaded_size: lock.loaded_size,
             update_time: lock.update_time,
             message: lock.message.clone(),
+            accepted_at_ms: lock.accepted_at_ms,
+            first_byte_at_ms: lock.first_byte_at_ms,
         }
     }
 
@@ -128,6 +136,8 @@ impl TaskContext {
             loaded_size: lock.loaded_size,
             update_time: lock.update_time,
             message: lock.message.clone(),
+            accepted_at_ms: lock.accepted_at_ms,
+            first_byte_at_ms: lock.first_byte_at_ms,
         }
     }
 
@@ -167,6 +177,23 @@ impl TaskContext {
         )
     }
 
+    /// Stamp task accept time once (phase breakdown needs it even when the
+    /// task waits for the local concurrency permit afterwards).
+    pub fn note_accepted(&self) {
+        let mut lock = self.progress_lock();
+        if lock.accepted_at_ms == 0 {
+            lock.accepted_at_ms = LocalTime::mills() as i64;
+        }
+    }
+
+    /// Stamp first source byte time once.
+    pub fn note_first_byte(&self) {
+        let mut lock = self.progress_lock();
+        if lock.first_byte_at_ms == 0 {
+            lock.first_byte_at_ms = LocalTime::mills() as i64;
+        }
+    }
+
     pub fn update_state(&self, state: JobTaskState, message: impl Into<String>) {
         let mut lock = self.progress_lock();
         if self.is_cancel() && state != JobTaskState::Canceled {
@@ -191,6 +218,8 @@ impl TaskContext {
                 loaded_size: lock.loaded_size,
                 update_time: lock.update_time,
                 message: lock.message.clone(),
+                accepted_at_ms: lock.accepted_at_ms,
+                first_byte_at_ms: lock.first_byte_at_ms,
             };
         }
 
@@ -209,6 +238,8 @@ impl TaskContext {
             loaded_size: lock.loaded_size,
             update_time: lock.update_time,
             message: lock.message.clone(),
+            accepted_at_ms: lock.accepted_at_ms,
+            first_byte_at_ms: lock.first_byte_at_ms,
         }
     }
 }

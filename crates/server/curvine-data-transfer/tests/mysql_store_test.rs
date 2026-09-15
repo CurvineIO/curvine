@@ -56,6 +56,8 @@ fn legacy_task() -> TransferTaskRecord {
         estimated_size: 0,
         retry_count: 0,
         attempt_started_at: 9,
+        accepted_at_ms: 0,
+        first_byte_at_ms: 0,
         last_report_at: 10,
         stale_deadline_at: 100,
         updated_at: 10,
