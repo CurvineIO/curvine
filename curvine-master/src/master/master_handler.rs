@@ -215,7 +215,9 @@ impl MasterHandler {
         let header: GetFileStatusRequest = ctx.parse_header()?;
         ctx.set_audit(Some(header.path.to_string()), None);
 
-        let status = self.fs.file_status(header.path.as_str())?;
+        let status = self
+            .fs
+            .file_status_by_id(header.path.as_str(), header.inode_id)?;
         let rep_header = GetFileStatusResponse {
             status: ProtoUtils::file_status_to_pb(status),
         };

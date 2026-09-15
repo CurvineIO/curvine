@@ -13,8 +13,7 @@
 // limitations under the License.
 
 use crate::master::fs::MasterFilesystem;
-use crate::master::meta::inode::{Inode, InodeView, ROOT_INODE_ID};
-use crate::master::meta::FsDir;
+use crate::master::meta::inode::InodeView;
 use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_model::TtlAction;
@@ -45,61 +44,9 @@ impl InodeTtlExecutor {
     }
 
     fn get_inode_path(&self, inode_id: i64) -> FsResult<String> {
-        let path = self.resolve_inode_path(inode_id)?;
-        Ok(path)
-    }
-
-    fn resolve_inode_path(&self, inode_id: i64) -> FsResult<String> {
         let fs_dir = self.filesystem.fs_dir();
         let fs_dir_guard = fs_dir.read();
-        Self::build_path_from_store(&fs_dir_guard, inode_id)
-    }
-
-    fn build_path_from_store(fs_dir: &FsDir, inode_id: i64) -> FsResult<String> {
-        if inode_id == ROOT_INODE_ID {
-            return Ok("/".to_string());
-        }
-
-        let mut current_id = inode_id;
-        let mut components = Vec::new();
-        let mut visited = Vec::new();
-
-        while current_id != ROOT_INODE_ID {
-            if visited.contains(&current_id) {
-                return err_box!("Cycle detected while resolving inode path {}", inode_id);
-            }
-            visited.push(current_id);
-
-            let inode_view = match fs_dir.store.get_inode(current_id, None)? {
-                Some(inode_view) => inode_view,
-                None => {
-                    return err_box!(
-                        "Cannot resolve path for inode {} (missing ancestor {})",
-                        inode_id,
-                        current_id
-                    );
-                }
-            };
-
-            match &inode_view {
-                InodeView::File(f) => {
-                    components.push(f.name.clone());
-                    current_id = f.parent_id();
-                }
-                InodeView::Dir(d) => {
-                    components.push(d.name.clone());
-                    current_id = d.parent_id();
-                }
-                InodeView::FileEntry(e) => {
-                    // FileEntry does not carry parent_id, so preserve the previous fallback.
-                    components.push(e.name.clone());
-                    break;
-                }
-            }
-        }
-
-        components.reverse();
-        Ok(format!("/{}", components.join("/")))
+        fs_dir_guard.get_inode_path(inode_id)
     }
 
     pub fn get_inode_from_store(&self, inode_id: i64) -> FsResult<Option<InodeView>> {

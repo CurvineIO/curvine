@@ -116,7 +116,7 @@ impl JournalLoader {
         journal_writer: Arc<JournalWriter>,
         testing: bool,
     ) -> CommonResult<Self> {
-        let ufs_loader = UfsLoader::new(job_manager, conf);
+        let ufs_loader = UfsLoader::new(job_manager, fs_dir.clone(), conf);
         let (sender, receiver) = AsyncChannel::new(conf.writer_channel_size).split();
         let loader = Self {
             node_id: conf.node_id()?,

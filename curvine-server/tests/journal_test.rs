@@ -589,7 +589,11 @@ fn test_ufs_loader_mkdir_recreates_missing_ufs_parent() -> CommonResult<()> {
 
     assert!(!ufs_dir.join("db/table").exists());
 
-    let loader = UfsLoader::new(journal_system.job_manager(), &conf.journal);
+    let loader = UfsLoader::new(
+        journal_system.job_manager(),
+        journal_system.fs().fs_dir.clone(),
+        &conf.journal,
+    );
     let rt = AsyncRuntime::single();
     rt.block_on(async { loader.mkdir(&mkdir_entry).await })?;
 

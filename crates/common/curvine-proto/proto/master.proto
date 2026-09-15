@@ -111,6 +111,7 @@ message FreeResponse {
 
 message GetFileStatusRequest {
     required string path = 1;
+    optional int64 inode_id = 2;
     optional ClientContextProto client_context = 100;
 }
 
