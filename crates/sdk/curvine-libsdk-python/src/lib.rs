@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// PyO3 extension monomorphizes LibFilesystem methods (deep UnifiedFileSystem futures).
+#![recursion_limit = "512"]
+
 pub use curvine_sdk_core::{LibFilesystem, LibFsReader, LibFsWriter};
 
 pub mod python;

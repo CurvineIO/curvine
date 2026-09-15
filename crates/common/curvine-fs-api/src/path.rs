@@ -154,7 +154,7 @@ impl Path {
                 scheme,
                 Self::SCHEME_DELIMITER,
                 authority,
-                &self.path
+                self.path
             ))
         }
     }
