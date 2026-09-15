@@ -288,21 +288,37 @@ impl TransferStore for TransferStoreBackend {
         prefer_pending: bool,
     ) -> FsResult<Option<TransferLease>> {
         self.record_store_operation("acquire_runnable_transfer", || match self {
-            Self::Memory(store) => {
-                store.acquire_runnable_transfer(owner, lease_ms, now_ms, max_executing_transfers, prefer_pending)
-            }
+            Self::Memory(store) => store.acquire_runnable_transfer(
+                owner,
+                lease_ms,
+                now_ms,
+                max_executing_transfers,
+                prefer_pending,
+            ),
             #[cfg(feature = "transfer-store-sqlite")]
-            Self::Sqlite(store) => {
-                store.acquire_runnable_transfer(owner, lease_ms, now_ms, max_executing_transfers, prefer_pending)
-            }
+            Self::Sqlite(store) => store.acquire_runnable_transfer(
+                owner,
+                lease_ms,
+                now_ms,
+                max_executing_transfers,
+                prefer_pending,
+            ),
             #[cfg(feature = "transfer-store-mysql")]
-            Self::Mysql(store) => {
-                store.acquire_runnable_transfer(owner, lease_ms, now_ms, max_executing_transfers, prefer_pending)
-            }
+            Self::Mysql(store) => store.acquire_runnable_transfer(
+                owner,
+                lease_ms,
+                now_ms,
+                max_executing_transfers,
+                prefer_pending,
+            ),
             #[cfg(feature = "transfer-store-postgres")]
-            Self::Postgres(store) => {
-                store.acquire_runnable_transfer(owner, lease_ms, now_ms, max_executing_transfers, prefer_pending)
-            }
+            Self::Postgres(store) => store.acquire_runnable_transfer(
+                owner,
+                lease_ms,
+                now_ms,
+                max_executing_transfers,
+                prefer_pending,
+            ),
         })
     }
 

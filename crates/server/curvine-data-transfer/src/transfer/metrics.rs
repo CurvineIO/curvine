@@ -14,7 +14,8 @@
 
 use curvine_error::FsError;
 use curvine_error::FsResult;
-use curvine_model::TransferTaskCounts;use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics as m};
+use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics as m};
+use curvine_model::TransferTaskCounts;
 use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};

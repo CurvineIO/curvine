@@ -322,11 +322,13 @@ impl TransferStore for MysqlTransferStore {
 
     fn count_tasks_global(&self) -> FsResult<TransferTaskCounts> {
         let mut counts = TransferTaskCounts::default();
-        for row in self.conn()?.exec::<(i32, u64), _, _>(
-            "select state, count(*) from transfer_tasks group by state",
-            Params::Empty,
-        )
-        .map_err(mysql_err)?
+        for row in self
+            .conn()?
+            .exec::<(i32, u64), _, _>(
+                "select state, count(*) from transfer_tasks group by state",
+                Params::Empty,
+            )
+            .map_err(mysql_err)?
         {
             match TransferTaskState::from(row.0) {
                 TransferTaskState::Pending => counts.pending += row.1,

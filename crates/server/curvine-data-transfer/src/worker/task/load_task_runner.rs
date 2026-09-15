@@ -604,7 +604,8 @@ impl LoadTaskRunner {
 
         // Ensure the target exists with the full block layout (first segment
         // creates and pre-allocates; concurrent segments reuse it).
-        self.ensure_segment_target(&target_path, plan.total_len).await?;
+        self.ensure_segment_target(&target_path, plan.total_len)
+            .await?;
 
         // Locate this segment's block in the target layout.
         let blocks = self.fs.get_block_locations(&target_path).await?;
@@ -730,7 +731,9 @@ impl LoadTaskRunner {
                     match self.fs.create_with_opts(target_path, opts, false).await {
                         Ok(mut writer) => {
                             if total_len > 0 {
-                                writer.resize(FileAllocOpts::with_truncate(total_len)).await?;
+                                writer
+                                    .resize(FileAllocOpts::with_truncate(total_len))
+                                    .await?;
                             }
                             writer.flush().await?;
                             Ok(())

@@ -15,9 +15,9 @@
 use curvine_error::{FsError, FsResult};
 use curvine_model::{
     summarize_transfer_tasks, StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease,
-    TransferListFilter, TransferProgress, TransferState, TransferStateUpdate, TransferTaskRecord,
-    TransferTaskCounts, TransferTaskReport, TransferTaskState, TransferTaskStatus, TransferTaskSummary,
-    TransferTenantSummary, WorkerInflight,
+    TransferListFilter, TransferProgress, TransferState, TransferStateUpdate, TransferTaskCounts,
+    TransferTaskRecord, TransferTaskReport, TransferTaskState, TransferTaskStatus,
+    TransferTaskSummary, TransferTenantSummary, WorkerInflight,
 };
 use native_tls::{Certificate, TlsConnector};
 use percent_encoding::percent_decode_str;
@@ -1317,7 +1317,10 @@ impl TransferStore for PostgresTransferStore {
         let mut conn = self.conn()?;
         let mut counts = TransferTaskCounts::default();
         let rows = conn
-            .query("select state, count(*) from transfer_tasks group by state", &[])
+            .query(
+                "select state, count(*) from transfer_tasks group by state",
+                &[],
+            )
             .map_err(postgres_err)?;
         for row in rows {
             let state: i32 = row.get(0);
@@ -1632,9 +1635,9 @@ impl TransferStore for PostgresTransferStore {
                 return Ok(false);
             }
             task.state = update.state;
-        if update.bump_retry {
-            task.retry_count = task.retry_count.saturating_add(1);
-        }
+            if update.bump_retry {
+                task.retry_count = task.retry_count.saturating_add(1);
+            }
             task.progress.message = update.message;
             task.progress.update_time = update.now_ms;
             task.updated_at = update.now_ms;

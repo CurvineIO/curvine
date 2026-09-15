@@ -856,11 +856,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
             {
                 Ok(true)
             }
-            Err(e) => Err(opendal_error(
-                "Failed to create directory",
-                &object_path,
-                e,
-            )),
+            Err(e) => Err(opendal_error("Failed to create directory", &object_path, e)),
         }
     }
 
