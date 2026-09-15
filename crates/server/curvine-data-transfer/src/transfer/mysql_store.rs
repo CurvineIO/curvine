@@ -320,6 +320,27 @@ impl TransferStore for MysqlTransferStore {
         )
     }
 
+    fn count_tasks_global(&self) -> FsResult<TransferTaskCounts> {
+        let mut counts = TransferTaskCounts::default();
+        for row in self.conn()?.exec::<(i32, u64), _, _>(
+            "select state, count(*) from transfer_tasks group by state",
+            Params::Empty,
+        )
+        .map_err(mysql_err)?
+        {
+            match TransferTaskState::from(row.0) {
+                TransferTaskState::Pending => counts.pending += row.1,
+                TransferTaskState::Running => counts.running += row.1,
+                TransferTaskState::Completed => counts.completed += row.1,
+                TransferTaskState::Failed => counts.failed += row.1,
+                TransferTaskState::Canceled => counts.canceled += row.1,
+                TransferTaskState::Stale => counts.stale += row.1,
+                _ => {}
+            }
+        }
+        Ok(counts)
+    }
+
     fn get_transfer_task_summary(
         &self,
         job_id: &str,

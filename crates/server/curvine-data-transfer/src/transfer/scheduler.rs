@@ -180,6 +180,7 @@ use crate::transfer::{ClusterMetadataCache, TransferMetrics};
 
 const TRANSFER_CLEANUP_INTERVAL_MS: u64 = 60_000;
 const TRANSFER_METRICS_INTERVAL_MS: u64 = 10_000;
+const TRANSFER_TASK_COUNTS_INTERVAL_MS: u64 = 60_000;
 const SCHEDULER_ACTIVE_INTERVAL: Duration = Duration::from_millis(200);
 const SCHEDULER_IDLE_INTERVAL: Duration = Duration::from_secs(1);
 const SCHEDULER_MIN_IDLE_INTERVAL: Duration = Duration::from_millis(1);
@@ -199,6 +200,7 @@ pub struct TransferScheduler<S> {
     worker_cursor: Arc<AtomicUsize>,
     last_cleanup_ms: Arc<AtomicU64>,
     last_metrics_ms: Arc<AtomicU64>,
+    last_task_counts_ms: Arc<AtomicU64>,
     inflight: Arc<InflightLedger>,
 }
 
@@ -216,6 +218,7 @@ impl<S> Clone for TransferScheduler<S> {
             worker_cursor: self.worker_cursor.clone(),
             last_cleanup_ms: self.last_cleanup_ms.clone(),
             last_metrics_ms: self.last_metrics_ms.clone(),
+            last_task_counts_ms: self.last_task_counts_ms.clone(),
             inflight: self.inflight.clone(),
         }
     }
@@ -250,6 +253,7 @@ where
             worker_cursor: Arc::new(AtomicUsize::new(0)),
             last_cleanup_ms: Arc::new(AtomicU64::new(0)),
             last_metrics_ms: Arc::new(AtomicU64::new(0)),
+            last_task_counts_ms: Arc::new(AtomicU64::new(0)),
             inflight: Arc::new(InflightLedger::new(inflight_ttl)),
         }
     }
@@ -358,6 +362,29 @@ where
             }
         };
         self.record_job_counts(active, executing);
+        // Global task-state counts are a full-range GROUP BY on transfer_tasks,
+        // so throttle them well below the job-count poll (60s). Observability
+        // only; failures must not perturb the scheduling path.
+        let now = now_ms.max(0) as u64;
+        let last_tasks = self.last_task_counts_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last_tasks) >= TRANSFER_TASK_COUNTS_INTERVAL_MS
+            && self
+                .last_task_counts_ms
+                .compare_exchange(last_tasks, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            match self.store.count_tasks_global() {
+                Ok(counts) => {
+                    if let Ok(metrics) = TransferMetrics::get() {
+                        metrics.set_task_counts(&counts);
+                    }
+                }
+                Err(err) => {
+                    self.last_task_counts_ms.store(0, Ordering::Relaxed);
+                    warn!("count_tasks_global failed: {}", err);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -775,12 +802,19 @@ where
         let mount = job_mount_snapshot_async(job, &self.cache).await?;
         let job_info = self.planner_job_info(job, &mount)?;
         let limit = self.conf.worker_dispatch_concurrency();
+        // Count tasks that could not be placed this round because no worker had
+        // capacity (choose_worker returned None). They stay Pending in store and
+        // are retried next round; this counter makes the backpressure visible.
+        let mut blocked_no_worker = 0usize;
 
         let started = stream::iter(tasks.into_iter().filter_map(|task| {
             let estimated_bytes = self.task_estimated_bytes(&task);
             // No worker has room (design §4.2): drop the task from this batch
             // (stays Pending in store) so remaining tasks still get placed.
-            let worker = self.choose_worker(&workers, estimated_bytes)?;
+            let Some(worker) = self.choose_worker(&workers, estimated_bytes) else {
+                blocked_no_worker += 1;
+                return None;
+            };
             let store = self.store.clone();
             let factory = self.factory.clone();
             let cache = self.cache.clone();
@@ -808,6 +842,11 @@ where
         .buffer_unordered(limit)
         .try_collect::<Vec<_>>()
         .await?;
+        if blocked_no_worker > 0 {
+            record_metric(|metrics| {
+                metrics.inc_dispatch("blocked_no_worker", blocked_no_worker);
+            });
+        }
         Ok(started.into_iter().filter(|value| *value).count())
     }
 

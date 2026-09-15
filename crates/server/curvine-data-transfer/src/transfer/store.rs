@@ -15,9 +15,9 @@
 use curvine_error::FsResult;
 use curvine_model::{
     summarize_transfer_tasks, StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease,
-    TransferListFilter, TransferProgress, TransferStateUpdate, TransferTaskRecord,
-    TransferTaskReport, TransferTaskState, TransferTaskStatus, TransferTaskSummary,
-    TransferTenantSummary, WorkerInflight,
+    TransferListFilter, TransferProgress, TransferStateUpdate, TransferTaskCounts,
+    TransferTaskRecord, TransferTaskReport, TransferTaskState, TransferTaskStatus,
+    TransferTaskSummary, TransferTenantSummary, WorkerInflight,
 };
 
 pub trait TransferStore: Send + Sync + 'static {
@@ -78,6 +78,13 @@ pub trait TransferStore: Send + Sync + 'static {
     ) -> FsResult<TransferTaskSummary> {
         let tasks = self.list_transfer_tasks(job_id, run_id)?;
         Ok(summarize_transfer_tasks(&tasks, now_ms))
+    }
+
+    /// Global transfer-task state counts across all jobs (observability only).
+    /// Backends override with a narrow GROUP BY; the default is a full scan,
+    /// so callers must keep this off the hot scheduling path (metrics poll).
+    fn count_tasks_global(&self) -> FsResult<TransferTaskCounts> {
+        Ok(TransferTaskCounts::default())
     }
 
     /// Return only the requested status page. Backends override this with a

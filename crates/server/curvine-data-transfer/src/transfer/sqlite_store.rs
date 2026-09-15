@@ -260,6 +260,30 @@ impl TransferStore for SqliteTransferStore {
         collect_sqlite_rows(rows)
     }
 
+    fn count_tasks_global(&self) -> FsResult<TransferTaskCounts> {
+        let conn = self.conn.lock();
+        let mut counts = TransferTaskCounts::default();
+        let mut stmt = conn
+            .prepare("select state, count(*) from transfer_tasks group by state")
+            .map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, i32>(0)?, row.get::<_, i64>(1)?)))
+            .map_err(sqlite_err)?;
+        for row in rows {
+            let (state, n) = row.map_err(sqlite_err)?;
+            match TransferTaskState::from(state) {
+                TransferTaskState::Pending => counts.pending += n as u64,
+                TransferTaskState::Running => counts.running += n as u64,
+                TransferTaskState::Completed => counts.completed += n as u64,
+                TransferTaskState::Failed => counts.failed += n as u64,
+                TransferTaskState::Canceled => counts.canceled += n as u64,
+                TransferTaskState::Stale => counts.stale += n as u64,
+                _ => {}
+            }
+        }
+        Ok(counts)
+    }
+
     fn get_transfer_task_summary(
         &self,
         job_id: &str,

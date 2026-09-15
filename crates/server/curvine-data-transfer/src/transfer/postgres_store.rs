@@ -16,7 +16,7 @@ use curvine_error::{FsError, FsResult};
 use curvine_model::{
     summarize_transfer_tasks, StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease,
     TransferListFilter, TransferProgress, TransferState, TransferStateUpdate, TransferTaskRecord,
-    TransferTaskReport, TransferTaskState, TransferTaskStatus, TransferTaskSummary,
+    TransferTaskCounts, TransferTaskReport, TransferTaskState, TransferTaskStatus, TransferTaskSummary,
     TransferTenantSummary, WorkerInflight,
 };
 use native_tls::{Certificate, TlsConnector};
@@ -1311,6 +1311,28 @@ impl TransferStore for PostgresTransferStore {
     fn list_transfer_tasks(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
         let mut conn = self.conn()?;
         select_tasks(&mut *conn, job_id, run_id, None, None)
+    }
+
+    fn count_tasks_global(&self) -> FsResult<TransferTaskCounts> {
+        let mut conn = self.conn()?;
+        let mut counts = TransferTaskCounts::default();
+        let rows = conn
+            .query("select state, count(*) from transfer_tasks group by state", &[])
+            .map_err(postgres_err)?;
+        for row in rows {
+            let state: i32 = row.get(0);
+            let n: i64 = row.get(1);
+            match TransferTaskState::from(state) {
+                TransferTaskState::Pending => counts.pending += n as u64,
+                TransferTaskState::Running => counts.running += n as u64,
+                TransferTaskState::Completed => counts.completed += n as u64,
+                TransferTaskState::Failed => counts.failed += n as u64,
+                TransferTaskState::Canceled => counts.canceled += n as u64,
+                TransferTaskState::Stale => counts.stale += n as u64,
+                _ => {}
+            }
+        }
+        Ok(counts)
     }
 
     fn get_transfer_task_summary(

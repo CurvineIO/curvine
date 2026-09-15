@@ -14,7 +14,7 @@
 
 use curvine_error::FsError;
 use curvine_error::FsResult;
-use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics as m};
+use curvine_model::TransferTaskCounts;use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics as m};
 use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -36,6 +36,11 @@ pub struct TransferMetrics {
     active_jobs: Gauge,
     executing_jobs: Gauge,
     pending_jobs: Gauge,
+    tasks_pending: Gauge,
+    tasks_running: Gauge,
+    tasks_completed: Gauge,
+    tasks_failed: Gauge,
+    tasks_stale: Gauge,
     cleanup_purged_total: Counter,
     acquire_total: CounterVec,
     planning_total: CounterVec,
@@ -146,6 +151,31 @@ impl TransferMetrics {
             pending_jobs: m::new_gauge(
                 "transfer_pending_jobs",
                 "Current pending transfer jobs waiting in TransferStore backlog",
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            tasks_pending: m::new_gauge(
+                "transfer_tasks_pending",
+                "Transfer tasks in Pending state across store (global observability)",
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            tasks_running: m::new_gauge(
+                "transfer_tasks_running",
+                "Transfer tasks in Running state across store (global observability)",
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            tasks_completed: m::new_gauge(
+                "transfer_tasks_completed",
+                "Transfer tasks in Completed state across store (global observability)",
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            tasks_failed: m::new_gauge(
+                "transfer_tasks_failed",
+                "Transfer tasks in Failed state across store (global observability)",
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            tasks_stale: m::new_gauge(
+                "transfer_tasks_stale",
+                "Transfer tasks in Stale state across store (global observability)",
             )
             .map_err(|err| FsError::common(err.to_string()))?,
             cleanup_purged_total: m::new_counter(
@@ -394,6 +424,14 @@ impl TransferMetrics {
         self.active_jobs.set(active as i64);
         self.executing_jobs.set(executing as i64);
         self.pending_jobs.set(pending as i64);
+    }
+
+    pub fn set_task_counts(&self, counts: &TransferTaskCounts) {
+        self.tasks_pending.set(counts.pending as i64);
+        self.tasks_running.set(counts.running as i64);
+        self.tasks_completed.set(counts.completed as i64);
+        self.tasks_failed.set(counts.failed as i64);
+        self.tasks_stale.set(counts.stale as i64);
     }
 
     pub fn inc_cleanup_purged(&self, value: usize) {
