@@ -300,6 +300,15 @@ impl TransferPlanner {
         // otherwise a retry or an incremental re-copy mixes new segments with
         // old bytes (data corruption). Respect overwrite: without it a
         // pre-existing target is an error (same as single-file semantics).
+        // The delete happens only after the segment ranges are computed (i.e.
+        // we know at least one segment task will be emitted), so a planner run
+        // that produces no tasks never destroys an existing target (review).
+        let seg_block = if block_size > 0 {
+            block_size
+        } else {
+            SEGMENT_BYTES
+        };
+        let ranges = segment_offsets(status.len, block_size);
         if task_target.is_cv() {
             match self.master_fs.get_status(task_target).await {
                 Ok(_) => {
@@ -315,12 +324,7 @@ impl TransferPlanner {
                 Err(err) => return Err(err),
             }
         }
-        let seg_block = if block_size > 0 {
-            block_size
-        } else {
-            SEGMENT_BYTES
-        };
-        for (offset, length) in segment_offsets(status.len, block_size) {
+        for (offset, length) in ranges {
             let plan = SegmentPlan {
                 offset,
                 length,

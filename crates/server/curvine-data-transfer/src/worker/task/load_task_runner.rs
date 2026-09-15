@@ -613,6 +613,10 @@ impl LoadTaskRunner {
             })?;
         let source_path = Path::from_str(&self.task.info.source_path)?;
         let target_path = Path::from_str(&self.task.info.target_path)?;
+        // Progress throttle aligned to the configured report interval (the
+        // previous hardcoded 10s window bypassed progress_interval_ms and could
+        // let the scheduler judge a long segment stale - review Required).
+        let mut last_progress_time = LocalTime::mills();
 
         // Ensure the target exists with the full block layout (first segment
         // creates and pre-allocates; concurrent segments reuse it).
@@ -688,7 +692,8 @@ impl LoadTaskRunner {
             writer.write(chunk).await?;
             remaining -= chunk_len;
             written += chunk_len;
-            if LocalTime::mills() % 10_000 < 100 {
+            if LocalTime::mills() > last_progress_time + self.progress_interval_ms {
+                last_progress_time = LocalTime::mills();
                 self.update_progress(written, plan.length, false).await;
             }
         }
