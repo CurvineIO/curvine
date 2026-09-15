@@ -22,8 +22,9 @@ use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::ListOptions;
 use curvine_model::{
-    BatchManifest, BatchManifestEntry, FileStatus, LoadJobInfo, MountInfo, TransferCommand,
-    TransferJobRecord, TransferKind, TransferProgress, TransferTaskRecord, TransferTaskState,
+    BatchManifest, BatchManifestEntry, FileStatus, LoadJobInfo, MountInfo, SegmentPlan,
+    TransferCommand, TransferJobRecord, TransferKind, TransferProgress, TransferTaskRecord,
+    TransferTaskState,
 };
 use curvine_runtime::common::LocalTime;
 use parking_lot::Mutex;
@@ -49,10 +50,42 @@ pub struct PlannedTransfer {
 pub const BATCH_MAX_FILES: usize = 512;
 pub const BATCH_TARGET_BYTES: i64 = 256 * 1024 * 1024;
 
+/// Large-file segmentation (design §14): files at least this size are split
+/// into per-block segment tasks dispatched to different workers. Equal to one
+/// CV block (128 MiB) so each segment maps to exactly one target block.
+pub const SEGMENT_BYTES: i64 = 128 * 1024 * 1024;
+
+/// Compressed formats must not be split (design §14, Flink
+/// `nonSplittableFileSuffixes`): segment-parallel reads of a compressed file
+/// would decompress each segment independently and produce corrupt output.
+/// Files with these suffixes stay a single task.
+pub const NON_SPLITTABLE_SUFFIXES: [&str; 6] = [".gz", ".bz2", ".zip", ".xz", ".lz4", ".zst"];
+
+/// True when the file must not be split into segments (compressed formats).
+pub fn is_non_splittable(name: &str) -> bool {
+    NON_SPLITTABLE_SUFFIXES
+        .iter()
+        .any(|suffix| name.to_ascii_lowercase().ends_with(suffix))
+}
+
 /// Pure batch split decision (design §7.1): flush when the file count or
 /// accumulated bytes reach the thresholds.
 pub fn batch_should_flush(file_count: usize, accumulated_bytes: i64) -> bool {
     file_count >= BATCH_MAX_FILES || accumulated_bytes >= BATCH_TARGET_BYTES
+}
+
+/// Pure segment split (design §14): returns (offset, length) ranges covering
+/// the whole file, each at most SEGMENT_BYTES (one CV block). Testable without
+/// a planner instance.
+pub fn segment_offsets(file_len: i64) -> Vec<(i64, i64)> {
+    let mut ranges = Vec::new();
+    let mut offset = 0i64;
+    while offset < file_len {
+        let length = SEGMENT_BYTES.min(file_len - offset);
+        ranges.push((offset, length));
+        offset += length;
+    }
+    ranges
 }
 
 #[derive(Clone)]
@@ -117,6 +150,7 @@ impl TransferPlanner {
         // CV sources keep per-file block-read plans, and single-file transfers
         // keep their existing shape (design §7.1).
         let batching = source_status.is_dir && !source.is_cv();
+        let overwrite = job_info.overwrite.unwrap_or(false);
         let mut batch: Vec<FileStatus> = Vec::new();
         let mut batch_bytes = 0i64;
 
@@ -168,9 +202,27 @@ impl TransferPlanner {
             total_size += status.len;
 
             if batching {
-                // Large files (>= batch target) stay a single task: flush the
-                // pending small-file batch first, then push the large file
-                // alone (design §7.1 - large files keep their own task).
+                // Large files (>= batch target) are split into per-block
+                // segment tasks dispatched to different workers (design §14).
+                // A segment maps to exactly one CV block (128 MiB).
+                if status.len >= BATCH_TARGET_BYTES && !is_non_splittable(path.name()) {
+                    if !batch.is_empty() {
+                        let files = std::mem::take(&mut batch);
+                        batch_bytes = 0;
+                        self.push_batch_task(job, &source, &target, files, &mut tasks)?;
+                    }
+                    self.push_segment_tasks(
+                        job,
+                        &path,
+                        &task_target,
+                        &status,
+                        overwrite,
+                        &mut tasks,
+                    )
+                    .await?;
+                    continue;
+                }
+                // Compressed large files or medium files stay a single task.
                 if status.len >= BATCH_TARGET_BYTES {
                     if !batch.is_empty() {
                         let files = std::mem::take(&mut batch);
@@ -214,8 +266,77 @@ impl TransferPlanner {
     /// instead of silently copying only one file of the batch. Manifest
     /// entries carry paths relative to the source root; a batch may span
     /// subdirectories.
+    async fn push_segment_tasks(
+        &self,
+        job: &TransferJobRecord,
+        path: &Path,
+        task_target: &Path,
+        status: &FileStatus,
+        overwrite: bool,
+        tasks: &mut Vec<TransferTaskRecord>,
+    ) -> FsResult<()> {
+        // Segment tasks write the target as a fresh full file (design §14). A
+        // pre-existing target must be cleared before any segment lands,
+        // otherwise a retry or an incremental re-copy mixes new segments with
+        // old bytes (data corruption). Respect overwrite: without it a
+        // pre-existing target is an error (same as single-file semantics).
+        if task_target.is_cv() {
+            match self.master_fs.get_status(task_target).await {
+                Ok(_) => {
+                    if !overwrite {
+                        return err_box!(
+                            "Transfer target {} already exists and overwrite=false",
+                            task_target.full_path()
+                        );
+                    }
+                    self.master_fs.delete(task_target, false).await?;
+                }
+                Err(FsError::FileNotFound(_)) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        for (offset, length) in segment_offsets(status.len) {
+            let plan = SegmentPlan { offset, length };
+            let segment_json = serde_json::to_string(&plan)
+                .map_err(|_| FsError::common("Unable to serialize segment plan"))?;
+            let task_id = format!("{}_task_{}", job.job_id, tasks.len());
+            tasks.push(TransferTaskRecord {
+                job_id: job.job_id.clone(),
+                run_id: job.run_id,
+                task_id,
+                attempt_id: 0,
+                source_path: path.clone_uri(),
+                target_path: task_target.clone_uri(),
+                worker_id: 0,
+                worker_session_id: String::new(),
+                source_read_plan_json: segment_json,
+                report_target_json: String::new(),
+                state: TransferTaskState::Pending,
+                progress: TransferProgress {
+                    total_size: length,
+                    ..Default::default()
+                },
+                estimated_size: length,
+                retry_count: 0,
+                attempt_started_at: 0,
+                last_report_at: 0,
+                stale_deadline_at: 0,
+                updated_at: LocalTime::mills() as i64,
+            });
+        }
+        if tasks.len() > self.max_tasks_per_transfer {
+            return err_box!(
+                "Transfer {} files exceeds {}",
+                job.job_id,
+                self.max_tasks_per_transfer
+            );
+        }
+        Ok(())
+    }
+
     /// Push one file as its own task (non-batching path, or a large file that
-    /// exceeds the batch target; design §7.1 keeps large files single-task).
+    /// exceeds the batch target but is below the segment threshold; design
+    /// §7.1 keeps such files single-task).
     async fn push_single_task(
         &self,
         job: &TransferJobRecord,

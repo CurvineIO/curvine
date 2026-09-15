@@ -101,3 +101,55 @@ fn batch_flush_disabled_for_zero_bytes_with_few_files() {
     assert!(!batch_should_flush(0, 0));
     assert!(!batch_should_flush(1, 1));
 }
+
+#[test]
+fn segment_offsets_cover_exact_block_multiple() {
+    use super::planner::{segment_offsets, SEGMENT_BYTES};
+    // 2.5 blocks -> 3 segments, last is the remainder.
+    let ranges = segment_offsets(SEGMENT_BYTES * 2 + SEGMENT_BYTES / 2);
+    assert_eq!(ranges.len(), 3);
+    assert_eq!(ranges[0], (0, SEGMENT_BYTES));
+    assert_eq!(ranges[1], (SEGMENT_BYTES, SEGMENT_BYTES));
+    assert_eq!(ranges[2], (SEGMENT_BYTES * 2, SEGMENT_BYTES / 2));
+}
+
+#[test]
+fn segment_offsets_contiguous_and_cover_whole_file() {
+    use super::planner::{segment_offsets, SEGMENT_BYTES};
+    let len = SEGMENT_BYTES * 3 + 12345;
+    let ranges = segment_offsets(len);
+    // Contiguous and total == file length.
+    let mut next = 0i64;
+    let mut total = 0i64;
+    for (off, l) in &ranges {
+        assert_eq!(*off, next);
+        next += *l;
+        total += *l;
+        assert!(*l <= SEGMENT_BYTES);
+    }
+    assert_eq!(total, len);
+    assert_eq!(next, len);
+}
+
+#[test]
+fn segment_offsets_small_file_is_single_segment() {
+    use super::planner::{segment_offsets, SEGMENT_BYTES};
+    assert_eq!(
+        segment_offsets(SEGMENT_BYTES - 1),
+        vec![(0, SEGMENT_BYTES - 1)]
+    );
+    assert_eq!(segment_offsets(SEGMENT_BYTES), vec![(0, SEGMENT_BYTES)]);
+    assert!(segment_offsets(0).is_empty());
+}
+
+#[test]
+fn non_splittable_compressed_suffixes_are_recognized() {
+    use super::planner::is_non_splittable;
+    assert!(is_non_splittable("data.gz"));
+    assert!(is_non_splittable("DATA.GZ"));
+    assert!(is_non_splittable("archive.zip"));
+    assert!(is_non_splittable("file.tar.zst"));
+    assert!(!is_non_splittable("file.orc"));
+    assert!(!is_non_splittable("file.parquet"));
+    assert!(!is_non_splittable("plain"));
+}
