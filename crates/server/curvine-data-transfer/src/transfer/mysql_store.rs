@@ -180,7 +180,7 @@ impl TransferStore for MysqlTransferStore {
     fn count_active_transfers(&self) -> FsResult<u64> {
         self.conn()?
             .exec_first::<u64, _, _>(
-                "select count(*) from transfer_jobs where state not in (6, 7, 8, 9)",
+                "select count(*) from transfer_jobs where state in (1, 2, 3, 4, 5)",
                 Params::Empty,
             )
             .map_err(mysql_err)?

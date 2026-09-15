@@ -133,7 +133,7 @@ impl TransferStore for SqliteTransferStore {
         self.conn
             .lock()
             .query_row(
-                "select count(*) from transfer_jobs where state not in (6, 7, 8, 9)",
+                "select count(*) from transfer_jobs where state in (1, 2, 3, 4, 5)",
                 [],
                 |row| row.get::<_, i64>(0),
             )

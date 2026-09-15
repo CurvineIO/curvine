@@ -1188,7 +1188,7 @@ impl TransferStore for PostgresTransferStore {
         let mut conn = self.conn()?;
         count_rows(
             &mut *conn,
-            "select count(*) from transfer_jobs where state not in (6, 7, 8, 9)",
+            "select count(*) from transfer_jobs where state in (1, 2, 3, 4, 5)",
             &[],
         )
     }

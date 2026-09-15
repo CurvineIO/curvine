@@ -179,7 +179,7 @@ fn mount_snapshot_failure_action(attempts: u32) -> MountSnapshotFailureAction {
 use crate::transfer::{ClusterMetadataCache, TransferMetrics};
 
 const TRANSFER_CLEANUP_INTERVAL_MS: u64 = 60_000;
-const TRANSFER_METRICS_INTERVAL_MS: u64 = 1_000;
+const TRANSFER_METRICS_INTERVAL_MS: u64 = 10_000;
 const SCHEDULER_ACTIVE_INTERVAL: Duration = Duration::from_millis(200);
 const SCHEDULER_IDLE_INTERVAL: Duration = Duration::from_secs(1);
 const SCHEDULER_MIN_IDLE_INTERVAL: Duration = Duration::from_millis(1);
