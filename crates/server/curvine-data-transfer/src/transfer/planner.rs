@@ -650,10 +650,14 @@ pub(crate) fn load_job_info(
 ) -> FsResult<LoadJobInfo> {
     let default_replicas = mount.replicas.unwrap_or(client_conf.replicas);
     let (replicas, overwrite) = match transfer_command(job) {
-        Ok(command) => (
-            command.replicas()?.unwrap_or(default_replicas),
-            command.overwrite(),
-        ),
+        Ok(command) => {
+            let replicas = command
+                .replicas()
+                .ok()
+                .flatten()
+                .unwrap_or(default_replicas);
+            (replicas, command.overwrite())
+        }
         // Keep the pre-options behavior for old/corrupt records: they used the
         // default overwrite and replica settings while planning.
         Err(_) => (default_replicas, true),

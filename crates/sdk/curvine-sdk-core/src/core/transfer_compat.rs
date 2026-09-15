@@ -58,9 +58,17 @@ pub(crate) fn map_transfer_state(state: TransferState) -> JobTaskState {
     }
 }
 
-pub(crate) fn validate_transfer_load_command(command: &LoadJobCommand) -> FsResult<()> {
-    if command.replicas.is_some_and(|replicas| replicas <= 0) {
-        return err_box!("transfer load replicas must be positive");
+pub(crate) fn validate_transfer_command(
+    command: &LoadJobCommand,
+    kind: TransferKind,
+) -> FsResult<()> {
+    if let Some(replicas) = command.replicas {
+        if kind != TransferKind::Load {
+            return err_box!("export does not support replicas");
+        }
+        if replicas <= 0 {
+            return err_box!("transfer load replicas must be positive");
+        }
     }
     if command.block_size.is_some()
         || command.storage_type.is_some()
@@ -247,7 +255,7 @@ pub(crate) async fn submit_load_job(
             .await;
     }
 
-    validate_transfer_load_command(&command)?;
+    validate_transfer_command(&command, TransferKind::Load)?;
     let overwrite = command.overwrite.unwrap_or(true);
     let replicas = command.replicas;
     let (source_path, target_path) =
@@ -273,7 +281,7 @@ pub(crate) async fn submit_export_job(
             .await;
     }
 
-    validate_transfer_load_command(&command)?;
+    validate_transfer_command(&command, TransferKind::Export)?;
     if command.target_path.is_some() {
         return err_box!("export does not support an explicit target path");
     }
@@ -447,36 +455,36 @@ mod tests {
     #[test]
     fn accepts_replicas_and_rejects_other_unsupported_transfer_load_options() {
         let command = LoadJobCommand::builder("s3://bucket/a").replicas(2).build();
-        assert!(validate_transfer_load_command(&command).is_ok());
+        assert!(validate_transfer_command(&command, TransferKind::Load).is_ok());
 
         let command = LoadJobCommand::builder("s3://bucket/a").replicas(0).build();
-        let err = validate_transfer_load_command(&command).unwrap_err();
+        let err = validate_transfer_command(&command, TransferKind::Load).unwrap_err();
         assert!(err.to_string().contains("replicas"));
 
         let command = LoadJobCommand::builder("s3://bucket/a")
             .block_size(1024)
             .build();
-        assert!(validate_transfer_load_command(&command).is_err());
+        assert!(validate_transfer_command(&command, TransferKind::Load).is_err());
 
         let command = LoadJobCommand::builder("s3://bucket/a")
             .storage_type(StorageType::Disk)
             .build();
-        assert!(validate_transfer_load_command(&command).is_err());
+        assert!(validate_transfer_command(&command, TransferKind::Load).is_err());
 
         let command = LoadJobCommand::builder("s3://bucket/a")
             .ttl_ms(1000)
             .ttl_action(TtlAction::Delete)
             .build();
-        assert!(validate_transfer_load_command(&command).is_err());
+        assert!(validate_transfer_command(&command, TransferKind::Load).is_err());
 
         let command = LoadJobCommand::builder("s3://bucket/a")
             .target_path("/mnt/a")
             .overwrite(false)
             .build();
-        assert!(validate_transfer_load_command(&command).is_ok());
+        assert!(validate_transfer_command(&command, TransferKind::Load).is_ok());
 
         let command = LoadJobCommand::builder("/mnt/a").build();
-        assert!(validate_transfer_load_command(&command).is_ok());
+        assert!(validate_transfer_command(&command, TransferKind::Load).is_ok());
     }
 
     #[test]
