@@ -277,6 +277,7 @@ pub struct TransferTaskStateUpdate {
 }
 
 impl TransferTaskStateUpdate {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         job_id: String,
         run_id: u64,
