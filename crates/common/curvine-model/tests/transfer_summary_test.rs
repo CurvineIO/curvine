@@ -24,6 +24,7 @@ fn task(
             message: message.to_string(),
             ..Default::default()
         },
+        estimated_size: 0,
         retry_count: 0,
         attempt_started_at: updated_at,
         last_report_at: updated_at,
