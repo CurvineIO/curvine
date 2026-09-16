@@ -43,6 +43,10 @@ mod planner_test;
 mod service;
 pub use self::service::{progress_to_proto, task_summary_to_proto, TransferService};
 
+#[cfg(test)]
+#[path = "tests/service_test.rs"]
+mod service_test;
+
 mod scheduler;
 pub use self::scheduler::TransferScheduler;
 
