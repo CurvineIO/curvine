@@ -1120,7 +1120,7 @@ pub(crate) fn cv_cache_target_needs_repair(status: &FileStatus) -> bool {
     if status.is_dir {
         return false;
     }
-    !status.is_complete() || status.storage_policy.ufs_mtime == 0
+!status.is_complete() || !status.cv_valid(None)
 }
 
 pub fn encode_transfer_command(command: &TransferCommand) -> FsResult<Vec<u8>> {
