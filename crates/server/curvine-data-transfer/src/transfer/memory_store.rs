@@ -44,6 +44,18 @@ impl MemoryTransferStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    #[cfg(test)]
+    pub(crate) fn set_job_state(&self, job_id: &str, state: TransferState) {
+        if let Some(job) = self.inner.lock().jobs.get_mut(job_id) {
+            job.state = state;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn job_count(&self) -> usize {
+        self.inner.lock().jobs.len()
+    }
 }
 
 impl TransferStore for MemoryTransferStore {
@@ -136,6 +148,15 @@ impl TransferStore for MemoryTransferStore {
             .filter(|job| !job.state.is_terminal())
             .cloned()
             .collect())
+    }
+
+    fn has_active_transfer_by_key(&self, job_key: &str) -> FsResult<bool> {
+        Ok(self
+            .inner
+            .lock()
+            .jobs
+            .values()
+            .any(|job| job.job_key == job_key && !job.state.is_terminal()))
     }
 
     fn find_conflicting_active_transfer(

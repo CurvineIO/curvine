@@ -122,6 +122,18 @@ impl TransferStore for TransferStoreBackend {
         })
     }
 
+    fn has_active_transfer_by_key(&self, job_key: &str) -> FsResult<bool> {
+        self.record_store_operation("has_active_transfer_by_key", || match self {
+            Self::Memory(store) => store.has_active_transfer_by_key(job_key),
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => store.has_active_transfer_by_key(job_key),
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => store.has_active_transfer_by_key(job_key),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.has_active_transfer_by_key(job_key),
+        })
+    }
+
     fn find_conflicting_active_transfer(
         &self,
         target_path: &str,

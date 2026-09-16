@@ -133,6 +133,10 @@ impl TransferStore for MysqlTransferStore {
         )
     }
 
+    fn has_active_transfer_by_key(&self, job_key: &str) -> FsResult<bool> {
+        Ok(select_non_terminal_job_by_key(&mut self.conn()?, job_key)?.is_some())
+    }
+
     fn find_conflicting_active_transfer(
         &self,
         target_path: &str,

@@ -249,6 +249,24 @@ impl ClusterMetadataCache {
         })
     }
 
+    /// Blocking CV `get_status` for transfer submit/repair decisions.
+    ///
+    /// `TransferService::submit_transfer` is synchronous, so callers use this helper
+    /// instead of awaiting `CurvineFileSystem::get_status` directly.
+    pub fn get_status_blocking(&self, path: &Path) -> FsResult<curvine_model::FileStatus> {
+        let fs = self.fs.clone();
+        let path = path.clone();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    let rt = fs.clone_runtime();
+                    rt.block_on(fs.get_status(&path))
+                })
+                .join()
+                .map_err(|_| FsError::common("Transfer get_status thread panicked"))?
+        })
+    }
+
     pub fn live_workers(&self) -> FsResult<Vec<WorkerInfo>> {
         let snapshot = self.snapshot();
         self.check_snapshot_fresh(&snapshot)?;

@@ -39,6 +39,8 @@ pub trait TransferStore: Send + Sync + 'static {
 
     fn list_active_transfers(&self) -> FsResult<Vec<TransferJobRecord>>;
 
+    fn has_active_transfer_by_key(&self, job_key: &str) -> FsResult<bool>;
+
     fn find_conflicting_active_transfer(
         &self,
         target_path: &str,
