@@ -68,6 +68,7 @@ pub struct TransferService<S> {
     task_stale_timeout_ms: i64,
     report_dispatcher: Option<TransferReportDispatcher<S>>,
     /// job_key -> last auto-repair attempt time (ms).
+    /// Cooldown is per-process / per-replica, not shared across transfer instances.
     auto_repair_last_attempt_ms: Arc<Mutex<HashMap<String, i64>>>,
 }
 
@@ -276,7 +277,7 @@ where
     }
 
     /// When auto_cache reuses a stable client_request_id, a Completed/PartialSuccess Load can
-    /// leave behind an incomplete CV cache shell (`!is_complete` / `ufs_mtime==0`). Re-submits
+    /// leave behind an unusable CV cache target (`!is_complete` or `!cv_valid`). Re-submits
     /// then keep returning that job and never reload. If the CV target is still invalid, retry
     /// once (with cooldown) so load can repair the shell without racing an in-flight job.
     ///
@@ -308,7 +309,31 @@ where
             return Ok(job);
         }
 
+        // Check cooldown before get_status so same-id storms do not hammer Master.
+        let now = now_ms();
+        {
+            let last_attempts = self.auto_repair_last_attempt_ms.lock();
+            if let Some(last) = last_attempts.get(&job.job_key).copied() {
+                if auto_repair_in_cooldown(last, now) {
+                    info!(
+                        "skip auto-repair for job_key={} target={} due to cooldown ({} ms remaining)",
+                        job.job_key,
+                        job.target_path,
+                        AUTO_REPAIR_COOLDOWN_MS - now.saturating_sub(last)
+                    );
+                    return Ok(job);
+                }
+            }
+        }
+
         let needs_repair = match cache.get_status_blocking(&target) {
+            Ok(status) if status.is_dir => {
+                info!(
+                    "skip auto-repair for job {} target {}: directory target is not auto-repaired",
+                    job.job_id, job.target_path
+                );
+                false
+            }
             Ok(status) => cv_cache_target_needs_repair(&status),
             Err(FsError::FileNotFound(_)) => true,
             Err(err) => {
@@ -342,9 +367,10 @@ where
             return Ok(job);
         }
 
-        let now = now_ms();
         {
+            let now = now_ms();
             let mut last_attempts = self.auto_repair_last_attempt_ms.lock();
+            // Re-check under write lock in case another submit raced past the early check.
             if let Some(last) = last_attempts.get(&job.job_key).copied() {
                 if auto_repair_in_cooldown(last, now) {
                     info!(
@@ -1114,13 +1140,13 @@ pub(crate) fn auto_repair_in_cooldown(last_attempt_ms: i64, now_ms: i64) -> bool
 
 /// True when a CV cache path left by Load is not usable and should be reloaded.
 ///
-/// Matches the incomplete CV shell case (`is_complete=false` and/or `ufs_mtime==0`)
-/// observed when auto_cache keeps returning a terminal job without repairing data.
+/// Treat as invalid when the file is incomplete or `cv_valid(None)` fails
+/// (e.g. `ufs_mtime==0`, no CV copy / `StorageState::Ufs`, expired).
 pub(crate) fn cv_cache_target_needs_repair(status: &FileStatus) -> bool {
     if status.is_dir {
         return false;
     }
-!status.is_complete() || !status.cv_valid(None)
+    !status.is_complete() || !status.cv_valid(None)
 }
 
 pub fn encode_transfer_command(command: &TransferCommand) -> FsResult<Vec<u8>> {

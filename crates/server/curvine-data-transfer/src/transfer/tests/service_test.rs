@@ -144,6 +144,12 @@ fn complete_but_zero_ufs_mtime_needs_repair() {
 }
 
 #[test]
+fn complete_ufs_only_without_cv_copy_needs_repair() {
+    let status = file_status(true, 1_700_000_000_000, StorageState::Ufs);
+    assert!(cv_cache_target_needs_repair(&status));
+}
+
+#[test]
 fn directory_never_needs_repair() {
     let mut status = file_status(false, 0, StorageState::Cv);
     status.is_dir = true;
