@@ -43,10 +43,9 @@ impl WeightedWorkerPolicy {
         selected_ids: &HashSet<u32>,
         min_available: i64,
     ) -> bool {
-        worker.is_live()
+        worker.can_allocate(min_available)
             && !exclude_workers.contains(id)
             && !selected_ids.contains(id)
-            && worker.available >= min_available
             && worker.weight > 0
     }
 
@@ -224,5 +223,22 @@ mod tests {
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].worker_id, 1);
+    }
+
+    #[test]
+    fn weighted_selection_filters_scheduled_bytes() {
+        let policy = WeightedWorkerPolicy::new();
+        let mut reserved = worker(1, 100);
+        reserved.available = 20;
+        reserved.scheduled_bytes = 20;
+        let workers = IndexMap::from([(1, reserved), (2, worker(2, 1))]);
+        let mut rng = StdRng::seed_from_u64(7);
+
+        let selected = policy
+            .select_weighted_workers(&workers, 1, &HashSet::new(), 20, &mut rng)
+            .unwrap();
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].worker_id, 2);
     }
 }

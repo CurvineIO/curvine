@@ -81,7 +81,7 @@ impl LoadJobRunner {
 
     pub fn choose_worker(&self, block_size: i64) -> FsResult<WorkerAddress> {
         let ctx = ChooseContext::with_num(1, block_size, vec![]);
-        let worker_mgr = self.master_fs.worker_manager.read();
+        let mut worker_mgr = self.master_fs.worker_manager.write();
         let workers = worker_mgr.choose_worker(ctx)?;
         if let Some(worker) = workers.first() {
             Ok(worker.clone())

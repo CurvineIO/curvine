@@ -60,6 +60,10 @@ pub struct WorkerInfo {
     pub startup_time_ms: u64,
     pub capacity: i64,
     pub available: i64,
+    #[serde(default)]
+    pub scheduled_bytes: i64,
+    #[serde(default)]
+    pub scheduled_since_ms: u64,
     pub fs_used: i64,
     pub non_fs_used: i64,
     pub reserved_bytes: i64,
@@ -88,6 +92,8 @@ impl WorkerInfo {
             startup_time_ms: 0,
             capacity: 0,
             available: 0,
+            scheduled_bytes: 0,
+            scheduled_since_ms: 0,
             fs_used: 0,
             non_fs_used: 0,
             reserved_bytes: 0,
@@ -134,6 +140,61 @@ impl WorkerInfo {
         self.status == WorkerStatus::Live
     }
 
+    pub fn allocatable_available(&self) -> i64 {
+        self.available.saturating_sub(self.scheduled_bytes)
+    }
+
+    pub fn can_allocate(&self, block_size: i64) -> bool {
+        if !self.is_live() {
+            return false;
+        }
+        if self.storage_map.is_empty() {
+            return self.allocatable_available() >= block_size;
+        }
+        self.storage_map.values().any(|storage| {
+            !storage.failed && storage.available.saturating_sub(self.scheduled_bytes) >= block_size
+        })
+    }
+
+    pub fn schedule_bytes(&mut self, bytes: i64) {
+        self.adjust_scheduled_bytes(bytes);
+    }
+
+    pub fn unschedule_bytes(&mut self, bytes: i64) {
+        self.adjust_scheduled_bytes(bytes.saturating_neg());
+    }
+
+    fn adjust_scheduled_bytes(&mut self, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        self.scheduled_bytes = self.scheduled_bytes.saturating_add(delta).max(0);
+        if self.scheduled_bytes == 0 {
+            self.scheduled_since_ms = 0;
+        } else if delta > 0 && self.scheduled_since_ms == 0 {
+            self.scheduled_since_ms = LocalTime::mills();
+        }
+    }
+
+    pub fn reclaim_scheduled_from_heartbeat(&mut self, previous_available: i64) {
+        let consumed = previous_available.saturating_sub(self.available).max(0);
+        self.adjust_scheduled_bytes(consumed.saturating_neg());
+    }
+
+    pub fn expire_scheduled_bytes(&mut self, now_ms: u64, timeout_ms: u64) {
+        if timeout_ms == 0 || self.scheduled_bytes == 0 {
+            return;
+        }
+        if self.scheduled_since_ms == 0 {
+            self.scheduled_since_ms = now_ms;
+            return;
+        }
+        if now_ms.saturating_sub(self.scheduled_since_ms) >= timeout_ms {
+            self.scheduled_bytes = 0;
+            self.scheduled_since_ms = 0;
+        }
+    }
+
     pub fn rpc_addr(&self) -> String {
         self.address.connect_addr()
     }
@@ -165,6 +226,8 @@ impl Default for WorkerInfo {
             startup_time_ms: 0,
             capacity: 1 << 30,
             available: 1 << 30,
+            scheduled_bytes: 0,
+            scheduled_since_ms: 0,
             fs_used: 0,
             non_fs_used: 0,
             reserved_bytes: 0,
@@ -194,5 +257,125 @@ impl Display for WorkerInfo {
             self.address.hostname,
             self.address.rpc_port
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allocatable_available_subtracts_scheduled_bytes() {
+        let mut worker = WorkerInfo::default();
+        worker.available = 1 << 30;
+        worker.scheduled_bytes = 8 * (128 << 20);
+        assert_eq!(worker.allocatable_available(), 0);
+        assert!(!worker.can_allocate(128 << 20));
+        assert!(worker.can_allocate(0));
+    }
+
+    #[test]
+    fn can_allocate_rejects_non_live_worker() {
+        let mut worker = WorkerInfo::default();
+        worker.status = WorkerStatus::Blacklist;
+        assert!(!worker.can_allocate(0));
+    }
+
+    #[test]
+    fn heartbeat_reclaim_keeps_unwritten_reservations() {
+        let mut worker = WorkerInfo::default();
+        worker.available = 1 << 30;
+        worker.schedule_bytes(1 << 30);
+        worker.reclaim_scheduled_from_heartbeat(1 << 30);
+        assert_eq!(worker.scheduled_bytes, 1 << 30);
+        assert_eq!(worker.allocatable_available(), 0);
+    }
+
+    #[test]
+    fn heartbeat_reclaim_drops_capacity_already_reported() {
+        let mut worker = WorkerInfo::default();
+        let prev = 1 << 30;
+        worker.available = prev - 4 * (128 << 20);
+        worker.scheduled_bytes = 8 * (128 << 20);
+        worker.reclaim_scheduled_from_heartbeat(prev);
+        assert_eq!(worker.scheduled_bytes, 4 * (128 << 20));
+        assert_eq!(worker.allocatable_available(), 0);
+    }
+
+    #[test]
+    fn heartbeat_reclaim_does_not_go_negative() {
+        let mut worker = WorkerInfo::default();
+        let prev = 1 << 30;
+        worker.available = 0;
+        worker.scheduled_bytes = 128 << 20;
+        worker.reclaim_scheduled_from_heartbeat(prev);
+        assert_eq!(worker.scheduled_bytes, 0);
+    }
+
+    fn worker_with_dirs(dirs: &[StorageInfo]) -> WorkerInfo {
+        let mut worker = WorkerInfo::new(WorkerAddress::default(), 1);
+        for dir in dirs {
+            worker.add_storage(dir.clone());
+        }
+        worker
+    }
+
+    fn dir(storage_id: &str, available: i64) -> StorageInfo {
+        StorageInfo {
+            storage_id: storage_id.to_string(),
+            available,
+            capacity: available,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn can_allocate_rejects_when_no_single_dir_fits_block() {
+        let worker = worker_with_dirs(&[dir("disk-0", 100), dir("disk-1", 100)]);
+        assert_eq!(worker.available, 200);
+        assert!(!worker.can_allocate(128));
+    }
+
+    #[test]
+    fn can_allocate_accepts_when_one_dir_fits_block() {
+        let worker = worker_with_dirs(&[dir("disk-0", 128), dir("disk-1", 10)]);
+        assert!(worker.can_allocate(128));
+    }
+
+    #[test]
+    fn can_allocate_deducts_scheduled_bytes_from_each_dir() {
+        let mut worker = worker_with_dirs(&[dir("disk-0", 200), dir("disk-1", 200)]);
+        assert!(worker.can_allocate(128));
+        worker.schedule_bytes(128);
+        assert!(!worker.can_allocate(128));
+    }
+
+    #[test]
+    fn unschedule_bytes_restores_reservation() {
+        let mut worker = WorkerInfo::default();
+        worker.schedule_bytes(128);
+        worker.unschedule_bytes(128);
+        assert_eq!(worker.scheduled_bytes, 0);
+        worker.unschedule_bytes(64);
+        assert_eq!(worker.scheduled_bytes, 0);
+    }
+
+    #[test]
+    fn expire_scheduled_bytes_after_timeout() {
+        let mut worker = WorkerInfo::default();
+        worker.schedule_bytes(128);
+        worker.scheduled_since_ms = 10;
+        worker.expire_scheduled_bytes(20, 10);
+        assert_eq!(worker.scheduled_bytes, 0);
+        assert_eq!(worker.scheduled_since_ms, 0);
+    }
+
+    #[test]
+    fn expire_scheduled_bytes_keeps_reservation_before_timeout() {
+        let mut worker = WorkerInfo::default();
+        worker.schedule_bytes(128);
+        worker.scheduled_since_ms = 10;
+        worker.expire_scheduled_bytes(19, 10);
+        assert_eq!(worker.scheduled_bytes, 128);
     }
 }

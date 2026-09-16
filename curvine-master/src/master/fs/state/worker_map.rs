@@ -117,11 +117,26 @@ impl WorkerMap {
             info.add_storage(item);
         }
 
+        let previous = self.workers.get(&worker_id).map(|worker| {
+            (
+                worker.available,
+                worker.scheduled_bytes,
+                worker.scheduled_since_ms,
+                worker.status,
+            )
+        });
+
         // The worker dcm state does not change
-        info.status = match self.workers.get(&worker_id) {
-            Some(v) if v.status == WorkerStatus::Decommission => v.status,
+        info.status = match previous {
+            Some((_, _, _, status)) if status == WorkerStatus::Decommission => status,
             _ => WorkerStatus::Live,
         };
+
+        if let Some((previous_available, previous_scheduled, previous_since, _)) = previous {
+            info.scheduled_bytes = previous_scheduled;
+            info.scheduled_since_ms = previous_since;
+            info.reclaim_scheduled_from_heartbeat(previous_available);
+        }
 
         self.workers.insert(worker_id, info);
         if let Some(lost) = self.lost_workers.swap_remove(&worker_id) {

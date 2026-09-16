@@ -43,7 +43,7 @@ impl LoadBasedWorkerPolicy {
         // Calculate the available space ratio as the base fraction
         // Other load factors can be added here, such as CPU usage, memory usage, etc.
         // Currently only the available space ratio is used as the load metric
-        worker.available as f64 / worker.capacity as f64
+        worker.allocatable_available() as f64 / worker.capacity as f64
     }
 
     /// Select the specified number of workers according to the load
@@ -52,23 +52,17 @@ impl LoadBasedWorkerPolicy {
         workers: &IndexMap<u32, WorkerInfo>,
         count: usize,
         exclude_workers: Option<&HashSet<u32>>,
-        min_available: Option<u64>,
+        min_available: i64,
     ) -> CommonResult<Vec<WorkerAddress>> {
         let mut available_workers: Vec<(&u32, &WorkerInfo, f64)> = workers
             .iter()
             .filter(|(id, worker)| {
-                // Basic state verification: the worker must be active and the effective capacity is greater than 0
-                worker.is_live() && worker.capacity > 0 && worker.available >= 0 &&
-                // Check if it is in the exclusion list
-                match exclude_workers {
-                    Some(excluded) => !excluded.contains(id),
-                    None => true
-                }&&
-                // Check whether the available space meets the minimum requirements
-                match min_available {
-                    Some(min) => worker.available >= min as i64,
-                    None => worker.available > 0 // Even if there are no minimum requirements, make sure there is space available
-                }
+                worker.capacity > 0
+                    && worker.can_allocate(min_available)
+                    && match exclude_workers {
+                        Some(excluded) => !excluded.contains(id),
+                        None => true,
+                    }
             })
             .map(|(id, worker)| (id, worker, self.calculate_score(worker)))
             .collect();
@@ -109,7 +103,7 @@ impl WorkerPolicy for LoadBasedWorkerPolicy {
             workers,
             ctx.replicas as usize,
             Some(&ctx.exclude_workers),
-            Some(ctx.block_size as u64),
+            ctx.block_size,
         )
     }
 }

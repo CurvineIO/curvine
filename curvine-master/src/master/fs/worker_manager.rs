@@ -23,7 +23,7 @@ use curvine_model::{
     TransferWorkerCapabilities, WorkerAddress, WorkerCommand, WorkerInfo, WorkerStatus,
 };
 use curvine_proto::ComponentInfoProto;
-use curvine_runtime::common::ByteUnit;
+use curvine_runtime::common::{ByteUnit, LocalTime};
 use log::{info, warn};
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
@@ -110,11 +110,14 @@ impl WorkerManager {
             storages,
             component_info,
         )?;
+        self.expire_scheduled_bytes();
         Ok(cmds)
     }
 
-    pub fn choose_worker(&self, ctx: ChooseContext) -> CommonResult<Vec<WorkerAddress>> {
+    pub fn choose_worker(&mut self, ctx: ChooseContext) -> CommonResult<Vec<WorkerAddress>> {
+        self.expire_scheduled_bytes();
         let replicas = ctx.replicas;
+        let block_size = ctx.block_size;
         let workers = self.worker_policy.choose(self.worker_map.workers(), ctx)?;
 
         if workers.is_empty() {
@@ -122,7 +125,47 @@ impl WorkerManager {
         } else if workers.len() > replicas as usize {
             err_box!("The number of workers exceeds the number of replicas")
         } else {
+            self.schedule_chosen_workers(&workers, block_size);
             Ok(workers)
+        }
+    }
+
+    pub(crate) fn unschedule_chosen_workers(&mut self, workers: &[WorkerAddress], block_size: i64) {
+        self.adjust_chosen_workers(workers, block_size, false);
+    }
+
+    fn expire_scheduled_bytes(&mut self) {
+        let timeout_ms = self.conf.master.worker_lost_interval_ms();
+        if timeout_ms == 0 {
+            return;
+        }
+        let now_ms = LocalTime::mills();
+        for worker in self.worker_map.workers.values_mut() {
+            worker.expire_scheduled_bytes(now_ms, timeout_ms);
+        }
+    }
+
+    fn schedule_chosen_workers(&mut self, workers: &[WorkerAddress], block_size: i64) {
+        self.adjust_chosen_workers(workers, block_size, true);
+    }
+
+    fn adjust_chosen_workers(
+        &mut self,
+        workers: &[WorkerAddress],
+        block_size: i64,
+        schedule: bool,
+    ) {
+        if block_size <= 0 {
+            return;
+        }
+        for addr in workers {
+            if let Some(worker) = self.worker_map.workers.get_mut(&addr.worker_id) {
+                if schedule {
+                    worker.schedule_bytes(block_size);
+                } else {
+                    worker.unschedule_bytes(block_size);
+                }
+            }
         }
     }
 
@@ -157,7 +200,8 @@ impl WorkerManager {
         self.worker_map
             .workers()
             .values()
-            .map(|worker| worker.available.max(0))
+            .filter(|worker| worker.is_live())
+            .map(|worker| worker.allocatable_available().max(0))
             .fold(0, i64::saturating_add)
     }
 
@@ -341,5 +385,209 @@ mod tests {
 
         manager.add_test_worker(worker_with_available(3, i64::MAX));
         assert_eq!(manager.available_bytes(), i64::MAX);
+    }
+
+    #[test]
+    fn available_bytes_subtracts_scheduled_bytes() {
+        let mut manager = WorkerManager::new(&ClusterConf::default()).unwrap();
+        let mut worker = worker_with_available(1, 20);
+        worker.scheduled_bytes = 5;
+        manager.add_test_worker(worker);
+        assert_eq!(manager.available_bytes(), 15);
+    }
+
+    #[test]
+    fn available_bytes_ignores_non_live_workers() {
+        let mut manager = WorkerManager::new(&ClusterConf::default()).unwrap();
+        let mut blacklisted = worker_with_available(1, 100);
+        blacklisted.status = WorkerStatus::Blacklist;
+        manager.add_test_worker(blacklisted);
+        manager.add_test_worker(worker_with_available(2, 20));
+        assert_eq!(manager.available_bytes(), 20);
+    }
+
+    fn robin_manager() -> WorkerManager {
+        let mut conf = ClusterConf::default();
+        conf.master.worker_policy = "robin".to_string();
+        WorkerManager::new(&conf).unwrap()
+    }
+
+    fn storage(capacity: i64, available: i64) -> StorageInfo {
+        StorageInfo {
+            storage_id: "disk-0".to_string(),
+            capacity,
+            available,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn choose_worker_stops_after_scheduled_bytes_fill_available() {
+        // 1 GiB remaining / 128 MiB blocks => 8 allocations then skip the node.
+        let mut manager = robin_manager();
+        let available = 1 << 30;
+        let block_size = 128 << 20;
+        let mut worker = worker_with_available(1, available);
+        worker.capacity = available;
+        manager.add_test_worker(worker);
+
+        for i in 0..8 {
+            let chosen = manager
+                .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+                .unwrap();
+            assert_eq!(chosen[0].worker_id, 1, "allocation {i}");
+        }
+
+        assert!(manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .is_err());
+        assert_eq!(
+            manager.get_worker(1).unwrap().scheduled_bytes,
+            8 * block_size
+        );
+    }
+
+    #[test]
+    fn choose_workers_without_block_size_does_not_schedule() {
+        let mut manager = robin_manager();
+        manager.add_test_worker(worker_with_available(1, 1 << 30));
+        manager.choose_workers(1, vec![]).unwrap();
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, 0);
+    }
+
+    #[test]
+    fn heartbeat_keeps_scheduled_bytes_when_available_unchanged() {
+        let mut manager = robin_manager();
+        let available = 1 << 30;
+        let block_size = 128 << 20;
+        let mut worker = worker_with_available(1, available);
+        worker.capacity = available;
+        let addr = worker.address.clone();
+        manager.add_test_worker(worker);
+
+        for _ in 0..8 {
+            manager
+                .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+                .unwrap();
+        }
+
+        let cluster_id = manager.cluster_id.clone();
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr,
+                1,
+                String::new(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![storage(available, available)],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            manager.get_worker(1).unwrap().scheduled_bytes,
+            8 * block_size
+        );
+        assert!(manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .is_err());
+    }
+
+    #[test]
+    fn heartbeat_reclaims_scheduled_bytes_by_available_delta() {
+        let mut manager = robin_manager();
+        let available = 1 << 30;
+        let block_size = 128 << 20;
+        let mut worker = worker_with_available(1, available);
+        worker.capacity = available;
+        let addr = worker.address.clone();
+        manager.add_test_worker(worker);
+
+        for _ in 0..4 {
+            manager
+                .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+                .unwrap();
+        }
+
+        let cluster_id = manager.cluster_id.clone();
+        let remaining = available - 4 * block_size;
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr,
+                1,
+                String::new(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![storage(available, remaining)],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, 0);
+        assert_eq!(
+            manager.get_worker(1).unwrap().allocatable_available(),
+            remaining
+        );
+
+        for i in 0..4 {
+            let chosen = manager
+                .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+                .unwrap();
+            assert_eq!(chosen[0].worker_id, 1, "post-heartbeat allocation {i}");
+        }
+        assert!(manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .is_err());
+    }
+
+    #[test]
+    fn heartbeat_expires_scheduled_bytes_after_lost_interval() {
+        let mut conf = ClusterConf::default();
+        conf.master.worker_policy = "robin".to_string();
+        conf.master.heartbeat_interval = "1ms".to_string();
+        conf.master.worker_lost_interval = "10ms".to_string();
+        conf.master.init().unwrap();
+        let mut manager = WorkerManager::new(&conf).unwrap();
+
+        let available = 1 << 30;
+        let block_size = 128 << 20;
+        let mut worker = worker_with_available(1, available);
+        worker.capacity = available;
+        let addr = worker.address.clone();
+        manager.add_test_worker(worker);
+
+        manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .unwrap();
+        manager
+            .worker_map
+            .workers
+            .get_mut(&1)
+            .unwrap()
+            .scheduled_since_ms = 1;
+
+        let cluster_id = manager.cluster_id.clone();
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr,
+                1,
+                String::new(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![storage(available, available)],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, 0);
     }
 }

@@ -601,7 +601,7 @@ impl MasterFilesystem {
         client_addr: ClientAddress,
         exclude_workers: Vec<u32>,
     ) -> FsResult<Vec<WorkerAddress>> {
-        let wm = self.worker_manager.read();
+        let mut wm = self.worker_manager.write();
         let validate_block = Self::validate_add_block(file, &client_addr, None)?;
         let choose_ctx = ChooseContext::with_block(validate_block, exclude_workers);
         Ok(wm.choose_worker(choose_ctx)?)
@@ -672,13 +672,22 @@ impl MasterFilesystem {
             return self.create_locate_block(path, extend_block, &locs);
         }
 
+        let block_size = file.block_size as i64;
         let choose_workers = self.choose_worker_for_file(file, client_addr, exclude_workers)?;
         let has_spdk = {
             let wm = self.worker_manager.read();
             wm.workers_have_spdk(&choose_workers)
         };
         let block =
-            fs_dir.acquire_new_block(path, inode, commit_blocks, &choose_workers, file_len)?;
+            match fs_dir.acquire_new_block(path, inode, commit_blocks, &choose_workers, file_len) {
+                Ok(block) => block,
+                Err(e) => {
+                    self.worker_manager
+                        .write()
+                        .unschedule_chosen_workers(&choose_workers, block_size);
+                    return Err(e);
+                }
+            };
         let located = LocatedBlock {
             block,
             locs: choose_workers,
@@ -1145,7 +1154,7 @@ impl MasterFilesystem {
                     // allocatable view mirrors the allocation policy. Failed
                     // storage dirs are already excluded from worker.capacity.
                     info.allocatable_capacity += worker.capacity;
-                    info.allocatable_available += worker.available;
+                    info.allocatable_available += worker.allocatable_available().max(0);
                 }
                 WorkerStatus::Blacklist => info.blacklist_workers.push(worker.clone()),
                 WorkerStatus::Decommission => info.decommission_workers.push(worker.clone()),
@@ -1735,13 +1744,22 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
 
-        let choose_workers =
-            self.choose_worker_for_file(inode.as_file_ref()?, client_addr, exclude_workers)?;
+        let file = inode.as_file_ref()?;
+        let block_size = file.block_size as i64;
+        let choose_workers = self.choose_worker_for_file(file, client_addr, exclude_workers)?;
         let has_spdk = {
             let wm = self.worker_manager.read();
             wm.workers_have_spdk(&choose_workers)
         };
-        let block = fs_dir.assign_worker_inode(path, &mut inode, block.id, &choose_workers)?;
+        let block = match fs_dir.assign_worker_inode(path, &mut inode, block.id, &choose_workers) {
+            Ok(block) => block,
+            Err(e) => {
+                self.worker_manager
+                    .write()
+                    .unschedule_chosen_workers(&choose_workers, block_size);
+                return Err(e);
+            }
+        };
 
         Ok(LocatedBlock {
             block,
