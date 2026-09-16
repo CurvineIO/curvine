@@ -266,9 +266,11 @@ mod tests {
 
     #[test]
     fn allocatable_available_subtracts_scheduled_bytes() {
-        let mut worker = WorkerInfo::default();
-        worker.available = 1 << 30;
-        worker.scheduled_bytes = 8 * (128 << 20);
+        let worker = WorkerInfo {
+            available: 1 << 30,
+            scheduled_bytes: 8 * (128 << 20),
+            ..Default::default()
+        };
         assert_eq!(worker.allocatable_available(), 0);
         assert!(!worker.can_allocate(128 << 20));
         assert!(worker.can_allocate(0));
@@ -276,15 +278,19 @@ mod tests {
 
     #[test]
     fn can_allocate_rejects_non_live_worker() {
-        let mut worker = WorkerInfo::default();
-        worker.status = WorkerStatus::Blacklist;
+        let worker = WorkerInfo {
+            status: WorkerStatus::Blacklist,
+            ..Default::default()
+        };
         assert!(!worker.can_allocate(0));
     }
 
     #[test]
     fn heartbeat_reclaim_keeps_unwritten_reservations() {
-        let mut worker = WorkerInfo::default();
-        worker.available = 1 << 30;
+        let mut worker = WorkerInfo {
+            available: 1 << 30,
+            ..Default::default()
+        };
         worker.schedule_bytes(1 << 30);
         worker.reclaim_scheduled_from_heartbeat(1 << 30);
         assert_eq!(worker.scheduled_bytes, 1 << 30);
@@ -293,10 +299,12 @@ mod tests {
 
     #[test]
     fn heartbeat_reclaim_drops_capacity_already_reported() {
-        let mut worker = WorkerInfo::default();
         let prev = 1 << 30;
-        worker.available = prev - 4 * (128 << 20);
-        worker.scheduled_bytes = 8 * (128 << 20);
+        let mut worker = WorkerInfo {
+            available: prev - 4 * (128 << 20),
+            scheduled_bytes: 8 * (128 << 20),
+            ..Default::default()
+        };
         worker.reclaim_scheduled_from_heartbeat(prev);
         assert_eq!(worker.scheduled_bytes, 4 * (128 << 20));
         assert_eq!(worker.allocatable_available(), 0);
@@ -304,10 +312,12 @@ mod tests {
 
     #[test]
     fn heartbeat_reclaim_does_not_go_negative() {
-        let mut worker = WorkerInfo::default();
         let prev = 1 << 30;
-        worker.available = 0;
-        worker.scheduled_bytes = 128 << 20;
+        let mut worker = WorkerInfo {
+            available: 0,
+            scheduled_bytes: 128 << 20,
+            ..Default::default()
+        };
         worker.reclaim_scheduled_from_heartbeat(prev);
         assert_eq!(worker.scheduled_bytes, 0);
     }

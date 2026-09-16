@@ -370,10 +370,14 @@ mod tests {
     use super::*;
 
     fn worker_with_available(worker_id: u32, available: i64) -> WorkerInfo {
-        let mut worker = WorkerInfo::default();
-        worker.address.worker_id = worker_id;
-        worker.available = available;
-        worker
+        WorkerInfo {
+            address: WorkerAddress {
+                worker_id,
+                ..Default::default()
+            },
+            available,
+            ..Default::default()
+        }
     }
 
     #[test]

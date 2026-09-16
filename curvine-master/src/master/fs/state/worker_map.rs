@@ -126,7 +126,8 @@ impl WorkerMap {
             )
         });
 
-        // The worker dcm state does not change
+        // Decommission is operator-managed and must survive heartbeats.
+        // Blacklist is heartbeat-timeout based; a new heartbeat clears it.
         info.status = match previous {
             Some((_, _, _, status)) if status == WorkerStatus::Decommission => status,
             _ => WorkerStatus::Live,

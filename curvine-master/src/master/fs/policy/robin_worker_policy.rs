@@ -86,9 +86,13 @@ mod tests {
     use super::*;
 
     fn worker(id: u32) -> WorkerInfo {
-        let mut worker = WorkerInfo::default();
-        worker.address.worker_id = id;
-        worker
+        WorkerInfo {
+            address: WorkerAddress {
+                worker_id: id,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     #[test]
