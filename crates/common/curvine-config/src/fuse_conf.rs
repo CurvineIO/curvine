@@ -1292,6 +1292,60 @@ negative_timeout_ms = 0
     }
 
     #[test]
+    fn cli_timeout_flags_apply_canonical_and_legacy_aliases() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct FuseCliHarness {
+            #[command(flatten)]
+            fuse: FuseConfCliOverrides,
+        }
+
+        fn apply_flags(argv: &[&str]) -> FuseConf {
+            let parsed = FuseCliHarness::try_parse_from(argv).expect("parse fuse CLI overrides");
+            let mut conf = FuseConf::default();
+            parsed
+                .fuse
+                .apply_to(&mut conf)
+                .expect("apply fuse CLI overrides");
+            conf.init().expect("init after CLI timeout overrides");
+            conf
+        }
+
+        let canonical = apply_flags(&[
+            "curvine-fuse",
+            "--entry-timeout",
+            "2s",
+            "--attr-timeout",
+            "500ms",
+            "--negative-timeout",
+            "250",
+        ]);
+        assert_eq!(canonical.entry_timeout.as_millis(), 2000);
+        assert_eq!(canonical.attr_timeout.as_millis(), 500);
+        assert_eq!(canonical.negative_timeout.as_millis(), 250);
+        assert_eq!(canonical.entry_ttl, Duration::from_secs(2));
+        assert_eq!(canonical.attr_ttl, Duration::from_millis(500));
+        assert_eq!(canonical.negative_ttl, Duration::from_millis(250));
+
+        let legacy = apply_flags(&[
+            "curvine-fuse",
+            "--entry-timeout-ms",
+            "2s",
+            "--attr-timeout-ms",
+            "500",
+            "--negative-timeout-ms",
+            "250ms",
+        ]);
+        assert_eq!(legacy.entry_timeout.as_millis(), 2000);
+        assert_eq!(legacy.attr_timeout.as_millis(), 500);
+        assert_eq!(legacy.negative_timeout.as_millis(), 250);
+        assert_eq!(legacy.entry_ttl, Duration::from_secs(2));
+        assert_eq!(legacy.attr_ttl, Duration::from_millis(500));
+        assert_eq!(legacy.negative_ttl, Duration::from_millis(250));
+    }
+
+    #[test]
     fn toml_legacy_mnt_per_task_alias_preserved() {
         // mnt_per_task was renamed to tasks_per_mnt (issue #1023 §2). FuseConf is
         // #[serde(default)] without deny_unknown_fields, so without a serde alias the

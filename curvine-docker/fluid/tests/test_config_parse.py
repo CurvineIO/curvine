@@ -112,6 +112,28 @@ class ConfigParseTest(unittest.TestCase):
             self.assertEqual(parsed["fuse"]["meta_cache_timeout"], "12h")
             self.assertEqual(parsed["fuse"]["node_cache_timeout"], "24h")
 
+    def test_legacy_fuse_timeout_cli_options_emit_canonical_flags(self):
+        _, script = self.run_parser({
+            "mounts": [{
+                "mountPoint": "curvine:///starrocks/datacache",
+                "name": "curvine",
+                "options": {
+                    "master-endpoints": "master-0:8995",
+                    "entry-timeout-ms": "1000",
+                    "attr-timeout-ms": "2000",
+                    "negative-timeout-ms": "0",
+                },
+            }],
+            "targetPath": "/runtime-mnt/thin/default/curvine-dataset/thin-fuse",
+        })
+
+        self.assertIn("--entry-timeout 1000", script)
+        self.assertIn("--attr-timeout 2000", script)
+        self.assertIn("--negative-timeout 0", script)
+        self.assertNotIn("--entry-timeout-ms", script)
+        self.assertNotIn("--attr-timeout-ms", script)
+        self.assertNotIn("--negative-timeout-ms", script)
+
     def test_managed_fuse_toml_option_is_rejected(self):
         parser = config_parse.ConfigParser()
         parser.mount_options = {"fuse.mnt_path": "/bad"}
