@@ -151,9 +151,12 @@ impl TransferStore for MemoryTransferStore {
     }
 
     fn has_active_transfer_by_key(&self, job_key: &str) -> FsResult<bool> {
-        Ok(self.inner.lock().jobs.values().any(|job| {
-            job.job_key == job_key && !job.state.is_terminal()
-        }))
+        Ok(self
+            .inner
+            .lock()
+            .jobs
+            .values()
+            .any(|job| job.job_key == job_key && !job.state.is_terminal()))
     }
 
     fn find_conflicting_active_transfer(
