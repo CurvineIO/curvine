@@ -506,6 +506,9 @@ impl ProtoUtils {
                 software_version: info.software_version.unwrap_or_default(),
                 startup_time_ms: info.startup_time_ms.unwrap_or_default(),
                 component_info: info.component_info,
+                // Master-only in-flight reservation; not carried on proto.
+                scheduled_bytes: 0,
+                scheduled_since_ms: 0,
             };
             vec.push(worker_info);
         }
