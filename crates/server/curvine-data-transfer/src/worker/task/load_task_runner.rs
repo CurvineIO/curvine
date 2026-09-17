@@ -634,12 +634,16 @@ impl LoadTaskRunner {
         let mut last_progress_time = LocalTime::mills();
 
         // Ensure the target exists with the full block layout (first segment
-        // creates and pre-allocates; concurrent segments reuse it).
-        self.ensure_segment_target(&target_path, plan.total_len)
-            .await?;
-
+        // creates and pre-allocates; concurrent segments reuse it). Reuse
+        // the verified layout when ensure already queried it.
+        let blocks = match self
+            .ensure_segment_target(&target_path, plan.total_len)
+            .await?
+        {
+            Some(blocks) => blocks,
+            None => self.fs.get_block_locations(&target_path).await?,
+        };
         // Locate this segment's block in the target layout.
-        let blocks = self.fs.get_block_locations(&target_path).await?;
         let block_size = blocks.status.block_size.max(1);
         // Use the planner-computed block index (aligned to the job's block
         // size), not offset/block_size here: the live layout may report a
@@ -752,14 +756,20 @@ impl LoadTaskRunner {
     /// every concurrent segment finds each block's layout (and its assigned
     /// worker) via get_block_locations. Concurrent creates race; a
     /// FileAlreadyExists on create means another segment already created it.
-    async fn ensure_segment_target(&self, target_path: &Path, total_len: i64) -> FsResult<()> {
+    async fn ensure_segment_target(
+        &self,
+        target_path: &Path,
+        total_len: i64,
+    ) -> FsResult<Option<FileBlocks>> {
         if target_path.is_cv() {
             match self.fs.open_existing_for_write(target_path).await {
                 // The file may have been created by a concurrent segment
                 // whose resize has not landed yet (create+resize are not
                 // atomic). Verify the pre-allocation before treating the
                 // target as ready instead of trusting open success alone.
-                Ok(_) => self.ensure_segment_size(target_path, total_len).await,
+                Ok(_) => Ok(Some(
+                    self.ensure_segment_size(target_path, total_len).await?,
+                )),
                 Err(FsError::FileNotFound(_)) => {
                     let opts = CreateFileOptsBuilder::new()
                         .create_parent(true)
@@ -779,15 +789,15 @@ impl LoadTaskRunner {
                                     .await?;
                             }
                             writer.flush().await?;
-                            Ok(())
+                            Ok(None)
                         }
                         // Concurrent create race: another segment created the
                         // file. create+resize are not atomic, so verify the
                         // resize actually landed before treating the target as
                         // ready; otherwise re-apply it (review Required).
-                        Err(FsError::FileAlreadyExists(_)) => {
-                            self.ensure_segment_size(target_path, total_len).await
-                        }
+                        Err(FsError::FileAlreadyExists(_)) => Ok(Some(
+                            self.ensure_segment_size(target_path, total_len).await?,
+                        )),
                         Err(err) => Err(err),
                     }
                 }
@@ -795,7 +805,7 @@ impl LoadTaskRunner {
             }
         } else {
             // Non-CV target (unusual for segment tasks, but keep parity).
-            self.create_unified(target_path).await.map(|_| ())
+            self.create_unified(target_path).await.map(|_| None)
         }
     }
 
@@ -805,10 +815,16 @@ impl LoadTaskRunner {
     /// empty layout (staged blocks discarded on cancel, or the creator's
     /// resize not yet visible). Truncate-to-length is idempotent, so
     /// concurrent segments racing here converge safely.
-    async fn ensure_segment_size(&self, target_path: &Path, total_len: i64) -> FsResult<()> {
+    /// Returns the verified layout so callers can reuse it instead of
+    /// querying block locations a second time. (PR #214: layout reuse.)
+    async fn ensure_segment_size(
+        &self,
+        target_path: &Path,
+        total_len: i64,
+    ) -> FsResult<FileBlocks> {
         let blocks = self.fs.get_block_locations(target_path).await?;
         if blocks.status.len >= total_len && !blocks.block_locs.is_empty() {
-            return Ok(());
+            return Ok(blocks);
         }
         let mut writer = self.fs.open_existing_for_write(target_path).await?;
         if total_len > 0 {
@@ -817,7 +833,7 @@ impl LoadTaskRunner {
                 .await?;
         }
         writer.flush().await?;
-        Ok(())
+        self.fs.get_block_locations(target_path).await
     }
 
     /// Stamp commit markers on the committed target (idempotent retry relies
