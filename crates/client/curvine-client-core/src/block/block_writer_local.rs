@@ -19,7 +19,7 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_io::DataSlice;
 use curvine_io::LocalFile;
-use curvine_model::{ExtendedBlock, WorkerAddress};
+use curvine_model::{ExtendedBlock, StorageType, WorkerAddress};
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_sys::RawPtr;
@@ -34,6 +34,7 @@ pub struct BlockWriterLocal {
     block_size: i64,
     seq_id: i32,
     req_id: i64,
+    actual_storage_type: StorageType,
 }
 
 impl BlockWriterLocal {
@@ -74,6 +75,7 @@ impl BlockWriterLocal {
                 )));
             }
         };
+        let actual_storage_type = write_context.storage_type;
         let file = LocalFile::with_write_offset(path, false, pos)?;
 
         let writer = Self {
@@ -85,6 +87,7 @@ impl BlockWriterLocal {
             block_size,
             seq_id,
             req_id,
+            actual_storage_type,
         };
 
         Ok(writer)
@@ -176,6 +179,10 @@ impl BlockWriterLocal {
 
     pub fn worker_address(&self) -> &WorkerAddress {
         &self.worker_address
+    }
+
+    pub fn actual_storage_type(&self) -> StorageType {
+        self.actual_storage_type
     }
 
     pub async fn seek(&mut self, pos: i64) -> FsResult<()> {

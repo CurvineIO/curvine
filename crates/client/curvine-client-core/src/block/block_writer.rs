@@ -22,7 +22,7 @@ use curvine_core_error::ErrorExt;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_io::DataSlice;
-use curvine_model::{BlockLocation, CommitBlock, LocatedBlock, WorkerAddress};
+use curvine_model::{BlockLocation, CommitBlock, LocatedBlock, StorageType, WorkerAddress};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use futures::future::{join_all, try_join_all};
 use std::sync::Arc;
@@ -57,6 +57,13 @@ impl WriterAdapter {
         match self {
             Local(f) => f.worker_address(),
             Remote(f) => f.worker_address(),
+        }
+    }
+
+    fn actual_storage_type(&self) -> StorageType {
+        match self {
+            Local(f) => f.actual_storage_type(),
+            Remote(f) => f.actual_storage_type(),
         }
     }
 
@@ -322,12 +329,13 @@ impl BlockWriter {
 
     pub fn to_commit_block(&self) -> CommitBlock {
         let locs = self
-            .locate
-            .locs
+            .inners
             .iter()
-            .map(|x| BlockLocation {
-                worker_id: x.worker_id,
-                storage_type: self.locate.block.storage_type,
+            .map(|writer| {
+                BlockLocation::new(
+                    writer.worker_address().worker_id,
+                    writer.actual_storage_type(),
+                )
             })
             .collect();
 
