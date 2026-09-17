@@ -964,7 +964,7 @@ where
             }
         };
         let mount = job_mount_snapshot_async(job, &self.cache).await?;
-        let job_info = self.planner_job_info(job, &mount)?;
+        let job_info = self.planner_job_info(job, &mount).await?;
         let limit = self.conf.worker_dispatch_concurrency();
         // Count tasks that could not be placed this round because no worker had
         // capacity (choose_worker returned None). They stay Pending in store and
@@ -1014,12 +1014,12 @@ where
         Ok(started.into_iter().filter(|value| *value).count())
     }
 
-    fn planner_job_info(
+    async fn planner_job_info(
         &self,
         job: &TransferJobRecord,
         mount: &curvine_model::MountInfo,
     ) -> FsResult<curvine_model::LoadJobInfo> {
-        self.planner.load_job_info(job, mount)
+        self.planner.load_job_info(job, mount).await
     }
 
     /// Redeliver transiently failed tasks instead of failing the job.

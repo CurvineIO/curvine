@@ -350,7 +350,7 @@ impl TransferPlanner {
     ) -> FsResult<PlannedTransfer> {
         let source = Path::from_str(&job.source_path)?;
         let target = Path::from_str(&job.target_path)?;
-        let job_info = self.load_job_info(job, &mount)?;
+        let job_info = self.load_job_info(job, &mount).await?;
         let source_status = self.get_status(&source, &mount).await?;
         let incremental_load = job.kind == TransferKind::Load && !source.is_cv() && target.is_cv();
         let target_status = if incremental_load {
@@ -412,23 +412,35 @@ impl TransferPlanner {
 
             let task_target = append_relative_path(&source, &target, &path)?;
             validate_transfer_target(&status, target_status.as_ref(), &task_target)?;
-            let unchanged =
-                if incremental_load && unchanged_load_target(&status, target_status.as_ref()) {
-                    true
-                } else if incremental_load
-                    && needs_source_status_refresh(&status, target_status.as_ref())
-                {
-                    let current_source_status = self.get_status(&path, &mount).await?;
-                    unchanged_load_target(&current_source_status, target_status.as_ref())
-                } else {
-                    false
-                };
+            // Replica reconciliation: a cached copy whose replica count differs
+            // from the mount's replica setting is re-copied even when its
+            // content is unchanged, so the configured replicas are enforced.
+            let replicas_mismatch = incremental_load
+                && load_replica_mismatch(target_status.as_ref(), job_info.replicas);
+            let unchanged = if replicas_mismatch {
+                false
+            } else if incremental_load && unchanged_load_target(&status, target_status.as_ref()) {
+                true
+            } else if incremental_load
+                && needs_source_status_refresh(&status, target_status.as_ref())
+            {
+                let current_source_status = self.get_status(&path, &mount).await?;
+                unchanged_load_target(&current_source_status, target_status.as_ref())
+            } else {
+                false
+            };
             if unchanged {
                 skipped_files += 1;
                 skipped_size += status.len;
                 continue;
             }
             total_size += status.len;
+            if replicas_mismatch {
+                // Forced overwrite: drop the stale cached copy up front so the
+                // tasks below rebuild it with the expected replica count even
+                // when the job runs with overwrite=false.
+                self.master_fs.delete(&task_target, false).await?;
+            }
 
             if batching {
                 // Large files (>= batch target) are split into per-block
@@ -731,12 +743,34 @@ impl TransferPlanner {
         }
     }
 
-    pub(crate) fn load_job_info(
+    pub(crate) async fn load_job_info(
         &self,
         job: &TransferJobRecord,
         mount: &MountInfo,
     ) -> FsResult<LoadJobInfo> {
-        load_job_info(job, mount, &self.client_conf)
+        let mount_dir_replicas = if job.kind == TransferKind::Load {
+            self.mount_dir_replicas(mount).await?
+        } else {
+            None
+        };
+        load_job_info(job, mount, mount_dir_replicas, &self.client_conf)
+    }
+
+    /// Real replica count of the mount-point directory inode, read from master
+    /// metadata. This is the ground truth the incremental-load replica check
+    /// compares against — not the client-side default configuration. A
+    /// transient master error propagates (planning retries) instead of
+    /// silently switching the baseline to the client default, which would
+    /// misjudge every file as mismatched and trigger a full re-copy.
+    async fn mount_dir_replicas(&self, mount: &MountInfo) -> FsResult<Option<i32>> {
+        let path = Path::from_str(&mount.cv_path)?;
+        match self.get_status(&path, mount).await {
+            Ok(status) => Ok((status.replicas > 0).then_some(status.replicas)),
+            // The mount-point directory is gone; nothing authoritative left to
+            // compare against, fall back to the client default.
+            Err(FsError::FileNotFound(_)) => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 
     async fn get_status(&self, path: &Path, mount: &MountInfo) -> FsResult<FileStatus> {
@@ -832,6 +866,13 @@ pub(crate) fn unchanged_load_target(source: &FileStatus, target: Option<&FileSta
     !target.is_dir && target.is_complete() && target.cv_valid(Some(source))
 }
 
+/// A cached target whose replica count diverges from the job's replica setting
+/// (the mount's replicas unless the command overrode it) must be re-copied even
+/// when its content is unchanged, so the configured replicas are enforced.
+pub(crate) fn load_replica_mismatch(target: Option<&FileStatus>, replicas: i32) -> bool {
+    target.is_some_and(|target| !target.is_dir && target.replicas != replicas)
+}
+
 pub(crate) fn needs_source_status_refresh(
     source: &FileStatus,
     target: Option<&FileStatus>,
@@ -872,9 +913,16 @@ fn validate_transfer_target(
 pub(crate) fn load_job_info(
     job: &TransferJobRecord,
     mount: &MountInfo,
+    mount_dir_replicas: Option<i32>,
     client_conf: &ClientConf,
 ) -> FsResult<LoadJobInfo> {
-    let default_replicas = mount.replicas.unwrap_or(client_conf.replicas);
+    // Replica precedence: explicit command option, mount config, then the real
+    // replica count of the mount-point directory inode in master metadata. The
+    // client default only covers the case where master metadata is unreachable.
+    let default_replicas = mount
+        .replicas
+        .or(mount_dir_replicas)
+        .unwrap_or(client_conf.replicas);
     let (replicas, overwrite) = match transfer_command(job) {
         Ok(command) => {
             let replicas = command
@@ -1065,7 +1113,7 @@ mod tests {
             ..Default::default()
         };
 
-        let info = load_job_info(&job(command), &mount, &client_conf).unwrap();
+        let info = load_job_info(&job(command), &mount, None, &client_conf).unwrap();
         assert_eq!(info.replicas, 3);
     }
 
@@ -1081,7 +1129,47 @@ mod tests {
             replicas: Some(2),
             ..Default::default()
         };
-        let info = load_job_info(&job(command), &mount, &ClientConf::default()).unwrap();
+        let info = load_job_info(&job(command), &mount, None, &ClientConf::default()).unwrap();
         assert_eq!(info.replicas, 2);
+    }
+
+    #[test]
+    fn load_job_info_falls_back_to_mount_dir_inode_before_client_conf() {
+        let command = TransferCommand {
+            kind: TransferKind::Load,
+            source_path: "s3://bucket/a".to_string(),
+            target_path: "/mnt/a".to_string(),
+            ..Default::default()
+        };
+        let mount = MountInfo {
+            replicas: None,
+            ..Default::default()
+        };
+
+        // Master metadata (mount-point directory inode) wins over client conf.
+        let info = load_job_info(
+            &job(command.clone()),
+            &mount,
+            Some(5),
+            &ClientConf {
+                replicas: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(info.replicas, 5);
+
+        // Client conf only covers an unreachable master metadata lookup.
+        let info = load_job_info(
+            &job(command),
+            &mount,
+            None,
+            &ClientConf {
+                replicas: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(info.replicas, 1);
     }
 }

@@ -18,7 +18,9 @@ use curvine_model::{
     TransferKind, TransferProgress, TransferState,
 };
 
-use super::planner::{load_job_info, needs_source_status_refresh, unchanged_load_target};
+use super::planner::{
+    load_job_info, load_replica_mismatch, needs_source_status_refresh, unchanged_load_target,
+};
 
 fn source_status(mtime: i64, len: i64) -> FileStatus {
     FileStatus {
@@ -68,6 +70,23 @@ fn incomplete_or_cv_missing_target_is_not_skipped() {
     let mut cv_missing = target_status(10, 1024);
     cv_missing.storage_policy.state = StorageState::Ufs;
     assert!(!unchanged_load_target(&source, Some(&cv_missing)));
+}
+
+#[test]
+fn replica_mismatch_forces_recopy_even_when_content_unchanged() {
+    let source = source_status(10, 1024);
+    let mut target = target_status(10, 1024);
+    target.replicas = 1;
+
+    // Same fingerprint as the source but the replica count diverges from the
+    // mount setting: planner must treat the file as changed.
+    assert!(load_replica_mismatch(Some(&target), 3));
+    assert!(!load_replica_mismatch(Some(&target), 1));
+    assert!(!load_replica_mismatch(None, 3));
+
+    // Replica parity keeps the unchanged skip intact.
+    let matched = target_status(10, 1024);
+    assert!(unchanged_load_target(&source, Some(&matched)));
 }
 
 #[test]
@@ -222,7 +241,9 @@ fn load_replicas_override_mount_and_service_defaults() {
     };
 
     assert_eq!(
-        load_job_info(&job, &mount, &client_conf).unwrap().replicas,
+        load_job_info(&job, &mount, None, &client_conf)
+            .unwrap()
+            .replicas,
         3
     );
 }
