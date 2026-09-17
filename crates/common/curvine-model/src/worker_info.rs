@@ -60,10 +60,6 @@ pub struct WorkerInfo {
     pub startup_time_ms: u64,
     pub capacity: i64,
     pub available: i64,
-    #[serde(default)]
-    pub scheduled_bytes: i64,
-    #[serde(default)]
-    pub scheduled_since_ms: u64,
     pub fs_used: i64,
     pub non_fs_used: i64,
     pub reserved_bytes: i64,
@@ -77,6 +73,11 @@ pub struct WorkerInfo {
     /// heartbeat. `None` means a legacy worker that only sent the display
     /// string `software_version`.
     pub component_info: Option<ComponentInfoProto>,
+    /// Master-only in-flight reservation. Not on proto or `/api/workers`.
+    #[serde(skip)]
+    pub scheduled_bytes: i64,
+    #[serde(skip)]
+    pub scheduled_since_ms: u64,
 }
 
 impl WorkerInfo {
@@ -92,8 +93,6 @@ impl WorkerInfo {
             startup_time_ms: 0,
             capacity: 0,
             available: 0,
-            scheduled_bytes: 0,
-            scheduled_since_ms: 0,
             fs_used: 0,
             non_fs_used: 0,
             reserved_bytes: 0,
@@ -104,6 +103,8 @@ impl WorkerInfo {
             worker_session_id: String::new(),
             transfer_capabilities: TransferWorkerCapabilities::default(),
             component_info: None,
+            scheduled_bytes: 0,
+            scheduled_since_ms: 0,
         }
     }
 
@@ -147,6 +148,10 @@ impl WorkerInfo {
     pub fn can_allocate(&self, block_size: i64) -> bool {
         if !self.is_live() {
             return false;
+        }
+        // 0 is a valid size: no capacity constraint, pick any live worker.
+        if block_size <= 0 {
+            return true;
         }
         if self.storage_map.is_empty() {
             return self.allocatable_available() >= block_size;
@@ -226,8 +231,6 @@ impl Default for WorkerInfo {
             startup_time_ms: 0,
             capacity: 1 << 30,
             available: 1 << 30,
-            scheduled_bytes: 0,
-            scheduled_since_ms: 0,
             fs_used: 0,
             non_fs_used: 0,
             reserved_bytes: 0,
@@ -238,6 +241,8 @@ impl Default for WorkerInfo {
             worker_session_id: String::new(),
             transfer_capabilities: TransferWorkerCapabilities::default(),
             component_info: None,
+            scheduled_bytes: 0,
+            scheduled_since_ms: 0,
         }
     }
 }
@@ -277,12 +282,24 @@ mod tests {
     }
 
     #[test]
+    fn can_allocate_zero_block_size_picks_live_worker() {
+        let worker = WorkerInfo {
+            available: 0,
+            scheduled_bytes: 0,
+            ..Default::default()
+        };
+        assert!(worker.can_allocate(0));
+        assert!(!worker.can_allocate(1));
+    }
+
+    #[test]
     fn can_allocate_rejects_non_live_worker() {
         let worker = WorkerInfo {
             status: WorkerStatus::Blacklist,
             ..Default::default()
         };
         assert!(!worker.can_allocate(0));
+        assert!(!worker.can_allocate(128));
     }
 
     #[test]

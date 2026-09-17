@@ -460,6 +460,17 @@ mod tests {
     }
 
     #[test]
+    fn choose_worker_zero_block_size_does_not_schedule() {
+        let mut manager = robin_manager();
+        manager.add_test_worker(worker_with_available(1, 0));
+        let chosen = manager
+            .choose_worker(ChooseContext::with_num(1, 0, vec![]))
+            .unwrap();
+        assert_eq!(chosen[0].worker_id, 1);
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, 0);
+    }
+
+    #[test]
     fn heartbeat_keeps_scheduled_bytes_when_available_unchanged() {
         let mut manager = robin_manager();
         let available = 1 << 30;

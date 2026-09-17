@@ -143,4 +143,25 @@ mod tests {
             .unwrap()
             .is_empty());
     }
+
+    #[test]
+    fn choose_zero_block_size_accepts_full_live_worker() {
+        let policy = RobinWorkerPolicy::new();
+        let mut workers = IndexMap::new();
+        let mut w = worker(1);
+        w.available = 0;
+        workers.insert(1, w);
+
+        assert_eq!(
+            policy
+                .choose(&workers, ChooseContext::with_num(1, 0, vec![]))
+                .unwrap()[0]
+                .worker_id,
+            1
+        );
+        assert!(policy
+            .choose(&workers, ChooseContext::with_num(1, 1, vec![]))
+            .unwrap()
+            .is_empty());
+    }
 }

@@ -450,8 +450,6 @@ impl ProtoUtils {
                 address: Self::worker_address_from_pb(&info.address),
                 capacity: info.capacity,
                 available: info.available,
-                scheduled_bytes: 0,
-                scheduled_since_ms: 0,
                 fs_used: info.fs_used,
                 non_fs_used: info.non_fs_used,
                 reserved_bytes: info.reserved_bytes,

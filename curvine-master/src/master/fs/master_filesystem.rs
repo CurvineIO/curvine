@@ -1752,7 +1752,14 @@ impl MasterFilesystem {
             wm.workers_have_spdk(&choose_workers)
         };
         let block = match fs_dir.assign_worker_inode(path, &mut inode, block.id, &choose_workers) {
-            Ok(block) => block,
+            Ok((block, assigned)) => {
+                if !assigned {
+                    self.worker_manager
+                        .write()
+                        .unschedule_chosen_workers(&choose_workers, block_size);
+                }
+                block
+            }
             Err(e) => {
                 self.worker_manager
                     .write()
@@ -2110,5 +2117,86 @@ mod tests {
             "lost worker capacity must not leak into allocatable"
         );
         assert_eq!(info.allocatable_available, 800);
+    }
+
+    #[test]
+    fn worker_info_rest_json_omits_scheduled_fields() {
+        let mut worker = worker_with_status(1, WorkerStatus::Live, 1000, 800);
+        worker.scheduled_bytes = 128;
+        worker.scheduled_since_ms = 99;
+        let json = serde_json::to_string(&worker).unwrap();
+        assert!(!json.contains("scheduled_bytes"));
+        assert!(!json.contains("scheduled_since_ms"));
+    }
+
+    #[test]
+    fn assign_worker_retry_does_not_leak_scheduled_bytes() {
+        let fs = test_fs("assign-worker-retry-unschedule");
+        let capacity = 1 << 30;
+        fs.add_test_worker(worker_with_status(
+            1,
+            WorkerStatus::Live,
+            capacity,
+            capacity,
+        ));
+
+        let created = fs.create("/retry.log", true).unwrap();
+        let blocks = fs
+            .resize(
+                "/retry.log",
+                FileAllocOpts::with_alloc(created.block_size, FileAllocMode::DEFAULT),
+            )
+            .unwrap();
+        let located = &blocks.block_locs[0];
+        assert!(located.block.alloc_opts.is_some());
+        assert!(located.locs.is_empty());
+        let block = located.block.clone();
+        let client = ClientAddress::default();
+
+        fs.assign_worker("/retry.log", block.clone(), client.clone(), vec![])
+            .unwrap();
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            created.block_size
+        );
+
+        // Idempotent retry must not stack a second reservation on top of the
+        // first successful assignment.
+        fs.assign_worker("/retry.log", block.clone(), client.clone(), vec![])
+            .unwrap();
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            created.block_size
+        );
+
+        // After heartbeat reports the write, leftover reservation is gone.
+        // Another retry still must not leak scheduled_bytes.
+        {
+            let mut wm = fs.worker_manager.write();
+            let worker = wm.worker_map.workers.get_mut(&1).unwrap();
+            let prev = worker.available;
+            worker.available = prev - created.block_size;
+            worker.reclaim_scheduled_from_heartbeat(prev);
+            assert_eq!(worker.scheduled_bytes, 0);
+        }
+
+        fs.assign_worker("/retry.log", block, client, vec![])
+            .unwrap();
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            0
+        );
     }
 }
