@@ -121,6 +121,7 @@ message GetTransferStatusResponse {
   optional int64 lease_expire_at = 16;
   optional uint64 cv_metadata_epoch = 17;
   optional TransferTaskSummaryProto task_summary = 18;
+  optional bool task_details_expired = 19;
 }
 
 message ListTransfersRequest {
@@ -182,6 +183,7 @@ message WatchTransferResponse {
   optional int64 lease_expire_at = 14;
   optional uint64 cv_metadata_epoch = 15;
   optional TransferTaskSummaryProto task_summary = 16;
+  optional bool task_details_expired = 17;
 }
 
 message CancelTransferRequest {

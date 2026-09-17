@@ -28,8 +28,9 @@ use std::thread;
 use std::time::Duration;
 
 use crate::transfer::{
-    TransferMountSnapshotUpdate, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
-    TransferTaskStateUpdate,
+    ensure_task_transaction_bound, TransferMountSnapshotUpdate, TransferPlannedTasks,
+    TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate, MAX_JOBS_PER_STORE_TRANSACTION,
+    MAX_TASKS_PER_STORE_TRANSACTION,
 };
 
 const TRANSFER_SCHEMA_VERSION: u64 = 4;
@@ -62,6 +63,97 @@ type TaskSummaryRow = (
     Option<i64>,
     Option<i64>,
 );
+
+fn mysql_cleanup_lease_owned(
+    conn: &mut impl Queryable,
+    owner: &str,
+    now_ms: i64,
+) -> FsResult<bool> {
+    conn.exec_first(
+        "select 1 from transfer_cleanup_lease
+         where id = 1 and owner = :owner and lease_expire_at > :now_ms for update",
+        params! { "owner" => owner, "now_ms" => now_ms },
+    )
+    .map(|row: Option<u8>| row.is_some())
+    .map_err(mysql_err)
+}
+
+fn mysql_purge_terminal_task_rows(
+    conn: &mut impl Queryable,
+    older_than_ms: i64,
+    task_limit: usize,
+) -> FsResult<usize> {
+    let task_limit = task_limit.min(MAX_TASKS_PER_STORE_TRANSACTION);
+    let keys: Vec<(String, u64, String)> = conn
+        .exec(
+            "select t.job_id, t.run_id, t.task_id from transfer_tasks t
+             join transfer_jobs j on t.job_id = j.job_id and t.run_id = j.run_id
+             where j.state in (6, 7, 8, 9) and j.updated_at < :older_than_ms
+               and json_type(json_extract(j.record_json, '$.terminal_summary')) = 'OBJECT'
+               and json_type(json_extract(j.record_json, '$.terminal_counts')) = 'OBJECT'
+             order by j.updated_at asc, t.task_id asc
+             limit :limit",
+            params! {
+                "older_than_ms" => older_than_ms,
+                "limit" => task_limit as u64,
+            },
+        )
+        .map_err(mysql_err)?;
+    let deleted = keys.len();
+    for (job_id, run_id, task_id) in &keys {
+        conn.exec_drop(
+            "delete from transfer_tasks
+             where job_id = :job_id and run_id = :run_id and task_id = :task_id",
+            params! {
+                "job_id" => job_id,
+                "run_id" => run_id,
+                "task_id" => task_id,
+            },
+        )
+        .map_err(mysql_err)?;
+    }
+    Ok(deleted)
+}
+
+fn mysql_purge_terminal_job_rows(
+    conn: &mut impl Queryable,
+    older_than_ms: i64,
+    limit: usize,
+) -> FsResult<usize> {
+    let limit = limit.min(MAX_JOBS_PER_STORE_TRANSACTION);
+    let keys: Vec<(String, u64)> = conn
+        .exec(
+            "select j.job_id, j.run_id from transfer_jobs j
+             where j.state in (6, 7, 8, 9) and j.updated_at < :older_than_ms
+               and not exists (
+                   select 1 from transfer_tasks t
+                   where t.job_id = j.job_id and t.run_id = j.run_id
+               )
+             order by j.updated_at asc
+             limit :limit",
+            params! {
+                "older_than_ms" => older_than_ms,
+                "limit" => limit as u64,
+            },
+        )
+        .map_err(mysql_err)?;
+    for (job_id, run_id) in &keys {
+        conn.exec_drop(
+            "delete from transfer_jobs
+             where job_id = :job_id and run_id = :run_id and state in (6, 7, 8, 9)
+               and not exists (
+                   select 1 from transfer_tasks t
+                   where t.job_id = :job_id and t.run_id = :run_id
+               )",
+            params! {
+                "job_id" => job_id,
+                "run_id" => run_id,
+            },
+        )
+        .map_err(mysql_err)?;
+    }
+    Ok(keys.len())
+}
 
 pub struct MysqlTransferStore {
     pool: Pool,
@@ -277,36 +369,112 @@ impl TransferStore for MysqlTransferStore {
         if limit == 0 {
             return Ok(0);
         }
+        let _ =
+            self.purge_terminal_tasks(older_than_ms, limit.min(MAX_TASKS_PER_STORE_TRANSACTION))?;
+        self.purge_terminal_jobs(older_than_ms, limit.min(MAX_JOBS_PER_STORE_TRANSACTION))
+    }
+
+    fn purge_terminal_tasks(&self, older_than_ms: i64, task_limit: usize) -> FsResult<usize> {
+        if task_limit == 0 {
+            return Ok(0);
+        }
+        let task_limit = task_limit.min(MAX_TASKS_PER_STORE_TRANSACTION);
         let mut conn = self.conn()?;
         let mut tx = conn
             .start_transaction(TxOpts::default())
             .map_err(mysql_err)?;
-        let job_ids: Vec<String> = tx
-            .exec(
-                "select job_id from transfer_jobs
-                 where state in (6, 7, 8, 9) and updated_at < :older_than_ms
-                 order by updated_at asc
-                 limit :limit",
-                params! {
-                    "older_than_ms" => older_than_ms,
-                    "limit" => limit as u64,
-                },
-            )
-            .map_err(mysql_err)?;
-        for job_id in &job_ids {
-            tx.exec_drop(
-                "delete from transfer_tasks where job_id = :job_id",
-                params! { "job_id" => job_id },
-            )
-            .map_err(mysql_err)?;
-            tx.exec_drop(
-                "delete from transfer_jobs where job_id = :job_id and state in (6, 7, 8, 9)",
-                params! { "job_id" => job_id },
-            )
-            .map_err(mysql_err)?;
-        }
+        let deleted = mysql_purge_terminal_task_rows(&mut tx, older_than_ms, task_limit)?;
         tx.commit().map_err(mysql_err)?;
-        Ok(job_ids.len())
+        Ok(deleted)
+    }
+
+    fn purge_terminal_tasks_with_cleanup_lease(
+        &self,
+        older_than_ms: i64,
+        task_limit: usize,
+        owner: &str,
+        now_ms: i64,
+    ) -> FsResult<usize> {
+        if task_limit == 0 {
+            return Ok(0);
+        }
+        let task_limit = task_limit.min(MAX_TASKS_PER_STORE_TRANSACTION);
+        let mut conn = self.conn()?;
+        let mut tx = conn
+            .start_transaction(TxOpts::default())
+            .map_err(mysql_err)?;
+        if !mysql_cleanup_lease_owned(&mut tx, owner, now_ms)? {
+            tx.commit().map_err(mysql_err)?;
+            return Ok(0);
+        }
+        let deleted = mysql_purge_terminal_task_rows(&mut tx, older_than_ms, task_limit)?;
+        tx.commit().map_err(mysql_err)?;
+        Ok(deleted)
+    }
+
+    fn purge_terminal_jobs(&self, older_than_ms: i64, limit: usize) -> FsResult<usize> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let limit = limit.min(MAX_JOBS_PER_STORE_TRANSACTION);
+        let mut conn = self.conn()?;
+        let mut tx = conn
+            .start_transaction(TxOpts::default())
+            .map_err(mysql_err)?;
+        let deleted = mysql_purge_terminal_job_rows(&mut tx, older_than_ms, limit)?;
+        tx.commit().map_err(mysql_err)?;
+        Ok(deleted)
+    }
+
+    fn purge_terminal_jobs_with_cleanup_lease(
+        &self,
+        older_than_ms: i64,
+        limit: usize,
+        owner: &str,
+        now_ms: i64,
+    ) -> FsResult<usize> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let mut conn = self.conn()?;
+        let mut tx = conn
+            .start_transaction(TxOpts::default())
+            .map_err(mysql_err)?;
+        if !mysql_cleanup_lease_owned(&mut tx, owner, now_ms)? {
+            tx.commit().map_err(mysql_err)?;
+            return Ok(0);
+        }
+        let deleted = mysql_purge_terminal_job_rows(&mut tx, older_than_ms, limit)?;
+        tx.commit().map_err(mysql_err)?;
+        Ok(deleted)
+    }
+
+    fn try_acquire_cleanup_lease(&self, owner: &str, now_ms: i64, lease_ms: i64) -> FsResult<bool> {
+        let mut conn = self.conn()?;
+        let mut tx = conn
+            .start_transaction(TxOpts::default())
+            .map_err(mysql_err)?;
+        // One conditional upsert makes first acquisition atomic too. A
+        // select-then-insert lets two empty-table transactions both claim it.
+        tx.exec_drop(
+            "insert into transfer_cleanup_lease(id, owner, lease_expire_at)
+             values (1, :owner, :lease_expire_at)
+             on duplicate key update
+                 owner=if(owner=values(owner) or lease_expire_at<=:now_ms, values(owner), owner),
+                 lease_expire_at=if(owner=values(owner) or lease_expire_at<=:now_ms,
+                                    values(lease_expire_at), lease_expire_at)",
+            params! {
+                "owner" => owner,
+                "lease_expire_at" => now_ms.saturating_add(lease_ms.max(1)),
+                "now_ms" => now_ms,
+            },
+        )
+        .map_err(mysql_err)?;
+        let current_owner: Option<String> = tx
+            .query_first("select owner from transfer_cleanup_lease where id = 1")
+            .map_err(mysql_err)?;
+        tx.commit().map_err(mysql_err)?;
+        Ok(current_owner.as_deref() == Some(owner))
     }
 
     fn list_transfer_tasks(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
@@ -754,6 +922,7 @@ impl TransferStore for MysqlTransferStore {
     }
 
     fn insert_tasks(&self, tasks: Vec<TransferTaskRecord>) -> FsResult<()> {
+        ensure_task_transaction_bound(tasks.len())?;
         let mut conn = self.conn()?;
         let mut tx = conn
             .start_transaction(TxOpts::default())
@@ -765,7 +934,33 @@ impl TransferStore for MysqlTransferStore {
         Ok(())
     }
 
+    fn append_planned_tasks(&self, update: TransferPlannedTasks) -> FsResult<bool> {
+        ensure_task_transaction_bound(update.tasks.len())?;
+        let mut conn = self.conn()?;
+        let mut tx = conn
+            .start_transaction(TxOpts::default())
+            .map_err(mysql_err)?;
+        match select_job_by_id_for_update(&mut tx, &update.job_id)? {
+            Some(job)
+                if job.run_id == update.run_id
+                    && job.owner == update.owner
+                    && job.lease_epoch == update.lease_epoch
+                    && job.lease_expire_at > update.now_ms
+                    && job.state == TransferState::Planning => {}
+            _ => {
+                tx.commit().map_err(mysql_err)?;
+                return Ok(false);
+            }
+        }
+        for task in update.tasks {
+            insert_task(&mut tx, &task)?;
+        }
+        tx.commit().map_err(mysql_err)?;
+        Ok(true)
+    }
+
     fn persist_planned_tasks(&self, update: TransferPlannedTasks) -> FsResult<bool> {
+        ensure_task_transaction_bound(update.tasks.len())?;
         let mut conn = self.conn()?;
         let mut tx = conn
             .start_transaction(TxOpts::default())
@@ -795,6 +990,16 @@ impl TransferStore for MysqlTransferStore {
         let updated = exec_update_job(&mut tx, &job)?;
         tx.commit().map_err(mysql_err)?;
         Ok(updated)
+    }
+
+    fn has_transfer_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool> {
+        self.conn()?
+            .exec_first(
+                "select 1 from transfer_tasks where job_id = :job_id and run_id = :run_id limit 1",
+                params! { "job_id" => job_id, "run_id" => run_id },
+            )
+            .map(|row: Option<u8>| row.is_some())
+            .map_err(mysql_err)
     }
 
     fn update_task_state(&self, update: TransferTaskStateUpdate) -> FsResult<bool> {
@@ -900,6 +1105,7 @@ impl TransferStore for MysqlTransferStore {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
+        ensure_task_transaction_bound(candidates.len())?;
         let mut conn = self.conn()?;
         let mut tx = conn
             .start_transaction(TxOpts::default())
@@ -1127,6 +1333,10 @@ impl TransferStore for MysqlTransferStore {
         task.last_report_at = start.now_ms;
         task.stale_deadline_at = start.stale_deadline_at;
         task.updated_at = start.now_ms;
+        task.progress.loaded_size = start
+            .resume_loaded_size
+            .clamp(0, task.progress.total_size.max(0));
+        task.progress.update_time = start.now_ms;
         let updated = exec_update_task(&mut tx, &task)?;
         tx.commit().map_err(mysql_err)?;
         Ok(updated)
@@ -1152,7 +1362,40 @@ impl TransferStore for MysqlTransferStore {
 
     fn update_task_report(&self, report: TransferTaskReport) -> FsResult<bool> {
         let mut conn = self.conn()?;
-        let sql = "update transfer_tasks
+        let (sql, loaded) = match report.state {
+            TransferTaskState::Running => (
+                "update transfer_tasks
+             set state = :state, progress_loaded_size = greatest(progress_loaded_size, :progress_loaded_size),
+                 progress_total_size = :progress_total_size,
+                 progress_updated_at = :progress_updated_at,
+                 progress_message = :progress_message, last_report_at = :last_report_at,
+                 stale_deadline_at = :stale_deadline_at,
+                 record_json = json_set(record_json,
+                     '$.state', case :state
+                         when 1 then 'Pending'
+                         when 2 then 'Running'
+                         when 3 then 'Completed'
+                         when 4 then 'Failed'
+                         when 5 then 'Canceled'
+                         when 6 then 'Stale'
+                     end,
+                     '$.progress.loaded_size', greatest(coalesce(cast(json_unquote(json_extract(record_json, '$.progress.loaded_size')) as signed), 0), :progress_loaded_size),
+                     '$.progress.total_size', :progress_total_size,
+                     '$.progress.update_time', :progress_updated_at,
+                     '$.progress.message', :progress_message,
+                     '$.last_report_at', :last_report_at,
+                     '$.stale_deadline_at', :stale_deadline_at,
+                     '$.updated_at', :updated_at,
+                     '$.accepted_at_ms', :accepted_at_ms,
+                     '$.first_byte_at_ms', :first_byte_at_ms),
+                 updated_at = :updated_at
+             where job_id = :job_id and run_id = :run_id and task_id = :task_id
+               and attempt_id = :attempt_id and worker_id = :worker_id
+               and worker_session_id = :worker_session_id and state in (1, 2)",
+                report.progress.loaded_size.max(0),
+            ),
+            _ => (
+                "update transfer_tasks
              set state = :state, progress_loaded_size = :progress_loaded_size,
                  progress_total_size = :progress_total_size,
                  progress_updated_at = :progress_updated_at,
@@ -1179,13 +1422,16 @@ impl TransferStore for MysqlTransferStore {
                  updated_at = :updated_at
              where job_id = :job_id and run_id = :run_id and task_id = :task_id
                and attempt_id = :attempt_id and worker_id = :worker_id
-               and worker_session_id = :worker_session_id and state in (1, 2)";
+               and worker_session_id = :worker_session_id and state in (1, 2)",
+                report.progress.loaded_size,
+            ),
+        };
         let updated = exec_affected(
             &mut conn,
             sql,
             params! {
                 "state" => report.state as i32,
-                "progress_loaded_size" => report.progress.loaded_size,
+                "progress_loaded_size" => loaded,
                 "progress_total_size" => report.progress.total_size,
                 "progress_updated_at" => report.progress.update_time,
                 "progress_message" => &report.progress.message,
@@ -1221,6 +1467,37 @@ impl TransferStore for MysqlTransferStore {
              where job_id = :job_id and run_id = :run_id",
                 params! {
                     "summary_json" => summary_json,
+                    "updated_at" => now_ms,
+                    "job_id" => job_id,
+                    "run_id" => run_id,
+                },
+            )
+            .map_err(mysql_err)?;
+        Ok(())
+    }
+
+    fn update_terminal_snapshot(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        summary: TransferProgress,
+        counts: TransferTaskCounts,
+        now_ms: i64,
+    ) -> FsResult<()> {
+        let summary_json = serde_json::to_string(&summary).map_err(json_err)?;
+        let counts_json = serde_json::to_string(&counts).map_err(json_err)?;
+        self.conn()?
+            .exec_drop(
+                "update transfer_jobs
+             set record_json = json_set(record_json, '$.summary', cast(:summary_json as json),
+                                        '$.terminal_summary', cast(:summary_json as json),
+                                        '$.terminal_counts', cast(:counts_json as json),
+                                        '$.updated_at', :updated_at), updated_at = :updated_at
+             where job_id = :job_id and run_id = :run_id
+               and coalesce(json_type(json_extract(record_json, '$.terminal_summary')), 'NULL') != 'OBJECT'",
+                params! {
+                    "summary_json" => summary_json,
+                    "counts_json" => counts_json,
                     "updated_at" => now_ms,
                     "job_id" => job_id,
                     "run_id" => run_id,
@@ -1290,9 +1567,18 @@ fn init_schema_locked(conn: &mut PooledConn, now_ms: u64) -> FsResult<()> {
             key transfer_jobs_job_key_state_idx(job_key(255), state),
             key transfer_jobs_target_state_idx(target_path(255), state),
             key transfer_jobs_state_lease_idx(state, lease_expire_at),
+            key transfer_jobs_state_updated_idx(state, updated_at),
             key transfer_jobs_owner_state_updated_idx(owner, state, updated_at),
             key transfer_jobs_tenant_state_updated_idx(tenant, state, updated_at),
             key transfer_jobs_submitter_state_updated_idx(submitter, state, updated_at)
+        )",
+    )
+    .map_err(mysql_err)?;
+    conn.query_drop(
+        "create table if not exists transfer_cleanup_lease (
+            id tinyint primary key,
+            owner varchar(255) not null,
+            lease_expire_at bigint not null
         )",
     )
     .map_err(mysql_err)?;
@@ -1352,7 +1638,8 @@ fn migrate_mysql_schema(conn: &mut PooledConn, mut version: u64, now_ms: u64) ->
             version, TRANSFER_SCHEMA_VERSION
         )));
     }
-    migrate_mysql_task_runtime_columns(conn)
+    migrate_mysql_task_runtime_columns(conn)?;
+    ensure_mysql_ttl_purge_index(conn)
 }
 
 fn migrate_mysql_schema_v2_to_v3(conn: &mut PooledConn) -> FsResult<()> {
@@ -1538,6 +1825,31 @@ fn mysql_column_exists(conn: &mut PooledConn, table: &str, column: &str) -> FsRe
     )
     .map(|value| value.is_some())
     .map_err(mysql_err)
+}
+
+fn mysql_index_exists(conn: &mut PooledConn, table: &str, index: &str) -> FsResult<bool> {
+    conn.exec_first::<String, _, _>(
+        "select index_name from information_schema.statistics
+         where table_schema = database()
+           and table_name = :table
+           and index_name = :index",
+        params! {
+            "table" => table,
+            "index" => index,
+        },
+    )
+    .map(|value| value.is_some())
+    .map_err(mysql_err)
+}
+
+fn ensure_mysql_ttl_purge_index(conn: &mut PooledConn) -> FsResult<()> {
+    if !mysql_index_exists(conn, "transfer_jobs", "transfer_jobs_state_updated_idx")? {
+        conn.query_drop(
+            "create index transfer_jobs_state_updated_idx on transfer_jobs(state, updated_at)",
+        )
+        .map_err(mysql_err)?;
+    }
+    Ok(())
 }
 
 fn mysql_schema_ready(conn: &mut PooledConn) -> FsResult<bool> {

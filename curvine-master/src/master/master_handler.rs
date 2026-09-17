@@ -802,6 +802,7 @@ impl MasterHandler {
                 query_task: header.transfer_query_task.unwrap_or(false),
                 attempt_safe_output: header.transfer_attempt_safe_output.unwrap_or(false),
                 source_read_plan: header.transfer_source_read_plan.unwrap_or(false),
+                segment_group: header.transfer_segment_group.unwrap_or(false),
             },
             header.software_version,
             u64::try_from(header.fs_ctime).unwrap_or_default(),

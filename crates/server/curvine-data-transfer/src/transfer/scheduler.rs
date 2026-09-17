@@ -25,8 +25,9 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
 use curvine_model::{
-    LoadJobInfo, LoadTaskInfo, TaskAttemptStart, TransferJobRecord, TransferLease,
-    TransferProgress, TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport,
+    classify_transfer_plan, normalize_group_resume, BatchManifest, LoadJobInfo, LoadTaskInfo,
+    TaskAttemptStart, TransferJobRecord, TransferLease, TransferPlanKind, TransferProgress,
+    TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport,
     TransferTaskReportInfo, TransferTaskState, WorkerInflight, WorkerInfo,
 };
 use curvine_runtime::common::LocalTime;
@@ -55,6 +56,49 @@ fn inflight_bytes_with_default(estimated_bytes: i64, unknown_count: u64, default
             .unwrap_or(i64::MAX)
             .saturating_mul(default_est),
     )
+}
+
+fn join_transfer_target(dir: &Path, relative_path: &str) -> FsResult<String> {
+    let full = dir.full_path();
+    let joined = if full.ends_with(Path::SEPARATOR) {
+        format!("{full}{relative_path}")
+    } else {
+        format!("{full}{}{relative_path}", Path::SEPARATOR)
+    };
+    Ok(Path::from_str(&joined)?.clone_uri())
+}
+
+fn planned_target_replacements(
+    tasks: &[TransferTaskRecord],
+) -> FsResult<(HashSet<String>, HashSet<String>)> {
+    let mut segment_targets = HashSet::new();
+    let mut replacement_targets = HashSet::new();
+    for task in tasks {
+        match classify_transfer_plan(&task.source_read_plan_json) {
+            TransferPlanKind::Segment | TransferPlanKind::SegmentGroup => {
+                segment_targets.insert(task.target_path.clone());
+                if task.replace_target {
+                    replacement_targets.insert(task.target_path.clone());
+                }
+            }
+            TransferPlanKind::Batch => {
+                let manifest: BatchManifest = serde_json::from_str(&task.source_read_plan_json)
+                    .map_err(|err| FsError::common(format!("invalid batch manifest: {err}")))?;
+                let target_dir = Path::from_str(&task.target_path)?;
+                for entry in manifest.batch {
+                    if entry.replace_target {
+                        replacement_targets
+                            .insert(join_transfer_target(&target_dir, &entry.rel_path)?);
+                    }
+                }
+            }
+            TransferPlanKind::Plain if task.replace_target => {
+                replacement_targets.insert(task.target_path.clone());
+            }
+            TransferPlanKind::Plain => {}
+        }
+    }
+    Ok((segment_targets, replacement_targets))
 }
 
 struct InflightLedger {
@@ -253,11 +297,19 @@ fn is_planning_retryable(err: &FsError) -> bool {
         || msg.contains("too many requests")
 }
 
-use crate::transfer::{ClusterMetadataCache, TransferMetrics};
+use crate::transfer::{
+    ClusterMetadataCache, TransferMetrics, MAX_JOBS_PER_STORE_TRANSACTION,
+    MAX_TASKS_PER_STORE_TRANSACTION,
+};
 
 const TRANSFER_CLEANUP_INTERVAL_MS: u64 = 60_000;
 const TRANSFER_METRICS_INTERVAL_MS: u64 = 10_000;
 const TRANSFER_TASK_COUNTS_INTERVAL_MS: u64 = 3_600_000;
+const TRANSFER_CLEANUP_LEASE_MS: i64 = 120_000;
+/// Max terminal task rows deleted per cleanup transaction (§8 C2).
+/// A huge job spans multiple rounds instead of one giant transaction.
+const TERMINAL_TASK_PURGE_ROW_LIMIT: usize = MAX_TASKS_PER_STORE_TRANSACTION;
+const TERMINAL_JOB_PURGE_LIMIT: usize = MAX_JOBS_PER_STORE_TRANSACTION;
 const SCHEDULER_ACTIVE_INTERVAL: Duration = Duration::from_millis(200);
 const SCHEDULER_IDLE_INTERVAL: Duration = Duration::from_secs(1);
 const SCHEDULER_MIN_IDLE_INTERVAL: Duration = Duration::from_millis(1);
@@ -277,6 +329,7 @@ pub struct TransferScheduler<S> {
     owner: String,
     report_endpoints: Vec<String>,
     conf: TransferConf,
+    worker_task_limit: usize,
     worker_cursor: Arc<AtomicUsize>,
     acquire_tick: Arc<AtomicU64>,
     last_cleanup_ms: Arc<AtomicU64>,
@@ -296,6 +349,7 @@ impl<S> Clone for TransferScheduler<S> {
             owner: self.owner.clone(),
             report_endpoints: self.report_endpoints.clone(),
             conf: self.conf.clone(),
+            worker_task_limit: self.worker_task_limit,
             worker_cursor: self.worker_cursor.clone(),
             acquire_tick: self.acquire_tick.clone(),
             last_cleanup_ms: self.last_cleanup_ms.clone(),
@@ -320,6 +374,7 @@ where
         owner: String,
         report_endpoints: Vec<String>,
         conf: TransferConf,
+        worker_task_limit: usize,
     ) -> Self {
         let inflight_ttl =
             Duration::from_millis(TransferConf::DEFAULT_SCHEDULER_INFLIGHT_CACHE_TTL_MS);
@@ -332,6 +387,7 @@ where
             owner,
             report_endpoints,
             conf,
+            worker_task_limit: worker_task_limit.max(1),
             worker_cursor: Arc::new(AtomicUsize::new(0)),
             acquire_tick: Arc::new(AtomicU64::new(0)),
             last_cleanup_ms: Arc::new(AtomicU64::new(0)),
@@ -481,8 +537,8 @@ where
         Ok(())
     }
 
-    fn cleanup_terminal_transfers(&self, now_ms: i64) -> FsResult<()> {
-        let now = now_ms.max(0) as u64;
+    fn cleanup_terminal_transfers(&self, tick_now_ms: i64) -> FsResult<()> {
+        let now = tick_now_ms.max(0) as u64;
         let last = self.last_cleanup_ms.load(Ordering::Relaxed);
         if now.saturating_sub(last) < TRANSFER_CLEANUP_INTERVAL_MS {
             return Ok(());
@@ -496,20 +552,61 @@ where
         }
         let retention_ms =
             i64::try_from(self.conf.terminal_retention.as_millis()).unwrap_or(i64::MAX);
-        let older_than = now_ms.saturating_sub(retention_ms);
-        let purged = self
-            .store
-            .purge_terminal_transfers(older_than, self.conf.cleanup_batch_size())?;
-        if purged >= self.conf.cleanup_batch_size() {
+        let task_retention_ms =
+            i64::try_from(self.conf.task_retention.as_millis()).unwrap_or(i64::MAX);
+        let task_older_than = tick_now_ms.saturating_sub(task_retention_ms);
+        let job_older_than = tick_now_ms.saturating_sub(retention_ms);
+        // Renew immediately before each bounded delete phase. The Store also
+        // locks and validates this lease in the delete transaction; renewal
+        // keeps a slow first phase from making the second phase run on an
+        // already-expired lease.
+        let task_cleanup_now_ms = now_ms();
+        if !self.store.try_acquire_cleanup_lease(
+            &self.owner,
+            task_cleanup_now_ms,
+            TRANSFER_CLEANUP_LEASE_MS,
+        )? {
+            return Ok(());
+        }
+        let purged_tasks = self.store.purge_terminal_tasks_with_cleanup_lease(
+            task_older_than,
+            TERMINAL_TASK_PURGE_ROW_LIMIT,
+            &self.owner,
+            task_cleanup_now_ms,
+        )?;
+        let job_cleanup_now_ms = now_ms();
+        let purged_jobs = if self.store.try_acquire_cleanup_lease(
+            &self.owner,
+            job_cleanup_now_ms,
+            TRANSFER_CLEANUP_LEASE_MS,
+        )? {
+            self.store.purge_terminal_jobs_with_cleanup_lease(
+                job_older_than,
+                TERMINAL_JOB_PURGE_LIMIT,
+                &self.owner,
+                job_cleanup_now_ms,
+            )?
+        } else {
+            0
+        };
+        if purged_tasks >= TERMINAL_TASK_PURGE_ROW_LIMIT || purged_jobs >= TERMINAL_JOB_PURGE_LIMIT
+        {
             self.last_cleanup_ms.store(0, Ordering::Relaxed);
         }
-        if purged > 0 {
+        if purged_jobs > 0 {
             if let Ok(metrics) = TransferMetrics::get() {
-                metrics.inc_cleanup_purged(purged);
+                metrics.inc_cleanup_purged(purged_jobs);
+                metrics.inc_cleanup_purged_tasks(purged_tasks);
             }
+        } else if purged_tasks > 0 {
+            if let Ok(metrics) = TransferMetrics::get() {
+                metrics.inc_cleanup_purged_tasks(purged_tasks);
+            }
+        }
+        if purged_tasks > 0 || purged_jobs > 0 {
             info!(
-                "purged {} terminal transfer jobs older than {}",
-                purged, older_than
+                "purged {} terminal transfer tasks (older than {}) and {} jobs (older than {})",
+                purged_tasks, task_older_than, purged_jobs, job_older_than
             );
         }
         Ok(())
@@ -520,6 +617,7 @@ where
         mut job: TransferJobRecord,
         lease: TransferLease,
     ) -> FsResult<()> {
+        let resuming_planning = job.state == TransferState::Planning;
         if !self.transition(
             &job,
             &lease,
@@ -529,6 +627,25 @@ where
         )? {
             record_metric(|metrics| metrics.inc_planning(transfer_kind_label(job.kind), "stale"));
             return Ok(());
+        }
+
+        if resuming_planning && self.store.has_transfer_tasks(&job.job_id, job.run_id)? {
+            let err = FsError::common(
+                "interrupted task-plan persistence cannot be safely recomputed; retry transfer",
+            );
+            self.fail_transfer(
+                &job,
+                &lease,
+                &[TransferState::Planning],
+                transfer_failure_message(
+                    job.kind,
+                    "planning",
+                    &job.source_path,
+                    &job.target_path,
+                    &err,
+                ),
+            )?;
+            return Err(err);
         }
 
         if job.mount_snapshot_json.trim().is_empty() || job.mount_snapshot_json == "{}" {
@@ -803,15 +920,56 @@ where
         let skipped_files = planned.skipped_files;
         let skipped_size = planned.skipped_size;
         let job_info = planned.job_info;
+        let message = format!(
+            "planned total_size={total_size} skipped_files={skipped_files} skipped_size={skipped_size}"
+        );
+        let batch_size = self
+            .conf
+            .planning_batch_size()
+            .clamp(1, MAX_TASKS_PER_STORE_TRANSACTION);
+        for tasks in planned.tasks.chunks(batch_size) {
+            let appended = self.store.append_planned_tasks(TransferPlannedTasks {
+                job_id: job.job_id.clone(),
+                run_id: job.run_id,
+                owner: lease.owner.clone(),
+                lease_epoch: lease.lease_epoch,
+                tasks: tasks.to_vec(),
+                message: String::new(),
+                now_ms: now_ms(),
+            })?;
+            if !appended {
+                warn!(
+                    "stop planning transfer {} because owner {} lease epoch {} is stale",
+                    job.job_id, lease.owner, lease.lease_epoch
+                );
+                return Ok(());
+            }
+        }
+        if let Err(err) = self
+            .prepare_transfer_targets(&planned.tasks, job_info.overwrite.unwrap_or(false))
+            .await
+        {
+            self.fail_transfer(
+                &job,
+                &lease,
+                &[TransferState::Planning],
+                transfer_failure_message(
+                    job.kind,
+                    "planning",
+                    &job.source_path,
+                    &job.target_path,
+                    &err,
+                ),
+            )?;
+            return Err(err);
+        }
         let persisted = self.store.persist_planned_tasks(TransferPlannedTasks {
             job_id: job.job_id.clone(),
             run_id: job.run_id,
             owner: lease.owner.clone(),
             lease_epoch: lease.lease_epoch,
-            tasks: planned.tasks,
-            message: format!(
-                "planned total_size={total_size} skipped_files={skipped_files} skipped_size={skipped_size}"
-            ),
+            tasks: Vec::new(),
+            message,
             now_ms: now_ms(),
         })?;
         if !persisted {
@@ -832,6 +990,63 @@ where
         });
 
         self.dispatch_pending_tasks(job, lease).await
+    }
+
+    /// Remove targets that need replacement only after all plan rows are
+    /// durable while the job remains Planning. This covers shared segment
+    /// targets and incremental-load files with mismatched replicas.
+    async fn prepare_transfer_targets(
+        &self,
+        tasks: &[TransferTaskRecord],
+        overwrite: bool,
+    ) -> FsResult<()> {
+        let (segment_targets, replacement_targets) = planned_target_replacements(tasks)?;
+
+        for target_path in &segment_targets {
+            let target = Path::from_str(target_path)?;
+            if !target.is_cv() {
+                continue;
+            }
+            match self.fs.get_status(&target).await {
+                Ok(status) if status.is_dir => {
+                    return Err(FsError::common(format!(
+                        "Transfer target {} is a directory; refusing to overwrite directory with file",
+                        target.full_path()
+                    )));
+                }
+                Ok(_) if !overwrite && !replacement_targets.contains(target_path) => {
+                    return Err(FsError::file_exists(target.full_path()));
+                }
+                Ok(_) => {
+                    self.fs.delete(&target, false).await?;
+                }
+                Err(FsError::FileNotFound(_)) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        for target_path in replacement_targets {
+            if segment_targets.contains(&target_path) {
+                continue;
+            }
+            let target = Path::from_str(&target_path)?;
+            if !target.is_cv() {
+                continue;
+            }
+            match self.fs.get_status(&target).await {
+                Ok(status) if status.is_dir => {
+                    return Err(FsError::common(format!(
+                        "Transfer target {} is a directory; refusing to replace directory with file",
+                        target.full_path()
+                    )));
+                }
+                Ok(_) => {
+                    self.fs.delete(&target, false).await?;
+                }
+                Err(FsError::FileNotFound(_)) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
     }
 
     async fn dispatch_pending_tasks(
@@ -1100,20 +1315,21 @@ where
             for candidate in &mut candidates {
                 candidate.progress.message = message.to_string();
             }
-            let staled = candidates.len();
-            let _ = self.store.mark_stale_attempts(
-                &job.job_id,
-                job.run_id,
-                &lease.owner,
-                lease.lease_epoch,
-                now,
-                candidates,
-            )?;
-            record_metric(|metrics| {
-                for _ in 0..staled {
-                    metrics.task_staled();
-                }
-            });
+            for candidates in candidates.chunks(MAX_TASKS_PER_STORE_TRANSACTION) {
+                let staled = self.store.mark_stale_attempts(
+                    &job.job_id,
+                    job.run_id,
+                    &lease.owner,
+                    lease.lease_epoch,
+                    now,
+                    candidates.to_vec(),
+                )?;
+                record_metric(|metrics| {
+                    for _ in &staled {
+                        metrics.task_staled();
+                    }
+                });
+            }
         }
         // Recover all Stale tasks (newly marked + orphan leftovers from CAS races).
         let stale_tasks = self.store.list_tasks_by_state(
@@ -1263,11 +1479,11 @@ where
         let mut target_total: std::collections::HashMap<String, usize> = Default::default();
         let mut target_done: std::collections::HashMap<String, usize> = Default::default();
         for task in &tasks {
-            if task
-                .source_read_plan_json
-                .trim_start()
-                .starts_with("{\"segment\"")
-            {
+            let is_segment = matches!(
+                classify_transfer_plan(&task.source_read_plan_json),
+                TransferPlanKind::Segment | TransferPlanKind::SegmentGroup
+            );
+            if is_segment {
                 *target_total.entry(task.target_path.clone()).or_insert(0) += 1;
                 if task.state == TransferTaskState::Completed {
                     *target_done.entry(task.target_path.clone()).or_insert(0) += 1;
@@ -1720,7 +1936,7 @@ where
         let admitted = choose_worker_admitted(
             workers,
             estimated_bytes,
-            self.conf.worker_max_inflight_tasks,
+            self.worker_task_limit,
             TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES,
             |worker_id| self.inflight.get(worker_id),
         );
@@ -1754,6 +1970,9 @@ where
         message: impl Into<String>,
     ) -> FsResult<bool> {
         let message = message.into();
+        if to_state.is_terminal() {
+            self.snapshot_terminal(job)?;
+        }
         let updated = self.store.update_transfer_state(TransferStateUpdate {
             job_id: lease.job_id.clone(),
             run_id: lease.run_id,
@@ -1794,6 +2013,19 @@ where
         record_metric(|metrics| metrics.inc_terminal("failed", "error"));
         Ok(())
     }
+
+    fn snapshot_terminal(&self, job: &TransferJobRecord) -> FsResult<()> {
+        let summary = self
+            .store
+            .get_transfer_task_summary(&job.job_id, job.run_id, now_ms())?;
+        self.store.update_terminal_snapshot(
+            &job.job_id,
+            job.run_id,
+            summary.progress.clone(),
+            summary.counts,
+            now_ms(),
+        )
+    }
 }
 
 struct DispatchTaskRequest<S> {
@@ -1827,6 +2059,15 @@ where
     } = request;
     let now = now_ms();
     let attempt_id = task.attempt_id.saturating_add(1);
+    let resume_loaded_size = match classify_transfer_plan(&task.source_read_plan_json) {
+        TransferPlanKind::SegmentGroup => {
+            normalize_group_resume(&task.source_read_plan_json, task.progress.loaded_size)
+        }
+        _ => 0,
+    };
+    if resume_loaded_size > 0 {
+        record_metric(|metrics| metrics.inc_group_resume(resume_loaded_size));
+    }
     let client = match factory.get_worker_client(&worker.address).await {
         Ok(client) => client,
         Err(err) => {
@@ -1858,6 +2099,7 @@ where
             .map_err(|_| FsError::common("Unable to prepare transfer report endpoints"))?,
         now_ms: now,
         stale_deadline_at: now.saturating_add(task_stale_timeout_ms),
+        resume_loaded_size,
     })?;
     if !started {
         return Ok(false);
@@ -1879,6 +2121,7 @@ where
             worker_session_id: worker.worker_session_id.clone(),
             report_target: report_endpoints.first().cloned().unwrap_or_default(),
             report_endpoints,
+            resume_loaded_size,
         }),
     };
 
@@ -2131,6 +2374,76 @@ mod tests {
     }
 
     #[test]
+    fn delayed_target_replacement_preserves_plan_type_boundaries() {
+        use super::planned_target_replacements;
+        use curvine_model::{
+            BatchManifest, BatchManifestEntry, TransferProgress, TransferTaskRecord,
+            TransferTaskState,
+        };
+
+        let task = |task_id: &str, plan: String, target_path: &str, replace_target: bool| {
+            TransferTaskRecord {
+                job_id: "job".to_string(),
+                run_id: 1,
+                task_id: task_id.to_string(),
+                attempt_id: 0,
+                source_path: "file:///source".to_string(),
+                target_path: target_path.to_string(),
+                worker_id: 0,
+                worker_session_id: String::new(),
+                source_read_plan_json: plan,
+                report_target_json: String::new(),
+                state: TransferTaskState::Pending,
+                progress: TransferProgress::default(),
+                estimated_size: 0,
+                retry_count: 0,
+                attempt_started_at: 0,
+                last_report_at: 0,
+                stale_deadline_at: 0,
+                updated_at: 0,
+                accepted_at_ms: 0,
+                first_byte_at_ms: 0,
+                replace_target,
+            }
+        };
+        let batch = serde_json::to_string(&BatchManifest {
+            batch: vec![
+                BatchManifestEntry {
+                    rel_path: "keep".to_string(),
+                    size: 1,
+                    replace_target: false,
+                },
+                BatchManifestEntry {
+                    rel_path: "nested/replace".to_string(),
+                    size: 1,
+                    replace_target: true,
+                },
+            ],
+        })
+        .unwrap();
+
+        let (segments, replacements) = planned_target_replacements(&[
+            task("plain", "{}".to_string(), "cv:///plain", true),
+            task(
+                "segment",
+                "{\"segment\":{\"offset\":0}}".to_string(),
+                "cv:///segment",
+                false,
+            ),
+            task("batch", batch, "cv:///batch", false),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            segments.into_iter().collect::<Vec<_>>(),
+            vec!["cv:///segment"]
+        );
+        assert!(replacements.contains("cv:///plain"));
+        assert!(replacements.contains("cv:///batch/nested/replace"));
+        assert!(!replacements.contains("cv:///batch/keep"));
+    }
+
+    #[test]
     fn choose_worker_enforces_byte_budget_and_oversize_idle_only() {
         use super::choose_worker_admitted;
         use curvine_model::WorkerAddress;
@@ -2288,6 +2601,7 @@ mod tests {
                 last_report_at: 0,
                 stale_deadline_at: 0,
                 updated_at: 0,
+                replace_target: false,
             }
         }
         // Transient: throttling, timeouts, capacity, session loss, report

@@ -296,6 +296,13 @@ pub struct TransferJobRecord {
     /// public-struct additive-evolution convention.
     #[serde(default)]
     pub planning_attempts: u32,
+    /// Terminal task snapshot (progress + structured counts) persisted
+    /// synchronously before the job lands terminal, so TTL task purge never
+    /// renders detail as 0/empty. JSON-only additive; None means not snapshotted.
+    #[serde(default)]
+    pub terminal_summary: Option<TransferProgress>,
+    #[serde(default)]
+    pub terminal_counts: Option<TransferTaskCounts>,
 }
 
 /// Multi-file batch manifest carried in a batch task's `source_read_plan_json`
@@ -326,6 +333,150 @@ pub struct SegmentPlan {
     pub block_index: i64,
 }
 
+/// Upper bound for `source_read_plan_json` / dispatch RPC plan payloads.
+/// A range manifest is ~10^2 B; the bound rejects accidental `Vec<SegmentPlan>`
+/// payloads (10^4 B級, §8 #7) without constraining legal plans.
+pub const TRANSFER_PLAN_JSON_LIMIT_BYTES: usize = 8192;
+
+/// Structured plan identity shared by Worker routing and scheduler finalize.
+/// Parses the JSON object tag instead of matching string prefixes (§8 #23).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferPlanKind {
+    Batch,
+    Segment,
+    SegmentGroup,
+    Plain,
+}
+
+/// Compact range manifest for a segment group (design §8裁决3).
+/// A group binds consecutive whole segments; cut points stay block-aligned.
+/// `loaded_size` in progress is cumulative bytes relative to `start_offset`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SegmentGroupPlan {
+    pub start_offset: i64,
+    pub end_offset: i64,
+    pub total_len: i64,
+    pub first_block_index: i64,
+    pub segment_bytes: i64,
+    #[serde(default)]
+    pub source_len: i64,
+    #[serde(default)]
+    pub source_mtime: i64,
+    #[serde(default)]
+    pub source_version: String,
+}
+
+impl SegmentGroupPlan {
+    pub fn group_len(&self) -> i64 {
+        self.end_offset.saturating_sub(self.start_offset).max(0)
+    }
+
+    pub fn validate(&self) -> FsResult<()> {
+        let ok = self.total_len > 0
+            && self.segment_bytes > 0
+            && self.first_block_index >= 0
+            && self.start_offset >= 0
+            && self.end_offset > self.start_offset
+            && self.end_offset <= self.total_len
+            && self.source_len == self.total_len
+            && self.start_offset % self.segment_bytes == 0
+            && self.first_block_index == self.start_offset / self.segment_bytes
+            && (self.end_offset == self.total_len || self.end_offset % self.segment_bytes == 0);
+        match ok {
+            true => Ok(()),
+            false => Err(FsError::common(format!(
+                "Invalid segment group plan start={} end={} total={} first_block={} seg={}",
+                self.start_offset,
+                self.end_offset,
+                self.total_len,
+                self.first_block_index,
+                self.segment_bytes
+            ))),
+        }
+    }
+
+    pub fn resume_floor(&self, reported: i64) -> i64 {
+        let len = self.group_len();
+        if len <= 0 || reported <= 0 {
+            return 0;
+        }
+        if reported >= len {
+            return len;
+        }
+        let seg = self.segment_bytes.max(1);
+        (reported / seg) * seg
+    }
+
+    pub fn iter_from(&self, resume: i64) -> Vec<(i64, i64, i64)> {
+        let floor = self.resume_floor(resume).min(self.group_len()).max(0);
+        let mut out = Vec::new();
+        let mut offset = self.start_offset.saturating_add(floor);
+        let mut index = self
+            .first_block_index
+            .saturating_add(floor / self.segment_bytes.max(1));
+        while offset < self.end_offset {
+            let length = self.segment_bytes.max(1).min(self.end_offset - offset);
+            out.push((offset, length, index));
+            offset += length;
+            index += 1;
+        }
+        out
+    }
+}
+
+pub fn classify_transfer_plan(plan_json: &str) -> TransferPlanKind {
+    let value: serde_json::Value = match serde_json::from_str(plan_json) {
+        Ok(value) => value,
+        Err(_) => return TransferPlanKind::Plain,
+    };
+    let obj = match value.as_object() {
+        Some(obj) => obj,
+        None => return TransferPlanKind::Plain,
+    };
+    if obj.contains_key("segment_group") {
+        TransferPlanKind::SegmentGroup
+    } else if obj.contains_key("segment") {
+        TransferPlanKind::Segment
+    } else if obj.contains_key("batch") {
+        TransferPlanKind::Batch
+    } else {
+        TransferPlanKind::Plain
+    }
+}
+
+pub fn parse_segment_group(plan_json: &str) -> FsResult<SegmentGroupPlan> {
+    let value: serde_json::Value = serde_json::from_str(plan_json)
+        .map_err(|err| FsError::common(format!("Invalid segment group plan: {}", err)))?;
+    let plan: SegmentGroupPlan = serde_json::from_value(
+        value
+            .get("segment_group")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    )
+    .map_err(|err| FsError::common(format!("Invalid segment group plan: {}", err)))?;
+    plan.validate()?;
+    Ok(plan)
+}
+
+pub fn segment_group_json(plan: &SegmentGroupPlan) -> FsResult<String> {
+    plan.validate()?;
+    let json = serde_json::to_string(&serde_json::json!({ "segment_group": plan }))
+        .map_err(|_| FsError::common("Unable to serialize segment group plan"))?;
+    check_transfer_plan_size(&json)?;
+    Ok(json)
+}
+
+pub fn check_transfer_plan_size(plan_json: &str) -> FsResult<()> {
+    match plan_json.len() <= TRANSFER_PLAN_JSON_LIMIT_BYTES {
+        true => Ok(()),
+        false => Err(FsError::common(format!(
+            "Transfer plan payload {} exceeds {} bytes",
+            plan_json.len(),
+            TRANSFER_PLAN_JSON_LIMIT_BYTES
+        ))),
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BatchManifestEntry {
     /// Source path relative to the job's source root (design §7.1): a batch
@@ -333,6 +484,10 @@ pub struct BatchManifestEntry {
     /// target_root + rel_path.
     pub rel_path: String,
     pub size: i64,
+    /// A cached incremental-load target has the wrong replica count. The
+    /// scheduler removes it only after the complete plan is durable.
+    #[serde(default)]
+    pub replace_target: bool,
 }
 
 /// Scheduler-side per-worker in-flight aggregation (state = Running only).
@@ -376,6 +531,10 @@ pub struct TransferTaskRecord {
     /// First source byte time (ms, 0 = unknown).
     #[serde(default)]
     pub first_byte_at_ms: i64,
+    /// Delay destructive replacement of an incremental-load target until all
+    /// planned task rows have been persisted. Legacy records default false.
+    #[serde(default)]
+    pub replace_target: bool,
 }
 
 /// Status-query projection. Task planning data stays in `TransferTaskRecord`;
@@ -426,7 +585,7 @@ pub struct TransferTaskSummary {
     pub all_completed: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferTaskCounts {
     pub pending: u64,
     pub running: u64,
@@ -621,6 +780,25 @@ pub struct TaskAttemptStart {
     pub report_target_json: String,
     pub now_ms: i64,
     pub stale_deadline_at: i64,
+    pub resume_loaded_size: i64,
+}
+
+pub fn normalize_group_resume(plan_json: &str, reported: i64) -> i64 {
+    let plan = match parse_segment_group(plan_json) {
+        Ok(plan) => plan,
+        Err(_) => return 0,
+    };
+    let clamped = reported.clamp(0, plan.group_len());
+    plan.resume_floor(clamped)
+}
+
+pub fn group_resume_remaining(plan_json: &str, reported: i64) -> (i64, i64) {
+    let plan = match parse_segment_group(plan_json) {
+        Ok(plan) => plan,
+        Err(_) => return (0, 0),
+    };
+    let resume = plan.resume_floor(reported.clamp(0, plan.group_len()));
+    (resume, plan.group_len().saturating_sub(resume))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

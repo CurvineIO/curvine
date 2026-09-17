@@ -17,4 +17,4 @@ pub mod ufs_manager;
 
 mod ufs_factory;
 pub use self::ufs_client::UfsClient;
-pub use self::ufs_factory::UfsFactory;
+pub use self::ufs_factory::{ufs_object_fingerprint, ufs_object_version, UfsFactory};

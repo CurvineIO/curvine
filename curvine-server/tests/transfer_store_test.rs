@@ -35,6 +35,8 @@ fn transfer_job(id: &str, target_path: &str) -> TransferJobRecord {
         cluster_snapshot_version: 1,
         mount_snapshot_attempts: 0,
         planning_attempts: 0,
+        terminal_summary: None,
+        terminal_counts: None,
         cv_metadata_epoch: None,
         state: TransferState::Pending,
         owner: String::new(),

@@ -12,6 +12,7 @@ curvine-core-error = { workspace = true }
 curvine-net = { workspace = true }
 curvine-runtime = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 prost = { workspace = true }
 bincode = { workspace = true }
 log = { workspace = true }

@@ -34,21 +34,6 @@ fn postgres_store_urls_select_the_postgres_backend() {
 }
 
 #[test]
-fn worker_max_inflight_tasks_parses_with_default() {
-    // The count gate stays configurable; when absent it defaults to the
-    // worker semaphore limit (100).
-    let conf: TransferConf = toml::from_str("worker_max_inflight_tasks = 2").unwrap();
-    assert_eq!(conf.worker_max_inflight_tasks, 2);
-
-    let conf: TransferConf = toml::from_str("").unwrap();
-    assert_eq!(
-        conf.worker_max_inflight_tasks,
-        TransferConf::DEFAULT_WORKER_MAX_INFLIGHT_TASKS
-    );
-    assert_eq!(TransferConf::DEFAULT_WORKER_MAX_INFLIGHT_TASKS, 100);
-}
-
-#[test]
 fn byte_budget_and_estimate_are_constants_on_by_default() {
     // Byte-budget gating is on by default (10 GiB); the unknown-size estimate
     // is fixed at 256 MiB. Neither is configurable - no knobs to mis-set.
@@ -67,11 +52,62 @@ fn byte_budget_and_estimate_are_constants_on_by_default() {
 }
 
 #[test]
-fn worker_max_inflight_tasks_parses_inside_cluster_conf() {
-    let raw = r#"
-        [transfer]
-        worker_max_inflight_tasks = 7
-    "#;
-    let conf: curvine_config::ClusterConf = toml::from_str(raw).unwrap();
-    assert_eq!(conf.transfer.worker_max_inflight_tasks, 7);
+fn task_retention_defaults_to_24_hours() {
+    let mut conf = TransferConf::default();
+    conf.init().unwrap();
+    assert_eq!(
+        conf.task_retention_str,
+        TransferConf::DEFAULT_TASK_RETENTION
+    );
+    assert_eq!(
+        conf.task_retention,
+        conf.terminal_retention.checked_div(7).unwrap()
+    );
+}
+
+#[test]
+fn task_retention_missing_key_falls_back_to_24h() {
+    // CI smoke loads the dist config template, which has no task_retention
+    // key: a bare #[serde(default)] would decode to "" and fail init with
+    // "invalid duration string". The field default must be "24h".
+    let mut conf: TransferConf = toml::from_str("").unwrap();
+    conf.init().unwrap();
+    assert_eq!(
+        conf.task_retention_str,
+        TransferConf::DEFAULT_TASK_RETENTION
+    );
+    assert_eq!(
+        conf.task_retention,
+        conf.terminal_retention.checked_div(7).unwrap()
+    );
+}
+
+#[test]
+fn task_retention_accepts_explicit_shorter_window() {
+    let mut conf: TransferConf = toml::from_str(
+        r#"
+            terminal_retention_str = "168h"
+            task_retention_str = "24h"
+        "#,
+    )
+    .unwrap();
+    conf.init().unwrap();
+    assert_eq!(
+        conf.task_retention,
+        conf.terminal_retention.checked_div(7).unwrap()
+    );
+}
+
+#[test]
+fn task_retention_rejects_zero_and_overshoot() {
+    let mut zero: TransferConf = toml::from_str(r#"task_retention_str = "0s""#).unwrap();
+    assert!(zero.init().is_err());
+    let mut over: TransferConf = toml::from_str(
+        r#"
+            terminal_retention_str = "24h"
+            task_retention_str = "168h"
+        "#,
+    )
+    .unwrap();
+    assert!(over.init().is_err());
 }

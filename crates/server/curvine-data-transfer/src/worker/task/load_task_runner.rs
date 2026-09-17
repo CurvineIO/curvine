@@ -24,21 +24,24 @@ use curvine_fs_api::{FileSystem, Path, Reader, Writer};
 use curvine_job_client::JobMasterClient;
 use curvine_model::transfer_failure_message;
 use curvine_model::{
-    BatchManifest, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileStatus, JobTaskProgress,
-    JobTaskState, SegmentPlan, SetAttrOptsBuilder, TRANSFER_TEMP_PATH_MARKER,
+    classify_transfer_plan, parse_segment_group, BatchManifest, CreateFileOptsBuilder,
+    FileAllocOpts, FileBlocks, FileStatus, JobTaskProgress, JobTaskState, SegmentGroupPlan,
+    SegmentPlan, SetAttrOptsBuilder, StorageType, TransferPlanKind, TRANSFER_TEMP_PATH_MARKER,
 };
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::runtime::{JoinHandle, RpcRuntime};
 use curvine_unified_fs::{UfsFileSystem, UnifiedReader, UnifiedWriter};
 use log::{debug, error, info, warn};
+use std::future::Future;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const TRANSFER_COMMIT_JOB_ID_XATTR: &str = "curvine.transfer.job_id";
 const TRANSFER_COMMIT_RUN_ID_XATTR: &str = "curvine.transfer.run_id";
 const TRANSFER_COMMIT_TASK_ID_XATTR: &str = "curvine.transfer.task_id";
 const TRANSFER_COMMIT_SOURCE_PATH_XATTR: &str = "curvine.transfer.source_path";
 const TRANSFER_COMMIT_TARGET_PATH_XATTR: &str = "curvine.transfer.target_path";
+const WRITER_CLEANUP_TIMEOUT_MS: u64 = 10_000;
 
 pub struct LoadTaskRunner {
     task: Arc<TaskContext>,
@@ -229,28 +232,12 @@ impl LoadTaskRunner {
             .update_state(JobTaskState::Loading, "Task started");
 
         // Batch-manifest task (design §7.2): one task copies many small files.
-        // A batch manifest serializes as {"batch":[...]}; a single-file CV read
-        // plan is a bare array, so the leading object key disambiguates.
-        if self
-            .task
-            .info
-            .source_read_plan_json
-            .trim_start()
-            .starts_with("{\"batch\"")
-        {
-            return self.run_batch().await;
-        }
-
-        // Single-file segment task (design §14): copy one byte range of one
-        // file, written at an explicit target offset (one CV block).
-        if self
-            .task
-            .info
-            .source_read_plan_json
-            .trim_start()
-            .starts_with("{\"segment\"")
-        {
-            return self.run_segment().await;
+        // Plan identity comes from the shared JSON-tag classifier (§8 #23).
+        match classify_transfer_plan(&self.task.info.source_read_plan_json) {
+            TransferPlanKind::Batch => return self.run_batch().await,
+            TransferPlanKind::Segment => return self.run_segment().await,
+            TransferPlanKind::SegmentGroup => return self.run_segment_group().await,
+            TransferPlanKind::Plain => {}
         }
 
         let source_path = Path::from_str(&self.task.info.source_path)?;
@@ -277,7 +264,7 @@ impl LoadTaskRunner {
             (match self.copy_and_commit_stream(&mut stream).await {
                 Ok(result) => result,
                 Err(err) => {
-                    self.cleanup_failed_stream(&stream).await;
+                    self.cleanup_failed_stream(&mut stream).await;
                     return Err(err);
                 }
             })
@@ -388,11 +375,18 @@ impl LoadTaskRunner {
         )))
     }
 
-    async fn cleanup_failed_stream(&self, stream: &CopyStream) {
+    async fn cleanup_failed_stream(&self, stream: &mut CopyStream) {
+        if let Err(err) = self.await_cleanup(stream.writer.cancel()).await {
+            warn!(
+                "cancel failed transfer writer after copy error: {} err={}",
+                self.log_context(),
+                err
+            );
+        }
         let Some(temp_path) = &stream.temp_path else {
             return;
         };
-        if let Err(err) = self.delete_temp_output(temp_path).await {
+        if let Err(err) = self.await_cleanup(self.delete_temp_output(temp_path)).await {
             warn!(
                 "delete failed transfer temp output {} failed: {} err={}",
                 temp_path.full_path(),
@@ -403,7 +397,7 @@ impl LoadTaskRunner {
     }
 
     async fn cancel_stream(&self, stream: &mut CopyStream) -> FsResult<bool> {
-        if let Err(err) = stream.writer.cancel().await {
+        if let Err(err) = self.await_cleanup(stream.writer.cancel()).await {
             warn!(
                 "cancel transfer writer failed: {} temp={:?} err={}",
                 self.log_context(),
@@ -413,7 +407,7 @@ impl LoadTaskRunner {
         }
 
         if let Some(temp_path) = &stream.temp_path {
-            if let Err(err) = self.delete_temp_output(temp_path).await {
+            if let Err(err) = self.await_cleanup(self.delete_temp_output(temp_path)).await {
                 warn!(
                     "delete canceled transfer temp output {} failed: {} err={}",
                     temp_path.full_path(),
@@ -511,7 +505,7 @@ impl LoadTaskRunner {
                 (match self.copy_and_commit_stream(&mut stream).await {
                     Ok(result) => result,
                     Err(err) => {
-                        self.cleanup_failed_stream(&stream).await;
+                        self.cleanup_failed_stream(&mut stream).await;
                         return err_box!(
                             "batch task {} file {}: {}",
                             self.task.info.task_id,
@@ -527,7 +521,7 @@ impl LoadTaskRunner {
             // on them, design §7.2). Mark before aggregating progress so a
             // marker failure fails this batch attempt like a copy failure.
             if let Err(err) = self.mark_committed_output(&stream).await {
-                self.cleanup_failed_stream(&stream).await;
+                self.cleanup_failed_stream(&mut stream).await;
                 return err_box!(
                     "batch task {} file {}: {}",
                     self.task.info.task_id,
@@ -631,17 +625,21 @@ impl LoadTaskRunner {
         // Progress throttle aligned to the configured report interval (the
         // previous hardcoded 10s window bypassed progress_interval_ms and could
         // let the scheduler judge a long segment stale - review Required).
+        let deadline_ms = LocalTime::mills().saturating_add(self.task_timeout_ms);
         let mut last_progress_time = LocalTime::mills();
 
         // Ensure the target exists with the full block layout (first segment
         // creates and pre-allocates; concurrent segments reuse it). Reuse
         // the verified layout when ensure already queried it.
         let blocks = match self
-            .ensure_segment_target(&target_path, plan.total_len)
+            .ensure_segment_target(&target_path, plan.total_len, deadline_ms)
             .await?
         {
             Some(blocks) => blocks,
-            None => self.fs.get_block_locations(&target_path).await?,
+            None => {
+                self.await_group_deadline(deadline_ms, self.fs.get_block_locations(&target_path))
+                    .await?
+            }
         };
         // Locate this segment's block in the target layout.
         let block_size = blocks.status.block_size.max(1);
@@ -650,99 +648,100 @@ impl LoadTaskRunner {
         // different block_size than the planner assumed during a rolling
         // upgrade or a non-default block size.
         let block_index = plan.block_index;
-        let located = blocks.block_locs.get(block_index as usize).ok_or_else(|| {
-            FsError::common(format!(
-                "segment task {} block {} not found in target layout (blocks={})",
-                self.task.info.task_id,
-                block_index,
-                blocks.block_locs.len()
-            ))
-        })?;
-        // The block may not have a worker assigned yet (resize pre-allocates
-        // the layout but does not assign). Assign it so we can write directly.
-        let located = if located.locs.is_empty() {
-            let assigned = self
-                .fs
-                .fs_client()
-                .assign_worker_by_id(&target_path, blocks.status.id, located.block.clone())
-                .await?;
-            assigned
-        } else {
-            located.clone()
-        };
-        let worker = located.locs.first().ok_or_else(|| {
-            FsError::common(format!(
-                "segment task {} block {} has no assigned worker",
-                self.task.info.task_id, block_index
-            ))
-        })?;
 
         // Open source and seek to the segment start.
-        let mut reader = self.open_unified(&source_path).await?;
-        reader.seek(plan.offset).await?;
-
-        // Hold a writer record for the data-copy window so concurrent
-        // readers see is_complete=false (paired close after flush below;
-        // master-side complete is authoritative for leftovers).
-        let write_guard = self.next_writer_name();
-        let _ = self
-            .fs
-            .open_existing_for_write_as(&target_path, &write_guard)
+        let mut reader = self
+            .await_group_deadline(deadline_ms, self.open_unified(&source_path))
             .await?;
 
-        // Write this segment's bytes directly to its block via
-        // BlockWriterRemote (bypasses FsWriter, whose complete/flush validates
-        // the whole file - impossible for a partial segment write).
-        let mut writer = BlockWriterRemote::new(
-            self.fs.fs_context().as_ref(),
-            located.block.clone(),
-            worker.clone(),
-            0,
-            block_size,
-        )
-        .await?;
-
-        // Copy exactly `length` bytes.
-        let mut remaining = plan.length;
-        let mut written: i64 = 0;
-        while remaining > 0 {
-            if self.task.is_cancel() {
-                info!("segment transfer task canceled: {}", self.log_context());
-                let _ = writer.cancel().await;
-                self.close_writer_record_as(&target_path, &write_guard)
-                    .await;
+        self.await_group_deadline(deadline_ms, reader.seek(plan.offset))
+            .await?;
+        // Hold a writer record for the data-copy window so concurrent
+        // readers see is_complete=false. Every path below closes it.
+        let (mut writer, write_guard) = self
+            .open_segment_writer(&target_path, &blocks, block_size, block_index, deadline_ms)
+            .await?;
+        let mut writer_completed = false;
+        let copy_result: FsResult<Option<i64>> = async {
+            let mut remaining = plan.length;
+            let mut written = 0i64;
+            while remaining > 0 {
+                if self.task.is_cancel() {
+                    info!("segment transfer task canceled: {}", self.log_context());
+                    return Ok(None);
+                }
+                let chunk = self
+                    .await_group_deadline(
+                        deadline_ms,
+                        reader.async_read(Some(remaining.min(Self::READ_CHUNK_BYTES) as usize)),
+                    )
+                    .await?;
+                if chunk.is_empty() || chunk.len() as i64 > remaining {
+                    return err_box!(
+                        "segment task {} short read: {} bytes missing",
+                        self.task.info.task_id,
+                        remaining
+                    );
+                }
+                self.task.note_first_byte();
+                let chunk_len = chunk.len() as i64;
+                self.await_group_deadline(deadline_ms, writer.write(chunk))
+                    .await?;
+                remaining -= chunk_len;
+                written += chunk_len;
+                if LocalTime::mills() > last_progress_time + self.progress_interval_ms {
+                    last_progress_time = LocalTime::mills();
+                    self.update_progress(written, plan.length, false).await;
+                }
+            }
+            self.await_group_deadline(deadline_ms, writer.flush())
+                .await?;
+            self.await_group_deadline(deadline_ms, writer.complete())
+                .await?;
+            writer_completed = true;
+            self.await_group_deadline(deadline_ms, reader.complete())
+                .await?;
+            Ok(Some(written))
+        }
+        .await;
+        if !writer_completed {
+            if let Err(err) = self.await_cleanup(writer.cancel()).await {
+                warn!(
+                    "cancel segment writer failed: {} err={}",
+                    self.log_context(),
+                    err
+                );
+            }
+        }
+        let close_result = self
+            .await_cleanup(self.close_writer_record_as(&target_path, &write_guard))
+            .await;
+        let written = match copy_result {
+            Ok(Some(written)) => {
+                close_result?;
+                written
+            }
+            Ok(None) => {
+                if let Err(err) = close_result {
+                    warn!(
+                        "close canceled segment writer record failed: {} err={}",
+                        self.log_context(),
+                        err
+                    );
+                }
                 return self.finish_canceled().await;
             }
-            let want = remaining.min(Self::READ_CHUNK_BYTES) as usize;
-            let chunk = reader.async_read(Some(want)).await?;
-            if chunk.is_empty() {
-                break;
+            Err(err) => {
+                if let Err(close_err) = close_result {
+                    warn!(
+                        "close failed segment writer record failed: {} err={}",
+                        self.log_context(),
+                        close_err
+                    );
+                }
+                return Err(err);
             }
-            self.task.note_first_byte();
-            let chunk_len = chunk.len() as i64;
-            writer.write(chunk).await?;
-            remaining -= chunk_len;
-            written += chunk_len;
-            if LocalTime::mills() > last_progress_time + self.progress_interval_ms {
-                last_progress_time = LocalTime::mills();
-                self.update_progress(written, plan.length, false).await;
-            }
-        }
-        if remaining != 0 {
-            let _ = writer.cancel().await;
-            self.close_writer_record_as(&target_path, &write_guard)
-                .await;
-            return err_box!(
-                "segment task {} short read: {} bytes missing",
-                self.task.info.task_id,
-                remaining
-            );
-        }
-        writer.flush().await?;
-        writer.complete().await?;
-        reader.complete().await?;
-        self.close_writer_record_as(&target_path, &write_guard)
-            .await;
+        };
 
         let progress = self.task.update_progress(written, plan.length, true);
         if let Err(err) = self.report_progress(progress).await {
@@ -765,6 +764,384 @@ impl LoadTaskRunner {
         Ok(true)
     }
 
+    async fn run_segment_group(&self) -> FsResult<bool> {
+        let plan = parse_segment_group(&self.task.info.source_read_plan_json)?;
+        // FileStatus exposes len/mtime only.  Neither identifies immutable
+        // UFS content, so a persisted lower-bound cannot safely skip source
+        // ranges after retry.  Keep direct/manual group tasks fail-closed
+        // until adapters provide a version/snapshot contract that this worker
+        // can compare before resuming.
+        if !group_source_version_is_verifiable(&plan) {
+            return err_box!(
+                "segment group task {} is disabled: immutable source version validation is unavailable",
+                self.task.info.task_id
+            );
+        }
+        if self.task.info.job.storage_type == StorageType::SpdkDisk {
+            return err_box!(
+                "segment group task {} unsupported on SPDK target",
+                self.task.info.task_id
+            );
+        }
+        let source_path = Path::from_str(&self.task.info.source_path)?;
+        let target_path = Path::from_str(&self.task.info.target_path)?;
+        let deadline_ms = LocalTime::mills().saturating_add(self.task_timeout_ms);
+        self.await_group_deadline(deadline_ms, self.check_group_source(&source_path, &plan))
+            .await?;
+        let blocks = match self
+            .ensure_segment_target(&target_path, plan.total_len, deadline_ms)
+            .await?
+        {
+            Some(blocks) => blocks,
+            None => {
+                self.await_group_deadline(deadline_ms, self.fs.get_block_locations(&target_path))
+                    .await?
+            }
+        };
+        let block_size = blocks.status.block_size.max(1);
+        if block_size != plan.segment_bytes || blocks.status.len != plan.total_len {
+            return err_box!(
+                "segment group task {} target layout changed: block_size={} expected={} len={} expected={}",
+                self.task.info.task_id,
+                block_size,
+                plan.segment_bytes,
+                blocks.status.len,
+                plan.total_len
+            );
+        }
+        let resume = self
+            .task
+            .info
+            .transfer_report
+            .as_ref()
+            .map(|report| report.resume_loaded_size)
+            .unwrap_or(0);
+        let start_resume = plan.resume_floor(resume.clamp(0, plan.group_len()));
+        let segments = plan.iter_from(start_resume);
+        let group_total = plan.group_len();
+        self.task.update_progress(start_resume, group_total, false);
+        let mut committed = start_resume;
+        let mut last_progress_ms = LocalTime::mills();
+        let mut reader = self
+            .await_group_deadline(deadline_ms, self.open_unified(&source_path))
+            .await?;
+        for (offset, length, block_index) in segments {
+            if !self
+                .copy_one_segment(
+                    &mut reader,
+                    &target_path,
+                    &blocks,
+                    block_size,
+                    offset,
+                    length,
+                    block_index,
+                    committed,
+                    group_total,
+                    &mut last_progress_ms,
+                    deadline_ms,
+                )
+                .await?
+            {
+                return Ok(true);
+            }
+            committed = committed.saturating_add(length);
+            self.update_progress(committed, group_total, false).await;
+            info!(
+                "segment group progress: {} offset={} length={} block={} committed={} total={}",
+                self.log_context(),
+                offset,
+                length,
+                block_index,
+                committed,
+                group_total,
+            );
+        }
+        self.await_group_deadline(deadline_ms, reader.complete())
+            .await?;
+        self.await_group_deadline(deadline_ms, self.check_group_source(&source_path, &plan))
+            .await?;
+        let progress = self.task.update_progress(committed, group_total, true);
+        if let Err(err) = self.report_progress(progress).await {
+            if self.task.info.transfer_report.is_some() {
+                warn!(
+                    "final segment group transfer task report failed, keep task for scheduler probe: {} err={}",
+                    self.log_context(),
+                    err
+                );
+                return Ok(false);
+            }
+            return Err(err);
+        }
+        info!(
+            "segment group transfer task completed: {} segments_committed_bytes={} total={}",
+            self.log_context(),
+            committed,
+            group_total,
+        );
+        Ok(true)
+    }
+
+    async fn check_group_source(
+        &self,
+        source_path: &Path,
+        plan: &SegmentGroupPlan,
+    ) -> FsResult<()> {
+        // Immutable identity first (design D0.4): len/mtime are only
+        // diagnostic hints, never the resume gate.
+        if plan.source_version.is_empty() {
+            return err_box!(
+                "segment group task {} has no source version; refusing resume",
+                self.task.info.task_id
+            );
+        }
+        if source_path.is_cv() {
+            // The planner only mints groups for UFS sources; a CV-sourced
+            // group manifest cannot be identity-checked, so fail closed.
+            return err_box!(
+                "segment group task {} source version is unverifiable for CV source",
+                self.task.info.task_id
+            );
+        }
+        let ufs = self.get_ufs()?;
+        // One HEAD observation, same source the planner fingerprinted: the
+        // version decides, len is an exact second signal, mtime is only a
+        // diagnostic hint (kept strict here because both sides are HEAD).
+        let (len, mtime, live) = crate::common::ufs_object_fingerprint(&ufs, source_path).await;
+        if live.is_empty() {
+            return err_box!(
+                "segment group task {} source version unavailable; refusing resume",
+                self.task.info.task_id
+            );
+        }
+        if live != plan.source_version {
+            return err_box!(
+                "segment group task {} source changed: version mismatch",
+                self.task.info.task_id
+            );
+        }
+        if len != plan.total_len || len != plan.source_len {
+            return err_box!(
+                "segment group task {} source changed: len={} expected={}",
+                self.task.info.task_id,
+                len,
+                plan.total_len
+            );
+        }
+        if plan.source_mtime != 0 && mtime != plan.source_mtime {
+            return err_box!(
+                "segment group task {} source changed: mtime={} expected={}",
+                self.task.info.task_id,
+                mtime,
+                plan.source_mtime
+            );
+        }
+        Ok(())
+    }
+
+    async fn open_segment_writer(
+        &self,
+        target_path: &Path,
+        blocks: &FileBlocks,
+        block_size: i64,
+        block_index: i64,
+        deadline_ms: u64,
+    ) -> FsResult<(BlockWriterRemote, String)> {
+        let located = blocks.block_locs.get(block_index as usize).ok_or_else(|| {
+            FsError::common(format!(
+                "segment task {} block {} not found in target layout (blocks={})",
+                self.task.info.task_id,
+                block_index,
+                blocks.block_locs.len()
+            ))
+        })?;
+        let located = if located.locs.is_empty() {
+            self.await_group_deadline(
+                deadline_ms,
+                self.fs.fs_client().assign_worker_by_id(
+                    target_path,
+                    blocks.status.id,
+                    located.block.clone(),
+                ),
+            )
+            .await?
+        } else {
+            located.clone()
+        };
+        let worker = located.locs.first().ok_or_else(|| {
+            FsError::common(format!(
+                "segment task {} block {} has no assigned worker",
+                self.task.info.task_id, block_index
+            ))
+        })?;
+        let write_guard = self.next_writer_name();
+        let _ = self
+            .await_group_deadline(
+                deadline_ms,
+                self.fs
+                    .open_existing_for_write_as(target_path, &write_guard),
+            )
+            .await?;
+        let writer = match self
+            .await_group_deadline(
+                deadline_ms,
+                BlockWriterRemote::new(
+                    self.fs.fs_context().as_ref(),
+                    located.block.clone(),
+                    worker.clone(),
+                    0,
+                    block_size,
+                ),
+            )
+            .await
+        {
+            Ok(writer) => writer,
+            Err(err) => {
+                if let Err(close_err) = self
+                    .await_cleanup(self.close_writer_record_as(target_path, &write_guard))
+                    .await
+                {
+                    warn!(
+                        "close segment writer record after open failure failed: {} err={}",
+                        self.log_context(),
+                        close_err
+                    );
+                }
+                return Err(err);
+            }
+        };
+        Ok((writer, write_guard))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn copy_one_segment(
+        &self,
+        reader: &mut UnifiedReader,
+        target_path: &Path,
+        blocks: &FileBlocks,
+        block_size: i64,
+        offset: i64,
+        length: i64,
+        block_index: i64,
+        committed_base: i64,
+        progress_total: i64,
+        last_progress_ms: &mut u64,
+        deadline_ms: u64,
+    ) -> FsResult<bool> {
+        let (mut writer, write_guard) = self
+            .open_segment_writer(target_path, blocks, block_size, block_index, deadline_ms)
+            .await?;
+        // Keep exactly one read and one write in flight. This chunk pipeline
+        // overlaps the source and target RPCs while holding at most two chunks.
+        let result = async {
+            self.await_group_deadline(deadline_ms, reader.seek(offset))
+                .await?;
+            if self.task.is_cancel() {
+                info!("segment transfer task canceled: {}", self.log_context());
+                return Ok(false);
+            }
+            if LocalTime::mills() > deadline_ms {
+                return err_box!(
+                    "Task {} exceed timeout {} ms",
+                    self.task.info.task_id,
+                    self.task_timeout_ms
+                );
+            }
+            let mut remaining = length;
+            let mut chunk = self
+                .await_group_deadline(
+                    deadline_ms,
+                    reader.async_read(Some(remaining.min(Self::READ_CHUNK_BYTES) as usize)),
+                )
+                .await?;
+            while remaining > 0 {
+                if self.task.is_cancel() {
+                    info!("segment transfer task canceled: {}", self.log_context());
+                    return Ok(false);
+                }
+                if LocalTime::mills() > deadline_ms {
+                    return err_box!(
+                        "Task {} exceed timeout {} ms",
+                        self.task.info.task_id,
+                        self.task_timeout_ms
+                    );
+                }
+                if chunk.is_empty() || chunk.len() as i64 > remaining {
+                    return err_box!(
+                        "segment task {} short read: {} bytes missing",
+                        self.task.info.task_id,
+                        remaining
+                    );
+                }
+                self.task.note_first_byte();
+                let chunk_len = chunk.len() as i64;
+                let next_remaining = remaining - chunk_len;
+                if next_remaining == 0 {
+                    self.await_group_deadline(deadline_ms, writer.write(chunk))
+                        .await?;
+                    break;
+                } else {
+                    let (next_chunk, _) = futures::try_join!(
+                        self.await_group_deadline(
+                            deadline_ms,
+                            reader.async_read(Some(
+                                next_remaining.min(Self::READ_CHUNK_BYTES) as usize
+                            )),
+                        ),
+                        self.await_group_deadline(deadline_ms, writer.write(chunk)),
+                    )?;
+                    chunk = next_chunk;
+                }
+                remaining = next_remaining;
+                if LocalTime::mills() > *last_progress_ms + self.progress_interval_ms {
+                    *last_progress_ms = LocalTime::mills();
+                    // A group heartbeat renews liveness but must not make a
+                    // partially written segment resumable. Only the prefix
+                    // before this segment has passed flush + complete.
+                    self.update_progress(committed_base, progress_total, false)
+                        .await;
+                }
+            }
+            self.await_group_deadline(deadline_ms, writer.flush())
+                .await?;
+            self.await_group_deadline(deadline_ms, writer.complete())
+                .await?;
+            Ok(true)
+        }
+        .await;
+        if !matches!(result, Ok(true)) {
+            if let Err(err) = self.await_cleanup(writer.cancel()).await {
+                warn!(
+                    "cancel group segment writer failed: {} err={}",
+                    self.log_context(),
+                    err
+                );
+            }
+        }
+        let close_result = self
+            .await_cleanup(self.close_writer_record_as(target_path, &write_guard))
+            .await;
+        match result {
+            Ok(false) => {
+                close_result?;
+                self.finish_canceled().await.map(|_| false)
+            }
+            Ok(value) => {
+                close_result?;
+                Ok(value)
+            }
+            Err(err) => {
+                if let Err(close_err) = close_result {
+                    warn!(
+                        "close failed group segment writer record failed: {} err={}",
+                        self.log_context(),
+                        close_err
+                    );
+                }
+                Err(err)
+            }
+        }
+    }
+
     /// Open an existing CV/UFS target for positional write, or create it on
     /// Ensure the segment target exists with the full block layout: the
     /// first segment creates and pre-allocates the whole file (resize), so
@@ -775,19 +1152,23 @@ impl LoadTaskRunner {
         &self,
         target_path: &Path,
         total_len: i64,
+        deadline_ms: u64,
     ) -> FsResult<Option<FileBlocks>> {
         if target_path.is_cv() {
             // Existence check via get_status (no writer record); open is
             // only used where a handle is actually needed below.
-            match self.fs.get_status(target_path).await {
+            match self
+                .await_group_deadline(deadline_ms, self.fs.get_status(target_path))
+                .await
+            {
                 // The file may have been created by a concurrent segment
                 // whose resize has not landed yet (create+resize are not
                 // atomic). Verify the pre-allocation before treating the
                 // target as ready instead of trusting existence alone.
-                Ok(_) => {
-                    let blocks = self.ensure_segment_size(target_path, total_len).await?;
-                    Ok(Some(blocks))
-                }
+                Ok(_) => self
+                    .ensure_segment_size(target_path, total_len, deadline_ms)
+                    .await
+                    .map(Some),
                 Err(FsError::FileNotFound(_)) => {
                     let opts = CreateFileOptsBuilder::new()
                         .create_parent(true)
@@ -797,26 +1178,65 @@ impl LoadTaskRunner {
                         .ttl_ms(self.task.info.job.ttl_ms)
                         .ttl_action(self.task.info.job.ttl_action)
                         .build();
-                    match self.fs.create_with_opts(target_path, opts, false).await {
-                        // Freshly created and synchronously resized above: the
-                        // layout is ready, no verification needed.
+                    match self
+                        .await_group_deadline(
+                            deadline_ms,
+                            self.fs.create_with_opts(target_path, opts, false),
+                        )
+                        .await
+                    {
+                        // Keep the creating writer record open on success so
+                        // the preallocated target remains incomplete until
+                        // scheduler convergence performs the final complete.
                         Ok(mut writer) => {
-                            if total_len > 0 {
-                                writer
-                                    .resize(FileAllocOpts::with_truncate(total_len))
+                            let result = async {
+                                if total_len > 0 {
+                                    self.await_group_deadline(
+                                        deadline_ms,
+                                        writer.resize(FileAllocOpts::with_truncate(total_len)),
+                                    )
                                     .await?;
+                                }
+                                self.await_group_deadline(deadline_ms, writer.flush()).await
                             }
-                            writer.flush().await?;
-                            Ok(None)
+                            .await;
+                            match result {
+                                Ok(()) => Ok(None),
+                                Err(err) => {
+                                    if let Err(cancel_err) =
+                                        self.await_cleanup(writer.cancel()).await
+                                    {
+                                        warn!(
+                                            "cancel newly created segment target after resize failure failed: {} err={}",
+                                            self.log_context(),
+                                            cancel_err
+                                        );
+                                    }
+                                    // This target was created by this call;
+                                    // remove it rather than leaving a partial
+                                    // file that could appear complete after
+                                    // closing its only writer record.
+                                    if let Err(delete_err) =
+                                        self.await_cleanup(self.fs.delete(target_path, false)).await
+                                    {
+                                        warn!(
+                                            "delete newly created segment target after resize failure failed: {} err={}",
+                                            self.log_context(),
+                                            delete_err
+                                        );
+                                    }
+                                    Err(err)
+                                }
+                            }
                         }
                         // Concurrent create race: another segment created the
                         // file. create+resize are not atomic, so verify the
                         // resize actually landed before treating the target as
                         // ready; otherwise re-apply it (review Required).
-                        Err(FsError::FileAlreadyExists(_)) => {
-                            let blocks = self.ensure_segment_size(target_path, total_len).await?;
-                            Ok(Some(blocks))
-                        }
+                        Err(FsError::FileAlreadyExists(_)) => self
+                            .ensure_segment_size(target_path, total_len, deadline_ms)
+                            .await
+                            .map(Some),
                         Err(err) => Err(err),
                     }
                 }
@@ -824,20 +1244,51 @@ impl LoadTaskRunner {
             }
         } else {
             // Non-CV target (unusual for segment tasks, but keep parity).
-            self.create_unified(target_path).await.map(|_| None)
+            self.await_group_deadline(deadline_ms, self.create_unified(target_path))
+                .await
+                .map(|_| None)
         }
     }
 
     /// Release the writer record registered under an explicit paired name.
-    async fn close_writer_record_as(&self, target_path: &Path, client_name: &str) {
-        if let Err(err) = self.fs.close_file_as(target_path, client_name).await {
-            warn!(
-                "close segment target writer record failed: task={} target={} err={}",
+    async fn close_writer_record_as(&self, target_path: &Path, client_name: &str) -> FsResult<()> {
+        self.fs.close_file_as(target_path, client_name).await
+    }
+
+    async fn await_cleanup<T>(&self, operation: impl Future<Output = FsResult<T>>) -> FsResult<T> {
+        let timeout_ms = self.task_timeout_ms.clamp(1, WRITER_CLEANUP_TIMEOUT_MS);
+        tokio::time::timeout(Duration::from_millis(timeout_ms), operation)
+            .await
+            .map_err(|_| {
+                FsError::common(format!(
+                    "Task {} writer cleanup exceeded {} ms",
+                    self.task.info.task_id, timeout_ms
+                ))
+            })?
+    }
+
+    async fn await_group_deadline<T>(
+        &self,
+        deadline_ms: u64,
+        operation: impl Future<Output = FsResult<T>>,
+    ) -> FsResult<T> {
+        let now_ms = LocalTime::mills();
+        let remaining_ms = deadline_ms.saturating_sub(now_ms);
+        if remaining_ms == 0 {
+            return err_box!(
+                "Task {} exceed timeout {} ms",
                 self.task.info.task_id,
-                target_path.full_path(),
-                err
+                self.task_timeout_ms
             );
         }
+        tokio::time::timeout(Duration::from_millis(remaining_ms), operation)
+            .await
+            .map_err(|_| {
+                FsError::common(format!(
+                    "Task {} exceed timeout {} ms",
+                    self.task.info.task_id, self.task_timeout_ms
+                ))
+            })?
     }
 
     /// Unique writer identity for one paired open/close. Sharing one name
@@ -864,24 +1315,63 @@ impl LoadTaskRunner {
         &self,
         target_path: &Path,
         total_len: i64,
+        deadline_ms: u64,
     ) -> FsResult<FileBlocks> {
-        let blocks = self.fs.get_block_locations(target_path).await?;
+        let blocks = self
+            .await_group_deadline(deadline_ms, self.fs.get_block_locations(target_path))
+            .await?;
         if blocks.status.len >= total_len && !blocks.block_locs.is_empty() {
             return Ok(blocks);
         }
         let writer_name = self.next_writer_name();
         let mut writer = self
-            .fs
-            .open_existing_for_write_as(target_path, &writer_name)
+            .await_group_deadline(
+                deadline_ms,
+                self.fs
+                    .open_existing_for_write_as(target_path, &writer_name),
+            )
             .await?;
         if total_len > 0 {
-            writer
-                .resize(FileAllocOpts::with_truncate(total_len))
+            let result = async {
+                self.await_group_deadline(
+                    deadline_ms,
+                    writer.resize(FileAllocOpts::with_truncate(total_len)),
+                )
+                .await?;
+                self.await_group_deadline(deadline_ms, writer.flush()).await
+            }
+            .await;
+            if result.is_err() {
+                if let Err(cancel_err) = self.await_cleanup(writer.cancel()).await {
+                    warn!(
+                        "cancel failed segment resize writer after error: {} err={}",
+                        self.log_context(),
+                        cancel_err
+                    );
+                }
+            }
+            let close_result = self
+                .await_cleanup(self.close_writer_record_as(target_path, &writer_name))
+                .await;
+            match result {
+                Ok(()) => close_result?,
+                Err(err) => {
+                    if let Err(close_err) = close_result {
+                        warn!(
+                            "close failed segment resize writer record failed: {} err={}",
+                            self.log_context(),
+                            close_err
+                        );
+                    }
+                    return Err(err);
+                }
+            }
+        } else {
+            self.await_cleanup(self.close_writer_record_as(target_path, &writer_name))
                 .await?;
         }
-        writer.flush().await?;
-        self.close_writer_record_as(target_path, &writer_name).await;
-        self.fs.get_block_locations(target_path).await
+        self.await_group_deadline(deadline_ms, self.fs.get_block_locations(target_path))
+            .await
     }
 
     /// Stamp commit markers on the committed target (idempotent retry relies
@@ -1516,6 +2006,15 @@ async fn ensure_ufs_parent(ufs: &UfsFileSystem, path: &Path) -> FsResult<()> {
         }
     }
     Ok(())
+}
+
+fn group_source_version_is_verifiable(plan: &SegmentGroupPlan) -> bool {
+    // Design D0.4: resume may skip source bytes only against an immutable
+    // version/snapshot. No adapter exposes one yet (FileStatus=len/mtime),
+    // so production plans (empty version) stay fail-closed. E2E crafts a
+    // synthetic version with a test-held immutable source to exercise the
+    // mechanics; production enable still waits for the adapter contract.
+    !plan.source_version.is_empty()
 }
 
 fn xattr_equals(status: &FileStatus, key: &str, expected: &[u8]) -> bool {

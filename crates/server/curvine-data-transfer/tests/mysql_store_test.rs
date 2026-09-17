@@ -61,6 +61,7 @@ fn legacy_task() -> TransferTaskRecord {
         last_report_at: 10,
         stale_deadline_at: 100,
         updated_at: 10,
+        replace_target: false,
     }
 }
 

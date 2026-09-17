@@ -139,9 +139,6 @@ fn segment_offsets_cover_exact_block_multiple() {
 #[test]
 fn segment_offsets_align_to_smaller_block_size() {
     use super::planner::{segment_offsets, SEGMENT_BYTES};
-    // A job with a 64 MiB block size must split at 64 MiB boundaries, not
-    // the 128 MiB default, so each segment maps to exactly one CV block
-    // (review: run_segment assumed block_size == SEGMENT_BYTES).
     let block = SEGMENT_BYTES / 2;
     let len = block * 3 + block / 2;
     let ranges = segment_offsets(len, block);
@@ -150,6 +147,195 @@ fn segment_offsets_align_to_smaller_block_size() {
     assert_eq!(ranges[1], (block, block));
     assert_eq!(ranges[2], (block * 2, block));
     assert_eq!(ranges[3], (block * 3, block / 2));
+}
+
+#[test]
+fn segment_offsets_large_block_maps_one_segment_per_block() {
+    use super::planner::{segment_offsets, SEGMENT_BYTES};
+    let block = SEGMENT_BYTES * 8;
+    let ranges = segment_offsets(block * 2 + block / 2, block);
+    assert_eq!(ranges.len(), 3);
+    assert_eq!(ranges[0], (0, block));
+    assert_eq!(ranges[1], (block, block));
+    assert_eq!(ranges[2], (block * 2, block / 2));
+    let narrow = segment_offsets(block, block);
+    assert_eq!(narrow, vec![(0, block)]);
+    let mut indices = ranges.iter().map(|(offset, _)| offset / block);
+    let first = indices.next().unwrap();
+    assert!(indices
+        .enumerate()
+        .all(|(i, idx)| idx == first + i as i64 + 1));
+}
+
+#[test]
+fn segment_offsets_tiny_block_stays_per_block() {
+    use super::planner::segment_offsets;
+    let block = 4 * 1024 * 1024;
+    let ranges = segment_offsets(block * 3, block);
+    assert_eq!(ranges.len(), 3);
+    assert_eq!(ranges[0], (0, block));
+    assert_eq!(ranges[2], (block * 2, block));
+}
+
+#[test]
+fn group_partition_keeps_small_files_per_segment() {
+    use super::planner::{plan_segment_groups, SEGMENT_BYTES};
+    let groups = plan_segment_groups(
+        SEGMENT_BYTES * 8,
+        SEGMENT_BYTES,
+        84,
+        SEGMENT_BYTES * 8,
+        7,
+        String::new(),
+    );
+    assert_eq!(groups.len(), 8);
+    for group in &groups {
+        assert_eq!(group.group_len(), SEGMENT_BYTES);
+    }
+    assert_eq!(groups[0].start_offset, 0);
+    assert_eq!(groups[7].end_offset, SEGMENT_BYTES * 8);
+    assert_eq!(groups[3].first_block_index, 3);
+}
+
+#[test]
+fn group_partition_matches_design_targets() {
+    use super::planner::{plan_segment_groups, SEGMENT_BYTES};
+    let gb = 1024 * 1024 * 1024;
+    let groups_100g = plan_segment_groups(100 * gb, SEGMENT_BYTES, 84, 100 * gb, 0, String::new());
+    assert_eq!(groups_100g.len(), 84);
+    let groups_5t = plan_segment_groups(
+        5 * 1024 * gb,
+        SEGMENT_BYTES,
+        84,
+        5 * 1024 * gb,
+        0,
+        String::new(),
+    );
+    assert_eq!(groups_5t.len(), 1024);
+    for group in groups_5t.iter().take(1023) {
+        assert!(group.group_len() <= 5 * gb);
+    }
+}
+
+#[test]
+fn group_partition_is_contiguous_and_covers_the_file() {
+    use super::planner::{plan_segment_groups, SEGMENT_BYTES};
+    let len = SEGMENT_BYTES * 100 + 12345;
+    let groups = plan_segment_groups(len, SEGMENT_BYTES, 4, len, 0, String::new());
+    let mut next = 0i64;
+    let mut index = 0i64;
+    for group in &groups {
+        assert_eq!(group.start_offset, next);
+        assert_eq!(group.first_block_index, index);
+        assert_eq!(group.total_len, len);
+        next = group.end_offset;
+        index += (group.group_len() + SEGMENT_BYTES - 1) / SEGMENT_BYTES;
+    }
+    assert_eq!(next, len);
+}
+
+#[test]
+fn group_partition_caps_bytes_with_large_blocks() {
+    use super::planner::plan_segment_groups;
+    let gb = 1024 * 1024 * 1024;
+    let groups = plan_segment_groups(100 * gb, gb, 84, 100 * gb, 0, String::new());
+    assert_eq!(groups.len(), 84);
+    let oversize = plan_segment_groups(6 * gb, 6 * gb, 84, 6 * gb, 0, String::new());
+    assert_eq!(oversize.len(), 1);
+    assert_eq!(oversize[0].group_len(), 6 * gb);
+}
+
+#[test]
+fn group_partition_derives_count_from_live_workers_and_budget() {
+    use super::planner::{plan_segment_groups, SEGMENT_BYTES, SEGMENT_GROUP_TARGET_BYTES};
+    let groups = plan_segment_groups(
+        SEGMENT_BYTES * 100,
+        SEGMENT_BYTES,
+        4,
+        SEGMENT_BYTES * 100,
+        0,
+        "etag".to_string(),
+    );
+    assert_eq!(groups.len(), 4);
+    assert!(groups
+        .iter()
+        .all(|group| group.group_len() <= SEGMENT_GROUP_TARGET_BYTES));
+}
+
+#[test]
+fn group_planning_requires_a_nonempty_all_capable_worker_view() {
+    use super::planner::supports_segment_grouping;
+    use curvine_model::{TransferWorkerCapabilities, WorkerInfo};
+
+    assert!(!supports_segment_grouping(&[]));
+
+    let mut current = WorkerInfo::default();
+    current.transfer_capabilities = TransferWorkerCapabilities::current();
+    assert!(supports_segment_grouping(&[current.clone()]));
+
+    let mut legacy = current;
+    legacy.transfer_capabilities.segment_group = false;
+    assert!(!supports_segment_grouping(&[legacy]));
+}
+
+#[test]
+fn group_partition_empty_file_has_no_groups() {
+    use super::planner::{plan_segment_groups, SEGMENT_BYTES};
+    assert!(plan_segment_groups(0, SEGMENT_BYTES, 84, 0, 0, String::new()).is_empty());
+}
+#[test]
+fn group_manifest_carries_source_version() {
+    use super::planner::{plan_segment_groups, SEGMENT_BYTES};
+    let gb = 1024 * 1024 * 1024;
+    let groups = plan_segment_groups(
+        100 * gb,
+        SEGMENT_BYTES,
+        84,
+        100 * gb,
+        0,
+        "etag-abc".to_string(),
+    );
+    let multi = groups
+        .iter()
+        .find(|group| group.group_len() > SEGMENT_BYTES)
+        .unwrap();
+    assert_eq!(multi.source_version, "etag-abc");
+    let unversioned = plan_segment_groups(100 * gb, SEGMENT_BYTES, 84, 100 * gb, 0, String::new());
+    assert!(unversioned
+        .iter()
+        .all(|group| group.source_version.is_empty()));
+}
+
+#[test]
+fn singleton_group_emits_legacy_segment_plan() {
+    use super::planner::{build_group_plan_json, plan_segment_groups, SEGMENT_BYTES};
+    use curvine_model::{classify_transfer_plan, TransferPlanKind};
+    let groups = plan_segment_groups(
+        SEGMENT_BYTES * 2,
+        SEGMENT_BYTES,
+        84,
+        SEGMENT_BYTES * 2,
+        0,
+        String::new(),
+    );
+    assert_eq!(groups.len(), 2);
+    for group in &groups {
+        let (json, total) = build_group_plan_json(group, SEGMENT_BYTES * 2).unwrap();
+        assert_eq!(classify_transfer_plan(&json), TransferPlanKind::Segment);
+        assert_eq!(total, SEGMENT_BYTES);
+    }
+    let gb = 1024 * 1024 * 1024;
+    let big = plan_segment_groups(100 * gb, SEGMENT_BYTES, 84, 100 * gb, 0, String::new());
+    let multi = big
+        .iter()
+        .find(|group| group.group_len() > SEGMENT_BYTES)
+        .unwrap();
+    let (json, total) = build_group_plan_json(multi, 100 * gb).unwrap();
+    assert_eq!(
+        classify_transfer_plan(&json),
+        TransferPlanKind::SegmentGroup
+    );
+    assert_eq!(total, multi.group_len());
 }
 
 #[test]
@@ -230,6 +416,8 @@ fn load_replicas_override_mount_and_service_defaults() {
         created_at: 0,
         updated_at: 0,
         planning_attempts: 0,
+        terminal_summary: None,
+        terminal_counts: None,
     };
     let mount = MountInfo {
         replicas: Some(2),
@@ -246,4 +434,35 @@ fn load_replicas_override_mount_and_service_defaults() {
             .replicas,
         3
     );
+}
+
+#[test]
+fn group_row_reduction_projection_matches_nightly_load() {
+    use super::planner::{plan_segment_groups, segment_offsets, SEGMENT_BYTES};
+    use std::time::Instant;
+    let gb = 1024 * 1024 * 1024;
+    let cases = [
+        (gb, 8, 8),
+        (100 * gb, 800, 84),
+        (5 * 1024 * gb, 40960, 1024),
+    ];
+    for (len, old_rows, new_rows) in cases {
+        assert_eq!(segment_offsets(len, SEGMENT_BYTES).len(), old_rows);
+        let start = Instant::now();
+        let groups = plan_segment_groups(len, SEGMENT_BYTES, 84, len, 0, String::new());
+        assert_eq!(groups.len(), new_rows);
+        assert!(start.elapsed().as_secs() < 5);
+    }
+    let manifest = curvine_model::segment_group_json(
+        &plan_segment_groups(
+            5 * 1024 * gb,
+            SEGMENT_BYTES,
+            84,
+            5 * 1024 * gb,
+            0,
+            String::new(),
+        )[0],
+    )
+    .unwrap();
+    assert!(manifest.len() < 1024);
 }

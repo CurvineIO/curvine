@@ -862,6 +862,47 @@ impl OpendalFileSystem {
         }
     }
 
+    /// Immutable object identity for Transfer group resume (design D0.4):
+    /// the backend version id when present, else the ETag. Empty when the
+    /// backend provides neither (e.g. plain files): callers must then fall
+    /// back to single-segment tasks instead of guessing from len/mtime.
+    pub fn object_version(metadata: &Metadata) -> String {
+        metadata
+            .version()
+            .or(metadata.etag())
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// Stat `path` and return its [`Self::object_version`], or empty when the
+    /// object is missing or carries no identity. Missing objects map to empty
+    /// (not NotFound) so planners treat them as unavailable, not fatal.
+    pub async fn get_object_version(&self, path: &Path) -> FsResult<String> {
+        Ok(self.object_fingerprint(path).await?.2)
+    }
+
+    /// One HEAD stat yielding `(len, mtime_ms, version)` together. Callers
+    /// must take all three from this single observation: LIST and HEAD
+    /// timestamps can disagree by sub-second truncation on S3-style stores,
+    /// so mixing a LIST mtime (planner) with a HEAD mtime (worker check)
+    /// false-fires "source changed" on unchanged objects.
+    pub async fn object_fingerprint(&self, path: &Path) -> FsResult<(i64, i64, String)> {
+        let (first_path, second_path) = if path.likely_file() {
+            (self.get_object_path(path)?, self.get_dir_path(path)?)
+        } else {
+            (self.get_dir_path(path)?, self.get_object_path(path)?)
+        };
+        let mut metadata = self.get_object_status(&first_path).await?;
+        if metadata.is_none() {
+            metadata = self.get_object_status(&second_path).await?;
+        }
+        let Some(m) = metadata else {
+            return Ok((0, 0, String::new()));
+        };
+        let status = Self::read_status(path, &m);
+        Ok((status.len, status.mtime, Self::object_version(&m)))
+    }
+
     pub async fn get_file_status(&self, path: &Path) -> FsResult<Option<FileStatus>> {
         let (first_path, second_path) = if path.likely_file() {
             (self.get_object_path(path)?, self.get_dir_path(path)?)

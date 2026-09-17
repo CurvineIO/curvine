@@ -27,6 +27,7 @@ pub struct TransferWorkerCapabilities {
     pub query_task: bool,
     pub attempt_safe_output: bool,
     pub source_read_plan: bool,
+    pub segment_group: bool,
 }
 
 impl TransferWorkerCapabilities {
@@ -37,6 +38,7 @@ impl TransferWorkerCapabilities {
             query_task: true,
             attempt_safe_output: true,
             source_read_plan: true,
+            segment_group: true,
         }
     }
 
@@ -46,6 +48,10 @@ impl TransferWorkerCapabilities {
             && self.query_task
             && self.attempt_safe_output
             && self.source_read_plan
+    }
+
+    pub fn supports_segment_group(&self) -> bool {
+        self.supports_transfer() && self.segment_group
     }
 }
 

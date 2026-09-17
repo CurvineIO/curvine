@@ -12,13 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_error::FsResult;
+use curvine_error::{FsError, FsResult};
 use curvine_model::{
     summarize_transfer_tasks, StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease,
     TransferListFilter, TransferProgress, TransferStateUpdate, TransferTaskCounts,
     TransferTaskRecord, TransferTaskReport, TransferTaskState, TransferTaskStatus,
     TransferTaskSummary, TransferTenantSummary, WorkerInflight,
 };
+
+/// Every SQL write path that mutates task rows must stay below this bound in
+/// one transaction. It prevents a single large transfer from holding locks
+/// and generating an unbounded undo/binlog record.
+pub const MAX_TASKS_PER_STORE_TRANSACTION: usize = 1_000;
+pub const MAX_JOBS_PER_STORE_TRANSACTION: usize = 200;
+
+pub fn ensure_task_transaction_bound(task_count: usize) -> FsResult<()> {
+    if task_count > MAX_TASKS_PER_STORE_TRANSACTION {
+        return Err(FsError::invalid_argument(format!(
+            "transfer store transaction exceeds {} task rows",
+            MAX_TASKS_PER_STORE_TRANSACTION
+        )));
+    }
+    Ok(())
+}
 
 pub trait TransferStore: Send + Sync + 'static {
     fn check_available(&self) -> FsResult<()>;
@@ -65,7 +81,46 @@ pub trait TransferStore: Send + Sync + 'static {
         offset: usize,
     ) -> FsResult<Vec<TransferTenantSummary>>;
 
+    /// Compatibility cleanup entry point. Implementations must retain the
+    /// same row bounds as the split task/job cleanup methods below.
     fn purge_terminal_transfers(&self, older_than_ms: i64, limit: usize) -> FsResult<usize>;
+
+    /// Delete task rows of terminal jobs only, bounded by actual task rows
+    /// per call so one oversized job spans multiple short transactions.
+    /// Never touches tasks of non-terminal jobs. Returns deleted task rows.
+    fn purge_terminal_tasks(&self, older_than_ms: i64, task_limit: usize) -> FsResult<usize>;
+
+    /// Lease-fenced cleanup variant used by the scheduler. SQL stores lock
+    /// the lease row in the same transaction as the delete, so another HA
+    /// scheduler cannot acquire an expired lease midway through that delete.
+    fn purge_terminal_tasks_with_cleanup_lease(
+        &self,
+        older_than_ms: i64,
+        task_limit: usize,
+        owner: &str,
+        now_ms: i64,
+    ) -> FsResult<usize> {
+        let _ = (owner, now_ms);
+        self.purge_terminal_tasks(older_than_ms, task_limit)
+    }
+
+    /// Delete terminal jobs that have no task rows left. Returns deleted jobs.
+    fn purge_terminal_jobs(&self, older_than_ms: i64, limit: usize) -> FsResult<usize>;
+
+    fn purge_terminal_jobs_with_cleanup_lease(
+        &self,
+        older_than_ms: i64,
+        limit: usize,
+        owner: &str,
+        now_ms: i64,
+    ) -> FsResult<usize> {
+        let _ = (owner, now_ms);
+        self.purge_terminal_jobs(older_than_ms, limit)
+    }
+
+    /// Acquire or renew the single cross-process cleanup lease. Cleanup is
+    /// independent of job leases, so HA schedulers must coordinate it here.
+    fn try_acquire_cleanup_lease(&self, owner: &str, now_ms: i64, lease_ms: i64) -> FsResult<bool>;
 
     fn list_transfer_tasks(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>>;
 
@@ -161,7 +216,19 @@ pub trait TransferStore: Send + Sync + 'static {
 
     fn insert_tasks(&self, tasks: Vec<TransferTaskRecord>) -> FsResult<()>;
 
+    /// Append one bounded planning batch while the job remains Planning.
+    /// The scheduler transitions to Dispatching only after every batch has
+    /// committed, so no transaction ever inserts an entire large plan.
+    fn append_planned_tasks(&self, update: TransferPlannedTasks) -> FsResult<bool>;
+
     fn persist_planned_tasks(&self, update: TransferPlannedTasks) -> FsResult<bool>;
+
+    /// True when an interrupted batched plan left rows behind. The scheduler
+    /// must fail rather than silently combine those rows with a re-planned
+    /// mutable source.
+    fn has_transfer_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool> {
+        Ok(!self.list_transfer_tasks(job_id, run_id)?.is_empty())
+    }
 
     fn update_task_state(&self, update: TransferTaskStateUpdate) -> FsResult<bool>;
 
@@ -227,6 +294,18 @@ pub trait TransferStore: Send + Sync + 'static {
         job_id: &str,
         run_id: u64,
         summary: TransferProgress,
+        now_ms: i64,
+    ) -> FsResult<()>;
+
+    /// Persist the terminal task snapshot (progress + structured counts)
+    /// synchronously before the job lands terminal, so TTL task purge never
+    /// renders detail as 0/empty. Additive; safe to call repeatedly.
+    fn update_terminal_snapshot(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        summary: TransferProgress,
+        counts: TransferTaskCounts,
         now_ms: i64,
     ) -> FsResult<()>;
 

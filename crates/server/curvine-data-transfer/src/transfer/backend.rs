@@ -16,8 +16,9 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
     StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease, TransferListFilter,
-    TransferProgress, TransferStateUpdate, TransferTaskRecord, TransferTaskReport,
-    TransferTaskState, TransferTaskStatus, TransferTaskSummary, TransferTenantSummary,
+    TransferProgress, TransferStateUpdate, TransferTaskCounts, TransferTaskRecord,
+    TransferTaskReport, TransferTaskState, TransferTaskStatus, TransferTaskSummary,
+    TransferTenantSummary,
 };
 use std::time::Instant;
 
@@ -209,6 +210,106 @@ impl TransferStore for TransferStoreBackend {
             Self::Mysql(store) => store.purge_terminal_transfers(older_than_ms, limit),
             #[cfg(feature = "transfer-store-postgres")]
             Self::Postgres(store) => store.purge_terminal_transfers(older_than_ms, limit),
+        })
+    }
+
+    fn purge_terminal_tasks(&self, older_than_ms: i64, task_limit: usize) -> FsResult<usize> {
+        self.record_store_operation("purge_terminal_tasks", || match self {
+            Self::Memory(store) => store.purge_terminal_tasks(older_than_ms, task_limit),
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => store.purge_terminal_tasks(older_than_ms, task_limit),
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => store.purge_terminal_tasks(older_than_ms, task_limit),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.purge_terminal_tasks(older_than_ms, task_limit),
+        })
+    }
+
+    fn purge_terminal_tasks_with_cleanup_lease(
+        &self,
+        older_than_ms: i64,
+        task_limit: usize,
+        owner: &str,
+        now_ms: i64,
+    ) -> FsResult<usize> {
+        self.record_store_operation("purge_terminal_tasks_with_cleanup_lease", || match self {
+            Self::Memory(store) => store.purge_terminal_tasks_with_cleanup_lease(
+                older_than_ms,
+                task_limit,
+                owner,
+                now_ms,
+            ),
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => store.purge_terminal_tasks_with_cleanup_lease(
+                older_than_ms,
+                task_limit,
+                owner,
+                now_ms,
+            ),
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => store.purge_terminal_tasks_with_cleanup_lease(
+                older_than_ms,
+                task_limit,
+                owner,
+                now_ms,
+            ),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.purge_terminal_tasks_with_cleanup_lease(
+                older_than_ms,
+                task_limit,
+                owner,
+                now_ms,
+            ),
+        })
+    }
+
+    fn purge_terminal_jobs(&self, older_than_ms: i64, limit: usize) -> FsResult<usize> {
+        self.record_store_operation("purge_terminal_jobs", || match self {
+            Self::Memory(store) => store.purge_terminal_jobs(older_than_ms, limit),
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => store.purge_terminal_jobs(older_than_ms, limit),
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => store.purge_terminal_jobs(older_than_ms, limit),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.purge_terminal_jobs(older_than_ms, limit),
+        })
+    }
+
+    fn purge_terminal_jobs_with_cleanup_lease(
+        &self,
+        older_than_ms: i64,
+        limit: usize,
+        owner: &str,
+        now_ms: i64,
+    ) -> FsResult<usize> {
+        self.record_store_operation("purge_terminal_jobs_with_cleanup_lease", || match self {
+            Self::Memory(store) => {
+                store.purge_terminal_jobs_with_cleanup_lease(older_than_ms, limit, owner, now_ms)
+            }
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => {
+                store.purge_terminal_jobs_with_cleanup_lease(older_than_ms, limit, owner, now_ms)
+            }
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => {
+                store.purge_terminal_jobs_with_cleanup_lease(older_than_ms, limit, owner, now_ms)
+            }
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => {
+                store.purge_terminal_jobs_with_cleanup_lease(older_than_ms, limit, owner, now_ms)
+            }
+        })
+    }
+
+    fn try_acquire_cleanup_lease(&self, owner: &str, now_ms: i64, lease_ms: i64) -> FsResult<bool> {
+        self.record_store_operation("try_acquire_cleanup_lease", || match self {
+            Self::Memory(store) => store.try_acquire_cleanup_lease(owner, now_ms, lease_ms),
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => store.try_acquire_cleanup_lease(owner, now_ms, lease_ms),
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => store.try_acquire_cleanup_lease(owner, now_ms, lease_ms),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.try_acquire_cleanup_lease(owner, now_ms, lease_ms),
         })
     }
 
@@ -463,6 +564,18 @@ impl TransferStore for TransferStoreBackend {
         })
     }
 
+    fn append_planned_tasks(&self, update: TransferPlannedTasks) -> FsResult<bool> {
+        self.record_store_operation("append_planned_tasks", || match self {
+            Self::Memory(store) => store.append_planned_tasks(update),
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => store.append_planned_tasks(update),
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => store.append_planned_tasks(update),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.append_planned_tasks(update),
+        })
+    }
+
     fn persist_planned_tasks(&self, update: TransferPlannedTasks) -> FsResult<bool> {
         self.record_store_operation("persist_planned_tasks", || match self {
             Self::Memory(store) => store.persist_planned_tasks(update),
@@ -472,6 +585,18 @@ impl TransferStore for TransferStoreBackend {
             Self::Mysql(store) => store.persist_planned_tasks(update),
             #[cfg(feature = "transfer-store-postgres")]
             Self::Postgres(store) => store.persist_planned_tasks(update),
+        })
+    }
+
+    fn has_transfer_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool> {
+        self.record_store_operation("has_transfer_tasks", || match self {
+            Self::Memory(store) => store.has_transfer_tasks(job_id, run_id),
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => store.has_transfer_tasks(job_id, run_id),
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => store.has_transfer_tasks(job_id, run_id),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.has_transfer_tasks(job_id, run_id),
         })
     }
 
@@ -658,6 +783,33 @@ impl TransferStore for TransferStoreBackend {
             #[cfg(feature = "transfer-store-postgres")]
             Self::Postgres(store) => {
                 store.update_job_progress_summary(job_id, run_id, summary, now_ms)
+            }
+        })
+    }
+
+    fn update_terminal_snapshot(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        summary: TransferProgress,
+        counts: TransferTaskCounts,
+        now_ms: i64,
+    ) -> FsResult<()> {
+        self.record_store_operation("update_terminal_snapshot", || match self {
+            Self::Memory(store) => {
+                store.update_terminal_snapshot(job_id, run_id, summary, counts, now_ms)
+            }
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => {
+                store.update_terminal_snapshot(job_id, run_id, summary, counts, now_ms)
+            }
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => {
+                store.update_terminal_snapshot(job_id, run_id, summary, counts, now_ms)
+            }
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => {
+                store.update_terminal_snapshot(job_id, run_id, summary, counts, now_ms)
             }
         })
     }

@@ -36,7 +36,9 @@ pub(crate) use self::job_snapshot::job_mount_snapshot_with_version_async;
 pub use self::job_snapshot::{job_mount_snapshot, job_mount_snapshot_async};
 
 mod planner;
-pub use self::planner::{PlannedTransfer, TransferPlanner};
+pub use self::planner::{
+    plan_segment_groups, segment_offsets, PlannedTransfer, TransferPlanner, SEGMENT_BYTES,
+};
 
 #[cfg(test)]
 #[path = "tests/planner_test.rs"]
@@ -45,6 +47,10 @@ mod planner_test;
 #[cfg(test)]
 #[path = "tests/report_batch_test.rs"]
 mod report_batch_test;
+
+#[cfg(test)]
+#[path = "tests/group_recovery_test.rs"]
+mod group_recovery_test;
 
 mod service;
 pub use self::service::{progress_to_proto, task_summary_to_proto, TransferService};

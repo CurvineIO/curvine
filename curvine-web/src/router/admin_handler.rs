@@ -1429,6 +1429,7 @@ fn transfer_status_payload(status: GetTransferStatusResponse) -> Value {
         "done": state.is_terminal(),
         "tasks": tasks,
         "next_page_token": status.next_page_token,
+        "task_details_expired": status.task_details_expired.unwrap_or(false),
     });
     extend_json_object(
         &mut payload,
@@ -4553,11 +4554,13 @@ mod transfer_tests {
                 stale: 0,
                 completed_size: 2048,
             }),
+            task_details_expired: None,
         };
         let value = transfer_status_payload(status);
         assert_eq!(value["total_files"], 10);
         assert_eq!(value["completed_size"], 2048);
         assert_eq!(value["next_page_token"], "100");
+        assert_eq!(value["task_details_expired"], false);
     }
 
     #[test]

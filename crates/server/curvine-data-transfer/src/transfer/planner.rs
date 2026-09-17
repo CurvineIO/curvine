@@ -15,16 +15,16 @@
 use crate::common::UfsFactory;
 use crate::transfer::{job_mount_snapshot_async, ClusterMetadataCache, TransferMetrics};
 use curvine_client_core::file::CurvineFileSystem;
-use curvine_config::ClientConf;
+use curvine_config::{ClientConf, TransferConf};
 use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::ListOptions;
 use curvine_model::{
-    BatchManifest, BatchManifestEntry, FileStatus, LoadJobInfo, MountInfo, SegmentPlan,
-    TransferCommand, TransferJobRecord, TransferKind, TransferProgress, TransferTaskRecord,
-    TransferTaskState,
+    segment_group_json, BatchManifest, BatchManifestEntry, FileStatus, LoadJobInfo, MountInfo,
+    SegmentGroupPlan, SegmentPlan, TransferCommand, TransferJobRecord, TransferKind,
+    TransferProgress, TransferTaskRecord, TransferTaskState, WorkerInfo,
 };
 use curvine_runtime::common::LocalTime;
 use parking_lot::Mutex;
@@ -51,6 +51,9 @@ pub struct PlannedTransfer {
 pub const BATCH_MAX_FILES: usize = 512;
 pub const BATCH_TARGET_BYTES: i64 = 256 * 1024 * 1024;
 
+/// Default group size: half of the 10GiB worker in-flight budget.
+pub const SEGMENT_GROUP_TARGET_BYTES: i64 = TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES / 2;
+
 /// Large-file segmentation (design §14): files at least this size are split
 /// into per-block segment tasks dispatched to different workers. Equal to one
 /// CV block (128 MiB) so each segment maps to exactly one target block.
@@ -75,18 +78,31 @@ pub fn batch_should_flush(file_count: usize, accumulated_bytes: i64) -> bool {
     file_count >= BATCH_MAX_FILES || accumulated_bytes >= BATCH_TARGET_BYTES
 }
 
-/// Pure segment split (design §14): returns (offset, length) ranges covering
-/// the whole file, each at most SEGMENT_BYTES and aligned to the target's
-/// CV block size so each segment maps to exactly one block. Testable without
-/// a planner instance.
+pub(crate) fn supports_segment_grouping(workers: &[WorkerInfo]) -> bool {
+    !workers.is_empty()
+        && workers
+            .iter()
+            .all(|worker| worker.transfer_capabilities.supports_segment_group())
+}
+
+/// Why a large file did or did not use segment-group tasks. Counted per
+/// file in `plan_once` so one job emits one info line instead of one log
+/// per file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SegmentSplitOutcome {
+    Grouped,
+    NoVersion,
+    NoCapability,
+    Moved,
+}
+
+/// Pure segment split (design §14, §8 A1): returns (offset, length) ranges
+/// covering the whole file with one segment per CV target block, so each
+/// segment maps to exactly one block. Testable without a planner instance.
 pub fn segment_offsets(file_len: i64, block_size: i64) -> Vec<(i64, i64)> {
-    // One segment per CV block: never exceed SEGMENT_BYTES, but also align to
-    // the job's block size so offset/block_size maps to an exact block index
-    // (a larger configured block_size would otherwise misalign offsets).
-    let seg = if block_size > 0 {
-        SEGMENT_BYTES.min(block_size)
-    } else {
-        SEGMENT_BYTES
+    let seg = match block_size > 0 {
+        true => block_size,
+        false => SEGMENT_BYTES,
     };
     let mut ranges = Vec::new();
     let mut offset = 0i64;
@@ -96,6 +112,189 @@ pub fn segment_offsets(file_len: i64, block_size: i64) -> Vec<(i64, i64)> {
         offset += length;
     }
     ranges
+}
+
+/// Pure segment-group partition (design §8 A2): packs consecutive whole
+/// segments into at most `G_target = min(max(workers,
+/// ceil(len / GROUP_BYTES)), segments)` groups, splitting any group that
+/// still exceeds `GROUP_BYTES` (a single oversized block stands alone).
+/// Cut points stay block-aligned; a one-segment group is emitted by the
+/// caller as the legacy single-segment plan so small files are unchanged.
+/// `source_version` is the adapter-supplied immutable identity (etag/version)
+/// persisted into every group manifest; empty means unavailable (the caller
+/// falls back to single segments per design D0.4).
+pub fn plan_segment_groups(
+    file_len: i64,
+    block_size: i64,
+    live_workers: usize,
+    source_len: i64,
+    source_mtime: i64,
+    source_version: String,
+) -> Vec<SegmentGroupPlan> {
+    let ranges = segment_offsets(file_len, block_size);
+    let total = ranges.len();
+    if total == 0 {
+        return Vec::new();
+    }
+    let seg = match block_size > 0 {
+        true => block_size,
+        false => SEGMENT_BYTES,
+    }
+    .max(1);
+    let workers = live_workers.max(1);
+    let by_bytes = file_len
+        .div_euclid(SEGMENT_GROUP_TARGET_BYTES)
+        .saturating_add(i64::from(file_len % SEGMENT_GROUP_TARGET_BYTES != 0))
+        .max(1) as usize;
+    let target = workers.max(by_bytes).min(total).max(1);
+    let base = total / target;
+    let rem = total % target;
+    let mut groups = Vec::new();
+    let mut start = 0usize;
+    for i in 0..target {
+        let count = base + usize::from(i < rem);
+        if count == 0 {
+            continue;
+        }
+        split_group_by_bytes(
+            &ranges,
+            start,
+            count,
+            seg,
+            file_len,
+            source_len,
+            source_mtime,
+            &source_version,
+            SEGMENT_GROUP_TARGET_BYTES,
+            &mut groups,
+        );
+        start += count;
+    }
+    groups
+}
+
+#[allow(clippy::too_many_arguments)]
+fn split_group_by_bytes(
+    ranges: &[(i64, i64)],
+    start: usize,
+    count: usize,
+    seg: i64,
+    file_len: i64,
+    source_len: i64,
+    source_mtime: i64,
+    source_version: &str,
+    target_bytes: i64,
+    groups: &mut Vec<SegmentGroupPlan>,
+) {
+    let mut first = start;
+    let mut bytes = 0i64;
+    for index in start..start + count {
+        let len = ranges[index].1;
+        if bytes > 0 && bytes.saturating_add(len) > target_bytes {
+            push_group_plan(
+                ranges,
+                first,
+                index,
+                seg,
+                file_len,
+                source_len,
+                source_mtime,
+                source_version,
+                groups,
+            );
+            first = index;
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(len);
+    }
+    push_group_plan(
+        ranges,
+        first,
+        start + count,
+        seg,
+        file_len,
+        source_len,
+        source_mtime,
+        source_version,
+        groups,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_group_plan(
+    ranges: &[(i64, i64)],
+    first: usize,
+    end: usize,
+    seg: i64,
+    file_len: i64,
+    source_len: i64,
+    source_mtime: i64,
+    source_version: &str,
+    groups: &mut Vec<SegmentGroupPlan>,
+) {
+    if first >= end || end > ranges.len() {
+        return;
+    }
+    let start_offset = ranges[first].0;
+    let end_offset = ranges[end - 1].0.saturating_add(ranges[end - 1].1);
+    groups.push(SegmentGroupPlan {
+        start_offset,
+        end_offset,
+        total_len: file_len,
+        first_block_index: start_offset / seg.max(1),
+        segment_bytes: seg,
+        source_len,
+        source_mtime,
+        source_version: source_version.to_owned(),
+    });
+}
+
+fn build_single_segment_plans(
+    status: &FileStatus,
+    block_size: i64,
+) -> FsResult<Vec<(String, i64)>> {
+    let seg_block = if block_size > 0 {
+        block_size
+    } else {
+        SEGMENT_BYTES
+    }
+    .max(1);
+    segment_offsets(status.len, block_size)
+        .into_iter()
+        .map(|(offset, length)| {
+            let plan = SegmentPlan {
+                offset,
+                length,
+                total_len: status.len,
+                block_index: offset / seg_block,
+            };
+            let plan_json = serde_json::to_string(&serde_json::json!({
+                "segment": plan
+            }))
+            .map_err(|_| FsError::common("Unable to serialize segment plan"))?;
+            Ok((plan_json, length))
+        })
+        .collect()
+}
+
+pub(crate) fn build_group_plan_json(
+    group: &SegmentGroupPlan,
+    total_len: i64,
+) -> FsResult<(String, i64)> {
+    if group.group_len() <= group.segment_bytes.max(1) {
+        let plan = SegmentPlan {
+            offset: group.start_offset,
+            length: group.group_len(),
+            total_len,
+            block_index: group.first_block_index,
+        };
+        let plan_json = serde_json::to_string(&serde_json::json!({
+            "segment": plan
+        }))
+        .map_err(|_| FsError::common("Unable to serialize segment plan"))?;
+        return Ok((plan_json, group.group_len()));
+    }
+    Ok((segment_group_json(group)?, group.group_len()))
 }
 
 #[derive(Clone)]
@@ -372,13 +571,19 @@ impl TransferPlanner {
         // keep their existing shape (design §7.1).
         let batching = source_status.is_dir && !source.is_cv();
         let overwrite = job_info.overwrite.unwrap_or(false);
-        let mut batch: Vec<FileStatus> = Vec::new();
+        let mut batch: Vec<(FileStatus, bool)> = Vec::new();
         let mut batch_bytes = 0i64;
 
         let mut tasks = Vec::new();
         let mut total_size = 0;
         let mut skipped_files = 0;
         let mut skipped_size = 0;
+        // Per-file segment-group decisions; logged once per job below so
+        // large directory scans do not emit one line per file.
+        let mut grouped_files = 0usize;
+        let mut fallback_no_version = 0usize;
+        let mut fallback_no_capability = 0usize;
+        let mut fallback_moved = 0usize;
         // Phase 1 fans directory listing out to concurrent workers (the slow
         // network part); phase 2 below walks the collected statuses in BFS
         // order and generates tasks exactly as the old serial loop did, so
@@ -435,13 +640,6 @@ impl TransferPlanner {
                 continue;
             }
             total_size += status.len;
-            if replicas_mismatch {
-                // Forced overwrite: drop the stale cached copy up front so the
-                // tasks below rebuild it with the expected replica count even
-                // when the job runs with overwrite=false.
-                self.master_fs.delete(&task_target, false).await?;
-            }
-
             if batching {
                 // Large files (>= batch target) are split into per-block
                 // segment tasks dispatched to different workers (design §14).
@@ -452,16 +650,26 @@ impl TransferPlanner {
                         batch_bytes = 0;
                         self.push_batch_task(job, &source, &target, files, &mut tasks)?;
                     }
-                    self.push_segment_tasks(
-                        job,
-                        &path,
-                        &task_target,
-                        &status,
-                        overwrite,
-                        job_info.block_size,
-                        &mut tasks,
-                    )
-                    .await?;
+                    let outcome = self
+                        .push_segment_tasks(
+                            job,
+                            &path,
+                            &task_target,
+                            &status,
+                            overwrite,
+                            replicas_mismatch,
+                            job_info.block_size,
+                            &mount,
+                            &mut tasks,
+                        )
+                        .await?;
+                    match outcome {
+                        Some(SegmentSplitOutcome::Grouped) => grouped_files += 1,
+                        Some(SegmentSplitOutcome::NoVersion) => fallback_no_version += 1,
+                        Some(SegmentSplitOutcome::NoCapability) => fallback_no_capability += 1,
+                        Some(SegmentSplitOutcome::Moved) => fallback_moved += 1,
+                        None => {}
+                    }
                     continue;
                 }
                 // Compressed large files or medium files stay a single task.
@@ -471,12 +679,19 @@ impl TransferPlanner {
                         batch_bytes = 0;
                         self.push_batch_task(job, &source, &target, files, &mut tasks)?;
                     }
-                    self.push_single_task(job, &path, &task_target, &status, &mut tasks)
-                        .await?;
+                    self.push_single_task(
+                        job,
+                        &path,
+                        &task_target,
+                        &status,
+                        replicas_mismatch,
+                        &mut tasks,
+                    )
+                    .await?;
                     continue;
                 }
                 batch_bytes += status.len;
-                batch.push(status);
+                batch.push((status, replicas_mismatch));
                 if batch_should_flush(batch.len(), batch_bytes) {
                     let files = std::mem::take(&mut batch);
                     batch_bytes = 0;
@@ -485,12 +700,30 @@ impl TransferPlanner {
                 continue;
             }
 
-            self.push_single_task(job, &path, &task_target, &status, &mut tasks)
-                .await?;
+            self.push_single_task(
+                job,
+                &path,
+                &task_target,
+                &status,
+                replicas_mismatch,
+                &mut tasks,
+            )
+            .await?;
         }
         if !batch.is_empty() {
             let files = std::mem::take(&mut batch);
             self.push_batch_task(job, &source, &target, files, &mut tasks)?;
+        }
+
+        if grouped_files + fallback_no_version + fallback_no_capability + fallback_moved > 0 {
+            log::info!(
+                "transfer {} segment split: grouped_files={} fallback_no_version={} fallback_no_capability={} fallback_moved={}",
+                job.job_id,
+                grouped_files,
+                fallback_no_version,
+                fallback_no_capability,
+                fallback_moved
+            );
         }
 
         Ok(PlannedTransfer {
@@ -517,59 +750,79 @@ impl TransferPlanner {
         task_target: &Path,
         status: &FileStatus,
         overwrite: bool,
+        replace_target: bool,
         block_size: i64,
+        mount: &MountInfo,
         tasks: &mut Vec<TransferTaskRecord>,
-    ) -> FsResult<()> {
-        // Segmentation writes each segment as one CV block on one worker. It
-        // only applies to CV targets: a UFS target has no block layout to
-        // write into, so fall back to a single whole-file task (design §14).
+    ) -> FsResult<Option<SegmentSplitOutcome>> {
         if !task_target.is_cv() {
-            return self
-                .push_single_task(job, path, task_target, status, tasks)
-                .await;
+            self.push_single_task(job, path, task_target, status, replace_target, tasks)
+                .await?;
+            return Ok(None);
         }
-        // Segment tasks write the target as a fresh full file (design §14). A
-        // pre-existing target must be cleared before any segment lands,
-        // otherwise a retry or an incremental re-copy mixes new segments with
-        // old bytes (data corruption). Respect overwrite: without it a
-        // pre-existing target is an error (same as single-file semantics).
-        // The delete happens only after the segment ranges are computed (i.e.
-        // we know at least one segment task will be emitted), so a planner run
-        // that produces no tasks never destroys an existing target (review).
-        let seg_block = if block_size > 0 {
-            block_size
-        } else {
-            SEGMENT_BYTES
+        // Immutable source identity (design D0.4): one HEAD observation for
+        // len/mtime/version together. Empty version, UFS-handle failure, or
+        // a length that moved since the LIST status below all mean
+        // unavailable/stale, and the file falls back to single segments.
+        // mtime comes from the same HEAD the worker re-reads: LIST and HEAD
+        // timestamps can disagree by truncation on S3-style stores.
+        let (fp_len, fp_mtime, source_version) = match self.factory.get_ufs(mount) {
+            Ok(ufs) => crate::common::ufs_object_fingerprint(&ufs, path).await,
+            Err(err) => {
+                log::debug!(
+                    "segment group fingerprint unavailable for {}: {}",
+                    path.full_path(),
+                    err
+                );
+                (0, 0, String::new())
+            }
         };
-        let ranges = segment_offsets(status.len, block_size);
+        if !source_version.is_empty() && fp_len != status.len {
+            log::debug!(
+                "segment group source moved during planning for {}: list={} head={}",
+                path.full_path(),
+                status.len,
+                fp_len
+            );
+            self.push_single_task(job, path, task_target, status, replace_target, tasks)
+                .await?;
+            return Ok(Some(SegmentSplitOutcome::Moved));
+        }
+        // A verified HEAD mtime keeps planner/worker comparisons on one
+        // timestamp source; LIST mtimes may be truncated.
+        let source_mtime = match source_version.is_empty() {
+            true => status.mtime,
+            false => fp_mtime,
+        };
+        let (plans, outcome) =
+            self.build_segment_plans(status, block_size, &source_version, source_mtime)?;
+        if tasks.len().saturating_add(plans.len()) > self.max_tasks_per_transfer {
+            return err_box!(
+                "Transfer {} files exceeds {}",
+                job.job_id,
+                self.max_tasks_per_transfer
+            );
+        }
         if task_target.is_cv() {
             match self.master_fs.get_status(task_target).await {
+                Ok(_) if !overwrite && !replace_target => {
+                    return err_box!(
+                        "Transfer target {} already exists and overwrite=false",
+                        task_target.full_path()
+                    );
+                }
                 Ok(_) => {
-                    if !overwrite {
-                        return err_box!(
-                            "Transfer target {} already exists and overwrite=false",
-                            task_target.full_path()
-                        );
-                    }
-                    self.master_fs.delete(task_target, false).await?;
+                    // Scheduler removes an overwrite target only after the
+                    // complete plan has been persisted while the job is still
+                    // Planning. Deleting here could lose the old file when a
+                    // planner crash leaves no dispatchable task rows.
                 }
                 Err(FsError::FileNotFound(_)) => {}
                 Err(err) => return Err(err),
             }
         }
-        for (offset, length) in ranges {
-            let plan = SegmentPlan {
-                offset,
-                length,
-                total_len: status.len,
-                block_index: offset / seg_block.max(1),
-            };
-            // Wrap so the runner can distinguish a segment task from a batch
-            // manifest or a CV block plan: {"segment": {offset, length}}.
-            let segment_json = serde_json::to_string(&serde_json::json!({
-                "segment": plan
-            }))
-            .map_err(|_| FsError::common("Unable to serialize segment plan"))?;
+        let plan_count = plans.len();
+        for (plan_json, total_size) in plans {
             let task_id = format!("{}_task_{}", job.job_id, tasks.len());
             tasks.push(TransferTaskRecord {
                 job_id: job.job_id.clone(),
@@ -580,14 +833,14 @@ impl TransferPlanner {
                 target_path: task_target.clone_uri(),
                 worker_id: 0,
                 worker_session_id: String::new(),
-                source_read_plan_json: segment_json,
+                source_read_plan_json: plan_json,
                 report_target_json: String::new(),
                 state: TransferTaskState::Pending,
                 progress: TransferProgress {
-                    total_size: length,
+                    total_size,
                     ..Default::default()
                 },
-                estimated_size: length,
+                estimated_size: total_size,
                 retry_count: 0,
                 attempt_started_at: 0,
                 accepted_at_ms: 0,
@@ -595,16 +848,72 @@ impl TransferPlanner {
                 last_report_at: 0,
                 stale_deadline_at: 0,
                 updated_at: LocalTime::mills() as i64,
+                replace_target,
             });
         }
-        if tasks.len() > self.max_tasks_per_transfer {
-            return err_box!(
-                "Transfer {} files exceeds {}",
-                job.job_id,
-                self.max_tasks_per_transfer
-            );
+        log::debug!(
+            "segment split decision for {}: {:?} tasks={}",
+            path.full_path(),
+            outcome,
+            plan_count
+        );
+        Ok(Some(outcome))
+    }
+
+    fn build_segment_plans(
+        &self,
+        status: &FileStatus,
+        block_size: i64,
+        source_version: &str,
+        source_mtime: i64,
+    ) -> FsResult<(Vec<(String, i64)>, SegmentSplitOutcome)> {
+        // No immutable identity (design D0.4) or no live capability proof
+        // (design §8#37): stay on single segments rather than risking a
+        // resume that skips rewritten source bytes.
+        if source_version.is_empty() {
+            return build_single_segment_plans(status, block_size)
+                .map(|plans| (plans, SegmentSplitOutcome::NoVersion));
         }
-        Ok(())
+        let workers = match self.cache.live_workers() {
+            Ok(workers) => workers,
+            Err(_) => {
+                return build_single_segment_plans(status, block_size)
+                    .map(|plans| (plans, SegmentSplitOutcome::NoCapability));
+            }
+        };
+        if !supports_segment_grouping(&workers) {
+            return build_single_segment_plans(status, block_size)
+                .map(|plans| (plans, SegmentSplitOutcome::NoCapability));
+        }
+        self.build_segment_groups(
+            status,
+            block_size,
+            workers.len(),
+            source_mtime,
+            source_version,
+        )
+        .into_iter()
+        .map(|group| build_group_plan_json(&group, status.len))
+        .collect::<FsResult<Vec<(String, i64)>>>()
+        .map(|plans| (plans, SegmentSplitOutcome::Grouped))
+    }
+
+    fn build_segment_groups(
+        &self,
+        status: &FileStatus,
+        block_size: i64,
+        live_workers: usize,
+        source_mtime: i64,
+        source_version: &str,
+    ) -> Vec<SegmentGroupPlan> {
+        plan_segment_groups(
+            status.len,
+            block_size,
+            live_workers,
+            status.len,
+            source_mtime,
+            source_version.to_owned(),
+        )
     }
 
     /// Push one file as its own task (non-batching path, or a large file that
@@ -616,6 +925,7 @@ impl TransferPlanner {
         path: &Path,
         task_target: &Path,
         status: &FileStatus,
+        replace_target: bool,
         tasks: &mut Vec<TransferTaskRecord>,
     ) -> FsResult<()> {
         let task_id = format!("{}_task_{}", job.job_id, tasks.len());
@@ -647,6 +957,7 @@ impl TransferPlanner {
             last_report_at: 0,
             stale_deadline_at: 0,
             updated_at: LocalTime::mills() as i64,
+            replace_target,
         });
         if tasks.len() > self.max_tasks_per_transfer {
             return err_box!(
@@ -663,22 +974,23 @@ impl TransferPlanner {
         job: &TransferJobRecord,
         source_root: &Path,
         target_root: &Path,
-        files: Vec<FileStatus>,
+        files: Vec<(FileStatus, bool)>,
         tasks: &mut Vec<TransferTaskRecord>,
     ) -> FsResult<()> {
         let entries: Vec<BatchManifestEntry> = files
             .iter()
-            .map(|file| {
+            .map(|(file, replace_target)| {
                 let file_path = Path::from_str(&file.path)?;
                 // Relative path from the source root to the file.
                 Ok(BatchManifestEntry {
                     rel_path: relative_path_from(source_root, &file_path)?,
                     size: file.len,
+                    replace_target: *replace_target,
                 })
             })
             .collect::<FsResult<Vec<_>>>()?;
         let manifest = BatchManifest { batch: entries };
-        let total: i64 = files.iter().map(|file| file.len).sum();
+        let total: i64 = files.iter().map(|(file, _)| file.len).sum();
         let batch_source = source_root.clone();
         let batch_target = append_relative_path(source_root, target_root, &batch_source)?;
         let task_id = format!("{}_task_{}", job.job_id, tasks.len());
@@ -707,6 +1019,7 @@ impl TransferPlanner {
             last_report_at: 0,
             stale_deadline_at: 0,
             updated_at: LocalTime::mills() as i64,
+            replace_target: false,
         });
         if tasks.len() > self.max_tasks_per_transfer {
             return err_box!(
@@ -1080,6 +1393,8 @@ mod tests {
             cluster_snapshot_version: 0,
             mount_snapshot_attempts: 0,
             planning_attempts: 0,
+            terminal_summary: None,
+            terminal_counts: None,
             cv_metadata_epoch: None,
             state: TransferState::Pending,
             owner: String::new(),

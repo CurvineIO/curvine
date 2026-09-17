@@ -263,7 +263,12 @@ impl TransferStatusCommand {
             }
             first = false;
             let job = status_to_job(&response);
-            print_status_summary(&job, response.task_summary.as_ref(), self.verbose);
+            print_status_summary(
+                &job,
+                response.task_summary.as_ref(),
+                response.task_details_expired.unwrap_or(false),
+                self.verbose,
+            );
             if self.verbose {
                 print_tasks_table(&response.tasks, self.full_id, true);
                 print_next_page(response.next_page_token.as_deref());
@@ -580,6 +585,7 @@ fn print_jobs_table(jobs: &[TransferJobStatusProto], full_id: bool, verbose: boo
 fn print_status_summary(
     job: &TransferJobStatusProto,
     task_summary: Option<&TransferTaskSummaryProto>,
+    task_details_expired: bool,
     verbose: bool,
 ) {
     let mut table = md_table();
@@ -596,6 +602,18 @@ fn print_status_summary(
     ]);
     if let Some(summary) = task_summary {
         table.add_row(["Files".to_string(), task_summary_text(summary)]);
+    }
+    if task_details_expired {
+        table.add_row([
+            "Task details".to_string(),
+            "expired (summary retained)".to_string(),
+        ]);
+    }
+    if verbose {
+        table.add_row([
+            "Progress note".to_string(),
+            "reported complete-segment prefix (async lower-bound, not live position)".to_string(),
+        ]);
     }
     if !job.progress.message.is_empty() {
         table.add_row(["Message".to_string(), job.progress.message.clone()]);

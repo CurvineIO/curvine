@@ -196,6 +196,7 @@ message WorkerInfoProto {
     optional bool transfer_query_task = 15 [default = false];
     optional bool transfer_attempt_safe_output = 16 [default = false];
     optional bool transfer_source_read_plan = 17 [default = false];
+    optional bool transfer_segment_group = 20 [default = false];
     optional string software_version = 18 [default = ""];
     optional uint64 startup_time_ms = 19 [default = 0];
 

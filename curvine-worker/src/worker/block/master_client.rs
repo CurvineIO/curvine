@@ -89,6 +89,7 @@ impl MasterClient {
             transfer_query_task: Some(transfer_capabilities.query_task),
             transfer_attempt_safe_output: Some(transfer_capabilities.attempt_safe_output),
             transfer_source_read_plan: Some(transfer_capabilities.source_read_plan),
+            transfer_segment_group: Some(transfer_capabilities.segment_group),
             software_version: self.software_version.clone(),
             fs_ctime: self.startup_time_ms as i64,
             component_info: Some(self.component_info.clone()),

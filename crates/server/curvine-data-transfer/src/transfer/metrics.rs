@@ -46,6 +46,8 @@ pub struct TransferMetrics {
     tasks_failed: Gauge,
     tasks_stale: Gauge,
     cleanup_purged_total: Counter,
+    cleanup_purged_tasks_total: Counter,
+    group_resume_loaded_bytes_total: Counter,
     acquire_total: CounterVec,
     planning_total: CounterVec,
     dispatch_total: CounterVec,
@@ -200,6 +202,16 @@ impl TransferMetrics {
             cleanup_purged_total: m::new_counter(
                 "transfer_cleanup_purged_total",
                 "Total terminal transfer jobs purged by cleanup",
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            cleanup_purged_tasks_total: m::new_counter(
+                "transfer_cleanup_purged_tasks_total",
+                "Total terminal transfer task rows purged by cleanup",
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            group_resume_loaded_bytes_total: m::new_counter(
+                "transfer_group_resume_loaded_bytes",
+                "Total persisted complete-segment prefix bytes reused by group retries",
             )
             .map_err(|err| FsError::common(err.to_string()))?,
             acquire_total: m::new_counter_vec(
@@ -505,6 +517,18 @@ impl TransferMetrics {
     pub fn inc_cleanup_purged(&self, value: usize) {
         if value > 0 {
             self.cleanup_purged_total.inc_by(value as i64);
+        }
+    }
+
+    pub fn inc_cleanup_purged_tasks(&self, value: usize) {
+        if value > 0 {
+            self.cleanup_purged_tasks_total.inc_by(value as i64);
+        }
+    }
+
+    pub fn inc_group_resume(&self, resume_bytes: i64) {
+        if resume_bytes > 0 {
+            self.group_resume_loaded_bytes_total.inc_by(resume_bytes);
         }
     }
 

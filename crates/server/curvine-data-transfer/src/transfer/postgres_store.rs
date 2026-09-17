@@ -33,8 +33,9 @@ use std::str::FromStr;
 use url::Url;
 
 use crate::transfer::{
-    TransferMountSnapshotUpdate, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
-    TransferTaskStateUpdate,
+    ensure_task_transaction_bound, TransferMountSnapshotUpdate, TransferPlannedTasks,
+    TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate, MAX_JOBS_PER_STORE_TRANSACTION,
+    MAX_TASKS_PER_STORE_TRANSACTION,
 };
 
 const TRANSFER_SCHEMA_VERSION: i64 = 1;
@@ -226,6 +227,11 @@ fn init_schema(conn: &mut PgConnection) -> FsResult<()> {
             updated_at bigint not null,
             unique(submitter, client_request_id)
         );
+        create table if not exists transfer_cleanup_lease (
+            id smallint primary key check (id = 1),
+            owner text not null,
+            lease_expire_at bigint not null
+        );
         create table if not exists transfer_tasks (
             job_id text not null,
             run_id bigint not null,
@@ -259,6 +265,8 @@ fn init_schema(conn: &mut PgConnection) -> FsResult<()> {
             on transfer_jobs(target_path, state);
         create index if not exists transfer_jobs_state_lease_idx
             on transfer_jobs(state, lease_expire_at);
+        create index if not exists transfer_jobs_state_updated_idx
+            on transfer_jobs(state, updated_at);
         create index if not exists transfer_jobs_owner_state_updated_idx
             on transfer_jobs(owner, state, updated_at);
         create index if not exists transfer_jobs_tenant_state_updated_idx
@@ -1281,30 +1289,189 @@ impl TransferStore for PostgresTransferStore {
         if limit == 0 {
             return Ok(0);
         }
-        let limit = db_limit(limit)?;
+        let _ =
+            self.purge_terminal_tasks(older_than_ms, limit.min(MAX_TASKS_PER_STORE_TRANSACTION))?;
+        self.purge_terminal_jobs(older_than_ms, limit.min(MAX_JOBS_PER_STORE_TRANSACTION))
+    }
+
+    fn purge_terminal_tasks(&self, older_than_ms: i64, task_limit: usize) -> FsResult<usize> {
+        if task_limit == 0 {
+            return Ok(0);
+        }
+        let limit = db_limit(task_limit.min(MAX_TASKS_PER_STORE_TRANSACTION))?;
         self.transaction(|tx| {
-            let job_ids = tx
-                .query(
-                    "select job_id from transfer_jobs
-                     where state in (6, 7, 8, 9) and updated_at < $1
-                     order by updated_at asc
-                     limit $2
-                     for update",
+            let affected = tx
+                .execute(
+                    "with candidates as (
+                         select t.ctid
+                         from transfer_tasks t
+                         join transfer_jobs j on t.job_id = j.job_id and t.run_id = j.run_id
+                         where j.state in (6, 7, 8, 9) and j.updated_at < $1
+                           and (j.record_json::jsonb ->> 'terminal_summary') is not null
+                           and (j.record_json::jsonb ->> 'terminal_counts') is not null
+                         order by j.updated_at asc, t.task_id asc
+                         limit $2
+                         for update of t
+                     )
+                     delete from transfer_tasks t using candidates
+                     where t.ctid = candidates.ctid",
                     &[&older_than_ms, &limit],
                 )
                 .map_err(postgres_err)?;
-            for row in &job_ids {
-                let job_id: String = row.get(0);
-                tx.execute("delete from transfer_tasks where job_id = $1", &[&job_id])
-                    .map_err(postgres_err)?;
+            Ok(affected as usize)
+        })
+    }
+
+    fn purge_terminal_tasks_with_cleanup_lease(
+        &self,
+        older_than_ms: i64,
+        task_limit: usize,
+        owner: &str,
+        now_ms: i64,
+    ) -> FsResult<usize> {
+        if task_limit == 0 {
+            return Ok(0);
+        }
+        let limit = db_limit(task_limit.min(MAX_TASKS_PER_STORE_TRANSACTION))?;
+        self.transaction(|tx| {
+            let lease_owned = tx
+                .query_opt(
+                    "select 1 from transfer_cleanup_lease
+                     where id = 1 and owner = $1 and lease_expire_at > $2 for update",
+                    &[&owner, &now_ms],
+                )
+                .map_err(postgres_err)?
+                .is_some();
+            if !lease_owned {
+                return Ok(0);
+            }
+            let affected = tx
+                .execute(
+                    "with candidates as (
+                         select t.ctid
+                         from transfer_tasks t
+                         join transfer_jobs j on t.job_id = j.job_id and t.run_id = j.run_id
+                         where j.state in (6, 7, 8, 9) and j.updated_at < $1
+                           and (j.record_json::jsonb ->> 'terminal_summary') is not null
+                           and (j.record_json::jsonb ->> 'terminal_counts') is not null
+                         order by j.updated_at asc, t.task_id asc
+                         limit $2
+                         for update of t
+                     )
+                     delete from transfer_tasks t using candidates
+                     where t.ctid = candidates.ctid",
+                    &[&older_than_ms, &limit],
+                )
+                .map_err(postgres_err)?;
+            Ok(affected as usize)
+        })
+    }
+
+    fn purge_terminal_jobs(&self, older_than_ms: i64, limit: usize) -> FsResult<usize> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let limit = db_limit(limit.min(MAX_JOBS_PER_STORE_TRANSACTION))?;
+        self.transaction(|tx| {
+            let rows = tx
+                .query(
+                    "select j.job_id, j.run_id from transfer_jobs j
+                     where j.state in (6, 7, 8, 9) and j.updated_at < $1
+                       and not exists (
+                           select 1 from transfer_tasks t
+                           where t.job_id = j.job_id and t.run_id = j.run_id
+                       )
+                     order by j.updated_at asc
+                     limit $2
+                     for update of j",
+                    &[&older_than_ms, &limit],
+                )
+                .map_err(postgres_err)?;
+            let keys = rows
+                .iter()
+                .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)))
+                .collect::<Vec<_>>();
+            for (job_id, run_id) in &keys {
                 tx.execute(
                     "delete from transfer_jobs
-                     where job_id = $1 and state in (6, 7, 8, 9)",
-                    &[&job_id],
+                     where job_id = $1 and run_id = $2 and state in (6, 7, 8, 9)
+                       and not exists (
+                           select 1 from transfer_tasks t
+                           where t.job_id = $1 and t.run_id = $2
+                       )",
+                    &[job_id, run_id],
                 )
                 .map_err(postgres_err)?;
             }
-            Ok(job_ids.len())
+            Ok(keys.len())
+        })
+    }
+
+    fn purge_terminal_jobs_with_cleanup_lease(
+        &self,
+        older_than_ms: i64,
+        limit: usize,
+        owner: &str,
+        now_ms: i64,
+    ) -> FsResult<usize> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let limit = db_limit(limit.min(MAX_JOBS_PER_STORE_TRANSACTION))?;
+        self.transaction(|tx| {
+            let lease_owned = tx
+                .query_opt(
+                    "select 1 from transfer_cleanup_lease
+                     where id = 1 and owner = $1 and lease_expire_at > $2 for update",
+                    &[&owner, &now_ms],
+                )
+                .map_err(postgres_err)?
+                .is_some();
+            if !lease_owned {
+                return Ok(0);
+            }
+            let affected = tx
+                .execute(
+                    "with candidates as (
+                         select j.ctid
+                         from transfer_jobs j
+                         where j.state in (6, 7, 8, 9) and j.updated_at < $1
+                           and not exists (
+                               select 1 from transfer_tasks t
+                               where t.job_id = j.job_id and t.run_id = j.run_id
+                           )
+                         order by j.updated_at asc
+                         limit $2
+                         for update of j
+                     )
+                     delete from transfer_jobs j using candidates
+                     where j.ctid = candidates.ctid",
+                    &[&older_than_ms, &limit],
+                )
+                .map_err(postgres_err)?;
+            Ok(affected as usize)
+        })
+    }
+
+    fn try_acquire_cleanup_lease(&self, owner: &str, now_ms: i64, lease_ms: i64) -> FsResult<bool> {
+        self.transaction(|tx| {
+            // Conditional upsert is required: SELECT ... FOR UPDATE does
+            // not lock an absent row, so two first-time schedulers could
+            // otherwise both decide the lease is available.
+            let acquired = tx
+                .query_opt(
+                    "insert into transfer_cleanup_lease(id, owner, lease_expire_at)
+                     values (1, $1, $2)
+                     on conflict(id) do update set
+                         owner=excluded.owner,
+                         lease_expire_at=excluded.lease_expire_at
+                     where transfer_cleanup_lease.owner=excluded.owner
+                        or transfer_cleanup_lease.lease_expire_at <= $3
+                     returning owner",
+                    &[&owner, &now_ms.saturating_add(lease_ms.max(1)), &now_ms],
+                )
+                .map_err(postgres_err)?;
+            Ok(acquired.is_some())
         })
     }
 
@@ -1585,6 +1752,7 @@ impl TransferStore for PostgresTransferStore {
     }
 
     fn insert_tasks(&self, tasks: Vec<TransferTaskRecord>) -> FsResult<()> {
+        ensure_task_transaction_bound(tasks.len())?;
         self.transaction(|tx| {
             for task in &tasks {
                 insert_task(tx, task)?;
@@ -1593,7 +1761,27 @@ impl TransferStore for PostgresTransferStore {
         })
     }
 
+    fn append_planned_tasks(&self, update: TransferPlannedTasks) -> FsResult<bool> {
+        ensure_task_transaction_bound(update.tasks.len())?;
+        self.transaction(|tx| {
+            match select_job_by_id_for_update(tx, &update.job_id)? {
+                Some(job)
+                    if job.run_id == update.run_id
+                        && job.owner == update.owner
+                        && job.lease_epoch == update.lease_epoch
+                        && job.lease_expire_at > update.now_ms
+                        && job.state == TransferState::Planning => {}
+                _ => return Ok(false),
+            }
+            for task in &update.tasks {
+                insert_task(tx, task)?;
+            }
+            Ok(true)
+        })
+    }
+
     fn persist_planned_tasks(&self, update: TransferPlannedTasks) -> FsResult<bool> {
+        ensure_task_transaction_bound(update.tasks.len())?;
         self.transaction(|tx| {
             let mut job = match select_job_by_id_for_update(tx, &update.job_id)? {
                 Some(job)
@@ -1616,6 +1804,17 @@ impl TransferStore for PostgresTransferStore {
             job.updated_at = update.now_ms;
             update_job(tx, &job)
         })
+    }
+
+    fn has_transfer_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool> {
+        let run_id = db_u64(run_id)?;
+        self.conn()?
+            .query_opt(
+                "select 1 from transfer_tasks where job_id = $1 and run_id = $2 limit 1",
+                &[&job_id, &run_id],
+            )
+            .map(|row| row.is_some())
+            .map_err(postgres_err)
     }
 
     fn update_task_state(&self, update: TransferTaskStateUpdate) -> FsResult<bool> {
@@ -1701,6 +1900,7 @@ impl TransferStore for PostgresTransferStore {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
+        ensure_task_transaction_bound(candidates.len())?;
         let run_id_value = db_u64(run_id)?;
         let lease_epoch_value = db_u64(lease_epoch)?;
         self.transaction(|tx| {
@@ -1873,6 +2073,10 @@ impl TransferStore for PostgresTransferStore {
             task.last_report_at = start.now_ms;
             task.stale_deadline_at = start.stale_deadline_at;
             task.updated_at = start.now_ms;
+            task.progress.loaded_size = start
+                .resume_loaded_size
+                .clamp(0, task.progress.total_size.max(0));
+            task.progress.update_time = start.now_ms;
             update_task(tx, &task)
         })
     }
@@ -1898,11 +2102,27 @@ impl TransferStore for PostgresTransferStore {
     fn update_task_report(&self, report: TransferTaskReport) -> FsResult<bool> {
         let run_id = db_u64(report.run_id)?;
         let attempt_id = db_u64(report.attempt_id)?;
-        let sql = "update transfer_tasks
-             set state = $1, progress_loaded_size = $2, progress_total_size = $3,
+        let loaded = match report.state {
+            TransferTaskState::Running => report.progress.loaded_size.max(0),
+            _ => report.progress.loaded_size,
+        };
+        let loaded_expr = match report.state {
+            TransferTaskState::Running => "greatest(progress_loaded_size, $2)",
+            _ => "$2",
+        };
+        let loaded_json_expr = match report.state {
+            TransferTaskState::Running => {
+                "greatest((record_json::jsonb->'progress'->>'loaded_size')::bigint, $2::bigint)"
+            }
+            _ => "$2::bigint",
+        };
+        let sql = format!(
+            "update transfer_tasks
+             set state = $1, progress_loaded_size = {loaded_expr}, progress_total_size = $3,
                  progress_updated_at = $4, progress_message = $5, last_report_at = $6,
                  stale_deadline_at = $7,
                  record_json = jsonb_set(
+                       jsonb_set(
                         jsonb_set(
                             jsonb_set(
                                 jsonb_set(
@@ -1910,7 +2130,7 @@ impl TransferStore for PostgresTransferStore {
                                         jsonb_set(
                                             jsonb_set(
                                                 jsonb_set(
-                                                    jsonb_set(record_json::jsonb, '{state}', to_jsonb(case $1::integer
+                                                    jsonb_set(record_json::jsonb, '{{state}}', to_jsonb(case $1::integer
                                                     when 1 then 'Pending'::text
                                                     when 2 then 'Running'::text
                                                     when 3 then 'Completed'::text
@@ -1919,24 +2139,25 @@ impl TransferStore for PostgresTransferStore {
                                                     when 6 then 'Stale'::text
                                                     else null::text
                                                 end)),
-                                                '{progress,loaded_size}', to_jsonb($2::bigint)),
-                                            '{progress,total_size}', to_jsonb($3::bigint)),
-                                        '{progress,update_time}', to_jsonb($4::bigint)),
-                                    '{progress,message}', to_jsonb($5::text)),
-                                '{last_report_at}', to_jsonb($6::bigint)),
-                            '{stale_deadline_at}', to_jsonb($7::bigint)),
-                        '{updated_at}', to_jsonb($8::bigint)),
-                    '{accepted_at_ms}', to_jsonb($15::bigint)),
-                '{first_byte_at_ms}', to_jsonb($16::bigint))::text,
+                                                '{{progress,loaded_size}}', to_jsonb({loaded_json_expr})),
+                                            '{{progress,total_size}}', to_jsonb($3::bigint)),
+                                        '{{progress,update_time}}', to_jsonb($4::bigint)),
+                                    '{{progress,message}}', to_jsonb($5::text)),
+                                '{{last_report_at}}', to_jsonb($6::bigint)),
+                            '{{stale_deadline_at}}', to_jsonb($7::bigint)),
+                        '{{updated_at}}', to_jsonb($8::bigint)),
+                    '{{accepted_at_ms}}', to_jsonb($15::bigint)),
+                '{{first_byte_at_ms}}', to_jsonb($16::bigint))::text,
                  updated_at = $8
              where job_id = $9 and run_id = $10 and task_id = $11 and attempt_id = $12
-               and worker_id = $13 and worker_session_id = $14 and state in (1, 2)";
+               and worker_id = $13 and worker_session_id = $14 and state in (1, 2)"
+        );
         self.conn()?
             .execute(
-                sql,
+                &sql,
                 &[
                     &(report.state as i32),
-                    &report.progress.loaded_size,
+                    &loaded,
                     &report.progress.total_size,
                     &report.progress.update_time,
                     &report.progress.message,
@@ -1975,6 +2196,34 @@ impl TransferStore for PostgresTransferStore {
                      )::text,
                      updated_at = $2 where job_id = $3 and run_id = $4",
                 &[&summary_json, &now_ms, &job_id, &run_id],
+            )
+            .map(|_| ())
+            .map_err(postgres_err)
+    }
+
+    fn update_terminal_snapshot(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        summary: TransferProgress,
+        counts: TransferTaskCounts,
+        now_ms: i64,
+    ) -> FsResult<()> {
+        let run_id = db_u64(run_id)?;
+        let summary_json = json(&summary)?;
+        let counts_json = json(&counts)?;
+        self.conn()?
+            .execute(
+                "update transfer_jobs
+                 set record_json = jsonb_set(
+                        jsonb_set(
+                            jsonb_set(record_json::jsonb, '{summary}', $1::text::jsonb),
+                            '{terminal_summary}', $1::text::jsonb),
+                        '{terminal_counts}', $2::text::jsonb)::text,
+                     updated_at = $3
+                 where job_id = $4 and run_id = $5
+                   and (record_json::jsonb ->> 'terminal_summary') is null",
+                &[&summary_json, &counts_json, &now_ms, &job_id, &run_id],
             )
             .map(|_| ())
             .map_err(postgres_err)

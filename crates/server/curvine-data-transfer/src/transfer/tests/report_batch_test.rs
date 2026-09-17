@@ -27,9 +27,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::scheduler::stale_retry_exhausted_message;
+#[cfg(feature = "transfer-store-sqlite")]
+use super::SqliteTransferStore;
 use super::{
-    MemoryTransferStore, SqliteTransferStore, TransferHandler, TransferPlannedTasks,
-    TransferService, TransferStore, TransferTaskStateUpdate,
+    MemoryTransferStore, TransferHandler, TransferPlannedTasks, TransferService, TransferStore,
+    TransferTaskStateUpdate,
 };
 
 fn running_store() -> (Arc<MemoryTransferStore>, TransferJobRecord) {
@@ -50,6 +52,8 @@ fn running_store_for<S: TransferStore>(store: Arc<S>) -> (Arc<S>, TransferJobRec
         cluster_snapshot_version: 1,
         mount_snapshot_attempts: 0,
         planning_attempts: 0,
+        terminal_summary: None,
+        terminal_counts: None,
         cv_metadata_epoch: None,
         state: TransferState::Pending,
         owner: String::new(),
@@ -91,6 +95,7 @@ fn running_store_for<S: TransferStore>(store: Arc<S>) -> (Arc<S>, TransferJobRec
         accepted_at_ms: 0,
         first_byte_at_ms: 0,
         updated_at: 1,
+        replace_target: false,
     };
     assert!(store
         .persist_planned_tasks(TransferPlannedTasks {
@@ -117,6 +122,7 @@ fn running_store_for<S: TransferStore>(store: Arc<S>) -> (Arc<S>, TransferJobRec
                 report_target_json: "{}".to_string(),
                 now_ms: 3,
                 stale_deadline_at: 1_000,
+                resume_loaded_size: 0,
             })
             .unwrap());
     }
@@ -328,7 +334,7 @@ fn assert_status_uses_task_summary_and_store_pagination<S: TransferStore>(
     }
 
     let service = TransferService::new(store);
-    let (status, summary, tasks, next_page_token) = service
+    let (status, summary, tasks, next_page_token, expired) = service
         .get_transfer_status(&job.job_id, Some(1), None)
         .unwrap();
 
@@ -338,6 +344,7 @@ fn assert_status_uses_task_summary_and_store_pagination<S: TransferStore>(
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].task_id, "task-1");
     assert_eq!(next_page_token.as_deref(), Some("1"));
+    assert!(!expired);
 }
 
 fn assert_stale_marking_uses_probe_snapshot<S: TransferStore>(
@@ -508,6 +515,7 @@ fn memory_failure_summary_uses_stable_task_order() {
 }
 
 #[test]
+#[cfg(feature = "transfer-store-sqlite")]
 fn sqlite_failure_summary_uses_stable_task_order() {
     let (store, job) = running_store_for(Arc::new(SqliteTransferStore::open(":memory:").unwrap()));
     assert_failure_summary_uses_stable_task_order(store, job);
@@ -520,6 +528,7 @@ fn memory_status_uses_task_summary_and_store_pagination_not_the_job_snapshot() {
 }
 
 #[test]
+#[cfg(feature = "transfer-store-sqlite")]
 fn sqlite_status_uses_task_summary_and_store_pagination_not_the_job_snapshot() {
     let store = Arc::new(SqliteTransferStore::open(":memory:").unwrap());
     let (store, job) = running_store_for(store);
@@ -533,6 +542,7 @@ fn memory_stale_marking_only_changes_probed_missing_attempts() {
 }
 
 #[test]
+#[cfg(feature = "transfer-store-sqlite")]
 fn sqlite_stale_marking_only_changes_probed_missing_attempts() {
     let store = Arc::new(SqliteTransferStore::open(":memory:").unwrap());
     let (store, job) = running_store_for(store);
@@ -546,6 +556,7 @@ fn memory_stale_marking_does_not_overwrite_fresh_report() {
 }
 
 #[test]
+#[cfg(feature = "transfer-store-sqlite")]
 fn sqlite_stale_marking_does_not_overwrite_fresh_report() {
     let store = Arc::new(SqliteTransferStore::open(":memory:").unwrap());
     let (store, job) = running_store_for(store);

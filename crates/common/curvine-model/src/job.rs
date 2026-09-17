@@ -330,6 +330,8 @@ pub struct TransferTaskReportInfo {
     pub report_target: String,
     #[serde(default)]
     pub report_endpoints: Vec<String>,
+    #[serde(default)]
+    pub resume_loaded_size: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

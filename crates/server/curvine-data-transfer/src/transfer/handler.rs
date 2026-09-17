@@ -55,9 +55,9 @@ where
 
     fn get_transfer_status(&self, msg: &Message) -> FsResult<Message> {
         let req: GetTransferStatusRequest = msg.parse_header()?;
-        let (job, task_summary, tasks, next_page_token) =
-            self.service
-                .get_transfer_status(&req.job_id, req.page_size, req.page_token)?;
+        let (job, task_summary, tasks, next_page_token, task_details_expired) = self
+            .service
+            .get_transfer_status(&req.job_id, req.page_size, req.page_token)?;
         let response = GetTransferStatusResponse {
             job_id: job.job_id,
             run_id: job.run_id,
@@ -77,6 +77,7 @@ where
             lease_expire_at: Some(job.lease_expire_at),
             cv_metadata_epoch: job.cv_metadata_epoch,
             task_summary: Some(task_summary_to_proto(task_summary)),
+            task_details_expired: Some(task_details_expired),
         };
         Ok(Builder::success(msg).proto_header(response).build())
     }
@@ -106,12 +107,13 @@ where
 
     fn watch_transfer(&self, msg: &Message) -> FsResult<Message> {
         let req: WatchTransferRequest = msg.parse_header()?;
-        let (job, task_summary, tasks, next_page_token, changed) = self.service.watch_transfer(
-            &req.job_id,
-            req.since_updated_at,
-            req.page_size,
-            req.page_token,
-        )?;
+        let (job, task_summary, tasks, next_page_token, changed, task_details_expired) =
+            self.service.watch_transfer(
+                &req.job_id,
+                req.since_updated_at,
+                req.page_size,
+                req.page_token,
+            )?;
         let response = WatchTransferResponse {
             job_id: job.job_id,
             run_id: job.run_id,
@@ -129,6 +131,7 @@ where
             lease_expire_at: Some(job.lease_expire_at),
             cv_metadata_epoch: job.cv_metadata_epoch,
             task_summary: Some(task_summary_to_proto(task_summary)),
+            task_details_expired: Some(task_details_expired),
         };
         Ok(Builder::success(msg).proto_header(response).build())
     }

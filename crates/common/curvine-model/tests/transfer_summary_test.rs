@@ -34,6 +34,7 @@ fn task(
         updated_at,
         accepted_at_ms: 0,
         first_byte_at_ms: 0,
+        replace_target: false,
     }
 }
 

@@ -557,6 +557,7 @@ mod tests {
             lease_expire_at: None,
             cv_metadata_epoch: None,
             task_summary: None,
+            task_details_expired: None,
         };
         let job_status = job_status_from_transfer(status);
         assert_eq!(job_status.state, JobTaskState::Loading);
@@ -606,6 +607,7 @@ mod tests {
                 stale: 7,
                 completed_size: 80,
             }),
+            task_details_expired: None,
         };
 
         let job_status = job_status_from_transfer(status);

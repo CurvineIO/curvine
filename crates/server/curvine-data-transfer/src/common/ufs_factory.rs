@@ -15,6 +15,7 @@
 use crate::JobWorkerClient;
 use curvine_config::ClientConf;
 use curvine_error::FsResult;
+use curvine_fs_api::Path;
 use curvine_model::{MountInfo, WorkerAddress};
 use curvine_net::net::InetAddr;
 use curvine_rpc::client::ClientFactory;
@@ -23,6 +24,32 @@ use curvine_runtime::sync::FastSyncCache;
 use curvine_unified_fs::{MountValue, UfsFileSystem};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Immutable UFS object identity for Transfer group resume (design D0.4).
+/// Returns the backend version/etag when the adapter provides one, else
+/// empty. Only the Opendal family can yield an identity today; Local and
+/// other adapters report unavailable so planners fall back to single
+/// segments instead of treating len/mtime as content identity.
+pub async fn ufs_object_version(ufs: &UfsFileSystem, _path: &Path) -> String {
+    ufs_object_fingerprint(ufs, _path).await.2
+}
+
+/// Single-observation `(len, mtime_ms, version)` for one object; `(0, 0, "")`
+/// when unavailable. Planner and worker must both derive manifest/check
+/// fields from HEAD observations (never mix LIST mtime with HEAD mtime:
+/// S3-style stores truncate LIST timestamps and strict equality false-fires).
+pub async fn ufs_object_fingerprint(ufs: &UfsFileSystem, _path: &Path) -> (i64, i64, String) {
+    match ufs {
+        #[cfg(feature = "opendal")]
+        UfsFileSystem::Opendal(fs) => {
+            fs.object_fingerprint(_path)
+                .await
+                .unwrap_or((0, 0, String::new()))
+        }
+        #[allow(unreachable_patterns)]
+        _ => (0, 0, String::new()),
+    }
+}
 
 pub struct UfsFactory {
     client_factory: ClientFactory,

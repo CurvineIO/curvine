@@ -18,15 +18,16 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
     summarize_transfer_tasks, StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease,
-    TransferListFilter, TransferProgress, TransferState, TransferStateUpdate, TransferTaskRecord,
-    TransferTaskReport, TransferTaskState, TransferTaskStatus, TransferTenantSummary,
-    WorkerInflight,
+    TransferListFilter, TransferProgress, TransferState, TransferStateUpdate, TransferTaskCounts,
+    TransferTaskRecord, TransferTaskReport, TransferTaskState, TransferTaskStatus,
+    TransferTenantSummary, WorkerInflight,
 };
 use parking_lot::Mutex;
 
 use crate::transfer::{
-    TransferMountSnapshotUpdate, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
-    TransferTaskStateUpdate,
+    ensure_task_transaction_bound, TransferMountSnapshotUpdate, TransferPlannedTasks,
+    TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate, MAX_JOBS_PER_STORE_TRANSACTION,
+    MAX_TASKS_PER_STORE_TRANSACTION,
 };
 
 fn running_job_needs_scheduler(
@@ -66,6 +67,7 @@ struct MemoryTransferState {
     jobs: HashMap<String, TransferJobRecord>,
     request_index: HashMap<(String, String), String>,
     tasks: HashMap<(String, u64, String), TransferTaskRecord>,
+    cleanup_lease: Option<(String, i64)>,
 }
 
 impl MemoryTransferStore {
@@ -232,24 +234,202 @@ impl TransferStore for MemoryTransferStore {
         if limit == 0 {
             return Ok(0);
         }
+        let _ =
+            self.purge_terminal_tasks(older_than_ms, limit.min(MAX_TASKS_PER_STORE_TRANSACTION))?;
+        self.purge_terminal_jobs(older_than_ms, limit.min(MAX_JOBS_PER_STORE_TRANSACTION))
+    }
+
+    fn purge_terminal_tasks(&self, older_than_ms: i64, task_limit: usize) -> FsResult<usize> {
+        if task_limit == 0 {
+            return Ok(0);
+        }
+        let task_limit = task_limit.min(MAX_TASKS_PER_STORE_TRANSACTION);
         let mut inner = self.inner.lock();
-        let job_ids = inner
+        // Never delete task rows without a retained terminal snapshot (C1).
+        // Jobs without a snapshot keep their rows until a snapshot lands, so
+        // TTL can never render detail as 0/empty.
+        let mut targets = inner
+            .jobs
+            .values()
+            .filter(|job| {
+                job.state.is_terminal()
+                    && job.updated_at < older_than_ms
+                    && job.terminal_summary.is_some()
+                    && job.terminal_counts.is_some()
+            })
+            .map(|job| (job.updated_at, job.job_id.clone(), job.run_id))
+            .collect::<Vec<_>>();
+        targets.sort();
+        let mut keys = Vec::new();
+        for (_, job_id, run_id) in targets {
+            let mut task_ids = inner
+                .tasks
+                .keys()
+                .filter(|(task_job_id, task_run_id, _)| {
+                    *task_job_id == job_id && *task_run_id == run_id
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            task_ids.sort();
+            for key in task_ids {
+                keys.push(key);
+                if keys.len() >= task_limit {
+                    break;
+                }
+            }
+            if keys.len() >= task_limit {
+                break;
+            }
+        }
+        let deleted = keys.len();
+        for key in keys {
+            inner.tasks.remove(&key);
+        }
+        Ok(deleted)
+    }
+
+    fn purge_terminal_tasks_with_cleanup_lease(
+        &self,
+        older_than_ms: i64,
+        task_limit: usize,
+        owner: &str,
+        now_ms: i64,
+    ) -> FsResult<usize> {
+        if task_limit == 0 {
+            return Ok(0);
+        }
+        let task_limit = task_limit.min(MAX_TASKS_PER_STORE_TRANSACTION);
+        let mut inner = self.inner.lock();
+        let lease_owned = inner
+            .cleanup_lease
+            .as_ref()
+            .is_some_and(|(lease_owner, expires_at)| lease_owner == owner && *expires_at > now_ms);
+        if !lease_owned {
+            return Ok(0);
+        }
+        let mut targets = inner
+            .jobs
+            .values()
+            .filter(|job| {
+                job.state.is_terminal()
+                    && job.updated_at < older_than_ms
+                    && job.terminal_summary.is_some()
+                    && job.terminal_counts.is_some()
+            })
+            .map(|job| (job.updated_at, job.job_id.clone(), job.run_id))
+            .collect::<Vec<_>>();
+        targets.sort();
+        let mut keys = Vec::with_capacity(task_limit);
+        for (_, job_id, run_id) in targets {
+            let mut task_ids = inner
+                .tasks
+                .keys()
+                .filter(|(task_job_id, task_run_id, _)| {
+                    *task_job_id == job_id && *task_run_id == run_id
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            task_ids.sort();
+            for key in task_ids {
+                keys.push(key);
+                if keys.len() >= task_limit {
+                    break;
+                }
+            }
+            if keys.len() >= task_limit {
+                break;
+            }
+        }
+        let deleted = keys.len();
+        for key in keys {
+            inner.tasks.remove(&key);
+        }
+        Ok(deleted)
+    }
+
+    fn purge_terminal_jobs(&self, older_than_ms: i64, limit: usize) -> FsResult<usize> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let limit = limit.min(MAX_JOBS_PER_STORE_TRANSACTION);
+        let mut inner = self.inner.lock();
+        let mut targets = inner
             .jobs
             .values()
             .filter(|job| job.state.is_terminal() && job.updated_at < older_than_ms)
-            .take(limit)
-            .map(|job| job.job_id.clone())
+            .filter(|job| {
+                !inner.tasks.keys().any(|(task_job_id, task_run_id, _)| {
+                    *task_job_id == job.job_id && *task_run_id == job.run_id
+                })
+            })
+            .map(|job| (job.updated_at, job.job_id.clone()))
             .collect::<Vec<_>>();
-        for job_id in &job_ids {
-            inner.jobs.remove(job_id);
+        targets.sort();
+        targets.truncate(limit);
+        let deleted = targets.len();
+        for (_, job_id) in targets {
+            inner.jobs.remove(&job_id);
             inner
                 .request_index
-                .retain(|_, indexed_job_id| indexed_job_id != job_id);
-            inner
-                .tasks
-                .retain(|(task_job_id, _, _), _| task_job_id != job_id);
+                .retain(|_, indexed_job_id| indexed_job_id != &job_id);
         }
-        Ok(job_ids.len())
+        Ok(deleted)
+    }
+
+    fn purge_terminal_jobs_with_cleanup_lease(
+        &self,
+        older_than_ms: i64,
+        limit: usize,
+        owner: &str,
+        now_ms: i64,
+    ) -> FsResult<usize> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let limit = limit.min(MAX_JOBS_PER_STORE_TRANSACTION);
+        let mut inner = self.inner.lock();
+        let lease_owned = inner
+            .cleanup_lease
+            .as_ref()
+            .is_some_and(|(lease_owner, expires_at)| lease_owner == owner && *expires_at > now_ms);
+        if !lease_owned {
+            return Ok(0);
+        }
+        let mut targets = inner
+            .jobs
+            .values()
+            .filter(|job| job.state.is_terminal() && job.updated_at < older_than_ms)
+            .filter(|job| {
+                !inner.tasks.keys().any(|(task_job_id, task_run_id, _)| {
+                    *task_job_id == job.job_id && *task_run_id == job.run_id
+                })
+            })
+            .map(|job| (job.updated_at, job.job_id.clone()))
+            .collect::<Vec<_>>();
+        targets.sort();
+        targets.truncate(limit);
+        let deleted = targets.len();
+        for (_, job_id) in targets {
+            inner.jobs.remove(&job_id);
+            inner
+                .request_index
+                .retain(|_, indexed_job_id| indexed_job_id != &job_id);
+        }
+        Ok(deleted)
+    }
+
+    fn try_acquire_cleanup_lease(&self, owner: &str, now_ms: i64, lease_ms: i64) -> FsResult<bool> {
+        let mut inner = self.inner.lock();
+        let expires_at = now_ms.saturating_add(lease_ms.max(1));
+        match &inner.cleanup_lease {
+            Some((current_owner, expiry)) if current_owner != owner && *expiry > now_ms => {
+                Ok(false)
+            }
+            _ => {
+                inner.cleanup_lease = Some((owner.to_string(), expires_at));
+                Ok(true)
+            }
+        }
     }
 
     fn list_transfer_tasks(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
@@ -591,6 +771,7 @@ impl TransferStore for MemoryTransferStore {
     }
 
     fn insert_tasks(&self, tasks: Vec<TransferTaskRecord>) -> FsResult<()> {
+        ensure_task_transaction_bound(tasks.len())?;
         let mut inner = self.inner.lock();
         for task in tasks {
             let key = (task.job_id.clone(), task.run_id, task.task_id.clone());
@@ -599,7 +780,28 @@ impl TransferStore for MemoryTransferStore {
         Ok(())
     }
 
+    fn append_planned_tasks(&self, update: TransferPlannedTasks) -> FsResult<bool> {
+        ensure_task_transaction_bound(update.tasks.len())?;
+        let mut inner = self.inner.lock();
+        let valid_owner = inner.jobs.get(&update.job_id).is_some_and(|job| {
+            job.run_id == update.run_id
+                && job.owner == update.owner
+                && job.lease_epoch == update.lease_epoch
+                && job.lease_expire_at > update.now_ms
+                && job.state == TransferState::Planning
+        });
+        if !valid_owner {
+            return Ok(false);
+        }
+        for task in update.tasks {
+            let key = (task.job_id.clone(), task.run_id, task.task_id.clone());
+            inner.tasks.entry(key).or_insert(task);
+        }
+        Ok(true)
+    }
+
     fn persist_planned_tasks(&self, update: TransferPlannedTasks) -> FsResult<bool> {
+        ensure_task_transaction_bound(update.tasks.len())?;
         let mut inner = self.inner.lock();
         let valid_owner = inner.jobs.get(&update.job_id).is_some_and(|job| {
             job.run_id == update.run_id
@@ -624,6 +826,15 @@ impl TransferStore for MemoryTransferStore {
         job.summary.update_time = update.now_ms;
         job.updated_at = update.now_ms;
         Ok(true)
+    }
+
+    fn has_transfer_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool> {
+        Ok(self
+            .inner
+            .lock()
+            .tasks
+            .keys()
+            .any(|(task_job_id, task_run_id, _)| task_job_id == job_id && *task_run_id == run_id))
     }
 
     fn update_task_state(&self, update: TransferTaskStateUpdate) -> FsResult<bool> {
@@ -715,6 +926,7 @@ impl TransferStore for MemoryTransferStore {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
+        ensure_task_transaction_bound(candidates.len())?;
         let mut inner = self.inner.lock();
         let owner_valid = inner.jobs.get(job_id).is_some_and(|job| {
             job.run_id == run_id
@@ -855,6 +1067,10 @@ impl TransferStore for MemoryTransferStore {
         task.last_report_at = start.now_ms;
         task.stale_deadline_at = start.stale_deadline_at;
         task.updated_at = start.now_ms;
+        task.progress.loaded_size = start
+            .resume_loaded_size
+            .clamp(0, task.progress.total_size.max(0));
+        task.progress.update_time = start.now_ms;
         Ok(true)
     }
 
@@ -873,7 +1089,18 @@ impl TransferStore for MemoryTransferStore {
         }
 
         task.state = report.state;
-        task.progress = report.progress.clone();
+        let reported = report.progress.loaded_size.max(0);
+        match report.state {
+            TransferTaskState::Running => {
+                task.progress.loaded_size = task.progress.loaded_size.max(0).max(reported);
+                task.progress.total_size = report.progress.total_size;
+                task.progress.update_time = report.progress.update_time;
+                task.progress.message = report.progress.message.clone();
+            }
+            _ => {
+                task.progress = report.progress.clone();
+            }
+        }
         task.last_report_at = report.now_ms;
         task.stale_deadline_at = report.stale_deadline_at;
         task.updated_at = report.now_ms;
@@ -909,6 +1136,30 @@ impl TransferStore for MemoryTransferStore {
         };
         if job.run_id != run_id {
             return Ok(());
+        }
+        job.summary = summary;
+        job.updated_at = now_ms;
+        Ok(())
+    }
+
+    fn update_terminal_snapshot(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        summary: TransferProgress,
+        counts: TransferTaskCounts,
+        now_ms: i64,
+    ) -> FsResult<()> {
+        let mut inner = self.inner.lock();
+        let Some(job) = inner.jobs.get_mut(job_id) else {
+            return Ok(());
+        };
+        if job.run_id != run_id {
+            return Ok(());
+        }
+        if job.terminal_summary.is_none() {
+            job.terminal_summary = Some(summary.clone());
+            job.terminal_counts = Some(counts);
         }
         job.summary = summary;
         job.updated_at = now_ms;
@@ -1005,6 +1256,8 @@ mod tests {
             cluster_snapshot_version: 1,
             mount_snapshot_attempts: 0,
             planning_attempts: 0,
+            terminal_summary: None,
+            terminal_counts: None,
             cv_metadata_epoch: None,
             state: TransferState::Pending,
             owner: String::new(),
@@ -1042,6 +1295,7 @@ mod tests {
             updated_at: 1,
             accepted_at_ms: 0,
             first_byte_at_ms: 0,
+            replace_target: false,
         }
     }
 
@@ -1133,6 +1387,7 @@ mod tests {
                     report_target_json: "{}".to_string(),
                     now_ms: 4,
                     stale_deadline_at: 1_000,
+                    resume_loaded_size: 0,
                 })
                 .unwrap());
         }

@@ -45,7 +45,6 @@ pub struct TransferConf {
     pub io_threads: usize,
     #[serde(skip, default = "TransferConf::default_worker_threads")]
     pub worker_threads: usize,
-    pub instance_id: String,
     pub endpoints: Vec<String>,
     #[serde(skip_serializing)]
     pub sqlite_path: String,
@@ -69,8 +68,6 @@ pub struct TransferConf {
     #[serde(skip, default = "TransferConf::default_task_max_retries")]
     pub task_max_retries: usize,
 
-    #[serde(default = "TransferConf::default_worker_max_inflight_tasks")]
-    pub worker_max_inflight_tasks: usize,
     #[serde(skip)]
     pub task_report_interval: Duration,
     #[serde(skip, default = "TransferConf::default_task_report_interval_str")]
@@ -98,6 +95,11 @@ pub struct TransferConf {
     pub terminal_retention: Duration,
     #[serde(alias = "terminal_retention")]
     pub terminal_retention_str: String,
+
+    #[serde(skip)]
+    pub task_retention: Duration,
+    #[serde(default = "TransferConf::default_task_retention_str")]
+    pub task_retention_str: String,
 }
 
 impl TransferConf {
@@ -106,6 +108,7 @@ impl TransferConf {
     pub const DEFAULT_LEASE_TIMEOUT: &'static str = "120s";
     pub const DEFAULT_CLUSTER_SNAPSHOT_MAX_STALENESS: &'static str = "60s";
     pub const DEFAULT_TERMINAL_RETENTION: &'static str = "168h";
+    pub const DEFAULT_TASK_RETENTION: &'static str = "24h";
     pub const DEFAULT_MAX_PLANNING_TRANSFERS: usize = 8;
     pub const DEFAULT_PLANNING_BATCH_SIZE: usize = 1000;
     pub const DEFAULT_WORKER_DISPATCH_CONCURRENCY: usize = 256;
@@ -121,8 +124,6 @@ impl TransferConf {
     pub const DEFAULT_TASK_ESTIMATED_BYTES: i64 = 256 * 1024 * 1024;
     /// Scheduler in-flight ledger cache refresh interval.
     pub const DEFAULT_SCHEDULER_INFLIGHT_CACHE_TTL_MS: u64 = 15_000;
-    /// Per-worker in-flight task count gate (matches worker semaphore default).
-    pub const DEFAULT_WORKER_MAX_INFLIGHT_TASKS: usize = 100;
     pub const DEFAULT_CLEANUP_BATCH_SIZE: usize = 1000;
     pub const DEFAULT_RPC_PORT: u16 = 9010;
     pub const DEFAULT_WEB_PORT: u16 = 9011;
@@ -158,6 +159,12 @@ impl TransferConf {
             DurationUnit::from_str(&self.cluster_snapshot_max_staleness_str)?.as_duration();
         self.terminal_retention =
             DurationUnit::from_str(&self.terminal_retention_str)?.as_duration();
+        self.task_retention = DurationUnit::from_str(&self.task_retention_str)?.as_duration();
+        if self.task_retention.is_zero() || self.task_retention > self.terminal_retention {
+            return Err(FsError::common(
+                "transfer.task_retention must satisfy 0 < task_retention <= terminal_retention",
+            ));
+        }
         if !self.store_url.is_empty() && self.effective_store_type() == TransferStoreType::Auto {
             return Err(FsError::common(
                 "transfer.store_url must use memory://, sqlite://, mysql://, postgres://, or postgresql://",
@@ -377,10 +384,6 @@ impl TransferConf {
         Self::DEFAULT_TASK_MAX_RETRIES
     }
 
-    fn default_worker_max_inflight_tasks() -> usize {
-        Self::DEFAULT_WORKER_MAX_INFLIGHT_TASKS
-    }
-
     fn default_task_report_interval_str() -> String {
         Self::DEFAULT_TASK_REPORT_INTERVAL.to_string()
     }
@@ -391,6 +394,10 @@ impl TransferConf {
 
     fn default_cluster_snapshot_max_staleness_str() -> String {
         Self::DEFAULT_CLUSTER_SNAPSHOT_MAX_STALENESS.to_string()
+    }
+
+    fn default_task_retention_str() -> String {
+        Self::DEFAULT_TASK_RETENTION.to_string()
     }
 
     pub fn scheduler_workers(&self) -> usize {
@@ -463,7 +470,6 @@ impl Default for TransferConf {
             },
             io_threads: Self::DEFAULT_IO_THREADS,
             worker_threads: Self::DEFAULT_WORKER_THREADS,
-            instance_id: String::new(),
             endpoints: vec![],
             sqlite_path: "data/transfer/transfer.db".to_string(),
             mysql_url: String::new(),
@@ -474,7 +480,6 @@ impl Default for TransferConf {
             max_tasks_per_transfer: Self::DEFAULT_MAX_TASKS_PER_TRANSFER,
             ufs_max_concurrency_per_endpoint: Self::DEFAULT_UFS_MAX_CONCURRENCY_PER_ENDPOINT,
             task_max_retries: Self::DEFAULT_TASK_MAX_RETRIES,
-            worker_max_inflight_tasks: Self::DEFAULT_WORKER_MAX_INFLIGHT_TASKS,
             task_report_interval: Duration::default(),
             task_report_interval_str: Self::DEFAULT_TASK_REPORT_INTERVAL.to_string(),
             task_stale_timeout: Duration::default(),
@@ -486,6 +491,8 @@ impl Default for TransferConf {
                 .to_string(),
             terminal_retention: Duration::default(),
             terminal_retention_str: Self::DEFAULT_TERMINAL_RETENTION.to_string(),
+            task_retention: Duration::default(),
+            task_retention_str: Self::DEFAULT_TASK_RETENTION.to_string(),
         }
     }
 }

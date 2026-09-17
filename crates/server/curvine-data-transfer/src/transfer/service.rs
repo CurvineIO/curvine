@@ -50,12 +50,14 @@ type TransferStatusPage = (
     TransferTaskCounts,
     Vec<TransferTaskStatusProto>,
     Option<String>,
+    bool,
 );
 type TransferWatchPage = (
     TransferJobRecord,
     TransferTaskCounts,
     Vec<TransferTaskStatusProto>,
     Option<String>,
+    bool,
     bool,
 );
 
@@ -212,6 +214,8 @@ where
             cluster_snapshot_version: 0,
             mount_snapshot_attempts: 0,
             planning_attempts: 0,
+            terminal_summary: None,
+            terminal_counts: None,
             cv_metadata_epoch: None,
             state: TransferState::Pending,
             owner: String::new(),
@@ -291,11 +295,12 @@ where
         let summary = self
             .store
             .get_transfer_task_summary(&job.job_id, job.run_id, now_ms())?;
-        job.summary = summary.progress;
+        let (progress, counts, expired) = resolve_terminal_summary(&job, &summary);
+        job.summary = progress;
         let page_size = page_size.unwrap_or(0) as usize;
         let offset = parse_page_token(page_token)?;
         if page_size == 0 {
-            return Ok((job, summary.counts, Vec::new(), None));
+            return Ok((job, counts, Vec::new(), None, expired));
         }
         let (tasks, has_next) = self.store.list_transfer_task_status_page(
             &job.job_id,
@@ -306,9 +311,10 @@ where
         let next_page_token = has_next.then(|| offset.saturating_add(tasks.len()).to_string());
         Ok((
             job,
-            summary.counts,
+            counts,
             tasks.into_iter().map(task_status_to_proto).collect(),
             next_page_token,
+            expired,
         ))
     }
 
@@ -374,12 +380,12 @@ where
         page_size: Option<u32>,
         page_token: Option<String>,
     ) -> FsResult<TransferWatchPage> {
-        let (job, counts, tasks, next_page_token) =
+        let (job, counts, tasks, next_page_token, expired) =
             self.get_transfer_status(job_id, page_size, page_token)?;
         let changed = since_updated_at
             .map(|since| job.updated_at as u64 > since)
             .unwrap_or(true);
-        Ok((job, counts, tasks, next_page_token, changed))
+        Ok((job, counts, tasks, next_page_token, changed, expired))
     }
 
     pub fn request_cancel(&self, job_id: &str, run_id: Option<u64>) -> FsResult<TransferState> {
@@ -1110,6 +1116,37 @@ pub fn task_summary_to_proto(value: TransferTaskCounts) -> TransferTaskSummaryPr
         canceled: value.canceled,
         stale: value.stale,
         completed_size: value.completed_size,
+    }
+}
+
+fn snapshot_has_tasks(summary: &TransferProgress, counts: &TransferTaskCounts) -> bool {
+    summary.total_size > 0
+        || counts.pending
+            + counts.running
+            + counts.completed
+            + counts.failed
+            + counts.canceled
+            + counts.stale
+            > 0
+}
+
+fn resolve_terminal_summary(
+    job: &TransferJobRecord,
+    live: &curvine_model::TransferTaskSummary,
+) -> (TransferProgress, TransferTaskCounts, bool) {
+    if !job.state.is_terminal() || live.has_task {
+        return (live.progress.clone(), live.counts, false);
+    }
+    let (Some(snapshot), Some(counts)) = (job.terminal_summary.clone(), job.terminal_counts) else {
+        // Terminal with no rows and no snapshot means details are gone without
+        // a retained summary (pre-C1 jobs or snapshot write failure). Report
+        // expired so callers never mistake the empty live aggregate for a
+        // genuinely empty job.
+        return (live.progress.clone(), live.counts, true);
+    };
+    match snapshot_has_tasks(&snapshot, &counts) {
+        true => (snapshot, counts, true),
+        false => (live.progress.clone(), live.counts, false),
     }
 }
 

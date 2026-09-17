@@ -149,11 +149,9 @@ impl TransferServer {
             Duration::from_millis(conf.client.mount_update_ttl_ms),
             stop.clone(),
         );
-        let owner = if conf.transfer.instance_id.is_empty() {
-            uuid::Uuid::new_v4().to_string()
-        } else {
-            conf.transfer.instance_id.clone()
-        };
+        // Lease owners are process-unique. A configured static instance id
+        // can be reused by two HA replicas and defeat owner-only fencing.
+        let owner = uuid::Uuid::new_v4().to_string();
         let planner = TransferPlanner::new(
             fs.clone(),
             factory.clone(),
@@ -171,6 +169,7 @@ impl TransferServer {
             owner,
             report_endpoints,
             conf.transfer.clone(),
+            conf.job.worker_max_concurrent_tasks,
         );
 
         let ready = Arc::new(AtomicBool::new(false));

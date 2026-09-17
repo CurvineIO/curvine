@@ -25,7 +25,7 @@ use postgres::{Client, Config};
 use postgres_native_tls::MakeTlsConnector;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 
 static TEST_SCHEMA_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -117,6 +117,35 @@ fn postgres_store_connects_with_a_private_ca() {
         .unwrap();
 }
 
+#[test]
+fn postgres_cleanup_lease_first_acquisition_is_exclusive() {
+    let Some((url, _schema)) = test_store_url() else {
+        eprintln!(
+            "CURVINE_TRANSFER_POSTGRES_URL is not set; skipping PostgreSQL cleanup lease test"
+        );
+        return;
+    };
+    let store = Arc::new(PostgresTransferStore::open(&url).unwrap());
+    let barrier = Arc::new(Barrier::new(3));
+    let attempts = ["scheduler-a", "scheduler-b"].map(|owner| {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            store.try_acquire_cleanup_lease(owner, 100, 60).unwrap()
+        })
+    });
+    barrier.wait();
+    assert_eq!(
+        attempts
+            .into_iter()
+            .map(|attempt| attempt.join().unwrap())
+            .filter(|acquired| *acquired)
+            .count(),
+        1
+    );
+}
+
 fn transfer_job(id: &str, target_path: &str) -> TransferJobRecord {
     TransferJobRecord {
         job_key: format!("key-{id}"),
@@ -131,6 +160,8 @@ fn transfer_job(id: &str, target_path: &str) -> TransferJobRecord {
         cluster_snapshot_version: 1,
         mount_snapshot_attempts: 0,
         planning_attempts: 0,
+        terminal_summary: None,
+        terminal_counts: None,
         cv_metadata_epoch: None,
         state: TransferState::Pending,
         owner: String::new(),
@@ -168,6 +199,7 @@ fn transfer_task(job: &TransferJobRecord) -> TransferTaskRecord {
         accepted_at_ms: 0,
         first_byte_at_ms: 0,
         updated_at: 1,
+        replace_target: false,
     }
 }
 
@@ -251,6 +283,7 @@ fn postgres_store_persists_transfer_lifecycle() {
             report_target_json: "{}".to_string(),
             now_ms: 4,
             stale_deadline_at: 100,
+            resume_loaded_size: 0,
         })
         .unwrap());
     assert!(store
@@ -407,6 +440,7 @@ fn postgres_store_marks_only_probed_missing_attempts() {
                 report_target_json: "{}".to_string(),
                 now_ms: 3,
                 stale_deadline_at: 1_000,
+                resume_loaded_size: 0,
             })
             .unwrap());
     }
@@ -865,4 +899,168 @@ fn postgres_store_does_not_backfill_historical_task_projections() {
     assert_eq!(row.get::<_, String>(4), "completed");
     assert_eq!(row.get::<_, String>(5), "Completed");
     assert_eq!(row.get::<_, String>(6), "42");
+}
+
+fn pg_report(job: &TransferJobRecord, loaded: i64, now_ms: i64) -> TransferTaskReport {
+    TransferTaskReport {
+        job_id: job.job_id.clone(),
+        run_id: job.run_id,
+        task_id: "task-1".to_string(),
+        attempt_id: 1,
+        worker_id: 7,
+        worker_session_id: "session-1".to_string(),
+        state: TransferTaskState::Running,
+        progress: TransferProgress {
+            loaded_size: loaded,
+            total_size: 384,
+            update_time: now_ms,
+            message: "running".to_string(),
+        },
+        now_ms,
+        stale_deadline_at: 2_000,
+        accepted_at_ms: 0,
+        first_byte_at_ms: 0,
+    }
+}
+
+fn pg_plan_one(store: &PostgresTransferStore, job: &TransferJobRecord, total: i64) {
+    let lease = store
+        .acquire_runnable_transfer("owner", 60_000, 1, 8, false)
+        .unwrap()
+        .unwrap();
+    let mut task = transfer_task(job);
+    task.progress.total_size = total;
+    task.estimated_size = total;
+    store
+        .persist_planned_tasks(TransferPlannedTasks {
+            job_id: job.job_id.clone(),
+            run_id: job.run_id,
+            owner: lease.owner.clone(),
+            lease_epoch: lease.lease_epoch,
+            tasks: vec![task],
+            message: "planned".to_string(),
+            now_ms: 2,
+        })
+        .unwrap();
+    let lease_now = store.get_transfer(&job.job_id).unwrap().unwrap();
+    store
+        .start_task_attempt(TaskAttemptStart {
+            job_id: job.job_id.clone(),
+            run_id: job.run_id,
+            owner: lease_now.owner.clone(),
+            lease_epoch: lease_now.lease_epoch,
+            task_id: "task-1".to_string(),
+            attempt_id: 1,
+            worker_id: 7,
+            worker_session_id: "session-1".to_string(),
+            report_target_json: "{}".to_string(),
+            now_ms: 3,
+            stale_deadline_at: 1_000,
+            resume_loaded_size: 0,
+        })
+        .unwrap();
+}
+
+/// Live PG: Running reports are monotonic, stale attempts fenced, and late
+/// terminal reports after terminal cannot clobber (crash fencing).
+#[test]
+fn postgres_store_running_report_is_monotonic_and_terminal_fenced() {
+    let Some((url, _schema)) = test_store_url() else {
+        eprintln!("CURVINE_TRANSFER_POSTGRES_URL is not set; skipping");
+        return;
+    };
+    let store = PostgresTransferStore::open(&url).unwrap();
+    let job = transfer_job("pg-monotonic", "/pg-monotonic");
+    store
+        .create_or_get_by_request_id_checked(job.clone())
+        .unwrap();
+    pg_plan_one(&store, &job, 384);
+    assert!(store.update_task_report(pg_report(&job, 256, 4)).unwrap());
+    assert!(store.update_task_report(pg_report(&job, 128, 5)).unwrap());
+    let row = store
+        .list_transfer_tasks(&job.job_id, job.run_id)
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(row.progress.loaded_size, 256);
+    let mut stale = pg_report(&job, 100, 6);
+    stale.attempt_id = 99;
+    assert!(!store.update_task_report(stale).unwrap());
+    let mut done = pg_report(&job, 384, 7);
+    done.state = TransferTaskState::Completed;
+    assert!(store.update_task_report(done).unwrap());
+    assert!(!store.update_task_report(pg_report(&job, 50, 8)).unwrap());
+    let mut foreign = pg_report(&job, 384, 9);
+    foreign.attempt_id = 99;
+    foreign.state = TransferTaskState::Completed;
+    assert!(!store.update_task_report(foreign).unwrap());
+    let row = store
+        .list_transfer_tasks(&job.job_id, job.run_id)
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(row.state, TransferTaskState::Completed);
+    assert_eq!(row.progress.loaded_size, 384);
+}
+
+/// Live PG: purge is row-bounded, skips snapshot-less jobs, and only deletes
+/// empty-task terminal jobs.
+#[test]
+fn postgres_store_purge_requires_snapshot_and_empty_tasks() {
+    let Some((url, _schema)) = test_store_url() else {
+        eprintln!("CURVINE_TRANSFER_POSTGRES_URL is not set; skipping");
+        return;
+    };
+    let store = PostgresTransferStore::open(&url).unwrap();
+    let job = transfer_job("pg-purge", "/pg-purge");
+    store
+        .create_or_get_by_request_id_checked(job.clone())
+        .unwrap();
+    pg_plan_one(&store, &job, 10);
+    let lease = store.get_transfer(&job.job_id).unwrap().unwrap();
+    assert!(store
+        .update_transfer_state(TransferStateUpdate {
+            job_id: job.job_id.clone(),
+            run_id: job.run_id,
+            owner: lease.owner.clone(),
+            lease_epoch: lease.lease_epoch,
+            from_states: vec![
+                TransferState::Planning,
+                TransferState::Dispatching,
+                TransferState::Running
+            ],
+            to_state: TransferState::Completed,
+            message: "done".to_string(),
+            now_ms: 10,
+        })
+        .unwrap());
+    assert_eq!(store.purge_terminal_tasks(100, 1000).unwrap(), 0);
+    let summary = store
+        .get_transfer_task_summary(&job.job_id, job.run_id, 10)
+        .unwrap();
+    store
+        .update_terminal_snapshot(
+            &job.job_id,
+            job.run_id,
+            summary.progress,
+            summary.counts,
+            10,
+        )
+        .unwrap();
+    // Second snapshot is a no-op (first wins); purge then proceeds row-bounded.
+    let summary2 = store
+        .get_transfer_task_summary(&job.job_id, job.run_id, 11)
+        .unwrap();
+    store
+        .update_terminal_snapshot(
+            &job.job_id,
+            job.run_id,
+            summary2.progress,
+            summary2.counts,
+            11,
+        )
+        .unwrap();
+    assert_eq!(store.purge_terminal_jobs(100, 1000).unwrap(), 0);
+    assert_eq!(store.purge_terminal_tasks(100, 1000).unwrap(), 1);
+    assert_eq!(store.purge_terminal_jobs(100, 1000).unwrap(), 1);
 }
