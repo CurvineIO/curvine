@@ -159,17 +159,28 @@ Transfer exposes its own Prometheus text `/metrics` endpoint on `transfer.web_po
 transfer_active_jobs
 transfer_executing_jobs
 transfer_pending_jobs
+transfer_tasks_pending
+transfer_tasks_running
+transfer_tasks_completed
+transfer_tasks_failed
+transfer_tasks_stale
 transfer_submit_total{kind,result}
 transfer_terminal_total{state,reason}
 transfer_task_report_queue_len
 transfer_task_report_queue_len_by_lane{lane}
 transfer_task_report_total{result}
+transfer_task_report_rpc_total{type}
+transfer_task_report_batch_tasks_total
 transfer_completed_bytes_total{state}
 transfer_acquire_total{result}
 transfer_planning_total{kind,result}
 transfer_dispatch_total{result}
 transfer_lease_renew_total{result}
 transfer_stale_retry_total{result}
+transfer_requeue_total{reason}
+transfer_worker_reject_total{class}
+transfer_worker_inflight_count{worker_id}
+transfer_worker_inflight_bytes{worker_id}
 transfer_store_operation_duration_us{backend,operation,result}
 transfer_store_operation_total{backend,operation,result}
 transfer_store_unavailable{backend}
@@ -183,6 +194,35 @@ transfer_cluster_snapshot_live_workers
 transfer_cluster_snapshot_capable_workers
 transfer_cluster_snapshot_refresh_total{result}
 transfer_cluster_snapshot_refresh_duration_us{result}
+```
+
+The `transfer_tasks_*` gauges are store-wide state counts; `transfer_task_report_rpc_total{type}`
+uses `type=single|batch` to show how many progress reports arrive as single versus batch
+envelopes, `transfer_task_report_batch_tasks_total` counts the tasks carried inside batch
+envelopes, and `transfer_requeue_total{reason}` / `transfer_worker_reject_total{class}` /
+`transfer_worker_inflight_*{worker_id}` expose the backpressure control plane.
+
+### Worker Transfer Task Metrics
+
+Each `curvine-worker` exposes its transfer-task metrics on `worker.web_port`
+(`9002` by default):
+
+```text
+worker_transfer_tasks_active
+worker_transfer_tasks_queued
+worker_transfer_tasks_running
+worker_transfer_task_permits_available
+worker_transfer_task_permits_max
+worker_transfer_task_submit_total{result}
+worker_transfer_task_submit_rejected_total{reason}
+worker_transfer_task_terminal_total{state,kind}
+worker_transfer_task_failed_total{reason}
+worker_transfer_task_report_total{result}
+worker_transfer_task_copy_bytes_total{state}
+worker_transfer_task_execution_duration_us{state}
+worker_transfer_task_read_duration_us{state}
+worker_transfer_task_write_duration_us{state}
+worker_transfer_task_queue_duration_us{result}
 ```
 
 ### Transfer Discovery Feasibility

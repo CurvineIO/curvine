@@ -424,6 +424,31 @@ fn build_transfer_panel_tasks(
         ),
         panel_task(
             ctx.clone(),
+            "transfer-task-water",
+            "Transfer Task Water",
+            "transfer_tasks_* store-wide task counts by state",
+            PanelKind::Timeseries,
+            Some("status"),
+            |ctx| {
+                timeseries_panel(
+                    ctx,
+                    "transfer-task-water",
+                    "Transfer Task Water",
+                    "transfer_tasks_* store-wide task counts by state",
+                    &[
+                        "transfer_tasks_pending",
+                        "transfer_tasks_running",
+                        "transfer_tasks_completed",
+                        "transfer_tasks_failed",
+                        "transfer_tasks_stale",
+                    ],
+                    TRANSFER,
+                    false,
+                )
+            },
+        ),
+        panel_task(
+            ctx.clone(),
             "transfer-report-queue",
             "Transfer Report Queue",
             "transfer_task_report_queue_len and queue length by lane",
@@ -855,6 +880,102 @@ fn build_transfer_panel_tasks(
                     TRANSFER,
                     GaugeRatioMode::Used,
                     "transfer_fd_usage_pct",
+                )
+            },
+        ),
+        // --- Flow: backpressure control plane (batch envelopes, requeue, rejects) ---
+        panel_task(
+            ctx.clone(),
+            "transfer-report-envelope-rate",
+            "Transfer Report Envelopes",
+            "transfer_task_report_rpc_total and transfer_task_report_batch_tasks_total rate by envelope type",
+            PanelKind::Timeseries,
+            Some("flow"),
+            |ctx| {
+                multi_counter_rate_panel(
+                    ctx,
+                    "transfer-report-envelope-rate",
+                    "Transfer Report Envelopes",
+                    "transfer_task_report_rpc_total and transfer_task_report_batch_tasks_total rate by envelope type",
+                    &[
+                        "transfer_task_report_rpc_total",
+                        "transfer_task_report_batch_tasks_total",
+                    ],
+                    TRANSFER,
+                )
+            },
+        ),
+        panel_task(
+            ctx.clone(),
+            "transfer-requeue-rate",
+            "Transfer Task Requeue",
+            "transfer_requeue_total rate by reason",
+            PanelKind::Timeseries,
+            Some("flow"),
+            |ctx| {
+                counter_rate_panel(
+                    ctx,
+                    "transfer-requeue-rate",
+                    "Transfer Task Requeue",
+                    "transfer_requeue_total rate by reason",
+                    "transfer_requeue_total",
+                    TRANSFER,
+                )
+            },
+        ),
+        panel_task(
+            ctx.clone(),
+            "transfer-worker-reject-rate",
+            "Transfer Worker Reject",
+            "transfer_worker_reject_total rate by rejection class",
+            PanelKind::Timeseries,
+            Some("flow"),
+            |ctx| {
+                counter_rate_panel(
+                    ctx,
+                    "transfer-worker-reject-rate",
+                    "Transfer Worker Reject",
+                    "transfer_worker_reject_total rate by rejection class",
+                    "transfer_worker_reject_total",
+                    TRANSFER,
+                )
+            },
+        ),
+        panel_task(
+            ctx.clone(),
+            "transfer-worker-inflight-count",
+            "Transfer Worker In-flight Tasks",
+            "transfer_worker_inflight_count by worker",
+            PanelKind::Timeseries,
+            Some("flow"),
+            |ctx| {
+                timeseries_panel(
+                    ctx,
+                    "transfer-worker-inflight-count",
+                    "Transfer Worker In-flight Tasks",
+                    "transfer_worker_inflight_count by worker",
+                    &["transfer_worker_inflight_count"],
+                    TRANSFER,
+                    false,
+                )
+            },
+        ),
+        panel_task(
+            ctx.clone(),
+            "transfer-worker-inflight-bytes",
+            "Transfer Worker In-flight Bytes",
+            "transfer_worker_inflight_bytes by worker",
+            PanelKind::Timeseries,
+            Some("flow"),
+            |ctx| {
+                timeseries_panel(
+                    ctx,
+                    "transfer-worker-inflight-bytes",
+                    "Transfer Worker In-flight Bytes",
+                    "transfer_worker_inflight_bytes by worker",
+                    &["transfer_worker_inflight_bytes"],
+                    TRANSFER,
+                    false,
                 )
             },
         ),
@@ -2032,6 +2153,69 @@ fn build_worker_panel_tasks(
                     "worker",
                     0.99,
                     "worker_transfer_execution_p99_us",
+                    1.0,
+                )
+            },
+        ),
+        panel_task(
+            ctx.clone(),
+            "worker-transfer-read-p99",
+            "Transfer Task Read P99",
+            "worker_transfer_task_read_duration_us P99 by state",
+            PanelKind::Timeseries,
+            Some("transfer-tasks"),
+            |ctx| {
+                histogram_quantile_panel(
+                    ctx,
+                    "worker-transfer-read-p99",
+                    "Transfer Task Read P99",
+                    "worker_transfer_task_read_duration_us P99 by state",
+                    "worker_transfer_task_read_duration_us_bucket",
+                    "worker",
+                    0.99,
+                    "worker_transfer_read_p99_us",
+                    1.0,
+                )
+            },
+        ),
+        panel_task(
+            ctx.clone(),
+            "worker-transfer-write-p99",
+            "Transfer Task Write P99",
+            "worker_transfer_task_write_duration_us P99 by state",
+            PanelKind::Timeseries,
+            Some("transfer-tasks"),
+            |ctx| {
+                histogram_quantile_panel(
+                    ctx,
+                    "worker-transfer-write-p99",
+                    "Transfer Task Write P99",
+                    "worker_transfer_task_write_duration_us P99 by state",
+                    "worker_transfer_task_write_duration_us_bucket",
+                    "worker",
+                    0.99,
+                    "worker_transfer_write_p99_us",
+                    1.0,
+                )
+            },
+        ),
+        panel_task(
+            ctx.clone(),
+            "worker-transfer-queue-p99",
+            "Transfer Task Queue Wait P99",
+            "worker_transfer_task_queue_duration_us P99 by result",
+            PanelKind::Timeseries,
+            Some("transfer-tasks"),
+            |ctx| {
+                histogram_quantile_panel(
+                    ctx,
+                    "worker-transfer-queue-p99",
+                    "Transfer Task Queue Wait P99",
+                    "worker_transfer_task_queue_duration_us P99 by result",
+                    "worker_transfer_task_queue_duration_us_bucket",
+                    "worker",
+                    0.99,
+                    "worker_transfer_queue_p99_us",
                     1.0,
                 )
             },
@@ -5147,6 +5331,51 @@ mod tests {
             .panels
             .iter()
             .any(|panel| panel.id == "worker-transfer-terminal-rate"
+                && panel.section.as_deref() == Some("transfer-tasks")));
+        assert!(transfer
+            .panels
+            .iter()
+            .any(|panel| panel.id == "transfer-task-water"
+                && panel.section.as_deref() == Some("status")));
+        assert!(transfer
+            .panels
+            .iter()
+            .any(|panel| panel.id == "transfer-report-envelope-rate"
+                && panel.section.as_deref() == Some("flow")));
+        assert!(transfer
+            .panels
+            .iter()
+            .any(|panel| panel.id == "transfer-requeue-rate"
+                && panel.section.as_deref() == Some("flow")));
+        assert!(transfer
+            .panels
+            .iter()
+            .any(|panel| panel.id == "transfer-worker-reject-rate"
+                && panel.section.as_deref() == Some("flow")));
+        assert!(transfer
+            .panels
+            .iter()
+            .any(|panel| panel.id == "transfer-worker-inflight-count"
+                && panel.section.as_deref() == Some("flow")));
+        assert!(transfer
+            .panels
+            .iter()
+            .any(|panel| panel.id == "transfer-worker-inflight-bytes"
+                && panel.section.as_deref() == Some("flow")));
+        assert!(workers
+            .panels
+            .iter()
+            .any(|panel| panel.id == "worker-transfer-read-p99"
+                && panel.section.as_deref() == Some("transfer-tasks")));
+        assert!(workers
+            .panels
+            .iter()
+            .any(|panel| panel.id == "worker-transfer-write-p99"
+                && panel.section.as_deref() == Some("transfer-tasks")));
+        assert!(workers
+            .panels
+            .iter()
+            .any(|panel| panel.id == "worker-transfer-queue-p99"
                 && panel.section.as_deref() == Some("transfer-tasks")));
     }
 

@@ -92,6 +92,38 @@ describe('seriesDisplayName', () => {
     )
     expect(name).toBe('Completed bytes · completed · cv-transfer-0:9011')
   })
+
+  it('labels transfer worker in-flight panels with the worker id', () => {
+    const name = seriesDisplayName(
+      {
+        name: 'transfer_worker_inflight_count',
+        labels: {
+          component: 'transfer',
+          metric: 'transfer_worker_inflight_count',
+          worker_id: '3',
+          instance: 'cv-transfer-0:9011'
+        }
+      },
+      'transfer-worker-inflight-count'
+    )
+    expect(name).toBe('3 · cv-transfer-0:9011')
+  })
+
+  it('labels transfer reject panels with the rejection class', () => {
+    const name = seriesDisplayName(
+      {
+        name: 'transfer_worker_reject_total',
+        labels: {
+          component: 'transfer',
+          metric: 'transfer_worker_reject_total',
+          class: 'capacity',
+          instance: 'cv-transfer-0:9011'
+        }
+      },
+      'transfer-worker-reject-rate'
+    )
+    expect(name).toBe('Worker rejects · capacity · cv-transfer-0:9011')
+  })
 })
 
 describe('uniqueSeriesChartNames', () => {
@@ -392,6 +424,24 @@ describe('panelValueFormatter', () => {
     expect(panelValueFormatter('transfer-job-summary-flush-p99')(1200)).toBe('1,200 us')
     expect(panelValueFormatter('worker-transfer-execution-p99')(2500)).toBe('2,500 us')
     expect(panelValueFormatter('worker-transfer-copy-bytes-rate')(3.5)).toBe('3.5 B/s')
+  })
+
+  it('formats the transfer phase latency panels as microseconds, not milliseconds', () => {
+    for (const panelId of [
+      'worker-transfer-read-p99',
+      'worker-transfer-write-p99',
+      'worker-transfer-queue-p99'
+    ]) {
+      const format = panelValueFormatter(panelId)
+      expect(format(2500)).toBe('2,500 us')
+      expect(format(2500)).not.toContain('ms')
+    }
+  })
+
+  it('formats the new transfer backpressure panels as rates', () => {
+    expect(panelValueFormatter('transfer-report-envelope-rate')(1.4)).toBe('1.4/s')
+    expect(panelValueFormatter('transfer-requeue-rate')(0)).toBe('0/s')
+    expect(panelValueFormatter('transfer-worker-reject-rate')(2)).toBe('2/s')
   })
 })
 

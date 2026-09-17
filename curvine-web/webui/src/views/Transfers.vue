@@ -148,10 +148,11 @@
           <h3>Task Counters</h3>
           <div class="counter-grid">
             <div><span>Total</span><strong>{{ displayTaskTotal(selectedTransfer) }}</strong></div>
-            <div><span>Completed</span><strong>{{ Number(selectedTransfer.completed_files || 0) }}</strong></div>
+            <div><span>Completed</span><strong>{{ taskCountLabel(selectedTransfer.completed_files) }}</strong></div>
             <div><span>Failed</span><strong class="bad-count">{{ failedTaskCount(selectedTransfer) }}</strong></div>
             <div><span>Running</span><strong>{{ runningTaskCount(selectedTransfer) }}</strong></div>
             <div><span>Loaded</span><strong>{{ sizeLabel(selectedTransfer) }}</strong></div>
+            <div><span>Transferred</span><strong>{{ transferredLabel(selectedTransfer) }}</strong></div>
           </div>
           <button v-if="failedTaskCount(selectedTransfer)" class="admin-button ghost compact" @click="showFailedTasksOnly = !showFailedTasksOnly">
             {{ showFailedTasksOnly ? 'Show all tasks' : 'View failed tasks' }}
@@ -183,6 +184,14 @@
             </div>
           </div>
           <div v-if="selectedTaskList.length === 0" class="empty-state">{{ selectedTaskEmptyMessage }}</div>
+          <div v-if="canLoadMoreTasks" class="task-list-footer">
+            <button class="admin-button ghost compact" :disabled="taskLoadingMore" @click="loadMoreTasks">
+              {{ taskLoadingMore ? 'Loading...' : `Load more tasks (showing ${selectedTransfer.tasks ? selectedTransfer.tasks.length : 0})` }}
+            </button>
+          </div>
+          <div v-else-if="taskListTruncated" class="task-list-footer task-list-hint">
+            Showing the first {{ taskPageSize }} tasks. Use <code>curvine-cli transfer status &lt;job&gt; --all</code> for the full list.
+          </div>
         </section>
       </aside>
     </section>
@@ -238,6 +247,14 @@ const emptyForm = () => ({
   overwrite: true
 })
 
+// Task pages are requested from offset 0 with a growing page size instead of
+// following page tokens, so each poll refresh replaces the task list as a whole
+// and never has to merge paged state. Jobs beyond TASK_PAGE_MAX are inspected
+// with `curvine-cli transfer status --all`.
+const TASK_PAGE_DEFAULT = 100
+const TASK_PAGE_STEP = 100
+const TASK_PAGE_MAX = 1000
+
 export default {
   name: 'TransfersPage',
   components: { MetricCard },
@@ -258,7 +275,10 @@ export default {
       polling: true,
       pollTimer: null,
       busyTransfers: {},
-      notice: ''
+      notice: '',
+      taskPageSize: TASK_PAGE_DEFAULT,
+      taskNextPageToken: '',
+      taskLoadingMore: false
     }
   },
   computed: {
@@ -279,6 +299,14 @@ export default {
       if (!this.selectedTransfer) return 'No task details available for this view.'
       if (this.showFailedTasksOnly) return 'No failed tasks in this transfer.'
       return 'No task details available for this transfer.'
+    },
+    canLoadMoreTasks() {
+      if (!this.selectedTransfer) return false
+      if (this.taskPageSize >= TASK_PAGE_MAX) return false
+      return Boolean(this.taskNextPageToken)
+    },
+    taskListTruncated() {
+      return this.taskPageSize >= TASK_PAGE_MAX && Boolean(this.taskNextPageToken)
     },
     emptyMessage() {
       if (!this.transfers.length) return 'No transfer jobs tracked yet. Submit a transfer to get started.'
@@ -389,10 +417,22 @@ export default {
       return Array.isArray(transfer && transfer.tasks) ? transfer.tasks : []
     },
     displayTaskTotal(transfer) {
-      if (!transfer) return 0
+      if (!transfer) return '-'
+      const tasks = this.taskDetails(transfer).length
+      if (transfer.total_files === null || transfer.total_files === undefined) {
+        return tasks || '-'
+      }
       const total = Number(transfer.total_files || 0)
-      if (total > 0) return total
-      return this.taskDetails(transfer).length || 0
+      return total > 0 ? total : (tasks || '-')
+    },
+    taskCountLabel(value) {
+      if (value === null || value === undefined) return '-'
+      return Number(value) || 0
+    },
+    transferredLabel(transfer) {
+      const value = transfer && transfer.completed_size
+      if (value === null || value === undefined) return '-'
+      return this.formatBytes(Number(value) || 0)
     },
     failedTaskCount(transfer) {
       const tasks = this.taskDetails(transfer)
@@ -514,6 +554,7 @@ export default {
       if (!id) return
       this.selectedTransferId = id
       this.showFailedTasksOnly = false
+      this.taskPageSize = TASK_PAGE_DEFAULT
       await this.refreshTransfer(transfer)
     },
     async refreshTransfer(transfer) {
@@ -521,16 +562,28 @@ export default {
       if (!id) return
       this.detailLoading = true
       try {
-        const next = await fetchTransferStatus(id)
+        const next = await fetchTransferStatus(id, { page_size: this.taskPageSize })
+        this.taskNextPageToken = next && next.next_page_token ? next.next_page_token : ''
         this.upsertTransfer(next)
         this.setNotice(`Status refreshed: ${id} is ${this.stateLabel(next)} (${this.progress(next)}%)`)
       } catch (error) {
         this.setNotice(`Status failed: ${error}`)
       } finally { this.detailLoading = false }
     },
+    async loadMoreTasks() {
+      if (!this.selectedTransfer || this.taskLoadingMore) return
+      if (!this.canLoadMoreTasks) return
+      this.taskLoadingMore = true
+      this.taskPageSize = Math.min(this.taskPageSize + TASK_PAGE_STEP, TASK_PAGE_MAX)
+      try {
+        await this.refreshTransfer(this.selectedTransfer)
+      } finally { this.taskLoadingMore = false }
+    },
     closeDetails() {
       this.selectedTransferId = ''
       this.showFailedTasksOnly = false
+      this.taskNextPageToken = ''
+      this.taskPageSize = TASK_PAGE_DEFAULT
     },
     async cancelTransferJob(transfer) {
       const id = this.jobId(transfer)
@@ -607,7 +660,9 @@ export default {
       for (const transfer of activeTransfers) {
         const id = this.jobId(transfer)
         if (!id) continue
-        try { this.upsertTransfer(await fetchTransferStatus(id)) }
+        // Summary only: the list needs counters, not every active job's task list.
+        // Loaded task rows are preserved by upsertTransfer's merge.
+        try { this.upsertTransfer(await fetchTransferStatus(id, { page_size: 0 })) }
         catch (_) {}
       }
       this.togglePolling()
@@ -974,6 +1029,15 @@ export default {
   border: 1px solid rgba(91, 103, 122, 0.14);
   border-radius: 8px;
   background: rgba(255, 255, 255, .76);
+}
+
+.task-list-footer {
+  margin-top: 8px;
+}
+
+.task-list-hint {
+  color: #6b7a90;
+  font-size: 11px;
 }
 
 .transfer-task-row {

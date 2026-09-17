@@ -161,6 +161,9 @@ const TRANSFER_SERIES_LABEL_KEYS = [
   'state',
   'reason',
   'lane',
+  'type',
+  'class',
+  'worker_id',
   'status'
 ] as const
 
@@ -230,7 +233,12 @@ const TRANSFER_LABELED_PANELS = new Set([
   'transfer-snapshot-refresh-rate',
   'transfer-snapshot-refresh-p99',
   'transfer-job-summary-flush-p99',
-  'transfer-process-cpu'
+  'transfer-process-cpu',
+  'transfer-report-envelope-rate',
+  'transfer-requeue-rate',
+  'transfer-worker-reject-rate',
+  'transfer-worker-inflight-count',
+  'transfer-worker-inflight-bytes'
 ])
 
 const WORKER_TRANSFER_LABELED_PANELS = new Set([
@@ -240,12 +248,16 @@ const WORKER_TRANSFER_LABELED_PANELS = new Set([
   'worker-transfer-failed-rate',
   'worker-transfer-report-rate',
   'worker-transfer-copy-bytes-rate',
-  'worker-transfer-execution-p99'
+  'worker-transfer-execution-p99',
+  'worker-transfer-read-p99',
+  'worker-transfer-write-p99',
+  'worker-transfer-queue-p99'
 ])
 
 const TRANSFER_PANEL_IDS = new Set([
   ...Array.from(TRANSFER_LABELED_PANELS),
   'transfer-job-water',
+  'transfer-task-water',
   'transfer-report-queue',
   'transfer-snapshot-health',
   'transfer-job-summary-water',
@@ -348,6 +360,9 @@ const METRIC_SERIES_PANELS = new Set([
   'worker-transfer-submit-rejected-rate',
   'worker-transfer-terminal-rate',
   'worker-transfer-failed-rate',
+  'transfer-report-envelope-rate',
+  'transfer-requeue-rate',
+  'transfer-worker-reject-rate',
   'worker-transfer-report-rate',
   'worker-transfer-copy-bytes-rate'
 ])
@@ -385,6 +400,20 @@ const METRIC_DISPLAY_OVERRIDES: Record<string, string> = {
   worker_transfer_task_failed_total: 'Failed',
   worker_transfer_task_report_total: 'Progress reports',
   worker_transfer_task_copy_bytes_total: 'Copy bytes',
+  transfer_tasks_pending: 'Tasks pending',
+  transfer_tasks_running: 'Tasks running',
+  transfer_tasks_completed: 'Tasks completed',
+  transfer_tasks_failed: 'Tasks failed',
+  transfer_tasks_stale: 'Tasks stale',
+  transfer_task_report_rpc_total: 'Report RPCs',
+  transfer_task_report_batch_tasks_total: 'Batched reports',
+  transfer_requeue_total: 'Task requeues',
+  transfer_worker_reject_total: 'Worker rejects',
+  transfer_worker_inflight_count: 'Worker in-flight tasks',
+  transfer_worker_inflight_bytes: 'Worker in-flight bytes',
+  worker_transfer_task_read_duration_us: 'Read duration',
+  worker_transfer_task_write_duration_us: 'Write duration',
+  worker_transfer_task_queue_duration_us: 'Queue wait',
   process_cpu_seconds_total: 'CPU cores',
   process_resident_memory_bytes: 'Resident memory'
 }
@@ -935,6 +964,9 @@ const TRANSFER_LATENCY_PANELS = new Set([
   'transfer-snapshot-refresh-p99',
   'transfer-job-summary-flush-p99',
   'worker-transfer-execution-p99',
+  'worker-transfer-read-p99',
+  'worker-transfer-write-p99',
+  'worker-transfer-queue-p99',
   'fs-dir-probe-acquire'
 ])
 

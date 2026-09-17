@@ -180,8 +180,8 @@ export function submitTransfer(data) {
   return postV1('/v1/transfers', data)
 }
 
-export function fetchTransferStatus(jobId) {
-  return getV1(`/v1/transfers/${encodeURIComponent(jobId)}`)
+export function fetchTransferStatus(jobId, params = {}) {
+  return getV1(`/v1/transfers/${encodeURIComponent(jobId)}`, { params })
 }
 
 export async function cancelTransfer(jobId) {

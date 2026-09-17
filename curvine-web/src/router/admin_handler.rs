@@ -241,6 +241,14 @@ struct TransferListQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct TransferStatusQuery {
+    #[serde(default)]
+    page_size: Option<usize>,
+    #[serde(default)]
+    page_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct SubmitTransferRequest {
     #[serde(default)]
     kind: Option<String>,
@@ -521,6 +529,10 @@ const TRANSFER_SUBMIT_RPC_TIMEOUT_SECS: u64 = 30;
 const TRANSFER_CANCEL_RPC_TIMEOUT_SECS: u64 = 15;
 const TRANSFER_LIST_MAX_FETCH: usize = 1000;
 const TRANSFER_LIST_MAX_PAGES: usize = 5;
+// Upper bound on the task list returned with a transfer status response. A job
+// with batching/segmentation can own far more tasks than a page should carry,
+// so the detail view requests pages explicitly and follows `next_page_token`.
+const TRANSFER_STATUS_DEFAULT_PAGE_SIZE: usize = 100;
 const WEB_TRANSFER_SUBMITTER: &str = "curvine-web";
 
 fn auth_username() -> String {
@@ -1287,55 +1299,33 @@ fn extend_json_object(base: &mut Value, extra: &Value) {
     }
 }
 
-fn transfer_counter_fields(
-    summary: Option<&TransferTaskSummaryProto>,
-    state: TransferState,
-    total_size: i64,
-) -> Value {
-    if let Some(summary) = summary {
-        return json!({
+/// File counters for a transfer job payload.
+///
+/// Only a status response carries a `TransferTaskSummaryProto`. The list path
+/// serialises `TransferJobStatusProto`, which has no task summary, so its counts
+/// are reported as `null` rather than a fabricated single-file count — the UI
+/// renders `-` for unknown counts and real numbers once the detail view is open.
+fn transfer_counter_fields(summary: Option<&TransferTaskSummaryProto>) -> Value {
+    match summary {
+        Some(summary) => json!({
             "total_files": summary.pending + summary.running + summary.completed + summary.failed + summary.canceled + summary.stale,
             "completed_files": summary.completed,
             "failed_files": summary.failed,
             "running_files": summary.pending + summary.running,
             "pending_files": summary.pending,
             "loading_files": summary.running,
-        });
+            "completed_size": summary.completed_size,
+        }),
+        None => json!({
+            "total_files": Value::Null,
+            "completed_files": Value::Null,
+            "failed_files": Value::Null,
+            "running_files": Value::Null,
+            "pending_files": Value::Null,
+            "loading_files": Value::Null,
+            "completed_size": Value::Null,
+        }),
     }
-
-    let mut total_files = 0_u64;
-    let mut completed_files = 0_u64;
-    let mut failed_files = 0_u64;
-    let mut running_files = 0_u64;
-    let mut pending_files = 0_u64;
-    let mut loading_files = 0_u64;
-    if total_size > 0 {
-        total_files = 1;
-        match state {
-            TransferState::Completed => completed_files = 1,
-            TransferState::Failed | TransferState::PartialSuccess => failed_files = 1,
-            TransferState::Pending => {
-                pending_files = 1;
-                running_files = 1;
-            }
-            TransferState::Planning
-            | TransferState::Dispatching
-            | TransferState::Running
-            | TransferState::Canceling => {
-                loading_files = 1;
-                running_files = 1;
-            }
-            TransferState::Canceled => {}
-        }
-    }
-    json!({
-        "total_files": total_files,
-        "completed_files": completed_files,
-        "failed_files": failed_files,
-        "running_files": running_files,
-        "pending_files": pending_files,
-        "loading_files": loading_files,
-    })
 }
 
 fn transfer_task_payload(task: TransferTaskStatusProto) -> Value {
@@ -1395,10 +1385,7 @@ fn transfer_job_status_payload(status: TransferJobStatusProto) -> Value {
         "done": state.is_terminal(),
         "tasks": []
     });
-    extend_json_object(
-        &mut payload,
-        &transfer_counter_fields(None, state, progress.total_size),
-    );
+    extend_json_object(&mut payload, &transfer_counter_fields(None));
     payload
 }
 
@@ -1445,11 +1432,7 @@ fn transfer_status_payload(status: GetTransferStatusResponse) -> Value {
     });
     extend_json_object(
         &mut payload,
-        &transfer_counter_fields(
-            status.task_summary.as_ref(),
-            state,
-            status.progress.total_size,
-        ),
+        &transfer_counter_fields(status.task_summary.as_ref()),
     );
     payload
 }
@@ -1484,7 +1467,7 @@ fn transfer_submit_payload(
         "done": state.is_terminal(),
         "tasks": []
     });
-    extend_json_object(&mut payload, &transfer_counter_fields(None, state, 0));
+    extend_json_object(&mut payload, &transfer_counter_fields(None));
     payload
 }
 
@@ -3908,25 +3891,42 @@ async fn submit_transfer_v1(
     let client = instance.transfer_client()?;
     let response =
         with_job_timeout_secs(TRANSFER_SUBMIT_RPC_TIMEOUT_SECS, client.submit(command)).await?;
-    let payload =
-        match with_job_timeout_secs(TRANSFER_RPC_TIMEOUT_SECS, client.status(&response.job_id))
-            .await
-        {
-            Ok(status) => transfer_status_payload(status),
-            Err(_) => transfer_submit_payload(response, source_path, target_path, kind, submitter),
-        };
+    let payload = match with_job_timeout_secs(
+        TRANSFER_RPC_TIMEOUT_SECS,
+        client.status_page(
+            &response.job_id,
+            Some(TRANSFER_STATUS_DEFAULT_PAGE_SIZE as u32),
+            None,
+        ),
+    )
+    .await
+    {
+        Ok(status) => transfer_status_payload(status),
+        Err(_) => transfer_submit_payload(response, source_path, target_path, kind, submitter),
+    };
     Ok(api_success(payload))
 }
 
 async fn transfer_status_v1(
     Path(job_id): Path<String>,
+    Query(query): Query<TransferStatusQuery>,
     Extension(instance): Extension<Arc<AdminRouterHandler>>,
 ) -> FsResult<Json<Value>> {
     if job_id.trim().is_empty() {
         return err_box!("job_id is required");
     }
+    // `page_size = 0` asks for the summary only (no task rows), which is what the
+    // list polling path uses to avoid pulling every active job's task list.
+    let page_size = query
+        .page_size
+        .unwrap_or(TRANSFER_STATUS_DEFAULT_PAGE_SIZE)
+        .clamp(0, TRANSFER_LIST_MAX_FETCH);
     let client = instance.transfer_client()?;
-    let status = with_job_timeout_secs(TRANSFER_RPC_TIMEOUT_SECS, client.status(&job_id)).await?;
+    let status = with_job_timeout_secs(
+        TRANSFER_RPC_TIMEOUT_SECS,
+        client.status_page(&job_id, Some(page_size as u32), query.page_token),
+    )
+    .await?;
     Ok(api_success(transfer_status_payload(status)))
 }
 
@@ -3943,7 +3943,15 @@ async fn transfer_cancel_v1(
         client.cancel(&job_id, None),
     )
     .await?;
-    let status = with_job_timeout_secs(TRANSFER_RPC_TIMEOUT_SECS, client.status(&job_id)).await?;
+    let status = with_job_timeout_secs(
+        TRANSFER_RPC_TIMEOUT_SECS,
+        client.status_page(
+            &job_id,
+            Some(TRANSFER_STATUS_DEFAULT_PAGE_SIZE as u32),
+            None,
+        ),
+    )
+    .await?;
     Ok(api_success(transfer_status_payload(status)))
 }
 
@@ -3957,8 +3965,15 @@ async fn transfer_retry_v1(
     let client = instance.transfer_client()?;
     let response =
         with_job_timeout_secs(TRANSFER_SUBMIT_RPC_TIMEOUT_SECS, client.retry(&job_id)).await?;
-    let status =
-        with_job_timeout_secs(TRANSFER_RPC_TIMEOUT_SECS, client.status(&response.job_id)).await?;
+    let status = with_job_timeout_secs(
+        TRANSFER_RPC_TIMEOUT_SECS,
+        client.status_page(
+            &response.job_id,
+            Some(TRANSFER_STATUS_DEFAULT_PAGE_SIZE as u32),
+            None,
+        ),
+    )
+    .await?;
     Ok(api_success(transfer_status_payload(status)))
 }
 
@@ -4431,6 +4446,7 @@ mod job_state_filter_tests {
 #[cfg(test)]
 mod transfer_tests {
     use super::*;
+    use curvine_proto::TransferProgressProto;
 
     #[test]
     fn parses_transfer_kinds() {
@@ -4479,11 +4495,69 @@ mod transfer_tests {
             stale: 1,
             completed_size: 1024,
         };
-        let value = transfer_counter_fields(Some(&summary), TransferState::Running, 0);
+        let value = transfer_counter_fields(Some(&summary));
         assert_eq!(value["total_files"], 10);
         assert_eq!(value["completed_files"], 5);
         assert_eq!(value["failed_files"], 1);
         assert_eq!(value["running_files"], 3);
+        assert_eq!(value["completed_size"], 1024);
+    }
+
+    #[test]
+    fn transfer_counters_are_null_without_task_summary() {
+        let value = transfer_counter_fields(None);
+        for field in [
+            "total_files",
+            "completed_files",
+            "failed_files",
+            "running_files",
+            "pending_files",
+            "loading_files",
+            "completed_size",
+        ] {
+            assert!(value[field].is_null(), "{field} should be null");
+        }
+    }
+
+    #[test]
+    fn transfer_status_payload_maps_summary_and_page_token() {
+        let status = GetTransferStatusResponse {
+            job_id: "job-1".to_string(),
+            run_id: 7,
+            state: TransferState::Running as i32,
+            progress: TransferProgressProto {
+                loaded_size: 512,
+                total_size: 4096,
+                update_time: 10,
+                message: String::new(),
+            },
+            tasks: Vec::new(),
+            next_page_token: Some("100".to_string()),
+            kind: Some(TransferKind::Load as i32),
+            source_path: Some("/src".to_string()),
+            target_path: Some("/dst".to_string()),
+            submitter: Some("alice".to_string()),
+            tenant: Some(String::new()),
+            created_at: Some(1),
+            updated_at: Some(2),
+            owner: Some(String::new()),
+            lease_epoch: Some(0),
+            lease_expire_at: Some(0),
+            cv_metadata_epoch: Some(0),
+            task_summary: Some(TransferTaskSummaryProto {
+                pending: 1,
+                running: 2,
+                completed: 3,
+                failed: 4,
+                canceled: 0,
+                stale: 0,
+                completed_size: 2048,
+            }),
+        };
+        let value = transfer_status_payload(status);
+        assert_eq!(value["total_files"], 10);
+        assert_eq!(value["completed_size"], 2048);
+        assert_eq!(value["next_page_token"], "100");
     }
 
     #[test]
