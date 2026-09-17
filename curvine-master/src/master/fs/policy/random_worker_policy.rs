@@ -50,9 +50,7 @@ impl RandomWorkerPolicy {
         let available_workers: Vec<(&u32, &WorkerInfo)> = workers
             .iter()
             .filter(|(id, worker)| {
-                worker.is_live()
-                    && !exclude_workers.contains(id)
-                    && worker.available > min_available
+                !exclude_workers.contains(id) && worker.can_allocate(min_available)
             })
             .collect();
 

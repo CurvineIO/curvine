@@ -58,9 +58,8 @@ impl WorkerPolicy for LocalWorkerPolicy {
         for (id, worker) in workers {
             if !ctx.exclude_workers.contains(id)
                 && worker.address.is_local(&ctx.client_host)
-                && worker.available > ctx.block_size
+                && worker.can_allocate(ctx.block_size)
                 && worker.weight > 0
-                && worker.is_live()
             {
                 res.push(worker.address.clone());
                 ctx.exclude_workers.insert(*id);
