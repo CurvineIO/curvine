@@ -1519,6 +1519,9 @@ impl TransferStore for PostgresTransferStore {
             if let Some(mount_snapshot_attempts) = update.mount_snapshot_attempts {
                 job.mount_snapshot_attempts = mount_snapshot_attempts;
             }
+            if let Some(planning_attempts) = update.planning_attempts {
+                job.planning_attempts = planning_attempts;
+            }
             job.summary.message = update.message;
             job.summary.update_time = update.now_ms;
             job.updated_at = update.now_ms;

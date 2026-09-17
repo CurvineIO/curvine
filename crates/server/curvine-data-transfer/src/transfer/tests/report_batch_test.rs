@@ -49,6 +49,7 @@ fn running_store_for<S: TransferStore>(store: Arc<S>) -> (Arc<S>, TransferJobRec
         secret_ref_json: "{}".to_string(),
         cluster_snapshot_version: 1,
         mount_snapshot_attempts: 0,
+        planning_attempts: 0,
         cv_metadata_epoch: None,
         state: TransferState::Pending,
         owner: String::new(),
@@ -61,7 +62,6 @@ fn running_store_for<S: TransferStore>(store: Arc<S>) -> (Arc<S>, TransferJobRec
         tenant: "test".to_string(),
         created_at: 1,
         updated_at: 1,
-        planning_attempts: 0,
     };
     store
         .create_or_get_by_request_id_checked(job.clone())

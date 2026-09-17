@@ -656,14 +656,16 @@ impl TransferStore for SqliteTransferStore {
             .execute(
                 "update transfer_jobs
                  set state = ?1, owner = '', lease_expire_at = ?2, summary_json = ?3,
-                     mount_snapshot_attempts = coalesce(?4, mount_snapshot_attempts), updated_at = ?5
-                 where job_id = ?6 and run_id = ?7 and owner = ?8 and lease_epoch = ?9
-                   and lease_expire_at > ?5 and state = ?10",
+                     mount_snapshot_attempts = coalesce(?4, mount_snapshot_attempts),
+                     planning_attempts = coalesce(?5, planning_attempts), updated_at = ?6
+                 where job_id = ?7 and run_id = ?8 and owner = ?9 and lease_epoch = ?10
+                   and lease_expire_at > ?6 and state = ?11",
                 params![
                     TransferState::Pending as i32,
                     update.next_attempt_at_ms,
                     summary,
                     update.mount_snapshot_attempts.map(i64::from),
+                    update.planning_attempts.map(i64::from),
                     update.now_ms,
                     update.job_id,
                     update.run_id as i64,

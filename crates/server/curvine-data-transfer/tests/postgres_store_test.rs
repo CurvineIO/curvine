@@ -130,6 +130,7 @@ fn transfer_job(id: &str, target_path: &str) -> TransferJobRecord {
         secret_ref_json: "{}".to_string(),
         cluster_snapshot_version: 1,
         mount_snapshot_attempts: 0,
+        planning_attempts: 0,
         cv_metadata_epoch: None,
         state: TransferState::Pending,
         owner: String::new(),
@@ -658,6 +659,7 @@ fn postgres_store_keeps_conflicting_requests_pending_and_persists_snapshot_retri
             message: "mount snapshot refresh delayed".to_string(),
             next_attempt_at_ms: 30,
             mount_snapshot_attempts: Some(1),
+            planning_attempts: Some(1),
             now_ms: 25,
         })
         .unwrap());

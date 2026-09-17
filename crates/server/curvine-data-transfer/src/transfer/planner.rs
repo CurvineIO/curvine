@@ -1031,6 +1031,7 @@ mod tests {
             secret_ref_json: "{}".to_string(),
             cluster_snapshot_version: 0,
             mount_snapshot_attempts: 0,
+            planning_attempts: 0,
             cv_metadata_epoch: None,
             state: TransferState::Pending,
             owner: String::new(),
@@ -1043,7 +1044,6 @@ mod tests {
             tenant: String::new(),
             created_at: 0,
             updated_at: 0,
-            planning_attempts: 0,
         }
     }
 

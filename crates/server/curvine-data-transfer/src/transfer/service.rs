@@ -211,6 +211,7 @@ where
             secret_ref_json: "{}".to_string(),
             cluster_snapshot_version: 0,
             mount_snapshot_attempts: 0,
+            planning_attempts: 0,
             cv_metadata_epoch: None,
             state: TransferState::Pending,
             owner: String::new(),
@@ -223,7 +224,6 @@ where
             tenant: command.tenant,
             created_at: now_ms,
             updated_at: now_ms,
-            planning_attempts: 0,
         };
         let job = self.store.create_or_get_by_request_id(job)?;
         record_submit_metric(kind, "accepted");
