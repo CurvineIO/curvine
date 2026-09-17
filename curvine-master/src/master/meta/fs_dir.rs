@@ -878,6 +878,24 @@ impl FsDir {
         Ok(status)
     }
 
+    /// Release one writer record registered by reopen. Idempotent: missing
+    /// files, directories and unknown clients succeed. Only the RocksDB
+    /// state is updated (no journal entry): complete carries the
+    /// authoritative snapshot, so a crash before complete replays to the
+    /// correct unfinished state either way.
+    pub fn close_writer(&mut self, inp: &InodePath, client_name: &str) -> FsResult<()> {
+        let mut inode = match inp.get_last_inode() {
+            Some(v) => v.clone(),
+            None => return Ok(()),
+        };
+        let Ok(file) = inode.as_file_mut() else {
+            return Ok(());
+        };
+        file.features.complete_write(client_name);
+        self.store.apply_reopen_file(&inode)?;
+        Ok(())
+    }
+
     pub(crate) fn block_inode_state(&self, block_id: i64) -> FsResult<BlockInodeState> {
         let file_id = InodeId::get_id(block_id);
         let inode = self.store.get_inode(file_id, None)?;

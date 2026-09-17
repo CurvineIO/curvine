@@ -483,6 +483,20 @@ impl MasterFilesystem {
         self.file_status_by_id(path, None)
     }
 
+    /// Release one writer record registered by OpenFile. Idempotent: missing
+    /// files, directories and unknown clients succeed. Only the RocksDB
+    /// state is updated (no journal entry): complete carries the
+    /// authoritative snapshot, so a crash before complete replays to the
+    /// correct unfinished state either way.
+    pub fn close_file<T: AsRef<str>>(&self, path: T, client_name: &str) -> FsResult<()> {
+        let path = path.as_ref();
+        let mut fs_dir = self.fs_dir.write();
+        let Ok(inp) = Self::resolve_path(&fs_dir, path) else {
+            return Ok(());
+        };
+        fs_dir.close_writer(&inp, client_name)
+    }
+
     pub fn file_status_by_id<T: AsRef<str>>(
         &self,
         path: T,

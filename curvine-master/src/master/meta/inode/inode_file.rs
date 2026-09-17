@@ -341,7 +341,7 @@ impl InodeFile {
         &mut self,
         len: i64,
         commit_blocks: &[CommitBlock],
-        client_name: impl AsRef<str>,
+        _client_name: impl AsRef<str>,
         only_flush: bool,
     ) -> FsResult<()> {
         for block in commit_blocks {
@@ -369,7 +369,12 @@ impl InodeFile {
         self.atime = mtime;
         self.update_ctime(mtime);
         if !only_flush {
-            self.features.complete_write(client_name);
+            // A real complete finalizes the contents: drop every writer
+            // record, not just the caller's. Leftover records (writers that
+            // never closed, e.g. crashed segment workers) would otherwise
+            // pin is_complete=false forever. Callers guarantee quiescence
+            // (transfer finalizes only after all segments reported).
+            self.features.clear_writing();
         }
         Ok(())
     }

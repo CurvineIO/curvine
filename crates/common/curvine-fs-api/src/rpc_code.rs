@@ -84,6 +84,7 @@ pub enum RpcCode {
     SetWorkerStatus = 55,
     ListJobStatus = 56,
     ReportTransferTaskBatch = 57,
+    CloseFile = 58,
 
     MetricsReport = 60,
 

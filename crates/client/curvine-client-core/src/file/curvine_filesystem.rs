@@ -175,6 +175,41 @@ impl CurvineFileSystem {
         ))
     }
 
+    /// Release the writer record registered by OpenFile. See
+    /// FsClient::close_file for idempotency guarantees.
+    pub async fn close_file(&self, path: &Path) -> FsResult<()> {
+        self.fs_client.close_file(path).await
+    }
+
+    /// Release the writer record registered under an explicit name (paired
+    /// with [`CurvineFileSystem::open_existing_for_write_as`]).
+    pub async fn close_file_as(&self, path: &Path, client_name: &str) -> FsResult<()> {
+        self.fs_client.close_file_as(path, client_name).await
+    }
+
+    /// Open an existing file for positional write under an explicit
+    /// writer-identity name. Each open must be paired with one
+    /// [`CurvineFileSystem::close_file_as`] using the same name; sharing one
+    /// name across concurrent writers breaks release accounting.
+    pub async fn open_existing_for_write_as(
+        &self,
+        path: &Path,
+        client_name: &str,
+    ) -> FsResult<FsWriter> {
+        let create_opts = self.create_opts_builder().create_parent(true).build();
+        let flags = OpenFlags::new_write_only();
+        let file_block = self
+            .fs_client
+            .open_with_opts_as(path, create_opts, flags, client_name)
+            .await?;
+        Ok(FsWriter::at(
+            self.fs_context.clone(),
+            path.clone(),
+            file_block,
+            0,
+        ))
+    }
+
     pub async fn open_with_opts(
         &self,
         path: &Path,

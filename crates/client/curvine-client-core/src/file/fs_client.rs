@@ -73,6 +73,7 @@ impl_with_client_context!(
     AddBlockRequest,
     AddBlocksBatchRequest,
     AssignWorkerRequest,
+    CloseFileRequest,
     CompleteFileRequest,
     CompleteFilesBatchRequest,
     CreateFileRequest,
@@ -238,15 +239,49 @@ impl FsClient {
         opts: CreateFileOpts,
         flags: OpenFlags,
     ) -> FsResult<FileBlocks> {
+        self.open_with_opts_as(path, opts, flags, &self.context.clone_client_name())
+            .await
+    }
+
+    /// Open with an explicit writer-identity name. Paired with
+    /// [`FsClient::close_file_as`]: concurrent writers on one client must
+    /// use distinct names, otherwise one close releases them all.
+    pub async fn open_with_opts_as(
+        &self,
+        path: &Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+        client_name: &str,
+    ) -> FsResult<FileBlocks> {
         let header = OpenFileRequest {
             path: path.encode(),
-            opts: ProtoUtils::create_opts_to_pb(opts, self.context.clone_client_name()),
+            opts: ProtoUtils::create_opts_to_pb(opts, client_name.to_string()),
             flags: flags.value(),
             client_context: None,
         };
         let rep_header: OpenFileResponse = self.rpc(RpcCode::OpenFile, header).await?;
         let status = ProtoUtils::file_blocks_from_pb(rep_header.file_blocks);
         Ok(status)
+    }
+
+    /// Release the writer record registered by OpenFile. Idempotent and
+    /// best-effort: callers ignore errors (master-side complete is the
+    /// authoritative cleanup).
+    pub async fn close_file(&self, path: &Path) -> FsResult<()> {
+        let name = self.context.clone_client_name();
+        self.close_file_as(path, &name).await
+    }
+
+    /// Release the writer record registered under an explicit name (paired
+    /// with an open that used the same name).
+    pub async fn close_file_as(&self, path: &Path, client_name: &str) -> FsResult<()> {
+        let header = CloseFileRequest {
+            path: path.encode(),
+            client_name: client_name.to_string(),
+            client_context: None,
+        };
+        let _rep: CloseFileResponse = self.rpc(RpcCode::CloseFile, header).await?;
+        Ok(())
     }
 
     pub async fn file_status(&self, path: &Path) -> FsResult<FileStatus> {

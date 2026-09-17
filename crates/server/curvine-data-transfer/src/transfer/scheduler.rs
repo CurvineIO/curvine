@@ -2250,9 +2250,9 @@ mod tests {
         let d0 = planning_retry_delay_ms(0, "job-a", 1_000_000);
         let d1 = planning_retry_delay_ms(1, "job-a", 1_000_000);
         let d2 = planning_retry_delay_ms(2, "job-a", 1_000_000);
-        assert!(d0 >= 1_000 && d0 < 2_000);
-        assert!(d1 >= 2_000 && d1 < 3_000);
-        assert!(d2 >= 4_000 && d2 < 5_000);
+        assert!((1_000..2_000).contains(&d0));
+        assert!((2_000..3_000).contains(&d1));
+        assert!((4_000..5_000).contains(&d2));
         // Same attempt, different timestamps spread out.
         assert_ne!(
             planning_retry_delay_ms(1, "job-a", 1_000_000),

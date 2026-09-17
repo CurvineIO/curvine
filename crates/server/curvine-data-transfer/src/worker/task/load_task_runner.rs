@@ -681,6 +681,15 @@ impl LoadTaskRunner {
         let mut reader = self.open_unified(&source_path).await?;
         reader.seek(plan.offset).await?;
 
+        // Hold a writer record for the data-copy window so concurrent
+        // readers see is_complete=false (paired close after flush below;
+        // master-side complete is authoritative for leftovers).
+        let write_guard = self.next_writer_name();
+        let _ = self
+            .fs
+            .open_existing_for_write_as(&target_path, &write_guard)
+            .await?;
+
         // Write this segment's bytes directly to its block via
         // BlockWriterRemote (bypasses FsWriter, whose complete/flush validates
         // the whole file - impossible for a partial segment write).
@@ -700,6 +709,8 @@ impl LoadTaskRunner {
             if self.task.is_cancel() {
                 info!("segment transfer task canceled: {}", self.log_context());
                 let _ = writer.cancel().await;
+                self.close_writer_record_as(&target_path, &write_guard)
+                    .await;
                 return self.finish_canceled().await;
             }
             let want = remaining.min(Self::READ_CHUNK_BYTES) as usize;
@@ -719,6 +730,8 @@ impl LoadTaskRunner {
         }
         if remaining != 0 {
             let _ = writer.cancel().await;
+            self.close_writer_record_as(&target_path, &write_guard)
+                .await;
             return err_box!(
                 "segment task {} short read: {} bytes missing",
                 self.task.info.task_id,
@@ -728,6 +741,8 @@ impl LoadTaskRunner {
         writer.flush().await?;
         writer.complete().await?;
         reader.complete().await?;
+        self.close_writer_record_as(&target_path, &write_guard)
+            .await;
 
         let progress = self.task.update_progress(written, plan.length, true);
         if let Err(err) = self.report_progress(progress).await {
@@ -762,14 +777,17 @@ impl LoadTaskRunner {
         total_len: i64,
     ) -> FsResult<Option<FileBlocks>> {
         if target_path.is_cv() {
-            match self.fs.open_existing_for_write(target_path).await {
+            // Existence check via get_status (no writer record); open is
+            // only used where a handle is actually needed below.
+            match self.fs.get_status(target_path).await {
                 // The file may have been created by a concurrent segment
                 // whose resize has not landed yet (create+resize are not
                 // atomic). Verify the pre-allocation before treating the
-                // target as ready instead of trusting open success alone.
-                Ok(_) => Ok(Some(
-                    self.ensure_segment_size(target_path, total_len).await?,
-                )),
+                // target as ready instead of trusting existence alone.
+                Ok(_) => {
+                    let blocks = self.ensure_segment_size(target_path, total_len).await?;
+                    Ok(Some(blocks))
+                }
                 Err(FsError::FileNotFound(_)) => {
                     let opts = CreateFileOptsBuilder::new()
                         .create_parent(true)
@@ -795,9 +813,10 @@ impl LoadTaskRunner {
                         // file. create+resize are not atomic, so verify the
                         // resize actually landed before treating the target as
                         // ready; otherwise re-apply it (review Required).
-                        Err(FsError::FileAlreadyExists(_)) => Ok(Some(
-                            self.ensure_segment_size(target_path, total_len).await?,
-                        )),
+                        Err(FsError::FileAlreadyExists(_)) => {
+                            let blocks = self.ensure_segment_size(target_path, total_len).await?;
+                            Ok(Some(blocks))
+                        }
                         Err(err) => Err(err),
                     }
                 }
@@ -807,6 +826,30 @@ impl LoadTaskRunner {
             // Non-CV target (unusual for segment tasks, but keep parity).
             self.create_unified(target_path).await.map(|_| None)
         }
+    }
+
+    /// Release the writer record registered under an explicit paired name.
+    async fn close_writer_record_as(&self, target_path: &Path, client_name: &str) {
+        if let Err(err) = self.fs.close_file_as(target_path, client_name).await {
+            warn!(
+                "close segment target writer record failed: task={} target={} err={}",
+                self.task.info.task_id,
+                target_path.full_path(),
+                err
+            );
+        }
+    }
+
+    /// Unique writer identity for one paired open/close. Sharing one name
+    /// across concurrent opens breaks release accounting (the master tracks
+    /// writers by name).
+    fn next_writer_name(&self) -> String {
+        static WRITER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        format!(
+            "{}-seg{}",
+            self.fs.fs_context().clone_client_name(),
+            WRITER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
     }
 
     /// Verify the target pre-allocation landed and re-apply the resize when
@@ -826,13 +869,18 @@ impl LoadTaskRunner {
         if blocks.status.len >= total_len && !blocks.block_locs.is_empty() {
             return Ok(blocks);
         }
-        let mut writer = self.fs.open_existing_for_write(target_path).await?;
+        let writer_name = self.next_writer_name();
+        let mut writer = self
+            .fs
+            .open_existing_for_write_as(target_path, &writer_name)
+            .await?;
         if total_len > 0 {
             writer
                 .resize(FileAllocOpts::with_truncate(total_len))
                 .await?;
         }
         writer.flush().await?;
+        self.close_writer_record_as(target_path, &writer_name).await;
         self.fs.get_block_locations(target_path).await
     }
 

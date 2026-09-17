@@ -234,6 +234,14 @@ impl MasterHandler {
         ctx.response(rep_header)
     }
 
+    pub fn close_file(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: CloseFileRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(header.path.to_string()), None);
+
+        self.fs.close_file(&header.path, &header.client_name)?;
+        ctx.response(CloseFileResponse {})
+    }
+
     pub fn delete0(&self, req_id: i64, header: DeleteRequest) -> FsResult<DeleteResult> {
         if self.check_is_retry(req_id)? {
             return Ok(DeleteResult::default());
@@ -1111,6 +1119,7 @@ impl MessageHandler for MasterHandler {
                 RpcCode::Mkdir => self.mkdir(ctx),
                 RpcCode::CreateFile => self.retry_check_create_file(ctx),
                 RpcCode::OpenFile => self.retry_check_open_file(ctx),
+                RpcCode::CloseFile => self.close_file(ctx),
                 RpcCode::FileStatus => self.file_status(ctx),
                 RpcCode::AddBlock => self.add_block(ctx),
                 RpcCode::CompleteFile => self.complete_file(ctx),

@@ -143,7 +143,6 @@ fn transfer_job(id: &str, target_path: &str) -> TransferJobRecord {
         tenant: "postgres-store-test".to_string(),
         created_at: 1,
         updated_at: 1,
-        planning_attempts: 0,
     }
 }
 

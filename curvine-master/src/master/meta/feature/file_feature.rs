@@ -58,6 +58,14 @@ impl FileFeature {
         }
     }
 
+    /// Drop every writer record. Complete means the file contents are final;
+    /// leftover records (crashed clients, writers that never closed) must not
+    /// pin is_complete=false forever. Callers must ensure no writer is still
+    /// active (transfer finalize runs only after all segments reported).
+    pub fn clear_writing(&mut self) {
+        let _ = self.file_write.take();
+    }
+
     pub fn set_writing(&mut self, client_name: String) {
         match &mut self.file_write {
             Some(f) => {
