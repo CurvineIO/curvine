@@ -29,8 +29,8 @@ spec:
       # Kubernetes YAML because Fluid Dataset mount options are string maps.
       # client.enable_unified_fs: "false"
       # fuse.write_back_cache: "true"
-      # fuse.entry_timeout_ms: "300000"
-      # fuse.attr_timeout_ms: "300000"
+      # fuse.entry_timeout: "300000"
+      # fuse.attr_timeout: "300000"
       # fuse.enable_meta_cache: "true"
       # fuse.meta_cache_timeout: "12h"
       # fuse.node_cache_timeout: "24h"

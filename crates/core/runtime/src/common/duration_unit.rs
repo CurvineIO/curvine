@@ -18,6 +18,7 @@ use crate::CommonResult;
 use serde::de::{Unexpected, Visitor};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
+use std::str::FromStr;
 use std::time::Duration;
 
 // The latest units supported are milliseconds, so DurationUnit saves the number of milliseconds.
@@ -103,6 +104,14 @@ impl DurationUnit {
             Ok(n) => Ok(DurationUnit::new((n * unit as f64) as u64)),
             Err(_) => err_box!("invalid duration string: {}", dur_str),
         }
+    }
+}
+
+impl FromStr for DurationUnit {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        DurationUnit::from_str(s).map_err(|e| e.to_string())
     }
 }
 
@@ -202,6 +211,14 @@ mod test {
             let res_dur: DurationUnit = DurationUnit::from_str(exp).unwrap();
             assert_eq!(res_dur.as_millis(), d.as_millis());
         }
+    }
+
+    #[test]
+    fn from_str_trait_parses_units() {
+        let parsed: DurationUnit = "90s".parse().unwrap();
+        assert_eq!(parsed.as_millis(), 90 * DurationUnit::SECONDS);
+        let millis: DurationUnit = "500".parse().unwrap();
+        assert_eq!(millis.as_millis(), 500);
     }
 
     #[test]
