@@ -224,6 +224,23 @@ impl TransferStore for TransferStoreBackend {
         })
     }
 
+    fn get_task_attempt_started_at(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        task_id: &str,
+    ) -> FsResult<Option<i64>> {
+        self.record_store_operation("get_task_attempt_started_at", || match self {
+            Self::Memory(store) => store.get_task_attempt_started_at(job_id, run_id, task_id),
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => store.get_task_attempt_started_at(job_id, run_id, task_id),
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => store.get_task_attempt_started_at(job_id, run_id, task_id),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.get_task_attempt_started_at(job_id, run_id, task_id),
+        })
+    }
+
     fn get_transfer_task_summary(
         &self,
         job_id: &str,

@@ -291,6 +291,11 @@ pub struct TransferJobRecord {
     pub tenant: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Consecutive retryable planning failures (UFS rate limiting, timeouts).
+    /// JSON-only; 0 means none (legacy rows). Appended at the tail per the
+    /// public-struct additive-evolution convention.
+    #[serde(default)]
+    pub planning_attempts: u32,
 }
 
 /// Multi-file batch manifest carried in a batch task's `source_read_plan_json`

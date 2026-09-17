@@ -247,6 +247,9 @@ pub struct TransferRequeueUpdate {
     /// Replaces the persisted mount snapshot retry count when this requeue is
     /// caused by a retryable metadata refresh failure.
     pub mount_snapshot_attempts: Option<u32>,
+    /// Replaces the persisted planning retry count when this requeue is
+    /// caused by a retryable planning failure (e.g. UFS rate limiting).
+    pub planning_attempts: Option<u32>,
     pub now_ms: i64,
 }
 

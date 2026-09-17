@@ -210,6 +210,7 @@ fn load_replicas_override_mount_and_service_defaults() {
         tenant: String::new(),
         created_at: 0,
         updated_at: 0,
+        planning_attempts: 0,
     };
     let mount = MountInfo {
         replicas: Some(2),

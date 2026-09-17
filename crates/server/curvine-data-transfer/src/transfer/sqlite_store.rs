@@ -34,7 +34,7 @@ use crate::transfer::{
     TransferTaskStateUpdate,
 };
 
-const TRANSFER_SCHEMA_VERSION: i64 = 3;
+const TRANSFER_SCHEMA_VERSION: i64 = 4;
 
 pub struct SqliteTransferStore {
     conn: Mutex<Connection>,
@@ -1172,7 +1172,7 @@ impl TransferStore for SqliteTransferStore {
                     report.task_id,
                     report.attempt_id as i64,
                     report.worker_id as i64,
-                    report.worker_session_id
+                    report.worker_session_id,
                 ],
             )
             .map_err(sqlite_err)?;
@@ -1181,6 +1181,25 @@ impl TransferStore for SqliteTransferStore {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    fn get_task_attempt_started_at(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        task_id: &str,
+    ) -> FsResult<Option<i64>> {
+        let conn = self.conn.lock();
+        let started: Option<i64> = conn
+            .query_row(
+                "select attempt_started_at from transfer_tasks
+                 where job_id = ?1 and run_id = ?2 and task_id = ?3",
+                params![job_id, run_id as i64, task_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_err)?;
+        Ok(started.filter(|started| *started > 0))
     }
 
     fn update_job_progress_summary(
@@ -1284,6 +1303,7 @@ fn create_base_tables(conn: &Connection) -> FsResult<()> {
             secret_ref_json text not null,
             cluster_snapshot_version integer not null,
             mount_snapshot_attempts integer not null default 0,
+            planning_attempts integer not null default 0,
             cv_metadata_epoch integer,
             state integer not null,
             owner text not null,
@@ -1355,7 +1375,7 @@ fn create_indexes(conn: &Connection) -> FsResult<()> {
 fn migrate_schema(conn: &Connection, version: i64) -> FsResult<()> {
     match version {
         1 => migrate_sqlite_schema_v1_to_v2(conn)?,
-        2 | 3 => {}
+        2..=4 => {}
         _ => {
             return Err(FsError::common(format!(
                 "Unsupported sqlite transfer schema version {}, expected {}",
@@ -1365,6 +1385,9 @@ fn migrate_schema(conn: &Connection, version: i64) -> FsResult<()> {
     }
     if version < 3 {
         migrate_sqlite_schema_v2_to_v3(conn)?;
+    }
+    if version < 4 {
+        migrate_sqlite_schema_v3_to_v4(conn)?;
     }
     if version != TRANSFER_SCHEMA_VERSION {
         conn.execute(
@@ -1385,6 +1408,19 @@ fn migrate_sqlite_schema_v2_to_v3(conn: &Connection) -> FsResult<()> {
     conn.execute(
         "alter table transfer_jobs
          add column mount_snapshot_attempts integer not null default 0",
+        [],
+    )
+    .map(|_| ())
+    .map_err(sqlite_err)
+}
+
+fn migrate_sqlite_schema_v3_to_v4(conn: &Connection) -> FsResult<()> {
+    if sqlite_column_exists(conn, "transfer_jobs", "planning_attempts")? {
+        return Ok(());
+    }
+    conn.execute(
+        "alter table transfer_jobs
+         add column planning_attempts integer not null default 0",
         [],
     )
     .map(|_| ())
@@ -1439,10 +1475,11 @@ fn insert_job(conn: &Connection, job: &TransferJobRecord) -> FsResult<()> {
         "insert into transfer_jobs (
             job_id, job_key, run_id, kind, source_path, target_path, command_json,
             mount_snapshot_json, secret_ref_json, cluster_snapshot_version, mount_snapshot_attempts,
+            planning_attempts,
             cv_metadata_epoch, state, owner, lease_epoch, lease_expire_at, cancel_requested, summary_json,
             client_request_id, submitter, tenant, created_at, updated_at
-        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                  ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                  ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
         params![
             job.job_id,
             job.job_key,
@@ -1455,6 +1492,7 @@ fn insert_job(conn: &Connection, job: &TransferJobRecord) -> FsResult<()> {
             job.secret_ref_json,
             job.cluster_snapshot_version as i64,
             job.mount_snapshot_attempts as i64,
+            job.planning_attempts as i64,
             job.cv_metadata_epoch.map(|v| v as i64),
             job.state as i32,
             job.owner,
@@ -1682,6 +1720,7 @@ fn job_select_sql(where_sql: &str) -> String {
     format!(
         "select job_id, job_key, run_id, kind, source_path, target_path, command_json,
                 mount_snapshot_json, secret_ref_json, cluster_snapshot_version, mount_snapshot_attempts,
+                planning_attempts,
                 cv_metadata_epoch, state, owner, lease_epoch, lease_expire_at, cancel_requested,
                 summary_json, client_request_id, submitter, tenant, created_at, updated_at
          from transfer_jobs {where_sql}"
@@ -1735,7 +1774,7 @@ fn lexicographic_successor(value: &str) -> Option<String> {
 }
 
 fn sqlite_job_row(row: &Row<'_>) -> rusqlite::Result<TransferJobRecord> {
-    let summary_json: String = row.get(17)?;
+    let summary_json: String = row.get(18)?;
     Ok(TransferJobRecord {
         job_id: row.get(0)?,
         job_key: row.get(1)?,
@@ -1748,18 +1787,19 @@ fn sqlite_job_row(row: &Row<'_>) -> rusqlite::Result<TransferJobRecord> {
         secret_ref_json: row.get(8)?,
         cluster_snapshot_version: row.get::<_, i64>(9)? as u64,
         mount_snapshot_attempts: row.get::<_, i64>(10)? as u32,
-        cv_metadata_epoch: row.get::<_, Option<i64>>(11)?.map(|v| v as u64),
-        state: TransferState::from(row.get::<_, i32>(12)?),
-        owner: row.get(13)?,
-        lease_epoch: row.get::<_, i64>(14)? as u64,
-        lease_expire_at: row.get(15)?,
-        cancel_requested: row.get::<_, i64>(16)? != 0,
+        planning_attempts: row.get::<_, i64>(11)? as u32,
+        cv_metadata_epoch: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
+        state: TransferState::from(row.get::<_, i32>(13)?),
+        owner: row.get(14)?,
+        lease_epoch: row.get::<_, i64>(15)? as u64,
+        lease_expire_at: row.get(16)?,
+        cancel_requested: row.get::<_, i64>(17)? != 0,
         summary: serde_json::from_str(&summary_json).unwrap_or_default(),
-        client_request_id: row.get(18)?,
-        submitter: row.get(19)?,
-        tenant: row.get(20)?,
-        created_at: row.get(21)?,
-        updated_at: row.get(22)?,
+        client_request_id: row.get(19)?,
+        submitter: row.get(20)?,
+        tenant: row.get(21)?,
+        created_at: row.get(22)?,
+        updated_at: row.get(23)?,
     })
 }
 

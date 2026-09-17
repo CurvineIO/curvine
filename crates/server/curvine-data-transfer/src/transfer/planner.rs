@@ -823,6 +823,7 @@ mod tests {
             tenant: String::new(),
             created_at: 0,
             updated_at: 0,
+            planning_attempts: 0,
         }
     }
 

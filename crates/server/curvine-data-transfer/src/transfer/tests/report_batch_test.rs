@@ -61,6 +61,7 @@ fn running_store_for<S: TransferStore>(store: Arc<S>) -> (Arc<S>, TransferJobRec
         tenant: "test".to_string(),
         created_at: 1,
         updated_at: 1,
+        planning_attempts: 0,
     };
     store
         .create_or_get_by_request_id_checked(job.clone())

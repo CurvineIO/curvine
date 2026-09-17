@@ -16,6 +16,7 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics as m};
 use curvine_model::TransferTaskCounts;
+use curvine_model::TransferTaskState;
 use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -40,6 +41,7 @@ pub struct TransferMetrics {
     pending_jobs: Gauge,
     tasks_pending: Gauge,
     tasks_running: Gauge,
+    tasks_canceled: Gauge,
     tasks_completed: Gauge,
     tasks_failed: Gauge,
     tasks_stale: Gauge,
@@ -188,6 +190,11 @@ impl TransferMetrics {
             tasks_stale: m::new_gauge(
                 "transfer_tasks_stale",
                 "Transfer tasks in Stale state across store (global observability)",
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            tasks_canceled: m::new_gauge(
+                "transfer_tasks_canceled",
+                "Transfer tasks in Canceled state across store (global observability)",
             )
             .map_err(|err| FsError::common(err.to_string()))?,
             cleanup_purged_total: m::new_counter(
@@ -452,6 +459,47 @@ impl TransferMetrics {
         self.tasks_completed.set(counts.completed as i64);
         self.tasks_failed.set(counts.failed as i64);
         self.tasks_stale.set(counts.stale as i64);
+        self.tasks_canceled.set(counts.canceled as i64);
+    }
+
+    /// Incremental task-state accounting between hourly full-scan
+    /// calibrations (set_task_counts). Cancel/purge drift is corrected by
+    /// the next calibration; gauges are approximate observability.
+    pub fn task_planned(&self, count: usize) {
+        self.tasks_pending.add(count as i64);
+    }
+
+    pub fn task_assigned(&self) {
+        self.tasks_pending.dec();
+        self.tasks_running.inc();
+    }
+
+    pub fn task_terminal(&self, state: TransferTaskState) {
+        self.tasks_running.dec();
+        match state {
+            TransferTaskState::Completed => self.tasks_completed.inc(),
+            TransferTaskState::Failed => self.tasks_failed.inc(),
+            TransferTaskState::Canceled => self.tasks_canceled.inc(),
+            _ => {}
+        }
+    }
+
+    /// Running→Stale (probe marked a missing attempt).
+    pub fn task_staled(&self) {
+        self.tasks_running.dec();
+        self.tasks_stale.inc();
+    }
+
+    /// Stale→Pending (redelivered after backoff).
+    pub fn task_stale_requeued(&self) {
+        self.tasks_stale.dec();
+        self.tasks_pending.inc();
+    }
+
+    /// Stale→Failed (retry budget exhausted).
+    pub fn task_stale_exhausted(&self) {
+        self.tasks_stale.dec();
+        self.tasks_failed.inc();
     }
 
     pub fn inc_cleanup_purged(&self, value: usize) {

@@ -526,6 +526,9 @@ impl TransferStore for MemoryTransferStore {
         if let Some(mount_snapshot_attempts) = update.mount_snapshot_attempts {
             job.mount_snapshot_attempts = mount_snapshot_attempts;
         }
+        if let Some(planning_attempts) = update.planning_attempts {
+            job.planning_attempts = planning_attempts;
+        }
         job.summary.message = update.message;
         job.summary.update_time = update.now_ms;
         job.updated_at = update.now_ms;
@@ -874,7 +877,23 @@ impl TransferStore for MemoryTransferStore {
         task.last_report_at = report.now_ms;
         task.stale_deadline_at = report.stale_deadline_at;
         task.updated_at = report.now_ms;
+        task.accepted_at_ms = report.accepted_at_ms;
+        task.first_byte_at_ms = report.first_byte_at_ms;
         Ok(true)
+    }
+
+    fn get_task_attempt_started_at(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        task_id: &str,
+    ) -> FsResult<Option<i64>> {
+        let inner = self.inner.lock();
+        Ok(inner
+            .tasks
+            .get(&(job_id.to_string(), run_id, task_id.to_string()))
+            .map(|task| task.attempt_started_at)
+            .filter(|started| *started > 0))
     }
 
     fn update_job_progress_summary(
@@ -985,6 +1004,7 @@ mod tests {
             secret_ref_json: "{}".to_string(),
             cluster_snapshot_version: 1,
             mount_snapshot_attempts: 0,
+            planning_attempts: 0,
             cv_metadata_epoch: None,
             state: TransferState::Pending,
             owner: String::new(),

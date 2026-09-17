@@ -149,6 +149,9 @@ impl InflightLedger {
 
 const PLANNING_REQUEUE_DELAY_MS: i64 = 1_000;
 const MOUNT_SNAPSHOT_MAX_RETRIES: u32 = 3;
+/// Max automatic retries for a retryable planning failure (rate limiting,
+/// timeouts). Budget: ~1s + 2s + 4s + 8s + jitter, then terminal failure.
+const PLANNING_LIST_MAX_RETRIES: u32 = 4;
 
 #[derive(Debug, PartialEq, Eq)]
 enum MountSnapshotFailureAction {
@@ -198,6 +201,61 @@ fn mount_snapshot_failure_action(attempts: u32) -> MountSnapshotFailureAction {
         retry_count: attempts.saturating_add(1),
         delay_ms: PLANNING_REQUEUE_DELAY_MS.saturating_mul(2_i64.saturating_pow(attempts)),
     }
+}
+
+/// Retryable planning failures get bounded exponential backoff instead of an
+/// immediate terminal failure (e.g. UFS rate limiting during list/stat).
+/// Returns the next attempt count, or None when the budget is exhausted.
+fn planning_retry_attempt(attempts: u32) -> Option<u32> {
+    if attempts >= PLANNING_LIST_MAX_RETRIES {
+        return None;
+    }
+    Some(attempts.saturating_add(1))
+}
+
+/// Backoff for a planning retry: base * 2^n plus jitter. Jitter spreads jobs
+/// that hit the same rate limiter so they do not retry in lockstep and
+/// amplify the limit.
+fn planning_retry_delay_ms(attempts: u32, job_key: &str, now_ms: i64) -> i64 {
+    let base = PLANNING_REQUEUE_DELAY_MS.saturating_mul(2_i64.saturating_pow(attempts.min(10)));
+    // Per-job entropy (hash) so a 429 burst hitting several planning workers
+    // does not retry in lockstep; wall-clock alone maps nearby failures to
+    // nearby retries.
+    let mut hash: u64 = 1469598103934665603;
+    for b in job_key.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    let jitter = (hash % (PLANNING_REQUEUE_DELAY_MS.max(1) as u64)) as i64;
+    base.saturating_add(jitter)
+        .saturating_add(now_ms.abs() % 64)
+}
+
+/// Whether a planning failure is worth an automatic retry. Structural errors
+/// (missing source, oversized directory, bad args) fail fast; only
+/// throttling/timeout/overload signals back off. Message matching is
+/// intentionally narrow: misclassifying permanent as retryable only delays
+/// the failure within a small bounded budget, while the reverse drops jobs
+/// that would succeed minutes later.
+fn is_planning_retryable(err: &FsError) -> bool {
+    use curvine_error::ErrorKind;
+    if matches!(
+        err.kind(),
+        ErrorKind::Timeout | ErrorKind::TransferOverloaded | ErrorKind::TransferStoreUnavailable
+    ) {
+        return true;
+    }
+    // UFS adapters surface OpenDAL throttling/timeout as a generic error
+    // (opendal_error wraps everything non-NotFound in FsError::common);
+    // match the stable upstream markers. OpenDAL 0.55 has no Timeout kind:
+    // TimeoutLayer emits Unexpected with these exact messages.
+    let msg = err.to_string();
+    msg.contains("RateLimited")
+        || msg.contains("TooManyRequests")
+        || msg.contains("too many requests")
+        || msg.contains("operation timeout reached")
+        || msg.contains("io timeout reached")
+        || msg.contains("io operation timeout reached")
 }
 
 use crate::transfer::{ClusterMetadataCache, TransferMetrics};
@@ -494,6 +552,7 @@ where
                                 message: format!("mount snapshot refresh delayed: {}", err),
                                 next_attempt_at_ms: now.saturating_add(delay_ms),
                                 mount_snapshot_attempts: Some(retry_count),
+                                planning_attempts: None,
                                 now_ms: now,
                             })?;
                             if requeued {
@@ -532,7 +591,7 @@ where
                         &[TransferState::Planning],
                         transfer_failure_message(
                             job.kind,
-                            "mount snapshot",
+                            "planning",
                             &job.source_path,
                             &job.target_path,
                             &err,
@@ -557,7 +616,7 @@ where
                         &[TransferState::Planning],
                         transfer_failure_message(
                             job.kind,
-                            "mount snapshot",
+                            "planning",
                             &job.source_path,
                             &job.target_path,
                             &err,
@@ -603,6 +662,7 @@ where
                     message: format!("planning delayed: {}", err),
                     next_attempt_at_ms: now.saturating_add(PLANNING_REQUEUE_DELAY_MS),
                     mount_snapshot_attempts: None,
+                    planning_attempts: None,
                     now_ms: now,
                 })?;
                 if requeued {
@@ -620,6 +680,65 @@ where
                     );
                 }
                 return Ok(());
+            }
+            Err(err) if is_planning_retryable(&err) => {
+                match planning_retry_attempt(job.planning_attempts) {
+                    Some(retry_count) => {
+                        let now = now_ms();
+                        let delay_ms =
+                            planning_retry_delay_ms(job.planning_attempts, &job.job_id, now);
+                        record_metric(|metrics| {
+                            metrics.inc_planning(transfer_kind_label(job.kind), "retry")
+                        });
+                        let requeued = self.store.requeue_transfer(TransferRequeueUpdate {
+                            job_id: job.job_id.clone(),
+                            run_id: job.run_id,
+                            owner: lease.owner.clone(),
+                            lease_epoch: lease.lease_epoch,
+                            message: format!(
+                                "planning throttled, retry {}/{}: {}",
+                                retry_count, PLANNING_LIST_MAX_RETRIES, err
+                            ),
+                            next_attempt_at_ms: now.saturating_add(delay_ms),
+                            mount_snapshot_attempts: None,
+                            planning_attempts: Some(retry_count),
+                            now_ms: now,
+                        })?;
+                        if requeued {
+                            info!(
+                                "transfer planning throttled job_id={} run_id={} kind={:?} tenant={} owner={} lease_epoch={} retry_count={} next_attempt_at_ms={} reason={}",
+                                job.job_id,
+                                job.run_id,
+                                job.kind,
+                                job.tenant,
+                                lease.owner,
+                                lease.lease_epoch,
+                                retry_count,
+                                now.saturating_add(delay_ms),
+                                err
+                            );
+                        }
+                        return Ok(());
+                    }
+                    None => {
+                        record_metric(|metrics| {
+                            metrics.inc_planning(transfer_kind_label(job.kind), "failure")
+                        });
+                        self.fail_transfer(
+                            &job,
+                            &lease,
+                            &[TransferState::Planning],
+                            transfer_failure_message(
+                                job.kind,
+                                "planning",
+                                &job.source_path,
+                                &job.target_path,
+                                &err,
+                            ),
+                        )?;
+                        return Err(err);
+                    }
+                }
             }
             Err(err) => {
                 record_metric(|metrics| {
@@ -767,7 +886,7 @@ where
                         &[TransferState::Dispatching],
                         transfer_failure_message(
                             job.kind,
-                            "dispatch",
+                            "planning",
                             &job.source_path,
                             &job.target_path,
                             &err,
@@ -1654,7 +1773,10 @@ where
     };
 
     match client.submit_load_task_response(load_task).await {
-        Ok(response) if response.accepted.unwrap_or(true) => Ok(true),
+        Ok(response) if response.accepted.unwrap_or(true) => {
+            record_metric(|metrics| metrics.task_assigned());
+            Ok(true)
+        }
         Ok(response) => {
             let reason = response.reject_reason.unwrap_or_default();
             warn!(
@@ -1724,6 +1846,10 @@ where
                 task.target_path,
                 err
             );
+            // The attempt is already committed Running (probe/stale recovery
+            // owns it from here); account for the Pending→Running move so the
+            // incremental gauges do not drift until calibration.
+            record_metric(|metrics| metrics.task_assigned());
             Ok(true)
         }
     }
@@ -1850,11 +1976,15 @@ fn transfer_kind_label(kind: curvine_model::TransferKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::is_planning_retryable;
     use super::mount_snapshot_failure_action;
+    use super::planning_retry_attempt;
+    use super::planning_retry_delay_ms;
     use super::scheduler_idle_interval;
     use super::InflightLedger;
     use super::MountSnapshotFailureAction;
     use super::MOUNT_SNAPSHOT_MAX_RETRIES;
+    use super::PLANNING_LIST_MAX_RETRIES;
     use curvine_model::WorkerInfo;
     use std::time::Duration;
 
@@ -1977,6 +2107,44 @@ mod tests {
             mount_snapshot_failure_action(MOUNT_SNAPSHOT_MAX_RETRIES),
             MountSnapshotFailureAction::Fail
         );
+    }
+
+    #[test]
+    fn planning_throttle_uses_bounded_backoff_with_jitter() {
+        assert_eq!(planning_retry_attempt(0), Some(1));
+        assert_eq!(planning_retry_attempt(PLANNING_LIST_MAX_RETRIES), None);
+        // Exponential growth with bounded per-job jitter.
+        let d0 = planning_retry_delay_ms(0, "job-a", 1_000_000);
+        let d1 = planning_retry_delay_ms(1, "job-a", 1_000_000);
+        let d2 = planning_retry_delay_ms(2, "job-a", 1_000_000);
+        assert!(d0 >= 1_000 && d0 < 2_000);
+        assert!(d1 >= 2_000 && d1 < 3_000);
+        assert!(d2 >= 4_000 && d2 < 5_000);
+        // Same attempt, different timestamps spread out.
+        assert_ne!(
+            planning_retry_delay_ms(1, "job-a", 1_000_000),
+            planning_retry_delay_ms(1, "job-a", 1_000_001)
+        );
+        // Same millisecond, different jobs spread out (no lockstep retries).
+        assert_ne!(
+            planning_retry_delay_ms(1, "job-a", 1_000_000),
+            planning_retry_delay_ms(1, "job-b", 1_000_000)
+        );
+    }
+
+    #[test]
+    fn planning_retryable_covers_throttle_signals_only() {
+        use curvine_error::FsError;
+        assert!(is_planning_retryable(&FsError::common(
+            "Failed to list directory x: RateLimited (persistent) at list"
+        )));
+        assert!(is_planning_retryable(&FsError::common(
+            "S3Error { code: \"TooManyRequests\" }"
+        )));
+        assert!(!is_planning_retryable(&FsError::file_not_found("/x")));
+        assert!(!is_planning_retryable(&FsError::common(
+            "Transfer target /x already exists and overwrite=false"
+        )));
     }
 
     #[test]

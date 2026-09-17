@@ -223,6 +223,7 @@ where
             tenant: command.tenant,
             created_at: now_ms,
             updated_at: now_ms,
+            planning_attempts: 0,
         };
         let job = self.store.create_or_get_by_request_id(job)?;
         record_submit_metric(kind, "accepted");
@@ -468,6 +469,9 @@ where
         };
         let accepted = self.store.update_task_report(report)?;
         if accepted && state.is_terminal() {
+            if let Ok(metrics) = TransferMetrics::get() {
+                metrics.task_terminal(state);
+            }
             let terminal_ms = req.progress.update_time;
             self.observe_task_phases(
                 &job_id,
@@ -763,6 +767,10 @@ where
         let state = envelope.state;
         let job_id = envelope.req.job_id.clone();
         let run_id = envelope.req.run_id;
+        let accepted_at_ms = envelope.req.accepted_at_ms.unwrap_or(0);
+        let first_byte_at_ms = envelope.req.first_byte_at_ms.unwrap_or(0);
+        let task_id = envelope.req.task_id.clone();
+        let terminal_ms = envelope.req.progress.update_time;
         let report = TransferTaskReport {
             job_id: envelope.req.job_id,
             run_id: envelope.req.run_id,
@@ -774,12 +782,26 @@ where
             progress: progress_from_proto(envelope.req.progress),
             now_ms,
             stale_deadline_at: now_ms.saturating_add(task_stale_timeout_ms),
-            accepted_at_ms: 0,
-            first_byte_at_ms: 0,
+            accepted_at_ms,
+            first_byte_at_ms,
         };
         let result = store.update_task_report(report);
         if matches!(&result, Ok(true)) {
-            dirty_jobs.mark(job_id, run_id);
+            dirty_jobs.mark(job_id.clone(), run_id);
+            if state.is_terminal() {
+                observe_task_phases_static(
+                    store,
+                    &job_id,
+                    run_id,
+                    &task_id,
+                    accepted_at_ms,
+                    first_byte_at_ms,
+                    terminal_ms,
+                );
+                if let Ok(metrics) = TransferMetrics::get() {
+                    metrics.task_terminal(state);
+                }
+            }
         }
         match envelope.reply {
             Some(reply) => {
@@ -875,6 +897,38 @@ fn record_submit_metric(kind: TransferKind, result: &str) {
 fn record_report_metric(result: &str) {
     if let Ok(metrics) = TransferMetrics::get() {
         metrics.inc_report(result);
+    }
+}
+
+/// Phase breakdown for reports processed on the queued path (the production
+/// default). Same rules as TransferService::observe_task_phases: skip when
+/// the worker omitted markers or the task row is gone; start <= 0 is unknown.
+#[allow(clippy::too_many_arguments)]
+fn observe_task_phases_static(
+    store: &impl TransferStore,
+    job_id: &str,
+    run_id: u64,
+    task_id: &str,
+    accepted_at_ms: i64,
+    first_byte_at_ms: i64,
+    terminal_ms: i64,
+) {
+    if accepted_at_ms <= 0 || first_byte_at_ms <= 0 {
+        return;
+    }
+    let Ok(Some(started)) = store.get_task_attempt_started_at(job_id, run_id, task_id) else {
+        return;
+    };
+    if started <= 0 {
+        return;
+    }
+    if let Ok(metrics) = TransferMetrics::get() {
+        metrics.observe_task_phase("dispatch_wait", accepted_at_ms.saturating_sub(started));
+        metrics.observe_task_phase(
+            "start_wait",
+            first_byte_at_ms.saturating_sub(accepted_at_ms),
+        );
+        metrics.observe_task_phase("transfer", terminal_ms.saturating_sub(first_byte_at_ms));
     }
 }
 
