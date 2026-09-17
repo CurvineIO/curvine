@@ -7,14 +7,16 @@ assignees: ''
 
 ---
 
-**Is your feature request related to a problem? Please describe.**
-A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]
+> **请使用中文填写本 issue。**
 
-**Describe the solution you'd like**
-A clear and concise description of what you want to happen.
+**这个功能需求与什么问题相关？请描述。**
+清晰简洁地描述问题是什么。例如：我一直因为 […] 而困扰……
 
-**Describe alternatives you've considered**
-A clear and concise description of any alternative solutions or features you've considered.
+**你期望的方案**
+清晰简洁地描述你想要的方案。
 
-**Additional context**
-Add any other context or screenshots about the feature request here.
+**你考虑过的替代方案**
+清晰简洁地描述你考虑过的替代方案或功能。
+
+**补充信息**
+在此处添加任何其他信息或截图。
