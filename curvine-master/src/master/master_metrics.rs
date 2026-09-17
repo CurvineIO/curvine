@@ -36,7 +36,7 @@ pub struct MasterMetrics {
     pub(crate) blocks_size_avg: Gauge,
     pub(crate) allocatable_capacity: Gauge,
     pub(crate) allocatable_available: Gauge,
-    pub(crate) scheduled_bytes: Gauge,
+    pub(crate) scheduled_bytes: GaugeVec,
 
     pub(crate) worker_num: GaugeVec,
 
@@ -119,9 +119,10 @@ impl MasterMetrics {
                 "allocatable_available",
                 "Available space eligible for new writes (Live workers only)",
             )?,
-            scheduled_bytes: m::new_gauge(
+            scheduled_bytes: m::new_gauge_vec(
                 "scheduled_bytes",
-                "In-flight allocations not yet reflected in heartbeat available space (Live workers)",
+                "In-flight allocations not yet reflected in heartbeat available space, labelled by live worker address",
+                &["worker_addr"],
             )?,
             worker_num: m::new_gauge_vec("worker_num", "The number of lived workers", &["tag"])?,
 
@@ -237,13 +238,11 @@ impl MasterMetrics {
             .set(filesystem_info.allocatable_capacity);
         self.allocatable_available
             .set(filesystem_info.allocatable_available);
-        self.scheduled_bytes.set(
-            filesystem_info
-                .live_workers
-                .iter()
-                .map(|worker| worker.scheduled_bytes.max(0))
-                .fold(0, i64::saturating_add),
-        );
+        for worker in &filesystem_info.live_workers {
+            self.scheduled_bytes
+                .with_label_values(&[worker.address.ip_addr.as_str()])
+                .set(worker.scheduled_bytes.max(0));
+        }
 
         if filesystem_info.block_num > 0 {
             let avg_size = filesystem_info.fs_used / filesystem_info.block_num;
