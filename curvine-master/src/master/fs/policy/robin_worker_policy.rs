@@ -65,10 +65,7 @@ impl WorkerPolicy for RobinWorkerPolicy {
                 );
             };
 
-            if !ctx.exclude_workers.contains(id)
-                && worker.available > ctx.block_size
-                && worker.is_live()
-            {
+            if !ctx.exclude_workers.contains(id) && worker.can_allocate(ctx.block_size) {
                 ctx.exclude_workers.insert(*id);
                 res.push(worker.address.clone())
             }
@@ -89,9 +86,13 @@ mod tests {
     use super::*;
 
     fn worker(id: u32) -> WorkerInfo {
-        let mut worker = WorkerInfo::default();
-        worker.address.worker_id = id;
-        worker
+        WorkerInfo {
+            address: WorkerAddress {
+                worker_id: id,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -117,5 +118,50 @@ mod tests {
                 .worker_id,
             2
         );
+    }
+
+    #[test]
+    fn choose_accepts_exact_allocatable_space() {
+        let policy = RobinWorkerPolicy::new();
+        let mut workers = IndexMap::new();
+        let mut w = worker(1);
+        w.available = 128;
+        w.scheduled_bytes = 0;
+        workers.insert(1, w);
+
+        assert_eq!(
+            policy
+                .choose(&workers, ChooseContext::with_num(1, 128, vec![]))
+                .unwrap()[0]
+                .worker_id,
+            1
+        );
+
+        workers.get_mut(&1).unwrap().scheduled_bytes = 128;
+        assert!(policy
+            .choose(&workers, ChooseContext::with_num(1, 128, vec![]))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn choose_zero_block_size_accepts_full_live_worker() {
+        let policy = RobinWorkerPolicy::new();
+        let mut workers = IndexMap::new();
+        let mut w = worker(1);
+        w.available = 0;
+        workers.insert(1, w);
+
+        assert_eq!(
+            policy
+                .choose(&workers, ChooseContext::with_num(1, 0, vec![]))
+                .unwrap()[0]
+                .worker_id,
+            1
+        );
+        assert!(policy
+            .choose(&workers, ChooseContext::with_num(1, 1, vec![]))
+            .unwrap()
+            .is_empty());
     }
 }

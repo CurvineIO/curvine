@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use crate::common::UfsFactory;
-use crate::master::fs::policy::ChooseContext;
 use crate::master::fs::MasterFilesystem;
 use crate::master::{JobContext, JobStore, TaskDetail};
 use curvine_config::ClientConf;
@@ -79,10 +78,9 @@ impl LoadJobRunner {
         }
     }
 
-    pub fn choose_worker(&self, block_size: i64) -> FsResult<WorkerAddress> {
-        let ctx = ChooseContext::with_num(1, block_size, vec![]);
+    pub fn choose_worker(&self, _block_size: i64) -> FsResult<WorkerAddress> {
         let worker_mgr = self.master_fs.worker_manager.read();
-        let workers = worker_mgr.choose_worker(ctx)?;
+        let workers = worker_mgr.choose_workers(1, vec![])?;
         if let Some(worker) = workers.first() {
             Ok(worker.clone())
         } else {
