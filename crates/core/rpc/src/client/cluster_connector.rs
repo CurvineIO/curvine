@@ -25,7 +25,7 @@ use log::{debug, warn};
 use prost::Message as PMessage;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // Cluster connection manager
 // 1. Request the master, automatically obtain the active master node, handle retries and master switching
@@ -252,12 +252,15 @@ impl ClusterConnector {
         // If the client returns that the current node is not the leader, we still perform polling and retry.
         // At this time, the server may be performing the master selection operation, and it is not advisable to fail directly to return.
         self.change_leader(Self::DEFAULT_LEADER_ID);
+        let sweep_start = Instant::now();
         let mut policy = self.retry_builder.build();
         let node_list = self.node_list(false);
         if node_list.is_empty() {
             let err = err_msg!("no nodes available in cluster");
             return Err(IOError::create(err).into());
         }
+        let node_count = node_list.len();
+        let mut last_failed_msgs: Vec<String> = Vec::new();
 
         while policy.attempt().await {
             let mut futures: Vec<_> = node_list
@@ -311,12 +314,19 @@ impl ClusterConnector {
                     warn!("{}", failed_msgs.join("; "));
                 }
             }
+            last_failed_msgs = failed_msgs;
         }
 
         let err = err_msg!(
-            "failed to determine after {} attempts: {:?}",
-            policy.count(),
-            last_error
+            "{}",
+            describe_determine_failure(
+                policy.count(),
+                node_count,
+                sweep_start.elapsed(),
+                self.rpc_timeout,
+                format!("{:?}", last_error),
+                &last_failed_msgs,
+            )
         );
         Err(IOError::create(err).into())
     }
@@ -360,5 +370,117 @@ impl Default for ClusterConnector {
     fn default() -> Self {
         let factory = ClientFactory::default();
         Self::new(factory)
+    }
+}
+
+/// Upper bound on per-node error lines carried into the terminal fan-out
+/// failure of [`ClusterConnector::rpc`].
+const DETERMINE_MAX_NODE_ERRORS: usize = 3;
+/// Upper bound on a single node error line; RPC errors can embed payloads.
+const DETERMINE_MAX_ERROR_CHARS: usize = 300;
+
+/// Human- and grep-friendly summary of a failed [`ClusterConnector::rpc`]
+/// fan-out.
+///
+/// The legacy prefix `failed to determine after {attempts} attempts` is
+/// preserved verbatim: dashboards and alerts grep for it. Everything after
+/// the colon is new: how many nodes the sweep covered, wall time, the
+/// configured per-RPC timeout, and the last sweep's per-node errors.
+pub(crate) fn describe_determine_failure(
+    attempts: u32,
+    nodes: usize,
+    elapsed: Duration,
+    rpc_timeout: Duration,
+    last_error: String,
+    failed_msgs: &[String],
+) -> String {
+    let shown: Vec<String> = failed_msgs
+        .iter()
+        .take(DETERMINE_MAX_NODE_ERRORS)
+        .map(|msg| truncate_error(msg, DETERMINE_MAX_ERROR_CHARS))
+        .collect();
+    let mut node_errors = shown.join("; ");
+    if failed_msgs.len() > DETERMINE_MAX_NODE_ERRORS {
+        if !node_errors.is_empty() {
+            node_errors.push_str("; ");
+        }
+        node_errors.push_str(&format!(
+            "...and {} more node error(s)",
+            failed_msgs.len() - DETERMINE_MAX_NODE_ERRORS
+        ));
+    }
+    format!(
+        "failed to determine after {} attempts: {} (swept {} node(s) in {:?}, rpc_timeout={:?}; node errors: [{}])",
+        attempts, last_error, nodes, elapsed, rpc_timeout, node_errors
+    )
+}
+
+fn truncate_error(msg: &str, max_chars: usize) -> String {
+    if msg.chars().count() > max_chars {
+        let truncated: String = msg.chars().take(max_chars).collect();
+        format!("{truncated}...")
+    } else {
+        msg.to_string()
+    }
+}
+
+#[cfg(test)]
+mod determine_failure_tests {
+    use super::{describe_determine_failure, truncate_error, ClientConf};
+    use std::time::Duration;
+
+    #[test]
+    fn message_keeps_legacy_prefix_and_reports_sweep() {
+        let msg = describe_determine_failure(
+            1,
+            3,
+            Duration::from_secs(120),
+            Duration::from_secs(120),
+            "Some(deadline has elapsed)".to_string(),
+            &["rpc(1) node 10.0.0.1:8000 is unavailable: timeout".to_string()],
+        );
+        assert!(
+            msg.starts_with("failed to determine after 1 attempts: "),
+            "legacy prefix must stay grep-compatible: {msg}"
+        );
+        assert!(msg.contains("swept 3 node(s)"), "{msg}");
+        assert!(msg.contains("rpc_timeout=120s"), "{msg}");
+        assert!(msg.contains("10.0.0.1:8000"), "{msg}");
+    }
+
+    #[test]
+    fn node_errors_are_capped_and_truncated() {
+        let msgs: Vec<String> = (0..5)
+            .map(|i| format!("node{i} {}", "x".repeat(500)))
+            .collect();
+        let msg = describe_determine_failure(
+            2,
+            5,
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+            "None".to_string(),
+            &msgs,
+        );
+        assert!(msg.contains("...and 2 more node error(s)"), "{msg}");
+        assert!(msg.len() < 5 * 500, "error lines must be truncated");
+    }
+
+    #[test]
+    fn truncate_error_keeps_char_boundaries() {
+        assert_eq!(truncate_error("abc", 10), "abc");
+        assert_eq!(truncate_error("abcdef", 3), "abc...");
+        // Multi-byte chars must not be split mid-codepoint.
+        assert_eq!(truncate_error("中文测试", 2), "中文...");
+    }
+
+    #[test]
+    fn retry_budget_covers_two_per_rpc_timeouts() {
+        // Industry rule of thumb: the total retry budget must cover at least
+        // two per-RPC timeouts. The first sweep pays the full timeout on
+        // every node to discover dead endpoints (e.g. half-open pooled
+        // connections to restarted servers) and ejects them; only a second
+        // sweep can then reconnect fast and succeed.
+        let conf = ClientConf::default();
+        assert_eq!(conf.io_retry_max_duration_ms, 2 * conf.rpc_timeout_ms);
     }
 }

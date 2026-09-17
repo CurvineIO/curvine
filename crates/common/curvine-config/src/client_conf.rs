@@ -428,7 +428,10 @@ impl Default for ClientConf {
             conn_retry_min_sleep_ms: 100,
             conn_retry_max_sleep_ms: 2 * 1000,
 
-            rpc_retry_max_duration_ms: 120 * 1000,
+            // Keep the retry budget at 2x rpc_timeout_ms (mirrors the RpcConf
+            // default): the first sweep pays the per-node timeout discovering
+            // dead endpoints; a second sweep is what actually recovers.
+            rpc_retry_max_duration_ms: 2 * 120 * 1000,
             rpc_retry_min_sleep_ms: 100,
             rpc_retry_max_sleep_ms: 10 * 1000,
 

@@ -93,7 +93,13 @@ impl Default for ClientConf {
             conn_retry_min_sleep_ms: 100,
             conn_retry_max_sleep_ms: 2 * 1000,
 
-            io_retry_max_duration_ms: 120 * 1000,
+            // Retry budget is 2x the per-RPC timeout on purpose: the first
+            // sweep pays the full per-node timeout to discover dead endpoints
+            // (e.g. half-open pooled connections to restarted servers) and
+            // ejects them; only a second sweep can then reconnect fast and
+            // succeed. A budget equal to one timeout makes blackhole retries
+            // exactly one sweep. See TimeBondedRetryBuilder.
+            io_retry_max_duration_ms: 2 * 120 * 1000,
             io_retry_min_sleep_ms: 100,
             io_retry_max_sleep_ms: 10 * 1000,
 
