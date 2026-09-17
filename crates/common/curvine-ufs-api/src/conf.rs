@@ -108,14 +108,11 @@ pub struct OpendalConf {
     pub read_timeout: Duration,
     pub retry_interval_ms: u64,
     pub retry_max_delay_ms: u64,
-    /// Per-request read buffer size (bytes) for the object reader. Also the size
-    /// of each concurrent range chunk when `read_concurrent > 1`. Internal
-    /// constant (not user-tunable); defaults to [`Self::DEFAULT_READ_CHUNK_SIZE`].
+    /// Per-request read buffer size (bytes) for random reads and each concurrent
+    /// sequential Range. Configured by [`Self::READ_CHUNK_SIZE`].
     pub read_chunk_size: usize,
-    /// Number of concurrent range requests issued against a single object while
-    /// reading. Internal constant (not user-tunable); defaults to
-    /// [`Self::DEFAULT_READ_CONCURRENT`]. Parallelism for large loads is driven
-    /// instead by the outer fan-out (`load_task.parallel_streams`).
+    /// Number of concurrent Range requests issued for sequential reads.
+    /// Configured by [`Self::READ_CONCURRENT`].
     pub read_concurrent: usize,
 }
 
@@ -256,6 +253,8 @@ impl OpendalConf {
     pub const READ_TIMEOUT: &'static str = "opendal.read_timeout";
     pub const RETRY_INTERVAL_MS: &'static str = "opendal.retry_interval_ms";
     pub const RETRY_MAX_DELAY_MS: &'static str = "opendal.retry_max_delay_ms";
+    pub const READ_CHUNK_SIZE: &'static str = "opendal.read_chunk_size";
+    pub const READ_CONCURRENT: &'static str = "opendal.read_concurrent";
 
     // Default values - using S3Conf defaults for consistency
     pub const DEFAULT_RETRY_TIMES: u32 = S3Conf::DEFAULT_RETRY_TIMES; // 3
@@ -263,8 +262,8 @@ impl OpendalConf {
     pub const DEFAULT_READ_TIMEOUT: &'static str = S3Conf::DEFAULT_READ_TIMEOUT; // "120s"
     pub const DEFAULT_RETRY_INTERVAL_MS: u64 = 1000; // 1 second
     pub const DEFAULT_RETRY_MAX_DELAY_MS: u64 = 10000; // 10 seconds
-    pub const DEFAULT_READ_CHUNK_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
-    pub const DEFAULT_READ_CONCURRENT: usize = 2; // 2 parallel range requests per object
+    pub const DEFAULT_READ_CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
+    pub const DEFAULT_READ_CONCURRENT: usize = 4; // 4 parallel range requests per object
 
     /// Create OpendalConf from configuration map
     pub fn from_map(properties: &HashMap<String, String>) -> CommonResult<Self> {
@@ -288,17 +287,24 @@ impl OpendalConf {
         let retry_max_delay_ms =
             map.get_u64_or(Self::RETRY_MAX_DELAY_MS, Self::DEFAULT_RETRY_MAX_DELAY_MS)?;
 
-        // read_chunk_size and read_concurrent are intentionally NOT user-tunable
-        // via mount properties: benchmarking showed the defaults saturate the
-        // link, and the outer parallel-load fan-out (load_task.parallel_streams)
-        // is the knob that matters. Kept as internal constants.
-        //
-        // NOTE: this is a silent behavior change. These used to be per-mount
-        // tunables (legacy keys `opendal.read_chunk_size_in_bytes` /
-        // `opendal.read_concurrent`). Existing mounts that still carry those keys
-        // are now ignored -- not rejected -- so the values below always win.
-        let read_chunk_size = Self::DEFAULT_READ_CHUNK_SIZE.max(1);
-        let read_concurrent = Self::DEFAULT_READ_CONCURRENT.max(1);
+        let read_chunk_size = usize::try_from(
+            map.get_u64_or(Self::READ_CHUNK_SIZE, Self::DEFAULT_READ_CHUNK_SIZE as u64)?,
+        )
+        .map_err(|_| {
+            curvine_core_error::CommonError::from(format!("{} is too large", Self::READ_CHUNK_SIZE))
+        })?;
+        if read_chunk_size == 0 {
+            return err_box!("{} must be greater than 0", Self::READ_CHUNK_SIZE);
+        }
+        let read_concurrent = usize::try_from(
+            map.get_u64_or(Self::READ_CONCURRENT, Self::DEFAULT_READ_CONCURRENT as u64)?,
+        )
+        .map_err(|_| {
+            curvine_core_error::CommonError::from(format!("{} is too large", Self::READ_CONCURRENT))
+        })?;
+        if read_concurrent == 0 {
+            return err_box!("{} must be greater than 0", Self::READ_CONCURRENT);
+        }
 
         Ok(Self {
             retry_times,
@@ -413,24 +419,34 @@ mod opendal_conf_tests {
         let conf = OpendalConf::from_map(&HashMap::new()).unwrap();
         assert_eq!(conf.read_chunk_size, OpendalConf::DEFAULT_READ_CHUNK_SIZE);
         assert_eq!(conf.read_concurrent, OpendalConf::DEFAULT_READ_CONCURRENT);
-        // Locks in the tuned defaults (16 MiB chunk, 2 concurrent range GETs).
-        assert_eq!(conf.read_chunk_size, 16 * 1024 * 1024);
-        assert_eq!(conf.read_concurrent, 2);
+        assert_eq!(conf.read_chunk_size, 1024 * 1024);
+        assert_eq!(conf.read_concurrent, 4);
     }
 
     #[test]
-    fn read_tuning_is_not_user_overridable() {
-        // read_chunk_size / read_concurrent are internal constants now: any mount
-        // property with those (legacy) keys must be ignored, not applied.
+    fn read_tuning_is_user_overridable() {
         let mut props = HashMap::new();
-        props.insert(
-            "opendal.read_chunk_size_in_bytes".to_string(),
-            "1024".to_string(),
-        );
+        props.insert("opendal.read_chunk_size".to_string(), "1024".to_string());
         props.insert("opendal.read_concurrent".to_string(), "32".to_string());
         let conf = OpendalConf::from_map(&props).unwrap();
-        assert_eq!(conf.read_chunk_size, OpendalConf::DEFAULT_READ_CHUNK_SIZE);
-        assert_eq!(conf.read_concurrent, OpendalConf::DEFAULT_READ_CONCURRENT);
+        assert_eq!(conf.read_chunk_size, 1024);
+        assert_eq!(conf.read_concurrent, 32);
+    }
+
+    #[test]
+    fn read_tuning_rejects_zero_and_invalid_values() {
+        for (key, value) in [
+            (OpendalConf::READ_CHUNK_SIZE, "0"),
+            (OpendalConf::READ_CONCURRENT, "0"),
+            (OpendalConf::READ_CHUNK_SIZE, "invalid"),
+            (OpendalConf::READ_CONCURRENT, "invalid"),
+        ] {
+            let props = HashMap::from([(key.to_string(), value.to_string())]);
+            assert!(
+                OpendalConf::from_map(&props).is_err(),
+                "{key}={value} should be rejected"
+            );
+        }
     }
 }
 
