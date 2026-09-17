@@ -28,7 +28,8 @@ use curvine_model::{
 };
 use curvine_runtime::common::LocalTime;
 use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -107,6 +108,91 @@ pub struct TransferPlanner {
     ufs_limiter: Arc<UfsEndpointLimiter>,
 }
 
+/// Max concurrent directory listings during planning collection.
+/// Bounds fan-out; per-endpoint pressure is still gated by UfsEndpointLimiter.
+const PLAN_LIST_CONCURRENCY: usize = 16;
+
+/// Hard cap on collected filesystem entries (files + directories). Listing
+/// memory is bounded independently of the task cap: batching collapses many
+/// files into one task, so a task-derived cap would both over- and
+/// under-count legal trees. Phase 2 still enforces max_tasks_per_transfer.
+const PLAN_ENTRY_CAP: usize = 300_000;
+
+/// One collected filesystem entry with its BFS position. Phase 2 sorts by
+/// (depth, seq) to replay the original serial BFS order, keeping task ids
+/// and batch boundaries deterministic.
+struct CollectedEntry {
+    depth: u32,
+    dir_ord: u64,
+    seq: u64,
+    status: FileStatus,
+    target_status: Option<FileStatus>,
+}
+
+/// Shared collection state for concurrent directory listing.
+struct CollectShared {
+    seq: AtomicU64,
+    dir_ord: AtomicU64,
+    count: AtomicUsize,
+    entries: Mutex<Vec<CollectedEntry>>,
+    sem: tokio::sync::Semaphore,
+    collect_limit: usize,
+    job_id: String,
+}
+
+/// One directory to list inside the collection JoinSet.
+#[derive(Clone)]
+struct CollectDirCtx {
+    source: Path,
+    target: Path,
+    mount: MountInfo,
+    dir: Path,
+    incremental_load: bool,
+    depth: u32,
+    /// Discovery ordinal of this directory (assigned by its parent when it
+    /// was listed). Children sort by (depth, dir_ord, child seq) so the
+    /// final order is deterministic regardless of list completion timing.
+    dir_ord: u64,
+}
+
+/// Record one entry, failing fast when the collection exceeds its cap.
+fn push_entry(
+    shared: &CollectShared,
+    depth: u32,
+    dir_ord: u64,
+    status: FileStatus,
+    target_status: Option<FileStatus>,
+) -> FsResult<()> {
+    let seq = shared.seq.fetch_add(1, Ordering::Relaxed);
+    let count = shared
+        .count
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    if count > shared.collect_limit {
+        return Err(FsError::common(format!(
+            "Transfer {} entries exceeds {} during listing",
+            shared.job_id, shared.collect_limit,
+        )));
+    }
+    shared.entries.lock().push(CollectedEntry {
+        depth,
+        dir_ord,
+        seq,
+        status,
+        target_status,
+    });
+    Ok(())
+}
+
+fn root_is_dir(shared: &CollectShared) -> bool {
+    shared
+        .entries
+        .lock()
+        .first()
+        .map(|e| e.status.is_dir)
+        .unwrap_or(false)
+}
+
 impl TransferPlanner {
     pub fn new(
         master_fs: CurvineFileSystem,
@@ -129,6 +215,132 @@ impl TransferPlanner {
     pub async fn plan(&self, job: &TransferJobRecord) -> FsResult<PlannedTransfer> {
         let mount = job_mount_snapshot_async(job, &self.cache).await?;
         self.plan_once(job, mount).await
+    }
+
+    /// Phase 1 of planning: concurrently list the source tree (the slow
+    /// network part) while task generation stays serial in phase 2.
+    /// Returns entries in arbitrary completion order; callers sort by
+    /// (depth, seq). Any listing failure aborts the whole collection, same
+    /// as the old serial loop. Collection is capped so a runaway directory
+    /// fails fast instead of buffering unbounded statuses.
+    async fn collect_tree(
+        &self,
+        job_id: &str,
+        root: CollectDirCtx,
+        root_status: FileStatus,
+        root_target: Option<FileStatus>,
+    ) -> FsResult<Vec<CollectedEntry>> {
+        let shared = Arc::new(CollectShared {
+            seq: AtomicU64::new(0),
+            dir_ord: AtomicU64::new(1),
+            count: AtomicUsize::new(0),
+            entries: Mutex::new(Vec::new()),
+            sem: tokio::sync::Semaphore::new(PLAN_LIST_CONCURRENCY),
+            collect_limit: PLAN_ENTRY_CAP,
+            job_id: job_id.to_string(),
+        });
+        push_entry(&shared, 0, 0, root_status, root_target)?;
+        let mut set = tokio::task::JoinSet::new();
+        if root_is_dir(&shared) {
+            let planner = self.clone();
+            let shared = shared.clone();
+            set.spawn(async move { planner.collect_dir(root, shared).await });
+        }
+        let mut first_err: Option<FsError> = None;
+        while let Some(res) = set.join_next().await {
+            let subdirs = match res {
+                Ok(Ok(subdirs)) => subdirs,
+                Ok(Err(err)) => {
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                    set.abort_all();
+                    continue;
+                }
+                Err(err) => {
+                    if first_err.is_none() {
+                        first_err = Some(FsError::common(format!(
+                            "planning list task failed: {}",
+                            err
+                        )));
+                    }
+                    set.abort_all();
+                    continue;
+                }
+            };
+            if first_err.is_none() {
+                for ctx in subdirs {
+                    let planner = self.clone();
+                    let shared = shared.clone();
+                    set.spawn(async move { planner.collect_dir(ctx, shared).await });
+                }
+            }
+        }
+        if let Some(err) = first_err {
+            return Err(err);
+        }
+        let entries = shared.entries.lock().drain(..).collect::<Vec<_>>();
+        Ok(entries)
+    }
+
+    /// List one directory and return its subdirectories for fan-out. Runs
+    /// inside the collection JoinSet with semaphore-bounded concurrency.
+    async fn collect_dir(
+        &self,
+        ctx: CollectDirCtx,
+        shared: Arc<CollectShared>,
+    ) -> FsResult<Vec<CollectDirCtx>> {
+        let _permit = shared
+            .sem
+            .acquire()
+            .await
+            .map_err(|_| FsError::common("Transfer planning is stopping; retry shortly"))?;
+        // Target-side children for incremental loads (same lookup the old
+        // serial loop did per directory). A missing target directory means
+        // nothing to skip: treat it as empty instead of failing planning
+        // (new trees and new subdirectories are legal in incremental loads).
+        let target_children: HashMap<String, FileStatus> = if ctx.incremental_load {
+            let target_path = append_relative_path(&ctx.source, &ctx.target, &ctx.dir)?;
+            match self.list_status(&target_path, &ctx.mount).await {
+                Ok(children) => children
+                    .into_iter()
+                    .map(|status| (status.name.clone(), status))
+                    .collect(),
+                Err(FsError::FileNotFound(_)) => HashMap::new(),
+                Err(err) => return Err(err),
+            }
+        } else {
+            HashMap::new()
+        };
+        let mut subdirs = Vec::new();
+        for child in self.list_status(&ctx.dir, &ctx.mount).await? {
+            let target_status = target_children.get(&child.name).cloned();
+            if child.is_dir {
+                let child_path = Path::from_str(&child.path)?;
+                // Assign the child directory its discovery ordinal serially
+                // inside the parent's listing, so sibling order is stable.
+                let child_ord = shared.dir_ord.fetch_add(1, Ordering::Relaxed);
+                push_entry(
+                    &shared,
+                    ctx.depth + 1,
+                    child_ord,
+                    child,
+                    target_status.clone(),
+                )?;
+                subdirs.push(CollectDirCtx {
+                    source: ctx.source.clone(),
+                    target: ctx.target.clone(),
+                    mount: ctx.mount.clone(),
+                    dir: child_path,
+                    incremental_load: ctx.incremental_load,
+                    depth: ctx.depth + 1,
+                    dir_ord: child_ord,
+                });
+            } else {
+                push_entry(&shared, ctx.depth + 1, ctx.dir_ord, child, target_status)?;
+            }
+        }
+        Ok(subdirs)
     }
 
     async fn plan_once(
@@ -167,26 +379,34 @@ impl TransferPlanner {
         let mut total_size = 0;
         let mut skipped_files = 0;
         let mut skipped_size = 0;
-        let mut stack = VecDeque::new();
-        stack.push_back((source_status, target_status));
+        // Phase 1 fans directory listing out to concurrent workers (the slow
+        // network part); phase 2 below walks the collected statuses in BFS
+        // order and generates tasks exactly as the old serial loop did, so
+        // task ids and batch boundaries are unchanged.
+        let mut collected = self
+            .collect_tree(
+                &job.job_id,
+                CollectDirCtx {
+                    source: source.clone(),
+                    target: target.clone(),
+                    mount: mount.clone(),
+                    dir: source.clone(),
+                    incremental_load,
+                    depth: 0,
+                    dir_ord: 0,
+                },
+                source_status,
+                target_status,
+            )
+            .await?;
+        collected.sort_by_key(|a| (a.depth, a.dir_ord, a.seq));
 
-        while let Some((status, target_status)) = stack.pop_front() {
+        for entry in collected {
+            let (status, target_status) = (entry.status, entry.target_status);
             let path = Path::from_str(&status.path)?;
             if status.is_dir {
-                let target_children = if incremental_load && target_status.is_some() {
-                    let target_path = append_relative_path(&source, &target, &path)?;
-                    self.list_status(&target_path, &mount)
-                        .await?
-                        .into_iter()
-                        .map(|status| (status.name.clone(), status))
-                        .collect()
-                } else {
-                    HashMap::new()
-                };
-                for child in self.list_status(&path, &mount).await? {
-                    let target_status = target_children.get(&child.name).cloned();
-                    stack.push_back((child, target_status));
-                }
+                // Directories only structure the walk; their children were
+                // collected as separate entries in phase 1.
                 continue;
             }
 
