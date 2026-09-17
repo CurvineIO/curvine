@@ -20,8 +20,9 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
 use curvine_model::{
-    TransferCommand, TransferJobRecord, TransferKind, TransferListFilter, TransferProgress,
-    TransferState, TransferTaskCounts, TransferTaskReport, TransferTaskState, TransferTaskStatus,
+    FileStatus, TransferCommand, TransferJobRecord, TransferKind, TransferListFilter,
+    TransferProgress, TransferState, TransferTaskCounts, TransferTaskReport, TransferTaskState,
+    TransferTaskStatus,
 };
 use curvine_proto::{
     ListTransferTenantsRequest, ListTransferTenantsResponse, ListTransfersRequest,
@@ -32,6 +33,7 @@ use curvine_proto::{
 };
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::common::SerdeUtils;
+use log::{info, warn};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -44,6 +46,9 @@ const JOB_SUMMARY_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 const TRANSFER_PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_LIST_PAGE_SIZE: usize = 20;
 const MAX_LIST_PAGE_SIZE: usize = 1000;
+/// Minimum interval between auto-repair retries for the same load job_key.
+/// Prevents submit storms when a broken CV target keeps failing to load.
+pub(crate) const AUTO_REPAIR_COOLDOWN_MS: i64 = 60 * 1000;
 
 type TransferStatusPage = (
     TransferJobRecord,
@@ -63,16 +68,22 @@ type TransferWatchPage = (
 
 pub struct TransferService<S> {
     store: Arc<S>,
+    cache: Option<ClusterMetadataCache>,
     task_stale_timeout_ms: i64,
     report_dispatcher: Option<TransferReportDispatcher<S>>,
+    /// job_key -> last auto-repair attempt time (ms).
+    /// Cooldown is per-process / per-replica, not shared across transfer instances.
+    auto_repair_last_attempt_ms: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 impl<S> Clone for TransferService<S> {
     fn clone(&self) -> Self {
         Self {
             store: self.store.clone(),
+            cache: self.cache.clone(),
             task_stale_timeout_ms: self.task_stale_timeout_ms,
             report_dispatcher: self.report_dispatcher.clone(),
+            auto_repair_last_attempt_ms: self.auto_repair_last_attempt_ms.clone(),
         }
     }
 }
@@ -84,17 +95,21 @@ where
     pub fn new(store: Arc<S>) -> Self {
         Self {
             store,
+            cache: None,
             task_stale_timeout_ms: 60_000,
             report_dispatcher: None,
+            auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn with_task_stale_timeout(store: Arc<S>, task_stale_timeout: Duration) -> Self {
         Self {
             store,
+            cache: None,
             task_stale_timeout_ms: i64::try_from(task_stale_timeout.as_millis())
                 .unwrap_or(i64::MAX),
             report_dispatcher: None,
+            auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -108,6 +123,7 @@ where
             i64::try_from(task_stale_timeout.as_millis()).unwrap_or(i64::MAX);
         Ok(Self {
             store: store.clone(),
+            cache: None,
             task_stale_timeout_ms,
             report_dispatcher: Some(TransferReportDispatcher::new(
                 store,
@@ -115,25 +131,28 @@ where
                 task_report_queue_size,
                 task_report_workers,
             )?),
+            auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     pub fn with_cache(
         store: Arc<S>,
-        _cache: ClusterMetadataCache,
+        cache: ClusterMetadataCache,
         task_stale_timeout: Duration,
     ) -> Self {
         Self {
             store,
+            cache: Some(cache),
             task_stale_timeout_ms: i64::try_from(task_stale_timeout.as_millis())
                 .unwrap_or(i64::MAX),
             report_dispatcher: None,
+            auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn with_cache_and_report_queue(
         store: Arc<S>,
-        _cache: ClusterMetadataCache,
+        cache: ClusterMetadataCache,
         task_stale_timeout: Duration,
         task_report_queue_size: usize,
         task_report_workers: usize,
@@ -142,6 +161,7 @@ where
             i64::try_from(task_stale_timeout.as_millis()).unwrap_or(i64::MAX);
         Ok(Self {
             store: store.clone(),
+            cache: Some(cache),
             task_stale_timeout_ms,
             report_dispatcher: Some(TransferReportDispatcher::new(
                 store,
@@ -149,10 +169,21 @@ where
                 task_report_queue_size,
                 task_report_workers,
             )?),
+            auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     pub fn submit_transfer(&self, req: SubmitTransferRequest) -> FsResult<TransferJobRecord> {
+        let job = self.submit_transfer_inner(req, true)?;
+        self.record_submit_accepted(&job);
+        Ok(job)
+    }
+
+    fn submit_transfer_inner(
+        &self,
+        req: SubmitTransferRequest,
+        allow_auto_repair: bool,
+    ) -> FsResult<TransferJobRecord> {
         validate_protocol_version(req.protocol_version)?;
         let kind = transfer_kind(req.kind)?;
         let client_request_id = if req.client_request_id.is_empty() {
@@ -229,9 +260,17 @@ where
             created_at: now_ms,
             updated_at: now_ms,
         };
-        let job = self.store.create_or_get_by_request_id(job)?;
-        record_submit_metric(kind, "accepted");
-        log::info!(
+        let job = self.store.create_or_get_by_request_id_checked(job)?;
+        if allow_auto_repair {
+            self.maybe_auto_repair_terminal_load(job)
+        } else {
+            Ok(job)
+        }
+    }
+
+    fn record_submit_accepted(&self, job: &TransferJobRecord) {
+        record_submit_metric(job.kind, "accepted");
+        info!(
             "transfer submit accepted job_id={} run_id={} kind={:?} tenant={} submitter={} source={} target={} state={:?}",
             job.job_id,
             job.run_id,
@@ -242,7 +281,139 @@ where
             job.target_path,
             job.state
         );
-        Ok(job)
+    }
+
+    /// When auto_cache reuses a stable client_request_id, a Completed/PartialSuccess Load can
+    /// leave behind an unusable CV cache target (`!is_complete` or `!cv_valid`). Re-submits
+    /// then keep returning that job and never reload. If the CV target is still invalid, retry
+    /// once (with cooldown) so load can repair the shell without racing an in-flight job.
+    ///
+    /// Failed/Canceled are intentionally excluded: callers should use explicit retry or a new
+    /// request id rather than treating same-id re-submit as an implicit retry.
+    fn maybe_auto_repair_terminal_load(
+        &self,
+        job: TransferJobRecord,
+    ) -> FsResult<TransferJobRecord> {
+        if !auto_repair_eligible(job.kind, job.state) {
+            return Ok(job);
+        }
+
+        let Some(cache) = &self.cache else {
+            return Ok(job);
+        };
+
+        let target = match Path::from_str(&job.target_path) {
+            Ok(path) => path,
+            Err(err) => {
+                warn!(
+                    "skip auto-repair for job {} target {}: invalid path: {}",
+                    job.job_id, job.target_path, err
+                );
+                return Ok(job);
+            }
+        };
+        if !target.is_cv() {
+            return Ok(job);
+        }
+
+        // Check cooldown before get_status so same-id storms do not hammer Master.
+        let now = now_ms();
+        {
+            let last_attempts = self
+                .auto_repair_last_attempt_ms
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            if let Some(last) = last_attempts.get(&job.job_key).copied() {
+                if auto_repair_in_cooldown(last, now) {
+                    info!(
+                        "skip auto-repair for job_key={} target={} due to cooldown ({} ms remaining)",
+                        job.job_key,
+                        job.target_path,
+                        AUTO_REPAIR_COOLDOWN_MS - now.saturating_sub(last)
+                    );
+                    return Ok(job);
+                }
+            }
+        }
+
+        let needs_repair = match cache.get_status_blocking(&target) {
+            Ok(status) if status.is_dir => {
+                info!(
+                    "skip auto-repair for job {} target {}: directory target is not auto-repaired",
+                    job.job_id, job.target_path
+                );
+                false
+            }
+            Ok(status) => cv_cache_target_needs_repair(&status),
+            Err(FsError::FileNotFound(_)) => true,
+            Err(err) => {
+                warn!(
+                    "skip auto-repair for job {} target {}: status check failed: {}",
+                    job.job_id, job.target_path, err
+                );
+                return Ok(job);
+            }
+        };
+        if !needs_repair {
+            return Ok(job);
+        }
+
+        // Another run for this job_key may already be repairing; do not burn cooldown.
+        let has_active_job = match self.store.has_active_transfer_by_key(&job.job_key) {
+            Ok(active) => active,
+            Err(err) => {
+                warn!(
+                    "skip auto-repair for job_key={} target={}: active job lookup failed: {}",
+                    job.job_key, job.target_path, err
+                );
+                return Ok(job);
+            }
+        };
+        if has_active_job {
+            info!(
+                "skip auto-repair for job_key={} target={}: active transfer already running",
+                job.job_key, job.target_path
+            );
+            return Ok(job);
+        }
+
+        {
+            let now = now_ms();
+            let mut last_attempts = self
+                .auto_repair_last_attempt_ms
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            // Re-check under write lock in case another submit raced past the early check.
+            if let Some(last) = last_attempts.get(&job.job_key).copied() {
+                if auto_repair_in_cooldown(last, now) {
+                    info!(
+                        "skip auto-repair for job_key={} target={} due to cooldown ({} ms remaining)",
+                        job.job_key,
+                        job.target_path,
+                        AUTO_REPAIR_COOLDOWN_MS - now.saturating_sub(last)
+                    );
+                    return Ok(job);
+                }
+            }
+            last_attempts.retain(|_, ts| auto_repair_in_cooldown(*ts, now));
+            last_attempts.insert(job.job_key.clone(), now);
+        }
+
+        info!(
+            "auto-repair completed load job_id={} state={:?} target={} still invalid; retrying",
+            job.job_id, job.state, job.target_path
+        );
+        match self.retry_transfer_inner(&job.job_id) {
+            Ok(repaired) => Ok(repaired),
+            Err(err) => {
+                // Concurrent submit may have won the race after our active-job check.
+                warn!(
+                    "auto-repair retry failed for job_id={} target={}: {}; returning original job",
+                    job.job_id, job.target_path, err
+                );
+                Ok(job)
+            }
+        }
     }
 
     pub fn check_store_available(&self) -> FsResult<()> {
@@ -256,6 +427,12 @@ where
     }
 
     pub fn retry_transfer(&self, job_id: &str) -> FsResult<TransferJobRecord> {
+        let job = self.retry_transfer_inner(job_id)?;
+        self.record_submit_accepted(&job);
+        Ok(job)
+    }
+
+    fn retry_transfer_inner(&self, job_id: &str) -> FsResult<TransferJobRecord> {
         let job = self.get_transfer(job_id)?;
         if !matches!(
             job.state,
@@ -273,16 +450,20 @@ where
 
         let mut command = decode_transfer_command(job.command_json.as_bytes())?;
         command.client_request_id = Uuid::new_v4().to_string();
-        self.submit_transfer(SubmitTransferRequest {
-            kind: command.kind as i32,
-            source_path: command.source_path.clone(),
-            target_path: command.target_path.clone(),
-            client_request_id: command.client_request_id.clone(),
-            submitter: command.submitter.clone(),
-            tenant: command.tenant.clone(),
-            command: encode_transfer_command(&command)?,
-            protocol_version: Some(TRANSFER_PROTOCOL_VERSION),
-        })
+        // Nested auto-repair must stay off: retry already opens a fresh request_id run.
+        self.submit_transfer_inner(
+            SubmitTransferRequest {
+                kind: command.kind as i32,
+                source_path: command.source_path.clone(),
+                target_path: command.target_path.clone(),
+                client_request_id: command.client_request_id.clone(),
+                submitter: command.submitter.clone(),
+                tenant: command.tenant.clone(),
+                command: encode_transfer_command(&command)?,
+                protocol_version: Some(TRANSFER_PROTOCOL_VERSION),
+            },
+            false,
+        )
     }
 
     pub fn get_transfer_status(
@@ -1207,6 +1388,30 @@ fn parse_page_token(page_token: Option<String>) -> FsResult<usize> {
 
 fn now_ms() -> i64 {
     i64::try_from(LocalTime::mills()).unwrap_or(i64::MAX)
+}
+
+/// Only Completed/PartialSuccess Load jobs are auto-repaired; Failed/Canceled need explicit retry.
+pub(crate) fn auto_repair_eligible(kind: TransferKind, state: TransferState) -> bool {
+    kind == TransferKind::Load
+        && matches!(
+            state,
+            TransferState::Completed | TransferState::PartialSuccess
+        )
+}
+
+pub(crate) fn auto_repair_in_cooldown(last_attempt_ms: i64, now_ms: i64) -> bool {
+    now_ms.saturating_sub(last_attempt_ms) < AUTO_REPAIR_COOLDOWN_MS
+}
+
+/// True when a CV cache path left by Load is not usable and should be reloaded.
+///
+/// Treat as invalid when the file is incomplete or `cv_valid(None)` fails
+/// (e.g. `ufs_mtime==0`, no CV copy / `StorageState::Ufs`, expired).
+pub(crate) fn cv_cache_target_needs_repair(status: &FileStatus) -> bool {
+    if status.is_dir {
+        return false;
+    }
+    !status.is_complete() || !status.cv_valid(None)
 }
 
 pub fn encode_transfer_command(command: &TransferCommand) -> FsResult<Vec<u8>> {

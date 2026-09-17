@@ -255,6 +255,10 @@ impl TransferStore for MysqlTransferStore {
         )
     }
 
+    fn has_active_transfer_by_key(&self, job_key: &str) -> FsResult<bool> {
+        Ok(select_non_terminal_job_by_key(&mut self.conn()?, job_key)?.is_some())
+    }
+
     fn find_conflicting_active_transfer(
         &self,
         target_path: &str,
@@ -1941,6 +1945,19 @@ fn select_job_by_request(
         "select record_json from transfer_jobs
          where submitter = :submitter and client_request_id = :client_request_id",
         params! { "submitter" => submitter, "client_request_id" => client_request_id },
+    )
+}
+
+fn select_non_terminal_job_by_key(
+    conn: &mut impl Queryable,
+    job_key: &str,
+) -> FsResult<Option<TransferJobRecord>> {
+    select_job(
+        conn,
+        "select record_json from transfer_jobs
+         where job_key = :job_key and state not in (6, 7, 8, 9)
+         limit 1",
+        params! { "job_key" => job_key },
     )
 }
 

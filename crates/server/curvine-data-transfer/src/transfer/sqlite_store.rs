@@ -117,6 +117,10 @@ impl TransferStore for SqliteTransferStore {
         collect_sqlite_rows(rows)
     }
 
+    fn has_active_transfer_by_key(&self, job_key: &str) -> FsResult<bool> {
+        Ok(select_non_terminal_job_by_key(&self.conn.lock(), job_key)?.is_some())
+    }
+
     fn find_conflicting_active_transfer(
         &self,
         target_path: &str,
@@ -1949,6 +1953,19 @@ fn select_job_by_request(
     conn.query_row(
         job_select_sql("where submitter = ?1 and client_request_id = ?2").as_str(),
         params![submitter, client_request_id],
+        sqlite_job_row,
+    )
+    .optional()
+    .map_err(sqlite_err)
+}
+
+fn select_non_terminal_job_by_key(
+    conn: &Connection,
+    job_key: &str,
+) -> FsResult<Option<TransferJobRecord>> {
+    conn.query_row(
+        job_select_sql("where job_key = ?1 and state not in (6, 7, 8, 9) limit 1").as_str(),
+        params![job_key],
         sqlite_job_row,
     )
     .optional()

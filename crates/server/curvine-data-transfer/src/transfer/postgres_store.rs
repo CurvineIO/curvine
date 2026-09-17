@@ -770,6 +770,20 @@ fn select_job_by_request(
     )
 }
 
+fn select_non_terminal_job_by_key(
+    conn: &mut impl GenericClient,
+    job_key: &str,
+) -> FsResult<Option<TransferJobRecord>> {
+    select_job(
+        conn,
+        "select record_json from transfer_jobs
+         where left(job_key, 255) = left($1, 255)
+           and job_key = $1 and state not in (6, 7, 8, 9)
+         limit 1",
+        &[&job_key],
+    )
+}
+
 fn select_conflicting_active_transfer(
     conn: &mut impl GenericClient,
     target_path: &str,
@@ -1179,6 +1193,11 @@ impl TransferStore for PostgresTransferStore {
             "select record_json from transfer_jobs where state not in (6, 7, 8, 9)",
             &[],
         )
+    }
+
+    fn has_active_transfer_by_key(&self, job_key: &str) -> FsResult<bool> {
+        let mut conn = self.conn()?;
+        Ok(select_non_terminal_job_by_key(&mut *conn, job_key)?.is_some())
     }
 
     fn find_conflicting_active_transfer(
