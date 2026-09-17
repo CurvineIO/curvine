@@ -85,13 +85,24 @@ pub(crate) fn supports_segment_grouping(workers: &[WorkerInfo]) -> bool {
             .all(|worker| worker.transfer_capabilities.supports_segment_group())
 }
 
+/// True when a group manifest can carry an identity the worker re-checks:
+/// an adapter-supplied immutable version, or the HEAD `(len, mtime)` pair from
+/// the same observation (the strongest thing an adapter without a version can
+/// offer, and the trust level `unchanged_load_target` already uses). The pair
+/// is minted only from HEAD so the worker compares like for like; without any
+/// identity the file falls back to single-segment tasks.
+pub(crate) fn has_group_identity(version: &str, head: Option<(i64, i64)>) -> bool {
+    !version.is_empty() || matches!(head, Some((len, mtime)) if len > 0 && mtime > 0)
+}
+
 /// Why a large file did or did not use segment-group tasks. Counted per
 /// file in `plan_once` so one job emits one info line instead of one log
 /// per file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SegmentSplitOutcome {
     Grouped,
-    NoVersion,
+    /// No immutable version and no HEAD `(len, mtime)` observation.
+    NoIdentity,
     NoCapability,
     Moved,
 }
@@ -581,7 +592,7 @@ impl TransferPlanner {
         // Per-file segment-group decisions; logged once per job below so
         // large directory scans do not emit one line per file.
         let mut grouped_files = 0usize;
-        let mut fallback_no_version = 0usize;
+        let mut fallback_no_identity = 0usize;
         let mut fallback_no_capability = 0usize;
         let mut fallback_moved = 0usize;
         // Phase 1 fans directory listing out to concurrent workers (the slow
@@ -665,7 +676,7 @@ impl TransferPlanner {
                         .await?;
                     match outcome {
                         Some(SegmentSplitOutcome::Grouped) => grouped_files += 1,
-                        Some(SegmentSplitOutcome::NoVersion) => fallback_no_version += 1,
+                        Some(SegmentSplitOutcome::NoIdentity) => fallback_no_identity += 1,
                         Some(SegmentSplitOutcome::NoCapability) => fallback_no_capability += 1,
                         Some(SegmentSplitOutcome::Moved) => fallback_moved += 1,
                         None => {}
@@ -715,12 +726,12 @@ impl TransferPlanner {
             self.push_batch_task(job, &source, &target, files, &mut tasks)?;
         }
 
-        if grouped_files + fallback_no_version + fallback_no_capability + fallback_moved > 0 {
+        if grouped_files + fallback_no_identity + fallback_no_capability + fallback_moved > 0 {
             log::info!(
-                "transfer {} segment split: grouped_files={} fallback_no_version={} fallback_no_capability={} fallback_moved={}",
+                "transfer {} segment split: grouped_files={} fallback_no_identity={} fallback_no_capability={} fallback_moved={}",
                 job.job_id,
                 grouped_files,
-                fallback_no_version,
+                fallback_no_identity,
                 fallback_no_capability,
                 fallback_moved
             );
@@ -760,13 +771,13 @@ impl TransferPlanner {
                 .await?;
             return Ok(None);
         }
-        // Immutable source identity (design D0.4): one HEAD observation for
-        // len/mtime/version together. Empty version, UFS-handle failure, or
-        // a length that moved since the LIST status below all mean
-        // unavailable/stale, and the file falls back to single segments.
-        // mtime comes from the same HEAD the worker re-reads: LIST and HEAD
-        // timestamps can disagree by truncation on S3-style stores.
-        let (fp_len, fp_mtime, source_version) = match self.factory.get_ufs(mount) {
+        // One HEAD observation for len/mtime/version together (design D0.4).
+        // A UFS-handle failure, or a length that moved since the walked LIST
+        // status, both mean the file cannot be grouped and falls back to one
+        // task per segment. mtime comes from the same HEAD the worker
+        // re-reads: LIST and HEAD timestamps can disagree by truncation on
+        // S3-style stores, so a stat identity is only minted from HEAD.
+        let (head_len, head_mtime, source_version) = match self.factory.get_ufs(mount) {
             Ok(ufs) => crate::common::ufs_object_fingerprint(&ufs, path).await,
             Err(err) => {
                 log::debug!(
@@ -777,25 +788,23 @@ impl TransferPlanner {
                 (0, 0, String::new())
             }
         };
-        if !source_version.is_empty() && fp_len != status.len {
+        if head_len > 0 && head_len != status.len {
             log::debug!(
                 "segment group source moved during planning for {}: list={} head={}",
                 path.full_path(),
                 status.len,
-                fp_len
+                head_len
             );
             self.push_single_task(job, path, task_target, status, replace_target, tasks)
                 .await?;
             return Ok(Some(SegmentSplitOutcome::Moved));
         }
-        // A verified HEAD mtime keeps planner/worker comparisons on one
-        // timestamp source; LIST mtimes may be truncated.
-        let source_mtime = match source_version.is_empty() {
-            true => status.mtime,
-            false => fp_mtime,
+        let head = match head_len > 0 && head_mtime > 0 {
+            true => Some((head_len, head_mtime)),
+            false => None,
         };
         let (plans, outcome) =
-            self.build_segment_plans(status, block_size, &source_version, source_mtime)?;
+            self.build_segment_plans(status, block_size, head, &source_version)?;
         if tasks.len().saturating_add(plans.len()) > self.max_tasks_per_transfer {
             return err_box!(
                 "Transfer {} files exceeds {}",
@@ -864,15 +873,16 @@ impl TransferPlanner {
         &self,
         status: &FileStatus,
         block_size: i64,
+        head: Option<(i64, i64)>,
         source_version: &str,
-        source_mtime: i64,
     ) -> FsResult<(Vec<(String, i64)>, SegmentSplitOutcome)> {
-        // No immutable identity (design D0.4) or no live capability proof
-        // (design §8#37): stay on single segments rather than risking a
-        // resume that skips rewritten source bytes.
-        if source_version.is_empty() {
+        // Grouping needs an identity a worker can re-check at execution time
+        // and a live capability proof (design §8#37). Without either, stay on
+        // single segments rather than risk a resume that skips rewritten
+        // source bytes or a task no worker can validate.
+        if !has_group_identity(source_version, head) {
             return build_single_segment_plans(status, block_size)
-                .map(|plans| (plans, SegmentSplitOutcome::NoVersion));
+                .map(|plans| (plans, SegmentSplitOutcome::NoIdentity));
         }
         let workers = match self.cache.live_workers() {
             Ok(workers) => workers,
@@ -885,6 +895,12 @@ impl TransferPlanner {
             return build_single_segment_plans(status, block_size)
                 .map(|plans| (plans, SegmentSplitOutcome::NoCapability));
         }
+        // Reaching here means the HEAD length matched the walked status, so
+        // `status.len` is the observed source length. mtime is only written
+        // when a HEAD observation produced it: a LIST-sourced mtime in the
+        // manifest would make the worker's HEAD re-check false-fire on stores
+        // where the two APIs disagree, and 0 tells the worker to skip it.
+        let source_mtime = head.map(|(_, mtime)| mtime).unwrap_or(0);
         self.build_segment_groups(
             status,
             block_size,

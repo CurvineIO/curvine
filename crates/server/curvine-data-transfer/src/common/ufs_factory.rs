@@ -15,6 +15,7 @@
 use crate::JobWorkerClient;
 use curvine_config::ClientConf;
 use curvine_error::FsResult;
+use curvine_fs_api::FileSystem;
 use curvine_fs_api::Path;
 use curvine_model::{MountInfo, WorkerAddress};
 use curvine_net::net::InetAddr;
@@ -27,27 +28,34 @@ use std::time::Duration;
 
 /// Immutable UFS object identity for Transfer group resume (design D0.4).
 /// Returns the backend version/etag when the adapter provides one, else
-/// empty. Only the Opendal family can yield an identity today; Local and
-/// other adapters report unavailable so planners fall back to single
-/// segments instead of treating len/mtime as content identity.
-pub async fn ufs_object_version(ufs: &UfsFileSystem, _path: &Path) -> String {
-    ufs_object_fingerprint(ufs, _path).await.2
+/// empty; callers that only need the identity must treat empty as
+/// unavailable and refuse to skip source bytes.
+pub async fn ufs_object_version(ufs: &UfsFileSystem, path: &Path) -> String {
+    ufs_object_fingerprint(ufs, path).await.2
 }
 
 /// Single-observation `(len, mtime_ms, version)` for one object; `(0, 0, "")`
 /// when unavailable. Planner and worker must both derive manifest/check
 /// fields from HEAD observations (never mix LIST mtime with HEAD mtime:
 /// S3-style stores truncate LIST timestamps and strict equality false-fires).
-pub async fn ufs_object_fingerprint(ufs: &UfsFileSystem, _path: &Path) -> (i64, i64, String) {
+pub async fn ufs_object_fingerprint(ufs: &UfsFileSystem, path: &Path) -> (i64, i64, String) {
     match ufs {
         #[cfg(feature = "opendal")]
         UfsFileSystem::Opendal(fs) => {
-            fs.object_fingerprint(_path)
+            fs.object_fingerprint(path)
                 .await
                 .unwrap_or((0, 0, String::new()))
         }
+        // Backends whose adapter supplies no version still expose one HEAD
+        // observation through `get_status`. OSS-HDFS reports a millisecond
+        // mtime identical to `listDir` (measured in production) and exposes
+        // neither etag nor version id in the JindoSDK C API, so the stat pair
+        // is the strongest identity available there.
         #[allow(unreachable_patterns)]
-        _ => (0, 0, String::new()),
+        _ => match ufs.get_status(path).await {
+            Ok(status) => (status.len, status.mtime, String::new()),
+            Err(_) => (0, 0, String::new()),
+        },
     }
 }
 

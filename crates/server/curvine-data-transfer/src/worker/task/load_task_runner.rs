@@ -766,14 +766,13 @@ impl LoadTaskRunner {
 
     async fn run_segment_group(&self) -> FsResult<bool> {
         let plan = parse_segment_group(&self.task.info.source_read_plan_json)?;
-        // FileStatus exposes len/mtime only.  Neither identifies immutable
-        // UFS content, so a persisted lower-bound cannot safely skip source
-        // ranges after retry.  Keep direct/manual group tasks fail-closed
-        // until adapters provide a version/snapshot contract that this worker
-        // can compare before resuming.
-        if !group_source_version_is_verifiable(&plan) {
+        // A group task skips source bytes on retry, so it must be able to
+        // re-identify the source it was planned against. Either an immutable
+        // version or a HEAD `(len, mtime)` pair is accepted; a manifest with
+        // neither is refused instead of resuming blind.
+        if !plan.has_identity() {
             return err_box!(
-                "segment group task {} is disabled: immutable source version validation is unavailable",
+                "segment group task {} is disabled: no source identity to validate",
                 self.task.info.task_id
             );
         }
@@ -886,11 +885,11 @@ impl LoadTaskRunner {
         source_path: &Path,
         plan: &SegmentGroupPlan,
     ) -> FsResult<()> {
-        // Immutable identity first (design D0.4): len/mtime are only
-        // diagnostic hints, never the resume gate.
-        if plan.source_version.is_empty() {
+        // Immutable identity first (design D0.4): a manifest must pin either
+        // a version or the HEAD stat pair before any byte may be skipped.
+        if !plan.has_identity() {
             return err_box!(
-                "segment group task {} has no source version; refusing resume",
+                "segment group task {} has no source identity; refusing resume",
                 self.task.info.task_id
             );
         }
@@ -898,41 +897,26 @@ impl LoadTaskRunner {
             // The planner only mints groups for UFS sources; a CV-sourced
             // group manifest cannot be identity-checked, so fail closed.
             return err_box!(
-                "segment group task {} source version is unverifiable for CV source",
+                "segment group task {} source identity is unverifiable for CV source",
                 self.task.info.task_id
             );
         }
         let ufs = self.get_ufs()?;
-        // One HEAD observation, same source the planner fingerprinted: the
-        // version decides, len is an exact second signal, mtime is only a
-        // diagnostic hint (kept strict here because both sides are HEAD).
+        // One HEAD observation, the same call the planner fingerprinted with:
+        // an immutable version must still match when the manifest pins one,
+        // otherwise the exact `(len, mtime)` pair from that single observation
+        // re-identifies the source. Both sides read HEAD, so an unchanged
+        // object compares equal (measured on OSS-HDFS: `listDir` and
+        // `getFileStatus` report the same millisecond mtime).
         let (len, mtime, live) = crate::common::ufs_object_fingerprint(&ufs, source_path).await;
-        if live.is_empty() {
+        if let Err(mismatch) = plan.verify_observation(len, mtime, &live) {
             return err_box!(
-                "segment group task {} source version unavailable; refusing resume",
-                self.task.info.task_id
-            );
-        }
-        if live != plan.source_version {
-            return err_box!(
-                "segment group task {} source changed: version mismatch",
-                self.task.info.task_id
-            );
-        }
-        if len != plan.total_len || len != plan.source_len {
-            return err_box!(
-                "segment group task {} source changed: len={} expected={}",
+                "segment group task {} source changed: {:?} len={} mtime={} version_present={}",
                 self.task.info.task_id,
+                mismatch,
                 len,
-                plan.total_len
-            );
-        }
-        if plan.source_mtime != 0 && mtime != plan.source_mtime {
-            return err_box!(
-                "segment group task {} source changed: mtime={} expected={}",
-                self.task.info.task_id,
                 mtime,
-                plan.source_mtime
+                !live.is_empty()
             );
         }
         Ok(())
@@ -2006,15 +1990,6 @@ async fn ensure_ufs_parent(ufs: &UfsFileSystem, path: &Path) -> FsResult<()> {
         }
     }
     Ok(())
-}
-
-fn group_source_version_is_verifiable(plan: &SegmentGroupPlan) -> bool {
-    // Design D0.4: resume may skip source bytes only against an immutable
-    // version/snapshot. No adapter exposes one yet (FileStatus=len/mtime),
-    // so production plans (empty version) stay fail-closed. E2E crafts a
-    // synthetic version with a test-held immutable source to exercise the
-    // mechanics; production enable still waits for the adapter contract.
-    !plan.source_version.is_empty()
 }
 
 fn xattr_equals(status: &FileStatus, key: &str, expected: &[u8]) -> bool {

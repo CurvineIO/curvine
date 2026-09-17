@@ -1,7 +1,7 @@
 use curvine_model::{
     check_transfer_plan_size, classify_transfer_plan, group_resume_remaining,
-    normalize_group_resume, parse_segment_group, segment_group_json, SegmentGroupPlan,
-    TransferPlanKind,
+    normalize_group_resume, parse_segment_group, segment_group_json, SegmentGroupMismatch,
+    SegmentGroupPlan, TransferPlanKind,
 };
 
 fn group() -> SegmentGroupPlan {
@@ -148,4 +148,69 @@ fn group_resume_remaining_reports_remaining_bytes() {
     assert_eq!(group_resume_remaining(&json, 200), (128, 256));
     assert_eq!(group_resume_remaining(&json, 384), (384, 0));
     assert_eq!(group_resume_remaining("bad", 200), (0, 0));
+}
+
+#[test]
+fn stat_identity_reidentifies_an_unchanged_source() {
+    // The default manifest carries a HEAD (len, mtime) pair and no version:
+    // this is the only identity an OSS-HDFS adapter can supply, so it must be
+    // enough to run and to resume.
+    let plan = group();
+    assert!(plan.has_stat_identity());
+    assert!(plan.has_identity());
+    assert_eq!(plan.verify_observation(512, 10, ""), Ok(()));
+}
+
+#[test]
+fn stat_identity_rejects_every_observable_change() {
+    let plan = group();
+    assert_eq!(
+        plan.verify_observation(511, 10, ""),
+        Err(SegmentGroupMismatch::LengthChanged)
+    );
+    assert_eq!(
+        plan.verify_observation(512, 11, ""),
+        Err(SegmentGroupMismatch::MtimeChanged)
+    );
+}
+
+#[test]
+fn version_identity_outranks_mtime_and_never_degrades() {
+    let mut plan = group();
+    plan.source_version = "etag-1".to_string();
+    // The pinned version still decides; a diagnostic mtime match is not enough
+    // when the backend swaps the object under the same mtime.
+    assert_eq!(
+        plan.verify_observation(512, 10, "etag-2"),
+        Err(SegmentGroupMismatch::VersionChanged)
+    );
+    assert_eq!(
+        plan.verify_observation(512, 10, ""),
+        Err(SegmentGroupMismatch::VersionUnavailable)
+    );
+    assert_eq!(plan.verify_observation(512, 10, "etag-1"), Ok(()));
+}
+
+#[test]
+fn manifest_without_identity_is_refused() {
+    let mut plan = group();
+    plan.source_len = 0;
+    plan.source_mtime = 0;
+    assert!(!plan.has_stat_identity());
+    assert!(!plan.has_identity());
+    assert_eq!(
+        plan.verify_observation(512, 10, ""),
+        Err(SegmentGroupMismatch::NoIdentity)
+    );
+}
+
+#[test]
+fn version_only_manifest_skips_the_mtime_gate() {
+    // Legacy manifests pin a version but no stat pair; they must keep working.
+    let mut plan = group();
+    plan.source_len = 512;
+    plan.source_mtime = 0;
+    plan.source_version = "etag-1".to_string();
+    assert!(plan.has_identity());
+    assert_eq!(plan.verify_observation(512, 999, "etag-1"), Ok(()));
 }

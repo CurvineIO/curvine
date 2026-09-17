@@ -267,15 +267,34 @@ fn group_planning_requires_a_nonempty_all_capable_worker_view() {
     use super::planner::supports_segment_grouping;
     use curvine_model::{TransferWorkerCapabilities, WorkerInfo};
 
+    fn capable() -> WorkerInfo {
+        WorkerInfo {
+            transfer_capabilities: TransferWorkerCapabilities::current(),
+            ..WorkerInfo::default()
+        }
+    }
+
     assert!(!supports_segment_grouping(&[]));
+    assert!(supports_segment_grouping(&[capable()]));
 
-    let mut current = WorkerInfo::default();
-    current.transfer_capabilities = TransferWorkerCapabilities::current();
-    assert!(supports_segment_grouping(&[current.clone()]));
-
-    let mut legacy = current;
+    let mut legacy = capable();
     legacy.transfer_capabilities.segment_group = false;
     assert!(!supports_segment_grouping(&[legacy]));
+}
+
+#[test]
+fn group_identity_accepts_a_version_or_a_complete_head_stat_pair() {
+    use super::planner::has_group_identity;
+
+    // Immutable version: identity regardless of the stat pair.
+    assert!(has_group_identity("etag", Some((10, 20))));
+    assert!(has_group_identity("etag", None));
+    // Version-less (OSS-HDFS): only a complete HEAD pair qualifies, and 0
+    // means "not observed" rather than a real length/mtime.
+    assert!(has_group_identity("", Some((10, 20))));
+    assert!(!has_group_identity("", Some((0, 20))));
+    assert!(!has_group_identity("", Some((10, 0))));
+    assert!(!has_group_identity("", None));
 }
 
 #[test]

@@ -721,3 +721,226 @@ fn e2e_a3a4_group_fail_closed_on_file() -> CommonResult<()> {
         Ok(())
     })
 }
+
+/// A3b: the identity production can actually supply. OSS-HDFS exposes no
+/// version/etag, so a group manifest carries only the HEAD `(len, mtime)`
+/// pair. file:// (Local) yields exactly that stat-only identity, so the
+/// production path is testable without S3: a version-less group must copy,
+/// land one block per segment, honour a non-zero resume floor, converge into a
+/// complete file, and refuse a drifted source.
+///
+/// Byte-level verification is deliberately left to the S3 full-stack E2E and
+/// staging: this MiniCluster does not serve block locations for files written
+/// by segment/group tasks (`locs` stays empty after commit), so a reader here
+/// sees "no available worker" for both write paths. The assertions therefore
+/// cover the identity gate and the committed layout, which is what this change
+/// alters.
+#[test]
+fn e2e_a3b_group_stat_identity_copies_and_resumes_on_file() -> CommonResult<()> {
+    let (cluster, base_dir) = e2e_cluster();
+    let rt = cluster.clone_client_rt();
+    let rt_inner = rt.clone();
+    rt.block_on(async move {
+        let fs = cluster.new_fs();
+        let ufs_dir = format!("{base_dir}/ufs-stat");
+        std::fs::create_dir_all(&ufs_dir)?;
+        let block_size = 1024 * 1024;
+        let total = 3 * block_size;
+        let payload: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        std::fs::write(format!("{ufs_dir}/src.bin"), &payload)?;
+
+        let ufs_root = Path::from_str(format!("file://{ufs_dir}"))?;
+        let mount_path = Path::from_str("/e2e-a3b")?;
+        let opts = curvine_model::MountOptions::builder()
+            .block_size(block_size)
+            .replicas(1)
+            .auto_cache(false)
+            .build();
+        fs.mount(&ufs_root, &mount_path, opts).await?;
+        let mount = fs
+            .get_mount_table()
+            .await?
+            .into_iter()
+            .find(|m| m.cv_path == "/e2e-a3b")
+            .unwrap();
+
+        let source = format!("file://{ufs_dir}/src.bin");
+        let target_full = "/e2e-a3b-out/full.bin".to_string();
+        let target_resume = "/e2e-a3b-out/resume.bin".to_string();
+        let factory = Arc::new(UfsFactory::with_rt(
+            &cluster.cluster_conf.client,
+            rt_inner.clone(),
+        ));
+        let src_status = factory
+            .get_ufs(&mount)?
+            .get_status(&Path::from_str(&source)?)
+            .await?;
+
+        // Version-less group covering all three blocks (group_len > one
+        // segment, so it stays a range manifest): the identity is stat-only,
+        // which is what the OSS-HDFS adapter can supply in production.
+        let plan = SegmentGroupPlan {
+            start_offset: 0,
+            end_offset: total,
+            total_len: total,
+            first_block_index: 0,
+            segment_bytes: block_size,
+            source_len: src_status.len,
+            source_mtime: src_status.mtime,
+            source_version: String::new(),
+        };
+        plan.validate()?;
+        assert!(plan.has_identity(), "HEAD len+mtime is a valid identity");
+        let plan_json = segment_group_json(&plan)?;
+        assert_eq!(
+            classify_transfer_plan(&plan_json),
+            TransferPlanKind::SegmentGroup
+        );
+        assert_eq!(
+            group_resume_remaining(&plan_json, block_size),
+            (block_size, plan.group_len() - block_size)
+        );
+
+        let make_ctx = |task_id: &str, src: &str, tgt: &str, plan_json: String, resume: i64| {
+            Arc::new(TaskContext::new(LoadTaskInfo {
+                job: e2e_job_info(
+                    "e2e-a3b",
+                    src,
+                    tgt,
+                    block_size,
+                    &mount,
+                    StorageType::default(),
+                ),
+                task_id: task_id.to_string(),
+                worker: WorkerAddress::default(),
+                source_path: src.to_string(),
+                target_path: tgt.to_string(),
+                create_time: 0,
+                source_read_plan_json: plan_json,
+                estimated_size: total,
+                transfer_report: Some(TransferTaskReportInfo {
+                    run_id: 1,
+                    attempt_id: 1,
+                    worker_id: 0,
+                    worker_session_id: "s".to_string(),
+                    report_target: String::new(),
+                    report_endpoints: Vec::new(),
+                    resume_loaded_size: resume,
+                }),
+            }))
+        };
+        let run_task = |ctx: Arc<TaskContext>| {
+            let fs = fs.clone();
+            let factory = factory.clone();
+            async move {
+                let runner = LoadTaskRunner::new(ctx, fs, factory, None, 10_000, 120_000);
+                runner.run().await
+            }
+        };
+        // A fresh client for observation: block locations are assigned while the
+        // group writes, so the writer's own cached layout still shows empty
+        // `locs`. In production the reader is a separate client.
+        let reader_fs = cluster.new_fs();
+        let layout = |tgt: String| {
+            let fs = reader_fs.clone();
+            async move { fs.get_block_locations(&Path::from_str(&tgt)?).await }
+        };
+        // The job's convergence protocol, exactly as the scheduler drives it.
+        let complete_target = |tgt: String| {
+            let fs = reader_fs.clone();
+            async move {
+                let target_path = Path::from_str(&tgt)?;
+                let blocks = fs.get_block_locations(&target_path).await?;
+                let commit: Vec<_> = blocks
+                    .block_locs
+                    .iter()
+                    .map(curvine_model::CommitBlock::from)
+                    .collect();
+                fs.fs_client()
+                    .complete_file_by_id(&target_path, blocks.status.id, total, commit, false, None)
+                    .await?;
+                fs.get_status(&target_path).await
+            }
+        };
+
+        // (1) A version-less manifest copies: one block per planned segment,
+        // and segments alone must not mark the file complete.
+        let _ = run_task(make_ctx(
+            "task-stat-full",
+            &source,
+            &target_full,
+            plan_json.clone(),
+            0,
+        ))
+        .await;
+        let blocks = layout(target_full.clone()).await?;
+        assert_eq!(blocks.block_locs.len(), 3, "one block per segment");
+        for block in &blocks.block_locs {
+            assert_eq!(block.block.len, block_size, "every segment must land");
+        }
+        assert_eq!(blocks.status.len, total);
+        assert!(
+            !blocks.status.is_complete(),
+            "segments alone must not mark the file complete"
+        );
+        let done = complete_target(target_full.clone()).await?;
+        assert!(done.is_complete() && done.len == total);
+
+        // (2) A non-zero resume floor is accepted and still lands the remaining
+        // segments under the same version-less identity. The skipped prefix is
+        // trusted, which is why the source is re-identified before any byte is
+        // skipped: a previous attempt that committed only block 0 is simulated
+        // with a single-segment task from another source.
+        let wrong: Vec<u8> = vec![0xAA; block_size as usize + 7];
+        std::fs::write(format!("{ufs_dir}/wrong.bin"), &wrong)?;
+        let wrong_source = format!("file://{ufs_dir}/wrong.bin");
+        let seg_json = serde_json::json!({
+            "segment": {
+                "offset": 0,
+                "length": block_size,
+                "total_len": total,
+                "block_index": 0
+            }
+        })
+        .to_string();
+        let _ = run_task(make_ctx(
+            "task-stat-block0",
+            &wrong_source,
+            &target_resume,
+            seg_json,
+            0,
+        ))
+        .await;
+        let _ = run_task(make_ctx(
+            "task-stat-resume",
+            &source,
+            &target_resume,
+            plan_json.clone(),
+            block_size,
+        ))
+        .await;
+        let blocks = layout(target_resume.clone()).await?;
+        assert_eq!(blocks.block_locs.len(), 3);
+        for block in &blocks.block_locs {
+            assert_eq!(block.block.len, block_size);
+        }
+        let done = complete_target(target_resume.clone()).await?;
+        assert!(done.is_complete() && done.len == total);
+
+        // (3) The stat gate fails closed on drift: rewrite the same length with
+        // different bytes so both mtime and content move, then reuse the stale
+        // manifest. The copy must not run.
+        let drifted: Vec<u8> = payload.iter().map(|b| b ^ 0xff).collect();
+        std::fs::write(format!("{ufs_dir}/src.bin"), &drifted)?;
+        let stale = run_task(make_ctx(
+            "task-stat-stale",
+            &source,
+            &target_full,
+            plan_json,
+            0,
+        ))
+        .await;
+        assert!(!stale, "a source whose HEAD identity moved must not resume");
+        Ok(())
+    })
+}

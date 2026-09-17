@@ -348,9 +348,27 @@ pub enum TransferPlanKind {
     Plain,
 }
 
+/// Why a fresh HEAD observation no longer identifies a group manifest's source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SegmentGroupMismatch {
+    /// The manifest carries neither an immutable version nor a stat pair.
+    NoIdentity,
+    /// The manifest pins a version but the backend reported none.
+    VersionUnavailable,
+    VersionChanged,
+    LengthChanged,
+    MtimeChanged,
+}
+
 /// Compact range manifest for a segment group (design §8裁决3).
 /// A group binds consecutive whole segments; cut points stay block-aligned.
 /// `loaded_size` in progress is cumulative bytes relative to `start_offset`.
+///
+/// Two identities can re-identify the source at execution time:
+/// * `source_version`: an immutable backend version/etag (OpenDAL mounts).
+/// * `source_len` + `source_mtime`: one HEAD observation (OSS-HDFS reports a
+///   millisecond mtime identical to `listDir`, measured on production),
+///   which is the same trust level `unchanged_load_target` already uses.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentGroupPlan {
     pub start_offset: i64,
@@ -369,6 +387,47 @@ pub struct SegmentGroupPlan {
 impl SegmentGroupPlan {
     pub fn group_len(&self) -> i64 {
         self.end_offset.saturating_sub(self.start_offset).max(0)
+    }
+
+    /// True when the manifest pins a HEAD-observed `(len, mtime)` pair.
+    pub fn has_stat_identity(&self) -> bool {
+        self.source_len > 0 && self.source_mtime > 0
+    }
+
+    /// True when the source can be re-identified after a retry or a worker
+    /// change; a manifest without identity must not be dispatched.
+    pub fn has_identity(&self) -> bool {
+        !self.source_version.is_empty() || self.has_stat_identity()
+    }
+
+    /// Re-identify the source from one fresh HEAD observation. `len`/`mtime`
+    /// must come from the same call the planner fingerprinted with, so an
+    /// unchanged source compares equal; a version-carrying manifest never
+    /// falls back to mtime alone when the backend stops reporting a version.
+    pub fn verify_observation(
+        &self,
+        len: i64,
+        mtime: i64,
+        version: &str,
+    ) -> Result<(), SegmentGroupMismatch> {
+        if !self.has_identity() {
+            return Err(SegmentGroupMismatch::NoIdentity);
+        }
+        if len != self.total_len || len != self.source_len {
+            return Err(SegmentGroupMismatch::LengthChanged);
+        }
+        if !self.source_version.is_empty() {
+            if version.is_empty() {
+                return Err(SegmentGroupMismatch::VersionUnavailable);
+            }
+            if version != self.source_version {
+                return Err(SegmentGroupMismatch::VersionChanged);
+            }
+        }
+        if self.source_mtime > 0 && mtime != self.source_mtime {
+            return Err(SegmentGroupMismatch::MtimeChanged);
+        }
+        Ok(())
     }
 
     pub fn validate(&self) -> FsResult<()> {
