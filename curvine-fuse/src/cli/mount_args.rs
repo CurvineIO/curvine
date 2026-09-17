@@ -153,8 +153,9 @@ mod tests {
     use clap::Parser;
     use curvine_config::ClusterConf;
     use curvine_core_error::CommonResult;
-    use curvine_runtime::common::Utils;
+    use curvine_runtime::common::{DurationUnit, Utils};
     use std::fs;
+    use std::time::Duration;
 
     fn try_get_conf(config: &str, extra_args: &[&str]) -> CommonResult<ClusterConf> {
         let conf_path = Utils::temp_file();
@@ -210,9 +211,51 @@ mod tests {
     }
 
     #[test]
+    fn kernel_timeout_flags_apply_canonical_and_legacy_aliases() {
+        let canonical = get_conf(
+            "[fuse]\n",
+            &[
+                "--entry-timeout",
+                "2s",
+                "--attr-timeout",
+                "500ms",
+                "--negative-timeout",
+                "250",
+            ],
+        );
+        assert_eq!(canonical.fuse.entry_timeout.as_millis(), 2000);
+        assert_eq!(canonical.fuse.attr_timeout.as_millis(), 500);
+        assert_eq!(canonical.fuse.negative_timeout.as_millis(), 250);
+        assert_eq!(canonical.fuse.entry_ttl, Duration::from_secs(2));
+        assert_eq!(canonical.fuse.attr_ttl, Duration::from_millis(500));
+        assert_eq!(canonical.fuse.negative_ttl, Duration::from_millis(250));
+
+        let legacy = get_conf(
+            "[fuse]\n",
+            &[
+                "--entry-timeout-ms",
+                "2s",
+                "--attr-timeout-ms",
+                "500",
+                "--negative-timeout-ms",
+                "250ms",
+            ],
+        );
+        assert_eq!(legacy.fuse.entry_timeout.as_millis(), 2000);
+        assert_eq!(legacy.fuse.attr_timeout.as_millis(), 500);
+        assert_eq!(legacy.fuse.negative_timeout.as_millis(), 250);
+        assert_eq!(legacy.fuse.entry_ttl, Duration::from_secs(2));
+        assert_eq!(legacy.fuse.attr_ttl, Duration::from_millis(500));
+        assert_eq!(legacy.fuse.negative_ttl, Duration::from_millis(250));
+    }
+
+    #[test]
     fn meta_cache_ttl_flag_maps_to_timeout_field() {
         let conf = get_conf("[fuse]\n", &["--meta-cache-ttl", "90s"]);
-        assert_eq!(conf.fuse.meta_cache_timeout, "90s");
+        assert_eq!(
+            conf.fuse.meta_cache_timeout,
+            DurationUnit::new(90 * DurationUnit::SECONDS)
+        );
     }
 
     #[test]
