@@ -29,6 +29,61 @@ export function formatTime(value) {
   return date.toLocaleString()
 }
 
+/**
+ * Format POSIX permission bits as a nine character `rwx` string.
+ *
+ * Mirrors `format_permission` in curvine-cli/src/cmds/fs/common.rs, including
+ * the setuid/setgid/sticky letters (`s`/`S`, `t`/`T`), so the web column matches
+ * `curvine-cli fs stat` output. Non numeric input yields `-`; a mode of 0 is
+ * still a valid `---------` (callers that treat 0 as "unset" check it first).
+ */
+export function formatPermission(mode: number | string | null | undefined): string {
+  // Guard explicitly: `Number(null)` is 0, which would render `---------` for a
+  // value the API never set.
+  if (mode === null || mode === undefined || mode === '') return '-'
+  const bits = Number(mode)
+  if (!Number.isFinite(bits) || bits < 0) return '-'
+  const value = Math.trunc(bits) & 0o7777
+
+  const special = (set: boolean, plain: boolean, letter: string) => {
+    if (set) return plain ? letter : letter.toUpperCase()
+    return plain ? 'x' : '-'
+  }
+
+  return [
+    value & 0o400 ? 'r' : '-',
+    value & 0o200 ? 'w' : '-',
+    special(Boolean(value & 0o4000), Boolean(value & 0o100), 's'),
+    value & 0o040 ? 'r' : '-',
+    value & 0o020 ? 'w' : '-',
+    special(Boolean(value & 0o2000), Boolean(value & 0o010), 's'),
+    value & 0o004 ? 'r' : '-',
+    value & 0o002 ? 'w' : '-',
+    special(Boolean(value & 0o1000), Boolean(value & 0o001), 't')
+  ].join('')
+}
+
+const TTL_UNITS: Array<[number, string]> = [
+  [86_400_000, 'd'],
+  [3_600_000, 'h'],
+  [60_000, 'm'],
+  [1_000, 's']
+]
+
+/**
+ * Format a millisecond TTL the way the CLI's `DurationUnit` Display does
+ * (crates/core/runtime/src/common/duration_unit.rs). Unlike that Display, a
+ * zero/absent TTL renders as `-` because it means "no TTL" for a file.
+ */
+export function formatTtl(ttlMs: number | string | null | undefined): string {
+  const value = Number(ttlMs)
+  if (!Number.isFinite(value) || value <= 0) return '-'
+  for (const [span, suffix] of TTL_UNITS) {
+    if (value % span === 0) return `${value / span}${suffix}`
+  }
+  return `${value}ms`
+}
+
 export function workerAddress(worker) {
   const address = worker.address || worker
   const host = address.hostname || worker.hostname || '-'

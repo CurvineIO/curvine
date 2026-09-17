@@ -2,7 +2,8 @@
   <div class="admin-page" v-loading="loading">
     <section class="admin-panel table-panel">
       <div class="panel-heading table-heading"><div><h2>{{ $t('browse.title') }}</h2><p>{{ $t('browse.subtitle') }}</p></div><div class="segmented"><button class="active">{{ $t('browse.view.list') }}</button><button @click="goBlocks">{{ $t('browse.view.blocks') }}</button></div></div>
-      <div class="path-toolbar"><button class="admin-button ghost compact" @click="setRoot">{{ $t('common.root') }}</button><button class="admin-button ghost compact" :disabled="!canGoUp" :title="$t('browse.goUpTitle')" @click="goUp">{{ $t('common.up') }}</button><input v-model="browsePath" class="admin-input path-input" @keyup.enter="navigate" :placeholder="$t('browse.pathPlaceholder')"><button class="admin-button primary compact" @click="navigate">{{ $t('common.go') }}</button><label class="cache-toggle"><input type="checkbox" v-model="cacheOnly" @change="fetchData"> {{ $t('browse.cacheOnly') }}</label><button class="admin-button ghost compact" @click="mkdirDialog">{{ $t('browse.mkdir') }}</button><button class="admin-button ghost compact" @click="uploadFileDialog">{{ $t('browse.uploadFile') }}</button><button class="admin-button ghost compact" @click="uploadFolderDialog">{{ $t('browse.uploadFolder') }}</button><button class="admin-button ghost compact" :disabled="!canFreeCurrentPath" :title="currentFreeTitle" @click="freeCurrentPath">{{ $t('browse.free') }}</button><input ref="fileInput" class="hidden-file-input" type="file" @change="onFilePicked"><input ref="folderInput" class="hidden-file-input" type="file" webkitdirectory directory multiple @change="onFolderPicked"></div>
+      <div class="path-toolbar"><button class="admin-button ghost compact" @click="setRoot">{{ $t('common.root') }}</button><button class="admin-button ghost compact" :disabled="!canGoUp" :title="$t('browse.goUpTitle')" @click="goUp">{{ $t('common.up') }}</button><input v-model="browsePath" class="admin-input path-input" @keyup.enter="navigate" :placeholder="$t('browse.pathPlaceholder')"><button class="admin-button primary compact" @click="navigate">{{ $t('common.go') }}</button><label class="cache-toggle"><input type="checkbox" v-model="cacheOnly" @change="fetchData"> {{ $t('browse.cacheOnly') }}</label><div class="columns-picker"><button type="button" class="admin-button ghost compact" :aria-expanded="columnsPanelOpen ? 'true' : 'false'" @click="toggleColumnsPanel">{{ $t('browse.columns.button') }}</button></div><button class="admin-button ghost compact" @click="mkdirDialog">{{ $t('browse.mkdir') }}</button><button class="admin-button ghost compact" @click="uploadFileDialog">{{ $t('browse.uploadFile') }}</button><button class="admin-button ghost compact" @click="uploadFolderDialog">{{ $t('browse.uploadFolder') }}</button><button class="admin-button ghost compact" :disabled="!canFreeCurrentPath" :title="currentFreeTitle" @click="freeCurrentPath">{{ $t('browse.free') }}</button><input ref="fileInput" class="hidden-file-input" type="file" @change="onFilePicked"><input ref="folderInput" class="hidden-file-input" type="file" webkitdirectory directory multiple @change="onFolderPicked"></div>
+      <div v-if="columnsPanelOpen" class="columns-panel"><span class="columns-panel-title">{{ $t('browse.columns.title') }}</span><label v-for="col in browsableColumns" :key="col.key" class="columns-option"><input type="checkbox" :checked="isColumnVisible(col.key)" @change="toggleColumn(col.key)"> {{ $t(col.labelKey) }}</label><button type="button" class="link-button columns-reset" @click="resetColumns">{{ $t('browse.columns.reset') }}</button><span class="columns-hint">{{ $t('browse.columns.hint') }}</span></div>
       <div v-if="uploadNotice" class="upload-notice">{{ uploadNotice }}</div>
       <div v-if="uploadBatchList.length" class="sync-panel">
         <div class="sync-panel-title">
@@ -70,9 +71,9 @@
         </div>
       </div>
       <table class="admin-table file-browser-table">
-        <colgroup><col class="name-col"><col class="type-col"><col class="size-col"><col class="modified-col"><col class="actions-col"></colgroup>
-        <thead><tr><th>{{ $t('browse.table.name') }}</th><th>{{ $t('browse.table.type') }}</th><th>{{ $t('browse.table.size') }}</th><th>{{ $t('browse.table.modified') }}</th><th></th></tr></thead>
-        <tbody><tr v-for="item in items" :key="item.path"><td class="file-name-cell" :title="item.path" @click="enterItem(item)"><div class="compact-name-cell"><strong>{{ fileName(item.path) }}</strong><button class="copy-path-button" :title="$t('browse.copyPath')" @click.stop="copyPath(item.path)">{{ copiedPath === item.path ? $t('common.copied') : $t('common.copy') }}</button></div></td><td>{{ item.is_dir ? $t('browse.itemType.directory') : $t('browse.itemType.file') }}</td><td>{{ itemSizeText(item) }}</td><td>{{ formatTime(item.mtime) }}</td><td class="row-actions"><button class="link-button" @click="item.is_dir ? openDir(item.path) : openBlocks(item.path)">{{ item.is_dir ? $t('common.open') : $t('common.blocks') }}</button><button class="link-button" @click="downloadItem(item)">{{ $t('common.download') }}</button><button class="link-button" :disabled="!canFreeItem(item)" :title="freeItemTitle(item)" @click="freeItem(item)">{{ $t('browse.free') }}</button><button class="link-button danger-link" :disabled="isMountRoot(item.path)" :title="deleteItemTitle(item)" @click="deleteItem(item)">{{ $t('common.delete') }}</button></td></tr></tbody>
+        <colgroup><col class="name-col" :style="{ width: columnWidths.name + '%' }"><col class="type-col" :style="{ width: columnWidths.type + '%' }"><col class="size-col" :style="{ width: columnWidths.size + '%' }"><col class="modified-col" :style="{ width: columnWidths.modified + '%' }"><col v-for="col in visibleColumnList" :key="col.key" :class="col.key + '-col'" :style="{ width: columnWidths[col.key] + '%' }"><col class="actions-col" :style="{ width: columnWidths.actions + '%' }"></colgroup>
+        <thead><tr><th>{{ $t('browse.table.name') }}</th><th>{{ $t('browse.table.type') }}</th><th>{{ $t('browse.table.size') }}</th><th>{{ $t('browse.table.modified') }}</th><th v-for="col in visibleColumnList" :key="col.key" :class="{ numeric: col.numeric }" :title="columnTitle(col)">{{ $t(col.labelKey) }}</th><th></th></tr></thead>
+        <tbody><tr v-for="item in items" :key="item.path"><td class="file-name-cell" :title="item.path" @click="enterItem(item)"><div class="compact-name-cell"><strong>{{ fileName(item.path) }}</strong><button class="copy-path-button" :title="$t('browse.copyPath')" @click.stop="copyPath(item.path)">{{ copiedPath === item.path ? $t('common.copied') : $t('common.copy') }}</button></div></td><td>{{ item.is_dir ? $t('browse.itemType.directory') : $t('browse.itemType.file') }}</td><td>{{ itemSizeText(item) }}</td><td>{{ formatTime(item.mtime) }}</td><td v-for="col in visibleColumnList" :key="col.key" :class="{ numeric: col.numeric }">{{ columnText(item, col.key) }}</td><td class="row-actions"><button class="link-button" @click="item.is_dir ? openDir(item.path) : openBlocks(item.path)">{{ item.is_dir ? $t('common.open') : $t('common.blocks') }}</button><button class="link-button" @click="downloadItem(item)">{{ $t('common.download') }}</button><button class="link-button" :disabled="!canFreeItem(item)" :title="freeItemTitle(item)" @click="freeItem(item)">{{ $t('browse.free') }}</button><button class="link-button danger-link" :disabled="isMountRoot(item.path)" :title="deleteItemTitle(item)" @click="deleteItem(item)">{{ $t('common.delete') }}</button></td></tr></tbody>
       </table>
       <div v-if="items.length === 0 && !loading" class="empty-state">{{ cacheOnly ? $t('browse.empty.cacheOnly') : $t('browse.empty.directory') }}</div>
     </section>
@@ -85,12 +86,16 @@ import { copyToClipboard } from '@/utils/clipboard'
 import { translateSyncState, syncStateMessage } from '@/utils/browseSyncState'
 import { formatBytes, formatTime } from '@/utils/format'
 import { buildJobDisplayName, shortJobId } from '@/utils/jobDisplay'
+import { BROWSABLE_COLUMNS, DEFAULT_VISIBLE_COLUMNS, columnText as browseColumnText, computeColumnWidths, isBrowseColumnKey, orderColumns } from '@/views/browseColumns'
 import eventBus from '@/utils/eventBus'
 
 export default {
   name: 'FileSystemPage',
-  data() { return { loading: false, browsePath: this.$route.query.path || '/', cacheOnly: false, items: [], copiedPath: '', uploadNotice: '', downloadNoticeActive: false, mounts: [], mountsLoaded: false, summaryLoadToken: 0, uploadBatches: {}, uploadBatchStorageRefreshTimer: null, ufsSyncJobs: {}, ufsSyncTimers: {}, ufsSyncBatchTimers: {}, ufsSyncSaveTimer: null, ufsSyncStorageRefreshTimer: null, ufsSyncDiscoverTimer: null, ufsSyncDiscoverToken: 0, ufsSyncDismissedAt: {}, ufsSyncPanelExpanded: true } },
+  data() { return { loading: false, browsePath: this.$route.query.path || '/', cacheOnly: false, items: [], copiedPath: '', uploadNotice: '', downloadNoticeActive: false, mounts: [], mountsLoaded: false, summaryLoadToken: 0, uploadBatches: {}, uploadBatchStorageRefreshTimer: null, ufsSyncJobs: {}, ufsSyncTimers: {}, ufsSyncBatchTimers: {}, ufsSyncSaveTimer: null, ufsSyncStorageRefreshTimer: null, ufsSyncDiscoverTimer: null, ufsSyncDiscoverToken: 0, ufsSyncDismissedAt: {}, ufsSyncPanelExpanded: true, columnsPanelOpen: false, visibleColumns: [...DEFAULT_VISIBLE_COLUMNS] } },
   computed: {
+    browsableColumns() { return BROWSABLE_COLUMNS },
+    visibleColumnList() { return orderColumns(this.visibleColumns) },
+    columnWidths() { return computeColumnWidths(this.visibleColumns) },
     uploadBatchList() { return Object.values(this.uploadBatches) },
     hasCompletedUploadBatches() {
       return Object.values(this.uploadBatches).some((batch) => batch && batch.done)
@@ -179,6 +184,7 @@ export default {
     this.restoreUploadBatches()
     this.loadUfsSyncDismissed()
     this.loadUfsSyncPanelExpanded()
+    this.loadBrowseColumns()
     this.restoreUfsSyncJobs()
     this.restoreBrowseSnapshot()
     this.fetchData()
@@ -299,6 +305,48 @@ export default {
     toggleUfsSyncPanel() {
       this.ufsSyncPanelExpanded = !this.ufsSyncPanelExpanded
       this.saveUfsSyncPanelExpanded()
+    },
+    columnText(item, key) {
+      return browseColumnText(item, key)
+    },
+    columnTitle(col) {
+      return col.key === 'replicas' ? this.$t('browse.columns.replicasHint') : ''
+    },
+    isColumnVisible(key) {
+      return this.visibleColumns.includes(key)
+    },
+    toggleColumn(key) {
+      const next = this.visibleColumns.includes(key)
+        ? this.visibleColumns.filter((item) => item !== key)
+        : [...this.visibleColumns, key]
+      this.visibleColumns = orderColumns(next).map((col) => col.key)
+      this.saveBrowseColumns()
+    },
+    resetColumns() {
+      this.visibleColumns = [...DEFAULT_VISIBLE_COLUMNS]
+      this.saveBrowseColumns()
+    },
+    toggleColumnsPanel() {
+      this.columnsPanelOpen = !this.columnsPanelOpen
+    },
+    browseColumnsStorageKey() {
+      return 'curvine.web.fs.browseColumns.v1'
+    },
+    loadBrowseColumns() {
+      try {
+        const raw = window.localStorage.getItem(this.browseColumnsStorageKey())
+        if (raw === null) return
+        const stored = JSON.parse(raw)
+        const keys = Array.isArray(stored) ? stored.filter(isBrowseColumnKey) : []
+        this.visibleColumns = orderColumns(keys).map((col) => col.key)
+      } catch (_) {
+        this.visibleColumns = [...DEFAULT_VISIBLE_COLUMNS]
+      }
+    },
+    saveBrowseColumns() {
+      try {
+        window.localStorage.setItem(this.browseColumnsStorageKey(), JSON.stringify(this.visibleColumns))
+      } catch (_) {}
     },
     ufsSyncDismissedStorageKey() {
       return 'curvine.web.fs.ufsSyncDismissed.v1'
@@ -1257,6 +1305,48 @@ export default {
   color: #44546a;
   font-size: 13px;
   white-space: nowrap;
+}
+
+.columns-picker {
+  display: inline-flex;
+}
+
+.columns-panel {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--admin-border);
+  border-radius: 8px;
+  background: #f8fbf6;
+}
+
+.columns-panel-title {
+  font-size: 12px;
+  font-weight: 760;
+  color: #44546a;
+}
+
+.columns-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #44546a;
+  font-size: 13px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.columns-reset {
+  margin-left: auto;
+}
+
+.columns-hint {
+  width: 100%;
+  color: #8a97a8;
+  font-size: 11px;
 }
 
 .hidden-file-input {

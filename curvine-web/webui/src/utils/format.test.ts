@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import {
   formatBytes,
   formatBytesPerSec,
+  formatPermission,
+  formatTtl,
   getUptimeParts,
   parseDateTime,
   versionsMismatch,
@@ -64,6 +66,61 @@ describe('getUptimeParts', () => {
       kind: 'hours',
       count: 1
     })
+  })
+})
+
+describe('formatPermission', () => {
+  // Mirrors the assertions in curvine-cli/src/cmds/fs/common.rs so the web column
+  // keeps matching `curvine-cli fs stat` output.
+  it('formats the ordinary mode bits', () => {
+    expect(formatPermission(0o755)).toBe('rwxr-xr-x')
+    expect(formatPermission(0o777)).toBe('rwxrwxrwx')
+    expect(formatPermission(0o644)).toBe('rw-r--r--')
+    expect(formatPermission(0o600)).toBe('rw-------')
+    expect(formatPermission(0o000)).toBe('---------')
+  })
+
+  it('formats setuid, setgid and sticky bits', () => {
+    expect(formatPermission(0o4755)).toBe('rwsr-xr-x')
+    expect(formatPermission(0o4644)).toBe('rwSr--r--')
+    expect(formatPermission(0o2775)).toBe('rwxrwsr-x')
+    expect(formatPermission(0o2664)).toBe('rw-rwSr--')
+    expect(formatPermission(0o1755)).toBe('rwxr-xr-t')
+    expect(formatPermission(0o1666)).toBe('rw-rw-rwT')
+  })
+
+  it('honours the decimal form the API sends', () => {
+    expect(formatPermission(493)).toBe('rwxr-xr-x')
+  })
+
+  it('returns a dash for missing or invalid input', () => {
+    expect(formatPermission(null)).toBe('-')
+    expect(formatPermission(undefined)).toBe('-')
+    expect(formatPermission('')).toBe('-')
+    expect(formatPermission('abc')).toBe('-')
+    expect(formatPermission(-1)).toBe('-')
+  })
+})
+
+describe('formatTtl', () => {
+  it('treats a missing TTL as no TTL', () => {
+    expect(formatTtl(0)).toBe('-')
+    expect(formatTtl(null)).toBe('-')
+    expect(formatTtl(undefined)).toBe('-')
+    expect(formatTtl(-1)).toBe('-')
+  })
+
+  it('matches the CLI DurationUnit display for whole units', () => {
+    expect(formatTtl(86_400_000)).toBe('1d')
+    expect(formatTtl(7 * 86_400_000)).toBe('7d')
+    expect(formatTtl(3_600_000)).toBe('1h')
+    expect(formatTtl(3 * 3_600_000)).toBe('3h')
+    expect(formatTtl(60_000)).toBe('1m')
+    expect(formatTtl(30_000)).toBe('30s')
+  })
+
+  it('falls back to milliseconds where no unit divides evenly', () => {
+    expect(formatTtl(90)).toBe('90ms')
   })
 })
 

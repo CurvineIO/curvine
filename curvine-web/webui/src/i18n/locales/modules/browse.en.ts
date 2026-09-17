@@ -22,7 +22,23 @@ export default {
       name: 'Name',
       type: 'Type',
       size: 'Size',
-      modified: 'Modified'
+      modified: 'Modified',
+      replicas: 'Replicas',
+      permission: 'Permission',
+      owner: 'Owner',
+      group: 'Group',
+      nlink: 'Links',
+      blockSize: 'Block size',
+      storageType: 'Storage type',
+      ttl: 'TTL',
+      atime: 'Accessed'
+    },
+    columns: {
+      button: 'Columns',
+      title: 'Visible columns',
+      hint: 'Applies to this listing only',
+      replicasHint: 'Configured target replica count, matching `curvine-cli fs ls -l`',
+      reset: 'Reset'
     },
     empty: {
       cacheOnly: 'No cached files in this path.',

@@ -134,21 +134,13 @@ button { cursor: pointer; }
 @media (max-width: 760px) { .admin-shell { display: block; } .admin-sidebar { width: auto; border-right: 0; border-bottom: 1px solid var(--admin-border); } .admin-nav { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); } .admin-main { padding: 16px; } .metric-grid, .capacity-layout { grid-template-columns: 1fr; } .admin-table { min-width: 760px; } .table-panel { overflow-x: auto; } .path-input, .toolbar .admin-input { min-width: 100%; } .form-panel label, .config-list label, .detail-list div { grid-template-columns: 1fr; } }
 
 
-.file-browser-table .name-col { width: 32%; }
-.file-browser-table .type-col { width: 12%; }
-.file-browser-table .size-col { width: 14%; }
-.file-browser-table .modified-col { width: 18%; }
-.file-browser-table .actions-col { width: 24%; }
+// Column widths are not declared here: the visible column set is user-toggleable
+// and `table-layout: fixed` requires the <col> widths to total exactly 100%, so
+// they are computed per render in views/browseColumns.ts and applied inline.
 .file-browser-table td { vertical-align: middle; }
+.file-browser-table .numeric { text-align: right; font-variant-numeric: tabular-nums; }
 .file-browser-table .file-name-cell { padding-top: 10px; padding-bottom: 10px; }
 .file-browser-table .row-actions { white-space: normal; }
-@media (max-width: 1280px) {
-  .file-browser-table .name-col { width: 36%; }
-  .file-browser-table .type-col { width: 12%; }
-  .file-browser-table .size-col { width: 12%; }
-  .file-browser-table .modified-col { width: 16%; }
-  .file-browser-table .actions-col { width: 24%; }
-}
 
 .file-name-cell { cursor: pointer; }
 .file-name-cell:hover strong { color: var(--admin-primary-strong); text-decoration: underline; }

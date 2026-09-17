@@ -22,7 +22,23 @@ export default {
       name: '名称',
       type: '类型',
       size: '大小',
-      modified: '修改时间'
+      modified: '修改时间',
+      replicas: '副本数',
+      permission: '权限',
+      owner: '属主',
+      group: '属组',
+      nlink: '硬链接',
+      blockSize: '块大小',
+      storageType: '存储类型',
+      ttl: 'TTL',
+      atime: '访问时间'
+    },
+    columns: {
+      button: '显示列',
+      title: '显示列',
+      hint: '仅影响当前列表展示',
+      replicasHint: '配置的目标副本数,与 `curvine-cli fs ls -l` 一致',
+      reset: '重置'
     },
     empty: {
       cacheOnly: '此路径下没有缓存文件。',
