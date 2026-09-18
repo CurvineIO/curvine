@@ -161,16 +161,14 @@ jobs:
           set -euo pipefail
           mkdir -p "$MOUNT_PATH"
           cd build/dist
-          ./bin/curvine-master.sh restart
-          sleep 5
-          ./bin/curvine-worker.sh restart
-          sleep 5
+          ./bin/local-cluster.sh restart force
           ./bin/curvine-fuse.sh restart -d
           python3 - <<'EOF'
           import os, time, sys
           p = os.path.join(os.environ["MOUNT_PATH"], ".ci-ready")
           payload = b"ci" * 8192
           deadline = time.time() + 120
+          last_error = None
           while time.time() < deadline:
               try:
                   with open(p, "wb") as f:
@@ -179,9 +177,10 @@ jobs:
                       assert f.read() == payload
                   os.unlink(p)
                   sys.exit(0)
-              except OSError:
+              except OSError as exc:
+                  last_error = exc
                   time.sleep(2)
-          print("data path not ready after 120s", file=sys.stderr)
+          print(f"data path not ready after 120s: {last_error}", file=sys.stderr)
           sys.exit(1)
           EOF
 
