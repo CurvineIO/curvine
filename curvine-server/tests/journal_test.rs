@@ -14,7 +14,7 @@
 
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
-use curvine_fs_api::CurvineURI;
+use curvine_fs_api::{CurvineURI, Path};
 use curvine_model::{
     BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, MountOptions, OpenFlags,
     RenameFlags, WorkerInfo, WriteType,
@@ -24,11 +24,11 @@ use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData, SnapshotFi
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
 use curvine_raft::raft::{NodeId, RaftPeer};
 use curvine_runtime::common::SerdeUtils;
-use curvine_runtime::common::{FileUtils, Logger, TimeSpent, Utils};
+use curvine_runtime::common::{CommonUtils, FileUtils, Logger, TimeSpent, Utils};
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::{
-    JournalBatch, JournalEntry, JournalLoader, JournalSystem, UfsLoader,
+    CompleteFileEntry, JournalBatch, JournalEntry, JournalLoader, JournalSystem, UfsLoader,
 };
 use curvine_server::master::{Master, MountManager};
 use log::info;
@@ -600,6 +600,195 @@ fn test_ufs_loader_mkdir_recreates_missing_ufs_parent() -> CommonResult<()> {
     assert!(ufs_dir.join("db/table/log").is_dir());
     let _ = std::fs::remove_dir_all(&ufs_dir);
 
+    Ok(())
+}
+
+fn new_ufs_loader_complete_env(
+    name: &str,
+) -> CommonResult<(
+    ClusterConf,
+    JournalSystem,
+    MasterFilesystem,
+    std::path::PathBuf,
+)> {
+    Master::init_test_metrics();
+
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.journal.ufs_copy_timeout = "2s".to_string();
+    conf.change_test_meta_dir(format!(
+        "ufs-loader-complete-{}-{}",
+        name,
+        curvine_runtime::common::LocalTime::mills()
+    ));
+
+    let journal_system = JournalSystem::from_conf(&conf)?;
+    let fs = MasterFilesystem::with_js(&conf, &journal_system);
+    fs.add_test_worker(WorkerInfo::default());
+
+    let ufs_dir = std::env::temp_dir().join(format!(
+        "curvine-ufs-loader-complete-{}-{}-{}",
+        name,
+        std::process::id(),
+        curvine_runtime::common::LocalTime::mills()
+    ));
+    let _ = std::fs::remove_dir_all(&ufs_dir);
+    std::fs::create_dir_all(&ufs_dir)?;
+
+    let mount_opts = MountOptions::builder()
+        .write_type(WriteType::FsMode)
+        .build();
+    journal_system.mount_manager().mount(
+        None,
+        "/mnt",
+        format!("file://{}/", ufs_dir.display()).as_ref(),
+        &mount_opts,
+    )?;
+
+    Ok((conf, journal_system, fs, ufs_dir))
+}
+
+fn take_complete_file_entry(journal_system: &JournalSystem) -> CommonResult<CompleteFileEntry> {
+    match journal_system
+        .fs()
+        .fs_dir
+        .read()
+        .take_entries()
+        .into_iter()
+        .find_map(|entry| match entry {
+            JournalEntry::CompleteFile(e) => Some(e),
+            _ => None,
+        }) {
+        Some(entry) => Ok(entry),
+        None => err_box!("missing complete_file journal entry"),
+    }
+}
+
+fn collect_ufs_rel_files(dir: &std::path::Path) -> Vec<String> {
+    let mut files = Vec::new();
+    fn walk(root: &std::path::Path, dir: &std::path::Path, files: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, files);
+            } else if let Ok(rel) = path.strip_prefix(root) {
+                files.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    walk(dir, dir, &mut files);
+    files.sort();
+    files
+}
+
+#[test]
+fn test_ufs_loader_complete_file_skips_non_mount() -> CommonResult<()> {
+    let (conf, journal_system, fs, ufs_dir) = new_ufs_loader_complete_env("skip-non-mount")?;
+
+    fs.create("/plain.log", true)?;
+    journal_system.fs().fs_dir.read().take_entries();
+    fs.complete_file("/plain.log", None, 0, vec![], "", false, None)?;
+    let entry = take_complete_file_entry(&journal_system)?;
+    let entry_debug = format!("{:?}", entry);
+    assert!(
+        entry_debug.contains("/plain.log"),
+        "journal complete path should be the non-mount request path: {}",
+        entry_debug
+    );
+
+    let loader = UfsLoader::new(
+        journal_system.job_manager(),
+        journal_system.fs().fs_dir.clone(),
+        &conf.journal,
+    );
+    let rt = AsyncRuntime::single();
+    rt.block_on(async { loader.complete_file(&entry).await })?;
+
+    assert!(
+        collect_ufs_rel_files(&ufs_dir).is_empty(),
+        "non-mount complete must not create UFS objects: {:?}",
+        collect_ufs_rel_files(&ufs_dir)
+    );
+    let live = Path::from_str("/plain.log")?;
+    assert!(
+        journal_system
+            .job_manager()
+            .get_job_status(CommonUtils::create_job_id(live.clone_uri()))
+            .is_err(),
+        "non-mount complete must not submit an export job"
+    );
+    let _ = std::fs::remove_dir_all(&ufs_dir);
+    Ok(())
+}
+
+#[test]
+fn test_ufs_loader_complete_file_rename_within_mount_exports_live_path() -> CommonResult<()> {
+    let (conf, journal_system, fs, ufs_dir) = new_ufs_loader_complete_env("rename-within-mount")?;
+
+    let created = fs.create("/mnt/old.log", true)?;
+    fs.rename("/mnt/old.log", "/mnt/new.log", RenameFlags::empty())?;
+    journal_system.fs().fs_dir.read().take_entries();
+    fs.complete_file("/mnt/old.log", Some(created.id), 0, vec![], "", false, None)?;
+    let entry = take_complete_file_entry(&journal_system)?;
+    let entry_debug = format!("{:?}", entry);
+    assert!(
+        entry_debug.contains("/mnt/old.log"),
+        "journal complete path should keep the original request path: {}",
+        entry_debug
+    );
+    assert!(
+        entry_debug.contains(&format!("id: {}", created.id)),
+        "journal complete entry should carry inode {}: {}",
+        created.id,
+        entry_debug
+    );
+
+    let loader = UfsLoader::new(
+        journal_system.job_manager(),
+        journal_system.fs().fs_dir.clone(),
+        &conf.journal,
+    );
+    let rt = AsyncRuntime::single();
+    let export = rt.block_on(async { loader.complete_file(&entry).await });
+
+    assert!(
+        !ufs_dir.join("old.log").exists(),
+        "export must not land at the stale journal path"
+    );
+
+    let live = Path::from_str("/mnt/new.log")?;
+    let job = match journal_system
+        .job_manager()
+        .get_job_status(CommonUtils::create_job_id(live.clone_uri()))
+    {
+        Ok(job) => job,
+        Err(status_err) => {
+            return err_box!(
+                "export job missing for live path; complete_file={:?}; status={}",
+                export,
+                status_err
+            );
+        }
+    };
+    assert!(
+        job.source_path.ends_with("/mnt/new.log"),
+        "export source should be the live CV path, got {}",
+        job.source_path
+    );
+    assert!(
+        job.target_path.contains("new.log") && !job.target_path.contains("old.log"),
+        "export must target the live UFS path, got {}",
+        job.target_path
+    );
+    if ufs_dir.join("new.log").exists() {
+        assert!(ufs_dir.join("new.log").is_file());
+    }
+    let _ = std::fs::remove_dir_all(&ufs_dir);
     Ok(())
 }
 
