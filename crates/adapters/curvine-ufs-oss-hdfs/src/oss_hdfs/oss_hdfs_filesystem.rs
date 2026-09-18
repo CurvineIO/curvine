@@ -19,7 +19,7 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, Path};
 use curvine_io::DataSlice;
-use curvine_model::{DeleteResult, FileStatus, FileType, SetAttrOpts};
+use curvine_model::{DeleteResult, FileStatus, FileType, SetAttrOpts, StoragePolicy};
 use curvine_runtime::common::LocalTime;
 use curvine_ufs_api::{err_ufs, OssHdfsConf};
 use std::collections::HashMap;
@@ -294,6 +294,7 @@ impl OssHdfsFileSystem {
                 FileType::File
             },
             mode: 0o777,
+            storage_policy: StoragePolicy::new_ufs(),
             ..Default::default()
         }
     }
@@ -331,6 +332,7 @@ impl OssHdfsFileSystem {
             mode: (info.perm as u16) as u32, // Convert i16 to u32 (safe: file permissions are non-negative)
             owner,
             group,
+            storage_policy: StoragePolicy::new_ufs(),
             ..Default::default()
         }
     }
