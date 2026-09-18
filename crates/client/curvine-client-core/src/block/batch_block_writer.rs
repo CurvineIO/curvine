@@ -13,15 +13,40 @@
 // limitations under the License.
 
 use crate::block::batch_block_writer::BatchWriterAdapter::{BatchLocal, BatchRemote};
-use crate::block::{BatchBlockWriterLocal, BatchBlockWriterRemote};
+use crate::block::{BatchBlockWriterLocal, BatchBlockWriterRemote, CreateBlockContext};
 use crate::file::FsContext;
 use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
-use curvine_model::{CommitBlock, ExtendedBlock, LocatedBlock, WorkerAddress};
+use curvine_model::{
+    BlockLocation, CommitBlock, ExtendedBlock, LocatedBlock, StorageType, WorkerAddress,
+};
 use futures::future::try_join_all;
 use std::sync::Arc;
+
+pub(super) fn validate_batch_contexts(
+    blocks: &[ExtendedBlock],
+    contexts: &[CreateBlockContext],
+) -> FsResult<()> {
+    if contexts.len() != blocks.len() {
+        return err_box!(
+            "batch block response count mismatch, expected {}, actual {}",
+            blocks.len(),
+            contexts.len()
+        );
+    }
+    for (block, context) in blocks.iter().zip(contexts) {
+        if context.id != block.id {
+            return err_box!(
+                "batch block response id mismatch, expected {}, actual {}",
+                block.id,
+                context.id
+            );
+        }
+    }
+    Ok(())
+}
 
 enum BatchWriterAdapter {
     BatchLocal(BatchBlockWriterLocal),
@@ -33,6 +58,13 @@ impl BatchWriterAdapter {
         match self {
             BatchLocal(f) => f.worker_address(),
             BatchRemote(f) => f.worker_address(),
+        }
+    }
+
+    fn actual_storage_type(&self, block_index: usize) -> StorageType {
+        match self {
+            BatchLocal(f) => f.actual_storage_type(block_index),
+            BatchRemote(f) => f.actual_storage_type(block_index),
         }
     }
 
@@ -199,7 +231,21 @@ impl BatchBlockWriter {
         let mut commit_blocks = Vec::with_capacity(self.located_blocks.len());
 
         for (i, located_block) in self.located_blocks.iter().enumerate() {
-            let mut commit_block = CommitBlock::from(located_block);
+            let locations = self
+                .inners
+                .iter()
+                .map(|writer| {
+                    BlockLocation::new(
+                        writer.worker_address().worker_id,
+                        writer.actual_storage_type(i),
+                    )
+                })
+                .collect();
+            let mut commit_block = CommitBlock {
+                block_id: located_block.block.id,
+                block_len: located_block.block.len,
+                locations,
+            };
 
             if let Some(&length) = self.file_lengths.get(i) {
                 commit_block.block_len = length;
@@ -209,5 +255,40 @@ impl BatchBlockWriter {
         }
 
         commit_blocks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_batch_contexts;
+    use crate::block::CreateBlockContext;
+    use curvine_model::{ExtendedBlock, StorageType};
+
+    fn context(id: i64) -> CreateBlockContext {
+        CreateBlockContext {
+            id,
+            off: 0,
+            block_size: 1024,
+            path: None,
+            storage_type: StorageType::Disk,
+        }
+    }
+
+    #[test]
+    fn batch_context_validation_rejects_missing_response() {
+        let blocks = vec![ExtendedBlock::with_id(1), ExtendedBlock::with_id(2)];
+
+        let error = validate_batch_contexts(&blocks, &[context(1)]).unwrap_err();
+
+        assert!(error.to_string().contains("response count mismatch"));
+    }
+
+    #[test]
+    fn batch_context_validation_rejects_reordered_response() {
+        let blocks = vec![ExtendedBlock::with_id(1), ExtendedBlock::with_id(2)];
+
+        let error = validate_batch_contexts(&blocks, &[context(2), context(1)]).unwrap_err();
+
+        assert!(error.to_string().contains("response id mismatch"));
     }
 }
