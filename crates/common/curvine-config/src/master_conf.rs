@@ -145,6 +145,8 @@ pub struct MasterConf {
 }
 
 impl MasterConf {
+    pub const DEFAULT_BLOCK_REPORT_LIMIT: usize = 100_000;
+
     pub fn init(&mut self) -> CommonResult<()> {
         self.heartbeat_interval_unit = DurationUnit::from_str(&self.heartbeat_interval)?;
 
@@ -281,7 +283,7 @@ impl Default for MasterConf {
             retry_cache_size: 100_000,
             retry_cache_ttl: "10m".to_string(),
 
-            block_report_limit: 1000,
+            block_report_limit: Self::DEFAULT_BLOCK_REPORT_LIMIT,
 
             worker_policy: "local".to_string(),
 
