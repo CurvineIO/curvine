@@ -19,7 +19,7 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, ListStream, Path, Reader, Writer};
 use curvine_io::DataSlice;
-use curvine_model::{DeleteResult, FileStatus, FileType, ListOptions, SetAttrOpts};
+use curvine_model::{DeleteResult, FileStatus, FileType, ListOptions, SetAttrOpts, StoragePolicy};
 use curvine_ufs_api::OpendalConf;
 #[cfg(feature = "opendal-oss")]
 use curvine_ufs_api::OssHdfsConf;
@@ -819,6 +819,7 @@ impl OpendalFileSystem {
             block_size: 4 * 1024 * 1024,
             file_type: FileType::File,
             mode: 0o777,
+            storage_policy: StoragePolicy::new_ufs(),
             ..Default::default()
         }
     }
@@ -845,6 +846,7 @@ impl OpendalFileSystem {
             replicas: 1,
             block_size: 4 * 1024 * 1024,
             mode: 0o777,
+            storage_policy: StoragePolicy::new_ufs(),
             ..Default::default()
         }
     }
