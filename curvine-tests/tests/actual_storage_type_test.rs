@@ -119,6 +119,80 @@ fn replicas_on_different_workers_persist_each_actual_storage_type() -> CommonRes
     })
 }
 
+#[test]
+fn batch_blocks_preserve_independent_worker_placement() -> CommonResult<()> {
+    let testing = Testing::builder()
+        .workers(2)
+        .mutate_conf(|conf| {
+            conf.master.worker_policy = "robin".to_string();
+        })
+        .mutate_worker_conf(|index, conf| {
+            let storage_type = if index == 0 { "MEM" } else { "DISK" };
+            conf.worker.data_dir = conf
+                .worker
+                .data_dir
+                .iter()
+                .map(|path| format!("[{storage_type}:512MB]{path}"))
+                .collect();
+        })
+        .build()?;
+    let cluster = testing.start_cluster()?;
+    let mem_worker_port = cluster.worker_conf[0].worker.rpc_port as u32;
+    let disk_worker_port = cluster.worker_conf[1].worker.rpc_port as u32;
+    let mut conf = testing.get_active_cluster_conf()?;
+    conf.client.replicas = 1;
+    conf.client.short_circuit = false;
+    conf.client.storage_type = StorageType::Mem;
+    conf.client.storage_type_str = "mem".to_string();
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+    let master_fs = cluster.get_active_master_fs();
+
+    rt.block_on(async move {
+        let files = [
+            (
+                Path::from_str("/actual-storage/independent-batch-1.data")?,
+                "independent-worker-1",
+            ),
+            (
+                Path::from_str("/actual-storage/independent-batch-2.data")?,
+                "independent-worker-2",
+            ),
+        ];
+        fs.write_batch_string(&files).await?;
+
+        let mut worker_ids = Vec::with_capacity(files.len());
+        for (path, expected_content) in &files {
+            assert_eq!(fs.read_string(path).await?, *expected_content);
+
+            let blocks = fs.get_block_locations(path).await?;
+            assert_eq!(blocks.block_locs.len(), 1);
+            assert_eq!(blocks.block_locs[0].locs.len(), 1);
+            let assigned_worker = &blocks.block_locs[0].locs[0];
+            worker_ids.push(assigned_worker.worker_id);
+
+            let locations = master_fs
+                .fs_dir
+                .read()
+                .get_block_locations(blocks.block_locs[0].block.id)?;
+            assert_eq!(locations.len(), 1);
+            assert_eq!(locations[0].worker_id, assigned_worker.worker_id);
+
+            let expected_storage_type = if assigned_worker.rpc_port == mem_worker_port {
+                StorageType::Mem
+            } else if assigned_worker.rpc_port == disk_worker_port {
+                StorageType::Disk
+            } else {
+                panic!("unexpected worker RPC port: {}", assigned_worker.rpc_port);
+            };
+            assert_eq!(locations[0].storage_type, expected_storage_type);
+        }
+
+        assert_ne!(worker_ids[0], worker_ids[1]);
+        Ok(())
+    })
+}
+
 async fn assert_actual_disk_location(
     fs: &CurvineFileSystem,
     master_fs: &MasterFilesystem,
