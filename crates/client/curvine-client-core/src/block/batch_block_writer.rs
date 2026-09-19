@@ -23,11 +23,8 @@ use curvine_model::{
     BlockLocation, CommitBlock, ExtendedBlock, LocatedBlock, StorageType, WorkerAddress,
 };
 use futures::future::try_join_all;
-use futures::stream::{self, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-
-const MAX_CONCURRENT_WORKER_GROUPS: usize = 16;
 
 pub(super) fn validate_batch_contexts(
     blocks: &[ExtendedBlock],
@@ -225,56 +222,37 @@ impl BatchBlockWriter {
         }
 
         let pending_groups = group_blocks_by_worker(&located_blocks)?;
-        let mut opened = stream::iter(pending_groups.into_iter().enumerate().map(
-            |(group_index, group)| {
-                let fs_context = fs_context.clone();
-                async move {
-                    let result = BatchWriterAdapter::new(
-                        fs_context,
-                        group.blocks,
-                        group.has_spdk,
-                        &group.worker,
-                    )
-                    .await;
-                    (group_index, group.entries, result)
-                }
-            },
-        ))
-        .buffer_unordered(MAX_CONCURRENT_WORKER_GROUPS)
-        .collect::<Vec<_>>()
-        .await;
-        opened.sort_by_key(|(group_index, _, _)| *group_index);
+        let mut groups: Vec<WorkerGroup> = Vec::with_capacity(pending_groups.len());
 
-        if let Some(error_index) = opened.iter().position(|(_, _, result)| result.is_err()) {
-            let cancellations = opened.iter_mut().filter_map(|(_, _, result)| {
-                result.as_mut().ok().map(|writer| async move {
-                    let worker = writer.worker_address().clone();
-                    (worker, writer.cancel().await)
-                })
-            });
-            for (worker, result) in futures::future::join_all(cancellations).await {
-                if let Err(cancel_error) = result {
-                    log::warn!(
-                        "failed to cancel batch group on worker {}: {}",
-                        worker.worker_id,
-                        cancel_error
-                    );
+        // TODO: Implement and benchmark bounded concurrent worker-group opens
+        for group in pending_groups {
+            let writer = match BatchWriterAdapter::new(
+                fs_context.clone(),
+                group.blocks,
+                group.has_spdk,
+                &group.worker,
+            )
+            .await
+            {
+                Ok(writer) => writer,
+                Err(error) => {
+                    for opened_group in &mut groups {
+                        if let Err(cancel_error) = opened_group.writer.cancel().await {
+                            log::warn!(
+                                "failed to cancel batch group on worker {}: {}",
+                                opened_group.writer.worker_address().worker_id,
+                                cancel_error
+                            );
+                        }
+                    }
+                    return Err(error);
                 }
-            }
-            let error = match opened.swap_remove(error_index).2 {
-                Ok(_) => unreachable!("batch group error index must contain an error"),
-                Err(error) => error,
             };
-            return Err(error);
+            groups.push(WorkerGroup {
+                writer,
+                entries: group.entries,
+            });
         }
-
-        let groups = opened
-            .into_iter()
-            .map(|(_, entries, writer)| WorkerGroup {
-                writer: writer.expect("batch group error handled above"),
-                entries,
-            })
-            .collect();
         let num_of_blocks = located_blocks.len();
 
         Ok(Self {
