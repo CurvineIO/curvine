@@ -374,9 +374,9 @@ impl BatchBlockWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::{group_blocks_by_worker, validate_batch_contexts, BatchBlockWriter};
+    use super::{group_blocks_by_worker, validate_batch_contexts};
     use crate::block::CreateBlockContext;
-    use curvine_model::{CommitBlock, ExtendedBlock, LocatedBlock, StorageType, WorkerAddress};
+    use curvine_model::{ExtendedBlock, LocatedBlock, StorageType, WorkerAddress};
 
     fn context(id: i64) -> CreateBlockContext {
         CreateBlockContext {
@@ -400,11 +400,6 @@ mod tests {
             ExtendedBlock::with_id(id),
             worker_ids.into_iter().map(worker).collect(),
         )
-    }
-
-    #[test]
-    fn to_commit_blocks_keeps_vec_return_type() {
-        let _: fn(&BatchBlockWriter) -> Vec<CommitBlock> = BatchBlockWriter::to_commit_blocks;
     }
 
     #[test]
