@@ -1,10 +1,11 @@
+use crate::block::batch_block_writer::validate_batch_contexts;
 use crate::block::BlockClient;
 use crate::file::FsContext;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
 use curvine_io::LocalFile;
-use curvine_model::{ExtendedBlock, WorkerAddress};
+use curvine_model::{ExtendedBlock, StorageType, WorkerAddress};
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_sys::RawPtr;
@@ -19,6 +20,7 @@ pub struct BatchBlockWriterLocal {
     block_size: i64,
     pos: i64,
     req_id: i64,
+    actual_storage_types: Vec<StorageType>,
 }
 
 impl BatchBlockWriterLocal {
@@ -44,6 +46,13 @@ impl BatchBlockWriterLocal {
                 true,
             )
             .await?;
+        // Defensive check to ensure batch contexts are valid
+        validate_batch_contexts(&blocks, &write_context.contexts)?;
+        let actual_storage_types = write_context
+            .contexts
+            .iter()
+            .map(|context| context.storage_type)
+            .collect();
 
         // Create multiple files, one for each block context
         let mut files = Vec::new();
@@ -77,6 +86,7 @@ impl BatchBlockWriterLocal {
             block_size,
             pos: 0,
             req_id,
+            actual_storage_types,
         })
     }
 
@@ -111,6 +121,10 @@ impl BatchBlockWriterLocal {
 
     pub fn worker_address(&self) -> &WorkerAddress {
         &self.worker_address
+    }
+
+    pub fn actual_storage_type(&self, block_index: usize) -> StorageType {
+        self.actual_storage_types[block_index]
     }
 
     pub async fn write(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {
