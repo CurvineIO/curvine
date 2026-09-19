@@ -272,9 +272,9 @@ impl BatchBlockWriter {
             );
         }
 
-        self.file_lengths.clear();
-        self.file_lengths
-            .extend(files.iter().map(|(_, content)| content.len() as i64));
+        for (_, content) in files {
+            self.file_lengths.push(content.len() as i64);
+        }
         let futures = self.groups.iter_mut().map(|group| async move {
             let group_files = group
                 .entries
