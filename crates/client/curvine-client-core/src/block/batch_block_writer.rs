@@ -103,17 +103,16 @@ impl BatchWriterAdapter {
     // Create new WriterAdapter
     async fn new(
         fs_context: Arc<FsContext>,
-        located_blocks: Vec<LocatedBlock>,
+        blocks: Vec<ExtendedBlock>,
+        has_spdk: bool,
         worker_addr: &WorkerAddress,
     ) -> FsResult<Self> {
         let conf = &fs_context.conf.client;
         // SPDK bypasses kernel — no local path. Disable short-circuit if any block uses SPDK.
         // Use has_spdk from worker-reported actual storage type, not block.storage_type
-        let has_spdk = located_blocks.iter().any(|lb| lb.has_spdk);
         let short_circuit =
             conf.short_circuit && fs_context.is_local_worker(worker_addr) && !has_spdk;
 
-        let blocks: Vec<ExtendedBlock> = located_blocks.iter().map(|lb| lb.block.clone()).collect();
         let adapter = if short_circuit {
             match BatchBlockWriterLocal::new(
                 fs_context.clone(),
@@ -156,7 +155,8 @@ struct WorkerGroup {
 
 struct PendingWorkerGroup {
     worker: WorkerAddress,
-    located_blocks: Vec<LocatedBlock>,
+    blocks: Vec<ExtendedBlock>,
+    has_spdk: bool,
     entries: Vec<WorkerGroupEntry>,
 }
 
@@ -189,15 +189,15 @@ fn group_blocks_by_worker(located_blocks: &[LocatedBlock]) -> FsResult<Vec<Pendi
                     group_by_worker.insert(worker.worker_id, index);
                     groups.push(PendingWorkerGroup {
                         worker: worker.clone(),
-                        located_blocks: Vec::new(),
+                        blocks: Vec::new(),
+                        has_spdk: false,
                         entries: Vec::new(),
                     });
                     index
                 }
             };
-            groups[group_index]
-                .located_blocks
-                .push(located_block.clone());
+            groups[group_index].blocks.push(located_block.block.clone());
+            groups[group_index].has_spdk |= located_block.has_spdk;
             groups[group_index].entries.push(WorkerGroupEntry {
                 original_index,
                 location_index,
@@ -229,9 +229,13 @@ impl BatchBlockWriter {
             |(group_index, group)| {
                 let fs_context = fs_context.clone();
                 async move {
-                    let result =
-                        BatchWriterAdapter::new(fs_context, group.located_blocks, &group.worker)
-                            .await;
+                    let result = BatchWriterAdapter::new(
+                        fs_context,
+                        group.blocks,
+                        group.has_spdk,
+                        &group.worker,
+                    )
+                    .await;
                     (group_index, group.entries, result)
                 }
             },
