@@ -159,7 +159,7 @@ impl BatchBlockWriterRemote {
         &self.worker_address
     }
 
-    pub fn actual_storage_type(&self, block_index: usize) -> StorageType {
+    pub(crate) fn actual_storage_type(&self, block_index: usize) -> StorageType {
         self.actual_storage_types[block_index]
     }
 }
