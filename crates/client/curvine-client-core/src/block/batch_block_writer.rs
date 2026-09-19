@@ -463,4 +463,49 @@ mod tests {
             .iter()
             .all(|group| group.entries.len() <= BLOCKS.div_ceil(WORKERS)));
     }
+
+    #[test]
+    fn grouping_maps_overlapping_replica_sets_to_original_locations() {
+        let blocks = vec![located_block(1, [1, 2]), located_block(2, [2, 3])];
+
+        let groups = group_blocks_by_worker(&blocks).unwrap();
+
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].worker.worker_id, 1);
+        assert_eq!(groups[0].entries.len(), 1);
+        assert_eq!(groups[0].entries[0].original_index, 0);
+        assert_eq!(groups[0].entries[0].location_index, 0);
+
+        assert_eq!(groups[1].worker.worker_id, 2);
+        assert_eq!(groups[1].entries.len(), 2);
+        assert_eq!(groups[1].entries[0].original_index, 0);
+        assert_eq!(groups[1].entries[0].location_index, 1);
+        assert_eq!(groups[1].entries[1].original_index, 1);
+        assert_eq!(groups[1].entries[1].location_index, 0);
+
+        assert_eq!(groups[2].worker.worker_id, 3);
+        assert_eq!(groups[2].entries.len(), 1);
+        assert_eq!(groups[2].entries[0].original_index, 1);
+        assert_eq!(groups[2].entries[0].location_index, 1);
+    }
+
+    #[test]
+    fn grouping_rejects_block_without_workers() {
+        let error = match group_blocks_by_worker(&[located_block(1, [])]) {
+            Ok(_) => panic!("grouping should reject a block without workers"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("no available worker"));
+    }
+
+    #[test]
+    fn grouping_rejects_duplicate_worker_for_block() {
+        let error = match group_blocks_by_worker(&[located_block(1, [1, 1])]) {
+            Ok(_) => panic!("grouping should reject duplicate workers"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("duplicate worker 1"));
+    }
 }
