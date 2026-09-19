@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::block::batch_block_writer::validate_batch_contexts;
 use crate::block::block_client::BlockClient;
 use crate::file::FsContext;
 use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
-use curvine_model::{ExtendedBlock, WorkerAddress};
+use curvine_model::{ExtendedBlock, StorageType, WorkerAddress};
 use curvine_runtime::common::Utils;
 
 pub struct BatchBlockWriterRemote {
@@ -28,6 +29,7 @@ pub struct BatchBlockWriterRemote {
     seq_id: i32,
     req_id: i64,
     block_size: i64,
+    actual_storage_types: Vec<StorageType>,
 }
 
 impl BatchBlockWriterRemote {
@@ -53,16 +55,29 @@ impl BatchBlockWriterRemote {
                 false,
             )
             .await?;
-
-        for context in &write_context.contexts {
-            if block_size != context.block_size {
-                return err_box!(
-                    "Abnormal block size, expected length {}, actual length {}",
-                    block_size,
-                    context.block_size
-                );
+        let validation = validate_batch_contexts(&blocks, &write_context.contexts).and_then(|_| {
+            for context in &write_context.contexts {
+                if block_size != context.block_size {
+                    return err_box!(
+                        "Abnormal block size, expected length {}, actual length {}",
+                        block_size,
+                        context.block_size
+                    );
+                }
             }
+            Ok(())
+        });
+        if let Err(error) = validation {
+            let _ = client
+                .write_commit_batch(&blocks, pos, block_size, req_id, seq_id, true)
+                .await;
+            return Err(error);
         }
+        let actual_storage_types = write_context
+            .contexts
+            .iter()
+            .map(|context| context.storage_type)
+            .collect();
 
         let writer = Self {
             blocks,
@@ -72,6 +87,7 @@ impl BatchBlockWriterRemote {
             seq_id,
             req_id,
             block_size,
+            actual_storage_types,
         };
 
         Ok(writer)
@@ -125,7 +141,25 @@ impl BatchBlockWriterRemote {
         Ok(())
     }
 
+    pub async fn cancel(&mut self) -> FsResult<()> {
+        let next_seq_id = self.next_seq_id();
+        self.client
+            .write_commit_batch(
+                &self.blocks,
+                self.pos,
+                self.block_size,
+                self.req_id,
+                next_seq_id,
+                true,
+            )
+            .await
+    }
+
     pub fn worker_address(&self) -> &WorkerAddress {
         &self.worker_address
+    }
+
+    pub(crate) fn actual_storage_type(&self, block_index: usize) -> StorageType {
+        self.actual_storage_types[block_index]
     }
 }
