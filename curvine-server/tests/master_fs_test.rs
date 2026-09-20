@@ -26,15 +26,16 @@ use curvine_model::{
 };
 use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
-    CompleteFileRequest, CompleteFileResponse, CreateFileRequest, DeleteRequest,
-    GetFilesystemInfoRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
+    BlockReportInfoProto, BlockReportListRequest, CompleteFileRequest, CompleteFileResponse,
+    CreateFileRequest, DeleteRequest, GetFilesystemInfoRequest, MkdirOptsProto, MkdirRequest,
+    RenameRequest,
 };
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
 use curvine_rpc::handler::MessageHandler;
-use curvine_rpc::message::Builder;
 #[cfg(feature = "fault-injection")]
 use curvine_rpc::message::ResponseStatus;
+use curvine_rpc::message::{Builder, MAX_DATE_SIZE};
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::Utils;
@@ -474,6 +475,70 @@ fn full_block_report_for_writing_missing_inode_schedules_worker_delete() -> Comm
     )?;
 
     assert_eq!(result.delete_blocks, vec![block_id]);
+    Ok(())
+}
+
+#[test]
+fn full_block_report_default_limit_to_master() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let count = MasterConf::DEFAULT_BLOCK_REPORT_LIMIT;
+    assert_eq!(MasterConf::default().block_report_limit, count);
+
+    let fs = new_fs(true, "full-block-report-100k");
+    let file = fs.create("/full-block-report-100k.log", false)?;
+    let worker_id = WorkerInfo::default().worker_id();
+
+    let blocks: Vec<_> = (0..count as i64)
+        .map(|seq| {
+            BlockReportInfo::new(
+                InodeId::create_block_id(file.id, seq).expect("block id"),
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                1,
+            )
+        })
+        .collect();
+
+    let req = BlockReportListRequest {
+        cluster_id: "curvine".into(),
+        worker_id,
+        full_report: true,
+        total_len: count as u64,
+        blocks: blocks
+            .iter()
+            .map(|block| BlockReportInfoProto {
+                id: block.id,
+                status: block.status.into(),
+                block_size: block.block_size,
+                storage_type: block.storage_type.into(),
+            })
+            .collect(),
+    };
+    let encoded = req.encode_to_vec();
+    assert!(
+        encoded.len() < MAX_DATE_SIZE as usize,
+        "100k-block report encoded to {} bytes, exceeds MAX_DATE_SIZE {}",
+        encoded.len(),
+        MAX_DATE_SIZE
+    );
+
+    let result = fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id,
+            full_report: true,
+            total_len: count as u64,
+            blocks,
+        },
+        None,
+    )?;
+    assert!(result.delete_blocks.is_empty());
+
+    let reported = {
+        let fs_dir = fs.fs_dir.read();
+        fs_dir.get_worker_block_ids(worker_id)?
+    };
+    assert_eq!(reported.len(), count);
     Ok(())
 }
 
