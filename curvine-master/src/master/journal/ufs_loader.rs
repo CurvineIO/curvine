@@ -146,6 +146,11 @@ impl UfsLoader {
             return Ok(());
         }
 
+        let entry_path = Path::from_str(&e.path)?;
+        let Some((_, mnt)) = self.get_mnt(&entry_path)? else {
+            return Ok(());
+        };
+
         // Rebuild via inode id so rename-after-open still exports to the live path.
         // Only fall back to e.path on typed not-found; store / corruption errors propagate.
         let path = match self.get_real_path(e.file.id) {
@@ -155,16 +160,12 @@ impl UfsLoader {
                     "complete_file: inode {} not found, fallback to entry.path={}",
                     e.file.id, e.path
                 );
-                Path::from_str(&e.path)?
+                entry_path
             }
             Err(err) => return Err(err.into()),
         };
-        if let Some((_, mnt)) = self.get_mnt(&path)? {
-            self.submit_export_task(&path, &mnt).await?;
-            Ok(())
-        } else {
-            Ok(())
-        }
+        self.submit_export_task(&path, &mnt).await?;
+        Ok(())
     }
 
     pub async fn rename(&self, e: &RenameEntry) -> CommonResult<()> {
