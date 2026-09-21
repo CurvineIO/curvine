@@ -26,6 +26,7 @@ use curvine_runtime::sync::channel::{
 };
 use curvine_runtime::sync::ErrorMonitor;
 use log::{debug, error};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::Permit;
 
@@ -46,14 +47,14 @@ struct PrefetchArgs {
     reader: FsReaderParallel,
     chunk_sender: AsyncSender<FileChunk>,
     task_receiver: AsyncReceiver<ReadTask>,
+    produced_end: Arc<AtomicI64>,
 }
 
 // Take the first chunk that covers or passes `pos`, discarding any chunk whose
-// tail is <= `pos` (residual data left after an absorbed seek). Empty EOF
-// sentinel chunks pass through unchanged.
-// NOTE: unused by production code until the seek-absorb integration lands in a
-// follow-up task.
-#[allow(dead_code)]
+// tail is <= `pos` (residual data left after an absorbed seek). This is the
+// unconditional read path for buffered lanes: in steady state pos == channel
+// head off, so the drain check is a zero-cost no-op. Empty EOF sentinel chunks
+// pass through unchanged.
 async fn recv_skipping_below(recv: &mut AsyncReceiver<FileChunk>, pos: i64) -> FsResult<FileChunk> {
     loop {
         let chunk = recv.recv_check().await?;
@@ -71,6 +72,7 @@ struct BufferChannel {
     chunk_receiver: AsyncReceiver<FileChunk>,
     task_sender: AsyncSender<ReadTask>,
     err_monitor: Arc<ErrorMonitor<FsError>>,
+    produced_end: Arc<AtomicI64>,
 }
 
 impl BufferChannel {
@@ -87,9 +89,13 @@ impl BufferChannel {
         let parallel_id = args.reader.parallel_id();
 
         args.rt.spawn(async move {
-            let res =
-                FsReaderBuffer::read_future(args.chunk_sender, args.task_receiver, args.reader)
-                    .await;
+            let res = FsReaderBuffer::read_future(
+                args.chunk_sender,
+                args.task_receiver,
+                args.reader,
+                args.produced_end,
+            )
+            .await;
             match res {
                 Ok(_) => {}
                 Err(e) => {
@@ -104,13 +110,16 @@ impl BufferChannel {
         });
     }
 
-    async fn read(&mut self) -> FsResult<FileChunk> {
+    async fn read(&mut self, want_pos: i64) -> FsResult<FileChunk> {
         self.start_prefetch();
 
-        self.chunk_receiver
-            .recv_check()
+        recv_skipping_below(&mut self.chunk_receiver, want_pos)
             .await
             .map_err(|e| self.check_error(e))
+    }
+
+    fn can_absorb(&self, pos: i64) -> bool {
+        pos <= self.produced_end.load(Ordering::Acquire)
     }
 
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
@@ -126,6 +135,11 @@ impl BufferChannel {
             // Both random and sequential reads need to clear buffer after seek,
             // because the prefetched data may be from the old position.
             while self.chunk_receiver.try_recv()?.is_some() {}
+
+            // Reset the produced watermark: the task is now paused and a stale
+            // high watermark must not let can_absorb false-accept (the covering
+            // chunk would never arrive, deadlocking the read).
+            self.produced_end.store(0, Ordering::Release);
 
             Ok::<(), FsError>(())
         };
@@ -164,9 +178,9 @@ enum ReaderAdapter {
 }
 
 impl ReaderAdapter {
-    async fn read(&mut self) -> FsResult<FileChunk> {
+    async fn read(&mut self, pos: i64) -> FsResult<FileChunk> {
         match self {
-            ReaderAdapter::Buffer(r) => r.read().await,
+            ReaderAdapter::Buffer(r) => r.read(pos).await,
             ReaderAdapter::Base(r) => r.read().await,
         }
     }
@@ -202,6 +216,7 @@ pub struct FsReaderBuffer {
     len: i64,
 
     slice_size: i64,
+    absorb_window: i64,
 
     read_detector: ReadDetector,
 }
@@ -220,6 +235,7 @@ impl FsReaderBuffer {
         let chunk_num = conf.read_chunk_num;
         let chunk_size = conf.read_chunk_size;
         let slice_size = conf.read_slice_size;
+        let absorb_window = conf.seek_absorb_window;
 
         let pos = 0;
         let len = file_blocks.status.len;
@@ -248,16 +264,19 @@ impl FsReaderBuffer {
             } else {
                 let (chunk_sender, chunk_receiver) = AsyncChannel::new(chunk_num).split();
                 let (task_sender, task_receiver) = AsyncChannel::new(2).split();
+                let produced_end = Arc::new(AtomicI64::new(0));
                 let channel = BufferChannel {
                     prefetch: Some(PrefetchArgs {
                         rt: rt.clone(),
                         reader,
                         chunk_sender,
                         task_receiver,
+                        produced_end: produced_end.clone(),
                     }),
                     chunk_receiver,
                     task_sender,
                     err_monitor: err_monitor.clone(),
+                    produced_end,
                 };
                 ReaderAdapter::Buffer(channel)
             };
@@ -274,6 +293,7 @@ impl FsReaderBuffer {
             pos,
             len,
             slice_size,
+            absorb_window,
             read_detector,
         };
         Ok(reader)
@@ -349,8 +369,9 @@ impl FsReaderBuffer {
             return Ok(DataSlice::Empty);
         }
 
+        let pos = self.pos;
         let reader = self.get_reader()?;
-        let mut chunk = reader.read().await?;
+        let mut chunk = reader.read(pos).await?;
 
         // Handle data alignment issues.
         // The chunk read by the underlying reader may be aligned according to chunk_size,
@@ -385,8 +406,44 @@ impl FsReaderBuffer {
         Ok(bytes)
     }
 
+    fn try_absorb(&mut self, pos: i64) -> bool {
+        if self.absorb_window <= 0 || pos - self.pos > self.absorb_window {
+            return false;
+        }
+        // 随机模式选中的是 base reader(无缓冲 channel),不可吸收。
+        let Some(id) = Self::select_reader_index(
+            self.read_detector.is_random(),
+            pos,
+            self.slice_size,
+            self.read_detector.read_parallel(),
+            self.base_reader_index,
+        ) else {
+            return false;
+        };
+        let Some(ReaderAdapter::Buffer(ch)) = self.readers.get_mut(id) else {
+            return false; // base reader 或未初始化
+        };
+        ch.start_prefetch(); // 保证预取任务已启动(否则水位必为 0,自然拒绝)
+        ch.can_absorb(pos)
+    }
+
     pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
         if pos == self.pos() {
+            return Ok(());
+        }
+
+        // 前向小跳且落在目标 lane 的已生产数据内:本地吸收,零后端交互。
+        if pos > self.pos && self.try_absorb(pos) {
+            debug!(
+                "seek absorbed: path={}, from={}, to={}, skipped={} bytes",
+                self.path,
+                self.pos,
+                pos,
+                pos - self.pos
+            );
+            self.read_detector.record_absorbed_seek(pos, &self.path);
+            self.pos = pos;
+            FsContext::get_metrics().seek_absorbed_total.inc();
             return Ok(());
         }
 
@@ -414,6 +471,7 @@ impl FsReaderBuffer {
         chunk_sender: AsyncSender<FileChunk>,
         mut task_receiver: AsyncReceiver<ReadTask>,
         mut reader: FsReaderParallel,
+        produced_end: Arc<AtomicI64>,
     ) -> FsResult<()> {
         let mut paused = false;
         loop {
@@ -470,6 +528,11 @@ impl FsReaderBuffer {
                     let chunk = reader.read().await?;
                     if chunk.is_empty() {
                         paused = true;
+                    } else {
+                        // Update the produced watermark before the chunk becomes
+                        // visible to consumers, so a seek target <= watermark is
+                        // guaranteed to be (or become) queued data.
+                        produced_end.store(chunk.off + chunk.len() as i64, Ordering::Release);
                     }
                     // Send the chunk (possibly empty) so the reader side does not block.
                     permit.send(chunk);
@@ -486,6 +549,12 @@ mod tests {
     use curvine_config::ClusterConf;
     use curvine_model::FileStatus;
 
+    // The seek-absorb tests assert on the process-global
+    // `ClientMetrics::seek_absorbed_total` counter, which is shared across all
+    // tests in this binary. Rust runs tests on parallel threads, so concurrent
+    // absorb tests would race on the counter; this mutex serializes them.
+    static ABSORB_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn sparse_file_blocks(len: i64) -> FileBlocks {
         FileBlocks::new(
             FileStatus {
@@ -496,6 +565,25 @@ mod tests {
             },
             vec![],
         )
+    }
+
+    fn absorb_reader(file_len: i64, absorb_window_str: &str) -> (FsReaderBuffer, Arc<Runtime>) {
+        let mut conf = ClusterConf::default();
+        conf.client.read_parallel = 4;
+        conf.client.read_chunk_num = 4;
+        conf.client.read_slice_size_str = "16MB".to_string();
+        conf.client.large_file_size_str = "1GB".to_string();
+        conf.client.enable_smart_prefetch = true;
+        conf.client.seek_absorb_window_str = absorb_window_str.to_string();
+        conf.client.init().unwrap();
+
+        let file_blocks = sparse_file_blocks(file_len);
+        let path = Path::from_str("/absorb-test").unwrap();
+        let read_detector = ReadDetector::with_conf(&conf.client, file_len);
+        let fs_context = Arc::new(FsContext::new(conf).unwrap());
+        let rt = fs_context.clone_runtime();
+        let reader = FsReaderBuffer::new(path, fs_context, file_blocks, read_detector).unwrap();
+        (reader, rt)
     }
 
     #[test]
@@ -568,5 +656,137 @@ mod tests {
         let chunk = recv_skipping_below(&mut rx, 4).await.unwrap(); // 稳态:pos == head off
         assert_eq!(chunk.off, 4);
         assert_eq!(chunk.len(), 4);
+    }
+
+    #[test]
+    fn test_seek_absorb_within_watermark() {
+        let _lock = ABSORB_TEST_LOCK.lock().unwrap();
+        let (mut reader, rt) = absorb_reader(4096, "4MB");
+
+        // Simulate the prefetch task of the selected lane having produced the
+        // chunk covering the seek target [4,8) and queue it for consumption.
+        if let Some(ReaderAdapter::Buffer(channel)) = reader.readers.get_mut(0) {
+            let tx = channel.prefetch.as_ref().unwrap().chunk_sender.clone();
+            rt.block_on(tx.send(FileChunk::with_buf(4, BytesMut::from(&b"bbbb"[..]))))
+                .unwrap();
+            channel
+                .produced_end
+                .store(8, std::sync::atomic::Ordering::Release);
+        } else {
+            panic!("lane 0 must be a buffered channel");
+        }
+        let metrics = FsContext::get_metrics();
+        let absorbed_before = metrics.seek_absorbed_total.get();
+
+        // Forward seek from 0 to 6: inside the window and covered by produced data.
+        rt.block_on(reader.seek(6)).unwrap();
+
+        assert!(reader.read_detector.is_sequential());
+        assert_eq!(reader.pos(), 6);
+        assert_eq!(metrics.seek_absorbed_total.get(), absorbed_before + 1);
+
+        // The next read aligns chunk [4,8) to pos 6 and returns its tail.
+        let data = rt.block_on(reader.read()).unwrap();
+        assert_eq!(data.as_slice(), b"bb");
+        assert_eq!(reader.pos(), 8);
+    }
+
+    // Convert a buffered-lane seek/read sequence into futures driven on the
+    // reader's own runtime. All four tests share the process-global
+    // seek_absorbed_total counter, so they are serialized via ABSORB_TEST_LOCK.
+    #[tokio::test]
+    async fn test_seek_absorb_drains_covered_chunks() {
+        let _lock = ABSORB_TEST_LOCK.lock().unwrap();
+        let (mut reader, _rt) = absorb_reader(4096, "4MB");
+
+        // Two already-produced chunks [0,4) and [4,8); the seek target 6 is
+        // covered by the second one.
+        if let Some(ReaderAdapter::Buffer(channel)) = reader.readers.get_mut(0) {
+            let tx = channel.prefetch.as_ref().unwrap().chunk_sender.clone();
+            tx.send(FileChunk::with_buf(0, BytesMut::from(&b"aaaa"[..])))
+                .await
+                .unwrap();
+            tx.send(FileChunk::with_buf(4, BytesMut::from(&b"bbbb"[..])))
+                .await
+                .unwrap();
+            channel
+                .produced_end
+                .store(8, std::sync::atomic::Ordering::Release);
+        } else {
+            panic!("lane 0 must be a buffered channel");
+        }
+
+        reader.seek(6).await.unwrap();
+        assert!(reader.read_detector.is_sequential());
+        assert_eq!(reader.pos(), 6);
+
+        // The read drains chunk [0,4) (tail <= pos) and aligns [4,8) to pos 6.
+        let data = reader.read().await.unwrap();
+        assert_eq!(data.as_slice(), b"bb");
+        assert_eq!(reader.pos(), 8);
+    }
+
+    #[test]
+    fn test_seek_absorb_rejected_beyond_watermark() {
+        let _lock = ABSORB_TEST_LOCK.lock().unwrap();
+        let (mut reader, rt) = absorb_reader(4096, "4MB");
+
+        if let Some(ReaderAdapter::Buffer(channel)) = reader.readers.get_mut(0) {
+            channel
+                .produced_end
+                .store(8, std::sync::atomic::Ordering::Release);
+        } else {
+            panic!("lane 0 must be a buffered channel");
+        }
+
+        // Forward seek to 12: within the absorb window but beyond the watermark.
+        // The seek must fall back to the full path, flipping the detector to
+        // Random. The buffered lanes have no backend blocks, so their seek fails
+        // inside the task and the error surfaces through the monitor.
+        let absorbed_before = FsContext::get_metrics().seek_absorbed_total.get();
+        let res = rt.block_on(reader.seek(12));
+        if res.is_ok() {
+            assert_eq!(reader.pos(), 12);
+        } else {
+            // Failed full-path seek: readers are left seeking, pos stays put.
+            assert_eq!(reader.pos(), 0);
+        }
+        assert!(reader.read_detector.is_random());
+        // The watermark gate must have refused absorption: no absorb happened,
+        // so the counter is unchanged (a buggy absorb would increment it even
+        // if a later record_seek flipped the pattern to Random).
+        assert_eq!(
+            FsContext::get_metrics().seek_absorbed_total.get(),
+            absorbed_before
+        );
+    }
+
+    #[test]
+    fn test_seek_absorb_window_zero_disabled() {
+        let _lock = ABSORB_TEST_LOCK.lock().unwrap();
+        let (mut reader, rt) = absorb_reader(4096, "0");
+
+        if let Some(ReaderAdapter::Buffer(channel)) = reader.readers.get_mut(0) {
+            channel
+                .produced_end
+                .store(8, std::sync::atomic::Ordering::Release);
+        } else {
+            panic!("lane 0 must be a buffered channel");
+        }
+
+        // Window disabled: even a seek covered by produced data is not absorbed.
+        let absorbed_before = FsContext::get_metrics().seek_absorbed_total.get();
+        let res = rt.block_on(reader.seek(6));
+        if res.is_ok() {
+            assert_eq!(reader.pos(), 6);
+        } else {
+            assert_eq!(reader.pos(), 0);
+        }
+        assert!(reader.read_detector.is_random());
+        // The window gate must have refused absorption: counter unchanged.
+        assert_eq!(
+            FsContext::get_metrics().seek_absorbed_total.get(),
+            absorbed_before
+        );
     }
 }
