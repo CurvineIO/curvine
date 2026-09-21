@@ -48,6 +48,21 @@ struct PrefetchArgs {
     task_receiver: AsyncReceiver<ReadTask>,
 }
 
+// Take the first chunk that covers or passes `pos`, discarding any chunk whose
+// tail is <= `pos` (residual data left after an absorbed seek). Empty EOF
+// sentinel chunks pass through unchanged.
+// NOTE: unused by production code until the seek-absorb integration lands in a
+// follow-up task.
+#[allow(dead_code)]
+async fn recv_skipping_below(recv: &mut AsyncReceiver<FileChunk>, pos: i64) -> FsResult<FileChunk> {
+    loop {
+        let chunk = recv.recv_check().await?;
+        if chunk.is_empty() || chunk.off + chunk.len() as i64 > pos {
+            return Ok(chunk);
+        }
+    }
+}
+
 // A parallel task description structure
 // chunk_receiver: accept data
 // task_sender: Send control command
@@ -467,6 +482,7 @@ impl FsReaderBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::BytesMut;
     use curvine_config::ClusterConf;
     use curvine_model::FileStatus;
 
@@ -504,5 +520,53 @@ mod tests {
         rt.block_on(reader.seek(file_len)).unwrap();
         assert!(reader.read_detector.is_random());
         assert!(reader.get_reader().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_recv_skipping_below_discards_covered() {
+        let (tx, mut rx) = AsyncChannel::<FileChunk>::new(8).split();
+        tx.send(FileChunk::with_buf(0, BytesMut::from(&b"aaaa"[..])))
+            .await
+            .unwrap();
+        tx.send(FileChunk::with_buf(4, BytesMut::from(&b"bbbb"[..])))
+            .await
+            .unwrap();
+        tx.send(FileChunk::with_buf(8, BytesMut::from(&b"cccc"[..])))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let chunk = recv_skipping_below(&mut rx, 6).await.unwrap();
+        assert_eq!(chunk.off, 4); // chunk[0,4) 整体低于 6 被丢弃;[4,8) 覆盖 6
+    }
+
+    #[tokio::test]
+    async fn test_recv_skipping_below_boundary_and_eof() {
+        let (tx, mut rx) = AsyncChannel::<FileChunk>::new(8).split();
+        tx.send(FileChunk::with_buf(0, BytesMut::from(&b"aaaa"[..])))
+            .await
+            .unwrap();
+        tx.send(FileChunk::with_buf(4, BytesMut::from(&b"bbbb"[..])))
+            .await
+            .unwrap();
+        tx.send(FileChunk::default()).await.unwrap(); // EOF 哨兵
+        drop(tx);
+
+        // pos 恰在 chunk 末尾边界:整条丢弃,取到 EOF 哨兵(直通,不参与位置比较)
+        let chunk = recv_skipping_below(&mut rx, 8).await.unwrap();
+        assert!(chunk.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_recv_skipping_below_noop_when_head_covers() {
+        let (tx, mut rx) = AsyncChannel::<FileChunk>::new(8).split();
+        tx.send(FileChunk::with_buf(4, BytesMut::from(&b"bbbb"[..])))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let chunk = recv_skipping_below(&mut rx, 4).await.unwrap(); // 稳态:pos == head off
+        assert_eq!(chunk.off, 4);
+        assert_eq!(chunk.len(), 4);
     }
 }
