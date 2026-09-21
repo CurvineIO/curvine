@@ -51,10 +51,12 @@ struct PrefetchArgs {
 }
 
 // Take the first chunk that covers or passes `pos`, discarding any chunk whose
-// tail is <= `pos` (residual data left after an absorbed seek). This is the
-// unconditional read path for buffered lanes: in steady state pos == channel
-// head off, so the drain check is a zero-cost no-op. Empty EOF sentinel chunks
-// pass through unchanged.
+// tail is <= `pos` (residual data left after an absorbed seek). Used only after
+// an absorb fired (BufferChannel::needs_drain): in steady state the plain
+// `recv_check` path is kept, so a chunk arriving wholly below pos without a
+// prior absorb still trips the "read data error" corruption guard upstream,
+// byte-identical to the original behavior at window=0. Empty EOF sentinel
+// chunks pass through unchanged.
 async fn recv_skipping_below(recv: &mut AsyncReceiver<FileChunk>, pos: i64) -> FsResult<FileChunk> {
     loop {
         let chunk = recv.recv_check().await?;
@@ -73,6 +75,10 @@ struct BufferChannel {
     task_sender: AsyncSender<ReadTask>,
     err_monitor: Arc<ErrorMonitor<FsError>>,
     produced_end: Arc<AtomicI64>,
+    // True between a successful absorb and the next full seek: only then may
+    // read() drain residual below-pos chunks. Outside absorbed seeks, chunks
+    // wholly below pos must still trip the upstream "read data error" guard.
+    needs_drain: bool,
 }
 
 impl BufferChannel {
@@ -113,13 +119,31 @@ impl BufferChannel {
     async fn read(&mut self, want_pos: i64) -> FsResult<FileChunk> {
         self.start_prefetch();
 
-        recv_skipping_below(&mut self.chunk_receiver, want_pos)
-            .await
-            .map_err(|e| self.check_error(e))
+        if self.needs_drain {
+            // An absorbed seek may have left residual chunks wholly below pos;
+            // skip them. Self-limiting: once the covering chunk is consumed,
+            // the head matches pos again. The flag stays set until the next
+            // full seek resets it, so later reads after another absorb on this
+            // lane drain as well.
+            recv_skipping_below(&mut self.chunk_receiver, want_pos)
+                .await
+                .map_err(|e| self.check_error(e))
+        } else {
+            self.chunk_receiver
+                .recv_check()
+                .await
+                .map_err(|e| self.check_error(e))
+        }
     }
 
     fn can_absorb(&self, pos: i64) -> bool {
         pos <= self.produced_end.load(Ordering::Acquire)
+    }
+
+    // Record that a forward seek was absorbed against this lane: reads that
+    // follow may need to drain residual chunks left below the new position.
+    fn mark_absorbed(&mut self) {
+        self.needs_drain = true;
     }
 
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
@@ -138,8 +162,13 @@ impl BufferChannel {
 
             // Reset the produced watermark: the task is now paused and a stale
             // high watermark must not let can_absorb false-accept (the covering
-            // chunk would never arrive, deadlocking the read).
+            // chunk would never arrive, deadlocking the read). This drain+reset
+            // is also the hygiene point for the Sequential->Random flip seek:
+            // with absorption enabled the random phase repositions only the
+            // base reader, so this is the one place lane channels are emptied
+            // and watermarks zeroed before lanes sit idle.
             self.produced_end.store(0, Ordering::Release);
+            self.needs_drain = false;
 
             Ok::<(), FsError>(())
         };
@@ -277,6 +306,7 @@ impl FsReaderBuffer {
                     task_sender,
                     err_monitor: err_monitor.clone(),
                     produced_end,
+                    needs_drain: false,
                 };
                 ReaderAdapter::Buffer(channel)
             };
@@ -424,7 +454,11 @@ impl FsReaderBuffer {
             return false; // base reader 或未初始化
         };
         ch.start_prefetch(); // 保证预取任务已启动(否则水位必为 0,自然拒绝)
-        ch.can_absorb(pos)
+        let absorbed = ch.can_absorb(pos);
+        if absorbed {
+            ch.mark_absorbed(); // 后续 read 需要 drain 掉 pos 之下的残留 chunk
+        }
+        absorbed
     }
 
     pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
@@ -447,10 +481,19 @@ impl FsReaderBuffer {
             return Ok(());
         }
 
+        // Capture the pattern BEFORE record_seek mutates it: the
+        // Sequential->Random flip seek itself must still take the full loop so
+        // every lane's BufferChannel::seek pauses the task, drains stale
+        // chunks, and resets the watermark. Skipping that on the flip seek
+        // leaves lanes holding stale data through the Random phase, and the
+        // next read after flip-back pops a chunk with off > pos -> EIO
+        // (reachable with the default window=0 config).
+        let was_random = self.read_detector.is_random();
         self.read_detector.record_seek(&self.path);
-        if self.read_detector.enabled && self.read_detector.is_random() {
-            // 随机模式只有 base reader 服务读;lane 由 Random→Sequential 翻转时的
-            // pause(pos, false) 循环统一重定位。
+        if self.read_detector.enabled && was_random && self.absorb_window > 0 {
+            // 随机模式且吸收特性开启:只有 base reader 服务读;lane 在翻转 seek
+            // 时已 pause/drain,由 Random→Sequential 的 pause(pos, false) 循环
+            // 统一重定位。window=0 时走全量循环,与上游逐字节一致。
             if let Some(base) = self.readers.get_mut(self.base_reader_index) {
                 base.seek(pos).await?;
             }
@@ -667,7 +710,9 @@ mod tests {
 
     #[test]
     fn test_seek_absorb_within_watermark() {
-        let _lock = ABSORB_TEST_LOCK.lock().unwrap();
+        let _lock = ABSORB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (mut reader, rt) = absorb_reader(4096, "4MB");
 
         // Simulate the prefetch task of the selected lane having produced the
@@ -734,9 +779,11 @@ mod tests {
     // Convert a buffered-lane seek/read sequence into futures driven on the
     // reader's own runtime. All four tests share the process-global
     // seek_absorbed_total counter, so they are serialized via ABSORB_TEST_LOCK.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_seek_absorb_drains_covered_chunks() {
-        let _lock = ABSORB_TEST_LOCK.lock().unwrap();
+        let _lock = ABSORB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (mut reader, _rt) = absorb_reader(4096, "4MB");
 
         // Two already-produced chunks [0,4) and [4,8); the seek target 6 is
@@ -768,7 +815,9 @@ mod tests {
 
     #[test]
     fn test_seek_absorb_rejected_beyond_watermark() {
-        let _lock = ABSORB_TEST_LOCK.lock().unwrap();
+        let _lock = ABSORB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (mut reader, rt) = absorb_reader(4096, "4MB");
 
         if let Some(ReaderAdapter::Buffer(channel)) = reader.readers.get_mut(0) {
@@ -803,7 +852,9 @@ mod tests {
 
     #[test]
     fn test_seek_absorb_window_zero_disabled() {
-        let _lock = ABSORB_TEST_LOCK.lock().unwrap();
+        let _lock = ABSORB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (mut reader, rt) = absorb_reader(4096, "0");
 
         if let Some(ReaderAdapter::Buffer(channel)) = reader.readers.get_mut(0) {
@@ -828,5 +879,79 @@ mod tests {
             FsContext::get_metrics().seek_absorbed_total.get(),
             absorbed_before
         );
+    }
+
+    // Regression for the flip-seek stale-lane EIO: the Sequential -> Random
+    // flip seek must take the FULL lane loop so every lane's BufferChannel::seek
+    // drains its channel and resets its watermark to 0. On the unfixed code the
+    // base-only branch fired on the flip seek itself, leaving stale chunks and
+    // a stale-high watermark in the lanes; on flip-back the next read popped a
+    // chunk with off > pos -> "read data error" -> EIO (reachable at window=0
+    // defaults). On unfixed code neither the drain nor the reset happens, so
+    // the stale chunk survives and this test is RED.
+    #[test]
+    fn test_flip_seek_drains_lane_state() {
+        let _lock = ABSORB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut reader, rt) = absorb_reader(4096, "4MB");
+        // Match the flip-seek production scenario: lane prefetch has produced
+        // into the channels but NO absorb has happened (this seek will flip
+        // Sequential -> Random, which is exactly when stale lanes bite).
+        reader.pos = 10;
+
+        // Simulate a prefetched lane whose task already started: inject a stale
+        // chunk through a CLONED sender (so the lane's own PrefetchArgs sender
+        // can be dropped below), start the task, and set a stale-high watermark.
+        let lane_tx = if let Some(ReaderAdapter::Buffer(channel)) = reader.readers.get_mut(0) {
+            let tx = channel.prefetch.as_ref().unwrap().chunk_sender.clone();
+            rt.block_on(tx.send(FileChunk::with_buf(4, BytesMut::from(&b"bbbb"[..]))))
+                .unwrap();
+            channel.start_prefetch();
+            channel
+                .produced_end
+                .store(8, std::sync::atomic::Ordering::Release);
+            tx
+        } else {
+            panic!("lane 0 must be a buffered channel");
+        };
+        // Drop the test handle: the lane task's own sender is the only one
+        // left, and the channel closes when the task consumes it.
+        drop(lane_tx);
+
+        // Backward full-path seek from Sequential: not absorbable (pos moves
+        // backward). BufferChannel::seek notifies the started lane task (the
+        // Seek task pauses it) and drains the channel; the lane task then
+        // consumes its own sender, closing the channel so the drain loop can
+        // terminate. Give the runtime a moment for that close to propagate
+        // (test-only; production readers read from the channels, so queued
+        // data never lingers like this).
+        let res1 = rt.block_on(reader.seek(0));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let res2 = rt.block_on(reader.seek(0));
+        let _ = (res1, res2); // results intentionally unused; asserts below pin lane state
+
+        // The flip seek must have drained lane state regardless of whether the
+        // backend seek succeeded.
+        if let Some(ReaderAdapter::Buffer(channel)) = reader.readers.get_mut(0) {
+            let leftover = channel
+                .chunk_receiver
+                .try_recv()
+                .expect("try_recv on lane channel must not fail");
+            assert!(
+                leftover.is_none(),
+                "flip seek must drain stale chunks from the lane channel, got {:?}",
+                leftover.map(|c| (c.off, c.len()))
+            );
+            assert_eq!(
+                channel
+                    .produced_end
+                    .load(std::sync::atomic::Ordering::Acquire),
+                0,
+                "flip seek must reset the produced watermark to 0"
+            );
+        } else {
+            panic!("lane 0 must be a buffered channel");
+        }
     }
 }
