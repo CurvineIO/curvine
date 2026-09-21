@@ -448,11 +448,18 @@ impl FsReaderBuffer {
         }
 
         self.read_detector.record_seek(&self.path);
-        for reader in &mut self.readers {
-            reader.seek(pos).await?;
-
-            if !self.read_detector.enabled {
-                reader.pause(pos, false).await?;
+        if self.read_detector.enabled && self.read_detector.is_random() {
+            // 随机模式只有 base reader 服务读;lane 由 Random→Sequential 翻转时的
+            // pause(pos, false) 循环统一重定位。
+            if let Some(base) = self.readers.get_mut(self.base_reader_index) {
+                base.seek(pos).await?;
+            }
+        } else {
+            for reader in &mut self.readers {
+                reader.seek(pos).await?;
+                if !self.read_detector.enabled {
+                    reader.pause(pos, false).await?;
+                }
             }
         }
 
@@ -689,6 +696,39 @@ mod tests {
         let data = rt.block_on(reader.read()).unwrap();
         assert_eq!(data.as_slice(), b"bb");
         assert_eq!(reader.pos(), 8);
+    }
+
+    // 随机模式 seek 只重定位 base reader:seek 到两个不同远端位置后,
+    // get_reader() 仍指向 base、detector 保持 Random、pos 生效。
+    // (行为优化而非语义变化;作为回归保护防止退化回 N+1 全量重定位。)
+    #[test]
+    fn test_random_mode_seek_repositions_base_only() {
+        let (mut reader, rt) = absorb_reader(4096, "4MB");
+        let base_index = reader.base_reader_index;
+
+        // First full-path seek flips Sequential -> Random. The sparse file has
+        // no backing blocks, so reader-side seeks may fail; the detector must
+        // already be Random either way (record_seek runs before repositioning).
+        let res = rt.block_on(reader.seek(1024));
+        assert!(reader.read_detector.is_random());
+        if res.is_ok() {
+            assert_eq!(reader.pos(), 1024);
+        } else {
+            assert_eq!(reader.pos(), 0);
+        }
+        assert!(reader.get_reader().is_ok());
+        assert_eq!(reader.base_reader_index, base_index);
+
+        // Second seek while already Random: base-only path must keep semantics.
+        let res = rt.block_on(reader.seek(3072));
+        assert!(reader.read_detector.is_random());
+        if res.is_ok() {
+            assert_eq!(reader.pos(), 3072);
+        } else {
+            assert_eq!(reader.pos(), 0);
+        }
+        assert!(reader.get_reader().is_ok());
+        assert_eq!(reader.base_reader_index, base_index);
     }
 
     // Convert a buffered-lane seek/read sequence into futures driven on the
