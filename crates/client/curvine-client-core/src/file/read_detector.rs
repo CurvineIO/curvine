@@ -561,6 +561,8 @@ mod tests {
 
     #[test]
     fn test_record_absorbed_seek_random_phase_counts_continuation() {
+        // Production never absorbs during Random (try_absorb rejects the base
+        // reader); this test pins the method-level contract only.
         let conf = create_test_conf(true, 3);
         let mut detector = ReadDetector::with_conf(&conf, 1000);
         let path = create_test_path();
