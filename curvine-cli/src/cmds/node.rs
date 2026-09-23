@@ -36,11 +36,11 @@ pub struct NodeCommand {
     versions: bool,
 
     /// add decommission node
-    #[arg(long)]
+    #[arg(long, visible_alias = "add-dcm")]
     add_decommission: bool,
 
     /// remove decommission node
-    #[arg(long)]
+    #[arg(long, visible_alias = "remove-dcm")]
     remove_decommission: bool,
 
     /// node list with port (format: hostname:port), comma separated for multiple nodes
