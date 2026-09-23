@@ -943,6 +943,7 @@ fn ttl_executor_deletes_nested_expired_inode() -> CommonResult<()> {
         opts,
         OpenFlags::new_create().set_overwrite(true),
     )?;
+    fs.complete_file("/ttl/a/b/file.log", None, 0, vec![], "", false, None)?;
 
     std::thread::sleep(Duration::from_millis(10));
     let executor = InodeTtlExecutor::with_managers(fs.clone());
@@ -984,6 +985,15 @@ fn ttl_executor_deletes_expired_directory_after_child_file() -> CommonResult<()>
         file_opts,
         OpenFlags::new_create().set_overwrite(true),
     )?;
+    fs.complete_file(
+        "/ttl/expired-dir/file.log",
+        None,
+        0,
+        vec![],
+        "",
+        false,
+        None,
+    )?;
 
     std::thread::sleep(Duration::from_millis(10));
     let dir_mtime_before_child_delete = fs.file_status("/ttl/expired-dir")?.mtime;
@@ -1013,6 +1023,65 @@ fn ttl_executor_deletes_expired_directory_after_child_file() -> CommonResult<()>
     assert!(
         fs.file_status("/ttl/expired-dir").is_err(),
         "TTL delete should remove the expired directory, not only its child file"
+    );
+
+    Ok(())
+}
+
+// An expired directory must not take unexpired children with it. The
+// directory stays until those children are gone, then the next TTL pass
+// removes the empty directory.
+#[test]
+fn ttl_executor_skips_non_empty_expired_directory() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "ttl-executor-non-empty-dir");
+
+    let dir_opts = MkdirOptsBuilder::new()
+        .create_parent(true)
+        .ttl_ms(1)
+        .ttl_action(TtlAction::Delete)
+        .build();
+    let dir = fs.mkdir_with_opts("/ttl/live-children", dir_opts)?;
+
+    let file_opts = CreateFileOptsBuilder::new()
+        .ttl_ms(3_600_000)
+        .ttl_action(TtlAction::Delete)
+        .build();
+    fs.create_with_opts(
+        "/ttl/live-children/file.log",
+        file_opts,
+        OpenFlags::new_create().set_overwrite(true),
+    )?;
+
+    std::thread::sleep(Duration::from_millis(10));
+    let dir_mtime = fs.file_status("/ttl/live-children")?.mtime;
+    let executor = InodeTtlExecutor::with_managers(fs.clone());
+
+    let (dir_processed, inode) = executor.execute_by_id(dir.id)?;
+    assert!(
+        !dir_processed,
+        "expired directory with a live child must be deferred"
+    );
+    assert_eq!(inode.id(), dir.id);
+    assert!(
+        fs.file_status("/ttl/live-children/file.log").is_ok(),
+        "unexpired child must survive the parent directory TTL"
+    );
+    assert_eq!(
+        fs.file_status("/ttl/live-children")?.mtime,
+        dir_mtime,
+        "deferring a non-empty directory must not refresh its mtime"
+    );
+
+    fs.delete("/ttl/live-children/file.log", false)?;
+    let (dir_processed, _) = executor.execute_by_id(dir.id)?;
+    assert!(
+        dir_processed,
+        "expired directory should be deleted once it is empty"
+    );
+    assert!(
+        fs.file_status("/ttl/live-children").is_err(),
+        "empty expired directory should be removed on the following TTL pass"
     );
 
     Ok(())
