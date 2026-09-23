@@ -246,16 +246,28 @@ impl WorkerManager {
         let mut addrs = Vec::with_capacity(locs.len());
         let mut live_storage_types = Vec::with_capacity(locs.len());
         for loc in locs {
-            if let Some(info) = self.get_worker(loc.worker_id) {
-                addrs.push(info.address.clone());
-                live_storage_types.push(loc.storage_type);
-            } else {
-                warn!(
-                    "File {} block {}, worker {} replicas has been lost",
-                    path.as_ref(),
-                    block.id,
-                    loc.worker_id
-                );
+            match self.get_worker(loc.worker_id) {
+                Some(info) if info.is_live() => {
+                    addrs.push(info.address.clone());
+                    live_storage_types.push(loc.storage_type);
+                }
+                Some(info) => {
+                    warn!(
+                        "File {} block {}, worker {} is not alive (status={:?}), replica excluded",
+                        path.as_ref(),
+                        block.id,
+                        loc.worker_id,
+                        info.status
+                    );
+                }
+                None => {
+                    warn!(
+                        "File {} block {}, worker {} replicas has been lost",
+                        path.as_ref(),
+                        block.id,
+                        loc.worker_id
+                    );
+                }
             }
         }
 
@@ -398,6 +410,43 @@ mod tests {
         worker.scheduled_bytes = 5;
         manager.add_test_worker(worker);
         assert_eq!(manager.available_bytes(), 15);
+    }
+
+    #[test]
+    fn create_locate_block_excludes_non_live_workers() {
+        let mut manager = WorkerManager::new(&ClusterConf::default()).unwrap();
+        manager.add_test_worker(worker_with_available(1, 100));
+        let mut blacklisted = worker_with_available(2, 100);
+        blacklisted.status = WorkerStatus::Blacklist;
+        manager.add_test_worker(blacklisted);
+        let mut decommissioned = worker_with_available(3, 100);
+        decommissioned.status = WorkerStatus::Decommission;
+        manager.add_test_worker(decommissioned);
+
+        let block = ExtendedBlock::new(7, 128, StorageType::Disk, curvine_model::FileType::File);
+        let locs = vec![
+            BlockLocation::with_id(1),
+            BlockLocation::with_id(2),
+            BlockLocation::with_id(3),
+            BlockLocation::with_id(4),
+        ];
+        let located = manager.create_locate_block("/a", block, &locs).unwrap();
+        assert_eq!(located.locs.len(), 1);
+        assert_eq!(located.locs[0].worker_id, 1);
+    }
+
+    #[test]
+    fn create_locate_block_errors_when_no_live_replica_remains() {
+        let mut manager = WorkerManager::new(&ClusterConf::default()).unwrap();
+        let mut blacklisted = worker_with_available(2, 100);
+        blacklisted.status = WorkerStatus::Blacklist;
+        manager.add_test_worker(blacklisted);
+
+        let block = ExtendedBlock::new(7, 128, StorageType::Disk, curvine_model::FileType::File);
+        let err = manager
+            .create_locate_block("/a", block, &[BlockLocation::with_id(2)])
+            .unwrap_err();
+        assert!(err.to_string().contains("all replicas has been lost"));
     }
 
     #[test]
