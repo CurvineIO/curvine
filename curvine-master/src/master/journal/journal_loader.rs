@@ -219,6 +219,22 @@ impl JournalLoader {
         }
     }
 
+    async fn replay_entry(&self, is_leader: bool, entry: &JournalEntry) -> CommonResult<()> {
+        {
+            let fs_dir = self.fs_dir.read();
+            fs_dir.update_op_id(entry.op_id());
+            if let Some(inode_id) = entry.inode_id() {
+                fs_dir.update_last_inode_id(inode_id)?;
+            }
+        }
+
+        if is_leader {
+            self.ufs_loader.apply_entry(entry).await
+        } else {
+            self.apply_entry(entry.clone())
+        }
+    }
+
     async fn apply0(
         &self,
         is_leader: bool,
@@ -273,34 +289,15 @@ impl JournalLoader {
                 _ => has_ufs_affecting = true,
             }
 
-            {
-                let fs_dir = self.fs_dir.read();
-                if !is_leader {
-                    if let Some(inode_id) = op_entry.allocated_inode_id() {
-                        let last_inode_id = fs_dir.last_inode_id();
-                        if inode_id <= last_inode_id {
-                            return err_box!(
-                                "refusing duplicate inode allocation during follower replay: inode_id={}, last_inode_id={}, journal={:?}",
-                                inode_id,
-                                last_inode_id,
-                                op_entry
-                            );
-                        }
-                    }
+            if let Err(e) = self.replay_entry(is_leader, &op_entry).await {
+                if self.ignore_reply_error {
+                    error!(
+                        "skip failed journal replay, entry index={}, term={}, journal={:?}, error={}",
+                        entry.index, entry.term, op_entry, e
+                    );
+                    continue;
                 }
-                fs_dir.update_op_id(op_entry.op_id());
-                if let Some(inode_id) = op_entry.inode_id() {
-                    fs_dir.update_last_inode_id(inode_id)?;
-                }
-            }
 
-            let res = if is_leader {
-                self.ufs_loader.apply_entry(&op_entry).await
-            } else {
-                self.apply_entry(op_entry.clone())
-            };
-
-            if let Err(e) = res {
                 if is_leader && skip_ufs_error {
                     error!(
                         "skip failed UFS replay after retries, entry index={}, term={}, journal={:?}, error={}",
@@ -480,10 +477,7 @@ impl JournalLoader {
                     }
 
                     Err(error) => {
-                        if self.ignore_reply_error {
-                            error!("apply entry failed(skip): {}", error);
-                            Self::complete_entry_ack(msg, Ok(()));
-                        } else if is_leader {
+                        if is_leader {
                             retry_num += 1;
 
                             if retry_num >= self.max_retry_num {
@@ -961,16 +955,7 @@ impl JournalLoader {
     }
 
     async fn apply_direct(&self, msg: ApplyMsg) -> RaftResult<()> {
-        let result = if let Err(e) = self.apply_msg(false, &msg, false).await {
-            if self.ignore_reply_error {
-                error!("apply entry failed: {}", e);
-                Ok(())
-            } else {
-                Err(e.into())
-            }
-        } else {
-            Ok(())
-        };
+        let result = self.apply_msg(false, &msg, false).await.map_err(Into::into);
 
         if matches!(&msg, ApplyMsg::EntryWithAck(_)) {
             Self::complete_entry_ack(msg, result);
