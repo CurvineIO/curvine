@@ -1027,12 +1027,10 @@ impl MasterHandler {
         self.metrics.rpc_request_total_time.inc_by(used_us as i64);
         self.metrics.rpc_request_total_count.inc();
 
-        if ctx.code != RpcCode::WorkerHeartbeat {
-            self.metrics
-                .operation_duration
-                .with_label_values(&[&code_label])
-                .observe(used_us as f64);
-        };
+        self.metrics
+            .operation_duration
+            .with_label_values(&[&code_label])
+            .observe(used_us as f64);
     }
 }
 
