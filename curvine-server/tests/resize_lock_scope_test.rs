@@ -76,7 +76,7 @@ fn resize_does_not_hold_fs_lock_while_waiting_worker_manager() {
     );
 
     assert!(
-        fs.fs_dir.try_read().is_ok(),
+        fs.fs_dir.try_read().is_some(),
         "resize must not keep fs_dir locked while waiting on worker_manager"
     );
 

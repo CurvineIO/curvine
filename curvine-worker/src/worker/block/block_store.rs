@@ -347,8 +347,13 @@ impl BlockStore {
     }
 
     pub fn all_blocks(&self) -> CommonResult<Vec<BlockMeta>> {
-        let state = self.read()?;
-        Ok(state.all_blocks())
+        let mut blocks = {
+            let state = self.read()?;
+            state.all_blocks()
+        };
+        // Keep each inode's blocks together when full reports are paginated.
+        blocks.sort_unstable_by_key(|block| block.id);
+        Ok(blocks)
     }
 
     pub fn remove_block(&self, id: i64) -> CommonResult<()> {
@@ -678,6 +683,42 @@ mod tests {
         assert!(store.short_circuit_by_id(block.id)?.is_none());
 
         store.write()?.rollback_file_finalize(&reservation)?;
+        Ok(())
+    }
+
+    #[test]
+    fn full_report_inventory_is_sorted_without_changing_metadata() -> CommonResult<()> {
+        let store = create_store("sorted-full-report")?;
+        assert!(store.all_blocks()?.is_empty());
+        {
+            let mut state = store.write()?;
+            for index in 0..32 {
+                let id = ((index * 17) % 32) + 1;
+                let mut meta = BlockMeta::new(id, id * 10, state.dir_iter().next().unwrap());
+                meta.state = match index % 3 {
+                    0 => BlockState::Finalized,
+                    1 => BlockState::Writing,
+                    _ => BlockState::Finalizing,
+                };
+                meta.actual_len = id * 7;
+                state.put_test_meta(meta);
+            }
+        }
+
+        let inventory = store.all_blocks()?;
+        assert_eq!(
+            inventory.iter().map(|block| block.id).collect::<Vec<_>>(),
+            (1..=32).collect::<Vec<_>>()
+        );
+        for block in inventory {
+            let stored = store.get_block(block.id)?;
+            assert_eq!(block.len, stored.len);
+            assert_eq!(block.state, stored.state);
+            assert_eq!(block.dir_id, stored.dir_id);
+            assert_eq!(block.storage_type, stored.storage_type);
+            assert_eq!(block.actual_len, stored.actual_len);
+            assert_eq!(block.bdev_offset, stored.bdev_offset);
+        }
         Ok(())
     }
 

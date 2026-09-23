@@ -16,8 +16,8 @@ use curvine_config::{ClusterConf, MasterConf};
 use curvine_core_error::CommonResult;
 use curvine_model::{
     BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
-    CreateFileOptsBuilder, LocatedBlock, OpenFlags, SetAttrOptsBuilder, StorageType, TtlAction,
-    WorkerInfo,
+    CreateFileOptsBuilder, HeartbeatStatus, LocatedBlock, OpenFlags, SetAttrOptsBuilder,
+    StorageType, TtlAction, WorkerCommand, WorkerInfo,
 };
 use curvine_raft::conf::JournalConf;
 use curvine_runtime::common::Utils;
@@ -102,6 +102,9 @@ fn report(
         },
         None,
     )?;
+    if full_report {
+        fs.wait_for_full_block_reconcile_for_test(worker_id)?;
+    }
     Ok(result.delete_blocks)
 }
 
@@ -210,6 +213,217 @@ fn reports_accept_current_blocks_and_remove_deleted_locations() -> CommonResult<
             .get_block_locations(block.block.id)?
             .iter()
             .all(|location| location.worker_id != 101));
+    }
+    Ok(())
+}
+
+#[test]
+fn reports_preserve_order_when_inode_group_mixes_current_and_obsolete_ids() -> CommonResult<()> {
+    let _serial = serial();
+    for full_report in [false, true] {
+        let fs = new_fs(if full_report {
+            "mixed-group-full"
+        } else {
+            "mixed-group-incremental"
+        });
+        let path = "/mixed-file";
+        let inode = fs.create(path, false)?;
+        let current = complete_block(&fs, path)?.block.id;
+        let obsolete_a = InodeId::create_block_id(inode.id, 100)?;
+        let obsolete_b = InodeId::create_block_id(inode.id, 101)?;
+        let mut replica = WorkerInfo::default();
+        replica.address.worker_id = 101;
+        replica.address.rpc_port = 667;
+        fs.add_test_worker(replica);
+
+        for delete_current in [false, true] {
+            for id in [obsolete_a, obsolete_b] {
+                fs.fs_dir
+                    .write()
+                    .add_block_location(id, BlockLocation::with_id(101))?;
+            }
+            let mut blocks: Vec<_> = [
+                (current, BlockReportStatus::Finalized, StorageType::Disk),
+                (obsolete_b, BlockReportStatus::Finalized, StorageType::Disk),
+                (current, BlockReportStatus::Deleted, StorageType::Disk),
+                (obsolete_a, BlockReportStatus::Writing, StorageType::Disk),
+                (current, BlockReportStatus::Writing, StorageType::Mem),
+                (obsolete_a, BlockReportStatus::Finalized, StorageType::Disk),
+                (obsolete_b, BlockReportStatus::Finalized, StorageType::Disk),
+                (current, BlockReportStatus::Finalized, StorageType::Ssd),
+            ]
+            .into_iter()
+            .map(|(id, status, storage)| BlockReportInfo::new(id, status, storage, 128))
+            .collect();
+            if delete_current {
+                blocks.push(BlockReportInfo::new(
+                    current,
+                    BlockReportStatus::Deleted,
+                    StorageType::Disk,
+                    128,
+                ));
+            }
+            let result = fs.block_report(
+                BlockReportList {
+                    cluster_id: "curvine".into(),
+                    worker_id: 101,
+                    full_report,
+                    // Full-report completion counts distinct IDs, not entries.
+                    total_len: 3,
+                    blocks,
+                },
+                None,
+            )?;
+            if full_report {
+                fs.wait_for_full_block_reconcile_for_test(101)?;
+            }
+            let expected_rejected = if full_report {
+                vec![obsolete_b, obsolete_a, obsolete_a, obsolete_b]
+            } else {
+                vec![obsolete_b, obsolete_a, obsolete_b]
+            };
+            assert_eq!(result.delete_blocks, expected_rejected);
+
+            let fs_dir = fs.fs_dir.read();
+            let mut locations: Vec<_> = fs_dir
+                .get_block_locations(current)?
+                .iter()
+                .map(|location| (location.worker_id, location.storage_type))
+                .collect();
+            locations.sort_unstable_by_key(|location| location.0);
+            let mut expected_locations = vec![(100, StorageType::Disk)];
+            if !delete_current {
+                expected_locations.push((101, StorageType::Ssd));
+            }
+            assert_eq!(locations, expected_locations);
+            for id in [obsolete_a, obsolete_b] {
+                assert!(fs_dir.get_block_locations(id)?.is_empty());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn reports_preserve_duplicate_status_order_across_processing_chunks() -> CommonResult<()> {
+    let _serial = serial();
+    for full_report in [false, true] {
+        let fs = new_fs(if full_report {
+            "duplicate-order-full"
+        } else {
+            "duplicate-order-incremental"
+        });
+        fs.create("/current", false)?;
+        let current = complete_block(&fs, "/current")?.block.id;
+        fs.create("/filler", false)?;
+        let filler = complete_block(&fs, "/filler")?.block.id;
+        let obsolete = InodeId::create_block_id(InodeId::get_id(current), 100)?;
+        let missing = InodeId::create_block_id(10_000_000, 0)?;
+        let mut replica = WorkerInfo::default();
+        replica.address.worker_id = 101;
+        replica.address.rpc_port = 667;
+        fs.add_test_worker(replica);
+
+        for id in [current, obsolete, missing] {
+            // Check adjacent entries and entries on opposite sides of the 250-entry boundary.
+            for gap in [0, 249] {
+                for reported_status in [BlockReportStatus::Finalized, BlockReportStatus::Writing] {
+                    for delete_last in [false, true] {
+                        let context = format!(
+                            "id={id}, full_report={full_report}, gap={gap}, status={reported_status:?}, delete_last={delete_last}"
+                        );
+                        fs.fs_dir
+                            .write()
+                            .add_block_location(id, BlockLocation::with_id(101))?;
+                        fs.worker_manager.write().remove_block(101, id);
+                        let (first, last) = if delete_last {
+                            (reported_status, BlockReportStatus::Deleted)
+                        } else {
+                            (BlockReportStatus::Deleted, reported_status)
+                        };
+                        let mut blocks =
+                            vec![BlockReportInfo::new(id, first, StorageType::Disk, 128)];
+                        blocks.extend((0..gap).map(|_| {
+                            BlockReportInfo::new(
+                                filler,
+                                BlockReportStatus::Finalized,
+                                StorageType::Disk,
+                                128,
+                            )
+                        }));
+                        blocks.push(BlockReportInfo::new(id, last, StorageType::Disk, 128));
+                        let result = fs.block_report(
+                            BlockReportList {
+                                cluster_id: "curvine".into(),
+                                worker_id: 101,
+                                full_report,
+                                // Keep full reports partial to isolate foreground status ordering.
+                                total_len: 1_000,
+                                blocks,
+                            },
+                            None,
+                        )?;
+                        let rejected = id != current
+                            && (full_report || reported_status == BlockReportStatus::Finalized);
+                        assert_eq!(
+                            result.delete_blocks,
+                            if rejected { vec![id] } else { vec![] },
+                            "{context}"
+                        );
+
+                        let fs_dir = fs.fs_dir.read();
+                        let retained = id == current && !delete_last;
+                        assert_eq!(
+                            fs_dir
+                                .get_block_locations(id)?
+                                .iter()
+                                .any(|loc| loc.worker_id == 101),
+                            retained,
+                            "{context}"
+                        );
+                        assert_eq!(
+                            fs_dir.get_worker_block_ids(101)?.contains(&id),
+                            retained,
+                            "{context}"
+                        );
+                        drop(fs_dir);
+
+                        let commands = {
+                            let mut wm = fs.worker_manager.write();
+                            let worker = wm.get_worker(101).unwrap().clone();
+                            wm.heartbeat(
+                                "curvine",
+                                HeartbeatStatus::Running,
+                                worker.address,
+                                worker.weight,
+                                worker.worker_session_id,
+                                worker.transfer_capabilities,
+                                worker.software_version,
+                                worker.startup_time_ms,
+                                worker.storage_map.into_values().collect(),
+                                worker.component_info,
+                            )?
+                        };
+                        let pending: Vec<_> = commands
+                            .into_iter()
+                            .flat_map(|command| match command {
+                                WorkerCommand::DeleteBlock(command) => command.blocks,
+                            })
+                            .collect();
+                        assert_eq!(
+                            pending,
+                            if rejected && !delete_last {
+                                vec![id]
+                            } else {
+                                vec![]
+                            },
+                            "{context}"
+                        );
+                        fs.worker_manager.write().deleted_block(101, id);
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }

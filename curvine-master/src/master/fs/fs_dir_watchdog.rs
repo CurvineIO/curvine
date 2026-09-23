@@ -18,26 +18,23 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::runtime::LoopTask;
-use log::{error, warn};
+use log::warn;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::TryLockError;
 
 /// Watches the single `fs_dir` metadata lock and surfaces a stall as an
 /// observable signal instead of a silent multi-minute control-plane freeze.
 ///
-/// The metadata lock is a single global `std::sync::RwLock` and cannot be
-/// sharded yet. When it wedges (for example a reader that never releases while
-/// writers queue), every metadata RPC blocks with no log or metric. This probe
-/// takes a non-blocking `try_read()` each tick: a lock that stays unacquirable
-/// past the threshold is reported. It never blocks and never aborts the
-/// process; recovery decisions stay with the operator / k8s.
+/// A non-blocking shared probe reports when reader admission remains blocked
+/// past the threshold. Shared report processing permits concurrent readers;
+/// waiting or active writers can still prevent reader admission.
+/// The `parking_lot` lock does not poison, so this probe reports availability
+/// only. It never blocks or aborts the process; recovery stays with the operator.
 pub struct FsDirWatchdog {
     fs: MasterFilesystem,
     metrics: Option<&'static MasterMetrics>,
     stall_threshold_ms: i64,
     first_unavailable_ms: AtomicI64,
     stall_reported: AtomicBool,
-    poison_reported: AtomicBool,
 }
 
 impl FsDirWatchdog {
@@ -48,14 +45,12 @@ impl FsDirWatchdog {
             stall_threshold_ms,
             first_unavailable_ms: AtomicI64::new(0),
             stall_reported: AtomicBool::new(false),
-            poison_reported: AtomicBool::new(false),
         }
     }
 
     fn reset_unavailable_state(&self) {
         self.first_unavailable_ms.store(0, Ordering::SeqCst);
         self.stall_reported.store(false, Ordering::SeqCst);
-        self.poison_reported.store(false, Ordering::SeqCst);
         if let Some(metrics) = self.metrics {
             metrics.fs_dir_stalled.set(0);
         }
@@ -65,7 +60,6 @@ impl FsDirWatchdog {
         if let Some(metrics) = self.metrics {
             metrics.fs_dir_probe_acquire_us.set(probe_us);
         }
-        self.poison_reported.store(false, Ordering::SeqCst);
         if self.stall_reported.swap(false, Ordering::SeqCst) {
             let stalled_ms =
                 LocalTime::mills() as i64 - self.first_unavailable_ms.load(Ordering::SeqCst);
@@ -80,7 +74,7 @@ impl FsDirWatchdog {
         self.first_unavailable_ms.store(0, Ordering::SeqCst);
     }
 
-    fn on_unavailable(&self, probe_us: i64, poisoned: bool) {
+    fn on_unavailable(&self, probe_us: i64) {
         if let Some(metrics) = self.metrics {
             metrics.fs_dir_probe_acquire_us.set(probe_us);
         }
@@ -95,9 +89,6 @@ impl FsDirWatchdog {
         };
 
         let unavailable_ms = now - first;
-        if poisoned && !self.poison_reported.swap(true, Ordering::SeqCst) {
-            error!("fs_dir metadata lock is poisoned; a holder panicked while mutating metadata");
-        }
         if unavailable_ms >= self.stall_threshold_ms
             && !self.stall_reported.swap(true, Ordering::SeqCst)
         {
@@ -126,9 +117,8 @@ impl LoopTask for FsDirWatchdog {
         let spent = TimeSpent::new();
         // Non-blocking shared probe. It never blocks the watchdog thread.
         match self.fs.fs_dir().try_read() {
-            Ok(_guard) => self.on_available(spent.used_us() as i64),
-            Err(TryLockError::WouldBlock) => self.on_unavailable(spent.used_us() as i64, false),
-            Err(TryLockError::Poisoned(_)) => self.on_unavailable(spent.used_us() as i64, true),
+            Some(_guard) => self.on_available(spent.used_us() as i64),
+            None => self.on_unavailable(spent.used_us() as i64),
         }
         Ok(())
     }
@@ -175,13 +165,11 @@ mod tests {
 
         watchdog.first_unavailable_ms.store(123, Ordering::SeqCst);
         watchdog.stall_reported.store(true, Ordering::SeqCst);
-        watchdog.poison_reported.store(true, Ordering::SeqCst);
 
         watchdog.run().unwrap();
 
         assert_eq!(watchdog.first_unavailable_ms.load(Ordering::SeqCst), 0);
         assert!(!watchdog.stall_reported.load(Ordering::SeqCst));
-        assert!(!watchdog.poison_reported.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -209,6 +197,30 @@ mod tests {
         drop(write_guard);
         watchdog.run().unwrap();
 
+        assert_eq!(watchdog.first_unavailable_ms.load(Ordering::SeqCst), 0);
+        assert!(!watchdog.stall_reported.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn watchdog_probes_during_shared_report_and_detects_writer() {
+        let fs = test_fs("shared-report");
+        fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
+        let fs_dir = fs.fs_dir();
+        let watchdog = FsDirWatchdog::new(fs, 0);
+
+        let report_guard = fs_dir.read();
+        watchdog.run().unwrap();
+        assert_eq!(watchdog.first_unavailable_ms.load(Ordering::SeqCst), 0);
+        assert!(!watchdog.stall_reported.load(Ordering::SeqCst));
+
+        drop(report_guard);
+        let write_guard = fs_dir.write();
+        watchdog.run().unwrap();
+        assert!(watchdog.first_unavailable_ms.load(Ordering::SeqCst) > 0);
+        assert!(watchdog.stall_reported.load(Ordering::SeqCst));
+
+        drop(write_guard);
+        watchdog.run().unwrap();
         assert_eq!(watchdog.first_unavailable_ms.load(Ordering::SeqCst), 0);
         assert!(!watchdog.stall_reported.load(Ordering::SeqCst));
     }

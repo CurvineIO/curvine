@@ -27,6 +27,10 @@ pub struct RocksInodeStore {
     pub(crate) db: DBEngine,
 }
 
+#[cfg(test)]
+#[path = "worker_block_scan_tests.rs"]
+mod worker_block_scan_tests;
+
 impl RocksInodeStore {
     pub const CF_INODES: &'static str = "inodes";
     pub const CF_EDGES: &'static str = "edges";
@@ -161,17 +165,26 @@ impl RocksInodeStore {
     }
 
     pub fn get_block_ids(&self, worker_id: u32) -> CommonResult<Vec<i64>> {
+        self.get_block_ids_with_capacity(worker_id, 8)
+    }
+
+    pub(crate) fn get_block_ids_with_capacity(
+        &self,
+        worker_id: u32,
+        capacity_hint: usize,
+    ) -> CommonResult<Vec<i64>> {
         let prefix = RocksUtils::u32_to_bytes(worker_id);
-        let iter = self.db.prefix_scan(Self::CF_LOCATION, prefix)?;
-
-        let mut vec = Vec::with_capacity(8);
-        for item in iter {
-            let bytes = item?;
-            let location = Serde::deserialize::<i64>(&bytes.1)?;
-            vec.push(location);
+        let mut iter = self.db.raw_prefix_scan(Self::CF_LOCATION, prefix)?;
+        let mut block_ids = Vec::with_capacity(capacity_hint.min(64 * 1024));
+        while let Some((key, value)) = iter.item() {
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            block_ids.push(Serde::deserialize::<i64>(value)?);
+            iter.next();
         }
-
-        Ok(vec)
+        iter.status()?;
+        Ok(block_ids)
     }
 
     pub fn add_mountpoint(&self, id: u32, entry: &MountInfo) -> CommonResult<()> {

@@ -522,10 +522,12 @@ impl JournalLoader {
 
     fn create_snapshot0(&self, dir_option: Option<String>) -> RaftResult<SnapshotData> {
         let fsm_state = self.fsm_state_snapshot()?;
-        let fs_dir = self.fs_dir.read();
         let dir = match dir_option {
             Some(dir) => dir,
-            None => fs_dir.create_checkpoint(fsm_state.applied.index)?,
+            None => {
+                let mut fs_dir = self.fs_dir.write();
+                fs_dir.create_checkpoint(fsm_state.applied.index)?
+            }
         };
 
         let data = RaftUtils::create_file_snapshot(&dir, self.node_id, fsm_state)?;

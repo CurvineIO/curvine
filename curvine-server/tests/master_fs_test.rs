@@ -17,6 +17,7 @@ use curvine_core_error::CommonResult;
 use curvine_error::FsError;
 use curvine_fs_api::RpcCode;
 use curvine_fs_api::{CurvineURI, Path};
+use curvine_master::master::meta::BlockMeta;
 use curvine_model::MountOptions;
 use curvine_model::ProtoUtils;
 use curvine_model::{
@@ -474,6 +475,7 @@ fn full_block_report_for_writing_missing_inode_schedules_worker_delete() -> Comm
         None,
     )?;
 
+    fs.wait_for_full_block_reconcile_for_test(0)?;
     assert_eq!(result.delete_blocks, vec![block_id]);
     Ok(())
 }
@@ -488,16 +490,28 @@ fn full_block_report_default_limit_to_master() -> CommonResult<()> {
     let file = fs.create("/full-block-report-100k.log", false)?;
     let worker_id = WorkerInfo::default().worker_id();
 
-    let blocks: Vec<_> = (0..count as i64)
-        .map(|seq| {
-            BlockReportInfo::new(
-                InodeId::create_block_id(file.id, seq).expect("block id"),
+    let blocks = {
+        let fs_dir = fs.fs_dir.write();
+        let store = fs_dir.get_rocks_store();
+        let mut inode = store.get_inode(file.id)?.expect("created inode");
+        let file = inode.as_file_mut()?;
+        let mut blocks = Vec::with_capacity(count);
+        for _ in 0..count {
+            let id = file.next_block_id()?;
+            file.add_block(BlockMeta::new(id, 1));
+            blocks.push(BlockReportInfo::new(
+                id,
                 BlockReportStatus::Finalized,
                 StorageType::Disk,
                 1,
-            )
-        })
-        .collect();
+            ));
+        }
+        // Persist the authoritative block list once instead of allocating 100k blocks via RPC.
+        let mut batch = store.new_batch();
+        batch.write_inode(&inode)?;
+        batch.commit()?;
+        blocks
+    };
 
     let req = BlockReportListRequest {
         cluster_id: "curvine".into(),
@@ -531,7 +545,9 @@ fn full_block_report_default_limit_to_master() -> CommonResult<()> {
             blocks,
         },
         None,
-    )?;
+    );
+    fs.wait_for_full_block_reconcile_for_test(worker_id)?;
+    let result = result?;
     assert!(result.delete_blocks.is_empty());
 
     let reported = {
@@ -610,24 +626,20 @@ fn full_block_report_reconcile_removes_stale_location_async() -> CommonResult<()
         None,
     )?;
 
-    for _ in 0..50 {
-        let blocks = fs.get_block_locations(path)?;
-        let stale = blocks
-            .block_locs
-            .iter()
-            .find(|block| block.block.id == second.block.id)
-            .expect("second block metadata should remain");
-        if stale.locs.is_empty() {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-
+    fs.wait_for_full_block_reconcile_for_test(100)?;
     let blocks = fs.get_block_locations(path)?;
-    panic!(
+    let stale = blocks
+        .block_locs
+        .iter()
+        .find(|block| block.block.id == second.block.id)
+        .expect("second block metadata should remain");
+    assert!(
+        stale.locs.is_empty(),
         "stale worker location for block {} was not reconciled: {:?}",
-        second.block.id, blocks
+        second.block.id,
+        blocks
     );
+    Ok(())
 }
 
 fn create_ufs_backed_cache_file(
@@ -911,6 +923,7 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
         None,
     )?;
 
+    fs.wait_for_full_block_reconcile_for_test(100)?;
     for _ in 0..50 {
         let blocks = fs.get_block_locations(path)?;
         let protected = blocks
@@ -2674,6 +2687,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
             None,
         )?;
 
+        fs.wait_for_full_block_reconcile_for_test(block.locs[0].worker_id)?;
         let fb = fs.get_block_locations(path)?;
         assert_eq!(fb.block_locs.len(), 1);
         assert!(
@@ -2707,6 +2721,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
             None,
         )?;
 
+        fs.wait_for_full_block_reconcile_for_test(block.locs[0].worker_id)?;
         let fb = fs.get_block_locations(path)?;
         assert_eq!(fb.block_locs.len(), 1);
         assert!(
@@ -2740,6 +2755,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
             None,
         )?;
 
+        fs.wait_for_full_block_reconcile_for_test(block.locs[0].worker_id)?;
         let fb = fs.get_block_locations(path)?;
         assert_eq!(fb.block_locs.len(), 1);
         assert!(
@@ -2783,6 +2799,8 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
             },
             None,
         )?;
+
+        fs.wait_for_full_block_reconcile_for_test(100)?;
 
         // Worker 200 reports same block as Disk
         fs.block_report(
