@@ -14,7 +14,7 @@
 
 use std::future::Future;
 
-use raft::StateRole;
+use raft::{eraftpb::HardState, StateRole};
 
 use crate::proto::raft::{FsmState, SnapshotData};
 use crate::raft::storage::ApplyMsg;
@@ -26,6 +26,9 @@ pub trait AppStorage: Clone + Send + Sync + 'static {
     fn apply(&self, wait: bool, msg: ApplyMsg) -> impl Future<Output = RaftResult<()>> + Send;
 
     fn get_fsm_state(&self) -> FsmState;
+
+    /// Observe durable Raft state without replaying a business operation.
+    fn hard_state_changed(&self, _state: &HardState) {}
 
     fn role_change(&self, role: StateRole) -> impl Future<Output = RaftResult<()>> + Send;
 

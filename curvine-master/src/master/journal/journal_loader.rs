@@ -137,6 +137,7 @@ impl JournalLoader {
             has_apply_worker: !testing,
         };
 
+        loader.refresh_metrics()?;
         if !testing {
             let loader1 = loader.clone();
             rt.spawn(async move {
@@ -189,16 +190,24 @@ impl JournalLoader {
             state.applied = applied;
         }
 
+        self.refresh_fsm_metrics(&state);
+        drop(state);
+        self.hard_state_changed(&self.log_store.hard_state());
+        Ok(())
+    }
+
+    fn refresh_fsm_metrics(&self, state: &FsmState) {
         self.metrics.journal_applied.set(state.applied.index as i64);
         self.metrics
             .journal_ufs_applied
             .set(state.ufs_applied.index as i64);
-        drop(state);
+    }
 
-        let state = self.log_store.hard_state();
-        self.metrics.journal_committed.set(state.commit as i64);
-        self.metrics.journal_term.set(state.term as i64);
-
+    /// Refresh gauges only: never advance metadata/UFS replay watermarks just
+    /// to make monitoring appear caught up.
+    fn refresh_metrics(&self) -> CommonResult<()> {
+        self.refresh_fsm_metrics(&*self.fsm_state()?);
+        self.hard_state_changed(&self.log_store.hard_state());
         Ok(())
     }
 
@@ -602,6 +611,7 @@ impl JournalLoader {
         let mount_ms = spend.used_ms();
 
         *self.fsm_state()? = snapshot.fsm_state;
+        self.refresh_metrics()?;
 
         info!(
             "apply_snapshot: fs_dir_restore={} ms, mount_restore={} ms, total={} ms",
@@ -998,6 +1008,11 @@ impl AppStorage for JournalLoader {
                 std::process::abort();
             }
         }
+    }
+
+    fn hard_state_changed(&self, state: &raft::eraftpb::HardState) {
+        self.metrics.journal_committed.set(state.commit as i64);
+        self.metrics.journal_term.set(state.term as i64);
     }
 
     async fn role_change(&self, role: StateRole) -> RaftResult<()> {
