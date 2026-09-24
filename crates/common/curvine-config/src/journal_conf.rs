@@ -28,6 +28,11 @@ pub struct JournalConf {
     // which is equivalent to a stand-alone system.
     pub enable: bool,
 
+    /// Rebuild one lost HA member from healthy peers. Disables elections and
+    /// voting until durable Raft and application state have caught up.
+    /// Never enable this on every member or when bootstrapping a new cluster.
+    pub recover_from_peers: bool,
+
     pub group_name: String,
     pub hostname: String,
     pub rpc_port: u16,
@@ -152,6 +157,11 @@ impl JournalConf {
         Arc::new(rt)
     }
 
+    /// Durable marker retained until a lost member has safely rejoined Raft.
+    pub fn recovery_marker(&self) -> std::path::PathBuf {
+        std::path::Path::new(&self.journal_dir).join("member-recovery-in-progress")
+    }
+
     pub fn local_addr(&self) -> InetAddr {
         InetAddr::new(self.hostname.clone(), self.rpc_port)
     }
@@ -200,6 +210,7 @@ impl Default for JournalConf {
         let rocksdb = Self::rocksdb_default().set_dir(journal_dir.as_str());
         Self {
             enable: true,
+            recover_from_peers: false,
             group_name: "raft-group".to_string(),
             hostname: ClusterConf::DEFAULT_HOSTNAME.to_string(),
             rpc_port: ClusterConf::DEFAULT_RAFT_PORT,

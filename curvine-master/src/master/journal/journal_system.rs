@@ -257,6 +257,15 @@ impl JournalSystem {
     }
 
     pub fn from_conf(conf: &ClusterConf) -> FsResult<Self> {
+        // Check the persistent marker before any directory formatting, even if
+        // the configuration flag was removed during an interrupted recovery.
+        let recovering =
+            conf.journal.recover_from_peers || conf.journal.recovery_marker().try_exists()?;
+        if recovering && (conf.format_master || !conf.journal.enable) {
+            return err_box!(
+                "member recovery requires format_master=false and journal.enable=true"
+            );
+        }
         // When the journal system is used, please note that it is separate from the fs system.
         Self::require_existing_master_data(conf)?;
 
@@ -493,6 +502,145 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod recovery_metrics_tests {
+    use super::*;
+    use crate::master::Master;
+    use curvine_config::{JournalConf, MasterConf};
+    use curvine_raft::proto::raft::AppliedIndex;
+    use curvine_raft::raft::storage::PeerStorage;
+    use curvine_runtime::common::Utils;
+    use raft::eraftpb::HardState;
+
+    #[test]
+    fn recovery_refuses_formatting_or_disabled_journal() -> FsResult<()> {
+        let root = std::env::temp_dir().join(format!("curvine-1718-config-{}", Utils::rand_id()));
+        fs::create_dir_all(&root)?;
+        for (format_master, enable) in [(true, true), (false, false)] {
+            for recover_from_peers in [true, false] {
+                let conf = ClusterConf {
+                    format_master,
+                    journal: JournalConf {
+                        recover_from_peers,
+                        journal_dir: root.to_str().unwrap().into(),
+                        enable,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let marker = conf.journal.recovery_marker();
+                if !recover_from_peers {
+                    fs::write(&marker, b"")?;
+                }
+                let Err(error) = JournalSystem::from_conf(&conf) else {
+                    panic!("unsafe recovery configuration was accepted")
+                };
+                assert!(error.to_string().contains("requires format_master=false"));
+                if !recover_from_peers {
+                    assert!(marker.exists(), "must not format away the recovery marker");
+                    fs::remove_file(marker)?;
+                }
+            }
+        }
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_restore_and_hard_state_only_changes_refresh_journal_metrics() -> FsResult<()> {
+        let root = std::env::temp_dir().join(format!("curvine-1718-metrics-{}", Utils::rand_id()));
+        let conf = ClusterConf {
+            testing: true,
+            format_master: true,
+            master: MasterConf {
+                meta_dir: root.join("meta").to_str().unwrap().into(),
+                ..Default::default()
+            },
+            journal: JournalConf {
+                journal_dir: root.join("journal").to_str().unwrap().into(),
+                io_threads: 1,
+                worker_threads: 2,
+                ..JournalConf::with_test()
+            },
+            ..Default::default()
+        };
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+        let log = js.raft_journal.log_store().clone();
+        log.append(
+            &(1..=13)
+                .map(|index| Entry {
+                    index,
+                    term: 30,
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>(),
+        )?;
+        let peer = PeerStorage::new(
+            js.rt.clone(),
+            log,
+            loader.clone(),
+            RaftClient::from_conf(js.rt.clone(), &conf.journal),
+            &conf.journal,
+        );
+        peer.set_hard_state(&HardState {
+            term: 30,
+            vote: 1,
+            commit: 12,
+        })?;
+        let mut snapshot = js.rt.block_on(loader.create_snapshot())?;
+        snapshot.snapshot_id = 10;
+        snapshot.fsm_state.applied = AppliedIndex {
+            index: 10,
+            term: 30,
+            ..Default::default()
+        };
+        snapshot.fsm_state.ufs_applied = AppliedIndex {
+            index: 7,
+            term: 29,
+            ..Default::default()
+        };
+        let metrics = Master::get_metrics()?;
+        metrics.journal_applied.set(0);
+        metrics.journal_ufs_applied.set(0);
+        metrics.journal_committed.set(0);
+        metrics.journal_term.set(0);
+        // Restore a real RocksDB checkpoint, with no subsequent business write.
+        js.rt.block_on(loader.apply_snapshot(snapshot))?;
+        assert_eq!(metrics.journal_applied.get(), 10);
+        assert_eq!(metrics.journal_ufs_applied.get(), 7);
+        assert_eq!(metrics.journal_committed.get(), 12);
+        assert_eq!(metrics.journal_term.get(), 30);
+        assert_eq!(
+            loader.get_fsm_state().applied.index,
+            10,
+            "metrics must not pretend applied == committed"
+        );
+        peer.set_hard_state(&HardState {
+            term: 31,
+            vote: 2,
+            commit: 12,
+        })?;
+        assert_eq!(metrics.journal_term.get(), 31);
+        assert_eq!(metrics.journal_applied.get(), 10);
+        peer.set_hard_state_commit(13)?;
+        assert_eq!(metrics.journal_committed.get(), 13);
+        assert_eq!(metrics.journal_applied.get(), 10);
+        js.rt
+            .block_on(loader.apply_snapshot(SnapshotData::default()))?;
+        assert_eq!(
+            metrics.journal_applied.get(),
+            10,
+            "placeholder must not reset restored gauges"
+        );
+        drop(peer);
+        drop(loader);
+        js.shutdown();
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 }

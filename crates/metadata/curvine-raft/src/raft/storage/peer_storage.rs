@@ -16,7 +16,7 @@ use crate::conf::JournalConf;
 use crate::proto::raft::{FsmState, SnapshotData};
 use crate::raft::snapshot::{DownloadJob, SnapshotState};
 use crate::raft::storage::{AppStorage, ApplyMsg, LogStorage};
-use crate::raft::{LibRaftResult, RaftClient, RaftError, RaftResult};
+use crate::raft::{LibRaftResult, RaftClient, RaftError, RaftGroup, RaftResult};
 use curvine_core_error::err_box;
 use curvine_runtime::common::{TimeSpent, Utils};
 use curvine_runtime::runtime::{GroupExecutor, JobCtl, JobState, RpcRuntime, Runtime};
@@ -81,11 +81,16 @@ where
     }
 
     pub fn set_hard_state(&self, hard_state: &HardState) -> RaftResult<()> {
-        self.log_store.set_hard_state(hard_state)
+        self.log_store.set_hard_state(hard_state)?;
+        self.app_store.hard_state_changed(hard_state);
+        Ok(())
     }
 
     pub fn set_hard_state_commit(&self, commit: u64) -> RaftResult<()> {
-        self.log_store.set_hard_state_commit(commit)
+        self.log_store.set_hard_state_commit(commit)?;
+        self.app_store
+            .hard_state_changed(&self.log_store.initial_state()?.hard_state);
+        Ok(())
     }
 
     pub fn set_conf_state(&self, conf_state: &ConfState) -> RaftResult<()> {
@@ -158,11 +163,32 @@ where
         }
     }
 
+    /// Wait for both log snapshot persistence and application restore before
+    /// advancing Ready or acknowledging replication. The job persists the log
+    /// snapshot first; a restart between the two stages reinstalls it locally.
+    pub async fn wait_snapshot_applied(&self) -> RaftResult<()> {
+        loop {
+            let state = self.snap_state.lock().unwrap().clone();
+            match state {
+                SnapshotState::Applying(job) => match job.state() {
+                    JobState::Finished => return Ok(()),
+                    JobState::Failed | JobState::Cancelled => {
+                        return err_box!(
+                            "snapshot application did not complete; refusing to advance Ready"
+                        );
+                    }
+                    _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                },
+                _ => return Ok(()),
+            }
+        }
+    }
+
     pub async fn role_change(&self, role: StateRole) -> RaftResult<()> {
         self.app_store.role_change(role).await
     }
 
-    pub fn gen_apply_snapshot_job(&self, snapshot: Snapshot) -> RaftResult<()> {
+    pub fn gen_apply_snapshot_job(&self, mut snapshot: Snapshot) -> RaftResult<()> {
         if self.is_snapshot_applying() {
             return err_box!("Currently applying snapshot");
         }
@@ -203,6 +229,11 @@ where
             let download_ms = spend.used_ms();
             spend.reset();
 
+            // The persisted descriptor must reference this member's downloaded
+            // files, not the sender's filesystem, including after a restart or
+            // if this member later serves the snapshot as leader.
+            snap_data.node_id = RaftGroup::from_conf(&conf).get_node_id(&conf.local_addr())?;
+            snapshot.data = snap_data.encode_to_vec();
             if let Err(e) = log_store.apply_snapshot(snapshot) {
                 return if e.is_snapshot_out_of_date() {
                     warn!("{}, skip apply; local state is already newer", e);

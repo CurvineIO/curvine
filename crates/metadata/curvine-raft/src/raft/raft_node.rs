@@ -17,6 +17,7 @@
 use crate::conf::{JournalConf, JournalConfExt};
 use crate::proto::raft::*;
 use crate::raft::raft_error::RaftError;
+use crate::raft::recovery::{PeerSessions, Recovery, SessionEvent};
 use crate::raft::storage::{AppStorage, ApplyMsg, LogStorage, PeerStorage};
 use crate::raft::*;
 use crate::utils::SerdeUtils;
@@ -25,7 +26,7 @@ use curvine_io::DataSlice;
 use curvine_net::net::InetAddr;
 use curvine_rpc::client::dispatch::{Callback, Envelope};
 use curvine_rpc::message::{Builder, RefMessage, ResponseStatus};
-use curvine_runtime::common::{DurationUnit, LocalTime, TimeSpent};
+use curvine_runtime::common::{DurationUnit, LocalTime, TimeSpent, Utils};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::channel::{CallChannel, CallReceiver};
 use log::{debug, error, info, warn};
@@ -55,6 +56,13 @@ where
     raw: RawNode<PeerStorage<A, B>>,
 
     client: RaftClient,
+
+    session: u64,
+    peer_sessions: PeerSessions,
+    heartbeat_sequence: u64,
+    session_sender: mpsc::UnboundedSender<SessionEvent>,
+    session_receiver: mpsc::UnboundedReceiver<SessionEvent>,
+    recovery: Recovery,
 
     storage: PeerStorage<A, B>,
 
@@ -98,6 +106,7 @@ where
         logger: &slog::Logger,
     ) -> RaftResult<Self> {
         let group = RaftGroup::from_conf(conf);
+        let recovery = Recovery::load(conf)?;
         let id = group.get_node_id(&conf.local_addr())?;
 
         let client = RaftClient::new(rt.clone(), &group, conf.new_client_conf());
@@ -114,12 +123,19 @@ where
 
         let storage = PeerStorage::new(rt.clone(), log_store, app_store, client.clone(), conf);
         let raw = RawNode::new(&config, storage.clone(), logger)?;
+        let (session_sender, session_receiver) = mpsc::unbounded_channel();
         // raw.raft.become_candidate();
 
         let node = Self {
             rt,
             raw,
             client,
+            session: Utils::rand_id(),
+            peer_sessions: PeerSessions::default(),
+            heartbeat_sequence: 0,
+            session_sender,
+            session_receiver,
+            recovery,
             storage,
             receiver,
             sender,
@@ -148,6 +164,7 @@ where
         logger: &slog::Logger,
     ) -> RaftResult<Self> {
         let group = RaftGroup::from_conf(conf);
+        let recovery = Recovery::load(conf)?;
         let id = group.get_node_id(&conf.local_addr())?;
         let client = RaftClient::new(rt.clone(), &group, conf.new_client_conf());
         let snapshot_interval_ms = DurationUnit::from_str(&conf.snapshot_interval)
@@ -164,10 +181,17 @@ where
         client.join_cluster(id, &conf.local_addr()).await?;
         let storage = PeerStorage::new(rt.clone(), log_store, app_store, client.clone(), conf);
         let raw = RawNode::new(&config, storage.clone(), logger)?;
+        let (session_sender, session_receiver) = mpsc::unbounded_channel();
         let node = Self {
             rt,
             raw,
             client,
+            session: Utils::rand_id(),
+            peer_sessions: PeerSessions::default(),
+            heartbeat_sequence: 0,
+            session_sender,
+            session_receiver,
+            recovery,
             storage,
             receiver,
             sender,
@@ -283,7 +307,13 @@ where
                 biased;
 
                 _ = ticker.tick() => {
-                    self.raw.tick();
+                    if !self.recovery.active {
+                        self.raw.tick();
+                    }
+                }
+
+                Some(event) = self.session_receiver.recv() => {
+                    self.peer_sessions.observe(&mut self.raw, event);
                 }
 
                 result = self.receiver.recv() => {
@@ -299,6 +329,25 @@ where
 
             // The raft state processing failed and the node directly reported an error.
             self.on_ready(&mut promise).await?;
+            if self.recovery.active
+                && !self.storage.is_snapshot_applying()
+                && self.recovery.finish(
+                    &self.raw,
+                    self.storage.log_store.initial_state()?.hard_state.commit,
+                    self.storage.get_fsm_state().applied.index,
+                )?
+            {
+                info!(
+                    "member recovery completed, raft_id {}, term {}, applied {}",
+                    self.id(),
+                    self.raw.raft.term,
+                    self.storage.get_fsm_state().applied.index
+                );
+                self.role_monitor.advance_role(&SoftState {
+                    leader_id: self.leader(),
+                    raft_state: self.raw.raft.state,
+                });
+            }
         }
 
         Ok(())
@@ -372,11 +421,38 @@ where
             Err(e) => return Self::send_malformed_request_error(env, e.into()),
         };
 
-        if let Err(e) = self.raw.step(raft.message) {
-            return Self::send_request_error(env, e.into());
+        let message = &raft.message;
+        if message.to != self.id() || message.from == self.id() || message.from == DEFAULT_LEADER_ID
+        {
+            return Self::send_request_error(
+                env,
+                RaftError::other("invalid Raft peer identity".into()),
+            );
+        }
+        if self.is_leader()
+            && matches!(
+                message.get_msg_type(),
+                MessageType::MsgAppendResponse | MessageType::MsgHeartbeatResponse
+            )
+            && !self
+                .peer_sessions
+                .accepts(message.from, raft.sender_session)
+        {
+            return Self::send_request_error(
+                env,
+                RaftError::other(
+                    "unverified Raft sender session; heartbeat handshake required".into(),
+                ),
+            );
+        }
+        if let Err(e) = self.recovery.step(&mut self.raw, raft, self.session) {
+            return Self::send_request_error(env, e);
         }
         let rep_msg = Builder::success(&env.msg)
-            .proto_header(RaftResponse::default())
+            .proto_header(RaftResponse {
+                session: Some(self.session),
+                term: Some(self.raw.raft.term),
+            })
             .build();
         env.send_with_log(Ok(rep_msg));
         Ok(())
@@ -472,6 +548,9 @@ where
         if *ready.snapshot() != Snapshot::default() {
             self.storage
                 .gen_apply_snapshot_job(ready.snapshot().clone())?;
+            // Snapshot, HardState and the application must be durable before
+            // advancing Ready or acknowledging snapshot replication.
+            self.storage.wait_snapshot_applied().await?;
         }
 
         // Persist entries before the HardState that may commit them. A crash may
@@ -535,7 +614,9 @@ where
                 .await?;
             }
 
-            self.role_monitor.advance_role(&ss);
+            if !self.recovery.active {
+                self.role_monitor.advance_role(&ss);
+            }
         } else {
             // Determine whether a snapshot is needed.
             self.apply_create_snapshot()?;
@@ -551,10 +632,20 @@ where
             let send_msg = Builder::new_rpc(RaftCode::Raft)
                 .proto_header(RaftRequest {
                     message: message.clone(),
+                    sender_session: Some(self.session),
+                    receiver_session: self.peer_sessions.get(to),
+                    leader_commit: self.is_leader().then_some(self.raw.raft.raft_log.committed),
                 })
                 .build();
 
             let client = self.client.clone();
+            let session_sender = self.session_sender.clone();
+            let term = message.term;
+            self.heartbeat_sequence += 1;
+            let heartbeat = self.heartbeat_sequence;
+            let discover = msg_type == MessageType::MsgHeartbeat
+                && self.is_leader()
+                && self.peer_sessions.begin(to, term, heartbeat);
             self.rt.spawn(async move {
                 // Heartbeat and voting messages do not need to be retryed.
                 let res: RaftResult<RaftResponse> = if msg_type == MessageType::MsgHeartbeat
@@ -565,11 +656,19 @@ where
                 } else {
                     client.retry_rpc(to, send_msg).await
                 };
-                if let Err(e) = res {
+                if let Err(e) = &res {
                     warn!(
                         "send message error, to {}, index {}, msg_type {:?}: {}",
                         to, index, msg_type, e
                     );
+                }
+                if discover {
+                    let _ = session_sender.send(SessionEvent {
+                        peer: to,
+                        term,
+                        heartbeat,
+                        response: res.ok(),
+                    });
                 }
             });
         }
@@ -580,10 +679,22 @@ where
     pub fn apply_config_change(&mut self, entry: &Entry) -> RaftResult<ConfChangeResponse> {
         let change: ConfChange = PMessage::decode(entry.get_data())?;
         let id = change.get_node_id();
+        let add_addr = match change.get_change_type() {
+            ConfChangeType::AddNode => {
+                Some(SerdeUtils::deserialize::<InetAddr>(change.get_context())?)
+            }
+            ConfChangeType::RemoveNode => None,
+            _ => unimplemented!(),
+        };
+
+        // Apply and persist Raft membership first. Transport and session state
+        // must not claim a change succeeded when raft-rs rejected it.
+        let cs = self.raw.apply_conf_change(&change)?;
+        self.raw.mut_store().set_conf_state(&cs)?;
 
         match change.get_change_type() {
             ConfChangeType::AddNode => {
-                let addr: InetAddr = SerdeUtils::deserialize(change.get_context())?;
+                let addr = add_addr.unwrap();
                 info!(
                     "Raft adding node: {}({}), current leader: {}({:?})",
                     id,
@@ -591,25 +702,23 @@ where
                     self.leader(),
                     self.group.get_addr(&self.leader())
                 );
-                self.group.insert(id, &addr);
                 self.client.add_node(id, &addr)?;
+                self.group.insert(id, &addr);
             }
 
             ConfChangeType::RemoveNode => {
-                if change.get_node_id() == self.id() {
+                // Membership removal ends the incarnation-fencing lifetime for
+                // this raft ID. A later AddNode with the same ID must negotiate
+                // a fresh session instead of inheriting stale peer state.
+                self.peer_sessions.remove(id);
+                if id == self.id() {
                     self.role_monitor.advance_exit();
                 } else {
                     self.group.remove(&id);
                 }
             }
 
-            _ => unimplemented!(),
-        }
-
-        // When a new node joins, create a snapshot.
-        if let Ok(cs) = self.raw.apply_conf_change(&change) {
-            let store = self.raw.mut_store();
-            store.set_conf_state(&cs)?;
+            _ => unreachable!(),
         }
 
         Ok(ConfChangeResponse::default())
@@ -793,5 +902,139 @@ where
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raft::storage::{HashAppStorage, MemLogStorage};
+    use curvine_config::RaftPeer;
+    use curvine_net::net::NetUtils;
+    use raft::eraftpb::{ConfChangeSingle, ConfChangeTransition, ConfChangeV2};
+
+    fn test_node(rt: Arc<Runtime>) -> RaftNode<MemLogStorage, HashAppStorage<String, String>> {
+        let mut conf = JournalConf::with_test();
+        let ports = [
+            conf.rpc_port,
+            NetUtils::get_available_port(),
+            NetUtils::get_available_port(),
+        ];
+        conf.journal_addrs = ports
+            .iter()
+            .enumerate()
+            .map(|(index, port)| RaftPeer::new((index + 1) as u64, &conf.hostname, *port))
+            .collect();
+        let group = RaftGroup::from_conf(&conf);
+        let id = group.get_node_id(&conf.local_addr()).unwrap();
+        let client = RaftClient::new(rt.clone(), &group, conf.new_client_conf());
+        let log_store = MemLogStorage::new();
+        log_store
+            .set_conf_state(&raft::eraftpb::ConfState {
+                voters: group.voters(),
+                ..Default::default()
+            })
+            .unwrap();
+        let storage = PeerStorage::new(
+            rt.clone(),
+            log_store,
+            HashAppStorage::new(),
+            client.clone(),
+            &conf,
+        );
+        let raw = RawNode::new(
+            &conf.new_raft_conf(id, 0),
+            storage.clone(),
+            &slog::Logger::root(slog::Discard, slog::o!()),
+        )
+        .unwrap();
+        let (sender, receiver) = mpsc::channel(conf.message_size);
+        let (session_sender, session_receiver) = mpsc::unbounded_channel();
+
+        RaftNode {
+            rt,
+            raw,
+            client,
+            session: 101,
+            peer_sessions: PeerSessions::default(),
+            heartbeat_sequence: 0,
+            session_sender,
+            session_receiver,
+            recovery: Recovery::new(false),
+            storage,
+            receiver,
+            sender,
+            group,
+            role_monitor: RoleMonitor::new(),
+            tick_interval: Duration::from_millis(conf.raft_tick_interval_ms),
+            max_batch_size: conf.raft_batch_size.max(1),
+            snapshot_interval_ms: 0,
+            snapshot_entries: conf.snapshot_entries,
+            last_snapshot_ms: 0,
+            last_snapshot_op_id: 0,
+        }
+    }
+
+    fn become_leader_and_fence(node: &mut RaftNode<MemLogStorage, HashAppStorage<String, String>>) {
+        node.raw.raft.become_candidate();
+        node.raw.raft.become_leader();
+        let term = node.raw.raft.term;
+        assert!(node.peer_sessions.begin(3, term, 100));
+        node.peer_sessions.observe(
+            &mut node.raw,
+            SessionEvent {
+                peer: 3,
+                term,
+                heartbeat: 100,
+                response: Some(RaftResponse {
+                    session: Some(301),
+                    term: Some(term),
+                }),
+            },
+        );
+        assert_eq!(node.peer_sessions.get(3), Some(301));
+    }
+
+    fn remove_entry(id: u64) -> Entry {
+        let change = ConfChange {
+            change_type: ConfChangeType::RemoveNode.into(),
+            node_id: id,
+            ..Default::default()
+        };
+        Entry {
+            data: change.encode_to_vec(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn successful_remove_node_clears_the_production_session_state() {
+        let rt = JournalConf::with_test().create_runtime();
+        let mut node = test_node(rt.clone());
+        become_leader_and_fence(&mut node);
+
+        node.apply_config_change(&remove_entry(3)).unwrap();
+
+        assert_eq!(node.peer_sessions.get(3), None);
+        assert!(node.raw.raft.prs().get(3).is_none());
+    }
+
+    #[test]
+    fn rejected_remove_node_keeps_the_existing_session_fence() {
+        let rt = JournalConf::with_test().create_runtime();
+        let mut node = test_node(rt.clone());
+        become_leader_and_fence(&mut node);
+
+        let mut joint = ConfChangeV2::default();
+        joint.set_transition(ConfChangeTransition::Explicit);
+        joint.set_changes(vec![ConfChangeSingle {
+            change_type: ConfChangeType::RemoveNode.into(),
+            node_id: 2,
+        }]);
+        node.raw.apply_conf_change(&joint).unwrap();
+
+        assert!(node.apply_config_change(&remove_entry(3)).is_err());
+        assert_eq!(node.peer_sessions.get(3), Some(301));
+        assert!(node.raw.raft.prs().get(3).is_some());
     }
 }
