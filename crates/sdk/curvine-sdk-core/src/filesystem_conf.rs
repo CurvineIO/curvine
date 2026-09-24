@@ -316,6 +316,15 @@ mod tests {
     use super::{FilesystemConf, TransferClientConf};
 
     #[test]
+    fn default_master_conn_pool_size_is_one() {
+        let conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        assert_eq!(conf.master_conn_pool_size, 1);
+
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.master_conn_pool_size, 1);
+    }
+
+    #[test]
     fn trims_whitespace_in_comma_separated_master_addrs() {
         let mut conf = FilesystemConf::with_master_addrs(["placeholder:8995"]).unwrap();
         // Production Hadoop/XML often inserts a space after only some commas.
