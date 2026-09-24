@@ -63,7 +63,12 @@ public class FilesystemConf {
     public long data_timeout_ms = 120 * 1000;
 
     // Number of fs master connections.
-    public int master_conn_pool_size = 3;
+    // Pool size 3 reaches the highest QPS. Pool size 1 supports the most clients, so the default is 1.
+    public int master_conn_pool_size = 1;
+
+    // When true, CurvineFileSystem instances share one runtime and one FsClient.
+    // Master addresses are not part of the reuse key.
+    public boolean share_rt_and_fs_client = true;
 
     // Whether to enable pre-reading, it only controls whether short-circuit read and write, and whether it is turned on.
     public boolean enable_read_ahead = true;
@@ -332,6 +337,7 @@ public class FilesystemConf {
                 ", rpc_timeout_ms=" + rpc_timeout_ms +
                 ", data_timeout_ms=" + data_timeout_ms +
                 ", master_conn_pool_size=" + master_conn_pool_size +
+                ", share_rt_and_fs_client=" + share_rt_and_fs_client +
                 ", enable_read_ahead=" + enable_read_ahead +
                 ", read_ahead_len='" + read_ahead_len + '\'' +
                 ", drop_cache_len='" + drop_cache_len + '\'' +
