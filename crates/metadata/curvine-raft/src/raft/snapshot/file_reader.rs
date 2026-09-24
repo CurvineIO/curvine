@@ -19,13 +19,11 @@ use curvine_io::LocalFile;
 use curvine_runtime::common::Utils;
 use flate2::read::ZlibEncoder;
 use flate2::Compression;
-use log::warn;
 
 // Read a file and read it after compression.
 pub struct FileReader {
     inner: LocalFile,
     read_buf: BytesMut,
-    compress_buf: BytesMut,
     chunk_size: usize,
     checksum: u64,
 }
@@ -37,7 +35,6 @@ impl FileReader {
         let reader = Self {
             inner,
             read_buf: BytesMut::with_capacity(chunk_size),
-            compress_buf: BytesMut::with_capacity(chunk_size),
             checksum: 0,
             chunk_size,
         };
@@ -62,27 +59,11 @@ impl FileReader {
         self.inner.read_all(&mut data)?;
         self.checksum += Utils::crc32(&data) as u64;
 
-        // Compress data.
-        // For small data, zlib compressed size may be larger than original due to header overhead
-        // Allocate extra space: original_len + 256 bytes for zlib overhead
-        let compress_buf_size = len + 256;
-        self.compress_buf.reserve(compress_buf_size);
-        unsafe {
-            self.compress_buf.set_len(compress_buf_size);
-        }
+        // Incompressible bytes can grow. compressBound is large enough for any
+        // zlib stream of this input, so the read cannot truncate a valid chunk.
         let mut encoder = ZlibEncoder::new(&data[..], Compression::default());
-        let read_len = RaftUtils::zlib_read_full(&mut encoder, &mut self.compress_buf[..])?;
-
-        // Check if buffer was too small
-        if read_len >= compress_buf_size {
-            warn!(
-                "[FileReader] Compression buffer may be too small! \
-                read_len: {}, buf_size: {}, original_len: {}",
-                read_len, compress_buf_size, len
-            );
-        }
-
-        Ok(self.compress_buf.split_to(read_len))
+        let max_len = RaftUtils::zlib_compress_bound(len);
+        Ok(RaftUtils::zlib_read_limited(&mut encoder, max_len)?)
     }
 
     pub fn checksum(&self) -> u64 {

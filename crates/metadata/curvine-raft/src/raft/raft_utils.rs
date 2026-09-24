@@ -17,6 +17,8 @@ use crate::proto::raft::{
 };
 use crate::raft::RaftResult;
 use crate::rocksdb::DBEngine;
+use bytes::BytesMut;
+use curvine_core_error::err_box;
 use curvine_runtime::common::{FileUtils, LocalTime};
 use std::path::PathBuf;
 
@@ -71,19 +73,43 @@ impl RaftUtils {
         format!("{}", path.display())
     }
 
-    pub fn zlib_read_full<R: std::io::Read>(reader: &mut R, buf: &mut [u8]) -> RaftResult<usize> {
-        let mut off = 0;
-        let mut len = 0;
-        loop {
-            let r = reader.read(&mut buf[off..])?;
-            if r == 0 {
-                break;
-            } else {
-                off += r;
-                len += r
-            }
-        }
+    /// Upper bound on zlib output for `len` bytes of input (`compressBound`).
+    pub(crate) fn zlib_compress_bound(len: usize) -> usize {
+        len.saturating_add(len >> 12)
+            .saturating_add(len >> 14)
+            .saturating_add(len >> 25)
+            .saturating_add(13)
+    }
 
-        Ok(len)
+    /// Read a zlib stream until EOF, rejecting output longer than `max_len`.
+    ///
+    /// A fixed buffer that is merely "usually big enough" cannot be used.
+    /// `Read::read` on a full slice returns `Ok(0)`, which is indistinguishable
+    /// from EOF, so the rest of the stream is dropped. The reader stops after
+    /// `max_len` bytes and checks one more byte so a hostile or oversized
+    /// stream fails before it is buffered.
+    pub(crate) fn zlib_read_limited<R: std::io::Read>(
+        reader: &mut R,
+        max_len: usize,
+    ) -> RaftResult<BytesMut> {
+        let mut out = BytesMut::with_capacity(max_len.min(64 * 1024));
+        let mut tmp = [0u8; 64 * 1024];
+        loop {
+            if out.len() >= max_len {
+                let extra = reader.read(&mut tmp[..1])?;
+                if extra == 0 {
+                    break;
+                }
+                return err_box!("zlib output exceeds limit {}", max_len);
+            }
+            let room = max_len - out.len();
+            let take = room.min(tmp.len());
+            let n = reader.read(&mut tmp[..take])?;
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&tmp[..n]);
+        }
+        Ok(out)
     }
 }
