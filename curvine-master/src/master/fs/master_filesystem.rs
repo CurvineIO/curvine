@@ -16,7 +16,7 @@ use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
-use crate::master::meta::{CacheInvalidationResult, FsDir};
+use crate::master::meta::{BlockReportDiagnostics, CacheInvalidationResult, FsDir};
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
@@ -29,7 +29,6 @@ use curvine_error::FsResult;
 use curvine_model::*;
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::GroupExecutor;
-use curvine_runtime::sync::ArcRwLock;
 use log::{error, info, warn};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -86,12 +85,6 @@ pub struct LostWorkerLocationCleanup {
     pub replication_block_ids: Vec<i64>,
 }
 
-pub(crate) enum BlockInodeState {
-    File,
-    Missing,
-    NotFile,
-}
-
 fn child_snapshot_path(parent: &str, child_name: &str) -> String {
     if parent == "/" {
         format!("/{child_name}")
@@ -132,10 +125,11 @@ const FULL_BLOCK_RECONCILE_THREADS: usize = 2;
 const FULL_BLOCK_RECONCILE_QUEUE_SIZE: usize = 128;
 
 impl MasterFilesystem {
-    // Max block-report location updates applied under a single fs_dir write lock.
-    const BLOCK_REPORT_WRITE_CHUNK: usize = 4096;
+    // Bound how long a report's shared guard can delay metadata writers.
+    pub(crate) const BLOCK_REPORT_CHUNK: usize = 250;
+    const FULL_BLOCK_RECONCILE_DELETE_CHUNK: usize = 500;
     // Max lost-worker block ids inspected under a single fs_dir write lock.
-    const LOST_WORKER_INVALIDATION_CHUNK: usize = Self::BLOCK_REPORT_WRITE_CHUNK;
+    const LOST_WORKER_INVALIDATION_CHUNK: usize = 4096;
 
     fn validate_alloc_capacity(
         current_len: i64,
@@ -1169,7 +1163,7 @@ impl MasterFilesystem {
         Ok(info)
     }
 
-    pub fn fs_dir(&self) -> ArcRwLock<FsDir> {
+    pub fn fs_dir(&self) -> SyncFsDir {
         self.fs_dir.clone()
     }
 
@@ -1205,11 +1199,6 @@ impl MasterFilesystem {
     pub fn restore_from_rocksdb(&self) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
         fs_dir.restore_from_rocksdb()
-    }
-
-    fn block_inode_state(&self, id: i64) -> FsResult<BlockInodeState> {
-        let fs_dir = self.fs_dir.read();
-        fs_dir.block_inode_state(id)
     }
 
     fn collect_full_block_report(&self, list: &BlockReportList) -> Option<HashSet<i64>> {
@@ -1319,6 +1308,11 @@ impl MasterFilesystem {
         if invalidate_full_reconcile {
             self.invalidate_full_block_state(list.worker_id);
         }
+        // A new page can republish locations before its final page queues a job.
+        // Cancel older cleanup without discarding this report's accumulated IDs.
+        if list.full_report {
+            self.invalidate_full_block_reconcile(list.worker_id);
+        }
 
         let full_reported_blocks = self.collect_full_block_report(&list);
         if list.blocks.is_empty() && full_reported_blocks.is_none() {
@@ -1327,99 +1321,76 @@ impl MasterFilesystem {
             });
         }
 
-        //(Whether to increase, block id, block location)
-        let mut checked = Vec::with_capacity(list.blocks.len());
         let mut delete_blocks = Vec::new();
-        let mut missing_blocks = 0usize;
-        let mut not_file_blocks = 0usize;
-        for item in list.blocks {
-            match item.status {
-                BlockReportStatus::Finalized | BlockReportStatus::Writing => {
-                    let defer_writing_delete =
-                        item.status == BlockReportStatus::Writing && !list.full_report;
-                    let state = match self.block_inode_state(item.id) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            warn!("block_report {item:?}: {e}");
-                            continue;
-                        }
-                    };
-                    match state {
-                        BlockInodeState::File => checked.push((item, Some(BlockInodeState::File))),
-                        BlockInodeState::Missing if defer_writing_delete => {
-                            warn!(
-                                "block_report deferred deletion for writing block {} on worker {} because its inode is missing",
-                                item.id, list.worker_id
-                            );
-                        }
-                        BlockInodeState::NotFile if defer_writing_delete => {
-                            warn!(
-                                "block_report deferred deletion for writing block {} on worker {} because its inode is not a file",
-                                item.id, list.worker_id
-                            );
-                        }
-                        BlockInodeState::Missing => {
-                            missing_blocks += 1;
-                            delete_blocks.push(item.id);
-                            checked.push((item, Some(BlockInodeState::Missing)));
-                        }
-                        BlockInodeState::NotFile => {
-                            not_file_blocks += 1;
-                            delete_blocks.push(item.id);
-                            checked.push((item, Some(BlockInodeState::NotFile)));
-                        }
-                    }
-                }
-                BlockReportStatus::Deleted => checked.push((item, None)),
+        let mut diagnostics = BlockReportDiagnostics::default();
+        let mut blocks = list.blocks.into_iter();
+        loop {
+            let chunk: Vec<_> = blocks.by_ref().take(Self::BLOCK_REPORT_CHUNK).collect();
+            if chunk.is_empty() {
+                break;
             }
-        }
-        if missing_blocks > 0 || not_file_blocks > 0 {
-            warn!(
-                "block_report found {} missing-inode and {} non-file-inode blocks for worker {}; scheduling worker deletion",
-                missing_blocks, not_file_blocks, list.worker_id
+            let status_order = chunk
+                .iter()
+                .any(|block| block.status == BlockReportStatus::Deleted)
+                .then(|| {
+                    chunk
+                        .iter()
+                        .map(|block| (block.id, block.status))
+                        .collect::<Vec<_>>()
+                });
+            let mut chunk_diagnostics = BlockReportDiagnostics::default();
+            let result = FsDir::apply_reported_blocks_with_read(
+                &self.fs_dir,
+                list.worker_id,
+                list.full_report,
+                &mut chunk_diagnostics,
+                chunk,
             );
-        }
-
-        let mut batch: Vec<(bool, i64, BlockLocation)> = vec![];
-        let mut wm = self.worker_manager.write();
-        for (item, exists) in checked {
-            let loc = BlockLocation::new(list.worker_id, item.storage_type);
-            match item.status {
-                BlockReportStatus::Finalized | BlockReportStatus::Writing => {
-                    let state = match exists {
-                        Some(v) => v,
-                        None => {
-                            warn!(
-                                "block_report invariant violated: missing inode state for block {}",
-                                item.id
-                            );
-                            continue;
-                        }
-                    };
-
-                    match state {
-                        BlockInodeState::File => batch.push((true, item.id, loc)),
-                        BlockInodeState::Missing | BlockInodeState::NotFile => {
-                            batch.push((false, item.id, loc));
-                            wm.remove_block(list.worker_id, item.id);
-                        }
+            chunk_diagnostics.log_chunk(list.worker_id, result.as_ref().err());
+            let obsolete = match result {
+                Ok(obsolete) => obsolete,
+                Err(e) => {
+                    diagnostics.log_summary(list.worker_id);
+                    return Err(e);
+                }
+            };
+            diagnostics.extend(chunk_diagnostics);
+            let mut wm = self.worker_manager.write();
+            if let Some(status_order) = status_order {
+                // A later rejection must requeue a prior deletion acknowledgement,
+                // even when both entries are processed in the same chunk.
+                let obsolete_ids: HashSet<_> = obsolete.iter().copied().collect();
+                for (id, status) in status_order {
+                    if status == BlockReportStatus::Deleted {
+                        wm.deleted_block(list.worker_id, id);
+                    } else if (list.full_report || status == BlockReportStatus::Finalized)
+                        && obsolete_ids.contains(&id)
+                    {
+                        wm.remove_block(list.worker_id, id);
                     }
                 }
-                BlockReportStatus::Deleted => {
-                    batch.push((false, item.id, loc));
-                    wm.deleted_block(list.worker_id, item.id);
+            } else {
+                for &id in &obsolete {
+                    wm.remove_block(list.worker_id, id);
                 }
             }
+            delete_blocks.extend(obsolete);
         }
-        drop(wm);
 
+        diagnostics.log_summary(list.worker_id);
         if let Some(reported_blocks) = full_reported_blocks {
             self.submit_full_block_reconcile(list.worker_id, reported_blocks, replication_handler)?;
         }
 
-        self.apply_block_report_batch(batch)?;
-
         Ok(BlockReportResult { delete_blocks })
+    }
+
+    #[doc(hidden)]
+    pub fn wait_for_full_block_reconcile_for_test(&self, worker_id: u32) -> FsResult<()> {
+        // Keep the test's filesystem owner alive until reconciliation releases its clone.
+        self.full_block_reconcile_executor
+            .fixed_spawn_blocking(worker_id as i64, || ())?;
+        Ok(())
     }
 
     fn submit_full_block_reconcile(
@@ -1535,19 +1506,30 @@ impl MasterFilesystem {
     ) -> FsResult<Vec<i64>> {
         let existing_blocks = {
             let fs_dir = self.fs_dir.read();
-            fs_dir.get_worker_block_ids(worker_id)?
+            fs_dir.get_worker_block_ids_with_capacity(worker_id, reported_blocks.len())?
         };
 
         let mut stale_block_ids = Vec::new();
-        let mut batch = Vec::new();
         for block_id in existing_blocks {
             if !reported_blocks.contains(&block_id) {
-                batch.push((false, block_id, BlockLocation::with_id(worker_id)));
                 stale_block_ids.push(block_id);
             }
         }
 
-        if !batch.is_empty() {
+        self.apply_full_block_reconcile(worker_id, generation, stale_block_ids)
+    }
+
+    fn apply_full_block_reconcile(
+        &self,
+        worker_id: u32,
+        generation: u64,
+        stale_block_ids: Vec<i64>,
+    ) -> FsResult<Vec<i64>> {
+        if !stale_block_ids.is_empty() {
+            let batch = stale_block_ids
+                .iter()
+                .map(|&id| (false, id, BlockLocation::with_id(worker_id)))
+                .collect();
             let reconciles = self.full_block_reconciles.lock();
             if !reconciles
                 .get(&worker_id)
@@ -1566,10 +1548,7 @@ impl MasterFilesystem {
         Ok(stale_block_ids)
     }
 
-    /// Applies block-report location updates in bounded chunks so the global
-    /// fs_dir write lock is held only briefly per chunk. Each entry is an
-    /// independent add/remove for one block location, so chunk boundaries do
-    /// not break cross-entry invariants.
+    /// Release the exclusive metadata guard between reconciliation deletion batches.
     fn apply_block_report_batch(&self, batch: Vec<(bool, i64, BlockLocation)>) -> FsResult<()> {
         if batch.is_empty() {
             return Ok(());
@@ -1577,7 +1556,10 @@ impl MasterFilesystem {
 
         let mut iter = batch.into_iter();
         loop {
-            let chunk: Vec<_> = iter.by_ref().take(Self::BLOCK_REPORT_WRITE_CHUNK).collect();
+            let chunk: Vec<_> = iter
+                .by_ref()
+                .take(Self::FULL_BLOCK_RECONCILE_DELETE_CHUNK)
+                .collect();
             if chunk.is_empty() {
                 break;
             }
@@ -1794,6 +1776,14 @@ impl MasterFilesystem {
         fs_dir.set_lock(inp, lock, self.conf.lock_expire_time_ms())
     }
 }
+
+#[cfg(test)]
+#[path = "reconcile_scan_tests.rs"]
+mod reconcile_scan_tests;
+
+#[cfg(test)]
+#[path = "report_state_tests.rs"]
+mod report_state_tests;
 
 #[cfg(test)]
 mod tests {

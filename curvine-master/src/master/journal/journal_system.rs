@@ -111,12 +111,12 @@ impl JournalSystem {
             //to-do: EvictionPolicy::Arc
         };
 
-        let fs_dir = SyncFsDir::new(FsDir::new(
+        let fs_dir = SyncFsDir::new(parking_lot::RwLock::new(FsDir::new(
             conf,
             journal_writer.clone(),
             ttl_bucket_list,
             evictor.clone(),
-        )?);
+        )?));
 
         let fs = MasterFilesystem::new(
             conf,

@@ -201,6 +201,30 @@ impl DBEngine {
         Ok(RocksIterator { inner: iter })
     }
 
+    /// Seek to a prefix without copying each key/value. The caller must check the
+    /// prefix before consuming a row and call `status()` when iteration ends.
+    pub fn raw_prefix_scan<K>(
+        &self,
+        cf: &str,
+        key: K,
+    ) -> CommonResult<DBRawIteratorWithThreadMode<'_, DB>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let mut opt = self.conf.create_read_opt();
+        opt.set_total_order_seek(true);
+        let start = key.as_ref();
+        let end = RocksUtils::calculate_end_bytes(start);
+        opt.set_iterate_lower_bound(start);
+        if !end.is_empty() {
+            opt.set_iterate_upper_bound(end);
+        }
+        let cf = self.cf(cf)?;
+        let mut iter = self.db.raw_iterator_cf_opt(cf, opt);
+        iter.seek(start);
+        Ok(iter)
+    }
+
     pub fn iter_cf_opt<'a: 'b, 'b>(
         &'a self,
         cf: &str,
