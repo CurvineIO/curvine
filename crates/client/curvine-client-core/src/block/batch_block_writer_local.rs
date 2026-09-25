@@ -1,10 +1,11 @@
+use crate::block::batch_block_writer::validate_batch_contexts;
 use crate::block::BlockClient;
 use crate::file::FsContext;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
 use curvine_io::LocalFile;
-use curvine_model::{ExtendedBlock, WorkerAddress};
+use curvine_model::{ExtendedBlock, StorageType, WorkerAddress};
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_sys::RawPtr;
@@ -19,6 +20,7 @@ pub struct BatchBlockWriterLocal {
     block_size: i64,
     pos: i64,
     req_id: i64,
+    actual_storage_types: Vec<StorageType>,
 }
 
 impl BatchBlockWriterLocal {
@@ -44,13 +46,34 @@ impl BatchBlockWriterLocal {
                 true,
             )
             .await?;
+        // A successful open creates the whole group on the worker. Abort it if
+        // the response violates the client-side ordering contract.
+        if let Err(error) = validate_batch_contexts(&blocks, &write_context.contexts) {
+            let _ = client
+                .write_commit_batch(&blocks, pos, block_size, req_id, 0, true)
+                .await;
+            return Err(error);
+        }
+        let actual_storage_types = write_context
+            .contexts
+            .iter()
+            .map(|context| context.storage_type)
+            .collect();
 
         // Create multiple files, one for each block context
         let mut files = Vec::new();
         for context in &write_context.contexts {
             match &context.path {
                 Some(path) => {
-                    let file = LocalFile::with_write_offset(path, false, pos)?;
+                    let file = match LocalFile::with_write_offset(path, false, pos) {
+                        Ok(file) => file,
+                        Err(error) => {
+                            let _ = client
+                                .write_commit_batch(&blocks, pos, block_size, req_id, 0, true)
+                                .await;
+                            return Err(error.into());
+                        }
+                    };
                     files.push(RawPtr::from_owned(file));
                 }
                 None => {
@@ -77,6 +100,7 @@ impl BatchBlockWriterLocal {
             block_size,
             pos: 0,
             req_id,
+            actual_storage_types,
         })
     }
 
@@ -96,6 +120,19 @@ impl BatchBlockWriterLocal {
             .await
     }
 
+    pub async fn cancel(&mut self) -> FsResult<()> {
+        self.client
+            .write_commit_batch(
+                &self.blocks,
+                self.pos,
+                self.block_size,
+                self.req_id,
+                0,
+                true,
+            )
+            .await
+    }
+
     pub async fn flush(&mut self) -> FsResult<()> {
         for file in &mut self.files {
             let file_clone = file.clone();
@@ -111,6 +148,10 @@ impl BatchBlockWriterLocal {
 
     pub fn worker_address(&self) -> &WorkerAddress {
         &self.worker_address
+    }
+
+    pub(crate) fn actual_storage_type(&self, block_index: usize) -> StorageType {
+        self.actual_storage_types[block_index]
     }
 
     pub async fn write(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {
