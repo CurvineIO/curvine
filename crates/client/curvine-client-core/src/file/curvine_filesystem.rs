@@ -473,6 +473,7 @@ impl CurvineFileSystem {
                 continue;
             }
 
+            // TODO: Cap each internal batch at N files (eg: 256) to bound tiny-file metadata.
             if batch_memory + content_size > chunk_size {
                 self.handle_batch_files(&batch).await?;
                 batch.clear();
