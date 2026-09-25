@@ -63,7 +63,8 @@ public class FilesystemConf {
     public long data_timeout_ms = 120 * 1000;
 
     // Number of fs master connections.
-    public int master_conn_pool_size = 3;
+    // Pool size 3 reaches the highest QPS. Pool size 1 supports the most clients, so the default is 1.
+    public int master_conn_pool_size = 1;
 
     // Whether to enable pre-reading, it only controls whether short-circuit read and write, and whether it is turned on.
     public boolean enable_read_ahead = true;

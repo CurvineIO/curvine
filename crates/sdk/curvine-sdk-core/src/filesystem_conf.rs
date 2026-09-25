@@ -68,7 +68,7 @@ pub struct FilesystemConf {
     pub data_timeout_ms: u64,
 
     // Number of fs master connections.
-    // After testing 3 connections, the best performance can be achieved, so the default value is 3.
+    // Pool size 3 reaches the highest QPS. Pool size 1 supports the most clients, so the default is 1.
     pub master_conn_pool_size: usize,
 
     // Whether to enable pre-reading, it only controls whether short-circuit read and write, and whether it is turned on.
@@ -162,7 +162,7 @@ impl FilesystemConf {
             master_addrs: master_addrs.join(","),
             io_threads: 16,
             worker_threads: 16,
-            master_conn_pool_size: 3,
+            master_conn_pool_size: 1,
             conn_timeout_ms: 30_000,
             rpc_timeout_ms: 120_000,
             data_timeout_ms: 120_000,
@@ -314,6 +314,15 @@ impl FilesystemConf {
 #[cfg(test)]
 mod tests {
     use super::{FilesystemConf, TransferClientConf};
+
+    #[test]
+    fn default_master_conn_pool_size_is_one() {
+        let conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        assert_eq!(conf.master_conn_pool_size, 1);
+
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.master_conn_pool_size, 1);
+    }
 
     #[test]
     fn trims_whitespace_in_comma_separated_master_addrs() {
