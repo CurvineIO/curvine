@@ -87,9 +87,23 @@ message ProposeResponse {
 
 message RaftRequest {
     required eraftpb.Message message = 1;
+    // Process incarnation, verified by a correlated heartbeat RPC response.
+    optional uint64 sender_session = 2;
+    // Fence append/snapshot payloads for an earlier receiver incarnation.
+    // A peer without a learned session may use legacy traffic. Once a session
+    // is learned, missing session fields cannot downgrade or clear the fence;
+    // mixed-version rollback then requires roll-forward or a leader process
+    // that has not learned the fenced session.
+    optional uint64 receiver_session = 3;
+    // The heartbeat commit itself is bounded by Progress.matched, not this value.
+    optional uint64 leader_commit = 4;
 }
 
 message RaftResponse {
+    // Transport handshake only, not an acknowledgement of replicated data.
+    optional uint64 session = 1;
+    // Leader accepts the session observation only in the queried term.
+    optional uint64 term = 2;
 }
 
 // Download snapshot request.

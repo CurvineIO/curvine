@@ -16,6 +16,7 @@ use crate::proto::raft::{FsmState, SnapshotData};
 use raft::eraftpb;
 
 mod raft_node;
+mod recovery;
 pub use self::raft_node::RaftNode;
 
 mod raft_client;
