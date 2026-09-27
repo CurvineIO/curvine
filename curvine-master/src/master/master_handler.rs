@@ -477,9 +477,12 @@ impl MasterHandler {
 
     pub fn get_file_block_details(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: GetFileBlockDetailsRequest = ctx.parse_header()?;
-        ctx.set_audit(Some(req.path.to_string()), None);
+        let path = req
+            .path
+            .ok_or_else(|| FsError::common("GetFileBlockDetails path is required"))?;
+        ctx.set_audit(Some(path.to_string()), None);
 
-        let details = Self::process_get_file_block_details(self.fs.clone(), req.path)?;
+        let details = Self::process_get_file_block_details(self.fs.clone(), path)?;
         ctx.response(ProtoUtils::file_block_details_to_pb(details))
     }
 
