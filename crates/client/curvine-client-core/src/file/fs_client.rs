@@ -540,7 +540,7 @@ impl FsClient {
 
     pub async fn get_file_block_details(&self, path: &Path) -> FsResult<FileBlockDetails> {
         let header = GetFileBlockDetailsRequest {
-            path: Some(path.encode()),
+            path: path.encode(),
         };
         let response: GetFileBlockDetailsResponse =
             self.rpc(RpcCode::GetFileBlockDetails, header).await?;

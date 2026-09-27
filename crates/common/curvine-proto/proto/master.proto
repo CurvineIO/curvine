@@ -212,24 +212,24 @@ message GetBlockLocationsResponse {
 
 // Diagnostic block placements retain actual storage types and unavailable replicas.
 message BlockReplicaDetailProto {
-    optional uint32 worker_id = 1;
-    optional StorageTypeProto storage_type = 2;
+    required uint32 worker_id = 1;
+    required StorageTypeProto storage_type = 2;
     optional WorkerAddressProto address = 3;
 }
 
 message FileBlockDetailProto {
-    optional int64 block_id = 1;
-    optional int64 block_size = 2;
-    optional int64 offset = 3;
+    required int64 block_id = 1;
+    required int64 block_size = 2;
+    required int64 offset = 3;
     repeated BlockReplicaDetailProto replicas = 4;
 }
 
 message GetFileBlockDetailsRequest {
-    optional string path = 1;
+    required string path = 1;
 }
 
 message GetFileBlockDetailsResponse {
-    optional FileStatusProto status = 1;
+    required FileStatusProto status = 1;
     repeated FileBlockDetailProto blocks = 2;
 }
 

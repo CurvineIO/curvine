@@ -309,15 +309,15 @@ impl ProtoUtils {
             .blocks
             .into_iter()
             .map(|block| FileBlockDetailProto {
-                block_id: Some(block.block_id),
-                block_size: Some(block.len),
-                offset: Some(block.offset),
+                block_id: block.block_id,
+                block_size: block.len,
+                offset: block.offset,
                 replicas: block
                     .replicas
                     .into_iter()
                     .map(|replica| BlockReplicaDetailProto {
-                        worker_id: Some(replica.worker_id),
-                        storage_type: Some(replica.storage_type.into()),
+                        worker_id: replica.worker_id,
+                        storage_type: replica.storage_type.into(),
                         address: replica.address.as_ref().map(Self::worker_address_to_pb),
                     })
                     .collect(),
@@ -325,7 +325,7 @@ impl ProtoUtils {
             .collect();
 
         GetFileBlockDetailsResponse {
-            status: Some(Self::file_status_to_pb(src.status)),
+            status: Self::file_status_to_pb(src.status),
             blocks,
         }
     }
@@ -335,15 +335,15 @@ impl ProtoUtils {
             .blocks
             .into_iter()
             .map(|block| FileBlockDetail {
-                block_id: block.block_id.unwrap_or_default(),
-                len: block.block_size.unwrap_or_default(),
-                offset: block.offset.unwrap_or_default(),
+                block_id: block.block_id,
+                len: block.block_size,
+                offset: block.offset,
                 replicas: block
                     .replicas
                     .into_iter()
                     .map(|replica| BlockReplicaDetail {
-                        worker_id: replica.worker_id.unwrap_or_default(),
-                        storage_type: StorageType::from(replica.storage_type.unwrap_or_default()),
+                        worker_id: replica.worker_id,
+                        storage_type: StorageType::from(replica.storage_type),
                         address: replica.address.as_ref().map(Self::worker_address_from_pb),
                     })
                     .collect(),
@@ -351,7 +351,7 @@ impl ProtoUtils {
             .collect();
 
         FileBlockDetails {
-            status: Self::file_status_from_pb(src.status.unwrap_or_default()),
+            status: Self::file_status_from_pb(src.status),
             blocks,
         }
     }
