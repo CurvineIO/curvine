@@ -850,6 +850,54 @@ impl MasterFilesystem {
         Ok(locate_blocks)
     }
 
+    pub fn get_file_block_details<T: AsRef<str>>(&self, path: T) -> FsResult<FileBlockDetails> {
+        let fs_dir = self.fs_dir.read();
+        let path = path.as_ref();
+        let inp = Self::resolve_path(&fs_dir, path)?;
+        let inode = match inp.get_last_inode() {
+            Some(inode) => inode,
+            None => return err_ext!(FsError::file_not_found(path)),
+        };
+        let file = inode.as_file_ref()?;
+        let file_locs = fs_dir.get_file_locations(file)?;
+        let worker_manager = self.worker_manager.read();
+        let mut offset = 0;
+        let mut blocks = Vec::with_capacity(file.blocks.len());
+
+        for meta in &file.blocks {
+            let mut replicas = file_locs
+                .get(&meta.id)
+                .map(|locations| {
+                    locations
+                        .iter()
+                        .map(|location| BlockReplicaDetail {
+                            worker_id: location.worker_id,
+                            storage_type: location.storage_type,
+                            address: worker_manager
+                                .get_worker(location.worker_id)
+                                .map(|worker| worker.address.clone()),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            replicas.sort_by_key(|replica| replica.worker_id);
+
+            let len = meta.len();
+            blocks.push(FileBlockDetail {
+                block_id: meta.id,
+                len,
+                offset,
+                replicas,
+            });
+            offset += len;
+        }
+
+        Ok(FileBlockDetails {
+            status: inode.to_file_status(path)?,
+            blocks,
+        })
+    }
+
     pub fn cv_metadata_snapshot_page(
         &self,
         page_token: Option<String>,

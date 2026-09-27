@@ -2814,6 +2814,131 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
 }
 
 #[test]
+fn file_block_details_preserve_mixed_replica_storage_types() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "file-block-details-mixed-storage");
+    let path = "/mixed-storage.log";
+    let client = ClientAddress::default();
+    fs.create(path, false)?;
+
+    let second_worker = WorkerInfo::new(
+        WorkerAddress {
+            worker_id: 200,
+            hostname: "worker-200".to_string(),
+            ip_addr: "127.0.0.2".to_string(),
+            rpc_port: 667,
+            ..Default::default()
+        },
+        0,
+    );
+    fs.add_test_worker(second_worker);
+    let block = fs.add_block(path, None, client, vec![], vec![], 0, None)?;
+
+    for (worker_id, storage_type, full_report) in [
+        (block.locs[0].worker_id, StorageType::SpdkDisk, true),
+        (200, StorageType::Disk, false),
+    ] {
+        fs.block_report(
+            BlockReportList {
+                cluster_id: "curvine".into(),
+                worker_id,
+                full_report,
+                total_len: 1,
+                blocks: vec![BlockReportInfo::new(
+                    block.block.id,
+                    BlockReportStatus::Finalized,
+                    storage_type,
+                    block.block.len,
+                )],
+            },
+            None,
+        )?;
+    }
+
+    let details = fs.get_file_block_details(path)?;
+    assert_eq!(details.blocks[0].replicas.len(), 2);
+    assert_eq!(
+        details.blocks[0]
+            .replicas
+            .iter()
+            .map(|replica| (replica.worker_id, replica.storage_type))
+            .collect::<Vec<_>>(),
+        vec![
+            (block.locs[0].worker_id, StorageType::SpdkDisk),
+            (200, StorageType::Disk),
+        ]
+    );
+    assert!(details.blocks[0]
+        .replicas
+        .iter()
+        .all(|replica| replica.address.is_some()));
+    Ok(())
+}
+
+#[test]
+fn file_block_details_reject_missing_paths_and_directories() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "file-block-details-invalid-paths");
+
+    assert!(fs.get_file_block_details("/missing").is_err());
+    fs.mkdir("/directory", true)?;
+    assert!(fs.get_file_block_details("/directory").is_err());
+    Ok(())
+}
+
+#[test]
+fn file_block_details_compute_cumulative_offsets() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "file-block-details-offsets");
+    let client = ClientAddress::default();
+    let path = "/offsets.log";
+    let (file_len, last_commit) = prepare_flush_file(&fs, path, &client, 3)?;
+    fs.complete_file(
+        path,
+        None,
+        file_len,
+        vec![last_commit],
+        &client.client_name,
+        false,
+        None,
+    )?;
+
+    let details = fs.get_file_block_details(path)?;
+    assert_eq!(details.blocks.len(), 3);
+    assert_eq!(details.blocks[0].offset, 0);
+    assert_eq!(details.blocks[1].offset, details.blocks[0].len);
+    assert_eq!(
+        details.blocks[2].offset,
+        details.blocks[0].len + details.blocks[1].len
+    );
+    Ok(())
+}
+
+#[test]
+fn file_block_details_preserve_unknown_worker_locations() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "file-block-details-unknown-worker");
+    let path = "/unknown-worker.log";
+    let client = ClientAddress::default();
+    fs.create(path, false)?;
+    let block = fs.add_block(path, None, client, vec![], vec![], 0, None)?;
+    fs.fs_dir.read().add_block_location(
+        block.block.id,
+        BlockLocation::new(999_999, StorageType::Ssd),
+    )?;
+
+    let details = fs.get_file_block_details(path)?;
+    let unknown = details.blocks[0]
+        .replicas
+        .iter()
+        .find(|replica| replica.worker_id == 999_999)
+        .expect("unknown worker location should be retained");
+    assert_eq!(unknown.storage_type, StorageType::Ssd);
+    assert!(unknown.address.is_none());
+    Ok(())
+}
+
+#[test]
 fn complete_file_with_set_attr_applies_attributes() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let fs = new_fs(true, "complete-with-attr");

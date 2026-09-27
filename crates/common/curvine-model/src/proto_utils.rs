@@ -304,6 +304,58 @@ impl ProtoUtils {
         }
     }
 
+    pub fn file_block_details_to_pb(src: FileBlockDetails) -> GetFileBlockDetailsResponse {
+        let blocks = src
+            .blocks
+            .into_iter()
+            .map(|block| FileBlockDetailProto {
+                block_id: block.block_id,
+                block_size: block.len,
+                offset: block.offset,
+                replicas: block
+                    .replicas
+                    .into_iter()
+                    .map(|replica| BlockReplicaDetailProto {
+                        worker_id: replica.worker_id,
+                        storage_type: replica.storage_type.into(),
+                        address: replica.address.as_ref().map(Self::worker_address_to_pb),
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        GetFileBlockDetailsResponse {
+            status: Self::file_status_to_pb(src.status),
+            blocks,
+        }
+    }
+
+    pub fn file_block_details_from_pb(src: GetFileBlockDetailsResponse) -> FileBlockDetails {
+        let blocks = src
+            .blocks
+            .into_iter()
+            .map(|block| FileBlockDetail {
+                block_id: block.block_id,
+                len: block.block_size,
+                offset: block.offset,
+                replicas: block
+                    .replicas
+                    .into_iter()
+                    .map(|replica| BlockReplicaDetail {
+                        worker_id: replica.worker_id,
+                        storage_type: StorageType::from(replica.storage_type),
+                        address: replica.address.as_ref().map(Self::worker_address_from_pb),
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        FileBlockDetails {
+            status: Self::file_status_from_pb(src.status),
+            blocks,
+        }
+    }
+
     pub fn filesystem_info_to_pb(src: FilesystemInfo) -> GetFilesystemInfoResponse {
         let mut pb = GetFilesystemInfoResponse {
             active_master: src.active_master,
