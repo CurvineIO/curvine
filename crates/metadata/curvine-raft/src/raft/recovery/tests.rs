@@ -171,6 +171,7 @@ impl Cluster {
             let response = RaftResponse {
                 session: Some(peer.session),
                 term: Some(peer.raw.raft.term),
+                recovering: Some(peer.recovery.active),
             };
             self.queue.extend(peer.ready());
             if kind == MessageType::MsgHeartbeat {
@@ -285,6 +286,96 @@ fn persisted_abstention_prevents_a_second_vote_after_normal_restart() {
 }
 
 #[test]
+fn unfenced_peer_accepts_sessions_until_an_exact_fence_is_learned() {
+    let mut sessions = PeerSessions::default();
+    assert!(sessions.accepts(3, None));
+    assert!(sessions.accepts(3, Some(300)));
+    sessions.peers.entry(3).or_default().session = Some(301);
+    assert!(!sessions.accepts(3, None));
+    assert!(!sessions.accepts(3, Some(300)));
+    assert!(sessions.accepts(3, Some(301)));
+}
+
+#[test]
+fn unfenced_leader_steps_sessioned_append_response_before_discovery() {
+    let mut cluster = Cluster::new();
+    cluster.peers[0].sessions.remove(3);
+
+    cluster.write();
+
+    let leader = &cluster.peers[0];
+    let committed = leader.raw.raft.raft_log.committed;
+    assert_eq!(leader.sessions.get(3), None);
+    assert_eq!(leader.raw.raft.prs().get(3).unwrap().matched, committed);
+}
+
+#[test]
+fn first_healthy_session_observation_preserves_progress_and_quorum_activity() {
+    let mut cluster = Cluster::new();
+    let leader = &mut cluster.peers[0];
+    let term = leader.raw.raft.term;
+    leader.sessions.peers.remove(&3);
+    let progress = leader.raw.raft.mut_prs().get_mut(3).unwrap();
+    progress.matched = 1;
+    progress.committed_index = 1;
+    progress.recent_active = true;
+
+    assert!(leader.sessions.begin(3, term, 100));
+    leader.sessions.observe(
+        &mut leader.raw,
+        SessionEvent {
+            peer: 3,
+            term,
+            heartbeat: 100,
+            response: Some(RaftResponse {
+                session: Some(301),
+                term: Some(term),
+                recovering: Some(false),
+            }),
+        },
+    );
+
+    let progress = leader.raw.raft.prs().get(3).unwrap();
+    assert_eq!(leader.sessions.get(3), Some(301));
+    assert_eq!(progress.matched, 1);
+    assert_eq!(progress.committed_index, 1);
+    assert!(progress.recent_active);
+}
+
+#[test]
+fn first_recovering_session_observation_resets_stale_progress() {
+    let mut cluster = Cluster::new();
+    let leader = &mut cluster.peers[0];
+    let term = leader.raw.raft.term;
+    leader.sessions.peers.remove(&3);
+    let progress = leader.raw.raft.mut_prs().get_mut(3).unwrap();
+    progress.matched = 1;
+    progress.committed_index = 1;
+    progress.recent_active = true;
+
+    assert!(leader.sessions.begin(3, term, 100));
+    leader.sessions.observe(
+        &mut leader.raw,
+        SessionEvent {
+            peer: 3,
+            term,
+            heartbeat: 100,
+            response: Some(RaftResponse {
+                session: Some(301),
+                term: Some(term),
+                recovering: Some(true),
+            }),
+        },
+    );
+
+    let progress = leader.raw.raft.prs().get(3).unwrap();
+    assert_eq!(leader.sessions.get(3), Some(301));
+    assert_eq!(progress.matched, 0);
+    assert_eq!(progress.committed_index, 0);
+    assert!(!progress.recent_active);
+}
+
+#[test]
 fn stale_handshakes_and_dead_process_responses_cannot_restore_matched() {
     let mut cluster = Cluster::new();
     cluster.write();
@@ -297,6 +388,7 @@ fn stale_handshakes_and_dead_process_responses_cannot_restore_matched() {
         response: Some(RaftResponse {
             session: Some(session),
             term: Some(term),
+            recovering: Some(false),
         }),
     };
     assert!(leader.sessions.begin(3, term, 100));
@@ -464,6 +556,7 @@ fn fenced_peer_cannot_downgrade_to_a_legacy_session() {
             response: Some(RaftResponse {
                 session: Some(301),
                 term: Some(term),
+                recovering: Some(false),
             }),
         },
     );
@@ -479,6 +572,7 @@ fn fenced_peer_cannot_downgrade_to_a_legacy_session() {
             response: Some(RaftResponse {
                 session: None,
                 term: Some(term),
+                recovering: Some(false),
             }),
         },
     );
@@ -526,6 +620,7 @@ fn failed_handshake_releases_slot_and_late_response_cannot_override_new_session(
             response: Some(RaftResponse {
                 session: Some(301),
                 term: Some(term),
+                recovering: Some(false),
             }),
         },
     );
@@ -539,6 +634,7 @@ fn failed_handshake_releases_slot_and_late_response_cannot_override_new_session(
             response: Some(RaftResponse {
                 session: Some(300),
                 term: Some(term),
+                recovering: Some(false),
             }),
         },
     );

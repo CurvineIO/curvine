@@ -373,7 +373,10 @@ impl JournalSystem {
     pub fn append_committed_entry_for_test(&self, entry: Entry) -> RaftResult<()> {
         let index = entry.index;
         self.raft_journal.log_store().append(&[entry])?;
-        self.raft_journal.log_store().set_hard_state_commit(index)
+        self.raft_journal
+            .log_store()
+            .set_hard_state_commit(index)
+            .map(|_| ())
     }
 
     pub fn state_listener(&self) -> RoleStateListener {

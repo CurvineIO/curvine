@@ -47,7 +47,10 @@ impl PeerSessions {
     }
 
     pub fn accepts(&self, peer: u64, session: Option<u64>) -> bool {
-        self.get(peer) == session
+        match self.get(peer) {
+            None => true,
+            Some(expected) => session == Some(expected),
+        }
     }
 
     pub fn remove(&mut self, peer: u64) {
@@ -89,10 +92,16 @@ impl PeerSessions {
         let Some(session) = response.session else {
             return;
         };
-        if peer.session == Some(session) {
+        let previous_session = peer.session.replace(session);
+        if previous_session == Some(session) {
             return;
         }
-        peer.session = Some(session);
+        // A healthy peer's first session observation must not disturb normal
+        // replication or check-quorum activity. Reset only a known replacement,
+        // or a peer that explicitly reports lost-state recovery on first contact.
+        if previous_session.is_none() && !response.recovering.unwrap_or(false) {
+            return;
+        }
         let next = raw.raft.raft_log.last_index() + 1;
         let pr = raw.raft.mut_prs().get_mut(event.peer).unwrap();
         pr.matched = 0;

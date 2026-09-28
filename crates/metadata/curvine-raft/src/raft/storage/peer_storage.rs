@@ -87,9 +87,8 @@ where
     }
 
     pub fn set_hard_state_commit(&self, commit: u64) -> RaftResult<()> {
-        self.log_store.set_hard_state_commit(commit)?;
-        self.app_store
-            .hard_state_changed(&self.log_store.initial_state()?.hard_state);
+        let hard_state = self.log_store.set_hard_state_commit(commit)?;
+        self.app_store.hard_state_changed(&hard_state);
         Ok(())
     }
 

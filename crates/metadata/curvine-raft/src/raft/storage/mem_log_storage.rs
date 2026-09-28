@@ -60,10 +60,10 @@ impl LogStorage for MemLogStorage {
         Ok(())
     }
 
-    fn set_hard_state_commit(&self, commit: u64) -> RaftResult<()> {
+    fn set_hard_state_commit(&self, commit: u64) -> RaftResult<HardState> {
         let mut store = self.core.wl();
         store.mut_hard_state().set_commit(commit);
-        Ok(())
+        Ok(store.hard_state().clone())
     }
 
     fn set_conf_state(&self, conf_state: &ConfState) -> RaftResult<()> {

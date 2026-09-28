@@ -452,6 +452,7 @@ where
             .proto_header(RaftResponse {
                 session: Some(self.session),
                 term: Some(self.raw.raft.term),
+                recovering: Some(self.recovery.active),
             })
             .build();
         env.send_with_log(Ok(rep_msg));
@@ -989,6 +990,7 @@ mod tests {
                 response: Some(RaftResponse {
                     session: Some(301),
                     term: Some(term),
+                    recovering: Some(false),
                 }),
             },
         );

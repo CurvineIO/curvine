@@ -28,11 +28,6 @@ pub struct JournalConf {
     // which is equivalent to a stand-alone system.
     pub enable: bool,
 
-    /// Rebuild one lost HA member from healthy peers. Disables elections and
-    /// voting until durable Raft and application state have caught up.
-    /// Never enable this on every member or when bootstrapping a new cluster.
-    pub recover_from_peers: bool,
-
     pub group_name: String,
     pub hostname: String,
     pub rpc_port: u16,
@@ -124,6 +119,11 @@ pub struct JournalConf {
 
     #[serde(default = "JournalConf::rocksdb_default")]
     pub rocksdb: DBConf,
+
+    /// Rebuild one lost HA member from healthy peers. Disables elections and
+    /// voting until durable Raft and application state have caught up.
+    /// Never enable this on every member or when bootstrapping a new cluster.
+    pub recover_from_peers: bool,
 }
 
 impl JournalConf {
@@ -210,7 +210,6 @@ impl Default for JournalConf {
         let rocksdb = Self::rocksdb_default().set_dir(journal_dir.as_str());
         Self {
             enable: true,
-            recover_from_peers: false,
             group_name: "raft-group".to_string(),
             hostname: ClusterConf::DEFAULT_HOSTNAME.to_string(),
             rpc_port: ClusterConf::DEFAULT_RAFT_PORT,
@@ -265,6 +264,7 @@ impl Default for JournalConf {
             ufs_copy_timeout: "20m".to_owned(), // 20 minutes
 
             rocksdb,
+            recover_from_peers: false,
         }
     }
 }

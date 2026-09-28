@@ -39,7 +39,7 @@ pub trait LogStorage: Storage + Clone + Send + Sync + 'static {
     /// Set the submission index of HardState
     /// When a node receives a committed log index from another node, it updates its own Commit field to ensure that the state of the node is consistent with that of the other nodes
     /// Usually, this is called when processing committed log entries to ensure that the node does not skip uncommitted parts when applying the log
-    fn set_hard_state_commit(&self, commit: u64) -> RaftResult<()>;
+    fn set_hard_state_commit(&self, commit: u64) -> RaftResult<HardState>;
 
     /// Set the configuration status of the node
     /// When nodes in the cluster change (such as adding or deleting nodes), the configuration status needs to be updated.

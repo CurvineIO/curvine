@@ -104,6 +104,9 @@ message RaftResponse {
     optional uint64 session = 1;
     // Leader accepts the session observation only in the queried term.
     optional uint64 term = 2;
+    // The sender is intentionally rebuilding lost local state. This lets a
+    // leader distinguish a replacement from a healthy peer on first contact.
+    optional bool recovering = 3;
 }
 
 // Download snapshot request.
