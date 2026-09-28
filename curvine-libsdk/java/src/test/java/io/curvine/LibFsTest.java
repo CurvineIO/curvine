@@ -25,6 +25,13 @@ import java.util.List;
 
 public class LibFsTest {
     @Test
+    public void defaultMasterConnPoolSizeIsOne() throws Exception {
+        FilesystemConf filesystemConf = new FilesystemConf(new Configuration());
+        Assert.assertEquals(1, filesystemConf.master_conn_pool_size);
+        Assert.assertTrue(filesystemConf.toToml().contains("master_conn_pool_size = 1\n"));
+    }
+
+    @Test
     public void conf() throws Exception {
         Configuration conf = new Configuration();
         conf.set("fs.cv.master_addrs", "localhost:9001,localhost:9002");
