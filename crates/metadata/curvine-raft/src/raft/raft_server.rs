@@ -66,6 +66,7 @@ pub struct RaftService {
     sender: mpsc::Sender<Envelope>,
     receiver: Option<mpsc::Receiver<Envelope>>,
     retry_cache: Arc<Cache<i64, ()>>,
+    snapshot_chunk_size: usize,
 }
 
 impl RaftService {
@@ -80,6 +81,7 @@ impl RaftService {
             sender,
             receiver: Some(receiver),
             retry_cache: Arc::new(cache),
+            snapshot_chunk_size: conf.snapshot_read_chunk_size,
         }
     }
 
@@ -95,7 +97,9 @@ impl HandlerService for RaftService {
     fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
         RaftHandler {
             sender: self.sender.clone(),
-            download_handler: FastMutex::new(SnapshotDownloadHandler::new(1024 * 1024)),
+            download_handler: FastMutex::new(SnapshotDownloadHandler::new(
+                self.snapshot_chunk_size,
+            )),
             retry_cache: self.retry_cache.clone(),
         }
     }
