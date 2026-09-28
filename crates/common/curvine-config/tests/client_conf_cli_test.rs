@@ -325,3 +325,8 @@ fn rejects_invalid_octal_umask() {
     let err = parsed.overrides.apply_to(&mut conf).unwrap_err();
     assert!(err.to_string().contains("umask"));
 }
+
+#[test]
+fn default_master_conn_pool_size_is_one() {
+    assert_eq!(ClientConf::default().master_conn_pool_size, 1);
+}

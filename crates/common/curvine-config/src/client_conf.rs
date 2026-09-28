@@ -149,7 +149,8 @@ pub struct ClientConf {
     pub data_timeout_ms: u64,
     pub pipeline_timeout_ms: u64,
 
-    // After testing 3 connections, the best performance can be achieved, so the default value is 3.
+    // Pool size 3 reaches the highest QPS. Pool size 1 keeps one connection per master
+    // and supports the most clients, so the default is 1.
     #[client_cli]
     pub master_conn_pool_size: usize,
 
@@ -410,7 +411,7 @@ impl Default for ClientConf {
             rpc_timeout_ms: 120 * 1000,
             data_timeout_ms: 120 * 1000,
             pipeline_timeout_ms: 120 * 1000,
-            master_conn_pool_size: 3,
+            master_conn_pool_size: 1,
 
             enable_read_ahead: true,
             read_ahead_len: 0,
