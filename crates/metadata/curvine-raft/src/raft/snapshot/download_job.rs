@@ -123,9 +123,27 @@ impl DownloadJob {
             if msg.header_len() > 0 {
                 let header: SnapshotDownloadResponse = msg.parse_header()?;
                 if header.is_last {
-                    // Check check_sum
                     let receiver_checksum = writer.checksum();
                     let sender_checksum = header.checksum;
+                    if writer.write_len() != client.file_len() {
+                        error!(
+                            "receiver snapshot file {} length mismatch! \
+                            written_len: {}, expected_len: {}, \
+                            receiver_checksum: {}, sender_checksum: {}",
+                            client.file_path(),
+                            writer.write_len(),
+                            client.file_len(),
+                            receiver_checksum,
+                            sender_checksum
+                        );
+                        return err_box!(
+                            "Snapshot file {}, length verification failed, \
+                            written_len: {}, expected_len: {}",
+                            client.file_path(),
+                            writer.write_len(),
+                            client.file_len()
+                        );
+                    }
                     if sender_checksum != receiver_checksum {
                         error!(
                             "receiver snapshot file {} checksum mismatch! \
