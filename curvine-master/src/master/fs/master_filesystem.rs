@@ -884,7 +884,7 @@ impl MasterFilesystem {
                     .into_iter()
                     .filter_map(|worker_id| {
                         worker_manager
-                            .get_worker(worker_id)
+                            .get_known_worker(worker_id)
                             .map(|worker| (worker_id, worker.address.clone()))
                     })
                     .collect::<HashMap<_, _>>()

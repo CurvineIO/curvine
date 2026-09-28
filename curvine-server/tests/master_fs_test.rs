@@ -2939,6 +2939,37 @@ fn file_block_details_preserve_unknown_worker_locations() -> CommonResult<()> {
 }
 
 #[test]
+fn file_block_details_resolves_lost_worker_addresses() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "file-block-details-lost-worker");
+    let path = "/lost-worker.log";
+    let client = ClientAddress::default();
+    fs.create(path, false)?;
+    let block = fs.add_block(path, None, client, vec![], vec![], 0, None)?;
+    let worker_id = block.locs[0].worker_id;
+    let expected_address = block.locs[0].clone();
+    fs.fs_dir.read().add_block_location(
+        block.block.id,
+        BlockLocation::new(worker_id, block.block.storage_type),
+    )?;
+
+    fs.worker_manager
+        .write()
+        .remove_expired_worker(worker_id)
+        .expect("worker should move to lost map");
+
+    let details = fs.get_file_block_details(path)?;
+    let lost = details.blocks[0]
+        .replicas
+        .iter()
+        .find(|replica| replica.worker_id == worker_id)
+        .expect("lost worker location should be retained");
+    assert_eq!(lost.storage_type, block.block.storage_type);
+    assert_eq!(lost.address.as_ref(), Some(&expected_address));
+    Ok(())
+}
+
+#[test]
 fn complete_file_with_set_attr_applies_attributes() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let fs = new_fs(true, "complete-with-attr");
