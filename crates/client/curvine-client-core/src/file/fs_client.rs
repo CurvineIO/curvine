@@ -107,6 +107,7 @@ impl_without_client_context!(
     CancelJobRequest,
     GetCvMetadataDeltaPageRequest,
     GetCvMetadataSnapshotPageRequest,
+    GetFileBlockDetailsRequest,
     GetJobStatusRequest,
     GetFilesystemInfoRequest,
     GetMountInfoRequest,
@@ -744,6 +745,15 @@ impl FsClient {
             results.push(result);
         }
         Ok(Some(results))
+    }
+
+    pub async fn get_file_block_details(&self, path: &Path) -> FsResult<FileBlockDetails> {
+        let header = GetFileBlockDetailsRequest {
+            path: path.encode(),
+        };
+        let response: GetFileBlockDetailsResponse =
+            self.rpc(RpcCode::GetFileBlockDetails, header).await?;
+        Ok(ProtoUtils::file_block_details_from_pb(response))
     }
 
     pub async fn get_cv_metadata_snapshot_page(

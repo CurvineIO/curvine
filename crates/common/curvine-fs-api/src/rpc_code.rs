@@ -78,6 +78,7 @@ pub enum RpcCode {
     ListTransfers = 52,
     ListTransferTenants = 53,
     RetryTransfer = 54,
+    GetFileBlockDetails = 59,
     WorkerHeartbeat = 40,
     WorkerBlockReport = 41,
 

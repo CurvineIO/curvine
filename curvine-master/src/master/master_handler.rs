@@ -33,8 +33,8 @@ use curvine_fs_api::{
 use curvine_model::ProtoUtils;
 use curvine_model::{
     CompatibilityMode, CompatibilityPolicy, CompatibilityVerdict, CreateFileOpts, DeleteBlockCmd,
-    DeleteResult, FileBlocks, FileStatus, FilesystemInfo, FreeResult, HeartbeatStatus, ListOptions,
-    OpenFlags, RenameFlags, WorkerCommand, WorkerInfo, WorkerStatus,
+    DeleteResult, FileBlockDetails, FileBlocks, FileStatus, FilesystemInfo, FreeResult,
+    HeartbeatStatus, ListOptions, OpenFlags, RenameFlags, WorkerCommand, WorkerInfo, WorkerStatus,
 };
 use curvine_net::net::ConnState;
 use curvine_proto::*;
@@ -561,6 +561,21 @@ impl MasterHandler {
 
     fn process_get_block_locations(fs: MasterFilesystem, path: String) -> FsResult<FileBlocks> {
         fs.get_block_locations(path)
+    }
+
+    pub fn get_file_block_details(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let req: GetFileBlockDetailsRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(req.path.to_string()), None);
+
+        let details = Self::process_get_file_block_details(self.fs.clone(), req.path)?;
+        ctx.response(ProtoUtils::file_block_details_to_pb(details))
+    }
+
+    fn process_get_file_block_details(
+        fs: MasterFilesystem,
+        path: String,
+    ) -> FsResult<FileBlockDetails> {
+        fs.get_file_block_details(path)
     }
 
     async fn run_master_rpc_task<T, F>(executor: Arc<GroupExecutor>, task: F) -> FsResult<T>
@@ -1253,6 +1268,7 @@ impl MessageHandler for MasterHandler {
                 RpcCode::ListOptions => self.list_options(ctx),
                 RpcCode::GetBlockLocations => self.get_block_locations(ctx),
                 RpcCode::GetBlockLocationsBatch => self.get_block_locations_batch(ctx),
+                RpcCode::GetFileBlockDetails => self.get_file_block_details(ctx),
                 RpcCode::SetAttr => self.set_attr_retry_check(ctx),
                 RpcCode::Symlink => self.symlink_retry_check(ctx),
                 RpcCode::Link => self.link_retry_check(ctx),

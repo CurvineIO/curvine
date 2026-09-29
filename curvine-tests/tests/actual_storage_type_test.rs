@@ -223,6 +223,17 @@ async fn assert_actual_disk_location(
         blocks.block_locs[0].locs[0].worker_id
     );
     assert_eq!(locations[0].storage_type, StorageType::Disk);
+
+    let details = fs.fs_client().get_file_block_details(&path).await?;
+    assert_eq!(details.status.storage_policy.storage_type, StorageType::Mem);
+    assert_eq!(details.blocks.len(), 1);
+    assert_eq!(details.blocks[0].block_id, blocks.block_locs[0].block.id);
+    assert_eq!(details.blocks[0].replicas.len(), 1);
+    assert_eq!(
+        details.blocks[0].replicas[0].storage_type,
+        StorageType::Disk
+    );
+    assert!(details.blocks[0].replicas[0].address.is_some());
     Ok(())
 }
 

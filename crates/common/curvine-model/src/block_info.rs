@@ -19,7 +19,8 @@ use curvine_runtime::common::{ByteUnit, FastHashMap};
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, Range};
 
-// block location information.
+// Worker-reported actual block placement. This can differ from the requested
+// storage type in the file policy when worker placement falls back.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockLocation {
     pub worker_id: u32,
@@ -66,6 +67,7 @@ impl From<&LocatedBlock> for CommitBlock {
 pub struct ExtendedBlock {
     pub id: i64,
     pub len: i64,
+    // Requested/allocation storage type. Use BlockLocation for actual placement.
     pub storage_type: StorageType,
     pub file_type: FileType,
     pub alloc_opts: Option<FileAllocOpts>,
@@ -161,6 +163,27 @@ impl Deref for LocatedBlock {
 pub struct FileBlocks {
     pub status: FileStatus,
     pub block_locs: Vec<LocatedBlock>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockReplicaDetail {
+    pub worker_id: u32,
+    pub storage_type: StorageType,
+    pub address: Option<WorkerAddress>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileBlockDetail {
+    pub block_id: i64,
+    pub len: i64,
+    pub offset: i64,
+    pub replicas: Vec<BlockReplicaDetail>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileBlockDetails {
+    pub status: FileStatus,
+    pub blocks: Vec<FileBlockDetail>,
 }
 
 impl FileBlocks {
