@@ -2948,10 +2948,19 @@ fn file_block_details_resolves_lost_worker_addresses() -> CommonResult<()> {
     let block = fs.add_block(path, None, client, vec![], vec![], 0, None)?;
     let worker_id = block.locs[0].worker_id;
     let expected_address = block.locs[0].clone();
-    let location = BlockLocation::new(worker_id, block.block.storage_type);
+    let reported_storage_type = StorageType::Ssd;
+    let location = BlockLocation::new(worker_id, reported_storage_type);
     fs.fs_dir
         .read()
         .add_block_location(block.block.id, location.clone())?;
+
+    let live_details = fs.get_file_block_details(path)?;
+    let live_replica = live_details.blocks[0]
+        .replicas
+        .iter()
+        .find(|replica| replica.worker_id == worker_id)
+        .expect("live worker location should be retained");
+    assert!(live_replica.address.is_some());
 
     fs.worker_manager
         .write()
@@ -2959,13 +2968,21 @@ fn file_block_details_resolves_lost_worker_addresses() -> CommonResult<()> {
         .expect("worker should move to lost map");
 
     let details = fs.get_file_block_details(path)?;
-    let lost = details.blocks[0]
-        .replicas
-        .iter()
-        .find(|replica| replica.worker_id == worker_id)
-        .expect("lost worker location should be retained");
-    assert_eq!(lost.storage_type, block.block.storage_type);
-    assert_eq!(lost.address.as_ref(), Some(&expected_address));
+    assert_eq!(details.blocks.len(), 1);
+    assert_eq!(details.blocks[0].block_id, block.block.id);
+    assert_eq!(details.blocks[0].replicas.len(), 1);
+    let lost = &details.blocks[0].replicas[0];
+    assert_eq!(lost.worker_id, worker_id);
+    assert_eq!(lost.storage_type, reported_storage_type);
+    let lost_address = lost
+        .address
+        .as_ref()
+        .expect("lost worker address should be resolved from lost worker map");
+    assert_eq!(lost_address.worker_id, expected_address.worker_id);
+    assert_eq!(lost_address.hostname, expected_address.hostname);
+    assert_eq!(lost_address.ip_addr, expected_address.ip_addr);
+    assert_eq!(lost_address.rpc_port, expected_address.rpc_port);
+    assert_eq!(lost_address.web_port, expected_address.web_port);
 
     // Contrast: create_locate_block must use live-only get_worker; lost replicas must not be returned to readers.
     assert!(
