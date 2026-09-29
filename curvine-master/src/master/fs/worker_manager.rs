@@ -237,6 +237,13 @@ impl WorkerManager {
         self.worker_map.workers.get(&id)
     }
 
+    pub fn get_known_worker(&self, id: u32) -> Option<&WorkerInfo> {
+        self.worker_map
+            .workers
+            .get(&id)
+            .or_else(|| self.worker_map.lost_workers().get(&id))
+    }
+
     pub fn create_locate_block(
         &self,
         path: impl AsRef<str>,

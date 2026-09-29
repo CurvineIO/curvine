@@ -538,6 +538,15 @@ impl FsClient {
         Ok(res)
     }
 
+    pub async fn get_file_block_details(&self, path: &Path) -> FsResult<FileBlockDetails> {
+        let header = GetFileBlockDetailsRequest {
+            path: path.encode(),
+        };
+        let response: GetFileBlockDetailsResponse =
+            self.rpc(RpcCode::GetFileBlockDetails, header).await?;
+        Ok(ProtoUtils::file_block_details_from_pb(response))
+    }
+
     pub async fn get_cv_metadata_snapshot_page(
         &self,
         page_token: Option<String>,

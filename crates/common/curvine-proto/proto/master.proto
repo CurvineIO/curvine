@@ -210,6 +210,29 @@ message GetBlockLocationsResponse {
     required FileBlocksProto blocks = 1;
 }
 
+// Diagnostic block placements retain actual storage types and unavailable replicas.
+message BlockReplicaDetailProto {
+    required uint32 worker_id = 1;
+    required StorageTypeProto storage_type = 2;
+    optional WorkerAddressProto address = 3;
+}
+
+message FileBlockDetailProto {
+    required int64 block_id = 1;
+    required int64 block_size = 2;
+    required int64 offset = 3;
+    repeated BlockReplicaDetailProto replicas = 4;
+}
+
+message GetFileBlockDetailsRequest {
+    required string path = 1;
+}
+
+message GetFileBlockDetailsResponse {
+    required FileStatusProto status = 1;
+    repeated FileBlockDetailProto blocks = 2;
+}
+
 // Request filesystem-wide information (statfs backend).
 message GetFilesystemInfoRequest {
     // Structured version of the requesting client (handshake). Cross-cutting

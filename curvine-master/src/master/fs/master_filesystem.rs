@@ -850,6 +850,74 @@ impl MasterFilesystem {
         Ok(locate_blocks)
     }
 
+    pub fn get_file_block_details<T: AsRef<str>>(&self, path: T) -> FsResult<FileBlockDetails> {
+        let path = path.as_ref();
+
+        let (status, block_snapshots, worker_addresses) = {
+            let fs_dir = self.fs_dir.read();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            let inode = match inp.get_last_inode() {
+                Some(inode) => inode,
+                None => return err_ext!(FsError::file_not_found(path)),
+            };
+            let file = inode.as_file_ref()?;
+            let file_locs = fs_dir.get_file_locations(file)?;
+            let status = inode.to_file_status(path)?;
+            let mut offset = 0;
+            let mut block_snapshots = Vec::with_capacity(file.blocks.len());
+            let mut worker_ids = HashSet::new();
+
+            for meta in &file.blocks {
+                let len = meta.len();
+                let replicas = file_locs.get(&meta.id).cloned().unwrap_or_default();
+                for replica in &replicas {
+                    worker_ids.insert(replica.worker_id);
+                }
+                block_snapshots.push((meta.id, len, offset, replicas));
+                offset += len;
+            }
+
+            // Snapshot addresses under the existing fs_dir -> worker_manager lock order.
+            let worker_addresses = {
+                let worker_manager = self.worker_manager.read();
+                worker_ids
+                    .into_iter()
+                    .filter_map(|worker_id| {
+                        worker_manager
+                            .get_known_worker(worker_id)
+                            .map(|worker| (worker_id, worker.address.clone()))
+                    })
+                    .collect::<HashMap<_, _>>()
+            };
+
+            (status, block_snapshots, worker_addresses)
+        };
+
+        let blocks = block_snapshots
+            .into_iter()
+            .map(|(block_id, len, offset, locations)| {
+                let mut replicas = locations
+                    .into_iter()
+                    .map(|location| BlockReplicaDetail {
+                        worker_id: location.worker_id,
+                        storage_type: location.storage_type,
+                        address: worker_addresses.get(&location.worker_id).cloned(),
+                    })
+                    .collect::<Vec<_>>();
+                replicas.sort_by_key(|replica| replica.worker_id);
+
+                FileBlockDetail {
+                    block_id,
+                    len,
+                    offset,
+                    replicas,
+                }
+            })
+            .collect();
+
+        Ok(FileBlockDetails { status, blocks })
+    }
+
     pub fn cv_metadata_snapshot_page(
         &self,
         page_token: Option<String>,
