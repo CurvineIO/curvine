@@ -2948,10 +2948,10 @@ fn file_block_details_resolves_lost_worker_addresses() -> CommonResult<()> {
     let block = fs.add_block(path, None, client, vec![], vec![], 0, None)?;
     let worker_id = block.locs[0].worker_id;
     let expected_address = block.locs[0].clone();
-    fs.fs_dir.read().add_block_location(
-        block.block.id,
-        BlockLocation::new(worker_id, block.block.storage_type),
-    )?;
+    let location = BlockLocation::new(worker_id, block.block.storage_type);
+    fs.fs_dir
+        .read()
+        .add_block_location(block.block.id, location.clone())?;
 
     fs.worker_manager
         .write()
@@ -2966,6 +2966,13 @@ fn file_block_details_resolves_lost_worker_addresses() -> CommonResult<()> {
         .expect("lost worker location should be retained");
     assert_eq!(lost.storage_type, block.block.storage_type);
     assert_eq!(lost.address.as_ref(), Some(&expected_address));
+
+    // Contrast: create_locate_block must use live-only get_worker; lost replicas must not be returned to readers.
+    assert!(
+        fs.create_locate_block(path, block.block.clone(), &[location])
+            .is_err(),
+        "read path must refuse a block whose only replica is on a lost worker"
+    );
     Ok(())
 }
 
