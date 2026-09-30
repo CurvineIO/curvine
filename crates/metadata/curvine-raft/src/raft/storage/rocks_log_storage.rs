@@ -84,7 +84,7 @@ impl LogStorage for RocksLogStorage {
         store.set_hard_state(hard_state.clone())
     }
 
-    fn set_hard_state_commit(&self, commit: u64) -> RaftResult<()> {
+    fn set_hard_state_commit(&self, commit: u64) -> RaftResult<HardState> {
         let mut store = self.write();
         store.set_hard_state_commit(commit)
     }

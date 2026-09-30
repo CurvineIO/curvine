@@ -26,6 +26,7 @@ use crate::master::{
 use curvine_config::ClusterConf;
 use curvine_core_error::err_box;
 use curvine_error::FsResult;
+use curvine_raft::conf::JournalConfExt;
 use curvine_raft::proto::raft::SnapshotData;
 use curvine_raft::raft::storage::{AppStorage, LogStorage, RocksLogStorage};
 use curvine_raft::raft::{RaftClient, RaftResult, RoleMonitor, RoleStateListener};
@@ -159,9 +160,13 @@ impl JournalSystem {
         let meta_db_conf = conf.db_conf();
         let journal_db_conf = conf.journal.db_conf();
         let meta_state =
-            Self::classify_master_data_dir(&meta_db_conf.base_dir, &meta_db_conf.data_dir);
-        let journal_state =
-            Self::classify_master_data_dir(&journal_db_conf.base_dir, &journal_db_conf.data_dir);
+            Self::classify_master_data_dir(&meta_db_conf.base_dir, &meta_db_conf.data_dir, None);
+        let recovery_marker = conf.journal.recovery_marker();
+        let journal_state = Self::classify_master_data_dir(
+            &journal_db_conf.base_dir,
+            &journal_db_conf.data_dir,
+            Some(&recovery_marker),
+        );
 
         if meta_state == MasterDataDirState::RocksDb && journal_state == MasterDataDirState::RocksDb
         {
@@ -191,7 +196,11 @@ impl JournalSystem {
         )
     }
 
-    fn classify_master_data_dir(base_dir: &str, data_dir: &str) -> MasterDataDirState {
+    fn classify_master_data_dir(
+        base_dir: &str,
+        data_dir: &str,
+        allowed_entry: Option<&Path>,
+    ) -> MasterDataDirState {
         if Self::looks_like_rocksdb_data_dir(data_dir) {
             return MasterDataDirState::RocksDb;
         }
@@ -205,14 +214,18 @@ impl JournalSystem {
         }
 
         let data_path = Path::new(data_dir);
-        if Self::is_clean_empty_master_base(base_path, data_path) {
+        if Self::is_clean_empty_master_base(base_path, data_path, allowed_entry) {
             MasterDataDirState::CleanEmpty
         } else {
             MasterDataDirState::Invalid
         }
     }
 
-    fn is_clean_empty_master_base(base_path: &Path, data_path: &Path) -> bool {
+    fn is_clean_empty_master_base(
+        base_path: &Path,
+        data_path: &Path,
+        allowed_entry: Option<&Path>,
+    ) -> bool {
         let Ok(entries) = fs::read_dir(base_path) else {
             return false;
         };
@@ -223,6 +236,9 @@ impl JournalSystem {
             };
 
             let path = entry.path();
+            if allowed_entry.is_some_and(|allowed| path == allowed) {
+                continue;
+            }
             if path != data_path || !Self::is_empty_dir(&path) {
                 return false;
             }
@@ -257,6 +273,16 @@ impl JournalSystem {
     }
 
     pub fn from_conf(conf: &ClusterConf) -> FsResult<Self> {
+        // Check the persistent marker before any directory formatting, even if
+        // the configuration flag was removed during an interrupted recovery.
+        let local_id = conf.journal.node_id()?;
+        let recovering = conf.journal.recover_from_peers == Some(local_id)
+            || conf.journal.recovery_marker().try_exists()?;
+        if recovering && (conf.format_master || !conf.journal.enable) {
+            return err_box!(
+                "member recovery requires format_master=false and journal.enable=true"
+            );
+        }
         // When the journal system is used, please note that it is separate from the fs system.
         Self::require_existing_master_data(conf)?;
 
@@ -364,7 +390,10 @@ impl JournalSystem {
     pub fn append_committed_entry_for_test(&self, entry: Entry) -> RaftResult<()> {
         let index = entry.index;
         self.raft_journal.log_store().append(&[entry])?;
-        self.raft_journal.log_store().set_hard_state_commit(index)
+        self.raft_journal
+            .log_store()
+            .set_hard_state_commit(index)
+            .map(|_| ())
     }
 
     pub fn state_listener(&self) -> RoleStateListener {
@@ -415,84 +444,5 @@ impl JournalSystem {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use curvine_config::{JournalConf, MasterConf};
-    use curvine_raft::raft::RaftPeer;
-    use curvine_runtime::common::Utils;
-
-    fn non_format_master_conf(name: &str, multi_master: bool) -> ClusterConf {
-        let mut journal = JournalConf::with_test();
-        journal.enable = false;
-        journal.journal_dir = Utils::test_sub_dir(format!("master-journal-test/journal-{}", name));
-        if multi_master {
-            journal
-                .journal_addrs
-                .push(RaftPeer::new(2, "localhost", journal.rpc_port + 1));
-        }
-
-        ClusterConf {
-            format_master: false,
-            testing: true,
-            master: MasterConf {
-                meta_dir: Utils::test_sub_dir(format!("master-journal-test/meta-{}", name)),
-                ..Default::default()
-            },
-            journal,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn require_existing_master_data_allows_clean_empty_non_format_dirs() -> FsResult<()> {
-        for multi_master in [false, true] {
-            let name = format!(
-                "clean-empty-non-format-{}-{}",
-                if multi_master { "ha" } else { "single" },
-                Utils::rand_str(6)
-            );
-            let conf = non_format_master_conf(&name, multi_master);
-            let _ = fs::remove_dir_all(&conf.master.meta_dir);
-            let _ = fs::remove_dir_all(&conf.journal.journal_dir);
-
-            JournalSystem::require_existing_master_data(&conf)?;
-
-            assert!(Path::new(&conf.master.meta_dir).is_dir());
-            assert!(Path::new(&conf.journal.journal_dir).is_dir());
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn require_existing_master_data_refuses_dirty_non_format_dirs() -> FsResult<()> {
-        for multi_master in [false, true] {
-            let name = format!(
-                "dirty-non-format-{}-{}",
-                if multi_master { "ha" } else { "single" },
-                Utils::rand_str(6)
-            );
-            let conf = non_format_master_conf(&name, multi_master);
-            let _ = fs::remove_dir_all(&conf.master.meta_dir);
-            let _ = fs::remove_dir_all(&conf.journal.journal_dir);
-            fs::create_dir_all(&conf.master.meta_dir)?;
-            fs::create_dir_all(&conf.journal.journal_dir)?;
-            fs::write(
-                Path::new(&conf.journal.journal_dir).join("orphaned-file"),
-                "not rocksdb",
-            )?;
-
-            let err = JournalSystem::require_existing_master_data(&conf)
-                .expect_err("dirty master data directory must be refused");
-            let err_msg = err.to_string();
-            assert!(
-                err_msg.contains("format_master=false")
-                    && err_msg.contains("inconsistent or invalid master data directories"),
-                "unexpected error: {}",
-                err_msg
-            );
-        }
-
-        Ok(())
-    }
-}
+#[path = "tests/journal_system_tests.rs"]
+mod journal_system_tests;

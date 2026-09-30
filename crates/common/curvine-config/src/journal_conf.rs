@@ -119,6 +119,12 @@ pub struct JournalConf {
 
     #[serde(default = "JournalConf::rocksdb_default")]
     pub rocksdb: DBConf,
+
+    /// Raft ID of one lost HA member to rebuild from healthy peers. Only the
+    /// matching member disables elections and voting until durable Raft and
+    /// application state have caught up.
+    #[serde(default)]
+    pub recover_from_peers: Option<u64>,
 }
 
 impl JournalConf {
@@ -150,6 +156,11 @@ impl JournalConf {
     pub fn create_runtime(&self) -> Arc<Runtime> {
         let rt = Runtime::new("raft-rpc", self.io_threads, self.worker_threads);
         Arc::new(rt)
+    }
+
+    /// Durable marker retained until a lost member has safely rejoined Raft.
+    pub fn recovery_marker(&self) -> std::path::PathBuf {
+        std::path::Path::new(&self.journal_dir).join("member-recovery-in-progress")
     }
 
     pub fn local_addr(&self) -> InetAddr {
@@ -254,6 +265,7 @@ impl Default for JournalConf {
             ufs_copy_timeout: "20m".to_owned(), // 20 minutes
 
             rocksdb,
+            recover_from_peers: None,
         }
     }
 }

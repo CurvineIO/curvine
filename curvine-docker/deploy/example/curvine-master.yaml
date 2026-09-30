@@ -48,13 +48,21 @@ spec:
             timeoutSeconds: 1
             failureThreshold: 3
             successThreshold: 1
+          # The Raft listener starts before the Master RPC listener. During a
+          # lost-member snapshot restore, 8996 remains live while 8995 stays
+          # intentionally unready.
+          startupProbe:
+            tcpSocket:
+              port: 8996
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 180
           livenessProbe:
             tcpSocket:
-              port: 8995
-            initialDelaySeconds: 15
-            periodSeconds: 300
-            timeoutSeconds: 60
-            failureThreshold: 5
+              port: 8996
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 6
           ports:
             - containerPort: 8995
             - containerPort: 8996

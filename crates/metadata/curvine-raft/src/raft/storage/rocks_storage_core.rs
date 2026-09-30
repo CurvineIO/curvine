@@ -158,7 +158,7 @@ impl RocksStorageCore {
         Ok(())
     }
 
-    pub fn set_hard_state_commit(&mut self, commit: u64) -> RaftResult<()> {
+    pub fn set_hard_state_commit(&mut self, commit: u64) -> RaftResult<HardState> {
         let mut hard_state = self.raft_state.hard_state.clone();
         hard_state.set_commit(commit);
 
@@ -166,8 +166,8 @@ impl RocksStorageCore {
         batch.set_state(&hard_state)?;
         batch.commit()?;
 
-        self.raft_state.hard_state = hard_state;
-        Ok(())
+        self.raft_state.hard_state = hard_state.clone();
+        Ok(hard_state)
     }
 
     fn validate_hard_state_commit(&self, commit: u64) -> RaftResult<()> {
