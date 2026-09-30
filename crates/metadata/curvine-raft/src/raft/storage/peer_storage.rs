@@ -25,6 +25,7 @@ use prost::Message;
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
 use raft::{GetEntriesContext, RaftState, StateRole, Storage};
 use std::sync::{Arc, Mutex};
+use tokio::sync::oneshot;
 
 // raft log packaging class
 // Unify the access interfaces of app_store and log_store. Convenient to code use.
@@ -187,7 +188,10 @@ where
         self.app_store.role_change(role).await
     }
 
-    pub fn gen_apply_snapshot_job(&self, mut snapshot: Snapshot) -> RaftResult<()> {
+    pub fn gen_apply_snapshot_job(
+        &self,
+        mut snapshot: Snapshot,
+    ) -> RaftResult<oneshot::Receiver<RaftResult<()>>> {
         if self.is_snapshot_applying() {
             return err_box!("Currently applying snapshot");
         }
@@ -285,28 +289,32 @@ where
             Ok::<(), RaftError>(())
         };
 
-        self.spawn_job(job, job_ctl)
+        drop(self.spawn_job(job, job_ctl)?);
+        Ok(())
     }
 
-    fn spawn_job<F>(&self, job: F, job_ctl: JobCtl) -> RaftResult<()>
+    fn spawn_job<F>(&self, job: F, job_ctl: JobCtl) -> RaftResult<oneshot::Receiver<RaftResult<()>>>
     where
         F: FnOnce() -> RaftResult<()> + Send + 'static,
     {
+        let (sender, receiver) = oneshot::channel();
         self.executor.spawn(move || {
             job_ctl.advance_state(JobState::Running);
-            match job() {
-                Ok(_) => {
+            let result = job();
+            match &result {
+                Ok(()) => {
                     job_ctl.advance_state(JobState::Finished);
                 }
 
                 Err(e) => {
                     job_ctl.advance_state(JobState::Failed);
-                    error!("create snap {}", e)
+                    error!("snapshot job failed: {}", e)
                 }
-            };
+            }
+            let _ = sender.send(result);
         })?;
 
-        Ok(())
+        Ok(receiver)
     }
 }
 

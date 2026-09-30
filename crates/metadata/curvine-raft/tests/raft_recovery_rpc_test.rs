@@ -277,7 +277,7 @@ impl Cluster {
         fs::create_dir_all(&root).unwrap();
         let _ = fs::remove_file(root.join("status.json"));
         let _ = fs::remove_file(root.join("command.json"));
-        self.conf[i].recover_from_peers = recovery;
+        self.conf[i].recover_from_peers = recovery.then_some((i + 1) as u64);
         fs::write(
             root.join("conf.json"),
             serde_json::to_vec(&self.conf[i]).unwrap(),

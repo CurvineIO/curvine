@@ -21,12 +21,21 @@ use crate::raft::{RaftError, RaftResult};
 use raft::eraftpb::MessageType;
 use raft::{RawNode, StateRole, Storage};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PeerIncarnation {
+    #[default]
+    Unknown,
+    Legacy,
+    Session(u64),
+}
 
 #[derive(Default)]
 struct PeerSession {
     in_flight: Option<(u64, u64)>, // term, heartbeat sequence
-    session: Option<u64>,
+    incarnation: PeerIncarnation,
 }
 
 #[derive(Default)]
@@ -43,13 +52,17 @@ pub(super) struct SessionEvent {
 
 impl PeerSessions {
     pub fn get(&self, peer: u64) -> Option<u64> {
-        self.peers.get(&peer).and_then(|p| p.session)
+        match self.peers.get(&peer).map(|p| p.incarnation) {
+            Some(PeerIncarnation::Session(session)) => Some(session),
+            _ => None,
+        }
     }
 
     pub fn accepts(&self, peer: u64, session: Option<u64>) -> bool {
-        match self.get(peer) {
-            None => true,
-            Some(expected) => session == Some(expected),
+        match self.peers.get(&peer).map(|p| p.incarnation) {
+            None | Some(PeerIncarnation::Unknown) => true,
+            Some(PeerIncarnation::Legacy) => session.is_none(),
+            Some(PeerIncarnation::Session(expected)) => session == Some(expected),
         }
     }
 
@@ -86,20 +99,27 @@ impl PeerSessions {
         let Some(response) = event.response else {
             return;
         };
-        if response.term != Some(event.term) || raw.raft.prs().get(event.peer).is_none() {
+        if raw.raft.prs().get(event.peer).is_none() {
             return;
         }
-        let Some(session) = response.session else {
-            return;
+        let observed = match response.session {
+            Some(session) if response.term == Some(event.term) => PeerIncarnation::Session(session),
+            Some(_) => return,
+            None if response.term.is_none() || response.term == Some(event.term) => {
+                PeerIncarnation::Legacy
+            }
+            None => return,
         };
-        let previous_session = peer.session.replace(session);
-        if previous_session == Some(session) {
+        let previous = peer.incarnation;
+        if previous == observed {
             return;
         }
+        peer.incarnation = observed;
         // A healthy peer's first session observation must not disturb normal
         // replication or check-quorum activity. Reset only a known replacement,
         // or a peer that explicitly reports lost-state recovery on first contact.
-        if previous_session.is_none() && !response.recovering.unwrap_or(false) {
+        let replacement = !matches!(previous, PeerIncarnation::Unknown);
+        if !replacement && !response.recovering.unwrap_or(false) {
             return;
         }
         let next = raw.raft.raft_log.last_index() + 1;
@@ -139,10 +159,47 @@ impl Recovery {
 
     /// A restart must not silently re-enable elections midway through recovery,
     /// even when the operator has already removed the configuration flag.
-    pub fn load(conf: &JournalConf) -> RaftResult<Self> {
+    pub fn load(conf: &JournalConf, local_id: u64) -> RaftResult<Self> {
         let marker = conf.recovery_marker();
         let pending = marker.try_exists()?;
-        if !conf.recover_from_peers && !pending {
+        if let Some(target) = conf.recover_from_peers {
+            if !conf.journal_addrs.iter().any(|peer| peer.id == target) {
+                return Err(RaftError::other(
+                    format!("journal.recover_from_peers targets unknown raft_id {target}").into(),
+                ));
+            }
+        }
+        if pending {
+            let marker_target = std::fs::read_to_string(&marker)?;
+            let marker_target = marker_target.trim();
+            if !marker_target.is_empty() {
+                let marker_target = marker_target.parse::<u64>().map_err(|e| {
+                    RaftError::other(
+                        format!("invalid member recovery marker {}: {e}", marker.display()).into(),
+                    )
+                })?;
+                if marker_target != local_id {
+                    return Err(RaftError::other(
+                        format!(
+                            "member recovery marker is bound to raft_id {marker_target}, but the local raft_id is {local_id}"
+                        )
+                        .into(),
+                    ));
+                }
+            }
+            if let Some(target) = conf.recover_from_peers {
+                if target != local_id {
+                    return Err(RaftError::other(
+                        format!(
+                            "member recovery marker for raft_id {local_id} is still active, but journal.recover_from_peers targets raft_id {target}; finish or explicitly abandon the existing recovery before retargeting"
+                        )
+                        .into(),
+                    ));
+                }
+            }
+        }
+        let selected = conf.recover_from_peers == Some(local_id);
+        if !selected && !pending {
             return Ok(Self::new(false));
         }
         if conf.journal_addrs.len() < 3 {
@@ -150,11 +207,12 @@ impl Recovery {
         }
         std::fs::create_dir_all(&conf.journal_dir)?;
         if !pending {
-            std::fs::OpenOptions::new()
+            let mut marker_file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&marker)?
-                .sync_all()?;
+                .open(&marker)?;
+            writeln!(marker_file, "{local_id}")?;
+            marker_file.sync_all()?;
             std::fs::File::open(&conf.journal_dir)?.sync_all()?;
         }
         let mut recovery = Self::new(true);

@@ -120,10 +120,11 @@ pub struct JournalConf {
     #[serde(default = "JournalConf::rocksdb_default")]
     pub rocksdb: DBConf,
 
-    /// Rebuild one lost HA member from healthy peers. Disables elections and
-    /// voting until durable Raft and application state have caught up.
-    /// Never enable this on every member or when bootstrapping a new cluster.
-    pub recover_from_peers: bool,
+    /// Raft ID of one lost HA member to rebuild from healthy peers. Only the
+    /// matching member disables elections and voting until durable Raft and
+    /// application state have caught up.
+    #[serde(default)]
+    pub recover_from_peers: Option<u64>,
 }
 
 impl JournalConf {
@@ -264,7 +265,7 @@ impl Default for JournalConf {
             ufs_copy_timeout: "20m".to_owned(), // 20 minutes
 
             rocksdb,
-            recover_from_peers: false,
+            recover_from_peers: None,
         }
     }
 }

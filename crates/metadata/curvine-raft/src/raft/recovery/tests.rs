@@ -290,7 +290,7 @@ fn unfenced_peer_accepts_sessions_until_an_exact_fence_is_learned() {
     let mut sessions = PeerSessions::default();
     assert!(sessions.accepts(3, None));
     assert!(sessions.accepts(3, Some(300)));
-    sessions.peers.entry(3).or_default().session = Some(301);
+    sessions.peers.entry(3).or_default().incarnation = PeerIncarnation::Session(301);
     assert!(!sessions.accepts(3, None));
     assert!(!sessions.accepts(3, Some(300)));
     assert!(sessions.accepts(3, Some(301)));
@@ -499,16 +499,16 @@ fn recovery_marker_survives_restart_without_the_flag() {
         curvine_runtime::common::Utils::rand_id()
     ));
     let mut conf = JournalConf {
-        recover_from_peers: true,
+        recover_from_peers: Some(1),
         journal_dir: root.to_str().unwrap().into(),
         journal_addrs: (1..=3)
             .map(|id| crate::raft::RaftPeer::new(id, "localhost", 9000 + id as u16))
             .collect(),
         ..Default::default()
     };
-    assert!(Recovery::load(&conf).unwrap().active);
-    conf.recover_from_peers = false;
-    let recovery = Recovery::load(&conf).unwrap();
+    assert!(Recovery::load(&conf, 1).unwrap().active);
+    conf.recover_from_peers = None;
+    let recovery = Recovery::load(&conf, 1).unwrap();
     assert!(recovery.active);
     let mut cluster = Cluster::new();
     cluster.write();
@@ -517,7 +517,7 @@ fn recovery_marker_survives_restart_without_the_flag() {
     cluster.peers[0].raw.ping();
     cluster.drain();
     assert!(!cluster.peers[2].recovery.active);
-    assert!(!Recovery::load(&conf).unwrap().active);
+    assert!(!Recovery::load(&conf, 1).unwrap().active);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -541,7 +541,7 @@ fn an_unfinished_or_changed_leader_target_cannot_publish_readiness() {
 }
 
 #[test]
-fn fenced_peer_cannot_downgrade_to_a_legacy_session() {
+fn fenced_peer_switches_to_a_correlated_legacy_replacement() {
     let mut cluster = Cluster::new();
     let leader = &mut cluster.peers[0];
     let term = leader.raw.raft.term;
@@ -561,6 +561,12 @@ fn fenced_peer_cannot_downgrade_to_a_legacy_session() {
         },
     );
     assert_eq!(leader.sessions.get(3), Some(301));
+    {
+        let progress = leader.raw.raft.mut_prs().get_mut(3).unwrap();
+        progress.matched = 8;
+        progress.committed_index = 8;
+        progress.recent_active = true;
+    }
 
     assert!(leader.sessions.begin(3, term, 101));
     leader.sessions.observe(
@@ -571,22 +577,26 @@ fn fenced_peer_cannot_downgrade_to_a_legacy_session() {
             heartbeat: 101,
             response: Some(RaftResponse {
                 session: None,
-                term: Some(term),
-                recovering: Some(false),
+                term: None,
+                recovering: None,
             }),
         },
     );
 
-    assert_eq!(leader.sessions.get(3), Some(301));
-    assert!(!leader.sessions.accepts(3, None));
-    assert!(leader.sessions.accepts(3, Some(301)));
+    assert_eq!(leader.sessions.get(3), None);
+    assert!(leader.sessions.accepts(3, None));
+    assert!(!leader.sessions.accepts(3, Some(301)));
+    let progress = leader.raw.raft.prs().get(3).unwrap();
+    assert_eq!(progress.matched, 0);
+    assert_eq!(progress.committed_index, 0);
+    assert!(!progress.recent_active);
 }
 
 #[test]
 fn removing_a_peer_clears_its_session_and_handshake() {
     let mut sessions = PeerSessions::default();
     assert!(sessions.begin(3, 10, 100));
-    sessions.peers.get_mut(&3).unwrap().session = Some(301);
+    sessions.peers.get_mut(&3).unwrap().incarnation = PeerIncarnation::Session(301);
 
     sessions.remove(3);
 
@@ -671,4 +681,197 @@ fn an_unfenced_heartbeat_cannot_commit_a_partially_recovered_suffix() {
     assert_eq!(peer.applied, 0);
     assert!(!peer.recovery.fenced);
     assert!(peer.recovery.active);
+}
+
+#[test]
+fn shared_recovery_target_activates_only_the_selected_member() {
+    let root = std::env::temp_dir().join(format!(
+        "curvine-targeted-recovery-{}",
+        curvine_runtime::common::Utils::rand_id()
+    ));
+    let shared = JournalConf {
+        recover_from_peers: Some(3),
+        journal_addrs: (1..=3)
+            .map(|id| crate::raft::RaftPeer::new(id, "localhost", 9100 + id as u16))
+            .collect(),
+        ..Default::default()
+    };
+
+    for local_id in 1..=3 {
+        let mut conf = shared.clone();
+        conf.journal_dir = root
+            .join(format!("member-{local_id}"))
+            .to_str()
+            .unwrap()
+            .into();
+        let recovery = Recovery::load(&conf, local_id).unwrap();
+        assert_eq!(recovery.active, local_id == 3);
+        assert_eq!(conf.recovery_marker().exists(), local_id == 3);
+    }
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn local_recovery_marker_rejects_a_conflicting_target_on_restart() {
+    let root = std::env::temp_dir().join(format!(
+        "curvine-conflicting-recovery-target-{}",
+        curvine_runtime::common::Utils::rand_id()
+    ));
+    let mut conf = JournalConf {
+        recover_from_peers: Some(3),
+        journal_dir: root.to_str().unwrap().into(),
+        journal_addrs: (1..=3)
+            .map(|id| crate::raft::RaftPeer::new(id, "localhost", 9150 + id as u16))
+            .collect(),
+        ..Default::default()
+    };
+
+    assert!(Recovery::load(&conf, 3).unwrap().active);
+    assert_eq!(
+        std::fs::read_to_string(conf.recovery_marker()).unwrap(),
+        "3\n"
+    );
+
+    conf.recover_from_peers = Some(2);
+    let error = match Recovery::load(&conf, 3) {
+        Ok(_) => panic!("an active marker must reject a conflicting recovery target"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("marker for raft_id 3"));
+    assert!(error.to_string().contains("targets raft_id 2"));
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unknown_recovery_target_is_rejected_before_any_marker_is_created() {
+    let root = std::env::temp_dir().join(format!(
+        "curvine-unknown-recovery-target-{}",
+        curvine_runtime::common::Utils::rand_id()
+    ));
+    let conf = JournalConf {
+        recover_from_peers: Some(4),
+        journal_dir: root.to_str().unwrap().into(),
+        journal_addrs: (1..=3)
+            .map(|id| crate::raft::RaftPeer::new(id, "localhost", 9200 + id as u16))
+            .collect(),
+        ..Default::default()
+    };
+
+    let error = match Recovery::load(&conf, 1) {
+        Ok(_) => panic!("unknown target must fail closed"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("unknown raft_id 4"));
+    assert!(!conf.recovery_marker().exists());
+}
+
+#[test]
+fn wrong_sequence_and_stale_term_cannot_change_a_session_fence() {
+    let mut cluster = Cluster::new();
+    let leader = &mut cluster.peers[0];
+    let term = leader.raw.raft.term;
+
+    assert!(leader.sessions.begin(3, term, 200));
+    leader.sessions.observe(
+        &mut leader.raw,
+        SessionEvent {
+            peer: 3,
+            term,
+            heartbeat: 201,
+            response: Some(RaftResponse {
+                session: None,
+                term: None,
+                recovering: None,
+            }),
+        },
+    );
+    assert_eq!(leader.sessions.get(3), Some(300));
+    assert!(!leader.sessions.accepts(3, None));
+
+    leader.sessions.observe(
+        &mut leader.raw,
+        SessionEvent {
+            peer: 3,
+            term,
+            heartbeat: 200,
+            response: Some(RaftResponse {
+                session: None,
+                term: None,
+                recovering: None,
+            }),
+        },
+    );
+    assert_eq!(leader.sessions.get(3), None);
+    assert!(leader.sessions.accepts(3, None));
+
+    assert!(leader.sessions.begin(3, term - 1, 202));
+    leader.sessions.observe(
+        &mut leader.raw,
+        SessionEvent {
+            peer: 3,
+            term: term - 1,
+            heartbeat: 202,
+            response: Some(RaftResponse {
+                session: Some(302),
+                term: Some(term - 1),
+                recovering: Some(false),
+            }),
+        },
+    );
+    assert_eq!(leader.sessions.get(3), None);
+    assert!(leader.sessions.accepts(3, None));
+    assert!(!leader.sessions.accepts(3, Some(302)));
+}
+
+#[test]
+fn legacy_to_session_replacement_resets_progress_and_rejects_legacy_acks() {
+    let mut cluster = Cluster::new();
+    let leader = &mut cluster.peers[0];
+    let term = leader.raw.raft.term;
+
+    assert!(leader.sessions.begin(3, term, 300));
+    leader.sessions.observe(
+        &mut leader.raw,
+        SessionEvent {
+            peer: 3,
+            term,
+            heartbeat: 300,
+            response: Some(RaftResponse {
+                session: None,
+                term: None,
+                recovering: None,
+            }),
+        },
+    );
+    {
+        let progress = leader.raw.raft.mut_prs().get_mut(3).unwrap();
+        progress.matched = 9;
+        progress.committed_index = 9;
+        progress.recent_active = true;
+    }
+
+    assert!(leader.sessions.begin(3, term, 301));
+    leader.sessions.observe(
+        &mut leader.raw,
+        SessionEvent {
+            peer: 3,
+            term,
+            heartbeat: 301,
+            response: Some(RaftResponse {
+                session: Some(303),
+                term: Some(term),
+                recovering: Some(false),
+            }),
+        },
+    );
+
+    assert_eq!(leader.sessions.get(3), Some(303));
+    assert!(!leader.sessions.accepts(3, None));
+    assert!(leader.sessions.accepts(3, Some(303)));
+    let progress = leader.raw.raft.prs().get(3).unwrap();
+    assert_eq!(progress.matched, 0);
+    assert_eq!(progress.committed_index, 0);
+    assert!(!progress.recent_active);
 }
