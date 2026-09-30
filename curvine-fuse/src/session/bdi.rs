@@ -35,6 +35,14 @@ fn mountinfo_bdi_path(mnt_path: &Path) -> std::io::Result<Option<String>> {
 fn mountinfo_bdi_path_from(mountinfo: &str, mnt_path: &Path) -> Option<String> {
     let target = mnt_path.to_string_lossy();
 
+    // The mount point can be shadowed: under Kubernetes the mount directory is
+    // typically a hostPath bind mount (e.g. ext4) that the FUSE filesystem is
+    // mounted over, so mountinfo holds several entries for the same path.
+    // Taking the first match would resolve to the bind mount's block device —
+    // whose BDI either does not exist (partition) or, worse, belongs to the
+    // host disk. Only a fuse-fstype entry is ours; keep the last one (the
+    // newest mount wins the path).
+    let mut bdi_path = None;
     for line in mountinfo.lines() {
         let mut fields = line.split_whitespace();
         let majmin = match fields.nth(2) {
@@ -47,12 +55,18 @@ fn mountinfo_bdi_path_from(mountinfo: &str, mnt_path: &Path) -> Option<String> {
             Some(v) => v,
             None => continue,
         };
-        if mount_point == target {
-            return Some(bdi_path_from_majmin(majmin));
+        if mount_point != target {
+            continue;
+        }
+        // A variable number of optional fields follows; per proc(5) the fstype
+        // is the field right after the "-" separator.
+        let mut rest = fields.skip_while(|f| *f != "-").skip(1);
+        if matches!(rest.next(), Some(fstype) if fstype == "fuse" || fstype.starts_with("fuse.")) {
+            bdi_path = Some(bdi_path_from_majmin(majmin));
         }
     }
 
-    None
+    bdi_path
 }
 
 /// Write `kb` into the mount's BDI sysfs entry; failures only warn.
@@ -95,9 +109,16 @@ pub fn apply_max_readahead_kb(mnt_path: &Path, kb: u32) {
                 }
             }
             Err(e) => {
+                let hint = if e.kind() == std::io::ErrorKind::ReadOnlyFilesystem {
+                    "; /sys is read-only here (typical inside containers) — mount a \
+                     writable host /sys into the container or set read_ahead_kb from \
+                     the host"
+                } else {
+                    ""
+                };
                 warn!(
-                    "bdi max_readahead_kb skip: write {} failed: {} (mount continues)",
-                    bdi_path, e
+                    "bdi max_readahead_kb skip: write {} failed: {}{} (mount continues)",
+                    bdi_path, e, hint
                 );
                 return;
             }
@@ -133,6 +154,34 @@ mod tests {
         assert_eq!(
             mountinfo_bdi_path_from(mountinfo, Path::new("/curvine-fuse")),
             Some("/sys/class/bdi/0:114/read_ahead_kb".to_string())
+        );
+    }
+
+    #[test]
+    fn mountinfo_bdi_path_from_prefers_fuse_over_shadowing_bind_mount() {
+        // Kubernetes hostPath pattern: the mount directory is a bind mount of a
+        // block device partition, and the FUSE filesystem is mounted over it.
+        // The partition entry comes first; resolving to it would target the
+        // host disk's BDI instead of the FUSE one.
+        let mountinfo = "\
+            14896 14612 8:2 /curvinefs /mnt/curvinefs rw,relatime shared:1 - ext4 /dev/sda2 rw,stripe=64\n\
+            7334 14896 0:481 / /mnt/curvinefs rw,relatime shared:3179 - fuse.curvinefs curvinefs rw,user_id=0,group_id=0\n";
+        assert_eq!(
+            mountinfo_bdi_path_from(mountinfo, Path::new("/mnt/curvinefs")),
+            Some("/sys/class/bdi/0:481/read_ahead_kb".to_string())
+        );
+    }
+
+    #[test]
+    fn mountinfo_bdi_path_from_ignores_non_fuse_entries() {
+        // Only a fuse mount's BDI is ours to tune: a path that matches solely a
+        // block-device mount must resolve to nothing rather than risk writing
+        // the host disk's readahead.
+        let mountinfo =
+            "14896 14612 8:2 /curvinefs /mnt/curvinefs rw,relatime shared:1 - ext4 /dev/sda2 rw\n";
+        assert_eq!(
+            mountinfo_bdi_path_from(mountinfo, Path::new("/mnt/curvinefs")),
+            None
         );
     }
 
