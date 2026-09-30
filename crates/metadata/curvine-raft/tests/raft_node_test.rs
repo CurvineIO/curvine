@@ -374,8 +374,11 @@ impl LogStorage for NoSnapshotLogStorage {
         Ok(())
     }
 
-    fn set_hard_state_commit(&self, _: u64) -> RaftResult<()> {
-        Ok(())
+    fn set_hard_state_commit(&self, commit: u64) -> RaftResult<HardState> {
+        Ok(HardState {
+            commit,
+            ..Default::default()
+        })
     }
 
     fn set_conf_state(&self, _: &ConfState) -> RaftResult<()> {
