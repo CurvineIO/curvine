@@ -319,6 +319,7 @@ impl ProtoUtils {
                         worker_id: replica.worker_id,
                         storage_type: replica.storage_type.into(),
                         address: replica.address.as_ref().map(Self::worker_address_to_pb),
+                        state: Some(Self::block_replica_state_to_pb(replica.state) as i32),
                     })
                     .collect(),
             })
@@ -345,6 +346,7 @@ impl ProtoUtils {
                         worker_id: replica.worker_id,
                         storage_type: StorageType::from(replica.storage_type),
                         address: replica.address.as_ref().map(Self::worker_address_from_pb),
+                        state: Self::block_replica_state_from_pb(replica.state),
                     })
                     .collect(),
             })
@@ -353,6 +355,26 @@ impl ProtoUtils {
         FileBlockDetails {
             status: Self::file_status_from_pb(src.status),
             blocks,
+        }
+    }
+
+    fn block_replica_state_to_pb(src: BlockReplicaState) -> BlockReplicaStateProto {
+        match src {
+            BlockReplicaState::Unknown => BlockReplicaStateProto::BlockReplicaUnknown,
+            BlockReplicaState::Live => BlockReplicaStateProto::BlockReplicaLive,
+            BlockReplicaState::Lost => BlockReplicaStateProto::BlockReplicaLost,
+        }
+    }
+
+    fn block_replica_state_from_pb(src: Option<i32>) -> BlockReplicaState {
+        match src.unwrap_or(BlockReplicaStateProto::BlockReplicaUnknown as i32) {
+            value if value == BlockReplicaStateProto::BlockReplicaLive as i32 => {
+                BlockReplicaState::Live
+            }
+            value if value == BlockReplicaStateProto::BlockReplicaLost as i32 => {
+                BlockReplicaState::Lost
+            }
+            _ => BlockReplicaState::Unknown,
         }
     }
 

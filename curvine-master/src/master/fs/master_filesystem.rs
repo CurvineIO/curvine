@@ -853,7 +853,7 @@ impl MasterFilesystem {
     pub fn get_file_block_details<T: AsRef<str>>(&self, path: T) -> FsResult<FileBlockDetails> {
         let path = path.as_ref();
 
-        let (status, block_snapshots, worker_addresses) = {
+        let (status, block_snapshots, worker_snapshots) = {
             let fs_dir = self.fs_dir.read();
             let inp = Self::resolve_path(&fs_dir, path)?;
             let inode = match inp.get_last_inode() {
@@ -877,20 +877,32 @@ impl MasterFilesystem {
                 offset += len;
             }
 
-            // Snapshot addresses under the existing fs_dir -> worker_manager lock order.
-            let worker_addresses = {
+            // Snapshot worker state under the existing fs_dir -> worker_manager lock order.
+            let worker_snapshots = {
                 let worker_manager = self.worker_manager.read();
                 worker_ids
                     .into_iter()
-                    .filter_map(|worker_id| {
-                        worker_manager
-                            .get_known_worker(worker_id)
-                            .map(|worker| (worker_id, worker.address.clone()))
+                    .map(|worker_id| {
+                        let (address, state) = if let Some(worker) =
+                            worker_manager.get_worker(worker_id)
+                        {
+                            let state = if worker.is_live() {
+                                BlockReplicaState::Live
+                            } else {
+                                BlockReplicaState::Lost
+                            };
+                            (Some(worker.address.clone()), state)
+                        } else if let Some(worker) = worker_manager.get_known_worker(worker_id) {
+                            (Some(worker.address.clone()), BlockReplicaState::Lost)
+                        } else {
+                            (None, BlockReplicaState::Unknown)
+                        };
+                        (worker_id, (address, state))
                     })
                     .collect::<HashMap<_, _>>()
             };
 
-            (status, block_snapshots, worker_addresses)
+            (status, block_snapshots, worker_snapshots)
         };
 
         let blocks = block_snapshots
@@ -901,7 +913,13 @@ impl MasterFilesystem {
                     .map(|location| BlockReplicaDetail {
                         worker_id: location.worker_id,
                         storage_type: location.storage_type,
-                        address: worker_addresses.get(&location.worker_id).cloned(),
+                        address: worker_snapshots
+                            .get(&location.worker_id)
+                            .and_then(|(address, _)| address.clone()),
+                        state: worker_snapshots
+                            .get(&location.worker_id)
+                            .map(|(_, state)| *state)
+                            .unwrap_or(BlockReplicaState::Unknown),
                     })
                     .collect::<Vec<_>>();
                 replicas.sort_by_key(|replica| replica.worker_id);

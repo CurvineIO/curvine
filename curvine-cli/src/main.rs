@@ -186,6 +186,7 @@ fn main() -> CommonResult<()> {
         let result = match args.command {
             Some(Commands::Bench(cmd)) => cmd.execute(curvine_fs, conf_source.clone()).await,
             Some(Commands::Fs(cmd)) => cmd.execute(curvine_fs).await,
+            Some(Commands::Fsck(cmd)) => cmd.execute(fs_client).await,
             Some(Commands::Report(cmd)) => cmd.execute(curvine_fs).await,
             Some(Commands::Load(cmd)) => match transfer_client.clone() {
                 Some(transfer_client) => cmd.execute_transfer(curvine_fs.clone(), transfer_client).await,
@@ -252,6 +253,17 @@ mod tests {
             .expect("export command should parse");
 
         assert!(matches!(args.command, Some(Commands::Export(_))));
+    }
+
+    #[test]
+    fn fsck_flags_are_available() {
+        let args = CurvineArgs::try_parse_from(["curvine", "fsck", "/data"])
+            .expect("fsck command should parse");
+
+        let Some(Commands::Fsck(command)) = args.command else {
+            panic!("expected fsck command");
+        };
+        assert_eq!(command.path, "/data");
     }
 
     #[test]

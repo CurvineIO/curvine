@@ -165,11 +165,27 @@ pub struct FileBlocks {
     pub block_locs: Vec<LocatedBlock>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum BlockReplicaState {
+    Live,
+    Lost,
+    #[default]
+    Unknown,
+}
+
+impl BlockReplicaState {
+    pub fn is_available(self) -> bool {
+        matches!(self, Self::Live)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockReplicaDetail {
     pub worker_id: u32,
     pub storage_type: StorageType,
     pub address: Option<WorkerAddress>,
+    #[serde(default)]
+    pub state: BlockReplicaState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

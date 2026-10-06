@@ -20,9 +20,9 @@ use curvine_fs_api::{CurvineURI, Path};
 use curvine_model::MountOptions;
 use curvine_model::ProtoUtils;
 use curvine_model::{
-    BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
-    CreateFileOpts, CreateFileOptsBuilder, DeleteResult, FileAllocOpts, LocatedBlock,
-    MkdirOptsBuilder, StorageType, TtlAction, WorkerAddress, WorkerInfo,
+    BlockLocation, BlockReplicaState, BlockReportInfo, BlockReportList, BlockReportStatus,
+    ClientAddress, CommitBlock, CreateFileOpts, CreateFileOptsBuilder, DeleteResult, FileAllocOpts,
+    LocatedBlock, MkdirOptsBuilder, StorageType, TtlAction, WorkerAddress, WorkerInfo,
 };
 use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
@@ -2935,6 +2935,7 @@ fn file_block_details_preserve_unknown_worker_locations() -> CommonResult<()> {
         .expect("unknown worker location should be retained");
     assert_eq!(unknown.storage_type, StorageType::Ssd);
     assert!(unknown.address.is_none());
+    assert_eq!(unknown.state, BlockReplicaState::Unknown);
     Ok(())
 }
 
@@ -2961,6 +2962,7 @@ fn file_block_details_resolves_lost_worker_addresses() -> CommonResult<()> {
         .find(|replica| replica.worker_id == worker_id)
         .expect("live worker location should be retained");
     assert!(live_replica.address.is_some());
+    assert_eq!(live_replica.state, BlockReplicaState::Live);
 
     fs.worker_manager
         .write()
@@ -2983,6 +2985,7 @@ fn file_block_details_resolves_lost_worker_addresses() -> CommonResult<()> {
     assert_eq!(lost_address.ip_addr, expected_address.ip_addr);
     assert_eq!(lost_address.rpc_port, expected_address.rpc_port);
     assert_eq!(lost_address.web_port, expected_address.web_port);
+    assert_eq!(lost.state, BlockReplicaState::Lost);
 
     // Contrast: create_locate_block must use live-only get_worker; lost replicas must not be returned to readers.
     assert!(
