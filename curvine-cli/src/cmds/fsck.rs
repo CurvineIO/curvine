@@ -140,7 +140,7 @@ fn render_file(mut details: FileBlockDetails, include_status: bool) -> String {
 }
 
 fn replica_is_available(status: WorkerStatus) -> bool {
-    !matches!(status, WorkerStatus::Lost | WorkerStatus::Unknown)
+    matches!(status, WorkerStatus::Live)
 }
 
 #[cfg(test)]
@@ -316,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn registered_non_live_worker_statuses_are_counted_available() {
+    fn registered_non_live_worker_statuses_are_counted_unavailable() {
         let mut details = details(
             2,
             vec![
@@ -327,15 +327,15 @@ mod tests {
         let summary = summarize_file(&mut details);
 
         assert_eq!(summary.recorded_replicas, 2);
-        assert_eq!(summary.available_replicas, 2);
-        assert_eq!(summary.unavailable_replicas, 0);
-        assert_eq!(summary.under_replicated_blocks, 0);
-        assert!(!summary.has_warnings());
+        assert_eq!(summary.available_replicas, 0);
+        assert_eq!(summary.unavailable_replicas, 2);
+        assert_eq!(summary.under_replicated_blocks, 1);
+        assert!(summary.has_warnings());
 
         let output = render_file(details, true);
         assert!(output.contains("blacklist"));
         assert!(output.contains("decommission"));
-        assert!(output.contains("Status: OK"));
+        assert!(output.contains("Status: WARNING"));
     }
 
     #[test]
