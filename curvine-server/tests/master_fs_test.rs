@@ -3024,7 +3024,7 @@ fn file_block_details_preserve_registered_non_live_worker_status() -> CommonResu
     assert_eq!(blacklist.state, WorkerStatus::Blacklist);
     assert!(blacklist.address.is_some());
     assert!(fs
-        .create_locate_block(path, block.block.clone(), &[location.clone()])
+        .create_locate_block(path, block.block.clone(), std::slice::from_ref(&location))
         .is_ok());
 
     fs.worker_manager.write().add_dcm(vec![hostname]);
