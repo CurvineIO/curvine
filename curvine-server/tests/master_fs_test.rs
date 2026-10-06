@@ -20,9 +20,9 @@ use curvine_fs_api::{CurvineURI, Path};
 use curvine_model::MountOptions;
 use curvine_model::ProtoUtils;
 use curvine_model::{
-    BlockLocation, BlockReplicaState, BlockReportInfo, BlockReportList, BlockReportStatus,
-    ClientAddress, CommitBlock, CreateFileOpts, CreateFileOptsBuilder, DeleteResult, FileAllocOpts,
-    LocatedBlock, MkdirOptsBuilder, StorageType, TtlAction, WorkerAddress, WorkerInfo,
+    BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
+    CreateFileOpts, CreateFileOptsBuilder, DeleteResult, FileAllocOpts, LocatedBlock,
+    MkdirOptsBuilder, StorageType, TtlAction, WorkerAddress, WorkerInfo, WorkerStatus,
 };
 use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
@@ -2935,7 +2935,7 @@ fn file_block_details_preserve_unknown_worker_locations() -> CommonResult<()> {
         .expect("unknown worker location should be retained");
     assert_eq!(unknown.storage_type, StorageType::Ssd);
     assert!(unknown.address.is_none());
-    assert_eq!(unknown.state, BlockReplicaState::Unknown);
+    assert_eq!(unknown.state, WorkerStatus::Unknown);
     Ok(())
 }
 
@@ -2962,7 +2962,7 @@ fn file_block_details_resolves_lost_worker_addresses() -> CommonResult<()> {
         .find(|replica| replica.worker_id == worker_id)
         .expect("live worker location should be retained");
     assert!(live_replica.address.is_some());
-    assert_eq!(live_replica.state, BlockReplicaState::Live);
+    assert_eq!(live_replica.state, WorkerStatus::Live);
 
     fs.worker_manager
         .write()
@@ -2985,7 +2985,7 @@ fn file_block_details_resolves_lost_worker_addresses() -> CommonResult<()> {
     assert_eq!(lost_address.ip_addr, expected_address.ip_addr);
     assert_eq!(lost_address.rpc_port, expected_address.rpc_port);
     assert_eq!(lost_address.web_port, expected_address.web_port);
-    assert_eq!(lost.state, BlockReplicaState::Lost);
+    assert_eq!(lost.state, WorkerStatus::Lost);
 
     // Contrast: create_locate_block must use live-only get_worker; lost replicas must not be returned to readers.
     assert!(
@@ -2993,6 +2993,52 @@ fn file_block_details_resolves_lost_worker_addresses() -> CommonResult<()> {
             .is_err(),
         "read path must refuse a block whose only replica is on a lost worker"
     );
+    Ok(())
+}
+
+#[test]
+fn file_block_details_preserve_registered_non_live_worker_status() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "file-block-details-non-live-worker");
+    let path = "/registered-non-live-worker.log";
+    let client = ClientAddress::default();
+    fs.create(path, false)?;
+    let block = fs.add_block(path, None, client, vec![], vec![], 0, None)?;
+    let worker_id = block.locs[0].worker_id;
+    let hostname = block.locs[0].hostname.clone();
+    let location = BlockLocation::new(worker_id, StorageType::Disk);
+    fs.fs_dir
+        .read()
+        .add_block_location(block.block.id, location.clone())?;
+
+    fs.worker_manager
+        .write()
+        .add_blacklist_worker(worker_id)
+        .expect("worker should be blacklisted");
+    let blacklist_details = fs.get_file_block_details(path)?;
+    let blacklist = blacklist_details.blocks[0]
+        .replicas
+        .iter()
+        .find(|replica| replica.worker_id == worker_id)
+        .expect("blacklisted worker location should be retained");
+    assert_eq!(blacklist.state, WorkerStatus::Blacklist);
+    assert!(blacklist.address.is_some());
+    assert!(fs
+        .create_locate_block(path, block.block.clone(), &[location.clone()])
+        .is_ok());
+
+    fs.worker_manager.write().add_dcm(vec![hostname]);
+    let dcm_details = fs.get_file_block_details(path)?;
+    let decommission = dcm_details.blocks[0]
+        .replicas
+        .iter()
+        .find(|replica| replica.worker_id == worker_id)
+        .expect("decommissioned worker location should be retained");
+    assert_eq!(decommission.state, WorkerStatus::Decommission);
+    assert!(decommission.address.is_some());
+    assert!(fs
+        .create_locate_block(path, block.block.clone(), &[location])
+        .is_ok());
     Ok(())
 }
 

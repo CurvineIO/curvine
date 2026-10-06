@@ -211,17 +211,19 @@ message GetBlockLocationsResponse {
 }
 
 // Diagnostic block placements retain actual storage types and unavailable replicas.
-enum BlockReplicaStateProto {
-    BLOCK_REPLICA_UNKNOWN = 0;
-    BLOCK_REPLICA_LIVE = 1;
-    BLOCK_REPLICA_LOST = 2;
+enum WorkerStatusProto {
+    WORKER_STATUS_UNKNOWN = 0;
+    WORKER_STATUS_LIVE = 1;
+    WORKER_STATUS_BLACKLIST = 2;
+    WORKER_STATUS_DECOMMISSION = 3;
+    WORKER_STATUS_LOST = 4;
 }
 
 message BlockReplicaDetailProto {
     required uint32 worker_id = 1;
     required StorageTypeProto storage_type = 2;
     optional WorkerAddressProto address = 3;
-    optional BlockReplicaStateProto state = 4 [default = BLOCK_REPLICA_UNKNOWN];
+    optional WorkerStatusProto state = 4 [default = WORKER_STATUS_UNKNOWN];
 }
 
 message FileBlockDetailProto {

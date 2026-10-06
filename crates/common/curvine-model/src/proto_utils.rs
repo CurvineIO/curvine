@@ -319,7 +319,7 @@ impl ProtoUtils {
                         worker_id: replica.worker_id,
                         storage_type: replica.storage_type.into(),
                         address: replica.address.as_ref().map(Self::worker_address_to_pb),
-                        state: Some(Self::block_replica_state_to_pb(replica.state) as i32),
+                        state: Some(Self::worker_status_to_pb(replica.state) as i32),
                     })
                     .collect(),
             })
@@ -346,7 +346,7 @@ impl ProtoUtils {
                         worker_id: replica.worker_id,
                         storage_type: StorageType::from(replica.storage_type),
                         address: replica.address.as_ref().map(Self::worker_address_from_pb),
-                        state: Self::block_replica_state_from_pb(replica.state),
+                        state: Self::worker_status_from_pb(replica.state),
                     })
                     .collect(),
             })
@@ -358,23 +358,27 @@ impl ProtoUtils {
         }
     }
 
-    fn block_replica_state_to_pb(src: BlockReplicaState) -> BlockReplicaStateProto {
+    fn worker_status_to_pb(src: WorkerStatus) -> WorkerStatusProto {
         match src {
-            BlockReplicaState::Unknown => BlockReplicaStateProto::BlockReplicaUnknown,
-            BlockReplicaState::Live => BlockReplicaStateProto::BlockReplicaLive,
-            BlockReplicaState::Lost => BlockReplicaStateProto::BlockReplicaLost,
+            WorkerStatus::Unknown => WorkerStatusProto::WorkerStatusUnknown,
+            WorkerStatus::Live => WorkerStatusProto::WorkerStatusLive,
+            WorkerStatus::Blacklist => WorkerStatusProto::WorkerStatusBlacklist,
+            WorkerStatus::Decommission => WorkerStatusProto::WorkerStatusDecommission,
+            WorkerStatus::Lost => WorkerStatusProto::WorkerStatusLost,
         }
     }
 
-    fn block_replica_state_from_pb(src: Option<i32>) -> BlockReplicaState {
-        match src.unwrap_or(BlockReplicaStateProto::BlockReplicaUnknown as i32) {
-            value if value == BlockReplicaStateProto::BlockReplicaLive as i32 => {
-                BlockReplicaState::Live
+    fn worker_status_from_pb(src: Option<i32>) -> WorkerStatus {
+        match src.unwrap_or(WorkerStatusProto::WorkerStatusUnknown as i32) {
+            value if value == WorkerStatusProto::WorkerStatusLive as i32 => WorkerStatus::Live,
+            value if value == WorkerStatusProto::WorkerStatusBlacklist as i32 => {
+                WorkerStatus::Blacklist
             }
-            value if value == BlockReplicaStateProto::BlockReplicaLost as i32 => {
-                BlockReplicaState::Lost
+            value if value == WorkerStatusProto::WorkerStatusDecommission as i32 => {
+                WorkerStatus::Decommission
             }
-            _ => BlockReplicaState::Unknown,
+            value if value == WorkerStatusProto::WorkerStatusLost as i32 => WorkerStatus::Lost,
+            _ => WorkerStatus::Unknown,
         }
     }
 

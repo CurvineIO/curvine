@@ -2,7 +2,7 @@ use clap::Parser;
 use curvine_client_core::file::FsClient;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_fs_api::Path;
-use curvine_model::{BlockReplicaState, FileBlockDetails, FileStatus, FileType};
+use curvine_model::{FileBlockDetails, FileStatus, FileType, WorkerStatus};
 use curvine_runtime::common::ByteUnit;
 use std::fmt::Write;
 use std::sync::Arc;
@@ -67,7 +67,7 @@ fn summarize_file(details: &mut FileBlockDetails) -> ReplicaSummary {
         let available = block
             .replicas
             .iter()
-            .filter(|replica| replica.state.is_available())
+            .filter(|replica| replica_is_available(replica.state))
             .count();
 
         summary.block_count += 1;
@@ -114,9 +114,11 @@ fn render_file(mut details: FileBlockDetails, include_status: bool) -> String {
                 .map(|address| format!("{}:{}", address.hostname, address.rpc_port))
                 .unwrap_or_else(|| format!("worker-{}", replica.worker_id));
             let availability = match replica.state {
-                BlockReplicaState::Live => "live",
-                BlockReplicaState::Lost => "lost",
-                BlockReplicaState::Unknown => "unknown",
+                WorkerStatus::Live => "live",
+                WorkerStatus::Blacklist => "blacklist",
+                WorkerStatus::Decommission => "decommission",
+                WorkerStatus::Lost => "lost",
+                WorkerStatus::Unknown => "unknown",
             };
             writeln!(output, "  {:<28} {}", worker, availability).unwrap();
         }
@@ -137,6 +139,10 @@ fn render_file(mut details: FileBlockDetails, include_status: bool) -> String {
     output
 }
 
+fn replica_is_available(status: WorkerStatus) -> bool {
+    !matches!(status, WorkerStatus::Lost | WorkerStatus::Unknown)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,7 +161,7 @@ mod tests {
 
     fn details(
         replicas: i32,
-        replicas_info: Vec<(Option<WorkerAddress>, BlockReplicaState)>,
+        replicas_info: Vec<(Option<WorkerAddress>, WorkerStatus)>,
     ) -> FileBlockDetails {
         FileBlockDetails {
             status: FileStatus {
@@ -187,8 +193,8 @@ mod tests {
         let mut healthy = details(
             2,
             vec![
-                (Some(address(1)), BlockReplicaState::Live),
-                (Some(address(2)), BlockReplicaState::Live),
+                (Some(address(1)), WorkerStatus::Live),
+                (Some(address(2)), WorkerStatus::Live),
             ],
         );
         let summary = summarize_file(&mut healthy);
@@ -210,8 +216,8 @@ mod tests {
         let mut details = details(
             3,
             vec![
-                (Some(address(1)), BlockReplicaState::Live),
-                (None, BlockReplicaState::Unknown),
+                (Some(address(1)), WorkerStatus::Live),
+                (None, WorkerStatus::Unknown),
             ],
         );
         let summary = summarize_file(&mut details);
@@ -234,7 +240,7 @@ mod tests {
 
     #[test]
     fn summarize_file_sorts_blocks_and_replicas() {
-        let mut unordered = details(2, vec![(Some(address(1)), BlockReplicaState::Live)]);
+        let mut unordered = details(2, vec![(Some(address(1)), WorkerStatus::Live)]);
         unordered.blocks = vec![
             FileBlockDetail {
                 block_id: 8,
@@ -251,13 +257,13 @@ mod tests {
                         worker_id: 3,
                         storage_type: Default::default(),
                         address: None,
-                        state: BlockReplicaState::Unknown,
+                        state: WorkerStatus::Unknown,
                     },
                     BlockReplicaDetail {
                         worker_id: 1,
                         storage_type: Default::default(),
                         address: None,
-                        state: BlockReplicaState::Unknown,
+                        state: WorkerStatus::Unknown,
                     },
                 ],
             },
@@ -277,8 +283,8 @@ mod tests {
             details(
                 2,
                 vec![
-                    (Some(address(1)), BlockReplicaState::Live),
-                    (Some(address(2)), BlockReplicaState::Lost),
+                    (Some(address(1)), WorkerStatus::Live),
+                    (Some(address(2)), WorkerStatus::Lost),
                 ],
             ),
             true,
@@ -294,7 +300,7 @@ mod tests {
 
     #[test]
     fn addressed_but_unavailable_replica_is_not_counted_available() {
-        let mut details = details(1, vec![(Some(address(1)), BlockReplicaState::Lost)]);
+        let mut details = details(1, vec![(Some(address(1)), WorkerStatus::Lost)]);
         let summary = summarize_file(&mut details);
 
         assert_eq!(summary.recorded_replicas, 1);
@@ -307,6 +313,29 @@ mod tests {
         assert!(output.contains("worker-1:50010"));
         assert!(output.contains("lost"));
         assert!(output.contains("Status: WARNING"));
+    }
+
+    #[test]
+    fn registered_non_live_worker_statuses_are_counted_available() {
+        let mut details = details(
+            2,
+            vec![
+                (Some(address(1)), WorkerStatus::Blacklist),
+                (Some(address(2)), WorkerStatus::Decommission),
+            ],
+        );
+        let summary = summarize_file(&mut details);
+
+        assert_eq!(summary.recorded_replicas, 2);
+        assert_eq!(summary.available_replicas, 2);
+        assert_eq!(summary.unavailable_replicas, 0);
+        assert_eq!(summary.under_replicated_blocks, 0);
+        assert!(!summary.has_warnings());
+
+        let output = render_file(details, true);
+        assert!(output.contains("blacklist"));
+        assert!(output.contains("decommission"));
+        assert!(output.contains("Status: OK"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use curvine_model::{
-    BlockReplicaDetail, BlockReplicaState, FileBlockDetail, FileBlockDetails, FileStatus,
-    ProtoUtils, StorageType, WorkerAddress,
+    BlockReplicaDetail, FileBlockDetail, FileBlockDetails, FileStatus, ProtoUtils, StorageType,
+    WorkerAddress, WorkerStatus,
 };
 
 #[test]
@@ -26,13 +26,13 @@ fn file_block_details_proto_preserves_actual_replica_storage() {
                         rpc_port: 50010,
                         web_port: 50011,
                     }),
-                    state: BlockReplicaState::Live,
+                    state: WorkerStatus::Live,
                 },
                 BlockReplicaDetail {
                     worker_id: 2,
                     storage_type: StorageType::Disk,
                     address: None,
-                    state: BlockReplicaState::Unknown,
+                    state: WorkerStatus::Unknown,
                 },
             ],
         }],
@@ -61,14 +61,8 @@ fn file_block_details_proto_preserves_actual_replica_storage() {
         StorageType::Disk
     );
     assert!(restored.blocks[0].replicas[1].address.is_none());
-    assert_eq!(
-        restored.blocks[0].replicas[0].state,
-        BlockReplicaState::Live
-    );
-    assert_eq!(
-        restored.blocks[0].replicas[1].state,
-        BlockReplicaState::Unknown
-    );
+    assert_eq!(restored.blocks[0].replicas[0].state, WorkerStatus::Live);
+    assert_eq!(restored.blocks[0].replicas[1].state, WorkerStatus::Unknown);
 }
 
 #[test]
@@ -86,5 +80,5 @@ fn block_replica_detail_deserializes_missing_state_as_unknown() {
     assert_eq!(replica.worker_id, 2);
     assert_eq!(replica.storage_type, StorageType::Disk);
     assert!(replica.address.is_none());
-    assert_eq!(replica.state, BlockReplicaState::Unknown);
+    assert_eq!(replica.state, WorkerStatus::Unknown);
 }

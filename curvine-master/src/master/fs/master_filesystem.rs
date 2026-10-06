@@ -886,16 +886,11 @@ impl MasterFilesystem {
                         let (address, state) = if let Some(worker) =
                             worker_manager.get_worker(worker_id)
                         {
-                            let state = if worker.is_live() {
-                                BlockReplicaState::Live
-                            } else {
-                                BlockReplicaState::Lost
-                            };
-                            (Some(worker.address.clone()), state)
+                            (Some(worker.address.clone()), worker.status)
                         } else if let Some(worker) = worker_manager.get_known_worker(worker_id) {
-                            (Some(worker.address.clone()), BlockReplicaState::Lost)
+                            (Some(worker.address.clone()), WorkerStatus::Lost)
                         } else {
-                            (None, BlockReplicaState::Unknown)
+                            (None, WorkerStatus::Unknown)
                         };
                         (worker_id, (address, state))
                     })
@@ -919,7 +914,7 @@ impl MasterFilesystem {
                         state: worker_snapshots
                             .get(&location.worker_id)
                             .map(|(_, state)| *state)
-                            .unwrap_or(BlockReplicaState::Unknown),
+                            .unwrap_or(WorkerStatus::Unknown),
                     })
                     .collect::<Vec<_>>();
                 replicas.sort_by_key(|replica| replica.worker_id);
