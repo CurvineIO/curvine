@@ -100,74 +100,103 @@ fn test_block_replication_e2e() -> CommonResult<()> {
         info!("Block {} has {} replicas", block_id, locations.len());
     }
 
-    // Step 3: Simulate under-replication by reporting blocks as missing
-    // In a real scenario, this would happen when a worker fails
+    // Step 3: Remove one real metadata location so the block is genuinely
+    // under-replicated. Merely submitting an already healthy block would ask the
+    // scheduler to exceed the file's configured replica count.
     let master_replication_manager = cluster.get_active_master_replication_manager();
     let master_filesystem = cluster.get_active_master_fs();
-
-    // Pick the first block and simulate it becoming under-replicated
     let first_block = file_blocks.block_locs.first().unwrap();
     let block_id = first_block.block.id;
-    let locations = &first_block.locs;
+    let target_replica_count = file_blocks.status.replicas as usize;
+    let removed_location = first_block
+        .locs
+        .last()
+        .expect("replication test file must have at least one location")
+        .clone();
 
     info!("Simulating under-replication for block {}", block_id);
+    let fs_dir = master_filesystem.fs_dir();
+    fs_dir.write().block_report(vec![(
+        false,
+        block_id,
+        BlockLocation {
+            worker_id: removed_location.worker_id,
+            storage_type: Default::default(),
+        },
+    )])?;
+    let under_replicated_locations =
+        rt.block_on(async { get_block_locations(&fs, &path).await })?;
+    assert_eq!(
+        target_replica_count - 1,
+        replica_count(&under_replicated_locations, block_id)
+    );
 
-    // Report that this block is under-replicated
-    // We'll use worker_id 1 (assuming it exists)
-    master_replication_manager.report_under_replicated_blocks(1, vec![block_id])?;
+    master_replication_manager
+        .report_under_replicated_blocks(removed_location.worker_id, vec![block_id])?;
 
-    // Step 4: Wait for replication to complete
+    // Step 4: Wait until replication restores the configured replica count.
     info!("Waiting for replication to complete...");
-    Utils::sleep(5000); // Give time for replication process
-
-    // Step 5: Verify that the block has been replicated
-    let final_locations = rt.block_on(async { get_block_locations(&fs, &path).await })?;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let final_locations = loop {
+        let current_locations = rt.block_on(async { get_block_locations(&fs, &path).await })?;
+        let current_replica_count = replica_count(&current_locations, block_id);
+        if current_replica_count == target_replica_count {
+            break current_locations;
+        }
+        if Instant::now() >= deadline {
+            return Err(CommonError::from(format!(
+                "block {} did not recover its configured replica count before timeout (expected={}, actual={})",
+                block_id, target_replica_count, current_replica_count
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
 
     info!("Final block locations after replication:");
     for (block_id, locations) in &final_locations {
         info!("Block {} has {} replicas", block_id, locations.len());
     }
 
-    let target_block_locations = final_locations.get(&block_id);
-    if let Some(locations) = target_block_locations {
-        info!("Target block locations: {}", locations.len());
-        if locations.len() > replica_count(&initial_locations, block_id) {
-            info!(
-                "✓ Block replication succeeded - block {} now has {} replicas",
-                block_id,
-                locations.len()
-            );
-        } else {
-            return Err(CommonError::from(
-                "Block replication did not increase replica count",
-            ));
-        }
-    } else {
-        return Err(CommonError::from(
-            "Target block not found in final locations",
-        ));
-    }
+    let target_block_locations = final_locations
+        .get(&block_id)
+        .ok_or_else(|| CommonError::from("Target block not found in final locations"))?;
+    let replicated_location = target_block_locations
+        .iter()
+        .find(|candidate| {
+            !under_replicated_locations
+                .get(&block_id)
+                .is_some_and(|locations| {
+                    locations
+                        .iter()
+                        .any(|location| location.worker_id == candidate.worker_id)
+                })
+        })
+        .ok_or_else(|| CommonError::from("No new replication target was recorded"))?;
 
-    // step 6: to remove other block locations to check the replicated block effectiveness
-    let fs_dir = master_filesystem.fs_dir();
-    {
-        let mut fs_dir = fs_dir.write();
-        let mut reports = vec![];
-        for addr in locations {
-            reports.push((
+    // Step 5: Keep only the location produced by replication and verify it can
+    // serve the complete file.
+    let reports = target_block_locations
+        .iter()
+        .filter(|location| location.worker_id != replicated_location.worker_id)
+        .map(|location| {
+            (
                 false,
                 block_id,
                 BlockLocation {
-                    worker_id: addr.worker_id,
+                    worker_id: location.worker_id,
                     storage_type: Default::default(),
                 },
-            ));
-        }
-        fs_dir.block_report(reports)?;
-    }
+            )
+        })
+        .collect();
+    fs_dir.write().block_report(reports)?;
     let latest_locations = rt.block_on(async { get_block_locations(&fs, &path).await })?;
     let first_block_locations = latest_locations.get(&block_id).unwrap();
     assert_eq!(1, first_block_locations.len());
+    assert_eq!(
+        replicated_location.worker_id,
+        first_block_locations[0].worker_id
+    );
 
     // Step 7: Verify data integrity
     info!("Verifying data integrity after replication");
@@ -306,49 +335,79 @@ fn test_replication_honors_source_block_capacity() -> CommonResult<()> {
         .find(|block| block.block.len > CLIENT_DEFAULT_BLOCK_SIZE)
         .expect("missing block larger than the worker client default");
     let block_id = oversized_block.block.id;
-    let original_locations = oversized_block.locs.clone();
+    let target_replica_count = file_blocks.status.replicas as usize;
+    let removed_location = oversized_block
+        .locs
+        .last()
+        .expect("replication test file must have at least one location")
+        .clone();
 
-    let initial_locations = rt.block_on(async { get_block_locations(&fs, &path).await })?;
-    let initial_replica_count = replica_count(&initial_locations, block_id);
+    let fs_dir = cluster.get_active_master_fs().fs_dir();
+    fs_dir.write().block_report(vec![(
+        false,
+        block_id,
+        BlockLocation {
+            worker_id: removed_location.worker_id,
+            storage_type: Default::default(),
+        },
+    )])?;
+    let under_replicated_locations =
+        rt.block_on(async { get_block_locations(&fs, &path).await })?;
+    assert_eq!(
+        target_replica_count - 1,
+        replica_count(&under_replicated_locations, block_id)
+    );
 
     cluster
         .get_active_master_replication_manager()
-        .report_under_replicated_blocks(1, vec![block_id])?;
+        .report_under_replicated_blocks(removed_location.worker_id, vec![block_id])?;
 
     let deadline = Instant::now() + REPLICATION_TIMEOUT;
-    loop {
+    let final_locations = loop {
         let current_locations = rt.block_on(async { get_block_locations(&fs, &path).await })?;
         let current_replica_count = replica_count(&current_locations, block_id);
-        if current_replica_count > initial_replica_count {
-            break;
+        if current_replica_count == target_replica_count {
+            break current_locations;
         }
         if Instant::now() >= deadline {
             return Err(CommonError::from(format!(
-                "oversized block {} did not gain a replica before timeout (before={}, after={})",
-                block_id, initial_replica_count, current_replica_count
+                "oversized block {} did not recover its configured replica count before timeout (expected={}, actual={})",
+                block_id, target_replica_count, current_replica_count
             )));
         }
         std::thread::sleep(REPLICATION_POLL_INTERVAL);
-    }
+    };
 
-    let fs_dir = cluster.get_active_master_fs().fs_dir();
-    {
-        let mut fs_dir = fs_dir.write();
-        let reports = original_locations
-            .iter()
-            .map(|location| {
-                (
-                    false,
-                    block_id,
-                    BlockLocation {
-                        worker_id: location.worker_id,
-                        storage_type: Default::default(),
-                    },
-                )
-            })
-            .collect();
-        fs_dir.block_report(reports)?;
-    }
+    let final_block_locations = final_locations
+        .get(&block_id)
+        .ok_or_else(|| CommonError::from("oversized block missing after replication"))?;
+    let replicated_location = final_block_locations
+        .iter()
+        .find(|candidate| {
+            !under_replicated_locations
+                .get(&block_id)
+                .is_some_and(|locations| {
+                    locations
+                        .iter()
+                        .any(|location| location.worker_id == candidate.worker_id)
+                })
+        })
+        .ok_or_else(|| CommonError::from("No new oversized-block replication target found"))?;
+    let reports = final_block_locations
+        .iter()
+        .filter(|location| location.worker_id != replicated_location.worker_id)
+        .map(|location| {
+            (
+                false,
+                block_id,
+                BlockLocation {
+                    worker_id: location.worker_id,
+                    storage_type: Default::default(),
+                },
+            )
+        })
+        .collect();
+    fs_dir.write().block_report(reports)?;
     let latest_locations = rt.block_on(async { get_block_locations(&fs, &path).await })?;
     assert_eq!(1, replica_count(&latest_locations, block_id));
 

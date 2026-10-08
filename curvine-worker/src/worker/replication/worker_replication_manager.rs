@@ -54,6 +54,31 @@ where
     }
 }
 
+fn build_report_request(
+    job: &ReplicationJob,
+    err_msg: Option<String>,
+) -> CommonResult<ReportBlockReplicationRequest> {
+    let success = err_msg.is_none();
+    let storage_type = match job.storage_type {
+        Some(storage_type) => storage_type,
+        None if !success => Default::default(),
+        None => {
+            return err_box!(
+                "missing storage type when reporting successful replication for block {}",
+                job.block_id
+            );
+        }
+    };
+
+    Ok(ReportBlockReplicationRequest {
+        block_id: job.block_id,
+        storage_type: storage_type.into(),
+        success,
+        message: err_msg,
+        attempt_id: job.attempt_id.clone(),
+    })
+}
+
 #[derive(Clone)]
 pub struct WorkerReplicationManager {
     block_store: BlockStore,
@@ -117,18 +142,7 @@ impl WorkerReplicationManager {
         job: &ReplicationJob,
         err_msg: Option<String>,
     ) -> CommonResult<ReportBlockReplicationResponse> {
-        let Some(storage_type) = job.storage_type else {
-            return err_box!(
-                "missing storage type when reporting replication result for block {}",
-                job.block_id
-            );
-        };
-        let request = ReportBlockReplicationRequest {
-            block_id: job.block_id,
-            storage_type: storage_type.into(),
-            success: err_msg.is_none(),
-            message: err_msg,
-        };
+        let request = build_report_request(job, err_msg)?;
 
         let Some(master_client) = self.master_client.get() else {
             return err_box!("master client is not initialized for worker replication reporting");
@@ -211,11 +225,53 @@ impl WorkerReplicationManager {
 
 #[cfg(test)]
 mod tests {
-    use super::finish_replication_with_cleanup;
+    use super::{build_report_request, finish_replication_with_cleanup};
+    use crate::worker::replication::replication_job::ReplicationJob;
     use curvine_core_error::{err_box, CommonResult};
     use curvine_error::FsError;
+    use curvine_model::{StorageType, WorkerAddress};
+    use curvine_proto::StorageTypeProto;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    fn job(storage_type: Option<StorageType>) -> ReplicationJob {
+        ReplicationJob {
+            block_id: 7,
+            target_worker_addr: WorkerAddress::default(),
+            storage_type,
+            attempt_id: Some("attempt-7".to_string()),
+        }
+    }
+
+    #[test]
+    fn failure_report_does_not_require_storage_type() -> CommonResult<()> {
+        let request = build_report_request(&job(None), Some("source block missing".to_string()))?;
+
+        assert!(!request.success);
+        assert_eq!(request.storage_type, StorageTypeProto::Disk as i32);
+        assert_eq!(request.message.as_deref(), Some("source block missing"));
+        assert_eq!(request.attempt_id.as_deref(), Some("attempt-7"));
+        Ok(())
+    }
+
+    #[test]
+    fn successful_report_requires_storage_type() {
+        let error = build_report_request(&job(None), None)
+            .expect_err("successful reports must contain the actual storage type");
+        assert!(error
+            .to_string()
+            .contains("missing storage type when reporting successful replication"));
+    }
+
+    #[test]
+    fn successful_report_preserves_storage_type_and_attempt() -> CommonResult<()> {
+        let request = build_report_request(&job(Some(StorageType::Ssd)), None)?;
+
+        assert!(request.success);
+        assert_eq!(request.storage_type, StorageTypeProto::Ssd as i32);
+        assert_eq!(request.attempt_id.as_deref(), Some("attempt-7"));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn successful_replication_skips_cancel() -> CommonResult<()> {

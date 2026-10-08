@@ -37,14 +37,17 @@ impl WorkerReplicationHandler {
 
     pub fn accept_job(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: SubmitBlockReplicationRequest = ctx.parse_header()?;
+        let attempt_id = req.attempt_id.clone();
         let response = match self.manager.accept_job(req.into()) {
             Ok(_) => SubmitBlockReplicationResponse {
                 success: true,
                 message: None,
+                attempt_id,
             },
             Err(e) => SubmitBlockReplicationResponse {
                 success: false,
                 message: e.to_string().into(),
+                attempt_id,
             },
         };
         ctx.response(response)

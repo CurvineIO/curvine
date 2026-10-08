@@ -6,11 +6,15 @@ import "common.proto";
 message SubmitBlockReplicationRequest {
     required int64 block_id = 1;
     required WorkerAddressProto target_worker_info = 2;
+    // Unique execution attempt. Optional for rolling compatibility.
+    optional string attempt_id = 3;
 }
 
 message SubmitBlockReplicationResponse {
     required bool success = 1;
     optional string message = 2;
+    // Echoed when the worker supports attempt-aware replication.
+    optional string attempt_id = 3;
 }
 
 message ReportBlockReplicationRequest {
@@ -18,6 +22,8 @@ message ReportBlockReplicationRequest {
     required StorageTypeProto storage_type = 2;
     required bool success =  3;
     optional string message = 4;
+    // Echoed from SubmitBlockReplicationRequest.
+    optional string attempt_id = 5;
 }
 
 message ReportBlockReplicationResponse {
