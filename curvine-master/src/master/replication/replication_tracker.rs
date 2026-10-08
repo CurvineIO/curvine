@@ -15,8 +15,11 @@
 use super::master_replication_manager::BlockId;
 use curvine_model::WorkerAddress;
 use curvine_proto::ReportBlockReplicationRequest;
-use curvine_runtime::sync::FastDashMap;
+use curvine_runtime::sync::{FastDashMap, FastMutex};
 use dashmap::mapref::entry::Entry;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::OwnedSemaphorePermit;
 
 pub(super) type WorkerId = u32;
@@ -68,7 +71,7 @@ pub(super) struct InflightReplicationJob {
 #[derive(Clone, Debug)]
 pub(super) struct UncertainReplicationJob {
     pub(super) attempt: ReplicationAttempt,
-    pub(super) since_ms: u64,
+    reconciliation_id: u64,
 }
 
 pub(super) struct CompletingReplicationJob {
@@ -93,6 +96,16 @@ pub(super) enum TrackedStateKind {
 pub(super) struct AttemptSnapshot {
     pub(super) attempt: ReplicationAttempt,
     pub(super) kind: TrackedStateKind,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) struct UncertainReconciliation {
+    pub(super) next_check_ms: u64,
+    pub(super) block_id: BlockId,
+    pub(super) attempt_id: String,
+    pub(super) since_ms: u64,
+    pub(super) retry_count: u32,
+    reconciliation_id: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -126,6 +139,8 @@ pub(super) enum AckDisposition {
 
 pub(super) struct ReplicationTracker {
     active: FastDashMap<BlockId, ReplicationState>,
+    uncertain_reconciliation: FastMutex<BinaryHeap<Reverse<UncertainReconciliation>>>,
+    next_reconciliation_id: AtomicU64,
     // Legacy reports have no attempt ID, so a delayed duplicate cannot be distinguished from a
     // later attempt for the same block. Keep the quarantine in the same map as active attempts so
     // completion and quarantine publication are one atomic state transition.
@@ -136,6 +151,8 @@ impl ReplicationTracker {
     pub(super) fn new(legacy_quarantine_ms: u64) -> Self {
         Self {
             active: Default::default(),
+            uncertain_reconciliation: FastMutex::new(BinaryHeap::new()),
+            next_reconciliation_id: AtomicU64::new(1),
             legacy_quarantine_ms,
         }
     }
@@ -306,7 +323,8 @@ impl ReplicationTracker {
         attempt_id: &str,
         now_ms: u64,
     ) -> bool {
-        match self.active.entry(block_id) {
+        let reconciliation_id = self.next_reconciliation_id.fetch_add(1, Ordering::Relaxed);
+        let transitioned = match self.active.entry(block_id) {
             Entry::Occupied(mut entry) => {
                 let attempt = match entry.get() {
                     ReplicationState::Completing(job) if job.attempt.attempt_id == attempt_id => {
@@ -316,12 +334,16 @@ impl ReplicationTracker {
                 };
                 entry.insert(ReplicationState::Uncertain(UncertainReplicationJob {
                     attempt,
-                    since_ms: now_ms,
+                    reconciliation_id,
                 }));
                 true
             }
             Entry::Vacant(_) => false,
+        };
+        if transitioned {
+            self.enqueue_uncertain(block_id, attempt_id, now_ms, reconciliation_id);
         }
+        transitioned
     }
 
     pub(super) fn cancel_known_inactive(
@@ -368,7 +390,8 @@ impl ReplicationTracker {
     }
 
     pub(super) fn mark_uncertain(&self, block_id: BlockId, attempt_id: &str, now_ms: u64) -> bool {
-        match self.active.entry(block_id) {
+        let reconciliation_id = self.next_reconciliation_id.fetch_add(1, Ordering::Relaxed);
+        let transitioned = match self.active.entry(block_id) {
             Entry::Occupied(mut entry) => {
                 let attempt = match entry.get() {
                     ReplicationState::Inflight(job) if job.attempt.attempt_id == attempt_id => {
@@ -378,12 +401,96 @@ impl ReplicationTracker {
                 };
                 entry.insert(ReplicationState::Uncertain(UncertainReplicationJob {
                     attempt,
-                    since_ms: now_ms,
+                    reconciliation_id,
                 }));
                 true
             }
             Entry::Vacant(_) => false,
+        };
+        if transitioned {
+            self.enqueue_uncertain(block_id, attempt_id, now_ms, reconciliation_id);
         }
+        transitioned
+    }
+
+    fn enqueue_uncertain(
+        &self,
+        block_id: BlockId,
+        attempt_id: &str,
+        since_ms: u64,
+        reconciliation_id: u64,
+    ) {
+        self.uncertain_reconciliation
+            .lock()
+            .push(Reverse(UncertainReconciliation {
+                next_check_ms: since_ms,
+                block_id,
+                attempt_id: attempt_id.to_string(),
+                since_ms,
+                retry_count: 0,
+                reconciliation_id,
+            }));
+    }
+
+    pub(super) fn take_due_uncertain(
+        &self,
+        now_ms: u64,
+        limit: usize,
+    ) -> Vec<UncertainReconciliation> {
+        let mut queue = self.uncertain_reconciliation.lock();
+        let mut due = Vec::with_capacity(limit.min(queue.len()));
+        while due.len() < limit {
+            let Some(Reverse(next)) = queue.peek() else {
+                break;
+            };
+            if next.next_check_ms > now_ms {
+                break;
+            }
+            let Reverse(next) = queue.pop().expect("peeked uncertain entry must exist");
+            due.push(next);
+        }
+        due
+    }
+
+    pub(super) fn reschedule_uncertain(
+        &self,
+        mut reconciliation: UncertainReconciliation,
+        next_check_ms: u64,
+    ) -> bool {
+        let is_current = self
+            .active
+            .get(&reconciliation.block_id)
+            .is_some_and(|state| {
+                matches!(
+                    state.value(),
+                    ReplicationState::Uncertain(job)
+                        if job.attempt.attempt_id == reconciliation.attempt_id
+                            && job.reconciliation_id == reconciliation.reconciliation_id
+                )
+            });
+        if !is_current {
+            return false;
+        }
+
+        reconciliation.next_check_ms = next_check_ms;
+        reconciliation.retry_count = reconciliation.retry_count.saturating_add(1);
+        self.uncertain_reconciliation
+            .lock()
+            .push(Reverse(reconciliation));
+        true
+    }
+
+    pub(super) fn is_current_uncertain(&self, reconciliation: &UncertainReconciliation) -> bool {
+        self.active
+            .get(&reconciliation.block_id)
+            .is_some_and(|state| {
+                matches!(
+                    state.value(),
+                    ReplicationState::Uncertain(job)
+                        if job.attempt.attempt_id == reconciliation.attempt_id
+                            && job.reconciliation_id == reconciliation.reconciliation_id
+                )
+            })
     }
 
     pub(super) fn inflight_snapshots(&self) -> Vec<InflightSnapshot> {
@@ -404,16 +511,17 @@ impl ReplicationTracker {
             .collect()
     }
 
-    pub(super) fn uncertain_snapshots(&self) -> Vec<(BlockId, String, u64)> {
+    #[cfg(test)]
+    fn uncertain_count(&self) -> usize {
         self.active
             .iter()
-            .filter_map(|entry| match entry.value() {
-                ReplicationState::Uncertain(job) => {
-                    Some((*entry.key(), job.attempt.attempt_id.clone(), job.since_ms))
-                }
-                _ => None,
-            })
-            .collect()
+            .filter(|entry| matches!(entry.value(), ReplicationState::Uncertain(_)))
+            .count()
+    }
+
+    #[cfg(test)]
+    fn uncertain_queue_len(&self) -> usize {
+        self.uncertain_reconciliation.lock().len()
     }
 
     pub(super) fn prune_expired_quarantine(&self, now_ms: u64) {
@@ -547,10 +655,11 @@ mod tests {
         assert_eq!(semaphore.available_permits(), 1);
 
         assert!(tracker.restore_completing_as_uncertain(1, "attempt-1", 10));
-        assert!(matches!(
-            tracker.uncertain_snapshots().as_slice(),
-            [(1, attempt_id, 10)] if attempt_id == "attempt-1"
-        ));
+        let due = tracker.take_due_uncertain(10, 10);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].block_id, 1);
+        assert_eq!(due[0].attempt_id, "attempt-1");
+        assert_eq!(due[0].since_ms, 10);
         assert!(!tracker.queue(1, 10));
     }
 
@@ -572,7 +681,7 @@ mod tests {
         };
         assert!(!tracker.mark_uncertain(1, "attempt-1", 10));
         assert!(tracker.inflight_snapshots().is_empty());
-        assert!(tracker.uncertain_snapshots().is_empty());
+        assert_eq!(tracker.uncertain_count(), 0);
 
         drop(accepted);
         assert_eq!(semaphore.available_permits(), 1);
@@ -741,6 +850,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uncertain_reconciliation_is_bounded_and_rescheduled_with_backoff() {
+        let tracker = ReplicationTracker::new(100);
+        let semaphore = Arc::new(Semaphore::new(5));
+        for block_id in 1..=5 {
+            let attempt_id = format!("attempt-{block_id}");
+            assert!(tracker.queue(block_id, 0));
+            assert!(tracker.promote(
+                block_id,
+                attempt(&attempt_id),
+                u64::MAX,
+                semaphore.clone().acquire_owned().await.unwrap(),
+            ));
+            assert!(tracker.mark_uncertain(block_id, &attempt_id, 10));
+        }
+
+        let first_batch = tracker.take_due_uncertain(10, 2);
+        assert_eq!(first_batch.len(), 2);
+        assert_eq!(tracker.uncertain_queue_len(), 3);
+        for reconciliation in first_batch {
+            assert!(tracker.reschedule_uncertain(reconciliation, 20));
+        }
+
+        assert_eq!(tracker.take_due_uncertain(10, 10).len(), 3);
+        assert_eq!(tracker.take_due_uncertain(19, 10).len(), 0);
+        let retried = tracker.take_due_uncertain(20, 10);
+        assert_eq!(retried.len(), 2);
+        assert!(retried.iter().all(|entry| entry.retry_count == 1));
+    }
+
+    #[tokio::test]
+    async fn stale_uncertain_queue_entry_does_not_match_reused_attempt_id() {
+        let tracker = ReplicationTracker::new(0);
+        let semaphore = Arc::new(Semaphore::new(2));
+        assert!(tracker.queue(1, 0));
+        assert!(tracker.promote(
+            1,
+            attempt("attempt-reused"),
+            u64::MAX,
+            semaphore.clone().acquire_owned().await.unwrap(),
+        ));
+        assert!(tracker.mark_uncertain(1, "attempt-reused", 10));
+        let stale = tracker.take_due_uncertain(10, 1).pop().unwrap();
+        tracker.remove_matching(1, "attempt-reused", 10).unwrap();
+
+        assert!(tracker.queue(1, 10));
+        assert!(tracker.promote(
+            1,
+            attempt("attempt-reused"),
+            u64::MAX,
+            semaphore.acquire_owned().await.unwrap(),
+        ));
+        assert!(tracker.mark_uncertain(1, "attempt-reused", 20));
+
+        assert!(!tracker.is_current_uncertain(&stale));
+        assert!(!tracker.reschedule_uncertain(stale, 30));
+        assert_eq!(tracker.uncertain_queue_len(), 1);
+    }
+
+    #[tokio::test]
     async fn timed_out_attempts_release_all_scheduler_permits() {
         let tracker = ReplicationTracker::new(100);
         let semaphore = Arc::new(Semaphore::new(3));
@@ -762,7 +930,8 @@ mod tests {
 
         assert_eq!(semaphore.available_permits(), 3);
         assert_eq!(tracker.inflight_snapshots().len(), 0);
-        assert_eq!(tracker.uncertain_snapshots().len(), 3);
+        assert_eq!(tracker.uncertain_count(), 3);
+        assert_eq!(tracker.uncertain_queue_len(), 3);
     }
 
     #[tokio::test]

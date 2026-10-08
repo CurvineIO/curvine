@@ -17,7 +17,7 @@ use curvine_client::file::CurvineFileSystem;
 use curvine_config::ClusterConf;
 use curvine_core_error::{CommonError, CommonResult};
 use curvine_fs_api::{Path, Reader, Writer};
-use curvine_model::{BlockLocation, CreateFileOptsBuilder, FileBlocks, WorkerAddress};
+use curvine_model::{BlockLocation, CreateFileOptsBuilder, FileBlocks, StorageType, WorkerAddress};
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::RpcRuntime;
 use curvine_tests::Testing;
@@ -210,6 +210,104 @@ fn test_block_replication_e2e() -> CommonResult<()> {
     }
 
     info!("✅ End-to-end replication test completed successfully");
+    Ok(())
+}
+
+/// Replication reports the destination writer's actual storage tier after fallback.
+#[test]
+fn test_replication_persists_destination_actual_storage_type() -> CommonResult<()> {
+    const REPLICATION_TIMEOUT: Duration = Duration::from_secs(8);
+    const REPLICATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+    let testing = Testing::builder()
+        .default()
+        .masters(1)
+        .workers(3)
+        .mutate_conf(|conf| {
+            conf.master.worker_policy = "robin".to_string();
+            conf.master.min_replication = 1;
+            conf.master.max_replication = 3;
+            conf.master.block_replication_enabled = true;
+        })
+        .mutate_worker_conf(|index, conf| {
+            let storage_type = if index < 2 { "MEM" } else { "DISK" };
+            conf.worker.data_dir = conf
+                .worker
+                .data_dir
+                .iter()
+                .map(|path| format!("[{storage_type}:512MB]{path}"))
+                .collect();
+        })
+        .build()?;
+    let cluster = testing.start_cluster()?;
+    let mem_worker_ports = [
+        cluster.worker_conf[0].worker.rpc_port as u32,
+        cluster.worker_conf[1].worker.rpc_port as u32,
+    ];
+    let disk_worker_port = cluster.worker_conf[2].worker.rpc_port as u32;
+    let mut conf = testing.get_active_cluster_conf()?;
+    conf.client.replicas = 2;
+    conf.client.short_circuit = false;
+    conf.client.storage_type = StorageType::Mem;
+    conf.client.storage_type_str = "mem".to_string();
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+
+    let path = Path::from_str("/replication_actual_storage_type.data")?;
+    let test_data = generate_test_data(16 * 1024);
+    let file_blocks =
+        rt.block_on(async { write_test_file_with_replicas(&fs, &path, &test_data, 2).await })?;
+    let block = file_blocks
+        .block_locs
+        .first()
+        .ok_or_else(|| CommonError::from("replication fallback test created no blocks"))?;
+    assert_eq!(block.locs.len(), 2);
+    assert!(block
+        .locs
+        .iter()
+        .all(|location| mem_worker_ports.contains(&location.rpc_port)));
+    let block_id = block.block.id;
+    let retained_source = block.locs[0].clone();
+    let removed_source = block.locs[1].clone();
+
+    let master_fs = cluster.get_active_master_fs();
+    master_fs.fs_dir.write().block_report(vec![(
+        false,
+        block_id,
+        BlockLocation::new(removed_source.worker_id, StorageType::Mem),
+    )])?;
+    cluster
+        .get_active_master_replication_manager()
+        .report_under_replicated_blocks(removed_source.worker_id, vec![block_id])?;
+
+    let deadline = Instant::now() + REPLICATION_TIMEOUT;
+    let replicated_location = loop {
+        let blocks = rt.block_on(async { fs.get_block_locations(&path).await })?;
+        let locations = &blocks.block_locs[0].locs;
+        if let Some(location) = locations
+            .iter()
+            .find(|location| location.worker_id != retained_source.worker_id)
+        {
+            break location.clone();
+        }
+        if Instant::now() >= deadline {
+            return Err(CommonError::from(format!(
+                "block {block_id} did not replicate to the Disk-only worker before timeout"
+            )));
+        }
+        std::thread::sleep(REPLICATION_POLL_INTERVAL);
+    };
+
+    assert_eq!(replicated_location.rpc_port, disk_worker_port);
+    let locations = master_fs.fs_dir.read().get_block_locations(block_id)?;
+    let target_location = locations
+        .iter()
+        .find(|location| location.worker_id == replicated_location.worker_id)
+        .ok_or_else(|| CommonError::from("replicated target missing from Master metadata"))?;
+    assert_eq!(target_location.storage_type, StorageType::Disk);
+
+    let read_data = rt.block_on(async { read_test_file(&fs, &path).await })?;
+    assert_eq!(read_data, test_data);
     Ok(())
 }
 
@@ -426,9 +524,18 @@ async fn write_test_file(
     path: &Path,
     data: &[u8],
 ) -> CommonResult<FileBlocks> {
+    write_test_file_with_replicas(fs, path, data, 2).await
+}
+
+async fn write_test_file_with_replicas(
+    fs: &CurvineFileSystem,
+    path: &Path,
+    data: &[u8],
+    replicas: i32,
+) -> CommonResult<FileBlocks> {
     let opts = CreateFileOptsBuilder::with_conf(&fs.fs_context().cluster_conf().client)
         .client_name(fs.fs_context().clone_client_name())
-        .replicas(2)
+        .replicas(replicas)
         .create_parent(true)
         .build();
     let mut writer = fs.create_with_opts(path, opts, true).await?;

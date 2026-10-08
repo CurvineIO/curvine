@@ -391,8 +391,10 @@ mod tests {
 
     #[test]
     fn replication_submit_timeout_must_be_positive() {
-        let mut conf = MasterConf::default();
-        conf.block_replication_submit_timeout = "0ms".to_string();
+        let mut conf = MasterConf {
+            block_replication_submit_timeout: "0ms".to_string(),
+            ..Default::default()
+        };
 
         let error = conf
             .init()
@@ -404,8 +406,10 @@ mod tests {
 
     #[test]
     fn replication_job_timeout_must_be_positive() {
-        let mut conf = MasterConf::default();
-        conf.block_replication_job_timeout = "0ms".to_string();
+        let mut conf = MasterConf {
+            block_replication_job_timeout: "0ms".to_string(),
+            ..Default::default()
+        };
 
         let error = conf.init().expect_err("zero job timeout must be rejected");
         assert!(error

@@ -166,8 +166,6 @@ impl WorkerReplicationManager {
         if block_meta.state != BlockState::Finalized {
             return err_box!("Block: {} is not finalized", job.block_id);
         }
-        // update the storage type for the replication job.
-        job.with_storage_type(block_meta.storage_type());
         let extend_block =
             ExtendedBlock::new(block_meta.id, 0, block_meta.storage_type(), FileType::File);
         let target_capacity = block_meta.replication_capacity();
@@ -187,6 +185,9 @@ impl WorkerReplicationManager {
             target_capacity,
         )
         .await?;
+        // The destination may fall back from the requested source tier. Report the tier that the
+        // remote writer actually opened so Master persists the real target block location.
+        job.with_storage_type(writer.actual_storage_type());
         let replication_result: CommonResult<()> = async {
             let mut remaining = block_meta.len;
             while remaining > 0 {

@@ -39,6 +39,9 @@ use tokio::time::{sleep, timeout, Instant};
 pub type BlockId = i64;
 type WorkerId = u32;
 
+const UNCERTAIN_RECONCILIATION_BATCH_SIZE: usize = 128;
+const UNCERTAIN_RECONCILIATION_MAX_BACKOFF_MULTIPLIER: u32 = 64;
+
 #[derive(Clone)]
 pub struct MasterReplicationManager {
     fs: MasterFilesystem,
@@ -266,25 +269,46 @@ impl MasterReplicationManager {
     }
 
     fn reconcile_uncertain_jobs(&self, now_ms: u64) {
-        for (block_id, attempt_id, since_ms) in self.tracker.uncertain_snapshots() {
-            let resolved = match self.fs.fs_dir.read().replication_block_state(block_id) {
+        for reconciliation in self
+            .tracker
+            .take_due_uncertain(now_ms, UNCERTAIN_RECONCILIATION_BATCH_SIZE)
+        {
+            if !self.tracker.is_current_uncertain(&reconciliation) {
+                continue;
+            }
+
+            let resolved = match self
+                .fs
+                .fs_dir
+                .read()
+                .replication_block_state(reconciliation.block_id)
+            {
                 Ok(None) => true,
                 Ok(Some(state)) => state.locations.len() >= state.replicas as usize,
                 Err(e) => {
                     warn!(
                         "Failed to reconcile uncertain replication for block {}: {}",
-                        block_id, e
+                        reconciliation.block_id, e
                     );
                     false
                 }
             };
-            if resolved && self.remove_attempt(block_id, &attempt_id) {
-                info!(
-                    "Reconciled uncertain replication attempt: block={}, attempt={}, uncertain_age_ms={}",
-                    block_id,
-                    attempt_id,
-                    now_ms.saturating_sub(since_ms)
-                );
+            if resolved {
+                if self.remove_attempt(reconciliation.block_id, &reconciliation.attempt_id) {
+                    info!(
+                        "Reconciled uncertain replication attempt: block={}, attempt={}, uncertain_age_ms={}",
+                        reconciliation.block_id,
+                        reconciliation.attempt_id,
+                        now_ms.saturating_sub(reconciliation.since_ms)
+                    );
+                }
+            } else {
+                let next_check_ms = now_ms.saturating_add(uncertain_reconciliation_backoff_ms(
+                    self.reaper_interval,
+                    reconciliation.retry_count,
+                ));
+                self.tracker
+                    .reschedule_uncertain(reconciliation, next_check_ms);
             }
         }
     }
@@ -590,6 +614,12 @@ impl MasterReplicationManager {
         }
         Ok(metadata_result?)
     }
+}
+
+fn uncertain_reconciliation_backoff_ms(interval: Duration, retry_count: u32) -> u64 {
+    let interval_ms = interval.as_millis().try_into().unwrap_or(u64::MAX);
+    let shift = retry_count.min(UNCERTAIN_RECONCILIATION_MAX_BACKOFF_MULTIPLIER.ilog2());
+    interval_ms.saturating_mul(1_u64 << shift)
 }
 
 fn target_duration(deadline: Instant) -> CommonResult<Duration> {
