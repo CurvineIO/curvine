@@ -14,7 +14,7 @@
 
 use super::replication_tracker::{
     AckDisposition, InflightSnapshot, ReplicationAttempt, ReplicationState, ReplicationTracker,
-    ReportDisposition,
+    ReportDisposition, UncertainReconciliation,
 };
 use crate::master::fs::MasterFilesystem;
 use crate::master::{Master, MasterMetrics, SyncWorkerManager};
@@ -23,13 +23,18 @@ use curvine_core_error::{err_box, CommonResult};
 use curvine_fs_api::RpcCode;
 use curvine_model::{BlockLocation, ProtoUtils, WorkerAddress};
 use curvine_proto::{
-    ReportBlockReplicationRequest, SubmitBlockReplicationRequest, SubmitBlockReplicationResponse,
+    PrepareReplicationRequest, PrepareReplicationResponse, ReconcileReplicationRequest,
+    ReconcileReplicationResponse, ReportBlockReplicationRequest, SubmitBlockReplicationRequest,
+    SubmitBlockReplicationResponse,
 };
 use curvine_rpc::client::ClientFactory;
 use curvine_rpc::message::{Builder, RequestStatus};
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+use curvine_runtime::sync::FastMutex;
 use log::{error, info, warn};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -59,6 +64,38 @@ pub struct MasterReplicationManager {
     clock_start: Instant,
 
     metrics: &'static MasterMetrics,
+    runtime: Arc<AsyncRuntime>,
+    recovery_semaphore: Arc<Semaphore>,
+    repairs: Arc<FastMutex<RepairQueue>>,
+}
+
+/// Repair demand outlives an individual attempt. One due entry per block, independent of
+/// heartbeat events. Both retry queues are bounded per tick and back off independently.
+#[derive(Default)]
+struct RepairQueue {
+    blocks: HashMap<BlockId, u64>,
+    due: BinaryHeap<Reverse<(u64, BlockId, u32)>>,
+}
+
+impl RepairQueue {
+    fn record(&mut self, block_id: BlockId, now_ms: u64) {
+        if let Some(generation) = self.blocks.get_mut(&block_id) {
+            *generation = generation.wrapping_add(1);
+        } else {
+            self.blocks.insert(block_id, 0);
+            self.due.push(Reverse((now_ms, block_id, 0)));
+        }
+    }
+
+    fn retire_if_unchanged(&mut self, block_id: BlockId, generation: Option<u64>, now_ms: u64) {
+        if self.blocks.get(&block_id).copied() == generation {
+            self.blocks.remove(&block_id);
+        } else {
+            // A new loss notification raced the healthy/deleted snapshot.
+            // Preserve that demand rather than losing its only wakeup.
+            self.due.push(Reverse((now_ms, block_id, 0)));
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -97,6 +134,9 @@ impl MasterReplicationManager {
             ),
             clock_start: Instant::now(),
             metrics: Master::get_metrics()?,
+            runtime: rt.clone(),
+            recovery_semaphore: Arc::new(Semaphore::new(8)),
+            repairs: Arc::new(FastMutex::new(RepairQueue::default())),
         };
         let manager = Arc::new(manager);
         Self::handle(async_runtime.clone(), manager.clone(), recv);
@@ -134,6 +174,7 @@ impl MasterReplicationManager {
                 me.tracker.prune_expired_quarantine(now_ms);
                 me.reap_inflight_jobs(now_ms);
                 me.reconcile_uncertain_jobs(now_ms);
+                me.retry_repairs(now_ms);
             }
         });
     }
@@ -268,6 +309,41 @@ impl MasterReplicationManager {
         }
     }
 
+    fn retry_repairs(&self, now_ms: u64) {
+        for _ in 0..UNCERTAIN_RECONCILIATION_BATCH_SIZE {
+            let entry = {
+                let mut repairs = self.repairs.lock();
+                match repairs.due.peek() {
+                    Some(Reverse((due, _, _))) if *due <= now_ms => repairs.due.pop(),
+                    _ => None,
+                }
+            };
+            let Some(Reverse((_, block_id, retry))) = entry else {
+                break;
+            };
+            let generation = self.repairs.lock().blocks.get(&block_id).copied();
+            // Never hold the demand mutex across filesystem reads or tracker operations.
+            let state = self.fs.fs_dir.read().replication_block_state(block_id);
+            if matches!(state, Ok(None))
+                || matches!(&state, Ok(Some(s)) if s.locations.len() >= s.replicas as usize)
+            {
+                self.repairs
+                    .lock()
+                    .retire_if_unchanged(block_id, generation, now_ms);
+                continue;
+            }
+            self.queue_block(block_id);
+            let next = now_ms.saturating_add(uncertain_reconciliation_backoff_ms(
+                self.reaper_interval,
+                retry,
+            ));
+            self.repairs
+                .lock()
+                .due
+                .push(Reverse((next, block_id, retry.saturating_add(1))));
+        }
+    }
+
     fn reconcile_uncertain_jobs(&self, now_ms: u64) {
         for reconciliation in self
             .tracker
@@ -276,41 +352,99 @@ impl MasterReplicationManager {
             if !self.tracker.is_current_uncertain(&reconciliation) {
                 continue;
             }
-
-            let resolved = match self
-                .fs
-                .fs_dir
-                .read()
-                .replication_block_state(reconciliation.block_id)
-            {
-                Ok(None) => true,
-                Ok(Some(state)) => state.locations.len() >= state.replicas as usize,
-                Err(e) => {
+            let Ok(permit) = self.recovery_semaphore.clone().try_acquire_owned() else {
+                self.reschedule_reconciliation(reconciliation);
+                continue;
+            };
+            let me = self.clone();
+            self.runtime.spawn(async move {
+                let _permit = permit;
+                if let Err(e) = me.reconcile_attempt(&reconciliation).await {
                     warn!(
-                        "Failed to reconcile uncertain replication for block {}: {}",
+                        "Replication reconciliation failed for block {}: {}",
                         reconciliation.block_id, e
                     );
-                    false
                 }
-            };
-            if resolved {
-                if self.remove_attempt(reconciliation.block_id, &reconciliation.attempt_id) {
-                    info!(
-                        "Reconciled uncertain replication attempt: block={}, attempt={}, uncertain_age_ms={}",
-                        reconciliation.block_id,
-                        reconciliation.attempt_id,
-                        now_ms.saturating_sub(reconciliation.since_ms)
-                    );
-                }
-            } else {
-                let next_check_ms = now_ms.saturating_add(uncertain_reconciliation_backoff_ms(
-                    self.reaper_interval,
-                    reconciliation.retry_count,
-                ));
-                self.tracker
-                    .reschedule_uncertain(reconciliation, next_check_ms);
-            }
+                me.reschedule_reconciliation(reconciliation);
+            });
         }
+    }
+
+    fn reschedule_reconciliation(&self, reconciliation: UncertainReconciliation) {
+        let next = self
+            .monotonic_millis()
+            .saturating_add(uncertain_reconciliation_backoff_ms(
+                self.reaper_interval,
+                reconciliation.retry_count,
+            ));
+        self.tracker.reschedule_uncertain(reconciliation, next);
+    }
+
+    async fn reconcile_attempt(&self, item: &UncertainReconciliation) -> CommonResult<()> {
+        let Some(attempt) = self
+            .tracker
+            .uncertain_attempt(item.block_id, &item.attempt_id)
+        else {
+            return Ok(());
+        };
+        let state = self
+            .fs
+            .fs_dir
+            .read()
+            .replication_block_state(item.block_id)?;
+        if state.is_none() || state.is_some_and(|s| s.locations.len() >= s.replicas as usize) {
+            if self.remove_attempt(item.block_id, &item.attempt_id) {
+                self.release_target(item.block_id, &attempt);
+            }
+            return Ok(());
+        }
+        // Missing heartbeats do not prove termination. A *different live session* plus
+        // destination-issued tokens does: old tokens cannot survive the target's restart.
+        if self
+            .worker_endpoint(attempt.target_worker.worker_id)
+            .is_some_and(|w| w.session_id != attempt.target_worker_session_id)
+        {
+            self.cancel_known_inactive_attempt(item.block_id, &item.attempt_id);
+            return Ok(());
+        }
+        let req = ReconcileReplicationRequest {
+            block_id: item.block_id,
+            attempt_id: item.attempt_id.clone(),
+            target_session_id: attempt.target_worker_session_id,
+            release: false,
+        };
+        let response: ReconcileReplicationResponse = timeout(self.submit_timeout, async {
+            let client = self
+                .worker_client_factory
+                .create_raw(&attempt.target_worker.inet_addr())
+                .await?;
+            let response = client
+                .rpc(
+                    Builder::new()
+                        .code(RpcCode::ReconcileReplication)
+                        .request(RequestStatus::Rpc)
+                        .proto_header(req)
+                        .build(),
+                )
+                .await?;
+            response.check_error_ext::<curvine_error::FsError>()?;
+            response.parse_header::<ReconcileReplicationResponse>()
+        })
+        .await??;
+        if let Some(storage_type) = response.storage_type {
+            self.finish_replicated_block(ReportBlockReplicationRequest {
+                block_id: item.block_id,
+                attempt_id: Some(item.attempt_id.clone()),
+                storage_type,
+                success: true,
+                message: None,
+            })?;
+        } else {
+            // The target has dropped/closed the old writer under its gate. Only now can
+            // the independently retained repair demand schedule a successor.
+            self.cancel_known_inactive_attempt(item.block_id, &item.attempt_id);
+        }
+        Ok(())
     }
 
     async fn replicate_block(
@@ -386,7 +520,7 @@ impl MasterReplicationManager {
             source.address.worker_id,
             source.session_id,
             target.address.clone(),
-            target.session_id,
+            target.session_id.clone(),
         );
         let deadline_ms = self.monotonic_millis().saturating_add(self.job_timeout_ms);
         if !self.tracker.promote(block_id, attempt, deadline_ms, permit) {
@@ -395,12 +529,57 @@ impl MasterReplicationManager {
         self.metrics.replication_staging_number.dec();
         self.metrics.replication_inflight_number.inc();
 
+        let remaining = match target_duration(submit_deadline) {
+            Ok(remaining) => remaining,
+            Err(e) => {
+                self.cancel_known_inactive_attempt(block_id, &attempt_id);
+                return Err(e);
+            }
+        };
+        let prepared = timeout(remaining, async {
+            let client = self
+                .worker_client_factory
+                .create_raw(&target.address.inet_addr())
+                .await?;
+            let request = PrepareReplicationRequest {
+                block_id,
+                attempt_id: attempt_id.clone(),
+                target_session_id: target.session_id.clone(),
+                lifetime_ms: self
+                    .job_timeout_ms
+                    .saturating_add(self.submit_timeout.as_millis() as u64)
+                    .saturating_mul(2),
+            };
+            let response = client
+                .rpc(
+                    Builder::new()
+                        .code(RpcCode::PrepareReplication)
+                        .request(RequestStatus::Rpc)
+                        .proto_header(request)
+                        .build(),
+                )
+                .await?;
+            response.check_error_ext::<curvine_error::FsError>()?;
+            response.parse_header::<PrepareReplicationResponse>()
+        })
+        .await;
+        let prepared = match prepared {
+            Ok(Ok(response)) => response,
+            other => {
+                // No source has been submitted: even a delayed prepare can only create a fresh
+                // opaque token that nobody possesses. Its bounded target lease will clean up.
+                self.cancel_known_inactive_attempt(block_id, &attempt_id);
+                return err_box!("Cannot prepare fenced replication target: {:?}", other);
+            }
+        };
         let request = SubmitBlockReplicationRequest {
             block_id,
             target_worker_info: ProtoUtils::worker_address_to_pb(&target.address),
             attempt_id: Some(attempt_id.clone()),
+            target_token: Some(prepared.token),
+            job_timeout_ms: Some(self.job_timeout_ms),
         };
-        let msg = Builder::new_rpc(RpcCode::SubmitBlockReplicationJob)
+        let msg = Builder::new_rpc(RpcCode::SubmitFencedReplication)
             .request(RequestStatus::Rpc)
             .proto_header(request)
             .build();
@@ -416,6 +595,14 @@ impl MasterReplicationManager {
         };
         match timeout(remaining, source_worker_client.rpc(msg)).await {
             Ok(Ok(response)) => {
+                if let Err(e) = response.check_error_ext::<curvine_error::FsError>() {
+                    self.transition_to_uncertain(
+                        block_id,
+                        &attempt_id,
+                        "source returned RPC error",
+                    );
+                    return Err(e.into());
+                }
                 let response: SubmitBlockReplicationResponse = match response.parse_header() {
                     Ok(response) => response,
                     Err(e) => {
@@ -443,11 +630,9 @@ impl MasterReplicationManager {
                     );
                 }
                 if !response.success {
-                    // Learn the peer protocol from the ACK before removing the attempt. A modern
-                    // worker's explicit rejection is safe to retry immediately; only legacy or
-                    // protocol-unknown attempts need quarantine against an unidentifiable report.
+                    // Revoke the prepared destination token before scheduling another attempt.
                     self.metrics.replication_failure_count.inc();
-                    self.remove_attempt(block_id, &attempt_id);
+                    self.transition_to_uncertain(block_id, &attempt_id, "source rejected submit");
                     return err_box!(
                         "Errors on submit replication job to {}. err: {:?}",
                         source_worker_addr,
@@ -486,6 +671,13 @@ impl MasterReplicationManager {
             }
         }
 
+        crate::fault_point! {
+            sync,
+            name: "master.replication.submit_acked",
+            description: "After the source acknowledges a replication submission",
+            context: { "block_id" => block_id },
+            return_error: |fault| err_box!("{}", fault.message),
+        }
         Ok(())
     }
 
@@ -499,22 +691,28 @@ impl MasterReplicationManager {
         }
 
         for block_id in block_ids {
-            if !self.tracker.queue(block_id, self.monotonic_millis()) {
-                continue;
-            }
-            info!("Accepting block {} replication job", block_id);
-            self.metrics.replication_staging_number.inc();
-            if let Err(e) = self.staging_queue_sender.try_send(block_id) {
-                if self.tracker.cancel_queued(block_id) {
-                    self.metrics.replication_staging_number.dec();
-                }
-                error!(
-                    "Failed to queue replication job for block {}: {}. Queue may be full. Will retry on next heartbeat check.",
-                    block_id, e
-                );
-            }
+            self.repairs
+                .lock()
+                .record(block_id, self.monotonic_millis());
+            self.queue_block(block_id);
         }
         Ok(())
+    }
+
+    fn queue_block(&self, block_id: BlockId) {
+        if !self.tracker.queue(block_id, self.monotonic_millis()) {
+            return;
+        }
+        self.metrics.replication_staging_number.inc();
+        if let Err(e) = self.staging_queue_sender.try_send(block_id) {
+            if self.tracker.cancel_queued(block_id) {
+                self.metrics.replication_staging_number.dec();
+            }
+            error!(
+                "Failed to queue replication block {} (repair demand retained): {}",
+                block_id, e
+            );
+        }
     }
 
     pub fn finish_replicated_block(&self, req: ReportBlockReplicationRequest) -> CommonResult<()> {
@@ -567,10 +765,7 @@ impl MasterReplicationManager {
                 req.storage_type.into(),
             );
             metadata_result = self
-                .fs
-                .fs_dir
-                .write()
-                .add_replication_location_if_needed(block_id, location)
+                .commit_replication_location(block_id, location)
                 .map(|added| {
                     if added {
                         info!("Successfully replicated {}", block_id);
@@ -590,7 +785,9 @@ impl MasterReplicationManager {
         }
 
         let now_ms = self.monotonic_millis();
-        if metadata_result.is_err() {
+        if metadata_result.is_err() || !success {
+            // Reconciliation rechecks destination evidence before retrying metadata.
+            // Never replay a cached success over a later failure without that check.
             if self.tracker.restore_completing_as_uncertain(
                 block_id,
                 &snapshot.attempt.attempt_id,
@@ -612,7 +809,67 @@ impl MasterReplicationManager {
                 block_id, snapshot.attempt.attempt_id, snapshot.kind
             );
         }
+        if metadata_result.is_ok() && success {
+            self.release_target(block_id, &snapshot.attempt);
+        }
         Ok(metadata_result?)
+    }
+
+    fn commit_replication_location(
+        &self,
+        block_id: BlockId,
+        location: BlockLocation,
+    ) -> curvine_error::FsResult<bool> {
+        crate::fault_point! {
+            sync,
+            name: "master.replication.before_metadata_commit",
+            description: "Before a successful replication result is inserted into metadata",
+            context: { "block_id" => block_id },
+            return_error: |fault| Err(curvine_error::FsError::common(fault.message)),
+        }
+        self.fs
+            .fs_dir
+            .write()
+            .add_replication_location_if_needed(block_id, location)
+    }
+
+    fn release_target(&self, block_id: BlockId, attempt: &ReplicationAttempt) {
+        let Ok(permit) = self.recovery_semaphore.clone().try_acquire_owned() else {
+            return;
+        };
+        let me = self.clone();
+        let attempt = attempt.clone();
+        self.runtime.spawn(async move {
+            let _permit = permit;
+            let result = timeout(me.submit_timeout, async {
+                let client = me
+                    .worker_client_factory
+                    .create_raw(&attempt.target_worker.inet_addr())
+                    .await?;
+                let response = client
+                    .rpc(
+                        Builder::new()
+                            .code(RpcCode::ReconcileReplication)
+                            .request(RequestStatus::Rpc)
+                            .proto_header(ReconcileReplicationRequest {
+                                block_id,
+                                attempt_id: attempt.attempt_id,
+                                target_session_id: attempt.target_worker_session_id,
+                                release: true,
+                            })
+                            .build(),
+                    )
+                    .await?;
+                response.check_error_ext::<curvine_error::FsError>()
+            })
+            .await;
+            if !matches!(result, Ok(Ok(()))) {
+                warn!(
+                    "Replication target cleanup deferred to lease expiry for block {}",
+                    block_id
+                );
+            }
+        });
     }
 }
 
@@ -628,5 +885,40 @@ fn target_duration(deadline: Instant) -> CommonResult<Duration> {
         err_box!("replication submit deadline exceeded")
     } else {
         Ok(deadline.duration_since(now))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_loss_notifications_keep_one_due_entry() {
+        let mut repairs = RepairQueue::default();
+        for now in 0..100 {
+            repairs.record(7, now);
+        }
+        assert_eq!(repairs.blocks.len(), 1);
+        assert_eq!(repairs.due.len(), 1);
+        assert_eq!(repairs.due.pop(), Some(Reverse((0, 7, 0))));
+        assert_eq!(repairs.blocks.get(&7), Some(&99));
+    }
+
+    #[test]
+    fn new_loss_notification_survives_retirement_of_an_old_snapshot() {
+        let mut repairs = RepairQueue::default();
+        repairs.record(7, 0);
+        repairs.due.pop();
+        let generation = repairs.blocks.get(&7).copied();
+        // The filesystem snapshot says healthy, then a new loss is reported.
+        repairs.record(7, 1);
+        repairs.retire_if_unchanged(7, generation, 2);
+        assert!(repairs.blocks.contains_key(&7));
+        assert_eq!(repairs.due.pop(), Some(Reverse((2, 7, 0))));
+        // With no further notification, a fresh healthy snapshot can retire it.
+        let generation = repairs.blocks.get(&7).copied();
+        repairs.retire_if_unchanged(7, generation, 3);
+        assert!(repairs.blocks.is_empty());
+        assert!(repairs.due.is_empty());
     }
 }

@@ -82,6 +82,10 @@ pub enum RpcCode {
     RequestReplacementWorker = 44,
     ReportUnderReplicatedBlocks = 45,
 
+    PrepareReplication = 56,
+    ReconcileReplication = 57,
+    SubmitFencedReplication = 58,
+
     MetricsReport = 60,
 
     // block interface.
@@ -89,6 +93,7 @@ pub enum RpcCode {
     ReadBlock = 81,
     WriteBlocksBatch = 82,
     WriteCommitsBatch = 83,
+    WriteReplicationBlock = 84,
 }
 
 impl fmt::Display for RpcCode {

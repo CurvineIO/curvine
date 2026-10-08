@@ -317,6 +317,21 @@ impl ReplicationTracker {
         true
     }
 
+    pub(super) fn uncertain_attempt(
+        &self,
+        block_id: BlockId,
+        attempt_id: &str,
+    ) -> Option<ReplicationAttempt> {
+        self.active
+            .get(&block_id)
+            .and_then(|state| match state.value() {
+                ReplicationState::Uncertain(job) if job.attempt.attempt_id == attempt_id => {
+                    Some(job.attempt.clone())
+                }
+                _ => None,
+            })
+    }
+
     pub(super) fn restore_completing_as_uncertain(
         &self,
         block_id: BlockId,
@@ -819,6 +834,41 @@ mod tests {
         tracker.remove_matching(1, "attempt-1", 10).unwrap();
         assert!(!tracker.queue(1, 109));
         assert!(tracker.queue(1, 110));
+    }
+
+    #[tokio::test]
+    async fn metadata_failure_does_not_cache_success_over_later_failure() {
+        let tracker = ReplicationTracker::new(100);
+        let semaphore = Arc::new(Semaphore::new(1));
+        assert!(tracker.queue(1, 0));
+        assert!(tracker.promote(
+            1,
+            attempt("attempt-1"),
+            10,
+            semaphore.clone().acquire_owned().await.unwrap(),
+        ));
+        let ReportDisposition::Process(accepted) = tracker.accept_report(report(Some("attempt-1")))
+        else {
+            panic!("success must claim completion");
+        };
+        assert!(accepted.request.success);
+        drop(accepted);
+        assert!(tracker.restore_completing_as_uncertain(1, "attempt-1", 10));
+        let mut failure = report(Some("attempt-1"));
+        failure.success = false;
+        let ReportDisposition::Process(accepted) = tracker.accept_report(failure) else {
+            panic!("late failure must be processed without replaying unverified success");
+        };
+        assert!(!accepted.request.success);
+        assert_eq!(semaphore.available_permits(), 1);
+        drop(accepted);
+        assert!(tracker.restore_completing_as_uncertain(1, "attempt-1", 20));
+        // A fresh destination reconciliation supplies the evidence for a metadata retry.
+        let ReportDisposition::Process(accepted) = tracker.accept_report(report(Some("attempt-1")))
+        else {
+            panic!("reconciled success must be accepted");
+        };
+        assert!(accepted.request.success);
     }
 
     #[tokio::test]

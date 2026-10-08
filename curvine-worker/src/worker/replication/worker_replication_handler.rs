@@ -37,6 +37,15 @@ impl WorkerReplicationHandler {
 
     pub fn accept_job(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: SubmitBlockReplicationRequest = ctx.parse_header()?;
+        if RpcCode::from(ctx.msg.code()) == RpcCode::SubmitFencedReplication
+            && (req.target_token.is_none()
+                || req.attempt_id.is_none()
+                || req.job_timeout_ms.is_none())
+        {
+            return curvine_core_error::err_box!(
+                "fenced replication requires token, attempt and deadline"
+            );
+        }
         let attempt_id = req.attempt_id.clone();
         let response = match self.manager.accept_job(req.into()) {
             Ok(_) => SubmitBlockReplicationResponse {
@@ -64,7 +73,16 @@ impl MessageHandler for WorkerReplicationHandler {
         let ctx = &mut rpc_context;
 
         let response = match code {
-            RpcCode::SubmitBlockReplicationJob => self.accept_job(ctx),
+            RpcCode::SubmitBlockReplicationJob | RpcCode::SubmitFencedReplication => {
+                self.accept_job(ctx)
+            }
+            RpcCode::PrepareReplication => {
+                ctx.response(self.manager.target.prepare(ctx.parse_header()?)?)
+            }
+            RpcCode::ReconcileReplication => {
+                ctx.response(self.manager.target.reconcile(ctx.parse_header()?)?)
+            }
+            RpcCode::WriteReplicationBlock => self.manager.target.write(msg),
             _ => Err(FsError::Common(ErrorImpl::with_source(
                 format!("Unsupported operation: {:?}", code).into(),
             ))),
