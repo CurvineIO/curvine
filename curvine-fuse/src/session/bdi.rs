@@ -35,38 +35,82 @@ fn mountinfo_bdi_path(mnt_path: &Path) -> std::io::Result<Option<String>> {
 fn mountinfo_bdi_path_from(mountinfo: &str, mnt_path: &Path) -> Option<String> {
     let target = mnt_path.to_string_lossy();
 
-    // The mount point can be shadowed: under Kubernetes the mount directory is
-    // typically a hostPath bind mount (e.g. ext4) that the FUSE filesystem is
-    // mounted over, so mountinfo holds several entries for the same path.
-    // Taking the first match would resolve to the bind mount's block device —
-    // whose BDI either does not exist (partition) or, worse, belongs to the
-    // host disk. Only a fuse-fstype entry is ours; keep the last one (the
-    // newest mount wins the path).
-    let mut bdi_path = None;
+    // mountinfo order (and mount ID magnitude) does not describe stacking.
+    // Keep every same-path entry until the top of the stack is identified:
+    // filtering out foreign filesystems first could expose a hidden Curvine BDI.
+    struct Mount<'a> {
+        id: u64,
+        parent: u64,
+        majmin: &'a str,
+        fstype: &'a str,
+        source: &'a str,
+    }
+
+    let mut mounts = std::collections::HashMap::new();
+    let mut parents = std::collections::HashSet::new();
     for line in mountinfo.lines() {
         let mut fields = line.split_whitespace();
-        let majmin = match fields.nth(2) {
-            Some(v) => v,
-            None => continue,
-        };
-        // mountinfo fields are: id parent major:minor root mount_point ...
-        // We already consumed through major:minor, so skip root and read mount_point.
-        let mount_point = match fields.nth(1) {
-            Some(v) => v,
-            None => continue,
-        };
-        if mount_point != target {
+        // mountinfo fields: id parent major:minor root mount_point ...
+        let (id, parent, majmin) = (fields.next(), fields.next(), fields.next());
+        if fields.nth(1) != Some(target.as_ref()) {
             continue;
         }
-        // A variable number of optional fields follows; per proc(5) the fstype
-        // is the field right after the "-" separator.
+
+        // A malformed matching entry makes the stack unsafe to identify; do
+        // not skip it and accidentally fall back to the mount underneath it.
+        let id = id?.parse::<u64>().ok()?;
+        let parent = parent?.parse::<u64>().ok()?;
         let mut rest = fields.skip_while(|f| *f != "-").skip(1);
-        if matches!(rest.next(), Some(fstype) if fstype == "fuse" || fstype.starts_with("fuse.")) {
-            bdi_path = Some(bdi_path_from_majmin(majmin));
+        let mount = Mount {
+            id,
+            parent,
+            majmin: majmin?,
+            fstype: rest.next()?,
+            source: rest.next()?,
+        };
+        if mounts.insert(id, mount).is_some() {
+            return None;
+        }
+        // A namespace root may be its own parent; it does not hide itself.
+        if parent != id {
+            parents.insert(parent);
         }
     }
 
-    bdi_path
+    // A stacked mount's parent is the previous mount at the same path. The
+    // top-most entry is therefore the only one that is not another's parent.
+    // See proc_pid_mountinfo(5). Multiple candidates are ambiguous: skip them.
+    let mut tops = mounts.values().filter(|mnt| !parents.contains(&mnt.id));
+    let top = tops.next()?;
+    if tops.next().is_some() {
+        return None;
+    }
+
+    // Require a single connected stack, even for malformed input containing a
+    // disconnected cycle beside an otherwise unique top-most candidate.
+    let mut current = top;
+    let mut depth = 1;
+    while current.parent != current.id {
+        let Some(parent) = mounts.get(&current.parent) else {
+            break;
+        };
+        depth += 1;
+        if depth > mounts.len() {
+            return None;
+        }
+        current = parent;
+    }
+    if depth != mounts.len() {
+        return None;
+    }
+
+    // New mounts use subtype=curvinefs. Restoring a pre-subtype mount through
+    // CURVINE_FUSE_STATE_PATH retains plain fuse, but its source is curvinefs.
+    if top.fstype == "fuse.curvinefs" || (top.fstype == "fuse" && top.source == "curvinefs") {
+        Some(bdi_path_from_majmin(top.majmin))
+    } else {
+        None
+    }
 }
 
 /// Write `kb` into the mount's BDI sysfs entry; failures only warn.
@@ -76,7 +120,7 @@ pub fn apply_max_readahead_kb(mnt_path: &Path, kb: u32) {
         Ok(Some(path)) => path,
         Ok(None) => {
             warn!(
-                "bdi max_readahead_kb skip: mountinfo entry for {} not found (mount continues)",
+                "bdi max_readahead_kb skip: no eligible top-most Curvine mountinfo entry for {} (mount absent, non-Curvine, or ambiguous; mount continues)",
                 mnt_path.display()
             );
             return;
@@ -110,9 +154,10 @@ pub fn apply_max_readahead_kb(mnt_path: &Path, kb: u32) {
             }
             Err(e) => {
                 let hint = if e.kind() == std::io::ErrorKind::ReadOnlyFilesystem {
-                    "; /sys is read-only here (typical inside containers) — mount a \
-                     writable host /sys into the container or set read_ahead_kb from \
-                     the host"
+                    "; /sys is read-only here (typical inside containers); set read_ahead_kb \
+                     from the host or expose only the required writable BDI sysfs path \
+                     with appropriate permissions. Kubernetes securityContext.privileged: true \
+                     is another option if policy allows, but grants broad host privileges"
                 } else {
                     ""
                 };
@@ -174,15 +219,200 @@ mod tests {
 
     #[test]
     fn mountinfo_bdi_path_from_ignores_non_fuse_entries() {
-        // Only a fuse mount's BDI is ours to tune: a path that matches solely a
-        // block-device mount must resolve to nothing rather than risk writing
-        // the host disk's readahead.
+        // A path matching only a block-device mount must resolve to nothing
+        // rather than risk writing the host disk's readahead.
         let mountinfo =
             "14896 14612 8:2 /curvinefs /mnt/curvinefs rw,relatime shared:1 - ext4 /dev/sda2 rw\n";
         assert_eq!(
             mountinfo_bdi_path_from(mountinfo, Path::new("/mnt/curvinefs")),
             None
         );
+    }
+
+    // Exercise every file order independently of the mount IDs. IDs can be
+    // reused, so the newest mount deliberately has a smaller ID than its parent.
+    fn assert_mount_orders(lines: &[&str], expected: Option<&str>) {
+        fn visit(lines: &mut [&str], index: usize, expected: &Option<String>) {
+            if index == lines.len() {
+                let mountinfo = lines.join("\n");
+                assert_eq!(
+                    mountinfo_bdi_path_from(&mountinfo, Path::new("/mnt/curvinefs")),
+                    *expected,
+                    "mountinfo:\n{mountinfo}"
+                );
+                return;
+            }
+            for next in index..lines.len() {
+                lines.swap(index, next);
+                visit(lines, index + 1, expected);
+                lines.swap(index, next);
+            }
+        }
+        visit(&mut lines.to_vec(), 0, &expected.map(bdi_path_from_majmin));
+    }
+
+    #[test]
+    fn mountinfo_bdi_path_from_selects_topmost_curvine_in_any_order() {
+        assert_mount_orders(
+            &[
+                "90 1 8:2 /curvinefs /mnt/curvinefs rw - ext4 /dev/sda2 rw",
+                "80 90 0:100 / /mnt/curvinefs rw shared:1 - fuse.curvinefs curvinefs rw",
+                "20 80 0:200 / /mnt/curvinefs rw shared:2 master:3 - fuse.curvinefs curvinefs rw",
+            ],
+            Some("0:200"),
+        );
+    }
+
+    #[test]
+    fn mountinfo_bdi_path_from_selects_curvine_over_foreign_fuse_in_any_order() {
+        for fstype in ["fuse.sshfs", "fuse.lxcfs", "fuse"] {
+            let lower = format!("80 1 0:100 / /mnt/curvinefs rw - {fstype} foreign rw");
+            assert_mount_orders(
+                &[
+                    &lower,
+                    "20 80 0:200 / /mnt/curvinefs rw - fuse.curvinefs curvinefs rw",
+                ],
+                Some("0:200"),
+            );
+        }
+    }
+
+    #[test]
+    fn mountinfo_bdi_path_from_does_not_fall_back_to_hidden_curvine() {
+        for fstype in ["ext4", "fuse.sshfs", "fuse.lxcfs", "fuse", "fuseblk"] {
+            let upper = format!("20 80 0:200 / /mnt/curvinefs rw - {fstype} foreign rw");
+            assert_mount_orders(
+                &[
+                    "80 1 0:100 / /mnt/curvinefs rw - fuse.curvinefs curvinefs rw",
+                    &upper,
+                ],
+                None,
+            );
+        }
+    }
+
+    #[test]
+    fn mountinfo_bdi_path_from_rejects_foreign_fuse_types_and_sources() {
+        for (fstype, source) in [
+            ("fuse.sshfs", "curvinefs"),
+            ("fuse.lxcfs", "curvinefs"),
+            ("fuse.curvinefs.extra", "curvinefs"),
+            ("fuseblk", "curvinefs"),
+            ("fuse", "foreign"),
+        ] {
+            let line = format!("20 1 0:200 / /mnt/curvinefs rw - {fstype} {source} rw");
+            assert_mount_orders(&[&line], None);
+        }
+    }
+
+    #[test]
+    fn mountinfo_bdi_path_from_preserves_legacy_curvine_in_any_order() {
+        assert_mount_orders(
+            &[
+                "80 1 8:2 /curvinefs /mnt/curvinefs rw - ext4 /dev/sda2 rw",
+                "20 80 0:200 / /mnt/curvinefs rw - fuse curvinefs rw",
+            ],
+            Some("0:200"),
+        );
+    }
+
+    #[test]
+    fn mountinfo_bdi_path_from_rejects_ambiguous_topmost_mounts() {
+        assert_mount_orders(
+            &[
+                "90 1 8:2 /curvinefs /mnt/curvinefs rw - ext4 /dev/sda2 rw",
+                "80 90 0:100 / /mnt/curvinefs rw - fuse.curvinefs curvinefs rw",
+                "20 90 0:200 / /mnt/curvinefs rw - fuse.curvinefs curvinefs rw",
+            ],
+            None,
+        );
+    }
+
+    #[test]
+    fn mountinfo_bdi_path_from_handles_self_parent_namespace_root() {
+        let root = "20 20 0:200 / / rw - fuse.curvinefs curvinefs rw";
+        assert_eq!(
+            mountinfo_bdi_path_from(root, Path::new("/")),
+            Some(bdi_path_from_majmin("0:200")),
+        );
+    }
+
+    #[test]
+    fn mountinfo_bdi_path_from_ignores_mounts_at_other_paths() {
+        assert_mount_orders(
+            &[
+                "80 1 0:100 / /mnt/curvinefs rw - fuse.curvinefs curvinefs rw",
+                "20 80 8:2 / /mnt/curvinefs/child rw - ext4 /dev/sda2 rw",
+            ],
+            Some("0:100"),
+        );
+    }
+
+    #[test]
+    fn mountinfo_bdi_path_from_rejects_malformed_matching_entry() {
+        for upper in [
+            "bad 80 0:200 / /mnt/curvinefs rw - fuse.curvinefs curvinefs rw",
+            "20 bad 0:200 / /mnt/curvinefs rw - fuse.curvinefs curvinefs rw",
+            "20 80 0:200 / /mnt/curvinefs rw",
+            "20 80 0:200 / /mnt/curvinefs rw -",
+            "20 80 0:200 / /mnt/curvinefs rw - fuse.curvinefs",
+        ] {
+            assert_mount_orders(
+                &[
+                    "80 1 0:100 / /mnt/curvinefs rw - fuse.curvinefs curvinefs rw",
+                    upper,
+                ],
+                None,
+            );
+        }
+    }
+
+    #[test]
+    fn mountinfo_bdi_path_from_rejects_cycles() {
+        assert_mount_orders(
+            &[
+                "80 20 0:100 / /mnt/curvinefs rw - fuse.curvinefs curvinefs rw",
+                "20 80 0:200 / /mnt/curvinefs rw - fuse.curvinefs curvinefs rw",
+            ],
+            None,
+        );
+    }
+
+    #[test]
+    fn mountinfo_bdi_path_from_rejects_disconnected_cycle() {
+        assert_mount_orders(
+            &[
+                "80 20 0:100 / /mnt/curvinefs rw - fuse.curvinefs curvinefs rw",
+                "20 80 0:200 / /mnt/curvinefs rw - fuse.curvinefs curvinefs rw",
+                "30 1 0:300 / /mnt/curvinefs rw - fuse.curvinefs curvinefs rw",
+            ],
+            None,
+        );
+    }
+
+    #[test]
+    fn mountinfo_bdi_path_from_rejects_duplicate_mount_ids() {
+        assert_mount_orders(
+            &[
+                "20 1 0:100 / /mnt/curvinefs rw - fuse.curvinefs curvinefs rw",
+                "20 1 0:200 / /mnt/curvinefs rw - fuse.curvinefs curvinefs rw",
+            ],
+            None,
+        );
+    }
+
+    #[test]
+    fn mountinfo_bdi_path_from_returns_none_for_absent_mount() {
+        for mountinfo in [
+            "",
+            "malformed unrelated record",
+            "20 1 0:200 / /elsewhere rw - fuse.curvinefs curvinefs rw",
+        ] {
+            assert_eq!(
+                mountinfo_bdi_path_from(mountinfo, Path::new("/mnt/curvinefs")),
+                None,
+            );
+        }
     }
 
     #[test]

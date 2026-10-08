@@ -246,6 +246,13 @@ pub struct FuseConf {
     /// [`FuseConf::DEFAULT_MAX_READAHEAD_KB`] (1024 = 1 MiB) only when the
     /// workload is sequential and mmap read amplification is acceptable.
     ///
+    /// The BDI override requires a writable sysfs entry and permission to write
+    /// it; container `/sys` may be read-only. Configure it on the host or expose
+    /// the required writable BDI sysfs path. Kubernetes
+    /// `securityContext.privileged: true` is another option if policy allows,
+    /// but grants broad host privileges. A failed sysfs write only warns and
+    /// leaves the BDI value unchanged; FUSE init negotiation is separate.
+    ///
     /// Linux only; on other platforms the value is accepted but has no effect.
     pub max_readahead_kb: Option<u32>,
 
