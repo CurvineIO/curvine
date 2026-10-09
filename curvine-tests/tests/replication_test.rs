@@ -796,3 +796,214 @@ fn replication_recovery_scenario(fail_copy: bool, fail_metadata: bool) -> Common
     }
     Ok(())
 }
+
+#[cfg(feature = "fault-injection")]
+mod prepared_target_cleanup {
+    use super::*;
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+
+    enum Failure {
+        LostPrepareResponse,
+        PrepareTimeout,
+        DeadlineAfterPrepare,
+    }
+
+    struct Rules(Vec<String>);
+
+    impl Drop for Rules {
+        fn drop(&mut self) {
+            for id in &self.0 {
+                let _ = FaultRuntime::process().remove(id);
+            }
+        }
+    }
+
+    #[test]
+    fn lost_prepare_response_reconciles_before_retry() -> CommonResult<()> {
+        scenario(Failure::LostPrepareResponse, 10)
+    }
+
+    #[test]
+    fn prepare_timeout_reconciles_before_retry() -> CommonResult<()> {
+        scenario(Failure::PrepareTimeout, 12)
+    }
+
+    #[test]
+    fn deadline_after_prepare_reconciles_without_submitting_source() -> CommonResult<()> {
+        scenario(Failure::DeadlineAfterPrepare, 14)
+    }
+
+    fn wait_for(
+        description: &str,
+        mut ready: impl FnMut() -> CommonResult<bool>,
+    ) -> CommonResult<()> {
+        let start = Instant::now();
+        while !ready()? {
+            assert!(start.elapsed() < Duration::from_secs(10), "{description}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
+    }
+
+    fn scenario(failure: Failure, padding: usize) -> CommonResult<()> {
+        // Two workers leave exactly one possible destination. The 61-second target lease
+        // exceeds every assertion deadline, so lease expiry cannot make the test pass.
+        let testing = Testing::builder()
+            .default()
+            .masters(1)
+            .workers(2)
+            .mutate_conf(|conf| {
+                conf.client.block_size_str = "64KB".into();
+                conf.master.min_block_size = 64 * 1024;
+                conf.master.min_replication = 1;
+                conf.master.max_replication = 3;
+                conf.master.block_replication_enabled = true;
+                conf.master.block_replication_concurrency_limit = 1;
+                conf.master.block_replication_submit_timeout = "500ms".into();
+                conf.master.block_replication_job_timeout = "30s".into();
+                conf.master.block_replication_retry_interval = "100ms".into();
+            })
+            .build()?;
+        let cluster = testing.start_cluster()?;
+        let conf = testing.get_active_cluster_conf()?;
+        let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+        let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+        // In-process MiniClusters share the fault runtime; keep block IDs disjoint from
+        // the other scenarios, including clusters whose background threads are still alive.
+        for index in 0..padding {
+            let path = Path::from_str(format!("/prepare-padding-{index}"))?;
+            rt.block_on(write_test_file_with_replicas(&fs, &path, b"padding", 1))?;
+        }
+        let a = Path::from_str("/prepared-a")?;
+        let b = Path::from_str("/prepared-b")?;
+        let data = generate_test_data(4096);
+        let fa = rt.block_on(write_test_file_with_replicas(&fs, &a, &data, 2))?;
+        let fb = rt.block_on(write_test_file_with_replicas(&fs, &b, &data, 2))?;
+        let aid = fa.block_locs[0].block.id;
+        let bid = fb.block_locs[0].block.id;
+        let runtime = FaultRuntime::process();
+        let prepare_id = format!("prepare-failure-{aid}");
+        let prepares_id = format!("a-prepare-count-{aid}");
+        let cleanup_id = format!("cleanup-response-loss-{aid}");
+        let copies_id = format!("prepare-copy-count-{aid}");
+        let _rules = Rules(vec![
+            prepare_id.clone(),
+            prepares_id.clone(),
+            cleanup_id.clone(),
+            copies_id.clone(),
+        ]);
+        let fault = match failure {
+            Failure::LostPrepareResponse => FaultRuleBuilder::named("worker.replication.prepared")
+                .matches("block_id", aid)?
+                .times(1)?
+                .return_error("prepare applied but token response lost")?,
+            Failure::PrepareTimeout => FaultRuleBuilder::named("worker.replication.prepared")
+                .matches("block_id", aid)?
+                .times(1)?
+                .delay(1_000)?,
+            Failure::DeadlineAfterPrepare => FaultRuleBuilder::named("master.replication.prepared")
+                .matches("block_id", aid)?
+                .times(1)?
+                .delay(1_000)?,
+        };
+        runtime.configure(&prepare_id, fault)?;
+        runtime.configure(
+            &prepares_id,
+            FaultRuleBuilder::named("worker.replication.prepared")
+                .matches("block_id", aid)?
+                .record()?,
+        )?;
+        // Revoke really runs, but its response is lost until explicitly unblocked below.
+        // The Master must retain the SAME attempt instead of forgetting or resubmitting it.
+        runtime.configure(
+            &cleanup_id,
+            FaultRuleBuilder::named("worker.replication.reconciled")
+                .matches("block_id", aid)?
+                .return_error("cleanup response lost")?,
+        )?;
+        runtime.configure(
+            &copies_id,
+            FaultRuleBuilder::named("worker.replication.before_copy")
+                .matches("block_id", aid)?
+                .record()?,
+        )?;
+        let master_fs = cluster.get_active_master_fs();
+        let remove_destination = |blocks: &FileBlocks, path: &Path| -> CommonResult<()> {
+            let blk = &blocks.block_locs[0];
+            let destination = &blk.locs[1];
+            let store = cluster
+                .worker_stores
+                .get(&destination.worker_id)
+                .unwrap()
+                .clone();
+            // Really delete the target replica as well as its Master location. Merely
+            // removing metadata would leave a finalized block that rejects the new writer.
+            store.remove_block(blk.block.id)?;
+            assert!(store.get_block(blk.block.id).is_err());
+            master_fs.fs_dir().write().block_report(vec![(
+                false,
+                blk.block.id,
+                BlockLocation::new(destination.worker_id, StorageType::Disk),
+            )])?;
+            assert_eq!(
+                replica_count(&rt.block_on(get_block_locations(&fs, path))?, blk.block.id),
+                1
+            );
+            Ok(())
+        };
+        remove_destination(&fa, &a)?;
+        let manager = cluster.get_active_master_replication_manager();
+        manager.report_under_replicated_blocks(fa.block_locs[0].locs[0].worker_id, vec![aid])?;
+        wait_for(
+            "prepared A must retry reconciliation after losing its response",
+            || Ok(runtime.rule(&cleanup_id)?.unwrap().executions >= 2),
+        )?;
+        assert_eq!(runtime.rule(&prepare_id)?.unwrap().executions, 1);
+        assert_eq!(runtime.rule(&prepares_id)?.unwrap().executions, 1);
+        assert_eq!(runtime.rule(&copies_id)?.unwrap().executions, 0);
+        assert_eq!(
+            replica_count(&rt.block_on(get_block_locations(&fs, &a))?, aid),
+            1
+        );
+        // B only becomes deficient after A is demonstrably waiting for cleanup.
+        remove_destination(&fb, &b)?;
+        manager.report_under_replicated_blocks(fb.block_locs[0].locs[0].worker_id, vec![bid])?;
+        wait_for(
+            "B must repair while A still awaits cleanup with concurrency=1",
+            || Ok(replica_count(&rt.block_on(get_block_locations(&fs, &b))?, bid) == 2),
+        )?;
+        assert_eq!(runtime.rule(&copies_id)?.unwrap().executions, 0);
+        assert_eq!(
+            replica_count(&rt.block_on(get_block_locations(&fs, &a))?, aid),
+            1
+        );
+        assert_eq!(runtime.rule(&prepares_id)?.unwrap().executions, 1);
+        runtime.remove(&cleanup_id)?;
+        wait_for(
+            "A must repair before its prepared target lease expires",
+            || Ok(replica_count(&rt.block_on(get_block_locations(&fs, &a))?, aid) == 2),
+        )?;
+        assert_eq!(runtime.rule(&copies_id)?.unwrap().executions, 1);
+        assert_eq!(runtime.rule(&prepares_id)?.unwrap().executions, 2);
+        // Read only from the repaired destinations and compare actual bytes.
+        for blocks in [&fa, &fb] {
+            let blk = &blocks.block_locs[0];
+            master_fs.fs_dir().write().block_report(vec![(
+                false,
+                blk.block.id,
+                BlockLocation::new(blk.locs[0].worker_id, StorageType::Disk),
+            )])?;
+        }
+        assert_eq!(rt.block_on(read_test_file(&fs, &a))?, data);
+        assert_eq!(rt.block_on(read_test_file(&fs, &b))?, data);
+        for blocks in [&fa, &fb] {
+            let blk = &blocks.block_locs[0];
+            master_fs.fs_dir().write().block_report(vec![(
+                true,
+                blk.block.id,
+                BlockLocation::new(blk.locs[0].worker_id, StorageType::Disk),
+            )])?;
+        }
+        Ok(())
+    }
+}

@@ -98,7 +98,13 @@ impl ReplicationTarget {
                         token: current.token.clone(),
                     });
                 }
-                return err_box!("replication target still owns another attempt");
+                if current.writer.is_some() || current.storage_type.is_some() {
+                    return err_box!("replication target still owns another attempt");
+                }
+                // Reconciliation can overtake a delayed Prepare. An unopened reservation
+                // has no writer or completion evidence, so replace it under this same lock
+                // instead of blocking repairs until expiry. Open racing this replacement
+                // either wins first (and prevents replacement) or sees a stale token.
             }
             self.revoke(req.block_id, current)?;
             self.deadlines
@@ -413,6 +419,91 @@ mod tests {
                 lifetime_ms: 1000,
             })
             .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn unopened_reservation_can_be_replaced_without_waiting_for_expiry() -> CommonResult<()> {
+        let target = target()?;
+        let old = prepare(&target, "old")?;
+        assert_eq!(old, prepare(&target, "old")?);
+        let new = prepare(&target, "new")?;
+        assert_ne!(old, new);
+        assert_eq!(target.deadlines.lock().len(), 1);
+        for status in [
+            RequestStatus::Open,
+            RequestStatus::Running,
+            RequestStatus::Complete,
+            RequestStatus::Cancel,
+        ] {
+            assert!(target.write(&frame(&old, status, b"bad!")).is_err());
+        }
+        // Old cleanup must not revoke the replacement either.
+        assert_eq!(reconcile(&target, "old", true)?, None);
+        copy(&target, &new)?;
+        assert!(reconcile(&target, "new", true)?.is_some());
+        let (_, mut reader) = target.store.open_reader_by_id_at_stored_len(1, 0)?;
+        assert_eq!(reader.read_region(false, 4)?.as_slice(), b"data");
+        Ok(())
+    }
+
+    #[test]
+    fn reconcile_before_late_prepare_does_not_block_successor() -> CommonResult<()> {
+        let target = target()?;
+        // The timed-out prepare has not arrived when reconciliation confirms absence.
+        assert_eq!(reconcile(&target, "late", false)?, None);
+        let late = prepare(&target, "late")?;
+        let successor = prepare(&target, "successor")?;
+        assert_ne!(late, successor);
+        assert!(target
+            .write(&frame(&late, RequestStatus::Open, &[]))
+            .is_err());
+        copy(&target, &successor)?;
+        assert!(reconcile(&target, "successor", true)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_cannot_replace_open_writer_or_completion_evidence() -> CommonResult<()> {
+        let target = target()?;
+        let token = prepare(&target, "active")?;
+        target.write(&frame(&token, RequestStatus::Open, &[]))?;
+        assert!(prepare(&target, "successor").is_err());
+        target.write(&frame(&token, RequestStatus::Running, b"data"))?;
+        target.write(&frame(&token, RequestStatus::Complete, &[]))?;
+        assert!(prepare(&target, "successor").is_err());
+        assert!(reconcile(&target, "active", false)?.is_some());
+        // Reconciliation closes the writer, but the completion evidence still owns the lease.
+        assert!(target.stripe(1).lock().get(&1).unwrap().writer.is_none());
+        assert!(prepare(&target, "successor").is_err());
+        assert!(reconcile(&target, "active", true)?.is_some());
+        let (_, mut reader) = target.store.open_reader_by_id_at_stored_len(1, 0)?;
+        assert_eq!(reader.read_region(false, 4)?.as_slice(), b"data");
+        Ok(())
+    }
+
+    #[test]
+    fn failed_revocation_keeps_successor_fenced_until_cleanup_succeeds() -> CommonResult<()> {
+        let target = target()?;
+        let old = prepare(&target, "old")?;
+        target.write(&frame(&old, RequestStatus::Open, &[]))?;
+        let meta = target.store.get_block(1)?;
+        let path = target.store.short_circuit(&meta)?.unwrap();
+        // A non-empty directory makes file-backed allocation cleanup fail deterministically.
+        std::fs::remove_file(&path)?;
+        std::fs::create_dir(&path)?;
+        std::fs::write(std::path::Path::new(&path).join("child"), b"blocked")?;
+        assert!(reconcile(&target, "old", false).is_err());
+        assert!(prepare(&target, "successor").is_err());
+        assert!(target
+            .write(&frame(&old, RequestStatus::Running, b"bad!"))
+            .is_err());
+        assert!(target.store.ordinary_write_lease(1).is_err());
+        std::fs::remove_dir_all(&path)?;
+        assert_eq!(reconcile(&target, "old", false)?, None);
+        let new = prepare(&target, "successor")?;
+        copy(&target, &new)?;
+        assert!(reconcile(&target, "successor", true)?.is_some());
         Ok(())
     }
 

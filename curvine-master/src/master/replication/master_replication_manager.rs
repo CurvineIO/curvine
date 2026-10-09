@@ -566,12 +566,22 @@ impl MasterReplicationManager {
         let prepared = match prepared {
             Ok(Ok(response)) => response,
             other => {
-                // No source has been submitted: even a delayed prepare can only create a fresh
-                // opaque token that nobody possesses. Its bounded target lease will clean up.
-                self.cancel_known_inactive_attempt(block_id, &attempt_id);
+                if other.is_err() {
+                    self.metrics.replication_timeout_count.inc();
+                }
+                // Prepare may have reserved the target even if its response was lost. Keep
+                // cleanup ownership until reconciliation confirms revocation; Uncertain
+                // releases the scheduler permit without abandoning that reservation.
+                self.transition_to_uncertain(block_id, &attempt_id, "target prepare failed");
                 return err_box!("Cannot prepare fenced replication target: {:?}", other);
             }
         };
+        crate::fault_point! {
+            async,
+            name: "master.replication.prepared",
+            description: "after receiving a target token but before checking the submit deadline",
+            context: {"block_id" => block_id},
+        }
         let request = SubmitBlockReplicationRequest {
             block_id,
             target_worker_info: ProtoUtils::worker_address_to_pb(&target.address),
@@ -587,9 +597,14 @@ impl MasterReplicationManager {
         let remaining = match target_duration(submit_deadline) {
             Ok(duration) => duration,
             Err(e) => {
-                // No submit bytes were sent, so this attempt is known not to be executing.
+                // The source was not submitted, but Prepare already reserved the target.
+                // Reconciliation must revoke that token before forgetting this attempt.
                 self.metrics.replication_timeout_count.inc();
-                self.cancel_known_inactive_attempt(block_id, &attempt_id);
+                self.transition_to_uncertain(
+                    block_id,
+                    &attempt_id,
+                    "submit deadline expired after target prepare",
+                );
                 return Err(e);
             }
         };

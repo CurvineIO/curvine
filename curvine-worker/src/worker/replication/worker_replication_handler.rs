@@ -18,7 +18,10 @@ use curvine_core_error::ErrorImpl;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::RpcCode;
-use curvine_proto::{SubmitBlockReplicationRequest, SubmitBlockReplicationResponse};
+use curvine_proto::{
+    PrepareReplicationRequest, ReconcileReplicationRequest, SubmitBlockReplicationRequest,
+    SubmitBlockReplicationResponse,
+};
 use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::Message;
 use log::warn;
@@ -77,10 +80,32 @@ impl MessageHandler for WorkerReplicationHandler {
                 self.accept_job(ctx)
             }
             RpcCode::PrepareReplication => {
-                ctx.response(self.manager.target.prepare(ctx.parse_header()?)?)
+                let req: PrepareReplicationRequest = ctx.parse_header()?;
+                let block_id = req.block_id;
+                let response = self.manager.target.prepare(req)?;
+                crate::fault_point! {
+                    sync,
+                    name: "worker.replication.prepared",
+                    description: "after reserving the target but before returning its token",
+                    context: {"block_id" => block_id},
+                    return_error: |fault| curvine_core_error::err_box!("{}", fault.message),
+                }
+                let _ = block_id;
+                ctx.response(response)
             }
             RpcCode::ReconcileReplication => {
-                ctx.response(self.manager.target.reconcile(ctx.parse_header()?)?)
+                let req: ReconcileReplicationRequest = ctx.parse_header()?;
+                let block_id = req.block_id;
+                let response = self.manager.target.reconcile(req)?;
+                crate::fault_point! {
+                    sync,
+                    name: "worker.replication.reconciled",
+                    description: "after revoking the target but before returning cleanup evidence",
+                    context: {"block_id" => block_id},
+                    return_error: |fault| curvine_core_error::err_box!("{}", fault.message),
+                }
+                let _ = block_id;
+                ctx.response(response)
             }
             RpcCode::WriteReplicationBlock => self.manager.target.write(msg),
             _ => Err(FsError::Common(ErrorImpl::with_source(
