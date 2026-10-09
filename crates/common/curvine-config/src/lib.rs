@@ -77,6 +77,13 @@ pub mod validation;
 /// Hot-reload extension points (no watcher/RPC wired yet — see module docs).
 pub mod reload;
 
+/// Process-local runtime config registry (admin push, non-persistent overrides).
+pub mod runtime_registry;
+pub use runtime_registry::{
+    RuntimeConfigEntryView, RuntimeConfigRegistry, RuntimeConfigRegistryBuilder,
+    RuntimeConfigUpdateResult,
+};
+
 impl curvine_model::ClientConfDefaults for ClientConf {
     fn replicas(&self) -> i32 {
         self.replicas

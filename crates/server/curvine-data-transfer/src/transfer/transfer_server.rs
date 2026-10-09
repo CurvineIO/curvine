@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use crate::common::UfsFactory;
 use curvine_client_core::file::CurvineFileSystem;
-use curvine_config::{ClusterConf, TransferStoreType};
+use curvine_config::{ClusterConf, RuntimeConfigRegistry, TransferStoreType};
 use curvine_core_error::CommonResult;
 use curvine_error::FsError;
 use curvine_net::net::ConnState;
@@ -41,6 +41,7 @@ pub struct TransferRpcService {
     ready: Arc<AtomicBool>,
     store_backend: &'static str,
     cluster_cache: ClusterMetadataCache,
+    runtime_config: Arc<RuntimeConfigRegistry>,
 }
 
 impl TransferRpcService {
@@ -49,12 +50,14 @@ impl TransferRpcService {
         ready: Arc<AtomicBool>,
         store_backend: &'static str,
         cluster_cache: ClusterMetadataCache,
+        runtime_config: Arc<RuntimeConfigRegistry>,
     ) -> Self {
         Self {
             service,
             ready,
             store_backend,
             cluster_cache,
+            runtime_config,
         }
     }
 }
@@ -76,6 +79,7 @@ impl WebHandlerService for TransferRpcService {
             self.store_backend,
             self.service.clone(),
             self.cluster_cache.clone(),
+            self.runtime_config.clone(),
         )
     }
 }
@@ -173,6 +177,7 @@ impl TransferServer {
         );
 
         let ready = Arc::new(AtomicBool::new(false));
+        let runtime_config = Arc::new(RuntimeConfigRegistry::builder().build());
         let service = TransferRpcService::new(
             TransferService::with_cache_and_report_queue(
                 store,
@@ -184,6 +189,7 @@ impl TransferServer {
             ready.clone(),
             store_backend,
             cache.clone(),
+            runtime_config,
         );
         let rpc_server =
             RpcServer::with_rt(rt.clone(), conf.transfer_server_conf(), service.clone());

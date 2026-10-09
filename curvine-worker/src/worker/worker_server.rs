@@ -16,9 +16,10 @@ use crate::worker::block::{BlockActor, BlockStore};
 use crate::worker::handler::{ConnectionPeer, WorkerHandler, WorkerRouterHandler};
 use crate::worker::replication::worker_replication_handler::WorkerReplicationHandler;
 use crate::worker::replication::worker_replication_manager::WorkerReplicationManager;
+use crate::worker::runtime_config::build_worker_runtime_registry;
 use crate::worker::task::TaskManager;
 use crate::worker::WorkerMetrics;
-use curvine_config::ClusterConf;
+use curvine_config::{ClusterConf, RuntimeConfigRegistry};
 use curvine_core_error::StringError;
 use curvine_core_error::{CommonError, CommonResult};
 use curvine_fault::FaultHttpControl;
@@ -58,6 +59,7 @@ pub struct WorkerService {
     /// shared by every per-connection `WorkerHandler` through an `Arc`, so
     /// handlers share the policy without deep-copying it per connection.
     compatibility_policy: Arc<CompatibilityPolicy>,
+    runtime_config: Arc<RuntimeConfigRegistry>,
 }
 
 impl WorkerService {
@@ -71,6 +73,7 @@ impl WorkerService {
         let store: BlockStore = BlockStore::new(&conf.cluster_id, conf)?;
 
         let task_manager = Arc::new(TaskManager::with_rt(rt.clone(), conf, worker_session_id)?);
+        let runtime_config = Arc::new(build_worker_runtime_registry(task_manager.clone(), conf));
 
         let replication_manager =
             WorkerReplicationManager::new(&store, &rt, conf, &task_manager.get_fs_context());
@@ -84,6 +87,7 @@ impl WorkerService {
             fault_http,
             server_state: Arc::new(OnceCell::new()),
             compatibility_policy: Arc::new(conf.worker.compatibility.to_policy()),
+            runtime_config,
         };
         Ok(ws)
     }
@@ -134,6 +138,7 @@ impl WebHandlerService for WorkerService {
             fault_http: self.fault_http.clone(),
             server_state: self.server_state.clone(),
             task_manager: self.task_manager.clone(),
+            runtime_config: self.runtime_config.clone(),
         }
     }
 }

@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use once_cell::sync::OnceCell;
 
-use curvine_config::ClusterConf;
+use curvine_config::{ClusterConf, RuntimeConfigRegistry};
 use curvine_core_error::{err_box, CommonError, CommonResult};
 use curvine_fault::FaultHttpControl;
 use curvine_net::net::ConnState;
@@ -199,8 +199,13 @@ impl Master {
 
         let rpc_conf = conf.master_server_conf();
         let rpc_server = RpcServer::with_rt(rt.clone(), rpc_conf, service);
-        let metrics_server =
-            MasterMetricsServer::with_rt(rt, conf.master_metrics_conf(), metrics_fs);
+        let runtime_config = Arc::new(RuntimeConfigRegistry::builder().build());
+        let metrics_server = MasterMetricsServer::with_rt(
+            rt,
+            conf.master_metrics_conf(),
+            metrics_fs,
+            runtime_config,
+        );
 
         Ok(Self {
             start_time: LocalTime::mills(),

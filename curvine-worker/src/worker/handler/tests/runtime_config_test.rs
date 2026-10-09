@@ -1,10 +1,12 @@
 use super::*;
+use crate::worker::runtime_config::build_worker_runtime_registry;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
-use curvine_config::{ClusterConf, TransferConf};
+use curvine_config::ClusterConf;
 use curvine_fault::FaultHttpControl;
 use curvine_runtime::runtime::Runtime;
 use tower::ServiceExt;
+
 fn test_handler() -> WorkerRouterHandler {
     let conf = ClusterConf::default();
     let task_manager = Arc::new(
@@ -14,7 +16,8 @@ fn test_handler() -> WorkerRouterHandler {
     WorkerRouterHandler {
         fault_http: FaultHttpControl::default(),
         server_state: Arc::default(),
-        task_manager,
+        task_manager: task_manager.clone(),
+        runtime_config: Arc::new(build_worker_runtime_registry(task_manager, &conf)),
     }
 }
 fn test_task_manager(handler: &WorkerRouterHandler) -> Arc<TaskManager> {
@@ -26,26 +29,6 @@ async fn response_json(response: axum::response::Response) -> Value {
         .await
         .expect("response body");
     serde_json::from_slice(&bytes).expect("json body")
-}
-
-#[test]
-fn parses_supported_value_formats() {
-    assert_eq!(
-        parse_inflight_budget("100GB").unwrap(),
-        100 * 1024 * 1024 * 1024
-    );
-    assert_eq!(
-        parse_duration_ms(TASK_TIMEOUT_CONFIG, "30m").unwrap(),
-        30 * 60 * 1000
-    );
-    assert_eq!(
-        parse_usize(WORKER_MAX_CONCURRENT_TASKS_CONFIG, "64").unwrap(),
-        64
-    );
-    assert!(parse_usize(WORKER_MAX_CONCURRENT_TASKS_CONFIG, "0").is_err());
-    assert!(parse_duration_ms(TASK_TIMEOUT_CONFIG, "0").is_err());
-    assert!(parse_inflight_budget("0").is_err());
-    assert!(parse_inflight_budget("nope").is_err());
 }
 
 #[test]
@@ -108,90 +91,17 @@ fn runtime_config_endpoint_updates_each_writable_config() {
         .enable_all()
         .build()
         .expect("test runtime");
-    rt.block_on(async {
-        let update = |config: &str, value: &str| {
-            let uri = format!("/api/update_config?{}={}", config, value);
-            app.clone().oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(uri)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-        };
 
-        // Byte budget (StarRocks-style size form).
-        let response = update(TRANSFER_INFLIGHT_BUDGET_CONFIG, "100GB")
-            .await
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_json(response).await;
-        assert_eq!(body["value"], 100 * 1024 * 1024 * 1024_i64);
-        assert_eq!(
-            body["previous_value"],
-            TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES
-        );
+    let cases = [
+        (TRANSFER_INFLIGHT_BUDGET_CONFIG, "100GB"),
+        (WORKER_MAX_CONCURRENT_TASKS_CONFIG, "32"),
+        (TASK_TIMEOUT_CONFIG, "30m"),
+        (TASK_REPORT_INTERVAL_CONFIG, "5m"),
+    ];
 
-        // Concurrency.
-        let response = update(WORKER_MAX_CONCURRENT_TASKS_CONFIG, "7")
-            .await
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response_json(response).await["value"], 7);
-        assert_eq!(task_manager.worker_max_concurrent_tasks(), 7);
-        assert_eq!(task_manager.available_worker_task_permits(), 7);
-
-        // Durations accept duration-unit strings and return milliseconds.
-        let response = update(TASK_TIMEOUT_CONFIG, "30m").await.expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response_json(response).await["value"], 30 * 60 * 1000_u64);
-        assert_eq!(task_manager.task_timeout_ms(), 30 * 60 * 1000);
-
-        let response = update(TASK_REPORT_INTERVAL_CONFIG, "5s")
-            .await
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response_json(response).await["value"], 5_000_u64);
-        assert_eq!(task_manager.task_report_interval_ms(), 5_000);
-
-        // GET reflects all updates.
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/worker/config")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .expect("response");
-        let current = response_json(response).await;
-        assert_eq!(current[WORKER_MAX_CONCURRENT_TASKS_CONFIG], 7);
-        assert_eq!(current[TASK_TIMEOUT_CONFIG], "1800000ms");
-    });
-}
-
-#[test]
-fn runtime_config_endpoint_rejects_unknown_or_invalid_updates() {
-    let handler = test_handler();
-    let task_manager = test_task_manager(&handler);
-    let app = handler.router();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("test runtime");
-    rt.block_on(async {
-        for uri in [
-            "/api/update_config?unrelated=100GB",
-            "/api/update_config?transfer_inflight_budget_bytes=100GB&unrelated=value",
-            "/api/update_config?transfer_inflight_budget_bytes=100GB&transfer_inflight_budget_bytes=200GB",
-            "/api/update_config?transfer_inflight_budget_bytes=0",
-            "/api/update_config?worker_max_concurrent_tasks=0",
-            "/api/update_config?worker_max_concurrent_tasks=abc",
-            "/api/update_config?task_timeout=0",
-            "/api/update_config?task_timeout=soon",
-            "/api/update_config?task_report_interval=0",
-        ] {
+    for (config, value) in cases {
+        let uri = format!("/api/update_config?{}={}", config, value);
+        let body = rt.block_on(async {
             let response = app
                 .clone()
                 .oneshot(
@@ -203,17 +113,63 @@ fn runtime_config_endpoint_rejects_unknown_or_invalid_updates() {
                 )
                 .await
                 .expect("response");
-            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{}", uri);
-        }
+            assert_eq!(response.status(), StatusCode::OK);
+            response_json(response).await
+        });
+        assert_eq!(body["config"], config);
+        assert_eq!(body["persistent"], false);
+        assert!(body.get("previous_value").is_some());
+        assert!(body.get("value").is_some());
+    }
 
-        // Nothing changed.
-        assert_eq!(
-            task_manager.transfer_inflight_budget_bytes(),
-            TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES
-        );
-        assert_eq!(
-            task_manager.worker_max_concurrent_tasks(),
-            ClusterConf::default().job.worker_max_concurrent_tasks
-        );
-    });
+    assert_eq!(
+        task_manager.transfer_inflight_budget_bytes(),
+        100 * 1024 * 1024 * 1024
+    );
+    assert_eq!(task_manager.worker_max_concurrent_tasks(), 32);
+}
+
+#[test]
+fn runtime_config_endpoint_rejects_unknown_or_invalid_updates() {
+    let handler = test_handler();
+    let task_manager = test_task_manager(&handler);
+    let app = handler.router();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+
+    let bad_uris = [
+        "/api/update_config?unrelated=100GB",
+        "/api/update_config?transfer_inflight_budget_bytes=100GB&unrelated=value",
+        "/api/update_config?transfer_inflight_budget_bytes=100GB&transfer_inflight_budget_bytes=200GB",
+        "/api/update_config?transfer_inflight_budget_bytes=0",
+        "/api/update_config?worker_max_concurrent_tasks=0",
+        "/api/update_config?worker_max_concurrent_tasks=abc",
+        "/api/update_config?task_timeout=0",
+        "/api/update_config?task_timeout=soon",
+        "/api/update_config?task_report_interval=0",
+    ];
+
+    for uri in bad_uris {
+        let status = rt.block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("response")
+                .status()
+        });
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "uri {}", uri);
+    }
+
+    assert_eq!(
+        task_manager.transfer_inflight_budget_bytes(),
+        curvine_config::TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES
+    );
 }

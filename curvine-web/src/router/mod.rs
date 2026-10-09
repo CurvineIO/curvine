@@ -15,6 +15,11 @@
 // pub mod load_handler;
 pub mod admin_handler;
 mod router_handler;
+pub mod runtime_config;
 
 pub use self::admin_handler::AdminRouterHandler;
 pub use self::router_handler::{RouterHandler, TestHandler};
+pub use self::runtime_config::{
+    get_runtime_config, post_update_config, runtime_config_view, RuntimeConfigHttpError,
+    RuntimeConfigHttpResult,
+};

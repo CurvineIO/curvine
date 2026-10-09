@@ -22,6 +22,7 @@ clap = { workspace = true }
 log = { workspace = true }
 if-addrs = { workspace = true }
 regex = { workspace = true }
+serde_json = { workspace = true }
 
 [features]
 default = []

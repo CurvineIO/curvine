@@ -15,20 +15,26 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use axum::extract::{Extension, Query};
 use axum::http::StatusCode;
-use axum::routing::get;
-use axum::Router;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use curvine_config::RuntimeConfigRegistry;
 use curvine_metrics::Metrics;
 use curvine_web::router::RouterHandler;
+use curvine_web::router::{get_runtime_config, post_update_config, RuntimeConfigHttpResult};
 use log::warn;
+use serde_json::Value;
 
 use crate::transfer::{ClusterMetadataCache, TransferService, TransferStoreBackend};
 
+#[derive(Clone)]
 pub struct TransferRouterHandler {
     ready: Arc<AtomicBool>,
     store_backend: &'static str,
     service: TransferService<TransferStoreBackend>,
     cluster_cache: ClusterMetadataCache,
+    runtime_config: Arc<RuntimeConfigRegistry>,
 }
 
 impl TransferRouterHandler {
@@ -37,12 +43,14 @@ impl TransferRouterHandler {
         store_backend: &'static str,
         service: TransferService<TransferStoreBackend>,
         cluster_cache: ClusterMetadataCache,
+        runtime_config: Arc<RuntimeConfigRegistry>,
     ) -> Self {
         Self {
             ready,
             store_backend,
             service,
             cluster_cache,
+            runtime_config,
         }
     }
 }
@@ -96,12 +104,26 @@ async fn readyz(
     (StatusCode::OK, "ok\n".to_string())
 }
 
+async fn runtime_config(
+    Extension(handler): Extension<Arc<TransferRouterHandler>>,
+) -> RuntimeConfigHttpResult<Json<Value>> {
+    get_runtime_config(handler.runtime_config.clone(), Value::Null).await
+}
+
+async fn update_runtime_config(
+    Extension(handler): Extension<Arc<TransferRouterHandler>>,
+    query: Query<Vec<(String, String)>>,
+) -> RuntimeConfigHttpResult<Json<Value>> {
+    post_update_config(handler.runtime_config.clone(), query, Value::Null).await
+}
+
 impl RouterHandler for TransferRouterHandler {
     fn router(&self) -> Router {
         let ready = self.ready.clone();
         let store_backend = self.store_backend;
         let service = self.service.clone();
         let cluster_cache = self.cluster_cache.clone();
+        let instance = Arc::new(self.clone());
         Router::new()
             .route("/healthz", get(healthz))
             .route(
@@ -116,5 +138,8 @@ impl RouterHandler for TransferRouterHandler {
                 }),
             )
             .route("/metrics", get(metrics))
+            .route("/api/v1/transfer/config", get(runtime_config))
+            .route("/api/update_config", post(update_runtime_config))
+            .layer(Extension(instance))
     }
 }

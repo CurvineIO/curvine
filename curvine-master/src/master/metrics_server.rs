@@ -16,15 +16,19 @@ use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::extract::Query;
 use axum::http::StatusCode;
-use axum::routing::get;
-use axum::{Extension, Router};
+use axum::routing::{get, post};
+use axum::{Extension, Json, Router};
+use curvine_config::RuntimeConfigRegistry;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsResult;
 use curvine_net::net::{InetAddr, NetUtils};
 use curvine_rpc::server::ServerConf;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use curvine_web::router::{get_runtime_config, post_update_config, RuntimeConfigHttpResult};
 use log::{error, info};
+use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
@@ -35,6 +39,7 @@ use crate::master::{Master, MasterState};
 #[derive(Clone)]
 struct MasterMetricsHandler {
     fs: MasterFilesystem,
+    runtime_config: Arc<RuntimeConfigRegistry>,
 }
 
 async fn metrics(Extension(handler): Extension<Arc<MasterMetricsHandler>>) -> FsResult<String> {
@@ -78,11 +83,26 @@ fn ready_status(state: MasterState) -> (StatusCode, &'static str) {
     }
 }
 
+async fn runtime_config(
+    Extension(handler): Extension<Arc<MasterMetricsHandler>>,
+) -> RuntimeConfigHttpResult<Json<Value>> {
+    get_runtime_config(handler.runtime_config.clone(), Value::Null).await
+}
+
+async fn update_runtime_config(
+    Extension(handler): Extension<Arc<MasterMetricsHandler>>,
+    query: Query<Vec<(String, String)>>,
+) -> RuntimeConfigHttpResult<Json<Value>> {
+    post_update_config(handler.runtime_config.clone(), query, Value::Null).await
+}
+
 fn metrics_router(handler: MasterMetricsHandler) -> Router {
     Router::new()
         .route("/metrics", get(metrics))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/api/v1/master/runtime/config", get(runtime_config))
+        .route("/api/update_config", post(update_runtime_config))
         .layer(Extension(Arc::new(handler)))
 }
 
@@ -93,16 +113,23 @@ pub struct MasterMetricsServer {
     fs: MasterFilesystem,
     conf: ServerConf,
     address: InetAddr,
+    runtime_config: Arc<RuntimeConfigRegistry>,
 }
 
 impl MasterMetricsServer {
-    pub fn with_rt(rt: Arc<Runtime>, conf: ServerConf, fs: MasterFilesystem) -> Self {
+    pub fn with_rt(
+        rt: Arc<Runtime>,
+        conf: ServerConf,
+        fs: MasterFilesystem,
+        runtime_config: Arc<RuntimeConfigRegistry>,
+    ) -> Self {
         let address = InetAddr::new(&conf.hostname, conf.port);
         Self {
             rt,
             fs,
             conf,
             address,
+            runtime_config,
         }
     }
 
@@ -125,8 +152,14 @@ impl MasterMetricsServer {
                     if tx.send(Ok(())).is_err() {
                         return;
                     }
-                    if let Err(err) =
-                        Self::serve(listener, self.fs, &self.conf, &self.address).await
+                    if let Err(err) = Self::serve(
+                        listener,
+                        self.fs,
+                        self.runtime_config.clone(),
+                        &self.conf,
+                        &self.address,
+                    )
+                    .await
                     {
                         error!("Master metrics server serve error: {err}");
                     }
@@ -158,6 +191,7 @@ impl MasterMetricsServer {
     async fn serve(
         listener: TcpListener,
         fs: MasterFilesystem,
+        runtime_config: Arc<RuntimeConfigRegistry>,
         conf: &ServerConf,
         address: &InetAddr,
     ) -> CommonResult<()> {
@@ -165,14 +199,21 @@ impl MasterMetricsServer {
             "Master metrics server [{}] listening on {}",
             conf.name, address
         );
-        let app = metrics_router(MasterMetricsHandler { fs });
+        let app = metrics_router(MasterMetricsHandler { fs, runtime_config });
         axum::serve(listener, app).await?;
         Ok(())
     }
 
     async fn run(self) -> CommonResult<()> {
         let listener = Self::bind_listener(&self).await?;
-        Self::serve(listener, self.fs, &self.conf, &self.address).await
+        Self::serve(
+            listener,
+            self.fs,
+            self.runtime_config,
+            &self.conf,
+            &self.address,
+        )
+        .await
     }
 }
 
