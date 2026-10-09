@@ -113,6 +113,11 @@ pub struct FuseConf {
     #[client_cli(long = "tasks-per-mnt", alias = "mnt-per-task")]
     pub tasks_per_mnt: usize,
 
+    /// Request dispatch mode: "v1" awaits stream dispatch and spawns metadata
+    /// tasks; "v2" drives both concurrently with FuturesUnordered. Default: "v2".
+    #[client_cli]
+    pub dispatch_mode: String,
+
     // Whether to enable the clone fd feature
     #[client_cli]
     pub clone_fd: bool,
@@ -338,6 +343,12 @@ impl FuseConf {
     pub const DEFAULT_MAX_READAHEAD_KB: u32 = 1024;
 
     pub fn init(&mut self) -> CommonResult<()> {
+        if !matches!(self.dispatch_mode.as_str(), "v1" | "v2") {
+            return err_box!(
+                "fuse.dispatch_mode must be v1 or v2, got {}",
+                self.dispatch_mode
+            );
+        }
         if self.io_threads == 0 {
             return err_box!("fuse.io_threads must be > 0");
         }
@@ -724,6 +735,7 @@ impl Default for FuseConf {
             fs_path: "/".to_string(),
             mnt_number: 1,
             tasks_per_mnt: 0,
+            dispatch_mode: "v2".to_string(),
             clone_fd: true,
             fuse_channel_size: 0,
             stream_channel_size: 0,

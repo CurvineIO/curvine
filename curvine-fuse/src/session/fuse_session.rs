@@ -170,13 +170,14 @@ impl<T: FileSystem> FuseSession<T> {
 
         info!(
             "Create fuse session, git version: {}, mnt number: {}, loop task number: {},\
-         io threads: {}, worker threads: {}, fuse channel size: {}",
+         io threads: {}, worker threads: {}, fuse channel size: {}, dispatch_mode: {}",
             GIT_VERSION,
             conf.mnt_number,
             channels[0].senders.len(),
             rt.io_threads(),
             rt.worker_threads(),
             conf.fuse_channel_size,
+            conf.dispatch_mode,
         );
 
         let session = Self {

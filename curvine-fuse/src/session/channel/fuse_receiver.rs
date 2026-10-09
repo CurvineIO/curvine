@@ -31,6 +31,7 @@ use curvine_runtime::sync::channel::AsyncSender;
 use curvine_runtime::sync::FastDashMap;
 use curvine_sys as sys;
 use curvine_sys::pipe::{AsyncFd, Pipe2};
+use futures::stream::{FuturesUnordered, StreamExt};
 use libc::{EAGAIN, ECONNABORTED, EINTR, ENODEV, ENOENT};
 use log::{debug, error, info, warn};
 use std::future::Future;
@@ -42,6 +43,22 @@ enum ReceiveOutcome {
     Request(FuseRequest),
     Continue,
     Exit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DispatchMode {
+    V1,
+    V2,
+}
+
+impl DispatchMode {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "v1" => Some(Self::V1),
+            "v2" => Some(Self::V2),
+            _ => None,
+        }
+    }
 }
 
 /// Removes an interruptible-request registration when its dispatch future ends.
@@ -95,6 +112,7 @@ pub struct FuseReceiver<T> {
     kernel_fd: Arc<AsyncFd>,
     fs: Arc<T>,
     rt: Arc<Runtime>,
+    dispatch_mode: DispatchMode,
     sender: AsyncSender<FuseTask>,
     pipe2: Option<Pipe2>,
     buf: BytesMut,
@@ -110,6 +128,7 @@ impl<T: FileSystem> FuseReceiver<T> {
     pub(super) fn new(
         fs: Arc<T>,
         rt: Arc<Runtime>,
+        dispatch_mode: DispatchMode,
         kernel_fd: Arc<AsyncFd>,
         sender: AsyncSender<FuseTask>,
         buf_size: usize,
@@ -130,6 +149,7 @@ impl<T: FileSystem> FuseReceiver<T> {
             kernel_fd,
             fs,
             rt,
+            dispatch_mode,
             sender,
             pipe2,
             buf,
@@ -439,6 +459,9 @@ impl<T: FileSystem> FuseReceiver<T> {
     }
 
     pub async fn start(mut self, mut shutdown_rx: watch::Receiver<bool>) -> FuseResult<()> {
+        if self.dispatch_mode == DispatchMode::V2 {
+            return self.run_v2(shutdown_rx).await;
+        }
         loop {
             let wait_start = self.metrics_enabled.then(mono_now);
             tokio::select! {
@@ -457,6 +480,48 @@ impl<T: FileSystem> FuseReceiver<T> {
             }
         }
         Ok(())
+    }
+
+    async fn run_v2(mut self, mut shutdown_rx: watch::Receiver<bool>) -> FuseResult<()> {
+        let mut tasks = FuturesUnordered::new();
+        loop {
+            let wait_start = self.metrics_enabled.then(mono_now);
+            let Some(res) = self.wait_next_receive(&mut shutdown_rx, &mut tasks).await else {
+                break;
+            };
+            match self.on_receive(res, wait_start)? {
+                ReceiveOutcome::Request(req) => {
+                    let is_stream = req.is_stream();
+                    tasks.push(self.new_dispatch_task(req, is_stream));
+                }
+                ReceiveOutcome::Continue => {}
+                ReceiveOutcome::Exit => break,
+            }
+        }
+        Ok(())
+    }
+
+    async fn wait_next_receive<F>(
+        &mut self,
+        shutdown_rx: &mut watch::Receiver<bool>,
+        tasks: &mut FuturesUnordered<F>,
+    ) -> Option<IOResult<BytesMut>>
+    where
+        F: Future<Output = ()>,
+    {
+        let receive = self.receive();
+        tokio::pin!(receive);
+        loop {
+            tokio::select! {
+                res = receive.as_mut() => return Some(res),
+                Some(()) = tasks.next(), if !tasks.is_empty() => continue,
+                changed = shutdown_rx.changed() => {
+                    if Self::should_exit_on_shutdown(changed, shutdown_rx) {
+                        return None;
+                    }
+                }
+            }
+        }
     }
 
     fn should_exit_on_shutdown<E>(
@@ -755,7 +820,7 @@ fn receive_error_labels(os_errno: Option<i32>) -> (&'static str, &'static str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{receive_error_labels, FuseReceiver, PendingRequestGuard};
+    use super::{receive_error_labels, DispatchMode, FuseReceiver, PendingRequestGuard};
     use crate::fs::TestFileSystem;
     use crate::fuse_metrics::{RECEIVE_ACTION_CONTINUE, RECEIVE_ACTION_EXIT};
     use bytes::BytesMut;
@@ -771,6 +836,11 @@ mod tests {
 
     #[test]
     fn receiver_exits_when_shutdown_channel_closes() {
+        receiver_exits_when_shutdown_channel_closes_with_mode(DispatchMode::V1);
+        receiver_exits_when_shutdown_channel_closes_with_mode(DispatchMode::V2);
+    }
+
+    fn receiver_exits_when_shutdown_channel_closes_with_mode(mode: DispatchMode) {
         let rt = Arc::new(AsyncRuntime::single());
         rt.clone().block_on(async move {
             let [read_fd, write_fd] = sys::pipe2(4096).unwrap();
@@ -781,6 +851,7 @@ mod tests {
             let receiver = FuseReceiver::new(
                 Arc::new(TestFileSystem::new(Default::default())),
                 rt.clone(),
+                mode,
                 kernel_fd,
                 sender,
                 4096,

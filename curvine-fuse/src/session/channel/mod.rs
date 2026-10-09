@@ -25,6 +25,7 @@ use curvine_sys::pipe::{Pipe2, PipeFd};
 use std::sync::Arc;
 
 mod fuse_receiver;
+use self::fuse_receiver::DispatchMode;
 pub use self::fuse_receiver::FuseReceiver;
 
 mod fuse_sender;
@@ -69,6 +70,18 @@ impl<T: FileSystem> FuseChannel<T> {
         let mut senders = Vec::with_capacity(tasks_per_mnt);
         let pending_requests = Arc::new(FastDashMap::default());
         let mnt_label = mnt.path.to_string_lossy().into_owned();
+
+        let dispatch_mode = DispatchMode::parse(&conf.dispatch_mode).ok_or_else(|| {
+            FuseError::from_errno_msg(
+                libc::EINVAL,
+                err_msg!(
+                    "fuse.dispatch_mode must be v1 or v2, got '{}'",
+                    conf.dispatch_mode
+                )
+                .into(),
+            )
+        })?;
+
         for idx in 0..tasks_per_mnt {
             let (tx, rx) = AsyncChannel::new(conf.fuse_channel_size).split();
             let fd = mnt.create_async_task_fd(conf.clone_fd)?;
@@ -90,6 +103,7 @@ impl<T: FileSystem> FuseChannel<T> {
             let receiver = FuseReceiver::new(
                 fs.clone(),
                 rt.clone(),
+                dispatch_mode,
                 fd,
                 tx,
                 buf_size,
