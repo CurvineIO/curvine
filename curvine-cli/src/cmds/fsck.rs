@@ -40,20 +40,36 @@ impl FsckCommand {
             return err_box!("fsck directory traversal is not supported yet; pass a file path");
         }
 
-        let details = if should_inspect_blocks(&status) {
-            client.get_file_block_details(&path).await?
-        } else {
-            FileBlockDetails {
-                status,
-                blocks: Vec::new(),
-            }
-        };
-        Ok(render_file(details))
+        if let Some(reason) = block_inspection_skip_reason(&status) {
+            return Ok(render_skipped_file(status, reason));
+        }
+
+        Ok(render_file(client.get_file_block_details(&path).await?))
     }
 }
 
-fn should_inspect_blocks(status: &FileStatus) -> bool {
-    status.file_type == FileType::File && !status.storage_policy.ufs_only()
+fn block_inspection_skip_reason(status: &FileStatus) -> Option<&'static str> {
+    if status.file_type != FileType::File {
+        Some("file type is not a regular file")
+    } else if status.storage_policy.ufs_only() {
+        Some("file is UFS-only")
+    } else {
+        None
+    }
+}
+
+fn render_skipped_file(status: FileStatus, reason: &str) -> String {
+    let mut output = String::new();
+    writeln!(output, "File: {}", status.path).unwrap();
+    writeln!(
+        output,
+        "Size: {} | Blocks: 0 | Expected replicas: {}",
+        ByteUnit::byte_to_string(status.len.max(0) as u64),
+        status.replicas.max(0)
+    )
+    .unwrap();
+    writeln!(output, "Block inspection skipped: {reason}").unwrap();
+    output
 }
 
 fn file_has_warnings(details: &mut FileBlockDetails) -> bool {
@@ -298,13 +314,13 @@ mod tests {
     #[test]
     fn only_regular_non_ufs_files_are_block_inspected() {
         let mut status = FileStatus::default();
-        assert!(should_inspect_blocks(&status));
+        assert!(block_inspection_skip_reason(&status).is_none());
 
         status.storage_policy = StoragePolicy {
             state: StorageState::Both,
             ..Default::default()
         };
-        assert!(should_inspect_blocks(&status));
+        assert!(block_inspection_skip_reason(&status).is_none());
 
         for file_type in [
             FileType::Dir,
@@ -318,7 +334,10 @@ mod tests {
             FileType::Socket,
         ] {
             status.file_type = file_type;
-            assert!(!should_inspect_blocks(&status), "inspected {file_type:?}");
+            assert!(
+                block_inspection_skip_reason(&status).is_some(),
+                "inspected {file_type:?}"
+            );
         }
 
         status.file_type = FileType::File;
@@ -326,6 +345,39 @@ mod tests {
             state: StorageState::Ufs,
             ..Default::default()
         };
-        assert!(!should_inspect_blocks(&status));
+        assert!(block_inspection_skip_reason(&status).is_some());
+    }
+
+    #[test]
+    fn ufs_only_file_reports_block_inspection_skipped() {
+        let status = FileStatus {
+            path: "/ufs-only".to_string(),
+            len: 100,
+            replicas: 1,
+            storage_policy: StoragePolicy {
+                state: StorageState::Ufs,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let output = render_skipped_file(status, "file is UFS-only");
+
+        assert!(output.contains("Block inspection skipped: file is UFS-only"));
+        assert!(!output.contains("Status: OK"));
+    }
+
+    #[test]
+    fn non_regular_file_reports_block_inspection_skipped() {
+        let status = FileStatus {
+            path: "/link".to_string(),
+            file_type: FileType::Link,
+            ..Default::default()
+        };
+
+        let output = render_skipped_file(status, "file type is not a regular file");
+
+        assert!(output.contains("Block inspection skipped: file type is not a regular file"));
+        assert!(!output.contains("Status: OK"));
     }
 }
