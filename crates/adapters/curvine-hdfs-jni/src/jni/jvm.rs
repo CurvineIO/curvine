@@ -43,15 +43,28 @@
 //! - `HADOOP_CONF_DIR`: Hadoop configuration directory (added to classpath)
 //! - `JVM_HEAP_SIZE`: Custom JVM heap size (e.g., "2g", "512m")
 
-use anyhow::{Context, Result};
-use std::env;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
-use tracing::{error, info, warn};
-
 #[cfg(feature = "jni")]
-use jni::{AttachGuard, InitArgsBuilder, JNIEnv, JNIVersion, JavaVM};
+use anyhow::Context;
+use anyhow::Result;
+#[cfg(feature = "jni")]
+use std::env;
+#[cfg(feature = "jni")]
+use std::path::{Path, PathBuf};
+#[cfg(feature = "jni")]
+use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(feature = "jni")]
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use tracing::warn;
+#[cfg(feature = "jni")]
+use tracing::{error, info};
+
+// JavaVM stays in the public API (JVM_BUILDER, register_jvm) either way, so it
+// is imported unconditionally; the remaining jni types only appear behind the
+// feature.
+use jni::JavaVM;
+#[cfg(feature = "jni")]
+use jni::{AttachGuard, InitArgsBuilder, JNIEnv, JNIVersion};
 
 pub static JVM: JavaVmWrapper = JavaVmWrapper;
 
@@ -151,7 +164,7 @@ impl JavaVmWrapper {
 
         // Try to initialize JVM
         info!("Initializing JVM for HDFS operations (thread-safe initialization)");
-        let jvm = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| builder())) {
+        let jvm = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(builder)) {
             Ok(jvm) => {
                 info!("JVM initialized successfully on attempt {}", attempt);
                 jvm
@@ -201,6 +214,7 @@ impl JavaVmWrapper {
     }
 }
 
+#[cfg(feature = "jni")]
 const DEFAULT_MEMORY_PROPORTION: f64 = 0.1;
 
 /// Locate HDFS libraries path from environment variables or default location
@@ -216,6 +230,7 @@ const DEFAULT_MEMORY_PROPORTION: f64 = 0.1;
 ///
 /// # Errors
 /// Returns error if unable to determine executable path for default location
+#[cfg(feature = "jni")]
 fn locate_hdfs_libs_path() -> Result<PathBuf> {
     // First priority: explicit connector libs path
     if let Ok(libs_path) = env::var("CONNECTOR_LIBS_PATH") {
@@ -258,6 +273,7 @@ fn locate_hdfs_libs_path() -> Result<PathBuf> {
 ///
 /// # Returns
 /// Available memory in bytes
+#[cfg(feature = "jni")]
 fn get_available_memory() -> usize {
     if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
         for line in meminfo.lines() {
@@ -295,7 +311,7 @@ fn scan_jar_files(dir: &PathBuf) -> Result<Vec<String>> {
 
     for entry in entries.flatten() {
         let entry_path = entry.path();
-        if entry_path.extension().map_or(false, |ext| ext == "jar") {
+        if entry_path.extension().is_some_and(|ext| ext == "jar") {
             if let Ok(canonical_path) = std::fs::canonicalize(&entry_path) {
                 if let Some(path_str) = canonical_path.to_str() {
                     jars.push(path_str.to_owned());
@@ -310,7 +326,7 @@ fn scan_jar_files(dir: &PathBuf) -> Result<Vec<String>> {
 
 /// Build classpath for HDFS operations
 #[cfg(feature = "jni")]
-fn build_classpath(libs_path: &PathBuf) -> Result<Vec<String>> {
+fn build_classpath(libs_path: &Path) -> Result<Vec<String>> {
     let mut class_vec = Vec::new();
 
     // Add HADOOP_CONF_DIR to classpath if available
@@ -326,7 +342,7 @@ fn build_classpath(libs_path: &PathBuf) -> Result<Vec<String>> {
         libs_path.join("hdfs"),
         libs_path.join("hdfs").join("lib"),
         libs_path.join("client"),
-        libs_path.clone(),
+        libs_path.to_path_buf(),
     ];
 
     // Scan each directory for JAR files
@@ -452,7 +468,7 @@ pub fn load_jvm_memory_stats() -> (usize, usize) {
     {
         match JVM.get() {
             Some(jvm) => {
-                let result: Result<(usize, usize), anyhow::Error> = (|| {
+                let result: Result<(usize, usize), anyhow::Error> =
                     execute_with_jni_env(jvm, |env| {
                         let runtime_instance = crate::call_static_method!(
                             env,
@@ -473,8 +489,7 @@ pub fn load_jvm_memory_stats() -> (usize, usize) {
                         )?;
 
                         Ok((total_memory as usize, (total_memory - free_memory) as usize))
-                    })
-                })();
+                    });
 
                 match result {
                     Ok(ret) => ret,

@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// UnifiedFileSystem async bodies exceed the default query recursion budget
+// when this test target is type-checked.
+#![recursion_limit = "256"]
+
 //! Integration tests for `FallbackFsReader`.
 //!
 //! # Test Plan

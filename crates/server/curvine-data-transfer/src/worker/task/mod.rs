@@ -27,6 +27,10 @@ mod task_progress_reporter_test;
 mod task_manager;
 pub use self::task_manager::{TaskManager, WORKER_AT_CAPACITY_REJECT_PREFIX};
 
+#[cfg(test)]
+#[path = "tests/task_manager_test.rs"]
+mod task_manager_test;
+
 mod task_store;
 pub use self::task_store::TaskStore;
 

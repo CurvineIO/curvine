@@ -112,9 +112,10 @@ impl TaskManager {
     ///
     /// # Behavior
     ///
-    /// - Modifies client hostname to "localhost" to prevent local write priority
-    /// - This ensures data distribution across all workers instead of local bias
-    /// - Initializes filesystem client with the modified configuration
+    /// - Initializes the filesystem client with the worker's own configuration;
+    ///   `client.hostname` stays equal to `worker.hostname` so the master
+    ///   reports the local worker as the client host and block writes can take
+    ///   the short-circuit path
     /// - Sets up task store and timing configurations from job settings
     /// - **Concurrency Control**: Uses a Semaphore to limit concurrent load tasks
     ///   based on `conf.job.load_task_concurrency_limit` to prevent excessive
@@ -132,10 +133,11 @@ impl TaskManager {
         conf: &ClusterConf,
         worker_session_id: impl Into<String>,
     ) -> FsResult<Self> {
-        let mut new_conf = conf.clone();
-        new_conf.client.hostname = "localhost".to_string();
-
-        let fs = CurvineFileSystem::with_rt(new_conf, rt.clone())?;
+        // Do not override client.hostname here: it must stay equal to
+        // worker.hostname on this node, otherwise `is_local_worker` never
+        // matches and every chunk loops through the worker RPC port instead of
+        // short-circuiting to the local disk.
+        let fs = CurvineFileSystem::with_rt(conf.clone(), rt.clone())?;
         let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
         let transfer_client = TransferClient::with_context(&fs.fs_context()).ok();
         let worker_task_semaphore = Arc::new(Semaphore::new(conf.job.worker_max_concurrent_tasks));
