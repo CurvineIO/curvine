@@ -1,6 +1,6 @@
 use curvine_model::{
     BlockReplicaDetail, FileBlockDetail, FileBlockDetails, FileStatus, ProtoUtils, StorageType,
-    WorkerAddress,
+    WorkerAddress, WorkerStatus,
 };
 
 #[test]
@@ -26,11 +26,31 @@ fn file_block_details_proto_preserves_actual_replica_storage() {
                         rpc_port: 50010,
                         web_port: 50011,
                     }),
+                    state: WorkerStatus::Live,
                 },
                 BlockReplicaDetail {
                     worker_id: 2,
                     storage_type: StorageType::Disk,
                     address: None,
+                    state: WorkerStatus::Unknown,
+                },
+                BlockReplicaDetail {
+                    worker_id: 3,
+                    storage_type: StorageType::Mem,
+                    address: None,
+                    state: WorkerStatus::Blacklist,
+                },
+                BlockReplicaDetail {
+                    worker_id: 4,
+                    storage_type: StorageType::Ssd,
+                    address: None,
+                    state: WorkerStatus::Decommission,
+                },
+                BlockReplicaDetail {
+                    worker_id: 5,
+                    storage_type: StorageType::Disk,
+                    address: None,
+                    state: WorkerStatus::Lost,
                 },
             ],
         }],
@@ -59,4 +79,37 @@ fn file_block_details_proto_preserves_actual_replica_storage() {
         StorageType::Disk
     );
     assert!(restored.blocks[0].replicas[1].address.is_none());
+    let states = restored.blocks[0]
+        .replicas
+        .iter()
+        .map(|replica| (replica.worker_id, replica.state))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        states,
+        vec![
+            (1, WorkerStatus::Live),
+            (2, WorkerStatus::Unknown),
+            (3, WorkerStatus::Blacklist),
+            (4, WorkerStatus::Decommission),
+            (5, WorkerStatus::Lost),
+        ]
+    );
+}
+
+#[test]
+fn block_replica_detail_deserializes_missing_state_as_unknown() {
+    let json = r#"
+        {
+            "worker_id": 2,
+            "storage_type": "Disk",
+            "address": null
+        }
+    "#;
+
+    let replica: BlockReplicaDetail = serde_json::from_str(json).unwrap();
+
+    assert_eq!(replica.worker_id, 2);
+    assert_eq!(replica.storage_type, StorageType::Disk);
+    assert!(replica.address.is_none());
+    assert_eq!(replica.state, WorkerStatus::Unknown);
 }

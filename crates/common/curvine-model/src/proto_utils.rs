@@ -319,6 +319,7 @@ impl ProtoUtils {
                         worker_id: replica.worker_id,
                         storage_type: replica.storage_type.into(),
                         address: replica.address.as_ref().map(Self::worker_address_to_pb),
+                        state: Some(Self::worker_status_to_pb(replica.state) as i32),
                     })
                     .collect(),
             })
@@ -345,6 +346,7 @@ impl ProtoUtils {
                         worker_id: replica.worker_id,
                         storage_type: StorageType::from(replica.storage_type),
                         address: replica.address.as_ref().map(Self::worker_address_from_pb),
+                        state: Self::worker_status_from_pb(replica.state),
                     })
                     .collect(),
             })
@@ -353,6 +355,30 @@ impl ProtoUtils {
         FileBlockDetails {
             status: Self::file_status_from_pb(src.status),
             blocks,
+        }
+    }
+
+    fn worker_status_to_pb(src: WorkerStatus) -> WorkerStatusProto {
+        match src {
+            WorkerStatus::Unknown => WorkerStatusProto::WorkerStatusUnknown,
+            WorkerStatus::Live => WorkerStatusProto::WorkerStatusLive,
+            WorkerStatus::Blacklist => WorkerStatusProto::WorkerStatusBlacklist,
+            WorkerStatus::Decommission => WorkerStatusProto::WorkerStatusDecommission,
+            WorkerStatus::Lost => WorkerStatusProto::WorkerStatusLost,
+        }
+    }
+
+    fn worker_status_from_pb(src: Option<i32>) -> WorkerStatus {
+        match src.unwrap_or(WorkerStatusProto::WorkerStatusUnknown as i32) {
+            value if value == WorkerStatusProto::WorkerStatusLive as i32 => WorkerStatus::Live,
+            value if value == WorkerStatusProto::WorkerStatusBlacklist as i32 => {
+                WorkerStatus::Blacklist
+            }
+            value if value == WorkerStatusProto::WorkerStatusDecommission as i32 => {
+                WorkerStatus::Decommission
+            }
+            value if value == WorkerStatusProto::WorkerStatusLost as i32 => WorkerStatus::Lost,
+            _ => WorkerStatus::Unknown,
         }
     }
 

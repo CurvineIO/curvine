@@ -24,6 +24,10 @@ pub enum Commands {
     #[command(name = "fs")]
     Fs(FsCommand),
 
+    /// Inspect block replica health
+    #[command(name = "fsck")]
+    Fsck(FsckCommand),
+
     #[command(name = "report")]
     Report(ReportCommand),
 

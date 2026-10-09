@@ -2603,6 +2603,7 @@ dependencies = [
  "num_enum",
  "prost 0.11.9",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

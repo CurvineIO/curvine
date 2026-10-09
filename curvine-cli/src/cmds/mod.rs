@@ -15,6 +15,7 @@
 mod bench;
 mod export;
 mod fs;
+mod fsck;
 mod load;
 mod load_cancel;
 mod load_status;
@@ -27,6 +28,7 @@ mod umount;
 pub use bench::BenchCommand;
 pub use export::ExportCommand;
 pub use fs::FsCommand;
+pub use fsck::FsckCommand;
 pub use load::LoadCommand;
 pub use load_cancel::CancelLoadCommand;
 pub use load_status::LoadStatusCommand;
