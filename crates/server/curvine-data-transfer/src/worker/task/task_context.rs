@@ -15,7 +15,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-use curvine_model::{JobTaskProgress, JobTaskState, LoadTaskInfo};
+use curvine_model::{JobTaskProgress, JobTaskState, LoadTaskInfo, TaskBlockLocation};
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::sync::StateCtl;
 
@@ -66,6 +66,7 @@ impl TaskContext {
             message: lock.message.clone(),
             accepted_at_ms: lock.accepted_at_ms,
             first_byte_at_ms: lock.first_byte_at_ms,
+            block_locations: lock.block_locations.clone(),
         }
     }
 
@@ -80,6 +81,7 @@ impl TaskContext {
                 message: lock.message.clone(),
                 accepted_at_ms: lock.accepted_at_ms,
                 first_byte_at_ms: lock.first_byte_at_ms,
+                block_locations: lock.block_locations.clone(),
             };
         }
 
@@ -95,6 +97,7 @@ impl TaskContext {
             message: lock.message.clone(),
             accepted_at_ms: lock.accepted_at_ms,
             first_byte_at_ms: lock.first_byte_at_ms,
+            block_locations: lock.block_locations.clone(),
         }
     }
 
@@ -113,6 +116,7 @@ impl TaskContext {
             message: lock.message.clone(),
             accepted_at_ms: lock.accepted_at_ms,
             first_byte_at_ms: lock.first_byte_at_ms,
+            block_locations: lock.block_locations.clone(),
         }
     }
 
@@ -138,6 +142,7 @@ impl TaskContext {
             message: lock.message.clone(),
             accepted_at_ms: lock.accepted_at_ms,
             first_byte_at_ms: lock.first_byte_at_ms,
+            block_locations: lock.block_locations.clone(),
         }
     }
 
@@ -194,6 +199,14 @@ impl TaskContext {
         }
     }
 
+    /// Record one block this task wrote and the workers holding it (segment
+    /// tasks, after the block completed). The terminal progress snapshot
+    /// carries them to the scheduler for file finalize.
+    pub fn push_block_location(&self, location: TaskBlockLocation) {
+        let mut lock = self.progress_lock();
+        lock.block_locations.push(location);
+    }
+
     pub fn update_state(&self, state: JobTaskState, message: impl Into<String>) {
         let mut lock = self.progress_lock();
         if self.is_cancel() && state != JobTaskState::Canceled {
@@ -220,6 +233,7 @@ impl TaskContext {
                 message: lock.message.clone(),
                 accepted_at_ms: lock.accepted_at_ms,
                 first_byte_at_ms: lock.first_byte_at_ms,
+                block_locations: lock.block_locations.clone(),
             };
         }
 
@@ -240,6 +254,7 @@ impl TaskContext {
             message: lock.message.clone(),
             accepted_at_ms: lock.accepted_at_ms,
             first_byte_at_ms: lock.first_byte_at_ms,
+            block_locations: lock.block_locations.clone(),
         }
     }
 }

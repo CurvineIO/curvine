@@ -95,6 +95,7 @@ fn running_store_for<S: TransferStore>(store: Arc<S>) -> (Arc<S>, TransferJobRec
         stale_deadline_at: 0,
         accepted_at_ms: 0,
         first_byte_at_ms: 0,
+        block_locations: Vec::new(),
         updated_at: 1,
         replace_target: false,
     };
@@ -153,6 +154,7 @@ fn progress_report(
         accepted_at_ms: None,
         first_byte_at_ms: None,
         attempt_started_at_ms: None,
+        block_locations: Vec::new(),
     }
 }
 
@@ -331,6 +333,7 @@ fn assert_status_uses_task_summary_and_store_pagination<S: TransferStore>(
                 stale_deadline_at: 1_000,
                 accepted_at_ms: 0,
                 first_byte_at_ms: 0,
+                block_locations: Vec::new(),
             })
             .unwrap());
     }
@@ -432,6 +435,7 @@ fn assert_stale_marking_does_not_overwrite_fresh_report<S: TransferStore>(
             stale_deadline_at: 2_000,
             accepted_at_ms: 0,
             first_byte_at_ms: 0,
+            block_locations: Vec::new(),
         })
         .unwrap());
 
@@ -536,6 +540,7 @@ fn assert_batched_report_write_contract<S: TransferStore>(store: Arc<S>, job: Tr
             stale_deadline_at: 2_000,
             accepted_at_ms: 0,
             first_byte_at_ms: 0,
+            block_locations: Vec::new(),
         });
     }
     // Stale attempt: the fencing predicate rejects it while the others land.

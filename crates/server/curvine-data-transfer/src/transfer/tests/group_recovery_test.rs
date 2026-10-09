@@ -62,6 +62,7 @@ fn task(job_id: &str, task_id: &str, total: i64) -> TransferTaskRecord {
         attempt_started_at: 0,
         accepted_at_ms: 0,
         first_byte_at_ms: 0,
+        block_locations: Vec::new(),
         last_report_at: 0,
         stale_deadline_at: 0,
         updated_at: 1,
@@ -144,6 +145,7 @@ fn running_report(
         stale_deadline_at: 2_000,
         accepted_at_ms: 0,
         first_byte_at_ms: 0,
+        block_locations: Vec::new(),
     }
 }
 

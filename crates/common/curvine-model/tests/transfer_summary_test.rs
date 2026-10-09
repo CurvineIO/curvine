@@ -35,6 +35,7 @@ fn task(
         accepted_at_ms: 0,
         first_byte_at_ms: 0,
         replace_target: false,
+        block_locations: Vec::new(),
     }
 }
 

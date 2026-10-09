@@ -211,6 +211,14 @@ message RetryTransferRequest {
   required string job_id = 1;
 }
 
+// One block a segment task wrote, with the workers holding it. Terminal
+// reports carry these so the scheduler can commit real block locations when
+// finalizing the segmented target file; older workers omit them.
+message TaskBlockLocationProto {
+  required int64 block_id = 1;
+  repeated uint32 worker_ids = 2;
+}
+
 message TransferTaskReportRequest {
   required string job_id = 1;
   required uint64 run_id = 2;
@@ -230,6 +238,8 @@ message TransferTaskReportRequest {
   // the dispatch request. Phase metrics use it instead of reading the task
   // row; old workers omit it and the service falls back to that read.
   optional int64 attempt_started_at_ms = 12;
+  // Segment tasks: blocks written by this attempt (terminal reports only).
+  repeated TaskBlockLocationProto block_locations = 13;
 }
 
 message TransferTaskReportResponse {
@@ -259,4 +269,5 @@ message QueryTransferTaskResponse {
   required bool found = 1;
   required TransferTaskStateProto state = 2;
   required TransferProgressProto progress = 3;
+  repeated TaskBlockLocationProto block_locations = 4;
 }

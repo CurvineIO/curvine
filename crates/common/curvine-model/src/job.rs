@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::state::{MountInfo, StorageType, TtlAction, WorkerAddress};
+use crate::transfer::TaskBlockLocation;
 use curvine_runtime::common::ByteUnit;
 use num_enum::{FromPrimitive, IntoPrimitive};
 use serde::{Deserialize, Serialize};
@@ -354,6 +355,12 @@ pub struct JobTaskProgress {
     /// First source byte time (ms since epoch, 0 = unknown).
     #[serde(default)]
     pub first_byte_at_ms: i64,
+    /// Segment tasks only: blocks this task actually wrote and the workers
+    /// holding them. Terminal reports carry them so the scheduler can commit
+    /// real locations when finalizing the target file; running reports leave
+    /// it empty.
+    #[serde(default)]
+    pub block_locations: Vec<TaskBlockLocation>,
 }
 
 impl Default for JobTaskProgress {
@@ -366,6 +373,7 @@ impl Default for JobTaskProgress {
             message: String::new(),
             accepted_at_ms: 0,
             first_byte_at_ms: 0,
+            block_locations: Vec::new(),
         }
     }
 }

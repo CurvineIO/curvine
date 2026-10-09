@@ -639,6 +639,11 @@ pub struct TransferTaskRecord {
     /// planned task rows have been persisted. Legacy records default false.
     #[serde(default)]
     pub replace_target: bool,
+    /// Segment tasks: blocks written by the completing attempt, reported via
+    /// the terminal progress and persisted here for finalize. Legacy rows
+    /// default empty.
+    #[serde(default)]
+    pub block_locations: Vec<TaskBlockLocation>,
 }
 
 /// Status-query projection. Task planning data stays in `TransferTaskRecord`;
@@ -905,6 +910,16 @@ pub fn group_resume_remaining(plan_json: &str, reported: i64) -> (i64, i64) {
     (resume, plan.group_len().saturating_sub(resume))
 }
 
+/// One block a segment task actually wrote, with the workers holding it.
+/// The scheduler aggregates these from terminal reports to commit real block
+/// locations when finalizing a segmented target file; without them the file
+/// completes with empty locations and every read must fall back to UFS.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskBlockLocation {
+    pub block_id: i64,
+    pub worker_ids: Vec<u32>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransferTaskReport {
     pub job_id: String,
@@ -921,6 +936,8 @@ pub struct TransferTaskReport {
     pub accepted_at_ms: i64,
     /// First source byte time (ms, 0 = unknown).
     pub first_byte_at_ms: i64,
+    /// Segment tasks: blocks written by this attempt (terminal reports only).
+    pub block_locations: Vec<TaskBlockLocation>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

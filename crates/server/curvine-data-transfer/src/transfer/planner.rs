@@ -878,6 +878,7 @@ impl TransferPlanner {
                 stale_deadline_at: 0,
                 updated_at: LocalTime::mills() as i64,
                 replace_target,
+                block_locations: Vec::new(),
             });
         }
         log::debug!(
@@ -994,6 +995,7 @@ impl TransferPlanner {
             stale_deadline_at: 0,
             updated_at: LocalTime::mills() as i64,
             replace_target,
+            block_locations: Vec::new(),
         });
         if tasks.len() > self.max_tasks_per_transfer {
             return err_box!(
@@ -1056,6 +1058,7 @@ impl TransferPlanner {
             stale_deadline_at: 0,
             updated_at: LocalTime::mills() as i64,
             replace_target: false,
+            block_locations: Vec::new(),
         });
         if tasks.len() > self.max_tasks_per_transfer {
             return err_box!(

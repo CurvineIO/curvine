@@ -26,9 +26,9 @@ use curvine_proto::{
     CancelTransferRequest, CancelTransferResponse, GetTransferStatusRequest,
     GetTransferStatusResponse, ListTransferTenantsRequest, ListTransferTenantsResponse,
     ListTransfersRequest, ListTransfersResponse, RetryTransferRequest, SubmitTransferRequest,
-    SubmitTransferResponse, TransferProgressProto, TransferTaskReportBatchRequest,
-    TransferTaskReportBatchResponse, TransferTaskReportRequest, TransferTaskReportResponse,
-    WatchTransferRequest, WatchTransferResponse,
+    SubmitTransferResponse, TaskBlockLocationProto, TransferProgressProto,
+    TransferTaskReportBatchRequest, TransferTaskReportBatchResponse, TransferTaskReportRequest,
+    TransferTaskReportResponse, WatchTransferRequest, WatchTransferResponse,
 };
 use curvine_rpc::client::ClusterConnector;
 use curvine_runtime::runtime::Runtime;
@@ -280,6 +280,15 @@ fn task_report_request(report: TransferTaskProgressReport) -> TransferTaskReport
         accepted_at_ms: Some(report.progress.accepted_at_ms),
         first_byte_at_ms: Some(report.progress.first_byte_at_ms),
         attempt_started_at_ms: Some(report.info.attempt_started_at_ms),
+        block_locations: report
+            .progress
+            .block_locations
+            .into_iter()
+            .map(|loc| TaskBlockLocationProto {
+                block_id: loc.block_id,
+                worker_ids: loc.worker_ids,
+            })
+            .collect(),
         protocol_version: Some(TRANSFER_PROTOCOL_VERSION),
     }
 }

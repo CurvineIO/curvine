@@ -20,9 +20,12 @@
 //! permanently unreadable (`cv_valid` rejects `ufs_mtime == 0`) and re-copied
 //! by every incremental load.
 
-use curvine_model::{TransferProgress, TransferTaskRecord, TransferTaskState};
+use curvine_model::{
+    ExtendedBlock, FileType, LocatedBlock, StorageType, TaskBlockLocation, TransferProgress,
+    TransferTaskRecord, TransferTaskState, WorkerAddress,
+};
 
-use super::scheduler::converged_segment_targets;
+use super::scheduler::{commit_block_for, converged_segment_targets, reported_block_locations};
 
 fn segment_plan(mtime: i64) -> String {
     serde_json::json!({
@@ -54,6 +57,7 @@ fn task(target: &str, plan: String, state: TransferTaskState) -> TransferTaskRec
         estimated_size: 0,
         retry_count: 0,
         replace_target: false,
+        block_locations: Vec::new(),
         accepted_at_ms: 0,
         first_byte_at_ms: 0,
         attempt_started_at: 0,
@@ -149,4 +153,85 @@ fn group_manifests_contribute_their_plan_time_mtime() {
         converged_segment_targets(&tasks),
         vec![("/t/grouped".to_string(), Some(mtime))]
     );
+}
+
+/// Regression guard for the shell-file defect: segment tasks write straight to
+/// workers and never report locations to the master, so the master layout query
+/// for a pre-allocated block carries no locations at all. Finalize must commit
+/// the worker ids the completing tasks reported instead of the (empty) ones
+/// from the layout query, otherwise the file completes as an unreadable shell
+/// (is_complete = true, every block location list empty).
+#[test]
+fn reported_task_locations_fill_empty_layout_blocks() {
+    // Layout as the master sees it: pre-allocated blocks, no locations yet.
+    let unlocated = located(1001, &[]);
+    assert!(commit_block_for(&unlocated, None).locations.is_empty());
+
+    let reported = [(1001i64, vec![7u32, 8, 9])].into_iter().collect();
+    let commit = commit_block_for(&unlocated, Some(&reported));
+    assert_eq!(commit.block_id, 1001);
+    assert_eq!(commit.block_len, 128);
+    let worker_ids: Vec<u32> = commit.locations.iter().map(|l| l.worker_id).collect();
+    assert_eq!(worker_ids, vec![7, 8, 9]);
+}
+
+#[test]
+fn layout_locations_take_precedence_over_reports() {
+    // A block that the layout query already located (previously committed by
+    // a client) must not be rewritten from stale task reports.
+    let located = located(1002, &[7]);
+    let reported = [(1002i64, vec![9])].into_iter().collect();
+    let commit = commit_block_for(&located, Some(&reported));
+    let worker_ids: Vec<u32> = commit.locations.iter().map(|l| l.worker_id).collect();
+    assert_eq!(worker_ids, vec![7]);
+}
+
+#[test]
+fn reported_block_locations_aggregate_completed_segment_tasks() {
+    let tasks = vec![
+        completed_with_locations(
+            "/t/one",
+            vec![TaskBlockLocation {
+                block_id: 1,
+                worker_ids: vec![5],
+            }],
+        ),
+        task("/t/one", segment_plan(0), TransferTaskState::Completed),
+        // Failed/pending/running reports never contribute.
+        task("/t/two", segment_plan(0), TransferTaskState::Failed),
+        // Non-segment plans never contribute.
+        task("/t/plain", String::new(), TransferTaskState::Completed),
+    ];
+    let reported = reported_block_locations(&tasks);
+    assert_eq!(reported.len(), 1);
+    assert_eq!(reported.get("/t/one").unwrap().get(&1), Some(&vec![5u32]));
+}
+
+fn completed_with_locations(target: &str, locations: Vec<TaskBlockLocation>) -> TransferTaskRecord {
+    let mut record = task(target, segment_plan(0), TransferTaskState::Completed);
+    record.block_locations = locations;
+    record
+}
+
+fn located(block_id: i64, worker_ids: &[u32]) -> LocatedBlock {
+    LocatedBlock {
+        block: ExtendedBlock {
+            id: block_id,
+            len: 128,
+            storage_type: StorageType::Disk,
+            file_type: FileType::File,
+            alloc_opts: None,
+        },
+        locs: worker_ids
+            .iter()
+            .map(|worker_id| WorkerAddress {
+                worker_id: *worker_id,
+                hostname: format!("worker-{worker_id}"),
+                ip_addr: format!("10.0.0.{worker_id}"),
+                rpc_port: 8997,
+                web_port: 9002,
+            })
+            .collect(),
+        has_spdk: false,
+    }
 }

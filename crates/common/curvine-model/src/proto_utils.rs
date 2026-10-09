@@ -781,6 +781,7 @@ impl ProtoUtils {
             message: report.message,
             accepted_at_ms: 0,
             first_byte_at_ms: 0,
+            block_locations: Vec::new(),
         }
     }
 

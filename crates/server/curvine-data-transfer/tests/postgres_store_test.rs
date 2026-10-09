@@ -200,6 +200,7 @@ fn transfer_task(job: &TransferJobRecord) -> TransferTaskRecord {
         first_byte_at_ms: 0,
         updated_at: 1,
         replace_target: false,
+        block_locations: Vec::new(),
     }
 }
 
@@ -305,6 +306,7 @@ fn postgres_store_persists_transfer_lifecycle() {
             stale_deadline_at: 90,
             accepted_at_ms: 0,
             first_byte_at_ms: 0,
+            block_locations: Vec::new(),
         })
         .unwrap());
     assert_eq!(
@@ -348,6 +350,7 @@ fn postgres_store_persists_transfer_lifecycle() {
             stale_deadline_at: 100,
             accepted_at_ms: 0,
             first_byte_at_ms: 0,
+            block_locations: Vec::new(),
         })
         .unwrap());
 
@@ -510,6 +513,7 @@ fn postgres_store_marks_only_probed_missing_attempts() {
             stale_deadline_at: 2_000,
             accepted_at_ms: 0,
             first_byte_at_ms: 0,
+            block_locations: Vec::new(),
         })
         .unwrap());
     assert!(store
@@ -864,6 +868,7 @@ fn postgres_store_does_not_backfill_historical_task_projections() {
             stale_deadline_at: 80,
             accepted_at_ms: 0,
             first_byte_at_ms: 0,
+            block_locations: Vec::new(),
         })
         .unwrap());
     assert!(!store
@@ -880,6 +885,7 @@ fn postgres_store_does_not_backfill_historical_task_projections() {
             stale_deadline_at: 70,
             accepted_at_ms: 0,
             first_byte_at_ms: 0,
+            block_locations: Vec::new(),
         })
         .unwrap());
 
@@ -920,6 +926,7 @@ fn pg_report(job: &TransferJobRecord, loaded: i64, now_ms: i64) -> TransferTaskR
         stale_deadline_at: 2_000,
         accepted_at_ms: 0,
         first_byte_at_ms: 0,
+        block_locations: Vec::new(),
     }
 }
 

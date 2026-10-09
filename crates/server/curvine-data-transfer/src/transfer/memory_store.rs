@@ -1141,6 +1141,9 @@ impl TransferStore for MemoryTransferStore {
         task.updated_at = report.now_ms;
         task.accepted_at_ms = report.accepted_at_ms;
         task.first_byte_at_ms = report.first_byte_at_ms;
+        if report.state != TransferTaskState::Running {
+            task.block_locations = report.block_locations.clone();
+        }
         Ok(true)
     }
 
@@ -1330,6 +1333,7 @@ mod tests {
             updated_at: 1,
             accepted_at_ms: 0,
             first_byte_at_ms: 0,
+            block_locations: Vec::new(),
             replace_target: false,
         }
     }
@@ -1446,6 +1450,7 @@ mod tests {
                 stale_deadline_at: 2_000,
                 accepted_at_ms: 0,
                 first_byte_at_ms: 0,
+                block_locations: Vec::new(),
             })
             .unwrap());
         assert!(store
@@ -1467,6 +1472,7 @@ mod tests {
                 stale_deadline_at: 3_000,
                 accepted_at_ms: 0,
                 first_byte_at_ms: 0,
+                block_locations: Vec::new(),
             })
             .unwrap());
 
@@ -1530,6 +1536,7 @@ mod tests {
                 stale_deadline_at: 4_000,
                 accepted_at_ms: 0,
                 first_byte_at_ms: 0,
+                block_locations: Vec::new(),
             })
             .unwrap());
         assert_eq!(

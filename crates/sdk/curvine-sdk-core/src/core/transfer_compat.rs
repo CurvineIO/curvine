@@ -159,6 +159,7 @@ pub(crate) fn job_status_from_transfer(status: GetTransferStatusResponse) -> Job
             message: status.progress.message,
             accepted_at_ms: 0,
             first_byte_at_ms: 0,
+            block_locations: Vec::new(),
         },
         total_files: counts.total_files,
         completed_files: counts.completed_files,

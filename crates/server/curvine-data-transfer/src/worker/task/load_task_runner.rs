@@ -25,8 +25,9 @@ use curvine_job_client::JobMasterClient;
 use curvine_model::transfer_failure_message;
 use curvine_model::{
     classify_transfer_plan, parse_segment_group, BatchManifest, CreateFileOptsBuilder,
-    FileAllocOpts, FileBlocks, FileStatus, JobTaskProgress, JobTaskState, SegmentGroupPlan,
-    SegmentPlan, SetAttrOptsBuilder, StorageType, TransferPlanKind, TRANSFER_TEMP_PATH_MARKER,
+    FileAllocOpts, FileBlocks, FileStatus, JobTaskProgress, JobTaskState, LocatedBlock,
+    SegmentGroupPlan, SegmentPlan, SetAttrOptsBuilder, StorageType, TaskBlockLocation,
+    TransferPlanKind, TRANSFER_TEMP_PATH_MARKER,
 };
 use curvine_runtime::common::{LocalTime, TimeSpent, Utils};
 use curvine_unified_fs::{UfsFileSystem, UnifiedReader, UnifiedWriter};
@@ -691,7 +692,7 @@ impl LoadTaskRunner {
             .await?;
         // Hold a writer record for the data-copy window so concurrent
         // readers see is_complete=false. Every path below closes it.
-        let (mut writer, write_guard) = self
+        let (mut writer, located, write_guard) = self
             .open_segment_writer(&target_path, &blocks, block_size, block_index, deadline_ms)
             .await?;
         let mut writer_completed = false;
@@ -776,6 +777,7 @@ impl LoadTaskRunner {
             }
         };
 
+        self.task.push_block_location(located_block(&located));
         let progress = self.task.update_progress(written, plan.length, true);
         if let Err(err) = self.report_progress(progress).await {
             if self.task.info.transfer_report.is_some() {
@@ -852,6 +854,17 @@ impl LoadTaskRunner {
         let segments = plan.iter_from(start_resume);
         let group_total = plan.group_len();
         self.task.update_progress(start_resume, group_total, false);
+        // A resumed attempt never reopens the segments before start_resume, so
+        // its terminal report would otherwise drop the workers of those blocks;
+        // the layout still carries the workers the previous attempt wrote to.
+        let skipped_blocks = (start_resume / plan.segment_bytes.max(1)).max(0);
+        for index in plan.first_block_index..plan.first_block_index + skipped_blocks {
+            if let Some(located) = blocks.block_locs.get(index as usize) {
+                if !located.locs.is_empty() {
+                    self.task.push_block_location(located_block(located));
+                }
+            }
+        }
         let mut committed = start_resume;
         let mut last_progress_ms = LocalTime::mills();
         // Groups execute segments sequentially in one task. One writer record
@@ -863,7 +876,7 @@ impl LoadTaskRunner {
                 .await_group_deadline(deadline_ms, self.open_unified(&source_path))
                 .await?;
             for (offset, length, block_index) in segments {
-                let writer = self
+                let (writer, located) = self
                     .prepare_segment_writer(
                         &target_path,
                         &blocks,
@@ -887,6 +900,7 @@ impl LoadTaskRunner {
                 {
                     return Ok(false);
                 }
+                self.task.push_block_location(located_block(&located));
                 committed = committed.saturating_add(length);
                 self.update_progress(committed, group_total, false).await;
                 info!(
@@ -1001,13 +1015,13 @@ impl LoadTaskRunner {
         block_size: i64,
         block_index: i64,
         deadline_ms: u64,
-    ) -> FsResult<(BlockWriterRemote, String)> {
+    ) -> FsResult<(BlockWriterRemote, LocatedBlock, String)> {
         let write_guard = self.open_writer_record(target_path, deadline_ms).await?;
-        let writer = match self
+        let (writer, located) = match self
             .prepare_segment_writer(target_path, blocks, block_size, block_index, deadline_ms)
             .await
         {
-            Ok(writer) => writer,
+            Ok(result) => result,
             Err(err) => {
                 if let Err(close_err) = self
                     .await_cleanup(self.close_writer_record_as(target_path, &write_guard))
@@ -1022,7 +1036,7 @@ impl LoadTaskRunner {
                 return Err(err);
             }
         };
-        Ok((writer, write_guard))
+        Ok((writer, located, write_guard))
     }
 
     async fn open_writer_record(&self, target_path: &Path, deadline_ms: u64) -> FsResult<String> {
@@ -1044,7 +1058,7 @@ impl LoadTaskRunner {
         block_size: i64,
         block_index: i64,
         deadline_ms: u64,
-    ) -> FsResult<BlockWriterRemote> {
+    ) -> FsResult<(BlockWriterRemote, LocatedBlock)> {
         let located = blocks.block_locs.get(block_index as usize).ok_or_else(|| {
             FsError::common(format!(
                 "segment task {} block {} not found in target layout (blocks={})",
@@ -1072,17 +1086,19 @@ impl LoadTaskRunner {
                 self.task.info.task_id, block_index
             ))
         })?;
-        self.await_group_deadline(
-            deadline_ms,
-            BlockWriterRemote::new(
-                self.fs.fs_context().as_ref(),
-                located.block.clone(),
-                worker.clone(),
-                0,
-                block_size,
-            ),
-        )
-        .await
+        let writer = self
+            .await_group_deadline(
+                deadline_ms,
+                BlockWriterRemote::new(
+                    self.fs.fs_context().as_ref(),
+                    located.block.clone(),
+                    worker.clone(),
+                    0,
+                    block_size,
+                ),
+            )
+            .await?;
+        Ok((writer, located))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1830,6 +1846,13 @@ fn xattr_equals(status: &FileStatus, key: &str, expected: &[u8]) -> bool {
         .get(key)
         .map(|actual| actual.as_slice() == expected)
         .unwrap_or(false)
+}
+
+fn located_block(located: &LocatedBlock) -> TaskBlockLocation {
+    TaskBlockLocation {
+        block_id: located.block.id,
+        worker_ids: located.locs.iter().map(|x| x.worker_id).collect(),
+    }
 }
 
 fn outcome_failed_reason(task: &TaskContext, _remove_task: bool) -> Option<&'static str> {

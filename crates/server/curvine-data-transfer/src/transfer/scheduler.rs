@@ -26,17 +26,17 @@ use curvine_error::FsResult;
 use curvine_fs_api::Path;
 use curvine_model::{
     agreed_plan_source_mtime, classify_transfer_plan, normalize_group_resume, BatchManifest,
-    LoadJobInfo, LoadTaskInfo, SetAttrOptsBuilder, TaskAttemptStart, TransferJobRecord,
-    TransferLease, TransferPlanKind, TransferProgress, TransferState, TransferStateUpdate,
-    TransferTaskRecord, TransferTaskReport, TransferTaskReportInfo, TransferTaskState,
-    WorkerInflight, WorkerInfo,
+    BlockLocation, CommitBlock, LoadJobInfo, LoadTaskInfo, LocatedBlock, SetAttrOptsBuilder,
+    TaskAttemptStart, TaskBlockLocation, TransferJobRecord, TransferLease, TransferPlanKind,
+    TransferProgress, TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport,
+    TransferTaskReportInfo, TransferTaskState, WorkerInflight, WorkerInfo,
 };
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::RpcRuntime;
 use dashmap::DashMap;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use log::{debug, error, info, warn};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -114,6 +114,48 @@ pub(crate) fn converged_segment_targets(
         .collect();
     targets.sort();
     targets
+}
+
+/// Target path → (block id → worker ids) reported by the completed segment
+/// tasks of a run. Only completed segment-task reports carry locations.
+pub(crate) fn reported_block_locations(
+    tasks: &[TransferTaskRecord],
+) -> HashMap<String, HashMap<i64, Vec<u32>>> {
+    let mut reported: HashMap<String, HashMap<i64, Vec<u32>>> = HashMap::new();
+    for task in tasks {
+        if task.state != TransferTaskState::Completed || task.block_locations.is_empty() {
+            continue;
+        }
+        if !matches!(
+            classify_transfer_plan(&task.source_read_plan_json),
+            TransferPlanKind::Segment | TransferPlanKind::SegmentGroup
+        ) {
+            continue;
+        }
+        let entry = reported.entry(task.target_path.clone()).or_default();
+        for location in &task.block_locations {
+            entry.insert(location.block_id, location.worker_ids.clone());
+        }
+    }
+    reported
+}
+
+/// Build the commit entry for one layout block. Reported worker ids win: the
+/// master layout carries no locations for blocks no client has committed yet.
+pub(crate) fn commit_block_for(
+    located: &LocatedBlock,
+    reported: Option<&HashMap<i64, Vec<u32>>>,
+) -> CommitBlock {
+    let mut commit = CommitBlock::from(located);
+    if commit.locations.is_empty() {
+        if let Some(worker_ids) = reported.and_then(|map| map.get(&located.block.id)) {
+            commit.locations = worker_ids
+                .iter()
+                .map(|worker_id| BlockLocation::new(*worker_id, located.block.storage_type))
+                .collect();
+        }
+    }
+    commit
 }
 
 fn planned_target_replacements(
@@ -1598,6 +1640,12 @@ where
         if targets.is_empty() {
             return Ok(());
         }
+        // The master keeps no locations for pre-allocated segment blocks until
+        // a commit carries them, and workers never report writes back, so the
+        // layout query alone would complete files with empty locations — shells
+        // every read must fall back to UFS from. The completing tasks report
+        // the workers they actually wrote to; commit those.
+        let mut reported = reported_block_locations(&tasks);
         let target_count = targets.len();
         let mut unstamped = 0usize;
         for (target, source_mtime) in targets {
@@ -1613,11 +1661,24 @@ where
                 );
                 continue;
             }
+            let located = reported.remove(&target);
             let commit_blocks: Vec<_> = blocks
                 .block_locs
                 .iter()
-                .map(curvine_model::CommitBlock::from)
+                .map(|block| commit_block_for(block, located.as_ref()))
                 .collect();
+            let located_blocks = commit_blocks
+                .iter()
+                .filter(|block| !block.locations.is_empty())
+                .count();
+            if located_blocks < commit_blocks.len() {
+                warn!(
+                    "finalizing segmented target file {} with {} of {} blocks unlocated: no task reported workers for them (older worker? retry?), reads of those blocks fall back to UFS",
+                    target,
+                    commit_blocks.len() - located_blocks,
+                    commit_blocks.len(),
+                );
+            }
             let block_count = commit_blocks.len();
             let file_len = blocks.status.len;
             // Stamp the plan-time UFS identity together with the completion.
@@ -1643,8 +1704,8 @@ where
                 )
                 .await?;
             info!(
-                "finalized segmented target file {} blocks={} len={} ufs_mtime_stamped={}",
-                target, block_count, file_len, stamped
+                "finalized segmented target file {} blocks={} located_blocks={} len={} ufs_mtime_stamped={}",
+                target, block_count, located_blocks, file_len, stamped
             );
         }
         if unstamped > 0 {
@@ -1806,6 +1867,16 @@ where
             stale_deadline_at: now.saturating_add(duration_ms(self.conf.task_stale_timeout)),
             accepted_at_ms: 0,
             first_byte_at_ms: 0,
+            // The probe recovers tasks whose terminal report was lost; without
+            // these workers the attempt's blocks would finalize as shells.
+            block_locations: response
+                .block_locations
+                .iter()
+                .map(|loc| TaskBlockLocation {
+                    block_id: loc.block_id,
+                    worker_ids: loc.worker_ids.clone(),
+                })
+                .collect(),
         })
     }
 
@@ -1834,6 +1905,7 @@ where
             stale_deadline_at: now.saturating_add(duration_ms(self.conf.task_stale_timeout)),
             accepted_at_ms: 0,
             first_byte_at_ms: 0,
+            block_locations: Vec::new(),
         })?;
         if deferred {
             debug!(
@@ -2573,6 +2645,7 @@ mod tests {
                 updated_at: 0,
                 accepted_at_ms: 0,
                 first_byte_at_ms: 0,
+                block_locations: Vec::new(),
                 replace_target,
             }
         };
@@ -2805,6 +2878,7 @@ mod tests {
                 attempt_started_at: 0,
                 accepted_at_ms: 0,
                 first_byte_at_ms: 0,
+                block_locations: Vec::new(),
                 last_report_at: 0,
                 stale_deadline_at: 0,
                 updated_at: 0,

@@ -1484,7 +1484,8 @@ fn update_task_report_in(conn: &mut impl Queryable, report: &TransferTaskReport)
                      '$.stale_deadline_at', :stale_deadline_at,
                      '$.updated_at', :updated_at,
                      '$.accepted_at_ms', :accepted_at_ms,
-                     '$.first_byte_at_ms', :first_byte_at_ms),
+                     '$.first_byte_at_ms', :first_byte_at_ms,
+                     '$.block_locations', cast(:block_locations as json)),
                  updated_at = :updated_at
              where job_id = :job_id and run_id = :run_id and task_id = :task_id
                and attempt_id = :attempt_id and worker_id = :worker_id
@@ -1515,7 +1516,8 @@ fn update_task_report_in(conn: &mut impl Queryable, report: &TransferTaskReport)
                      '$.stale_deadline_at', :stale_deadline_at,
                      '$.updated_at', :updated_at,
                      '$.accepted_at_ms', :accepted_at_ms,
-                     '$.first_byte_at_ms', :first_byte_at_ms),
+                     '$.first_byte_at_ms', :first_byte_at_ms,
+                     '$.block_locations', cast(:block_locations as json)),
                  updated_at = :updated_at
              where job_id = :job_id and run_id = :run_id and task_id = :task_id
                and attempt_id = :attempt_id and worker_id = :worker_id
@@ -1537,6 +1539,7 @@ fn update_task_report_in(conn: &mut impl Queryable, report: &TransferTaskReport)
             "updated_at" => report.now_ms,
             "accepted_at_ms" => report.accepted_at_ms,
             "first_byte_at_ms" => report.first_byte_at_ms,
+            "block_locations" => json(&report.block_locations)?,
             "job_id" => &report.job_id,
             "run_id" => report.run_id,
             "task_id" => &report.task_id,

@@ -216,6 +216,7 @@ fn e2e_task(job_id: &str, task_id: &str, total: i64) -> TransferTaskRecord {
         stale_deadline_at: 0,
         updated_at: 1,
         replace_target: false,
+        block_locations: Vec::new(),
     }
 }
 
@@ -299,6 +300,7 @@ fn e2e_c123_store_service_config_index() -> CommonResult<()> {
         stale_deadline_at: 2_000,
         accepted_at_ms: 0,
         first_byte_at_ms: 0,
+        block_locations: Vec::new(),
     };
     assert!(store.update_task_report(report(256, 4))?);
     assert!(store.update_task_report(report(128, 5))?);

@@ -406,6 +406,14 @@ impl WorkerHandler {
                     update_time: progress.update_time,
                     message: progress.message,
                 },
+                block_locations: progress
+                    .block_locations
+                    .iter()
+                    .map(|loc| TaskBlockLocationProto {
+                        block_id: loc.block_id,
+                        worker_ids: loc.worker_ids.clone(),
+                    })
+                    .collect(),
             },
             None => QueryTransferTaskResponse {
                 found: false,
@@ -416,6 +424,7 @@ impl WorkerHandler {
                     update_time: 0,
                     message: String::new(),
                 },
+                block_locations: Vec::new(),
             },
         };
         Ok(Builder::success(msg).proto_header(response).build())

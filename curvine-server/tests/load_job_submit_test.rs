@@ -612,6 +612,7 @@ fn late_task_report_does_not_change_terminal_job_state() -> CommonResult<()> {
             message: "late completed report".to_string(),
             accepted_at_ms: 0,
             first_byte_at_ms: 0,
+            block_locations: Vec::new(),
         },
     )?;
 
@@ -653,6 +654,7 @@ fn stale_task_report_for_running_job_is_ignored() -> CommonResult<()> {
             message: "stale completed report".to_string(),
             accepted_at_ms: 0,
             first_byte_at_ms: 0,
+            block_locations: Vec::new(),
         },
     )?;
 

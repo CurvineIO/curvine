@@ -2218,28 +2218,31 @@ impl TransferStore for PostgresTransferStore {
                                         jsonb_set(
                                             jsonb_set(
                                                 jsonb_set(
-                                                    jsonb_set(record_json::jsonb, '{{state}}', to_jsonb(case $1::integer
-                                                    when 1 then 'Pending'::text
-                                                    when 2 then 'Running'::text
-                                                    when 3 then 'Completed'::text
-                                                    when 4 then 'Failed'::text
-                                                    when 5 then 'Canceled'::text
-                                                    when 6 then 'Stale'::text
-                                                    else null::text
-                                                end)),
-                                                '{{progress,loaded_size}}', to_jsonb({loaded_json_expr})),
-                                            '{{progress,total_size}}', to_jsonb($3::bigint)),
-                                        '{{progress,update_time}}', to_jsonb($4::bigint)),
-                                    '{{progress,message}}', to_jsonb($5::text)),
-                                '{{last_report_at}}', to_jsonb($6::bigint)),
-                            '{{stale_deadline_at}}', to_jsonb($7::bigint)),
-                        '{{updated_at}}', to_jsonb($8::bigint)),
-                    '{{accepted_at_ms}}', to_jsonb($15::bigint)),
-                '{{first_byte_at_ms}}', to_jsonb($16::bigint))::text,
+                                                    jsonb_set(
+                                                        jsonb_set(record_json::jsonb, '{{state}}', to_jsonb(case $1::integer
+                                                        when 1 then 'Pending'::text
+                                                        when 2 then 'Running'::text
+                                                        when 3 then 'Completed'::text
+                                                        when 4 then 'Failed'::text
+                                                        when 5 then 'Canceled'::text
+                                                        when 6 then 'Stale'::text
+                                                        else null::text
+                                                    end)),
+                                                    '{{progress,loaded_size}}', to_jsonb({loaded_json_expr})),
+                                                '{{progress,total_size}}', to_jsonb($3::bigint)),
+                                            '{{progress,update_time}}', to_jsonb($4::bigint)),
+                                        '{{progress,message}}', to_jsonb($5::text)),
+                                    '{{last_report_at}}', to_jsonb($6::bigint)),
+                                '{{stale_deadline_at}}', to_jsonb($7::bigint)),
+                            '{{updated_at}}', to_jsonb($8::bigint)),
+                        '{{accepted_at_ms}}', to_jsonb($15::bigint)),
+                    '{{first_byte_at_ms}}', to_jsonb($16::bigint)),
+                '{{block_locations}}', $17::text::jsonb)::text,
                  updated_at = $8
              where job_id = $9 and run_id = $10 and task_id = $11 and attempt_id = $12
                and worker_id = $13 and worker_session_id = $14 and state in (1, 2)"
         );
+        let block_locations_json = json(&report.block_locations)?;
         self.conn()?
             .execute(
                 &sql,
@@ -2260,6 +2263,7 @@ impl TransferStore for PostgresTransferStore {
                     &report.worker_session_id,
                     &report.accepted_at_ms,
                     &report.first_byte_at_ms,
+                    &block_locations_json,
                 ],
             )
             .map(|affected| affected > 0)

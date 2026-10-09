@@ -20,9 +20,9 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
 use curvine_model::{
-    FileStatus, TransferCommand, TransferCountFilter, TransferJobRecord, TransferKind,
-    TransferListFilter, TransferProgress, TransferState, TransferStateCounts, TransferTaskCounts,
-    TransferTaskReport, TransferTaskState, TransferTaskStatus,
+    FileStatus, TaskBlockLocation, TransferCommand, TransferCountFilter, TransferJobRecord,
+    TransferKind, TransferListFilter, TransferProgress, TransferState, TransferStateCounts,
+    TransferTaskCounts, TransferTaskReport, TransferTaskState, TransferTaskStatus,
 };
 use curvine_proto::{
     ListTransferTenantsRequest, ListTransferTenantsResponse, ListTransfersRequest,
@@ -688,6 +688,7 @@ where
             stale_deadline_at: now_ms.saturating_add(self.task_stale_timeout_ms),
             accepted_at_ms: req.accepted_at_ms.unwrap_or(0),
             first_byte_at_ms: req.first_byte_at_ms.unwrap_or(0),
+            block_locations: block_locations_from_proto(&req.block_locations),
         };
         let accepted = self.store.update_task_report(report)?;
         if accepted && state.is_terminal() {
@@ -1107,6 +1108,7 @@ where
             stale_deadline_at: now_ms.saturating_add(task_stale_timeout_ms),
             accepted_at_ms,
             first_byte_at_ms,
+            block_locations: block_locations_from_proto(&envelope.req.block_locations),
         };
         (report, settle)
     }
@@ -1465,6 +1467,18 @@ fn progress_from_proto(value: TransferProgressProto) -> TransferProgress {
         update_time: value.update_time,
         message: value.message,
     }
+}
+
+fn block_locations_from_proto(
+    locations: &[curvine_proto::TaskBlockLocationProto],
+) -> Vec<TaskBlockLocation> {
+    locations
+        .iter()
+        .map(|loc| TaskBlockLocation {
+            block_id: loc.block_id,
+            worker_ids: loc.worker_ids.clone(),
+        })
+        .collect()
 }
 
 pub fn progress_to_proto(value: TransferProgress) -> TransferProgressProto {

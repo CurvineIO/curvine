@@ -2302,6 +2302,9 @@ fn sqlite_task_row(row: &Row<'_>) -> rusqlite::Result<TransferTaskRecord> {
         accepted_at_ms: 0,
         first_byte_at_ms: 0,
         replace_target: false,
+        // Columnar tasks table carries no block locations; segment finalize
+        // falls back to the master layout query on this store.
+        block_locations: Vec::new(),
     })
 }
 
