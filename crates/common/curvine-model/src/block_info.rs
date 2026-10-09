@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::state::{FileAllocOpts, FileStatus, FileType, StorageType, WorkerAddress};
+use crate::state::{FileAllocOpts, FileStatus, FileType, StorageType, WorkerAddress, WorkerStatus};
 use crate::FsResult;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_runtime::common::{ByteUnit, FastHashMap};
@@ -170,6 +170,12 @@ pub struct BlockReplicaDetail {
     pub worker_id: u32,
     pub storage_type: StorageType,
     pub address: Option<WorkerAddress>,
+    #[serde(default = "default_block_replica_state")]
+    pub state: WorkerStatus,
+}
+
+fn default_block_replica_state() -> WorkerStatus {
+    WorkerStatus::Unknown
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,0 +1,383 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use clap::Parser;
+use curvine_client_core::file::FsClient;
+use curvine_core_error::{err_box, CommonResult};
+use curvine_fs_api::Path;
+use curvine_model::{FileBlockDetails, FileStatus, FileType, WorkerStatus};
+use curvine_runtime::common::ByteUnit;
+use std::fmt::Write;
+use std::sync::Arc;
+
+#[derive(Parser, Debug)]
+pub struct FsckCommand {
+    #[clap(value_name = "path")]
+    pub path: String,
+}
+
+impl FsckCommand {
+    pub async fn execute(&self, client: Arc<FsClient>) -> CommonResult<()> {
+        print!("{}", self.render(client).await?);
+        Ok(())
+    }
+
+    async fn render(&self, client: Arc<FsClient>) -> CommonResult<String> {
+        let path = Path::from_str(&self.path)?;
+        let status = client.file_status(&path).await?;
+        if status.is_dir {
+            return err_box!("fsck directory traversal is not supported yet; pass a file path");
+        }
+
+        if let Some(reason) = block_inspection_skip_reason(&status) {
+            return Ok(render_skipped_file(status, reason));
+        }
+
+        Ok(render_file(client.get_file_block_details(&path).await?))
+    }
+}
+
+fn block_inspection_skip_reason(status: &FileStatus) -> Option<&'static str> {
+    if status.file_type != FileType::File {
+        Some("file type is not a regular file")
+    } else if status.storage_policy.ufs_only() {
+        Some("file is UFS-only")
+    } else {
+        None
+    }
+}
+
+fn render_skipped_file(status: FileStatus, reason: &str) -> String {
+    let mut output = String::new();
+    writeln!(output, "File: {}", status.path).unwrap();
+    writeln!(
+        output,
+        "Size: {} | Blocks: 0 | Expected replicas: {}",
+        ByteUnit::byte_to_string(status.len.max(0) as u64),
+        status.replicas.max(0)
+    )
+    .unwrap();
+    writeln!(output, "Block inspection skipped: {reason}").unwrap();
+    output
+}
+
+fn file_has_warnings(details: &mut FileBlockDetails) -> bool {
+    details.blocks.sort_by_key(|block| block.offset);
+    let mut warning = false;
+    for block in &mut details.blocks {
+        block.replicas.sort_by_key(|replica| replica.worker_id);
+        let expected = details.status.replicas.max(0) as usize;
+        let available = block
+            .replicas
+            .iter()
+            .filter(|replica| replica_is_available(replica.state))
+            .count();
+
+        if available < expected {
+            warning = true;
+        }
+    }
+    warning
+}
+
+fn render_file(mut details: FileBlockDetails) -> String {
+    let warning = file_has_warnings(&mut details);
+    let mut output = String::new();
+    writeln!(output, "File: {}", details.status.path).unwrap();
+    writeln!(
+        output,
+        "Size: {} | Blocks: {} | Expected replicas: {}",
+        ByteUnit::byte_to_string(details.status.len.max(0) as u64),
+        details.blocks.len(),
+        details.status.replicas.max(0)
+    )
+    .unwrap();
+
+    for (index, block) in details.blocks.iter().enumerate() {
+        writeln!(
+            output,
+            "\nBlock {} (blk_{}): {}",
+            index + 1,
+            block.block_id,
+            ByteUnit::byte_to_string(block.len.max(0) as u64)
+        )
+        .unwrap();
+        if block.replicas.is_empty() {
+            writeln!(output, "  no replicas").unwrap();
+        }
+        for replica in &block.replicas {
+            let worker = replica
+                .address
+                .as_ref()
+                .map(|address| format!("{}:{}", address.hostname, address.rpc_port))
+                .unwrap_or_else(|| format!("worker-{}", replica.worker_id));
+            let availability = match replica.state {
+                WorkerStatus::Live => "live",
+                WorkerStatus::Blacklist => "blacklist",
+                WorkerStatus::Decommission => "decommission",
+                WorkerStatus::Lost => "lost",
+                WorkerStatus::Unknown => "unknown",
+            };
+            writeln!(output, "  {:<28} {}", worker, availability).unwrap();
+        }
+    }
+
+    writeln!(
+        output,
+        "\nStatus: {}",
+        if warning { "WARNING" } else { "OK" }
+    )
+    .unwrap();
+    output
+}
+
+fn replica_is_available(status: WorkerStatus) -> bool {
+    matches!(status, WorkerStatus::Live)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_model::{
+        BlockReplicaDetail, FileBlockDetail, StoragePolicy, StorageState, WorkerAddress,
+    };
+
+    fn address(worker_id: u32) -> WorkerAddress {
+        WorkerAddress {
+            worker_id,
+            hostname: format!("worker-{worker_id}"),
+            rpc_port: 50010,
+            ..Default::default()
+        }
+    }
+
+    fn details(
+        replicas: i32,
+        replicas_info: Vec<(Option<WorkerAddress>, WorkerStatus)>,
+    ) -> FileBlockDetails {
+        FileBlockDetails {
+            status: FileStatus {
+                path: "/data/file".to_string(),
+                len: 100,
+                replicas,
+                ..Default::default()
+            },
+            blocks: vec![FileBlockDetail {
+                block_id: 7,
+                len: 100,
+                offset: 0,
+                replicas: replicas_info
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (address, state))| BlockReplicaDetail {
+                        worker_id: index as u32 + 1,
+                        storage_type: Default::default(),
+                        address,
+                        state,
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    #[test]
+    fn healthy_and_empty_files_have_no_warnings() {
+        let mut healthy = details(
+            2,
+            vec![
+                (Some(address(1)), WorkerStatus::Live),
+                (Some(address(2)), WorkerStatus::Live),
+            ],
+        );
+        assert!(!file_has_warnings(&mut healthy));
+
+        let mut empty = details(2, Vec::new());
+        empty.status.len = 0;
+        empty.blocks.clear();
+        assert!(!file_has_warnings(&mut empty));
+    }
+
+    #[test]
+    fn missing_and_unavailable_replicas_warn() {
+        let mut details = details(
+            3,
+            vec![
+                (Some(address(1)), WorkerStatus::Live),
+                (None, WorkerStatus::Unknown),
+            ],
+        );
+        assert!(file_has_warnings(&mut details));
+    }
+
+    #[test]
+    fn zero_recorded_replicas_are_under_replicated() {
+        let mut details = details(1, Vec::new());
+        assert!(file_has_warnings(&mut details));
+    }
+
+    #[test]
+    fn file_has_warnings_sorts_blocks_and_replicas() {
+        let mut unordered = details(2, vec![(Some(address(1)), WorkerStatus::Live)]);
+        unordered.blocks = vec![
+            FileBlockDetail {
+                block_id: 8,
+                len: 100,
+                offset: 100,
+                replicas: Vec::new(),
+            },
+            FileBlockDetail {
+                block_id: 7,
+                len: 100,
+                offset: 0,
+                replicas: vec![
+                    BlockReplicaDetail {
+                        worker_id: 3,
+                        storage_type: Default::default(),
+                        address: None,
+                        state: WorkerStatus::Unknown,
+                    },
+                    BlockReplicaDetail {
+                        worker_id: 1,
+                        storage_type: Default::default(),
+                        address: None,
+                        state: WorkerStatus::Unknown,
+                    },
+                ],
+            },
+        ];
+
+        file_has_warnings(&mut unordered);
+
+        assert_eq!(unordered.blocks[0].block_id, 7);
+        assert_eq!(unordered.blocks[1].block_id, 8);
+        assert_eq!(unordered.blocks[0].replicas[0].worker_id, 1);
+        assert_eq!(unordered.blocks[0].replicas[1].worker_id, 3);
+    }
+
+    #[test]
+    fn file_report_shows_health_without_storage_analysis() {
+        let output = render_file(details(
+            2,
+            vec![
+                (Some(address(1)), WorkerStatus::Live),
+                (Some(address(2)), WorkerStatus::Lost),
+            ],
+        ));
+        assert!(output.contains("worker-1:50010"));
+        assert!(output.contains("live"));
+        assert!(output.contains("worker-2"));
+        assert!(output.contains("lost"));
+        assert!(!output.contains("MISMATCH"));
+        assert!(!output.contains("Policy:"));
+        assert!(output.contains("Status: WARNING"));
+    }
+
+    #[test]
+    fn addressed_but_unavailable_replica_is_not_counted_available() {
+        let mut details = details(1, vec![(Some(address(1)), WorkerStatus::Lost)]);
+        assert!(file_has_warnings(&mut details));
+
+        let output = render_file(details);
+        assert!(output.contains("worker-1:50010"));
+        assert!(output.contains("lost"));
+        assert!(output.contains("Status: WARNING"));
+    }
+
+    #[test]
+    fn registered_non_live_worker_statuses_are_counted_unavailable() {
+        let mut details = details(
+            2,
+            vec![
+                (Some(address(1)), WorkerStatus::Blacklist),
+                (Some(address(2)), WorkerStatus::Decommission),
+            ],
+        );
+        assert!(file_has_warnings(&mut details));
+
+        let output = render_file(details);
+        assert!(output.contains("blacklist"));
+        assert!(output.contains("decommission"));
+        assert!(output.contains("Status: WARNING"));
+    }
+
+    #[test]
+    fn only_regular_non_ufs_files_are_block_inspected() {
+        let mut status = FileStatus::default();
+        assert!(block_inspection_skip_reason(&status).is_none());
+
+        status.storage_policy = StoragePolicy {
+            state: StorageState::Both,
+            ..Default::default()
+        };
+        assert!(block_inspection_skip_reason(&status).is_none());
+
+        for file_type in [
+            FileType::Dir,
+            FileType::Link,
+            FileType::Stream,
+            FileType::Agg,
+            FileType::Object,
+            FileType::Fifo,
+            FileType::Char,
+            FileType::Block,
+            FileType::Socket,
+        ] {
+            status.file_type = file_type;
+            assert!(
+                block_inspection_skip_reason(&status).is_some(),
+                "inspected {file_type:?}"
+            );
+        }
+
+        status.file_type = FileType::File;
+        status.storage_policy = StoragePolicy {
+            state: StorageState::Ufs,
+            ..Default::default()
+        };
+        assert!(block_inspection_skip_reason(&status).is_some());
+    }
+
+    #[test]
+    fn ufs_only_file_reports_block_inspection_skipped() {
+        let status = FileStatus {
+            path: "/ufs-only".to_string(),
+            len: 100,
+            replicas: 1,
+            storage_policy: StoragePolicy {
+                state: StorageState::Ufs,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let output = render_skipped_file(status, "file is UFS-only");
+
+        assert!(output.contains("Block inspection skipped: file is UFS-only"));
+        assert!(!output.contains("Status: OK"));
+    }
+
+    #[test]
+    fn non_regular_file_reports_block_inspection_skipped() {
+        let status = FileStatus {
+            path: "/link".to_string(),
+            file_type: FileType::Link,
+            ..Default::default()
+        };
+
+        let output = render_skipped_file(status, "file type is not a regular file");
+
+        assert!(output.contains("Block inspection skipped: file type is not a regular file"));
+        assert!(!output.contains("Status: OK"));
+    }
+}
