@@ -36,11 +36,24 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const TRANSFER_COMMIT_JOB_ID_XATTR: &str = "curvine.transfer.job_id";
-const TRANSFER_COMMIT_RUN_ID_XATTR: &str = "curvine.transfer.run_id";
-const TRANSFER_COMMIT_TASK_ID_XATTR: &str = "curvine.transfer.task_id";
-const TRANSFER_COMMIT_SOURCE_PATH_XATTR: &str = "curvine.transfer.source_path";
-const TRANSFER_COMMIT_TARGET_PATH_XATTR: &str = "curvine.transfer.target_path";
+/// Single idempotent-commit marker (design §7.2, minimized from five keys):
+/// value is `{task_id}` on committed targets, or `{task_id}\n{target_path}`
+/// on a cv→ufs export source (one source fans out to many targets, so the
+/// target must ride along). task_id embeds job_id ("{job_id}_task_{n}"),
+/// and run_id/attempt_id equality is implied by a same-task re-report, so a
+/// key/value pair is all the retry check needs. task_id is the whole value:
+/// no separator ambiguity for plain targets.
+const TRANSFER_COMMIT_TASK_XATTR: &str = "curvine.transfer.task";
+/// Separator between task_id and target_path inside the export-source marker.
+const TRANSFER_COMMIT_MARKER_SEP: char = '\n';
+/// Legacy five-key markers (job_id/run_id/task_id/source_path/target_path).
+/// Recognized read-only for one release cycle so in-flight files committed by
+/// the previous image still dedupe; new writes only emit the single key.
+const LEGACY_TRANSFER_COMMIT_JOB_ID_XATTR: &str = "curvine.transfer.job_id";
+const LEGACY_TRANSFER_COMMIT_RUN_ID_XATTR: &str = "curvine.transfer.run_id";
+const LEGACY_TRANSFER_COMMIT_TASK_ID_XATTR: &str = "curvine.transfer.task_id";
+const LEGACY_TRANSFER_COMMIT_SOURCE_PATH_XATTR: &str = "curvine.transfer.source_path";
+const LEGACY_TRANSFER_COMMIT_TARGET_PATH_XATTR: &str = "curvine.transfer.target_path";
 const WRITER_CLEANUP_TIMEOUT_MS: u64 = 10_000;
 
 pub struct LoadTaskRunner {
@@ -1367,11 +1380,10 @@ impl LoadTaskRunner {
             .await
     }
 
-    /// Stamp commit markers on the committed target (idempotent retry relies
-    /// on these xattrs, design §7.2). Returns the target's UFS mtime. For
-    /// batch tasks the markers are per-task (task_id/source_path are the
-    /// batch-level values), which stays self-consistent across retries of the
-    /// same batch.
+    /// Stamp the single-key commit marker on the committed target (idempotent
+    /// retry relies on it, design §7.2). Returns the target's UFS mtime. For
+    /// batch tasks the marker is per-task (task_id is the batch-level value),
+    /// which stays self-consistent across retries of the same batch.
     async fn mark_committed_output(&self, stream: &CopyStream) -> FsResult<i64> {
         let (cv_path, ufs_mtime) = if stream.final_path.is_cv() {
             // ufs -> cv
@@ -1384,28 +1396,8 @@ impl LoadTaskRunner {
 
         let mut attr_builder = SetAttrOptsBuilder::new().ufs_mtime(ufs_mtime);
         if stream.final_path.is_cv() {
-            if let Some(report) = &self.task.info.transfer_report {
-                attr_builder = attr_builder
-                    .add_x_attr(
-                        TRANSFER_COMMIT_JOB_ID_XATTR,
-                        self.task.info.job.job_id.as_bytes().to_vec(),
-                    )
-                    .add_x_attr(
-                        TRANSFER_COMMIT_RUN_ID_XATTR,
-                        report.run_id.to_string().into_bytes(),
-                    )
-                    .add_x_attr(
-                        TRANSFER_COMMIT_TASK_ID_XATTR,
-                        self.task.info.task_id.as_bytes().to_vec(),
-                    )
-                    .add_x_attr(
-                        TRANSFER_COMMIT_SOURCE_PATH_XATTR,
-                        self.task.info.source_path.as_bytes().to_vec(),
-                    )
-                    .add_x_attr(
-                        TRANSFER_COMMIT_TARGET_PATH_XATTR,
-                        self.task.info.target_path.as_bytes().to_vec(),
-                    );
+            if let Some(value) = self.commit_marker_value(None) {
+                attr_builder = attr_builder.add_x_attr(TRANSFER_COMMIT_TASK_XATTR, value);
             }
         }
         let attr_opts = attr_builder.build();
@@ -1542,30 +1534,54 @@ impl LoadTaskRunner {
             && self.has_transfer_commit_marker(&source_status, Some(target_path))
     }
 
+    /// Marker value for this task: `{task_id}` for committed targets, or
+    /// `{task_id}\n{target_path}` when stamping a cv→ufs export source that
+    /// fans out to many targets. None when the task carries no transfer
+    /// report (marker protocol disabled).
+    fn commit_marker_value(&self, export_target: Option<&Path>) -> Option<Vec<u8>> {
+        let has_report = self.task.info.transfer_report.is_some();
+        commit_marker_value_for(&self.task.info.task_id, has_report, export_target)
+    }
+
+    /// True when the file carries this task's single-key commit marker, or
+    /// (transition window) the legacy five-key set from the previous image.
     fn has_transfer_commit_marker(&self, status: &FileStatus, target_path: Option<&Path>) -> bool {
+        if let Some(value) = self.commit_marker_value(target_path) {
+            if xattr_equals(status, TRANSFER_COMMIT_TASK_XATTR, &value) {
+                return true;
+            }
+        }
+        self.has_legacy_transfer_commit_marker(status, target_path)
+    }
+
+    fn has_legacy_transfer_commit_marker(
+        &self,
+        status: &FileStatus,
+        target_path: Option<&Path>,
+    ) -> bool {
         let Some(report) = &self.task.info.transfer_report else {
             return false;
         };
         xattr_equals(
             status,
-            TRANSFER_COMMIT_JOB_ID_XATTR,
+            LEGACY_TRANSFER_COMMIT_JOB_ID_XATTR,
             self.task.info.job.job_id.as_bytes(),
         ) && xattr_equals(
             status,
-            TRANSFER_COMMIT_RUN_ID_XATTR,
+            LEGACY_TRANSFER_COMMIT_RUN_ID_XATTR,
             report.run_id.to_string().as_bytes(),
         ) && xattr_equals(
             status,
-            TRANSFER_COMMIT_TASK_ID_XATTR,
+            LEGACY_TRANSFER_COMMIT_TASK_ID_XATTR,
             self.task.info.task_id.as_bytes(),
         ) && xattr_equals(
             status,
-            TRANSFER_COMMIT_SOURCE_PATH_XATTR,
+            LEGACY_TRANSFER_COMMIT_SOURCE_PATH_XATTR,
             self.task.info.source_path.as_bytes(),
         ) && target_path.is_none_or(|path| {
             xattr_equals(
                 status,
-                TRANSFER_COMMIT_TARGET_PATH_XATTR,
+                LEGACY_TRANSFER_COMMIT_TARGET_PATH_XATTR,
                 path.full_path().as_bytes(),
             )
         })
@@ -1582,31 +1598,14 @@ impl LoadTaskRunner {
                 source_path.full_path()
             );
         }
-        let report = self.task.info.transfer_report.as_ref().unwrap();
+        let Some(value) = self.commit_marker_value(Some(target_path)) else {
+            return Ok(());
+        };
         self.fs
             .set_attr(
                 &source_path,
                 SetAttrOptsBuilder::new()
-                    .add_x_attr(
-                        TRANSFER_COMMIT_JOB_ID_XATTR,
-                        self.task.info.job.job_id.as_bytes().to_vec(),
-                    )
-                    .add_x_attr(
-                        TRANSFER_COMMIT_RUN_ID_XATTR,
-                        report.run_id.to_string().into_bytes(),
-                    )
-                    .add_x_attr(
-                        TRANSFER_COMMIT_TASK_ID_XATTR,
-                        self.task.info.task_id.as_bytes().to_vec(),
-                    )
-                    .add_x_attr(
-                        TRANSFER_COMMIT_SOURCE_PATH_XATTR,
-                        self.task.info.source_path.as_bytes().to_vec(),
-                    )
-                    .add_x_attr(
-                        TRANSFER_COMMIT_TARGET_PATH_XATTR,
-                        target_path.full_path().as_bytes().to_vec(),
-                    )
+                    .add_x_attr(TRANSFER_COMMIT_TASK_XATTR, value)
                     .build(),
             )
             .await
@@ -2009,6 +2008,25 @@ async fn ensure_ufs_parent(ufs: &UfsFileSystem, path: &Path) -> FsResult<()> {
     Ok(())
 }
 
+fn commit_marker_value_for(
+    task_id: &str,
+    has_report: bool,
+    export_target: Option<&Path>,
+) -> Option<Vec<u8>> {
+    if !has_report {
+        return None;
+    }
+    Some(match export_target {
+        None => task_id.as_bytes().to_vec(),
+        Some(path) => {
+            let mut value = task_id.as_bytes().to_vec();
+            value.push(TRANSFER_COMMIT_MARKER_SEP as u8);
+            value.extend_from_slice(path.full_path().as_bytes());
+            value
+        }
+    })
+}
+
 fn xattr_equals(status: &FileStatus, key: &str, expected: &[u8]) -> bool {
     status
         .x_attr
@@ -2030,7 +2048,10 @@ fn outcome_failed_reason(task: &TaskContext, _remove_task: bool) -> Option<&'sta
 
 #[cfg(test)]
 mod tests {
-    use super::{outcome_failed_reason, rename_ufs_output, LoadTaskRunner, TaskContext};
+    use super::{
+        outcome_failed_reason, rename_ufs_output, LoadTaskRunner, TaskContext,
+        TRANSFER_COMMIT_MARKER_SEP, TRANSFER_COMMIT_TASK_XATTR,
+    };
     use curvine_fs_api::Path;
     use curvine_model::{
         JobSourceType, JobTaskState, LoadJobInfo, LoadTaskInfo, MountInfo, StorageType, TtlAction,
@@ -2219,6 +2240,38 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn commit_marker_is_single_compact_value() {
+        use crate::worker::task::load_task_runner::commit_marker_value_for as marker;
+        let target = Path::from_str("/cv/out").unwrap();
+
+        // No transfer report: no marker at all.
+        assert!(marker("job_a_task_0", false, None).is_none());
+
+        // Committed target: bare task_id (job_id rides inside the prefix).
+        assert_eq!(
+            marker("job_a_task_0", true, None).unwrap(),
+            b"job_a_task_0".to_vec()
+        );
+
+        // Export source: task_id + target path, one key instead of five.
+        assert_eq!(
+            marker("job_a_task_0", true, Some(&target)).unwrap(),
+            format!("job_a_task_0{}/cv/out", TRANSFER_COMMIT_MARKER_SEP).into_bytes()
+        );
+
+        // Round-trip: the marker must be recognized by an exact-match check
+        // against the same key (xattr_equals semantics).
+        let value = marker("job_a_task_0", true, Some(&target)).unwrap();
+        assert_eq!(
+            value
+                .split(|b| *b == TRANSFER_COMMIT_MARKER_SEP as u8)
+                .count(),
+            2
+        );
+        assert!(TRANSFER_COMMIT_TASK_XATTR.starts_with("curvine.transfer."));
     }
 }
 
