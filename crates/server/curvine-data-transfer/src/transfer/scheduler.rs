@@ -60,6 +60,16 @@ fn inflight_bytes_with_default(estimated_bytes: i64, unknown_count: u64, default
     )
 }
 
+pub(crate) fn terminal_snapshot_progress(
+    mut progress: TransferProgress,
+    transition_message: &str,
+) -> TransferProgress {
+    if progress.message.trim().is_empty() && !transition_message.trim().is_empty() {
+        progress.message = transition_message.to_string();
+    }
+    progress
+}
+
 fn join_transfer_target(dir: &Path, relative_path: &str) -> FsResult<String> {
     let full = dir.full_path();
     let joined = if full.ends_with(Path::SEPARATOR) {
@@ -2162,7 +2172,7 @@ where
     ) -> FsResult<bool> {
         let message = message.into();
         if to_state.is_terminal() {
-            self.snapshot_terminal(job)?;
+            self.snapshot_terminal(job, &message)?;
         }
         let updated = self.store.update_transfer_state(TransferStateUpdate {
             job_id: lease.job_id.clone(),
@@ -2205,14 +2215,15 @@ where
         Ok(())
     }
 
-    fn snapshot_terminal(&self, job: &TransferJobRecord) -> FsResult<()> {
+    fn snapshot_terminal(&self, job: &TransferJobRecord, message: &str) -> FsResult<()> {
         let summary = self
             .store
             .get_transfer_task_summary(&job.job_id, job.run_id, now_ms())?;
+        let progress = terminal_snapshot_progress(summary.progress, message);
         self.store.update_terminal_snapshot(
             &job.job_id,
             job.run_id,
-            summary.progress.clone(),
+            progress,
             summary.counts,
             now_ms(),
         )

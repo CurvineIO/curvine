@@ -125,6 +125,41 @@ public class LoadJobClientTest {
     }
 
     @Test
+    public void transferFailureMessageIncludesOnlyNonBlankProgress() {
+        LoadJobStatus failed = new LoadJobStatus(
+                "job-1",
+                JobTaskStateProto.FAILED,
+                "s3://bucket/source",
+                "/target",
+                JobTaskProgressProto.newBuilder()
+                        .setLoadedSize(0)
+                        .setTotalSize(0)
+                        .setUpdateTime(1)
+                        .setState(JobTaskStateProto.FAILED.getNumber())
+                        .setMessage("source not found")
+                        .build());
+        Assert.assertEquals(
+                "job job-1 ended with state FAILED: source not found",
+                CurvineTransferClient.formatJobFailureMessage("job-1", failed));
+
+        LoadJobStatus empty = new LoadJobStatus(
+                "job-2",
+                JobTaskStateProto.FAILED,
+                "s3://bucket/source",
+                "/target",
+                JobTaskProgressProto.newBuilder()
+                        .setLoadedSize(0)
+                        .setTotalSize(0)
+                        .setUpdateTime(1)
+                        .setState(JobTaskStateProto.FAILED.getNumber())
+                        .setMessage("  ")
+                        .build());
+        Assert.assertEquals(
+                "job job-2 ended with state FAILED",
+                CurvineTransferClient.formatJobFailureMessage("job-2", empty));
+    }
+
+    @Test
     public void loadJobStatusFinishedHelpers() {
         LoadJobStatus completed = LoadJobStatus.fromProto(GetJobStatusResponse.newBuilder()
                 .setJobId("job-1")

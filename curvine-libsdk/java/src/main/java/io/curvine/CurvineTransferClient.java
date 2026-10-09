@@ -141,6 +141,16 @@ public final class CurvineTransferClient implements Closeable {
         });
     }
 
+    static String formatJobFailureMessage(String jobId, LoadJobStatus status) {
+        String message = status.getProgress() == null
+                ? null
+                : status.getProgress().getMessage();
+        String suffix = message == null || message.trim().isEmpty()
+                ? ""
+                : ": " + message;
+        return "job " + jobId + " ended with state " + status.getState() + suffix;
+    }
+
     /**
      * Poll a job until it reaches a terminal state or the timeout expires.
      * <p>On timeout the job may still be running server-side and finish later;
@@ -168,11 +178,7 @@ public final class CurvineTransferClient implements Closeable {
                 if (status.isSuccessful() || status.isPartialSuccess()) {
                     return status;
                 }
-                throw new IOException(
-                        "job " + jobId + " ended with state " + status.getState()
-                                + (status.getProgress() != null
-                                ? ": " + status.getProgress().getMessage()
-                                : ""));
+                throw new IOException(formatJobFailureMessage(jobId, status));
             }
             long remainingNanos = deadlineNanos - System.nanoTime();
             if (remainingNanos <= 0L) {

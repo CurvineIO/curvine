@@ -1513,24 +1513,39 @@ fn snapshot_has_tasks(summary: &TransferProgress, counts: &TransferTaskCounts) -
             > 0
 }
 
-fn resolve_terminal_summary(
+pub(crate) fn resolve_terminal_summary(
     job: &TransferJobRecord,
     live: &curvine_model::TransferTaskSummary,
 ) -> (TransferProgress, TransferTaskCounts, bool) {
     if !job.state.is_terminal() || live.has_task {
         return (live.progress.clone(), live.counts, false);
     }
+    let job_summary_has_progress = job.summary.loaded_size > 0
+        || job.summary.total_size > 0
+        || !job.summary.message.trim().is_empty();
     let (Some(snapshot), Some(counts)) = (job.terminal_summary.clone(), job.terminal_counts) else {
-        // Terminal with no rows and no snapshot means details are gone without
-        // a retained summary (pre-C1 jobs or snapshot write failure). Report
-        // expired so callers never mistake the empty live aggregate for a
-        // genuinely empty job.
+        // Terminal with no rows and no snapshot means details are gone. Keep
+        // the persisted job-level progress message when one is available so
+        // callers still receive the terminal failure reason.
+        if job_summary_has_progress {
+            return (job.summary.clone(), live.counts, true);
+        }
         return (live.progress.clone(), live.counts, true);
     };
-    match snapshot_has_tasks(&snapshot, &counts) {
-        true => (snapshot, counts, true),
-        false => (live.progress.clone(), live.counts, false),
+    if snapshot_has_tasks(&snapshot, &counts) {
+        let mut snapshot = snapshot;
+        if snapshot.message.trim().is_empty() && !job.summary.message.trim().is_empty() {
+            snapshot.message = job.summary.message.clone();
+        }
+        return (snapshot, counts, true);
     }
+    if !snapshot.message.trim().is_empty() {
+        return (snapshot, counts, false);
+    }
+    if job_summary_has_progress {
+        return (job.summary.clone(), counts, false);
+    }
+    (live.progress.clone(), live.counts, false)
 }
 
 pub fn task_status_to_proto(task: TransferTaskStatus) -> TransferTaskStatusProto {

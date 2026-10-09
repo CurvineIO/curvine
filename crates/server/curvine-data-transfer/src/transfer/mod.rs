@@ -54,6 +54,10 @@ mod report_batch_test;
 #[path = "tests/group_recovery_test.rs"]
 mod group_recovery_test;
 
+#[cfg(test)]
+#[path = "tests/terminal_summary_test.rs"]
+mod terminal_summary_test;
+
 mod service;
 pub use self::service::{progress_to_proto, task_summary_to_proto, TransferService};
 
