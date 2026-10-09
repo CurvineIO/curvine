@@ -2220,6 +2220,31 @@ async fn directory_cache_state_summary(
     Ok((state.to_string(), truncated, scanned_entries))
 }
 
+/// Overlay CV metadata onto a row that was listed from UFS.
+///
+/// Unified listing of a mount walks UFS, so the file exists on UFS. If the
+/// corresponding CV inode still has a cache copy (`cv_exists`), Browse reports
+/// `Both` even when the inode still says `Cv` — that happens for writes that
+/// never called `save_ufs`. A freed cache (`state = Ufs`) stays UFS-only.
+fn overlay_cv_metadata_on_ufs_entry(item: &mut FileStatus, cv_status: Option<&FileStatus>) {
+    match cv_status {
+        Some(cv) => {
+            item.storage_policy = cv.storage_policy.clone();
+            item.block_size = cv.block_size;
+            item.replicas = cv.replicas;
+            item.is_complete = cv.is_complete;
+            item.storage_policy.state = if cv.storage_policy.cv_exists() {
+                StorageState::Both
+            } else {
+                StorageState::Ufs
+            };
+        }
+        None => {
+            item.storage_policy.state = StorageState::Ufs;
+        }
+    }
+}
+
 async fn browse_v1(
     Extension(instance): Extension<Arc<AdminRouterHandler>>,
     Query(params): Query<HashMap<String, String>>,
@@ -2245,18 +2270,12 @@ async fn browse_v1(
         for item in &mut items {
             if item.path.contains("://") {
                 if let Some(cv_path) = map_ufs_path_to_cv(&item.path, &mounts) {
-                    if let Ok(cv_status) = summary_client
+                    let cv_status = summary_client
                         .cv()
                         .get_status(&FsPath::from_str(&cv_path)?)
                         .await
-                    {
-                        item.storage_policy = cv_status.storage_policy;
-                        item.block_size = cv_status.block_size;
-                        item.replicas = cv_status.replicas;
-                        item.is_complete = cv_status.is_complete;
-                    } else {
-                        item.storage_policy.state = StorageState::Ufs;
-                    }
+                        .ok();
+                    overlay_cv_metadata_on_ufs_entry(item, cv_status.as_ref());
                     item.path = cv_path;
                 } else {
                     item.storage_policy.state = StorageState::Ufs;
@@ -4657,5 +4676,56 @@ mod version_payload_tests {
         assert!(info.start_time_ms.is_none());
         assert!(info.start_time_json().is_null());
         assert!(info.start_time_ms_json().is_null());
+    }
+}
+
+#[cfg(test)]
+mod browse_overlay_tests {
+    use super::*;
+
+    fn ufs_row() -> FileStatus {
+        let mut item = FileStatus::with_name(0, "cached.log".to_string(), false);
+        item.path = "s3://bucket/cached.log".to_string();
+        item.storage_policy.state = StorageState::Cv;
+        item
+    }
+
+    fn cv_status(state: StorageState) -> FileStatus {
+        let mut status = FileStatus::with_name(7, "cached.log".to_string(), false);
+        status.storage_policy.state = state;
+        status.replicas = 3;
+        status.block_size = 128 * 1024 * 1024;
+        status.is_complete = true;
+        status
+    }
+
+    #[test]
+    fn ufs_listing_plus_cv_inode_is_both_even_when_inode_says_cv() {
+        let mut item = ufs_row();
+        overlay_cv_metadata_on_ufs_entry(&mut item, Some(&cv_status(StorageState::Cv)));
+        assert_eq!(item.storage_policy.state, StorageState::Both);
+        assert_eq!(item.replicas, 3);
+        assert!(item.is_complete);
+    }
+
+    #[test]
+    fn already_both_stays_both() {
+        let mut item = ufs_row();
+        overlay_cv_metadata_on_ufs_entry(&mut item, Some(&cv_status(StorageState::Both)));
+        assert_eq!(item.storage_policy.state, StorageState::Both);
+    }
+
+    #[test]
+    fn freed_cv_cache_stays_ufs_only() {
+        let mut item = ufs_row();
+        overlay_cv_metadata_on_ufs_entry(&mut item, Some(&cv_status(StorageState::Ufs)));
+        assert_eq!(item.storage_policy.state, StorageState::Ufs);
+    }
+
+    #[test]
+    fn missing_cv_inode_is_ufs_only() {
+        let mut item = ufs_row();
+        overlay_cv_metadata_on_ufs_entry(&mut item, None);
+        assert_eq!(item.storage_policy.state, StorageState::Ufs);
     }
 }

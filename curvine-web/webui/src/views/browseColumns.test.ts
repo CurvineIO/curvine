@@ -5,9 +5,11 @@ import {
   BROWSABLE_COLUMNS,
   DEFAULT_VISIBLE_COLUMNS,
   columnText,
-  computeColumnWidths,
+  expireTimeMs,
   isBrowseColumnKey,
-  orderColumns
+  isExpired,
+  orderColumns,
+  storageLocation
 } from './browseColumns'
 
 function hasKey(tree: unknown, key: string): boolean {
@@ -23,9 +25,18 @@ describe('browse column definitions', () => {
   // These labels are resolved through a dynamic `$t(col.labelKey)`, so the i18n
   // static-key scan cannot see them — assert them here instead.
   it('labels every column in both locales', () => {
-    for (const column of BROWSABLE_COLUMNS) {
-      expect(hasKey(en, column.labelKey), `en is missing ${column.labelKey}`).toBe(true)
-      expect(hasKey(zhCN, column.labelKey), `zh-CN is missing ${column.labelKey}`).toBe(true)
+    const extraKeys = [
+      'browse.table.expireTime',
+      'browse.expire.never',
+      'browse.storageLocation.both',
+      'browse.storageLocation.cv',
+      'browse.storageLocation.ufs',
+      'browse.columns.expireHint',
+      'browse.columns.locationHint'
+    ]
+    for (const key of [...BROWSABLE_COLUMNS.map((column) => column.labelKey), ...extraKeys]) {
+      expect(hasKey(en, key), `en is missing ${key}`).toBe(true)
+      expect(hasKey(zhCN, key), `zh-CN is missing ${key}`).toBe(true)
     }
   })
 
@@ -111,30 +122,40 @@ describe('columnText', () => {
   })
 })
 
-describe('computeColumnWidths', () => {
-  const allKeys = BROWSABLE_COLUMNS.map((column) => column.key)
+describe('expire time and storage location', () => {
+  const mtime = 1_700_000_000_000
+  const file = {
+    is_dir: false,
+    mtime,
+    storage_policy: { ttl_ms: 86_400_000, ttl_action: 'Delete', state: 'Both' }
+  }
 
-  it('totals 100% and keeps the name column readable for every subset', () => {
-    for (let mask = 0; mask < 1 << allKeys.length; mask += 1) {
-      const visible = allKeys.filter((_, index) => mask & (1 << index))
-      const widths = computeColumnWidths(visible)
-      const total = Object.values(widths).reduce((sum, value) => sum + value, 0)
-      expect(total, `subset ${visible.join(',')}`).toBeCloseTo(100, 9)
-      expect(widths.name, `subset ${visible.join(',')}`).toBeGreaterThanOrEqual(18)
-    }
+  it('computes expire time as mtime + ttl_ms when a TTL action is set', () => {
+    expect(expireTimeMs(file)).toBe(mtime + 86_400_000)
+    expect(isExpired(file, mtime + 86_400_000 - 1)).toBe(false)
+    expect(isExpired(file, mtime + 86_400_000 + 1)).toBe(true)
   })
 
-  it('keeps the default layout close to the previous four column look', () => {
-    const widths = computeColumnWidths(DEFAULT_VISIBLE_COLUMNS)
-    expect(widths.name).toBe(24)
-    expect(widths.replicas).toBe(8)
-    expect(widths.actions).toBe(24)
+  it('treats ttl_ms=0 or ttl_action=None as never expires', () => {
+    expect(expireTimeMs({ ...file, storage_policy: { ttl_ms: 0, ttl_action: 'Delete', state: 'Cv' } })).toBeNull()
+    expect(expireTimeMs({ ...file, storage_policy: { ttl_ms: 86_400_000, ttl_action: 'None', state: 'Cv' } })).toBeNull()
+    expect(expireTimeMs({ ...file, storage_policy: { ttl_ms: 86_400_000, ttl_action: 'none', state: 'Cv' } })).toBeNull()
+    expect(isExpired({ ...file, storage_policy: { ttl_ms: 0, ttl_action: 'Delete' } }, mtime + 1)).toBe(false)
   })
 
-  it('shrinks the optional columns once the name budget is exhausted', () => {
-    const widths = computeColumnWidths(allKeys)
-    expect(widths.name).toBeGreaterThanOrEqual(18)
-    const optionalTotal = allKeys.reduce((sum, key) => sum + widths[key], 0)
-    expect(optionalTotal).toBeLessThanOrEqual(14)
+  it('computes expire time for directories the same way as files', () => {
+    expect(expireTimeMs({ is_dir: true, mtime, storage_policy: { ttl_ms: 3_600_000, ttl_action: 'Free', state: 'Cv' } }))
+      .toBe(mtime + 3_600_000)
+  })
+
+  it('maps StorageState to the three Browse location values', () => {
+    expect(storageLocation(file)).toBe('both')
+    expect(storageLocation({ storage_policy: { state: 'Cv' } })).toBe('cv')
+    expect(storageLocation({ storage_policy: { state: 'Ufs' } })).toBe('ufs')
+    expect(storageLocation({ storage_policy: { state: 3 } })).toBe('both')
+    expect(storageLocation({ storage_policy: { state: 1 } })).toBe('cv')
+    expect(storageLocation({ storage_policy: { state: 2 } })).toBe('ufs')
+    expect(storageLocation({ storage_policy: {} })).toBeNull()
+    expect(storageLocation(undefined)).toBeNull()
   })
 })

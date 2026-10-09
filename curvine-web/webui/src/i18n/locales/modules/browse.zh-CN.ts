@@ -31,13 +31,24 @@ export default {
       blockSize: '块大小',
       storageType: '存储类型',
       ttl: 'TTL',
-      atime: '访问时间'
+      atime: '访问时间',
+      expireTime: '过期时间'
+    },
+    expire: {
+      never: '不过期'
+    },
+    storageLocation: {
+      both: 'both',
+      cv: 'CV',
+      ufs: 'UFS'
     },
     columns: {
       button: '显示列',
       title: '显示列',
       hint: '仅影响当前列表展示',
       replicasHint: '配置的目标副本数,与 `curvine-cli fs ls -l` 一致',
+      expireHint: 'ttl_action 非 None 时为 mtime + TTL',
+      locationHint: '数据在 UFS、Curvine 或两边都有',
       reset: '重置'
     },
     empty: {

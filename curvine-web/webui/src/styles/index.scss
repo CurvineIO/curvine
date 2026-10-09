@@ -134,13 +134,16 @@ button { cursor: pointer; }
 @media (max-width: 760px) { .admin-shell { display: block; } .admin-sidebar { width: auto; border-right: 0; border-bottom: 1px solid var(--admin-border); } .admin-nav { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); } .admin-main { padding: 16px; } .metric-grid, .capacity-layout { grid-template-columns: 1fr; } .admin-table { min-width: 760px; } .table-panel { overflow-x: auto; } .path-input, .toolbar .admin-input { min-width: 100%; } .form-panel label, .config-list label, .detail-list div { grid-template-columns: 1fr; } }
 
 
-// Column widths are not declared here: the visible column set is user-toggleable
-// and `table-layout: fixed` requires the <col> widths to total exactly 100%, so
-// they are computed per render in views/browseColumns.ts and applied inline.
+.file-browser-panel { overflow-x: auto; }
+.admin-table.file-browser-table { table-layout: auto; width: max-content; min-width: 100%; }
+.file-browser-table th, .file-browser-table td { white-space: nowrap; }
 .file-browser-table td { vertical-align: middle; }
 .file-browser-table .numeric { text-align: right; font-variant-numeric: tabular-nums; }
-.file-browser-table .file-name-cell { padding-top: 10px; padding-bottom: 10px; }
-.file-browser-table .row-actions { white-space: normal; }
+.file-browser-table .file-name-cell { padding-top: 10px; padding-bottom: 10px; max-width: 360px; }
+.file-browser-table .row-actions { white-space: nowrap; }
+.file-browser-table tr.is-expired td { color: #8a6d3b; }
+.file-browser-table tr.is-expired td strong { color: #8a6d3b; }
+.file-browser-table td.is-expired { color: #97610a; font-weight: 600; }
 
 .file-name-cell { cursor: pointer; }
 .file-name-cell:hover strong { color: var(--admin-primary-strong); text-decoration: underline; }
@@ -157,6 +160,23 @@ button { cursor: pointer; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.storage-tag {
+  display: inline-flex !important;
+  flex: 0 0 auto;
+  align-items: center;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 760;
+  line-height: 20px;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: nowrap;
+}
+.storage-tag.is-both { color: #2356a3; background: #e8f1ff; }
+.storage-tag.is-cv { color: var(--admin-primary-strong); background: #e8f6df; }
+.storage-tag.is-ufs { color: #97610a; background: #fff4df; }
 .copy-path-button {
   flex: 0 0 auto;
   height: 24px;

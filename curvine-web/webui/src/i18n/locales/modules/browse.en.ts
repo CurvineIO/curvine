@@ -31,13 +31,24 @@ export default {
       blockSize: 'Block size',
       storageType: 'Storage type',
       ttl: 'TTL',
-      atime: 'Accessed'
+      atime: 'Accessed',
+      expireTime: 'Expire time'
+    },
+    expire: {
+      never: 'Never'
+    },
+    storageLocation: {
+      both: 'both',
+      cv: 'CV',
+      ufs: 'UFS'
     },
     columns: {
       button: 'Columns',
       title: 'Visible columns',
       hint: 'Applies to this listing only',
       replicasHint: 'Configured target replica count, matching `curvine-cli fs ls -l`',
+      expireHint: 'mtime + TTL when ttl_action is not None',
+      locationHint: 'Whether data is on UFS, Curvine, or both',
       reset: 'Reset'
     },
     empty: {

@@ -15,11 +15,11 @@ export interface BrowseColumnDef {
   key: BrowseColumnKey
   /** i18n key for the column header; asserted against the en locale by tests. */
   labelKey: string
-  /** Percentage width used when the column is visible. */
-  width: number
   /** Right align numeric values. */
   numeric?: boolean
 }
+
+export type StorageLocation = 'both' | 'cv' | 'ufs'
 
 /** A row from `GET /api/v1/fs/list` (a serialised `FileStatus`). */
 export interface BrowseEntry {
@@ -30,23 +30,26 @@ export interface BrowseEntry {
   group?: string | null
   nlink?: number | null
   block_size?: number | null
+  mtime?: number | null
   atime?: number | null
   storage_policy?: {
     storage_type?: string | null
     ttl_ms?: number | null
+    ttl_action?: string | number | null
+    state?: string | number | null
   } | null
 }
 
 export const BROWSABLE_COLUMNS: BrowseColumnDef[] = [
-  { key: 'replicas', labelKey: 'browse.table.replicas', width: 8, numeric: true },
-  { key: 'permission', labelKey: 'browse.table.permission', width: 12 },
-  { key: 'owner', labelKey: 'browse.table.owner', width: 9 },
-  { key: 'group', labelKey: 'browse.table.group', width: 9 },
-  { key: 'nlink', labelKey: 'browse.table.nlink', width: 7, numeric: true },
-  { key: 'blockSize', labelKey: 'browse.table.blockSize', width: 9 },
-  { key: 'storageType', labelKey: 'browse.table.storageType', width: 9 },
-  { key: 'ttl', labelKey: 'browse.table.ttl', width: 8 },
-  { key: 'atime', labelKey: 'browse.table.atime', width: 12 }
+  { key: 'replicas', labelKey: 'browse.table.replicas', numeric: true },
+  { key: 'permission', labelKey: 'browse.table.permission' },
+  { key: 'owner', labelKey: 'browse.table.owner' },
+  { key: 'group', labelKey: 'browse.table.group' },
+  { key: 'nlink', labelKey: 'browse.table.nlink', numeric: true },
+  { key: 'blockSize', labelKey: 'browse.table.blockSize' },
+  { key: 'storageType', labelKey: 'browse.table.storageType' },
+  { key: 'ttl', labelKey: 'browse.table.ttl' },
+  { key: 'atime', labelKey: 'browse.table.atime' }
 ]
 
 /** Replicas show by default; every other attribute is opt-in. */
@@ -74,6 +77,49 @@ function positiveNumber(value: unknown): number | null {
   const number = Number(value)
   if (!Number.isFinite(number) || number <= 0) return null
   return number
+}
+
+const INACTIVE_TTL_ACTIONS = new Set(['', 'none', '0'])
+
+/**
+ * TTL is active only when both a positive duration and a non-`None` action are
+ * set, matching `FileStatus::is_expired` / the Browse expire-time rule.
+ */
+export function hasActiveTtl(policy: BrowseEntry['storage_policy']): boolean {
+  if (!policy) return false
+  if (positiveNumber(policy.ttl_ms) === null) return false
+  if (policy.ttl_action === null || policy.ttl_action === undefined) return false
+  return !INACTIVE_TTL_ACTIONS.has(String(policy.ttl_action).trim().toLowerCase())
+}
+
+/** Expire timestamp in ms (`mtime + ttl_ms`), or `null` when the entry never expires. */
+export function expireTimeMs(item: BrowseEntry | null | undefined): number | null {
+  if (!item || !hasActiveTtl(item.storage_policy)) return null
+  const mtime = Number(item.mtime)
+  if (!Number.isFinite(mtime) || mtime <= 0) return null
+  return mtime + Number(item.storage_policy!.ttl_ms)
+}
+
+export function isExpired(
+  item: BrowseEntry | null | undefined,
+  nowMs: number = Date.now()
+): boolean {
+  const expireAt = expireTimeMs(item)
+  return expireAt !== null && expireAt < nowMs
+}
+
+/**
+ * Map `storage_policy.state` to the three Browse location values.
+ * Accepts the serde variant names (`Both`/`Cv`/`Ufs`) and the i8 discriminants.
+ */
+export function storageLocation(item: BrowseEntry | null | undefined): StorageLocation | null {
+  const state = item?.storage_policy?.state
+  if (state === null || state === undefined || state === '') return null
+  const normalized = String(state).trim().toLowerCase()
+  if (normalized === 'both' || normalized === '3') return 'both'
+  if (normalized === 'cv' || normalized === '1') return 'cv'
+  if (normalized === 'ufs' || normalized === '2') return 'ufs'
+  return null
 }
 
 /**
@@ -111,51 +157,4 @@ export function columnText(item: BrowseEntry | null | undefined, key: BrowseColu
     default:
       return '-'
   }
-}
-
-const BASE_COLUMN_WIDTHS = { name: 32, type: 12, size: 14, modified: 18 }
-const ACTIONS_WIDTH = 24
-const NAME_MIN_WIDTH = 18
-/** Percentage the name column can give up to the optional attributes. */
-const OPTIONAL_BUDGET = BASE_COLUMN_WIDTHS.name - NAME_MIN_WIDTH
-
-/**
- * Final percentage width for every column (name/type/size/modified/actions plus
- * each visible optional column).
- *
- * The table is `table-layout: fixed`, so `<col>` widths are authoritative and
- * must add up to 100%: optional columns are paid for out of the name column
- * (which keeps at least `NAME_MIN_WIDTH`), and once that budget is exhausted
- * every optional column shrinks proportionally.
- */
-export function computeColumnWidths(visible: BrowseColumnKey[]): Record<string, number> {
-  const columns = orderColumns(visible)
-  const requested = columns.reduce((sum, column) => sum + column.width, 0)
-  const scale = requested > OPTIONAL_BUDGET ? OPTIONAL_BUDGET / requested : 1
-
-  // Floor to hundredths so the optional columns can never exceed their budget
-  // and the name column never drops below NAME_MIN_WIDTH.
-  const optionalWidths = columns.map((column) => ({
-    key: column.key,
-    width: Math.floor(column.width * scale * 100) / 100
-  }))
-  const optionalTotal = optionalWidths.reduce((sum, column) => sum + column.width, 0)
-
-  const widths: Record<string, number> = {
-    name:
-      100 -
-      BASE_COLUMN_WIDTHS.type -
-      BASE_COLUMN_WIDTHS.size -
-      BASE_COLUMN_WIDTHS.modified -
-      ACTIONS_WIDTH -
-      optionalTotal,
-    type: BASE_COLUMN_WIDTHS.type,
-    size: BASE_COLUMN_WIDTHS.size,
-    modified: BASE_COLUMN_WIDTHS.modified,
-    actions: ACTIONS_WIDTH
-  }
-  for (const column of optionalWidths) {
-    widths[column.key] = column.width
-  }
-  return widths
 }
