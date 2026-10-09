@@ -215,6 +215,10 @@ message TransferTaskReportRequest {
   // breakdown; old workers omit them.
   optional int64 accepted_at_ms = 10;
   optional int64 first_byte_at_ms = 11;
+  // Dispatch time of this attempt (ms since epoch, 0 = unknown), echoed from
+  // the dispatch request. Phase metrics use it instead of reading the task
+  // row; old workers omit it and the service falls back to that read.
+  optional int64 attempt_started_at_ms = 12;
 }
 
 message TransferTaskReportResponse {

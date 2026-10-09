@@ -35,6 +35,7 @@ fn progress_report(task_id: &str, loaded_size: i64) -> ProgressReport {
                 worker_session_id: "session".to_string(),
                 report_target: String::new(),
                 report_endpoints: Vec::new(),
+                attempt_started_at_ms: 0,
                 resume_loaded_size: 0,
             },
             progress: JobTaskProgress {

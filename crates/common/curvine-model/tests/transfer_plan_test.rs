@@ -1,7 +1,7 @@
 use curvine_model::{
-    check_transfer_plan_size, classify_transfer_plan, group_resume_remaining,
-    normalize_group_resume, parse_segment_group, segment_group_json, SegmentGroupMismatch,
-    SegmentGroupPlan, TransferPlanKind,
+    agreed_plan_source_mtime, check_transfer_plan_size, classify_transfer_plan,
+    group_resume_remaining, normalize_group_resume, parse_segment_group, plan_source_mtime,
+    segment_group_json, SegmentGroupMismatch, SegmentGroupPlan, TransferPlanKind,
 };
 
 fn group() -> SegmentGroupPlan {
@@ -213,4 +213,75 @@ fn version_only_manifest_skips_the_mtime_gate() {
     plan.source_version = "etag-1".to_string();
     assert!(plan.has_identity());
     assert_eq!(plan.verify_observation(512, 999, "etag-1"), Ok(()));
+}
+
+#[test]
+fn segment_manifest_carries_the_plan_time_source_mtime() {
+    // The scheduler stamps this value as the target's UFS identity at
+    // convergence, so a segment manifest must persist it and old manifests
+    // (written before the field existed) must still parse.
+    let plan = serde_json::json!({
+        "segment": {
+            "offset": 0,
+            "length": 128,
+            "total_len": 512,
+            "block_index": 0,
+            "source_mtime": 1_789_595_866_000i64
+        }
+    })
+    .to_string();
+    assert_eq!(plan_source_mtime(&plan), 1_789_595_866_000);
+
+    let legacy = serde_json::json!({
+        "segment": { "offset": 0, "length": 128, "total_len": 512, "block_index": 0 }
+    })
+    .to_string();
+    assert_eq!(plan_source_mtime(&legacy), 0);
+}
+
+#[test]
+fn plan_source_mtime_reads_group_and_rejects_other_plans() {
+    let mut grouped = group();
+    grouped.source_mtime = 42;
+    assert_eq!(
+        plan_source_mtime(&segment_group_json(&grouped).unwrap()),
+        42
+    );
+    assert_eq!(plan_source_mtime("{\"batch\":{\"batch\":[]}}"), 0);
+    assert_eq!(plan_source_mtime(""), 0);
+    assert_eq!(plan_source_mtime("not json"), 0);
+}
+
+#[test]
+fn convergence_requires_every_segment_to_agree_on_the_source_mtime() {
+    let mtime = 1_789_595_866_000i64;
+    let seg = |mtime: i64| {
+        serde_json::json!({
+            "segment": {
+                "offset": 0, "length": 128, "total_len": 512, "block_index": 0,
+                "source_mtime": mtime
+            }
+        })
+        .to_string()
+    };
+
+    let a = seg(mtime);
+    let b = seg(mtime);
+    assert_eq!(
+        agreed_plan_source_mtime([a.as_str(), b.as_str()]),
+        Some(mtime)
+    );
+
+    // A source that moved mid-copy leaves the plans disagreeing: no single
+    // mtime describes the cached bytes, so the target stays cache-invalid.
+    let moved = seg(mtime + 1);
+    assert_eq!(agreed_plan_source_mtime([a.as_str(), moved.as_str()]), None);
+    // A plan without the observation must not be invented either.
+    let unknown = seg(0);
+    assert_eq!(
+        agreed_plan_source_mtime([a.as_str(), unknown.as_str()]),
+        None
+    );
+    assert_eq!(agreed_plan_source_mtime([unknown.as_str()]), None);
+    assert_eq!(agreed_plan_source_mtime(Vec::<&str>::new()), None);
 }

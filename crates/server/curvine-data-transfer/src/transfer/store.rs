@@ -289,6 +289,22 @@ pub trait TransferStore: Send + Sync + 'static {
     /// `summary` is refreshed separately by [`Self::flush_job_progress_summary`].
     fn update_task_report(&self, report: TransferTaskReport) -> FsResult<bool>;
 
+    /// Persist a batch of task reports, one accepted flag per report in the
+    /// same order.
+    ///
+    /// Semantics are identical to calling [`Self::update_task_report`] for each
+    /// report (a report that fails its fencing predicate is rejected, not
+    /// retried); the batch exists so a backend can pay a single commit for the
+    /// group, which is where the cost is — production measures ~15 ms for one
+    /// single-row report write while a plain read costs ~7 ms. Backends without
+    /// a cheaper path keep the per-report loop.
+    fn update_task_reports(&self, reports: Vec<TransferTaskReport>) -> FsResult<Vec<bool>> {
+        reports
+            .into_iter()
+            .map(|report| self.update_task_report(report))
+            .collect()
+    }
+
     /// Persist a previously computed summary. The task aggregation and the job
     /// write are separate so job locks never cover task scans.
     fn update_job_progress_summary(

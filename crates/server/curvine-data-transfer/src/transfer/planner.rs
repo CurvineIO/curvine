@@ -95,6 +95,13 @@ pub(crate) fn has_group_identity(version: &str, head: Option<(i64, i64)>) -> boo
     !version.is_empty() || matches!(head, Some((len, mtime)) if len > 0 && mtime > 0)
 }
 
+/// Plan-time HEAD mtime to persist in a segment manifest, `0` when the planner
+/// could not observe one. A zero keeps the target cache-invalid after
+/// convergence rather than claiming a freshness nobody verified.
+pub(crate) fn head_mtime(head: Option<(i64, i64)>) -> i64 {
+    head.map(|(_, mtime)| mtime).unwrap_or(0)
+}
+
 /// Why a large file did or did not use segment-group tasks. Counted per
 /// file in `plan_once` so one job emits one info line instead of one log
 /// per file.
@@ -263,6 +270,7 @@ fn push_group_plan(
 fn build_single_segment_plans(
     status: &FileStatus,
     block_size: i64,
+    source_mtime: i64,
 ) -> FsResult<Vec<(String, i64)>> {
     let seg_block = if block_size > 0 {
         block_size
@@ -278,6 +286,7 @@ fn build_single_segment_plans(
                 length,
                 total_len: status.len,
                 block_index: offset / seg_block,
+                source_mtime,
             };
             let plan_json = serde_json::to_string(&serde_json::json!({
                 "segment": plan
@@ -298,6 +307,7 @@ pub(crate) fn build_group_plan_json(
             length: group.group_len(),
             total_len,
             block_index: group.first_block_index,
+            source_mtime: group.source_mtime,
         };
         let plan_json = serde_json::to_string(&serde_json::json!({
             "segment": plan
@@ -881,18 +891,18 @@ impl TransferPlanner {
         // single segments rather than risk a resume that skips rewritten
         // source bytes or a task no worker can validate.
         if !has_group_identity(source_version, head) {
-            return build_single_segment_plans(status, block_size)
+            return build_single_segment_plans(status, block_size, head_mtime(head))
                 .map(|plans| (plans, SegmentSplitOutcome::NoIdentity));
         }
         let workers = match self.cache.live_workers() {
             Ok(workers) => workers,
             Err(_) => {
-                return build_single_segment_plans(status, block_size)
+                return build_single_segment_plans(status, block_size, head_mtime(head))
                     .map(|plans| (plans, SegmentSplitOutcome::NoCapability));
             }
         };
         if !supports_segment_grouping(&workers) {
-            return build_single_segment_plans(status, block_size)
+            return build_single_segment_plans(status, block_size, head_mtime(head))
                 .map(|plans| (plans, SegmentSplitOutcome::NoCapability));
         }
         // Reaching here means the HEAD length matched the walked status, so

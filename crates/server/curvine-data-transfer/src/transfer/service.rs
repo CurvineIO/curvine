@@ -664,9 +664,12 @@ where
                 &job_id,
                 run_id,
                 &task_id,
-                req.accepted_at_ms.unwrap_or(0),
-                req.first_byte_at_ms.unwrap_or(0),
-                terminal_ms,
+                ReportPhaseMarkers {
+                    attempt_started_at_ms: req.attempt_started_at_ms.unwrap_or(0),
+                    accepted_at_ms: req.accepted_at_ms.unwrap_or(0),
+                    first_byte_at_ms: req.first_byte_at_ms.unwrap_or(0),
+                    terminal_ms,
+                },
             );
         }
         if accepted {
@@ -695,17 +698,23 @@ where
         job_id: &str,
         run_id: u64,
         task_id: &str,
-        accepted_at_ms: i64,
-        first_byte_at_ms: i64,
-        terminal_ms: i64,
+        markers: ReportPhaseMarkers,
     ) {
+        let ReportPhaseMarkers {
+            attempt_started_at_ms,
+            accepted_at_ms,
+            first_byte_at_ms,
+            terminal_ms,
+        } = markers;
         if accepted_at_ms <= 0 || first_byte_at_ms <= 0 {
             return;
         }
-        let Ok(Some(started)) = self
-            .store
-            .get_task_attempt_started_at(job_id, run_id, task_id)
-        else {
+        let Some(started) = resolve_attempt_started_at(attempt_started_at_ms, || {
+            self.store
+                .get_task_attempt_started_at(job_id, run_id, task_id)
+                .ok()
+                .flatten()
+        }) else {
             return;
         };
         if let Ok(metrics) = TransferMetrics::get() {
@@ -717,6 +726,27 @@ where
             metrics.observe_task_phase("transfer", terminal_ms.saturating_sub(first_byte_at_ms));
         }
     }
+}
+
+/// Worker-reported phase markers (ms since epoch, 0 = unknown). Grouped so the
+/// two phase observers stay under the argument limit and share one shape.
+#[derive(Clone, Copy, Default)]
+struct ReportPhaseMarkers {
+    attempt_started_at_ms: i64,
+    accepted_at_ms: i64,
+    first_byte_at_ms: i64,
+    terminal_ms: i64,
+}
+
+/// Everything needed to settle one persisted report after the store write:
+/// what to mark dirty, which phase markers to observe, and where to answer.
+struct ReportSettle {
+    job_id: String,
+    run_id: u64,
+    task_id: String,
+    state: TransferTaskState,
+    markers: ReportPhaseMarkers,
+    reply: Option<mpsc::Sender<FsResult<bool>>>,
 }
 
 struct TransferReportEnvelope {
@@ -921,14 +951,14 @@ where
                                     Err(channel::TryRecvError::Disconnected) => return,
                                 }
                             }
-                            for envelope in reports.into_values() {
-                                Self::handle_report_envelope(
-                                    &store,
-                                    &dirty_jobs,
-                                    task_stale_timeout_ms,
-                                    envelope,
-                                );
-                            }
+                            // One store call for the whole drained group so the
+                            // reports share a single commit.
+                            Self::handle_report_envelopes(
+                                &store,
+                                &dirty_jobs,
+                                task_stale_timeout_ms,
+                                reports.into_values().collect(),
+                            );
                         } else {
                             Self::handle_report_envelope(
                                 &store,
@@ -950,14 +980,85 @@ where
         task_stale_timeout_ms: i64,
         envelope: TransferReportEnvelope,
     ) {
+        Self::handle_report_envelopes(store, dirty_jobs, task_stale_timeout_ms, vec![envelope]);
+    }
+
+    /// Persist a drained group of reports with one store call so the whole
+    /// group shares a single commit, then settle each report on its own
+    /// (acceptance, dirty-summary marking, terminal phases, reply).
+    ///
+    /// A failed batch is logged and dropped rather than replayed one by one:
+    /// the progress lane carries running progress only, and the next report of
+    /// each task carries a greater-or-equal loaded size, so a lost group
+    /// self-heals within one report interval. Terminal reports keep their own
+    /// lane and their per-report reply.
+    fn handle_report_envelopes(
+        store: &S,
+        dirty_jobs: &JobSummaryDirtySet,
+        task_stale_timeout_ms: i64,
+        envelopes: Vec<TransferReportEnvelope>,
+    ) {
+        if envelopes.is_empty() {
+            return;
+        }
+        let mut pending: Vec<(TransferTaskReport, ReportSettle)> =
+            Vec::with_capacity(envelopes.len());
+        for envelope in envelopes {
+            pending.push(Self::prepare_report(envelope, task_stale_timeout_ms));
+        }
+        // Deterministic lock order: two report workers can each drain a report
+        // for the same task, and unordered batches would then take row locks in
+        // opposite orders. Sorting by key keeps the transaction deadlock-free
+        // and leaves the per-report acceptance order aligned with `settled`.
+        pending.sort_by(|(left, _), (right, _)| {
+            (&left.job_id, left.run_id, &left.task_id).cmp(&(
+                &right.job_id,
+                right.run_id,
+                &right.task_id,
+            ))
+        });
+        let (reports, settled): (Vec<_>, Vec<_>) = pending.into_iter().unzip();
+        match store.update_task_reports(reports) {
+            Ok(accepted) => {
+                for (settle, accepted) in settled.into_iter().zip(accepted) {
+                    Self::settle_report(store, dirty_jobs, settle, Some(accepted));
+                }
+            }
+            Err(err) => {
+                // Log once for the group; each report still answers its caller.
+                log::warn!(
+                    "batched transfer task report update failed, {} report(s) dropped: err={}",
+                    settled.len(),
+                    err
+                );
+                for settle in settled {
+                    Self::settle_report(store, dirty_jobs, settle, None);
+                }
+            }
+        }
+    }
+
+    fn prepare_report(
+        envelope: TransferReportEnvelope,
+        task_stale_timeout_ms: i64,
+    ) -> (TransferTaskReport, ReportSettle) {
         let now_ms = now_ms();
         let state = envelope.state;
-        let job_id = envelope.req.job_id.clone();
-        let run_id = envelope.req.run_id;
         let accepted_at_ms = envelope.req.accepted_at_ms.unwrap_or(0);
         let first_byte_at_ms = envelope.req.first_byte_at_ms.unwrap_or(0);
-        let task_id = envelope.req.task_id.clone();
-        let terminal_ms = envelope.req.progress.update_time;
+        let settle = ReportSettle {
+            job_id: envelope.req.job_id.clone(),
+            run_id: envelope.req.run_id,
+            task_id: envelope.req.task_id.clone(),
+            state,
+            markers: ReportPhaseMarkers {
+                attempt_started_at_ms: envelope.req.attempt_started_at_ms.unwrap_or(0),
+                accepted_at_ms,
+                first_byte_at_ms,
+                terminal_ms: envelope.req.progress.update_time,
+            },
+            reply: envelope.reply,
+        };
         let report = TransferTaskReport {
             job_id: envelope.req.job_id,
             run_id: envelope.req.run_id,
@@ -972,39 +1073,46 @@ where
             accepted_at_ms,
             first_byte_at_ms,
         };
-        let result = store.update_task_report(report);
-        if matches!(&result, Ok(true)) {
-            dirty_jobs.mark(job_id.clone(), run_id);
-            if state.is_terminal() {
+        (report, settle)
+    }
+
+    /// `accepted` is `Some(true)`/`Some(false)` for a persisted report and
+    /// `None` when the store write failed (the batch caller logs that once).
+    fn settle_report(
+        store: &S,
+        dirty_jobs: &JobSummaryDirtySet,
+        settle: ReportSettle,
+        accepted: Option<bool>,
+    ) {
+        if accepted == Some(true) {
+            dirty_jobs.mark(settle.job_id.clone(), settle.run_id);
+            if settle.state.is_terminal() {
                 observe_task_phases_static(
                     store,
-                    &job_id,
-                    run_id,
-                    &task_id,
-                    accepted_at_ms,
-                    first_byte_at_ms,
-                    terminal_ms,
+                    &settle.job_id,
+                    settle.run_id,
+                    &settle.task_id,
+                    settle.markers,
                 );
                 if let Ok(metrics) = TransferMetrics::get() {
-                    metrics.task_terminal(state);
+                    metrics.task_terminal(settle.state);
                 }
             }
         }
-        match envelope.reply {
+        match settle.reply {
             Some(reply) => {
+                let result = match accepted {
+                    Some(accepted) => Ok(accepted),
+                    None => Err(FsError::common(
+                        "Transfer task report update failed; retry the report",
+                    )),
+                };
                 let _ = reply.send(result);
             }
-            None => match result {
-                Ok(true) => record_report_metric("accepted_async"),
-                Ok(false) => record_report_metric("rejected_async"),
-                Err(err) => {
-                    record_report_metric("failure_async");
-                    log::warn!(
-                        "async transfer task report update failed: state={:?}, err={}",
-                        state,
-                        err
-                    );
-                }
+            None => match accepted {
+                Some(true) => record_report_metric("accepted_async"),
+                Some(false) => record_report_metric("rejected_async"),
+                None => record_report_metric("failure_async"),
             },
         }
     }
@@ -1091,24 +1199,46 @@ fn record_report_metric(result: &str) {
 /// default). Same rules as TransferService::observe_task_phases: skip when
 /// the worker omitted markers or the task row is gone; start <= 0 is unknown.
 #[allow(clippy::too_many_arguments)]
+/// Attempt start time for the phase metrics.
+///
+/// The worker echoes the dispatch time it was handed, so the normal path needs
+/// no store round trip; only a report from an older worker (field absent, 0)
+/// falls back to reading the task row. `None` means no usable timestamp, and
+/// the caller must skip the observation rather than invent one.
+pub(crate) fn resolve_attempt_started_at(
+    reported_ms: i64,
+    lookup: impl FnOnce() -> Option<i64>,
+) -> Option<i64> {
+    match reported_ms > 0 {
+        true => Some(reported_ms),
+        false => lookup().filter(|started| *started > 0),
+    }
+}
+
 fn observe_task_phases_static(
     store: &impl TransferStore,
     job_id: &str,
     run_id: u64,
     task_id: &str,
-    accepted_at_ms: i64,
-    first_byte_at_ms: i64,
-    terminal_ms: i64,
+    markers: ReportPhaseMarkers,
 ) {
+    let ReportPhaseMarkers {
+        attempt_started_at_ms,
+        accepted_at_ms,
+        first_byte_at_ms,
+        terminal_ms,
+    } = markers;
     if accepted_at_ms <= 0 || first_byte_at_ms <= 0 {
         return;
     }
-    let Ok(Some(started)) = store.get_task_attempt_started_at(job_id, run_id, task_id) else {
+    let Some(started) = resolve_attempt_started_at(attempt_started_at_ms, || {
+        store
+            .get_task_attempt_started_at(job_id, run_id, task_id)
+            .ok()
+            .flatten()
+    }) else {
         return;
     };
-    if started <= 0 {
-        return;
-    }
     if let Ok(metrics) = TransferMetrics::get() {
         metrics.observe_task_phase("dispatch_wait", accepted_at_ms.saturating_sub(started));
         metrics.observe_task_phase(

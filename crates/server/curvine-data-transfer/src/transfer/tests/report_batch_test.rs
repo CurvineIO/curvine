@@ -151,6 +151,7 @@ fn progress_report(
         protocol_version: Some(1),
         accepted_at_ms: None,
         first_byte_at_ms: None,
+        attempt_started_at_ms: None,
     }
 }
 
@@ -506,6 +507,71 @@ fn stale_retry_exhaustion_keeps_the_confirmed_missing_diagnosis() {
         stale_retry_exhausted_message(&task),
         "transfer task recovery retries exhausted after 4 stale attempt(s): assigned Worker does not have this task attempt"
     );
+}
+
+/// `update_task_reports` must behave exactly like one `update_task_report`
+/// call per report: same order, one acceptance flag each, and a fenced report
+/// (stale attempt) rejected without disturbing its neighbours. Backends
+/// override it to share one commit, so the contract is asserted for the
+/// default implementation and for the transactional override.
+fn assert_batched_report_write_contract<S: TransferStore>(store: Arc<S>, job: TransferJobRecord) {
+    let mut reports = Vec::new();
+    for (task_id, loaded) in [("task-1", 10i64), ("task-2", 20)] {
+        reports.push(TransferTaskReport {
+            job_id: job.job_id.clone(),
+            run_id: job.run_id,
+            task_id: task_id.to_string(),
+            attempt_id: 1,
+            worker_id: 7,
+            worker_session_id: "session".to_string(),
+            state: TransferTaskState::Running,
+            progress: TransferProgress {
+                loaded_size: loaded,
+                total_size: 100,
+                update_time: loaded,
+                message: task_id.to_string(),
+            },
+            now_ms: 1_000,
+            stale_deadline_at: 2_000,
+            accepted_at_ms: 0,
+            first_byte_at_ms: 0,
+        });
+    }
+    // Stale attempt: the fencing predicate rejects it while the others land.
+    let mut fenced = reports[0].clone();
+    fenced.task_id = "task-1".to_string();
+    fenced.attempt_id = 99;
+    fenced.progress.loaded_size = 999;
+
+    let accepted = store
+        .update_task_reports(vec![reports[0].clone(), reports[1].clone(), fenced])
+        .expect("batched report write");
+    assert_eq!(accepted, vec![true, true, false]);
+    let loaded = |task_id: &str| {
+        store
+            .list_transfer_tasks(&job.job_id, job.run_id)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.task_id == task_id)
+            .unwrap()
+            .progress
+            .loaded_size
+    };
+    assert_eq!(loaded("task-1"), 10);
+    assert_eq!(loaded("task-2"), 20);
+}
+
+#[test]
+fn memory_batched_report_write_keeps_per_report_acceptance() {
+    let (store, job) = running_store();
+    assert_batched_report_write_contract(store, job);
+}
+
+#[test]
+#[cfg(feature = "transfer-store-sqlite")]
+fn sqlite_batched_report_write_keeps_per_report_acceptance() {
+    let (store, job) = running_store_for(Arc::new(SqliteTransferStore::open(":memory:").unwrap()));
+    assert_batched_report_write_contract(store, job);
 }
 
 #[test]

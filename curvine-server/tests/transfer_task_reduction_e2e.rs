@@ -29,9 +29,9 @@ use curvine_fs_api::{FileSystem, Path};
 use curvine_model::{
     classify_transfer_plan, group_resume_remaining, normalize_group_resume, parse_segment_group,
     segment_group_json, JobSourceType, LoadJobInfo, LoadTaskInfo, MountInfo, SegmentGroupPlan,
-    StorageType, TaskAttemptStart, TransferJobRecord, TransferKind, TransferPlanKind,
-    TransferProgress, TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport,
-    TransferTaskReportInfo, TransferTaskState, TtlAction, WorkerAddress,
+    SetAttrOptsBuilder, StorageType, TaskAttemptStart, TransferJobRecord, TransferKind,
+    TransferPlanKind, TransferProgress, TransferState, TransferStateUpdate, TransferTaskRecord,
+    TransferTaskReport, TransferTaskReportInfo, TransferTaskState, TtlAction, WorkerAddress,
 };
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::RpcRuntime;
@@ -91,6 +91,7 @@ fn e2e_d1_classifier_rpc_manifest_compat() -> CommonResult<()> {
         worker_session_id: "s".to_string(),
         report_target: String::new(),
         report_endpoints: Vec::new(),
+        attempt_started_at_ms: 0,
         resume_loaded_size: 128 * MB,
     };
     let bytes = curvine_runtime::common::SerdeUtils::serialize(&info)?;
@@ -572,6 +573,7 @@ fn e2e_a3a4_group_fail_closed_on_file() -> CommonResult<()> {
                 worker_session_id: "s".to_string(),
                 report_target: String::new(),
                 report_endpoints: Vec::new(),
+                attempt_started_at_ms: 0,
                 resume_loaded_size: 0,
             }),
         }));
@@ -610,6 +612,7 @@ fn e2e_a3a4_group_fail_closed_on_file() -> CommonResult<()> {
                 worker_session_id: "s".to_string(),
                 report_target: String::new(),
                 report_endpoints: Vec::new(),
+                attempt_started_at_ms: 0,
                 resume_loaded_size: 0,
             }),
         }));
@@ -658,6 +661,7 @@ fn e2e_a3a4_group_fail_closed_on_file() -> CommonResult<()> {
                 worker_session_id: "s".to_string(),
                 report_target: String::new(),
                 report_endpoints: Vec::new(),
+                attempt_started_at_ms: 0,
                 resume_loaded_size: 0,
             }),
         }));
@@ -704,6 +708,7 @@ fn e2e_a3a4_group_fail_closed_on_file() -> CommonResult<()> {
                 worker_session_id: "s".to_string(),
                 report_target: String::new(),
                 report_endpoints: Vec::new(),
+                attempt_started_at_ms: 0,
                 resume_loaded_size: 0,
             }),
         }));
@@ -791,6 +796,8 @@ fn e2e_a3b_group_stat_identity_copies_and_resumes_on_file() -> CommonResult<()> 
         };
         plan.validate()?;
         assert!(plan.has_identity(), "HEAD len+mtime is a valid identity");
+        // The value the scheduler stamps at convergence (plan-time HEAD mtime).
+        let plan_source_mtime = plan.source_mtime;
         let plan_json = segment_group_json(&plan)?;
         assert_eq!(
             classify_transfer_plan(&plan_json),
@@ -825,6 +832,7 @@ fn e2e_a3b_group_stat_identity_copies_and_resumes_on_file() -> CommonResult<()> 
                     worker_session_id: "s".to_string(),
                     report_target: String::new(),
                     report_endpoints: Vec::new(),
+                    attempt_started_at_ms: 0,
                     resume_loaded_size: resume,
                 }),
             }))
@@ -845,7 +853,10 @@ fn e2e_a3b_group_stat_identity_copies_and_resumes_on_file() -> CommonResult<()> 
             let fs = reader_fs.clone();
             async move { fs.get_block_locations(&Path::from_str(&tgt)?).await }
         };
-        // The job's convergence protocol, exactly as the scheduler drives it.
+        // The job's convergence protocol, exactly as the scheduler drives it:
+        // complete the file and stamp the plan-time source mtime as its UFS
+        // identity. Without that stamp the target stays `{ufs_mtime: 0,
+        // state: Cv}` and every read falls back to UFS.
         let complete_target = |tgt: String| {
             let fs = reader_fs.clone();
             async move {
@@ -856,8 +867,18 @@ fn e2e_a3b_group_stat_identity_copies_and_resumes_on_file() -> CommonResult<()> 
                     .iter()
                     .map(curvine_model::CommitBlock::from)
                     .collect();
+                let set_attr_opts = SetAttrOptsBuilder::new()
+                    .ufs_mtime(plan_source_mtime)
+                    .build();
                 fs.fs_client()
-                    .complete_file_by_id(&target_path, blocks.status.id, total, commit, false, None)
+                    .complete_file_by_id(
+                        &target_path,
+                        blocks.status.id,
+                        total,
+                        commit,
+                        false,
+                        Some(set_attr_opts),
+                    )
                     .await?;
                 fs.get_status(&target_path).await
             }
@@ -885,6 +906,17 @@ fn e2e_a3b_group_stat_identity_copies_and_resumes_on_file() -> CommonResult<()> 
         );
         let done = complete_target(target_full.clone()).await?;
         assert!(done.is_complete() && done.len == total);
+        // The stamp is what makes the cached copy usable: `cv_valid` rejects
+        // `ufs_mtime == 0` outright, so without it every read falls back to UFS
+        // and every incremental load re-copies the file.
+        assert_eq!(
+            done.storage_policy.ufs_mtime, plan_source_mtime,
+            "convergence must stamp the plan-time source mtime"
+        );
+        assert!(
+            done.cv_valid(None),
+            "a stamped target must be cache-valid for readers"
+        );
 
         // (2) A non-zero resume floor is accepted and still lands the remaining
         // segments under the same version-less identity. The skipped prefix is

@@ -1366,7 +1366,91 @@ impl TransferStore for MysqlTransferStore {
 
     fn update_task_report(&self, report: TransferTaskReport) -> FsResult<bool> {
         let mut conn = self.conn()?;
-        let (sql, loaded) = match report.state {
+        update_task_report_in(&mut conn, &report)
+    }
+
+    /// One transaction for the whole drained report batch: production measures
+    /// ~15 ms for a single-row report write against ~7 ms for a plain read, so
+    /// the per-report commit — not the row update — dominates the cost.
+    fn update_task_reports(&self, reports: Vec<TransferTaskReport>) -> FsResult<Vec<bool>> {
+        if reports.len() <= 1 {
+            return reports
+                .into_iter()
+                .map(|report| self.update_task_report(report))
+                .collect();
+        }
+        let mut conn = self.conn()?;
+        let mut tx = conn
+            .start_transaction(TxOpts::default())
+            .map_err(mysql_err)?;
+        let mut accepted = Vec::with_capacity(reports.len());
+        for report in &reports {
+            accepted.push(update_task_report_in(&mut tx, report)?);
+        }
+        tx.commit().map_err(mysql_err)?;
+        Ok(accepted)
+    }
+
+    fn update_job_progress_summary(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        summary: TransferProgress,
+        now_ms: i64,
+    ) -> FsResult<()> {
+        let summary_json = serde_json::to_string(&summary).map_err(json_err)?;
+        self.conn()?
+            .exec_drop(
+                "update transfer_jobs
+             set record_json = json_set(record_json, '$.summary', cast(:summary_json as json),
+                                        '$.updated_at', :updated_at), updated_at = :updated_at
+             where job_id = :job_id and run_id = :run_id",
+                params! {
+                    "summary_json" => summary_json,
+                    "updated_at" => now_ms,
+                    "job_id" => job_id,
+                    "run_id" => run_id,
+                },
+            )
+            .map_err(mysql_err)?;
+        Ok(())
+    }
+
+    fn update_terminal_snapshot(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        summary: TransferProgress,
+        counts: TransferTaskCounts,
+        now_ms: i64,
+    ) -> FsResult<()> {
+        let summary_json = serde_json::to_string(&summary).map_err(json_err)?;
+        let counts_json = serde_json::to_string(&counts).map_err(json_err)?;
+        self.conn()?
+            .exec_drop(
+                "update transfer_jobs
+             set record_json = json_set(record_json, '$.summary', cast(:summary_json as json),
+                                        '$.terminal_summary', cast(:summary_json as json),
+                                        '$.terminal_counts', cast(:counts_json as json),
+                                        '$.updated_at', :updated_at), updated_at = :updated_at
+             where job_id = :job_id and run_id = :run_id
+               and coalesce(json_type(json_extract(record_json, '$.terminal_summary')), 'NULL') != 'OBJECT'",
+                params! {
+                    "summary_json" => summary_json,
+                    "counts_json" => counts_json,
+                    "updated_at" => now_ms,
+                    "job_id" => job_id,
+                    "run_id" => run_id,
+                },
+            )
+            .map_err(mysql_err)?;
+        Ok(())
+    }
+}
+
+/// Row update shared by the single and batched report paths.
+fn update_task_report_in(conn: &mut impl Queryable, report: &TransferTaskReport) -> FsResult<bool> {
+    let (sql, loaded) = match report.state {
             TransferTaskState::Running => (
                 "update transfer_tasks
              set state = :state, progress_loaded_size = greatest(progress_loaded_size, :progress_loaded_size),
@@ -1430,86 +1514,29 @@ impl TransferStore for MysqlTransferStore {
                 report.progress.loaded_size,
             ),
         };
-        let updated = exec_affected(
-            &mut conn,
-            sql,
-            params! {
-                "state" => report.state as i32,
-                "progress_loaded_size" => loaded,
-                "progress_total_size" => report.progress.total_size,
-                "progress_updated_at" => report.progress.update_time,
-                "progress_message" => &report.progress.message,
-                "last_report_at" => report.now_ms,
-                "stale_deadline_at" => report.stale_deadline_at,
-                "updated_at" => report.now_ms,
-                "accepted_at_ms" => report.accepted_at_ms,
-                "first_byte_at_ms" => report.first_byte_at_ms,
-                "job_id" => &report.job_id,
-                "run_id" => report.run_id,
-                "task_id" => &report.task_id,
-                "attempt_id" => report.attempt_id,
-                "worker_id" => report.worker_id,
-                "worker_session_id" => &report.worker_session_id,
-            },
-        )? > 0;
-        Ok(updated)
-    }
-
-    fn update_job_progress_summary(
-        &self,
-        job_id: &str,
-        run_id: u64,
-        summary: TransferProgress,
-        now_ms: i64,
-    ) -> FsResult<()> {
-        let summary_json = serde_json::to_string(&summary).map_err(json_err)?;
-        self.conn()?
-            .exec_drop(
-                "update transfer_jobs
-             set record_json = json_set(record_json, '$.summary', cast(:summary_json as json),
-                                        '$.updated_at', :updated_at), updated_at = :updated_at
-             where job_id = :job_id and run_id = :run_id",
-                params! {
-                    "summary_json" => summary_json,
-                    "updated_at" => now_ms,
-                    "job_id" => job_id,
-                    "run_id" => run_id,
-                },
-            )
-            .map_err(mysql_err)?;
-        Ok(())
-    }
-
-    fn update_terminal_snapshot(
-        &self,
-        job_id: &str,
-        run_id: u64,
-        summary: TransferProgress,
-        counts: TransferTaskCounts,
-        now_ms: i64,
-    ) -> FsResult<()> {
-        let summary_json = serde_json::to_string(&summary).map_err(json_err)?;
-        let counts_json = serde_json::to_string(&counts).map_err(json_err)?;
-        self.conn()?
-            .exec_drop(
-                "update transfer_jobs
-             set record_json = json_set(record_json, '$.summary', cast(:summary_json as json),
-                                        '$.terminal_summary', cast(:summary_json as json),
-                                        '$.terminal_counts', cast(:counts_json as json),
-                                        '$.updated_at', :updated_at), updated_at = :updated_at
-             where job_id = :job_id and run_id = :run_id
-               and coalesce(json_type(json_extract(record_json, '$.terminal_summary')), 'NULL') != 'OBJECT'",
-                params! {
-                    "summary_json" => summary_json,
-                    "counts_json" => counts_json,
-                    "updated_at" => now_ms,
-                    "job_id" => job_id,
-                    "run_id" => run_id,
-                },
-            )
-            .map_err(mysql_err)?;
-        Ok(())
-    }
+    let updated = exec_affected(
+        conn,
+        sql,
+        params! {
+            "state" => report.state as i32,
+            "progress_loaded_size" => loaded,
+            "progress_total_size" => report.progress.total_size,
+            "progress_updated_at" => report.progress.update_time,
+            "progress_message" => &report.progress.message,
+            "last_report_at" => report.now_ms,
+            "stale_deadline_at" => report.stale_deadline_at,
+            "updated_at" => report.now_ms,
+            "accepted_at_ms" => report.accepted_at_ms,
+            "first_byte_at_ms" => report.first_byte_at_ms,
+            "job_id" => &report.job_id,
+            "run_id" => report.run_id,
+            "task_id" => &report.task_id,
+            "attempt_id" => report.attempt_id,
+            "worker_id" => report.worker_id,
+            "worker_session_id" => &report.worker_session_id,
+        },
+    )? > 0;
+    Ok(updated)
 }
 
 fn init_schema(conn: &mut PooledConn) -> FsResult<()> {

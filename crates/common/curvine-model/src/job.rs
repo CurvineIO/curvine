@@ -332,6 +332,12 @@ pub struct TransferTaskReportInfo {
     pub report_endpoints: Vec<String>,
     #[serde(default)]
     pub resume_loaded_size: i64,
+    /// Dispatch time of this attempt (ms since epoch, 0 = unknown): the same
+    /// instant the scheduler persisted as `attempt_started_at`. The worker
+    /// echoes it back in every report so phase metrics need no task-row read;
+    /// an older worker omits it and the service falls back to that read.
+    #[serde(default)]
+    pub attempt_started_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

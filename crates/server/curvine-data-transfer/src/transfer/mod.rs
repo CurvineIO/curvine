@@ -56,6 +56,14 @@ mod service;
 pub use self::service::{progress_to_proto, task_summary_to_proto, TransferService};
 
 #[cfg(test)]
+#[path = "tests/finalize_test.rs"]
+mod finalize_test;
+
+#[cfg(test)]
+#[path = "tests/report_phase_test.rs"]
+mod report_phase_test;
+
+#[cfg(test)]
 #[path = "tests/service_test.rs"]
 mod service_test;
 

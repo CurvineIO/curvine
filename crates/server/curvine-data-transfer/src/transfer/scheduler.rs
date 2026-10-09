@@ -25,10 +25,11 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
 use curvine_model::{
-    classify_transfer_plan, normalize_group_resume, BatchManifest, LoadJobInfo, LoadTaskInfo,
-    TaskAttemptStart, TransferJobRecord, TransferLease, TransferPlanKind, TransferProgress,
-    TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport,
-    TransferTaskReportInfo, TransferTaskState, WorkerInflight, WorkerInfo,
+    agreed_plan_source_mtime, classify_transfer_plan, normalize_group_resume, BatchManifest,
+    LoadJobInfo, LoadTaskInfo, SetAttrOptsBuilder, TaskAttemptStart, TransferJobRecord,
+    TransferLease, TransferPlanKind, TransferProgress, TransferState, TransferStateUpdate,
+    TransferTaskRecord, TransferTaskReport, TransferTaskReportInfo, TransferTaskState,
+    WorkerInflight, WorkerInfo,
 };
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::RpcRuntime;
@@ -66,6 +67,52 @@ fn join_transfer_target(dir: &Path, relative_path: &str) -> FsResult<String> {
         format!("{full}{}{relative_path}", Path::SEPARATOR)
     };
     Ok(Path::from_str(&joined)?.clone_uri())
+}
+
+/// Targets whose segment tasks all completed, paired with the plan-time
+/// source mtime their plans agree on (`None` when a plan pins none, or when
+/// the plans disagree because the source moved while it was being copied).
+///
+/// Convergence stamps that mtime as the target's UFS identity. Without it a
+/// directory-loaded large file stays `{ufs_mtime: 0, state: Cv}`, which
+/// `cv_valid` rejects outright: every read falls back to UFS and every
+/// incremental load re-copies the whole file.
+pub(crate) fn converged_segment_targets(
+    tasks: &[TransferTaskRecord],
+) -> Vec<(String, Option<i64>)> {
+    use std::collections::HashMap;
+
+    let mut total: HashMap<&str, usize> = HashMap::new();
+    let mut completed: HashMap<&str, usize> = HashMap::new();
+    let mut plans: HashMap<&str, Vec<&str>> = HashMap::new();
+    for task in tasks {
+        if !matches!(
+            classify_transfer_plan(&task.source_read_plan_json),
+            TransferPlanKind::Segment | TransferPlanKind::SegmentGroup
+        ) {
+            continue;
+        }
+        let target = task.target_path.as_str();
+        *total.entry(target).or_insert(0) += 1;
+        plans
+            .entry(target)
+            .or_default()
+            .push(task.source_read_plan_json.as_str());
+        if task.state == TransferTaskState::Completed {
+            *completed.entry(target).or_insert(0) += 1;
+        }
+    }
+
+    let mut targets: Vec<(String, Option<i64>)> = total
+        .into_iter()
+        .filter(|(target, count)| completed.get(target).copied().unwrap_or(0) == *count)
+        .map(|(target, _)| {
+            let mtime = agreed_plan_source_mtime(plans.remove(target).unwrap_or_default());
+            (target.to_string(), mtime)
+        })
+        .collect();
+    targets.sort();
+    targets
 }
 
 fn planned_target_replacements(
@@ -1476,29 +1523,13 @@ where
         // (resize records the requested length before any payload lands)
         // from a written one, so file length heuristics would cements holes;
         // the per-task convergence fact is the reliable signal.
-        let mut target_total: std::collections::HashMap<String, usize> = Default::default();
-        let mut target_done: std::collections::HashMap<String, usize> = Default::default();
-        for task in &tasks {
-            let is_segment = matches!(
-                classify_transfer_plan(&task.source_read_plan_json),
-                TransferPlanKind::Segment | TransferPlanKind::SegmentGroup
-            );
-            if is_segment {
-                *target_total.entry(task.target_path.clone()).or_insert(0) += 1;
-                if task.state == TransferTaskState::Completed {
-                    *target_done.entry(task.target_path.clone()).or_insert(0) += 1;
-                }
-            }
-        }
-        let targets: Vec<String> = target_total
-            .iter()
-            .filter(|(target, total)| target_done.get(*target).copied().unwrap_or(0) == **total)
-            .map(|(target, _)| target.clone())
-            .collect();
+        let targets = converged_segment_targets(&tasks);
         if targets.is_empty() {
             return Ok(());
         }
-        for target in targets {
+        let target_count = targets.len();
+        let mut unstamped = 0usize;
+        for (target, source_mtime) in targets {
             let path = Path::from_str(&target)?;
             let blocks = self.fs.get_block_locations(&path).await?;
             if blocks.status.is_complete() {
@@ -1518,6 +1549,17 @@ where
                 .collect();
             let block_count = commit_blocks.len();
             let file_len = blocks.status.len;
+            // Stamp the plan-time UFS identity together with the completion.
+            // No agreed mtime (missing, or the segments disagree because the
+            // source moved mid-copy) leaves the target cache-invalid on
+            // purpose: readers then fall back to UFS instead of trusting bytes
+            // nobody can identify.
+            let set_attr_opts = source_mtime
+                .map(|ufs_mtime| SetAttrOptsBuilder::new().ufs_mtime(ufs_mtime).build());
+            let stamped = set_attr_opts.is_some();
+            if !stamped {
+                unstamped += 1;
+            }
             self.fs
                 .fs_client()
                 .complete_file_by_id(
@@ -1526,12 +1568,18 @@ where
                     file_len,
                     commit_blocks,
                     false,
-                    None,
+                    set_attr_opts,
                 )
                 .await?;
             info!(
-                "finalized segmented target file {} blocks={} len={}",
-                target, block_count, file_len
+                "finalized segmented target file {} blocks={} len={} ufs_mtime_stamped={}",
+                target, block_count, file_len, stamped
+            );
+        }
+        if unstamped > 0 {
+            warn!(
+                "finalized {} of {} segmented target(s) for transfer {} without a UFS identity: no agreed plan-time source mtime, so reads keep falling back to UFS until a later load stamps it",
+                unstamped, target_count, job.job_id
             );
         }
         Ok(())
@@ -2122,6 +2170,9 @@ where
             report_target: report_endpoints.first().cloned().unwrap_or_default(),
             report_endpoints,
             resume_loaded_size,
+            // Same instant `start_task_attempt` persisted above; the worker
+            // echoes it so the report path never re-reads the task row.
+            attempt_started_at_ms: now,
         }),
     };
 

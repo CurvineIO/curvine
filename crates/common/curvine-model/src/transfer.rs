@@ -331,6 +331,14 @@ pub struct SegmentPlan {
     /// not re-derive it from the live layout (which may differ during rolling
     /// upgrades or when block_size != SEGMENT_BYTES).
     pub block_index: i64,
+    /// Source mtime the planner observed with its HEAD fingerprint (0 when
+    /// unavailable). Scheduler convergence stamps it as the target's UFS
+    /// identity so the cached copy is readable (`cv_valid`) and skippable by
+    /// the next incremental load. It must stay the *plan-time* value: reading
+    /// the source again at finalize would claim a freshness the cached bytes
+    /// may not have, and a mixed old/new copy would be served as fresh.
+    #[serde(default)]
+    pub source_mtime: i64,
 }
 
 /// Upper bound for `source_read_plan_json` / dispatch RPC plan payloads.
@@ -523,6 +531,43 @@ pub fn segment_group_json(plan: &SegmentGroupPlan) -> FsResult<String> {
         .map_err(|_| FsError::common("Unable to serialize segment group plan"))?;
     check_transfer_plan_size(&json)?;
     Ok(json)
+}
+
+/// Plan-time source mtime carried by a segment plan, `0` when the plan pins
+/// none. Group manifests always carried it; single-segment manifests carry it
+/// so the scheduler can stamp the target's UFS identity at convergence.
+pub fn plan_source_mtime(plan_json: &str) -> i64 {
+    match classify_transfer_plan(plan_json) {
+        TransferPlanKind::SegmentGroup => parse_segment_group(plan_json)
+            .map(|plan| plan.source_mtime)
+            .unwrap_or(0),
+        TransferPlanKind::Segment => serde_json::from_str::<serde_json::Value>(plan_json)
+            .ok()
+            .and_then(|value| value.get("segment").cloned())
+            .and_then(|segment| serde_json::from_value::<SegmentPlan>(segment).ok())
+            .map(|plan| plan.source_mtime)
+            .unwrap_or(0),
+        TransferPlanKind::Batch | TransferPlanKind::Plain => 0,
+    }
+}
+
+/// Source mtime shared by every segment plan of one target. `None` when a
+/// plan pins none, or when the plans disagree: the source moved while it was
+/// being copied, so no single mtime describes the bytes now cached and the
+/// target must stay cache-invalid rather than claim a freshness it lacks.
+pub fn agreed_plan_source_mtime<'a>(plans: impl IntoIterator<Item = &'a str>) -> Option<i64> {
+    let mut agreed: Option<i64> = None;
+    for mtime in plans.into_iter().map(plan_source_mtime) {
+        if mtime <= 0 {
+            return None;
+        }
+        match agreed {
+            Some(previous) if previous != mtime => return None,
+            Some(_) => {}
+            None => agreed = Some(mtime),
+        }
+    }
+    agreed
 }
 
 pub fn check_transfer_plan_size(plan_json: &str) -> FsResult<()> {
