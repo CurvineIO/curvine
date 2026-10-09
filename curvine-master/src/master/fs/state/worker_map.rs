@@ -90,6 +90,8 @@ impl WorkerMap {
         weight: u32,
         worker_session_id: String,
         transfer_capabilities: TransferWorkerCapabilities,
+        transfer_inflight_budget_bytes: i64,
+        worker_max_concurrent_tasks: usize,
         software_version: String,
         startup_time_ms: u64,
         storages: Vec<StorageInfo>,
@@ -109,6 +111,8 @@ impl WorkerMap {
         let mut info = WorkerInfo::new(addr, weight);
         info.worker_session_id = worker_session_id;
         info.transfer_capabilities = transfer_capabilities;
+        info.transfer_inflight_budget_bytes = transfer_inflight_budget_bytes;
+        info.worker_max_concurrent_tasks = worker_max_concurrent_tasks;
         info.software_version = software_version;
         info.startup_time_ms = startup_time_ms;
         info.component_info = component_info;

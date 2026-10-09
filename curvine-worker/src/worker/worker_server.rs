@@ -70,7 +70,7 @@ impl WorkerService {
             .map_err(|error| CommonError::from(error.to_string()))?;
         let store: BlockStore = BlockStore::new(&conf.cluster_id, conf)?;
 
-        let task_manager = TaskManager::with_rt(rt.clone(), conf, worker_session_id)?;
+        let task_manager = Arc::new(TaskManager::with_rt(rt.clone(), conf, worker_session_id)?);
 
         let replication_manager =
             WorkerReplicationManager::new(&store, &rt, conf, &task_manager.get_fs_context());
@@ -78,7 +78,7 @@ impl WorkerService {
         let ws = Self {
             store,
             conf: conf.clone(),
-            task_manager: Arc::new(task_manager),
+            task_manager,
             rt,
             replication_manager,
             fault_http,
@@ -133,6 +133,7 @@ impl WebHandlerService for WorkerService {
         WorkerRouterHandler {
             fault_http: self.fault_http.clone(),
             server_state: self.server_state.clone(),
+            task_manager: self.task_manager.clone(),
         }
     }
 }
@@ -250,6 +251,8 @@ impl Worker {
             block_store.clone(),
             rpc_server.new_state_ctl(),
             start_ms,
+            service.task_manager.inflight_budget_bytes(),
+            service.task_manager.worker_max_concurrent_tasks_shared(),
         )?;
 
         let master_client = block_actor.client.clone();

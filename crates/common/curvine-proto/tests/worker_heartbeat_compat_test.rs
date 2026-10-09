@@ -92,6 +92,8 @@ fn test_worker_heartbeat_component_info_round_trip() {
     // wire on the reserved 1000+ range of the heartbeat.
     let req = WorkerHeartbeatRequest {
         component_info: Some(sample_component_info()),
+        transfer_inflight_budget_bytes: Some(100 * 1024 * 1024 * 1024),
+        worker_max_concurrent_tasks: Some(64),
         ..Default::default()
     };
 
@@ -104,6 +106,11 @@ fn test_worker_heartbeat_component_info_round_trip() {
     assert_eq!(info.protocol_version, Some(1));
     assert_eq!(info.min_protocol_version, Some(1));
     assert_eq!(info.capabilities.len(), 2);
+    assert_eq!(
+        decoded.transfer_inflight_budget_bytes,
+        Some(100 * 1024 * 1024 * 1024)
+    );
+    assert_eq!(decoded.worker_max_concurrent_tasks, Some(64));
 }
 
 #[test]
@@ -123,6 +130,8 @@ fn test_worker_heartbeat_legacy_empty_decodes() {
     let encoded = legacy.encode_to_vec();
     let decoded = WorkerHeartbeatRequest::decode(encoded.as_slice()).unwrap();
     assert!(decoded.component_info.is_none());
+    assert!(decoded.transfer_inflight_budget_bytes.is_none());
+    assert!(decoded.worker_max_concurrent_tasks.is_none());
     assert_eq!(decoded.software_version, "0.1.0");
     assert_eq!(decoded.worker_id, 7);
     assert_eq!(decoded.fs_ctime, 123_456);
@@ -168,6 +177,7 @@ fn test_worker_info_proto_legacy_empty_decodes() {
     let encoded = legacy.encode_to_vec();
     let decoded = WorkerInfoProto::decode(encoded.as_slice()).unwrap();
     assert!(decoded.component_info.is_none());
+    assert!(decoded.transfer_inflight_budget_bytes.is_none());
     assert_eq!(decoded.software_version.as_deref(), Some("0.1.0"));
     assert_eq!(decoded.address.worker_id, 7);
     assert_eq!(decoded.capacity, 100);

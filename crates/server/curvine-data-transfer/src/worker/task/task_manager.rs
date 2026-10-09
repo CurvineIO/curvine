@@ -20,7 +20,7 @@ use crate::worker::task::{
 };
 use curvine_client_core::file::{CurvineFileSystem, FsContext};
 use curvine_config::ClusterConf;
-use curvine_error::FsResult;
+use curvine_error::{FsError, FsResult};
 use curvine_job_client::TransferClient;
 use curvine_model::{JobTaskProgress, JobTaskState, LoadTaskInfo, TransferTaskReportInfo};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
@@ -28,7 +28,7 @@ use dashmap::mapref::entry::Entry;
 use log::{debug, info, warn};
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
@@ -41,16 +41,27 @@ pub struct TaskManager {
     transfer_client: Option<TransferClient>,
     transfer_reporters: Mutex<HashMap<Vec<String>, Weak<TransferProgressBatcher>>>,
     worker_session_id: String,
-    progress_interval_ms: u64,
-    transfer_progress_interval_ms: u64,
-    task_timeout_ms: u64,
-    worker_task_concurrency: usize,
     worker_task_semaphore: Arc<Semaphore>,
-    /// In-flight byte budget (design §3): admit rejects tasks that would push
-    /// aggregate estimated bytes over
-    /// `TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES` (10 GiB, on by
-    /// default).
-    inflight_budget_bytes: i64,
+    /// Serializes semaphore reconciliation so concurrent submits cannot
+    /// over-add or double-retire permits while resizing.
+    permit_lock: Arc<Mutex<()>>,
+    /// Runtime ceiling for concurrent tasks. The semaphore is reconciled to
+    /// this target by `update_worker_max_concurrent_tasks`.
+    worker_max_concurrent_tasks: Arc<AtomicUsize>,
+    /// Permits currently in circulation (available + held). Tracked so a
+    /// reduced target retires surplus permits instead of returning them.
+    issued_task_permits: Arc<AtomicUsize>,
+    /// Runtime per-task timeout, read at submit; running tasks keep the
+    /// value captured when they were submitted.
+    task_timeout_ms: Arc<AtomicU64>,
+    /// Runtime load-task progress report interval, read at submit.
+    task_report_interval_ms: Arc<AtomicU64>,
+    /// Fixed transfer-report interval from conf (0 = follow the job one).
+    transfer_report_interval_ms: u64,
+    /// Runtime in-flight byte budget. It starts at
+    /// `TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES` and can be safely
+    /// updated without restarting this worker.
+    inflight_budget_bytes: Arc<AtomicI64>,
     inflight_bytes: Arc<AtomicI64>,
 }
 
@@ -69,6 +80,45 @@ pub const WORKER_AT_CAPACITY_REJECT_PREFIX: &str = "worker_at_capacity";
 struct InflightByteGuard {
     inflight_bytes: Arc<AtomicI64>,
     bytes: i64,
+}
+
+/// Atomically reserves `estimated_bytes` against one snapshot of the runtime
+/// budget. A concurrent configuration update affects subsequent admissions;
+/// work already admitted is never interrupted.
+fn admit_inflight_bytes(
+    inflight_bytes: &AtomicI64,
+    budget_bytes: i64,
+    estimated_bytes: i64,
+) -> Result<(), String> {
+    let oversize = estimated_bytes > budget_bytes;
+    loop {
+        let current = inflight_bytes.load(Ordering::Acquire);
+        let Some(next) = current.checked_add(estimated_bytes) else {
+            return Err(format!(
+                "{}: inflight bytes {} + task {} would overflow budget accounting",
+                WORKER_AT_CAPACITY_REJECT_PREFIX, current, estimated_bytes
+            ));
+        };
+        if oversize {
+            if current != 0 {
+                return Err(format!(
+                    "{}: inflight bytes {} + oversized task {} would exceed budget {}",
+                    WORKER_AT_CAPACITY_REJECT_PREFIX, current, estimated_bytes, budget_bytes
+                ));
+            }
+        } else if next > budget_bytes {
+            return Err(format!(
+                "{}: inflight bytes {} + task {} would exceed budget {}",
+                WORKER_AT_CAPACITY_REJECT_PREFIX, current, estimated_bytes, budget_bytes
+            ));
+        }
+        if inflight_bytes
+            .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
 }
 
 impl Drop for InflightByteGuard {
@@ -161,15 +211,25 @@ impl TaskManager {
             transfer_client,
             transfer_reporters: Mutex::new(HashMap::new()),
             worker_session_id: worker_session_id.into(),
-            progress_interval_ms: conf.job.task_report_interval.as_millis() as u64,
-            transfer_progress_interval_ms: transfer_progress_interval.as_millis() as u64,
-            task_timeout_ms: conf.job.task_timeout.as_millis() as u64,
-            worker_task_concurrency: conf.job.worker_max_concurrent_tasks,
             worker_task_semaphore,
-            inflight_budget_bytes:
+            permit_lock: Arc::new(Mutex::new(())),
+            worker_max_concurrent_tasks: Arc::new(AtomicUsize::new(
+                conf.job.worker_max_concurrent_tasks,
+            )),
+            issued_task_permits: Arc::new(AtomicUsize::new(conf.job.worker_max_concurrent_tasks)),
+            task_timeout_ms: Arc::new(AtomicU64::new(conf.job.task_timeout.as_millis() as u64)),
+            task_report_interval_ms: Arc::new(AtomicU64::new(
+                conf.job.task_report_interval.as_millis() as u64,
+            )),
+            transfer_report_interval_ms: transfer_progress_interval.as_millis() as u64,
+            inflight_budget_bytes: Arc::new(AtomicI64::new(
                 curvine_config::TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES,
+            )),
             inflight_bytes: Arc::new(AtomicI64::new(0)),
         };
+        record_metric(|metrics| {
+            metrics.set_inflight_budget_bytes(mgr.transfer_inflight_budget_bytes())
+        });
 
         Ok(mgr)
     }
@@ -237,9 +297,34 @@ impl TaskManager {
         let task_id = task.task_id.clone();
         let source_path = task.source_path.clone();
         let context = Arc::new(TaskContext::new(task));
+        // Byte-budget admit (design §3.2): reject synchronously before the task
+        // enters the local queue, so a saturated worker never silently queues
+        // (the incident's "queued 112s" failure mode). Unknown sizes count at
+        // zero here; the scheduler-side default estimate already gates them.
+        let estimated_bytes = context.info.estimated_size.max(0);
+        let budget_bytes = self.transfer_inflight_budget_bytes();
+        let inflight_bytes = self.inflight_bytes.clone();
+        let reserve_inflight = || -> Result<Option<InflightByteGuard>, TaskSubmitResult> {
+            if budget_bytes <= 0 {
+                return Ok(None);
+            }
+            match admit_inflight_bytes(&inflight_bytes, budget_bytes, estimated_bytes) {
+                Ok(()) => Ok(Some(InflightByteGuard {
+                    inflight_bytes: inflight_bytes.clone(),
+                    bytes: estimated_bytes,
+                })),
+                Err(reason) => {
+                    record_metric(|metrics| metrics.inc_submit_rejected("inflight_budget"));
+                    Err(TaskSubmitResult::rejected(reason))
+                }
+            }
+        };
         let mut track_active = false;
 
-        match self.tasks.entry(task_id.clone()) {
+        // Reserve before replacing an existing context. A capacity rejection
+        // must leave the current task runnable; otherwise a rejected retry
+        // could cancel it and strand a Loading map entry without a runner.
+        let byte_guard = match self.tasks.entry(task_id.clone()) {
             Entry::Occupied(mut occ) => {
                 if let Some(new_report) = &context.info.transfer_report {
                     let old_report = occ.get().info.transfer_report.as_ref();
@@ -276,19 +361,29 @@ impl TaskManager {
                     }
                 }
 
+                let byte_guard = match reserve_inflight() {
+                    Ok(guard) => guard,
+                    Err(result) => return Ok(result),
+                };
                 let old = occ.insert(context.clone());
                 old.set_canceled("superseded by new submit");
                 warn!(
                     "cancel duplicate task {} (source_path={})",
                     old.info.task_id, old.info.source_path
                 );
+                byte_guard
             }
 
             Entry::Vacant(vac) => {
+                let byte_guard = match reserve_inflight() {
+                    Ok(guard) => guard,
+                    Err(result) => return Ok(result),
+                };
                 vac.insert(context.clone());
                 track_active = true;
+                byte_guard
             }
-        }
+        };
         record_metric(|metrics| metrics.inc_submit_accepted());
         if track_active {
             record_metric(|metrics| metrics.inc_active());
@@ -317,9 +412,9 @@ impl TaskManager {
 
         let progress_reporter = self.task_progress_reporter(&context);
         let progress_interval_ms = if context.info.transfer_report.is_some() {
-            self.transfer_progress_interval_ms
+            self.transfer_report_interval_ms
         } else {
-            self.progress_interval_ms
+            self.task_report_interval_ms.load(Ordering::Acquire)
         };
         let runner = LoadTaskRunner::new(
             context.clone(),
@@ -327,64 +422,15 @@ impl TaskManager {
             self.factory.clone(),
             progress_reporter,
             progress_interval_ms,
-            self.task_timeout_ms,
+            self.task_timeout_ms.load(Ordering::Acquire),
         );
-
-        // Byte-budget admit (design §3.2): reject synchronously before the task
-        // enters the local queue, so a saturated worker never silently queues
-        // (the incident's "queued 112s" failure mode). Unknown sizes count at
-        // zero here; the scheduler-side default estimate already gates them.
-        let estimated_bytes = context.info.estimated_size.max(0);
-        let byte_guard = if self.inflight_budget_bytes > 0 {
-            let oversize = estimated_bytes > self.inflight_budget_bytes;
-            // Atomic admit: CAS loop so concurrent submits cannot all observe
-            // the same current value and collectively exceed the budget
-            // (review P1). Oversized tasks (> budget) admit only when the
-            // worker is fully idle, matching the scheduler's idle-only rule;
-            // otherwise a 10GiB+ file would deadlock in a dispatch/reject loop.
-            let admitted = loop {
-                let current = self.inflight_bytes.load(Ordering::Acquire);
-                if oversize {
-                    if current != 0 {
-                        return Ok(TaskSubmitResult::rejected(format!(
-                            "{}: inflight bytes {} + oversized task {} would exceed budget {}",
-                            WORKER_AT_CAPACITY_REJECT_PREFIX,
-                            current,
-                            estimated_bytes,
-                            self.inflight_budget_bytes
-                        )));
-                    }
-                } else if current + estimated_bytes > self.inflight_budget_bytes {
-                    return Ok(TaskSubmitResult::rejected(format!(
-                        "{}: inflight bytes {} + task {} would exceed budget {}",
-                        WORKER_AT_CAPACITY_REJECT_PREFIX,
-                        current,
-                        estimated_bytes,
-                        self.inflight_budget_bytes
-                    )));
-                }
-                match self.inflight_bytes.compare_exchange_weak(
-                    current,
-                    current + estimated_bytes,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => break true,
-                    Err(_) => continue,
-                }
-            };
-            let _ = admitted;
-            Some(InflightByteGuard {
-                inflight_bytes: self.inflight_bytes.clone(),
-                bytes: estimated_bytes,
-            })
-        } else {
-            None
-        };
 
         let tasks = self.tasks.clone();
         let semaphore = self.worker_task_semaphore.clone();
         let context_this = context.clone();
+        let permit_lock = self.permit_lock.clone();
+        let issued_permits = self.issued_task_permits.clone();
+        let max_tasks = self.worker_max_concurrent_tasks.clone();
 
         // Spawn task with concurrency control. The byte admission is released
         // together with the semaphore permit when the runner exits (success,
@@ -403,6 +449,19 @@ impl TaskManager {
                     });
                     remove_task = runner.run().await;
                     drop(permit);
+                    // Under a pending shrink the just-returned permit is
+                    // surplus capacity: forget it (serialized with updates).
+                    {
+                        let _guard = permit_lock.lock();
+                        if issued_permits.load(Ordering::Acquire)
+                            > max_tasks.load(Ordering::Acquire)
+                        {
+                            if let Ok(surplus) = semaphore.try_acquire() {
+                                surplus.forget();
+                                issued_permits.fetch_sub(1, Ordering::AcqRel);
+                            }
+                        }
+                    }
                     record_metric(|metrics| {
                         metrics.dec_running();
                         metrics.set_permits_available(semaphore.available_permits());
@@ -423,10 +482,6 @@ impl TaskManager {
                         0,
                         Some("permit_acquire_failed"),
                     );
-                    record_metric(|metrics| {
-                        metrics.dec_queued();
-                        metrics.set_permits_available(semaphore.available_permits());
-                    });
                     log::error!("task {} failed to acquire permit: {}", task_id, e);
                 }
             }
@@ -483,6 +538,41 @@ impl TaskManager {
         Ok(Some(task.progress()))
     }
 
+    /// Current runtime Transfer byte-admission budget.
+    pub fn transfer_inflight_budget_bytes(&self) -> i64 {
+        self.inflight_budget_bytes.load(Ordering::Acquire)
+    }
+
+    /// Shared budget read by the worker heartbeat on every report.
+    pub fn inflight_budget_bytes(&self) -> Arc<AtomicI64> {
+        self.inflight_budget_bytes.clone()
+    }
+
+    /// Shared concurrency ceiling read by the worker heartbeat on every
+    /// report; resizing it also propagates to the scheduler this way.
+    pub fn worker_max_concurrent_tasks_shared(&self) -> Arc<AtomicUsize> {
+        self.worker_max_concurrent_tasks.clone()
+    }
+
+    /// Updates the runtime Transfer byte-admission budget. Existing tasks keep
+    /// running; new submissions observe the new value.
+    pub fn update_transfer_inflight_budget_bytes(&self, budget_bytes: i64) -> FsResult<i64> {
+        if budget_bytes <= 0 {
+            return Err(FsError::common(
+                "transfer_inflight_budget_bytes must be greater than zero",
+            ));
+        }
+        let previous = self
+            .inflight_budget_bytes
+            .swap(budget_bytes, Ordering::AcqRel);
+        record_metric(|metrics| metrics.set_inflight_budget_bytes(budget_bytes));
+        info!(
+            "updated worker transfer in-flight budget: previous={} current={}",
+            previous, budget_bytes
+        );
+        Ok(previous)
+    }
+
     pub fn get_fs_context(&self) -> Arc<FsContext> {
         self.fs.fs_context()
     }
@@ -532,8 +622,8 @@ impl TaskManager {
             let batcher = Arc::new(TransferProgressBatcher::new(
                 self.rt.clone(),
                 transfer_client,
-                self.worker_task_concurrency,
-                Duration::from_millis(self.transfer_progress_interval_ms),
+                self.worker_max_concurrent_tasks.load(Ordering::Acquire),
+                Duration::from_millis(self.transfer_report_interval_ms),
             ));
             reporters.insert(report_endpoints, Arc::downgrade(&batcher));
             batcher
@@ -557,6 +647,100 @@ impl TaskManager {
 
     pub fn available_worker_task_permits(&self) -> usize {
         self.worker_task_semaphore.available_permits()
+    }
+
+    /// Current runtime per-task timeout in milliseconds.
+    pub fn task_timeout_ms(&self) -> u64 {
+        self.task_timeout_ms.load(Ordering::Acquire)
+    }
+
+    /// Updates the runtime per-task timeout. Running tasks keep the deadline
+    /// captured at submit; new submissions observe the new value. Accepts
+    /// durations like "30m" / "1h" via DurationUnit or raw milliseconds.
+    pub fn update_task_timeout(&self, timeout_ms: u64) -> FsResult<u64> {
+        if timeout_ms == 0 {
+            return Err(FsError::common("task_timeout must be greater than zero"));
+        }
+        let previous = self.task_timeout_ms.swap(timeout_ms, Ordering::AcqRel);
+        info!(
+            "updated worker task timeout: previous={}ms current={}ms",
+            previous, timeout_ms
+        );
+        Ok(previous)
+    }
+
+    /// Current runtime load-task progress report interval in milliseconds.
+    pub fn task_report_interval_ms(&self) -> u64 {
+        self.task_report_interval_ms.load(Ordering::Acquire)
+    }
+
+    /// Updates the runtime load-task progress report interval. Applies to
+    /// tasks submitted afterwards; running tasks keep the old cadence.
+    pub fn update_task_report_interval(&self, interval_ms: u64) -> FsResult<u64> {
+        if interval_ms == 0 {
+            return Err(FsError::common(
+                "task_report_interval must be greater than zero",
+            ));
+        }
+        let previous = self
+            .task_report_interval_ms
+            .swap(interval_ms, Ordering::AcqRel);
+        info!(
+            "updated worker task report interval: previous={}ms current={}ms",
+            previous, interval_ms
+        );
+        Ok(previous)
+    }
+
+    /// Current runtime ceiling for concurrent transfer/load tasks.
+    pub fn worker_max_concurrent_tasks(&self) -> usize {
+        self.worker_max_concurrent_tasks.load(Ordering::Acquire)
+    }
+
+    /// Resizes the concurrency ceiling and reconciles the semaphore. Growing
+    /// adds permits immediately; shrinking retires surplus permits as running
+    /// tasks finish (holders keep running). Serialized so concurrent updates
+    /// or submits cannot double-count permits.
+    pub fn update_worker_max_concurrent_tasks(&self, target: usize) -> FsResult<usize> {
+        if target == 0 {
+            return Err(FsError::common(
+                "worker_max_concurrent_tasks must be greater than zero",
+            ));
+        }
+        let previous = self
+            .worker_max_concurrent_tasks
+            .swap(target, Ordering::AcqRel);
+        {
+            let _guard = self.permit_lock.lock();
+            let issued = self.issued_task_permits.load(Ordering::Acquire);
+            if target > issued {
+                self.worker_task_semaphore.add_permits(target - issued);
+                self.issued_task_permits.store(target, Ordering::Release);
+            } else {
+                // Retire surplus permits by forgetting them: a dropped permit
+                // would return to the pool and undo the shrink. Permits held
+                // by running tasks retire at task exit instead.
+                while self.issued_task_permits.load(Ordering::Acquire) > target {
+                    match self.worker_task_semaphore.clone().try_acquire_owned() {
+                        Ok(permit) => {
+                            permit.forget();
+                            self.issued_task_permits.fetch_sub(1, Ordering::AcqRel);
+                        }
+                        // All remaining permits are held by running tasks.
+                        Err(_) => break,
+                    }
+                }
+            }
+            record_metric(|metrics| {
+                metrics.set_permits_max(target);
+                metrics.set_permits_available(self.worker_task_semaphore.available_permits());
+            });
+        }
+        info!(
+            "updated worker max concurrent tasks: previous={} current={}",
+            previous, target
+        );
+        Ok(previous)
     }
 }
 
@@ -632,3 +816,7 @@ mod budget_tests {
         assert_eq!(bytes.load(Ordering::Relaxed), 42);
     }
 }
+
+#[cfg(test)]
+#[path = "tests/task_manager_budget_test.rs"]
+mod task_manager_budget_test;

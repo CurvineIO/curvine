@@ -99,6 +99,12 @@ message WorkerHeartbeatRequest {
     optional bool transfer_attempt_safe_output = 15 [default = false];
     optional bool transfer_source_read_plan = 16 [default = false];
     optional bool transfer_segment_group = 17 [default = false];
+    // Runtime Transfer admission budget. Legacy workers omit it; the master
+    // preserves absence as the default scheduler budget.
+    optional int64 transfer_inflight_budget_bytes = 18;
+    // Runtime concurrency ceiling. Legacy workers omit it; the master
+    // preserves absence as the configured scheduler limit.
+    optional int64 worker_max_concurrent_tasks = 22;
 
     // Structured version/protocol metadata reported by the worker on the
     // reserved 1000+ cross-cutting range. Legacy workers omit this field and

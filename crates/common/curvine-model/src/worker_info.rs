@@ -75,6 +75,12 @@ pub struct WorkerInfo {
     pub status: WorkerStatus,
     pub worker_session_id: String,
     pub transfer_capabilities: TransferWorkerCapabilities,
+    /// Runtime Transfer admission budget from the latest heartbeat. Zero
+    /// represents a legacy worker that did not report this capability.
+    pub transfer_inflight_budget_bytes: i64,
+    /// Runtime concurrency ceiling from the latest heartbeat. Zero represents
+    /// a legacy worker that did not report this capability.
+    pub worker_max_concurrent_tasks: usize,
     /// Structured version/protocol metadata reported by the worker on its
     /// heartbeat. `None` means a legacy worker that only sent the display
     /// string `software_version`.
@@ -108,9 +114,31 @@ impl WorkerInfo {
             status: WorkerStatus::Live,
             worker_session_id: String::new(),
             transfer_capabilities: TransferWorkerCapabilities::default(),
+            transfer_inflight_budget_bytes: 0,
+            worker_max_concurrent_tasks: 0,
             component_info: None,
             scheduled_bytes: 0,
             scheduled_since_ms: 0,
+        }
+    }
+
+    /// Returns the worker-reported budget, or `default_budget` for a legacy
+    /// heartbeat that omitted it.
+    pub fn effective_transfer_inflight_budget_bytes(&self, default_budget: i64) -> i64 {
+        if self.transfer_inflight_budget_bytes > 0 {
+            self.transfer_inflight_budget_bytes
+        } else {
+            default_budget
+        }
+    }
+
+    /// Returns the worker-reported concurrency ceiling, or `default_limit`
+    /// for a legacy heartbeat that omitted it.
+    pub fn effective_worker_max_concurrent_tasks(&self, default_limit: usize) -> usize {
+        if self.worker_max_concurrent_tasks > 0 {
+            self.worker_max_concurrent_tasks
+        } else {
+            default_limit
         }
     }
 
@@ -246,6 +274,8 @@ impl Default for WorkerInfo {
             status: WorkerStatus::Live,
             worker_session_id: String::new(),
             transfer_capabilities: TransferWorkerCapabilities::default(),
+            transfer_inflight_budget_bytes: 0,
+            worker_max_concurrent_tasks: 0,
             component_info: None,
             scheduled_bytes: 0,
             scheduled_since_ms: 0,

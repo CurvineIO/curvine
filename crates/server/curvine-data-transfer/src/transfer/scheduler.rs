@@ -227,8 +227,8 @@ impl InflightLedger {
 
     fn account(&self, worker_id: u32, count: u64, bytes: i64) {
         let mut entry = self.entries.entry(worker_id).or_insert((0u64, 0i64));
-        entry.0 += count;
-        entry.1 += bytes;
+        entry.0 = entry.0.saturating_add(count);
+        entry.1 = entry.1.saturating_add(bytes);
     }
 
     fn get(&self, worker_id: u32) -> (u64, i64) {
@@ -2387,25 +2387,27 @@ pub(crate) fn dispatch_result_message(dispatched: usize, blocked: usize) -> Stri
 }
 
 /// Candidates for [`TransferScheduler::choose_worker`]: workers that pass the
-/// batch-capability gate, the count gate, and the byte gate (oversize tasks
-/// only on idle workers, design §4.2). Pure - the ledger lookup is injected so
-/// the gating rules can be unit-tested without a full scheduler.
+/// batch-capability gate, their heartbeat-reported count/byte gates (oversize
+/// tasks only on idle workers, design §4.2). Pure - the ledger lookup is
+/// injected so the gating rules can be unit-tested without a full scheduler.
 fn choose_worker_admitted(
     workers: &[WorkerInfo],
     estimated_bytes: i64,
-    count_limit: usize,
-    byte_limit: i64,
+    default_count_limit: usize,
+    default_byte_limit: i64,
     inflight: impl Fn(u32) -> (u64, i64),
 ) -> Vec<(i64, usize)> {
-    let oversize = byte_limit > 0 && estimated_bytes > byte_limit;
     let mut admitted: Vec<(i64, usize)> = Vec::with_capacity(workers.len());
     for (index, worker) in workers.iter().enumerate() {
         let (count, bytes) = inflight(worker.worker_id());
+        let count_limit = worker.effective_worker_max_concurrent_tasks(default_count_limit);
         if count_limit > 0 && count >= count_limit as u64 {
             continue;
         }
+        let byte_limit = worker.effective_transfer_inflight_budget_bytes(default_byte_limit);
+        let oversize = byte_limit > 0 && estimated_bytes > byte_limit;
         // Oversize tasks only run on an idle worker to avoid starvation.
-        let fits = byte_limit <= 0 || bytes + estimated_bytes <= byte_limit;
+        let fits = byte_limit <= 0 || bytes.saturating_add(estimated_bytes) <= byte_limit;
         let take = if oversize { bytes == 0 } else { fits };
         if take {
             admitted.push((bytes, index));
@@ -2630,7 +2632,8 @@ mod tests {
             1,
         );
         let workers = [w1, w2];
-        // 100-byte budget, 80 already used on w1: only w2 fits a 30-byte task.
+        // Legacy workers use the supplied 100-byte compatibility default. With
+        // 80 already used on w1, only w2 fits a 30-byte task.
         let admitted =
             choose_worker_admitted(
                 &workers,
@@ -2655,18 +2658,54 @@ mod tests {
                                        // Zero byte_limit disables byte gating entirely.
         let admitted = choose_worker_admitted(&workers, 150, 0, 0, |_| (0, 1000));
         assert_eq!(admitted.len(), 2);
+
+        // A worker that reported 200 bytes may receive a 150-byte task while
+        // a non-idle worker that kept the legacy 100-byte default cannot.
+        let mut w1 = WorkerInfo::new(
+            WorkerAddress {
+                worker_id: 1,
+                ..Default::default()
+            },
+            1,
+        );
+        let mut w2 = WorkerInfo::new(
+            WorkerAddress {
+                worker_id: 2,
+                ..Default::default()
+            },
+            1,
+        );
+        w1.transfer_inflight_budget_bytes = 100;
+        w2.transfer_inflight_budget_bytes = 200;
+        let admitted = choose_worker_admitted(&[w1, w2], 150, 0, 100, |id| {
+            if id == 1 {
+                (1, 1)
+            } else {
+                (0, 0)
+            }
+        });
+        assert_eq!(admitted, vec![(0, 1)]);
     }
 
     #[test]
     fn choose_worker_enforces_count_gate() {
         use super::choose_worker_admitted;
         let w1 = WorkerInfo::new(Default::default(), 1);
-        // count_limit=2, w1 already at 2: excluded.
+        // Default count_limit=2, w1 already at 2: excluded.
         let admitted = choose_worker_admitted(std::slice::from_ref(&w1), 10, 2, 0, |_| (2, 0));
         assert!(admitted.is_empty());
         // count_limit=0 disables the count gate.
         let admitted = choose_worker_admitted(&[w1], 10, 0, 0, |_| (2, 0));
         assert_eq!(admitted.len(), 1);
+        // A worker that reported its own ceiling overrides the default: at 4
+        // in-flight it still fits under its reported limit of 5.
+        let mut w2 = WorkerInfo::new(Default::default(), 1);
+        w2.worker_max_concurrent_tasks = 5;
+        let admitted = choose_worker_admitted(std::slice::from_ref(&w2), 10, 2, 0, |_| (4, 0));
+        assert_eq!(admitted.len(), 1);
+        // ...and is excluded once it reaches its own reported limit.
+        let admitted = choose_worker_admitted(std::slice::from_ref(&w2), 10, 2, 0, |_| (5, 0));
+        assert!(admitted.is_empty());
     }
 
     #[test]

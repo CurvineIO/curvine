@@ -386,6 +386,10 @@ impl ProtoUtils {
             transfer_attempt_safe_output: Some(src.transfer_capabilities.attempt_safe_output),
             transfer_source_read_plan: Some(src.transfer_capabilities.source_read_plan),
             transfer_segment_group: Some(src.transfer_capabilities.segment_group),
+            transfer_inflight_budget_bytes: (src.transfer_inflight_budget_bytes > 0)
+                .then_some(src.transfer_inflight_budget_bytes),
+            worker_max_concurrent_tasks: (src.worker_max_concurrent_tasks > 0)
+                .then_some(src.worker_max_concurrent_tasks as i64),
             software_version: Some(src.software_version),
             startup_time_ms: Some(src.startup_time_ms),
             component_info: src.component_info,
@@ -502,6 +506,11 @@ impl ProtoUtils {
                     source_read_plan: info.transfer_source_read_plan.unwrap_or(false),
                     segment_group: info.transfer_segment_group.unwrap_or(false),
                 },
+                transfer_inflight_budget_bytes: info
+                    .transfer_inflight_budget_bytes
+                    .unwrap_or_default(),
+                worker_max_concurrent_tasks: info.worker_max_concurrent_tasks.unwrap_or_default()
+                    as usize,
                 storage_map,
                 software_version: info.software_version.unwrap_or_default(),
                 startup_time_ms: info.startup_time_ms.unwrap_or_default(),

@@ -24,6 +24,7 @@ use curvine_runtime::runtime::{GroupExecutor, Runtime};
 use curvine_runtime::sync::StateCtl;
 use dashmap::{DashMap, DashSet};
 use log::info;
+use std::sync::atomic::{AtomicI64, AtomicUsize};
 use std::sync::Arc;
 
 /// Worker block management role.
@@ -48,6 +49,7 @@ pub struct BlockActor {
 }
 
 impl BlockActor {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         rt: Arc<Runtime>,
         conf: &ClusterConf,
@@ -56,6 +58,8 @@ impl BlockActor {
         store: BlockStore,
         worker_ctl: StateCtl,
         startup_time_ms: u64,
+        transfer_inflight_budget_bytes: Arc<AtomicI64>,
+        worker_max_concurrent_tasks: Arc<AtomicUsize>,
     ) -> CommonResult<BlockActor> {
         let context = FsContext::with_rt(conf.clone(), rt)?;
         let context = Arc::new(context);
@@ -67,6 +71,8 @@ impl BlockActor {
             conf.worker.weight,
             worker_session_id,
             startup_time_ms,
+            transfer_inflight_budget_bytes,
+            worker_max_concurrent_tasks,
         );
         let executor = GroupExecutor::new(
             "worker-block-executor",

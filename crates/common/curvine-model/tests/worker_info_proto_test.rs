@@ -22,6 +22,8 @@ fn sample_worker() -> WorkerInfo {
     worker.fs_used = 300;
     worker.non_fs_used = 100;
     worker.reserved_bytes = 50;
+    worker.transfer_inflight_budget_bytes = 100 * 1024 * 1024 * 1024;
+    worker.worker_max_concurrent_tasks = 64;
     worker.storage_map.insert(
         "disk-0".to_string(),
         StorageInfo {
@@ -84,6 +86,11 @@ fn worker_info_from_pb_derives_block_num_from_storage_map() {
         .expect("worker");
 
     assert_eq!(restored.block_num, 42);
+    assert_eq!(
+        restored.transfer_inflight_budget_bytes,
+        100 * 1024 * 1024 * 1024
+    );
+    assert_eq!(restored.worker_max_concurrent_tasks, 64);
 }
 
 #[test]
@@ -92,6 +99,8 @@ fn worker_info_from_pb_treats_missing_optional_fields_as_legacy_defaults() {
     pb.block_num = None;
     pb.status = None;
     pb.weight = None;
+    pb.transfer_inflight_budget_bytes = None;
+    pb.worker_max_concurrent_tasks = None;
 
     let restored = ProtoUtils::worker_info_from_pb(vec![pb])
         .pop()
@@ -100,6 +109,8 @@ fn worker_info_from_pb_treats_missing_optional_fields_as_legacy_defaults() {
     assert_eq!(restored.status, WorkerStatus::Live);
     assert_eq!(restored.block_num, 42);
     assert_eq!(restored.weight, WorkerInfo::default_weight());
+    assert_eq!(restored.transfer_inflight_budget_bytes, 0);
+    assert_eq!(restored.worker_max_concurrent_tasks, 0);
 }
 
 #[test]

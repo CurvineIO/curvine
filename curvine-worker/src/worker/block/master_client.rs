@@ -22,6 +22,7 @@ use curvine_model::{
 };
 use curvine_proto::*;
 use curvine_sys::version;
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 //Worker and master communicate with the customer client.
@@ -37,6 +38,11 @@ pub struct MasterClient {
     pub(crate) worker_session_id: String,
     pub(crate) software_version: String,
     pub(crate) startup_time_ms: u64,
+    /// Runtime budget shared with TaskManager and reported on every heartbeat.
+    pub(crate) transfer_inflight_budget_bytes: Arc<AtomicI64>,
+    /// Runtime concurrency ceiling shared with TaskManager, reported on every
+    /// heartbeat.
+    pub(crate) worker_max_concurrent_tasks: Arc<AtomicUsize>,
     /// Prebuilt structured component metadata reported on every heartbeat.
     /// Constant for the lifetime of the worker process, so it is built once
     /// and cloned into each request instead of re-allocated on the hot path.
@@ -44,6 +50,7 @@ pub struct MasterClient {
 }
 
 impl MasterClient {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         context: Arc<FsContext>,
         cluster_id: impl Into<String>,
@@ -52,6 +59,8 @@ impl MasterClient {
         worker_weight: u32,
         worker_session_id: impl Into<String>,
         startup_time_ms: u64,
+        transfer_inflight_budget_bytes: Arc<AtomicI64>,
+        worker_max_concurrent_tasks: Arc<AtomicUsize>,
     ) -> Self {
         // Directly reused file system client service.
         let fs_client = FsClient::new(context);
@@ -66,6 +75,8 @@ impl MasterClient {
             worker_session_id: worker_session_id.into(),
             software_version: version::VERSION.to_string(),
             startup_time_ms,
+            transfer_inflight_budget_bytes,
+            worker_max_concurrent_tasks,
             component_info,
         }
     }
@@ -90,6 +101,12 @@ impl MasterClient {
             transfer_attempt_safe_output: Some(transfer_capabilities.attempt_safe_output),
             transfer_source_read_plan: Some(transfer_capabilities.source_read_plan),
             transfer_segment_group: Some(transfer_capabilities.segment_group),
+            transfer_inflight_budget_bytes: Some(
+                self.transfer_inflight_budget_bytes.load(Ordering::Acquire),
+            ),
+            worker_max_concurrent_tasks: Some(
+                self.worker_max_concurrent_tasks.load(Ordering::Acquire) as i64,
+            ),
             software_version: self.software_version.clone(),
             fs_ctime: self.startup_time_ms as i64,
             component_info: Some(self.component_info.clone()),

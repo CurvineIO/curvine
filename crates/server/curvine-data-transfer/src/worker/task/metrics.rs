@@ -37,6 +37,7 @@ pub struct WorkerTransferMetrics {
     tasks_queued: Gauge,
     permits_available: Gauge,
     permits_max: Gauge,
+    inflight_budget_bytes: Gauge,
     queue_duration_us: HistogramVec,
 }
 
@@ -162,6 +163,11 @@ impl WorkerTransferMetrics {
                 "Configured maximum concurrent transfer tasks on this worker",
             )
             .map_err(|err| FsError::common(err.to_string()))?,
+            inflight_budget_bytes: m::new_gauge(
+                "worker_transfer_task_inflight_budget_bytes",
+                "Current runtime Transfer in-flight byte admission budget on this worker",
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
             queue_duration_us: m::new_histogram_vec_with_buckets(
                 "worker_transfer_task_queue_duration_us",
                 "Time a transfer task waits for a concurrency permit before running, in microseconds",
@@ -189,6 +195,10 @@ impl WorkerTransferMetrics {
 
     pub fn set_permits_available(&self, value: usize) {
         self.permits_available.set(value as i64);
+    }
+
+    pub fn set_inflight_budget_bytes(&self, value: i64) {
+        self.inflight_budget_bytes.set(value);
     }
 
     pub fn inc_submit_accepted(&self) {

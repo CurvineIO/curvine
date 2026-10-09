@@ -197,6 +197,12 @@ message WorkerInfoProto {
     optional bool transfer_attempt_safe_output = 16 [default = false];
     optional bool transfer_source_read_plan = 17 [default = false];
     optional bool transfer_segment_group = 20 [default = false];
+    // Runtime Transfer admission budget reported by the worker. Absence means
+    // the consumer must use its compatibility default.
+    optional int64 transfer_inflight_budget_bytes = 21;
+    // Runtime concurrency ceiling reported by the worker. Absence means the
+    // consumer must use its configured default.
+    optional int64 worker_max_concurrent_tasks = 22;
     optional string software_version = 18 [default = ""];
     optional uint64 startup_time_ms = 19 [default = 0];
 

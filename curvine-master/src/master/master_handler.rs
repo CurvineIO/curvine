@@ -804,6 +804,8 @@ impl MasterHandler {
                 source_read_plan: header.transfer_source_read_plan.unwrap_or(false),
                 segment_group: header.transfer_segment_group.unwrap_or(false),
             },
+            header.transfer_inflight_budget_bytes.unwrap_or_default(),
+            header.worker_max_concurrent_tasks.unwrap_or_default() as usize,
             header.software_version,
             u64::try_from(header.fs_ctime).unwrap_or_default(),
             ProtoUtils::storage_info_list_from_pb(header.storages),
@@ -1277,6 +1279,7 @@ mod tests {
             address: ProtoUtils::worker_address_to_pb(&address),
             software_version: "0.1.0-test".to_string(),
             fs_ctime: 123_456,
+            transfer_inflight_budget_bytes: Some(100 * 1024 * 1024 * 1024),
             component_info: Some(component_info.clone()),
             ..Default::default()
         };
@@ -1291,6 +1294,10 @@ mod tests {
             .unwrap();
         assert_eq!(worker.software_version, "0.1.0-test");
         assert_eq!(worker.startup_time_ms, 123_456);
+        assert_eq!(
+            worker.transfer_inflight_budget_bytes,
+            100 * 1024 * 1024 * 1024
+        );
         // Structured version metadata survives heartbeat -> WorkerInfo ->
         // WorkerInfoProto (filesystem_info) -> WorkerInfo round trip.
         assert_eq!(worker.component_info, Some(component_info));
