@@ -27,9 +27,11 @@ pub struct MasterConf {
     pub rpc_port: u16,
     /// Prometheus `/metrics` HTTP port for the master process.
     pub web_port: u16,
-    /// When true, master startup fails if the Prometheus `/metrics` listener cannot bind.
-    /// Defaults to false so metrics port issues do not block master availability; set
-    /// explicitly to true for fail-fast observability hardening.
+    /// When true, master startup fails if the Prometheus `/metrics` (and `/healthz`,
+    /// `/readyz`) listener cannot bind. Defaults to true: the listener also backs the
+    /// liveness/readiness probes, so silently running without it would hide a broken
+    /// probe endpoint from orchestration. Set to false only to tolerate a degraded
+    /// observability port.
     pub metrics_required: bool,
     pub io_threads: usize,
     pub worker_threads: usize,
@@ -266,7 +268,7 @@ impl Default for MasterConf {
             hostname: ClusterConf::DEFAULT_HOSTNAME.to_string(),
             rpc_port: ClusterConf::DEFAULT_MASTER_PORT,
             web_port: ClusterConf::DEFAULT_MASTER_WEB_PORT,
-            metrics_required: false,
+            metrics_required: true,
             io_threads: 32,
             worker_threads: Utils::worker_threads(32),
             actor_threads: 4,

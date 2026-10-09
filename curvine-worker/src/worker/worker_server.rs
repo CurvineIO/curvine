@@ -29,7 +29,7 @@ use curvine_rpc::server::{RpcServer, ServerStateListener};
 use curvine_runtime::common::Utils;
 use curvine_runtime::common::{LocalTime, Logger};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
-use curvine_runtime::sync::FastMutex;
+use curvine_runtime::sync::{FastMutex, StateCtl};
 #[cfg(feature = "spdk")]
 use curvine_storage_spdk::SpdkEnv;
 use curvine_web::server::{WebHandlerService, WebServer};
@@ -50,6 +50,9 @@ pub struct WorkerService {
     rt: Arc<Runtime>,
     replication_manager: Arc<WorkerReplicationManager>,
     fault_http: FaultHttpControl,
+    /// Rpc server state handle, set once the rpc server exists so the web
+    /// `/healthz` route can report whether the worker is serving.
+    server_state: Arc<OnceCell<StateCtl>>,
     /// Compatibility policy applied to client peers on data-plane connections.
     /// Built once from `worker.compatibility` config (diagnose by default) and
     /// shared by every per-connection `WorkerHandler` through an `Arc`, so
@@ -79,9 +82,15 @@ impl WorkerService {
             rt,
             replication_manager,
             fault_http,
+            server_state: Arc::new(OnceCell::new()),
             compatibility_policy: Arc::new(conf.worker.compatibility.to_policy()),
         };
         Ok(ws)
+    }
+
+    /// Called once after the rpc server is created; later calls are ignored.
+    pub(crate) fn set_server_state(&self, state: StateCtl) {
+        let _ = self.server_state.set(state);
     }
 
     pub fn clone_rt(&self) -> Arc<Runtime> {
@@ -123,6 +132,7 @@ impl WebHandlerService for WorkerService {
     fn get_handler(&self) -> Self::Item {
         WorkerRouterHandler {
             fault_http: self.fault_http.clone(),
+            server_state: self.server_state.clone(),
         }
     }
 }
@@ -219,6 +229,7 @@ impl Worker {
 
         let block_store = service.store.clone();
         let rpc_server = RpcServer::with_rt(rt.clone(), conf.worker_server_conf(), service.clone());
+        service.set_server_state(rpc_server.new_state_ctl());
 
         let web_server = WebServer::with_rt(rt.clone(), conf.worker_web_conf(), service.clone());
 

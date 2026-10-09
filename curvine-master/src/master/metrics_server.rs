@@ -16,6 +16,7 @@ use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Extension, Router};
 use curvine_core_error::{err_box, CommonResult};
@@ -29,7 +30,7 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 use crate::master::fs::MasterFilesystem;
-use crate::master::Master;
+use crate::master::{Master, MasterState};
 
 #[derive(Clone)]
 struct MasterMetricsHandler {
@@ -41,13 +42,52 @@ async fn metrics(Extension(handler): Extension<Arc<MasterMetricsHandler>>) -> Fs
     Ok(metrics.text_output(handler.fs.clone())?)
 }
 
+async fn healthz(
+    Extension(handler): Extension<Arc<MasterMetricsHandler>>,
+) -> (StatusCode, &'static str) {
+    health_status(handler.fs.master_monitor.journal_state())
+}
+
+async fn readyz(
+    Extension(handler): Extension<Arc<MasterMetricsHandler>>,
+) -> (StatusCode, &'static str) {
+    ready_status(handler.fs.master_monitor.journal_state())
+}
+
+/// Liveness semantics: once the journal role is known the master is serving, so
+/// both the active (leader) and the standby (follower) node report healthy.
+fn health_status(state: MasterState) -> (StatusCode, &'static str) {
+    match state {
+        MasterState::Active | MasterState::Standby => (StatusCode::OK, "ok\n"),
+        MasterState::SafeMode | MasterState::Exit => {
+            (StatusCode::SERVICE_UNAVAILABLE, "master is not serving\n")
+        }
+    }
+}
+
+/// Readiness semantics: only the active (leader) master can serve metadata, so
+/// a standby answers 503 and traffic should be routed to the leader instead.
+fn ready_status(state: MasterState) -> (StatusCode, &'static str) {
+    match state {
+        MasterState::Active => (StatusCode::OK, "ok\n"),
+        MasterState::Standby => (StatusCode::SERVICE_UNAVAILABLE, "not ready: standby\n"),
+        MasterState::SafeMode | MasterState::Exit => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not ready: master is not serving\n",
+        ),
+    }
+}
+
 fn metrics_router(handler: MasterMetricsHandler) -> Router {
     Router::new()
         .route("/metrics", get(metrics))
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .layer(Extension(Arc::new(handler)))
 }
 
-/// Minimal HTTP server exposing only Prometheus `/metrics` for the master process.
+/// Minimal HTTP server exposing Prometheus `/metrics` and the `/healthz`
+/// (liveness) and `/readyz` (leader-only readiness) probe endpoints.
 pub struct MasterMetricsServer {
     rt: Arc<Runtime>,
     fs: MasterFilesystem,
@@ -157,5 +197,64 @@ pub async fn wait_for_metrics_bind(
             error!("Master metrics server bind timed out after 5s on port {port}");
             err_box!("Master metrics server bind timed out after 5s on port {port}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::master::MasterMonitor;
+    use curvine_raft::raft::RoleState;
+    use curvine_runtime::sync::StateCtl;
+
+    fn health_with_role(role: RoleState) -> (StatusCode, &'static str) {
+        let monitor = MasterMonitor::new(StateCtl::new(role.into()), StateCtl::new(0));
+        health_status(monitor.journal_state())
+    }
+
+    #[test]
+    fn healthz_ok_for_active_and_standby() {
+        assert_eq!(health_with_role(RoleState::Leader).0, StatusCode::OK);
+        assert_eq!(health_with_role(RoleState::Follower).0, StatusCode::OK);
+    }
+
+    #[test]
+    fn healthz_unavailable_before_role_and_after_exit() {
+        let init = health_with_role(RoleState::Init);
+        assert_eq!(init.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(init.1, "master is not serving\n");
+
+        assert_eq!(
+            health_with_role(RoleState::Exit).0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    fn ready_with_role(role: RoleState) -> (StatusCode, &'static str) {
+        let monitor = MasterMonitor::new(StateCtl::new(role.into()), StateCtl::new(0));
+        ready_status(monitor.journal_state())
+    }
+
+    #[test]
+    fn readyz_ok_only_on_leader() {
+        let leader = ready_with_role(RoleState::Leader);
+        assert_eq!(leader.0, StatusCode::OK);
+        assert_eq!(leader.1, "ok\n");
+    }
+
+    #[test]
+    fn readyz_unavailable_for_standby_and_exit() {
+        let standby = ready_with_role(RoleState::Follower);
+        assert_eq!(standby.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(standby.1, "not ready: standby\n");
+
+        let init = ready_with_role(RoleState::Init);
+        assert_eq!(init.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(init.1, "not ready: master is not serving\n");
+
+        assert_eq!(
+            ready_with_role(RoleState::Exit).0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }

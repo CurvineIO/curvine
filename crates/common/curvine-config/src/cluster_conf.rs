@@ -586,7 +586,7 @@ mod port_layout_tests {
         assert_eq!(conf.master.web_port, ClusterConf::DEFAULT_MASTER_WEB_PORT);
         assert_eq!(conf.web.port, ClusterConf::DEFAULT_WEB_PORT);
         assert_ne!(conf.master.web_port, conf.web.port);
-        assert!(!conf.master.metrics_required);
+        assert!(conf.master.metrics_required);
     }
 
     #[test]
