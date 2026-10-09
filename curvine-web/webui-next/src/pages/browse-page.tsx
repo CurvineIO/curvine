@@ -45,6 +45,7 @@ import { UfsSyncPanel, UploadBatchesPanel } from './browse/sync-panels'
 import type { BrowseRow, TrackedUploadBatch, UfsSyncBatch, UfsSyncJob } from './browse/types'
 import {
   fileName,
+  isReadOnlyMount,
   isTerminalSyncState,
   joinPath,
   normalizePath,
@@ -212,6 +213,19 @@ export function BrowsePage() {
     (path: string) =>
       mounts.some((mount) => mount?.cv_path && normalizePath(path) === normalizePath(mount.cv_path)),
     [mounts]
+  )
+
+  const isReadOnlyMountedPath = useCallback(
+    (path: string, source: MountInfo[] = mounts) => {
+      const owner = source
+        .filter((mount) => mount?.cv_path && isPathInside(path, mount.cv_path))
+        .sort(
+          (left, right) =>
+            normalizePath(right.cv_path).length - normalizePath(left.cv_path).length
+        )[0]
+      return isReadOnlyMount(owner)
+    },
+    [mounts, isPathInside]
   )
 
   const ensureMounts = useCallback(async () => {
@@ -997,11 +1011,32 @@ export function BrowsePage() {
   const skippedByFree = selectedItems.length - freeableSelected.length
 
   /** Mount roots are managed from the Mounts page, so batch delete passes over them. */
-  const deletableSelected = useMemo(
-    () => selectedItems.filter((item) => !(item.path && isMountRoot(String(item.path)))),
-    [selectedItems, isMountRoot]
+  const readOnlyDeleteSelected = useMemo(
+    () =>
+      selectedItems.filter(
+        (item) =>
+          item.path &&
+          !isMountRoot(String(item.path)) &&
+          isReadOnlyMountedPath(String(item.path))
+      ),
+    [selectedItems, isMountRoot, isReadOnlyMountedPath]
   )
-  const skippedByDelete = selectedItems.length - deletableSelected.length
+  const deletableSelected = useMemo(
+    () =>
+      selectedItems.filter(
+        (item) =>
+          item.path &&
+          !isMountRoot(String(item.path)) &&
+          !isReadOnlyMountedPath(String(item.path))
+      ),
+    [selectedItems, isMountRoot, isReadOnlyMountedPath]
+  )
+  const mountedDeleteCount = deletableSelected.filter(
+    (item) => item.path && isMountedPath(String(item.path))
+  ).length
+  const skippedByDelete = selectedItems.filter(
+    (item) => item.path && isMountRoot(String(item.path))
+  ).length
 
   /* -------------------------------------------------------------- handlers */
 
@@ -1155,6 +1190,12 @@ export function BrowsePage() {
       : t('browse.delete.confirmFile', { path: item.path })
   }
 
+  function deleteTargetWarning(item: BrowseRow): string {
+    return item.path && isMountedPath(String(item.path))
+      ? t('browse.delete.warningMounted')
+      : t('browse.delete.warningCurvine')
+  }
+
   async function performFree(path: string, recursive: boolean) {
     setSubmitting(true)
     try {
@@ -1223,9 +1264,29 @@ export function BrowsePage() {
 
   function bulkDeleteMessage(): string {
     const base = t('browse.bulk.deleteConfirm', { count: deletableSelected.length })
-    return skippedByDelete
-      ? `${base} ${t('browse.bulk.deleteSkipped', { count: skippedByDelete })}`
-      : base
+    const messages = [base]
+    if (skippedByDelete) {
+      messages.push(t('browse.bulk.deleteSkipped', { count: skippedByDelete }))
+    }
+    if (readOnlyDeleteSelected.length) {
+      messages.push(
+        t('browse.bulk.deleteReadOnlySkipped', { count: readOnlyDeleteSelected.length })
+      )
+    }
+    return messages.join(' ')
+  }
+
+  function bulkDeleteDisabledTitle(): string | undefined {
+    if (deletableSelected.length > 0) return undefined
+    return readOnlyDeleteSelected.length > 0
+      ? t('browse.bulk.deleteNothingReadOnly')
+      : t('browse.bulk.deleteNothing')
+  }
+
+  function bulkDeleteWarning(): string {
+    return mountedDeleteCount > 0
+      ? t('browse.bulk.deleteWarningMounted', { count: mountedDeleteCount })
+      : t('browse.bulk.deleteWarningCurvine')
   }
 
   /**
@@ -1468,6 +1529,9 @@ export function BrowsePage() {
 
   function deleteItemTitle(item: BrowseRow): string {
     if (item.path && isMountRoot(String(item.path))) return t('browse.delete.mountRoot')
+    if (item.path && isReadOnlyMountedPath(String(item.path))) {
+      return t('browse.delete.readOnlyMount')
+    }
     if (item.path && isMountedPath(String(item.path))) return t('browse.delete.mounted')
     return item.is_dir ? t('browse.delete.directory') : t('browse.delete.file')
   }
@@ -1618,7 +1682,7 @@ export function BrowsePage() {
             size="sm"
             className="text-destructive"
             disabled={deletableSelected.length === 0}
-            title={deletableSelected.length === 0 ? t('browse.bulk.deleteNothing') : undefined}
+            title={bulkDeleteDisabledTitle()}
             onClick={() => setBulkDeleteOpen(true)}
             data-testid="browse-bulk-delete"
           >
@@ -1834,7 +1898,7 @@ export function BrowsePage() {
                         variant="ghost"
                         size="xs"
                         className="text-destructive"
-                        disabled={isMountRoot(itemPath)}
+                        disabled={isMountRoot(itemPath) || isReadOnlyMountedPath(itemPath)}
                         title={deleteItemTitle(item)}
                         onClick={() => requestDelete(item)}
                         data-testid={`browse-delete-${itemPath}`}
@@ -1915,6 +1979,7 @@ export function BrowsePage() {
         open={deleteTarget !== null}
         title={t('common.delete')}
         description={deleteTarget ? deleteTargetMessage(deleteTarget) : ''}
+        warning={deleteTarget ? deleteTargetWarning(deleteTarget) : ''}
         confirmLabel={t('common.delete')}
         cancelLabel={t('common.cancel')}
         pending={submitting}
@@ -1960,6 +2025,7 @@ export function BrowsePage() {
         open={bulkDeleteOpen}
         title={t('common.delete')}
         description={bulkDeleteMessage()}
+        warning={bulkDeleteWarning()}
         confirmLabel={t('common.delete')}
         cancelLabel={t('common.cancel')}
         pending={submitting}

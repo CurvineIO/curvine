@@ -135,12 +135,17 @@ export default {
       freeFailed: '{failed} 项释放失败；{done} 项成功。',
       deleteConfirm: '删除选中的 {count} 项？',
       deleteSkipped: '将跳过 {count} 个挂载根目录。',
+      deleteReadOnlySkipped: '将跳过 {count} 个只读挂载下的条目。',
       deleteNothing: '挂载根目录不能在此删除',
+      deleteNothingReadOnly: '只读挂载的条目不能在此删除',
+      deleteWarningMounted: '危险：选中的 {count} 项位于 UFS 挂载路径下。删除会同时清理 Curvine 和底层 UFS 中的数据（FS 模式与缓存模式均如此），且无法恢复。',
+      deleteWarningCurvine: '危险：这会永久删除选中的 Curvine 数据，且无法恢复。',
       deleteSuccess: '已删除 {count} 项。',
       deleteFailed: '{failed} 项删除失败；{done} 项成功。'
     },
     delete: {
       mountRoot: '请在挂载页面删除挂载点',
+      readOnlyMount: '该挂载点为只读，已禁用删除',
       mounted: '从 Curvine 及底层 UFS 删除',
       directory: '递归删除目录',
       file: '删除文件',
@@ -148,6 +153,8 @@ export default {
       confirmFileMounted: '删除文件 {path}？这将同时删除底层 UFS 数据。',
       confirmDir: '删除目录 {path}？',
       confirmFile: '删除文件 {path}？',
+      warningMounted: '危险：这会同时清理底层 UFS 中的数据（FS 模式与缓存模式均如此），且无法恢复。',
+      warningCurvine: '危险：这会永久删除 Curvine 中的数据，且无法恢复。',
       success: '已删除：{path}',
       failed: '删除失败：{error}'
     },

@@ -1,3 +1,7 @@
+import type { ReactNode } from 'react'
+import { TriangleAlert } from 'lucide-react'
+
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Spinner } from '@/components/ui/spinner'
 import {
   AlertDialog,
@@ -20,6 +24,7 @@ export function ConfirmDialog({
   open,
   title,
   description,
+  warning,
   confirmLabel,
   cancelLabel,
   pending = false,
@@ -31,6 +36,7 @@ export function ConfirmDialog({
   open: boolean
   title: string
   description: string
+  warning?: ReactNode
   confirmLabel: string
   cancelLabel: string
   pending?: boolean
@@ -46,6 +52,15 @@ export function ConfirmDialog({
           <AlertDialogTitle>{title}</AlertDialogTitle>
           <AlertDialogDescription>{description}</AlertDialogDescription>
         </AlertDialogHeader>
+        {warning && (
+          <Alert
+            variant="destructive"
+            data-testid={testId ? `${testId}-warning` : undefined}
+          >
+            <TriangleAlert />
+            <AlertDescription className="text-destructive">{warning}</AlertDescription>
+          </Alert>
+        )}
         <AlertDialogFooter>
           <AlertDialogCancel disabled={pending}>{cancelLabel}</AlertDialogCancel>
           <AlertDialogAction

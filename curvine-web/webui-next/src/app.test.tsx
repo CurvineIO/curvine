@@ -387,6 +387,80 @@ describe('Console shell', () => {
     await waitFor(() => expect(screen.queryByTestId('browse-bulk-bar')).not.toBeInTheDocument())
   })
 
+  it('warns that deleting mounted entries also removes backing UFS data', async () => {
+    const deletePath = vi.fn(async () => ({}))
+    const client = createStubClient({
+      fetchBrowseData: vi.fn(async () => ({
+        path: '/lake',
+        items: [{ name: 'a.txt', path: '/lake/a.txt', is_dir: false }]
+      })),
+      deletePath
+    })
+    renderApp('/browse?path=/lake', client)
+
+    await userEvent.click(await screen.findByTestId('browse-delete-/lake/a.txt'))
+
+    expect(await screen.findByTestId('browse-delete-confirm-warning')).toHaveTextContent(
+      /removes the item from the backing UFS in both FS mode and cache mode/
+    )
+    expect(deletePath).not.toHaveBeenCalled()
+
+    await userEvent.click(screen.getByTestId('browse-delete-confirm'))
+    await waitFor(() => expect(deletePath).toHaveBeenCalledWith('/lake/a.txt', false))
+  })
+
+  it('warns when a batch delete includes entries under a UFS mount', async () => {
+    const client = createStubClient({
+      fetchBrowseData: vi.fn(async () => ({
+        path: '/lake',
+        items: [
+          { name: 'a.txt', path: '/lake/a.txt', is_dir: false },
+          { name: 'b.txt', path: '/lake/b.txt', is_dir: false }
+        ]
+      }))
+    })
+    renderApp('/browse?path=/lake', client)
+
+    await userEvent.click(await screen.findByTestId('browse-select-all'))
+    await userEvent.click(screen.getByTestId('browse-bulk-delete'))
+
+    expect(await screen.findByTestId('browse-bulk-delete-confirm-warning')).toHaveTextContent(
+      /2 selected item\(s\) are under UFS mounts/
+    )
+  })
+
+  it('disables delete for entries under a read-only mount', async () => {
+    const deletePath = vi.fn(async () => ({}))
+    const client = createStubClient({
+      fetchMountsData: vi.fn(async () => [
+        {
+          mount_id: 'readonly',
+          cv_path: '/lake',
+          ufs_path: 's3://bucket/lake',
+          write_type: 'FsMode',
+          access_mode: 0
+        }
+      ]),
+      fetchBrowseData: vi.fn(async () => ({
+        path: '/lake',
+        items: [{ name: 'a.txt', path: '/lake/a.txt', is_dir: false }]
+      })),
+      deletePath
+    })
+    renderApp('/browse?path=/lake', client)
+
+    const deleteButton = await screen.findByTestId('browse-delete-/lake/a.txt')
+    expect(deleteButton).toBeDisabled()
+    expect(deleteButton).toHaveAttribute('title', 'This mount is read-only; delete is disabled')
+
+    await userEvent.click(deleteButton)
+    expect(deletePath).not.toHaveBeenCalled()
+    expect(screen.queryByTestId('browse-delete-confirm')).not.toBeInTheDocument()
+
+    await userEvent.click(screen.getByTestId('browse-select-all'))
+    expect(screen.getByTestId('browse-bulk-delete')).toBeDisabled()
+  })
+
   it('frees only the cached rows in a batch and skips UFS-only ones', async () => {
     const freePath = vi.fn(async () => ({ bytes: 10, inodes: 1 }))
     const client = createStubClient({

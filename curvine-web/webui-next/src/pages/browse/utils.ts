@@ -84,3 +84,8 @@ export function writeTypeLabel(value: unknown): string {
   if (value === 0 || value === 'CacheMode') return 'cache_mode'
   return String(value || 'fs_mode').toLowerCase()
 }
+
+export function isReadOnlyMount(mount: { access_mode?: number | string | null } | null | undefined): boolean {
+  const value = mount?.access_mode
+  return value === 0 || value === 'ReadOnly' || String(value || '').toLowerCase() === 'read_only'
+}

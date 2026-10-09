@@ -135,12 +135,17 @@ export default {
       freeFailed: 'Free failed for {failed} item(s); {done} succeeded.',
       deleteConfirm: 'Delete {count} selected item(s)?',
       deleteSkipped: '{count} mount root(s) will be skipped.',
+      deleteReadOnlySkipped: '{count} item(s) under read-only mounts will be skipped.',
       deleteNothing: 'Mount roots cannot be deleted here',
+      deleteNothingReadOnly: 'Read-only mounts cannot be deleted here',
+      deleteWarningMounted: 'Danger: {count} selected item(s) are under UFS mounts. Delete removes them from Curvine and the backing UFS in both FS mode and cache mode; this cannot be undone.',
+      deleteWarningCurvine: 'Danger: This permanently removes the selected data from Curvine and cannot be undone.',
       deleteSuccess: 'Deleted {count} item(s).',
       deleteFailed: 'Delete failed for {failed} item(s); {done} succeeded.'
     },
     delete: {
       mountRoot: 'Use Mounts page to delete mount',
+      readOnlyMount: 'This mount is read-only; delete is disabled',
       mounted: 'Delete from Curvine and backing UFS',
       directory: 'Delete directory recursively',
       file: 'Delete file',
@@ -148,6 +153,8 @@ export default {
       confirmFileMounted: 'Delete file {path}? This also deletes the backing UFS data.',
       confirmDir: 'Delete directory {path}?',
       confirmFile: 'Delete file {path}?',
+      warningMounted: 'Danger: This also removes the item from the backing UFS in both FS mode and cache mode. This cannot be undone.',
+      warningCurvine: 'Danger: This permanently removes the item from Curvine and cannot be undone.',
       success: 'Deleted: {path}',
       failed: 'Delete failed: {error}'
     },
