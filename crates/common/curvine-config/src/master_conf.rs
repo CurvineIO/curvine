@@ -16,7 +16,7 @@ use crate::{ClusterConf, CompatibilityConf, DBConf};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_runtime::common::{ByteUnit, DurationUnit, LogConf, Utils};
 use curvine_runtime::runtime::GroupExecutor;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::sync::Arc;
 
 // master Configuration file.
@@ -147,7 +147,10 @@ pub struct MasterConf {
     /// explicitly configured).
     pub compatibility: CompatibilityConf,
 
-    #[serde(default = "MasterConf::rocksdb_default")]
+    #[serde(
+        default = "MasterConf::rocksdb_default",
+        deserialize_with = "MasterConf::deserialize_rocksdb"
+    )]
     pub rocksdb: DBConf,
 }
 
@@ -199,10 +202,41 @@ impl MasterConf {
             block_size: ByteUnit::kb(4),
             disable_wal: true,
             use_bloom_filter: true,
+            block_based_bloom_filter: true,
             cache_index_and_filter_blocks: true,
             pin_l0_filter_and_index_blocks_in_cache: true,
+            block_cache_size: ByteUnit::gb(2),
+            bytes_per_sync: ByteUnit::mb(1),
+            compaction_readahead_size: ByteUnit::mb(2),
+            max_background_jobs: (Utils::cpu_nums() / 2).clamp(2, 8),
+            db_write_buffer_size: ByteUnit::mb(512),
+            max_write_buffer_number: 4,
+            level0_file_num_compaction_trigger: 4,
+            format_version: 5,
+            block_cache_type: DBConf::BLOCK_CACHE_LRU.to_string(),
+            scan_fill_cache: true,
+            dynamic_level_bytes: true,
+            rate_limiter_bytes_per_sec: ByteUnit::new(0),
+            rate_limiter_refill_period_ms: 100,
+            rate_limiter_fairness: 10,
             ..Default::default()
         }
+    }
+
+    fn deserialize_rocksdb<'de, D>(deserializer: D) -> Result<DBConf, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // A partial table must inherit Master defaults, not DBConf's generic ones.
+        // Merge raw values so explicit false/zero values and lists are preserved.
+        let overrides = toml::Table::deserialize(deserializer)?;
+        let mut defaults =
+            toml::Value::try_from(Self::rocksdb_default()).map_err(serde::de::Error::custom)?;
+        defaults
+            .as_table_mut()
+            .expect("DBConf must serialize to a table")
+            .extend(overrides);
+        defaults.try_into().map_err(serde::de::Error::custom)
     }
 
     pub fn heartbeat_interval_ms(&self) -> u64 {
@@ -358,5 +392,96 @@ impl Default for MasterConf {
 
         conf.init().unwrap();
         conf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn db_settings(conf: &DBConf) -> toml::Value {
+        let mut value = toml::Value::try_from(conf).unwrap();
+        // Generic DB defaults generate a fresh temporary directory on each call.
+        let table = value.as_table_mut().unwrap();
+        for key in ["base_dir", "data_dir", "checkpoint_dir"] {
+            table.remove(key);
+        }
+        value
+    }
+
+    #[test]
+    fn rocksdb_missing_and_empty_tables_preserve_master_defaults() {
+        let expected = db_settings(&MasterConf::rocksdb_default());
+        for input in ["[master]", "[master.rocksdb]"] {
+            let conf: ClusterConf = toml::from_str(input).unwrap();
+            assert_eq!(db_settings(&conf.master.rocksdb), expected);
+        }
+    }
+
+    #[test]
+    fn rocksdb_partial_table_preserves_master_defaults() {
+        let conf: ClusterConf = toml::from_str(
+            r#"
+            [master.rocksdb]
+            block_cache_size = "256MB"
+            "#,
+        )
+        .unwrap();
+        let expected = MasterConf::rocksdb_default().set_block_cache_size("256MB");
+        assert_eq!(db_settings(&conf.master.rocksdb), db_settings(&expected));
+    }
+
+    #[test]
+    fn rocksdb_explicit_values_override_master_defaults() {
+        let conf: ClusterConf = toml::from_str(
+            r#"
+            [master.rocksdb]
+            dynamic_level_bytes = false
+            scan_fill_cache = false
+            bytes_per_sync = 0
+            max_background_jobs = 3
+            block_cache_type = "hyper_clock"
+            rate_limiter_bytes_per_sec = "128MB"
+            family_list = ["custom"]
+            "#,
+        )
+        .unwrap();
+        let mut expected = MasterConf::rocksdb_default()
+            .set_dynamic_level_bytes(false)
+            .set_scan_fill_cache(false)
+            .set_bytes_per_sync("0")
+            .set_max_background_jobs(3)
+            .set_block_cache_type(DBConf::BLOCK_CACHE_HYPER_CLOCK)
+            .set_rate_limiter_bytes_per_sec("128MB");
+        expected.family_list = vec!["custom".to_string()];
+        assert_eq!(db_settings(&conf.master.rocksdb), db_settings(&expected));
+    }
+
+    #[test]
+    fn rocksdb_defaults_do_not_change_journal_defaults() {
+        let conf: ClusterConf = toml::from_str("[master.rocksdb]").unwrap();
+        assert_eq!(
+            db_settings(&conf.journal.rocksdb),
+            db_settings(&crate::JournalConf::rocksdb_default())
+        );
+    }
+
+    #[test]
+    fn rocksdb_config_round_trip_preserves_paths_and_options() {
+        let mut conf = MasterConf::default();
+        conf.rocksdb = conf.rocksdb.set_dir("custom-meta");
+        let encoded = toml::to_string(&conf).unwrap();
+        let decoded: MasterConf = toml::from_str(&encoded).unwrap();
+        assert_eq!(
+            toml::Value::try_from(&decoded.rocksdb).unwrap(),
+            toml::Value::try_from(&conf.rocksdb).unwrap()
+        );
+    }
+
+    #[test]
+    fn rocksdb_invalid_field_types_are_rejected() {
+        assert!(
+            toml::from_str::<MasterConf>("[rocksdb]\nmax_background_jobs = 'invalid'").is_err()
+        );
     }
 }

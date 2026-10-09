@@ -39,7 +39,22 @@ pub trait DBConfExt {
 
 impl DBConfExt for DBConf {
     fn create_cache(&self) -> Cache {
-        Cache::new_lru_cache(self.block_cache_size.as_byte() as usize)
+        let capacity = self.block_cache_size.as_byte() as usize;
+        match self.block_cache_type.as_str() {
+            DBConf::BLOCK_CACHE_LRU => Cache::new_lru_cache(capacity),
+            DBConf::BLOCK_CACHE_HYPER_CLOCK => {
+                // Approximate the average cache entry charge with the data block
+                // size. Index/filter entries also contribute to the actual average.
+                let charge = self.block_size.as_byte().max(1) as usize;
+                Cache::new_hyper_clock_cache(capacity, charge)
+            }
+            other => panic!(
+                "Unsupported block_cache_type: {} (expected {} or {})",
+                other,
+                DBConf::BLOCK_CACHE_LRU,
+                DBConf::BLOCK_CACHE_HYPER_CLOCK
+            ),
+        }
     }
 
     fn create_block_opts(&self, cache: &Cache) -> BlockBasedOptions {
@@ -62,7 +77,13 @@ impl DBConfExt for DBConf {
         opts.set_pin_l0_filter_and_index_blocks_in_cache(
             self.pin_l0_filter_and_index_blocks_in_cache,
         );
-        opts.set_format_version(2);
+        if !(0..=6).contains(&self.format_version) {
+            panic!(
+                "Unsupported format_version: {} (expected 0..=6)",
+                self.format_version
+            );
+        }
+        opts.set_format_version(self.format_version);
         opts.set_checksum_type(ChecksumType::XXH3);
         opts.set_optimize_filters_for_memory(false);
         opts
@@ -116,6 +137,23 @@ impl DBConfExt for DBConf {
             opts.set_db_write_buffer_size(self.db_write_buffer_size.as_byte() as usize);
         }
         opts.set_write_buffer_size(self.write_buffer_size.as_byte() as usize);
+        opts.set_level_compaction_dynamic_level_bytes(self.dynamic_level_bytes);
+
+        let rate = self.rate_limiter_bytes_per_sec.as_byte();
+        if rate > 0 {
+            let refill_ms = if self.rate_limiter_refill_period_ms == 0 {
+                100
+            } else {
+                self.rate_limiter_refill_period_ms
+            };
+            let fairness = if self.rate_limiter_fairness <= 0 {
+                10
+            } else {
+                self.rate_limiter_fairness
+            };
+            // Limits flush and compaction writes. Foreground WAL writes are not limited.
+            opts.set_ratelimiter(rate as i64, (refill_ms as i64) * 1000, fairness);
+        }
 
         opts
     }
@@ -135,11 +173,13 @@ impl DBConfExt for DBConf {
 
     // Read configuration.
     fn create_read_opt(&self) -> ReadOptions {
-        ReadOptions::default()
+        let mut opt = ReadOptions::default();
+        opt.fill_cache(self.scan_fill_cache);
+        opt
     }
 
     fn create_iterator_opt(&self) -> ReadOptions {
-        let mut opt = ReadOptions::default();
+        let mut opt = self.create_read_opt();
         opt.set_readahead_size(64 * 1024 * 1024);
         opt
     }

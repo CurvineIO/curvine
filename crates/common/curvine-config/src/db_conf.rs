@@ -68,6 +68,20 @@ pub struct DBConf {
     pub pin_l0_filter_and_index_blocks_in_cache: bool,
 
     pub enable_statistics: bool,
+
+    pub format_version: i32,
+
+    pub block_cache_type: String,
+
+    pub scan_fill_cache: bool,
+
+    pub dynamic_level_bytes: bool,
+
+    pub rate_limiter_bytes_per_sec: ByteUnit,
+
+    pub rate_limiter_refill_period_ms: u64,
+
+    pub rate_limiter_fairness: i32,
 }
 
 impl DBConf {
@@ -78,6 +92,8 @@ impl DBConf {
     pub const COMPRESSION_NONE: &'static str = "none";
     pub const COMPRESSION_LZ4: &'static str = "lz4";
     pub const DEFAULT_FAMILY: &'static str = "default";
+    pub const BLOCK_CACHE_LRU: &'static str = "lru";
+    pub const BLOCK_CACHE_HYPER_CLOCK: &'static str = "hyper_clock";
 
     pub fn new<T: AsRef<str>>(dir: T) -> Self {
         Self {
@@ -256,6 +272,53 @@ impl DBConf {
         self
     }
 
+    pub fn set_format_version(mut self, version: i32) -> Self {
+        self.format_version = version;
+        self
+    }
+
+    pub fn set_block_cache_type(mut self, block_cache_type: impl AsRef<str>) -> Self {
+        let block_cache_type = block_cache_type.as_ref();
+        match block_cache_type {
+            Self::BLOCK_CACHE_LRU | Self::BLOCK_CACHE_HYPER_CLOCK => {
+                self.block_cache_type = block_cache_type.to_string();
+            }
+            other => panic!(
+                "Unsupported block_cache_type: {} (expected {} or {})",
+                other,
+                Self::BLOCK_CACHE_LRU,
+                Self::BLOCK_CACHE_HYPER_CLOCK
+            ),
+        }
+        self
+    }
+
+    pub fn set_scan_fill_cache(mut self, scan_fill_cache: bool) -> Self {
+        self.scan_fill_cache = scan_fill_cache;
+        self
+    }
+
+    pub fn set_dynamic_level_bytes(mut self, dynamic_level_bytes: bool) -> Self {
+        self.dynamic_level_bytes = dynamic_level_bytes;
+        self
+    }
+
+    pub fn set_rate_limiter_bytes_per_sec(mut self, size: impl AsRef<str>) -> Self {
+        self.rate_limiter_bytes_per_sec =
+            Self::byte_unit_from_str("rate_limiter_bytes_per_sec", size);
+        self
+    }
+
+    pub fn set_rate_limiter_refill_period_ms(mut self, ms: u64) -> Self {
+        self.rate_limiter_refill_period_ms = ms;
+        self
+    }
+
+    pub fn set_rate_limiter_fairness(mut self, fairness: i32) -> Self {
+        self.rate_limiter_fairness = fairness;
+        self
+    }
+
     fn byte_unit_from_str(label: &'static str, size: impl AsRef<str>) -> ByteUnit {
         ByteUnit::from_str(size).unwrap_or_else(|e| panic!("Invalid {}: {}", label, e))
     }
@@ -299,6 +362,14 @@ impl Default for DBConf {
             pin_l0_filter_and_index_blocks_in_cache: false,
 
             enable_statistics: false,
+
+            format_version: 2,
+            block_cache_type: Self::BLOCK_CACHE_LRU.to_string(),
+            scan_fill_cache: true,
+            dynamic_level_bytes: false,
+            rate_limiter_bytes_per_sec: ByteUnit::new(0),
+            rate_limiter_refill_period_ms: 100,
+            rate_limiter_fairness: 10,
         }
     }
 }
