@@ -22,8 +22,8 @@ use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::ListOptions;
 use curvine_model::{
-    segment_group_json, BatchManifest, BatchManifestEntry, FileStatus, LoadJobInfo, MountInfo,
-    SegmentGroupPlan, SegmentPlan, TransferCommand, TransferJobRecord, TransferKind,
+    segment_group_json, BatchManifest, BatchManifestEntry, FileStatus, LoadJobInfo, LocatedBlock,
+    MountInfo, SegmentGroupPlan, SegmentPlan, TransferCommand, TransferJobRecord, TransferKind,
     TransferProgress, TransferTaskRecord, TransferTaskState, WorkerInfo,
 };
 use curvine_runtime::common::LocalTime;
@@ -643,7 +643,11 @@ impl TransferPlanner {
             // content is unchanged, so the configured replicas are enforced.
             let replicas_mismatch = incremental_load
                 && load_replica_mismatch(target_status.as_ref(), job_info.replicas);
-            let unchanged = if replicas_mismatch {
+            // Any re-copy of an existing target must set replace_target: the
+            // scheduler deletes the old copy after planning, and a task that
+            // writes an existing target with overwrite=false fails validation.
+            let mut replace_target = replicas_mismatch;
+            let mut unchanged = if replicas_mismatch {
                 false
             } else if incremental_load && unchanged_load_target(&status, target_status.as_ref()) {
                 true
@@ -655,6 +659,12 @@ impl TransferPlanner {
             } else {
                 false
             };
+            if unchanged && status.len > 0 {
+                unchanged = self.target_cache_readable(&task_target).await;
+                if !unchanged {
+                    replace_target = true;
+                }
+            }
             if unchanged {
                 skipped_files += 1;
                 skipped_size += status.len;
@@ -678,7 +688,7 @@ impl TransferPlanner {
                             &task_target,
                             &status,
                             overwrite,
-                            replicas_mismatch,
+                            replace_target,
                             job_info.block_size,
                             &mount,
                             &mut tasks,
@@ -705,14 +715,14 @@ impl TransferPlanner {
                         &path,
                         &task_target,
                         &status,
-                        replicas_mismatch,
+                        replace_target,
                         &mut tasks,
                     )
                     .await?;
                     continue;
                 }
                 batch_bytes += status.len;
-                batch.push((status, replicas_mismatch));
+                batch.push((status, replace_target));
                 if batch_should_flush(batch.len(), batch_bytes) {
                     let files = std::mem::take(&mut batch);
                     batch_bytes = 0;
@@ -726,7 +736,7 @@ impl TransferPlanner {
                 &path,
                 &task_target,
                 &status,
-                replicas_mismatch,
+                replace_target,
                 &mut tasks,
             )
             .await?;
@@ -1196,6 +1206,40 @@ impl TransferPlanner {
             ))
         })
     }
+
+    /// An incrementally-unchanged target is only skippable when its cached
+    /// blocks still have live locations. A shell target (allocated blocks
+    /// with empty locations, e.g. after a worker restart dropped the only
+    /// replica without triggering lost-worker invalidation) must be
+    /// re-copied; a failed location query also forces a re-copy.
+    async fn target_cache_readable(&self, path: &Path) -> bool {
+        match self.master_fs.get_block_locations(path).await {
+            Ok(blocks) if located_blocks_readable(&blocks.block_locs) => true,
+            Ok(_) => {
+                log::warn!(
+                    "incremental load re-copies {}: cached blocks have no live locations",
+                    path.full_path()
+                );
+                false
+            }
+            Err(e) => {
+                log::warn!(
+                    "incremental load re-copies {}: get block locations failed: {}",
+                    path.full_path(),
+                    e
+                );
+                false
+            }
+        }
+    }
+}
+
+/// A target with allocated blocks but no live locations is an unusable cache
+/// shell: metadata looks complete while every cached byte is gone. Matches the
+/// master's `cache_unreadable` semantics — partial replicas still count as
+/// readable.
+pub(crate) fn located_blocks_readable(block_locs: &[LocatedBlock]) -> bool {
+    block_locs.iter().all(|l| !l.locs.is_empty())
 }
 
 pub(crate) fn unchanged_load_target(source: &FileStatus, target: Option<&FileStatus>) -> bool {

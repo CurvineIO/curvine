@@ -14,8 +14,9 @@
 
 use curvine_config::ClientConf;
 use curvine_model::{
-    FileStatus, MountInfo, StoragePolicy, StorageState, TransferCommand, TransferJobRecord,
-    TransferKind, TransferProgress, TransferState,
+    ExtendedBlock, FileStatus, LocatedBlock, MountInfo, StoragePolicy, StorageState,
+    TransferCommand, TransferJobRecord, TransferKind, TransferProgress, TransferState,
+    WorkerAddress,
 };
 
 use super::planner::{
@@ -70,6 +71,24 @@ fn incomplete_or_cv_missing_target_is_not_skipped() {
     let mut cv_missing = target_status(10, 1024);
     cv_missing.storage_policy.state = StorageState::Ufs;
     assert!(!unchanged_load_target(&source, Some(&cv_missing)));
+}
+
+#[test]
+fn shell_cache_with_empty_block_locations_is_not_readable() {
+    use super::planner::located_blocks_readable;
+
+    // No data blocks: nothing to lose (empty file).
+    assert!(located_blocks_readable(&[]));
+
+    // Healthy blocks keep at least one live location.
+    let healthy = LocatedBlock::new(ExtendedBlock::with_id(1), vec![WorkerAddress::default()]);
+    assert!(located_blocks_readable(&[healthy]));
+
+    // A single shell block makes the whole file unreadable.
+    let partial = LocatedBlock::new(ExtendedBlock::with_id(2), vec![WorkerAddress::default()]);
+    let shell = LocatedBlock::new(ExtendedBlock::with_id(3), vec![]);
+    assert!(located_blocks_readable(&[partial]));
+    assert!(!located_blocks_readable(&[shell]));
 }
 
 #[test]
