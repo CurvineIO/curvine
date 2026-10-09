@@ -37,6 +37,7 @@ use dashmap::DashMap;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use log::{debug, error, info, warn};
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -819,7 +820,13 @@ where
             job.cluster_snapshot_version = version;
         }
 
-        let planned = match self.planner.plan(&job).await {
+        let Some(planning_result) = self
+            .await_with_planning_lease(&lease, self.planner.plan(&job))
+            .await?
+        else {
+            return Ok(());
+        };
+        let planned = match planning_result {
             Ok(planned) => planned,
             Err(err @ FsError::InProgress(_)) => {
                 record_metric(|metrics| {
@@ -1002,11 +1009,20 @@ where
                 );
                 return Ok(());
             }
+            if !self.renew_planning_lease(&lease)? {
+                return Ok(());
+            }
         }
-        if let Err(err) = self
-            .prepare_transfer_targets(&planned.tasks, job_info.overwrite.unwrap_or(false))
-            .await
-        {
+        let Some(preparation_result) = self
+            .await_with_planning_lease(
+                &lease,
+                self.prepare_transfer_targets(&planned.tasks, job_info.overwrite.unwrap_or(false)),
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        if let Err(err) = preparation_result {
             self.fail_transfer(
                 &job,
                 &lease,
@@ -1020,6 +1036,9 @@ where
                 ),
             )?;
             return Err(err);
+        }
+        if !self.renew_planning_lease(&lease)? {
+            return Ok(());
         }
         let persisted = self.store.persist_planned_tasks(TransferPlannedTasks {
             job_id: job.job_id.clone(),
@@ -1048,6 +1067,39 @@ where
         });
 
         self.dispatch_pending_tasks(job, lease).await
+    }
+
+    async fn await_with_planning_lease<T, F>(
+        &self,
+        lease: &TransferLease,
+        work: F,
+    ) -> FsResult<Option<T>>
+    where
+        F: Future<Output = T>,
+    {
+        await_with_lease_renewal(work, lease_renew_interval(self.conf.lease_timeout), || {
+            self.renew_planning_lease(lease)
+        })
+        .await
+    }
+
+    fn renew_planning_lease(&self, lease: &TransferLease) -> FsResult<bool> {
+        let renewed = self.store.renew_lease(
+            &lease.job_id,
+            lease.run_id,
+            &lease.owner,
+            lease.lease_epoch,
+            duration_ms(self.conf.lease_timeout),
+            now_ms(),
+        )?;
+        record_metric(|metrics| metrics.inc_lease_renew(if renewed { "success" } else { "stale" }));
+        if !renewed {
+            warn!(
+                "stop planning transfer {} because owner {} lease epoch {} is stale",
+                lease.job_id, lease.owner, lease.lease_epoch
+            );
+        }
+        Ok(renewed)
     }
 
     /// Remove targets that need replacement only after all plan rows are
@@ -2286,6 +2338,37 @@ fn scheduler_idle_interval(lease_timeout: Duration) -> Duration {
     SCHEDULER_IDLE_INTERVAL
         .min(lease_timeout / 2)
         .max(SCHEDULER_MIN_IDLE_INTERVAL)
+}
+
+pub(crate) fn lease_renew_interval(lease_timeout: Duration) -> Duration {
+    (lease_timeout / 2).max(SCHEDULER_MIN_IDLE_INTERVAL)
+}
+
+/// Poll work while extending its fenced lease; `None` means ownership changed.
+pub(crate) async fn await_with_lease_renewal<T, F, R>(
+    work: F,
+    renew_interval: Duration,
+    mut renew: R,
+) -> FsResult<Option<T>>
+where
+    F: Future<Output = T>,
+    R: FnMut() -> FsResult<bool>,
+{
+    let mut work = std::pin::pin!(work);
+    let renewal = tokio::time::sleep(renew_interval);
+    tokio::pin!(renewal);
+
+    loop {
+        tokio::select! {
+            result = &mut work => return Ok(Some(result)),
+            _ = &mut renewal => {
+                if !renew()? {
+                    return Ok(None);
+                }
+                renewal.as_mut().reset(tokio::time::Instant::now() + renew_interval);
+            }
+        }
+    }
 }
 
 /// Message for a dispatch round: capacity backpressure must be visible in the

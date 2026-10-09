@@ -67,6 +67,10 @@ mod report_phase_test;
 #[path = "tests/service_test.rs"]
 mod service_test;
 
+#[cfg(test)]
+#[path = "tests/planning_lease_test.rs"]
+mod planning_lease_test;
+
 mod scheduler;
 pub use self::scheduler::TransferScheduler;
 
