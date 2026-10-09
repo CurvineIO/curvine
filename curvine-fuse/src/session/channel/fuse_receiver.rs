@@ -25,7 +25,7 @@ use crate::session::{FuseOpCode, FuseRequest, FuseResponse, FuseTask};
 use crate::{err_fuse, FuseResult, FUSE_IN_HEADER_LEN};
 use bytes::BytesMut;
 use curvine_core_error::{err_box, try_option_ref};
-use curvine_io::IOResult;
+use curvine_io::{IOError, IOResult};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::channel::AsyncSender;
 use curvine_runtime::sync::FastDashMap;
@@ -33,8 +33,16 @@ use curvine_sys as sys;
 use curvine_sys::pipe::{AsyncFd, Pipe2};
 use libc::{EAGAIN, ECONNABORTED, EINTR, ENODEV, ENOENT};
 use log::{debug, error, info, warn};
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{watch, Notify};
+
+enum ReceiveOutcome {
+    Request(FuseRequest),
+    Continue,
+    Exit,
+}
 
 /// Removes an interruptible-request registration when its dispatch future ends.
 /// `Drop` covers cancellation paths (e.g. task abort on shutdown) where neither
@@ -277,16 +285,7 @@ impl<T: FileSystem> FuseReceiver<T> {
         );
     }
 
-    pub async fn send_stream(&self, req: FuseRequest) -> FuseResult<()> {
-        // Build the ctx before parsing, so a later parse failure is a real
-        // finish-state event (matching the metadata path).
-        let labels = self.maybe_req_labels(&req);
-        let rep = self.new_reply(req.unique(), labels);
-        Self::send_stream_dispatch(&self.fs, req, rep).await
-    }
-
-    /// Stream dispatch + IO attribution core, factored out of `send_stream` so tests
-    /// can drive it with a hand-built `FuseResponse`. The metrics gate derives solely
+    /// Stream dispatch + IO attribution core. The metrics gate derives solely
     /// from `rep.metrics.is_some()`, so a "metrics but no ctx" state is unrepresentable.
     async fn send_stream_dispatch(
         fs: &Arc<T>,
@@ -395,130 +394,147 @@ impl<T: FileSystem> FuseReceiver<T> {
         Ok(())
     }
 
-    pub async fn start(mut self, mut shutdown_rx: watch::Receiver<bool>) -> FuseResult<()> {
-        debug!("fuse receiver started");
-        loop {
-            // Loop-wait timer, observed only on the `receive()` Ok path. Read
-            // before the `select!` (a shutdown wake reads an unused `Instant`) to
-            // avoid tangling the `&mut self` borrow inside the branch.
-            let wait_start = if self.metrics_enabled {
-                Some(mono_now())
+    async fn dispatch(&self, req: FuseRequest) {
+        let is_stream = req.is_stream();
+        let task = self.new_dispatch_task(req, is_stream);
+        if is_stream {
+            task.await;
+        } else {
+            self.rt.spawn(task);
+        }
+    }
+
+    fn new_dispatch_task(
+        &self,
+        req: FuseRequest,
+        is_stream: bool,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        let labels = self.maybe_req_labels(&req);
+        let reply = self.new_reply(req.unique(), labels);
+        let fs = self.fs.clone();
+        let pending_requests = self.pending_requests.clone();
+
+        let track_meta = self.metrics_enabled && !is_stream;
+        let meta_guard = FuseMetrics::meta_task_guard(track_meta);
+        let spawn_start = track_meta.then(mono_now);
+
+        async move {
+            if is_stream {
+                if let Err(e) = Self::send_stream_dispatch(&fs, req, reply).await {
+                    error!("failed to dispatch stream request: {}", e);
+                }
             } else {
-                None
-            };
+                if let Some(start) = spawn_start {
+                    FuseMetrics::get().record_meta_spawn(start.elapsed().as_micros() as u64);
+                }
+                let dispatch_result =
+                    Self::dispatch_meta_interrupt(fs, pending_requests, req, reply).await;
+                drop(meta_guard);
+
+                if let Err(e) = dispatch_result {
+                    error!("failed to dispatch meta request: {}", e);
+                }
+            }
+        }
+    }
+
+    pub async fn start(mut self, mut shutdown_rx: watch::Receiver<bool>) -> FuseResult<()> {
+        loop {
+            let wait_start = self.metrics_enabled.then(mono_now);
             tokio::select! {
                 res = self.receive() => {
-                    match res {
-                        Ok(buf) => {
-                            // Parse before observing loop-wait, so the histogram
-                            // includes parse cost and a decode failure still samples.
-                            let parsed = FuseRequest::from_bytes(buf.freeze());
-                            if let Some(start) = wait_start {
-                                FuseMetrics::get()
-                                    .record_receive_loop_wait(start.elapsed().as_micros() as u64);
-                            }
-                            let req = match parsed {
-                                Ok(req) => req,
-                                Err(e) => {
-                                    // Decode failure before any ctx exists: count
-                                    // it, then terminate the receiver as before.
-                                    if self.metrics_enabled {
-                                        FuseMetrics::get().record_decode_error("other");
-                                    }
-                                    return Err(e.into());
-                                }
-                            };
-
-                            if self.debug {
-                                // Log header fields only: parsing the operator here
-                                // could `?`-return early and bypass the dispatch
-                                // path's `finish_early` cleanup.
-                                info!(
-                                    "receive unique: {}, code: {:?}",
-                                    req.unique(),
-                                    req.opcode(),
-                                );
-                            }
-                            if req.should_audit() {
-                                self.audit(&req);
-                            }
-
-                            if req.is_stream() {
-                                if let Err(e) = self.send_stream(req).await {
-                                    error!("failed to dispatch stream request: {}", e);
-                                }
-                            } else {
-                                let labels = self.maybe_req_labels(&req);
-                                let reply = self.new_reply(req.unique(), labels);
-                                let fs = self.fs.clone();
-                                let pending_requests = self.pending_requests.clone();
-                                // Guard + spawn timer built before spawn so they
-                                // cover the runtime queue wait (submit -> first poll).
-                                let meta_guard = FuseMetrics::meta_task_guard(self.metrics_enabled);
-                                let spawn_start =
-                                    if self.metrics_enabled { Some(mono_now()) } else { None };
-                                self.rt.spawn(async move {
-                                    if let Some(start) = spawn_start {
-                                        FuseMetrics::get()
-                                            .record_meta_spawn(start.elapsed().as_micros() as u64);
-                                    }
-                                    let dispatch_result = Self::dispatch_meta_interrupt(
-                                        fs, pending_requests, req, reply,
-                                    )
-                                    .await;
-                                    // Drop the guard before the error log, so the
-                                    // inflight scope excludes log-formatting time.
-                                    drop(meta_guard);
-                                    if let Err(e) = dispatch_result {
-                                        error!("failed to dispatch meta request: {}", e);
-                                    }
-                                });
-                            }
-                        }
-
-                        Err(e) => {
-                            // Receive error before any request is decoded: count by
-                            // errno + loop action, then dispatch on the errno below.
-                            let os_errno = e.raw_error().raw_os_error();
-                            if self.metrics_enabled {
-                                let (errno_label, action) = receive_error_labels(os_errno);
-                                FuseMetrics::get().record_receive_error(errno_label, action);
-                            }
-                            match os_errno {
-                                Some(ENOENT) => continue,
-                                Some(EINTR) => continue,
-                                Some(EAGAIN) => continue,
-                                Some(ENODEV) => {
-                                    info!("receiver exiting: fuse device gone (ENODEV)");
-                                    break;
-                                }
-                                Some(ECONNABORTED) => {
-                                    info!("receiver exiting: connection aborted (ECONNABORTED)");
-                                    break;
-                                }
-                                _ => return Err(e.into()),
-                            }
-                        }
+                    match self.on_receive(res, wait_start)? {
+                        ReceiveOutcome::Request(req) => self.dispatch(req).await,
+                        ReceiveOutcome::Continue => {}
+                        ReceiveOutcome::Exit => break,
                     }
                 }
-
                 changed = shutdown_rx.changed() => {
-                    match changed {
-                        Ok(()) if *shutdown_rx.borrow() => {
-                            info!("receiver observed shutdown broadcast; exiting receive loop");
-                            break;
-                        }
-                        Ok(()) => {}
-                        Err(_) => {
-                            warn!("receiver shutdown channel closed; exiting receive loop");
-                            break;
-                        }
+                    if Self::should_exit_on_shutdown(changed, &shutdown_rx) {
+                        break;
                     }
                 }
             }
         }
-
         Ok(())
+    }
+
+    fn should_exit_on_shutdown<E>(
+        changed: Result<(), E>,
+        shutdown_rx: &watch::Receiver<bool>,
+    ) -> bool {
+        match changed {
+            Ok(()) if *shutdown_rx.borrow() => {
+                debug!("receiver observed shutdown broadcast; exiting receive loop");
+                true
+            }
+            Ok(()) => false,
+            Err(_) => {
+                warn!("receiver shutdown channel closed; exiting receive loop");
+                true
+            }
+        }
+    }
+
+    fn on_receive(
+        &self,
+        res: IOResult<BytesMut>,
+        wait_start: Option<Instant>,
+    ) -> FuseResult<ReceiveOutcome> {
+        match res {
+            Ok(buf) => self.on_receive_ok(buf, wait_start),
+            Err(e) => self.on_receive_err(e),
+        }
+    }
+
+    fn on_receive_ok(
+        &self,
+        buf: BytesMut,
+        wait_start: Option<Instant>,
+    ) -> FuseResult<ReceiveOutcome> {
+        let parsed = FuseRequest::from_bytes(buf.freeze());
+        if let Some(start) = wait_start {
+            FuseMetrics::get().record_receive_loop_wait(start.elapsed().as_micros() as u64);
+        }
+        let req = match parsed {
+            Ok(req) => req,
+            Err(e) => {
+                if self.metrics_enabled {
+                    FuseMetrics::get().record_decode_error("other");
+                }
+                return Err(e.into());
+            }
+        };
+
+        if self.debug {
+            info!("receive unique: {}, code: {:?}", req.unique(), req.opcode(),);
+        }
+
+        if req.should_audit() {
+            self.audit(&req);
+        }
+
+        Ok(ReceiveOutcome::Request(req))
+    }
+
+    fn on_receive_err(&self, e: IOError) -> FuseResult<ReceiveOutcome> {
+        let os_errno = e.raw_error().raw_os_error();
+        if self.metrics_enabled {
+            let (errno_label, action) = receive_error_labels(os_errno);
+            FuseMetrics::get().record_receive_error(errno_label, action);
+        }
+        match os_errno {
+            Some(ENOENT) | Some(EINTR) | Some(EAGAIN) => Ok(ReceiveOutcome::Continue),
+            Some(ENODEV) => {
+                info!("receiver exiting: fuse device gone (ENODEV)");
+                Ok(ReceiveOutcome::Exit)
+            }
+            Some(ECONNABORTED) => {
+                info!("receiver exiting: connection aborted (ECONNABORTED)");
+                Ok(ReceiveOutcome::Exit)
+            }
+            _ => Err(e.into()),
+        }
     }
 
     pub async fn dispatch_meta_interrupt(
