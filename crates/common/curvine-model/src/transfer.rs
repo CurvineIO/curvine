@@ -926,11 +926,140 @@ pub struct TransferTaskReport {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TransferListFilter {
     pub kind: Option<TransferKind>,
-    pub state: Option<TransferState>,
+    /// State selection; empty means every state passes (a UI bucket expands to one
+    /// or more of these before the store sees it).
+    pub states: Vec<TransferState>,
     pub submitter: Option<String>,
     pub tenant: Option<String>,
     pub limit: usize,
     pub offset: usize,
+}
+
+impl TransferListFilter {
+    pub fn matches_state(&self, state: TransferState) -> bool {
+        self.states.is_empty() || self.states.contains(&state)
+    }
+}
+
+/// Predicate for counting jobs. There is deliberately no state filter: the UI's
+/// bucket tallies are global, so one grouped count serves all of them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TransferCountFilter {
+    pub kind: Option<TransferKind>,
+    pub submitter: Option<String>,
+    pub tenant: Option<String>,
+}
+
+impl TransferCountFilter {
+    pub fn matches(&self, job: &TransferJobRecord) -> bool {
+        self.kind.is_none_or(|kind| job.kind == kind)
+            && self
+                .submitter
+                .as_ref()
+                .is_none_or(|submitter| job.submitter == *submitter)
+            && self
+                .tenant
+                .as_ref()
+                .is_none_or(|tenant| job.tenant == *tenant)
+    }
+}
+
+/// Per-state job counts over the whole store.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TransferStateCounts {
+    pub pending: u64,
+    pub planning: u64,
+    pub dispatching: u64,
+    pub running: u64,
+    pub canceling: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub canceled: u64,
+    pub partial_success: u64,
+}
+
+/// The buckets the console groups states into, plus the grand total.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TransferBucketCounts {
+    pub all: u64,
+    pub active: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub canceled: u64,
+}
+
+/// The states that make up each UI bucket. Exposed so the web layer and the
+/// service expand the same bucket names the same way.
+pub const TRANSFER_BUCKET_ACTIVE: &[TransferState] = &[
+    TransferState::Pending,
+    TransferState::Planning,
+    TransferState::Dispatching,
+    TransferState::Running,
+    TransferState::Canceling,
+];
+pub const TRANSFER_BUCKET_COMPLETED: &[TransferState] = &[TransferState::Completed];
+pub const TRANSFER_BUCKET_FAILED: &[TransferState] =
+    &[TransferState::Failed, TransferState::PartialSuccess];
+pub const TRANSFER_BUCKET_CANCELED: &[TransferState] = &[TransferState::Canceled];
+
+impl TransferStateCounts {
+    pub fn add(&mut self, state: TransferState, count: u64) {
+        match state {
+            TransferState::Pending => self.pending += count,
+            TransferState::Planning => self.planning += count,
+            TransferState::Dispatching => self.dispatching += count,
+            TransferState::Running => self.running += count,
+            TransferState::Canceling => self.canceling += count,
+            TransferState::Completed => self.completed += count,
+            TransferState::Failed => self.failed += count,
+            TransferState::Canceled => self.canceled += count,
+            TransferState::PartialSuccess => self.partial_success += count,
+        }
+    }
+
+    pub fn total(&self) -> u64 {
+        self.pending
+            + self.planning
+            + self.dispatching
+            + self.running
+            + self.canceling
+            + self.completed
+            + self.failed
+            + self.canceled
+            + self.partial_success
+    }
+
+    /// Rows matching a (possibly empty) state selection, for the paged total.
+    pub fn total_for(&self, states: &[TransferState]) -> u64 {
+        if states.is_empty() {
+            return self.total();
+        }
+        states.iter().map(|state| self.count_of(*state)).sum()
+    }
+
+    pub fn count_of(&self, state: TransferState) -> u64 {
+        match state {
+            TransferState::Pending => self.pending,
+            TransferState::Planning => self.planning,
+            TransferState::Dispatching => self.dispatching,
+            TransferState::Running => self.running,
+            TransferState::Canceling => self.canceling,
+            TransferState::Completed => self.completed,
+            TransferState::Failed => self.failed,
+            TransferState::Canceled => self.canceled,
+            TransferState::PartialSuccess => self.partial_success,
+        }
+    }
+
+    pub fn bucket_counts(&self) -> TransferBucketCounts {
+        TransferBucketCounts {
+            all: self.total(),
+            active: self.total_for(TRANSFER_BUCKET_ACTIVE),
+            completed: self.total_for(TRANSFER_BUCKET_COMPLETED),
+            failed: self.total_for(TRANSFER_BUCKET_FAILED),
+            canceled: self.total_for(TRANSFER_BUCKET_CANCELED),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

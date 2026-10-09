@@ -52,7 +52,7 @@ use curvine_model::{
 use curvine_net::net::InetAddr;
 use curvine_proto::{
     GetTransferStatusResponse, SubmitTransferResponse, TransferJobStatusProto,
-    TransferTaskStatusProto, TransferTaskSummaryProto,
+    TransferStateCountProto, TransferTaskStatusProto, TransferTaskSummaryProto,
 };
 use curvine_raft::raft::RaftClient;
 use curvine_runtime::common::CommonUtils;
@@ -232,6 +232,9 @@ struct TransferListQuery {
     kind: Option<String>,
     #[serde(default)]
     state: Option<String>,
+    /// Console status group: all / active / completed / failed / canceled.
+    #[serde(default)]
+    bucket: Option<String>,
     #[serde(default)]
     page: Option<usize>,
     #[serde(default)]
@@ -528,7 +531,6 @@ const TRANSFER_RPC_TIMEOUT_SECS: u64 = 10;
 const TRANSFER_SUBMIT_RPC_TIMEOUT_SECS: u64 = 30;
 const TRANSFER_CANCEL_RPC_TIMEOUT_SECS: u64 = 15;
 const TRANSFER_LIST_MAX_FETCH: usize = 1000;
-const TRANSFER_LIST_MAX_PAGES: usize = 5;
 // Upper bound on the task list returned with a transfer status response. A job
 // with batching/segmentation can own far more tasks than a page should carry,
 // so the detail view requests pages explicitly and follows `next_page_token`.
@@ -1232,6 +1234,47 @@ fn transfer_state_from_name(name: &str) -> FsResult<TransferState> {
         "partial_success" | "partialsuccess" | "partial" => Ok(TransferState::PartialSuccess),
         _ => err_box!("unsupported transfer state: {}", name),
     }
+}
+
+/// The console's status groups, expanded to the states each one covers. `None`
+/// means "no state filter", so the whole list is returned.
+fn transfer_state_bucket(name: &str) -> FsResult<Option<Vec<TransferState>>> {
+    match name.trim().to_lowercase().as_str() {
+        "" | "all" => Ok(None),
+        "active" => Ok(Some(vec![
+            TransferState::Pending,
+            TransferState::Planning,
+            TransferState::Dispatching,
+            TransferState::Running,
+            TransferState::Canceling,
+        ])),
+        "completed" => Ok(Some(vec![TransferState::Completed])),
+        "failed" => Ok(Some(vec![
+            TransferState::Failed,
+            TransferState::PartialSuccess,
+        ])),
+        "canceled" => Ok(Some(vec![TransferState::Canceled])),
+        _ => err_box!("unsupported transfer bucket: {}", name),
+    }
+}
+
+/// Fold the per-state counts into the console's bucket tallies.
+fn transfer_bucket_counts_payload(counts: &[TransferStateCountProto]) -> Value {
+    let count_of = |states: &[i32]| -> u64 {
+        counts
+            .iter()
+            .filter(|entry| states.contains(&entry.state))
+            .map(|entry| entry.count)
+            .sum()
+    };
+    let all: u64 = counts.iter().map(|entry| entry.count).sum();
+    json!({
+        "all": all,
+        "active": count_of(&[1, 2, 3, 4, 5]),
+        "completed": count_of(&[6]),
+        "failed": count_of(&[7, 9]),
+        "canceled": count_of(&[8]),
+    })
 }
 
 fn transfer_task_state_name(state: i32) -> &'static str {
@@ -3798,79 +3841,61 @@ async fn transfers_v1(
         .page_size
         .unwrap_or(20)
         .clamp(1, TRANSFER_LIST_MAX_FETCH);
+    let offset = (page - 1) * page_size;
     let kind_filter = query
         .kind
         .as_deref()
         .map(transfer_kind_from_name)
         .transpose()?;
-    let state_filter = query
-        .state
-        .as_deref()
-        .map(transfer_state_from_name)
-        .transpose()?;
+
+    // `bucket` is the console's status group. `state` and `failed_only` stay
+    // supported so older clients keep working; `bucket` wins when both are sent.
+    let mut states = match query.bucket.as_deref() {
+        Some(bucket) => transfer_state_bucket(bucket)?,
+        None => None,
+    };
+    if states.is_none() {
+        if let Some(state) = query.state.as_deref() {
+            states = Some(vec![transfer_state_from_name(state)?]);
+        }
+    }
+    if states.is_none() && query.failed_only.unwrap_or(false) {
+        states = transfer_state_bucket("failed")?;
+    }
+    let states = states.unwrap_or_default();
+
+    // One source-side page: the offset rides in the RPC's page token, so the
+    // server fetches exactly this window instead of the whole history.
     let client = instance.transfer_client()?;
-    let mut items = Vec::new();
-    let mut page_token = None;
-    for _ in 0..TRANSFER_LIST_MAX_PAGES {
-        let response = with_job_timeout_secs(
-            TRANSFER_RPC_TIMEOUT_SECS,
-            client.list(
-                kind_filter,
-                state_filter,
-                None,
-                None,
-                Some(TRANSFER_LIST_MAX_FETCH as u32),
-                page_token.clone(),
-            ),
-        )
-        .await?;
-        let fetched = response.jobs.len();
-        items.extend(response.jobs.into_iter().map(transfer_job_status_payload));
-        match response.next_page_token {
-            Some(next) if !next.is_empty() => page_token = Some(next),
-            _ => break,
-        }
-        if fetched == 0 {
-            break;
-        }
-    }
+    let response = with_job_timeout_secs(
+        TRANSFER_RPC_TIMEOUT_SECS,
+        client.list(
+            kind_filter,
+            states,
+            None,
+            None,
+            Some(page_size as u32),
+            Some(offset.to_string()),
+        ),
+    )
+    .await?;
 
-    if query.failed_only.unwrap_or(false) {
-        items.retain(|item| {
-            matches!(
-                item.get("state").and_then(Value::as_str),
-                Some("Failed" | "PartialSuccess")
-            )
-        });
-    }
-    items.sort_by(|left, right| {
-        let left_time = left
-            .get("update_time_ms")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        let right_time = right
-            .get("update_time_ms")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        right_time.cmp(&left_time).then_with(|| {
-            let left_id = left.get("job_id").and_then(Value::as_str).unwrap_or("");
-            let right_id = right.get("job_id").and_then(Value::as_str).unwrap_or("");
-            right_id.cmp(left_id)
-        })
-    });
-
-    let total = items.len();
-    let start = (page - 1) * page_size;
-    let paged = items
+    let items = response
+        .jobs
         .into_iter()
-        .skip(start)
-        .take(page_size)
+        .map(transfer_job_status_payload)
         .collect::<Vec<_>>();
+    let counts = transfer_bucket_counts_payload(&response.counts);
+    let total = response
+        .total
+        .unwrap_or_else(|| counts.get("all").and_then(Value::as_u64).unwrap_or(0));
+
     Ok(api_success(json!({
-        "items": paged,
+        "items": items,
         "page": page,
         "page_size": page_size,
-        "total": total
+        "total": total,
+        "counts": counts
     })))
 }
 

@@ -141,10 +141,12 @@ impl TransferClient {
             .await
     }
 
+    /// `states` selects any of several states at once (a console bucket); empty
+    /// means all. `page_token` is a numeric offset.
     pub async fn list(
         &self,
         kind: Option<TransferKind>,
-        state: Option<TransferState>,
+        states: Vec<TransferState>,
         submitter: Option<String>,
         tenant: Option<String>,
         page_size: Option<u32>,
@@ -152,7 +154,8 @@ impl TransferClient {
     ) -> FsResult<ListTransfersResponse> {
         let req = ListTransfersRequest {
             kind: kind.map(transfer_kind_code),
-            state: state.map(transfer_state_code),
+            state: None,
+            states: states.into_iter().map(transfer_state_code).collect(),
             page_size,
             page_token,
             submitter,

@@ -348,9 +348,10 @@ async fn list_transfer_pages(
     all: bool,
 ) -> CommonResult<ListTransfersResponse> {
     validate_all_page_limit(limit, all)?;
+    let states: Vec<TransferState> = state.into_iter().collect();
     let mut response = handle_rpc_result(client.list(
         kind,
-        state,
+        states.clone(),
         submitter.clone(),
         tenant.clone(),
         Some(limit),
@@ -366,7 +367,7 @@ async fn list_transfer_pages(
         ensure_page_advanced(previous_token.as_deref(), &next_token)?;
         let mut next = handle_rpc_result(client.list(
             kind,
-            state,
+            states.clone(),
             submitter.clone(),
             tenant.clone(),
             Some(limit),

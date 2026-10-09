@@ -20,16 +20,16 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
 use curvine_model::{
-    FileStatus, TransferCommand, TransferJobRecord, TransferKind, TransferListFilter,
-    TransferProgress, TransferState, TransferTaskCounts, TransferTaskReport, TransferTaskState,
-    TransferTaskStatus,
+    FileStatus, TransferCommand, TransferCountFilter, TransferJobRecord, TransferKind,
+    TransferListFilter, TransferProgress, TransferState, TransferStateCounts, TransferTaskCounts,
+    TransferTaskReport, TransferTaskState, TransferTaskStatus,
 };
 use curvine_proto::{
     ListTransferTenantsRequest, ListTransferTenantsResponse, ListTransfersRequest,
     ListTransfersResponse, SubmitTransferRequest, TransferJobStatusProto, TransferKindProto,
-    TransferProgressProto, TransferTaskReportBatchRequest, TransferTaskReportRequest,
-    TransferTaskStateProto, TransferTaskStatusProto, TransferTaskSummaryProto,
-    TransferTenantSummaryProto,
+    TransferProgressProto, TransferStateCountProto, TransferTaskReportBatchRequest,
+    TransferTaskReportRequest, TransferTaskStateProto, TransferTaskStatusProto,
+    TransferTaskSummaryProto, TransferTenantSummaryProto,
 };
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::common::SerdeUtils;
@@ -511,11 +511,28 @@ where
     pub fn list_transfers(&self, req: ListTransfersRequest) -> FsResult<ListTransfersResponse> {
         let page_size = bounded_page_size(req.page_size);
         let offset = parse_page_token(req.page_token)?;
+        let kind = req.kind.map(transfer_kind).transpose()?;
+        // The bucket arrives as a set of states; a single `state` is the older,
+        // single-valued form of the same filter.
+        let states: Vec<TransferState> = if !req.states.is_empty() {
+            req.states
+                .iter()
+                .map(|state| transfer_state(*state))
+                .collect::<FsResult<Vec<_>>>()?
+        } else {
+            req.state
+                .map(transfer_state)
+                .transpose()?
+                .into_iter()
+                .collect()
+        };
+        let submitter = non_empty_filter(req.submitter);
+        let tenant = non_empty_filter(req.tenant);
         let filter = TransferListFilter {
-            kind: req.kind.map(transfer_kind).transpose()?,
-            state: req.state.map(transfer_state).transpose()?,
-            submitter: non_empty_filter(req.submitter),
-            tenant: non_empty_filter(req.tenant),
+            kind,
+            states: states.clone(),
+            submitter: submitter.clone(),
+            tenant: tenant.clone(),
             limit: page_size + 1,
             offset,
         };
@@ -526,9 +543,18 @@ where
         } else {
             None
         };
+        // One grouped count serves the page total and every UI bucket badge.
+        let counts = self.store.count_transfers_by_state(&TransferCountFilter {
+            kind,
+            submitter,
+            tenant,
+        })?;
+        let total = counts.total_for(&states);
         Ok(ListTransfersResponse {
             jobs: jobs.into_iter().map(job_to_proto).collect(),
             next_page_token,
+            total: Some(total),
+            counts: state_counts_to_proto(&counts),
         })
     }
 
@@ -1329,6 +1355,29 @@ fn transfer_state(state: i32) -> FsResult<TransferState> {
         9 => Ok(TransferState::PartialSuccess),
         _ => Err(FsError::common(format!("Unknown transfer state {}", state))),
     }
+}
+
+/// Every state is emitted, zeros included, so the console can index the response
+/// by state instead of guessing which ones were absent.
+fn state_counts_to_proto(counts: &TransferStateCounts) -> Vec<TransferStateCountProto> {
+    const STATES: [TransferState; 9] = [
+        TransferState::Pending,
+        TransferState::Planning,
+        TransferState::Dispatching,
+        TransferState::Running,
+        TransferState::Canceling,
+        TransferState::Completed,
+        TransferState::Failed,
+        TransferState::Canceled,
+        TransferState::PartialSuccess,
+    ];
+    STATES
+        .iter()
+        .map(|state| TransferStateCountProto {
+            state: i32::from(*state),
+            count: counts.count_of(*state),
+        })
+        .collect()
 }
 
 fn transfer_state_name(state: TransferState) -> &'static str {

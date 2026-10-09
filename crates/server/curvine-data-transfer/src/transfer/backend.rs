@@ -15,10 +15,10 @@
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
-    StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease, TransferListFilter,
-    TransferProgress, TransferStateUpdate, TransferTaskCounts, TransferTaskRecord,
-    TransferTaskReport, TransferTaskState, TransferTaskStatus, TransferTaskSummary,
-    TransferTenantSummary,
+    StaleTaskAttempt, TaskAttemptStart, TransferCountFilter, TransferJobRecord, TransferLease,
+    TransferListFilter, TransferProgress, TransferStateCounts, TransferStateUpdate,
+    TransferTaskCounts, TransferTaskRecord, TransferTaskReport, TransferTaskState,
+    TransferTaskStatus, TransferTaskSummary, TransferTenantSummary,
 };
 use std::time::Instant;
 
@@ -194,6 +194,21 @@ impl TransferStore for TransferStoreBackend {
             Self::Mysql(store) => store.list_transfers(filter),
             #[cfg(feature = "transfer-store-postgres")]
             Self::Postgres(store) => store.list_transfers(filter),
+        })
+    }
+
+    fn count_transfers_by_state(
+        &self,
+        filter: &TransferCountFilter,
+    ) -> FsResult<TransferStateCounts> {
+        self.record_store_operation("count_transfers_by_state", || match self {
+            Self::Memory(store) => store.count_transfers_by_state(filter),
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => store.count_transfers_by_state(filter),
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => store.count_transfers_by_state(filter),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.count_transfers_by_state(filter),
         })
     }
 

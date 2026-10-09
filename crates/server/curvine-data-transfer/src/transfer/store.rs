@@ -14,10 +14,11 @@
 
 use curvine_error::{FsError, FsResult};
 use curvine_model::{
-    summarize_transfer_tasks, StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease,
-    TransferListFilter, TransferProgress, TransferStateUpdate, TransferTaskCounts,
-    TransferTaskRecord, TransferTaskReport, TransferTaskState, TransferTaskStatus,
-    TransferTaskSummary, TransferTenantSummary, WorkerInflight,
+    summarize_transfer_tasks, StaleTaskAttempt, TaskAttemptStart, TransferCountFilter,
+    TransferJobRecord, TransferLease, TransferListFilter, TransferProgress, TransferStateCounts,
+    TransferStateUpdate, TransferTaskCounts, TransferTaskRecord, TransferTaskReport,
+    TransferTaskState, TransferTaskStatus, TransferTaskSummary, TransferTenantSummary,
+    WorkerInflight,
 };
 
 /// Every SQL write path that mutates task rows must stay below this bound in
@@ -76,6 +77,14 @@ pub trait TransferStore: Send + Sync + 'static {
     fn count_executing_transfers(&self) -> FsResult<u64>;
 
     fn list_transfers(&self, filter: TransferListFilter) -> FsResult<Vec<TransferJobRecord>>;
+
+    /// Job counts grouped by state, over the whole store (ignoring paging and the
+    /// state filter), so the console's bucket tallies stay global while the list is
+    /// paged. Only the kind/submitter/tenant predicates are honoured.
+    fn count_transfers_by_state(
+        &self,
+        filter: &TransferCountFilter,
+    ) -> FsResult<TransferStateCounts>;
 
     fn list_tenant_summaries(
         &self,

@@ -131,11 +131,22 @@ message ListTransfersRequest {
   optional string page_token = 4;
   optional string submitter = 5;
   optional string tenant = 6;
+  // When non-empty, selects several states at once (a UI bucket); overrides `state`.
+  repeated TransferStateProto states = 7;
+}
+
+message TransferStateCountProto {
+  required TransferStateProto state = 1;
+  required uint64 count = 2;
 }
 
 message ListTransfersResponse {
   repeated TransferJobStatusProto jobs = 1;
   optional string next_page_token = 2;
+  // Rows matching the request's filters, across all pages.
+  optional uint64 total = 3;
+  // Per-state counts over the whole store, so the UI's bucket tallies stay global.
+  repeated TransferStateCountProto counts = 4;
 }
 
 message TransferTenantSummaryProto {

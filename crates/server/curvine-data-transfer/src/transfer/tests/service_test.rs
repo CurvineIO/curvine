@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use curvine_model::{
     FileStatus, StoragePolicy, StorageState, StorageType, TransferKind, TransferState, TtlAction,
 };
-use curvine_proto::SubmitTransferRequest;
+use curvine_proto::{ListTransfersRequest, SubmitTransferRequest};
 
 use super::service::{
     auto_repair_eligible, auto_repair_in_cooldown, cv_cache_target_needs_repair,
@@ -239,4 +240,67 @@ fn dispatch_result_message_prefers_capacity_reasons() {
         "waiting for worker capacity: 5 task(s) blocked this round (worker in-flight byte budget or concurrency limit reached)"
     );
     assert_eq!(dispatch_result_message(3, 0), "dispatched 3 tasks");
+}
+
+#[test]
+fn list_transfers_pages_at_the_source_and_counts_by_state() {
+    let store = Arc::new(MemoryTransferStore::new());
+    let service = TransferService::new(store.clone());
+    let mut ids = Vec::new();
+    for index in 0..5 {
+        let job = service
+            .submit_transfer(load_submit_request(&format!("list-req-{index}")))
+            .unwrap();
+        ids.push(job.job_id);
+    }
+    store.set_job_state(&ids[0], TransferState::Completed);
+    store.set_job_state(&ids[1], TransferState::Failed);
+
+    // A short page reports the full total and follows with a next-page token.
+    let first = service
+        .list_transfers(ListTransfersRequest {
+            page_size: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(first.jobs.len(), 2);
+    assert_eq!(first.total, Some(5));
+    assert!(first.next_page_token.is_some());
+
+    let counts: HashMap<i32, u64> = first
+        .counts
+        .iter()
+        .map(|entry| (entry.state, entry.count))
+        .collect();
+    assert_eq!(counts.get(&(TransferState::Pending as i32)), Some(&3));
+    assert_eq!(counts.get(&(TransferState::Completed as i32)), Some(&1));
+    assert_eq!(counts.get(&(TransferState::Failed as i32)), Some(&1));
+
+    // The bucket expands to several states and narrows the total with it.
+    let failed = service
+        .list_transfers(ListTransfersRequest {
+            states: vec![
+                TransferState::Failed as i32,
+                TransferState::PartialSuccess as i32,
+            ],
+            page_size: Some(50),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(failed.total, Some(1));
+    assert_eq!(failed.jobs.len(), 1);
+
+    // Following the token reads the second window, not the first.
+    let second = service
+        .list_transfers(ListTransfersRequest {
+            page_size: Some(2),
+            page_token: first.next_page_token,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(second.jobs.len(), 2);
+    assert!(second
+        .jobs
+        .iter()
+        .all(|job| !first.jobs.iter().any(|first| first.job_id == job.job_id)));
 }

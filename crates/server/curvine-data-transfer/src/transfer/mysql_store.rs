@@ -16,10 +16,10 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
     summarize_transfer_tasks, transfer_task_summary_from_aggregate, StaleTaskAttempt,
-    TaskAttemptStart, TransferJobRecord, TransferLease, TransferListFilter, TransferProgress,
-    TransferState, TransferStateUpdate, TransferTaskCounts, TransferTaskRecord, TransferTaskReport,
-    TransferTaskState, TransferTaskStatus, TransferTaskSummary, TransferTenantSummary,
-    WorkerInflight,
+    TaskAttemptStart, TransferCountFilter, TransferJobRecord, TransferKind, TransferLease,
+    TransferListFilter, TransferProgress, TransferState, TransferStateCounts, TransferStateUpdate,
+    TransferTaskCounts, TransferTaskRecord, TransferTaskReport, TransferTaskState,
+    TransferTaskStatus, TransferTaskSummary, TransferTenantSummary, WorkerInflight,
 };
 use mysql::prelude::*;
 use mysql::{params, IsolationLevel, Params, Pool, PooledConn, TxOpts};
@@ -294,35 +294,44 @@ impl TransferStore for MysqlTransferStore {
     }
 
     fn list_transfers(&self, filter: TransferListFilter) -> FsResult<Vec<TransferJobRecord>> {
-        let mut jobs = select_jobs(
-            &mut self.conn()?,
-            "select record_json from transfer_jobs",
-            Params::Empty,
-        )?;
-        jobs.retain(|job| {
-            filter.kind.is_none_or(|kind| job.kind == kind)
-                && filter.state.is_none_or(|state| job.state == state)
-                && filter
-                    .submitter
-                    .as_ref()
-                    .is_none_or(|submitter| job.submitter == *submitter)
-                && filter
-                    .tenant
-                    .as_ref()
-                    .is_none_or(|tenant| job.tenant == *tenant)
-        });
-        jobs.sort_by(|left, right| {
-            right
-                .updated_at
-                .cmp(&left.updated_at)
-                .then(right.created_at.cmp(&left.created_at))
-                .then(right.job_id.cmp(&left.job_id))
-        });
-        Ok(jobs
-            .into_iter()
-            .skip(filter.offset)
-            .take(filter.limit)
-            .collect())
+        let (where_sql, mut values) = job_where_mysql(
+            filter.kind,
+            &filter.states,
+            filter.submitter.as_deref(),
+            filter.tenant.as_deref(),
+        );
+        let sql = format!(
+            "select record_json from transfer_jobs {where_sql}
+             order by updated_at desc, created_at desc, job_id desc
+             limit ? offset ?"
+        );
+        values.push(mysql::Value::from(filter.limit as u64));
+        values.push(mysql::Value::from(filter.offset as u64));
+        select_jobs(&mut self.conn()?, sql.as_str(), Params::Positional(values))
+    }
+
+    fn count_transfers_by_state(
+        &self,
+        filter: &TransferCountFilter,
+    ) -> FsResult<TransferStateCounts> {
+        let (where_sql, values) = job_where_mysql(
+            filter.kind,
+            &[],
+            filter.submitter.as_deref(),
+            filter.tenant.as_deref(),
+        );
+        let sql = format!("select state, count(*) from transfer_jobs {where_sql} group by state");
+        let params = if values.is_empty() {
+            Params::Empty
+        } else {
+            Params::Positional(values)
+        };
+        let rows: Vec<(i32, u64)> = self.conn()?.exec(sql.as_str(), params).map_err(mysql_err)?;
+        let mut counts = TransferStateCounts::default();
+        for (state, count) in rows {
+            counts.add(TransferState::from(state), count);
+        }
+        Ok(counts)
     }
 
     fn list_tenant_summaries(
@@ -2091,6 +2100,39 @@ fn target_paths_conflict(left: &str, right: &str) -> bool {
         || right
             .strip_prefix(left)
             .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+/// Shared WHERE builder for the job list and the state-grouped count. Returns the
+/// clause text and the positional values the caller must bind in order.
+fn job_where_mysql(
+    kind: Option<TransferKind>,
+    states: &[TransferState],
+    submitter: Option<&str>,
+    tenant: Option<&str>,
+) -> (String, Vec<mysql::Value>) {
+    let mut clauses = Vec::new();
+    let mut values: Vec<mysql::Value> = Vec::new();
+    if let Some(kind) = kind {
+        clauses.push("kind = ?".to_string());
+        values.push(mysql::Value::from(kind as i32));
+    }
+    for state in states {
+        clauses.push("state = ?".to_string());
+        values.push(mysql::Value::from(*state as i32));
+    }
+    if let Some(submitter) = submitter {
+        clauses.push("submitter = ?".to_string());
+        values.push(mysql::Value::from(submitter.to_string()));
+    }
+    if let Some(tenant) = tenant {
+        clauses.push("tenant = ?".to_string());
+        values.push(mysql::Value::from(tenant.to_string()));
+    }
+    if clauses.is_empty() {
+        (String::new(), values)
+    } else {
+        (format!("where {}", clauses.join(" and ")), values)
+    }
 }
 
 fn select_jobs(

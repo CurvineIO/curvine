@@ -16,10 +16,10 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
     transfer_task_summary_from_aggregate, StaleTaskAttempt, TaskAttemptStart, TransferCommand,
-    TransferJobRecord, TransferKind, TransferLease, TransferListFilter, TransferProgress,
-    TransferState, TransferStateUpdate, TransferTaskCounts, TransferTaskRecord, TransferTaskReport,
-    TransferTaskState, TransferTaskStatus, TransferTaskSummary, TransferTenantSummary,
-    WorkerInflight,
+    TransferCountFilter, TransferJobRecord, TransferKind, TransferLease, TransferListFilter,
+    TransferProgress, TransferState, TransferStateCounts, TransferStateUpdate, TransferTaskCounts,
+    TransferTaskRecord, TransferTaskReport, TransferTaskState, TransferTaskStatus,
+    TransferTaskSummary, TransferTenantSummary, WorkerInflight,
 };
 use parking_lot::Mutex;
 use rusqlite::{
@@ -175,6 +175,36 @@ impl TransferStore for SqliteTransferStore {
             .query_map(params_from_iter(values), sqlite_job_row)
             .map_err(sqlite_err)?;
         collect_sqlite_rows(rows)
+    }
+
+    fn count_transfers_by_state(
+        &self,
+        filter: &TransferCountFilter,
+    ) -> FsResult<TransferStateCounts> {
+        // Reuse the list filter's WHERE builder with the state predicate cleared.
+        let predicate = TransferListFilter {
+            kind: filter.kind,
+            states: Vec::new(),
+            submitter: filter.submitter.clone(),
+            tenant: filter.tenant.clone(),
+            limit: 0,
+            offset: 0,
+        };
+        let (where_sql, values) = list_filter_sqlite_params(&predicate);
+        let sql = format!("select state, count(*) from transfer_jobs {where_sql} group by state");
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(sql.as_str()).map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params_from_iter(values), |row| {
+                Ok((row.get::<_, i32>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(sqlite_err)?;
+        let mut counts = TransferStateCounts::default();
+        for row in rows {
+            let (state, count) = row.map_err(sqlite_err)?;
+            counts.add(TransferState::from(state), count.max(0) as u64);
+        }
+        Ok(counts)
     }
 
     fn list_tenant_summaries(
@@ -2219,22 +2249,25 @@ fn sqlite_job_row(row: &Row<'_>) -> rusqlite::Result<TransferJobRecord> {
 }
 
 fn list_filter_sqlite_params(filter: &TransferListFilter) -> (String, Vec<SqliteValue>) {
-    let mut clauses = Vec::new();
+    let mut clauses: Vec<String> = Vec::new();
     let mut values = Vec::new();
     if let Some(kind) = filter.kind {
-        clauses.push("kind = ?");
+        clauses.push("kind = ?".to_string());
         values.push(SqliteValue::Integer(kind as i32 as i64));
     }
-    if let Some(state) = filter.state {
-        clauses.push("state = ?");
-        values.push(SqliteValue::Integer(state as i32 as i64));
+    if !filter.states.is_empty() {
+        let placeholders = vec!["?"; filter.states.len()].join(", ");
+        clauses.push(format!("state in ({placeholders})"));
+        for state in &filter.states {
+            values.push(SqliteValue::Integer(*state as i32 as i64));
+        }
     }
     if let Some(submitter) = &filter.submitter {
-        clauses.push("submitter = ?");
+        clauses.push("submitter = ?".to_string());
         values.push(SqliteValue::Text(submitter.clone()));
     }
     if let Some(tenant) = &filter.tenant {
-        clauses.push("tenant = ?");
+        clauses.push("tenant = ?".to_string());
         values.push(SqliteValue::Text(tenant.clone()));
     }
     if clauses.is_empty() {

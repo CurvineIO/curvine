@@ -17,10 +17,11 @@ use std::collections::{HashMap, HashSet};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
-    summarize_transfer_tasks, StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease,
-    TransferListFilter, TransferProgress, TransferState, TransferStateUpdate, TransferTaskCounts,
-    TransferTaskRecord, TransferTaskReport, TransferTaskState, TransferTaskStatus,
-    TransferTenantSummary, WorkerInflight,
+    summarize_transfer_tasks, StaleTaskAttempt, TaskAttemptStart, TransferCountFilter,
+    TransferJobRecord, TransferLease, TransferListFilter, TransferProgress, TransferState,
+    TransferStateCounts, TransferStateUpdate, TransferTaskCounts, TransferTaskRecord,
+    TransferTaskReport, TransferTaskState, TransferTaskStatus, TransferTenantSummary,
+    WorkerInflight,
 };
 use parking_lot::Mutex;
 
@@ -209,7 +210,7 @@ impl TransferStore for MemoryTransferStore {
             .jobs
             .values()
             .filter(|job| filter.kind.is_none_or(|kind| job.kind == kind))
-            .filter(|job| filter.state.is_none_or(|state| job.state == state))
+            .filter(|job| filter.matches_state(job.state))
             .filter(|job| {
                 filter
                     .submitter
@@ -236,6 +237,19 @@ impl TransferStore for MemoryTransferStore {
             .skip(filter.offset)
             .take(filter.limit)
             .collect())
+    }
+
+    fn count_transfers_by_state(
+        &self,
+        filter: &TransferCountFilter,
+    ) -> FsResult<TransferStateCounts> {
+        let mut counts = TransferStateCounts::default();
+        for job in self.inner.lock().jobs.values() {
+            if filter.matches(job) {
+                counts.add(job.state, 1);
+            }
+        }
+        Ok(counts)
     }
 
     fn list_tenant_summaries(

@@ -14,10 +14,11 @@
 
 use curvine_error::{FsError, FsResult};
 use curvine_model::{
-    summarize_transfer_tasks, StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease,
-    TransferListFilter, TransferProgress, TransferState, TransferStateUpdate, TransferTaskCounts,
-    TransferTaskRecord, TransferTaskReport, TransferTaskState, TransferTaskStatus,
-    TransferTaskSummary, TransferTenantSummary, WorkerInflight,
+    summarize_transfer_tasks, StaleTaskAttempt, TaskAttemptStart, TransferCountFilter,
+    TransferJobRecord, TransferLease, TransferListFilter, TransferProgress, TransferState,
+    TransferStateCounts, TransferStateUpdate, TransferTaskCounts, TransferTaskRecord,
+    TransferTaskReport, TransferTaskState, TransferTaskStatus, TransferTaskSummary,
+    TransferTenantSummary, WorkerInflight,
 };
 use native_tls::{Certificate, TlsConnector};
 use percent_encoding::percent_decode_str;
@@ -974,6 +975,72 @@ fn count_rows(
         .map_err(|_| FsError::common("Transfer store returned a negative row count"))
 }
 
+/// Shared WHERE builder for the job list and the state-grouped count, so the two
+/// cannot drift apart.
+fn transfer_filter_clause<'a>(
+    kind: &'a Option<i32>,
+    states: &'a [i32],
+    submitter: Option<&'a String>,
+    tenant: Option<&'a String>,
+    clauses: &mut Vec<String>,
+    params: &mut Vec<&'a (dyn postgres::types::ToSql + Sync)>,
+) {
+    if let Some(value) = kind.as_ref() {
+        clauses.push(format!("kind = ${}", params.len() + 1));
+        params.push(value);
+    }
+    for state in states {
+        clauses.push(format!("state = ${}", params.len() + 1));
+        params.push(state);
+    }
+    if let Some(value) = submitter {
+        clauses.push(format!("submitter = ${}", params.len() + 1));
+        params.push(value);
+    }
+    if let Some(value) = tenant {
+        clauses.push(format!("tenant = ${}", params.len() + 1));
+        params.push(value);
+    }
+}
+
+fn where_sql_of(clauses: &[String]) -> String {
+    if clauses.is_empty() {
+        String::new()
+    } else {
+        format!("where {}", clauses.join(" and "))
+    }
+}
+
+/// Job counts grouped by state over the whole table, for the console's buckets.
+fn count_transfers_by_state_sql(
+    conn: &mut impl GenericClient,
+    kind: &Option<i32>,
+    submitter: Option<&String>,
+    tenant: Option<&String>,
+) -> FsResult<TransferStateCounts> {
+    let mut clauses = Vec::new();
+    let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = Vec::new();
+    transfer_filter_clause(kind, &[], submitter, tenant, &mut clauses, &mut params);
+    let sql = format!(
+        "select state, count(*) from transfer_jobs {} group by state",
+        where_sql_of(&clauses)
+    );
+    let mut counts = TransferStateCounts::default();
+    for row in conn
+        .query(sql.as_str(), &params)
+        .map_err(postgres_err)?
+        .iter()
+    {
+        let state: i32 = row.get(0);
+        let count: i64 = row.get(1);
+        counts.add(
+            TransferState::from(state),
+            u64::try_from(count).unwrap_or(0),
+        );
+    }
+    Ok(counts)
+}
+
 fn job_from_row(row: &Row) -> FsResult<TransferJobRecord> {
     let value: String = row.get(0);
     serde_json::from_str(&value).map_err(json_err)
@@ -1231,36 +1298,22 @@ impl TransferStore for PostgresTransferStore {
 
     fn list_transfers(&self, filter: TransferListFilter) -> FsResult<Vec<TransferJobRecord>> {
         let kind = filter.kind.map(|value| value as i32);
-        let state = filter.state.map(|value| value as i32);
-        let has_submitter = filter.submitter.is_some();
-        let submitter = filter.submitter.unwrap_or_default();
-        let has_tenant = filter.tenant.is_some();
-        let tenant = filter.tenant.unwrap_or_default();
+        let states: Vec<i32> = filter.states.iter().map(|state| *state as i32).collect();
+        let submitter = filter.submitter;
+        let tenant = filter.tenant;
         let limit = db_limit(filter.limit)?;
         let offset = db_limit(filter.offset)?;
         let mut clauses = Vec::new();
         let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = Vec::new();
-        if let Some(value) = kind.as_ref() {
-            clauses.push(format!("kind = ${}", params.len() + 1));
-            params.push(value);
-        }
-        if let Some(value) = state.as_ref() {
-            clauses.push(format!("state = ${}", params.len() + 1));
-            params.push(value);
-        }
-        if has_submitter {
-            clauses.push(format!("submitter = ${}", params.len() + 1));
-            params.push(&submitter);
-        }
-        if has_tenant {
-            clauses.push(format!("tenant = ${}", params.len() + 1));
-            params.push(&tenant);
-        }
-        let where_sql = if clauses.is_empty() {
-            String::new()
-        } else {
-            format!("where {}", clauses.join(" and "))
-        };
+        transfer_filter_clause(
+            &kind,
+            &states,
+            submitter.as_ref(),
+            tenant.as_ref(),
+            &mut clauses,
+            &mut params,
+        );
+        let where_sql = where_sql_of(&clauses);
         let sql = format!(
             "select record_json from transfer_jobs {where_sql}
              order by updated_at desc, created_at desc, job_id desc
@@ -1272,6 +1325,20 @@ impl TransferStore for PostgresTransferStore {
         params.push(&offset);
         let mut conn = self.conn()?;
         select_jobs(&mut *conn, &sql, &params)
+    }
+
+    fn count_transfers_by_state(
+        &self,
+        filter: &TransferCountFilter,
+    ) -> FsResult<TransferStateCounts> {
+        let kind = filter.kind.map(|value| value as i32);
+        let mut conn = self.conn()?;
+        count_transfers_by_state_sql(
+            &mut *conn,
+            &kind,
+            filter.submitter.as_ref(),
+            filter.tenant.as_ref(),
+        )
     }
 
     fn list_tenant_summaries(
