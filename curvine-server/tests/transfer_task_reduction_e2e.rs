@@ -39,6 +39,9 @@ use curvine_server::test::MiniCluster;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(feature = "fault-injection")]
+use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+
 const MB: i64 = 1024 * 1024;
 
 /// D1: shared classifier, compact manifest, size bound, RPC compat.
@@ -428,6 +431,255 @@ fn e2e_job_info(
         overwrite: Some(true),
         source_type: JobSourceType::default(),
     }
+}
+
+/// A normal Transfer load writes to a temporary CV inode. The source identity
+/// and retry marker must be part of CompleteFile so rename cannot expose a
+/// final path with valid bytes but `ufs_mtime == 0`.
+#[test]
+fn e2e_u2c_complete_atomically_preserves_mtime_and_marker() -> CommonResult<()> {
+    let (cluster, base_dir) = e2e_cluster();
+    let rt = cluster.clone_client_rt();
+    rt.block_on(async move {
+        let fs = cluster.new_fs();
+        let ufs_dir = format!("{base_dir}/ufs-atomic-complete");
+        std::fs::create_dir_all(&ufs_dir)?;
+        let source = format!("file://{ufs_dir}/source.bin");
+        std::fs::write(format!("{ufs_dir}/source.bin"), b"atomic-complete")?;
+
+        let mount_path = Path::from_str("/e2e-u2c-atomic")?;
+        fs.mount(
+            &Path::from_str(format!("file://{ufs_dir}"))?,
+            &mount_path,
+            curvine_model::MountOptions::builder()
+                .block_size(1024 * 1024)
+                .replicas(1)
+                .auto_cache(false)
+                .build(),
+        )
+        .await?;
+        let mount = fs
+            .get_mount_table()
+            .await?
+            .into_iter()
+            .find(|mount| mount.cv_path == "/e2e-u2c-atomic")
+            .unwrap();
+        let factory = Arc::new(UfsFactory::with_rt(
+            &cluster.cluster_conf.client,
+            cluster.clone_client_rt(),
+        ));
+        let source_status = factory
+            .get_ufs(&mount)?
+            .get_status(&Path::from_str(&source)?)
+            .await?;
+        assert_ne!(
+            source_status.mtime, 0,
+            "test source must carry a non-zero UFS mtime"
+        );
+        let target = "/e2e-u2c-atomic-output/final.bin";
+        let mut committed_inode = None;
+
+        for attempt_id in [1, 2] {
+            let context = Arc::new(TaskContext::new(LoadTaskInfo {
+                job: e2e_job_info(
+                    "e2e-u2c-atomic",
+                    &source,
+                    target,
+                    1024 * 1024,
+                    &mount,
+                    StorageType::default(),
+                ),
+                task_id: "atomic-task".to_string(),
+                worker: WorkerAddress::default(),
+                source_path: source.clone(),
+                target_path: target.to_string(),
+                create_time: 0,
+                source_read_plan_json: String::new(),
+                estimated_size: source_status.len,
+                transfer_report: Some(TransferTaskReportInfo {
+                    run_id: 1,
+                    attempt_id,
+                    worker_id: 0,
+                    worker_session_id: "atomic-session".to_string(),
+                    report_target: String::new(),
+                    report_endpoints: Vec::new(),
+                    attempt_started_at_ms: 0,
+                    resume_loaded_size: 0,
+                }),
+            }));
+            let runner =
+                LoadTaskRunner::new(context, fs.clone(), factory.clone(), None, 10_000, 120_000);
+            // No reporter is installed in this isolated runner. Terminal
+            // reporting therefore returns false after the data commit, which
+            // lets this test inspect the committed inode directly.
+            assert!(!runner.run().await);
+
+            let status = fs.get_status(&Path::from_str(target)?).await?;
+            assert_eq!(status.storage_policy.ufs_mtime, source_status.mtime);
+            assert!(
+                status.cv_valid(None),
+                "atomic UFS mtime must make the completed target cache-valid"
+            );
+            assert_eq!(
+                status
+                    .x_attr
+                    .get("curvine.transfer.task")
+                    .map(Vec::as_slice),
+                Some(&b"atomic-task"[..])
+            );
+            if let Some(inode) = committed_inode {
+                assert_eq!(
+                    status.id, inode,
+                    "retry must recognize the atomic marker instead of replacing the target"
+                );
+            } else {
+                committed_inode = Some(status.id);
+            }
+        }
+
+        // Master-originated load tasks have no Transfer report. They still
+        // commit through a temporary CV inode so cancellation or report
+        // failure cannot expose a partially completed cache entry.
+        let legacy_target = "/e2e-u2c-atomic-output/legacy.bin";
+        let legacy_context = Arc::new(TaskContext::new(LoadTaskInfo {
+            job: e2e_job_info(
+                "e2e-u2c-atomic",
+                &source,
+                legacy_target,
+                1024 * 1024,
+                &mount,
+                StorageType::default(),
+            ),
+            task_id: "legacy-task".to_string(),
+            worker: WorkerAddress::default(),
+            source_path: source,
+            target_path: legacy_target.to_string(),
+            create_time: 0,
+            source_read_plan_json: String::new(),
+            estimated_size: source_status.len,
+            transfer_report: None,
+        }));
+        let legacy_runner =
+            LoadTaskRunner::new(legacy_context, fs.clone(), factory, None, 10_000, 120_000);
+        assert!(legacy_runner.run().await);
+        let legacy_status = fs.get_status(&Path::from_str(legacy_target)?).await?;
+        assert_eq!(legacy_status.storage_policy.ufs_mtime, source_status.mtime);
+        assert!(legacy_status.cv_valid(None));
+
+        Ok(())
+    })
+}
+
+/// A Master-originated load carries no Transfer report. Cancellation after its
+/// temporary inode is complete must delete that inode instead of exposing the
+/// final cache entry.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn e2e_legacy_u2c_cancel_after_temp_complete_keeps_final_absent() -> CommonResult<()> {
+    let faults = FaultRuntime::process();
+    faults.clear()?;
+    let rule = FaultRuleBuilder::named("worker.load_task.after_temp_complete")
+        .matches("task_id", "legacy-cancel-task")?
+        .times(1)?
+        .delay(500)?;
+    faults.configure("legacy-u2c-cancel", rule)?;
+
+    let (cluster, base_dir) = e2e_cluster();
+    let rt = cluster.clone_client_rt();
+    let result: CommonResult<()> = rt.block_on(async move {
+        let fs = cluster.new_fs();
+        let ufs_dir = format!("{base_dir}/ufs-legacy-cancel");
+        std::fs::create_dir_all(&ufs_dir)?;
+        let source = format!("file://{ufs_dir}/source.bin");
+        std::fs::write(format!("{ufs_dir}/source.bin"), b"legacy-cancel")?;
+
+        let mount_path = Path::from_str("/e2e-u2c-legacy-cancel")?;
+        fs.mount(
+            &Path::from_str(format!("file://{ufs_dir}"))?,
+            &mount_path,
+            curvine_model::MountOptions::builder()
+                .block_size(1024 * 1024)
+                .replicas(1)
+                .auto_cache(false)
+                .build(),
+        )
+        .await?;
+        let mount = fs
+            .get_mount_table()
+            .await?
+            .into_iter()
+            .find(|mount| mount.cv_path == mount_path.full_path())
+            .unwrap();
+        let target = "/e2e-u2c-legacy-cancel-output/final.bin";
+        let context = Arc::new(TaskContext::new(LoadTaskInfo {
+            job: e2e_job_info(
+                "e2e-u2c-legacy-cancel",
+                &source,
+                target,
+                1024 * 1024,
+                &mount,
+                StorageType::default(),
+            ),
+            task_id: "legacy-cancel-task".to_string(),
+            worker: WorkerAddress::default(),
+            source_path: source,
+            target_path: target.to_string(),
+            create_time: 0,
+            source_read_plan_json: String::new(),
+            estimated_size: 13,
+            transfer_report: None,
+        }));
+        let runner = LoadTaskRunner::new(
+            context.clone(),
+            fs.clone(),
+            Arc::new(UfsFactory::with_rt(
+                &cluster.cluster_conf.client,
+                cluster.clone_client_rt(),
+            )),
+            None,
+            10_000,
+            120_000,
+        );
+        let run = tokio::spawn(async move { runner.run().await });
+
+        for _ in 0..100 {
+            if FaultRuntime::process()
+                .status()
+                .rules
+                .iter()
+                .any(|rule| rule.id == "legacy-u2c-cancel" && rule.executions == 1)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            FaultRuntime::process()
+                .status()
+                .rules
+                .iter()
+                .any(|rule| rule.id == "legacy-u2c-cancel" && rule.executions == 1),
+            "runner must reach the post-complete fault point before cancellation"
+        );
+        context.set_canceled("test cancellation after temporary completion");
+        assert!(run.await.expect("legacy runner must join"));
+
+        let target_path = Path::from_str(target)?;
+        assert!(
+            !fs.exists(&target_path).await?,
+            "canceled legacy load must not expose its final target"
+        );
+        let output_dir = Path::from_str("/e2e-u2c-legacy-cancel-output")?;
+        assert!(
+            fs.list_status(&output_dir).await?.is_empty(),
+            "canceled legacy load must clean its temporary output"
+        );
+        Ok(())
+    });
+    let cleanup = faults.clear();
+    result?;
+    cleanup?;
+    Ok(())
 }
 
 /// A2: real UFS lengths + pure grouping prove small files stay per-segment
