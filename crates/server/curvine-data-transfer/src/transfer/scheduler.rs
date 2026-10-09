@@ -676,6 +676,17 @@ where
             return Ok(());
         }
 
+        // Observability only: how long the job waited in Pending before its
+        // first planning pass. A resumed Planning attempt is not queue time, so
+        // only the Pending -> Planning edge is observed. This is the term that
+        // explains "why is my transfer taking so long" when the executing-slot
+        // cap or the worker byte budget is saturated.
+        if !resuming_planning {
+            let wait_ms = now_ms().saturating_sub(job.created_at);
+            let kind = transfer_kind_label(job.kind);
+            record_metric(|metrics| metrics.observe_job_pending_wait(kind, wait_ms));
+        }
+
         if resuming_planning && self.store.has_transfer_tasks(&job.job_id, job.run_id)? {
             let err = FsError::common(
                 "interrupted task-plan persistence cannot be safely recomputed; retry transfer",

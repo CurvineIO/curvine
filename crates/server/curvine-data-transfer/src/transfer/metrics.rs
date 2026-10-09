@@ -36,6 +36,7 @@ pub struct TransferMetrics {
     job_summary_flush_total: CounterVec,
     job_summary_flush_duration_us: HistogramVec,
     task_phase_duration_ms: HistogramVec,
+    job_pending_wait_ms: HistogramVec,
     active_jobs: Gauge,
     executing_jobs: Gauge,
     pending_jobs: Gauge,
@@ -151,6 +152,16 @@ impl TransferMetrics {
                 &[
                     10.0, 50.0, 100.0, 500.0, 1_000.0, 5_000.0, 10_000.0, 30_000.0,
                     60_000.0, 300_000.0,
+                ],
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            job_pending_wait_ms: m::new_histogram_vec_with_buckets(
+                "transfer_job_pending_wait_ms",
+                "Transfer job queue wait in milliseconds from submit to first planning (job-level backlog, not task-level phase latency)",
+                &["kind"],
+                &[
+                    1_000.0, 5_000.0, 30_000.0, 60_000.0, 120_000.0, 300_000.0, 600_000.0,
+                    1_800_000.0, 3_600_000.0,
                 ],
             )
             .map_err(|err| FsError::common(err.to_string()))?,
@@ -455,6 +466,21 @@ impl TransferMetrics {
             self.task_phase_duration_ms
                 .with_label_values(&[phase])
                 .observe(elapsed_ms as f64);
+        }
+    }
+
+    /// Job-level queue wait: submit -> first entry into Planning.
+    ///
+    /// This is the dominant term when the executing-slot cap
+    /// (`transfer.max_running_transfers`, default 64) or the per-worker byte
+    /// budget keeps jobs in Pending; unlike `transfer_task_phase_duration_ms`
+    /// it is a job-level backlog, so its range is minutes rather than seconds
+    /// and it needs its own, coarser bucket set. Observability only.
+    pub fn observe_job_pending_wait(&self, kind: &str, wait_ms: i64) {
+        if wait_ms >= 0 {
+            self.job_pending_wait_ms
+                .with_label_values(&[kind])
+                .observe(wait_ms as f64);
         }
     }
 
