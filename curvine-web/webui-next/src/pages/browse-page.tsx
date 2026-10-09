@@ -32,7 +32,7 @@ import {
   storageLocation,
   type BrowseColumnKey
 } from '@/lib/browseColumns'
-import { copyToClipboard } from '@/lib/clipboard'
+import { useCopy } from '@/components/copy-fallback'
 import { readStoredColumns, writeStoredColumns } from '@/lib/column-visibility'
 import { formatBytes, formatTime } from '@/lib/format'
 import { useSlidingSheet } from '@/lib/use-sliding-sheet'
@@ -113,6 +113,7 @@ export function BrowsePage() {
   const t = useT()
   const api = useApi()
   const toast = useToast()
+  const { copy } = useCopy()
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const pathFromUrl = normalizePath(searchParams.get('path') || '/')
@@ -1095,14 +1096,13 @@ export function BrowsePage() {
   }
 
   async function copyPath(path: string, message: string) {
-    try {
-      await copyToClipboard(path)
-      setCopiedPath(path)
-      window.setTimeout(() => setCopiedPath((current) => (current === path ? '' : current)), 1600)
-      toast.success(message)
-    } catch (error) {
-      toast.error(t('browse.copy.failed', { error: String(error) }))
-    }
+    // On plain HTTP the browser will not write the clipboard and cannot be asked to confirm
+    // it: the hook opens a preselected field for a real Ctrl/Cmd+C instead, and the check mark
+    // would then be a lie.
+    const outcome = await copy(path, message)
+    if (outcome !== 'copied') return
+    setCopiedPath(path)
+    window.setTimeout(() => setCopiedPath((current) => (current === path ? '' : current)), 1600)
   }
 
   async function createDirectory(target: string) {

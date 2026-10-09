@@ -26,7 +26,8 @@ import { Spinner } from '@/components/ui/spinner'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { useToast } from '@/components/ui/toast'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
-import { copyToClipboard } from '@/lib/clipboard'
+import { useCopy } from '@/components/copy-fallback'
+import type { CopyOutcome } from '@/lib/clipboard'
 import { useT } from '@/i18n'
 import { truncatedListLimit } from '@/lib/list-window'
 import { useSlidingSheet } from '@/lib/use-sliding-sheet'
@@ -79,6 +80,7 @@ export function JobsPage() {
   const t = useT()
   const api = useApi()
   const toast = useToast()
+  const { copy } = useCopy()
 
   const [jobs, setJobs] = useState<JobInfo[]>([])
   const [mounts, setMounts] = useState<MountInfo[]>([])
@@ -347,17 +349,12 @@ export function JobsPage() {
 
   /* ------------------------------------------------------------ actions */
 
-  async function copyText(text: string, message: string) {
+  async function copyText(text: string, message: string): Promise<CopyOutcome> {
     if (!text || text === '-') {
       toast.info(t('jobs.copy.nothing'))
-      return
+      return 'manual'
     }
-    try {
-      await copyToClipboard(text)
-      toast.success(message)
-    } catch (error) {
-      toast.error(t('jobs.copy.failed', { error: String(error) }))
-    }
+    return copy(text, message)
   }
 
   async function confirmCancel() {
@@ -703,7 +700,7 @@ export function JobsPage() {
           mounts={mounts}
           loading={detailLoading}
           onClose={() => setSelectedJobId('')}
-          onCopy={(text, message) => void copyText(text, message)}
+          onCopy={(text, message) => copyText(text, message)}
         />
       )}
 

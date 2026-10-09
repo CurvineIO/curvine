@@ -28,6 +28,8 @@ export default {
     saving: '保存中…',
     cancel: '取消',
     close: '关闭',
+    copyManually: '请手动复制',
+    copyManuallyHint: '当前以 HTTP 访问，浏览器不允许网页写入剪贴板。请按 Ctrl/Cmd+C 复制下面的内容。',
     more: '更多',
     toggleSidebar: '切换侧边栏',
     discardChanges: '放弃未保存的更改?',

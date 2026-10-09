@@ -26,7 +26,7 @@ import { Spinner } from '@/components/ui/spinner'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { useToast } from '@/components/ui/toast'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
-import { copyToClipboard } from '@/lib/clipboard'
+import { useCopy } from '@/components/copy-fallback'
 import { readStoredColumns, writeStoredColumns } from '@/lib/column-visibility'
 import {
   DEFAULT_VISIBLE_OPTIONAL_TRANSFER_COLUMNS,
@@ -90,6 +90,7 @@ export function TransfersPage() {
   const api = useApi()
   const t = useT()
   const toast = useToast()
+  const { copy } = useCopy()
 
   const [transfers, setTransfers] = useState<TransferInfo[]>([])
   const [loading, setLoading] = useState(false)
@@ -290,12 +291,7 @@ export function TransfersPage() {
       toast.info(t('transfers.copy.nothing'))
       return
     }
-    try {
-      await copyToClipboard(String(text))
-      toast.success(message)
-    } catch (error) {
-      toast.error(t('transfers.copy.failed', { error: String(error) }))
-    }
+    await copy(String(text), message)
   }
 
   async function refreshTransfer(transfer: TransferInfo, pageSize: number): Promise<TransferInfo | null> {

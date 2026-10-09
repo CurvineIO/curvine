@@ -6,6 +6,7 @@ import { ApiProvider } from '@/api/api-context'
 import type { ApiClient } from '@/api/client'
 import type { TransferInfo } from '@/api/types'
 import { ToastProvider } from '@/components/ui/toast'
+import { CopyFallbackProvider } from '@/components/copy-fallback'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { I18nProvider, LOCALE_STORAGE_KEY, type AppLocale } from '@/i18n'
 import { RefreshProvider } from '@/refresh/refresh-context'
@@ -42,9 +43,11 @@ function renderPageWithClient(locale: AppLocale, client: ApiClient) {
       <I18nProvider>
         <RefreshProvider>
           <ToastProvider>
-            <TooltipProvider>
-              <TransfersPage />
-            </TooltipProvider>
+            <CopyFallbackProvider>
+              <TooltipProvider>
+                <TransfersPage />
+              </TooltipProvider>
+            </CopyFallbackProvider>
           </ToastProvider>
         </RefreshProvider>
       </I18nProvider>

@@ -2,9 +2,14 @@ import * as React from 'react'
 
 import { cn } from '@/lib/utils'
 
-function Input({ className, type, ...props }: React.ComponentProps<'input'>) {
+/** See `button.tsx`: the ref must reach the DOM node, here so the copy fallback can select it. */
+const Input = React.forwardRef<HTMLInputElement, React.ComponentProps<'input'>>(function Input(
+  { className, type, ...props },
+  ref
+) {
   return (
     <input
+      ref={ref}
       type={type}
       data-slot="input"
       className={cn(
@@ -19,6 +24,6 @@ function Input({ className, type, ...props }: React.ComponentProps<'input'>) {
       {...props}
     />
   )
-}
+})
 
 export { Input }

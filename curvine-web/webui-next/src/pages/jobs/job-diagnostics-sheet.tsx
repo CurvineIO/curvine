@@ -14,6 +14,7 @@ import {
 import { Spinner } from '@/components/ui/spinner'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { useT } from '@/i18n'
+import type { CopyOutcome } from '@/lib/clipboard'
 import { formatTime } from '@/lib/format'
 import {
   allTasksForJob,
@@ -55,7 +56,7 @@ export function JobDiagnosticsSheet({
   mounts: MountInfo[]
   loading: boolean
   onClose(): void
-  onCopy(text: string, message: string): void
+  onCopy(text: string, message: string): Promise<CopyOutcome>
 }) {
   const t = useT()
   const [failedOnly, setFailedOnly] = useState(false)
@@ -282,8 +283,11 @@ export function JobDiagnosticsSheet({
                     <Button
                       variant="outline"
                       size="xs"
-                      onClick={() => {
-                        onCopy(item.command, t('jobs.copy.command'))
+                      onClick={async () => {
+                        // Only claim success when the copy actually happened: the fallback
+                        // hands the text over for a manual copy instead.
+                        const outcome = await onCopy(item.command, t('jobs.copy.command'))
+                        if (outcome !== 'copied') return
                         setCopiedCliKey(item.key)
                         window.setTimeout(() => setCopiedCliKey(''), 1500)
                       }}

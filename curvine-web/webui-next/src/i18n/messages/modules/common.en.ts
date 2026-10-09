@@ -28,6 +28,9 @@ export default {
     saving: 'Saving…',
     cancel: 'Cancel',
     close: 'Close',
+    copyManually: 'Copy this by hand',
+    copyManuallyHint:
+      'This console is open over plain HTTP, where the browser does not let a page write to the clipboard. Press Ctrl/Cmd+C to copy the text below.',
     more: 'More',
     toggleSidebar: 'Toggle sidebar',
     discardChanges: 'Discard unsaved changes?',

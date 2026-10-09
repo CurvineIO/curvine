@@ -5,6 +5,7 @@ import { ApiProvider } from '@/api/api-context'
 import type { ApiClient } from '@/api/client'
 import type { JobInfo } from '@/api/types'
 import { ToastProvider } from '@/components/ui/toast'
+import { CopyFallbackProvider } from '@/components/copy-fallback'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { I18nProvider } from '@/i18n'
 import { RefreshProvider } from '@/refresh/refresh-context'
@@ -41,9 +42,11 @@ function renderPage(items: JobInfo[]) {
       <I18nProvider>
         <RefreshProvider>
           <ToastProvider>
-            <TooltipProvider>
-              <JobsPage />
-            </TooltipProvider>
+            <CopyFallbackProvider>
+              <TooltipProvider>
+                <JobsPage />
+              </TooltipProvider>
+            </CopyFallbackProvider>
           </ToastProvider>
         </RefreshProvider>
       </I18nProvider>

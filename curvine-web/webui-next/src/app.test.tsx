@@ -7,6 +7,7 @@ import { App } from './App'
 import type { ApiClient } from '@/api/client'
 import { AuthProvider } from '@/auth/auth-context'
 import { ToastProvider } from '@/components/ui/toast'
+import { CopyFallbackProvider } from '@/components/copy-fallback'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { I18nProvider } from '@/i18n'
 import { MasterRuntimeProvider } from '@/master-runtime/master-runtime-context'
@@ -165,9 +166,11 @@ function renderApp(path: string, client: ApiClient) {
             <MasterRuntimeProvider>
               <RefreshProvider>
                 <ToastProvider>
-                  <TooltipProvider>
-                    <App />
-                  </TooltipProvider>
+                  <CopyFallbackProvider>
+                    <TooltipProvider>
+                      <App />
+                    </TooltipProvider>
+                  </CopyFallbackProvider>
                 </ToastProvider>
               </RefreshProvider>
             </MasterRuntimeProvider>
