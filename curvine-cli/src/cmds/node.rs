@@ -16,13 +16,11 @@ use crate::util::*;
 use clap::Parser;
 use curvine_client_core::file::FsClient;
 use curvine_config::ClusterConf;
-use curvine_core_error::{err_box, CommonResult};
+use curvine_core_error::CommonResult;
+use curvine_model::WorkerInfo;
 use curvine_runtime::common::ByteUnit;
-use reqwest::Client;
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(arg_required_else_help = true)]
@@ -36,16 +34,15 @@ pub struct NodeCommand {
     versions: bool,
 
     /// add decommission node
-    #[arg(long)]
+    #[arg(long, visible_alias = "add-dcm")]
     add_decommission: bool,
 
     /// remove decommission node
-    #[arg(long)]
+    #[arg(long, visible_alias = "remove-dcm")]
     remove_decommission: bool,
 
-    /// node list with port (format: hostname:port), comma separated for multiple nodes
+    /// node list (hostname, ip, or host:port). Repeat the argument or separate with commas.
     #[arg(
-        last = true,
         required_if_eq("add_decommission", "true"),
         required_if_eq("remove_decommission", "true")
     )]
@@ -53,60 +50,21 @@ pub struct NodeCommand {
 }
 
 impl NodeCommand {
-    // Send HTTP GET request to master server
-    async fn http_get(
-        &self,
-        client: Arc<FsClient>,
-        conf: &ClusterConf,
-        path: &str,
-    ) -> CommonResult<String> {
-        // Get master address and web port
-        let filesystem_info = client.get_filesystem_info().await?;
-        let master_parts: Vec<&str> = filesystem_info.active_master.split(':').collect();
-        let master_host = master_parts[0];
-        let web_port = conf.master.web_port;
-
-        // Build complete URL
-        let url = format!("http://{}:{}{}", master_host, web_port, path);
-
-        // Create HTTP client and send request
-        let http_client = match Client::builder().timeout(Duration::from_secs(30)).build() {
-            Ok(client) => client,
-            Err(e) => return err_box!("Failed to create HTTP client: {}", e),
-        };
-
-        let response = match http_client.get(&url).send().await {
-            Ok(resp) => resp,
-            Err(e) => return err_box!("Failed to send HTTP request: {}", e),
-        };
-
-        let status = response.status();
-        if !status.is_success() {
-            return err_box!("HTTP request failed with status: {}", status);
-        }
-
-        let body = match response.text().await {
-            Ok(text) => text,
-            Err(e) => return err_box!("Failed to read response body: {}", e),
-        };
-
-        Ok(body)
+    fn print_worker(worker: &WorkerInfo) {
+        let address = format!("{}:{}", worker.address.hostname, worker.address.rpc_port);
+        println!(
+            "{:<25} {:<15} {:<15} {:<15}",
+            address,
+            format!("{:?}", worker.status),
+            ByteUnit::byte_to_string(worker.capacity as u64),
+            ByteUnit::byte_to_string(worker.available as u64)
+        );
     }
 
     // Handle listing all worker nodes
-    async fn handle_list(&self, client: Arc<FsClient>, conf: &ClusterConf) -> CommonResult<()> {
-        // Get worker list
-        let url = "/api/workers";
-        let response = handle_rpc_result(self.http_get(client.clone(), conf, url)).await;
+    async fn handle_list(&self, client: Arc<FsClient>) -> CommonResult<()> {
+        let info = handle_rpc_result(client.get_filesystem_info()).await;
 
-        // Parse JSON response
-        let workers_map: HashMap<String, Vec<serde_json::Value>> = serde_json::from_str(&response)?;
-
-        // Get live_workers and lost_workers
-        let live_workers = workers_map.get("live_workers").cloned().unwrap_or_default();
-        let lost_workers = workers_map.get("lost_workers").cloned().unwrap_or_default();
-
-        // Print worker information
         println!("Worker Nodes:");
         println!(
             "{:<25} {:<15} {:<15} {:<15}",
@@ -114,182 +72,91 @@ impl NodeCommand {
         );
         println!("{}", "-".repeat(70));
 
-        // Process live_workers
-        for worker in live_workers {
-            let hostname = worker["address"]["hostname"].as_str().unwrap_or("Unknown");
-            let rpc_port = worker["address"]["rpc_port"].as_u64().unwrap_or(0);
-            let address = format!("{hostname}:{rpc_port}");
-            let status = worker["status"].as_str().unwrap_or("Unknown");
-            let capacity = worker["capacity"].as_i64().unwrap_or(0);
-            let available = worker["available"].as_i64().unwrap_or(0);
-
-            println!(
-                "{:<25} {:<15} {:<15} {:<15}",
-                address,
-                status,
-                ByteUnit::byte_to_string(capacity as u64),
-                ByteUnit::byte_to_string(available as u64)
-            );
-        }
-
-        // Process lost_workers
-        for worker in lost_workers {
-            let hostname = worker["address"]["hostname"].as_str().unwrap_or("Unknown");
-            let rpc_port = worker["address"]["rpc_port"].as_u64().unwrap_or(0);
-            let address = format!("{hostname}:{rpc_port}");
-            let status = worker["status"].as_str().unwrap_or("Unknown");
-            let capacity = worker["capacity"].as_i64().unwrap_or(0);
-            let available = worker["available"].as_i64().unwrap_or(0);
-
-            println!(
-                "{:<25} {:<15} {:<15} {:<15}",
-                address,
-                status,
-                ByteUnit::byte_to_string(capacity as u64),
-                ByteUnit::byte_to_string(available as u64)
-            );
+        for worker in info
+            .live_workers
+            .iter()
+            .chain(info.blacklist_workers.iter())
+            .chain(info.decommission_workers.iter())
+            .chain(info.lost_workers.iter())
+        {
+            Self::print_worker(worker);
         }
 
         Ok(())
     }
 
-    // Extract hostnames from node addresses (hostname:port format)
-    fn extract_hostnames(&self, nodes: &[String]) -> Vec<String> {
-        nodes
+    /// Selectors from repeated arguments and comma-separated values.
+    fn node_selectors(&self) -> Vec<String> {
+        self.nodes
             .iter()
-            .map(|node| {
-                // Split by ':' and take the first part (hostname)
-                node.split(':').next().unwrap_or(node).to_string()
-            })
+            .flat_map(|node| node.split(','))
+            .map(|node| node.trim().to_string())
+            .filter(|node| !node.is_empty())
             .collect()
     }
 
-    // Process decommission operation results
-    fn process_decommission_results(
-        &self,
-        result: &[String],
-        requested_nodes: &[String],
-        operation_type: &str,
-    ) {
-        if result.is_empty() {
+    fn print_decommission_results(successful: &[String], failed: &[String], operation_type: &str) {
+        if successful.is_empty() && failed.is_empty() {
             println!("No worker was {} decommission list", operation_type);
             return;
         }
 
-        // Create a map of requested nodes for quick lookup
-        let mut requested_map = HashMap::new();
-        for node in requested_nodes {
-            let hostname = node.split(':').next().unwrap_or(node);
-            requested_map.insert(hostname.to_string(), node.clone());
-        }
-
-        // Track successful and failed operations
-        let mut successful = Vec::new();
-        let mut failed = Vec::new();
-
-        // Process successful operations
-        for worker in result {
-            // Extract worker_id and hostname:port from worker info
-            let parts: Vec<&str> = worker.split(',').collect();
-            if parts.len() >= 2 {
-                let addr_part = parts[1].to_string();
-                successful.push(addr_part);
-            }
-        }
-
-        // Identify failed operations
-        for (hostname, full_node) in &requested_map {
-            let found = result.iter().any(|worker| {
-                let parts: Vec<&str> = worker.split(',').collect();
-                if parts.len() >= 2 {
-                    let worker_hostname = parts[1].split(':').next().unwrap_or("");
-                    worker_hostname == hostname
-                } else {
-                    false
-                }
-            });
-
-            if !found {
-                failed.push(full_node.clone());
-            }
-        }
-
-        // Print successful operations
         if !successful.is_empty() {
             println!("Successfully {} workers:", operation_type);
-            for addr in &successful {
+            for addr in successful {
                 println!("  {}", addr);
             }
             println!("Total: {} worker(s)", successful.len());
         }
 
-        // Print failed operations
         if !failed.is_empty() {
             println!("Failed to {} workers:", operation_type);
-            for addr in &failed {
+            for addr in failed {
                 println!("  {}", addr);
             }
             println!("Total: {} worker(s)", failed.len());
         }
     }
 
-    // Handle adding workers to decommission list
-    async fn handle_add_decommission(
+    async fn set_decommission_status(
         &self,
         client: Arc<FsClient>,
-        conf: &ClusterConf,
+        status: &str,
+        operation_type: &str,
     ) -> CommonResult<()> {
-        // Extract hostname from hostname:port format
-        let worker_hostnames = self.extract_hostnames(&self.nodes);
-        let workers = worker_hostnames.join(",");
-
-        // Call add-dcm API
-        let url = format!("/add-dcm?workers={}", workers);
-        let response = handle_rpc_result(self.http_get(client.clone(), conf, &url)).await;
-
-        // Parse response
-        let result: Vec<String> = serde_json::from_str(&response)?;
-
-        // Process and display results
-        self.process_decommission_results(&result, &self.nodes, "added to");
-
+        let mut successful = Vec::new();
+        let mut failed = Vec::new();
+        for node in self.node_selectors() {
+            match client.set_worker_status(&node, status).await {
+                Ok((worker, _)) => successful.push(format!(
+                    "{}:{}",
+                    worker.address.hostname, worker.address.rpc_port
+                )),
+                Err(err) => failed.push(format!("{} ({})", node, err)),
+            }
+        }
+        Self::print_decommission_results(&successful, &failed, operation_type);
         Ok(())
     }
 
-    // Handle removing workers from decommission list
-    async fn handle_remove_decommission(
-        &self,
-        client: Arc<FsClient>,
-        conf: &ClusterConf,
-    ) -> CommonResult<()> {
-        // Extract hostname from hostname:port format
-        let worker_hostnames = self.extract_hostnames(&self.nodes);
-        let workers = worker_hostnames.join(",");
+    async fn handle_add_decommission(&self, client: Arc<FsClient>) -> CommonResult<()> {
+        self.set_decommission_status(client, "decommission", "added to")
+            .await
+    }
 
-        // Call remove-dcm API
-        let url = format!("/remove-dcm?workers={}", workers);
-        let response = handle_rpc_result(self.http_get(client.clone(), conf, &url)).await;
-
-        // Parse response
-        let result: Vec<String> = serde_json::from_str(&response)?;
-
-        // Process and display results
-        self.process_decommission_results(&result, &self.nodes, "removed from");
-
-        Ok(())
+    async fn handle_remove_decommission(&self, client: Arc<FsClient>) -> CommonResult<()> {
+        self.set_decommission_status(client, "remove_decommission", "removed from")
+            .await
     }
 
     // Handle showing version distribution across workers
-    async fn handle_versions(&self, client: Arc<FsClient>, conf: &ClusterConf) -> CommonResult<()> {
-        let url = "/api/workers";
-        let response = handle_rpc_result(self.http_get(client.clone(), conf, url)).await;
+    async fn handle_versions(&self, client: Arc<FsClient>) -> CommonResult<()> {
+        let info = handle_rpc_result(client.get_filesystem_info()).await;
+        let mut workers = info.live_workers;
+        workers.extend(info.blacklist_workers);
+        workers.extend(info.decommission_workers);
 
-        // Parse JSON response
-        let workers_map: HashMap<String, Vec<serde_json::Value>> = serde_json::from_str(&response)?;
-
-        let live_workers = workers_map.get("live_workers").cloned().unwrap_or_default();
-
-        let version_counts = Self::count_worker_versions(&live_workers);
+        let version_counts = Self::count_worker_versions(&workers);
 
         println!("Version Distribution:");
         println!("{}", "-".repeat(40));
@@ -314,14 +181,12 @@ impl NodeCommand {
         Ok(())
     }
 
-    /// Count worker release-version distribution from the `/api/workers` JSON
-    /// payload.
+    /// Count worker release-version distribution.
     ///
     /// Prefers the structured `component_info.release_version` reported on
     /// heartbeat (T7+); falls back to the legacy `software_version` display
     /// string. Workers with no useful version data count as `legacy_count`.
-    fn count_worker_versions(workers: &[serde_json::Value]) -> VersionCounts {
-        // Count version distribution: release_version (from component_info) -> count
+    fn count_worker_versions(workers: &[WorkerInfo]) -> VersionCounts {
         let mut version_counts: BTreeMap<String, u32> = BTreeMap::new();
         let mut legacy_count: u32 = 0;
 
@@ -330,17 +195,16 @@ impl NodeCommand {
             // component_info is present but release_version is missing or
             // empty (partially-upgraded / malformed payloads), fall back to
             // the legacy software_version display string.
-            let release_version = worker["component_info"]
-                .as_object()
-                .and_then(|ci| ci.get("release_version"))
-                .and_then(|v| v.as_str())
-                .filter(|v| !v.is_empty());
+            let release_version = worker
+                .component_info
+                .as_ref()
+                .and_then(|info| info.release_version.as_deref())
+                .filter(|version| !version.is_empty());
 
             if let Some(version) = release_version {
                 *version_counts.entry(version.to_string()).or_insert(0) += 1;
             } else {
-                // Fall back to legacy software_version
-                let sv = worker["software_version"].as_str().unwrap_or("unknown");
+                let sv = worker.software_version.as_str();
                 if sv.is_empty() || sv == "unknown" {
                     legacy_count += 1;
                 } else {
@@ -357,21 +221,21 @@ impl NodeCommand {
         }
     }
 
-    pub async fn execute(&self, client: Arc<FsClient>, conf: ClusterConf) -> CommonResult<()> {
+    pub async fn execute(&self, client: Arc<FsClient>, _conf: ClusterConf) -> CommonResult<()> {
         if self.versions {
-            return self.handle_versions(client, &conf).await;
+            return self.handle_versions(client).await;
         }
 
         if self.list {
-            return self.handle_list(client, &conf).await;
+            return self.handle_list(client).await;
         }
 
         if self.add_decommission {
-            return self.handle_add_decommission(client, &conf).await;
+            return self.handle_add_decommission(client).await;
         }
 
         if self.remove_decommission {
-            return self.handle_remove_decommission(client, &conf).await;
+            return self.handle_remove_decommission(client).await;
         }
 
         Ok(())
@@ -391,26 +255,37 @@ struct VersionCounts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use curvine_proto::ComponentInfoProto;
 
-    fn worker_with_component_info(version: &str) -> serde_json::Value {
-        serde_json::json!({
-            "address": {"hostname": "worker-host", "rpc_port": 1234},
-            "status": "Live",
-            "software_version": "0.0.0-old",
-            "component_info": {
-                "component": "worker",
-                "release_version": version,
-                "protocol_version": 1
-            }
-        })
+    fn worker_with_component_info(version: &str) -> WorkerInfo {
+        WorkerInfo {
+            software_version: "0.0.0-old".to_string(),
+            component_info: Some(ComponentInfoProto {
+                component: Some("worker".to_string()),
+                release_version: Some(version.to_string()),
+                protocol_version: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
     }
 
-    fn worker_with_legacy_software_version(version: &str) -> serde_json::Value {
-        serde_json::json!({
-            "address": {"hostname": "worker-host", "rpc_port": 1234},
-            "status": "Live",
-            "software_version": version
-        })
+    fn worker_with_legacy_software_version(version: &str) -> WorkerInfo {
+        WorkerInfo {
+            software_version: version.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn worker_with_component_info_proto(
+        info: ComponentInfoProto,
+        software_version: &str,
+    ) -> WorkerInfo {
+        WorkerInfo {
+            software_version: software_version.to_string(),
+            component_info: Some(info),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -448,18 +323,15 @@ mod tests {
         // fall back to the legacy software_version display string instead of
         // counting the worker as legacy.
         let workers = vec![
-            serde_json::json!({
-                "address": {"hostname": "worker-host", "rpc_port": 1234},
-                "status": "Live",
-                "software_version": "0.2.0-test",
-                "component_info": {}
-            }),
-            serde_json::json!({
-                "address": {"hostname": "worker-host2", "rpc_port": 1235},
-                "status": "Live",
-                "software_version": "0.2.0-test",
-                "component_info": {"component": "worker", "release_version": ""}
-            }),
+            worker_with_component_info_proto(ComponentInfoProto::default(), "0.2.0-test"),
+            worker_with_component_info_proto(
+                ComponentInfoProto {
+                    component: Some("worker".to_string()),
+                    release_version: Some(String::new()),
+                    ..Default::default()
+                },
+                "0.2.0-test",
+            ),
         ];
 
         let counts = NodeCommand::count_worker_versions(&workers);
@@ -472,15 +344,45 @@ mod tests {
     fn count_worker_versions_counts_legacy_when_no_version_data_at_all() {
         // component_info present but release_version unusable, and no legacy
         // software_version either -> legacy.
-        let workers = vec![serde_json::json!({
-            "address": {"hostname": "worker-host", "rpc_port": 1234},
-            "status": "Live",
-            "component_info": {"component": "worker", "release_version": ""}
-        })];
+        let workers = vec![worker_with_component_info_proto(
+            ComponentInfoProto {
+                component: Some("worker".to_string()),
+                release_version: Some(String::new()),
+                ..Default::default()
+            },
+            "",
+        )];
 
         let counts = NodeCommand::count_worker_versions(&workers);
 
         assert!(counts.versions.is_empty());
         assert_eq!(counts.legacy_count, 1);
+    }
+
+    #[test]
+    fn add_decommission_accepts_node_without_double_dash() {
+        let cmd =
+            NodeCommand::try_parse_from(["node", "--add-decommission", "10.144.228.84"]).unwrap();
+        assert!(cmd.add_decommission);
+        assert_eq!(cmd.nodes, vec!["10.144.228.84".to_string()]);
+    }
+
+    #[test]
+    fn node_selectors_split_commas_and_repeated_args() {
+        let cmd = NodeCommand::try_parse_from([
+            "node",
+            "--add-decommission",
+            "10.144.228.84,10.144.228.85",
+            "host-a",
+        ])
+        .unwrap();
+        assert_eq!(
+            cmd.node_selectors(),
+            vec![
+                "10.144.228.84".to_string(),
+                "10.144.228.85".to_string(),
+                "host-a".to_string(),
+            ]
+        );
     }
 }
