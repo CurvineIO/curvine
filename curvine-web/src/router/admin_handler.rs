@@ -46,8 +46,8 @@ use curvine_fs_api::{FileSystem, Path as FsPath, Reader, RpcCode, Writer};
 use curvine_job_client::{JobListOptions, JobMasterClient, TransferClient};
 use curvine_model::{
     AccessMode, FileBlocks, FileStatus, FilesystemInfo, JobSourceType, JobStatus, JobTaskState,
-    LoadJobCommand, MountInfo, MountOptions, Provider, StorageState, StorageType, TransferCommand,
-    TransferKind, TransferState, TtlAction, WorkerInfo, WriteType,
+    ListOptions, LoadJobCommand, MountInfo, MountOptions, Provider, StorageState, StorageType,
+    TransferCommand, TransferKind, TransferState, TtlAction, WorkerInfo, WriteType,
 };
 use curvine_net::net::InetAddr;
 use curvine_proto::{
@@ -531,6 +531,9 @@ const TRANSFER_RPC_TIMEOUT_SECS: u64 = 10;
 const TRANSFER_SUBMIT_RPC_TIMEOUT_SECS: u64 = 30;
 const TRANSFER_CANCEL_RPC_TIMEOUT_SECS: u64 = 15;
 const TRANSFER_LIST_MAX_FETCH: usize = 1000;
+// Largest window a paged directory listing will return in one response. Keeps a
+// huge directory inside the RPC frame cap and the request timeout.
+const FS_LIST_MAX_LIMIT: usize = 1000;
 // Upper bound on the task list returned with a transfer status response. A job
 // with batching/segmentation can own far more tasks than a page should carry,
 // so the detail view requests pages explicitly and follows `next_page_token`.
@@ -2288,6 +2291,39 @@ fn overlay_cv_metadata_on_ufs_entry(item: &mut FileStatus, cv_status: Option<&Fi
     }
 }
 
+/// One page of a directory listing.
+///
+/// With no `limit` this is the old unbounded behaviour. With a window it uses the
+/// master's `list_options`, which keeps a huge directory inside the RPC frame cap.
+/// Globs and UFS mounts reject `list_options`, so they fall back to `list_status`
+/// and are sliced here — safe because the master returns entries name-sorted.
+async fn list_items_page(
+    client: &UnifiedFileSystem,
+    path: &FsPath,
+    limit: Option<usize>,
+    start_after: Option<&str>,
+) -> FsResult<Vec<FileStatus>> {
+    let Some(limit) = limit else {
+        return client.list_status(path).await;
+    };
+
+    let options = ListOptions {
+        limit: Some(limit),
+        start_after: start_after.map(str::to_owned),
+    };
+    match client.list_options(path, options).await {
+        Ok(items) => Ok(items),
+        Err(_) => {
+            let mut items = client.list_status(path).await?;
+            if let Some(start_after) = start_after {
+                items.retain(|item| item.name.as_str() > start_after);
+            }
+            items.truncate(limit);
+            Ok(items)
+        }
+    }
+}
+
 async fn browse_v1(
     Extension(instance): Extension<Arc<AdminRouterHandler>>,
     Query(params): Query<HashMap<String, String>>,
@@ -2298,14 +2334,28 @@ async fn browse_v1(
         .get("cache_only")
         .map(|value| value == "true" || value == "1")
         .unwrap_or(false);
+    let limit = match params.get("limit") {
+        Some(value) => Some(
+            value
+                .parse::<usize>()
+                .map_err(|_| FsError::invalid_argument(format!("invalid limit: {value}")))?
+                .clamp(1, FS_LIST_MAX_LIMIT),
+        ),
+        None => None,
+    };
+    let start_after = params
+        .get("start_after")
+        .filter(|value| !value.is_empty())
+        .cloned();
 
     let list_client = instance.unified_client(cache_only);
     let fs_path = FsPath::from_str(path)?;
-    let mut items = match list_client.list_status(&fs_path).await {
-        Ok(items) => items,
-        Err(err) if cache_only && is_cv_dir_missing(&err) => vec![],
-        Err(err) => return Err(err),
-    };
+    let mut items =
+        match list_items_page(&list_client, &fs_path, limit, start_after.as_deref()).await {
+            Ok(items) => items,
+            Err(err) if cache_only && is_cv_dir_missing(&err) => vec![],
+            Err(err) => return Err(err),
+        };
 
     if !cache_only {
         let summary_client = instance.unified_client(false);
@@ -2327,12 +2377,20 @@ async fn browse_v1(
         }
     }
 
+    // The next cursor is the last entry's name: the window is name-ordered. A full
+    // window means there may be more, so the table can offer "load more".
+    let has_more = limit.is_some_and(|limit| items.len() >= limit);
+    let next_start_after = items.last().map(|item| item.name.clone());
+
     Ok(api_success(json!({
         "items": items,
         "cache_only": cache_only,
         "page": 1,
         "page_size": items.len(),
-        "total": items.len()
+        "total": items.len(),
+        "limit": limit,
+        "has_more": has_more,
+        "next_start_after": next_start_after
     })))
 }
 
