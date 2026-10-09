@@ -43,6 +43,10 @@ pub use self::planner::{
 };
 
 #[cfg(test)]
+#[path = "tests/store_filter_test.rs"]
+mod store_filter_test;
+
+#[cfg(test)]
 #[path = "tests/planner_test.rs"]
 mod planner_test;
 

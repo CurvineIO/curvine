@@ -80,9 +80,13 @@ export function TransferDiagnosticsSheet({
   const canLoadMore = taskPageSize < TASK_PAGE_MAX && Boolean(taskNextPageToken)
   const truncated = taskPageSize >= TASK_PAGE_MAX && Boolean(taskNextPageToken)
 
-  const emptyMessage = failedOnly
-    ? t('transfers.detail.noFailedTasks')
-    : t('transfers.detail.noTasks')
+  const emptyMessage = transfer.task_details_expired
+    ? t('transfers.detail.taskDetailsExpired')
+    : failureCount > 0
+      ? t('transfers.detail.failedTasksNotLoaded')
+      : failedOnly
+        ? t('transfers.detail.noFailedTasks')
+        : t('transfers.detail.noTasks')
 
   return (
     <Sheet open={open} onOpenChange={(next) => !next && onClose()}>

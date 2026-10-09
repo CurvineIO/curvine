@@ -141,18 +141,31 @@ export function transferTasks(transfer: TransferInfo | null | undefined): JobTas
 }
 
 export function failedTaskCount(transfer: TransferInfo): number {
-  const tasks = transferTasks(transfer)
-  if (tasks.length) return tasks.filter((task) => isFailedTask(task)).length
-  return Number(transfer.failed_files || transfer.failed_tasks || 0) || 0
+  if (transfer.failed_files !== null && transfer.failed_files !== undefined) {
+    return Number(transfer.failed_files) || 0
+  }
+  if (transfer.failed_tasks !== null && transfer.failed_tasks !== undefined) {
+    return Number(transfer.failed_tasks) || 0
+  }
+  return transferTasks(transfer).filter((task) => isFailedTask(task)).length
 }
 
 export function runningTaskCount(transfer: TransferInfo): number {
   if (!ACTIVE_STATES.includes(transferStateValue(transfer))) return 0
-  const tasks = transferTasks(transfer)
-  if (tasks.length) {
-    return tasks.filter((task) => ['pending', 'running'].includes(transferStateValue(task))).length
+  if (transfer.running_files !== null && transfer.running_files !== undefined) {
+    return Number(transfer.running_files) || 0
   }
-  return Number(transfer.running_files || transfer.loading_files || transfer.pending_files || 0)
+  const loading = transfer.loading_files
+  const pending = transfer.pending_files
+  if (
+    (loading !== null && loading !== undefined) ||
+    (pending !== null && pending !== undefined)
+  ) {
+    return (Number(loading) || 0) + (Number(pending) || 0)
+  }
+  return transferTasks(transfer).filter((task) =>
+    ['pending', 'running'].includes(transferStateValue(task))
+  ).length
 }
 
 export function isFailedTask(task: JobTask): boolean {

@@ -1,14 +1,14 @@
 export default {
   transfers: {
     list: {
-      title: '传输任务',
+      title: '传输作业',
       subtitle: 'Transfer 服务负责的加载 / 导出任务',
       submit: '提交传输',
-      searchPlaceholder: '按 ID、路径、提交者、租户或类型搜索',
-      searchAria: '搜索传输任务',
+      searchPlaceholder: '搜索当前页；粘贴完整作业 ID 查找',
+      searchAria: '搜索传输作业',
       pollActive: '轮询活跃任务',
       failedOnly: '仅失败',
-      headerJob: '任务 ID',
+      headerJob: '作业 ID',
       headerOwner: '提交者',
       headerKind: '类型',
       headerPath: '路径',
@@ -18,8 +18,8 @@ export default {
       headerDuration: '传输时间',
       headerUpdated: '更新时间',
       headerActions: '操作',
-      emptyNoTransfers: '尚无传输任务。提交一个传输任务即可开始。',
-      emptyFiltered: '没有匹配当前筛选条件的传输任务。{suffix}',
+      emptyNoTransfers: '尚无传输作业。提交一个传输作业即可开始。',
+      emptyFiltered: '没有匹配当前筛选条件的传输作业。{suffix}',
       activeFilters: ' 当前筛选（{filters}）。',
       hintTimeRange: '时间范围：{value}',
       hintKind: '类型：{value}',
@@ -43,8 +43,8 @@ export default {
       export: '导出'
     },
     metrics: {
-      transferJobs: '传输任务',
-      transferJobsMeta: 'Transfer 服务任务',
+      transferJobs: '传输作业',
+      transferJobsMeta: 'Transfer 服务作业',
       activeJobs: '进行中',
       activeJobsMeta: '等待或执行中',
       failedJobs: '失败',
@@ -61,7 +61,7 @@ export default {
       retry: '重试',
       cancel: '取消',
       working: '处理中…',
-      copyJobId: '复制任务 ID',
+      copyJobId: '复制作业 ID',
       copy: '复制',
       showAllTasks: '显示全部子任务',
       viewFailedTasks: '查看失败子任务'
@@ -93,6 +93,8 @@ export default {
       failedTasks: '失败子任务',
       noTasks: '该传输任务没有子任务详情。',
       noFailedTasks: '该传输任务没有失败的子任务。',
+      failedTasksNotLoaded: '汇总显示还有失败子任务，但当前页未加载到。请加载更多或使用 CLI 查看完整详情。',
+      taskDetailsExpired: '子任务详情已过期清理，汇总计数仍保留。',
       loadMore: '加载更多子任务（当前显示 {count} 个）',
       truncatedPrefix: '仅显示前 {count} 个子任务，使用',
       truncatedSuffix: '查看完整列表。'
@@ -103,9 +105,10 @@ export default {
       transferType: '传输类型',
       kindLoad: '加载（UFS -> Curvine）',
       kindExport: '导出（Curvine -> UFS）',
-      overwrite: '覆盖',
-      trueValue: 'true',
-      falseValue: 'false',
+      overwrite: '目标已存在时',
+      trueValue: '覆盖已存在的目标',
+      falseValue: '目标已存在时失败',
+      overwriteHint: '开启后可能替换目标中已有的文件。默认关闭；仅在确实需要替换时开启。',
       sourcePath: '源路径',
       sourcePathPlaceholderLoad: 'file:///data/path 或挂载路径',
       sourcePathPlaceholderExport: '/curvine/path 或 cv://path',
@@ -116,15 +119,17 @@ export default {
       submit: '提交传输'
     },
     copy: {
-      transferId: '任务 ID 已复制',
+      transferId: '作业 ID 已复制',
       sourcePath: '源路径已复制',
       targetPath: '目标路径已复制',
       nothing: '没有可复制的内容',
       failed: '复制失败：{error}'
     },
     alerts: {
-      refreshFailed: '刷新传输任务列表失败：{error}',
-      submitted: '传输任务已提交：{name}',
+      refreshFailed: '刷新传输作业列表失败：{error}',
+      lookupFailed: '查询传输作业失败：{error}',
+      pollFailed: '无法刷新活跃传输作业状态：{error}',
+      submitted: '传输作业已提交：{name}',
       submitFailed: '提交传输失败：{error}',
       sourceRequired: '源路径为必填项',
       statusRefreshed: '状态已刷新：{id} 为 {state}（{progress}%）',
@@ -135,8 +140,8 @@ export default {
       retryFailed: '重试失败：{error}'
     },
     confirm: {
-      cancel: '取消传输任务 {id}？',
-      retry: '重试传输任务 {id}？这将以新的 request id 提交一次新的运行。'
+      cancel: '取消传输作业 {id}？',
+      retry: '重试传输作业 {id}？这将以新的 request id 提交一次新的运行。'
     }
   }
 }

@@ -102,7 +102,7 @@ export default {
     mountsSubtitle: 'UFS mappings and validation state',
     jobs: 'Load / Export Jobs',
     jobsSubtitle: 'Manual load and fs_mode auto-export diagnostics',
-    transfers: 'Transfer Tasks',
+    transfers: 'Transfer Jobs',
     transfersSubtitle: 'Transfer service load/export jobs',
     config: 'Config',
     configSubtitle: 'Readonly cluster configuration'

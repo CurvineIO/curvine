@@ -19,7 +19,7 @@ interface TransferFormState {
 }
 
 function emptyForm(): TransferFormState {
-  return { kind: 'load', source_path: '', target_path: '', overwrite: 'true' }
+  return { kind: 'load', source_path: '', target_path: '', overwrite: 'false' }
 }
 
 export function SubmitTransferSheet({
@@ -139,7 +139,10 @@ export function SubmitTransferSheet({
             />
           </FieldGroup>
 
-          <p className="text-xs text-muted-foreground">{t('transfers.form.targetHint')}</p>
+          <div className="space-y-1 text-xs text-muted-foreground">
+            <p>{t('transfers.form.targetHint')}</p>
+            <p>{t('transfers.form.overwriteHint')}</p>
+          </div>
 
           {error && <ErrorAlert message={error} />}
 

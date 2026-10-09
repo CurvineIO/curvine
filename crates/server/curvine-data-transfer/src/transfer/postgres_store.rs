@@ -977,7 +977,7 @@ fn count_rows(
 
 /// Shared WHERE builder for the job list and the state-grouped count, so the two
 /// cannot drift apart.
-fn transfer_filter_clause<'a>(
+pub(super) fn transfer_filter_clause<'a>(
     kind: &'a Option<i32>,
     states: &'a [i32],
     submitter: Option<&'a String>,
@@ -989,9 +989,16 @@ fn transfer_filter_clause<'a>(
         clauses.push(format!("kind = ${}", params.len() + 1));
         params.push(value);
     }
-    for state in states {
-        clauses.push(format!("state = ${}", params.len() + 1));
-        params.push(state);
+    if !states.is_empty() {
+        let first = params.len() + 1;
+        let placeholders = (first..first + states.len())
+            .map(|index| format!("${index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        clauses.push(format!("state in ({placeholders})"));
+        for state in states {
+            params.push(state);
+        }
     }
     if let Some(value) = submitter {
         clauses.push(format!("submitter = ${}", params.len() + 1));

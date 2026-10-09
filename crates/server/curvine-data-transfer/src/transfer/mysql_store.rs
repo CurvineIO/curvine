@@ -2107,7 +2107,7 @@ fn target_paths_conflict(left: &str, right: &str) -> bool {
 
 /// Shared WHERE builder for the job list and the state-grouped count. Returns the
 /// clause text and the positional values the caller must bind in order.
-fn job_where_mysql(
+pub(super) fn job_where_mysql(
     kind: Option<TransferKind>,
     states: &[TransferState],
     submitter: Option<&str>,
@@ -2119,9 +2119,10 @@ fn job_where_mysql(
         clauses.push("kind = ?".to_string());
         values.push(mysql::Value::from(kind as i32));
     }
-    for state in states {
-        clauses.push("state = ?".to_string());
-        values.push(mysql::Value::from(*state as i32));
+    if !states.is_empty() {
+        let placeholders = vec!["?"; states.len()].join(", ");
+        clauses.push(format!("state in ({placeholders})"));
+        values.extend(states.iter().map(|state| mysql::Value::from(*state as i32)));
     }
     if let Some(submitter) = submitter {
         clauses.push("submitter = ?".to_string());

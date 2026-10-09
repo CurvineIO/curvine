@@ -1,10 +1,10 @@
 export default {
   transfers: {
     list: {
-      title: 'Transfer Tasks',
+      title: 'Transfer Jobs',
       subtitle: 'Load / export jobs owned by the transfer service',
       submit: 'Submit Transfer',
-      searchPlaceholder: 'Search by id, path, submitter, tenant or kind',
+      searchPlaceholder: 'Search current page or paste a full Job ID',
       searchAria: 'Search transfers',
       pollActive: 'Poll active',
       failedOnly: 'Failed only',
@@ -93,6 +93,9 @@ export default {
       failedTasks: 'Failed Tasks',
       noTasks: 'No task details available for this transfer.',
       noFailedTasks: 'No failed tasks in this transfer.',
+      failedTasksNotLoaded:
+        'The summary reports failures outside the loaded task page. Load more tasks or use the CLI for full details.',
+      taskDetailsExpired: 'Task details have expired; the summary counts are retained.',
       loadMore: 'Load more tasks (showing {count})',
       truncatedPrefix: 'Showing the first {count} tasks. Use',
       truncatedSuffix: 'for the full list.'
@@ -103,9 +106,11 @@ export default {
       transferType: 'Transfer Type',
       kindLoad: 'Load (UFS -> Curvine)',
       kindExport: 'Export (Curvine -> UFS)',
-      overwrite: 'Overwrite',
-      trueValue: 'true',
-      falseValue: 'false',
+      overwrite: 'When destination exists',
+      trueValue: 'Overwrite existing destination',
+      falseValue: 'Fail if destination exists',
+      overwriteHint:
+        'Overwriting may replace existing destination files. It is disabled by default; enable it only when replacement is intended.',
       sourcePath: 'Source Path',
       sourcePathPlaceholderLoad: 'file:///data/path or mounted path',
       sourcePathPlaceholderExport: '/curvine/path or cv://path',
@@ -125,6 +130,8 @@ export default {
     },
     alerts: {
       refreshFailed: 'Transfer refresh failed: {error}',
+      lookupFailed: 'Transfer lookup failed: {error}',
+      pollFailed: 'Could not refresh active transfer status: {error}',
       submitted: 'Transfer submitted: {name}',
       submitFailed: 'Submit transfer failed: {error}',
       sourceRequired: 'Source Path is required',

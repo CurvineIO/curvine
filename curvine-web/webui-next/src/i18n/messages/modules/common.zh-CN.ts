@@ -101,7 +101,7 @@ export default {
     mountsSubtitle: 'UFS 映射与校验状态',
     jobs: '加载 / 导出任务',
     jobsSubtitle: '手动加载与 fs_mode 自动导出诊断',
-    transfers: '传输任务',
+    transfers: '传输作业',
     transfersSubtitle: 'Transfer 加载 / 导出任务',
     config: '配置',
     configSubtitle: '只读集群配置'

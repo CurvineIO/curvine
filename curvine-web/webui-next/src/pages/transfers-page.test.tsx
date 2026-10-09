@@ -2,6 +2,7 @@ import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { ApiError } from '@/api/error'
 import { ApiProvider } from '@/api/api-context'
 import type { ApiClient } from '@/api/client'
 import type { TransferInfo } from '@/api/types'
@@ -25,15 +26,20 @@ const transfer = {
   update_time_ms: 1_750_000_000_000
 } as TransferInfo
 
-function makeClient(listResponse: unknown = { items: [transfer] }) {
+function makeClient(
+  listResponse: unknown = { items: [transfer] },
+  transferStatus: (jobId: string, params?: Record<string, unknown>) => Promise<TransferInfo> =
+    async () => transfer
+) {
   const fetchTransfersData = vi.fn(async () => listResponse)
+  const fetchTransferStatus = vi.fn(transferStatus)
   const client = {
     fetchTransfersData,
-    fetchTransferStatus: async () => transfer,
+    fetchTransferStatus,
     cancelTransfer: async () => transfer,
     retryTransfer: async () => transfer
   } as unknown as ApiClient
-  return { client, fetchTransfersData }
+  return { client, fetchTransfersData, fetchTransferStatus }
 }
 
 function renderPageWithClient(locale: AppLocale, client: ApiClient) {
@@ -69,13 +75,12 @@ describe('TransfersPage localization', () => {
   it('renders the page and its table in Chinese', async () => {
     renderPage('zh-CN')
 
-    // By role: the metric card carries the same 传输任务 string.
-    expect(await screen.findByRole('heading', { level: 1, name: '传输任务' })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { level: 1, name: '传输作业' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '提交传输' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '刷新' })).toBeInTheDocument()
 
     for (const header of [
-      '任务 ID',
+      '作业 ID',
       '提交者',
       '类型',
       '路径',
@@ -86,7 +91,7 @@ describe('TransfersPage localization', () => {
       '更新时间',
       '操作'
     ]) {
-      expect(screen.getByRole('columnheader', { name: header })).toBeInTheDocument()
+      expect(screen.getByText(header, { selector: 'th' })).toBeInTheDocument()
     }
 
     // The state badge goes through the shared status vocabulary rather than
@@ -99,7 +104,7 @@ describe('TransfersPage localization', () => {
   it('renders the same page in English', async () => {
     renderPage('en')
 
-    expect(await screen.findByRole('heading', { level: 1, name: 'Transfer Tasks' })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { level: 1, name: 'Transfer Jobs' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Submit Transfer' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Refresh' })).toBeInTheDocument()
 
@@ -133,10 +138,72 @@ describe('TransfersPage localization', () => {
     )
   })
 
+  it('finds a transfer by a full job id outside the current page', async () => {
+    const jobId = '12345678-1234-1234-1234-123456789abc'
+    const target = { ...transfer, job_id: jobId, path: '/history/old.parquet' } as TransferInfo
+    const { client, fetchTransferStatus } = makeClient(
+      { items: [transfer], total: 1200, counts: { all: 1200 } },
+      async () => target
+    )
+    renderPageWithClient('en', client)
+
+    await screen.findByTestId('transfer-row-job-abc123')
+    await userEvent.type(screen.getByTestId('transfers-search'), jobId)
+
+    const row = await screen.findByTestId(`transfer-row-${jobId}`)
+    expect(within(row).getByText(jobId)).toBeInTheDocument()
+    expect(screen.queryByTestId('transfer-row-job-abc123')).not.toBeInTheDocument()
+    expect(screen.getByTestId('transfers-total')).toHaveTextContent('1 total')
+    expect(fetchTransferStatus).toHaveBeenCalledWith(jobId, { page_size: 0 })
+
+    await userEvent.clear(screen.getByTestId('transfers-search'))
+    expect(await screen.findByTestId('transfer-row-job-abc123')).toBeInTheDocument()
+    expect(screen.queryByTestId(`transfer-row-${jobId}`)).not.toBeInTheDocument()
+    expect(screen.getByTestId('transfers-total')).toHaveTextContent('1200 total')
+
+    await userEvent.type(screen.getByTestId('transfers-search'), jobId)
+    await screen.findByTestId(`transfer-row-${jobId}`)
+    await userEvent.click(screen.getByTestId(`transfer-details-${jobId}`))
+    expect(await screen.findByTestId('transfer-diagnostics-sheet')).toBeInTheDocument()
+  })
+
+  it('treats a missing full job id as an empty search result', async () => {
+    const jobId = '12345678-1234-1234-1234-123456789abc'
+    const { client } = makeClient(
+      { items: [], total: 0, counts: { all: 0 } },
+      async () => {
+        throw new ApiError(500, `Job ${jobId} not found: `)
+      }
+    )
+    renderPageWithClient('en', client)
+
+    await screen.findByText(/No transfer jobs tracked yet/)
+    await userEvent.type(screen.getByTestId('transfers-search'), jobId)
+
+    await waitFor(() => expect(screen.getByTestId('transfers-total')).toHaveTextContent('0 total'))
+    expect(screen.queryByTestId(`transfer-row-${jobId}`)).not.toBeInTheDocument()
+    expect(await screen.findByText(/No transfers matched the current filters/)).toBeInTheDocument()
+    expect(screen.queryByText(/No transfer jobs tracked yet/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Transfer lookup failed/)).not.toBeInTheDocument()
+  })
+
+  it('shows lookup failures without claiming the job was not found', async () => {
+    const jobId = '12345678-1234-1234-1234-123456789abc'
+    const { client } = makeClient({ items: [], total: 0, counts: { all: 0 } }, async () => {
+      throw new ApiError(503, 'Service unavailable')
+    })
+    renderPageWithClient('en', client)
+
+    await userEvent.type(screen.getByTestId('transfers-search'), jobId)
+
+    expect(await screen.findByText(/Transfer lookup failed: Service unavailable/)).toBeInTheDocument()
+    expect(screen.queryByText(/No transfers matched the current filters/)).not.toBeInTheDocument()
+  })
+
   it('heads the row with the job id', async () => {
     renderPage('en')
     const row = await screen.findByTestId('transfer-row-job-abc123')
-    expect(within(row).getByText('job-abc123')).toBeInTheDocument()
+    expect(within(row).getByTestId('transfer-copy-job-abc123')).toHaveTextContent('job-abc123')
   })
 
   it('hides a column from the header and the rows together', async () => {

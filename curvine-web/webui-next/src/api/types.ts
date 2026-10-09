@@ -250,6 +250,8 @@ export interface TransferInfo extends JobInfo {
   tenant?: string | null
   run_id?: string | number | null
   completed_size?: number | null
+  /** True when terminal task details were TTL-purged while summary counts remain. */
+  task_details_expired?: boolean
   /** Present when more tasks exist than the requested page size. */
   next_page_token?: string | null
 }

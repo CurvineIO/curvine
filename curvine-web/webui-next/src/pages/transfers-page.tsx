@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ChevronLeftIcon, ChevronRightIcon, CircleAlert } from 'lucide-react'
 
+import { ApiError } from '@/api/error'
 import { useApi } from '@/api/api-context'
 import type { TransferInfo, TransferListCounts, TransferListData } from '@/api/types'
 import { ColumnsPicker } from '@/components/columns-picker'
@@ -28,6 +29,7 @@ import { useToast } from '@/components/ui/toast'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { useCopy } from '@/components/copy-fallback'
 import { readStoredColumns, writeStoredColumns } from '@/lib/column-visibility'
+import { shortJobId } from '@/lib/jobDisplay'
 import {
   DEFAULT_VISIBLE_OPTIONAL_TRANSFER_COLUMNS,
   DEFAULT_VISIBLE_TRANSFER_COLUMNS,
@@ -73,10 +75,30 @@ const STATUS_FILTERS = ['all', 'active', 'completed', 'failed', 'canceled'] as c
 type StatusFilter = (typeof STATUS_FILTERS)[number]
 
 const LAYOUT_STORAGE_KEY = 'curvine.web.transfers.columns.v1'
+const TRANSFER_JOB_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /** Rows per page the list offers; the backend clamps anything above 1000. */
 const LIST_PAGE_SIZES = [20, 50, 100]
 const LIST_PAGE_DEFAULT = 50
+const MOBILE_HIDDEN_COLUMNS = new Set<TransferColumnKey>([
+  'owner',
+  'kind',
+  'path',
+  'progress',
+  'files',
+  'duration',
+  'updated'
+])
+
+function transferColumnClass(column: TransferColumnDef) {
+  const classes = MOBILE_HIDDEN_COLUMNS.has(column.key) ? ['hidden sm:table-cell'] : []
+  if (column.key === 'status') classes.push('w-[35%] sm:w-[9%]')
+  return classes.join(' ')
+}
+
+function transferColumnWidth(column: TransferColumnDef) {
+  return column.key === 'status' ? undefined : column.width
+}
 
 const TONE_BY_CLASS: Record<string, StatusTone> = {
   healthy: 'positive',
@@ -105,6 +127,10 @@ export function TransfersPage() {
 
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [query, setQuery] = useState('')
+  const [jobIdResult, setJobIdResult] = useState<TransferInfo | null>(null)
+  const [jobIdLookupLoading, setJobIdLookupLoading] = useState(false)
+  const [jobIdLookupError, setJobIdLookupError] = useState<string | null>(null)
+  const [pollError, setPollError] = useState<string | null>(null)
   const [kindFilter, setKindFilter] = useState('all')
   const [timeRange, setTimeRange] = useState('all')
   const [failedOnly, setFailedOnly] = useState(false)
@@ -144,7 +170,18 @@ export function TransfersPage() {
 
   const transfersRef = useRef(transfers)
   transfersRef.current = transfers
+  const jobIdResultRef = useRef(jobIdResult)
+  jobIdResultRef.current = jobIdResult
   const detailRequestRef = useRef(0)
+  const upsertVisibleTransfer = useCallback((next: TransferInfo) => {
+    const id = transferId(next)
+    const inList = transfersRef.current.some((item) => transferId(item) === id)
+    const isSearched = transferId(jobIdResultRef.current) === id
+    if (isSearched) {
+      setJobIdResult((current) => (current ? upsertTransfer([current], next)[0] : current))
+    }
+    if (inList || !isSearched) setTransfers((current) => upsertTransfer(current, next))
+  }, [])
 
   const refreshTransfers = useCallback(async () => {
     setLoading(true)
@@ -182,11 +219,80 @@ export function TransfersPage() {
   useRefreshSignal(refreshTransfers)
 
   useEffect(() => {
-    if (!polling) return
+    const jobId = query.trim()
+    if (!TRANSFER_JOB_ID_RE.test(jobId)) {
+      setJobIdResult(null)
+      setJobIdLookupLoading(false)
+      setJobIdLookupError(null)
+      return
+    }
+
+    setJobIdResult(null)
+    setJobIdLookupLoading(true)
+    setJobIdLookupError(null)
+    const existing = transfersRef.current.find(
+      (transfer) => transferId(transfer).toLowerCase() === jobId.toLowerCase()
+    )
+    if (existing) {
+      setJobIdResult(existing)
+      setJobIdLookupLoading(false)
+      return
+    }
+
+    let cancelled = false
+    const timer = window.setTimeout(() => {
+      void api
+        .fetchTransferStatus(jobId, { page_size: 0 })
+        .then((response) => {
+          if (cancelled) return
+          const transfer = response as TransferInfo
+          setJobIdResult(
+            transferId(transfer).toLowerCase() === jobId.toLowerCase() ? transfer : null
+          )
+        })
+        .catch((error) => {
+          if (cancelled) return
+          const notFound =
+            error instanceof ApiError &&
+            (error.status === 404 || /\bjob\b.*\bnot found\b/i.test(error.message))
+          if (!notFound) {
+            setJobIdLookupError(
+              t('transfers.alerts.lookupFailed', {
+                error: error instanceof Error ? error.message : String(error)
+              })
+            )
+          }
+        })
+        .finally(() => {
+          if (!cancelled) setJobIdLookupLoading(false)
+        })
+    }, 300)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [api, query, t])
+
+  useEffect(() => {
+    if (!polling) {
+      setPollError(null)
+      return
+    }
     let cancelled = false
     let timer = 0
     const tick = async () => {
+      let bucketChanged = false
+      let pollFailure: unknown
       const active = transfersRef.current.filter((transfer) => !isTransferFinal(transfer))
+      const searchedTransfer = jobIdResultRef.current
+      if (
+        searchedTransfer &&
+        !isTransferFinal(searchedTransfer) &&
+        !active.some((transfer) => transferId(transfer) === transferId(searchedTransfer))
+      ) {
+        active.push(searchedTransfer)
+      }
       for (const transfer of active) {
         const id = transferId(transfer)
         if (!id) continue
@@ -194,11 +300,22 @@ export function TransfersPage() {
         // Loaded task rows are preserved by upsertTransfer's merge.
         try {
           const next = (await api.fetchTransferStatus(id, { page_size: 0 })) as TransferInfo
-          setTransfers((current) => upsertTransfer(current, next))
-        } catch {
-          // A single failed poll must not stop the loop.
+          bucketChanged ||= transferBucket(next) !== transferBucket(transfer)
+          upsertVisibleTransfer(next)
+        } catch (error) {
+          pollFailure ??= error
         }
       }
+      if (cancelled) return
+      if (bucketChanged) await refreshTransfers()
+      if (cancelled) return
+      setPollError(
+        pollFailure
+          ? t('transfers.alerts.pollFailed', {
+              error: pollFailure instanceof Error ? pollFailure.message : String(pollFailure)
+            })
+          : null
+      )
       if (!cancelled) timer = window.setTimeout(() => void tick(), 3000)
     }
     timer = window.setTimeout(() => void tick(), 3000)
@@ -206,12 +323,15 @@ export function TransfersPage() {
       cancelled = true
       window.clearTimeout(timer)
     }
-  }, [polling, api])
+  }, [polling, api, t, refreshTransfers, upsertVisibleTransfer])
 
-  const selectedTransfer = useMemo(
-    () => (selectedTransferId ? transfers.find((item) => transferId(item) === selectedTransferId) || null : null),
-    [transfers, selectedTransferId]
-  )
+  const selectedTransfer = useMemo(() => {
+    if (!selectedTransferId) return null
+    return (
+      transfers.find((item) => transferId(item) === selectedTransferId) ||
+      (transferId(jobIdResult) === selectedTransferId ? jobIdResult : null)
+    )
+  }, [transfers, selectedTransferId, jobIdResult])
   const detailSheet = useSlidingSheet(Boolean(selectedTransfer), selectedTransfer)
 
   /**
@@ -238,18 +358,19 @@ export function TransfersPage() {
     }
   }, [counts, transfers])
 
-  const totalPages = Math.max(1, Math.ceil(total / pageSize))
-
-  // A shrinking result set (jobs completing out of a bucket, a narrowed filter)
-  // can leave the cursor past the end; pull it back onto a real page.
-  useEffect(() => {
-    if (page > totalPages) setPage(totalPages)
-  }, [page, totalPages])
-
   /** Status, kind and failed-only are applied by the server; search and time stay local. */
   const filteredTransfers = useMemo(() => {
     const q = query.trim().toLowerCase()
-    return transfers.filter((transfer) => {
+    const isJobIdQuery = TRANSFER_JOB_ID_RE.test(query.trim())
+    const jobIdMatchesFilters =
+      jobIdResult &&
+      transferId(jobIdResult).toLowerCase() === q &&
+      (statusFilter === 'all' || transferBucket(jobIdResult) === statusFilter) &&
+      (kindFilter === 'all' || kindValue(jobIdResult) === kindFilter) &&
+      (!failedOnly || transferBucket(jobIdResult) === 'failed')
+    const candidates = isJobIdQuery ? (jobIdMatchesFilters ? [jobIdResult] : []) : transfers
+
+    return candidates.filter((transfer) => {
       if (!isWithinRange(transfer.update_time_ms, timeRange)) return false
       if (!q) return true
       const haystack =
@@ -258,10 +379,21 @@ export function TransfersPage() {
         `${transfer.kind || ''} ${transfer.message || ''}`.toLowerCase()
       return haystack.includes(q)
     })
-  }, [transfers, query, timeRange])
+  }, [transfers, query, timeRange, jobIdResult, statusFilter, kindFilter, failedOnly])
+
+  const displayedTotal = TRANSFER_JOB_ID_RE.test(query.trim()) ? filteredTransfers.length : total
+  const totalPages = Math.max(1, Math.ceil(displayedTotal / pageSize))
+
+  // A shrinking result set (jobs completing out of a bucket, a narrowed filter)
+  // can leave the cursor past the end; pull it back onto a real page.
+  useEffect(() => {
+    if (page > totalPages) setPage(totalPages)
+  }, [page, totalPages])
 
   const emptyMessage = useMemo(() => {
-    if (!transfers.length) return t('transfers.list.emptyNoTransfers')
+    if (!query.trim() && Number(counts.all ?? total) === 0) {
+      return t('transfers.list.emptyNoTransfers')
+    }
     const hints: string[] = []
     if (timeRange !== 'all') {
       hints.push(t('transfers.list.hintTimeRange', { value: timeRange }))
@@ -272,7 +404,7 @@ export function TransfersPage() {
       ? t('transfers.list.activeFilters', { filters: hints.join(', ') })
       : ''
     return t('transfers.list.emptyFiltered', { suffix })
-  }, [transfers.length, timeRange, kindFilter, failedOnly, t])
+  }, [counts.all, total, query, timeRange, kindFilter, failedOnly, t])
 
   const setBusy = useCallback((id: string, action: string | null) => {
     if (!id) return
@@ -303,7 +435,7 @@ export function TransfersPage() {
       const next = (await api.fetchTransferStatus(id, { page_size: pageSize })) as TransferInfo
       if (requestToken !== detailRequestRef.current) return null
       setTaskNextPageToken(next?.next_page_token ? String(next.next_page_token) : '')
-      setTransfers((current) => upsertTransfer(current, next))
+      upsertVisibleTransfer(next)
       toast.success(
         t('transfers.alerts.statusRefreshed', {
           id,
@@ -356,7 +488,7 @@ export function TransfersPage() {
     setBusy(id, 'cancel')
     try {
       const next = (await api.cancelTransfer(id)) as TransferInfo
-      setTransfers((current) => upsertTransfer(current, next))
+      upsertVisibleTransfer(next)
       toast.success(
         t('transfers.alerts.cancelRequested', { id, state: transferStateLabel(t, next) })
       )
@@ -492,6 +624,8 @@ export function TransfersPage() {
       />
 
       {loadError && <ErrorAlert message={loadError} />}
+      {jobIdLookupError && <ErrorAlert message={jobIdLookupError} />}
+      {pollError && <ErrorAlert message={pollError} />}
 
       <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <MetricCard
@@ -535,6 +669,7 @@ export function TransfersPage() {
               setStatusFilter(value as StatusFilter)
             }}
             aria-label={t('transfers.filters.ariaStatus')}
+            className="max-w-full flex-wrap"
             data-testid="transfers-status-filter"
           >
             {STATUS_FILTERS.map((filter) => (
@@ -553,7 +688,10 @@ export function TransfersPage() {
           <div className="flex flex-wrap items-center gap-2">
             <Input
               value={query}
-              onChange={(event) => setQuery(event.target.value)}
+              onChange={(event) => {
+                setPage(1)
+                setQuery(event.target.value)
+              }}
               placeholder={t('transfers.list.searchPlaceholder')}
               className="w-80"
               aria-label={t('transfers.list.searchAria')}
@@ -629,13 +767,17 @@ export function TransfersPage() {
           <Table className="table-fixed">
             <TableHeader className="bg-card">
               <TableRow>
-                <TableHead className="w-[14%]">{t('transfers.list.headerJob')}</TableHead>
+                <TableHead className="w-[35%] sm:w-[14%]">{t('transfers.list.headerJob')}</TableHead>
                 {visibleColumnList.map((column) => (
-                  <TableHead key={column.key} style={{ width: column.width }}>
+                  <TableHead
+                    key={column.key}
+                    className={transferColumnClass(column)}
+                    style={{ width: transferColumnWidth(column) }}
+                  >
                     {t(column.labelKey)}
                   </TableHead>
                 ))}
-                <TableHead className="w-[10%] text-right">
+                <TableHead className="w-[30%] text-right sm:w-[10%]">
                   {t('transfers.list.headerActions')}
                 </TableHead>
               </TableRow>
@@ -650,7 +792,7 @@ export function TransfersPage() {
                     data-state={selectedTransferId === id ? 'selected' : undefined}
                     data-testid={`transfer-row-${id}`}
                   >
-                    <TableCell>
+                    <TableCell className="w-[35%] sm:w-[14%]">
                       {/* The id heads the row; the display name and submitter stay
                           reachable through the hover title, the copy action and the
                           optional Owner column. */}
@@ -661,14 +803,19 @@ export function TransfersPage() {
                         data-testid={`transfer-copy-${id}`}
                         onClick={() => void copyText(id, t('transfers.copy.transferId'))}
                       >
-                        <strong className="truncate font-mono text-xs">{id || '-'}</strong>
+                        <strong className="hidden truncate font-mono text-xs sm:block">{id || '-'}</strong>
+                        <strong className="block truncate font-mono text-xs sm:hidden">
+                          {shortJobId(id)}
+                        </strong>
                       </button>
                     </TableCell>
                     {visibleColumnList.map((column) => (
-                      <TableCell key={column.key}>{renderTransferCell(column, transfer)}</TableCell>
+                      <TableCell key={column.key} className={transferColumnClass(column)}>
+                        {renderTransferCell(column, transfer)}
+                      </TableCell>
                     ))}
-                    <TableCell>
-                      <div className="flex items-center justify-end gap-1">
+                    <TableCell className="w-[30%] sm:w-[10%]">
+                      <div className="flex flex-col items-stretch gap-1 sm:flex-row sm:items-center sm:justify-end">
                         <Button
                           variant="ghost"
                           size="xs"
@@ -710,12 +857,15 @@ export function TransfersPage() {
             </TableBody>
           </Table>
 
-          {filteredTransfers.length === 0 && !loading && (
-            <div className="border-t border-border p-2">
-              <EmptyNotice title={emptyMessage} />
-            </div>
-          )}
-          {loading && (
+          {filteredTransfers.length === 0 &&
+            !loading &&
+            !jobIdLookupLoading &&
+            !jobIdLookupError && (
+              <div className="border-t border-border p-2">
+                <EmptyNotice title={emptyMessage} />
+              </div>
+            )}
+          {(loading || jobIdLookupLoading) && (
             <div className="flex items-center justify-center gap-2 border-t border-border p-3 text-xs text-muted-foreground">
               <Spinner className="size-3.5" />
               {t('common.loading')}
@@ -748,7 +898,7 @@ export function TransfersPage() {
                 </SelectContent>
               </Select>
               <span className="text-xs tabular-nums text-muted-foreground" data-testid="transfers-total">
-                {t('common.pagination.total', { count: total })}
+                {t('common.pagination.total', { count: displayedTotal })}
               </span>
             </div>
             <div className="flex items-center gap-2">
