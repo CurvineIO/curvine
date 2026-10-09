@@ -22,7 +22,7 @@ use curvine_model::{BlockLocation, CommitBlock, FileLock, FileStatus, MountInfo}
 use curvine_rocksdb::{DBConf, RocksUtils};
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::{FileUtils, Utils};
-use log::info;
+use log::{info, warn};
 use std::collections::{HashMap, HashSet, LinkedList, VecDeque};
 use std::sync::Arc;
 
@@ -153,6 +153,7 @@ impl InodeStore {
         let mut del_res = DeleteResult::new();
         let mut deleted_files = 0i64;
         let mut deleted_dirs = 0i64;
+        let mut file_link_counts: HashMap<i64, u32> = HashMap::new();
 
         while let Some((parent_id, edge_name, inode)) = stack.pop_front() {
             // Delete inode edges
@@ -174,12 +175,20 @@ impl InodeStore {
 
                 _ => {
                     deleted_files += 1;
-                    let res = self.decrement_inode_nlink(inode.id(), ctime, &mut batch)?;
-                    del_res.inodes += res.inodes;
-                    del_res.bytes += res.bytes;
-                    del_res.blocks.extend(res.blocks);
+                    let links = file_link_counts.entry(inode.id()).or_default();
+                    *links = links.saturating_add(1);
                 }
             }
+        }
+
+        // Multiple hard-link edges can point at the same inode. Aggregate all
+        // removals in this traversal so every edge decrements the persisted
+        // nlink count exactly once.
+        for (inode_id, links) in file_link_counts {
+            let res = self.decrement_inode_nlink(inode_id, links, ctime, &mut batch)?;
+            del_res.inodes += res.inodes;
+            del_res.bytes += res.bytes;
+            del_res.blocks.extend(res.blocks);
         }
 
         batch.commit()?;
@@ -430,7 +439,7 @@ impl InodeStore {
         // Decrement nlink count of the file being unlinked.
         // If nlink reaches 0 the inode is also deleted and del_res.blocks will be populated.
         let del_res = if let InodeView::File(_) = child {
-            self.decrement_inode_nlink(child.id(), ctime, &mut batch)?
+            self.decrement_inode_nlink(child.id(), 1, ctime, &mut batch)?
         } else {
             DeleteResult::new()
         };
@@ -468,7 +477,7 @@ impl InodeStore {
 
         // Decrement nlink count of the original inode.
         // If nlink reaches 0 the inode is also deleted and del_res.blocks will be populated.
-        let del_res = self.decrement_inode_nlink(inode_id, ctime, &mut batch)?;
+        let del_res = self.decrement_inode_nlink(inode_id, 1, ctime, &mut batch)?;
 
         batch.commit()?;
 
@@ -481,15 +490,28 @@ impl InodeStore {
     fn decrement_inode_nlink(
         &self,
         inode_id: i64,
+        links: u32,
         ctime: i64,
         batch: &mut InodeWriteBatch<'_>,
     ) -> CommonResult<DeleteResult> {
         let mut del_res = DeleteResult::new();
+        if links == 0 {
+            return Ok(del_res);
+        }
+
         // Load the inode from storage
         if let Some(mut inode_view) = self.get_inode(inode_id, None)? {
             match &mut inode_view {
                 InodeView::File(f) => {
-                    let remaining_links = f.decrement_nlink(ctime);
+                    if links > f.nlink() {
+                        warn!(
+                            "Inode {} nlink {} is smaller than the {} link(s) being removed",
+                            inode_id,
+                            f.nlink(),
+                            links
+                        );
+                    }
+                    let remaining_links = f.decrement_nlink_by(links, ctime);
                     if remaining_links == 0 {
                         batch.delete_inode(inode_id)?;
 
@@ -510,7 +532,10 @@ impl InodeStore {
                 }
             }
         } else {
-            return err_box!("Inode {} not found when decrementing nlink", inode_id);
+            warn!(
+                "Inode {} not found when decrementing nlink; treating the stale directory entry as already deleted",
+                inode_id
+            );
         }
         Ok(del_res)
     }
@@ -1138,6 +1163,101 @@ mod tests {
         assert_eq!(result[0].name, "good.txt");
         assert_eq!(result[0].id, good_file_id);
         assert_eq!(result[0].path, "/good.txt");
+
+        Ok(())
+    }
+
+    #[test]
+    fn apply_delete_skips_missing_file_entry() -> CommonResult<()> {
+        let store = new_store("delete-missing-file-entry")?;
+        let root = FsDir::create_root();
+        let missing_id = 9999;
+        let missing = InodeView::new_entry("missing.txt".to_string(), missing_id);
+
+        {
+            let mut batch = store.new_batch();
+            batch.write_inode(&root)?;
+            batch.add_child(ROOT_INODE_ID, "missing.txt", missing_id)?;
+            batch.commit()?;
+        }
+
+        let result = store.apply_delete(&root, &missing, "missing.txt", 100)?;
+        assert_eq!(result.inodes, 0);
+        assert!(store.get_inode(missing_id, None)?.is_none());
+        assert_eq!(store.store.edges_iter(ROOT_INODE_ID)?.count(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn apply_delete_handles_valid_and_stale_file_entries() -> CommonResult<()> {
+        let store = new_store("delete-valid-and-stale-file-entries")?;
+        let root = FsDir::create_root();
+        let dir_id = 2001;
+        let file_id = 2002;
+        let missing_id = 9999;
+        let dir = InodeView::new_dir("dir".to_string(), InodeDir::new(dir_id, ROOT_INODE_ID));
+        let file = InodeView::new_file("valid.txt".to_string(), InodeFile::new(file_id, dir_id));
+
+        {
+            let mut batch = store.new_batch();
+            batch.write_inode(&root)?;
+            batch.write_inode(&dir)?;
+            batch.write_inode(&file)?;
+            batch.add_child(ROOT_INODE_ID, "dir", dir_id)?;
+            batch.add_child(dir_id, "valid.txt", file_id)?;
+            batch.commit()?;
+        }
+
+        let (_, mut restored) = store.create_tree()?;
+        let dir = restored
+            .get_child_ptr("dir")
+            .expect("restored directory should exist");
+        dir.as_mut()
+            .add_child(InodeView::new_entry("stale.txt".to_string(), missing_id))?;
+
+        let result = store.apply_delete(&restored, dir.as_ref(), "dir", 100)?;
+        assert_eq!(result.inodes, 1);
+        assert!(store.get_inode(file_id, None)?.is_none());
+        assert!(store.get_inode(missing_id, None)?.is_none());
+        assert!(store.get_inode(dir_id, None)?.is_none());
+        assert_eq!(store.store.edges_iter(ROOT_INODE_ID)?.count(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn apply_delete_aggregates_hard_link_counts() -> CommonResult<()> {
+        let store = new_store("delete-hard-link-counts")?;
+        let root = FsDir::create_root();
+        let dir_id = 2001;
+        let file_id = 2002;
+        let dir = InodeView::new_dir("dir".to_string(), InodeDir::new(dir_id, ROOT_INODE_ID));
+        let mut file = InodeView::new_file("file".to_string(), InodeFile::new(file_id, dir_id));
+        file.incr_nlink(0);
+
+        {
+            let mut batch = store.new_batch();
+            batch.write_inode(&root)?;
+            batch.write_inode(&dir)?;
+            batch.write_inode(&file)?;
+            batch.add_child(ROOT_INODE_ID, "dir", dir_id)?;
+            batch.add_child(dir_id, "a", file_id)?;
+            batch.add_child(dir_id, "b", file_id)?;
+            batch.commit()?;
+        }
+
+        let (_, restored) = store.create_tree()?;
+        let dir = restored
+            .get_child("dir")
+            .expect("restored directory should exist")
+            .clone();
+
+        let result = store.apply_delete(&restored, &dir, "dir", 100)?;
+        assert_eq!(result.inodes, 1);
+        assert!(store.get_inode(file_id, None)?.is_none());
+        assert!(store.get_inode(dir_id, None)?.is_none());
+        assert_eq!(store.store.edges_iter(ROOT_INODE_ID)?.count(), 0);
 
         Ok(())
     }

@@ -262,8 +262,13 @@ impl InodeFile {
 
     // Decrement link count
     pub fn decrement_nlink(&mut self, ctime: i64) -> u32 {
-        if self.nlink > 0 {
-            self.nlink -= 1;
+        self.decrement_nlink_by(1, ctime)
+    }
+
+    // Decrement link count by the number of edges removed in one operation.
+    pub fn decrement_nlink_by(&mut self, count: u32, ctime: i64) -> u32 {
+        if count > 0 {
+            self.nlink = self.nlink.saturating_sub(count);
             self.update_ctime(ctime);
         }
         self.nlink
