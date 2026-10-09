@@ -773,6 +773,18 @@ impl TransferStore for TransferStoreBackend {
         })
     }
 
+    fn update_task_reports(&self, reports: Vec<TransferTaskReport>) -> FsResult<Vec<bool>> {
+        self.record_store_operation("update_task_reports", || match self {
+            Self::Memory(store) => store.update_task_reports(reports),
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => store.update_task_reports(reports),
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => store.update_task_reports(reports),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.update_task_reports(reports),
+        })
+    }
+
     fn update_job_progress_summary(
         &self,
         job_id: &str,

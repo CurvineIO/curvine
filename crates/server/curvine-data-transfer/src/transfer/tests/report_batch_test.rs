@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use curvine_fs_api::RpcCode;
+use curvine_metrics::Metrics;
 use curvine_model::{
     TaskAttemptStart, TransferJobRecord, TransferKind, TransferProgress, TransferState,
     TransferTaskRecord, TransferTaskReport, TransferTaskState,
@@ -31,7 +32,7 @@ use super::scheduler::stale_retry_exhausted_message;
 use super::SqliteTransferStore;
 use super::{
     MemoryTransferStore, TransferHandler, TransferPlannedTasks, TransferService, TransferStore,
-    TransferTaskStateUpdate,
+    TransferStoreBackend, TransferTaskStateUpdate,
 };
 
 fn running_store() -> (Arc<MemoryTransferStore>, TransferJobRecord) {
@@ -565,6 +566,21 @@ fn assert_batched_report_write_contract<S: TransferStore>(store: Arc<S>, job: Tr
 fn memory_batched_report_write_keeps_per_report_acceptance() {
     let (store, job) = running_store();
     assert_batched_report_write_contract(store, job);
+}
+
+#[test]
+fn backend_delegates_batched_reports_in_one_store_operation() {
+    let backend = Arc::new(TransferStoreBackend::Memory(MemoryTransferStore::new()));
+    let (store, job) = running_store_for(backend);
+    assert_batched_report_write_contract(store, job);
+
+    let metrics = Metrics::text_output().unwrap();
+    assert!(metrics.contains(
+        "transfer_store_operation_total{backend=\"memory\",operation=\"update_task_reports\",result=\"success\"} 1"
+    ));
+    assert!(!metrics.contains(
+        "transfer_store_operation_total{backend=\"memory\",operation=\"update_task_report\",result=\"success\"}"
+    ));
 }
 
 #[test]
