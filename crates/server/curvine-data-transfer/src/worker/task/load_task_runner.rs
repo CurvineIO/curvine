@@ -260,7 +260,7 @@ impl LoadTaskRunner {
             info!("transfer task canceled: {}", self.log_context());
             return self.cancel_stream(&mut stream).await;
         }
-        let Some((copied_bytes, reader_len, read_cost_ms, total_cost_ms)) =
+        let Some((copied_bytes, reader_len, read_cost_us, task_cost_us)) =
             (match self.copy_and_commit_stream(&mut stream).await {
                 Ok(result) => result,
                 Err(err) => {
@@ -287,12 +287,12 @@ impl LoadTaskRunner {
         }
 
         info!(
-            "transfer task completed: {} ufs_mtime={} copied_bytes={} read_cost_ms={} task_cost_ms={}",
+            "transfer task completed: {} ufs_mtime={} copied_bytes={} read_cost_us={} task_cost_us={}",
             self.log_context(),
             ufs_mtime,
             copied_bytes,
-            read_cost_ms,
-            total_cost_ms,
+            read_cost_us,
+            task_cost_us,
         );
 
         Ok(true)
@@ -303,9 +303,9 @@ impl LoadTaskRunner {
         stream: &mut CopyStream,
     ) -> FsResult<Option<(i64, i64, u64, u64)>> {
         let mut last_progress_time = LocalTime::mills();
-        let mut read_cost_ms = 0;
-        let mut write_cost_ms = 0;
-        let mut total_cost_ms = 0;
+        let mut read_cost_us: u64 = 0;
+        let mut write_cost_us: u64 = 0;
+        let mut total_cost_us: u64 = 0;
 
         loop {
             if self.task.is_cancel() {
@@ -319,9 +319,12 @@ impl LoadTaskRunner {
 
             // Measure read and write phases separately so metrics can answer
             // "is the bottleneck the source read or the target write?".
+            // Microsecond resolution: a single chunk write is routinely
+            // sub-millisecond, so per-chunk millisecond truncation would
+            // round every chunk to zero and report a write cost of ~0.
             let read_spend = TimeSpent::new();
             let chunk = stream.reader.async_read(None).await?;
-            read_cost_ms += read_spend.used_ms();
+            read_cost_us += read_spend.used_us();
 
             if chunk.is_empty() {
                 break;
@@ -330,9 +333,9 @@ impl LoadTaskRunner {
 
             let write_spend = TimeSpent::new();
             stream.writer.async_write(chunk).await?;
-            let chunk_write_ms = write_spend.used_ms();
-            write_cost_ms += chunk_write_ms;
-            total_cost_ms += chunk_write_ms;
+            let chunk_write_us = write_spend.used_us();
+            write_cost_us += chunk_write_us;
+            total_cost_us += chunk_write_us;
 
             if LocalTime::mills() > last_progress_time + self.progress_interval_ms {
                 last_progress_time = LocalTime::mills();
@@ -340,7 +343,7 @@ impl LoadTaskRunner {
                     .await;
             }
 
-            if total_cost_ms > self.task_timeout_ms {
+            if total_cost_us > self.task_timeout_ms.saturating_mul(1000) {
                 return err_box!(
                     "Task {} exceed timeout {} ms",
                     self.task.info.task_id,
@@ -349,12 +352,18 @@ impl LoadTaskRunner {
             }
         }
 
+        // The final flush happens inside complete(); count it as write cost so
+        // the trailing chunk is not silently dropped from the write phase total.
+        let complete_spend = TimeSpent::new();
+        let complete_result = stream.writer.complete().await;
+        write_cost_us += complete_spend.used_us();
+
         // Attribute accumulated read/write phases to the task context for
         // per-task metrics attribution at completion.
-        self.task.add_read_cost(read_cost_ms.saturating_mul(1000));
-        self.task.add_write_cost(write_cost_ms.saturating_mul(1000));
+        self.task.add_read_cost(read_cost_us);
+        self.task.add_write_cost(write_cost_us);
 
-        stream.writer.complete().await?;
+        complete_result?;
         stream.reader.complete().await?;
         if self.task.is_cancel() {
             info!(
@@ -370,8 +379,8 @@ impl LoadTaskRunner {
         Ok(Some((
             copied_bytes,
             reader_len,
-            read_cost_ms,
-            total_cost_ms,
+            read_cost_us,
+            total_cost_us,
         )))
     }
 
@@ -1839,13 +1848,19 @@ impl LoadTaskRunner {
                         );
                     }
                     let want = remaining.min(Self::READ_CHUNK_BYTES) as usize;
+                    // Per-chunk microsecond timing, matching the serial path:
+                    // sub-millisecond chunks would round to zero in ms.
+                    let read_spend = TimeSpent::new();
                     let chunk = reader.async_read(Some(want)).await?;
+                    task.add_read_cost(read_spend.used_us());
                     if chunk.is_empty() {
                         break;
                     }
                     task.note_first_byte();
                     remaining -= chunk.len() as i64;
+                    let write_spend = TimeSpent::new();
                     writer.async_write(chunk).await?;
+                    task.add_write_cost(write_spend.used_us());
                 }
                 if remaining != 0 {
                     let _ = writer.cancel().await;
@@ -1856,7 +1871,9 @@ impl LoadTaskRunner {
                         remaining
                     );
                 }
+                let complete_spend = TimeSpent::new();
                 writer.complete().await?;
+                task.add_write_cost(complete_spend.used_us());
                 reader.complete().await?;
                 FsResult::Ok(len)
             }));
