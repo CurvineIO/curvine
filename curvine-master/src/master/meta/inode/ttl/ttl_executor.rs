@@ -101,6 +101,13 @@ impl InodeTtlExecutor {
 
         match action {
             TtlAction::Delete => {
+                // A non-empty directory stays until its children are gone.
+                // Returning (false, inode) puts it back in its TTL bucket.
+                // Free is not gated here: it drops cached blocks and leaves children.
+                if inode.is_dir() && !self.is_empty_dir(&path)? {
+                    debug!("skip ttl delete for non-empty directory {}", inode_id);
+                    return Ok((false, inode));
+                }
                 self.filesystem.delete(&path, true)?;
                 debug!("ttl delete {} {:?}", path, inode);
                 Ok((true, inode))

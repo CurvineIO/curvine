@@ -177,7 +177,7 @@ impl MasterMetrics {
 
             operation_duration: m::new_histogram_vec_with_buckets(
                 "operation_duration",
-                "Operation duration except WorkerHeartbeat",
+                "Operation duration including WorkerHeartbeat",
                 &["operation"],
                 &buckets,
             )?,
