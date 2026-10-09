@@ -327,6 +327,17 @@ pub trait TransferStore: Send + Sync + 'static {
         now_ms: i64,
     ) -> FsResult<()>;
 
+    /// Refreshes only the job's status message (e.g. scheduling backpressure
+    /// reasons) without touching aggregated progress counters. Best-effort:
+    /// callers ignore failures since the next round refreshes it again.
+    fn flush_job_progress_message(&self, job_id: &str, run_id: u64, message: &str) -> FsResult<()> {
+        let now_ms = curvine_runtime::common::LocalTime::mills() as i64;
+        let summary = self.get_transfer_task_summary(job_id, run_id, now_ms)?;
+        let mut progress = summary.progress;
+        progress.message = message.to_string();
+        self.update_job_progress_summary(job_id, run_id, progress, now_ms)
+    }
+
     fn flush_job_progress_summary(&self, job_id: &str, run_id: u64) -> FsResult<()> {
         let now_ms = curvine_runtime::common::LocalTime::mills() as i64;
         let summary = self.get_transfer_task_summary(job_id, run_id, now_ms)?;

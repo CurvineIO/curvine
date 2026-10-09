@@ -253,7 +253,10 @@ where
             lease_epoch: 0,
             lease_expire_at: 0,
             cancel_requested: false,
-            summary: TransferProgress::default(),
+            summary: TransferProgress {
+                message: "waiting for scheduling".to_string(),
+                ..Default::default()
+            },
             client_request_id: command.client_request_id,
             submitter: command.submitter,
             tenant: command.tenant,
@@ -476,7 +479,13 @@ where
         let summary = self
             .store
             .get_transfer_task_summary(&job.job_id, job.run_id, now_ms())?;
-        let (progress, counts, expired) = resolve_terminal_summary(&job, &summary);
+        let (mut progress, counts, expired) = resolve_terminal_summary(&job, &summary);
+        // The live aggregate derives its message from task rows; scheduling-phase
+        // reasons ("waiting for worker capacity", planning requeues) live on the
+        // persisted job summary, so fall back to it while tasks carry no message.
+        if progress.message.is_empty() && !job.summary.message.is_empty() {
+            progress.message = job.summary.message.clone();
+        }
         job.summary = progress;
         let page_size = page_size.unwrap_or(0) as usize;
         let offset = parse_page_token(page_token)?;

@@ -1113,6 +1113,7 @@ where
         lease: TransferLease,
     ) -> FsResult<()> {
         let mut dispatched = 0usize;
+        let mut blocked_total = 0usize;
         // Lazy ledger refresh (design §4.1): only on dispatch; a failed
         // aggregation skips dispatch this tick (fail-safe, no blind dispatch).
         if let Err(err) = self.inflight.ensure_fresh(
@@ -1140,8 +1141,8 @@ where
                 break;
             }
 
-            let started = match self.dispatch_batch(&job, &lease, tasks).await {
-                Ok(started) => started,
+            let (started, blocked) = match self.dispatch_batch(&job, &lease, tasks).await {
+                Ok((started, blocked)) => (started, blocked),
                 Err(err) => {
                     record_metric(|metrics| metrics.inc_dispatch("failure", 1));
                     if is_store_unavailable_error(&err) {
@@ -1167,6 +1168,7 @@ where
                 }
             };
             dispatched += started;
+            blocked_total += blocked;
             record_metric(|metrics| metrics.inc_dispatch("started", started));
             if started == 0 {
                 record_metric(|metrics| metrics.inc_dispatch("not_started", 1));
@@ -1195,12 +1197,24 @@ where
         if self.cancel_requested(&job, &lease).await? {
             return Ok(());
         }
+        // "dispatched 0 tasks" explains nothing when tasks were blocked by
+        // worker capacity; surface the real reason instead (and flush it so
+        // the persisted message matches even before this transition).
+        let message = dispatch_result_message(dispatched, blocked_total);
+        if blocked_total > 0 {
+            record_metric(|metrics| {
+                metrics.inc_dispatch("blocked_no_worker", blocked_total);
+            });
+            let _ = self
+                .store
+                .flush_job_progress_message(&job.job_id, job.run_id, &message);
+        }
         let _ = self.transition(
             &job,
             &lease,
             &[TransferState::Dispatching],
             TransferState::Running,
-            format!("dispatched {} tasks", dispatched),
+            message,
         )?;
         Ok(())
     }
@@ -1225,15 +1239,13 @@ where
         job: &TransferJobRecord,
         lease: &TransferLease,
         tasks: Vec<TransferTaskRecord>,
-    ) -> FsResult<usize> {
+    ) -> FsResult<(usize, usize)> {
         let workers = match self.cache.live_workers() {
-            Ok(workers) => workers,
-            Err(err) => {
-                debug!(
-                    "no live worker with required transfer capabilities is available for transfer {}: {}",
-                    job.job_id, err
-                );
-                return Ok(0);
+            Ok(workers) if !workers.is_empty() => workers,
+            Ok(_) | Err(_) => {
+                // No candidate worker at all: the remaining tasks stay
+                // Pending and the caller must see why.
+                return Ok((0, tasks.len()));
             }
         };
         let mount = job_mount_snapshot_async(job, &self.cache).await?;
@@ -1279,12 +1291,8 @@ where
         .buffer_unordered(limit)
         .try_collect::<Vec<_>>()
         .await?;
-        if blocked_no_worker > 0 {
-            record_metric(|metrics| {
-                metrics.inc_dispatch("blocked_no_worker", blocked_no_worker);
-            });
-        }
-        Ok(started.into_iter().filter(|value| *value).count())
+        let started_count = started.into_iter().filter(|value| *value).count();
+        Ok((started_count, blocked_no_worker))
     }
 
     async fn planner_job_info(
@@ -2278,6 +2286,21 @@ fn scheduler_idle_interval(lease_timeout: Duration) -> Duration {
     SCHEDULER_IDLE_INTERVAL
         .min(lease_timeout / 2)
         .max(SCHEDULER_MIN_IDLE_INTERVAL)
+}
+
+/// Message for a dispatch round: capacity backpressure must be visible in the
+/// job status Message column, so blocked reasons win over a bare count.
+/// Message for a dispatch round: capacity backpressure must be visible in the
+/// job status Message column, so blocked reasons win over a bare count.
+pub(crate) fn dispatch_result_message(dispatched: usize, blocked: usize) -> String {
+    if blocked > 0 {
+        format!(
+            "waiting for worker capacity: {} task(s) blocked this round (worker in-flight byte budget or concurrency limit reached)",
+            blocked
+        )
+    } else {
+        format!("dispatched {} tasks", dispatched)
+    }
 }
 
 /// Candidates for [`TransferScheduler::choose_worker`]: workers that pass the

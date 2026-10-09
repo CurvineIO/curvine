@@ -23,6 +23,7 @@ use super::service::{
     auto_repair_eligible, auto_repair_in_cooldown, cv_cache_target_needs_repair,
     AUTO_REPAIR_COOLDOWN_MS,
 };
+use super::store::TransferStore;
 use super::{MemoryTransferStore, TransferService};
 
 fn load_submit_request(client_request_id: &str) -> SubmitTransferRequest {
@@ -174,4 +175,68 @@ fn submit_completed_load_without_cache_does_not_auto_repair() {
 #[test]
 fn submit_partial_success_load_without_cache_does_not_auto_repair() {
     resubmit_same_request_keeps_job(TransferState::PartialSuccess);
+}
+
+#[test]
+fn submitted_job_starts_with_a_scheduling_message() {
+    let store = Arc::new(MemoryTransferStore::new());
+    let service = TransferService::new(store.clone());
+    let job = service
+        .submit_transfer(load_submit_request("msg-pending"))
+        .unwrap();
+
+    assert_eq!(job.state, TransferState::Pending);
+    assert_eq!(job.summary.message, "waiting for scheduling");
+}
+
+#[test]
+fn status_message_falls_back_to_the_persisted_job_message() {
+    let store = Arc::new(MemoryTransferStore::new());
+    let service = TransferService::new(store.clone());
+    let job = service
+        .submit_transfer(load_submit_request("msg-fallback"))
+        .unwrap();
+
+    // No task rows yet: the live aggregate has no message, so the persisted
+    // scheduling-phase reason must surface in the status response.
+    let (status, _, _, _, _) = service
+        .get_transfer_status(&job.job_id, None, None)
+        .unwrap();
+    assert_eq!(status.summary.message, "waiting for scheduling");
+}
+
+#[test]
+fn flush_job_progress_message_updates_message_without_touching_progress() {
+    let store = Arc::new(MemoryTransferStore::new());
+    let service = TransferService::new(store.clone());
+    let job = service
+        .submit_transfer(load_submit_request("msg-flush"))
+        .unwrap();
+
+    store
+        .flush_job_progress_message(&job.job_id, job.run_id, "blocked: no worker capacity")
+        .unwrap();
+
+    let stored = store.get_transfer(&job.job_id).unwrap().unwrap();
+    assert_eq!(stored.summary.message, "blocked: no worker capacity");
+    assert_eq!(stored.summary.loaded_size, 0);
+    assert_eq!(stored.summary.total_size, 0);
+
+    let (status, _, _, _, _) = service
+        .get_transfer_status(&job.job_id, None, None)
+        .unwrap();
+    assert_eq!(status.summary.message, "blocked: no worker capacity");
+}
+
+#[test]
+fn dispatch_result_message_prefers_capacity_reasons() {
+    use crate::transfer::scheduler::dispatch_result_message;
+
+    // Blocked tasks must win over a bare "dispatched 0 tasks": the Message
+    // column has to explain WHY tasks stay Pending.
+    assert_eq!(
+        dispatch_result_message(0, 5),
+        "waiting for worker capacity: 5 task(s) blocked this round (worker in-flight byte budget or concurrency limit reached)"
+    );
+    assert_eq!(dispatch_result_message(3, 0), "dispatched 3 tasks");
 }

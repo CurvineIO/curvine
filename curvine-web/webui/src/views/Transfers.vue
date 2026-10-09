@@ -141,7 +141,7 @@
             <div><span>Source Path</span><strong :title="sourcePath(selectedTransfer)">{{ sourcePath(selectedTransfer) }}</strong><button class="link-button" @click="copyText(sourcePath(selectedTransfer), 'Source path copied')">Copy</button></div>
             <div><span>Target Path</span><strong :title="targetPath(selectedTransfer)">{{ targetPath(selectedTransfer) }}</strong><button class="link-button" @click="copyText(targetPath(selectedTransfer), 'Target path copied')">Copy</button></div>
           </div>
-          <p v-if="selectedTransfer.message" class="detail-error">{{ selectedTransfer.message }}</p>
+          <p v-if="selectedTransfer.message" :class="detailMessageClass(selectedTransfer)">{{ selectedTransfer.message }}</p>
         </section>
 
         <section class="detail-section">
@@ -447,6 +447,13 @@ export default {
       return Number(transfer && (transfer.running_files || transfer.loading_files || transfer.pending_files || 0))
     },
     isFailedTask(task) { return this.stateValue(task) === 'failed' },
+    // Scheduling reasons ("waiting for scheduling", capacity backpressure)
+    // surface here too; only render them as errors for failed jobs.
+    detailMessageClass(transfer) {
+      const value = this.stateValue(transfer)
+      const isError = value === 'failed' || value === 'partialsuccess' || value === 'canceled'
+      return isError ? 'detail-error' : 'detail-hint'
+    },
     taskMessage(task, transfer = null) {
       const message = task && (task.message || (task.progress && task.progress.message))
       return message || (transfer && transfer.message) || '-'
@@ -1016,6 +1023,17 @@ export default {
   border-radius: 8px;
   color: #8a2f2f;
   background: #fff8f8;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.detail-hint {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(91, 103, 122, 0.14);
+  border-radius: 8px;
+  color: #5b677a;
+  background: rgba(245, 247, 250, 0.85);
   overflow-wrap: anywhere;
   font-size: 12px;
 }
