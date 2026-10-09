@@ -7,24 +7,20 @@ assignees: ''
 
 ---
 
-> **请使用中文填写本 issue。**
+**Describe the bug**
+A clear and concise description of what the bug is.
 
-**问题描述**
-清晰简洁地描述这个缺陷是什么。
+**To Reproduce**
+Steps to reproduce the behavior:
 
-**复现步骤**
-复现该行为的步骤：
+**Expected behavior**
+A clear and concise description of what you expected to happen.
 
-**期望行为**
-清晰简洁地描述你期望发生什么。
+**Screenshots**
+If applicable, add screenshots to help explain your problem.
 
-**截图**
-如果有，附上截图以帮助说明问题。
+**OS Version (please complete the following information):**
+ - 
 
-**环境信息（请填写以下内容）：**
-- 操作系统：
-- Curvine 版本/分支：
-- 相关配置：
-
-**补充信息**
-在此处添加任何其他信息。
+**Additional context**
+Add any other context about the problem here.

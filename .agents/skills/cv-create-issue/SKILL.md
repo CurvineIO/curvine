@@ -5,34 +5,38 @@ description: Create a GitHub issue for Curvine using repository templates, with 
 
 # cv-create-issue
 
-按 `.github/ISSUE_TEMPLATE/` 与 Curvine 约定创建结构化 GitHub issue。
+Create structured GitHub issues that follow `.github/ISSUE_TEMPLATE/` and Curvine conventions.
 
-Issue 标题与正文**必须使用中文**（模板文件本身已是中文；`[BUG]:` / `[FEATURE]` 前缀与 labels 保持英文原样，机器可解析）。
+## Language Rules
 
-## 使用时机 (When to Use)
+- **Issue body (content):** write in **Chinese** — this is the communication medium with reviewers and maintainers.
+- **Issue title:** keep in **English** (with `[BUG]:` / `[FEATURE]` prefix and labels left as-is, machine-parseable).
+- **Commit titles / messages:** always **English** (code-related text stays English).
 
-- 用户明确要求创建 / 提交 / 发起 issue
-- 测试中发现**严重缺陷**（数据丢失、崩溃、安全、CI 中断）
-- Agent 发现值得跟踪的未解决问题——先**问用户**是否建 issue
+## When to Use
 
-## 步骤一：分类 (Step 1: Classify)
+- User explicitly asks to create / file / open an issue
+- A **serious bug** is found during testing (data loss, crash, security, CI breakage)
+- Agent detects an unresolved problem worth tracking — **ask user** whether to file an issue
 
-| 类型 | 模板 | Label | 标题前缀 |
+## Step 1: Classify
+
+| Type | Template | Label | Title prefix |
 | ---- | -------- | ----- | ------------ |
-| 缺陷 | `bug_report.md` | `bug` | `[BUG]:` |
-| 功能 | `feature_request.md` | `enhancement` | `[FEATURE]` |
+| Bug | `bug_report.md` | `bug` | `[BUG]:` |
+| Feature | `feature_request.md` | `enhancement` | `[FEATURE]` |
 
-先搜索是否已有重复：
+Search for duplicates first:
 
 ```bash
 gh issue list --search "<keywords>" --state open --limit 10
 ```
 
-## 步骤二：起草正文 (Step 2: Draft Body)
+## Step 2: Draft Body
 
-### 缺陷（按模板）
+### Bug (follow template)
 
-`.github/ISSUE_TEMPLATE/bug_report.md` 的必填章节（中文填写）:
+Required sections from `.github/ISSUE_TEMPLATE/bug_report.md`:
 
 - **问题描述**
 - **复现步骤** (numbered steps)
@@ -40,21 +44,21 @@ gh issue list --search "<keywords>" --state open --limit 10
 - **环境信息** (OS, Curvine version/branch, relevant config)
 - **补充信息** (logs, screenshots)
 
-### 功能（模板 + 扩展）
+### Feature (template + extensions)
 
-`.github/ISSUE_TEMPLATE/feature_request.md` 的基础章节（中文填写）:
+Base sections from `.github/ISSUE_TEMPLATE/feature_request.md`:
 
 - **关联的问题是什么？**
 - **期望的方案**
 - **考虑过的替代方案**
 - **补充信息**
 
-**功能类 issue 必备的扩展章节（中文填写）:**
+**Required extra sections for Feature issues (fill in Chinese):**
 
 ```markdown
 # 目标 (Goal)
 
-设计范围：列出子需求及其解决的问题。
+Design scope: list sub-requirements and the problem each solves.
 
 | 子需求 | 解决的问题 |
 | --------------- | -------------- |
@@ -62,7 +66,7 @@ gh issue list --search "<keywords>" --state open --limit 10
 
 # 非目标 (Not Goal)
 
-本 issue **不**涉及的模块、功能或边界。
+Modules, features, or boundaries this issue must **not** touch.
 
 - ...
 
@@ -73,25 +77,25 @@ gh issue list --search "<keywords>" --state open --limit 10
 | ... | ... | ... |
 ```
 
-## 步骤三：与用户确认 (Step 3: Confirm with User)
+## Step 3: Confirm with User
 
-展示标题 + 完整正文预览。`gh issue create` 之前等待批准。
+Show title + full body preview. Wait for approval before `gh issue create`.
 
-## 步骤四：创建 (Step 4: Create)
+## Step 4: Create
 
 ```bash
-# 缺陷
+# Bug
 gh issue create \
-  --title "[BUG]: <中文概述>" \
+  --title "[BUG]: <English summary>" \
   --label bug \
   --body "$(cat <<'EOF'
 ...
 EOF
 )"
 
-# 功能
+# Feature
 gh issue create \
-  --title "[FEATURE] <中文概述>" \
+  --title "[FEATURE] <English summary>" \
   --label enhancement \
   --body "$(cat <<'EOF'
 ...
@@ -99,15 +103,15 @@ EOF
 )"
 ```
 
-## 步骤五：输出 (Step 5: Output)
+## Step 5: Output
 
-返回 issue 号、URL 和建议的下一步：
+Return issue number, URL, and suggested next step:
 
-- 修缺陷 → [cv-handle-issue](../cv-handle-issue/SKILL.md)
-- 大功能 → [cv-tasks-breakdown](../cv-tasks-breakdown/SKILL.md)
+- Bug fix → [cv-handle-issue](../cv-handle-issue/SKILL.md)
+- Large feature → [cv-tasks-breakdown](../cv-tasks-breakdown/SKILL.md)
 
-## 规则 (Rules)
+## Rules
 
-- 标题与正文必须使用中文（仅 `[BUG]:` / `[FEATURE]` 前缀与 labels 例外）
-- 一事一 issue
-- 父 issue 的子任务：标题加 `[SUB]` 前缀，正文链接 `Parent: #<n>`
+- Body in **Chinese**; title in **English** (`[BUG]:` / `[FEATURE]` prefix and labels stay English)
+- One issue per topic
+- For sub-tasks of a parent issue, prefix title with `[SUB]` and link `Parent: #<n>` in body
