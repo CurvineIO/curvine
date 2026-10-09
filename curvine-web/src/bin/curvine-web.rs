@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use curvine_config::ClusterConf;
+use curvine_config::{pipeline, ClusterConf, ConfigSource, ConfigSourceMap};
 use curvine_core_error::CommonResult;
 use curvine_runtime::common::{LocalTime, Logger, Utils};
 use curvine_sys::version;
@@ -36,20 +36,28 @@ fn main() -> CommonResult<()> {
 }
 
 fn start_web(args: StartArgs) -> CommonResult<()> {
-    let conf = ClusterConf::from(&args.conf)?;
+    let mut conf = ClusterConf::from(&args.conf)?;
+    let mut config_sources = if args.conf.trim().is_empty() {
+        ConfigSourceMap::new()
+    } else {
+        let text = pipeline::read_file_text(&args.conf)?;
+        pipeline::build_document_with_sources(&text, &[])?.1
+    };
     Logger::init(conf.log.clone());
     Utils::set_panic_exit_hook();
 
-    let port = args.port.unwrap_or(conf.web.port);
-    let hostname = args
-        .hostname
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .unwrap_or(&conf.web.hostname);
-    let web_conf = conf.standalone_web_conf(hostname, port);
+    if let Some(hostname) = args.hostname.as_deref().filter(|value| !value.is_empty()) {
+        conf.web.hostname = hostname.to_string();
+        config_sources.insert("web.hostname".to_string(), ConfigSource::Cli);
+    }
+    if let Some(port) = args.port {
+        conf.web.port = port;
+        config_sources.insert("web.port".to_string(), ConfigSource::Cli);
+    }
+    let web_conf = conf.standalone_web_conf(&conf.web.hostname, conf.web.port);
 
     let rt = Arc::new(web_conf.create_runtime());
-    let service = AdminWebService::new(conf, rt.clone());
+    let service = AdminWebService::with_sources(conf, config_sources, rt.clone());
     let web = WebServer::with_rt(rt, web_conf, service);
     web.block_on_start();
     Ok(())

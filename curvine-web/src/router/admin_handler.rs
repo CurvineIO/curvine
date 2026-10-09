@@ -38,7 +38,7 @@ use crate::util::addr::{
     display_master_endpoint, hosts_match_for_cluster_mapping, master_runtime_scrape_url,
     resolve_display_hostname, resolve_display_ip,
 };
-use curvine_config::ClusterConf;
+use curvine_config::{ClusterConf, ConfigSourceMap};
 use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_error::{ErrorKind, FsError};
@@ -498,6 +498,7 @@ fn master_runtime_http_client() -> Option<reqwest::Client> {
 #[derive(Clone)]
 pub struct AdminRouterHandler {
     conf: ClusterConf,
+    config_sources: ConfigSourceMap,
     unified_fs: UnifiedFileSystem,
     rt: Arc<Runtime>,
     start_time: String,
@@ -1645,12 +1646,21 @@ impl AdminRouterHandler {
     }
 
     pub fn with_rt(conf: ClusterConf, rt: Arc<Runtime>) -> FsResult<Self> {
+        Self::with_rt_and_sources(conf, ConfigSourceMap::new(), rt)
+    }
+
+    pub fn with_rt_and_sources(
+        conf: ClusterConf,
+        config_sources: ConfigSourceMap,
+        rt: Arc<Runtime>,
+    ) -> FsResult<Self> {
         let unified_fs = UnifiedFileSystem::with_rt(conf.clone(), rt.clone())?;
         let observability = Arc::new(ObservabilityService::new(conf.clone(), unified_fs.clone()));
         observability.start(rt.clone());
 
         Ok(Self {
             conf,
+            config_sources,
             unified_fs,
             rt,
             start_time: LocalTime::now_datetime(),
@@ -2140,7 +2150,10 @@ async fn master_failover_v1(
 async fn config_v1(
     Extension(instance): Extension<Arc<AdminRouterHandler>>,
 ) -> FsResult<Json<Value>> {
-    Ok(api_success(json!(instance.conf)))
+    Ok(api_success(json!({
+        "values": instance.conf,
+        "sources": instance.config_sources,
+    })))
 }
 
 fn add_cache_state_count(

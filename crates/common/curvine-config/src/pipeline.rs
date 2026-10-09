@@ -36,6 +36,8 @@
 
 use crate::ClusterConf;
 use curvine_core_error::{err_box, try_err, CommonResult};
+use serde::Serialize;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs::read_to_string;
 use std::path::PathBuf;
@@ -49,6 +51,20 @@ pub enum LoadProfile {
     /// Standalone transfer service: only client + transfer hostnames resolve.
     Transfer,
 }
+
+/// Effective source of a configuration value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigSource {
+    Default,
+    File,
+    Env,
+    Cli,
+}
+
+/// Dotted configuration paths mapped to the layer that supplied the effective
+/// value. Paths absent from the map use the type's built-in default.
+pub type ConfigSourceMap = BTreeMap<String, ConfigSource>;
 
 /// One allowlisted environment variable and the dotted config paths it feeds.
 #[derive(Debug, Clone, Copy)]
@@ -110,6 +126,14 @@ pub fn build_document(file_text: &str, overlays: &[toml::Value]) -> CommonResult
     build_document_with(file_text, overlays, &real_env_lookup)
 }
 
+/// Builds the effective document and the source map for each file/env leaf.
+pub fn build_document_with_sources(
+    file_text: &str,
+    overlays: &[toml::Value],
+) -> CommonResult<(toml::Value, ConfigSourceMap)> {
+    build_document_inner(file_text, overlays, LoadProfile::Full, &real_env_lookup)
+}
+
 /// [`build_document`] with an injected environment lookup (tests pass a map;
 /// production passes the real process environment).
 pub fn build_document_with(
@@ -117,12 +141,7 @@ pub fn build_document_with(
     overlays: &[toml::Value],
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> CommonResult<toml::Value> {
-    let mut doc: toml::Value = try_err!(toml::from_str(file_text));
-    for overlay in overlays {
-        deep_merge(&mut doc, overlay);
-    }
-    apply_env_layer_with(&mut doc, LoadProfile::Full, lookup)?;
-    Ok(doc)
+    Ok(build_document_inner(file_text, overlays, LoadProfile::Full, lookup)?.0)
 }
 
 /// [`build_document`] restricted to the transfer service's hostname scope.
@@ -133,18 +152,38 @@ pub fn build_transfer_document(
     build_transfer_document_with(file_text, overlays, &real_env_lookup)
 }
 
+/// [`build_transfer_document`] with the effective source map.
+pub fn build_transfer_document_with_sources(
+    file_text: &str,
+    overlays: &[toml::Value],
+) -> CommonResult<(toml::Value, ConfigSourceMap)> {
+    build_document_inner(file_text, overlays, LoadProfile::Transfer, &real_env_lookup)
+}
+
 /// [`build_transfer_document`] with an injected environment lookup.
 pub fn build_transfer_document_with(
     file_text: &str,
     overlays: &[toml::Value],
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> CommonResult<toml::Value> {
+    Ok(build_document_inner(file_text, overlays, LoadProfile::Transfer, lookup)?.0)
+}
+
+fn build_document_inner(
+    file_text: &str,
+    overlays: &[toml::Value],
+    profile: LoadProfile,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> CommonResult<(toml::Value, ConfigSourceMap)> {
     let mut doc: toml::Value = try_err!(toml::from_str(file_text));
+    let mut sources = ConfigSourceMap::new();
+    collect_file_sources(&doc, "", &mut sources);
     for overlay in overlays {
+        collect_file_sources(overlay, "", &mut sources);
         deep_merge(&mut doc, overlay);
     }
-    apply_env_layer_with(&mut doc, LoadProfile::Transfer, lookup)?;
-    Ok(doc)
+    sources.extend(apply_env_layer_with_sources(&mut doc, profile, lookup)?);
+    Ok((doc, sources))
 }
 
 /// Production environment lookup.
@@ -165,6 +204,15 @@ pub fn apply_env_layer_with(
     profile: LoadProfile,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> CommonResult<()> {
+    apply_env_layer_with_sources(doc, profile, lookup).map(|_| ())
+}
+
+fn apply_env_layer_with_sources(
+    doc: &mut toml::Value,
+    profile: LoadProfile,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> CommonResult<ConfigSourceMap> {
+    let mut sources = ConfigSourceMap::new();
     let scoped: Vec<&EnvOverride> = ENV_HOSTNAME_OVERRIDES
         .iter()
         .filter(|o| match profile {
@@ -226,8 +274,9 @@ pub fn apply_env_layer_with(
         }
         for path in touched {
             set_dotted(doc, path, toml::Value::String(ip.clone()))?;
+            sources.insert(path.to_string(), ConfigSource::File);
         }
-        return Ok(());
+        return Ok(sources);
     }
 
     for entry in scoped {
@@ -240,10 +289,11 @@ pub fn apply_env_layer_with(
             }
             for path in entry.paths {
                 set_dotted(doc, path, toml::Value::String(value.clone()))?;
+                sources.insert(path.to_string(), ConfigSource::Env);
             }
         }
     }
-    Ok(())
+    Ok(sources)
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +308,23 @@ pub fn doc_string(doc: &toml::Value, path: &[&str]) -> Option<String> {
         cur = cur.get(seg)?;
     }
     cur.as_str().map(str::to_string)
+}
+
+fn collect_file_sources(value: &toml::Value, parent: &str, sources: &mut ConfigSourceMap) {
+    if let Some(table) = value.as_table() {
+        for (key, child) in table {
+            let path = if parent.is_empty() {
+                key.clone()
+            } else {
+                format!("{parent}.{key}")
+            };
+            collect_file_sources(child, &path, sources);
+        }
+        return;
+    }
+    if !parent.is_empty() {
+        sources.insert(parent.to_string(), ConfigSource::File);
+    }
 }
 
 /// Sets a value at a dotted path, creating intermediate tables as needed.
@@ -503,6 +570,29 @@ mod tests {
         );
         // Unset vars leave file values untouched.
         assert!(doc.get("client").is_none());
+    }
+
+    #[test]
+    fn source_map_tracks_file_and_environment_leaves() {
+        let text = r#"
+            [master]
+            hostname = "file-master"
+
+            [client]
+            hostname = "file-client"
+            master_addrs = ["m1:8995", "m2:8995"]
+        "#;
+        let env = lookup(&[(ClusterConf::ENV_MASTER_HOSTNAME, "env-master")]);
+
+        let (_, sources) = build_document_inner(text, &[], LoadProfile::Full, &env).unwrap();
+
+        assert_eq!(sources.get("master.hostname"), Some(&ConfigSource::Env));
+        assert_eq!(sources.get("journal.hostname"), Some(&ConfigSource::Env));
+        assert_eq!(sources.get("client.hostname"), Some(&ConfigSource::File));
+        assert_eq!(
+            sources.get("client.master_addrs"),
+            Some(&ConfigSource::File)
+        );
     }
 
     // A whitespace-only hostname env var carries no value: the file hostname

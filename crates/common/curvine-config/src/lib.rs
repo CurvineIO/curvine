@@ -69,7 +69,7 @@ pub use self::ufs_conf::{UfsConf, UfsConfBuilder};
 
 /// Unified layered config-loading pipeline (file → env → cli).
 pub mod pipeline;
-pub use pipeline::{ConfigLoader, DiscoveredPath};
+pub use pipeline::{ConfigLoader, ConfigSource, ConfigSourceMap, DiscoveredPath};
 
 /// Unified validation framework (per-section validate + unknown-key audit).
 pub mod validation;
