@@ -310,7 +310,6 @@ fn control_plane_requests_use_the_async_handler() {
         RpcCode::ReportTask,
         RpcCode::GetFilesystemInfo,
         RpcCode::GetCvMetadataSnapshotPage,
-        RpcCode::GetCvMetadataDeltaPage,
     ] {
         let msg = Builder::new_rpc(code).build();
         assert!(

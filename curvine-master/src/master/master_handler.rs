@@ -577,42 +577,6 @@ impl MasterHandler {
         ctx.response(response)
     }
 
-    async fn async_get_cv_metadata_delta_page(
-        &self,
-        ctx: &mut RpcContext<'_>,
-    ) -> FsResult<Message> {
-        let req: GetCvMetadataDeltaPageRequest = ctx.parse_header()?;
-        ctx.set_audit(Some("cv-metadata-delta".to_string()), None);
-        let fs = self.fs.clone();
-        let response = Self::run_master_rpc_task(self.control_rpc_executor.clone(), move || {
-            let page = fs.cv_metadata_delta_page(
-                req.from_epoch,
-                req.target_epoch,
-                req.page_token,
-                req.page_size.unwrap_or(10_000) as usize,
-            )?;
-            Ok(GetCvMetadataDeltaPageResponse {
-                entries: page
-                    .entries
-                    .into_iter()
-                    .map(|entry| CvMetadataDeltaEntryProto {
-                        path: entry.path,
-                        entry: entry.entry.map(|entry| CvMetadataSnapshotEntryProto {
-                            status: ProtoUtils::file_status_to_pb(entry.status),
-                            blocks: entry.blocks.map(ProtoUtils::file_blocks_to_pb),
-                        }),
-                    })
-                    .collect(),
-                next_page_token: page.next_page_token,
-                from_epoch: page.from_epoch,
-                to_epoch: page.to_epoch,
-                full_snapshot_required: page.full_snapshot_required,
-            })
-        })
-        .await?;
-        ctx.response(response)
-    }
-
     fn process_get_filesystem_info(fs: MasterFilesystem) -> FsResult<FilesystemInfo> {
         fs.filesystem_info()
     }
@@ -1053,7 +1017,6 @@ impl MessageHandler for MasterHandler {
                 | RpcCode::ReportTask
                 | RpcCode::GetFilesystemInfo
                 | RpcCode::GetCvMetadataSnapshotPage
-                | RpcCode::GetCvMetadataDeltaPage
         )
     }
 
@@ -1167,7 +1130,6 @@ impl MessageHandler for MasterHandler {
                 RpcCode::GetCvMetadataSnapshotPage => {
                     self.async_get_cv_metadata_snapshot_page(ctx).await
                 }
-                RpcCode::GetCvMetadataDeltaPage => self.async_get_cv_metadata_delta_page(ctx).await,
 
                 v => err_box!("unsupported operation {:?}", v),
             }

@@ -29,7 +29,7 @@ use curvine_model::{
     FilesystemInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, RenameFlags,
     SetAttrOpts,
 };
-use curvine_proto::{GetCvMetadataDeltaPageResponse, GetCvMetadataSnapshotPageResponse};
+use curvine_proto::GetCvMetadataSnapshotPageResponse;
 use curvine_rpc::client::ClientConf;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use log::info;
@@ -211,18 +211,6 @@ impl CurvineFileSystem {
     ) -> FsResult<GetCvMetadataSnapshotPageResponse> {
         self.fs_client
             .get_cv_metadata_snapshot_page(page_token, page_size)
-            .await
-    }
-
-    pub async fn get_cv_metadata_delta_page(
-        &self,
-        from_epoch: u64,
-        target_epoch: Option<u64>,
-        page_token: Option<String>,
-        page_size: Option<u32>,
-    ) -> FsResult<GetCvMetadataDeltaPageResponse> {
-        self.fs_client
-            .get_cv_metadata_delta_page(from_epoch, target_epoch, page_token, page_size)
             .await
     }
 

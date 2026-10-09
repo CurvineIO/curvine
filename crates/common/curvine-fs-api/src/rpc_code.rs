@@ -50,7 +50,7 @@ pub enum RpcCode {
     Free = 26,
     ListOptions = 27,
     GetCvMetadataSnapshotPage = 28,
-    GetCvMetadataDeltaPage = 29,
+    // 29: retired (GetCvMetadataDeltaPage), do not reuse.
 
     // manager interface.
     Mount = 30,
