@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 /// Standalone curvine-web admin console configuration.
 ///
 /// This is intentionally separate from `master.web_port`, which belongs to the
-/// master process and exposes only Prometheus `/metrics`.
+/// master process and exposes Prometheus `/metrics` plus lightweight runtime
+/// metadata.
 ///
 /// Default port is 9000. New clusters should keep `web.port` at 9000 and
 /// `master.web_port` at 9010. Legacy configs that still set `[master] web_port = 9000`

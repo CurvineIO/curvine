@@ -191,6 +191,8 @@ impl Master {
         let retry_cache = FsRetryCache::with_conf(&conf.master)?;
         let metrics_fs = fs.clone();
         let runtime_config = Arc::new(build_master_runtime_registry(&conf));
+        let start_time_ms = LocalTime::mills();
+        let start_time = LocalTime::now_datetime();
         let service = MasterService::new(
             conf.clone(),
             fs,
@@ -211,10 +213,12 @@ impl Master {
             conf.master_metrics_conf(),
             metrics_fs,
             runtime_config,
+            start_time,
+            start_time_ms,
         );
 
         Ok(Self {
-            start_time: LocalTime::mills(),
+            start_time: start_time_ms,
             rpc_server: Some(rpc_server),
             metrics_server: Some(metrics_server),
             journal_system: Some(journal_system),

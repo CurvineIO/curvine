@@ -28,7 +28,7 @@ use curvine_rpc::server::ServerConf;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_web::router::{get_runtime_config, post_update_config, RuntimeConfigHttpResult};
 use log::{error, info};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
@@ -40,6 +40,13 @@ use crate::master::{Master, MasterState};
 struct MasterMetricsHandler {
     fs: MasterFilesystem,
     runtime_config: Arc<RuntimeConfigRegistry>,
+    runtime: MasterRuntimeMetadata,
+}
+
+#[derive(Clone)]
+struct MasterRuntimeMetadata {
+    start_time: String,
+    start_time_ms: u64,
 }
 
 async fn metrics(Extension(handler): Extension<Arc<MasterMetricsHandler>>) -> FsResult<String> {
@@ -57,6 +64,20 @@ async fn readyz(
     Extension(handler): Extension<Arc<MasterMetricsHandler>>,
 ) -> (StatusCode, &'static str) {
     ready_status(handler.fs.master_monitor.journal_state())
+}
+
+fn runtime_payload(runtime: &MasterRuntimeMetadata) -> Value {
+    let master_version = curvine_sys::version::component_version("master");
+    json!({
+        "version": master_version.release_version,
+        "version_commit": master_version.git_commit,
+        "start_time": runtime.start_time.as_str(),
+        "start_time_ms": runtime.start_time_ms,
+    })
+}
+
+async fn master_runtime(Extension(handler): Extension<Arc<MasterMetricsHandler>>) -> Json<Value> {
+    Json(runtime_payload(&handler.runtime))
 }
 
 /// Liveness semantics: once the journal role is known the master is serving, so
@@ -101,19 +122,22 @@ fn metrics_router(handler: MasterMetricsHandler) -> Router {
         .route("/metrics", get(metrics))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/api/v1/master/runtime", get(master_runtime))
         .route("/api/v1/master/runtime/config", get(runtime_config))
         .route("/api/update_config", post(update_runtime_config))
         .layer(Extension(Arc::new(handler)))
 }
 
-/// Minimal HTTP server exposing Prometheus `/metrics` and the `/healthz`
-/// (liveness) and `/readyz` (leader-only readiness) probe endpoints.
+/// Minimal HTTP server exposing Prometheus `/metrics`, the `/healthz`
+/// (liveness) and `/readyz` (leader-only readiness) probe endpoints, and
+/// runtime metadata used by curvine-web.
 pub struct MasterMetricsServer {
     rt: Arc<Runtime>,
     fs: MasterFilesystem,
     conf: ServerConf,
     address: InetAddr,
     runtime_config: Arc<RuntimeConfigRegistry>,
+    runtime: MasterRuntimeMetadata,
 }
 
 impl MasterMetricsServer {
@@ -122,6 +146,8 @@ impl MasterMetricsServer {
         conf: ServerConf,
         fs: MasterFilesystem,
         runtime_config: Arc<RuntimeConfigRegistry>,
+        start_time: String,
+        start_time_ms: u64,
     ) -> Self {
         let address = InetAddr::new(&conf.hostname, conf.port);
         Self {
@@ -130,6 +156,10 @@ impl MasterMetricsServer {
             conf,
             address,
             runtime_config,
+            runtime: MasterRuntimeMetadata {
+                start_time,
+                start_time_ms,
+            },
         }
     }
 
@@ -156,6 +186,7 @@ impl MasterMetricsServer {
                         listener,
                         self.fs,
                         self.runtime_config.clone(),
+                        self.runtime.clone(),
                         &self.conf,
                         &self.address,
                     )
@@ -192,6 +223,7 @@ impl MasterMetricsServer {
         listener: TcpListener,
         fs: MasterFilesystem,
         runtime_config: Arc<RuntimeConfigRegistry>,
+        runtime: MasterRuntimeMetadata,
         conf: &ServerConf,
         address: &InetAddr,
     ) -> CommonResult<()> {
@@ -199,7 +231,11 @@ impl MasterMetricsServer {
             "Master metrics server [{}] listening on {}",
             conf.name, address
         );
-        let app = metrics_router(MasterMetricsHandler { fs, runtime_config });
+        let app = metrics_router(MasterMetricsHandler {
+            fs,
+            runtime_config,
+            runtime,
+        });
         axum::serve(listener, app).await?;
         Ok(())
     }
@@ -210,6 +246,7 @@ impl MasterMetricsServer {
             listener,
             self.fs,
             self.runtime_config,
+            self.runtime,
             &self.conf,
             &self.address,
         )
@@ -297,5 +334,21 @@ mod tests {
             ready_with_role(RoleState::Exit).0,
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn runtime_payload_reports_master_version_and_start_time() {
+        let runtime = MasterRuntimeMetadata {
+            start_time: "2026-09-24 12:34:56.789".to_string(),
+            start_time_ms: 1_727_085_296_789,
+        };
+        let master_version = curvine_sys::version::component_version("master");
+
+        let payload = runtime_payload(&runtime);
+
+        assert_eq!(payload["version"], json!(master_version.release_version));
+        assert_eq!(payload["version_commit"], json!(master_version.git_commit));
+        assert_eq!(payload["start_time"], json!(runtime.start_time.as_str()));
+        assert_eq!(payload["start_time_ms"], json!(runtime.start_time_ms));
     }
 }
