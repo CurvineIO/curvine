@@ -1,11 +1,11 @@
 import { useCallback, useMemo, useState } from 'react'
 
 import { useApi } from '@/api/api-context'
-import type { ConfigValue } from '@/api/types'
+import type { ConfigSource, ConfigValue } from '@/api/types'
 import { ErrorAlert } from '@/components/data-state'
 import { MetricCard } from '@/components/metric-card'
 import { PageHeader } from '@/components/page-header'
-import { MonoText } from '@/components/resource-table'
+import { MonoText, StatusBadge, type StatusTone } from '@/components/resource-table'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import {
@@ -31,11 +31,21 @@ import { useRefreshSignal } from '@/refresh/refresh-context'
 import { useAsync } from '@/lib/use-async'
 
 const ALL_GROUPS = '__all__'
+const ALL_SOURCES = '__all__'
+const CONFIG_SOURCES: ConfigSource[] = ['default', 'file', 'env', 'cli']
 
 interface ConfigItem {
   key: string
   value: string
   multiline: boolean
+  source: ConfigSource
+}
+
+const SOURCE_TONES: Record<ConfigSource, StatusTone> = {
+  default: 'neutral',
+  file: 'info',
+  env: 'warning',
+  cli: 'positive'
 }
 
 function formatValue(value: ConfigValue): { value: string; multiline: boolean } {
@@ -64,16 +74,30 @@ function formatArrayItem(item: ConfigValue): string {
     .join(', ')
 }
 
-function flattenConfig(data: ConfigValue, parent = ''): ConfigItem[] {
+function configSourceFor(key: string, sources: Record<string, ConfigSource>): ConfigSource {
+  const source = sources[key]
+  return source === 'file' || source === 'env' || source === 'cli' ? source : 'default'
+}
+
+function flattenConfig(
+  data: ConfigValue,
+  sources: Record<string, ConfigSource>,
+  parent = ''
+): ConfigItem[] {
   const items: ConfigItem[] = []
   for (const key of Object.keys(data || {})) {
     const name = parent ? `${parent}.${key}` : key
     const value = (data as Record<string, ConfigValue>)[key]
     if (value && typeof value === 'object' && !Array.isArray(value)) {
-      items.push(...flattenConfig(value, name))
+      items.push(...flattenConfig(value, sources, name))
     } else {
       const formatted = formatValue(value)
-      items.push({ key: name, value: formatted.value, multiline: formatted.multiline })
+      items.push({
+        key: name,
+        value: formatted.value,
+        multiline: formatted.multiline,
+        source: configSourceFor(name, sources)
+      })
     }
   }
   return items
@@ -89,12 +113,16 @@ export function ConfigPage() {
 
   const [query, setQuery] = useState('')
   const [groupFilter, setGroupFilter] = useState(ALL_GROUPS)
+  const [sourceFilter, setSourceFilter] = useState(ALL_SOURCES)
 
   const load = useCallback(() => api.fetchConfigData(), [api])
   const { data, loading, error, reload } = useAsync(load, [load])
   useRefreshSignal(reload)
 
-  const configItems = useMemo(() => flattenConfig(data || {}), [data])
+  const configItems = useMemo(
+    () => flattenConfig(data?.values || {}, data?.sources || {}),
+    [data]
+  )
   const groups = useMemo(
     () => [...new Set(configItems.map((item) => groupOf(item.key)).filter(Boolean))].sort(),
     [configItems]
@@ -105,12 +133,15 @@ export function ConfigPage() {
     return configItems.filter(
       (item) =>
         (groupFilter === ALL_GROUPS || groupOf(item.key) === groupFilter) &&
+        (sourceFilter === ALL_SOURCES || item.source === sourceFilter) &&
         item.key.toLowerCase().includes(needle)
     )
-  }, [configItems, query, groupFilter])
+  }, [configItems, query, groupFilter, sourceFilter])
 
   const groupCount = (group: string) =>
     configItems.filter((item) => groupOf(item.key) === group).length
+  const sourceCount = (source: ConfigSource) =>
+    configItems.filter((item) => item.source === source).length
 
   const delta = (value: string) => translateDelta(t, value)
 
@@ -159,7 +190,7 @@ export function ConfigPage() {
           <p className="text-xs text-muted-foreground">{t('config.subtitle')}</p>
         </CardHeader>
         <CardContent className="flex flex-col gap-3">
-          <div className="grid gap-3 border-b border-border pb-3 md:grid-cols-[minmax(0,1fr)_minmax(0,20rem)]">
+          <div className="grid gap-3 border-b border-border pb-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,18rem)_minmax(0,14rem)]">
             <label className="flex flex-col gap-1.5">
               <span className="text-xs font-medium text-muted-foreground">
                 {t('config.searchLabel')}
@@ -193,6 +224,31 @@ export function ConfigPage() {
                 </SelectContent>
               </Select>
             </label>
+            <label className="flex flex-col gap-1.5">
+              <span className="text-xs font-medium text-muted-foreground">
+                {t('config.sourceLabel')}
+              </span>
+              <Select value={sourceFilter} onValueChange={setSourceFilter}>
+                <SelectTrigger className="w-full" data-testid="config-source">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value={ALL_SOURCES}>
+                      {t('config.allSources', { count: configItems.length })}
+                    </SelectItem>
+                    {CONFIG_SOURCES.map((source) => (
+                      <SelectItem key={source} value={source}>
+                        {t('config.sourceOption', {
+                          source: t(`config.sources.${source}`),
+                          count: sourceCount(source)
+                        })}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            </label>
           </div>
 
           {error && <ErrorAlert message={error} />}
@@ -212,7 +268,8 @@ export function ConfigPage() {
               <Table>
                 <TableHeader className="sticky top-0 z-10 bg-card">
                   <TableRow>
-                    <TableHead className="w-[38%]">{t('config.property')}</TableHead>
+                    <TableHead className="w-[34%]">{t('config.property')}</TableHead>
+                    <TableHead className="w-[12%] whitespace-nowrap">{t('config.source')}</TableHead>
                     <TableHead>{t('config.value')}</TableHead>
                   </TableRow>
                 </TableHeader>
@@ -221,6 +278,12 @@ export function ConfigPage() {
                     <TableRow key={item.key}>
                       <TableCell>
                         <MonoText>{item.key}</MonoText>
+                      </TableCell>
+                      <TableCell>
+                        <StatusBadge
+                          value={t(`config.sources.${item.source}`)}
+                          tone={SOURCE_TONES[item.source]}
+                        />
                       </TableCell>
                       <TableCell className="break-words">
                         {item.multiline ? (

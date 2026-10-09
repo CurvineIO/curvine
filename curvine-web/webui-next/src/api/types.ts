@@ -124,6 +124,13 @@ export interface WorkerDetailData {
 
 export type ConfigValue = string | number | boolean | null | ConfigValue[] | { [key: string]: ConfigValue }
 
+export type ConfigSource = 'default' | 'file' | 'env' | 'cli'
+
+export interface ConfigData {
+  values: ConfigValue
+  sources?: Record<string, ConfigSource>
+}
+
 export interface BrowseEntry {
   is_dir?: boolean
   name?: string | null

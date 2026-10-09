@@ -17,7 +17,17 @@ export default {
     groupLabel: 'Group',
     allGroups: 'All groups ({count})',
     groupOption: '{group} ({count})',
+    sourceLabel: 'Source',
+    allSources: 'All sources ({count})',
+    sourceOption: '{source} ({count})',
     property: 'Property',
+    source: 'Source',
+    sources: {
+      default: 'Default',
+      file: 'Config File',
+      env: 'Environment',
+      cli: 'CLI'
+    },
     value: 'Value',
     empty: 'No configuration matched.'
   }

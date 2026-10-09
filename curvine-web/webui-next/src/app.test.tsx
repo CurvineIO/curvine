@@ -92,7 +92,19 @@ function createStubClient(overrides: Partial<ApiClient> = {}): ApiClient {
       decommission_workers: [],
       lost_workers: []
     })),
-    fetchConfigData: vi.fn(async () => ({ master: { hostname: 'master-01' } })),
+    fetchConfigData: vi.fn(async () => ({
+      values: {
+        master: { hostname: 'master-01' },
+        worker: { hostname: 'worker-01' },
+        web: { port: 9000 },
+        log: { level: 'info' }
+      },
+      sources: {
+        'master.hostname': 'file',
+        'worker.hostname': 'env',
+        'web.port': 'cli'
+      }
+    })),
     fetchBrowseData: vi.fn(async () => ({ path: '/', items: [] })),
     fetchBlocksData: vi.fn(async () => ({})),
     downloadFile: vi.fn(async () => new Blob(['hello curvine'])),
@@ -290,6 +302,22 @@ describe('Console shell', () => {
 
     expect(await screen.findByText('master.hostname')).toBeInTheDocument()
     expect(screen.getByText('master-01')).toBeInTheDocument()
+    expect(screen.getByText('Config File')).toBeInTheDocument()
+    expect(screen.getByText('Environment')).toBeInTheDocument()
+    expect(screen.getByText('CLI')).toBeInTheDocument()
+    expect(screen.getByText('Default')).toBeInTheDocument()
+  })
+
+  it('filters config entries by source', async () => {
+    renderApp('/config', createStubClient())
+
+    await userEvent.click(await screen.findByTestId('config-source'))
+    await userEvent.click(await screen.findByRole('option', { name: 'Environment (1)' }))
+
+    expect(screen.getByText('worker.hostname')).toBeInTheDocument()
+    expect(screen.queryByText('master.hostname')).not.toBeInTheDocument()
+    expect(screen.queryByText('web.port')).not.toBeInTheDocument()
+    expect(screen.queryByText('log.level')).not.toBeInTheDocument()
   })
 
   it('renders the browse toolbar', async () => {

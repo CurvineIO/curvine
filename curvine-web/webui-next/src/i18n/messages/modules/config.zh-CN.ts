@@ -17,7 +17,17 @@ export default {
     groupLabel: '分组',
     allGroups: '全部分组（{count}）',
     groupOption: '{group}（{count}）',
+    sourceLabel: '来源',
+    allSources: '全部来源（{count}）',
+    sourceOption: '{source}（{count}）',
     property: '属性',
+    source: '来源',
+    sources: {
+      default: '默认值',
+      file: '配置文件',
+      env: '环境变量',
+      cli: 'CLI'
+    },
     value: '值',
     empty: '没有匹配的配置项。'
   }

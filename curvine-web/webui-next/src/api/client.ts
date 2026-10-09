@@ -11,7 +11,7 @@ import type {
   AuthSession,
   BlockLocationData,
   BrowseData,
-  ConfigValue,
+  ConfigData,
   DashboardQueryParams,
   DiagnosticsPayload,
   InstantMetric,
@@ -50,7 +50,7 @@ export interface ApiClient {
   fetchOverviewData(): Promise<OverviewData>
   fetchMasterHa(): Promise<MasterHaData>
   requestMasterFailover(targetMaster: string): Promise<unknown>
-  fetchConfigData(): Promise<ConfigValue>
+  fetchConfigData(): Promise<ConfigData>
 
   fetchBrowseData(query: Record<string, unknown>): Promise<BrowseData>
   fetchBlocksData(query: Record<string, unknown>): Promise<BlockLocationData>
@@ -148,7 +148,7 @@ export function createApiClient(options: HttpClientOptions = {}): ApiClient {
         data: { target_master: targetMaster },
         timeout: 180000
       }),
-    fetchConfigData: () => get<ConfigValue>('/v1/config'),
+    fetchConfigData: () => get<ConfigData>('/v1/config'),
 
     fetchBrowseData: (query) => get<BrowseData>('/v1/fs/list', { params: query }),
     fetchBlocksData: (query) => get<BlockLocationData>('/v1/fs/blocks', { params: query }),
