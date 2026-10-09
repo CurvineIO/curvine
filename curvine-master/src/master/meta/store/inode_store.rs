@@ -818,7 +818,7 @@ impl InodeStore {
             return Ok(vec![]);
         }
 
-        let mut out = vec![FileStatus::default(); list.len()];
+        let mut out: Vec<Option<FileStatus>> = vec![None; list.len()];
         let mut scan_inodes = Vec::with_capacity(list.len());
 
         for (index, inode) in list.iter().enumerate() {
@@ -826,12 +826,12 @@ impl InodeStore {
                 scan_inodes.push((index, RocksUtils::i64_to_bytes(inode.id())));
             } else {
                 let child_path = inp.child_path(inode.name());
-                out[index] = inode.to_file_status(&child_path)?;
+                out[index] = Some(inode.to_file_status(&child_path)?);
             }
         }
 
         if scan_inodes.is_empty() {
-            return Ok(out);
+            return Ok(out.into_iter().flatten().collect());
         }
 
         let keys = scan_inodes.iter().map(|x| &x.1);
@@ -863,17 +863,17 @@ impl InodeStore {
 
                 inode.change_name(file_entry.name().to_owned());
                 let child_path = inp.child_path(file_entry.name());
-                out[index] = inode.to_file_status(&child_path)?;
+                out[index] = Some(inode.to_file_status(&child_path)?);
             } else {
-                return err_box!(
-                    "batched_get_inodes: inode missing in store path {}, id {}",
+                log::warn!(
+                    "batched_get_inodes: inode missing in store path {}, id {}, skipping",
                     inp.child_path(file_entry.name()),
                     file_entry.id()
                 );
             }
         }
 
-        Ok(out)
+        Ok(out.into_iter().flatten().collect())
     }
 
     pub fn cf_hash(&self, cf: &str) -> CommonResult<u128> {
@@ -971,7 +971,9 @@ impl InodeStore {
 mod tests {
     use super::*;
     use crate::master::meta::inode::ttl::TtlBucketList;
-    use crate::master::meta::inode::{Inode, InodeDir, InodeFile, ROOT_INODE_ID};
+    use crate::master::meta::inode::{
+        Inode, InodeDir, InodeFile, InodePath, InodePtr, ROOT_INODE_ID,
+    };
     use crate::master::Master;
 
     fn new_store(name: &str) -> CommonResult<InodeStore> {
@@ -1101,6 +1103,41 @@ mod tests {
         let names: Vec<&str> = restored.children().into_iter().map(|c| c.name()).collect();
         // Only the real directory should be in the tree; both orphaned edges are skipped.
         assert_eq!(names, vec!["real-dir"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn batched_get_inodes_skips_missing_file_entry() -> CommonResult<()> {
+        let store = new_store("skip-missing-file-entry")?;
+        let good_file_id = 2001;
+        let missing_id = 9999;
+        let root = FsDir::create_root();
+        let good_file = InodeView::new_file(
+            "good.txt".to_string(),
+            InodeFile::new(good_file_id, ROOT_INODE_ID),
+        );
+
+        {
+            let mut batch = store.new_batch();
+            batch.write_inode(&root)?;
+            batch.write_inode(&good_file)?;
+            batch.add_child(ROOT_INODE_ID, "good.txt", good_file_id)?;
+            batch.commit()?;
+        }
+
+        let (_, mut root) = store.create_tree()?;
+        root.add_child(InodeView::new_entry("missing.txt".to_string(), missing_id))?;
+
+        let children: Vec<InodeView> = root.children().into_iter().cloned().collect();
+        let child_refs: Vec<&InodeView> = children.iter().collect();
+        let inp = InodePath::resolve(InodePtr::from_owned(root), "/", &store)?;
+
+        let result = store.batched_get_inodes(&inp, child_refs)?;
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "good.txt");
+        assert_eq!(result[0].id, good_file_id);
+        assert_eq!(result[0].path, "/good.txt");
 
         Ok(())
     }
