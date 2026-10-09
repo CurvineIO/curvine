@@ -1087,6 +1087,66 @@ fn ttl_executor_skips_non_empty_expired_directory() -> CommonResult<()> {
     Ok(())
 }
 
+// Directory TTL Free must still run when children are present. Free drops
+// cached blocks and leaves the child file in place.
+#[test]
+fn ttl_executor_frees_child_blocks_of_expired_directory() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "ttl-executor-free-dir");
+
+    let dir_opts = MkdirOptsBuilder::new()
+        .create_parent(true)
+        .ttl_ms(1)
+        .ttl_action(TtlAction::Free)
+        .build();
+    let dir = fs.mkdir_with_opts("/ttl/free-dir", dir_opts)?;
+
+    let client = ClientAddress::default();
+    let file_path = "/ttl/free-dir/file.log";
+    let status = fs.create_with_opts(
+        file_path,
+        CreateFileOptsBuilder::new()
+            .ttl_ms(3_600_000)
+            .ttl_action(TtlAction::Free)
+            .build(),
+        OpenFlags::new_create(),
+    )?;
+    let block = fs.add_block(file_path, None, client.clone(), vec![], vec![], 0, None)?;
+    fs.complete_file(
+        file_path,
+        None,
+        status.block_size,
+        vec![full_commit(&block, status.block_size)],
+        &client.client_name,
+        false,
+        None,
+    )?;
+    fs.set_attr(file_path, SetAttrOptsBuilder::new().ufs_mtime(1).build())?;
+    assert!(
+        !fs.get_block_locations(file_path)?.block_locs.is_empty(),
+        "child file should have blocks before directory TTL free"
+    );
+
+    std::thread::sleep(Duration::from_millis(10));
+    let executor = InodeTtlExecutor::with_managers(fs.clone());
+    let (processed, inode) = executor.execute_by_id(dir.id)?;
+    assert!(
+        processed,
+        "directory TTL Free should run while a child file is still present"
+    );
+    assert_eq!(inode.id(), dir.id);
+    assert!(
+        fs.file_status(file_path).is_ok(),
+        "child file must remain after directory TTL Free"
+    );
+    assert!(
+        fs.get_block_locations(file_path)?.block_locs.is_empty(),
+        "directory TTL Free should drop the child file's cached blocks"
+    );
+
+    Ok(())
+}
+
 // Regression: TTL path resolution must not re-acquire the fs_dir read lock while
 // already holding it. std::sync::RwLock is writer-preferring, so a reentrant read
 // deadlocks once a writer is queued. This reproduces the 2026-07-08 freeze shape:
