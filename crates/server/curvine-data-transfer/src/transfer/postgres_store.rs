@@ -34,9 +34,9 @@ use std::str::FromStr;
 use url::Url;
 
 use crate::transfer::{
-    ensure_task_transaction_bound, TransferMountSnapshotUpdate, TransferPlannedTasks,
-    TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate, MAX_JOBS_PER_STORE_TRANSACTION,
-    MAX_TASKS_PER_STORE_TRANSACTION,
+    ensure_task_transaction_bound, store_error_detail, TransferMountSnapshotUpdate,
+    TransferPlannedTasks, TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
+    MAX_JOBS_PER_STORE_TRANSACTION, MAX_TASKS_PER_STORE_TRANSACTION,
 };
 
 const TRANSFER_SCHEMA_VERSION: i64 = 1;
@@ -1151,9 +1151,10 @@ fn postgres_err(err: postgres::Error) -> FsError {
         ));
     }
     if postgres_error_is_unavailable(&err) {
-        FsError::transfer_store_unavailable(
-            "Transfer metadata store is unavailable; verify transfer.store_url and PostgreSQL connectivity",
-        )
+        FsError::transfer_store_unavailable(format!(
+            "Transfer metadata store is unavailable; verify transfer.store_url and PostgreSQL connectivity: {}",
+            store_error_detail(&err)
+        ))
     } else {
         let message = err.as_db_error().map_or_else(
             || err.to_string(),
@@ -1187,9 +1188,10 @@ fn is_postgres_connectivity_error(code: &SqlState) -> bool {
 
 fn postgres_pool_err(err: r2d2::Error) -> FsError {
     log::warn!("transfer PostgreSQL store connection pool failed: {}", err);
-    FsError::transfer_store_unavailable(
-        "Transfer metadata store is unavailable; verify transfer.store_url and PostgreSQL connectivity",
-    )
+    FsError::transfer_store_unavailable(format!(
+        "Transfer metadata store is unavailable; verify transfer.store_url and PostgreSQL connectivity: {}",
+        store_error_detail(&err)
+    ))
 }
 
 impl TransferStore for PostgresTransferStore {

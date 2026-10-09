@@ -1,3 +1,5 @@
+use std::error::Error;
+
 mod store;
 pub use self::store::*;
 
@@ -79,6 +81,23 @@ pub(crate) const RUNNING_TRANSFER_CHECK_INTERVAL_MS: i64 = 5_000;
 
 pub(crate) fn running_transfer_check_interval_ms(lease_ms: i64) -> i64 {
     RUNNING_TRANSFER_CHECK_INTERVAL_MS.min((lease_ms / 2).max(1))
+}
+
+/// Renders an error with its source chain.
+///
+/// Store backends report one stable "unavailable" message so callers can match
+/// on the error kind; the backend cause (driver error, SQL state, OS error) is
+/// appended here so that the failure reason survives into the client error and
+/// the startup log instead of only reaching the server log.
+pub(crate) fn store_error_detail(err: &(dyn Error + 'static)) -> String {
+    let mut detail = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        detail.push_str(": ");
+        detail.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    detail
 }
 
 mod handler;

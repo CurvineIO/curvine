@@ -28,9 +28,9 @@ use std::thread;
 use std::time::Duration;
 
 use crate::transfer::{
-    ensure_task_transaction_bound, TransferMountSnapshotUpdate, TransferPlannedTasks,
-    TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate, MAX_JOBS_PER_STORE_TRANSACTION,
-    MAX_TASKS_PER_STORE_TRANSACTION,
+    ensure_task_transaction_bound, store_error_detail, TransferMountSnapshotUpdate,
+    TransferPlannedTasks, TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
+    MAX_JOBS_PER_STORE_TRANSACTION, MAX_TASKS_PER_STORE_TRANSACTION,
 };
 
 const TRANSFER_SCHEMA_VERSION: u64 = 4;
@@ -2508,9 +2508,10 @@ fn json_err(_: serde_json::Error) -> FsError {
 
 fn mysql_err(err: mysql::Error) -> FsError {
     log::warn!("transfer MySQL store operation failed: {}", err);
-    FsError::transfer_store_unavailable(
-        "Transfer metadata store is unavailable; verify transfer.store_url and database connectivity",
-    )
+    FsError::transfer_store_unavailable(format!(
+        "Transfer metadata store is unavailable; verify transfer.store_url and database connectivity: {}",
+        store_error_detail(&err)
+    ))
 }
 
 fn mysql_error_code(err: &mysql::Error) -> Option<u16> {

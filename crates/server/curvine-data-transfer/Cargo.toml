@@ -87,3 +87,7 @@ required-features = ["transfer-store-postgres"]
 [[test]]
 name = "mysql_store_test"
 required-features = ["transfer-store-mysql"]
+
+[[test]]
+name = "sqlite_store_test"
+required-features = ["transfer-store-sqlite"]

@@ -31,9 +31,9 @@ use std::fs;
 use std::path::Path;
 
 use crate::transfer::{
-    ensure_task_transaction_bound, TransferMountSnapshotUpdate, TransferPlannedTasks,
-    TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate, MAX_JOBS_PER_STORE_TRANSACTION,
-    MAX_TASKS_PER_STORE_TRANSACTION,
+    ensure_task_transaction_bound, store_error_detail, TransferMountSnapshotUpdate,
+    TransferPlannedTasks, TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
+    MAX_JOBS_PER_STORE_TRANSACTION, MAX_TASKS_PER_STORE_TRANSACTION,
 };
 
 const TRANSFER_SCHEMA_VERSION: i64 = 5;
@@ -2400,7 +2400,8 @@ fn state_list(states: &[TransferState]) -> String {
 
 fn sqlite_err(err: rusqlite::Error) -> FsError {
     log::warn!("transfer SQLite store operation failed: {}", err);
-    FsError::transfer_store_unavailable(
-        "Transfer metadata store is unavailable; verify transfer.store_url and local disk health",
-    )
+    FsError::transfer_store_unavailable(format!(
+        "Transfer metadata store is unavailable; verify transfer.store_url and local disk health: {}",
+        store_error_detail(&err)
+    ))
 }

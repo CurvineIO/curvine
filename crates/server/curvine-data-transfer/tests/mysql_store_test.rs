@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use curvine_data_transfer::transfer::{MysqlTransferStore, TransferStore};
+use curvine_error::ErrorKind;
 use curvine_model::{TransferProgress, TransferTaskRecord, TransferTaskState};
 use mysql::prelude::Queryable;
 use mysql::{params, Opts, OptsBuilder, Pool};
@@ -153,4 +154,22 @@ fn mysql_store_does_not_backfill_historical_task_projections() {
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].source_path, task.source_path);
     assert_eq!(page[0].progress, task.progress);
+}
+
+#[test]
+fn mysql_store_unavailable_error_keeps_backend_detail() {
+    // Nothing listens on port 1, so the driver fails before any schema work and
+    // the reported error must carry that driver cause.
+    let err = match MysqlTransferStore::open("mysql://transfer@127.0.0.1:1/curvine_transfer") {
+        Ok(_) => panic!("an unreachable MySQL server must reject the store open"),
+        Err(err) => err,
+    };
+
+    assert!(matches!(err.kind(), ErrorKind::TransferStoreUnavailable));
+    let message = err.to_string();
+    assert!(message.contains("Transfer metadata store is unavailable"));
+    assert!(
+        message.contains("127.0.0.1:1"),
+        "the backend cause must stay in the message: {message}"
+    );
 }
