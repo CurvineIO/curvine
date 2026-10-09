@@ -237,6 +237,20 @@ impl FsDir {
         }
     }
 
+    fn mkdir_opts_for_intermediate_parent(
+        base: &MkdirOpts,
+        mount_table: &[MountInfo],
+        cv_path: &str,
+    ) -> MkdirOpts {
+        let mut opts = base.parent_opts();
+        if let Some(mount) = MountInfo::find_for_cv_path(mount_table, cv_path) {
+            if let Some(policy) = mount.intermediate_dir_storage_policy() {
+                opts.storage_policy = policy;
+            }
+        }
+        opts
+    }
+
     // Create all previous directories that may be missing on the path.
     fn create_parent_dir(&mut self, mut inp: InodePath, opts: MkdirOpts) -> FsResult<InodePath> {
         let mut index = inp.existing_len();
@@ -246,8 +260,13 @@ impl FsDir {
             return Ok(inp);
         }
 
+        let mount_table = self.get_mount_table()?;
+
         while index <= inp.len() - 2 {
-            inp = self.create_single_dir(inp, opts.clone())?;
+            let cv_path = inp.get_path(inp.existing_len() + 1);
+            let parent_opts =
+                Self::mkdir_opts_for_intermediate_parent(&opts, &mount_table, &cv_path);
+            inp = self.create_single_dir(inp, parent_opts)?;
             index += 1;
         }
 

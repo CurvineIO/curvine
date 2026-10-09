@@ -306,6 +306,39 @@ impl MountInfo {
         }
     }
 
+    /// Whether `cv_path` is a strict child of `mount_cv_path` (the mount point
+    /// inode itself is excluded).
+    pub fn cv_path_is_under_mount(cv_path: &str, mount_cv_path: &str) -> bool {
+        if mount_cv_path == "/" {
+            return cv_path != "/";
+        }
+        let Some(rest) = cv_path.strip_prefix(mount_cv_path) else {
+            return false;
+        };
+        rest.starts_with('/')
+    }
+
+    /// Longest-prefix mount whose CV path strictly contains `cv_path`.
+    pub fn find_for_cv_path<'a>(mounts: &'a [MountInfo], cv_path: &str) -> Option<&'a MountInfo> {
+        mounts
+            .iter()
+            .filter(|m| Self::cv_path_is_under_mount(cv_path, &m.cv_path))
+            .max_by_key(|m| m.cv_path.len())
+    }
+
+    /// Storage policy for `create_parent` intermediate directories under this mount.
+    pub fn intermediate_dir_storage_policy(&self) -> Option<StoragePolicy> {
+        if self.ttl_ms <= 0 || self.ttl_action == TtlAction::None {
+            return None;
+        }
+        Some(StoragePolicy {
+            ttl_ms: self.ttl_ms,
+            ttl_action: self.ttl_action,
+            storage_type: self.storage_type.unwrap_or_default(),
+            ..Default::default()
+        })
+    }
+
     pub fn get_ufs_path<P: CurvinePath>(&self, path: &P) -> CommonResult<P> {
         if !path.is_cv() {
             return err_box!("path {} is not cv path", path);
@@ -951,6 +984,37 @@ mod tests {
         let to_ufs = info.get_ufs_path(&original_cv).unwrap();
         let back_to_cv = info.get_cv_path(&to_ufs).unwrap();
         assert_eq!(original_cv.full_path(), back_to_cv.full_path());
+    }
+
+    #[test]
+    fn cv_path_is_under_mount_rejects_prefix_false_positives() {
+        assert!(MountInfo::cv_path_is_under_mount(
+            "/mnt/data/hour=12",
+            "/mnt/data"
+        ));
+        assert!(!MountInfo::cv_path_is_under_mount("/mnt/data", "/mnt/data"));
+        assert!(!MountInfo::cv_path_is_under_mount(
+            "/mnt/data-backup/x",
+            "/mnt/data"
+        ));
+    }
+
+    #[test]
+    fn find_for_cv_path_picks_longest_mount_prefix() {
+        let mounts = vec![
+            MountInfo {
+                cv_path: "/mnt".to_string(),
+                mount_id: 1,
+                ..Default::default()
+            },
+            MountInfo {
+                cv_path: "/mnt/hive".to_string(),
+                mount_id: 2,
+                ..Default::default()
+            },
+        ];
+        let found = MountInfo::find_for_cv_path(&mounts, "/mnt/hive/dayno=1").unwrap();
+        assert_eq!(found.mount_id, 2);
     }
 
     #[test]

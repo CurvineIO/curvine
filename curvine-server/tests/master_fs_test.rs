@@ -20,9 +20,10 @@ use curvine_fs_api::{CurvineURI, Path};
 use curvine_model::MountOptions;
 use curvine_model::ProtoUtils;
 use curvine_model::{
-    BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
-    CreateFileOpts, CreateFileOptsBuilder, DeleteResult, FileAllocOpts, LocatedBlock,
-    MkdirOptsBuilder, StorageType, TtlAction, WorkerAddress, WorkerInfo,
+    AccessMode, BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress,
+    CommitBlock, CreateFileOpts, CreateFileOptsBuilder, DeleteResult, FileAllocOpts, LocatedBlock,
+    MkdirOpts, MkdirOptsBuilder, MountInfo, Provider, StorageType, TtlAction, TtlType,
+    WorkerAddress, WorkerInfo, WriteType,
 };
 use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
@@ -47,6 +48,7 @@ use curvine_server::master::replication::master_replication_manager::MasterRepli
 use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
 use prost::Message as ProtoMessage;
 use raft::eraftpb::Entry;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -860,6 +862,92 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+
+    Ok(())
+}
+
+fn test_mount_info(mount_path: &str, ttl_ms: i64) -> MountInfo {
+    MountInfo {
+        cv_path: mount_path.to_string(),
+        ufs_path: format!("s3://bucket{mount_path}"),
+        mount_id: 1,
+        properties: HashMap::new(),
+        ttl_ms,
+        ttl_action: TtlAction::Delete,
+        read_verify_ufs: false,
+        storage_type: None,
+        block_size: None,
+        replicas: None,
+        write_type: WriteType::CacheMode,
+        provider: Some(Provider::Auto),
+        auto_cache: false,
+        access_mode: AccessMode::ReadOnly,
+        write_cache: false,
+        ttl_type: TtlType::Mtime,
+    }
+}
+
+#[test]
+fn create_parent_intermediate_dir_inherits_mount_ttl() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "create-parent-mount-ttl");
+    let mount_path = "/mnt/hive";
+    let mount_ttl_ms = 86_400_000_i64;
+    let leaf_ttl_ms = 3_600_000_i64;
+
+    fs.mkdir_with_opts(mount_path, MkdirOpts::with_create(true))?;
+    fs.fs_dir()
+        .write()
+        .unprotected_store_mount(test_mount_info(mount_path, mount_ttl_ms))?;
+
+    let opts = CreateFileOptsBuilder::new()
+        .create_parent(true)
+        .ttl_ms(leaf_ttl_ms)
+        .ttl_action(TtlAction::Delete)
+        .build();
+    fs.create_with_opts(
+        "/mnt/hive/dayno=20260920/hour=12/region=CN/file.parquet",
+        opts,
+        OpenFlags::new_create().set_overwrite(true),
+    )?;
+
+    let hour = fs.file_status("/mnt/hive/dayno=20260920/hour=12")?;
+    assert_eq!(hour.storage_policy.ttl_ms, mount_ttl_ms);
+    assert_eq!(hour.storage_policy.ttl_action, TtlAction::Delete);
+
+    let region = fs.file_status("/mnt/hive/dayno=20260920/hour=12/region=CN")?;
+    assert_eq!(region.storage_policy.ttl_ms, mount_ttl_ms);
+
+    let file = fs.file_status("/mnt/hive/dayno=20260920/hour=12/region=CN/file.parquet")?;
+    assert_eq!(file.storage_policy.ttl_ms, leaf_ttl_ms);
+
+    let off_mount = CreateFileOptsBuilder::new()
+        .create_parent(true)
+        .ttl_ms(leaf_ttl_ms)
+        .ttl_action(TtlAction::Delete)
+        .build();
+    fs.create_with_opts(
+        "/warehouse/a/b/file.txt",
+        off_mount,
+        OpenFlags::new_create().set_overwrite(true),
+    )?;
+    let mid = fs.file_status("/warehouse/a")?;
+    assert_eq!(mid.storage_policy.ttl_ms, 0);
+    assert_eq!(mid.storage_policy.ttl_action, TtlAction::None);
+
+    let dir_opts = MkdirOptsBuilder::new()
+        .create_parent(true)
+        .ttl_ms(leaf_ttl_ms)
+        .ttl_action(TtlAction::Delete)
+        .build();
+    fs.mkdir_with_opts(
+        "/mnt/hive/dayno=20260921/hour=12/brand=REALME/region=CN",
+        dir_opts,
+    )?;
+    let mkdir_hour = fs.file_status("/mnt/hive/dayno=20260921/hour=12")?;
+    assert_eq!(mkdir_hour.storage_policy.ttl_ms, mount_ttl_ms);
+    let mkdir_region = fs.file_status("/mnt/hive/dayno=20260921/hour=12/brand=REALME/region=CN")?;
+    assert_eq!(mkdir_region.storage_policy.ttl_ms, leaf_ttl_ms);
 
     Ok(())
 }
