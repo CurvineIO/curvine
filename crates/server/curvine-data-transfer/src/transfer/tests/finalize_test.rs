@@ -25,7 +25,7 @@ use curvine_model::{
     TransferTaskRecord, TransferTaskState, WorkerAddress,
 };
 
-use super::scheduler::{commit_block_for, converged_segment_targets, reported_block_locations};
+use super::dispatch::{commit_block_for, converged_segment_targets, reported_block_locations};
 
 fn segment_plan(mtime: i64) -> String {
     serde_json::json!({

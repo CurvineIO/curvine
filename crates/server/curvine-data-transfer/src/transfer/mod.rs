@@ -38,8 +38,9 @@ mod job_snapshot;
 pub(crate) use self::job_snapshot::job_mount_snapshot_with_version_async;
 pub use self::job_snapshot::{job_mount_snapshot, job_mount_snapshot_async};
 
-mod planner;
-pub use self::planner::{
+mod dispatch;
+mod plan;
+pub use self::plan::{
     plan_segment_groups, segment_offsets, PlannedTransfer, TransferPlanner, SEGMENT_BYTES,
 };
 
@@ -82,8 +83,7 @@ mod service_test;
 #[path = "tests/planning_lease_test.rs"]
 mod planning_lease_test;
 
-mod scheduler;
-pub use self::scheduler::TransferScheduler;
+pub use self::dispatch::TransferScheduler;
 
 // Running jobs only need scheduler attention for task state changes or lease renewal.
 pub(crate) const RUNNING_TRANSFER_CHECK_INTERVAL_MS: i64 = 5_000;

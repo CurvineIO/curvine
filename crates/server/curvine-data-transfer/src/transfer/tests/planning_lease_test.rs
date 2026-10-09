@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::scheduler::{await_with_lease_renewal, lease_renew_interval};
+use super::dispatch::{await_with_lease_renewal, lease_renew_interval};
 
 #[test]
 fn planning_lease_renews_halfway_through_its_timeout() {

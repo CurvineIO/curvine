@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::scheduler::terminal_snapshot_progress;
+use super::dispatch::terminal_snapshot_progress;
 use super::service::resolve_terminal_summary;
 use curvine_model::{
     TransferJobRecord, TransferKind, TransferProgress, TransferState, TransferTaskCounts,

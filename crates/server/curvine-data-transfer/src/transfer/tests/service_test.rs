@@ -231,7 +231,7 @@ fn flush_job_progress_message_updates_message_without_touching_progress() {
 
 #[test]
 fn dispatch_result_message_prefers_capacity_reasons() {
-    use crate::transfer::scheduler::dispatch_result_message;
+    use crate::transfer::dispatch::dispatch_result_message;
 
     // Blocked tasks must win over a bare "dispatched 0 tasks": the Message
     // column has to explain WHY tasks stay Pending.

@@ -19,7 +19,7 @@ use curvine_model::{
     WorkerAddress,
 };
 
-use super::planner::{
+use super::plan::{
     load_job_info, load_replica_mismatch, needs_source_status_refresh, unchanged_load_target,
 };
 
@@ -105,7 +105,7 @@ fn incomplete_or_cv_missing_target_is_not_skipped() {
 
 #[test]
 fn shell_cache_with_empty_block_locations_is_not_readable() {
-    use super::planner::located_blocks_readable;
+    use super::plan::located_blocks_readable;
 
     // No data blocks: nothing to lose (empty file).
     assert!(located_blocks_readable(&[]));
@@ -154,7 +154,7 @@ fn equal_size_timestamp_mismatch_refreshes_source_status_before_planning() {
 
 #[test]
 fn batch_flush_triggers_on_file_count_threshold() {
-    use super::planner::{batch_should_flush, BATCH_MAX_FILES};
+    use super::plan::{batch_should_flush, BATCH_MAX_FILES};
     // Flush exactly at the file-count boundary, not before.
     assert!(!batch_should_flush(BATCH_MAX_FILES - 1, 0));
     assert!(batch_should_flush(BATCH_MAX_FILES, 0));
@@ -162,21 +162,21 @@ fn batch_flush_triggers_on_file_count_threshold() {
 
 #[test]
 fn batch_flush_triggers_on_byte_threshold() {
-    use super::planner::{batch_should_flush, BATCH_TARGET_BYTES};
+    use super::plan::{batch_should_flush, BATCH_TARGET_BYTES};
     assert!(!batch_should_flush(1, BATCH_TARGET_BYTES - 1));
     assert!(batch_should_flush(1, BATCH_TARGET_BYTES));
 }
 
 #[test]
 fn batch_flush_disabled_for_zero_bytes_with_few_files() {
-    use super::planner::batch_should_flush;
+    use super::plan::batch_should_flush;
     assert!(!batch_should_flush(0, 0));
     assert!(!batch_should_flush(1, 1));
 }
 
 #[test]
 fn segment_offsets_cover_exact_block_multiple() {
-    use super::planner::{segment_offsets, SEGMENT_BYTES};
+    use super::plan::{segment_offsets, SEGMENT_BYTES};
     // 2.5 blocks -> 3 segments, last is the remainder (default block = SEGMENT_BYTES).
     let ranges = segment_offsets(SEGMENT_BYTES * 2 + SEGMENT_BYTES / 2, SEGMENT_BYTES);
     assert_eq!(ranges.len(), 3);
@@ -187,7 +187,7 @@ fn segment_offsets_cover_exact_block_multiple() {
 
 #[test]
 fn segment_offsets_align_to_smaller_block_size() {
-    use super::planner::{segment_offsets, SEGMENT_BYTES};
+    use super::plan::{segment_offsets, SEGMENT_BYTES};
     let block = SEGMENT_BYTES / 2;
     let len = block * 3 + block / 2;
     let ranges = segment_offsets(len, block);
@@ -200,7 +200,7 @@ fn segment_offsets_align_to_smaller_block_size() {
 
 #[test]
 fn segment_offsets_large_block_maps_one_segment_per_block() {
-    use super::planner::{segment_offsets, SEGMENT_BYTES};
+    use super::plan::{segment_offsets, SEGMENT_BYTES};
     let block = SEGMENT_BYTES * 8;
     let ranges = segment_offsets(block * 2 + block / 2, block);
     assert_eq!(ranges.len(), 3);
@@ -218,7 +218,7 @@ fn segment_offsets_large_block_maps_one_segment_per_block() {
 
 #[test]
 fn segment_offsets_tiny_block_stays_per_block() {
-    use super::planner::segment_offsets;
+    use super::plan::segment_offsets;
     let block = 4 * 1024 * 1024;
     let ranges = segment_offsets(block * 3, block);
     assert_eq!(ranges.len(), 3);
@@ -228,7 +228,7 @@ fn segment_offsets_tiny_block_stays_per_block() {
 
 #[test]
 fn group_partition_keeps_small_files_per_segment() {
-    use super::planner::{plan_segment_groups, SEGMENT_BYTES};
+    use super::plan::{plan_segment_groups, SEGMENT_BYTES};
     let groups = plan_segment_groups(
         SEGMENT_BYTES * 8,
         SEGMENT_BYTES,
@@ -248,7 +248,7 @@ fn group_partition_keeps_small_files_per_segment() {
 
 #[test]
 fn group_partition_matches_design_targets() {
-    use super::planner::{plan_segment_groups, SEGMENT_BYTES};
+    use super::plan::{plan_segment_groups, SEGMENT_BYTES};
     let gb = 1024 * 1024 * 1024;
     let groups_100g = plan_segment_groups(100 * gb, SEGMENT_BYTES, 84, 100 * gb, 0, String::new());
     assert_eq!(groups_100g.len(), 84);
@@ -268,7 +268,7 @@ fn group_partition_matches_design_targets() {
 
 #[test]
 fn group_partition_is_contiguous_and_covers_the_file() {
-    use super::planner::{plan_segment_groups, SEGMENT_BYTES};
+    use super::plan::{plan_segment_groups, SEGMENT_BYTES};
     let len = SEGMENT_BYTES * 100 + 12345;
     let groups = plan_segment_groups(len, SEGMENT_BYTES, 4, len, 0, String::new());
     let mut next = 0i64;
@@ -285,7 +285,7 @@ fn group_partition_is_contiguous_and_covers_the_file() {
 
 #[test]
 fn group_partition_caps_bytes_with_large_blocks() {
-    use super::planner::plan_segment_groups;
+    use super::plan::plan_segment_groups;
     let gb = 1024 * 1024 * 1024;
     let groups = plan_segment_groups(100 * gb, gb, 84, 100 * gb, 0, String::new());
     assert_eq!(groups.len(), 84);
@@ -296,7 +296,7 @@ fn group_partition_caps_bytes_with_large_blocks() {
 
 #[test]
 fn group_partition_derives_count_from_live_workers_and_budget() {
-    use super::planner::{plan_segment_groups, SEGMENT_BYTES, SEGMENT_GROUP_TARGET_BYTES};
+    use super::plan::{plan_segment_groups, SEGMENT_BYTES, SEGMENT_GROUP_TARGET_BYTES};
     let groups = plan_segment_groups(
         SEGMENT_BYTES * 100,
         SEGMENT_BYTES,
@@ -313,7 +313,7 @@ fn group_partition_derives_count_from_live_workers_and_budget() {
 
 #[test]
 fn group_planning_requires_a_nonempty_all_capable_worker_view() {
-    use super::planner::supports_segment_grouping;
+    use super::plan::supports_segment_grouping;
     use curvine_model::{TransferWorkerCapabilities, WorkerInfo};
 
     fn capable() -> WorkerInfo {
@@ -333,7 +333,7 @@ fn group_planning_requires_a_nonempty_all_capable_worker_view() {
 
 #[test]
 fn group_identity_accepts_a_version_or_a_complete_head_stat_pair() {
-    use super::planner::has_group_identity;
+    use super::plan::has_group_identity;
 
     // Immutable version: identity regardless of the stat pair.
     assert!(has_group_identity("etag", Some((10, 20))));
@@ -348,12 +348,12 @@ fn group_identity_accepts_a_version_or_a_complete_head_stat_pair() {
 
 #[test]
 fn group_partition_empty_file_has_no_groups() {
-    use super::planner::{plan_segment_groups, SEGMENT_BYTES};
+    use super::plan::{plan_segment_groups, SEGMENT_BYTES};
     assert!(plan_segment_groups(0, SEGMENT_BYTES, 84, 0, 0, String::new()).is_empty());
 }
 #[test]
 fn group_manifest_carries_source_version() {
-    use super::planner::{plan_segment_groups, SEGMENT_BYTES};
+    use super::plan::{plan_segment_groups, SEGMENT_BYTES};
     let gb = 1024 * 1024 * 1024;
     let groups = plan_segment_groups(
         100 * gb,
@@ -376,7 +376,7 @@ fn group_manifest_carries_source_version() {
 
 #[test]
 fn singleton_group_emits_legacy_segment_plan() {
-    use super::planner::{build_group_plan_json, plan_segment_groups, SEGMENT_BYTES};
+    use super::plan::{build_group_plan_json, plan_segment_groups, SEGMENT_BYTES};
     use curvine_model::{classify_transfer_plan, TransferPlanKind};
     let groups = plan_segment_groups(
         SEGMENT_BYTES * 2,
@@ -408,7 +408,7 @@ fn singleton_group_emits_legacy_segment_plan() {
 
 #[test]
 fn segment_offsets_contiguous_and_cover_whole_file() {
-    use super::planner::{segment_offsets, SEGMENT_BYTES};
+    use super::plan::{segment_offsets, SEGMENT_BYTES};
     let len = SEGMENT_BYTES * 3 + 12345;
     let ranges = segment_offsets(len, SEGMENT_BYTES);
     // Contiguous and total == file length.
@@ -426,7 +426,7 @@ fn segment_offsets_contiguous_and_cover_whole_file() {
 
 #[test]
 fn segment_offsets_small_file_is_single_segment() {
-    use super::planner::{segment_offsets, SEGMENT_BYTES};
+    use super::plan::{segment_offsets, SEGMENT_BYTES};
     assert_eq!(
         segment_offsets(SEGMENT_BYTES - 1, SEGMENT_BYTES),
         vec![(0, SEGMENT_BYTES - 1)]
@@ -440,7 +440,7 @@ fn segment_offsets_small_file_is_single_segment() {
 
 #[test]
 fn non_splittable_compressed_suffixes_are_recognized() {
-    use super::planner::is_non_splittable;
+    use super::plan::is_non_splittable;
     assert!(is_non_splittable("data.gz"));
     assert!(is_non_splittable("DATA.GZ"));
     assert!(is_non_splittable("archive.zip"));
@@ -506,7 +506,7 @@ fn load_replicas_override_mount_and_service_defaults() {
 
 #[test]
 fn group_row_reduction_projection_matches_nightly_load() {
-    use super::planner::{plan_segment_groups, segment_offsets, SEGMENT_BYTES};
+    use super::plan::{plan_segment_groups, segment_offsets, SEGMENT_BYTES};
     use std::time::Instant;
     let gb = 1024 * 1024 * 1024;
     let cases = [

@@ -27,7 +27,7 @@ use curvine_rpc::message::MessageBuilder;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::scheduler::stale_retry_exhausted_message;
+use super::dispatch::stale_retry_exhausted_message;
 #[cfg(feature = "transfer-store-sqlite")]
 use super::SqliteTransferStore;
 use super::{
