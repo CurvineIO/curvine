@@ -40,6 +40,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub struct BlockClient {
+    replication_token: Option<(i64, String)>,
     client: Option<RpcClient>,
     client_name: String,
     timeout: Duration,
@@ -56,6 +57,7 @@ pub struct BlockClient {
 impl BlockClient {
     pub fn new(client: RpcClient, worker_addr: WorkerAddress, context: &FsContext) -> Self {
         Self {
+            replication_token: None,
             client: Some(client),
             client_name: context.clone_client_name(),
             timeout: Duration::from_millis(context.conf.client.data_timeout_ms),
@@ -99,7 +101,26 @@ impl BlockClient {
             .is_some_and(|client| client.is_active())
     }
 
-    pub async fn rpc(&self, msg: Message) -> FsResult<Message> {
+    pub fn with_replication_token(mut self, block_id: i64, token: String) -> Self {
+        self.replication_token = Some((block_id, token));
+        self
+    }
+
+    pub async fn rpc(&self, mut msg: Message) -> FsResult<Message> {
+        if let Some((block_id, token)) = &self.replication_token {
+            if RpcCode::from(msg.code()) == RpcCode::WriteBlock {
+                let envelope = curvine_proto::ReplicationWriteRequest {
+                    block_id: *block_id,
+                    token: token.clone(),
+                    header: msg.header.take().map(|h| h.to_vec()).unwrap_or_default(),
+                };
+                msg.protocol.code = RpcCode::WriteReplicationBlock.into();
+                msg = Builder::protocol(msg.protocol)
+                    .proto_header(envelope)
+                    .data(msg.data)
+                    .build();
+            }
+        }
         let client = try_option_ref!(self.client);
         let rep_msg = match client.timeout_rpc(self.timeout, msg).await {
             Ok(rep_msg) => rep_msg,
@@ -460,6 +481,7 @@ impl Drop for BlockClient {
         if let Some(pool) = self.pool.take() {
             if let Some(moved_client) = self.client.take() {
                 let client = BlockClient {
+                    replication_token: None,
                     client: Some(moved_client),
                     client_name: std::mem::take(&mut self.client_name),
                     timeout: self.timeout,

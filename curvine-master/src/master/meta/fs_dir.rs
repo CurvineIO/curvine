@@ -69,6 +69,12 @@ impl CacheInvalidationResult {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ReplicationBlockState {
+    pub replicas: u8,
+    pub locations: Vec<BlockLocation>,
+}
+
 impl FsDir {
     pub fn new(
         conf: &ClusterConf,
@@ -844,6 +850,53 @@ impl FsDir {
 
     pub fn get_block_locations(&self, block_id: i64) -> FsResult<Vec<BlockLocation>> {
         Ok(self.store.get_block_locations(block_id)?)
+    }
+
+    /// Returns replication state only when the block still belongs to the current file version.
+    pub(crate) fn replication_block_state(
+        &self,
+        block_id: i64,
+    ) -> FsResult<Option<ReplicationBlockState>> {
+        let inode_id = InodeId::get_id(block_id);
+        let Some(File(file)) = self.store.get_inode(inode_id, None)? else {
+            return Ok(None);
+        };
+        if !file.blocks.iter().any(|block| block.id == block_id) {
+            return Ok(None);
+        }
+        Ok(Some(ReplicationBlockState {
+            replicas: file.replicas,
+            locations: self.store.get_block_locations(block_id)?,
+        }))
+    }
+
+    /// Adds a replication result only if the block is still current and still needs a replica.
+    /// The caller holds the filesystem write lock, so validation and insertion are atomic with
+    /// respect to overwrite and deletion.
+    pub(crate) fn add_replication_location_if_needed(
+        &mut self,
+        block_id: i64,
+        location: BlockLocation,
+    ) -> FsResult<bool> {
+        let inode_id = InodeId::get_id(block_id);
+        let Some(File(file)) = self.store.get_inode(inode_id, None)? else {
+            return Ok(false);
+        };
+        if !file.blocks.iter().any(|block| block.id == block_id) {
+            return Ok(false);
+        }
+
+        let locations = self.store.get_block_locations(block_id)?;
+        if locations
+            .iter()
+            .any(|current| current.worker_id == location.worker_id)
+            || locations.len() >= file.replicas as usize
+        {
+            return Ok(false);
+        }
+
+        self.store.add_block_location(block_id, location)?;
+        Ok(true)
     }
 
     pub fn reopen_file(

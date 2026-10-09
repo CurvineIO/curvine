@@ -6,11 +6,17 @@ import "common.proto";
 message SubmitBlockReplicationRequest {
     required int64 block_id = 1;
     required WorkerAddressProto target_worker_info = 2;
+    // Unique execution attempt. Optional for rolling compatibility.
+    optional string attempt_id = 3;
+    optional string target_token = 4;
+    optional uint64 job_timeout_ms = 5;
 }
 
 message SubmitBlockReplicationResponse {
     required bool success = 1;
     optional string message = 2;
+    // Echoed when the worker supports attempt-aware replication.
+    optional string attempt_id = 3;
 }
 
 message ReportBlockReplicationRequest {
@@ -18,9 +24,37 @@ message ReportBlockReplicationRequest {
     required StorageTypeProto storage_type = 2;
     required bool success =  3;
     optional string message = 4;
+    // Echoed from SubmitBlockReplicationRequest.
+    optional string attempt_id = 5;
 }
 
 message ReportBlockReplicationResponse {
     required bool success = 1;
     optional string message = 2;
+}
+
+// Separate RPC codes make fencing fail closed on older Workers. A destination issues the
+// opaque token; neither a delayed prepare nor a restarted Master can recreate a retired token.
+message PrepareReplicationRequest {
+    required int64 block_id = 1;
+    required string attempt_id = 2;
+    required string target_session_id = 3;
+    required uint64 lifetime_ms = 4;
+}
+message PrepareReplicationResponse { required string token = 1; }
+message ReconcileReplicationRequest {
+    required bool release = 4; // Master metadata is durable; discard completion evidence.
+    required int64 block_id = 1;
+    required string attempt_id = 2;
+    required string target_session_id = 3;
+}
+message ReconcileReplicationResponse {
+    // Presence means this attempt committed. Absence means it is fenced and may be retried.
+    optional StorageTypeProto storage_type = 1;
+}
+message ReplicationWriteRequest {
+    required int64 block_id = 1;
+    required string token = 2;
+    // Original WriteBlock header. Payload data is not copied into this envelope.
+    required bytes header = 3;
 }

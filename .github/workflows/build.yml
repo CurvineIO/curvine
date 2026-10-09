@@ -126,6 +126,12 @@ jobs:
           echo "After etcd service discovery tests, disk usage:"
           df -h
 
+      - name: Replication lifecycle regression tests
+        run: |
+          # Exercise the real Master/Worker submit, dropped-report, reaper and
+          # destination-fencing chain; these tests require the explicit feature.
+          cargo test -p curvine-tests --features fault-injection --test replication_test --jobs ${{ env.CARGO_BUILD_JOBS }} -- --test-threads=1
+
       - name: Minimal client artifact dependency guardrails
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"

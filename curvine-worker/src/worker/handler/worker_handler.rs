@@ -107,7 +107,11 @@ impl MessageHandler for WorkerHandler {
 
             RpcCode::CancelJob => self.cancel_job(msg),
 
-            RpcCode::SubmitBlockReplicationJob => self.replication_handler.handle(msg),
+            RpcCode::SubmitBlockReplicationJob
+            | RpcCode::SubmitFencedReplication
+            | RpcCode::PrepareReplication
+            | RpcCode::ReconcileReplication
+            | RpcCode::WriteReplicationBlock => self.replication_handler.handle(msg),
 
             _ => {
                 let mut handler = self.handler.lock();

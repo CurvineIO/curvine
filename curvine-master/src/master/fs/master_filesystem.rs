@@ -1926,6 +1926,114 @@ mod tests {
         assert!(MasterFilesystem::validate_alloc_capacity(20, 2, &opts, 0).is_ok());
     }
 
+    fn replication_file(fs: &MasterFilesystem, path: &str) -> i64 {
+        for worker_id in [100, 200, 300] {
+            let mut worker = WorkerInfo::default();
+            worker.address.worker_id = worker_id;
+            fs.add_test_worker(worker);
+        }
+        let opts = CreateFileOptsBuilder::new()
+            .create_parent(true)
+            .replicas(2)
+            .build();
+        fs.create_with_opts(path, opts, OpenFlags::new_create())
+            .unwrap();
+        let block = fs
+            .add_block(
+                path,
+                None,
+                ClientAddress::default(),
+                vec![],
+                vec![],
+                0,
+                None,
+            )
+            .unwrap();
+        let block_id = block.block.id;
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(100))
+            .unwrap();
+        block_id
+    }
+
+    #[test]
+    fn replication_state_rejects_deleted_block() {
+        let fs = test_fs("replication-state-deleted");
+        let path = "/replication-state-deleted.log";
+        let block_id = replication_file(&fs, path);
+        assert!(fs
+            .fs_dir
+            .read()
+            .replication_block_state(block_id)
+            .unwrap()
+            .is_some());
+
+        fs.delete(path, false).unwrap();
+        let mut fs_dir = fs.fs_dir.write();
+        assert!(fs_dir.replication_block_state(block_id).unwrap().is_none());
+        assert!(!fs_dir
+            .add_replication_location_if_needed(block_id, BlockLocation::with_id(200))
+            .unwrap());
+    }
+
+    #[test]
+    fn replication_state_rejects_overwritten_block() {
+        let fs = test_fs("replication-state-overwritten");
+        let path = "/replication-state-overwritten.log";
+        let old_block_id = replication_file(&fs, path);
+
+        let opts = CreateFileOptsBuilder::new()
+            .create_parent(true)
+            .replicas(2)
+            .build();
+        fs.create_with_opts(path, opts, OpenFlags::new_create().set_overwrite(true))
+            .unwrap();
+
+        let mut fs_dir = fs.fs_dir.write();
+        assert!(fs_dir
+            .replication_block_state(old_block_id)
+            .unwrap()
+            .is_none());
+        assert!(!fs_dir
+            .add_replication_location_if_needed(old_block_id, BlockLocation::with_id(200))
+            .unwrap());
+    }
+
+    #[test]
+    fn replication_location_update_is_idempotent_and_respects_replica_count() {
+        let fs = test_fs("replication-location-guard");
+        let block_id = replication_file(&fs, "/replication-location-guard.log");
+        let mut fs_dir = fs.fs_dir.write();
+
+        assert!(fs_dir
+            .add_replication_location_if_needed(block_id, BlockLocation::with_id(200))
+            .unwrap());
+        assert!(
+            !fs_dir
+                .add_replication_location_if_needed(
+                    block_id,
+                    BlockLocation::new(200, StorageType::Ssd),
+                )
+                .unwrap()
+        );
+        assert!(!fs_dir
+            .add_replication_location_if_needed(block_id, BlockLocation::with_id(300))
+            .unwrap());
+
+        let state = fs_dir.replication_block_state(block_id).unwrap().unwrap();
+        assert_eq!(state.replicas, 2);
+        assert_eq!(state.locations.len(), 2);
+        assert_eq!(
+            state
+                .locations
+                .iter()
+                .map(|location| location.worker_id)
+                .collect::<Vec<_>>(),
+            vec![100, 200]
+        );
+    }
+
     #[test]
     fn resolve_file_inode_missing_inode_id_returns_file_not_found() {
         let fs = test_fs("missing-inode-id");
