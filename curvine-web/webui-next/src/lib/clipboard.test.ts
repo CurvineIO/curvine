@@ -112,6 +112,39 @@ describe('copyToClipboard', () => {
     }
   })
 
+  it('keeps focus on a menu item and selects an in-place Range', async () => {
+    setSecureContext(false)
+    setUserAgent(CHROMIUM_UA)
+    setClipboard(undefined)
+
+    const menuItem = document.createElement('div')
+    menuItem.setAttribute('role', 'menuitem')
+    menuItem.tabIndex = 0
+    menuItem.textContent = 'Copy path'
+    document.body.appendChild(menuItem)
+    menuItem.focus()
+
+    let activeAtCopy: Element | null = null
+    let selectedAtCopy = ''
+    let scratchParent: Element | null = null
+    const execCommand = setExecCommand(() => {
+      activeAtCopy = document.activeElement
+      selectedAtCopy = document.getSelection()?.toString() ?? ''
+      scratchParent = document.querySelector('[contenteditable]')?.parentElement ?? null
+      return true
+    })
+
+    await expect(copyToClipboard('/data/menu.csv')).resolves.toBe('copied')
+
+    expect(execCommand).toHaveBeenCalledWith('copy')
+    expect(activeAtCopy).toBe(menuItem)
+    expect(selectedAtCopy).toBe('/data/menu.csv')
+    expect(scratchParent).toBe(menuItem)
+    expect(document.activeElement).toBe(menuItem)
+    expect(document.querySelector('[contenteditable]')).toBeNull()
+    expect(document.querySelector('textarea')).toBeNull()
+  })
+
   it('selects through an editable host on Safari instead of a readonly textarea', async () => {
     setUserAgent(SAFARI_UA)
     setClipboard(undefined)

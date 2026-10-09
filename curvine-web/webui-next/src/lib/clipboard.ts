@@ -21,6 +21,8 @@
 const SCRATCH_CSS =
   'position:fixed;top:0;left:0;width:1px;height:1px;margin:0;padding:0;border:0;opacity:0;pointer-events:none'
 
+const MENU_ITEM_SELECTOR = '[role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"]'
+
 interface Scratch {
   element: HTMLElement
   select(): void
@@ -53,7 +55,7 @@ function textareaScratch(value: string): Scratch {
   }
 }
 
-function editableScratch(value: string): Scratch {
+function editableScratch(value: string, focus = true): Scratch {
   const element = document.createElement('div')
   element.textContent = value
   element.setAttribute('contenteditable', 'true')
@@ -62,7 +64,7 @@ function editableScratch(value: string): Scratch {
   return {
     element,
     select() {
-      element.focus()
+      if (focus) element.focus()
       const range = document.createRange()
       range.selectNodeContents(element)
       const selection = document.getSelection()
@@ -72,19 +74,40 @@ function editableScratch(value: string): Scratch {
   }
 }
 
-function legacyCopy(value: string): boolean {
+/**
+ * Radix menu items trap focus while their `onSelect` callback runs. Moving focus to a
+ * body-level scratch element therefore lets the menu immediately steal it back and clear the
+ * selection before `execCommand` reads it. Keep the scratch node and Range inside the
+ * currently focused menu item so the focus trap has nothing to undo.
+ */
+function focusedMenuItem(): HTMLElement | null {
+  const active = document.activeElement
+  if (!(active instanceof HTMLElement)) return null
+  return active.closest<HTMLElement>(MENU_ITEM_SELECTOR)
+}
+
+function legacyCopy(value: string): 'copied' | 'manual' {
   // Engines that dropped the command have no legacy path at all; reporting that is better
   // than pretending the copy happened.
-  if (typeof document.execCommand !== 'function') return false
+  if (typeof document.execCommand !== 'function') return 'manual'
 
-  const scratch = needsEditableSelection() ? editableScratch(value) : textareaScratch(value)
+  const menuItem = focusedMenuItem()
+  // The in-place Range is verified to write the clipboard from a focused menu item in
+  // Chromium. Keep every other legacy attempt manual: its return value alone is not proof.
+  const trustedMenuCopy =
+    menuItem !== null && /(Chrome|Chromium|CriOS|Edg|OPR)/.test(navigator.userAgent)
+  const scratch = menuItem
+    ? editableScratch(value, false)
+    : needsEditableSelection()
+      ? editableScratch(value)
+      : textareaScratch(value)
   const selection = document.getSelection()
   const previousRanges = selection
     ? Array.from({ length: selection.rangeCount }, (_, index) => selection.getRangeAt(index))
     : []
   const previousFocus = document.activeElement
 
-  document.body.appendChild(scratch.element)
+  ;(menuItem ?? document.body).appendChild(scratch.element)
   let copied = false
   try {
     scratch.select()
@@ -99,10 +122,16 @@ function legacyCopy(value: string): boolean {
     }
     // Selecting the scratch element took focus; hand it back so a keyboard-triggered copy
     // does not strand the user on <body>. A menu restores focus to its trigger right after.
-    if (previousFocus instanceof HTMLElement && previousFocus.isConnected) previousFocus.focus()
+    if (
+      previousFocus instanceof HTMLElement &&
+      previousFocus.isConnected &&
+      document.activeElement !== previousFocus
+    ) {
+      previousFocus.focus()
+    }
   }
 
-  return copied
+  return copied && trustedMenuCopy ? 'copied' : 'manual'
 }
 
 export type CopyOutcome = 'copied' | 'manual'
@@ -132,7 +161,5 @@ export async function copyToClipboard(text: string): Promise<CopyOutcome> {
     }
   }
 
-  // Attempted anyway: where it works, the user can simply dismiss the fallback.
-  legacyCopy(value)
-  return 'manual'
+  return legacyCopy(value)
 }
