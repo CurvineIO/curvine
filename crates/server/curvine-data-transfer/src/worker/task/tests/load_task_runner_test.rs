@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{join_path, optional_batch_target_status};
+use super::{join_path, optional_batch_target_status, segment_layout_ready};
 use curvine_error::FsError;
 use curvine_fs_api::Path;
+use curvine_model::{FileBlocks, LocatedBlock};
 
 #[test]
 fn join_path_handles_trailing_separator_and_scheme_prefix() {
@@ -38,4 +39,16 @@ fn join_path_preserves_nested_relative_name() {
 fn missing_batch_target_is_not_an_error() {
     let target = optional_batch_target_status(Err(FsError::file_not_found("/target"))).unwrap();
     assert!(target.is_none());
+}
+
+#[test]
+fn segment_layout_requires_full_length_and_blocks() {
+    let mut blocks = FileBlocks::default();
+    blocks.status.len = 100;
+    blocks.block_locs.push(LocatedBlock::default());
+    assert!(segment_layout_ready(&blocks, 100));
+    assert!(!segment_layout_ready(&blocks, 101));
+
+    blocks.block_locs.clear();
+    assert!(!segment_layout_ready(&blocks, 100));
 }

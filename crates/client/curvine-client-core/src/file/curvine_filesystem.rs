@@ -342,6 +342,13 @@ impl CurvineFileSystem {
         self.fs_client.get_block_locations(path).await
     }
 
+    pub async fn get_block_locations_batch(
+        &self,
+        paths: &[Path],
+    ) -> FsResult<Option<Vec<FsResult<FileBlocks>>>> {
+        self.fs_client.get_block_locations_batch(paths).await
+    }
+
     pub async fn get_filesystem_info(&self) -> FsResult<FilesystemInfo> {
         self.fs_client.get_filesystem_info().await
     }

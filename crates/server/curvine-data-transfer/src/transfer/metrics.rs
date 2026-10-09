@@ -68,6 +68,8 @@ pub struct TransferMetrics {
     store_unavailable_since: Mutex<HashMap<String, Instant>>,
     metadata_operation_duration_us: HistogramVec,
     metadata_operation_total: CounterVec,
+    master_rpc_duration_us: HistogramVec,
+    master_rpc_total: CounterVec,
     cluster_snapshot_version: Gauge,
     cluster_snapshot_staleness_ms: Gauge,
     cluster_snapshot_live_workers: Gauge,
@@ -355,6 +357,30 @@ impl TransferMetrics {
                 "transfer_metadata_operation_total",
                 "Transfer planning metadata operations by source, operation, and result",
                 &["source", "operation", "result"],
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            master_rpc_duration_us: m::new_histogram_vec_with_buckets(
+                "transfer_master_rpc_duration_us",
+                "Transfer Master RPC latency by call stage, operation, and result",
+                &["stage", "operation", "result"],
+                &[
+                    100.0,
+                    500.0,
+                    1_000.0,
+                    5_000.0,
+                    10_000.0,
+                    50_000.0,
+                    100_000.0,
+                    500_000.0,
+                    1_000_000.0,
+                    5_000_000.0,
+                ],
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            master_rpc_total: m::new_counter_vec(
+                "transfer_master_rpc_total",
+                "Transfer Master RPC operations by call stage, operation, and result",
+                &["stage", "operation", "result"],
             )
             .map_err(|err| FsError::common(err.to_string()))?,
             cluster_snapshot_version: m::new_gauge(
@@ -680,6 +706,14 @@ impl TransferMetrics {
             .inc();
     }
 
+    pub fn observe_master_rpc(&self, stage: &str, operation: &str, result: &str, elapsed_us: u128) {
+        let labels = &[stage, operation, result];
+        self.master_rpc_duration_us
+            .with_label_values(labels)
+            .observe(elapsed_us as f64);
+        self.master_rpc_total.with_label_values(labels).inc();
+    }
+
     pub fn observe_cluster_snapshot_refresh(
         &self,
         result: &str,
@@ -720,6 +754,20 @@ impl TransferMetrics {
             self.cluster_snapshot_capable_workers
                 .set(capable_workers as i64);
         }
+    }
+}
+
+pub(crate) fn record_master_rpc(
+    stage: &'static str,
+    operation: &'static str,
+    result: &'static str,
+    start: Instant,
+) {
+    if result == "fallback" {
+        return;
+    }
+    if let Ok(metrics) = TransferMetrics::get() {
+        metrics.observe_master_rpc(stage, operation, result, start.elapsed().as_micros());
     }
 }
 

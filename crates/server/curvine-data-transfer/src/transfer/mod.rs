@@ -22,6 +22,7 @@ mod postgres_store;
 pub use self::postgres_store::PostgresTransferStore;
 
 mod metrics;
+pub(crate) use self::metrics::record_master_rpc;
 pub use self::metrics::TransferMetrics;
 
 mod backend;

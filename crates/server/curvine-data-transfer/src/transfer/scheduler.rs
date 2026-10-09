@@ -15,7 +15,7 @@
 use crate::common::UfsFactory;
 use crate::transfer::{
     is_store_unavailable_error, job_mount_snapshot_async, job_mount_snapshot_with_version_async,
-    transfer_failure_message, MountSnapshotError, TransferMountSnapshotUpdate,
+    record_master_rpc, transfer_failure_message, MountSnapshotError, TransferMountSnapshotUpdate,
     TransferPlannedTasks, TransferPlanner, TransferRequeueUpdate, TransferStore,
     TransferTaskStateUpdate,
 };
@@ -23,7 +23,7 @@ use curvine_client_core::file::CurvineFileSystem;
 use curvine_config::TransferConf;
 use curvine_error::FsError;
 use curvine_error::FsResult;
-use curvine_fs_api::Path;
+use curvine_fs_api::{Path, GET_BLOCK_LOCATIONS_BATCH_MAX_PATHS};
 use curvine_model::{
     agreed_plan_source_mtime, classify_transfer_plan, normalize_group_resume, BatchManifest,
     BlockLocation, CommitBlock, LoadJobInfo, LoadTaskInfo, LocatedBlock, SetAttrOptsBuilder,
@@ -1163,13 +1163,20 @@ where
         overwrite: bool,
     ) -> FsResult<()> {
         let (segment_targets, replacement_targets) = planned_target_replacements(tasks)?;
-
         for target_path in &segment_targets {
             let target = Path::from_str(target_path)?;
             if !target.is_cv() {
                 continue;
             }
-            match self.fs.get_status(&target).await {
+            let start = std::time::Instant::now();
+            let status = self.fs.get_status(&target).await;
+            record_master_rpc(
+                "target_prepare",
+                "get_file_status",
+                if status.is_ok() { "success" } else { "error" },
+                start,
+            );
+            match status {
                 Ok(status) if status.is_dir => {
                     return Err(FsError::common(format!(
                         "Transfer target {} is a directory; refusing to overwrite directory with file",
@@ -1194,7 +1201,15 @@ where
             if !target.is_cv() {
                 continue;
             }
-            match self.fs.get_status(&target).await {
+            let start = std::time::Instant::now();
+            let status = self.fs.get_status(&target).await;
+            record_master_rpc(
+                "target_prepare",
+                "get_file_status",
+                if status.is_ok() { "success" } else { "error" },
+                start,
+            );
+            match status {
                 Ok(status) if status.is_dir => {
                     return Err(FsError::common(format!(
                         "Transfer target {} is a directory; refusing to replace directory with file",
@@ -1658,65 +1673,130 @@ where
         let mut reported = reported_block_locations(&tasks);
         let target_count = targets.len();
         let mut unstamped = 0usize;
-        for (target, source_mtime) in targets {
-            let path = Path::from_str(&target)?;
-            let blocks = self.fs.get_block_locations(&path).await?;
-            if blocks.status.is_complete() {
-                continue;
+        let mut next_target = 0;
+        while next_target < targets.len() {
+            let batch_start = next_target;
+            let mut paths = Vec::with_capacity(GET_BLOCK_LOCATIONS_BATCH_MAX_PATHS);
+            while next_target < targets.len() && paths.len() < GET_BLOCK_LOCATIONS_BATCH_MAX_PATHS {
+                paths.push(Path::from_str(&targets[next_target].0)?);
+                next_target += 1;
             }
-            if blocks.block_locs.is_empty() {
-                warn!(
-                    "skip finalizing segmented target file {} with empty layout",
-                    target,
+            let target_batch = &targets[batch_start..next_target];
+            let layouts = if paths.len() == 1 {
+                let start = std::time::Instant::now();
+                let result = self.fs.get_block_locations(&paths[0]).await;
+                record_master_rpc(
+                    "segment_finalize",
+                    "get_block_locations",
+                    if result.is_ok() { "success" } else { "error" },
+                    start,
                 );
-                continue;
-            }
-            let located = reported.remove(&target);
-            let commit_blocks: Vec<_> = blocks
-                .block_locs
-                .iter()
-                .map(|block| commit_block_for(block, located.as_ref()))
-                .collect();
-            let located_blocks = commit_blocks
-                .iter()
-                .filter(|block| !block.locations.is_empty())
-                .count();
-            if located_blocks < commit_blocks.len() {
-                warn!(
-                    "finalizing segmented target file {} with {} of {} blocks unlocated: no task reported workers for them (older worker? retry?), reads of those blocks fall back to UFS",
+                vec![result]
+            } else {
+                let start = std::time::Instant::now();
+                let result = self.fs.get_block_locations_batch(&paths).await;
+                let metric_result = match &result {
+                    Ok(Some(_)) => "success",
+                    Ok(None) => "fallback",
+                    Err(_) => "error",
+                };
+                record_master_rpc(
+                    "segment_finalize",
+                    "get_block_locations_batch",
+                    metric_result,
+                    start,
+                );
+                match result? {
+                    Some(layouts) => layouts,
+                    None => {
+                        let mut layouts = Vec::with_capacity(paths.len());
+                        for path in &paths {
+                            let start = std::time::Instant::now();
+                            let result = self.fs.get_block_locations(path).await;
+                            record_master_rpc(
+                                "segment_finalize",
+                                "get_block_locations",
+                                if result.is_ok() { "success" } else { "error" },
+                                start,
+                            );
+                            layouts.push(result);
+                        }
+                        layouts
+                    }
+                }
+            };
+            for (((target, source_mtime), path), blocks) in
+                target_batch.iter().zip(&paths).zip(layouts)
+            {
+                let blocks = blocks?;
+                if blocks.status.is_complete() {
+                    continue;
+                }
+                if blocks.block_locs.is_empty() {
+                    warn!(
+                        "skip finalizing segmented target file {} with empty layout",
+                        target,
+                    );
+                    continue;
+                }
+                let located = reported.remove(target);
+                let commit_blocks: Vec<_> = blocks
+                    .block_locs
+                    .iter()
+                    .map(|block| commit_block_for(block, located.as_ref()))
+                    .collect();
+                let located_blocks = commit_blocks
+                    .iter()
+                    .filter(|block| !block.locations.is_empty())
+                    .count();
+                if located_blocks < commit_blocks.len() {
+                    warn!(
+                        "finalizing segmented target file {} with {} of {} blocks unlocated: no task reported workers for them (older worker? retry?), reads of those blocks fall back to UFS",
+                        target,
+                        commit_blocks.len() - located_blocks,
+                        commit_blocks.len(),
+                    );
+                }
+                // Stamp the plan-time UFS identity together with the completion.
+                // No agreed mtime (missing, or the segments disagree because the
+                // source moved mid-copy) leaves the target cache-invalid on
+                // purpose: readers then fall back to UFS instead of trusting bytes
+                // nobody can identify.
+                let set_attr_opts = (*source_mtime)
+                    .map(|ufs_mtime| SetAttrOptsBuilder::new().ufs_mtime(ufs_mtime).build());
+                let stamped = set_attr_opts.is_some();
+                if !stamped {
+                    unstamped += 1;
+                }
+                let start = std::time::Instant::now();
+                let result = self
+                    .fs
+                    .fs_client()
+                    .complete_file_by_id(
+                        path,
+                        blocks.status.id,
+                        blocks.status.len,
+                        commit_blocks,
+                        false,
+                        set_attr_opts,
+                    )
+                    .await;
+                record_master_rpc(
+                    "segment_finalize",
+                    "complete_file_by_id",
+                    if result.is_ok() { "success" } else { "error" },
+                    start,
+                );
+                result?;
+                info!(
+                    "finalized segmented target file {} blocks={} located_blocks={} len={} ufs_mtime_stamped={}",
                     target,
-                    commit_blocks.len() - located_blocks,
-                    commit_blocks.len(),
+                    blocks.block_locs.len(),
+                    located_blocks,
+                    blocks.status.len,
+                    stamped
                 );
             }
-            let block_count = commit_blocks.len();
-            let file_len = blocks.status.len;
-            // Stamp the plan-time UFS identity together with the completion.
-            // No agreed mtime (missing, or the segments disagree because the
-            // source moved mid-copy) leaves the target cache-invalid on
-            // purpose: readers then fall back to UFS instead of trusting bytes
-            // nobody can identify.
-            let set_attr_opts = source_mtime
-                .map(|ufs_mtime| SetAttrOptsBuilder::new().ufs_mtime(ufs_mtime).build());
-            let stamped = set_attr_opts.is_some();
-            if !stamped {
-                unstamped += 1;
-            }
-            self.fs
-                .fs_client()
-                .complete_file_by_id(
-                    &path,
-                    blocks.status.id,
-                    file_len,
-                    commit_blocks,
-                    false,
-                    set_attr_opts,
-                )
-                .await?;
-            info!(
-                "finalized segmented target file {} blocks={} located_blocks={} len={} ufs_mtime_stamped={}",
-                target, block_count, located_blocks, file_len, stamped
-            );
         }
         if unstamped > 0 {
             warn!(

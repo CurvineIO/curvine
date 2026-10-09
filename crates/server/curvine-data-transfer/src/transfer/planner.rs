@@ -35,7 +35,6 @@ use std::time::Instant;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const CV_LIST_PAGE_SIZE: usize = 1_000;
-
 pub struct PlannedTransfer {
     pub job_info: LoadJobInfo,
     pub tasks: Vec<TransferTaskRecord>,
@@ -626,7 +625,6 @@ impl TransferPlanner {
             )
             .await?;
         collected.sort_by_key(|a| (a.depth, a.dir_ord, a.seq));
-
         for entry in collected {
             let (status, target_status) = (entry.status, entry.target_status);
             let path = Path::from_str(&status.path)?;
@@ -833,7 +831,10 @@ impl TransferPlanner {
             );
         }
         if task_target.is_cv() {
-            match self.master_fs.get_status(task_target).await {
+            let start = Instant::now();
+            let target_status = self.master_fs.get_status(task_target).await;
+            record_metadata_operation("cv", "get_status", target_status.is_ok(), start);
+            match target_status {
                 Ok(_) if !overwrite && !replace_target => {
                     return err_box!(
                         "Transfer target {} already exists and overwrite=false",
@@ -1175,7 +1176,8 @@ impl TransferPlanner {
         let mut statuses = Vec::new();
         let mut start_after = None;
         loop {
-            let page = self
+            let start = Instant::now();
+            let result = self
                 .master_fs
                 .list_options(
                     path,
@@ -1184,7 +1186,9 @@ impl TransferPlanner {
                         start_after: start_after.take(),
                     },
                 )
-                .await?;
+                .await;
+            record_metadata_operation("cv", "list_options", result.is_ok(), start);
+            let page = result?;
             let count = page.len();
             start_after = page.last().map(|status| status.name.clone());
             statuses.extend(page);
@@ -1216,7 +1220,10 @@ impl TransferPlanner {
     /// replica without triggering lost-worker invalidation) must be
     /// re-copied; a failed location query also forces a re-copy.
     async fn target_cache_readable(&self, path: &Path) -> bool {
-        match self.master_fs.get_block_locations(path).await {
+        let start = Instant::now();
+        let blocks = self.master_fs.get_block_locations(path).await;
+        record_metadata_operation("cv", "get_block_locations", blocks.is_ok(), start);
+        match blocks {
             Ok(blocks) if located_blocks_readable(&blocks.block_locs) => true,
             Ok(_) => {
                 log::warn!(
@@ -1385,12 +1392,12 @@ fn record_metadata_operation(
     start: Instant,
 ) {
     if let Ok(metrics) = TransferMetrics::get() {
-        metrics.observe_metadata_operation(
-            source,
-            operation,
-            if success { "success" } else { "error" },
-            start.elapsed().as_micros(),
-        );
+        let elapsed_us = start.elapsed().as_micros();
+        let result = if success { "success" } else { "error" };
+        metrics.observe_metadata_operation(source, operation, result, elapsed_us);
+        if source == "cv" && operation != "list_status" {
+            metrics.observe_master_rpc("planning", operation, result, elapsed_us);
+        }
     }
 }
 

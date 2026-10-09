@@ -54,6 +54,18 @@ const LEGACY_TRANSFER_COMMIT_RUN_ID_XATTR: &str = "curvine.transfer.run_id";
 const LEGACY_TRANSFER_COMMIT_TASK_ID_XATTR: &str = "curvine.transfer.task_id";
 const LEGACY_TRANSFER_COMMIT_SOURCE_PATH_XATTR: &str = "curvine.transfer.source_path";
 const LEGACY_TRANSFER_COMMIT_TARGET_PATH_XATTR: &str = "curvine.transfer.target_path";
+
+fn record_master_rpc(
+    stage: &'static str,
+    operation: &'static str,
+    result: &'static str,
+    start: Instant,
+) {
+    #[cfg(feature = "transfer")]
+    crate::transfer::record_master_rpc(stage, operation, result, start);
+    #[cfg(not(feature = "transfer"))]
+    let _ = (stage, operation, result, start);
+}
 const WRITER_CLEANUP_TIMEOUT_MS: u64 = 10_000;
 
 pub struct LoadTaskRunner {
@@ -99,6 +111,10 @@ fn optional_batch_target_status(status: FsResult<FileStatus>) -> FsResult<Option
         Err(FsError::FileNotFound(_)) => Ok(None),
         Err(err) => Err(err),
     }
+}
+
+fn segment_layout_ready(blocks: &FileBlocks, total_len: i64) -> bool {
+    blocks.status.len >= total_len && !blocks.block_locs.is_empty()
 }
 
 impl LoadTaskRunner {
@@ -489,13 +505,18 @@ impl LoadTaskRunner {
             }
             let source = join_path(&source_dir, &entry.rel_path)?;
             let target = join_path(&target_dir, &entry.rel_path)?;
-            // Idempotent retry: a file already committed by a previous attempt
-            // of this batch must not be copied again (review Required).
-            // Commit markers live on CV targets only; UFS targets always copy.
+            // Retry checks each file immediately before copying: a previous
+            // attempt can finish while this batch processes earlier files.
             if target.is_cv() {
-                if let Some(target_status) =
-                    optional_batch_target_status(self.fs.get_status(&target).await)?
-                {
+                let start = Instant::now();
+                let status = self.fs.get_status(&target).await;
+                record_master_rpc(
+                    "worker_batch",
+                    "get_file_status",
+                    if status.is_ok() { "success" } else { "error" },
+                    start,
+                );
+                if let Some(target_status) = optional_batch_target_status(status)? {
                     let source_status = self.open_unified(&source).await?.status().clone();
                     if self.is_committed_transfer_output(&target_status, &source_status) {
                         committed += entry.size;
@@ -1220,18 +1241,25 @@ impl LoadTaskRunner {
         deadline_ms: u64,
     ) -> FsResult<Option<FileBlocks>> {
         if target_path.is_cv() {
-            // Existence check via get_status (no writer record); open is
-            // only used where a handle is actually needed below.
-            match self
-                .await_group_deadline(deadline_ms, self.fs.get_status(target_path))
-                .await
-            {
+            // GetBlockLocations carries both existence and layout; avoid a
+            // separate GetStatus for this target.
+            let start = Instant::now();
+            let layout = self
+                .await_group_deadline(deadline_ms, self.fs.get_block_locations(target_path))
+                .await;
+            record_master_rpc(
+                "worker_segment",
+                "get_block_locations",
+                if layout.is_ok() { "success" } else { "error" },
+                start,
+            );
+            match layout {
                 // The file may have been created by a concurrent segment
                 // whose resize has not landed yet (create+resize are not
                 // atomic). Verify the pre-allocation before treating the
                 // target as ready instead of trusting existence alone.
-                Ok(_) => self
-                    .ensure_segment_size(target_path, total_len, deadline_ms)
+                Ok(blocks) => self
+                    .ensure_segment_size(target_path, total_len, deadline_ms, Some(blocks))
                     .await
                     .map(Some),
                 Err(FsError::FileNotFound(_)) => {
@@ -1299,7 +1327,7 @@ impl LoadTaskRunner {
                         // resize actually landed before treating the target as
                         // ready; otherwise re-apply it (review Required).
                         Err(FsError::FileAlreadyExists(_)) => self
-                            .ensure_segment_size(target_path, total_len, deadline_ms)
+                            .ensure_segment_size(target_path, total_len, deadline_ms, None)
                             .await
                             .map(Some),
                         Err(err) => Err(err),
@@ -1381,11 +1409,25 @@ impl LoadTaskRunner {
         target_path: &Path,
         total_len: i64,
         deadline_ms: u64,
+        initial_blocks: Option<FileBlocks>,
     ) -> FsResult<FileBlocks> {
-        let blocks = self
-            .await_group_deadline(deadline_ms, self.fs.get_block_locations(target_path))
-            .await?;
-        if blocks.status.len >= total_len && !blocks.block_locs.is_empty() {
+        let blocks = match initial_blocks {
+            Some(blocks) => blocks,
+            None => {
+                let start = Instant::now();
+                let result = self
+                    .await_group_deadline(deadline_ms, self.fs.get_block_locations(target_path))
+                    .await;
+                record_master_rpc(
+                    "worker_segment",
+                    "get_block_locations",
+                    if result.is_ok() { "success" } else { "error" },
+                    start,
+                );
+                result?
+            }
+        };
+        if segment_layout_ready(&blocks, total_len) {
             return Ok(blocks);
         }
         let writer_name = self.next_writer_name();

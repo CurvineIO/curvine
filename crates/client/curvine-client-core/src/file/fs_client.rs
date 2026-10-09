@@ -16,10 +16,13 @@ use crate::client_context::ClientContext;
 use crate::file::{FsContext, MasterHandshake};
 use bytes::BytesMut;
 use curvine_config::{ClientConf, ClusterConf, UfsConf, UfsConfBuilder};
-use curvine_core_error::err_box;
+use curvine_core_error::{err_box, ErrorExt};
 use curvine_error::FsError;
 use curvine_error::FsResult;
-use curvine_fs_api::{Path, RpcCode};
+use curvine_fs_api::{
+    Path, RpcCode, GET_BLOCK_LOCATIONS_BATCH_MAX_ENCODED_PATH_BYTES,
+    GET_BLOCK_LOCATIONS_BATCH_MAX_PATHS, MASTER_CAPABILITY_GET_BLOCK_LOCATIONS_BATCH,
+};
 use curvine_model::*;
 use curvine_model::{sanitize_client_context, ProtoUtils};
 use curvine_proto::*;
@@ -83,6 +86,7 @@ impl_with_client_context!(
     FileResizeRequest,
     FreeRequest,
     GetBlockLocationsRequest,
+    GetBlockLocationsBatchRequest,
     GetFileStatusRequest,
     GetLockRequest,
     LinkRequest,
@@ -664,6 +668,81 @@ impl FsClient {
         Ok(res)
     }
 
+    /// Query block layouts in a bounded RPC. `None` asks callers to retry as
+    /// individual lookups (legacy master or a response above the server cap).
+    pub async fn get_block_locations_batch(
+        &self,
+        paths: &[Path],
+    ) -> FsResult<Option<Vec<FsResult<FileBlocks>>>> {
+        if paths.len() > GET_BLOCK_LOCATIONS_BATCH_MAX_PATHS {
+            return Err(FsError::invalid_argument(format!(
+                "GetBlockLocationsBatch accepts at most {} paths",
+                GET_BLOCK_LOCATIONS_BATCH_MAX_PATHS
+            )));
+        }
+        if paths.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        if !self
+            .master_supports_capability(MASTER_CAPABILITY_GET_BLOCK_LOCATIONS_BATCH)
+            .await
+        {
+            return Ok(None);
+        }
+
+        let requested: Vec<String> = paths.iter().map(Path::encode).collect();
+        let encoded_path_bytes = requested
+            .iter()
+            .map(|path| path.len().saturating_add(5))
+            .fold(0usize, usize::saturating_add);
+        if encoded_path_bytes > GET_BLOCK_LOCATIONS_BATCH_MAX_ENCODED_PATH_BYTES {
+            return Ok(None);
+        }
+        let header = GetBlockLocationsBatchRequest {
+            paths: requested.clone(),
+            client_context: None,
+        };
+        let rep: GetBlockLocationsBatchResponse = match self
+            .rpc(RpcCode::GetBlockLocationsBatch, header)
+            .await
+        {
+            Ok(rep) => rep,
+            // Older masters route unknown RPC codes to this stable error.
+            Err(err) if err.to_string().starts_with("Unsupported operation") => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        if rep.too_large.unwrap_or(false) {
+            return Ok(None);
+        }
+        if rep.results.len() != requested.len() {
+            return Err(FsError::common(format!(
+                "GetBlockLocationsBatch returned {} results for {} paths",
+                rep.results.len(),
+                requested.len()
+            )));
+        }
+
+        let mut results = Vec::with_capacity(rep.results.len());
+        for (path, item) in requested.iter().zip(rep.results) {
+            if item.path.as_str() != path {
+                return Err(FsError::common(
+                    "GetBlockLocationsBatch response order does not match request",
+                ));
+            }
+            let result = match (item.blocks, item.error) {
+                (Some(blocks), None) => Ok(ProtoUtils::file_blocks_from_pb(blocks)),
+                (None, Some(error)) => Err(FsError::decode(BytesMut::from(error.as_slice()))),
+                _ => {
+                    return Err(FsError::common(
+                        "GetBlockLocationsBatch item must contain exactly one of blocks or error",
+                    ));
+                }
+            };
+            results.push(result);
+        }
+        Ok(Some(results))
+    }
+
     pub async fn get_cv_metadata_snapshot_page(
         &self,
         page_token: Option<String>,
@@ -1099,6 +1178,15 @@ impl FsClient {
         if let Err(e) = self.handshake().await {
             warn!("client-master handshake failed: {e}; continuing with legacy assumptions");
         }
+    }
+
+    async fn master_supports_capability(&self, capability: &str) -> bool {
+        self.ensure_handshake().await;
+        self.context
+            .master_handshake()
+            .capabilities()
+            .iter()
+            .any(|advertised| advertised == capability)
     }
 
     pub fn rpc_blocking<T, R>(&self, code: RpcCode, header: T) -> FsResult<R>

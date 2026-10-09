@@ -46,6 +46,36 @@ fn target_status(mtime: i64, len: i64) -> FileStatus {
 }
 
 #[test]
+fn transfer_master_rpc_metrics_record_stage_operation_and_result() {
+    super::record_master_rpc(
+        "test_stage",
+        "test_operation",
+        "success",
+        std::time::Instant::now(),
+    );
+    super::record_master_rpc(
+        "test_stage",
+        "test_fallback",
+        "fallback",
+        std::time::Instant::now(),
+    );
+    let output = curvine_metrics::Metrics::text_output().unwrap();
+    assert!(
+        output.contains(
+            "transfer_master_rpc_total{operation=\"test_operation\",result=\"success\",stage=\"test_stage\"} 1"
+        ),
+        "{output}"
+    );
+    assert!(
+        output.contains(
+            "transfer_master_rpc_duration_us_count{operation=\"test_operation\",result=\"success\",stage=\"test_stage\"} 1"
+        ),
+        "{output}"
+    );
+    assert!(!output.contains("operation=\"test_fallback\""), "{output}");
+}
+
+#[test]
 fn unchanged_load_output_is_skipped_only_when_source_fingerprint_matches() {
     let source = source_status(10, 1024);
     let target = target_status(10, 1024);
