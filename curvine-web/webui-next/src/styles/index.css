@@ -1,0 +1,254 @@
+/*
+ * Copyright 2025 OPPO.
+ *
+ * Licensed under the Apache License, Version 2.0.
+ */
+
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "@fontsource-variable/geist";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * Text layer for the PDF preview.
+ *
+ * These declarations mirror pdf.js's own stylesheet (`web/pdf_viewer.css`), scoped to our
+ * container instead of the global `.textLayer` class so nothing else can pick them up. The
+ * spans carry their geometry inline; what they need from CSS is to be transparent, absolute
+ * and selectable, plus the custom properties the layer's font maths reads.
+ */
+.pdf-text-surface {
+    position: absolute;
+    inset: 0;
+    overflow: clip;
+    opacity: 1;
+    line-height: 1;
+    letter-spacing: normal;
+    word-spacing: normal;
+    text-align: initial;
+    text-size-adjust: none;
+    forced-color-adjust: none;
+    transform-origin: 0 0;
+    caret-color: CanvasText;
+    --min-font-size: 1;
+    --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+    --min-font-size-inv: calc(1 / var(--min-font-size));
+}
+
+.pdf-text-surface :is(span, br) {
+    position: absolute;
+    color: transparent;
+    white-space: pre;
+    cursor: text;
+    transform-origin: 0% 0%;
+    user-select: text;
+}
+
+.pdf-text-surface > :not(.markedContent) {
+    z-index: 1;
+    --font-height: 0;
+    font-size: calc(var(--text-scale-factor) * var(--font-height));
+    --scale-x: 1;
+    --rotate: 0deg;
+    transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+}
+
+.pdf-text-surface .markedContent {
+    display: contents;
+}
+
+
+/*
+ * Panel zoom (observability charts) morphs the card's old box into its new one, which
+ * needs both snapshots to carry a `view-transition-name` — see TimeSeriesChart. Only the
+ * timing lives here: the browser's default is a slow linear cross-fade that reads as a
+ * flicker rather than a stretch.
+ */
+::view-transition-group(*) {
+    animation-duration: 260ms;
+    animation-timing-function: cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+/*
+ * The default cross-fade paints the outgoing snapshot over the incoming one, so zooming
+ * a panel flashes the original small chart on top of the enlarged one before it fades.
+ * The outgoing snapshot is dropped and the incoming one shown immediately, which leaves
+ * the group's own box to do the morphing: the panel stretches open from where it was.
+ * `mix-blend-mode` is reset because the default plus-lighter would brighten the overlap.
+ */
+::view-transition-old(*) {
+    opacity: 0;
+    animation: none;
+}
+
+::view-transition-new(*) {
+    opacity: 1;
+    animation: none;
+    mix-blend-mode: normal;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    ::view-transition-group(*) {
+        animation-duration: 1ms;
+    }
+}
+
+@theme inline {
+    --font-sans: 'Geist Variable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+    --font-heading: var(--font-sans);
+
+    --color-sidebar-ring: var(--sidebar-ring);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar: var(--sidebar);
+    --color-chart-5: var(--chart-5);
+    --color-chart-4: var(--chart-4);
+    --color-chart-3: var(--chart-3);
+    --color-chart-2: var(--chart-2);
+    --color-chart-1: var(--chart-1);
+    --color-ring: var(--ring);
+    --color-input: var(--input);
+    --color-border: var(--border);
+    --color-destructive: var(--destructive);
+    --color-destructive-foreground: var(--destructive-foreground);
+    --color-success: var(--success);
+    --color-warning: var(--warning);
+    --color-info: var(--info);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-accent: var(--accent);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-muted: var(--muted);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-secondary: var(--secondary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-primary: var(--primary);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-popover: var(--popover);
+    --color-card-foreground: var(--card-foreground);
+    --color-card: var(--card);
+    --color-foreground: var(--foreground);
+    --color-background: var(--background);
+
+    --radius-sm: calc(var(--radius) * 0.6);
+    --radius-md: calc(var(--radius) * 0.8);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) * 1.4);
+    --radius-2xl: calc(var(--radius) * 1.8);
+    --radius-3xl: calc(var(--radius) * 2.2);
+    --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+    /* Surfaces are neutral (white page, neutral grey chrome). The Curvine brand
+       green is carried by the accent surfaces and the focus ring instead:
+       primary fills primary buttons, accent tints hover/active/selected states.
+       Text on an accent tint stays neutral so green never sits on green. */
+    --primary: #4f8f34;
+    --primary-foreground: #ffffff;
+    --accent: #eaf6df;
+    --accent-foreground: #111111;
+
+    --background: #ffffff;
+    --foreground: #111111;
+    --card: #ffffff;
+    --card-foreground: #111111;
+    --popover: #ffffff;
+    --popover-foreground: #111111;
+
+    --secondary: #f5f5f5;
+    --secondary-foreground: #262626;
+    --muted: #f5f5f5;
+    --muted-foreground: #737373;
+
+    --destructive: #b84635;
+    --destructive-foreground: #ffffff;
+    --success: #3f8f2f;
+    --warning: #a8791f;
+    --info: #2f6fb0;
+
+    --border: #e5e5e5;
+    --input: #d4d4d4;
+    --ring: #6fae3f;
+
+    --chart-1: #4f8f34;
+    --chart-2: #8fb4d0;
+    --chart-3: #c9b07a;
+    --chart-4: #7fbfa0;
+    --chart-5: #b3a4cc;
+
+    --radius: 0.5rem;
+
+    --sidebar: #ffffff;
+    --sidebar-foreground: #111111;
+    --sidebar-primary: #4f8f34;
+    --sidebar-primary-foreground: #ffffff;
+    --sidebar-accent: #eaf6df;
+    --sidebar-accent-foreground: #111111;
+    --sidebar-border: #e5e5e5;
+    --sidebar-ring: #6fae3f;
+}
+
+.dark {
+    --primary: #7fc45a;
+    --primary-foreground: #0a0a0a;
+    --accent: #16210f;
+    --accent-foreground: #fafafa;
+
+    /* Pure black page; raised surfaces get the smallest possible lift so
+       borders and overlays still read as separate layers. */
+    --background: #000000;
+    --foreground: #fafafa;
+    --card: #0a0a0a;
+    --card-foreground: #fafafa;
+    --popover: #0a0a0a;
+    --popover-foreground: #fafafa;
+
+    --secondary: #171717;
+    --secondary-foreground: #fafafa;
+    --muted: #171717;
+    --muted-foreground: #a3a3a3;
+
+    --destructive: #e07a68;
+    --destructive-foreground: #0a0a0a;
+    --success: #8fd177;
+    --warning: #e0b458;
+    --info: #82b3e4;
+
+    --border: oklch(1 0 0 / 12%);
+    --input: oklch(1 0 0 / 16%);
+    --ring: #7fc45a;
+
+    --chart-1: #7fc45a;
+    --chart-2: #a8c8e0;
+    --chart-3: #dcc592;
+    --chart-4: #9ad3b8;
+    --chart-5: #c9bce0;
+
+    --sidebar: #000000;
+    --sidebar-foreground: #fafafa;
+    --sidebar-primary: #7fc45a;
+    --sidebar-primary-foreground: #0a0a0a;
+    --sidebar-accent: #16210f;
+    --sidebar-accent-foreground: #fafafa;
+    --sidebar-border: oklch(1 0 0 / 12%);
+    --sidebar-ring: #7fc45a;
+}
+
+@layer base {
+    * {
+        @apply border-border outline-ring/50;
+    }
+
+    html {
+        @apply font-sans antialiased;
+    }
+
+    body {
+        @apply bg-background text-foreground;
+    }
+}

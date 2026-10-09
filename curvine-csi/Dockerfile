@@ -28,20 +28,13 @@ WORKDIR /workspace
 # Copy entire Curvine source code
 COPY . /workspace/
 
-# Pre-install WebUI dependencies and fix vue-cli-service module resolution
-RUN if [ -d "/workspace/curvine-web/webui" ]; then \
+# Pre-install WebUI dependencies so the make build reuses them and dependency
+# resolution failures surface before the (much longer) Rust build starts.
+RUN if [ -d "/workspace/curvine-web/webui-next" ]; then \
         echo "Pre-installing WebUI dependencies..."; \
-        cd /workspace/curvine-web/webui && \
-        npm install --legacy-peer-deps && \
-        echo "npm install completed" && \
-        ln -s @vue/cli-service/package.json node_modules/package.json && \
-        echo "Created symlink: node_modules/package.json -> @vue/cli-service/package.json"; \
-    fi
-
-# Patch build.sh to use direct vue-cli-service.js call
-RUN if [ -f "/workspace/build/build.sh" ]; then \
-        echo "Patching build.sh to fix vue-cli-service wrapper script issue..."; \
-        sed -i 's/npm run build/node node_modules\/@vue\/cli-service\/bin\/vue-cli-service.js build/g' /workspace/build/build.sh; \
+        cd /workspace/curvine-web/webui-next && \
+        npm ci --include=dev && \
+        echo "npm ci completed"; \
     fi
 
 # Build Curvine from source

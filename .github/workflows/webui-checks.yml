@@ -1,0 +1,58 @@
+# Frontend gate for the React console in curvine-web/webui-next.
+#
+# Before this existed the module had a type-check plus ~125 vitest cases and
+# nothing ran them, so a broken commit could merge unnoticed.
+#
+# NOTE: `paths` is intentionally narrow. If this check is ever made a *required*
+# status check, drop the filter (or add a no-op companion job) so the check still
+# reports on pull requests that do not touch the frontend — a required check that
+# never reports leaves the PR blocked.
+name: WebUI Checks
+
+on:
+  pull_request:
+    paths:
+      - 'curvine-web/webui-next/**'
+      - '.github/workflows/webui-checks.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'curvine-web/webui-next/**'
+      - '.github/workflows/webui-checks.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Self-hosted runners on older glibc hosts cannot run the runner-bundled Node 24.
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+
+jobs:
+  webui-next:
+    runs-on: self-hosted
+    container:
+      # The release compile image builds the webui on Node 22 LTS; match it so the
+      # gate cannot pass on a Node version the real build would reject.
+      image: node:22-bookworm
+    defaults:
+      run:
+        working-directory: curvine-web/webui-next
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        # --include=dev matters: vite and tailwind are devDependencies, and any
+        # environment exporting NODE_ENV=production would otherwise omit them.
+        run: npm ci --include=dev
+
+      - name: Type check
+        run: npm run type-check
+
+      - name: Unit tests
+        run: npm run test
+
+      - name: Production build
+        run: npm run build

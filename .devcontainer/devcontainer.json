@@ -12,7 +12,7 @@
     "source=curvine-m2-cache,target=/root/.m2,type=volume",
     "source=curvine-npm-cache,target=/root/.npm,type=volume"
   ],
-  "postCreateCommand": "git config --global --add safe.directory /workspace && cd /workspace/curvine-web/webui && npm install",
+  "postCreateCommand": "git config --global --add safe.directory /workspace && cd /workspace/curvine-web/webui-next && npm install",
   "customizations": {
     "vscode": {
       "extensions": [

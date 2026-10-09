@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Shell(make:*)",
+      "Shell(git:*)",
+      "Shell(git commit -m \"$(cat <<'EOF' ci(workflows): switch to self-hosted runners Change daily-ut-coverage, pr-title-check, release, and trigger-helm-release workflows from ubuntu-latest to self-hosted. Co-authored-by: CommandCodeBot <noreply@commandcode.ai> EOF )\")",
+      "Shell(gh pr create --draft --title \"ci(workflows): switch to self-hosted runners\" --body \"$(cat <<'EOF' # Summary Switch daily-ut-coverage, pr-title-check, release, and trigger-helm-release workflows from `ubuntu-latest` to `self-hosted` runners for better performance and control. # Changes | Module / File | Change | Impact on existing behavior | | ------------- | ------ | --------------------------- | | `.github/workflows/daily-ut-coverage.yml` | `ubuntu-latest` → `self-hosted` | CI runs on self-hosted runner | | `.github/workflows/pr-title-check.yml` | `ubuntu-latest` → `self-hosted` | CI runs on self-hosted runner | | `.github/workflows/release.yml` | `ubuntu-latest` → `self-hosted` (2 jobs) | CI runs on self-hosted runner | | `.github/workflows/trigger-helm-release.yml` | `ubuntu-latest` → `self-hosted` | CI runs on self-hosted runner | # Dependencies - Related PRs: None - Related issues: None - Blocks / blocked by: None EOF )\")",
+      "Shell(npm:*)",
+      "Shell(cd /Users/barry/CodeSpace/curvine-next/curvine-web/webui-next && for p in react react-dom react-router-dom vite vitest tailwindcss @tailwindcss/vite @vitejs/plugin-react radix-ui lucide-react axios echarts clsx tailwind-merge class-variance-authority jsdom @testing-library/react @fontsource-variable/geist tw-animate-css typescript; do printf \"%-32s %s\\n\" \"$p\" \"$(node -p \"require('./node_modules/$p/package.json').version\" 2>/dev/null || echo MISSING)\"; done)"
+    ],
+    "deny": [],
+    "defaultMode": "default"
+  }
+}

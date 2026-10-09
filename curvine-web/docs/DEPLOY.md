@@ -8,7 +8,7 @@
 | 组件 | 路径 | 说明 |
 |------|------|------|
 | 后端二进制 | `curvine-web/src/bin/curvine-web.rs` | 独立进程，Axum 提供 `/api/v1/*` 并托管静态资源 |
-| 前端 | `curvine-web/webui/` | Vue 3 + Vite，构建产物在 `webui/dist/` |
+| 前端 | `curvine-web/webui-next/` | React 18 + Vite，构建产物在 `webui-next/dist/` |
 | 集群配置 | `etc/curvine-cluster.toml` | 通过 `--conf` 传入，连接远端 Master/Worker |
 
 ### 端口分工
@@ -85,12 +85,18 @@ cargo build --release -p curvine-web --features curvine-unified-fs/oss-hdfs
 ### 4.2 前端
 
 ```bash
-cd curvine-web/webui
-npm install    # 首次
+cd curvine-web/webui-next
+npm ci --include=dev   # 首次
 npm run build
 ```
 
-产物：`curvine-web/webui/dist/`
+> `vite` / `tailwindcss` 属于 devDependencies。若环境导出 `NODE_ENV=production`，
+> 必须带 `--include=dev`，否则安装后缺少构建工具。
+
+产物：`curvine-web/webui-next/dist/`
+
+也可以直接用 `build/build.sh -p web`（或 `make build`）：它会构建本模块并把
+`dist/` 移动到 **`build/dist/webui/`**，部署目录名仍为 `webui`，后端无需任何改动。
 
 ---
 
@@ -221,7 +227,7 @@ mkdir -p "${DEPLOY_ROOT}"/{bin,conf,data,lib,logs,webui}
 
 cp target/release/curvine-web "${DEPLOY_ROOT}/lib/"
 chmod +x "${DEPLOY_ROOT}/lib/curvine-web"
-cp -r curvine-web/webui/dist/* "${DEPLOY_ROOT}/webui/"
+cp -r build/dist/webui/* "${DEPLOY_ROOT}/webui/"
 echo "your-initial-password" > "${DEPLOY_ROOT}/data/web-password"
 chmod 600 "${DEPLOY_ROOT}/data/web-password"
 ```
@@ -307,13 +313,13 @@ sudo systemctl enable --now curvine-web.service
 cd curvine-next
 git pull --rebase origin main
 cargo build --release -p curvine-web
-cd curvine-web/webui && npm run build
+cd curvine-web/webui-next && npm ci --include=dev && npm run build
 
 # 2. 停服替换（避免 Text file busy）
 systemctl --user stop curvine-web.service   # 或 sudo systemctl stop curvine-web.service
 cp target/release/curvine-web /opt/curvine-web/lib/
 rm -rf /opt/curvine-web/webui/*
-cp -r curvine-web/webui/dist/* /opt/curvine-web/webui/
+cp -r curvine-web/webui-next/dist/* /opt/curvine-web/webui/
 echo "$(git rev-parse HEAD)" > /opt/curvine-web/build-version
 
 # 3. 启动

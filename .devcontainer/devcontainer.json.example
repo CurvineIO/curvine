@@ -18,7 +18,7 @@
     "ALL_PROXY": "socks5://host.docker.internal:7891",
     "NO_PROXY": "localhost,127.0.0.1,host.docker.internal"
   },
-  "postCreateCommand": "git config --global --add safe.directory /workspace && cd /workspace/curvine-web/webui && npm install",
+  "postCreateCommand": "git config --global --add safe.directory /workspace && cd /workspace/curvine-web/webui-next && npm install",
   "customizations": {
     "vscode": {
       "extensions": [

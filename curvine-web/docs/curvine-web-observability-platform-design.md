@@ -55,6 +55,11 @@ observe -> diagnose -> navigate to Curvine object -> operate
 - Main admin router: `curvine-web/src/router/admin_handler.rs`
 - Frontend: `curvine-web/webui/`
 
+> **Note (later change):** the frontend has since been migrated to
+> `curvine-web/webui-next/` (React 18 + Vite + Tailwind). The Vue paths quoted
+> throughout this document describe the original implementation and are kept as
+> the design record; the React module is the one that ships.
+
 The backend constructs:
 
 ```text

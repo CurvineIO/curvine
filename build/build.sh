@@ -417,6 +417,9 @@ declare -a SERVER_RUST_BUILD_ARGS=()
 declare -a CLIENT_RUST_BUILD_ARGS=()
 declare -a CLI_RUST_BUILD_ARGS=()
 declare -a TEST_RUST_BUILD_ARGS=()
+# curvine-web has its own invocation because it does not depend on
+# curvine-client, so the client-safe UFS features cannot be passed with it.
+declare -a WEB_RUST_BUILD_ARGS=()
 declare -a COPY_TARGETS=()
 declare -a CLIENT_ARTIFACT_CHECK_TARGETS=()
 
@@ -450,9 +453,12 @@ if should_build_package "tests"; then
   COPY_TARGETS+=("curvine-bench")
 fi
 
-# Next-only packages: keep on client-safe profile (no server-native feature leak)
+# curvine-web is built on its own, without the client-safe UFS features:
+# it does not depend on curvine-client, so `--features curvine-client/<ufs>`
+# makes cargo reject the build ("does not contain this feature") whenever web is
+# selected without client/cli/fuse — i.e. for `-p web` and `-p server -p web`.
 if should_build_package "web"; then
-  CLIENT_RUST_BUILD_ARGS+=("-p" "curvine-web")
+  WEB_RUST_BUILD_ARGS+=("-p" "curvine-web")
   COPY_TARGETS+=("curvine-web")
 fi
 
@@ -1002,13 +1008,15 @@ elif [ -d "/opt/spdk" ]; then
 fi
 
 # Skip cargo build when no non-SDK rust package was selected
-if [ ${#SERVER_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#CLIENT_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#CLI_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#TEST_RUST_BUILD_ARGS[@]} -eq 0 ]; then
+if [ ${#SERVER_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#CLIENT_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#CLI_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#TEST_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#WEB_RUST_BUILD_ARGS[@]} -eq 0 ]; then
   echo "No non-SDK rust packages selected, skipping workspace cargo build..."
 else
   build_rust_packages "server-native" "${SERVER_RUST_BUILD_ARGS[@]}" -- "${SERVER_FEATURES[@]}"
   build_rust_packages "tests" "${TEST_RUST_BUILD_ARGS[@]}" -- "${TEST_FEATURES[@]}"
   build_rust_packages "client-safe" "${CLIENT_RUST_BUILD_ARGS[@]}" -- "${CLIENT_FEATURES[@]}"
   build_rust_packages "cli-minimal" "${CLI_RUST_BUILD_ARGS[@]}" -- "${CLI_FEATURES[@]}"
+  # No features: curvine-web enables its own UFS backend in its Cargo.toml.
+  build_rust_packages "web" "${WEB_RUST_BUILD_ARGS[@]}" --
 fi
 
 if [ $BUILD_JAVA_SDK -eq 1 ]; then
@@ -1036,11 +1044,13 @@ fi
 
 # Build optional non-rust packages
 if should_build_package "web"; then
-  echo "Building WebUI..."
-  cd "$FS_HOME"/curvine-web/webui
-  npm install
+  echo "Building WebUI (webui-next)..."
+  cd "$FS_HOME"/curvine-web/webui-next
+  # --include=dev is required: build tooling (vite, tailwind) is a devDependency,
+  # and CI images commonly export NODE_ENV=production which would omit it.
+  npm ci --include=dev
   npm run build
-  mv "$FS_HOME"/curvine-web/webui/dist "$DIST_DIR"/webui
+  mv "$FS_HOME"/curvine-web/webui-next/dist "$DIST_DIR"/webui
 fi
 
 if [ $BUILD_JAVA_SDK -eq 1 ]; then

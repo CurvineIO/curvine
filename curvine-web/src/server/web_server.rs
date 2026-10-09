@@ -79,15 +79,15 @@ fn webui_dir() -> PathBuf {
     }
 
     for path in [
-        Path::new("webui/dist"),
-        Path::new("webui/public"),
+        // The React console (curvine-web/webui-next). Only its `dist` is a
+        // candidate: the module root holds the Vite dev entry whose index.html
+        // points at /src/main.tsx, so matching it would serve a blank page.
+        Path::new("webui-next/dist"),
+        Path::new("curvine-web/webui-next/dist"),
+        Path::new("/workspace/curvine-web/webui-next/dist"),
+        // The packaged layout, where the built console is installed as `webui`
+        // (see build/build.sh and CURVINE_WEBUI_DIR).
         Path::new(WEBUI_DIR),
-        Path::new("curvine-web/webui/dist"),
-        Path::new("curvine-web/webui/public"),
-        Path::new("curvine-web/webui"),
-        Path::new("/workspace/curvine-web/webui/dist"),
-        Path::new("/workspace/curvine-web/webui/public"),
-        Path::new("/workspace/curvine-web/webui"),
     ] {
         if path.join("index.html").exists() {
             return path.to_path_buf();

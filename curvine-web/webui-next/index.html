@@ -1,0 +1,38 @@
+<!--
+  ~ Copyright 2025 OPPO.
+  ~
+  ~ Licensed under the Apache License, Version 2.0.
+  -->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="alternate icon" href="/favicon.ico">
+    <title>Curvine Admin Console</title>
+    <script>
+      // Applies the stored theme before the bundle loads so a dark-mode reload
+      // does not flash white. Mirrors src/theme/theme-context.tsx — keep the
+      // storage key and the resolution rule in sync.
+      ;(function () {
+        try {
+          var stored = localStorage.getItem('curvine-theme')
+          var dark =
+            stored === 'dark' ||
+            (stored !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches)
+          if (dark) {
+            document.documentElement.classList.add('dark')
+            document.documentElement.style.colorScheme = 'dark'
+          }
+        } catch (error) {
+          /* storage unavailable: fall back to the light theme */
+        }
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

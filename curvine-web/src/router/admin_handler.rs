@@ -4157,15 +4157,12 @@ fn resolve_webui_index_path() -> std::path::PathBuf {
         .filter(|path| path.exists())
         .or_else(|| {
             [
-                "webui/dist/index.html",
-                "webui/public/index.html",
+                // Mirror `webui_dir()` in server/web_server.rs: the React console's
+                // `dist` first, then the packaged `webui` directory.
+                "webui-next/dist/index.html",
+                "curvine-web/webui-next/dist/index.html",
+                "/workspace/curvine-web/webui-next/dist/index.html",
                 "webui/index.html",
-                "curvine-web/webui/dist/index.html",
-                "curvine-web/webui/public/index.html",
-                "curvine-web/webui/index.html",
-                "/workspace/curvine-web/webui/dist/index.html",
-                "/workspace/curvine-web/webui/public/index.html",
-                "/workspace/curvine-web/webui/index.html",
             ]
             .iter()
             .map(std::path::PathBuf::from)

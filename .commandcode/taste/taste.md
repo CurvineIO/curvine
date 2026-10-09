@@ -1,0 +1,4 @@
+- Prefers self-hosted GitHub Actions runners over GitHub-hosted runners for CI/CD workflows. Confidence: 0.7
+- Communicates in Chinese and is comfortable with terse prompts ("继续", or a one-line bug report like "点击复制图标没有反应") rather than lengthy instructions. Confidence: 0.65
+- When asking for configuration help, wants the complete, ready-to-paste config (not partial snippets or conceptual explanation). Confidence: 0.5
+- Prefers to set up tool/agent permissions declaratively (e.g. `permissions.allow` rules in `settings.json`) rather than working around interactive permission prompts each session. Confidence: 0.5
