@@ -15,6 +15,8 @@
 use crate::master::fs::MasterFilesystem;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::Master;
+#[cfg(feature = "fault-injection")]
+use crate::worker::block::BlockStore;
 use crate::worker::Worker;
 use curvine_client_core::file::CurvineFileSystem;
 use curvine_config::ClusterConf;
@@ -23,6 +25,8 @@ use curvine_error::FsResult;
 use curvine_net::net::{InetAddr, NetUtils};
 use curvine_raft::raft::{NodeId, RaftPeer};
 use curvine_rpc::client::RpcClient;
+#[cfg(feature = "fault-injection")]
+use curvine_rpc::handler::HandlerService;
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use dashmap::DashMap;
@@ -42,6 +46,9 @@ pub struct MiniCluster {
     pub worker_conf: Vec<ClusterConf>,
 
     pub master_entries: DashMap<usize, MasterEntry>,
+    // Retain the live stores so fault tests can remove a real replica, not just metadata.
+    #[cfg(feature = "fault-injection")]
+    pub worker_stores: DashMap<u32, BlockStore>,
     pub client_rt: Arc<Runtime>,
 }
 
@@ -70,6 +77,8 @@ impl MiniCluster {
             master_conf,
             worker_conf,
             master_entries: Default::default(),
+            #[cfg(feature = "fault-injection")]
+            worker_stores: Default::default(),
             client_rt,
         }
     }
@@ -122,6 +131,11 @@ impl MiniCluster {
     pub fn start_worker(&self) {
         for conf in &self.worker_conf {
             let worker = Worker::with_conf(conf.clone()).unwrap();
+            #[cfg(feature = "fault-injection")]
+            self.worker_stores.insert(
+                worker.worker_id,
+                worker.service().get_message_handler(None).store,
+            );
             thread::spawn(move || {
                 if let Err(e) = worker.block_on_start() {
                     log::error!("mini cluster worker failed to start: {}", e);

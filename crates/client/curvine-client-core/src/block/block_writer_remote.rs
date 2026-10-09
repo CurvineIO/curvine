@@ -34,17 +34,31 @@ pub struct BlockWriterRemote {
 }
 
 impl BlockWriterRemote {
-    pub async fn new(
+    pub fn new(
         fs_context: &FsContext,
         block: ExtendedBlock,
         worker_address: WorkerAddress,
         pos: i64,
         block_size: i64,
+    ) -> impl std::future::Future<Output = FsResult<Self>> + '_ {
+        Self::new_replication(fs_context, block, worker_address, pos, block_size, None)
+    }
+
+    pub async fn new_replication(
+        fs_context: &FsContext,
+        block: ExtendedBlock,
+        worker_address: WorkerAddress,
+        pos: i64,
+        block_size: i64,
+        token: Option<String>,
     ) -> FsResult<Self> {
         let req_id = Utils::req_id();
         let seq_id = 0;
 
-        let client = fs_context.acquire_write(&worker_address).await?;
+        let mut client = fs_context.acquire_write(&worker_address).await?;
+        if let Some(token) = token {
+            client = client.with_replication_token(block.id, token);
+        }
         let write_context = client
             .write_block(
                 &block,

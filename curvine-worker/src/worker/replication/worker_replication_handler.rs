@@ -18,7 +18,10 @@ use curvine_core_error::ErrorImpl;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::RpcCode;
-use curvine_proto::{SubmitBlockReplicationRequest, SubmitBlockReplicationResponse};
+use curvine_proto::{
+    PrepareReplicationRequest, ReconcileReplicationRequest, SubmitBlockReplicationRequest,
+    SubmitBlockReplicationResponse,
+};
 use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::Message;
 use log::warn;
@@ -37,14 +40,26 @@ impl WorkerReplicationHandler {
 
     pub fn accept_job(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: SubmitBlockReplicationRequest = ctx.parse_header()?;
+        if RpcCode::from(ctx.msg.code()) == RpcCode::SubmitFencedReplication
+            && (req.target_token.is_none()
+                || req.attempt_id.is_none()
+                || req.job_timeout_ms.is_none())
+        {
+            return curvine_core_error::err_box!(
+                "fenced replication requires token, attempt and deadline"
+            );
+        }
+        let attempt_id = req.attempt_id.clone();
         let response = match self.manager.accept_job(req.into()) {
             Ok(_) => SubmitBlockReplicationResponse {
                 success: true,
                 message: None,
+                attempt_id,
             },
             Err(e) => SubmitBlockReplicationResponse {
                 success: false,
                 message: e.to_string().into(),
+                attempt_id,
             },
         };
         ctx.response(response)
@@ -61,7 +76,38 @@ impl MessageHandler for WorkerReplicationHandler {
         let ctx = &mut rpc_context;
 
         let response = match code {
-            RpcCode::SubmitBlockReplicationJob => self.accept_job(ctx),
+            RpcCode::SubmitBlockReplicationJob | RpcCode::SubmitFencedReplication => {
+                self.accept_job(ctx)
+            }
+            RpcCode::PrepareReplication => {
+                let req: PrepareReplicationRequest = ctx.parse_header()?;
+                let block_id = req.block_id;
+                let response = self.manager.target.prepare(req)?;
+                crate::fault_point! {
+                    sync,
+                    name: "worker.replication.prepared",
+                    description: "after reserving the target but before returning its token",
+                    context: {"block_id" => block_id},
+                    return_error: |fault| curvine_core_error::err_box!("{}", fault.message),
+                }
+                let _ = block_id;
+                ctx.response(response)
+            }
+            RpcCode::ReconcileReplication => {
+                let req: ReconcileReplicationRequest = ctx.parse_header()?;
+                let block_id = req.block_id;
+                let response = self.manager.target.reconcile(req)?;
+                crate::fault_point! {
+                    sync,
+                    name: "worker.replication.reconciled",
+                    description: "after revoking the target but before returning cleanup evidence",
+                    context: {"block_id" => block_id},
+                    return_error: |fault| curvine_core_error::err_box!("{}", fault.message),
+                }
+                let _ = block_id;
+                ctx.response(response)
+            }
+            RpcCode::WriteReplicationBlock => self.manager.target.write(msg),
             _ => Err(FsError::Common(ErrorImpl::with_source(
                 format!("Unsupported operation: {:?}", code).into(),
             ))),

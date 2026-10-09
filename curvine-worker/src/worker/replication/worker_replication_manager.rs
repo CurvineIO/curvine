@@ -54,9 +54,35 @@ where
     }
 }
 
+fn build_report_request(
+    job: &ReplicationJob,
+    err_msg: Option<String>,
+) -> CommonResult<ReportBlockReplicationRequest> {
+    let success = err_msg.is_none();
+    let storage_type = match job.storage_type {
+        Some(storage_type) => storage_type,
+        None if !success => Default::default(),
+        None => {
+            return err_box!(
+                "missing storage type when reporting successful replication for block {}",
+                job.block_id
+            );
+        }
+    };
+
+    Ok(ReportBlockReplicationRequest {
+        block_id: job.block_id,
+        storage_type: storage_type.into(),
+        success,
+        message: err_msg,
+        attempt_id: job.attempt_id.clone(),
+    })
+}
+
 #[derive(Clone)]
 pub struct WorkerReplicationManager {
     block_store: BlockStore,
+    pub(super) target: Arc<super::replication_target::ReplicationTarget>,
     replication_semaphore: Arc<Semaphore>,
     jobs_queue_sender: Arc<Sender<ReplicationJob>>,
     fs_client_context: Arc<FsContext>,
@@ -71,10 +97,15 @@ impl WorkerReplicationManager {
         async_runtime: &Arc<AsyncRuntime>,
         conf: &ClusterConf,
         fs_client_context: &Arc<FsContext>,
+        session_id: String,
     ) -> Arc<Self> {
         let (send, recv) = tokio::sync::mpsc::channel(Semaphore::MAX_PERMITS);
         let handler = Self {
             block_store: block_store.clone(),
+            target: Arc::new(super::replication_target::ReplicationTarget::new(
+                block_store.clone(),
+                session_id,
+            )),
             replication_semaphore: Arc::new(Semaphore::new(
                 conf.worker.block_replication_concurrency_limit,
             )),
@@ -95,18 +126,53 @@ impl WorkerReplicationManager {
         async_runtime: Arc<AsyncRuntime>,
         mut recv: Receiver<ReplicationJob>,
     ) {
+        let target = me.target.clone();
+        async_runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                target.reap();
+            }
+        });
         let manager = me.clone();
         async_runtime.spawn(async move {
             while let Some(mut job) = recv.recv().await {
-                let msg = match manager.replicate_block(&mut job).await {
+                let result = if let Some(ms) = job.job_timeout_ms {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(ms),
+                        manager.replicate_block(&mut job),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => err_box!("replication copy deadline exceeded"),
+                    }
+                } else {
+                    manager.replicate_block(&mut job).await
+                };
+                let msg = match result {
                     Ok(_) => None,
                     Err(e) => {
                         error!("Errors on replicating block: {}. err: {}", job.block_id, e);
                         Some(e.to_string())
                     }
                 };
-                if let Err(e) = manager.report_job(&job, msg).await {
-                    error!("Errors on reporting block: {}. err: {}", job.block_id, e);
+                let report = async {
+                    if let Err(e) = manager.report_job(&job, msg).await {
+                        error!("Errors on reporting block: {}. err: {}", job.block_id, e);
+                    }
+                };
+                if let Some(ms) = job.job_timeout_ms {
+                    if tokio::time::timeout(std::time::Duration::from_millis(ms), report)
+                        .await
+                        .is_err()
+                    {
+                        error!(
+                            "Replication result report timed out for block {}",
+                            job.block_id
+                        );
+                    }
+                } else {
+                    report.await;
                 }
             }
         });
@@ -117,18 +183,14 @@ impl WorkerReplicationManager {
         job: &ReplicationJob,
         err_msg: Option<String>,
     ) -> CommonResult<ReportBlockReplicationResponse> {
-        let Some(storage_type) = job.storage_type else {
-            return err_box!(
-                "missing storage type when reporting replication result for block {}",
-                job.block_id
-            );
-        };
-        let request = ReportBlockReplicationRequest {
-            block_id: job.block_id,
-            storage_type: storage_type.into(),
-            success: err_msg.is_none(),
-            message: err_msg,
-        };
+        crate::fault_point! {
+            async,
+            name: "worker.replication.before_report",
+            description: "Before a replication result is sent to the Master",
+            context: { "block_id" => job.block_id },
+            return_error: |fault| async move { err_box!("{}", fault.message) },
+        }
+        let request = build_report_request(job, err_msg)?;
 
         let Some(master_client) = self.master_client.get() else {
             return err_box!("master client is not initialized for worker replication reporting");
@@ -142,6 +204,13 @@ impl WorkerReplicationManager {
     }
 
     async fn replicate_block(&self, job: &mut ReplicationJob) -> CommonResult<()> {
+        crate::fault_point! {
+            async,
+            name: "worker.replication.before_copy",
+            description: "Before an acknowledged job starts copying its source block",
+            context: { "block_id" => job.block_id },
+            return_error: |fault| async move { err_box!("{}", fault.message) },
+        }
         let _permit = match self.replication_semaphore.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(e) => return err_box!("replication semaphore closed: {}", e),
@@ -152,8 +221,6 @@ impl WorkerReplicationManager {
         if block_meta.state != BlockState::Finalized {
             return err_box!("Block: {} is not finalized", job.block_id);
         }
-        // update the storage type for the replication job.
-        job.with_storage_type(block_meta.storage_type());
         let extend_block =
             ExtendedBlock::new(block_meta.id, 0, block_meta.storage_type(), FileType::File);
         let target_capacity = block_meta.replication_capacity();
@@ -165,20 +232,30 @@ impl WorkerReplicationManager {
             block_meta.len,
             target_capacity
         );
-        let mut writer = BlockWriterRemote::new(
+        let mut writer = BlockWriterRemote::new_replication(
             &self.fs_client_context,
             extend_block,
             job.target_worker_addr.clone(),
             0,
             target_capacity,
+            job.target_token.clone(),
         )
         .await?;
+        // The destination may fall back from the requested source tier. Report the tier that the
+        // remote writer actually opened so Master persists the real target block location.
+        job.with_storage_type(writer.actual_storage_type());
         let replication_result: CommonResult<()> = async {
             let mut remaining = block_meta.len;
             while remaining > 0 {
                 let size = remaining.min(self.replicate_chunk_size as i64);
                 let slice = reader.read_region(true, size as i32)?;
                 let read_len = slice.len() as i64;
+                if read_len == 0 {
+                    return err_box!(
+                        "unexpected end of replication source block {}",
+                        job.block_id
+                    );
+                }
                 writer.write(slice).await?;
                 remaining -= read_len;
             }
@@ -211,11 +288,55 @@ impl WorkerReplicationManager {
 
 #[cfg(test)]
 mod tests {
-    use super::finish_replication_with_cleanup;
+    use super::{build_report_request, finish_replication_with_cleanup};
+    use crate::worker::replication::replication_job::ReplicationJob;
     use curvine_core_error::{err_box, CommonResult};
     use curvine_error::FsError;
+    use curvine_model::{StorageType, WorkerAddress};
+    use curvine_proto::StorageTypeProto;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    fn job(storage_type: Option<StorageType>) -> ReplicationJob {
+        ReplicationJob {
+            block_id: 7,
+            target_worker_addr: WorkerAddress::default(),
+            storage_type,
+            attempt_id: Some("attempt-7".to_string()),
+            target_token: None,
+            job_timeout_ms: None,
+        }
+    }
+
+    #[test]
+    fn failure_report_does_not_require_storage_type() -> CommonResult<()> {
+        let request = build_report_request(&job(None), Some("source block missing".to_string()))?;
+
+        assert!(!request.success);
+        assert_eq!(request.storage_type, StorageTypeProto::Disk as i32);
+        assert_eq!(request.message.as_deref(), Some("source block missing"));
+        assert_eq!(request.attempt_id.as_deref(), Some("attempt-7"));
+        Ok(())
+    }
+
+    #[test]
+    fn successful_report_requires_storage_type() {
+        let error = build_report_request(&job(None), None)
+            .expect_err("successful reports must contain the actual storage type");
+        assert!(error
+            .to_string()
+            .contains("missing storage type when reporting successful replication"));
+    }
+
+    #[test]
+    fn successful_report_preserves_storage_type_and_attempt() -> CommonResult<()> {
+        let request = build_report_request(&job(Some(StorageType::Ssd)), None)?;
+
+        assert!(request.success);
+        assert_eq!(request.storage_type, StorageTypeProto::Ssd as i32);
+        assert_eq!(request.attempt_id.as_deref(), Some("attempt-7"));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn successful_replication_skips_cancel() -> CommonResult<()> {

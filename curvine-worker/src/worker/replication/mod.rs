@@ -15,3 +15,5 @@
 pub mod replication_job;
 pub mod worker_replication_handler;
 pub mod worker_replication_manager;
+
+pub(crate) mod replication_target;

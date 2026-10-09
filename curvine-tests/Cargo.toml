@@ -16,6 +16,7 @@ oss-hdfs = ["curvine-client/oss-hdfs"]
 # --fdb / --features fdb to build the test harness with the libfdb_c
 # link-time dependency.
 default = []
+fault-injection = ["curvine-server/fault-injection", "curvine-fault/fault-injection"]
 fdb = ["curvine-server/fdb"]
 lancedb = [
     "dep:curvine-lancedb",
@@ -32,6 +33,7 @@ path = "tests/lancedb_object_store_e2e.rs"
 required-features = ["lancedb"]
 
 [dependencies]
+curvine-fault = { workspace = true }
 curvine-core-error = { workspace = true }
 curvine-runtime = { workspace = true }
 curvine-rpc = { workspace = true }

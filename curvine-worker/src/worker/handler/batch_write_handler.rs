@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::block::BlockStore;
+use crate::worker::block::{BlockStore, BlockWriteLease};
 use crate::worker::handler::WriteContext;
 use crate::worker::handler::WriteHandler;
 use crate::worker::storage::BlockWriteContext;
@@ -33,8 +33,17 @@ pub struct BatchWriteHandler {
     pub(crate) store: BlockStore,
     pub(crate) context: Option<Vec<WriteContext>>,
     pub(crate) file: Option<Vec<Option<BlockWriteContext>>>,
+    leases: Vec<Option<BlockWriteLease>>,
     pub(crate) is_commit: bool,
     pub(crate) write_handler: WriteHandler,
+}
+
+impl Drop for BatchWriteHandler {
+    fn drop(&mut self) {
+        self.file.take();
+        self.write_handler.file.take();
+        self.leases.clear();
+    }
 }
 
 impl BatchWriteHandler {
@@ -44,6 +53,7 @@ impl BatchWriteHandler {
             store,
             context: None,
             file: None,
+            leases: Vec::new(),
             is_commit: false,
             write_handler: WriteHandler::new(store_clone, client_addr)?,
         })
@@ -77,6 +87,10 @@ impl BatchWriteHandler {
         let mut responses = Vec::with_capacity(header.blocks.len());
         let mut files = Vec::with_capacity(header.blocks.len());
         let mut contexts = Vec::with_capacity(header.blocks.len());
+        if !self.leases.is_empty() {
+            return err_box!("previous batch write is still active");
+        }
+        let mut leases = Vec::new();
         self.is_commit = false;
 
         for (i, block_proto) in header.blocks.iter().cloned().enumerate() {
@@ -109,6 +123,7 @@ impl BatchWriteHandler {
             let response = match self.write_handler.open(&single_msg_req) {
                 Ok(response) => response,
                 Err(e) => {
+                    files.clear();
                     Self::abort_open_contexts(&self.store, &contexts);
                     return Err(e);
                 }
@@ -116,6 +131,7 @@ impl BatchWriteHandler {
 
             // Extract file and context from handler and store in batch vectors
             let Some(context) = self.write_handler.context.take() else {
+                files.clear();
                 Self::abort_open_contexts(&self.store, &contexts);
                 return err_box!(
                     "batch open did not create write context for block index {}",
@@ -125,6 +141,7 @@ impl BatchWriteHandler {
             let block_response: BlockWriteResponse = match response.parse_header() {
                 Ok(response) => response,
                 Err(e) => {
+                    self.write_handler.file.take();
                     if let Err(abort_err) = self.store.abort_block(&context.block) {
                         log::warn!(
                             "failed to abort batch-opened block {} after response parse error: {}",
@@ -132,6 +149,7 @@ impl BatchWriteHandler {
                             abort_err
                         );
                     }
+                    files.clear();
                     Self::abort_open_contexts(&self.store, &contexts);
                     return Err(e.into());
                 }
@@ -139,8 +157,10 @@ impl BatchWriteHandler {
             responses.push(block_response);
             files.push(self.write_handler.file.take());
             contexts.push(context);
+            leases.push(self.write_handler.lease.take());
         }
         self.file = Some(files);
+        self.leases = leases;
         self.context = Some(contexts);
         let batch_response = BlocksBatchWriteResponse { responses };
 
@@ -223,6 +243,7 @@ impl BatchWriteHandler {
             results.push(true);
         }
         self.is_commit = true;
+        self.leases.clear();
         let batch_response = BlocksBatchCommitResponse { results };
 
         Ok(Builder::success(msg).proto_header(batch_response).build())

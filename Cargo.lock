@@ -3033,6 +3033,7 @@ dependencies = [
  "curvine-config",
  "curvine-core-error",
  "curvine-error",
+ "curvine-fault",
  "curvine-fs-api",
  "curvine-fuse",
  "curvine-io",

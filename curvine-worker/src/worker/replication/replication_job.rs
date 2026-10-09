@@ -20,6 +20,9 @@ pub struct ReplicationJob {
     pub block_id: i64,
     pub target_worker_addr: WorkerAddress,
     pub storage_type: Option<StorageType>,
+    pub attempt_id: Option<String>,
+    pub target_token: Option<String>,
+    pub job_timeout_ms: Option<u64>,
 }
 
 impl From<SubmitBlockReplicationRequest> for ReplicationJob {
@@ -28,6 +31,9 @@ impl From<SubmitBlockReplicationRequest> for ReplicationJob {
             block_id: val.block_id,
             target_worker_addr: ProtoUtils::worker_address_from_pb(&val.target_worker_info),
             storage_type: None,
+            attempt_id: val.attempt_id,
+            target_token: val.target_token,
+            job_timeout_ms: val.job_timeout_ms,
         }
     }
 }

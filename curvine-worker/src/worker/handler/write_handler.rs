@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::block::BlockStore;
+use crate::worker::block::{BlockStore, BlockWriteLease};
 use crate::worker::handler::WriteContext;
 use crate::worker::storage::BlockWriteContext;
 use crate::worker::{Worker, WorkerMetrics};
@@ -50,6 +50,7 @@ pub struct WriteHandler {
     pub(crate) store: BlockStore,
     pub(crate) context: Option<WriteContext>,
     pub(crate) file: Option<BlockWriteContext>,
+    pub(crate) lease: Option<BlockWriteLease>,
     pub(crate) is_commit: bool,
     pub(crate) io_slow_us: u64,
     pub(crate) metrics: &'static WorkerMetrics,
@@ -64,6 +65,7 @@ impl WriteHandler {
             store,
             context: None,
             file: None,
+            lease: None,
             is_commit: false,
             io_slow_us: conf.worker.io_slow_us(),
             metrics,
@@ -115,6 +117,10 @@ impl WriteHandler {
                 context.block_size
             );
         }
+        if self.lease.is_some() {
+            return err_box!("previous write lease is still active");
+        }
+        let lease = self.store.ordinary_write_lease(context.block.id)?;
         self.is_commit = false;
 
         let open_block = ExtendedBlock {
@@ -208,6 +214,7 @@ impl WriteHandler {
 
         let _ = mem::replace(&mut self.file, file);
         let _ = self.context.replace(context);
+        self.lease = lease;
 
         self.metrics.write_blocks.with_label_values(&[label]).inc();
 
@@ -340,6 +347,7 @@ impl WriteHandler {
 
         self.commit_block(&context.block, commit)?;
         self.is_commit = true;
+        self.lease.take();
 
         info!(
             "write block end for req_id {}, is commit: {}, off: {}, len: {}, client: {}",
@@ -421,6 +429,8 @@ mod tests {
             },
             ..ClusterConf::default()
         };
+        // Initialize metrics/config explicitly; these tests must not depend on test order.
+        let _worker = Worker::with_conf(conf.clone())?;
         BlockStore::new("test", &conf).map_err(FsError::from)
     }
 
@@ -585,6 +595,7 @@ mod tests {
             store,
             context: Some(context),
             file: Some(file),
+            lease: None,
             is_commit: false,
             io_slow_us: 0,
             metrics: Worker::get_metrics()?,
@@ -642,6 +653,7 @@ mod tests {
             store,
             context: Some(context),
             file: Some(file),
+            lease: None,
             is_commit: false,
             io_slow_us: 0,
             metrics: Worker::get_metrics()?,

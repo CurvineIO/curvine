@@ -92,6 +92,10 @@ pub enum RpcCode {
     ReportTransferTaskBatch = 57,
     CloseFile = 58,
 
+    PrepareReplication = 65,
+    ReconcileReplication = 66,
+    SubmitFencedReplication = 67,
+
     MetricsReport = 60,
     GetBlockLocationsBatch = 61,
     UpdateRuntimeConfig = 62,
@@ -103,6 +107,7 @@ pub enum RpcCode {
     ReadBlock = 81,
     WriteBlocksBatch = 82,
     WriteCommitsBatch = 83,
+    WriteReplicationBlock = 84,
 }
 
 impl fmt::Display for RpcCode {

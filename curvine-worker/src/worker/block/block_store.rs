@@ -21,15 +21,50 @@ use curvine_config::ClusterConf;
 use curvine_core_error::{CommonError, CommonResult};
 use curvine_model::{ExtendedBlock, StorageInfo};
 use parking_lot::{Mutex, MutexGuard};
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 const BLOCK_LOCK_STRIPES: usize = 256;
 
+#[derive(Default)]
+struct BlockUse {
+    ordinary_writers: usize,
+    replication: Option<String>,
+}
+
+/// Keeps replication exclusive against active ordinary/batch/short-circuit RPC sessions
+/// and deletion. A disconnected short-circuit FD must additionally be isolated by
+/// unlinking its abandoned staging allocation before opening a replication successor.
+/// The writer's file must be closed before releasing this lease.
+pub(crate) struct BlockWriteLease {
+    uses: Arc<Vec<Mutex<HashMap<i64, BlockUse>>>>,
+    block_id: i64,
+    replication: bool,
+}
+
+impl Drop for BlockWriteLease {
+    fn drop(&mut self) {
+        let mut uses = self.uses[self.block_id as u64 as usize % self.uses.len()].lock();
+        if let Some(entry) = uses.get_mut(&self.block_id) {
+            if self.replication {
+                entry.replication = None;
+            } else {
+                entry.ordinary_writers -= 1;
+            }
+            if entry.replication.is_none() && entry.ordinary_writers == 0 {
+                uses.remove(&self.block_id);
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct BlockStore {
     state: Arc<RwLock<BlockDataset>>,
     block_locks: Arc<Vec<Mutex<()>>>,
+    uses: Arc<Vec<Mutex<HashMap<i64, BlockUse>>>>,
+    replication_owner: Option<String>,
 }
 
 impl BlockStore {
@@ -37,10 +72,81 @@ impl BlockStore {
         let dataset = BlockDataset::from_conf(cluster_id, conf)?;
         let block_store = BlockStore {
             state: Arc::new(RwLock::new(dataset)),
+            uses: Arc::new(
+                (0..BLOCK_LOCK_STRIPES)
+                    .map(|_| Mutex::new(HashMap::new()))
+                    .collect(),
+            ),
+            replication_owner: None,
             block_locks: Arc::new((0..BLOCK_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
         };
 
         Ok(block_store)
+    }
+
+    fn block_uses(&self, block_id: i64) -> &Mutex<HashMap<i64, BlockUse>> {
+        &self.uses[block_id as u64 as usize % self.uses.len()]
+    }
+
+    /// Existing ordinary writer concurrency is unchanged; only replication is exclusive.
+    pub(crate) fn ordinary_write_lease(
+        &self,
+        block_id: i64,
+    ) -> CommonResult<Option<BlockWriteLease>> {
+        if self.replication_owner.is_some() {
+            return Ok(None);
+        }
+        let _lock = self.block_lock(block_id, "write_lease");
+        self.check_replication_owner(block_id)?;
+        self.block_uses(block_id)
+            .lock()
+            .entry(block_id)
+            .or_default()
+            .ordinary_writers += 1;
+        Ok(Some(BlockWriteLease {
+            uses: self.uses.clone(),
+            block_id,
+            replication: false,
+        }))
+    }
+
+    pub(crate) fn replication_write_lease(
+        &self,
+        block_id: i64,
+        token: &str,
+    ) -> CommonResult<(Self, BlockWriteLease)> {
+        let _lock = self.block_lock(block_id, "replication_lease");
+        let mut uses = self.block_uses(block_id).lock();
+        let entry = uses.entry(block_id).or_default();
+        if entry.replication.is_some() || entry.ordinary_writers != 0 {
+            return curvine_core_error::err_box!("block {} has an active writer", block_id);
+        }
+        entry.replication = Some(token.to_owned());
+        let mut scoped = self.clone();
+        scoped.replication_owner = Some(token.to_owned());
+        Ok((
+            scoped,
+            BlockWriteLease {
+                uses: self.uses.clone(),
+                block_id,
+                replication: true,
+            },
+        ))
+    }
+
+    // Called under the block stripe lock, so acquisition cannot race admission/removal.
+    fn check_replication_owner(&self, block_id: i64) -> CommonResult<()> {
+        let uses = self.block_uses(block_id).lock();
+        let owner = uses
+            .get(&block_id)
+            .and_then(|entry| entry.replication.as_deref());
+        if owner != self.replication_owner.as_deref() {
+            return curvine_core_error::err_box!(
+                "block {} is fenced by a replication writer",
+                block_id
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn write(&self) -> CommonResult<RwLockWriteGuard<'_, BlockDataset>> {
@@ -127,6 +233,7 @@ impl BlockStore {
 
     pub fn open_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         let _block_lock = self.block_lock(block.id, "open");
+        self.check_replication_owner(block.id)?;
         let reservation =
             self.with_dataset_write("open", |state| state.reserve_file_open(block))?;
 
@@ -158,6 +265,7 @@ impl BlockStore {
 
     pub fn finalize_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         let _block_lock = self.block_lock(block.id, "finalize");
+        self.check_replication_owner(block.id)?;
         let reservation =
             self.with_dataset_write("finalize", |state| state.reserve_file_finalize(block))?;
 
@@ -231,7 +339,24 @@ impl BlockStore {
 
     pub fn abort_block(&self, block: &ExtendedBlock) -> CommonResult<()> {
         let _block_lock = self.block_lock(block.id, "abort");
+        self.check_replication_owner(block.id)?;
         self.with_dataset_write("abort", |state| state.abort_block(block))
+    }
+
+    pub(crate) fn abort_replication_write(&self, block_id: i64) -> CommonResult<()> {
+        let _lock = self.block_lock(block_id, "abort_replication");
+        self.check_replication_owner(block_id)?;
+        self.with_dataset_write("abort_replication", |state| {
+            // complete/open error paths may already have rolled back to an old committed
+            // generation. A second abort must not delete that finalized replica.
+            if state
+                .get_block(block_id)
+                .is_some_and(|meta| !meta.is_final())
+            {
+                state.abort_block(&ExtendedBlock::with_id(block_id))?;
+            }
+            Ok(())
+        })
     }
 
     pub fn get_block(&self, id: i64) -> CommonResult<BlockMeta> {
@@ -353,6 +478,7 @@ impl BlockStore {
 
     pub fn remove_block(&self, id: i64) -> CommonResult<()> {
         let _block_lock = self.block_lock(id, "remove");
+        self.check_replication_owner(id)?;
         let block = ExtendedBlock::with_id(id);
         self.with_dataset_write("remove", |state| state.remove_block(&block))
     }
@@ -360,6 +486,10 @@ impl BlockStore {
     // Asynchronously delete block.
     pub fn async_remove_block(&self, id: i64) -> CommonResult<Option<BlockMeta>> {
         let _block_lock = self.block_lock(id, "remove");
+        if let Err(error) = self.check_replication_owner(id) {
+            self.write()?.decrement_blocks_to_delete();
+            return Err(error);
+        }
         let removed = self.with_dataset_write("remove", |state| {
             let remove_result = match state.get_block(id) {
                 Some(_) => state.remove_block_state_by_id(id).map(Some),

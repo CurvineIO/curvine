@@ -17,7 +17,7 @@ use curvine_client::file::CurvineFileSystem;
 use curvine_config::ClusterConf;
 use curvine_core_error::{CommonError, CommonResult};
 use curvine_fs_api::{Path, Reader, Writer};
-use curvine_model::{BlockLocation, CreateFileOptsBuilder, FileBlocks, WorkerAddress};
+use curvine_model::{BlockLocation, CreateFileOptsBuilder, FileBlocks, StorageType, WorkerAddress};
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::RpcRuntime;
 use curvine_tests::Testing;
@@ -100,74 +100,103 @@ fn test_block_replication_e2e() -> CommonResult<()> {
         info!("Block {} has {} replicas", block_id, locations.len());
     }
 
-    // Step 3: Simulate under-replication by reporting blocks as missing
-    // In a real scenario, this would happen when a worker fails
+    // Step 3: Remove one real metadata location so the block is genuinely
+    // under-replicated. Merely submitting an already healthy block would ask the
+    // scheduler to exceed the file's configured replica count.
     let master_replication_manager = cluster.get_active_master_replication_manager();
     let master_filesystem = cluster.get_active_master_fs();
-
-    // Pick the first block and simulate it becoming under-replicated
     let first_block = file_blocks.block_locs.first().unwrap();
     let block_id = first_block.block.id;
-    let locations = &first_block.locs;
+    let target_replica_count = file_blocks.status.replicas as usize;
+    let removed_location = first_block
+        .locs
+        .last()
+        .expect("replication test file must have at least one location")
+        .clone();
 
     info!("Simulating under-replication for block {}", block_id);
+    let fs_dir = master_filesystem.fs_dir();
+    fs_dir.write().block_report(vec![(
+        false,
+        block_id,
+        BlockLocation {
+            worker_id: removed_location.worker_id,
+            storage_type: Default::default(),
+        },
+    )])?;
+    let under_replicated_locations =
+        rt.block_on(async { get_block_locations(&fs, &path).await })?;
+    assert_eq!(
+        target_replica_count - 1,
+        replica_count(&under_replicated_locations, block_id)
+    );
 
-    // Report that this block is under-replicated
-    // We'll use worker_id 1 (assuming it exists)
-    master_replication_manager.report_under_replicated_blocks(1, vec![block_id])?;
+    master_replication_manager
+        .report_under_replicated_blocks(removed_location.worker_id, vec![block_id])?;
 
-    // Step 4: Wait for replication to complete
+    // Step 4: Wait until replication restores the configured replica count.
     info!("Waiting for replication to complete...");
-    Utils::sleep(5000); // Give time for replication process
-
-    // Step 5: Verify that the block has been replicated
-    let final_locations = rt.block_on(async { get_block_locations(&fs, &path).await })?;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let final_locations = loop {
+        let current_locations = rt.block_on(async { get_block_locations(&fs, &path).await })?;
+        let current_replica_count = replica_count(&current_locations, block_id);
+        if current_replica_count == target_replica_count {
+            break current_locations;
+        }
+        if Instant::now() >= deadline {
+            return Err(CommonError::from(format!(
+                "block {} did not recover its configured replica count before timeout (expected={}, actual={})",
+                block_id, target_replica_count, current_replica_count
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
 
     info!("Final block locations after replication:");
     for (block_id, locations) in &final_locations {
         info!("Block {} has {} replicas", block_id, locations.len());
     }
 
-    let target_block_locations = final_locations.get(&block_id);
-    if let Some(locations) = target_block_locations {
-        info!("Target block locations: {}", locations.len());
-        if locations.len() > replica_count(&initial_locations, block_id) {
-            info!(
-                "✓ Block replication succeeded - block {} now has {} replicas",
-                block_id,
-                locations.len()
-            );
-        } else {
-            return Err(CommonError::from(
-                "Block replication did not increase replica count",
-            ));
-        }
-    } else {
-        return Err(CommonError::from(
-            "Target block not found in final locations",
-        ));
-    }
+    let target_block_locations = final_locations
+        .get(&block_id)
+        .ok_or_else(|| CommonError::from("Target block not found in final locations"))?;
+    let replicated_location = target_block_locations
+        .iter()
+        .find(|candidate| {
+            !under_replicated_locations
+                .get(&block_id)
+                .is_some_and(|locations| {
+                    locations
+                        .iter()
+                        .any(|location| location.worker_id == candidate.worker_id)
+                })
+        })
+        .ok_or_else(|| CommonError::from("No new replication target was recorded"))?;
 
-    // step 6: to remove other block locations to check the replicated block effectiveness
-    let fs_dir = master_filesystem.fs_dir();
-    {
-        let mut fs_dir = fs_dir.write();
-        let mut reports = vec![];
-        for addr in locations {
-            reports.push((
+    // Step 5: Keep only the location produced by replication and verify it can
+    // serve the complete file.
+    let reports = target_block_locations
+        .iter()
+        .filter(|location| location.worker_id != replicated_location.worker_id)
+        .map(|location| {
+            (
                 false,
                 block_id,
                 BlockLocation {
-                    worker_id: addr.worker_id,
+                    worker_id: location.worker_id,
                     storage_type: Default::default(),
                 },
-            ));
-        }
-        fs_dir.block_report(reports)?;
-    }
+            )
+        })
+        .collect();
+    fs_dir.write().block_report(reports)?;
     let latest_locations = rt.block_on(async { get_block_locations(&fs, &path).await })?;
     let first_block_locations = latest_locations.get(&block_id).unwrap();
     assert_eq!(1, first_block_locations.len());
+    assert_eq!(
+        replicated_location.worker_id,
+        first_block_locations[0].worker_id
+    );
 
     // Step 7: Verify data integrity
     info!("Verifying data integrity after replication");
@@ -181,6 +210,104 @@ fn test_block_replication_e2e() -> CommonResult<()> {
     }
 
     info!("✅ End-to-end replication test completed successfully");
+    Ok(())
+}
+
+/// Replication reports the destination writer's actual storage tier after fallback.
+#[test]
+fn test_replication_persists_destination_actual_storage_type() -> CommonResult<()> {
+    const REPLICATION_TIMEOUT: Duration = Duration::from_secs(8);
+    const REPLICATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+    let testing = Testing::builder()
+        .default()
+        .masters(1)
+        .workers(3)
+        .mutate_conf(|conf| {
+            conf.master.worker_policy = "robin".to_string();
+            conf.master.min_replication = 1;
+            conf.master.max_replication = 3;
+            conf.master.block_replication_enabled = true;
+        })
+        .mutate_worker_conf(|index, conf| {
+            let storage_type = if index < 2 { "MEM" } else { "DISK" };
+            conf.worker.data_dir = conf
+                .worker
+                .data_dir
+                .iter()
+                .map(|path| format!("[{storage_type}:512MB]{path}"))
+                .collect();
+        })
+        .build()?;
+    let cluster = testing.start_cluster()?;
+    let mem_worker_ports = [
+        cluster.worker_conf[0].worker.rpc_port as u32,
+        cluster.worker_conf[1].worker.rpc_port as u32,
+    ];
+    let disk_worker_port = cluster.worker_conf[2].worker.rpc_port as u32;
+    let mut conf = testing.get_active_cluster_conf()?;
+    conf.client.replicas = 2;
+    conf.client.short_circuit = false;
+    conf.client.storage_type = StorageType::Mem;
+    conf.client.storage_type_str = "mem".to_string();
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+
+    let path = Path::from_str("/replication_actual_storage_type.data")?;
+    let test_data = generate_test_data(16 * 1024);
+    let file_blocks =
+        rt.block_on(async { write_test_file_with_replicas(&fs, &path, &test_data, 2).await })?;
+    let block = file_blocks
+        .block_locs
+        .first()
+        .ok_or_else(|| CommonError::from("replication fallback test created no blocks"))?;
+    assert_eq!(block.locs.len(), 2);
+    assert!(block
+        .locs
+        .iter()
+        .all(|location| mem_worker_ports.contains(&location.rpc_port)));
+    let block_id = block.block.id;
+    let retained_source = block.locs[0].clone();
+    let removed_source = block.locs[1].clone();
+
+    let master_fs = cluster.get_active_master_fs();
+    master_fs.fs_dir.write().block_report(vec![(
+        false,
+        block_id,
+        BlockLocation::new(removed_source.worker_id, StorageType::Mem),
+    )])?;
+    cluster
+        .get_active_master_replication_manager()
+        .report_under_replicated_blocks(removed_source.worker_id, vec![block_id])?;
+
+    let deadline = Instant::now() + REPLICATION_TIMEOUT;
+    let replicated_location = loop {
+        let blocks = rt.block_on(async { fs.get_block_locations(&path).await })?;
+        let locations = &blocks.block_locs[0].locs;
+        if let Some(location) = locations
+            .iter()
+            .find(|location| location.worker_id != retained_source.worker_id)
+        {
+            break location.clone();
+        }
+        if Instant::now() >= deadline {
+            return Err(CommonError::from(format!(
+                "block {block_id} did not replicate to the Disk-only worker before timeout"
+            )));
+        }
+        std::thread::sleep(REPLICATION_POLL_INTERVAL);
+    };
+
+    assert_eq!(replicated_location.rpc_port, disk_worker_port);
+    let locations = master_fs.fs_dir.read().get_block_locations(block_id)?;
+    let target_location = locations
+        .iter()
+        .find(|location| location.worker_id == replicated_location.worker_id)
+        .ok_or_else(|| CommonError::from("replicated target missing from Master metadata"))?;
+    assert_eq!(target_location.storage_type, StorageType::Disk);
+
+    let read_data = rt.block_on(async { read_test_file(&fs, &path).await })?;
+    assert_eq!(read_data, test_data);
     Ok(())
 }
 
@@ -306,49 +433,79 @@ fn test_replication_honors_source_block_capacity() -> CommonResult<()> {
         .find(|block| block.block.len > CLIENT_DEFAULT_BLOCK_SIZE)
         .expect("missing block larger than the worker client default");
     let block_id = oversized_block.block.id;
-    let original_locations = oversized_block.locs.clone();
+    let target_replica_count = file_blocks.status.replicas as usize;
+    let removed_location = oversized_block
+        .locs
+        .last()
+        .expect("replication test file must have at least one location")
+        .clone();
 
-    let initial_locations = rt.block_on(async { get_block_locations(&fs, &path).await })?;
-    let initial_replica_count = replica_count(&initial_locations, block_id);
+    let fs_dir = cluster.get_active_master_fs().fs_dir();
+    fs_dir.write().block_report(vec![(
+        false,
+        block_id,
+        BlockLocation {
+            worker_id: removed_location.worker_id,
+            storage_type: Default::default(),
+        },
+    )])?;
+    let under_replicated_locations =
+        rt.block_on(async { get_block_locations(&fs, &path).await })?;
+    assert_eq!(
+        target_replica_count - 1,
+        replica_count(&under_replicated_locations, block_id)
+    );
 
     cluster
         .get_active_master_replication_manager()
-        .report_under_replicated_blocks(1, vec![block_id])?;
+        .report_under_replicated_blocks(removed_location.worker_id, vec![block_id])?;
 
     let deadline = Instant::now() + REPLICATION_TIMEOUT;
-    loop {
+    let final_locations = loop {
         let current_locations = rt.block_on(async { get_block_locations(&fs, &path).await })?;
         let current_replica_count = replica_count(&current_locations, block_id);
-        if current_replica_count > initial_replica_count {
-            break;
+        if current_replica_count == target_replica_count {
+            break current_locations;
         }
         if Instant::now() >= deadline {
             return Err(CommonError::from(format!(
-                "oversized block {} did not gain a replica before timeout (before={}, after={})",
-                block_id, initial_replica_count, current_replica_count
+                "oversized block {} did not recover its configured replica count before timeout (expected={}, actual={})",
+                block_id, target_replica_count, current_replica_count
             )));
         }
         std::thread::sleep(REPLICATION_POLL_INTERVAL);
-    }
+    };
 
-    let fs_dir = cluster.get_active_master_fs().fs_dir();
-    {
-        let mut fs_dir = fs_dir.write();
-        let reports = original_locations
-            .iter()
-            .map(|location| {
-                (
-                    false,
-                    block_id,
-                    BlockLocation {
-                        worker_id: location.worker_id,
-                        storage_type: Default::default(),
-                    },
-                )
-            })
-            .collect();
-        fs_dir.block_report(reports)?;
-    }
+    let final_block_locations = final_locations
+        .get(&block_id)
+        .ok_or_else(|| CommonError::from("oversized block missing after replication"))?;
+    let replicated_location = final_block_locations
+        .iter()
+        .find(|candidate| {
+            !under_replicated_locations
+                .get(&block_id)
+                .is_some_and(|locations| {
+                    locations
+                        .iter()
+                        .any(|location| location.worker_id == candidate.worker_id)
+                })
+        })
+        .ok_or_else(|| CommonError::from("No new oversized-block replication target found"))?;
+    let reports = final_block_locations
+        .iter()
+        .filter(|location| location.worker_id != replicated_location.worker_id)
+        .map(|location| {
+            (
+                false,
+                block_id,
+                BlockLocation {
+                    worker_id: location.worker_id,
+                    storage_type: Default::default(),
+                },
+            )
+        })
+        .collect();
+    fs_dir.write().block_report(reports)?;
     let latest_locations = rt.block_on(async { get_block_locations(&fs, &path).await })?;
     assert_eq!(1, replica_count(&latest_locations, block_id));
 
@@ -367,9 +524,18 @@ async fn write_test_file(
     path: &Path,
     data: &[u8],
 ) -> CommonResult<FileBlocks> {
+    write_test_file_with_replicas(fs, path, data, 2).await
+}
+
+async fn write_test_file_with_replicas(
+    fs: &CurvineFileSystem,
+    path: &Path,
+    data: &[u8],
+    replicas: i32,
+) -> CommonResult<FileBlocks> {
     let opts = CreateFileOptsBuilder::with_conf(&fs.fs_context().cluster_conf().client)
         .client_name(fs.fs_context().clone_client_name())
-        .replicas(2)
+        .replicas(replicas)
         .create_parent(true)
         .build();
     let mut writer = fs.create_with_opts(path, opts, true).await?;
@@ -432,4 +598,412 @@ fn generate_test_data(size: usize) -> Vec<u8> {
     }
 
     data
+}
+
+/// Exercise the actual submit/ACK/deadline/reaper/metadata chain, not the tracker in isolation.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn test_lost_replication_result_releases_scheduler_and_repairs_block() -> CommonResult<()> {
+    replication_recovery_scenario(false, false)
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn test_failed_copy_and_lost_result_are_retried_without_heartbeat() -> CommonResult<()> {
+    replication_recovery_scenario(true, false)
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn test_metadata_failure_retries_result_without_recopying() -> CommonResult<()> {
+    replication_recovery_scenario(false, true)
+}
+
+#[cfg(feature = "fault-injection")]
+fn replication_recovery_scenario(fail_copy: bool, fail_metadata: bool) -> CommonResult<()> {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    struct Rules(Vec<String>);
+    impl Drop for Rules {
+        fn drop(&mut self) {
+            for id in &self.0 {
+                let _ = FaultRuntime::process().remove(id);
+            }
+        }
+    }
+    let testing = Testing::builder()
+        .default()
+        .masters(1)
+        .workers(3)
+        .mutate_conf(|conf| {
+            conf.client.block_size_str = "64KB".into();
+            conf.master.min_block_size = 64 * 1024;
+            conf.master.min_replication = 1;
+            conf.master.max_replication = 3;
+            conf.master.block_replication_enabled = true;
+            conf.master.block_replication_concurrency_limit = 1;
+            conf.master.block_replication_job_timeout = "2s".into();
+            conf.master.block_replication_retry_interval = "100ms".into();
+        })
+        .build()?;
+    let cluster = testing.start_cluster()?;
+    let conf = testing.get_active_cluster_conf()?;
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+    // MiniClusters share one process-wide fault runtime. Their inode allocators start
+    // at the same ID, so reserve distinct IDs for each recovery scenario.
+    for index in 0..(if fail_copy {
+        2
+    } else if fail_metadata {
+        4
+    } else {
+        0
+    }) {
+        let path = Path::from_str(format!("/recovery-padding-{index}"))?;
+        rt.block_on(write_test_file_with_replicas(&fs, &path, b"padding", 1))?;
+    }
+    let a = Path::from_str("/lost-result-a")?;
+    let b = Path::from_str("/lost-result-b")?;
+    let data = generate_test_data(4096);
+    let fa = rt.block_on(write_test_file_with_replicas(&fs, &a, &data, 2))?;
+    let fb = rt.block_on(write_test_file_with_replicas(&fs, &b, &data, 2))?;
+    let aid = fa.block_locs[0].block.id;
+    let bid = fb.block_locs[0].block.id;
+    let runtime = FaultRuntime::process();
+    let drop_id = format!("drop-result-{aid}");
+    let ack_id = format!("record-ack-{aid}");
+    let copy_id = format!("a-record-copy-{aid}");
+    let fail_copy_id = format!("b-fail-copy-{aid}");
+    let metadata_id = format!("fail-metadata-{aid}");
+    let _rules = Rules(vec![
+        drop_id.clone(),
+        ack_id.clone(),
+        copy_id.clone(),
+        fail_copy_id.clone(),
+        metadata_id.clone(),
+    ]);
+    runtime.configure(
+        &copy_id,
+        FaultRuleBuilder::named("worker.replication.before_copy")
+            .matches("block_id", aid)?
+            .record()?,
+    )?;
+    if fail_copy {
+        runtime.configure(
+            &fail_copy_id,
+            FaultRuleBuilder::named("worker.replication.before_copy")
+                .matches("block_id", aid)?
+                .times(1)?
+                .return_error("source lost before copy")?,
+        )?;
+    }
+    if fail_metadata {
+        runtime.configure(
+            &metadata_id,
+            FaultRuleBuilder::named("master.replication.before_metadata_commit")
+                .matches("block_id", aid)?
+                .times(2)?
+                .return_error("metadata unavailable")?,
+        )?;
+    }
+    runtime.configure(
+        &drop_id,
+        FaultRuleBuilder::named("worker.replication.before_report")
+            .matches("block_id", aid)?
+            .times(1)?
+            .return_error("drop A result")?,
+    )?;
+    runtime.configure(
+        &ack_id,
+        FaultRuleBuilder::named("master.replication.submit_acked")
+            .matches("block_id", aid)?
+            .record()?,
+    )?;
+    let master_fs = cluster.get_active_master_fs();
+    let manager = cluster.get_active_master_replication_manager();
+    for blocks in [&fa, &fb] {
+        let blk = &blocks.block_locs[0];
+        let loc = &blk.locs[1];
+        master_fs.fs_dir().write().block_report(vec![(
+            false,
+            blk.block.id,
+            BlockLocation::new(loc.worker_id, StorageType::Disk),
+        )])?;
+    }
+    manager.report_under_replicated_blocks(fa.block_locs[0].locs[1].worker_id, vec![aid])?;
+    let start = Instant::now();
+    loop {
+        let executed = |id: &str| runtime.rule(id).unwrap().is_some_and(|r| r.executions > 0);
+        if executed(&drop_id) && executed(&ack_id) {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "A must ACK and lose its report"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        replica_count(&rt.block_on(get_block_locations(&fs, &a))?, aid),
+        1,
+        "A must still be deficient after its result was dropped"
+    );
+    manager.report_under_replicated_blocks(fb.block_locs[0].locs[1].worker_id, vec![bid])?;
+    let wait = |path: &Path, id| -> CommonResult<()> {
+        let start = Instant::now();
+        loop {
+            if replica_count(&rt.block_on(get_block_locations(&fs, path))?, id) == 2 {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "block {id} did not regain its configured replica count"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
+    };
+    wait(&b, bid)?;
+    wait(&a, aid)?;
+    let copies = runtime.rule(&copy_id)?.unwrap().executions;
+    assert_eq!(
+        copies,
+        if fail_copy { 2 } else { 1 },
+        "successful copy must not be repeated for metadata failure"
+    );
+    if fail_metadata {
+        assert_eq!(runtime.rule(&metadata_id)?.unwrap().executions, 2);
+    }
+    // Force reads from the repaired destination rather than accidentally reading the source.
+    for blocks in [&fa, &fb] {
+        let blk = &blocks.block_locs[0];
+        let source = &blk.locs[0];
+        master_fs.fs_dir().write().block_report(vec![(
+            false,
+            blk.block.id,
+            BlockLocation::new(source.worker_id, StorageType::Disk),
+        )])?;
+    }
+    assert_eq!(rt.block_on(read_test_file(&fs, &a))?, data);
+    assert_eq!(rt.block_on(read_test_file(&fs, &b))?, data);
+    for blocks in [&fa, &fb] {
+        let blk = &blocks.block_locs[0];
+        let source = &blk.locs[0];
+        master_fs.fs_dir().write().block_report(vec![(
+            true,
+            blk.block.id,
+            BlockLocation::new(source.worker_id, StorageType::Disk),
+        )])?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "fault-injection")]
+mod prepared_target_cleanup {
+    use super::*;
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+
+    enum Failure {
+        LostPrepareResponse,
+        PrepareTimeout,
+        DeadlineAfterPrepare,
+    }
+
+    struct Rules(Vec<String>);
+
+    impl Drop for Rules {
+        fn drop(&mut self) {
+            for id in &self.0 {
+                let _ = FaultRuntime::process().remove(id);
+            }
+        }
+    }
+
+    #[test]
+    fn lost_prepare_response_reconciles_before_retry() -> CommonResult<()> {
+        scenario(Failure::LostPrepareResponse, 10)
+    }
+
+    #[test]
+    fn prepare_timeout_reconciles_before_retry() -> CommonResult<()> {
+        scenario(Failure::PrepareTimeout, 12)
+    }
+
+    #[test]
+    fn deadline_after_prepare_reconciles_without_submitting_source() -> CommonResult<()> {
+        scenario(Failure::DeadlineAfterPrepare, 14)
+    }
+
+    fn wait_for(
+        description: &str,
+        mut ready: impl FnMut() -> CommonResult<bool>,
+    ) -> CommonResult<()> {
+        let start = Instant::now();
+        while !ready()? {
+            assert!(start.elapsed() < Duration::from_secs(10), "{description}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
+    }
+
+    fn scenario(failure: Failure, padding: usize) -> CommonResult<()> {
+        // Two workers leave exactly one possible destination. The 61-second target lease
+        // exceeds every assertion deadline, so lease expiry cannot make the test pass.
+        let testing = Testing::builder()
+            .default()
+            .masters(1)
+            .workers(2)
+            .mutate_conf(|conf| {
+                conf.client.block_size_str = "64KB".into();
+                conf.master.min_block_size = 64 * 1024;
+                conf.master.min_replication = 1;
+                conf.master.max_replication = 3;
+                conf.master.block_replication_enabled = true;
+                conf.master.block_replication_concurrency_limit = 1;
+                conf.master.block_replication_submit_timeout = "500ms".into();
+                conf.master.block_replication_job_timeout = "30s".into();
+                conf.master.block_replication_retry_interval = "100ms".into();
+            })
+            .build()?;
+        let cluster = testing.start_cluster()?;
+        let conf = testing.get_active_cluster_conf()?;
+        let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+        let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+        // In-process MiniClusters share the fault runtime; keep block IDs disjoint from
+        // the other scenarios, including clusters whose background threads are still alive.
+        for index in 0..padding {
+            let path = Path::from_str(format!("/prepare-padding-{index}"))?;
+            rt.block_on(write_test_file_with_replicas(&fs, &path, b"padding", 1))?;
+        }
+        let a = Path::from_str("/prepared-a")?;
+        let b = Path::from_str("/prepared-b")?;
+        let data = generate_test_data(4096);
+        let fa = rt.block_on(write_test_file_with_replicas(&fs, &a, &data, 2))?;
+        let fb = rt.block_on(write_test_file_with_replicas(&fs, &b, &data, 2))?;
+        let aid = fa.block_locs[0].block.id;
+        let bid = fb.block_locs[0].block.id;
+        let runtime = FaultRuntime::process();
+        let prepare_id = format!("prepare-failure-{aid}");
+        let prepares_id = format!("a-prepare-count-{aid}");
+        let cleanup_id = format!("cleanup-response-loss-{aid}");
+        let copies_id = format!("prepare-copy-count-{aid}");
+        let _rules = Rules(vec![
+            prepare_id.clone(),
+            prepares_id.clone(),
+            cleanup_id.clone(),
+            copies_id.clone(),
+        ]);
+        let fault = match failure {
+            Failure::LostPrepareResponse => FaultRuleBuilder::named("worker.replication.prepared")
+                .matches("block_id", aid)?
+                .times(1)?
+                .return_error("prepare applied but token response lost")?,
+            Failure::PrepareTimeout => FaultRuleBuilder::named("worker.replication.prepared")
+                .matches("block_id", aid)?
+                .times(1)?
+                .delay(1_000)?,
+            Failure::DeadlineAfterPrepare => FaultRuleBuilder::named("master.replication.prepared")
+                .matches("block_id", aid)?
+                .times(1)?
+                .delay(1_000)?,
+        };
+        runtime.configure(&prepare_id, fault)?;
+        runtime.configure(
+            &prepares_id,
+            FaultRuleBuilder::named("worker.replication.prepared")
+                .matches("block_id", aid)?
+                .record()?,
+        )?;
+        // Revoke really runs, but its response is lost until explicitly unblocked below.
+        // The Master must retain the SAME attempt instead of forgetting or resubmitting it.
+        runtime.configure(
+            &cleanup_id,
+            FaultRuleBuilder::named("worker.replication.reconciled")
+                .matches("block_id", aid)?
+                .return_error("cleanup response lost")?,
+        )?;
+        runtime.configure(
+            &copies_id,
+            FaultRuleBuilder::named("worker.replication.before_copy")
+                .matches("block_id", aid)?
+                .record()?,
+        )?;
+        let master_fs = cluster.get_active_master_fs();
+        let remove_destination = |blocks: &FileBlocks, path: &Path| -> CommonResult<()> {
+            let blk = &blocks.block_locs[0];
+            let destination = &blk.locs[1];
+            let store = cluster
+                .worker_stores
+                .get(&destination.worker_id)
+                .unwrap()
+                .clone();
+            // Really delete the target replica as well as its Master location. Merely
+            // removing metadata would leave a finalized block that rejects the new writer.
+            store.remove_block(blk.block.id)?;
+            assert!(store.get_block(blk.block.id).is_err());
+            master_fs.fs_dir().write().block_report(vec![(
+                false,
+                blk.block.id,
+                BlockLocation::new(destination.worker_id, StorageType::Disk),
+            )])?;
+            assert_eq!(
+                replica_count(&rt.block_on(get_block_locations(&fs, path))?, blk.block.id),
+                1
+            );
+            Ok(())
+        };
+        remove_destination(&fa, &a)?;
+        let manager = cluster.get_active_master_replication_manager();
+        manager.report_under_replicated_blocks(fa.block_locs[0].locs[0].worker_id, vec![aid])?;
+        wait_for(
+            "prepared A must retry reconciliation after losing its response",
+            || Ok(runtime.rule(&cleanup_id)?.unwrap().executions >= 2),
+        )?;
+        assert_eq!(runtime.rule(&prepare_id)?.unwrap().executions, 1);
+        assert_eq!(runtime.rule(&prepares_id)?.unwrap().executions, 1);
+        assert_eq!(runtime.rule(&copies_id)?.unwrap().executions, 0);
+        assert_eq!(
+            replica_count(&rt.block_on(get_block_locations(&fs, &a))?, aid),
+            1
+        );
+        // B only becomes deficient after A is demonstrably waiting for cleanup.
+        remove_destination(&fb, &b)?;
+        manager.report_under_replicated_blocks(fb.block_locs[0].locs[0].worker_id, vec![bid])?;
+        wait_for(
+            "B must repair while A still awaits cleanup with concurrency=1",
+            || Ok(replica_count(&rt.block_on(get_block_locations(&fs, &b))?, bid) == 2),
+        )?;
+        assert_eq!(runtime.rule(&copies_id)?.unwrap().executions, 0);
+        assert_eq!(
+            replica_count(&rt.block_on(get_block_locations(&fs, &a))?, aid),
+            1
+        );
+        assert_eq!(runtime.rule(&prepares_id)?.unwrap().executions, 1);
+        runtime.remove(&cleanup_id)?;
+        wait_for(
+            "A must repair before its prepared target lease expires",
+            || Ok(replica_count(&rt.block_on(get_block_locations(&fs, &a))?, aid) == 2),
+        )?;
+        assert_eq!(runtime.rule(&copies_id)?.unwrap().executions, 1);
+        assert_eq!(runtime.rule(&prepares_id)?.unwrap().executions, 2);
+        // Read only from the repaired destinations and compare actual bytes.
+        for blocks in [&fa, &fb] {
+            let blk = &blocks.block_locs[0];
+            master_fs.fs_dir().write().block_report(vec![(
+                false,
+                blk.block.id,
+                BlockLocation::new(blk.locs[0].worker_id, StorageType::Disk),
+            )])?;
+        }
+        assert_eq!(rt.block_on(read_test_file(&fs, &a))?, data);
+        assert_eq!(rt.block_on(read_test_file(&fs, &b))?, data);
+        for blocks in [&fa, &fb] {
+            let blk = &blocks.block_locs[0];
+            master_fs.fs_dir().write().block_report(vec![(
+                true,
+                blk.block.id,
+                BlockLocation::new(blk.locs[0].worker_id, StorageType::Disk),
+            )])?;
+        }
+        Ok(())
+    }
 }

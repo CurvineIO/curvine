@@ -97,6 +97,14 @@ pub struct MasterConf {
     pub block_replication_retry_interval: String,
     #[serde(skip)]
     pub block_replication_retry_interval_unit: DurationUnit,
+    /// Deadline for connecting to a source worker and receiving its submit acknowledgement.
+    pub block_replication_submit_timeout: String,
+    #[serde(skip)]
+    pub block_replication_submit_timeout_unit: DurationUnit,
+    /// Maximum time to wait for a submitted replication attempt to report a result.
+    pub block_replication_job_timeout: String,
+    #[serde(skip)]
+    pub block_replication_job_timeout_unit: DurationUnit,
 
     pub log: LogConf,
 
@@ -174,6 +182,10 @@ impl MasterConf {
         self.ttl_retry_interval_unit = DurationUnit::from_str(&self.ttl_retry_interval)?;
         self.block_replication_retry_interval_unit =
             DurationUnit::from_str(&self.block_replication_retry_interval)?;
+        self.block_replication_submit_timeout_unit =
+            DurationUnit::from_str(&self.block_replication_submit_timeout)?;
+        self.block_replication_job_timeout_unit =
+            DurationUnit::from_str(&self.block_replication_job_timeout)?;
 
         // Initialize lock expiration time
         self.lock_expire_time_unit = DurationUnit::from_str(&self.lock_expire_time)?;
@@ -192,6 +204,14 @@ impl MasterConf {
 
         if self.global_limit == 0 {
             return err_box!("master.global_limit must be greater than zero");
+        }
+
+        if self.block_replication_submit_timeout_ms() == 0 {
+            return err_box!("master.block_replication_submit_timeout must be greater than zero");
+        }
+
+        if self.block_replication_job_timeout_ms() == 0 {
+            return err_box!("master.block_replication_job_timeout must be greater than zero");
         }
 
         Ok(())
@@ -275,6 +295,14 @@ impl MasterConf {
         self.block_replication_retry_interval_unit.as_millis()
     }
 
+    pub fn block_replication_submit_timeout_ms(&self) -> u64 {
+        self.block_replication_submit_timeout_unit.as_millis()
+    }
+
+    pub fn block_replication_job_timeout_ms(&self) -> u64 {
+        self.block_replication_job_timeout_unit.as_millis()
+    }
+
     pub fn lock_expire_time_ms(&self) -> u64 {
         self.lock_expire_time_unit.as_millis()
     }
@@ -351,6 +379,10 @@ impl Default for MasterConf {
             block_replication_concurrency_limit: 1000,
             block_replication_retry_interval: "5s".to_string(),
             block_replication_retry_interval_unit: Default::default(),
+            block_replication_submit_timeout: "30s".to_string(),
+            block_replication_submit_timeout_unit: Default::default(),
+            block_replication_job_timeout: "30m".to_string(),
+            block_replication_job_timeout_unit: Default::default(),
             log: Default::default(),
 
             ttl_checker_retry_attempts: 3,
@@ -483,5 +515,33 @@ mod tests {
         assert!(
             toml::from_str::<MasterConf>("[rocksdb]\nmax_background_jobs = 'invalid'").is_err()
         );
+    }
+
+    #[test]
+    fn replication_submit_timeout_must_be_positive() {
+        let mut conf = MasterConf {
+            block_replication_submit_timeout: "0ms".to_string(),
+            ..Default::default()
+        };
+
+        let error = conf
+            .init()
+            .expect_err("zero submit timeout must be rejected");
+        assert!(error
+            .to_string()
+            .contains("block_replication_submit_timeout must be greater than zero"));
+    }
+
+    #[test]
+    fn replication_job_timeout_must_be_positive() {
+        let mut conf = MasterConf {
+            block_replication_job_timeout: "0ms".to_string(),
+            ..Default::default()
+        };
+
+        let error = conf.init().expect_err("zero job timeout must be rejected");
+        assert!(error
+            .to_string()
+            .contains("block_replication_job_timeout must be greater than zero"));
     }
 }

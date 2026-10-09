@@ -56,7 +56,9 @@ pub struct MasterMetrics {
     // for the replication manager
     pub(crate) replication_staging_number: Gauge,
     pub(crate) replication_inflight_number: Gauge,
+    pub(crate) replication_uncertain_number: Gauge,
     pub(crate) replication_failure_count: Counter,
+    pub(crate) replication_timeout_count: Counter,
 
     pub(crate) operation_duration: HistogramVec,
 
@@ -158,11 +160,19 @@ impl MasterMetrics {
             )?,
             replication_inflight_number: m::new_gauge(
                 "replication_inflight_number",
-                "Replication stage number",
+                "Replication jobs awaiting a result",
+            )?,
+            replication_uncertain_number: m::new_gauge(
+                "replication_uncertain_number",
+                "Replication jobs whose remote execution state is uncertain",
             )?,
             replication_failure_count: m::new_counter(
                 "replication_failure_count",
                 "Total failure count",
+            )?,
+            replication_timeout_count: m::new_counter(
+                "replication_timeout_count",
+                "Total replication submit and result timeouts",
             )?,
 
             operation_duration: m::new_histogram_vec_with_buckets(

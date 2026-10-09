@@ -72,11 +72,20 @@ impl WorkerService {
             .map_err(|error| CommonError::from(error.to_string()))?;
         let store: BlockStore = BlockStore::new(&conf.cluster_id, conf)?;
 
-        let task_manager = Arc::new(TaskManager::with_rt(rt.clone(), conf, worker_session_id)?);
+        let task_manager = Arc::new(TaskManager::with_rt(
+            rt.clone(),
+            conf,
+            worker_session_id.clone(),
+        )?);
         let runtime_config = Arc::new(build_worker_runtime_registry(task_manager.clone(), conf));
 
-        let replication_manager =
-            WorkerReplicationManager::new(&store, &rt, conf, &task_manager.get_fs_context());
+        let replication_manager = WorkerReplicationManager::new(
+            &store,
+            &rt,
+            conf,
+            &task_manager.get_fs_context(),
+            worker_session_id,
+        );
 
         let ws = Self {
             store,
