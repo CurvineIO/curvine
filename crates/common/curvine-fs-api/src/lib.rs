@@ -21,7 +21,10 @@ mod fs_kind;
 pub use self::fs_kind::FsKind;
 
 mod rpc_code;
-pub use self::rpc_code::RpcCode;
+pub use self::rpc_code::{
+    RpcCode, GET_BLOCK_LOCATIONS_BATCH_MAX_ENCODED_PATH_BYTES, GET_BLOCK_LOCATIONS_BATCH_MAX_PATHS,
+    GET_BLOCK_LOCATIONS_BATCH_MAX_RESPONSE_BYTES, MASTER_CAPABILITY_GET_BLOCK_LOCATIONS_BATCH,
+};
 
 mod reader;
 pub use self::reader::Reader;

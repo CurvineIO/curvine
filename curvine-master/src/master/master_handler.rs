@@ -19,11 +19,14 @@ use crate::master::replication::master_replication_manager::MasterReplicationMan
 use crate::master::MountManager;
 use crate::master::{Master, MasterMetrics, RpcContext};
 use curvine_config::ClusterConf;
-use curvine_core_error::err_box;
+use curvine_core_error::{err_box, ErrorExt};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
-use curvine_fs_api::RpcCode;
+use curvine_fs_api::{
+    RpcCode, GET_BLOCK_LOCATIONS_BATCH_MAX_ENCODED_PATH_BYTES, GET_BLOCK_LOCATIONS_BATCH_MAX_PATHS,
+    GET_BLOCK_LOCATIONS_BATCH_MAX_RESPONSE_BYTES, MASTER_CAPABILITY_GET_BLOCK_LOCATIONS_BATCH,
+};
 use curvine_model::ProtoUtils;
 use curvine_model::{
     CompatibilityMode, CompatibilityPolicy, CompatibilityVerdict, CreateFileOpts, DeleteBlockCmd,
@@ -36,6 +39,7 @@ use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::Message;
 use curvine_runtime::runtime::{GroupExecutor, Runtime};
 use dashmap::DashMap;
+use prost::Message as ProstMessage;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -88,8 +92,19 @@ impl MasterHandler {
         // the configured compatibility section; defaults are lenient diagnose
         // with no bounds, so old components are never rejected by default.
         let compatibility_policy = conf.master.compatibility.to_policy();
-        let master_compatibility =
+        let mut master_compatibility =
             ProtoUtils::compatibility_to_pb(&master_version, &compatibility_policy);
+        if !master_compatibility
+            .server
+            .capabilities
+            .iter()
+            .any(|capability| capability == MASTER_CAPABILITY_GET_BLOCK_LOCATIONS_BATCH)
+        {
+            master_compatibility
+                .server
+                .capabilities
+                .push(MASTER_CAPABILITY_GET_BLOCK_LOCATIONS_BATCH.to_string());
+        }
         Self {
             fs,
             retry_cache,
@@ -477,6 +492,65 @@ impl MasterHandler {
             blocks: ProtoUtils::file_blocks_to_pb(blocks),
         };
         ctx.response(rep_header)
+    }
+
+    pub fn get_block_locations_batch(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let req: GetBlockLocationsBatchRequest = ctx.parse_header()?;
+        if req.paths.len() > GET_BLOCK_LOCATIONS_BATCH_MAX_PATHS {
+            return Err(FsError::invalid_argument(format!(
+                "GetBlockLocationsBatch accepts at most {} paths",
+                GET_BLOCK_LOCATIONS_BATCH_MAX_PATHS
+            )));
+        }
+        let encoded_path_bytes = req
+            .paths
+            .iter()
+            .map(|path| path.len().saturating_add(5))
+            .fold(0usize, usize::saturating_add);
+        if encoded_path_bytes > GET_BLOCK_LOCATIONS_BATCH_MAX_ENCODED_PATH_BYTES {
+            return Err(FsError::invalid_argument(
+                "GetBlockLocationsBatch encoded paths exceed the protocol size limit",
+            ));
+        }
+        ctx.set_audit(req.paths.first().cloned(), None);
+
+        let lookups = self.fs.get_block_locations_batch(&req.paths)?;
+        let mut results = Vec::with_capacity(req.paths.len());
+        let mut response_bytes = 0usize;
+        for (path, lookup) in req.paths.iter().cloned().zip(lookups) {
+            let item = match lookup {
+                Ok(blocks) => GetBlockLocationsBatchItem {
+                    path,
+                    blocks: Some(ProtoUtils::file_blocks_to_pb(blocks)),
+                    error: None,
+                },
+                Err(err) => GetBlockLocationsBatchItem {
+                    path,
+                    blocks: None,
+                    error: Some(err.encode().to_vec()),
+                },
+            };
+            // Field tag + length delimiter are at most five bytes. Stop before
+            // building a response the RPC frame codec would reject.
+            let item_bytes = item.encoded_len().saturating_add(5);
+            if item_bytes
+                > GET_BLOCK_LOCATIONS_BATCH_MAX_RESPONSE_BYTES.saturating_sub(response_bytes)
+            {
+                results.clear();
+                let response = GetBlockLocationsBatchResponse {
+                    results,
+                    too_large: Some(true),
+                };
+                return ctx.response(response);
+            }
+            response_bytes += item_bytes;
+            results.push(item);
+        }
+
+        ctx.response(GetBlockLocationsBatchResponse {
+            results,
+            too_large: None,
+        })
     }
 
     fn process_get_block_locations(fs: MasterFilesystem, path: String) -> FsResult<FileBlocks> {
@@ -1134,6 +1208,7 @@ impl MessageHandler for MasterHandler {
                 RpcCode::ListStatus => self.list_status(ctx),
                 RpcCode::ListOptions => self.list_options(ctx),
                 RpcCode::GetBlockLocations => self.get_block_locations(ctx),
+                RpcCode::GetBlockLocationsBatch => self.get_block_locations_batch(ctx),
                 RpcCode::SetAttr => self.set_attr_retry_check(ctx),
                 RpcCode::Symlink => self.symlink_retry_check(ctx),
                 RpcCode::Link => self.link_retry_check(ctx),

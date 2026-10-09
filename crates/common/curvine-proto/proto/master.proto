@@ -236,6 +236,25 @@ message GetBlockLocationsResponse {
     required FileBlocksProto blocks = 1;
 }
 
+// Bounded read-only batch variant used by transfer planning. Results preserve
+// request order and carry per-path errors so one stale entry does not fail the
+// other lookups in the same batch.
+message GetBlockLocationsBatchRequest {
+    repeated string paths = 1;
+    optional ClientContextProto client_context = 100;
+}
+
+message GetBlockLocationsBatchItem {
+    required string path = 1;
+    optional FileBlocksProto blocks = 2;
+    optional bytes error = 3;
+}
+
+message GetBlockLocationsBatchResponse {
+    repeated GetBlockLocationsBatchItem results = 1;
+    optional bool too_large = 2 [default = false];
+}
+
 // Request filesystem-wide information (statfs backend).
 message GetFilesystemInfoRequest {
     // Structured version of the requesting client (handshake). Cross-cutting

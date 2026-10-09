@@ -15,6 +15,11 @@
 use num_enum::{FromPrimitive, IntoPrimitive};
 use std::fmt;
 
+pub const GET_BLOCK_LOCATIONS_BATCH_MAX_PATHS: usize = 64;
+pub const GET_BLOCK_LOCATIONS_BATCH_MAX_ENCODED_PATH_BYTES: usize = 1024 * 1024;
+pub const GET_BLOCK_LOCATIONS_BATCH_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+pub const MASTER_CAPABILITY_GET_BLOCK_LOCATIONS_BATCH: &str = "get-block-locations-batch";
+
 #[repr(i8)]
 #[derive(Debug, IntoPrimitive, FromPrimitive, PartialEq, Eq, Hash, Copy, Clone)]
 pub enum RpcCode {
@@ -87,6 +92,7 @@ pub enum RpcCode {
     CloseFile = 58,
 
     MetricsReport = 60,
+    GetBlockLocationsBatch = 61,
 
     // block interface.
     WriteBlock = 80,

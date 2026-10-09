@@ -26,6 +26,7 @@ use curvine_config::{ClusterConf, MasterConf};
 use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
 use curvine_error::FsError;
 use curvine_error::FsResult;
+use curvine_fs_api::GET_BLOCK_LOCATIONS_BATCH_MAX_PATHS;
 use curvine_model::*;
 use curvine_raft::conf::JournalConfExt;
 use curvine_runtime::common::LocalTime;
@@ -881,6 +882,19 @@ impl MasterFilesystem {
         }
 
         Ok(locate_blocks)
+    }
+
+    pub fn get_block_locations_batch<'a>(
+        &'a self,
+        paths: &'a [String],
+    ) -> FsResult<impl Iterator<Item = FsResult<FileBlocks>> + 'a> {
+        if paths.len() > GET_BLOCK_LOCATIONS_BATCH_MAX_PATHS {
+            return Err(FsError::invalid_argument(format!(
+                "GetBlockLocationsBatch accepts at most {} paths",
+                GET_BLOCK_LOCATIONS_BATCH_MAX_PATHS
+            )));
+        }
+        Ok(paths.iter().map(|path| self.get_block_locations(path)))
     }
 
     /// Whether this file's atime should be refreshed on this open: it has an
@@ -2581,4 +2595,7 @@ mod tests {
             0
         );
     }
+
+    #[path = "get_block_locations_batch_test.rs"]
+    mod get_block_locations_batch_test;
 }
