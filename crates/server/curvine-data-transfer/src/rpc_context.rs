@@ -61,10 +61,7 @@ impl<'a> RpcContext<'a> {
     }
 
     pub fn audit_log<T>(&self, res: &FsResult<T>, used_us: u64, conn_state: Option<&ConnState>) {
-        if matches!(
-            self.code,
-            RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport | RpcCode::GetMountTable
-        ) {
+        if matches!(self.code, RpcCode::WorkerHeartbeat | RpcCode::GetMountTable) {
             return;
         }
 

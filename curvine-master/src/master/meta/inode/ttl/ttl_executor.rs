@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::master::fs::MasterFilesystem;
-use crate::master::meta::inode::InodeView;
+use crate::master::meta::inode::{InodePath, InodeView};
 use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_model::TtlAction;
@@ -56,6 +56,13 @@ impl InodeTtlExecutor {
         Ok(inode)
     }
 
+    fn is_empty_dir(&self, path: &str) -> FsResult<bool> {
+        let fs_dir = self.filesystem.fs_dir();
+        let fs_dir_guard = fs_dir.read();
+        let inp = InodePath::resolve(fs_dir_guard.root_ptr(), path, &fs_dir_guard.store)?;
+        Ok(inp.is_empty_dir())
+    }
+
     pub fn execute_by_id(&self, inode_id: i64) -> FsResult<(bool, InodeView)> {
         let inode = if let Some(inode) = self.get_inode_from_store(inode_id)? {
             inode
@@ -77,6 +84,13 @@ impl InodeTtlExecutor {
         let path = self.get_inode_path(inode_id)?;
         match action {
             TtlAction::Delete => {
+                // A non-empty directory stays until its children are gone.
+                // Returning (false, inode) puts it back in its TTL bucket.
+                // Free is not gated here: it drops cached blocks and leaves children.
+                if inode.is_dir() && !self.is_empty_dir(&path)? {
+                    debug!("skip ttl delete for non-empty directory {}", inode_id);
+                    return Ok((false, inode));
+                }
                 self.filesystem.delete(&path, true)?;
                 debug!("ttl delete {} {:?}", path, inode);
                 Ok((true, inode))

@@ -230,7 +230,7 @@ fn leader_promotion_advances_over_committed_configuration_entry() -> CommonResul
 }
 
 #[test]
-fn follower_replay_rejects_duplicate_allocated_inode_id() -> CommonResult<()> {
+fn follower_replay_allows_inode_id_below_allocator_watermark() -> CommonResult<()> {
     Master::init_test_metrics();
 
     let mut source_conf = ClusterConf {
@@ -258,8 +258,11 @@ fn follower_replay_rejects_duplicate_allocated_inode_id() -> CommonResult<()> {
     target_conf.change_test_meta_dir(format!("duplicate-id-target-{}", Utils::rand_str(6)));
     let target = JournalSystem::from_conf(&target_conf)?;
     let target_fs = target.fs();
-    target_fs.mkdir("/occupied", false)?;
-    assert_eq!(target_fs.last_inode_id(), inode_id);
+    // The allocator can advance before a journal operation succeeds. Its
+    // watermark must not prevent replaying an inode that has not been created.
+    let watermark = inode_id + 1;
+    target_fs.fs_dir.read().update_last_inode_id(watermark)?;
+    assert!(target_fs.file_status("/source").is_err());
 
     let mut batch = JournalBatch::new(1);
     batch.push(source_entry);
@@ -271,12 +274,12 @@ fn follower_replay_rejects_duplicate_allocated_inode_id() -> CommonResult<()> {
     };
     target.append_committed_entry_for_test(entry.clone())?;
 
-    let err = AsyncRuntime::single()
-        .block_on(async { target.journal_loader().role_change(StateRole::Leader).await })
-        .expect_err("follower replay must reject a reused inode id");
-    assert!(err
-        .to_string()
-        .contains("refusing duplicate inode allocation during follower replay"));
+    let loader = target.journal_loader();
+    AsyncRuntime::single()
+        .block_on(loader.apply(true, ApplyMsg::new_scan(AppliedIndex::default())))?;
+    assert!(target_fs.file_status("/source").is_ok());
+    assert_eq!(target_fs.last_inode_id(), watermark);
+    assert_eq!(loader.get_fsm_state().applied.index, 1);
     Ok(())
 }
 

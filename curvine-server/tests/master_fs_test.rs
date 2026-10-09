@@ -943,6 +943,7 @@ fn ttl_executor_deletes_nested_expired_inode() -> CommonResult<()> {
         opts,
         OpenFlags::new_create().set_overwrite(true),
     )?;
+    fs.complete_file("/ttl/a/b/file.log", None, 0, vec![], "", false, None)?;
 
     std::thread::sleep(Duration::from_millis(10));
     let executor = InodeTtlExecutor::with_managers(fs.clone());
@@ -984,6 +985,15 @@ fn ttl_executor_deletes_expired_directory_after_child_file() -> CommonResult<()>
         file_opts,
         OpenFlags::new_create().set_overwrite(true),
     )?;
+    fs.complete_file(
+        "/ttl/expired-dir/file.log",
+        None,
+        0,
+        vec![],
+        "",
+        false,
+        None,
+    )?;
 
     std::thread::sleep(Duration::from_millis(10));
     let dir_mtime_before_child_delete = fs.file_status("/ttl/expired-dir")?.mtime;
@@ -1013,6 +1023,125 @@ fn ttl_executor_deletes_expired_directory_after_child_file() -> CommonResult<()>
     assert!(
         fs.file_status("/ttl/expired-dir").is_err(),
         "TTL delete should remove the expired directory, not only its child file"
+    );
+
+    Ok(())
+}
+
+// An expired directory must not take unexpired children with it. The
+// directory stays until those children are gone, then the next TTL pass
+// removes the empty directory.
+#[test]
+fn ttl_executor_skips_non_empty_expired_directory() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "ttl-executor-non-empty-dir");
+
+    let dir_opts = MkdirOptsBuilder::new()
+        .create_parent(true)
+        .ttl_ms(1)
+        .ttl_action(TtlAction::Delete)
+        .build();
+    let dir = fs.mkdir_with_opts("/ttl/live-children", dir_opts)?;
+
+    let file_opts = CreateFileOptsBuilder::new()
+        .ttl_ms(3_600_000)
+        .ttl_action(TtlAction::Delete)
+        .build();
+    fs.create_with_opts(
+        "/ttl/live-children/file.log",
+        file_opts,
+        OpenFlags::new_create().set_overwrite(true),
+    )?;
+
+    std::thread::sleep(Duration::from_millis(10));
+    let dir_mtime = fs.file_status("/ttl/live-children")?.mtime;
+    let executor = InodeTtlExecutor::with_managers(fs.clone());
+
+    let (dir_processed, inode) = executor.execute_by_id(dir.id)?;
+    assert!(
+        !dir_processed,
+        "expired directory with a live child must be deferred"
+    );
+    assert_eq!(inode.id(), dir.id);
+    assert!(
+        fs.file_status("/ttl/live-children/file.log").is_ok(),
+        "unexpired child must survive the parent directory TTL"
+    );
+    assert_eq!(
+        fs.file_status("/ttl/live-children")?.mtime,
+        dir_mtime,
+        "deferring a non-empty directory must not refresh its mtime"
+    );
+
+    fs.delete("/ttl/live-children/file.log", false)?;
+    let (dir_processed, _) = executor.execute_by_id(dir.id)?;
+    assert!(
+        dir_processed,
+        "expired directory should be deleted once it is empty"
+    );
+    assert!(
+        fs.file_status("/ttl/live-children").is_err(),
+        "empty expired directory should be removed on the following TTL pass"
+    );
+
+    Ok(())
+}
+
+// Directory TTL Free must still run when children are present. Free drops
+// cached blocks and leaves the child file in place.
+#[test]
+fn ttl_executor_frees_child_blocks_of_expired_directory() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "ttl-executor-free-dir");
+
+    let dir_opts = MkdirOptsBuilder::new()
+        .create_parent(true)
+        .ttl_ms(1)
+        .ttl_action(TtlAction::Free)
+        .build();
+    let dir = fs.mkdir_with_opts("/ttl/free-dir", dir_opts)?;
+
+    let client = ClientAddress::default();
+    let file_path = "/ttl/free-dir/file.log";
+    let status = fs.create_with_opts(
+        file_path,
+        CreateFileOptsBuilder::new()
+            .ttl_ms(3_600_000)
+            .ttl_action(TtlAction::Free)
+            .build(),
+        OpenFlags::new_create(),
+    )?;
+    let block = fs.add_block(file_path, None, client.clone(), vec![], vec![], 0, None)?;
+    fs.complete_file(
+        file_path,
+        None,
+        status.block_size,
+        vec![full_commit(&block, status.block_size)],
+        &client.client_name,
+        false,
+        None,
+    )?;
+    fs.set_attr(file_path, SetAttrOptsBuilder::new().ufs_mtime(1).build())?;
+    assert!(
+        !fs.get_block_locations(file_path)?.block_locs.is_empty(),
+        "child file should have blocks before directory TTL free"
+    );
+
+    std::thread::sleep(Duration::from_millis(10));
+    let executor = InodeTtlExecutor::with_managers(fs.clone());
+    let (processed, inode) = executor.execute_by_id(dir.id)?;
+    assert!(
+        processed,
+        "directory TTL Free should run while a child file is still present"
+    );
+    assert_eq!(inode.id(), dir.id);
+    assert!(
+        fs.file_status(file_path).is_ok(),
+        "child file must remain after directory TTL Free"
+    );
+    assert!(
+        fs.get_block_locations(file_path)?.block_locs.is_empty(),
+        "directory TTL Free should drop the child file's cached blocks"
     );
 
     Ok(())
