@@ -305,6 +305,104 @@ describe('Console shell', () => {
     expect(screen.getByTestId('browse-go')).toBeInTheDocument()
   })
 
+  it('moves the breadcrumb with a path typed into the box and opened with Go', async () => {
+    renderApp('/browse', createStubClient())
+
+    const input = await screen.findByTestId('browse-path')
+    await userEvent.clear(input)
+    await userEvent.type(input, '/demo/docs')
+    await userEvent.click(screen.getByTestId('browse-go'))
+
+    // The breadcrumb follows the route, so a jump that skips the URL leaves it
+    // stuck on root; the trail has to end at the directory that was opened.
+    await waitFor(() =>
+      expect(screen.getByTestId('browse-crumb-current')).toHaveTextContent('docs')
+    )
+    expect(screen.getByTestId('browse-crumb-0')).toHaveTextContent('demo')
+    expect(screen.getByTestId('browse-path')).toHaveValue('/demo/docs')
+  })
+
+  it('selects rows in a batch and deletes them', async () => {
+    const deletePath = vi.fn(async () => ({}))
+    const client = createStubClient({
+      fetchBrowseData: vi.fn(async () => ({
+        path: '/',
+        items: [
+          { name: 'a.txt', path: '/a.txt', is_dir: false },
+          { name: 'b.txt', path: '/b.txt', is_dir: false }
+        ]
+      })),
+      deletePath
+    })
+    renderApp('/browse', client)
+
+    const selectAll = await screen.findByTestId('browse-select-all')
+    await userEvent.click(await screen.findByTestId('browse-select-/a.txt'))
+
+    // One of two ticked: the header box has to read as a partial selection.
+    expect(selectAll).toHaveAttribute('data-state', 'indeterminate')
+    expect(screen.getByTestId('browse-bulk-count')).toHaveTextContent('1 selected')
+
+    await userEvent.click(selectAll)
+    expect(selectAll).toHaveAttribute('data-state', 'checked')
+    expect(screen.getByTestId('browse-bulk-count')).toHaveTextContent('2 selected')
+
+    await userEvent.click(screen.getByTestId('browse-bulk-delete'))
+    await userEvent.click(await screen.findByTestId('browse-bulk-delete-confirm'))
+
+    await waitFor(() => expect(deletePath).toHaveBeenCalledTimes(2))
+    expect(deletePath).toHaveBeenCalledWith('/a.txt', false)
+    expect(deletePath).toHaveBeenCalledWith('/b.txt', false)
+    await waitFor(() => expect(screen.queryByTestId('browse-bulk-bar')).not.toBeInTheDocument())
+  })
+
+  it('frees only the cached rows in a batch and skips UFS-only ones', async () => {
+    const freePath = vi.fn(async () => ({ bytes: 10, inodes: 1 }))
+    const client = createStubClient({
+      fetchBrowseData: vi.fn(async () => ({
+        path: '/',
+        items: [
+          {
+            name: 'cached.bin',
+            path: '/cached.bin',
+            is_dir: false,
+            storage_policy: { state: 'Cv' }
+          },
+          { name: 'ufs.bin', path: '/ufs.bin', is_dir: false, storage_policy: { state: 'Ufs' } }
+        ]
+      })),
+      freePath
+    })
+    renderApp('/browse', client)
+
+    await userEvent.click(await screen.findByTestId('browse-select-all'))
+    await userEvent.click(screen.getByTestId('browse-bulk-free'))
+
+    // The confirm spells out what will not be touched before anything runs.
+    expect(await screen.findByText(/1 UFS-only item\(s\) will be skipped/)).toBeInTheDocument()
+
+    await userEvent.click(screen.getByTestId('browse-bulk-free-confirm'))
+
+    await waitFor(() => expect(freePath).toHaveBeenCalledTimes(1))
+    expect(freePath).toHaveBeenCalledWith('/cached.bin', false)
+  })
+
+  it('disables batch free when nothing selected is cached in Curvine', async () => {
+    const client = createStubClient({
+      fetchBrowseData: vi.fn(async () => ({
+        path: '/',
+        items: [
+          { name: 'ufs.bin', path: '/ufs.bin', is_dir: false, storage_policy: { state: 'Ufs' } }
+        ]
+      }))
+    })
+    renderApp('/browse', client)
+
+    await userEvent.click(await screen.findByTestId('browse-select-all'))
+
+    expect(screen.getByTestId('browse-bulk-free')).toBeDisabled()
+  })
+
   it('distinguishes directories from files and offers both copy targets', async () => {
     const client = createStubClient({
       fetchBrowseData: vi.fn(async () => ({

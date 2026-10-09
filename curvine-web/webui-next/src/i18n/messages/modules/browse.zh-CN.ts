@@ -123,6 +123,22 @@ export default {
       result: 'inode：{inodes}，空间：{space}',
       failed: '释放失败：{error}'
     },
+    bulk: {
+      selectAll: '全选',
+      selectRow: '选择 {path}',
+      selected: '已选 {count} 项',
+      clear: '清除选择',
+      freeConfirm: '释放选中的 {count} 项的缓存？',
+      freeSkipped: '将跳过 {count} 项仅存在于 UFS 的条目。',
+      freeNothing: '选中的条目都不在 Curvine 中',
+      freeSuccess: '已释放 {count} 项的缓存：{inodes} 个 inode，{space}。',
+      freeFailed: '{failed} 项释放失败；{done} 项成功。',
+      deleteConfirm: '删除选中的 {count} 项？',
+      deleteSkipped: '将跳过 {count} 个挂载根目录。',
+      deleteNothing: '挂载根目录不能在此删除',
+      deleteSuccess: '已删除 {count} 项。',
+      deleteFailed: '{failed} 项删除失败；{done} 项成功。'
+    },
     delete: {
       mountRoot: '请在挂载页面删除挂载点',
       mounted: '从 Curvine 及底层 UFS 删除',

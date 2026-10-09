@@ -143,6 +143,11 @@ export function BrowsePage() {
   const [freeTarget, setFreeTarget] = useState<{ path: string; recursive: boolean; message: string } | null>(
     null
   )
+  // Batch selection. Held as paths (not rows) so a refresh or a "load more" keeps
+  // the ticks on the entries that are still listed.
+  const [selectedPaths, setSelectedPaths] = useState<string[]>([])
+  const [bulkFreeOpen, setBulkFreeOpen] = useState(false)
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false)
   const [submitting, setSubmitting] = useState(false)
 
   const browsePathRef = useRef(browsePath)
@@ -752,6 +757,8 @@ export function BrowsePage() {
     // Route change drives the listing, mirroring the Vue $route.query.path watcher.
     setBrowsePath(pathFromUrl)
     browsePathRef.current = pathFromUrl
+    // The ticks belong to the directory that was on screen, not to the next one.
+    setSelectedPaths([])
     void fetchData({ path: pathFromUrl })
   }, [pathFromUrl, fetchData])
 
@@ -960,6 +967,41 @@ export function BrowsePage() {
   const canFreeCurrentPath = isMountedPath(browsePath)
   const showUfsPanel = ufsSyncJobCount > 0
 
+  /* ------------------------------------------------------------- selection */
+
+  const selectablePaths = useMemo(
+    () => items.map((item) => String(item.path || '')).filter(Boolean),
+    [items]
+  )
+  // Intersected with the listing, so entries that vanished from a refresh drop out.
+  const selectedSet = useMemo(
+    () => new Set(selectedPaths.filter((path) => selectablePaths.includes(path))),
+    [selectedPaths, selectablePaths]
+  )
+  const selectedItems = useMemo(
+    () => items.filter((item) => item.path && selectedSet.has(String(item.path))),
+    [items, selectedSet]
+  )
+  const allSelected = selectablePaths.length > 0 && selectedSet.size === selectablePaths.length
+  const partiallySelected = selectedSet.size > 0 && !allSelected
+
+  /**
+   * Free only removes data Curvine actually holds: an entry that lives in UFS
+   * alone has no cache to drop, so it is skipped rather than failing.
+   */
+  const freeableSelected = useMemo(
+    () => selectedItems.filter((item) => storageLocation(item) !== 'ufs'),
+    [selectedItems]
+  )
+  const skippedByFree = selectedItems.length - freeableSelected.length
+
+  /** Mount roots are managed from the Mounts page, so batch delete passes over them. */
+  const deletableSelected = useMemo(
+    () => selectedItems.filter((item) => !(item.path && isMountRoot(String(item.path)))),
+    [selectedItems, isMountRoot]
+  )
+  const skippedByDelete = selectedItems.length - deletableSelected.length
+
   /* -------------------------------------------------------------- handlers */
 
   useEffect(() => {
@@ -972,7 +1014,10 @@ export function BrowsePage() {
 
   function navigateTo(path: string) {
     const normalized = normalizePath(path)
-    if (normalized === browsePathRef.current) {
+    // Compare against the route's path, not `browsePathRef`: that ref mirrors the
+    // path input, so typing a path and pressing Go would compare the target with
+    // itself, skip the navigation, and leave the URL (and the breadcrumb) behind.
+    if (normalized === pathFromUrl) {
       void fetchData({ path: normalized })
       return
     }
@@ -1155,6 +1200,98 @@ export function BrowsePage() {
       recursive: true,
       message: t('browse.freeAction.confirmCurrent', { path: browsePath })
     })
+  }
+
+  /* --------------------------------------------------------- batch actions */
+
+  function toggleSelected(path: string) {
+    setSelectedPaths((current) =>
+      current.includes(path) ? current.filter((value) => value !== path) : [...current, path]
+    )
+  }
+
+  function toggleSelectAll() {
+    setSelectedPaths(allSelected ? [] : selectablePaths)
+  }
+
+  function bulkFreeMessage(): string {
+    const base = t('browse.bulk.freeConfirm', { count: freeableSelected.length })
+    return skippedByFree
+      ? `${base} ${t('browse.bulk.freeSkipped', { count: skippedByFree })}`
+      : base
+  }
+
+  function bulkDeleteMessage(): string {
+    const base = t('browse.bulk.deleteConfirm', { count: deletableSelected.length })
+    return skippedByDelete
+      ? `${base} ${t('browse.bulk.deleteSkipped', { count: skippedByDelete })}`
+      : base
+  }
+
+  /**
+   * Batch operations run one request at a time and tally the outcome: a single
+   * failure (a locked file, a mount that changed under us) must not abandon the
+   * rest of the selection, and the toast has to say what actually happened.
+   */
+  async function confirmBulkFree() {
+    setSubmitting(true)
+    let freed = 0
+    let failed = 0
+    let inodes = 0
+    let bytes = 0
+    try {
+      for (const item of freeableSelected) {
+        try {
+          const data = (await api.freePath(String(item.path), Boolean(item.is_dir))) as {
+            bytes?: number
+            inodes?: number
+          }
+          freed += 1
+          inodes += Number(data?.inodes || 0)
+          bytes += Number(data?.bytes || 0)
+        } catch {
+          failed += 1
+        }
+      }
+    } finally {
+      setSubmitting(false)
+      setBulkFreeOpen(false)
+    }
+    setSelectedPaths([])
+    if (failed) {
+      toast.error(t('browse.bulk.freeFailed', { failed, done: freed }))
+    } else {
+      toast.success(
+        t('browse.bulk.freeSuccess', { count: freed, inodes, space: formatBytes(bytes) })
+      )
+    }
+    await fetchData()
+  }
+
+  async function confirmBulkDelete() {
+    setSubmitting(true)
+    let deleted = 0
+    let failed = 0
+    try {
+      for (const item of deletableSelected) {
+        try {
+          await api.deletePath(String(item.path), Boolean(item.is_dir))
+          deleted += 1
+        } catch {
+          failed += 1
+        }
+      }
+    } finally {
+      setSubmitting(false)
+      setBulkDeleteOpen(false)
+    }
+    setSelectedPaths([])
+    if (failed) {
+      toast.error(t('browse.bulk.deleteFailed', { failed, done: deleted }))
+    } else {
+      toast.success(t('browse.bulk.deleteSuccess', { count: deleted }))
+    }
+    await fetchData()
   }
 
   async function onFilePicked(event: React.ChangeEvent<HTMLInputElement>) {
@@ -1456,6 +1593,48 @@ export function BrowsePage() {
         />
       </div>
 
+      {selectedSet.size > 0 && (
+        <div
+          className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-muted/30 px-3 py-2"
+          data-testid="browse-bulk-bar"
+        >
+          <span className="text-xs font-medium" data-testid="browse-bulk-count">
+            {t('browse.bulk.selected', { count: selectedSet.size })}
+          </span>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={freeableSelected.length === 0}
+            title={
+              freeableSelected.length === 0 ? t('browse.bulk.freeNothing') : t('browse.freeAction.itemFile')
+            }
+            onClick={() => setBulkFreeOpen(true)}
+            data-testid="browse-bulk-free"
+          >
+            {t('browse.free')}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="text-destructive"
+            disabled={deletableSelected.length === 0}
+            title={deletableSelected.length === 0 ? t('browse.bulk.deleteNothing') : undefined}
+            onClick={() => setBulkDeleteOpen(true)}
+            data-testid="browse-bulk-delete"
+          >
+            {t('common.delete')}
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setSelectedPaths([])}
+            data-testid="browse-bulk-clear"
+          >
+            {t('browse.bulk.clear')}
+          </Button>
+        </div>
+      )}
+
       {loadError && <ErrorAlert message={loadError} />}
 
       {uploadBatchList.length > 0 && (
@@ -1483,6 +1662,15 @@ export function BrowsePage() {
         <Table>
           <TableHeader className="sticky top-0 z-10 bg-card">
             <TableRow>
+              <TableHead className="w-10">
+                <Checkbox
+                  checked={allSelected ? true : partiallySelected ? 'indeterminate' : false}
+                  onCheckedChange={toggleSelectAll}
+                  disabled={selectablePaths.length === 0}
+                  aria-label={t('browse.bulk.selectAll')}
+                  data-testid="browse-select-all"
+                />
+              </TableHead>
               <TableHead>{t('browse.table.name')}</TableHead>
               <TableHead>{t('browse.table.type')}</TableHead>
               <TableHead className="text-right">{t('browse.table.size')}</TableHead>
@@ -1511,8 +1699,17 @@ export function BrowsePage() {
                 <TableRow
                   key={itemPath}
                   className={expired ? 'bg-warning/5' : undefined}
+                  data-state={selectedSet.has(itemPath) ? 'selected' : undefined}
                   data-testid={`browse-row-${itemPath}`}
                 >
+                  <TableCell className="w-10">
+                    <Checkbox
+                      checked={selectedSet.has(itemPath)}
+                      onCheckedChange={() => toggleSelected(itemPath)}
+                      aria-label={t('browse.bulk.selectRow', { path: itemPath })}
+                      data-testid={`browse-select-${itemPath}`}
+                    />
+                  </TableCell>
                   <TableCell>
                     <div className="flex max-w-96 min-w-0 items-center gap-2">
                       {item.is_dir ? (
@@ -1743,6 +1940,35 @@ export function BrowsePage() {
           if (freeTarget) void performFree(freeTarget.path, freeTarget.recursive)
         }}
         testId="browse-free-confirm"
+      />
+
+      <ConfirmDialog
+        open={bulkFreeOpen}
+        title={t('browse.free')}
+        description={bulkFreeMessage()}
+        confirmLabel={t('common.confirm')}
+        cancelLabel={t('common.cancel')}
+        pending={submitting}
+        onOpenChange={(open) => {
+          if (!open) setBulkFreeOpen(false)
+        }}
+        onConfirm={() => void confirmBulkFree()}
+        testId="browse-bulk-free-confirm"
+      />
+
+      <ConfirmDialog
+        open={bulkDeleteOpen}
+        title={t('common.delete')}
+        description={bulkDeleteMessage()}
+        confirmLabel={t('common.delete')}
+        cancelLabel={t('common.cancel')}
+        pending={submitting}
+        destructive
+        onOpenChange={(open) => {
+          if (!open) setBulkDeleteOpen(false)
+        }}
+        onConfirm={() => void confirmBulkDelete()}
+        testId="browse-bulk-delete-confirm"
       />
     </>
   )

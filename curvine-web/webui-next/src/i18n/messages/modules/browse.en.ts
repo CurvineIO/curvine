@@ -123,6 +123,22 @@ export default {
       result: 'inodes: {inodes}, space: {space}',
       failed: 'Free failed: {error}'
     },
+    bulk: {
+      selectAll: 'Select all',
+      selectRow: 'Select {path}',
+      selected: '{count} selected',
+      clear: 'Clear selection',
+      freeConfirm: 'Free cached data for {count} selected item(s)?',
+      freeSkipped: '{count} UFS-only item(s) will be skipped.',
+      freeNothing: 'None of the selected items are cached in Curvine',
+      freeSuccess: 'Freed {count} item(s): {inodes} inodes, {space}.',
+      freeFailed: 'Free failed for {failed} item(s); {done} succeeded.',
+      deleteConfirm: 'Delete {count} selected item(s)?',
+      deleteSkipped: '{count} mount root(s) will be skipped.',
+      deleteNothing: 'Mount roots cannot be deleted here',
+      deleteSuccess: 'Deleted {count} item(s).',
+      deleteFailed: 'Delete failed for {failed} item(s); {done} succeeded.'
+    },
     delete: {
       mountRoot: 'Use Mounts page to delete mount',
       mounted: 'Delete from Curvine and backing UFS',
