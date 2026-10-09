@@ -24,6 +24,7 @@ use curvine_runtime::runtime::{GroupExecutor, Runtime};
 use curvine_runtime::sync::StateCtl;
 use dashmap::{DashMap, DashSet};
 use log::info;
+use std::mem::size_of_val;
 use std::sync::atomic::{AtomicI64, AtomicUsize};
 use std::sync::Arc;
 
@@ -145,9 +146,15 @@ impl BlockActor {
         let mut off = 0;
         while off < blocks.len() {
             let end = (off + self.block_report_limit).min(blocks.len());
-            let response = self
-                .client
-                .full_block_report(blocks.len(), &blocks[off..end])?;
+            let batch = &blocks[off..end];
+            let spend = TimeSpent::new();
+            let response = self.client.full_block_report(blocks.len(), batch)?;
+            info!(
+                "full block report, blocks={}, msg_bytes={}, used_ms={}",
+                batch.len(),
+                size_of_val(batch),
+                spend.used_ms()
+            );
             let cmds = ProtoUtils::worker_cmd_from_pb(response.cmds);
             HeartbeatTask::delete_block_task(
                 self.executor.clone(),
