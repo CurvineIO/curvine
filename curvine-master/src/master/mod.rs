@@ -45,6 +45,9 @@ pub use self::master_metrics::*;
 mod metrics_server;
 pub use self::metrics_server::*;
 
+mod runtime_config;
+pub use self::runtime_config::build_master_runtime_registry;
+
 mod router_handler;
 pub use self::router_handler::*;
 

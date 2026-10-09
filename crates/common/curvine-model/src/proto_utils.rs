@@ -875,6 +875,35 @@ impl ProtoUtils {
     pub fn delete_res_to_pb(res: DeleteResult) -> FreeResultProto {
         Self::free_res_to_pb(res.into())
     }
+
+    pub fn runtime_config_entry_from_pb(entry: RuntimeConfigEntryProto) -> RuntimeConfigEntry {
+        RuntimeConfigEntry {
+            key: entry.key,
+            file_value_json: entry.file_value_json,
+            override_value: entry.override_value,
+            effective_value_json: entry.effective_value_json,
+        }
+    }
+
+    pub fn runtime_config_update_from_pb(
+        rep: UpdateRuntimeConfigResponse,
+    ) -> RuntimeConfigUpdateResult {
+        RuntimeConfigUpdateResult {
+            key: rep.key,
+            previous_value_json: rep.previous_value_json,
+            value_json: rep.value_json,
+            persistent: rep.persistent,
+        }
+    }
+
+    pub fn runtime_config_reset_from_pb(
+        rep: ResetRuntimeConfigResponse,
+    ) -> RuntimeConfigResetResult {
+        RuntimeConfigResetResult {
+            key: rep.key,
+            effective_value_json: rep.effective_value_json,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -71,6 +71,10 @@ pub enum Commands {
     #[command(name = "node")]
     Node(NodeCommand),
 
+    /// Cluster administration (runtime config, …)
+    #[command(name = "admin")]
+    Admin(AdminCommand),
+
     /// show cli version
     #[command(name = "version")]
     Version,

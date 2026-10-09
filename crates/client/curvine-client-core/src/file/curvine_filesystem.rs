@@ -27,7 +27,7 @@ use curvine_model::{CommitBlock, DeleteResult, FreeResult, ListOptions};
 use curvine_model::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
     FilesystemInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, RenameFlags,
-    SetAttrOpts,
+    RuntimeConfigEntry, RuntimeConfigResetResult, RuntimeConfigUpdateResult, SetAttrOpts,
 };
 use curvine_proto::{GetCvMetadataDeltaPageResponse, GetCvMetadataSnapshotPageResponse};
 use curvine_rpc::client::ClientConf;
@@ -351,6 +351,22 @@ impl CurvineFileSystem {
 
     pub async fn get_filesystem_info(&self) -> FsResult<FilesystemInfo> {
         self.fs_client.get_filesystem_info().await
+    }
+
+    pub async fn update_runtime_config(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> FsResult<RuntimeConfigUpdateResult> {
+        self.fs_client.update_runtime_config(key, value).await
+    }
+
+    pub async fn get_runtime_config(&self, key: Option<&str>) -> FsResult<Vec<RuntimeConfigEntry>> {
+        self.fs_client.get_runtime_config(key).await
+    }
+
+    pub async fn reset_runtime_config(&self, key: &str) -> FsResult<RuntimeConfigResetResult> {
+        self.fs_client.reset_runtime_config(key).await
     }
 
     /// Client-master version handshake: report this client's `component_info`

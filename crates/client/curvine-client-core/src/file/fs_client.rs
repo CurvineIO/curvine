@@ -98,6 +98,8 @@ impl_with_client_context!(
     SetAttrRequest,
     SetLockRequest,
     SymlinkRequest,
+    UpdateRuntimeConfigRequest,
+    ResetRuntimeConfigRequest,
 );
 
 impl_without_client_context!(
@@ -109,6 +111,7 @@ impl_without_client_context!(
     GetFilesystemInfoRequest,
     GetMountInfoRequest,
     GetMountTableRequest,
+    GetRuntimeConfigRequest,
     ListJobStatusRequest,
     MetricsReportRequest,
     MountRequest,
@@ -978,6 +981,41 @@ impl FsClient {
         };
         let _: SymlinkResponse = self.rpc(RpcCode::Symlink, req).await?;
         Ok(())
+    }
+
+    pub async fn update_runtime_config(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> FsResult<RuntimeConfigUpdateResult> {
+        let req = UpdateRuntimeConfigRequest {
+            key: key.to_string(),
+            value: value.to_string(),
+            client_context: None,
+        };
+        let rep: UpdateRuntimeConfigResponse = self.rpc(RpcCode::UpdateRuntimeConfig, req).await?;
+        Ok(ProtoUtils::runtime_config_update_from_pb(rep))
+    }
+
+    pub async fn get_runtime_config(&self, key: Option<&str>) -> FsResult<Vec<RuntimeConfigEntry>> {
+        let req = GetRuntimeConfigRequest {
+            key: key.map(|k| k.to_string()),
+        };
+        let rep: GetRuntimeConfigResponse = self.rpc(RpcCode::GetRuntimeConfig, req).await?;
+        Ok(rep
+            .entries
+            .into_iter()
+            .map(ProtoUtils::runtime_config_entry_from_pb)
+            .collect())
+    }
+
+    pub async fn reset_runtime_config(&self, key: &str) -> FsResult<RuntimeConfigResetResult> {
+        let req = ResetRuntimeConfigRequest {
+            key: key.to_string(),
+            client_context: None,
+        };
+        let rep: ResetRuntimeConfigResponse = self.rpc(RpcCode::ResetRuntimeConfig, req).await?;
+        Ok(ProtoUtils::runtime_config_reset_from_pb(rep))
     }
 
     pub async fn metrics_report(&self, metrics: Vec<MetricValue>) -> FsResult<()> {

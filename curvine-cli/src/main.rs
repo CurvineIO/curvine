@@ -234,6 +234,9 @@ fn main() -> CommonResult<()> {
             Some(Commands::Mount(cmd)) => cmd.execute(curvine_fs).await,
             Some(Commands::UnMount(cmd)) => cmd.execute(fs_client).await,
             Some(Commands::Node(cmd)) => cmd.execute(fs_client, conf.clone()).await,
+            Some(Commands::Admin(cmd)) => match cmd.action {
+                cmds::AdminSubCommand::Config(config) => config.execute(fs_client).await,
+            },
             Some(Commands::Version) | None => Ok(()),
         };
 

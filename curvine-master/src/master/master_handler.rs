@@ -16,9 +16,12 @@ use crate::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use crate::master::job::JobHandler;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
+use crate::master::runtime_config::{
+    list_runtime_config_entries, runtime_entry_to_proto, value_to_json_string,
+};
 use crate::master::MountManager;
 use crate::master::{Master, MasterMetrics, RpcContext};
-use curvine_config::ClusterConf;
+use curvine_config::{ClusterConf, RuntimeConfigRegistry};
 use curvine_core_error::{err_box, ErrorExt};
 use curvine_error::FsError;
 use curvine_error::FsResult;
@@ -68,6 +71,7 @@ pub struct MasterHandler {
     // incompatible or legacy peer does not spam identical warnings on every
     // heartbeat or statfs call.
     compat_warned: DashMap<String, CompatibilityVerdict>,
+    runtime_config: Arc<RuntimeConfigRegistry>,
 }
 
 impl MasterHandler {
@@ -83,6 +87,7 @@ impl MasterHandler {
         replication_manager: Arc<MasterReplicationManager>,
         actor_rt: Arc<Runtime>,
         metrics: &'static MasterMetrics,
+        runtime_config: Arc<RuntimeConfigRegistry>,
     ) -> Self {
         metrics.active_connections.inc();
         // Build the master's compatibility payload once; GetFilesystemInfo can
@@ -119,6 +124,7 @@ impl MasterHandler {
             master_compatibility,
             compatibility_policy,
             compat_warned: DashMap::new(),
+            runtime_config,
         }
     }
 
@@ -1013,6 +1019,44 @@ impl MasterHandler {
         ctx.response(SymlinkResponse::default())
     }
 
+    fn update_runtime_config(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let request: UpdateRuntimeConfigRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(request.key.clone()), None);
+        let audit = format!("rpc:{}", self.client_ip());
+        let result = self
+            .runtime_config
+            .set(&request.key, &request.value, Some(&audit))?;
+        let rep = UpdateRuntimeConfigResponse {
+            key: result.config,
+            previous_value_json: value_to_json_string(&result.previous_value),
+            value_json: value_to_json_string(&result.value),
+            persistent: result.persistent,
+        };
+        ctx.response(rep)
+    }
+
+    fn get_runtime_config(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let request: GetRuntimeConfigRequest = ctx.parse_header()?;
+        if let Some(ref key) = request.key {
+            ctx.set_audit(Some(key.clone()), None);
+        }
+        let views = list_runtime_config_entries(&self.runtime_config, request.key)?;
+        let entries = views.into_iter().map(runtime_entry_to_proto).collect();
+        ctx.response(GetRuntimeConfigResponse { entries })
+    }
+
+    fn reset_runtime_config(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let request: ResetRuntimeConfigRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(request.key.clone()), None);
+        let audit = format!("rpc:{}", self.client_ip());
+        let effective = self.runtime_config.reset(&request.key, Some(&audit))?;
+        let rep = ResetRuntimeConfigResponse {
+            key: request.key,
+            effective_value_json: value_to_json_string(&effective),
+        };
+        ctx.response(rep)
+    }
+
     fn metrics_report(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: MetricsReportRequest = ctx.parse_header()?;
 
@@ -1223,6 +1267,9 @@ impl MessageHandler for MasterHandler {
                 RpcCode::GetMountInfo => self.get_mount_info(ctx),
 
                 RpcCode::MetricsReport => self.metrics_report(ctx),
+                RpcCode::UpdateRuntimeConfig => self.update_runtime_config(ctx),
+                RpcCode::GetRuntimeConfig => self.get_runtime_config(ctx),
+                RpcCode::ResetRuntimeConfig => self.reset_runtime_config(ctx),
 
                 // Worker related requests
                 RpcCode::WorkerHeartbeat => self.worker_heartbeat(ctx),

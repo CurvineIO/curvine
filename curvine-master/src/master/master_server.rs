@@ -26,6 +26,7 @@ use curvine_runtime::common::{LocalTime, Logger};
 use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime, Runtime};
 use log::{error, info};
 
+use crate::master::build_master_runtime_registry;
 use crate::master::fs::{FsRetryCache, MasterActor, MasterFilesystem};
 use crate::master::journal::JournalSystem;
 use crate::master::metrics_server::{wait_for_metrics_bind, MasterMetricsServer};
@@ -50,6 +51,7 @@ pub struct MasterService {
     limit: LimitConf,
     metrics: &'static MasterMetrics,
     pub fault_http: FaultHttpControl,
+    runtime_config: Arc<RuntimeConfigRegistry>,
 }
 
 impl MasterService {
@@ -64,6 +66,7 @@ impl MasterService {
         replication_manager: Arc<MasterReplicationManager>,
         metrics: &'static MasterMetrics,
         fault_http: FaultHttpControl,
+        runtime_config: Arc<RuntimeConfigRegistry>,
     ) -> Self {
         let actor_rt = Arc::new(AsyncRuntime::new(
             "master-actor",
@@ -85,6 +88,7 @@ impl MasterService {
             limit,
             metrics,
             fault_http,
+            runtime_config,
         }
     }
 
@@ -124,6 +128,7 @@ impl HandlerService for MasterService {
             self.replication_manager.clone(),
             self.actor_rt.clone(),
             self.metrics,
+            self.runtime_config.clone(),
         )
     }
 
@@ -185,6 +190,7 @@ impl Master {
         // step 3: Create rpc server.
         let retry_cache = FsRetryCache::with_conf(&conf.master)?;
         let metrics_fs = fs.clone();
+        let runtime_config = Arc::new(build_master_runtime_registry(&conf));
         let service = MasterService::new(
             conf.clone(),
             fs,
@@ -195,11 +201,11 @@ impl Master {
             replication_manager.clone(),
             metrics,
             fault_http,
+            runtime_config.clone(),
         );
 
         let rpc_conf = conf.master_server_conf();
         let rpc_server = RpcServer::with_rt(rt.clone(), rpc_conf, service);
-        let runtime_config = Arc::new(RuntimeConfigRegistry::builder().build());
         let metrics_server = MasterMetricsServer::with_rt(
             rt,
             conf.master_metrics_conf(),

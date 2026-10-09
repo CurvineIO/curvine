@@ -12,12 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::runtime_config;
 use crate::worker::task::TaskManager;
 use crate::worker::Worker;
 use axum::extract::{Extension, Query};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use curvine_config::RuntimeConfigRegistry;
@@ -32,15 +30,11 @@ use once_cell::sync::OnceCell;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-pub use crate::worker::runtime_config::{
-    TASK_REPORT_INTERVAL_CONFIG, TASK_TIMEOUT_CONFIG, TRANSFER_INFLIGHT_BUDGET_CONFIG,
-    WORKER_MAX_CONCURRENT_TASKS_CONFIG,
-};
-
 #[derive(Clone)]
 pub struct WorkerRouterHandler {
     pub(crate) fault_http: FaultHttpControl,
     pub(crate) server_state: Arc<OnceCell<StateCtl>>,
+    #[allow(dead_code)] // used by integration tests and registry wiring
     pub(crate) task_manager: Arc<TaskManager>,
     pub(crate) runtime_config: Arc<RuntimeConfigRegistry>,
 }
@@ -130,6 +124,10 @@ mod tests {
 
     #[test]
     fn parse_helpers_match_registry() {
+        use crate::worker::runtime_config::{
+            build_worker_runtime_registry, TRANSFER_INFLIGHT_BUDGET_CONFIG,
+        };
+
         let conf = ClusterConf::default();
         let tm = Arc::new(
             TaskManager::with_rt(
@@ -139,7 +137,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let registry = runtime_config::build_worker_runtime_registry(tm, &conf);
+        let registry = build_worker_runtime_registry(tm, &conf);
         registry
             .set(TRANSFER_INFLIGHT_BUDGET_CONFIG, "100GB", None)
             .unwrap();

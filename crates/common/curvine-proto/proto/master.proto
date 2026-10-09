@@ -464,3 +464,41 @@ message GetCvMetadataDeltaPageResponse {
     required uint64 to_epoch = 4;
     required bool full_snapshot_required = 5;
 }
+
+message RuntimeConfigEntryProto {
+    required string key = 1;
+    required string file_value_json = 2;
+    optional string override_value = 3;
+    required string effective_value_json = 4;
+}
+
+message UpdateRuntimeConfigRequest {
+    required string key = 1;
+    required string value = 2;
+    optional ClientContextProto client_context = 100;
+}
+
+message UpdateRuntimeConfigResponse {
+    required string key = 1;
+    required string previous_value_json = 2;
+    required string value_json = 3;
+    required bool persistent = 4;
+}
+
+message GetRuntimeConfigRequest {
+    optional string key = 1;
+}
+
+message GetRuntimeConfigResponse {
+    repeated RuntimeConfigEntryProto entries = 1;
+}
+
+message ResetRuntimeConfigRequest {
+    required string key = 1;
+    optional ClientContextProto client_context = 100;
+}
+
+message ResetRuntimeConfigResponse {
+    required string key = 1;
+    required string effective_value_json = 2;
+}

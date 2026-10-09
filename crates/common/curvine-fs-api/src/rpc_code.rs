@@ -93,6 +93,9 @@ pub enum RpcCode {
 
     MetricsReport = 60,
     GetBlockLocationsBatch = 61,
+    UpdateRuntimeConfig = 62,
+    GetRuntimeConfig = 63,
+    ResetRuntimeConfig = 64,
 
     // block interface.
     WriteBlock = 80,

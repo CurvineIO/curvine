@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod admin;
 mod bench;
 mod export;
 mod fs;
@@ -25,6 +26,7 @@ mod report;
 pub mod transfer;
 mod umount;
 
+pub use admin::{AdminCommand, AdminSubCommand};
 pub use bench::BenchCommand;
 pub use export::ExportCommand;
 pub use fs::FsCommand;

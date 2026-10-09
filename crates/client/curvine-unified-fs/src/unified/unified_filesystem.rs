@@ -29,7 +29,8 @@ use curvine_job_client::{JobMasterClient, TransferClient};
 use curvine_model::{
     CreateFileOpts, DeleteResult, FileAllocOpts, FileLock, FileStatus, FilesystemInfo, FreeResult,
     JobStatus, ListOptions, LoadJobCommand, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions,
-    OpenFlags, RenameFlags, SetAttrOpts, TransferCommand, TransferKind, TransferState,
+    OpenFlags, RenameFlags, RuntimeConfigEntry, RuntimeConfigResetResult,
+    RuntimeConfigUpdateResult, SetAttrOpts, TransferCommand, TransferKind, TransferState,
 };
 use curvine_runtime::common::TimeSpent;
 use curvine_runtime::common::Utils;
@@ -337,6 +338,26 @@ impl UnifiedFileSystem {
     pub async fn get_mount_table(&self) -> FsResult<Vec<MountInfo>> {
         let fut = async { self.cv.get_mount_table().await };
         self.track("GetMountTable", "", "", fut).await
+    }
+
+    pub async fn update_runtime_config(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> FsResult<RuntimeConfigUpdateResult> {
+        let fut = async { self.cv.update_runtime_config(key, value).await };
+        self.track("UpdateRuntimeConfig", key, value, fut).await
+    }
+
+    pub async fn get_runtime_config(&self, key: Option<&str>) -> FsResult<Vec<RuntimeConfigEntry>> {
+        let label = key.unwrap_or("*");
+        let fut = async { self.cv.get_runtime_config(key).await };
+        self.track("GetRuntimeConfig", label, "", fut).await
+    }
+
+    pub async fn reset_runtime_config(&self, key: &str) -> FsResult<RuntimeConfigResetResult> {
+        let fut = async { self.cv.reset_runtime_config(key).await };
+        self.track("ResetRuntimeConfig", key, "", fut).await
     }
 
     pub fn clone_runtime(&self) -> Arc<Runtime> {

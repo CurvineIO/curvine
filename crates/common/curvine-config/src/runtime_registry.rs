@@ -43,12 +43,16 @@ pub struct RuntimeConfigUpdateResult {
     pub persistent: bool,
 }
 
+type RuntimeValueFn = Arc<dyn Fn() -> Value + Send + Sync>;
+type RuntimeApplyFn = Arc<dyn Fn(&str) -> CommonResult<(Value, Value)> + Send + Sync>;
+type RuntimeResetFn = Arc<dyn Fn() -> CommonResult<Value> + Send + Sync>;
+
 struct EntryInner {
     key: &'static str,
-    file_value: Arc<dyn Fn() -> Value + Send + Sync>,
-    effective: Arc<dyn Fn() -> Value + Send + Sync>,
-    apply: Arc<dyn Fn(&str) -> CommonResult<(Value, Value)> + Send + Sync>,
-    reset: Arc<dyn Fn() -> CommonResult<Value> + Send + Sync>,
+    file_value: RuntimeValueFn,
+    effective: RuntimeValueFn,
+    apply: RuntimeApplyFn,
+    reset: RuntimeResetFn,
 }
 
 /// Builder for [`RuntimeConfigRegistry`].

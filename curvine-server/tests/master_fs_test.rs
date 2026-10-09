@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_config::{ClusterConf, MasterConf};
+use curvine_config::{ClusterConf, MasterConf, RuntimeConfigRegistry};
 use curvine_core_error::CommonResult;
 use curvine_error::FsError;
 use curvine_fs_api::RpcCode;
@@ -251,6 +251,7 @@ fn new_handler_for_test(test_name: &str) -> MasterHandler {
         replication_manager,
         rt,
         Master::get_metrics().expect("test master metrics should initialize"),
+        Arc::new(RuntimeConfigRegistry::builder().build()),
     )
 }
 
