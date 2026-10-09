@@ -53,6 +53,7 @@ pub mod quota;
 pub use self::quota::*;
 
 pub type MetaRaftJournal = RaftJournal<RocksLogStorage, JournalLoader>;
-pub type SyncFsDir = ArcRwLock<FsDir>;
+/// Non-poisoning metadata lock; location reports share access with readers.
+pub type SyncFsDir = std::sync::Arc<parking_lot::RwLock<FsDir>>;
 pub type SyncWorkerManager = ArcRwLock<WorkerManager>;
 pub use mount::MountManager;
