@@ -45,6 +45,7 @@ pub(crate) enum QpairReserveResult {
 
 pub struct QpairPool {
     pub(crate) inner: Mutex<HashMap<usize, Vec<*mut spdk_ffi::spdk_nvme_qpair>>>,
+    pub(crate) pending_destroy: Mutex<HashMap<usize, Vec<*mut spdk_ffi::spdk_nvme_qpair>>>,
     /// Per-controller active count and max limit, keyed by controller pointer.
     pub(crate) ctrl_state: Mutex<HashMap<usize, CtrlQpairState>>,
     /// Aggregate active qpair reservations across controllers.
@@ -83,6 +84,7 @@ impl QpairPool {
     pub(crate) fn with_qpair_acquire_timeout(qpair_acquire_timeout: Duration) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            pending_destroy: Mutex::new(HashMap::new()),
             ctrl_state: Mutex::new(HashMap::new()),
             total_active: AtomicUsize::new(0),
             total_limit: AtomicUsize::new(0),
@@ -127,6 +129,7 @@ impl QpairPool {
     }
 
     /// Get (active, max_active) for a controller.
+    #[cfg(test)]
     pub(crate) fn controller_stats(&self, ctrlr_ptr: usize) -> (usize, usize) {
         let state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(s) = state.get(&ctrlr_ptr) {
@@ -351,7 +354,7 @@ impl QpairPool {
         &self,
         ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
-    ) {
+    ) -> bool {
         let key = ctrlr as usize;
         let release_result = {
             let mut pool = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -359,7 +362,17 @@ impl QpairPool {
             if stack.len() >= self.max_per_ctrlr {
                 // Pool full — free immediately to bound controller-side memory.
                 drop(pool); // release lock before FFI call
-                unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) };
+                let rc = unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) };
+                if rc != 0 {
+                    error!("QpairPool: failed to free qpair {:p}: rc={}", qpair, rc);
+                    self.pending_destroy
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .entry(key)
+                        .or_default()
+                        .push(qpair);
+                    return false;
+                }
                 log::trace!(
                     "QpairPool: pool full for ctrlr {:p} (max={}), freed qpair",
                     ctrlr,
@@ -382,27 +395,65 @@ impl QpairPool {
         spdk_metrics::record_qpair_release(release_result);
         self.release_reservation(key);
         self.notify.notify_one(); // safe to call without holding inner lock
+        true
     }
+
     /// Free all pooled qpairs. Only frees cached (idle) qpairs - active/in-flight
     /// qpairs are tracked by their owners and will be released normally. Repeated
     /// calls still drain late releases, but only the first shutdown transition is counted.
-    pub(crate) fn drain_all(&self) {
+    pub(crate) fn drain_all(&self) -> bool {
         if !self.shutdown.swap(true, Ordering::AcqRel) {
             spdk_metrics::record_qpair_shutdown();
         }
         let mut pool = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let mut total = 0usize;
-        for (_ctrlr_key, qpairs) in pool.drain() {
+        let mut failed: HashMap<usize, Vec<*mut spdk_ffi::spdk_nvme_qpair>> = HashMap::new();
+        for (ctrlr_key, qpairs) in pool.drain() {
             for qpair in qpairs {
-                unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) };
+                let rc = unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) };
+                if rc != 0 {
+                    error!(
+                        "QpairPool: failed to free cached qpair {:p} during shutdown: rc={}",
+                        qpair, rc
+                    );
+                    failed.entry(ctrlr_key).or_default().push(qpair);
+                    continue;
+                }
                 total += 1;
             }
         }
-        if total > 0 {
-            info!("QpairPool: freed {} cached qpair(s) during shutdown", total);
+        let failed_count = failed.values().map(Vec::len).sum();
+        *pool = failed;
+        drop(pool);
+
+        let mut pending = self
+            .pending_destroy
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut failed_pending: HashMap<usize, Vec<*mut spdk_ffi::spdk_nvme_qpair>> =
+            HashMap::new();
+        for (ctrlr_key, qpairs) in pending.drain() {
+            for qpair in qpairs {
+                let rc = unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) };
+                if rc != 0 {
+                    error!(
+                        "QpairPool: failed to free pending qpair {:p} during shutdown: rc={}",
+                        qpair, rc
+                    );
+                    failed_pending.entry(ctrlr_key).or_default().push(qpair);
+                    continue;
+                }
+                total += 1;
+                self.release_reservation(ctrlr_key);
+            }
         }
-        self.total_cached.store(0, Ordering::Release);
-        spdk_metrics::set_qpair_cached(0);
+        let failed_pending_count = failed_pending.values().map(Vec::len).sum::<usize>();
+        *pending = failed_pending;
+        if total > 0 {
+            info!("QpairPool: freed {} qpair(s) during shutdown", total);
+        }
+        self.total_cached.store(failed_count, Ordering::Release);
+        spdk_metrics::set_qpair_cached(failed_count);
         // Warn if there are still active (in-flight) qpairs - these are not freed here,
         // they are tracked by their SpdkBdev owners and will be released via drop().
         for state in self
@@ -421,6 +472,7 @@ impl QpairPool {
             }
         }
         self.notify.notify_all();
+        failed_count == 0 && failed_pending_count == 0
     }
 
     pub(crate) fn publish_metrics(&self) {
@@ -502,6 +554,8 @@ pub struct SpdkEnv {
     open_handles: AtomicUsize,
     qpair_pool: QpairPool,
     poller: Mutex<Option<SpdkPoller>>,
+    shutdown_lock: Mutex<()>,
+    shutdown_complete: AtomicBool,
 }
 
 // SAFETY: Fields are either immutable after init (conf, bdevs) or atomic (state).
@@ -527,6 +581,8 @@ impl SpdkEnv {
             open_handles: AtomicUsize::new(0),
             qpair_pool,
             poller: Mutex::new(None),
+            shutdown_lock: Mutex::new(()),
+            shutdown_complete: AtomicBool::new(false),
         })
     }
 
@@ -708,18 +764,12 @@ impl SpdkEnv {
 
     /// Shutdown: detach controllers, free hugepages
     pub fn shutdown(&self) {
-        // CAS Initialized => ShutDown, reject new opens after transition
-        let prev = self.state.compare_exchange(
-            SpdkEnvState::Initialized as u8,
-            SpdkEnvState::ShutDown as u8,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        if prev.is_err() {
-            warn!(
-                "SpdkEnv::shutdown() called in state: {} (expected Initialized)",
-                self.state()
-            );
+        let _shutdown_guard = self
+            .shutdown_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if !self.begin_shutdown_attempt() {
             return;
         }
 
@@ -768,11 +818,48 @@ impl SpdkEnv {
             info!("SPDK poller thread stopped");
         }
 
-        self.qpair_pool.drain_all();
+        if !self.qpair_pool.drain_all() {
+            error!("SPDK shutdown retains qpairs that failed to free; skipping detach");
+            return;
+        }
         self.detach_controllers(); // stop keep-alive, release controller resources
         self.env_fini(); // release hugepages, cleanup DPDK EAL
+        self.shutdown_complete.store(true, Ordering::Release);
 
         info!("SPDK environment shut down successfully");
+    }
+
+    fn begin_shutdown_attempt(&self) -> bool {
+        // CAS Initialized => ShutDown, rejecting new opens before cleanup starts.
+        let prev = self.state.compare_exchange(
+            SpdkEnvState::Initialized as u8,
+            SpdkEnvState::ShutDown as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        if prev.is_ok() {
+            return true;
+        }
+
+        if self.shutdown_complete.load(Ordering::Acquire) {
+            warn!(
+                "SpdkEnv::shutdown() called in state: {} (expected Initialized)",
+                self.state()
+            );
+            return false;
+        }
+
+        if self.state() != SpdkEnvState::ShutDown {
+            warn!(
+                "SpdkEnv::shutdown() called in state: {} (expected Initialized or incomplete ShutDown)",
+                self.state()
+            );
+            return false;
+        }
+
+        // A previous shutdown attempt preserved unresolved qpairs and returned
+        // before detach/env_fini. Retrying is safe because new opens are already rejected.
+        true
     }
 
     /// Current lifecycle state.
@@ -896,8 +983,8 @@ impl SpdkEnv {
         &self,
         ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
-    ) {
-        self.qpair_pool.release(ctrlr, qpair);
+    ) -> bool {
+        self.qpair_pool.release(ctrlr, qpair)
     }
 
     /// Unregister qpair from poller, blocking until removed to prevent UAF.
@@ -1078,7 +1165,7 @@ impl SpdkEnv {
                     "Controller {} has no active namespaces, detaching controller",
                     target.endpoint()
                 );
-                unsafe { spdk_ffi::spdk_nvme_detach(ctrlr) };
+                spdk_ffi::spdk_nvme_detach(ctrlr);
             }
             Ok(bdevs)
         }
@@ -1499,6 +1586,45 @@ mod test {
         assert!(output.contains("spdk_qpair_limit 1"));
         assert!(output.contains("spdk_qpair_cached 0"));
         assert!(output.contains("spdk_qpair_shutdown_total"));
+    }
+
+    #[test]
+    fn shutdown_attempt_retries_until_completion() {
+        let env = SpdkEnv::new(SpdkConf::default()).unwrap();
+
+        env.state
+            .store(SpdkEnvState::Initialized as u8, Ordering::Release);
+
+        assert!(env.begin_shutdown_attempt());
+        assert_eq!(env.state(), SpdkEnvState::ShutDown);
+
+        // Incomplete shutdown attempts must be retryable so preserved qpairs can
+        // be retried before controller detach and env_fini are allowed.
+        assert!(env.begin_shutdown_attempt());
+
+        env.shutdown_complete.store(true, Ordering::Release);
+        assert!(!env.begin_shutdown_attempt());
+    }
+
+    #[test]
+    fn shutdown_lock_serializes_attempts() {
+        let env = Arc::new(SpdkEnv::new(SpdkConf::default()).unwrap());
+        let guard = env.shutdown_lock.lock().unwrap();
+        let entered = Arc::new(AtomicBool::new(false));
+
+        let env_for_thread = Arc::clone(&env);
+        let entered_for_thread = Arc::clone(&entered);
+        let handle = thread::spawn(move || {
+            let _guard = env_for_thread.shutdown_lock.lock().unwrap();
+            entered_for_thread.store(true, Ordering::Release);
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        assert!(!entered.load(Ordering::Acquire));
+
+        drop(guard);
+        handle.join().unwrap();
+        assert!(entered.load(Ordering::Acquire));
     }
 
     #[test]
