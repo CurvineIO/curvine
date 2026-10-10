@@ -1178,6 +1178,10 @@ impl MessageHandler for MasterHandler {
         }
     }
 
+    // Only WorkerHeartbeat and WorkerBlockReport are routed to actor_rt;
+    // GetFilesystemInfo (statfs) deliberately runs on the main RPC blocking pool
+    // so that FUSE/kubelet statfs bursts cannot delay heartbeats and cause workers
+    // to be marked lost.
     fn get_rt(&self, msg: &Message) -> Option<&Runtime> {
         let code = RpcCode::from(msg.code());
         if matches!(code, RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport) {

@@ -332,6 +332,22 @@ fn control_plane_requests_use_the_async_handler() {
 
     let mkdir = Builder::new_rpc(RpcCode::Mkdir).build();
     assert!(handler.is_sync(&mkdir));
+
+    // Pin the actor-runtime routing: only heartbeat and block report must
+    // use actor_rt; GetFilesystemInfo (statfs) must run on the main pool so
+    // that statfs bursts cannot delay heartbeats.
+    let fs_info_msg = Builder::new_rpc(RpcCode::GetFilesystemInfo).build();
+    assert!(
+        handler.get_rt(&fs_info_msg).is_none(),
+        "GetFilesystemInfo must NOT be routed to actor_rt"
+    );
+    for code in [RpcCode::WorkerHeartbeat, RpcCode::WorkerBlockReport] {
+        let msg = Builder::new_rpc(code).build();
+        assert!(
+            handler.get_rt(&msg).is_some(),
+            "{code:?} must be routed to actor_rt"
+        );
+    }
 }
 
 #[test]
