@@ -313,14 +313,17 @@ impl JournalLoader {
         self.set_applied(is_leader, applied, has_ufs_affecting)?;
 
         if let Some(e) = snapshot {
+            let spent = TimeSpent::new();
             let snap_data = self.create_snapshot0(Some(e.dir.to_string()))?;
 
             self.log_store.create_snapshot(snap_data.clone())?;
             self.log_store.compact(snap_data.fsm_state.compact())?;
 
             info!(
-                "create leader snapshot, dir={}, fsm_state={:?}",
-                e.dir, snap_data.fsm_state
+                "create leader snapshot, dir={}, cost={}ms, fsm_state={:?}",
+                e.dir,
+                spent.used_ms(),
+                snap_data.fsm_state
             );
         }
 
@@ -525,10 +528,12 @@ impl JournalLoader {
 
     fn create_snapshot0(&self, dir_option: Option<String>) -> RaftResult<SnapshotData> {
         let fsm_state = self.fsm_state_snapshot()?;
-        let fs_dir = self.fs_dir.read();
         let dir = match dir_option {
             Some(dir) => dir,
-            None => fs_dir.create_checkpoint(fsm_state.applied.index)?,
+            None => {
+                let fs_dir = self.fs_dir.read();
+                fs_dir.create_checkpoint(fsm_state.applied.index)?
+            }
         };
 
         let data = RaftUtils::create_file_snapshot(&dir, self.node_id, fsm_state)?;

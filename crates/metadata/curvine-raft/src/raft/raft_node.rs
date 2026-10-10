@@ -89,6 +89,8 @@ where
 
     snapshot_interval_ms: u64,
 
+    snapshot_min_interval_ms: u64,
+
     snapshot_entries: u64,
 
     last_snapshot_ms: u64,
@@ -153,6 +155,7 @@ where
             tick_interval,
             max_batch_size,
             snapshot_interval_ms,
+            snapshot_min_interval_ms: conf.snapshot_min_interval.as_millis(),
             snapshot_entries,
             last_snapshot_ms: LocalTime::mills(),
             last_snapshot_op_id: 0,
@@ -211,6 +214,7 @@ where
             tick_interval,
             max_batch_size,
             snapshot_interval_ms,
+            snapshot_min_interval_ms: conf.snapshot_min_interval.as_millis(),
             snapshot_entries,
             last_snapshot_ms: LocalTime::mills(),
             last_snapshot_op_id: 0,
@@ -858,14 +862,21 @@ where
             return Ok(());
         }
 
+        let now = LocalTime::mills();
+        if self.last_snapshot_op_id > 0
+            && now.saturating_sub(self.last_snapshot_ms) < self.snapshot_min_interval_ms
+        {
+            return Ok(());
+        }
+
         let last_op_id = self.storage.get_fsm_state().op_id();
         let diff = last_op_id.saturating_sub(self.last_snapshot_op_id);
-        if (LocalTime::mills() - self.last_snapshot_ms > self.snapshot_interval_ms && diff > 0)
+        if (now.saturating_sub(self.last_snapshot_ms) > self.snapshot_interval_ms && diff > 0)
             || diff > self.snapshot_entries
         {
             self.storage.gen_create_snapshot_job()?;
 
-            self.last_snapshot_ms = LocalTime::mills();
+            self.last_snapshot_ms = now;
             self.last_snapshot_op_id = last_op_id;
         }
 

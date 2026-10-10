@@ -16,7 +16,8 @@ use super::*;
 use crate::raft::storage::{HashAppStorage, MemLogStorage};
 use curvine_config::RaftPeer;
 use curvine_net::net::NetUtils;
-use raft::eraftpb::{ConfChangeSingle, ConfChangeTransition, ConfChangeV2};
+use raft::eraftpb::{ConfChangeSingle, ConfChangeTransition, ConfChangeV2, HardState};
+use std::time::Instant;
 
 fn test_node(rt: Arc<Runtime>) -> RaftNode<MemLogStorage, HashAppStorage<String, String>> {
     let mut conf = JournalConf::with_test();
@@ -76,6 +77,7 @@ fn test_node(rt: Arc<Runtime>) -> RaftNode<MemLogStorage, HashAppStorage<String,
         tick_interval: Duration::from_millis(conf.raft_tick_interval_ms),
         max_batch_size: conf.raft_batch_size.max(1),
         snapshot_interval_ms: 0,
+        snapshot_min_interval_ms: 0,
         snapshot_entries: conf.snapshot_entries,
         last_snapshot_ms: 0,
         last_snapshot_op_id: 0,
@@ -232,4 +234,124 @@ fn snapshot_failure_keeps_the_ready_unadvanced_for_node_shutdown() {
     assert!(error.to_string().contains("injected snapshot failure"));
     assert!(node.pending_ready.is_some());
     assert!(node.raw.has_ready());
+}
+
+fn wait_for_snapshot_job(node: &RaftNode<MemLogStorage, HashAppStorage<String, String>>) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !node.storage.can_generate_snapshot() {
+        assert!(
+            Instant::now() < deadline,
+            "the snapshot job did not finish in time"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn follower_snapshot_is_throttled_by_min_interval() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt.clone());
+
+    // Freeze a follower state whose applied op_id (2) exceeds the
+    // snapshot_entries trigger (1), so only the min interval holds snapshots
+    // back.
+    let fsm_state = FsmState {
+        applied: AppliedIndex {
+            term: 1,
+            index: 1,
+            op_id: 2,
+            rpc_id: 0,
+        },
+        ..Default::default()
+    };
+    rt.block_on(node.storage.app_store.apply_snapshot(SnapshotData {
+        snapshot_id: 1,
+        node_id: 1,
+        create_time: LocalTime::mills(),
+        bytes_data: Some(SerdeUtils::serialize(&HashMap::<String, String>::new()).unwrap()),
+        files_data: None,
+        fsm_state,
+    }))
+    .unwrap();
+    // The snapshot job builds the snapshot metadata from the committed log
+    // entry (index 1, term 1), so seed a matching log entry and hard state.
+    node.storage
+        .append(&[Entry {
+            index: 1,
+            term: 1,
+            ..Default::default()
+        }])
+        .unwrap();
+    node.storage
+        .set_hard_state(&HardState {
+            term: 1,
+            commit: 1,
+            ..Default::default()
+        })
+        .unwrap();
+
+    node.snapshot_interval_ms = 0;
+    node.snapshot_min_interval_ms = 10 * 60 * 1000;
+    node.snapshot_entries = 1;
+    // Match the production constructors, which anchor `last_snapshot_ms` to
+    // process start; the throttle must not treat that anchor as a snapshot.
+    node.last_snapshot_ms = LocalTime::mills();
+    node.last_snapshot_op_id = 0;
+
+    // First check: the interval is open, so a create job is generated and
+    // both markers advance.
+    node.apply_create_snapshot().unwrap();
+    let first_ms = node.last_snapshot_ms;
+    let first_op_id = node.last_snapshot_op_id;
+    assert!(first_ms > 0, "the first check must generate a snapshot job");
+    assert_eq!(
+        first_op_id, 2,
+        "the first check must generate a snapshot job"
+    );
+    wait_for_snapshot_job(&node);
+
+    // Push the applied op_id ahead by 2 so the entry count alone already
+    // crosses the trigger (diff 2 > snapshot_entries 1): only the min
+    // interval guard can hold the next snapshot back.
+    rt.block_on(node.storage.app_store.apply_snapshot(SnapshotData {
+        snapshot_id: 2,
+        node_id: 1,
+        create_time: LocalTime::mills(),
+        bytes_data: Some(SerdeUtils::serialize(&HashMap::<String, String>::new()).unwrap()),
+        files_data: None,
+        fsm_state: FsmState {
+            applied: AppliedIndex {
+                term: 1,
+                index: 1,
+                op_id: 4,
+                rpc_id: 0,
+            },
+            ..Default::default()
+        },
+    }))
+    .unwrap();
+
+    // Second check inside the interval: it is skipped, so no new create job
+    // is generated and the markers stay unchanged.
+    node.apply_create_snapshot().unwrap();
+    assert_eq!(
+        node.last_snapshot_ms, first_ms,
+        "a second snapshot inside the interval must be skipped"
+    );
+    assert_eq!(
+        node.last_snapshot_op_id, first_op_id,
+        "a second snapshot inside the interval must be skipped"
+    );
+
+    // Once the interval expires, the next check may create a new snapshot
+    // without resetting the op_id marker.
+    let expired_anchor = LocalTime::mills().saturating_sub(node.snapshot_min_interval_ms + 1);
+    node.last_snapshot_ms = expired_anchor;
+    node.apply_create_snapshot().unwrap();
+    assert!(
+        node.last_snapshot_ms > expired_anchor,
+        "the interval must allow a new snapshot afterwards"
+    );
+    assert_eq!(node.last_snapshot_op_id, 4);
+    wait_for_snapshot_job(&node);
 }

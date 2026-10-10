@@ -38,7 +38,10 @@ pub struct JournalWriter {
     metrics: &'static MasterMetrics,
     receiver: Option<Mutex<BlockingReceiver<JournalEntry>>>,
 
+    leader_create_snapshot: bool,
     snapshot_entries: u64,
+    snapshot_min_interval_ms: u64,
+    last_snapshot_ms: AtomicCounter,
     entries_since_snapshot: AtomicCounter,
 }
 
@@ -63,7 +66,10 @@ impl JournalWriter {
             sender,
             metrics,
             receiver,
+            leader_create_snapshot: conf.leader_creates_snapshot(),
             snapshot_entries: conf.snapshot_entries,
+            snapshot_min_interval_ms: conf.snapshot_min_interval.as_millis(),
+            last_snapshot_ms: AtomicCounter::new(0),
             entries_since_snapshot: AtomicCounter::new(0),
         })
     }
@@ -84,6 +90,9 @@ impl JournalWriter {
     }
 
     fn maybe_emit_snapshot(&self, fs_dir: &FsDir) -> FsResult<()> {
+        if !self.leader_create_snapshot {
+            return Ok(());
+        }
         if self.snapshot_entries == 0 {
             return Ok(());
         }
@@ -94,10 +103,21 @@ impl JournalWriter {
         }
 
         let now = LocalTime::mills();
+        let last = self.last_snapshot_ms.get();
+        if last > 0 && now.saturating_sub(last) < self.snapshot_min_interval_ms {
+            return Ok(());
+        }
+
         self.entries_since_snapshot.set(0);
+        self.last_snapshot_ms.set(now);
+
         let dir = match fs_dir.store.create_checkpoint(now) {
             Ok(d) => d,
             Err(e) => {
+                // Restore the consumed entry count as well, so a failed
+                // snapshot retries without waiting for another full batch.
+                self.entries_since_snapshot.set(entries);
+                self.last_snapshot_ms.set(last);
                 return err_box!("leaderSnapshot: create_checkpoint failed: {}", e);
             }
         };
@@ -118,6 +138,8 @@ impl JournalWriter {
         });
 
         if let Err(send_error) = self.send_inner(snapshot_entry) {
+            self.entries_since_snapshot.set(entries);
+            self.last_snapshot_ms.set(last);
             if let Err(cleanup_error) = FileUtils::delete_path(&dir, true) {
                 warn!(
                     "failed to remove checkpoint {} after snapshot entry send failure: {}",
@@ -391,7 +413,8 @@ mod tests {
     use crate::master::meta::inode::ttl::TtlBucketList;
     use crate::master::quota::eviction::evictor::{Evictor, LRUEvictor};
     use crate::master::quota::eviction::EvictionConf;
-    use curvine_config::ClusterConf;
+    use curvine_config::{ClusterConf, RaftPeer};
+    use curvine_runtime::common::DurationUnit;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -472,6 +495,16 @@ mod tests {
             "checkpoint should be removed after enqueue failure: {:?}",
             checkpoints
         );
+        assert_eq!(
+            writer.last_snapshot_ms.get(),
+            0,
+            "failed snapshot must not start the interval"
+        );
+        assert_eq!(
+            writer.entries_since_snapshot.get(),
+            1,
+            "failed snapshot must not consume the entry count"
+        );
 
         Ok(())
     }
@@ -503,6 +536,130 @@ mod tests {
             }
             other => panic!("expected snapshot entry, got {:?}", other),
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn retries_snapshot_after_failure_without_waiting_for_entries() -> FsResult<()> {
+        let mut conf = test_conf("snapshot_failure_retry");
+        conf.journal.snapshot_entries = 2;
+        let mut writer = build_writer(&conf)?;
+
+        let receiver = writer
+            .receiver
+            .take()
+            .expect("testing writer should retain its receiver");
+        drop(receiver);
+
+        let writer = Arc::new(writer);
+        let fs_dir = build_fs_dir(&conf, writer.clone())?;
+
+        // The first check only reaches one of the two required entries.
+        writer.maybe_emit_snapshot(&fs_dir)?;
+        assert_eq!(writer.entries_since_snapshot.get(), 1);
+
+        // The second check creates a checkpoint, but handing the entry off
+        // fails; the consumed entry count must be restored.
+        assert!(writer.maybe_emit_snapshot(&fs_dir).is_err());
+        assert_eq!(
+            writer.entries_since_snapshot.get(),
+            2,
+            "failed snapshot must restore the consumed entry count"
+        );
+
+        // With the count restored, the next check retries immediately instead
+        // of waiting for another full snapshot_entries batch.
+        assert!(
+            writer.maybe_emit_snapshot(&fs_dir).is_err(),
+            "a restored entry count must allow an immediate retry"
+        );
+
+        Ok(())
+    }
+
+    fn raft_group(conf: &ClusterConf, nodes: u64) -> Vec<RaftPeer> {
+        (1..=nodes)
+            .map(|id| {
+                let hostname = if id == 1 {
+                    conf.journal.hostname.clone()
+                } else {
+                    format!("10.0.0.{id}")
+                };
+                RaftPeer::new(id, hostname, conf.journal.rpc_port)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn skips_checkpoint_when_raft_group_has_multiple_nodes() -> FsResult<()> {
+        let mut conf = test_conf("snapshot_multi_node");
+        conf.journal.journal_addrs = raft_group(&conf, 3);
+        // The compat default is true; None must fall back to single-node-only creation.
+        conf.journal.leader_create_snapshot = None;
+        let writer = Arc::new(build_writer(&conf)?);
+        let fs_dir = build_fs_dir(&conf, writer.clone())?;
+
+        writer.maybe_emit_snapshot(&fs_dir)?;
+
+        assert!(
+            checkpoint_dirs(&conf).is_empty(),
+            "leader checkpoint is disabled when the raft group has more than one node"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn creates_checkpoint_when_leader_override_is_enabled() -> FsResult<()> {
+        let mut conf = test_conf("snapshot_leader_override");
+        conf.journal.journal_addrs = raft_group(&conf, 3);
+        conf.journal.leader_create_snapshot = Some(true);
+        let writer = Arc::new(build_writer(&conf)?);
+        let fs_dir = build_fs_dir(&conf, writer.clone())?;
+
+        writer.maybe_emit_snapshot(&fs_dir)?;
+
+        assert_eq!(checkpoint_dirs(&conf).len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn skips_checkpoint_when_leader_override_is_disabled() -> FsResult<()> {
+        let mut conf = test_conf("snapshot_leader_disabled");
+        conf.journal.leader_create_snapshot = Some(false);
+        let writer = Arc::new(build_writer(&conf)?);
+        let fs_dir = build_fs_dir(&conf, writer.clone())?;
+
+        writer.maybe_emit_snapshot(&fs_dir)?;
+
+        assert!(checkpoint_dirs(&conf).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn creates_at_most_one_checkpoint_per_interval() -> FsResult<()> {
+        let mut conf = test_conf("snapshot_min_interval");
+        conf.journal.writer_channel_size = 8;
+        conf.journal.snapshot_min_interval = DurationUnit::new(10 * DurationUnit::MINUTE);
+        let writer = Arc::new(build_writer(&conf)?);
+        let fs_dir = build_fs_dir(&conf, writer.clone())?;
+
+        writer.maybe_emit_snapshot(&fs_dir)?;
+        assert_eq!(checkpoint_dirs(&conf).len(), 1);
+
+        writer.maybe_emit_snapshot(&fs_dir)?;
+        assert_eq!(
+            checkpoint_dirs(&conf).len(),
+            1,
+            "a second checkpoint inside the interval must be skipped"
+        );
+
+        writer
+            .last_snapshot_ms
+            .set(LocalTime::mills().saturating_sub(writer.snapshot_min_interval_ms + 1));
+        std::thread::sleep(Duration::from_millis(2));
+        writer.maybe_emit_snapshot(&fs_dir)?;
+        assert_eq!(checkpoint_dirs(&conf).len(), 2);
 
         Ok(())
     }
