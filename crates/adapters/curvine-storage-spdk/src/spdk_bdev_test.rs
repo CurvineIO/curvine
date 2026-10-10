@@ -33,14 +33,12 @@ fn test_spdk_conf() -> SpdkConf {
         std::env::var("SPDK_TARGET_NQN").unwrap_or("nqn.2024-01.io.curvine:test".to_string());
     let trtype = std::env::var("SPDK_TRANSPORT_TYPE").unwrap_or("tcp".to_string());
     let iova_mode = std::env::var("SPDK_IOVA_MODE").unwrap_or_else(|_| "va".to_string());
+    let hugepage_mb = std::env::var("SPDK_HUGEPAGE_MB").unwrap_or_else(|_| "256".to_string());
 
     SpdkConf {
         enabled: true,
         app_name: "curvine-test".to_string(),
-        hugepage_mb: std::env::var("SPDK_HUGEPAGE_MB")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(256),
+        hugepage_str: format!("{}MB", hugepage_mb),
         reactor_mask: std::env::var("SPDK_REACTOR_MASK").unwrap_or("0x1".to_string()),
         keep_alive_timeout_ms: 500,
         iova_mode,
@@ -200,6 +198,7 @@ fn spdk_full_lifecycle() {
 
         let p = QpairPool {
             inner: Mutex::new(HashMap::new()),
+            pending_destroy: Mutex::new(HashMap::new()),
             ctrl_state: Mutex::new(HashMap::new()),
             total_active: AtomicUsize::new(0),
             total_limit: AtomicUsize::new(0),
@@ -242,6 +241,7 @@ fn spdk_full_lifecycle() {
 
         let p = Arc::new(QpairPool {
             inner: Mutex::new(HashMap::new()),
+            pending_destroy: Mutex::new(HashMap::new()),
             ctrl_state: Mutex::new(HashMap::new()),
             total_active: AtomicUsize::new(0),
             total_limit: AtomicUsize::new(0),

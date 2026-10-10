@@ -536,6 +536,8 @@ impl SpdkBdev {
             bdev_inflight: self.inflight.clone(),
         };
         if self.io_channel.poller_tx.send(req).is_err() {
+            self.inflight
+                .fetch_sub(1, std::sync::atomic::Ordering::Release);
             return err_box!("SPDK poller thread is gone");
         }
         if self.io_channel.poller_is_sleeping.load(Ordering::SeqCst) {
@@ -739,7 +741,12 @@ impl Drop for SpdkBdev {
             // Unregister qpair from poller before returning it to pool to avoid use-after-free
             let unregistered = env.unregister_qpair_from_poller(self.io_channel.qpair);
             if unregistered {
-                env.release_qpair(self.ctrlr, self.io_channel.qpair);
+                if !env.release_qpair(self.ctrlr, self.io_channel.qpair) {
+                    error!(
+                        "SpdkBdev '{}': qpair release failed, preserving reservation",
+                        self.name
+                    );
+                }
             } else {
                 error!(
                     "SpdkBdev '{}': qpair not unregistered, leaking to prevent UAF",
@@ -748,8 +755,12 @@ impl Drop for SpdkBdev {
             }
             env.release_handle();
         } else {
-            unsafe {
-                crate::spdk_ffi::curvine_spdk_free_io_qpair(self.io_channel.qpair);
+            let rc = unsafe { crate::spdk_ffi::curvine_spdk_free_io_qpair(self.io_channel.qpair) };
+            if rc != 0 {
+                error!(
+                    "SpdkBdev '{}': failed to free SPDK qpair during drop: rc={}",
+                    self.name, rc
+                );
             }
         }
         debug!(
@@ -772,7 +783,8 @@ mod test {
         let mut conf = SpdkConf::default();
         conf.enabled = true;
         conf.app_name = "curvine-test".to_string();
-        conf.hugepage_mb = 64;
+        let hugepage_mb = std::env::var("SPDK_HUGEPAGE_MB").unwrap_or_else(|_| "64".to_string());
+        conf.hugepage_str = format!("{}MB", hugepage_mb);
         conf.reactor_mask = "0x1".to_string();
         let traddr = std::env::var("SPDK_TARGET_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
         let trsvcid = std::env::var("SPDK_TARGET_PORT")
