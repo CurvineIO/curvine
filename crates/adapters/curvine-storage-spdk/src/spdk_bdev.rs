@@ -723,7 +723,7 @@ impl Drop for SpdkBdev {
                 // Poison pointers so DmaBuf::drop is a no-op.
                 self.read_buf.ptr = std::ptr::null_mut();
                 self.write_buf.ptr = std::ptr::null_mut();
-                // TODO: leak qpair and handle on timeout because reusing a qpair with orphaned callbacks causes use after free.
+                // TODO: leak qpair and handle on timeout because reusing a qpair with retired callbacks causes use after free.
                 break;
             }
             if !logged {
@@ -738,21 +738,8 @@ impl Drop for SpdkBdev {
 
         // Return qpair to pool and release handle.
         if let Some(env) = crate::spdk_env::SpdkEnv::global_including_shutdown() {
-            // Unregister qpair from poller before returning it to pool to avoid use-after-free
-            let unregistered = env.unregister_qpair_from_poller(self.io_channel.qpair);
-            if unregistered {
-                if !env.release_qpair(self.ctrlr, self.io_channel.qpair) {
-                    error!(
-                        "SpdkBdev '{}': qpair release failed, preserving reservation",
-                        self.name
-                    );
-                }
-            } else {
-                error!(
-                    "SpdkBdev '{}': qpair not unregistered, leaking to prevent UAF",
-                    self.name
-                );
-            }
+            // Unregister qpair from poller before returning it to pool to avoid use-after-free.
+            env.retire_qpair(self.ctrlr, self.io_channel.qpair);
             env.release_handle();
         } else {
             let rc = unsafe { crate::spdk_ffi::curvine_spdk_free_io_qpair(self.io_channel.qpair) };
