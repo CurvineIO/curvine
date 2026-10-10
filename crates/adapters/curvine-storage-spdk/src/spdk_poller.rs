@@ -49,6 +49,13 @@ pub enum IoOp {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnregisterResult {
+    Acked,
+    TimedOut,
+    Disconnected,
+}
+
 // SAFETY: exclusive ownership - blocks until completion.
 unsafe impl Send for IoOp {}
 
@@ -232,6 +239,11 @@ impl RetiredQpairRegistry {
     }
 
     #[cfg(test)]
+    pub(crate) fn mark_clean(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) {
+        self.insert(qpair as usize, None, false);
+    }
+
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
@@ -313,8 +325,10 @@ impl SpdkPoller {
     }
 
     /// Unregister qpair from poller, blocking until removed to prevent UAF.
-    /// Returns false if poller didn't ack within timeout (likely stuck/dead).
-    pub fn unregister_qpair(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> bool {
+    pub(crate) fn unregister_qpair(
+        &self,
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+    ) -> UnregisterResult {
         let (ack_tx, ack_rx) = mpsc::channel::<()>();
         // TODO: use dedicated control channel instead of IoRequest to avoid dummy allocation (negligible cost)
         let req = IoRequest {
@@ -323,17 +337,19 @@ impl SpdkPoller {
             bdev_inflight: Arc::new(AtomicUsize::new(0)),
         };
         if let Some(tx) = &self.tx {
-            let _ = tx.send(req);
+            if tx.send(req).is_err() {
+                return UnregisterResult::Disconnected;
+            }
             let _ = self.eventfd.write(1);
             match ack_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(()) => true,
+                Ok(()) => UnregisterResult::Acked,
                 Err(_) => {
                     error!("Unregister timeout: poller may be stuck, qpair not removed");
-                    false
+                    UnregisterResult::TimedOut
                 }
             }
         } else {
-            false // Poller stopped
+            UnregisterResult::Disconnected
         }
     }
 
