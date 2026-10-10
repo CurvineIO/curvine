@@ -54,7 +54,9 @@ pub struct JournalConf {
     pub snapshot_interval: String,
 
     // Minimum gap between snapshots on the leader and on followers.
-    // At most one snapshot is created during this interval. Zero disables the limit.
+    // At most one snapshot is created during this interval; on the leader a
+    // failed attempt also opens the window, so retries wait for the next
+    // cycle. Zero disables the limit.
     pub snapshot_min_interval: DurationUnit,
 
     /// Whether the leader creates a metadata snapshot.
@@ -66,7 +68,8 @@ pub struct JournalConf {
     ///
     /// When the leader does not create snapshots, the leader raft log has no
     /// compaction path until the follower snapshot reporting path lands, so
-    /// this mode is not production ready yet.
+    /// this mode is not production ready yet. A running master logs an error
+    /// every few minutes while it is disabled.
     pub leader_create_snapshot: Option<bool>,
 
     // How many entries are created after creating snapshots.

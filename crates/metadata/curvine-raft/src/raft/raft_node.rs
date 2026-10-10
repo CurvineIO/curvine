@@ -863,7 +863,7 @@ where
         }
 
         let now = LocalTime::mills();
-        if self.last_snapshot_ms > 0
+        if self.last_snapshot_op_id > 0
             && now.saturating_sub(self.last_snapshot_ms) < self.snapshot_min_interval_ms
         {
             return Ok(());
