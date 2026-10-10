@@ -1157,8 +1157,31 @@ impl SpdkEnv {
                     self.defer_qpair(ctrlr, qpair);
                 }
             }
-            UnregisterResult::TimedOut | UnregisterResult::Disconnected => {
+            UnregisterResult::TimedOut => {
                 self.defer_qpair(ctrlr, qpair);
+            }
+            UnregisterResult::Disconnected => {
+                if let Some(retired) = self.retired_qpairs.take(qpair) {
+                    if matches!(
+                        self.finish_retired_qpair(ctrlr, qpair, retired),
+                        RetiredQpairFinish::DeferredRetired
+                    ) {
+                        self.defer_qpair(ctrlr, qpair);
+                    }
+                } else if self.retired_qpairs.poller_exited_cleanly() {
+                    // A stopped and joined poller publishes every callback-bearing
+                    // qpair at exit. No record means this qpair can be destroyed.
+                    let rc = unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) };
+                    if rc == 0 {
+                        self.qpair_pool.release_destroyed(ctrlr);
+                        return;
+                    }
+                    error!("failed to free untracked SPDK qpair {:p}: rc={}", qpair, rc);
+                    self.retired_qpairs.mark_must_free(qpair);
+                    self.defer_qpair(ctrlr, qpair);
+                } else {
+                    self.defer_qpair(ctrlr, qpair);
+                }
             }
         }
         self.resolve_deferred_qpairs();
@@ -1692,6 +1715,25 @@ mod test {
 
         assert_eq!(env.deferred_qpair_count(), 1);
         assert!(env.retired_qpairs.take(qpair).is_none());
+    }
+
+    #[test]
+    fn retire_qpair_disconnected_direct_frees_untracked_qpair_after_clean_exit() {
+        let env = test_env();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+        let qpair = std::ptr::null_mut();
+
+        env.qpair_pool.register_limit(ctrlr as usize, 1);
+        assert_eq!(
+            env.qpair_pool.try_reserve(ctrlr as usize),
+            QpairReserveResult::Reserved
+        );
+        env.retired_qpairs.mark_poller_exited_cleanly();
+
+        env.retire_qpair(ctrlr, qpair);
+
+        assert_eq!(env.deferred_qpair_count(), 0);
+        assert_eq!(env.qpair_pool.controller_stats(ctrlr as usize).0, 0);
     }
 
     #[test]

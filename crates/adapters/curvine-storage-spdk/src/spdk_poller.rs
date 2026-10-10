@@ -178,6 +178,7 @@ impl RetiredQpair {
 pub(crate) struct RetiredQpairRegistry {
     entries: Mutex<HashMap<usize, RetiredQpair>>,
     has_entries: AtomicBool,
+    poller_exited_cleanly: AtomicBool,
 }
 
 impl RetiredQpairRegistry {
@@ -185,6 +186,7 @@ impl RetiredQpairRegistry {
         Arc::new(Self {
             entries: Mutex::new(HashMap::new()),
             has_entries: AtomicBool::new(false),
+            poller_exited_cleanly: AtomicBool::new(false),
         })
     }
 
@@ -236,6 +238,14 @@ impl RetiredQpairRegistry {
 
     pub(crate) fn mark_must_free(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) {
         self.insert(qpair as usize, None, true);
+    }
+
+    pub(crate) fn poller_exited_cleanly(&self) -> bool {
+        self.poller_exited_cleanly.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_poller_exited_cleanly(&self) {
+        self.poller_exited_cleanly.store(true, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -395,10 +405,7 @@ impl SpdkPoller {
         let poll_interval = config.poll_interval_ms as i32;
         loop {
             // Check shutdown first
-            if shutdown.load(Ordering::Acquire)
-                && rx.is_empty()
-                && !Self::has_active_qpairs(&qpair_state)
-            {
+            if shutdown.load(Ordering::Acquire) && rx.is_empty() {
                 break;
             }
 
@@ -532,19 +539,24 @@ impl SpdkPoller {
             }
         }
 
-        // Thread exiting — drain remaining QpairStates into retired records for safe reclamation.
-        // Do NOT call reclaim_stale here — late SPDK callbacks may still fire
-        // (caller is responsible for calling reclaim_stale after qpair_pool::drain_all).
-        // Force-complete any remaining pending I/Os before the lock so cleanup
-        // cannot be skipped by a poisoned mutex.
+        Self::publish_shutdown_records(&mut qpair_state, &retired);
+        info!("SPDK poller thread exiting");
+    }
+
+    /// Publish every poller-owned qpair record before reporting clean exit.
+    fn publish_shutdown_records(
+        qpair_state: &mut HashMap<usize, Box<QpairState>>,
+        retired: &RetiredQpairRegistry,
+    ) {
+        // Do NOT reclaim stale here — late SPDK callbacks may still fire.
         let dead_keys: Vec<usize> = qpair_state.keys().copied().collect();
         for &key in &dead_keys {
-            Self::force_complete_qpair(key, &mut qpair_state);
+            Self::force_complete_qpair(key, qpair_state);
         }
         for (key, qs) in qpair_state.drain() {
             retired.insert(key, Some(qs), true);
         }
-        info!("SPDK poller thread exiting");
+        retired.mark_poller_exited_cleanly();
     }
 
     /// Handle unregister request, remove qpair from active set and ack.
@@ -1598,6 +1610,51 @@ mod test {
 
         assert_eq!(retired.len(), 1);
         assert!(retired.take(qpair).unwrap().requires_free());
+    }
+
+    #[test]
+    fn poller_exit_publishes_remaining_qpairs_as_must_free() {
+        let qpair_key = 0xDEADusize;
+        let retired = RetiredQpairRegistry::new();
+        let completion = IoCompletion::new();
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let mut qs = Box::new(QpairState {
+            dead: Arc::new(AtomicBool::new(false)),
+            pending: Vec::new(),
+            stale: Vec::new(),
+        });
+        let ctx = Box::into_raw(Box::new(CallbackCtx {
+            completion: completion.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight.clone(),
+            qpair_state: &mut *qs as *mut QpairState,
+            pending_idx: 0,
+        }));
+        qs.pending.push(ctx);
+        let mut qpair_state = HashMap::new();
+        qpair_state.insert(qpair_key, qs);
+
+        SpdkPoller::publish_shutdown_records(&mut qpair_state, &retired);
+
+        assert!(qpair_state.is_empty());
+        assert!(retired.poller_exited_cleanly());
+        let qpair = qpair_key as *mut spdk_ffi::spdk_nvme_qpair;
+        let entry = retired.take(qpair).expect("shutdown record must exist");
+        assert!(entry.requires_free());
+        assert_eq!(completion.wait(0), -libc::EIO);
+        assert_eq!(inflight.load(Ordering::Acquire), 0);
+        entry.reclaim();
+    }
+
+    #[test]
+    fn poller_exit_sets_clean_exit_after_publication() {
+        let retired = RetiredQpairRegistry::new();
+        let mut qpair_state = HashMap::new();
+
+        assert!(!retired.poller_exited_cleanly());
+        SpdkPoller::publish_shutdown_records(&mut qpair_state, &retired);
+
+        assert!(retired.poller_exited_cleanly());
     }
 
     #[test]
