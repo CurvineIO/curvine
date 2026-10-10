@@ -1,5 +1,5 @@
 use crate::spdk_bdev::SpdkBdev;
-use crate::spdk_env::{QpairPool, SpdkEnv, SpdkEnvState};
+use crate::spdk_env::{QpairPool, QpairReleaseOutcome, SpdkEnv, SpdkEnvState};
 use crate::spdk_ffi;
 use bytes::BytesMut;
 use curvine_io::DataSlice;
@@ -216,11 +216,11 @@ fn spdk_full_lifecycle() {
         let q3 = p.acquire(ctrlr).expect("acquire q3"); // active 2→3
 
         // Release 2 — pool accepts them (0 < max_per_ctrlr=2, then 1 < 2)
-        p.release(ctrlr, q1); // pushes q1, active 3→2
-        p.release(ctrlr, q2); // pushes q2, active 2→1
+        assert_eq!(p.release(ctrlr, q1), QpairReleaseOutcome::Cached); // pushes q1, active 3→2
+        assert_eq!(p.release(ctrlr, q2), QpairReleaseOutcome::Cached); // pushes q2, active 2→1
 
         // Release 3rd — pool full (2 >= max_per_ctrlr=2), frees via FFI
-        p.release(ctrlr, q3); // frees q3 via FFI, active 1→0
+        assert_eq!(p.release(ctrlr, q3), QpairReleaseOutcome::Destroyed); // frees q3 via FFI, active 1→0
 
         // Pool has 2 cached (q3 was freed, not pushed)
         let pool = p.inner.lock().unwrap();
@@ -271,7 +271,7 @@ fn spdk_full_lifecycle() {
         thread::sleep(Duration::from_millis(50));
 
         // Release first qpair -> unblocks the second acquire
-        p.release(ctrlr, q1);
+        assert_eq!(p.release(ctrlr, q1), QpairReleaseOutcome::Cached);
 
         let q2_ptr = handle.join().expect("second acquire thread panicked")
             as *mut spdk_ffi::spdk_nvme_qpair;
@@ -281,7 +281,7 @@ fn spdk_full_lifecycle() {
         assert_eq!(active, 1);
 
         // Release second qpair -> active=0
-        p.release(ctrlr, q2_ptr);
+        assert_eq!(p.release(ctrlr, q2_ptr), QpairReleaseOutcome::Cached);
         let (active, _) = p.controller_stats(ctrlr as usize);
         assert_eq!(active, 0);
 
