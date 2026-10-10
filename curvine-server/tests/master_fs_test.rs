@@ -308,7 +308,6 @@ fn control_plane_requests_use_the_async_handler() {
         RpcCode::GetJobStatus,
         RpcCode::CancelJob,
         RpcCode::ReportTask,
-        RpcCode::GetFilesystemInfo,
         RpcCode::GetCvMetadataSnapshotPage,
         RpcCode::GetCvMetadataDeltaPage,
     ] {
@@ -325,6 +324,7 @@ fn control_plane_requests_use_the_async_handler() {
         RpcCode::ListOptions,
         RpcCode::WorkerHeartbeat,
         RpcCode::WorkerBlockReport,
+        RpcCode::GetFilesystemInfo,
     ] {
         let msg = Builder::new_rpc(code).build();
         assert!(handler.is_sync(&msg), "{code:?} must use the sync handler");
