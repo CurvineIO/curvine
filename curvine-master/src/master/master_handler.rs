@@ -504,7 +504,7 @@ impl MasterHandler {
         rx.await?
     }
 
-    async fn async_get_filesystem_info(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    pub fn get_filesystem_info(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: GetFilesystemInfoRequest = ctx.parse_header()?;
         // GetFilesystemInfo backs statfs and is called frequently. Only
         // evaluate the compatibility policy when the result can actually be
@@ -525,11 +525,7 @@ impl MasterHandler {
                 self.metrics,
             )?;
         }
-        let fs = self.fs.clone();
-        let info = Self::run_master_rpc_task(self.control_rpc_executor.clone(), move || {
-            Self::process_get_filesystem_info(fs)
-        })
-        .await?;
+        let info = Self::process_get_filesystem_info(self.fs.clone())?;
         let rep_header = Self::build_filesystem_info_response(info, &self.master_compatibility);
         ctx.response(rep_header)
     }
@@ -1015,7 +1011,6 @@ impl MessageHandler for MasterHandler {
                 | RpcCode::GetJobStatus
                 | RpcCode::CancelJob
                 | RpcCode::ReportTask
-                | RpcCode::GetFilesystemInfo
                 | RpcCode::GetCvMetadataSnapshotPage
         )
     }
@@ -1060,6 +1055,7 @@ impl MessageHandler for MasterHandler {
                 RpcCode::ListOptions => self.list_options(ctx),
                 RpcCode::GetBlockLocations => self.get_block_locations(ctx),
                 RpcCode::GetFileBlockDetails => self.get_file_block_details(ctx),
+                RpcCode::GetFilesystemInfo => self.get_filesystem_info(ctx),
                 RpcCode::SetAttr => self.set_attr_retry_check(ctx),
                 RpcCode::Symlink => self.symlink_retry_check(ctx),
                 RpcCode::Link => self.link_retry_check(ctx),
@@ -1126,7 +1122,6 @@ impl MessageHandler for MasterHandler {
                 RpcCode::GetJobStatus => self.job_handler.get_load_status(ctx),
                 RpcCode::CancelJob => self.job_handler.cancel_job(ctx).await,
                 RpcCode::ReportTask => self.job_handler.task_report(ctx),
-                RpcCode::GetFilesystemInfo => self.async_get_filesystem_info(ctx).await,
                 RpcCode::GetCvMetadataSnapshotPage => {
                     self.async_get_cv_metadata_snapshot_page(ctx).await
                 }
@@ -1143,12 +1138,13 @@ impl MessageHandler for MasterHandler {
         }
     }
 
+    // Only WorkerHeartbeat and WorkerBlockReport are routed to actor_rt;
+    // GetFilesystemInfo (statfs) deliberately runs on the main RPC blocking pool
+    // so that FUSE/kubelet statfs bursts cannot delay heartbeats and cause workers
+    // to be marked lost.
     fn get_rt(&self, msg: &Message) -> Option<&Runtime> {
         let code = RpcCode::from(msg.code());
-        if matches!(
-            code,
-            RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport | RpcCode::GetFilesystemInfo
-        ) {
+        if matches!(code, RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport) {
             Some(&self.actor_rt)
         } else {
             None
