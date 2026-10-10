@@ -977,6 +977,41 @@ fn ttl_executor_deletes_nested_expired_inode() -> CommonResult<()> {
     Ok(())
 }
 
+// A missing inode must surface as a typed FileNotFound error; the TTL
+// checker relies on this classification to skip benign warnings.
+#[test]
+fn ttl_executor_missing_inode_returns_file_not_found() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "ttl-executor-missing-inode");
+
+    let opts = CreateFileOptsBuilder::new()
+        .create_parent(true)
+        .ttl_ms(1)
+        .ttl_action(TtlAction::Delete)
+        .build();
+    let status = fs.create_with_opts(
+        "/ttl/removed.log",
+        opts,
+        OpenFlags::new_create().set_overwrite(true),
+    )?;
+    fs.complete_file("/ttl/removed.log", None, 0, vec![], "", false, None)?;
+
+    // Remove the inode before the TTL pass runs.
+    fs.delete("/ttl/removed.log", false)?;
+
+    let executor = InodeTtlExecutor::with_managers(fs.clone());
+    let err = executor
+        .execute_by_id(status.id)
+        .expect_err("execute_by_id must fail once the inode is removed");
+    assert!(
+        matches!(err, FsError::FileNotFound(_)),
+        "missing inodes must be classified as FileNotFound, got: {:?}",
+        err
+    );
+
+    Ok(())
+}
+
 // TTL delete must not refresh the parent directory mtime, otherwise a
 // directory with its own TTL is renewed after its child file is cleaned.
 #[test]
