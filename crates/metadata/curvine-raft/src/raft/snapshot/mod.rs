@@ -29,3 +29,6 @@ pub use download_job::DownloadJob;
 
 mod snapshot_client;
 pub use self::snapshot_client::SnapshotClient;
+
+mod snapshot_fetcher;
+pub use self::snapshot_fetcher::SnapshotFetcher;

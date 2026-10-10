@@ -24,4 +24,5 @@ pub enum RaftCode {
     Unreachable = 4,
     Raft = 5,
     SnapshotDownload = 6,
+    ReportSnapshot = 7,
 }
