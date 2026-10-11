@@ -45,6 +45,26 @@ pub(crate) enum QpairReserveResult {
     Unregistered,
 }
 
+#[cfg(test)]
+pub(crate) type FreeIoQpairFn =
+    std::sync::Arc<dyn Fn(*mut spdk_ffi::spdk_nvme_qpair) -> i32 + Send + Sync>;
+
+#[cfg(test)]
+pub(crate) struct QpairPoolTestHooks {
+    pub(crate) free_io_qpair: FreeIoQpairFn,
+}
+
+#[cfg(test)]
+impl Default for QpairPoolTestHooks {
+    fn default() -> Self {
+        Self {
+            free_io_qpair: std::sync::Arc::new(|qpair| unsafe {
+                spdk_ffi::curvine_spdk_free_io_qpair(qpair)
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QpairReleaseOutcome {
     Cached,
@@ -55,7 +75,6 @@ pub(crate) enum QpairReleaseOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetiredQpairFinish {
     Complete,
-    DeferredRetired,
     PendingDestroy,
 }
 
@@ -87,6 +106,8 @@ pub struct QpairPool {
     pub(crate) shutdown: AtomicBool,
     /// How long `acquire` blocks waiting for a free slot before timing out.
     pub(crate) qpair_acquire_timeout: Duration,
+    #[cfg(test)]
+    pub(crate) test_hooks: QpairPoolTestHooks,
 }
 // SAFETY: exclusive ownership
 unsafe impl Send for QpairPool {}
@@ -118,6 +139,20 @@ impl QpairPool {
             notify: Condvar::new(),
             shutdown: AtomicBool::new(false),
             qpair_acquire_timeout,
+            #[cfg(test)]
+            test_hooks: QpairPoolTestHooks::default(),
+        }
+    }
+
+    fn free_io_qpair(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> i32 {
+        #[cfg(test)]
+        {
+            return (self.test_hooks.free_io_qpair)(qpair);
+        }
+
+        #[cfg(not(test))]
+        unsafe {
+            spdk_ffi::curvine_spdk_free_io_qpair(qpair)
         }
     }
 
@@ -387,7 +422,7 @@ impl QpairPool {
             if stack.len() >= self.max_per_ctrlr {
                 // Pool full — free immediately to bound controller-side memory.
                 drop(pool); // release lock before FFI call
-                let rc = unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) };
+                let rc = self.free_io_qpair(qpair);
                 if rc != 0 {
                     error!("QpairPool: failed to free qpair {:p}: rc={}", qpair, rc);
                     self.pending_destroy
@@ -430,6 +465,21 @@ impl QpairPool {
         self.notify.notify_one();
     }
 
+    /// Transfer retry ownership for a qpair that still has an active reservation
+    /// but could not be destroyed by another cleanup owner.
+    pub(crate) fn retain_pending_destroy(
+        &self,
+        ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+    ) {
+        self.pending_destroy
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(ctrlr as usize)
+            .or_default()
+            .push(qpair);
+    }
+
     /// Free all pooled qpairs. Only frees cached (idle) qpairs - active/in-flight
     /// qpairs are tracked by their owners and will be released normally. Repeated
     /// calls still drain late releases, but only the first shutdown transition is counted.
@@ -442,7 +492,7 @@ impl QpairPool {
         let mut failed: HashMap<usize, Vec<*mut spdk_ffi::spdk_nvme_qpair>> = HashMap::new();
         for (ctrlr_key, qpairs) in pool.drain() {
             for qpair in qpairs {
-                let rc = unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) };
+                let rc = self.free_io_qpair(qpair);
                 if rc != 0 {
                     error!(
                         "QpairPool: failed to free cached qpair {:p} during shutdown: rc={}",
@@ -466,7 +516,7 @@ impl QpairPool {
             HashMap::new();
         for (ctrlr_key, qpairs) in pending.drain() {
             for qpair in qpairs {
-                let rc = unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) };
+                let rc = self.free_io_qpair(qpair);
                 if rc != 0 {
                     error!(
                         "QpairPool: failed to free pending qpair {:p} during shutdown: rc={}",
@@ -486,25 +536,21 @@ impl QpairPool {
         }
         self.total_cached.store(failed_count, Ordering::Release);
         spdk_metrics::set_qpair_cached(failed_count);
-        // Warn if there are still active (in-flight) qpairs - these are not freed here,
-        // they are tracked by their SpdkBdev owners and will be released via drop().
-        for state in self
+        let active_count = self
             .ctrl_state
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .values()
-        {
-            let active = state.active.load(Ordering::Acquire);
-            if active > 0 {
-                warn!(
-                    "QpairPool: drain_all called with {} active (in-flight) qpair(s) remaining",
-                    active
-                );
-                break;
-            }
+            .map(|state| state.active.load(Ordering::Acquire))
+            .sum::<usize>();
+        if active_count > 0 {
+            warn!(
+                "QpairPool: drain_all called with {} active (in-flight) qpair(s) remaining",
+                active_count
+            );
         }
         self.notify.notify_all();
-        failed_count == 0 && failed_pending_count == 0
+        failed_count == 0 && failed_pending_count == 0 && active_count == 0
     }
 
     pub(crate) fn publish_metrics(&self) {
@@ -578,6 +624,13 @@ impl Display for BdevInfo {
 
 // SpdkEnv - the core struct
 
+#[cfg(test)]
+#[derive(Default)]
+struct SpdkEnvTestHooks {
+    detach_controllers: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    env_fini: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
 /// SPDK env lifecycle (singleton). Send + Sync
 pub struct SpdkEnv {
     conf: SpdkConf,
@@ -590,6 +643,8 @@ pub struct SpdkEnv {
     shutdown_lock: Mutex<()>,
     shutdown_complete: AtomicBool,
     deferred_qpairs: Mutex<HashMap<usize, usize>>,
+    #[cfg(test)]
+    test_hooks: SpdkEnvTestHooks,
 }
 
 // SAFETY: Fields are either immutable after init (conf, bdevs) or atomic (state).
@@ -619,6 +674,8 @@ impl SpdkEnv {
             shutdown_lock: Mutex::new(()),
             shutdown_complete: AtomicBool::new(false),
             deferred_qpairs: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            test_hooks: SpdkEnvTestHooks::default(),
         })
     }
 
@@ -1054,17 +1111,15 @@ impl SpdkEnv {
                     retired.reclaim();
                     return RetiredQpairFinish::PendingDestroy;
                 }
-                RetiredQpairFinish::DeferredRetired => unreachable!(
-                    "clean retired release outcomes cannot ask retired registry to retry"
-                ),
             }
         }
 
-        let rc = unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) };
+        let rc = self.qpair_pool.free_io_qpair(qpair);
         if rc != 0 {
             error!("failed to free retired SPDK qpair {:p}: rc={}", qpair, rc);
-            self.retired_qpairs.put_back(qpair, retired);
-            return RetiredQpairFinish::DeferredRetired;
+            retired.reclaim();
+            self.qpair_pool.retain_pending_destroy(ctrlr, qpair);
+            return RetiredQpairFinish::PendingDestroy;
         }
 
         retired.reclaim();
@@ -1106,12 +1161,7 @@ impl SpdkEnv {
                 continue;
             };
             let ctrlr = ctrlr_key as *mut spdk_ffi::spdk_nvme_ctrlr;
-            if matches!(
-                self.finish_retired_qpair(ctrlr, qpair, retired),
-                RetiredQpairFinish::DeferredRetired
-            ) {
-                self.defer_qpair(ctrlr, qpair);
-            }
+            self.finish_retired_qpair(ctrlr, qpair, retired);
         }
     }
 
@@ -1130,24 +1180,14 @@ impl SpdkEnv {
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
     ) {
         if let Some(retired) = self.retired_qpairs.take(qpair) {
-            if matches!(
-                self.finish_retired_qpair(ctrlr, qpair, retired),
-                RetiredQpairFinish::DeferredRetired
-            ) {
-                self.defer_qpair(ctrlr, qpair);
-            }
+            self.finish_retired_qpair(ctrlr, qpair, retired);
             return;
         }
 
         match self.unregister_qpair_from_poller(qpair) {
             UnregisterResult::Acked => {
                 if let Some(retired) = self.retired_qpairs.take(qpair) {
-                    if matches!(
-                        self.finish_retired_qpair(ctrlr, qpair, retired),
-                        RetiredQpairFinish::DeferredRetired
-                    ) {
-                        self.defer_qpair(ctrlr, qpair);
-                    }
+                    self.finish_retired_qpair(ctrlr, qpair, retired);
                 } else {
                     error!(
                         "unregister acked but no retired marker for qpair {:p}",
@@ -1365,6 +1405,12 @@ impl SpdkEnv {
     }
 
     fn detach_controllers(&self) {
+        #[cfg(test)]
+        if let Some(hook) = &self.test_hooks.detach_controllers {
+            hook();
+            return;
+        }
+
         let mut detached: HashSet<usize> = HashSet::new();
         for bdev in &self.bdevs {
             if bdev.ctrlr == 0 || !detached.insert(bdev.ctrlr) {
@@ -1387,6 +1433,12 @@ impl SpdkEnv {
     }
 
     fn env_fini(&self) {
+        #[cfg(test)]
+        if let Some(hook) = &self.test_hooks.env_fini {
+            hook();
+            return;
+        }
+
         info!("Finalizing SPDK environment");
         unsafe { spdk_ffi::spdk_env_fini() };
     }
@@ -1822,6 +1874,19 @@ mod test {
     }
 
     #[test]
+    fn drain_all_fails_when_active_reservations_remain() {
+        let p = QpairPool::new();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+        p.register_limit(ctrlr as usize, 1);
+
+        assert_eq!(p.try_reserve(ctrlr as usize), QpairReserveResult::Reserved);
+
+        assert!(!p.drain_all());
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 1);
+    }
+
+    #[test]
     fn acquire_times_out_after_configured_timeout() {
         let p = QpairPool::with_qpair_acquire_timeout(Duration::from_millis(200));
         let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
@@ -1893,6 +1958,174 @@ mod test {
 
         env.shutdown_complete.store(true, Ordering::Release);
         assert!(!env.begin_shutdown_attempt());
+    }
+
+    #[test]
+    fn shutdown_retries_failed_qpair_free_before_teardown() {
+        let ctrlr = 0x1000usize;
+        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+        let free_calls = Arc::new(AtomicUsize::new(0));
+        let detach_calls = Arc::new(AtomicUsize::new(0));
+        let fini_calls = Arc::new(AtomicUsize::new(0));
+
+        let free_calls_for_hook = Arc::clone(&free_calls);
+        let detach_calls_for_hook = Arc::clone(&detach_calls);
+        let fini_calls_for_hook = Arc::clone(&fini_calls);
+
+        let mut env = SpdkEnv::new(SpdkConf::default()).unwrap();
+        env.bdevs.push(BdevInfo {
+            name: "test-bdev".to_string(),
+            size_bytes: 4096,
+            block_size: 512,
+            num_blocks: 8,
+            target_endpoint: "test-target".to_string(),
+            ctrlr,
+            ns: 0,
+            io_timeout_ms: 0,
+        });
+        env.qpair_pool.register_limit(ctrlr, 1);
+        assert_eq!(
+            env.qpair_pool.try_reserve(ctrlr),
+            QpairReserveResult::Reserved
+        );
+        env.qpair_pool
+            .pending_destroy
+            .lock()
+            .unwrap()
+            .entry(ctrlr)
+            .or_default()
+            .push(qpair);
+        env.qpair_pool.test_hooks.free_io_qpair = Arc::new(move |_| {
+            if free_calls_for_hook.fetch_add(1, Ordering::AcqRel) == 0 {
+                -libc::EIO
+            } else {
+                0
+            }
+        });
+        env.test_hooks.detach_controllers = Some(Arc::new(move || {
+            detach_calls_for_hook.fetch_add(1, Ordering::AcqRel);
+        }));
+        env.test_hooks.env_fini = Some(Arc::new(move || {
+            fini_calls_for_hook.fetch_add(1, Ordering::AcqRel);
+        }));
+        env.state
+            .store(SpdkEnvState::Initialized as u8, Ordering::Release);
+
+        env.shutdown();
+
+        assert_eq!(free_calls.load(Ordering::Acquire), 1);
+        assert_eq!(detach_calls.load(Ordering::Acquire), 0);
+        assert_eq!(fini_calls.load(Ordering::Acquire), 0);
+        assert!(!env.shutdown_complete.load(Ordering::Acquire));
+        assert_eq!(
+            env.qpair_pool
+                .pending_destroy
+                .lock()
+                .unwrap()
+                .get(&ctrlr)
+                .map_or(0, Vec::len),
+            1
+        );
+        let (active, _) = env.qpair_pool.controller_stats(ctrlr);
+        assert_eq!(active, 1);
+
+        env.shutdown();
+
+        assert_eq!(free_calls.load(Ordering::Acquire), 2);
+        assert_eq!(detach_calls.load(Ordering::Acquire), 1);
+        assert_eq!(fini_calls.load(Ordering::Acquire), 1);
+        assert!(env.shutdown_complete.load(Ordering::Acquire));
+        assert_eq!(
+            env.qpair_pool
+                .pending_destroy
+                .lock()
+                .unwrap()
+                .get(&ctrlr)
+                .map_or(0, Vec::len),
+            0
+        );
+        let (active, _) = env.qpair_pool.controller_stats(ctrlr);
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn retired_free_failure_transfers_to_pending_destroy_for_shutdown_retry() {
+        let ctrlr = 0x1000usize;
+        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+        let free_calls = Arc::new(AtomicUsize::new(0));
+        let detach_calls = Arc::new(AtomicUsize::new(0));
+        let fini_calls = Arc::new(AtomicUsize::new(0));
+
+        let free_calls_for_hook = Arc::clone(&free_calls);
+        let detach_calls_for_hook = Arc::clone(&detach_calls);
+        let fini_calls_for_hook = Arc::clone(&fini_calls);
+
+        let mut env = SpdkEnv::new(SpdkConf::default()).unwrap();
+        env.bdevs.push(BdevInfo {
+            name: "test-bdev".to_string(),
+            size_bytes: 4096,
+            block_size: 512,
+            num_blocks: 8,
+            target_endpoint: "test-target".to_string(),
+            ctrlr,
+            ns: 0,
+            io_timeout_ms: 0,
+        });
+        env.qpair_pool.register_limit(ctrlr, 1);
+        assert_eq!(
+            env.qpair_pool.try_reserve(ctrlr),
+            QpairReserveResult::Reserved
+        );
+        env.retired_qpairs.mark_must_free(qpair);
+        env.qpair_pool.test_hooks.free_io_qpair = Arc::new(move |_| {
+            if free_calls_for_hook.fetch_add(1, Ordering::AcqRel) == 0 {
+                -libc::EIO
+            } else {
+                0
+            }
+        });
+        env.test_hooks.detach_controllers = Some(Arc::new(move || {
+            detach_calls_for_hook.fetch_add(1, Ordering::AcqRel);
+        }));
+        env.test_hooks.env_fini = Some(Arc::new(move || {
+            fini_calls_for_hook.fetch_add(1, Ordering::AcqRel);
+        }));
+        env.state
+            .store(SpdkEnvState::Initialized as u8, Ordering::Release);
+
+        env.retire_qpair(ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr, qpair);
+
+        assert_eq!(free_calls.load(Ordering::Acquire), 1);
+        assert!(!env.retired_qpairs.has_entries());
+        assert_eq!(
+            env.qpair_pool
+                .pending_destroy
+                .lock()
+                .unwrap()
+                .get(&ctrlr)
+                .map_or(0, Vec::len),
+            1
+        );
+        let (active, _) = env.qpair_pool.controller_stats(ctrlr);
+        assert_eq!(active, 1);
+
+        env.shutdown();
+
+        assert_eq!(free_calls.load(Ordering::Acquire), 2);
+        assert_eq!(detach_calls.load(Ordering::Acquire), 1);
+        assert_eq!(fini_calls.load(Ordering::Acquire), 1);
+        assert!(env.shutdown_complete.load(Ordering::Acquire));
+        assert_eq!(
+            env.qpair_pool
+                .pending_destroy
+                .lock()
+                .unwrap()
+                .get(&ctrlr)
+                .map_or(0, Vec::len),
+            0
+        );
+        let (active, _) = env.qpair_pool.controller_stats(ctrlr);
+        assert_eq!(active, 0);
     }
 
     #[test]

@@ -226,6 +226,7 @@ impl RetiredQpairRegistry {
         retired
     }
 
+    #[cfg(test)]
     pub(crate) fn put_back(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair, retired: RetiredQpair) {
         self.entries
             .lock()
