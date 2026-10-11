@@ -629,6 +629,7 @@ impl Display for BdevInfo {
 struct SpdkEnvTestHooks {
     detach_controllers: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     env_fini: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    poller_stop: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 /// SPDK env lifecycle (singleton). Send + Sync
@@ -890,12 +891,6 @@ impl SpdkEnv {
                     count,
                     Self::SHUTDOWN_DRAIN_TIMEOUT.as_secs()
                 );
-                // Stop the poller thread (safe — pending I/Os will get channel-closed errors)
-                // but do NOT detach controllers or call env_fini.
-                if let Some(mut poller) = self.poller.lock().unwrap().take() {
-                    poller.stop();
-                    info!("SPDK poller thread stopped (timeout path)");
-                }
                 self.resolve_deferred_qpairs();
                 return;
             }
@@ -909,12 +904,9 @@ impl SpdkEnv {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        // Stop poller before draining qpairs (no in-flight I/Os).
-        if let Some(mut poller) = self.poller.lock().unwrap().take() {
-            poller.stop();
-            info!("SPDK poller thread stopped");
-        }
-
+        // Resolve deferred qpairs before stopping the poller. If a retired marker
+        // is still missing, the poller must stay alive so a late unregister can
+        // still publish it. PR4 adds clean-stop publication for disconnected cleanup.
         self.resolve_deferred_qpairs();
         let deferred = self.deferred_qpair_count();
         if deferred != 0 {
@@ -924,6 +916,9 @@ impl SpdkEnv {
             );
             return;
         }
+
+        // Stop poller only after no deferred qpair still depends on future markers.
+        self.stop_poller("normal");
 
         if self.retired_qpairs.has_entries() {
             error!(
@@ -941,6 +936,19 @@ impl SpdkEnv {
         self.shutdown_complete.store(true, Ordering::Release);
 
         info!("SPDK environment shut down successfully");
+    }
+
+    fn stop_poller(&self, reason: &str) {
+        #[cfg(test)]
+        if let Some(hook) = &self.test_hooks.poller_stop {
+            hook(reason);
+            return;
+        }
+
+        if let Some(mut poller) = self.poller.lock().unwrap().take() {
+            poller.stop();
+            info!("SPDK poller thread stopped ({})", reason);
+        }
     }
 
     fn begin_shutdown_attempt(&self) -> bool {
@@ -1744,6 +1752,44 @@ mod test {
 
         assert_eq!(env.deferred_qpair_count(), 1);
         assert!(env.retired_qpairs.take(qpair).is_none());
+    }
+
+    #[test]
+    fn shutdown_keeps_poller_alive_when_deferred_marker_missing() {
+        let mut env = test_env();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+        let poller_stop_calls = Arc::new(AtomicUsize::new(0));
+        let detach_calls = Arc::new(AtomicUsize::new(0));
+        let fini_calls = Arc::new(AtomicUsize::new(0));
+
+        let poller_stop_calls_for_hook = Arc::clone(&poller_stop_calls);
+        let detach_calls_for_hook = Arc::clone(&detach_calls);
+        let fini_calls_for_hook = Arc::clone(&fini_calls);
+
+        env.test_hooks.poller_stop = Some(Arc::new(move |_| {
+            poller_stop_calls_for_hook.fetch_add(1, Ordering::AcqRel);
+        }));
+        env.test_hooks.detach_controllers = Some(Arc::new(move || {
+            detach_calls_for_hook.fetch_add(1, Ordering::AcqRel);
+        }));
+        env.test_hooks.env_fini = Some(Arc::new(move || {
+            fini_calls_for_hook.fetch_add(1, Ordering::AcqRel);
+        }));
+        env.state
+            .store(SpdkEnvState::Initialized as u8, Ordering::Release);
+        env.deferred_qpairs
+            .lock()
+            .unwrap()
+            .insert(qpair as usize, ctrlr as usize);
+
+        env.shutdown();
+
+        assert_eq!(env.deferred_qpair_count(), 1);
+        assert_eq!(poller_stop_calls.load(Ordering::Acquire), 0);
+        assert_eq!(detach_calls.load(Ordering::Acquire), 0);
+        assert_eq!(fini_calls.load(Ordering::Acquire), 0);
+        assert!(!env.shutdown_complete.load(Ordering::Acquire));
     }
 
     #[test]
