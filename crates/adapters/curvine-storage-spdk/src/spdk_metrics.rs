@@ -19,6 +19,7 @@ pub(crate) struct SpdkMetrics {
     qpair_cached: Gauge,
     qpair_release_cached: Counter,
     qpair_release_freed_pool_full: Counter,
+    qpair_release_freed_retired: Counter,
     qpair_shutdown_total: Counter,
 }
 
@@ -70,6 +71,7 @@ impl SpdkMetrics {
             qpair_release_cached: qpair_release_total.with_label_values(&["cached"]),
             qpair_release_freed_pool_full: qpair_release_total
                 .with_label_values(&["freed_pool_full"]),
+            qpair_release_freed_retired: qpair_release_total.with_label_values(&["freed_retired"]),
             qpair_shutdown_total: m::new_counter(
                 "spdk_qpair_shutdown_total",
                 "Total SPDK qpair pool shutdown drains",
@@ -129,6 +131,7 @@ pub(crate) fn record_qpair_release(result: &'static str) {
     with_metrics(|m| match result {
         "cached" => m.qpair_release_cached.inc(),
         "freed_pool_full" => m.qpair_release_freed_pool_full.inc(),
+        "freed_retired" => m.qpair_release_freed_retired.inc(),
         _ => warn!("unknown spdk qpair release result label: {}", result),
     });
 }
