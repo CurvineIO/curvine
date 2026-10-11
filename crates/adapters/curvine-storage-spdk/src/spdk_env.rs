@@ -1147,6 +1147,23 @@ impl SpdkEnv {
             .or_insert(ctrlr as usize);
     }
 
+    fn finish_untracked_after_clean_poller_exit(
+        &self,
+        ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+    ) {
+        // A stopped and joined poller publishes every callback-bearing qpair at
+        // exit. No retired record after that means this qpair can be destroyed.
+        let rc = self.qpair_pool.free_io_qpair(qpair);
+        if rc == 0 {
+            self.qpair_pool.release_destroyed(ctrlr);
+            return;
+        }
+
+        error!("failed to free untracked SPDK qpair {:p}: rc={}", qpair, rc);
+        self.qpair_pool.retain_pending_destroy(ctrlr, qpair);
+    }
+
     /// Resolve qpairs whose unregister acknowledgement timed out. A qpair stays
     /// deferred until the poller publishes its durable retirement record.
     pub fn resolve_deferred_qpairs(&self) {
@@ -1161,6 +1178,13 @@ impl SpdkEnv {
         for (qpair_key, ctrlr_key) in deferred {
             let qpair = qpair_key as *mut spdk_ffi::spdk_nvme_qpair;
             let Some(retired) = self.retired_qpairs.take(qpair) else {
+                if self.retired_qpairs.poller_exited_cleanly() {
+                    self.finish_untracked_after_clean_poller_exit(
+                        ctrlr_key as *mut spdk_ffi::spdk_nvme_ctrlr,
+                        qpair,
+                    );
+                    continue;
+                }
                 self.deferred_qpairs
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1212,16 +1236,7 @@ impl SpdkEnv {
                 if let Some(retired) = self.retired_qpairs.take(qpair) {
                     self.finish_retired_qpair(ctrlr, qpair, retired);
                 } else if self.retired_qpairs.poller_exited_cleanly() {
-                    // A stopped and joined poller publishes every callback-bearing
-                    // qpair at exit. No record means this qpair can be destroyed.
-                    let rc = unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) };
-                    if rc == 0 {
-                        self.qpair_pool.release_destroyed(ctrlr);
-                        return;
-                    }
-                    error!("failed to free untracked SPDK qpair {:p}: rc={}", qpair, rc);
-                    self.retired_qpairs.mark_must_free(qpair);
-                    self.defer_qpair(ctrlr, qpair);
+                    self.finish_untracked_after_clean_poller_exit(ctrlr, qpair);
                 } else {
                     self.defer_qpair(ctrlr, qpair);
                 }
@@ -1750,6 +1765,69 @@ mod test {
         assert_eq!(env.deferred_qpair_count(), 0);
         assert_eq!(cnt(&env.qpair_pool, ctrlr as usize), 1);
         assert_eq!(env.qpair_pool.controller_stats(ctrlr as usize).0, 0);
+    }
+
+    #[test]
+    fn resolve_deferred_qpairs_frees_missing_marker_after_clean_exit() {
+        let env = test_env();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+        let qpair = std::ptr::null_mut::<spdk_ffi::spdk_nvme_qpair>();
+
+        env.qpair_pool.register_limit(ctrlr as usize, 1);
+        assert_eq!(
+            env.qpair_pool.try_reserve(ctrlr as usize),
+            QpairReserveResult::Reserved
+        );
+        env.deferred_qpairs
+            .lock()
+            .unwrap()
+            .insert(qpair as usize, ctrlr as usize);
+        env.retired_qpairs.mark_poller_exited_cleanly();
+
+        env.resolve_deferred_qpairs();
+
+        assert_eq!(env.deferred_qpair_count(), 0);
+        assert!(!env.retired_qpairs.has_entries());
+        assert_eq!(env.qpair_pool.controller_stats(ctrlr as usize).0, 0);
+    }
+
+    #[test]
+    fn resolve_deferred_qpairs_moves_failed_clean_exit_destroy_to_pending_destroy() {
+        let mut env = test_env();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+        let free_calls = Arc::new(AtomicUsize::new(0));
+        let free_calls_for_hook = Arc::clone(&free_calls);
+
+        env.qpair_pool.register_limit(ctrlr as usize, 1);
+        assert_eq!(
+            env.qpair_pool.try_reserve(ctrlr as usize),
+            QpairReserveResult::Reserved
+        );
+        env.qpair_pool.test_hooks.free_io_qpair = Arc::new(move |_| {
+            free_calls_for_hook.fetch_add(1, Ordering::AcqRel);
+            -libc::EIO
+        });
+        env.deferred_qpairs
+            .lock()
+            .unwrap()
+            .insert(qpair as usize, ctrlr as usize);
+        env.retired_qpairs.mark_poller_exited_cleanly();
+
+        env.resolve_deferred_qpairs();
+
+        assert_eq!(free_calls.load(Ordering::Acquire), 1);
+        assert_eq!(env.deferred_qpair_count(), 0);
+        assert_eq!(
+            env.qpair_pool
+                .pending_destroy
+                .lock()
+                .unwrap()
+                .get(&(ctrlr as usize))
+                .map_or(0, Vec::len),
+            1
+        );
+        assert_eq!(env.qpair_pool.controller_stats(ctrlr as usize).0, 1);
     }
 
     #[test]
