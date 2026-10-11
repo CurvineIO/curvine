@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -54,6 +54,21 @@ pub(crate) enum UnregisterResult {
     Acked,
     TimedOut,
     Disconnected,
+}
+
+fn unregister_ack_error_to_result(err: RecvTimeoutError) -> UnregisterResult {
+    match err {
+        RecvTimeoutError::Timeout => {
+            error!("Unregister timeout: poller may be stuck, qpair not removed");
+            UnregisterResult::TimedOut
+        }
+        RecvTimeoutError::Disconnected => {
+            error!(
+                "Unregister disconnected: poller dropped ack sender before acknowledging qpair removal"
+            );
+            UnregisterResult::Disconnected
+        }
+    }
 }
 
 // SAFETY: exclusive ownership - blocks until completion.
@@ -228,6 +243,7 @@ impl RetiredQpairRegistry {
         retired
     }
 
+    #[cfg(test)]
     pub(crate) fn put_back(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair, retired: RetiredQpair) {
         self.entries
             .lock()
@@ -353,10 +369,7 @@ impl SpdkPoller {
             let _ = self.eventfd.write(1);
             match ack_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(()) => UnregisterResult::Acked,
-                Err(_) => {
-                    error!("Unregister timeout: poller may be stuck, qpair not removed");
-                    UnregisterResult::TimedOut
-                }
+                Err(err) => unregister_ack_error_to_result(err),
             }
         } else {
             UnregisterResult::Disconnected
@@ -869,6 +882,18 @@ mod test {
 
     const DEAD: usize = 0xDEAD;
     const LIVE: usize = 0xCAFE;
+
+    #[test]
+    fn unregister_ack_disconnect_maps_to_disconnected() {
+        assert_eq!(
+            unregister_ack_error_to_result(RecvTimeoutError::Disconnected),
+            UnregisterResult::Disconnected
+        );
+        assert_eq!(
+            unregister_ack_error_to_result(RecvTimeoutError::Timeout),
+            UnregisterResult::TimedOut
+        );
+    }
 
     #[test]
     fn force_complete_reclaims_callback_ctx() {
