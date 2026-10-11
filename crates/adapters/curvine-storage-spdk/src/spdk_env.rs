@@ -904,9 +904,11 @@ impl SpdkEnv {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        // Resolve deferred qpairs before stopping the poller. If a retired marker
-        // is still missing, the poller must stay alive so a late unregister can
-        // still publish it. PR4 adds clean-stop publication for disconnected cleanup.
+        // Stop/join the poller first so shutdown records and the clean-exit proof
+        // are published before deferred cleanup decides whether a missing marker
+        // means "untracked and safe to destroy".
+        self.stop_poller("normal");
+
         self.resolve_deferred_qpairs();
         let deferred = self.deferred_qpair_count();
         if deferred != 0 {
@@ -916,9 +918,6 @@ impl SpdkEnv {
             );
             return;
         }
-
-        // Stop poller only after no deferred qpair still depends on future markers.
-        self.stop_poller("normal");
 
         if self.retired_qpairs.has_entries() {
             error!(
@@ -1870,10 +1869,10 @@ mod test {
     }
 
     #[test]
-    fn shutdown_keeps_poller_alive_when_deferred_marker_missing() {
+    fn shutdown_resolves_deferred_missing_marker_after_clean_poller_exit() {
         let mut env = test_env();
         let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
-        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+        let qpair = std::ptr::null_mut::<spdk_ffi::spdk_nvme_qpair>();
         let poller_stop_calls = Arc::new(AtomicUsize::new(0));
         let detach_calls = Arc::new(AtomicUsize::new(0));
         let fini_calls = Arc::new(AtomicUsize::new(0));
@@ -1881,9 +1880,11 @@ mod test {
         let poller_stop_calls_for_hook = Arc::clone(&poller_stop_calls);
         let detach_calls_for_hook = Arc::clone(&detach_calls);
         let fini_calls_for_hook = Arc::clone(&fini_calls);
+        let retired_qpairs = Arc::clone(&env.retired_qpairs);
 
         env.test_hooks.poller_stop = Some(Arc::new(move |_| {
             poller_stop_calls_for_hook.fetch_add(1, Ordering::AcqRel);
+            retired_qpairs.mark_poller_exited_cleanly();
         }));
         env.test_hooks.detach_controllers = Some(Arc::new(move || {
             detach_calls_for_hook.fetch_add(1, Ordering::AcqRel);
@@ -1893,6 +1894,11 @@ mod test {
         }));
         env.state
             .store(SpdkEnvState::Initialized as u8, Ordering::Release);
+        env.qpair_pool.register_limit(ctrlr as usize, 1);
+        assert_eq!(
+            env.qpair_pool.try_reserve(ctrlr as usize),
+            QpairReserveResult::Reserved
+        );
         env.deferred_qpairs
             .lock()
             .unwrap()
@@ -1900,11 +1906,12 @@ mod test {
 
         env.shutdown();
 
-        assert_eq!(env.deferred_qpair_count(), 1);
-        assert_eq!(poller_stop_calls.load(Ordering::Acquire), 0);
-        assert_eq!(detach_calls.load(Ordering::Acquire), 0);
-        assert_eq!(fini_calls.load(Ordering::Acquire), 0);
-        assert!(!env.shutdown_complete.load(Ordering::Acquire));
+        assert_eq!(env.deferred_qpair_count(), 0);
+        assert_eq!(poller_stop_calls.load(Ordering::Acquire), 1);
+        assert_eq!(detach_calls.load(Ordering::Acquire), 1);
+        assert_eq!(fini_calls.load(Ordering::Acquire), 1);
+        assert!(env.shutdown_complete.load(Ordering::Acquire));
+        assert_eq!(env.qpair_pool.controller_stats(ctrlr as usize).0, 0);
     }
 
     #[test]
