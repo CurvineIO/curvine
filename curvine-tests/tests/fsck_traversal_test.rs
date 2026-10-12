@@ -170,7 +170,7 @@ fn fsck_reports_lost_replica_in_two_worker_cluster() -> CommonResult<()> {
             conf.client.block_size = 64 * 1024;
             conf.client.block_size_str = "64KB".to_string();
             conf.master.min_block_size = 64 * 1024;
-            conf.master.heartbeat_interval = "10s".to_string();
+            conf.master.heartbeat_interval = "1h".to_string();
             conf.master.worker_blacklist_interval = "20s".to_string();
             conf.master.worker_lost_interval = "30s".to_string();
         })
