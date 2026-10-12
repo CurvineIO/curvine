@@ -17,8 +17,10 @@ use curvine_io::BlockIO;
 use curvine_io::DataSlice;
 use curvine_io::IOResult;
 use log::{debug, error, warn};
+use nix::sys::eventfd::EventFd;
 use std::fmt::{Display, Formatter};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 // ---------------------------------------------------------------------------
 // SPDK I/O channel — bridge between Tokio and SPDK reactor
 // ---------------------------------------------------------------------------
@@ -36,6 +38,40 @@ pub struct SpdkIoChannel {
 }
 unsafe impl Send for SpdkIoChannel {}
 unsafe impl Sync for SpdkIoChannel {}
+
+fn submit_flush_request(
+    name: &str,
+    ns: *mut crate::spdk_ffi::spdk_nvme_ns,
+    qpair: *mut crate::spdk_ffi::spdk_nvme_qpair,
+    poller_tx: &crossbeam::channel::Sender<crate::spdk_poller::IoRequest>,
+    eventfd: &EventFd,
+    poller_is_sleeping: &AtomicBool,
+    inflight: &Arc<AtomicUsize>,
+    completion: Arc<crate::spdk_poller::IoCompletion>,
+) -> IOResult<()> {
+    use crate::spdk_poller::{IoOp, IoRequest};
+
+    inflight.fetch_add(1, Ordering::Release);
+    let req = IoRequest {
+        op: IoOp::Flush { ns, qpair },
+        completion,
+        bdev_inflight: inflight.clone(),
+    };
+    if poller_tx.send(req).is_err() {
+        inflight.fetch_sub(1, Ordering::Release);
+        return err_box!("SPDK poller thread is gone");
+    }
+    if poller_is_sleeping.load(Ordering::SeqCst) {
+        if let Err(e) = eventfd.write(1) {
+            warn!(
+                "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
+                 I/O may be delayed until timeout.",
+                name, e
+            );
+        }
+    }
+    Ok(())
+}
 
 /// DMA buffer (hugepage-backed).
 pub struct DmaBuf {
@@ -523,30 +559,18 @@ impl SpdkBdev {
             return err_box!("SPDK qpair is dead, device unreachable");
         }
 
-        use crate::spdk_poller::{IoCompletion, IoOp, IoRequest};
+        use crate::spdk_poller::IoCompletion;
         let completion = IoCompletion::new();
-        self.inflight
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
-        let req = IoRequest {
-            op: IoOp::Flush {
-                ns: self.ns,
-                qpair: self.io_channel.qpair,
-            },
-            completion: completion.clone(),
-            bdev_inflight: self.inflight.clone(),
-        };
-        if self.io_channel.poller_tx.send(req).is_err() {
-            return err_box!("SPDK poller thread is gone");
-        }
-        if self.io_channel.poller_is_sleeping.load(Ordering::SeqCst) {
-            if let Err(e) = self.io_channel.eventfd.write(1) {
-                warn!(
-                    "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
-                     I/O may be delayed until timeout.",
-                    self.name, e
-                );
-            }
-        }
+        submit_flush_request(
+            &self.name,
+            self.ns,
+            self.io_channel.qpair,
+            &self.io_channel.poller_tx,
+            &self.io_channel.eventfd,
+            &self.io_channel.poller_is_sleeping,
+            &self.inflight,
+            completion.clone(),
+        )?;
         let rc = completion.wait(self.io_timeout_ms * 1000);
         if rc != 0 {
             if rc == -libc::EIO {
@@ -739,7 +763,12 @@ impl Drop for SpdkBdev {
             // Unregister qpair from poller before returning it to pool to avoid use-after-free
             let unregistered = env.unregister_qpair_from_poller(self.io_channel.qpair);
             if unregistered {
-                env.release_qpair(self.ctrlr, self.io_channel.qpair);
+                if !env.release_qpair(self.ctrlr, self.io_channel.qpair) {
+                    error!(
+                        "SpdkBdev '{}': qpair release failed, preserving reservation",
+                        self.name
+                    );
+                }
             } else {
                 error!(
                     "SpdkBdev '{}': qpair not unregistered, leaking to prevent UAF",
@@ -748,8 +777,12 @@ impl Drop for SpdkBdev {
             }
             env.release_handle();
         } else {
-            unsafe {
-                crate::spdk_ffi::curvine_spdk_free_io_qpair(self.io_channel.qpair);
+            let rc = unsafe { crate::spdk_ffi::curvine_spdk_free_io_qpair(self.io_channel.qpair) };
+            if rc != 0 {
+                error!(
+                    "SpdkBdev '{}': failed to free SPDK qpair during drop: rc={}",
+                    self.name, rc
+                );
             }
         }
         debug!(
@@ -763,7 +796,9 @@ impl Drop for SpdkBdev {
 mod test {
     use super::*;
     use crate::spdk_env::SpdkEnv;
+    use crate::spdk_poller::IoCompletion;
     use curvine_io::SpdkConf;
+    use nix::sys::eventfd::EfdFlags;
 
     fn ensure_spdk_init() {
         if SpdkEnv::global().is_some() {
@@ -772,7 +807,8 @@ mod test {
         let mut conf = SpdkConf::default();
         conf.enabled = true;
         conf.app_name = "curvine-test".to_string();
-        conf.hugepage_mb = 64;
+        let hugepage_mb = std::env::var("SPDK_HUGEPAGE_MB").unwrap_or_else(|_| "64".to_string());
+        conf.hugepage_str = format!("{}MB", hugepage_mb);
         conf.reactor_mask = "0x1".to_string();
         let traddr = std::env::var("SPDK_TARGET_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
         let trsvcid = std::env::var("SPDK_TARGET_PORT")
@@ -792,6 +828,35 @@ mod test {
             ..Default::default()
         }];
         SpdkEnv::init_global(conf).expect("SPDK init for tests");
+    }
+
+    #[test]
+    fn flush_send_failure_decrements_inflight() {
+        let (tx, rx) = crossbeam::channel::unbounded();
+        drop(rx);
+
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let poller_is_sleeping = AtomicBool::new(false);
+        let eventfd = EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK).unwrap();
+
+        let err = submit_flush_request(
+            "test-bdev",
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &tx,
+            &eventfd,
+            &poller_is_sleeping,
+            &inflight,
+            IoCompletion::new(),
+        )
+        .expect_err("flush enqueue should fail when poller receiver is disconnected");
+
+        assert!(
+            err.to_string().contains("SPDK poller thread is gone"),
+            "unexpected error: {}",
+            err
+        );
+        assert_eq!(inflight.load(Ordering::Acquire), 0);
     }
 
     #[test]
