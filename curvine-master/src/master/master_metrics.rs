@@ -101,7 +101,18 @@ pub struct MasterMetrics {
 impl MasterMetrics {
     pub fn new() -> CommonResult<Self> {
         let buckets = vec![
-            10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0, 100000.0,
+            10.0,
+            50.0,
+            100.0,
+            500.0,
+            1000.0,
+            5000.0,
+            10000.0,
+            50000.0,
+            100000.0,
+            1_000_000.0,
+            5_000_000.0,
+            30_000_000.0,
         ];
         let wm = Self {
             rpc_request_total_count: m::new_counter(
