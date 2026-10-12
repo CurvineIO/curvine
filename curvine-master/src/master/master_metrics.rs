@@ -18,7 +18,9 @@ use crate::master::fs::MasterFilesystem;
 use crate::master::meta::inode::ttl::TtlBucket;
 use crate::master::Master;
 use curvine_core_error::CommonResult;
-use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics, Metrics as m};
+use curvine_metrics::{
+    Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, Metrics, Metrics as m,
+};
 use curvine_model::{MetricValue, WorkerInfo};
 use curvine_runtime::sync::FastDashMap;
 use log::{debug, info, warn};
@@ -61,6 +63,13 @@ pub struct MasterMetrics {
     pub(crate) replication_timeout_count: Counter,
 
     pub(crate) operation_duration: HistogramVec,
+
+    // Delay from request receipt to the executor starting to run the handler,
+    // i.e. how long a request waited in the RPC runtime's queue. operation_duration
+    // above only covers processing time, so this is what exposes executor
+    // saturation (e.g. a read burst occupying the blocking pool) before clients
+    // start timing out.
+    pub(crate) rpc_queue_duration: Histogram,
 
     // for quota eviction (LRU)
     pub(crate) eviction_lru_cache_size: Gauge,
@@ -179,6 +188,12 @@ impl MasterMetrics {
                 "operation_duration",
                 "Operation duration including WorkerHeartbeat",
                 &["operation"],
+                &buckets,
+            )?,
+
+            rpc_queue_duration: m::new_histogram_with_buckets(
+                "rpc_queue_duration",
+                "Latency(us) from request receipt to handler execution start in the shared executor pool",
                 &buckets,
             )?,
 

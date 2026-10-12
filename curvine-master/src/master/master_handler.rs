@@ -977,6 +977,12 @@ impl MasterHandler {
         fs.list_options(&path, opts)
     }
 
+    fn record_rpc_queue_duration(&self, ctx: &RpcContext<'_>) {
+        if let Some(queue_us) = ctx.queue_us {
+            self.metrics.rpc_queue_duration.observe(queue_us as f64);
+        }
+    }
+
     fn record_rpc_observability(&self, ctx: &RpcContext<'_>, response: &FsResult<Message>) {
         let used_us = ctx.spent.used_us();
         if self.audit_logging_enabled {
@@ -1030,6 +1036,8 @@ impl MessageHandler for MasterHandler {
         let mut rpc_context = RpcContext::new(msg);
         let ctx = &mut rpc_context;
         let code = RpcCode::from(msg.code());
+
+        self.record_rpc_queue_duration(ctx);
 
         // Unified processing of all RPC requests (standby NotLeader uses the same
         // observability + error_ext conversion path as async_handle).

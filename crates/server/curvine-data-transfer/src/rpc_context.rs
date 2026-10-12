@@ -27,6 +27,7 @@ pub struct RpcContext<'a> {
     pub msg: &'a Message,
     pub code: RpcCode,
     pub spent: TimeSpent,
+    pub queue_us: Option<u64>,
     pub audit_src: Option<String>,
     pub audit_dst: Option<String>,
 }
@@ -38,6 +39,7 @@ impl<'a> RpcContext<'a> {
             msg,
             code,
             spent: TimeSpent::new(),
+            queue_us: msg.time.map(|t| t.elapsed().as_micros() as u64),
             audit_src: None,
             audit_dst: None,
         }
@@ -77,12 +79,13 @@ impl<'a> RpcContext<'a> {
         };
         info!(
             target: "audit",
-            "cmd={} ok={} ip={} src={} dst={} usedUs={}{}",
+            "cmd={} ok={} ip={} src={} dst={} queueUs={} usedUs={}{}",
             self.code,
             res.is_ok(),
             ip,
             src,
             dst,
+            self.queue_us.unwrap_or(0),
             used_us,
             err_suffix,
         );

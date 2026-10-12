@@ -82,11 +82,7 @@ impl ReadFrame {
                         let bytes = self.read_full(data_size).await?;
                         DataSlice::Buffer(bytes)
                     };
-                    let msg = Message {
-                        protocol,
-                        header,
-                        data,
-                    };
+                    let msg = Message::new(protocol, header, data);
 
                     let _ = mem::replace(&mut state, FrameSate::Head);
 
