@@ -103,8 +103,8 @@ struct spdk_nvme_qpair *curvine_spdk_alloc_io_qpair(struct spdk_nvme_ctrlr *ctrl
     spdk_nvme_ctrlr_get_default_io_qpair_opts(ctrlr, &opts, sizeof(opts));
     return spdk_nvme_ctrlr_alloc_io_qpair(ctrlr, &opts, sizeof(opts));
 }
-void curvine_spdk_free_io_qpair(struct spdk_nvme_qpair *qpair) {
-    if (qpair) spdk_nvme_ctrlr_free_io_qpair(qpair);
+int curvine_spdk_free_io_qpair(struct spdk_nvme_qpair *qpair) {
+    return qpair ? spdk_nvme_ctrlr_free_io_qpair(qpair) : 0;
 }
 
 // I/O context
