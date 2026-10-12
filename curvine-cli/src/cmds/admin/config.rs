@@ -82,21 +82,17 @@ fn print_entry(entry: &RuntimeConfigEntry) {
 mod tests {
     use super::*;
     use crate::cmds::admin::AdminSubCommand;
-    use crate::commands::Commands;
-    use crate::CurvineArgs;
+    use crate::cmds::AdminCommand;
     use clap::Parser;
 
     #[test]
     fn admin_config_set_parses() {
-        let args = CurvineArgs::try_parse_from(["curvine", "admin", "config", "set", "k", "v"])
+        let args = AdminCommand::try_parse_from(["curvine", "admin", "config", "set", "k", "v"])
             .expect("parse");
-        match args.command {
-            Some(Commands::Admin(admin)) => match admin.action {
-                AdminSubCommand::Config(cfg) => {
-                    assert!(matches!(cfg.action, ConfigSubCommand::Set { .. }));
-                }
-            },
-            _ => panic!("expected admin command"),
+        match args.action {
+            AdminSubCommand::Config(cfg) => {
+                assert!(matches!(cfg.action, ConfigSubCommand::Set { .. }));
+            }
         }
     }
 }
