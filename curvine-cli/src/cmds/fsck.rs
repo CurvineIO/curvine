@@ -16,15 +16,99 @@ use clap::Parser;
 use curvine_client_core::file::FsClient;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_fs_api::Path;
-use curvine_model::{FileBlockDetails, FileStatus, FileType, WorkerStatus};
+use curvine_model::{FileBlockDetails, FileStatus, FileType, ListOptions, WorkerStatus};
 use curvine_runtime::common::ByteUnit;
+use std::collections::VecDeque;
 use std::fmt::Write;
 use std::sync::Arc;
+
+const DEFAULT_LIST_PAGE_SIZE: usize = 256;
+const MAX_LIST_PAGE_SIZE: usize = 4096;
 
 #[derive(Parser, Debug)]
 pub struct FsckCommand {
     #[clap(value_name = "path")]
     pub path: String,
+
+    /// Show per-file and per-block details for directories
+    #[clap(long)]
+    pub detail: bool,
+
+    /// Maximum directory entries requested per listing RPC
+    #[clap(
+        long,
+        default_value_t = DEFAULT_LIST_PAGE_SIZE,
+        value_parser = parse_list_page_size
+    )]
+    pub list_page_size: usize,
+}
+
+fn parse_list_page_size(value: &str) -> Result<usize, String> {
+    let value = value
+        .parse::<usize>()
+        .map_err(|_| "must be a positive integer".to_string())?;
+    validate_list_page_size(value).map_err(|error| error.to_string())?;
+    Ok(value)
+}
+
+fn validate_list_page_size(value: usize) -> CommonResult<()> {
+    if !(1..=MAX_LIST_PAGE_SIZE).contains(&value) {
+        return err_box!("--list-page-size must be between 1 and {MAX_LIST_PAGE_SIZE}");
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct FsckReport {
+    root: String,
+    is_dir: bool,
+    retain_files: bool,
+    files: Vec<FileBlockDetails>,
+    file_count: usize,
+    block_count: usize,
+    expected_replicas: usize,
+    recorded_replicas: usize,
+    available_replicas: usize,
+    unavailable_replicas: usize,
+    under_replicated_blocks: usize,
+    errors: Vec<(String, String)>,
+}
+
+impl FsckReport {
+    fn add_file(&mut self, mut details: FileBlockDetails) {
+        details.blocks.sort_by_key(|block| block.offset);
+        for block in &mut details.blocks {
+            block.replicas.sort_by_key(|replica| replica.worker_id);
+            let expected = details.status.replicas.max(0) as usize;
+            let available = block
+                .replicas
+                .iter()
+                .filter(|replica| replica_is_available(replica.state))
+                .count();
+
+            self.block_count += 1;
+            self.expected_replicas += expected;
+            self.recorded_replicas += block.replicas.len();
+            self.available_replicas += available;
+            self.unavailable_replicas += block.replicas.len().saturating_sub(available);
+            if available < expected {
+                self.under_replicated_blocks += 1;
+            }
+        }
+        self.file_count += 1;
+        if self.retain_files {
+            self.files.push(details);
+        }
+    }
+
+    fn add_error(&mut self, path: String, error: String) {
+        self.file_count += 1;
+        self.errors.push((path, error));
+    }
+
+    fn has_warnings(&self) -> bool {
+        self.under_replicated_blocks > 0 || self.unavailable_replicas > 0 || !self.errors.is_empty()
+    }
 }
 
 impl FsckCommand {
@@ -33,18 +117,98 @@ impl FsckCommand {
         Ok(())
     }
 
-    async fn render(&self, client: Arc<FsClient>) -> CommonResult<String> {
+    pub async fn render(&self, client: Arc<FsClient>) -> CommonResult<String> {
+        validate_list_page_size(self.list_page_size)?;
+        let report = self.build_report(client).await?;
+        Ok(render_report(&report, self.detail))
+    }
+
+    async fn build_report(&self, client: Arc<FsClient>) -> CommonResult<FsckReport> {
         let path = Path::from_str(&self.path)?;
         let status = client.file_status(&path).await?;
+        let mut report = FsckReport {
+            root: status.path.clone(),
+            is_dir: status.is_dir,
+            retain_files: !status.is_dir || self.detail,
+            ..Default::default()
+        };
+
         if status.is_dir {
-            return err_box!("fsck directory traversal is not supported yet; pass a file path");
+            self.scan_directory(&client, status, &mut report).await?;
+        } else {
+            self.scan_file(&client, status, &mut report, false).await?;
         }
 
-        if let Some(reason) = block_inspection_skip_reason(&status) {
-            return Ok(render_skipped_file(status, reason));
+        if report.retain_files {
+            report
+                .files
+                .sort_by(|left, right| left.status.path.cmp(&right.status.path));
+        }
+        Ok(report)
+    }
+
+    async fn scan_directory(
+        &self,
+        client: &Arc<FsClient>,
+        root: FileStatus,
+        report: &mut FsckReport,
+    ) -> CommonResult<()> {
+        let mut directories = VecDeque::from([root.path]);
+        while let Some(directory) = directories.pop_front() {
+            let path = Path::from_str(&directory)?;
+            let mut start_after = None;
+
+            loop {
+                let entries = client
+                    .list_options(
+                        &path,
+                        ListOptions {
+                            limit: Some(self.list_page_size),
+                            start_after: start_after.clone(),
+                        },
+                    )
+                    .await?;
+                let entry_count = entries.len();
+                start_after = entries.last().map(|entry| entry.name.clone());
+
+                for entry in entries {
+                    if entry.is_dir {
+                        directories.push_back(entry.path);
+                    } else {
+                        self.scan_file(client, entry, report, true).await?;
+                    }
+                }
+
+                if entry_count < self.list_page_size {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn scan_file(
+        &self,
+        client: &Arc<FsClient>,
+        status: FileStatus,
+        report: &mut FsckReport,
+        tolerate_error: bool,
+    ) -> CommonResult<()> {
+        if block_inspection_skip_reason(&status).is_some() {
+            report.add_file(FileBlockDetails {
+                status,
+                blocks: Vec::new(),
+            });
+            return Ok(());
         }
 
-        Ok(render_file(client.get_file_block_details(&path).await?))
+        let path = Path::from_str(&status.path)?;
+        match client.get_file_block_details(&path).await {
+            Ok(details) => report.add_file(details),
+            Err(error) if tolerate_error => report.add_error(status.path, error.to_string()),
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
     }
 }
 
@@ -58,41 +222,87 @@ fn block_inspection_skip_reason(status: &FileStatus) -> Option<&'static str> {
     }
 }
 
-fn render_skipped_file(status: FileStatus, reason: &str) -> String {
+fn render_report(report: &FsckReport, detail: bool) -> String {
+    if !report.is_dir {
+        let Some(file) = report.files.first() else {
+            return String::new();
+        };
+        let mut output = render_file(file);
+        if block_inspection_skip_reason(&file.status).is_none() {
+            writeln!(
+                output,
+                "\nStatus: {}",
+                if report.has_warnings() {
+                    "WARNING"
+                } else {
+                    "OK"
+                }
+            )
+            .unwrap();
+        }
+        return output;
+    }
+
     let mut output = String::new();
-    writeln!(output, "File: {}", status.path).unwrap();
+    writeln!(output, "Directory: {}", report.root).unwrap();
     writeln!(
         output,
-        "Size: {} | Blocks: 0 | Expected replicas: {}",
-        ByteUnit::byte_to_string(status.len.max(0) as u64),
-        status.replicas.max(0)
+        "Files: {} | Blocks: {}",
+        report.file_count, report.block_count
     )
     .unwrap();
-    writeln!(output, "Block inspection skipped: {reason}").unwrap();
+
+    if detail {
+        writeln!(output).unwrap();
+        for file in &report.files {
+            output.push_str(&render_file(file));
+            writeln!(output).unwrap();
+        }
+    }
+
+    writeln!(output, "\n--- Replica Health ---").unwrap();
+    writeln!(output, "  Expected replicas: {}", report.expected_replicas).unwrap();
+    writeln!(output, "  Recorded replicas: {}", report.recorded_replicas).unwrap();
+    writeln!(
+        output,
+        "  Available replicas: {}",
+        report.available_replicas
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Unavailable replicas: {}",
+        report.unavailable_replicas
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Under-replicated blocks: {}",
+        report.under_replicated_blocks
+    )
+    .unwrap();
+    writeln!(output, "  Failed files: {}", report.errors.len()).unwrap();
+    for (path, error) in &report.errors {
+        writeln!(output, "  Failed to inspect {}: {}", path, error).unwrap();
+    }
+    writeln!(
+        output,
+        "\nStatus: {}",
+        if report.has_warnings() {
+            "WARNING"
+        } else {
+            "OK"
+        }
+    )
+    .unwrap();
     output
 }
 
-fn file_has_warnings(details: &mut FileBlockDetails) -> bool {
-    details.blocks.sort_by_key(|block| block.offset);
-    let mut warning = false;
-    for block in &mut details.blocks {
-        block.replicas.sort_by_key(|replica| replica.worker_id);
-        let expected = details.status.replicas.max(0) as usize;
-        let available = block
-            .replicas
-            .iter()
-            .filter(|replica| replica_is_available(replica.state))
-            .count();
-
-        if available < expected {
-            warning = true;
-        }
+fn render_file(details: &FileBlockDetails) -> String {
+    if let Some(reason) = block_inspection_skip_reason(&details.status) {
+        return render_skipped_file(&details.status, reason);
     }
-    warning
-}
 
-fn render_file(mut details: FileBlockDetails) -> String {
-    let warning = file_has_warnings(&mut details);
     let mut output = String::new();
     writeln!(output, "File: {}", details.status.path).unwrap();
     writeln!(
@@ -132,13 +342,20 @@ fn render_file(mut details: FileBlockDetails) -> String {
             writeln!(output, "  {:<28} {}", worker, availability).unwrap();
         }
     }
+    output
+}
 
+fn render_skipped_file(status: &FileStatus, reason: &str) -> String {
+    let mut output = String::new();
+    writeln!(output, "File: {}", status.path).unwrap();
     writeln!(
         output,
-        "\nStatus: {}",
-        if warning { "WARNING" } else { "OK" }
+        "Size: {} | Blocks: 0 | Expected replicas: {}",
+        ByteUnit::byte_to_string(status.len.max(0) as u64),
+        status.replicas.max(0)
     )
     .unwrap();
+    writeln!(output, "Block inspection skipped: {reason}").unwrap();
     output
 }
 
@@ -192,42 +409,115 @@ mod tests {
     }
 
     #[test]
+    fn list_page_size_parser_enforces_bounds() {
+        assert_eq!(parse_list_page_size("1").unwrap(), 1);
+        assert_eq!(parse_list_page_size("4096").unwrap(), 4096);
+        for value in ["0", "4097", "-1", "abc", "1.5"] {
+            assert!(parse_list_page_size(value).is_err(), "accepted {value}");
+        }
+    }
+
+    #[test]
+    fn list_page_size_validation_protects_direct_callers() {
+        assert!(validate_list_page_size(1).is_ok());
+        assert!(validate_list_page_size(MAX_LIST_PAGE_SIZE).is_ok());
+        assert!(validate_list_page_size(0).is_err());
+        assert!(validate_list_page_size(MAX_LIST_PAGE_SIZE + 1).is_err());
+    }
+
+    #[test]
     fn healthy_and_empty_files_have_no_warnings() {
-        let mut healthy = details(
+        let mut report = FsckReport {
+            retain_files: true,
+            ..Default::default()
+        };
+        report.add_file(details(
             2,
             vec![
                 (Some(address(1)), WorkerStatus::Live),
                 (Some(address(2)), WorkerStatus::Live),
             ],
-        );
-        assert!(!file_has_warnings(&mut healthy));
+        ));
+        assert_eq!(report.expected_replicas, 2);
+        assert_eq!(report.recorded_replicas, 2);
+        assert_eq!(report.available_replicas, 2);
+        assert!(!report.has_warnings());
 
         let mut empty = details(2, Vec::new());
         empty.status.len = 0;
         empty.blocks.clear();
-        assert!(!file_has_warnings(&mut empty));
+        let mut empty_report = FsckReport::default();
+        empty_report.add_file(empty);
+        assert_eq!(empty_report.expected_replicas, 0);
+        assert!(!empty_report.has_warnings());
     }
 
     #[test]
-    fn missing_and_unavailable_replicas_warn() {
-        let mut details = details(
+    fn missing_and_unavailable_replicas_are_accounted_separately() {
+        let mut report = FsckReport {
+            retain_files: true,
+            ..Default::default()
+        };
+        report.add_file(details(
             3,
             vec![
                 (Some(address(1)), WorkerStatus::Live),
                 (None, WorkerStatus::Unknown),
             ],
-        );
-        assert!(file_has_warnings(&mut details));
+        ));
+
+        assert_eq!(report.expected_replicas, 3);
+        assert_eq!(report.recorded_replicas, 2);
+        assert_eq!(report.available_replicas, 1);
+        assert_eq!(report.unavailable_replicas, 1);
+        assert_eq!(report.under_replicated_blocks, 1);
+        assert!(report.has_warnings());
     }
 
     #[test]
     fn zero_recorded_replicas_are_under_replicated() {
-        let mut details = details(1, Vec::new());
-        assert!(file_has_warnings(&mut details));
+        let mut report = FsckReport {
+            retain_files: true,
+            ..Default::default()
+        };
+        report.add_file(details(1, Vec::new()));
+        assert_eq!(report.recorded_replicas, 0);
+        assert_eq!(report.under_replicated_blocks, 1);
     }
 
     #[test]
-    fn file_has_warnings_sorts_blocks_and_replicas() {
+    fn directory_summary_does_not_retain_file_details() {
+        let mut report = FsckReport {
+            is_dir: true,
+            retain_files: false,
+            ..Default::default()
+        };
+
+        report.add_file(details(1, vec![(Some(address(1)), WorkerStatus::Live)]));
+
+        assert_eq!(report.file_count, 1);
+        assert_eq!(report.block_count, 1);
+        assert_eq!(report.available_replicas, 1);
+        assert!(report.files.is_empty());
+    }
+
+    #[test]
+    fn detail_reports_retain_file_details_for_rendering() {
+        let mut report = FsckReport {
+            is_dir: true,
+            retain_files: true,
+            ..Default::default()
+        };
+
+        report.add_file(details(1, vec![(Some(address(1)), WorkerStatus::Live)]));
+
+        assert_eq!(report.file_count, 1);
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(report.files[0].status.path, "/data/file");
+    }
+
+    #[test]
+    fn add_file_sorts_blocks_and_replicas() {
         let mut unordered = details(2, vec![(Some(address(1)), WorkerStatus::Live)]);
         unordered.blocks = vec![
             FileBlockDetail {
@@ -256,24 +546,49 @@ mod tests {
                 ],
             },
         ];
+        let mut report = FsckReport {
+            retain_files: true,
+            ..Default::default()
+        };
+        report.add_file(unordered);
 
-        file_has_warnings(&mut unordered);
+        assert_eq!(report.files[0].blocks[0].block_id, 7);
+        assert_eq!(report.files[0].blocks[1].block_id, 8);
+        assert_eq!(report.files[0].blocks[0].replicas[0].worker_id, 1);
+        assert_eq!(report.files[0].blocks[0].replicas[1].worker_id, 3);
+    }
 
-        assert_eq!(unordered.blocks[0].block_id, 7);
-        assert_eq!(unordered.blocks[1].block_id, 8);
-        assert_eq!(unordered.blocks[0].replicas[0].worker_id, 1);
-        assert_eq!(unordered.blocks[0].replicas[1].worker_id, 3);
+    #[test]
+    fn recoverable_error_is_counted_and_rendered() {
+        let mut report = FsckReport {
+            root: "/data".to_string(),
+            is_dir: true,
+            ..Default::default()
+        };
+        report.add_error("/data/bad".to_string(), "rpc failed".to_string());
+        let output = render_report(&report, false);
+
+        assert!(output.contains("Files: 1 | Blocks: 0"));
+        assert!(output.contains("Failed files: 1"));
+        assert!(output.contains("Failed to inspect /data/bad: rpc failed"));
+        assert!(output.contains("Status: WARNING"));
     }
 
     #[test]
     fn file_report_shows_health_without_storage_analysis() {
-        let output = render_file(details(
+        let mut report = FsckReport {
+            retain_files: true,
+            ..Default::default()
+        };
+        report.add_file(details(
             2,
             vec![
                 (Some(address(1)), WorkerStatus::Live),
                 (Some(address(2)), WorkerStatus::Lost),
             ],
         ));
+
+        let output = render_report(&report, false);
         assert!(output.contains("worker-1:50010"));
         assert!(output.contains("live"));
         assert!(output.contains("worker-2"));
@@ -284,31 +599,72 @@ mod tests {
     }
 
     #[test]
-    fn addressed_but_unavailable_replica_is_not_counted_available() {
-        let mut details = details(1, vec![(Some(address(1)), WorkerStatus::Lost)]);
-        assert!(file_has_warnings(&mut details));
+    fn healthy_file_report_shows_ok_status() {
+        let mut report = FsckReport {
+            retain_files: true,
+            ..Default::default()
+        };
+        report.add_file(details(
+            2,
+            vec![
+                (Some(address(1)), WorkerStatus::Live),
+                (Some(address(2)), WorkerStatus::Live),
+            ],
+        ));
 
-        let output = render_file(details);
+        let output = render_report(&report, false);
+
+        assert!(output.contains("Status: OK"));
+    }
+
+    #[test]
+    fn addressed_but_unavailable_replica_is_not_counted_available() {
+        let mut report = FsckReport {
+            retain_files: true,
+            ..Default::default()
+        };
+        report.add_file(details(1, vec![(Some(address(1)), WorkerStatus::Lost)]));
+
+        assert_eq!(report.recorded_replicas, 1);
+        assert_eq!(report.available_replicas, 0);
+        assert_eq!(report.unavailable_replicas, 1);
+        assert_eq!(report.under_replicated_blocks, 1);
+        assert!(report.has_warnings());
+
+        let output = render_file(&report.files[0]);
         assert!(output.contains("worker-1:50010"));
+        assert!(output.contains("lost"));
+    }
+
+    #[test]
+    fn summary_reports_lost_replica_as_unavailable() {
+        let mut report = FsckReport {
+            root: "/data".to_string(),
+            is_dir: true,
+            retain_files: true,
+            ..Default::default()
+        };
+        report.add_file(details(1, vec![(Some(address(1)), WorkerStatus::Lost)]));
+
+        let output = render_report(&report, true);
+
+        assert!(output.contains("Available replicas: 0"));
+        assert!(output.contains("Unavailable replicas: 1"));
+        assert!(output.contains("Under-replicated blocks: 1"));
         assert!(output.contains("lost"));
         assert!(output.contains("Status: WARNING"));
     }
 
     #[test]
-    fn registered_non_live_worker_statuses_are_counted_unavailable() {
-        let mut details = details(
-            2,
-            vec![
-                (Some(address(1)), WorkerStatus::Blacklist),
-                (Some(address(2)), WorkerStatus::Decommission),
-            ],
-        );
-        assert!(file_has_warnings(&mut details));
-
-        let output = render_file(details);
-        assert!(output.contains("blacklist"));
-        assert!(output.contains("decommission"));
-        assert!(output.contains("Status: WARNING"));
+    fn empty_directory_is_ok() {
+        let report = FsckReport {
+            root: "/empty".to_string(),
+            is_dir: true,
+            ..Default::default()
+        };
+        let output = render_report(&report, false);
+        assert!(output.contains("Files: 0 | Blocks: 0"));
+        assert!(output.contains("Status: OK"));
     }
 
     #[test]
@@ -361,7 +717,7 @@ mod tests {
             ..Default::default()
         };
 
-        let output = render_skipped_file(status, "file is UFS-only");
+        let output = render_skipped_file(&status, "file is UFS-only");
 
         assert!(output.contains("Block inspection skipped: file is UFS-only"));
         assert!(!output.contains("Status: OK"));
@@ -375,7 +731,7 @@ mod tests {
             ..Default::default()
         };
 
-        let output = render_skipped_file(status, "file type is not a regular file");
+        let output = render_skipped_file(&status, "file type is not a regular file");
 
         assert!(output.contains("Block inspection skipped: file type is not a regular file"));
         assert!(!output.contains("Status: OK"));

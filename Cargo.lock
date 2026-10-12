@@ -3029,6 +3029,7 @@ dependencies = [
  "bytes",
  "clap",
  "curvine-alloc",
+ "curvine-cli",
  "curvine-client",
  "curvine-config",
  "curvine-core-error",
