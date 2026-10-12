@@ -257,13 +257,46 @@ mod tests {
 
     #[test]
     fn fsck_flags_are_available() {
-        let args = CurvineArgs::try_parse_from(["curvine", "fsck", "/data"])
-            .expect("fsck command should parse");
+        let args = CurvineArgs::try_parse_from([
+            "curvine",
+            "fsck",
+            "/data",
+            "--detail",
+            "--list-page-size",
+            "512",
+        ])
+        .expect("fsck command should parse");
 
         let Some(Commands::Fsck(command)) = args.command else {
             panic!("expected fsck command");
         };
         assert_eq!(command.path, "/data");
+        assert!(command.detail);
+        assert_eq!(command.list_page_size, 512);
+    }
+
+    #[test]
+    fn fsck_list_page_size_defaults_and_enforces_bounds() {
+        let args = CurvineArgs::try_parse_from(["curvine", "fsck", "/data"])
+            .expect("default fsck command should parse");
+        let Some(Commands::Fsck(command)) = args.command else {
+            panic!("expected fsck command");
+        };
+        assert_eq!(command.list_page_size, 256);
+
+        for value in ["0", "4097", "-1", "1.5", "abc"] {
+            assert!(
+                CurvineArgs::try_parse_from([
+                    "curvine",
+                    "fsck",
+                    "/data",
+                    "--list-page-size",
+                    value,
+                ])
+                .is_err(),
+                "accepted {value}"
+            );
+        }
     }
 
     #[test]
