@@ -977,9 +977,21 @@ impl MasterHandler {
         fs.list_options(&path, opts)
     }
 
+    fn uses_actor_rt(code: RpcCode) -> bool {
+        matches!(code, RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport)
+    }
+
     fn record_rpc_queue_duration(&self, ctx: &RpcContext<'_>) {
         if let Some(queue_us) = ctx.queue_us {
-            self.metrics.rpc_queue_duration.observe(queue_us as f64);
+            let executor = if Self::uses_actor_rt(ctx.code) {
+                "actor"
+            } else {
+                "main"
+            };
+            self.metrics
+                .rpc_queue_duration
+                .with_label_values(&[executor])
+                .observe(queue_us as f64);
         }
     }
 
@@ -1152,7 +1164,7 @@ impl MessageHandler for MasterHandler {
     // to be marked lost.
     fn get_rt(&self, msg: &Message) -> Option<&Runtime> {
         let code = RpcCode::from(msg.code());
-        if matches!(code, RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport) {
+        if Self::uses_actor_rt(code) {
             Some(&self.actor_rt)
         } else {
             None
