@@ -74,16 +74,6 @@ impl InodeTtlExecutor {
             return Ok((false, inode));
         }
 
-        // A file still being written is active by definition; deleting or
-        // freeing its blocks mid-write would break the client's write
-        // session. Returning (false, inode) makes the caller re-add it to
-        // its bucket, so it is re-examined on later scans once the write
-        // completes and the clocks advance.
-        if inode.as_file_ref().map(|f| f.is_writing()).unwrap_or(false) {
-            debug!("skip ttl action for in-use file {}", inode_id);
-            return Ok((false, inode));
-        }
-
         let action = inode.storage_policy()?.ttl_action;
 
         debug!(
@@ -92,13 +82,6 @@ impl InodeTtlExecutor {
         );
 
         let path = self.get_inode_path(inode_id)?;
-        // A non-empty directory stays until its children are gone. Returning
-        // (false, inode) puts it back in its TTL bucket.
-        if inode.is_dir() && !self.is_empty_dir(&path)? {
-            debug!("skip ttl action for non-empty directory {}", inode_id);
-            return Ok((false, inode));
-        }
-
         match action {
             TtlAction::Delete => {
                 // A non-empty directory stays until its children are gone.
