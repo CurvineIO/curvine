@@ -75,6 +75,7 @@ pub(crate) enum QpairReleaseOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetiredQpairFinish {
     Complete,
+    DeferredRetired,
     PendingDestroy,
 }
 
@@ -463,21 +464,6 @@ impl QpairPool {
         self.release_reservation(ctrlr as usize);
         spdk_metrics::record_qpair_release("freed_retired");
         self.notify.notify_one();
-    }
-
-    /// Transfer retry ownership for a qpair that still has an active reservation
-    /// but could not be destroyed by another cleanup owner.
-    pub(crate) fn retain_pending_destroy(
-        &self,
-        ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
-        qpair: *mut spdk_ffi::spdk_nvme_qpair,
-    ) {
-        self.pending_destroy
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .entry(ctrlr as usize)
-            .or_default()
-            .push(qpair);
     }
 
     /// Free all pooled qpairs. Only frees cached (idle) qpairs - active/in-flight
@@ -1119,15 +1105,17 @@ impl SpdkEnv {
                     retired.reclaim();
                     return RetiredQpairFinish::PendingDestroy;
                 }
+                RetiredQpairFinish::DeferredRetired => unreachable!(
+                    "clean retired release outcomes cannot ask retired registry to retry"
+                ),
             }
         }
 
         let rc = self.qpair_pool.free_io_qpair(qpair);
         if rc != 0 {
             error!("failed to free retired SPDK qpair {:p}: rc={}", qpair, rc);
-            retired.reclaim();
-            self.qpair_pool.retain_pending_destroy(ctrlr, qpair);
-            return RetiredQpairFinish::PendingDestroy;
+            self.retired_qpairs.put_back(qpair, retired);
+            return RetiredQpairFinish::DeferredRetired;
         }
 
         retired.reclaim();
@@ -1169,7 +1157,12 @@ impl SpdkEnv {
                 continue;
             };
             let ctrlr = ctrlr_key as *mut spdk_ffi::spdk_nvme_ctrlr;
-            self.finish_retired_qpair(ctrlr, qpair, retired);
+            if matches!(
+                self.finish_retired_qpair(ctrlr, qpair, retired),
+                RetiredQpairFinish::DeferredRetired
+            ) {
+                self.defer_qpair(ctrlr, qpair);
+            }
         }
     }
 
@@ -1188,14 +1181,24 @@ impl SpdkEnv {
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
     ) {
         if let Some(retired) = self.retired_qpairs.take(qpair) {
-            self.finish_retired_qpair(ctrlr, qpair, retired);
+            if matches!(
+                self.finish_retired_qpair(ctrlr, qpair, retired),
+                RetiredQpairFinish::DeferredRetired
+            ) {
+                self.defer_qpair(ctrlr, qpair);
+            }
             return;
         }
 
         match self.unregister_qpair_from_poller(qpair) {
             UnregisterResult::Acked => {
                 if let Some(retired) = self.retired_qpairs.take(qpair) {
-                    self.finish_retired_qpair(ctrlr, qpair, retired);
+                    if matches!(
+                        self.finish_retired_qpair(ctrlr, qpair, retired),
+                        RetiredQpairFinish::DeferredRetired
+                    ) {
+                        self.defer_qpair(ctrlr, qpair);
+                    }
                 } else {
                     error!(
                         "unregister acked but no retired marker for qpair {:p}",
@@ -2095,7 +2098,7 @@ mod test {
     }
 
     #[test]
-    fn retired_free_failure_transfers_to_pending_destroy_for_shutdown_retry() {
+    fn retired_free_failure_preserves_retired_state_for_deferred_retry() {
         let ctrlr = 0x1000usize;
         let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
         let free_calls = Arc::new(AtomicUsize::new(0));
@@ -2142,7 +2145,8 @@ mod test {
         env.retire_qpair(ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr, qpair);
 
         assert_eq!(free_calls.load(Ordering::Acquire), 1);
-        assert!(!env.retired_qpairs.has_entries());
+        assert!(env.retired_qpairs.has_entries());
+        assert_eq!(env.deferred_qpair_count(), 1);
         assert_eq!(
             env.qpair_pool
                 .pending_destroy
@@ -2150,7 +2154,7 @@ mod test {
                 .unwrap()
                 .get(&ctrlr)
                 .map_or(0, Vec::len),
-            1
+            0
         );
         let (active, _) = env.qpair_pool.controller_stats(ctrlr);
         assert_eq!(active, 1);
@@ -2161,6 +2165,8 @@ mod test {
         assert_eq!(detach_calls.load(Ordering::Acquire), 1);
         assert_eq!(fini_calls.load(Ordering::Acquire), 1);
         assert!(env.shutdown_complete.load(Ordering::Acquire));
+        assert!(!env.retired_qpairs.has_entries());
+        assert_eq!(env.deferred_qpair_count(), 0);
         assert_eq!(
             env.qpair_pool
                 .pending_destroy

@@ -241,7 +241,6 @@ impl RetiredQpairRegistry {
         retired
     }
 
-    #[cfg(test)]
     pub(crate) fn put_back(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair, retired: RetiredQpair) {
         self.entries
             .lock()
@@ -881,6 +880,45 @@ mod test {
             unregister_ack_error_to_result(RecvTimeoutError::Timeout),
             UnregisterResult::TimedOut
         );
+    }
+
+    #[test]
+    fn retired_qpair_free_failure_keeps_stale_callback_ctx_valid_until_reclaim() {
+        let completion = IoCompletion::new();
+        let inflight = Arc::new(AtomicUsize::new(0));
+
+        // Force the callback into the late path: completion was already signaled
+        // when the qpair was retired, so a later SPDK callback must not free ctx.
+        assert!(completion.complete(-libc::ESHUTDOWN));
+
+        let mut qpair_state = Box::new(QpairState {
+            dead: Arc::new(AtomicBool::new(true)),
+            pending: Vec::new(),
+            stale: Vec::new(),
+        });
+        let qpair_state_ptr = &mut *qpair_state as *mut QpairState;
+
+        let ctx = Box::into_raw(Box::new(CallbackCtx {
+            completion: completion.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight.clone(),
+            qpair_state: qpair_state_ptr,
+            pending_idx: 0,
+        }));
+        qpair_state.stale.push(ctx);
+
+        let retired = RetiredQpair {
+            state: Some(qpair_state),
+            must_free: true,
+        };
+
+        // Simulate free_io_qpair failure: retired remains alive, so the stale
+        // CallbackCtx is still valid if SPDK reports a late completion.
+        unsafe { poller_callback(ctx as *mut c_void, 0) };
+        assert_eq!(inflight.load(Ordering::Acquire), 0);
+
+        // Simulate a later successful free: only now is it safe to reclaim stale.
+        retired.reclaim();
     }
 
     #[test]
