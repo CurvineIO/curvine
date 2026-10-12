@@ -247,6 +247,18 @@ impl Logger {
                 }
             };
             let file_path = format!("{}/{}.log", log_dir, base);
+            // The rolling appender does not create its parent directory, and this runs
+            // during logger init: a missing log directory would otherwise panic the
+            // process instead of just falling back to a quieter start.
+            if let Some(parent) = std::path::Path::new(&file_path).parent() {
+                if let Err(err) = std::fs::create_dir_all(parent) {
+                    eprintln!(
+                        "[logger] failed to create log directory {}: {}",
+                        parent.display(),
+                        err
+                    );
+                }
+            }
             let condition = Self::build_rolling_condition(conf);
             let appender = RollingFileAppender::new(&file_path, condition, conf.max_log_files)
                 .expect("initializing rolling file appender failed");
