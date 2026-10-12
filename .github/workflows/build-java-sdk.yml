@@ -204,6 +204,7 @@ jobs:
           # Generate protobuf code and package
           cd curvine-libsdk/java
           mvn protobuf:compile package -DskipTests -B
+          mvn test -Dtest=ClientArtifactIT -B
           
           echo "Built JAR files:"
           ls -la target/*.jar
@@ -252,7 +253,7 @@ jobs:
             
             ### JAR Downloads
             - **curvine-hadoop-${{ needs.package-jar.outputs.version }}.jar** - Base JAR
-            - **curvine-hadoop-${{ needs.package-jar.outputs.version }}-client.jar** - Client JAR (with shaded protobuf, recommended for big data environments)
+            - **curvine-hadoop-${{ needs.package-jar.outputs.version }}-client.jar** - Single-JAR cv:// deployment package for Hadoop hosts; embeds relocated Protobuf and Curvine runtime dependencies
             - **curvine-hadoop-${{ needs.package-jar.outputs.version }}-shade.jar** - Fully shaded JAR
             
             ### Supported Platforms
