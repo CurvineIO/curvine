@@ -327,7 +327,11 @@
                         </configuration>
                     </execution>
 
-                    <!-- Customer service package used in big data environment-->
+                    <!--
+                      Deployment package for Hadoop hosts such as Flink and StarRocks.
+                      Hadoop APIs and SLF4J stay host-provided. All other runtime
+                      dependencies used by cv:// are embedded and relocated.
+                    -->
                     <execution>
                         <id>client</id>
                         <phase>package</phase>
@@ -352,6 +356,12 @@
                                         <exclude>org/apache/log4j/**</exclude>
                                         <exclude>org/apache/hadoop/**</exclude>
                                         <exclude>io/curvine/S3aProxyFileSystem.class</exclude>
+                                        <exclude>io/curvine/S3aProxyFileSystem$*</exclude>
+                                        <exclude>io/curvine/CurvineFilesystemProvider.class</exclude>
+                                        <exclude>io/curvine/CurvineFilesystemProvider$*</exclude>
+                                        <exclude>io/curvine/CurvineFallbackInputStream.class</exclude>
+                                        <exclude>io/curvine/CurvineFallbackInputStream$*</exclude>
+                                        <exclude>io/curvine/CurvineShell.class</exclude>
                                         <exclude>scala/**</exclude>
                                         <exclude>io/curvine/bench/**</exclude>
                                         <exclude>javax/**</exclude>
@@ -360,27 +370,11 @@
                                 </filter>
                             </filters>
                             <artifactSet>
-                                <excludes>
-                                    <exclude>org.scala-lang:scala-library</exclude>
-                                    <exclude>org.apache.hadoop:*</exclude>
-                                    <exclude>org.apache.hadoop.thirdparty:*</exclude>
-                                    <exclude>org.slf4j:slf4j-api</exclude>
-                                    <exclude>org.slf4j:slf4j-log4j12</exclude>
-                                    <exclude>org.slf4j:slf4j-reload4j</exclude>
-                                    <exclude>org.apache.hadoop:hadoop-aws</exclude>
-                                    <exclude>com.amazonaws:aws-java-sdk-bundle</exclude>
-                                    <exclude>javax.activation:activation</exclude>
-                                    <exclude>jakarta.activation:jakarta.activation-api</exclude>
-                                    <exclude>javax.servlet:javax.servlet-api</exclude>
-                                    <exclude>javax.servlet.jsp:jsp-api</exclude>
-                                    <exclude>javax.ws.rs:jsr311-api</exclude>
-                                    <exclude>javax.xml.bind:jaxb-api</exclude>
-                                    <exclude>javax.xml.stream:stax-api</exclude>
-                                    <exclude>javax.el:javax.el-api</exclude>
-                                    <exclude>org.glassfish:javax.el</exclude>
-                                    <exclude>log4j:log4j</exclude>
-                                    <exclude>ch.qos.reload4j:reload4j</exclude>
-                                </excludes>
+                                <includes>
+                                    <include>com.google.protobuf:protobuf-java</include>
+                                    <include>commons-io:commons-io</include>
+                                    <include>org.apache.commons:commons-lang3</include>
+                                </includes>
                             </artifactSet>
                             <relocations>
                                 <relocation>
@@ -388,72 +382,8 @@
                                     <shadedPattern>${shade.prefix}.com.google.protobuf</shadedPattern>
                                 </relocation>
                                 <relocation>
-                                    <pattern>com.google.gson</pattern>
-                                    <shadedPattern>${shade.prefix}.com.google.gson</shadedPattern>
-                                </relocation>
-                                <relocation>
                                     <pattern>org.apache.commons</pattern>
                                     <shadedPattern>${shade.prefix}.org.apache.commons</shadedPattern>
-                                </relocation>
-                                <relocation>
-                                    <pattern>commons-logging</pattern>
-                                    <shadedPattern>${shade.prefix}.commons.logging</shadedPattern>
-                                </relocation>
-                                <relocation>
-                                    <pattern>com.google.common</pattern>
-                                    <shadedPattern>${shade.prefix}.com.google.common</shadedPattern>
-                                </relocation>
-                                <relocation>
-                                    <pattern>com.google.thirdparty</pattern>
-                                    <shadedPattern>${shade.prefix}.com.google.thirdparty</shadedPattern>
-                                </relocation>
-                                <relocation>
-                                    <pattern>com.google.re2j</pattern>
-                                    <shadedPattern>${shade.prefix}.com.google.re2j</shadedPattern>
-                                </relocation>
-                                <relocation>
-                                    <pattern>com.google.errorprone</pattern>
-                                    <shadedPattern>${shade.prefix}.com.google.errorprone</shadedPattern>
-                                </relocation>
-                                <relocation>
-                                    <pattern>com.google.j2objc</pattern>
-                                    <shadedPattern>${shade.prefix}.com.google.j2objc</shadedPattern>
-                                </relocation>
-                                <relocation>
-                                    <pattern>com.fasterxml</pattern>
-                                    <shadedPattern>${shade.prefix}.com.fasterxml</shadedPattern>
-                                </relocation>
-                                <relocation>
-                                    <pattern>org.codehaus.jackson</pattern>
-                                    <shadedPattern>${shade.prefix}.org.codehaus.jackson</shadedPattern>
-                                </relocation>
-                                <relocation>
-                                    <pattern>org.codehaus.stax2</pattern>
-                                    <shadedPattern>${shade.prefix}.org.codehaus.stax2</shadedPattern>
-                                </relocation>
-                                <relocation>
-                                    <pattern>org.codehaus.jettison</pattern>
-                                    <shadedPattern>${shade.prefix}.org.codehaus.jettison</shadedPattern>
-                                </relocation>
-                                <relocation>
-                                    <pattern>org.apache.curator</pattern>
-                                    <shadedPattern>${shade.prefix}.org.apache.curator</shadedPattern>
-                                </relocation>
-                                <relocation>
-                                    <pattern>org.apache.zookeeper</pattern>
-                                    <shadedPattern>${shade.prefix}.org.apache.zookeeper</shadedPattern>
-                                </relocation>
-                                <relocation>
-                                    <pattern>org.apache.http</pattern>
-                                    <shadedPattern>${shade.prefix}.org.apache.http</shadedPattern>
-                                </relocation>
-                                <relocation>
-                                    <pattern>org.checkerframework</pattern>
-                                    <shadedPattern>${shade.prefix}.org.checkerframework</shadedPattern>
-                                </relocation>
-                                <relocation>
-                                    <pattern>org.codehaus.mojo</pattern>
-                                    <shadedPattern>${shade.prefix}.org.codehaus.mojo</shadedPattern>
                                 </relocation>
                             </relocations>
                         </configuration>
