@@ -674,6 +674,28 @@ feature_list() {
   echo "$*"
 }
 
+# JindoSDK-backed builds need a package-relative RPATH: curvine-fuse and curvine-cli link
+# libjindosdk_c.so.6 out of `<home>/jindosdk/lib/native`, and a bare binary run (no
+# sourced `conf/curvine-env.sh`, e.g. under `sudo` with env_reset) still has to resolve it.
+# Tied to the oss-hdfs feature so builds without JindoSDK are left untouched.
+client_rpath_rustflags() {
+  local -a features=("$@")
+
+  if [ ${#features[@]} -eq 0 ]; then
+    return 0
+  fi
+
+  if [[ " $(feature_list "${features[@]}") " != *"oss-hdfs"* ]]; then
+    return 0
+  fi
+
+  # $ORIGIN is the directory holding the binary (<home>/lib). Escaping keeps the
+  # literal `$ORIGIN` for the dynamic loader instead of expanding it in shell.
+  printf '%s' "-C link-arg=-Wl,-rpath,\$ORIGIN"
+  printf ' %s' "-C link-arg=-Wl,-rpath,\$ORIGIN/../jindosdk/lib/native"
+  printf ' %s' "-C link-arg=-Wl,-rpath,\$ORIGIN/../jindosdk/lib"
+}
+
 build_rust_packages() {
   local label="$1"
   shift
@@ -703,7 +725,16 @@ build_rust_packages() {
   fi
 
   echo "Building ${label} crates with command: ${build_cmd[*]}"
-  "${build_cmd[@]}"
+
+  local rpath_flags
+  rpath_flags="$(client_rpath_rustflags "${features[@]}")"
+  if [ -n "$rpath_flags" ]; then
+    local base_rustflags="${RUSTFLAGS:-}"
+    echo "Adding package-relative RPATH for JindoSDK: ${rpath_flags}"
+    RUSTFLAGS="${base_rustflags:+${base_rustflags} }${rpath_flags}" "${build_cmd[@]}"
+  else
+    "${build_cmd[@]}"
+  fi
 }
 
 artifact_dynamic_entries() {
@@ -1172,6 +1203,36 @@ echo "Copying Rust binaries into ${DIST_DIR}/lib ..."
 for target in "${COPY_TARGETS[@]}"; do
   cp -f "$FS_HOME"/target/${TARGET_DIR}/${target} "$DIST_DIR"/lib
 done
+
+# JindoSDK-backed client builds: the binaries carry a package-relative RPATH
+# pointing at `<home>/jindosdk/lib/native`, but RPATH only tells the loader where
+# to look - the library still has to be in the package. Bundle it here (and wire
+# the same path into the packaged env script) whenever oss-hdfs was requested, so
+# a plain `build.sh` tree is already self-contained and no manual packaging step
+# can be forgotten.
+if printf '%s\n' "${CLIENT_FEATURES[@]}" | grep -qx 'curvine-client/oss-hdfs'; then
+  jindo_home="${JINDOSDK_HOME:-/opt/jindosdk}"
+  if [ -d "$jindo_home" ]; then
+    echo "Bundling JindoSDK from ${jindo_home} into ${DIST_DIR}/jindosdk ..."
+    mkdir -p "$DIST_DIR/jindosdk"
+    cp -a "$jindo_home"/. "$DIST_DIR/jindosdk/"
+
+    env_file="$DIST_DIR/conf/curvine-env.sh"
+    if [ -f "$env_file" ] && ! grep -q 'CURVINE_SELF_CONTAINED_DEPS' "$env_file"; then
+      cat >> "$env_file" <<'CURVINE_JINDO_ENV'
+
+# CURVINE_SELF_CONTAINED_DEPS
+# Appended automatically for oss-hdfs builds: package-local JindoSDK and libs.
+export JINDOSDK_HOME="${JINDOSDK_HOME:-$CURVINE_HOME/jindosdk}"
+export LD_LIBRARY_PATH="$CURVINE_HOME/lib:$JINDOSDK_HOME/lib/native:$JINDOSDK_HOME/lib:${LD_LIBRARY_PATH:-}"
+CURVINE_JINDO_ENV
+      echo "Appended package-local JindoSDK env to ${env_file}"
+    fi
+  else
+    echo "Warning: oss-hdfs was requested but JindoSDK is missing at ${jindo_home};" >&2
+    echo "         ${DIST_DIR}/lib/curvine-fuse will not resolve libjindosdk_c.so.6" >&2
+  fi
+fi
 
 echo "Checking minimal client artifact runtime dependencies ..."
 for target in "${CLIENT_ARTIFACT_CHECK_TARGETS[@]}"; do
