@@ -161,10 +161,14 @@ fn test_block_report_session_is_backward_compatible() {
         worker_session_id: Some("session-1".to_string()),
         full_report: true,
         total_len: 0,
+        report_id: Some(42),
         blocks: vec![],
     };
     let decoded = BlockReportListRequest::decode(request.encode_to_vec().as_slice()).unwrap();
     assert_eq!(decoded.worker_session_id.as_deref(), Some("session-1"));
+    // Session ownership and report-round identity travel together: the master
+    // needs both to attribute a resent batch to the right attempt.
+    assert_eq!(decoded.report_id, Some(42));
 
     let legacy = LegacyBlockReportListRequest {
         cluster_id: "test-cluster".to_string(),
@@ -174,6 +178,10 @@ fn test_block_report_session_is_backward_compatible() {
     };
     let decoded = BlockReportListRequest::decode(legacy.encode_to_vec().as_slice()).unwrap();
     assert!(decoded.worker_session_id.is_none());
+    assert!(
+        decoded.report_id.is_none(),
+        "a legacy report carries no round id"
+    );
 }
 
 #[test]

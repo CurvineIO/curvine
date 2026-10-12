@@ -140,7 +140,7 @@ fn recursive_delete_collects_nonempty_blocks_before_detaching_tree() {
     assert_eq!(result.inodes, 1);
     let mut worker = WorkerInfo::default();
     worker.address.worker_id = 11;
-    let commands = fs
+    let (commands, _accepted_start) = fs
         .worker_manager
         .write()
         .heartbeat(

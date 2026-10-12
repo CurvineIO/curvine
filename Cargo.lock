@@ -2938,6 +2938,7 @@ dependencies = [
  "curvine-storage-local",
  "curvine-sys",
  "curvine-ufs-api",
+ "curvine-unified-fs",
  "curvine-web",
  "curvine-worker",
  "dashmap 5.5.3",

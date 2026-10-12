@@ -134,7 +134,6 @@ impl WorkerManager {
                 return Ok((vec![], true));
             }
 
-<<<<<<< HEAD
             HeartbeatStatus::Running => {
                 let current_session_mismatch = self
                     .worker_map
@@ -156,13 +155,16 @@ impl WorkerManager {
                     );
                     return Ok((vec![], false));
                 }
-                self.block_map.handle_heartbeat(addr.worker_id)
+                // A presence-only heartbeat still has to pass the session checks
+                // above and still refreshes worker liveness through the insert
+                // below; it only suppresses the block commands that a normal
+                // running heartbeat carries.
+                if presence_only {
+                    Vec::new()
+                } else {
+                    self.block_map.handle_heartbeat(addr.worker_id)
+                }
             }
-=======
-            HeartbeatStatus::Running if presence_only => Vec::new(),
-
-            HeartbeatStatus::Running => self.block_map.handle_heartbeat(addr.worker_id),
->>>>>>> 49ca7acd (fix(master): keep the control plane up across master recovery)
 
             HeartbeatStatus::End => {
                 info!("Worker unregister: {}", addr);

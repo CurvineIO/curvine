@@ -42,6 +42,9 @@ pub use self::fallback_fs_reader::FallbackFsReader;
 mod write_cache_writer;
 pub use self::write_cache_writer::WriteCacheWriter;
 
+#[cfg(test)]
+mod tests;
+
 #[allow(clippy::large_enum_variant)]
 pub enum UnifiedWriter {
     Cv(FsWriter),

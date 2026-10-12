@@ -23,6 +23,7 @@ fn stale_unregister_does_not_remove_new_worker_session() {
             0,
             Vec::new(),
             None,
+            false,
         )
         .unwrap();
 
@@ -57,6 +58,7 @@ fn lost_session_requires_new_start_before_running() {
             10,
             Vec::new(),
             None,
+            false,
         )
         .unwrap();
     assert!(manager.get_worker(1).is_none());
@@ -76,6 +78,7 @@ fn lost_session_requires_new_start_before_running() {
             20,
             Vec::new(),
             None,
+            false,
         )
         .unwrap();
     assert!(accepted_start);
@@ -95,6 +98,7 @@ fn lost_session_requires_new_start_before_running() {
             20,
             Vec::new(),
             None,
+            false,
         )
         .unwrap();
     assert!(manager.get_worker(1).unwrap().is_live());

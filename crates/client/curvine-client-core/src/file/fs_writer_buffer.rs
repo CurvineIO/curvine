@@ -133,6 +133,16 @@ impl BufferChannel {
     }
 }
 
+fn record_writer_error<E: Into<FsError>>(error: E, err_monitor: &ErrorMonitor<FsError>) {
+    let error = error.into();
+    if matches!(error.kind(), ErrorKind::FileNotFound) {
+        debug!("buffer writer error: {:?}", error);
+    } else {
+        error!("buffer writer error: {:?}", error);
+    }
+    err_monitor.set_error(error);
+}
+
 // Reader with buffer.
 pub struct FsWriterBuffer {
     path: Path,
@@ -154,19 +164,7 @@ impl FsWriterBuffer {
 
         let rt = writer.fs_context().clone_runtime();
         rt.spawn(async move {
-            let res = Self::write_future(chunk_receiver, task_receiver, writer).await;
-            match res {
-                Ok(_) => {}
-                Err(e) => {
-                    if matches!(e.kind(), ErrorKind::FileNotFound) {
-                        debug!("buffer writer error: {:?}", e);
-                    } else {
-                        error!("buffer writer error: {:?}", e);
-                    }
-
-                    monitor.set_error(e);
-                }
-            }
+            Self::write_future(chunk_receiver, task_receiver, writer, monitor).await;
         });
 
         let writer = BufferChannel {
@@ -250,31 +248,44 @@ impl FsWriterBuffer {
         mut chunk_receiver: AsyncReceiver<DataSlice>,
         mut task_receiver: AsyncReceiver<WriterTask>,
         mut writer: FsWriterBase,
-    ) -> FsResult<()> {
+        err_monitor: Arc<ErrorMonitor<FsError>>,
+    ) {
+        macro_rules! return_on_error {
+            ($result:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        record_writer_error(error, err_monitor.as_ref());
+                        return;
+                    }
+                }
+            };
+        }
+
         loop {
             // The queue can be written and controlled to complete any future.
             let select_task = match recv_task(&mut chunk_receiver, &mut task_receiver).await {
                 Some(task) => task,
-                None => return Ok(()),
+                None => return,
             };
 
             match select_task {
                 SelectTask::Control(task) => match task {
                     WriterTask::Flush(cx) => {
-                        while let Some(chunk) = chunk_receiver.try_recv()? {
-                            writer.write(chunk).await?;
+                        while let Some(chunk) = return_on_error!(chunk_receiver.try_recv()) {
+                            return_on_error!(writer.write(chunk).await);
                         }
-                        writer.flush().await?;
-                        cx.send(1)?;
+                        return_on_error!(writer.flush().await);
+                        return_on_error!(cx.send(1));
                     }
 
                     WriterTask::Complete((_, opts, tx)) => {
-                        while let Some(chunk) = chunk_receiver.try_recv()? {
-                            writer.write(chunk).await?;
+                        while let Some(chunk) = return_on_error!(chunk_receiver.try_recv()) {
+                            return_on_error!(writer.write(chunk).await);
                         }
-                        writer.complete_with_attr(opts).await?;
-                        tx.send(1)?;
-                        return Ok(());
+                        return_on_error!(writer.complete_with_attr(opts).await);
+                        return_on_error!(tx.send(1));
+                        return;
                     }
 
                     WriterTask::Cancel(tx) => {
@@ -283,39 +294,35 @@ impl FsWriterBuffer {
                         // them. FsWriterBase::cancel attempts every active block
                         // writer before returning its first error.
                         let res = writer.cancel().await;
-                        tx.send(res)?;
-                        return Ok(());
+                        return_on_error!(tx.send(res));
+                        return;
                     }
 
                     WriterTask::Seek((pos, tx)) => {
                         // Process all buffered data first
-                        while let Some(chunk) = chunk_receiver.try_recv()? {
-                            writer.write(chunk).await?
+                        while let Some(chunk) = return_on_error!(chunk_receiver.try_recv()) {
+                            return_on_error!(writer.write(chunk).await);
                         }
 
                         // Execute seek operation
-                        writer.seek(pos).await?;
+                        return_on_error!(writer.seek(pos).await);
 
-                        if let Err(e) = tx.send(1) {
-                            return Err(e.into());
-                        }
+                        return_on_error!(tx.send(1));
                     }
 
                     WriterTask::Resize((opts, tx)) => {
-                        while let Some(chunk) = chunk_receiver.try_recv()? {
-                            writer.write(chunk).await?
+                        while let Some(chunk) = return_on_error!(chunk_receiver.try_recv()) {
+                            return_on_error!(writer.write(chunk).await);
                         }
 
-                        writer.resize(opts).await?;
+                        return_on_error!(writer.resize(opts).await);
 
-                        if let Err(e) = tx.send(writer.file_blocks()) {
-                            return Err(e.into());
-                        }
+                        return_on_error!(tx.send(writer.file_blocks()));
                     }
                 },
 
                 SelectTask::Data(chunk) => {
-                    writer.write(chunk).await?;
+                    return_on_error!(writer.write(chunk).await);
                 }
             }
         }
@@ -324,11 +331,13 @@ impl FsWriterBuffer {
 
 #[cfg(test)]
 mod tests {
-    use super::{recv_task, SelectTask, WriterTask};
+    use super::{record_writer_error, recv_task, BufferChannel, SelectTask, WriterTask};
     use bytes::Bytes;
-    use curvine_error::FsResult;
+    use curvine_error::{FsError, FsResult};
     use curvine_io::DataSlice;
     use curvine_runtime::sync::channel::{AsyncChannel, CallChannel};
+    use curvine_runtime::sync::ErrorMonitor;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn cancel_control_preempts_queued_data() {
@@ -345,5 +354,30 @@ mod tests {
             recv_task(&mut chunk_rx, &mut task_rx).await,
             Some(SelectTask::Control(WriterTask::Cancel(_)))
         ));
+    }
+
+    #[tokio::test]
+    async fn pending_call_returns_writer_error_after_sender_drops() {
+        let err_monitor = Arc::new(ErrorMonitor::new());
+        let (chunk_sender, _) = AsyncChannel::new(1).split();
+        let (task_sender, _) = AsyncChannel::new(1).split();
+        let channel = BufferChannel {
+            chunk_sender,
+            task_sender,
+            err_monitor: err_monitor.clone(),
+        };
+        let (sender, receiver) = CallChannel::channel::<i8>();
+
+        record_writer_error(
+            FsError::common("No workers available"),
+            err_monitor.as_ref(),
+        );
+        drop(sender);
+
+        let sender_dropped = receiver.receive().await.unwrap_err();
+        assert!(channel
+            .check_error(sender_dropped)
+            .to_string()
+            .contains("No workers available"));
     }
 }

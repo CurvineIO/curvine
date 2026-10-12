@@ -16,6 +16,7 @@ fn full_block_report_reclaims_excess_replica() {
                 worker_id: 300,
                 full_report: true,
                 total_len: 1,
+                report_id: 0,
                 blocks: vec![BlockReportInfo::new(
                     block_id,
                     BlockReportStatus::Finalized,
@@ -60,6 +61,7 @@ fn stale_block_report_does_not_register_location() {
                 worker_id: 300,
                 full_report: false,
                 total_len: 1,
+                report_id: 0,
                 blocks: vec![BlockReportInfo::new(
                     block_id,
                     BlockReportStatus::Finalized,
@@ -88,6 +90,7 @@ fn stale_block_report_does_not_register_location() {
                 worker_id: 300,
                 full_report: false,
                 total_len: 1,
+                report_id: 0,
                 blocks: vec![BlockReportInfo::new(
                     block_id,
                     BlockReportStatus::Finalized,
@@ -163,6 +166,7 @@ fn old_lost_cleanup_skips_recovered_worker_session() {
                 20,
                 Vec::new(),
                 None,
+                false,
             )
             .unwrap();
         worker_manager
@@ -179,6 +183,7 @@ fn old_lost_cleanup_skips_recovered_worker_session() {
                 20,
                 Vec::new(),
                 None,
+                false,
             )
             .unwrap();
     }

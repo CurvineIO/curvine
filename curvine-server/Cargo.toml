@@ -76,5 +76,6 @@ curvine-s3-gateway = { workspace = true }
 
 [dev-dependencies]
 curvine-fault = { workspace = true, features = ["http-client"] }
+curvine-unified-fs = { workspace = true, features = ["opendal-s3"] }
 mysql = { workspace = true }
 raft = { workspace = true }
