@@ -7,6 +7,13 @@ description: Create or update a Curvine pull request with standardized title and
 
 Create or update a PR with Curvine title and body conventions.
 
+## Route first
+
+| Signal | Action |
+| ------ | ------ |
+| CoMind KEY, internal MR, `cr push`, `main-next` on code.oppoer.me | Use [cv-comind-internal](../cv-comind-internal/SKILL.md); **do not** `gh pr create` |
+| GitHub PR to CurvineIO/curvine `main` | Continue below |
+
 ## Language Rules
 
 - **PR body (content):** write in **Chinese** — this is the communication medium with reviewers.
@@ -149,5 +156,6 @@ gh pr edit <number> --title "..." --body "..."
 
 ## Related
 
+- Internal CoMind / Huoyan → [cv-comind-internal](../cv-comind-internal/SKILL.md)
 - Review feedback → [cv-address-pr-review](../cv-address-pr-review/SKILL.md)
 - Fix issue workflow → [cv-handle-issue](../cv-handle-issue/SKILL.md)

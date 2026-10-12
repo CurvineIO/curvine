@@ -2,11 +2,16 @@
 
 Referenced by `cv-*` skills.
 
-## Issue
+## Issue tracks
 
-- Follow `.github/ISSUE_TEMPLATE/` format
-- Feature issues require **Goal**, **Not Goal**, **Test Plan** sections
-- Sub-tasks: title `[SUB]`, body links `Parent: #<n>`
+| Track | Tracker | Skill |
+| ----- | ------- | ----- |
+| Community | GitHub issue | `cv-handle-issue`, `cv-create-issue` |
+| Internal | CoMind parent + sub-issues | `cv-comind-internal` |
+
+GitHub: follow `.github/ISSUE_TEMPLATE/`; features need **Goal**, **Not Goal**, **Test Plan**; sub-tasks title `[SUB]`, body `Parent: #<n>`.
+
+Internal: parent issue holds acceptance criteria; implementation sub-issue holds branch/MR notes; commits include CoMind **KEY**; Huoyan MR or `cr push` to `main-next` (no direct push to main branches, rebase merge only).
 
 ## Implementation
 

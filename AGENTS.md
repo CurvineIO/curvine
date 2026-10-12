@@ -38,6 +38,12 @@ Usage notes:
 </skill>
 
 <skill>
+<name>cv-comind-internal</name>
+<description>Implement Curvine work tracked in CoMind on the internal repo (code.oppoer.me, main-next) with parent/child issues, commit KEY tagging, and Huoyan (cr push / MR) delivery. Use when the task is a CoMind issue KEY, internal MR, comind CLI workflow, or code.oppoer.me instead of GitHub issue/PR.</description>
+<location>project</location>
+</skill>
+
+<skill>
 <name>cv-create-issue</name>
 <description>Create a GitHub issue for Curvine using repository templates, with extended Goal/Not Goal/Test Plan sections for features. Use when user asks to create an issue, report a serious bug found during testing, or when agent should suggest filing an issue for the current problem.</description>
 <location>project</location>

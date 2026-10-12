@@ -147,6 +147,7 @@ ls -la .github/skills .cursor/skills .claude/skills
 | ----- | ----- |
 | `cv-add-skills` | Meta — add/update skills |
 | `cv-codegraph` | Code exploration — CodeGraph setup and usage |
+| `cv-comind-internal` | Internal — CoMind + Huoyan on code.oppoer.me |
 | `cv-create-issue` | Issue |
 | `cv-create-pr` | PR |
 | `cv-csi-test` | Testing |

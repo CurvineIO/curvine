@@ -93,7 +93,12 @@ Do **not** start coding during breakdown. Iterate on the table until the user ap
 
 ### Step 6: Sub-Issues (when parent issue exists)
 
-If a parent GitHub issue is linked, create sub-issues via `cv-create-issue` or:
+| Parent tracker | Sub-issue creation |
+| -------------- | ------------------ |
+| CoMind parent issue | `comind issue create --title "实现：…" --parent <parent-id> --status todo` (see [cv-comind-internal](../cv-comind-internal/SKILL.md)) |
+| GitHub parent issue | `cv-create-issue` or `gh issue create` below |
+
+If a parent **GitHub** issue is linked, create sub-issues via `cv-create-issue` or:
 
 ```bash
 gh issue create \
@@ -146,6 +151,7 @@ After user approval:
 
 ## Related
 
+- Internal CoMind breakdown → [cv-comind-internal](../cv-comind-internal/SKILL.md)
 - Handle issue → [cv-handle-issue](../cv-handle-issue/SKILL.md)
 - Create issue / sub-issue → [cv-create-issue](../cv-create-issue/SKILL.md)
 - Submit work → [cv-create-pr](../cv-create-pr/SKILL.md)

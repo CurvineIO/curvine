@@ -9,11 +9,18 @@ End-to-end issue resolution with explicit user approval before coding.
 
 ## When to Use
 
-- User provides an **issue URL or issue number** and asks to fix / implement / resolve it
+- User provides a **GitHub issue URL or `#<number>`** and asks to fix / implement / resolve it
+
+## Route first
+
+| Signal | Skill |
+| ------ | ----- |
+| CoMind KEY / `comind issue` / internal `code.oppoer.me` / `main-next` | [cv-comind-internal](../cv-comind-internal/SKILL.md) — stop here |
+| GitHub issue URL or `#<number>` | Continue below |
 
 ## Prerequisites
 
-- Valid issue reference (URL or `#<number>`)
+- Valid **GitHub** issue reference (URL or `#<number>`)
 - `gh auth status` OK
 
 ## Step 1: Read Issue
@@ -109,6 +116,7 @@ When implementation and tests pass, use [cv-create-pr](../cv-create-pr/SKILL.md)
 
 ## Related
 
+- Internal CoMind / Huoyan → [cv-comind-internal](../cv-comind-internal/SKILL.md)
 - Break down large work → [cv-tasks-breakdown](../cv-tasks-breakdown/SKILL.md)
 - File new issue → [cv-create-issue](../cv-create-issue/SKILL.md)
 - Submit PR → [cv-create-pr](../cv-create-pr/SKILL.md)

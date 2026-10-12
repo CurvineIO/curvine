@@ -38,6 +38,7 @@ rm -rf .claude/skills && ln -sfn ../.agents/skills .claude/skills
 | ----- | ----- |
 | `cv-add-skills` | Meta — add/update cv skills |
 | `cv-codegraph` | Code exploration — install/init CodeGraph, prefer before grep |
+| `cv-comind-internal` | Internal repo — CoMind issues + Huoyan MR on main-next |
 | `cv-tasks-breakdown` | Plan → small tasks + sub-issues |
 | `cv-create-issue` | File GitHub issue |
 | `cv-handle-issue` | Fix issue (plan first, then code) |
