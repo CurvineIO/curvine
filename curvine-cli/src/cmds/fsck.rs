@@ -14,7 +14,7 @@
 
 use clap::Parser;
 use curvine_client_core::file::FsClient;
-use curvine_core_error::CommonResult;
+use curvine_core_error::{err_box, CommonResult};
 use curvine_fs_api::Path;
 use curvine_model::{FileBlockDetails, FileStatus, FileType, ListOptions, WorkerStatus};
 use curvine_runtime::common::ByteUnit;
@@ -47,10 +47,15 @@ fn parse_list_page_size(value: &str) -> Result<usize, String> {
     let value = value
         .parse::<usize>()
         .map_err(|_| "must be a positive integer".to_string())?;
-    if !(1..=MAX_LIST_PAGE_SIZE).contains(&value) {
-        return Err(format!("must be between 1 and {MAX_LIST_PAGE_SIZE}"));
-    }
+    validate_list_page_size(value).map_err(|error| error.to_string())?;
     Ok(value)
+}
+
+fn validate_list_page_size(value: usize) -> CommonResult<()> {
+    if !(1..=MAX_LIST_PAGE_SIZE).contains(&value) {
+        return err_box!("--list-page-size must be between 1 and {MAX_LIST_PAGE_SIZE}");
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -113,6 +118,7 @@ impl FsckCommand {
     }
 
     pub async fn render(&self, client: Arc<FsClient>) -> CommonResult<String> {
+        validate_list_page_size(self.list_page_size)?;
         let report = self.build_report(client).await?;
         Ok(render_report(&report, self.detail))
     }
@@ -409,6 +415,14 @@ mod tests {
         for value in ["0", "4097", "-1", "abc", "1.5"] {
             assert!(parse_list_page_size(value).is_err(), "accepted {value}");
         }
+    }
+
+    #[test]
+    fn list_page_size_validation_protects_direct_callers() {
+        assert!(validate_list_page_size(1).is_ok());
+        assert!(validate_list_page_size(MAX_LIST_PAGE_SIZE).is_ok());
+        assert!(validate_list_page_size(0).is_err());
+        assert!(validate_list_page_size(MAX_LIST_PAGE_SIZE + 1).is_err());
     }
 
     #[test]
