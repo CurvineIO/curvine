@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use curvine_core_error::{err_box, CommonResult};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DirAgg {
@@ -78,4 +79,56 @@ pub enum ScanAbortReason {
     MaxDirs { limit: u64, observed: u64 },
     MaxDepth { limit: u32, observed: u32 },
     Overflow,
+}
+
+/// Where a served content-summary result came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotSource {
+    /// Full-namespace snapshot built by the global scanner.
+    Global,
+    /// Snapshot rooted at a tracked point (mount or configured path).
+    TrackedPoint,
+    /// A single file resolved live from the inode tree (no snapshot behind it).
+    LiveFile,
+    /// Client-side recursive fallback built by the CLI.
+    LiveRecursive,
+}
+
+impl SnapshotSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SnapshotSource::Global => "GLOBAL",
+            SnapshotSource::TrackedPoint => "TRACKED_POINT",
+            SnapshotSource::LiveFile => "LIVE_FILE",
+            SnapshotSource::LiveRecursive => "LIVE_RECURSIVE",
+        }
+    }
+}
+
+/// Metadata of one published immutable generation.
+///
+/// `generation` is assigned by the snapshot store inside the publish critical
+/// section; scanner products carry a placeholder until they are published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotMeta {
+    pub generation: u64,
+    pub started_ms: i64,
+    pub finished_ms: i64,
+    pub inode_count: u64,
+    pub edge_count: u64,
+    pub anomaly_count: u64,
+    pub degraded: bool,
+}
+
+/// An immutable, fully built dir-space generation for one subtree.
+///
+/// `entries` maps every directory inode id in the subtree (excluding
+/// `root_id`) to its recursive aggregate; the root's own aggregate is carried
+/// by the scanner output and merged into the snapshot by the publisher.
+#[derive(Debug, Clone)]
+pub struct DirSpaceSnapshot {
+    pub meta: SnapshotMeta,
+    pub root_id: i64,
+    pub source: SnapshotSource,
+    pub entries: HashMap<i64, DirAgg>,
 }
