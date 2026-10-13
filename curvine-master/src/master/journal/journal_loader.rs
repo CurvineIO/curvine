@@ -265,7 +265,26 @@ impl JournalLoader {
             return Ok(());
         }
 
-        let batch = JournalBatch::deserialize_compat(&entry.data)?;
+        let batch = match JournalBatch::deserialize_compat(&entry.data) {
+            Ok(batch) => batch,
+            Err(e) if self.ignore_reply_error => {
+                error!(
+                    "skip failed journal batch deserialization, entry index={}, term={}, error={}",
+                    entry.index, entry.term, e
+                );
+                let mut applied = if is_leader {
+                    cur.ufs_applied
+                } else {
+                    cur.applied
+                };
+                applied.term = entry.term;
+                applied.index = entry.index;
+                self.set_applied(is_leader, applied, false)?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+
         let batch_len = batch.len();
         let mut snapshot = None;
         let mut applied = Self::build_applied(entry);
