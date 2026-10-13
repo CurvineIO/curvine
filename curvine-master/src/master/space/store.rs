@@ -127,6 +127,13 @@ impl DirSpaceSnapshotStore {
         self.inner.read().points.get(root_path).cloned()
     }
 
+    /// Snapshot of the currently published tracked points (path -> newest
+    /// generation). Used by the manager to select point candidates and by
+    /// metrics aggregation; the returned snapshots are immutable.
+    pub fn points(&self) -> HashMap<String, Arc<DirSpaceSnapshot>> {
+        self.inner.read().points.clone()
+    }
+
     /// Resolves a query against the published snapshots.
     ///
     /// `validated_point_path` must be the normalized tracked-point path that

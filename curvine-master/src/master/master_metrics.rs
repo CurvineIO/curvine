@@ -96,6 +96,22 @@ pub struct MasterMetrics {
     pub(crate) compat_client_verdict: GaugeVec,
     // Total number of enforce-mode rejections, labelled by component and verdict.
     pub(crate) compat_enforce_rejected_total: CounterVec,
+
+    // Dir-space snapshot observability (design doc §12). Point gauges are
+    // aggregates over all tracked points — never per-path labels.
+    pub(crate) dir_space_global_ready: Gauge,
+    pub(crate) dir_space_global_generation: Gauge,
+    pub(crate) dir_space_global_age_seconds: Gauge,
+    pub(crate) dir_space_global_entries: Gauge,
+    pub(crate) dir_space_points_configured: Gauge,
+    pub(crate) dir_space_points_ready: Gauge,
+    pub(crate) dir_space_points_oldest_age_seconds: Gauge,
+    pub(crate) dir_space_points_entries: Gauge,
+    pub(crate) dir_space_scan_duration_ms: HistogramVec,
+    pub(crate) dir_space_scan_total: CounterVec,
+    pub(crate) dir_space_scan_inodes: GaugeVec,
+    pub(crate) dir_space_scan_edges: GaugeVec,
+    pub(crate) dir_space_scan_anomalies: GaugeVec,
 }
 
 impl MasterMetrics {
@@ -261,6 +277,63 @@ impl MasterMetrics {
                 "compat_enforce_rejected_total",
                 "Total number of enforce-mode compatibility rejections, labelled by component and verdict",
                 &["component", "verdict"],
+            )?,
+            dir_space_global_ready: m::new_gauge(
+                "dir_space_global_ready",
+                "1 when a complete global dir-space snapshot has been published",
+            )?,
+            dir_space_global_generation: m::new_gauge(
+                "dir_space_global_generation",
+                "Generation of the current global dir-space snapshot",
+            )?,
+            dir_space_global_age_seconds: m::new_gauge(
+                "dir_space_global_age_seconds",
+                "Age in seconds of the current global dir-space snapshot, refreshed by the coordinator tick",
+            )?,
+            dir_space_global_entries: m::new_gauge(
+                "dir_space_global_entries",
+                "Directory aggregation entries in the current global dir-space snapshot",
+            )?,
+            dir_space_points_configured: m::new_gauge(
+                "dir_space_points_configured",
+                "Number of tracked dir-space points currently configured",
+            )?,
+            dir_space_points_ready: m::new_gauge(
+                "dir_space_points_ready",
+                "Number of tracked dir-space points with a published generation",
+            )?,
+            dir_space_points_oldest_age_seconds: m::new_gauge(
+                "dir_space_points_oldest_age_seconds",
+                "Age in seconds of the oldest published tracked-point snapshot",
+            )?,
+            dir_space_points_entries: m::new_gauge(
+                "dir_space_points_entries",
+                "Total directory aggregation entries across all tracked-point snapshots",
+            )?,
+            dir_space_scan_duration_ms: m::new_histogram_vec(
+                "dir_space_scan_duration_ms",
+                "Dir-space scan duration in milliseconds, labelled by scope and result",
+                &["scope", "result"],
+            )?,
+            dir_space_scan_total: m::new_counter_vec(
+                "dir_space_scan_total",
+                "Dir-space scan round outcomes, labelled by scope and result (success/failed/timeout/limit/role_lost/busy)",
+                &["scope", "result"],
+            )?,
+            dir_space_scan_inodes: m::new_gauge_vec(
+                "dir_space_scan_inodes",
+                "Inodes processed by the last successful dir-space scan round, labelled by scope",
+                &["scope"],
+            )?,
+            dir_space_scan_edges: m::new_gauge_vec(
+                "dir_space_scan_edges",
+                "Edges processed by the last successful dir-space scan round, labelled by scope",
+                &["scope"],
+            )?,
+            dir_space_scan_anomalies: m::new_gauge_vec(
+                "dir_space_scan_anomalies",
+                "Anomalies recorded by the last successful dir-space scan round, labelled by scope",
+                &["scope"],
             )?,
         };
 

@@ -31,6 +31,7 @@ use crate::master::fs::{FsRetryCache, MasterActor, MasterFilesystem};
 use crate::master::journal::JournalSystem;
 use crate::master::metrics_server::{wait_for_metrics_bind, MasterMetricsServer};
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
+use crate::master::space::DirSpaceManager;
 use crate::master::{JobHandler, MountManager};
 use crate::master::{JobManager, MasterHandler};
 use crate::master::{MasterMetrics, MasterMonitor, SyncWorkerManager};
@@ -52,6 +53,8 @@ pub struct MasterService {
     metrics: &'static MasterMetrics,
     pub fault_http: FaultHttpControl,
     runtime_config: Arc<RuntimeConfigRegistry>,
+    /// Shared dir-space query facade; `None` when the feature is disabled.
+    pub dir_space_manager: Option<Arc<DirSpaceManager>>,
 }
 
 impl MasterService {
@@ -67,6 +70,7 @@ impl MasterService {
         metrics: &'static MasterMetrics,
         fault_http: FaultHttpControl,
         runtime_config: Arc<RuntimeConfigRegistry>,
+        dir_space_manager: Option<Arc<DirSpaceManager>>,
     ) -> Self {
         let actor_rt = Arc::new(AsyncRuntime::new(
             "master-actor",
@@ -89,6 +93,7 @@ impl MasterService {
             metrics,
             fault_http,
             runtime_config,
+            dir_space_manager,
         }
     }
 
@@ -179,12 +184,26 @@ impl Master {
         let rt = Arc::new(conf.master_server_conf().create_runtime());
         let replication_manager = MasterReplicationManager::new(&fs, &conf, &rt, &worker_manager)?;
 
+        // The dir-space manager owns the snapshot store and query facade; the
+        // master actor drives its scans, the RPC handler (Task 8) serves its
+        // queries. Built once here so both sides observe the same generations.
+        let dir_space_manager = if conf.master.dir_space_enabled {
+            Some(Arc::new(DirSpaceManager::new(
+                fs.clone(),
+                mount_manager.clone(),
+                Arc::new(conf.master.clone()),
+            )))
+        } else {
+            None
+        };
+
         let actor = MasterActor::new(
             fs.clone(),
             journal_system.master_monitor(),
             conf.master.new_executor(),
             &replication_manager,
             quota_manager,
+            dir_space_manager.clone(),
         );
 
         // step 3: Create rpc server.
@@ -204,6 +223,7 @@ impl Master {
             metrics,
             fault_http,
             runtime_config.clone(),
+            dir_space_manager,
         );
 
         let rpc_conf = conf.master_server_conf();
@@ -266,6 +286,7 @@ impl Master {
 
         self.actor.start()?;
         self.mount_manager.restore_best_effort();
+        self.actor.start_dir_space_scheduler()?;
         self.job_manager.start()?;
 
         if let Err(e) = self.actor.start_ttl_scheduler() {

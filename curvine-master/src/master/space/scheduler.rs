@@ -1,0 +1,138 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Active-only dir-space coordinator task.
+//!
+//! One `dir-space-coordinator` loop ticks every second (well below the
+//! configured scan intervals) and drives the [`DirSpaceManager`]:
+//!
+//! - Scans only fire while the master is active; standby ticks do nothing.
+//! - A standby → active transition pulls the global next-due forward to now,
+//!   so a newly promoted master scans immediately instead of waiting a full
+//!   interval (design doc §9).
+//! - A round whose previous attempt is still in flight (long scan) reports
+//!   `Busy` on the manager permit and leaves the next-due untouched.
+//! - Metrics ages (global snapshot age) are refreshed on each tick.
+
+use std::time::Instant;
+
+use curvine_error::FsError;
+use curvine_runtime::runtime::LoopTask;
+
+use crate::master::space::manager::{DirSpaceManager, ScanOutcome};
+use crate::master::MasterMonitor;
+
+#[allow(dead_code)]
+fn _assert_send_sync<T: Send + Sync>() {}
+
+#[allow(dead_code)]
+fn _task_is_send() {
+    _assert_send_sync::<DirSpaceCoordinatorTask>();
+}
+
+/// Coordinator tick interval: 1 second, per design doc §9.
+pub const COORDINATOR_TICK_MS: u64 = 1000;
+
+pub struct DirSpaceCoordinatorTask {
+    manager: std::sync::Arc<DirSpaceManager>,
+    monitor: MasterMonitor,
+    global_interval_ms: u64,
+    /// Last-tick active state, used to detect standby → active transitions.
+    was_active: std::sync::atomic::AtomicBool,
+    /// Monotonic instant of the next allowed global round.
+    global_next_due: std::sync::Mutex<Instant>,
+}
+
+impl DirSpaceCoordinatorTask {
+    pub fn new(manager: std::sync::Arc<DirSpaceManager>, monitor: MasterMonitor) -> Self {
+        let global_interval_ms = manager.interval_ms();
+        Self {
+            manager,
+            monitor,
+            global_interval_ms,
+            was_active: std::sync::atomic::AtomicBool::new(false),
+            global_next_due: std::sync::Mutex::new(Instant::now()),
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.monitor.is_active()
+    }
+
+    /// One scheduler tick: promote next-due on standby→active, then run a
+    /// global round when due. Point rounds are added by Task 6 on the same
+    /// coordinator.
+    fn tick(&self) {
+        let active = self.active();
+        let was_active = self
+            .was_active
+            .swap(active, std::sync::atomic::Ordering::SeqCst);
+
+        let mut next_due = self.global_next_due.lock().unwrap();
+        if active && !was_active {
+            // Newly promoted (or first active tick): scan immediately.
+            *next_due = Instant::now();
+        }
+        if !active {
+            return;
+        }
+
+        // Snapshot ages and point aggregates are refreshed every tick (§12).
+        self.manager.refresh_global_age();
+        self.manager.refresh_point_metrics();
+
+        if Instant::now() < *next_due {
+            return;
+        }
+
+        match self.manager.try_scan_global() {
+            ScanOutcome::Success => {
+                *next_due =
+                    Instant::now() + std::time::Duration::from_millis(self.global_interval_ms);
+            }
+            ScanOutcome::Busy => {
+                // A round is still in flight from a previous tick; retry soon
+                // without shifting the schedule.
+            }
+            ScanOutcome::RoleLost => {
+                // Role dropped mid-scheduling; the next active transition
+                // resets the due time.
+            }
+            ScanOutcome::Disabled => {
+                // Feature off: park the due time far ahead so ticks stay cheap.
+                *next_due =
+                    Instant::now() + std::time::Duration::from_millis(self.global_interval_ms);
+            }
+            ScanOutcome::Failed | ScanOutcome::Timeout | ScanOutcome::Limit => {
+                // Keep the regular cadence; the failed round left the previous
+                // generation queryable.
+                *next_due =
+                    Instant::now() + std::time::Duration::from_millis(self.global_interval_ms);
+            }
+        }
+    }
+}
+
+impl LoopTask for DirSpaceCoordinatorTask {
+    type Error = FsError;
+
+    fn run(&self) -> Result<(), FsError> {
+        self.tick();
+        Ok(())
+    }
+
+    fn terminate(&self) -> bool {
+        self.monitor.is_stop()
+    }
+}

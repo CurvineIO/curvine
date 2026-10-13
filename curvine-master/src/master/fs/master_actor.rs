@@ -20,6 +20,7 @@ use crate::master::meta::inode::ttl::TtlHeartbeatConfig;
 use crate::master::meta::inode::ttl::{InodeTtlExecutor, InodeTtlManager};
 use crate::master::quota::QuotaManager;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
+use crate::master::space::{DirSpaceCoordinatorTask, DirSpaceManager, COORDINATOR_TICK_MS};
 use crate::master::MasterMonitor;
 use curvine_core_error::CommonResult;
 use curvine_runtime::runtime::GroupExecutor;
@@ -33,6 +34,7 @@ pub struct MasterActor {
     pub executor: Arc<GroupExecutor>,
     pub replication_manager: Arc<MasterReplicationManager>,
     pub quota_manager: Arc<QuotaManager>,
+    pub dir_space_manager: Option<Arc<DirSpaceManager>>,
 }
 
 impl MasterActor {
@@ -47,6 +49,7 @@ impl MasterActor {
         executor: Arc<GroupExecutor>,
         replication_manager: &Arc<MasterReplicationManager>,
         quota_manager: Arc<QuotaManager>,
+        dir_space_manager: Option<Arc<DirSpaceManager>>,
     ) -> Self {
         Self {
             fs,
@@ -54,6 +57,7 @@ impl MasterActor {
             executor,
             replication_manager: replication_manager.clone(),
             quota_manager,
+            dir_space_manager,
         }
     }
 
@@ -147,6 +151,26 @@ impl MasterActor {
         );
 
         scheduler.start(task)?;
+        Ok(())
+    }
+
+    /// Start the dir-space coordinator loop.
+    ///
+    /// Called after `mount_manager.restore_best_effort()` so the first scan
+    /// sees the recovered mount table. The coordinator itself only schedules;
+    /// it re-checks `is_active()` on every tick and per scan cooperative
+    /// check, so it is safe to start before the role is fully known.
+    pub fn start_dir_space_scheduler(&self) -> CommonResult<()> {
+        let Some(manager) = self.dir_space_manager.as_ref() else {
+            return Ok(());
+        };
+        let task = DirSpaceCoordinatorTask::new(manager.clone(), self.master_monitor.clone());
+        let scheduler = ScheduledExecutor::new("dir-space-coordinator", COORDINATOR_TICK_MS);
+        scheduler.start(task)?;
+        info!(
+            "dir-space coordinator started, tick {} ms",
+            COORDINATOR_TICK_MS
+        );
         Ok(())
     }
 }

@@ -1130,6 +1130,20 @@ impl FsDir {
         &self.store.store
     }
 
+    /// Read-only access to the inode store for snapshot scan coordination.
+    pub fn store_ref(&self) -> &InodeStore {
+        &self.store
+    }
+
+    /// Acquire a metadata snapshot scan lease against the current store.
+    ///
+    /// The lease holds an `Arc` clone of the RocksDB store so the scan reads
+    /// one consistent generation; a pending Raft snapshot restore cancels the
+    /// lease (or rejects acquisition) so it never blocks restore indefinitely.
+    pub fn begin_snapshot_scan(&self) -> CommonResult<crate::master::space::MetadataScanLease> {
+        self.store.begin_snapshot_scan()
+    }
+
     pub fn delete_locations(&self, worker_id: u32) -> FsResult<Vec<i64>> {
         let block_ids = self.store.store.delete_locations(worker_id)?;
         Ok(block_ids)
