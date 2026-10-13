@@ -257,6 +257,7 @@ impl Cluster {
                 raft_max_election_ticks: 60,
                 snapshot_interval: "1h".into(),
                 snapshot_entries: 1_000_000,
+                retain_checkpoint_num: 0,
                 conn_timeout_ms: 500,
                 io_timeout_ms: 2000,
                 ..Default::default()
