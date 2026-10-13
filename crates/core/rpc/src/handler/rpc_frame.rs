@@ -267,11 +267,7 @@ impl Frame for RpcFrame {
                         None
                     };
                     let data = self.read_data(data_size).await?;
-                    let msg = Message {
-                        protocol,
-                        header,
-                        data,
-                    };
+                    let mut msg = Message::new(protocol, header, data);
 
                     let _ = mem::replace(&mut state, FrameSate::Head);
 
@@ -279,6 +275,7 @@ impl Frame for RpcFrame {
                     if msg.is_heartbeat() {
                         continue;
                     } else {
+                        msg.set_time();
                         return Ok(msg);
                     }
                 }

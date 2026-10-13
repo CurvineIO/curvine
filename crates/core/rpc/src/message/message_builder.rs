@@ -151,11 +151,7 @@ impl MessageBuilder {
             seq_id: self.seq_id,
         };
 
-        Message {
-            protocol,
-            header: self.header,
-            data: self.data,
-        }
+        Message::new(protocol, self.header, self.data)
     }
 }
 

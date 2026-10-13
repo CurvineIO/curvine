@@ -79,6 +79,7 @@ pub struct RpcContext<'a> {
     pub msg: &'a Message,
     pub code: RpcCode,
     pub spent: TimeSpent,
+    pub queue_us: Option<u64>,
     pub audit_src: Option<String>,
     pub audit_dst: Option<String>,
     client_context: Option<ClientContextProto>,
@@ -92,6 +93,7 @@ impl<'a> RpcContext<'a> {
             msg,
             code,
             spent: TimeSpent::new(),
+            queue_us: msg.time.map(|t| t.elapsed().as_micros() as u64),
             audit_src: None,
             audit_dst: None,
             client_context,
@@ -145,12 +147,13 @@ impl<'a> RpcContext<'a> {
             Ok(_) => Cow::Borrowed(""),
         };
         format!(
-            "cmd={} ok={} ip={} src={} dst={} usedUs={}{}{}",
+            "cmd={} ok={} ip={} src={} dst={} queueUs={} usedUs={}{}{}",
             self.code,
             res.is_ok(),
             ip,
             src,
             dst,
+            self.queue_us.unwrap_or(0),
             used_us,
             context_suffix,
             err_suffix,
@@ -240,7 +243,7 @@ mod tests {
         let line = ctx.format_audit_log(&Ok(()), 123, None);
         assert_eq!(
             line,
-            "cmd=GetBlockLocations ok=true ip= src= dst= usedUs=123"
+            "cmd=GetBlockLocations ok=true ip= src= dst= queueUs=0 usedUs=123"
         );
     }
 
