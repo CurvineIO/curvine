@@ -275,12 +275,6 @@ RUN ARCH=$(uname -m) && \
     esac && \
     ldconfig
 
-# Copy JindoSDK from builder stage for OSS-HDFS support
-COPY --from=builder /opt/jindosdk /opt/jindosdk
-
-ENV JINDOSDK_HOME=/opt/jindosdk
-ENV LD_LIBRARY_PATH="${JINDOSDK_HOME}/lib/native:${JINDOSDK_HOME}/lib"
-
 # Create curvine directories
 RUN mkdir -p /app/curvine \
     && mkdir -p /opt/curvine/data/{meta,journal} \

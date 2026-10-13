@@ -707,9 +707,20 @@ feature_list() {
   echo "$*"
 }
 
-# JindoSDK-backed builds need a package-relative RPATH: curvine-fuse and curvine-cli link
-# libjindosdk_c.so.6 out of `<home>/jindosdk/lib/native`, and a bare binary run (no
-# sourced `conf/curvine-env.sh`, e.g. under `sudo` with env_reset) still has to resolve it.
+has_oss_hdfs_feature() {
+  local feature
+  for feature in "$@"; do
+    case "$feature" in
+      oss-hdfs|*/oss-hdfs)
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+# JindoSDK-backed binaries link libjindosdk_c.so.6. Stage that library beside
+# the binaries in `<home>/lib` and resolve it through a package-relative RPATH.
 # Tied to the oss-hdfs feature so builds without JindoSDK are left untouched.
 client_rpath_rustflags() {
   local -a features=("$@")
@@ -718,15 +729,13 @@ client_rpath_rustflags() {
     return 0
   fi
 
-  if [[ " $(feature_list "${features[@]}") " != *"oss-hdfs"* ]]; then
+  if ! has_oss_hdfs_feature "${features[@]}"; then
     return 0
   fi
 
   # $ORIGIN is the directory holding the binary (<home>/lib). Escaping keeps the
   # literal `$ORIGIN` for the dynamic loader instead of expanding it in shell.
   printf '%s' "-C link-arg=-Wl,-rpath,\$ORIGIN"
-  printf ' %s' "-C link-arg=-Wl,-rpath,\$ORIGIN/../jindosdk/lib/native"
-  printf ' %s' "-C link-arg=-Wl,-rpath,\$ORIGIN/../jindosdk/lib"
 }
 
 build_rust_packages() {
@@ -891,6 +900,46 @@ verify_jindo_soname() {
     echo "Error: JindoSDK SONAME must be libjindosdk_c.so.6, got ${soname:-missing}: $library" >&2
     exit 1
   fi
+}
+
+stage_jindo_runtime() {
+  local jindo_home="$1"
+  local target_dir="$2"
+  local library=""
+  local candidate
+  local -a candidates=()
+
+  case "$ARCH_NAME" in
+    x86_64)
+      candidates+=("$jindo_home/lib/native/libjindosdk_c_x86.so" "$jindo_home/lib/libjindosdk_c_x86.so")
+      ;;
+    aarch_64)
+      candidates+=("$jindo_home/lib/native/libjindosdk_c_aarch.so" "$jindo_home/lib/libjindosdk_c_aarch.so")
+      ;;
+  esac
+  candidates+=(
+    "$jindo_home/lib/native/libjindosdk_c.so.6"
+    "$jindo_home/lib/native/libjindosdk_c.so"
+    "$jindo_home/lib/libjindosdk_c.so.6"
+    "$jindo_home/lib/libjindosdk_c.so"
+  )
+
+  for candidate in "${candidates[@]}"; do
+    if [ -f "$candidate" ]; then
+      library="$(readlink -f "$candidate")"
+      break
+    fi
+  done
+  if [ -z "$library" ]; then
+    echo "Error: could not find a JindoSDK C runtime library under ${jindo_home}" >&2
+    exit 1
+  fi
+
+  verify_jindo_soname "$library"
+  mkdir -p "$target_dir"
+  cp -Lf "$library" "$target_dir/$(basename "$library")"
+  ln -sfn "$(basename "$library")" "$target_dir/libjindosdk_c.so.6"
+  echo "Packaged JindoSDK runtime: $(basename "$library") -> libjindosdk_c.so.6"
 }
 
 prepare_java_native_dependencies() {
@@ -1241,34 +1290,8 @@ for target in "${COPY_TARGETS[@]}"; do
   cp -f "$FS_HOME"/target/${TARGET_DIR}/${target} "$DIST_DIR"/lib
 done
 
-# JindoSDK-backed client builds: the binaries carry a package-relative RPATH
-# pointing at `<home>/jindosdk/lib/native`, but RPATH only tells the loader where
-# to look - the library still has to be in the package. Bundle it here (and wire
-# the same path into the packaged env script) whenever oss-hdfs was requested, so
-# a plain `build.sh` tree is already self-contained and no manual packaging step
-# can be forgotten.
-if printf '%s\n' "${CLIENT_FEATURES[@]}" | grep -qx 'curvine-client/oss-hdfs'; then
-  jindo_home="${JINDOSDK_HOME:-/opt/jindosdk}"
-  if [ -d "$jindo_home" ]; then
-    echo "Bundling JindoSDK from ${jindo_home} into ${DIST_DIR}/jindosdk ..."
-    mkdir -p "$DIST_DIR/jindosdk"
-    cp -a "$jindo_home"/. "$DIST_DIR/jindosdk/"
-
-    env_file="$DIST_DIR/conf/curvine-env.sh"
-    if [ -f "$env_file" ] && ! grep -q 'CURVINE_SELF_CONTAINED_DEPS' "$env_file"; then
-      cat >> "$env_file" <<'CURVINE_JINDO_ENV'
-
-# CURVINE_SELF_CONTAINED_DEPS
-# Appended automatically for oss-hdfs builds: package-local JindoSDK and libs.
-export JINDOSDK_HOME="${JINDOSDK_HOME:-$CURVINE_HOME/jindosdk}"
-export LD_LIBRARY_PATH="$CURVINE_HOME/lib:$JINDOSDK_HOME/lib/native:$JINDOSDK_HOME/lib:${LD_LIBRARY_PATH:-}"
-CURVINE_JINDO_ENV
-      echo "Appended package-local JindoSDK env to ${env_file}"
-    fi
-  else
-    echo "Warning: oss-hdfs was requested but JindoSDK is missing at ${jindo_home};" >&2
-    echo "         ${DIST_DIR}/lib/curvine-fuse will not resolve libjindosdk_c.so.6" >&2
-  fi
+if has_oss_hdfs_feature "${SERVER_FEATURES[@]}" "${CLIENT_FEATURES[@]}" "${CLI_FEATURES[@]}"; then
+  stage_jindo_runtime "${JINDOSDK_HOME:-/opt/jindosdk}" "$DIST_DIR/lib"
 fi
 
 echo "Checking minimal client artifact runtime dependencies ..."
