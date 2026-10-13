@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::client::{ClientConf, ClientFactory, RpcClient, SyncClient};
+use crate::client::{ClientConf, ClientFactory, RpcClient};
 use crate::message::{Message, MessageBuilder, RefMessage};
 use curvine_core_error::{CommonError, ErrorExt};
 use curvine_io::{IOError, IOResult};
@@ -99,9 +99,9 @@ impl ClusterConnector {
         self.factory.get(&addr.addr).await
     }
 
-    pub fn create_sync_with_id(&self, id: u64) -> IOResult<SyncClient> {
+    pub async fn create_client_with_id(&self, id: u64, buffer: bool) -> IOResult<RpcClient> {
         let addr = self.get_addr(id)?;
-        self.factory.create_sync(&addr.addr)
+        self.factory.create(&addr.addr, buffer).await
     }
 
     pub fn get_addr(&self, id: u64) -> IOResult<Arc<NodeAddr>> {
@@ -138,7 +138,7 @@ impl ClusterConnector {
         &self.factory.conf
     }
 
-    fn get_addr_string(&self, id: u64) -> String {
+    pub fn get_addr_string(&self, id: u64) -> String {
         self.group
             .get(&id)
             .map(|x| x.addr.to_string())

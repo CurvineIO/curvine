@@ -14,21 +14,21 @@
 
 use crate::proto::raft::{SnapshotDownloadRequest, SnapshotDownloadResponse, SnapshotFileInfo};
 use crate::raft::{RaftCode, RaftError, RaftResult};
-use curvine_rpc::client::SyncClient;
+use curvine_net::net::InetAddr;
+use curvine_rpc::client::RpcClient;
 use curvine_rpc::message::{Builder, Message, RequestStatus};
 use curvine_runtime::common::Utils;
 
 // Snapshot data download client service.
-// Change the customer service side to synchronous operation.
 pub struct SnapshotClient {
     dir: String,
     file: SnapshotFileInfo,
     req_id: i64,
-    client: SyncClient,
+    client: RpcClient,
 }
 
 impl SnapshotClient {
-    pub fn new(dir: impl Into<String>, file: SnapshotFileInfo, client: SyncClient) -> Self {
+    pub fn new(dir: impl Into<String>, file: SnapshotFileInfo, client: RpcClient) -> Self {
         Self {
             dir: dir.into(),
             file,
@@ -38,7 +38,11 @@ impl SnapshotClient {
     }
 
     // Request to download the snapshot file.
-    pub fn open_file(&self, seq_id: i32, offset: u64) -> RaftResult<SnapshotDownloadResponse> {
+    pub async fn open_file(
+        &self,
+        seq_id: i32,
+        offset: u64,
+    ) -> RaftResult<SnapshotDownloadResponse> {
         let header = SnapshotDownloadRequest {
             dir: self.dir.clone(),
             snapshot_file: self.file.clone(),
@@ -52,14 +56,14 @@ impl SnapshotClient {
             .proto_header(header)
             .build();
 
-        let rep_msg = self.client.rpc(msg)?;
+        let rep_msg = self.client.rpc(msg).await?;
         rep_msg.check_error_ext::<RaftError>()?;
         let rep_header: SnapshotDownloadResponse = rep_msg.parse_header()?;
         Ok(rep_header)
     }
 
     // Read snapshot data.
-    pub fn read_data(&self, seq_id: i32) -> RaftResult<Message> {
+    pub async fn read_data(&self, seq_id: i32) -> RaftResult<Message> {
         let msg = Builder::new()
             .code(RaftCode::SnapshotDownload)
             .request(RequestStatus::Running)
@@ -67,13 +71,13 @@ impl SnapshotClient {
             .seq_id(seq_id)
             .build();
 
-        let rep_msg = self.client.rpc(msg)?;
+        let rep_msg = self.client.rpc(msg).await?;
         rep_msg.check_error_ext::<RaftError>()?;
         Ok(rep_msg)
     }
 
     // Snapshot file reading is completed
-    pub fn close_file(&self, seq_id: i32) -> RaftResult<()> {
+    pub async fn close_file(&self, seq_id: i32) -> RaftResult<()> {
         let msg = Builder::new()
             .code(RaftCode::SnapshotDownload)
             .request(RequestStatus::Complete)
@@ -81,7 +85,7 @@ impl SnapshotClient {
             .seq_id(seq_id)
             .build();
 
-        let rep_msg = self.client.rpc(msg)?;
+        let rep_msg = self.client.rpc(msg).await?;
         rep_msg.check_error_ext::<RaftError>()?;
         Ok(())
     }
@@ -92,5 +96,9 @@ impl SnapshotClient {
 
     pub fn file_path(&self) -> &str {
         &self.file.path
+    }
+
+    pub fn remote_addr(&self) -> &InetAddr {
+        self.client.remote_addr()
     }
 }

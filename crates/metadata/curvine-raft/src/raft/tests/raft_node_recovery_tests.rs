@@ -43,6 +43,7 @@ fn test_node(rt: Arc<Runtime>) -> RaftNode<MemLogStorage, HashAppStorage<String,
         .unwrap();
     let storage = PeerStorage::new(
         rt.clone(),
+        id,
         log_store,
         HashAppStorage::new(),
         client.clone(),

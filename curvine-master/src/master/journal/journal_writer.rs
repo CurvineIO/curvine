@@ -595,8 +595,8 @@ mod tests {
     fn skips_checkpoint_when_raft_group_has_multiple_nodes() -> FsResult<()> {
         let mut conf = test_conf("snapshot_multi_node");
         conf.journal.journal_addrs = raft_group(&conf, 3);
-        // The compat default is true; None must fall back to single-node-only creation.
-        conf.journal.leader_create_snapshot = None;
+        // Default is None, so a multi-node raft group must fall back to
+        // single-node-only creation and skip the leader checkpoint.
         let writer = Arc::new(build_writer(&conf)?);
         let fs_dir = build_fs_dir(&conf, writer.clone())?;
 

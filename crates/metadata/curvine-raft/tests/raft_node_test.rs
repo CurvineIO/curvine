@@ -16,13 +16,14 @@
 
 use curvine_core_error::CommonResult;
 use curvine_raft::conf::JournalConf;
-use curvine_raft::proto::raft::{FsmState, SnapshotData};
+use curvine_raft::proto::raft::{FsmState, SnapshotData, SnapshotFileInfo, SnapshotFileList};
+use curvine_raft::raft::snapshot::SnapshotFetcher;
 use curvine_raft::raft::storage::{
-    AppStorage, ApplyMsg, HashAppStorage, LogStorage, MemLogStorage, RocksAppStorage,
+    AppStorage, ApplyMsg, HashAppStorage, LogStorage, MemLogStorage, PeerStorage, RocksAppStorage,
     RocksLogStorage,
 };
 use curvine_raft::raft::{
-    RaftClient, RaftCode, RaftError, RaftJournal, RaftNode, RaftResult, RoleMonitor,
+    RaftClient, RaftCode, RaftError, RaftGroup, RaftJournal, RaftNode, RaftResult, RoleMonitor,
 };
 use curvine_raft::utils::SerdeUtils;
 use curvine_rpc::client::{ClientConf, RpcClient};
@@ -564,13 +565,23 @@ fn install_snapshot_skips_empty_app_snapshot_when_applied_index_nonzero() -> Com
     // snapshot, but AppStorage already has applied.index > 0. install_snapshot
     // must skip app_store.apply_snapshot(empty) so local metadata is preserved.
     let rt = JournalConf::with_test().create_runtime();
+    let conf = JournalConf::with_test();
     let app = PopulatedRefuseEmptySnapshotAppStorage::with_applied_index(7);
+    let group = RaftGroup::from_conf(&conf);
+    let client = RaftClient::new(rt.clone(), &group, conf.new_client_conf());
+    let storage = PeerStorage::new(
+        rt.clone(),
+        1,
+        NoSnapshotLogStorage,
+        app.clone(),
+        client,
+        &conf,
+    );
 
-    let index = rt.block_on(RaftNode::<NoSnapshotLogStorage, _>::install_snapshot(
-        &NoSnapshotLogStorage,
-        &app,
-        vec![1],
-    ))?;
+    let index = rt.block_on(RaftNode::<
+        NoSnapshotLogStorage,
+        PopulatedRefuseEmptySnapshotAppStorage,
+    >::install_snapshot(&storage, vec![1]))?;
 
     assert_eq!(index, 7);
     assert_eq!(
@@ -754,5 +765,295 @@ fn empty_static_voter_panics_on_leader_commit_above_local_last_index() -> Common
         "raft-rs must reject commit 10 when the local voter has last_index 0"
     );
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot reporting (follower -> leader) and locality-aware fetch on restart.
+// ---------------------------------------------------------------------------
+
+/// Build a reported snapshot owned by `node_id` at applied `index`.
+fn reported_snapshot(index: u64, node_id: u64) -> SnapshotData {
+    let mut fsm = FsmState::default();
+    fsm.applied.index = index;
+    SnapshotData {
+        snapshot_id: index,
+        node_id,
+        fsm_state: fsm,
+        ..Default::default()
+    }
+}
+
+fn remote_files() -> SnapshotFileList {
+    SnapshotFileList {
+        dir: "/remote/snapshot".to_string(),
+        files: vec![SnapshotFileInfo {
+            path: "checkpoint.db".to_string(),
+            mtime: 0,
+            ctime: 0,
+            len: 16,
+        }],
+    }
+}
+
+/// The leader registers the first follower report and remembers the owner so a
+/// later restart knows the snapshot files live on another member.
+#[test]
+fn register_snapshot_accepts_first_report_and_records_owner() {
+    let log = MemLogStorage::new();
+
+    assert!(log.register_snapshot(reported_snapshot(5, 2)).unwrap());
+
+    let latest = log
+        .latest_snapshot()
+        .unwrap()
+        .expect("reported snapshot must be registered");
+    assert_eq!(latest.get_metadata().index, 5);
+    let data = SnapshotData::decode(latest.get_data()).unwrap();
+    assert_eq!(
+        data.node_id, 2,
+        "leader must remember the reporting follower"
+    );
+}
+
+/// A stale or equal-index report must never overwrite the registered snapshot.
+#[test]
+fn register_snapshot_rejects_stale_or_equal_index() {
+    let log = MemLogStorage::new();
+    assert!(log.register_snapshot(reported_snapshot(5, 2)).unwrap());
+
+    // Older snapshot from another follower.
+    assert!(!log.register_snapshot(reported_snapshot(3, 3)).unwrap());
+    // Same index is not newer, so it must not replace the current owner.
+    assert!(!log.register_snapshot(reported_snapshot(5, 3)).unwrap());
+
+    let latest = log.latest_snapshot().unwrap().unwrap();
+    assert_eq!(latest.get_metadata().index, 5);
+    assert_eq!(
+        SnapshotData::decode(latest.get_data()).unwrap().node_id,
+        2,
+        "stale reports must not change the registered owner"
+    );
+}
+
+/// A strictly newer report replaces the registered snapshot and its owner.
+#[test]
+fn register_snapshot_accepts_newer_index() {
+    let log = MemLogStorage::new();
+    assert!(log.register_snapshot(reported_snapshot(5, 2)).unwrap());
+
+    assert!(log.register_snapshot(reported_snapshot(7, 3)).unwrap());
+
+    let latest = log.latest_snapshot().unwrap().unwrap();
+    assert_eq!(latest.get_metadata().index, 7);
+    assert_eq!(SnapshotData::decode(latest.get_data()).unwrap().node_id, 3);
+}
+
+fn test_client(conf: &JournalConf, rt: Arc<Runtime>) -> RaftClient {
+    let group = RaftGroup::from_conf(conf);
+    RaftClient::new(rt, &group, conf.new_client_conf())
+}
+
+/// A snapshot this member owns is used directly, without any download.
+#[test]
+fn snapshot_fetcher_treats_matching_node_as_local() {
+    let conf = JournalConf::with_test();
+    let rt = conf.create_runtime();
+    let app = PopulatedRefuseEmptySnapshotAppStorage::with_applied_index(0);
+    let mut data = reported_snapshot(5, 7);
+    data.files_data = Some(remote_files());
+
+    let fetcher =
+        SnapshotFetcher::new(7, &app, &conf, test_client(&conf, rt.clone()), data).unwrap();
+
+    assert!(
+        matches!(fetcher, SnapshotFetcher::Local(_)),
+        "snapshot owned by this member must not be downloaded"
+    );
+}
+
+/// A remote snapshot without a file list cannot be downloaded and must error.
+#[test]
+fn snapshot_fetcher_requires_files_for_remote_snapshot() {
+    let conf = JournalConf::with_test();
+    let rt = conf.create_runtime();
+    let app = PopulatedRefuseEmptySnapshotAppStorage::with_applied_index(0);
+    let data = reported_snapshot(5, 7); // files_data is None
+
+    let result = SnapshotFetcher::new(9, &app, &conf, test_client(&conf, rt.clone()), data);
+    let err = result
+        .err()
+        .expect("remote snapshot without files must fail to build a fetcher");
+
+    assert!(
+        err.to_string().contains("Not found snapshot data"),
+        "unexpected error: {err}"
+    );
+}
+
+/// A remote snapshot with a file list prepares a download instead of a local read.
+#[test]
+fn snapshot_fetcher_builds_download_for_remote_snapshot() {
+    let conf = JournalConf::with_test();
+    let rt = conf.create_runtime();
+    let app = PopulatedRefuseEmptySnapshotAppStorage::with_applied_index(0);
+    let mut data = reported_snapshot(5, 7);
+    data.files_data = Some(remote_files());
+
+    let fetcher =
+        SnapshotFetcher::new(9, &app, &conf, test_client(&conf, rt.clone()), data).unwrap();
+
+    assert!(
+        matches!(fetcher, SnapshotFetcher::Remote(_, _)),
+        "snapshot owned by another member must be downloaded"
+    );
+}
+
+/// AppStorage that records every snapshot applied to it and reports a fixed
+/// applied index from `create_snapshot`. It deliberately stamps `node_id: 0` so
+/// tests can prove the raft layer overwrites it with the real raft node id.
+#[derive(Clone)]
+struct RecordingSnapshotAppStorage {
+    fsm_state: Arc<Mutex<FsmState>>,
+    applied_snapshots: Arc<Mutex<Vec<SnapshotData>>>,
+}
+
+impl RecordingSnapshotAppStorage {
+    fn with_applied_index(index: u64) -> Self {
+        let mut fsm = FsmState::default();
+        fsm.applied.index = index;
+        Self {
+            fsm_state: Arc::new(Mutex::new(fsm)),
+            applied_snapshots: Arc::new(Mutex::new(vec![])),
+        }
+    }
+
+    fn applied_snapshots(&self) -> Vec<SnapshotData> {
+        self.applied_snapshots.lock().unwrap().clone()
+    }
+}
+
+impl AppStorage for RecordingSnapshotAppStorage {
+    async fn apply(&self, _: bool, msg: ApplyMsg) -> RaftResult<()> {
+        if let ApplyMsg::Scan(applied) = msg {
+            self.fsm_state.lock().unwrap().applied = applied;
+        }
+        Ok(())
+    }
+
+    fn get_fsm_state(&self) -> FsmState {
+        self.fsm_state.lock().unwrap().clone()
+    }
+
+    async fn role_change(&self, _: StateRole) -> RaftResult<()> {
+        Ok(())
+    }
+
+    async fn create_snapshot(&self) -> RaftResult<SnapshotData> {
+        // node_id is intentionally wrong (0); the raft layer must fix it.
+        Ok(SnapshotData {
+            snapshot_id: self.get_fsm_state().applied.index,
+            node_id: 0,
+            create_time: 0,
+            bytes_data: Some(Vec::new()),
+            files_data: None,
+            fsm_state: self.get_fsm_state(),
+        })
+    }
+
+    async fn apply_snapshot(&self, data: SnapshotData) -> RaftResult<()> {
+        *self.fsm_state.lock().unwrap() = data.fsm_state.clone();
+        self.applied_snapshots.lock().unwrap().push(data);
+        Ok(())
+    }
+
+    fn snapshot_dir(&self, _: u64) -> RaftResult<String> {
+        Ok(String::new())
+    }
+}
+
+/// An empty group makes `report_snapshot` fail fast (no nodes to contact), so a
+/// create-snapshot job finishes without blocking on RPC retries during tests.
+fn empty_group_client(rt: Arc<Runtime>, conf: &JournalConf, name: &str) -> RaftClient {
+    let group = RaftGroup::new(name, std::collections::HashMap::new());
+    RaftClient::new(rt, &group, conf.new_client_conf())
+}
+
+/// #5: `gen_create_snapshot_job` must overwrite the app-store `node_id` with the
+/// raft node id, so the creator later recognizes its own snapshot as local
+/// instead of re-downloading it, and the leader records the true owner.
+#[test]
+fn create_snapshot_job_stamps_raft_node_id() -> CommonResult<()> {
+    Logger::default();
+
+    let conf = JournalConf::with_test();
+    let rt = conf.create_runtime();
+    let log = MemLogStorage::new();
+    let app = RecordingSnapshotAppStorage::with_applied_index(5);
+    let client = empty_group_client(rt.clone(), &conf, "stamp-node-id");
+
+    let storage = PeerStorage::new(rt.clone(), 42, log.clone(), app.clone(), client, &conf);
+    storage.gen_create_snapshot_job()?;
+
+    // The job runs on the executor; poll until it persists the snapshot.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let stamped = loop {
+        if let Ok(Some(snap)) = log.latest_snapshot() {
+            if let Ok(data) = SnapshotData::decode(snap.get_data()) {
+                if data.node_id == 42 {
+                    break data;
+                }
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("create snapshot job did not stamp the raft node id");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+
+    assert_eq!(
+        stamped.node_id, 42,
+        "persisted snapshot must be owned by the raft node, not the app store default"
+    );
+    assert_eq!(stamped.fsm_state.applied.index, 5);
+    Ok(())
+}
+
+/// #1/#3b: on restart, a persisted snapshot this member owns is re-fetched
+/// locally (no download), stamped with the local node id, and re-applied to the
+/// app store, advancing the applied index. Covers the `Some(snapshot)` branch of
+/// `install_snapshot`, which the empty-snapshot test does not exercise.
+#[test]
+fn install_snapshot_reapplies_local_snapshot() -> CommonResult<()> {
+    Logger::default();
+
+    let conf = JournalConf::with_test();
+    let rt = conf.create_runtime();
+    let log = MemLogStorage::new();
+    // Register a snapshot owned by node 1 at applied index 9.
+    assert!(log.register_snapshot(reported_snapshot(9, 1))?);
+
+    let app = RecordingSnapshotAppStorage::with_applied_index(0);
+    let client = empty_group_client(rt.clone(), &conf, "install-local");
+    let storage = PeerStorage::new(rt.clone(), 1, log.clone(), app.clone(), client, &conf);
+
+    let index = rt.block_on(
+        RaftNode::<MemLogStorage, RecordingSnapshotAppStorage>::install_snapshot(&storage, vec![1]),
+    )?;
+
+    assert_eq!(
+        index, 9,
+        "install_snapshot must restore the persisted applied index"
+    );
+    let applied = app.applied_snapshots();
+    assert_eq!(
+        applied.len(),
+        1,
+        "local snapshot must be applied exactly once"
+    );
+    assert_eq!(
+        applied[0].node_id, 1,
+        "applied snapshot must be stamped with the local node id"
+    );
     Ok(())
 }

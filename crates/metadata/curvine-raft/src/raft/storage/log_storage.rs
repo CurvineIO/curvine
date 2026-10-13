@@ -48,6 +48,28 @@ pub trait LogStorage: Storage + Clone + Send + Sync + 'static {
     /// Create a new snapshot.
     fn create_snapshot(&self, data: SnapshotData) -> RaftResult<()>;
 
+    /// Register a snapshot reported by another node, such as a follower.
+    /// Only a snapshot newer than the currently registered one is accepted;
+    /// stale reports are rejected.
+    fn register_snapshot(&self, data: SnapshotData) -> RaftResult<bool> {
+        match self.latest_snapshot()? {
+            None => {
+                self.create_snapshot(data)?;
+                Ok(true)
+            }
+
+            Some(latest) => {
+                // A stale report must not overwrite the currently registered snapshot.
+                if data.fsm_state.applied.index <= latest.get_metadata().index {
+                    return Ok(false);
+                }
+
+                self.create_snapshot(data)?;
+                Ok(true)
+            }
+        }
+    }
+
     /// The state machine used to apply snapshots to nodes.
     /// When the node needs to restore state from the snapshot, it calls this method.
     fn apply_snapshot(&self, snapshot: Snapshot) -> RaftResult<()>;
