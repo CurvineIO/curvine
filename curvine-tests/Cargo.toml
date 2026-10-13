@@ -47,6 +47,7 @@ curvine-sys = { workspace = true }
 curvine-alloc = { workspace = true }
 curvine-server = { workspace = true, default-features = false }
 curvine-client = { workspace = true, features = ["job-client", "unified", "opendal-s3"] }
+curvine-cli = { path = "../curvine-cli" }
 curvine-lancedb = { workspace = true, optional = true }
 curvine-ufs-api = { workspace = true }
 tokio  = { workspace = true }

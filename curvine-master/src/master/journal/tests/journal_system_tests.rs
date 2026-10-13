@@ -145,6 +145,7 @@ mod recovery_metrics_tests {
     use curvine_config::{JournalConf, MasterConf};
     use curvine_raft::proto::raft::AppliedIndex;
     use curvine_raft::raft::storage::PeerStorage;
+    use curvine_raft::raft::RaftGroup;
     use curvine_runtime::common::Utils;
     use raft::eraftpb::HardState;
 
@@ -214,6 +215,9 @@ mod recovery_metrics_tests {
         )?;
         let peer = PeerStorage::new(
             js.rt.clone(),
+            RaftGroup::from_conf(&conf.journal)
+                .get_node_id(&conf.journal.local_addr())
+                .unwrap(),
             log,
             loader.clone(),
             RaftClient::from_conf(js.rt.clone(), &conf.journal),

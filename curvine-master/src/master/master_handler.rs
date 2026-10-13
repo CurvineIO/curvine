@@ -977,6 +977,24 @@ impl MasterHandler {
         fs.list_options(&path, opts)
     }
 
+    fn uses_actor_rt(code: RpcCode) -> bool {
+        matches!(code, RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport)
+    }
+
+    fn record_rpc_queue_duration(&self, ctx: &RpcContext<'_>) {
+        if let Some(queue_us) = ctx.queue_us {
+            let executor = if Self::uses_actor_rt(ctx.code) {
+                "actor"
+            } else {
+                "main"
+            };
+            self.metrics
+                .rpc_queue_duration
+                .with_label_values(&[executor])
+                .observe(queue_us as f64);
+        }
+    }
+
     fn record_rpc_observability(&self, ctx: &RpcContext<'_>, response: &FsResult<Message>) {
         let used_us = ctx.spent.used_us();
         if self.audit_logging_enabled {
@@ -1030,6 +1048,8 @@ impl MessageHandler for MasterHandler {
         let mut rpc_context = RpcContext::new(msg);
         let ctx = &mut rpc_context;
         let code = RpcCode::from(msg.code());
+
+        self.record_rpc_queue_duration(ctx);
 
         // Unified processing of all RPC requests (standby NotLeader uses the same
         // observability + error_ext conversion path as async_handle).
@@ -1144,7 +1164,7 @@ impl MessageHandler for MasterHandler {
     // to be marked lost.
     fn get_rt(&self, msg: &Message) -> Option<&Runtime> {
         let code = RpcCode::from(msg.code());
-        if matches!(code, RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport) {
+        if Self::uses_actor_rt(code) {
             Some(&self.actor_rt)
         } else {
             None

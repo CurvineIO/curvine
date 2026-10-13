@@ -19,14 +19,11 @@ use crate::raft::{NodeId, RaftClient, RaftResult};
 use curvine_core_error::err_box;
 use curvine_io::DataSlice;
 use curvine_runtime::common::{ByteUnit, FileUtils, TimeSpent};
-use curvine_runtime::runtime::GroupExecutor;
 use log::{debug, error, info};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 // @todo Consider developing concurrent download snapshot files.
 pub struct DownloadJob {
-    _executor: Arc<GroupExecutor>,
     node_id: NodeId,
     chunk_size: usize,
     snapshot_dir: String,
@@ -35,28 +32,26 @@ pub struct DownloadJob {
 }
 
 impl DownloadJob {
-    pub fn new<T: AsRef<str>>(
-        _executor: Arc<GroupExecutor>,
+    pub fn new(
         node_id: NodeId,
-        snapshot_dir: T,
+        snapshot_dir: String,
         files: SnapshotFileList,
         conf: &JournalConf,
         client: RaftClient,
     ) -> Self {
         let chunk_size = conf.snapshot_read_chunk_size;
         Self {
-            _executor,
             node_id,
             chunk_size,
-            snapshot_dir: snapshot_dir.as_ref().to_string(),
+            snapshot_dir,
             files,
             client,
         }
     }
 
-    pub fn run(&mut self) -> RaftResult<String> {
+    pub async fn run(&mut self) -> RaftResult<String> {
         let dir = self.snapshot_dir.clone();
-        match self.run0() {
+        match self.run0().await {
             Ok(_) => Ok(dir),
 
             Err(e) => {
@@ -81,22 +76,22 @@ impl DownloadJob {
     }
 
     // @todo Will parallel download be considered in the later stage?
-    fn run0(&mut self) -> RaftResult<()> {
+    async fn run0(&mut self) -> RaftResult<()> {
         for file in &self.files.files {
             // Create writer
             let path = self.get_write_path(file)?;
             let writer = FileWriter::from_file(path, self.chunk_size)?;
 
-            let client = self.client.create_snapshot_client(self.node_id)?;
+            let client = self.client.create_snapshot_client(self.node_id).await?;
             let client = SnapshotClient::new(&self.files.dir, file.clone(), client);
 
-            Self::download_file(client, 0, writer)?;
+            Self::download_file(client, 0, writer).await?;
         }
 
         Ok(())
     }
 
-    pub fn download_file(
+    pub async fn download_file(
         client: SnapshotClient,
         offset: u64,
         mut writer: FileWriter,
@@ -104,7 +99,7 @@ impl DownloadJob {
         let mut seq_id = 0;
         let spend = TimeSpent::new();
 
-        let _ = client.open_file(seq_id, offset)?;
+        let _ = client.open_file(seq_id, offset).await?;
         seq_id += 1;
         loop {
             if writer.write_len() > client.file_len() {
@@ -116,7 +111,7 @@ impl DownloadJob {
                 );
             }
 
-            let msg = client.read_data(seq_id)?;
+            let msg = client.read_data(seq_id).await?;
             seq_id += 1;
 
             // Check whether the read is finished.
@@ -182,8 +177,9 @@ impl DownloadJob {
         }
 
         info!(
-            "Snapshot file {} download complete, len {}, cost {} ms",
+            "Snapshot file {} from {} download complete, len {}, cost {} ms",
             client.file_path(),
+            client.remote_addr(),
             ByteUnit::new(client.file_len()),
             spend.used_ms()
         );

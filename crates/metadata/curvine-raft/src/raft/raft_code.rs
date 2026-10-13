@@ -18,10 +18,12 @@ use num_enum::{FromPrimitive, IntoPrimitive};
 #[derive(Debug, Copy, Clone, IntoPrimitive, FromPrimitive, Eq, PartialEq)]
 pub enum RaftCode {
     #[num_enum(default)]
+    Unknown = 0,
     Propose = 1,
     ConfChange = 2,
     Ping = 3,
     Unreachable = 4,
     Raft = 5,
     SnapshotDownload = 6,
+    ReportSnapshot = 7,
 }

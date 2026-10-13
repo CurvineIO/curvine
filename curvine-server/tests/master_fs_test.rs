@@ -365,6 +365,74 @@ fn sync_rpc_to_standby_returns_rpc_error_response() -> CommonResult<()> {
     Ok(())
 }
 
+// rpc_queue_duration is derived from the timestamp RpcFrame::receive stamps on
+// decoded requests, and its executor label must mirror the actor_rt split in
+// MasterHandler::get_rt. Both facts need a regression guard: without set_time()
+// or the record call the metric stays silently empty, and without the label
+// actor-routed requests would pollute the main-pool signal.
+fn rpc_queue_count(fs: &MasterFilesystem, executor: &str) -> u64 {
+    let text = Master::get_metrics()
+        .expect("test master metrics should initialize")
+        .text_output(fs.clone())
+        .expect("metrics text output should render");
+    let prefix = format!("rpc_queue_duration_count{{executor=\"{executor}\"}}");
+    text.lines()
+        .find_map(|line| line.strip_prefix(&prefix)?.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+#[test]
+fn rpc_queue_duration_is_recorded_per_executor_pool() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_for_test("rpc-queue-duration");
+    let fs = new_fs(true, "rpc-queue-duration-metrics");
+
+    let main_before = rpc_queue_count(&fs, "main");
+    let actor_before = rpc_queue_count(&fs, "actor");
+
+    // A stamped request must record its queue wait into the main pool series.
+    let mut main_req = Builder::new_rpc(RpcCode::Mkdir).build();
+    main_req.set_time();
+    handler.handle(&main_req)?;
+    assert_eq!(
+        rpc_queue_count(&fs, "main"),
+        main_before + 1,
+        "a stamped main-pool request must add exactly one rpc_queue_duration sample"
+    );
+
+    // WorkerBlockReport runs on actor_rt (get_rt), so it must land in the
+    // actor series instead of polluting the main-pool signal.
+    let mut report_req = Builder::new_rpc(RpcCode::WorkerBlockReport).build();
+    report_req.set_time();
+    handler.handle(&report_req)?;
+    assert_eq!(
+        rpc_queue_count(&fs, "actor"),
+        actor_before + 1,
+        "a stamped WorkerBlockReport must be recorded under executor=actor"
+    );
+    assert_eq!(
+        rpc_queue_count(&fs, "main"),
+        main_before + 1,
+        "actor-routed requests must not increment the main series"
+    );
+
+    // Messages without a receipt timestamp (not decoded by RpcFrame) record
+    // nothing.
+    let unstamped = Builder::new_rpc(RpcCode::Mkdir).build();
+    assert!(
+        unstamped.time.is_none(),
+        "builder must default to no receipt time"
+    );
+    handler.handle(&unstamped)?;
+    assert_eq!(
+        rpc_queue_count(&fs, "main"),
+        main_before + 1,
+        "a request without receipt time must not add a sample"
+    );
+
+    Ok(())
+}
+
 #[test]
 fn test_master_filesystem_core_operations() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
@@ -972,6 +1040,41 @@ fn ttl_executor_deletes_nested_expired_inode() -> CommonResult<()> {
     assert!(
         fs.file_status("/ttl/a/b/file.log").is_err(),
         "TTL delete should remove the nested file path resolved from inode id"
+    );
+
+    Ok(())
+}
+
+// A missing inode must surface as a typed FileNotFound error; the TTL
+// checker relies on this classification to skip benign warnings.
+#[test]
+fn ttl_executor_missing_inode_returns_file_not_found() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "ttl-executor-missing-inode");
+
+    let opts = CreateFileOptsBuilder::new()
+        .create_parent(true)
+        .ttl_ms(1)
+        .ttl_action(TtlAction::Delete)
+        .build();
+    let status = fs.create_with_opts(
+        "/ttl/removed.log",
+        opts,
+        OpenFlags::new_create().set_overwrite(true),
+    )?;
+    fs.complete_file("/ttl/removed.log", None, 0, vec![], "", false, None)?;
+
+    // Remove the inode before the TTL pass runs.
+    fs.delete("/ttl/removed.log", false)?;
+
+    let executor = InodeTtlExecutor::with_managers(fs.clone());
+    let err = executor
+        .execute_by_id(status.id)
+        .expect_err("execute_by_id must fail once the inode is removed");
+    assert!(
+        matches!(err, FsError::FileNotFound(_)),
+        "missing inodes must be classified as FileNotFound, got: {:?}",
+        err
     );
 
     Ok(())
@@ -3167,9 +3270,11 @@ fn file_block_details_preserve_registered_non_live_worker_status() -> CommonResu
         .expect("blacklisted worker location should be retained");
     assert_eq!(blacklist.state, WorkerStatus::Blacklist);
     assert!(blacklist.address.is_some());
+    // create_locate_block serves reads and keeps only live workers (#1731),
+    // so a blacklisted replica must not be returned to readers.
     assert!(fs
         .create_locate_block(path, block.block.clone(), std::slice::from_ref(&location))
-        .is_ok());
+        .is_err());
 
     fs.worker_manager.write().add_dcm(vec![hostname]);
     let dcm_details = fs.get_file_block_details(path)?;
@@ -3180,9 +3285,11 @@ fn file_block_details_preserve_registered_non_live_worker_status() -> CommonResu
         .expect("decommissioned worker location should be retained");
     assert_eq!(decommission.state, WorkerStatus::Decommission);
     assert!(decommission.address.is_some());
+    // Same live-only locate contract: a decommissioned replica stays visible
+    // in block details but is not used for reads.
     assert!(fs
         .create_locate_block(path, block.block.clone(), &[location])
-        .is_ok());
+        .is_err());
     Ok(())
 }
 

@@ -121,3 +121,11 @@ message SnapshotDownloadResponse {
     required bool is_last = 1;
     required uint64 checksum = 2;
 }
+
+message ReportSnapshotRequest {
+    required SnapshotData snapshot = 1;
+}
+
+message ReportSnapshotResponse {
+    required bool accepted = 1;
+}

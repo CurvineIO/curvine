@@ -19,7 +19,7 @@ use crate::raft::{LibRaftMessage, NodeId, RaftCode, RaftGroup, RaftResult};
 use crate::utils::SerdeUtils;
 use curvine_core_error::CommonResult;
 use curvine_net::net::{InetAddr, NodeAddr};
-use curvine_rpc::client::{ClientConf, ClusterConnector, SyncClient};
+use curvine_rpc::client::{ClientConf, ClusterConnector, RpcClient};
 use curvine_rpc::message::{Builder, Message, RefMessage};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use prost::Message as PMessage;
@@ -152,8 +152,22 @@ impl RaftClient {
         Ok(rep_header)
     }
 
-    pub fn create_snapshot_client(&self, id: u64) -> RaftResult<SyncClient> {
-        let client = self.connector.create_sync_with_id(id)?;
+    pub async fn create_snapshot_client(&self, id: u64) -> RaftResult<RpcClient> {
+        let client = self.connector.create_client_with_id(id, false).await?;
         Ok(client)
+    }
+
+    pub fn report_snapshot(&self, snapshot: SnapshotData) -> RaftResult<bool> {
+        let fut = async move {
+            let req = ReportSnapshotRequest { snapshot };
+            let rep: ReportSnapshotResponse =
+                self.leader_rpc(RaftCode::ReportSnapshot, req).await?;
+            Ok(rep.accepted)
+        };
+        self.rt.block_on(fut)
+    }
+
+    pub fn get_addr_string(&self, id: u64) -> String {
+        self.connector.get_addr_string(id)
     }
 }
