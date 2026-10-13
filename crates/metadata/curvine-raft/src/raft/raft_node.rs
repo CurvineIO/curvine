@@ -618,6 +618,7 @@ where
             Ok(response) => response,
             Err(e) => return Self::send_malformed_request_error(env, e.into()),
         };
+
         if !self.is_leader() {
             return Self::send_not_leader(self.leader(), env, &self.group);
         }
