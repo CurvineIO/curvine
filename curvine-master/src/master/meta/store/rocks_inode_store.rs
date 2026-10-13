@@ -16,7 +16,9 @@ use crate::master::meta::inode::InodeView;
 use crate::master::meta::LockMeta;
 use curvine_core_error::CommonResult;
 use curvine_model::{BlockLocation, FileLock, MountInfo};
-use curvine_rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
+use curvine_rocksdb::{
+    DBConf, DBEngine, DbReadSnapshot as DBReadSnapshot, RocksIterator, RocksUtils,
+};
 use curvine_rocksdb::{
     DBIteratorWithThreadMode, DBPinnableSlice, Error, WriteBatchWithTransaction, DB,
 };
@@ -142,6 +144,11 @@ impl RocksInodeStore {
     /// Bulk-scan the entire `edges` CF with tuned ReadOptions.
     pub fn bulk_scan_edges<'a: 'b, 'b>(&'a self) -> CommonResult<DBIteratorWithThreadMode<'b, DB>> {
         self.db.bulk_scan(Self::CF_EDGES)
+    }
+
+    /// Create a consistent multi-CF read snapshot for background scans.
+    pub fn read_snapshot(&self) -> DBReadSnapshot<'_> {
+        self.db.read_snapshot()
     }
 
     pub fn delete_locations(&self, worker_id: u32) -> CommonResult<Vec<i64>> {

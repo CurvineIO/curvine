@@ -77,6 +77,20 @@ impl DBEngine {
         Ok(())
     }
 
+    /// Create a consistent read snapshot across all column families.
+    ///
+    /// All iterators and point reads created from the returned `DbReadSnapshot`
+    /// observe a single-generation view: writes committed after `read_snapshot()`
+    /// are invisible to them. The snapshot is released when the wrapper is
+    /// dropped.
+    pub fn read_snapshot(&self) -> DbReadSnapshot<'_> {
+        DbReadSnapshot {
+            snapshot: self.db.snapshot(),
+            db: &self.db,
+            conf: &self.conf,
+        }
+    }
+
     // Get a reference to the column family.
     pub fn cf(&self, name: &str) -> CommonResult<&ColumnFamily> {
         match self.db.cf_handle(name) {
@@ -529,5 +543,60 @@ impl Iterator for RocksIterator<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next()
+    }
+}
+
+/// Consistent multi-CF read view backed by one RocksDB snapshot.
+///
+/// Wraps `rocksdb::SnapshotWithThreadMode` so that upper layers (inode store,
+/// dir-space scanner) never depend on concrete `rocksdb` snapshot types. Every
+/// iterator borrows from this wrapper, which keeps all iterator lifetimes
+/// shorter than the snapshot lifetime.
+pub struct DbReadSnapshot<'a> {
+    snapshot: SnapshotWithThreadMode<'a, DB>,
+    db: &'a DB,
+    conf: &'a DBConf,
+}
+
+impl<'a> DbReadSnapshot<'a> {
+    /// Full-CF scan within this snapshot using bulk-scan ReadOptions
+    /// (`total_order_seek(true)` + `fill_cache(false)` + 64 MiB readahead).
+    pub fn bulk_scan(&self, cf: &str) -> CommonResult<RocksIterator<'_>> {
+        let cf = self.cf(cf)?;
+        let mut opt = self.conf.create_bulk_scan_opt();
+        opt.set_snapshot(&self.snapshot);
+        let iter = self.snapshot.iterator_cf_opt(cf, opt, IteratorMode::Start);
+        Ok(RocksIterator { inner: iter })
+    }
+
+    /// Point read within this snapshot.
+    pub fn get_cf<K: AsRef<[u8]>>(&self, cf: &str, key: K) -> CommonResult<Option<Vec<u8>>> {
+        let cf = self.cf(cf)?;
+        let bytes = try_err!(self.snapshot.get_cf(cf, key));
+        Ok(bytes)
+    }
+
+    /// Prefix scan within this snapshot.
+    pub fn prefix_scan<K: AsRef<[u8]>>(&self, cf: &str, key: K) -> CommonResult<RocksIterator<'_>> {
+        let mut opt = self.conf.create_read_opt();
+        opt.set_prefix_same_as_start(true);
+
+        let start = key.as_ref();
+        let end = RocksUtils::calculate_end_bytes(start);
+        opt.set_iterate_lower_bound(start);
+        opt.set_iterate_upper_bound(end);
+        opt.set_snapshot(&self.snapshot);
+
+        let cf = self.cf(cf)?;
+        let mode = IteratorMode::From(start, Direction::Forward);
+        let iter = self.snapshot.iterator_cf_opt(cf, opt, mode);
+        Ok(RocksIterator { inner: iter })
+    }
+
+    fn cf(&self, name: &str) -> CommonResult<&ColumnFamily> {
+        match self.db.cf_handle(name) {
+            Some(v) => Ok(v),
+            None => err_box!("cf {} not exists", name),
+        }
     }
 }

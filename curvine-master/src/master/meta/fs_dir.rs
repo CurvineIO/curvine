@@ -46,6 +46,9 @@ pub struct FsDir {
     pub(crate) journal_writer: Arc<JournalWriter>,
     pub(crate) evictor: Arc<dyn Evictor>,
     pub(crate) op_id: AtomicCounter,
+    /// Max time `restore()` waits for active metadata scan leases to release
+    /// the store before aborting (leaves the original DB/tree untouched).
+    restore_wait_timeout: std::time::Duration,
 }
 
 #[derive(Default)]
@@ -95,6 +98,9 @@ impl FsDir {
             journal_writer,
             evictor,
             op_id: AtomicCounter::new(0),
+            restore_wait_timeout: std::time::Duration::from_millis(
+                conf.master.dir_space_restore_wait_timeout_ms(),
+            ),
         };
         fs_dir.update_last_inode_id(last_inode_id)?;
 
@@ -1069,11 +1075,17 @@ impl FsDir {
         let mut spend = TimeSpent::new();
         let path = path.as_ref();
 
+        // Cancel any active metadata snapshot scan lease and wait (bounded) for
+        // scanners to release the store before touching anything. A timeout
+        // leaves the original RocksDB and in-memory tree untouched and
+        // queryable.
+        let restore_guard = self.store.begin_restore(self.restore_wait_timeout)?;
+
         // Set to other value first to facilitate memory recycling.
         self.root_dir = Self::create_root();
 
         // Reset rocksdb
-        self.store.restore(path)?;
+        self.store.restore_with_guard(&restore_guard, path)?;
         let time1 = spend.used_ms();
         spend.reset();
 

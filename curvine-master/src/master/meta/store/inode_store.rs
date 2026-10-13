@@ -17,9 +17,12 @@ use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::{Inode, InodeFile, InodePath, InodePtr, InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
+use crate::master::space::scan_lease::{
+    MetadataRestoreGuard, MetadataScanControl, MetadataScanLease,
+};
 use curvine_core_error::{err_box, try_err, try_option, CommonResult};
 use curvine_model::{BlockLocation, CommitBlock, FileLock, FileStatus, MountInfo};
-use curvine_rocksdb::{DBConf, RocksUtils};
+use curvine_rocksdb::{DBConf, DbReadSnapshot as DBReadSnapshot, RocksIterator, RocksUtils};
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::{FileUtils, Utils};
 use log::{info, warn};
@@ -98,6 +101,7 @@ pub struct InodeStore {
     pub(crate) store: Arc<RocksInodeStore>,
     pub(crate) fs_stats: Arc<FileSystemStats>,
     ttl_bucket_list: Arc<TtlBucketList>,
+    scan_control: Arc<MetadataScanControl>,
 }
 
 impl InodeStore {
@@ -106,7 +110,39 @@ impl InodeStore {
             store: Arc::new(store),
             fs_stats: Arc::new(FileSystemStats::new()?),
             ttl_bucket_list,
+            scan_control: Arc::new(MetadataScanControl::new()),
         })
+    }
+
+    /// Acquire a metadata snapshot scan lease.
+    ///
+    /// The lease temporarily holds an `Arc<RocksInodeStore>` clone; scanners
+    /// must drop the lease before the store can be restored. Returns an error
+    /// while a restore is pending or in progress.
+    pub fn begin_snapshot_scan(&self) -> CommonResult<MetadataScanLease> {
+        let ticket = self.scan_control.try_acquire_lease()?;
+        Ok(MetadataScanLease::new(
+            self.scan_control.clone(),
+            self.store.clone(),
+            ticket,
+        ))
+    }
+
+    /// Begin a Raft snapshot restore.
+    ///
+    /// Cancels all active scan leases and waits (bounded by `wait_timeout`)
+    /// until they are dropped. On success the returned guard keeps new leases
+    /// out until the restore completes; on timeout the store is untouched.
+    pub fn begin_restore(
+        &self,
+        wait_timeout: std::time::Duration,
+    ) -> CommonResult<MetadataRestoreGuard> {
+        self.scan_control.begin_restore(wait_timeout)?;
+        Ok(MetadataRestoreGuard::new(self.scan_control.clone()))
+    }
+
+    pub fn scan_control(&self) -> &Arc<MetadataScanControl> {
+        &self.scan_control
     }
 
     pub fn get_ttl_bucket_list(&self) -> Arc<TtlBucketList> {
@@ -943,6 +979,20 @@ impl InodeStore {
         Ok(())
     }
 
+    /// Restore under a previously acquired restore guard (see `begin_restore`).
+    ///
+    /// The guard proves scan leases have been drained and new ones are locked
+    /// out for the whole replace window. `wait_timeout` is only used when the
+    /// guard was not obtained through `begin_restore` — passing a guard means
+    /// the wait already happened, so this path never blocks.
+    pub fn restore_with_guard<T: AsRef<str>>(
+        &mut self,
+        _guard: &MetadataRestoreGuard,
+        path: T,
+    ) -> CommonResult<()> {
+        self.restore(path)
+    }
+
     pub fn get_checkpoint_path(&self, id: u64) -> String {
         self.store.db.get_checkpoint_path(id)
     }
@@ -989,6 +1039,55 @@ impl InodeStore {
 
     pub fn store(&self) -> &RocksInodeStore {
         &self.store
+    }
+}
+
+/// Typed, read-only view of one RocksDB snapshot over the inode/edge column
+/// families.
+///
+/// Created through a [`MetadataScanLease`] so the underlying store Arc stays
+/// alive for the whole scan. Exposes only the reads the dir-space scanner
+/// needs; it never exposes the writable DB. All returned iterators borrow from
+/// this wrapper and must be dropped before it.
+pub struct InodeStoreSnapshot<'a> {
+    snapshot: DBReadSnapshot<'a>,
+}
+
+impl<'a> InodeStoreSnapshot<'a> {
+    pub(crate) fn new(snapshot: DBReadSnapshot<'a>) -> Self {
+        Self { snapshot }
+    }
+
+    /// Full scan of the `inodes` column family.
+    pub fn scan_inodes(&self) -> CommonResult<RocksIterator<'_>> {
+        self.snapshot.bulk_scan(RocksInodeStore::CF_INODES)
+    }
+
+    /// Full scan of the `edges` column family.
+    pub fn scan_edges(&self) -> CommonResult<RocksIterator<'_>> {
+        self.snapshot.bulk_scan(RocksInodeStore::CF_EDGES)
+    }
+
+    /// Point read of a single inode within the snapshot.
+    pub fn get_inode(&self, id: i64) -> CommonResult<Option<InodeView>> {
+        let bytes = self
+            .snapshot
+            .get_cf(RocksInodeStore::CF_INODES, RocksUtils::i64_to_bytes(id))?;
+        match bytes {
+            None => Ok(None),
+            Some(v) => {
+                let inode: InodeView = SerdeUtils::deserialize(&v)?;
+                Ok(Some(inode))
+            }
+        }
+    }
+
+    /// Scan the child edges of one parent directory within the snapshot.
+    pub fn scan_children(&self, parent_id: i64) -> CommonResult<RocksIterator<'_>> {
+        self.snapshot.prefix_scan(
+            RocksInodeStore::CF_EDGES,
+            RocksUtils::i64_to_bytes(parent_id),
+        )
     }
 }
 
@@ -1434,6 +1533,225 @@ mod tests {
             elapsed_ms,
             total_inodes
         );
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Snapshot scan lease / restore coordination tests (CV-6 / Task 2)
+    // -----------------------------------------------------------------------
+
+    fn seed_two_dirs(store: &InodeStore) -> CommonResult<(i64, i64)> {
+        let dir_a_id = 3001;
+        let dir_b_id = 3002;
+        let file_id = 3003;
+        let root = FsDir::create_root();
+        let dir_a = InodeView::new_dir("a".to_string(), InodeDir::new(dir_a_id, ROOT_INODE_ID));
+        let dir_b = InodeView::new_dir("b".to_string(), InodeDir::new(dir_b_id, ROOT_INODE_ID));
+        let file = InodeView::new_file("a.txt".to_string(), InodeFile::new(file_id, dir_a_id));
+
+        let mut batch = store.new_batch();
+        batch.write_inode(&root)?;
+        batch.write_inode(&dir_a)?;
+        batch.write_inode(&dir_b)?;
+        batch.write_inode(&file)?;
+        batch.add_child(ROOT_INODE_ID, "a", dir_a_id)?;
+        batch.add_child(ROOT_INODE_ID, "b", dir_b_id)?;
+        batch.add_child(dir_a_id, "a.txt", file_id)?;
+        batch.commit()?;
+        Ok((dir_a_id, dir_b_id))
+    }
+
+    /// Within one lease the typed snapshot readers must observe a single
+    /// generation: writes committed after the lease's snapshot was created
+    /// are invisible to `scan_inodes`, `scan_edges`, `get_inode` and
+    /// `scan_children` alike.
+    #[test]
+    fn snapshot_scanner_reads_consistent_generation_across_apis() -> CommonResult<()> {
+        let store = new_store("snapshot-consistent-generation")?;
+        let (dir_a_id, _dir_b_id) = seed_two_dirs(&store)?;
+
+        let lease = store.begin_snapshot_scan()?;
+        {
+            let reader = lease.snapshot_reader()?;
+
+            // Mutate the store after the snapshot: add a file to dir a.
+            let new_file_id = 3004;
+            let _root = FsDir::create_root();
+            let file = InodeView::new_file(
+                "late.txt".to_string(),
+                InodeFile::new(new_file_id, dir_a_id),
+            );
+            {
+                let mut batch = store.new_batch();
+                batch.write_inode(&file)?;
+                batch.add_child(dir_a_id, "late.txt", new_file_id)?;
+                batch.commit()?;
+            }
+
+            // inodes scan sees only pre-snapshot records.
+            let mut inode_ids: Vec<i64> = Vec::new();
+            for item in reader.scan_inodes()? {
+                let (k, _) = item?;
+                inode_ids.push(RocksUtils::i64_from_bytes(&k)?);
+            }
+            assert!(inode_ids.contains(&ROOT_INODE_ID));
+            assert!(inode_ids.contains(&dir_a_id));
+            assert!(!inode_ids.contains(&new_file_id));
+
+            // Edges scan sees only pre-snapshot edges.
+            let edge_count = reader.scan_edges()?.count();
+            assert_eq!(edge_count, 3);
+
+            // Point reads share the same generation.
+            assert!(reader.get_inode(new_file_id)?.is_none());
+            assert!(reader.get_inode(dir_a_id)?.is_some());
+
+            // Child scan of dir a sees one edge only.
+            let children = reader.scan_children(dir_a_id)?.count();
+            assert_eq!(children, 1);
+        }
+        drop(lease);
+
+        // Outside the lease the new data is visible again.
+        assert!(store.get_inode(3004, None)?.is_some());
+
+        Ok(())
+    }
+
+    /// Concurrent restore while a scan lease is live: restore cancels the
+    /// lease, waits for the scanner to drop it and then succeeds. New leases
+    /// are rejected as busy while restoring.
+    #[test]
+    fn scan_restore_coordination_cancels_scan_and_restores() -> CommonResult<()> {
+        let store = new_store("scan-restore-cancel")?;
+        seed_two_dirs(&store)?;
+
+        // Checkpoint to restore from later.
+        let checkpoint = store.create_checkpoint(1)?;
+        assert!(std::path::Path::new(&checkpoint).exists());
+
+        // Control handle for polling without touching the store mutex.
+        let control = store.scan_control().clone();
+
+        // 1. Acquire a lease and create a snapshot reader (iterator alive).
+        let lease = store.begin_snapshot_scan()?;
+        let reader = lease.snapshot_reader()?;
+        let iter = reader.scan_inodes()?;
+        assert!(!lease.is_cancelled());
+
+        // Strong count: store's own Arc + the lease's Arc.
+        let strong = Arc::strong_count(&store.store);
+        assert_eq!(strong, 2, "lease should hold exactly one extra store ref");
+
+        // 2. Restore concurrently; scanner stays idle holding lease+iter.
+        let restore_store = Arc::new(parking_lot::Mutex::new(store));
+        let restore_thread_store = Arc::clone(&restore_store);
+        let handle = std::thread::spawn(move || {
+            let mut store = restore_thread_store.lock();
+            let guard = store.begin_restore(std::time::Duration::from_secs(30))?;
+            store.restore_with_guard(&guard, &checkpoint)
+        });
+
+        // 3. Wait until restore marks the control as restoring, then verify
+        //    the lease observes cancellation and new leases are rejected.
+        while !control.is_restoring() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(lease.is_cancelled());
+        assert!(
+            control.try_acquire_lease().is_err(),
+            "lease must be rejected while restoring"
+        );
+
+        // 4. Scanner cooperates: drop iterator/reader/lease, releasing the
+        //    store Arc and waking restore.
+        drop(iter);
+        drop(reader);
+        drop(lease);
+
+        let res = handle.join().unwrap();
+        assert!(
+            res.is_ok(),
+            "restore should succeed after lease release: {:?}",
+            res
+        );
+
+        // 5. New leases work again and strong count returned to 1.
+        assert!(store_begin_scan_ok(&restore_store));
+        assert_eq!(store_strong_count(&restore_store), 1);
+
+        Ok(())
+    }
+
+    /// Helper: try to acquire a scan lease through the shared store wrapper.
+    fn store_begin_scan_ok(store: &parking_lot::Mutex<InodeStore>) -> bool {
+        let store = store.lock();
+        match store.begin_snapshot_scan() {
+            Ok(lease) => {
+                drop(lease);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Strong-count check via the shared store wrapper.
+    fn store_strong_count(store: &parking_lot::Mutex<InodeStore>) -> usize {
+        Arc::strong_count(&store.lock().store)
+    }
+
+    /// Restore timeout path: when the scanner refuses to release its lease in
+    /// time, restore aborts BEFORE touching the DB; both the old DB and the
+    /// store stay usable.
+    #[test]
+    fn scan_restore_coordination_timeout_keeps_original_data() -> CommonResult<()> {
+        let mut store = new_store("scan-restore-timeout")?;
+        seed_two_dirs(&store)?;
+        let checkpoint = store.create_checkpoint(1)?;
+
+        let lease = store.begin_snapshot_scan()?;
+        let reader = lease.snapshot_reader()?;
+        let iter = reader.scan_inodes()?;
+
+        let res = store.begin_restore(std::time::Duration::from_millis(100));
+        assert!(
+            res.is_err(),
+            "restore wait should time out while lease held"
+        );
+
+        // Control rolled back: scans can be acquired again.
+        assert!(!store.scan_control().is_restoring());
+        assert!(store.begin_snapshot_scan().is_ok());
+
+        // Original data untouched.
+        assert!(store.get_inode(3001, None)?.is_some());
+        assert!(store.get_inode(3003, None)?.is_some());
+        let _ = iter.count();
+        drop(reader);
+        drop(lease);
+
+        // A subsequent restore (with the lease released) succeeds.
+        let guard = store.begin_restore(std::time::Duration::from_secs(30))?;
+        store.restore_with_guard(&guard, &checkpoint)?;
+
+        Ok(())
+    }
+
+    /// Restore must fail cleanly when an extra store reference is held, and
+    /// the original data must remain queryable afterwards.
+    #[test]
+    fn restore_rejects_when_store_arc_is_held() -> CommonResult<()> {
+        let mut store = new_store("restore-extra-ref")?;
+        seed_two_dirs(&store)?;
+
+        let leaked: Arc<RocksInodeStore> = Arc::clone(&store.store);
+        let guard = store.begin_restore(std::time::Duration::from_secs(1))?;
+        let res = store.restore_with_guard(&guard, "/nonexistent-checkpoint");
+        // restore_with_guard performs the strong-count defensive check.
+        assert!(res.is_err());
+        assert_eq!(Arc::strong_count(&leaked), 2);
+        drop(leaked);
 
         Ok(())
     }

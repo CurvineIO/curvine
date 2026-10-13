@@ -13,7 +13,11 @@
 // limitations under the License.
 
 mod agg;
+pub mod scan_lease;
 mod types;
 
 pub use agg::{AggregationOutput, SubtreeAggregator};
+pub use scan_lease::{
+    LeaseTicket, MetadataRestoreGuard, MetadataScanControl, MetadataScanLease, RestoreTicket,
+};
 pub use types::{AggregationStats, DirAgg, ScanAbortReason};

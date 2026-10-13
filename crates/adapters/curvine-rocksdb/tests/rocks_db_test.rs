@@ -177,3 +177,73 @@ fn test_rocksdb_prefix_delete_range_operation() -> CommonResult<()> {
 
     Ok(())
 }
+
+/// A single `DbReadSnapshot` must give a consistent multi-CF view: bulk scans
+/// on different column families share one snapshot generation, so records
+/// written after `read_snapshot()` are invisible to every snapshot iterator,
+/// while ordinary iterators see them.
+#[test]
+fn test_rocksdb_snapshot_bulk_scan_consistent_across_cfs() -> CommonResult<()> {
+    let conf = DBConf::new("../testing/snapshot_bulk_scan")
+        .add_cf("inodes")
+        .add_cf("edges");
+    let db = DBEngine::new(conf, true)?;
+
+    db.put_cf("inodes", RocksUtils::i64_to_bytes(1), "root")?;
+    db.put_cf(
+        "edges",
+        RocksUtils::i64_str_to_bytes(1, "child"),
+        RocksUtils::i64_to_bytes(2),
+    )?;
+
+    let snapshot = db.read_snapshot();
+
+    // Write new records after the snapshot was created.
+    db.put_cf("inodes", RocksUtils::i64_to_bytes(2), "child-inode")?;
+    db.put_cf(
+        "edges",
+        RocksUtils::i64_str_to_bytes(1, "child2"),
+        RocksUtils::i64_to_bytes(3),
+    )?;
+
+    // Snapshot iterators must not see the post-snapshot writes.
+    let mut inode_keys = vec![];
+    for item in snapshot.bulk_scan("inodes")? {
+        let kv = item?;
+        let id = RocksUtils::i64_from_bytes(&kv.0)?;
+        inode_keys.push(id);
+    }
+    assert_eq!(inode_keys, vec![1]);
+
+    let mut edge_keys = vec![];
+    for item in snapshot.bulk_scan("edges")? {
+        let kv = item?;
+        let (parent, name) = RocksUtils::i64_str_from_bytes(&kv.0)?;
+        edge_keys.push((parent, name));
+    }
+    assert_eq!(edge_keys.len(), 1);
+    assert_eq!(edge_keys[0], (1, "child".to_string()));
+
+    // Point reads inside the snapshot also see the old generation.
+    assert!(snapshot
+        .get_cf("inodes", RocksUtils::i64_to_bytes(2))?
+        .is_none());
+    assert_eq!(
+        snapshot.get_cf("inodes", RocksUtils::i64_to_bytes(1))?,
+        Some("root".as_bytes().to_vec())
+    );
+
+    // Prefix scans inside the snapshot see only the pre-snapshot edges.
+    let mut prefix_count = 0;
+    for item in snapshot.prefix_scan("edges", RocksUtils::i64_to_bytes(1))? {
+        let _ = item?;
+        prefix_count += 1;
+    }
+    assert_eq!(prefix_count, 1);
+
+    // Ordinary (non-snapshot) iterators see the new writes.
+    let live_inode_count = db.scan("inodes")?.count();
+    assert_eq!(live_inode_count, 2);
+
+    Ok(())
+}
