@@ -12,20 +12,80 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::block::{BlockStore, HeartbeatTask, MasterClient};
+use crate::worker::block::{BlockMeta, BlockStore, HeartbeatTask, MasterClient};
 use curvine_client_core::file::FsContext;
 use curvine_config::ClusterConf;
-use curvine_core_error::CommonResult;
+use curvine_core_error::{CommonError, CommonResult};
+use curvine_error::FsError;
 use curvine_model::ProtoUtils;
 use curvine_model::{BlockReportInfo, HeartbeatStatus, WorkerAddress};
+use curvine_proto::BlockReportListResponse;
+use curvine_rpc::server::ServerState;
 use curvine_runtime::common::TimeSpent;
 use curvine_runtime::runtime::ScheduledExecutor;
 use curvine_runtime::runtime::{GroupExecutor, Runtime};
 use curvine_runtime::sync::StateCtl;
 use dashmap::{DashMap, DashSet};
-use log::info;
+use log::{info, warn};
 use std::mem::size_of_val;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Attempts per full block report batch, including the first one.
+const FULL_REPORT_MAX_ATTEMPTS: u32 = 5;
+/// Backoff before the first retry; doubled on every further retry.
+const FULL_REPORT_RETRY_BASE: Duration = Duration::from_secs(1);
+/// Upper bound of the backoff between two attempts.
+const FULL_REPORT_RETRY_MAX: Duration = Duration::from_secs(10);
+
+/// Whether a failed full block report batch may succeed when sent again.
+///
+/// Only transport level failures (timeouts, IO errors and a master switch) are
+/// transient. Anything else is a decision made by the master, so retrying it
+/// would not help and startup should fail.
+fn is_retryable_report_error(err: &CommonError) -> bool {
+    matches!(
+        err.downcast_ref::<FsError>(),
+        Some(FsError::Timeout(_) | FsError::IO(_) | FsError::NotLeaderMaster(_))
+    )
+}
+
+/// Run one full block report RPC and resend it on transient errors.
+///
+/// The master accumulates a full report by `worker_id` and `total_len` and
+/// de-duplicates block ids, so resending a batch of the same report is safe.
+/// Gives up early once `is_stopped` reports that the worker is shutting down.
+fn send_with_retry<T>(
+    what: &str,
+    is_stopped: impl Fn() -> bool,
+    mut sleep: impl FnMut(Duration),
+    mut send: impl FnMut() -> CommonResult<T>,
+) -> CommonResult<T> {
+    let mut attempt = 1;
+    let mut backoff = FULL_REPORT_RETRY_BASE;
+    loop {
+        let err = match send() {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+
+        if attempt >= FULL_REPORT_MAX_ATTEMPTS || !is_retryable_report_error(&err) || is_stopped() {
+            return Err(err);
+        }
+
+        warn!(
+            "{} failed (attempt {}/{}), retry in {} ms: {}",
+            what,
+            attempt,
+            FULL_REPORT_MAX_ATTEMPTS,
+            backoff.as_millis(),
+            err
+        );
+        sleep(backoff);
+        backoff = (backoff * 2).min(FULL_REPORT_RETRY_MAX);
+        attempt += 1;
+    }
+}
 
 /// Worker block management role.
 /// 1. Register worker with master
@@ -125,7 +185,7 @@ impl BlockActor {
     pub fn full_block_report(&self) -> CommonResult<usize> {
         let blocks = self.store.all_blocks()?;
         if blocks.is_empty() {
-            let response = self.client.full_block_report(0, &[])?;
+            let response = self.send_full_report(0, &[])?;
             let cmds = ProtoUtils::worker_cmd_from_pb(response.cmds);
             HeartbeatTask::delete_block_task(
                 self.executor.clone(),
@@ -142,7 +202,7 @@ impl BlockActor {
             let end = (off + self.block_report_limit).min(blocks.len());
             let batch = &blocks[off..end];
             let spend = TimeSpent::new();
-            let response = self.client.full_block_report(blocks.len(), batch)?;
+            let response = self.send_full_report(blocks.len(), batch)?;
             info!(
                 "full block report, blocks={}, msg_bytes={}, used_ms={}",
                 batch.len(),
@@ -161,6 +221,19 @@ impl BlockActor {
         }
 
         Ok(blocks.len())
+    }
+
+    fn send_full_report(
+        &self,
+        total_len: usize,
+        batch: &[BlockMeta],
+    ) -> CommonResult<BlockReportListResponse> {
+        send_with_retry(
+            "full block report",
+            || self.worker_ctl.state::<ServerState>() == ServerState::Stop,
+            std::thread::sleep,
+            || self.client.full_block_report(total_len, batch),
+        )
     }
 
     pub fn start_heartbeat(
@@ -185,5 +258,113 @@ impl BlockActor {
 
         scheduler.start(task)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::io;
+
+    fn io_error() -> CommonError {
+        CommonError::from(FsError::from(io::Error::from(io::ErrorKind::TimedOut)))
+    }
+
+    fn master_error() -> CommonError {
+        CommonError::from(FsError::common("rejected by master"))
+    }
+
+    #[test]
+    fn retries_transient_error_until_success() {
+        let calls = Cell::new(0);
+        let waits = RefCell::new(vec![]);
+
+        let res = send_with_retry(
+            "test",
+            || false,
+            |d| waits.borrow_mut().push(d),
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() < 3 {
+                    Err(io_error())
+                } else {
+                    Ok(calls.get())
+                }
+            },
+        );
+
+        assert_eq!(res.unwrap(), 3);
+        assert_eq!(
+            *waits.borrow(),
+            vec![Duration::from_secs(1), Duration::from_secs(2)]
+        );
+    }
+
+    #[test]
+    fn gives_up_after_max_attempts() {
+        let calls = Cell::new(0);
+        let waits = RefCell::new(vec![]);
+
+        let res: CommonResult<()> = send_with_retry(
+            "test",
+            || false,
+            |d| waits.borrow_mut().push(d),
+            || {
+                calls.set(calls.get() + 1);
+                Err(io_error())
+            },
+        );
+
+        assert!(res.is_err());
+        assert_eq!(calls.get(), FULL_REPORT_MAX_ATTEMPTS);
+        assert_eq!(waits.borrow().len() as u32, FULL_REPORT_MAX_ATTEMPTS - 1);
+        assert!(waits.borrow().iter().all(|d| *d <= FULL_REPORT_RETRY_MAX));
+    }
+
+    #[test]
+    fn does_not_retry_permanent_error() {
+        let calls = Cell::new(0);
+
+        let res: CommonResult<()> = send_with_retry(
+            "test",
+            || false,
+            |_| panic!("must not wait for a permanent error"),
+            || {
+                calls.set(calls.get() + 1);
+                Err(master_error())
+            },
+        );
+
+        assert!(res.is_err());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn stops_retrying_when_worker_is_shutting_down() {
+        let calls = Cell::new(0);
+
+        let res: CommonResult<()> = send_with_retry(
+            "test",
+            || true,
+            |_| panic!("must not wait while shutting down"),
+            || {
+                calls.set(calls.get() + 1);
+                Err(io_error())
+            },
+        );
+
+        assert!(res.is_err());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn classifies_retryable_errors() {
+        assert!(is_retryable_report_error(&io_error()));
+        assert!(is_retryable_report_error(&CommonError::from(
+            FsError::not_leader("master switched")
+        )));
+        assert!(!is_retryable_report_error(&master_error()));
+        assert!(!is_retryable_report_error(&CommonError::from("plain")));
     }
 }
