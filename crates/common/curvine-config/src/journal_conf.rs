@@ -61,15 +61,14 @@ pub struct JournalConf {
 
     /// Whether the leader creates a metadata snapshot.
     ///
-    /// `None` creates one only when the raft group has a single node.
-    /// Set `true` or `false` to override that. An omitted key in a TOML
-    /// config falls back to `Some(true)`, and `None` is reachable from Rust
-    /// code only.
+    /// The default is `None`, which is also what an omitted TOML key falls
+    /// back to: a snapshot is created only when the raft group has a single
+    /// node. Set `true` or `false` to override that for every group size.
     ///
     /// When the leader does not create snapshots, the leader raft log has no
-    /// compaction path until the follower snapshot reporting path lands, so
-    /// this mode is not production ready yet. A running master logs an error
-    /// every few minutes while it is disabled.
+    /// compaction path until the follower snapshot reporting path lands, so a
+    /// multi-node group must not rely on this default in production yet. A
+    /// running master logs an error every few minutes while it is disabled.
     pub leader_create_snapshot: Option<bool>,
 
     // How many entries are created after creating snapshots.
@@ -239,7 +238,7 @@ impl Default for JournalConf {
             writer_flush_batch_ms: 10,
             snapshot_interval: "6h".to_string(),
             snapshot_min_interval: DurationUnit::new(10 * DurationUnit::MINUTE),
-            leader_create_snapshot: Some(true),
+            leader_create_snapshot: None,
             snapshot_entries: 1_000_000,
             snapshot_read_chunk_size: 1024 * 1024,
 

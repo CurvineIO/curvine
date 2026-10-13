@@ -210,9 +210,9 @@ where
 
             let fetcher = ps.create_fetcher(data)?;
 
-            let download_ms = spend.used_ms();
             let mut data = ps.rt.block_on(fetcher.fetch())?;
             data.node_id = ps.id;
+            let download_ms = spend.used_ms();
             spend.reset();
 
             snapshot.data = data.encode_to_vec();
@@ -263,18 +263,17 @@ where
             log_store.compact(snap_data.fsm_state.compact())?;
 
             info!(
-                "create new snapshot, dir {}, id: {}, fsm_state: {:?}, used {} ms",
-                snap_data.snapshot_id,
+                "create new snapshot, dir {}, fsm_state: {:?}, used {} ms",
                 snap_data.data_dir(),
                 snap_data.fsm_state,
                 cost.used_ms()
             );
 
-            let snapshot_id = snap_data.data_dir();
+            let snapshot_dir = snap_data.data_dir();
             match client.report_snapshot(snap_data) {
-                Ok(accepted) => info!("report snapshot {} accepted: {}", snapshot_id, accepted),
+                Ok(accepted) => info!("report snapshot {} accepted: {}", snapshot_dir, accepted),
                 Err(e) => {
-                    warn!("report snapshot {} failed: {}", snapshot_id, e)
+                    warn!("report snapshot {} failed: {}", snapshot_dir, e)
                 }
             }
 
@@ -294,17 +293,19 @@ where
             "register snapshot from node id {}, accepted {}, node addr {}, dir {}, fsm_state {:?} cost {}ms",
             snapshot.node_id,
             accepted,
-             self.client.get_addr_string(snapshot.node_id),
+            self.client.get_addr_string(snapshot.node_id),
             snapshot.data_dir(),
             snapshot.fsm_state,
             spent.used_ms()
         );
 
-        self.executor.spawn(move || {
-            if let Err(e) = store.compact(snapshot.fsm_state.compact()) {
-                warn!("log store compact failed: {}", e);
-            }
-        })?;
+        if accepted {
+            self.executor.spawn(move || {
+                if let Err(e) = store.compact(snapshot.fsm_state.compact()) {
+                    warn!("log store compact failed: {}", e);
+                }
+            })?;
+        }
 
         Ok(accepted)
     }

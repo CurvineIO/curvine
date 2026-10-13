@@ -584,11 +584,7 @@ where
         };
 
         if !self.is_leader() {
-            let msg = Builder::success(&env.msg)
-                .proto_header(ReportSnapshotResponse { accepted: false })
-                .build();
-            env.send_with_log(Ok(msg));
-            return Ok(());
+            return Self::send_not_leader(self.leader(), env, &self.group);
         }
 
         match self.storage.register_snapshot(request.snapshot) {
