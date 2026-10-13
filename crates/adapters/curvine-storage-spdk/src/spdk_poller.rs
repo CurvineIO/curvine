@@ -47,6 +47,11 @@ pub enum IoOp {
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
         ack: mpsc::Sender<()>,
     },
+    /// Poll a retired qpair once before retrying free on the owner thread.
+    PollRetiredQpair {
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+        ack: mpsc::Sender<i32>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -375,6 +380,25 @@ impl SpdkPoller {
         }
     }
 
+    pub(crate) fn poll_retired_qpair(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> i32 {
+        let (ack_tx, ack_rx) = mpsc::channel::<i32>();
+        let req = IoRequest {
+            op: IoOp::PollRetiredQpair { qpair, ack: ack_tx },
+            completion: IoCompletion::new(),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
+        };
+        let Some(tx) = &self.tx else {
+            return -libc::ENOTCONN;
+        };
+        if tx.send(req).is_err() {
+            return -libc::ENOTCONN;
+        }
+        let _ = self.eventfd.write(1);
+        ack_rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap_or(-libc::ENOTCONN)
+    }
+
     /// Shut down the poller thread.
     pub fn stop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
@@ -432,10 +456,21 @@ impl SpdkPoller {
                 let mut deadline = Instant::now() + delta;
                 let mut drain_count: u64 = 0;
                 while let Ok(req) = rx.try_recv() {
-                    if matches!(req.op, IoOp::UnregisterQpair { .. }) {
-                        Self::handle_unregister(&req, &mut qpair_state, &retired);
-                    } else {
-                        Self::submit_one(&req, &mut qpair_state, &retired, config.io_queue_depth);
+                    match &req.op {
+                        IoOp::UnregisterQpair { .. } => {
+                            Self::handle_unregister(&req, &mut qpair_state, &retired);
+                        }
+                        IoOp::PollRetiredQpair { .. } => {
+                            Self::handle_poll_retired(&req);
+                        }
+                        _ => {
+                            Self::submit_one(
+                                &req,
+                                &mut qpair_state,
+                                &retired,
+                                config.io_queue_depth,
+                            );
+                        }
                     }
                     drain_count += 1;
                     if drain_count & 0x7F == 0 && Instant::now() >= deadline {
@@ -510,15 +545,21 @@ impl SpdkPoller {
                         let mut deadline = Instant::now() + delta;
                         let mut drain_count: u64 = 0;
                         while let Ok(req) = rx.try_recv() {
-                            if matches!(req.op, IoOp::UnregisterQpair { .. }) {
-                                Self::handle_unregister(&req, &mut qpair_state, &retired);
-                            } else {
-                                Self::submit_one(
-                                    &req,
-                                    &mut qpair_state,
-                                    &retired,
-                                    config.io_queue_depth,
-                                );
+                            match &req.op {
+                                IoOp::UnregisterQpair { .. } => {
+                                    Self::handle_unregister(&req, &mut qpair_state, &retired);
+                                }
+                                IoOp::PollRetiredQpair { .. } => {
+                                    Self::handle_poll_retired(&req);
+                                }
+                                _ => {
+                                    Self::submit_one(
+                                        &req,
+                                        &mut qpair_state,
+                                        &retired,
+                                        config.io_queue_depth,
+                                    );
+                                }
                             }
                             drain_count += 1;
                             if drain_count & 0x7F == 0 && Instant::now() >= deadline {
@@ -606,6 +647,13 @@ impl SpdkPoller {
         }
     }
 
+    fn handle_poll_retired(req: &IoRequest) {
+        if let IoOp::PollRetiredQpair { qpair, ack } = &req.op {
+            let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(*qpair, 0) };
+            let _ = ack.send(rc);
+        }
+    }
+
     /// Submit a single I/O request on the poller thread.
     fn submit_one(
         req: &IoRequest,
@@ -617,8 +665,8 @@ impl SpdkPoller {
             IoOp::Read { qpair, .. } => *qpair,
             IoOp::Write { qpair, .. } => *qpair,
             IoOp::Flush { qpair, .. } => *qpair,
-            IoOp::UnregisterQpair { .. } => {
-                unreachable!("UnregisterQpair handled by handle_unregister")
+            IoOp::UnregisterQpair { .. } | IoOp::PollRetiredQpair { .. } => {
+                unreachable!("control request handled before submit_one")
             }
         };
 
@@ -703,7 +751,10 @@ impl SpdkPoller {
                 spdk_ffi::curvine_spdk_ns_submit_flush(*ns, *qpair, &mut (*cb_ctx_ptr).async_ctx)
             },
             IoOp::UnregisterQpair { .. } => {
-                unreachable!("UnregisterQpair handled by handle_unregister")
+                unreachable!("control request handled before submit_one")
+            }
+            IoOp::PollRetiredQpair { .. } => {
+                unreachable!("control request handled before submit_one")
             }
         };
 

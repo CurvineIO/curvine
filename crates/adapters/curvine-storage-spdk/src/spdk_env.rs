@@ -617,6 +617,8 @@ struct SpdkEnvTestHooks {
     env_fini: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     poller_stop: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
     unregister_qpair: Option<std::sync::Arc<dyn Fn() -> UnregisterResult + Send + Sync>>,
+    poll_retired_qpair:
+        Option<std::sync::Arc<dyn Fn(*mut spdk_ffi::spdk_nvme_qpair) -> i32 + Send + Sync>>,
 }
 
 /// SPDK env lifecycle (singleton). Send + Sync
@@ -1087,6 +1089,32 @@ impl SpdkEnv {
         self.resolve_deferred_qpairs();
         self.qpair_pool.acquire(ctrlr)
     }
+
+    fn prepare_retired_qpair_for_free(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) {
+        #[cfg(test)]
+        if let Some(hook) = &self.test_hooks.poll_retired_qpair {
+            let rc = hook(qpair);
+            if rc < 0 {
+                warn!(
+                    "failed to poll retired SPDK qpair {:p} before free retry: rc={}",
+                    qpair, rc
+                );
+            }
+            return;
+        }
+
+        let poller = self.poller.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(poller) = poller.as_ref() {
+            let rc = poller.poll_retired_qpair(qpair);
+            if rc < 0 {
+                warn!(
+                    "failed to poll retired SPDK qpair {:p} before free retry: rc={}",
+                    qpair, rc
+                );
+            }
+        }
+    }
+
     fn finish_retired_qpair(
         &self,
         ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
@@ -1111,6 +1139,7 @@ impl SpdkEnv {
             }
         }
 
+        self.prepare_retired_qpair_for_free(qpair);
         let rc = self.qpair_pool.free_io_qpair(qpair);
         if rc != 0 {
             error!("failed to free retired SPDK qpair {:p}: rc={}", qpair, rc);
@@ -2219,10 +2248,13 @@ mod test {
         let ctrlr = 0x1000usize;
         let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
         let free_calls = Arc::new(AtomicUsize::new(0));
+        let poll_calls = Arc::new(AtomicUsize::new(0));
         let detach_calls = Arc::new(AtomicUsize::new(0));
         let fini_calls = Arc::new(AtomicUsize::new(0));
 
         let free_calls_for_hook = Arc::clone(&free_calls);
+        let poll_calls_for_free = Arc::clone(&poll_calls);
+        let poll_calls_for_hook = Arc::clone(&poll_calls);
         let detach_calls_for_hook = Arc::clone(&detach_calls);
         let fini_calls_for_hook = Arc::clone(&fini_calls);
 
@@ -2246,10 +2278,16 @@ mod test {
         env.qpair_pool.test_hooks.free_io_qpair = Arc::new(move |_| {
             if free_calls_for_hook.fetch_add(1, Ordering::AcqRel) == 0 {
                 -libc::EIO
-            } else {
+            } else if poll_calls_for_free.load(Ordering::Acquire) > 0 {
                 0
+            } else {
+                -libc::EBUSY
             }
         });
+        env.test_hooks.poll_retired_qpair = Some(Arc::new(move |_| {
+            poll_calls_for_hook.fetch_add(1, Ordering::AcqRel);
+            0
+        }));
         env.test_hooks.detach_controllers = Some(Arc::new(move || {
             detach_calls_for_hook.fetch_add(1, Ordering::AcqRel);
         }));
@@ -2262,6 +2300,7 @@ mod test {
         env.retire_qpair(ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr, qpair);
 
         assert_eq!(free_calls.load(Ordering::Acquire), 1);
+        assert_eq!(poll_calls.load(Ordering::Acquire), 1);
         assert!(env.retired_qpairs.has_entries());
         assert_eq!(env.deferred_qpair_count(), 1);
         assert_eq!(
@@ -2279,6 +2318,7 @@ mod test {
         env.shutdown();
 
         assert_eq!(free_calls.load(Ordering::Acquire), 2);
+        assert_eq!(poll_calls.load(Ordering::Acquire), 2);
         assert_eq!(detach_calls.load(Ordering::Acquire), 1);
         assert_eq!(fini_calls.load(Ordering::Acquire), 1);
         assert!(env.shutdown_complete.load(Ordering::Acquire));
