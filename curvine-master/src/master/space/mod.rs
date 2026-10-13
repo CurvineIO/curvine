@@ -14,6 +14,7 @@
 
 mod agg;
 pub mod scan_lease;
+pub mod scanner;
 mod store;
 mod types;
 
@@ -21,6 +22,7 @@ pub use agg::{AggregationOutput, SubtreeAggregator};
 pub use scan_lease::{
     LeaseTicket, MetadataRestoreGuard, MetadataScanControl, MetadataScanLease, RestoreTicket,
 };
+pub use scanner::{GlobalScanner, ScanContext, ScanLimits, UnpublishedSnapshot};
 pub use store::{DirSpaceQueryResult, DirSpaceSnapshotStore, SnapshotMiss};
 pub use types::{
     AggregationStats, DirAgg, DirSpaceSnapshot, ScanAbortReason, SnapshotMeta, SnapshotSource,

@@ -285,6 +285,16 @@ impl<'a> InodeWriteBatch<'a> {
         }
     }
 
+    /// Raw CF put, for tests that inject corrupted records.
+    #[cfg(test)]
+    pub fn put_cf_raw<K, V>(&mut self, cf: &str, key: K, value: V) -> CommonResult<()>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        self.put_cf(cf, key, value)
+    }
+
     fn put_cf<K, V>(&mut self, cf: &str, key: K, value: V) -> CommonResult<()>
     where
         K: AsRef<[u8]>,
