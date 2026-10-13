@@ -62,6 +62,15 @@ pub struct MasterMetrics {
 
     pub(crate) operation_duration: HistogramVec,
 
+    // Delay from request receipt to the executor starting to run the handler,
+    // i.e. how long a request waited in the RPC runtime's queue. operation_duration
+    // above only covers processing time, so this is what exposes executor
+    // saturation (e.g. a read burst occupying the blocking pool) before clients
+    // start timing out. The executor label separates the two blocking pools:
+    // worker heartbeats/block reports wait on actor_rt, all other sync RPCs wait
+    // on the main runtime (see MasterHandler::uses_actor_rt).
+    pub(crate) rpc_queue_duration: HistogramVec,
+
     // for quota eviction (LRU)
     pub(crate) eviction_lru_cache_size: Gauge,
     pub(crate) eviction_trigger_count: Counter,
@@ -92,7 +101,20 @@ pub struct MasterMetrics {
 impl MasterMetrics {
     pub fn new() -> CommonResult<Self> {
         let buckets = vec![
-            10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0, 100000.0,
+            10.0,
+            50.0,
+            100.0,
+            500.0,
+            1000.0,
+            5000.0,
+            10000.0,
+            50000.0,
+            100000.0,
+            500_000.0,
+            1_000_000.0,
+            5_000_000.0,
+            10_000_000.0,
+            30_000_000.0,
         ];
         let wm = Self {
             rpc_request_total_count: m::new_counter(
@@ -179,6 +201,13 @@ impl MasterMetrics {
                 "operation_duration",
                 "Operation duration including WorkerHeartbeat",
                 &["operation"],
+                &buckets,
+            )?,
+
+            rpc_queue_duration: m::new_histogram_vec_with_buckets(
+                "rpc_queue_duration",
+                "Latency(us) from request receipt to handler execution start, by executor pool (main/actor)",
+                &["executor"],
                 &buckets,
             )?,
 
