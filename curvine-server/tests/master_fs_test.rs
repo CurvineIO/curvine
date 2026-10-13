@@ -504,6 +504,7 @@ fn full_block_report_default_limit_to_master() -> CommonResult<()> {
     let req = BlockReportListRequest {
         cluster_id: "curvine".into(),
         worker_id,
+        worker_session_id: None,
         full_report: true,
         total_len: count as u64,
         blocks: blocks
@@ -534,13 +535,13 @@ fn full_block_report_default_limit_to_master() -> CommonResult<()> {
         },
         None,
     )?;
-    assert!(result.delete_blocks.is_empty());
+    assert_eq!(result.delete_blocks.len(), count);
 
     let reported = {
         let fs_dir = fs.fs_dir.read();
         fs_dir.get_worker_block_ids(worker_id)?
     };
-    assert_eq!(reported.len(), count);
+    assert!(reported.is_empty());
     Ok(())
 }
 

@@ -199,7 +199,10 @@ impl MasterReplicationManager {
     fn source_endpoint(&self, locations: &[BlockLocation]) -> CommonResult<WorkerEndpoint> {
         let worker_manager = self.worker_manager.read();
         for location in locations {
-            if let Some(worker) = worker_manager.get_worker(location.worker_id) {
+            if let Some(worker) = worker_manager
+                .get_worker(location.worker_id)
+                .filter(|worker| worker.is_live())
+            {
                 return Ok(WorkerEndpoint {
                     address: worker.address.clone(),
                     session_id: worker.worker_session_id.clone(),

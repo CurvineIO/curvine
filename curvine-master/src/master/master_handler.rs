@@ -709,6 +709,9 @@ impl MasterHandler {
 
     pub fn worker_heartbeat(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: WorkerHeartbeatRequest = ctx.parse_header()?;
+        let status = HeartbeatStatus::from(header.status);
+        let worker_id = ProtoUtils::worker_address_from_pb(&header.address).worker_id;
+        let worker_session_id = header.worker_session_id.clone().unwrap_or_default();
         // Evaluate the compatibility policy only when the result can actually
         // be acted upon (enforce mode, configured bounds/blocklist, or the
         // worker reported component_info); otherwise a legacy worker would hit
@@ -728,10 +731,31 @@ impl MasterHandler {
             )?;
         }
         let cmds = Self::process_worker_heartbeat(self.fs.clone(), header)?;
+        if matches!(status, HeartbeatStatus::End) {
+            self.cleanup_lost_worker_locations(worker_id, &worker_session_id)?;
+        }
         let rep_header = WorkerHeartbeatResponse {
             cmds: ProtoUtils::worker_cmd_to_pb(cmds),
         };
         ctx.response(rep_header)
+    }
+
+    fn cleanup_lost_worker_locations(
+        &self,
+        worker_id: u32,
+        worker_session_id: &str,
+    ) -> FsResult<()> {
+        let Some(cleanup) = self
+            .fs
+            .delete_lost_worker_locations(worker_id, worker_session_id)?
+        else {
+            return Ok(());
+        };
+        if let Some(replication_handler) = &self.replication_handler {
+            replication_handler
+                .report_under_replicated_blocks(worker_id, cleanup.replication_block_ids)?;
+        }
+        Ok(())
     }
 
     /// Evaluate a compatibility verdict against the configured mode.
@@ -844,33 +868,37 @@ impl MasterHandler {
         // Worker weight comes from trusted administrator configuration. Preserve the
         // configured u32 value so the master does not silently alter allocation ratios.
         let weight = header.weight.unwrap_or_else(WorkerInfo::default_weight);
-        if matches!(status, HeartbeatStatus::Start) {
-            fs.reset_full_block_report(address.worker_id);
-        }
-
-        let mut wm = fs.worker_manager.write();
-        let cmds = wm.heartbeat(
-            &header.cluster_id,
-            status,
-            address,
-            weight,
-            header.worker_session_id.unwrap_or_default(),
-            curvine_model::TransferWorkerCapabilities {
-                task_submit: header.transfer_task_submit.unwrap_or(false),
-                report_target: header.transfer_report_target.unwrap_or(false),
-                query_task: header.transfer_query_task.unwrap_or(false),
-                attempt_safe_output: header.transfer_attempt_safe_output.unwrap_or(false),
-                source_read_plan: header.transfer_source_read_plan.unwrap_or(false),
-                segment_group: header.transfer_segment_group.unwrap_or(false),
-            },
-            header.transfer_inflight_budget_bytes.unwrap_or_default(),
-            header.worker_max_concurrent_tasks.unwrap_or_default() as usize,
-            header.software_version,
-            u64::try_from(header.fs_ctime).unwrap_or_default(),
-            ProtoUtils::storage_info_list_from_pb(header.storages),
-            header.component_info,
-        )?;
-        Ok(cmds)
+        let worker_id = address.worker_id;
+        fs.with_worker_location_lock(worker_id, || {
+            let (cmds, accepted_start) = {
+                let mut wm = fs.worker_manager.write();
+                wm.heartbeat(
+                    &header.cluster_id,
+                    status,
+                    address,
+                    weight,
+                    header.worker_session_id.unwrap_or_default(),
+                    curvine_model::TransferWorkerCapabilities {
+                        task_submit: header.transfer_task_submit.unwrap_or(false),
+                        report_target: header.transfer_report_target.unwrap_or(false),
+                        query_task: header.transfer_query_task.unwrap_or(false),
+                        attempt_safe_output: header.transfer_attempt_safe_output.unwrap_or(false),
+                        source_read_plan: header.transfer_source_read_plan.unwrap_or(false),
+                        segment_group: header.transfer_segment_group.unwrap_or(false),
+                    },
+                    header.transfer_inflight_budget_bytes.unwrap_or_default(),
+                    header.worker_max_concurrent_tasks.unwrap_or_default() as usize,
+                    header.software_version,
+                    u64::try_from(header.fs_ctime).unwrap_or_default(),
+                    ProtoUtils::storage_info_list_from_pb(header.storages),
+                    header.component_info,
+                )?
+            };
+            if accepted_start {
+                fs.reset_full_block_report(worker_id);
+            }
+            Ok(cmds)
+        })
     }
 
     pub fn block_report(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -888,8 +916,31 @@ impl MasterHandler {
         replication_handler: Option<MasterReplicationHandler>,
         header: BlockReportListRequest,
     ) -> FsResult<Vec<WorkerCommand>> {
+        let worker_id = header.worker_id;
+        let worker_session_id = header.worker_session_id.clone().unwrap_or_default();
         let list = ProtoUtils::block_report_list_from_pb(header);
-        let result = fs.block_report(list, replication_handler)?;
+        let result = if worker_session_id.is_empty() {
+            match fs.block_report_for_legacy_live_worker(list, replication_handler)? {
+                Some(result) => result,
+                None => return Ok(Vec::new()),
+            }
+        } else {
+            match fs.block_report_for_live_worker_session(
+                list,
+                &worker_session_id,
+                replication_handler,
+            )? {
+                Some(result) => result,
+                None => {
+                    log::warn!(
+                        "Ignore stale block report from worker {} with session {}",
+                        worker_id,
+                        worker_session_id
+                    );
+                    return Ok(Vec::new());
+                }
+            }
+        };
 
         if result.delete_blocks.is_empty() {
             Ok(Vec::new())

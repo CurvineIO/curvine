@@ -65,25 +65,22 @@ impl LoopTask for HeartbeatChecker {
 
         let mut blacklisted_workers = Vec::new();
         let mut removed_workers = Vec::new();
-        {
-            let mut wm = self.fs.worker_manager.write();
-            let workers = wm.get_last_heartbeat();
-            let now = LocalTime::mills();
-
-            for (id, last_update) in workers {
-                if now > last_update + self.worker_blacklist_ms {
-                    // Worker blacklist timeout
-                    if let Some(worker) = wm.add_blacklist_worker(id) {
-                        blacklisted_workers.push((id, worker.address, worker.last_update));
-                    }
-                }
-
-                if now > last_update + self.worker_lost_ms {
-                    // Heartbeat timeout
-                    if let Some(worker) = wm.remove_expired_worker(id) {
-                        removed_workers.push((id, worker.address, worker.last_update));
-                    }
-                }
+        let workers = self.fs.worker_manager.read().get_last_heartbeat();
+        let now = LocalTime::mills();
+        for (id, _) in workers {
+            let (blacklisted, removed) =
+                self.fs
+                    .expire_worker(id, now, self.worker_blacklist_ms, self.worker_lost_ms);
+            if let Some(worker) = blacklisted {
+                blacklisted_workers.push((id, worker.address, worker.last_update));
+            }
+            if let Some(worker) = removed {
+                removed_workers.push((
+                    id,
+                    worker.address,
+                    worker.last_update,
+                    worker.worker_session_id,
+                ));
             }
         }
 
@@ -94,7 +91,7 @@ impl LoopTask for HeartbeatChecker {
             );
         }
 
-        for (id, address, last_update) in removed_workers {
+        for (id, address, last_update, worker_session_id) in removed_workers {
             warn!(
                 "Worker {} ({}) last heartbeat {} has exceeded lost timeout {} ms and will be removed",
                 id, address, last_update, self.worker_lost_ms
@@ -104,12 +101,13 @@ impl LoopTask for HeartbeatChecker {
             let rm = self.replication_manager.clone();
             let res = self.executor.spawn(move || {
                 let spend = TimeSpent::new();
-                let cleanup = match fs.delete_locations(id) {
+                let cleanup = match fs.delete_lost_worker_locations(id, &worker_session_id) {
                     Err(e) => {
                         warn!("{}", curvine_core_error::err_msg!(e));
                         Default::default()
                     }
-                    Ok(res) => res,
+                    Ok(Some(res)) => res,
+                    Ok(None) => return,
                 };
                 let replication_block_num = cleanup.replication_block_ids.len();
                 if let Err(e) = rm.report_under_replicated_blocks(id, cleanup.replication_block_ids)

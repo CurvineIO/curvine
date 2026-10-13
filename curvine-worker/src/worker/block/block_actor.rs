@@ -17,7 +17,7 @@ use curvine_client_core::file::FsContext;
 use curvine_config::ClusterConf;
 use curvine_core_error::CommonResult;
 use curvine_model::ProtoUtils;
-use curvine_model::{BlockReportInfo, HeartbeatStatus, WorkerAddress};
+use curvine_model::{BlockReportInfo, HeartbeatStatus, WorkerAddress, WorkerCommand};
 use curvine_runtime::common::TimeSpent;
 use curvine_runtime::runtime::ScheduledExecutor;
 use curvine_runtime::runtime::{GroupExecutor, Runtime};
@@ -97,8 +97,15 @@ impl BlockActor {
     pub fn start(self) -> CommonResult<()> {
         info!("start block actor");
 
-        self.register()?;
+        let cmds = self.register()?;
         info!("worker register success");
+        HeartbeatTask::delete_block_task(
+            self.executor.clone(),
+            self.store.clone(),
+            cmds,
+            self.report_blocks.clone(),
+            self.pending_deletes.clone(),
+        );
 
         let spend = TimeSpent::new();
         let total_len = self.full_block_report()?;
@@ -121,11 +128,14 @@ impl BlockActor {
     }
 
     // Worker registration.
-    pub fn register(&self) -> CommonResult<()> {
+    pub fn register(&self) -> CommonResult<Vec<WorkerCommand>> {
         let storages_info = self.store.get_and_check_storages()?;
-        let result = self.client.heartbeat(HeartbeatStatus::Start, storages_info);
-        result?;
-        Ok(())
+        self.client
+            .heartbeat(HeartbeatStatus::Start, storages_info.clone())?;
+        let response = self
+            .client
+            .heartbeat(HeartbeatStatus::Running, storages_info)?;
+        Ok(ProtoUtils::worker_cmd_from_pb(response.cmds))
     }
 
     pub fn full_block_report(&self) -> CommonResult<usize> {

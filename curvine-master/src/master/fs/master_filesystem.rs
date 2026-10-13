@@ -63,6 +63,7 @@ pub struct MasterFilesystem {
     full_block_reports: Arc<Mutex<HashMap<u32, FullBlockReportState>>>,
     full_block_reconciles: Arc<Mutex<HashMap<u32, FullBlockReconcileState>>>,
     full_block_reconcile_executor: Arc<GroupExecutor>,
+    worker_location_locks: Arc<Vec<Mutex<()>>>,
 }
 
 pub struct BlockReportResult {
@@ -119,6 +120,7 @@ struct FullBlockReconcileJob {
 const FULL_BLOCK_REPORT_TTL_MS: u64 = 60 * 60 * 1000;
 const FULL_BLOCK_RECONCILE_THREADS: usize = 2;
 const FULL_BLOCK_RECONCILE_QUEUE_SIZE: usize = 128;
+const WORKER_LOCATION_LOCK_STRIPES: usize = 256;
 
 impl MasterFilesystem {
     // Max block-report location updates applied under a single fs_dir write lock.
@@ -166,6 +168,11 @@ impl MasterFilesystem {
                 FULL_BLOCK_RECONCILE_THREADS,
                 FULL_BLOCK_RECONCILE_QUEUE_SIZE,
             )),
+            worker_location_locks: Arc::new(
+                (0..WORKER_LOCATION_LOCK_STRIPES)
+                    .map(|_| Mutex::new(()))
+                    .collect(),
+            ),
         }
     }
 
@@ -182,6 +189,11 @@ impl MasterFilesystem {
                 FULL_BLOCK_RECONCILE_THREADS,
                 FULL_BLOCK_RECONCILE_QUEUE_SIZE,
             )),
+            worker_location_locks: Arc::new(
+                (0..WORKER_LOCATION_LOCK_STRIPES)
+                    .map(|_| Mutex::new(()))
+                    .collect(),
+            ),
         }
     }
 
@@ -1250,6 +1262,41 @@ impl MasterFilesystem {
         self.invalidate_full_block_reconcile(worker_id);
     }
 
+    pub(crate) fn with_worker_location_lock<T>(
+        &self,
+        worker_id: u32,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        let _worker_lock = self.worker_location_lock(worker_id).lock();
+        action()
+    }
+
+    pub(crate) fn expire_worker(
+        &self,
+        worker_id: u32,
+        now_ms: u64,
+        blacklist_ms: u64,
+        lost_ms: u64,
+    ) -> (Option<WorkerInfo>, Option<WorkerInfo>) {
+        self.with_worker_location_lock(worker_id, || {
+            let mut worker_manager = self.worker_manager.write();
+            let Some(last_update) = worker_manager
+                .get_worker(worker_id)
+                .map(|worker| worker.last_update)
+            else {
+                return (None, None);
+            };
+
+            let blacklisted = (now_ms > last_update + blacklist_ms)
+                .then(|| worker_manager.add_blacklist_worker(worker_id))
+                .flatten();
+            let lost = (now_ms > last_update + lost_ms)
+                .then(|| worker_manager.remove_expired_worker(worker_id))
+                .flatten();
+            (blacklisted, lost)
+        })
+    }
+
     fn invalidate_full_block_report_session(&self, worker_id: u32) {
         let now = LocalTime::mills();
         let mut reports = self.full_block_reports.lock();
@@ -1284,7 +1331,53 @@ impl MasterFilesystem {
         list: BlockReportList,
         replication_handler: Option<MasterReplicationHandler>,
     ) -> FsResult<BlockReportResult> {
+        let _worker_lock = self.worker_location_lock(list.worker_id).lock();
+        self.block_report_locked(list, replication_handler)
+    }
+
+    pub(crate) fn block_report_for_live_worker_session(
+        &self,
+        list: BlockReportList,
+        worker_session_id: &str,
+        replication_handler: Option<MasterReplicationHandler>,
+    ) -> FsResult<Option<BlockReportResult>> {
+        let _worker_lock = self.worker_location_lock(list.worker_id).lock();
+        if !self
+            .worker_manager
+            .read()
+            .is_live_worker_session(list.worker_id, worker_session_id)
+        {
+            return Ok(None);
+        }
+        self.block_report_locked(list, replication_handler)
+            .map(Some)
+    }
+
+    pub(crate) fn block_report_for_legacy_live_worker(
+        &self,
+        list: BlockReportList,
+        replication_handler: Option<MasterReplicationHandler>,
+    ) -> FsResult<Option<BlockReportResult>> {
+        let _worker_lock = self.worker_location_lock(list.worker_id).lock();
+        if !self
+            .worker_manager
+            .read()
+            .get_worker(list.worker_id)
+            .is_some_and(|worker| worker.is_live() && worker.worker_session_id.is_empty())
+        {
+            return Ok(None);
+        }
+        self.block_report_locked(list, replication_handler)
+            .map(Some)
+    }
+
+    fn block_report_locked(
+        &self,
+        list: BlockReportList,
+        replication_handler: Option<MasterReplicationHandler>,
+    ) -> FsResult<BlockReportResult> {
         // @todo check cluster.
+        let limit_replicas = list.full_report;
         let invalidate_full_reconcile = !list.full_report
             && list.blocks.iter().any(|block| {
                 matches!(
@@ -1389,11 +1482,17 @@ impl MasterFilesystem {
         }
         drop(wm);
 
+        delete_blocks.extend(self.apply_block_report_batch_locked(
+            list.worker_id,
+            batch,
+            limit_replicas,
+        )?);
+        delete_blocks.sort_unstable();
+        delete_blocks.dedup();
+
         if let Some(reported_blocks) = full_reported_blocks {
             self.submit_full_block_reconcile(list.worker_id, reported_blocks, replication_handler)?;
         }
-
-        self.apply_block_report_batch(batch)?;
 
         Ok(BlockReportResult { delete_blocks })
     }
@@ -1524,33 +1623,31 @@ impl MasterFilesystem {
         }
 
         if !batch.is_empty() {
-            let reconciles = self.full_block_reconciles.lock();
-            if !reconciles
-                .get(&worker_id)
-                .map(|state| state.generation == generation)
-                .unwrap_or(false)
-            {
+            let _worker_lock = self.worker_location_lock(worker_id).lock();
+            if !self.is_full_block_reconcile_current(worker_id, generation) {
                 info!(
                     "skip stale full block report reconcile apply for worker {}, generation {}",
                     worker_id, generation
                 );
                 return Ok(Vec::new());
             }
-            self.apply_block_report_batch(batch)?;
+            self.apply_block_report_batch_locked(worker_id, batch, false)?;
         }
 
         Ok(stale_block_ids)
     }
 
-    /// Applies block-report location updates in bounded chunks so the global
-    /// fs_dir write lock is held only briefly per chunk. Each entry is an
-    /// independent add/remove for one block location, so chunk boundaries do
-    /// not break cross-entry invariants.
-    fn apply_block_report_batch(&self, batch: Vec<(bool, i64, BlockLocation)>) -> FsResult<()> {
+    fn apply_block_report_batch_locked(
+        &self,
+        worker_id: u32,
+        batch: Vec<(bool, i64, BlockLocation)>,
+        limit_replicas: bool,
+    ) -> FsResult<Vec<i64>> {
         if batch.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
+        let mut delete_blocks = Vec::new();
         let mut iter = batch.into_iter();
         loop {
             let chunk: Vec<_> = iter.by_ref().take(Self::BLOCK_REPORT_WRITE_CHUNK).collect();
@@ -1558,9 +1655,37 @@ impl MasterFilesystem {
                 break;
             }
             let mut fs_dir = self.fs_dir.write();
-            fs_dir.block_report(chunk)?;
+            let mut accepted = Vec::with_capacity(chunk.len());
+            for (add, block_id, location) in chunk {
+                if !add {
+                    accepted.push((false, block_id, location));
+                    continue;
+                }
+
+                let Some(state) = fs_dir.replication_block_state(block_id)? else {
+                    delete_blocks.push(block_id);
+                    continue;
+                };
+                if state
+                    .locations
+                    .iter()
+                    .any(|current| current.worker_id == worker_id)
+                {
+                    continue;
+                }
+                if limit_replicas && state.locations.len() >= state.replicas as usize {
+                    delete_blocks.push(block_id);
+                    continue;
+                }
+                accepted.push((true, block_id, location));
+            }
+            fs_dir.block_report(accepted)?;
         }
-        Ok(())
+        Ok(delete_blocks)
+    }
+
+    fn worker_location_lock(&self, worker_id: u32) -> &Mutex<()> {
+        &self.worker_location_locks[worker_id as usize % WORKER_LOCATION_LOCK_STRIPES]
     }
 
     fn is_full_block_reconcile_current(&self, worker_id: u32, generation: u64) -> bool {
@@ -1572,6 +1697,27 @@ impl MasterFilesystem {
     }
 
     pub fn delete_locations(&self, worker_id: u32) -> FsResult<LostWorkerLocationCleanup> {
+        let _worker_lock = self.worker_location_lock(worker_id).lock();
+        self.delete_locations_unchecked(worker_id)
+    }
+
+    pub(crate) fn delete_lost_worker_locations(
+        &self,
+        worker_id: u32,
+        worker_session_id: &str,
+    ) -> FsResult<Option<LostWorkerLocationCleanup>> {
+        let _worker_lock = self.worker_location_lock(worker_id).lock();
+        if !self
+            .worker_manager
+            .read()
+            .is_lost_worker_session(worker_id, worker_session_id)
+        {
+            return Ok(None);
+        }
+        self.delete_locations_unchecked(worker_id).map(Some)
+    }
+
+    fn delete_locations_unchecked(&self, worker_id: u32) -> FsResult<LostWorkerLocationCleanup> {
         let removed_block_ids = {
             let fs_dir = self.fs_dir.write();
             fs_dir.delete_locations(worker_id)?
@@ -2605,4 +2751,6 @@ mod tests {
 
     #[path = "get_block_locations_batch_test.rs"]
     mod get_block_locations_batch_test;
+    #[path = "worker_recovery_test.rs"]
+    mod worker_recovery_test;
 }

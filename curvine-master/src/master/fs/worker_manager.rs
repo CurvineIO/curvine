@@ -64,7 +64,7 @@ impl WorkerManager {
         startup_time_ms: u64,
         storages: Vec<StorageInfo>,
         component_info: Option<ComponentInfoProto>,
-    ) -> FsResult<Vec<WorkerCommand>> {
+    ) -> FsResult<(Vec<WorkerCommand>, bool)> {
         // The cluster id must match to prevent misregistration.
         if cluster_id != self.cluster_id {
             return err_box!(
@@ -77,28 +77,93 @@ impl WorkerManager {
         let cmds = match status {
             HeartbeatStatus::Start => {
                 info!("Worker register: {}", addr);
-                // Enforce the same worker_id ↔ address rule as insert() before remove(): a Start
-                // from a conflicting address must not evict the live registration.
-                self.worker_map.ensure_worker_id_addr(&addr)?;
-                for stale in self.worker_map.remove_same_endpoint(&addr) {
-                    warn!(
-                        "Remove stale worker {} on restart endpoint {}",
-                        stale.simple_debug(),
-                        addr
-                    );
+                let worker_id = addr.worker_id;
+                let previous = self
+                    .worker_map
+                    .workers
+                    .get(&worker_id)
+                    .or_else(|| self.worker_map.lost_workers.get(&worker_id));
+                if let Some(worker) = previous {
+                    if !worker.worker_session_id.is_empty()
+                        && (worker_session_id.is_empty()
+                            || worker.worker_session_id == worker_session_id
+                            || startup_time_ms == 0
+                            || startup_time_ms <= worker.startup_time_ms)
+                    {
+                        warn!(
+                                "Ignore stale or unversioned worker registration for {} with session {}",
+                                addr, worker_session_id
+                            );
+                        return Ok((vec![], false));
+                    }
                 }
-                // Same node restarting: clear the slot so we do not treat it as ready or run
-                // Running heartbeat bookkeeping until insert() on the next Running beat.
-                self.worker_map.remove(&addr);
-                return Ok(vec![]);
+
+                self.worker_map.insert(
+                    addr,
+                    weight,
+                    worker_session_id,
+                    transfer_capabilities,
+                    transfer_inflight_budget_bytes,
+                    worker_max_concurrent_tasks,
+                    software_version,
+                    startup_time_ms,
+                    storages,
+                    component_info,
+                )?;
+                let worker = self.worker_map.workers.get_mut(&worker_id).unwrap();
+                if worker.status != WorkerStatus::Decommission {
+                    worker.status = WorkerStatus::Blacklist;
+                }
+                return Ok((vec![], true));
             }
 
-            HeartbeatStatus::Running => self.block_map.handle_heartbeat(addr.worker_id),
+            HeartbeatStatus::Running => {
+                let current_session_mismatch = self
+                    .worker_map
+                    .workers
+                    .get(&addr.worker_id)
+                    .is_some_and(|worker| {
+                        !worker.worker_session_id.is_empty()
+                            && worker.worker_session_id != worker_session_id
+                    });
+                let lost_session = self
+                    .worker_map
+                    .lost_workers
+                    .get(&addr.worker_id)
+                    .is_some_and(|worker| !worker.worker_session_id.is_empty());
+                if current_session_mismatch || lost_session {
+                    warn!(
+                        "Ignore stale worker heartbeat for {} with session {}",
+                        addr, worker_session_id
+                    );
+                    return Ok((vec![], false));
+                }
+                self.block_map.handle_heartbeat(addr.worker_id)
+            }
 
             HeartbeatStatus::End => {
                 info!("Worker unregister: {}", addr);
+                if worker_session_id.is_empty() {
+                    warn!(
+                        "Ignore worker unregister without a session id for {}; waiting for heartbeat timeout",
+                        addr
+                    );
+                    return Ok((vec![], false));
+                }
+                if self
+                    .worker_map
+                    .workers
+                    .get(&addr.worker_id)
+                    .is_some_and(|worker| worker.worker_session_id != worker_session_id)
+                {
+                    warn!(
+                        "Ignore stale worker unregister for {} with session {}",
+                        addr, worker_session_id
+                    );
+                    return Ok((vec![], false));
+                }
                 let _ = self.worker_map.remove_offline(addr.worker_id);
-                return Ok(vec![]);
+                return Ok((vec![], false));
             }
         };
 
@@ -115,7 +180,7 @@ impl WorkerManager {
             component_info,
         )?;
         self.expire_scheduled_bytes();
-        Ok(cmds)
+        Ok((cmds, false))
     }
 
     pub fn choose_worker(&mut self, ctx: ChooseContext) -> CommonResult<Vec<WorkerAddress>> {
@@ -246,6 +311,16 @@ impl WorkerManager {
             .workers
             .get(&id)
             .or_else(|| self.worker_map.lost_workers().get(&id))
+    }
+
+    pub fn is_lost_worker_session(&self, worker_id: u32, worker_session_id: &str) -> bool {
+        self.worker_map
+            .is_lost_worker_session(worker_id, worker_session_id)
+    }
+
+    pub fn is_live_worker_session(&self, worker_id: u32, worker_session_id: &str) -> bool {
+        self.get_worker(worker_id)
+            .is_some_and(|worker| worker.is_live() && worker.worker_session_id == worker_session_id)
     }
 
     pub fn create_locate_block(
@@ -671,4 +746,7 @@ mod tests {
 
         assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, 0);
     }
+
+    #[path = "session_recovery_test.rs"]
+    mod session_recovery_test;
 }

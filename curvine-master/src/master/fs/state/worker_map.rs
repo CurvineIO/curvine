@@ -190,4 +190,10 @@ impl WorkerMap {
     pub fn lost_workers(&self) -> &IndexMap<u32, WorkerInfo> {
         &self.lost_workers
     }
+
+    pub fn is_lost_worker_session(&self, worker_id: u32, worker_session_id: &str) -> bool {
+        self.lost_workers
+            .get(&worker_id)
+            .is_some_and(|worker| worker.worker_session_id == worker_session_id)
+    }
 }
