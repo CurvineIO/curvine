@@ -73,6 +73,7 @@ pub enum ErrorKind {
     TransferStoreUnavailable = 34,
     TransferAlreadyRunning = 35,
     TransferTargetConflict = 36,
+    SnapshotNotReady = 37,
 
     #[num_enum(default)]
     Common = 10000,
@@ -226,6 +227,11 @@ pub enum FsError {
     #[error("{0}")]
     TransferTargetConflict(ErrorImpl<StringError>),
 
+    // No complete dir-space snapshot generation is available for the queried
+    // directory yet (scanning in progress or directory not covered).
+    #[error("{0}")]
+    SnapshotNotReady(ErrorImpl<StringError>),
+
     // Other errors that are not defined.
     #[error("{0}")]
     Common(ErrorImpl<StringError>),
@@ -310,6 +316,14 @@ impl FsError {
 
     pub fn transfer_target_conflict(msg: impl Into<String>) -> Self {
         Self::TransferTargetConflict(ErrorImpl::with_source(msg.into().into()))
+    }
+
+    pub fn snapshot_not_ready(path: impl AsRef<str>) -> Self {
+        let msg = format!(
+            "Dir-space snapshot for {} is not ready yet, please retry later",
+            path.as_ref()
+        );
+        Self::SnapshotNotReady(ErrorImpl::with_source(msg.into()))
     }
 
     pub fn file_exists(path: impl AsRef<str>) -> Self {
@@ -456,6 +470,7 @@ impl FsError {
             FsError::TransferStoreUnavailable(_) => ErrorKind::TransferStoreUnavailable,
             FsError::TransferAlreadyRunning(_) => ErrorKind::TransferAlreadyRunning,
             FsError::TransferTargetConflict(_) => ErrorKind::TransferTargetConflict,
+            FsError::SnapshotNotReady(_) => ErrorKind::SnapshotNotReady,
             FsError::Common(_) => ErrorKind::Common,
         }
     }
@@ -604,6 +619,7 @@ impl ErrorExt for FsError {
             FsError::TransferStoreUnavailable(e) => FsError::TransferStoreUnavailable(e.ctx(ctx)),
             FsError::TransferAlreadyRunning(e) => FsError::TransferAlreadyRunning(e.ctx(ctx)),
             FsError::TransferTargetConflict(e) => FsError::TransferTargetConflict(e.ctx(ctx)),
+            FsError::SnapshotNotReady(e) => FsError::SnapshotNotReady(e.ctx(ctx)),
             FsError::Common(e) => FsError::Common(e.ctx(ctx)),
         }
     }
@@ -646,6 +662,7 @@ impl ErrorExt for FsError {
             FsError::TransferStoreUnavailable(e) => e.encode(ErrorKind::TransferStoreUnavailable),
             FsError::TransferAlreadyRunning(e) => e.encode(ErrorKind::TransferAlreadyRunning),
             FsError::TransferTargetConflict(e) => e.encode(ErrorKind::TransferTargetConflict),
+            FsError::SnapshotNotReady(e) => e.encode(ErrorKind::SnapshotNotReady),
             FsError::Common(e) => e.encode(ErrorKind::Common),
         }
     }
@@ -693,6 +710,7 @@ impl ErrorExt for FsError {
             }
             ErrorKind::TransferAlreadyRunning => FsError::TransferAlreadyRunning(de.into_string()),
             ErrorKind::TransferTargetConflict => FsError::TransferTargetConflict(de.into_string()),
+            ErrorKind::SnapshotNotReady => FsError::SnapshotNotReady(de.into_string()),
             ErrorKind::Common => FsError::Common(de.into_string()),
         }
     }
@@ -832,5 +850,26 @@ mod tests {
         let decoded = FsError::decode(bytes);
         assert!(matches!(decoded, FsError::TransferTargetConflict(_)));
         assert!(decoded.to_string().contains("/a"));
+    }
+
+    #[test]
+    pub fn snapshot_not_ready_test() {
+        let error = FsError::snapshot_not_ready("/mnt/data");
+
+        assert!(matches!(error.kind(), ErrorKind::SnapshotNotReady));
+        assert!(matches!(error, FsError::SnapshotNotReady(_)));
+        assert!(error.to_string().contains("/mnt/data"));
+
+        // Wire round-trip must preserve the kind (no collapse into Common).
+        let bytes = error.encode();
+        let decoded = FsError::decode(bytes);
+        assert!(matches!(decoded.kind(), ErrorKind::SnapshotNotReady));
+        assert!(matches!(decoded, FsError::SnapshotNotReady(_)));
+        assert!(decoded.to_string().contains("/mnt/data"));
+    }
+
+    #[test]
+    pub fn snapshot_not_ready_kind_value_test() {
+        assert_eq!(ErrorKind::SnapshotNotReady as i32, 37);
     }
 }

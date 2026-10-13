@@ -123,6 +123,9 @@ pub use self::file_alloc::*;
 mod file_lock;
 pub use self::file_lock::*;
 
+mod content_summary;
+pub use self::content_summary::{ContentSummary, ContentSummarySnapshot, ContentSummarySource};
+
 mod result;
 pub use self::result::*;
 

@@ -19,6 +19,7 @@ pub const GET_BLOCK_LOCATIONS_BATCH_MAX_PATHS: usize = 64;
 pub const GET_BLOCK_LOCATIONS_BATCH_MAX_ENCODED_PATH_BYTES: usize = 1024 * 1024;
 pub const GET_BLOCK_LOCATIONS_BATCH_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 pub const MASTER_CAPABILITY_GET_BLOCK_LOCATIONS_BATCH: &str = "get-block-locations-batch";
+pub const MASTER_CAPABILITY_GET_CONTENT_SUMMARY_SNAPSHOT: &str = "get-content-summary-snapshot-v1";
 
 #[repr(i8)]
 #[derive(Debug, IntoPrimitive, FromPrimitive, PartialEq, Eq, Hash, Copy, Clone)]
@@ -95,6 +96,7 @@ pub enum RpcCode {
     PrepareReplication = 65,
     ReconcileReplication = 66,
     SubmitFencedReplication = 67,
+    GetContentSummary = 68,
 
     MetricsReport = 60,
     GetBlockLocationsBatch = 61,
@@ -113,5 +115,27 @@ pub enum RpcCode {
 impl fmt::Display for RpcCode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:?}", self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    pub fn content_summary_rpc_code_test() {
+        // Dir-space content summary uses the next free master RPC code 68.
+        assert_eq!(RpcCode::GetContentSummary as i8, 68);
+        assert_eq!(RpcCode::from(68), RpcCode::GetContentSummary);
+        // The wire round-trip must not collide with any existing code.
+        assert_eq!(RpcCode::from(68i8).to_string(), "GetContentSummary");
+    }
+
+    #[test]
+    pub fn content_summary_capability_test() {
+        assert_eq!(
+            MASTER_CAPABILITY_GET_CONTENT_SUMMARY_SNAPSHOT,
+            "get-content-summary-snapshot-v1"
+        );
     }
 }

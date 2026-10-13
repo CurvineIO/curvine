@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::content_summary::{ContentSummary, ContentSummarySnapshot, ContentSummarySource};
 use crate::proto::*;
 use crate::state::*;
 use crate::worker_info::TransferWorkerCapabilities;
@@ -980,6 +981,53 @@ impl ProtoUtils {
         RuntimeConfigResetResult {
             key: rep.key,
             effective_value_json: rep.effective_value_json,
+        }
+    }
+
+    pub fn content_summary_to_pb(src: ContentSummary) -> ContentSummaryProto {
+        let mut pb = ContentSummaryProto {
+            logical_bytes: Some(src.logical_bytes),
+            file_count: Some(src.file_count),
+            directory_count: Some(src.directory_count),
+            source: src.source.as_ref().map(|s| s.as_str().to_string()),
+            ..Default::default()
+        };
+
+        // Snapshot metadata is only set for generation-served results; file
+        // and live-recursive results leave these fields unset on the wire.
+        if let Some(snapshot) = src.snapshot {
+            pb.generation = Some(snapshot.generation);
+            pb.started_ms = Some(snapshot.started_ms);
+            pb.finished_ms = Some(snapshot.finished_ms);
+            pb.anomaly_count = Some(snapshot.anomaly_count);
+            pb.degraded = Some(snapshot.degraded);
+        }
+
+        pb
+    }
+
+    pub fn content_summary_from_pb(src: ContentSummaryProto) -> ContentSummary {
+        let source = src
+            .source
+            .as_deref()
+            .map(ContentSummarySource::from_str_lossy);
+
+        // A published generation is recognisable by its monotonically
+        // assigned generation field; legacy/live responses leave it unset.
+        let snapshot = src.generation.map(|generation| ContentSummarySnapshot {
+            generation,
+            started_ms: src.started_ms.unwrap_or_default(),
+            finished_ms: src.finished_ms.unwrap_or_default(),
+            anomaly_count: src.anomaly_count.unwrap_or_default(),
+            degraded: src.degraded.unwrap_or(false),
+        });
+
+        ContentSummary {
+            logical_bytes: src.logical_bytes.unwrap_or_default(),
+            file_count: src.file_count.unwrap_or_default(),
+            directory_count: src.directory_count.unwrap_or_default(),
+            source,
+            snapshot,
         }
     }
 }
