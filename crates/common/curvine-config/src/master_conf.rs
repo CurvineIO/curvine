@@ -160,6 +160,46 @@ pub struct MasterConf {
         deserialize_with = "MasterConf::deserialize_rocksdb"
     )]
     pub rocksdb: DBConf,
+
+    // Dir-space snapshot (default off).
+    pub dir_space_enabled: bool,
+    pub dir_space_global_scan_interval: String,
+    #[serde(skip)]
+    pub dir_space_global_scan_interval_unit: DurationUnit,
+    pub dir_space_global_scan_timeout: String,
+    #[serde(skip)]
+    pub dir_space_global_scan_timeout_unit: DurationUnit,
+    pub dir_space_tracked_scan_interval: String,
+    #[serde(skip)]
+    pub dir_space_tracked_scan_interval_unit: DurationUnit,
+    pub dir_space_tracked_scan_timeout: String,
+    #[serde(skip)]
+    pub dir_space_tracked_scan_timeout_unit: DurationUnit,
+    pub dir_space_max_inodes: u64,
+    pub dir_space_max_edges: u64,
+    pub dir_space_max_dirs: u64,
+    pub dir_space_memory_budget: String,
+    #[serde(skip)]
+    pub dir_space_memory_budget_unit: ByteUnit,
+    pub dir_space_max_depth: u32,
+    pub dir_space_track_max_inodes: u64,
+    pub dir_space_track_max_edges: u64,
+    pub dir_space_track_memory_budget: String,
+    #[serde(skip)]
+    pub dir_space_track_memory_budget_unit: ByteUnit,
+    pub dir_space_track_max_depth: u32,
+    pub dir_space_max_tracked_points: u32,
+    pub dir_space_max_inode_record_bytes: String,
+    #[serde(skip)]
+    pub dir_space_max_inode_record_bytes_unit: ByteUnit,
+    pub dir_space_auto_track_mounts: bool,
+    pub dir_space_tracked_paths: Vec<String>,
+    pub dir_space_restore_wait_timeout: String,
+    #[serde(skip)]
+    pub dir_space_restore_wait_timeout_unit: DurationUnit,
+    /// Normalized absolute tracked paths (no root `/`), populated in `init()`.
+    #[serde(skip)]
+    pub dir_space_tracked_paths_normalized: Vec<String>,
 }
 
 impl MasterConf {
@@ -190,6 +230,24 @@ impl MasterConf {
         // Initialize lock expiration time
         self.lock_expire_time_unit = DurationUnit::from_str(&self.lock_expire_time)?;
 
+        self.dir_space_global_scan_interval_unit =
+            DurationUnit::from_str(&self.dir_space_global_scan_interval)?;
+        self.dir_space_global_scan_timeout_unit =
+            DurationUnit::from_str(&self.dir_space_global_scan_timeout)?;
+        self.dir_space_tracked_scan_interval_unit =
+            DurationUnit::from_str(&self.dir_space_tracked_scan_interval)?;
+        self.dir_space_tracked_scan_timeout_unit =
+            DurationUnit::from_str(&self.dir_space_tracked_scan_timeout)?;
+        self.dir_space_restore_wait_timeout_unit =
+            DurationUnit::from_str(&self.dir_space_restore_wait_timeout)?;
+        self.dir_space_memory_budget_unit = ByteUnit::from_str(&self.dir_space_memory_budget)?;
+        self.dir_space_track_memory_budget_unit =
+            ByteUnit::from_str(&self.dir_space_track_memory_budget)?;
+        self.dir_space_max_inode_record_bytes_unit =
+            ByteUnit::from_str(&self.dir_space_max_inode_record_bytes)?;
+
+        self.validate_dir_space()?;
+
         if self.heartbeat_interval_unit > self.worker_blacklist_interval_unit {
             return err_box!("Worker_blacklist_interval must be greater than heartbeat_interval");
         };
@@ -215,6 +273,129 @@ impl MasterConf {
         }
 
         Ok(())
+    }
+
+    fn validate_dir_space(&mut self) -> CommonResult<()> {
+        if self.dir_space_global_scan_interval_unit.as_millis() == 0 {
+            return err_box!("dir_space_global_scan_interval must be greater than zero");
+        }
+        if self.dir_space_global_scan_timeout_unit.as_millis() == 0 {
+            return err_box!("dir_space_global_scan_timeout must be greater than zero");
+        }
+        if self.dir_space_tracked_scan_interval_unit.as_millis() == 0 {
+            return err_box!("dir_space_tracked_scan_interval must be greater than zero");
+        }
+        if self.dir_space_tracked_scan_timeout_unit.as_millis() == 0 {
+            return err_box!("dir_space_tracked_scan_timeout must be greater than zero");
+        }
+        if self.dir_space_restore_wait_timeout_unit.as_millis() == 0 {
+            return err_box!("dir_space_restore_wait_timeout must be greater than zero");
+        }
+
+        if self.dir_space_global_scan_timeout_unit > self.dir_space_global_scan_interval_unit {
+            return err_box!(
+                "dir_space_global_scan_timeout must not be greater than dir_space_global_scan_interval"
+            );
+        }
+        if self.dir_space_tracked_scan_timeout_unit > self.dir_space_tracked_scan_interval_unit {
+            return err_box!(
+                "dir_space_tracked_scan_timeout must not be greater than dir_space_tracked_scan_interval"
+            );
+        }
+
+        for field in [
+            ("dir_space_max_inodes", self.dir_space_max_inodes),
+            ("dir_space_max_edges", self.dir_space_max_edges),
+            ("dir_space_max_dirs", self.dir_space_max_dirs),
+            (
+                "dir_space_track_max_inodes",
+                self.dir_space_track_max_inodes,
+            ),
+            ("dir_space_track_max_edges", self.dir_space_track_max_edges),
+        ] {
+            if field.1 == 0 {
+                return err_box!("{} must be greater than zero", field.0);
+            }
+        }
+        if self.dir_space_max_depth == 0 {
+            return err_box!("dir_space_max_depth must be greater than zero");
+        }
+        if self.dir_space_track_max_depth == 0 {
+            return err_box!("dir_space_track_max_depth must be greater than zero");
+        }
+        if self.dir_space_max_tracked_points == 0 {
+            return err_box!("dir_space_max_tracked_points must be greater than zero");
+        }
+        if self.dir_space_memory_budget_unit.as_byte() == 0 {
+            return err_box!("dir_space_memory_budget must be greater than zero");
+        }
+        if self.dir_space_track_memory_budget_unit.as_byte() == 0 {
+            return err_box!("dir_space_track_memory_budget must be greater than zero");
+        }
+        if self.dir_space_max_inode_record_bytes_unit.as_byte() == 0 {
+            return err_box!("dir_space_max_inode_record_bytes must be greater than zero");
+        }
+
+        let mut normalized = Vec::new();
+        for raw in self.dir_space_tracked_paths.clone() {
+            let path = raw.trim();
+            if path.is_empty() {
+                continue;
+            }
+            if !path.starts_with('/') {
+                return err_box!("dir_space_tracked_paths entries must be absolute paths");
+            }
+            if path.contains('*') || path.contains('?') || path.contains('[') {
+                return err_box!("dir_space_tracked_paths must not contain glob characters");
+            }
+            let mut norm = path.to_string();
+            while norm.len() > 1 && norm.ends_with('/') {
+                norm.pop();
+            }
+            if norm == "/" {
+                continue;
+            }
+            if !normalized.iter().any(|p| p == &norm) {
+                normalized.push(norm);
+            }
+        }
+        if normalized.len() > self.dir_space_max_tracked_points as usize {
+            return err_box!("dir_space_tracked_paths exceeds dir_space_max_tracked_points");
+        }
+        self.dir_space_tracked_paths_normalized = normalized;
+        Ok(())
+    }
+
+    pub fn dir_space_global_scan_interval_ms(&self) -> u64 {
+        self.dir_space_global_scan_interval_unit.as_millis()
+    }
+
+    pub fn dir_space_global_scan_timeout_ms(&self) -> u64 {
+        self.dir_space_global_scan_timeout_unit.as_millis()
+    }
+
+    pub fn dir_space_tracked_scan_interval_ms(&self) -> u64 {
+        self.dir_space_tracked_scan_interval_unit.as_millis()
+    }
+
+    pub fn dir_space_tracked_scan_timeout_ms(&self) -> u64 {
+        self.dir_space_tracked_scan_timeout_unit.as_millis()
+    }
+
+    pub fn dir_space_restore_wait_timeout_ms(&self) -> u64 {
+        self.dir_space_restore_wait_timeout_unit.as_millis()
+    }
+
+    pub fn dir_space_memory_budget_bytes(&self) -> u64 {
+        self.dir_space_memory_budget_unit.as_byte()
+    }
+
+    pub fn dir_space_track_memory_budget_bytes(&self) -> u64 {
+        self.dir_space_track_memory_budget_unit.as_byte()
+    }
+
+    pub fn dir_space_max_inode_record_bytes(&self) -> u64 {
+        self.dir_space_max_inode_record_bytes_unit.as_byte()
     }
 
     pub fn rocksdb_default() -> DBConf {
@@ -420,6 +601,35 @@ impl Default for MasterConf {
             compatibility: Default::default(),
 
             rocksdb,
+
+            dir_space_enabled: false,
+            dir_space_global_scan_interval: "10m".to_string(),
+            dir_space_global_scan_interval_unit: Default::default(),
+            dir_space_global_scan_timeout: "5m".to_string(),
+            dir_space_global_scan_timeout_unit: Default::default(),
+            dir_space_tracked_scan_interval: "2m".to_string(),
+            dir_space_tracked_scan_interval_unit: Default::default(),
+            dir_space_tracked_scan_timeout: "90s".to_string(),
+            dir_space_tracked_scan_timeout_unit: Default::default(),
+            dir_space_max_inodes: 5_000_000,
+            dir_space_max_edges: 10_000_000,
+            dir_space_max_dirs: 1_000_000,
+            dir_space_memory_budget: "768MB".to_string(),
+            dir_space_memory_budget_unit: Default::default(),
+            dir_space_max_depth: 1024,
+            dir_space_track_max_inodes: 1_000_000,
+            dir_space_track_max_edges: 2_000_000,
+            dir_space_track_memory_budget: "256MB".to_string(),
+            dir_space_track_memory_budget_unit: Default::default(),
+            dir_space_track_max_depth: 1024,
+            dir_space_max_tracked_points: 128,
+            dir_space_max_inode_record_bytes: "16MB".to_string(),
+            dir_space_max_inode_record_bytes_unit: Default::default(),
+            dir_space_auto_track_mounts: true,
+            dir_space_tracked_paths: Vec::new(),
+            dir_space_restore_wait_timeout: "30s".to_string(),
+            dir_space_restore_wait_timeout_unit: Default::default(),
+            dir_space_tracked_paths_normalized: Vec::new(),
         };
 
         conf.init().unwrap();
@@ -543,5 +753,97 @@ mod tests {
         assert!(error
             .to_string()
             .contains("block_replication_job_timeout must be greater than zero"));
+    }
+
+    mod dir_space {
+        use super::*;
+
+        #[test]
+        fn defaults_disabled_with_design_values() {
+            let conf = MasterConf::default();
+            assert!(!conf.dir_space_enabled);
+            assert_eq!(conf.dir_space_global_scan_interval, "10m");
+            assert_eq!(conf.dir_space_global_scan_timeout, "5m");
+            assert_eq!(conf.dir_space_tracked_scan_interval, "2m");
+            assert_eq!(conf.dir_space_tracked_scan_timeout, "90s");
+            assert_eq!(conf.dir_space_max_inodes, 5_000_000);
+            assert_eq!(conf.dir_space_max_edges, 10_000_000);
+            assert_eq!(conf.dir_space_max_dirs, 1_000_000);
+            assert_eq!(conf.dir_space_memory_budget, "768MB");
+            assert_eq!(conf.dir_space_max_depth, 1024);
+            assert_eq!(conf.dir_space_track_max_inodes, 1_000_000);
+            assert_eq!(conf.dir_space_track_max_edges, 2_000_000);
+            assert_eq!(conf.dir_space_track_memory_budget, "256MB");
+            assert_eq!(conf.dir_space_track_max_depth, 1024);
+            assert_eq!(conf.dir_space_max_tracked_points, 128);
+            assert_eq!(conf.dir_space_max_inode_record_bytes, "16MB");
+            assert!(conf.dir_space_auto_track_mounts);
+            assert_eq!(conf.dir_space_restore_wait_timeout, "30s");
+            assert_eq!(conf.dir_space_global_scan_interval_ms(), 600_000);
+            assert_eq!(
+                conf.dir_space_memory_budget_bytes(),
+                ByteUnit::mb(768).as_byte()
+            );
+        }
+
+        #[test]
+        fn zero_limits_rejected() {
+            let mut conf = MasterConf {
+                dir_space_max_inodes: 0,
+                ..Default::default()
+            };
+            let err = conf.init().unwrap_err();
+            assert!(err.to_string().contains("dir_space_max_inodes"));
+        }
+
+        #[test]
+        fn invalid_duration_rejected() {
+            let mut conf = MasterConf {
+                dir_space_global_scan_interval: "not-a-duration".to_string(),
+                ..Default::default()
+            };
+            assert!(conf.init().is_err());
+        }
+
+        #[test]
+        fn global_timeout_must_not_exceed_interval() {
+            let mut conf = MasterConf {
+                dir_space_global_scan_interval: "1m".to_string(),
+                dir_space_global_scan_timeout: "2m".to_string(),
+                ..Default::default()
+            };
+            let err = conf.init().unwrap_err();
+            assert!(err.to_string().contains("dir_space_global_scan_timeout"));
+        }
+
+        #[test]
+        fn relative_tracked_path_rejected() {
+            let mut conf = MasterConf {
+                dir_space_tracked_paths: vec!["relative/path".to_string()],
+                ..Default::default()
+            };
+            let err = conf.init().unwrap_err();
+            assert!(err
+                .to_string()
+                .contains("dir_space_tracked_paths entries must be absolute"));
+        }
+
+        #[test]
+        fn tracked_paths_deduped_and_root_removed() {
+            let mut conf = MasterConf {
+                dir_space_tracked_paths: vec![
+                    "/".to_string(),
+                    "/data/".to_string(),
+                    "/data".to_string(),
+                    "/other".to_string(),
+                ],
+                ..Default::default()
+            };
+            conf.init().unwrap();
+            assert_eq!(
+                conf.dir_space_tracked_paths_normalized,
+                vec!["/data".to_string(), "/other".to_string()]
+            );
+        }
     }
 }
