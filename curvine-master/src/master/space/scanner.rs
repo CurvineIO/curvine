@@ -52,6 +52,9 @@ use crate::master::space::scan_lease::MetadataScanLease;
 /// many records.
 const CHECK_INTERVAL: u64 = 4096;
 
+/// Maximum child inode ids fetched per RocksDB batch in a point BFS step.
+pub(crate) const POINT_CHILD_BATCH_SIZE: usize = 1024;
+
 /// Per-record size guard against corrupted or adversarial edge values.
 const MAX_EDGE_VALUE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -119,6 +122,199 @@ pub struct UnpublishedSnapshot {
 
 /// Scans one RocksDB metadata snapshot into a complete dir-space generation.
 pub struct GlobalScanner;
+
+/// BFS dir-space scanner rooted at one tracked directory inode.
+pub struct PointScanner;
+
+impl PointScanner {
+    /// Scan the subtree reachable from `root_id` within one metadata snapshot.
+    ///
+    /// Path resolution happens before this call; the scanner only reads
+    /// RocksDB via `lease`. Sibling subtrees and nodes outside the BFS
+    /// closure are never visited.
+    pub fn scan(
+        lease: &MetadataScanLease,
+        root_id: i64,
+        context: &ScanContext,
+    ) -> CommonResult<UnpublishedSnapshot> {
+        let started_ms = now_ms();
+        let reader = lease.snapshot_reader()?;
+        let mut scan = PointScanState::new(root_id, context);
+        scan.check_cooperative(lease)?;
+        scan.run_bfs(&reader, lease)?;
+        let UnpublishedScan {
+            root,
+            entries,
+            stats,
+            inode_count,
+            edge_count,
+        } = scan.build()?;
+
+        drop(reader);
+
+        Ok(UnpublishedSnapshot {
+            source: SnapshotSource::TrackedPoint,
+            root_id,
+            root,
+            entries,
+            started_ms,
+            finished_ms: now_ms(),
+            inode_count,
+            edge_count,
+            stats,
+        })
+    }
+}
+
+struct PointScanState<'a> {
+    root_id: i64,
+    context: &'a ScanContext,
+    aggregator: SubtreeAggregator,
+    inode_count: u64,
+    edge_count: u64,
+    dir_count: u64,
+    stats: AggregationStats,
+}
+
+impl<'a> PointScanState<'a> {
+    fn new(root_id: i64, context: &'a ScanContext) -> Self {
+        let limits = context.limits;
+        Self {
+            root_id,
+            context,
+            aggregator: SubtreeAggregator::new(root_id, limits.max_dirs, limits.max_depth),
+            inode_count: 0,
+            edge_count: 0,
+            dir_count: 1,
+            stats: AggregationStats::default(),
+        }
+    }
+
+    fn check_cooperative(&self, lease: &MetadataScanLease) -> CommonResult<()> {
+        if lease.is_cancelled() {
+            return err_box!("dir-space scan aborted: scan lease cancelled by restore");
+        }
+        if !(self.context.is_active)() {
+            return err_box!("dir-space scan aborted: master role lost");
+        }
+        if Instant::now() >= self.context.deadline {
+            return err_box!("dir-space point scan timed out");
+        }
+        Ok(())
+    }
+
+    fn check_budget(&self) -> CommonResult<()> {
+        let limits = self.context.limits;
+        if self.inode_count > limits.max_inodes {
+            return err_box!("dir-space MaxInodes limit {} exceeded", limits.max_inodes);
+        }
+        if self.edge_count > limits.max_edges {
+            return err_box!("dir-space MaxEdges limit {} exceeded", limits.max_edges);
+        }
+        let estimated = limits.estimated_bytes(self.inode_count, self.dir_count, self.edge_count);
+        if estimated > limits.memory_budget_bytes {
+            return err_box!(
+                "dir-space memory budget {} bytes exceeded (estimated {} bytes)",
+                limits.memory_budget_bytes,
+                estimated
+            );
+        }
+        Ok(())
+    }
+
+    fn run_bfs(
+        &mut self,
+        reader: &InodeStoreSnapshot<'_>,
+        lease: &MetadataScanLease,
+    ) -> CommonResult<()> {
+        use std::collections::VecDeque;
+
+        let mut queue: VecDeque<(i64, u32)> = VecDeque::new();
+        queue.push_back((self.root_id, 0));
+
+        while let Some((parent_id, depth)) = queue.pop_front() {
+            self.check_cooperative(lease)?;
+            self.check_budget()?;
+
+            let mut child_ids = Vec::new();
+            for item in reader.scan_children(parent_id)? {
+                let (_, value) = try_err!(item);
+                if value.len() > MAX_EDGE_VALUE_BYTES {
+                    return err_box!(
+                        "dir-space edge value of {} bytes exceeds sanity limit",
+                        value.len()
+                    );
+                }
+                self.edge_count = match self.edge_count.checked_add(1) {
+                    Some(v) => v,
+                    None => return err_box!("dir-space edge count overflow"),
+                };
+                child_ids.push(i64_from_value(&value)?);
+            }
+
+            for chunk in child_ids.chunks(POINT_CHILD_BATCH_SIZE) {
+                self.check_cooperative(lease)?;
+                self.check_budget()?;
+                let inodes = reader.get_inodes(chunk)?;
+                for (&child_id, inode_opt) in chunk.iter().zip(inodes.iter()) {
+                    self.inode_count = match self.inode_count.checked_add(1) {
+                        Some(v) => v,
+                        None => return err_box!("dir-space inode count overflow"),
+                    };
+                    let Some(view) = inode_opt else {
+                        self.stats.record_anomaly(1);
+                        continue;
+                    };
+                    if view.id() != child_id {
+                        return err_box!(
+                            "dir-space scan: inode key/value id mismatch (key {}, value {})",
+                            child_id,
+                            view.id()
+                        );
+                    }
+                    let fact = inode_fact_from_view_ref(view);
+                    if fact.is_dir {
+                        if depth.saturating_add(1) >= self.context.limits.max_depth {
+                            return err_box!(
+                                "dir-space MaxDepth limit {} exceeded",
+                                self.context.limits.max_depth
+                            );
+                        }
+                        self.dir_count = match self.dir_count.checked_add(1) {
+                            Some(v) => v,
+                            None => return err_box!("dir-space dir count overflow"),
+                        };
+                        self.aggregator.add_dir(child_id, parent_id)?;
+                        queue.push_back((child_id, depth.saturating_add(1)));
+                    } else {
+                        if fact.logical_len < 0 {
+                            self.stats.record_anomaly(1);
+                        }
+                        self.aggregator.add_file(parent_id, fact.logical_len)?;
+                    }
+                }
+            }
+        }
+        self.check_budget()
+    }
+
+    fn build(self) -> CommonResult<UnpublishedScan> {
+        let AggregationOutput {
+            root,
+            entries,
+            mut stats,
+        } = self.aggregator.build()?;
+        stats.anomaly_count = stats.anomaly_count.saturating_add(self.stats.anomaly_count);
+        stats.degraded = stats.degraded || self.stats.degraded;
+        Ok(UnpublishedScan {
+            root,
+            entries,
+            stats,
+            inode_count: self.inode_count,
+            edge_count: self.edge_count,
+        })
+    }
+}
 
 impl GlobalScanner {
     /// Run one global scan round on `lease`'s consistent read view.
@@ -400,19 +596,20 @@ fn inode_fact_from_view(id: i64, bytes: &[u8]) -> CommonResult<InodeFact> {
             view.id()
         );
     }
+    Ok(inode_fact_from_view_ref(&view))
+}
 
-    Ok(match &view {
+fn inode_fact_from_view_ref(view: &InodeView) -> InodeFact {
+    match view {
         InodeView::Dir(_) => InodeFact {
             is_dir: true,
             logical_len: 0,
         },
-        // Files, links, entries and other special nodes all count as
-        // non-directory items priced at their logical length.
         _ => InodeFact {
             is_dir: false,
-            logical_len: inode_logical_len(&view),
+            logical_len: inode_logical_len(view),
         },
-    })
+    }
 }
 
 /// Logical length of a non-directory inode (negative lengths degrade to 0).
@@ -522,7 +719,7 @@ mod tests {
     }
 
     fn agg_of(snap: &UnpublishedSnapshot, id: i64) -> DirAgg {
-        if id == ROOT_INODE_ID {
+        if id == ROOT_INODE_ID || id == snap.root_id {
             snap.root
         } else {
             *snap
@@ -868,6 +1065,114 @@ mod tests {
         let active = Arc::new(AtomicBool::new(false));
         let err = run_global(&store, &context(&active)).unwrap_err();
         assert!(err.to_string().contains("role"));
+        Ok(())
+    }
+
+    fn run_point(
+        store: &InodeStore,
+        root_id: i64,
+        ctx: &ScanContext,
+    ) -> CommonResult<UnpublishedSnapshot> {
+        let lease = store.begin_snapshot_scan()?;
+        PointScanner::scan(&lease, root_id, ctx)
+    }
+
+    #[test]
+    fn tracked_point_scan_excludes_sibling_subtree() -> CommonResult<()> {
+        let store = new_store("point-sibling")?;
+        seed_basic(&store)?;
+
+        let active = Arc::new(AtomicBool::new(true));
+        let snap = run_point(&store, 2001, &context(&active))?;
+
+        assert_eq!(snap.root_id, 2001);
+        assert_eq!(snap.source, SnapshotSource::TrackedPoint);
+        let root = agg_of(&snap, 2001);
+        assert_eq!(root.file_count, 1);
+        assert_eq!(root.logical_bytes, 100);
+        assert!(!snap.entries.contains_key(&2002));
+        assert!(!snap.entries.contains_key(&ROOT_INODE_ID));
+        Ok(())
+    }
+
+    #[test]
+    fn tracked_point_child_batch_boundary() -> CommonResult<()> {
+        let store = new_store("point-batch")?;
+        let root = FsDir::create_root();
+        let dir_a = dir("a", 2001, ROOT_INODE_ID);
+        let mut inodes = vec![root, dir_a];
+        let mut edges = vec![(ROOT_INODE_ID, "a".to_string(), 2001)];
+
+        for i in 0..1025 {
+            let id = 10_000 + i;
+            inodes.push(file(&format!("f{i}"), id, 2001, 1));
+            edges.push((2001, format!("f{i}"), id));
+        }
+        write_batch(&store, &inodes, &edges)?;
+
+        let active = Arc::new(AtomicBool::new(true));
+        let snap = run_point(&store, 2001, &context(&active))?;
+        assert_eq!(snap.root.file_count, 1025);
+        Ok(())
+    }
+
+    #[test]
+    fn tracked_point_max_inodes_limit_aborts() -> CommonResult<()> {
+        let store = new_store("point-max-inodes")?;
+        let root = FsDir::create_root();
+        let dir_a = dir("a", 2001, ROOT_INODE_ID);
+        write_batch(
+            &store,
+            &[
+                root,
+                dir_a,
+                file("f1", 3001, 2001, 1),
+                file("f2", 3002, 2001, 1),
+            ],
+            &[
+                (ROOT_INODE_ID, "a".to_string(), 2001),
+                (2001, "f1".to_string(), 3001),
+                (2001, "f2".to_string(), 3002),
+            ],
+        )?;
+        let ctx = ScanContext {
+            deadline: Instant::now() + Duration::from_secs(60),
+            is_active: Box::new(|| true),
+            limits: ScanLimits {
+                max_inodes: 1,
+                ..limits()
+            },
+        };
+        let err = run_point(&store, 2001, &ctx).unwrap_err();
+        assert!(err.to_string().contains("MaxInodes"));
+        Ok(())
+    }
+
+    #[test]
+    fn tracked_point_max_depth_limit_aborts() -> CommonResult<()> {
+        let store = new_store("point-max-depth")?;
+        let depth = 5;
+        let mut inodes = vec![FsDir::create_root()];
+        let mut edges = Vec::new();
+        let mut parent = ROOT_INODE_ID;
+        for i in 0..depth {
+            let id = 7000 + i;
+            inodes.push(dir(&format!("d{i}"), id, parent));
+            edges.push((parent, format!("d{i}"), id));
+            parent = id;
+        }
+        write_batch(&store, &inodes, &edges)?;
+
+        let ctx = ScanContext {
+            deadline: Instant::now() + Duration::from_secs(60),
+            is_active: Box::new(|| true),
+            limits: ScanLimits {
+                max_depth: 2,
+                ..limits()
+            },
+        };
+        let err = run_point(&store, ROOT_INODE_ID, &ctx).unwrap_err();
+        assert!(err.to_string().contains("MaxDepth"));
         Ok(())
     }
 

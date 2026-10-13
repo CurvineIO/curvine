@@ -45,9 +45,11 @@ use curvine_runtime::common::LocalTime;
 use log::{info, warn};
 
 use crate::master::fs::MasterFilesystem;
-use crate::master::space::scanner::{GlobalScanner, ScanContext, ScanLimits};
+use crate::master::space::scanner::{GlobalScanner, PointScanner, ScanContext, ScanLimits};
 use crate::master::space::store::DirSpaceSnapshotStore;
 use crate::master::space::types::{DirAgg, DirSpaceSnapshot, SnapshotMeta, SnapshotSource};
+use crate::master::MountManager;
+use std::collections::HashSet;
 
 /// Outcome of one attempted global scan round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +99,7 @@ pub enum DirSpaceQueryError {
 /// Scan driver plus query facade over the published snapshot generations.
 pub struct DirSpaceManager {
     fs: MasterFilesystem,
+    mount_manager: Arc<MountManager>,
     conf: Arc<MasterConf>,
     store: DirSpaceSnapshotStore,
     pub(crate) scan_permit: AtomicBool,
@@ -107,12 +110,12 @@ impl DirSpaceManager {
     /// is accepted here so the wiring is stable across the two tasks.
     pub fn new(
         fs: MasterFilesystem,
-        mount_manager: std::sync::Arc<crate::master::MountManager>,
+        mount_manager: Arc<MountManager>,
         conf: Arc<MasterConf>,
     ) -> Self {
-        let _ = mount_manager;
         Self {
             fs,
+            mount_manager,
             conf,
             store: DirSpaceSnapshotStore::new(),
             scan_permit: AtomicBool::new(false),
@@ -126,6 +129,11 @@ impl DirSpaceManager {
     /// Configured global scan interval in milliseconds (coordinator cadence).
     pub fn interval_ms(&self) -> u64 {
         self.conf.dir_space_global_scan_interval_ms()
+    }
+
+    /// Configured tracked-point scan interval in milliseconds.
+    pub fn point_interval_ms(&self) -> u64 {
+        self.conf.dir_space_tracked_scan_interval_ms()
     }
 
     /// Refresh the global snapshot age metric from the published generation.
@@ -145,7 +153,7 @@ impl DirSpaceManager {
         if let Ok(metrics) = crate::master::Master::get_metrics() {
             metrics
                 .dir_space_points_configured
-                .set(self.conf.dir_space_tracked_paths.len() as i64);
+                .set(self.effective_tracked_paths().len() as i64);
             let points = self.store.points();
             metrics.dir_space_points_ready.set(points.len() as i64);
             let total_entries: usize = points.values().map(|p| p.entries.len()).sum();
@@ -168,6 +176,276 @@ impl DirSpaceManager {
             max_depth: self.conf.dir_space_max_depth,
             memory_budget_bytes: self.conf.dir_space_memory_budget_bytes(),
             max_inode_record_bytes: self.conf.dir_space_max_inode_record_bytes(),
+        }
+    }
+
+    fn point_limits(&self) -> ScanLimits {
+        ScanLimits {
+            max_inodes: self.conf.dir_space_track_max_inodes,
+            max_edges: self.conf.dir_space_track_max_edges,
+            max_dirs: self.conf.dir_space_max_dirs,
+            max_depth: self.conf.dir_space_track_max_depth,
+            memory_budget_bytes: self.conf.dir_space_track_memory_budget_bytes(),
+            max_inode_record_bytes: self.conf.dir_space_max_inode_record_bytes(),
+        }
+    }
+
+    /// Effective tracked-point paths: explicit config first, then fs-mode
+    /// mounts sorted by path, capped by `dir_space_max_tracked_points`.
+    /// Root `/` is never tracked (global covers it).
+    pub fn effective_tracked_paths(&self) -> Vec<String> {
+        let max = self.conf.dir_space_max_tracked_points as usize;
+        let mut paths: Vec<String> = self
+            .conf
+            .dir_space_tracked_paths_normalized
+            .iter()
+            .filter(|p| p.as_str() != "/")
+            .cloned()
+            .collect();
+        let mut seen: HashSet<String> = paths.iter().cloned().collect();
+
+        if self.conf.dir_space_auto_track_mounts {
+            let mut mount_paths: Vec<String> = self
+                .mount_manager
+                .get_mount_table()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|m| m.is_fs_mode())
+                .filter_map(|m| normalize_tracked_path(&m.cv_path).ok())
+                .filter(|p| p.as_str() != "/" && seen.insert(p.clone()))
+                .collect();
+            mount_paths.sort();
+            for path in mount_paths {
+                if paths.len() >= max {
+                    break;
+                }
+                paths.push(path);
+            }
+        }
+
+        paths.truncate(max);
+        paths
+    }
+
+    /// Drop store entries for paths no longer in the effective tracked set.
+    pub fn sync_tracked_point_catalog(&self) {
+        let effective: HashSet<String> = self.effective_tracked_paths().into_iter().collect();
+        for path in self.store.points().keys().cloned().collect::<Vec<_>>() {
+            if !effective.contains(&path) {
+                self.store.remove_point(&path);
+            }
+        }
+    }
+
+    /// Resolve one tracked path to its directory inode id under a short read
+    /// lock. Returns `None` when the path is missing or not a directory.
+    fn resolve_tracked_root(&self, path: &str) -> Option<i64> {
+        let normalized = normalize_tracked_path(path).ok()?;
+        let fs_dir = self.fs.fs_dir.read();
+        resolve_dir_id(&fs_dir, &normalized).ok()
+    }
+
+    /// Attempt one tracked-point refresh round starting at `start_index` in the
+    /// effective path list. Returns the next round-robin cursor and whether the
+    /// full list was completed within the round deadline.
+    pub fn try_scan_tracked_points(&self, start_index: usize) -> (ScanOutcome, usize, bool) {
+        if !self.conf.dir_space_enabled {
+            return (ScanOutcome::Disabled, start_index, false);
+        }
+        if !self.fs.master_monitor.is_active() {
+            self.record_simple_outcome_for_scope("point", ScanOutcome::RoleLost);
+            return (ScanOutcome::RoleLost, start_index, false);
+        }
+        if self
+            .scan_permit
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            self.record_simple_outcome_for_scope("point", ScanOutcome::Busy);
+            return (ScanOutcome::Busy, start_index, false);
+        }
+        let _permit = PermitGuard(&self.scan_permit);
+
+        self.sync_tracked_point_catalog();
+        let paths = self.effective_tracked_paths();
+        if paths.is_empty() {
+            return (ScanOutcome::Success, 0, true);
+        }
+
+        let timeout_ms = self.conf.dir_space_tracked_scan_timeout_ms();
+        let monitor = self.fs.master_monitor.clone();
+        let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let monitor_for_ctx = monitor.clone();
+        let context = ScanContext {
+            deadline,
+            is_active: Box::new(move || monitor_for_ctx.is_active()),
+            limits: self.point_limits(),
+        };
+        let mut index = start_index % paths.len();
+        let mut scanned = 0usize;
+        let mut any_success = false;
+
+        loop {
+            if Instant::now() >= deadline {
+                break;
+            }
+            if !monitor.is_active() {
+                self.record_simple_outcome_for_scope("point", ScanOutcome::RoleLost);
+                return (ScanOutcome::RoleLost, index, false);
+            }
+
+            let path = paths[index].clone();
+            let Some(root_id) = self.resolve_tracked_root(&path) else {
+                warn!(
+                    "dir-space tracked point {} skipped: path missing or not a directory",
+                    path
+                );
+                index = (index + 1) % paths.len();
+                scanned += 1;
+                if scanned >= paths.len() {
+                    return (ScanOutcome::Success, 0, true);
+                }
+                continue;
+            };
+
+            let started_ms = LocalTime::mills() as i64;
+            match self.run_point_scan(&path, root_id, &context) {
+                Ok(snapshot) => {
+                    let duration_ms = (LocalTime::mills() as i64 - started_ms).max(0) as u64;
+                    let inode_count = snapshot.meta.inode_count;
+                    let edge_count = snapshot.meta.edge_count;
+                    let anomaly_count = snapshot.meta.anomaly_count;
+                    let generation = self.store.publish_point(&path, snapshot).meta.generation;
+                    info!(
+                        "dir-space point scan published {} generation {} in {} ms",
+                        path, generation, duration_ms
+                    );
+                    self.record_point_success(duration_ms, inode_count, edge_count, anomaly_count);
+                    any_success = true;
+                }
+                Err(e) => {
+                    let duration_ms = (LocalTime::mills() as i64 - started_ms).max(0) as u64;
+                    let outcome = classify_scan_error(&e);
+                    warn!(
+                        "dir-space point scan {} {:?} after {} ms: {}",
+                        path, outcome, duration_ms, e
+                    );
+                    self.record_point_failure(outcome, duration_ms, &path);
+                }
+            }
+
+            index = (index + 1) % paths.len();
+            scanned += 1;
+            if scanned >= paths.len() {
+                return (
+                    if any_success {
+                        ScanOutcome::Success
+                    } else {
+                        ScanOutcome::Failed
+                    },
+                    0,
+                    true,
+                );
+            }
+        }
+
+        (
+            if any_success {
+                ScanOutcome::Success
+            } else {
+                ScanOutcome::Timeout
+            },
+            index,
+            false,
+        )
+    }
+
+    fn run_point_scan(
+        &self,
+        _path: &str,
+        root_id: i64,
+        context: &ScanContext,
+    ) -> CommonResult<DirSpaceSnapshot> {
+        let lease = {
+            let fs_dir = self.fs.fs_dir.read();
+            fs_dir.begin_snapshot_scan()?
+        };
+        let unpublished = PointScanner::scan(&lease, root_id, context)?;
+        drop(lease);
+
+        let mut entries = unpublished.entries;
+        let root = unpublished.root;
+        let root_entry = entries.entry(root_id).or_insert_with(DirAgg::empty_dir);
+        root_entry.merge(&root)?;
+        let stats = unpublished.stats;
+
+        Ok(DirSpaceSnapshot {
+            meta: SnapshotMeta {
+                generation: 0,
+                started_ms: unpublished.started_ms,
+                finished_ms: unpublished.finished_ms,
+                inode_count: unpublished.inode_count,
+                edge_count: unpublished.edge_count,
+                anomaly_count: stats.anomaly_count,
+                degraded: stats.degraded,
+            },
+            root_id,
+            source: SnapshotSource::TrackedPoint,
+            entries,
+        })
+    }
+
+    fn record_simple_outcome_for_scope(&self, scope: &str, outcome: ScanOutcome) {
+        if let Ok(metrics) = crate::master::Master::get_metrics() {
+            metrics
+                .dir_space_scan_total
+                .with_label_values(&[scope, outcome.as_str()])
+                .inc();
+        }
+    }
+
+    fn record_point_success(
+        &self,
+        duration_ms: u64,
+        inode_count: u64,
+        edge_count: u64,
+        anomaly_count: u64,
+    ) {
+        if let Ok(metrics) = crate::master::Master::get_metrics() {
+            metrics
+                .dir_space_scan_total
+                .with_label_values(&["point", "success"])
+                .inc();
+            metrics
+                .dir_space_scan_duration_ms
+                .with_label_values(&["point", "success"])
+                .observe(duration_ms as f64);
+            metrics
+                .dir_space_scan_inodes
+                .with_label_values(&["point"])
+                .set(inode_count as i64);
+            metrics
+                .dir_space_scan_edges
+                .with_label_values(&["point"])
+                .set(edge_count as i64);
+            metrics
+                .dir_space_scan_anomalies
+                .with_label_values(&["point"])
+                .set(anomaly_count as i64);
+        }
+    }
+
+    fn record_point_failure(&self, outcome: ScanOutcome, duration_ms: u64, _path: &str) {
+        if let Ok(metrics) = crate::master::Master::get_metrics() {
+            let label = outcome.as_str();
+            metrics
+                .dir_space_scan_total
+                .with_label_values(&["point", label])
+                .inc();
+            metrics
+                .dir_space_scan_duration_ms
+                .with_label_values(&["point", label])
+                .observe(duration_ms as f64);
         }
     }
 
@@ -452,6 +730,21 @@ impl Drop for PermitGuard<'_> {
 }
 
 /// Normalize a queried directory path to a component-level absolute form.
+fn normalize_tracked_path(path: &str) -> CommonResult<String> {
+    let path = path.trim();
+    if !crate::master::meta::inode::InodeView::is_full_path(path) {
+        return err_box!("tracked path must be absolute");
+    }
+    if path == "/" {
+        return Ok("/".to_string());
+    }
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return err_box!("tracked path must not be empty");
+    }
+    Ok(trimmed.to_string())
+}
+
 fn normalize_dir_path(path: &str) -> Result<String, DirSpaceQueryError> {
     let path = path.trim();
     if !crate::master::meta::inode::InodeView::is_full_path(path) {
@@ -491,6 +784,7 @@ mod tests {
     use crate::master::space::store::SnapshotMiss;
     use crate::master::{Master, MasterMonitor, MountManager};
     use curvine_config::{ClusterConf, JournalConf, MasterConf};
+    use curvine_model::RenameFlags;
     use curvine_raft::raft::RoleState;
     use curvine_runtime::common::Utils;
     use curvine_runtime::runtime::LoopTask;
@@ -501,6 +795,14 @@ mod tests {
     /// tests. The monitor starts in Standby (state 0 = follower-equivalent
     /// for `is_active`).
     fn test_fs(name: &str, dir_space_enabled: bool) -> (MasterFilesystem, Arc<MasterConf>) {
+        test_fs_with_options(name, dir_space_enabled, |_| {})
+    }
+
+    fn test_fs_with_options(
+        name: &str,
+        dir_space_enabled: bool,
+        configure: impl FnOnce(&mut MasterConf),
+    ) -> (MasterFilesystem, Arc<MasterConf>) {
         Master::init_test_metrics();
         let mut conf = ClusterConf {
             testing: true,
@@ -516,6 +818,7 @@ mod tests {
             ..Default::default()
         };
         conf.master.dir_space_enabled = dir_space_enabled;
+        configure(&mut conf.master);
         conf.master.init().unwrap();
         let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
         (fs, Arc::new(conf.master))
@@ -852,6 +1155,45 @@ mod tests {
             "role_lost outcome must be counted, got {}",
             role_lost
         );
+    }
+
+    #[test]
+    fn tracked_point_effective_paths_and_publish() {
+        let (fs, conf) = test_fs_with_options("tracked-publish", true, |master| {
+            master.dir_space_tracked_paths = vec!["/a".to_string()];
+        });
+        set_role(&monitor_for(&fs), true);
+        seed_tree(&fs);
+        let manager = manager_for(&fs, &conf);
+
+        assert_eq!(manager.effective_tracked_paths(), vec!["/a".to_string()]);
+        let (outcome, _, complete) = manager.try_scan_tracked_points(0);
+        assert_eq!(outcome, ScanOutcome::Success);
+        assert!(complete);
+        let point = manager.store().point("/a").expect("point published");
+        assert_eq!(point.source, SnapshotSource::TrackedPoint);
+        assert!(point.entries.contains_key(&point.root_id));
+
+        let res = manager.query("/a/sub").expect("point query");
+        assert_eq!(res.source, SnapshotSource::TrackedPoint);
+    }
+
+    #[test]
+    fn tracked_point_stale_root_not_selected_after_rename() {
+        let (fs, conf) = test_fs_with_options("tracked-stale", true, |master| {
+            master.dir_space_tracked_paths = vec!["/a".to_string()];
+        });
+        set_role(&monitor_for(&fs), true);
+        seed_tree(&fs);
+        let manager = manager_for(&fs, &conf);
+        manager.try_scan_tracked_points(0);
+
+        fs.rename("/a", "/a-renamed", RenameFlags::empty()).unwrap();
+        assert!(manager.query("/a-renamed/sub").is_err());
+        assert!(manager
+            .select_point("/a-renamed/sub", &manager.store().points())
+            .unwrap()
+            .is_none());
     }
 
     #[test]

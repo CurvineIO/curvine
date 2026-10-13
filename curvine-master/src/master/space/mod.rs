@@ -25,7 +25,7 @@ pub use manager::{DirSpaceManager, DirSpaceQueryError, ScanOutcome};
 pub use scan_lease::{
     LeaseTicket, MetadataRestoreGuard, MetadataScanControl, MetadataScanLease, RestoreTicket,
 };
-pub use scanner::{GlobalScanner, ScanContext, ScanLimits, UnpublishedSnapshot};
+pub use scanner::{GlobalScanner, PointScanner, ScanContext, ScanLimits, UnpublishedSnapshot};
 pub use scheduler::{DirSpaceCoordinatorTask, COORDINATOR_TICK_MS};
 pub use store::{DirSpaceQueryResult, DirSpaceSnapshotStore, SnapshotMiss};
 pub use types::{

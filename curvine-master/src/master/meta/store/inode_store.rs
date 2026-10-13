@@ -1089,6 +1089,16 @@ impl<'a> InodeStoreSnapshot<'a> {
             RocksUtils::i64_to_bytes(parent_id),
         )
     }
+
+    /// Point-read up to `ids.len()` inodes within this snapshot (missing keys
+    /// yield `None` at the same index).
+    pub fn get_inodes(&self, ids: &[i64]) -> CommonResult<Vec<Option<InodeView>>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            out.push(self.get_inode(id)?);
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
