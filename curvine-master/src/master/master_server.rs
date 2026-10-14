@@ -134,6 +134,7 @@ impl HandlerService for MasterService {
             self.actor_rt.clone(),
             self.metrics,
             self.runtime_config.clone(),
+            self.dir_space_manager.clone(),
         )
     }
 

@@ -19,6 +19,9 @@ use crate::master::replication::master_replication_manager::MasterReplicationMan
 use crate::master::runtime_config::{
     list_runtime_config_entries, runtime_entry_to_proto, value_to_json_string,
 };
+use crate::master::space::{
+    DirSpaceManager, DirSpaceQueryError, DirSpaceQueryResult, SnapshotMiss, SnapshotSource,
+};
 use crate::master::MountManager;
 use crate::master::{Master, MasterMetrics, RpcContext};
 use curvine_config::{ClusterConf, RuntimeConfigRegistry};
@@ -29,12 +32,14 @@ use curvine_fs_api::Path;
 use curvine_fs_api::{
     RpcCode, GET_BLOCK_LOCATIONS_BATCH_MAX_ENCODED_PATH_BYTES, GET_BLOCK_LOCATIONS_BATCH_MAX_PATHS,
     GET_BLOCK_LOCATIONS_BATCH_MAX_RESPONSE_BYTES, MASTER_CAPABILITY_GET_BLOCK_LOCATIONS_BATCH,
+    MASTER_CAPABILITY_GET_CONTENT_SUMMARY_SNAPSHOT,
 };
 use curvine_model::ProtoUtils;
 use curvine_model::{
-    CompatibilityMode, CompatibilityPolicy, CompatibilityVerdict, CreateFileOpts, DeleteBlockCmd,
-    DeleteResult, FileBlockDetails, FileBlocks, FileStatus, FilesystemInfo, FreeResult,
-    HeartbeatStatus, ListOptions, OpenFlags, RenameFlags, WorkerCommand, WorkerInfo, WorkerStatus,
+    CompatibilityMode, CompatibilityPolicy, CompatibilityVerdict, ContentSummary,
+    ContentSummarySnapshot, ContentSummarySource, CreateFileOpts, DeleteBlockCmd, DeleteResult,
+    FileBlockDetails, FileBlocks, FileStatus, FilesystemInfo, FreeResult, HeartbeatStatus,
+    ListOptions, OpenFlags, RenameFlags, WorkerCommand, WorkerInfo, WorkerStatus,
 };
 use curvine_net::net::ConnState;
 use curvine_proto::*;
@@ -72,6 +77,7 @@ pub struct MasterHandler {
     // heartbeat or statfs call.
     compat_warned: DashMap<String, CompatibilityVerdict>,
     runtime_config: Arc<RuntimeConfigRegistry>,
+    pub(crate) dir_space_manager: Option<Arc<DirSpaceManager>>,
 }
 
 impl MasterHandler {
@@ -88,6 +94,7 @@ impl MasterHandler {
         actor_rt: Arc<Runtime>,
         metrics: &'static MasterMetrics,
         runtime_config: Arc<RuntimeConfigRegistry>,
+        dir_space_manager: Option<Arc<DirSpaceManager>>,
     ) -> Self {
         metrics.active_connections.inc();
         // Build the master's compatibility payload once; GetFilesystemInfo can
@@ -110,6 +117,18 @@ impl MasterHandler {
                 .capabilities
                 .push(MASTER_CAPABILITY_GET_BLOCK_LOCATIONS_BATCH.to_string());
         }
+        if dir_space_manager.is_some()
+            && !master_compatibility
+                .server
+                .capabilities
+                .iter()
+                .any(|capability| capability == MASTER_CAPABILITY_GET_CONTENT_SUMMARY_SNAPSHOT)
+        {
+            master_compatibility
+                .server
+                .capabilities
+                .push(MASTER_CAPABILITY_GET_CONTENT_SUMMARY_SNAPSHOT.to_string());
+        }
         Self {
             fs,
             retry_cache,
@@ -125,7 +144,76 @@ impl MasterHandler {
             compatibility_policy,
             compat_warned: DashMap::new(),
             runtime_config,
+            dir_space_manager,
         }
+    }
+
+    fn content_summary_from_dir_query(
+        dir_id: i64,
+        result: DirSpaceQueryResult,
+    ) -> FsResult<ContentSummary> {
+        let agg = result.snapshot.entries.get(&dir_id).ok_or_else(|| {
+            FsError::snapshot_not_ready(format!("directory inode {dir_id} not in snapshot"))
+        })?;
+        let source = match result.source {
+            SnapshotSource::Global => ContentSummarySource::Global,
+            SnapshotSource::TrackedPoint => ContentSummarySource::TrackedPoint,
+            _other => {
+                return err_box!("unexpected dir-space snapshot source: {other:?}");
+            }
+        };
+        let meta = &result.snapshot.meta;
+        Ok(ContentSummary::from_snapshot(
+            agg.logical_bytes,
+            agg.file_count,
+            agg.directory_count,
+            source,
+            ContentSummarySnapshot {
+                generation: meta.generation,
+                started_ms: meta.started_ms,
+                finished_ms: meta.finished_ms,
+                anomaly_count: meta.anomaly_count,
+                degraded: meta.degraded,
+            },
+        ))
+    }
+
+    pub fn get_content_summary(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: GetContentSummaryRequest = ctx.parse_header()?;
+        let path_str = header
+            .path
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| FsError::invalid_argument("path is required"))?;
+        ctx.set_audit(Some(path_str.clone()), None);
+
+        let path = Path::from_str(&path_str)?;
+        let status = self.fs.file_status_by_id(path.path(), None)?;
+
+        if !status.is_dir {
+            let summary = ContentSummary::live_file(status.len.max(0) as u64);
+            return ctx.response(GetContentSummaryResponse {
+                summary: Some(ProtoUtils::content_summary_to_pb(summary)),
+            });
+        }
+
+        let manager = self
+            .dir_space_manager
+            .as_ref()
+            .ok_or_else(|| FsError::unsupported("dir-space content summary"))?;
+
+        let query = manager.query(path.path()).map_err(|err| match err {
+            DirSpaceQueryError::Disabled => FsError::unsupported("dir-space content summary"),
+            DirSpaceQueryError::Path(p) => FsError::file_not_found(p),
+            DirSpaceQueryError::SnapshotMiss(SnapshotMiss::NoSnapshot)
+            | DirSpaceQueryError::SnapshotMiss(SnapshotMiss::NotInSnapshot) => {
+                FsError::snapshot_not_ready(path_str)
+            }
+        })?;
+
+        let summary = Self::content_summary_from_dir_query(status.id, query)?;
+        ctx.response(GetContentSummaryResponse {
+            summary: Some(ProtoUtils::content_summary_to_pb(summary)),
+        })
     }
 
     pub fn get_req_cache(&self, id: i64) -> Option<OperationStatus> {
@@ -1311,6 +1399,7 @@ impl MessageHandler for MasterHandler {
                 RpcCode::UnMount => self.umount(ctx),
                 RpcCode::GetMountTable => self.get_mount_table(ctx),
                 RpcCode::GetMountInfo => self.get_mount_info(ctx),
+                RpcCode::GetContentSummary => self.get_content_summary(ctx),
 
                 RpcCode::MetricsReport => self.metrics_report(ctx),
                 RpcCode::UpdateRuntimeConfig => self.update_runtime_config(ctx),

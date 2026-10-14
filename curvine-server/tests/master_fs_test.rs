@@ -28,7 +28,8 @@ use curvine_model::{
 use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
     BlockReportInfoProto, BlockReportListRequest, CompleteFileRequest, CompleteFileResponse,
-    CreateFileRequest, DeleteRequest, GetFilesystemInfoRequest, MkdirOptsProto, MkdirRequest,
+    CreateFileRequest, DeleteRequest, GetContentSummaryRequest, GetContentSummaryResponse,
+    GetFilesystemInfoRequest, GetFilesystemInfoResponse, MkdirOptsProto, MkdirRequest,
     RenameRequest,
 };
 use curvine_raft::conf::JournalConf;
@@ -211,6 +212,13 @@ fn prepare_flush_file(
 }
 
 fn new_handler_for_test(test_name: &str) -> MasterHandler {
+    new_handler_for_test_with_dir_space(test_name, false).0
+}
+
+fn new_handler_for_test_with_dir_space(
+    test_name: &str,
+    dir_space_enabled: bool,
+) -> (MasterHandler, MasterFilesystem) {
     Master::init_test_metrics();
 
     let test_id = Utils::rand_str(8);
@@ -221,6 +229,10 @@ fn new_handler_for_test(test_name: &str) -> MasterHandler {
         Utils::test_sub_dir(format!("master-fs-test/meta-{test_name}-{test_id}"));
     conf.journal.journal_dir =
         Utils::test_sub_dir(format!("master-fs-test/journal-{test_name}-{test_id}"));
+    conf.master.dir_space_enabled = dir_space_enabled;
+    if dir_space_enabled {
+        conf.master.init().unwrap();
+    }
 
     let journal_system = JournalSystem::from_conf(&conf).unwrap();
     let fs = MasterFilesystem::with_js(&conf, &journal_system);
@@ -229,6 +241,17 @@ fn new_handler_for_test(test_name: &str) -> MasterHandler {
         .expect("test master retry cache configuration should be valid");
 
     let mount_manager = journal_system.mount_manager();
+    let dir_space_manager = if dir_space_enabled {
+        Some(Arc::new(
+            curvine_server::master::space::DirSpaceManager::new(
+                fs.clone(),
+                mount_manager.clone(),
+                Arc::new(conf.master.clone()),
+            ),
+        ))
+    } else {
+        None
+    };
     let rt = Arc::new(AsyncRuntime::single());
     let replication_manager =
         MasterReplicationManager::new(&fs, &conf, &rt, &journal_system.worker_manager())
@@ -240,9 +263,9 @@ fn new_handler_for_test(test_name: &str) -> MasterHandler {
         &conf,
     ));
     let control_rpc_executor = Arc::new(GroupExecutor::new("master-handler-test", 1, 16));
-    MasterHandler::new(
+    let handler = MasterHandler::new(
         &conf,
-        fs,
+        fs.clone(),
         retry_cache,
         None,
         mount_manager,
@@ -252,7 +275,9 @@ fn new_handler_for_test(test_name: &str) -> MasterHandler {
         rt,
         Master::get_metrics().expect("test master metrics should initialize"),
         Arc::new(RuntimeConfigRegistry::builder().build()),
-    )
+        dir_space_manager,
+    );
+    (handler, fs)
 }
 
 #[cfg(feature = "fault-injection")]
@@ -3449,4 +3474,63 @@ fn complete_file_with_set_attr_applies_attributes() -> CommonResult<()> {
     );
 
     Ok(())
+}
+
+#[test]
+fn content_summary_capability_advertised_when_dir_space_enabled() {
+    let _guard = master_fs_test_serial();
+    let (handler, _fs) = new_handler_for_test_with_dir_space("content-summary-cap", true);
+
+    let msg = Builder::new_rpc(RpcCode::GetFilesystemInfo)
+        .proto_header(GetFilesystemInfoRequest::default())
+        .build();
+    let mut ctx = RpcContext::new(&msg);
+    let rep = handler.get_filesystem_info(&mut ctx).unwrap();
+    let header: GetFilesystemInfoResponse = rep.parse_header().unwrap();
+    let capabilities = header.compatibility.unwrap().server.capabilities;
+    assert!(capabilities
+        .iter()
+        .any(|cap| cap == "get-content-summary-snapshot-v1"));
+}
+
+#[test]
+fn content_summary_file_returns_live_summary_without_snapshot_metadata() {
+    let _guard = master_fs_test_serial();
+    let (handler, fs) = new_handler_for_test_with_dir_space("content-summary-file", true);
+    fs.mkdir("/fdir", true).unwrap();
+    fs.create("/fdir/file.txt", true).unwrap();
+
+    let msg = Builder::new_rpc(RpcCode::GetContentSummary)
+        .proto_header(GetContentSummaryRequest {
+            path: Some("/fdir/file.txt".to_string()),
+            client_context: None,
+        })
+        .build();
+    let mut ctx = RpcContext::new(&msg);
+    let rep = handler.get_content_summary(&mut ctx).unwrap();
+    let header: GetContentSummaryResponse = rep.parse_header().unwrap();
+    let summary =
+        curvine_model::ProtoUtils::content_summary_from_pb(header.summary.expect("summary"));
+    assert_eq!(
+        summary.source,
+        Some(curvine_model::ContentSummarySource::LiveFile)
+    );
+    assert!(summary.snapshot.is_none());
+}
+
+#[test]
+fn content_summary_directory_without_snapshot_is_not_ready() {
+    let _guard = master_fs_test_serial();
+    let (handler, fs) = new_handler_for_test_with_dir_space("content-summary-dir", true);
+    fs.mkdir("/data", true).unwrap();
+
+    let msg = Builder::new_rpc(RpcCode::GetContentSummary)
+        .proto_header(GetContentSummaryRequest {
+            path: Some("/data".to_string()),
+            client_context: None,
+        })
+        .build();
+    let mut ctx = RpcContext::new(&msg);
+    let err = handler.get_content_summary(&mut ctx).unwrap_err();
+    assert!(matches!(err, FsError::SnapshotNotReady(_)));
 }
