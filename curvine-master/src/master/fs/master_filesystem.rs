@@ -1072,7 +1072,9 @@ impl MasterFilesystem {
         {
             let mut wm = self.worker_manager.write();
             wm.track_block_reservation(block.id, &choose_workers, block_size);
-            wm.release_committed_reservations(&committed);
+            // The committed blocks are finished: a new block was just allocated in
+            // their place, so their reservation can be closed out.
+            wm.release_committed_reservations(&committed, true);
         }
         let located = LocatedBlock {
             block,
@@ -1159,7 +1161,9 @@ impl MasterFilesystem {
         )?;
         self.worker_manager
             .write()
-            .release_committed_reservations(&committed);
+            // A flush commits the current block while the writer keeps growing it,
+            // so only a real close may drop the tracking entry.
+            .release_committed_reservations(&committed, !options.only_flush);
 
         if options.only_flush && options.return_file_blocks {
             let file = inode.as_file_ref()?;
@@ -3842,5 +3846,76 @@ mod tests {
         fs.master_monitor
             .set_role_for_test(curvine_raft::raft::RoleState::Leader);
         assert_eq!(fs.drain_pending_trash().unwrap().unwrap().inodes, 1);
+    }
+
+    #[test]
+    fn flush_then_growth_keeps_the_written_bytes_reserved() {
+        // A `flush` commits the current block while the writer goes on appending to
+        // it. Releasing the never-written remainder once, at flush time, would keep
+        // removing the bytes that land after the flush (they are also reclaimed by
+        // the heartbeat) and could eat the reservation of another in-flight block.
+        let fs = test_fs("flush-then-growth");
+        let capacity = 1 << 30;
+        fs.add_test_worker(worker_with_status(
+            1,
+            WorkerStatus::Live,
+            capacity,
+            capacity,
+        ));
+
+        let created = fs.create("/grow.log", true).unwrap();
+        let blocks = fs
+            .resize(
+                "/grow.log",
+                FileAllocOpts::with_alloc(created.block_size, FileAllocMode::DEFAULT),
+            )
+            .unwrap();
+        let block = blocks.block_locs[0].block.clone();
+        fs.assign_worker("/grow.log", block.clone(), ClientAddress::default(), vec![])
+            .unwrap();
+
+        let location = BlockLocation::with_id(1);
+        let flushed = 4096;
+        let grown = flushed + (1 << 20);
+        let flush_commit = CommitBlock {
+            block_id: block.id,
+            block_len: flushed,
+            locations: vec![location.clone()],
+        };
+        fs.flush_file("/grow.log", None, flushed, vec![flush_commit], "cv18")
+            .unwrap();
+        let after_flush = fs
+            .worker_manager
+            .read()
+            .get_worker(1)
+            .unwrap()
+            .scheduled_bytes;
+        assert_eq!(after_flush, flushed);
+
+        let close_commit = CommitBlock {
+            block_id: block.id,
+            block_len: grown,
+            locations: vec![location],
+        };
+        fs.complete_file(
+            "/grow.log",
+            None,
+            grown,
+            vec![close_commit],
+            "cv18",
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            grown,
+            "bytes written after the flush must stay reserved"
+        );
     }
 }
